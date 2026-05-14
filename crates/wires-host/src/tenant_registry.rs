@@ -47,7 +47,6 @@ pub struct TenantRegistry {
     pub root: PathBuf,
     tenants_db: Arc<Database>,
     topic_index_db: Arc<Database>,
-    #[allow(dead_code)]
     nonces_db: Arc<Database>,
 }
 
@@ -171,6 +170,42 @@ impl TenantRegistry {
         write.commit().context(CommitSnafu)?;
         Ok(removed)
     }
+
+    /// Returns `true` iff the (root_pubkey, nonce) pair was already seen within
+    /// the TTL window. On `false`, the pair is recorded.
+    pub fn nonce_seen(
+        &self,
+        root_pubkey: &[u8; 32],
+        nonce: &[u8; 16],
+        now_unix_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<bool> {
+        let mut key = [0u8; 48];
+        key[0..32].copy_from_slice(root_pubkey);
+        key[32..48].copy_from_slice(nonce);
+        let expires_at = now_unix_ms.saturating_add(ttl_ms);
+
+        let write = self.nonces_db.begin_write().context(TxnSnafu)?;
+        let seen_recent = {
+            let mut table = write.open_table(NONCES).context(TableSnafu)?;
+            let prior = table.get(&key[..]).context(StorageIoSnafu)?;
+            let recent = match prior.map(|g| g.value().to_vec()) {
+                Some(raw) if raw.len() >= 8 => {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&raw[..8]);
+                    let stored_expires = i64::from_be_bytes(buf);
+                    stored_expires > now_unix_ms
+                }
+                _ => false,
+            };
+            if !recent {
+                table.insert(&key[..], &expires_at.to_be_bytes()[..]).context(StorageIoSnafu)?;
+            }
+            recent
+        };
+        write.commit().context(CommitSnafu)?;
+        Ok(seen_recent)
+    }
 }
 
 #[cfg(test)]
@@ -240,5 +275,30 @@ mod tests {
         reg.register_topic(&root_a, &topic).unwrap();
         let conflict = reg.register_topic(&root_b, &topic).unwrap();
         assert!(matches!(conflict, TopicRegisterOutcome::Conflict { .. }));
+    }
+
+    #[test]
+    fn nonce_first_seen_then_replay_detected() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let root = [7u8; 32];
+        let nonce = [3u8; 16];
+        let now = 100_000i64;
+        let ttl_ms = 120_000i64;
+        assert!(!reg.nonce_seen(&root, &nonce, now, ttl_ms).unwrap());
+        assert!(reg.nonce_seen(&root, &nonce, now + 1_000, ttl_ms).unwrap());
+    }
+
+    #[test]
+    fn nonce_expires_past_ttl() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let root = [7u8; 32];
+        let nonce = [3u8; 16];
+        let now = 100_000i64;
+        let ttl_ms = 120_000i64;
+        assert!(!reg.nonce_seen(&root, &nonce, now, ttl_ms).unwrap());
+        // Re-use after TTL elapses should be allowed again.
+        assert!(!reg.nonce_seen(&root, &nonce, now + ttl_ms + 1, ttl_ms).unwrap());
     }
 }
