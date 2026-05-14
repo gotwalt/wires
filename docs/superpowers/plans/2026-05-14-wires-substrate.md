@@ -6,7 +6,9 @@
 
 **Architecture:** Seven-crate Cargo workspace. Pure types/logic in `wires-core`, primitives in `wires-crypto`, persistence in `wires-store`, iroh networking in `wires-net`, agent-facing runtime in `wires-node`, CLI in `wires-cli`, blind relay binary in `wires-host`. Built TDD: every behavior gets a failing test first, then the smallest implementation that passes, then refactor. Each task ends with a commit.
 
-**Tech Stack:** Rust 2024 edition, `iroh` + `iroh-gossip`, `ed25519-dalek`, `x25519-dalek`, `chacha20poly1305`, `blake3`, `redb`, `serde` + `serde_json`, `tokio`, `tracing`, `clap`, `snafu` (errors), `proptest` (property tests).
+**Tech Stack:** Rust stable (currently 1.95+), 2024 edition, `iroh` + `iroh-gossip`, `ed25519-dalek`, `x25519-dalek`, `chacha20poly1305`, `blake3`, `redb`, `serde` + `serde_json`, `tokio`, `tracing`, `clap`, `snafu` (errors), `proptest` (property tests).
+
+**Version policy:** Use the latest stable release of every dependency, added via `cargo add`. Do NOT pin to specific minor versions in this plan — let `cargo` resolve them. The version pins below in workspace `Cargo.toml` examples should be replaced with whatever `cargo add` chooses at the time of execution.
 
 **Error convention reminder:** Every error variant uses `snafu` with `#[snafu(display("..., at {location}"))]` and `#[snafu(implicit)] location: Location`. No `message: String` fields. Source errors via `#[snafu(source)]`. See spec §8 for the template.
 
@@ -53,51 +55,47 @@ members = [
 edition = "2024"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
-rust-version = "1.85"
+# rust-version: leave unset or pin to current stable. Update at execution time.
 
 [workspace.dependencies]
-# Internal
+# Internal — paths only
 wires-core   = { path = "crates/wires-core" }
 wires-crypto = { path = "crates/wires-crypto" }
 wires-store  = { path = "crates/wires-store" }
 wires-net    = { path = "crates/wires-net" }
 wires-node   = { path = "crates/wires-node" }
 
-# Iroh
-iroh        = "0.28"
-iroh-gossip = "0.28"
+# IMPORTANT: All external versions below are PLACEHOLDERS. Replace each with
+# the latest stable resolved by `cargo add --workspace <crate>` at execution
+# time. Keep the feature flags listed; only the version strings should change.
 
-# Crypto
-ed25519-dalek    = { version = "2", features = ["rand_core"] }
-x25519-dalek     = { version = "2", features = ["static_secrets"] }
-chacha20poly1305 = "0.10"
-blake3           = "1"
-rand             = "0.8"
+iroh        = "*"
+iroh-gossip = "*"
 
-# Storage
-redb = "2"
+ed25519-dalek    = { version = "*", features = ["rand_core"] }
+x25519-dalek     = { version = "*", features = ["static_secrets"] }
+chacha20poly1305 = "*"
+blake3           = "*"
+rand             = "*"
 
-# Serde
-serde      = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_bytes = "0.11"
-hex        = "0.4"
-uuid       = { version = "1", features = ["v4", "serde"] }
+redb = "*"
 
-# Runtime
-tokio   = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde       = { version = "*", features = ["derive"] }
+serde_json  = "*"
+serde_bytes = "*"
+hex         = "*"
+uuid        = { version = "*", features = ["v4", "serde"] }
 
-# CLI
-clap = { version = "4", features = ["derive"] }
+tokio              = { version = "*", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "signal"] }
+tracing            = "*"
+tracing-subscriber = { version = "*", features = ["env-filter"] }
 
-# Errors
-snafu = { version = "0.8", features = ["futures"] }
+clap = { version = "*", features = ["derive"] }
 
-# Dev
-proptest = "1"
-tempfile = "3"
+snafu = { version = "*", features = ["futures"] }
+
+proptest = "*"
+tempfile = "*"
 
 [profile.dev]
 opt-level = 0
@@ -114,7 +112,7 @@ lto = "thin"
 
 ```toml
 [toolchain]
-channel = "1.85"
+channel = "stable"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
 ```

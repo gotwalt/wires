@@ -1,0 +1,50 @@
+use snafu::{Location, Snafu};
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum NetError {
+    #[snafu(display("iroh endpoint setup failed, at {location}"))]
+    Endpoint {
+        #[snafu(source(from(anyhow::Error, Box::new)))]
+        source: Box<anyhow::Error>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Gossip subscription failed, at {location}"))]
+    GossipSubscribe {
+        #[snafu(source(from(anyhow::Error, Box::new)))]
+        source: Box<anyhow::Error>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Gossip publish failed, at {location}"))]
+    GossipPublish {
+        #[snafu(source(from(anyhow::Error, Box::new)))]
+        source: Box<anyhow::Error>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Replay RPC failed, at {location}"))]
+    ReplayRpc {
+        #[snafu(source(from(anyhow::Error, Box::new)))]
+        source: Box<anyhow::Error>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Serialization failure in net layer, at {location}"))]
+    Serde {
+        #[snafu(source)]
+        source: serde_json::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("I/O failure, at {location}"))]
+    Io {
+        #[snafu(source)]
+        source: std::io::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+}
+
+pub type Result<T, E = NetError> = core::result::Result<T, E>;
