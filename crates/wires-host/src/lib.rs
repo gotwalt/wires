@@ -4,6 +4,7 @@
 pub mod error;
 pub mod tenant_registry;
 pub mod per_tenant_logs;
+pub mod replay_source;
 pub mod retention;
 pub mod routing;
 pub mod http_discovery;
