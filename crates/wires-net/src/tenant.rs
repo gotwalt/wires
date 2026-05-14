@@ -217,6 +217,7 @@ pub fn status_signing_bytes(
 use std::sync::Arc;
 
 use iroh::endpoint::Connection;
+use iroh::{Endpoint, EndpointId};
 use snafu::ResultExt as _;
 
 use crate::error::{IoSnafu, Result};
@@ -279,6 +280,40 @@ impl<H: TenantHandler> iroh::protocol::ProtocolHandler for TenantProtocol<H> {
                 tracing::warn!(error = %e, "tenant handler stream failed");
             }
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct TenantClient {
+    endpoint: Endpoint,
+}
+
+impl TenantClient {
+    pub fn new(endpoint: Endpoint) -> Self {
+        Self { endpoint }
+    }
+
+    /// Open a bidi stream to `peer` and send a `TenantRequest`. Returns the
+    /// response, or an error if the connection fails or the response is
+    /// malformed.
+    pub async fn send(&self, peer: EndpointId, req: &TenantRequest) -> Result<TenantResponse> {
+        let conn = self
+            .endpoint
+            .connect(peer, ALPN)
+            .await
+            .map_err(std::io::Error::other)
+            .context(IoSnafu)?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(std::io::Error::other)
+            .context(IoSnafu)?;
+        write_frame(&mut send, req).await?;
+        send.finish()
+            .map_err(std::io::Error::other)
+            .context(IoSnafu)?;
+        let resp: TenantResponse = read_frame(&mut recv, MAX_FRAME_LEN).await?;
+        Ok(resp)
     }
 }
 
