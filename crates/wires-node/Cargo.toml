@@ -16,6 +16,8 @@ snafu        = { workspace = true }
 tracing      = { workspace = true }
 ed25519-dalek = { workspace = true }
 x25519-dalek = { workspace = true }
+blake3       = { workspace = true }
+hex          = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
