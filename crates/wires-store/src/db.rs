@@ -26,6 +26,13 @@ pub fn open_caps(root: &Path) -> Result<Database> {
     Database::create(&path).context(OpenDbSnafu { path: path.clone() })
 }
 
+/// Open the per-tenant ingest index db at `<root>/ingest_<tenant_hex>.redb`.
+pub fn open_ingest_index(root: &Path, tenant_hex: &str) -> Result<Database> {
+    std::fs::create_dir_all(root).context(FsSnafu { path: root.to_path_buf() })?;
+    let path = root.join(format!("ingest_{tenant_hex}.redb"));
+    Database::create(&path).context(OpenDbSnafu { path: path.clone() })
+}
+
 /// Compose a 40-byte key for the log table.
 pub fn log_key(sender: &[u8; 32], seq: u64) -> [u8; 40] {
     let mut k = [0u8; 40];
