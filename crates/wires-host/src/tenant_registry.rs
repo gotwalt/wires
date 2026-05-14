@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt as _;
 
@@ -36,10 +36,16 @@ pub struct TenantRecord {
     pub retention_budget_bytes: u64,
 }
 
+#[derive(Debug)]
+pub enum TopicRegisterOutcome {
+    Inserted,
+    AlreadyOwned,
+    Conflict { other_root: [u8; 32] },
+}
+
 pub struct TenantRegistry {
     pub root: PathBuf,
     tenants_db: Arc<Database>,
-    #[allow(dead_code)]
     topic_index_db: Arc<Database>,
     #[allow(dead_code)]
     nonces_db: Arc<Database>,
@@ -92,6 +98,79 @@ impl TenantRegistry {
         write.commit().context(CommitSnafu)?;
         Ok(rec)
     }
+
+    pub fn lookup_topic_tenant(&self, topic_id: &[u8; 32]) -> Result<Option<[u8; 32]>> {
+        let read = self.topic_index_db.begin_read().context(TxnSnafu)?;
+        let table = match read.open_table(TOPIC_INDEX) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(crate::error::HostError::Table {
+                source: e, location: snafu::location!(),
+            }),
+        };
+        match table.get(&topic_id[..]).context(StorageIoSnafu)? {
+            Some(v) => {
+                let raw = v.value();
+                if raw.len() != 32 { return Ok(None); }
+                let mut out = [0u8; 32];
+                out.copy_from_slice(raw);
+                Ok(Some(out))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn register_topic(
+        &self,
+        root_pubkey: &[u8; 32],
+        topic_id: &[u8; 32],
+    ) -> Result<TopicRegisterOutcome> {
+        let write = self.topic_index_db.begin_write().context(TxnSnafu)?;
+        let outcome = {
+            let mut table = write.open_table(TOPIC_INDEX).context(TableSnafu)?;
+            let prior_data = table.get(&topic_id[..]).context(StorageIoSnafu)?
+                .map(|guard| guard.value().to_vec());
+            if let Some(raw) = prior_data {
+                if raw == root_pubkey.as_slice() {
+                    TopicRegisterOutcome::AlreadyOwned
+                } else {
+                    let mut other = [0u8; 32];
+                    other.copy_from_slice(&raw);
+                    TopicRegisterOutcome::Conflict { other_root: other }
+                }
+            } else {
+                table.insert(&topic_id[..], &root_pubkey[..]).context(StorageIoSnafu)?;
+                TopicRegisterOutcome::Inserted
+            }
+        };
+        write.commit().context(CommitSnafu)?;
+        Ok(outcome)
+    }
+
+    pub fn unregister_topic(
+        &self,
+        root_pubkey: &[u8; 32],
+        topic_id: &[u8; 32],
+    ) -> Result<bool> {
+        let write = self.topic_index_db.begin_write().context(TxnSnafu)?;
+        let removed = {
+            let mut table = write.open_table(TOPIC_INDEX).context(TableSnafu)?;
+            let prior_data = table.get(&topic_id[..]).context(StorageIoSnafu)?
+                .map(|guard| guard.value().to_vec());
+            if let Some(raw) = prior_data {
+                if raw == root_pubkey.as_slice() {
+                    table.remove(&topic_id[..]).context(StorageIoSnafu)?;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        write.commit().context(CommitSnafu)?;
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]
@@ -135,5 +214,31 @@ mod tests {
         // Idempotent — second insert returns the first record unchanged.
         assert_eq!(first.registered_at, again.registered_at);
         assert_eq!(again.retention_budget_bytes, 100);
+    }
+
+    #[test]
+    fn topic_index_register_and_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let root = [7u8; 32];
+        let topic = [1u8; 32];
+        assert!(reg.lookup_topic_tenant(&topic).unwrap().is_none());
+        let outcome = reg.register_topic(&root, &topic).unwrap();
+        assert!(matches!(outcome, TopicRegisterOutcome::Inserted));
+        assert_eq!(reg.lookup_topic_tenant(&topic).unwrap(), Some(root));
+        let again = reg.register_topic(&root, &topic).unwrap();
+        assert!(matches!(again, TopicRegisterOutcome::AlreadyOwned));
+    }
+
+    #[test]
+    fn topic_index_rejects_conflict() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let root_a = [7u8; 32];
+        let root_b = [8u8; 32];
+        let topic = [1u8; 32];
+        reg.register_topic(&root_a, &topic).unwrap();
+        let conflict = reg.register_topic(&root_b, &topic).unwrap();
+        assert!(matches!(conflict, TopicRegisterOutcome::Conflict { .. }));
     }
 }
