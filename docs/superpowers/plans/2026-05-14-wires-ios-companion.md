@@ -1,5 +1,7 @@
 # Wires iOS Companion Implementation Plan
 
+**Status:** Draft — on hold pending upcoming substrate architecture changes. Do not begin execution until the spec at `docs/superpowers/specs/2026-05-14-wires-ios-companion-design.md` has been re-validated against the revised substrate.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the v1 iOS companion app described in `docs/superpowers/specs/2026-05-14-wires-ios-companion-design.md`: a SwiftUI + TCA app over a Rust `wires-uniffi` facade that custodies the household root key, pairs with `wires-host` via a scanned QR, and onboards new agents by scanning their enrollment QR and minting capabilities.

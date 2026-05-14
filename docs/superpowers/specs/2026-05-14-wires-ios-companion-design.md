@@ -1,7 +1,7 @@
 # Wires — iOS Companion App Design
 
 **Date:** 2026-05-14
-**Status:** Draft (awaiting user review)
+**Status:** Draft — on hold pending upcoming substrate architecture changes. Reviewed and approved 2026-05-14 against the current substrate spec; revisit before implementing to confirm the trust model, capability shape, and `__caps` semantics still hold.
 **Scope:** v1 of the iOS companion app. Pairs with [the substrate design](2026-05-14-wires-substrate-design.md), which defines the wire format, capability model, and host blindness contract this app participates in.
 
 ---
