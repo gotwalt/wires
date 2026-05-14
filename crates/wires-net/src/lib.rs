@@ -4,6 +4,7 @@ pub mod gossip;
 pub mod identity;
 pub mod invite;
 pub mod replay;
+pub mod tenant;
 
 pub use error::{NetError, Result};
 pub use gossip::{GossipHandle, GossipNode};
