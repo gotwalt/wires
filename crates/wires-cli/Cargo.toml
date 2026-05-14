@@ -1,0 +1,19 @@
+[package]
+name = "wires-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wires"
+path = "src/main.rs"
+
+[dependencies]
+wires-core = { workspace = true }
+wires-node = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+snafu = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
