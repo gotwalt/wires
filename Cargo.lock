@@ -4485,6 +4485,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "hex",
  "iroh",
  "iroh-gossip",
  "n0-future",
