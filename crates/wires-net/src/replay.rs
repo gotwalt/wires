@@ -161,6 +161,85 @@ impl<S: ReplaySource> iroh::protocol::ProtocolHandler for ReplayProtocol<S> {
     }
 }
 
+use iroh::{Endpoint, EndpointId};
+use tokio::sync::mpsc;
+
+#[derive(Clone)]
+pub struct ReplayClient {
+    endpoint: Endpoint,
+}
+
+impl ReplayClient {
+    pub fn new(endpoint: Endpoint) -> Self {
+        Self { endpoint }
+    }
+
+    /// Open a bidi stream to `peer` and send a `ReplayRequest`. Returns a
+    /// channel that receives each `WireMessage` from the server's stream
+    /// until the end-of-stream sentinel.
+    pub async fn request(
+        &self,
+        peer: EndpointId,
+        request: &ReplayRequest,
+    ) -> Result<mpsc::Receiver<WireMessage>> {
+        let conn = self
+            .endpoint
+            .connect(peer, ALPN)
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("{e}")))
+            .context(ReplayRpcSnafu)?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("{e}")))
+            .context(ReplayRpcSnafu)?;
+
+        let bytes = serde_json::to_vec(request).context(SerdeSnafu)?;
+        send.write_all(&(bytes.len() as u32).to_be_bytes())
+            .await
+            .map_err(|e| std::io::Error::other(e))
+            .context(IoSnafu)?;
+        send.write_all(&bytes)
+            .await
+            .map_err(|e| std::io::Error::other(e))
+            .context(IoSnafu)?;
+        send.finish()
+            .map_err(|e| std::io::Error::other(e))
+            .context(IoSnafu)?;
+
+        let (tx, rx) = mpsc::channel::<WireMessage>(64);
+        tokio::spawn(async move {
+            loop {
+                let mut len_buf = [0u8; 4];
+                if recv.read_exact(&mut len_buf).await.is_err() {
+                    break;
+                }
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                if recv.read_exact(&mut buf).await.is_err() {
+                    break;
+                }
+                let frame: ReplayResponseFrame = match serde_json::from_slice(&buf) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "bad replay frame");
+                        break;
+                    }
+                };
+                match frame.msg {
+                    Some(m) => {
+                        if tx.send(m).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break, // end-of-stream
+                }
+            }
+        });
+        Ok(rx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
