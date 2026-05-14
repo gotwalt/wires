@@ -1,0 +1,19 @@
+[package]
+name = "wires-host"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wires-host"
+path = "src/main.rs"
+
+[dependencies]
+wires-core  = { workspace = true }
+wires-store = { workspace = true }
+wires-net   = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+snafu = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
