@@ -21,3 +21,4 @@ toml          = "0.8"
 hex           = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand_core     = { workspace = true }
+chrono        = "0.4"
