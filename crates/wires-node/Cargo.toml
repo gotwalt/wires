@@ -9,6 +9,7 @@ wires-core   = { workspace = true }
 wires-crypto = { workspace = true }
 wires-store  = { workspace = true }
 wires-net    = { workspace = true }
+iroh         = { workspace = true }
 redb         = { workspace = true }
 tokio        = { workspace = true }
 serde        = { workspace = true }
