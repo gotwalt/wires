@@ -57,6 +57,7 @@ snafu = { version = "0.9", features = ["futures"] }
 
 # Dev
 proptest = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
 tempfile = "3"
 
 [profile.dev]
