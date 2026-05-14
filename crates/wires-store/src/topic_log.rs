@@ -154,6 +154,18 @@ impl TopicLog {
         }
         Ok(out)
     }
+
+    /// Total stored byte size across all entries in this topic's log.
+    pub fn bytes_stored(&self) -> Result<u64> {
+        let read = self.db.begin_read().context(BeginTxnSnafu)?;
+        let table = read.open_table(TOPIC_LOG).context(OpenTableSnafu)?;
+        let mut total: u64 = 0;
+        for entry in table.iter().context(StorageIoSnafu)? {
+            let (_k, v) = entry.context(StorageIoSnafu)?;
+            total = total.saturating_add(v.value().len() as u64);
+        }
+        Ok(total)
+    }
 }
 
 #[cfg(test)]
@@ -270,5 +282,20 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].timestamp, 1);
         assert_eq!(all[1].timestamp, 2);
+    }
+
+    #[test]
+    fn bytes_stored_sums_value_lengths() {
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(open_topic_log(tmp.path(), "abc").unwrap());
+        let log = TopicLog::new(db);
+        let sender = [7u8; 32];
+        let m0 = make(sender, 0, [0u8; 32]);
+        let m1 = make(sender, 1, m0.message_hash().unwrap());
+        log.append(&m0).unwrap();
+        log.append(&m1).unwrap();
+        let b = log.bytes_stored().unwrap();
+        let expected = serde_json::to_vec(&m0).unwrap().len() + serde_json::to_vec(&m1).unwrap().len();
+        assert_eq!(b as usize, expected);
     }
 }
