@@ -28,8 +28,10 @@ hex        = { workspace = true }
 axum   = "0.8"
 redb   = { workspace = true }
 serde  = { workspace = true }
-blake3 = { workspace = true }
+blake3        = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tempfile = { workspace = true }
+tokio     = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile  = { workspace = true }
+rand_core = { workspace = true }

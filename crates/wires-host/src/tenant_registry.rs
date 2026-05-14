@@ -208,6 +208,203 @@ impl TenantRegistry {
     }
 }
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use wires_net::tenant::{
+    register_signing_bytes, status_signing_bytes, topic_register_signing_bytes,
+    topic_unregister_signing_bytes, TenantErrorCode, TenantErrorResponse,
+    TenantRegisterRequest, TenantRegisterResponse, TenantResponse,
+    TenantStatusKind, TenantStatusRequest, TenantStatusResponse,
+    TopicRegisterRequest, TopicRegisterResponse,
+    TopicUnregisterRequest, TopicUnregisterResponse,
+};
+
+/// Tunable behaviour for `TenantHandlerImpl`.
+#[derive(Clone, Copy)]
+pub struct TenantHandlerConfig {
+    pub max_clock_skew_ms: i64,
+    pub nonce_ttl_ms: i64,
+    pub write_rate_limit_per_sec: u32,
+}
+
+impl Default for TenantHandlerConfig {
+    fn default() -> Self {
+        Self {
+            max_clock_skew_ms: 60_000,
+            nonce_ttl_ms: 120_000,
+            write_rate_limit_per_sec: 1_000,
+        }
+    }
+}
+
+pub struct TenantHandlerImpl {
+    pub registry: Arc<TenantRegistry>,
+    pub host_endpoint_id: [u8; 32],
+    pub config: TenantHandlerConfig,
+    pub now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
+    pub on_topic_registered: Arc<dyn Fn([u8; 32], [u8; 32]) + Send + Sync>,
+    pub on_topic_unregistered: Arc<dyn Fn([u8; 32], [u8; 32]) + Send + Sync>,
+}
+
+impl TenantHandlerImpl {
+    fn caps_topic_id_for(root_pubkey: &[u8; 32]) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(b"wires.caps.v1");
+        h.update(root_pubkey);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_bytes());
+        out
+    }
+
+    fn err(code: TenantErrorCode, message: &str) -> TenantResponse {
+        TenantResponse::Error(TenantErrorResponse {
+            code,
+            message: message.to_string(),
+        })
+    }
+
+    fn check_common(
+        &self,
+        root_pubkey: &[u8; 32],
+        timestamp: i64,
+        nonce: &[u8; 16],
+        signature: &[u8; 64],
+        signing_bytes: &[u8],
+    ) -> std::result::Result<(), TenantResponse> {
+        let now = (self.now_ms)();
+        if (now - timestamp).abs() > self.config.max_clock_skew_ms {
+            return Err(Self::err(TenantErrorCode::StaleTimestamp, "timestamp out of range"));
+        }
+        let vk = match VerifyingKey::from_bytes(root_pubkey) {
+            Ok(k) => k,
+            Err(_) => return Err(Self::err(TenantErrorCode::BadSignature, "bad pubkey")),
+        };
+        let sig = Signature::from_bytes(signature);
+        if vk.verify(signing_bytes, &sig).is_err() {
+            return Err(Self::err(TenantErrorCode::BadSignature, "signature failed"));
+        }
+        match self.registry.nonce_seen(root_pubkey, nonce, now, self.config.nonce_ttl_ms) {
+            Ok(true) => Err(Self::err(TenantErrorCode::ReplayedNonce, "nonce already seen")),
+            Ok(false) => Ok(()),
+            Err(_) => Err(Self::err(TenantErrorCode::Internal, "nonce store error")),
+        }
+    }
+}
+
+impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
+    fn handle_register(&self, req: TenantRegisterRequest) -> TenantResponse {
+        let signing_bytes = register_signing_bytes(
+            &req.root_pubkey, req.timestamp, &req.nonce, &self.host_endpoint_id,
+        );
+        if let Err(e) = self.check_common(
+            &req.root_pubkey, req.timestamp, &req.nonce, &req.signature, &signing_bytes,
+        ) { return e; }
+
+        let now = (self.now_ms)();
+        let rec = TenantRecord {
+            registered_at: now,
+            status: TenantStatus::Active,
+            retention_budget_bytes: DEFAULT_RETENTION_BUDGET_BYTES,
+        };
+        if self.registry.insert_if_absent(&req.root_pubkey, rec).is_err() {
+            return Self::err(TenantErrorCode::Internal, "tenant table write failed");
+        }
+
+        let caps_topic_id = Self::caps_topic_id_for(&req.root_pubkey);
+        if matches!(
+            self.registry.register_topic(&req.root_pubkey, &caps_topic_id),
+            Ok(TopicRegisterOutcome::Inserted | TopicRegisterOutcome::AlreadyOwned),
+        ) {
+            (self.on_topic_registered)(req.root_pubkey, caps_topic_id);
+        }
+
+        TenantResponse::Register(TenantRegisterResponse {
+            ok: true,
+            host_endpoint_id: hex::encode(self.host_endpoint_id),
+            server_time: now,
+            caps_topic_id,
+        })
+    }
+
+    fn handle_topic_register(&self, req: TopicRegisterRequest) -> TenantResponse {
+        let signing_bytes = topic_register_signing_bytes(
+            &req.root_pubkey, &req.topic_id, req.timestamp, &req.nonce, &self.host_endpoint_id,
+        );
+        if let Err(e) = self.check_common(
+            &req.root_pubkey, req.timestamp, &req.nonce, &req.signature, &signing_bytes,
+        ) { return e; }
+
+        match self.registry.get(&req.root_pubkey) {
+            Ok(Some(rec)) if rec.status == TenantStatus::Active => {}
+            Ok(Some(_)) => return Self::err(TenantErrorCode::TenantSuspended, "tenant suspended"),
+            Ok(None) => return Self::err(TenantErrorCode::TenantNotFound, "register tenant first"),
+            Err(_) => return Self::err(TenantErrorCode::Internal, "tenant lookup failed"),
+        }
+
+        match self.registry.register_topic(&req.root_pubkey, &req.topic_id) {
+            Ok(TopicRegisterOutcome::Inserted) | Ok(TopicRegisterOutcome::AlreadyOwned) => {
+                (self.on_topic_registered)(req.root_pubkey, req.topic_id);
+                TenantResponse::TopicRegister(TopicRegisterResponse {
+                    ok: true,
+                    topic_id: req.topic_id,
+                })
+            }
+            Ok(TopicRegisterOutcome::Conflict { .. }) => {
+                Self::err(TenantErrorCode::TopicAlreadyRegistered, "topic owned by another tenant")
+            }
+            Err(_) => Self::err(TenantErrorCode::Internal, "topic register write failed"),
+        }
+    }
+
+    fn handle_topic_unregister(&self, req: TopicUnregisterRequest) -> TenantResponse {
+        let signing_bytes = topic_unregister_signing_bytes(
+            &req.root_pubkey, &req.topic_id, req.timestamp, &req.nonce, &self.host_endpoint_id,
+        );
+        if let Err(e) = self.check_common(
+            &req.root_pubkey, req.timestamp, &req.nonce, &req.signature, &signing_bytes,
+        ) { return e; }
+
+        match self.registry.unregister_topic(&req.root_pubkey, &req.topic_id) {
+            Ok(true) => {
+                (self.on_topic_unregistered)(req.root_pubkey, req.topic_id);
+                TenantResponse::TopicUnregister(TopicUnregisterResponse {
+                    ok: true, topic_id: req.topic_id,
+                })
+            }
+            Ok(false) => TenantResponse::TopicUnregister(TopicUnregisterResponse {
+                ok: false, topic_id: req.topic_id,
+            }),
+            Err(_) => Self::err(TenantErrorCode::Internal, "topic unregister failed"),
+        }
+    }
+
+    fn handle_status(&self, req: TenantStatusRequest) -> TenantResponse {
+        let signing_bytes = status_signing_bytes(
+            &req.root_pubkey, req.timestamp, &req.nonce, &self.host_endpoint_id,
+        );
+        if let Err(e) = self.check_common(
+            &req.root_pubkey, req.timestamp, &req.nonce, &req.signature, &signing_bytes,
+        ) { return e; }
+
+        let rec = match self.registry.get(&req.root_pubkey) {
+            Ok(Some(rec)) => rec,
+            _ => return Self::err(TenantErrorCode::TenantNotFound, "no such tenant"),
+        };
+
+        TenantResponse::Status(TenantStatusResponse {
+            registered_at: rec.registered_at,
+            topic_count: 0,                 // populated in a later task once routing tracks this
+            bytes_stored: 0,
+            retention_budget_bytes: rec.retention_budget_bytes,
+            oldest_retained_at: 0,
+            write_rate_limit_per_sec: self.config.write_rate_limit_per_sec,
+            status: match rec.status {
+                TenantStatus::Active => TenantStatusKind::Active,
+                TenantStatus::Suspended => TenantStatusKind::Suspended,
+            },
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +497,56 @@ mod tests {
         assert!(!reg.nonce_seen(&root, &nonce, now, ttl_ms).unwrap());
         // Re-use after TTL elapses should be allowed again.
         assert!(!reg.nonce_seen(&root, &nonce, now + ttl_ms + 1, ttl_ms).unwrap());
+    }
+
+    #[test]
+    fn handle_register_signs_and_records_tenant() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand_core::OsRng;
+        use std::sync::Arc;
+        use wires_net::tenant::{TenantHandler, TenantRegisterRequest, TenantResponse};
+
+        let tmp = TempDir::new().unwrap();
+        let reg = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let root_pubkey = signing_key.verifying_key().to_bytes();
+        let host_endpoint_id = [42u8; 32];
+        let now_ms = 1_000_000i64;
+
+        let handler = TenantHandlerImpl {
+            registry: Arc::clone(&reg),
+            host_endpoint_id,
+            config: TenantHandlerConfig::default(),
+            now_ms: Arc::new(move || now_ms),
+            on_topic_registered: Arc::new(|_root, _topic| {}),
+            on_topic_unregistered: Arc::new(|_root, _topic| {}),
+        };
+
+        let nonce = [9u8; 16];
+        let bytes = wires_net::tenant::register_signing_bytes(
+            &root_pubkey, now_ms, &nonce, &host_endpoint_id,
+        );
+        let sig = signing_key.sign(&bytes).to_bytes();
+
+        let req = TenantRegisterRequest {
+            version: 1,
+            root_pubkey,
+            timestamp: now_ms,
+            nonce,
+            signature: sig,
+        };
+        let resp = handler.handle_register(req);
+        match resp {
+            TenantResponse::Register(r) => {
+                assert!(r.ok);
+                assert_eq!(r.host_endpoint_id, hex::encode(host_endpoint_id));
+            }
+            other => panic!("expected Register response, got {:?}", other),
+        }
+
+        // Tenant row now exists.
+        let rec = reg.get(&root_pubkey).unwrap().unwrap();
+        assert_eq!(rec.status, TenantStatus::Active);
     }
 }
