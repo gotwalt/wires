@@ -16,3 +16,4 @@ snafu = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+rand_core = { workspace = true }
