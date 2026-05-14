@@ -8,11 +8,11 @@
 
 ## 1. Mental model
 
-In the substrate spec, `wires-host` is a self-hosted appliance: an operator runs it on their NAS or VPS, hands its `EndpointId` to their iOS app via a QR code, and that one host serves that one user's world. That model is preserved.
-
-This spec adds a second deployment mode: **hosted service**. The same `wires-host` binary, with the same blind-host contract, runs as a single process that may serve **many** users' worlds. A fresh iOS app discovers the service's `EndpointId` via an HTTPS endpoint, proves possession of a freshly minted root key by signing a registration challenge, and the host commits to serving that root pubkey's `__caps` topic plus any topics the root later registers.
+The substrate spec describes a self-hosted single-tenant `wires-host`. This spec replaces that operational model with a uniform, multi-tenant one: every `wires-host` process is structurally capable of serving many tenants, and every iOS app onboards through the same flow — HTTPS service discovery to find a host `EndpointId`, then a signed tenant-registration RPC over a new iroh ALPN. Self-hosting is preserved by virtue of being trivial (run `wires-host`, run a discovery URL pointing at it, point your iOS app at that URL); it is not a separate code path.
 
 Nothing in the wire format changes. The host's blindness contract is unchanged: it sees `topic_id`, `epoch`, `kind`, `recipient` (for `SealedTo`), `sender`, `cap_id`, `seq`, `timestamp`, and ciphertext length, and the cleartext content of `Public` messages on `__caps`. It learns one additional metadata fact per tenant: the tenant's root pubkey, plus the topic_ids that root has registered for service. The root pubkey is already cleartext in every `__cap.grant` envelope's `sender` field, so this is not new leakage — only an explicit binding the host already could have inferred from traffic.
+
+The per-tenant log is **bounded**: each tenant has a fixed retention budget, and the oldest messages are evicted to make room for new writes. This replaces v1's "unbounded retention" non-goal from the substrate spec.
 
 **Non-goals for this spec:**
 - Topic→host sharding (a single host process serves all registered tenants and topics; fleet sharding comes later).
@@ -49,11 +49,11 @@ New code lives in the existing workspace; no new crate boundaries.
 |---|---|
 | `wires-core` | No changes. Reserved message types are unchanged. |
 | `wires-crypto` | No changes. |
-| `wires-store` | No changes. (The `TopicLogs` struct is reused per-tenant.) |
-| `wires-net` | New `tenant` module: `TenantProtocol` (server-side ALPN handler), `TenantClient` (client-side dialer), request/response types. New invite-token format `v2`, with v1-compat decode. |
+| `wires-store` | Adds `TopicLog::evict_oldest_until(target_bytes)` and `TopicLog::bytes_stored()` for the per-tenant rolling-log retention behavior (§5). `TopicLogs` is otherwise reused per-tenant. |
+| `wires-net` | New `tenant` module: `TenantProtocol` (server-side ALPN handler), `TenantClient` (client-side dialer), request/response types. `InviteToken` replaced outright with the new shape (§6) — only one version is valid, no compat shim. |
 | `wires-node` | Join flow gains an iterating peer-hint loop that consumes `InviteToken::peer_hints` in order and optionally falls back to `service_discovery_url` (§6). Existing publish/subscribe surface is unchanged. |
 | `wires-host` | New `tenant_registry` module: tenant table, topic→tenant index, per-tenant storage. New `http_discovery` module: tiny axum service. Main rewritten to wire all this together and to remove `--topic` flags (topics are registered dynamically now). |
-| `wires-cli` | Updated to decode invite token v2; otherwise unchanged. |
+| `wires-cli` | Picks up the new `InviteToken` via `wires-net`; no other changes. |
 | iOS `wires-uniffi` | New FFI: `register_with_hosted_service`, `register_topic`. New `HostedServiceClient` type. |
 
 No new external dependencies except `axum` (or `hyper`+`tower`) in `wires-host` for the HTTPS surface. We pick the latest stable `axum` (currently 0.8.x at the time of writing).
@@ -108,7 +108,7 @@ Server behavior:
 2. Verify `|server_time - timestamp| <= 60_000` ms.
 3. Verify `(root_pubkey, nonce)` not in the recent nonce table (TTL ≥ 120s). Insert.
 4. If tenant already exists: re-derive `__caps_topic_id`, ensure host is subscribed, return `ok: true` (idempotent re-register).
-5. Otherwise: insert `Tenant { root_pubkey, registered_at: server_time, status: Active, quota: default_quota }` into `tenants.redb`. Derive `__caps_topic_id = BLAKE3("wires.caps.v1" || root_pubkey)`. Insert `(__caps_topic_id → root_pubkey)` into `topic_index.redb`. Spawn the gossip subscription for `__caps_topic_id`. Return `ok: true`.
+5. Otherwise: insert `Tenant { root_pubkey, registered_at: server_time, status: Active, retention_budget_bytes: default_retention_budget }` into `tenants.redb`. Derive `__caps_topic_id = BLAKE3("wires.caps.v1" || root_pubkey)`. Insert `(__caps_topic_id → root_pubkey)` into `topic_index.redb`. Spawn the gossip subscription for `__caps_topic_id`. Return `ok: true`.
 
 ```rust
 pub struct TenantRegisterResponse {
@@ -167,11 +167,11 @@ pub struct TenantStatusRequest {
 pub struct TenantStatusResponse {
     pub registered_at: i64,
     pub topic_count: u32,
-    pub message_count_24h: u64,
-    pub bytes_24h: u64,
-    pub quota_messages_per_hour: u32,
-    pub quota_bytes_per_hour: u64,
-    pub status: TenantStatusKind,    // Active | Suspended | RateLimited
+    pub bytes_stored: u64,           // current total ciphertext bytes across all topics
+    pub retention_budget_bytes: u64, // configured ceiling; ingestion evicts oldest past this
+    pub oldest_retained_at: i64,     // unix millis of the oldest retained message (informational)
+    pub write_rate_limit_per_sec: u32,
+    pub status: TenantStatusKind,    // Active | Suspended
 }
 ```
 
@@ -190,7 +190,6 @@ pub enum TenantErrorCode {
     TenantNotFound,
     TenantSuspended,
     TopicAlreadyRegistered,
-    QuotaExceeded,
     RegistrationRateLimited,
     Internal,
 }
@@ -228,10 +227,11 @@ The existing `wires-host/src/main.rs` accepts envelopes from gossip and appends 
 
 1. Receive envelope, parse `WireMessage`.
 2. Look up `root_pubkey = topic_index[envelope.topic_id]`. Absent → drop (with rate-limited tracing).
-3. Look up `tenant = tenants[root_pubkey]`. `Suspended` → drop. Already `RateLimited` for this hour → drop.
-4. Run `verify_envelope(&msg)` — unchanged signature check.
-5. Increment per-tenant and per-(tenant, sender) counters, check quotas. Over quota → drop and mark tenant `RateLimited` for the remainder of the rolling hour.
+3. Look up `tenant = tenants[root_pubkey]`. `Suspended` → drop.
+4. Check write-rate ceiling for this tenant. Over → drop (with a per-tenant warning counter so operators can see who's being throttled).
+5. Run `verify_envelope(&msg)` — unchanged signature check.
 6. Append to the per-tenant per-topic log.
+7. If `tenant.bytes_stored > retention_budget`, evict oldest messages globally within the tenant until back under budget.
 
 This is a thin layer over the existing flow — about 50 lines of additional routing logic plus the tenant_registry module.
 
@@ -246,25 +246,26 @@ The existing `/wires/replay/0` ALPN gains tenant-awareness:
 
 No ACL checks on replay beyond the existing "host serves anyone who asks" model — the receiver still verifies caps and decrypts on its end. Adding cap-level enforcement at the host would require breaking blindness; we don't.
 
-### Quotas (v1, single tier)
+### Retention (rolling log per tenant)
 
-Hardcoded defaults:
-- 50 000 messages/hour per tenant.
-- 100 MiB/hour per tenant.
-- 5 000 messages/hour per (tenant, sender) pair.
+Each tenant has a fixed **retention budget** measured in bytes. v1 default: 1 GiB per tenant, hardcoded. When a write would push a tenant's total stored ciphertext past the budget, the host evicts the **oldest entries (lowest `seq` per publisher chain, across all topics in the tenant)** until the total is back under the budget. Writes themselves always succeed (modulo signature verification, tenant status, and the write-rate ceiling below) — the log is a ring, not a gate.
 
-Stored in-memory with a 1-hour rolling window (simple bucket + epoch). Persisted snapshots every 5 minutes so quotas survive a process restart. Counters reset to zero after `Suspended` → `Active` transitions (manual admin action, no v1 UI).
+The eviction unit is the message. Eviction order is global within a tenant, by ingestion timestamp on the host (which is monotonic per host process). This is simpler than per-topic round-robin and matches "you get N bytes of history, period."
+
+**Consequence for receivers.** An agent doing a cold-start replay receives only what the host still retains. If its high-water mark is older than the host's oldest retained `seq` for some `(topic, sender)` pair, the replay returns the surviving suffix and the agent records a gap. The substrate spec's hash chain detects tampering within the surviving suffix; it does not let receivers reconstruct the lost prefix. This is acceptable for a SaaS retention bound and is the same property a future `__topic.snapshot` compaction would have.
+
+**Write-rate ceiling (anti-CPU-DoS, not anti-storage).** A tenant signing valid envelopes faster than the host can persist them would burn CPU even if storage is bounded. A coarse rate limiter caps write rate at 1 000 envelopes/sec per tenant; excess envelopes are dropped at the routing step (§ below). This is a CPU/network protection, not a storage policy. v1 hardcodes the limit; later specs make it tier-configurable.
 
 ---
 
-## 6. Invite token v2
+## 6. Invite token
 
-The current `InviteToken` (in `wires-net/src/invite.rs`) carries a single peer hint. v2 carries multiple.
+The existing `InviteToken` in `wires-net/src/invite.rs` is replaced outright with the structure below. There is no shipped consumer of the old format, so no compatibility shim is needed. `InviteToken::decode` accepts only `version: 1` (this format); anything else is an error.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteToken {
-    pub version: u8,                       // 2
+    pub version: u8,                       // 1 (only valid value)
     pub cap: Capability,
     pub peer_hints: Vec<PeerHint>,         // try in order
     pub service_discovery_url: Option<String>,
@@ -279,13 +280,6 @@ pub struct PeerHint {
     pub relay: Option<String>,
 }
 ```
-
-`InviteToken::decode` first parses the JSON, inspects `version`:
-- `1`: lift the single `peer_node_id`/`peer_addrs`/`peer_relay` into a one-element `peer_hints` vec; set `service_discovery_url: None`.
-- `2`: parse directly.
-- other: error.
-
-`InviteToken::encode` always writes v2.
 
 The CLI agent's join flow (in `wires-node`):
 1. Iterate `peer_hints`. For each, try `endpoint.connect(node_id).await`. On success, run the existing bootstrap logic (subscribe to `__caps`, replay, etc.).
@@ -318,31 +312,22 @@ GET /v1/bootstrap
 
 In this slice, the response always contains one entry: this host's own `EndpointId`. Sub-project B (sharding) will return multiple entries with sharding hints. The iOS app picks the first entry and uses it.
 
-For self-hosted operators, this URL is optional — the iOS app's existing `HostPairToken` QR flow stays valid and bypasses HTTPS discovery entirely. The two modes are selected at first-launch ("hosted service" vs "self-hosted") and recorded on the iOS-side `Household` record.
+A self-hosting operator runs their own discovery URL (a static HTTPS endpoint returning their `wires-host`'s `EndpointId`) and points their iOS-app build at it. There is no separate "self-hosted pairing mode" — the same code path is used either way.
 
 ---
 
 ## 8. iOS app changes
 
-The iOS spec already implements `Household` and the QR-scan `HostPairToken` flow. This spec adds a hosted-service pairing mode alongside it.
+The iOS companion is on hold (see memory note), and its spec will be revisited when this work lands. This section describes the iOS-side surface that must exist when iOS is revived — the QR-scan `HostPairToken` flow from the original iOS spec is dropped in favor of the single discovery-and-register path below.
 
-### 8.1 First-launch wizard changes
+### 8.1 First-launch wizard
 
-A new step inserted before "Pair with host":
+Pairing has a single path. The QR-scan `HostPairToken` flow from the iOS companion spec is removed; the iOS app finds its host via service discovery.
 
-> **Where is your wires backend?**
-> ◦ Use the hosted Wires service (recommended)
-> ◦ I'm running my own wires-host
-
-"Hosted service" path:
-1. iOS app fetches `https://discovery.wires.example/v1/bootstrap` (URL is build-time configurable; default points at the public hosted service).
+1. iOS app fetches `https://discovery.wires.example/v1/bootstrap` (URL is build-time configurable; for a self-hosted operator, they configure a build pointing at their own discovery URL).
 2. Picks `endpoints[0]`. Constructs a `HostInfo { hostNodeIdHex, hostRelayURL, hostDirectAddrs }` from it.
-3. Calls into Rust: `WiresApp.bootstrap(agentIdentity, rootSigner)` then `WiresApp.registerWithHostedService(hostInfo, discoveryUrl)`.
-   - This dials the host on `/wires/tenant/0`, sends `TenantRegisterRequest` signed by the root key (biometric prompt to access the Secure Enclave).
-   - On success, populates `Household.hostNodeIdHex`, `Household.discoveryUrl`, `Household.mode = .hostedService`.
+3. Calls into Rust: `WiresApp.bootstrap(agentIdentity, rootSigner)` then `WiresApp.registerWithHostedService(hostInfo, discoveryUrl)`. This dials the host on `/wires/tenant/0`, sends `TenantRegisterRequest` signed by the root key (biometric prompt to access the Secure Enclave). On success, populates `Household.hostNodeIdHex` and `Household.discoveryUrl`.
 4. Continues with the existing "mint iOS agent self-cap" flow.
-
-"Self-hosted" path: existing flow (QR scan from `wires-host show-pair-qr`).
 
 ### 8.2 FFI additions
 
@@ -353,7 +338,7 @@ impl WiresApp {
     pub async fn register_with_hosted_service(
         &self,
         host: HostInfo,
-        discovery_url: Option<String>,
+        discovery_url: String,
     ) -> Result<(), WiresError> { ... }
 
     pub async fn register_topic(
@@ -371,23 +356,23 @@ impl WiresApp {
 @Model
 final class Household {
     // ...existing fields...
-    var mode: HouseholdMode               // .selfHosted | .hostedService
-    var discoveryUrl: String?             // nil for self-hosted
+    var discoveryUrl: String                 // always set; selected at first launch
 }
 ```
 
-Migration for existing data: any pre-existing `Household` records (none in production yet) get `mode = .selfHosted`, `discoveryUrl = nil`.
+There is no on-disk migration concern: the iOS companion is on hold pending this work (see memory note), so no production `Household` records exist.
 
 ---
 
-## 9. Backward compatibility
+## 9. Self-hosting
 
-The self-hosted single-tenant deployment continues to work, with one operational change: `wires-host` no longer takes `--topic <hex>` flags. Topics must now be registered via the tenant control protocol. To preserve the self-hosted UX:
+Self-hosting is supported but does not get a separate pairing flow. A self-hosting operator:
 
-- `wires-host show-pair-qr` is unchanged in payload: the QR carries `host_node_id`, `host_addrs`, `host_relay` exactly as the existing iOS spec defines.
-- The iOS app, after scanning, runs the same `register_with_hosted_service` flow against the scanned `EndpointId`. The host has no special-case code for self-hosted vs. hosted; both paths funnel through `TenantProtocol`. The only difference between the two pairing modes on the iOS side is where the host endpoint hints came from (HTTPS discovery vs. QR scan).
+1. Runs `wires-host` on their own infrastructure.
+2. Runs an HTTPS service-discovery endpoint that returns their host's `EndpointId`. This can be as simple as a static file served by any HTTPS server, or a `--serve-discovery` flag on `wires-host` itself (out of scope for this spec; the host process exposes one in §7 by default, which already covers single-operator setups).
+3. Builds the iOS app with that discovery URL baked in (or enters it in a settings screen — design choice deferred to the iOS-revival spec).
 
-This means `wires-host` is now always multi-tenant — even in the self-hosted single-user case, the user's root pubkey is one tenant on a host that *could* hold many. The operational footprint difference between self-hosted and hosted is purely deployment (where the binary runs, who pays for the box, what discovery URL the iOS app uses).
+There is no `--topic <hex>` flag on `wires-host` and no `show-pair-qr` subcommand. All topics arrive via the tenant control protocol. All onboarding is HTTPS discovery + tenant register. The hosted-vs-self-hosted distinction is purely "whose discovery URL the iOS app points at."
 
 ---
 
@@ -396,7 +381,7 @@ This means `wires-host` is now always multi-tenant — even in the self-hosted s
 Snafu pattern per `CLAUDE.md`. New error variants live in:
 
 - `wires-net::error::NetError`: `TenantRegisterFailed { source, location }`, `TopicRegisterFailed { source, location }`, `TenantStreamClosed { location }`, `TenantBadResponse { source, location }`. Each with `Location`, message ending in `, at {location}`.
-- `wires-host::error::HostError`: `TenantTableOpen { source, location }`, `TopicIndexOpen { source, location }`, `NonceTableOpen { source, location }`, `TenantSignatureInvalid { location }`, `TenantSuspended { root_hex, location }`, `QuotaExceeded { root_hex, location }`.
+- `wires-host::error::HostError`: `TenantTableOpen { source, location }`, `TopicIndexOpen { source, location }`, `NonceTableOpen { source, location }`, `TenantSignatureInvalid { location }`, `TenantSuspended { root_hex, location }`, `RetentionEvictionFailed { source, location }`.
 - iOS `wires-uniffi::error::WiresError`: `RegisterHostedService { source, location }`, `RegisterTopic { source, location }`, `DiscoveryFetchFailed { source, location }`.
 
 ---
@@ -407,21 +392,22 @@ Following the substrate spec's testing strategy: real iroh transports (in-memory
 
 ### Unit
 - `wires-net::tenant`: signature round-trip for each request type, replay-nonce rejection, response decode, malformed-frame handling.
-- `wires-host::tenant_registry`: tenant create/load roundtrip, idempotent re-register, topic register idempotent, topic→tenant lookup, quota bucket logic, persistence across restart.
+- `wires-host::tenant_registry`: tenant create/load roundtrip, idempotent re-register, topic register idempotent, topic→tenant lookup, write-rate ceiling, retention eviction (writes beyond budget cause oldest to disappear), persistence across restart.
+- `wires-store`: `TopicLog::evict_oldest_until(target_bytes)` correctness — oldest seq disappears first, ordering across multiple senders, no corruption of hash chain on surviving suffix.
 
 ### Integration (`crates/wires-host/tests/` or `crates/wires-node/tests/`)
 - **Single tenant happy path**: spin up a host, dial via `TenantClient`, register tenant, register topic, publish on that topic from a separate agent, confirm host appends to the right per-tenant log.
 - **Two tenants isolated**: same host, two iOS-stand-ins each register, each registers their own topic, each publishes. Dump `data_dir/tenants/<a>/` and `<b>/` and verify no cross-contamination.
-- **Quota exceeded**: agent publishes 50 001 messages in an hour, 50 001st is dropped, `tenant_status` reflects `RateLimited`.
+- **Retention eviction**: set retention budget to a small value (e.g. 1 MiB), publish enough messages to overflow, verify total stored stays within budget and oldest messages are dropped first. Replay from `hwm: {}` returns only the surviving suffix.
+- **Write-rate ceiling**: publish above the per-tenant ceiling, verify the excess is dropped without corrupting log state.
 - **Bad signature rejection**: `TenantRegisterRequest` with wrong signature → `Error(BadSignature)`.
 - **Replay rejection**: same nonce within TTL → `Error(ReplayedNonce)`.
 - **Unknown topic dropped**: publish on a topic the tenant never registered, confirm host drops and does not panic.
-- **Self-hosted compat**: `wires-host show-pair-qr` → iOS scans → register flow succeeds → invite token v2 round-trip end-to-end.
 
 ### Acceptance (`crates/wires-host/tests/acceptance.rs`, marked `#[ignore]`)
 1. Two fresh `wires` CLI clients (representing two iOS apps' agent identities) on the same host process register two distinct tenants. Each registers `home.test`. Each publishes. Each can only read their own messages (host enforces topic→tenant routing; cross-tenant traffic is dropped at the host).
-2. A `wires-host` process is restarted with its data dir intact. Both tenants reconnect, no re-registration required (idempotent), historical messages still served via replay.
-3. Invite token v2 with multiple peer hints: agent tries the first hint (unreachable), falls back to the second (reachable), bootstraps successfully.
+2. A `wires-host` process is restarted with its data dir intact. Both tenants reconnect, no re-registration required (idempotent), retained messages still served via replay; previously-evicted messages do not reappear.
+3. Invite token with multiple peer hints: agent tries the first hint (unreachable), falls back to the second (reachable), bootstraps successfully.
 4. Service discovery: agent fetches `https://localhost:8443/v1/bootstrap` from the same `wires-host` process, parses the endpoint list, dials, registers.
 
 ---
@@ -430,14 +416,13 @@ Following the substrate spec's testing strategy: real iroh transports (in-memory
 
 For this spec to be considered done:
 
-1. `wires-host` runs without `--topic` flags. Topics are registered dynamically through `/wires/tenant/0`.
-2. A fresh iOS app can complete the full onboarding flow against a hosted `wires-host`: discovery fetch → tenant register → topic register → mint self-cap → publish a message → replay it.
+1. `wires-host` runs without `--topic` flags and without a `show-pair-qr` subcommand. Topics arrive only via `/wires/tenant/0`.
+2. A fresh iOS app can complete the full onboarding flow: discovery fetch → tenant register → topic register → mint self-cap → publish a message → replay it.
 3. Two iOS apps with distinct root pubkeys can coexist on the same host process with no cross-tenant content leakage (verified by inspecting `data_dir/tenants/`).
-4. Existing self-hosted users (using `wires-host show-pair-qr`) experience the same UX they would have under the substrate+iOS specs — just routed through the new tenant protocol under the hood.
-5. Invite token v2 is correctly decoded by `wires-cli`, with v1 round-trip preserved.
-6. Quotas fire as documented, surfaced via `tenant_status`.
-7. All new error variants follow the snafu/location convention from `CLAUDE.md`.
-8. Acceptance test suite (§11) passes.
+4. A tenant whose ingest exceeds its retention budget has its oldest messages dropped automatically; `tenant_status` shows `bytes_stored ≤ retention_budget_bytes` after settling, and `oldest_retained_at` advances forward.
+5. Invite token round-trips through `wires-cli` cleanly; decoding any token whose `version` field is not `1` returns an explicit error.
+6. All new error variants follow the snafu/location convention from `CLAUDE.md`.
+7. Acceptance test suite (§11) passes.
 
 ---
 
@@ -447,7 +432,7 @@ For this spec to be considered done:
 - **Cross-host replication.** Hot-standby hosts so a tenant survives a single host process death.
 - **iOS root-key custody and recovery.** iCloud Keychain sync, passphrase-wrapped backup, social recovery via Shamir, multi-device root.
 - **Operator backup/restore.** Snapshot pipeline for per-tenant redb files, point-in-time recovery, cross-region async replication.
-- **Billing and quota UI.** Per-tenant tier configuration, payment integration, admin dashboard.
+- **Billing and per-tenant retention tiers.** v1 hardcodes a single retention budget for all tenants. Tiering, payment integration, and admin dashboard come later.
 - **Tenant deletion and data export.** GDPR-shaped flows.
 - **Service-discovery hardening.** Multi-region discovery, signed discovery responses (today the response is bare HTTPS; signing it with a long-term service key is sub-project B territory).
 - **Migration tooling.** Moving a tenant from one host to another, key rotation, host EndpointId rotation.
