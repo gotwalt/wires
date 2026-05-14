@@ -6,7 +6,7 @@ use iroh::{Endpoint, EndpointId};
 use snafu::ResultExt;
 use wires_core::WireMessage;
 use wires_net::replay::{ReplayClient, ReplayProtocol, ReplayRequest, ALPN};
-use wires_net::GossipNode;
+use wires_net::{GossipHandle, GossipNode};
 
 use crate::error::{NetSnafu, Result};
 use crate::inbound::InboundCtx;
@@ -41,14 +41,16 @@ impl NetGlue {
     }
 
     /// Subscribe to `topic_id` and route every received `WireMessage` to
-    /// `node.handle_inbound`. Spawns a background task.
+    /// `node.handle_inbound`. Spawns a background task. Returns a
+    /// [`GossipHandle`] so the caller can broadcast its own messages on the
+    /// same topic.
     pub async fn subscribe_and_route(
         &self,
         node: Arc<Node>,
         topic_id: [u8; 32],
         bootstrap: Vec<EndpointId>,
-    ) -> Result<()> {
-        let (_handle, mut rx) = self
+    ) -> Result<GossipHandle> {
+        let (handle, mut rx) = self
             .gossip
             .join(topic_id, bootstrap)
             .await
@@ -68,7 +70,7 @@ impl NetGlue {
                 }
             }
         });
-        Ok(())
+        Ok(handle)
     }
 
     /// Pull missing history for `topic_id` from `peer` via the replay protocol.
