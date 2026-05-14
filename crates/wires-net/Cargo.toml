@@ -21,4 +21,6 @@ n0-future = "0.3"
 rand_core = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+tempfile      = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand_core     = { workspace = true }
