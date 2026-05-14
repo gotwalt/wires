@@ -33,6 +33,32 @@ pub enum CoreError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Capability signature invalid, at {location}"))]
+    BadCapSignature {
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Capability expired (issued={issued}, expires={expires:?}, now={now}), at {location}"))]
+    CapExpired {
+        issued: i64,
+        expires: Option<i64>,
+        now: i64,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Capability does not grant {right} on topic '{topic}', at {location}"))]
+    CapDenied {
+        right: String,
+        topic: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Invalid glob pattern '{pattern}', at {location}"))]
+    BadGlob {
+        pattern: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = CoreError> = core::result::Result<T, E>;
