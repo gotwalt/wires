@@ -166,6 +166,22 @@ impl TopicLog {
         }
         Ok(total)
     }
+
+    /// Remove the entry for `(sender, seq)`. Returns the byte size of the removed
+    /// value, or 0 if no entry existed. Does **not** touch the HWM table — eviction
+    /// is intentionally invisible to the chain-tracking layer (the chain still
+    /// reads correctly for the surviving suffix; the prefix is simply gone).
+    pub fn delete(&self, sender: &Pubkey, seq: u64) -> Result<u64> {
+        let key = log_key(sender, seq);
+        let write = self.db.begin_write().context(BeginTxnSnafu)?;
+        let removed_bytes = {
+            let mut table = write.open_table(TOPIC_LOG).context(OpenTableSnafu)?;
+            let prior = table.remove(&key[..]).context(StorageIoSnafu)?;
+            prior.map(|g| g.value().len() as u64).unwrap_or(0)
+        };
+        write.commit().context(CommitTxnSnafu)?;
+        Ok(removed_bytes)
+    }
 }
 
 #[cfg(test)]
@@ -297,5 +313,34 @@ mod tests {
         let b = log.bytes_stored().unwrap();
         let expected = serde_json::to_vec(&m0).unwrap().len() + serde_json::to_vec(&m1).unwrap().len();
         assert_eq!(b as usize, expected);
+    }
+
+    #[test]
+    fn delete_removes_entry_and_returns_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(open_topic_log(tmp.path(), "abc").unwrap());
+        let log = TopicLog::new(db);
+        let sender = [7u8; 32];
+        let m0 = make(sender, 0, [0u8; 32]);
+        let m1 = make(sender, 1, m0.message_hash().unwrap());
+        log.append(&m0).unwrap();
+        log.append(&m1).unwrap();
+        let m0_bytes = serde_json::to_vec(&m0).unwrap().len() as u64;
+
+        let removed = log.delete(&sender, 0).unwrap();
+        assert_eq!(removed, m0_bytes);
+
+        let got = log.read_after(&sender, None, 10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].seq, 1);
+    }
+
+    #[test]
+    fn delete_missing_returns_zero() {
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(open_topic_log(tmp.path(), "abc").unwrap());
+        let log = TopicLog::new(db);
+        let removed = log.delete(&[9u8; 32], 42).unwrap();
+        assert_eq!(removed, 0);
     }
 }
