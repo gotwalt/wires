@@ -11,7 +11,7 @@ use wires_core::WireMessage;
 use crate::error::{Result, StoreSnafu};
 use crate::per_tenant_logs::PerTenantLogs;
 use crate::retention::Retention;
-use crate::tenant_registry::{TenantRegistry, TenantRecord, TenantStatus};
+use crate::tenant_registry::{TenantRecord, TenantRegistry, TenantStatus};
 
 pub struct WriteRateLimiter {
     per_sec: u32,
@@ -20,7 +20,10 @@ pub struct WriteRateLimiter {
 
 impl WriteRateLimiter {
     pub fn new(per_sec: u32) -> Self {
-        Self { per_sec, buckets: RwLock::new(HashMap::new()) }
+        Self {
+            per_sec,
+            buckets: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Returns `true` if the request is within the per-tenant per-second cap.
@@ -31,7 +34,9 @@ impl WriteRateLimiter {
         if now.duration_since(entry.0).as_secs() >= 1 {
             *entry = (now, 0);
         }
-        if entry.1 >= self.per_sec { return false; }
+        if entry.1 >= self.per_sec {
+            return false;
+        }
         entry.1 += 1;
         true
     }
@@ -60,7 +65,12 @@ impl Router {
         retention: Arc<Retention>,
         rate: Arc<WriteRateLimiter>,
     ) -> Self {
-        Self { registry, logs, retention, rate }
+        Self {
+            registry,
+            logs,
+            retention,
+            rate,
+        }
     }
 
     pub fn route(&self, msg: &WireMessage) -> Result<RouteOutcome> {
@@ -86,9 +96,7 @@ impl Router {
         if !inserted {
             return Ok(RouteOutcome::DroppedDuplicate);
         }
-        let bytes = serde_json::to_vec(msg)
-            .map(|v| v.len() as u32)
-            .unwrap_or(0);
+        let bytes = serde_json::to_vec(msg).map(|v| v.len() as u32).unwrap_or(0);
         self.retention.on_append(
             &root_pubkey,
             &msg.topic_id,
@@ -104,9 +112,9 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tenant_registry::{TenantRecord, TenantStatus};
     use tempfile::TempDir;
     use wires_core::{MessageKind, WireMessage};
-    use crate::tenant_registry::{TenantRecord, TenantStatus};
 
     fn dummy_msg(topic: [u8; 32], sender: u8, seq: u64) -> WireMessage {
         WireMessage {
@@ -124,20 +132,22 @@ mod tests {
         }
     }
 
-    fn router_with_one_tenant(
-        tmp: &TempDir,
-        topic: [u8; 32],
-    ) -> (Router, [u8; 32]) {
+    fn router_with_one_tenant(tmp: &TempDir, topic: [u8; 32]) -> (Router, [u8; 32]) {
         let registry = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
         let logs = Arc::new(PerTenantLogs::new(tmp.path()));
         let retention = Arc::new(Retention::new(tmp.path(), Arc::clone(&logs)));
         let rate = Arc::new(WriteRateLimiter::new(1_000_000));
         let root = [3u8; 32];
-        registry.insert_if_absent(&root, TenantRecord {
-            registered_at: 0,
-            status: TenantStatus::Active,
-            retention_budget_bytes: u64::MAX,
-        }).unwrap();
+        registry
+            .insert_if_absent(
+                &root,
+                TenantRecord {
+                    registered_at: 0,
+                    status: TenantStatus::Active,
+                    retention_budget_bytes: u64::MAX,
+                },
+            )
+            .unwrap();
         registry.register_topic(&root, &topic).unwrap();
         (Router::new(registry, logs, retention, rate), root)
     }
@@ -174,17 +184,28 @@ mod tests {
         let retention = Arc::new(Retention::new(tmp.path(), Arc::clone(&logs)));
         let rate = Arc::new(WriteRateLimiter::new(1)); // 1/sec
         let root = [3u8; 32];
-        registry.insert_if_absent(&root, TenantRecord {
-            registered_at: 0,
-            status: TenantStatus::Active,
-            retention_budget_bytes: u64::MAX,
-        }).unwrap();
+        registry
+            .insert_if_absent(
+                &root,
+                TenantRecord {
+                    registered_at: 0,
+                    status: TenantStatus::Active,
+                    retention_budget_bytes: u64::MAX,
+                },
+            )
+            .unwrap();
         registry.register_topic(&root, &topic).unwrap();
         let router = Router::new(registry, logs, retention, rate);
 
         let msg0 = dummy_msg(topic, 7, 0);
         let msg1 = dummy_msg(topic, 7, 1);
-        assert!(matches!(router.route(&msg0).unwrap(), RouteOutcome::Appended));
-        assert!(matches!(router.route(&msg1).unwrap(), RouteOutcome::DroppedRateLimited));
+        assert!(matches!(
+            router.route(&msg0).unwrap(),
+            RouteOutcome::Appended
+        ));
+        assert!(matches!(
+            router.route(&msg1).unwrap(),
+            RouteOutcome::DroppedRateLimited
+        ));
     }
 }

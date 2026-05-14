@@ -32,7 +32,8 @@ impl ReplaySource for PerTenantReplaySource {
             Ok(None) => return Ok(vec![]),
             Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
         };
-        let log = self.logs
+        let log = self
+            .logs
             .get_or_open(&root, topic_id)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         log.read_after(sender, after_seq, limit)
@@ -48,10 +49,12 @@ impl ReplaySource for PerTenantReplaySource {
             Ok(None) => return Ok(vec![]),
             Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
         };
-        let log = self.logs
+        let log = self
+            .logs
             .get_or_open(&root, topic_id)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        let hwm = log.hwm()
+        let hwm = log
+            .hwm()
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         Ok(hwm.into_keys().collect())
     }

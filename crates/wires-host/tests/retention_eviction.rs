@@ -41,11 +41,16 @@ fn retention_eviction_drops_oldest_first() {
     let probe = mk_msg(topic, 7, 0, 1024);
     let probe_bytes = serde_json::to_vec(&probe).unwrap().len() as u64;
     let budget = probe_bytes * 3;
-    registry.insert_if_absent(&root, TenantRecord {
-        registered_at: 0,
-        status: TenantStatus::Active,
-        retention_budget_bytes: budget,
-    }).unwrap();
+    registry
+        .insert_if_absent(
+            &root,
+            TenantRecord {
+                registered_at: 0,
+                status: TenantStatus::Active,
+                retention_budget_bytes: budget,
+            },
+        )
+        .unwrap();
     registry.register_topic(&root, &topic).unwrap();
     let router = Router::new(registry, Arc::clone(&logs), Arc::clone(&retention), rate);
 
@@ -57,7 +62,11 @@ fn retention_eviction_drops_oldest_first() {
     assert!(retention.bytes_stored(&[9u8; 32]).unwrap() <= budget);
     let log = logs.get_or_open(&root, &topic).unwrap();
     let got = log.read_after(&[7u8; 32], None, 100).unwrap();
-    assert!(got.len() <= 3, "expected at most 3 messages surviving, got {}", got.len());
+    assert!(
+        got.len() <= 3,
+        "expected at most 3 messages surviving, got {}",
+        got.len()
+    );
     // The surviving messages should be the most recent ones.
     let highest_seq = got.iter().map(|m| m.seq).max().unwrap();
     assert_eq!(highest_seq, 5);

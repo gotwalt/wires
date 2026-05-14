@@ -5,13 +5,13 @@
 use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
-use iroh::{endpoint::presets, Endpoint, SecretKey};
+use iroh::{Endpoint, SecretKey, endpoint::presets};
 use rand_core::OsRng;
 use tempfile::TempDir;
 use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
 use wires_net::tenant::{
-    register_signing_bytes, TenantClient, TenantProtocol, TenantRegisterRequest, TenantRequest,
-    TenantResponse, ALPN as TENANT_ALPN,
+    ALPN as TENANT_ALPN, TenantClient, TenantProtocol, TenantRegisterRequest, TenantRequest,
+    TenantResponse, register_signing_bytes,
 };
 
 fn endpoint_id_bytes(ep: &Endpoint) -> [u8; 32] {
@@ -29,7 +29,8 @@ async fn tenant_register_round_trip() {
         .secret_key(host_secret)
         .alpns(vec![TENANT_ALPN.to_vec()])
         .bind()
-        .await.unwrap();
+        .await
+        .unwrap();
     let host_eid_bytes = endpoint_id_bytes(&host_ep);
 
     let handler = Arc::new(TenantHandlerImpl {
@@ -49,7 +50,8 @@ async fn tenant_register_round_trip() {
     let client_ep = Endpoint::builder(presets::N0)
         .secret_key(client_secret)
         .bind()
-        .await.unwrap();
+        .await
+        .unwrap();
     let client = TenantClient::new(client_ep);
 
     // Sign + send.

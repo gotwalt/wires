@@ -6,14 +6,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
-use iroh::{endpoint::presets, Endpoint, SecretKey};
+use iroh::{Endpoint, SecretKey, endpoint::presets};
 use rand_core::OsRng;
 use tempfile::TempDir;
 use wires_host::http_discovery::{self, DiscoveryEndpoint, DiscoveryResponse, DiscoveryState};
 use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
 use wires_net::tenant::{
-    register_signing_bytes, TenantClient, TenantProtocol, TenantRegisterRequest, TenantRequest,
-    TenantResponse, ALPN as TENANT_ALPN,
+    ALPN as TENANT_ALPN, TenantClient, TenantProtocol, TenantRegisterRequest, TenantRequest,
+    TenantResponse, register_signing_bytes,
 };
 
 fn endpoint_id_bytes(ep: &Endpoint) -> [u8; 32] {
@@ -31,7 +31,8 @@ async fn end_to_end_register_via_http_discovery() {
         .secret_key(host_secret)
         .alpns(vec![TENANT_ALPN.to_vec()])
         .bind()
-        .await.unwrap();
+        .await
+        .unwrap();
     let host_eid_bytes = endpoint_id_bytes(&host_ep);
 
     let handler = Arc::new(TenantHandlerImpl {
@@ -61,10 +62,14 @@ async fn end_to_end_register_via_http_discovery() {
     let app = http_discovery::router(discovery_state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
 
     // Client: fetch discovery, then register.
-    let resp = reqwest::get(format!("http://{addr}/v1/bootstrap")).await.unwrap();
+    let resp = reqwest::get(format!("http://{addr}/v1/bootstrap"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let payload: DiscoveryResponse = resp.json().await.unwrap();
     assert_eq!(payload.endpoints.len(), 1);
@@ -72,7 +77,11 @@ async fn end_to_end_register_via_http_discovery() {
     assert_eq!(target_endpoint_id_hex, hex::encode(host_eid_bytes));
 
     let client_secret = SecretKey::generate();
-    let client_ep = Endpoint::builder(presets::N0).secret_key(client_secret).bind().await.unwrap();
+    let client_ep = Endpoint::builder(presets::N0)
+        .secret_key(client_secret)
+        .bind()
+        .await
+        .unwrap();
     let client = TenantClient::new(client_ep);
 
     let signing_key = SigningKey::generate(&mut OsRng);

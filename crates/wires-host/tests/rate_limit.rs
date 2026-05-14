@@ -8,10 +8,10 @@ use tempfile::TempDir;
 use wires_core::{MessageKind, WireMessage};
 use wires_host::per_tenant_logs::PerTenantLogs;
 use wires_host::retention::Retention;
-use wires_host::routing::{Router, RouteOutcome, WriteRateLimiter};
+use wires_host::routing::{RouteOutcome, Router, WriteRateLimiter};
 use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
 use wires_net::tenant::{
-    register_signing_bytes, TenantErrorCode, TenantHandler, TenantRegisterRequest, TenantResponse,
+    TenantErrorCode, TenantHandler, TenantRegisterRequest, TenantResponse, register_signing_bytes,
 };
 
 #[test]

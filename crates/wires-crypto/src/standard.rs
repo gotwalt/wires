@@ -53,7 +53,13 @@ pub fn decrypt_standard(
     let nonce_bytes = standard_nonce(topic_id, sender, seq);
     let nonce = Nonce::from_slice(&nonce_bytes);
     cipher
-        .decrypt(nonce, Payload { msg: ciphertext, aad })
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .ok()
         .context(DecryptSnafu)
 }

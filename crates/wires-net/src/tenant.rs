@@ -246,7 +246,9 @@ impl<H: TenantHandler> std::fmt::Debug for TenantProtocol<H> {
 }
 
 impl<H: TenantHandler> TenantProtocol<H> {
-    pub fn new(handler: Arc<H>) -> Self { Self { handler } }
+    pub fn new(handler: Arc<H>) -> Self {
+        Self { handler }
+    }
 
     async fn handle_stream(
         &self,
@@ -261,7 +263,9 @@ impl<H: TenantHandler> TenantProtocol<H> {
             TenantRequest::Status(r) => self.handler.handle_status(r),
         };
         write_frame(&mut send, &resp).await?;
-        send.finish().map_err(std::io::Error::other).context(IoSnafu)?;
+        send.finish()
+            .map_err(std::io::Error::other)
+            .context(IoSnafu)?;
         Ok(())
     }
 }

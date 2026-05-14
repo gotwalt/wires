@@ -21,7 +21,7 @@ use bytes::Bytes;
 use iroh::{Endpoint, EndpointId};
 use iroh_gossip::{
     api::{Event, GossipSender},
-    net::{Gossip, GOSSIP_ALPN},
+    net::{GOSSIP_ALPN, Gossip},
     proto::TopicId,
 };
 use n0_future::StreamExt as _;
@@ -177,11 +177,7 @@ impl GossipNode {
     /// Broadcast `payload` into the topic identified by `handle`.
     ///
     /// Convenience wrapper around [`GossipHandle::broadcast`].
-    pub async fn publish(
-        &self,
-        handle: &GossipHandle,
-        payload: Vec<u8>,
-    ) -> Result<(), NetError> {
+    pub async fn publish(&self, handle: &GossipHandle, payload: Vec<u8>) -> Result<(), NetError> {
         handle.broadcast(payload).await
     }
 }

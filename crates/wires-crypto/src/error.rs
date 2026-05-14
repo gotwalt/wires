@@ -15,7 +15,9 @@ pub enum CryptoError {
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("AEAD decryption failed (tag mismatch or corrupted ciphertext), at {location}"))]
+    #[snafu(display(
+        "AEAD decryption failed (tag mismatch or corrupted ciphertext), at {location}"
+    ))]
     Decrypt {
         #[snafu(implicit)]
         location: Location,

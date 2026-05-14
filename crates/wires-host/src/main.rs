@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use iroh::{endpoint::presets, Endpoint, SecretKey};
+use iroh::{Endpoint, SecretKey, endpoint::presets};
 use tokio::sync::mpsc;
 use wires_core::WireMessage;
 use wires_host::http_discovery::{self, DiscoveryEndpoint, DiscoveryResponse, DiscoveryState};
@@ -15,12 +15,15 @@ use wires_host::replay_source::PerTenantReplaySource;
 use wires_host::retention::Retention;
 use wires_host::routing::{Router as MsgRouter, WriteRateLimiter};
 use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
-use wires_net::replay::{ReplayProtocol, ALPN as REPLAY_ALPN};
-use wires_net::tenant::{TenantProtocol, ALPN as TENANT_ALPN};
-use wires_net::{load_or_create_secret, GossipNode};
+use wires_net::replay::{ALPN as REPLAY_ALPN, ReplayProtocol};
+use wires_net::tenant::{ALPN as TENANT_ALPN, TenantProtocol};
+use wires_net::{GossipNode, load_or_create_secret};
 
 #[derive(Parser)]
-#[command(name = "wires-host", about = "Blind multi-tenant relay for the wires network")]
+#[command(
+    name = "wires-host",
+    about = "Blind multi-tenant relay for the wires network"
+)]
 struct Args {
     #[arg(long)]
     data_dir: PathBuf,
@@ -88,10 +91,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     while let Some(bytes) = rx.recv().await {
                         let msg: WireMessage = match serde_json::from_slice(&bytes) {
                             Ok(m) => m,
-                            Err(e) => { tracing::warn!(error = %e, "bad gossip frame"); continue; }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "bad gossip frame");
+                                continue;
+                            }
                         };
                         if wires_core::verify_envelope(&msg).is_err() {
-                            tracing::warn!("dropped unsigned/bad envelope at host"); continue;
+                            tracing::warn!("dropped unsigned/bad envelope at host");
+                            continue;
                         }
                         if let Err(e) = router_state.route(&msg) {
                             tracing::warn!(error = %e, "router error");
@@ -125,7 +132,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Register ALPNs --------------------------------------------------------
     let replay_protocol = ReplayProtocol::new(Arc::new(PerTenantReplaySource::new(
-        Arc::clone(&registry), Arc::clone(&logs),
+        Arc::clone(&registry),
+        Arc::clone(&logs),
     )));
     let _router = iroh::protocol::Router::builder(endpoint.clone())
         .accept(REPLAY_ALPN, replay_protocol)
@@ -133,7 +141,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .spawn();
 
     // HTTPS discovery -------------------------------------------------------
-    let public_url = args.public_url.unwrap_or_else(|| format!("http://{}", args.discovery_addr));
+    let public_url = args
+        .public_url
+        .unwrap_or_else(|| format!("http://{}", args.discovery_addr));
     let discovery_state = Arc::new(DiscoveryState {
         response: DiscoveryResponse {
             version: 1,

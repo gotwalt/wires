@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use snafu::ResultExt as _;
-use wires_store::{open_ingest_index, IngestEntry, IngestIndex};
+use wires_store::{IngestEntry, IngestIndex, open_ingest_index};
 
-use crate::error::{RetentionEvictionFailedSnafu, Result, StoreSnafu};
+use crate::error::{Result, RetentionEvictionFailedSnafu, StoreSnafu};
 use crate::per_tenant_logs::PerTenantLogs;
 
 pub struct Retention {
@@ -30,7 +30,9 @@ impl Retention {
     fn index_for(&self, root_pubkey: &[u8; 32]) -> Result<Arc<IngestIndex>> {
         {
             let map = self.indices.read().unwrap();
-            if let Some(idx) = map.get(root_pubkey) { return Ok(Arc::clone(idx)); }
+            if let Some(idx) = map.get(root_pubkey) {
+                return Ok(Arc::clone(idx));
+            }
         }
         let dir = self.root.join("tenants").join(hex::encode(root_pubkey));
         std::fs::create_dir_all(&dir).ok();
@@ -62,11 +64,13 @@ impl Retention {
             sender: *sender,
             seq,
             bytes,
-        }).context(StoreSnafu)?;
+        })
+        .context(StoreSnafu)?;
         let evicted = idx.evict_oldest_until(budget).context(StoreSnafu)?;
         for e in &evicted {
             let log = self.logs.get_or_open(root_pubkey, &e.topic_id)?;
-            log.delete(&e.sender, e.seq).context(RetentionEvictionFailedSnafu)?;
+            log.delete(&e.sender, e.seq)
+                .context(RetentionEvictionFailedSnafu)?;
         }
         Ok(evicted)
     }
@@ -120,8 +124,12 @@ mod tests {
         let b1 = serde_json::to_vec(&m1).unwrap().len() as u32;
         let b2 = serde_json::to_vec(&m2).unwrap().len() as u32;
 
-        retention.on_append(&root, &topic, &[7u8; 32], 0, b0, u64::MAX).unwrap();
-        retention.on_append(&root, &topic, &[7u8; 32], 1, b1, u64::MAX).unwrap();
+        retention
+            .on_append(&root, &topic, &[7u8; 32], 0, b0, u64::MAX)
+            .unwrap();
+        retention
+            .on_append(&root, &topic, &[7u8; 32], 1, b1, u64::MAX)
+            .unwrap();
         // Last append imposes a tight budget — should evict m0 and m1.
         let evicted = retention
             .on_append(&root, &topic, &[7u8; 32], 2, b2, b2 as u64)
