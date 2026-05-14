@@ -4441,6 +4441,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "hex",
  "proptest",
+ "rand_core 0.6.4",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -4456,7 +4457,7 @@ dependencies = [
  "chacha20poly1305",
  "ed25519-dalek 2.2.0",
  "proptest",
- "rand 0.10.1",
+ "rand_core 0.6.4",
  "serde",
  "serde_bytes",
  "snafu",
@@ -4482,8 +4483,12 @@ dependencies = [
 name = "wires-net"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "bytes",
  "iroh",
  "iroh-gossip",
+ "n0-future",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
  "snafu",
@@ -4517,7 +4522,9 @@ dependencies = [
 name = "wires-store"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek 2.2.0",
  "proptest",
+ "rand_core 0.6.4",
  "redb",
  "serde",
  "serde_json",
