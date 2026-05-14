@@ -71,8 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn subscriber dispatcher: when the handler tells us about a new
     // topic, join it.
-    let gossip_for_subscribe = gossip.clone_for_subscribe()
-        .expect("GossipNode::clone_for_subscribe required for dynamic topic joins");
+    let gossip_for_subscribe = gossip.clone_for_subscribe();
     {
         let router_state = Arc::clone(&router_state);
         tokio::spawn(async move {
