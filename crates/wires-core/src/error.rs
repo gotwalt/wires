@@ -59,6 +59,26 @@ pub enum CoreError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Content missing required field '{field}', at {location}"))]
+    ContentMissingField {
+        field: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Failed to parse content JSON, at {location}"))]
+    ParseContent {
+        #[snafu(source)]
+        source: serde_json::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Failed to encode content JSON, at {location}"))]
+    EncodeContent {
+        #[snafu(source)]
+        source: serde_json::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = CoreError> = core::result::Result<T, E>;
