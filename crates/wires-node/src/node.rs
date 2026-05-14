@@ -1,0 +1,260 @@
+//! The `Node` is the agent-facing runtime. Owns identity keys, local storage,
+//! and a broadcast channel for decrypted events. The networking (iroh endpoint,
+//! gossip, replay client) is wired in by Task 26's NetGlue.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use ed25519_dalek::SigningKey;
+use parking_lot::Mutex;
+use snafu::ResultExt;
+use tokio::sync::broadcast;
+use wires_core::{CanonicalContent, MessageKind, WireMessage};
+use wires_crypto::{X25519Public, X25519Secret};
+use wires_store::{open_caps, open_topic_keys, CapTable, EpochKey, EpochKeyStore};
+
+use crate::config::NodeConfig;
+use crate::error::{IoSnafu, NetSnafu, Result, StoreSnafu};
+use crate::inbound::{process, Inbound, InboundCtx};
+use crate::publish::{build_message, current_epoch_key, next_seq_and_prev_hash, KeyingMaterial, PublishParams};
+use crate::storage::TopicLogs;
+use wires_store::StoreError;
+
+pub struct Node {
+    pub config: NodeConfig,
+    pub ed_sk: SigningKey,
+    pub x_sk: X25519Secret,
+    pub x_pk: [u8; 32],
+    pub logs: Arc<TopicLogs>,
+    pub caps: Arc<CapTable>,
+    keys_by_topic: Mutex<HashMap<[u8; 32], Arc<EpochKeyStore>>>,
+    pub events_tx: broadcast::Sender<DecryptedEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecryptedEvent {
+    pub topic_id: [u8; 32],
+    pub msg: WireMessage,
+    pub content: Option<CanonicalContent>,
+}
+
+impl Node {
+    pub fn open(config: NodeConfig) -> Result<Self> {
+        std::fs::create_dir_all(&config.data_dir).context(IoSnafu)?;
+        let secret_path = config.data_dir.join("identity.ed25519");
+        let secret = wires_net::load_or_create_secret(&secret_path).context(NetSnafu)?;
+        let ed_sk = SigningKey::from_bytes(&secret);
+
+        let x_path = config.data_dir.join("identity.x25519");
+        let x_secret = wires_net::load_or_create_secret(&x_path).context(NetSnafu)?;
+        let x_sk = X25519Secret::from(x_secret);
+        let x_pk = X25519Public::from(&x_sk).to_bytes();
+
+        let logs = Arc::new(TopicLogs::new(&config.data_dir));
+        let caps_db = open_caps(&config.data_dir).context(StoreSnafu)?;
+        let caps = Arc::new(CapTable::new(Arc::new(caps_db)));
+        let (events_tx, _) = broadcast::channel::<DecryptedEvent>(1024);
+
+        Ok(Self {
+            config,
+            ed_sk,
+            x_sk,
+            x_pk,
+            logs,
+            caps,
+            keys_by_topic: Mutex::new(HashMap::new()),
+            events_tx,
+        })
+    }
+
+    pub fn epoch_keys_for(&self, topic_id: &[u8; 32]) -> Result<Arc<EpochKeyStore>> {
+        let mut m = self.keys_by_topic.lock();
+        if let Some(e) = m.get(topic_id) {
+            return Ok(Arc::clone(e));
+        }
+        let hex_id = hex::encode(topic_id);
+        let db = open_topic_keys(&self.config.data_dir, &hex_id).context(StoreSnafu)?;
+        let store = Arc::new(EpochKeyStore::new(Arc::new(db)).context(StoreSnafu)?);
+        m.insert(*topic_id, Arc::clone(&store));
+        Ok(store)
+    }
+
+    /// Publish a `Standard`-mode message to `topic_id` using `cap_id` (must be
+    /// granted to this agent). Looks up the current epoch and the local hwm.
+    pub fn publish_standard(
+        &self,
+        topic_id: [u8; 32],
+        cap_id: [u8; 16],
+        content: CanonicalContent,
+    ) -> Result<WireMessage> {
+        let log = self.logs.get_or_open(&topic_id)?;
+        let keys = self.epoch_keys_for(&topic_id)?;
+        let sender_pk = self.ed_sk.verifying_key().to_bytes();
+        let (seq, prev_hash) = match next_seq_and_prev_hash(&log, &sender_pk) {
+            Ok(pair) => pair,
+            // Fresh database: the hwm table doesn't exist yet — treat as empty.
+            Err(crate::error::NodeError::Store {
+                source: StoreError::OpenTable { ref source, .. },
+                ..
+            }) if matches!(source, redb::TableError::TableDoesNotExist(_)) => (0, [0u8; 32]),
+            Err(e) => return Err(e),
+        };
+        let (epoch, epoch_key) = current_epoch_key(&keys, &topic_id)?;
+
+        let msg = build_message(&PublishParams {
+            topic_id,
+            sender_sk: &self.ed_sk,
+            cap_id,
+            kind: MessageKind::Standard,
+            content,
+            epoch,
+            seq,
+            prev_hash,
+            timestamp: now_millis(),
+            keying: KeyingMaterial::StandardEpochKey(&epoch_key),
+        })?;
+        log.append(&msg).context(StoreSnafu)?;
+        let _ = self.events_tx.send(DecryptedEvent {
+            topic_id,
+            msg: msg.clone(),
+            content: None,
+        });
+        Ok(msg)
+    }
+
+    /// Process an inbound message that arrived via gossip or replay.
+    pub fn handle_inbound(&self, msg: WireMessage) -> Result<Inbound> {
+        let log = self.logs.get_or_open(&msg.topic_id)?;
+        let keys = self.epoch_keys_for(&msg.topic_id)?;
+        let ctx = InboundCtx {
+            topic_log: &log,
+            epoch_keys: &keys,
+            cap_table: &self.caps,
+            self_x25519_sk: &self.x_sk,
+            self_x25519_pk: &self.x_pk,
+        };
+        let outcome = process(&ctx, msg.clone())?;
+        match &outcome {
+            Inbound::Accepted { msg, content } => {
+                let _ = self.events_tx.send(DecryptedEvent {
+                    topic_id: msg.topic_id,
+                    msg: msg.clone(),
+                    content: content.clone(),
+                });
+            }
+            Inbound::AcceptedOpaque { msg } => {
+                let _ = self.events_tx.send(DecryptedEvent {
+                    topic_id: msg.topic_id,
+                    msg: msg.clone(),
+                    content: None,
+                });
+            }
+            Inbound::Rejected { .. } => {}
+        }
+        Ok(outcome)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<DecryptedEvent> {
+        self.events_tx.subscribe()
+    }
+
+    pub fn install_epoch_key(&self, topic_id: [u8; 32], epoch: u32, key: EpochKey) -> Result<()> {
+        let keys = self.epoch_keys_for(&topic_id)?;
+        keys.put(epoch, &key).context(StoreSnafu)?;
+        Ok(())
+    }
+
+    /// Accessor for Task 26's NetGlue.
+    pub fn keys_by_topic_mut(
+        &self,
+    ) -> parking_lot::MutexGuard<'_, HashMap<[u8; 32], Arc<EpochKeyStore>>> {
+        self.keys_by_topic.lock()
+    }
+}
+
+fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
+    use tempfile::TempDir;
+    use wires_core::cap::Right;
+    use wires_core::Capability;
+
+    fn open_node(tmp: &TempDir, root_hex: String) -> Node {
+        let cfg = NodeConfig {
+            data_dir: tmp.path().to_path_buf(),
+            root_pubkey_hex: root_hex,
+            bootstrap_peers: vec![],
+        };
+        Node::open(cfg).unwrap()
+    }
+
+    #[tokio::test]
+    async fn publish_appears_to_subscriber() {
+        let tmp = TempDir::new().unwrap();
+        let root = SigningKey::generate(&mut OsRng);
+        let root_hex = hex::encode(root.verifying_key().to_bytes());
+        let node = open_node(&tmp, root_hex);
+
+        let sender_pk = node.ed_sk.verifying_key().to_bytes();
+        let mut cap = Capability::new_unsigned(
+            sender_pk,
+            vec!["home.test".into()],
+            vec![Right::Read, Right::Write],
+            0,
+            None,
+        );
+        cap.sign(&root).unwrap();
+        let cap_id = cap.cap_id.0;
+        node.caps.upsert_grant(&cap).unwrap();
+
+        let topic_id = [42u8; 32];
+        node.install_epoch_key(topic_id, 0, [9u8; 32]).unwrap();
+
+        let mut sub = node.subscribe();
+        let _msg = node
+            .publish_standard(topic_id, cap_id, CanonicalContent::new("home.test", "hello"))
+            .unwrap();
+        let ev = sub.recv().await.unwrap();
+        assert_eq!(ev.topic_id, topic_id);
+    }
+
+    #[test]
+    fn open_persists_identity_across_reopens() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = NodeConfig {
+            data_dir: tmp.path().to_path_buf(),
+            root_pubkey_hex: "deadbeef".into(),
+            bootstrap_peers: vec![],
+        };
+        let node_a = Node::open(cfg.clone()).unwrap();
+        let pk_a = node_a.ed_sk.verifying_key().to_bytes();
+        drop(node_a);
+        let node_b = Node::open(cfg).unwrap();
+        let pk_b = node_b.ed_sk.verifying_key().to_bytes();
+        assert_eq!(pk_a, pk_b);
+    }
+
+    #[test]
+    fn install_and_lookup_epoch_key() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = NodeConfig {
+            data_dir: tmp.path().to_path_buf(),
+            root_pubkey_hex: "deadbeef".into(),
+            bootstrap_peers: vec![],
+        };
+        let node = Node::open(cfg).unwrap();
+        node.install_epoch_key([1u8; 32], 0, [7u8; 32]).unwrap();
+        let keys = node.epoch_keys_for(&[1u8; 32]).unwrap();
+        assert_eq!(keys.get(0).unwrap().unwrap(), [7u8; 32]);
+    }
+}
