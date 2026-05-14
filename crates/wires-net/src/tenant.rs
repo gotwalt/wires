@@ -214,6 +214,74 @@ pub fn status_signing_bytes(
     out
 }
 
+use std::sync::Arc;
+
+use iroh::endpoint::Connection;
+use snafu::ResultExt as _;
+
+use crate::error::{IoSnafu, Result};
+use crate::framing::{read_frame, write_frame};
+
+/// Business-logic hook the host wires in. All methods are synchronous and
+/// pure-function from the protocol's perspective: validate, mutate state,
+/// return the response. The protocol layer handles framing and stream
+/// lifecycle.
+pub trait TenantHandler: Send + Sync + 'static {
+    fn handle_register(&self, req: TenantRegisterRequest) -> TenantResponse;
+    fn handle_topic_register(&self, req: TopicRegisterRequest) -> TenantResponse;
+    fn handle_topic_unregister(&self, req: TopicUnregisterRequest) -> TenantResponse;
+    fn handle_status(&self, req: TenantStatusRequest) -> TenantResponse;
+}
+
+#[derive(Clone)]
+pub struct TenantProtocol<H: TenantHandler> {
+    handler: Arc<H>,
+}
+
+impl<H: TenantHandler> std::fmt::Debug for TenantProtocol<H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TenantProtocol").finish_non_exhaustive()
+    }
+}
+
+impl<H: TenantHandler> TenantProtocol<H> {
+    pub fn new(handler: Arc<H>) -> Self { Self { handler } }
+
+    async fn handle_stream(
+        &self,
+        mut send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
+    ) -> Result<()> {
+        let req: TenantRequest = read_frame(&mut recv, MAX_FRAME_LEN).await?;
+        let resp = match req {
+            TenantRequest::Register(r) => self.handler.handle_register(r),
+            TenantRequest::TopicRegister(r) => self.handler.handle_topic_register(r),
+            TenantRequest::TopicUnregister(r) => self.handler.handle_topic_unregister(r),
+            TenantRequest::Status(r) => self.handler.handle_status(r),
+        };
+        write_frame(&mut send, &resp).await?;
+        send.finish().map_err(std::io::Error::other).context(IoSnafu)?;
+        Ok(())
+    }
+}
+
+impl<H: TenantHandler> iroh::protocol::ProtocolHandler for TenantProtocol<H> {
+    async fn accept(
+        &self,
+        connection: Connection,
+    ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+        loop {
+            let (send, recv) = match connection.accept_bi().await {
+                Ok(s) => s,
+                Err(_) => return Ok(()),
+            };
+            if let Err(e) = self.handle_stream(send, recv).await {
+                tracing::warn!(error = %e, "tenant handler stream failed");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
