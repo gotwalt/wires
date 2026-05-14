@@ -10,3 +10,6 @@ pub use public::{decode_public, encode_public};
 
 // Re-export x25519_dalek types so downstream crates don't all need the dep.
 pub use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
+
+pub mod keywrap;
+pub use keywrap::{unwrap_epoch_key, wrap_epoch_key};
