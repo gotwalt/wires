@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use iroh::{endpoint::presets, Endpoint, SecretKey};
-use wires_net::{load_or_create_secret, ALPN};
+use iroh::{Endpoint, SecretKey, endpoint::presets};
+use wires_net::{ALPN, load_or_create_secret};
 use wires_node::{NetGlue, Node, NodeConfig};
 
 mod ha;
@@ -62,7 +62,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let topic_id = resolve_topic(&args.data_dir, &args.topic)?;
     let cap_id = decode_hex_16(&args.cap)?;
-    let access_token = std::fs::read_to_string(&args.token_file)?.trim().to_string();
+    let access_token = std::fs::read_to_string(&args.token_file)?
+        .trim()
+        .to_string();
     if access_token.is_empty() {
         return Err("token file is empty".into());
     }
@@ -109,16 +111,15 @@ fn resolve_topic(
     data_dir: &Path,
     topic: &str,
 ) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
-    if let Ok(bytes) = hex::decode(topic) {
-        if bytes.len() == 32 {
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&bytes);
-            return Ok(out);
-        }
+    if let Ok(bytes) = hex::decode(topic)
+        && bytes.len() == 32
+    {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        return Ok(out);
     }
     let map_path = data_dir.join("topic_names.json");
-    let map: HashMap<String, String> =
-        serde_json::from_str(&std::fs::read_to_string(map_path)?)?;
+    let map: HashMap<String, String> = serde_json::from_str(&std::fs::read_to_string(map_path)?)?;
     let hex_id = map
         .get(topic)
         .ok_or_else(|| format!("unknown topic '{topic}'"))?;
