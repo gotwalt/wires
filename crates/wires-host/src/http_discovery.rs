@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use axum::{routing::get, Json, Router};
+use axum::{Json, Router, routing::get};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,14 +25,16 @@ pub struct DiscoveryState {
 }
 
 pub fn router(state: Arc<DiscoveryState>) -> Router {
-    Router::new()
-        .route("/v1/bootstrap", get({
+    Router::new().route(
+        "/v1/bootstrap",
+        get({
             let state = Arc::clone(&state);
             move || {
                 let state = Arc::clone(&state);
                 async move { Json(state.response.clone()) }
             }
-        }))
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -57,10 +59,18 @@ mod tests {
         });
         let app = router(state);
         let resp = app
-            .oneshot(Request::builder().uri("/v1/bootstrap").body(Body::empty()).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/bootstrap")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
-        let body_bytes = axum::body::to_bytes(resp.into_body(), 64_000).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64_000)
+            .await
+            .unwrap();
         let parsed: DiscoveryResponse = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(parsed.version, 1);
         assert_eq!(parsed.endpoints.len(), 1);

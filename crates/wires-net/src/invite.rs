@@ -71,9 +71,15 @@ fn base64url_encode(bytes: &[u8]) -> String {
     let _ = chunks;
     if !rem.is_empty() {
         let mut buf = [0u8; 3];
-        for (i, b) in rem.iter().enumerate() { buf[i] = *b; }
+        for (i, b) in rem.iter().enumerate() {
+            buf[i] = *b;
+        }
         let n = ((buf[0] as u32) << 16) | ((buf[1] as u32) << 8) | (buf[2] as u32);
-        let chars_to_emit = match rem.len() { 1 => 2, 2 => 3, _ => unreachable!() };
+        let chars_to_emit = match rem.len() {
+            1 => 2,
+            2 => 3,
+            _ => unreachable!(),
+        };
         for i in (4 - chars_to_emit..4).rev() {
             out.push(CHARS[((n >> (6 * i)) & 0x3F) as usize] as char);
         }
@@ -99,15 +105,25 @@ fn base64url_decode(s: &str) -> std::result::Result<Vec<u8>, ()> {
         let mut got = 0;
         let mut chunk = [0u32; 4];
         for j in 0..4 {
-            if i + j >= bytes.len() { break; }
+            if i + j >= bytes.len() {
+                break;
+            }
             chunk[j] = val(bytes[i + j])?;
             got += 1;
         }
-        if got == 0 { break; }
+        if got == 0 {
+            break;
+        }
         let n = (chunk[0] << 18) | (chunk[1] << 12) | (chunk[2] << 6) | chunk[3];
-        if got >= 2 { out.push(((n >> 16) & 0xFF) as u8); }
-        if got >= 3 { out.push(((n >> 8) & 0xFF) as u8); }
-        if got == 4 { out.push((n & 0xFF) as u8); }
+        if got >= 2 {
+            out.push(((n >> 16) & 0xFF) as u8);
+        }
+        if got >= 3 {
+            out.push(((n >> 8) & 0xFF) as u8);
+        }
+        if got == 4 {
+            out.push((n & 0xFF) as u8);
+        }
         i += 4;
     }
     Ok(out)
@@ -135,8 +151,16 @@ mod tests {
 
     #[test]
     fn base64url_roundtrip() {
-        let cases: &[&[u8]] = &[b"", b"a", b"ab", b"abc", b"abcd", b"abcde", b"abcdef",
-            &[0u8, 255, 128, 1, 2, 3, 4, 5, 6, 7]];
+        let cases: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"ab",
+            b"abc",
+            b"abcd",
+            b"abcde",
+            b"abcdef",
+            &[0u8, 255, 128, 1, 2, 3, 4, 5, 6, 7],
+        ];
         for input in cases {
             let encoded = base64url_encode(input);
             let back = base64url_decode(&encoded).unwrap();
@@ -169,9 +193,14 @@ mod tests {
         let back = InviteToken::decode(&encoded).unwrap();
         assert_eq!(back.token_id, "tk-1");
         assert_eq!(back.peer_hints.len(), 2);
-        assert_eq!(back.peer_hints[1].relay.as_deref(), Some("https://relay.example/"));
-        assert_eq!(back.service_discovery_url.as_deref(),
-                   Some("https://discovery.example/v1/bootstrap"));
+        assert_eq!(
+            back.peer_hints[1].relay.as_deref(),
+            Some("https://relay.example/")
+        );
+        assert_eq!(
+            back.service_discovery_url.as_deref(),
+            Some("https://discovery.example/v1/bootstrap")
+        );
     }
 
     #[test]

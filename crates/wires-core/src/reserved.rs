@@ -20,9 +20,9 @@ pub enum RequiredMode {
 /// - `__topic.history_grant` → SealedTo (sealed to the new member)
 pub fn required_mode_for(type_: &str) -> Option<RequiredMode> {
     match type_ {
-        "__cap.grant"           => Some(RequiredMode::SealedTo),
-        "__cap.revoke"          => Some(RequiredMode::Public),
-        "__cap.root_rotation"   => Some(RequiredMode::Public),
+        "__cap.grant" => Some(RequiredMode::SealedTo),
+        "__cap.revoke" => Some(RequiredMode::Public),
+        "__cap.root_rotation" => Some(RequiredMode::Public),
         "__topic.epoch_advance" => Some(RequiredMode::SealedTo),
         "__topic.history_grant" => Some(RequiredMode::SealedTo),
         _ => None,
@@ -45,7 +45,12 @@ pub fn check_kind_matches(type_: &str, kind: &MessageKind) -> Result<()> {
         MessageKind::SealedTo(_) => RequiredMode::SealedTo,
         MessageKind::Public => RequiredMode::Public,
     };
-    ensure!(actual == required, ReservedTypeWrongModeSnafu { reserved_type: type_.to_string() });
+    ensure!(
+        actual == required,
+        ReservedTypeWrongModeSnafu {
+            reserved_type: type_.to_string()
+        }
+    );
     Ok(())
 }
 
@@ -70,7 +75,9 @@ mod tests {
     #[test]
     fn root_rotation_requires_public() {
         check_kind_matches("__cap.root_rotation", &MessageKind::Public).unwrap();
-        assert!(check_kind_matches("__cap.root_rotation", &MessageKind::SealedTo([0u8; 32])).is_err());
+        assert!(
+            check_kind_matches("__cap.root_rotation", &MessageKind::SealedTo([0u8; 32])).is_err()
+        );
     }
 
     #[test]

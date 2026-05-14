@@ -36,7 +36,8 @@ impl CapTable {
         let write = self.db.begin_write().context(BeginTxnSnafu)?;
         {
             let mut t = write.open_table(CAPS).context(OpenTableSnafu)?;
-            t.insert(&cap.cap_id.0[..], bytes.as_slice()).context(StorageIoSnafu)?;
+            t.insert(&cap.cap_id.0[..], bytes.as_slice())
+                .context(StorageIoSnafu)?;
         }
         write.commit().context(CommitTxnSnafu)?;
         Ok(())
@@ -46,7 +47,8 @@ impl CapTable {
         let write = self.db.begin_write().context(BeginTxnSnafu)?;
         {
             let mut t = write.open_table(REVOKED).context(OpenTableSnafu)?;
-            t.insert(&cap_id[..], &revoke_hash[..]).context(StorageIoSnafu)?;
+            t.insert(&cap_id[..], &revoke_hash[..])
+                .context(StorageIoSnafu)?;
         }
         write.commit().context(CommitTxnSnafu)?;
         Ok(())
@@ -60,7 +62,10 @@ impl CapTable {
             None => return Ok(None),
         };
         let revoked_t = read.open_table(REVOKED).context(OpenTableSnafu)?;
-        let revoked = revoked_t.get(&cap_id[..]).context(StorageIoSnafu)?.is_some();
+        let revoked = revoked_t
+            .get(&cap_id[..])
+            .context(StorageIoSnafu)?
+            .is_some();
         Ok(Some(CapEntry { cap, revoked }))
     }
 
@@ -72,11 +77,16 @@ impl CapTable {
         for entry in caps_t.iter().context(StorageIoSnafu)? {
             let (k, v) = entry.context(StorageIoSnafu)?;
             let k_bytes = k.value();
-            if k_bytes.len() != 16 { continue; }
+            if k_bytes.len() != 16 {
+                continue;
+            }
             let mut cap_id = [0u8; 16];
             cap_id.copy_from_slice(k_bytes);
             let cap: Capability = serde_json::from_slice(v.value()).context(DeserializeSnafu)?;
-            let revoked = revoked_t.get(&cap_id[..]).context(StorageIoSnafu)?.is_some();
+            let revoked = revoked_t
+                .get(&cap_id[..])
+                .context(StorageIoSnafu)?
+                .is_some();
             out.insert(cap_id, CapEntry { cap, revoked });
         }
         Ok(out)
@@ -94,13 +104,8 @@ mod tests {
 
     fn make_cap() -> (Capability, SigningKey) {
         let root = SigningKey::generate(&mut OsRng);
-        let mut cap = Capability::new_unsigned(
-            [9u8; 32],
-            vec!["home.*".into()],
-            vec![Right::Read],
-            0,
-            None,
-        );
+        let mut cap =
+            Capability::new_unsigned([9u8; 32], vec!["home.*".into()], vec![Right::Read], 0, None);
         cap.sign(&root).unwrap();
         (cap, root)
     }

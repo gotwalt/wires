@@ -4,8 +4,8 @@
 //! that follow, capped per-call by the caller.
 
 use iroh::endpoint::{RecvStream, SendStream};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use snafu::ResultExt;
 
 use crate::error::{IoSnafu, Result, SerdeSnafu};
@@ -24,10 +24,7 @@ pub async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Resu
     Ok(())
 }
 
-pub async fn read_frame<T: DeserializeOwned>(
-    recv: &mut RecvStream,
-    max_len: u32,
-) -> Result<T> {
+pub async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream, max_len: u32) -> Result<T> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf)
         .await

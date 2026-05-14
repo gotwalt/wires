@@ -149,34 +149,84 @@ mod tests {
         let base = sample();
         let base_bytes = base.signing_bytes().unwrap();
 
-        let mut m = sample(); m.topic_id[0] ^= 1;
-        assert_ne!(base_bytes, m.signing_bytes().unwrap(), "topic_id not in signing_bytes");
+        let mut m = sample();
+        m.topic_id[0] ^= 1;
+        assert_ne!(
+            base_bytes,
+            m.signing_bytes().unwrap(),
+            "topic_id not in signing_bytes"
+        );
 
-        let mut m = sample(); m.epoch = base.epoch.wrapping_add(1);
-        assert_ne!(base_bytes, m.signing_bytes().unwrap(), "epoch not in signing_bytes");
+        let mut m = sample();
+        m.epoch = base.epoch.wrapping_add(1);
+        assert_ne!(
+            base_bytes,
+            m.signing_bytes().unwrap(),
+            "epoch not in signing_bytes"
+        );
 
-        let mut m = sample(); m.kind = MessageKind::Public;
-        assert_ne!(base_bytes, m.signing_bytes().unwrap(), "kind not in signing_bytes");
+        let mut m = sample();
+        m.kind = MessageKind::Public;
+        assert_ne!(
+            base_bytes,
+            m.signing_bytes().unwrap(),
+            "kind not in signing_bytes"
+        );
 
-        let mut m = sample(); m.sender[0] ^= 1;
-        assert_ne!(base_bytes, m.signing_bytes().unwrap(), "sender not in signing_bytes");
+        let mut m = sample();
+        m.sender[0] ^= 1;
+        assert_ne!(
+            base_bytes,
+            m.signing_bytes().unwrap(),
+            "sender not in signing_bytes"
+        );
 
-        let mut m = sample(); m.cap_id[0] ^= 1;
-        assert_ne!(base_bytes, m.signing_bytes().unwrap(), "cap_id not in signing_bytes");
+        let mut m = sample();
+        m.cap_id[0] ^= 1;
+        assert_ne!(
+            base_bytes,
+            m.signing_bytes().unwrap(),
+            "cap_id not in signing_bytes"
+        );
 
-        let mut m = sample(); m.seq = base.seq.wrapping_add(1);
-        assert_ne!(base_bytes, m.signing_bytes().unwrap(), "seq not in signing_bytes");
+        let mut m = sample();
+        m.seq = base.seq.wrapping_add(1);
+        assert_ne!(
+            base_bytes,
+            m.signing_bytes().unwrap(),
+            "seq not in signing_bytes"
+        );
 
-        let mut m = sample(); m.prev_hash[0] ^= 1;
-        assert_ne!(base_bytes, m.signing_bytes().unwrap(), "prev_hash not in signing_bytes");
+        let mut m = sample();
+        m.prev_hash[0] ^= 1;
+        assert_ne!(
+            base_bytes,
+            m.signing_bytes().unwrap(),
+            "prev_hash not in signing_bytes"
+        );
 
-        let mut m = sample(); m.timestamp = base.timestamp.wrapping_add(1);
-        assert_ne!(base_bytes, m.signing_bytes().unwrap(), "timestamp not in signing_bytes");
+        let mut m = sample();
+        m.timestamp = base.timestamp.wrapping_add(1);
+        assert_ne!(
+            base_bytes,
+            m.signing_bytes().unwrap(),
+            "timestamp not in signing_bytes"
+        );
 
-        let mut m = sample(); m.payload_len = base.payload_len.wrapping_add(1);
-        assert_ne!(base_bytes, m.signing_bytes().unwrap(), "payload_len not in signing_bytes");
+        let mut m = sample();
+        m.payload_len = base.payload_len.wrapping_add(1);
+        assert_ne!(
+            base_bytes,
+            m.signing_bytes().unwrap(),
+            "payload_len not in signing_bytes"
+        );
 
-        let mut m = sample(); m.ciphertext[0] ^= 1;
-        assert_ne!(base_bytes, m.signing_bytes().unwrap(), "ciphertext not in signing_bytes");
+        let mut m = sample();
+        m.ciphertext[0] ^= 1;
+        assert_ne!(
+            base_bytes,
+            m.signing_bytes().unwrap(),
+            "ciphertext not in signing_bytes"
+        );
     }
 }

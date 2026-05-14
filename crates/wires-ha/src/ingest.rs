@@ -56,16 +56,7 @@ pub async fn run(
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
-        match run_session(
-            &node,
-            &gossip,
-            topic_id,
-            cap_id,
-            &ha_url,
-            &access_token,
-        )
-        .await
-        {
+        match run_session(&node, &gossip, topic_id, cap_id, &ha_url, &access_token).await {
             Ok(()) => {
                 tracing::warn!("HA WebSocket closed cleanly; reconnecting in {:?}", backoff);
             }

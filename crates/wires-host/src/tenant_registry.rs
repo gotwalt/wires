@@ -53,16 +53,17 @@ pub struct TenantRegistry {
 impl TenantRegistry {
     pub fn open(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root).context(IoSnafu)?;
-        let tenants_db = Arc::new(
-            Database::create(root.join("tenants.redb")).context(DbOpenSnafu)?
-        );
-        let topic_index_db = Arc::new(
-            Database::create(root.join("topic_index.redb")).context(DbOpenSnafu)?
-        );
-        let nonces_db = Arc::new(
-            Database::create(root.join("nonces.redb")).context(DbOpenSnafu)?
-        );
-        Ok(Self { root: root.to_path_buf(), tenants_db, topic_index_db, nonces_db })
+        let tenants_db =
+            Arc::new(Database::create(root.join("tenants.redb")).context(DbOpenSnafu)?);
+        let topic_index_db =
+            Arc::new(Database::create(root.join("topic_index.redb")).context(DbOpenSnafu)?);
+        let nonces_db = Arc::new(Database::create(root.join("nonces.redb")).context(DbOpenSnafu)?);
+        Ok(Self {
+            root: root.to_path_buf(),
+            tenants_db,
+            topic_index_db,
+            nonces_db,
+        })
     }
 
     /// Look up an existing tenant.
@@ -71,7 +72,12 @@ impl TenantRegistry {
         let table = match read.open_table(TENANTS) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(e) => return Err(crate::error::HostError::Table { source: e, location: snafu::location!() }),
+            Err(e) => {
+                return Err(crate::error::HostError::Table {
+                    source: e,
+                    location: snafu::location!(),
+                });
+            }
         };
         match table.get(&root_pubkey[..]).context(StorageIoSnafu)? {
             Some(v) => {
@@ -84,7 +90,11 @@ impl TenantRegistry {
 
     /// Insert a new tenant (idempotent: returns Ok with the existing record if
     /// already present).
-    pub fn insert_if_absent(&self, root_pubkey: &[u8; 32], rec: TenantRecord) -> Result<TenantRecord> {
+    pub fn insert_if_absent(
+        &self,
+        root_pubkey: &[u8; 32],
+        rec: TenantRecord,
+    ) -> Result<TenantRecord> {
         if let Some(existing) = self.get(root_pubkey)? {
             return Ok(existing);
         }
@@ -92,7 +102,8 @@ impl TenantRegistry {
         let write = self.tenants_db.begin_write().context(TxnSnafu)?;
         {
             let mut t = write.open_table(TENANTS).context(TableSnafu)?;
-            t.insert(&root_pubkey[..], json.as_slice()).context(StorageIoSnafu)?;
+            t.insert(&root_pubkey[..], json.as_slice())
+                .context(StorageIoSnafu)?;
         }
         write.commit().context(CommitSnafu)?;
         Ok(rec)
@@ -103,14 +114,19 @@ impl TenantRegistry {
         let table = match read.open_table(TOPIC_INDEX) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(e) => return Err(crate::error::HostError::Table {
-                source: e, location: snafu::location!(),
-            }),
+            Err(e) => {
+                return Err(crate::error::HostError::Table {
+                    source: e,
+                    location: snafu::location!(),
+                });
+            }
         };
         match table.get(&topic_id[..]).context(StorageIoSnafu)? {
             Some(v) => {
                 let raw = v.value();
-                if raw.len() != 32 { return Ok(None); }
+                if raw.len() != 32 {
+                    return Ok(None);
+                }
                 let mut out = [0u8; 32];
                 out.copy_from_slice(raw);
                 Ok(Some(out))
@@ -127,7 +143,9 @@ impl TenantRegistry {
         let write = self.topic_index_db.begin_write().context(TxnSnafu)?;
         let outcome = {
             let mut table = write.open_table(TOPIC_INDEX).context(TableSnafu)?;
-            let prior_data = table.get(&topic_id[..]).context(StorageIoSnafu)?
+            let prior_data = table
+                .get(&topic_id[..])
+                .context(StorageIoSnafu)?
                 .map(|guard| guard.value().to_vec());
             if let Some(raw) = prior_data {
                 if raw == root_pubkey.as_slice() {
@@ -138,7 +156,9 @@ impl TenantRegistry {
                     TopicRegisterOutcome::Conflict { other_root: other }
                 }
             } else {
-                table.insert(&topic_id[..], &root_pubkey[..]).context(StorageIoSnafu)?;
+                table
+                    .insert(&topic_id[..], &root_pubkey[..])
+                    .context(StorageIoSnafu)?;
                 TopicRegisterOutcome::Inserted
             }
         };
@@ -146,15 +166,13 @@ impl TenantRegistry {
         Ok(outcome)
     }
 
-    pub fn unregister_topic(
-        &self,
-        root_pubkey: &[u8; 32],
-        topic_id: &[u8; 32],
-    ) -> Result<bool> {
+    pub fn unregister_topic(&self, root_pubkey: &[u8; 32], topic_id: &[u8; 32]) -> Result<bool> {
         let write = self.topic_index_db.begin_write().context(TxnSnafu)?;
         let removed = {
             let mut table = write.open_table(TOPIC_INDEX).context(TableSnafu)?;
-            let prior_data = table.get(&topic_id[..]).context(StorageIoSnafu)?
+            let prior_data = table
+                .get(&topic_id[..])
+                .context(StorageIoSnafu)?
                 .map(|guard| guard.value().to_vec());
             if let Some(raw) = prior_data {
                 if raw == root_pubkey.as_slice() {
@@ -199,7 +217,9 @@ impl TenantRegistry {
                 _ => false,
             };
             if !recent {
-                table.insert(&key[..], &expires_at.to_be_bytes()[..]).context(StorageIoSnafu)?;
+                table
+                    .insert(&key[..], &expires_at.to_be_bytes()[..])
+                    .context(StorageIoSnafu)?;
             }
             recent
         };
@@ -210,12 +230,11 @@ impl TenantRegistry {
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use wires_net::tenant::{
+    TenantErrorCode, TenantErrorResponse, TenantRegisterRequest, TenantRegisterResponse,
+    TenantResponse, TenantStatusKind, TenantStatusRequest, TenantStatusResponse,
+    TopicRegisterRequest, TopicRegisterResponse, TopicUnregisterRequest, TopicUnregisterResponse,
     register_signing_bytes, status_signing_bytes, topic_register_signing_bytes,
-    topic_unregister_signing_bytes, TenantErrorCode, TenantErrorResponse,
-    TenantRegisterRequest, TenantRegisterResponse, TenantResponse,
-    TenantStatusKind, TenantStatusRequest, TenantStatusResponse,
-    TopicRegisterRequest, TopicRegisterResponse,
-    TopicUnregisterRequest, TopicUnregisterResponse,
+    topic_unregister_signing_bytes,
 };
 
 /// Tunable behaviour for `TenantHandlerImpl`.
@@ -272,7 +291,10 @@ impl TenantHandlerImpl {
     ) -> std::result::Result<(), TenantResponse> {
         let now = (self.now_ms)();
         if (now - timestamp).abs() > self.config.max_clock_skew_ms {
-            return Err(Self::err(TenantErrorCode::StaleTimestamp, "timestamp out of range"));
+            return Err(Self::err(
+                TenantErrorCode::StaleTimestamp,
+                "timestamp out of range",
+            ));
         }
         let vk = match VerifyingKey::from_bytes(root_pubkey) {
             Ok(k) => k,
@@ -282,8 +304,14 @@ impl TenantHandlerImpl {
         if vk.verify(signing_bytes, &sig).is_err() {
             return Err(Self::err(TenantErrorCode::BadSignature, "signature failed"));
         }
-        match self.registry.nonce_seen(root_pubkey, nonce, now, self.config.nonce_ttl_ms) {
-            Ok(true) => Err(Self::err(TenantErrorCode::ReplayedNonce, "nonce already seen")),
+        match self
+            .registry
+            .nonce_seen(root_pubkey, nonce, now, self.config.nonce_ttl_ms)
+        {
+            Ok(true) => Err(Self::err(
+                TenantErrorCode::ReplayedNonce,
+                "nonce already seen",
+            )),
             Ok(false) => Ok(()),
             Err(_) => Err(Self::err(TenantErrorCode::Internal, "nonce store error")),
         }
@@ -293,11 +321,20 @@ impl TenantHandlerImpl {
 impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
     fn handle_register(&self, req: TenantRegisterRequest) -> TenantResponse {
         let signing_bytes = register_signing_bytes(
-            &req.root_pubkey, req.timestamp, &req.nonce, &self.host_endpoint_id,
+            &req.root_pubkey,
+            req.timestamp,
+            &req.nonce,
+            &self.host_endpoint_id,
         );
         if let Err(e) = self.check_common(
-            &req.root_pubkey, req.timestamp, &req.nonce, &req.signature, &signing_bytes,
-        ) { return e; }
+            &req.root_pubkey,
+            req.timestamp,
+            &req.nonce,
+            &req.signature,
+            &signing_bytes,
+        ) {
+            return e;
+        }
 
         let now = (self.now_ms)();
         let rec = TenantRecord {
@@ -305,13 +342,18 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
             status: TenantStatus::Active,
             retention_budget_bytes: DEFAULT_RETENTION_BUDGET_BYTES,
         };
-        if self.registry.insert_if_absent(&req.root_pubkey, rec).is_err() {
+        if self
+            .registry
+            .insert_if_absent(&req.root_pubkey, rec)
+            .is_err()
+        {
             return Self::err(TenantErrorCode::Internal, "tenant table write failed");
         }
 
         let caps_topic_id = Self::caps_topic_id_for(&req.root_pubkey);
         if matches!(
-            self.registry.register_topic(&req.root_pubkey, &caps_topic_id),
+            self.registry
+                .register_topic(&req.root_pubkey, &caps_topic_id),
             Ok(TopicRegisterOutcome::Inserted | TopicRegisterOutcome::AlreadyOwned),
         ) {
             (self.on_topic_registered)(req.root_pubkey, caps_topic_id);
@@ -327,11 +369,21 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
 
     fn handle_topic_register(&self, req: TopicRegisterRequest) -> TenantResponse {
         let signing_bytes = topic_register_signing_bytes(
-            &req.root_pubkey, &req.topic_id, req.timestamp, &req.nonce, &self.host_endpoint_id,
+            &req.root_pubkey,
+            &req.topic_id,
+            req.timestamp,
+            &req.nonce,
+            &self.host_endpoint_id,
         );
         if let Err(e) = self.check_common(
-            &req.root_pubkey, req.timestamp, &req.nonce, &req.signature, &signing_bytes,
-        ) { return e; }
+            &req.root_pubkey,
+            req.timestamp,
+            &req.nonce,
+            &req.signature,
+            &signing_bytes,
+        ) {
+            return e;
+        }
 
         match self.registry.get(&req.root_pubkey) {
             Ok(Some(rec)) if rec.status == TenantStatus::Active => {}
@@ -340,7 +392,10 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
             Err(_) => return Self::err(TenantErrorCode::Internal, "tenant lookup failed"),
         }
 
-        match self.registry.register_topic(&req.root_pubkey, &req.topic_id) {
+        match self
+            .registry
+            .register_topic(&req.root_pubkey, &req.topic_id)
+        {
             Ok(TopicRegisterOutcome::Inserted) | Ok(TopicRegisterOutcome::AlreadyOwned) => {
                 (self.on_topic_registered)(req.root_pubkey, req.topic_id);
                 TenantResponse::TopicRegister(TopicRegisterResponse {
@@ -348,30 +403,46 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
                     topic_id: req.topic_id,
                 })
             }
-            Ok(TopicRegisterOutcome::Conflict { .. }) => {
-                Self::err(TenantErrorCode::TopicAlreadyRegistered, "topic owned by another tenant")
-            }
+            Ok(TopicRegisterOutcome::Conflict { .. }) => Self::err(
+                TenantErrorCode::TopicAlreadyRegistered,
+                "topic owned by another tenant",
+            ),
             Err(_) => Self::err(TenantErrorCode::Internal, "topic register write failed"),
         }
     }
 
     fn handle_topic_unregister(&self, req: TopicUnregisterRequest) -> TenantResponse {
         let signing_bytes = topic_unregister_signing_bytes(
-            &req.root_pubkey, &req.topic_id, req.timestamp, &req.nonce, &self.host_endpoint_id,
+            &req.root_pubkey,
+            &req.topic_id,
+            req.timestamp,
+            &req.nonce,
+            &self.host_endpoint_id,
         );
         if let Err(e) = self.check_common(
-            &req.root_pubkey, req.timestamp, &req.nonce, &req.signature, &signing_bytes,
-        ) { return e; }
+            &req.root_pubkey,
+            req.timestamp,
+            &req.nonce,
+            &req.signature,
+            &signing_bytes,
+        ) {
+            return e;
+        }
 
-        match self.registry.unregister_topic(&req.root_pubkey, &req.topic_id) {
+        match self
+            .registry
+            .unregister_topic(&req.root_pubkey, &req.topic_id)
+        {
             Ok(true) => {
                 (self.on_topic_unregistered)(req.root_pubkey, req.topic_id);
                 TenantResponse::TopicUnregister(TopicUnregisterResponse {
-                    ok: true, topic_id: req.topic_id,
+                    ok: true,
+                    topic_id: req.topic_id,
                 })
             }
             Ok(false) => TenantResponse::TopicUnregister(TopicUnregisterResponse {
-                ok: false, topic_id: req.topic_id,
+                ok: false,
+                topic_id: req.topic_id,
             }),
             Err(_) => Self::err(TenantErrorCode::Internal, "topic unregister failed"),
         }
@@ -379,11 +450,20 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
 
     fn handle_status(&self, req: TenantStatusRequest) -> TenantResponse {
         let signing_bytes = status_signing_bytes(
-            &req.root_pubkey, req.timestamp, &req.nonce, &self.host_endpoint_id,
+            &req.root_pubkey,
+            req.timestamp,
+            &req.nonce,
+            &self.host_endpoint_id,
         );
         if let Err(e) = self.check_common(
-            &req.root_pubkey, req.timestamp, &req.nonce, &req.signature, &signing_bytes,
-        ) { return e; }
+            &req.root_pubkey,
+            req.timestamp,
+            &req.nonce,
+            &req.signature,
+            &signing_bytes,
+        ) {
+            return e;
+        }
 
         let rec = match self.registry.get(&req.root_pubkey) {
             Ok(Some(rec)) => rec,
@@ -392,7 +472,7 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
 
         TenantResponse::Status(TenantStatusResponse {
             registered_at: rec.registered_at,
-            topic_count: 0,                 // populated in a later task once routing tracks this
+            topic_count: 0, // populated in a later task once routing tracks this
             bytes_stored: 0,
             retention_budget_bytes: rec.retention_budget_bytes,
             oldest_retained_at: 0,
@@ -424,7 +504,10 @@ mod tests {
         let got = reg.insert_if_absent(&root, rec.clone()).unwrap();
         assert_eq!(got.retention_budget_bytes, DEFAULT_RETENTION_BUDGET_BYTES);
         let read_back = reg.get(&root).unwrap().unwrap();
-        assert_eq!(read_back.retention_budget_bytes, DEFAULT_RETENTION_BUDGET_BYTES);
+        assert_eq!(
+            read_back.retention_budget_bytes,
+            DEFAULT_RETENTION_BUDGET_BYTES
+        );
         assert_eq!(read_back.status, TenantStatus::Active);
     }
 
@@ -433,16 +516,26 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let reg = TenantRegistry::open(tmp.path()).unwrap();
         let root = [7u8; 32];
-        let first = reg.insert_if_absent(&root, TenantRecord {
-            registered_at: 1,
-            status: TenantStatus::Active,
-            retention_budget_bytes: 100,
-        }).unwrap();
-        let again = reg.insert_if_absent(&root, TenantRecord {
-            registered_at: 2,
-            status: TenantStatus::Suspended,
-            retention_budget_bytes: 200,
-        }).unwrap();
+        let first = reg
+            .insert_if_absent(
+                &root,
+                TenantRecord {
+                    registered_at: 1,
+                    status: TenantStatus::Active,
+                    retention_budget_bytes: 100,
+                },
+            )
+            .unwrap();
+        let again = reg
+            .insert_if_absent(
+                &root,
+                TenantRecord {
+                    registered_at: 2,
+                    status: TenantStatus::Suspended,
+                    retention_budget_bytes: 200,
+                },
+            )
+            .unwrap();
         // Idempotent — second insert returns the first record unchanged.
         assert_eq!(first.registered_at, again.registered_at);
         assert_eq!(again.retention_budget_bytes, 100);
@@ -496,7 +589,10 @@ mod tests {
         let ttl_ms = 120_000i64;
         assert!(!reg.nonce_seen(&root, &nonce, now, ttl_ms).unwrap());
         // Re-use after TTL elapses should be allowed again.
-        assert!(!reg.nonce_seen(&root, &nonce, now + ttl_ms + 1, ttl_ms).unwrap());
+        assert!(
+            !reg.nonce_seen(&root, &nonce, now + ttl_ms + 1, ttl_ms)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -525,7 +621,10 @@ mod tests {
 
         let nonce = [9u8; 16];
         let bytes = wires_net::tenant::register_signing_bytes(
-            &root_pubkey, now_ms, &nonce, &host_endpoint_id,
+            &root_pubkey,
+            now_ms,
+            &nonce,
+            &host_endpoint_id,
         );
         let sig = signing_key.sign(&bytes).to_bytes();
 

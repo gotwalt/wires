@@ -19,7 +19,9 @@ pub struct TopicLog {
 }
 
 impl TopicLog {
-    pub fn new(db: Arc<Database>) -> Self { Self { db } }
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
+    }
 
     /// Insert a message. Idempotent: re-inserting the same (sender, seq) when the
     /// stored hash matches is a no-op returning false. Returns true if newly inserted.
@@ -54,7 +56,9 @@ impl TopicLog {
                     });
                 }
             } else {
-                log_t.insert(&key[..], value.as_slice()).context(StorageIoSnafu)?;
+                log_t
+                    .insert(&key[..], value.as_slice())
+                    .context(StorageIoSnafu)?;
                 true
             }
         };
@@ -78,7 +82,9 @@ impl TopicLog {
                 let mut v = Vec::with_capacity(40);
                 v.extend_from_slice(&msg.seq.to_be_bytes());
                 v.extend_from_slice(&new_hash);
-                hwm_t.insert(&msg.sender[..], v.as_slice()).context(StorageIoSnafu)?;
+                hwm_t
+                    .insert(&msg.sender[..], v.as_slice())
+                    .context(StorageIoSnafu)?;
             }
         }
 
@@ -102,13 +108,16 @@ impl TopicLog {
         end[32..].copy_from_slice(&u64::MAX.to_be_bytes());
 
         let mut out = Vec::new();
-        let iter = table.range::<&[u8]>(&start[..]..=&end[..]).context(StorageIoSnafu)?;
+        let iter = table
+            .range::<&[u8]>(&start[..]..=&end[..])
+            .context(StorageIoSnafu)?;
         for entry in iter {
             let (_k, v) = entry.context(StorageIoSnafu)?;
-            let msg: WireMessage =
-                serde_json::from_slice(v.value()).context(DeserializeSnafu)?;
+            let msg: WireMessage = serde_json::from_slice(v.value()).context(DeserializeSnafu)?;
             out.push(msg);
-            if out.len() >= limit { break; }
+            if out.len() >= limit {
+                break;
+            }
         }
         Ok(out)
     }
@@ -120,8 +129,7 @@ impl TopicLog {
         let mut out: Vec<WireMessage> = Vec::new();
         for entry in table.iter().context(StorageIoSnafu)? {
             let (_k, v) = entry.context(StorageIoSnafu)?;
-            let msg: WireMessage =
-                serde_json::from_slice(v.value()).context(DeserializeSnafu)?;
+            let msg: WireMessage = serde_json::from_slice(v.value()).context(DeserializeSnafu)?;
             out.push(msg);
         }
         out.sort_by(|a, b| {
@@ -142,7 +150,9 @@ impl TopicLog {
             let (k, v) = entry.context(StorageIoSnafu)?;
             let key_bytes = k.value();
             let val_bytes = v.value();
-            if key_bytes.len() != 32 || val_bytes.len() != 40 { continue; }
+            if key_bytes.len() != 32 || val_bytes.len() != 40 {
+                continue;
+            }
             let mut pk = [0u8; 32];
             pk.copy_from_slice(key_bytes);
             let mut s = [0u8; 8];
@@ -290,8 +300,10 @@ mod tests {
         let log = TopicLog::new(db);
         let a = [7u8; 32];
         let b = [8u8; 32];
-        let mut a0 = make(a, 0, [0u8; 32]); a0.timestamp = 2;
-        let mut b0 = make(b, 0, [0u8; 32]); b0.timestamp = 1;
+        let mut a0 = make(a, 0, [0u8; 32]);
+        a0.timestamp = 2;
+        let mut b0 = make(b, 0, [0u8; 32]);
+        b0.timestamp = 1;
         log.append(&a0).unwrap();
         log.append(&b0).unwrap();
         let all = log.read_all().unwrap();
@@ -311,7 +323,8 @@ mod tests {
         log.append(&m0).unwrap();
         log.append(&m1).unwrap();
         let b = log.bytes_stored().unwrap();
-        let expected = serde_json::to_vec(&m0).unwrap().len() + serde_json::to_vec(&m1).unwrap().len();
+        let expected =
+            serde_json::to_vec(&m0).unwrap().len() + serde_json::to_vec(&m1).unwrap().len();
         assert_eq!(b as usize, expected);
     }
 

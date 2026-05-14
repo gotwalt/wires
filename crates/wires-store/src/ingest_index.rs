@@ -3,9 +3,7 @@ use std::sync::Arc;
 use redb::{Database, ReadableDatabase, ReadableTable};
 use snafu::ResultExt;
 
-use crate::error::{
-    BeginTxnSnafu, CommitTxnSnafu, OpenTableSnafu, Result, StorageIoSnafu,
-};
+use crate::error::{BeginTxnSnafu, CommitTxnSnafu, OpenTableSnafu, Result, StorageIoSnafu};
 use crate::schema::{INGEST_INDEX, INGEST_META};
 
 const META_KEY: &[u8] = b"m";
@@ -24,7 +22,9 @@ pub struct IngestIndex {
 }
 
 impl IngestIndex {
-    pub fn new(db: Arc<Database>) -> Self { Self { db } }
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
+    }
 
     /// Record an ingested message. Returns the assigned ingest_seq.
     pub fn record(&self, entry: &IngestEntry) -> Result<u64> {
@@ -85,21 +85,30 @@ impl IngestIndex {
                 let mut kbuf = [0u8; 8];
                 kbuf.copy_from_slice(k.value());
                 let raw = v.value();
-                if raw.len() < 76 { continue; }
-                let mut topic_id = [0u8; 32]; topic_id.copy_from_slice(&raw[0..32]);
-                let mut sender = [0u8; 32]; sender.copy_from_slice(&raw[32..64]);
-                let mut sb = [0u8; 8]; sb.copy_from_slice(&raw[64..72]);
-                let mut bb = [0u8; 4]; bb.copy_from_slice(&raw[72..76]);
+                if raw.len() < 76 {
+                    continue;
+                }
+                let mut topic_id = [0u8; 32];
+                topic_id.copy_from_slice(&raw[0..32]);
+                let mut sender = [0u8; 32];
+                sender.copy_from_slice(&raw[32..64]);
+                let mut sb = [0u8; 8];
+                sb.copy_from_slice(&raw[64..72]);
+                let mut bb = [0u8; 4];
+                bb.copy_from_slice(&raw[72..76]);
                 let bytes = u32::from_be_bytes(bb);
                 let ent = IngestEntry {
-                    topic_id, sender,
+                    topic_id,
+                    sender,
                     seq: u64::from_be_bytes(sb),
                     bytes,
                 };
                 total = total.saturating_sub(bytes as u64);
                 victim_keys.push(kbuf);
                 victim_entries.push(ent);
-                if total <= budget_bytes { break; }
+                if total <= budget_bytes {
+                    break;
+                }
             }
 
             for k in &victim_keys {
@@ -120,8 +129,10 @@ fn read_meta<T: ReadableTable<&'static [u8], &'static [u8]>>(table: &T) -> Resul
             if raw.len() < 16 {
                 return Ok((0, 0));
             }
-            let mut a = [0u8; 8]; a.copy_from_slice(&raw[..8]);
-            let mut b = [0u8; 8]; b.copy_from_slice(&raw[8..16]);
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&raw[..8]);
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&raw[8..16]);
             Ok((u64::from_be_bytes(a), u64::from_be_bytes(b)))
         }
         None => Ok((0, 0)),

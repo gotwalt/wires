@@ -34,18 +34,28 @@ fn two_tenants_isolated() {
     let logs = Arc::new(PerTenantLogs::new(tmp.path()));
     let retention = Arc::new(Retention::new(tmp.path(), Arc::clone(&logs)));
     let rate = Arc::new(WriteRateLimiter::new(1_000_000));
-    let router = Router::new(Arc::clone(&registry), Arc::clone(&logs), Arc::clone(&retention), rate);
+    let router = Router::new(
+        Arc::clone(&registry),
+        Arc::clone(&logs),
+        Arc::clone(&retention),
+        rate,
+    );
 
     let root_a = [0xAAu8; 32];
     let root_b = [0xBBu8; 32];
     let topic_a = [0x11u8; 32];
     let topic_b = [0x22u8; 32];
     for (r, t) in [(root_a, topic_a), (root_b, topic_b)] {
-        registry.insert_if_absent(&r, TenantRecord {
-            registered_at: 0,
-            status: TenantStatus::Active,
-            retention_budget_bytes: u64::MAX,
-        }).unwrap();
+        registry
+            .insert_if_absent(
+                &r,
+                TenantRecord {
+                    registered_at: 0,
+                    status: TenantStatus::Active,
+                    retention_budget_bytes: u64::MAX,
+                },
+            )
+            .unwrap();
         registry.register_topic(&r, &t).unwrap();
     }
 
@@ -54,8 +64,24 @@ fn two_tenants_isolated() {
 
     let dir_a = tmp.path().join("tenants").join(hex::encode(root_a));
     let dir_b = tmp.path().join("tenants").join(hex::encode(root_b));
-    assert!(dir_a.join(format!("log_{}.redb", hex::encode(topic_a))).exists());
-    assert!(dir_b.join(format!("log_{}.redb", hex::encode(topic_b))).exists());
-    assert!(!dir_a.join(format!("log_{}.redb", hex::encode(topic_b))).exists());
-    assert!(!dir_b.join(format!("log_{}.redb", hex::encode(topic_a))).exists());
+    assert!(
+        dir_a
+            .join(format!("log_{}.redb", hex::encode(topic_a)))
+            .exists()
+    );
+    assert!(
+        dir_b
+            .join(format!("log_{}.redb", hex::encode(topic_b)))
+            .exists()
+    );
+    assert!(
+        !dir_a
+            .join(format!("log_{}.redb", hex::encode(topic_b)))
+            .exists()
+    );
+    assert!(
+        !dir_b
+            .join(format!("log_{}.redb", hex::encode(topic_a)))
+            .exists()
+    );
 }
