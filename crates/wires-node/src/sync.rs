@@ -5,20 +5,19 @@ use wires_net::replay::{HwmEntry, ReplaySource};
 use wires_store::StoreError;
 
 use crate::error::{Result, StoreSnafu};
-use crate::inbound::{process, Inbound, InboundCtx};
+use crate::inbound::{Inbound, InboundCtx, process};
+
+type Hwm = HashMap<[u8; 32], (u64, [u8; 32])>;
 
 /// Read the hwm from the topic log, returning an empty map if the table has
 /// not yet been created (i.e. no messages have ever been written).
-fn read_hwm(
-    ctx: &InboundCtx,
-) -> Result<HashMap<[u8; 32], (u64, [u8; 32])>> {
+fn read_hwm(ctx: &InboundCtx) -> Result<Hwm> {
     match ctx.topic_log.hwm() {
         Ok(m) => Ok(m),
-        Err(StoreError::OpenTable { source, .. })
-            if matches!(source, redb::TableError::TableDoesNotExist(_)) =>
-        {
-            Ok(HashMap::new())
-        }
+        Err(StoreError::OpenTable {
+            source: redb::TableError::TableDoesNotExist(_),
+            ..
+        }) => Ok(HashMap::new()),
         Err(e) => Err(e).context(StoreSnafu),
     }
 }
@@ -44,13 +43,12 @@ pub fn drive_sync_pass(
     let mut applied = 0usize;
     for sender in senders {
         let after = hwm.get(&sender).map(|(s, _)| *s);
-        let batch =
-            source
-                .read_after(topic_id, &sender, after, 1024)
-                .map_err(|e| crate::error::NodeError::Config {
-                    message: format!("replay source failure: {e}"),
-                    location: snafu::location!(),
-                })?;
+        let batch = source
+            .read_after(topic_id, &sender, after, 1024)
+            .map_err(|e| crate::error::NodeError::Config {
+                message: format!("replay source failure: {e}"),
+                location: snafu::location!(),
+            })?;
         for msg in batch {
             match process(ctx, msg)? {
                 Inbound::Accepted { .. } | Inbound::AcceptedOpaque { .. } => applied += 1,
@@ -76,7 +74,7 @@ pub fn current_hwm_for_request(ctx: &InboundCtx) -> Result<HashMap<String, HwmEn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::publish::{build_message, KeyingMaterial, PublishParams};
+    use crate::publish::{KeyingMaterial, PublishParams, build_message};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use std::sync::{Arc, Mutex};
@@ -84,7 +82,9 @@ mod tests {
     use wires_core::cap::Right;
     use wires_core::{CanonicalContent, Capability, MessageKind, WireMessage};
     use wires_crypto::{X25519Public, X25519Secret};
-    use wires_store::{open_caps, open_topic_keys, open_topic_log, CapTable, EpochKeyStore, TopicLog};
+    use wires_store::{
+        CapTable, EpochKeyStore, TopicLog, open_caps, open_topic_keys, open_topic_log,
+    };
 
     /// In-memory replay source for testing.
     struct MemSource {
@@ -98,7 +98,8 @@ mod tests {
             sender: &[u8; 32],
             after_seq: Option<u64>,
             limit: usize,
-        ) -> std::result::Result<Vec<WireMessage>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> std::result::Result<Vec<WireMessage>, Box<dyn std::error::Error + Send + Sync>>
+        {
             let lock = self.msgs.lock().unwrap();
             let mut out: Vec<WireMessage> = lock
                 .iter()
@@ -149,24 +150,41 @@ mod tests {
         caps.upsert_grant(&cap).unwrap();
 
         let m0 = build_message(&PublishParams {
-            topic_id: [1u8; 32], sender_sk: &sender_sk, cap_id: cap.cap_id.0,
+            topic_id: [1u8; 32],
+            sender_sk: &sender_sk,
+            cap_id: cap.cap_id.0,
             kind: MessageKind::Public,
             content: CanonicalContent::new("__cap.revoke", "a"),
-            epoch: 0, seq: 0, prev_hash: [0u8; 32], timestamp: 1,
+            epoch: 0,
+            seq: 0,
+            prev_hash: [0u8; 32],
+            timestamp: 1,
             keying: KeyingMaterial::Public,
-        }).unwrap();
+        })
+        .unwrap();
         let m1 = build_message(&PublishParams {
-            topic_id: [1u8; 32], sender_sk: &sender_sk, cap_id: cap.cap_id.0,
+            topic_id: [1u8; 32],
+            sender_sk: &sender_sk,
+            cap_id: cap.cap_id.0,
             kind: MessageKind::Public,
             content: CanonicalContent::new("__cap.revoke", "b"),
-            epoch: 0, seq: 1, prev_hash: m0.message_hash().unwrap(),
-            timestamp: 2, keying: KeyingMaterial::Public,
-        }).unwrap();
+            epoch: 0,
+            seq: 1,
+            prev_hash: m0.message_hash().unwrap(),
+            timestamp: 2,
+            keying: KeyingMaterial::Public,
+        })
+        .unwrap();
 
-        let source = MemSource { msgs: Mutex::new(vec![m0, m1]) };
+        let source = MemSource {
+            msgs: Mutex::new(vec![m0, m1]),
+        };
         let ctx = InboundCtx {
-            topic_log: &log, epoch_keys: &keys, cap_table: &caps,
-            self_x25519_sk: &xsk, self_x25519_pk: &xpk,
+            topic_log: &log,
+            epoch_keys: &keys,
+            cap_table: &caps,
+            self_x25519_sk: &xsk,
+            self_x25519_pk: &xpk,
         };
         let applied = drive_sync_pass(&ctx, &source, &[1u8; 32]).unwrap();
         assert_eq!(applied, 2);
@@ -185,10 +203,15 @@ mod tests {
         let xsk = X25519Secret::random_from_rng(OsRng);
         let xpk = X25519Public::from(&xsk).to_bytes();
 
-        let source = MemSource { msgs: Mutex::new(vec![]) };
+        let source = MemSource {
+            msgs: Mutex::new(vec![]),
+        };
         let ctx = InboundCtx {
-            topic_log: &log, epoch_keys: &keys, cap_table: &caps,
-            self_x25519_sk: &xsk, self_x25519_pk: &xpk,
+            topic_log: &log,
+            epoch_keys: &keys,
+            cap_table: &caps,
+            self_x25519_sk: &xsk,
+            self_x25519_pk: &xpk,
         };
         let applied = drive_sync_pass(&ctx, &source, &[1u8; 32]).unwrap();
         assert_eq!(applied, 0);
@@ -204,15 +227,26 @@ mod tests {
         let xpk = X25519Public::from(&xsk).to_bytes();
 
         let m = WireMessage {
-            topic_id: [1u8; 32], epoch: 0, kind: MessageKind::Standard,
-            sender: [7u8; 32], cap_id: [0u8; 16], seq: 0, prev_hash: [0u8; 32],
-            timestamp: 0, payload_len: 0, signature: [0u8; 64], ciphertext: vec![],
+            topic_id: [1u8; 32],
+            epoch: 0,
+            kind: MessageKind::Standard,
+            sender: [7u8; 32],
+            cap_id: [0u8; 16],
+            seq: 0,
+            prev_hash: [0u8; 32],
+            timestamp: 0,
+            payload_len: 0,
+            signature: [0u8; 64],
+            ciphertext: vec![],
         };
         log.append(&m).unwrap();
 
         let ctx = InboundCtx {
-            topic_log: &log, epoch_keys: &keys, cap_table: &caps,
-            self_x25519_sk: &xsk, self_x25519_pk: &xpk,
+            topic_log: &log,
+            epoch_keys: &keys,
+            cap_table: &caps,
+            self_x25519_sk: &xsk,
+            self_x25519_pk: &xpk,
         };
         let map = current_hwm_for_request(&ctx).unwrap();
         assert_eq!(map.len(), 1);

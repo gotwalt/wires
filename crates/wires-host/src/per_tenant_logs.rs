@@ -12,9 +12,11 @@ use wires_store::TopicLog;
 
 use crate::error::{DbOpenSnafu, IoSnafu, Result};
 
+type TopicLogCache = HashMap<([u8; 32], [u8; 32]), Arc<TopicLog>>;
+
 pub struct PerTenantLogs {
     root: PathBuf,
-    cache: RwLock<HashMap<([u8; 32], [u8; 32]), Arc<TopicLog>>>,
+    cache: RwLock<TopicLogCache>,
 }
 
 impl PerTenantLogs {
@@ -90,7 +92,15 @@ mod tests {
         log_b.append(&dummy_msg(8, 0)).unwrap();
         assert!(logs.tenant_dir(&root_a).exists());
         assert!(logs.tenant_dir(&root_b).exists());
-        assert!(logs.tenant_dir(&root_a).join(format!("log_{}.redb", hex::encode(topic))).exists());
-        assert!(logs.tenant_dir(&root_b).join(format!("log_{}.redb", hex::encode(topic))).exists());
+        assert!(
+            logs.tenant_dir(&root_a)
+                .join(format!("log_{}.redb", hex::encode(topic)))
+                .exists()
+        );
+        assert!(
+            logs.tenant_dir(&root_b)
+                .join(format!("log_{}.redb", hex::encode(topic)))
+                .exists()
+        );
     }
 }
