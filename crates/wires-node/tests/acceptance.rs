@@ -128,6 +128,82 @@ fn criterion_2_replay_after_outage() {
     }
 }
 
+/// Criterion 4: Revocation. Sender's prior messages still verify, but post-revoke
+/// messages are refused at the receiver.
+#[test]
+#[ignore]
+fn criterion_4_revocation_takes_effect() {
+    let root = SigningKey::generate(&mut OsRng);
+    let root_hex = hex::encode(root.verifying_key().to_bytes());
+    let (_a_dir, a) = open_node(TempDir::new().unwrap(), &root_hex);
+    let (_b_dir, b) = open_node(TempDir::new().unwrap(), &root_hex);
+
+    let a_pk = a.ed_sk.verifying_key().to_bytes();
+    let cap = mint_cap(&root, a_pk, vec!["home.test".into()], vec![Right::Read, Right::Write]);
+    let cap_id = cap.cap_id.0;
+    a.caps.upsert_grant(&cap).unwrap();
+    b.caps.upsert_grant(&cap).unwrap();
+    let topic = [42u8; 32];
+    a.install_epoch_key(topic, 0, [7u8; 32]).unwrap();
+    b.install_epoch_key(topic, 0, [7u8; 32]).unwrap();
+
+    let m_pre = a
+        .publish_standard(topic, cap_id, CanonicalContent::new("home.test", "before"))
+        .unwrap();
+    b.handle_inbound(m_pre).unwrap();
+
+    // Revoke on B side
+    b.caps.mark_revoked(&cap_id, &[0u8; 32]).unwrap();
+
+    let m_post = a
+        .publish_standard(topic, cap_id, CanonicalContent::new("home.test", "after"))
+        .unwrap();
+    let result = b.handle_inbound(m_post).unwrap();
+    match result {
+        Inbound::Rejected { reason, .. } => assert!(reason.contains("cap"), "unexpected reason: {reason}"),
+        other => panic!("expected rejection after revocation, got {other:?}"),
+    }
+
+    // Prior message stays in B's log; post-revoke is absent
+    let log_b = b.logs.get_or_open(&topic).unwrap();
+    let got = log_b.read_all().unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].seq, 0);
+}
+
+/// Criterion 6: `cat` produces human-readable output — i.e. the decrypted
+/// content includes `type` and `text` fields readable on the wire.
+#[test]
+#[ignore]
+fn criterion_6_cat_is_human_readable() {
+    let root = SigningKey::generate(&mut OsRng);
+    let root_hex = hex::encode(root.verifying_key().to_bytes());
+    let (_a_dir, a) = open_node(TempDir::new().unwrap(), &root_hex);
+
+    let a_pk = a.ed_sk.verifying_key().to_bytes();
+    let cap = mint_cap(&root, a_pk, vec!["home.test".into()], vec![Right::Read, Right::Write]);
+    a.caps.upsert_grant(&cap).unwrap();
+    let topic = [42u8; 32];
+    a.install_epoch_key(topic, 0, [7u8; 32]).unwrap();
+
+    let msg = a
+        .publish_standard(
+            topic,
+            cap.cap_id.0,
+            CanonicalContent::new("home.fridge.temp", "fridge at 38F"),
+        )
+        .unwrap();
+    let outcome = a.handle_inbound(msg.clone()).unwrap();
+    match outcome {
+        Inbound::Accepted { content: Some(c), .. } => {
+            assert_eq!(c.type_, "home.fridge.temp");
+            assert!(c.text.contains("fridge"));
+            assert!(c.text.contains("38F"));
+        }
+        other => panic!("expected accepted-with-content, got {other:?}"),
+    }
+}
+
 /// Criterion 3: New agent bootstrapped later receives full history when given
 /// the same epoch key. (In production the key arrives via a `__topic.history_grant`
 /// event; here we install it directly to simulate.)
