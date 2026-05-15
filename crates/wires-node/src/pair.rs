@@ -6,6 +6,7 @@ use std::path::Path;
 use snafu::{ResultExt, ensure};
 use wires_net::pair::PairGrant;
 
+use crate::atomic_write::atomic_write;
 use crate::config::{HostConfig, NodeConfig};
 use crate::error::{
     AgentMismatchSnafu, ConfigWriteSnafu, NodeError, Result, UnknownTopicSnafu, UpsertCapSnafu,
@@ -63,7 +64,7 @@ pub fn install_grant(
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
         location: snafu::location!(),
     })?;
-    std::fs::write(&cfg_path, toml_str).context(ConfigWriteSnafu)?;
+    atomic_write(&cfg_path, toml_str.as_bytes(), None).context(ConfigWriteSnafu)?;
 
     upsert_topic_names(
         data_dir,
