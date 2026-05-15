@@ -16,7 +16,7 @@ use snafu::{ResultExt, ensure};
 
 use crate::error::{
     NetError, Result, TicketBoundsSnafu, TicketDecodeSnafu, TicketInvalidEndpointIdSnafu,
-    TicketParseSnafu, TicketUnsupportedVersionSnafu,
+    TicketParseSnafu, TicketQrRenderSnafu, TicketUnsupportedVersionSnafu,
 };
 
 pub const TICKET_VERSION: u8 = 1;
@@ -150,11 +150,7 @@ impl HostTicket {
     /// writes it wherever it likes (typically stderr).
     pub fn render_qr_ansi(&self) -> Result<String> {
         let payload = self.encode()?;
-        let code = qrcode::QrCode::new(payload.as_bytes())
-            .map_err(|source| NetError::TicketQrRender {
-                source,
-                location: snafu::location!(),
-            })?;
+        let code = qrcode::QrCode::new(payload.as_bytes()).context(TicketQrRenderSnafu)?;
         let s = code
             .render::<qrcode::render::unicode::Dense1x2>()
             .dark_color(qrcode::render::unicode::Dense1x2::Light)
