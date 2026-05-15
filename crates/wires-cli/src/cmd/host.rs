@@ -5,8 +5,8 @@
 use std::path::Path;
 
 use ed25519_dalek::SigningKey;
-use iroh::{Endpoint, SecretKey, endpoint::presets};
-use snafu::{ResultExt, location};
+use iroh::{Endpoint, SecretKey};
+use snafu::ResultExt;
 use wires_net::tenant::{TenantClient, TenantResponse};
 use wires_net::{endpoint_id_from_hex, fetch_endpoints, load_or_create_secret, unix_now_ms};
 use wires_node::{HostConfig, NodeConfig, load_root_signing_key, resolve_topic};
@@ -87,14 +87,9 @@ async fn open_paired_client(
 }
 
 async fn bind_endpoint(secret: [u8; 32]) -> Result<Endpoint> {
-    Endpoint::builder(presets::N0)
-        .secret_key(SecretKey::from_bytes(&secret))
-        .bind()
+    wires_net::bind_lan(SecretKey::from_bytes(&secret), vec![])
         .await
-        .map_err(|e| CliError::Endpoint {
-            message: format!("bind: {e}"),
-            location: location!(),
-        })
+        .context(NetSnafu)
 }
 
 pub async fn topic_register(data_dir: &Path, topic: &str) -> Result<()> {

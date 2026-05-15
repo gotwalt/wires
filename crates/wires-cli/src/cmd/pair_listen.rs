@@ -3,14 +3,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use iroh::{Endpoint, SecretKey, endpoint::presets};
-use snafu::{ResultExt, location};
+use iroh::SecretKey;
+use snafu::ResultExt;
 use wires_core::cap::Right;
 use wires_net::load_or_create_secret;
 use wires_net::pair::{PairManifest, RequestedScope};
 use wires_node::{Node, NodeConfig, PairListenArgs, PairOutcome, pair_listen as run_listen};
 
-use crate::error::{CliError, IoSnafu, NetSnafu, NodeSnafu, Result, TomlParseSnafu};
+use crate::error::{IoSnafu, NetSnafu, NodeSnafu, Result, TomlParseSnafu};
 use crate::invalid;
 
 pub async fn run(
@@ -35,14 +35,9 @@ pub async fn run(
             .to_bytes();
 
     let secret = load_or_create_secret(&data_dir.join("iroh.secret")).context(NetSnafu)?;
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(SecretKey::from_bytes(&secret))
-        .bind()
+    let endpoint = wires_net::bind_lan(SecretKey::from_bytes(&secret), vec![])
         .await
-        .map_err(|e| CliError::Endpoint {
-            message: format!("bind: {e}"),
-            location: location!(),
-        })?;
+        .context(NetSnafu)?;
 
     let started = run_listen(
         data_dir.to_path_buf(),
