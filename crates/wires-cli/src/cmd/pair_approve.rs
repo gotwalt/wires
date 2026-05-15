@@ -6,11 +6,11 @@ use ed25519_dalek::SigningKey;
 use iroh::{Endpoint, SecretKey, endpoint::presets};
 use wires_core::Capability;
 use wires_core::cap::Right;
+use wires_net::load_or_create_secret;
 use wires_net::pair::{
     HostInfo, PairClient, PairGrant, PairGrantEnvelope, PairRequest, RequestedScope, TopicEpochKey,
     TopicNameEntry,
 };
-use wires_net::load_or_create_secret;
 use wires_node::{Node, NodeConfig};
 
 pub async fn run(
@@ -102,8 +102,7 @@ pub async fn run(
         nonce: request.nonce,
         issued_at: now,
     };
-    let envelope =
-        PairGrantEnvelope::seal_and_sign(&grant, &request.ephemeral_x25519, &root_sk)?;
+    let envelope = PairGrantEnvelope::seal_and_sign(&grant, &request.ephemeral_x25519, &root_sk)?;
 
     let secret = load_or_create_secret(&data_dir.join("iroh.secret"))?;
     let endpoint = Endpoint::builder(presets::N0)
@@ -139,7 +138,10 @@ fn print_manifest(req: &PairRequest, now_ms: i64) {
     }
     println!("  issued_at   : {} (ms)", req.issued_at);
     let remaining_s = (req.expires - now_ms).max(0) / 1000;
-    println!("  expires_at  : {} ({}s remaining)", req.expires, remaining_s);
+    println!(
+        "  expires_at  : {} ({}s remaining)",
+        req.expires, remaining_s
+    );
     println!("  nonce       : {}...", &hex::encode(req.nonce)[..16]);
 }
 
@@ -148,7 +150,10 @@ fn prompt_yes_no(prompt: &str) -> std::io::Result<bool> {
     std::io::stdout().flush()?;
     let mut buf = String::new();
     std::io::stdin().read_line(&mut buf)?;
-    Ok(matches!(buf.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    Ok(matches!(
+        buf.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn load_topic_names(
@@ -162,9 +167,7 @@ fn load_topic_names(
     let mut out = HashMap::new();
     for (k, v) in raw {
         let bytes = hex::decode(&v)?;
-        let arr: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| "topic_id must be 32 bytes")?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| "topic_id must be 32 bytes")?;
         out.insert(k, arr);
     }
     Ok(out)

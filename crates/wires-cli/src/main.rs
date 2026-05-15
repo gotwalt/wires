@@ -148,9 +148,13 @@ async fn main() -> std::process::ExitCode {
             ttl,
             qr,
         } => cmd::pair_listen::run(&data_dir, role, description, request, ttl.into(), qr).await,
-        Cmd::PairApprove { token, scope, topics, no_host, yes } => {
-            cmd::pair_approve::run(&data_dir, &token, scope, topics, no_host, yes).await
-        }
+        Cmd::PairApprove {
+            token,
+            scope,
+            topics,
+            no_host,
+            yes,
+        } => cmd::pair_approve::run(&data_dir, &token, scope, topics, no_host, yes).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

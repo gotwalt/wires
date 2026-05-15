@@ -31,7 +31,11 @@ fn fresh_setup(td: &TempDir, expected_nonce: [u8; 32]) -> Setup {
         root_pubkey_hex: String::new(),
         host: None,
     };
-    std::fs::write(td.path().join("config.toml"), toml::to_string_pretty(&cfg).unwrap()).unwrap();
+    std::fs::write(
+        td.path().join("config.toml"),
+        toml::to_string_pretty(&cfg).unwrap(),
+    )
+    .unwrap();
     let node = Arc::new(Node::open(cfg).unwrap());
 
     let ephemeral_sk = XSk::random_from_rng(OsRng);
@@ -46,7 +50,12 @@ fn fresh_setup(td: &TempDir, expected_nonce: [u8; 32]) -> Setup {
         i64::MAX,
         tx,
     );
-    Setup { handler, agent_pk, ephemeral_pk, outcome_rx: rx }
+    Setup {
+        handler,
+        agent_pk,
+        ephemeral_pk,
+        outcome_rx: rx,
+    }
 }
 
 fn signed_cap(root_sk: &SigningKey, agent_pk: [u8; 32]) -> Capability {
@@ -72,8 +81,15 @@ async fn happy_path_returns_ack_and_signals_outcome() {
         version: 1,
         root_pubkey: root_sk.verifying_key().to_bytes(),
         cap: signed_cap(&root_sk, setup.agent_pk),
-        topic_keys: vec![TopicEpochKey { topic_id, epoch: 0, key: [8u8; 32] }],
-        topic_names: vec![TopicNameEntry { topic_id, name: "home.notes".into() }],
+        topic_keys: vec![TopicEpochKey {
+            topic_id,
+            epoch: 0,
+            key: [8u8; 32],
+        }],
+        topic_names: vec![TopicNameEntry {
+            topic_id,
+            name: "home.notes".into(),
+        }],
         host: None,
         nonce,
         issued_at: 1_700_000_000_000,
@@ -147,8 +163,15 @@ async fn already_paired_after_first_success() {
         version: 1,
         root_pubkey: root_sk.verifying_key().to_bytes(),
         cap: signed_cap(&root_sk, setup.agent_pk),
-        topic_keys: vec![TopicEpochKey { topic_id, epoch: 0, key: [8u8; 32] }],
-        topic_names: vec![TopicNameEntry { topic_id, name: "home.notes".into() }],
+        topic_keys: vec![TopicEpochKey {
+            topic_id,
+            epoch: 0,
+            key: [8u8; 32],
+        }],
+        topic_names: vec![TopicNameEntry {
+            topic_id,
+            name: "home.notes".into(),
+        }],
         host: None,
         nonce,
         issued_at: 0,

@@ -2,8 +2,8 @@ use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
-use wires_core::cap::Right;
 use wires_core::Capability;
+use wires_core::cap::Right;
 use wires_node::{Node, NodeConfig};
 
 pub async fn create(data_dir: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {

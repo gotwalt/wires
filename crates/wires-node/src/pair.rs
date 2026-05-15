@@ -26,12 +26,17 @@ pub fn install_grant(
     // 1. Cap target sanity: signed cap must name us.
     ensure!(&grant.cap.agent == self_agent_pubkey, AgentMismatchSnafu);
     // 2. Cap must be signed by the claimed root.
-    grant.cap.verify(&grant.root_pubkey).context(VerifyCapSnafu)?;
+    grant
+        .cap
+        .verify(&grant.root_pubkey)
+        .context(VerifyCapSnafu)?;
     // 3. Every topic_key references a topic that also has a name entry.
     for tk in &grant.topic_keys {
         ensure!(
             grant.topic_names.iter().any(|n| n.topic_id == tk.topic_id),
-            UnknownTopicSnafu { topic_id_hex: hex::encode(tk.topic_id) }
+            UnknownTopicSnafu {
+                topic_id_hex: hex::encode(tk.topic_id)
+            }
         );
     }
 
@@ -85,7 +90,9 @@ pub fn install_grant(
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
-use wires_net::pair::{PairAck, PairFrame, PairGrantEnvelope, PairHandler, PairReject, PairRejectCode};
+use wires_net::pair::{
+    PairAck, PairFrame, PairGrantEnvelope, PairHandler, PairReject, PairRejectCode,
+};
 use x25519_dalek::StaticSecret;
 
 /// Outcome signaled to the outer pair-listen loop on a successful install.
@@ -141,7 +148,10 @@ impl PairHandler for NodePairHandler {
     async fn handle_grant(&self, envelope: PairGrantEnvelope) -> PairFrame {
         let mut state = self.inner.lock().await;
         if state.completed {
-            return reject(PairRejectCode::AlreadyPaired, "already paired in this window");
+            return reject(
+                PairRejectCode::AlreadyPaired,
+                "already paired in this window",
+            );
         }
 
         let grant = match envelope.open_and_verify(&state.ephemeral_secret, &state.expected_nonce) {
@@ -150,7 +160,10 @@ impl PairHandler for NodePairHandler {
                 return reject(PairRejectCode::SignatureInvalid, "signature invalid");
             }
             Err(wires_net::NetError::PairCrypto { .. }) => {
-                return reject(PairRejectCode::SealUndecryptable, "sealed payload undecryptable");
+                return reject(
+                    PairRejectCode::SealUndecryptable,
+                    "sealed payload undecryptable",
+                );
             }
             Err(e) => {
                 return reject(PairRejectCode::InternalError, &format!("{e}"));
@@ -164,10 +177,18 @@ impl PairHandler for NodePairHandler {
             return reject(PairRejectCode::NonceMismatch, "nonce mismatch");
         }
         if grant.issued_at > state.request_expires_ms {
-            return reject(PairRejectCode::NonceExpired, "grant issued after request expired");
+            return reject(
+                PairRejectCode::NonceExpired,
+                "grant issued after request expired",
+            );
         }
 
-        match install_grant(&state.data_dir.clone(), &state.node, &state.self_agent_pubkey, &grant) {
+        match install_grant(
+            &state.data_dir.clone(),
+            &state.node,
+            &state.self_agent_pubkey,
+            &grant,
+        ) {
             Ok(out) => {
                 if let Err(e) = crate::pair_pending::delete(&state.data_dir) {
                     return reject(
@@ -190,12 +211,11 @@ impl PairHandler for NodePairHandler {
             Err(NodeError::VerifyCap { .. }) => {
                 reject(PairRejectCode::CapInvalid, "cap failed root verification")
             }
-            Err(NodeError::UnknownTopic { .. }) => {
-                reject(PairRejectCode::CapInvalid, "grant references unknown topic_id")
-            }
-            Err(e) => {
-                reject(PairRejectCode::InternalError, &format!("{e}"))
-            }
+            Err(NodeError::UnknownTopic { .. }) => reject(
+                PairRejectCode::CapInvalid,
+                "grant references unknown topic_id",
+            ),
+            Err(e) => reject(PairRejectCode::InternalError, &format!("{e}")),
         }
     }
 }
@@ -288,12 +308,10 @@ pub async fn pair_listen(
                 source: Box::new(source),
                 location: snafu::location!(),
             })?;
-        let token = req
-            .encode()
-            .map_err(|source| NodeError::PairListenSign {
-                source: Box::new(source),
-                location: snafu::location!(),
-            })?;
+        let token = req.encode().map_err(|source| NodeError::PairListenSign {
+            source: Box::new(source),
+            location: snafu::location!(),
+        })?;
         crate::pair_pending::save(
             &data_dir,
             &crate::pair_pending::PairPending {
@@ -349,7 +367,11 @@ fn pair_dial_from(endpoint: &iroh::Endpoint) -> PairDial {
             _ => {}
         }
     }
-    PairDial { node_id, addrs, relay }
+    PairDial {
+        node_id,
+        addrs,
+        relay,
+    }
 }
 
 fn hex_to_arr32(s: &str) -> crate::error::Result<[u8; 32]> {

@@ -13,15 +13,15 @@ pub use discovery::{DiscoveryEndpoint, DiscoveryResponse, fetch_endpoints};
 pub use error::{NetError, Result};
 pub use gossip::{GOSSIP_ALPN, Gossip, GossipHandle, GossipNode};
 pub use identity::load_or_create_secret;
-pub use peer_hint::{DialOutcome, PeerHint, first_reachable, first_reachable_with_discovery};
-pub use replay::{
-    ALPN, HwmEntry, ReplayClient, ReplayProtocol, ReplayRequest, ReplayResponseFrame, ReplaySource,
-};
 pub use pair::{
     ALPN as PAIR_ALPN, HostInfo as PairHostInfo, MAX_FRAME_LEN as PAIR_MAX_FRAME_LEN, PairAck,
     PairClient, PairDial, PairFrame, PairGrant, PairGrantEnvelope, PairHandler, PairManifest,
     PairProtocol, PairReject, PairRejectCode, PairRequest, RequestedScope, TopicEpochKey,
     TopicNameEntry,
+};
+pub use peer_hint::{DialOutcome, PeerHint, first_reachable, first_reachable_with_discovery};
+pub use replay::{
+    ALPN, HwmEntry, ReplayClient, ReplayProtocol, ReplayRequest, ReplayResponseFrame, ReplaySource,
 };
 pub use tenant::{
     ALPN as TENANT_ALPN, TenantClient, TenantErrorCode, TenantErrorResponse, TenantHandler,
