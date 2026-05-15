@@ -63,6 +63,14 @@ pub enum NetError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Discovery fetch failed for {url}, at {location}"))]
+    DiscoveryFetch {
+        url: String,
+        #[snafu(source)]
+        source: reqwest::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = NetError> = core::result::Result<T, E>;
