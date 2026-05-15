@@ -145,6 +145,23 @@ impl HostTicket {
             relay: self.relay.clone(),
         }
     }
+
+    /// Render the encoded ticket as an ANSI half-block QR string. Caller
+    /// writes it wherever it likes (typically stderr).
+    pub fn render_qr_ansi(&self) -> Result<String> {
+        let payload = self.encode()?;
+        let code = qrcode::QrCode::new(payload.as_bytes())
+            .map_err(|source| NetError::TicketQrRender {
+                source,
+                location: snafu::location!(),
+            })?;
+        let s = code
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .dark_color(qrcode::render::unicode::Dense1x2::Light)
+            .light_color(qrcode::render::unicode::Dense1x2::Dark)
+            .build();
+        Ok(s)
+    }
 }
 
 #[cfg(test)]
@@ -261,5 +278,18 @@ mod tests {
         assert_eq!(h.node_id, t.endpoint_id);
         assert_eq!(h.addrs, t.addrs);
         assert_eq!(h.relay, t.relay);
+    }
+
+    #[test]
+    fn render_qr_ansi_produces_block_art() {
+        let t = sample();
+        let s = t.render_qr_ansi().unwrap();
+        assert!(!s.is_empty(), "rendered QR must be non-empty");
+        // Dense1x2 renderer uses half-block characters; sanity-check at least
+        // one is present.
+        assert!(
+            s.chars().any(|c| c == '\u{2580}' || c == '\u{2584}' || c == '\u{2588}'),
+            "rendered string should contain block art chars"
+        );
     }
 }
