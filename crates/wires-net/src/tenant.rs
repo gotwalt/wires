@@ -143,69 +143,52 @@ pub enum TenantErrorCode {
     Internal,
 }
 
-const REGISTER_DOMAIN: &[u8] = b"wires-tenant-register-v1\0";
-const TOPIC_REGISTER_DOMAIN: &[u8] = b"wires-topic-register-v1\0";
-const TOPIC_UNREGISTER_DOMAIN: &[u8] = b"wires-topic-unregister-v1\0";
-const STATUS_DOMAIN: &[u8] = b"wires-tenant-status-v1\0";
-
-pub fn register_signing_bytes(
-    root_pubkey: &[u8; 32],
-    timestamp: i64,
-    nonce: &[u8; 16],
-    host_endpoint_id: &[u8; 32],
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(REGISTER_DOMAIN.len() + 32 + 8 + 16 + 32);
-    out.extend_from_slice(REGISTER_DOMAIN);
-    out.extend_from_slice(root_pubkey);
-    out.extend_from_slice(&timestamp.to_le_bytes());
-    out.extend_from_slice(nonce);
-    out.extend_from_slice(host_endpoint_id);
-    out
+/// The four control-plane operations. Each one's signed bytes are domain-
+/// separated (spec §4.2) so signatures from one operation can never be
+/// replayed as another.
+#[derive(Debug, Clone, Copy)]
+pub enum TenantOp<'a> {
+    Register,
+    TopicRegister(&'a [u8; 32]),
+    TopicUnregister(&'a [u8; 32]),
+    Status,
 }
 
-pub fn topic_register_signing_bytes(
-    root_pubkey: &[u8; 32],
-    topic_id: &[u8; 32],
-    timestamp: i64,
-    nonce: &[u8; 16],
-    host_endpoint_id: &[u8; 32],
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(TOPIC_REGISTER_DOMAIN.len() + 32 + 32 + 8 + 16 + 32);
-    out.extend_from_slice(TOPIC_REGISTER_DOMAIN);
-    out.extend_from_slice(root_pubkey);
-    out.extend_from_slice(topic_id);
-    out.extend_from_slice(&timestamp.to_le_bytes());
-    out.extend_from_slice(nonce);
-    out.extend_from_slice(host_endpoint_id);
-    out
+impl TenantOp<'_> {
+    fn domain(&self) -> &'static [u8] {
+        match self {
+            TenantOp::Register => b"wires-tenant-register-v1\0",
+            TenantOp::TopicRegister(_) => b"wires-topic-register-v1\0",
+            TenantOp::TopicUnregister(_) => b"wires-topic-unregister-v1\0",
+            TenantOp::Status => b"wires-tenant-status-v1\0",
+        }
+    }
+
+    fn topic_id(&self) -> Option<&[u8; 32]> {
+        match self {
+            TenantOp::TopicRegister(t) | TenantOp::TopicUnregister(t) => Some(t),
+            TenantOp::Register | TenantOp::Status => None,
+        }
+    }
 }
 
-pub fn topic_unregister_signing_bytes(
-    root_pubkey: &[u8; 32],
-    topic_id: &[u8; 32],
-    timestamp: i64,
-    nonce: &[u8; 16],
-    host_endpoint_id: &[u8; 32],
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(TOPIC_UNREGISTER_DOMAIN.len() + 32 + 32 + 8 + 16 + 32);
-    out.extend_from_slice(TOPIC_UNREGISTER_DOMAIN);
-    out.extend_from_slice(root_pubkey);
-    out.extend_from_slice(topic_id);
-    out.extend_from_slice(&timestamp.to_le_bytes());
-    out.extend_from_slice(nonce);
-    out.extend_from_slice(host_endpoint_id);
-    out
-}
-
-pub fn status_signing_bytes(
+/// Canonical bytes to sign / verify for any tenant control-plane operation.
+/// Layout: `domain || root_pubkey || [topic_id] || timestamp_le || nonce || host_endpoint_id`.
+pub fn signing_bytes(
+    op: TenantOp<'_>,
     root_pubkey: &[u8; 32],
     timestamp: i64,
     nonce: &[u8; 16],
     host_endpoint_id: &[u8; 32],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(STATUS_DOMAIN.len() + 32 + 8 + 16 + 32);
-    out.extend_from_slice(STATUS_DOMAIN);
+    let topic = op.topic_id();
+    let domain = op.domain();
+    let mut out = Vec::with_capacity(domain.len() + 32 + topic.map_or(0, |_| 32) + 8 + 16 + 32);
+    out.extend_from_slice(domain);
     out.extend_from_slice(root_pubkey);
+    if let Some(t) = topic {
+        out.extend_from_slice(t);
+    }
     out.extend_from_slice(&timestamp.to_le_bytes());
     out.extend_from_slice(nonce);
     out.extend_from_slice(host_endpoint_id);
@@ -318,13 +301,15 @@ impl TenantClient {
         Ok(resp)
     }
 
-    /// Sign a `TenantRegisterRequest` with `root_signer` and dial `peer` to
-    /// send it. `host_endpoint_id` must be the 32-byte ID of the host at
-    /// `peer` (included in the signed bytes per spec §4.2). `timestamp_ms`
-    /// should be the caller's current UNIX millis (the host accepts ±60s).
-    pub async fn register_tenant(
+    /// Sign `op` with `root_signer` and dial `peer` to deliver the matching
+    /// `TenantRequest` variant. `host_endpoint_id` must be the 32-byte ID of
+    /// the host at `peer` (included in the signed bytes per spec §4.2).
+    /// `timestamp_ms` should be the caller's current UNIX millis (the host
+    /// accepts ±60s).
+    pub async fn signed_send(
         &self,
         peer: EndpointId,
+        op: TenantOp<'_>,
         root_signer: &ed25519_dalek::SigningKey,
         host_endpoint_id: &[u8; 32],
         timestamp_ms: i64,
@@ -334,16 +319,60 @@ impl TenantClient {
         let root_pubkey = root_signer.verifying_key().to_bytes();
         let mut nonce = [0u8; 16];
         rand_core::OsRng.fill_bytes(&mut nonce);
-        let bytes = register_signing_bytes(&root_pubkey, timestamp_ms, &nonce, host_endpoint_id);
+        let bytes = signing_bytes(op, &root_pubkey, timestamp_ms, &nonce, host_endpoint_id);
         let signature = root_signer.sign(&bytes).to_bytes();
-        let req = TenantRequest::Register(TenantRegisterRequest {
-            version: 1,
-            root_pubkey,
-            timestamp: timestamp_ms,
-            nonce,
-            signature,
-        });
+        let req = match op {
+            TenantOp::Register => TenantRequest::Register(TenantRegisterRequest {
+                version: 1,
+                root_pubkey,
+                timestamp: timestamp_ms,
+                nonce,
+                signature,
+            }),
+            TenantOp::TopicRegister(topic) => TenantRequest::TopicRegister(TopicRegisterRequest {
+                version: 1,
+                root_pubkey,
+                topic_id: *topic,
+                timestamp: timestamp_ms,
+                nonce,
+                signature,
+            }),
+            TenantOp::TopicUnregister(topic) => {
+                TenantRequest::TopicUnregister(TopicUnregisterRequest {
+                    version: 1,
+                    root_pubkey,
+                    topic_id: *topic,
+                    timestamp: timestamp_ms,
+                    nonce,
+                    signature,
+                })
+            }
+            TenantOp::Status => TenantRequest::Status(TenantStatusRequest {
+                version: 1,
+                root_pubkey,
+                timestamp: timestamp_ms,
+                nonce,
+                signature,
+            }),
+        };
         self.send(peer, &req).await
+    }
+
+    pub async fn register_tenant(
+        &self,
+        peer: EndpointId,
+        root_signer: &ed25519_dalek::SigningKey,
+        host_endpoint_id: &[u8; 32],
+        timestamp_ms: i64,
+    ) -> Result<TenantResponse> {
+        self.signed_send(
+            peer,
+            TenantOp::Register,
+            root_signer,
+            host_endpoint_id,
+            timestamp_ms,
+        )
+        .await
     }
 
     pub async fn register_topic(
@@ -354,28 +383,14 @@ impl TenantClient {
         host_endpoint_id: &[u8; 32],
         timestamp_ms: i64,
     ) -> Result<TenantResponse> {
-        use ed25519_dalek::Signer as _;
-        use rand_core::RngCore as _;
-        let root_pubkey = root_signer.verifying_key().to_bytes();
-        let mut nonce = [0u8; 16];
-        rand_core::OsRng.fill_bytes(&mut nonce);
-        let bytes = topic_register_signing_bytes(
-            &root_pubkey,
-            topic_id,
-            timestamp_ms,
-            &nonce,
+        self.signed_send(
+            peer,
+            TenantOp::TopicRegister(topic_id),
+            root_signer,
             host_endpoint_id,
-        );
-        let signature = root_signer.sign(&bytes).to_bytes();
-        let req = TenantRequest::TopicRegister(TopicRegisterRequest {
-            version: 1,
-            root_pubkey,
-            topic_id: *topic_id,
-            timestamp: timestamp_ms,
-            nonce,
-            signature,
-        });
-        self.send(peer, &req).await
+            timestamp_ms,
+        )
+        .await
     }
 
     pub async fn unregister_topic(
@@ -386,28 +401,14 @@ impl TenantClient {
         host_endpoint_id: &[u8; 32],
         timestamp_ms: i64,
     ) -> Result<TenantResponse> {
-        use ed25519_dalek::Signer as _;
-        use rand_core::RngCore as _;
-        let root_pubkey = root_signer.verifying_key().to_bytes();
-        let mut nonce = [0u8; 16];
-        rand_core::OsRng.fill_bytes(&mut nonce);
-        let bytes = topic_unregister_signing_bytes(
-            &root_pubkey,
-            topic_id,
-            timestamp_ms,
-            &nonce,
+        self.signed_send(
+            peer,
+            TenantOp::TopicUnregister(topic_id),
+            root_signer,
             host_endpoint_id,
-        );
-        let signature = root_signer.sign(&bytes).to_bytes();
-        let req = TenantRequest::TopicUnregister(TopicUnregisterRequest {
-            version: 1,
-            root_pubkey,
-            topic_id: *topic_id,
-            timestamp: timestamp_ms,
-            nonce,
-            signature,
-        });
-        self.send(peer, &req).await
+            timestamp_ms,
+        )
+        .await
     }
 
     pub async fn tenant_status(
@@ -417,21 +418,14 @@ impl TenantClient {
         host_endpoint_id: &[u8; 32],
         timestamp_ms: i64,
     ) -> Result<TenantResponse> {
-        use ed25519_dalek::Signer as _;
-        use rand_core::RngCore as _;
-        let root_pubkey = root_signer.verifying_key().to_bytes();
-        let mut nonce = [0u8; 16];
-        rand_core::OsRng.fill_bytes(&mut nonce);
-        let bytes = status_signing_bytes(&root_pubkey, timestamp_ms, &nonce, host_endpoint_id);
-        let signature = root_signer.sign(&bytes).to_bytes();
-        let req = TenantRequest::Status(TenantStatusRequest {
-            version: 1,
-            root_pubkey,
-            timestamp: timestamp_ms,
-            nonce,
-            signature,
-        });
-        self.send(peer, &req).await
+        self.signed_send(
+            peer,
+            TenantOp::Status,
+            root_signer,
+            host_endpoint_id,
+            timestamp_ms,
+        )
+        .await
     }
 }
 
@@ -461,15 +455,39 @@ mod tests {
 
     #[test]
     fn signing_bytes_change_with_each_field() {
-        let base = register_signing_bytes(&[1u8; 32], 1, &[2u8; 16], &[3u8; 32]);
-        let diff_root = register_signing_bytes(&[9u8; 32], 1, &[2u8; 16], &[3u8; 32]);
-        let diff_ts = register_signing_bytes(&[1u8; 32], 2, &[2u8; 16], &[3u8; 32]);
-        let diff_nonce = register_signing_bytes(&[1u8; 32], 1, &[7u8; 16], &[3u8; 32]);
-        let diff_host = register_signing_bytes(&[1u8; 32], 1, &[2u8; 16], &[8u8; 32]);
+        let base = signing_bytes(TenantOp::Register, &[1u8; 32], 1, &[2u8; 16], &[3u8; 32]);
+        let diff_root = signing_bytes(TenantOp::Register, &[9u8; 32], 1, &[2u8; 16], &[3u8; 32]);
+        let diff_ts = signing_bytes(TenantOp::Register, &[1u8; 32], 2, &[2u8; 16], &[3u8; 32]);
+        let diff_nonce = signing_bytes(TenantOp::Register, &[1u8; 32], 1, &[7u8; 16], &[3u8; 32]);
+        let diff_host = signing_bytes(TenantOp::Register, &[1u8; 32], 1, &[2u8; 16], &[8u8; 32]);
         assert_ne!(base, diff_root);
         assert_ne!(base, diff_ts);
         assert_ne!(base, diff_nonce);
         assert_ne!(base, diff_host);
+    }
+
+    #[test]
+    fn signing_bytes_distinguishes_topic_ops() {
+        let topic = [4u8; 32];
+        let r = signing_bytes(TenantOp::Register, &[1u8; 32], 1, &[2u8; 16], &[3u8; 32]);
+        let s = signing_bytes(TenantOp::Status, &[1u8; 32], 1, &[2u8; 16], &[3u8; 32]);
+        let tr = signing_bytes(
+            TenantOp::TopicRegister(&topic),
+            &[1u8; 32],
+            1,
+            &[2u8; 16],
+            &[3u8; 32],
+        );
+        let tu = signing_bytes(
+            TenantOp::TopicUnregister(&topic),
+            &[1u8; 32],
+            1,
+            &[2u8; 16],
+            &[3u8; 32],
+        );
+        assert_ne!(r, s);
+        assert_ne!(tr, tu);
+        assert_ne!(r, tr);
     }
 
     #[tokio::test]
@@ -484,7 +502,8 @@ mod tests {
             fn handle_register(&self, req: TenantRegisterRequest) -> TenantResponse {
                 // Verify the signature so we exercise the convenience function's signing.
                 use ed25519_dalek::{Verifier, VerifyingKey};
-                let bytes = register_signing_bytes(
+                let bytes = signing_bytes(
+                    TenantOp::Register,
                     &req.root_pubkey,
                     req.timestamp,
                     &req.nonce,
@@ -558,9 +577,9 @@ mod tests {
             }
             fn handle_topic_register(&self, req: TopicRegisterRequest) -> TenantResponse {
                 use ed25519_dalek::{Verifier, VerifyingKey};
-                let bytes = topic_register_signing_bytes(
+                let bytes = signing_bytes(
+                    TenantOp::TopicRegister(&req.topic_id),
                     &req.root_pubkey,
-                    &req.topic_id,
                     req.timestamp,
                     &req.nonce,
                     &self.host_id,
@@ -575,9 +594,9 @@ mod tests {
             }
             fn handle_topic_unregister(&self, req: TopicUnregisterRequest) -> TenantResponse {
                 use ed25519_dalek::{Verifier, VerifyingKey};
-                let bytes = topic_unregister_signing_bytes(
+                let bytes = signing_bytes(
+                    TenantOp::TopicUnregister(&req.topic_id),
                     &req.root_pubkey,
-                    &req.topic_id,
                     req.timestamp,
                     &req.nonce,
                     &self.host_id,
@@ -595,7 +614,8 @@ mod tests {
             }
             fn handle_status(&self, req: TenantStatusRequest) -> TenantResponse {
                 use ed25519_dalek::{Verifier, VerifyingKey};
-                let bytes = status_signing_bytes(
+                let bytes = signing_bytes(
+                    TenantOp::Status,
                     &req.root_pubkey,
                     req.timestamp,
                     &req.nonce,

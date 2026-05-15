@@ -12,8 +12,8 @@ use wires_host::per_tenant_logs::PerTenantLogs;
 use wires_host::retention::Retention;
 use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
 use wires_net::tenant::{
-    ALPN as TENANT_ALPN, TenantClient, TenantProtocol, TenantRegisterRequest, TenantRequest,
-    TenantResponse, register_signing_bytes,
+    ALPN as TENANT_ALPN, TenantClient, TenantOp, TenantProtocol, TenantRegisterRequest,
+    TenantRequest, TenantResponse, signing_bytes,
 };
 
 fn endpoint_id_bytes(ep: &Endpoint) -> [u8; 32] {
@@ -64,7 +64,13 @@ async fn tenant_register_round_trip() {
     let root_pubkey = signing_key.verifying_key().to_bytes();
     let now_ms = 1_000_000i64;
     let nonce = [9u8; 16];
-    let bytes = register_signing_bytes(&root_pubkey, now_ms, &nonce, &host_eid_bytes);
+    let bytes = signing_bytes(
+        TenantOp::Register,
+        &root_pubkey,
+        now_ms,
+        &nonce,
+        &host_eid_bytes,
+    );
     let sig = signing_key.sign(&bytes).to_bytes();
     let req = TenantRequest::Register(TenantRegisterRequest {
         version: 1,

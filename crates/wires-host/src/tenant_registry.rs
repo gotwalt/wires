@@ -282,11 +282,10 @@ impl TenantRegistry {
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use wires_net::tenant::{
-    TenantErrorCode, TenantErrorResponse, TenantRegisterRequest, TenantRegisterResponse,
+    TenantErrorCode, TenantErrorResponse, TenantOp, TenantRegisterRequest, TenantRegisterResponse,
     TenantResponse, TenantStatusKind, TenantStatusRequest, TenantStatusResponse,
     TopicRegisterRequest, TopicRegisterResponse, TopicUnregisterRequest, TopicUnregisterResponse,
-    register_signing_bytes, status_signing_bytes, topic_register_signing_bytes,
-    topic_unregister_signing_bytes,
+    signing_bytes,
 };
 
 /// Tunable behaviour for `TenantHandlerImpl`.
@@ -373,7 +372,8 @@ impl TenantHandlerImpl {
 
 impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
     fn handle_register(&self, req: TenantRegisterRequest) -> TenantResponse {
-        let signing_bytes = register_signing_bytes(
+        let sig_bytes = signing_bytes(
+            TenantOp::Register,
             &req.root_pubkey,
             req.timestamp,
             &req.nonce,
@@ -384,7 +384,7 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
             req.timestamp,
             &req.nonce,
             &req.signature,
-            &signing_bytes,
+            &sig_bytes,
         ) {
             return e;
         }
@@ -421,9 +421,9 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
     }
 
     fn handle_topic_register(&self, req: TopicRegisterRequest) -> TenantResponse {
-        let signing_bytes = topic_register_signing_bytes(
+        let sig_bytes = signing_bytes(
+            TenantOp::TopicRegister(&req.topic_id),
             &req.root_pubkey,
-            &req.topic_id,
             req.timestamp,
             &req.nonce,
             &self.host_endpoint_id,
@@ -433,7 +433,7 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
             req.timestamp,
             &req.nonce,
             &req.signature,
-            &signing_bytes,
+            &sig_bytes,
         ) {
             return e;
         }
@@ -465,9 +465,9 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
     }
 
     fn handle_topic_unregister(&self, req: TopicUnregisterRequest) -> TenantResponse {
-        let signing_bytes = topic_unregister_signing_bytes(
+        let sig_bytes = signing_bytes(
+            TenantOp::TopicUnregister(&req.topic_id),
             &req.root_pubkey,
-            &req.topic_id,
             req.timestamp,
             &req.nonce,
             &self.host_endpoint_id,
@@ -477,7 +477,7 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
             req.timestamp,
             &req.nonce,
             &req.signature,
-            &signing_bytes,
+            &sig_bytes,
         ) {
             return e;
         }
@@ -502,7 +502,8 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
     }
 
     fn handle_status(&self, req: TenantStatusRequest) -> TenantResponse {
-        let signing_bytes = status_signing_bytes(
+        let sig_bytes = signing_bytes(
+            TenantOp::Status,
             &req.root_pubkey,
             req.timestamp,
             &req.nonce,
@@ -513,7 +514,7 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
             req.timestamp,
             &req.nonce,
             &req.signature,
-            &signing_bytes,
+            &sig_bytes,
         ) {
             return e;
         }
@@ -727,7 +728,8 @@ mod tests {
         };
 
         let nonce = [9u8; 16];
-        let bytes = wires_net::tenant::register_signing_bytes(
+        let bytes = wires_net::tenant::signing_bytes(
+            TenantOp::Register,
             &root_pubkey,
             now_ms,
             &nonce,
