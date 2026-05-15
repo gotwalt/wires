@@ -20,16 +20,22 @@ fn host_persists_but_cannot_decrypt() {
 
     let tmp_a = TempDir::new().unwrap();
     let tmp_host = TempDir::new().unwrap();
-    let a = Arc::new(Node::open(NodeConfig {
-        data_dir: tmp_a.path().to_path_buf(),
-        root_pubkey_hex: root_hex.clone(),
-        bootstrap_peers: vec![],
-    }).unwrap());
-    let host = Arc::new(Node::open(NodeConfig {
-        data_dir: tmp_host.path().to_path_buf(),
-        root_pubkey_hex: root_hex.clone(),
-        bootstrap_peers: vec![],
-    }).unwrap());
+    let a = Arc::new(
+        Node::open(NodeConfig {
+            data_dir: tmp_a.path().to_path_buf(),
+            root_pubkey_hex: root_hex.clone(),
+            bootstrap_peers: vec![],
+        })
+        .unwrap(),
+    );
+    let host = Arc::new(
+        Node::open(NodeConfig {
+            data_dir: tmp_host.path().to_path_buf(),
+            root_pubkey_hex: root_hex.clone(),
+            bootstrap_peers: vec![],
+        })
+        .unwrap(),
+    );
 
     let a_pk = a.ed_sk.verifying_key().to_bytes();
     let mut cap = Capability::new_unsigned(
@@ -49,13 +55,19 @@ fn host_persists_but_cannot_decrypt() {
     // CRUCIAL: host does NOT call install_epoch_key.
 
     let msg = a
-        .publish_standard(topic, cap.cap_id.0, CanonicalContent::new("home.test", "secret data"))
+        .publish_standard(
+            topic,
+            cap.cap_id.0,
+            CanonicalContent::new("home.test", "secret data"),
+        )
         .unwrap();
     let outcome = host.handle_inbound(msg.clone()).unwrap();
     match outcome {
         Inbound::AcceptedOpaque { .. } => { /* expected: persisted but not decrypted */ }
         Inbound::Accepted { content: None, .. } => { /* also acceptable */ }
-        Inbound::Accepted { content: Some(_), .. } => panic!("host should not have decrypted content"),
+        Inbound::Accepted {
+            content: Some(_), ..
+        } => panic!("host should not have decrypted content"),
         Inbound::Rejected { reason, .. } => panic!("host should accept ciphertext: {reason}"),
     }
 

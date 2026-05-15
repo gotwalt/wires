@@ -3,8 +3,7 @@ use std::path::Path;
 use wires_node::{Node, NodeConfig};
 
 pub async fn run(data_dir: &Path, cap_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg: NodeConfig =
-        toml::from_str(&std::fs::read_to_string(data_dir.join("config.toml"))?)?;
+    let cfg: NodeConfig = toml::from_str(&std::fs::read_to_string(data_dir.join("config.toml"))?)?;
     let node = Node::open(cfg)?;
     let bytes = hex::decode(cap_id)?;
     if bytes.len() != 16 {

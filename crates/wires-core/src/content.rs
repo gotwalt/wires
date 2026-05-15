@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use snafu::{ensure, ResultExt};
+use snafu::{ResultExt, ensure};
 
 use crate::error::{ContentMissingFieldSnafu, EncodeContentSnafu, ParseContentSnafu, Result};
 
@@ -34,8 +34,14 @@ impl CanonicalContent {
     }
 
     pub fn validate(&self) -> Result<()> {
-        ensure!(!self.type_.is_empty(), ContentMissingFieldSnafu { field: "type" });
-        ensure!(!self.text.is_empty(), ContentMissingFieldSnafu { field: "text" });
+        ensure!(
+            !self.type_.is_empty(),
+            ContentMissingFieldSnafu { field: "type" }
+        );
+        ensure!(
+            !self.text.is_empty(),
+            ContentMissingFieldSnafu { field: "text" }
+        );
         Ok(())
     }
 
@@ -79,9 +85,17 @@ mod tests {
 
     #[test]
     fn requires_type_and_text() {
-        let bad = CanonicalContent { type_: "".into(), text: "x".into(), data: None };
+        let bad = CanonicalContent {
+            type_: "".into(),
+            text: "x".into(),
+            data: None,
+        };
         assert!(bad.validate().is_err());
-        let bad = CanonicalContent { type_: "x".into(), text: "".into(), data: None };
+        let bad = CanonicalContent {
+            type_: "x".into(),
+            text: "".into(),
+            data: None,
+        };
         assert!(bad.validate().is_err());
         let good = CanonicalContent::new("home.fridge.temp", "holding at 38F");
         good.validate().unwrap();
@@ -93,7 +107,10 @@ mod tests {
         let b: serde_json::Value = json!({"type": "x", "data": {"a": 2, "b": 1}, "text": "y"});
         let a_c: CanonicalContent = serde_json::from_value(a).unwrap();
         let b_c: CanonicalContent = serde_json::from_value(b).unwrap();
-        assert_eq!(a_c.to_canonical_bytes().unwrap(), b_c.to_canonical_bytes().unwrap());
+        assert_eq!(
+            a_c.to_canonical_bytes().unwrap(),
+            b_c.to_canonical_bytes().unwrap()
+        );
     }
 
     #[test]

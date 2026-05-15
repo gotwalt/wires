@@ -1,7 +1,7 @@
 use ed25519_dalek::SigningKey;
 use snafu::{OptionExt, ResultExt};
 use wires_core::{
-    sign_envelope, CanonicalContent, CapId, MessageKind, Pubkey, TopicId, WireMessage,
+    CanonicalContent, CapId, MessageKind, Pubkey, TopicId, WireMessage, sign_envelope,
 };
 use wires_crypto::{encrypt_standard, seal_to};
 use wires_store::{EpochKey, EpochKeyStore, TopicLog};
@@ -78,20 +78,37 @@ pub fn build_message(params: &PublishParams) -> Result<WireMessage> {
     let aad = envelope.signing_bytes().context(CoreSnafu)?;
 
     let ciphertext = match (&params.kind, &params.keying) {
-        (MessageKind::Standard, KeyingMaterial::StandardEpochKey(key)) => {
-            encrypt_standard(key, &params.topic_id, &sender, params.seq, &content_bytes, &aad)
-                .context(CryptoSnafu)?
-        }
+        (MessageKind::Standard, KeyingMaterial::StandardEpochKey(key)) => encrypt_standard(
+            key,
+            &params.topic_id,
+            &sender,
+            params.seq,
+            &content_bytes,
+            &aad,
+        )
+        .context(CryptoSnafu)?,
         (MessageKind::SealedTo(target), KeyingMaterial::SealedRecipient(recipient))
             if target == *recipient =>
         {
-            seal_to(*recipient, &params.topic_id, &sender, params.seq, &content_bytes, &aad)
-                .context(CryptoSnafu)?
+            seal_to(
+                recipient,
+                &params.topic_id,
+                &sender,
+                params.seq,
+                &content_bytes,
+                &aad,
+            )
+            .context(CryptoSnafu)?
         }
-        (MessageKind::SealedTo(_), KeyingMaterial::SealedRecipient(recipient)) => {
-            seal_to(*recipient, &params.topic_id, &sender, params.seq, &content_bytes, &aad)
-                .context(CryptoSnafu)?
-        }
+        (MessageKind::SealedTo(_), KeyingMaterial::SealedRecipient(recipient)) => seal_to(
+            recipient,
+            &params.topic_id,
+            &sender,
+            params.seq,
+            &content_bytes,
+            &aad,
+        )
+        .context(CryptoSnafu)?,
         (MessageKind::Public, KeyingMaterial::Public) => content_bytes,
         _ => {
             return crate::error::ConfigSnafu {
@@ -117,10 +134,12 @@ pub fn next_seq_and_prev_hash(log: &TopicLog, sender: &Pubkey) -> Result<(u64, [
 }
 
 pub fn current_epoch_key(keys: &EpochKeyStore, topic_id: &TopicId) -> Result<(u32, EpochKey)> {
-    keys.latest().context(StoreSnafu)?.context(MissingEpochKeySnafu {
-        topic_id_hex: hex::encode(topic_id),
-        epoch: 0u32,
-    })
+    keys.latest()
+        .context(StoreSnafu)?
+        .context(MissingEpochKeySnafu {
+            topic_id_hex: hex::encode(topic_id),
+            epoch: 0u32,
+        })
 }
 
 #[cfg(test)]
@@ -155,7 +174,15 @@ mod tests {
         for_aad.payload_len = 0;
         for_aad.signature = [0u8; 64];
         let aad = for_aad.signing_bytes().unwrap();
-        let pt = decrypt_standard(&epoch_key, &msg.topic_id, &msg.sender, msg.seq, &msg.ciphertext, &aad).unwrap();
+        let pt = decrypt_standard(
+            &epoch_key,
+            &msg.topic_id,
+            &msg.sender,
+            msg.seq,
+            &msg.ciphertext,
+            &aad,
+        )
+        .unwrap();
         let content = CanonicalContent::from_canonical_bytes(&pt).unwrap();
         assert_eq!(content.type_, "home.fridge.temp");
     }

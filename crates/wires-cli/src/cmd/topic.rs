@@ -4,8 +4,7 @@ use rand_core::{OsRng, RngCore};
 use wires_node::{Node, NodeConfig};
 
 pub async fn create(data_dir: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg: NodeConfig =
-        toml::from_str(&std::fs::read_to_string(data_dir.join("config.toml"))?)?;
+    let cfg: NodeConfig = toml::from_str(&std::fs::read_to_string(data_dir.join("config.toml"))?)?;
     let node = Node::open(cfg)?;
 
     let mut topic_id = [0u8; 32];

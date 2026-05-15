@@ -2,10 +2,10 @@
 //!
 //! Wire format (over a single bidi stream):
 //! - Client opens a bidi stream, sends:
-//!     [u32 BE length][JSON-serialized ReplayRequest bytes]
+//!   [u32 BE length][JSON-serialized ReplayRequest bytes]
 //!   then closes the send side.
 //! - Server streams a series of frames:
-//!     [u32 BE length][JSON-serialized ReplayResponseFrame bytes]
+//!   [u32 BE length][JSON-serialized ReplayResponseFrame bytes]
 //!   ending with a frame where `msg = None` (end-of-stream sentinel).
 
 use std::collections::HashMap;
@@ -84,13 +84,13 @@ impl<S: ReplaySource> ReplayProtocol<S> {
         let mut len_buf = [0u8; 4];
         recv.read_exact(&mut len_buf)
             .await
-            .map_err(|e| std::io::Error::other(e))
+            .map_err(std::io::Error::other)
             .context(IoSnafu)?;
         let len = u32::from_be_bytes(len_buf) as usize;
         let mut req_buf = vec![0u8; len];
         recv.read_exact(&mut req_buf)
             .await
-            .map_err(|e| std::io::Error::other(e))
+            .map_err(std::io::Error::other)
             .context(IoSnafu)?;
         let req: ReplayRequest = serde_json::from_slice(&req_buf).context(SerdeSnafu)?;
 
@@ -117,11 +117,11 @@ impl<S: ReplaySource> ReplayProtocol<S> {
                 let bytes = serde_json::to_vec(&frame).context(SerdeSnafu)?;
                 send.write_all(&(bytes.len() as u32).to_be_bytes())
                     .await
-                    .map_err(|e| std::io::Error::other(e))
+                    .map_err(std::io::Error::other)
                     .context(IoSnafu)?;
                 send.write_all(&bytes)
                     .await
-                    .map_err(|e| std::io::Error::other(e))
+                    .map_err(std::io::Error::other)
                     .context(IoSnafu)?;
                 emitted += 1;
                 if emitted >= req.limit {
@@ -134,21 +134,24 @@ impl<S: ReplaySource> ReplayProtocol<S> {
         let bytes = serde_json::to_vec(&end).context(SerdeSnafu)?;
         send.write_all(&(bytes.len() as u32).to_be_bytes())
             .await
-            .map_err(|e| std::io::Error::other(e))
+            .map_err(std::io::Error::other)
             .context(IoSnafu)?;
         send.write_all(&bytes)
             .await
-            .map_err(|e| std::io::Error::other(e))
+            .map_err(std::io::Error::other)
             .context(IoSnafu)?;
         send.finish()
-            .map_err(|e| std::io::Error::other(e))
+            .map_err(std::io::Error::other)
             .context(IoSnafu)?;
         Ok(())
     }
 }
 
 impl<S: ReplaySource> iroh::protocol::ProtocolHandler for ReplayProtocol<S> {
-    async fn accept(&self, connection: Connection) -> std::result::Result<(), iroh::protocol::AcceptError> {
+    async fn accept(
+        &self,
+        connection: Connection,
+    ) -> std::result::Result<(), iroh::protocol::AcceptError> {
         loop {
             let (send, recv) = match connection.accept_bi().await {
                 Ok(s) => s,
@@ -197,14 +200,14 @@ impl ReplayClient {
         let bytes = serde_json::to_vec(request).context(SerdeSnafu)?;
         send.write_all(&(bytes.len() as u32).to_be_bytes())
             .await
-            .map_err(|e| std::io::Error::other(e))
+            .map_err(std::io::Error::other)
             .context(IoSnafu)?;
         send.write_all(&bytes)
             .await
-            .map_err(|e| std::io::Error::other(e))
+            .map_err(std::io::Error::other)
             .context(IoSnafu)?;
         send.finish()
-            .map_err(|e| std::io::Error::other(e))
+            .map_err(std::io::Error::other)
             .context(IoSnafu)?;
 
         let (tx, rx) = mpsc::channel::<WireMessage>(64);

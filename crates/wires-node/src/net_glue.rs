@@ -5,7 +5,7 @@ use std::sync::Arc;
 use iroh::{Endpoint, EndpointId};
 use snafu::ResultExt;
 use wires_core::WireMessage;
-use wires_net::replay::{ReplayClient, ReplayProtocol, ReplayRequest, ALPN};
+use wires_net::replay::{ALPN, ReplayClient, ReplayProtocol, ReplayRequest};
 use wires_net::{GossipHandle, GossipNode};
 
 use crate::error::{NetSnafu, Result};
@@ -96,8 +96,6 @@ impl NetGlue {
             hwm,
             limit: 1024,
         };
-        // Drop ctx before the async boundary so the borrows don't cross await.
-        drop(ctx);
         let mut rx = self
             .replay_client
             .request(peer, &req)

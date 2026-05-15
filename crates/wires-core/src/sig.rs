@@ -1,5 +1,5 @@
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use snafu::{ensure, OptionExt};
+use snafu::{OptionExt, ensure};
 
 use crate::error::{BadSignatureSnafu, Result};
 use crate::wire::WireMessage;
@@ -15,7 +15,9 @@ pub fn sign_envelope(msg: &mut WireMessage, sk: &SigningKey) -> Result<()> {
 
 /// Verify the envelope's signature against the sender pubkey in the envelope.
 pub fn verify_envelope(msg: &WireMessage) -> Result<()> {
-    let vk = VerifyingKey::from_bytes(&msg.sender).ok().context(BadSignatureSnafu)?;
+    let vk = VerifyingKey::from_bytes(&msg.sender)
+        .ok()
+        .context(BadSignatureSnafu)?;
     let sig = ed25519_dalek::Signature::from_bytes(&msg.signature);
     let bytes = msg.signing_bytes()?;
     ensure!(vk.verify(&bytes, &sig).is_ok(), BadSignatureSnafu);

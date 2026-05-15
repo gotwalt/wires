@@ -1,10 +1,11 @@
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use snafu::{ensure, OptionExt, ResultExt};
+use snafu::{OptionExt, ResultExt, ensure};
 use uuid::Uuid;
 
 use crate::error::{
-    BadCapSignatureSnafu, BadGlobSnafu, CapDeniedSnafu, CapExpiredSnafu, Result, SerializeEnvelopeSnafu,
+    BadCapSignatureSnafu, BadGlobSnafu, CapDeniedSnafu, CapExpiredSnafu, Result,
+    SerializeEnvelopeSnafu,
 };
 use crate::wire::{CapId, Pubkey};
 
@@ -28,10 +29,10 @@ impl std::fmt::Display for Right {
 pub struct Capability {
     #[serde(with = "hex::serde")]
     pub agent: Pubkey,
-    pub topics: Vec<String>,    // glob patterns
+    pub topics: Vec<String>, // glob patterns
     pub rights: Vec<Right>,
-    pub issued: i64,            // unix ms
-    pub expires: Option<i64>,   // unix ms, None = no expiry
+    pub issued: i64,          // unix ms
+    pub expires: Option<i64>, // unix ms, None = no expiry
     pub cap_id: CapIdRepr,
     #[serde(with = "hex::serde")]
     pub sig: [u8; 64],
@@ -51,7 +52,9 @@ impl<'de> Deserialize<'de> for CapIdRepr {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        let arr: CapId = bytes.try_into().map_err(|_| serde::de::Error::custom("cap_id must be 16 bytes"))?;
+        let arr: CapId = bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("cap_id must be 16 bytes"))?;
         Ok(CapIdRepr(arr))
     }
 }
@@ -106,7 +109,9 @@ impl Capability {
     }
 
     pub fn verify(&self, root_pk: &Pubkey) -> Result<()> {
-        let vk = VerifyingKey::from_bytes(root_pk).ok().context(BadCapSignatureSnafu)?;
+        let vk = VerifyingKey::from_bytes(root_pk)
+            .ok()
+            .context(BadCapSignatureSnafu)?;
         let sig = ed25519_dalek::Signature::from_bytes(&self.sig);
         let bytes = self.signing_bytes()?;
         ensure!(vk.verify(&bytes, &sig).is_ok(), BadCapSignatureSnafu);
@@ -117,7 +122,11 @@ impl Capability {
         if let Some(exp) = self.expires {
             ensure!(
                 now < exp,
-                CapExpiredSnafu { issued: self.issued, expires: self.expires, now }
+                CapExpiredSnafu {
+                    issued: self.issued,
+                    expires: self.expires,
+                    now
+                }
             );
         }
         Ok(())
@@ -126,12 +135,21 @@ impl Capability {
     pub fn allows(&self, topic_name: &str, right: Right) -> Result<()> {
         ensure!(
             self.rights.contains(&right),
-            CapDeniedSnafu { right: right.to_string(), topic: topic_name.to_string() }
+            CapDeniedSnafu {
+                right: right.to_string(),
+                topic: topic_name.to_string()
+            }
         );
-        let any_match = self.topics.iter().any(|p| glob_matches(p, topic_name).unwrap_or(false));
+        let any_match = self
+            .topics
+            .iter()
+            .any(|p| glob_matches(p, topic_name).unwrap_or(false));
         ensure!(
             any_match,
-            CapDeniedSnafu { right: right.to_string(), topic: topic_name.to_string() }
+            CapDeniedSnafu {
+                right: right.to_string(),
+                topic: topic_name.to_string()
+            }
         );
         Ok(())
     }
@@ -142,7 +160,12 @@ impl Capability {
 /// - `**` matches zero or more segments
 /// - anything else is a literal segment
 pub fn glob_matches(pattern: &str, name: &str) -> Result<bool> {
-    ensure!(!pattern.is_empty(), BadGlobSnafu { pattern: pattern.to_string() });
+    ensure!(
+        !pattern.is_empty(),
+        BadGlobSnafu {
+            pattern: pattern.to_string()
+        }
+    );
     let p: Vec<&str> = pattern.split('.').collect();
     let n: Vec<&str> = name.split('.').collect();
     Ok(matches_segments(&p, &n))
@@ -153,8 +176,12 @@ fn matches_segments(pattern: &[&str], name: &[&str]) -> bool {
         (None, None) => true,
         (None, Some(_)) => false,
         (Some(&"**"), _) => {
-            if matches_segments(&pattern[1..], name) { return true; }
-            if name.is_empty() { return false; }
+            if matches_segments(&pattern[1..], name) {
+                return true;
+            }
+            if name.is_empty() {
+                return false;
+            }
             matches_segments(pattern, &name[1..])
         }
         (Some(_), None) => false,

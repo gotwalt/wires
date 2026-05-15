@@ -1,7 +1,7 @@
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand_core::OsRng;
-use snafu::{ensure, OptionExt};
+use snafu::{OptionExt, ensure};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
 use crate::error::{DecryptSnafu, EncryptSnafu, Result, SealedShortSnafu};
@@ -75,7 +75,13 @@ pub fn open_sealed(
     let nonce_bytes = sealed_nonce(topic_id, sender, seq, &recipient_pub_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     cipher
-        .decrypt(nonce, Payload { msg: &sealed_bytes[32..], aad })
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &sealed_bytes[32..],
+                aad,
+            },
+        )
         .ok()
         .context(DecryptSnafu)
 }

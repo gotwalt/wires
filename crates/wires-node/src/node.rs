@@ -11,12 +11,14 @@ use snafu::ResultExt;
 use tokio::sync::broadcast;
 use wires_core::{CanonicalContent, MessageKind, WireMessage};
 use wires_crypto::{X25519Public, X25519Secret};
-use wires_store::{open_caps, open_topic_keys, CapTable, EpochKey, EpochKeyStore};
+use wires_store::{CapTable, EpochKey, EpochKeyStore, open_caps, open_topic_keys};
 
 use crate::config::NodeConfig;
 use crate::error::{IoSnafu, NetSnafu, Result, StoreSnafu};
-use crate::inbound::{process, Inbound, InboundCtx};
-use crate::publish::{build_message, current_epoch_key, next_seq_and_prev_hash, KeyingMaterial, PublishParams};
+use crate::inbound::{Inbound, InboundCtx, process};
+use crate::publish::{
+    KeyingMaterial, PublishParams, build_message, current_epoch_key, next_seq_and_prev_hash,
+};
 use crate::storage::TopicLogs;
 use wires_store::StoreError;
 
@@ -186,8 +188,8 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use tempfile::TempDir;
-    use wires_core::cap::Right;
     use wires_core::Capability;
+    use wires_core::cap::Right;
 
     fn open_node(tmp: &TempDir, root_hex: String) -> Node {
         let cfg = NodeConfig {
@@ -222,7 +224,11 @@ mod tests {
 
         let mut sub = node.subscribe();
         let _msg = node
-            .publish_standard(topic_id, cap_id, CanonicalContent::new("home.test", "hello"))
+            .publish_standard(
+                topic_id,
+                cap_id,
+                CanonicalContent::new("home.test", "hello"),
+            )
             .unwrap();
         let ev = sub.recv().await.unwrap();
         assert_eq!(ev.topic_id, topic_id);

@@ -6,12 +6,10 @@
 //! against recorded HA frames without any network.
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{
-    connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream,
-};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 pub type HaWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -85,13 +83,16 @@ pub struct HaEvent {
 /// drives it from there.
 pub async fn connect(url: &str, access_token: &str) -> Result<HaWs, HaError> {
     if url::Url::parse(url).is_err() {
-        return UrlSnafu { url: url.to_string() }.fail();
+        return UrlSnafu {
+            url: url.to_string(),
+        }
+        .fail();
     }
     let (mut ws, _resp) = connect_async(url).await.context(WsSnafu)?;
 
     // 1. auth_required
     let first = recv_json(&mut ws).await?;
-    expect_type(&first, "auth_required")?;
+    expect_type(&first, "auth_required").map_err(|e| *e)?;
 
     // 2. send auth
     let auth = json!({ "type": "auth", "access_token": access_token });
@@ -133,7 +134,10 @@ pub async fn connect(url: &str, access_token: &str) -> Result<HaWs, HaError> {
         .and_then(Value::as_str)
         .map(|t| t == "result")
         .unwrap_or(false)
-        && result.get("success").and_then(Value::as_bool).unwrap_or(false);
+        && result
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     if !success {
         let message = result
             .get("error")
@@ -161,16 +165,18 @@ async fn recv_json(ws: &mut HaWs) -> Result<Value, HaError> {
     }
 }
 
-fn expect_type(v: &Value, expected: &str) -> Result<(), HaError> {
+fn expect_type(v: &Value, expected: &str) -> std::result::Result<(), Box<HaError>> {
     let got = v.get("type").and_then(Value::as_str).unwrap_or("(missing)");
     if got == expected {
         Ok(())
     } else {
-        HandshakeProtocolSnafu {
-            expected: expected.to_string(),
-            got: got.to_string(),
-        }
-        .fail()
+        Err(Box::new(
+            HandshakeProtocolSnafu {
+                expected: expected.to_string(),
+                got: got.to_string(),
+            }
+            .build(),
+        ))
     }
 }
 
@@ -195,9 +201,7 @@ pub fn parse_event(value: &Value) -> Option<HaEvent> {
         entity_id,
         new_state: state_string(new_state_obj),
         old_state: state_string(old_state_obj),
-        attributes: new_state_obj
-            .and_then(|s| s.get("attributes"))
-            .cloned(),
+        attributes: new_state_obj.and_then(|s| s.get("attributes")).cloned(),
         time_fired: event
             .get("time_fired")
             .and_then(Value::as_str)
@@ -211,7 +215,10 @@ pub fn parse_event(value: &Value) -> Option<HaEvent> {
 }
 
 fn state_string(state: Option<&Value>) -> Option<String> {
-    state?.get("state").and_then(Value::as_str).map(str::to_string)
+    state?
+        .get("state")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Read the next frame from `ws` and decode it as a JSON value, looping past
@@ -266,7 +273,10 @@ mod tests {
         assert_eq!(ev.entity_id, "light.kitchen");
         assert_eq!(ev.new_state.as_deref(), Some("on"));
         assert_eq!(ev.old_state.as_deref(), Some("off"));
-        assert_eq!(ev.time_fired.as_deref(), Some("2026-05-14T12:00:00.000000+00:00"));
+        assert_eq!(
+            ev.time_fired.as_deref(),
+            Some("2026-05-14T12:00:00.000000+00:00")
+        );
         assert_eq!(ev.context_id.as_deref(), Some("abc123"));
         let attrs = ev.attributes.unwrap();
         assert_eq!(attrs["brightness"], 254);

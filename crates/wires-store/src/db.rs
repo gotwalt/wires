@@ -21,8 +21,19 @@ pub fn open_topic_keys(root: &Path, topic_id_hex: &str) -> Result<Database> {
 }
 
 pub fn open_caps(root: &Path) -> Result<Database> {
-    std::fs::create_dir_all(root).context(FsSnafu { path: root.to_path_buf() })?;
+    std::fs::create_dir_all(root).context(FsSnafu {
+        path: root.to_path_buf(),
+    })?;
     let path = root.join("caps.db");
+    Database::create(&path).context(OpenDbSnafu { path: path.clone() })
+}
+
+/// Open the per-tenant ingest index db at `<root>/ingest_<tenant_hex>.redb`.
+pub fn open_ingest_index(root: &Path, tenant_hex: &str) -> Result<Database> {
+    std::fs::create_dir_all(root).context(FsSnafu {
+        path: root.to_path_buf(),
+    })?;
+    let path = root.join(format!("ingest_{tenant_hex}.redb"));
     Database::create(&path).context(OpenDbSnafu { path: path.clone() })
 }
 
