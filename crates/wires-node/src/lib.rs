@@ -9,8 +9,9 @@ pub mod publish;
 pub mod runtime;
 pub mod storage;
 pub mod sync;
+pub mod topic_names;
 
-pub use config::{HostConfig, NodeConfig};
+pub use config::{HostConfig, NodeConfig, load_root_signing_key};
 pub use error::{NodeError, Result};
 pub use inbound::{Inbound, InboundCtx, process as process_inbound};
 pub use net_glue::NetGlue;
@@ -25,3 +26,4 @@ pub use publish::{
 pub use runtime::NodeRuntime;
 pub use storage::TopicLogs;
 pub use sync::{current_hwm_for_request, drive_sync_pass};
+pub use topic_names::{load_topic_names, resolve_topic, upsert_entries as upsert_topic_names};

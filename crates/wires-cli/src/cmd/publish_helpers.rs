@@ -2,7 +2,7 @@
 //! configured `HostConfig` into an iroh bootstrap list and priming the
 //! endpoint's address-lookup with direct address / relay hints.
 
-use wires_net::PeerHint;
+use wires_net::endpoint_id_from_hex;
 use wires_node::{NodeConfig, NodeRuntime};
 
 /// Build a bootstrap list of `EndpointId`s from the optional `HostConfig`.
@@ -11,7 +11,7 @@ pub fn bootstrap_endpoints(cfg: &NodeConfig) -> Vec<iroh::EndpointId> {
     let mut out = Vec::new();
     if let Some(h) = &cfg.host {
         for hint in &h.peer_hints {
-            match peer_hint_endpoint_id(hint) {
+            match endpoint_id_from_hex(&hint.node_id) {
                 Some(id) => out.push(id),
                 None => {
                     tracing::warn!(
@@ -25,15 +25,6 @@ pub fn bootstrap_endpoints(cfg: &NodeConfig) -> Vec<iroh::EndpointId> {
     out
 }
 
-pub fn peer_hint_endpoint_id(hint: &PeerHint) -> Option<iroh::EndpointId> {
-    let bytes = match hex::decode(&hint.node_id) {
-        Ok(b) if b.len() == 32 => b,
-        _ => return None,
-    };
-    let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
-    iroh::EndpointId::from_bytes(&arr).ok()
-}
-
 /// Convert any `PeerHint` entries that carry direct addresses or a relay URL
 /// into `EndpointAddr` values and register them with `endpoint.address_lookup`
 /// via a `MemoryLookup`. Returns `Ok(())` either way; unparseable addrs are
@@ -45,9 +36,8 @@ pub fn register_peer_addresses(runtime: &NodeRuntime) -> Result<(), Box<dyn std:
     };
     let mut infos: Vec<iroh::EndpointAddr> = Vec::new();
     for hint in &host.peer_hints {
-        let id = match peer_hint_endpoint_id(hint) {
-            Some(id) => id,
-            None => continue,
+        let Some(id) = endpoint_id_from_hex(&hint.node_id) else {
+            continue;
         };
         let mut addrs: Vec<iroh::TransportAddr> = Vec::new();
         for s in &hint.addrs {

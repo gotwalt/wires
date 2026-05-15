@@ -4880,6 +4880,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "bytes",
  "ed25519-dalek 2.2.0",
  "hex",

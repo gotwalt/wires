@@ -23,21 +23,24 @@ pub struct PeerHint {
     pub relay: Option<String>,
 }
 
-/// Outcome of attempting to dial a single hint.
-#[derive(Debug)]
-pub enum DialOutcome {
-    Connected(EndpointId),
-    BadNodeId,
-    Failed(String),
+/// Parse a 64-character hex string into an `EndpointId`. `PeerHint::node_id`
+/// and the `endpoint_id` field of discovery responses are both stored as hex;
+/// `EndpointId::FromStr` parses base32, so callers go through this helper.
+pub fn endpoint_id_from_hex(s: &str) -> Option<EndpointId> {
+    let bytes = hex::decode(s).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    EndpointId::from_bytes(&arr).ok()
+}
+
+/// Parse a 32-character hex string into a 16-byte capability id.
+pub fn cap_id_from_hex(s: &str) -> Option<[u8; 16]> {
+    let bytes = hex::decode(s).ok()?;
+    bytes.try_into().ok()
 }
 
 /// Iterate `peer_hints` in order, attempting to open a connection on `alpn`
 /// (with `per_hint_timeout`). Returns the first `EndpointId` that succeeds,
 /// or `None` if every hint failed.
-///
-/// Note: This currently establishes a QUIC connection and immediately drops
-/// it. A real bootstrap caller would subscribe to gossip / open replay using
-/// the returned `EndpointId`; that orchestration lives elsewhere.
 pub async fn first_reachable(
     endpoint: &Endpoint,
     peer_hints: &[PeerHint],
@@ -45,26 +48,9 @@ pub async fn first_reachable(
     per_hint_timeout: Duration,
 ) -> Option<EndpointId> {
     for hint in peer_hints {
-        // `PeerHint::node_id` is stored as lowercase hex (see `PeerHint` doc
-        // and how main.rs produces it via `hex::encode(endpoint_id.as_bytes())`).
-        // `EndpointId` is `PublicKey` whose `FromStr` uses base32, not hex, so
-        // we hex-decode manually and call `from_bytes`.
-        let bytes: [u8; 32] = match hex::decode(&hint.node_id)
-            .ok()
-            .and_then(|v| v.try_into().ok())
-        {
-            Some(b) => b,
-            None => {
-                tracing::warn!(node_id = %hint.node_id, "skipping hint with invalid hex node_id");
-                continue;
-            }
-        };
-        let node_id = match EndpointId::from_bytes(&bytes) {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!(node_id = %hint.node_id, error = %e, "skipping hint with invalid key bytes");
-                continue;
-            }
+        let Some(node_id) = endpoint_id_from_hex(&hint.node_id) else {
+            tracing::warn!(node_id = %hint.node_id, "skipping hint with invalid endpoint_id hex");
+            continue;
         };
         match tokio::time::timeout(per_hint_timeout, endpoint.connect(node_id, alpn)).await {
             Ok(Ok(_conn)) => return Some(node_id),

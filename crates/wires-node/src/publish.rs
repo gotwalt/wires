@@ -36,32 +36,10 @@ pub fn build_message(params: &PublishParams) -> Result<WireMessage> {
     let content_bytes = params.content.to_canonical_bytes().context(CoreSnafu)?;
 
     let sender = params.sender_sk.verifying_key().to_bytes();
-    // Build the envelope with ciphertext temporarily empty so signing_bytes()
-    // gives us the AAD before we know the ciphertext. The ciphertext field is
-    // included in signing_bytes, so we need to know it first → so we compute
-    // ciphertext using a stand-in AAD? No: the design is that AAD is the
-    // envelope minus signature minus ciphertext. Re-read spec §4: "AAD: byte
-    // serialization of the cleartext envelope fields (everything above
-    // `ciphertext`)" — actually the spec says envelope INCLUDING ciphertext
-    // is AAD. That's a chicken-and-egg: ciphertext depends on AAD which
-    // depends on ciphertext.
-    //
-    // The correct read of the spec is: `signing_bytes` covers every envelope
-    // field including ciphertext (the AEAD tag goes in `signature`? no, the
-    // tag is appended to ciphertext by chacha20poly1305). So the path is:
-    // 1. Build envelope with placeholder ciphertext (empty Vec).
-    // 2. Compute AAD = signing_bytes() of that envelope.
-    // 3. Encrypt content with that AAD → ciphertext.
-    // 4. Set the envelope's ciphertext field to the result.
-    // 5. Re-compute signing_bytes (now including the actual ciphertext) and
-    //    use that as the input to ed25519 signing.
-    //
-    // The AAD used for AEAD is the pre-encryption signing_bytes (with empty
-    // ciphertext); decryption must reproduce the same AAD. Receivers do this
-    // by setting ciphertext = [] in their local copy before computing AAD.
-    //
-    // To make this symmetric with decryption, we will document this in code
-    // and matching it in the inbound task.
+    // AAD = envelope with `signature`, `ciphertext`, and `payload_len` zeroed
+    // (mirrored on the receiver in inbound.rs). Build the envelope with those
+    // placeholders, compute AAD, encrypt, set the real ciphertext and
+    // payload_len, then sign over the now-complete signing bytes.
     let mut envelope = WireMessage {
         topic_id: params.topic_id,
         epoch: params.epoch,
@@ -87,19 +65,6 @@ pub fn build_message(params: &PublishParams) -> Result<WireMessage> {
             &aad,
         )
         .context(CryptoSnafu)?,
-        (MessageKind::SealedTo(target), KeyingMaterial::SealedRecipient(recipient))
-            if target == *recipient =>
-        {
-            seal_to(
-                recipient,
-                &params.topic_id,
-                &sender,
-                params.seq,
-                &content_bytes,
-                &aad,
-            )
-            .context(CryptoSnafu)?
-        }
         (MessageKind::SealedTo(_), KeyingMaterial::SealedRecipient(recipient)) => seal_to(
             recipient,
             &params.topic_id,

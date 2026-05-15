@@ -52,17 +52,6 @@ pub enum NetError {
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Tenant stream closed unexpectedly, at {location}"))]
-    TenantStreamClosed {
-        #[snafu(implicit)]
-        location: Location,
-    },
-    #[snafu(display("Tenant protocol returned a bad response: {message}, at {location}"))]
-    TenantBadResponse {
-        message: String,
-        #[snafu(implicit)]
-        location: Location,
-    },
     #[snafu(display("Discovery fetch failed for {url}, at {location}"))]
     DiscoveryFetch {
         url: String,
@@ -75,6 +64,13 @@ pub enum NetError {
     PairBounds {
         what: &'static str,
         limit: usize,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Pair token base64 decode failed, at {location}"))]
+    PairTokenDecode {
+        #[snafu(source)]
+        source: base64::DecodeError,
         #[snafu(implicit)]
         location: Location,
     },

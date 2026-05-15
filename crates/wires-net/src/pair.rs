@@ -8,9 +8,12 @@ use snafu::{ResultExt, ensure};
 use wires_core::Capability;
 use x25519_dalek::StaticSecret;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
 use crate::error::{
     NetError, PairBoundsSnafu, PairCryptoSnafu, PairInvalidCharsSnafu, PairSignatureSnafu,
-    PairUnsupportedVersionSnafu, Result, SerdeSnafu,
+    PairTokenDecodeSnafu, PairUnsupportedVersionSnafu, Result, SerdeSnafu,
 };
 use crate::peer_hint::PeerHint;
 
@@ -123,7 +126,7 @@ impl PairRequest {
                 limit: MAX_TOKEN_BYTES
             }
         );
-        Ok(crate::base64url::encode(&json))
+        Ok(URL_SAFE_NO_PAD.encode(&json))
     }
 
     pub fn decode(token: &str) -> Result<Self> {
@@ -134,10 +137,9 @@ impl PairRequest {
                 limit: MAX_TOKEN_BYTES
             }
         );
-        let bytes = crate::base64url::decode(token).map_err(|_| NetError::Serde {
-            source: serde_json::from_str::<()>("\"bad base64\"").unwrap_err(),
-            location: snafu::location!(),
-        })?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(token)
+            .context(PairTokenDecodeSnafu)?;
         let tok: PairRequest = serde_json::from_slice(&bytes).context(SerdeSnafu)?;
         tok.check_bounds()?;
         Ok(tok)
@@ -660,8 +662,6 @@ pub enum PairRejectCode {
     InternalError,
 }
 
-// --- PairHandler trait + PairProtocol iroh ProtocolHandler ------------------
-
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -741,8 +741,6 @@ impl<H: PairHandler> iroh::protocol::ProtocolHandler for PairProtocol<H> {
     }
 }
 
-// --- PairClient dialer -------------------------------------------------------
-
 use iroh::Endpoint;
 
 /// Dialer side of the `/wires/pair/0` protocol.
@@ -769,18 +767,11 @@ impl PairClient {
         dial: &PairDial,
         envelope: PairGrantEnvelope,
     ) -> Result<PairAck> {
-        // Decode hex node_id into an EndpointId (PublicKey).
-        let bytes: [u8; 32] = hex::decode(&dial.node_id)
-            .ok()
-            .and_then(|v| v.try_into().ok())
-            .ok_or_else(|| NetError::PairDial {
-                message: format!("invalid node_id hex: {}", dial.node_id),
+        let node_id =
+            crate::endpoint_id_from_hex(&dial.node_id).ok_or_else(|| NetError::PairDial {
+                message: format!("invalid endpoint_id hex: {}", dial.node_id),
                 location: snafu::location!(),
             })?;
-        let node_id = iroh::EndpointId::from_bytes(&bytes).map_err(|e| NetError::PairDial {
-            message: format!("invalid node_id key bytes: {e}"),
-            location: snafu::location!(),
-        })?;
 
         // Build an EndpointAddr with any direct IP addresses and optional relay.
         let mut endpoint_addr = iroh::EndpointAddr::new(node_id);

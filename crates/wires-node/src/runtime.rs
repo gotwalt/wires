@@ -19,8 +19,8 @@ pub struct NodeRuntime {
     pub node: Arc<Node>,
     pub endpoint: Endpoint,
     pub glue: NetGlue,
-    /// One gossip handle per joined topic. Populated by `join_topic` and
-    /// consulted by `publish_and_broadcast` in subsequent tasks.
+    /// One gossip handle per joined topic, populated by `join_topic` and
+    /// consumed by `publish_and_broadcast`.
     handles: Mutex<HashMap<[u8; 32], GossipHandle>>,
 }
 

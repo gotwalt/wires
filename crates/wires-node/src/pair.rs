@@ -4,14 +4,15 @@
 use std::path::Path;
 
 use snafu::{ResultExt, ensure};
-use wires_net::pair::{PairGrant, TopicNameEntry};
+use wires_net::pair::PairGrant;
 
 use crate::config::{HostConfig, NodeConfig};
 use crate::error::{
-    AgentMismatchSnafu, ConfigWriteSnafu, NodeError, Result, TopicNamesWriteSnafu,
-    UnknownTopicSnafu, UpsertCapSnafu, VerifyCapSnafu,
+    AgentMismatchSnafu, ConfigWriteSnafu, NodeError, Result, UnknownTopicSnafu, UpsertCapSnafu,
+    VerifyCapSnafu,
 };
 use crate::node::Node;
+use crate::topic_names::upsert_entries as upsert_topic_names;
 
 pub struct InstallOutcome {
     pub cap_id: [u8; 16],
@@ -23,14 +24,11 @@ pub fn install_grant(
     self_agent_pubkey: &[u8; 32],
     grant: &PairGrant,
 ) -> Result<InstallOutcome> {
-    // 1. Cap target sanity: signed cap must name us.
     ensure!(&grant.cap.agent == self_agent_pubkey, AgentMismatchSnafu);
-    // 2. Cap must be signed by the claimed root.
     grant
         .cap
         .verify(&grant.root_pubkey)
         .context(VerifyCapSnafu)?;
-    // 3. Every topic_key references a topic that also has a name entry.
     for tk in &grant.topic_keys {
         ensure!(
             grant.topic_names.iter().any(|n| n.topic_id == tk.topic_id),
@@ -40,7 +38,6 @@ pub fn install_grant(
         );
     }
 
-    // 4. config.toml — root pubkey + optional host info.
     let cfg_path = data_dir.join("config.toml");
     let mut cfg: NodeConfig = if cfg_path.exists() {
         let s = std::fs::read_to_string(&cfg_path).context(ConfigWriteSnafu)?;
@@ -68,16 +65,19 @@ pub fn install_grant(
     })?;
     std::fs::write(&cfg_path, toml_str).context(ConfigWriteSnafu)?;
 
-    // 5. topic_names.json — merge new entries.
-    write_topic_names(data_dir, &grant.topic_names)?;
+    upsert_topic_names(
+        data_dir,
+        grant
+            .topic_names
+            .iter()
+            .map(|e| (e.name.clone(), e.topic_id)),
+    )?;
 
-    // 6. Epoch keys.
     for tk in &grant.topic_keys {
         node.install_epoch_key(tk.topic_id, tk.epoch, tk.key)?;
     }
 
-    // 7. The cap itself, last so the invariant "keys present ⟹ cap present"
-    //    never inverts.
+    // Cap goes last so the invariant "keys present ⟹ cap present" never inverts.
     node.caps.upsert_grant(&grant.cap).context(UpsertCapSnafu)?;
 
     Ok(InstallOutcome {
@@ -85,14 +85,13 @@ pub fn install_grant(
     })
 }
 
-// ─── NodePairHandler ────────────────────────────────────────────────────────
-
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 use wires_net::pair::{
     PairAck, PairFrame, PairGrantEnvelope, PairHandler, PairReject, PairRejectCode,
 };
+use wires_net::unix_now_ms;
 use x25519_dalek::StaticSecret;
 
 /// Outcome signaled to the outer pair-listen loop on a successful install.
@@ -202,7 +201,7 @@ impl PairHandler for NodePairHandler {
                 }
                 PairFrame::Ack(PairAck {
                     installed_cap_id: out.cap_id,
-                    installed_at: now_ms(),
+                    installed_at: unix_now_ms(),
                 })
             }
             Err(NodeError::AgentMismatch { .. }) => {
@@ -226,15 +225,6 @@ fn reject(code: PairRejectCode, msg: &str) -> PairFrame {
         message: msg.to_string(),
     })
 }
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-// ─── pair_listen ─────────────────────────────────────────────────────────────
 
 use ed25519_dalek::SigningKey;
 use wires_net::pair::{ALPN as PAIR_ALPN, PairDial, PairManifest, PairProtocol, PairRequest};
@@ -288,7 +278,7 @@ pub async fn pair_listen(
         let ephemeral_sk = StaticSecret::random_from_rng(rand_core::OsRng);
         let ephemeral_pk = XPub::from(&ephemeral_sk).to_bytes();
         let agent_pk = agent_sk.verifying_key().to_bytes();
-        let now = now_ms();
+        let now = unix_now_ms();
         let expires = now + args.ttl.as_millis() as i64;
         let dial = pair_dial_from(&endpoint);
         let mut req = PairRequest {
@@ -384,25 +374,4 @@ fn hex_to_arr32(s: &str) -> crate::error::Result<[u8; 32]> {
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, "wrong length"),
         location: snafu::location!(),
     })
-}
-
-// ─── write_topic_names ───────────────────────────────────────────────────────
-
-fn write_topic_names(data_dir: &Path, entries: &[TopicNameEntry]) -> Result<()> {
-    let p = data_dir.join("topic_names.json");
-    let mut map: std::collections::HashMap<String, String> = if p.exists() {
-        let s = std::fs::read_to_string(&p).context(TopicNamesWriteSnafu)?;
-        serde_json::from_str(&s).map_err(|e| NodeError::TopicNamesWrite {
-            source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-            location: snafu::location!(),
-        })?
-    } else {
-        std::collections::HashMap::new()
-    };
-    for entry in entries {
-        map.insert(entry.name.clone(), hex::encode(entry.topic_id));
-    }
-    let serialized = serde_json::to_string_pretty(&map).expect("HashMap serializes");
-    std::fs::write(&p, serialized).context(TopicNamesWriteSnafu)?;
-    Ok(())
 }

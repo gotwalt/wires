@@ -143,8 +143,6 @@ pub enum TenantErrorCode {
     Internal,
 }
 
-// --- canonical signing-byte builders ---------------------------------------
-
 const REGISTER_DOMAIN: &[u8] = b"wires-tenant-register-v1\0";
 const TOPIC_REGISTER_DOMAIN: &[u8] = b"wires-topic-register-v1\0";
 const TOPIC_UNREGISTER_DOMAIN: &[u8] = b"wires-topic-unregister-v1\0";

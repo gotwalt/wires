@@ -1,6 +1,6 @@
 //! The `Node` is the agent-facing runtime. Owns identity keys, local storage,
 //! and a broadcast channel for decrypted events. The networking (iroh endpoint,
-//! gossip, replay client) is wired in by Task 26's NetGlue.
+//! gossip, replay client) is wired in by `NetGlue`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use crate::publish::{
     KeyingMaterial, PublishParams, build_message, current_epoch_key, next_seq_and_prev_hash,
 };
 use crate::storage::TopicLogs;
+use wires_net::unix_now_ms;
 use wires_store::StoreError;
 
 pub struct Node {
@@ -112,7 +113,7 @@ impl Node {
             epoch,
             seq,
             prev_hash,
-            timestamp: now_millis(),
+            timestamp: unix_now_ms(),
             keying: KeyingMaterial::StandardEpochKey(&epoch_key),
         })?;
         log.append(&msg).context(StoreSnafu)?;
@@ -165,21 +166,6 @@ impl Node {
         keys.put(epoch, &key).context(StoreSnafu)?;
         Ok(())
     }
-
-    /// Accessor for Task 26's NetGlue.
-    pub fn keys_by_topic_mut(
-        &self,
-    ) -> parking_lot::MutexGuard<'_, HashMap<[u8; 32], Arc<EpochKeyStore>>> {
-        self.keys_by_topic.lock()
-    }
-}
-
-fn now_millis() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

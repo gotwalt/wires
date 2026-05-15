@@ -1,17 +1,15 @@
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-use ed25519_dalek::SigningKey;
 use iroh::{Endpoint, SecretKey, endpoint::presets};
 use wires_core::Capability;
 use wires_core::cap::Right;
-use wires_net::load_or_create_secret;
 use wires_net::pair::{
     HostInfo, PairClient, PairGrant, PairGrantEnvelope, PairRequest, RequestedScope, TopicEpochKey,
     TopicNameEntry,
 };
-use wires_node::{Node, NodeConfig};
+use wires_net::{load_or_create_secret, unix_now_ms};
+use wires_node::{Node, NodeConfig, load_root_signing_key, load_topic_names};
 
 pub async fn run(
     data_dir: &Path,
@@ -23,9 +21,7 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let request = PairRequest::decode(token)?;
     request.verify()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis() as i64;
+    let now = unix_now_ms();
     if now >= request.expires {
         return Err("pair request has expired".into());
     }
@@ -45,11 +41,7 @@ pub async fn run(
         })
     };
     let node = Node::open(cfg)?;
-    let root_bytes = std::fs::read(data_dir.join("root.ed25519"))?;
-    if root_bytes.len() != 32 {
-        return Err("root.ed25519 must be 32 bytes".into());
-    }
-    let root_sk = SigningKey::from_bytes(&root_bytes.try_into().unwrap());
+    let root_sk = load_root_signing_key(data_dir)?;
     let root_pk = root_sk.verifying_key().to_bytes();
 
     let name_map = load_topic_names(data_dir)?;
@@ -154,23 +146,6 @@ fn prompt_yes_no(prompt: &str) -> std::io::Result<bool> {
         buf.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
-}
-
-fn load_topic_names(
-    data_dir: &Path,
-) -> Result<HashMap<String, [u8; 32]>, Box<dyn std::error::Error>> {
-    let p = data_dir.join("topic_names.json");
-    if !p.exists() {
-        return Ok(HashMap::new());
-    }
-    let raw: HashMap<String, String> = serde_json::from_str(&std::fs::read_to_string(p)?)?;
-    let mut out = HashMap::new();
-    for (k, v) in raw {
-        let bytes = hex::decode(&v)?;
-        let arr: [u8; 32] = bytes.try_into().map_err(|_| "topic_id must be 32 bytes")?;
-        out.insert(k, arr);
-    }
-    Ok(out)
 }
 
 fn filter_scopes(

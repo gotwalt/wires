@@ -1,10 +1,10 @@
 use std::path::Path;
 
-use ed25519_dalek::SigningKey;
 use rand_core::{OsRng, RngCore};
 use wires_core::Capability;
 use wires_core::cap::Right;
-use wires_node::{Node, NodeConfig};
+use wires_net::unix_now_ms;
+use wires_node::{Node, NodeConfig, load_root_signing_key, upsert_topic_names};
 
 pub async fn create(data_dir: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let cfg: NodeConfig = toml::from_str(&std::fs::read_to_string(data_dir.join("config.toml"))?)?;
@@ -16,31 +16,18 @@ pub async fn create(data_dir: &Path, name: &str) -> Result<(), Box<dyn std::erro
     OsRng.fill_bytes(&mut epoch_key);
     node.install_epoch_key(topic_id, 0, epoch_key)?;
 
-    // Persist name → topic_id map
-    let map_path = data_dir.join("topic_names.json");
-    let mut map: std::collections::HashMap<String, String> = if map_path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&map_path)?)?
-    } else {
-        std::collections::HashMap::new()
-    };
-    map.insert(name.to_string(), hex::encode(topic_id));
-    std::fs::write(&map_path, serde_json::to_string_pretty(&map)?)?;
+    upsert_topic_names(data_dir, [(name.to_string(), topic_id)])?;
 
     println!("Created topic '{name}' with id {}", hex::encode(topic_id));
     println!(
-        "Note: in v1, epoch keys are not distributed via gossip yet — share epoch key {} with peers manually.",
+        "Epoch key (share with peers via `wires pair-approve`): {}",
         hex::encode(epoch_key)
     );
 
     // Auto-mint a self-cap when this data dir holds a root key and no existing
     // non-revoked cap covers (agent, topic, write).
-    let root_path = data_dir.join("root.ed25519");
-    if root_path.exists() {
-        let root_bytes = std::fs::read(&root_path)?;
-        if root_bytes.len() != 32 {
-            return Err("root.ed25519 must be 32 bytes".into());
-        }
-        let root_sk = SigningKey::from_bytes(&root_bytes.try_into().unwrap());
+    if data_dir.join("root.ed25519").exists() {
+        let root_sk = load_root_signing_key(data_dir)?;
         let agent_pk = node.ed_sk.verifying_key().to_bytes();
 
         let has_existing = node.caps.all()?.values().any(|entry| {
@@ -50,9 +37,7 @@ pub async fn create(data_dir: &Path, name: &str) -> Result<(), Box<dyn std::erro
         });
 
         if !has_existing {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_millis() as i64;
+            let now = unix_now_ms();
             let mut cap = Capability::new_unsigned(
                 agent_pk,
                 vec![name.to_string()],

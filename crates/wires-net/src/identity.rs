@@ -15,8 +15,7 @@ pub fn load_or_create_secret(path: &Path) -> Result<[u8; 32]> {
             out.copy_from_slice(&bytes);
             return Ok(out);
         }
-        // File exists but is the wrong size — treat as corrupt and regenerate.
-        // (Production code might prefer to surface an error; v1 self-heals.)
+        // Wrong-size file is corrupt — regenerate rather than refuse to boot.
     }
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
