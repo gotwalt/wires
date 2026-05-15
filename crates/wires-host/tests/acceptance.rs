@@ -245,10 +245,9 @@ async fn two_tenants_share_one_host_no_leakage() {
         .add(iroh::address_lookup::memory::MemoryLookup::from_endpoint_info(vec![host_ep.addr()]));
     // The host also needs to be able to dial caller_ep_a back (gossip mesh
     // is bidirectional).
-    host_ep
-        .address_lookup()
-        .unwrap()
-        .add(iroh::address_lookup::memory::MemoryLookup::from_endpoint_info(vec![caller_ep_a.addr()]));
+    host_ep.address_lookup().unwrap().add(
+        iroh::address_lookup::memory::MemoryLookup::from_endpoint_info(vec![caller_ep_a.addr()]),
+    );
 
     let client_a = TenantClient::new(caller_ep_a.clone());
     let r = client_a
@@ -276,10 +275,9 @@ async fn two_tenants_share_one_host_no_leakage() {
         .address_lookup()
         .unwrap()
         .add(iroh::address_lookup::memory::MemoryLookup::from_endpoint_info(vec![host_ep.addr()]));
-    host_ep
-        .address_lookup()
-        .unwrap()
-        .add(iroh::address_lookup::memory::MemoryLookup::from_endpoint_info(vec![caller_ep_b.addr()]));
+    host_ep.address_lookup().unwrap().add(
+        iroh::address_lookup::memory::MemoryLookup::from_endpoint_info(vec![caller_ep_b.addr()]),
+    );
 
     let client_b = TenantClient::new(caller_ep_b.clone());
     let _ = client_b

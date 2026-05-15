@@ -35,7 +35,10 @@ async fn topic_register_round_trip() {
         config: TenantHandlerConfig::default(),
         now_ms: Arc::new(|| {
             use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64
         }),
         on_topic_registered: Arc::new(|_, _| {}),
         on_topic_unregistered: Arc::new(|_, _| {}),
@@ -58,7 +61,9 @@ async fn topic_register_round_trip() {
     let app = wires_host::http_discovery::router(discovery_state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
 
     // Init + pair.
     let agent_dir = TempDir::new().unwrap();
@@ -72,7 +77,8 @@ async fn topic_register_round_trip() {
     std::fs::write(
         agent_dir.path().join("config.toml"),
         toml::to_string_pretty(&cfg).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
     wires_cli::cmd::host::pair(agent_dir.path(), &format!("http://{addr}/v1/bootstrap"))
         .await
         .unwrap();

@@ -8,7 +8,9 @@ use wires_core::{MessageKind, WireMessage};
 use wires_host::per_tenant_logs::PerTenantLogs;
 use wires_host::retention::Retention;
 use wires_host::routing::{Router, WriteRateLimiter};
-use wires_host::tenant_registry::{TenantRecord, TenantRegistry, TenantStatus, TopicRegisterOutcome};
+use wires_host::tenant_registry::{
+    TenantRecord, TenantRegistry, TenantStatus, TopicRegisterOutcome,
+};
 
 fn mk_msg(topic: [u8; 32], sender: u8, seq: u64) -> WireMessage {
     WireMessage {
@@ -200,7 +202,10 @@ fn restart_preserves_tenants_topics_and_messages() {
             TopicRegisterOutcome::AlreadyOwned => {
                 // Expected.
             }
-            _ => panic!("re-registering same topic should return AlreadyOwned, got {:?}", outcome),
+            _ => panic!(
+                "re-registering same topic should return AlreadyOwned, got {:?}",
+                outcome
+            ),
         }
 
         // Route an additional message post-restart to verify router still works.
@@ -312,11 +317,7 @@ fn retention_persists_across_restart() {
             msgs_after_restart.len()
         );
         // The highest seq should still be 5 (no magical resurrection).
-        let highest_after = msgs_after_restart
-            .iter()
-            .map(|m| m.seq)
-            .max()
-            .unwrap_or(0);
+        let highest_after = msgs_after_restart.iter().map(|m| m.seq).max().unwrap_or(0);
         assert_eq!(
             highest_after, 5,
             "highest seq after restart should still be 5"

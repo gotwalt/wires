@@ -336,8 +336,7 @@ impl TenantClient {
         let root_pubkey = root_signer.verifying_key().to_bytes();
         let mut nonce = [0u8; 16];
         rand_core::OsRng.fill_bytes(&mut nonce);
-        let bytes =
-            register_signing_bytes(&root_pubkey, timestamp_ms, &nonce, host_endpoint_id);
+        let bytes = register_signing_bytes(&root_pubkey, timestamp_ms, &nonce, host_endpoint_id);
         let signature = root_signer.sign(&bytes).to_bytes();
         let req = TenantRequest::Register(TenantRegisterRequest {
             version: 1,
@@ -520,10 +519,7 @@ mod tests {
             .await
             .unwrap();
         let host_id: [u8; 32] = host_ep.id().as_bytes().to_owned();
-        let handler = Arc::new(Acc {
-            host_id,
-            now: 42,
-        });
+        let handler = Arc::new(Acc { host_id, now: 42 });
         let _router = iroh::protocol::Router::builder(host_ep.clone())
             .accept(ALPN, TenantProtocol::new(handler))
             .spawn();
@@ -590,7 +586,10 @@ mod tests {
                 );
                 let vk = VerifyingKey::from_bytes(&req.root_pubkey).unwrap();
                 vk.verify(&bytes, &req.signature.into()).unwrap();
-                self.registered.lock().unwrap().retain(|t| t != &req.topic_id);
+                self.registered
+                    .lock()
+                    .unwrap()
+                    .retain(|t| t != &req.topic_id);
                 TenantResponse::TopicUnregister(TopicUnregisterResponse {
                     ok: true,
                     topic_id: req.topic_id,
@@ -626,7 +625,10 @@ mod tests {
             .await
             .unwrap();
         let host_id: [u8; 32] = host_ep.id().as_bytes().to_owned();
-        let handler = Arc::new(Acc { host_id, registered: Default::default() });
+        let handler = Arc::new(Acc {
+            host_id,
+            registered: Default::default(),
+        });
         let _router = iroh::protocol::Router::builder(host_ep.clone())
             .accept(ALPN, TenantProtocol::new(Arc::clone(&handler)))
             .spawn();
