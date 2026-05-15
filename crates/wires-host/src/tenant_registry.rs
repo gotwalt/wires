@@ -166,6 +166,29 @@ impl TenantRegistry {
         Ok(outcome)
     }
 
+    /// Count the number of topics registered to `root_pubkey`.
+    pub fn topic_count_for(&self, root_pubkey: &[u8; 32]) -> Result<u32> {
+        let read = self.topic_index_db.begin_read().context(TxnSnafu)?;
+        let table = match read.open_table(TOPIC_INDEX) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => {
+                return Err(crate::error::HostError::Table {
+                    source: e,
+                    location: snafu::location!(),
+                });
+            }
+        };
+        let mut count = 0u32;
+        for row in table.iter().context(StorageIoSnafu)? {
+            let (_k, v) = row.context(StorageIoSnafu)?;
+            if v.value() == root_pubkey.as_slice() {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
+    }
+
     pub fn unregister_topic(&self, root_pubkey: &[u8; 32], topic_id: &[u8; 32]) -> Result<bool> {
         let write = self.topic_index_db.begin_write().context(TxnSnafu)?;
         let removed = {
@@ -257,6 +280,7 @@ impl Default for TenantHandlerConfig {
 
 pub struct TenantHandlerImpl {
     pub registry: Arc<TenantRegistry>,
+    pub retention: Arc<crate::retention::Retention>,
     pub host_endpoint_id: [u8; 32],
     pub config: TenantHandlerConfig,
     pub now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
@@ -470,12 +494,25 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
             _ => return Self::err(TenantErrorCode::TenantNotFound, "no such tenant"),
         };
 
+        let topic_count = self
+            .registry
+            .topic_count_for(&req.root_pubkey)
+            .unwrap_or(0);
+        let bytes_stored = self
+            .retention
+            .bytes_stored(&req.root_pubkey)
+            .unwrap_or(0);
+        let oldest_retained_at = self
+            .retention
+            .oldest_retained_at(&req.root_pubkey)
+            .unwrap_or(0);
+
         TenantResponse::Status(TenantStatusResponse {
             registered_at: rec.registered_at,
-            topic_count: 0, // populated in a later task once routing tracks this
-            bytes_stored: 0,
+            topic_count,
+            bytes_stored,
             retention_budget_bytes: rec.retention_budget_bytes,
-            oldest_retained_at: 0,
+            oldest_retained_at,
             write_rate_limit_per_sec: self.config.write_rate_limit_per_sec,
             status: match rec.status {
                 TenantStatus::Active => TenantStatusKind::Active,
@@ -568,6 +605,29 @@ mod tests {
     }
 
     #[test]
+    fn topic_count_for_returns_correct_count() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let root_a = [0xAAu8; 32];
+        let root_b = [0xBBu8; 32];
+        let topic1 = [0x11u8; 32];
+        let topic2 = [0x22u8; 32];
+        let topic3 = [0x33u8; 32];
+
+        // No topics registered yet.
+        assert_eq!(reg.topic_count_for(&root_a).unwrap(), 0);
+
+        reg.register_topic(&root_a, &topic1).unwrap();
+        assert_eq!(reg.topic_count_for(&root_a).unwrap(), 1);
+        assert_eq!(reg.topic_count_for(&root_b).unwrap(), 0);
+
+        reg.register_topic(&root_a, &topic2).unwrap();
+        reg.register_topic(&root_b, &topic3).unwrap();
+        assert_eq!(reg.topic_count_for(&root_a).unwrap(), 2);
+        assert_eq!(reg.topic_count_for(&root_b).unwrap(), 1);
+    }
+
+    #[test]
     fn nonce_first_seen_then_replay_detected() {
         let tmp = TempDir::new().unwrap();
         let reg = TenantRegistry::open(tmp.path()).unwrap();
@@ -600,10 +660,13 @@ mod tests {
         use ed25519_dalek::{Signer, SigningKey};
         use rand_core::OsRng;
         use std::sync::Arc;
+        use crate::per_tenant_logs::PerTenantLogs;
         use wires_net::tenant::{TenantHandler, TenantRegisterRequest, TenantResponse};
 
         let tmp = TempDir::new().unwrap();
         let reg = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
+        let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+        let retention = Arc::new(crate::retention::Retention::new(tmp.path(), logs));
 
         let signing_key = SigningKey::generate(&mut OsRng);
         let root_pubkey = signing_key.verifying_key().to_bytes();
@@ -612,6 +675,7 @@ mod tests {
 
         let handler = TenantHandlerImpl {
             registry: Arc::clone(&reg),
+            retention,
             host_endpoint_id,
             config: TenantHandlerConfig::default(),
             now_ms: Arc::new(move || now_ms),

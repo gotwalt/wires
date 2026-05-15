@@ -113,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscribe_tx_clone = subscribe_tx.clone();
     let handler = Arc::new(TenantHandlerImpl {
         registry: Arc::clone(&registry),
+        retention: Arc::clone(&retention),
         host_endpoint_id: endpoint_id_bytes,
         config: TenantHandlerConfig::default(),
         now_ms: Arc::new(|| {

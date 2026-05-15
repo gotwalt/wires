@@ -79,6 +79,23 @@ impl Retention {
         let idx = self.index_for(root_pubkey)?;
         idx.total_bytes().context(StoreSnafu)
     }
+
+    /// Returns the host-side timestamp (ms) of the oldest retained message
+    /// for this tenant, by reading the oldest IngestEntry, looking up the
+    /// matching WireMessage, and returning its `timestamp`. Returns 0 if no
+    /// entries exist for this tenant.
+    pub fn oldest_retained_at(&self, root_pubkey: &[u8; 32]) -> Result<i64> {
+        let idx = self.index_for(root_pubkey)?;
+        let oldest = idx.oldest_entry().context(StoreSnafu)?;
+        let Some(entry) = oldest else {
+            return Ok(0);
+        };
+        let log = self.logs.get_or_open(root_pubkey, &entry.topic_id)?;
+        let msgs = log
+            .read_after(&entry.sender, entry.seq.checked_sub(1), 1)
+            .context(StoreSnafu)?;
+        Ok(msgs.first().map(|m| m.timestamp).unwrap_or(0))
+    }
 }
 
 #[cfg(test)]
