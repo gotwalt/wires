@@ -650,6 +650,97 @@ impl<H: PairHandler> iroh::protocol::ProtocolHandler for PairProtocol<H> {
     }
 }
 
+// --- PairClient dialer -------------------------------------------------------
+
+use iroh::Endpoint;
+
+/// Dialer side of the `/wires/pair/0` protocol.
+///
+/// Resolves a [`PairDial`] into an iroh [`iroh::EndpointAddr`], opens a bidi
+/// stream, writes one [`PairFrame::Grant`] frame, and awaits one
+/// [`PairFrame::Ack`] or [`PairFrame::Reject`] frame back. A `Reject` is
+/// mapped into [`NetError::PairRejected`]; any transport problem becomes
+/// [`NetError::PairDial`] or [`NetError::PairStream`].
+#[derive(Clone)]
+pub struct PairClient {
+    endpoint: Endpoint,
+}
+
+impl PairClient {
+    pub fn new(endpoint: Endpoint) -> Self {
+        Self { endpoint }
+    }
+
+    /// Dial `dial.node_id`, send a Grant frame, await one Ack or Reject frame,
+    /// then close. Maps `Reject` into `NetError::PairRejected`.
+    pub async fn deliver_grant(
+        &self,
+        dial: &PairDial,
+        envelope: PairGrantEnvelope,
+    ) -> Result<PairAck> {
+        // Decode hex node_id into an EndpointId (PublicKey).
+        let bytes: [u8; 32] = hex::decode(&dial.node_id)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| NetError::PairDial {
+                message: format!("invalid node_id hex: {}", dial.node_id),
+                location: snafu::location!(),
+            })?;
+        let node_id = iroh::EndpointId::from_bytes(&bytes).map_err(|e| NetError::PairDial {
+            message: format!("invalid node_id key bytes: {e}"),
+            location: snafu::location!(),
+        })?;
+
+        // Build an EndpointAddr with any direct IP addresses and optional relay.
+        let mut endpoint_addr = iroh::EndpointAddr::new(node_id);
+        for a in &dial.addrs {
+            if let Ok(sa) = a.parse::<std::net::SocketAddr>() {
+                endpoint_addr = endpoint_addr.with_ip_addr(sa);
+            }
+        }
+        if let Some(r) = &dial.relay {
+            if let Ok(url) = r.parse::<iroh::RelayUrl>() {
+                endpoint_addr = endpoint_addr.with_relay_url(url);
+            }
+        }
+
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.endpoint.connect(endpoint_addr, ALPN),
+        )
+        .await
+        .map_err(|_| NetError::PairDial {
+            message: "dial timeout".into(),
+            location: snafu::location!(),
+        })?
+        .map_err(|e| NetError::PairDial {
+            message: format!("{e}"),
+            location: snafu::location!(),
+        })?;
+
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| NetError::PairStream {
+            message: format!("open_bi: {e}"),
+            location: snafu::location!(),
+        })?;
+        crate::framing::write_frame(&mut send, &PairFrame::Grant(envelope)).await?;
+        send.finish().ok();
+        let frame: PairFrame =
+            crate::framing::read_frame(&mut recv, MAX_FRAME_LEN).await?;
+        match frame {
+            PairFrame::Ack(a) => Ok(a),
+            PairFrame::Reject(r) => Err(NetError::PairRejected {
+                code: r.code,
+                message: r.message,
+                location: snafu::location!(),
+            }),
+            PairFrame::Grant(_) => Err(NetError::PairStream {
+                message: "server returned Grant frame".into(),
+                location: snafu::location!(),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod frame_tests {
     use super::*;
