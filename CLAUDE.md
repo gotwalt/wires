@@ -4,12 +4,23 @@ End-to-end encrypted gossip substrate for a household's AI agents. Rust workspac
 
 ## Status
 
-Prototype. The **v1 substrate** is built and merged on `main` (commit `fefbbfc`). What works end-to-end via the CLI: identity, topic creation, capability mint/revoke, publish with AEAD, gossip + replay between peers, decrypt on receive, persisted hash-chained logs. What does **not** exist yet: iOS companion (root key custody), REST/MCP surface, ingestion daemons, `__cap.*` gossip propagation, `__topic.epoch_advance` distribution. See "Out of scope for v1" in the design spec.
+Prototype. Two slices have landed on `main`:
+
+- **Substrate v1** (merge `fefbbfc`) — identity, topic creation, capability mint/revoke, publish with AEAD, gossip + replay between peers, decrypt on receive, persisted hash-chained logs. Drives the CLI end-to-end.
+- **Hosted service v1** (merge `3da4ec8`) — `wires-host` is now multi-tenant: tenant registration over a `/wires/tenant/0` ALPN, per-tenant rolling retention with FIFO eviction, topic→tenant routing, write-rate ceiling, HTTPS service discovery at `/v1/bootstrap`, new `InviteToken` shape with `peer_hints` + `service_discovery_url`. The host became a `lib + bin` crate. The `--topic` CLI flag is gone; topics arrive only via the tenant protocol.
+
+A Home Assistant ingestion daemon (`wires-ha`) also exists as a working example of an agent that participates in gossip + replay.
+
+What does **not** exist yet: iOS companion (still a stock SwiftUI scaffold — the spec/plan need revision against the post-hosted-service architecture), REST/MCP surface, `__cap.*` gossip propagation, `__topic.epoch_advance` distribution, any CLI client for the tenant protocol. See "Out of scope" in each design spec.
 
 ## Authoritative docs
 
-- **Design spec** — `docs/superpowers/specs/2026-05-14-wires-substrate-design.md`. Read this before making non-trivial changes. It defines the wire format, encryption modes, capability model, reserved message types, and host blindness contract. Treat it as load-bearing.
-- **Implementation plan** — `docs/superpowers/plans/2026-05-14-wires-substrate.md`. The 32-task plan that built v1; useful as a map of who-implements-what.
+- **Substrate spec** — `docs/superpowers/specs/2026-05-14-wires-substrate-design.md`. Wire format, encryption modes, capability model, reserved message types, host blindness contract. Load-bearing.
+- **Substrate plan** — `docs/superpowers/plans/2026-05-14-wires-substrate.md`. The 32-task plan that built v1; map of who-implements-what.
+- **Hosted-service spec** — `docs/superpowers/specs/2026-05-14-wires-hosted-service-design.md`. Multi-tenant `wires-host`, tenant control protocol, per-tenant storage layout, new invite-token shape, HTTPS discovery surface.
+- **Hosted-service plan** — `docs/superpowers/plans/2026-05-14-wires-hosted-service.md`. 29 tasks, fully landed.
+- **iOS companion spec** — `docs/superpowers/specs/2026-05-14-wires-ios-companion-design.md`. **Stale**: written before hosted-service landed; still describes the dropped `HostPairToken` QR-pair flow. Revise against the hosted-service spec's §8 (discovery + `register_with_hosted_service`) before implementing.
+- **iOS companion plan** — `docs/superpowers/plans/2026-05-14-wires-ios-companion.md`. Also **stale** for the same reason. Revise after the spec.
 
 ## Crate layout
 
@@ -19,11 +30,12 @@ Strict bottom-up layering — a crate may only depend on crates above it in this
 |---|---|
 | `wires-core` | Pure types: `WireMessage`, `MessageKind` (Standard/SealedTo/Public), `Capability`, content schema, envelope sign/verify, hash-chain link math. No I/O, no async. |
 | `wires-crypto` | AEAD primitives: `standard.rs` (ChaCha20-Poly1305 with BLAKE3-derived nonces), `sealed.rs` (x25519 sealed-box), `public.rs` (plaintext-with-AAD), `keywrap.rs`. |
-| `wires-store` | redb-backed persistence: per-publisher hash-chained `topic_log`, `cap_table`, `epoch_keys`. |
-| `wires-net` | iroh transport: `gossip.rs` wraps `iroh-gossip`, `replay.rs` is a custom QUIC protocol on ALPN `/wires/replay/0`, `invite.rs` is the base64 invite token format. |
+| `wires-store` | redb-backed persistence: per-publisher hash-chained `topic_log` (now with `bytes_stored` and `delete` for eviction), `cap_table`, `epoch_keys`, and `ingest_index` for FIFO eviction across a tenant's topics. |
+| `wires-net` | iroh transport: `gossip.rs` wraps `iroh-gossip`, `replay.rs` is a custom QUIC protocol on ALPN `/wires/replay/0`, `tenant.rs` is the new `/wires/tenant/0` control-plane (request/response types, `TenantClient`, `TenantProtocol` server-side handler, `TenantHandler` trait), `framing.rs` is the shared length-prefixed JSON helper, `invite.rs` is the new `InviteToken` with `peer_hints` + `service_discovery_url`, `peer_hint::first_reachable` is the join-time fallback iterator. |
 | `wires-node` | Agent runtime. `Node::open` opens identity + storage; `publish_standard` / `handle_inbound` are the main entry points. `NetGlue` wires gossip + replay into a `Node`. |
-| `wires-cli` | `wires` binary — clap-based human/agent CLI. |
-| `wires-host` | `wires-host` binary — blind relay/replay-server. Holds no root key, no epoch keys, no caps; only persists ciphertext after a coarse signature check. |
+| `wires-cli` | `wires` binary — clap-based human/agent CLI. Does **not** yet speak the tenant control protocol. |
+| `wires-host` | `lib + bin`. The binary is a multi-tenant blind relay; the library houses `tenant_registry` (tenants/topic_index/nonces), `per_tenant_logs`, `retention`, `routing`, `replay_source`, `http_discovery` (axum `/v1/bootstrap`), and `error`. Still has no root key, no epoch keys, no caps; only persists ciphertext after a signature check, routed by topic→tenant lookup. |
+| `wires-ha` | `wires-ha` binary — Home Assistant ingestion daemon. Subscribes to a HA WebSocket, publishes `state_changed` events onto a configured topic, participates in gossip + replay like any other agent. Example of a non-CLI agent. |
 
 Do not reach across layers (e.g. `wires-net` must not depend on `wires-store`).
 
@@ -47,27 +59,29 @@ These are easy to break by accident and break the security model when broken:
 
 2. **Encrypt-then-sign, with AAD computed from a placeholder envelope.** The publish flow: build envelope with `ciphertext: vec![]` and `payload_len: 0`, compute `signing_bytes` → use as AAD, encrypt, set the real `ciphertext` and `payload_len`, sign over `signing_bytes` again. See `wires-node/src/publish.rs`.
 
-3. **Host blindness.** The host enforces `verify_envelope` (signature) only. ACL checks (cap_id has rights to topic, sender owns cap, not revoked) happen on the **receiver** at decrypt time. Never add cap lookups to `wires-host`. The host has no caps and no epoch keys.
+3. **Host blindness.** The host enforces `verify_envelope` (signature) only. ACL checks (cap_id has rights to topic, sender owns cap, not revoked) happen on the **receiver** at decrypt time. Never add cap lookups to `wires-host`. The host has no caps and no epoch keys. Multi-tenancy did **not** soften this: the only per-tenant metadata the host learns is `(root_pubkey, registered topic_ids)`, both of which were already inferrable from on-wire traffic.
 
 4. **Per-publisher hash chain.** Each `(topic_id, sender)` has its own chain. `TopicLog::append` is idempotent on duplicate hash but errors on fork attempts (same `seq`, different content). The log key is `32-byte sender || 8-byte BE seq`.
 
 5. **Three `MessageKind`s, three nonce schemes.** `Standard` uses a deterministic nonce derived from `(topic_id, sender, seq)` — never reuse epoch keys across (sender, seq). `SealedTo(pubkey)` is x25519 sealed-box; the ephemeral pubkey is prepended to ciphertext. `Public` is JSON-with-AAD, no encryption. Reserved message types (prefix `__`) require specific kinds — see `wires-core/src/reserved.rs`.
 
+6. **Topic→tenant routing is the host's only ACL.** Inbound envelopes whose `topic_id` is not in `topic_index.redb` are dropped (no panic, no log spam). Envelopes whose tenant is `Suspended` are dropped. Envelopes that would push a tenant past its retention budget are accepted, then the oldest entries (across all of that tenant's topics, ordered by host-side ingest timestamp) are evicted via `IngestIndex::evict_oldest_until`. Eviction is global within a tenant, not per-topic.
+
 ## Build and test
 
 ```bash
 cargo build                         # all crates
-cargo test --workspace              # 95 unit/integration tests
-cargo test --workspace -- --ignored # 6 acceptance scenarios (slower)
+cargo test --workspace              # ~139 unit/integration tests
+cargo test --workspace -- --ignored # 7 acceptance scenarios (slower)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all
 ```
 
-Binaries land at `target/debug/wires` and `target/debug/wires-host`.
+Binaries land at `target/debug/wires`, `target/debug/wires-host`, and `target/debug/wires-ha`.
 
-## Data-dir layout (for the CLI)
+## Data-dir layouts
 
-Default `~/.wires/`:
+### CLI agent (default `~/.wires/`)
 
 ```
 config.toml             NodeConfig (root_pubkey_hex, data_dir, bootstrap_peers)
@@ -78,6 +92,19 @@ topic_names.json        name → 32-byte topic_id map (CLI-side convenience)
 caps.redb               CapTable
 log_<topic-hex>.redb    per-topic hash-chained ciphertext log
 keys_<topic-hex>.redb   per-topic epoch keys
+```
+
+### Host (passed via `--data-dir`)
+
+```
+iroh.secret                    32-byte iroh node secret (this host's EndpointId)
+tenants.redb                   tenant table: root_pubkey -> TenantRecord
+topic_index.redb               topic_id -> root_pubkey (forward index)
+nonces.redb                    recent registration nonces with TTL (replay protection)
+tenants/
+  <root_pubkey_hex>/
+    log_<topic_hex>.redb       per-topic ciphertext log (unchanged format)
+    ingest_<root_hex>.redb     per-tenant FIFO eviction index (ingest_ts + size)
 ```
 
 ## When working in this repo
