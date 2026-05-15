@@ -1,8 +1,8 @@
 use std::io::Write;
 use std::path::Path;
 
-use iroh::{Endpoint, SecretKey, endpoint::presets};
-use snafu::{ResultExt, location};
+use iroh::SecretKey;
+use snafu::ResultExt;
 use wires_core::Capability;
 use wires_core::cap::Right;
 use wires_net::pair::{
@@ -12,9 +12,7 @@ use wires_net::pair::{
 use wires_net::{load_or_create_secret, unix_now_ms};
 use wires_node::{Node, NodeConfig, load_root_signing_key, load_topic_names};
 
-use crate::error::{
-    CliError, CoreSnafu, IoSnafu, NetSnafu, NodeSnafu, Result, StoreSnafu, TomlParseSnafu,
-};
+use crate::error::{CoreSnafu, IoSnafu, NetSnafu, NodeSnafu, Result, StoreSnafu, TomlParseSnafu};
 use crate::invalid;
 
 pub async fn run(
@@ -106,14 +104,9 @@ pub async fn run(
         .context(NetSnafu)?;
 
     let secret = load_or_create_secret(&data_dir.join("iroh.secret")).context(NetSnafu)?;
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(SecretKey::from_bytes(&secret))
-        .bind()
+    let endpoint = wires_net::bind_lan(SecretKey::from_bytes(&secret), vec![])
         .await
-        .map_err(|e| CliError::Endpoint {
-            message: format!("bind: {e}"),
-            location: location!(),
-        })?;
+        .context(NetSnafu)?;
     let client = PairClient::new(endpoint);
     let ack = client
         .deliver_grant(&request.dial, envelope)
