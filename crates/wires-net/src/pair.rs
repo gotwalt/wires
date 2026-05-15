@@ -5,11 +5,14 @@
 use ed25519_dalek::{Signature, SigningKey, Signer, VerifyingKey, Verifier};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, ensure};
+use x25519_dalek::StaticSecret;
+use wires_core::Capability;
 
 use crate::error::{
-    NetError, PairBoundsSnafu, PairInvalidCharsSnafu, PairSignatureSnafu,
+    NetError, PairBoundsSnafu, PairCryptoSnafu, PairInvalidCharsSnafu, PairSignatureSnafu,
     PairUnsupportedVersionSnafu, Result, SerdeSnafu,
 };
+use crate::invite::PeerHint;
 
 pub const ALPN: &[u8] = b"/wires/pair/0";
 
@@ -167,9 +170,6 @@ impl PairRequest {
     }
 }
 
-use wires_core::Capability;
-use crate::invite::PeerHint;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairGrant {
     pub version: u8,
@@ -216,6 +216,8 @@ pub struct PairGrantEnvelope {
     pub signature: [u8; 64],
 }
 
+/// Domain separator for the pair-grant sealed-box AAD. Prevents cross-protocol
+/// confusion if the same ephemeral key were ever reused elsewhere.
 const PAIR_SEAL_AAD: &[u8] = b"wires.pair.v1";
 
 impl PairGrantEnvelope {
@@ -235,10 +237,7 @@ impl PairGrantEnvelope {
             &content,
             PAIR_SEAL_AAD,
         )
-        .map_err(|e| NetError::PairCrypto {
-            source: Box::new(e),
-            location: snafu::location!(),
-        })?;
+        .context(PairCryptoSnafu)?;
 
         let mut to_sign = Vec::with_capacity(32 + sealed_payload.len());
         to_sign.extend_from_slice(&grant.root_pubkey);
@@ -257,7 +256,7 @@ impl PairGrantEnvelope {
     /// after parsing.
     pub fn open_and_verify(
         &self,
-        recipient_sk: &x25519_dalek::StaticSecret,
+        recipient_sk: &StaticSecret,
         expected_nonce: &[u8; 32],
     ) -> Result<PairGrant> {
         let vk = VerifyingKey::from_bytes(&self.root_pubkey)
@@ -279,10 +278,7 @@ impl PairGrantEnvelope {
             &self.sealed_payload,
             PAIR_SEAL_AAD,
         )
-        .map_err(|e| NetError::PairCrypto {
-            source: Box::new(e),
-            location: snafu::location!(),
-        })?;
+        .context(PairCryptoSnafu)?;
         let grant: PairGrant = serde_json::from_slice(&content).context(SerdeSnafu)?;
         Ok(grant)
     }
@@ -350,11 +346,12 @@ mod grant_tests {
         let root_pk = root_sk.verifying_key().to_bytes();
         let bob_ephemeral_sk = XSk::random_from_rng(OsRng);
         let bob_ephemeral_pk = XPub::from(&bob_ephemeral_sk).to_bytes();
-        let grant = sample_grant([0u8; 32], signed_cap(&root_sk, [7u8; 32]), [9u8; 32]);
+
+        let nonce = [9u8; 32];
+        let grant = sample_grant(root_pk, signed_cap(&root_sk, [7u8; 32]), nonce);
         let mut env = PairGrantEnvelope::seal_and_sign(&grant, &bob_ephemeral_pk, &root_sk).unwrap();
-        // mutate root_pubkey to break the signature scope
-        env.root_pubkey = root_pk; // doesn't match what was signed (which was [0u8;32])
-        assert!(env.open_and_verify(&bob_ephemeral_sk, &[9u8; 32]).is_err());
+        env.signature[0] ^= 0x01;
+        assert!(env.open_and_verify(&bob_ephemeral_sk, &nonce).is_err());
     }
 
     #[test]
