@@ -319,6 +319,35 @@ impl TenantClient {
         let resp: TenantResponse = read_frame(&mut recv, MAX_FRAME_LEN).await?;
         Ok(resp)
     }
+
+    /// Sign a `TenantRegisterRequest` with `root_signer` and dial `peer` to
+    /// send it. `host_endpoint_id` must be the 32-byte ID of the host at
+    /// `peer` (included in the signed bytes per spec §4.2). `timestamp_ms`
+    /// should be the caller's current UNIX millis (the host accepts ±60s).
+    pub async fn register_tenant(
+        &self,
+        peer: EndpointId,
+        root_signer: &ed25519_dalek::SigningKey,
+        host_endpoint_id: &[u8; 32],
+        timestamp_ms: i64,
+    ) -> Result<TenantResponse> {
+        use ed25519_dalek::Signer as _;
+        use rand_core::RngCore as _;
+        let root_pubkey = root_signer.verifying_key().to_bytes();
+        let mut nonce = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut nonce);
+        let bytes =
+            register_signing_bytes(&root_pubkey, timestamp_ms, &nonce, host_endpoint_id);
+        let signature = root_signer.sign(&bytes).to_bytes();
+        let req = TenantRequest::Register(TenantRegisterRequest {
+            version: 1,
+            root_pubkey,
+            timestamp: timestamp_ms,
+            nonce,
+            signature,
+        });
+        self.send(peer, &req).await
+    }
 }
 
 #[cfg(test)]
@@ -356,5 +385,78 @@ mod tests {
         assert_ne!(base, diff_ts);
         assert_ne!(base, diff_nonce);
         assert_ne!(base, diff_host);
+    }
+
+    #[tokio::test]
+    async fn register_tenant_helper_round_trips() {
+        // Build a tiny TenantHandler that approves any well-signed register.
+        use std::sync::Arc;
+        struct Acc {
+            host_id: [u8; 32],
+            now: i64,
+        }
+        impl TenantHandler for Acc {
+            fn handle_register(&self, req: TenantRegisterRequest) -> TenantResponse {
+                // Verify the signature so we exercise the convenience function's signing.
+                use ed25519_dalek::{Verifier, VerifyingKey};
+                let bytes = register_signing_bytes(
+                    &req.root_pubkey,
+                    req.timestamp,
+                    &req.nonce,
+                    &self.host_id,
+                );
+                let vk = VerifyingKey::from_bytes(&req.root_pubkey).unwrap();
+                vk.verify(&bytes, &req.signature.into()).unwrap();
+                TenantResponse::Register(TenantRegisterResponse {
+                    ok: true,
+                    host_endpoint_id: hex::encode(self.host_id),
+                    server_time: self.now,
+                    caps_topic_id: [9u8; 32],
+                })
+            }
+            fn handle_topic_register(&self, _r: TopicRegisterRequest) -> TenantResponse {
+                unreachable!()
+            }
+            fn handle_topic_unregister(&self, _r: TopicUnregisterRequest) -> TenantResponse {
+                unreachable!()
+            }
+            fn handle_status(&self, _r: TenantStatusRequest) -> TenantResponse {
+                unreachable!()
+            }
+        }
+        let host_secret = iroh::SecretKey::generate();
+        let host_ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(host_secret)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let host_id: [u8; 32] = host_ep.id().as_bytes().to_owned();
+        let handler = Arc::new(Acc {
+            host_id,
+            now: 42,
+        });
+        let _router = iroh::protocol::Router::builder(host_ep.clone())
+            .accept(ALPN, TenantProtocol::new(handler))
+            .spawn();
+
+        let caller_ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::generate())
+            .bind()
+            .await
+            .unwrap();
+        let client = TenantClient::new(caller_ep);
+        let root = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let resp = client
+            .register_tenant(host_ep.id(), &root, &host_id, 1234)
+            .await
+            .unwrap();
+        match resp {
+            TenantResponse::Register(r) => {
+                assert!(r.ok);
+                assert_eq!(r.server_time, 42);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 }
