@@ -87,6 +87,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint_id_bytes: [u8; 32] = endpoint_id.as_bytes().to_owned();
     println!("wires-host: EndpointId = {endpoint_id}");
 
+    // Emit the host ticket on every startup. Operators copy/scan; TTY runs
+    // additionally get a QR rendered to stderr.
+    {
+        use std::io::IsTerminal as _;
+        let ticket = wires_net::HostTicket::from_endpoint(&endpoint, *args.ticket_hint_ttl)?;
+        let encoded = ticket.encode()?;
+        tracing::info!("host ticket: {encoded}");
+        let show_qr = args.qr || (!args.no_qr && std::io::stderr().is_terminal());
+        if show_qr {
+            let art = ticket.render_qr_ansi()?;
+            eprintln!();
+            eprintln!("{art}");
+        }
+    }
+
     // Storage + state -------------------------------------------------------
     let registry = Arc::new(TenantRegistry::open(&args.data_dir)?);
     let logs = Arc::new(PerTenantLogs::new(&args.data_dir));
