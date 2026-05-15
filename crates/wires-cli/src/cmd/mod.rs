@@ -1,8 +1,6 @@
 pub mod cat;
 pub mod host;
 pub mod init;
-pub mod invite;
-pub mod join;
 pub mod pair_approve;
 pub mod pair_listen;
 pub mod publish;

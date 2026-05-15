@@ -1,4 +1,4 @@
-//! URL-safe base64 (no padding) used by invite tokens and pair tokens.
+//! URL-safe base64 (no padding) used by pair tokens and other protocol messages.
 
 pub fn encode(bytes: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

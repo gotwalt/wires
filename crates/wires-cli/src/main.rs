@@ -45,25 +45,11 @@ enum Cmd {
         #[arg(long)]
         tail: bool,
     },
-    /// Mint a new capability for an agent
-    Invite {
-        #[arg(long)]
-        agent_pubkey: String,
-        #[arg(long, value_delimiter = ',')]
-        topics: Vec<String>,
-        #[arg(long, value_delimiter = ',', default_values_t = vec!["read".to_string(), "write".to_string()])]
-        rights: Vec<String>,
-    },
     /// Revoke a capability by id
     Revoke { cap_id: String },
     /// Tenant control: pair with a host, register topics, view status.
     #[command(subcommand)]
     Host(HostCmd),
-    /// Join an invite token: install the cap and store the inviter's host info.
-    Join {
-        /// Base64-encoded InviteToken (output of `wires invite`).
-        token: String,
-    },
     /// Start a pair-listen window; print a PairRequest token; wait for a
     /// pair-approve dial.
     PairListen {
@@ -144,11 +130,6 @@ async fn main() -> std::process::ExitCode {
             data,
         } => cmd::publish::run(&data_dir, &topic, &cap, &r#type, &text, data.as_deref()).await,
         Cmd::Cat { topic, tail } => cmd::cat::run(&data_dir, &topic, tail).await,
-        Cmd::Invite {
-            agent_pubkey,
-            topics,
-            rights,
-        } => cmd::invite::run(&data_dir, &agent_pubkey, &topics, &rights).await,
         Cmd::Revoke { cap_id } => cmd::revoke::run(&data_dir, &cap_id).await,
         Cmd::Host(HostCmd::Pair { discovery_url }) => {
             cmd::host::pair(&data_dir, &discovery_url).await
@@ -160,7 +141,6 @@ async fn main() -> std::process::ExitCode {
             cmd::host::topic_unregister(&data_dir, &topic).await
         }
         Cmd::Host(HostCmd::Status) => cmd::host::status(&data_dir).await,
-        Cmd::Join { token } => cmd::join::run(&data_dir, &token).await,
         Cmd::PairListen {
             role,
             description,
