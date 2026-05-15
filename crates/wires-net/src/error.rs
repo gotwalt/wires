@@ -102,6 +102,25 @@ pub enum NetError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Pair dial failed: {message}, at {location}"))]
+    PairDial {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Pair stream error: {message}, at {location}"))]
+    PairStream {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Pair rejected by responder: {code:?}: {message}, at {location}"))]
+    PairRejected {
+        code: crate::pair::PairRejectCode,
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = NetError> = core::result::Result<T, E>;
