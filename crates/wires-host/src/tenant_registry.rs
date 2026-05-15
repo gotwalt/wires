@@ -166,6 +166,35 @@ impl TenantRegistry {
         Ok(outcome)
     }
 
+    /// Every registered topic id. Used on host startup to resubscribe to the
+    /// gossip mesh for all topics persisted from prior runs — without this,
+    /// the host wakes up unsubscribed and silently misses traffic until each
+    /// tenant re-registers.
+    pub fn all_topic_ids(&self) -> Result<Vec<[u8; 32]>> {
+        let read = self.topic_index_db.begin_read().context(TxnSnafu)?;
+        let table = match read.open_table(TOPIC_INDEX) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(crate::error::HostError::Table {
+                    source: e,
+                    location: snafu::location!(),
+                });
+            }
+        };
+        let mut out = Vec::new();
+        for row in table.iter().context(StorageIoSnafu)? {
+            let (k, _v) = row.context(StorageIoSnafu)?;
+            let raw = k.value();
+            if raw.len() == 32 {
+                let mut id = [0u8; 32];
+                id.copy_from_slice(raw);
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
     /// Count the number of topics registered to `root_pubkey`.
     pub fn topic_count_for(&self, root_pubkey: &[u8; 32]) -> Result<u32> {
         let read = self.topic_index_db.begin_read().context(TxnSnafu)?;
@@ -596,6 +625,26 @@ mod tests {
         reg.register_topic(&root_a, &topic).unwrap();
         let conflict = reg.register_topic(&root_b, &topic).unwrap();
         assert!(matches!(conflict, TopicRegisterOutcome::Conflict { .. }));
+    }
+
+    #[test]
+    fn all_topic_ids_returns_every_registered_topic() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        assert!(reg.all_topic_ids().unwrap().is_empty());
+
+        let root_a = [7u8; 32];
+        let root_b = [8u8; 32];
+        let topic1 = [0x11u8; 32];
+        let topic2 = [0x22u8; 32];
+        let topic3 = [0x33u8; 32];
+        reg.register_topic(&root_a, &topic1).unwrap();
+        reg.register_topic(&root_a, &topic2).unwrap();
+        reg.register_topic(&root_b, &topic3).unwrap();
+
+        let mut got = reg.all_topic_ids().unwrap();
+        got.sort();
+        assert_eq!(got, vec![topic1, topic2, topic3]);
     }
 
     #[test]
