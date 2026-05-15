@@ -1,4 +1,5 @@
 pub mod discovery;
+pub mod endpoint;
 pub mod error;
 pub mod framing;
 pub mod gossip;
@@ -10,6 +11,7 @@ pub mod tenant;
 pub mod time;
 
 pub use discovery::{DiscoveryEndpoint, DiscoveryResponse, fetch_endpoints};
+pub use endpoint::{bind_cloud, bind_lan};
 pub use error::{NetError, Result};
 pub use gossip::{GOSSIP_ALPN, Gossip, GossipHandle, GossipNode};
 pub use identity::load_or_create_secret;

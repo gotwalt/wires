@@ -133,7 +133,7 @@ pub enum NetError {
     #[cfg(feature = "mdns")]
     #[snafu(display("endpoint address-lookup registry unavailable: {source}, at {location}"))]
     AddressLookup {
-        source: iroh::address_lookup::Error,
+        source: iroh::endpoint::EndpointError,
         #[snafu(implicit)]
         location: Location,
     },
