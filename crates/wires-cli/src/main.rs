@@ -64,6 +64,22 @@ enum Cmd {
         /// Base64-encoded InviteToken (output of `wires invite`).
         token: String,
     },
+    /// Start a pair-listen window; print a PairRequest token; wait for a
+    /// pair-approve dial.
+    PairListen {
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        description: String,
+        /// Topic-name + rights, e.g. "home.notes:read+write". Repeatable.
+        #[arg(long = "request", required = true)]
+        request: Vec<String>,
+        /// Pair window TTL. Examples: "5m", "60s", "1h".
+        #[arg(long, default_value = "5m")]
+        ttl: humantime::Duration,
+        #[arg(long)]
+        qr: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -128,6 +144,13 @@ async fn main() -> std::process::ExitCode {
         }
         Cmd::Host(HostCmd::Status) => cmd::host::status(&data_dir).await,
         Cmd::Join { token } => cmd::join::run(&data_dir, &token).await,
+        Cmd::PairListen {
+            role,
+            description,
+            request,
+            ttl,
+            qr,
+        } => cmd::pair_listen::run(&data_dir, role, description, request, ttl.into(), qr).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
