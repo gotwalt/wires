@@ -133,6 +133,18 @@ impl HostTicket {
             })?;
         Ok(())
     }
+
+    /// `HostTicket` → `PeerHint`. Used by the CLI when dispatching
+    /// `wires host …` subcommands: the `--ticket` value is decoded into a
+    /// `HostTicket`, converted to a `PeerHint`, and handed to
+    /// `peer_hint::first_reachable`.
+    pub fn to_peer_hint(&self) -> crate::peer_hint::PeerHint {
+        crate::peer_hint::PeerHint {
+            node_id: self.endpoint_id.clone(),
+            addrs: self.addrs.clone(),
+            relay: self.relay.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -240,5 +252,14 @@ mod tests {
         let s = t.encode().unwrap();
         let back = HostTicket::decode(&s).unwrap();
         assert_eq!(back.endpoint_id, t.endpoint_id);
+    }
+
+    #[test]
+    fn to_peer_hint_carries_fields() {
+        let t = sample();
+        let h = t.to_peer_hint();
+        assert_eq!(h.node_id, t.endpoint_id);
+        assert_eq!(h.addrs, t.addrs);
+        assert_eq!(h.relay, t.relay);
     }
 }
