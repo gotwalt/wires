@@ -15,14 +15,30 @@ path = "src/main.rs"
 [dependencies]
 wires-core = { workspace = true }
 wires-node = { workspace = true }
+wires-net  = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 snafu = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
-toml          = "0.8"
+toml          = { workspace = true }
 hex           = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand_core     = { workspace = true }
+iroh          = { workspace = true }
 chrono        = "0.4"
+
+[dev-dependencies]
+tempfile   = { workspace = true }
+tokio      = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wires-host = { workspace = true }
+wires-net  = { workspace = true }
+wires-node = { workspace = true }
+rand_core  = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex        = { workspace = true }
+serde_json = { workspace = true }
+toml       = { workspace = true }
+axum       = "0.8"
+iroh       = { workspace = true }
