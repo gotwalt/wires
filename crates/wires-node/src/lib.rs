@@ -4,6 +4,7 @@ pub mod inbound;
 pub mod net_glue;
 pub mod node;
 pub mod publish;
+pub mod runtime;
 pub mod storage;
 pub mod sync;
 
@@ -15,5 +16,6 @@ pub use node::{DecryptedEvent, Node};
 pub use publish::{
     KeyingMaterial, PublishParams, build_message, current_epoch_key, next_seq_and_prev_hash,
 };
+pub use runtime::NodeRuntime;
 pub use storage::TopicLogs;
 pub use sync::{current_hwm_for_request, drive_sync_pass};
