@@ -38,11 +38,7 @@ pub struct HostTicket {
 impl HostTicket {
     /// URL-safe base64 of canonical JSON.
     pub fn encode(&self) -> Result<String> {
-        let json =
-            serde_json::to_vec(self).map_err(|source| NetError::TicketParse {
-                source,
-                location: snafu::location!(),
-            })?;
+        let json = serde_json::to_vec(self).context(TicketParseSnafu)?;
         ensure!(
             json.len() <= MAX_TICKET_BYTES,
             TicketBoundsSnafu {
@@ -99,7 +95,6 @@ impl HostTicket {
             .ok_or_else(|| NetError::TicketInvalidEndpointId {
                 location: snafu::location!(),
             })?;
-        ensure!(bytes.len() == 32, TicketInvalidEndpointIdSnafu);
         iroh::EndpointId::from_bytes(&bytes.as_slice().try_into().expect("len checked"))
             .ok()
             .ok_or_else(|| NetError::TicketInvalidEndpointId {
@@ -181,9 +176,9 @@ mod tests {
 
     #[test]
     fn rejects_oversize_token() {
-        // Force a JSON > MAX_TICKET_BYTES via a big addrs list. Encode bypasses
-        // the bound (we'd need to mutate after encode), so build base64 of an
-        // oversize byte buffer directly.
+        // Build base64 of a raw oversize buffer directly — the JSON encode
+        // path is also guarded, but this exercises the decode-side check in
+        // isolation.
         let big = vec![b'a'; MAX_TICKET_BYTES + 100];
         let s = URL_SAFE_NO_PAD.encode(&big);
         let err = HostTicket::decode(&s).unwrap_err();
