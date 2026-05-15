@@ -1,31 +1,35 @@
 # Wires — iOS Companion App Design
 
-**Date:** 2026-05-14
-**Status:** Draft — on hold pending upcoming substrate architecture changes. Reviewed and approved 2026-05-14 against the current substrate spec; revisit before implementing to confirm the trust model, capability shape, and `__caps` semantics still hold.
-**Scope:** v1 of the iOS companion app. Pairs with [the substrate design](2026-05-14-wires-substrate-design.md), which defines the wire format, capability model, and host blindness contract this app participates in.
+**Date:** 2026-05-14 (revised 2026-05-15)
+**Status:** Draft. Revised on 2026-05-15 after the hosted-service v1 and responder-driven-pairing v1 substrate slices landed. The previous draft's `HostPairToken` and `EnrollmentToken` flows are gone; the iOS app no longer participates as a gossip peer. This revision aligns the iOS surface against [the hosted-service design](2026-05-14-wires-hosted-service-design.md) and [the responder-driven pairing design](2026-05-15-wires-responder-driven-pairing-design.md).
+**Scope:** v1 of the iOS companion app. The app is the household's root of trust and operator console: it custodies the Ed25519 root key, registers with a hosted `wires-host` for relay, registers topics, and approves new agents into the household via the responder-driven pair flow.
 
 ---
 
 ## 1. Mental model
 
-The iOS app is the **root of trust** for a household's wires network. It custodies the Ed25519 root key that signs every capability, and it is where the operator approves new agents joining the network.
+The iOS app is the **root of trust** and the **operator console** for a household's wires network. It is *not* itself a wires gossip peer — it does not publish `__cap.grant` envelopes, does not maintain a per-publisher hash chain, and does not subscribe to `__caps`. It does only what the root key alone is competent to do:
 
-Architecturally it is a thin SwiftUI app over a Rust core. The Rust core (`crates/wires-uniffi`) is a narrow facade exposing only what the iOS app needs — QR parsing, signed-message construction, one iroh connection to the household's blind host. The existing `wires-core`, `wires-crypto`, and `wires-net` crates are reused unchanged. `wires-store` and `wires-node` are not used on iOS: there is no append-only log to maintain, no per-topic ciphertext store, no replay responder.
+1. Register the household with a hosted `wires-host` (and any topics the household creates) over the `/wires/tenant/0` ALPN.
+2. Approve agent enrollment by receiving a `PairRequest` (QR or paste), reviewing the manifest, narrowing scopes if desired, minting a root-signed `Capability` plus the matching epoch keys, and delivering a `PairGrant` over the `/wires/pair/0` ALPN.
 
-Persistence is split by sensitivity: SwiftData for low-sensitivity records (cap registry, topic registry, host info, pending publish queue), Keychain for secrets (root signing key, agent identity, topic epoch keys).
+Architecturally it is a SwiftUI + The Composable Architecture (TCA) app over a Rust core. The Rust core (`crates/wires-uniffi`) is a narrow facade reusing `wires-core`, `wires-crypto`, and `wires-net`. It does not depend on `wires-store` or `wires-node`: nothing on the iOS side needs an append-only log, an envelope replay responder, or a gossip subscription.
+
+Persistence is split by sensitivity: SwiftData for low-sensitivity records (host info, topic registry, cap registry); Keychain for secrets (root signing key, topic epoch keys).
 
 **v1 user-visible scope:**
 - Generate household root key on first launch.
-- Pair with the household's `wires-host` via a QR shown by `wires-host`.
-- Onboard new agents by scanning their enrollment QR and approving topics + rights.
+- Register with the household's hosted `wires-host` via HTTPS discovery (`/v1/bootstrap`) + a signed `TenantRegisterRequest`.
+- Approve agent enrollment by scanning a `PairRequest` QR (produced by `wires pair-listen --qr`), narrowing scopes if desired, and delivering a sealed `PairGrant`.
 
 **Explicitly out of scope for v1:**
 - Revoking capabilities (no Revoke UI). Revocation can only be performed by the root key, so this is an iOS feature when added.
 - Tail / view feeds (read-only household activity view).
-- Standalone "create topic" UI. Topic creation happens implicitly when a granted cap names a previously-unknown topic.
-- Multi-device root key custody (e.g. iPhone + iPad). One device per household for v1.
+- Supplemental cap-mints after initial pair (would require gossiping `__cap.grant` on `__caps`; deferred until the substrate spec's `__cap.grant` propagation lands).
+- Multi-device root key custody (e.g. iPhone + iPad).
 - Backup / recovery of the root key. Lose the phone, lose the household.
 - iCloud sync of any iOS-app state.
+- Operator-side topic creation UI as a discrete screen. Topics are created inline during pair-approve when a `PairRequest`'s `requested_scopes` references a literal topic name not yet in the registry.
 
 ---
 
@@ -44,116 +48,146 @@ A single Ed25519 keypair, generated in CryptoKit at first launch and stored in i
 
 **Security delta:** Both SE and Keychain-with-biometric gate signing on biometric assertion and prevent extraction via the normal Keychain API without that assertion. SE additionally guarantees the private key bytes never enter normal CPU memory; Keychain does not — the seed is briefly in process memory during signing. For a household-scale trust root the realistic threats (lost or stolen phone) are mitigated identically by both. Kernel compromise during an authorized sign window is the differential threat and is judged out-of-scope.
 
-### Agent identity (the iOS app as a wires peer)
+### What the iOS app uses the root key for
 
-To publish capability events to the `__caps` topic, the iOS app must be a wires peer with its own agent identity. This identity is separate from the root key and is software Ed25519 + X25519 stored in Keychain.
+Three signing sites, all biometric-gated:
 
-- `wires.agent.ed25519` — 32-byte Ed25519 seed
-- `wires.agent.x25519` — 32-byte X25519 secret
-- Both with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, no biometric ACL (agent-identity signs every envelope; biometric prompting per envelope is not usable UX).
-- Both `kSecAttrSynchronizable = false`.
+1. **`TenantRegisterRequest` / `TopicRegisterRequest`** — root-signed messages over `/wires/tenant/0` (signing-bytes layout per the hosted-service spec §4).
+2. **`Capability.sign`** — the inner root-signed cap embedded in every `PairGrant`.
+3. **`PairGrantEnvelope.signature`** — the outer ed25519 signature over `(root_pubkey || sealed_payload)` (responder-driven-pairing spec §4).
 
-The iOS app's agent pubkey is registered like any other agent in the household's `__caps` topic. The first cap minted by a new household is the iOS app's own cap, self-signed by the root, granting write on `__caps`. (See §3.1 step 4 for the bootstrap flow that mints this self-cap.)
+The iOS app does *not* sign `WireMessage` envelopes. It does not publish `__cap.grant` envelopes via gossip. Future work that introduces supplemental cap-mints will need a separate signing path; not in v1.
+
+### No iOS agent identity
+
+The previous draft of this spec gave iOS its own ed25519+x25519 "agent identity" so the app could publish `__cap.grant` envelopes on `__caps`. In the responder-driven pair flow, the cap reaches the new agent out-of-band inside the `PairGrant` ciphertext — there is no gossip publish. The iOS app therefore has no agent identity, no self-cap, and no per-publisher hash chain. The previous Keychain entries `wires.agent.ed25519` and `wires.agent.x25519` are removed from this design.
+
+### iroh node identity
+
+`PairClient` requires an iroh `Endpoint` to dial Bob's address. The endpoint needs a secret key, but it is purely a transport identity unrelated to the wires trust model. We persist 32 random bytes as `wires.iroh.secret` in Keychain (`.afterFirstUnlockThisDeviceOnly`, no biometric ACL) and pass them to `wires-net::endpoint::bind_lan` on each launch. There is no security requirement that this key be biometric-gated — it does not authorize anything in the wires protocol.
 
 ### Topic epoch keys
 
-The iOS app holds, for each topic the household has created, every epoch symmetric key (32 bytes, ChaCha20-Poly1305) ever issued. Required because `__topic.history_grant` events sealed to new agents must carry the full epoch-key history.
+The iOS app holds, for each topic the household has created, every epoch symmetric key (32 bytes, ChaCha20-Poly1305) ever issued. Required because pair-approve embeds the full epoch-key set for each granted topic into the `PairGrant` so a newly enrolled agent can decrypt historical traffic on that topic up to its retention horizon.
 
 Storage: Keychain, one entry per (topic_id, epoch).
 - Key: `wires.topic.<topic_id_hex>.epoch.<n>`
 - Value: 32 raw bytes
-- Same accessibility as the agent identity: `.afterFirstUnlockThisDeviceOnly`, no biometric ACL.
+- Accessibility: `.afterFirstUnlockThisDeviceOnly`, no biometric ACL. (Reading epoch keys to assemble a `PairGrant` is gated by the biometric prompt on the *root* sign of the cap and envelope, not on each key read.)
 
 Topic epoch keys are placed in Keychain rather than SwiftData because SwiftData's store, while encrypted at rest while the device is locked, is plaintext while the device is unlocked. An attacker with a one-time unlocked-device backup can therefore extract a SwiftData store but not Keychain entries with `.afterFirstUnlockThisDeviceOnly`.
 
 ---
 
-## 3. Pairing flows
+## 3. Flows
 
-Three flows: first-launch wizard, agent onboarding, and (implicit) per-launch reconnect.
+Three flows: first-launch wizard, agent approval, and per-launch refresh.
 
 ### 3.1 First-launch wizard
 
-Triggered when AppFeature observes no `Household` record in SwiftData.
+Triggered when `AppFeature` observes no `Household` record in SwiftData.
 
-**Step 1: Create household.** Single screen, single button "Create Household". On tap:
-1. Generate Ed25519 root keypair in CryptoKit. Persist to Keychain at `wires.root.signingkey` with the biometric ACL described in §2. Cache root pubkey hex separately at `wires.root.pubkey` (no ACL, read freely).
-2. Generate Ed25519 + X25519 agent identity. Persist to Keychain.
-3. Insert a `Household` record into SwiftData: `rootPubkeyHex` set, `iosAgentPubkeyHex` set, `iosAgentNextSeq = 0`, `iosAgentLastHash = nil`, `iosAgentCapIdHex = nil`. Host fields nil — populated in step 2; cap fields nil — populated in step 4.
-4. Advance to step 2.
+**Step 1: Discovery URL.** A single screen prompts for the household's service-discovery URL. A default is offered (a build-time constant pointing at the project's hosted service); a self-hosting operator pastes their own URL. The URL must be HTTPS. On submit:
 
-**Step 2: Pair with host.** Camera-permission prompt (on first invocation), then live AVFoundation capture session scanning for QR codes. The operator runs `wires-host show-pair-qr` on their server; the rendered QR encodes a base64 `HostPairToken` (§5.1). On scan:
-1. Decode and validate token (version check, NodeId hex parses, addresses well-formed).
-2. Populate `Household.hostNodeIdHex`, `hostRelayURL`, `hostDirectAddrs`.
-3. Call into Rust: `WiresApp.bootstrap(agentIdentity, rootSigner)` to construct the in-process state; then `WiresApp.connectHost(HostInfo)` to dial the host's iroh `NodeAddr`, open a QUIC connection, subscribe to `__caps` via iroh-gossip, and confirm the subscribe ACK lands within a 10s timeout.
-4. If the iOS app's own agent identity has not yet been bound to a cap, mint and publish the self-cap now: a `Capability` granting the iOS agent `read+write` on `__caps`, signed by the root (with biometric prompt). The mint flow is described in §3.2 step 3.b; the only difference for the self-cap is that `enrollment` is constructed from the iOS app's own keys, not from a scanned QR.
-5. Advance to step 3.
+1. `WiresClient.fetchDiscovery(url)` calls into Rust → `wires_net::discovery::fetch_endpoints(url)` → returns a non-empty `Vec<PeerHint>`. iOS picks `endpoints[0]`. (Multi-endpoint discovery handling is sub-project B; v1 uses the first.)
+2. Surface a confirmation screen showing the host's `endpoint_id`, `addrs`, optional `relay`, and the discovery URL. Operator taps "Continue".
+3. Persist a `Household` draft with `discoveryUrl` set and a non-persisted `HostInfo` cached in feature state.
 
-**Step 3: Done.** Confirmation screen with the household root pubkey hex (a long string the operator may want to save for verification). Tap "Continue" to enter the Home screen.
+**Step 2: Generate root and register tenant.** Single button "Create Household". On tap:
 
-### 3.2 Agent onboarding
+1. Generate Ed25519 root keypair in CryptoKit. Persist to Keychain at `wires.root.signingkey` with the biometric ACL described in §2. Cache root pubkey hex separately at `wires.root.pubkey` (no ACL, read freely). Generate iroh node secret at `wires.iroh.secret`.
+2. Call `WiresClient.registerWithHostedService(hostInfo)`. Rust:
+   a. Binds an iroh `Endpoint` using the iroh node secret.
+   b. Resolves the `HostInfo` into an iroh `NodeAddr` with the supplied direct-addr and relay hints.
+   c. Builds a `TenantRegisterRequest`: `{ version: 1, root_pubkey, timestamp = now_ms, nonce = random[16], signature = root_sign(signing_bytes) }`. The `signing_bytes` layout comes from `wires_net::tenant::signing_bytes(TenantOp::Register, host_endpoint_id, ...)` (hosted-service spec §4.2). Root-sign call triggers the Face ID prompt on the Swift side.
+   d. Opens a bidirectional stream over `/wires/tenant/0`, sends `TenantRequest::Register(...)`, awaits `TenantResponse::Register(ok = true, ...)`. Returns the `caps_topic_id` and `host_endpoint_id` to Swift.
+   e. On error: stream/dial failures map to `WiresError::TenantStream { source }`; signature-rejection responses map to `WiresError::TenantRejected { code, message }`.
+3. Persist a complete `Household` record: `rootPubkeyHex`, `discoveryUrl`, `hostEndpointIdHex`, `hostDirectAddrs`, `hostRelayURL`, `capsTopicIdHex`, `tenantRegisteredAt`, empty `topics` and `caps` relationships. Single SwiftData transaction.
+4. Advance to step 3.
 
-Triggered from Home by "Scan agent" button.
+**Step 3: Done.** Confirmation screen showing the household root pubkey hex (a long string the operator may want to save for verification). "Continue" enters Home.
 
-**Step 1: Agent prepares.** The new agent runs `wires enroll` (new CLI subcommand, §5.2). It:
-1. Reads `data_dir/identity.ed25519` and `identity.x25519`; if absent, generates both and persists.
-2. Prints an `EnrollmentToken` (base64) and a Unicode QR render of the same token to stdout.
+The biometric prompt fires exactly once in this wizard, at step 2's root sign. No HostPairToken QR scan exists in this flow.
 
-The operator points the iOS camera at the QR.
+### 3.2 Agent approval (responder-driven pair)
 
-**Step 2: Scan and approve.** On successful QR decode:
-1. Push the `ApprovalFeature` screen (modal sheet). Pre-fill alias from `EnrollmentToken.suggested_alias` (editable). Empty topic-globs field. Read + write toggles both off by default; operator must explicitly enable.
-2. Operator types topic globs one per line — e.g. `home.lights`, `home.*`, `mail.inbox`. Sets rights. Taps Approve.
-3. **Approve action:**
-   a. Resolve topic globs against the topic registry:
-      - For each glob, find matching `TopicRecord`s in SwiftData. Collect their `topic_id`s and load all epoch keys from Keychain.
-      - If the glob is a literal name (`home.lights`, no `*`) and no `TopicRecord` matches, this is a new topic. Call `WiresClient.generateTopicIdAndEpoch0()` to produce a fresh `(topic_id, epoch_0_key)`. Create a `TopicRecord` (currentEpoch = 0, name = the literal). Persist the epoch key to Keychain. Treat the new topic as a match for the glob.
-      - If the glob contains a wildcard (`*` or `**`) and matches zero existing topics, no new topics are created — the glob is recorded in the cap and applies prospectively to any future matching topic.
-   b. Build the message bundle. Read the current chain position (`iosAgentNextSeq`, `iosAgentLastHash`) and self-cap id (`iosAgentCapIdHex`) from the `Household` record. Call `WiresClient.mintGrant(enrollment, topicGrants, rights, chainPosition)`. Rust:
-      - Constructs `Capability` with `agent = enrollment.agent_ed25519`, `topics = glob_strings`, `rights`, `issued = now`, `expires = None`, fresh random `cap_id`.
-      - Signs the cap by invoking the `RootSigner` callback. Swift side triggers Face ID, signs the cap signing-bytes with the Keychain-resident root key, returns 64 bytes.
-      - Constructs the `__cap.grant` `WireMessage` envelope: `topic_id = __caps`, kind `SealedTo(enrollment.agent_x25519)`, sender = iOS agent pubkey, cap_id = the iOS agent's self-cap, content = canonical-JSON-serialized `Capability` plus topic name metadata for each `topic_id` in `topicGrants`.
-      - For each `topic_id` in `topicGrants` with non-empty `epoch_keys`, constructs a `__topic.history_grant` envelope on that topic, kind `SealedTo(enrollment.agent_x25519)`, content `{topic_id, epochs: [{epoch, key}, ...]}`.
-      - Signs each envelope with the iOS agent ed25519. Encrypts each (sealed-box for `SealedTo`).
-      - Returns `[SignedWireMessage]` (a UniFFI-friendly opaque type wrapping `Vec<u8>`).
-   c. Persist the new `CapRecord` to SwiftData and advance the chain position on `Household` via `HouseholdClient.advanceChain(newChainPosition)`. Both writes happen in a single SwiftData transaction so a crash mid-write does not leave chain state and cap registry out of sync.
-   d. Call `WiresClient.publish(messages)`. Rust gossips each envelope on its target topic via the existing `HostConnection`.
-   e. On publish failure: write each message to SwiftData `PendingPublish`. Surface a pending-sync banner on Home. The chain position has already advanced — the envelopes are valid and durable; re-issuing them is safe (idempotent on hash).
-4. Dismiss the sheet, return to Home with a brief confirmation.
+Triggered from Home by "Approve agent" button.
 
-**Epoch rotation note.** v1 does not rotate epochs on agent add (membership is monotonic without revoke). When revoke is added in v2, agent removal triggers `__topic.epoch_advance` events sealed to each *remaining* member. The plumbing for epoch state is already in place — only the trigger and the rotation pipeline are deferred.
+**Step 1: Agent prepares.** On a separate machine, the new agent runs `wires pair-listen --role <slug> --description <text> --request <topic:rights> --qr [...]` (responder-driven-pairing spec §8). The CLI prints the `PairRequest` as base64 plus a terminal QR. The operator points the iOS camera at the QR.
 
-### 3.3 Per-launch reconnect
+**Step 2: iOS scans and previews.** `ScanFeature` decodes the QR string. iOS feeds the payload to `WiresClient.parsePairRequest(payload)`:
 
-On every app launch (after first):
-1. AppFeature reads `Household` from SwiftData. Bootstrap completion is judged by `hostNodeIdHex != nil && iosAgentCapIdHex != nil`. Complete → home path; incomplete or absent → bootstrap path, resumed at the first incomplete step.
-2. Load agent identity from Keychain.
-3. Call `WiresApp.bootstrap(agentIdentity, rootSigner)` and `WiresApp.connectHost(hostInfo)`.
-4. On `connectHost` failure (host offline, no network): proceed to Home in a degraded state. Drain `PendingPublish` queue when reachability resumes.
+1. Rust calls `wires_net::pair::request::PairRequest::decode_and_verify(payload)` which base64-decodes, parses canonical JSON, and verifies the agent's ed25519 signature on the request body. On failure → `WiresError::InvalidPairRequest { reason }`.
+2. Returns a `PairRequestPreview { agentPubkeyHex, role, description, issuedAt, expiresAt, dial, requestedScopes }` to Swift. The raw token and ephemeral X25519 pubkey are kept inside the Rust core so Swift never touches them directly.
+
+`AgentEnrollmentFeature` presents an approval sheet pre-filled from the preview.
+
+**Step 3: Operator reviews and approves.** The sheet shows the agent's role + description + requested scopes. For each `RequestedScope`:
+
+- If the topic name resolves against `TopicRecord` in SwiftData → show "✓ existing topic", precheck the requested rights (operator may downgrade `read+write` to `read`).
+- If the topic name has no matching `TopicRecord` and is a syntactically valid literal name → show "+ new topic", offer to create it. Precheck the requested rights.
+- If the operator denies a scope, it is dropped from the grant.
+
+The sheet has a top-level Approve button that becomes enabled once at least one scope is checked. Approve triggers the pair effect chain:
+
+1. **Resolve / create topics.** For each kept scope:
+   - Existing topic: load its `topic_id` and all epoch keys from Keychain.
+   - New literal-name topic: call `WiresClient.generateTopicIdAndEpoch0()` → returns `(topic_id_hex, epoch_0_key)`. Persist a `TopicRecord` (currentEpoch = 0). Persist the key to Keychain at `wires.topic.<id>.epoch.0`. Call `WiresClient.registerTopic(topicIdBytes)` — Rust sends a signed `TopicRegisterRequest` over `/wires/tenant/0`. Biometric prompt fires here for the root signature. On host failure → `WiresError::TopicRegisterFailed { code, message }`; the topic record is left in place (idempotent re-register on retry).
+2. **Mint the grant.** Single FFI call `WiresClient.approvePairRequest(pendingHandle, grantedScopes)`. Rust:
+   - Loads the cached `PairRequest` (kept by handle from step 2 above).
+   - Constructs a `Capability { agent_pubkey = request.agent_pubkey, topics = [name for each granted scope], rights = combined rights, issued_at = now, expires_at = None, cap_id = random[16] }`.
+   - Signs the cap via the `RootSigner` callback (biometric prompt fires here; this is the second prompt in the agent-approve flow if a new topic was registered, or the first if all topics were pre-existing).
+   - Assembles `PairGrant { version: 1, root_pubkey, cap, topic_keys = [...], topic_names = [...], host = Some(HostInfo { peer_hints: [Household.host as PeerHint], service_discovery_url: Some(Household.discoveryUrl) }), nonce = request.nonce, issued_at = now }`.
+   - Serializes the grant to canonical JSON, seals it to `request.ephemeral_x25519` with AAD `b"wires.pair.v1"` and AEAD nonce derived per `wires_crypto::sealed::sealed_nonce(grant.nonce, grant.root_pubkey, seq=0)` (responder-driven-pairing spec §4 "Crypto choices").
+   - Signs the envelope: `signature = root_sign(root_pubkey || sealed_payload)`. **Re-uses the cap-sign biometric assertion** if iOS can do so within a single LocalAuthentication transaction; otherwise this is a second prompt. (See §6 "Biometric prompts" for the resolution.)
+   - Returns `PairGrantEnvelope` to be sent.
+3. **Deliver the grant.** Rust uses `wires_net::pair::PairClient::deliver_grant(dial, envelope)`:
+   - Resolves `request.dial` into an iroh `NodeAddr`, adds direct-addr and relay hints.
+   - Opens a stream on `/wires/pair/0`, writes `PairFrame::Grant`, reads one frame back.
+   - Returns `Ok(PairAck)` or `Err(PairError::Rejected { code, message })`.
+4. **Persist.** On `Ok(ack)`, in a single SwiftData transaction:
+   - Insert a `CapRecord` with `capIdHex = ack.installed_cap_id`, `agentPubkeyHex`, `agentAlias = request.role + ": " + request.description`, `topicNames = ...`, `rights = ...`, `issuedAt = ack.installed_at`.
+   - No chain advance — there is no chain on iOS.
+   Dismiss the sheet, return to Home with a brief confirmation.
+
+**Failure modes (operator-facing):**
+
+- Scan decode / signature verify fails → "Couldn't read pair request. Ask the agent to print a fresh QR."
+- Pair-request TTL has elapsed (`request.expires < now`) → "Pair request has expired. Ask the agent to re-run `wires pair-listen`."
+- Host topic-register fails → "Couldn't register topic with host: {code}. {message}." Keep sheet open for retry.
+- Pair dial fails (agent unreachable) → "Couldn't reach agent at {addrs}. Make sure `wires pair-listen` is still running on that machine."
+- `PairAck` not received within 30s → same as above.
+- `PairFrame::Reject` received → render the specific `PairRejectCode` (NonceMismatch, NonceExpired, RootMismatch, CapInvalid, etc.) with a sentence of guidance.
+
+Concurrent approval of two different `PairRequest` tokens is not supported; the sheet is modal. Two-phase commit is unnecessary because the cap install on the agent's side is idempotent (responder-driven-pairing spec §6 "Crash recovery / idempotence").
+
+### 3.3 Per-launch refresh
+
+On every launch after first:
+
+1. `AppFeature` reads the `Household` from SwiftData. Completion is judged by `tenantRegisteredAt != nil`. If absent → bootstrap path; if present → home path.
+2. The iroh `Endpoint` is bound lazily — on the first action that needs it (Approve agent, Register topic) rather than at launch. Idle iOS apps stay quiet.
+3. Discovery refresh: at launch, kick off a background task that re-fetches `discoveryUrl/v1/bootstrap` and updates `hostDirectAddrs` / `hostRelayURL` / `hostEndpointIdHex` if changed. Persisted to SwiftData. On fetch failure (offline, DNS, TLS) — silent, keeps stale values.
+4. No reconnection or subscription state needs to be re-established: the iOS app has no long-lived stream beyond the per-action ones it opens for tenant-register / topic-register / pair-deliver.
 
 ---
 
 ## 4. Data model
 
-Four SwiftData `@Model` types, in `Wires/Wires/Models/`.
+Three SwiftData `@Model` types, in `Wires/Wires/Models/`. There is no `PendingPublish` queue — iOS never has unsent gossip envelopes.
 
 ```swift
 @Model final class Household {
     @Attribute(.unique) var rootPubkeyHex: String
     var createdAt: Date
 
-    // Host pairing (populated at bootstrap step 2)
-    var hostNodeIdHex: String?
+    // Host discovery + registration (populated at bootstrap step 2)
+    var discoveryUrl: String                 // always set; entered or defaulted at first launch
+    var hostEndpointIdHex: String?           // nil until tenant register succeeds
     var hostRelayURL: String?
     var hostDirectAddrs: [String]
-
-    // iOS agent's own self-cap, minted at bootstrap step 4
-    var iosAgentPubkeyHex: String         // 32-byte ed25519 pubkey of this device's agent identity
-    var iosAgentCapIdHex: String?         // nil until the self-cap is minted
-
-    // iOS agent's per-publisher chain on __caps. Used by mint_grant to build envelopes.
-    var iosAgentNextSeq: UInt64           // initialized to 0
-    var iosAgentLastHash: Data?           // nil at seq=0; 32 bytes after each successful mint
+    var capsTopicIdHex: String?              // echoed by tenant register; for future use
+    var tenantRegisteredAt: Date?            // nil until tenant register succeeds
 
     @Relationship(deleteRule: .cascade) var topics: [TopicRecord]
     @Relationship(deleteRule: .cascade) var caps: [CapRecord]
@@ -164,27 +198,19 @@ Four SwiftData `@Model` types, in `Wires/Wires/Models/`.
     var name: String
     var createdAt: Date
     var currentEpoch: UInt32
-    // Epoch key bytes live in Keychain, not here. This record only asserts
-    // that epochs 0..currentEpoch exist; the actual bytes are retrieved by
-    // looking up wires.topic.<topicIdHex>.epoch.<n>.
+    var registeredWithHost: Bool             // true once register_topic succeeded
+    // Epoch key bytes live in Keychain at wires.topic.<topicIdHex>.epoch.<n>.
 }
 
 @Model final class CapRecord {
     @Attribute(.unique) var capIdHex: String
     var agentPubkeyHex: String
-    var agentAlias: String?
-    var topicGlobs: [String]
+    var agentAlias: String?                  // "role: description" from PairRequest
+    var topicNames: [String]                 // resolved literal names in this cap
     var rights: [String]
     var issuedAt: Date
     var expiresAt: Date?
-    var revokedAt: Date?
-}
-
-@Model final class PendingPublish {
-    @Attribute(.unique) var id: UUID
-    var payload: Data
-    var createdAt: Date
-    var attempts: Int
+    var revokedAt: Date?                     // unused in v1; reserved
 }
 ```
 
@@ -194,222 +220,195 @@ Four SwiftData `@Model` types, in `Wires/Wires/Models/`.
 |---|---|---|
 | `wires.root.signingkey` | Raw 32-byte Ed25519 seed | `.biometryCurrentSet` |
 | `wires.root.pubkey` | Raw 32-byte Ed25519 pubkey | None (read freely) |
-| `wires.agent.ed25519` | Raw 32-byte Ed25519 seed | None |
-| `wires.agent.x25519` | Raw 32-byte X25519 secret | None |
+| `wires.iroh.secret` | Raw 32-byte iroh node secret | None |
 | `wires.topic.<id_hex>.epoch.<n>` | Raw 32-byte symmetric key | None |
+
+Removed compared to the previous draft: `wires.agent.ed25519`, `wires.agent.x25519`. iOS has no agent identity.
 
 ---
 
-## 5. Wire-side additions
+## 5. Wire-side surface (already landed)
 
-Two additions outside the iOS app, and one small refactor.
+This section was previously titled "Wire-side additions" and proposed three substrate changes. The substrate has since absorbed all three. For this revision the section is a pointer to what already exists; no new substrate work is required to ship the iOS app.
 
-### 5.1 `wires-host show-pair-qr`
+- **`wires-net::pair`** — `PairRequest`, `PairGrant`, `PairGrantEnvelope`, `PairClient::deliver_grant`, plus all framing and crypto. Used directly by `wires-uniffi`.
+- **`wires-net::tenant`** — `TenantClient`, `TenantRequest::{Register, TopicRegister, TopicUnregister, Status}`, signing-bytes helpers. Used directly by `wires-uniffi`.
+- **`wires-net::discovery::fetch_endpoints`** — fetches `/v1/bootstrap` and returns `Vec<PeerHint>`. Used directly by `wires-uniffi`.
+- **`wires-net::endpoint::bind_lan`** — used by `wires-uniffi` to bind the iroh Endpoint. (The iOS app is on-LAN-as-far-as-its-router-is-concerned; mDNS is harmless and useful when the operator's host is on the same network.)
+- **`RootSigner` trait** — *not yet landed* in `wires-core`. Today `Capability::sign(&self, root_sk: &SigningKey)`. The plan introduces a `RootSigner` trait so the iOS side can supply a callback-backed signer (Swift Keychain + biometric prompt) without `wires-core` learning anything about Swift. See the implementation plan, Phase 1, Task 1.
 
-New subcommand on the `wires-host` binary. Prints a base64 `HostPairToken` plus a Unicode QR render to stdout.
+Deleted compared to the previous draft:
 
-```rust
-// crates/wires-net/src/pair.rs
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HostPairToken {
-    pub version: u8,                       // 1
-    pub host_node_id: String,              // hex iroh EndpointId
-    pub host_addrs: Vec<String>,           // direct addr hints, "ip:port"
-    pub host_relay: Option<String>,        // relay url
-    pub household_label: Option<String>,   // optional friendly name
-}
-```
-
-Encoding: URL-safe base64 of canonical JSON, matching the pattern of `InviteToken` in the same crate. No secrets — the host NodeId is a public identifier and the addresses are public network locations.
-
-### 5.2 `wires enroll`
-
-New subcommand on the `wires` binary. Generates agent identity (if not already present), then prints an `EnrollmentToken` and a Unicode QR.
-
-```rust
-// crates/wires-net/src/enroll.rs
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnrollmentToken {
-    pub version: u8,                       // 1
-    pub agent_ed25519: [u8; 32],
-    pub agent_x25519: [u8; 32],
-    pub agent_local_addrs: Vec<String>,
-    pub suggested_alias: Option<String>,   // derived from hostname
-}
-```
-
-The enrollment token contains no secrets — `agent_ed25519` and `agent_x25519` are the agent's *public* keys. The matching private keys remain on the agent's machine.
-
-The agent does not yet know the host NodeAddr at enrollment time. After approval the iOS app publishes the cap to `__caps`, but the agent cannot pick it up until it dials a peer. For v1 the agent operator configures the host separately (e.g. `wires set-host <node-addr>` or by hand-editing `config.toml`). The substrate spec's invite-bundles-peer-hint flow is preserved as the existing `wires invite` command and is unchanged by this work.
-
-### 5.3 Lift `RootSigner` into `wires-core`
-
-Currently `Capability::sign` takes `&SigningKey` directly:
-
-```rust
-// crates/wires-core/src/cap.rs (current)
-impl Capability {
-    pub fn sign(&mut self, root: &SigningKey) -> Result<(), CapError> { ... }
-}
-```
-
-Refactor to a trait:
-
-```rust
-// crates/wires-core/src/cap.rs (new)
-pub trait RootSigner {
-    fn pubkey(&self) -> [u8; 32];
-    fn sign(&self, message: &[u8]) -> Result<[u8; 64], SignError>;
-}
-
-impl Capability {
-    pub fn sign(&mut self, signer: &dyn RootSigner) -> Result<(), CapError> { ... }
-}
-```
-
-Two impls:
-- `LocalFileSigner` in `wires-cli` — wraps a `SigningKey` loaded from `root.ed25519`. Today's `wires invite` is migrated to use it. Behavior identical.
-- `KeychainBiometricSigner` in `wires-uniffi` — wraps a `Box<dyn SwiftRootSigner>` callback. The Swift side reads the root key from Keychain (triggering Face ID), reconstructs `Curve25519.Signing.PrivateKey`, signs, zeros the seed buffer.
-
-The same lift applies to the agent identity dependency in `Node::open`. Today `Node::open(cfg)` reads `identity.ed25519` and `identity.x25519` from disk via `cfg.data_dir`. We introduce:
-
-```rust
-// crates/wires-node/src/identity.rs (new)
-pub struct AgentIdentity {
-    pub ed25519_seed: [u8; 32],
-    pub x25519_secret: [u8; 32],
-}
-
-impl Node {
-    pub fn open_with_identity(cfg: NodeConfig, identity: AgentIdentity) -> Result<Self, NodeError> { ... }
-    pub fn open(cfg: NodeConfig) -> Result<Self, NodeError> { /* loads identity from cfg.data_dir, calls open_with_identity */ }
-}
-```
-
-The CLI keeps using `Node::open`. `wires-uniffi` uses `Node::open_with_identity`, but note that on iOS we do not actually use `Node::open` or `wires-node` at all (see §6); the lift exists so that the FFI's `WiresApp::bootstrap` can construct the relevant pieces of state without the disk-file dependency.
+- `wires-host show-pair-qr` subcommand — never landed; hosted-service spec §9 explicitly forbids it. Replaced by HTTPS discovery.
+- `wires enroll` subcommand + `EnrollmentToken` — replaced by `wires pair-listen` + `PairRequest`, which already ship.
+- The iOS-only `HostPairToken` — never landed; superseded by discovery + tenant-register.
 
 ---
 
 ## 6. Rust-on-iOS shape: `wires-uniffi`
 
-A new crate, `crates/wires-uniffi`, that depends on `wires-core`, `wires-crypto`, `wires-net`. It does **not** depend on `wires-store` or `wires-node` — those are designed for tailing/replay/log-keeping, which iOS does not do.
-
-### Crate role
-
-`wires-uniffi` is a thin facade. Its public API is a single `WiresApp` UniFFI object plus a small set of parsers and types. The bulk of the protocol logic remains in `wires-core` and `wires-crypto`, unchanged.
+A new crate, `crates/wires-uniffi`, depending on `wires-core`, `wires-crypto`, `wires-net`. It does **not** depend on `wires-store` or `wires-node`.
 
 ### Public FFI surface
 
 ```rust
 #[derive(uniffi::Object)]
 pub struct WiresApp {
-    /* private: AgentIdentity, RootSigner box, optional HostConnection */
+    rt: tokio::runtime::Runtime,
+    iroh_secret: [u8; 32],
+    root_signer: Arc<dyn SwiftRootSigner>,
+    // Resolved on first use; cached for the process lifetime.
+    endpoint: tokio::sync::OnceCell<iroh::Endpoint>,
+    // Pending pair-request preview, keyed by opaque handle.
+    pending: parking_lot::Mutex<HashMap<PendingPairHandle, PendingPair>>,
 }
 
 #[uniffi::export]
 impl WiresApp {
     #[uniffi::constructor]
     pub fn bootstrap(
-        agent_identity: AgentIdentity,
-        root_signer: Box<dyn SwiftRootSigner>,
-    ) -> Arc<Self> { ... }
+        iroh_secret: Vec<u8>,          // 32 raw bytes
+        root_signer: Arc<dyn SwiftRootSigner>,
+    ) -> Arc<Self>;
 
-    pub async fn connect_host(&self, host: HostInfo) -> Result<(), WiresError> { ... }
-    pub fn disconnect_host(&self);
+    pub async fn fetch_discovery(&self, url: String) -> Result<HostInfo, WiresError>;
 
-    pub fn parse_host_pair_qr(&self, payload: String) -> Result<HostInfo, WiresError>;
-    pub fn parse_agent_enrollment_qr(&self, payload: String) -> Result<AgentEnrollment, WiresError>;
+    pub async fn register_with_hosted_service(
+        &self,
+        host: HostInfo,
+    ) -> Result<TenantRegistration, WiresError>;
+
+    pub async fn register_topic(
+        &self,
+        host: HostInfo,
+        topic_id: Vec<u8>,             // 32 bytes
+    ) -> Result<(), WiresError>;
+
+    pub fn parse_pair_request(
+        &self,
+        payload: String,
+    ) -> Result<PairRequestPreview, WiresError>;
 
     pub fn generate_topic_id_and_epoch0(&self) -> NewTopic;
 
-    pub fn mint_grant(
+    pub async fn approve_pair_request(
         &self,
-        enrollment: AgentEnrollment,
-        topic_grants: Vec<TopicGrant>,
-        rights: Vec<Right>,
-    ) -> Result<Vec<SignedWireMessage>, WiresError>;
+        handle: PendingPairHandle,
+        granted_scopes: Vec<GrantedScope>,
+        // Inline host info to embed in the PairGrant (must match the
+        // household's current host).
+        host: HostInfo,
+    ) -> Result<PairAckRecord, WiresError>;
 
-    pub async fn publish(&self, messages: Vec<SignedWireMessage>) -> Result<(), WiresError>;
+    pub fn discard_pair_request(&self, handle: PendingPairHandle);
+}
+```
+
+UniFFI records and enums:
+
+```rust
+#[derive(uniffi::Record)] pub struct HostInfo {
+    pub endpoint_id_hex: String,
+    pub addrs: Vec<String>,
+    pub relay: Option<String>,
+    pub discovery_url: String,
 }
 
-#[derive(uniffi::Record)]
-pub struct AgentIdentity { pub ed25519_seed: Vec<u8>, pub x25519_secret: Vec<u8> }
+#[derive(uniffi::Record)] pub struct TenantRegistration {
+    pub caps_topic_id_hex: String,
+    pub host_endpoint_id_hex: String,
+    pub server_time_ms: i64,
+}
 
-#[derive(uniffi::Record)]
-pub struct HostInfo { pub node_id_hex: String, pub addrs: Vec<String>, pub relay: Option<String> }
+#[derive(uniffi::Record)] pub struct PairRequestPreview {
+    pub handle: PendingPairHandle,
+    pub agent_pubkey_hex: String,
+    pub role: String,
+    pub description: String,
+    pub issued_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub requested_scopes: Vec<RequestedScopePreview>,
+    pub dial_summary: String,          // human-readable "endpoint_id + addrs" for display
+}
 
-#[derive(uniffi::Record)]
-pub struct AgentEnrollment { pub agent_ed25519: Vec<u8>, pub agent_x25519: Vec<u8>, pub suggested_alias: Option<String> }
+#[derive(uniffi::Record)] pub struct RequestedScopePreview {
+    pub topic_name: String,
+    pub rights: Vec<Right>,
+}
 
-#[derive(uniffi::Record)]
-pub struct TopicGrant { pub topic_id_hex: String, pub name: String, pub epochs: Vec<EpochKey> }
+#[derive(uniffi::Record)] pub struct GrantedScope {
+    pub topic_id_hex: String,          // resolved by Swift
+    pub topic_name: String,
+    pub rights: Vec<Right>,
+    pub epochs: Vec<EpochKey>,         // all epoch keys for this topic
+}
 
-#[derive(uniffi::Record)]
-pub struct EpochKey { pub epoch: u32, pub key: Vec<u8> }
+#[derive(uniffi::Record)] pub struct EpochKey {
+    pub epoch: u32,
+    pub key: Vec<u8>,                  // 32 bytes
+}
 
-#[derive(uniffi::Record)]
-pub struct NewTopic { pub topic_id_hex: String, pub epoch_0_key: Vec<u8> }
+#[derive(uniffi::Record)] pub struct NewTopic {
+    pub topic_id_hex: String,
+    pub epoch_0_key: Vec<u8>,          // 32 bytes
+}
 
-#[derive(uniffi::Record)]
-pub struct SignedWireMessage { pub bytes: Vec<u8> }  // serialized WireMessage, opaque to Swift
+#[derive(uniffi::Record)] pub struct PairAckRecord {
+    pub installed_cap_id_hex: String,
+    pub installed_at_ms: i64,
+}
 
-#[derive(uniffi::Enum)]
-pub enum Right { Read, Write }
+#[derive(uniffi::Record)] pub struct PendingPairHandle { pub id: String } // UUID
+
+#[derive(uniffi::Enum)] pub enum Right { Read, Write }
 
 pub trait SwiftRootSigner: Send + Sync {
-    fn pubkey(&self) -> Vec<u8>;
-    fn sign(&self, message: Vec<u8>) -> Result<Vec<u8>, WiresError>;
+    fn pubkey(&self) -> Vec<u8>;       // 32 bytes
+    fn sign(&self, message: Vec<u8>) -> Result<Vec<u8>, WiresError>;  // 64 bytes
 }
 ```
 
 ### Internal state
 
-A single `tokio` runtime is owned by `WiresApp` (built once at `bootstrap`, dropped at `Drop`). The optional `HostConnection` owns an iroh `Endpoint`, a gossip subscription handle on `__caps`, and a small in-memory retry queue. No disk persistence inside the Rust core.
+A single `tokio` runtime owned by `WiresApp`. One iroh `Endpoint` is bound lazily on first network call via `wires_net::endpoint::bind_lan` and cached. The `pending` map holds verified-but-not-yet-approved `PairRequest` payloads keyed by a Swift-opaque handle so the raw token and ephemeral pubkey never need to cross the FFI again. Entries are reaped on `discard_pair_request` or after a TTL (15 min) whichever comes first.
 
-### What about the agent's own message-chain state?
+### `RootSigner` adapter
 
-The iOS app's agent identity publishes `__cap.grant` events. Each is a `WireMessage` on the `__caps` topic with `(sender = ios_agent, seq, prev_hash)`. Per the substrate spec, the per-publisher hash chain must be maintained or the host will reject as a chain fork.
+Internally `WiresApp` constructs a thin Rust adapter that implements the new `wires_core::RootSigner` trait (see §5) by calling the Swift-side `SwiftRootSigner` trait object. The adapter normalizes byte-length errors (32-byte pubkey, 64-byte signature) at the FFI boundary so `wires_core` sees a typed `SignError` and not a Swift-shaped one.
 
-On iOS the chain state is held in SwiftData on the `Household` record (`iosAgentNextSeq`, `iosAgentLastHash`; see §4). Before each `mint_grant`, Swift passes the current `ChainPosition` into the FFI; Rust uses it during envelope construction. The returned `MintResult` carries the post-mint `ChainPosition`, which Swift writes back transactionally alongside the new `CapRecord`. This is the only mutable wire-protocol state the iOS app maintains, and lifting it out of Rust into SwiftData keeps the Rust core stateless across crash boundaries.
+### Biometric prompts
 
-This adds one parameter pair to `mint_grant`. Updated signature:
+LocalAuthentication on iOS will reuse a recently-passed evaluation for ~10 seconds by default when subsequent `SecItemCopyMatching` calls hit the same access-control flag. In practice for `approve_pair_request` this means:
 
-```rust
-pub fn mint_grant(
-    &self,
-    enrollment: AgentEnrollment,
-    topic_grants: Vec<TopicGrant>,
-    rights: Vec<Right>,
-    chain_position: ChainPosition,
-) -> Result<MintResult, WiresError>;
+- If a new topic was registered just before approval: two prompts (one for `TopicRegisterRequest` signature, one for the cap-sign that happens shortly after). Acceptable; the cap-sign prompt is the visible "you are about to grant access to this agent" act.
+- If all topics already existed: one prompt at cap-sign time.
+- The envelope's outer signature reuses the same Keychain access window as the cap-sign; in practice no extra prompt.
 
-#[derive(uniffi::Record)]
-pub struct ChainPosition { pub next_seq: u64, pub last_hash: Option<Vec<u8>> }
+If LocalAuthentication does not coalesce in a future iOS release, we can wrap the two sign calls in an explicit `LAContext` with a single `evaluatePolicy` up-front, then perform both sign operations within its validity window. Not implementing that fallback until we see a measured regression.
 
-#[derive(uniffi::Record)]
-pub struct MintResult {
-    pub messages: Vec<SignedWireMessage>,
-    pub new_chain_position: ChainPosition,
-    pub cap_id_hex: String,
-}
-```
+### Public surface invariants
+
+- `WiresApp` is `Send + Sync`. UniFFI generates `Arc<WiresApp>` on the Swift side.
+- All `async` methods are driven from the embedded tokio runtime; Swift sees Swift `async` thanks to the `uniffi` `tokio` feature.
+- No method panics on bad input. Every validation failure returns a typed `WiresError` variant.
+- The Rust core is stateless across crashes. Restart-safety lives entirely in SwiftData + Keychain.
 
 ---
 
 ## 7. Swift architecture under TCA
 
-The iOS app uses [swift-composable-architecture](https://github.com/pointfreeco/swift-composable-architecture) (TCA, current 1.16+ release line). The reasons: many async flows (scan → parse → mint → publish → persist) each with multiple failure modes, an FFI boundary that fits naturally as a Dependency, and a strong testing story via `TestStore`.
+The iOS app uses [swift-composable-architecture](https://github.com/pointfreeco/swift-composable-architecture) (TCA, current 1.16+ release line).
 
 ### Features
 
 One folder per feature under `Wires/Wires/Features/`, each containing a `Feature.swift` (reducer) and a `FeatureView.swift` (SwiftUI).
 
-- **`AppFeature`** — root. `State` is an enum: `case bootstrap(BootstrapFeature.State)` or `case home(HomeFeature.State)`. Transitions on `bootstrapCompleted`. At launch, reads `Household` from SwiftData via `HouseholdClient`; absent → bootstrap, present → home.
-- **`BootstrapFeature`** — three-screen wizard. Uses `StackState<Path.State>` with cases `welcome`, `pairHost(ScanFeature.State)`, `done`.
-- **`HomeFeature`** — list of `CapRecord`s, "Scan agent" button, pending-publish banner. Presents `AgentEnrollmentFeature` via `@Presents`.
+- **`AppFeature`** — root. `State` is an enum: `case bootstrap(BootstrapFeature.State)` or `case home(HomeFeature.State)`. Transitions on `bootstrapCompleted`. At launch, reads `Household` from SwiftData via `HouseholdClient`; `tenantRegisteredAt == nil` → bootstrap, else → home.
+- **`BootstrapFeature`** — three-screen wizard using `StackState<Path.State>` with cases `discoveryUrl`, `confirmHost`, `done`. No QR scanning anywhere in bootstrap.
+- **`HomeFeature`** — lists `CapRecord`s grouped by agent, "Approve agent" button. Presents `AgentEnrollmentFeature` via `@Presents`.
 - **`AgentEnrollmentFeature`** — composes `ScanFeature` and `ApprovalFeature` via a small two-state stack.
 - **`ScanFeature`** — reusable QR scanner reducer. State: camera permission, last decoded payload, error. Generic in payload shape via an init-time parser closure.
-- **`ApprovalFeature`** — approval sheet. State: alias, topic-globs (one per line), read/write toggles. Approve action triggers the mint+publish effect chain.
+- **`ApprovalFeature`** — approval sheet driven by the `PairRequestPreview`. State: per-scope grant/deny + rights toggles; per-new-topic create/skip; "Approve" enabled when ≥1 scope kept. Approve action triggers the topic-register-then-mint-then-deliver effect chain.
 
 ### Dependencies
 
@@ -417,25 +416,25 @@ Under `Wires/Wires/Dependencies/`. Each is a `struct` of closures with `Dependen
 
 ```swift
 @DependencyClient struct WiresClient {
-    var bootstrap: @Sendable (AgentIdentity, any RootSignerCallback) async throws -> Void
-    var connectHost: @Sendable (HostInfo) async throws -> Void
-    var parseEnrollmentQR: @Sendable (String) throws -> AgentEnrollment
-    var parseHostPairQR: @Sendable (String) throws -> HostInfo
+    var bootstrap: @Sendable (Data, any RootSignerCallback) -> Void
+    var fetchDiscovery: @Sendable (String) async throws -> HostInfo
+    var registerWithHostedService: @Sendable (HostInfo) async throws -> TenantRegistration
+    var registerTopic: @Sendable (HostInfo, Data) async throws -> Void
+    var parsePairRequest: @Sendable (String) throws -> PairRequestPreview
     var generateTopicIdAndEpoch0: @Sendable () -> NewTopic
-    var mintGrant: @Sendable (AgentEnrollment, [TopicGrant], [Right], ChainPosition) async throws -> MintResult
-    var publish: @Sendable ([SignedWireMessage]) async throws -> Void
+    var approvePairRequest: @Sendable (PendingPairHandle, [GrantedScope], HostInfo) async throws -> PairAckRecord
+    var discardPairRequest: @Sendable (PendingPairHandle) -> Void
 }
 
 @DependencyClient struct HouseholdClient {
     var loadHousehold: @Sendable () async throws -> Household?
     var saveHousehold: @Sendable (Household) async throws -> Void
+    var refreshHostInfo: @Sendable (HostInfo) async throws -> Void
     var listTopics: @Sendable () async throws -> [TopicRecord]
     var saveTopic: @Sendable (TopicRecord) async throws -> Void
+    var markTopicRegistered: @Sendable (String) async throws -> Void
     var listCaps: @Sendable () async throws -> [CapRecord]
     var saveCap: @Sendable (CapRecord) async throws -> Void
-    var enqueuePending: @Sendable (SignedWireMessage) async throws -> Void
-    var advanceChain: @Sendable (ChainPosition) async throws -> Void
-    var observePendingCount: @Sendable () -> AsyncStream<Int>
 }
 
 @DependencyClient struct KeychainClient {
@@ -446,7 +445,7 @@ Under `Wires/Wires/Dependencies/`. Each is a `struct` of closures with `Dependen
 }
 ```
 
-Reducers never touch `ModelContext` or `SecItem` APIs directly — all I/O goes through these clients. This is what makes reducers testable.
+Reducers never touch `ModelContext` or `SecItem` APIs directly — all I/O goes through these clients.
 
 ### Folder layout
 
@@ -460,7 +459,8 @@ Wires/
       Bootstrap/
         BootstrapFeature.swift
         BootstrapView.swift
-        PathReducers.swift
+        DiscoveryURLView.swift
+        ConfirmHostView.swift
       Home/
         HomeFeature.swift
         HomeView.swift
@@ -479,7 +479,6 @@ Wires/
       Household.swift
       TopicRecord.swift
       CapRecord.swift
-      PendingPublish.swift
   WiresKit/                       # SwiftPM local package
     Package.swift
     Sources/WiresKit/             # UniFFI-generated Swift
@@ -488,11 +487,13 @@ Wires/
   WiresUITests/                   # snapshot + UI tests
 ```
 
+Removed compared to the previous draft: `Models/PendingPublish.swift`. iOS has nothing to retry.
+
 ### Xcode project dependencies
 
-- `swift-composable-architecture` from `https://github.com/pointfreeco/swift-composable-architecture`, pinned `from: "1.16.0"`.
+- `swift-composable-architecture` pinned `from: "1.16.0"`.
 - Local SwiftPM package at `path: "../WiresKit"`.
-- `swift-snapshot-testing` from `https://github.com/pointfreeco/swift-snapshot-testing`, dev-only (test target).
+- `swift-snapshot-testing` (dev-only, test target).
 
 ---
 
@@ -500,20 +501,21 @@ Wires/
 
 ### `wires-uniffi` build
 
-The crate is `crate-type = ["staticlib", "cdylib"]`. UniFFI is wired via `uniffi-bindgen` (matching the pattern in iroh-ffi, which is itself archived but serves as a reference). The build script `scripts/build-ioskit.sh`:
+The crate is `crate-type = ["staticlib", "cdylib"]`. UniFFI 0.28+ via `uniffi-bindgen`. The build script `scripts/build-ioskit.sh`:
 
 1. `cargo build --release --target aarch64-apple-ios -p wires-uniffi`
 2. `cargo build --release --target aarch64-apple-ios-sim -p wires-uniffi`
 3. `cargo build --release --target x86_64-apple-ios-sim -p wires-uniffi`
-4. `lipo -create` the two simulator slices into a fat library
-5. `xcodebuild -create-xcframework` combining the device library and the fat simulator library into `Wires/WiresKit/Frameworks/wires.xcframework`
-6. `cargo run --bin wires-uniffi-bindgen` (or the appropriate uniffi-bindgen invocation) to emit `wires_uniffi.swift` and `wires_uniffi.h` into `Wires/WiresKit/Sources/WiresKit/`
+4. `lipo -create` the two simulator slices into a fat library.
+5. `xcodebuild -create-xcframework` combining the device library and the fat simulator library into `Wires/WiresKit/Frameworks/wires.xcframework`.
+6. `cargo run --bin uniffi-bindgen` to emit `wires_uniffi.swift` and module headers into `Wires/WiresKit/Sources/WiresKit/`.
 
 The script is idempotent; CI runs it on a macOS runner before Xcode build.
 
 ### Xcode project
 
-The `Wires.xcodeproj` is updated to:
+`Wires.xcodeproj` is updated to:
+
 - Add `Package.swift` references for swift-composable-architecture and the local `WiresKit` package.
 - Update the `Wires` target's "Frameworks, Libraries, and Embedded Content" to include `ComposableArchitecture` and `WiresKit`.
 - Bump deployment target to iOS 17 (TCA + SwiftData + `@Observable` macro require it).
@@ -525,35 +527,53 @@ The `Wires.xcodeproj` is updated to:
 
 ### Rust side: `WiresError`
 
-A single UniFFI-modeled enum, defined in `wires-uniffi/src/error.rs` per the existing snafu pattern (every variant has `#[snafu(implicit)] location: Location`, display ends with `, at {location}`, no `message: String` field).
+A single UniFFI-modeled enum, in `wires-uniffi/src/error.rs` per the existing snafu pattern (every variant has `#[snafu(implicit)] location: Location`, display ends with `, at {location}`, no `message: String` field unless required as data; external errors are leaves linked via `source`).
 
 ```rust
 #[derive(Debug, Snafu, uniffi::Error)]
 pub enum WiresError {
-    #[snafu(display("Failed to parse pairing QR token, at {location}"))]
-    InvalidPairingToken { #[snafu(implicit)] location: Location },
+    #[snafu(display("Failed to fetch service discovery URL, at {location}"))]
+    DiscoveryFetch { source: wires_net::error::NetError, #[snafu(implicit)] location: Location },
 
-    #[snafu(display("Failed to parse enrollment token, at {location}"))]
-    InvalidEnrollmentToken { #[snafu(implicit)] location: Location },
+    #[snafu(display("Discovery URL returned no endpoints, at {location}"))]
+    DiscoveryEmpty { #[snafu(implicit)] location: Location },
 
-    #[snafu(display("Failed to sign with root key, at {location}"))]
-    RootSignerFailed { source: SignError, #[snafu(implicit)] location: Location },
+    #[snafu(display("Tenant register stream failed, at {location}"))]
+    TenantStream { source: wires_net::error::NetError, #[snafu(implicit)] location: Location },
 
-    #[snafu(display("Failed to connect to host, at {location}"))]
-    HostUnreachable { source: NetError, #[snafu(implicit)] location: Location },
+    #[snafu(display("Host rejected tenant register: {code:?}: {message}, at {location}"))]
+    TenantRejected { code: TenantErrorCode, message: String, #[snafu(implicit)] location: Location },
 
-    #[snafu(display("Failed to publish to gossip topic, at {location}"))]
-    PublishFailed { source: NetError, #[snafu(implicit)] location: Location },
+    #[snafu(display("Topic register stream failed, at {location}"))]
+    TopicRegisterStream { source: wires_net::error::NetError, #[snafu(implicit)] location: Location },
 
-    #[snafu(display("Topic name conflicts with existing topic_id, at {location}"))]
-    TopicConflict { #[snafu(implicit)] location: Location },
+    #[snafu(display("Host rejected topic register: {code:?}: {message}, at {location}"))]
+    TopicRegisterRejected { code: TenantErrorCode, message: String, #[snafu(implicit)] location: Location },
 
-    #[snafu(display("Not connected to host, at {location}"))]
-    NotConnected { #[snafu(implicit)] location: Location },
+    #[snafu(display("Pair request token is invalid, at {location}"))]
+    InvalidPairRequest { reason: PairDecodeReason, #[snafu(implicit)] location: Location },
+
+    #[snafu(display("Pair request has expired, at {location}"))]
+    PairRequestExpired { #[snafu(implicit)] location: Location },
+
+    #[snafu(display("Unknown pending pair handle, at {location}"))]
+    UnknownPairHandle { #[snafu(implicit)] location: Location },
+
+    #[snafu(display("Pair grant delivery failed, at {location}"))]
+    PairDeliveryFailed { source: wires_net::pair::PairError, #[snafu(implicit)] location: Location },
+
+    #[snafu(display("Agent rejected pair grant: {code:?}: {message}, at {location}"))]
+    PairRejected { code: PairRejectCode, message: String, #[snafu(implicit)] location: Location },
+
+    #[snafu(display("Root signer failed, at {location}"))]
+    RootSignerFailed { message: String, #[snafu(implicit)] location: Location },
+
+    #[snafu(display("Internal error: {message}, at {location}"))]
+    Internal { message: String, #[snafu(implicit)] location: Location },
 }
 ```
 
-UniFFI generates a matching Swift `enum WiresError: Error` with the same case names.
+`TenantErrorCode`, `PairRejectCode`, and `PairDecodeReason` are re-exported from `wires-net` so Swift sees the same vocabulary the protocols define. `TenantErrorCode` is re-exported as a `uniffi::Enum` rather than passed across the boundary as a string.
 
 ### Swift side
 
@@ -572,32 +592,35 @@ enum KeychainError: Error {
 
 User-cancelled Face ID is silent: the reducer returns to the previous state without alerting. Other Keychain failures surface as alerts.
 
-Publish failures inside `WiresClient.publish` are caught at the boundary: Swift catches `WiresError.PublishFailed`, enqueues each `SignedWireMessage` to `HouseholdClient.enqueuePending`, and reports success-with-pending. A background task in `AppFeature` observes `observePendingCount`, retries with exponential backoff when count > 0 and `connectHost` is alive.
-
 ---
 
 ## 10. Testing strategy
 
-### Rust tests
+### Rust tests in `wires-uniffi`
 
-- **`wires-core`** — existing tests stay; one new test asserts the `RootSigner` trait roundtrip: a mock signer signs, `Capability::verify_root` checks.
-- **`wires-uniffi`** unit tests — parser roundtrips (token serialize/parse), malformed-input rejection, `generate_topic_id_and_epoch0` returns 32+32 bytes of nonzero entropy.
-- **`wires-uniffi`** integration test — spins up a local iroh test endpoint as a stand-in for `wires-host`, calls `WiresApp.bootstrap` + `connect_host` + `mint_grant` + `publish`, verifies the host receives the envelope and `verify_envelope` passes.
+- **Pure parser tests.** `parse_pair_request` round-trip and signature-verify rejection. Synthetic `PairRequest`s constructed via `wires_net::pair::request::PairRequest::new + sign`.
+- **`generate_topic_id_and_epoch0`** returns 32+32 bytes, distinct across calls, nonzero.
+- **`RootSigner` adapter** roundtrip: a fake `SwiftRootSigner` (in-process ed25519 keypair) signs a `Capability`; `cap.verify(&pubkey)` passes.
+- **Integration with real iroh + wires-host.** Spins up `wires-host` in a test process, calls `WiresApp.fetch_discovery` (with a small axum stub serving `/v1/bootstrap`) → `register_with_hosted_service` → `register_topic`, then verifies `tenants.redb` and `topic_index.redb` reflect the registration.
+- **Pair end-to-end.** Two `WiresApp`s would be wrong — iOS only plays Alice. Spin up `wires-node` in a test process running `pair::listen`, point `WiresApp.approve_pair_request` at its endpoint, assert the listener's cap install completes and the SwiftData-side `PairAckRecord` matches.
 
 ### Swift reducer tests (`WiresTests/`, TCA `TestStore`)
 
 - **`BootstrapFeatureTests`** — drives the wizard with mocked dependencies. Cases:
-  - Happy path: create → pair scan → connect → self-cap mint → done. Asserts `mintGrant` is called exactly once with the iOS agent's own keys as the enrollment target, and that `Household.iosAgentCapIdHex` and `iosAgentNextSeq` are advanced.
-  - Host scan returns malformed QR → alert, retry available.
-  - Connect fails → alert, stays on pair-host step, no mint attempted.
-  - Self-cap mint fails after successful connect → alert, leaves Household in a recoverable partial state (host info saved, cap nil); next launch retries the self-cap mint.
-- **`AgentEnrollmentFeatureTests`** — scan → approval → mint → publish. Cases:
-  - Happy path: existing topic.
-  - Happy path: new topic name (asserts `generateTopicIdAndEpoch0` was called and a new `TopicRecord` saved).
-  - Malformed enrollment QR.
-  - User cancels at approval.
-  - Mint succeeds, publish fails: assert `enqueuePending` called once per message.
-  - Topic conflict: glob `home.lights` literal matches no existing topic but a different topic with the same name exists in registry → conflict error surfaced.
+  - Happy path: enter URL → confirm host → register → done. Assert `fetchDiscovery` and `registerWithHostedService` each called once.
+  - Bad discovery URL → alert, stays on URL step.
+  - Discovery returns empty endpoints → alert, stays on URL step.
+  - Tenant register fails on first attempt, succeeds on retry → final state matches happy path.
+  - Tenant register receives `TenantErrorCode::BadSignature` from host → alert with code-specific copy.
+- **`AgentEnrollmentFeatureTests`** — scan → approval → mint → deliver. Cases:
+  - Happy path: existing topic, requested rights granted as-is.
+  - Operator narrows `read+write` to `read` → assert `approvePairRequest` receives the narrowed rights.
+  - Happy path: new topic name → assert `generateTopicIdAndEpoch0` was called, new `TopicRecord` saved, `registerTopic` called, then mint proceeds.
+  - Operator denies one of two requested scopes → assert only the kept one appears in `GrantedScope[]`.
+  - Pair-request expired (preview's `expiresAt < now`) → block Approve, show inline error.
+  - Topic register fails → keep sheet open, retry button enabled.
+  - Pair deliver fails with `PairRejectCode::NonceMismatch` → render guidance, don't persist a `CapRecord`.
+  - Pair deliver succeeds → `CapRecord` saved exactly once with `installed_cap_id_hex` from the ack.
 - **`ScanFeatureTests`** — permission denied path, malformed payload path, successful decode propagation.
 - **`AppFeatureTests`** — restoration: nil household → bootstrap; populated → home; reads from `HouseholdClient.loadHousehold` exactly once at launch.
 
@@ -606,26 +629,30 @@ Publish failures inside `WiresClient.publish` are caught at the boundary: Swift 
 ### UI snapshot tests (`WiresUITests/`)
 
 Using `swift-snapshot-testing`. One snapshot per major screen state:
-- Bootstrap: welcome, scanning, paired, done.
-- Home: empty, populated, with pending-publish banner.
-- Approval sheet: pristine, partially filled, validation error.
+
+- Bootstrap: enter URL, confirm host, registering (in flight), done.
+- Home: empty (no caps), populated.
+- Approval sheet: pristine preview, partially-narrowed, all-denied (Approve disabled), in-flight, success.
 
 ### End-to-end manual acceptance
 
 Not part of CI. Run before each release.
 
-1. Fresh install on a real device → wizard runs → root key generated, Face ID enrolled, host paired with `wires-host` on a separate machine.
-2. New agent (`wires enroll` on a third machine) produces QR → operator scans → approves with `home.test` topic + read+write → agent dials host → receives cap → can `wires publish` on `home.test`.
-3. Kill app, relaunch → state restored, immediately ready to onboard another agent without re-bootstrap.
-4. With `wires-host` offline, scan another agent, approve → pending banner appears. Bring host online → banner clears within retry interval. New agent receives cap.
+1. Fresh install on a real device → wizard runs → root key generated, Face ID enrolled, tenant registered against a known `wires-host` (self-hosted or hosted).
+2. New agent (`wires pair-listen --role chat-agent --description "Bob" --request home.notes:read+write --qr` on a third machine) produces QR → operator scans → approves with `home.notes` + read+write → Bob's pair-listen exits with success → Bob can `wires publish home.notes hello`.
+3. Kill app, relaunch → state restored, immediately ready to approve another agent.
+4. Approve a second agent for the same `home.notes` topic → epoch-key history is included in the new agent's grant; second agent can `wires cat home.notes` and see Bob's earlier message.
 
 ---
 
 ## 11. Out of scope (each gets its own spec)
 
-- **Revoke UI.** Listing existing caps, tapping to revoke. Requires the spec's `__cap.revoke` flow plus a tap-to-confirm-with-biometric path. Depends on this iOS spec.
-- **Tail / view feeds.** Read-only "household activity" view. Requires the iOS app to subscribe to topics beyond `__caps`, decrypt with epoch keys, render. Substantial new work.
+- **Revoke UI.** Listing existing caps, tapping to revoke. Requires the substrate `__cap.revoke` flow plus a tap-to-confirm-with-biometric path. The iOS surface is small but depends on `__cap.revoke` propagation existing.
+- **Tail / view feeds.** Read-only "household activity" view. Requires the iOS app to subscribe to topics beyond what tenant-register sets up, decrypt with epoch keys, render. Substantial new work that pulls `wires-store` (or a SwiftData equivalent) onto iOS.
+- **Supplemental cap-mints post-pair.** Granting Alice's existing agent access to a new topic without re-pairing. Requires the substrate's `__cap.grant`-over-`__caps` propagation to land. Iff that lands, iOS gains an agent identity, a self-cap, and a per-publisher hash chain — i.e. the architecture the *previous* draft of this spec proposed for v1. The shape of that work is captured in the previous draft.
 - **Root key backup and recovery.** Secret sharing, recovery phrase, or successor key designation. Depends on protocol-level `__cap.root_rotation` flow being designed and implemented.
-- **Multi-device root custody.** Pairing iPhone + iPad as co-custodians of the same root key. Depends on a key-mirroring mechanism — likely via iCloud Keychain with synchronizable items, but the threat model needs rework.
+- **Multi-device root custody.** Pairing iPhone + iPad as co-custodians of the same root key.
+- **Multi-endpoint discovery selection.** v1 always picks `endpoints[0]`. Sharding awareness, latency-based selection, and signed discovery responses come with sub-project B of the hosted-service work.
 - **Epoch rotation triggers.** Wired when revoke lands.
 - **macOS / iPadOS variants.** Same SwiftUI + TCA + WiresKit code targets these, but layout, navigation, and Keychain accessibility nuances need their own pass.
+- **Operator-side topic management UI.** Standalone "create topic" screen, "unregister topic" action, viewing per-topic stats. Topic creation is currently inline-only during pair-approve. A future operator-tools pass adds the full surface.
