@@ -6,7 +6,10 @@ use ed25519_dalek::{Signature, SigningKey, Signer, VerifyingKey, Verifier};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, ensure};
 
-use crate::error::{NetError, PairBoundsSnafu, PairSignatureSnafu, Result, SerdeSnafu};
+use crate::error::{
+    NetError, PairBoundsSnafu, PairInvalidCharsSnafu, PairSignatureSnafu,
+    PairUnsupportedVersionSnafu, Result, SerdeSnafu,
+};
 
 pub const ALPN: &[u8] = b"/wires/pair/0";
 
@@ -130,14 +133,14 @@ impl PairRequest {
     }
 
     fn check_bounds(&self) -> Result<()> {
-        ensure!(self.version == 1, PairBoundsSnafu { what: "version", limit: 1usize });
+        ensure!(self.version == 1, PairUnsupportedVersionSnafu { version: self.version });
         ensure!(
             !self.manifest.role.is_empty() && self.manifest.role.len() <= MAX_ROLE_LEN,
             PairBoundsSnafu { what: "manifest.role", limit: MAX_ROLE_LEN }
         );
         ensure!(
             self.manifest.role.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-            PairBoundsSnafu { what: "manifest.role chars", limit: 0usize }
+            PairInvalidCharsSnafu { field: "manifest.role" }
         );
         ensure!(
             !self.manifest.description.is_empty()
@@ -263,5 +266,56 @@ mod request_tests {
         req.sign(&sk).unwrap();
         let s = req.encode().unwrap();
         assert!(PairRequest::decode(&s).is_err());
+    }
+
+    #[test]
+    fn signing_bytes_covers_every_non_signature_field() {
+        let now = 1_700_000_000_000;
+        let (req, _) = sample(now);
+        let baseline = req.signing_bytes().unwrap();
+
+        // version
+        let mut m = req.clone(); m.version = 2;
+        assert_ne!(m.signing_bytes().unwrap(), baseline, "version not covered");
+        // agent_pubkey
+        let mut m = req.clone(); m.agent_pubkey = [0xff; 32];
+        assert_ne!(m.signing_bytes().unwrap(), baseline, "agent_pubkey not covered");
+        // agent_x25519
+        let mut m = req.clone(); m.agent_x25519 = [0xff; 32];
+        assert_ne!(m.signing_bytes().unwrap(), baseline, "agent_x25519 not covered");
+        // ephemeral_x25519
+        let mut m = req.clone(); m.ephemeral_x25519 = [0xff; 32];
+        assert_ne!(m.signing_bytes().unwrap(), baseline, "ephemeral_x25519 not covered");
+        // dial.node_id
+        let mut m = req.clone(); m.dial.node_id = "ff".repeat(32);
+        assert_ne!(m.signing_bytes().unwrap(), baseline, "dial.node_id not covered");
+        // dial.addrs
+        let mut m = req.clone(); m.dial.addrs = vec!["10.0.0.1:9999".into()];
+        assert_ne!(m.signing_bytes().unwrap(), baseline, "dial.addrs not covered");
+        // dial.relay
+        let mut m = req.clone(); m.dial.relay = Some("https://relay.example".into());
+        assert_ne!(m.signing_bytes().unwrap(), baseline, "dial.relay not covered");
+        // manifest.role
+        let mut m = req.clone(); m.manifest.role = "other-role".into();
+        assert_ne!(m.signing_bytes().unwrap(), baseline, "manifest.role not covered");
+        // manifest.description
+        let mut m = req.clone(); m.manifest.description = "different".into();
+        assert_ne!(m.signing_bytes().unwrap(), baseline, "manifest.description not covered");
+        // manifest.requested_scopes
+        let mut m = req.clone(); m.manifest.requested_scopes[0].topic_name = "mail.inbox".into();
+        assert_ne!(m.signing_bytes().unwrap(), baseline, "requested_scopes not covered");
+        // nonce
+        let mut m = req.clone(); m.nonce = [0xff; 32];
+        assert_ne!(m.signing_bytes().unwrap(), baseline, "nonce not covered");
+        // issued_at
+        let mut m = req.clone(); m.issued_at = now + 1;
+        assert_ne!(m.signing_bytes().unwrap(), baseline, "issued_at not covered");
+        // expires
+        let mut m = req.clone(); m.expires = now + 6 * 60 * 1000;
+        assert_ne!(m.signing_bytes().unwrap(), baseline, "expires not covered");
+
+        // signature itself MUST NOT be covered (otherwise sign() is recursive)
+        let mut m = req.clone(); m.signature = [0xff; 64];
+        assert_eq!(m.signing_bytes().unwrap(), baseline, "signature must be excluded");
     }
 }

@@ -19,7 +19,10 @@ pub use peer_hint::{DialOutcome, first_reachable, first_reachable_with_discovery
 pub use replay::{
     ALPN, HwmEntry, ReplayClient, ReplayProtocol, ReplayRequest, ReplayResponseFrame, ReplaySource,
 };
-pub use pair::{PairDial, PairManifest, PairRequest, RequestedScope};
+pub use pair::{
+    ALPN as PAIR_ALPN, MAX_FRAME_LEN as PAIR_MAX_FRAME_LEN, PairDial, PairManifest, PairRequest,
+    RequestedScope,
+};
 pub use tenant::{
     ALPN as TENANT_ALPN, TenantClient, TenantErrorCode, TenantErrorResponse, TenantHandler,
     TenantProtocol, TenantRegisterRequest, TenantRegisterResponse, TenantRequest, TenantResponse,
