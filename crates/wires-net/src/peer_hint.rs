@@ -1,9 +1,9 @@
-//! Peer-hint iteration for `InviteToken` consumers.
+//! Peer-hint iteration for bootstrap consumers.
 //!
-//! Spec §6: an `InviteToken` carries an ordered list of `PeerHint`s. A new
-//! agent should iterate them in order, attempting to dial each, and proceed
-//! with the first one that succeeds. If every hint fails and a
-//! `service_discovery_url` is available, [`first_reachable_with_discovery`]
+//! An ordered list of `PeerHint`s is carried in pairing tokens and discovery
+//! responses. A new agent should iterate them in order, attempting to dial
+//! each, and proceed with the first one that succeeds. If every hint fails and
+//! a `service_discovery_url` is available, [`first_reachable_with_discovery`]
 //! refreshes the hint list from that URL and retries once.
 //!
 //! Higher-level bootstrap orchestration (cap parsing, gossip subscribe,
@@ -12,8 +12,16 @@
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointId};
+use serde::{Deserialize, Serialize};
 
-use crate::invite::PeerHint;
+/// A single peer hint: an iroh endpoint the caller can try to dial.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerHint {
+    /// Hex of the iroh EndpointId.
+    pub node_id: String,
+    pub addrs: Vec<String>,
+    pub relay: Option<String>,
+}
 
 /// Outcome of attempting to dial a single hint.
 #[derive(Debug)]
@@ -72,7 +80,7 @@ pub async fn first_reachable(
 /// Spec §6 fallback path.
 pub async fn first_reachable_with_discovery(
     endpoint: &iroh::Endpoint,
-    peer_hints: &[crate::invite::PeerHint],
+    peer_hints: &[PeerHint],
     discovery_url: Option<&str>,
     alpn: &[u8],
     per_hint_timeout: std::time::Duration,

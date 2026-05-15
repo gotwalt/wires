@@ -1472,6 +1472,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "humantime"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4767,6 +4773,7 @@ dependencies = [
  "clap",
  "ed25519-dalek 2.2.0",
  "hex",
+ "humantime",
  "iroh",
  "rand_core 0.6.4",
  "serde_json",
@@ -4780,6 +4787,7 @@ dependencies = [
  "wires-host",
  "wires-net",
  "wires-node",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -4870,6 +4878,7 @@ name = "wires-net"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bytes",
  "ed25519-dalek 2.2.0",
@@ -4886,13 +4895,16 @@ dependencies = [
  "tokio",
  "tracing",
  "wires-core",
+ "wires-crypto",
  "wires-store",
+ "x25519-dalek",
 ]
 
 [[package]]
 name = "wires-node"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "ed25519-dalek 2.2.0",
  "hex",

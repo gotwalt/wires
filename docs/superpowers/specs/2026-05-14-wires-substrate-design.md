@@ -59,7 +59,7 @@ This split is the practical consequence of host blindness: the host enforces ant
 
 **Revocation.** A `__cap.revoke` event published as `Public` on `__caps`, signed by the root, referencing a `cap_id`. Honored from its log offset forward. An agent that was using the cap and is now offline learns about its revocation on next reconnect; before that, peers refuse messages signed under the revoked cap by looking up the `cap_id` carried in every message envelope.
 
-**Bootstrapping.** When a new agent comes online, it needs (a) a capability and (b) the iroh `NodeAddr` of at least one peer. Both are conveyed out-of-band — typically by the iOS app showing a QR that the agent's CLI scans, or by `wires invite <agent-pubkey>` producing a paste-able token. The token is short-lived (24h default), single-use, and bundles the cap plus a peer hint.
+**Bootstrapping.** When a new agent comes online, it needs (a) an iroh `EndpointAddr` of at least one peer and (b) a capability. Both are conveyed via the responder-driven pairing flow defined in [`docs/superpowers/specs/2026-05-15-wires-responder-driven-pairing-design.md`](2026-05-15-wires-responder-driven-pairing-design.md): the agent declares its role and requested scopes through a signed `PairRequest` token (QR or paste); the operator consents and dials the agent over `/wires/pair/0` with a sealed, signed `PairGrant` carrying the root pubkey, root-signed cap, per-topic epoch keys, and host info. The token's single-use nonce binds the grant to a live pairing window; the QR/paste handoff is the trust-establishment act (TOFU on the root pubkey).
 
 **Trust root rotation.** Out of scope for v1, but accommodated: a `root_rotation` event signed by the current root nominating a successor pubkey, persisted in `__caps`. Implemented when the iOS app supports backup/recovery.
 
@@ -204,7 +204,7 @@ The responder validates the requester's cap allows read on the topic (signature 
 **Gap detection and repair.** A live gossip subscriber receiving `seq=N` when its hwm for that sender is at `seq=N-3` knows it missed two messages. It opens a targeted replay to any reachable peer for that sender's gap. Peers that have those messages serve them; if none do, the consumer tolerates the gap and notes it. The hash chain means tampering at the gap boundary is detectable.
 
 **Initial sync (cold start).** A freshly bootstrapped agent:
-1. Connects to the peer hint from its invite token (typically the host).
+1. Connects to a peer hint from its `PairGrant.host` (typically the host).
 2. Subscribes to `__caps` first; issues `ReplayRequest{topic_id: __caps, hwm: {}}`. From the resulting stream: decrypts every `SealedTo(self)` `__cap.grant` to learn its own capability set (including the topic ids and names granted to it); reads every `Public` `__cap.revoke` and `__cap.root_rotation` directly; materializes a local cap-table indexed by `cap_id` for verifying every other sender.
 3. Derives the set of topics it has read rights on from its own caps. For each, subscribes via iroh-gossip and issues `ReplayRequest{hwm: {}}`. Processes `SealedTo(self)` `__topic.epoch_advance` and `__topic.history_grant` events to populate `keys.db`, then decrypts the topic's `Standard`-mode messages.
 4. Verifies hash chains and signatures as it goes; rejects anything invalid.
@@ -294,7 +294,7 @@ wires/
 
 1. Two `wires` CLI instances on the same LAN can `wires topic create home.test`, then publish/subscribe and see each other's messages in real time.
 2. Stopping one agent for an hour and restarting → it replays missed messages on reconnect, hash chains verify, and no gaps go undetected.
-3. A third agent bootstrapped from an invite token → receives full history (including all prior epoch keys), tails live.
+3. A third agent bootstrapped via `wires pair-listen` / `wires pair-approve` → receives full history (including all prior epoch keys), tails live.
 4. Revoking the third agent's cap → it can no longer post; a fourth agent created after revoke does not see the revoked agent's prior messages decrypted into garbage (chain intact, messages still stored, receiver refuses them on cap-check).
 5. `wires-host` running on a VPS (no cap of its own) → mediates replay between two agents that have never been directly peered, while content is not decryptable from its disk dumps. Verified by dumping the host's storage and confirming the only readable content is `Public` `__cap.revoke` / `__cap.root_rotation` events.
 6. `wires cat home.test --tail` produces human-readable lines: timestamp, sender alias, type, text.
