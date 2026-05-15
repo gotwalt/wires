@@ -84,9 +84,10 @@ Binaries land at `target/debug/wires`, `target/debug/wires-host`, and `target/de
 ### CLI agent (default `~/.wires/`)
 
 ```
-config.toml             NodeConfig (root_pubkey_hex, data_dir, bootstrap_peers)
+config.toml             NodeConfig (root_pubkey_hex, data_dir, optional host)
 identity.ed25519        agent signing key (32 bytes raw)
 identity.x25519         agent x25519 secret (32 bytes raw)
+iroh.secret             iroh node secret (created on first NodeRuntime::open)
 root.ed25519            local root key (only when `wires init` generated it)
 topic_names.json        name → 32-byte topic_id map (CLI-side convenience)
 caps.redb               CapTable
