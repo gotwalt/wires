@@ -21,9 +21,13 @@ use bytes::Bytes;
 use iroh::{Endpoint, EndpointId};
 use iroh_gossip::{
     api::{Event, GossipSender},
-    net::{GOSSIP_ALPN, Gossip},
     proto::TopicId,
 };
+
+// Re-export the iroh-gossip protocol handler and ALPN under wires-net's public
+// surface so callers can wire the gossip protocol into their own combined
+// `iroh::protocol::Router`.
+pub use iroh_gossip::net::{GOSSIP_ALPN, Gossip};
 use n0_future::StreamExt as _;
 use snafu::ResultExt as _;
 use tokio::sync::mpsc;
@@ -64,16 +68,24 @@ impl GossipHandle {
 // GossipNode
 // ---------------------------------------------------------------------------
 
-/// Wraps an [`iroh::Endpoint`], a [`Gossip`] actor, and a protocol [`Router`].
+/// Wraps an [`iroh::Endpoint`], a [`Gossip`] actor, and (optionally) a protocol
+/// [`Router`].
 ///
-/// Create with [`GossipNode::new`].  The router is shut down when this value is dropped
-/// (via the `AbortOnDrop` internal to iroh).
+/// Create with [`GossipNode::new`] for the standalone case (the gossip ALPN is
+/// served by a dedicated [`Router`] spawned internally), or with
+/// [`GossipNode::new_without_router`] when the caller wants to register the
+/// gossip protocol on its own combined router alongside other ALPNs. The
+/// returned [`Gossip`] handler can be passed to `Router::builder(..).accept(..)`
+/// by the caller in that case.
+///
+/// The router (if owned) is shut down when this value is dropped (via the
+/// `AbortOnDrop` internal to iroh).
 ///
 /// [`Router`]: iroh::protocol::Router
 pub struct GossipNode {
     endpoint: Endpoint,
     gossip: Gossip,
-    _router: Arc<iroh::protocol::Router>,
+    _router: Option<Arc<iroh::protocol::Router>>,
 }
 
 impl GossipNode {
@@ -96,8 +108,27 @@ impl GossipNode {
         Ok(Self {
             endpoint,
             gossip,
-            _router: Arc::new(router),
+            _router: Some(Arc::new(router)),
         })
+    }
+
+    /// Like [`GossipNode::new`], but does NOT spawn an internal protocol
+    /// router. The returned [`Gossip`] handler must be registered with the
+    /// caller's own [`iroh::protocol::Router`] on [`GOSSIP_ALPN`] (re-exported
+    /// from `iroh_gossip::net`) so inbound gossip QUIC streams are dispatched
+    /// correctly. Use this when the same endpoint must accept additional
+    /// non-gossip ALPNs from a single router (e.g. wires-node multiplexes
+    /// gossip and the replay protocol).
+    ///
+    /// Errors are mapped to [`NetError::Endpoint`].
+    pub async fn new_without_router(endpoint: Endpoint) -> Result<(Self, Gossip), NetError> {
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let node = Self {
+            endpoint,
+            gossip: gossip.clone(),
+            _router: None,
+        };
+        Ok((node, gossip))
     }
 
     /// Access the underlying iroh endpoint (e.g. to obtain our [`EndpointId`]).
@@ -112,7 +143,7 @@ impl GossipNode {
         Self {
             endpoint: self.endpoint.clone(),
             gossip: self.gossip.clone(),
-            _router: Arc::clone(&self._router),
+            _router: self._router.as_ref().map(Arc::clone),
         }
     }
 

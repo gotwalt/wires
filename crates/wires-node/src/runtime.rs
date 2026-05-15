@@ -73,6 +73,30 @@ impl NodeRuntime {
     pub fn has_joined(&self, topic_id: &[u8; 32]) -> bool {
         self.handles.lock().contains_key(topic_id)
     }
+
+    /// Publish a `Standard`-mode message and broadcast the resulting envelope
+    /// to every joined peer on this topic. The topic must already have been
+    /// joined via `join_topic`.
+    pub async fn publish_and_broadcast(
+        &self,
+        topic_id: [u8; 32],
+        cap_id: [u8; 16],
+        content: wires_core::CanonicalContent,
+    ) -> Result<wires_core::WireMessage> {
+        let handle = self.handles.lock().get(&topic_id).cloned().ok_or_else(|| {
+            crate::error::NodeError::Config {
+                message: format!(
+                    "publish_and_broadcast called on un-joined topic {}",
+                    hex::encode(topic_id)
+                ),
+                location: snafu::location!(),
+            }
+        })?;
+        let msg = self.node.publish_standard(topic_id, cap_id, content)?;
+        let bytes = serde_json::to_vec(&msg).context(crate::error::SerdeSnafu)?;
+        handle.broadcast(bytes).await.context(NetSnafu)?;
+        Ok(msg)
+    }
 }
 
 #[cfg(test)]
