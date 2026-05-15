@@ -138,26 +138,25 @@ pub struct HostInfo {
 
 ```rust
 pub struct PairGrantEnvelope {
-    pub root_pubkey:             [u8; 32], // claimed signer; matches inner.root_pubkey
-    pub ephemeral_alice_x25519:  [u8; 32], // Alice's one-shot key for sealed-box ECDH
-    pub sealed_payload:          Vec<u8>,  // sealed-box(canonical-JSON(PairGrant)) → Bob's ephemeral_x25519
-    pub signature:               [u8; 64], // ed25519 by root over (root_pubkey || ephemeral_alice_x25519 || sealed_payload)
+    pub root_pubkey:    [u8; 32], // claimed signer; matches inner.root_pubkey
+    pub sealed_payload: Vec<u8>,  // 32-byte Alice ephemeral X25519 pubkey || ChaCha20-Poly1305 ciphertext
+    pub signature:      [u8; 64], // ed25519 by root over (root_pubkey || sealed_payload)
 }
 ```
 
 **Crypto choices.**
 
-- **Sealed to Bob's ephemeral X25519** via `wires-crypto::sealed`. Forward-secret — Bob discards the ephemeral secret as soon as pairing closes; stored ciphertext is then undecryptable by any party.
-- **Outer signature by the root key.** Bob has no agent pubkey to trust yet; he learns the root pubkey from this envelope. The signature → claimed root pubkey link gives a verification chain: outer signature checks against `envelope.root_pubkey`; that pubkey matches `inner.root_pubkey`; `cap.verify(&inner.root_pubkey)` succeeds (i.e. the cap was actually signed by that root); `cap.agent` matches Bob's ed25519 identity. TOFU on the root pubkey is the trust act; the QR handoff and nonce binding give freshness.
-- **Nonce binding.** Bob refuses any grant whose inner `nonce` ≠ his pending request's nonce. Closes replay (an old grant cannot bootstrap a new Bob-instance) and substitution (a grant for a different agent cannot be redirected because `cap.agent` is signed inside).
-- **No AAD.** This is sealed-box authenticated encryption plus an outer ed25519 signature — no separate AAD construction.
+- **Sealed to Bob's ephemeral X25519** via `wires-crypto::sealed::seal_to`. That helper internally generates Alice's one-shot ephemeral X25519 keypair, prepends the public key to the ciphertext, and discards the secret on return. The first 32 bytes of `sealed_payload` are therefore Alice's ephemeral pubkey; the remaining bytes are the AEAD ciphertext. Forward-secret — the ephemeral secret never persists.
+- **Sealed-box AAD = `b"wires.pair.v1"`** (a fixed domain separator). The AEAD nonce is derived from `(grant.nonce, grant.root_pubkey, seq=0)` per the existing sealed-box convention in `wires_crypto::sealed::sealed_nonce`. A tampered or stale nonce causes AEAD failure on decrypt.
+- **Outer signature by the root key.** The signature covers `root_pubkey || sealed_payload` — and because Alice's ephemeral pubkey is the first 32 bytes of `sealed_payload`, the signature also authenticates the ephemeral key. Bob has no agent pubkey to trust yet; he learns the root pubkey from this envelope. The verification chain: outer signature checks against `envelope.root_pubkey`; that pubkey matches `inner.root_pubkey`; `cap.verify(&inner.root_pubkey)` succeeds (i.e. the cap was actually signed by that root); `cap.agent` matches Bob's ed25519 identity. TOFU on the root pubkey is the trust act; the QR handoff and nonce binding give freshness.
+- **Nonce binding.** A `PairGrant` whose nonce doesn't match Bob's pending request fails AEAD decryption (because the nonce is baked into the AEAD nonce). Bob also re-checks the inner `grant.nonce` against pending after decrypt as belt-and-suspenders, but in practice the AEAD layer catches the mismatch first and surfaces it as `SealUndecryptable`. Closes replay (an old grant cannot bootstrap a new Bob-instance) and substitution (a grant for a different agent cannot be redirected because `cap.agent` is signed inside).
 
 **Validation order on Bob's receive side:**
 
-1. Decode envelope; verify outer ed25519 signature against `envelope.root_pubkey`.
-2. Sealed-box-decrypt `sealed_payload` with Bob's ephemeral x25519 + `envelope.ephemeral_alice_x25519`.
-3. Parse inner `PairGrant`. Check `inner.root_pubkey == envelope.root_pubkey`.
-4. Check `inner.nonce == pending_nonce` (from `pair_pending.json`).
+1. Decode envelope; verify outer ed25519 signature against `envelope.root_pubkey` over `(root_pubkey || sealed_payload)`.
+2. Sealed-box-decrypt `sealed_payload` with Bob's ephemeral X25519 secret. The first 32 bytes of `sealed_payload` are Alice's ephemeral pubkey (per `wires_crypto::sealed`); the rest is AEAD ciphertext keyed by ECDH-derived material with AAD `b"wires.pair.v1"` and AEAD nonce derived from the pending request nonce + `envelope.root_pubkey`. A wrong recipient or stale nonce fails here.
+3. Parse inner `PairGrant`. Check `inner.root_pubkey == envelope.root_pubkey` (defensive; the AEAD layer already binds them in practice).
+4. Check `inner.nonce == pending_nonce` (from `pair_pending.json`) — also defensive given the AEAD nonce binding.
 5. Check `inner.issued_at` is within the still-valid request window (≤ `request.expires`).
 6. Verify the `Capability`: `cap.verify(&inner.root_pubkey)` returns `Ok` (signature valid under that root) and `cap.agent == self.agent_pubkey` (the ed25519 identity on disk).
 7. Install everything (see §6 for order and idempotence). Delete `pair_pending.json`.
