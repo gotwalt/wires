@@ -28,9 +28,9 @@ pub use replay::{
 };
 pub use tenant::{
     ALPN as TENANT_ALPN, TenantClient, TenantErrorCode, TenantErrorResponse, TenantHandler,
-    TenantProtocol, TenantRegisterRequest, TenantRegisterResponse, TenantRequest, TenantResponse,
-    TenantStatusKind, TenantStatusRequest, TenantStatusResponse, TopicRegisterRequest,
-    TopicRegisterResponse, TopicUnregisterRequest, TopicUnregisterResponse, register_signing_bytes,
-    status_signing_bytes, topic_register_signing_bytes, topic_unregister_signing_bytes,
+    TenantOp, TenantProtocol, TenantRegisterRequest, TenantRegisterResponse, TenantRequest,
+    TenantResponse, TenantStatusKind, TenantStatusRequest, TenantStatusResponse,
+    TopicRegisterRequest, TopicRegisterResponse, TopicUnregisterRequest, TopicUnregisterResponse,
+    signing_bytes as tenant_signing_bytes,
 };
 pub use time::unix_now_ms;

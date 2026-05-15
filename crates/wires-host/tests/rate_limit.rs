@@ -11,7 +11,7 @@ use wires_host::retention::Retention;
 use wires_host::routing::{RouteOutcome, Router, WriteRateLimiter};
 use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
 use wires_net::tenant::{
-    TenantErrorCode, TenantHandler, TenantRegisterRequest, TenantResponse, register_signing_bytes,
+    TenantErrorCode, TenantHandler, TenantOp, TenantRegisterRequest, TenantResponse, signing_bytes,
 };
 
 #[test]
@@ -64,7 +64,13 @@ fn handle_register_rejects_replayed_nonce() {
     let signing_key = SigningKey::generate(&mut OsRng);
     let root_pubkey = signing_key.verifying_key().to_bytes();
     let nonce = [0xCDu8; 16];
-    let bytes = register_signing_bytes(&root_pubkey, 1_000_000, &nonce, &host_endpoint_id);
+    let bytes = signing_bytes(
+        TenantOp::Register,
+        &root_pubkey,
+        1_000_000,
+        &nonce,
+        &host_endpoint_id,
+    );
     let sig = signing_key.sign(&bytes).to_bytes();
     let req = TenantRegisterRequest {
         version: 1,

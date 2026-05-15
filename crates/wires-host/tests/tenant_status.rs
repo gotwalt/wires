@@ -12,9 +12,8 @@ use wires_host::retention::Retention;
 use wires_host::routing::{Router, WriteRateLimiter};
 use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
 use wires_net::tenant::{
-    TenantHandler, TenantRegisterRequest, TenantResponse, TenantStatusRequest,
-    TopicRegisterRequest, register_signing_bytes, status_signing_bytes,
-    topic_register_signing_bytes,
+    TenantHandler, TenantOp, TenantRegisterRequest, TenantResponse, TenantStatusRequest,
+    TopicRegisterRequest, signing_bytes,
 };
 
 fn mk_msg(topic: [u8; 32], sender: [u8; 32], seq: u64, timestamp: i64) -> WireMessage {
@@ -59,7 +58,13 @@ fn handle_status_returns_real_values() {
 
     // 1. Register the tenant.
     let nonce1 = [0x01u8; 16];
-    let reg_bytes = register_signing_bytes(&root_pubkey, now_ms, &nonce1, &host_endpoint_id);
+    let reg_bytes = signing_bytes(
+        TenantOp::Register,
+        &root_pubkey,
+        now_ms,
+        &nonce1,
+        &host_endpoint_id,
+    );
     let reg_sig = signing_key.sign(&reg_bytes).to_bytes();
     let reg_resp = handler.handle_register(TenantRegisterRequest {
         version: 1,
@@ -76,8 +81,13 @@ fn handle_status_returns_real_values() {
     // 2. Register an explicit topic.
     let topic = [0x55u8; 32];
     let nonce2 = [0x02u8; 16];
-    let topic_reg_bytes =
-        topic_register_signing_bytes(&root_pubkey, &topic, now_ms, &nonce2, &host_endpoint_id);
+    let topic_reg_bytes = signing_bytes(
+        TenantOp::TopicRegister(&topic),
+        &root_pubkey,
+        now_ms,
+        &nonce2,
+        &host_endpoint_id,
+    );
     let topic_reg_sig = signing_key.sign(&topic_reg_bytes).to_bytes();
     let topic_resp = handler.handle_topic_register(TopicRegisterRequest {
         version: 1,
@@ -109,7 +119,13 @@ fn handle_status_returns_real_values() {
 
     // 4. Query status.
     let nonce3 = [0x03u8; 16];
-    let status_bytes = status_signing_bytes(&root_pubkey, now_ms, &nonce3, &host_endpoint_id);
+    let status_bytes = signing_bytes(
+        TenantOp::Status,
+        &root_pubkey,
+        now_ms,
+        &nonce3,
+        &host_endpoint_id,
+    );
     let status_sig = signing_key.sign(&status_bytes).to_bytes();
     let status_resp = handler.handle_status(TenantStatusRequest {
         version: 1,
@@ -167,7 +183,13 @@ fn handle_status_zero_when_no_messages() {
 
     // Register tenant only — no messages routed.
     let nonce1 = [0x11u8; 16];
-    let reg_bytes = register_signing_bytes(&root_pubkey, now_ms, &nonce1, &host_endpoint_id);
+    let reg_bytes = signing_bytes(
+        TenantOp::Register,
+        &root_pubkey,
+        now_ms,
+        &nonce1,
+        &host_endpoint_id,
+    );
     let reg_sig = signing_key.sign(&reg_bytes).to_bytes();
     handler.handle_register(TenantRegisterRequest {
         version: 1,
@@ -178,7 +200,13 @@ fn handle_status_zero_when_no_messages() {
     });
 
     let nonce2 = [0x22u8; 16];
-    let status_bytes = status_signing_bytes(&root_pubkey, now_ms, &nonce2, &host_endpoint_id);
+    let status_bytes = signing_bytes(
+        TenantOp::Status,
+        &root_pubkey,
+        now_ms,
+        &nonce2,
+        &host_endpoint_id,
+    );
     let status_sig = signing_key.sign(&status_bytes).to_bytes();
     let status_resp = handler.handle_status(TenantStatusRequest {
         version: 1,
