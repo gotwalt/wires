@@ -80,6 +80,142 @@ pub fn install_grant(
     })
 }
 
+// ─── NodePairHandler ────────────────────────────────────────────────────────
+
+use async_trait::async_trait;
+use std::sync::Arc;
+use tokio::sync::{Mutex, oneshot};
+use wires_net::pair::{PairAck, PairFrame, PairGrantEnvelope, PairHandler, PairReject, PairRejectCode};
+use x25519_dalek::StaticSecret;
+
+/// Outcome signaled to the outer pair-listen loop on a successful install.
+#[derive(Debug)]
+pub enum PairOutcome {
+    Paired { cap_id: [u8; 16] },
+}
+
+/// Concrete PairHandler that verifies a PairGrantEnvelope against the
+/// in-memory pending pair state, installs the grant, and signals the loop.
+pub struct NodePairHandler {
+    inner: Arc<Mutex<HandlerState>>,
+}
+
+struct HandlerState {
+    data_dir: std::path::PathBuf,
+    node: Arc<Node>,
+    self_agent_pubkey: [u8; 32],
+    expected_nonce: [u8; 32],
+    ephemeral_secret: StaticSecret,
+    request_expires_ms: i64,
+    outcome_tx: Option<oneshot::Sender<PairOutcome>>,
+    completed: bool,
+}
+
+impl NodePairHandler {
+    pub fn new(
+        data_dir: std::path::PathBuf,
+        node: Arc<Node>,
+        self_agent_pubkey: [u8; 32],
+        expected_nonce: [u8; 32],
+        ephemeral_secret: StaticSecret,
+        request_expires_ms: i64,
+        outcome_tx: oneshot::Sender<PairOutcome>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HandlerState {
+                data_dir,
+                node,
+                self_agent_pubkey,
+                expected_nonce,
+                ephemeral_secret,
+                request_expires_ms,
+                outcome_tx: Some(outcome_tx),
+                completed: false,
+            })),
+        }
+    }
+}
+
+#[async_trait]
+impl PairHandler for NodePairHandler {
+    async fn handle_grant(&self, envelope: PairGrantEnvelope) -> PairFrame {
+        let mut state = self.inner.lock().await;
+        if state.completed {
+            return reject(PairRejectCode::AlreadyPaired, "already paired in this window");
+        }
+
+        let grant = match envelope.open_and_verify(&state.ephemeral_secret, &state.expected_nonce) {
+            Ok(g) => g,
+            Err(wires_net::NetError::PairSignature { .. }) => {
+                return reject(PairRejectCode::SignatureInvalid, "signature invalid");
+            }
+            Err(wires_net::NetError::PairCrypto { .. }) => {
+                return reject(PairRejectCode::SealUndecryptable, "sealed payload undecryptable");
+            }
+            Err(e) => {
+                return reject(PairRejectCode::InternalError, &format!("{e}"));
+            }
+        };
+
+        if grant.root_pubkey != envelope.root_pubkey {
+            return reject(PairRejectCode::RootMismatch, "inner/outer root mismatch");
+        }
+        if grant.nonce != state.expected_nonce {
+            return reject(PairRejectCode::NonceMismatch, "nonce mismatch");
+        }
+        if grant.issued_at > state.request_expires_ms {
+            return reject(PairRejectCode::NonceExpired, "grant issued after request expired");
+        }
+
+        match install_grant(&state.data_dir.clone(), &state.node, &state.self_agent_pubkey, &grant) {
+            Ok(out) => {
+                if let Err(e) = crate::pair_pending::delete(&state.data_dir) {
+                    return reject(
+                        PairRejectCode::InternalError,
+                        &format!("delete pair_pending: {e}"),
+                    );
+                }
+                state.completed = true;
+                if let Some(tx) = state.outcome_tx.take() {
+                    let _ = tx.send(PairOutcome::Paired { cap_id: out.cap_id });
+                }
+                PairFrame::Ack(PairAck {
+                    installed_cap_id: out.cap_id,
+                    installed_at: now_ms(),
+                })
+            }
+            Err(NodeError::AgentMismatch { .. }) => {
+                reject(PairRejectCode::CapInvalid, "cap targets a different agent")
+            }
+            Err(NodeError::VerifyCap { .. }) => {
+                reject(PairRejectCode::CapInvalid, "cap failed root verification")
+            }
+            Err(NodeError::UnknownTopic { .. }) => {
+                reject(PairRejectCode::CapInvalid, "grant references unknown topic_id")
+            }
+            Err(e) => {
+                reject(PairRejectCode::InternalError, &format!("{e}"))
+            }
+        }
+    }
+}
+
+fn reject(code: PairRejectCode, msg: &str) -> PairFrame {
+    PairFrame::Reject(PairReject {
+        code,
+        message: msg.to_string(),
+    })
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+// ─── write_topic_names ───────────────────────────────────────────────────────
+
 fn write_topic_names(data_dir: &Path, entries: &[TopicNameEntry]) -> Result<()> {
     let p = data_dir.join("topic_names.json");
     let mut map: std::collections::HashMap<String, String> = if p.exists() {
