@@ -21,7 +21,6 @@ pub struct NodeRuntime {
     pub glue: NetGlue,
     /// One gossip handle per joined topic. Populated by `join_topic` and
     /// consulted by `publish_and_broadcast` in subsequent tasks.
-    #[allow(dead_code)]
     handles: Mutex<HashMap<[u8; 32], GossipHandle>>,
 }
 
@@ -50,6 +49,30 @@ impl NodeRuntime {
             handles: Mutex::new(HashMap::new()),
         })
     }
+
+    /// Join `topic_id` on gossip (with optional `bootstrap` peer hints), and
+    /// route inbound envelopes to `node.handle_inbound`. Idempotent: a second
+    /// call returns the cached handle.
+    pub async fn join_topic(
+        &self,
+        topic_id: [u8; 32],
+        bootstrap: Vec<iroh::EndpointId>,
+    ) -> Result<GossipHandle> {
+        if let Some(h) = self.handles.lock().get(&topic_id) {
+            return Ok(h.clone());
+        }
+        let handle = self
+            .glue
+            .subscribe_and_route(Arc::clone(&self.node), topic_id, bootstrap)
+            .await?;
+        self.handles.lock().insert(topic_id, handle.clone());
+        Ok(handle)
+    }
+
+    /// Whether `topic_id` has been joined (debug/test helper).
+    pub fn has_joined(&self, topic_id: &[u8; 32]) -> bool {
+        self.handles.lock().contains_key(topic_id)
+    }
 }
 
 #[cfg(test)]
@@ -68,5 +91,21 @@ mod tests {
         let rt = NodeRuntime::open(cfg).await.unwrap();
         assert!(rt.endpoint.id().as_bytes().iter().any(|b| *b != 0));
         assert_eq!(rt.node.config.root_pubkey_hex.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn join_topic_registers_a_gossip_handle() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = NodeConfig {
+            data_dir: tmp.path().to_path_buf(),
+            root_pubkey_hex: hex::encode([7u8; 32]),
+            host: None,
+        };
+        let rt = NodeRuntime::open(cfg).await.unwrap();
+        let topic = [1u8; 32];
+        assert!(rt.join_topic(topic, vec![]).await.is_ok());
+        // Second join is idempotent (returns the cached handle).
+        assert!(rt.join_topic(topic, vec![]).await.is_ok());
+        assert!(rt.has_joined(&topic));
     }
 }
