@@ -83,6 +83,18 @@ pub enum NetError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Pair request unsupported version {version}, at {location}"))]
+    PairUnsupportedVersion {
+        version: u8,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Pair request invalid characters in {field}, at {location}"))]
+    PairInvalidChars {
+        field: &'static str,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = NetError> = core::result::Result<T, E>;
