@@ -3,6 +3,7 @@ pub mod error;
 pub mod inbound;
 pub mod net_glue;
 pub mod node;
+pub mod pair_pending;
 pub mod publish;
 pub mod runtime;
 pub mod storage;
