@@ -72,6 +72,37 @@ impl HostTicket {
         Ok(t)
     }
 
+    /// Build a ticket from a live iroh `Endpoint`. Pulls `EndpointId`, direct
+    /// socket addrs, and the optional relay url off `endpoint.addr()`.
+    pub fn from_endpoint(
+        endpoint: &iroh::Endpoint,
+        hint_ttl: std::time::Duration,
+    ) -> Result<Self> {
+        let endpoint_id = hex::encode(endpoint.id().as_bytes());
+        let endpoint_addr = endpoint.addr();
+        let mut addrs: Vec<String> = Vec::new();
+        let mut relay: Option<String> = None;
+        for t in &endpoint_addr.addrs {
+            match t {
+                iroh::TransportAddr::Ip(sa) => addrs.push(sa.to_string()),
+                iroh::TransportAddr::Relay(url) => relay = Some(url.to_string()),
+                _ => {}
+            }
+        }
+        // Cap addrs so we never exceed the wire bound.
+        if addrs.len() > MAX_HINT_ADDRS {
+            addrs.truncate(MAX_HINT_ADDRS);
+        }
+        let now_ms = crate::unix_now_ms();
+        Ok(HostTicket {
+            version: TICKET_VERSION,
+            endpoint_id,
+            addrs,
+            relay,
+            hint_expires_at: now_ms + hint_ttl.as_millis() as i64,
+        })
+    }
+
     fn check_bounds(&self) -> Result<()> {
         ensure!(
             self.version == TICKET_VERSION,
@@ -195,5 +226,19 @@ mod tests {
         let s = t.encode().unwrap();
         let back = HostTicket::decode(&s).unwrap();
         assert_eq!(back.hint_expires_at, 0);
+    }
+
+    #[tokio::test]
+    async fn from_endpoint_roundtrips_endpoint_id() {
+        use iroh::SecretKey;
+        let ep = crate::bind_lan(SecretKey::generate(), vec![]).await.unwrap();
+        let t = HostTicket::from_endpoint(&ep, std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(t.endpoint_id, hex::encode(ep.id().as_bytes()));
+        assert_eq!(t.version, TICKET_VERSION);
+        assert!(t.hint_expires_at > 0, "hint_expires_at must be set");
+        // Round-trip the encoded form.
+        let s = t.encode().unwrap();
+        let back = HostTicket::decode(&s).unwrap();
+        assert_eq!(back.endpoint_id, t.endpoint_id);
     }
 }
