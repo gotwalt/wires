@@ -17,7 +17,7 @@ use wires_host::routing::{Router as MsgRouter, WriteRateLimiter};
 use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
 use wires_net::replay::{ALPN as REPLAY_ALPN, ReplayProtocol};
 use wires_net::tenant::{ALPN as TENANT_ALPN, TenantProtocol};
-use wires_net::{GossipNode, load_or_create_secret};
+use wires_net::{GOSSIP_ALPN, GossipNode, load_or_create_secret};
 
 #[derive(Parser)]
 #[command(
@@ -49,7 +49,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let iroh_sk = SecretKey::from_bytes(&secret);
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(iroh_sk)
-        .alpns(vec![TENANT_ALPN.to_vec(), REPLAY_ALPN.to_vec()])
+        .alpns(vec![
+            GOSSIP_ALPN.to_vec(),
+            TENANT_ALPN.to_vec(),
+            REPLAY_ALPN.to_vec(),
+        ])
         .bind()
         .await?;
     let endpoint_id = endpoint.id();
@@ -69,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // Gossip + dynamic subscribe channel -----------------------------------
-    let gossip = GossipNode::new(endpoint.clone()).await?;
+    let (gossip, gossip_handler) = GossipNode::new_without_router(endpoint.clone()).await?;
     let (subscribe_tx, mut subscribe_rx) = mpsc::unbounded_channel::<[u8; 32]>();
 
     // Spawn subscriber dispatcher: when the handler tells us about a new
@@ -137,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&logs),
     )));
     let _router = iroh::protocol::Router::builder(endpoint.clone())
+        .accept(GOSSIP_ALPN, gossip_handler)
         .accept(REPLAY_ALPN, replay_protocol)
         .accept(TENANT_ALPN, TenantProtocol::new(Arc::clone(&handler)))
         .spawn();
