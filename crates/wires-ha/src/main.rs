@@ -69,11 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let secret = load_or_create_secret(&args.data_dir.join("iroh.secret"))?;
-    let endpoint = wires_net::bind_lan(
-        SecretKey::from_bytes(&secret),
-        vec![ALPN.to_vec()],
-    )
-    .await?;
+    let endpoint = wires_net::bind_lan(SecretKey::from_bytes(&secret), vec![ALPN.to_vec()]).await?;
     let endpoint_id = endpoint.id();
     tracing::info!(%endpoint_id, "wires-ha endpoint bound");
 
