@@ -8,6 +8,7 @@ pub mod pair;
 pub mod peer_hint;
 pub mod replay;
 pub mod tenant;
+pub mod ticket;
 pub mod time;
 
 pub use discovery::{DiscoveryEndpoint, DiscoveryResponse, fetch_endpoints};
@@ -35,4 +36,5 @@ pub use tenant::{
     TopicRegisterRequest, TopicRegisterResponse, TopicUnregisterRequest, TopicUnregisterResponse,
     signing_bytes as tenant_signing_bytes,
 };
+pub use ticket::{HostTicket, MAX_HINT_ADDRS, MAX_TICKET_BYTES, TICKET_VERSION};
 pub use time::unix_now_ms;
