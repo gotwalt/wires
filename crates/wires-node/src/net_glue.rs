@@ -70,15 +70,25 @@ impl NetGlue {
         let n = Arc::clone(&node);
         tokio::spawn(async move {
             while let Some(bytes) = rx.recv().await {
-                let msg: WireMessage = match serde_json::from_slice(&bytes) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "bad gossip frame");
-                        continue;
+                // ed25519 verify + decrypt + redb writes; off the tokio
+                // worker. Awaited so per-topic ordering (which the hash-chain
+                // link check depends on) is preserved.
+                let n = Arc::clone(&n);
+                let res = tokio::task::spawn_blocking(move || {
+                    let msg: WireMessage = match serde_json::from_slice(&bytes) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "bad gossip frame");
+                            return;
+                        }
+                    };
+                    if let Err(e) = n.handle_inbound(msg) {
+                        tracing::warn!(error = %e, "handle_inbound failed");
                     }
-                };
-                if let Err(e) = n.handle_inbound(msg) {
-                    tracing::warn!(error = %e, "handle_inbound failed");
+                })
+                .await;
+                if let Err(e) = res {
+                    tracing::error!(error = %e, "node inbound task panicked");
                 }
             }
         });
@@ -115,10 +125,12 @@ impl NetGlue {
             .context(NetSnafu)?;
         let mut count = 0usize;
         while let Some(msg) = rx.recv().await {
-            if let Err(e) = node.handle_inbound(msg) {
-                tracing::warn!(error = %e, "handle_inbound from replay failed");
-            } else {
-                count += 1;
+            let node = Arc::clone(&node);
+            let outcome = tokio::task::spawn_blocking(move || node.handle_inbound(msg)).await;
+            match outcome {
+                Ok(Ok(_)) => count += 1,
+                Ok(Err(e)) => tracing::warn!(error = %e, "handle_inbound from replay failed"),
+                Err(e) => tracing::error!(error = %e, "replay inbound task panicked"),
             }
         }
         Ok(count)

@@ -93,19 +93,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let router_state = Arc::clone(&router_state);
                 tokio::spawn(async move {
                     while let Some(bytes) = rx.recv().await {
-                        let msg: WireMessage = match serde_json::from_slice(&bytes) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "bad gossip frame");
-                                continue;
+                        // ed25519 verify + redb write transactions; off the
+                        // tokio worker so a slow disk doesn't stall every
+                        // other topic's receive loop on the same thread.
+                        let router_state = Arc::clone(&router_state);
+                        let res = tokio::task::spawn_blocking(move || {
+                            let msg: WireMessage = match serde_json::from_slice(&bytes) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "bad gossip frame");
+                                    return;
+                                }
+                            };
+                            if wires_core::verify_envelope(&msg).is_err() {
+                                tracing::warn!("dropped unsigned/bad envelope at host");
+                                return;
                             }
-                        };
-                        if wires_core::verify_envelope(&msg).is_err() {
-                            tracing::warn!("dropped unsigned/bad envelope at host");
-                            continue;
-                        }
-                        if let Err(e) = router_state.route(&msg) {
-                            tracing::warn!(error = %e, "router error");
+                            if let Err(e) = router_state.route(&msg) {
+                                tracing::warn!(error = %e, "router error");
+                            }
+                        })
+                        .await;
+                        if let Err(e) = res {
+                            tracing::error!(error = %e, "host inbound task panicked");
                         }
                     }
                 });
