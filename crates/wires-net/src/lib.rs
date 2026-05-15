@@ -1,3 +1,4 @@
+pub mod discovery;
 pub mod error;
 pub mod framing;
 pub mod gossip;
@@ -7,6 +8,7 @@ pub mod peer_hint;
 pub mod replay;
 pub mod tenant;
 
+pub use discovery::{DiscoveryEndpoint, DiscoveryResponse, fetch_endpoints};
 pub use error::{NetError, Result};
 pub use gossip::{GossipHandle, GossipNode};
 pub use identity::load_or_create_secret;
