@@ -6,7 +6,7 @@ use iroh::{Endpoint, EndpointId};
 use snafu::ResultExt;
 use wires_core::WireMessage;
 use wires_net::replay::{ALPN, ReplayClient, ReplayProtocol, ReplayRequest};
-use wires_net::{GossipHandle, GossipNode};
+use wires_net::{GOSSIP_ALPN, GossipHandle, GossipNode};
 
 use crate::error::{NetSnafu, Result};
 use crate::inbound::InboundCtx;
@@ -19,16 +19,28 @@ pub struct NetGlue {
     pub replay_client: ReplayClient,
     pub endpoint: Endpoint,
     /// The iroh `Router` keeps inbound ALPN dispatch alive. Holding it here
-    /// ensures the replay server stays up for the lifetime of the glue.
+    /// ensures both the replay server and the gossip protocol stay up for the
+    /// lifetime of the glue. A single router serves both ALPNs so that
+    /// `Endpoint::set_alpns` (which Router::spawn invokes — overwriting,
+    /// not merging) keeps both protocols reachable.
     _router: iroh::protocol::Router,
 }
 
 impl NetGlue {
     /// Construct over an existing iroh Endpoint and a TopicLogs to serve replay from.
     pub async fn new(endpoint: Endpoint, logs: Arc<TopicLogs>) -> Result<Self> {
-        let gossip = GossipNode::new(endpoint.clone()).await.context(NetSnafu)?;
+        // Build the gossip actor WITHOUT spawning its own protocol router so
+        // that we can register the gossip ALPN on the same combined router as
+        // replay. If gossip had its own router, the second `Router::spawn`
+        // (replay) would call `endpoint.set_alpns(...)` and silently kick the
+        // gossip ALPN out of the endpoint's server config, breaking peer
+        // discovery on inbound QUIC handshakes.
+        let (gossip, gossip_handler) = GossipNode::new_without_router(endpoint.clone())
+            .await
+            .context(NetSnafu)?;
         let replay_protocol = ReplayProtocol::new(logs);
         let router = iroh::protocol::Router::builder(endpoint.clone())
+            .accept(GOSSIP_ALPN, gossip_handler)
             .accept(ALPN, replay_protocol)
             .spawn();
         let replay_client = ReplayClient::new(endpoint.clone());
