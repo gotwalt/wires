@@ -80,6 +80,23 @@ enum Cmd {
         #[arg(long)]
         qr: bool,
     },
+    /// Decode and approve a PairRequest from an agent.
+    PairApprove {
+        /// Base64 PairRequest token.
+        token: String,
+        /// Narrow per-topic rights, e.g. `--scope home.notes:read`. Repeatable.
+        #[arg(long = "scope")]
+        scope: Vec<String>,
+        /// Narrow to a subset of requested topic names. Comma-separated.
+        #[arg(long = "topics", value_delimiter = ',')]
+        topics: Option<Vec<String>>,
+        /// Omit host info from the grant.
+        #[arg(long)]
+        no_host: bool,
+        /// Skip the interactive prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -151,6 +168,9 @@ async fn main() -> std::process::ExitCode {
             ttl,
             qr,
         } => cmd::pair_listen::run(&data_dir, role, description, request, ttl.into(), qr).await,
+        Cmd::PairApprove { token, scope, topics, no_host, yes } => {
+            cmd::pair_approve::run(&data_dir, &token, scope, topics, no_host, yes).await
+        }
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
