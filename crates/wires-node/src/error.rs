@@ -115,6 +115,13 @@ pub enum NodeError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Pair-listen sign/encode failed: {source}, at {location}"))]
+    PairListenSign {
+        #[snafu(source(from(wires_net::error::NetError, Box::new)))]
+        source: Box<wires_net::error::NetError>,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = NodeError> = core::result::Result<T, E>;
