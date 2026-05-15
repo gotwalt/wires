@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use snafu::ResultExt;
 use wires_core::WireMessage;
 use wires_net::replay::{Pubkey, ReplaySource};
-use wires_store::{open_topic_log, TopicLog};
+use wires_store::{TopicLog, open_topic_log};
 
 use crate::error::{Result, StoreSnafu};
 
@@ -47,7 +47,8 @@ impl ReplaySource for TopicLogs {
         after_seq: Option<u64>,
         limit: usize,
     ) -> std::result::Result<Vec<WireMessage>, Box<dyn std::error::Error + Send + Sync>> {
-        let log = self.get_or_open(topic_id)
+        let log = self
+            .get_or_open(topic_id)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         log.read_after(sender, after_seq, limit)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
@@ -57,9 +58,11 @@ impl ReplaySource for TopicLogs {
         &self,
         topic_id: &[u8; 32],
     ) -> std::result::Result<Vec<Pubkey>, Box<dyn std::error::Error + Send + Sync>> {
-        let log = self.get_or_open(topic_id)
+        let log = self
+            .get_or_open(topic_id)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        let hwm = log.hwm()
+        let hwm = log
+            .hwm()
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         Ok(hwm.into_keys().collect())
     }

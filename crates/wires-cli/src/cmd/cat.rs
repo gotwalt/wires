@@ -10,8 +10,7 @@ pub async fn run(
     topic: &str,
     tail: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg: NodeConfig =
-        toml::from_str(&std::fs::read_to_string(data_dir.join("config.toml"))?)?;
+    let cfg: NodeConfig = toml::from_str(&std::fs::read_to_string(data_dir.join("config.toml"))?)?;
     let node = Node::open(cfg)?;
     let topic_id = resolve_topic(data_dir, topic)?;
     let log = node.logs.get_or_open(&topic_id)?;

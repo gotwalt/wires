@@ -1,11 +1,24 @@
 pub mod error;
+pub mod framing;
 pub mod gossip;
 pub mod identity;
 pub mod invite;
+pub mod peer_hint;
 pub mod replay;
+pub mod tenant;
 
 pub use error::{NetError, Result};
 pub use gossip::{GossipHandle, GossipNode};
 pub use identity::load_or_create_secret;
-pub use invite::InviteToken;
-pub use replay::{HwmEntry, ReplayClient, ReplayProtocol, ReplayRequest, ReplayResponseFrame, ReplaySource, ALPN};
+pub use invite::{InviteToken, PeerHint};
+pub use peer_hint::{DialOutcome, first_reachable};
+pub use replay::{
+    ALPN, HwmEntry, ReplayClient, ReplayProtocol, ReplayRequest, ReplayResponseFrame, ReplaySource,
+};
+pub use tenant::{
+    ALPN as TENANT_ALPN, TenantClient, TenantErrorCode, TenantErrorResponse, TenantHandler,
+    TenantProtocol, TenantRegisterRequest, TenantRegisterResponse, TenantRequest, TenantResponse,
+    TenantStatusKind, TenantStatusRequest, TenantStatusResponse, TopicRegisterRequest,
+    TopicRegisterResponse, TopicUnregisterRequest, TopicUnregisterResponse, register_signing_bytes,
+    status_signing_bytes, topic_register_signing_bytes, topic_unregister_signing_bytes,
+};

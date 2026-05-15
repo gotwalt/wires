@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use ed25519_dalek::SigningKey;
-use wires_core::cap::Right;
 use wires_core::Capability;
+use wires_core::cap::Right;
 use wires_node::{Node, NodeConfig};
 
 pub async fn run(
@@ -11,8 +11,7 @@ pub async fn run(
     topics: &[String],
     rights: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg: NodeConfig =
-        toml::from_str(&std::fs::read_to_string(data_dir.join("config.toml"))?)?;
+    let cfg: NodeConfig = toml::from_str(&std::fs::read_to_string(data_dir.join("config.toml"))?)?;
     let node = Node::open(cfg)?;
 
     let root_bytes_vec = std::fs::read(data_dir.join("root.ed25519"))?;

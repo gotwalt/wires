@@ -53,9 +53,7 @@ enum Cmd {
         rights: Vec<String>,
     },
     /// Revoke a capability by id
-    Revoke {
-        cap_id: String,
-    },
+    Revoke { cap_id: String },
 }
 
 #[derive(Subcommand)]
@@ -70,21 +68,27 @@ async fn main() -> std::process::ExitCode {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let cli = Cli::parse();
-    let data_dir = cli.data_dir.unwrap_or_else(|| {
-        dirs_data_dir().unwrap_or_else(|| std::path::PathBuf::from(".wires"))
-    });
+    let data_dir = cli
+        .data_dir
+        .unwrap_or_else(|| dirs_data_dir().unwrap_or_else(|| std::path::PathBuf::from(".wires")));
 
     let result = match cli.command {
         Cmd::Init { root } => cmd::init::run(&data_dir, root).await,
         Cmd::Status => cmd::status::run(&data_dir).await,
         Cmd::Topic(TopicCmd::Create { name }) => cmd::topic::create(&data_dir, &name).await,
-        Cmd::Publish { topic, cap, r#type, text, data } => {
-            cmd::publish::run(&data_dir, &topic, &cap, &r#type, &text, data.as_deref()).await
-        }
+        Cmd::Publish {
+            topic,
+            cap,
+            r#type,
+            text,
+            data,
+        } => cmd::publish::run(&data_dir, &topic, &cap, &r#type, &text, data.as_deref()).await,
         Cmd::Cat { topic, tail } => cmd::cat::run(&data_dir, &topic, tail).await,
-        Cmd::Invite { agent_pubkey, topics, rights } => {
-            cmd::invite::run(&data_dir, &agent_pubkey, &topics, &rights).await
-        }
+        Cmd::Invite {
+            agent_pubkey,
+            topics,
+            rights,
+        } => cmd::invite::run(&data_dir, &agent_pubkey, &topics, &rights).await,
         Cmd::Revoke { cap_id } => cmd::revoke::run(&data_dir, &cap_id).await,
     };
     match result {

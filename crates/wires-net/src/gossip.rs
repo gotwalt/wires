@@ -15,11 +15,13 @@
 //!
 //! Publishing is done via [`GossipNode::publish`] or directly on the [`GossipHandle`].
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointId};
 use iroh_gossip::{
     api::{Event, GossipSender},
-    net::{Gossip, GOSSIP_ALPN},
+    net::{GOSSIP_ALPN, Gossip},
     proto::TopicId,
 };
 use n0_future::StreamExt as _;
@@ -71,7 +73,7 @@ impl GossipHandle {
 pub struct GossipNode {
     endpoint: Endpoint,
     gossip: Gossip,
-    _router: iroh::protocol::Router,
+    _router: Arc<iroh::protocol::Router>,
 }
 
 impl GossipNode {
@@ -94,13 +96,24 @@ impl GossipNode {
         Ok(Self {
             endpoint,
             gossip,
-            _router: router,
+            _router: Arc::new(router),
         })
     }
 
     /// Access the underlying iroh endpoint (e.g. to obtain our [`EndpointId`]).
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// Returns a handle that can be used to call `join` from another task. The
+    /// underlying `iroh_gossip::Gossip` and endpoint are internally Arc-based, so this is a cheap
+    /// clone. The router is held in an Arc to make this clonable.
+    pub fn clone_for_subscribe(&self) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            gossip: self.gossip.clone(),
+            _router: Arc::clone(&self._router),
+        }
     }
 
     /// Join a gossip topic.
@@ -164,11 +177,7 @@ impl GossipNode {
     /// Broadcast `payload` into the topic identified by `handle`.
     ///
     /// Convenience wrapper around [`GossipHandle::broadcast`].
-    pub async fn publish(
-        &self,
-        handle: &GossipHandle,
-        payload: Vec<u8>,
-    ) -> Result<(), NetError> {
+    pub async fn publish(&self, handle: &GossipHandle, payload: Vec<u8>) -> Result<(), NetError> {
         handle.broadcast(payload).await
     }
 }

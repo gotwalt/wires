@@ -45,6 +45,24 @@ pub enum NetError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Tenant register failed, at {location}"))]
+    TenantRegister {
+        #[snafu(source(from(anyhow::Error, Box::new)))]
+        source: Box<anyhow::Error>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Tenant stream closed unexpectedly, at {location}"))]
+    TenantStreamClosed {
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Tenant protocol returned a bad response: {message}, at {location}"))]
+    TenantBadResponse {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = NetError> = core::result::Result<T, E>;

@@ -27,7 +27,9 @@ pub enum CoreError {
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Reserved type '{reserved_type}' used with disallowed encryption mode, at {location}"))]
+    #[snafu(display(
+        "Reserved type '{reserved_type}' used with disallowed encryption mode, at {location}"
+    ))]
     ReservedTypeWrongMode {
         reserved_type: String,
         #[snafu(implicit)]
@@ -38,7 +40,9 @@ pub enum CoreError {
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Capability expired (issued={issued}, expires={expires:?}, now={now}), at {location}"))]
+    #[snafu(display(
+        "Capability expired (issued={issued}, expires={expires:?}, now={now}), at {location}"
+    ))]
     CapExpired {
         issued: i64,
         expires: Option<i64>,

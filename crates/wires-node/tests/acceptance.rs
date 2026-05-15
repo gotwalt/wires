@@ -13,7 +13,7 @@ use rand_core::OsRng;
 use tempfile::TempDir;
 use wires_core::cap::Right;
 use wires_core::{CanonicalContent, Capability};
-use wires_node::{drive_sync_pass, Inbound, InboundCtx, Node, NodeConfig};
+use wires_node::{Inbound, InboundCtx, Node, NodeConfig, drive_sync_pass};
 
 fn open_node(tmp: TempDir, root_hex: &str) -> (TempDir, Arc<Node>) {
     let cfg = NodeConfig {
@@ -25,7 +25,12 @@ fn open_node(tmp: TempDir, root_hex: &str) -> (TempDir, Arc<Node>) {
     (tmp, n)
 }
 
-fn mint_cap(root: &SigningKey, agent_pk: [u8; 32], topics: Vec<String>, rights: Vec<Right>) -> Capability {
+fn mint_cap(
+    root: &SigningKey,
+    agent_pk: [u8; 32],
+    topics: Vec<String>,
+    rights: Vec<Right>,
+) -> Capability {
     let mut cap = Capability::new_unsigned(agent_pk, topics, rights, 0, None);
     cap.sign(root).unwrap();
     cap
@@ -43,8 +48,18 @@ fn criterion_1_two_nodes_publish_subscribe() {
 
     let a_pk = a.ed_sk.verifying_key().to_bytes();
     let b_pk = b.ed_sk.verifying_key().to_bytes();
-    let cap_a = mint_cap(&root, a_pk, vec!["home.test".into()], vec![Right::Read, Right::Write]);
-    let cap_b = mint_cap(&root, b_pk, vec!["home.test".into()], vec![Right::Read, Right::Write]);
+    let cap_a = mint_cap(
+        &root,
+        a_pk,
+        vec!["home.test".into()],
+        vec![Right::Read, Right::Write],
+    );
+    let cap_b = mint_cap(
+        &root,
+        b_pk,
+        vec!["home.test".into()],
+        vec![Right::Read, Right::Write],
+    );
     a.caps.upsert_grant(&cap_a).unwrap();
     a.caps.upsert_grant(&cap_b).unwrap();
     b.caps.upsert_grant(&cap_a).unwrap();
@@ -56,10 +71,18 @@ fn criterion_1_two_nodes_publish_subscribe() {
     b.install_epoch_key(topic, 0, key).unwrap();
 
     let m_a = a
-        .publish_standard(topic, cap_a.cap_id.0, CanonicalContent::new("home.test", "hello from A"))
+        .publish_standard(
+            topic,
+            cap_a.cap_id.0,
+            CanonicalContent::new("home.test", "hello from A"),
+        )
         .unwrap();
     let m_b = b
-        .publish_standard(topic, cap_b.cap_id.0, CanonicalContent::new("home.test", "hello from B"))
+        .publish_standard(
+            topic,
+            cap_b.cap_id.0,
+            CanonicalContent::new("home.test", "hello from B"),
+        )
         .unwrap();
     b.handle_inbound(m_a.clone()).unwrap();
     a.handle_inbound(m_b.clone()).unwrap();
@@ -81,7 +104,12 @@ fn criterion_2_replay_after_outage() {
     let (_b_dir, b) = open_node(TempDir::new().unwrap(), &root_hex);
 
     let a_pk = a.ed_sk.verifying_key().to_bytes();
-    let cap = mint_cap(&root, a_pk, vec!["home.test".into()], vec![Right::Read, Right::Write]);
+    let cap = mint_cap(
+        &root,
+        a_pk,
+        vec!["home.test".into()],
+        vec![Right::Read, Right::Write],
+    );
     a.caps.upsert_grant(&cap).unwrap();
     b.caps.upsert_grant(&cap).unwrap();
 
@@ -139,7 +167,12 @@ fn criterion_4_revocation_takes_effect() {
     let (_b_dir, b) = open_node(TempDir::new().unwrap(), &root_hex);
 
     let a_pk = a.ed_sk.verifying_key().to_bytes();
-    let cap = mint_cap(&root, a_pk, vec!["home.test".into()], vec![Right::Read, Right::Write]);
+    let cap = mint_cap(
+        &root,
+        a_pk,
+        vec!["home.test".into()],
+        vec![Right::Read, Right::Write],
+    );
     let cap_id = cap.cap_id.0;
     a.caps.upsert_grant(&cap).unwrap();
     b.caps.upsert_grant(&cap).unwrap();
@@ -160,7 +193,9 @@ fn criterion_4_revocation_takes_effect() {
         .unwrap();
     let result = b.handle_inbound(m_post).unwrap();
     match result {
-        Inbound::Rejected { reason, .. } => assert!(reason.contains("cap"), "unexpected reason: {reason}"),
+        Inbound::Rejected { reason, .. } => {
+            assert!(reason.contains("cap"), "unexpected reason: {reason}")
+        }
         other => panic!("expected rejection after revocation, got {other:?}"),
     }
 
@@ -181,7 +216,12 @@ fn criterion_6_cat_is_human_readable() {
     let (_a_dir, a) = open_node(TempDir::new().unwrap(), &root_hex);
 
     let a_pk = a.ed_sk.verifying_key().to_bytes();
-    let cap = mint_cap(&root, a_pk, vec!["home.test".into()], vec![Right::Read, Right::Write]);
+    let cap = mint_cap(
+        &root,
+        a_pk,
+        vec!["home.test".into()],
+        vec![Right::Read, Right::Write],
+    );
     a.caps.upsert_grant(&cap).unwrap();
     let topic = [42u8; 32];
     a.install_epoch_key(topic, 0, [7u8; 32]).unwrap();
@@ -195,7 +235,9 @@ fn criterion_6_cat_is_human_readable() {
         .unwrap();
     let outcome = a.handle_inbound(msg.clone()).unwrap();
     match outcome {
-        Inbound::Accepted { content: Some(c), .. } => {
+        Inbound::Accepted {
+            content: Some(c), ..
+        } => {
             assert_eq!(c.type_, "home.fridge.temp");
             assert!(c.text.contains("fridge"));
             assert!(c.text.contains("38F"));
@@ -215,21 +257,35 @@ fn criterion_3_history_on_join() {
     let (_a_dir, a) = open_node(TempDir::new().unwrap(), &root_hex);
 
     let a_pk = a.ed_sk.verifying_key().to_bytes();
-    let cap_a = mint_cap(&root, a_pk, vec!["home.test".into()], vec![Right::Read, Right::Write]);
+    let cap_a = mint_cap(
+        &root,
+        a_pk,
+        vec!["home.test".into()],
+        vec![Right::Read, Right::Write],
+    );
     a.caps.upsert_grant(&cap_a).unwrap();
     let topic = [42u8; 32];
     let key = [7u8; 32];
     a.install_epoch_key(topic, 0, key).unwrap();
 
     for i in 0..10 {
-        a.publish_standard(topic, cap_a.cap_id.0, CanonicalContent::new("home.test", format!("msg-{i}")))
-            .unwrap();
+        a.publish_standard(
+            topic,
+            cap_a.cap_id.0,
+            CanonicalContent::new("home.test", format!("msg-{i}")),
+        )
+        .unwrap();
     }
 
     // New agent C bootstraps later
     let (_c_dir, c) = open_node(TempDir::new().unwrap(), &root_hex);
     let c_pk = c.ed_sk.verifying_key().to_bytes();
-    let cap_c = mint_cap(&root, c_pk, vec!["home.test".into()], vec![Right::Read, Right::Write]);
+    let cap_c = mint_cap(
+        &root,
+        c_pk,
+        vec!["home.test".into()],
+        vec![Right::Read, Right::Write],
+    );
     a.caps.upsert_grant(&cap_c).unwrap();
     c.caps.upsert_grant(&cap_a).unwrap();
     c.caps.upsert_grant(&cap_c).unwrap();
@@ -253,7 +309,9 @@ fn criterion_3_history_on_join() {
     let one = got.first().unwrap();
     let outcome = c.handle_inbound(one.clone()).unwrap();
     match outcome {
-        Inbound::Accepted { content: Some(c), .. } => {
+        Inbound::Accepted {
+            content: Some(c), ..
+        } => {
             assert_eq!(c.type_, "home.test");
         }
         other => panic!("expected decrypted accept on history replay, got {other:?}"),

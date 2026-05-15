@@ -3,9 +3,7 @@ use std::sync::Arc;
 use redb::{Database, ReadableDatabase, ReadableTable};
 use snafu::ResultExt;
 
-use crate::error::{
-    BeginTxnSnafu, CommitTxnSnafu, OpenTableSnafu, Result, StorageIoSnafu,
-};
+use crate::error::{BeginTxnSnafu, CommitTxnSnafu, OpenTableSnafu, Result, StorageIoSnafu};
 use crate::schema::EPOCH_KEYS;
 
 pub type EpochKey = [u8; 32];
@@ -41,7 +39,9 @@ impl EpochKeyStore {
         let t = read.open_table(EPOCH_KEYS).context(OpenTableSnafu)?;
         Ok(t.get(epoch).context(StorageIoSnafu)?.and_then(|v| {
             let bytes = v.value();
-            if bytes.len() != 32 { return None; }
+            if bytes.len() != 32 {
+                return None;
+            }
             let mut out = [0u8; 32];
             out.copy_from_slice(bytes);
             Some(out)
@@ -55,7 +55,9 @@ impl EpochKeyStore {
         for entry in t.iter().context(StorageIoSnafu)? {
             let (k, v) = entry.context(StorageIoSnafu)?;
             let bytes = v.value();
-            if bytes.len() != 32 { continue; }
+            if bytes.len() != 32 {
+                continue;
+            }
             let mut key = [0u8; 32];
             key.copy_from_slice(bytes);
             let epoch = k.value();

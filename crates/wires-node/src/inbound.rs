@@ -1,9 +1,9 @@
 use snafu::ResultExt;
 use wires_core::{
-    check_kind_matches, verify_chain_link, verify_envelope, CanonicalContent, MessageHash,
-    MessageKind, WireMessage,
+    CanonicalContent, MessageHash, MessageKind, WireMessage, check_kind_matches, verify_chain_link,
+    verify_envelope,
 };
-use wires_crypto::{decrypt_standard, open_sealed, X25519Secret};
+use wires_crypto::{X25519Secret, decrypt_standard, open_sealed};
 use wires_store::{CapTable, EpochKeyStore, TopicLog};
 
 use crate::error::{CoreSnafu, Result, StoreSnafu};
@@ -12,12 +12,18 @@ use crate::error::{CoreSnafu, Result, StoreSnafu};
 #[derive(Debug)]
 pub enum Inbound {
     /// Verified envelope, persisted, content decrypted.
-    Accepted { msg: WireMessage, content: Option<CanonicalContent> },
+    Accepted {
+        msg: WireMessage,
+        content: Option<CanonicalContent>,
+    },
     /// Verified envelope, persisted, but content not decryptable (no epoch key,
     /// or sealed to someone else, or content not well-formed).
     AcceptedOpaque { msg: WireMessage },
     /// Refused. Persisted nothing.
-    Rejected { reason: String, message_hash: MessageHash },
+    Rejected {
+        reason: String,
+        message_hash: MessageHash,
+    },
 }
 
 pub struct InboundCtx<'a> {
@@ -32,7 +38,10 @@ pub fn process(ctx: &InboundCtx, msg: WireMessage) -> Result<Inbound> {
     // 1. Envelope signature
     if verify_envelope(&msg).is_err() {
         let hash = msg.message_hash().unwrap_or_default();
-        return Ok(Inbound::Rejected { reason: "bad signature".into(), message_hash: hash });
+        return Ok(Inbound::Rejected {
+            reason: "bad signature".into(),
+            message_hash: hash,
+        });
     }
 
     // 2. Cap check (coarse): cap_id known and not revoked, AND issued to this sender pubkey.
@@ -76,19 +85,9 @@ pub fn process(ctx: &InboundCtx, msg: WireMessage) -> Result<Inbound> {
 
     // 6. Try to decrypt content based on kind
     let content = match &msg.kind {
-        MessageKind::Standard => {
-            match ctx.epoch_keys.get(msg.epoch).context(StoreSnafu)? {
-                Some(key) => decrypt_standard(
-                    &key, &msg.topic_id, &msg.sender, msg.seq, &msg.ciphertext, &aad,
-                )
-                .ok()
-                .and_then(|bytes| CanonicalContent::from_canonical_bytes(&bytes).ok()),
-                None => None,
-            }
-        }
-        MessageKind::SealedTo(recipient) if recipient == ctx.self_x25519_pk => {
-            open_sealed(
-                ctx.self_x25519_sk,
+        MessageKind::Standard => match ctx.epoch_keys.get(msg.epoch).context(StoreSnafu)? {
+            Some(key) => decrypt_standard(
+                &key,
                 &msg.topic_id,
                 &msg.sender,
                 msg.seq,
@@ -96,25 +95,39 @@ pub fn process(ctx: &InboundCtx, msg: WireMessage) -> Result<Inbound> {
                 &aad,
             )
             .ok()
-            .and_then(|bytes| CanonicalContent::from_canonical_bytes(&bytes).ok())
-        }
+            .and_then(|bytes| CanonicalContent::from_canonical_bytes(&bytes).ok()),
+            None => None,
+        },
+        MessageKind::SealedTo(recipient) if recipient == ctx.self_x25519_pk => open_sealed(
+            ctx.self_x25519_sk,
+            &msg.topic_id,
+            &msg.sender,
+            msg.seq,
+            &msg.ciphertext,
+            &aad,
+        )
+        .ok()
+        .and_then(|bytes| CanonicalContent::from_canonical_bytes(&bytes).ok()),
         MessageKind::SealedTo(_) => None, // not for us
         MessageKind::Public => CanonicalContent::from_canonical_bytes(&msg.ciphertext).ok(),
     };
 
     // 7. Reserved-type/mode enforcement once content is known
-    if let Some(c) = &content {
-        if check_kind_matches(&c.type_, &msg.kind).is_err() {
-            let hash = msg.message_hash().context(CoreSnafu)?;
-            return Ok(Inbound::Rejected {
-                reason: format!("reserved type {} used with wrong mode", c.type_),
-                message_hash: hash,
-            });
-        }
+    if let Some(c) = &content
+        && check_kind_matches(&c.type_, &msg.kind).is_err()
+    {
+        let hash = msg.message_hash().context(CoreSnafu)?;
+        return Ok(Inbound::Rejected {
+            reason: format!("reserved type {} used with wrong mode", c.type_),
+            message_hash: hash,
+        });
     }
 
     Ok(match content {
-        Some(c) => Inbound::Accepted { msg, content: Some(c) },
+        Some(c) => Inbound::Accepted {
+            msg,
+            content: Some(c),
+        },
         None => Inbound::AcceptedOpaque { msg },
     })
 }
@@ -122,7 +135,7 @@ pub fn process(ctx: &InboundCtx, msg: WireMessage) -> Result<Inbound> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::publish::{build_message, KeyingMaterial, PublishParams};
+    use crate::publish::{KeyingMaterial, PublishParams, build_message};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use std::sync::Arc;
@@ -130,7 +143,9 @@ mod tests {
     use wires_core::cap::Right;
     use wires_core::{CanonicalContent, Capability, MessageKind};
     use wires_crypto::{X25519Public, X25519Secret};
-    use wires_store::{open_caps, open_topic_keys, open_topic_log, CapTable, EpochKeyStore, TopicLog};
+    use wires_store::{
+        CapTable, EpochKeyStore, TopicLog, open_caps, open_topic_keys, open_topic_log,
+    };
 
     fn open_stores(tmp: &TempDir) -> (TopicLog, EpochKeyStore, CapTable) {
         let log = TopicLog::new(Arc::new(open_topic_log(tmp.path(), "x").unwrap()));
@@ -163,15 +178,24 @@ mod tests {
         let (log, keys, caps) = open_stores(&tmp);
         let (xsk, xpk) = make_xkeys();
         let ctx = InboundCtx {
-            topic_log: &log, epoch_keys: &keys, cap_table: &caps,
-            self_x25519_sk: &xsk, self_x25519_pk: &xpk,
+            topic_log: &log,
+            epoch_keys: &keys,
+            cap_table: &caps,
+            self_x25519_sk: &xsk,
+            self_x25519_pk: &xpk,
         };
 
         let sender_sk = SigningKey::generate(&mut OsRng);
         let params = PublishParams {
-            topic_id: [1u8; 32], sender_sk: &sender_sk, cap_id: [9u8; 16],
-            kind: MessageKind::Public, content: CanonicalContent::new("x", "y"),
-            epoch: 0, seq: 0, prev_hash: [0u8; 32], timestamp: 0,
+            topic_id: [1u8; 32],
+            sender_sk: &sender_sk,
+            cap_id: [9u8; 16],
+            kind: MessageKind::Public,
+            content: CanonicalContent::new("x", "y"),
+            epoch: 0,
+            seq: 0,
+            prev_hash: [0u8; 32],
+            timestamp: 0,
             keying: KeyingMaterial::Public,
         };
         let msg = build_message(&params).unwrap();
@@ -196,14 +220,22 @@ mod tests {
         caps.upsert_grant(&cap).unwrap();
 
         let ctx = InboundCtx {
-            topic_log: &log, epoch_keys: &keys, cap_table: &caps,
-            self_x25519_sk: &xsk, self_x25519_pk: &xpk,
+            topic_log: &log,
+            epoch_keys: &keys,
+            cap_table: &caps,
+            self_x25519_sk: &xsk,
+            self_x25519_pk: &xpk,
         };
         let params = PublishParams {
-            topic_id: [1u8; 32], sender_sk: &sender_sk, cap_id,
+            topic_id: [1u8; 32],
+            sender_sk: &sender_sk,
+            cap_id,
             kind: MessageKind::Public,
             content: CanonicalContent::new("__cap.revoke", "revoking cap deadbeef"),
-            epoch: 0, seq: 0, prev_hash: [0u8; 32], timestamp: 0,
+            epoch: 0,
+            seq: 0,
+            prev_hash: [0u8; 32],
+            timestamp: 0,
             keying: KeyingMaterial::Public,
         };
         let msg = build_message(&params).unwrap();
@@ -229,20 +261,30 @@ mod tests {
         keys.put(0, &epoch_key).unwrap();
 
         let ctx = InboundCtx {
-            topic_log: &log, epoch_keys: &keys, cap_table: &caps,
-            self_x25519_sk: &xsk, self_x25519_pk: &xpk,
+            topic_log: &log,
+            epoch_keys: &keys,
+            cap_table: &caps,
+            self_x25519_sk: &xsk,
+            self_x25519_pk: &xpk,
         };
         let params = PublishParams {
-            topic_id: [1u8; 32], sender_sk: &sender_sk, cap_id: cap.cap_id.0,
+            topic_id: [1u8; 32],
+            sender_sk: &sender_sk,
+            cap_id: cap.cap_id.0,
             kind: MessageKind::Standard,
             content: CanonicalContent::new("home.fridge.temp", "38F"),
-            epoch: 0, seq: 0, prev_hash: [0u8; 32], timestamp: 0,
+            epoch: 0,
+            seq: 0,
+            prev_hash: [0u8; 32],
+            timestamp: 0,
             keying: KeyingMaterial::StandardEpochKey(&epoch_key),
         };
         let msg = build_message(&params).unwrap();
         let result = process(&ctx, msg).unwrap();
         match result {
-            Inbound::Accepted { content, .. } => assert_eq!(content.unwrap().type_, "home.fridge.temp"),
+            Inbound::Accepted { content, .. } => {
+                assert_eq!(content.unwrap().type_, "home.fridge.temp")
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -261,15 +303,23 @@ mod tests {
         // NOTE: no epoch key installed
 
         let ctx = InboundCtx {
-            topic_log: &log, epoch_keys: &keys, cap_table: &caps,
-            self_x25519_sk: &xsk, self_x25519_pk: &xpk,
+            topic_log: &log,
+            epoch_keys: &keys,
+            cap_table: &caps,
+            self_x25519_sk: &xsk,
+            self_x25519_pk: &xpk,
         };
         let epoch_key = [42u8; 32]; // sender used this; receiver doesn't have it
         let params = PublishParams {
-            topic_id: [1u8; 32], sender_sk: &sender_sk, cap_id: cap.cap_id.0,
+            topic_id: [1u8; 32],
+            sender_sk: &sender_sk,
+            cap_id: cap.cap_id.0,
             kind: MessageKind::Standard,
             content: CanonicalContent::new("home.fridge.temp", "38F"),
-            epoch: 0, seq: 0, prev_hash: [0u8; 32], timestamp: 0,
+            epoch: 0,
+            seq: 0,
+            prev_hash: [0u8; 32],
+            timestamp: 0,
             keying: KeyingMaterial::StandardEpochKey(&epoch_key),
         };
         let msg = build_message(&params).unwrap();

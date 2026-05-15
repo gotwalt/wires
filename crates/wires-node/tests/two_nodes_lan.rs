@@ -6,7 +6,7 @@ use rand_core::OsRng;
 use tempfile::TempDir;
 use wires_core::cap::Right;
 use wires_core::{CanonicalContent, Capability};
-use wires_node::{drive_sync_pass, Inbound, InboundCtx, Node, NodeConfig};
+use wires_node::{Inbound, InboundCtx, Node, NodeConfig, drive_sync_pass};
 
 fn open_node(tmp: &TempDir, root_hex: &str) -> Node {
     Node::open(NodeConfig {
@@ -59,8 +59,14 @@ fn publish_replicates_via_handle_inbound() {
 
     let r0 = b.handle_inbound(m0.clone()).unwrap();
     let r1 = b.handle_inbound(m1.clone()).unwrap();
-    assert!(matches!(r0, Inbound::Accepted { .. } | Inbound::AcceptedOpaque { .. }));
-    assert!(matches!(r1, Inbound::Accepted { .. } | Inbound::AcceptedOpaque { .. }));
+    assert!(matches!(
+        r0,
+        Inbound::Accepted { .. } | Inbound::AcceptedOpaque { .. }
+    ));
+    assert!(matches!(
+        r1,
+        Inbound::Accepted { .. } | Inbound::AcceptedOpaque { .. }
+    ));
 
     let log = b.logs.get_or_open(&topic).unwrap();
     let got = log.read_after(&a_pk, None, 10).unwrap();
@@ -147,7 +153,11 @@ fn replay_only_pulls_messages_we_dont_have() {
     let mut msgs = Vec::new();
     for i in 0..5 {
         let m = a
-            .publish_standard(topic, cap_id, CanonicalContent::new("home.test", format!("m{i}")))
+            .publish_standard(
+                topic,
+                cap_id,
+                CanonicalContent::new("home.test", format!("m{i}")),
+            )
             .unwrap();
         msgs.push(m);
     }

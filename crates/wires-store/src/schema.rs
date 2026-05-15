@@ -27,3 +27,12 @@ pub const EPOCH_KEYS: TableDefinition<u32, &[u8]> = TableDefinition::new("epoch_
 
 /// Meta key/value (e.g. topic name).
 pub const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
+
+/// Per-tenant FIFO index over ingested messages. Key = u64 BE ingest_seq.
+/// Value = 32 (topic_id) || 32 (sender) || 8 (seq BE) || 4 (bytes BE) = 76 bytes.
+pub const INGEST_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ingest_index");
+
+/// Single-entry table holding (next_ingest_seq u64 BE) || (total_bytes u64 BE) = 16 bytes.
+/// Keyed by a fixed marker byte (b"m"). Stored separately to make total-bytes
+/// reads/writes cheap.
+pub const INGEST_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ingest_meta");
