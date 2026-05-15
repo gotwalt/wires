@@ -3,6 +3,8 @@ pub mod error;
 pub mod inbound;
 pub mod net_glue;
 pub mod node;
+pub mod pair;
+pub mod pair_pending;
 pub mod publish;
 pub mod runtime;
 pub mod storage;
@@ -13,6 +15,10 @@ pub use error::{NodeError, Result};
 pub use inbound::{Inbound, InboundCtx, process as process_inbound};
 pub use net_glue::NetGlue;
 pub use node::{DecryptedEvent, Node};
+pub use pair::{
+    InstallOutcome, NodePairHandler, PairListenArgs, PairListenStarted, PairOutcome, install_grant,
+    pair_listen,
+};
 pub use publish::{
     KeyingMaterial, PublishParams, build_message, current_epoch_key, next_seq_and_prev_hash,
 };

@@ -5,7 +5,7 @@ use serde::Deserialize;
 use snafu::ResultExt;
 
 use crate::error::{DiscoveryFetchSnafu, Result};
-use crate::invite::PeerHint;
+use crate::peer_hint::PeerHint;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiscoveryEndpoint {

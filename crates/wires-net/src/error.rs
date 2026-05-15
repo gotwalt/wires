@@ -71,6 +71,56 @@ pub enum NetError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Pair request bounds: {what} exceeds limit {limit}, at {location}"))]
+    PairBounds {
+        what: &'static str,
+        limit: usize,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Pair signature verify failed, at {location}"))]
+    PairSignature {
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Pair request unsupported version {version}, at {location}"))]
+    PairUnsupportedVersion {
+        version: u8,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Pair request invalid characters in {field}, at {location}"))]
+    PairInvalidChars {
+        field: &'static str,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Pair sealed-box failure, at {location}"))]
+    PairCrypto {
+        #[snafu(source(from(wires_crypto::error::CryptoError, Box::new)))]
+        source: Box<wires_crypto::error::CryptoError>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Pair dial failed: {message}, at {location}"))]
+    PairDial {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Pair stream error: {message}, at {location}"))]
+    PairStream {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Pair rejected by responder: {code:?}: {message}, at {location}"))]
+    PairRejected {
+        code: crate::pair::PairRejectCode,
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = NetError> = core::result::Result<T, E>;

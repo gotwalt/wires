@@ -14,11 +14,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Initialize identity and config in the data directory
+    /// Initialize identity (Ed25519 + X25519) in the data directory.
     Init {
-        /// Root pubkey hex. Defaults to a freshly generated local root (for testing).
+        /// Generate a fresh local root key in addition to identity. Use this for
+        /// the household operator (Alice). Without it, `init` writes identity
+        /// only and the agent has no household pinning until paired.
         #[arg(long)]
-        root: Option<String>,
+        new_root: bool,
     },
     /// Print identity, derived topic ids, and config summary
     Status,
@@ -43,24 +45,43 @@ enum Cmd {
         #[arg(long)]
         tail: bool,
     },
-    /// Mint a new capability for an agent
-    Invite {
-        #[arg(long)]
-        agent_pubkey: String,
-        #[arg(long, value_delimiter = ',')]
-        topics: Vec<String>,
-        #[arg(long, value_delimiter = ',', default_values_t = vec!["read".to_string(), "write".to_string()])]
-        rights: Vec<String>,
-    },
     /// Revoke a capability by id
     Revoke { cap_id: String },
     /// Tenant control: pair with a host, register topics, view status.
     #[command(subcommand)]
     Host(HostCmd),
-    /// Join an invite token: install the cap and store the inviter's host info.
-    Join {
-        /// Base64-encoded InviteToken (output of `wires invite`).
+    /// Start a pair-listen window; print a PairRequest token; wait for a
+    /// pair-approve dial.
+    PairListen {
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        description: String,
+        /// Topic-name + rights, e.g. "home.notes:read+write". Repeatable.
+        #[arg(long = "request", required = true)]
+        request: Vec<String>,
+        /// Pair window TTL. Examples: "5m", "60s", "1h".
+        #[arg(long, default_value = "5m")]
+        ttl: humantime::Duration,
+        #[arg(long)]
+        qr: bool,
+    },
+    /// Decode and approve a PairRequest from an agent.
+    PairApprove {
+        /// Base64 PairRequest token.
         token: String,
+        /// Narrow per-topic rights, e.g. `--scope home.notes:read`. Repeatable.
+        #[arg(long = "scope")]
+        scope: Vec<String>,
+        /// Narrow to a subset of requested topic names. Comma-separated.
+        #[arg(long = "topics", value_delimiter = ',')]
+        topics: Option<Vec<String>>,
+        /// Omit host info from the grant.
+        #[arg(long)]
+        no_host: bool,
+        /// Skip the interactive prompt.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -98,7 +119,7 @@ async fn main() -> std::process::ExitCode {
         .unwrap_or_else(|| dirs_data_dir().unwrap_or_else(|| std::path::PathBuf::from(".wires")));
 
     let result = match cli.command {
-        Cmd::Init { root } => cmd::init::run(&data_dir, root).await,
+        Cmd::Init { new_root } => cmd::init::run(&data_dir, new_root).await,
         Cmd::Status => cmd::status::run(&data_dir).await,
         Cmd::Topic(TopicCmd::Create { name }) => cmd::topic::create(&data_dir, &name).await,
         Cmd::Publish {
@@ -109,11 +130,6 @@ async fn main() -> std::process::ExitCode {
             data,
         } => cmd::publish::run(&data_dir, &topic, &cap, &r#type, &text, data.as_deref()).await,
         Cmd::Cat { topic, tail } => cmd::cat::run(&data_dir, &topic, tail).await,
-        Cmd::Invite {
-            agent_pubkey,
-            topics,
-            rights,
-        } => cmd::invite::run(&data_dir, &agent_pubkey, &topics, &rights).await,
         Cmd::Revoke { cap_id } => cmd::revoke::run(&data_dir, &cap_id).await,
         Cmd::Host(HostCmd::Pair { discovery_url }) => {
             cmd::host::pair(&data_dir, &discovery_url).await
@@ -125,7 +141,20 @@ async fn main() -> std::process::ExitCode {
             cmd::host::topic_unregister(&data_dir, &topic).await
         }
         Cmd::Host(HostCmd::Status) => cmd::host::status(&data_dir).await,
-        Cmd::Join { token } => cmd::join::run(&data_dir, &token).await,
+        Cmd::PairListen {
+            role,
+            description,
+            request,
+            ttl,
+            qr,
+        } => cmd::pair_listen::run(&data_dir, role, description, request, ttl.into(), qr).await,
+        Cmd::PairApprove {
+            token,
+            scope,
+            topics,
+            no_host,
+            yes,
+        } => cmd::pair_approve::run(&data_dir, &token, scope, topics, no_host, yes).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
