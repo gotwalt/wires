@@ -36,7 +36,7 @@ pub struct TenantRecord {
     pub retention_budget_bytes: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum TopicRegisterOutcome {
     Inserted,
     AlreadyOwned,
