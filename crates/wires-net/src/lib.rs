@@ -20,8 +20,9 @@ pub use replay::{
     ALPN, HwmEntry, ReplayClient, ReplayProtocol, ReplayRequest, ReplayResponseFrame, ReplaySource,
 };
 pub use pair::{
-    ALPN as PAIR_ALPN, MAX_FRAME_LEN as PAIR_MAX_FRAME_LEN, PairDial, PairManifest, PairRequest,
-    RequestedScope,
+    ALPN as PAIR_ALPN, HostInfo as PairHostInfo, MAX_FRAME_LEN as PAIR_MAX_FRAME_LEN, PairDial,
+    PairGrant, PairGrantEnvelope, PairManifest, PairRequest, RequestedScope, TopicEpochKey,
+    TopicNameEntry,
 };
 pub use tenant::{
     ALPN as TENANT_ALPN, TenantClient, TenantErrorCode, TenantErrorResponse, TenantHandler,

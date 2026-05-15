@@ -95,6 +95,13 @@ pub enum NetError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Pair sealed-box failure, at {location}"))]
+    PairCrypto {
+        #[snafu(source(from(wires_crypto::error::CryptoError, Box::new)))]
+        source: Box<wires_crypto::error::CryptoError>,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = NetError> = core::result::Result<T, E>;
