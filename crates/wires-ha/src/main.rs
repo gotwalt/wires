@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use iroh::{Endpoint, SecretKey, endpoint::presets};
+use iroh::{Endpoint, SecretKey};
 use wires_net::{ALPN, cap_id_from_hex, endpoint_id_from_hex, load_or_create_secret, unix_now_ms};
 use wires_node::{NetGlue, Node, NodeConfig, load_root_signing_key, resolve_topic};
 
@@ -69,12 +69,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let secret = load_or_create_secret(&args.data_dir.join("iroh.secret"))?;
-    let iroh_sk = SecretKey::from_bytes(&secret);
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(iroh_sk)
-        .alpns(vec![ALPN.to_vec()])
-        .bind()
-        .await?;
+    let endpoint = wires_net::bind_lan(
+        SecretKey::from_bytes(&secret),
+        vec![ALPN.to_vec()],
+    )
+    .await?;
     let endpoint_id = endpoint.id();
     tracing::info!(%endpoint_id, "wires-ha endpoint bound");
 
