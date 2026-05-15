@@ -14,11 +14,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Initialize identity and config in the data directory
+    /// Initialize identity (Ed25519 + X25519) in the data directory.
     Init {
-        /// Root pubkey hex. Defaults to a freshly generated local root (for testing).
+        /// Generate a fresh local root key in addition to identity. Use this for
+        /// the household operator (Alice). Without it, `init` writes identity
+        /// only and the agent has no household pinning until paired.
         #[arg(long)]
-        root: Option<String>,
+        new_root: bool,
     },
     /// Print identity, derived topic ids, and config summary
     Status,
@@ -98,7 +100,7 @@ async fn main() -> std::process::ExitCode {
         .unwrap_or_else(|| dirs_data_dir().unwrap_or_else(|| std::path::PathBuf::from(".wires")));
 
     let result = match cli.command {
-        Cmd::Init { root } => cmd::init::run(&data_dir, root).await,
+        Cmd::Init { new_root } => cmd::init::run(&data_dir, new_root).await,
         Cmd::Status => cmd::status::run(&data_dir).await,
         Cmd::Topic(TopicCmd::Create { name }) => cmd::topic::create(&data_dir, &name).await,
         Cmd::Publish {
