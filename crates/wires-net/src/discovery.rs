@@ -28,11 +28,12 @@ pub struct DiscoveryResponse {
 pub async fn fetch_endpoints(url: &str) -> Result<Vec<PeerHint>> {
     let resp = reqwest::get(url)
         .await
-        .with_context(|_| DiscoveryFetchSnafu { url: url.to_string() })?;
-    let payload: DiscoveryResponse = resp
-        .json()
-        .await
-        .with_context(|_| DiscoveryFetchSnafu { url: url.to_string() })?;
+        .with_context(|_| DiscoveryFetchSnafu {
+            url: url.to_string(),
+        })?;
+    let payload: DiscoveryResponse = resp.json().await.with_context(|_| DiscoveryFetchSnafu {
+        url: url.to_string(),
+    })?;
     Ok(payload
         .endpoints
         .into_iter()
@@ -68,7 +69,9 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
         let url = format!("http://{addr}/v1/bootstrap");
         let hints = fetch_endpoints(&url).await.unwrap();
         assert_eq!(hints.len(), 1);

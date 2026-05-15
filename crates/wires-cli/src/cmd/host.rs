@@ -76,10 +76,7 @@ pub async fn pair(data_dir: &Path, discovery_url: &str) -> Result<(), Box<dyn st
 
 async fn open_paired_client(
     data_dir: &Path,
-) -> Result<
-    (TenantClient, iroh::EndpointId, [u8; 32], SigningKey),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(TenantClient, iroh::EndpointId, [u8; 32], SigningKey), Box<dyn std::error::Error>> {
     let cfg: NodeConfig = toml::from_str(&std::fs::read_to_string(data_dir.join("config.toml"))?)?;
     let host = cfg
         .host
@@ -103,7 +100,11 @@ async fn open_paired_client(
     let host_eid = iroh::EndpointId::from_bytes(&host_eid_bytes)
         .map_err(|e| format!("bad host endpoint id: {e}"))?;
     let root_bytes = std::fs::read(data_dir.join("root.ed25519"))?;
-    let root = SigningKey::from_bytes(&root_bytes.try_into().map_err(|_| "root.ed25519 not 32 bytes")?);
+    let root = SigningKey::from_bytes(
+        &root_bytes
+            .try_into()
+            .map_err(|_| "root.ed25519 not 32 bytes")?,
+    );
     let secret = load_or_create_secret(&data_dir.join("iroh.secret"))?;
     let ep = Endpoint::builder(presets::N0)
         .secret_key(SecretKey::from_bytes(&secret))
@@ -137,7 +138,10 @@ fn parse_topic(data_dir: &Path, topic: &str) -> Result<[u8; 32], Box<dyn std::er
 
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 pub async fn topic_register(
@@ -154,7 +158,9 @@ pub async fn topic_register(
             println!("Registered topic {}", hex::encode(r.topic_id));
             Ok(())
         }
-        TenantResponse::Error(e) => Err(format!("host rejected: {:?} — {}", e.code, e.message).into()),
+        TenantResponse::Error(e) => {
+            Err(format!("host rejected: {:?} — {}", e.code, e.message).into())
+        }
         other => Err(format!("unexpected response: {other:?}").into()),
     }
 }
@@ -173,7 +179,9 @@ pub async fn topic_unregister(
             println!("Unregistered topic {}", hex::encode(r.topic_id));
             Ok(())
         }
-        TenantResponse::Error(e) => Err(format!("host rejected: {:?} — {}", e.code, e.message).into()),
+        TenantResponse::Error(e) => {
+            Err(format!("host rejected: {:?} — {}", e.code, e.message).into())
+        }
         other => Err(format!("unexpected response: {other:?}").into()),
     }
 }
@@ -191,11 +199,16 @@ pub async fn status(data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
             println!("  bytes_stored          : {}", s.bytes_stored);
             println!("  retention_budget      : {}", s.retention_budget_bytes);
             println!("  oldest_retained_at    : {}", s.oldest_retained_at);
-            println!("  write_rate_limit_per_sec : {}", s.write_rate_limit_per_sec);
+            println!(
+                "  write_rate_limit_per_sec : {}",
+                s.write_rate_limit_per_sec
+            );
             println!("  status                : {:?}", s.status);
             Ok(())
         }
-        TenantResponse::Error(e) => Err(format!("host rejected: {:?} — {}", e.code, e.message).into()),
+        TenantResponse::Error(e) => {
+            Err(format!("host rejected: {:?} — {}", e.code, e.message).into())
+        }
         other => Err(format!("unexpected response: {other:?}").into()),
     }
 }

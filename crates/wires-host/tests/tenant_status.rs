@@ -123,7 +123,10 @@ fn handle_status_returns_real_values() {
         TenantResponse::Status(s) => {
             // handle_register auto-creates the caps topic, so topic_count includes
             // the caps topic (1) plus our explicit topic (1) = 2.
-            assert_eq!(s.topic_count, 2, "expected 2 registered topics (caps + explicit)");
+            assert_eq!(
+                s.topic_count, 2,
+                "expected 2 registered topics (caps + explicit)"
+            );
             assert!(
                 s.bytes_stored > 0,
                 "expected bytes_stored > 0, got {}",

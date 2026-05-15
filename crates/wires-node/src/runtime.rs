@@ -103,15 +103,15 @@ impl NodeRuntime {
     /// Errors with a configuration error if no host is set or if no usable
     /// peer hint is reachable.
     pub async fn replay_from_host(&self, topic_id: [u8; 32]) -> Result<usize> {
-        let host = self
-            .node
-            .config
-            .host
-            .as_ref()
-            .ok_or_else(|| crate::error::NodeError::Config {
-                message: "replay_from_host: no host configured".into(),
-                location: snafu::location!(),
-            })?;
+        let host =
+            self.node
+                .config
+                .host
+                .as_ref()
+                .ok_or_else(|| crate::error::NodeError::Config {
+                    message: "replay_from_host: no host configured".into(),
+                    location: snafu::location!(),
+                })?;
         let peer = wires_net::first_reachable_with_discovery(
             &self.endpoint,
             &host.peer_hints,
@@ -124,7 +124,9 @@ impl NodeRuntime {
             message: "replay_from_host: no reachable peer hint".into(),
             location: snafu::location!(),
         })?;
-        self.glue.replay_from(Arc::clone(&self.node), topic_id, peer).await
+        self.glue
+            .replay_from(Arc::clone(&self.node), topic_id, peer)
+            .await
     }
 }
 
@@ -158,7 +160,10 @@ mod tests {
         let topic = [9u8; 32];
         let err = rt.replay_from_host(topic).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("no host configured"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("no host configured"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[tokio::test]
