@@ -94,8 +94,6 @@ pub async fn first_reachable_with_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[allow(unused_imports)]
-    use crate::invite::PeerHint;
     use iroh::SecretKey;
     use iroh::endpoint::presets;
 
@@ -166,7 +164,9 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
         let url = format!("http://{addr}/v1/bootstrap");
 
         // Caller endpoint with no usable peer_hints.
