@@ -38,9 +38,7 @@ pub async fn bind_lan(secret: SecretKey, alpns: Vec<Vec<u8>>) -> Result<Endpoint
         let mdns = MdnsAddressLookup::builder()
             .build(ep.id())
             .context(MdnsSetupSnafu)?;
-        ep.address_lookup()
-            .context(AddressLookupSnafu)?
-            .add(mdns);
+        ep.address_lookup().context(AddressLookupSnafu)?.add(mdns);
     }
 
     Ok(ep)
