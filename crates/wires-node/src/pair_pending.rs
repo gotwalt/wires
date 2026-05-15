@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::atomic_write::atomic_write;
+
 pub const FILE_NAME: &str = "pair_pending.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,7 +27,9 @@ pub fn path(data_dir: &Path) -> PathBuf {
 
 pub fn save(data_dir: &Path, p: &PairPending) -> std::io::Result<()> {
     let s = serde_json::to_string_pretty(p).expect("PairPending serializes");
-    write_secret(&path(data_dir), s.as_bytes())
+    // mode 0600 because the file carries the ephemeral x25519 secret used to
+    // open the inbound PairGrant.
+    atomic_write(&path(data_dir), s.as_bytes(), Some(0o600))
 }
 
 pub fn load(data_dir: &Path) -> std::io::Result<Option<PairPending>> {
@@ -45,24 +49,6 @@ pub fn delete(data_dir: &Path) -> std::io::Result<()> {
         std::fs::remove_file(p)?;
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn write_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(bytes)
-}
-
-#[cfg(not(unix))]
-fn write_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)
 }
 
 #[cfg(test)]
