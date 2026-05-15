@@ -148,8 +148,8 @@ pub struct PairGrantEnvelope {
 **Crypto choices.**
 
 - **Sealed to Bob's ephemeral X25519** via `wires-crypto::sealed`. Forward-secret — Bob discards the ephemeral secret as soon as pairing closes; stored ciphertext is then undecryptable by any party.
-- **Outer signature by the root key.** Bob has no agent pubkey to trust yet; he learns the root pubkey from this envelope. The signature → claimed root pubkey link gives a verification chain: outer signature checks against `envelope.root_pubkey`; that pubkey matches `inner.root_pubkey` and `cap.signed_by`; `cap.agent_pubkey` matches Bob's own identity. TOFU on the root pubkey is the trust act; the QR handoff and nonce binding give freshness.
-- **Nonce binding.** Bob refuses any grant whose inner `nonce` ≠ his pending request's nonce. Closes replay (an old grant cannot bootstrap a new Bob-instance) and substitution (a grant for a different agent cannot be redirected because `cap.agent_pubkey` is signed inside).
+- **Outer signature by the root key.** Bob has no agent pubkey to trust yet; he learns the root pubkey from this envelope. The signature → claimed root pubkey link gives a verification chain: outer signature checks against `envelope.root_pubkey`; that pubkey matches `inner.root_pubkey`; `cap.verify(&inner.root_pubkey)` succeeds (i.e. the cap was actually signed by that root); `cap.agent` matches Bob's ed25519 identity. TOFU on the root pubkey is the trust act; the QR handoff and nonce binding give freshness.
+- **Nonce binding.** Bob refuses any grant whose inner `nonce` ≠ his pending request's nonce. Closes replay (an old grant cannot bootstrap a new Bob-instance) and substitution (a grant for a different agent cannot be redirected because `cap.agent` is signed inside).
 - **No AAD.** This is sealed-box authenticated encryption plus an outer ed25519 signature — no separate AAD construction.
 
 **Validation order on Bob's receive side:**
@@ -159,7 +159,7 @@ pub struct PairGrantEnvelope {
 3. Parse inner `PairGrant`. Check `inner.root_pubkey == envelope.root_pubkey`.
 4. Check `inner.nonce == pending_nonce` (from `pair_pending.json`).
 5. Check `inner.issued_at` is within the still-valid request window (≤ `request.expires`).
-6. Verify the `Capability`: `cap.signed_by == inner.root_pubkey`, signature valid, `cap.agent_pubkey == self.agent_pubkey`.
+6. Verify the `Capability`: `cap.verify(&inner.root_pubkey)` returns `Ok` (signature valid under that root) and `cap.agent == self.agent_pubkey` (the ed25519 identity on disk).
 7. Install everything (see §6 for order and idempotence). Delete `pair_pending.json`.
 8. Send `PairFrame::Ack` so Alice's CLI knows pairing succeeded.
 
@@ -296,7 +296,7 @@ Install order on Bob's side: write config (root pubkey + host) → topic names �
 2. `config.toml.root_pubkey_hex` is set ⟺ Bob has been successfully paired at least once.
 3. `caps.redb` contains a cap for a topic ⟺ Bob received a valid `Capability` for that topic signed by `root_pubkey_hex`.
 4. `keys_<topic>.redb` contains keys ⟹ `caps.redb` contains a cap referencing that topic. (Bob doesn't hoard epoch keys he can't authorize.)
-5. Every installed cap's `agent_pubkey` equals the local `identity.ed25519` pubkey. Sanity-check at install; refuses caps targeted at someone else.
+5. Every installed cap's `agent` field equals the local `identity.ed25519` pubkey. Sanity-check at install; refuses caps targeted at someone else.
 
 ## 7. Error handling
 
@@ -324,7 +324,7 @@ Variants:
 | outer ed25519 verify failed | `SignatureInvalid` |
 | sealed-box decrypt failed | `SealUndecryptable` |
 | `inner.root_pubkey != envelope.root_pubkey` | `RootMismatch` |
-| cap signed-by mismatch / cap agent_pubkey ≠ self / cap signature invalid / any inner data check | `CapInvalid` |
+| `cap.verify(&inner.root_pubkey)` fails / cap.agent ≠ self / any inner data check | `CapInvalid` |
 | `topic_keys` references a `topic_id` not in `topic_names` | `CapInvalid` |
 | handler invoked after successful install in the same window | `AlreadyPaired` |
 | redb or file write error during install | `InternalError` |
