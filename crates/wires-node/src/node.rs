@@ -32,6 +32,12 @@ pub struct Node {
     pub caps: Arc<CapTable>,
     keys_by_topic: Mutex<HashMap<[u8; 32], Arc<EpochKeyStore>>>,
     pub events_tx: broadcast::Sender<DecryptedEvent>,
+    /// Serializes the read-build-append sequence in `publish_standard`. Without
+    /// it, two concurrent publishes on the same (topic, sender) would both read
+    /// the same hwm seq, encrypt under the same deterministic ChaCha20 nonce
+    /// (derived from topic_id || sender || seq), and only fail at `log.append`
+    /// — long after the AEAD key was reused. See substrate spec invariant #5.
+    publish_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +73,7 @@ impl Node {
             caps,
             keys_by_topic: Mutex::new(HashMap::new()),
             events_tx,
+            publish_lock: Mutex::new(()),
         })
     }
 
@@ -90,6 +97,7 @@ impl Node {
         cap_id: [u8; 16],
         content: CanonicalContent,
     ) -> Result<WireMessage> {
+        let _guard = self.publish_lock.lock();
         let log = self.logs.get_or_open(&topic_id)?;
         let keys = self.epoch_keys_for(&topic_id)?;
         let sender_pk = self.ed_sk.verifying_key().to_bytes();
@@ -248,5 +256,50 @@ mod tests {
         node.install_epoch_key([1u8; 32], 0, [7u8; 32]).unwrap();
         let keys = node.epoch_keys_for(&[1u8; 32]).unwrap();
         assert_eq!(keys.get(0).unwrap().unwrap(), [7u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_publish_assigns_unique_seqs() {
+        // Regression test for the publish race that would produce two messages
+        // at the same seq under the same deterministic ChaCha20 nonce.
+        let tmp = TempDir::new().unwrap();
+        let root = SigningKey::generate(&mut OsRng);
+        let root_hex = hex::encode(root.verifying_key().to_bytes());
+        let node = Arc::new(open_node(&tmp, root_hex));
+
+        let sender_pk = node.ed_sk.verifying_key().to_bytes();
+        let mut cap = Capability::new_unsigned(
+            sender_pk,
+            vec!["home.test".into()],
+            vec![Right::Read, Right::Write],
+            0,
+            None,
+        );
+        cap.sign(&root).unwrap();
+        let cap_id = cap.cap_id.0;
+        node.caps.upsert_grant(&cap).unwrap();
+
+        let topic_id = [42u8; 32];
+        node.install_epoch_key(topic_id, 0, [9u8; 32]).unwrap();
+
+        let n: u64 = 32;
+        let mut handles = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let node = Arc::clone(&node);
+            handles.push(tokio::task::spawn_blocking(move || {
+                node.publish_standard(
+                    topic_id,
+                    cap_id,
+                    CanonicalContent::new("home.test", format!("msg-{i}")),
+                )
+                .unwrap()
+            }));
+        }
+        let mut seqs: Vec<u64> = Vec::new();
+        for h in handles {
+            seqs.push(h.await.unwrap().seq);
+        }
+        seqs.sort();
+        assert_eq!(seqs, (0..n).collect::<Vec<_>>());
     }
 }
