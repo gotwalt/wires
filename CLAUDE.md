@@ -71,11 +71,13 @@ These are easy to break by accident and break the security model when broken:
 
 ```bash
 cargo build                         # all crates
-cargo test --workspace              # ~139 unit/integration tests
-cargo test --workspace -- --ignored # 7 acceptance scenarios (slower)
+cargo test --workspace              # ~154 unit/integration tests
+cargo test --workspace -- --ignored # 8 acceptance scenarios (slower)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all
 ```
+
+**Note on cold-start flakiness:** The integration tests bring real iroh endpoints online via the N0 preset. The first run after a cold machine can take 5–30s as pkarr/DNS lookups warm up — tests defend with 10s `endpoint.online()` timeouts and `MemoryLookup` cross-registration where possible. Transient failures on the first run that pass on retry are usually iroh warm-up, not your code.
 
 Binaries land at `target/debug/wires`, `target/debug/wires-host`, and `target/debug/wires-ha`.
 
