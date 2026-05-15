@@ -11,7 +11,7 @@ Prototype. Two slices have landed on `main`:
 
 A Home Assistant ingestion daemon (`wires-ha`) also exists as a working example of an agent that participates in gossip + replay.
 
-What does **not** exist yet: iOS companion (still a stock SwiftUI scaffold — the spec/plan need revision against the post-hosted-service architecture), REST/MCP surface, `__cap.*` gossip propagation, `__topic.epoch_advance` distribution, any CLI client for the tenant protocol. See "Out of scope" in each design spec.
+What does **not** exist yet: iOS companion (still a stock SwiftUI scaffold — the spec/plan need revision against the post-hosted-service architecture), REST/MCP surface, `__cap.*` gossip propagation, `__topic.epoch_advance` distribution. See "Out of scope" in each design spec.
 
 ## Authoritative docs
 
@@ -31,9 +31,9 @@ Strict bottom-up layering — a crate may only depend on crates above it in this
 | `wires-core` | Pure types: `WireMessage`, `MessageKind` (Standard/SealedTo/Public), `Capability`, content schema, envelope sign/verify, hash-chain link math. No I/O, no async. |
 | `wires-crypto` | AEAD primitives: `standard.rs` (ChaCha20-Poly1305 with BLAKE3-derived nonces), `sealed.rs` (x25519 sealed-box), `public.rs` (plaintext-with-AAD), `keywrap.rs`. |
 | `wires-store` | redb-backed persistence: per-publisher hash-chained `topic_log` (now with `bytes_stored` and `delete` for eviction), `cap_table`, `epoch_keys`, and `ingest_index` for FIFO eviction across a tenant's topics. |
-| `wires-net` | iroh transport: `gossip.rs` wraps `iroh-gossip`, `replay.rs` is a custom QUIC protocol on ALPN `/wires/replay/0`, `tenant.rs` is the new `/wires/tenant/0` control-plane (request/response types, `TenantClient`, `TenantProtocol` server-side handler, `TenantHandler` trait), `framing.rs` is the shared length-prefixed JSON helper, `invite.rs` is the new `InviteToken` with `peer_hints` + `service_discovery_url`, `peer_hint::first_reachable` is the join-time fallback iterator. |
-| `wires-node` | Agent runtime. `Node::open` opens identity + storage; `publish_standard` / `handle_inbound` are the main entry points. `NetGlue` wires gossip + replay into a `Node`. |
-| `wires-cli` | `wires` binary — clap-based human/agent CLI. Does **not** yet speak the tenant control protocol. |
+| `wires-net` | iroh transport: `gossip.rs` wraps `iroh-gossip` (with `GossipNode::new_without_router` so callers can multiplex ALPNs on one Router), `replay.rs` is a custom QUIC protocol on ALPN `/wires/replay/0`, `tenant.rs` is the `/wires/tenant/0` control-plane (request/response types, `TenantClient` with `register_tenant` / `register_topic` / `unregister_topic` / `tenant_status` convenience helpers, `TenantProtocol` server-side handler, `TenantHandler` trait), `framing.rs` is the shared length-prefixed JSON helper, `invite.rs` is the `InviteToken` with `peer_hints` + `service_discovery_url`, `discovery.rs` is the HTTPS `/v1/bootstrap` client, `peer_hint::first_reachable_with_discovery` is the join-time iterator with discovery-URL fallback. |
+| `wires-node` | Agent runtime. `Node::open` opens identity + storage (synchronous, no I/O on the network). `NodeRuntime` is the async wrapper: owns an iroh `Endpoint`, gossip + replay glue, per-topic gossip handles, and exposes `join_topic` / `publish_and_broadcast` / `replay_from_host`. `NetGlue` is the lower-level transport-wiring helper. |
+| `wires-cli` | `wires` binary — clap-based human/agent CLI. Speaks the tenant control protocol (`wires host pair / topic-register / topic-unregister / status`), emits InviteTokens (`wires invite`), accepts them (`wires join <token>`), and auto-dials gossip on `publish` / `cat`. |
 | `wires-host` | `lib + bin`. The binary is a multi-tenant blind relay; the library houses `tenant_registry` (tenants/topic_index/nonces), `per_tenant_logs`, `retention`, `routing`, `replay_source`, `http_discovery` (axum `/v1/bootstrap`), and `error`. Still has no root key, no epoch keys, no caps; only persists ciphertext after a signature check, routed by topic→tenant lookup. |
 | `wires-ha` | `wires-ha` binary — Home Assistant ingestion daemon. Subscribes to a HA WebSocket, publishes `state_changed` events onto a configured topic, participates in gossip + replay like any other agent. Example of a non-CLI agent. |
 
@@ -71,11 +71,13 @@ These are easy to break by accident and break the security model when broken:
 
 ```bash
 cargo build                         # all crates
-cargo test --workspace              # ~139 unit/integration tests
-cargo test --workspace -- --ignored # 7 acceptance scenarios (slower)
+cargo test --workspace              # ~154 unit/integration tests
+cargo test --workspace -- --ignored # 8 acceptance scenarios (slower)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all
 ```
+
+**Note on cold-start flakiness:** The integration tests bring real iroh endpoints online via the N0 preset. The first run after a cold machine can take 5–30s as pkarr/DNS lookups warm up — tests defend with 10s `endpoint.online()` timeouts and `MemoryLookup` cross-registration where possible. Transient failures on the first run that pass on retry are usually iroh warm-up, not your code.
 
 Binaries land at `target/debug/wires`, `target/debug/wires-host`, and `target/debug/wires-ha`.
 
@@ -84,9 +86,10 @@ Binaries land at `target/debug/wires`, `target/debug/wires-host`, and `target/de
 ### CLI agent (default `~/.wires/`)
 
 ```
-config.toml             NodeConfig (root_pubkey_hex, data_dir, bootstrap_peers)
+config.toml             NodeConfig (root_pubkey_hex, data_dir, optional host)
 identity.ed25519        agent signing key (32 bytes raw)
 identity.x25519         agent x25519 secret (32 bytes raw)
+iroh.secret             iroh node secret (created on first NodeRuntime::open)
 root.ed25519            local root key (only when `wires init` generated it)
 topic_names.json        name → 32-byte topic_id map (CLI-side convenience)
 caps.redb               CapTable

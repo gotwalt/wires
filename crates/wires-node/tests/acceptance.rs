@@ -19,7 +19,7 @@ fn open_node(tmp: TempDir, root_hex: &str) -> (TempDir, Arc<Node>) {
     let cfg = NodeConfig {
         data_dir: tmp.path().to_path_buf(),
         root_pubkey_hex: root_hex.to_string(),
-        bootstrap_peers: vec![],
+        host: None,
     };
     let n = Arc::new(Node::open(cfg).unwrap());
     (tmp, n)

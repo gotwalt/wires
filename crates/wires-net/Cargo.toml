@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 wires-core = { workspace = true }
 wires-store = { workspace = true }
+ed25519-dalek = { workspace = true }
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
 tokio = { workspace = true }
@@ -19,8 +20,8 @@ bytes = "1"
 hex = { workspace = true }
 n0-future = "0.3"
 rand_core = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
 tempfile      = { workspace = true }
-ed25519-dalek = { workspace = true }
-rand_core     = { workspace = true }
+axum          = { version = "0.8", features = ["json"] }

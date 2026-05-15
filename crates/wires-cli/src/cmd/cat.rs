@@ -1,9 +1,10 @@
 use std::path::Path;
 
 use chrono::TimeZone;
-use wires_node::{DecryptedEvent, Inbound, Node, NodeConfig};
+use wires_node::{DecryptedEvent, Inbound, NodeConfig, NodeRuntime};
 
 use crate::cmd::publish::resolve_topic;
+use crate::cmd::publish_helpers::{bootstrap_endpoints, register_peer_addresses};
 
 pub async fn run(
     data_dir: &Path,
@@ -11,11 +12,24 @@ pub async fn run(
     tail: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cfg: NodeConfig = toml::from_str(&std::fs::read_to_string(data_dir.join("config.toml"))?)?;
-    let node = Node::open(cfg)?;
     let topic_id = resolve_topic(data_dir, topic)?;
-    let log = node.logs.get_or_open(&topic_id)?;
+    let bootstrap = bootstrap_endpoints(&cfg);
+    let host_configured = cfg.host.is_some();
+
+    let runtime = NodeRuntime::open(cfg).await?;
+    register_peer_addresses(&runtime)?;
+    runtime.join_topic(topic_id, bootstrap).await?;
+    if host_configured {
+        match runtime.replay_from_host(topic_id).await {
+            Ok(n) => eprintln!("(replay catch-up: {n} envelopes from host)"),
+            Err(e) => eprintln!("(replay catch-up skipped: {e})"),
+        }
+    }
+
+    // Print everything currently in the local log.
+    let log = runtime.node.logs.get_or_open(&topic_id)?;
     for msg in log.read_all()? {
-        let outcome = node.handle_inbound(msg.clone())?;
+        let outcome = runtime.node.handle_inbound(msg.clone())?;
         let content = match outcome {
             Inbound::Accepted { content, .. } => content,
             _ => None,
@@ -26,11 +40,12 @@ pub async fn run(
             content,
         });
     }
+
     if !tail {
         return Ok(());
     }
 
-    let mut sub = node.subscribe();
+    let mut sub = runtime.node.subscribe();
     while let Ok(ev) = sub.recv().await {
         if ev.topic_id == topic_id {
             print_event(&ev);

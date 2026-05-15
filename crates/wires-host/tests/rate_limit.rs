@@ -14,7 +14,6 @@ use wires_net::tenant::{
     TenantErrorCode, TenantHandler, TenantRegisterRequest, TenantResponse, register_signing_bytes,
 };
 
-
 #[test]
 fn handle_register_rejects_bad_signature() {
     let tmp = TempDir::new().unwrap();
