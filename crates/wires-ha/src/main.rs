@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let cfg: NodeConfig =
         toml::from_str(&std::fs::read_to_string(args.data_dir.join("config.toml"))?)?;
-    let node = Arc::new(Node::open(cfg)?);
+    let node = Arc::new(Node::open(cfg.clone())?);
 
     let topic_id = resolve_topic(&args.data_dir, &args.topic)?;
     let cap_id = decode_hex_16(&args.cap)?;
@@ -78,6 +78,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?;
     let endpoint_id = endpoint.id();
     tracing::info!(%endpoint_id, "wires-ha endpoint bound");
+
+    // If this agent is paired with a host, register the target topic so the
+    // host actually persists what we publish.
+    if let Some(host) = cfg.host.as_ref()
+        && let Some(first) = host.peer_hints.first()
+    {
+        match register_topic_best_effort(&endpoint, first, &topic_id, &args.data_dir).await {
+            Ok(()) => tracing::info!(topic = %hex::encode(topic_id), "host topic-register OK"),
+            Err(e) => {
+                tracing::warn!(error = %e, "host topic-register failed; continuing peer-to-peer")
+            }
+        }
+    }
 
     let glue = NetGlue::new(endpoint.clone(), Arc::clone(&node.logs)).await?;
     let gossip = glue
@@ -137,4 +150,34 @@ fn decode_hex_16(s: &str) -> Result<[u8; 16], Box<dyn std::error::Error + Send +
     let mut out = [0u8; 16];
     out.copy_from_slice(&bytes);
     Ok(out)
+}
+
+async fn register_topic_best_effort(
+    endpoint: &Endpoint,
+    hint: &wires_net::PeerHint,
+    topic_id: &[u8; 32],
+    data_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = hex::decode(&hint.node_id)?;
+    if bytes.len() != 32 {
+        return Err("host node_id not 32-byte hex".into());
+    }
+    let arr: [u8; 32] = bytes.as_slice().try_into().unwrap();
+    let host_eid = iroh::EndpointId::from_bytes(&arr)?;
+    let root_bytes = std::fs::read(data_dir.join("root.ed25519"))?;
+    if root_bytes.len() != 32 {
+        return Err("root.ed25519 must be 32 bytes".into());
+    }
+    let root = ed25519_dalek::SigningKey::from_bytes(&root_bytes.try_into().unwrap());
+    let client = wires_net::tenant::TenantClient::new(endpoint.clone());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    let resp = client
+        .register_topic(host_eid, &root, topic_id, &arr, now)
+        .await?;
+    match resp {
+        wires_net::tenant::TenantResponse::TopicRegister(r) if r.ok => Ok(()),
+        other => Err(format!("host responded: {other:?}").into()),
+    }
 }
