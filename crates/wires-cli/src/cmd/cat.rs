@@ -1,23 +1,25 @@
 use std::path::Path;
 
 use chrono::TimeZone;
+use snafu::ResultExt;
 use wires_node::{DecryptedEvent, Inbound, NodeConfig, NodeRuntime, resolve_topic};
 
 use crate::cmd::publish_helpers::{bootstrap_endpoints, register_peer_addresses};
+use crate::error::{IoSnafu, NodeSnafu, Result, StoreSnafu, TomlParseSnafu};
 
-pub async fn run(
-    data_dir: &Path,
-    topic: &str,
-    tail: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg: NodeConfig = toml::from_str(&std::fs::read_to_string(data_dir.join("config.toml"))?)?;
-    let topic_id = resolve_topic(data_dir, topic)?;
+pub async fn run(data_dir: &Path, topic: &str, tail: bool) -> Result<()> {
+    let raw = std::fs::read_to_string(data_dir.join("config.toml")).context(IoSnafu)?;
+    let cfg: NodeConfig = toml::from_str(&raw).context(TomlParseSnafu)?;
+    let topic_id = resolve_topic(data_dir, topic).context(IoSnafu)?;
     let bootstrap = bootstrap_endpoints(&cfg);
     let host_configured = cfg.host.is_some();
 
-    let runtime = NodeRuntime::open(cfg).await?;
+    let runtime = NodeRuntime::open(cfg).await.context(NodeSnafu)?;
     register_peer_addresses(&runtime)?;
-    runtime.join_topic(topic_id, bootstrap).await?;
+    runtime
+        .join_topic(topic_id, bootstrap)
+        .await
+        .context(NodeSnafu)?;
     if host_configured {
         match runtime.replay_from_host(topic_id).await {
             Ok(n) => eprintln!("(replay catch-up: {n} envelopes from host)"),
@@ -25,10 +27,16 @@ pub async fn run(
         }
     }
 
-    // Print everything currently in the local log.
-    let log = runtime.node.logs.get_or_open(&topic_id)?;
-    for msg in log.read_all()? {
-        let outcome = runtime.node.handle_inbound(msg.clone())?;
+    let log = runtime
+        .node
+        .logs
+        .get_or_open(&topic_id)
+        .context(NodeSnafu)?;
+    for msg in log.read_all().context(StoreSnafu)? {
+        let outcome = runtime
+            .node
+            .handle_inbound(msg.clone())
+            .context(NodeSnafu)?;
         let content = match outcome {
             Inbound::Accepted { content, .. } => content,
             _ => None,

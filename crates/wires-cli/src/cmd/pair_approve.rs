@@ -2,6 +2,7 @@ use std::io::Write;
 use std::path::Path;
 
 use iroh::{Endpoint, SecretKey, endpoint::presets};
+use snafu::{ResultExt, location};
 use wires_core::Capability;
 use wires_core::cap::Right;
 use wires_net::pair::{
@@ -11,6 +12,11 @@ use wires_net::pair::{
 use wires_net::{load_or_create_secret, unix_now_ms};
 use wires_node::{Node, NodeConfig, load_root_signing_key, load_topic_names};
 
+use crate::error::{
+    CliError, CoreSnafu, IoSnafu, NetSnafu, NodeSnafu, Result, StoreSnafu, TomlParseSnafu,
+};
+use crate::invalid;
+
 pub async fn run(
     data_dir: &Path,
     token: &str,
@@ -18,20 +24,21 @@ pub async fn run(
     narrow_topics: Option<Vec<String>>,
     no_host: bool,
     assume_yes: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let request = PairRequest::decode(token)?;
-    request.verify()?;
+) -> Result<()> {
+    let request = PairRequest::decode(token).context(NetSnafu)?;
+    request.verify().context(NetSnafu)?;
     let now = unix_now_ms();
     if now >= request.expires {
-        return Err("pair request has expired".into());
+        return Err(invalid!("pair request has expired"));
     }
 
     print_manifest(&request, now);
     if !assume_yes && !prompt_yes_no("Approve and grant? [y/N] ")? {
-        return Err("rejected by operator".into());
+        return Err(invalid!("rejected by operator"));
     }
 
-    let cfg: NodeConfig = toml::from_str(&std::fs::read_to_string(data_dir.join("config.toml"))?)?;
+    let raw = std::fs::read_to_string(data_dir.join("config.toml")).context(IoSnafu)?;
+    let cfg: NodeConfig = toml::from_str(&raw).context(TomlParseSnafu)?;
     let host_info = if no_host {
         None
     } else {
@@ -40,11 +47,11 @@ pub async fn run(
             service_discovery_url: h.discovery_url.clone(),
         })
     };
-    let node = Node::open(cfg)?;
-    let root_sk = load_root_signing_key(data_dir)?;
+    let node = Node::open(cfg).context(NodeSnafu)?;
+    let root_sk = load_root_signing_key(data_dir).context(IoSnafu)?;
     let root_pk = root_sk.verifying_key().to_bytes();
 
-    let name_map = load_topic_names(data_dir)?;
+    let name_map = load_topic_names(data_dir).context(IoSnafu)?;
     let scopes = filter_scopes(
         &request.manifest.requested_scopes,
         &narrow_scopes,
@@ -59,11 +66,12 @@ pub async fn run(
     for scope in &scopes {
         let topic_id = name_map
             .get(&scope.topic_name)
-            .ok_or_else(|| format!("unknown topic '{}'", scope.topic_name))?;
-        let keys = node.epoch_keys_for(topic_id)?;
+            .ok_or_else(|| invalid!("unknown topic '{}'", scope.topic_name))?;
+        let keys = node.epoch_keys_for(topic_id).context(NodeSnafu)?;
         let (epoch, key) = keys
-            .latest()?
-            .ok_or_else(|| format!("no epoch key for topic '{}'", scope.topic_name))?;
+            .latest()
+            .context(StoreSnafu)?
+            .ok_or_else(|| invalid!("no epoch key for topic '{}'", scope.topic_name))?;
         topic_keys.push(TopicEpochKey {
             topic_id: *topic_id,
             epoch,
@@ -82,7 +90,7 @@ pub async fn run(
     }
 
     let mut cap = Capability::new_unsigned(request.agent_pubkey, cap_topics, cap_rights, now, None);
-    cap.sign(&root_sk)?;
+    cap.sign(&root_sk).context(CoreSnafu)?;
     let cap_id = cap.cap_id.0;
     let grant = PairGrant {
         version: 1,
@@ -94,15 +102,23 @@ pub async fn run(
         nonce: request.nonce,
         issued_at: now,
     };
-    let envelope = PairGrantEnvelope::seal_and_sign(&grant, &request.ephemeral_x25519, &root_sk)?;
+    let envelope = PairGrantEnvelope::seal_and_sign(&grant, &request.ephemeral_x25519, &root_sk)
+        .context(NetSnafu)?;
 
-    let secret = load_or_create_secret(&data_dir.join("iroh.secret"))?;
+    let secret = load_or_create_secret(&data_dir.join("iroh.secret")).context(NetSnafu)?;
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(SecretKey::from_bytes(&secret))
         .bind()
-        .await?;
+        .await
+        .map_err(|e| CliError::Endpoint {
+            message: format!("bind: {e}"),
+            location: location!(),
+        })?;
     let client = PairClient::new(endpoint);
-    let ack = client.deliver_grant(&request.dial, envelope).await?;
+    let ack = client
+        .deliver_grant(&request.dial, envelope)
+        .await
+        .context(NetSnafu)?;
     println!(
         "Paired: cap {} installed at {} on agent {}",
         hex::encode(cap_id),
@@ -137,11 +153,11 @@ fn print_manifest(req: &PairRequest, now_ms: i64) {
     println!("  nonce       : {}...", &hex::encode(req.nonce)[..16]);
 }
 
-fn prompt_yes_no(prompt: &str) -> std::io::Result<bool> {
+fn prompt_yes_no(prompt: &str) -> Result<bool> {
     print!("{prompt}");
-    std::io::stdout().flush()?;
+    std::io::stdout().flush().context(IoSnafu)?;
     let mut buf = String::new();
-    std::io::stdin().read_line(&mut buf)?;
+    std::io::stdin().read_line(&mut buf).context(IoSnafu)?;
     Ok(matches!(
         buf.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
@@ -152,7 +168,7 @@ fn filter_scopes(
     requested: &[RequestedScope],
     narrow_scopes: &[String],
     narrow_topics: Option<&[String]>,
-) -> Result<Vec<RequestedScope>, Box<dyn std::error::Error>> {
+) -> Result<Vec<RequestedScope>> {
     let mut base: Vec<RequestedScope> = match narrow_topics {
         Some(names) => requested
             .iter()
@@ -164,13 +180,13 @@ fn filter_scopes(
     for spec in narrow_scopes {
         let (name, rights) = spec
             .split_once(':')
-            .ok_or_else(|| format!("--scope '{spec}' must be 'name:rights'"))?;
+            .ok_or_else(|| invalid!("--scope '{}' must be 'name:rights'", spec))?;
         let mut rs = Vec::new();
         for t in rights.split('+') {
             match t {
                 "read" => rs.push(Right::Read),
                 "write" => rs.push(Right::Write),
-                other => return Err(format!("unknown right '{other}' in --scope '{spec}'").into()),
+                other => return Err(invalid!("unknown right '{}' in --scope '{}'", other, spec)),
             }
         }
         if let Some(s) = base.iter_mut().find(|s| s.topic_name == name) {
@@ -179,7 +195,7 @@ fn filter_scopes(
     }
     base.retain(|s| !s.rights.is_empty());
     if base.is_empty() {
-        return Err("after narrowing, no scopes remain to grant".into());
+        return Err(invalid!("after narrowing, no scopes remain to grant"));
     }
     Ok(base)
 }

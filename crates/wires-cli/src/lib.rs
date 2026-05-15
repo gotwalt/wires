@@ -2,3 +2,6 @@
 //! subcommand handlers without running the binary through a subprocess.
 
 pub mod cmd;
+pub mod error;
+
+pub use error::{CliError, Result};

@@ -2,8 +2,11 @@
 //! configured `HostConfig` into an iroh bootstrap list and priming the
 //! endpoint's address-lookup with direct address / relay hints.
 
+use snafu::location;
 use wires_net::endpoint_id_from_hex;
 use wires_node::{NodeConfig, NodeRuntime};
+
+use crate::error::{CliError, Result};
 
 /// Build a bootstrap list of `EndpointId`s from the optional `HostConfig`.
 /// Bad hex / wrong length entries are logged at warn level and dropped.
@@ -29,7 +32,7 @@ pub fn bootstrap_endpoints(cfg: &NodeConfig) -> Vec<iroh::EndpointId> {
 /// into `EndpointAddr` values and register them with `endpoint.address_lookup`
 /// via a `MemoryLookup`. Returns `Ok(())` either way; unparseable addrs are
 /// warned but otherwise ignored.
-pub fn register_peer_addresses(runtime: &NodeRuntime) -> Result<(), Box<dyn std::error::Error>> {
+pub fn register_peer_addresses(runtime: &NodeRuntime) -> Result<()> {
     let host = match runtime.node.config.host.as_ref() {
         Some(h) => h,
         None => return Ok(()),
@@ -65,7 +68,10 @@ pub fn register_peer_addresses(runtime: &NodeRuntime) -> Result<(), Box<dyn std:
     let lookup = runtime
         .endpoint
         .address_lookup()
-        .map_err(|e| format!("address_lookup unavailable: {e}"))?;
+        .map_err(|e| CliError::Endpoint {
+            message: format!("address_lookup unavailable: {e}"),
+            location: location!(),
+        })?;
     lookup.add(iroh::address_lookup::memory::MemoryLookup::from_endpoint_info(infos));
     Ok(())
 }
