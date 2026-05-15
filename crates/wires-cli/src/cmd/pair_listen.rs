@@ -61,9 +61,10 @@ pub async fn run(
     println!("Share this token with the operator:");
     println!("{}", started.request_token);
     if qr {
-        println!(
-            "(--qr requested; pipe the token to `qrencode -t ANSI256UTF8 -o-` for a terminal QR)"
-        );
+        let req = wires_net::pair::PairRequest::decode(&started.request_token).context(NetSnafu)?;
+        let art = req.render_qr_ansi().context(NetSnafu)?;
+        println!();
+        print!("{art}");
     }
     println!();
     println!("Waiting for pair-approve…");
