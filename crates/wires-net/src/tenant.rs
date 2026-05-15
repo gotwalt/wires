@@ -348,6 +348,94 @@ impl TenantClient {
         });
         self.send(peer, &req).await
     }
+
+    pub async fn register_topic(
+        &self,
+        peer: EndpointId,
+        root_signer: &ed25519_dalek::SigningKey,
+        topic_id: &[u8; 32],
+        host_endpoint_id: &[u8; 32],
+        timestamp_ms: i64,
+    ) -> Result<TenantResponse> {
+        use ed25519_dalek::Signer as _;
+        use rand_core::RngCore as _;
+        let root_pubkey = root_signer.verifying_key().to_bytes();
+        let mut nonce = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut nonce);
+        let bytes = topic_register_signing_bytes(
+            &root_pubkey,
+            topic_id,
+            timestamp_ms,
+            &nonce,
+            host_endpoint_id,
+        );
+        let signature = root_signer.sign(&bytes).to_bytes();
+        let req = TenantRequest::TopicRegister(TopicRegisterRequest {
+            version: 1,
+            root_pubkey,
+            topic_id: *topic_id,
+            timestamp: timestamp_ms,
+            nonce,
+            signature,
+        });
+        self.send(peer, &req).await
+    }
+
+    pub async fn unregister_topic(
+        &self,
+        peer: EndpointId,
+        root_signer: &ed25519_dalek::SigningKey,
+        topic_id: &[u8; 32],
+        host_endpoint_id: &[u8; 32],
+        timestamp_ms: i64,
+    ) -> Result<TenantResponse> {
+        use ed25519_dalek::Signer as _;
+        use rand_core::RngCore as _;
+        let root_pubkey = root_signer.verifying_key().to_bytes();
+        let mut nonce = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut nonce);
+        let bytes = topic_unregister_signing_bytes(
+            &root_pubkey,
+            topic_id,
+            timestamp_ms,
+            &nonce,
+            host_endpoint_id,
+        );
+        let signature = root_signer.sign(&bytes).to_bytes();
+        let req = TenantRequest::TopicUnregister(TopicUnregisterRequest {
+            version: 1,
+            root_pubkey,
+            topic_id: *topic_id,
+            timestamp: timestamp_ms,
+            nonce,
+            signature,
+        });
+        self.send(peer, &req).await
+    }
+
+    pub async fn tenant_status(
+        &self,
+        peer: EndpointId,
+        root_signer: &ed25519_dalek::SigningKey,
+        host_endpoint_id: &[u8; 32],
+        timestamp_ms: i64,
+    ) -> Result<TenantResponse> {
+        use ed25519_dalek::Signer as _;
+        use rand_core::RngCore as _;
+        let root_pubkey = root_signer.verifying_key().to_bytes();
+        let mut nonce = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut nonce);
+        let bytes = status_signing_bytes(&root_pubkey, timestamp_ms, &nonce, host_endpoint_id);
+        let signature = root_signer.sign(&bytes).to_bytes();
+        let req = TenantRequest::Status(TenantStatusRequest {
+            version: 1,
+            root_pubkey,
+            timestamp: timestamp_ms,
+            nonce,
+            signature,
+        });
+        self.send(peer, &req).await
+    }
 }
 
 #[cfg(test)]
@@ -458,5 +546,123 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn topic_register_status_unregister_helpers_round_trip() {
+        use std::sync::{Arc, Mutex};
+        let topic = [0xAAu8; 32];
+
+        #[derive(Default)]
+        struct Acc {
+            host_id: [u8; 32],
+            registered: Mutex<Vec<[u8; 32]>>,
+        }
+        impl TenantHandler for Acc {
+            fn handle_register(&self, _r: TenantRegisterRequest) -> TenantResponse {
+                unreachable!()
+            }
+            fn handle_topic_register(&self, req: TopicRegisterRequest) -> TenantResponse {
+                use ed25519_dalek::{Verifier, VerifyingKey};
+                let bytes = topic_register_signing_bytes(
+                    &req.root_pubkey,
+                    &req.topic_id,
+                    req.timestamp,
+                    &req.nonce,
+                    &self.host_id,
+                );
+                let vk = VerifyingKey::from_bytes(&req.root_pubkey).unwrap();
+                vk.verify(&bytes, &req.signature.into()).unwrap();
+                self.registered.lock().unwrap().push(req.topic_id);
+                TenantResponse::TopicRegister(TopicRegisterResponse {
+                    ok: true,
+                    topic_id: req.topic_id,
+                })
+            }
+            fn handle_topic_unregister(&self, req: TopicUnregisterRequest) -> TenantResponse {
+                use ed25519_dalek::{Verifier, VerifyingKey};
+                let bytes = topic_unregister_signing_bytes(
+                    &req.root_pubkey,
+                    &req.topic_id,
+                    req.timestamp,
+                    &req.nonce,
+                    &self.host_id,
+                );
+                let vk = VerifyingKey::from_bytes(&req.root_pubkey).unwrap();
+                vk.verify(&bytes, &req.signature.into()).unwrap();
+                self.registered.lock().unwrap().retain(|t| t != &req.topic_id);
+                TenantResponse::TopicUnregister(TopicUnregisterResponse {
+                    ok: true,
+                    topic_id: req.topic_id,
+                })
+            }
+            fn handle_status(&self, req: TenantStatusRequest) -> TenantResponse {
+                use ed25519_dalek::{Verifier, VerifyingKey};
+                let bytes = status_signing_bytes(
+                    &req.root_pubkey,
+                    req.timestamp,
+                    &req.nonce,
+                    &self.host_id,
+                );
+                let vk = VerifyingKey::from_bytes(&req.root_pubkey).unwrap();
+                vk.verify(&bytes, &req.signature.into()).unwrap();
+                TenantResponse::Status(TenantStatusResponse {
+                    registered_at: 1,
+                    topic_count: 1,
+                    bytes_stored: 0,
+                    retention_budget_bytes: 1 << 20,
+                    oldest_retained_at: 0,
+                    write_rate_limit_per_sec: 1000,
+                    status: TenantStatusKind::Active,
+                })
+            }
+        }
+
+        let host_secret = iroh::SecretKey::generate();
+        let host_ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(host_secret)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let host_id: [u8; 32] = host_ep.id().as_bytes().to_owned();
+        let handler = Arc::new(Acc { host_id, registered: Default::default() });
+        let _router = iroh::protocol::Router::builder(host_ep.clone())
+            .accept(ALPN, TenantProtocol::new(Arc::clone(&handler)))
+            .spawn();
+
+        let caller_ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::generate())
+            .bind()
+            .await
+            .unwrap();
+        let client = TenantClient::new(caller_ep);
+        let root = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+
+        // Register.
+        let r = client
+            .register_topic(host_ep.id(), &root, &topic, &host_id, 100)
+            .await
+            .unwrap();
+        assert!(matches!(r, TenantResponse::TopicRegister(_)));
+        assert_eq!(handler.registered.lock().unwrap().clone(), vec![topic]);
+
+        // Status.
+        let s = client
+            .tenant_status(host_ep.id(), &root, &host_id, 101)
+            .await
+            .unwrap();
+        match s {
+            TenantResponse::Status(s) => assert_eq!(s.write_rate_limit_per_sec, 1000),
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // Unregister.
+        let u = client
+            .unregister_topic(host_ep.id(), &root, &topic, &host_id, 102)
+            .await
+            .unwrap();
+        assert!(matches!(u, TenantResponse::TopicUnregister(_)));
+        assert!(handler.registered.lock().unwrap().is_empty());
     }
 }
