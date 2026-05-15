@@ -3,31 +3,33 @@ use snafu::{Location, Snafu};
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum NetError {
-    #[snafu(display("iroh endpoint setup failed, at {location}"))]
-    Endpoint {
-        #[snafu(source(from(anyhow::Error, Box::new)))]
-        source: Box<anyhow::Error>,
-        #[snafu(implicit)]
-        location: Location,
-    },
-    #[snafu(display("Gossip subscription failed, at {location}"))]
+    #[snafu(display("Gossip subscription failed: {source}, at {location}"))]
     GossipSubscribe {
-        #[snafu(source(from(anyhow::Error, Box::new)))]
-        source: Box<anyhow::Error>,
+        source: iroh_gossip::api::ApiError,
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Gossip publish failed, at {location}"))]
+    #[snafu(display("Gossip publish failed: {source}, at {location}"))]
     GossipPublish {
-        #[snafu(source(from(anyhow::Error, Box::new)))]
-        source: Box<anyhow::Error>,
+        source: iroh_gossip::api::ApiError,
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Replay RPC failed, at {location}"))]
-    ReplayRpc {
-        #[snafu(source(from(anyhow::Error, Box::new)))]
-        source: Box<anyhow::Error>,
+    #[snafu(display("Replay source read failed: {source}, at {location}"))]
+    ReplaySource {
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Replay RPC connect failed: {source}, at {location}"))]
+    ReplayConnect {
+        source: iroh::endpoint::ConnectError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Replay RPC stream open failed: {source}, at {location}"))]
+    ReplayOpenBi {
+        source: iroh::endpoint::ConnectionError,
         #[snafu(implicit)]
         location: Location,
     },
@@ -42,13 +44,6 @@ pub enum NetError {
     Io {
         #[snafu(source)]
         source: std::io::Error,
-        #[snafu(implicit)]
-        location: Location,
-    },
-    #[snafu(display("Tenant register failed, at {location}"))]
-    TenantRegister {
-        #[snafu(source(from(anyhow::Error, Box::new)))]
-        source: Box<anyhow::Error>,
         #[snafu(implicit)]
         location: Location,
     },
