@@ -71,6 +71,50 @@ pub enum NodeError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Pair-grant cap targets a different agent, at {location}"))]
+    AgentMismatch {
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Pair-grant cap failed root verification: {source}, at {location}"))]
+    VerifyCap {
+        #[snafu(source(from(wires_core::CoreError, Box::new)))]
+        source: Box<wires_core::CoreError>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Pair-grant references unknown topic_id {topic_id_hex}, at {location}"))]
+    UnknownTopic {
+        topic_id_hex: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Failed to write config.toml: {source}, at {location}"))]
+    ConfigWrite {
+        source: std::io::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Failed to write topic_names.json: {source}, at {location}"))]
+    TopicNamesWrite {
+        source: std::io::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Failed to upsert cap: {source}, at {location}"))]
+    UpsertCap {
+        #[snafu(source(from(wires_store::StoreError, Box::new)))]
+        source: Box<wires_store::StoreError>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Failed to install epoch key: {source}, at {location}"))]
+    EpochKey {
+        #[snafu(source(from(wires_store::StoreError, Box::new)))]
+        source: Box<wires_store::StoreError>,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = NodeError> = core::result::Result<T, E>;

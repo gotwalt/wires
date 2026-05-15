@@ -4870,6 +4870,7 @@ name = "wires-net"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bytes",
  "ed25519-dalek 2.2.0",
@@ -4886,7 +4887,9 @@ dependencies = [
  "tokio",
  "tracing",
  "wires-core",
+ "wires-crypto",
  "wires-store",
+ "x25519-dalek",
 ]
 
 [[package]]
