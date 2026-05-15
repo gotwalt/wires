@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use iroh::{Endpoint, SecretKey, endpoint::presets};
+use iroh::SecretKey;
 use tokio::sync::mpsc;
 use wires_core::WireMessage;
 use wires_host::http_discovery::{self, DiscoveryEndpoint, DiscoveryResponse, DiscoveryState};
@@ -46,16 +46,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // iroh identity ---------------------------------------------------------
     let secret_path = args.data_dir.join("iroh.secret");
     let secret = load_or_create_secret(&secret_path)?;
-    let iroh_sk = SecretKey::from_bytes(&secret);
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(iroh_sk)
-        .alpns(vec![
+    let endpoint = wires_net::bind_cloud(
+        SecretKey::from_bytes(&secret),
+        vec![
             GOSSIP_ALPN.to_vec(),
             TENANT_ALPN.to_vec(),
             REPLAY_ALPN.to_vec(),
-        ])
-        .bind()
-        .await?;
+        ],
+    )
+    .await?;
     let endpoint_id = endpoint.id();
     let endpoint_id_bytes: [u8; 32] = endpoint_id.as_bytes().to_owned();
     println!("wires-host: EndpointId = {endpoint_id}");
