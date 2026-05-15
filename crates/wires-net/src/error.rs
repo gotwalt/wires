@@ -117,6 +117,26 @@ pub enum NetError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("iroh endpoint bind failed: {source}, at {location}"))]
+    EndpointBind {
+        source: iroh::endpoint::BindError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[cfg(feature = "mdns")]
+    #[snafu(display("mDNS address-lookup setup failed: {source}, at {location}"))]
+    MdnsSetup {
+        source: iroh::address_lookup::AddressLookupBuilderError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[cfg(feature = "mdns")]
+    #[snafu(display("endpoint address-lookup registry unavailable: {source}, at {location}"))]
+    AddressLookup {
+        source: iroh::address_lookup::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = NetError> = core::result::Result<T, E>;
