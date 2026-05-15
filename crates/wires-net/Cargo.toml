@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 wires-core = { workspace = true }
+wires-crypto = { workspace = true }
 wires-store = { workspace = true }
+x25519-dalek = { workspace = true }
 ed25519-dalek = { workspace = true }
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
