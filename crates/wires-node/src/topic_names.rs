@@ -7,6 +7,7 @@ use std::path::Path;
 
 use snafu::ResultExt;
 
+use crate::atomic_write::atomic_write;
 use crate::error::{NodeError, Result, TopicNamesWriteSnafu};
 
 const FILE: &str = "topic_names.json";
@@ -94,6 +95,6 @@ pub fn upsert_entries<I: IntoIterator<Item = (String, [u8; 32])>>(
         map.insert(name, hex::encode(id));
     }
     let serialized = serde_json::to_string_pretty(&map).expect("HashMap serializes");
-    std::fs::write(&p, serialized).context(TopicNamesWriteSnafu)?;
+    atomic_write(&p, serialized.as_bytes(), None).context(TopicNamesWriteSnafu)?;
     Ok(())
 }
