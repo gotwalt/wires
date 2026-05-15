@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use wires_core::CanonicalContent;
-use wires_net::PeerHint;
 use wires_node::{NodeConfig, NodeRuntime};
+
+use crate::cmd::publish_helpers::{bootstrap_endpoints, register_peer_addresses};
 
 pub async fn run(
     data_dir: &Path,
@@ -13,12 +14,12 @@ pub async fn run(
     data: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cfg: NodeConfig = toml::from_str(&std::fs::read_to_string(data_dir.join("config.toml"))?)?;
-    let bootstrap = bootstrap_endpoints(&cfg)?;
+    let bootstrap = bootstrap_endpoints(&cfg);
     let runtime = NodeRuntime::open(cfg).await?;
     // If the config carries `PeerHint` entries with direct addresses or relay
     // info, prime the endpoint's address-lookup with them so gossip/replay can
     // dial without going through pkarr/DNS.
-    register_peer_addresses(&runtime, &runtime.node.config)?;
+    register_peer_addresses(&runtime)?;
     let topic_id = resolve_topic(data_dir, topic)?;
     let cap_id = decode_hex_16(cap)?;
 
@@ -73,74 +74,4 @@ fn decode_hex_16(s: &str) -> Result<[u8; 16], Box<dyn std::error::Error>> {
     let mut out = [0u8; 16];
     out.copy_from_slice(&bytes);
     Ok(out)
-}
-
-/// Build a bootstrap list of `EndpointId`s from the optional `HostConfig`,
-/// silently skipping unparseable hints (the caller logs).
-fn bootstrap_endpoints(
-    cfg: &NodeConfig,
-) -> Result<Vec<iroh::EndpointId>, Box<dyn std::error::Error>> {
-    let mut out = Vec::new();
-    if let Some(h) = &cfg.host {
-        for hint in &h.peer_hints {
-            if let Some(id) = peer_hint_endpoint_id(hint) {
-                out.push(id);
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn peer_hint_endpoint_id(hint: &PeerHint) -> Option<iroh::EndpointId> {
-    let bytes = match hex::decode(&hint.node_id) {
-        Ok(b) if b.len() == 32 => b,
-        _ => return None,
-    };
-    let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
-    iroh::EndpointId::from_bytes(&arr).ok()
-}
-
-/// Convert any `PeerHint` entries that carry direct addresses or a relay URL
-/// into `EndpointAddr` values and register them with `endpoint.address_lookup`
-/// via a `MemoryLookup`. This lets gossip dial peers using the supplied hints
-/// without first round-tripping to pkarr/DNS.
-fn register_peer_addresses(
-    runtime: &NodeRuntime,
-    cfg: &NodeConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let host = match cfg.host.as_ref() {
-        Some(h) => h,
-        None => return Ok(()),
-    };
-    let mut infos: Vec<iroh::EndpointAddr> = Vec::new();
-    for hint in &host.peer_hints {
-        let id = match peer_hint_endpoint_id(hint) {
-            Some(id) => id,
-            None => continue,
-        };
-        let mut addrs: Vec<iroh::TransportAddr> = Vec::new();
-        for s in &hint.addrs {
-            if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
-                addrs.push(iroh::TransportAddr::Ip(sa));
-            }
-        }
-        if let Some(relay) = hint.relay.as_deref()
-            && let Ok(url) = relay.parse::<iroh::RelayUrl>()
-        {
-            addrs.push(iroh::TransportAddr::Relay(url));
-        }
-        if addrs.is_empty() {
-            continue;
-        }
-        infos.push(iroh::EndpointAddr::from_parts(id, addrs));
-    }
-    if infos.is_empty() {
-        return Ok(());
-    }
-    let lookup = runtime
-        .endpoint
-        .address_lookup()
-        .map_err(|e| format!("address_lookup unavailable: {e}"))?;
-    lookup.add(iroh::address_lookup::memory::MemoryLookup::from_endpoint_info(infos));
-    Ok(())
 }

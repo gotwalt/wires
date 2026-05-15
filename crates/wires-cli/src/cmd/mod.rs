@@ -4,6 +4,7 @@ pub mod init;
 pub mod invite;
 pub mod join;
 pub mod publish;
+pub mod publish_helpers;
 pub mod revoke;
 pub mod status;
 pub mod topic;
