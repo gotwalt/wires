@@ -97,6 +97,35 @@ impl NodeRuntime {
         handle.broadcast(bytes).await.context(NetSnafu)?;
         Ok(msg)
     }
+
+    /// Pull missing history for `topic_id` from the configured host via the
+    /// replay ALPN, and feed each delivered envelope to `node.handle_inbound`.
+    /// Errors with a configuration error if no host is set or if no usable
+    /// peer hint is reachable.
+    pub async fn replay_from_host(&self, topic_id: [u8; 32]) -> Result<usize> {
+        let host = self
+            .node
+            .config
+            .host
+            .as_ref()
+            .ok_or_else(|| crate::error::NodeError::Config {
+                message: "replay_from_host: no host configured".into(),
+                location: snafu::location!(),
+            })?;
+        let peer = wires_net::first_reachable_with_discovery(
+            &self.endpoint,
+            &host.peer_hints,
+            host.discovery_url.as_deref(),
+            wires_net::ALPN,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .ok_or_else(|| crate::error::NodeError::Config {
+            message: "replay_from_host: no reachable peer hint".into(),
+            location: snafu::location!(),
+        })?;
+        self.glue.replay_from(Arc::clone(&self.node), topic_id, peer).await
+    }
 }
 
 #[cfg(test)]
@@ -115,6 +144,21 @@ mod tests {
         let rt = NodeRuntime::open(cfg).await.unwrap();
         assert!(rt.endpoint.id().as_bytes().iter().any(|b| *b != 0));
         assert_eq!(rt.node.config.root_pubkey_hex.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn replay_from_host_errors_when_no_host_configured() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = NodeConfig {
+            data_dir: tmp.path().to_path_buf(),
+            root_pubkey_hex: hex::encode([7u8; 32]),
+            host: None,
+        };
+        let rt = NodeRuntime::open(cfg).await.unwrap();
+        let topic = [9u8; 32];
+        let err = rt.replay_from_host(topic).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no host configured"), "unexpected error: {msg}");
     }
 
     #[tokio::test]
