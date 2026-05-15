@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use iroh::{Endpoint, SecretKey, endpoint::presets};
+use iroh::{Endpoint, SecretKey};
 use parking_lot::Mutex;
 use snafu::ResultExt;
 use wires_net::{GossipHandle, load_or_create_secret};
@@ -31,13 +31,12 @@ impl NodeRuntime {
         let node = Arc::new(Node::open(config.clone())?);
         let secret_path = config.data_dir.join("iroh.secret");
         let secret = load_or_create_secret(&secret_path).context(NetSnafu)?;
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(SecretKey::from_bytes(&secret))
-            .alpns(vec![wires_net::ALPN.to_vec()])
-            .bind()
-            .await
-            .map_err(|e| std::io::Error::other(format!("endpoint bind: {e}")))
-            .context(IoSnafu)?;
+        let endpoint = wires_net::bind_lan(
+            SecretKey::from_bytes(&secret),
+            vec![wires_net::ALPN.to_vec()],
+        )
+        .await
+        .context(NetSnafu)?;
         let glue = NetGlue::new(endpoint.clone(), Arc::clone(&node.logs))
             .await
             .map_err(|e| std::io::Error::other(format!("net glue: {e}")))
