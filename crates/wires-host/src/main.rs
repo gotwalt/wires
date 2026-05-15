@@ -113,6 +113,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Resubscribe to every topic persisted in topic_index before any control
+    // RPC can arrive. Otherwise a restarted host stays silent until each
+    // tenant re-issues `topic-register`.
+    for topic_id in registry.all_topic_ids()? {
+        let _ = subscribe_tx.send(topic_id);
+    }
+
     // Tenant handler --------------------------------------------------------
     let subscribe_tx_clone = subscribe_tx.clone();
     let handler = Arc::new(TenantHandlerImpl {
