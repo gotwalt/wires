@@ -21,8 +21,8 @@ pub use replay::{
 };
 pub use pair::{
     ALPN as PAIR_ALPN, HostInfo as PairHostInfo, MAX_FRAME_LEN as PAIR_MAX_FRAME_LEN, PairAck,
-    PairDial, PairFrame, PairGrant, PairGrantEnvelope, PairManifest, PairReject, PairRejectCode,
-    PairRequest, RequestedScope, TopicEpochKey, TopicNameEntry,
+    PairDial, PairFrame, PairGrant, PairGrantEnvelope, PairHandler, PairManifest, PairProtocol,
+    PairReject, PairRejectCode, PairRequest, RequestedScope, TopicEpochKey, TopicNameEntry,
 };
 pub use tenant::{
     ALPN as TENANT_ALPN, TenantClient, TenantErrorCode, TenantErrorResponse, TenantHandler,
