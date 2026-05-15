@@ -13,7 +13,7 @@ pub use error::{NetError, Result};
 pub use gossip::{GossipHandle, GossipNode};
 pub use identity::load_or_create_secret;
 pub use invite::{InviteToken, PeerHint};
-pub use peer_hint::{DialOutcome, first_reachable};
+pub use peer_hint::{DialOutcome, first_reachable, first_reachable_with_discovery};
 pub use replay::{
     ALPN, HwmEntry, ReplayClient, ReplayProtocol, ReplayRequest, ReplayResponseFrame, ReplaySource,
 };
