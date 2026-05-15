@@ -494,14 +494,8 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
             _ => return Self::err(TenantErrorCode::TenantNotFound, "no such tenant"),
         };
 
-        let topic_count = self
-            .registry
-            .topic_count_for(&req.root_pubkey)
-            .unwrap_or(0);
-        let bytes_stored = self
-            .retention
-            .bytes_stored(&req.root_pubkey)
-            .unwrap_or(0);
+        let topic_count = self.registry.topic_count_for(&req.root_pubkey).unwrap_or(0);
+        let bytes_stored = self.retention.bytes_stored(&req.root_pubkey).unwrap_or(0);
         let oldest_retained_at = self
             .retention
             .oldest_retained_at(&req.root_pubkey)
@@ -657,10 +651,10 @@ mod tests {
 
     #[test]
     fn handle_register_signs_and_records_tenant() {
+        use crate::per_tenant_logs::PerTenantLogs;
         use ed25519_dalek::{Signer, SigningKey};
         use rand_core::OsRng;
         use std::sync::Arc;
-        use crate::per_tenant_logs::PerTenantLogs;
         use wires_net::tenant::{TenantHandler, TenantRegisterRequest, TenantResponse};
 
         let tmp = TempDir::new().unwrap();

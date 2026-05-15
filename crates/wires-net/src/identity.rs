@@ -56,7 +56,7 @@ mod tests {
     fn corrupt_file_regenerated() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("secret");
-        std::fs::write(&p, &[1, 2, 3]).unwrap(); // wrong size
+        std::fs::write(&p, [1, 2, 3]).unwrap(); // wrong size
         let secret = load_or_create_secret(&p).unwrap();
         assert_eq!(secret.len(), 32);
         // Now it's a valid 32-byte secret on disk

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use wires_net::PeerHint;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -9,8 +10,21 @@ pub struct NodeConfig {
     /// Hex of the root pubkey for this household; needed to derive
     /// firehose/__caps topic ids.
     pub root_pubkey_hex: String,
-    /// Optional peer hint(s) to dial on startup (typically the hosted node).
-    pub bootstrap_peers: Vec<String>,
+    /// Optional host this agent has paired with. `None` for purely
+    /// peer-to-peer operation (no persistent relay, no replay catch-up).
+    #[serde(default)]
+    pub host: Option<HostConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostConfig {
+    /// Peer hints harvested from discovery or an invite token. Tried in order
+    /// when bootstrapping gossip and when dialing the tenant/replay ALPNs.
+    pub peer_hints: Vec<PeerHint>,
+    /// Optional HTTPS service-discovery URL; consulted only if every entry in
+    /// `peer_hints` is unreachable.
+    #[serde(default)]
+    pub discovery_url: Option<String>,
 }
 
 impl NodeConfig {
@@ -40,7 +54,7 @@ mod tests {
         NodeConfig {
             data_dir: PathBuf::from("/tmp/wires-test"),
             root_pubkey_hex: hex_pk.to_string(),
-            bootstrap_peers: vec![],
+            host: None,
         }
     }
 
@@ -63,5 +77,40 @@ mod tests {
         let a = cfg("aa");
         let b = cfg("bb");
         assert_ne!(a.firehose_topic_id(), b.firehose_topic_id());
+    }
+
+    #[test]
+    fn host_config_round_trips_through_toml() {
+        let cfg = NodeConfig {
+            data_dir: PathBuf::from("/tmp/wires-test"),
+            root_pubkey_hex: "deadbeef".into(),
+            host: Some(HostConfig {
+                peer_hints: vec![wires_net::PeerHint {
+                    node_id: "ab".repeat(32),
+                    addrs: vec!["127.0.0.1:11204".into()],
+                    relay: None,
+                }],
+                discovery_url: Some("https://discovery.example/v1/bootstrap".into()),
+            }),
+        };
+        let s = toml::to_string_pretty(&cfg).unwrap();
+        let back: NodeConfig = toml::from_str(&s).unwrap();
+        assert_eq!(back.root_pubkey_hex, "deadbeef");
+        let h = back.host.expect("host must round-trip");
+        assert_eq!(h.peer_hints.len(), 1);
+        assert_eq!(
+            h.discovery_url.as_deref(),
+            Some("https://discovery.example/v1/bootstrap")
+        );
+    }
+
+    #[test]
+    fn legacy_config_without_host_deserializes() {
+        let s = r#"
+            data_dir = "/tmp/wires-test"
+            root_pubkey_hex = "deadbeef"
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert!(cfg.host.is_none());
     }
 }

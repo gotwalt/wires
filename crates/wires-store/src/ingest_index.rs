@@ -68,10 +68,17 @@ impl IngestIndex {
         let table = match read.open_table(INGEST_INDEX) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(e) => return Err(crate::error::StoreError::OpenTable { source: e, location: snafu::location!() }),
+            Err(e) => {
+                return Err(crate::error::StoreError::OpenTable {
+                    source: e,
+                    location: snafu::location!(),
+                });
+            }
         };
         let mut iter = table.iter().context(StorageIoSnafu)?;
-        let Some(first) = iter.next() else { return Ok(None); };
+        let Some(first) = iter.next() else {
+            return Ok(None);
+        };
         let (_k, v) = first.context(StorageIoSnafu)?;
         let raw = v.value();
         if raw.len() < 76 {
