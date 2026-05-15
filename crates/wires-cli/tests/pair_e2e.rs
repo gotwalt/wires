@@ -9,11 +9,17 @@ async fn alice_pairs_bob_end_to_end() {
     let bob_td = TempDir::new().unwrap();
 
     // Alice: init with new root, create topic.
-    wires_cli::cmd::init::run(alice_td.path(), true).await.unwrap();
-    wires_cli::cmd::topic::create(alice_td.path(), "home.notes").await.unwrap();
+    wires_cli::cmd::init::run(alice_td.path(), true)
+        .await
+        .unwrap();
+    wires_cli::cmd::topic::create(alice_td.path(), "home.notes")
+        .await
+        .unwrap();
 
     // Bob: identity-only init.
-    wires_cli::cmd::init::run(bob_td.path(), false).await.unwrap();
+    wires_cli::cmd::init::run(bob_td.path(), false)
+        .await
+        .unwrap();
 
     // Bob: start pair-listen in background.
     let bob_path = bob_td.path().to_path_buf();

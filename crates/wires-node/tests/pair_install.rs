@@ -49,23 +49,27 @@ fn happy_path_installs_all_artifacts() {
         version: 1,
         root_pubkey: root_pk,
         cap: make_signed_cap(&root_sk, agent_pk),
-        topic_keys: vec![TopicEpochKey { topic_id, epoch: 0, key: [7u8; 32] }],
-        topic_names: vec![TopicNameEntry { topic_id, name: "home.notes".into() }],
+        topic_keys: vec![TopicEpochKey {
+            topic_id,
+            epoch: 0,
+            key: [7u8; 32],
+        }],
+        topic_names: vec![TopicNameEntry {
+            topic_id,
+            name: "home.notes".into(),
+        }],
         host: None,
         nonce: [9u8; 32],
         issued_at: 1_700_000_000_000,
     };
     let out = install_grant(td.path(), &node, &agent_pk, &grant).unwrap();
     assert_eq!(out.cap_id, grant.cap.cap_id.0);
-    let cfg: NodeConfig = toml::from_str(
-        &std::fs::read_to_string(td.path().join("config.toml")).unwrap(),
-    )
-    .unwrap();
+    let cfg: NodeConfig =
+        toml::from_str(&std::fs::read_to_string(td.path().join("config.toml")).unwrap()).unwrap();
     assert_eq!(cfg.root_pubkey_hex, hex::encode(root_pk));
-    let names: std::collections::HashMap<String, String> = serde_json::from_str(
-        &std::fs::read_to_string(td.path().join("topic_names.json")).unwrap(),
-    )
-    .unwrap();
+    let names: std::collections::HashMap<String, String> =
+        serde_json::from_str(&std::fs::read_to_string(td.path().join("topic_names.json")).unwrap())
+            .unwrap();
     assert_eq!(names.get("home.notes"), Some(&hex::encode(topic_id)));
 }
 
@@ -117,8 +121,15 @@ fn idempotent_on_replay() {
         version: 1,
         root_pubkey: root_sk.verifying_key().to_bytes(),
         cap: make_signed_cap(&root_sk, agent_pk),
-        topic_keys: vec![TopicEpochKey { topic_id, epoch: 0, key: [7u8; 32] }],
-        topic_names: vec![TopicNameEntry { topic_id, name: "home.notes".into() }],
+        topic_keys: vec![TopicEpochKey {
+            topic_id,
+            epoch: 0,
+            key: [7u8; 32],
+        }],
+        topic_names: vec![TopicNameEntry {
+            topic_id,
+            name: "home.notes".into(),
+        }],
         host: None,
         nonce: [9u8; 32],
         issued_at: 0,

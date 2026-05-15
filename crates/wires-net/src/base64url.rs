@@ -30,6 +30,7 @@ pub fn encode(bytes: &[u8]) -> String {
     out
 }
 
+#[allow(clippy::result_unit_err)]
 pub fn decode(s: &str) -> std::result::Result<Vec<u8>, ()> {
     fn val(c: u8) -> std::result::Result<u32, ()> {
         match c {

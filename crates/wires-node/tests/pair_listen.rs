@@ -85,8 +85,15 @@ async fn full_lifecycle_alice_dial_bob_install() {
         version: 1,
         root_pubkey: root_sk.verifying_key().to_bytes(),
         cap,
-        topic_keys: vec![TopicEpochKey { topic_id, epoch: 0, key: [8u8; 32] }],
-        topic_names: vec![TopicNameEntry { topic_id, name: "home.notes".into() }],
+        topic_keys: vec![TopicEpochKey {
+            topic_id,
+            epoch: 0,
+            key: [8u8; 32],
+        }],
+        topic_names: vec![TopicNameEntry {
+            topic_id,
+            name: "home.notes".into(),
+        }],
         host: None,
         nonce: request.nonce,
         issued_at: 1_700_000_000_000,

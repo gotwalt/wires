@@ -27,8 +27,9 @@ async fn pair_listen_emits_a_valid_token() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    let pending =
-        wires_node::pair_pending::load(td.path()).unwrap().expect("pair_pending exists");
+    let pending = wires_node::pair_pending::load(td.path())
+        .unwrap()
+        .expect("pair_pending exists");
     let req = PairRequest::decode(&pending.request_token).unwrap();
     req.verify().unwrap();
     assert_eq!(req.manifest.role, "test");

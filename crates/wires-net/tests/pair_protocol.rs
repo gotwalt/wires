@@ -60,10 +60,9 @@ async fn handler_returns_ack() {
         .await
         .unwrap();
     send.finish().ok();
-    let frame: PairFrame =
-        wires_net::framing::read_frame(&mut recv, MAX_FRAME_LEN)
-            .await
-            .unwrap();
+    let frame: PairFrame = wires_net::framing::read_frame(&mut recv, MAX_FRAME_LEN)
+        .await
+        .unwrap();
     assert!(matches!(frame, PairFrame::Ack(_)));
 }
 
@@ -97,10 +96,9 @@ async fn handler_returns_reject() {
         .await
         .unwrap();
     send.finish().ok();
-    let frame: PairFrame =
-        wires_net::framing::read_frame(&mut recv, MAX_FRAME_LEN)
-            .await
-            .unwrap();
+    let frame: PairFrame = wires_net::framing::read_frame(&mut recv, MAX_FRAME_LEN)
+        .await
+        .unwrap();
     match frame {
         PairFrame::Reject(r) => assert_eq!(r.code, PairRejectCode::NonceMismatch),
         _ => panic!("expected Reject"),

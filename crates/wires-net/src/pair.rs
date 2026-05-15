@@ -2,11 +2,11 @@
 //!
 //! See `docs/superpowers/specs/2026-05-15-wires-responder-driven-pairing-design.md`.
 
-use ed25519_dalek::{Signature, SigningKey, Signer, VerifyingKey, Verifier};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, ensure};
-use x25519_dalek::StaticSecret;
 use wires_core::Capability;
+use x25519_dalek::StaticSecret;
 
 use crate::error::{
     NetError, PairBoundsSnafu, PairCryptoSnafu, PairInvalidCharsSnafu, PairSignatureSnafu,
@@ -105,7 +105,9 @@ impl PairRequest {
     pub fn verify(&self) -> Result<()> {
         let vk = VerifyingKey::from_bytes(&self.agent_pubkey)
             .ok()
-            .ok_or_else(|| NetError::PairSignature { location: snafu::location!() })?;
+            .ok_or_else(|| NetError::PairSignature {
+                location: snafu::location!(),
+            })?;
         let sig = Signature::from_bytes(&self.signature);
         let bytes = self.signing_bytes()?;
         ensure!(vk.verify(&bytes, &sig).is_ok(), PairSignatureSnafu);
@@ -116,7 +118,10 @@ impl PairRequest {
         let json = serde_json::to_vec(self).context(SerdeSnafu)?;
         ensure!(
             json.len() <= MAX_TOKEN_BYTES,
-            PairBoundsSnafu { what: "encoded token", limit: MAX_TOKEN_BYTES }
+            PairBoundsSnafu {
+                what: "encoded token",
+                limit: MAX_TOKEN_BYTES
+            }
         );
         Ok(crate::base64url::encode(&json))
     }
@@ -124,7 +129,10 @@ impl PairRequest {
     pub fn decode(token: &str) -> Result<Self> {
         ensure!(
             token.len() <= MAX_TOKEN_BYTES * 2,
-            PairBoundsSnafu { what: "encoded token", limit: MAX_TOKEN_BYTES }
+            PairBoundsSnafu {
+                what: "encoded token",
+                limit: MAX_TOKEN_BYTES
+            }
         );
         let bytes = crate::base64url::decode(token).map_err(|_| NetError::Serde {
             source: serde_json::from_str::<()>("\"bad base64\"").unwrap_err(),
@@ -136,35 +144,60 @@ impl PairRequest {
     }
 
     fn check_bounds(&self) -> Result<()> {
-        ensure!(self.version == 1, PairUnsupportedVersionSnafu { version: self.version });
         ensure!(
-            !self.manifest.role.is_empty() && self.manifest.role.len() <= MAX_ROLE_LEN,
-            PairBoundsSnafu { what: "manifest.role", limit: MAX_ROLE_LEN }
+            self.version == 1,
+            PairUnsupportedVersionSnafu {
+                version: self.version
+            }
         );
         ensure!(
-            self.manifest.role.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-            PairInvalidCharsSnafu { field: "manifest.role" }
+            !self.manifest.role.is_empty() && self.manifest.role.len() <= MAX_ROLE_LEN,
+            PairBoundsSnafu {
+                what: "manifest.role",
+                limit: MAX_ROLE_LEN
+            }
+        );
+        ensure!(
+            self.manifest
+                .role
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            PairInvalidCharsSnafu {
+                field: "manifest.role"
+            }
         );
         ensure!(
             !self.manifest.description.is_empty()
                 && self.manifest.description.len() <= MAX_DESCRIPTION_LEN,
-            PairBoundsSnafu { what: "manifest.description", limit: MAX_DESCRIPTION_LEN }
+            PairBoundsSnafu {
+                what: "manifest.description",
+                limit: MAX_DESCRIPTION_LEN
+            }
         );
         ensure!(
             !self.manifest.requested_scopes.is_empty()
                 && self.manifest.requested_scopes.len() <= MAX_SCOPES,
-            PairBoundsSnafu { what: "manifest.requested_scopes", limit: MAX_SCOPES }
+            PairBoundsSnafu {
+                what: "manifest.requested_scopes",
+                limit: MAX_SCOPES
+            }
         );
         for scope in &self.manifest.requested_scopes {
             ensure!(
                 !scope.topic_name.is_empty() && scope.topic_name.len() <= MAX_TOPIC_NAME_LEN,
-                PairBoundsSnafu { what: "scope.topic_name", limit: MAX_TOPIC_NAME_LEN }
+                PairBoundsSnafu {
+                    what: "scope.topic_name",
+                    limit: MAX_TOPIC_NAME_LEN
+                }
             );
         }
         let ttl = self.expires.saturating_sub(self.issued_at);
         ensure!(
-            ttl >= MIN_TTL_MS && ttl <= MAX_TTL_MS,
-            PairBoundsSnafu { what: "ttl", limit: MAX_TTL_MS as usize }
+            (MIN_TTL_MS..=MAX_TTL_MS).contains(&ttl),
+            PairBoundsSnafu {
+                what: "ttl",
+                limit: MAX_TTL_MS as usize
+            }
         );
         Ok(())
     }
@@ -349,7 +382,8 @@ mod grant_tests {
 
         let nonce = [9u8; 32];
         let grant = sample_grant(root_pk, signed_cap(&root_sk, [7u8; 32]), nonce);
-        let mut env = PairGrantEnvelope::seal_and_sign(&grant, &bob_ephemeral_pk, &root_sk).unwrap();
+        let mut env =
+            PairGrantEnvelope::seal_and_sign(&grant, &bob_ephemeral_pk, &root_sk).unwrap();
         env.signature[0] ^= 0x01;
         assert!(env.open_and_verify(&bob_ephemeral_sk, &nonce).is_err());
     }
@@ -488,48 +522,106 @@ mod request_tests {
         let baseline = req.signing_bytes().unwrap();
 
         // version
-        let mut m = req.clone(); m.version = 2;
+        let mut m = req.clone();
+        m.version = 2;
         assert_ne!(m.signing_bytes().unwrap(), baseline, "version not covered");
         // agent_pubkey
-        let mut m = req.clone(); m.agent_pubkey = [0xff; 32];
-        assert_ne!(m.signing_bytes().unwrap(), baseline, "agent_pubkey not covered");
+        let mut m = req.clone();
+        m.agent_pubkey = [0xff; 32];
+        assert_ne!(
+            m.signing_bytes().unwrap(),
+            baseline,
+            "agent_pubkey not covered"
+        );
         // agent_x25519
-        let mut m = req.clone(); m.agent_x25519 = [0xff; 32];
-        assert_ne!(m.signing_bytes().unwrap(), baseline, "agent_x25519 not covered");
+        let mut m = req.clone();
+        m.agent_x25519 = [0xff; 32];
+        assert_ne!(
+            m.signing_bytes().unwrap(),
+            baseline,
+            "agent_x25519 not covered"
+        );
         // ephemeral_x25519
-        let mut m = req.clone(); m.ephemeral_x25519 = [0xff; 32];
-        assert_ne!(m.signing_bytes().unwrap(), baseline, "ephemeral_x25519 not covered");
+        let mut m = req.clone();
+        m.ephemeral_x25519 = [0xff; 32];
+        assert_ne!(
+            m.signing_bytes().unwrap(),
+            baseline,
+            "ephemeral_x25519 not covered"
+        );
         // dial.node_id
-        let mut m = req.clone(); m.dial.node_id = "ff".repeat(32);
-        assert_ne!(m.signing_bytes().unwrap(), baseline, "dial.node_id not covered");
+        let mut m = req.clone();
+        m.dial.node_id = "ff".repeat(32);
+        assert_ne!(
+            m.signing_bytes().unwrap(),
+            baseline,
+            "dial.node_id not covered"
+        );
         // dial.addrs
-        let mut m = req.clone(); m.dial.addrs = vec!["10.0.0.1:9999".into()];
-        assert_ne!(m.signing_bytes().unwrap(), baseline, "dial.addrs not covered");
+        let mut m = req.clone();
+        m.dial.addrs = vec!["10.0.0.1:9999".into()];
+        assert_ne!(
+            m.signing_bytes().unwrap(),
+            baseline,
+            "dial.addrs not covered"
+        );
         // dial.relay
-        let mut m = req.clone(); m.dial.relay = Some("https://relay.example".into());
-        assert_ne!(m.signing_bytes().unwrap(), baseline, "dial.relay not covered");
+        let mut m = req.clone();
+        m.dial.relay = Some("https://relay.example".into());
+        assert_ne!(
+            m.signing_bytes().unwrap(),
+            baseline,
+            "dial.relay not covered"
+        );
         // manifest.role
-        let mut m = req.clone(); m.manifest.role = "other-role".into();
-        assert_ne!(m.signing_bytes().unwrap(), baseline, "manifest.role not covered");
+        let mut m = req.clone();
+        m.manifest.role = "other-role".into();
+        assert_ne!(
+            m.signing_bytes().unwrap(),
+            baseline,
+            "manifest.role not covered"
+        );
         // manifest.description
-        let mut m = req.clone(); m.manifest.description = "different".into();
-        assert_ne!(m.signing_bytes().unwrap(), baseline, "manifest.description not covered");
+        let mut m = req.clone();
+        m.manifest.description = "different".into();
+        assert_ne!(
+            m.signing_bytes().unwrap(),
+            baseline,
+            "manifest.description not covered"
+        );
         // manifest.requested_scopes
-        let mut m = req.clone(); m.manifest.requested_scopes[0].topic_name = "mail.inbox".into();
-        assert_ne!(m.signing_bytes().unwrap(), baseline, "requested_scopes not covered");
+        let mut m = req.clone();
+        m.manifest.requested_scopes[0].topic_name = "mail.inbox".into();
+        assert_ne!(
+            m.signing_bytes().unwrap(),
+            baseline,
+            "requested_scopes not covered"
+        );
         // nonce
-        let mut m = req.clone(); m.nonce = [0xff; 32];
+        let mut m = req.clone();
+        m.nonce = [0xff; 32];
         assert_ne!(m.signing_bytes().unwrap(), baseline, "nonce not covered");
         // issued_at
-        let mut m = req.clone(); m.issued_at = now + 1;
-        assert_ne!(m.signing_bytes().unwrap(), baseline, "issued_at not covered");
+        let mut m = req.clone();
+        m.issued_at = now + 1;
+        assert_ne!(
+            m.signing_bytes().unwrap(),
+            baseline,
+            "issued_at not covered"
+        );
         // expires
-        let mut m = req.clone(); m.expires = now + 6 * 60 * 1000;
+        let mut m = req.clone();
+        m.expires = now + 6 * 60 * 1000;
         assert_ne!(m.signing_bytes().unwrap(), baseline, "expires not covered");
 
         // signature itself MUST NOT be covered (otherwise sign() is recursive)
-        let mut m = req.clone(); m.signature = [0xff; 64];
-        assert_eq!(m.signing_bytes().unwrap(), baseline, "signature must be excluded");
+        let mut m = req.clone();
+        m.signature = [0xff; 64];
+        assert_eq!(
+            m.signing_bytes().unwrap(),
+            baseline,
+            "signature must be excluded"
+        );
     }
 }
 
@@ -611,8 +703,7 @@ impl<H: PairHandler> PairProtocol<H> {
         mut send: iroh::endpoint::SendStream,
         mut recv: iroh::endpoint::RecvStream,
     ) -> crate::error::Result<()> {
-        let frame: PairFrame =
-            crate::framing::read_frame(&mut recv, MAX_FRAME_LEN).await?;
+        let frame: PairFrame = crate::framing::read_frame(&mut recv, MAX_FRAME_LEN).await?;
 
         let response = match frame {
             PairFrame::Grant(envelope) => {
@@ -698,10 +789,10 @@ impl PairClient {
                 endpoint_addr = endpoint_addr.with_ip_addr(sa);
             }
         }
-        if let Some(r) = &dial.relay {
-            if let Ok(url) = r.parse::<iroh::RelayUrl>() {
-                endpoint_addr = endpoint_addr.with_relay_url(url);
-            }
+        if let Some(r) = &dial.relay
+            && let Ok(url) = r.parse::<iroh::RelayUrl>()
+        {
+            endpoint_addr = endpoint_addr.with_relay_url(url);
         }
 
         let conn = tokio::time::timeout(
@@ -724,8 +815,7 @@ impl PairClient {
         })?;
         crate::framing::write_frame(&mut send, &PairFrame::Grant(envelope)).await?;
         send.finish().ok();
-        let frame: PairFrame =
-            crate::framing::read_frame(&mut recv, MAX_FRAME_LEN).await?;
+        let frame: PairFrame = crate::framing::read_frame(&mut recv, MAX_FRAME_LEN).await?;
         match frame {
             PairFrame::Ack(a) => Ok(a),
             PairFrame::Reject(r) => Err(NetError::PairRejected {
@@ -763,7 +853,10 @@ mod frame_tests {
 
     #[test]
     fn ack_frame_roundtrip() {
-        let f = PairFrame::Ack(PairAck { installed_cap_id: [9u8; 16], installed_at: 42 });
+        let f = PairFrame::Ack(PairAck {
+            installed_cap_id: [9u8; 16],
+            installed_at: 42,
+        });
         let j = serde_json::to_vec(&f).unwrap();
         let back: PairFrame = serde_json::from_slice(&j).unwrap();
         assert!(matches!(back, PairFrame::Ack(_)));
