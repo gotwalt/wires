@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::{Endpoint, SecretKey, endpoint::presets};
-use wires_net::invite::PeerHint;
+use wires_net::PeerHint;
 use wires_net::peer_hint::first_reachable;
 use wires_net::tenant::{
     ALPN as TENANT_ALPN, TenantErrorCode, TenantErrorResponse, TenantHandler, TenantProtocol,

@@ -12,7 +12,7 @@ use crate::error::{
     NetError, PairBoundsSnafu, PairCryptoSnafu, PairInvalidCharsSnafu, PairSignatureSnafu,
     PairUnsupportedVersionSnafu, Result, SerdeSnafu,
 };
-use crate::invite::PeerHint;
+use crate::peer_hint::PeerHint;
 
 pub const ALPN: &[u8] = b"/wires/pair/0";
 
