@@ -12,7 +12,7 @@ pub mod sync;
 
 pub use config::{HostConfig, NodeConfig};
 pub use error::{NodeError, Result};
-pub use pair::{InstallOutcome, install_grant};
+pub use pair::{InstallOutcome, NodePairHandler, PairOutcome, install_grant};
 pub use inbound::{Inbound, InboundCtx, process as process_inbound};
 pub use net_glue::NetGlue;
 pub use node::{DecryptedEvent, Node};
