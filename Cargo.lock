@@ -4915,7 +4915,6 @@ dependencies = [
 name = "wires-net"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "base64",

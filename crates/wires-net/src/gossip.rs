@@ -52,7 +52,6 @@ impl GossipHandle {
         self.sender
             .broadcast(Bytes::from(payload))
             .await
-            .map_err(anyhow::Error::from)
             .context(GossipPublishSnafu)?;
         Ok(())
     }
@@ -158,7 +157,6 @@ impl GossipNode {
             .gossip
             .subscribe(iroh_topic, bootstrap)
             .await
-            .map_err(anyhow::Error::from)
             .context(GossipSubscribeSnafu)?;
 
         let (sender, mut receiver) = topic.split();

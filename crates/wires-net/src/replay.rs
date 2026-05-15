@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use wires_core::{MessageHash, WireMessage};
 
-use crate::error::{IoSnafu, ReplayRpcSnafu, Result};
+use crate::error::{IoSnafu, ReplayConnectSnafu, ReplayOpenBiSnafu, ReplaySourceSnafu, Result};
 use crate::framing::{read_frame, write_frame};
 
 /// ALPN advertised for the wires replay protocol.
@@ -89,8 +89,7 @@ impl<S: ReplaySource> ReplayProtocol<S> {
         let all_senders = self
             .source
             .all_senders_for(&req.topic_id)
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .context(ReplayRpcSnafu)?;
+            .context(ReplaySourceSnafu)?;
         let mut emitted: u32 = 0;
         for sender in all_senders {
             if emitted >= req.limit {
@@ -101,8 +100,7 @@ impl<S: ReplaySource> ReplayProtocol<S> {
             let batch = self
                 .source
                 .read_after(&req.topic_id, &sender, after, remaining)
-                .map_err(|e| anyhow::anyhow!("{e}"))
-                .context(ReplayRpcSnafu)?;
+                .context(ReplaySourceSnafu)?;
             for msg in batch {
                 write_frame(&mut send, &ReplayResponseFrame { msg: Some(msg) }).await?;
                 emitted += 1;
@@ -161,13 +159,8 @@ impl ReplayClient {
             .endpoint
             .connect(peer, ALPN)
             .await
-            .map_err(|e| anyhow::Error::msg(format!("{e}")))
-            .context(ReplayRpcSnafu)?;
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| anyhow::Error::msg(format!("{e}")))
-            .context(ReplayRpcSnafu)?;
+            .context(ReplayConnectSnafu)?;
+        let (mut send, mut recv) = conn.open_bi().await.context(ReplayOpenBiSnafu)?;
 
         write_frame(&mut send, request).await?;
         send.finish()
