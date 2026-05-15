@@ -18,7 +18,7 @@ pub async fn pair(data_dir: &Path, discovery_url: &str) -> Result<(), Box<dyn st
     let root_bytes = std::fs::read(data_dir.join("root.ed25519"))?;
     if root_bytes.len() != 32 {
         return Err(
-            "root.ed25519 must be 32 bytes — `wires invite` requires the local root.".into(),
+            "root.ed25519 must be 32 bytes — `wires host pair` requires the local root.".into(),
         );
     }
     let root = SigningKey::from_bytes(&root_bytes.try_into().unwrap());
