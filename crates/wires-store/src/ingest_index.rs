@@ -61,6 +61,38 @@ impl IngestIndex {
         Ok(total)
     }
 
+    /// Return the oldest (lowest ingest_seq) entry still stored, or `None` if
+    /// the index is empty.
+    pub fn oldest_entry(&self) -> Result<Option<IngestEntry>> {
+        let read = self.db.begin_read().context(BeginTxnSnafu)?;
+        let table = match read.open_table(INGEST_INDEX) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(crate::error::StoreError::OpenTable { source: e, location: snafu::location!() }),
+        };
+        let mut iter = table.iter().context(StorageIoSnafu)?;
+        let Some(first) = iter.next() else { return Ok(None); };
+        let (_k, v) = first.context(StorageIoSnafu)?;
+        let raw = v.value();
+        if raw.len() < 76 {
+            return Ok(None);
+        }
+        let mut topic_id = [0u8; 32];
+        topic_id.copy_from_slice(&raw[0..32]);
+        let mut sender = [0u8; 32];
+        sender.copy_from_slice(&raw[32..64]);
+        let mut sb = [0u8; 8];
+        sb.copy_from_slice(&raw[64..72]);
+        let mut bb = [0u8; 4];
+        bb.copy_from_slice(&raw[72..76]);
+        Ok(Some(IngestEntry {
+            topic_id,
+            sender,
+            seq: u64::from_be_bytes(sb),
+            bytes: u32::from_be_bytes(bb),
+        }))
+    }
+
     /// Evict the oldest entries until `total_bytes() ≤ budget_bytes`. Returns the
     /// dropped entries in ingest order (oldest first).
     pub fn evict_oldest_until(&self, budget_bytes: u64) -> Result<Vec<IngestEntry>> {
@@ -208,5 +240,43 @@ mod tests {
         let dropped = idx.evict_oldest_until(1000).unwrap();
         assert!(dropped.is_empty());
         assert_eq!(idx.total_bytes().unwrap(), 100);
+    }
+
+    #[test]
+    fn oldest_entry_empty_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
+        let idx = IngestIndex::new(db);
+        assert!(idx.oldest_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn oldest_entry_returns_first_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
+        let idx = IngestIndex::new(db);
+        let e0 = entry(1, 9, 0, 100);
+        let e1 = entry(2, 8, 1, 200);
+        let e2 = entry(3, 7, 2, 50);
+        idx.record(&e0).unwrap();
+        idx.record(&e1).unwrap();
+        idx.record(&e2).unwrap();
+        let oldest = idx.oldest_entry().unwrap().unwrap();
+        assert_eq!(oldest, e0);
+    }
+
+    #[test]
+    fn oldest_entry_advances_after_eviction() {
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
+        let idx = IngestIndex::new(db);
+        let e0 = entry(1, 9, 0, 100);
+        let e1 = entry(2, 8, 1, 200);
+        idx.record(&e0).unwrap();
+        idx.record(&e1).unwrap();
+        // Evict until ≤ 200 — evicts e0 (100 bytes), leaves e1 (200).
+        idx.evict_oldest_until(200).unwrap();
+        let oldest = idx.oldest_entry().unwrap().unwrap();
+        assert_eq!(oldest, e1);
     }
 }

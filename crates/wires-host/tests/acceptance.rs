@@ -10,6 +10,8 @@ use iroh::{Endpoint, SecretKey, endpoint::presets};
 use rand_core::OsRng;
 use tempfile::TempDir;
 use wires_host::http_discovery::{self, DiscoveryEndpoint, DiscoveryResponse, DiscoveryState};
+use wires_host::per_tenant_logs::PerTenantLogs;
+use wires_host::retention::Retention;
 use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
 use wires_net::tenant::{
     ALPN as TENANT_ALPN, TenantClient, TenantProtocol, TenantRegisterRequest, TenantRequest,
@@ -25,6 +27,8 @@ fn endpoint_id_bytes(ep: &Endpoint) -> [u8; 32] {
 async fn end_to_end_register_via_http_discovery() {
     let tmp = TempDir::new().unwrap();
     let registry = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
+    let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+    let retention = Arc::new(Retention::new(tmp.path(), Arc::clone(&logs)));
 
     let host_secret = SecretKey::generate();
     let host_ep = Endpoint::builder(presets::N0)
@@ -37,6 +41,7 @@ async fn end_to_end_register_via_http_discovery() {
 
     let handler = Arc::new(TenantHandlerImpl {
         registry: Arc::clone(&registry),
+        retention,
         host_endpoint_id: host_eid_bytes,
         config: TenantHandlerConfig::default(),
         now_ms: Arc::new(|| 1_000_000i64),

@@ -14,13 +14,17 @@ use wires_net::tenant::{
     TenantErrorCode, TenantHandler, TenantRegisterRequest, TenantResponse, register_signing_bytes,
 };
 
+
 #[test]
 fn handle_register_rejects_bad_signature() {
     let tmp = TempDir::new().unwrap();
     let reg = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
+    let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+    let retention = Arc::new(Retention::new(tmp.path(), Arc::clone(&logs)));
     let host_endpoint_id = [42u8; 32];
     let handler = TenantHandlerImpl {
         registry: Arc::clone(&reg),
+        retention,
         host_endpoint_id,
         config: TenantHandlerConfig::default(),
         now_ms: Arc::new(|| 1_000_000),
@@ -46,9 +50,12 @@ fn handle_register_rejects_bad_signature() {
 fn handle_register_rejects_replayed_nonce() {
     let tmp = TempDir::new().unwrap();
     let reg = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
+    let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+    let retention = Arc::new(Retention::new(tmp.path(), Arc::clone(&logs)));
     let host_endpoint_id = [42u8; 32];
     let handler = TenantHandlerImpl {
         registry: Arc::clone(&reg),
+        retention,
         host_endpoint_id,
         config: TenantHandlerConfig::default(),
         now_ms: Arc::new(|| 1_000_000),
