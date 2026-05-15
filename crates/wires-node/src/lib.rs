@@ -1,3 +1,4 @@
+pub mod atomic_write;
 pub mod config;
 pub mod error;
 pub mod inbound;
