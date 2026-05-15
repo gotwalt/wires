@@ -7,7 +7,7 @@ pub mod publish;
 pub mod storage;
 pub mod sync;
 
-pub use config::NodeConfig;
+pub use config::{HostConfig, NodeConfig};
 pub use error::{NodeError, Result};
 pub use inbound::{Inbound, InboundCtx, process as process_inbound};
 pub use net_glue::NetGlue;

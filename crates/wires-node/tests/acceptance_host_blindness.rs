@@ -24,7 +24,7 @@ fn host_persists_but_cannot_decrypt() {
         Node::open(NodeConfig {
             data_dir: tmp_a.path().to_path_buf(),
             root_pubkey_hex: root_hex.clone(),
-            bootstrap_peers: vec![],
+            host: None,
         })
         .unwrap(),
     );
@@ -32,7 +32,7 @@ fn host_persists_but_cannot_decrypt() {
         Node::open(NodeConfig {
             data_dir: tmp_host.path().to_path_buf(),
             root_pubkey_hex: root_hex.clone(),
-            bootstrap_peers: vec![],
+            host: None,
         })
         .unwrap(),
     );
