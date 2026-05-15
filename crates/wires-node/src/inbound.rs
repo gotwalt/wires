@@ -35,7 +35,6 @@ pub struct InboundCtx<'a> {
 }
 
 pub fn process(ctx: &InboundCtx, msg: WireMessage) -> Result<Inbound> {
-    // 1. Envelope signature
     if verify_envelope(&msg).is_err() {
         let hash = msg.message_hash().unwrap_or_default();
         return Ok(Inbound::Rejected {
@@ -44,7 +43,6 @@ pub fn process(ctx: &InboundCtx, msg: WireMessage) -> Result<Inbound> {
         });
     }
 
-    // 2. Cap check (coarse): cap_id known and not revoked, AND issued to this sender pubkey.
     let entry = ctx.cap_table.get(&msg.cap_id).context(StoreSnafu)?;
     let cap_ok = matches!(&entry, Some(e) if !e.revoked && e.cap.agent == msg.sender);
     if !cap_ok {
@@ -55,7 +53,6 @@ pub fn process(ctx: &InboundCtx, msg: WireMessage) -> Result<Inbound> {
         });
     }
 
-    // 3. Hash-chain link check (if we have prior messages from this sender)
     let prior = if msg.seq == 0 {
         None
     } else {
@@ -73,17 +70,16 @@ pub fn process(ctx: &InboundCtx, msg: WireMessage) -> Result<Inbound> {
         });
     }
 
-    // 4. Persist (idempotent)
     let _newly = ctx.topic_log.append(&msg).context(StoreSnafu)?;
 
-    // 5. Compute AAD per the publish-time pattern (ciphertext + payload_len zeroed).
+    // AAD mirrors the publish-time placeholder envelope: ciphertext, payload_len,
+    // and signature zeroed. See publish.rs.
     let mut aad_view = msg.clone();
     aad_view.ciphertext = vec![];
     aad_view.payload_len = 0;
     aad_view.signature = [0u8; 64];
     let aad = aad_view.signing_bytes().context(CoreSnafu)?;
 
-    // 6. Try to decrypt content based on kind
     let content = match &msg.kind {
         MessageKind::Standard => match ctx.epoch_keys.get(msg.epoch).context(StoreSnafu)? {
             Some(key) => decrypt_standard(
@@ -112,7 +108,6 @@ pub fn process(ctx: &InboundCtx, msg: WireMessage) -> Result<Inbound> {
         MessageKind::Public => CanonicalContent::from_canonical_bytes(&msg.ciphertext).ok(),
     };
 
-    // 7. Reserved-type/mode enforcement once content is known
     if let Some(c) = &content
         && check_kind_matches(&c.type_, &msg.kind).is_err()
     {

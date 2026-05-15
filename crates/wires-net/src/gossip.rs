@@ -37,10 +37,6 @@ use crate::error::{GossipPublishSnafu, GossipSubscribeSnafu, NetError};
 /// Capacity of the inbound message channel created per topic join.
 const INBOUND_CHANNEL_CAP: usize = 256;
 
-// ---------------------------------------------------------------------------
-// GossipHandle
-// ---------------------------------------------------------------------------
-
 /// Handle for publishing messages into a joined gossip topic.
 ///
 /// Obtained from [`GossipNode::join`].  Cheap to clone; all clones share the
@@ -52,8 +48,6 @@ pub struct GossipHandle {
 
 impl GossipHandle {
     /// Broadcast `payload` to all peers on this topic.
-    ///
-    /// Errors are mapped to [`NetError::GossipPublish`].
     pub async fn broadcast(&self, payload: Vec<u8>) -> Result<(), NetError> {
         self.sender
             .broadcast(Bytes::from(payload))
@@ -63,10 +57,6 @@ impl GossipHandle {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// GossipNode
-// ---------------------------------------------------------------------------
 
 /// Wraps an [`iroh::Endpoint`], a [`Gossip`] actor, and (optionally) a protocol
 /// [`Router`].
@@ -92,8 +82,6 @@ impl GossipNode {
     /// Wrap an already-bound [`Endpoint`], spawn a [`Gossip`] actor on top of it,
     /// and register the gossip ALPN with an iroh protocol router so that inbound
     /// connections are accepted.
-    ///
-    /// Errors are mapped to [`NetError::Endpoint`].
     pub async fn new(endpoint: Endpoint) -> Result<Self, NetError> {
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
@@ -119,8 +107,6 @@ impl GossipNode {
     /// correctly. Use this when the same endpoint must accept additional
     /// non-gossip ALPNs from a single router (e.g. wires-node multiplexes
     /// gossip and the replay protocol).
-    ///
-    /// Errors are mapped to [`NetError::Endpoint`].
     pub async fn new_without_router(endpoint: Endpoint) -> Result<(Self, Gossip), NetError> {
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let node = Self {
@@ -158,8 +144,6 @@ impl GossipNode {
     /// - An `mpsc::Receiver<Vec<u8>>` that yields raw inbound message payloads.
     ///   The receiver is fed by a background task that is cancelled when the
     ///   receiver is dropped (sender half will close, ending the background task).
-    ///
-    /// Errors are mapped to [`NetError::GossipSubscribe`].
     pub async fn join(
         &self,
         topic_id: [u8; 32],

@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use wires_core::CanonicalContent;
-use wires_node::{NodeConfig, NodeRuntime};
+use wires_net::cap_id_from_hex;
+use wires_node::{NodeConfig, NodeRuntime, resolve_topic};
 
 use crate::cmd::publish_helpers::{bootstrap_endpoints, register_peer_addresses};
 
@@ -21,7 +22,7 @@ pub async fn run(
     // dial without going through pkarr/DNS.
     register_peer_addresses(&runtime)?;
     let topic_id = resolve_topic(data_dir, topic)?;
-    let cap_id = decode_hex_16(cap)?;
+    let cap_id = cap_id_from_hex(cap).ok_or("cap_id must be 16 bytes (32 hex chars)")?;
 
     runtime.join_topic(topic_id, bootstrap).await?;
     // Give gossip a moment to converge with the bootstrap peer(s) before we
@@ -44,34 +45,4 @@ pub async fn run(
     // Give gossip a moment to drain before exiting.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     Ok(())
-}
-
-pub fn resolve_topic(data_dir: &Path, topic: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    if let Ok(bytes) = hex::decode(topic)
-        && bytes.len() == 32
-    {
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&bytes);
-        return Ok(out);
-    }
-    let map_path = data_dir.join("topic_names.json");
-    let map: std::collections::HashMap<String, String> =
-        serde_json::from_str(&std::fs::read_to_string(map_path)?)?;
-    let hex_id = map
-        .get(topic)
-        .ok_or_else(|| format!("unknown topic '{topic}'"))?;
-    let bytes = hex::decode(hex_id)?;
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
-fn decode_hex_16(s: &str) -> Result<[u8; 16], Box<dyn std::error::Error>> {
-    let bytes = hex::decode(s)?;
-    if bytes.len() != 16 {
-        return Err("cap_id must be 16 bytes (32 hex chars)".into());
-    }
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&bytes);
-    Ok(out)
 }

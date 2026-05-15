@@ -1,9 +1,8 @@
 use std::path::Path;
 
 use chrono::TimeZone;
-use wires_node::{DecryptedEvent, Inbound, NodeConfig, NodeRuntime};
+use wires_node::{DecryptedEvent, Inbound, NodeConfig, NodeRuntime, resolve_topic};
 
-use crate::cmd::publish::resolve_topic;
 use crate::cmd::publish_helpers::{bootstrap_endpoints, register_peer_addresses};
 
 pub async fn run(

@@ -5,15 +5,14 @@
 //! topic. Participates in iroh-gossip and the replay protocol just like any
 //! other wires agent, so peers see live messages and can pull history.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use iroh::{Endpoint, SecretKey, endpoint::presets};
-use wires_net::{ALPN, load_or_create_secret};
-use wires_node::{NetGlue, Node, NodeConfig};
+use wires_net::{ALPN, cap_id_from_hex, endpoint_id_from_hex, load_or_create_secret, unix_now_ms};
+use wires_node::{NetGlue, Node, NodeConfig, load_root_signing_key, resolve_topic};
 
 mod ha;
 mod ingest;
@@ -61,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node = Arc::new(Node::open(cfg.clone())?);
 
     let topic_id = resolve_topic(&args.data_dir, &args.topic)?;
-    let cap_id = decode_hex_16(&args.cap)?;
+    let cap_id = cap_id_from_hex(&args.cap).ok_or("cap_id must be 16 bytes (32 hex chars)")?;
     let access_token = std::fs::read_to_string(&args.token_file)?
         .trim()
         .to_string();
@@ -120,61 +119,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-fn resolve_topic(
-    data_dir: &Path,
-    topic: &str,
-) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
-    if let Ok(bytes) = hex::decode(topic)
-        && bytes.len() == 32
-    {
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&bytes);
-        return Ok(out);
-    }
-    let map_path = data_dir.join("topic_names.json");
-    let map: HashMap<String, String> = serde_json::from_str(&std::fs::read_to_string(map_path)?)?;
-    let hex_id = map
-        .get(topic)
-        .ok_or_else(|| format!("unknown topic '{topic}'"))?;
-    let bytes = hex::decode(hex_id)?;
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
-fn decode_hex_16(s: &str) -> Result<[u8; 16], Box<dyn std::error::Error + Send + Sync>> {
-    let bytes = hex::decode(s)?;
-    if bytes.len() != 16 {
-        return Err("cap_id must be 16 bytes (32 hex chars)".into());
-    }
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
 async fn register_topic_best_effort(
     endpoint: &Endpoint,
     hint: &wires_net::PeerHint,
     topic_id: &[u8; 32],
     data_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bytes = hex::decode(&hint.node_id)?;
-    if bytes.len() != 32 {
-        return Err("host node_id not 32-byte hex".into());
-    }
-    let arr: [u8; 32] = bytes.as_slice().try_into().unwrap();
-    let host_eid = iroh::EndpointId::from_bytes(&arr)?;
-    let root_bytes = std::fs::read(data_dir.join("root.ed25519"))?;
-    if root_bytes.len() != 32 {
-        return Err("root.ed25519 must be 32 bytes".into());
-    }
-    let root = ed25519_dalek::SigningKey::from_bytes(&root_bytes.try_into().unwrap());
+    let host_eid = endpoint_id_from_hex(&hint.node_id).ok_or("host node_id is not 32-byte hex")?;
+    let host_eid_bytes = *host_eid.as_bytes();
+    let root = load_root_signing_key(data_dir)?;
     let client = wires_net::tenant::TenantClient::new(endpoint.clone());
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis() as i64;
     let resp = client
-        .register_topic(host_eid, &root, topic_id, &arr, now)
+        .register_topic(host_eid, &root, topic_id, &host_eid_bytes, unix_now_ms())
         .await?;
     match resp {
         wires_net::tenant::TenantResponse::TopicRegister(r) if r.ok => Ok(()),

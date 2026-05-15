@@ -1,5 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use wires_net::PeerHint;
 
@@ -34,6 +35,21 @@ impl NodeConfig {
     pub fn caps_topic_id(&self) -> [u8; 32] {
         derived_topic_id("wires.caps.v1", &self.root_pubkey_hex)
     }
+}
+
+/// Read the household root signing key from `<data_dir>/root.ed25519`.
+/// Returns an error if the file is missing or not exactly 32 bytes — callers
+/// surface the message verbatim since each path that needs this also wants to
+/// instruct the operator to run `wires init --new-root`.
+pub fn load_root_signing_key(data_dir: &Path) -> std::io::Result<SigningKey> {
+    let bytes = std::fs::read(data_dir.join("root.ed25519"))?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "root.ed25519 must be 32 bytes",
+        )
+    })?;
+    Ok(SigningKey::from_bytes(&arr))
 }
 
 fn derived_topic_id(domain: &str, root_pubkey_hex: &str) -> [u8; 32] {

@@ -17,7 +17,7 @@ use wires_host::routing::{Router as MsgRouter, WriteRateLimiter};
 use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
 use wires_net::replay::{ALPN as REPLAY_ALPN, ReplayProtocol};
 use wires_net::tenant::{ALPN as TENANT_ALPN, TenantProtocol};
-use wires_net::{GOSSIP_ALPN, GossipNode, load_or_create_secret};
+use wires_net::{GOSSIP_ALPN, GossipNode, load_or_create_secret, unix_now_ms};
 
 #[derive(Parser)]
 #[command(
@@ -120,13 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         retention: Arc::clone(&retention),
         host_endpoint_id: endpoint_id_bytes,
         config: TenantHandlerConfig::default(),
-        now_ms: Arc::new(|| {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64
-        }),
+        now_ms: Arc::new(unix_now_ms),
         on_topic_registered: Arc::new(move |_root, topic| {
             let _ = subscribe_tx_clone.send(topic);
         }),

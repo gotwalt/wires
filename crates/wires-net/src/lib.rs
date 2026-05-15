@@ -1,4 +1,3 @@
-pub mod base64url;
 pub mod discovery;
 pub mod error;
 pub mod framing;
@@ -8,6 +7,7 @@ pub mod pair;
 pub mod peer_hint;
 pub mod replay;
 pub mod tenant;
+pub mod time;
 
 pub use discovery::{DiscoveryEndpoint, DiscoveryResponse, fetch_endpoints};
 pub use error::{NetError, Result};
@@ -19,7 +19,10 @@ pub use pair::{
     PairProtocol, PairReject, PairRejectCode, PairRequest, RequestedScope, TopicEpochKey,
     TopicNameEntry,
 };
-pub use peer_hint::{DialOutcome, PeerHint, first_reachable, first_reachable_with_discovery};
+pub use peer_hint::{
+    PeerHint, cap_id_from_hex, endpoint_id_from_hex, first_reachable,
+    first_reachable_with_discovery,
+};
 pub use replay::{
     ALPN, HwmEntry, ReplayClient, ReplayProtocol, ReplayRequest, ReplayResponseFrame, ReplaySource,
 };
@@ -30,3 +33,4 @@ pub use tenant::{
     TopicRegisterResponse, TopicUnregisterRequest, TopicUnregisterResponse, register_signing_bytes,
     status_signing_bytes, topic_register_signing_bytes, topic_unregister_signing_bytes,
 };
+pub use time::unix_now_ms;
