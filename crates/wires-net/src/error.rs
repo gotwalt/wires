@@ -132,6 +132,44 @@ pub enum NetError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Ticket base64 decode failed, at {location}"))]
+    TicketDecode {
+        #[snafu(source)]
+        source: base64::DecodeError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Ticket JSON parse failed, at {location}"))]
+    TicketParse {
+        #[snafu(source)]
+        source: serde_json::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Ticket bounds: {what} exceeds limit {limit}, at {location}"))]
+    TicketBounds {
+        what: &'static str,
+        limit: usize,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Ticket unsupported version {version}, at {location}"))]
+    TicketUnsupportedVersion {
+        version: u8,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Ticket endpoint_id was not valid 32-byte hex, at {location}"))]
+    TicketInvalidEndpointId {
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Ticket QR rendering failed: {source}, at {location}"))]
+    TicketQrRender {
+        source: qrcode::types::QrError,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = NetError> = core::result::Result<T, E>;
