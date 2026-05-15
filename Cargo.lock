@@ -4787,6 +4787,7 @@ dependencies = [
  "wires-host",
  "wires-net",
  "wires-node",
+ "wires-store",
  "x25519-dalek",
 ]
 

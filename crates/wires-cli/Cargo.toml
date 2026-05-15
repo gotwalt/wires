@@ -13,9 +13,10 @@ name = "wires"
 path = "src/main.rs"
 
 [dependencies]
-wires-core = { workspace = true }
-wires-node = { workspace = true }
-wires-net  = { workspace = true }
+wires-core  = { workspace = true }
+wires-node  = { workspace = true }
+wires-net   = { workspace = true }
+wires-store = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 snafu = { workspace = true }
