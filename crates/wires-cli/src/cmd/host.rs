@@ -178,6 +178,24 @@ pub async fn topic_unregister(
     }
 }
 
-pub async fn status(_data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    Err("wires host status: not implemented yet (Task 13)".into())
+pub async fn status(data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let (client, host_eid, host_eid_bytes, root) = open_paired_client(data_dir).await?;
+    let resp = client
+        .tenant_status(host_eid, &root, &host_eid_bytes, now_ms())
+        .await?;
+    match resp {
+        TenantResponse::Status(s) => {
+            println!("Tenant status (as reported by host):");
+            println!("  registered_at         : {}", s.registered_at);
+            println!("  topic_count           : {}", s.topic_count);
+            println!("  bytes_stored          : {}", s.bytes_stored);
+            println!("  retention_budget      : {}", s.retention_budget_bytes);
+            println!("  oldest_retained_at    : {}", s.oldest_retained_at);
+            println!("  write_rate_limit_per_sec : {}", s.write_rate_limit_per_sec);
+            println!("  status                : {:?}", s.status);
+            Ok(())
+        }
+        TenantResponse::Error(e) => Err(format!("host rejected: {:?} — {}", e.code, e.message).into()),
+        other => Err(format!("unexpected response: {other:?}").into()),
+    }
 }
