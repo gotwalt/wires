@@ -1,6 +1,6 @@
 # wires — iroh-native host-ticket discovery
 
-**Status:** design, 2026-05-15. Replaces the HTTPS `/v1/bootstrap` surface defined in the hosted-service spec §7 with an iroh-native QR/paste artifact. Augments the responder-driven-pairing spec §4 by repurposing `PairGrant.HostInfo.service_discovery_url` into a `refresh_ticket` field of the same shape.
+**Status:** design, 2026-05-15. Replaces the HTTPS `/v1/bootstrap` surface defined in the hosted-service spec §7 with an iroh-native QR/paste artifact. Drops `PairGrant.HostInfo.service_discovery_url` from the responder-driven-pairing spec §4 — the field's job (recover from stale `peer_hints`) is already covered by iroh's pkarr/DNS + mDNS resolution layer, so nothing replaces it.
 
 ## 1. Motivation
 
@@ -32,10 +32,7 @@ This spec introduces a **`HostTicket`**: a small, self-contained, base64-encoded
 
 **Changed:**
 
-- `pair::HostInfo.service_discovery_url: Option<String>` → `pair::HostInfo.refresh_ticket: Option<String>`. Same shape (opaque string carried in `PairGrant`), different contents (a base64 `HostTicket` rather than an HTTPS URL).
-- `peer_hint::first_reachable_with_discovery` → `peer_hint::first_reachable_with_ticket`. Iterates `peer_hints` as today; on exhaustion, decodes `refresh_ticket` and retries against the embedded hints. No network fetch.
 - `wires-cli`: `wires host pair --discovery-url <URL>` → `wires host pair --ticket <STRING>` (also accepts `@path` to read from a file). Same swap on `host topic-register`, `host topic-unregister`, `host status`.
-- `wires-cli` host-pair success path writes the captured ticket to `~/.wires/host_ticket.txt` so future `pair-approve` invocations can embed it in `PairGrant.host.refresh_ticket` without re-prompting.
 - `wires pair-listen --qr` becomes a real renderer (currently it prints a hint telling the user to pipe to `qrencode`). Same `qrcode 0.14` dep handles both.
 
 **Deleted:**
@@ -45,7 +42,10 @@ This spec introduces a **`HostTicket`**: a small, self-contained, base64-encoded
 - `axum` boot in `wires-host/src/main.rs` (the discovery axum task and its config plumbing).
 - `reqwest` dependency from `wires-net`.
 - `axum` dependency from `wires-host` (was only used for the discovery surface).
-- Integration tests that stand up an axum harness for discovery — see §7 for rewrites.
+- `pair::HostInfo.service_discovery_url` field (see §6 for the rationale).
+- `peer_hint::first_reachable_with_discovery` (and its test fixture). The remaining `peer_hint::first_reachable` is sufficient — see §7.
+- `wires-node::config::HostConfig.discovery_url` field. No replacement.
+- Integration tests that stand up an axum harness for discovery — see §10 for rewrites.
 
 **Unchanged:**
 
@@ -101,8 +101,10 @@ impl HostTicket {
     pub fn encode(&self) -> Result<String, NetError>;
     pub fn decode(s: &str) -> Result<Self, NetError>;
 
-    /// `HostTicket` → `PeerHint`. Adapter used by the bootstrap loop in
-    /// `peer_hint::first_reachable_with_ticket`.
+    /// `HostTicket` → `PeerHint`. Adapter used by the CLI when dispatching
+    /// `wires host …` subcommands: the `--ticket` value is decoded into a
+    /// `HostTicket`, converted to a `PeerHint`, and handed to
+    /// `peer_hint::first_reachable`.
     pub fn to_peer_hint(&self) -> crate::peer_hint::PeerHint;
 
     /// Render the encoded ticket as an ANSI-art QR code. Returns a string the
@@ -169,13 +171,7 @@ wires host status                   --ticket <STRING>
 
 `<STRING>` is the raw URL-safe base64 ticket, or `@<path>` to read it from a file. The `@<path>` convention is implemented in a custom clap value parser (not native clap behavior); the parser strips a leading `@`, reads the named file via `std::fs::read_to_string`, trims whitespace, and decodes the result. The same parser validates raw tokens via `HostTicket::decode`. Failures surface as a clear CLI error before any iroh call.
 
-**Side-effect of `wires host pair` success.** On a successful tenant register, the operator CLI writes the ticket it just used to `<operator_cli_data_dir>/host_ticket.txt` (mode `0600` to match other operator-side state — `<operator_cli_data_dir>` is the operator's `wires-cli` data dir, distinct from the host process's data dir). Subsequent `wires pair-approve` invocations on the same operator CLI read this file to populate `PairGrant.host.refresh_ticket`. Operators who run `wires-host` and `wires-cli` from different machines (or want fresher hints) override with an explicit flag at pair-approve time:
-
-```
-wires pair-approve <TOKEN> [--refresh-ticket <STRING>]
-```
-
-If `--refresh-ticket` is provided, it overrides the cached file. If neither is available, the grant goes out with `refresh_ticket = None`; iroh resolution still works, the receiver just has no manual fallback if their cached `peer_hints` all go stale.
+The ticket is consumed in-process only — there is no on-disk cache and `wires pair-approve` gains no new flag. The operator's `wires host pair` flow already persists the host's `EndpointId` into the operator-side config (it's how `pair-approve` already populates `PairGrant.HostInfo.peer_hints`); the ticket itself doesn't need to survive past the command that used it.
 
 **Removed flags.** `--discovery-url` on all four `host` subcommands. No shim; no deprecation period. Prototype rules per CLAUDE.md.
 
@@ -189,42 +185,23 @@ If `--refresh-ticket` is provided, it overrides the cached file. If neither is a
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostInfo {
     pub peer_hints: Vec<PeerHint>,
-    /// Opaque base64-encoded HostTicket. Single source of truth when
-    /// `peer_hints` go stale. Replaces the v1 `service_discovery_url`.
-    pub refresh_ticket: Option<String>,
 }
 ```
 
-Field rename only; both fields are an `Option<String>` so on-disk JSON in `pair_pending.json` and in any test fixtures changes shape only by key name. No `version`-bump on `PairGrant` itself — the responder-driven-pairing spec's `version: 1` field changes meaning of `HostInfo` but the surrounding envelope is unchanged. This is acceptable because:
+The `service_discovery_url: Option<String>` field is deleted with no replacement. The field's job in the v1 design was "give Bob a fallback when his cached `peer_hints` go stale" — a real concern in the HTTPS world, because the discovery URL was a *live indirection* (URL → current addrs). A ticket would not be a live indirection; it would be another static snapshot, identical in structure to the `peer_hints` snapshot already in `HostInfo`. Two snapshots of the same data add complexity without adding recovery capability.
 
-- The responder-driven-pairing spec was newly landed and has no shipped consumers outside the wires repo.
-- Mid-flight `PairGrant`s do not survive process restart (`pair_pending.json` is a Bob-side artifact, not an Alice-side one); there's no compat horizon.
-- The substrate spec's `version` discipline is reserved for envelope structure, not for HostInfo content shifts.
+Liveness is already provided by iroh: given an `EndpointId` (always present in `peer_hints[0]`), iroh's pkarr/DNS resolves the host's *current* socket addresses. The mDNS lookup (default-on per the mDNS-discovery spec) does the same on-LAN. If every entry in `peer_hints` becomes unreachable, iroh's resolution layer transparently re-resolves the same `EndpointId` to a fresh `EndpointAddr`. No application-layer fallback is needed.
+
+No `version`-bump on `PairGrant` itself. The responder-driven-pairing spec was newly landed and has no shipped consumers outside the wires repo; mid-flight `PairGrant`s do not survive process restart (`pair_pending.json` is a Bob-side artifact); the substrate spec's `version` discipline is reserved for envelope structure, not for HostInfo content shifts.
 
 ## 7. `peer_hint` — bootstrap iteration
 
-Rename:
-
-```rust
-// crates/wires-net/src/peer_hint.rs
-
-pub async fn first_reachable_with_ticket(
-    endpoint: &Endpoint,
-    peer_hints: &[PeerHint],
-    refresh_ticket: Option<&str>,
-    alpn: &[u8],
-    per_hint_timeout: Duration,
-) -> Option<EndpointId>;
-```
-
-Implementation: iterate `peer_hints` against `first_reachable` (unchanged). If that returns `None` and `refresh_ticket.is_some()`, decode via `HostTicket::decode` (errors logged at `warn` and swallowed — fallback is best-effort), convert via `to_peer_hint()` into a single-element `Vec<PeerHint>`, and call `first_reachable` once more. Return that.
-
-No reqwest, no async fetch, no `axum`-shaped test fixture.
+The `peer_hint::first_reachable_with_discovery` helper is deleted along with the HTTPS surface. `peer_hint::first_reachable` (already present, unchanged) is the only iteration helper; it iterates `peer_hints` in order, dials each, returns the first that succeeds, and returns `None` on exhaustion. Re-resolution of stale addresses happens inside iroh, transparently to this layer.
 
 Consumers:
 
-- `wires-node::pair::install_grant` — already calls a `first_reachable_*` helper; one-line rename + field rename.
-- `wires-node::config::HostConfig` — `discovery_url: Option<String>` → `refresh_ticket: Option<String>`.
+- `wires-node::pair::install_grant` — drop the `service_discovery_url` argument; call `first_reachable` instead of `first_reachable_with_discovery`.
+- `wires-node::config::HostConfig` — `discovery_url: Option<String>` field is deleted with no replacement.
 
 ## 8. Error handling
 
@@ -316,9 +293,7 @@ Following the substrate spec's testing strategy: real iroh transports, real redb
 
 ### Unit (`crates/wires-net/src/peer_hint.rs`)
 
-- `first_reachable_with_ticket` falls back to the embedded ticket's hints when initial `peer_hints` are empty. (Rewrite of the existing `first_reachable_falls_back_to_discovery_url` test; replace the axum/reqwest fixture with an inline `HostTicket::encode`.)
-- Returns `None` cleanly when both `peer_hints` is empty and `refresh_ticket` is `None`.
-- Returns `None` cleanly when `refresh_ticket` is malformed (decode-error path logged, no panic).
+The existing `first_reachable_falls_back_to_discovery_url` test is **deleted** along with the helper it covered. `first_reachable` already has coverage via existing peer-hint tests; no new cases are needed here.
 
 ### Integration (`crates/wires-host/tests/`)
 
@@ -328,12 +303,10 @@ Following the substrate spec's testing strategy: real iroh transports, real redb
 ### Integration (`crates/wires-cli/tests/`)
 
 - `cli_host_pair.rs` and `cli_host_topic_register.rs` lose `wires_host::http_discovery::DiscoveryState` and the axum harness. Both gain `spawn_test_host_and_capture_ticket()`, a small helper that builds a `Host` library-side, binds an endpoint, constructs a ticket via `HostTicket::from_endpoint`, and returns it for the test body. Net deletion of test scaffolding is substantial.
-- `cli_host_pair.rs` additionally asserts that `~/.wires/host_ticket.txt` (under the test's tempdir-rooted `data_dir`) is written with mode `0600` after a successful pair.
 
 ### Acceptance (`#[ignore]`)
 
-1. End-to-end Tab 1/Tab 2/Tab 3 walkthrough from the responder-driven-pairing spec §8 README, with the operator-side bootstrap going through `wires-host ticket` instead of the deleted `--discovery-url`. The pair flow proceeds as before; assert the resulting `PairGrant.host.refresh_ticket` matches the captured ticket bytes.
-2. Ticket refresh fallback: pair Bob, then move the host to a new socket (rebind on a different port), update the operator-side `host_ticket.txt` via `wires-host ticket`, run `wires pair-approve` for a second agent. Confirm the new grant's `refresh_ticket` reflects the new addrs; the second agent uses the refresh path on its first dial attempt after restart.
+1. End-to-end Tab 1/Tab 2/Tab 3 walkthrough from the responder-driven-pairing spec §8 README, with the operator-side bootstrap going through `wires-host ticket` instead of the deleted `--discovery-url`. The pair flow proceeds as before; assert that the new agent receives a `PairGrant` containing the host's `EndpointId` in `HostInfo.peer_hints` and can dial it.
 
 ## 11. Acceptance criteria
 
@@ -343,7 +316,7 @@ For this spec to be considered done:
 2. `wires-host ticket [--qr | --no-qr] [--hint-ttl <duration>]` prints a valid base64 ticket to stdout and (per TTY rule) a QR to stderr.
 3. `wires host pair --ticket <STRING>` registers a tenant successfully against a real host; `--discovery-url` is removed from every CLI subcommand.
 4. `wires pair-listen --qr` renders a real terminal QR inline.
-5. `PairGrant.host.refresh_ticket` round-trips through pair-listen / pair-approve / install-grant; `peer_hint::first_reachable_with_ticket` falls back to it when initial hints fail.
+5. `PairGrant.HostInfo` is `{ peer_hints }` only; `service_discovery_url` is gone from the type, `pair_pending.json`, and every consumer; `peer_hint::first_reachable_with_discovery` is deleted; `HostConfig.discovery_url` is deleted.
 6. `reqwest` and `axum` are no longer declared by `wires-net` or `wires-host`. `qrcode = "0.14"` is the only new dep.
 7. All new error variants follow CLAUDE.md's snafu convention.
 8. Existing acceptance suite (with `end_to_end_register_via_host_ticket` substituted) passes.
