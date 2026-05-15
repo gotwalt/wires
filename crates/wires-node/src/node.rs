@@ -195,7 +195,7 @@ mod tests {
         let cfg = NodeConfig {
             data_dir: tmp.path().to_path_buf(),
             root_pubkey_hex: root_hex,
-            bootstrap_peers: vec![],
+            host: None,
         };
         Node::open(cfg).unwrap()
     }
@@ -240,7 +240,7 @@ mod tests {
         let cfg = NodeConfig {
             data_dir: tmp.path().to_path_buf(),
             root_pubkey_hex: "deadbeef".into(),
-            bootstrap_peers: vec![],
+            host: None,
         };
         let node_a = Node::open(cfg.clone()).unwrap();
         let pk_a = node_a.ed_sk.verifying_key().to_bytes();
@@ -256,7 +256,7 @@ mod tests {
         let cfg = NodeConfig {
             data_dir: tmp.path().to_path_buf(),
             root_pubkey_hex: "deadbeef".into(),
-            bootstrap_peers: vec![],
+            host: None,
         };
         let node = Node::open(cfg).unwrap();
         node.install_epoch_key([1u8; 32], 0, [7u8; 32]).unwrap();

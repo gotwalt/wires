@@ -4897,6 +4897,7 @@ dependencies = [
  "snafu",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "wires-core",

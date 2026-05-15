@@ -12,7 +12,7 @@ fn open_node(tmp: &TempDir, root_hex: &str) -> Node {
     Node::open(NodeConfig {
         data_dir: tmp.path().to_path_buf(),
         root_pubkey_hex: root_hex.to_string(),
-        bootstrap_peers: vec![],
+        host: None,
     })
     .unwrap()
 }

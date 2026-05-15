@@ -20,7 +20,7 @@ pub async fn run(data_dir: &Path, root: Option<String>) -> Result<(), Box<dyn st
     let cfg = NodeConfig {
         data_dir: data_dir.to_path_buf(),
         root_pubkey_hex: root_hex.clone(),
-        bootstrap_peers: vec![],
+        host: None,
     };
     std::fs::write(&cfg_path, toml::to_string_pretty(&cfg)?)?;
     let _node = Node::open(cfg)?;
