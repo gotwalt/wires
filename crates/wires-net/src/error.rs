@@ -71,6 +71,18 @@ pub enum NetError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Pair request bounds: {what} exceeds limit {limit}, at {location}"))]
+    PairBounds {
+        what: &'static str,
+        limit: usize,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Pair signature verify failed, at {location}"))]
+    PairSignature {
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = NetError> = core::result::Result<T, E>;
