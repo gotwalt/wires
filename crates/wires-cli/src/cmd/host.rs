@@ -10,6 +10,7 @@ use snafu::ResultExt;
 use wires_net::tenant::{TenantClient, TenantResponse};
 use wires_net::{endpoint_id_from_hex, load_or_create_secret, unix_now_ms};
 use wires_node::{HostConfig, NodeConfig, load_root_signing_key, resolve_topic};
+use tracing;
 
 use crate::error::{
     CliError, HostRejectedSnafu, IoSnafu, NetSnafu, Result, TomlParseSnafu, TomlSerializeSnafu,
@@ -106,13 +107,17 @@ fn register_hint_addrs(ep: &Endpoint, hint: &wires_net::peer_hint::PeerHint) {
     };
     let mut addrs: Vec<iroh::TransportAddr> = Vec::new();
     for s in &hint.addrs {
-        if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
-            addrs.push(iroh::TransportAddr::Ip(sa));
+        match s.parse::<std::net::SocketAddr>() {
+            Ok(sa) => addrs.push(iroh::TransportAddr::Ip(sa)),
+            Err(e) => tracing::warn!(addr = %s, error = %e, "dropping unparseable peer addr"),
         }
     }
     if let Some(relay) = hint.relay.as_deref() {
-        if let Ok(url) = relay.parse::<iroh::RelayUrl>() {
-            addrs.push(iroh::TransportAddr::Relay(url));
+        match relay.parse::<iroh::RelayUrl>() {
+            Ok(url) => addrs.push(iroh::TransportAddr::Relay(url)),
+            Err(e) => {
+                tracing::warn!(relay = %relay, error = %e, "dropping unparseable relay URL")
+            }
         }
     }
     if addrs.is_empty() {
