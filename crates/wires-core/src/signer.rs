@@ -16,7 +16,7 @@ pub enum SignError {
     },
 }
 
-pub trait RootSigner {
+pub trait RootSigner: Send + Sync {
     fn pubkey(&self) -> [u8; 32];
     fn sign(&self, message: &[u8]) -> Result<[u8; 64], SignError>;
 }
