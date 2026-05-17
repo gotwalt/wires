@@ -1,50 +1,42 @@
-//! Acceptance: start the discovery HTTP service and a live iroh host with the
-//! tenant protocol; a client fetches `/v1/bootstrap` via reqwest, parses the
-//! endpoint list, dials the listed EndpointId, and registers.
+//! Acceptance scenario: end-to-end tenant register via a host ticket.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ed25519_dalek::{Signer, SigningKey};
-use iroh::{Endpoint, SecretKey, endpoint::presets};
-use rand_core::OsRng;
+use iroh::SecretKey;
 use tempfile::TempDir;
-use wires_host::http_discovery::{self, DiscoveryEndpoint, DiscoveryResponse, DiscoveryState};
 use wires_host::per_tenant_logs::PerTenantLogs;
 use wires_host::retention::Retention;
 use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
-use wires_net::tenant::{
-    ALPN as TENANT_ALPN, TenantClient, TenantOp, TenantProtocol, TenantRegisterRequest,
-    TenantRequest, TenantResponse, signing_bytes,
-};
-
-fn endpoint_id_bytes(ep: &Endpoint) -> [u8; 32] {
-    ep.id().as_bytes().to_owned()
-}
+use rand_core::OsRng;
+use wires_net::tenant::{ALPN as TENANT_ALPN, TenantProtocol, TenantResponse};
 
 #[tokio::test]
 #[ignore]
-async fn end_to_end_register_via_http_discovery() {
-    let tmp = TempDir::new().unwrap();
-    let registry = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
-    let logs = Arc::new(PerTenantLogs::new(tmp.path()));
-    let retention = Arc::new(Retention::new(tmp.path(), Arc::clone(&logs)));
+async fn end_to_end_register_via_host_ticket() {
+    use ed25519_dalek::SigningKey;
+    use wires_net::HostTicket;
 
-    let host_secret = SecretKey::generate();
-    let host_ep = Endpoint::builder(presets::N0)
-        .secret_key(host_secret)
-        .alpns(vec![TENANT_ALPN.to_vec()])
-        .bind()
+    // ---- host setup ----------------------------------------------------
+    let host_tmp = TempDir::new().unwrap();
+    let registry = Arc::new(TenantRegistry::open(host_tmp.path()).unwrap());
+    let logs = Arc::new(PerTenantLogs::new(host_tmp.path()));
+    let retention = Arc::new(Retention::new(host_tmp.path(), Arc::clone(&logs)));
+    let host_ep = wires_net::bind_cloud(SecretKey::generate(), vec![TENANT_ALPN.to_vec()])
         .await
         .unwrap();
-    let host_eid_bytes = endpoint_id_bytes(&host_ep);
-
+    let host_eid_bytes: [u8; 32] = host_ep.id().as_bytes().to_owned();
     let handler = Arc::new(TenantHandlerImpl {
         registry: Arc::clone(&registry),
         retention,
         host_endpoint_id: host_eid_bytes,
         config: TenantHandlerConfig::default(),
-        now_ms: Arc::new(|| 1_000_000i64),
+        now_ms: Arc::new(|| {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64
+        }),
         on_topic_registered: Arc::new(|_, _| {}),
         on_topic_unregistered: Arc::new(|_, _| {}),
     });
@@ -52,66 +44,31 @@ async fn end_to_end_register_via_http_discovery() {
         .accept(TENANT_ALPN, TenantProtocol::new(handler))
         .spawn();
 
-    // Spin up discovery HTTP service on an ephemeral port.
-    let discovery_state = Arc::new(DiscoveryState {
-        response: DiscoveryResponse {
-            version: 1,
-            endpoints: vec![DiscoveryEndpoint {
-                endpoint_id: hex::encode(host_eid_bytes),
-                relay: None,
-                addrs: vec![],
-            }],
-            ttl_seconds: 300,
-        },
-    });
-    let app = http_discovery::router(discovery_state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr: SocketAddr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
+    // ---- operator builds the ticket the iOS-app / CLI would scan -------
+    let ticket = HostTicket::from_endpoint(&host_ep, std::time::Duration::from_secs(60)).unwrap();
+    let token = ticket.encode().unwrap();
 
-    // Client: fetch discovery, then register.
-    let resp = reqwest::get(format!("http://{addr}/v1/bootstrap"))
+    // ---- fresh agent: init then pair -----------------------------------
+    let agent_dir = TempDir::new().unwrap();
+    let root = SigningKey::generate(&mut OsRng);
+    std::fs::write(agent_dir.path().join("root.ed25519"), root.to_bytes()).unwrap();
+    let cfg = wires_node::NodeConfig {
+        data_dir: agent_dir.path().to_path_buf(),
+        root_pubkey_hex: hex::encode(root.verifying_key().to_bytes()),
+        host: None,
+    };
+    std::fs::write(
+        agent_dir.path().join("config.toml"),
+        toml::to_string_pretty(&cfg).unwrap(),
+    )
+    .unwrap();
+
+    wires_cli::cmd::host::pair(agent_dir.path(), &token)
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
-    let payload: DiscoveryResponse = resp.json().await.unwrap();
-    assert_eq!(payload.endpoints.len(), 1);
-    let target_endpoint_id_hex = payload.endpoints[0].endpoint_id.clone();
-    assert_eq!(target_endpoint_id_hex, hex::encode(host_eid_bytes));
 
-    let client_secret = SecretKey::generate();
-    let client_ep = Endpoint::builder(presets::N0)
-        .secret_key(client_secret)
-        .bind()
-        .await
-        .unwrap();
-    let client = TenantClient::new(client_ep);
-
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let root_pubkey = signing_key.verifying_key().to_bytes();
-    let nonce = [11u8; 16];
-    let bytes = signing_bytes(
-        TenantOp::Register,
-        &root_pubkey,
-        1_000_000i64,
-        &nonce,
-        &host_eid_bytes,
-    );
-    let sig = signing_key.sign(&bytes).to_bytes();
-    let req = TenantRequest::Register(TenantRegisterRequest {
-        version: 1,
-        root_pubkey,
-        timestamp: 1_000_000i64,
-        nonce,
-        signature: sig,
-    });
-    let resp = client.send(host_ep.id(), &req).await.unwrap();
-    match resp {
-        TenantResponse::Register(r) => assert!(r.ok),
-        other => panic!("expected Register OK, got {:?}", other),
-    }
+    // ---- assert tenant registered --------------------------------------
+    let root_pubkey = root.verifying_key().to_bytes();
     assert!(registry.get(&root_pubkey).unwrap().is_some());
 }
 
@@ -126,6 +83,9 @@ use tokio::sync::mpsc;
 use wires_core::WireMessage;
 use wires_host::routing::{Router as MsgRouter, WriteRateLimiter};
 use wires_net::{ALPN as REPLAY_ALPN, GossipNode};
+
+use iroh::{Endpoint, endpoint::presets};
+use wires_net::tenant::TenantClient;
 
 #[tokio::test]
 #[ignore]
