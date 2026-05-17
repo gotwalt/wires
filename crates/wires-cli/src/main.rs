@@ -93,11 +93,12 @@ enum TopicCmd {
 
 #[derive(Subcommand)]
 enum HostCmd {
-    /// Pair with a host: fetch its endpoint from a discovery URL, register
-    /// this tenant (signed by your local root key), persist the host info.
+    /// Pair with a host: decode a HostTicket, register this tenant (signed by
+    /// your local root key), persist the host info.
     Pair {
+        /// HostTicket string (base64), or `@<path>` to read from a file.
         #[arg(long)]
-        discovery_url: String,
+        ticket: String,
     },
     /// Register a topic with the paired host so it persists envelopes for it.
     TopicRegister { topic: String },
@@ -131,9 +132,7 @@ async fn main() -> std::process::ExitCode {
         } => cmd::publish::run(&data_dir, &topic, &cap, &r#type, &text, data.as_deref()).await,
         Cmd::Cat { topic, tail } => cmd::cat::run(&data_dir, &topic, tail).await,
         Cmd::Revoke { cap_id } => cmd::revoke::run(&data_dir, &cap_id).await,
-        Cmd::Host(HostCmd::Pair { discovery_url }) => {
-            cmd::host::pair(&data_dir, &discovery_url).await
-        }
+        Cmd::Host(HostCmd::Pair { ticket }) => cmd::host::pair(&data_dir, &ticket).await,
         Cmd::Host(HostCmd::TopicRegister { topic }) => {
             cmd::host::topic_register(&data_dir, &topic).await
         }

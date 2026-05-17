@@ -42,7 +42,6 @@ pub async fn run(
     } else {
         cfg.host.as_ref().map(|h| HostInfo {
             peer_hints: h.peer_hints.clone(),
-            service_discovery_url: h.discovery_url.clone(),
         })
     };
     let node = Node::open(cfg).context(NodeSnafu)?;

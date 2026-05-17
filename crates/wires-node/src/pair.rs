@@ -57,7 +57,6 @@ pub fn install_grant(
     if let Some(host) = &grant.host {
         cfg.host = Some(HostConfig {
             peer_hints: host.peer_hints.clone(),
-            discovery_url: host.service_discovery_url.clone(),
         });
     }
     let toml_str = toml::to_string_pretty(&cfg).map_err(|e| NodeError::ConfigWrite {

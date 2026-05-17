@@ -1,7 +1,6 @@
 //! Blind multi-tenant relay/replay-server. Topics arrive dynamically via the
 //! tenant control protocol; no `--topic` flags.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,7 +8,6 @@ use clap::Parser;
 use iroh::SecretKey;
 use tokio::sync::mpsc;
 use wires_core::WireMessage;
-use wires_host::http_discovery::{self, DiscoveryEndpoint, DiscoveryResponse, DiscoveryState};
 use wires_host::per_tenant_logs::PerTenantLogs;
 use wires_host::replay_source::PerTenantReplaySource;
 use wires_host::retention::Retention;
@@ -27,21 +25,41 @@ use wires_net::{GOSSIP_ALPN, GossipNode, load_or_create_secret, unix_now_ms};
 struct Args {
     #[arg(long)]
     data_dir: PathBuf,
-    #[arg(long, default_value = "0.0.0.0:8443")]
-    discovery_addr: SocketAddr,
-    /// Public URL the discovery service advertises (e.g. https://wires.example).
-    /// If omitted, defaults to `http://<discovery_addr>` (testing).
-    #[arg(long)]
-    public_url: Option<String>,
+
+    /// TTL after which a ticket's addrs/relay are considered stale by
+    /// consumers. The `endpoint_id` itself never expires.
+    #[arg(long, global = true, default_value = "7d")]
+    ticket_hint_ttl: humantime::Duration,
+    /// Force-emit a terminal QR of the host ticket even if stderr is not a TTY.
+    #[arg(long, global = true, conflicts_with = "no_qr")]
+    qr: bool,
+    /// Suppress terminal QR emission even if stderr is a TTY.
+    #[arg(long, global = true)]
+    no_qr: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Print the host's discovery ticket (base64 to stdout, optional QR to stderr) and exit.
+    Ticket,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
     std::fs::create_dir_all(&args.data_dir)?;
+
+    if matches!(args.command, Some(Command::Ticket)) {
+        run_ticket_subcommand(&args).await?;
+        return Ok(());
+    }
 
     // iroh identity ---------------------------------------------------------
     let secret_path = args.data_dir.join("iroh.secret");
@@ -58,6 +76,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint_id = endpoint.id();
     let endpoint_id_bytes: [u8; 32] = endpoint_id.as_bytes().to_owned();
     println!("wires-host: EndpointId = {endpoint_id}");
+
+    // Emit the host ticket on every startup. Operators copy/scan; TTY runs
+    // additionally get a QR rendered to stderr.
+    {
+        use std::io::IsTerminal as _;
+        let ticket = wires_net::HostTicket::from_endpoint(&endpoint, *args.ticket_hint_ttl)?;
+        let encoded = ticket.encode()?;
+        tracing::info!("host ticket: {encoded}");
+        let show_qr = args.qr || (!args.no_qr && std::io::stderr().is_terminal());
+        if show_qr {
+            let art = ticket.render_qr_ansi()?;
+            eprintln!();
+            eprintln!("{art}");
+        }
+    }
 
     // Storage + state -------------------------------------------------------
     let registry = Arc::new(TenantRegistry::open(&args.data_dir)?);
@@ -156,29 +189,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .accept(TENANT_ALPN, TenantProtocol::new(Arc::clone(&handler)))
         .spawn();
 
-    // HTTPS discovery -------------------------------------------------------
-    let public_url = args
-        .public_url
-        .unwrap_or_else(|| format!("http://{}", args.discovery_addr));
-    let discovery_state = Arc::new(DiscoveryState {
-        response: DiscoveryResponse {
-            version: 1,
-            endpoints: vec![DiscoveryEndpoint {
-                endpoint_id: hex::encode(endpoint_id_bytes),
-                relay: None,
-                addrs: vec![],
-            }],
-            ttl_seconds: 300,
-        },
-    });
-    let discovery_app = http_discovery::router(discovery_state);
-    let listener = tokio::net::TcpListener::bind(args.discovery_addr).await?;
-    let actual_addr = listener.local_addr()?;
-    tokio::spawn(async move {
-        axum::serve(listener, discovery_app).await.ok();
-    });
-    println!("wires-host: discovery listening at {actual_addr} (public={public_url})");
     println!("wires-host: running. Press Ctrl-C to exit.");
     tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
+async fn run_ticket_subcommand(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::IsTerminal as _;
+
+    let secret_path = args.data_dir.join("iroh.secret");
+    let secret = load_or_create_secret(&secret_path)?;
+    let endpoint = wires_net::bind_cloud(SecretKey::from_bytes(&secret), vec![]).await?;
+    let ticket = wires_net::HostTicket::from_endpoint(&endpoint, *args.ticket_hint_ttl)?;
+    let encoded = ticket.encode()?;
+    println!("{encoded}");
+    let show_qr = args.qr || (!args.no_qr && std::io::stderr().is_terminal());
+    if show_qr {
+        let art = ticket.render_qr_ansi()?;
+        eprintln!();
+        eprintln!("{art}");
+    }
     Ok(())
 }
