@@ -4826,7 +4826,6 @@ name = "wires-net"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "axum",
  "base64",
  "bytes",
  "ed25519-dalek 2.2.0",

@@ -27,7 +27,6 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tempfile      = { workspace = true }
-axum          = { version = "0.8", features = ["json"] }
 
 [features]
 default = ["mdns"]
