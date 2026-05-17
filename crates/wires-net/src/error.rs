@@ -104,6 +104,20 @@ pub enum NetError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Root signer rejected the pair grant envelope, at {location}"))]
+    PairSignerRejected {
+        #[snafu(source)]
+        source: wires_core::SignError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Root signer rejected the tenant request, at {location}"))]
+    TenantSignerRejected {
+        #[snafu(source)]
+        source: wires_core::SignError,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("iroh endpoint bind failed: {source}, at {location}"))]
     EndpointBind {
         source: iroh::endpoint::BindError,

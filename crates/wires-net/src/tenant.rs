@@ -200,8 +200,9 @@ use std::sync::Arc;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointId};
 use snafu::ResultExt as _;
+use wires_core::RootSigner;
 
-use crate::error::{IoSnafu, Result};
+use crate::error::{IoSnafu, Result, TenantSignerRejectedSnafu};
 use crate::framing::{read_frame, write_frame};
 
 /// Business-logic hook the host wires in. All methods are synchronous and
@@ -310,17 +311,18 @@ impl TenantClient {
         &self,
         peer: EndpointId,
         op: TenantOp<'_>,
-        root_signer: &ed25519_dalek::SigningKey,
+        root_signer: &dyn RootSigner,
         host_endpoint_id: &[u8; 32],
         timestamp_ms: i64,
     ) -> Result<TenantResponse> {
-        use ed25519_dalek::Signer as _;
         use rand_core::RngCore as _;
-        let root_pubkey = root_signer.verifying_key().to_bytes();
+        let root_pubkey = root_signer.pubkey();
         let mut nonce = [0u8; 16];
         rand_core::OsRng.fill_bytes(&mut nonce);
         let bytes = signing_bytes(op, &root_pubkey, timestamp_ms, &nonce, host_endpoint_id);
-        let signature = root_signer.sign(&bytes).to_bytes();
+        let signature = root_signer
+            .sign(&bytes)
+            .context(TenantSignerRejectedSnafu)?;
         let req = match op {
             TenantOp::Register => TenantRequest::Register(TenantRegisterRequest {
                 version: 1,
@@ -361,7 +363,7 @@ impl TenantClient {
     pub async fn register_tenant(
         &self,
         peer: EndpointId,
-        root_signer: &ed25519_dalek::SigningKey,
+        root_signer: &dyn RootSigner,
         host_endpoint_id: &[u8; 32],
         timestamp_ms: i64,
     ) -> Result<TenantResponse> {
@@ -378,7 +380,7 @@ impl TenantClient {
     pub async fn register_topic(
         &self,
         peer: EndpointId,
-        root_signer: &ed25519_dalek::SigningKey,
+        root_signer: &dyn RootSigner,
         topic_id: &[u8; 32],
         host_endpoint_id: &[u8; 32],
         timestamp_ms: i64,
@@ -396,7 +398,7 @@ impl TenantClient {
     pub async fn unregister_topic(
         &self,
         peer: EndpointId,
-        root_signer: &ed25519_dalek::SigningKey,
+        root_signer: &dyn RootSigner,
         topic_id: &[u8; 32],
         host_endpoint_id: &[u8; 32],
         timestamp_ms: i64,
@@ -414,7 +416,7 @@ impl TenantClient {
     pub async fn tenant_status(
         &self,
         peer: EndpointId,
-        root_signer: &ed25519_dalek::SigningKey,
+        root_signer: &dyn RootSigner,
         host_endpoint_id: &[u8; 32],
         timestamp_ms: i64,
     ) -> Result<TenantResponse> {
