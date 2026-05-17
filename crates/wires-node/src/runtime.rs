@@ -111,10 +111,9 @@ impl NodeRuntime {
                     message: "replay_from_host: no host configured".into(),
                     location: snafu::location!(),
                 })?;
-        let peer = wires_net::first_reachable_with_discovery(
+        let peer = wires_net::first_reachable(
             &self.endpoint,
             &host.peer_hints,
-            host.discovery_url.as_deref(),
             wires_net::ALPN,
             std::time::Duration::from_secs(5),
         )

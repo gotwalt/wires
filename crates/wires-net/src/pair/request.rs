@@ -9,7 +9,7 @@ use snafu::{ResultExt, ensure};
 
 use crate::error::{
     NetError, PairBoundsSnafu, PairInvalidCharsSnafu, PairSignatureSnafu, PairTokenDecodeSnafu,
-    PairUnsupportedVersionSnafu, Result, SerdeSnafu,
+    PairUnsupportedVersionSnafu, Result, SerdeSnafu, TicketQrRenderSnafu,
 };
 
 pub const MAX_TOKEN_BYTES: usize = 4 * 1024;
@@ -135,6 +135,19 @@ impl PairRequest {
         let tok: PairRequest = serde_json::from_slice(&bytes).context(SerdeSnafu)?;
         tok.check_bounds()?;
         Ok(tok)
+    }
+
+    /// Render the encoded PairRequest token as an ANSI half-block QR string.
+    /// Mirrors `HostTicket::render_qr_ansi`.
+    pub fn render_qr_ansi(&self) -> Result<String> {
+        let payload = self.encode()?;
+        let code = qrcode::QrCode::new(payload.as_bytes()).context(TicketQrRenderSnafu)?;
+        let s = code
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .dark_color(qrcode::render::unicode::Dense1x2::Light)
+            .light_color(qrcode::render::unicode::Dense1x2::Dark)
+            .build();
+        Ok(s)
     }
 
     fn check_bounds(&self) -> Result<()> {
@@ -403,6 +416,18 @@ mod tests {
             m.signing_bytes().unwrap(),
             baseline,
             "signature must be excluded"
+        );
+    }
+
+    #[test]
+    fn render_qr_ansi_produces_block_art() {
+        let (req, _) = sample(1_700_000_000_000);
+        let s = req.render_qr_ansi().unwrap();
+        assert!(!s.is_empty());
+        assert!(
+            s.chars()
+                .any(|c| c == '\u{2580}' || c == '\u{2584}' || c == '\u{2588}'),
+            "rendered string should contain block art chars"
         );
     }
 }

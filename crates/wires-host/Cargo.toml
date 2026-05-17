@@ -25,7 +25,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 hex        = { workspace = true }
-axum   = "0.8"
+humantime = "2"
 redb   = { workspace = true }
 serde  = { workspace = true }
 blake3        = { workspace = true }
@@ -35,5 +35,5 @@ ed25519-dalek = { workspace = true }
 tokio     = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile  = { workspace = true }
 rand_core = { workspace = true }
-tower = { version = "0.5", features = ["util"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+toml      = { workspace = true }
+wires-cli = { path = "../wires-cli" }

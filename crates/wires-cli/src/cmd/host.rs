@@ -7,8 +7,9 @@ use std::path::Path;
 use ed25519_dalek::SigningKey;
 use iroh::{Endpoint, SecretKey};
 use snafu::ResultExt;
+use tracing;
 use wires_net::tenant::{TenantClient, TenantResponse};
-use wires_net::{endpoint_id_from_hex, fetch_endpoints, load_or_create_secret, unix_now_ms};
+use wires_net::{endpoint_id_from_hex, load_or_create_secret, unix_now_ms};
 use wires_node::{HostConfig, NodeConfig, load_root_signing_key, resolve_topic};
 
 use crate::error::{
@@ -17,24 +18,23 @@ use crate::error::{
 };
 use crate::invalid;
 
-pub async fn pair(data_dir: &Path, discovery_url: &str) -> Result<()> {
+pub async fn pair(data_dir: &Path, ticket_arg: &str) -> Result<()> {
     let cfg_path = data_dir.join("config.toml");
     let raw = std::fs::read_to_string(&cfg_path).context(IoSnafu)?;
     let mut cfg: NodeConfig = toml::from_str(&raw).context(TomlParseSnafu)?;
     let root = load_root_signing_key(data_dir).context(IoSnafu)?;
 
-    let hints = fetch_endpoints(discovery_url).await.context(NetSnafu)?;
-    let first = hints
-        .first()
-        .ok_or_else(|| invalid!("discovery returned no endpoints"))?
-        .clone();
-    let host_eid = endpoint_id_from_hex(&first.node_id)
-        .ok_or_else(|| invalid!("discovery returned an invalid endpoint_id"))?;
+    let token = read_ticket_arg(ticket_arg)?;
+    let ticket = wires_net::HostTicket::decode(&token).context(NetSnafu)?;
+    let hint = ticket.to_peer_hint();
+    let host_eid = endpoint_id_from_hex(&hint.node_id)
+        .ok_or_else(|| invalid!("ticket carried an invalid endpoint_id"))?;
     let host_eid_bytes = *host_eid.as_bytes();
 
     let secret_path = data_dir.join("iroh.secret");
     let secret = load_or_create_secret(&secret_path).context(NetSnafu)?;
     let ep = bind_endpoint(secret).await?;
+    register_hint_addrs(&ep, &hint);
     let client = TenantClient::new(ep);
     let resp = client
         .register_tenant(host_eid, &root, &host_eid_bytes, unix_now_ms())
@@ -51,13 +51,22 @@ pub async fn pair(data_dir: &Path, discovery_url: &str) -> Result<()> {
         other => return unexpected(other),
     }
     cfg.host = Some(HostConfig {
-        peer_hints: vec![first],
-        discovery_url: Some(discovery_url.to_string()),
+        peer_hints: vec![hint],
     });
     let toml_str = toml::to_string_pretty(&cfg).context(TomlSerializeSnafu)?;
     std::fs::write(&cfg_path, toml_str).context(IoSnafu)?;
     println!("Host info persisted to {}", cfg_path.display());
     Ok(())
+}
+
+/// Accept either a raw base64 ticket or `@<path>` to read from a file.
+fn read_ticket_arg(arg: &str) -> Result<String> {
+    if let Some(path) = arg.strip_prefix('@') {
+        let s = std::fs::read_to_string(path).context(IoSnafu)?;
+        Ok(s.trim().to_string())
+    } else {
+        Ok(arg.trim().to_string())
+    }
 }
 
 async fn open_paired_client(
@@ -68,9 +77,7 @@ async fn open_paired_client(
     let host = cfg
         .host
         .as_ref()
-        .ok_or_else(|| {
-            invalid!("no host paired — run `wires host pair --discovery-url <URL>` first")
-        })?
+        .ok_or_else(|| invalid!("no host paired — run `wires host pair --ticket <STRING>` first"))?
         .clone();
     let first = host
         .peer_hints
@@ -83,7 +90,42 @@ async fn open_paired_client(
     let root = load_root_signing_key(data_dir).context(IoSnafu)?;
     let secret = load_or_create_secret(&data_dir.join("iroh.secret")).context(NetSnafu)?;
     let ep = bind_endpoint(secret).await?;
+    register_hint_addrs(&ep, &first);
     Ok((TenantClient::new(ep), host_eid, host_eid_bytes, root))
+}
+
+/// Register the addresses from a `PeerHint` into the endpoint's address-lookup
+/// table so iroh can find the peer without falling back to pkarr/DNS. This is
+/// equivalent to the `publish_helpers::register_peer_addresses` pattern used by
+/// the gossip/replay path.
+fn register_hint_addrs(ep: &Endpoint, hint: &wires_net::peer_hint::PeerHint) {
+    let Some(id) = endpoint_id_from_hex(&hint.node_id) else {
+        return;
+    };
+    let mut addrs: Vec<iroh::TransportAddr> = Vec::new();
+    for s in &hint.addrs {
+        match s.parse::<std::net::SocketAddr>() {
+            Ok(sa) => addrs.push(iroh::TransportAddr::Ip(sa)),
+            Err(e) => tracing::warn!(addr = %s, error = %e, "dropping unparseable peer addr"),
+        }
+    }
+    if let Some(relay) = hint.relay.as_deref() {
+        match relay.parse::<iroh::RelayUrl>() {
+            Ok(url) => addrs.push(iroh::TransportAddr::Relay(url)),
+            Err(e) => {
+                tracing::warn!(relay = %relay, error = %e, "dropping unparseable relay URL")
+            }
+        }
+    }
+    if addrs.is_empty() {
+        return;
+    }
+    let endpoint_addr = iroh::EndpointAddr::from_parts(id, addrs);
+    if let Ok(lookup) = ep.address_lookup() {
+        lookup.add(
+            iroh::address_lookup::memory::MemoryLookup::from_endpoint_info(vec![endpoint_addr]),
+        );
+    }
 }
 
 async fn bind_endpoint(secret: [u8; 32]) -> Result<Endpoint> {
