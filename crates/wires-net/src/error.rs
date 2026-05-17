@@ -47,14 +47,6 @@ pub enum NetError {
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Discovery fetch failed for {url}, at {location}"))]
-    DiscoveryFetch {
-        url: String,
-        #[snafu(source)]
-        source: reqwest::Error,
-        #[snafu(implicit)]
-        location: Location,
-    },
     #[snafu(display("Pair request bounds: {what} exceeds limit {limit}, at {location}"))]
     PairBounds {
         what: &'static str,
