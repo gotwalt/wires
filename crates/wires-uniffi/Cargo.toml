@@ -31,3 +31,7 @@ tracing = { workspace = true }
 
 [build-dependencies]
 uniffi = { version = "0.31", features = ["build"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
