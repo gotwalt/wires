@@ -43,7 +43,6 @@ pub struct TopicNameEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostInfo {
     pub peer_hints: Vec<PeerHint>,
-    pub service_discovery_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
