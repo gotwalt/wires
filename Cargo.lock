@@ -4798,7 +4798,6 @@ dependencies = [
 name = "wires-host"
 version = "0.1.0"
 dependencies = [
- "axum",
  "blake3",
  "clap",
  "ed25519-dalek 2.2.0",
@@ -4813,7 +4812,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
- "tower",
  "tracing",
  "tracing-subscriber",
  "wires-cli",

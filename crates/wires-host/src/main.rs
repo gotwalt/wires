@@ -1,7 +1,6 @@
 //! Blind multi-tenant relay/replay-server. Topics arrive dynamically via the
 //! tenant control protocol; no `--topic` flags.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,7 +9,6 @@ use humantime;
 use iroh::SecretKey;
 use tokio::sync::mpsc;
 use wires_core::WireMessage;
-use wires_host::http_discovery::{self, DiscoveryEndpoint, DiscoveryResponse, DiscoveryState};
 use wires_host::per_tenant_logs::PerTenantLogs;
 use wires_host::replay_source::PerTenantReplaySource;
 use wires_host::retention::Retention;
@@ -28,13 +26,6 @@ use wires_net::{GOSSIP_ALPN, GossipNode, load_or_create_secret, unix_now_ms};
 struct Args {
     #[arg(long)]
     data_dir: PathBuf,
-    /// Public URL the (legacy) discovery service advertises. If omitted,
-    /// defaults to `http://<discovery_addr>` (testing). Deleted in a later task.
-    #[arg(long, global = true)]
-    public_url: Option<String>,
-    /// (Legacy) HTTPS discovery bind address. Deleted in a later task.
-    #[arg(long, global = true, default_value = "0.0.0.0:8443")]
-    discovery_addr: SocketAddr,
 
     /// TTL after which a ticket's addrs/relay are considered stale by
     /// consumers. The `endpoint_id` itself never expires.
@@ -199,28 +190,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .accept(TENANT_ALPN, TenantProtocol::new(Arc::clone(&handler)))
         .spawn();
 
-    // HTTPS discovery -------------------------------------------------------
-    let public_url = args
-        .public_url
-        .unwrap_or_else(|| format!("http://{}", args.discovery_addr));
-    let discovery_state = Arc::new(DiscoveryState {
-        response: DiscoveryResponse {
-            version: 1,
-            endpoints: vec![DiscoveryEndpoint {
-                endpoint_id: hex::encode(endpoint_id_bytes),
-                relay: None,
-                addrs: vec![],
-            }],
-            ttl_seconds: 300,
-        },
-    });
-    let discovery_app = http_discovery::router(discovery_state);
-    let listener = tokio::net::TcpListener::bind(args.discovery_addr).await?;
-    let actual_addr = listener.local_addr()?;
-    tokio::spawn(async move {
-        axum::serve(listener, discovery_app).await.ok();
-    });
-    println!("wires-host: discovery listening at {actual_addr} (public={public_url})");
     println!("wires-host: running. Press Ctrl-C to exit.");
     tokio::signal::ctrl_c().await?;
     Ok(())
