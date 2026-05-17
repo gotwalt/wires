@@ -425,7 +425,8 @@ mod tests {
         let s = req.render_qr_ansi().unwrap();
         assert!(!s.is_empty());
         assert!(
-            s.chars().any(|c| c == '\u{2580}' || c == '\u{2584}' || c == '\u{2588}'),
+            s.chars()
+                .any(|c| c == '\u{2580}' || c == '\u{2584}' || c == '\u{2588}'),
             "rendered string should contain block art chars"
         );
     }

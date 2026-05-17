@@ -74,10 +74,7 @@ impl HostTicket {
 
     /// Build a ticket from a live iroh `Endpoint`. Pulls `EndpointId`, direct
     /// socket addrs, and the optional relay url off `endpoint.addr()`.
-    pub fn from_endpoint(
-        endpoint: &iroh::Endpoint,
-        hint_ttl: std::time::Duration,
-    ) -> Result<Self> {
+    pub fn from_endpoint(endpoint: &iroh::Endpoint, hint_ttl: std::time::Duration) -> Result<Self> {
         let endpoint_id = hex::encode(endpoint.id().as_bytes());
         let endpoint_addr = endpoint.addr();
         let mut addrs: Vec<String> = Vec::new();
@@ -117,15 +114,12 @@ impl HostTicket {
                 limit: MAX_HINT_ADDRS,
             }
         );
-        ensure!(
-            self.endpoint_id.len() == 64,
-            TicketInvalidEndpointIdSnafu
-        );
-        let bytes = hex::decode(&self.endpoint_id)
-            .ok()
-            .ok_or_else(|| NetError::TicketInvalidEndpointId {
+        ensure!(self.endpoint_id.len() == 64, TicketInvalidEndpointIdSnafu);
+        let bytes = hex::decode(&self.endpoint_id).ok().ok_or_else(|| {
+            NetError::TicketInvalidEndpointId {
                 location: snafu::location!(),
-            })?;
+            }
+        })?;
         iroh::EndpointId::from_bytes(&bytes.as_slice().try_into().expect("len checked"))
             .ok()
             .ok_or_else(|| NetError::TicketInvalidEndpointId {
@@ -256,7 +250,9 @@ mod tests {
     #[tokio::test]
     async fn from_endpoint_roundtrips_endpoint_id() {
         use iroh::SecretKey;
-        let ep = crate::bind_lan(SecretKey::generate(), vec![]).await.unwrap();
+        let ep = crate::bind_lan(SecretKey::generate(), vec![])
+            .await
+            .unwrap();
         let t = HostTicket::from_endpoint(&ep, std::time::Duration::from_secs(60)).unwrap();
         assert_eq!(t.endpoint_id, hex::encode(ep.id().as_bytes()));
         assert_eq!(t.version, TICKET_VERSION);
@@ -284,7 +280,8 @@ mod tests {
         // Dense1x2 renderer uses half-block characters; sanity-check at least
         // one is present.
         assert!(
-            s.chars().any(|c| c == '\u{2580}' || c == '\u{2584}' || c == '\u{2588}'),
+            s.chars()
+                .any(|c| c == '\u{2580}' || c == '\u{2584}' || c == '\u{2588}'),
             "rendered string should contain block art chars"
         );
     }
