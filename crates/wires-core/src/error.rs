@@ -40,6 +40,13 @@ pub enum CoreError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Root signer rejected the capability, at {location}"))]
+    CapSignerRejected {
+        #[snafu(source)]
+        source: crate::signer::SignError,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display(
         "Capability expired (issued={issued}, expires={expires:?}, now={now}), at {location}"
     ))]
