@@ -1,13 +1,15 @@
 //! `PairGrant` — the operator's signed, sealed reply: cap, epoch keys, topic
 //! names, optional host info. Travels inside `PairGrantEnvelope`.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, ensure};
-use wires_core::Capability;
+use wires_core::{Capability, RootSigner};
 use x25519_dalek::StaticSecret;
 
-use crate::error::{NetError, PairCryptoSnafu, PairSignatureSnafu, Result, SerdeSnafu};
+use crate::error::{
+    NetError, PairCryptoSnafu, PairSignatureSnafu, PairSignerRejectedSnafu, Result, SerdeSnafu,
+};
 use crate::peer_hint::PeerHint;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,11 +63,11 @@ const PAIR_SEAL_AAD: &[u8] = b"wires.pair.v1";
 
 impl PairGrantEnvelope {
     /// Build an envelope from `grant`: seal `grant` to Bob's `recipient_ephemeral_x25519`,
-    /// then sign over (root_pubkey || sealed_payload) with `root_sk`.
+    /// then sign over (root_pubkey || sealed_payload) with `root`.
     pub fn seal_and_sign(
         grant: &PairGrant,
         recipient_ephemeral_x25519: &[u8; 32],
-        root_sk: &SigningKey,
+        root: &dyn RootSigner,
     ) -> Result<Self> {
         let content = serde_json::to_vec(grant).context(SerdeSnafu)?;
         let sealed_payload = wires_crypto::sealed::seal_to(
@@ -81,7 +83,7 @@ impl PairGrantEnvelope {
         let mut to_sign = Vec::with_capacity(32 + sealed_payload.len());
         to_sign.extend_from_slice(&grant.root_pubkey);
         to_sign.extend_from_slice(&sealed_payload);
-        let signature = root_sk.sign(&to_sign).to_bytes();
+        let signature = root.sign(&to_sign).context(PairSignerRejectedSnafu)?;
 
         Ok(Self {
             root_pubkey: grant.root_pubkey,
