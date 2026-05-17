@@ -23,7 +23,6 @@ base64 = { workspace = true }
 qrcode = { version = "0.14", default-features = false }
 n0-future = "0.3"
 rand_core = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 async-trait = "0.1"
 
 [dev-dependencies]
