@@ -2,25 +2,9 @@ use std::collections::HashMap;
 
 use snafu::ResultExt;
 use wires_net::replay::{HwmEntry, ReplaySource};
-use wires_store::StoreError;
 
 use crate::error::{Result, StoreSnafu};
 use crate::inbound::{Inbound, InboundCtx, process};
-
-type Hwm = HashMap<[u8; 32], (u64, [u8; 32])>;
-
-/// Read the hwm from the topic log, returning an empty map if the table has
-/// not yet been created (i.e. no messages have ever been written).
-fn read_hwm(ctx: &InboundCtx) -> Result<Hwm> {
-    match ctx.topic_log.hwm() {
-        Ok(m) => Ok(m),
-        Err(StoreError::OpenTable {
-            source: redb::TableError::TableDoesNotExist(_),
-            ..
-        }) => Ok(HashMap::new()),
-        Err(e) => Err(e).context(StoreSnafu),
-    }
-}
 
 /// Drive one sync pass over `source` for the given topic. Reads each sender's
 /// messages past our local hwm and feeds them through `process()`.
@@ -31,7 +15,7 @@ pub fn drive_sync_pass(
     source: &dyn ReplaySource,
     topic_id: &[u8; 32],
 ) -> Result<usize> {
-    let hwm = read_hwm(ctx)?;
+    let hwm = ctx.topic_log.hwm().context(StoreSnafu)?;
     let senders =
         source
             .all_senders_for(topic_id)
@@ -63,7 +47,7 @@ pub fn drive_sync_pass(
 
 /// Build an `hwm` map (hex-keyed) suitable for `ReplayRequest::hwm`.
 pub fn current_hwm_for_request(ctx: &InboundCtx) -> Result<HashMap<String, HwmEntry>> {
-    let hwm = read_hwm(ctx)?;
+    let hwm = ctx.topic_log.hwm().context(StoreSnafu)?;
     let mut out = HashMap::new();
     for (k, (seq, hash)) in hwm {
         out.insert(hex::encode(k), HwmEntry { seq, hash });

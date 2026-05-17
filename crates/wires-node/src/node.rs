@@ -21,7 +21,6 @@ use crate::publish::{
 };
 use crate::storage::TopicLogs;
 use wires_net::unix_now_ms;
-use wires_store::StoreError;
 
 pub struct Node {
     pub config: NodeConfig,
@@ -101,15 +100,7 @@ impl Node {
         let log = self.logs.get_or_open(&topic_id)?;
         let keys = self.epoch_keys_for(&topic_id)?;
         let sender_pk = self.ed_sk.verifying_key().to_bytes();
-        let (seq, prev_hash) = match next_seq_and_prev_hash(&log, &sender_pk) {
-            Ok(pair) => pair,
-            // Fresh database: the hwm table doesn't exist yet — treat as empty.
-            Err(crate::error::NodeError::Store {
-                source: StoreError::OpenTable { ref source, .. },
-                ..
-            }) if matches!(source, redb::TableError::TableDoesNotExist(_)) => (0, [0u8; 32]),
-            Err(e) => return Err(e),
-        };
+        let (seq, prev_hash) = next_seq_and_prev_hash(&log, &sender_pk)?;
         let (epoch, epoch_key) = current_epoch_key(&keys, &topic_id)?;
 
         let msg = build_message(&PublishParams {

@@ -93,6 +93,7 @@ impl TopicLog {
     }
 
     /// Get all messages from `sender` strictly after `after_seq` (None = from genesis), in order.
+    /// On a never-written log (table not yet created) returns an empty Vec.
     pub fn read_after(
         &self,
         sender: &Pubkey,
@@ -100,7 +101,16 @@ impl TopicLog {
         limit: usize,
     ) -> Result<Vec<WireMessage>> {
         let read = self.db.begin_read().context(BeginTxnSnafu)?;
-        let table = read.open_table(TOPIC_LOG).context(OpenTableSnafu)?;
+        let table = match read.open_table(TOPIC_LOG) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(crate::error::StoreError::OpenTable {
+                    source: e,
+                    location: snafu::location!(),
+                });
+            }
+        };
         let start_seq = after_seq.map(|s| s + 1).unwrap_or(0);
         let start = log_key(sender, start_seq);
         let mut end = [0u8; 40];
@@ -123,9 +133,19 @@ impl TopicLog {
     }
 
     /// Read every message across all senders, sorted by (timestamp, sender, seq).
+    /// On a never-written log (table not yet created) returns an empty Vec.
     pub fn read_all(&self) -> Result<Vec<WireMessage>> {
         let read = self.db.begin_read().context(BeginTxnSnafu)?;
-        let table = read.open_table(TOPIC_LOG).context(OpenTableSnafu)?;
+        let table = match read.open_table(TOPIC_LOG) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(crate::error::StoreError::OpenTable {
+                    source: e,
+                    location: snafu::location!(),
+                });
+            }
+        };
         let mut out: Vec<WireMessage> = Vec::new();
         for entry in table.iter().context(StorageIoSnafu)? {
             let (_k, v) = entry.context(StorageIoSnafu)?;
@@ -141,10 +161,19 @@ impl TopicLog {
         Ok(out)
     }
 
-    /// Current high-water-mark per sender.
+    /// Current high-water-mark per sender. On a never-written log returns an empty map.
     pub fn hwm(&self) -> Result<HashMap<Pubkey, (u64, MessageHash)>> {
         let read = self.db.begin_read().context(BeginTxnSnafu)?;
-        let table = read.open_table(TOPIC_HWM).context(OpenTableSnafu)?;
+        let table = match read.open_table(TOPIC_HWM) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
+            Err(e) => {
+                return Err(crate::error::StoreError::OpenTable {
+                    source: e,
+                    location: snafu::location!(),
+                });
+            }
+        };
         let mut out = HashMap::new();
         for entry in table.iter().context(StorageIoSnafu)? {
             let (k, v) = entry.context(StorageIoSnafu)?;
@@ -166,9 +195,19 @@ impl TopicLog {
     }
 
     /// Total stored byte size across all entries in this topic's log.
+    /// On a never-written log returns 0.
     pub fn bytes_stored(&self) -> Result<u64> {
         let read = self.db.begin_read().context(BeginTxnSnafu)?;
-        let table = read.open_table(TOPIC_LOG).context(OpenTableSnafu)?;
+        let table = match read.open_table(TOPIC_LOG) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => {
+                return Err(crate::error::StoreError::OpenTable {
+                    source: e,
+                    location: snafu::location!(),
+                });
+            }
+        };
         let mut total: u64 = 0;
         for entry in table.iter().context(StorageIoSnafu)? {
             let (_k, v) = entry.context(StorageIoSnafu)?;
@@ -233,6 +272,20 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].seq, 0);
         assert_eq!(got[1].seq, 1);
+    }
+
+    #[test]
+    fn fresh_log_reads_return_empty_not_error() {
+        // A log file opened before any append() has no tables yet. All read
+        // methods must treat this as "empty", not surface TableDoesNotExist.
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(open_topic_log(tmp.path(), "fresh").unwrap());
+        let log = TopicLog::new(db);
+
+        assert_eq!(log.read_all().unwrap().len(), 0);
+        assert_eq!(log.read_after(&[7u8; 32], None, 10).unwrap().len(), 0);
+        assert!(log.hwm().unwrap().is_empty());
+        assert_eq!(log.bytes_stored().unwrap(), 0);
     }
 
     #[test]

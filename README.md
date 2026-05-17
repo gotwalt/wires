@@ -44,17 +44,21 @@ This walks through running the full system on one machine. Open four terminal ta
 
 ```bash
 mkdir -p ./host
-wires-host --data-dir ./host
+RUST_LOG=info wires-host --data-dir ./host
 # → wires-host: EndpointId = <HOST_ID>
-# → wires-host: discovery listening at 0.0.0.0:8443 (public=http://0.0.0.0:8443)
+# → INFO wires_host: host ticket: <TICKET_BASE64>
 # → wires-host: running. Press Ctrl-C to exit.
 ```
 
-Leave it running for the rest of the walkthrough. Set `RUST_LOG=info` (or `debug`) before the command if you want to see routing decisions in real time.
+Leave it running for the rest of the walkthrough. The `host ticket: …` line is a base64-encoded `HostTicket` that agents need to pair with this host; you can also fetch it from a separate shell at any time with `wires-host --data-dir ./host ticket --no-qr` (prints base64 to stdout). Running `wires-host` with stderr attached to a TTY additionally emits a scannable QR of the same ticket; pass `--no-qr` to suppress it.
 
 ### Tab 2 — Alice, the operator
 
-Alice is the root-key holder for this household.
+Alice is the root-key holder for this household. Capture the host ticket first (Tab 1 must already be running):
+
+```bash
+TICKET=$(wires-host --data-dir ./host ticket --no-qr)
+```
 
 ```bash
 # 1. Initialize Alice's data dir with a fresh local root.
@@ -64,14 +68,14 @@ wires --data-dir ./alice init --new-root
 # → Root pubkey: <ROOT_HEX>
 
 # 2. Pair Alice's root with the host.
-wires --data-dir ./alice host pair \
-  --discovery-url http://127.0.0.1:8443/v1/bootstrap
+wires --data-dir ./alice host pair --ticket "$TICKET"
 # → Paired with host <HOST_ID> (server_time=<MILLIS>)
+# → Host info persisted to ./alice/config.toml
 
 # 3. Create a topic. Auto-mints a self-cap because root.ed25519 is present.
 wires --data-dir ./alice topic create home.notes
 # → Created topic 'home.notes' with id <TOPIC_HEX>
-# → Note: share epoch key <EPOCH_HEX> with peers manually.
+# → Epoch key (share with peers via `wires pair-approve`): <EPOCH_HEX>
 # → Minted self-cap: <ALICE_CAP_HEX>
 
 # 4. Register the topic with the host so the host persists envelopes for it.
@@ -201,11 +205,12 @@ wires --data-dir ./alice cat home.notes                    # no --tail: print lo
 
 ## Networking notes
 
-- Transport is [iroh](https://www.iroh.computer) (`0.98`). Discovery uses iroh's N0 preset by default.
+- Transport is [iroh](https://www.iroh.computer) (`0.98`). Discovery uses iroh's N0 preset by default, plus mDNS on the LAN.
 - Gossip runs over iroh-gossip on the topic id directly.
 - Replay (catching up after downtime) uses a custom QUIC stream on ALPN `/wires/replay/0`.
 - Tenant control (registration + topic register/unregister + status) uses ALPN `/wires/tenant/0` with length-prefixed JSON frames.
-- Service discovery is plain HTTPS at `GET /v1/bootstrap`, returning a list of host endpoints. Self-hosting operators can serve a static JSON file; the host serves its own by default (HTTP only — production wants a TLS terminator in front).
+- Pairing (operator approving an agent) uses ALPN `/wires/pair/0` with a sealed, signed `PairGrant`.
+- Host discovery is out-of-band: the host emits a base64 `HostTicket` on startup (and a terminal QR when stderr is a TTY) that carries the host's `endpoint_id`, direct addrs, and relay URL. Operators paste the ticket into `wires host pair --ticket <…>`; the `endpoint_id` is permanent while the addrs/relay are a short-TTL hint that iroh re-resolves as needed.
 
 ## Layout
 
@@ -214,10 +219,10 @@ crates/
   wires-core    pure types (WireMessage, Capability, content, sign/verify)
   wires-crypto  AEAD (chacha20-poly1305), sealed-box (x25519), public envelopes
   wires-store   redb-backed hash-chained logs, cap table, epoch keys, ingest index
-  wires-net     iroh gossip + replay protocol + tenant control protocol + pair protocol + discovery
+  wires-net     iroh gossip + replay protocol + tenant control protocol + pair protocol + host ticket
   wires-node    Node runtime (publish, inbound, sync, NetGlue, NodeRuntime)
   wires-cli     `wires` binary
-  wires-host    `wires-host` multi-tenant relay (lib + bin: tenant registry, retention, routing, http discovery)
+  wires-host    `wires-host` multi-tenant relay (lib + bin: tenant registry, retention, routing, host-ticket emission)
   wires-ha      `wires-ha` Home Assistant ingestion daemon
 docs/superpowers/
   specs/        design docs (substrate, hosted-service, iOS companion)
