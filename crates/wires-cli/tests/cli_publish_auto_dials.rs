@@ -81,7 +81,6 @@ async fn publish_broadcasts_via_gossip() {
                 addrs: hint_addrs,
                 relay: hint_relay,
             }],
-            discovery_url: None,
         }),
     };
     std::fs::write(

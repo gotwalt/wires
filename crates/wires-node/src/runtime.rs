@@ -114,7 +114,7 @@ impl NodeRuntime {
         let peer = wires_net::first_reachable_with_discovery(
             &self.endpoint,
             &host.peer_hints,
-            host.discovery_url.as_deref(),
+            None,
             wires_net::ALPN,
             std::time::Duration::from_secs(5),
         )

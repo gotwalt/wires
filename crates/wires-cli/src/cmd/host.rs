@@ -52,7 +52,6 @@ pub async fn pair(data_dir: &Path, ticket_arg: &str) -> Result<()> {
     }
     cfg.host = Some(HostConfig {
         peer_hints: vec![hint],
-        discovery_url: None,
     });
     let toml_str = toml::to_string_pretty(&cfg).context(TomlSerializeSnafu)?;
     std::fs::write(&cfg_path, toml_str).context(IoSnafu)?;
