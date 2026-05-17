@@ -1,0 +1,33 @@
+[package]
+name = "wires-uniffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "wires_uniffi"
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+[dependencies]
+wires-core   = { workspace = true }
+wires-crypto = { workspace = true }
+wires-net    = { workspace = true }
+uniffi = { version = "0.31", features = ["tokio", "cli"] }
+snafu = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+hex = { workspace = true }
+iroh = { workspace = true }
+parking_lot = "0.12"
+uuid = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+uniffi = { version = "0.31", features = ["build"] }

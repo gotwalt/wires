@@ -9,6 +9,7 @@ members = [
     "crates/wires-cli",
     "crates/wires-host",
     "crates/wires-ha",
+    "crates/wires-uniffi",
 ]
 
 [workspace.package]
