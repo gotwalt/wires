@@ -1,7 +1,4 @@
 uniffi::setup_scaffolding!();
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_compiles() {}
-}
+pub mod error;
+pub use error::{WiresError, WiresResult};
