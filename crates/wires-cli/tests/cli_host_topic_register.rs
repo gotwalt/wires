@@ -2,17 +2,16 @@
 //! topic with the host. Subsequent inbound envelopes for that topic should
 //! be routed and persisted.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
-use iroh::{Endpoint, SecretKey, endpoint::presets};
+use iroh::SecretKey;
 use rand_core::OsRng;
 use tempfile::TempDir;
-use wires_host::http_discovery::{DiscoveryEndpoint, DiscoveryResponse, DiscoveryState};
 use wires_host::per_tenant_logs::PerTenantLogs;
 use wires_host::retention::Retention;
 use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
+use wires_net::HostTicket;
 use wires_net::tenant::{ALPN as TENANT_ALPN, TenantProtocol};
 
 #[tokio::test]
@@ -21,10 +20,7 @@ async fn topic_register_round_trip() {
     let registry = Arc::new(TenantRegistry::open(host_tmp.path()).unwrap());
     let logs = Arc::new(PerTenantLogs::new(host_tmp.path()));
     let retention = Arc::new(Retention::new(host_tmp.path(), Arc::clone(&logs)));
-    let host_ep = Endpoint::builder(presets::N0)
-        .secret_key(SecretKey::generate())
-        .alpns(vec![TENANT_ALPN.to_vec()])
-        .bind()
+    let host_ep = wires_net::bind_cloud(SecretKey::generate(), vec![TENANT_ALPN.to_vec()])
         .await
         .unwrap();
     let host_eid: [u8; 32] = host_ep.id().as_bytes().to_owned();
@@ -47,25 +43,20 @@ async fn topic_register_round_trip() {
         .accept(TENANT_ALPN, TenantProtocol::new(handler))
         .spawn();
 
-    let discovery_state = Arc::new(DiscoveryState {
-        response: DiscoveryResponse {
-            version: 1,
-            endpoints: vec![DiscoveryEndpoint {
-                endpoint_id: hex::encode(host_eid),
-                relay: None,
-                addrs: vec![],
-            }],
-            ttl_seconds: 300,
-        },
-    });
-    let app = wires_host::http_discovery::router(discovery_state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr: SocketAddr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
+    // Wait for the host endpoint to come online so socket addresses are
+    // populated in the ticket (avoids pkarr/DNS for in-process connect).
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        host_ep.online(),
+    )
+    .await
+    .expect("host endpoint did not come online within 10s");
 
-    // Init + pair.
+    // Build the host ticket the operator would scan.
+    let ticket = HostTicket::from_endpoint(&host_ep, std::time::Duration::from_secs(60)).unwrap();
+    let token = ticket.encode().unwrap();
+
+    // Init + pair via ticket.
     let agent_dir = TempDir::new().unwrap();
     let root = SigningKey::generate(&mut OsRng);
     std::fs::write(agent_dir.path().join("root.ed25519"), root.to_bytes()).unwrap();
@@ -79,11 +70,10 @@ async fn topic_register_round_trip() {
         toml::to_string_pretty(&cfg).unwrap(),
     )
     .unwrap();
-    wires_cli::cmd::host::pair(agent_dir.path(), &format!("http://{addr}/v1/bootstrap"))
-        .await
-        .unwrap();
+    wires_cli::cmd::host::pair(agent_dir.path(), &token).await.unwrap();
 
-    // Register a synthetic topic id.
+    // Register a synthetic topic id (matches the pre-existing test's shape:
+    // we call topic_register with a hex string, not a name created locally).
     let topic = [0xCDu8; 32];
     wires_cli::cmd::host::topic_register(agent_dir.path(), &hex::encode(topic))
         .await
