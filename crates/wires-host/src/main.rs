@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use humantime;
 use iroh::SecretKey;
 use tokio::sync::mpsc;
 use wires_core::WireMessage;

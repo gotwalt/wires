@@ -7,10 +7,10 @@ use std::path::Path;
 use ed25519_dalek::SigningKey;
 use iroh::{Endpoint, SecretKey};
 use snafu::ResultExt;
+use tracing;
 use wires_net::tenant::{TenantClient, TenantResponse};
 use wires_net::{endpoint_id_from_hex, load_or_create_secret, unix_now_ms};
 use wires_node::{HostConfig, NodeConfig, load_root_signing_key, resolve_topic};
-use tracing;
 
 use crate::error::{
     CliError, HostRejectedSnafu, IoSnafu, NetSnafu, Result, TomlParseSnafu, TomlSerializeSnafu,
@@ -77,9 +77,7 @@ async fn open_paired_client(
     let host = cfg
         .host
         .as_ref()
-        .ok_or_else(|| {
-            invalid!("no host paired — run `wires host pair --ticket <STRING>` first")
-        })?
+        .ok_or_else(|| invalid!("no host paired — run `wires host pair --ticket <STRING>` first"))?
         .clone();
     let first = host
         .peer_hints
@@ -124,9 +122,9 @@ fn register_hint_addrs(ep: &Endpoint, hint: &wires_net::peer_hint::PeerHint) {
     }
     let endpoint_addr = iroh::EndpointAddr::from_parts(id, addrs);
     if let Ok(lookup) = ep.address_lookup() {
-        lookup.add(iroh::address_lookup::memory::MemoryLookup::from_endpoint_info(vec![
-            endpoint_addr,
-        ]));
+        lookup.add(
+            iroh::address_lookup::memory::MemoryLookup::from_endpoint_info(vec![endpoint_addr]),
+        );
     }
 }
 

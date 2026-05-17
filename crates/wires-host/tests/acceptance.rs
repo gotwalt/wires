@@ -3,11 +3,11 @@
 use std::sync::Arc;
 
 use iroh::SecretKey;
+use rand_core::OsRng;
 use tempfile::TempDir;
 use wires_host::per_tenant_logs::PerTenantLogs;
 use wires_host::retention::Retention;
 use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
-use rand_core::OsRng;
 use wires_net::tenant::{ALPN as TENANT_ALPN, TenantProtocol, TenantResponse};
 
 #[tokio::test]

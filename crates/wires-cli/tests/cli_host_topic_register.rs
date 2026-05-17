@@ -45,12 +45,9 @@ async fn topic_register_round_trip() {
 
     // Wait for the host endpoint to come online so socket addresses are
     // populated in the ticket (avoids pkarr/DNS for in-process connect).
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        host_ep.online(),
-    )
-    .await
-    .expect("host endpoint did not come online within 10s");
+    tokio::time::timeout(std::time::Duration::from_secs(10), host_ep.online())
+        .await
+        .expect("host endpoint did not come online within 10s");
 
     // Build the host ticket the operator would scan.
     let ticket = HostTicket::from_endpoint(&host_ep, std::time::Duration::from_secs(60)).unwrap();
@@ -70,7 +67,9 @@ async fn topic_register_round_trip() {
         toml::to_string_pretty(&cfg).unwrap(),
     )
     .unwrap();
-    wires_cli::cmd::host::pair(agent_dir.path(), &token).await.unwrap();
+    wires_cli::cmd::host::pair(agent_dir.path(), &token)
+        .await
+        .unwrap();
 
     // Register a synthetic topic id (matches the pre-existing test's shape:
     // we call topic_register with a hex string, not a name created locally).

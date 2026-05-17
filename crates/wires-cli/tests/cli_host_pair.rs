@@ -47,12 +47,9 @@ async fn host_pair_persists_host_to_config() {
     // Wait for the host endpoint to come online so its socket addresses are
     // populated and HostTicket::from_endpoint carries real addrs for the
     // client to register in its MemoryLookup (avoids pkarr/DNS in-process).
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        host_ep.online(),
-    )
-    .await
-    .expect("host endpoint did not come online within 10s");
+    tokio::time::timeout(std::time::Duration::from_secs(10), host_ep.online())
+        .await
+        .expect("host endpoint did not come online within 10s");
 
     // ---- build the host ticket the operator would scan ------------------
     let ticket = HostTicket::from_endpoint(&host_ep, std::time::Duration::from_secs(60)).unwrap();
@@ -73,7 +70,9 @@ async fn host_pair_persists_host_to_config() {
     )
     .unwrap();
 
-    wires_cli::cmd::host::pair(agent_dir.path(), &token).await.unwrap();
+    wires_cli::cmd::host::pair(agent_dir.path(), &token)
+        .await
+        .unwrap();
 
     // ---- assert config.toml gained host fields -------------------------
     let after: wires_node::NodeConfig =
