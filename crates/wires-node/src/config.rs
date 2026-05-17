@@ -22,10 +22,6 @@ pub struct HostConfig {
     /// Peer hints harvested from discovery or an invite token. Tried in order
     /// when bootstrapping gossip and when dialing the tenant/replay ALPNs.
     pub peer_hints: Vec<PeerHint>,
-    /// Optional HTTPS service-discovery URL; consulted only if every entry in
-    /// `peer_hints` is unreachable.
-    #[serde(default)]
-    pub discovery_url: Option<String>,
 }
 
 impl NodeConfig {
@@ -106,7 +102,6 @@ mod tests {
                     addrs: vec!["127.0.0.1:11204".into()],
                     relay: None,
                 }],
-                discovery_url: Some("https://discovery.example/v1/bootstrap".into()),
             }),
         };
         let s = toml::to_string_pretty(&cfg).unwrap();
@@ -114,10 +109,6 @@ mod tests {
         assert_eq!(back.root_pubkey_hex, "deadbeef");
         let h = back.host.expect("host must round-trip");
         assert_eq!(h.peer_hints.len(), 1);
-        assert_eq!(
-            h.discovery_url.as_deref(),
-            Some("https://discovery.example/v1/bootstrap")
-        );
     }
 
     #[test]
