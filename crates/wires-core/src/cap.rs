@@ -1,12 +1,13 @@
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, ensure};
 use uuid::Uuid;
 
 use crate::error::{
-    BadCapSignatureSnafu, BadGlobSnafu, CapDeniedSnafu, CapExpiredSnafu, Result,
-    SerializeEnvelopeSnafu,
+    BadCapSignatureSnafu, BadGlobSnafu, CapDeniedSnafu, CapExpiredSnafu, CapSignerRejectedSnafu,
+    Result, SerializeEnvelopeSnafu,
 };
+use crate::signer::RootSigner;
 use crate::wire::{CapId, Pubkey};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -102,9 +103,9 @@ impl Capability {
         serde_json::to_vec(&v).context(SerializeEnvelopeSnafu)
     }
 
-    pub fn sign(&mut self, root_sk: &SigningKey) -> Result<()> {
+    pub fn sign(&mut self, root: &dyn RootSigner) -> Result<()> {
         let bytes = self.signing_bytes()?;
-        self.sig = root_sk.sign(&bytes).to_bytes();
+        self.sig = root.sign(&bytes).context(CapSignerRejectedSnafu)?;
         Ok(())
     }
 
