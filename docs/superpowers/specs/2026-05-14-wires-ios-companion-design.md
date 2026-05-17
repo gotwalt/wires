@@ -1,7 +1,7 @@
 # Wires — iOS Companion App Design
 
-**Date:** 2026-05-14 (revised 2026-05-15)
-**Status:** Draft. Revised on 2026-05-15 after the hosted-service v1 and responder-driven-pairing v1 substrate slices landed. The previous draft's `HostPairToken` and `EnrollmentToken` flows are gone; the iOS app no longer participates as a gossip peer. This revision aligns the iOS surface against [the hosted-service design](2026-05-14-wires-hosted-service-design.md) and [the responder-driven pairing design](2026-05-15-wires-responder-driven-pairing-design.md).
+**Date:** 2026-05-14 (revised 2026-05-17)
+**Status:** Draft. Revised again on 2026-05-17 to track the host-ticket-discovery slice that landed since the last revision: the HTTPS `/v1/bootstrap` discovery flow is gone, replaced by a base64 `HostTicket` distributed by QR / paste / AirDrop. The iOS bootstrap wizard now scans a QR from a running `wires-host` instead of typing a URL. This revision aligns the iOS surface against [the hosted-service design](2026-05-14-wires-hosted-service-design.md), [the responder-driven pairing design](2026-05-15-wires-responder-driven-pairing-design.md), and [the host-ticket-discovery design](2026-05-15-wires-iroh-host-ticket-discovery-design.md).
 **Scope:** v1 of the iOS companion app. The app is the household's root of trust and operator console: it custodies the Ed25519 root key, registers with a hosted `wires-host` for relay, registers topics, and approves new agents into the household via the responder-driven pair flow.
 
 ---
@@ -10,8 +10,10 @@
 
 The iOS app is the **root of trust** and the **operator console** for a household's wires network. It is *not* itself a wires gossip peer — it does not publish `__cap.grant` envelopes, does not maintain a per-publisher hash chain, and does not subscribe to `__caps`. It does only what the root key alone is competent to do:
 
-1. Register the household with a hosted `wires-host` (and any topics the household creates) over the `/wires/tenant/0` ALPN.
-2. Approve agent enrollment by receiving a `PairRequest` (QR or paste), reviewing the manifest, narrowing scopes if desired, minting a root-signed `Capability` plus the matching epoch keys, and delivering a `PairGrant` over the `/wires/pair/0` ALPN.
+1. Pair with a hosted `wires-host` by scanning the host's `HostTicket` QR (or pasting the base64), then sending a signed `TenantRegisterRequest` over the `/wires/tenant/0` ALPN; register any topics the household creates over the same ALPN.
+2. Approve agent enrollment by scanning the agent's `PairRequest` QR (or pasting it), reviewing the manifest, narrowing scopes if desired, minting a root-signed `Capability` plus the matching epoch keys, and delivering a sealed `PairGrant` over the `/wires/pair/0` ALPN.
+
+There are exactly two QR codes in the iOS surface: a **host ticket** at first launch, an **agent pair request** every time the operator approves an agent. Both are decoded by the same `ScanFeature` reducer with a different parser closure.
 
 Architecturally it is a SwiftUI + The Composable Architecture (TCA) app over a Rust core. The Rust core (`crates/wires-uniffi`) is a narrow facade reusing `wires-core`, `wires-crypto`, and `wires-net`. It does not depend on `wires-store` or `wires-node`: nothing on the iOS side needs an append-only log, an envelope replay responder, or a gossip subscription.
 
@@ -19,7 +21,8 @@ Persistence is split by sensitivity: SwiftData for low-sensitivity records (host
 
 **v1 user-visible scope:**
 - Generate household root key on first launch.
-- Register with the household's hosted `wires-host` via HTTPS discovery (`/v1/bootstrap`) + a signed `TenantRegisterRequest`.
+- Pair with the household's hosted `wires-host` by scanning its `HostTicket` QR (`wires-host` emits the QR to stderr at startup; the same ticket is reproducible at any time via `wires-host ticket`). Operators on an iOS-without-a-camera path can paste the base64 ticket instead.
+- Register topics on demand with the host via a signed `TopicRegisterRequest`.
 - Approve agent enrollment by scanning a `PairRequest` QR (produced by `wires pair-listen --qr`), narrowing scopes if desired, and delivering a sealed `PairGrant`.
 
 **Explicitly out of scope for v1:**
@@ -87,27 +90,27 @@ Three flows: first-launch wizard, agent approval, and per-launch refresh.
 
 Triggered when `AppFeature` observes no `Household` record in SwiftData.
 
-**Step 1: Discovery URL.** A single screen prompts for the household's service-discovery URL. A default is offered (a build-time constant pointing at the project's hosted service); a self-hosting operator pastes their own URL. The URL must be HTTPS. On submit:
+**Step 1: Scan host ticket.** A single screen shows a camera viewfinder ("Scan the QR from your `wires-host` terminal"). A "Paste ticket" button below opens a text-entry sheet for the base64 form. On a successful scan or paste:
 
-1. `WiresClient.fetchDiscovery(url)` calls into Rust → `wires_net::discovery::fetch_endpoints(url)` → returns a non-empty `Vec<PeerHint>`. iOS picks `endpoints[0]`. (Multi-endpoint discovery handling is sub-project B; v1 uses the first.)
-2. Surface a confirmation screen showing the host's `endpoint_id`, `addrs`, optional `relay`, and the discovery URL. Operator taps "Continue".
-3. Persist a `Household` draft with `discoveryUrl` set and a non-persisted `HostInfo` cached in feature state.
+1. `WiresClient.parseHostTicket(payload)` calls into Rust → `wires_net::ticket::HostTicket::decode(payload)` → returns a typed `HostTicket`. The Rust side validates the version byte, address-count bound, base64 framing, and that `endpoint_id` is 32 valid bytes of an iroh `EndpointId`. iOS receives a `HostInfo { endpointIdHex, addrs, relay, hintExpiresAtMs }`.
+2. Surface a confirmation screen showing the host's `endpoint_id` (first 12 hex chars + ellipsis), the count of direct addrs, the optional relay URL, and the `hint_expires_at` timestamp. Operator taps "Continue". (Manual identity verification beyond reading the prefix is left to the operator — the ticket itself is unsigned; trust is established by the scan-from-a-machine-I-physically-have-in-front-of-me handshake.)
+3. Persist a `Household` draft with the host fields populated; cache `HostInfo` in feature state for step 2.
 
 **Step 2: Generate root and register tenant.** Single button "Create Household". On tap:
 
 1. Generate Ed25519 root keypair in CryptoKit. Persist to Keychain at `wires.root.signingkey` with the biometric ACL described in §2. Cache root pubkey hex separately at `wires.root.pubkey` (no ACL, read freely). Generate iroh node secret at `wires.iroh.secret`.
 2. Call `WiresClient.registerWithHostedService(hostInfo)`. Rust:
    a. Binds an iroh `Endpoint` using the iroh node secret.
-   b. Resolves the `HostInfo` into an iroh `NodeAddr` with the supplied direct-addr and relay hints.
+   b. Adds the host's `endpoint_id`, direct addrs, and optional relay to the endpoint's address book (the ticket's `addrs`/`relay` are short-TTL hints; iroh's discovery resolves the `endpoint_id` to fresh addrs over time).
    c. Builds a `TenantRegisterRequest`: `{ version: 1, root_pubkey, timestamp = now_ms, nonce = random[16], signature = root_sign(signing_bytes) }`. The `signing_bytes` layout comes from `wires_net::tenant::signing_bytes(TenantOp::Register, host_endpoint_id, ...)` (hosted-service spec §4.2). Root-sign call triggers the Face ID prompt on the Swift side.
    d. Opens a bidirectional stream over `/wires/tenant/0`, sends `TenantRequest::Register(...)`, awaits `TenantResponse::Register(ok = true, ...)`. Returns the `caps_topic_id` and `host_endpoint_id` to Swift.
-   e. On error: stream/dial failures map to `WiresError::TenantStream { source }`; signature-rejection responses map to `WiresError::TenantRejected { code, message }`.
-3. Persist a complete `Household` record: `rootPubkeyHex`, `discoveryUrl`, `hostEndpointIdHex`, `hostDirectAddrs`, `hostRelayURL`, `capsTopicIdHex`, `tenantRegisteredAt`, empty `topics` and `caps` relationships. Single SwiftData transaction.
+   e. On error: stream/dial failures map to `WiresError::TenantStream { message }`; signature-rejection responses map to `WiresError::TenantRejected { code, message }`.
+3. Persist a complete `Household` record: `rootPubkeyHex`, `hostEndpointIdHex`, `hostDirectAddrs`, `hostRelayURL`, `hostHintExpiresAtMs`, `capsTopicIdHex`, `tenantRegisteredAt`, empty `topics` and `caps` relationships. Single SwiftData transaction.
 4. Advance to step 3.
 
 **Step 3: Done.** Confirmation screen showing the household root pubkey hex (a long string the operator may want to save for verification). "Continue" enters Home.
 
-The biometric prompt fires exactly once in this wizard, at step 2's root sign. No HostPairToken QR scan exists in this flow.
+The biometric prompt fires exactly once in this wizard, at step 2's root sign.
 
 ### 3.2 Agent approval (responder-driven pair)
 
@@ -137,7 +140,7 @@ The sheet has a top-level Approve button that becomes enabled once at least one 
    - Loads the cached `PairRequest` (kept by handle from step 2 above).
    - Constructs a `Capability { agent_pubkey = request.agent_pubkey, topics = [name for each granted scope], rights = combined rights, issued_at = now, expires_at = None, cap_id = random[16] }`.
    - Signs the cap via the `RootSigner` callback (biometric prompt fires here; this is the second prompt in the agent-approve flow if a new topic was registered, or the first if all topics were pre-existing).
-   - Assembles `PairGrant { version: 1, root_pubkey, cap, topic_keys = [...], topic_names = [...], host = Some(HostInfo { peer_hints: [Household.host as PeerHint], service_discovery_url: Some(Household.discoveryUrl) }), nonce = request.nonce, issued_at = now }`.
+   - Assembles `PairGrant { version: 1, root_pubkey, cap, topic_keys = [...], topic_names = [...], host = Some(HostInfo { peer_hints: vec![PeerHint { node_id: Household.hostEndpointIdHex, addrs: Household.hostDirectAddrs, relay: Household.hostRelayURL }] }), nonce = request.nonce, issued_at = now }`. (The substrate `PairGrant::HostInfo` is `{ peer_hints }` only.)
    - Serializes the grant to canonical JSON, seals it to `request.ephemeral_x25519` with AAD `b"wires.pair.v1"` and AEAD nonce derived per `wires_crypto::sealed::sealed_nonce(grant.nonce, grant.root_pubkey, seq=0)` (responder-driven-pairing spec §4 "Crypto choices").
    - Signs the envelope: `signature = root_sign(root_pubkey || sealed_payload)`. **Re-uses the cap-sign biometric assertion** if iOS can do so within a single LocalAuthentication transaction; otherwise this is a second prompt. (See §6 "Biometric prompts" for the resolution.)
    - Returns `PairGrantEnvelope` to be sent.
@@ -167,7 +170,7 @@ On every launch after first:
 
 1. `AppFeature` reads the `Household` from SwiftData. Completion is judged by `tenantRegisteredAt != nil`. If absent → bootstrap path; if present → home path.
 2. The iroh `Endpoint` is bound lazily — on the first action that needs it (Approve agent, Register topic) rather than at launch. Idle iOS apps stay quiet.
-3. Discovery refresh: at launch, kick off a background task that re-fetches `discoveryUrl/v1/bootstrap` and updates `hostDirectAddrs` / `hostRelayURL` / `hostEndpointIdHex` if changed. Persisted to SwiftData. On fetch failure (offline, DNS, TLS) — silent, keeps stale values.
+3. No background refresh of host info is required. The host's `endpoint_id` is permanent, and iroh discovery resolves it to fresh addresses on demand whether or not the cached `addrs`/`relay` hints have expired. `hostHintExpiresAtMs` is recorded for future re-scan UX (a settings-screen "Re-scan host ticket" action), but v1 does not enforce it.
 4. No reconnection or subscription state needs to be re-established: the iOS app has no long-lived stream beyond the per-action ones it opens for tenant-register / topic-register / pair-deliver.
 
 ---
@@ -181,12 +184,15 @@ Three SwiftData `@Model` types, in `Wires/Wires/Models/`. There is no `PendingPu
     @Attribute(.unique) var rootPubkeyHex: String
     var createdAt: Date
 
-    // Host discovery + registration (populated at bootstrap step 2)
-    var discoveryUrl: String                 // always set; entered or defaulted at first launch
-    var hostEndpointIdHex: String?           // nil until tenant register succeeds
-    var hostRelayURL: String?
+    // Host info, populated from the scanned/pasted HostTicket at bootstrap step 1.
+    // hostEndpointIdHex is permanent; addrs / relay are short-TTL hints that
+    // iroh re-resolves over time. hostHintExpiresAtMs is recorded for future
+    // re-scan UX but not enforced in v1.
+    var hostEndpointIdHex: String?           // nil until ticket parsed
     var hostDirectAddrs: [String]
-    var capsTopicIdHex: String?              // echoed by tenant register; for future use
+    var hostRelayURL: String?
+    var hostHintExpiresAtMs: Int64?
+    var capsTopicIdHex: String?              // echoed by tenant register
     var tenantRegisteredAt: Date?            // nil until tenant register succeeds
 
     @Relationship(deleteRule: .cascade) var topics: [TopicRecord]
@@ -233,15 +239,17 @@ This section was previously titled "Wire-side additions" and proposed three subs
 
 - **`wires-net::pair`** — `PairRequest`, `PairGrant`, `PairGrantEnvelope`, `PairClient::deliver_grant`, plus all framing and crypto. Used directly by `wires-uniffi`.
 - **`wires-net::tenant`** — `TenantClient`, `TenantRequest::{Register, TopicRegister, TopicUnregister, Status}`, signing-bytes helpers. Used directly by `wires-uniffi`.
-- **`wires-net::discovery::fetch_endpoints`** — fetches `/v1/bootstrap` and returns `Vec<PeerHint>`. Used directly by `wires-uniffi`.
+- **`wires-net::ticket::HostTicket`** — base64-encoded JSON ticket: `{ version, endpoint_id, addrs, relay, hint_expires_at }`. Bounds-checked on decode (`MAX_TICKET_BYTES = 1024`, `MAX_HINT_ADDRS = 8`). `HostTicket::decode(&str)` and `HostTicket::to_peer_hint()` are the entry points `wires-uniffi` will use.
 - **`wires-net::endpoint::bind_lan`** — used by `wires-uniffi` to bind the iroh Endpoint. (The iOS app is on-LAN-as-far-as-its-router-is-concerned; mDNS is harmless and useful when the operator's host is on the same network.)
 - **`RootSigner` trait** — *not yet landed* in `wires-core`. Today `Capability::sign(&self, root_sk: &SigningKey)`. The plan introduces a `RootSigner` trait so the iOS side can supply a callback-backed signer (Swift Keychain + biometric prompt) without `wires-core` learning anything about Swift. See the implementation plan, Phase 1, Task 1.
 
 Deleted compared to the previous draft:
 
-- `wires-host show-pair-qr` subcommand — never landed; hosted-service spec §9 explicitly forbids it. Replaced by HTTPS discovery.
+- `wires-host show-pair-qr` subcommand — never landed; hosted-service spec §9 explicitly forbids it. Replaced first by HTTPS discovery, then by the `HostTicket` flow.
 - `wires enroll` subcommand + `EnrollmentToken` — replaced by `wires pair-listen` + `PairRequest`, which already ship.
-- The iOS-only `HostPairToken` — never landed; superseded by discovery + tenant-register.
+- The iOS-only `HostPairToken` — never landed; superseded by `HostTicket` + tenant-register.
+- `wires-net::discovery` module and HTTPS `/v1/bootstrap` — deleted; the `HostTicket` flow replaces them.
+- `PairGrant::HostInfo.service_discovery_url` — the field never existed on the wire; the previous spec described it but the substrate `HostInfo` is `{ peer_hints }` only.
 
 ---
 
@@ -271,7 +279,7 @@ impl WiresApp {
         root_signer: Arc<dyn SwiftRootSigner>,
     ) -> Arc<Self>;
 
-    pub async fn fetch_discovery(&self, url: String) -> Result<HostInfo, WiresError>;
+    pub fn parse_host_ticket(&self, payload: String) -> Result<HostInfo, WiresError>;
 
     pub async fn register_with_hosted_service(
         &self,
@@ -311,7 +319,7 @@ UniFFI records and enums:
     pub endpoint_id_hex: String,
     pub addrs: Vec<String>,
     pub relay: Option<String>,
-    pub discovery_url: String,
+    pub hint_expires_at_ms: i64,
 }
 
 #[derive(uniffi::Record)] pub struct TenantRegistration {
@@ -404,10 +412,10 @@ The iOS app uses [swift-composable-architecture](https://github.com/pointfreeco/
 One folder per feature under `Wires/Wires/Features/`, each containing a `Feature.swift` (reducer) and a `FeatureView.swift` (SwiftUI).
 
 - **`AppFeature`** — root. `State` is an enum: `case bootstrap(BootstrapFeature.State)` or `case home(HomeFeature.State)`. Transitions on `bootstrapCompleted`. At launch, reads `Household` from SwiftData via `HouseholdClient`; `tenantRegisteredAt == nil` → bootstrap, else → home.
-- **`BootstrapFeature`** — three-screen wizard using `StackState<Path.State>` with cases `discoveryUrl`, `confirmHost`, `done`. No QR scanning anywhere in bootstrap.
+- **`BootstrapFeature`** — three-screen wizard using `StackState<Path.State>` with cases `scanTicket`, `confirmHost`, `done`. The `scanTicket` step composes `ScanFeature` parameterised with the host-ticket parser closure (`WiresClient.parseHostTicket`) and offers a "Paste ticket" alternate path that opens a sheet for the base64 form.
 - **`HomeFeature`** — lists `CapRecord`s grouped by agent, "Approve agent" button. Presents `AgentEnrollmentFeature` via `@Presents`.
 - **`AgentEnrollmentFeature`** — composes `ScanFeature` and `ApprovalFeature` via a small two-state stack.
-- **`ScanFeature`** — reusable QR scanner reducer. State: camera permission, last decoded payload, error. Generic in payload shape via an init-time parser closure.
+- **`ScanFeature`** — reusable QR scanner reducer. State: camera permission, last decoded payload, error. Generic in payload shape via an init-time parser closure. Used in two places: bootstrap (parser = `parseHostTicket`) and agent enrollment (parser = `parsePairRequest`).
 - **`ApprovalFeature`** — approval sheet driven by the `PairRequestPreview`. State: per-scope grant/deny + rights toggles; per-new-topic create/skip; "Approve" enabled when ≥1 scope kept. Approve action triggers the topic-register-then-mint-then-deliver effect chain.
 
 ### Dependencies
@@ -417,7 +425,7 @@ Under `Wires/Wires/Dependencies/`. Each is a `struct` of closures with `Dependen
 ```swift
 @DependencyClient struct WiresClient {
     var bootstrap: @Sendable (Data, any RootSignerCallback) -> Void
-    var fetchDiscovery: @Sendable (String) async throws -> HostInfo
+    var parseHostTicket: @Sendable (String) throws -> HostInfo
     var registerWithHostedService: @Sendable (HostInfo) async throws -> TenantRegistration
     var registerTopic: @Sendable (HostInfo, Data) async throws -> Void
     var parsePairRequest: @Sendable (String) throws -> PairRequestPreview
@@ -459,7 +467,7 @@ Wires/
       Bootstrap/
         BootstrapFeature.swift
         BootstrapView.swift
-        DiscoveryURLView.swift
+        ScanTicketView.swift
         ConfirmHostView.swift
       Home/
         HomeFeature.swift
@@ -532,11 +540,8 @@ A single UniFFI-modeled enum, in `wires-uniffi/src/error.rs` per the existing sn
 ```rust
 #[derive(Debug, Snafu, uniffi::Error)]
 pub enum WiresError {
-    #[snafu(display("Failed to fetch service discovery URL, at {location}"))]
-    DiscoveryFetch { source: wires_net::error::NetError, #[snafu(implicit)] location: Location },
-
-    #[snafu(display("Discovery URL returned no endpoints, at {location}"))]
-    DiscoveryEmpty { #[snafu(implicit)] location: Location },
+    #[snafu(display("Failed to decode host ticket: {message}, at {location}"))]
+    TicketDecode { message: String, #[snafu(implicit)] location: Location },
 
     #[snafu(display("Tenant register stream failed, at {location}"))]
     TenantStream { source: wires_net::error::NetError, #[snafu(implicit)] location: Location },
@@ -598,18 +603,18 @@ User-cancelled Face ID is silent: the reducer returns to the previous state with
 
 ### Rust tests in `wires-uniffi`
 
-- **Pure parser tests.** `parse_pair_request` round-trip and signature-verify rejection. Synthetic `PairRequest`s constructed via `wires_net::pair::request::PairRequest::new + sign`.
+- **Pure parser tests.** `parse_pair_request` round-trip and signature-verify rejection. Synthetic `PairRequest`s constructed via `wires_net::pair::request::PairRequest::new + sign`. `parse_host_ticket` round-trip on a synthetic `HostTicket` (encoded with `HostTicket::encode`) plus rejection of arbitrary garbage strings.
 - **`generate_topic_id_and_epoch0`** returns 32+32 bytes, distinct across calls, nonzero.
 - **`RootSigner` adapter** roundtrip: a fake `SwiftRootSigner` (in-process ed25519 keypair) signs a `Capability`; `cap.verify(&pubkey)` passes.
-- **Integration with real iroh + wires-host.** Spins up `wires-host` in a test process, calls `WiresApp.fetch_discovery` (with a small axum stub serving `/v1/bootstrap`) → `register_with_hosted_service` → `register_topic`, then verifies `tenants.redb` and `topic_index.redb` reflect the registration.
+- **Integration with real iroh + wires-host.** Spins up `wires-host` in a test process, reads the host's `HostTicket` (via the host lib's ticket accessor), feeds it to `WiresApp.parse_host_ticket` → `register_with_hosted_service` → `register_topic`, then verifies `tenants.redb` and `topic_index.redb` reflect the registration.
 - **Pair end-to-end.** Two `WiresApp`s would be wrong — iOS only plays Alice. Spin up `wires-node` in a test process running `pair::listen`, point `WiresApp.approve_pair_request` at its endpoint, assert the listener's cap install completes and the SwiftData-side `PairAckRecord` matches.
 
 ### Swift reducer tests (`WiresTests/`, TCA `TestStore`)
 
 - **`BootstrapFeatureTests`** — drives the wizard with mocked dependencies. Cases:
-  - Happy path: enter URL → confirm host → register → done. Assert `fetchDiscovery` and `registerWithHostedService` each called once.
-  - Bad discovery URL → alert, stays on URL step.
-  - Discovery returns empty endpoints → alert, stays on URL step.
+  - Happy path (scan): decoded payload → confirm host → register → done. Assert `parseHostTicket` and `registerWithHostedService` each called once.
+  - Happy path (paste): same as above, via the paste sheet.
+  - Bad ticket payload (`parseHostTicket` throws `TicketDecode`) → alert, stays on scanTicket step.
   - Tenant register fails on first attempt, succeeds on retry → final state matches happy path.
   - Tenant register receives `TenantErrorCode::BadSignature` from host → alert with code-specific copy.
 - **`AgentEnrollmentFeatureTests`** — scan → approval → mint → deliver. Cases:
@@ -630,7 +635,7 @@ User-cancelled Face ID is silent: the reducer returns to the previous state with
 
 Using `swift-snapshot-testing`. One snapshot per major screen state:
 
-- Bootstrap: enter URL, confirm host, registering (in flight), done.
+- Bootstrap: scan-ticket (camera viewfinder), scan-ticket (paste sheet visible), confirm host, registering (in flight), done.
 - Home: empty (no caps), populated.
 - Approval sheet: pristine preview, partially-narrowed, all-denied (Approve disabled), in-flight, success.
 
@@ -638,7 +643,7 @@ Using `swift-snapshot-testing`. One snapshot per major screen state:
 
 Not part of CI. Run before each release.
 
-1. Fresh install on a real device → wizard runs → root key generated, Face ID enrolled, tenant registered against a known `wires-host` (self-hosted or hosted).
+1. Fresh install on a real device → wizard runs → operator scans the `wires-host` terminal QR (or pastes the base64 from `wires-host ticket --no-qr`) → root key generated, Face ID enrolled, tenant registered against a known `wires-host` (self-hosted or hosted).
 2. New agent (`wires pair-listen --role chat-agent --description "Bob" --request home.notes:read+write --qr` on a third machine) produces QR → operator scans → approves with `home.notes` + read+write → Bob's pair-listen exits with success → Bob can `wires publish home.notes hello`.
 3. Kill app, relaunch → state restored, immediately ready to approve another agent.
 4. Approve a second agent for the same `home.notes` topic → epoch-key history is included in the new agent's grant; second agent can `wires cat home.notes` and see Bob's earlier message.

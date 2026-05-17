@@ -1,10 +1,10 @@
 # Wires iOS Companion Implementation Plan
 
-**Status:** Draft, revised 2026-05-15 against the post-hosted-service / responder-driven-pairing substrate. The previous draft's tasks for `HostPairToken`, `EnrollmentToken`, and `wires-host show-pair-qr` are deleted; tasks for tenant-client wrappers, pair-client wrappers, and discovery wrappers replace them. The previous draft's iOS agent identity and chain-state plumbing are gone — iOS is no longer a gossip peer in v1.
+**Status:** Draft, revised 2026-05-17 against the host-ticket-discovery substrate slice (which landed on top of the hosted-service / responder-driven-pairing slices the 2026-05-15 revision targeted). HTTPS service discovery is gone; bootstrap now decodes a base64 `HostTicket` (scanned QR or pasted text). The iOS app continues to be a non-gossip operator console; the only protocol changes vs. the 2026-05-15 plan are: drop `fetch_discovery`, add `parse_host_ticket`, and drop the (never-on-the-wire) `service_discovery_url` field from the `PairGrant::HostInfo` literal.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the v1 iOS companion app described in `docs/superpowers/specs/2026-05-14-wires-ios-companion-design.md`: a SwiftUI + TCA app over a Rust `wires-uniffi` facade that custodies the household root key, registers with a hosted `wires-host` via discovery + `/wires/tenant/0`, registers topics on demand, and approves new agents via responder-driven pair (`/wires/pair/0`).
+**Goal:** Build the v1 iOS companion app described in `docs/superpowers/specs/2026-05-14-wires-ios-companion-design.md`: a SwiftUI + TCA app over a Rust `wires-uniffi` facade that custodies the household root key, pairs with a hosted `wires-host` by scanning its `HostTicket` QR and signing a `TenantRegisterRequest` over `/wires/tenant/0`, registers topics on demand, and approves new agents via responder-driven pair (`/wires/pair/0`).
 
 **Architecture:** Rust core reuses `wires-core`, `wires-crypto`, `wires-net` unchanged in behavior. One small substrate refactor lifts the existing `Capability::sign(&SigningKey)`-style signing sites onto a `wires_core::RootSigner` trait so the iOS Keychain can supply a callback-backed signer; a blanket impl for `SigningKey` keeps every existing caller working. A new `crates/wires-uniffi` exposes a narrow per-operation FFI via UniFFI 0.28+. iOS persists low-sensitivity state in SwiftData, secrets in Keychain. SwiftUI views are driven by Composable Architecture reducers with dependency-injected `WiresClient`, `HouseholdClient`, `KeychainClient`.
 
@@ -16,7 +16,7 @@
 
 **New Rust files:**
 - `crates/wires-core/src/signer.rs` — `RootSigner` trait + `SignError` + blanket impl for `&SigningKey`
-- `crates/wires-uniffi/Cargo.toml` + `src/{lib,error,types,signer,parse,topic,tenant,pair,app}.rs` + `build.rs` + `uniffi.toml` + `uniffi-bindgen.rs`
+- `crates/wires-uniffi/Cargo.toml` + `src/{lib,error,types,signer,ticket,parse,topic,tenant,pair,app}.rs` + `build.rs` + `uniffi.toml` + `uniffi-bindgen.rs`
 
 **Modified Rust files:**
 - `Cargo.toml` (workspace) — add `wires-uniffi` member
@@ -30,7 +30,7 @@
 
 **iOS files (new under `Wires/Wires/`):**
 - `App/WiresApp.swift` (replaces template), `App/AppFeature.swift`
-- `Features/Bootstrap/{BootstrapFeature,BootstrapView,DiscoveryURLView,ConfirmHostView}.swift`
+- `Features/Bootstrap/{BootstrapFeature,BootstrapView,ScanTicketView,ConfirmHostView}.swift`
 - `Features/Home/{HomeFeature,HomeView}.swift`
 - `Features/AgentEnrollment/{AgentEnrollmentFeature,ApprovalFeature,AgentEnrollmentView}.swift`
 - `Features/Scan/{ScanFeature,ScanView}.swift`
@@ -389,11 +389,8 @@ use wires_net::tenant::TenantErrorCode;
 #[derive(Debug, Snafu, uniffi::Error)]
 #[uniffi(flat_error)]
 pub enum WiresError {
-    #[snafu(display("Failed to fetch service discovery URL: {message}, at {location}"))]
-    DiscoveryFetch { message: String, #[snafu(implicit)] location: Location },
-
-    #[snafu(display("Discovery URL returned no endpoints, at {location}"))]
-    DiscoveryEmpty { #[snafu(implicit)] location: Location },
+    #[snafu(display("Failed to decode host ticket: {message}, at {location}"))]
+    TicketDecode { message: String, #[snafu(implicit)] location: Location },
 
     #[snafu(display("Tenant register stream failed: {message}, at {location}"))]
     TenantStream { message: String, #[snafu(implicit)] location: Location },
@@ -437,7 +434,7 @@ mod tests {
 
     #[test]
     fn display_ends_with_location() {
-        let e = DiscoveryEmptySnafu.build();
+        let e = TicketDecodeSnafu { message: "bad".to_string() }.build();
         let s = format!("{e}");
         assert!(s.contains(", at"), "got: {s}");
     }
@@ -485,7 +482,7 @@ pub struct HostInfo {
     pub endpoint_id_hex: String,
     pub addrs: Vec<String>,
     pub relay: Option<String>,
-    pub discovery_url: String,
+    pub hint_expires_at_ms: i64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -560,7 +557,7 @@ mod tests {
             endpoint_id_hex: "00".repeat(32),
             addrs: vec!["1.2.3.4:5".into()],
             relay: None,
-            discovery_url: "https://example/v1/bootstrap".into(),
+            hint_expires_at_ms: 1_700_000_000_000,
         };
         let _ = Right::Read;
         let _ = PairAckRecord { installed_cap_id_hex: "".into(), installed_at_ms: 0 };
@@ -692,10 +689,10 @@ git add crates/wires-uniffi/
 git commit -m "wires-uniffi: SwiftRootSigner callback trait + RootSigner adapter"
 ```
 
-### Task 7: Pure helpers — pair-request parsing, topic generation
+### Task 7: Pure helpers — host-ticket decoding, pair-request parsing, topic generation
 
 **Files:**
-- Create: `crates/wires-uniffi/src/parse.rs`, `crates/wires-uniffi/src/topic.rs`
+- Create: `crates/wires-uniffi/src/ticket.rs`, `crates/wires-uniffi/src/parse.rs`, `crates/wires-uniffi/src/topic.rs`
 - Modify: `crates/wires-uniffi/src/lib.rs`
 
 - [ ] **Step 1: Write `topic.rs` with a test**
@@ -835,39 +832,104 @@ mod tests {
 
 If `PairRequest::new_signed` / `decode_and_verify` / `encode` have different names in `wires-net::pair::request`, adjust to match. Find them via `grep -rn "pub fn .*PairRequest" crates/wires-net/`.
 
-- [ ] **Step 3: Register and run**
+- [ ] **Step 3: Write `ticket.rs` with tests**
+
+Create `crates/wires-uniffi/src/ticket.rs`:
+
+```rust
+//! Host-ticket decoding for the iOS bootstrap flow. Delegates to
+//! `wires_net::ticket::HostTicket::decode`, then projects the result onto the
+//! Swift-facing `HostInfo` record.
+
+use wires_net::ticket::HostTicket;
+
+use crate::error::{TicketDecodeSnafu, WiresError};
+use crate::types::HostInfo;
+
+pub fn parse_host_ticket(payload: &str) -> Result<HostInfo, WiresError> {
+    let t = HostTicket::decode(payload).map_err(|e| {
+        TicketDecodeSnafu { message: format!("{e}") }.build()
+    })?;
+    Ok(HostInfo {
+        endpoint_id_hex: t.endpoint_id,
+        addrs: t.addrs,
+        relay: t.relay,
+        hint_expires_at_ms: t.hint_expires_at,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wires_net::ticket::{HostTicket, TICKET_VERSION};
+
+    fn valid_endpoint_id_hex() -> String {
+        let sk = iroh::SecretKey::generate();
+        hex::encode(sk.public().as_bytes())
+    }
+
+    fn sample() -> HostTicket {
+        HostTicket {
+            version: TICKET_VERSION,
+            endpoint_id: valid_endpoint_id_hex(),
+            addrs: vec!["127.0.0.1:11204".into()],
+            relay: Some("https://relay.example/".into()),
+            hint_expires_at: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn roundtrip() {
+        let t = sample();
+        let s = t.encode().unwrap();
+        let parsed = parse_host_ticket(&s).unwrap();
+        assert_eq!(parsed.endpoint_id_hex, t.endpoint_id);
+        assert_eq!(parsed.addrs, t.addrs);
+        assert_eq!(parsed.relay, t.relay);
+        assert_eq!(parsed.hint_expires_at_ms, t.hint_expires_at);
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_host_ticket("not a ticket").is_err());
+    }
+}
+```
+
+- [ ] **Step 4: Register and run**
 
 In `crates/wires-uniffi/src/lib.rs` add:
 
 ```rust
 pub mod parse;
+pub mod ticket;
 pub mod topic;
 ```
 
 Run: `cargo test -p wires-uniffi`
 Expected: all PASS.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add crates/wires-uniffi/
-git commit -m "wires-uniffi: pair-request parser + topic id/epoch generator"
+git commit -m "wires-uniffi: host-ticket + pair-request parsers + topic id/epoch generator"
 ```
 
-### Task 8: Tenant flow — `fetch_discovery`, `register_with_hosted_service`, `register_topic`
+### Task 8: Tenant flow — `register_with_hosted_service`, `register_topic`
 
 **Files:**
 - Create: `crates/wires-uniffi/src/tenant.rs`
 - Modify: `crates/wires-uniffi/src/lib.rs`
 
-- [ ] **Step 1: Implement the three operations against `wires_net`**
+- [ ] **Step 1: Implement the two tenant operations against `wires_net::tenant`**
 
 Create `crates/wires-uniffi/src/tenant.rs`:
 
 ```rust
-//! Thin wrappers around wires-net::discovery and wires-net::tenant that the
-//! iOS app drives. Stateless — each call binds (or reuses) an endpoint and
-//! sends one request.
+//! Thin wrappers around `wires-net::tenant` that the iOS app drives. Stateless —
+//! each call binds (or reuses) an endpoint and sends one request. Host info
+//! reaches these via `parse_host_ticket` upstream; there is no HTTPS discovery.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -877,24 +939,11 @@ use wires_net::peer_hint::endpoint_id_from_hex;
 use wires_net::tenant::{TenantClient, TenantRequest, TenantResponse};
 
 use crate::error::{
-    DiscoveryEmptySnafu, DiscoveryFetchSnafu, InternalSnafu, TenantRejectedSnafu,
-    TenantStreamSnafu, TopicRegisterRejectedSnafu, TopicRegisterStreamSnafu, WiresError,
+    InternalSnafu, TenantRejectedSnafu, TenantStreamSnafu, TopicRegisterRejectedSnafu,
+    TopicRegisterStreamSnafu, WiresError,
 };
 use crate::signer::{SwiftRootSigner, SwiftRootSignerAdapter};
 use crate::types::{HostInfo, TenantRegistration};
-
-pub async fn fetch_discovery(url: &str) -> Result<HostInfo, WiresError> {
-    let hints = wires_net::discovery::fetch_endpoints(url)
-        .await
-        .map_err(|e| DiscoveryFetchSnafu { message: format!("{e}") }.build())?;
-    let first = hints.into_iter().next().ok_or_else(|| DiscoveryEmptySnafu.build())?;
-    Ok(HostInfo {
-        endpoint_id_hex: first.node_id,
-        addrs: first.addrs,
-        relay: first.relay,
-        discovery_url: url.to_string(),
-    })
-}
 
 pub async fn register_with_hosted_service(
     endpoint: Endpoint,
@@ -1009,7 +1058,7 @@ Expected: builds.
 
 ```bash
 git add crates/wires-uniffi/
-git commit -m "wires-uniffi: fetch_discovery + register_with_hosted_service + register_topic wrappers"
+git commit -m "wires-uniffi: register_with_hosted_service + register_topic wrappers"
 ```
 
 ### Task 9: Pair flow — `approve_pair_request`
@@ -1107,7 +1156,6 @@ pub async fn approve_pair_request(
                 addrs: host.addrs,
                 relay: host.relay,
             }],
-            service_discovery_url: Some(host.discovery_url),
         }),
         nonce: request.nonce,
         issued_at: now,
@@ -1258,8 +1306,8 @@ impl WiresApp {
         })
     }
 
-    pub async fn fetch_discovery(&self, url: String) -> Result<HostInfo, WiresError> {
-        tenant::fetch_discovery(&url).await
+    pub fn parse_host_ticket(&self, payload: String) -> Result<HostInfo, WiresError> {
+        crate::ticket::parse_host_ticket(&payload)
     }
 
     pub async fn register_with_hosted_service(
@@ -1401,12 +1449,12 @@ impl SwiftRootSigner for InProcessSigner {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn end_to_end_register_and_approve() {
-    // 1. Spin up wires-host in-process with a temp data dir + an HTTP discovery
-    //    endpoint serving /v1/bootstrap. (Use wires_host::run() if it exists,
-    //    or compose the components directly.)
+    // 1. Spin up wires-host in-process with a temp data dir. Read its
+    //    HostTicket via wires_host's library ticket accessor (the host's
+    //    endpoint secret is persisted, so the ticket is reproducible).
     // 2. Spin up a wires-node running pair::listen with a known PairRequest.
     // 3. Construct WiresApp with InProcessSigner.
-    // 4. fetch_discovery(URL) -> HostInfo.
+    // 4. parse_host_ticket(ticket_base64) -> HostInfo.
     // 5. register_with_hosted_service(host) -> TenantRegistration.
     // 6. generate_topic_id_and_epoch0() -> NewTopic.
     // 7. register_topic(host, new_topic.topic_id_bytes).
@@ -1725,7 +1773,7 @@ import WiresKit
 
 @DependencyClient struct WiresClient {
     var bootstrap: @Sendable (Data, any SwiftRootSigner) -> Void
-    var fetchDiscovery: @Sendable (String) async throws -> HostInfo
+    var parseHostTicket: @Sendable (String) throws -> HostInfo
     var registerWithHostedService: @Sendable (HostInfo) async throws -> TenantRegistration
     var registerTopic: @Sendable (HostInfo, Data) async throws -> Void
     var parsePairRequest: @Sendable (String) throws -> PairRequestPreview
@@ -1746,9 +1794,10 @@ The `SwiftRootSigner` protocol comes from the UniFFI-generated header; the live 
 Create `Wires/WiresTests/WiresClientLiveTests.swift`. Test that:
 
 - Calling `parsePairRequest` on a known-invalid string returns an error (we know it does because UniFFI maps `InvalidPairRequest`).
+- Calling `parseHostTicket` on a known-invalid string returns an error (`TicketDecode`).
 - Calling `generateTopicIdAndEpoch0` returns a topic_id_hex of length 64 and a 32-byte epoch_0_key.
 
-These are deterministic-without-network tests; the live network calls (fetchDiscovery, register…, approve…) are exercised in `end_to_end.rs` on the Rust side and in `BootstrapFeatureTests` / `AgentEnrollmentFeatureTests` via `testValue`.
+These are deterministic-without-network tests; the live network calls (register…, approve…) are exercised in `end_to_end.rs` on the Rust side and in `BootstrapFeatureTests` / `AgentEnrollmentFeatureTests` via `testValue`.
 
 - [ ] **Step 3: Run and commit**
 
@@ -1871,31 +1920,31 @@ git add Wires/Wires/App/ Wires/Wires/WiresApp.swift
 git commit -m "ios: AppFeature + root composition"
 ```
 
-### Task 18: `BootstrapFeature` (discovery URL → confirm host → register → done)
+### Task 18: `BootstrapFeature` (scan ticket → confirm host → register → done)
 
 **Files:**
-- Create: `Wires/Wires/Features/Bootstrap/{BootstrapFeature,BootstrapView,DiscoveryURLView,ConfirmHostView}.swift`
+- Create: `Wires/Wires/Features/Bootstrap/{BootstrapFeature,BootstrapView,ScanTicketView,ConfirmHostView}.swift`
 - Create: `Wires/WiresTests/BootstrapFeatureTests.swift`
 
 - [ ] **Step 1: Write the reducer**
 
-Create `Wires/Wires/Features/Bootstrap/BootstrapFeature.swift`. State + actions for three steps: `discoveryUrl`, `confirmHost(HostInfo)`, `done(Household)`. Effects:
+Create `Wires/Wires/Features/Bootstrap/BootstrapFeature.swift`. State + actions for three steps: `scanTicket(ScanFeature.State)`, `confirmHost(HostInfo)`, `done(Household)`. The `scanTicket` step composes `ScanFeature` with the host-ticket parser closure and also exposes a `pasteSubmitted(String)` action that runs the same parser. Effects:
 
-- `fetchDiscovery` → on success transition to confirmHost; on error stay on discoveryUrl with error.
+- `parseHostTicket` (via scan-decoded payload or paste-submit) → on success transition to confirmHost; on error stay on scanTicket with an error banner.
 - `registerWithHostedService` → on success construct Household, save via HouseholdClient, transition to done.
 - "Continue" from done → emits `bootstrapCompleted` which the parent observes.
 
 - [ ] **Step 2: Write the view files**
 
-Three small SwiftUI views. The view file is a thin observation over `@Bindable var store: StoreOf<BootstrapFeature>`.
+Three small SwiftUI views. `ScanTicketView` wraps the shared `ScanView` and adds a "Paste ticket" button that presents a sheet with a multi-line text field. The view file is a thin observation over `@Bindable var store: StoreOf<BootstrapFeature>`.
 
 - [ ] **Step 3: Write TestStore tests covering the spec §10 cases**
 
 In `BootstrapFeatureTests.swift`:
 
-- Happy path: enter URL → confirm host → register → done.
-- Bad discovery URL (`testValue` throws) → alert, stays on URL step.
-- Empty endpoints (`testValue` returns DiscoveryEmpty) → alert.
+- Happy path (scan): decoded payload → parseHostTicket → confirmHost → registerWithHostedService → done.
+- Happy path (paste): paste-submit → parseHostTicket → confirmHost → registerWithHostedService → done.
+- Bad ticket payload (`parseHostTicket` throws `TicketDecode`) → alert, stays on scanTicket step.
 - Tenant register fails → retry → succeeds.
 - Tenant register receives `TenantErrorCode.BadSignature` → alert with code-specific copy.
 
@@ -1907,7 +1956,7 @@ Build + test (⌘U).
 
 ```bash
 git add Wires/Wires/Features/Bootstrap/ Wires/WiresTests/BootstrapFeatureTests.swift
-git commit -m "ios: BootstrapFeature — discovery -> confirm -> register -> done"
+git commit -m "ios: BootstrapFeature — scan ticket -> confirm -> register -> done"
 ```
 
 ### Task 19: `HomeFeature`
@@ -2010,7 +2059,7 @@ git commit -m "ios: AgentEnrollmentFeature + ApprovalFeature — scan, approve, 
 
 Using `swift-snapshot-testing`, one snapshot per state listed in the spec §10:
 
-- Bootstrap: enter URL, confirm host, registering, done.
+- Bootstrap: scan-ticket (camera viewfinder), scan-ticket (paste sheet visible), confirm host, registering, done.
 - Home: empty, populated.
 - Approval sheet: pristine, partially-narrowed, all-denied, in-flight, success.
 
