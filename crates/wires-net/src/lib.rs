@@ -22,10 +22,7 @@ pub use pair::{
     PairProtocol, PairReject, PairRejectCode, PairRequest, RequestedScope, TopicEpochKey,
     TopicNameEntry,
 };
-pub use peer_hint::{
-    PeerHint, cap_id_from_hex, endpoint_id_from_hex, first_reachable,
-    first_reachable_with_discovery,
-};
+pub use peer_hint::{PeerHint, cap_id_from_hex, endpoint_id_from_hex, first_reachable};
 pub use replay::{
     ALPN, HwmEntry, ReplayClient, ReplayProtocol, ReplayRequest, ReplayResponseFrame, ReplaySource,
 };
