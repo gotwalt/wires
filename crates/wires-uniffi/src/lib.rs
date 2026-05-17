@@ -1,6 +1,7 @@
 uniffi::setup_scaffolding!();
 
 pub mod error;
+pub mod pair;
 pub mod parse;
 pub mod signer;
 pub mod tenant;
