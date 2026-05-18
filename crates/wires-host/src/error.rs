@@ -105,8 +105,8 @@ pub enum HostError {
         location: Location,
     },
 
-    #[snafu(display("Failed to render host-ticket SVG: {source}, at {location}"))]
-    QrSvg {
+    #[snafu(display("Host-ticket operation failed: {source}, at {location}"))]
+    HostTicket {
         #[snafu(source)]
         source: wires_net::NetError,
         #[snafu(implicit)]
