@@ -19,6 +19,8 @@ pub struct ServiceState {
     pub config: Arc<GatewayConfig>,
     pub store: Store,
     pub signing_key: Arc<SigningKey>,
+    pub supervisor: crate::tenants::TenantSupervisor,
+    pub pair_bridge: Arc<crate::pair_bridge::PairBridge>,
 }
 
 impl FromRef<ServiceState> for Arc<GatewayConfig> {
@@ -77,6 +79,37 @@ pub async fn serve(state: ServiceState) -> Result<()> {
         .context(ServeHttpSnafu)
 }
 
+/// Construct a `ServiceState` backed by a temp directory for use in tests.
+/// All modules that need a `ServiceState` in tests should use this helper
+/// rather than building `ServiceState { ... }` by hand so that additions
+/// to the struct don't require edits across every test.
+#[cfg(test)]
+pub fn test_state(tmp: &std::path::Path) -> ServiceState {
+    let cfg = GatewayConfig {
+        public_url: "https://mcp.example.com".into(),
+        bind: "127.0.0.1:0".into(),
+        data_dir: tmp.to_path_buf(),
+    };
+    let store = Store::open(&cfg.gateway_db_path()).unwrap();
+    let supervisor = crate::tenants::TenantSupervisor::new(
+        cfg.users_dir(),
+        std::time::Duration::from_secs(60),
+    );
+    let pair_bridge = Arc::new(crate::pair_bridge::PairBridge::new(
+        cfg.pending_pairs_dir(),
+        cfg.public_url.clone(),
+        store.clone(),
+        supervisor.clone(),
+    ));
+    ServiceState {
+        config: Arc::new(cfg),
+        store,
+        signing_key: Arc::new(SigningKey::from_bytes(&[1u8; 32])),
+        supervisor,
+        pair_bridge,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,19 +120,8 @@ mod tests {
 
     fn state() -> (TempDir, ServiceState) {
         let tmp = TempDir::new().unwrap();
-        let cfg = GatewayConfig {
-            public_url: "https://mcp.example".into(),
-            bind: "127.0.0.1:0".into(),
-            data_dir: tmp.path().to_path_buf(),
-        };
-        let store = Store::open(&cfg.gateway_db_path()).unwrap();
-        let sk = SigningKey::from_bytes(&[1u8; 32]);
-        let state = ServiceState {
-            config: Arc::new(cfg),
-            store,
-            signing_key: Arc::new(sk),
-        };
-        (tmp, state)
+        let st = test_state(tmp.path());
+        (tmp, st)
     }
 
     #[tokio::test]

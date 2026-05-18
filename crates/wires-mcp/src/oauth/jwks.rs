@@ -46,28 +46,19 @@ pub async fn handler(State(sk): State<Arc<SigningKey>>) -> Json<Jwks> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::GatewayConfig;
-    use crate::http::{ServiceState, app};
-    use crate::store::Store;
+    use crate::http::app;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
     use tempfile::TempDir;
     use tower::ServiceExt;
 
-    fn state(seed: [u8; 32]) -> (TempDir, ServiceState) {
+    fn state(seed: [u8; 32]) -> (TempDir, crate::http::ServiceState) {
         let tmp = TempDir::new().unwrap();
-        let cfg = GatewayConfig {
-            public_url: "https://mcp.example.com".into(),
-            bind: "127.0.0.1:0".into(),
-            data_dir: tmp.path().to_path_buf(),
-        };
-        let store = Store::open(&cfg.gateway_db_path()).unwrap();
-        let state = ServiceState {
-            config: std::sync::Arc::new(cfg),
-            store,
-            signing_key: std::sync::Arc::new(SigningKey::from_bytes(&seed)),
-        };
-        (tmp, state)
+        let mut st = crate::http::test_state(tmp.path());
+        // Override the signing key for seed-dependent tests.
+        st.signing_key = Arc::new(SigningKey::from_bytes(&seed));
+        (tmp, st)
     }
 
     #[tokio::test]

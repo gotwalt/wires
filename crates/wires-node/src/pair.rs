@@ -403,6 +403,109 @@ pub async fn pair_listen(
     })
 }
 
+/// Identical to [`pair_listen`] but wires in an `on_paired` callback that
+/// runs synchronously after `install_grant` succeeds and before the `Ack`
+/// is returned to the operator. Use this instead of `pair_listen` when the
+/// caller (e.g. the MCP gateway's `PairBridge`) needs to react to a
+/// successful pairing inside the handler.
+pub async fn pair_listen_with_on_paired(
+    data_dir: std::path::PathBuf,
+    node: Arc<Node>,
+    agent_sk: SigningKey,
+    agent_x25519: [u8; 32],
+    endpoint: iroh::Endpoint,
+    args: PairListenArgs,
+    on_paired: Arc<OnPaired>,
+) -> crate::error::Result<PairListenStarted> {
+    use crate::error::NodeError;
+
+    let pending =
+        crate::pair_pending::load(&data_dir).map_err(|source| NodeError::ConfigWrite {
+            source,
+            location: snafu::location!(),
+        })?;
+
+    let (nonce, ephemeral_sk, request_token, request_expires_ms) = if let Some(p) = pending {
+        let nonce_arr = hex_to_arr32(&p.nonce_hex)?;
+        let secret_arr = hex_to_arr32(&p.ephemeral_x25519_secret_hex)?;
+        (
+            nonce_arr,
+            StaticSecret::from(secret_arr),
+            p.request_token,
+            p.expires_unix_ms,
+        )
+    } else {
+        use rand_core::RngCore as _;
+        let mut nonce = [0u8; 32];
+        rand_core::OsRng.fill_bytes(&mut nonce);
+        let ephemeral_sk = StaticSecret::random_from_rng(rand_core::OsRng);
+        let ephemeral_pk = XPub::from(&ephemeral_sk).to_bytes();
+        let agent_pk = agent_sk.verifying_key().to_bytes();
+        let now = unix_now_ms();
+        let expires = now + args.ttl.as_millis() as i64;
+        let dial = pair_dial_from(&endpoint);
+        let mut req = PairRequest {
+            version: 1,
+            agent_pubkey: agent_pk,
+            agent_x25519,
+            ephemeral_x25519: ephemeral_pk,
+            dial,
+            manifest: args.manifest,
+            nonce,
+            issued_at: now,
+            expires,
+            signature: [0u8; 64],
+        };
+        req.sign(&agent_sk)
+            .map_err(|source| NodeError::PairListenSign {
+                source: Box::new(source),
+                location: snafu::location!(),
+            })?;
+        let token = req.encode().map_err(|source| NodeError::PairListenSign {
+            source: Box::new(source),
+            location: snafu::location!(),
+        })?;
+        crate::pair_pending::save(
+            &data_dir,
+            &crate::pair_pending::PairPending {
+                version: 1,
+                nonce_hex: hex::encode(nonce),
+                ephemeral_x25519_secret_hex: hex::encode(ephemeral_sk.to_bytes()),
+                expires_unix_ms: expires,
+                request_token: token.clone(),
+            },
+        )
+        .map_err(|source| NodeError::ConfigWrite {
+            source,
+            location: snafu::location!(),
+        })?;
+        (nonce, ephemeral_sk, token, expires)
+    };
+
+    let (outcome_tx, outcome_rx) = oneshot::channel();
+    let handler = Arc::new(
+        NodePairHandler::new(
+            data_dir,
+            node,
+            agent_sk.verifying_key().to_bytes(),
+            nonce,
+            ephemeral_sk,
+            request_expires_ms,
+            outcome_tx,
+        )
+        .with_on_paired(on_paired),
+    );
+    let protocol = PairProtocol::new(handler);
+    let router = iroh::protocol::Router::builder(endpoint)
+        .accept(PAIR_ALPN, protocol)
+        .spawn();
+    Ok(PairListenStarted {
+        request_token,
+        outcome: outcome_rx,
+        router,
+    })
+}
+
 /// Build a `PairDial` from a running iroh `Endpoint`.
 ///
 /// Uses `endpoint.id()` for the node_id and `endpoint.addr()` to extract

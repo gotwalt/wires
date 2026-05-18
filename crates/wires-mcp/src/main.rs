@@ -46,10 +46,22 @@ fn main() -> std::process::ExitCode {
                     return std::process::ExitCode::FAILURE;
                 }
             };
+            let supervisor = wires_mcp::tenants::TenantSupervisor::new(
+                cfg.users_dir(),
+                std::time::Duration::from_secs(600),
+            );
+            let pair_bridge = std::sync::Arc::new(wires_mcp::pair_bridge::PairBridge::new(
+                cfg.pending_pairs_dir(),
+                cfg.public_url.clone(),
+                store.clone(),
+                supervisor.clone(),
+            ));
             let state = wires_mcp::http::ServiceState {
                 config: std::sync::Arc::new(cfg),
                 store,
                 signing_key: std::sync::Arc::new(sk),
+                supervisor,
+                pair_bridge,
             };
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,

@@ -55,29 +55,17 @@ pub async fn handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::GatewayConfig;
     use crate::http::app;
-    use crate::store::{AuthSessionRecord, Store};
+    use crate::store::AuthSessionRecord;
     use axum::body::Body;
     use axum::http::Request;
-    use ed25519_dalek::SigningKey;
-    use std::sync::Arc;
     use tempfile::TempDir;
     use tower::ServiceExt;
 
     fn state() -> (TempDir, ServiceState) {
         let tmp = TempDir::new().unwrap();
-        let cfg = GatewayConfig {
-            public_url: "https://mcp.example.com".into(),
-            bind: "127.0.0.1:0".into(),
-            data_dir: tmp.path().to_path_buf(),
-        };
-        let store = Store::open(&cfg.gateway_db_path()).unwrap();
-        (tmp, ServiceState {
-            config: Arc::new(cfg),
-            store,
-            signing_key: Arc::new(SigningKey::from_bytes(&[1u8; 32])),
-        })
+        let st = crate::http::test_state(tmp.path());
+        (tmp, st)
     }
 
     fn put(state: &ServiceState, sid: &str, kind: AuthSessionKind, expires_ms: i64) {

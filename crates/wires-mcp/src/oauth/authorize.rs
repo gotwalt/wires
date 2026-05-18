@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::http::ServiceState;
 use crate::sign_in::SignInChallenge;
 use crate::store::{
-    AuthSessionKind, AuthSessionRecord, PendingPairRecord, PendingSigninRecord,
+    AuthSessionKind, AuthSessionRecord, PendingSigninRecord,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,19 +120,16 @@ pub async fn validate_and_create(
         })
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, oauth_err("server_error", "store")))?;
 
-    // Pair-listen token is constructed by pair_bridge in Task 21; here we
-    // just leave a placeholder so Tasks 18–20 can be developed independently.
-    // Task 21 replaces this with the actual PairRequest token.
-    let pair_token_b64 = String::new();
-    state
-        .store
-        .put_pending_pair(&PendingPairRecord {
-            session_id: session_id.clone(),
-            temp_data_dir: String::new(),
-            request_token_b64: pair_token_b64.clone(),
-            ttl_expires_ms: now_ms + AUTH_SESSION_TTL_MS,
-        })
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, oauth_err("server_error", "store")))?;
+    // Start the pair-listen window: generates a fresh identity + iroh endpoint,
+    // persists the PendingPairRecord internally, returns the base64 PairRequest token.
+    let pair_token_b64 = state
+        .pair_bridge
+        .start(&session_id, &client.client_name)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "pair_bridge.start");
+            (StatusCode::INTERNAL_SERVER_ERROR, oauth_err("server_error", "pair_bridge"))
+        })?;
 
     Ok(AuthorizeContext {
         session_id,
@@ -149,21 +146,14 @@ fn oauth_err(code: &str, desc: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::GatewayConfig;
-    use crate::store::{OauthClientRecord, Store};
-    use ed25519_dalek::SigningKey;
-    use std::sync::Arc;
+    use crate::store::OauthClientRecord;
     use tempfile::TempDir;
 
     fn state() -> (TempDir, ServiceState) {
         let tmp = TempDir::new().unwrap();
-        let cfg = GatewayConfig {
-            public_url: "https://mcp.example.com".into(),
-            bind: "127.0.0.1:0".into(),
-            data_dir: tmp.path().to_path_buf(),
-        };
-        let store = Store::open(&cfg.gateway_db_path()).unwrap();
-        store.put_oauth_client(&OauthClientRecord {
+        let st = crate::http::test_state(tmp.path());
+        // Pre-populate the client used by all authorize tests.
+        st.store.put_oauth_client(&OauthClientRecord {
             client_id: "c1".into(),
             client_name: "Claude Desktop".into(),
             redirect_uris: vec!["http://localhost:33333/callback".into()],
@@ -171,14 +161,7 @@ mod tests {
             created_at_ms: 0,
             revoked: false,
         }).unwrap();
-        (
-            tmp,
-            ServiceState {
-                config: Arc::new(cfg),
-                store,
-                signing_key: Arc::new(SigningKey::from_bytes(&[1u8; 32])),
-            },
-        )
+        (tmp, st)
     }
 
     fn params() -> AuthorizeParams {

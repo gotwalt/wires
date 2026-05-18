@@ -5345,6 +5345,7 @@ dependencies = [
  "wires-net",
  "wires-node",
  "wires-store",
+ "x25519-dalek",
 ]
 
 [[package]]
