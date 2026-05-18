@@ -55,6 +55,7 @@ pub async fn spawn(
 fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/ticket.txt", get(serve_txt))
+        .route("/ticket.svg", get(serve_svg))
         .with_state(state)
 }
 
@@ -71,6 +72,19 @@ async fn serve_txt(State(state): State<Arc<AppState>>) -> Result<Response> {
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(resp)
+}
+
+async fn serve_svg(State(state): State<Arc<AppState>>) -> Result<Response> {
+    let ticket = current_ticket(&state)?;
+    let svg = ticket.render_qr_svg().context(HostTicketSnafu)?;
+    let mut resp = svg.into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("image/svg+xml"),
     );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(resp)
