@@ -7,12 +7,14 @@ use std::sync::Arc;
 use clap::Parser;
 use iroh::SecretKey;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use wires_core::WireMessage;
 use wires_host::per_tenant_logs::PerTenantLogs;
 use wires_host::replay_source::PerTenantReplaySource;
 use wires_host::retention::Retention;
 use wires_host::routing::{Router as MsgRouter, WriteRateLimiter};
 use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
+use wires_host::ticket_http;
 use wires_net::replay::{ALPN as REPLAY_ALPN, ReplayProtocol};
 use wires_net::tenant::{ALPN as TENANT_ALPN, TenantProtocol};
 use wires_net::{GOSSIP_ALPN, GossipNode, load_or_create_secret, unix_now_ms};
@@ -36,6 +38,14 @@ struct Args {
     /// Suppress terminal QR emission even if stderr is a TTY.
     #[arg(long, global = true)]
     no_qr: bool,
+
+    /// Bind address for the ticket HTTP page.
+    #[arg(long, global = true, default_value = "0.0.0.0:8089", conflicts_with = "no_http")]
+    http_bind: std::net::SocketAddr,
+
+    /// Disable the ticket HTTP page entirely.
+    #[arg(long, global = true)]
+    no_http: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -189,8 +199,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .accept(TENANT_ALPN, TenantProtocol::new(Arc::clone(&handler)))
         .spawn();
 
+    // Shared shutdown signal. Ctrl+C cancels the token; the HTTP task and
+    // any future tasks observe it via `shutdown.cancelled().await`.
+    let shutdown = CancellationToken::new();
+    {
+        let s = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            s.cancel();
+        });
+    }
+
+    let http_handle = if !args.no_http {
+        let (bound, handle) = ticket_http::spawn(
+            endpoint.clone(),
+            args.http_bind,
+            *args.ticket_hint_ttl,
+            shutdown.clone(),
+        )
+        .await?;
+        tracing::info!("ticket-http listening on http://{bound}/");
+        Some(handle)
+    } else {
+        None
+    };
+
     println!("wires-host: running. Press Ctrl-C to exit.");
-    tokio::signal::ctrl_c().await?;
+    shutdown.cancelled().await;
+
+    if let Some(h) = http_handle {
+        match h.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(error = %e, "ticket-http exited with error"),
+            Err(e) => tracing::error!(error = %e, "ticket-http task panicked"),
+        }
+    }
     Ok(())
 }
 
