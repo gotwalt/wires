@@ -105,6 +105,14 @@ enum HostCmd {
     /// Unregister a topic: the host stops persisting new envelopes (existing
     /// data is retained until eviction).
     TopicUnregister { topic: String },
+    /// Unregister this tenant entirely: the host drops the tenant row, every
+    /// topic_index entry for this root, and the on-disk tenant directory.
+    /// Clears the local `config.toml` host block on success.
+    TenantUnregister {
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Print this tenant's status as the host reports it.
     Status,
 }
@@ -138,6 +146,9 @@ async fn main() -> std::process::ExitCode {
         }
         Cmd::Host(HostCmd::TopicUnregister { topic }) => {
             cmd::host::topic_unregister(&data_dir, &topic).await
+        }
+        Cmd::Host(HostCmd::TenantUnregister { yes }) => {
+            cmd::host::tenant_unregister(&data_dir, yes).await
         }
         Cmd::Host(HostCmd::Status) => cmd::host::status(&data_dir).await,
         Cmd::PairListen {

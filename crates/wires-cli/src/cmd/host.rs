@@ -168,6 +168,69 @@ pub async fn topic_unregister(data_dir: &Path, topic: &str) -> Result<()> {
     }
 }
 
+pub async fn tenant_unregister(data_dir: &Path, yes: bool) -> Result<()> {
+    if !yes {
+        use std::io::Write as _;
+        eprint!(
+            "This will tell the host to drop this tenant's record, every \
+             topic_index entry, and the on-disk tenant directory.\n\
+             It will also clear the local config.toml host block.\n\
+             Continue? [y/N] "
+        );
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).context(IoSnafu)?;
+        let a = answer.trim().to_ascii_lowercase();
+        if a != "y" && a != "yes" {
+            eprintln!("aborted");
+            return Ok(());
+        }
+    }
+    let (client, host_eid, host_eid_bytes, root) = open_paired_client(data_dir).await?;
+    let resp = client
+        .unregister_tenant(host_eid, &root, &host_eid_bytes, unix_now_ms())
+        .await
+        .context(NetSnafu)?;
+    match resp {
+        TenantResponse::Unregister(r) => {
+            if r.ok {
+                println!(
+                    "Unregistered tenant on host; host dropped {} topic(s)",
+                    r.topics_removed
+                );
+            } else {
+                println!("Host did not have a record for this tenant (already gone)");
+            }
+        }
+        TenantResponse::Error(e) => return Err(host_rejected(e)),
+        other => return unexpected(other),
+    }
+
+    // Clear the local host block in config.toml so subsequent `wires host *`
+    // commands don't keep trying to use a host that just tore us down. Best
+    // effort: if the file's gone or unparseable, log and move on — the host
+    // side of the unregister already succeeded.
+    let cfg_path = data_dir.join("config.toml");
+    if let Ok(raw) = std::fs::read_to_string(&cfg_path) {
+        if let Ok(mut cfg) = toml::from_str::<NodeConfig>(&raw) {
+            cfg.host = None;
+            match toml::to_string_pretty(&cfg) {
+                Ok(serialized) => {
+                    if let Err(e) = std::fs::write(&cfg_path, serialized) {
+                        tracing::warn!(error = %e, "failed to rewrite config.toml after tenant-unregister");
+                    } else {
+                        println!("Cleared host block in {}", cfg_path.display());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to serialize cleared config.toml after tenant-unregister");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn status(data_dir: &Path) -> Result<()> {
     let (client, host_eid, host_eid_bytes, root) = open_paired_client(data_dir).await?;
     let resp = client
