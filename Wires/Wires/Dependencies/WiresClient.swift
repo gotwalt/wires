@@ -17,6 +17,7 @@ struct WiresClient {
     var parseHostTicket: @Sendable (_ payload: String) async throws -> HostInfo
     var registerWithHostedService: @Sendable (_ host: HostInfo) async throws -> TenantRegistration
     var registerTopic: @Sendable (_ host: HostInfo, _ topicId: Data) async throws -> Void
+    var unregisterTenant: @Sendable (_ host: HostInfo) async throws -> UnregisterResult
     var parsePairRequest: @Sendable (_ payload: String) async throws -> PairRequestPreview
     /// Non-throwing default: empty topic id + zero-byte key. Real impl
     /// returns 32-byte random hex + 32-byte symmetric key.
@@ -29,6 +30,11 @@ struct WiresClient {
         _ host: HostInfo
     ) async throws -> PairAckRecord
     var discardPairRequest: @Sendable (_ handle: PendingPairHandle) async -> Void = { _ in }
+    /// Drops the in-memory `WiresApp` instance so the next `bootstrap` call
+    /// creates a fresh one. Use after wiping local Keychain/SwiftData state to
+    /// guarantee the next session uses the newly-generated iroh secret + root
+    /// signer, not the cached one bound to the old keys.
+    var reset: @Sendable () async -> Void = {}
 }
 
 enum WiresClientError: Error, Equatable {
@@ -50,6 +56,10 @@ private actor WiresAppHolder {
         guard let instance else { throw WiresClientError.notBootstrapped }
         return instance
     }
+
+    func reset() {
+        instance = nil
+    }
 }
 
 extension WiresClient: DependencyKey {
@@ -67,6 +77,9 @@ extension WiresClient: DependencyKey {
             },
             registerTopic: { host, topicId in
                 try await holder.require().registerTopic(host: host, topicId: topicId)
+            },
+            unregisterTenant: { host in
+                try await holder.require().unregisterWithHostedService(host: host)
             },
             parsePairRequest: { payload in
                 try await holder.require().parsePairRequest(payload: payload)
@@ -89,6 +102,9 @@ extension WiresClient: DependencyKey {
             discardPairRequest: { handle in
                 guard let app = try? await holder.require() else { return }
                 app.discardPairRequest(handle: handle)
+            },
+            reset: {
+                await holder.reset()
             }
         )
     }()
