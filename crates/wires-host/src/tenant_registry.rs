@@ -363,8 +363,8 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use wires_net::tenant::{
     TenantErrorCode, TenantErrorResponse, TenantOp, TenantRegisterRequest, TenantRegisterResponse,
     TenantResponse, TenantStatusKind, TenantStatusRequest, TenantStatusResponse,
-    TenantUnregisterRequest, TopicRegisterRequest, TopicRegisterResponse, TopicUnregisterRequest,
-    TopicUnregisterResponse, signing_bytes,
+    TenantUnregisterRequest, TenantUnregisterResponse, TopicRegisterRequest, TopicRegisterResponse,
+    TopicUnregisterRequest, TopicUnregisterResponse, signing_bytes,
 };
 
 /// Tunable behaviour for `TenantHandlerImpl`.
@@ -393,6 +393,11 @@ pub struct TenantHandlerImpl {
     pub now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
     pub on_topic_registered: Arc<dyn Fn([u8; 32], [u8; 32]) + Send + Sync>,
     pub on_topic_unregistered: Arc<dyn Fn([u8; 32], [u8; 32]) + Send + Sync>,
+    /// Fires after a successful `handle_unregister` removes the tenant's row
+    /// and topic_index entries. `Vec<[u8; 32]>` is the list of topic_ids that
+    /// were dropped from the index. The host wires this to clear filesystem
+    /// state for the tenant.
+    pub on_tenant_unregistered: Arc<dyn Fn([u8; 32], Vec<[u8; 32]>) + Send + Sync>,
 }
 
 impl TenantHandlerImpl {
@@ -499,9 +504,37 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
         })
     }
 
-    fn handle_unregister(&self, _req: TenantUnregisterRequest) -> TenantResponse {
-        // Real implementation lands in Task 3.
-        todo!("TenantHandlerImpl::handle_unregister not yet implemented")
+    fn handle_unregister(&self, req: TenantUnregisterRequest) -> TenantResponse {
+        let sig_bytes = signing_bytes(
+            TenantOp::Unregister,
+            &req.root_pubkey,
+            req.timestamp,
+            &req.nonce,
+            &self.host_endpoint_id,
+        );
+        if let Err(e) = self.check_common(
+            &req.root_pubkey,
+            req.timestamp,
+            &req.nonce,
+            &req.signature,
+            &sig_bytes,
+        ) {
+            return e;
+        }
+
+        match self.registry.delete_tenant(&req.root_pubkey) {
+            Ok(outcome) => {
+                let n = outcome.topics_removed.len() as u32;
+                if outcome.existed {
+                    (self.on_tenant_unregistered)(req.root_pubkey, outcome.topics_removed);
+                }
+                TenantResponse::Unregister(TenantUnregisterResponse {
+                    ok: outcome.existed,
+                    topics_removed: n,
+                })
+            }
+            Err(_) => Self::err(TenantErrorCode::Internal, "tenant delete failed"),
+        }
     }
 
     fn handle_topic_register(&self, req: TopicRegisterRequest) -> TenantResponse {
@@ -864,6 +897,7 @@ mod tests {
             now_ms: Arc::new(move || now_ms),
             on_topic_registered: Arc::new(|_root, _topic| {}),
             on_topic_unregistered: Arc::new(|_root, _topic| {}),
+            on_tenant_unregistered: Arc::new(|_root, _topics| {}),
         };
 
         let nonce = [9u8; 16];
@@ -895,5 +929,150 @@ mod tests {
         // Tenant row now exists.
         let rec = reg.get(&root_pubkey).unwrap().unwrap();
         assert_eq!(rec.status, TenantStatus::Active);
+    }
+
+    #[test]
+    fn handle_unregister_drops_tenant_and_fires_hook() {
+        use crate::per_tenant_logs::PerTenantLogs;
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand_core::OsRng;
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use wires_net::tenant::{
+            TenantHandler, TenantRegisterRequest, TenantResponse, TenantUnregisterRequest,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let reg = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
+        let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+        let retention = Arc::new(crate::retention::Retention::new(tmp.path(), logs));
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let root_pubkey = signing_key.verifying_key().to_bytes();
+        let host_endpoint_id = [42u8; 32];
+        let now_ms = 1_000_000i64;
+
+        let observed: Arc<Mutex<Vec<([u8; 32], Vec<[u8; 32]>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_cb = Arc::clone(&observed);
+
+        let handler = TenantHandlerImpl {
+            registry: Arc::clone(&reg),
+            retention,
+            host_endpoint_id,
+            config: TenantHandlerConfig::default(),
+            now_ms: Arc::new(move || now_ms),
+            on_topic_registered: Arc::new(|_root, _topic| {}),
+            on_topic_unregistered: Arc::new(|_root, _topic| {}),
+            on_tenant_unregistered: Arc::new(move |root, topics| {
+                observed_for_cb.lock().unwrap().push((root, topics));
+            }),
+        };
+
+        // Register first so we have something to unregister.
+        let nonce_reg = [1u8; 16];
+        let bytes_reg = wires_net::tenant::signing_bytes(
+            TenantOp::Register,
+            &root_pubkey,
+            now_ms,
+            &nonce_reg,
+            &host_endpoint_id,
+        );
+        let sig_reg = signing_key.sign(&bytes_reg).to_bytes();
+        let _ = handler.handle_register(TenantRegisterRequest {
+            version: 1,
+            root_pubkey,
+            timestamp: now_ms,
+            nonce: nonce_reg,
+            signature: sig_reg,
+        });
+        assert!(reg.get(&root_pubkey).unwrap().is_some());
+
+        // Unregister.
+        let nonce_un = [2u8; 16];
+        let bytes_un = wires_net::tenant::signing_bytes(
+            TenantOp::Unregister,
+            &root_pubkey,
+            now_ms,
+            &nonce_un,
+            &host_endpoint_id,
+        );
+        let sig_un = signing_key.sign(&bytes_un).to_bytes();
+        let resp = handler.handle_unregister(TenantUnregisterRequest {
+            version: 1,
+            root_pubkey,
+            timestamp: now_ms,
+            nonce: nonce_un,
+            signature: sig_un,
+        });
+        match resp {
+            TenantResponse::Unregister(r) => {
+                assert!(r.ok);
+                // handle_register inserted the caps_topic_id for this tenant
+                // (see TenantHandlerImpl::handle_register), so topics_removed
+                // must reflect that.
+                assert_eq!(r.topics_removed, 1);
+            }
+            other => panic!("expected Unregister, got {:?}", other),
+        }
+        // Tenant gone, hook fired with one topic.
+        assert!(reg.get(&root_pubkey).unwrap().is_none());
+        let obs = observed.lock().unwrap();
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].0, root_pubkey);
+        assert_eq!(obs[0].1.len(), 1);
+    }
+
+    #[test]
+    fn handle_unregister_unknown_tenant_returns_ok_false() {
+        use crate::per_tenant_logs::PerTenantLogs;
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand_core::OsRng;
+        use std::sync::Arc;
+        use wires_net::tenant::{TenantHandler, TenantResponse, TenantUnregisterRequest};
+
+        let tmp = TempDir::new().unwrap();
+        let reg = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
+        let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+        let retention = Arc::new(crate::retention::Retention::new(tmp.path(), logs));
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let root_pubkey = signing_key.verifying_key().to_bytes();
+        let host_endpoint_id = [42u8; 32];
+        let now_ms = 1_000_000i64;
+
+        let handler = TenantHandlerImpl {
+            registry: Arc::clone(&reg),
+            retention,
+            host_endpoint_id,
+            config: TenantHandlerConfig::default(),
+            now_ms: Arc::new(move || now_ms),
+            on_topic_registered: Arc::new(|_, _| {}),
+            on_topic_unregistered: Arc::new(|_, _| {}),
+            on_tenant_unregistered: Arc::new(|_, _| {}),
+        };
+
+        let nonce = [9u8; 16];
+        let bytes = wires_net::tenant::signing_bytes(
+            TenantOp::Unregister,
+            &root_pubkey,
+            now_ms,
+            &nonce,
+            &host_endpoint_id,
+        );
+        let sig = signing_key.sign(&bytes).to_bytes();
+        let resp = handler.handle_unregister(TenantUnregisterRequest {
+            version: 1,
+            root_pubkey,
+            timestamp: now_ms,
+            nonce,
+            signature: sig,
+        });
+        match resp {
+            TenantResponse::Unregister(r) => {
+                assert!(!r.ok);
+                assert_eq!(r.topics_removed, 0);
+            }
+            other => panic!("expected Unregister, got {:?}", other),
+        }
     }
 }
