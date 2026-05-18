@@ -81,7 +81,11 @@ pub async fn serve(state: ServiceState) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&state.config.bind)
         .await
         .context(BindHttpSnafu)?;
-    tracing::info!(addr = %state.config.bind, "wires-mcp listening");
+    serve_with_listener(state, listener).await
+}
+
+pub async fn serve_with_listener(state: ServiceState, listener: tokio::net::TcpListener) -> Result<()> {
+    tracing::info!(addr = ?listener.local_addr().ok(), "wires-mcp listening");
     axum::serve(listener, app(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

@@ -18,6 +18,9 @@ pub fn render(ctx: &AuthorizeContext) -> Html<String> {
 <head>
 <meta charset="utf-8">
 <title>Sign in to MCP Gateway</title>
+<meta name="wires-mcp-session-id" content="{session_id}">
+<meta name="wires-mcp-pair-token" content="{pair_token_b64}">
+<meta name="wires-mcp-signin-challenge" content="{signin_challenge_b64}">
 <style>
 body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; max-width: 860px; }}
 h1 {{ font-size: 1.4rem; margin-bottom: 0.25rem; }}
@@ -69,6 +72,8 @@ h1 {{ font-size: 1.4rem; margin-bottom: 0.25rem; }}
 </script>
 </body></html>"##,
         session_id_json = serde_json::to_string(&session_id).unwrap(),
+        pair_token_b64 = html_escape(&ctx.pair_token_b64),
+        signin_challenge_b64 = html_escape(&ctx.signin_challenge_b64),
     ))
 }
 
