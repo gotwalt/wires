@@ -9,8 +9,8 @@ use wires_net::PeerHint;
 use wires_net::peer_hint::first_reachable;
 use wires_net::tenant::{
     ALPN as TENANT_ALPN, TenantErrorCode, TenantErrorResponse, TenantHandler, TenantProtocol,
-    TenantRegisterRequest, TenantResponse, TenantStatusRequest, TopicRegisterRequest,
-    TopicUnregisterRequest,
+    TenantRegisterRequest, TenantResponse, TenantStatusRequest, TenantUnregisterRequest,
+    TopicRegisterRequest, TopicUnregisterRequest,
 };
 
 /// A stub handler that rejects all requests. Only used to satisfy
@@ -20,6 +20,13 @@ struct RejectAll;
 
 impl TenantHandler for RejectAll {
     fn handle_register(&self, _req: TenantRegisterRequest) -> TenantResponse {
+        TenantResponse::Error(TenantErrorResponse {
+            code: TenantErrorCode::Internal,
+            message: "test stub".into(),
+        })
+    }
+
+    fn handle_unregister(&self, _req: TenantUnregisterRequest) -> TenantResponse {
         TenantResponse::Error(TenantErrorResponse {
             code: TenantErrorCode::Internal,
             message: "test stub".into(),

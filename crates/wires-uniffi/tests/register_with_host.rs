@@ -18,8 +18,8 @@ use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::OsRng;
 use wires_net::tenant::{
     ALPN as TENANT_ALPN, TenantHandler, TenantOp, TenantProtocol, TenantRegisterRequest,
-    TenantRegisterResponse, TenantResponse, TenantStatusRequest, TopicRegisterRequest,
-    TopicUnregisterRequest, signing_bytes,
+    TenantRegisterResponse, TenantResponse, TenantStatusRequest, TenantUnregisterRequest,
+    TopicRegisterRequest, TopicUnregisterRequest, signing_bytes,
 };
 use wires_net::ticket::HostTicket;
 use wires_uniffi::{SwiftRootSigner, WiresApp, WiresError};
@@ -59,6 +59,9 @@ impl TenantHandler for AcceptingHandler {
             server_time: self.now_ms,
             caps_topic_id: self.caps_topic_id,
         })
+    }
+    fn handle_unregister(&self, _r: TenantUnregisterRequest) -> TenantResponse {
+        unreachable!()
     }
     fn handle_topic_register(&self, _r: TopicRegisterRequest) -> TenantResponse {
         unreachable!()
