@@ -45,6 +45,10 @@ pub fn app(state: ServiceState) -> Router {
             axum::routing::get(crate::oauth::as_meta::handler),
         )
         .route("/.well-known/jwks.json", axum::routing::get(crate::oauth::jwks::handler))
+        .route(
+            "/oauth/register",
+            axum::routing::post(crate::oauth::register::handler),
+        )
         .with_state(state)
 }
 
