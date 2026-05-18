@@ -284,8 +284,8 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use wires_net::tenant::{
     TenantErrorCode, TenantErrorResponse, TenantOp, TenantRegisterRequest, TenantRegisterResponse,
     TenantResponse, TenantStatusKind, TenantStatusRequest, TenantStatusResponse,
-    TopicRegisterRequest, TopicRegisterResponse, TopicUnregisterRequest, TopicUnregisterResponse,
-    signing_bytes,
+    TenantUnregisterRequest, TopicRegisterRequest, TopicRegisterResponse,
+    TopicUnregisterRequest, TopicUnregisterResponse, signing_bytes,
 };
 
 /// Tunable behaviour for `TenantHandlerImpl`.
@@ -418,6 +418,11 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
             server_time: now,
             caps_topic_id,
         })
+    }
+
+    fn handle_unregister(&self, _req: TenantUnregisterRequest) -> TenantResponse {
+        // Real implementation lands in Task 3.
+        todo!("TenantHandlerImpl::handle_unregister not yet implemented")
     }
 
     fn handle_topic_register(&self, req: TopicRegisterRequest) -> TenantResponse {
