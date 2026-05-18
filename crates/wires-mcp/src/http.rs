@@ -53,6 +53,10 @@ pub fn app(state: ServiceState) -> Router {
             "/oauth/authorize",
             axum::routing::get(crate::oauth::authorize::handler),
         )
+        .route(
+            "/oauth/authorize/status/{session_id}",
+            axum::routing::get(crate::oauth::authorize_status::handler),
+        )
         .with_state(state)
 }
 
