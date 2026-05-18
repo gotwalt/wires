@@ -20,12 +20,14 @@ wires-node  = { workspace = true }
 iroh        = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
+axum       = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 snafu = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 hex        = { workspace = true }
 humantime = "2"
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 redb   = { workspace = true }
 serde  = { workspace = true }
 blake3        = { workspace = true }
@@ -37,3 +39,4 @@ tempfile  = { workspace = true }
 rand_core = { workspace = true }
 toml      = { workspace = true }
 wires-cli = { path = "../wires-cli" }
+reqwest   = { version = "0.12", default-features = false, features = ["rustls-tls"] }
