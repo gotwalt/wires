@@ -7,6 +7,7 @@ pub mod error;
 pub mod keys;
 pub mod store;
 pub mod token;
+pub mod http;
 
 #[cfg(test)]
 mod lib_tests {
