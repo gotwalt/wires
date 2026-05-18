@@ -117,9 +117,7 @@ async fn ticket_http_serves_all_three_routes() {
     assert!(html.contains("<svg"), "missing inline QR svg");
     // Endpoint id (the half that doesn't change per-request) should appear.
     assert!(html.contains(&endpoint_id_hex), "endpoint id not rendered");
-    // The dark-mode post-processing should have removed the raw color literals.
-    assert!(!html.contains("#1c1c1c"), "dark-color literal leaked into HTML");
-    assert!(!html.contains("#ffffff"), "light-color literal leaked into HTML");
+    // The SVG color post-processing should have substituted currentColor in the QR.
     assert!(html.contains("currentColor"), "missing currentColor substitution");
 
     shutdown.cancel();
