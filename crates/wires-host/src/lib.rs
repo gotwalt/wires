@@ -7,3 +7,4 @@ pub mod replay_source;
 pub mod retention;
 pub mod routing;
 pub mod tenant_registry;
+pub mod ticket_http;
