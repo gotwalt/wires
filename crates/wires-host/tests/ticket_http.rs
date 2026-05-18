@@ -25,10 +25,14 @@ async fn ticket_http_serves_all_three_routes() {
 
     let shutdown = CancellationToken::new();
     let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let (bound, handle) =
-        ticket_http::spawn(endpoint.clone(), bind, Duration::from_secs(60), shutdown.clone())
-            .await
-            .expect("ticket_http::spawn failed");
+    let (bound, handle) = ticket_http::spawn(
+        endpoint.clone(),
+        bind,
+        Duration::from_secs(60),
+        shutdown.clone(),
+    )
+    .await
+    .expect("ticket_http::spawn failed");
 
     let client = reqwest::Client::new();
 
@@ -112,14 +116,26 @@ async fn ticket_http_serves_all_three_routes() {
     assert!(html.contains("<!doctype html>"), "missing doctype");
     assert!(html.contains("Scan with"), "missing caption");
     assert!(html.contains("Copy ticket"), "missing copy button label");
-    assert!(html.contains("Show ticket text"), "missing ticket-text disclosure");
-    assert!(html.contains("Host details"), "missing host-details disclosure");
+    assert!(
+        html.contains("Show ticket text"),
+        "missing ticket-text disclosure"
+    );
+    assert!(
+        html.contains("Host details"),
+        "missing host-details disclosure"
+    );
     assert!(html.contains("<svg"), "missing inline QR svg");
     // Endpoint id (the half that doesn't change per-request) should appear.
     assert!(html.contains(&endpoint_id_hex), "endpoint id not rendered");
     // The SVG color post-processing should have substituted currentColor in the QR.
-    assert!(html.contains("currentColor"), "missing currentColor substitution");
+    assert!(
+        html.contains("currentColor"),
+        "missing currentColor substitution"
+    );
 
     shutdown.cancel();
-    handle.await.expect("HTTP task panicked").expect("HTTP task returned error");
+    handle
+        .await
+        .expect("HTTP task panicked")
+        .expect("HTTP task returned error");
 }

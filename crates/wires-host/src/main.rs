@@ -40,7 +40,12 @@ struct Args {
     no_qr: bool,
 
     /// Bind address for the ticket HTTP page.
-    #[arg(long, global = true, default_value = "0.0.0.0:8089", conflicts_with = "no_http")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "0.0.0.0:8089",
+        conflicts_with = "no_http"
+    )]
     http_bind: std::net::SocketAddr,
 
     /// Disable the ticket HTTP page entirely.

@@ -229,7 +229,9 @@ pub async fn spawn(
     hint_ttl: Duration,
     shutdown: CancellationToken,
 ) -> Result<(SocketAddr, JoinHandle<Result<()>>)> {
-    let listener = TcpListener::bind(bind).await.context(HttpBindSnafu { bind })?;
+    let listener = TcpListener::bind(bind)
+        .await
+        .context(HttpBindSnafu { bind })?;
     let bound = listener.local_addr().context(HttpBindSnafu { bind })?;
     let state = Arc::new(AppState { endpoint, hint_ttl });
     let router = build_router(state);
@@ -390,9 +392,17 @@ fn format_duration_human(d: Duration) -> String {
     let hours = (total % 86_400) / 3600;
     let mins = (total % 3600) / 60;
     if days > 0 {
-        if hours > 0 { format!("{days}d {hours}h") } else { format!("{days}d") }
+        if hours > 0 {
+            format!("{days}d {hours}h")
+        } else {
+            format!("{days}d")
+        }
     } else if hours > 0 {
-        if mins > 0 { format!("{hours}h {mins}m") } else { format!("{hours}h") }
+        if mins > 0 {
+            format!("{hours}h {mins}m")
+        } else {
+            format!("{hours}h")
+        }
     } else {
         format!("{mins}m")
     }
@@ -437,8 +447,14 @@ mod tests {
     fn format_duration_human_examples() {
         assert_eq!(format_duration_human(Duration::from_secs(60)), "1m");
         assert_eq!(format_duration_human(Duration::from_secs(3600)), "1h");
-        assert_eq!(format_duration_human(Duration::from_secs(3600 + 5 * 60)), "1h 5m");
+        assert_eq!(
+            format_duration_human(Duration::from_secs(3600 + 5 * 60)),
+            "1h 5m"
+        );
         assert_eq!(format_duration_human(Duration::from_secs(86_400)), "1d");
-        assert_eq!(format_duration_human(Duration::from_secs(7 * 86_400 - 1)), "6d 23h");
+        assert_eq!(
+            format_duration_human(Duration::from_secs(7 * 86_400 - 1)),
+            "6d 23h"
+        );
     }
 }
