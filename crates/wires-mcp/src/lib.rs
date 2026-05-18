@@ -10,6 +10,7 @@ pub mod token;
 pub mod http;
 pub mod oauth;
 pub mod tenants;
+pub mod sign_in;
 
 #[cfg(test)]
 mod lib_tests {
