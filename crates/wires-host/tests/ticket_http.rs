@@ -86,7 +86,41 @@ async fn ticket_http_serves_all_three_routes() {
     );
     assert!(body.contains("<rect") || body.contains("<path"));
 
-    // Task 6 extends this test in place below.
+    // / — full HTML page. Asserts on structural markers, since the exact
+    // base64 differs from request to request (issued_at advances).
+    let resp = client
+        .get(format!("http://{bound}/"))
+        .send()
+        .await
+        .expect("GET / failed");
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap_or(""))
+            .unwrap_or("")
+            .starts_with("text/html"),
+        "expected text/html content-type"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .map(|v| v.to_str().unwrap_or("")),
+        Some("no-store"),
+    );
+    let html = resp.text().await.expect("body");
+    assert!(html.contains("<!doctype html>"), "missing doctype");
+    assert!(html.contains("Scan with"), "missing caption");
+    assert!(html.contains("Copy ticket"), "missing copy button label");
+    assert!(html.contains("Show ticket text"), "missing ticket-text disclosure");
+    assert!(html.contains("Host details"), "missing host-details disclosure");
+    assert!(html.contains("<svg"), "missing inline QR svg");
+    // Endpoint id (the half that doesn't change per-request) should appear.
+    assert!(html.contains(&endpoint_id_hex), "endpoint id not rendered");
+    // The dark-mode post-processing should have removed the raw color literals.
+    assert!(!html.contains("#1c1c1c"), "dark-color literal leaked into HTML");
+    assert!(!html.contains("#ffffff"), "light-color literal leaked into HTML");
+    assert!(html.contains("currentColor"), "missing currentColor substitution");
 
     shutdown.cancel();
     handle.await.expect("HTTP task panicked").expect("HTTP task returned error");
