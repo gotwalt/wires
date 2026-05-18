@@ -37,11 +37,11 @@ struct ScanFeature<Payload: Equatable & Sendable>: Reducer {
         case decodeFailed(ScanError)
     }
 
-    let parse: @Sendable (String) throws -> Payload
+    let parse: @Sendable (String) async throws -> Payload
 
     @Dependency(\.cameraPermissionClient) var camera
 
-    init(parse: @escaping @Sendable (String) throws -> Payload) {
+    init(parse: @escaping @Sendable (String) async throws -> Payload) {
         self.parse = parse
     }
 
@@ -67,7 +67,7 @@ struct ScanFeature<Payload: Equatable & Sendable>: Reducer {
             state.error = nil
             return .run { [parse] send in
                 do {
-                    let parsed = try parse(payload)
+                    let parsed = try await parse(payload)
                     await send(.decodedPayload(parsed))
                 } catch {
                     await send(.decodeFailed(.parseFailed(String(describing: error))))

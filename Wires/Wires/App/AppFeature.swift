@@ -49,6 +49,10 @@ struct AppFeature {
                     state = .bootstrap(BootstrapFeature.State())
                 }
                 return .none
+            case let .bootstrap(.bootstrapCompleted(rootPubkeyHex)):
+                state = .home(HomeFeature.State(rootPubkeyHex: rootPubkeyHex))
+                return .none
+
             case .bootstrap, .home:
                 return .none
             }
