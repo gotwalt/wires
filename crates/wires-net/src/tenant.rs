@@ -143,12 +143,13 @@ pub enum TenantErrorCode {
     Internal,
 }
 
-/// The four control-plane operations. Each one's signed bytes are domain-
+/// The five control-plane operations. Each one's signed bytes are domain-
 /// separated (spec §4.2) so signatures from one operation can never be
 /// replayed as another.
 #[derive(Debug, Clone, Copy)]
 pub enum TenantOp<'a> {
     Register,
+    Unregister,
     TopicRegister(&'a [u8; 32]),
     TopicUnregister(&'a [u8; 32]),
     Status,
@@ -158,6 +159,7 @@ impl TenantOp<'_> {
     fn domain(&self) -> &'static [u8] {
         match self {
             TenantOp::Register => b"wires-tenant-register-v1\0",
+            TenantOp::Unregister => b"wires-tenant-unregister-v1\0",
             TenantOp::TopicRegister(_) => b"wires-topic-register-v1\0",
             TenantOp::TopicUnregister(_) => b"wires-topic-unregister-v1\0",
             TenantOp::Status => b"wires-tenant-status-v1\0",
@@ -167,7 +169,7 @@ impl TenantOp<'_> {
     fn topic_id(&self) -> Option<&[u8; 32]> {
         match self {
             TenantOp::TopicRegister(t) | TenantOp::TopicUnregister(t) => Some(t),
-            TenantOp::Register | TenantOp::Status => None,
+            TenantOp::Register | TenantOp::Unregister | TenantOp::Status => None,
         }
     }
 }
@@ -331,6 +333,11 @@ impl TenantClient {
                 nonce,
                 signature,
             }),
+            TenantOp::Unregister => {
+                // Wire type added in a subsequent task; this arm keeps exhaustive
+                // matching while TenantRequest::Unregister does not yet exist.
+                unreachable!("TenantOp::Unregister client wire-up not yet implemented")
+            }
             TenantOp::TopicRegister(topic) => TenantRequest::TopicRegister(TopicRegisterRequest {
                 version: 1,
                 root_pubkey,
@@ -490,6 +497,15 @@ mod tests {
         assert_ne!(r, s);
         assert_ne!(tr, tu);
         assert_ne!(r, tr);
+    }
+
+    #[test]
+    fn signing_bytes_distinguishes_tenant_unregister_from_other_no_topic_ops() {
+        let r = signing_bytes(TenantOp::Register, &[1u8; 32], 1, &[2u8; 16], &[3u8; 32]);
+        let s = signing_bytes(TenantOp::Status, &[1u8; 32], 1, &[2u8; 16], &[3u8; 32]);
+        let u = signing_bytes(TenantOp::Unregister, &[1u8; 32], 1, &[2u8; 16], &[3u8; 32]);
+        assert_ne!(u, r);
+        assert_ne!(u, s);
     }
 
     #[tokio::test]
