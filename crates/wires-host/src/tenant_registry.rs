@@ -43,6 +43,14 @@ pub enum TopicRegisterOutcome {
     Conflict { other_root: [u8; 32] },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantDeleteOutcome {
+    /// Whether a tenant row was found before deletion.
+    pub existed: bool,
+    /// Every topic_id that was removed from the topic_index as part of this delete.
+    pub topics_removed: Vec<[u8; 32]>,
+}
+
 pub struct TenantRegistry {
     pub root: PathBuf,
     tenants_db: Arc<Database>,
@@ -241,6 +249,77 @@ impl TenantRegistry {
         Ok(removed)
     }
 
+    /// Remove the tenant row and every topic_index entry that maps to this
+    /// `root_pubkey`. The two writes happen in separate transactions: topic
+    /// index first (so routing stops immediately), then the tenant row. Each
+    /// step is idempotent; calling on an unknown tenant returns
+    /// `existed: false, topics_removed: vec![]`.
+    pub fn delete_tenant(&self, root_pubkey: &[u8; 32]) -> Result<TenantDeleteOutcome> {
+        // 1. Collect every topic_id owned by this tenant.
+        let mut topics_removed: Vec<[u8; 32]> = Vec::new();
+        {
+            let read = self.topic_index_db.begin_read().context(TxnSnafu)?;
+            match read.open_table(TOPIC_INDEX) {
+                Ok(table) => {
+                    for row in table.iter().context(StorageIoSnafu)? {
+                        let (k, v) = row.context(StorageIoSnafu)?;
+                        if v.value() == root_pubkey.as_slice() && k.value().len() == 32 {
+                            let mut id = [0u8; 32];
+                            id.copy_from_slice(k.value());
+                            topics_removed.push(id);
+                        }
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => {
+                    return Err(crate::error::HostError::Table {
+                        source: e,
+                        location: snafu::location!(),
+                    });
+                }
+            }
+        }
+
+        // 2. Remove every collected topic_id from the topic_index.
+        if !topics_removed.is_empty() {
+            let write = self.topic_index_db.begin_write().context(TxnSnafu)?;
+            {
+                let mut table = write.open_table(TOPIC_INDEX).context(TableSnafu)?;
+                for topic in &topics_removed {
+                    table.remove(&topic[..]).context(StorageIoSnafu)?;
+                }
+            }
+            write.commit().context(CommitSnafu)?;
+        }
+
+        // 3. Delete the tenant row.
+        let existed: bool = {
+            let write = self.tenants_db.begin_write().context(TxnSnafu)?;
+            let was_present = {
+                match write.open_table(TENANTS) {
+                    Ok(mut table) => table
+                        .remove(&root_pubkey[..])
+                        .context(StorageIoSnafu)?
+                        .is_some(),
+                    Err(redb::TableError::TableDoesNotExist(_)) => false,
+                    Err(e) => {
+                        return Err(crate::error::HostError::Table {
+                            source: e,
+                            location: snafu::location!(),
+                        });
+                    }
+                }
+            };
+            write.commit().context(CommitSnafu)?;
+            was_present
+        };
+
+        Ok(TenantDeleteOutcome {
+            existed,
+            topics_removed,
+        })
+    }
+
     /// Returns `true` iff the (root_pubkey, nonce) pair was already seen within
     /// the TTL window. On `false`, the pair is recorded.
     pub fn nonce_seen(
@@ -284,8 +363,8 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use wires_net::tenant::{
     TenantErrorCode, TenantErrorResponse, TenantOp, TenantRegisterRequest, TenantRegisterResponse,
     TenantResponse, TenantStatusKind, TenantStatusRequest, TenantStatusResponse,
-    TenantUnregisterRequest, TopicRegisterRequest, TopicRegisterResponse,
-    TopicUnregisterRequest, TopicUnregisterResponse, signing_bytes,
+    TenantUnregisterRequest, TopicRegisterRequest, TopicRegisterResponse, TopicUnregisterRequest,
+    TopicUnregisterResponse, signing_bytes,
 };
 
 /// Tunable behaviour for `TenantHandlerImpl`.
@@ -702,6 +781,61 @@ mod tests {
             !reg.nonce_seen(&root, &nonce, now + ttl_ms + 1, ttl_ms)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn delete_tenant_drops_record_and_indexed_topics() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let root_a = [0xAAu8; 32];
+        let root_b = [0xBBu8; 32];
+        let topic1 = [0x11u8; 32];
+        let topic2 = [0x22u8; 32];
+        let topic3 = [0x33u8; 32];
+
+        reg.insert_if_absent(
+            &root_a,
+            TenantRecord {
+                registered_at: 1,
+                status: TenantStatus::Active,
+                retention_budget_bytes: 100,
+            },
+        )
+        .unwrap();
+        reg.insert_if_absent(
+            &root_b,
+            TenantRecord {
+                registered_at: 1,
+                status: TenantStatus::Active,
+                retention_budget_bytes: 100,
+            },
+        )
+        .unwrap();
+        reg.register_topic(&root_a, &topic1).unwrap();
+        reg.register_topic(&root_a, &topic2).unwrap();
+        reg.register_topic(&root_b, &topic3).unwrap();
+
+        let dropped = reg.delete_tenant(&root_a).unwrap();
+        assert_eq!(dropped.existed, true);
+        let mut topics = dropped.topics_removed;
+        topics.sort();
+        assert_eq!(topics, vec![topic1, topic2]);
+
+        // Tenant A is gone; tenant B is intact.
+        assert!(reg.get(&root_a).unwrap().is_none());
+        assert!(reg.get(&root_b).unwrap().is_some());
+        assert!(reg.lookup_topic_tenant(&topic1).unwrap().is_none());
+        assert!(reg.lookup_topic_tenant(&topic2).unwrap().is_none());
+        assert_eq!(reg.lookup_topic_tenant(&topic3).unwrap(), Some(root_b));
+    }
+
+    #[test]
+    fn delete_tenant_unknown_returns_not_existed() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let dropped = reg.delete_tenant(&[7u8; 32]).unwrap();
+        assert_eq!(dropped.existed, false);
+        assert!(dropped.topics_removed.is_empty());
     }
 
     #[test]
