@@ -7,10 +7,11 @@ End-to-end encrypted gossip substrate for a household's AI agents. Think "a priv
 - **Substrate v1** — identity, topics, capabilities, encrypted publish/subscribe, replay between peers, persisted hash-chained logs. Drives the CLI end-to-end. Spec: [`docs/superpowers/specs/2026-05-14-wires-substrate-design.md`](docs/superpowers/specs/2026-05-14-wires-substrate-design.md).
 - **Hosted service v1** — `wires-host` is a multi-tenant blind relay with a `/wires/tenant/0` control-plane ALPN, per-tenant rolling retention, and an HTTPS service-discovery endpoint. Spec: [`docs/superpowers/specs/2026-05-14-wires-hosted-service-design.md`](docs/superpowers/specs/2026-05-14-wires-hosted-service-design.md).
 - **Responder-driven pairing v1** — agents declare a role + requested scopes via `wires pair-listen`; the operator consents and dials in via `wires pair-approve` over `/wires/pair/0` with a sealed, signed `PairGrant`. Spec: [`docs/superpowers/specs/2026-05-15-wires-responder-driven-pairing-design.md`](docs/superpowers/specs/2026-05-15-wires-responder-driven-pairing-design.md).
+- **MCP gateway v1** — `wires-mcp` is a multi-tenant authenticated MCP gateway. OAuth 2.1 (PRM + AS + DCR), iOS as universal authenticator, MCP tools: `wires.list_topics`, `wires.publish`, `wires.tail`. Spec: [`docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md`](docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md).
 
 A working Home Assistant ingestion daemon (`wires-ha`) ships as a separate binary.
 
-Not built yet: iOS companion app (still a stock SwiftUI scaffold pending revised plan), REST/MCP surface, `__cap.*` gossip propagation, `__topic.epoch_advance` distribution.
+Not built yet: iOS companion app (still a stock SwiftUI scaffold pending revised plan), `__cap.*` gossip propagation, `__topic.epoch_advance` distribution.
 
 ## Build
 
@@ -224,10 +225,70 @@ crates/
   wires-cli     `wires` binary
   wires-host    `wires-host` multi-tenant relay (lib + bin: tenant registry, retention, routing, host-ticket emission)
   wires-ha      `wires-ha` Home Assistant ingestion daemon
+  wires-mcp     `wires-mcp` authenticated MCP gateway (lib + bin: OAuth 2.1, per-user NodeRuntime, MCP tools)
 docs/superpowers/
   specs/        design docs (substrate, hosted-service, iOS companion)
   plans/        implementation plans
 ```
+
+## MCP gateway
+
+`wires-mcp` exposes a small authenticated MCP surface so AI-agent clients
+(Claude Desktop, Cursor, VS Code, etc.) can act on a household's behalf.
+It pairs into each household as a normal wires agent — `wires-host`'s
+blindness contract is unchanged.
+
+### Operator walkthrough
+
+```bash
+# 1. Generate a config.
+cat >/etc/wires-mcp/config.toml <<EOF
+public_url = "https://mcp.example.com"
+bind = "127.0.0.1:3001"
+data_dir = "/var/lib/wires-mcp"
+EOF
+
+# 2. Run the service.
+wires-mcp serve
+
+# 3. List onboarded users.
+wires-mcp user-list
+
+# 4. Remove a user (e.g. household-side cap was revoked).
+wires-mcp user-delete <root_pubkey_hex>
+```
+
+Operators must put a TLS-terminating reverse proxy (nginx, caddy, etc.) in
+front of `wires-mcp`; the binary speaks plain HTTP and assumes a trusted
+upstream for TLS.
+
+### User walkthrough (from the user's perspective)
+
+1. Add the MCP server URL `https://mcp.example.com` to your MCP client.
+2. The client opens the gateway's `/oauth/authorize` page in a browser.
+3. Two QR codes appear. First-time users scan the **left** one with the
+   Wires iOS app and approve a new "MCP gateway" agent like any other agent.
+   Returning users scan the **right** one to authenticate with their root
+   key.
+4. The browser redirects back; the MCP client now has an access token
+   bound to the user's household root pubkey.
+5. The client can call `wires.list_topics`, `wires.publish`, `wires.tail`
+   against the user's agent's caps.
+
+### Known limitations (v1)
+
+- `keys rotate` archives the old key but doesn't keep it in JWKS for an
+  overlap window — existing access tokens become unverifiable on the next
+  process restart. Wait out access-token TTL before restarting after a
+  rotation.
+- A user's topic set is fixed at pair time. To grant a paired gateway
+  agent access to a new topic, `__cap.revoke` the existing cap and re-pair
+  (the substrate's gossip-borne `__cap.grant` distribution is not yet
+  implemented).
+- Per-MCP-client distinction lives in logs only, not on the wires bus.
+- The end-to-end acceptance test (`tests/end_to_end.rs`, marked `#[ignore]`)
+  is a structural scaffold; filling in the test body requires factoring
+  the pair-approve helper out of `wires-cli` and is tracked separately.
 
 ## License
 
