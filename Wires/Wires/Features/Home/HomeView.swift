@@ -16,11 +16,21 @@ struct HomeView: View {
                             Label("Approve node", systemImage: "person.badge.plus")
                         }
                     }
+                    #if DEBUG
+                    ToolbarItem(placement: .secondaryAction) {
+                        Button(role: .destructive) {
+                            store.send(.resetHouseholdTapped)
+                        } label: {
+                            Label("Reset household (debug)", systemImage: "trash")
+                        }
+                    }
+                    #endif
                 }
                 .task { store.send(.onAppear) }
                 .sheet(item: $store.scope(state: \.nodeEnrollment, action: \.nodeEnrollment)) { childStore in
                     NodeEnrollmentView(store: childStore)
                 }
+                .alert($store.scope(state: \.alert, action: \.alert))
         }
     }
 
