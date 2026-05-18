@@ -357,11 +357,13 @@ impl TenantClient {
                 nonce,
                 signature,
             }),
-            TenantOp::Unregister => {
-                // Wire type added in a subsequent task; this arm keeps exhaustive
-                // matching while TenantRequest::Unregister does not yet exist.
-                unreachable!("TenantOp::Unregister client wire-up not yet implemented")
-            }
+            TenantOp::Unregister => TenantRequest::Unregister(TenantUnregisterRequest {
+                version: 1,
+                root_pubkey,
+                timestamp: timestamp_ms,
+                nonce,
+                signature,
+            }),
             TenantOp::TopicRegister(topic) => TenantRequest::TopicRegister(TopicRegisterRequest {
                 version: 1,
                 root_pubkey,
@@ -401,6 +403,23 @@ impl TenantClient {
         self.signed_send(
             peer,
             TenantOp::Register,
+            root_signer,
+            host_endpoint_id,
+            timestamp_ms,
+        )
+        .await
+    }
+
+    pub async fn unregister_tenant(
+        &self,
+        peer: EndpointId,
+        root_signer: &dyn RootSigner,
+        host_endpoint_id: &[u8; 32],
+        timestamp_ms: i64,
+    ) -> Result<TenantResponse> {
+        self.signed_send(
+            peer,
+            TenantOp::Unregister,
             root_signer,
             host_endpoint_id,
             timestamp_ms,
@@ -533,7 +552,10 @@ mod tests {
             signature: [3u8; 64],
         });
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"type\":\"unregister\""), "tag missing: {json}");
+        assert!(
+            json.contains("\"type\":\"unregister\""),
+            "tag missing: {json}"
+        );
         let back: TenantRequest = serde_json::from_str(&json).unwrap();
         match back {
             TenantRequest::Unregister(r) => {
@@ -598,8 +620,21 @@ mod tests {
                     caps_topic_id: [9u8; 32],
                 })
             }
-            fn handle_unregister(&self, _r: TenantUnregisterRequest) -> TenantResponse {
-                unreachable!()
+            fn handle_unregister(&self, req: TenantUnregisterRequest) -> TenantResponse {
+                use ed25519_dalek::{Verifier, VerifyingKey};
+                let bytes = signing_bytes(
+                    TenantOp::Unregister,
+                    &req.root_pubkey,
+                    req.timestamp,
+                    &req.nonce,
+                    &self.host_id,
+                );
+                let vk = VerifyingKey::from_bytes(&req.root_pubkey).unwrap();
+                vk.verify(&bytes, &req.signature.into()).unwrap();
+                TenantResponse::Unregister(TenantUnregisterResponse {
+                    ok: true,
+                    topics_removed: 7,
+                })
             }
             fn handle_topic_register(&self, _r: TopicRegisterRequest) -> TenantResponse {
                 unreachable!()
@@ -639,6 +674,20 @@ mod tests {
             TenantResponse::Register(r) => {
                 assert!(r.ok);
                 assert_eq!(r.server_time, 42);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // Now unregister: the handler returns a fixed response, we verify the
+        // signature was domain-separated for Unregister.
+        let resp = client
+            .unregister_tenant(host_ep.id(), &root, &host_id, 1234)
+            .await
+            .unwrap();
+        match resp {
+            TenantResponse::Unregister(r) => {
+                assert!(r.ok);
+                assert_eq!(r.topics_removed, 7);
             }
             other => panic!("unexpected response: {other:?}"),
         }
