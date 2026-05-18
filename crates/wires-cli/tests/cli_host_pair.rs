@@ -39,6 +39,7 @@ async fn host_pair_persists_host_to_config() {
         }),
         on_topic_registered: Arc::new(|_, _| {}),
         on_topic_unregistered: Arc::new(|_, _| {}),
+        on_tenant_unregistered: Arc::new(|_, _| {}),
     });
     let _router = iroh::protocol::Router::builder(host_ep.clone())
         .accept(TENANT_ALPN, TenantProtocol::new(handler))
