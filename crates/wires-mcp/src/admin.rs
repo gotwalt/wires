@@ -16,6 +16,22 @@ pub fn load_config(path: &Path) -> Result<GatewayConfig> {
     })
 }
 
+pub fn keys_rotate(cfg: &GatewayConfig) -> Result<()> {
+    let path = cfg.token_signing_path();
+    if path.exists() {
+        let now_s = chrono::Utc::now().timestamp();
+        let archived = cfg.data_dir.join(format!("token_signing.ed25519.archived.{now_s}"));
+        std::fs::rename(&path, &archived).context(IoSnafu)?;
+        println!("archived old signing key to {}", archived.display());
+    }
+    let new = crate::keys::load_or_create(&path)?;
+    println!(
+        "new signing key kid = {}",
+        crate::keys::kid_for(&new.verifying_key())
+    );
+    Ok(())
+}
+
 pub fn client_list(cfg: &GatewayConfig) -> Result<()> {
     let store = Store::open(&cfg.gateway_db_path())?;
     for c in store.list_oauth_clients()? {
@@ -178,5 +194,27 @@ mod tests {
         let store2 = Store::open(&cfg.gateway_db_path()).unwrap();
         let rec = store2.get_oauth_client("c1").unwrap().unwrap();
         assert!(rec.revoked);
+    }
+
+    #[test]
+    fn keys_rotate_generates_new_key_and_archives_old() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = GatewayConfig {
+            public_url: "https://mcp.example.com".into(),
+            bind: "127.0.0.1:0".into(),
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let initial = crate::keys::load_or_create(&cfg.token_signing_path()).unwrap();
+        keys_rotate(&cfg).unwrap();
+        let after = crate::keys::load_or_create(&cfg.token_signing_path()).unwrap();
+        assert_ne!(initial.to_bytes(), after.to_bytes());
+        // Old key archived with a timestamp suffix.
+        let archive_glob = cfg.data_dir.join("token_signing.ed25519.archived");
+        // The implementation should produce *something* with that prefix.
+        let archived = std::fs::read_dir(&cfg.data_dir).unwrap().any(|e| {
+            let n = e.unwrap().file_name();
+            n.to_string_lossy().starts_with("token_signing.ed25519.archived")
+        });
+        assert!(archived, "expected archived key in {:?}", archive_glob);
     }
 }
