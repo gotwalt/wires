@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use wires_net::HostTicket;
 
-use crate::error::{HostError, HttpBindSnafu, HttpServeSnafu, QrSvgSnafu, Result};
+use crate::error::{HostError, HostTicketSnafu, HttpBindSnafu, HttpServeSnafu, Result};
 
 struct AppState {
     endpoint: iroh::Endpoint,
@@ -60,12 +60,12 @@ fn build_router(state: Arc<AppState>) -> Router {
 
 /// Build the current ticket from the live endpoint. Re-derived per request.
 fn current_ticket(state: &AppState) -> Result<HostTicket> {
-    HostTicket::from_endpoint(&state.endpoint, state.hint_ttl).context(QrSvgSnafu)
+    HostTicket::from_endpoint(&state.endpoint, state.hint_ttl).context(HostTicketSnafu)
 }
 
 async fn serve_txt(State(state): State<Arc<AppState>>) -> Result<Response> {
     let ticket = current_ticket(&state)?;
-    let body = ticket.encode().context(QrSvgSnafu)?;
+    let body = ticket.encode().context(HostTicketSnafu)?;
     let mut resp = body.into_response();
     let h = resp.headers_mut();
     h.insert(
