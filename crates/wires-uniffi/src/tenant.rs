@@ -16,7 +16,7 @@ use crate::error::{
     TopicRegisterStreamSnafu, WiresError,
 };
 use crate::signer::{SwiftRootSigner, SwiftRootSignerAdapter};
-use crate::types::{HostInfo, TenantRegistration};
+use crate::types::{HostInfo, TenantRegistration, UnregisterResult};
 
 pub async fn register_with_hosted_service(
     endpoint: Endpoint,
@@ -48,6 +48,46 @@ pub async fn register_with_hosted_service(
             caps_topic_id_hex: hex::encode(r.caps_topic_id),
             host_endpoint_id_hex: r.host_endpoint_id,
             server_time_ms: r.server_time,
+        }),
+        TenantResponse::Error(err) => Err(TenantRejectedSnafu {
+            code: err.code,
+            message: err.message,
+        }
+        .build()),
+        other => Err(InternalSnafu {
+            message: format!("unexpected tenant response: {other:?}"),
+        }
+        .build()),
+    }
+}
+
+pub async fn unregister_with_hosted_service(
+    endpoint: Endpoint,
+    root_signer: Arc<dyn SwiftRootSigner>,
+    host: &HostInfo,
+) -> Result<UnregisterResult, WiresError> {
+    let peer = decode_endpoint_id(&host.endpoint_id_hex)?;
+    register_hint_addrs(&endpoint, host);
+
+    let adapter = SwiftRootSignerAdapter { inner: root_signer };
+    let host_eid_bytes = *peer.as_bytes();
+    let now = now_ms()?;
+
+    let client = TenantClient::new(endpoint);
+    let resp = client
+        .unregister_tenant(peer, &adapter, &host_eid_bytes, now)
+        .await
+        .map_err(|e| {
+            TenantStreamSnafu {
+                message: format!("{e}"),
+            }
+            .build()
+        })?;
+
+    match resp {
+        TenantResponse::Unregister(r) => Ok(UnregisterResult {
+            ok: r.ok,
+            topics_removed: r.topics_removed,
         }),
         TenantResponse::Error(err) => Err(TenantRejectedSnafu {
             code: err.code,
