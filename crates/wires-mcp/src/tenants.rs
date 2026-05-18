@@ -4,7 +4,7 @@
 //! addressing — fine at v1 scale; see spec §7 for the v2 sharing note).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,10 @@ struct Slot {
 }
 
 impl TenantSupervisor {
+    pub fn users_dir(&self) -> &Path {
+        &self.users_dir
+    }
+
     pub fn new(users_dir: PathBuf, idle_ttl: Duration) -> Self {
         Self {
             inner: Arc::new(tokio::sync::Mutex::new(Inner {

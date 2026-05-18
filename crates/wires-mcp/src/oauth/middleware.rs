@@ -82,33 +82,20 @@ pub fn claims_from(req: &Request) -> Option<&Claims> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::GatewayConfig;
     use crate::http::ServiceState;
-    use crate::store::{OauthClientRecord, Store};
+    use crate::store::OauthClientRecord;
     use crate::token::{MintInput, mint};
     use axum::Router;
     use axum::body::Body;
     use axum::http::Request;
     use axum::routing::get;
-    use ed25519_dalek::SigningKey;
-    use std::sync::Arc;
     use tempfile::TempDir;
     use tower::ServiceExt;
 
     fn state() -> (TempDir, ServiceState) {
         let tmp = TempDir::new().unwrap();
-        let cfg = GatewayConfig {
-            public_url: "https://mcp.example.com".into(),
-            bind: "127.0.0.1:0".into(),
-            data_dir: tmp.path().to_path_buf(),
-        };
-        let store = Store::open(&cfg.gateway_db_path()).unwrap();
-        let state = ServiceState {
-            config: Arc::new(cfg),
-            store,
-            signing_key: Arc::new(SigningKey::from_bytes(&[1u8; 32])),
-        };
-        (tmp, state)
+        let st = crate::http::test_state(tmp.path());
+        (tmp, st)
     }
 
     fn protected_app(state: ServiceState) -> Router {
