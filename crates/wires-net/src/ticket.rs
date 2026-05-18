@@ -152,6 +152,23 @@ impl HostTicket {
             .build();
         Ok(s)
     }
+
+    /// Render the encoded ticket as a standalone SVG QR. Dark modules are
+    /// `#1c1c1c`; light modules are `#ffffff`. Callers that inline this SVG
+    /// into HTML and want it to follow the page's text color should
+    /// post-process: `str::replace("#1c1c1c", "currentColor")` and
+    /// `str::replace("#ffffff", "transparent")`.
+    pub fn render_qr_svg(&self) -> Result<String> {
+        let payload = self.encode()?;
+        let code = qrcode::QrCode::new(payload.as_bytes()).context(TicketQrRenderSnafu)?;
+        let svg = code
+            .render::<qrcode::render::svg::Color>()
+            .quiet_zone(true)
+            .dark_color(qrcode::render::svg::Color("#1c1c1c"))
+            .light_color(qrcode::render::svg::Color("#ffffff"))
+            .build();
+        Ok(svg)
+    }
 }
 
 #[cfg(test)]
@@ -284,5 +301,25 @@ mod tests {
                 .any(|c| c == '\u{2580}' || c == '\u{2584}' || c == '\u{2588}'),
             "rendered string should contain block art chars"
         );
+    }
+
+    #[test]
+    fn render_qr_svg_produces_svg() {
+        let t = sample();
+        let s = t.render_qr_svg().unwrap();
+        assert!(!s.is_empty(), "rendered SVG must be non-empty");
+        assert!(
+            s.starts_with("<?xml") || s.starts_with("<svg"),
+            "expected SVG to start with <?xml or <svg, got {:?}",
+            &s[..s.len().min(40)]
+        );
+        assert!(
+            s.contains("<rect") || s.contains("<path"),
+            "SVG should contain at least one <rect> or <path>"
+        );
+        // Sanity-check that the dark/light colors land in the output so the
+        // wires-host module's post-processing has something to str::replace on.
+        assert!(s.contains("#1c1c1c"), "expected dark color to appear");
+        assert!(s.contains("#ffffff"), "expected light color to appear");
     }
 }
