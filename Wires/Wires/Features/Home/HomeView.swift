@@ -11,15 +11,15 @@ struct HomeView: View {
                 .toolbar {
                     ToolbarItem(placement: .primaryAction) {
                         Button {
-                            store.send(.approveAgentTapped)
+                            store.send(.approveNodeTapped)
                         } label: {
-                            Label("Approve agent", systemImage: "person.badge.plus")
+                            Label("Approve node", systemImage: "person.badge.plus")
                         }
                     }
                 }
                 .task { store.send(.onAppear) }
-                .sheet(item: $store.scope(state: \.agentEnrollment, action: \.agentEnrollment)) { childStore in
-                    AgentEnrollmentView(store: childStore)
+                .sheet(item: $store.scope(state: \.nodeEnrollment, action: \.nodeEnrollment)) { childStore in
+                    NodeEnrollmentView(store: childStore)
                 }
         }
     }
@@ -57,9 +57,9 @@ struct HomeView: View {
             Image(systemName: "person.crop.circle.badge.questionmark")
                 .font(.system(size: 48))
                 .foregroundStyle(.secondary)
-            Text("No agents yet")
+            Text("No nodes yet")
                 .font(.headline)
-            Text("Tap \"Approve agent\" to enroll one.")
+            Text("Tap \"Approve node\" to enroll one.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
@@ -68,7 +68,7 @@ struct HomeView: View {
 
     private var capsList: some View {
         List {
-            ForEach(groupedByAgent(), id: \.agentPubkeyHex) { group in
+            ForEach(groupedByNode(), id: \.nodePubkeyHex) { group in
                 Section {
                     ForEach(group.caps) { cap in
                         capRow(cap)
@@ -98,29 +98,29 @@ struct HomeView: View {
         .padding(.vertical, 2)
     }
 
-    private struct AgentGroup {
-        let agentPubkeyHex: String
-        let agentAlias: String?
+    private struct NodeGroup {
+        let nodePubkeyHex: String
+        let nodeAlias: String?
         let caps: [HomeFeature.CapSummary]
     }
 
-    private func groupedByAgent() -> [AgentGroup] {
-        let grouped = Dictionary(grouping: store.caps, by: \.agentPubkeyHex)
+    private func groupedByNode() -> [NodeGroup] {
+        let grouped = Dictionary(grouping: store.caps, by: \.nodePubkeyHex)
         return grouped
             .map { key, caps in
-                AgentGroup(
-                    agentPubkeyHex: key,
-                    agentAlias: caps.first?.agentAlias,
+                NodeGroup(
+                    nodePubkeyHex: key,
+                    nodeAlias: caps.first?.nodeAlias,
                     caps: caps.sorted { $0.issuedAt < $1.issuedAt }
                 )
             }
-            .sorted { $0.agentPubkeyHex < $1.agentPubkeyHex }
+            .sorted { $0.nodePubkeyHex < $1.nodePubkeyHex }
     }
 
-    private func headerLabel(for group: AgentGroup) -> String {
-        if let alias = group.agentAlias, !alias.isEmpty {
+    private func headerLabel(for group: NodeGroup) -> String {
+        if let alias = group.nodeAlias, !alias.isEmpty {
             return alias
         }
-        return String(group.agentPubkeyHex.prefix(16)) + "…"
+        return String(group.nodePubkeyHex.prefix(16)) + "…"
     }
 }

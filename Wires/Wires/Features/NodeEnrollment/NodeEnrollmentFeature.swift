@@ -2,9 +2,9 @@ import ComposableArchitecture
 import SwiftUI
 
 /// Stub — real implementation in Task 21. HomeFeature presents this as a
-/// sheet when the user taps "Approve agent."
+/// sheet when the user taps "Approve node."
 @Reducer
-struct AgentEnrollmentFeature {
+struct NodeEnrollmentFeature {
     @ObservableState
     struct State: Equatable {}
 
@@ -18,15 +18,15 @@ struct AgentEnrollmentFeature {
     }
 }
 
-struct AgentEnrollmentView: View {
-    let store: StoreOf<AgentEnrollmentFeature>
+struct NodeEnrollmentView: View {
+    let store: StoreOf<NodeEnrollmentFeature>
 
     var body: some View {
         VStack(spacing: 16) {
-            Text("Approve agent")
+            Text("Approve node")
                 .font(.title2)
                 .bold()
-            Text("Scan a pair-request QR from the agent device.")
+            Text("Scan a pair-request QR from the node device.")
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
             Spacer()

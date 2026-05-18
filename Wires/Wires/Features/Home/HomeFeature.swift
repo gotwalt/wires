@@ -9,7 +9,7 @@ struct HomeFeature {
         var caps: [CapSummary] = []
         var loading = false
         var loadError: String?
-        @Presents var agentEnrollment: AgentEnrollmentFeature.State?
+        @Presents var nodeEnrollment: NodeEnrollmentFeature.State?
     }
 
     /// Equatable value snapshot of `CapRecord`. We don't pass SwiftData
@@ -17,8 +17,8 @@ struct HomeFeature {
     /// reducer stay Sendable-friendly.
     struct CapSummary: Equatable, Identifiable, Sendable {
         let id: String  // capIdHex
-        let agentPubkeyHex: String
-        let agentAlias: String?
+        let nodePubkeyHex: String
+        let nodeAlias: String?
         let topicNames: [String]
         let rights: [String]
         let issuedAt: Date
@@ -30,8 +30,8 @@ struct HomeFeature {
         case onAppear
         case capsLoaded([CapSummary])
         case capsLoadFailed(String)
-        case approveAgentTapped
-        case agentEnrollment(PresentationAction<AgentEnrollmentFeature.Action>)
+        case approveNodeTapped
+        case nodeEnrollment(PresentationAction<NodeEnrollmentFeature.Action>)
     }
 
     @Dependency(\.householdClient) var household
@@ -50,8 +50,8 @@ struct HomeFeature {
                             records.map { rec in
                                 CapSummary(
                                     id: rec.capIdHex,
-                                    agentPubkeyHex: rec.agentPubkeyHex,
-                                    agentAlias: rec.agentAlias,
+                                    nodePubkeyHex: rec.nodePubkeyHex,
+                                    nodeAlias: rec.nodeAlias,
                                     topicNames: rec.topicNames,
                                     rights: rec.rights,
                                     issuedAt: rec.issuedAt,
@@ -75,21 +75,21 @@ struct HomeFeature {
                 state.loadError = message
                 return .none
 
-            case .approveAgentTapped:
-                state.agentEnrollment = AgentEnrollmentFeature.State()
+            case .approveNodeTapped:
+                state.nodeEnrollment = NodeEnrollmentFeature.State()
                 return .none
 
-            case .agentEnrollment(.presented(.dismissTapped)),
-                 .agentEnrollment(.dismiss):
-                state.agentEnrollment = nil
+            case .nodeEnrollment(.presented(.dismissTapped)),
+                 .nodeEnrollment(.dismiss):
+                state.nodeEnrollment = nil
                 return .none
 
-            case .agentEnrollment:
+            case .nodeEnrollment:
                 return .none
             }
         }
-        .ifLet(\.$agentEnrollment, action: \.agentEnrollment) {
-            AgentEnrollmentFeature()
+        .ifLet(\.$nodeEnrollment, action: \.nodeEnrollment) {
+            NodeEnrollmentFeature()
         }
     }
 }

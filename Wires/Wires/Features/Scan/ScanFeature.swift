@@ -14,7 +14,7 @@ enum ScanError: Error, Equatable, Sendable {
 }
 
 /// Reusable QR scanner reducer. Generic on the parsed payload type so the
-/// same reducer drives bootstrap (`HostInfo`) and agent enrollment
+/// same reducer drives bootstrap (`HostInfo`) and node enrollment
 /// (`PairRequestPreview`). The parser closure is injected at init.
 ///
 /// Manual `Reducer` conformance — the `@Reducer` macro doesn't play

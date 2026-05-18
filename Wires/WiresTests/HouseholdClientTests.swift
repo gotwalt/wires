@@ -51,15 +51,15 @@ struct HouseholdClientTests {
         try await client.saveCap(
             CapRecord(
                 capIdHex: String(repeating: "11", count: 16),
-                agentPubkeyHex: String(repeating: "22", count: 32),
-                agentAlias: "chat-agent: Bob",
+                nodePubkeyHex: String(repeating: "22", count: 32),
+                nodeAlias: "chat-node: Bob",
                 topicNames: ["home.notes"],
                 rights: ["read", "write"]
             )
         )
         let caps = try await client.listCaps()
         #expect(caps.count == 1)
-        #expect(caps.first?.agentAlias == "chat-agent: Bob")
+        #expect(caps.first?.nodeAlias == "chat-node: Bob")
         #expect(caps.first?.rights == ["read", "write"])
     }
 
