@@ -1,0 +1,49 @@
+[package]
+name = "wires-mcp"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "wires_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wires-mcp"
+path = "src/main.rs"
+
+[dependencies]
+wires-core   = { workspace = true }
+wires-crypto = { workspace = true }
+wires-store  = { workspace = true }
+wires-net    = { workspace = true }
+wires-node   = { workspace = true }
+
+iroh        = { workspace = true }
+tokio       = { workspace = true }
+clap        = { workspace = true }
+axum        = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+tokio-util  = { version = "0.7", default-features = false, features = ["rt"] }
+snafu       = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+hex         = { workspace = true }
+toml        = { workspace = true }
+redb        = { workspace = true }
+blake3      = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand_core   = { workspace = true }
+qrcode      = { version = "0.14", default-features = false, features = ["svg"] }
+jsonwebtoken = "9"
+uuid        = { version = "1", features = ["v4", "serde"] }
+sha2        = "0.10"
+base64      = "0.22"
+chrono      = { version = "0.4", default-features = false, features = ["clock"] }
+async-trait = "0.1"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile    = "3"
+tokio       = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

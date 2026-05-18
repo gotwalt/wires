@@ -8,6 +8,7 @@ members = [
     "crates/wires-node",
     "crates/wires-cli",
     "crates/wires-host",
+    "crates/wires-mcp",
     "crates/wires-ha",
     "crates/wires-uniffi",
 ]
@@ -25,6 +26,7 @@ wires-store  = { path = "crates/wires-store" }
 wires-net    = { path = "crates/wires-net" }
 wires-node   = { path = "crates/wires-node" }
 wires-host   = { path = "crates/wires-host" }
+wires-mcp    = { path = "crates/wires-mcp" }
 
 # Iroh
 iroh        = "0.98"
