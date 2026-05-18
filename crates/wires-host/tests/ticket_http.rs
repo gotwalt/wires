@@ -57,6 +57,35 @@ async fn ticket_http_serves_all_three_routes() {
     let ticket = HostTicket::decode(body.trim()).expect("decode HostTicket");
     assert_eq!(ticket.endpoint_id, endpoint_id_hex);
 
+    // /ticket.svg — SVG content with the right content-type and no-store cache header.
+    let resp = client
+        .get(format!("http://{bound}/ticket.svg"))
+        .send()
+        .await
+        .expect("GET /ticket.svg failed");
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap_or(""))
+            .unwrap_or("")
+            .starts_with("image/svg+xml"),
+        "expected image/svg+xml content-type"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .map(|v| v.to_str().unwrap_or("")),
+        Some("no-store"),
+    );
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.starts_with("<?xml") || body.starts_with("<svg"),
+        "expected SVG header, got {:?}",
+        &body[..body.len().min(40)]
+    );
+    assert!(body.contains("<rect") || body.contains("<path"));
+
     // Task 6 extends this test in place below.
 
     shutdown.cancel();
