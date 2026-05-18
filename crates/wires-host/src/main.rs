@@ -179,6 +179,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Tenant handler --------------------------------------------------------
     let subscribe_tx_clone = subscribe_tx.clone();
+    let logs_for_cb = Arc::clone(&logs);
+    let retention_for_cb = Arc::clone(&retention);
+    let data_dir_for_cb = args.data_dir.clone();
     let handler = Arc::new(TenantHandlerImpl {
         registry: Arc::clone(&registry),
         retention: Arc::clone(&retention),
@@ -191,8 +194,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         on_topic_unregistered: Arc::new(|_root, _topic| {
             // v1: subscription stays live; future spec adds a teardown signal.
         }),
-        on_tenant_unregistered: Arc::new(|_root, _topics| {
-            // v1: filesystem eviction handled by retention; no extra teardown needed.
+        on_tenant_unregistered: Arc::new(move |root, _topics| {
+            // Drop in-memory caches first so the open redb handles get released,
+            // then remove the on-disk tenant directory. Cache clearing is
+            // synchronous; the rm is best-effort and logged on failure.
+            logs_for_cb.clear_tenant(&root);
+            retention_for_cb.clear_tenant(&root);
+            let tenant_dir = data_dir_for_cb.join("tenants").join(hex::encode(root));
+            if tenant_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&tenant_dir) {
+                    tracing::warn!(
+                        error = %e,
+                        dir = %tenant_dir.display(),
+                        "failed to remove tenant directory on unregister",
+                    );
+                } else {
+                    tracing::info!(
+                        dir = %tenant_dir.display(),
+                        "removed tenant directory on unregister",
+                    );
+                }
+            }
         }),
     });
 
