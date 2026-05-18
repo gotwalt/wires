@@ -11,6 +11,7 @@ pub mod http;
 pub mod oauth;
 pub mod tenants;
 pub mod sign_in;
+pub mod sign_in_endpoint;
 pub mod pair_bridge;
 
 #[cfg(test)]
