@@ -64,6 +64,12 @@ pub fn app(state: ServiceState) -> Router {
             axum::routing::post(crate::sign_in_endpoint::handler),
         )
         .route("/oauth/token", axum::routing::post(crate::oauth::token::handler))
+        .route(
+            "/mcp",
+            axum::routing::post(crate::mcp::router::handler).layer(
+                axum::middleware::from_fn_with_state(state.clone(), crate::oauth::middleware::bearer),
+            ),
+        )
         .with_state(state)
 }
 
