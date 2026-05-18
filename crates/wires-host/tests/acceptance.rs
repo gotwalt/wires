@@ -39,6 +39,7 @@ async fn end_to_end_register_via_host_ticket() {
         }),
         on_topic_registered: Arc::new(|_, _| {}),
         on_topic_unregistered: Arc::new(|_, _| {}),
+        on_tenant_unregistered: Arc::new(|_, _| {}),
     });
     let _router = iroh::protocol::Router::builder(host_ep.clone())
         .accept(TENANT_ALPN, TenantProtocol::new(handler))
@@ -168,6 +169,7 @@ async fn two_tenants_share_one_host_no_leakage() {
             let _ = subscribe_tx_for_handler.send(topic);
         }),
         on_topic_unregistered: Arc::new(|_, _| {}),
+        on_tenant_unregistered: Arc::new(|_, _| {}),
     });
     let _proto_router = iroh::protocol::Router::builder(host_ep.clone())
         .accept(wires_net::GOSSIP_ALPN, gossip_handler)

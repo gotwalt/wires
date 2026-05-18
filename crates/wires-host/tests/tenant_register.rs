@@ -45,6 +45,7 @@ async fn tenant_register_round_trip() {
         now_ms: Arc::new(|| 1_000_000i64),
         on_topic_registered: Arc::new(|_, _| {}),
         on_topic_unregistered: Arc::new(|_, _| {}),
+        on_tenant_unregistered: Arc::new(|_, _| {}),
     });
     let _host_router = iroh::protocol::Router::builder(host_ep.clone())
         .accept(TENANT_ALPN, TenantProtocol::new(handler))

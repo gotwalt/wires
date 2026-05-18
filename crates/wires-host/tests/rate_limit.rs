@@ -29,6 +29,7 @@ fn handle_register_rejects_bad_signature() {
         now_ms: Arc::new(|| 1_000_000),
         on_topic_registered: Arc::new(|_, _| {}),
         on_topic_unregistered: Arc::new(|_, _| {}),
+        on_tenant_unregistered: Arc::new(|_, _| {}),
     };
     let signing_key = SigningKey::generate(&mut OsRng);
     let root_pubkey = signing_key.verifying_key().to_bytes();
@@ -60,6 +61,7 @@ fn handle_register_rejects_replayed_nonce() {
         now_ms: Arc::new(|| 1_000_000),
         on_topic_registered: Arc::new(|_, _| {}),
         on_topic_unregistered: Arc::new(|_, _| {}),
+        on_tenant_unregistered: Arc::new(|_, _| {}),
     };
     let signing_key = SigningKey::generate(&mut OsRng);
     let root_pubkey = signing_key.verifying_key().to_bytes();

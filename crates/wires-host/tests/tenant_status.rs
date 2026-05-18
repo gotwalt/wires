@@ -54,6 +54,7 @@ fn handle_status_returns_real_values() {
         now_ms: Arc::new(move || now_ms),
         on_topic_registered: Arc::new(|_, _| {}),
         on_topic_unregistered: Arc::new(|_, _| {}),
+        on_tenant_unregistered: Arc::new(|_, _| {}),
     };
 
     // 1. Register the tenant.
@@ -179,6 +180,7 @@ fn handle_status_zero_when_no_messages() {
         now_ms: Arc::new(move || now_ms),
         on_topic_registered: Arc::new(|_, _| {}),
         on_topic_unregistered: Arc::new(|_, _| {}),
+        on_tenant_unregistered: Arc::new(|_, _| {}),
     };
 
     // Register tenant only — no messages routed.
