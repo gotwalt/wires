@@ -33,6 +33,11 @@ enum Cmd {
         #[arg(long, default_value = "/etc/wires-mcp/config.toml")]
         config: std::path::PathBuf,
     },
+    /// Rotate the token signing key (archive old, generate new).
+    KeysRotate {
+        #[arg(long, default_value = "/etc/wires-mcp/config.toml")]
+        config: std::path::PathBuf,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -138,6 +143,16 @@ fn main() -> std::process::ExitCode {
             match wires_mcp::admin::client_revoke(&cfg, &client_id) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(e) => { eprintln!("client-revoke: {e}"); std::process::ExitCode::FAILURE }
+            }
+        }
+        Cmd::KeysRotate { config } => {
+            let cfg = match wires_mcp::admin::load_config(&config) {
+                Ok(c) => c,
+                Err(e) => { eprintln!("config: {e}"); return std::process::ExitCode::FAILURE; }
+            };
+            match wires_mcp::admin::keys_rotate(&cfg) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => { eprintln!("keys rotate: {e}"); std::process::ExitCode::FAILURE }
             }
         }
     }
