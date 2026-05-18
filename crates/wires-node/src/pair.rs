@@ -100,6 +100,42 @@ pub enum PairOutcome {
     Paired { cap_id: [u8; 16] },
 }
 
+/// Summary of a successful pair install. Carries the household root pubkey
+/// (so the caller can route on OAuth `sub`) plus the installed cap id and a
+/// timestamp. The gateway uses this in `on_paired` to bind the temp data
+/// dir to `users/<root>/` and complete the OAuth `/authorize` flow.
+#[derive(Debug, Clone)]
+pub struct PairInstallSummary {
+    pub root_pubkey_hex: String,
+    pub cap_id: [u8; 16],
+    pub installed_at: i64,
+}
+
+/// Callback invoked after `install_grant` commits and before
+/// `PairFrame::Ack` is sent. Returning `Err` aborts the ack: the handler
+/// returns `PairFrame::Reject(AlreadyPaired)` if the error is of type
+/// `OnPairedError::AlreadyPaired`, otherwise `Reject(InternalError)`.
+pub type OnPaired = dyn Fn(PairInstallSummary) -> std::result::Result<(), OnPairedError>
+    + Send
+    + Sync;
+
+/// Reject codes the on_paired callback can request.
+#[derive(Debug)]
+pub enum OnPairedError {
+    AlreadyPaired(String),
+    Internal(String),
+}
+
+impl std::fmt::Display for OnPairedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyPaired(m) => write!(f, "already paired: {m}"),
+            Self::Internal(m) => write!(f, "internal: {m}"),
+        }
+    }
+}
+impl std::error::Error for OnPairedError {}
+
 /// Concrete PairHandler that verifies a PairGrantEnvelope against the
 /// in-memory pending pair state, installs the grant, and signals the loop.
 pub struct NodePairHandler {
@@ -115,6 +151,7 @@ struct HandlerState {
     request_expires_ms: i64,
     outcome_tx: Option<oneshot::Sender<PairOutcome>>,
     completed: bool,
+    on_paired: Option<Arc<OnPaired>>,
 }
 
 impl NodePairHandler {
@@ -137,8 +174,20 @@ impl NodePairHandler {
                 request_expires_ms,
                 outcome_tx: Some(outcome_tx),
                 completed: false,
+                on_paired: None,
             })),
         }
+    }
+
+    pub fn with_on_paired(mut self, on_paired: Arc<OnPaired>) -> Self {
+        // Replace the inner Arc with a new one carrying the callback.
+        // Done by re-wrapping; ok because no one has cloned `self.inner` yet
+        // at construction time.
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_on_paired must be called before any clone of the handler");
+        let state = inner.get_mut();
+        state.on_paired = Some(on_paired);
+        self
     }
 }
 
@@ -196,6 +245,20 @@ impl PairHandler for NodePairHandler {
                     );
                 }
                 state.completed = true;
+                if let Some(cb) = state.on_paired.clone() {
+                    let summary = PairInstallSummary {
+                        root_pubkey_hex: hex::encode(grant.root_pubkey),
+                        cap_id: out.cap_id,
+                        installed_at: unix_now_ms(),
+                    };
+                    if let Err(e) = (cb)(summary) {
+                        let (code, msg) = match e {
+                            OnPairedError::AlreadyPaired(m) => (PairRejectCode::AlreadyPaired, m),
+                            OnPairedError::Internal(m) => (PairRejectCode::InternalError, m),
+                        };
+                        return reject(code, &msg);
+                    }
+                }
                 if let Some(tx) = state.outcome_tx.take() {
                     let _ = tx.send(PairOutcome::Paired { cap_id: out.cap_id });
                 }
@@ -374,4 +437,48 @@ fn hex_to_arr32(s: &str) -> crate::error::Result<[u8; 32]> {
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, "wrong length"),
         location: snafu::location!(),
     })
+}
+
+#[cfg(test)]
+mod on_paired_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct DummyErr(String);
+    impl std::fmt::Display for DummyErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+    impl std::error::Error for DummyErr {}
+
+    #[test]
+    fn pair_install_summary_carries_root_and_cap() {
+        let s = PairInstallSummary {
+            root_pubkey_hex: "deadbeef".repeat(8),
+            cap_id: [1u8; 16],
+            installed_at: 12345,
+        };
+        assert_eq!(s.root_pubkey_hex.len(), 64);
+        assert_eq!(s.cap_id, [1u8; 16]);
+    }
+
+    #[test]
+    fn on_paired_callback_type_compiles() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let c2 = Arc::clone(&count);
+        let cb: Arc<OnPaired> = Arc::new(move |_s: PairInstallSummary| {
+            c2.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let s = PairInstallSummary {
+            root_pubkey_hex: "x".into(),
+            cap_id: [0u8; 16],
+            installed_at: 0,
+        };
+        (cb)(s).unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
 }
