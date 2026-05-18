@@ -16,6 +16,12 @@ enum Cmd {
         #[arg(long, default_value = "/etc/wires-mcp/config.toml")]
         config: std::path::PathBuf,
     },
+    /// Delete a user and all their data.
+    UserDelete {
+        root_pubkey_hex: String,
+        #[arg(long, default_value = "/etc/wires-mcp/config.toml")]
+        config: std::path::PathBuf,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -91,6 +97,16 @@ fn main() -> std::process::ExitCode {
             match wires_mcp::admin::user_list(&cfg) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(e) => { eprintln!("user-list: {e}"); std::process::ExitCode::FAILURE }
+            }
+        }
+        Cmd::UserDelete { root_pubkey_hex, config } => {
+            let cfg = match wires_mcp::admin::load_config(&config) {
+                Ok(c) => c,
+                Err(e) => { eprintln!("config: {e}"); return std::process::ExitCode::FAILURE; }
+            };
+            match wires_mcp::admin::user_delete(&cfg, &root_pubkey_hex) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => { eprintln!("user-delete: {e}"); std::process::ExitCode::FAILURE }
             }
         }
     }
