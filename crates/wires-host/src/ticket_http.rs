@@ -298,9 +298,8 @@ async fn serve_html(State(state): State<Arc<AppState>>) -> Result<Response> {
 fn render_page(state: &AppState, ticket: &HostTicket) -> Result<String> {
     let encoded = ticket.encode().context(HostTicketSnafu)?;
     let svg_raw = ticket.render_qr_svg().context(HostTicketSnafu)?;
-    // Replace raw color literals so the SVG uses CSS currentColor for
-    // dark-mode compatibility. These replacements are applied to the SVG only
-    // here; the full-page pass below strips any remaining literals.
+    // Replace raw color literals in the SVG so it uses CSS currentColor for
+    // dark-mode compatibility. The HTML template's CSS hex literals are left intact.
     let svg = svg_raw
         .replace("#1c1c1c", "currentColor")
         .replace("#ffffff", "transparent");
@@ -336,11 +335,7 @@ fn render_page(state: &AppState, ticket: &HostTicket) -> Result<String> {
         .replace("__ISSUED_UTC__", &issued_utc)
         .replace("__TTL_HUMAN__", &ttl_human)
         .replace("__ADDRS_HTML__", &addrs_html)
-        .replace("__RELAY_HTML__", &relay_html)
-        // Post-process: remove raw color literals so the page uses CSS
-        // variables / currentColor throughout for dark-mode compatibility.
-        .replace("#1c1c1c", "currentColor")
-        .replace("#ffffff", "currentColor");
+        .replace("__RELAY_HTML__", &relay_html);
     Ok(page)
 }
 
