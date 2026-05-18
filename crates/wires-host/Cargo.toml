@@ -19,6 +19,8 @@ wires-net   = { workspace = true }
 wires-node  = { workspace = true }
 iroh        = { workspace = true }
 tokio = { workspace = true }
+axum       = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 clap = { workspace = true }
 snafu = { workspace = true }
 tracing = { workspace = true }
@@ -37,3 +39,4 @@ tempfile  = { workspace = true }
 rand_core = { workspace = true }
 toml      = { workspace = true }
 wires-cli = { path = "../wires-cli" }
+reqwest   = { version = "0.12", default-features = false, features = ["rustls-tls"] }
