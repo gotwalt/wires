@@ -9,6 +9,7 @@ pub mod store;
 pub mod token;
 pub mod http;
 pub mod oauth;
+pub mod tenants;
 
 #[cfg(test)]
 mod lib_tests {
