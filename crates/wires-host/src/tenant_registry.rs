@@ -397,6 +397,7 @@ pub struct TenantHandlerImpl {
     /// and topic_index entries. `Vec<[u8; 32]>` is the list of topic_ids that
     /// were dropped from the index. The host wires this to clear filesystem
     /// state for the tenant.
+    #[allow(clippy::type_complexity)]
     pub on_tenant_unregistered: Arc<dyn Fn([u8; 32], Vec<[u8; 32]>) + Send + Sync>,
 }
 
