@@ -22,7 +22,7 @@ wires-node   = { workspace = true }
 iroh        = { workspace = true }
 tokio       = { workspace = true }
 clap        = { workspace = true }
-axum        = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+axum        = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
 tokio-util  = { version = "0.7", default-features = false, features = ["rt"] }
 snafu       = { workspace = true }
 tracing     = { workspace = true }

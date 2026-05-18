@@ -5,3 +5,5 @@ pub mod as_meta;
 pub mod jwks;
 pub mod register;
 pub mod middleware;
+pub mod authorize;
+pub mod authorize_html;
