@@ -59,6 +59,10 @@ pub fn app(state: ServiceState) -> Router {
             "/oauth/authorize/status/{session_id}",
             axum::routing::get(crate::oauth::authorize_status::handler),
         )
+        .route(
+            "/oauth/signin/assertion",
+            axum::routing::post(crate::sign_in_endpoint::handler),
+        )
         .with_state(state)
 }
 
