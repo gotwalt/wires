@@ -13,6 +13,7 @@ pub mod tenants;
 pub mod sign_in;
 pub mod sign_in_endpoint;
 pub mod pair_bridge;
+pub mod mcp;
 
 #[cfg(test)]
 mod lib_tests {
