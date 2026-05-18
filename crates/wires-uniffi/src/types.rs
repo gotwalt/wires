@@ -16,6 +16,15 @@ pub struct TenantRegistration {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct UnregisterResult {
+    /// True iff the host had a tenant record to remove. False is a successful
+    /// no-op (idempotent on retry).
+    pub ok: bool,
+    /// Number of topic_index entries the host dropped.
+    pub topics_removed: u32,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct PairRequestPreview {
     pub handle: PendingPairHandle,
     pub agent_pubkey_hex: String,
