@@ -7,3 +7,7 @@ Cargo.lock
 .wires/
 *.db
 *.key
+./data
+
+# Xcode + SPM per-user state (Package.resolved is checked in; xcuserdata isn't)
+**/xcuserdata/
