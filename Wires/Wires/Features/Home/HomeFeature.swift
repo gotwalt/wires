@@ -12,6 +12,7 @@ struct HomeFeature {
         var loading = false
         var loadError: String?
         @Presents var nodeEnrollment: NodeEnrollmentFeature.State?
+        @Presents var alert: AlertState<Action.Alert>?
     }
 
     /// Equatable value snapshot of `CapRecord`. We don't pass SwiftData
@@ -39,9 +40,21 @@ struct HomeFeature {
         case loadFailed(String)
         case approveNodeTapped
         case nodeEnrollment(PresentationAction<NodeEnrollmentFeature.Action>)
+        case resetHouseholdTapped
+        case alert(PresentationAction<Alert>)
+        case resetCompleted
+        case resetFailed(String)
+        case didReset
+
+        @CasePathable
+        enum Alert: Equatable {
+            case confirmReset
+        }
     }
 
     @Dependency(\.householdClient) var household
+    @Dependency(\.keychainClient) var keychain
+    @Dependency(\.wiresClient) var wires
 
     var body: some Reducer<State, Action> {
         Reduce { state, action in
@@ -105,11 +118,75 @@ struct HomeFeature {
 
             case .nodeEnrollment:
                 return .none
+
+            case .resetHouseholdTapped:
+                state.alert = AlertState {
+                    TextState("Reset household?")
+                } actions: {
+                    ButtonState(role: .destructive, action: .confirmReset) {
+                        TextState("Reset")
+                    }
+                    ButtonState(role: .cancel) {
+                        TextState("Cancel")
+                    }
+                } message: {
+                    TextState("Tells the host to drop this tenant, then wipes every local key and database row. The next launch behaves like a fresh install.")
+                }
+                return .none
+
+            case .alert(.presented(.confirmReset)):
+                state.alert = nil
+                let host = state.host
+                let household = self.household
+                let keychain = self.keychain
+                let wires = self.wires
+                return .run { send in
+                    // 1. Tell the host to unregister. Soft-fail: a host that's offline
+                    //    or already-forgotten shouldn't block a local reset.
+                    if let host {
+                        do {
+                            _ = try await wires.unregisterTenant(host)
+                        } catch {
+                            // Logged, not raised.
+                            print("[reset] host unregister failed: \(error)")
+                        }
+                    }
+                    // 2. Wipe SwiftData.
+                    do { try await household.wipeAll() }
+                    catch {
+                        await send(.resetFailed("wipe SwiftData: \(error)"))
+                        return
+                    }
+                    // 3. Wipe Keychain.
+                    do { try keychain.wipeAllWiresAccounts() }
+                    catch {
+                        await send(.resetFailed("wipe Keychain: \(error)"))
+                        return
+                    }
+                    // 4. Drop the cached WiresApp so the next bootstrap regenerates.
+                    await wires.reset()
+                    await send(.resetCompleted)
+                }
+
+            case .alert:
+                return .none
+
+            case .resetCompleted:
+                return .send(.didReset)
+
+            case let .resetFailed(message):
+                state.loadError = "Reset failed: \(message)"
+                return .none
+
+            case .didReset:
+                // AppFeature observes this delegate action and transitions to .launching.
+                return .none
             }
         }
         .ifLet(\.$nodeEnrollment, action: \.nodeEnrollment) {
             NodeEnrollmentFeature()
         }
+        .ifLet(\.$alert, action: \.alert)
     }
 }
 
