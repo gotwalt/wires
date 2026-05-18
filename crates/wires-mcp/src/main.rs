@@ -11,6 +11,11 @@ struct Cli {
 enum Cmd {
     /// Run the gateway HTTPS service + tenant supervisor.
     Serve,
+    /// List all registered users.
+    UserList {
+        #[arg(long, default_value = "/etc/wires-mcp/config.toml")]
+        config: std::path::PathBuf,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -76,6 +81,16 @@ fn main() -> std::process::ExitCode {
                     eprintln!("serve failed: {e}");
                     std::process::ExitCode::FAILURE
                 }
+            }
+        }
+        Cmd::UserList { config } => {
+            let cfg = match wires_mcp::admin::load_config(&config) {
+                Ok(c) => c,
+                Err(e) => { eprintln!("config: {e}"); return std::process::ExitCode::FAILURE; }
+            };
+            match wires_mcp::admin::user_list(&cfg) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => { eprintln!("user-list: {e}"); std::process::ExitCode::FAILURE }
             }
         }
     }
