@@ -211,20 +211,20 @@ pub async fn tenant_unregister(data_dir: &Path, yes: bool) -> Result<()> {
     // effort: if the file's gone or unparseable, log and move on — the host
     // side of the unregister already succeeded.
     let cfg_path = data_dir.join("config.toml");
-    if let Ok(raw) = std::fs::read_to_string(&cfg_path) {
-        if let Ok(mut cfg) = toml::from_str::<NodeConfig>(&raw) {
-            cfg.host = None;
-            match toml::to_string_pretty(&cfg) {
-                Ok(serialized) => {
-                    if let Err(e) = std::fs::write(&cfg_path, serialized) {
-                        tracing::warn!(error = %e, "failed to rewrite config.toml after tenant-unregister");
-                    } else {
-                        println!("Cleared host block in {}", cfg_path.display());
-                    }
+    if let Ok(raw) = std::fs::read_to_string(&cfg_path)
+        && let Ok(mut cfg) = toml::from_str::<NodeConfig>(&raw)
+    {
+        cfg.host = None;
+        match toml::to_string_pretty(&cfg) {
+            Ok(serialized) => {
+                if let Err(e) = std::fs::write(&cfg_path, serialized) {
+                    tracing::warn!(error = %e, "failed to rewrite config.toml after tenant-unregister");
+                } else {
+                    println!("Cleared host block in {}", cfg_path.display());
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to serialize cleared config.toml after tenant-unregister");
-                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize cleared config.toml after tenant-unregister");
             }
         }
     }
