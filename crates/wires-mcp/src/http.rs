@@ -34,6 +34,10 @@ pub fn app(state: ServiceState) -> Router {
             "/.well-known/oauth-protected-resource",
             axum::routing::get(crate::oauth::prm::handler),
         )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            axum::routing::get(crate::oauth::as_meta::handler),
+        )
         .with_state(state)
 }
 
