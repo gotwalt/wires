@@ -9,10 +9,11 @@ Prototype. Three slices have landed on `main`:
 - **Substrate v1** (merge `fefbbfc`) — identity, topic creation, capability mint/revoke, publish with AEAD, gossip + replay between peers, decrypt on receive, persisted hash-chained logs. Drives the CLI end-to-end.
 - **Hosted service v1** (merge `3da4ec8`) — `wires-host` is multi-tenant: tenant registration over a `/wires/tenant/0` ALPN, per-tenant rolling retention with FIFO eviction, topic→tenant routing, write-rate ceiling, host-ticket discovery (base64 + terminal QR; `wires-host ticket` and startup-time emission). The host became a `lib + bin` crate.
 - **Responder-driven pairing v1** — agents declare a role + requested scopes via `wires pair-listen`; the operator consents and dials in via `wires pair-approve` over the new `/wires/pair/0` ALPN with a sealed, signed `PairGrant` carrying root pubkey, root-signed cap, per-topic epoch keys, and host info. Replaces the deleted `InviteToken` / `wires invite` / `wires join` surface. Spec: `docs/superpowers/specs/2026-05-15-wires-responder-driven-pairing-design.md`.
+- **MCP gateway v1** — `wires-mcp` is a multi-tenant authenticated MCP gateway. It joins each household as a normal wires agent via the responder pair flow, exposes OAuth 2.1 (PRM + AS + DCR) with the household root pubkey as `sub` and iOS as the universal authenticator (pair QR for first-time, sign-in challenge QR for returning). MCP tools: `wires.list_topics`, `wires.publish`, `wires.tail`. Spec: `docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md`.
 
 A Home Assistant ingestion daemon (`wires-ha`) also exists as a working example of an agent that participates in gossip + replay.
 
-What does **not** exist yet: iOS companion (still a stock SwiftUI scaffold — the spec/plan need revision against the post-hosted-service architecture), REST/MCP surface, `__cap.*` gossip propagation, `__topic.epoch_advance` distribution. See "Out of scope" in each design spec.
+What does **not** exist yet: iOS companion (still a stock SwiftUI scaffold — the spec/plan need revision against the post-hosted-service architecture), `__cap.*` gossip propagation, `__topic.epoch_advance` distribution. See "Out of scope" in each design spec.
 
 ## Authoritative docs
 
@@ -26,6 +27,8 @@ What does **not** exist yet: iOS companion (still a stock SwiftUI scaffold — t
 - **Host-ticket discovery plan** — `docs/superpowers/plans/2026-05-15-wires-iroh-host-ticket-discovery.md`.
 - **iOS companion spec** — `docs/superpowers/specs/2026-05-14-wires-ios-companion-design.md`. **Stale**: written before hosted-service landed; still describes the dropped `HostPairToken` QR-pair flow. Revise against the hosted-service spec's §8 (discovery + `register_with_hosted_service`) before implementing.
 - **iOS companion plan** — `docs/superpowers/plans/2026-05-14-wires-ios-companion.md`. Also **stale** for the same reason. Revise after the spec.
+- **MCP gateway spec** — `docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md`. PRM, AS, DCR, the two consent paths, the MCP tool surface.
+- **MCP gateway plan** — `docs/superpowers/plans/2026-05-18-wires-mcp-gateway.md`. 34 tasks, fully landed.
 
 ## Crate layout
 
@@ -41,6 +44,7 @@ Strict bottom-up layering — a crate may only depend on crates above it in this
 | `wires-cli` | `wires` binary — clap-based human/agent CLI. Speaks the tenant control protocol (`wires host pair / topic-register / topic-unregister / status`), drives responder-driven pairing (`wires pair-listen` on the agent, `wires pair-approve <token>` on the operator), and auto-dials gossip on `publish` / `cat`. `wires init` is identity-only by default; `wires init --new-root` is the operator path. `wires topic create` auto-mints a self-cap when run with a root key present. |
 | `wires-host` | `lib + bin`. The binary is a multi-tenant blind relay; the library houses `tenant_registry` (tenants/topic_index/nonces), `per_tenant_logs`, `retention`, `routing`, `replay_source`, and `error`. Still has no root key, no epoch keys, no caps; only persists ciphertext after a signature check, routed by topic→tenant lookup. |
 | `wires-ha` | `wires-ha` binary — Home Assistant ingestion daemon. Subscribes to a HA WebSocket, publishes `state_changed` events onto a configured topic, participates in gossip + replay like any other agent. Example of a non-CLI agent. |
+| `wires-mcp` | `lib + bin`. Authenticated MCP gateway. Holds one wires-agent data dir per OAuth user (`users/<root>/`) plus a small `gateway.redb` for OAuth state. Per-user `NodeRuntime`s are managed by `TenantSupervisor`. First-time `/authorize` runs the existing pair flow via a per-session iroh endpoint; returning `/authorize` accepts a root-signed challenge over HTTPS. Tokens are EdDSA JWTs, verified offline. |
 
 Do not reach across layers (e.g. `wires-net` must not depend on `wires-store`).
 
