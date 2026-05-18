@@ -30,6 +30,10 @@ impl FromRef<ServiceState> for Arc<GatewayConfig> {
 pub fn app(state: ServiceState) -> Router {
     Router::new()
         .route("/_health", axum::routing::get(health))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            axum::routing::get(crate::oauth::prm::handler),
+        )
         .with_state(state)
 }
 

@@ -8,6 +8,7 @@ pub mod keys;
 pub mod store;
 pub mod token;
 pub mod http;
+pub mod oauth;
 
 #[cfg(test)]
 mod lib_tests {
