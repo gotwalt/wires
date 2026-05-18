@@ -55,6 +55,18 @@ impl PerTenantLogs {
         map.insert((*root_pubkey, *topic_id), Arc::clone(&log));
         Ok(log)
     }
+
+    /// Drop every cached `TopicLog` handle for this tenant. The caller is
+    /// responsible for then deleting the on-disk `tenant_dir(root_pubkey)`.
+    pub fn clear_tenant(&self, root_pubkey: &[u8; 32]) {
+        let mut map = self.cache.write().unwrap();
+        map.retain(|(root, _topic), _| root != root_pubkey);
+    }
+
+    #[cfg(test)]
+    pub fn cache_len(&self) -> usize {
+        self.cache.read().unwrap().len()
+    }
 }
 
 #[cfg(test)]
@@ -102,5 +114,21 @@ mod tests {
                 .join(format!("log_{}.redb", hex::encode(topic)))
                 .exists()
         );
+    }
+
+    #[test]
+    fn clear_tenant_drops_cached_handles() {
+        let tmp = TempDir::new().unwrap();
+        let logs = PerTenantLogs::new(tmp.path());
+        let root_a = [1u8; 32];
+        let root_b = [2u8; 32];
+        let topic1 = [9u8; 32];
+        let topic2 = [10u8; 32];
+        let _ = logs.get_or_open(&root_a, &topic1).unwrap();
+        let _ = logs.get_or_open(&root_a, &topic2).unwrap();
+        let _ = logs.get_or_open(&root_b, &topic1).unwrap();
+        assert_eq!(logs.cache_len(), 3);
+        logs.clear_tenant(&root_a);
+        assert_eq!(logs.cache_len(), 1);
     }
 }

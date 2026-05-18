@@ -96,6 +96,18 @@ impl Retention {
             .context(StoreSnafu)?;
         Ok(msgs.first().map(|m| m.timestamp).unwrap_or(0))
     }
+
+    /// Drop the cached `IngestIndex` for this tenant. The caller is responsible
+    /// for then deleting `tenants/<root_pubkey_hex>/` on disk.
+    pub fn clear_tenant(&self, root_pubkey: &[u8; 32]) {
+        let mut map = self.indices.write().unwrap();
+        map.remove(root_pubkey);
+    }
+
+    #[cfg(test)]
+    pub fn cache_len(&self) -> usize {
+        self.indices.read().unwrap().len()
+    }
 }
 
 #[cfg(test)]
@@ -159,5 +171,26 @@ mod tests {
         let survivors = log.read_after(&[7u8; 32], None, 10).unwrap();
         assert_eq!(survivors.len(), 1);
         assert_eq!(survivors[0].seq, 2);
+    }
+
+    #[test]
+    fn clear_tenant_drops_cached_index() {
+        let tmp = TempDir::new().unwrap();
+        let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+        let retention = Retention::new(tmp.path(), Arc::clone(&logs));
+        let root_a = [1u8; 32];
+        let root_b = [2u8; 32];
+        let topic = [9u8; 32];
+
+        // Force index creation for both tenants.
+        retention
+            .on_append(&root_a, &topic, &[7u8; 32], 0, 100, u64::MAX)
+            .unwrap();
+        retention
+            .on_append(&root_b, &topic, &[7u8; 32], 0, 100, u64::MAX)
+            .unwrap();
+        assert_eq!(retention.cache_len(), 2);
+        retention.clear_tenant(&root_a);
+        assert_eq!(retention.cache_len(), 1);
     }
 }
