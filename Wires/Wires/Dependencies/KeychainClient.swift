@@ -33,6 +33,10 @@ struct KeychainClient {
     /// 64-byte signature. Triggers the system biometric prompt; subsequent
     /// signs within the LocalAuthentication reuse window are silent.
     var signWithBiometric: @Sendable (_ account: String, _ message: Data) async throws -> Data
+    /// Drop every Keychain entry under the `"wires"` service in a single
+    /// `SecItemDelete` — covers root.signingkey, root.pubkey, iroh.secret,
+    /// and every `wires.topic.<id>.epoch.<n>` entry.
+    var wipeAllWiresAccounts: @Sendable () throws -> Void
 }
 
 extension KeychainClient: DependencyKey {
@@ -51,6 +55,9 @@ extension KeychainClient: DependencyKey {
             },
             signWithBiometric: { account, message in
                 try await Self.signWithBiometric(service: service, account: account, message: message)
+            },
+            wipeAllWiresAccounts: {
+                try Self.deleteService(service: service)
             }
         )
     }
@@ -123,6 +130,18 @@ extension KeychainClient: DependencyKey {
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: account,
+            kSecUseDataProtectionKeychain: true,
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        if status != errSecSuccess && status != errSecItemNotFound {
+            throw KeychainError.unexpectedStatus(status)
+        }
+    }
+
+    private static func deleteService(service: String) throws {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
             kSecUseDataProtectionKeychain: true,
         ]
         let status = SecItemDelete(query as CFDictionary)
