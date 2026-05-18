@@ -16,6 +16,31 @@ pub fn load_config(path: &Path) -> Result<GatewayConfig> {
     })
 }
 
+pub fn client_list(cfg: &GatewayConfig) -> Result<()> {
+    let store = Store::open(&cfg.gateway_db_path())?;
+    for c in store.list_oauth_clients()? {
+        println!(
+            "{}\trevoked={}\tname={}\turis={:?}",
+            c.client_id, c.revoked, c.client_name, c.redirect_uris
+        );
+    }
+    Ok(())
+}
+
+pub fn client_revoke(cfg: &GatewayConfig, client_id: &str) -> Result<()> {
+    let store = Store::open(&cfg.gateway_db_path())?;
+    let mut rec = store
+        .get_oauth_client(client_id)?
+        .ok_or_else(|| crate::error::GatewayError::Io {
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "unknown client_id"),
+            location: snafu::location!(),
+        })?;
+    rec.revoked = true;
+    store.put_oauth_client(&rec)?;
+    println!("client {client_id} revoked");
+    Ok(())
+}
+
 pub fn user_delete(cfg: &GatewayConfig, root_pubkey_hex: &str) -> Result<()> {
     let store = Store::open(&cfg.gateway_db_path())?;
     let removed = store.delete_user(root_pubkey_hex)?;
@@ -128,5 +153,30 @@ mod tests {
         let store2 = Store::open(&cfg.gateway_db_path()).unwrap();
         assert!(store2.get_user(&sub).unwrap().is_none());
         assert!(store2.get_refresh_token("h1").unwrap().is_none());
+    }
+
+    #[test]
+    fn client_revoke_flips_the_flag() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = GatewayConfig {
+            public_url: "https://mcp.example.com".into(),
+            bind: "127.0.0.1:0".into(),
+            data_dir: tmp.path().to_path_buf(),
+        };
+        {
+            let store = Store::open(&cfg.gateway_db_path()).unwrap();
+            store.put_oauth_client(&crate::store::OauthClientRecord {
+                client_id: "c1".into(),
+                client_name: "C".into(),
+                redirect_uris: vec!["http://x".into()],
+                grant_types: vec!["authorization_code".into()],
+                created_at_ms: 0,
+                revoked: false,
+            }).unwrap();
+        }
+        client_revoke(&cfg, "c1").unwrap();
+        let store2 = Store::open(&cfg.gateway_db_path()).unwrap();
+        let rec = store2.get_oauth_client("c1").unwrap().unwrap();
+        assert!(rec.revoked);
     }
 }

@@ -22,6 +22,17 @@ enum Cmd {
         #[arg(long, default_value = "/etc/wires-mcp/config.toml")]
         config: std::path::PathBuf,
     },
+    /// List registered OAuth clients.
+    ClientList {
+        #[arg(long, default_value = "/etc/wires-mcp/config.toml")]
+        config: std::path::PathBuf,
+    },
+    /// Revoke an OAuth client.
+    ClientRevoke {
+        client_id: String,
+        #[arg(long, default_value = "/etc/wires-mcp/config.toml")]
+        config: std::path::PathBuf,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -107,6 +118,26 @@ fn main() -> std::process::ExitCode {
             match wires_mcp::admin::user_delete(&cfg, &root_pubkey_hex) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(e) => { eprintln!("user-delete: {e}"); std::process::ExitCode::FAILURE }
+            }
+        }
+        Cmd::ClientList { config } => {
+            let cfg = match wires_mcp::admin::load_config(&config) {
+                Ok(c) => c,
+                Err(e) => { eprintln!("config: {e}"); return std::process::ExitCode::FAILURE; }
+            };
+            match wires_mcp::admin::client_list(&cfg) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => { eprintln!("client-list: {e}"); std::process::ExitCode::FAILURE }
+            }
+        }
+        Cmd::ClientRevoke { client_id, config } => {
+            let cfg = match wires_mcp::admin::load_config(&config) {
+                Ok(c) => c,
+                Err(e) => { eprintln!("config: {e}"); return std::process::ExitCode::FAILURE; }
+            };
+            match wires_mcp::admin::client_revoke(&cfg, &client_id) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => { eprintln!("client-revoke: {e}"); std::process::ExitCode::FAILURE }
             }
         }
     }
