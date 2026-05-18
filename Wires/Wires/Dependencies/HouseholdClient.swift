@@ -27,6 +27,8 @@ struct HouseholdClient {
     var markTopicRegistered: @Sendable (_ topicIdHex: String) async throws -> Void
     var listCaps: @Sendable () async throws -> [CapRecord]
     var saveCap: @Sendable (_ cap: CapRecord) async throws -> Void
+    /// Delete every Household, TopicRecord, and CapRecord row.
+    var wipeAll: @Sendable () async throws -> Void
 }
 
 extension HouseholdClient: DependencyKey {
@@ -51,7 +53,8 @@ extension HouseholdClient: DependencyKey {
             saveTopic: { try await store.save($0) },
             markTopicRegistered: { try await store.markTopicRegistered(topicIdHex: $0) },
             listCaps: { try await store.listCaps() },
-            saveCap: { try await store.save($0) }
+            saveCap: { try await store.save($0) },
+            wipeAll: { try await store.wipeAll() }
         )
     }
 
@@ -158,6 +161,22 @@ private final class HouseholdStore {
     func save(_ cap: CapRecord) throws {
         let ctx = ModelContext(container)
         ctx.insert(cap)
+        try ctx.save()
+    }
+
+    func wipeAll() throws {
+        let ctx = ModelContext(container)
+        // Delete in dependency-free order. The schema has no cascades wired
+        // up, so each entity is dropped independently.
+        for h in try ctx.fetch(FetchDescriptor<Household>()) {
+            ctx.delete(h)
+        }
+        for t in try ctx.fetch(FetchDescriptor<TopicRecord>()) {
+            ctx.delete(t)
+        }
+        for c in try ctx.fetch(FetchDescriptor<CapRecord>()) {
+            ctx.delete(c)
+        }
         try ctx.save()
     }
 }
