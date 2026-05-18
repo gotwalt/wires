@@ -5,6 +5,7 @@
 pub mod config;
 pub mod error;
 pub mod keys;
+pub mod store;
 
 #[cfg(test)]
 mod lib_tests {
