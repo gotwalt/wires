@@ -12,19 +12,23 @@ struct WiresClient {
     /// One-shot bootstrap. Subsequent calls are no-ops. Takes the 32-byte
     /// iroh node secret and the `SwiftRootSigner` callback the FFI will use
     /// for every signing operation.
-    var bootstrap: @Sendable (_ irohSecret: Data, _ rootSigner: any SwiftRootSigner) async -> Void
+    var bootstrap: @Sendable (_ irohSecret: Data, _ rootSigner: any SwiftRootSigner) async -> Void = { _, _ in }
 
     var parseHostTicket: @Sendable (_ payload: String) async throws -> HostInfo
     var registerWithHostedService: @Sendable (_ host: HostInfo) async throws -> TenantRegistration
     var registerTopic: @Sendable (_ host: HostInfo, _ topicId: Data) async throws -> Void
     var parsePairRequest: @Sendable (_ payload: String) async throws -> PairRequestPreview
-    var generateTopicIdAndEpoch0: @Sendable () async -> NewTopic
+    /// Non-throwing default: empty topic id + zero-byte key. Real impl
+    /// returns 32-byte random hex + 32-byte symmetric key.
+    var generateTopicIdAndEpoch0: @Sendable () async -> NewTopic = {
+        NewTopic(topicIdHex: "", epoch0Key: Data())
+    }
     var approvePairRequest: @Sendable (
         _ handle: PendingPairHandle,
         _ grantedScopes: [GrantedScope],
         _ host: HostInfo
     ) async throws -> PairAckRecord
-    var discardPairRequest: @Sendable (_ handle: PendingPairHandle) async -> Void
+    var discardPairRequest: @Sendable (_ handle: PendingPairHandle) async -> Void = { _ in }
 }
 
 enum WiresClientError: Error, Equatable {

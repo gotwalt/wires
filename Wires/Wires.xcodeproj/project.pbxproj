@@ -6,6 +6,12 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		933434A62FBB5F7F00573F2D /* WiresKit in Frameworks */ = {isa = PBXBuildFile; productRef = 933434A52FBB5F7F00573F2D /* WiresKit */; };
+		933434A82FBB5F7F00573F2D /* ComposableArchitecture in Frameworks */ = {isa = PBXBuildFile; productRef = 933434A72FBB5F7F00573F2D /* ComposableArchitecture */; };
+		933434AA2FBB65B900573F2D /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 933434A92FBB65B900573F2D /* SystemConfiguration.framework */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		9331014E2FB64F0700DC7CA4 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -27,6 +33,9 @@
 		9331013E2FB64F0600DC7CA4 /* Wires.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Wires.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		9331014D2FB64F0700DC7CA4 /* WiresTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = WiresTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		933101572FB64F0700DC7CA4 /* WiresUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = WiresUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		933101A22FBAB80300DC7CA4 /* WiresKit */ = {isa = PBXFileReference; lastKnownFileType = folder; path = WiresKit; sourceTree = "<group>"; };
+		933101A42FBB5E2200DC7CA4 /* Package.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Package.swift; path = WiresKit/Package.swift; sourceTree = "<group>"; };
+		933434A92FBB65B900573F2D /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.4.sdk/System/Library/Frameworks/SystemConfiguration.framework; sourceTree = DEVELOPER_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -52,6 +61,9 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				933434A82FBB5F7F00573F2D /* ComposableArchitecture in Frameworks */,
+				933434AA2FBB65B900573F2D /* SystemConfiguration.framework in Frameworks */,
+				933434A62FBB5F7F00573F2D /* WiresKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -78,6 +90,7 @@
 				933101402FB64F0600DC7CA4 /* Wires */,
 				933101502FB64F0700DC7CA4 /* WiresTests */,
 				9331015A2FB64F0700DC7CA4 /* WiresUITests */,
+				933101A12FBAB80300DC7CA4 /* Frameworks */,
 				9331013F2FB64F0600DC7CA4 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -90,6 +103,16 @@
 				933101572FB64F0700DC7CA4 /* WiresUITests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		933101A12FBAB80300DC7CA4 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				933434A92FBB65B900573F2D /* SystemConfiguration.framework */,
+				933101A42FBB5E2200DC7CA4 /* Package.swift */,
+				933101A22FBAB80300DC7CA4 /* WiresKit */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -112,6 +135,8 @@
 			);
 			name = Wires;
 			packageProductDependencies = (
+				933434A52FBB5F7F00573F2D /* WiresKit */,
+				933434A72FBB5F7F00573F2D /* ComposableArchitecture */,
 			);
 			productName = Wires;
 			productReference = 9331013E2FB64F0600DC7CA4 /* Wires.app */;
@@ -195,6 +220,11 @@
 			);
 			mainGroup = 933101352FB64F0600DC7CA4;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				933101A02FBAB7D800DC7CA4 /* XCRemoteSwiftPackageReference "swift-composable-architecture" */,
+				933101A32FBAB85800DC7CA4 /* XCRemoteSwiftPackageReference "swift-snapshot-testing" */,
+				933101A52FBB5F1C00DC7CA4 /* XCLocalSwiftPackageReference "WiresKit" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 9331013F2FB64F0600DC7CA4 /* Products */;
 			projectDirPath = "";
@@ -418,13 +448,14 @@
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TARGETED_DEVICE_FAMILY = "1,2";
 				XROS_DEPLOYMENT_TARGET = 26.4;
 			};
 			name = Debug;
@@ -462,13 +493,14 @@
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TARGETED_DEVICE_FAMILY = "1,2";
 				XROS_DEPLOYMENT_TARGET = 26.4;
 			};
 			name = Release;
@@ -615,6 +647,44 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		933101A52FBB5F1C00DC7CA4 /* XCLocalSwiftPackageReference "WiresKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = WiresKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		933101A02FBAB7D800DC7CA4 /* XCRemoteSwiftPackageReference "swift-composable-architecture" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pointfreeco/swift-composable-architecture";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.25.5;
+			};
+		};
+		933101A32FBAB85800DC7CA4 /* XCRemoteSwiftPackageReference "swift-snapshot-testing" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pointfreeco/swift-snapshot-testing";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.19.2;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		933434A52FBB5F7F00573F2D /* WiresKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = WiresKit;
+		};
+		933434A72FBB5F7F00573F2D /* ComposableArchitecture */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 933101A02FBAB7D800DC7CA4 /* XCRemoteSwiftPackageReference "swift-composable-architecture" */;
+			productName = ComposableArchitecture;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 933101362FB64F0600DC7CA4 /* Project object */;
 }
