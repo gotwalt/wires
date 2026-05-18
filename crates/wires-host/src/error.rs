@@ -87,6 +87,31 @@ pub enum HostError {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Failed to bind ticket-http listener on {bind}: {source}, at {location}"))]
+    HttpBind {
+        bind: std::net::SocketAddr,
+        #[snafu(source)]
+        source: std::io::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("ticket-http server failed: {source}, at {location}"))]
+    HttpServe {
+        #[snafu(source)]
+        source: std::io::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Failed to render host-ticket SVG: {source}, at {location}"))]
+    QrSvg {
+        #[snafu(source)]
+        source: wires_net::NetError,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, HostError>;
