@@ -1,32 +1,14 @@
-//
-//  WiresApp.swift
-//  Wires
-//
-//  Created by Aaron Gotwalt on 5/14/26.
-//
-
 import SwiftUI
-import SwiftData
+import WiresKit
+import ComposableArchitecture
 
+/// Renamed from `WiresApp` to avoid clashing with `WiresKit.WiresApp`
+/// (the UniFFI-generated FFI class) within this module.
 @main
-struct WiresApp: App {
-    var sharedModelContainer: ModelContainer = {
-        let schema = Schema([
-            Item.self,
-        ])
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
-
-        do {
-            return try ModelContainer(for: schema, configurations: [modelConfiguration])
-        } catch {
-            fatalError("Could not create ModelContainer: \(error)")
-        }
-    }()
-
+struct WiresIOSApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            Text("WiresKit + TCA loaded")
         }
-        .modelContainer(sharedModelContainer)
     }
 }
