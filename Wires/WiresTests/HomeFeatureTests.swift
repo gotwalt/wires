@@ -30,8 +30,8 @@ struct HomeFeatureTests {
     func onAppear_populatesCapsFromStore() async {
         let cap = CapRecord(
             capIdHex: String(repeating: "11", count: 16),
-            agentPubkeyHex: String(repeating: "22", count: 32),
-            agentAlias: "chat-agent: Bob",
+            nodePubkeyHex: String(repeating: "22", count: 32),
+            nodeAlias: "chat-node: Bob",
             topicNames: ["home.notes"],
             rights: ["read", "write"],
             issuedAt: Date(timeIntervalSince1970: 1_700_000_000)
@@ -53,8 +53,8 @@ struct HomeFeatureTests {
             $0.caps = [
                 HomeFeature.CapSummary(
                     id: cap.capIdHex,
-                    agentPubkeyHex: cap.agentPubkeyHex,
-                    agentAlias: cap.agentAlias,
+                    nodePubkeyHex: cap.nodePubkeyHex,
+                    nodeAlias: cap.nodeAlias,
                     topicNames: cap.topicNames,
                     rights: cap.rights,
                     issuedAt: cap.issuedAt,
@@ -85,27 +85,27 @@ struct HomeFeatureTests {
     }
 
     @Test
-    func approveAgent_presentsEnrollmentSheet() async {
+    func approveNode_presentsEnrollmentSheet() async {
         let store = TestStore(
             initialState: HomeFeature.State(rootPubkeyHex: Self.pubkey)
         ) {
             HomeFeature()
         }
 
-        await store.send(.approveAgentTapped) {
-            $0.agentEnrollment = AgentEnrollmentFeature.State()
+        await store.send(.approveNodeTapped) {
+            $0.nodeEnrollment = NodeEnrollmentFeature.State()
         }
     }
 
     @Test
     func enrollmentDismiss_clearsSheet() async {
         var initial = HomeFeature.State(rootPubkeyHex: Self.pubkey)
-        initial.agentEnrollment = AgentEnrollmentFeature.State()
+        initial.nodeEnrollment = NodeEnrollmentFeature.State()
 
         let store = TestStore(initialState: initial) { HomeFeature() }
 
-        await store.send(.agentEnrollment(.presented(.dismissTapped))) {
-            $0.agentEnrollment = nil
+        await store.send(.nodeEnrollment(.presented(.dismissTapped))) {
+            $0.nodeEnrollment = nil
         }
     }
 }

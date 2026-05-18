@@ -4,8 +4,8 @@ import SwiftData
 @Model
 final class CapRecord {
     @Attribute(.unique) var capIdHex: String
-    var agentPubkeyHex: String
-    var agentAlias: String?
+    var nodePubkeyHex: String
+    var nodeAlias: String?
     var topicNames: [String]
     var rights: [String]
     var issuedAt: Date
@@ -14,8 +14,8 @@ final class CapRecord {
 
     init(
         capIdHex: String,
-        agentPubkeyHex: String,
-        agentAlias: String? = nil,
+        nodePubkeyHex: String,
+        nodeAlias: String? = nil,
         topicNames: [String] = [],
         rights: [String] = [],
         issuedAt: Date = .now,
@@ -23,8 +23,8 @@ final class CapRecord {
         revokedAt: Date? = nil
     ) {
         self.capIdHex = capIdHex
-        self.agentPubkeyHex = agentPubkeyHex
-        self.agentAlias = agentAlias
+        self.nodePubkeyHex = nodePubkeyHex
+        self.nodeAlias = nodeAlias
         self.topicNames = topicNames
         self.rights = rights
         self.issuedAt = issuedAt
