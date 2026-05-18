@@ -27,6 +27,12 @@ impl FromRef<ServiceState> for Arc<GatewayConfig> {
     }
 }
 
+impl FromRef<ServiceState> for Arc<SigningKey> {
+    fn from_ref(s: &ServiceState) -> Self {
+        Arc::clone(&s.signing_key)
+    }
+}
+
 pub fn app(state: ServiceState) -> Router {
     Router::new()
         .route("/_health", axum::routing::get(health))
@@ -38,6 +44,7 @@ pub fn app(state: ServiceState) -> Router {
             "/.well-known/oauth-authorization-server",
             axum::routing::get(crate::oauth::as_meta::handler),
         )
+        .route("/.well-known/jwks.json", axum::routing::get(crate::oauth::jwks::handler))
         .with_state(state)
 }
 
