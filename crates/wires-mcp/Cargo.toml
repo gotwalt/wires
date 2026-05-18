@@ -37,9 +37,9 @@ ed25519-dalek = { workspace = true }
 rand_core   = { workspace = true }
 qrcode      = { version = "0.14", default-features = false, features = ["svg"] }
 jsonwebtoken = "9"
-uuid        = { version = "1", features = ["v4", "serde"] }
+uuid        = { workspace = true }
 sha2        = "0.10"
-base64      = "0.22"
+base64      = { workspace = true }
 chrono      = { version = "0.4", default-features = false, features = ["clock"] }
 async-trait = "0.1"
 parking_lot = "0.12"
