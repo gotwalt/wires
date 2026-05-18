@@ -16,6 +16,7 @@ pub const MAX_FRAME_LEN: u32 = 64 * 1024;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TenantRequest {
     Register(TenantRegisterRequest),
+    Unregister(TenantUnregisterRequest),
     TopicRegister(TopicRegisterRequest),
     TopicUnregister(TopicUnregisterRequest),
     Status(TenantStatusRequest),
@@ -25,6 +26,7 @@ pub enum TenantRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TenantResponse {
     Register(TenantRegisterResponse),
+    Unregister(TenantUnregisterResponse),
     TopicRegister(TopicRegisterResponse),
     TopicUnregister(TopicUnregisterResponse),
     Status(TenantStatusResponse),
@@ -50,6 +52,26 @@ pub struct TenantRegisterResponse {
     pub server_time: i64,
     #[serde(with = "hex::serde")]
     pub caps_topic_id: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantUnregisterRequest {
+    pub version: u8,
+    #[serde(with = "hex::serde")]
+    pub root_pubkey: [u8; 32],
+    pub timestamp: i64,
+    #[serde(with = "hex::serde")]
+    pub nonce: [u8; 16],
+    #[serde(with = "hex::serde")]
+    pub signature: [u8; 64],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantUnregisterResponse {
+    pub ok: bool,
+    /// Number of topics that were removed from the topic_index as part of this
+    /// unregister. Zero when the tenant didn't exist or had no registered topics.
+    pub topics_removed: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +235,7 @@ use crate::framing::{read_frame, write_frame};
 /// lifecycle.
 pub trait TenantHandler: Send + Sync + 'static {
     fn handle_register(&self, req: TenantRegisterRequest) -> TenantResponse;
+    fn handle_unregister(&self, req: TenantUnregisterRequest) -> TenantResponse;
     fn handle_topic_register(&self, req: TopicRegisterRequest) -> TenantResponse;
     fn handle_topic_unregister(&self, req: TopicUnregisterRequest) -> TenantResponse;
     fn handle_status(&self, req: TenantStatusRequest) -> TenantResponse;
@@ -242,6 +265,7 @@ impl<H: TenantHandler> TenantProtocol<H> {
         let req: TenantRequest = read_frame(&mut recv, MAX_FRAME_LEN).await?;
         let resp = match req {
             TenantRequest::Register(r) => self.handler.handle_register(r),
+            TenantRequest::Unregister(r) => self.handler.handle_unregister(r),
             TenantRequest::TopicRegister(r) => self.handler.handle_topic_register(r),
             TenantRequest::TopicUnregister(r) => self.handler.handle_topic_unregister(r),
             TenantRequest::Status(r) => self.handler.handle_status(r),
@@ -500,6 +524,44 @@ mod tests {
     }
 
     #[test]
+    fn tenant_unregister_request_serde_roundtrip() {
+        let req = TenantRequest::Unregister(TenantUnregisterRequest {
+            version: 1,
+            root_pubkey: [1u8; 32],
+            timestamp: 99,
+            nonce: [9u8; 16],
+            signature: [3u8; 64],
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"type\":\"unregister\""), "tag missing: {json}");
+        let back: TenantRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            TenantRequest::Unregister(r) => {
+                assert_eq!(r.timestamp, 99);
+                assert_eq!(r.root_pubkey, [1u8; 32]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn tenant_unregister_response_serde_roundtrip() {
+        let resp = TenantResponse::Unregister(TenantUnregisterResponse {
+            ok: true,
+            topics_removed: 3,
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: TenantResponse = serde_json::from_str(&json).unwrap();
+        match back {
+            TenantResponse::Unregister(r) => {
+                assert!(r.ok);
+                assert_eq!(r.topics_removed, 3);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn signing_bytes_distinguishes_tenant_unregister_from_other_no_topic_ops() {
         let r = signing_bytes(TenantOp::Register, &[1u8; 32], 1, &[2u8; 16], &[3u8; 32]);
         let s = signing_bytes(TenantOp::Status, &[1u8; 32], 1, &[2u8; 16], &[3u8; 32]);
@@ -535,6 +597,9 @@ mod tests {
                     server_time: self.now,
                     caps_topic_id: [9u8; 32],
                 })
+            }
+            fn handle_unregister(&self, _r: TenantUnregisterRequest) -> TenantResponse {
+                unreachable!()
             }
             fn handle_topic_register(&self, _r: TopicRegisterRequest) -> TenantResponse {
                 unreachable!()
@@ -591,6 +656,9 @@ mod tests {
         }
         impl TenantHandler for Acc {
             fn handle_register(&self, _r: TenantRegisterRequest) -> TenantResponse {
+                unreachable!()
+            }
+            fn handle_unregister(&self, _r: TenantUnregisterRequest) -> TenantResponse {
                 unreachable!()
             }
             fn handle_topic_register(&self, req: TopicRegisterRequest) -> TenantResponse {
