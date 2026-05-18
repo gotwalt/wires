@@ -16,7 +16,7 @@ pub use config::{HostConfig, NodeConfig, load_root_signing_key};
 pub use error::{NodeError, Result};
 pub use inbound::{Inbound, InboundCtx, process as process_inbound};
 pub use net_glue::NetGlue;
-pub use node::{DecryptedEvent, Node};
+pub use node::{DecryptedEvent, DecryptedMessage, Node};
 pub use pair::{
     InstallOutcome, NodePairHandler, PairListenArgs, PairListenStarted, PairOutcome, install_grant,
     pair_listen,

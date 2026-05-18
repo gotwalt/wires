@@ -46,6 +46,14 @@ pub struct DecryptedEvent {
     pub content: Option<CanonicalContent>,
 }
 
+/// A decrypted message returned by `Node::read_decrypted_since` for cursor-based
+/// pagination (used by the MCP gateway's `wires.tail` tool).
+#[derive(Debug, Clone)]
+pub struct DecryptedMessage {
+    pub envelope: WireMessage,
+    pub content: Option<CanonicalContent>,
+}
+
 impl Node {
     pub fn open(config: NodeConfig) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir).context(IoSnafu)?;
@@ -158,6 +166,59 @@ impl Node {
 
     pub fn subscribe(&self) -> broadcast::Receiver<DecryptedEvent> {
         self.events_tx.subscribe()
+    }
+
+    /// Read all decrypted messages from `topic_id` that are strictly after the
+    /// per-sender high-water marks in `hwm` (sender_hex → last seen seq).
+    /// Returns up to `limit` messages sorted by (timestamp, sender, seq).
+    ///
+    /// This is the "tail" surface used by the MCP gateway. The hwm map starts
+    /// empty (meaning "from genesis") and is advanced by the caller via the
+    /// returned cursor after each call.
+    pub fn read_decrypted_since(
+        &self,
+        topic_id: &[u8; 32],
+        hwm: &std::collections::HashMap<String, (u64, String)>,
+        limit: usize,
+    ) -> Result<Vec<DecryptedMessage>> {
+        let log = self.logs.get_or_open(topic_id)?;
+        // Collect all senders with messages in this log.
+        let all_msgs = log.read_all().context(StoreSnafu)?;
+        // Group by sender; apply hwm filter.
+        let mut by_sender: std::collections::HashMap<[u8; 32], Vec<WireMessage>> =
+            std::collections::HashMap::new();
+        for msg in all_msgs {
+            let after_seq = hwm
+                .get(&hex::encode(msg.sender))
+                .map(|(seq, _)| *seq);
+            let include = match after_seq {
+                None => true,
+                Some(last) => msg.seq > last,
+            };
+            if include {
+                by_sender.entry(msg.sender).or_default().push(msg);
+            }
+        }
+        // Flatten and sort by (timestamp, sender, seq).
+        let mut flat: Vec<WireMessage> = by_sender.into_values().flatten().collect();
+        flat.sort_by(|a, b| {
+            a.timestamp
+                .cmp(&b.timestamp)
+                .then(a.sender.cmp(&b.sender))
+                .then(a.seq.cmp(&b.seq))
+        });
+        flat.truncate(limit);
+        // Decrypt each message.
+        let mut out = Vec::with_capacity(flat.len());
+        for msg in flat {
+            let outcome = self.handle_inbound(msg.clone())?;
+            let content = match outcome {
+                crate::inbound::Inbound::Accepted { content, .. } => content,
+                _ => None,
+            };
+            out.push(DecryptedMessage { envelope: msg, content });
+        }
+        Ok(out)
     }
 
     pub fn install_epoch_key(&self, topic_id: [u8; 32], epoch: u32, key: EpochKey) -> Result<()> {
