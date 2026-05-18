@@ -61,6 +61,14 @@ struct AppFeature {
                 state = .home(HomeFeature.State(rootPubkeyHex: rootPubkeyHex))
                 return .none
 
+            case .home(.didReset):
+                // Home wiped the local + remote state. Drop back to
+                // .launching and re-run onAppear so prepareWiresApp
+                // regenerates keys against the empty Keychain and routes
+                // us back through bootstrap.
+                state = .launching
+                return .send(.onAppear)
+
             case .bootstrap, .home:
                 return .none
             }
