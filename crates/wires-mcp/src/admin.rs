@@ -16,6 +16,24 @@ pub fn load_config(path: &Path) -> Result<GatewayConfig> {
     })
 }
 
+pub fn user_delete(cfg: &GatewayConfig, root_pubkey_hex: &str) -> Result<()> {
+    let store = Store::open(&cfg.gateway_db_path())?;
+    let removed = store.delete_user(root_pubkey_hex)?;
+    let n_tokens = store.revoke_refresh_tokens_for_sub(root_pubkey_hex)?;
+    let user_dir = cfg.users_dir().join(root_pubkey_hex);
+    let dir_removed = if user_dir.exists() {
+        std::fs::remove_dir_all(&user_dir).context(IoSnafu)?;
+        true
+    } else {
+        false
+    };
+    println!(
+        "user-delete root={} user_row_removed={} dir_removed={} refresh_tokens_revoked={}",
+        root_pubkey_hex, removed, dir_removed, n_tokens
+    );
+    Ok(())
+}
+
 pub fn user_list(cfg: &GatewayConfig) -> Result<()> {
     let store = Store::open(&cfg.gateway_db_path())?;
     let users = store.list_users()?;
@@ -71,5 +89,44 @@ mod tests {
         // Re-open to verify the row is still there.
         let store2 = Store::open(&cfg.gateway_db_path()).unwrap();
         assert_eq!(store2.list_users().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn user_delete_removes_users_dir_and_refresh_tokens() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = GatewayConfig {
+            public_url: "https://mcp.example.com".into(),
+            bind: "127.0.0.1:0".into(),
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let sub = "cd".repeat(32);
+        {
+            let store = Store::open(&cfg.gateway_db_path()).unwrap();
+            store.put_user(&UserRecord {
+                root_pubkey_hex: sub.clone(),
+                data_dir: "x".into(),
+                created_at_ms: 0,
+                last_seen_ms: 0,
+            }).unwrap();
+            store.put_refresh_token(&crate::store::RefreshTokenRecord {
+                token_hash_hex: "h1".into(),
+                sub: sub.clone(),
+                client_id: "c".into(),
+                issued_at_ms: 0,
+                expires_ms: i64::MAX,
+                rotated_to_hash_hex: None,
+            }).unwrap();
+        }
+        let user_dir = cfg.users_dir().join(&sub);
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::write(user_dir.join("config.toml"), "x").unwrap();
+
+        user_delete(&cfg, &sub).unwrap();
+        assert!(!user_dir.exists());
+
+        // Re-open to verify rows were deleted.
+        let store2 = Store::open(&cfg.gateway_db_path()).unwrap();
+        assert!(store2.get_user(&sub).unwrap().is_none());
+        assert!(store2.get_refresh_token("h1").unwrap().is_none());
     }
 }
