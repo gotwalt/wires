@@ -63,7 +63,7 @@ pub fn verify(
     token: &str,
     now_s: i64,
 ) -> Result<Claims> {
-    let key = DecodingKey::from_ed_der(&ed_spki_der(vk));
+    let key = DecodingKey::from_ed_der(&ed_pubkey_bytes(vk));
     let mut validation = Validation::new(Algorithm::EdDSA);
     validation.set_audience(&[expected_aud]);
     validation.set_issuer(&[expected_iss]);
@@ -114,10 +114,8 @@ fn ed_pkcs8_der(sk: &SigningKey) -> Vec<u8> {
     out
 }
 
-fn ed_spki_der(vk: &VerifyingKey) -> Vec<u8> {
-    // ring's ED25519 UnparsedPublicKey::verify expects raw 32-byte pubkey,
-    // not a SPKI DER wrapper. DecodingKey::from_ed_der passes bytes straight
-    // through to ring, so we return only the raw key bytes.
+// jsonwebtoken's Ed25519 path expects raw 32-byte pubkeys.
+fn ed_pubkey_bytes(vk: &VerifyingKey) -> Vec<u8> {
     vk.to_bytes().to_vec()
 }
 
