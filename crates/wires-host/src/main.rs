@@ -65,7 +65,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(build_env_filter())
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
@@ -148,12 +148,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let msg: WireMessage = match serde_json::from_slice(&bytes) {
                                 Ok(m) => m,
                                 Err(e) => {
-                                    tracing::warn!(error = %e, "bad gossip frame");
+                                    tracing::debug!(error = %e, "bad gossip frame");
                                     return;
                                 }
                             };
                             if wires_core::verify_envelope(&msg).is_err() {
-                                tracing::warn!("dropped unsigned/bad envelope at host");
+                                tracing::debug!("dropped unsigned/bad envelope at host");
                                 return;
                             }
                             if let Err(e) = router_state.route(&msg) {
@@ -190,6 +190,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         on_topic_unregistered: Arc::new(|_root, _topic| {
             // v1: subscription stays live; future spec adds a teardown signal.
+        }),
+        on_tenant_unregistered: Arc::new(|_root, _topics| {
+            // v1: filesystem eviction handled by retention; no extra teardown needed.
         }),
     });
 
@@ -240,6 +243,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Build the tracing filter. Library internals (iroh, quinn, hyper, …) are
+/// pinned at WARN even when the user raises the global level via RUST_LOG, so
+/// `wires-host` stays focused on its own logs. Per-target directives in
+/// RUST_LOG still override these defaults (e.g. `RUST_LOG=iroh=debug` works).
+fn build_env_filter() -> tracing_subscriber::EnvFilter {
+    const QUIET_LIBS: &str = "iroh=warn,iroh_gossip=warn,iroh_relay=warn,\
+        iroh_quinn=warn,iroh_quinn_proto=warn,iroh_quinn_udp=warn,\
+        iroh_base=warn,iroh_metrics=warn,iroh_net_report=warn,\
+        iroh_dns_node=warn,pkarr=warn,mainline=warn,swarm_discovery=warn,\
+        quinn=warn,quinn_proto=warn,quinn_udp=warn,\
+        noq=warn,noq_proto=warn,noq_udp=warn,\
+        h2=warn,hyper=warn,hyper_util=warn,tower=warn,tower_http=warn,\
+        reqwest=warn,rustls=warn,\
+        hickory_net=warn,hickory_proto=warn,hickory_resolver=warn,\
+        trust_dns_proto=warn,igd_next=warn,netwatch=warn,portmapper=warn";
+    let user = std::env::var("RUST_LOG")
+        .unwrap_or_else(|_| "warn,wires_host=info,wires_net=info,wires_node=info".to_string());
+    tracing_subscriber::EnvFilter::new(format!("{QUIET_LIBS},{user}"))
 }
 
 async fn run_ticket_subcommand(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
