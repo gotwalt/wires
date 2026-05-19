@@ -1,38 +1,37 @@
 #!/usr/bin/env bash
-# docker/funnel.sh — manage the Tailscale Funnel for wires-host's ticket page.
+# docker/funnel.sh — manage Tailscale Funnel mappings for wires services.
 #
 # Run on the deploy host. Tailscale must already be installed, logged in,
 # and granted Funnel permission in the tailnet admin panel.
 set -euo pipefail
 
-# Local listen port: where wires-host's ticket HTTP server binds inside the
-# host's network namespace. Defaults to 10000 to match the wires-* port
-# convention (10000+ reserved for wires services).
-PORT="${WIRES_HOST_HTTP_PORT:-10000}"
-
-# Tailscale Funnel public port. Funnel only supports three values: 443, 8443,
-# 10000. Default to 10000 — :443 is most often already in use on a shared
-# host, and 8443 collides with default `tailscale serve` setups. Override
-# via WIRES_FUNNEL_HTTPS_PORT if your environment frees one of the others.
-FUNNEL_PORT="${WIRES_FUNNEL_HTTPS_PORT:-10000}"
-
-# Path on the Funnel hostname under which the ticket page is served.
-FUNNEL_PATH="${WIRES_FUNNEL_PATH:-/}"
+# Service catalog. Add an entry per wires service that needs Funnel.
+# Format (space-separated): <name> <funnel_https_port> <local_port> <funnel_path>
+# Funnel public port must be one of 443, 8443, 10000 (Tailscale's only
+# Funnel-supported public ports).
+SERVICES=(
+  "host  10000  10000  /"
+  "mcp     443  10001  /"
+)
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") <up|down|status>
+Usage: $(basename "$0") <up|down|status> [host|mcp|all]
 
-  up      Publish http://127.0.0.1:$PORT via Tailscale Funnel on :$FUNNEL_PORT$FUNNEL_PATH.
-  down    Remove just the wires-host Funnel mapping ( :$FUNNEL_PORT$FUNNEL_PATH ).
-  status  Print current serve/funnel configuration.
+  up [name]     Publish service(s) via Tailscale Funnel.
+                Default: all.
+  down [name]   Remove service(s)' Funnel mapping. Targeted — leaves
+                other Funnel rules on this node untouched.
+                Default: all.
+  status        Print current serve/funnel configuration.
 
-Environment:
-  WIRES_HOST_HTTP_PORT    Local port wires-host listens on (default: 10000).
-  WIRES_FUNNEL_HTTPS_PORT Tailscale Funnel public port: 443, 8443, or 10000
-                          (default: 10000).
-  WIRES_FUNNEL_PATH       Path under the Funnel hostname (default: /).
+Services:
 EOF
+  for row in "${SERVICES[@]}"; do
+    # shellcheck disable=SC2086
+    set -- $row
+    printf "  %-6s Funnel :%s%s -> 127.0.0.1:%s\n" "$1" "$2" "$4" "$3"
+  done
 }
 
 require_tailscale() {
@@ -46,18 +45,38 @@ require_tailscale() {
   fi
 }
 
+apply() {
+  local action="$1" target="$2"
+  local matched=0
+  for row in "${SERVICES[@]}"; do
+    # shellcheck disable=SC2086
+    set -- $row
+    local svc="$1" fport="$2" lport="$3" fpath="$4"
+    if [[ "$target" != "all" && "$target" != "$svc" ]]; then
+      continue
+    fi
+    matched=1
+    case "$action" in
+      up)
+        sudo tailscale funnel --bg --https="$fport" --set-path="$fpath" \
+          "http://127.0.0.1:$lport"
+        ;;
+      down)
+        sudo tailscale funnel --https="$fport" --set-path="$fpath" off
+        ;;
+    esac
+  done
+  if [[ "$matched" -eq 0 ]]; then
+    echo "unknown service: $target (known: $(printf "%s " "${SERVICES[@]%% *}" | sed 's/ $//'), all)" >&2
+    exit 64
+  fi
+}
+
 case "${1:-}" in
-  up)
+  up|down)
     require_tailscale
-    sudo tailscale funnel --bg --https="$FUNNEL_PORT" --set-path="$FUNNEL_PATH" \
-      "http://127.0.0.1:$PORT"
-    sudo tailscale funnel status
-    ;;
-  down)
-    require_tailscale
-    # Targeted removal: only this script's (port, path) mapping. Other
-    # Funnel/serve mappings on this node are left untouched.
-    sudo tailscale funnel --https="$FUNNEL_PORT" --set-path="$FUNNEL_PATH" off
+    apply "$1" "${2:-all}"
+    tailscale funnel status
     ;;
   status)
     require_tailscale
