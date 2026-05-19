@@ -34,7 +34,7 @@ operators use the base64 ticket to pair against this host.
 ```bash
 ./docker/deploy.sh                  # pulls, rebuilds, recreates, verifies
 ./docker/deploy.sh --no-pull        # deploy uncommitted local changes
-./docker/deploy.sh --no-verify      # skip the HTTP healthcheck poll
+./docker/deploy.sh --no-verify      # skip the HTTP healthcheck poll (e.g. when running with `--no-http`)
 ```
 
 The named volume `wires-host-data` carries `iroh.secret` and all tenant

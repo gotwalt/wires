@@ -65,9 +65,9 @@ Emits `recipe.json` describing every workspace dependency. Source files are not 
 ```
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release -p wires-host --recipe-path recipe.json
+RUN cargo chef cook --release --locked -p wires-host --recipe-path recipe.json
 COPY . .
-RUN cargo build --release -p wires-host
+RUN cargo build --release --locked -p wires-host
 ```
 
 The two-step `cook` then `COPY . .` is the load-bearing detail: `cargo chef cook` builds only the dependencies, so changing any non-dep source file (everything in `crates/`) reuses the cached deps layer instead of recompiling iroh.
@@ -228,7 +228,7 @@ usage() {
 Usage: $(basename "$0") <up|down|status>
 
   up      Publish http://127.0.0.1:$PORT via Tailscale Funnel on :443.
-  down    Tear down the Funnel mapping on :443.
+  down    Tear down all Funnel mappings on this node.
   status  Print current serve/funnel configuration.
 
 Environment:
