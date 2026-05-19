@@ -122,6 +122,55 @@ tenants/
     ingest_<root_hex>.redb     per-tenant FIFO eviction index (ingest_ts + size)
 ```
 
+## Deployment
+
+**This is a temporary deploy story.** Docker Compose + Tailscale Funnel is
+a placeholder we picked so we could dogfood the gateway against a real
+public HTTPS URL. The eventual alpha hosting target hasn't been chosen
+yet — don't invest in deep automation around this stack. If a future
+conversation looks like it's heading toward "let's harden this for
+production," push back and clarify the target first.
+
+The reference deploy host is `workbench` (a Tailscale node). The full
+runbook lives in `docker/README.md` — load that file before touching deploy
+plumbing. Quick orientation:
+
+- **Two services, one Compose stack.** `docker/compose.yaml` builds
+  `wires-host` and `wires-mcp` from a single multi-stage `docker/Dockerfile`
+  and runs both with `network_mode: host`. State is in named volumes
+  (`wires-host-data`, `wires-mcp-data`) — destroying them rotates the
+  iroh `EndpointId` and the gateway's JWT signing key, so don't.
+- **127.0.0.1 binds only.** Tailscale Funnel listens on the node's Tailnet
+  IP for the public port, so the matching container must bind localhost or
+  it will `AddrInUse`. `wires-host` is overridden to `--http-bind
+  127.0.0.1:10000`; `wires-mcp` reads `bind = "127.0.0.1:10001"` from
+  `docker/wires-mcp.toml` (operator-edited, mounted read-only).
+- **Funnel slots.** Tailscale Funnel exposes only `443`, `8443`, `10000`
+  publicly. Current assignments:
+
+  | Local | Service | Funnel public |
+  |---|---|---|
+  | `127.0.0.1:10000` | wires-host ticket | Funnel `:10000` |
+  | `127.0.0.1:10001` | wires-mcp OAuth + MCP | Funnel `:443` |
+  | `127.0.0.1:10002+` | future wires-* services | tbd |
+
+  The `SERVICES` array at the top of `docker/funnel.sh` is the single
+  source of truth. Adding a third wires-* service means stealing a Funnel
+  slot from another tenant on the node or sharing one via sub-paths.
+- **Deploy command.** `./docker/deploy.sh` does `git pull --ff-only`,
+  `docker compose build`, `docker compose up -d`, then polls `:10000/` and
+  `:10001/_health`. `--no-pull` skips the pull; `--no-verify` skips the
+  polls. Subsequent rollouts from the dev machine:
+  `git push origin main && ssh workbench 'bash -lc "cd ~/src/wires && ./docker/deploy.sh"'`.
+- **`docker/wires-mcp.toml`** is gitignored. First deploy on a new host
+  must `cp docker/wires-mcp.toml.example docker/wires-mcp.toml` and edit
+  `public_url` to the Funnel hostname before `deploy.sh` will succeed.
+  Changing `public_url` later invalidates every outstanding JWT (the
+  string is the OAuth issuer baked into tokens).
+- **Hostname detection when invoking deploys.** If `hostname == workbench`,
+  skip the `ssh workbench` wrapper and run `./docker/deploy.sh` directly —
+  ssh-from-workbench-to-workbench works but is wasteful.
+
 ## When working in this repo
 
 - Don't invent a CLAUDE/AGENTS-side convention layer over snafu. The error pattern in `crates/*/src/error.rs` is canonical.
