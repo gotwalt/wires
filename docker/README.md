@@ -21,20 +21,50 @@ Then:
 ```bash
 git clone <repo-url> ~/src/wires
 cd ~/src/wires
-./docker/deploy.sh                  # builds, starts, prints the ticket
-./docker/funnel.sh up               # publishes the ticket page on :443
+
+# 1. Seed the wires-mcp config (one-time per host).
+cp docker/wires-mcp.toml.example docker/wires-mcp.toml
+${EDITOR:-nano} docker/wires-mcp.toml   # edit public_url to your Funnel hostname
+
+# 2. Build and start both services. Polls /:10000 (wires-host) and /_health
+#    (wires-mcp) to confirm both are up.
+./docker/deploy.sh
+
+# 3. Publish both services via Tailscale Funnel.
+./docker/funnel.sh up all
 ```
 
-The Funnel URL is printed by `funnel.sh up` (look for the line under
-`Funnel on:`). Visiting it returns the host's ticket page; agents and
-operators use the base64 ticket to pair against this host.
+The Funnel URLs are printed by `funnel.sh`. wires-host's ticket page is at
+`https://<workbench>:10000/`; wires-mcp's OAuth surface is at
+`https://<workbench>/` (Funnel `:443`, no port in the URL).
+
+> **Reclamation warning:** `funnel.sh up all` overwrites any prior `:443`
+> Funnel mapping on this node. If something else was on `:443`, it loses
+> its public Funnel exposure. Run `tailscale funnel status` first to see
+> what's there.
+
+### Port convention
+
+| Local listen | Service | Funnel public |
+|---|---|---|
+| `127.0.0.1:10000` | wires-host ticket | Funnel `:10000` |
+| `127.0.0.1:10001` | wires-mcp (HTTPS via Funnel) | Funnel `:443` |
+| `127.0.0.1:10002+` | reserved for future wires-* services | tbd |
+
+Both services share `network_mode: host`, so the local ports above are
+ports on the deploy host itself; pick non-conflicting locals when adding
+new services. Tailscale Funnel is independently limited to three public
+ports — `443`, `8443`, `10000` — so adding a third wires service means
+either sharing one of those slots via a sub-path or moving an existing
+mapping. The `SERVICES` array at the top of `docker/funnel.sh` is the
+single source of truth for which wires service holds which Funnel slot.
 
 ## Subsequent rollouts
 
 ```bash
 ./docker/deploy.sh                  # pulls, rebuilds, recreates, verifies
 ./docker/deploy.sh --no-pull        # deploy uncommitted local changes
-./docker/deploy.sh --no-verify      # skip the HTTP healthcheck poll (e.g. when running with `--no-http`)
+./docker/deploy.sh --no-verify      # skip the HTTP healthcheck polls on :10000 and :10001
 ```
 
 The named volume `wires-host-data` carries `iroh.secret` and all tenant
@@ -76,6 +106,21 @@ docker run --rm \
   tar -C /src -czf "/out/wires-host-$(date +%F).tgz" .
 ```
 
+Same recipe for wires-mcp:
+
+```bash
+docker run --rm \
+  -v wires-mcp-data:/src \
+  -v "$PWD:/out" \
+  debian:bookworm-slim \
+  tar -C /src -czf "/out/wires-mcp-$(date +%F).tgz" .
+```
+
+The wires-mcp volume holds the JWT signing key (`token_signing.ed25519`),
+gateway OAuth state (`gateway.redb`), and per-user wires agent data
+(`users/<root>/`). Treat its backups as security-sensitive — anyone with
+the signing key can mint valid wires-mcp JWTs.
+
 Restore the same tarball into a fresh volume:
 
 ```bash
@@ -92,24 +137,43 @@ After restoring, `./docker/deploy.sh` to start against the restored state.
 ## Tailscale Funnel
 
 ```bash
-./docker/funnel.sh up      # publish :8089 on Funnel :443
-./docker/funnel.sh status  # see current mapping
-./docker/funnel.sh down    # remove all Funnel mappings on this node
+./docker/funnel.sh up all   # publish all wires services (host + mcp)
+./docker/funnel.sh up host  # just wires-host (Funnel :10000)
+./docker/funnel.sh up mcp   # just wires-mcp  (Funnel :443)
+./docker/funnel.sh status   # see current mappings
+./docker/funnel.sh down mcp # remove only the wires-mcp mapping; host stays up
+./docker/funnel.sh down all # remove every wires-* Funnel mapping on this node
 ```
 
 The script wraps `tailscale funnel`; it does not manage admin-policy
 permissions or HTTPS cert provisioning, both of which are tailnet-wide
 toggles done once in the Tailscale admin panel.
 
+Funnel slot assignments are baked into the script's `SERVICES` catalog at
+the top of `docker/funnel.sh`. Adding a third wires-* service later means
+adding one line to that array. Tailscale Funnel itself supports only three
+public ports — `443`, `8443`, `10000` — so adding services means either
+sharing a port via sub-paths or moving an existing service.
+
 ## Troubleshooting
 
 - **`Cannot connect to the Docker daemon`** — start Docker (or your VM
   runtime). `deploy.sh` cannot continue without it.
-- **Ticket HTTP poll times out** — check `docker compose logs wires-host`
-  for a bind error on `0.0.0.0:8089` (another process is using the port)
+- **`wires-host` poll times out** — check `docker compose logs wires-host`
+  for a bind error on `0.0.0.0:10000` (another process is using the port)
   or an iroh endpoint failure.
-- **Funnel URL returns 502** — the container is down, or its HTTP server
-  was disabled. Confirm with `curl http://127.0.0.1:8089/` on the host.
+- **`wires-mcp` poll times out** — check `docker compose logs wires-mcp`
+  for a bind error on the address in `wires-mcp.toml`, or a TOML parse
+  error if `public_url` was edited incorrectly.
+- **`docker/wires-mcp.toml is missing`** — first-deploy step skipped.
+  `cp docker/wires-mcp.toml.example docker/wires-mcp.toml`, edit
+  `public_url`, re-run `./docker/deploy.sh`.
+- **Funnel URL returns 502** — the matching container is down. Confirm
+  with `curl http://127.0.0.1:10000/` (wires-host) or
+  `curl http://127.0.0.1:10001/_health` (wires-mcp).
+- **wires-mcp public_url changed; clients see 401/invalid issuer** — the
+  TOML's `public_url` is part of every issued JWT. If you change it, all
+  outstanding tokens become invalid; clients must re-authorize.
 - **EndpointId changed after redeploy** — the named volume was destroyed.
   Restore from backup if available; otherwise every paired tenant must
   re-pair against the new ticket.

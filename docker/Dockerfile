@@ -13,21 +13,37 @@ RUN cargo chef prepare --recipe-path recipe.json
 # --- builder: pre-builds deps from the recipe, then builds wires-host ------
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
-# Cook only the deps required by wires-host; this layer is cached as long
-# as recipe.json is unchanged (i.e. workspace deps haven't shifted).
-RUN cargo chef cook --release --locked -p wires-host --recipe-path recipe.json
+# Cook the union of deps required by wires-host and wires-mcp; the cached
+# layer is invalidated only when recipe.json changes (i.e. workspace deps
+# shift), not on source-only edits to either binary.
+RUN cargo chef cook --release --locked \
+    -p wires-host -p wires-mcp --recipe-path recipe.json
 COPY . .
-RUN cargo build --release --locked -p wires-host
+# Single `cargo build` invocation so both binaries share the same workspace
+# crate cache; two separate invocations would recompile every shared crate
+# (wires-core, wires-crypto, wires-store, wires-net, wires-node) twice.
+RUN cargo build --release --locked -p wires-host -p wires-mcp
 
-# --- runtime: minimal Debian with the binary and a non-root user -----------
-FROM debian:bookworm-slim AS runtime
+# Shared runtime base: debian-slim, ca-certificates, non-root `wires` user.
+# Both runtime-host and runtime-mcp build on top of this to avoid duplication.
+FROM debian:bookworm-slim AS runtime-base
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 --create-home --home-dir /data --shell /usr/sbin/nologin wires
-COPY --from=builder /app/target/release/wires-host /usr/local/bin/wires-host
 USER wires
 WORKDIR /data
-EXPOSE 8089/tcp
+
+# Final image for wires-host. Compose selects this with `build.target: runtime-host`.
+FROM runtime-base AS runtime-host
+COPY --from=builder /app/target/release/wires-host /usr/local/bin/wires-host
+EXPOSE 10000/tcp
 ENTRYPOINT ["wires-host"]
 CMD ["--data-dir", "/data"]
+
+# Final image for wires-mcp. Compose selects this with `build.target: runtime-mcp`.
+FROM runtime-base AS runtime-mcp
+COPY --from=builder /app/target/release/wires-mcp /usr/local/bin/wires-mcp
+EXPOSE 10001/tcp
+ENTRYPOINT ["wires-mcp"]
+CMD ["serve"]
