@@ -139,6 +139,22 @@ impl Node {
             keying: KeyingMaterial::StandardEpochKey(&epoch_key),
         })?;
         log.append(&msg).context(StoreSnafu)?;
+        if let (Some(ix), Some(_)) = (&self.ingest_index, &self.retention) {
+            let bytes = serde_json::to_vec(&msg).context(crate::error::SerdeSnafu)?.len() as u32;
+            let now = wires_net::unix_now_ms();
+            ix.record(
+                &wires_store::IngestEntry {
+                    topic_id,
+                    sender: self.ed_sk.verifying_key().to_bytes(),
+                    seq: msg.seq,
+                    bytes,
+                    ingested_at_ms: now,
+                },
+                now,
+            )
+            .context(StoreSnafu)?;
+            self.sweep(now)?;
+        }
         let _ = self.events_tx.send(DecryptedEvent {
             topic_id,
             msg: msg.clone(),
@@ -161,6 +177,7 @@ impl Node {
         let outcome = process(&ctx, msg.clone())?;
         match &outcome {
             Inbound::Accepted { msg, content } => {
+                self.record_and_sweep(msg)?;
                 let _ = self.events_tx.send(DecryptedEvent {
                     topic_id: msg.topic_id,
                     msg: msg.clone(),
@@ -168,6 +185,7 @@ impl Node {
                 });
             }
             Inbound::AcceptedOpaque { msg } => {
+                self.record_and_sweep(msg)?;
                 let _ = self.events_tx.send(DecryptedEvent {
                     topic_id: msg.topic_id,
                     msg: msg.clone(),
@@ -290,6 +308,27 @@ impl Node {
         let log = self.logs.get_or_open(&e.topic_id)?;
         log.delete(&e.sender, e.seq).context(StoreSnafu)?;
         Ok(())
+    }
+
+    fn record_and_sweep(&self, msg: &wires_core::WireMessage) -> Result<()> {
+        let Some(ix) = &self.ingest_index else { return Ok(()); };
+        if self.retention.is_none() {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(msg).context(crate::error::SerdeSnafu)?.len() as u32;
+        let now = wires_net::unix_now_ms();
+        ix.record(
+            &wires_store::IngestEntry {
+                topic_id: msg.topic_id,
+                sender: msg.sender,
+                seq: msg.seq,
+                bytes,
+                ingested_at_ms: now,
+            },
+            now,
+        )
+        .context(StoreSnafu)?;
+        self.sweep(now)
     }
 }
 
@@ -561,6 +600,107 @@ mod tests {
         node.install_epoch_key([1u8; 32], 0, [7u8; 32]).unwrap();
         let keys = node.epoch_keys_for(&[1u8; 32]).unwrap();
         assert_eq!(keys.get(0).unwrap().unwrap(), [7u8; 32]);
+    }
+
+    #[test]
+    fn publish_records_and_sweep_evicts_after_ttl_lapse() {
+        use std::time::Duration;
+        let tmp = TempDir::new().unwrap();
+        let root = SigningKey::generate(&mut OsRng);
+        let root_hex = hex::encode(root.verifying_key().to_bytes());
+        let cfg = NodeConfig {
+            data_dir: tmp.path().to_path_buf(),
+            root_pubkey_hex: root_hex,
+            host: None,
+            retention: Some(crate::config::RetentionPolicy {
+                ttl: Duration::from_millis(1),
+                max_bytes_per_user: 0,
+            }),
+        };
+        let node = Node::open(cfg).unwrap();
+
+        let sender_pk = node.ed_sk.verifying_key().to_bytes();
+        let mut cap = Capability::new_unsigned(
+            sender_pk,
+            vec!["home.test".into()],
+            vec![Right::Read, Right::Write],
+            0,
+            None,
+        );
+        cap.sign(&root).unwrap();
+        let cap_id = cap.cap_id.0;
+        node.caps.upsert_grant(&cap).unwrap();
+
+        let topic_id = [42u8; 32];
+        node.install_epoch_key(topic_id, 0, [9u8; 32]).unwrap();
+        node.publish_standard(
+            topic_id,
+            cap_id,
+            CanonicalContent::new("home.test", "hello"),
+        )
+        .unwrap();
+
+        let ix = node.ingest_index.as_ref().unwrap();
+        assert!(ix.total_bytes().unwrap() > 0, "publish must record an entry");
+
+        // Sleep past TTL, then call sweep — the entry must be evicted.
+        std::thread::sleep(Duration::from_millis(5));
+        node.sweep(wires_net::unix_now_ms()).unwrap();
+        assert_eq!(ix.total_bytes().unwrap(), 0, "TTL sweep must drop the entry");
+    }
+
+    #[test]
+    fn handle_inbound_records_into_ingest_index() {
+        // Construct a known-good envelope by publishing it on one node, then
+        // hand the wire bytes to a second node and confirm its ingest_index
+        // records the entry.
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let root = SigningKey::generate(&mut OsRng);
+        let root_hex = hex::encode(root.verifying_key().to_bytes());
+
+        let cfg_pub = NodeConfig {
+            data_dir: tmp1.path().to_path_buf(),
+            root_pubkey_hex: root_hex.clone(),
+            host: None,
+            retention: None,
+        };
+        let pub_node = Node::open(cfg_pub).unwrap();
+        let pub_pk = pub_node.ed_sk.verifying_key().to_bytes();
+        let mut cap = Capability::new_unsigned(
+            pub_pk,
+            vec!["home.test".into()],
+            vec![Right::Read, Right::Write],
+            0,
+            None,
+        );
+        cap.sign(&root).unwrap();
+        let cap_id = cap.cap_id.0;
+        pub_node.caps.upsert_grant(&cap).unwrap();
+
+        let topic_id = [42u8; 32];
+        pub_node.install_epoch_key(topic_id, 0, [9u8; 32]).unwrap();
+        let msg = pub_node
+            .publish_standard(topic_id, cap_id, CanonicalContent::new("home.test", "hi"))
+            .unwrap();
+
+        // Now the receiver — retention enabled, will use pub_node's pubkey via cap grant.
+        let cfg_rx = NodeConfig {
+            data_dir: tmp2.path().to_path_buf(),
+            root_pubkey_hex: root_hex,
+            host: None,
+            retention: Some(crate::config::RetentionPolicy {
+                ttl: std::time::Duration::from_secs(3600),
+                max_bytes_per_user: 0,
+            }),
+        };
+        let rx_node = Node::open(cfg_rx).unwrap();
+        rx_node.caps.upsert_grant(&cap).unwrap();
+        rx_node.install_epoch_key(topic_id, 0, [9u8; 32]).unwrap();
+        let outcome = rx_node.handle_inbound(msg).unwrap();
+        matches!(outcome, crate::inbound::Inbound::Accepted { .. } | crate::inbound::Inbound::AcceptedOpaque { .. });
+        let ix = rx_node.ingest_index.as_ref().unwrap();
+        assert!(ix.total_bytes().unwrap() > 0, "inbound must record an entry");
     }
 
     #[tokio::test]
