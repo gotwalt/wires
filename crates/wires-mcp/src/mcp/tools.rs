@@ -10,9 +10,9 @@ use crate::token::Claims;
 
 pub fn list_descriptors() -> Value {
     serde_json::json!({"tools": [
-        {"name": "wires.list_topics", "description": "List topics this agent can access", "inputSchema": {"type":"object","properties":{}}},
-        {"name": "wires.publish",     "description": "Publish a message to a topic",       "inputSchema": {"type":"object","properties":{"topic":{"type":"string"},"text":{"type":"string"},"data":{"type":"object"}},"required":["topic","text"]}},
-        {"name": "wires.tail",        "description": "Read recent messages from a topic",  "inputSchema": {"type":"object","properties":{"topic":{"type":"string"},"since":{"type":"string"},"limit":{"type":"integer"}},"required":["topic"]}}
+        {"name": "wires_list_topics", "description": "List topics this agent can access", "inputSchema": {"type":"object","properties":{}}},
+        {"name": "wires_publish",     "description": "Publish a message to a topic",       "inputSchema": {"type":"object","properties":{"topic":{"type":"string"},"text":{"type":"string"},"data":{"type":"object"}},"required":["topic","text"]}},
+        {"name": "wires_tail",        "description": "Read recent messages from a topic",  "inputSchema": {"type":"object","properties":{"topic":{"type":"string"},"since":{"type":"string"},"limit":{"type":"integer"}},"required":["topic"]}}
     ]})
 }
 
@@ -309,8 +309,8 @@ pub async fn call(
         message: format!("invalid params: {e}"),
     })?;
     match p.name.as_str() {
-        "wires.list_topics" => list_topics(&state, claims).await,
-        "wires.publish" => {
+        "wires_list_topics" => list_topics(&state, claims).await,
+        "wires_publish" => {
             let args: PublishArgs = serde_json::from_value(p.arguments).map_err(|e| {
                 JsonRpcError {
                     code: -32602,
@@ -319,7 +319,7 @@ pub async fn call(
             })?;
             publish_tool(&state, claims, args).await
         }
-        "wires.tail" => {
+        "wires_tail" => {
             let args: TailArgs = serde_json::from_value(p.arguments).map_err(|e| {
                 JsonRpcError {
                     code: -32602,
@@ -438,7 +438,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (st, root_hex) = seed_user(&tmp).await;
         let claims = make_claims(&st, root_hex);
-        let params = serde_json::json!({"name": "wires.list_topics", "arguments": {}});
+        let params = serde_json::json!({"name": "wires_list_topics", "arguments": {}});
         let v = call(st, &claims, &params).await.unwrap();
         let arr = v["content"][0]["text"].as_str().unwrap();
         let body: serde_json::Value = serde_json::from_str(arr).unwrap();
@@ -452,7 +452,7 @@ mod tests {
         let (st, root_hex) = seed_user(&tmp).await;
         let claims = make_claims(&st, root_hex);
         let params = serde_json::json!({
-            "name": "wires.publish",
+            "name": "wires_publish",
             "arguments": {"topic": "no.such.topic", "text": "hi"}
         });
         let v = call(st, &claims, &params).await.unwrap();
@@ -473,7 +473,7 @@ mod tests {
         .caps_topic_id();
         let claims = make_claims(&st, root_hex);
         let params = serde_json::json!({
-            "name": "wires.publish",
+            "name": "wires_publish",
             "arguments": {"topic": hex::encode(caps_topic), "text": "x"}
         });
         let v = call(st, &claims, &params).await.unwrap();
@@ -489,13 +489,13 @@ mod tests {
         let claims = make_claims(&st, root_hex);
         // Publish via the tool.
         let pub_params = serde_json::json!({
-            "name": "wires.publish",
+            "name": "wires_publish",
             "arguments": {"topic": "home.notes", "text": "hello"}
         });
         let _ = call(st.clone(), &claims, &pub_params).await.unwrap();
         // Tail.
         let tail_params = serde_json::json!({
-            "name": "wires.tail",
+            "name": "wires_tail",
             "arguments": {"topic": "home.notes"}
         });
         let v = call(st, &claims, &tail_params).await.unwrap();

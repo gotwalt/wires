@@ -7,7 +7,7 @@ End-to-end encrypted gossip substrate for a household's AI agents. Think "a priv
 - **Substrate v1** — identity, topics, capabilities, encrypted publish/subscribe, replay between peers, persisted hash-chained logs. Drives the CLI end-to-end. Spec: [`docs/superpowers/specs/2026-05-14-wires-substrate-design.md`](docs/superpowers/specs/2026-05-14-wires-substrate-design.md).
 - **Hosted service v1** — `wires-host` is a multi-tenant blind relay with a `/wires/tenant/0` control-plane ALPN, per-tenant rolling retention, and an HTTPS service-discovery endpoint. Spec: [`docs/superpowers/specs/2026-05-14-wires-hosted-service-design.md`](docs/superpowers/specs/2026-05-14-wires-hosted-service-design.md).
 - **Responder-driven pairing v1** — agents declare a role + requested scopes via `wires pair-listen`; the operator consents and dials in via `wires pair-approve` over `/wires/pair/0` with a sealed, signed `PairGrant`. Spec: [`docs/superpowers/specs/2026-05-15-wires-responder-driven-pairing-design.md`](docs/superpowers/specs/2026-05-15-wires-responder-driven-pairing-design.md).
-- **MCP gateway v1** — `wires-mcp` is a multi-tenant authenticated MCP gateway. OAuth 2.1 (PRM + AS + DCR), iOS as universal authenticator, MCP tools: `wires.list_topics`, `wires.publish`, `wires.tail`. Spec: [`docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md`](docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md).
+- **MCP gateway v1** — `wires-mcp` is a multi-tenant authenticated MCP gateway. OAuth 2.1 (PRM + AS + DCR), iOS as universal authenticator, MCP tools: `wires_list_topics`, `wires_publish`, `wires_tail`. Spec: [`docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md`](docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md).
 
 A working Home Assistant ingestion daemon (`wires-ha`) ships as a separate binary.
 
@@ -272,7 +272,7 @@ upstream for TLS.
    key.
 4. The browser redirects back; the MCP client now has an access token
    bound to the user's household root pubkey.
-5. The client can call `wires.list_topics`, `wires.publish`, `wires.tail`
+5. The client can call `wires_list_topics`, `wires_publish`, `wires_tail`
    against the user's agent's caps.
 
 ### Known limitations (v1)

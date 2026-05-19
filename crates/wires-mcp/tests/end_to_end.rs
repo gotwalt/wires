@@ -17,8 +17,8 @@
 //!      bridge `on_paired` callback completes the OAuth flow.)
 //!   5. Poll /oauth/authorize/status/{session_id} until `done`; extract code.
 //!   6. POST /oauth/token with PKCE verifier; receive access token.
-//!   7. POST /mcp `tools/call wires.publish`; assert success.
-//!   8. POST /mcp `tools/call wires.tail`; assert the published message comes
+//!   7. POST /mcp `tools/call wires_publish`; assert success.
+//!   8. POST /mcp `tools/call wires_tail`; assert the published message comes
 //!      back in the messages array.
 //!
 //! Test fixtures inline the cap-mint + PairGrant assembly rather than reusing
@@ -188,7 +188,7 @@ async fn first_time_pair_then_publish_then_tail() {
     let token_body: serde_json::Value = token_resp.json().await.unwrap();
     let access_token = token_body["access_token"].as_str().unwrap().to_string();
 
-    // ── 7. wires.publish ──────────────────────────────────────────────────────
+    // ── 7. wires_publish ──────────────────────────────────────────────────────
     let publish_resp = http_client
         .post(format!("{public_url}/mcp"))
         .bearer_auth(&access_token)
@@ -197,7 +197,7 @@ async fn first_time_pair_then_publish_then_tail() {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "wires.publish",
+                "name": "wires_publish",
                 "arguments": {"topic": &topic_name, "text": "hello world"}
             }
         }))
@@ -211,7 +211,7 @@ async fn first_time_pair_then_publish_then_tail() {
         "publish reported isError=true: {publish_body}"
     );
 
-    // ── 8. wires.tail must return the published message ───────────────────────
+    // ── 8. wires_tail must return the published message ───────────────────────
     let tail_resp = http_client
         .post(format!("{public_url}/mcp"))
         .bearer_auth(&access_token)
@@ -220,7 +220,7 @@ async fn first_time_pair_then_publish_then_tail() {
             "id": 2,
             "method": "tools/call",
             "params": {
-                "name": "wires.tail",
+                "name": "wires_tail",
                 "arguments": {"topic": &topic_name}
             }
         }))
