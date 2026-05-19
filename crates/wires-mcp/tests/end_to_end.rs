@@ -61,6 +61,7 @@ async fn first_time_pair_then_publish_then_tail() {
         public_url: public_url.clone(),
         bind: local_addr.to_string(),
         data_dir: tmp.path().to_path_buf(),
+        retention: None,
     };
     let store = Store::open(&cfg.gateway_db_path()).unwrap();
     let supervisor = TenantSupervisor::new(cfg.users_dir(), Duration::from_secs(60));
