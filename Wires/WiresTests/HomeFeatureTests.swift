@@ -133,6 +133,33 @@ struct HomeFeatureTests {
         }
     }
 
+    // MARK: - OAuth sign-in
+
+    @Test
+    func signInToServiceTapped_presentsOAuthSignInSheet() async {
+        let store = TestStore(
+            initialState: HomeFeature.State(rootPubkeyHex: Self.pubkey)
+        ) {
+            HomeFeature()
+        }
+
+        await store.send(.signInToServiceTapped) {
+            $0.oauthSignIn = .initial()
+        }
+    }
+
+    @Test
+    func oauthSignInDismissTapped_clearsSheet() async {
+        var initial = HomeFeature.State(rootPubkeyHex: Self.pubkey)
+        initial.oauthSignIn = .initial()
+
+        let store = TestStore(initialState: initial) { HomeFeature() }
+
+        await store.send(.oauthSignIn(.presented(.dismissTapped))) {
+            $0.oauthSignIn = nil
+        }
+    }
+
     // MARK: - Reset household
 
     private static func resetAlertState() -> AlertState<HomeFeature.Action.Alert> {

@@ -12,6 +12,7 @@ struct HomeFeature {
         var loading = false
         var loadError: String?
         @Presents var nodeEnrollment: NodeEnrollmentFeature.State?
+        @Presents var oauthSignIn: OAuthSignInFeature.State?
         @Presents var alert: AlertState<Action.Alert>?
     }
 
@@ -40,6 +41,8 @@ struct HomeFeature {
         case loadFailed(String)
         case approveNodeTapped
         case nodeEnrollment(PresentationAction<NodeEnrollmentFeature.Action>)
+        case signInToServiceTapped
+        case oauthSignIn(PresentationAction<OAuthSignInFeature.Action>)
         case resetHouseholdTapped
         case alert(PresentationAction<Alert>)
         case resetCompleted
@@ -119,6 +122,18 @@ struct HomeFeature {
             case .nodeEnrollment:
                 return .none
 
+            case .signInToServiceTapped:
+                state.oauthSignIn = .initial()
+                return .none
+
+            case .oauthSignIn(.presented(.dismissTapped)),
+                 .oauthSignIn(.dismiss):
+                state.oauthSignIn = nil
+                return .none
+
+            case .oauthSignIn:
+                return .none
+
             case .resetHouseholdTapped:
                 state.alert = AlertState {
                     TextState("Reset household?")
@@ -185,6 +200,9 @@ struct HomeFeature {
         }
         .ifLet(\.$nodeEnrollment, action: \.nodeEnrollment) {
             NodeEnrollmentFeature()
+        }
+        .ifLet(\.$oauthSignIn, action: \.oauthSignIn) {
+            OAuthSignInFeature()
         }
         .ifLet(\.$alert, action: \.alert)
     }
