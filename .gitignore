@@ -11,3 +11,6 @@ Cargo.lock
 
 # Xcode + SPM per-user state (Package.resolved is checked in; xcuserdata isn't)
 **/xcuserdata/
+
+# Operator-edited wires-mcp config (template lives at docker/wires-mcp.toml.example)
+docker/wires-mcp.toml
