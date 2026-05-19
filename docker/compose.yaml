@@ -20,6 +20,30 @@ services:
     stop_signal: SIGINT
     stop_grace_period: 10s
 
+  wires-mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime-mcp
+    image: wires-mcp:local
+    container_name: wires-mcp
+    network_mode: host
+    volumes:
+      - wires-mcp-data:/data
+      # Operator-edited TOML mounted read-only so the binary can't
+      # accidentally overwrite the operator's edits.
+      - ./wires-mcp.toml:/etc/wires-mcp/config.toml:ro
+    restart: unless-stopped
+    environment:
+      WIRES_MCP_CONFIG: /etc/wires-mcp/config.toml
+      # RUST_LOG is documentation-only today — wires-mcp's main.rs hardcodes
+      # the filter to "info". Setting it anticipates a future binary fix.
+      RUST_LOG: "info,wires_mcp=info"
+    stop_signal: SIGINT
+    stop_grace_period: 10s
+
 volumes:
   wires-host-data:
     name: wires-host-data
+  wires-mcp-data:
+    name: wires-mcp-data
