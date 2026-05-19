@@ -11,16 +11,9 @@ struct HomeView: View {
                 .toolbar {
                     ToolbarItem(placement: .primaryAction) {
                         Button {
-                            store.send(.approveNodeTapped)
+                            store.send(.connectTapped)
                         } label: {
-                            Label("Approve node", systemImage: "person.badge.plus")
-                        }
-                    }
-                    ToolbarItem(placement: .secondaryAction) {
-                        Button {
-                            store.send(.signInToServiceTapped)
-                        } label: {
-                            Label("Sign in to a service", systemImage: "key.horizontal")
+                            Label("Connect", systemImage: "qrcode.viewfinder")
                         }
                     }
                     #if DEBUG
@@ -34,9 +27,6 @@ struct HomeView: View {
                     #endif
                 }
                 .task { store.send(.onAppear) }
-                .sheet(item: $store.scope(state: \.nodeEnrollment, action: \.nodeEnrollment)) { childStore in
-                    NodeEnrollmentView(store: childStore)
-                }
                 .sheet(item: $store.scope(state: \.oauthSignIn, action: \.oauthSignIn)) { childStore in
                     OAuthSignInView(store: childStore)
                 }
@@ -79,7 +69,7 @@ struct HomeView: View {
                 .foregroundStyle(.secondary)
             Text("No nodes yet")
                 .font(.headline)
-            Text("Tap \"Approve node\" to enroll one.")
+            Text("Tap \"Connect\" and scan a service QR code.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
