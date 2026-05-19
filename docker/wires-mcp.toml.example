@@ -15,3 +15,10 @@ bind = "127.0.0.1:10001"
 # Filesystem root inside the container; backed by the wires-mcp-data
 # named volume.
 data_dir = "/data"
+
+# Per-user retention policy. Defaults (ttl_secs = 3600, max_bytes_per_user
+# = 52428800 = 50 MiB) apply if this block is omitted. `ttl_secs` must be
+# > 0; `max_bytes_per_user = 0` disables the byte budget (TTL alone enforces).
+#[retention]
+#ttl_secs = 3600
+#max_bytes_per_user = 52428800
