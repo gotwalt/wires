@@ -132,6 +132,49 @@ impl IngestIndex {
         write.commit().context(CommitTxnSnafu)?;
         Ok(dropped)
     }
+
+    /// Remove every entry whose `ingested_at_ms < deadline_ms`. Returns the
+    /// dropped entries in ingest order (oldest first). O(k) in the number of
+    /// expired entries — short-circuits at the first row whose timestamp is
+    /// ≥ deadline.
+    ///
+    /// Iteration order is by ingest_seq (the redb table key), which is monotone
+    /// in arrival time. The short-circuit therefore covers the common case
+    /// where every newly-arrived row was timestamped close to "now" — a single
+    /// out-of-order row (e.g. from a misbehaving clock) still gets cleaned up
+    /// later when its predecessor would have been swept.
+    pub fn evict_older_than(&self, deadline_ms: i64) -> Result<Vec<IngestEntry>> {
+        let write = self.db.begin_write().context(BeginTxnSnafu)?;
+        let dropped;
+        {
+            let mut meta_t = write.open_table(INGEST_META).context(OpenTableSnafu)?;
+            let (next_ingest, mut total) = read_meta(&meta_t)?;
+
+            let mut idx_t = write.open_table(INGEST_INDEX).context(OpenTableSnafu)?;
+            let mut victim_keys: Vec<[u8; 8]> = Vec::new();
+            let mut victim_entries: Vec<IngestEntry> = Vec::new();
+            for entry_r in idx_t.iter().context(StorageIoSnafu)? {
+                let (k, v) = entry_r.context(StorageIoSnafu)?;
+                let Some(ent) = decode_row(v.value()) else { continue };
+                if ent.ingested_at_ms >= deadline_ms {
+                    break; // short-circuit
+                }
+                let mut kbuf = [0u8; 8];
+                kbuf.copy_from_slice(k.value());
+                total = total.saturating_sub(ent.bytes as u64);
+                victim_keys.push(kbuf);
+                victim_entries.push(ent);
+            }
+
+            for k in &victim_keys {
+                idx_t.remove(&k[..]).context(StorageIoSnafu)?;
+            }
+            write_meta(&mut meta_t, next_ingest, total)?;
+            dropped = victim_entries;
+        }
+        write.commit().context(CommitTxnSnafu)?;
+        Ok(dropped)
+    }
 }
 
 /// Decode a serialized ingest-index row. Accepts both the legacy 76-byte
@@ -308,6 +351,63 @@ mod tests {
         let oldest = idx.oldest_entry().unwrap().unwrap();
         assert_eq!(oldest.ingested_at_ms, 1_700_000_000_000);
         assert_eq!(oldest.bytes, 100);
+    }
+
+    #[test]
+    fn evict_older_than_drops_stale_keeps_fresh() {
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
+        let idx = IngestIndex::new(db);
+        // Insert four entries with increasing timestamps.
+        idx.record(&entry(1, 9, 0, 100), 1_000).unwrap();
+        idx.record(&entry(1, 9, 1, 100), 2_000).unwrap();
+        idx.record(&entry(2, 8, 0, 100), 3_000).unwrap();
+        idx.record(&entry(2, 8, 1, 100), 4_000).unwrap();
+
+        // Drop everything older than 2_500.
+        let dropped = idx.evict_older_than(2_500).unwrap();
+        assert_eq!(dropped.len(), 2);
+        assert_eq!(dropped[0].seq, 0);
+        assert_eq!(dropped[0].ingested_at_ms, 1_000);
+        assert_eq!(dropped[1].seq, 1);
+        assert_eq!(dropped[1].ingested_at_ms, 2_000);
+
+        // total_bytes drops to 200 (two surviving entries × 100 bytes).
+        assert_eq!(idx.total_bytes().unwrap(), 200);
+        let surviving = idx.oldest_entry().unwrap().unwrap();
+        assert_eq!(surviving.ingested_at_ms, 3_000);
+    }
+
+    #[test]
+    fn evict_older_than_stops_at_first_fresh_row() {
+        // The index is ordered by ingest_seq, which is monotone in
+        // arrival time. evict_older_than must short-circuit as soon as it
+        // hits a row with ingested_at_ms >= deadline — this is what makes
+        // it O(k) instead of O(n).
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
+        let idx = IngestIndex::new(db);
+        idx.record(&entry(1, 9, 0, 50), 1_000).unwrap();
+        idx.record(&entry(1, 9, 1, 50), 5_000).unwrap();
+        idx.record(&entry(1, 9, 2, 50), 2_000).unwrap(); // arrives later, but timestamped earlier
+        // deadline = 3_000 — the first row is stale, the second is fresh, so we
+        // must stop after dropping just the first row.
+        let dropped = idx.evict_older_than(3_000).unwrap();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].seq, 0);
+        // Two entries survive even though one of them is "stale" by timestamp,
+        // because we short-circuited.
+        assert_eq!(idx.total_bytes().unwrap(), 100);
+    }
+
+    #[test]
+    fn evict_older_than_empty_index_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
+        let idx = IngestIndex::new(db);
+        let dropped = idx.evict_older_than(1_000).unwrap();
+        assert!(dropped.is_empty());
+        assert_eq!(idx.total_bytes().unwrap(), 0);
     }
 
     #[test]
