@@ -38,19 +38,17 @@ struct OAuthSignInView: View {
             .padding()
         case .signingIn:
             ProgressView("Signing…")
-        case .pairApprove:
-            // v1: ApprovalFeature composition deferred (see Task 14). Show a
-            // placeholder so the build is clean and the flow is testable.
+        case .pairLoading:
             VStack(spacing: 12) {
                 ProgressView()
-                Text("Setting up new agent…")
+                Text("Loading pair request…")
                     .font(.headline)
-                Text("Open the Wires app to approve the pair request from this gateway.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
             }
             .padding()
+        case .pairApprove:
+            if let approveStore = store.scope(state: \.pairApprove, action: \.approve) {
+                ApprovalView(store: approveStore)
+            }
         case let .done(message):
             VStack(spacing: 12) {
                 Image(systemName: "checkmark.circle.fill")
