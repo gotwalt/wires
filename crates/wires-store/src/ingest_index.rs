@@ -7,6 +7,7 @@ use crate::error::{BeginTxnSnafu, CommitTxnSnafu, OpenTableSnafu, Result, Storag
 use crate::schema::{INGEST_INDEX, INGEST_META};
 
 const META_KEY: &[u8] = b"m";
+const BACKFILLED_KEY: &[u8] = b"b";
 
 /// A single entry in the per-tenant ingest order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +175,63 @@ impl IngestIndex {
         }
         write.commit().context(CommitTxnSnafu)?;
         Ok(dropped)
+    }
+
+    /// Whether the one-time per-tenant backfill has already been performed.
+    /// Defaults to `false` on a fresh index.
+    pub fn is_backfilled(&self) -> Result<bool> {
+        let read = self.db.begin_read().context(BeginTxnSnafu)?;
+        let table = match read.open_table(INGEST_META) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => {
+                return Err(crate::error::StoreError::OpenTable {
+                    source: e,
+                    location: snafu::location!(),
+                });
+            }
+        };
+        match table.get(BACKFILLED_KEY).context(StorageIoSnafu)? {
+            Some(g) => Ok(g.value().first() == Some(&1)),
+            None => Ok(false),
+        }
+    }
+
+    /// Mark this index as backfilled. Idempotent.
+    pub fn set_backfilled(&self) -> Result<()> {
+        let write = self.db.begin_write().context(BeginTxnSnafu)?;
+        {
+            let mut meta_t = write.open_table(INGEST_META).context(OpenTableSnafu)?;
+            meta_t
+                .insert(BACKFILLED_KEY, &[1u8][..])
+                .context(StorageIoSnafu)?;
+        }
+        write.commit().context(CommitTxnSnafu)?;
+        Ok(())
+    }
+
+    /// Return every stored entry, in ingest_seq order. O(n); intended for
+    /// startup reconciliation only.
+    pub fn iter_all_entries(&self) -> Result<Vec<IngestEntry>> {
+        let read = self.db.begin_read().context(BeginTxnSnafu)?;
+        let table = match read.open_table(INGEST_INDEX) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(crate::error::StoreError::OpenTable {
+                    source: e,
+                    location: snafu::location!(),
+                });
+            }
+        };
+        let mut out = Vec::new();
+        for entry_r in table.iter().context(StorageIoSnafu)? {
+            let (_k, v) = entry_r.context(StorageIoSnafu)?;
+            if let Some(ent) = decode_row(v.value()) {
+                out.push(ent);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -408,6 +466,57 @@ mod tests {
         let dropped = idx.evict_older_than(1_000).unwrap();
         assert!(dropped.is_empty());
         assert_eq!(idx.total_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn backfilled_flag_defaults_to_false() {
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
+        let idx = IngestIndex::new(db);
+        assert!(!idx.is_backfilled().unwrap());
+    }
+
+    #[test]
+    fn set_backfilled_persists_across_reopens() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
+            let idx = IngestIndex::new(db);
+            assert!(!idx.is_backfilled().unwrap());
+            idx.set_backfilled().unwrap();
+            assert!(idx.is_backfilled().unwrap());
+        }
+        // Reopen and confirm persistence.
+        let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
+        let idx = IngestIndex::new(db);
+        assert!(idx.is_backfilled().unwrap());
+    }
+
+    #[test]
+    fn iter_all_entries_returns_every_row() {
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
+        let idx = IngestIndex::new(db);
+        idx.record(&entry(1, 9, 0, 100), 1_000).unwrap();
+        idx.record(&entry(2, 8, 0, 200), 2_000).unwrap();
+        idx.record(&entry(2, 8, 1, 200), 3_000).unwrap();
+        let all = idx.iter_all_entries().unwrap();
+        assert_eq!(all.len(), 3);
+        let keys: std::collections::HashSet<_> = all
+            .iter()
+            .map(|e| (e.topic_id, e.sender, e.seq))
+            .collect();
+        assert!(keys.contains(&([1u8; 32], [9u8; 32], 0)));
+        assert!(keys.contains(&([2u8; 32], [8u8; 32], 0)));
+        assert!(keys.contains(&([2u8; 32], [8u8; 32], 1)));
+    }
+
+    #[test]
+    fn iter_all_entries_empty_index_returns_empty_vec() {
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
+        let idx = IngestIndex::new(db);
+        assert!(idx.iter_all_entries().unwrap().is_empty());
     }
 
     #[test]
