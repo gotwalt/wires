@@ -4,13 +4,15 @@
 //! warm-up depending on environment. Run with `cargo test --workspace --
 //! --ignored` (matches the project README and existing acceptance scenarios).
 //!
-//! Mirrors the 8-step driver in plan
-//! `docs/superpowers/plans/2026-05-18-wires-mcp-gateway.md` (Task 33):
+//! Mirrors the updated driver from plan
+//! `docs/superpowers/plans/2026-05-19-wires-mcp-single-qr-dispatch.md`:
 //!
 //!   1. Spawn `http::serve_with_listener` on a random port.
 //!   2. POST /oauth/register.
-//!   3. GET /oauth/authorize; pull the pair token + session_id out of the
-//!      consent HTML's `<meta>` tags.
+//!   3. GET /oauth/authorize; read the `wires-mcp-session-ticket` meta tag;
+//!      decode the `SessionTicket` to get `session_id` + `gateway_url`.
+//!   3a. POST /oauth/session/probe with `{ session_id, root_pubkey_hex }`;
+//!       expect `{ kind: "pair", pair_token_b64: "..." }`.
 //!   4. Act as the iOS operator: decode the PairRequest, mint a Capability
 //!      for the gateway-agent against a fresh root SigningKey + topic, build
 //!      a PairGrant, seal+sign, dial /wires/pair/0, await Ack. (The gateway's
@@ -38,6 +40,7 @@ use wires_core::Capability;
 use wires_core::cap::Right;
 use wires_mcp::config::GatewayConfig;
 use wires_mcp::http::{self, ServiceState};
+use wires_mcp::oauth::session_ticket::SessionTicket;
 use wires_mcp::pair_bridge::PairBridge;
 use wires_mcp::rate_limit::RateLimiter;
 use wires_mcp::store::Store;
@@ -96,7 +99,7 @@ async fn first_time_pair_then_publish_then_tail() {
     let dcr_body: serde_json::Value = dcr_resp.json().await.unwrap();
     let client_id = dcr_body["client_id"].as_str().unwrap().to_string();
 
-    // ── 3. /authorize → extract pair token + session_id from <meta> tags ──────
+    // ── 3. /authorize → extract session ticket from <meta> tag; decode it ──────
     let verifier = URL_SAFE_NO_PAD.encode(random_bytes(32));
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let auth_resp = http_client
@@ -116,16 +119,36 @@ async fn first_time_pair_then_publish_then_tail() {
         .unwrap();
     assert_eq!(auth_resp.status(), 200);
     let html = auth_resp.text().await.unwrap();
-    let pair_token =
-        extract_meta(&html, "wires-mcp-pair-token").expect("wires-mcp-pair-token meta tag missing");
-    let session_id =
-        extract_meta(&html, "wires-mcp-session-id").expect("wires-mcp-session-id meta tag missing");
+    let ticket_b64 = extract_meta(&html, "wires-mcp-session-ticket")
+        .expect("wires-mcp-session-ticket meta tag missing");
+    let ticket = SessionTicket::decode_url_safe_b64(&ticket_b64)
+        .expect("failed to decode SessionTicket");
+    let session_id = ticket.session_id.clone();
+
+    // ── 3a. POST /oauth/session/probe → get pair token ────────────────────────
+    let root_sk = SigningKey::from_bytes(&[0x11; 32]);
+    let root_pubkey_hex = hex::encode(root_sk.verifying_key().to_bytes());
+    let probe_resp = http_client
+        .post(format!("{public_url}/oauth/session/probe"))
+        .json(&serde_json::json!({
+            "session_id": &session_id,
+            "root_pubkey_hex": &root_pubkey_hex,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(probe_resp.status(), 200);
+    let probe_body: serde_json::Value = probe_resp.json().await.unwrap();
+    assert_eq!(probe_body["kind"], "pair", "expected pair branch: {probe_body}");
+    let pair_token = probe_body["pair_token_b64"]
+        .as_str()
+        .expect("pair_token_b64 missing")
+        .to_string();
 
     // ── 4. Fake-iOS: decode, mint cap, build grant, deliver over /wires/pair/0 ─
     let request = PairRequest::decode(&pair_token).unwrap();
     request.verify().unwrap();
 
-    let root_sk = SigningKey::from_bytes(&[0x11; 32]);
     let root_pk = root_sk.verifying_key().to_bytes();
     let topic_id = [0x42u8; 32];
     let topic_name = "home.test".to_string();
