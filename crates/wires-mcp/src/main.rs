@@ -45,7 +45,10 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Serve => {
-            let cfg_path = std::path::PathBuf::from(std::env::var("WIRES_MCP_CONFIG").unwrap_or_else(|_| "/etc/wires-mcp/config.toml".into()));
+            let cfg_path = std::path::PathBuf::from(
+                std::env::var("WIRES_MCP_CONFIG")
+                    .unwrap_or_else(|_| "/etc/wires-mcp/config.toml".into()),
+            );
             let cfg: wires_mcp::config::GatewayConfig = match std::fs::read_to_string(&cfg_path) {
                 Ok(s) => match toml::from_str(&s) {
                     Ok(c) => c,
@@ -89,6 +92,7 @@ fn main() -> std::process::ExitCode {
                 signing_key: std::sync::Arc::new(sk),
                 supervisor,
                 pair_bridge,
+                rate_limit: wires_mcp::rate_limit::RateLimiter::dcr_default(),
             };
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
@@ -108,51 +112,84 @@ fn main() -> std::process::ExitCode {
         Cmd::UserList { config } => {
             let cfg = match wires_mcp::admin::load_config(&config) {
                 Ok(c) => c,
-                Err(e) => { eprintln!("config: {e}"); return std::process::ExitCode::FAILURE; }
+                Err(e) => {
+                    eprintln!("config: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
             };
             match wires_mcp::admin::user_list(&cfg) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
-                Err(e) => { eprintln!("user-list: {e}"); std::process::ExitCode::FAILURE }
+                Err(e) => {
+                    eprintln!("user-list: {e}");
+                    std::process::ExitCode::FAILURE
+                }
             }
         }
-        Cmd::UserDelete { root_pubkey_hex, config } => {
+        Cmd::UserDelete {
+            root_pubkey_hex,
+            config,
+        } => {
             let cfg = match wires_mcp::admin::load_config(&config) {
                 Ok(c) => c,
-                Err(e) => { eprintln!("config: {e}"); return std::process::ExitCode::FAILURE; }
+                Err(e) => {
+                    eprintln!("config: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
             };
             match wires_mcp::admin::user_delete(&cfg, &root_pubkey_hex) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
-                Err(e) => { eprintln!("user-delete: {e}"); std::process::ExitCode::FAILURE }
+                Err(e) => {
+                    eprintln!("user-delete: {e}");
+                    std::process::ExitCode::FAILURE
+                }
             }
         }
         Cmd::ClientList { config } => {
             let cfg = match wires_mcp::admin::load_config(&config) {
                 Ok(c) => c,
-                Err(e) => { eprintln!("config: {e}"); return std::process::ExitCode::FAILURE; }
+                Err(e) => {
+                    eprintln!("config: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
             };
             match wires_mcp::admin::client_list(&cfg) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
-                Err(e) => { eprintln!("client-list: {e}"); std::process::ExitCode::FAILURE }
+                Err(e) => {
+                    eprintln!("client-list: {e}");
+                    std::process::ExitCode::FAILURE
+                }
             }
         }
         Cmd::ClientRevoke { client_id, config } => {
             let cfg = match wires_mcp::admin::load_config(&config) {
                 Ok(c) => c,
-                Err(e) => { eprintln!("config: {e}"); return std::process::ExitCode::FAILURE; }
+                Err(e) => {
+                    eprintln!("config: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
             };
             match wires_mcp::admin::client_revoke(&cfg, &client_id) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
-                Err(e) => { eprintln!("client-revoke: {e}"); std::process::ExitCode::FAILURE }
+                Err(e) => {
+                    eprintln!("client-revoke: {e}");
+                    std::process::ExitCode::FAILURE
+                }
             }
         }
         Cmd::KeysRotate { config } => {
             let cfg = match wires_mcp::admin::load_config(&config) {
                 Ok(c) => c,
-                Err(e) => { eprintln!("config: {e}"); return std::process::ExitCode::FAILURE; }
+                Err(e) => {
+                    eprintln!("config: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
             };
             match wires_mcp::admin::keys_rotate(&cfg) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
-                Err(e) => { eprintln!("keys rotate: {e}"); std::process::ExitCode::FAILURE }
+                Err(e) => {
+                    eprintln!("keys rotate: {e}");
+                    std::process::ExitCode::FAILURE
+                }
             }
         }
     }
