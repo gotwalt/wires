@@ -204,4 +204,31 @@ mod tests {
         let (status, _) = probe(st, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn probe_is_idempotent_for_known_root() {
+        // Two probe calls for the same session_id + known root must return
+        // the same sign-in challenge. The nonce is stored eagerly at
+        // /authorize; the probe handler reconstructs the challenge from
+        // that stored nonce on every call, so retries must be deterministic.
+        let tmp = TempDir::new().unwrap();
+        let st = seed(&tmp);
+        let root = SigningKey::from_bytes(&[42u8; 32]);
+        let root_hex = hex::encode(root.verifying_key().to_bytes());
+        st.store.put_user(&UserRecord {
+            root_pubkey_hex: root_hex.clone(),
+            data_dir: "x".into(),
+            created_at_ms: 0,
+            last_seen_ms: 0,
+        }).unwrap();
+
+        let body = serde_json::json!({"session_id": "sid", "root_pubkey_hex": root_hex});
+        let (s1, j1) = probe(st.clone(), body.clone()).await;
+        let (s2, j2) = probe(st, body).await;
+        assert_eq!(s1, StatusCode::OK);
+        assert_eq!(s2, StatusCode::OK);
+        assert_eq!(j1["kind"], "signin");
+        assert_eq!(j2["kind"], "signin");
+        assert_eq!(j1["challenge_b64"], j2["challenge_b64"], "challenge must be deterministic across retries");
+    }
 }
