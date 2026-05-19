@@ -59,12 +59,16 @@ impl Retention {
         budget: u64,
     ) -> Result<Vec<IngestEntry>> {
         let idx = self.index_for(root_pubkey)?;
-        idx.record(&IngestEntry {
-            topic_id: *topic_id,
-            sender: *sender,
-            seq,
-            bytes,
-        })
+        idx.record(
+            &IngestEntry {
+                topic_id: *topic_id,
+                sender: *sender,
+                seq,
+                bytes,
+                ingested_at_ms: 0, // placeholder; overwritten by the explicit arg
+            },
+            wires_net::unix_now_ms(),
+        )
         .context(StoreSnafu)?;
         let evicted = idx.evict_oldest_until(budget).context(StoreSnafu)?;
         for e in &evicted {
