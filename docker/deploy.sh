@@ -17,7 +17,7 @@ for arg in "$@"; do
 Usage: $(basename "$0") [--no-pull] [--no-verify]
 
   --no-pull    Skip git fetch/pull; deploy the current working tree.
-  --no-verify  Skip the HTTP healthcheck poll on :8089.
+  --no-verify  Skip the HTTP healthcheck poll on :10000.
 EOF
       exit 0 ;;
     *)
@@ -40,10 +40,10 @@ docker compose -f docker/compose.yaml build
 docker compose -f docker/compose.yaml up -d
 
 if [[ "$VERIFY" -eq 1 ]]; then
-  echo "==> waiting for ticket HTTP on :8089"
+  echo "==> waiting for ticket HTTP on :10000"
   ok=0
   for _ in $(seq 1 15); do
-    if curl -fsS -o /dev/null http://127.0.0.1:8089/; then
+    if curl -fsS -o /dev/null http://127.0.0.1:10000/; then
       ok=1
       break
     fi

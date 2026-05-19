@@ -124,6 +124,7 @@ services:
     restart: unless-stopped
     environment:
       RUST_LOG: "warn,wires_host=info,wires_net=info,wires_node=info"
+    command: ["--data-dir", "/data", "--http-bind", "0.0.0.0:10000"]
     stop_signal: SIGINT
     stop_grace_period: 10s
 
@@ -134,7 +135,8 @@ volumes:
 
 ### Design notes
 
-- **`network_mode: host`** — iroh binds UDP directly on the host's interfaces (no Docker NAT), and the ticket HTTP page is reachable on `127.0.0.1:8089` so `tailscale funnel` (also running on the host) can proxy it without any port-publish dance. Tradeoff: the container shares the host's network namespace; this is acceptable on a dedicated single-tenant deploy host.
+- **`network_mode: host`** — iroh binds UDP directly on the host's interfaces (no Docker NAT), and the ticket HTTP page is reachable on `127.0.0.1:10000` so `tailscale funnel` (also running on the host) can proxy it without any port-publish dance. Tradeoff: the container shares the host's network namespace; this is acceptable on a dedicated single-tenant deploy host.
+- **`command:` overrides `--http-bind` to `0.0.0.0:10000`.** The binary's own default is `:10000` (preserved for direct, non-Docker invocations). The Docker deploy bumps the listener to `:10000` so the wires ecosystem can use the contiguous `10000+` range for service ports — `:10000` for `wires-host`'s ticket HTTP, `:10001` for `wires-mcp`, future services at `:10002+`. The convention sidesteps privileged ports entirely.
 - **Named volume `wires-host-data`** — Docker manages the volume. It persists `iroh.secret`, `tenants.redb`, `topic_index.redb`, `nonces.redb`, and the `tenants/<root>/` subtree across container recreates and image rebuilds. Backups are taken by running a one-shot container that mounts the volume.
 - **`restart: unless-stopped`** — survives reboots; respects an explicit `docker compose down`.
 - **`stop_signal: SIGINT`** — compose's default `SIGTERM` is not caught by `wires-host` today (its shutdown task only listens on `tokio::signal::ctrl_c()`, i.e. `SIGINT`). Overriding the stop signal lets the existing shutdown path drain cleanly without a code change. A future cleanup could add a proper `SIGTERM` handler in `wires-host` and drop this override.
@@ -178,15 +180,15 @@ docker compose -f docker/compose.yaml build
 docker compose -f docker/compose.yaml up -d
 
 if [[ "$VERIFY" -eq 1 ]]; then
-  echo "==> waiting for ticket HTTP on :8089"
+  echo "==> waiting for ticket HTTP on :10000"
   for _ in $(seq 1 15); do
-    if curl -fsS -o /dev/null http://127.0.0.1:8089/; then
+    if curl -fsS -o /dev/null http://127.0.0.1:10000/; then
       echo "==> ticket HTTP up"
       break
     fi
     sleep 1
   done
-  if ! curl -fsS -o /dev/null http://127.0.0.1:8089/; then
+  if ! curl -fsS -o /dev/null http://127.0.0.1:10000/; then
     echo "!! ticket HTTP did not come up; recent logs:" >&2
     docker compose -f docker/compose.yaml logs --tail=200 wires-host >&2
     exit 1
@@ -221,46 +223,51 @@ This one-liner lives in `docker/README.md`. No separate remote script.
 #!/usr/bin/env bash
 set -euo pipefail
 
-PORT="${WIRES_HOST_HTTP_PORT:-8089}"
+PORT="${WIRES_HOST_HTTP_PORT:-10000}"
+FUNNEL_PORT="${WIRES_FUNNEL_HTTPS_PORT:-10000}"
+FUNNEL_PATH="${WIRES_FUNNEL_PATH:-/}"
 
 usage() {
   cat <<EOF
 Usage: $(basename "$0") <up|down|status>
 
-  up      Publish http://127.0.0.1:$PORT via Tailscale Funnel on :443.
-  down    Tear down all Funnel mappings on this node.
+  up      Publish http://127.0.0.1:$PORT via Tailscale Funnel on :$FUNNEL_PORT$FUNNEL_PATH.
+  down    Remove just the wires-host Funnel mapping ( :$FUNNEL_PORT$FUNNEL_PATH ).
   status  Print current serve/funnel configuration.
 
 Environment:
-  WIRES_HOST_HTTP_PORT  Override the local port (default: 8089).
+  WIRES_HOST_HTTP_PORT    Local port wires-host listens on (default: 10000).
+  WIRES_FUNNEL_HTTPS_PORT Tailscale Funnel public port: 443, 8443, or 10000
+                          (default: 10000).
+  WIRES_FUNNEL_PATH       Path under the Funnel hostname (default: /).
 EOF
 }
 
-require_tailscale() {
-  command -v tailscale >/dev/null 2>&1 \
-    || { echo "tailscale CLI not on PATH" >&2; exit 1; }
-  tailscale status --self=true --peers=false >/dev/null 2>&1 \
-    || { echo "tailscale is not logged in; run 'sudo tailscale up' first" >&2; exit 2; }
-}
+require_tailscale() { ... }
 
 case "${1:-}" in
   up)
     require_tailscale
-    sudo tailscale funnel --bg --https=443 --set-path=/ "http://127.0.0.1:$PORT"
+    sudo tailscale funnel --bg --https="$FUNNEL_PORT" --set-path="$FUNNEL_PATH" \
+      "http://127.0.0.1:$PORT"
     sudo tailscale funnel status
     ;;
   down)
     require_tailscale
-    sudo tailscale funnel reset
+    sudo tailscale funnel --https="$FUNNEL_PORT" --set-path="$FUNNEL_PATH" off
     ;;
   status)
     require_tailscale
-    sudo tailscale funnel status
+    tailscale funnel status
     ;;
   *)
     usage; exit 64 ;;
 esac
 ```
+
+### Funnel port choice
+
+Tailscale Funnel publishes only on three ports: `443`, `8443`, `10000`. The script defaults to **`10000`** because `:443` is most often already in use on a shared host (e.g. another service behind Funnel), and `:8443` collides with default `tailscale serve` setups. Each wires service should pick one of the three slots; `down` is targeted (only removes the configured `(port, path)` pair) so multiple wires services can coexist on the same node without one tearing down the others.
 
 ### Prerequisites the script does not handle
 
@@ -272,7 +279,7 @@ If any of these are missing, the underlying `tailscale` invocation prints a clea
 
 ### Why a separate script
 
-Funnel setup is a one-time install action, not per-rollout. Bundling it into `deploy.sh` would mean every rollover poked at the Tailscale state, which is unnecessary and slightly surprising. The container's `127.0.0.1:8089` listener is stable across rollovers — once Funnel points at it, it stays valid.
+Funnel setup is a one-time install action, not per-rollout. Bundling it into `deploy.sh` would mean every rollover poked at the Tailscale state, which is unnecessary and slightly surprising. The container's `127.0.0.1:10000` listener is stable across rollovers — once Funnel points at it, it stays valid.
 
 ## docker/README.md
 
@@ -320,7 +327,7 @@ Three equivalent ways:
 
 ## Risks and tradeoffs
 
-1. **`network_mode: host` weakens container isolation.** On a dedicated single-tenant deploy host this is acceptable. If the host ever becomes multi-tenant for unrelated services, this should be revisited (bridge networking + explicit `ports:` for `8089/tcp` plus careful UDP forwarding for iroh).
+1. **`network_mode: host` weakens container isolation.** On a dedicated single-tenant deploy host this is acceptable. If the host ever becomes multi-tenant for unrelated services, this should be revisited (bridge networking + explicit `ports:` for `10000/tcp` plus careful UDP forwarding for iroh).
 2. **No image tagging or rollback.** A bad deploy is fixed by reverting the repo and re-running `deploy.sh`. There's no quick way to flip back to the prior image without a rebuild. Future enhancement: tag images `:<sha>` and `:latest`, retain the last N, and add `deploy.sh --rollback <sha>`.
 3. **Build host requirements.** Compiling iroh + the workspace under release uses ~3GB peak RAM and several minutes of CPU on first run. cargo-chef makes subsequent builds fast but does not change the cold-start cost.
 4. **Volume-as-source-of-identity.** The named volume holds the only copy of `iroh.secret` and all tenant data. Operators must take backups before doing anything destructive (e.g., `docker volume rm`).
