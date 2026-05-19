@@ -64,6 +64,10 @@ pub fn app(state: ServiceState) -> Router {
             axum::routing::post(crate::sign_in_endpoint::handler),
         )
         .route(
+            "/oauth/session/probe",
+            axum::routing::post(crate::oauth::session_probe::handler),
+        )
+        .route(
             "/oauth/token",
             axum::routing::post(crate::oauth::token::handler),
         )
