@@ -13,10 +13,12 @@ services:
     restart: unless-stopped
     environment:
       RUST_LOG: "warn,wires_host=info,wires_net=info,wires_node=info"
-    # Override the binary's default --http-bind (0.0.0.0:8089) so the ticket
-    # HTTP page lives on the wires namespace port range (10000+). 10001+ is
-    # reserved for future wires-* services (wires-mcp, etc.).
-    command: ["--data-dir", "/data", "--http-bind", "0.0.0.0:10000"]
+    # Override the binary's default --http-bind so the ticket HTTP page
+    # lives on the wires namespace port range (10000+) and binds to
+    # 127.0.0.1 only — Tailscale Funnel's :10000 listener takes the Tailnet
+    # IP on the same port, so a wildcard bind here would AddrInUse.
+    # Funnel proxies `<tailnet-ip>:10000` → `127.0.0.1:10000`.
+    command: ["--data-dir", "/data", "--http-bind", "127.0.0.1:10000"]
     stop_signal: SIGINT
     stop_grace_period: 10s
 

@@ -59,6 +59,13 @@ either sharing one of those slots via a sub-path or moving an existing
 mapping. The `SERVICES` array at the top of `docker/funnel.sh` is the
 single source of truth for which wires service holds which Funnel slot.
 
+> **Gotcha — `127.0.0.1` binds, not `0.0.0.0`.** Tailscale Funnel listens on
+> the node's Tailnet IP (e.g. `100.x.y.z:10000`) for `:10000`, so a
+> wildcard bind to `0.0.0.0:10000` will `AddrInUse`. wires-host's
+> `--http-bind` is therefore `127.0.0.1:10000`; Funnel terminates HTTPS
+> externally and proxies into localhost. Same logic applies to any future
+> wires-* service that shares a Funnel public port.
+
 ## Subsequent rollouts
 
 ```bash
