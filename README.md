@@ -238,7 +238,7 @@ docs/superpowers/
 It pairs into each household as a normal wires agent — `wires-host`'s
 blindness contract is unchanged.
 
-### Operator walkthrough
+### Operator walkthrough (running directly)
 
 ```bash
 # 1. Generate a config.
@@ -261,6 +261,35 @@ wires-mcp user-delete <root_pubkey_hex>
 Operators must put a TLS-terminating reverse proxy (nginx, caddy, etc.) in
 front of `wires-mcp`; the binary speaks plain HTTP and assumes a trusted
 upstream for TLS.
+
+### Operator walkthrough (Docker + Tailscale Funnel)
+
+> **Temporary.** This Docker + Funnel setup is a placeholder so we can dogfood
+> the gateway against a real public HTTPS URL. The eventual alpha hosting
+> story hasn't been chosen yet — expect this section to be replaced.
+
+The current reference deploy packages `wires-host` and `wires-mcp` as a
+two-service Docker Compose stack with Tailscale Funnel providing public
+HTTPS. See [`docker/README.md`](docker/README.md) for the full walkthrough;
+the short version:
+
+```bash
+# One-time per host: seed the wires-mcp config (edit public_url).
+cp docker/wires-mcp.toml.example docker/wires-mcp.toml
+${EDITOR:-nano} docker/wires-mcp.toml
+
+# Build, start, and verify both services.
+./docker/deploy.sh
+
+# Publish both via Tailscale Funnel (wires-host on :10000, wires-mcp on :443).
+./docker/funnel.sh up all
+```
+
+Subsequent rollouts: `git push origin main && ssh <host> ./docker/deploy.sh`.
+The named volumes `wires-host-data` and `wires-mcp-data` carry iroh secrets,
+tenant state, the gateway JWT signing key, and per-user agent data through
+container recreates, so the host's `EndpointId` and the gateway's JWT
+issuer survive rollouts.
 
 ### User walkthrough (from the user's perspective)
 
