@@ -59,7 +59,7 @@ struct OAuthSignInFeatureTests {
     // MARK: - Test 2: probe dispatches to pair branch
 
     @Test
-    func probe_pair_branch_transitions_to_approval() async throws {
+    func probe_pair_branch_transitions_to_pair_loading() async throws {
         let ticket = makeTicket()
 
         let store = TestStore(
@@ -70,32 +70,34 @@ struct OAuthSignInFeatureTests {
             $0.mcpGatewayClient.probe = { _, _, _ in
                 .pair(pairTokenB64: "PAIR_TOKEN")
             }
-            // parsePairRequest is called in the background after state transitions;
-            // return a failure so the test ends cleanly without needing a full
-            // WiresKit environment. The assertion below only checks the initial
-            // state transition into .pairApprove — the parse effect completion
-            // is exercised by integration tests in Task 14.
+            // Background work after .pairLoading: parsePairRequest throws,
+            // householdClient.loadHousehold returns nil. Either failure path
+            // surfaces as .pairLoadFailed and ends the test cleanly.
             $0.wiresClient.parsePairRequest = { _ in
                 throw NSError(domain: "test", code: 0, userInfo: [NSLocalizedDescriptionKey: "deferred"])
             }
+            $0.householdClient.loadHousehold = { nil }
         }
 
         await store.send(.probeStarted)
 
-        // Confirm the state transitions into .pairApprove with the right token.
+        // Confirm the state transitions into .pairLoading with the right token.
         await store.receive(\.probeResolvedPair) { newState in
-            if case let .pairApprove(branch) = newState {
-                #expect(branch.pairTokenB64 == "PAIR_TOKEN")
-                #expect(branch.ticket == ticket)
+            if case let .pairLoading(t, token) = newState {
+                #expect(token == "PAIR_TOKEN")
+                #expect(t == ticket)
             } else {
-                Issue.record("Expected .pairApprove state, got \(newState)")
+                Issue.record("Expected .pairLoading state, got \(newState)")
             }
         }
 
-        // The background parsePairRequest throws, producing a pairParseFailed
-        // action. Exhaust it so TCA's strict matcher doesn't flag an unchecked
-        // received action.
-        await store.receive(\.pairParseFailed) { _ in }
+        // Background async block fails (parsePairRequest throws), producing
+        // pairLoadFailed → .error. Exhaust both transitions.
+        await store.receive(\.pairLoadFailed) { newState in
+            if case .error = newState { /* ok */ } else {
+                Issue.record("Expected .error state after pairLoadFailed")
+            }
+        }
     }
 
     // MARK: - Test 3: signin assertion post succeeds → .done
