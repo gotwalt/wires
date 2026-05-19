@@ -5,10 +5,11 @@ import WiresKit
 /// Drives the wires-mcp OAuth consent flow on iOS.
 ///
 /// Flow:
-///   .scan                   →  user scans a SessionTicket QR
-///   .probing(ticket, root)  →  POST /oauth/session/probe
-///       └ signin branch →  .signinConfirm  →  biometric sign + POST  →  .done
-///       └ pair branch   →  .pairApprove (delegates to ApprovalFeature) →  .done
+///   .scan                    →  user scans a SessionTicket QR
+///   .probing                 →  POST /oauth/session/probe
+///       └ signin branch  →  .signinConfirm  →  biometric sign + POST  →  .done
+///       └ pair branch    →  .pairLoading    →  .pairApprove (ApprovalFeature)
+///                                              →  .done
 @Reducer
 struct OAuthSignInFeature {
     @ObservableState
@@ -17,19 +18,13 @@ struct OAuthSignInFeature {
         case probing(ticket: SessionTicket, rootPubkeyHex: String)
         case signinConfirm(ticket: SessionTicket, challenge: SignInChallenge)
         case signingIn(ticket: SessionTicket, challenge: SignInChallenge)
-        case pairApprove(PairBranchState)
+        /// Transient state after the probe returns a pair token. Parses the
+        /// PairRequest preview and loads the household's HostInfo in parallel;
+        /// transitions to `.pairApprove` when both are ready.
+        case pairLoading(ticket: SessionTicket, pairTokenB64: String)
+        case pairApprove(ApprovalFeature.State)
         case done(message: String)
         case error(message: String)
-
-        struct PairBranchState: Equatable {
-            let ticket: SessionTicket
-            let pairTokenB64: String
-            // ApprovalFeature.State is not embedded here in v1; this feature
-            // hands off to ApprovalFeature via a `pairTokenParsed` action
-            // after parsing the token. Kept as a simple holder for now.
-            var preview: PairRequestPreview?
-            var error: String?
-        }
 
         static func initial() -> Self {
             .scan(ScanFeature<SessionTicket>.State())
@@ -37,7 +32,7 @@ struct OAuthSignInFeature {
     }
 
     @CasePathable
-    enum Action: Equatable {
+    enum Action {
         case scan(ScanFeature<SessionTicket>.Action)
         /// Internal: carries ticket + resolved root pubkey hex from scan step.
         case probeBegin(ticket: SessionTicket, rootPubkeyHex: String)
@@ -49,8 +44,11 @@ struct OAuthSignInFeature {
         case signinApproveTapped
         case signinSucceeded
         case signinFailed(String)
-        case pairTokenParsed(PairRequestPreview)
-        case pairParseFailed(String)
+        /// Fired once both PairRequest parsing and household → HostInfo lookup
+        /// complete. Carries the data ApprovalFeature needs.
+        case pairReadyToApprove(PairRequestPreview, HostInfo)
+        case pairLoadFailed(String)
+        case approve(ApprovalFeature.Action)
         case dismissTapped
     }
 
@@ -113,14 +111,23 @@ struct OAuthSignInFeature {
 
             case let .probeResolvedPair(token):
                 guard case let .probing(ticket, _) = state else { return .none }
-                state = .pairApprove(State.PairBranchState(ticket: ticket, pairTokenB64: token))
+                state = .pairLoading(ticket: ticket, pairTokenB64: token)
                 let wires = self.wires
+                let household = self.household
                 return .run { send in
                     do {
-                        let preview = try await wires.parsePairRequest(token)
-                        await send(.pairTokenParsed(preview))
+                        // Parse the pair request preview (FFI) and fetch the
+                        // household's HostInfo (SwiftData) in parallel.
+                        async let previewTask = wires.parsePairRequest(token)
+                        async let hostTask = loadHostInfo(household: household)
+                        let preview = try await previewTask
+                        guard let host = try await hostTask else {
+                            await send(.pairLoadFailed("no host — bootstrap first"))
+                            return
+                        }
+                        await send(.pairReadyToApprove(preview, host))
                     } catch {
-                        await send(.pairParseFailed(String(describing: error)))
+                        await send(.pairLoadFailed(String(describing: error)))
                     }
                 }
 
@@ -165,15 +172,19 @@ struct OAuthSignInFeature {
 
             // MARK: Pair branch
 
-            case let .pairTokenParsed(preview):
-                if case var .pairApprove(p) = state {
-                    p.preview = preview
-                    state = .pairApprove(p)
-                }
+            case let .pairReadyToApprove(preview, host):
+                state = .pairApprove(ApprovalFeature.State(preview: preview, host: host))
                 return .none
 
-            case let .pairParseFailed(message):
+            case let .pairLoadFailed(message):
                 state = .error(message: message)
+                return .none
+
+            case .approve(.approveCompleted):
+                state = .done(message: "Connected to gateway")
+                return .none
+
+            case .approve:
                 return .none
 
             // MARK: Dismiss
@@ -187,5 +198,23 @@ struct OAuthSignInFeature {
                 try SessionTicket.decode(urlSafeBase64: payload)
             })
         }
+        .ifCaseLet(\.pairApprove, action: \.approve) {
+            ApprovalFeature()
+        }
+    }
+}
+
+/// Read the household once and convert its host columns to a `HostInfo` on
+/// `MainActor` (SwiftData `@Model` properties require it).
+private func loadHostInfo(household: HouseholdClient) async throws -> HostInfo? {
+    guard let hh = try await household.loadHousehold() else { return nil }
+    return await MainActor.run {
+        guard let endpointIdHex = hh.hostEndpointIdHex else { return nil as HostInfo? }
+        return HostInfo(
+            endpointIdHex: endpointIdHex,
+            addrs: hh.hostDirectAddrs,
+            relay: hh.hostRelayURL,
+            hintExpiresAtMs: hh.hostHintExpiresAtMs ?? 0
+        )
     }
 }
