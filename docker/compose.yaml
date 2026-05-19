@@ -38,9 +38,12 @@ services:
     restart: unless-stopped
     environment:
       WIRES_MCP_CONFIG: /etc/wires-mcp/config.toml
-      # RUST_LOG is documentation-only today — wires-mcp's main.rs hardcodes
-      # the filter to "info". Setting it anticipates a future binary fix.
-      RUST_LOG: "info,wires_mcp=info"
+      # `wires_mcp::http=debug` enables the OAuth request/response logger
+      # added for first-time MCP-client debugging. Drop it back to info
+      # (or remove that target) once the OAuth flow is verified — request
+      # and response bodies may contain short-lived secrets (auth codes,
+      # PKCE verifiers, refresh tokens).
+      RUST_LOG: "info,wires_mcp=info,wires_mcp::http=debug"
     stop_signal: SIGINT
     stop_grace_period: 10s
 
