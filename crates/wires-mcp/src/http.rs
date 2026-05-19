@@ -227,7 +227,7 @@ pub fn test_state(tmp: &std::path::Path) -> ServiceState {
     };
     let store = Store::open(&cfg.gateway_db_path()).unwrap();
     let supervisor =
-        crate::tenants::TenantSupervisor::new(cfg.users_dir(), std::time::Duration::from_secs(60));
+        crate::tenants::TenantSupervisor::new(cfg.users_dir(), std::time::Duration::from_secs(60), None);
     let pair_bridge = Arc::new(crate::pair_bridge::PairBridge::new(
         cfg.pending_pairs_dir(),
         cfg.public_url.clone(),

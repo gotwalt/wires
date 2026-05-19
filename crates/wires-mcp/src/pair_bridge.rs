@@ -401,7 +401,7 @@ mod tests {
             retention: None,
         };
         let store = Store::open(&cfg.gateway_db_path()).unwrap();
-        let supervisor = TenantSupervisor::new(cfg.users_dir(), Duration::from_secs(60));
+        let supervisor = TenantSupervisor::new(cfg.users_dir(), Duration::from_secs(60), None);
         let pending_dir = cfg.pending_pairs_dir().join(session_id);
         std::fs::create_dir_all(&pending_dir).unwrap();
 

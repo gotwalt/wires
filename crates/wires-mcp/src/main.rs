@@ -78,9 +78,17 @@ fn main() -> std::process::ExitCode {
                     return std::process::ExitCode::FAILURE;
                 }
             };
+            let retention_policy = match cfg.retention_policy() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("config: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
             let supervisor = wires_mcp::tenants::TenantSupervisor::new(
                 cfg.users_dir(),
                 std::time::Duration::from_secs(600),
+                Some(retention_policy),
             );
             let pair_bridge = std::sync::Arc::new(wires_mcp::pair_bridge::PairBridge::new(
                 cfg.pending_pairs_dir(),
