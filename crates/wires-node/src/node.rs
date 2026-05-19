@@ -84,7 +84,7 @@ impl Node {
         };
         let (events_tx, _) = broadcast::channel::<DecryptedEvent>(1024);
 
-        Ok(Self {
+        let result = Self {
             config,
             ed_sk,
             x_sk,
@@ -96,7 +96,9 @@ impl Node {
             retention,
             ingest_index,
             publish_lock: Mutex::new(()),
-        })
+        };
+        result.reconcile_ingest_index(wires_net::unix_now_ms())?;
+        Ok(result)
     }
 
     pub fn epoch_keys_for(&self, topic_id: &[u8; 32]) -> Result<Arc<EpochKeyStore>> {
@@ -307,6 +309,50 @@ impl Node {
     fn delete_topic_log_entry(&self, e: &wires_store::IngestEntry) -> Result<()> {
         let log = self.logs.get_or_open(&e.topic_id)?;
         log.delete(&e.sender, e.seq).context(StoreSnafu)?;
+        Ok(())
+    }
+
+    /// Walk every per-topic `TopicLog` on disk and insert a fresh
+    /// `IngestIndex` row for any (topic_id, sender, seq) that isn't already
+    /// indexed. Used at open-time both as a one-shot backfill for pre-retention
+    /// deploys and as a permanent safety net for the inbound/sweep crash
+    /// window (IngestIndex remove committed but TopicLog delete not yet
+    /// applied → orphan log row).
+    ///
+    /// Orphans get a fresh TTL window starting at `now_ms` and age out
+    /// normally. Idempotent; safe to call on every open.
+    fn reconcile_ingest_index(&self, now_ms: i64) -> Result<()> {
+        let Some(ix) = &self.ingest_index else { return Ok(()); };
+        let known: std::collections::HashSet<([u8; 32], [u8; 32], u64)> = ix
+            .iter_all_entries()
+            .context(StoreSnafu)?
+            .into_iter()
+            .map(|e| (e.topic_id, e.sender, e.seq))
+            .collect();
+        for topic_id in self.logs.persisted_topic_ids()? {
+            let log = self.logs.get_or_open(&topic_id)?;
+            let entries = log.read_all().context(StoreSnafu)?;
+            for msg in entries {
+                if known.contains(&(topic_id, msg.sender, msg.seq)) {
+                    continue;
+                }
+                let bytes = serde_json::to_vec(&msg).context(crate::error::SerdeSnafu)?.len() as u32;
+                ix.record(
+                    &wires_store::IngestEntry {
+                        topic_id,
+                        sender: msg.sender,
+                        seq: msg.seq,
+                        bytes,
+                        ingested_at_ms: now_ms,
+                    },
+                    now_ms,
+                )
+                .context(StoreSnafu)?;
+            }
+        }
+        if !ix.is_backfilled().context(StoreSnafu)? {
+            ix.set_backfilled().context(StoreSnafu)?;
+        }
         Ok(())
     }
 
@@ -701,6 +747,100 @@ mod tests {
         matches!(outcome, crate::inbound::Inbound::Accepted { .. } | crate::inbound::Inbound::AcceptedOpaque { .. });
         let ix = rx_node.ingest_index.as_ref().unwrap();
         assert!(ix.total_bytes().unwrap() > 0, "inbound must record an entry");
+    }
+
+    #[test]
+    fn reconcile_inserts_missing_index_rows_for_existing_log_entries() {
+        use std::time::Duration;
+        let tmp = TempDir::new().unwrap();
+        let root_hex = "deadbeef".to_string();
+        let topic = [42u8; 32];
+
+        // First, open WITHOUT retention to write log entries. Then close.
+        {
+            let cfg = NodeConfig {
+                data_dir: tmp.path().to_path_buf(),
+                root_pubkey_hex: root_hex.clone(),
+                host: None,
+                retention: None,
+            };
+            let node = Node::open(cfg).unwrap();
+            let log = node.logs.get_or_open(&topic).unwrap();
+            for seq in 0..3u64 {
+                let m = wires_core::WireMessage {
+                    topic_id: topic,
+                    epoch: 0,
+                    kind: wires_core::MessageKind::Public,
+                    sender: [9u8; 32],
+                    cap_id: [0u8; 16],
+                    seq,
+                    prev_hash: [0u8; 32],
+                    timestamp: seq as i64,
+                    payload_len: 0,
+                    signature: [0u8; 64],
+                    ciphertext: vec![],
+                };
+                log.append(&m).unwrap();
+            }
+        }
+
+        // Now reopen WITH retention. Backfill should fire.
+        let cfg = NodeConfig {
+            data_dir: tmp.path().to_path_buf(),
+            root_pubkey_hex: root_hex,
+            host: None,
+            retention: Some(crate::config::RetentionPolicy {
+                ttl: Duration::from_secs(3600),
+                max_bytes_per_user: 0,
+            }),
+        };
+        let node = Node::open(cfg).unwrap();
+        let ix = node.ingest_index.as_ref().unwrap();
+        assert!(ix.is_backfilled().unwrap(), "first open must set the flag");
+        let all = ix.iter_all_entries().unwrap();
+        assert_eq!(all.len(), 3, "backfill must insert one row per log entry");
+    }
+
+    #[test]
+    fn reconcile_is_idempotent_on_second_open() {
+        use std::time::Duration;
+        let tmp = TempDir::new().unwrap();
+        let root_hex = "deadbeef".to_string();
+        let topic = [42u8; 32];
+
+        let cfg = NodeConfig {
+            data_dir: tmp.path().to_path_buf(),
+            root_pubkey_hex: root_hex,
+            host: None,
+            retention: Some(crate::config::RetentionPolicy {
+                ttl: Duration::from_secs(3600),
+                max_bytes_per_user: 0,
+            }),
+        };
+        {
+            let node = Node::open(cfg.clone()).unwrap();
+            // Append directly to the log to simulate an orphan (no index entry).
+            let log = node.logs.get_or_open(&topic).unwrap();
+            let m = wires_core::WireMessage {
+                topic_id: topic,
+                epoch: 0,
+                kind: wires_core::MessageKind::Public,
+                sender: [9u8; 32],
+                cap_id: [0u8; 16],
+                seq: 0,
+                prev_hash: [0u8; 32],
+                timestamp: 0,
+                payload_len: 0,
+                signature: [0u8; 64],
+                ciphertext: vec![],
+            };
+            log.append(&m).unwrap();
+        }
+        // Reopen — must pick up the orphan even though the backfill flag is set.
+        let node = Node::open(cfg).unwrap();
+        let ix = node.ingest_index.as_ref().unwrap();
+        let all = ix.iter_all_entries().unwrap();
+        assert_eq!(all.len(), 1, "second open must reconcile orphan log entries");
     }
 
     #[tokio::test]

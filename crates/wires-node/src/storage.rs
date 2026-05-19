@@ -23,6 +23,42 @@ impl TopicLogs {
         }
     }
 
+    /// List every topic_id that has a `topics/<hex>/log.db` on disk under
+    /// `root`. Used by `Node::reconcile_ingest_index` to walk pre-existing
+    /// logs. Returns `Ok(Vec::new())` if `root/topics/` does not yet exist.
+    pub fn persisted_topic_ids(&self) -> Result<Vec<[u8; 32]>> {
+        let topics_root = self.root.join("topics");
+        let mut out = Vec::new();
+        let read_dir = match std::fs::read_dir(&topics_root) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(crate::error::NodeError::Io {
+                    source: e,
+                    location: snafu::location!(),
+                });
+            }
+        };
+        for entry in read_dir {
+            let entry = entry.map_err(|e| crate::error::NodeError::Io {
+                source: e,
+                location: snafu::location!(),
+            })?;
+            let name = entry.file_name();
+            let Some(hex_id) = name.to_str() else { continue };
+            if hex_id.len() != 64 {
+                continue;
+            }
+            let Ok(raw) = hex::decode(hex_id) else { continue };
+            let Ok(arr) = <[u8; 32]>::try_from(raw.as_slice()) else { continue };
+            // Only count directories that actually have a log.db.
+            if entry.path().join("log.db").is_file() {
+                out.push(arr);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn get_or_open(&self, topic_id: &[u8; 32]) -> Result<Arc<TopicLog>> {
         if let Some(log) = self.logs.read().unwrap().get(topic_id).cloned() {
             return Ok(log);
