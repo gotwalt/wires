@@ -1,6 +1,7 @@
 import ComposableArchitecture
 import Dependencies
 import Foundation
+import WiresKit
 
 /// Every notable UI state of the app, identified by a stable string the
 /// snapshot test target writes into `WIRES_FIXTURE` at launch.
@@ -54,21 +55,88 @@ enum LaunchFixture: String, CaseIterable {
         // Default placeholder dependencies that work for every fixture:
         // .placeholder camera so no AVCaptureSession spins up.
         values.cameraPreviewKind = .placeholder
-        // Per-fixture overrides land in switch arms below as tasks 4a-4d
-        // are implemented.
+
         switch self {
-        case .bootstrapScanDenied, .bootstrapScanGranted, .bootstrapConfirm, .bootstrapDone,
-             .homeLoading, .homeEmpty, .homeOneCap, .homeThreeCapsOneRevoked,
+        case .bootstrapScanDenied:
+            values.cameraPermissionClient = .fixture(.denied)
+            values.wiresClient = .fixture()
+            values.householdClient = .fixture()
+            values.mcpGatewayClient = .fixture()
+
+        case .bootstrapScanGranted:
+            values.cameraPermissionClient = .fixture(.granted)
+            values.wiresClient = .fixture()
+            values.householdClient = .fixture()
+            values.mcpGatewayClient = .fixture()
+
+        case .bootstrapConfirm:
+            values.cameraPermissionClient = .fixture(.granted)
+            values.wiresClient = .fixture()
+            values.householdClient = .fixture()
+            values.mcpGatewayClient = .fixture()
+
+        case .bootstrapDone:
+            values.cameraPermissionClient = .fixture(.granted)
+            values.wiresClient = .fixture()
+            values.householdClient = .fixture()
+            values.mcpGatewayClient = .fixture()
+
+        case .homeLoading, .homeEmpty, .homeOneCap, .homeThreeCapsOneRevoked,
              .enrollScan, .enrollApprovePristine, .enrollApprovePartial, .enrollDone,
              .oauthScan, .oauthSigninConfirm, .oauthPairApprove, .oauthDone, .oauthError:
-            break  // filled in by Task 4
+            break  // filled in by Tasks 4b–4d
         }
     }
 
     /// (filled in by Task 4a–4d)
     var initialAppState: AppFeature.State {
-        // Stub — every case returns .launching until Task 4 fills it.
-        return .launching
+        switch self {
+        case .bootstrapScanDenied:
+            var s = BootstrapFeature.State()
+            s.scan.cameraPermission = .denied
+            return .bootstrap(s)
+
+        case .bootstrapScanGranted:
+            var s = BootstrapFeature.State()
+            s.scan.cameraPermission = .granted
+            return .bootstrap(s)
+
+        case .bootstrapConfirm:
+            var s = BootstrapFeature.State()
+            s.scan.cameraPermission = .granted
+            s.confirmedHost = HostInfo(
+                endpointIdHex: String(repeating: "ab", count: 32),
+                addrs: ["192.168.1.20:4242"],
+                relay: "https://relay.example.org",
+                hintExpiresAtMs: 0
+            )
+            return .bootstrap(s)
+
+        case .bootstrapDone:
+            var s = BootstrapFeature.State()
+            s.scan.cameraPermission = .granted
+            let host = HostInfo(
+                endpointIdHex: String(repeating: "ab", count: 32),
+                addrs: ["192.168.1.20:4242"],
+                relay: "https://relay.example.org",
+                hintExpiresAtMs: 0
+            )
+            s.completed = BootstrapFeature.State.Completed(
+                registration: TenantRegistration(
+                    capsTopicIdHex: String(repeating: "cd", count: 32),
+                    hostEndpointIdHex: host.endpointIdHex,
+                    serverTimeMs: 0
+                ),
+                host: host,
+                rootPubkeyHex: String(repeating: "ab", count: 32)
+            )
+            return .bootstrap(s)
+
+        case .homeLoading, .homeEmpty, .homeOneCap, .homeThreeCapsOneRevoked,
+             .enrollScan, .enrollApprovePristine, .enrollApprovePartial, .enrollDone,
+             .oauthScan, .oauthSigninConfirm, .oauthPairApprove, .oauthDone, .oauthError:
+            return .launching  // filled in by Tasks 4b–4d
+        }
     }
 
     /// Maps each fixture to a (flow folder, short filename) tuple. Used
