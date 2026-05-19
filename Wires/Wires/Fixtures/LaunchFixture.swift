@@ -156,9 +156,30 @@ enum LaunchFixture: String, CaseIterable {
             )
             values.mcpGatewayClient = .fixture()
 
-        case .enrollScan, .enrollApprovePristine, .enrollApprovePartial, .enrollDone,
-             .oauthScan, .oauthSigninConfirm, .oauthPairApprove, .oauthDone, .oauthError:
-            break  // filled in by Tasks 4c–4d
+        case .enrollScan:
+            values.cameraPermissionClient = .fixture(.granted)
+            values.wiresClient = .fixture()
+            values.householdClient = .fixture(
+                household: Household(
+                    rootPubkeyHex: String(repeating: "ab", count: 32),
+                    hostEndpointIdHex: String(repeating: "cd", count: 32)
+                )
+            )
+            values.mcpGatewayClient = .fixture()
+
+        case .enrollApprovePristine, .enrollApprovePartial, .enrollDone:
+            values.cameraPermissionClient = .fixture(.granted)
+            values.wiresClient = .fixture()
+            values.householdClient = .fixture(
+                household: Household(
+                    rootPubkeyHex: String(repeating: "ab", count: 32),
+                    hostEndpointIdHex: String(repeating: "cd", count: 32)
+                )
+            )
+            values.mcpGatewayClient = .fixture()
+
+        case .oauthScan, .oauthSigninConfirm, .oauthPairApprove, .oauthDone, .oauthError:
+            break  // filled in by Task 4d
         }
     }
 
@@ -218,9 +239,105 @@ enum LaunchFixture: String, CaseIterable {
             // effect resolves and overwrites caps from the client.
             return .home(HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32)))
 
-        case .enrollScan, .enrollApprovePristine, .enrollApprovePartial, .enrollDone,
-             .oauthScan, .oauthSigninConfirm, .oauthPairApprove, .oauthDone, .oauthError:
-            return .launching  // filled in by Tasks 4c–4d
+        case .enrollScan:
+            let host = HostInfo(
+                endpointIdHex: String(repeating: "cd", count: 32),
+                addrs: [],
+                relay: nil,
+                hintExpiresAtMs: 0
+            )
+            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            var enroll = NodeEnrollmentFeature.State.initial(host: host)
+            // Pre-grant camera so the scan view shows the placeholder, not the
+            // permission-request spinner.
+            if case .scan(var scanStep) = enroll {
+                scanStep.scan.cameraPermission = .granted
+                enroll = .scan(scanStep)
+            }
+            home.nodeEnrollment = enroll
+            return .home(home)
+
+        case .enrollApprovePristine:
+            let host = HostInfo(
+                endpointIdHex: String(repeating: "cd", count: 32),
+                addrs: [],
+                relay: nil,
+                hintExpiresAtMs: 0
+            )
+            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            let preview = PairRequestPreview(
+                handle: PendingPairHandle(id: "fixture-pair"),
+                agentPubkeyHex: String(repeating: "ef", count: 32),
+                role: "agent",
+                description: "Aaron's Mac",
+                issuedAtMs: 0,
+                expiresAtMs: 0,
+                requestedScopes: [
+                    RequestedScopePreview(topicName: "family", rights: [.read, .write]),
+                    RequestedScopePreview(topicName: "calendar", rights: [.read])
+                ],
+                dialSummary: ""
+            )
+            home.nodeEnrollment = .approve(ApprovalFeature.State(preview: preview, host: host))
+            return .home(home)
+
+        case .enrollApprovePartial:
+            let host = HostInfo(
+                endpointIdHex: String(repeating: "cd", count: 32),
+                addrs: [],
+                relay: nil,
+                hintExpiresAtMs: 0
+            )
+            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            let preview = PairRequestPreview(
+                handle: PendingPairHandle(id: "fixture-pair"),
+                agentPubkeyHex: String(repeating: "ef", count: 32),
+                role: "agent",
+                description: "Aaron's Mac",
+                issuedAtMs: 0,
+                expiresAtMs: 0,
+                requestedScopes: [
+                    RequestedScopePreview(topicName: "family", rights: [.read, .write]),
+                    RequestedScopePreview(topicName: "calendar", rights: [.read])
+                ],
+                dialSummary: ""
+            )
+            var approve = ApprovalFeature.State(preview: preview, host: host)
+            // Default state grants everything. Mutate to partial:
+            //   - family: only .read granted (drop .write)
+            //   - calendar: scope toggled off entirely
+            if var fam = approve.decisions[id: "family"] {
+                fam.grantedRights = [.read]
+                approve.decisions[id: "family"] = fam
+            }
+            if var cal = approve.decisions[id: "calendar"] {
+                cal.granted = false
+                approve.decisions[id: "calendar"] = cal
+            }
+            home.nodeEnrollment = .approve(approve)
+            return .home(home)
+
+        case .enrollDone:
+            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            let preview = PairRequestPreview(
+                handle: PendingPairHandle(id: "fixture-pair"),
+                agentPubkeyHex: String(repeating: "ef", count: 32),
+                role: "agent",
+                description: "Aaron's Mac",
+                issuedAtMs: 0,
+                expiresAtMs: 0,
+                requestedScopes: [],
+                dialSummary: ""
+            )
+            let ack = PairAckRecord(
+                installedCapIdHex: String(repeating: "11", count: 32),
+                installedAtMs: 0
+            )
+            home.nodeEnrollment = .done(NodeEnrollmentFeature.DoneStepState(ack: ack, preview: preview))
+            return .home(home)
+
+        case .oauthScan, .oauthSigninConfirm, .oauthPairApprove, .oauthDone, .oauthError:
+            return .launching  // filled in by Task 4d
         }
     }
 
