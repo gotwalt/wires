@@ -1,4 +1,4 @@
-# docker/.dockerignore
+# docker/Dockerfile.dockerignore
 target/
 data/
 Wires/

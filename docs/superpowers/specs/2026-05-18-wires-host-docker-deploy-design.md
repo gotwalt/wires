@@ -27,12 +27,12 @@ A new top-level `docker/` directory:
 
 ```
 docker/
-  Dockerfile        # multi-stage with cargo-chef
-  .dockerignore
-  compose.yaml      # single service: wires-host
-  deploy.sh         # build + roll out
-  funnel.sh         # up / down / status for Tailscale Funnel
-  README.md         # walkthrough
+  Dockerfile               # multi-stage with cargo-chef
+  Dockerfile.dockerignore  # BuildKit reads this when -f docker/Dockerfile is used
+  compose.yaml             # single service: wires-host
+  deploy.sh                # build + roll out
+  funnel.sh                # up / down / status for Tailscale Funnel
+  README.md                # walkthrough
 ```
 
 `docker/` is the build context root for the compose file's `build:` block via `context: ..`, so the Dockerfile sees the whole workspace.
@@ -92,7 +92,9 @@ CMD ["--data-dir", "/data"]
 
 The `wires` user owns `/data`; the named volume inherits that ownership on first mount because the directory is created during image build before the volume is attached.
 
-### .dockerignore
+### Dockerfile.dockerignore
+
+The file lives at `docker/Dockerfile.dockerignore`, the per-Dockerfile sidecar location that BuildKit reads when `docker build -f docker/Dockerfile <context>` is invoked. A plain `docker/.dockerignore` would be silently ignored (Docker reads `.dockerignore` from the *context* root, not from the Dockerfile's directory) — using the `<dockerfile-name>.dockerignore` convention keeps the exclusion list co-located with the Dockerfile while remaining honored by BuildKit.
 
 ```
 target/
