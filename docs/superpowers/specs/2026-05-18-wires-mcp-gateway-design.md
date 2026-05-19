@@ -145,7 +145,8 @@ The gateway is simultaneously the **Protected Resource** (the `/mcp` endpoint) a
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 AS metadata. | Public |
 | `GET /.well-known/jwks.json` | One EdDSA key, stable `kid`. | Public |
 | `POST /oauth/register` | DCR (RFC 7591). Anonymous, rate-limited. | Public |
-| `GET /oauth/authorize` | Renders the consent page (two QRs). | Public |
+| `GET /oauth/authorize` | Renders the consent page (single `SessionTicket` QR). | Public |
+| `POST /oauth/session/probe` | iOS probes with `root_pubkey_hex`; gateway dispatches to pair or sign-in. | Public, session-bound |
 | `GET /oauth/authorize/status/{session_id}` | Browser-polled status. | Public, session-bound |
 | `POST /oauth/signin/assertion` | iOS posts root-signed sign-in assertions here. | Self-validating |
 | `POST /oauth/token` | Authorization-code + refresh-token grants. | Public, validated by code/refresh |
@@ -227,7 +228,7 @@ Default lifetime: 15 minutes. Refresh tokens are opaque random 256-bit values, s
 
 ## 5. Consent flow
 
-`/oauth/authorize` renders an HTML page showing **two QR codes** side by side: one for first-time pair, one for returning sign-in. The browser polls `/oauth/authorize/status/{session_id}` until either QR's path completes. iOS auto-detects which kind of QR it's looking at by the `kind` field in the decoded JSON envelope.
+`/oauth/authorize` renders an HTML page showing a **single QR** containing a compact `SessionTicket`. iOS scans it, POSTs `/oauth/session/probe` with its `root_pubkey_hex`, and the gateway dispatches into either the pair flow (unknown root) or the sign-in flow (known root). The browser polls `/oauth/authorize/status/{session_id}` as before until either path completes.
 
 ### 5.1 `/oauth/authorize` request
 
@@ -253,11 +254,42 @@ Validations on receipt:
 - `code_challenge_method=S256`. Anything else: `invalid_request`.
 - `resource` equals the gateway `issuer`. Anything else: `invalid_target` (RFC 8707).
 
-If validation passes the gateway creates an `auth_sessions` row, generates a `session_id` (uuid v4), and renders the consent page.
+If validation passes the gateway:
+
+1. Creates an `auth_sessions` row.
+2. Creates a `pending_signins` row (fresh 32-byte nonce, 5-minute TTL). Stored eagerly because it's cheap.
+3. Does **not** allocate a `pending_pairs` row or iroh endpoint at this point — those are deferred to `/oauth/session/probe` to avoid burning resources on returning users who never need them.
+4. Renders the consent page with a single `SessionTicket` QR.
+
+### 5.1a SessionTicket
+
+The QR payload is a URL-safe base64 JSON object:
+
+```json
+{ "v": 1, "k": "wires.oauth.v1", "gateway_url": "https://mcp.example.com", "session_id": "<uuid>" }
+```
+
+### 5.1b `POST /oauth/session/probe`
+
+iOS posts:
+
+```json
+{ "session_id": "<uuid>", "root_pubkey_hex": "<64 hex chars>" }
+```
+
+Gateway handler:
+
+1. Looks up `auth_sessions[session_id]`. Absent or non-`Pending`: `404`. Expired: `410`.
+2. Validates `root_pubkey_hex` is 32 bytes hex.
+3. Looks up `users[root_pubkey_hex]`.
+4. **Known user** → returns `{ "kind": "signin", "challenge_b64": "<URL-safe base64 of canonical SignInChallenge JSON>" }`. Reuses the existing `pending_signins[session_id]` row.
+5. **Unknown user** → calls `pair_bridge.start(session_id, client_name)` (idempotent: if `pending_pairs[session_id]` already exists, returns the cached token instead of allocating again), returns `{ "kind": "pair", "pair_token_b64": "..." }`.
+
+Probe is idempotent per `session_id`: a second call returns the same kind. This matters because mobile networks retry; iOS must be able to call probe twice without burning a new iroh endpoint.
 
 ### 5.2 First-time (pair) path
 
-The QR encodes a standard `PairRequest` produced from a freshly generated agent identity in a temp data dir. The pair flow runs untouched over the existing `/wires/pair/0` ALPN.
+The pair flow itself is unchanged once iOS receives `kind: "pair"`. Steps 1–10 below remain, except step 1 ("Gateway creates pending_pairs…") now happens during the probe call instead of during `/authorize`.
 
 1. Gateway creates `pending_pairs/<session_id>/` (mode 0700) and generates fresh `identity.ed25519`, `identity.x25519`, `iroh.secret`.
 2. Gateway binds an **iroh endpoint** with the new `iroh.secret`, registers the standard `PairProtocol` on it.
@@ -279,7 +311,7 @@ The QR encodes a standard `PairRequest` produced from a freshly generated agent 
 
 ### 5.3 Returning (sign-in) path
 
-The QR encodes a `SignInChallenge` consumed by the iOS app, which signs it with the household root and POSTs the assertion back.
+iOS receives `kind: "signin"` from the probe (rather than scanning a sign-in QR directly), base64-decodes the `challenge_b64` field to obtain the `SignInChallenge`, biometric-signs the canonical bytes, and POSTs the assertion back.
 
 `SignInChallenge` shape (canonical JSON, URL-safe base64-encoded for QR transport):
 
@@ -685,7 +717,7 @@ Real iroh endpoints, `MemoryLookup` cross-registration to dodge pkarr warm-up:
 
 This spec implies, but does not specify, two iOS app additions:
 
-- A scanner path for the `SignInChallenge` QR (distinguishable from the existing `PairRequest` QR by the `kind` field), with a Face-ID-gated root-key sign and an HTTPS POST to the gateway URL the QR carries.
-- A consent affordance distinguishing "approving a new gateway agent" (existing pair-approve UX) from "signing into a gateway we've already approved" (new flow). Both terminate in the same gateway-side state, but the user-visible meaning differs.
+- A scanner path for the `SessionTicket` QR. iOS scans one `SessionTicket` QR and probes the gateway to discover which flow to run. The probe returns `kind: "pair"` or `kind: "signin"`, and iOS dispatches accordingly — there is no separate sign-in QR for the user to scan.
+- A consent affordance distinguishing "approving a new gateway agent" (existing pair-approve UX, entered when probe returns `kind: "pair"`) from "signing into a gateway we've already approved" (Face-ID-gated biometric sign + `POST /oauth/signin/assertion`, entered when probe returns `kind: "signin"`). Both terminate in the same gateway-side state, but the user-visible meaning differs.
 
 The iOS companion spec gets a follow-on revision once this design lands.
