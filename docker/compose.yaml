@@ -1,0 +1,20 @@
+# docker/compose.yaml
+services:
+  wires-host:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: wires-host:local
+    container_name: wires-host
+    network_mode: host
+    volumes:
+      - wires-host-data:/data
+    restart: unless-stopped
+    environment:
+      RUST_LOG: "warn,wires_host=info,wires_net=info,wires_node=info"
+    stop_signal: SIGINT
+    stop_grace_period: 10s
+
+volumes:
+  wires-host-data:
+    name: wires-host-data
