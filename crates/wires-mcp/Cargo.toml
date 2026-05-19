@@ -49,3 +49,4 @@ parking_lot = "0.12"
 tempfile    = "3"
 tokio       = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tower       = "0.5"
+reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
