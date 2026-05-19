@@ -11,7 +11,6 @@ struct HomeFeature {
         var host: HostInfo?
         var loading = false
         var loadError: String?
-        @Presents var nodeEnrollment: NodeEnrollmentFeature.State?
         @Presents var oauthSignIn: OAuthSignInFeature.State?
         @Presents var alert: AlertState<Action.Alert>?
     }
@@ -39,9 +38,7 @@ struct HomeFeature {
         case onAppear
         case loaded(LoadedSnapshot)
         case loadFailed(String)
-        case approveNodeTapped
-        case nodeEnrollment(PresentationAction<NodeEnrollmentFeature.Action>)
-        case signInToServiceTapped
+        case connectTapped
         case oauthSignIn(PresentationAction<OAuthSignInFeature.Action>)
         case resetHouseholdTapped
         case alert(PresentationAction<Alert>)
@@ -103,33 +100,16 @@ struct HomeFeature {
                 state.loadError = message
                 return .none
 
-            case .approveNodeTapped:
-                guard let host = state.host else { return .none }
-                state.nodeEnrollment = .initial(host: host)
-                return .none
-
-            // Enrollment completed: dismiss the sheet and refresh caps so
-            // the newly-installed cap shows up.
-            case .nodeEnrollment(.presented(.completed)):
-                state.nodeEnrollment = nil
-                return .send(.onAppear)
-
-            case .nodeEnrollment(.presented(.dismissTapped)),
-                 .nodeEnrollment(.dismiss):
-                state.nodeEnrollment = nil
-                return .none
-
-            case .nodeEnrollment:
-                return .none
-
-            case .signInToServiceTapped:
+            case .connectTapped:
                 state.oauthSignIn = .initial()
                 return .none
 
+            // Dismissed (success or cancel): clear the sheet and refresh caps
+            // so a freshly-installed cap shows up in the list.
             case .oauthSignIn(.presented(.dismissTapped)),
                  .oauthSignIn(.dismiss):
                 state.oauthSignIn = nil
-                return .none
+                return .send(.onAppear)
 
             case .oauthSignIn:
                 return .none
@@ -197,9 +177,6 @@ struct HomeFeature {
                 // AppFeature observes this delegate action and transitions to .launching.
                 return .none
             }
-        }
-        .ifLet(\.$nodeEnrollment, action: \.nodeEnrollment) {
-            NodeEnrollmentFeature()
         }
         .ifLet(\.$oauthSignIn, action: \.oauthSignIn) {
             OAuthSignInFeature()

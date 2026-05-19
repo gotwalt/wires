@@ -97,66 +97,44 @@ struct HomeFeatureTests {
         }
     }
 
+    // MARK: - Connect (OAuth sign-in)
+
     @Test
-    func approveNode_withoutHost_isNoop() async {
+    func connectTapped_presentsOAuthSignInSheet() async {
         let store = TestStore(
             initialState: HomeFeature.State(rootPubkeyHex: Self.pubkey)
         ) {
             HomeFeature()
         }
 
-        await store.send(.approveNodeTapped)
-        #expect(store.state.nodeEnrollment == nil)
-    }
-
-    @Test
-    func approveNode_withHost_presentsEnrollmentSheet() async {
-        var initial = HomeFeature.State(rootPubkeyHex: Self.pubkey)
-        initial.host = Self.sampleHost
-        let store = TestStore(initialState: initial) { HomeFeature() }
-
-        await store.send(.approveNodeTapped) {
-            $0.nodeEnrollment = .scan(NodeEnrollmentFeature.ScanStepState(host: Self.sampleHost))
-        }
-    }
-
-    @Test
-    func enrollmentDismiss_clearsSheet() async {
-        var initial = HomeFeature.State(rootPubkeyHex: Self.pubkey)
-        initial.host = Self.sampleHost
-        initial.nodeEnrollment = .initial(host: Self.sampleHost)
-
-        let store = TestStore(initialState: initial) { HomeFeature() }
-
-        await store.send(.nodeEnrollment(.presented(.dismissTapped))) {
-            $0.nodeEnrollment = nil
-        }
-    }
-
-    // MARK: - OAuth sign-in
-
-    @Test
-    func signInToServiceTapped_presentsOAuthSignInSheet() async {
-        let store = TestStore(
-            initialState: HomeFeature.State(rootPubkeyHex: Self.pubkey)
-        ) {
-            HomeFeature()
-        }
-
-        await store.send(.signInToServiceTapped) {
+        await store.send(.connectTapped) {
             $0.oauthSignIn = .initial()
         }
     }
 
     @Test
-    func oauthSignInDismissTapped_clearsSheet() async {
+    func oauthSignInDismiss_clearsSheetAndRefreshesCaps() async {
         var initial = HomeFeature.State(rootPubkeyHex: Self.pubkey)
         initial.oauthSignIn = .initial()
 
-        let store = TestStore(initialState: initial) { HomeFeature() }
+        let store = TestStore(initialState: initial) {
+            HomeFeature()
+        } withDependencies: {
+            $0.householdClient.listCaps = { [] }
+            $0.householdClient.loadHousehold = { nil }
+        }
 
         await store.send(.oauthSignIn(.presented(.dismissTapped))) {
             $0.oauthSignIn = nil
+        }
+        await store.receive(\.onAppear) {
+            $0.loading = true
+            $0.loadError = nil
+        }
+        await store.receive(\.loaded) {
+            $0.loading = false
+            $0.caps = []
+            $0.host = nil
         }
     }
 
