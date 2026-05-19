@@ -1,15 +1,15 @@
-//! Renders the consent HTML page. Two QR codes (pair on the left, sign-in
-//! on the right) inline as SVG, plus a small JS polling loop that hits
-//! `/oauth/authorize/status/<session_id>` and performs the OAuth redirect
-//! when one of the paths completes.
+//! Renders the consent HTML page. A single QR (the `SessionTicket`) is shown
+//! inline as SVG. A small JS polling loop hits
+//! `/oauth/authorize/status/<session_id>` and performs the OAuth redirect when
+//! either the pair or sign-in path completes.
+// TODO Task 6: full single-QR design goes here; this is the compile shim from Task 5.
 
 use axum::response::Html;
 
 use crate::oauth::authorize::AuthorizeContext;
 
 pub fn render(ctx: &AuthorizeContext) -> Html<String> {
-    let pair_svg = render_qr_svg(&ctx.pair_token_b64);
-    let signin_svg = render_qr_svg(&ctx.signin_challenge_b64);
+    let qr_svg = render_qr_svg(&ctx.session_ticket_b64);
     let session_id = html_escape(&ctx.session_id);
     let client_name = html_escape(&ctx.client_name);
     Html(format!(
@@ -19,34 +19,23 @@ pub fn render(ctx: &AuthorizeContext) -> Html<String> {
 <meta charset="utf-8">
 <title>Sign in to MCP Gateway</title>
 <meta name="wires-mcp-session-id" content="{session_id}">
-<meta name="wires-mcp-pair-token" content="{pair_token_b64}">
-<meta name="wires-mcp-signin-challenge" content="{signin_challenge_b64}">
+<meta name="wires-mcp-session-ticket" content="{ticket_b64}">
 <style>
-body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; max-width: 860px; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; max-width: 520px; }}
 h1 {{ font-size: 1.4rem; margin-bottom: 0.25rem; }}
 .subtitle {{ color: #666; margin-top: 0; }}
-.row {{ display: flex; gap: 2rem; margin-top: 2rem; }}
-.col {{ flex: 1; border: 1px solid #ddd; border-radius: 12px; padding: 1.5rem; text-align: center; }}
-.col h2 {{ font-size: 1.1rem; margin: 0 0 1rem; }}
-.qr {{ width: 240px; height: 240px; margin: 0 auto; }}
+.card {{ margin-top: 2rem; border: 1px solid #ddd; border-radius: 12px; padding: 1.5rem; text-align: center; }}
+.qr {{ width: 280px; height: 280px; margin: 0 auto; }}
 .qr svg {{ width: 100%; height: 100%; }}
-.hint {{ color: #666; font-size: 0.9rem; margin-top: 1rem; }}
+.hint {{ color: #666; font-size: 0.95rem; margin-top: 1rem; }}
 </style>
 </head>
 <body>
 <h1>Sign in to MCP Gateway</h1>
 <p class="subtitle">Requesting access for <strong>{client_name}</strong>. Scope: <code>mcp:wires</code>.</p>
-<div class="row">
-  <div class="col">
-    <h2>First time here?</h2>
-    <div class="qr">{pair_svg}</div>
-    <p class="hint">Scan with the Wires app and approve the new agent.</p>
-  </div>
-  <div class="col">
-    <h2>Already signed in?</h2>
-    <div class="qr">{signin_svg}</div>
-    <p class="hint">Scan with the Wires app to authenticate.</p>
-  </div>
+<div class="card">
+  <div class="qr">{qr_svg}</div>
+  <p class="hint">Open the Wires app on your iPhone and scan this code. Whether this is a new account or you've signed in before, the app will figure it out.</p>
 </div>
 <p id="status" class="hint">Waiting…</p>
 <script>
@@ -72,8 +61,7 @@ h1 {{ font-size: 1.4rem; margin-bottom: 0.25rem; }}
 </script>
 </body></html>"##,
         session_id_json = serde_json::to_string(&session_id).unwrap(),
-        pair_token_b64 = html_escape(&ctx.pair_token_b64),
-        signin_challenge_b64 = html_escape(&ctx.signin_challenge_b64),
+        ticket_b64 = html_escape(&ctx.session_ticket_b64),
     ))
 }
 
@@ -100,18 +88,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_includes_both_qrs_and_session_id() {
+    fn render_includes_single_qr_and_session_id() {
         let ctx = AuthorizeContext {
             session_id: "sess-1".into(),
             client_name: "Claude Desktop".into(),
-            pair_token_b64: "AAAA".into(),
-            signin_challenge_b64: "BBBB".into(),
+            session_ticket_b64: "AAAA".into(),
         };
         let html = render(&ctx).0;
         assert!(html.contains("sess-1"));
         assert!(html.contains("Claude Desktop"));
-        // Two SVGs (one per QR).
-        assert_eq!(html.matches("<svg").count(), 2);
+        // Single QR now (was 2).
+        assert_eq!(html.matches("<svg").count(), 1);
+        // Meta tag matches the new name.
+        assert!(html.contains("wires-mcp-session-ticket"));
+        assert!(!html.contains("wires-mcp-pair-token"));
     }
 
     #[test]
@@ -119,8 +109,7 @@ mod tests {
         let ctx = AuthorizeContext {
             session_id: "sess-1".into(),
             client_name: "<script>evil</script>".into(),
-            pair_token_b64: "AAAA".into(),
-            signin_challenge_b64: "BBBB".into(),
+            session_ticket_b64: "AAAA".into(),
         };
         let html = render(&ctx).0;
         assert!(!html.contains("<script>evil"));
