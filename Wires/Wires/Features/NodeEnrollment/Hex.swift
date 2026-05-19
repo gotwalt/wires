@@ -16,6 +16,11 @@ extension Data {
         }
         self = bytes
     }
+
+    /// Encode as a lower-case hex string (no separators).
+    func wiresHex() -> String {
+        map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 /// Stable serialised name for a Right — matches the spec's wire-format
