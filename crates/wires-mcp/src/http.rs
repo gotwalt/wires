@@ -6,7 +6,11 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::body::{Body, to_bytes};
 use axum::extract::FromRef;
+use axum::http::Request;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use ed25519_dalek::SigningKey;
 use snafu::ResultExt;
 
@@ -37,8 +41,7 @@ impl FromRef<ServiceState> for Arc<SigningKey> {
 }
 
 pub fn app(state: ServiceState) -> Router {
-    Router::new()
-        .route("/_health", axum::routing::get(health))
+    let oauth_routes = Router::new()
         .route(
             "/.well-known/oauth-protected-resource",
             axum::routing::get(crate::oauth::prm::handler),
@@ -71,6 +74,11 @@ pub fn app(state: ServiceState) -> Router {
             "/oauth/token",
             axum::routing::post(crate::oauth::token::handler),
         )
+        .layer(axum::middleware::from_fn(log_oauth));
+
+    Router::new()
+        .route("/_health", axum::routing::get(health))
+        .merge(oauth_routes)
         .route(
             "/mcp",
             axum::routing::post(crate::mcp::router::handler).layer(
@@ -81,6 +89,53 @@ pub fn app(state: ServiceState) -> Router {
             ),
         )
         .with_state(state)
+}
+
+/// Debug middleware for `/oauth/*` and `/.well-known/*`: buffers the request
+/// body and response body, logs both at `debug` level, then passes them
+/// through. Enabled by setting `RUST_LOG=wires_mcp::http=debug`. Off by
+/// default; do not leave on in production — request bodies may contain
+/// short-lived secrets (auth codes, PKCE verifiers, refresh tokens).
+async fn log_oauth(req: Request<Body>, next: Next) -> Response {
+    const MAX_LOG_BODY: usize = 64 * 1024;
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let req_headers = format!("{:?}", req.headers());
+    let (parts, body) = req.into_parts();
+    let req_bytes = match to_bytes(body, MAX_LOG_BODY).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, method = %method, uri = %uri, "log_oauth: req body read failed");
+            return axum::http::StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    tracing::debug!(
+        method = %method,
+        uri = %uri,
+        headers = %req_headers,
+        body = %String::from_utf8_lossy(&req_bytes),
+        "oauth request",
+    );
+    let req = Request::from_parts(parts, Body::from(req_bytes));
+    let resp = next.run(req).await;
+    let (resp_parts, resp_body) = resp.into_parts();
+    let resp_headers = format!("{:?}", resp_parts.headers);
+    let resp_bytes = match to_bytes(resp_body, MAX_LOG_BODY).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, method = %method, uri = %uri, "log_oauth: resp body read failed");
+            return Response::from_parts(resp_parts, Body::empty());
+        }
+    };
+    tracing::debug!(
+        method = %method,
+        uri = %uri,
+        status = %resp_parts.status,
+        headers = %resp_headers,
+        body = %String::from_utf8_lossy(&resp_bytes),
+        "oauth response",
+    );
+    Response::from_parts(resp_parts, Body::from(resp_bytes))
 }
 
 async fn health() -> &'static str {
