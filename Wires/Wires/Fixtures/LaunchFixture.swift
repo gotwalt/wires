@@ -81,10 +81,84 @@ enum LaunchFixture: String, CaseIterable {
             values.householdClient = .fixture()
             values.mcpGatewayClient = .fixture()
 
-        case .homeLoading, .homeEmpty, .homeOneCap, .homeThreeCapsOneRevoked,
-             .enrollScan, .enrollApprovePristine, .enrollApprovePartial, .enrollDone,
+        case .homeLoading:
+            values.cameraPermissionClient = .fixture(.granted)
+            values.wiresClient = .fixture()
+            values.householdClient = .fixture(listCapsBehavior: .block)
+            values.mcpGatewayClient = .fixture()
+
+        case .homeEmpty:
+            values.cameraPermissionClient = .fixture(.granted)
+            values.wiresClient = .fixture()
+            values.householdClient = .fixture(
+                household: Household(
+                    rootPubkeyHex: String(repeating: "ab", count: 32),
+                    hostEndpointIdHex: String(repeating: "cd", count: 32)
+                ),
+                caps: []
+            )
+            values.mcpGatewayClient = .fixture()
+
+        case .homeOneCap:
+            values.cameraPermissionClient = .fixture(.granted)
+            values.wiresClient = .fixture()
+            let cap = CapRecord(
+                capIdHex: String(repeating: "11", count: 32),
+                nodePubkeyHex: String(repeating: "aa", count: 32),
+                nodeAlias: "Aaron's Mac",
+                topicNames: ["family"],
+                rights: ["read", "write"],
+                issuedAt: Date(timeIntervalSince1970: 1_715_000_000)
+            )
+            values.householdClient = .fixture(
+                household: Household(
+                    rootPubkeyHex: String(repeating: "ab", count: 32),
+                    hostEndpointIdHex: String(repeating: "cd", count: 32)
+                ),
+                caps: [cap]
+            )
+            values.mcpGatewayClient = .fixture()
+
+        case .homeThreeCapsOneRevoked:
+            values.cameraPermissionClient = .fixture(.granted)
+            values.wiresClient = .fixture()
+            let macFamily = CapRecord(
+                capIdHex: String(repeating: "11", count: 32),
+                nodePubkeyHex: String(repeating: "aa", count: 32),
+                nodeAlias: "Aaron's Mac",
+                topicNames: ["family"],
+                rights: ["read", "write"],
+                issuedAt: Date(timeIntervalSince1970: 1_715_000_000)
+            )
+            let iPadCalendar = CapRecord(
+                capIdHex: String(repeating: "22", count: 32),
+                nodePubkeyHex: String(repeating: "bb", count: 32),
+                nodeAlias: "Kitchen iPad",
+                topicNames: ["calendar"],
+                rights: ["read"],
+                issuedAt: Date(timeIntervalSince1970: 1_715_100_000),
+                revokedAt: Date(timeIntervalSince1970: 1_715_200_000)
+            )
+            let hassMqtt = CapRecord(
+                capIdHex: String(repeating: "33", count: 32),
+                nodePubkeyHex: String(repeating: "cc", count: 32),
+                nodeAlias: nil,
+                topicNames: ["mqtt:hass"],
+                rights: ["read", "write"],
+                issuedAt: Date(timeIntervalSince1970: 1_715_300_000)
+            )
+            values.householdClient = .fixture(
+                household: Household(
+                    rootPubkeyHex: String(repeating: "ab", count: 32),
+                    hostEndpointIdHex: String(repeating: "cd", count: 32)
+                ),
+                caps: [macFamily, iPadCalendar, hassMqtt]
+            )
+            values.mcpGatewayClient = .fixture()
+
+        case .enrollScan, .enrollApprovePristine, .enrollApprovePartial, .enrollDone,
              .oauthScan, .oauthSigninConfirm, .oauthPairApprove, .oauthDone, .oauthError:
-            break  // filled in by Tasks 4b–4d
+            break  // filled in by Tasks 4c–4d
         }
     }
 
@@ -132,10 +206,21 @@ enum LaunchFixture: String, CaseIterable {
             )
             return .bootstrap(s)
 
-        case .homeLoading, .homeEmpty, .homeOneCap, .homeThreeCapsOneRevoked,
-             .enrollScan, .enrollApprovePristine, .enrollApprovePartial, .enrollDone,
+        case .homeLoading:
+            var s = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            s.loading = true
+            return .home(s)
+
+        case .homeEmpty, .homeOneCap, .homeThreeCapsOneRevoked:
+            // HomeFeature.onAppear will call householdClient.listCaps which the
+            // per-fixture override returns immediately. Set loading=false so
+            // the brief flash before the effect resolves isn't .loading; the
+            // effect resolves and overwrites caps from the client.
+            return .home(HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32)))
+
+        case .enrollScan, .enrollApprovePristine, .enrollApprovePartial, .enrollDone,
              .oauthScan, .oauthSigninConfirm, .oauthPairApprove, .oauthDone, .oauthError:
-            return .launching  // filled in by Tasks 4b–4d
+            return .launching  // filled in by Tasks 4c–4d
         }
     }
 
