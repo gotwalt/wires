@@ -7,7 +7,7 @@ End-to-end encrypted gossip substrate for a household's AI agents. Think "a priv
 - **Substrate v1** — identity, topics, capabilities, encrypted publish/subscribe, replay between peers, persisted hash-chained logs. Drives the CLI end-to-end. Spec: [`docs/superpowers/specs/2026-05-14-wires-substrate-design.md`](docs/superpowers/specs/2026-05-14-wires-substrate-design.md).
 - **Hosted service v1** — `wires-host` is a multi-tenant blind relay with a `/wires/tenant/0` control-plane ALPN, per-tenant rolling retention, and an HTTPS service-discovery endpoint. Spec: [`docs/superpowers/specs/2026-05-14-wires-hosted-service-design.md`](docs/superpowers/specs/2026-05-14-wires-hosted-service-design.md).
 - **Responder-driven pairing v1** — agents declare a role + requested scopes via `wires pair-listen`; the operator consents and dials in via `wires pair-approve` over `/wires/pair/0` with a sealed, signed `PairGrant`. Spec: [`docs/superpowers/specs/2026-05-15-wires-responder-driven-pairing-design.md`](docs/superpowers/specs/2026-05-15-wires-responder-driven-pairing-design.md).
-- **MCP gateway v1** — `wires-mcp` is a multi-tenant authenticated MCP gateway. OAuth 2.1 (PRM + AS + DCR), iOS as universal authenticator, MCP tools: `wires_list_topics`, `wires_publish`, `wires_tail`. Spec: [`docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md`](docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md).
+- **MCP gateway v1** — `wires-mcp` is a multi-tenant authenticated MCP gateway. OAuth 2.1 (PRM + AS + DCR), iOS as universal authenticator, MCP tools: `wires_list_topics`, `wires_publish`, `wires_tail`. Per-user TTL + byte-budget retention (defaults: 1 h / 50 MiB; operator-tunable via `[retention]`). Specs: [gateway](docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md), [retention](docs/superpowers/specs/2026-05-18-wires-mcp-retention-design.md).
 
 A working Home Assistant ingestion daemon (`wires-ha`) ships as a separate binary.
 
@@ -246,6 +246,12 @@ cat >/etc/wires-mcp/config.toml <<EOF
 public_url = "https://mcp.example.com"
 bind = "127.0.0.1:3001"
 data_dir = "/var/lib/wires-mcp"
+
+# Optional. Defaults: ttl_secs = 3600 (1 h), max_bytes_per_user = 52428800 (50 MiB).
+# ttl_secs must be > 0; max_bytes_per_user = 0 disables the byte cap.
+# [retention]
+# ttl_secs = 3600
+# max_bytes_per_user = 52428800
 EOF
 
 # 2. Run the service.

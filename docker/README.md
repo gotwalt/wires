@@ -25,6 +25,9 @@ cd ~/src/wires
 # 1. Seed the wires-mcp config (one-time per host).
 cp docker/wires-mcp.toml.example docker/wires-mcp.toml
 ${EDITOR:-nano} docker/wires-mcp.toml   # edit public_url to your Funnel hostname
+                                        # (the example file also documents the
+                                        #  [retention] block; defaults 1 h / 50 MiB
+                                        #  apply if omitted)
 
 # 2. Build and start both services. Polls /:10000 (wires-host) and /_health
 #    (wires-mcp) to confirm both are up.
