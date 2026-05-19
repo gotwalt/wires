@@ -190,6 +190,19 @@ impl PairBridge {
     /// `session_id`, bind an iroh endpoint, register the pair protocol with
     /// an `on_paired` callback, return the base64 PairRequest token.
     pub async fn start(&self, session_id: &str, client_name: &str) -> Result<String> {
+        // Idempotency: if we've already started for this session, return the
+        // cached token. Probe retries must not allocate a new iroh endpoint.
+        if let Ok(Some(existing)) = self.store.get_pending_pair(session_id) {
+            let still_active = self.routers.lock().contains_key(session_id);
+            if still_active {
+                return Ok(existing.request_token_b64);
+            }
+            // Row exists but router is gone (process restart, ttl sweep, etc.):
+            // clear the stale row so the fresh start path proceeds cleanly.
+            let _ = self.store.delete_pending_pair(session_id);
+            let _ = std::fs::remove_dir_all(self.pending_pairs_dir.join(session_id));
+        }
+
         std::fs::create_dir_all(&self.pending_pairs_dir).context(IoSnafu)?;
         let temp_dir = self.pending_pairs_dir.join(session_id);
         std::fs::create_dir_all(&temp_dir).context(IoSnafu)?;
@@ -546,5 +559,31 @@ mod tests {
         let map: HashMap<String, Instant> = [("a".to_string(), now - ttl)].into_iter().collect();
         // Exactly `ttl` old is considered expired (>=).
         assert_eq!(pick_expired(map.iter(), now, ttl), vec!["a".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_is_idempotent_per_session() {
+        // Two probe retries for the same session_id MUST NOT allocate a new
+        // iroh endpoint each time; both calls return the same pair_token.
+        let tmp = TempDir::new().unwrap();
+        let cfg = GatewayConfig {
+            public_url: "https://mcp.example.com".into(),
+            bind: "127.0.0.1:0".into(),
+            data_dir: tmp.path().to_path_buf(),
+            retention: None,
+        };
+        let store = Store::open(&cfg.gateway_db_path()).unwrap();
+        let supervisor = TenantSupervisor::new(cfg.users_dir(), Duration::from_secs(60), None);
+        let bridge = PairBridge::new(
+            cfg.pending_pairs_dir(),
+            cfg.public_url.clone(),
+            store.clone(),
+            supervisor,
+        );
+
+        let first = bridge.start("sess-x", "Claude Desktop").await.unwrap();
+        let second = bridge.start("sess-x", "Claude Desktop").await.unwrap();
+        assert_eq!(first, second, "second start must return cached token");
+        assert_eq!(bridge.tracked_sessions(), 1, "only one router per session");
     }
 }
