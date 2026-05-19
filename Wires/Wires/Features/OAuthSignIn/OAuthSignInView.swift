@@ -20,7 +20,7 @@ struct OAuthSignInView: View {
     @ViewBuilder private var content: some View {
         switch store.state {
         case .scan:
-            if let scanStore = store.scope(state: \.scan, action: \.scan) {
+            if let scanStore = store.scope(state: \.scan?, action: \.scan) {
                 ScanView(store: scanStore)
             }
         case .probing:
