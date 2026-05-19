@@ -115,9 +115,8 @@ pub struct PairInstallSummary {
 /// `PairFrame::Ack` is sent. Returning `Err` aborts the ack: the handler
 /// returns `PairFrame::Reject(AlreadyPaired)` if the error is of type
 /// `OnPairedError::AlreadyPaired`, otherwise `Reject(InternalError)`.
-pub type OnPaired = dyn Fn(PairInstallSummary) -> std::result::Result<(), OnPairedError>
-    + Send
-    + Sync;
+pub type OnPaired =
+    dyn Fn(PairInstallSummary) -> std::result::Result<(), OnPairedError> + Send + Sync;
 
 /// Reject codes the on_paired callback can request.
 #[derive(Debug)]
@@ -144,7 +143,11 @@ pub struct NodePairHandler {
 
 struct HandlerState {
     data_dir: std::path::PathBuf,
-    node: Arc<Node>,
+    /// `Some` until `install_grant` returns successfully. Dropped before
+    /// `on_paired` runs so the handler doesn't hold redb file locks at the
+    /// data_dir path while the callback may be renaming it elsewhere — a
+    /// process-wide flock contention bug seen by the wires-mcp gateway.
+    node: Option<Arc<Node>>,
     self_agent_pubkey: [u8; 32],
     expected_nonce: [u8; 32],
     ephemeral_secret: StaticSecret,
@@ -167,7 +170,7 @@ impl NodePairHandler {
         Self {
             inner: Arc::new(Mutex::new(HandlerState {
                 data_dir,
-                node,
+                node: Some(node),
                 self_agent_pubkey,
                 expected_nonce,
                 ephemeral_secret,
@@ -231,9 +234,15 @@ impl PairHandler for NodePairHandler {
             );
         }
 
+        let node = match state.node.as_ref() {
+            Some(n) => Arc::clone(n),
+            None => {
+                return reject(PairRejectCode::InternalError, "node already released");
+            }
+        };
         match install_grant(
             &state.data_dir.clone(),
-            &state.node,
+            &node,
             &state.self_agent_pubkey,
             &grant,
         ) {
@@ -245,6 +254,12 @@ impl PairHandler for NodePairHandler {
                     );
                 }
                 state.completed = true;
+                // Release every Arc<Node> reference held by the handler before
+                // the callback runs. The callback may rename data_dir, which
+                // would otherwise contend with the redb flock the Node holds
+                // on its caps.db / topic-log files.
+                state.node = None;
+                drop(node);
                 if let Some(cb) = state.on_paired.clone() {
                     let summary = PairInstallSummary {
                         root_pubkey_hex: hex::encode(grant.root_pubkey),
