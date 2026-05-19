@@ -101,6 +101,13 @@ fn main() -> std::process::ExitCode {
                     return std::process::ExitCode::FAILURE;
                 }
             };
+            let _pair_gc = {
+                let _enter = rt.enter();
+                std::sync::Arc::clone(&state.pair_bridge).spawn_gc(
+                    std::time::Duration::from_secs(60),
+                    wires_mcp::pair_bridge::PAIR_TTL,
+                )
+            };
             match rt.block_on(wires_mcp::http::serve(state)) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(e) => {
