@@ -175,6 +175,10 @@ impl Node {
     /// This is the "tail" surface used by the MCP gateway. The hwm map starts
     /// empty (meaning "from genesis") and is advanced by the caller via the
     /// returned cursor after each call.
+    ///
+    /// Reads are side-effect free: they do not broadcast `DecryptedEvent`s to
+    /// `subscribe()` listeners, since the events represent live traffic and a
+    /// historical read shouldn't masquerade as one.
     pub fn read_decrypted_since(
         &self,
         topic_id: &[u8; 32],
@@ -182,25 +186,17 @@ impl Node {
         limit: usize,
     ) -> Result<Vec<DecryptedMessage>> {
         let log = self.logs.get_or_open(topic_id)?;
-        // Collect all senders with messages in this log.
-        let all_msgs = log.read_all().context(StoreSnafu)?;
-        // Group by sender; apply hwm filter.
-        let mut by_sender: std::collections::HashMap<[u8; 32], Vec<WireMessage>> =
-            std::collections::HashMap::new();
-        for msg in all_msgs {
-            let after_seq = hwm
-                .get(&hex::encode(msg.sender))
-                .map(|(seq, _)| *seq);
-            let include = match after_seq {
-                None => true,
-                Some(last) => msg.seq > last,
-            };
-            if include {
-                by_sender.entry(msg.sender).or_default().push(msg);
-            }
+        // Enumerate senders from the log's HWM map, then range-scan each.
+        // Avoids loading the entire topic log into memory just to filter.
+        let log_hwm = log.hwm().context(StoreSnafu)?;
+        let mut flat: Vec<WireMessage> = Vec::new();
+        for sender_pk in log_hwm.keys() {
+            let after_seq = hwm.get(&hex::encode(sender_pk)).map(|(seq, _)| *seq);
+            let msgs = log
+                .read_after(sender_pk, after_seq, limit)
+                .context(StoreSnafu)?;
+            flat.extend(msgs);
         }
-        // Flatten and sort by (timestamp, sender, seq).
-        let mut flat: Vec<WireMessage> = by_sender.into_values().flatten().collect();
         flat.sort_by(|a, b| {
             a.timestamp
                 .cmp(&b.timestamp)
@@ -208,17 +204,37 @@ impl Node {
                 .then(a.seq.cmp(&b.seq))
         });
         flat.truncate(limit);
-        // Decrypt each message.
+        // Decrypt-only path: runs `process` directly without going through
+        // `handle_inbound` (which broadcasts).
         let mut out = Vec::with_capacity(flat.len());
         for msg in flat {
-            let outcome = self.handle_inbound(msg.clone())?;
+            let outcome = self.decrypt_only(msg.clone())?;
             let content = match outcome {
                 crate::inbound::Inbound::Accepted { content, .. } => content,
                 _ => None,
             };
-            out.push(DecryptedMessage { envelope: msg, content });
+            out.push(DecryptedMessage {
+                envelope: msg,
+                content,
+            });
         }
         Ok(out)
+    }
+
+    /// Decrypt + validate a message without broadcasting an event. Used by
+    /// `read_decrypted_since` so historical reads don't leak as live traffic
+    /// to subscribers.
+    fn decrypt_only(&self, msg: WireMessage) -> Result<Inbound> {
+        let log = self.logs.get_or_open(&msg.topic_id)?;
+        let keys = self.epoch_keys_for(&msg.topic_id)?;
+        let ctx = InboundCtx {
+            topic_log: &log,
+            epoch_keys: &keys,
+            cap_table: &self.caps,
+            self_x25519_sk: &self.x_sk,
+            self_x25519_pk: &self.x_pk,
+        };
+        process(&ctx, msg)
     }
 
     pub fn install_epoch_key(&self, topic_id: [u8; 32], epoch: u32, key: EpochKey) -> Result<()> {
@@ -278,6 +294,63 @@ mod tests {
             .unwrap();
         let ev = sub.recv().await.unwrap();
         assert_eq!(ev.topic_id, topic_id);
+    }
+
+    #[tokio::test]
+    async fn read_decrypted_since_does_not_broadcast_historical_messages() {
+        // Reading history must be side-effect-free: a separate live subscriber
+        // shouldn't see historical messages re-broadcast as if they just
+        // arrived. Regression test for the leak in the original implementation
+        // where read_decrypted_since called handle_inbound (which broadcasts).
+        let tmp = TempDir::new().unwrap();
+        let root = SigningKey::generate(&mut OsRng);
+        let root_hex = hex::encode(root.verifying_key().to_bytes());
+        let node = open_node(&tmp, root_hex);
+
+        let sender_pk = node.ed_sk.verifying_key().to_bytes();
+        let mut cap = Capability::new_unsigned(
+            sender_pk,
+            vec!["home.test".into()],
+            vec![Right::Read, Right::Write],
+            0,
+            None,
+        );
+        cap.sign(&root).unwrap();
+        let cap_id = cap.cap_id.0;
+        node.caps.upsert_grant(&cap).unwrap();
+
+        let topic_id = [42u8; 32];
+        node.install_epoch_key(topic_id, 0, [9u8; 32]).unwrap();
+
+        // Publish two messages first (these broadcast — expected).
+        node.publish_standard(
+            topic_id,
+            cap_id,
+            CanonicalContent::new("home.test", "first"),
+        )
+        .unwrap();
+        node.publish_standard(
+            topic_id,
+            cap_id,
+            CanonicalContent::new("home.test", "second"),
+        )
+        .unwrap();
+
+        // Now attach a fresh subscriber and read history.
+        let mut sub = node.subscribe();
+        let history = node
+            .read_decrypted_since(&topic_id, &std::collections::HashMap::new(), 100)
+            .unwrap();
+        assert_eq!(history.len(), 2, "expected both messages in history");
+
+        // The fresh subscriber must NOT see the historical messages — they
+        // happened before subscribe() was called and the read should be
+        // side-effect free.
+        match sub.try_recv() {
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+            Ok(ev) => panic!("history leaked into live broadcast: {:?}", ev),
+            Err(e) => panic!("unexpected channel state: {e:?}"),
+        }
     }
 
     #[test]
