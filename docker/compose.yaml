@@ -4,6 +4,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      target: runtime-host
     image: wires-host:local
     container_name: wires-host
     network_mode: host
