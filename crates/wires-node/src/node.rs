@@ -11,7 +11,7 @@ use snafu::ResultExt;
 use tokio::sync::broadcast;
 use wires_core::{CanonicalContent, MessageKind, WireMessage};
 use wires_crypto::{X25519Public, X25519Secret};
-use wires_store::{CapTable, EpochKey, EpochKeyStore, open_caps, open_topic_keys};
+use wires_store::{CapTable, EpochKey, EpochKeyStore, IngestIndex, open_caps, open_ingest_index, open_topic_keys};
 
 use crate::config::NodeConfig;
 use crate::error::{IoSnafu, NetSnafu, Result, StoreSnafu};
@@ -31,6 +31,10 @@ pub struct Node {
     pub caps: Arc<CapTable>,
     keys_by_topic: Mutex<HashMap<[u8; 32], Arc<EpochKeyStore>>>,
     pub events_tx: broadcast::Sender<DecryptedEvent>,
+    /// Optional retention enforcement (gateway path). `None` for CLI/HA.
+    pub retention: Option<crate::config::RetentionPolicy>,
+    /// Per-user ingest index. Present iff `retention.is_some()`.
+    pub ingest_index: Option<Arc<wires_store::IngestIndex>>,
     /// Serializes the read-build-append sequence in `publish_standard`. Without
     /// it, two concurrent publishes on the same (topic, sender) would both read
     /// the same hwm seq, encrypt under the same deterministic ChaCha20 nonce
@@ -69,6 +73,15 @@ impl Node {
         let logs = Arc::new(TopicLogs::new(&config.data_dir));
         let caps_db = open_caps(&config.data_dir).context(StoreSnafu)?;
         let caps = Arc::new(CapTable::new(Arc::new(caps_db)));
+        let (retention, ingest_index) = match &config.retention {
+            Some(policy) => {
+                let ingest_db =
+                    open_ingest_index(&config.data_dir, &config.root_pubkey_hex).context(StoreSnafu)?;
+                let idx = Arc::new(IngestIndex::new(Arc::new(ingest_db)));
+                (Some(policy.clone()), Some(idx))
+            }
+            None => (None, None),
+        };
         let (events_tx, _) = broadcast::channel::<DecryptedEvent>(1024);
 
         Ok(Self {
@@ -80,6 +93,8 @@ impl Node {
             caps,
             keys_by_topic: Mutex::new(HashMap::new()),
             events_tx,
+            retention,
+            ingest_index,
             publish_lock: Mutex::new(()),
         })
     }
