@@ -22,12 +22,25 @@ Then:
 git clone <repo-url> ~/src/wires
 cd ~/src/wires
 ./docker/deploy.sh                  # builds, starts, prints the ticket
-./docker/funnel.sh up               # publishes the ticket page on :443
+./docker/funnel.sh up               # publishes the ticket page on Funnel :10000
 ```
 
 The Funnel URL is printed by `funnel.sh up` (look for the line under
 `Funnel on:`). Visiting it returns the host's ticket page; agents and
 operators use the base64 ticket to pair against this host.
+
+### Port convention
+
+`wires-host` listens on `127.0.0.1:10000` inside the container (overridden
+from the binary's default `:8089` via `compose.yaml`). The `10000`+ range
+is reserved for wires services going forward — e.g. `wires-mcp` is
+planned for `:10001`. This sidesteps privileged ports entirely and gives
+each wires service a predictable home.
+
+Tailscale Funnel is independently limited to three public ports — `443`,
+`8443`, `10000`. `funnel.sh` defaults to publishing on `:10000` because
+`:443` is usually already in use on a shared host; override via
+`WIRES_FUNNEL_HTTPS_PORT` if you need a different one.
 
 ## Subsequent rollouts
 
@@ -92,24 +105,36 @@ After restoring, `./docker/deploy.sh` to start against the restored state.
 ## Tailscale Funnel
 
 ```bash
-./docker/funnel.sh up      # publish :8089 on Funnel :443
+./docker/funnel.sh up      # publish 127.0.0.1:10000 on Funnel :10000
 ./docker/funnel.sh status  # see current mapping
-./docker/funnel.sh down    # remove all Funnel mappings on this node
+./docker/funnel.sh down    # remove just this script's Funnel mapping
 ```
 
 The script wraps `tailscale funnel`; it does not manage admin-policy
 permissions or HTTPS cert provisioning, both of which are tailnet-wide
 toggles done once in the Tailscale admin panel.
 
+Override the defaults with env vars when needed:
+
+```bash
+WIRES_FUNNEL_HTTPS_PORT=443 ./docker/funnel.sh up    # public Funnel port (443, 8443, or 10000)
+WIRES_HOST_HTTP_PORT=10000  ./docker/funnel.sh up    # local port to forward to (matches compose.yaml)
+WIRES_FUNNEL_PATH=/host/    ./docker/funnel.sh up    # serve under a sub-path
+```
+
+`funnel.sh down` removes only the mapping for the configured
+`(WIRES_FUNNEL_HTTPS_PORT, WIRES_FUNNEL_PATH)` pair, not every Funnel rule
+on the node — so other services using Funnel on this host stay up.
+
 ## Troubleshooting
 
 - **`Cannot connect to the Docker daemon`** — start Docker (or your VM
   runtime). `deploy.sh` cannot continue without it.
 - **Ticket HTTP poll times out** — check `docker compose logs wires-host`
-  for a bind error on `0.0.0.0:8089` (another process is using the port)
+  for a bind error on `0.0.0.0:10000` (another process is using the port)
   or an iroh endpoint failure.
 - **Funnel URL returns 502** — the container is down, or its HTTP server
-  was disabled. Confirm with `curl http://127.0.0.1:8089/` on the host.
+  was disabled. Confirm with `curl http://127.0.0.1:10000/` on the host.
 - **EndpointId changed after redeploy** — the named volume was destroyed.
   Restore from backup if available; otherwise every paired tenant must
   re-pair against the new ticket.

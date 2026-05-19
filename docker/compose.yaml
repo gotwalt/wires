@@ -12,6 +12,10 @@ services:
     restart: unless-stopped
     environment:
       RUST_LOG: "warn,wires_host=info,wires_net=info,wires_node=info"
+    # Override the binary's default --http-bind (0.0.0.0:8089) so the ticket
+    # HTTP page lives on the wires namespace port range (10000+). 10001+ is
+    # reserved for future wires-* services (wires-mcp, etc.).
+    command: ["--data-dir", "/data", "--http-bind", "0.0.0.0:10000"]
     stop_signal: SIGINT
     stop_grace_period: 10s
 
