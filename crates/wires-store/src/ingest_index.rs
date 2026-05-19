@@ -15,6 +15,7 @@ pub struct IngestEntry {
     pub sender: [u8; 32],
     pub seq: u64,
     pub bytes: u32,
+    pub ingested_at_ms: i64,
 }
 
 pub struct IngestIndex {
@@ -27,17 +28,23 @@ impl IngestIndex {
     }
 
     /// Record an ingested message. Returns the assigned ingest_seq.
-    pub fn record(&self, entry: &IngestEntry) -> Result<u64> {
+    ///
+    /// `now_ms` must be a wall-clock millisecond timestamp (see
+    /// `wires_net::unix_now_ms`). It is stored verbatim into the row's
+    /// `ingested_at_ms` field so the index can later answer "evict everything
+    /// older than X".
+    pub fn record(&self, entry: &IngestEntry, now_ms: i64) -> Result<u64> {
         let write = self.db.begin_write().context(BeginTxnSnafu)?;
         let assigned = {
             let mut meta_t = write.open_table(INGEST_META).context(OpenTableSnafu)?;
             let (next_ingest, total_bytes) = read_meta(&meta_t)?;
 
-            let mut value = [0u8; 76];
+            let mut value = [0u8; 84];
             value[0..32].copy_from_slice(&entry.topic_id);
             value[32..64].copy_from_slice(&entry.sender);
             value[64..72].copy_from_slice(&entry.seq.to_be_bytes());
             value[72..76].copy_from_slice(&entry.bytes.to_be_bytes());
+            value[76..84].copy_from_slice(&now_ms.to_be_bytes());
 
             let key = next_ingest.to_be_bytes();
 
@@ -80,24 +87,7 @@ impl IngestIndex {
             return Ok(None);
         };
         let (_k, v) = first.context(StorageIoSnafu)?;
-        let raw = v.value();
-        if raw.len() < 76 {
-            return Ok(None);
-        }
-        let mut topic_id = [0u8; 32];
-        topic_id.copy_from_slice(&raw[0..32]);
-        let mut sender = [0u8; 32];
-        sender.copy_from_slice(&raw[32..64]);
-        let mut sb = [0u8; 8];
-        sb.copy_from_slice(&raw[64..72]);
-        let mut bb = [0u8; 4];
-        bb.copy_from_slice(&raw[72..76]);
-        Ok(Some(IngestEntry {
-            topic_id,
-            sender,
-            seq: u64::from_be_bytes(sb),
-            bytes: u32::from_be_bytes(bb),
-        }))
+        Ok(decode_row(v.value()))
     }
 
     /// Evict the oldest entries until `total_bytes() ≤ budget_bytes`. Returns the
@@ -123,25 +113,8 @@ impl IngestIndex {
                 let (k, v) = entry_r.context(StorageIoSnafu)?;
                 let mut kbuf = [0u8; 8];
                 kbuf.copy_from_slice(k.value());
-                let raw = v.value();
-                if raw.len() < 76 {
-                    continue;
-                }
-                let mut topic_id = [0u8; 32];
-                topic_id.copy_from_slice(&raw[0..32]);
-                let mut sender = [0u8; 32];
-                sender.copy_from_slice(&raw[32..64]);
-                let mut sb = [0u8; 8];
-                sb.copy_from_slice(&raw[64..72]);
-                let mut bb = [0u8; 4];
-                bb.copy_from_slice(&raw[72..76]);
-                let bytes = u32::from_be_bytes(bb);
-                let ent = IngestEntry {
-                    topic_id,
-                    sender,
-                    seq: u64::from_be_bytes(sb),
-                    bytes,
-                };
+                let Some(ent) = decode_row(v.value()) else { continue };
+                let bytes = ent.bytes;
                 total = total.saturating_sub(bytes as u64);
                 victim_keys.push(kbuf);
                 victim_entries.push(ent);
@@ -159,6 +132,37 @@ impl IngestIndex {
         write.commit().context(CommitTxnSnafu)?;
         Ok(dropped)
     }
+}
+
+/// Decode a serialized ingest-index row. Accepts both the legacy 76-byte
+/// layout (decoded with `ingested_at_ms = 0`) and the current 84-byte layout.
+/// Returns `None` for any shorter buffer.
+fn decode_row(raw: &[u8]) -> Option<IngestEntry> {
+    if raw.len() < 76 {
+        return None;
+    }
+    let mut topic_id = [0u8; 32];
+    topic_id.copy_from_slice(&raw[0..32]);
+    let mut sender = [0u8; 32];
+    sender.copy_from_slice(&raw[32..64]);
+    let mut sb = [0u8; 8];
+    sb.copy_from_slice(&raw[64..72]);
+    let mut bb = [0u8; 4];
+    bb.copy_from_slice(&raw[72..76]);
+    let ingested_at_ms = if raw.len() >= 84 {
+        let mut tb = [0u8; 8];
+        tb.copy_from_slice(&raw[76..84]);
+        i64::from_be_bytes(tb)
+    } else {
+        0
+    };
+    Some(IngestEntry {
+        topic_id,
+        sender,
+        seq: u64::from_be_bytes(sb),
+        bytes: u32::from_be_bytes(bb),
+        ingested_at_ms,
+    })
 }
 
 fn read_meta<T: ReadableTable<&'static [u8], &'static [u8]>>(table: &T) -> Result<(u64, u64)> {
@@ -202,6 +206,7 @@ mod tests {
             sender: [sender; 32],
             seq,
             bytes,
+            ingested_at_ms: 0,
         }
     }
 
@@ -210,9 +215,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
         let idx = IngestIndex::new(db);
-        let a = idx.record(&entry(1, 9, 0, 100)).unwrap();
-        let b = idx.record(&entry(1, 9, 1, 200)).unwrap();
-        let c = idx.record(&entry(2, 8, 0, 50)).unwrap();
+        let a = idx.record(&entry(1, 9, 0, 100), 0).unwrap();
+        let b = idx.record(&entry(1, 9, 1, 200), 0).unwrap();
+        let c = idx.record(&entry(2, 8, 0, 50), 0).unwrap();
         assert_eq!(a, 0);
         assert_eq!(b, 1);
         assert_eq!(c, 2);
@@ -224,10 +229,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
         let idx = IngestIndex::new(db);
-        idx.record(&entry(1, 9, 0, 100)).unwrap();
-        idx.record(&entry(1, 9, 1, 200)).unwrap();
-        idx.record(&entry(2, 8, 0, 50)).unwrap();
-        idx.record(&entry(2, 8, 1, 75)).unwrap();
+        idx.record(&entry(1, 9, 0, 100), 0).unwrap();
+        idx.record(&entry(1, 9, 1, 200), 0).unwrap();
+        idx.record(&entry(2, 8, 0, 50), 0).unwrap();
+        idx.record(&entry(2, 8, 1, 75), 0).unwrap();
         // Total = 425. Evict until ≤ 75.
         let dropped = idx.evict_oldest_until(75).unwrap();
         assert_eq!(dropped.len(), 3); // oldest 100 + 200 + 50, leaving 75
@@ -243,7 +248,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
         let idx = IngestIndex::new(db);
-        idx.record(&entry(1, 9, 0, 100)).unwrap();
+        idx.record(&entry(1, 9, 0, 100), 0).unwrap();
         let dropped = idx.evict_oldest_until(1000).unwrap();
         assert!(dropped.is_empty());
         assert_eq!(idx.total_bytes().unwrap(), 100);
@@ -265,9 +270,9 @@ mod tests {
         let e0 = entry(1, 9, 0, 100);
         let e1 = entry(2, 8, 1, 200);
         let e2 = entry(3, 7, 2, 50);
-        idx.record(&e0).unwrap();
-        idx.record(&e1).unwrap();
-        idx.record(&e2).unwrap();
+        idx.record(&e0, 0).unwrap();
+        idx.record(&e1, 0).unwrap();
+        idx.record(&e2, 0).unwrap();
         let oldest = idx.oldest_entry().unwrap().unwrap();
         assert_eq!(oldest, e0);
     }
@@ -279,11 +284,45 @@ mod tests {
         let idx = IngestIndex::new(db);
         let e0 = entry(1, 9, 0, 100);
         let e1 = entry(2, 8, 1, 200);
-        idx.record(&e0).unwrap();
-        idx.record(&e1).unwrap();
+        idx.record(&e0, 0).unwrap();
+        idx.record(&e1, 0).unwrap();
         // Evict until ≤ 200 — evicts e0 (100 bytes), leaves e1 (200).
         idx.evict_oldest_until(200).unwrap();
         let oldest = idx.oldest_entry().unwrap().unwrap();
         assert_eq!(oldest, e1);
+    }
+
+    #[test]
+    fn record_persists_ingested_at_ms() {
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(open_ingest_index(tmp.path(), "aa").unwrap());
+        let idx = IngestIndex::new(db);
+        let e = IngestEntry {
+            topic_id: [1u8; 32],
+            sender: [9u8; 32],
+            seq: 0,
+            bytes: 100,
+            ingested_at_ms: 1_700_000_000_000,
+        };
+        idx.record(&e, 1_700_000_000_000).unwrap();
+        let oldest = idx.oldest_entry().unwrap().unwrap();
+        assert_eq!(oldest.ingested_at_ms, 1_700_000_000_000);
+        assert_eq!(oldest.bytes, 100);
+    }
+
+    #[test]
+    fn decode_row_accepts_legacy_76_byte_layout() {
+        // Build a 76-byte row by hand, decode it, expect ingested_at_ms = 0.
+        let mut raw = [0u8; 76];
+        raw[0..32].copy_from_slice(&[1u8; 32]);
+        raw[32..64].copy_from_slice(&[9u8; 32]);
+        raw[64..72].copy_from_slice(&7u64.to_be_bytes());
+        raw[72..76].copy_from_slice(&100u32.to_be_bytes());
+        let ent = decode_row(&raw).expect("legacy row should decode");
+        assert_eq!(ent.topic_id, [1u8; 32]);
+        assert_eq!(ent.sender, [9u8; 32]);
+        assert_eq!(ent.seq, 7);
+        assert_eq!(ent.bytes, 100);
+        assert_eq!(ent.ingested_at_ms, 0);
     }
 }
