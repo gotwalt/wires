@@ -21,6 +21,7 @@ pub struct ServiceState {
     pub signing_key: Arc<SigningKey>,
     pub supervisor: crate::tenants::TenantSupervisor,
     pub pair_bridge: Arc<crate::pair_bridge::PairBridge>,
+    pub rate_limit: crate::rate_limit::RateLimiter,
 }
 
 impl FromRef<ServiceState> for Arc<GatewayConfig> {
@@ -46,7 +47,10 @@ pub fn app(state: ServiceState) -> Router {
             "/.well-known/oauth-authorization-server",
             axum::routing::get(crate::oauth::as_meta::handler),
         )
-        .route("/.well-known/jwks.json", axum::routing::get(crate::oauth::jwks::handler))
+        .route(
+            "/.well-known/jwks.json",
+            axum::routing::get(crate::oauth::jwks::handler),
+        )
         .route(
             "/oauth/register",
             axum::routing::post(crate::oauth::register::handler),
@@ -63,11 +67,17 @@ pub fn app(state: ServiceState) -> Router {
             "/oauth/signin/assertion",
             axum::routing::post(crate::sign_in_endpoint::handler),
         )
-        .route("/oauth/token", axum::routing::post(crate::oauth::token::handler))
+        .route(
+            "/oauth/token",
+            axum::routing::post(crate::oauth::token::handler),
+        )
         .route(
             "/mcp",
             axum::routing::post(crate::mcp::router::handler).layer(
-                axum::middleware::from_fn_with_state(state.clone(), crate::oauth::middleware::bearer),
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::oauth::middleware::bearer,
+                ),
             ),
         )
         .with_state(state)
@@ -84,7 +94,10 @@ pub async fn serve(state: ServiceState) -> Result<()> {
     serve_with_listener(state, listener).await
 }
 
-pub async fn serve_with_listener(state: ServiceState, listener: tokio::net::TcpListener) -> Result<()> {
+pub async fn serve_with_listener(
+    state: ServiceState,
+    listener: tokio::net::TcpListener,
+) -> Result<()> {
     tracing::info!(addr = ?listener.local_addr().ok(), "wires-mcp listening");
     axum::serve(listener, app(state))
         .with_graceful_shutdown(async {
@@ -106,10 +119,8 @@ pub fn test_state(tmp: &std::path::Path) -> ServiceState {
         data_dir: tmp.to_path_buf(),
     };
     let store = Store::open(&cfg.gateway_db_path()).unwrap();
-    let supervisor = crate::tenants::TenantSupervisor::new(
-        cfg.users_dir(),
-        std::time::Duration::from_secs(60),
-    );
+    let supervisor =
+        crate::tenants::TenantSupervisor::new(cfg.users_dir(), std::time::Duration::from_secs(60));
     let pair_bridge = Arc::new(crate::pair_bridge::PairBridge::new(
         cfg.pending_pairs_dir(),
         cfg.public_url.clone(),
@@ -122,6 +133,7 @@ pub fn test_state(tmp: &std::path::Path) -> ServiceState {
         signing_key: Arc::new(SigningKey::from_bytes(&[1u8; 32])),
         supervisor,
         pair_bridge,
+        rate_limit: crate::rate_limit::RateLimiter::dcr_default(),
     }
 }
 
