@@ -126,4 +126,15 @@ mod tests {
         tampered.nonce = hex::encode([8u8; 32]);
         assert!(!tampered.verify(&k.verifying_key(), &sig));
     }
+
+    /// Dumps the canonical signing bytes for the fixture used in
+    /// `Wires/WiresTests/SignInChallengeTests.signing_bytes_match_server_for_known_inputs`.
+    /// Run with `cargo test -p wires-mcp dump_signing_bytes -- --nocapture` to regenerate
+    /// the iOS fixture string when the canonical encoding changes.
+    #[test]
+    fn dump_signing_bytes() {
+        let c = SignInChallenge::new("https://mcp.example.com", "sess-1", [7u8; 32], 1000, 60_000);
+        println!("{}", String::from_utf8_lossy(&c.signing_bytes()));
+    }
+
 }
