@@ -8,7 +8,10 @@ import Foundation
 /// `crates/wires-mcp/src/sign_in.rs` exactly.  `signingBytes()` uses
 /// `JSONSerialization` with `.sortedKeys` and `.withoutEscapingSlashes`, which
 /// reproduces the Rust `canonicalize()` + `serde_json::to_vec` output.
-struct SignInChallenge: Equatable, Sendable {
+///
+/// `nonisolated` so Sendable holds across async boundaries — project default
+/// actor isolation is MainActor and would otherwise taint conformances.
+nonisolated struct SignInChallenge: Equatable, Sendable {
     static let kindV1 = "wires.signin.v1"
 
     let version: Int

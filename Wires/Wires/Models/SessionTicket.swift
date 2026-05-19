@@ -2,7 +2,11 @@ import Foundation
 
 /// Compact QR payload the wires-mcp consent page renders.
 /// Format: URL-safe base64 (no padding) of a small JSON object.
-struct SessionTicket: Equatable, Sendable {
+///
+/// `nonisolated` so the Sendable conformance is honored across async boundaries
+/// — the project default actor isolation is MainActor, which would otherwise
+/// taint the Equatable/Sendable conformance.
+nonisolated struct SessionTicket: Equatable, Sendable {
     static let kindV1 = "wires.oauth.v1"
 
     let version: Int
