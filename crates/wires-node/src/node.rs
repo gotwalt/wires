@@ -257,6 +257,40 @@ impl Node {
         keys.put(epoch, &key).context(StoreSnafu)?;
         Ok(())
     }
+
+    /// Apply the configured retention policy: evict TTL-expired entries from
+    /// the ingest index and (if a byte budget is set) evict oldest entries
+    /// until the user is under budget. For each dropped entry, deletes the
+    /// matching per-topic `TopicLog` row.
+    ///
+    /// No-op when `retention` is `None`. Safe to call concurrently with
+    /// inbound/publish — each step is a single redb write transaction.
+    pub fn sweep(&self, now_ms: i64) -> Result<()> {
+        let Some(policy) = &self.retention else { return Ok(()); };
+        let Some(ix) = &self.ingest_index else { return Ok(()); };
+
+        let deadline = now_ms.saturating_sub(policy.ttl.as_millis() as i64);
+        let dropped_ttl = ix.evict_older_than(deadline).context(StoreSnafu)?;
+        for e in &dropped_ttl {
+            self.delete_topic_log_entry(e)?;
+        }
+
+        if policy.max_bytes_per_user > 0 {
+            let dropped_budget = ix
+                .evict_oldest_until(policy.max_bytes_per_user)
+                .context(StoreSnafu)?;
+            for e in &dropped_budget {
+                self.delete_topic_log_entry(e)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_topic_log_entry(&self, e: &wires_store::IngestEntry) -> Result<()> {
+        let log = self.logs.get_or_open(&e.topic_id)?;
+        log.delete(&e.sender, e.seq).context(StoreSnafu)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -384,6 +418,134 @@ mod tests {
         let node_b = Node::open(cfg).unwrap();
         let pk_b = node_b.ed_sk.verifying_key().to_bytes();
         assert_eq!(pk_a, pk_b);
+    }
+
+    #[test]
+    fn sweep_evicts_ttl_expired_entries_and_their_topic_log_rows() {
+        use std::time::Duration;
+        let tmp = TempDir::new().unwrap();
+        let root = SigningKey::generate(&mut OsRng);
+        let root_hex = hex::encode(root.verifying_key().to_bytes());
+        let cfg = NodeConfig {
+            data_dir: tmp.path().to_path_buf(),
+            root_pubkey_hex: root_hex,
+            host: None,
+            retention: Some(crate::config::RetentionPolicy {
+                ttl: Duration::from_millis(100),
+                max_bytes_per_user: 0,
+            }),
+        };
+        let node = Node::open(cfg).unwrap();
+
+        // Manually plant a row in the ingest_index with an old timestamp,
+        // and a matching row in the topic log.
+        let topic = [42u8; 32];
+        let sender = [9u8; 32];
+        let log = node.logs.get_or_open(&topic).unwrap();
+        let msg = wires_core::WireMessage {
+            topic_id: topic,
+            epoch: 0,
+            kind: wires_core::MessageKind::Public,
+            sender,
+            cap_id: [0u8; 16],
+            seq: 0,
+            prev_hash: [0u8; 32],
+            timestamp: 0,
+            payload_len: 0,
+            signature: [0u8; 64],
+            ciphertext: vec![],
+        };
+        log.append(&msg).unwrap();
+        let bytes = serde_json::to_vec(&msg).unwrap().len() as u32;
+        let ix = node.ingest_index.as_ref().expect("retention enabled");
+        ix.record(
+            &wires_store::IngestEntry {
+                topic_id: topic,
+                sender,
+                seq: 0,
+                bytes,
+                ingested_at_ms: 0,
+            },
+            1_000, // timestamp deep in the past
+        )
+        .unwrap();
+
+        // Sweep with now = 10_000; ttl = 100 ms → deadline = 9_900 — the entry
+        // (ts = 1_000) is stale.
+        node.sweep(10_000).unwrap();
+        assert_eq!(ix.total_bytes().unwrap(), 0);
+        assert!(log.read_after(&sender, None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sweep_with_budget_evicts_oldest_when_over() {
+        use std::time::Duration;
+        let tmp = TempDir::new().unwrap();
+        let root = SigningKey::generate(&mut OsRng);
+        let root_hex = hex::encode(root.verifying_key().to_bytes());
+        let cfg = NodeConfig {
+            data_dir: tmp.path().to_path_buf(),
+            root_pubkey_hex: root_hex,
+            host: None,
+            retention: Some(crate::config::RetentionPolicy {
+                // huge TTL so only the budget enforces.
+                ttl: Duration::from_secs(86_400),
+                max_bytes_per_user: 200,
+            }),
+        };
+        let node = Node::open(cfg).unwrap();
+        let topic = [42u8; 32];
+        let sender = [9u8; 32];
+        let log = node.logs.get_or_open(&topic).unwrap();
+        let ix = node.ingest_index.as_ref().unwrap();
+        for seq in 0..5u64 {
+            let m = wires_core::WireMessage {
+                topic_id: topic,
+                epoch: 0,
+                kind: wires_core::MessageKind::Public,
+                sender,
+                cap_id: [0u8; 16],
+                seq,
+                prev_hash: [0u8; 32],
+                timestamp: seq as i64,
+                payload_len: 0,
+                signature: [0u8; 64],
+                ciphertext: vec![],
+            };
+            log.append(&m).unwrap();
+            let b = serde_json::to_vec(&m).unwrap().len() as u32;
+            ix.record(
+                &wires_store::IngestEntry {
+                    topic_id: topic,
+                    sender,
+                    seq,
+                    bytes: b,
+                    ingested_at_ms: 1_000 + seq as i64,
+                },
+                1_000 + seq as i64,
+            )
+            .unwrap();
+        }
+        node.sweep(2_000).unwrap();
+        // Budget = 200; per-entry bytes ≈ 200+, so we expect at most 1 entry to
+        // remain (or possibly 0).
+        let after = log.read_after(&sender, None, 100).unwrap();
+        assert!(after.len() <= 1, "budget eviction left too much: {}", after.len());
+        assert!(ix.total_bytes().unwrap() <= 200);
+    }
+
+    #[test]
+    fn sweep_is_noop_when_retention_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = NodeConfig {
+            data_dir: tmp.path().to_path_buf(),
+            root_pubkey_hex: "deadbeef".into(),
+            host: None,
+            retention: None,
+        };
+        let node = Node::open(cfg).unwrap();
+        assert!(node.ingest_index.is_none());
+        node.sweep(123).unwrap(); // must not panic / error
     }
 
     #[test]
