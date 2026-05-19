@@ -89,7 +89,12 @@ If a build command times out, that's almost certainly an iOS simulator runtime d
 | `.gitignore` | Add `Wires/screenshots/` |
 | `CLAUDE.md` | One-line pointer under "Status" |
 
-**Targets:** all source files in the `Wires` target except the `SnapshotSweep.swift` (WiresUITests target) and `LaunchFixtureTests.swift` (WiresTests target). Adding files to the Xcode project: use Xcode UI to add new files to the right target so the pbxproj diff is minimal, then commit the pbxproj as part of the same commit.
+**Targets:** the Xcode project uses **synchronized folder groups** (Xcode 16's `PBXFileSystemSynchronizedRootGroup`). That means:
+- Any file under `Wires/Wires/` is automatically in the `Wires` target.
+- Any file under `Wires/WiresTests/` is automatically in the `WiresTests` target.
+- Any file under `Wires/WiresUITests/` is automatically in the `WiresUITests` target.
+
+No pbxproj editing or Xcode UI is needed. Just create the file in the correct directory and it's a target member. (You may need to verify this once for the first task by running `xcodebuild build` — if the build fails with "cannot find symbol X", the synchronized group is working but the import or target isn't right.)
 
 ---
 
@@ -207,9 +212,13 @@ case .granted:
     }
 ```
 
-- [ ] **Step 4: Add the new files to the Xcode project**
+- [ ] **Step 4: Verify file locations**
 
-Open `Wires/Wires.xcodeproj` in Xcode. Right-click the `Dependencies` group and choose "Add Files to Wires…", select `CameraPreviewKind.swift`, ensure target `Wires` is checked. Right-click the `Features/Scan` group and add `FixtureCameraPlaceholder.swift` to the `Wires` target. Save the project (`⌘S`).
+The two new files must sit at:
+- `Wires/Wires/Dependencies/CameraPreviewKind.swift`
+- `Wires/Wires/Features/Scan/FixtureCameraPlaceholder.swift`
+
+Both are inside the synchronized group rooted at `Wires/Wires/`, so they're automatically members of the `Wires` target. No pbxproj edit needed.
 
 - [ ] **Step 5: Build**
 
@@ -229,8 +238,7 @@ Expected: exit 0. Errors will be unresolved imports or missing target membership
 ```bash
 git add Wires/Wires/Dependencies/CameraPreviewKind.swift \
         Wires/Wires/Features/Scan/FixtureCameraPlaceholder.swift \
-        Wires/Wires/Features/Scan/ScanView.swift \
-        Wires/Wires.xcodeproj/project.pbxproj
+        Wires/Wires/Features/Scan/ScanView.swift
 git commit -m "$(cat <<'EOF'
 ios: add CameraPreviewKind dependency seam
 
@@ -424,16 +432,21 @@ final class LaunchFixtureTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 5: Add the four new files to the right targets**
+- [ ] **Step 5: Verify file locations**
 
-In Xcode: right-click the `Wires` group (under `Wires/Wires/`), choose
-"New Group", name it `Fixtures`. Right-click the new `Fixtures` group →
-"Add Files to Wires…" → select `FixtureRuntime.swift`, `Appearance.swift`,
-and `LaunchFixture.swift`, ensure target `Wires` is checked, click Add.
+The four new files must sit at:
+- `Wires/Wires/Fixtures/FixtureRuntime.swift`
+- `Wires/Wires/Fixtures/LaunchFixture.swift`
+- `Wires/Wires/Fixtures/Appearance.swift`
+- `Wires/WiresTests/LaunchFixtureTests.swift`
 
-Then right-click the `WiresTests` group, "Add Files to Wires…", select
-`LaunchFixtureTests.swift`, ensure **only** target `WiresTests` is
-checked, click Add. Save (`⌘S`).
+The first three are in the `Wires` target's synchronized group; the
+fourth is in the `WiresTests` synchronized group. Creating them at
+those paths is sufficient — no Xcode UI or pbxproj edits.
+
+The `Fixtures` directory does not exist yet; just `mkdir -p
+Wires/Wires/Fixtures` before writing the files (or rely on the Write
+tool to create it).
 
 - [ ] **Step 6: Build**
 
@@ -464,7 +477,7 @@ Expected: 2 tests pass, exit 0.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add Wires/Wires/Fixtures/ Wires/WiresTests/LaunchFixtureTests.swift Wires/Wires.xcodeproj/project.pbxproj
+git add Wires/Wires/Fixtures/ Wires/WiresTests/LaunchFixtureTests.swift
 git commit -m "$(cat <<'EOF'
 ios: add LaunchFixture / FixtureRuntime / Appearance skeleton
 
@@ -648,10 +661,10 @@ extension CameraPermissionClient {
 }
 ```
 
-- [ ] **Step 5: Add files to Wires target**
+- [ ] **Step 5: Verify file locations**
 
-In Xcode, right-click the `Fixtures` group, "Add Files to Wires…",
-select the four new files, ensure target `Wires` is checked. Save.
+All four new files sit under `Wires/Wires/Fixtures/`, already inside
+the `Wires` target's synchronized group. No Xcode UI step needed.
 
 - [ ] **Step 6: Build**
 
@@ -669,7 +682,7 @@ Expected: exit 0. If a WiresKit type name doesn't match (e.g. `PendingPairHandle
 - [ ] **Step 7: Commit**
 
 ```bash
-git add Wires/Wires/Fixtures/Fixtures+*.swift Wires/Wires.xcodeproj/project.pbxproj
+git add Wires/Wires/Fixtures/Fixtures+*.swift
 git commit -m "$(cat <<'EOF'
 ios: add per-dependency fixture constructors
 
@@ -1585,9 +1598,9 @@ final class WiresUITests: XCTestCase {
 }
 ```
 
-- [ ] **Step 3: Add SnapshotSweep.swift to WiresUITests target**
+- [ ] **Step 3: Verify file location**
 
-In Xcode: right-click the `WiresUITests` group, "Add Files to Wires…", select `SnapshotSweep.swift`. **Important:** in the "Add to targets" picker, check `WiresUITests` ONLY, not `Wires`. Save.
+`SnapshotSweep.swift` sits at `Wires/WiresUITests/SnapshotSweep.swift`, inside the `WiresUITests` synchronized group. That alone makes it a member of the `WiresUITests` target — no pbxproj edit or Xcode UI step.
 
 - [ ] **Step 4: Build the UI test target**
 
@@ -1606,8 +1619,7 @@ Expected: exit 0. The UITest target builds without running.
 
 ```bash
 git add Wires/WiresUITests/SnapshotSweep.swift \
-        Wires/WiresUITests/WiresUITests.swift \
-        Wires/Wires.xcodeproj/project.pbxproj
+        Wires/WiresUITests/WiresUITests.swift
 git commit -m "$(cat <<'EOF'
 ios: add SnapshotSweep UITest class
 
