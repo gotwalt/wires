@@ -212,6 +212,7 @@ impl PairBridge {
             data_dir: temp_dir.clone(),
             root_pubkey_hex: String::new(),
             host: None,
+            retention: None,
         };
         let s = toml::to_string_pretty(&cfg).map_err(|e| crate::error::GatewayError::Io {
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
@@ -434,6 +435,7 @@ mod tests {
             data_dir: pending_dir.clone(),
             root_pubkey_hex: String::new(),
             host: None,
+            retention: None,
         };
         std::fs::write(
             pending_dir.join("config.toml"),

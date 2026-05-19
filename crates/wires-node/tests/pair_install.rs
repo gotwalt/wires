@@ -16,6 +16,7 @@ fn fresh_node(td: &TempDir) -> (Node, [u8; 32]) {
         data_dir: td.path().to_path_buf(),
         root_pubkey_hex: String::new(),
         host: None,
+        retention: None,
     };
     std::fs::write(
         td.path().join("config.toml"),

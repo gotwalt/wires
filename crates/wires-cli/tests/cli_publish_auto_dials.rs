@@ -26,6 +26,7 @@ async fn publish_broadcasts_via_gossip() {
         data_dir: sub_tmp.path().to_path_buf(),
         root_pubkey_hex: root_hex.clone(),
         host: None,
+        retention: None,
     };
     let sub = NodeRuntime::open(sub_cfg).await.unwrap();
     sub.node.install_epoch_key(topic, 0, [0x99u8; 32]).unwrap();
@@ -45,6 +46,7 @@ async fn publish_broadcasts_via_gossip() {
         data_dir: pub_tmp.path().to_path_buf(),
         root_pubkey_hex: root_hex.clone(),
         host: None,
+        retention: None,
     })
     .unwrap();
     pub_node.install_epoch_key(topic, 0, [0x99u8; 32]).unwrap();
@@ -82,6 +84,7 @@ async fn publish_broadcasts_via_gossip() {
                 relay: hint_relay,
             }],
         }),
+        retention: None,
     };
     std::fs::write(
         pub_tmp.path().join("config.toml"),

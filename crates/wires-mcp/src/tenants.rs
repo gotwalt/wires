@@ -155,6 +155,7 @@ mod tests {
             data_dir: pending.clone(),
             root_pubkey_hex: sub.clone(),
             host: None,
+            retention: None,
         };
         std::fs::write(
             pending.join("config.toml"),
@@ -182,6 +183,7 @@ mod tests {
             data_dir: dir.clone(),
             root_pubkey_hex: sub.clone(),
             host: None,
+            retention: None,
         };
         std::fs::write(dir.join("config.toml"), toml::to_string_pretty(&cfg).unwrap()).unwrap();
         std::fs::write(dir.join("iroh.secret"), [5u8; 32]).unwrap();

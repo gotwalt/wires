@@ -140,6 +140,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             root_pubkey_hex: hex::encode([7u8; 32]),
             host: None,
+            retention: None,
         };
         let rt = NodeRuntime::open(cfg).await.unwrap();
         assert!(rt.endpoint.id().as_bytes().iter().any(|b| *b != 0));
@@ -153,6 +154,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             root_pubkey_hex: hex::encode([7u8; 32]),
             host: None,
+            retention: None,
         };
         let rt = NodeRuntime::open(cfg).await.unwrap();
         let topic = [9u8; 32];
@@ -171,6 +173,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             root_pubkey_hex: hex::encode([7u8; 32]),
             host: None,
+            retention: None,
         };
         let rt = NodeRuntime::open(cfg).await.unwrap();
         let topic = [1u8; 32];

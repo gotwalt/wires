@@ -368,6 +368,7 @@ mod tests {
             data_dir: user_dir.clone(),
             root_pubkey_hex: root_hex.clone(),
             host: None,
+            retention: None,
         };
         std::fs::write(
             user_dir.join("config.toml"),
@@ -469,6 +470,7 @@ mod tests {
             data_dir: st.config.users_dir().join(&root_hex),
             root_pubkey_hex: root_hex.clone(),
             host: None,
+            retention: None,
         }
         .caps_topic_id();
         let claims = make_claims(&st, root_hex);

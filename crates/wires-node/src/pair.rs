@@ -51,6 +51,7 @@ pub fn install_grant(
             data_dir: data_dir.to_path_buf(),
             root_pubkey_hex: String::new(),
             host: None,
+            retention: None,
         }
     };
     cfg.root_pubkey_hex = hex::encode(grant.root_pubkey);

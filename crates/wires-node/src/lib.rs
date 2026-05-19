@@ -12,7 +12,7 @@ pub mod storage;
 pub mod sync;
 pub mod topic_names;
 
-pub use config::{HostConfig, NodeConfig, load_root_signing_key};
+pub use config::{HostConfig, NodeConfig, RetentionPolicy, load_root_signing_key};
 pub use error::{NodeError, Result};
 pub use inbound::{Inbound, InboundCtx, process as process_inbound};
 pub use net_glue::NetGlue;

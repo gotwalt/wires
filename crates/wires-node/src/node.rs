@@ -258,6 +258,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             root_pubkey_hex: root_hex,
             host: None,
+            retention: None,
         };
         Node::open(cfg).unwrap()
     }
@@ -360,6 +361,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             root_pubkey_hex: "deadbeef".into(),
             host: None,
+            retention: None,
         };
         let node_a = Node::open(cfg.clone()).unwrap();
         let pk_a = node_a.ed_sk.verifying_key().to_bytes();
@@ -376,6 +378,7 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             root_pubkey_hex: "deadbeef".into(),
             host: None,
+            retention: None,
         };
         let node = Node::open(cfg).unwrap();
         node.install_epoch_key([1u8; 32], 0, [7u8; 32]).unwrap();
