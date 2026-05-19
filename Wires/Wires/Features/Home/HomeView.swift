@@ -16,6 +16,13 @@ struct HomeView: View {
                             Label("Approve node", systemImage: "person.badge.plus")
                         }
                     }
+                    ToolbarItem(placement: .secondaryAction) {
+                        Button {
+                            store.send(.signInToServiceTapped)
+                        } label: {
+                            Label("Sign in to a service", systemImage: "key.horizontal")
+                        }
+                    }
                     #if DEBUG
                     ToolbarItem(placement: .secondaryAction) {
                         Button(role: .destructive) {
@@ -29,6 +36,9 @@ struct HomeView: View {
                 .task { store.send(.onAppear) }
                 .sheet(item: $store.scope(state: \.nodeEnrollment, action: \.nodeEnrollment)) { childStore in
                     NodeEnrollmentView(store: childStore)
+                }
+                .sheet(item: $store.scope(state: \.oauthSignIn, action: \.oauthSignIn)) { childStore in
+                    OAuthSignInView(store: childStore)
                 }
                 .alert($store.scope(state: \.alert, action: \.alert))
         }
