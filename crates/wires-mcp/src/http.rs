@@ -41,7 +41,8 @@ impl FromRef<ServiceState> for Arc<SigningKey> {
 }
 
 pub fn app(state: ServiceState) -> Router {
-    let oauth_routes = Router::new()
+    // JSON-bodied OAuth endpoints — small payloads, safe to buffer + log.
+    let json_oauth_routes = Router::new()
         .route(
             "/.well-known/oauth-protected-resource",
             axum::routing::get(crate::oauth::prm::handler),
@@ -59,14 +60,6 @@ pub fn app(state: ServiceState) -> Router {
             axum::routing::post(crate::oauth::register::handler),
         )
         .route(
-            "/oauth/authorize",
-            axum::routing::get(crate::oauth::authorize::handler),
-        )
-        .route(
-            "/oauth/authorize/status/{session_id}",
-            axum::routing::get(crate::oauth::authorize_status::handler),
-        )
-        .route(
             "/oauth/signin/assertion",
             axum::routing::post(crate::sign_in_endpoint::handler),
         )
@@ -76,9 +69,23 @@ pub fn app(state: ServiceState) -> Router {
         )
         .layer(axum::middleware::from_fn(log_oauth));
 
+    // HTML-bodied user-facing endpoints — bodies include an SVG QR and
+    // are too large to buffer cheaply. Only log method/URI/status here.
+    let html_oauth_routes = Router::new()
+        .route(
+            "/oauth/authorize",
+            axum::routing::get(crate::oauth::authorize::handler),
+        )
+        .route(
+            "/oauth/authorize/status/{session_id}",
+            axum::routing::get(crate::oauth::authorize_status::handler),
+        )
+        .layer(axum::middleware::from_fn(log_oauth_brief));
+
     Router::new()
         .route("/_health", axum::routing::get(health))
-        .merge(oauth_routes)
+        .merge(json_oauth_routes)
+        .merge(html_oauth_routes)
         .route(
             "/mcp",
             axum::routing::post(crate::mcp::router::handler).layer(
@@ -91,13 +98,15 @@ pub fn app(state: ServiceState) -> Router {
         .with_state(state)
 }
 
-/// Debug middleware for `/oauth/*` and `/.well-known/*`: buffers the request
+/// Debug middleware for JSON-bodied OAuth endpoints: buffers the request
 /// body and response body, logs both at `debug` level, then passes them
 /// through. Enabled by setting `RUST_LOG=wires_mcp::http=debug`. Off by
-/// default; do not leave on in production — request bodies may contain
-/// short-lived secrets (auth codes, PKCE verifiers, refresh tokens).
+/// default; do not leave on in production — request and response bodies
+/// may contain short-lived secrets (auth codes, PKCE verifiers, refresh
+/// tokens). Do NOT mount on HTML endpoints (e.g. /oauth/authorize) — the
+/// SVG QR pushes payloads well beyond what we want to buffer in memory.
 async fn log_oauth(req: Request<Body>, next: Next) -> Response {
-    const MAX_LOG_BODY: usize = 64 * 1024;
+    const MAX_LOG_BODY: usize = 1024 * 1024;
     let method = req.method().clone();
     let uri = req.uri().clone();
     let req_headers = format!("{:?}", req.headers());
@@ -105,8 +114,12 @@ async fn log_oauth(req: Request<Body>, next: Next) -> Response {
     let req_bytes = match to_bytes(body, MAX_LOG_BODY).await {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(error = %e, method = %method, uri = %uri, "log_oauth: req body read failed");
-            return axum::http::StatusCode::BAD_REQUEST.into_response();
+            tracing::warn!(error = %e, method = %method, uri = %uri, "log_oauth: req body too large to buffer; failing closed");
+            return (
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeded debug log buffer",
+            )
+                .into_response();
         }
     };
     tracing::debug!(
@@ -123,8 +136,16 @@ async fn log_oauth(req: Request<Body>, next: Next) -> Response {
     let resp_bytes = match to_bytes(resp_body, MAX_LOG_BODY).await {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(error = %e, method = %method, uri = %uri, "log_oauth: resp body read failed");
-            return Response::from_parts(resp_parts, Body::empty());
+            // Body too large to buffer-and-replay. We've already consumed
+            // the stream, so we cannot pass the original through. Surface
+            // the failure as a 500 so the client sees a clear error rather
+            // than a silent empty 200.
+            tracing::warn!(error = %e, method = %method, uri = %uri, "log_oauth: resp body too large to buffer; mount log_oauth_brief instead for this route");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "response body exceeded debug log buffer",
+            )
+                .into_response();
         }
     };
     tracing::debug!(
@@ -136,6 +157,31 @@ async fn log_oauth(req: Request<Body>, next: Next) -> Response {
         "oauth response",
     );
     Response::from_parts(resp_parts, Body::from(resp_bytes))
+}
+
+/// Lightweight version of [`log_oauth`] for endpoints whose bodies are
+/// large or sensitive in ways that don't help OAuth debugging (HTML
+/// consent pages, status pages). Logs method, URI, request headers, and
+/// response status — does not buffer or read bodies, so it passes
+/// streamed bodies through unchanged.
+async fn log_oauth_brief(req: Request<Body>, next: Next) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let req_headers = format!("{:?}", req.headers());
+    tracing::debug!(
+        method = %method,
+        uri = %uri,
+        headers = %req_headers,
+        "oauth request (brief)",
+    );
+    let resp = next.run(req).await;
+    tracing::debug!(
+        method = %method,
+        uri = %uri,
+        status = %resp.status(),
+        "oauth response (brief)",
+    );
+    resp
 }
 
 async fn health() -> &'static str {
