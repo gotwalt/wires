@@ -73,11 +73,64 @@ the published ticket) is stable across rollouts.
 
 ## Remote invocation
 
-To deploy from a developer machine without SSH'ing first:
+The reference deploy host is `workbench`. Repo is at `~/src/wires`; Docker
+and Tailscale are already installed and running.
+
+**Detect where you are.** Skip the `ssh workbench` wrapper when already on
+workbench — running `ssh workbench …` from workbench itself works but is
+wasteful and confusing. Use the hostname:
 
 ```bash
+if [[ "$(hostname)" == "workbench" ]]; then
+  cd ~/src/wires
+  ./docker/deploy.sh
+else
+  ssh workbench 'bash -lc "cd ~/src/wires && ./docker/deploy.sh"'
+fi
+```
+
+**First deploy on a host (one-time):**
+
+```bash
+# From the dev machine:
+ssh workbench 'cd ~/src/wires && cp docker/wires-mcp.toml.example docker/wires-mcp.toml'
+# Then edit public_url to the host's Funnel hostname; either:
+ssh workbench '${EDITOR:-nano} ~/src/wires/docker/wires-mcp.toml'
+# …or scp a pre-edited copy:
+scp ./local-wires-mcp.toml workbench:~/src/wires/docker/wires-mcp.toml
+```
+
+**Subsequent deploys** (from the dev machine, after pushing to origin):
+
+```bash
+git push origin main
 ssh workbench 'bash -lc "cd ~/src/wires && ./docker/deploy.sh"'
 ```
+
+`deploy.sh` runs `git pull --ff-only` itself, so the local repo on workbench
+stays current. Pass `--no-pull` to deploy uncommitted edits already present
+on workbench.
+
+**Verify from the dev machine** (no ssh needed — workbench listens on
+Tailnet IP):
+
+```bash
+curl -fsS -o /dev/null -w "host: HTTP %{http_code}\n" https://workbench.tail63ef5.ts.net:10000/
+curl -fsS -w "\nmcp: %{http_code}\n" https://workbench.tail63ef5.ts.net/_health   # only if mcp Funnel is up
+```
+
+For local-on-workbench verification (works even if Funnel isn't pointed at
+wires-mcp yet):
+
+```bash
+ssh workbench 'curl -fsS -o /dev/null -w "host: %{http_code}\n" http://127.0.0.1:10000/ && curl -fsS -w "\nmcp: %{http_code}\n" http://127.0.0.1:10001/_health'
+```
+
+> **Funnel `:443` reclamation:** if Funnel `:443` is already proxying
+> something else on workbench (check with `ssh workbench 'tailscale funnel
+> status'`), running `./docker/funnel.sh up mcp` will steal it. Decide
+> deliberately; the wires-mcp service is reachable on `127.0.0.1:10001`
+> regardless of Funnel state.
 
 ## Inspecting the running host
 
