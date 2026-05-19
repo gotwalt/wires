@@ -6,7 +6,13 @@
 
 **Architecture:** A new `LaunchFixture` enum is read from `WIRES_FIXTURE` at app launch; matching cases call `prepareDependencies` to swap every external client for a canned fixture and seed `AppFeature.State` directly into the target screen. A new `WiresUITests/SnapshotSweep.swift` test class enumerates the 17 fixtures × 2 appearances, relaunching the app per cell, taking `XCUIScreen.main.screenshot()`, and writing PNGs to `Wires/screenshots/<run-id>/` on the host filesystem. `scripts/snapshot-ios.sh` drives it.
 
-**Tech Stack:** Swift 6, SwiftUI, The Composable Architecture (TCA), `swift-dependencies` (`@DependencyClient`, `prepareDependencies`), XCTest / XCUITest, iPhone 17 Pro simulator (iOS 26.1, UDID `2FDEB6B7-09A0-4BAD-96E6-117086D09A8D`).
+**Tech Stack:** Swift 6, SwiftUI, The Composable Architecture (TCA), `swift-dependencies` (`@DependencyClient`, `prepareDependencies`), XCTest / XCUITest, iPhone 17 Pro simulator (iOS 26.4, UDID `161DAE86-C4C7-47FE-B25E-1FAF251F93F6`).
+
+**Environment note:** The project's `IPHONEOS_DEPLOYMENT_TARGET = 26.4`, so an iOS 26.4 simulator is required. If only an iOS 26.1 iPhone 17 Pro is installed, create the right one with: `xcrun simctl create "iPhone 17 Pro - 26.4" "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro" "com.apple.CoreSimulator.SimRuntime.iOS-26-4"`.
+
+**Branch prerequisite:** This worktree branch must include the two infrastructure commits cherry-picked from main: `5d3c5a7 ios: fix Swift 6 build errors in OAuthSignInFeature` and `b1bf0fa ios: wire ApprovalFeature into OAuthSignInFeature pair branch`. They are already on the branch as of `260db0f` (T1).
+
+**Build prerequisite:** Before any `xcodebuild` invocation on a fresh worktree, run `scripts/build-ioskit.sh` once to generate `Wires/WiresKit/Frameworks/wires.xcframework` (the UniFFI-built Rust→Swift binding bundle). Worktrees don't share this artifact.
 
 **Spec:** `docs/superpowers/specs/2026-05-19-wires-ios-snapshot-tooling-design.md`. Read it before starting.
 
@@ -31,7 +37,7 @@ This deviation is recorded in this plan, not in the spec.
 WORK=/Users/aaron/src/wires/.claude/worktrees/wires-mcp-single-qr
 
 # iPhone 17 Pro simulator (iOS 26.1):
-SIM_UDID=2FDEB6B7-09A0-4BAD-96E6-117086D09A8D
+SIM_UDID=161DAE86-C4C7-47FE-B25E-1FAF251F93F6
 
 # Build the app for the simulator (no run):
 xcodebuild build \
@@ -227,7 +233,7 @@ cd /Users/aaron/src/wires/.claude/worktrees/wires-mcp-single-qr
 xcodebuild build \
   -project Wires/Wires.xcodeproj \
   -scheme Wires \
-  -destination 'platform=iOS Simulator,id=2FDEB6B7-09A0-4BAD-96E6-117086D09A8D' \
+  -destination 'platform=iOS Simulator,id=161DAE86-C4C7-47FE-B25E-1FAF251F93F6' \
   -quiet
 ```
 
@@ -455,7 +461,7 @@ cd /Users/aaron/src/wires/.claude/worktrees/wires-mcp-single-qr
 xcodebuild build \
   -project Wires/Wires.xcodeproj \
   -scheme Wires \
-  -destination 'platform=iOS Simulator,id=2FDEB6B7-09A0-4BAD-96E6-117086D09A8D' \
+  -destination 'platform=iOS Simulator,id=161DAE86-C4C7-47FE-B25E-1FAF251F93F6' \
   -quiet
 ```
 
@@ -467,7 +473,7 @@ Expected: exit 0. Common failures: missing target membership ("AppFeature not fo
 xcodebuild test \
   -project Wires/Wires.xcodeproj \
   -scheme Wires \
-  -destination 'platform=iOS Simulator,id=2FDEB6B7-09A0-4BAD-96E6-117086D09A8D' \
+  -destination 'platform=iOS Simulator,id=161DAE86-C4C7-47FE-B25E-1FAF251F93F6' \
   -only-testing:WiresTests/LaunchFixtureTests \
   -quiet
 ```
@@ -673,7 +679,7 @@ cd /Users/aaron/src/wires/.claude/worktrees/wires-mcp-single-qr
 xcodebuild build \
   -project Wires/Wires.xcodeproj \
   -scheme Wires \
-  -destination 'platform=iOS Simulator,id=2FDEB6B7-09A0-4BAD-96E6-117086D09A8D' \
+  -destination 'platform=iOS Simulator,id=161DAE86-C4C7-47FE-B25E-1FAF251F93F6' \
   -quiet
 ```
 
@@ -808,7 +814,7 @@ var initialAppState: AppFeature.State {
 xcodebuild build \
   -project Wires/Wires.xcodeproj \
   -scheme Wires \
-  -destination 'platform=iOS Simulator,id=2FDEB6B7-09A0-4BAD-96E6-117086D09A8D' \
+  -destination 'platform=iOS Simulator,id=161DAE86-C4C7-47FE-B25E-1FAF251F93F6' \
   -quiet
 ```
 
@@ -950,7 +956,7 @@ Note: `.homeLoading` does NOT skip onAppear — `loading=true` is set up front a
 xcodebuild build \
   -project Wires/Wires.xcodeproj \
   -scheme Wires \
-  -destination 'platform=iOS Simulator,id=2FDEB6B7-09A0-4BAD-96E6-117086D09A8D' \
+  -destination 'platform=iOS Simulator,id=161DAE86-C4C7-47FE-B25E-1FAF251F93F6' \
   -quiet
 ```
 
@@ -1114,7 +1120,7 @@ case .enrollDone:
 xcodebuild build \
   -project Wires/Wires.xcodeproj \
   -scheme Wires \
-  -destination 'platform=iOS Simulator,id=2FDEB6B7-09A0-4BAD-96E6-117086D09A8D' \
+  -destination 'platform=iOS Simulator,id=161DAE86-C4C7-47FE-B25E-1FAF251F93F6' \
   -quiet
 ```
 
@@ -1200,13 +1206,25 @@ case .oauthSigninConfirm:
     return .home(home)
 
 case .oauthPairApprove:
-    var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
-    let ticket = SessionTicket(
-        gatewayURL: "https://wires-mcp.example.org",
-        sessionID: "fixture-session-id-abc",
-        version: 1
+    // The OAuth pair-approve state was rewired (commit b1bf0fa) to embed
+    // ApprovalFeature.State directly — same payload as enrollApprovePristine.
+    let host = HostInfo(
+        endpointIdHex: String(repeating: "cd", count: 32),
+        addrs: [],
+        relay: nil,
+        hintExpiresAtMs: 0
     )
-    home.oauthSignIn = .pairApprove(.init(ticket: ticket, pairTokenB64: "fixture-pair-token"))
+    var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+    let preview = PairRequestPreview(
+        handle: PendingPairHandle(opaque: Data()),
+        agentPubkeyHex: String(repeating: "ef", count: 32),
+        role: "agent",
+        description: "wires-mcp gateway",
+        requestedScopes: [
+            RequestedScope(topicName: "wires-mcp:claude.ai", rights: [.read, .write])
+        ]
+    )
+    home.oauthSignIn = .pairApprove(ApprovalFeature.State(preview: preview, host: host))
     return .home(home)
 
 case .oauthDone:
@@ -1230,7 +1248,7 @@ case .oauthError:
 xcodebuild build \
   -project Wires/Wires.xcodeproj \
   -scheme Wires \
-  -destination 'platform=iOS Simulator,id=2FDEB6B7-09A0-4BAD-96E6-117086D09A8D' \
+  -destination 'platform=iOS Simulator,id=161DAE86-C4C7-47FE-B25E-1FAF251F93F6' \
   -quiet
 ```
 
@@ -1432,7 +1450,7 @@ Justification: every home-targeting fixture *wants* onAppear to fire (it's what 
 xcodebuild build \
   -project Wires/Wires.xcodeproj \
   -scheme Wires \
-  -destination 'platform=iOS Simulator,id=2FDEB6B7-09A0-4BAD-96E6-117086D09A8D' \
+  -destination 'platform=iOS Simulator,id=161DAE86-C4C7-47FE-B25E-1FAF251F93F6' \
   -quiet
 ```
 
@@ -1444,11 +1462,11 @@ Boot the simulator and launch the app with a fixture, by hand:
 
 ```bash
 # Boot:
-xcrun simctl bootstatus 2FDEB6B7-09A0-4BAD-96E6-117086D09A8D -b
+xcrun simctl bootstatus 161DAE86-C4C7-47FE-B25E-1FAF251F93F6 -b
 
 # Install + launch with fixture env:
 xcodebuild -project Wires/Wires.xcodeproj -scheme Wires \
-  -destination 'platform=iOS Simulator,id=2FDEB6B7-09A0-4BAD-96E6-117086D09A8D' \
+  -destination 'platform=iOS Simulator,id=161DAE86-C4C7-47FE-B25E-1FAF251F93F6' \
   build install -quiet
 
 # Wait for install, then launch:
@@ -1456,7 +1474,7 @@ xcrun simctl launch \
   --terminate-running-process \
   --setenv WIRES_FIXTURE=home_one_cap \
   --setenv WIRES_APPEARANCE=light \
-  2FDEB6B7-09A0-4BAD-96E6-117086D09A8D \
+  161DAE86-C4C7-47FE-B25E-1FAF251F93F6 \
   io.example.wires.Wires
 ```
 
@@ -1608,7 +1626,7 @@ final class WiresUITests: XCTestCase {
 xcodebuild build-for-testing \
   -project Wires/Wires.xcodeproj \
   -scheme Wires \
-  -destination 'platform=iOS Simulator,id=2FDEB6B7-09A0-4BAD-96E6-117086D09A8D' \
+  -destination 'platform=iOS Simulator,id=161DAE86-C4C7-47FE-B25E-1FAF251F93F6' \
   -only-testing:WiresUITests \
   -quiet
 ```
@@ -1679,7 +1697,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 # ----- Defaults -------------------------------------------------------
-DEFAULT_UDID="2FDEB6B7-09A0-4BAD-96E6-117086D09A8D"
+DEFAULT_UDID="161DAE86-C4C7-47FE-B25E-1FAF251F93F6"
 DEVICE_UDID="$DEFAULT_UDID"
 FIXTURE_FILTER=""
 KEEP_DERIVED="0"
@@ -1854,11 +1872,11 @@ EOF
 
 ```bash
 cd /Users/aaron/src/wires/.claude/worktrees/wires-mcp-single-qr
-xcrun simctl bootstatus 2FDEB6B7-09A0-4BAD-96E6-117086D09A8D -b
+xcrun simctl bootstatus 161DAE86-C4C7-47FE-B25E-1FAF251F93F6 -b
 xcodebuild build-for-testing \
   -project Wires/Wires.xcodeproj \
   -scheme Wires \
-  -destination 'platform=iOS Simulator,id=2FDEB6B7-09A0-4BAD-96E6-117086D09A8D' \
+  -destination 'platform=iOS Simulator,id=161DAE86-C4C7-47FE-B25E-1FAF251F93F6' \
   -only-testing:WiresUITests \
   -quiet
 ```
@@ -1995,6 +2013,6 @@ EOF
 - [ ] `./scripts/snapshot-ios.sh` (no flags) exits 0 and produces exactly 34 PNGs.
 - [ ] `git status` is clean (modulo `Wires/screenshots/` which is gitignored).
 - [ ] The full suite of commits looks reviewable: each task should be one commit, with a message that explains *why* (not just *what*).
-- [ ] The simulator UDID `2FDEB6B7-09A0-4BAD-96E6-117086D09A8D` is referenced in the script and in this plan; if it changed on the host machine, `scripts/snapshot-ios.sh`'s fallback should pick up the new one automatically.
+- [ ] The simulator UDID `161DAE86-C4C7-47FE-B25E-1FAF251F93F6` is referenced in the script and in this plan; if it changed on the host machine, `scripts/snapshot-ios.sh`'s fallback should pick up the new one automatically.
 - [ ] `CameraPreviewKind.live` is the default; production launches (no `WIRES_FIXTURE` env) still use the real `AVCaptureSession`. Quick sanity: run the app from Xcode normally (▶), confirm the bootstrap scan view shows the live camera feed.
 - [ ] No `WIRES_FIXTURE` leakage in production: search the codebase for `WIRES_FIXTURE` — only `WiresIOSApp.swift` and `LaunchFixture.swift` should mention it.
