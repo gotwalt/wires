@@ -101,6 +101,7 @@ mod tests {
             public_url: "https://mcp.example.com".into(),
             bind: "127.0.0.1:0".into(),
             data_dir: tmp.path().to_path_buf(),
+            retention: None,
         };
         // Create (and immediately drop) the store so the db file exists,
         // then let user_list open it exclusively.
@@ -115,6 +116,7 @@ mod tests {
             public_url: "https://mcp.example.com".into(),
             bind: "127.0.0.1:0".into(),
             data_dir: tmp.path().to_path_buf(),
+            retention: None,
         };
         // Seed data, drop the handle, then let user_list open exclusively.
         {
@@ -139,6 +141,7 @@ mod tests {
             public_url: "https://mcp.example.com".into(),
             bind: "127.0.0.1:0".into(),
             data_dir: tmp.path().to_path_buf(),
+            retention: None,
         };
         let sub = "cd".repeat(32);
         {
@@ -178,6 +181,7 @@ mod tests {
             public_url: "https://mcp.example.com".into(),
             bind: "127.0.0.1:0".into(),
             data_dir: tmp.path().to_path_buf(),
+            retention: None,
         };
         {
             let store = Store::open(&cfg.gateway_db_path()).unwrap();
@@ -203,6 +207,7 @@ mod tests {
             public_url: "https://mcp.example.com".into(),
             bind: "127.0.0.1:0".into(),
             data_dir: tmp.path().to_path_buf(),
+            retention: None,
         };
         let initial = crate::keys::load_or_create(&cfg.token_signing_path()).unwrap();
         keys_rotate(&cfg).unwrap();

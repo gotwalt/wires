@@ -285,4 +285,11 @@ pub enum GatewayError {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Invalid [retention] config: {detail}, at {location}"))]
+    InvalidRetention {
+        detail: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }

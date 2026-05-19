@@ -223,6 +223,7 @@ pub fn test_state(tmp: &std::path::Path) -> ServiceState {
         public_url: "https://mcp.example.com".into(),
         bind: "127.0.0.1:0".into(),
         data_dir: tmp.to_path_buf(),
+        retention: None,
     };
     let store = Store::open(&cfg.gateway_db_path()).unwrap();
     let supervisor =
