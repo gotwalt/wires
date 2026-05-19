@@ -22,6 +22,7 @@ pub struct NodeRuntime {
     /// One gossip handle per joined topic, populated by `join_topic` and
     /// consumed by `publish_and_broadcast`.
     handles: Mutex<HashMap<[u8; 32], GossipHandle>>,
+    sweep_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl NodeRuntime {
@@ -41,11 +42,30 @@ impl NodeRuntime {
             .await
             .map_err(|e| std::io::Error::other(format!("net glue: {e}")))
             .context(IoSnafu)?;
+        let sweep_task = if node.retention.is_some() {
+            let node_for_sweep = Arc::clone(&node);
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                // The first tick fires immediately; skip it — open() already ran reconcile.
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let n = Arc::clone(&node_for_sweep);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = n.sweep(wires_net::unix_now_ms());
+                    })
+                    .await;
+                }
+            }))
+        } else {
+            None
+        };
         Ok(Self {
             node,
             endpoint,
             glue,
             handles: Mutex::new(HashMap::new()),
+            sweep_task,
         })
     }
 
@@ -129,6 +149,21 @@ impl NodeRuntime {
 }
 
 #[cfg(test)]
+impl NodeRuntime {
+    pub fn has_sweep_task(&self) -> bool {
+        self.sweep_task.is_some()
+    }
+}
+
+impl Drop for NodeRuntime {
+    fn drop(&mut self) {
+        if let Some(h) = self.sweep_task.take() {
+            h.abort();
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -181,5 +216,38 @@ mod tests {
         // Second join is idempotent (returns the cached handle).
         assert!(rt.join_topic(topic, vec![]).await.is_ok());
         assert!(rt.has_joined(&topic));
+    }
+
+    #[tokio::test]
+    async fn runtime_with_retention_opens_index_and_timer() {
+        use std::time::Duration;
+        let tmp = TempDir::new().unwrap();
+        let cfg = NodeConfig {
+            data_dir: tmp.path().to_path_buf(),
+            root_pubkey_hex: hex::encode([7u8; 32]),
+            host: None,
+            retention: Some(crate::config::RetentionPolicy {
+                ttl: Duration::from_secs(3600),
+                max_bytes_per_user: 0,
+            }),
+        };
+        let rt = NodeRuntime::open(cfg).await.unwrap();
+        assert!(rt.node.ingest_index.is_some(), "IngestIndex must be opened");
+        assert!(rt.has_sweep_task(), "sweep task must be running");
+        drop(rt);
+    }
+
+    #[tokio::test]
+    async fn runtime_without_retention_skips_timer() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = NodeConfig {
+            data_dir: tmp.path().to_path_buf(),
+            root_pubkey_hex: hex::encode([7u8; 32]),
+            host: None,
+            retention: None,
+        };
+        let rt = NodeRuntime::open(cfg).await.unwrap();
+        assert!(rt.node.ingest_index.is_none());
+        assert!(!rt.has_sweep_task());
     }
 }
