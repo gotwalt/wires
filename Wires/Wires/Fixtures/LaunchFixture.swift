@@ -178,8 +178,20 @@ enum LaunchFixture: String, CaseIterable {
             )
             values.mcpGatewayClient = .fixture()
 
-        case .oauthScan, .oauthSigninConfirm, .oauthPairApprove, .oauthDone, .oauthError:
-            break  // filled in by Task 4d
+        case .oauthScan,
+             .oauthSigninConfirm,
+             .oauthPairApprove,
+             .oauthDone,
+             .oauthError:
+            values.cameraPermissionClient = .fixture(.granted)
+            values.wiresClient = .fixture()
+            values.householdClient = .fixture(
+                household: Household(
+                    rootPubkeyHex: String(repeating: "ab", count: 32),
+                    hostEndpointIdHex: String(repeating: "cd", count: 32)
+                )
+            )
+            values.mcpGatewayClient = .fixture()
         }
     }
 
@@ -336,8 +348,70 @@ enum LaunchFixture: String, CaseIterable {
             home.nodeEnrollment = .done(NodeEnrollmentFeature.DoneStepState(ack: ack, preview: preview))
             return .home(home)
 
-        case .oauthScan, .oauthSigninConfirm, .oauthPairApprove, .oauthDone, .oauthError:
-            return .launching  // filled in by Task 4d
+        case .oauthScan:
+            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            var oauth = OAuthSignInFeature.State.initial()
+            if case .scan(var scanState) = oauth {
+                scanState.cameraPermission = .granted
+                oauth = .scan(scanState)
+            }
+            home.oauthSignIn = oauth
+            return .home(home)
+
+        case .oauthSigninConfirm:
+            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            let ticket = SessionTicket(
+                version: 1,
+                kind: SessionTicket.kindV1,
+                gatewayURL: "https://wires-mcp.example.org",
+                sessionID: "fixture-session-id-abc"
+            )
+            let challenge = SignInChallenge(
+                version: 1,
+                kind: SignInChallenge.kindV1,
+                gatewayURL: "https://wires-mcp.example.org",
+                sessionID: "fixture-session-id-abc",
+                nonce: String(repeating: "0", count: 64),
+                issuedAt: 0,
+                expires: 0
+            )
+            home.oauthSignIn = .signinConfirm(ticket: ticket, challenge: challenge)
+            return .home(home)
+
+        case .oauthPairApprove:
+            // The OAuth pair-approve state was rewired (commit b1bf0fa) to embed
+            // ApprovalFeature.State directly — same payload as enrollApprovePristine.
+            let host = HostInfo(
+                endpointIdHex: String(repeating: "cd", count: 32),
+                addrs: [],
+                relay: nil,
+                hintExpiresAtMs: 0
+            )
+            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            let preview = PairRequestPreview(
+                handle: PendingPairHandle(id: "fixture-pair"),
+                agentPubkeyHex: String(repeating: "ef", count: 32),
+                role: "agent",
+                description: "wires-mcp gateway",
+                issuedAtMs: 0,
+                expiresAtMs: 0,
+                requestedScopes: [
+                    RequestedScopePreview(topicName: "wires-mcp:claude.ai", rights: [.read, .write])
+                ],
+                dialSummary: ""
+            )
+            home.oauthSignIn = .pairApprove(ApprovalFeature.State(preview: preview, host: host))
+            return .home(home)
+
+        case .oauthDone:
+            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            home.oauthSignIn = .done(message: "Signed in")
+            return .home(home)
+
+        case .oauthError:
+            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            home.oauthSignIn = .error(message: "gateway returned 500")
+            return .home(home)
         }
     }
 
