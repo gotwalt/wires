@@ -850,7 +850,7 @@ mod tests {
         reg.register_topic(&root_b, &topic3).unwrap();
 
         let dropped = reg.delete_tenant(&root_a).unwrap();
-        assert_eq!(dropped.existed, true);
+        assert!(dropped.existed);
         let mut topics = dropped.topics_removed;
         topics.sort();
         assert_eq!(topics, vec![topic1, topic2]);
@@ -868,7 +868,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let reg = TenantRegistry::open(tmp.path()).unwrap();
         let dropped = reg.delete_tenant(&[7u8; 32]).unwrap();
-        assert_eq!(dropped.existed, false);
+        assert!(!dropped.existed);
         assert!(dropped.topics_removed.is_empty());
     }
 
@@ -953,7 +953,8 @@ mod tests {
         let host_endpoint_id = [42u8; 32];
         let now_ms = 1_000_000i64;
 
-        let observed: Arc<Mutex<Vec<([u8; 32], Vec<[u8; 32]>)>>> = Arc::new(Mutex::new(Vec::new()));
+        type ObservedTenantUnregisters = Arc<Mutex<Vec<([u8; 32], Vec<[u8; 32]>)>>>;
+        let observed: ObservedTenantUnregisters = Arc::new(Mutex::new(Vec::new()));
         let observed_for_cb = Arc::clone(&observed);
 
         let handler = TenantHandlerImpl {
