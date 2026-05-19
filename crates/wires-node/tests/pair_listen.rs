@@ -26,6 +26,7 @@ async fn full_lifecycle_alice_dial_bob_install() {
         data_dir: td.path().to_path_buf(),
         root_pubkey_hex: String::new(),
         host: None,
+        retention: None,
     };
     std::fs::write(
         td.path().join("config.toml"),
@@ -136,6 +137,7 @@ async fn resume_from_pair_pending_reuses_same_token() {
         data_dir: td.path().to_path_buf(),
         root_pubkey_hex: String::new(),
         host: None,
+        retention: None,
     };
     std::fs::write(
         td.path().join("config.toml"),

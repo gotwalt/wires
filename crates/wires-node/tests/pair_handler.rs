@@ -30,6 +30,7 @@ fn fresh_setup(td: &TempDir, expected_nonce: [u8; 32]) -> Setup {
         data_dir: td.path().to_path_buf(),
         root_pubkey_hex: String::new(),
         host: None,
+        retention: None,
     };
     std::fs::write(
         td.path().join("config.toml"),

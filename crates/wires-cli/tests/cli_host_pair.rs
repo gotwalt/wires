@@ -64,6 +64,7 @@ async fn host_pair_persists_host_to_config() {
         data_dir: agent_dir.path().to_path_buf(),
         root_pubkey_hex: hex::encode(root.verifying_key().to_bytes()),
         host: None,
+        retention: None,
     };
     std::fs::write(
         agent_dir.path().join("config.toml"),

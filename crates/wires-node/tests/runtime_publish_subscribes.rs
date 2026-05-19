@@ -24,11 +24,13 @@ async fn runtime_publish_reaches_peer_runtime() {
         data_dir: alice_tmp.path().to_path_buf(),
         root_pubkey_hex: root_hex.clone(),
         host: None,
+        retention: None,
     };
     let bob_cfg = NodeConfig {
         data_dir: bob_tmp.path().to_path_buf(),
         root_pubkey_hex: root_hex.clone(),
         host: None,
+        retention: None,
     };
 
     let alice = NodeRuntime::open(alice_cfg).await.unwrap();

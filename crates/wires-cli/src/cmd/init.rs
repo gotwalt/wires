@@ -22,6 +22,7 @@ pub async fn run(data_dir: &Path, new_root: bool) -> Result<()> {
         data_dir: data_dir.to_path_buf(),
         root_pubkey_hex: root_pubkey_hex.clone(),
         host: None,
+        retention: None,
     };
     let toml_str = toml::to_string_pretty(&cfg).context(TomlSerializeSnafu)?;
     std::fs::write(data_dir.join("config.toml"), toml_str).context(IoSnafu)?;

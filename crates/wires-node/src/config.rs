@@ -15,6 +15,12 @@ pub struct NodeConfig {
     /// peer-to-peer operation (no persistent relay, no replay catch-up).
     #[serde(default)]
     pub host: Option<HostConfig>,
+    /// `None` = "no retention, behave as today" (CLI agents, `wires-ha`).
+    /// `Some(_)` = wires-mcp gateway path: open IngestIndex, run sweeps.
+    /// Marked `#[serde(skip)]` because the gateway injects it in code,
+    /// never via per-user config.toml.
+    #[serde(skip)]
+    pub retention: Option<RetentionPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +28,26 @@ pub struct HostConfig {
     /// Peer hints harvested from discovery or an invite token. Tried in order
     /// when bootstrapping gossip and when dialing the tenant/replay ALPNs.
     pub peer_hints: Vec<PeerHint>,
+}
+
+/// Per-user retention policy. When `Some(_)`, the runtime opens an
+/// `IngestIndex` for the user, hooks record+sweep into inbound and publish,
+/// runs a startup reconciliation pass, and starts a periodic 60 s sweep.
+///
+/// Deliberately not `Serialize`/`Deserialize` — built in code by the
+/// gateway and injected into `NodeConfig` at runtime. The matching
+/// `NodeConfig.retention` field is `#[serde(skip)]`, so per-user
+/// `config.toml` files never carry retention state on disk.
+#[derive(Debug, Clone)]
+pub struct RetentionPolicy {
+    /// TTL after which a stored message becomes eligible for eviction.
+    /// Must be > 0.
+    pub ttl: std::time::Duration,
+    /// Byte budget across all of this user's topics. 0 = no budget cap
+    /// (TTL alone enforces). When > 0, after each TTL sweep the runtime
+    /// also calls `evict_oldest_until(max_bytes_per_user)` to enforce the
+    /// budget.
+    pub max_bytes_per_user: u64,
 }
 
 impl NodeConfig {
@@ -67,6 +93,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/wires-test"),
             root_pubkey_hex: hex_pk.to_string(),
             host: None,
+            retention: None,
         }
     }
 
@@ -103,6 +130,7 @@ mod tests {
                     relay: None,
                 }],
             }),
+            retention: None,
         };
         let s = toml::to_string_pretty(&cfg).unwrap();
         let back: NodeConfig = toml::from_str(&s).unwrap();
@@ -118,6 +146,52 @@ mod tests {
             root_pubkey_hex = "deadbeef"
         "#;
         let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert!(cfg.host.is_none());
+    }
+
+    #[test]
+    fn node_config_with_retention_field_constructs() {
+        let cfg = NodeConfig {
+            data_dir: PathBuf::from("/tmp/wires-test"),
+            root_pubkey_hex: "deadbeef".into(),
+            host: None,
+            retention: Some(crate::config::RetentionPolicy {
+                ttl: std::time::Duration::from_secs(3600),
+                max_bytes_per_user: 52_428_800,
+            }),
+        };
+        let r = cfg.retention.expect("retention must be set");
+        assert_eq!(r.ttl, std::time::Duration::from_secs(3600));
+        assert_eq!(r.max_bytes_per_user, 52_428_800);
+    }
+
+    #[test]
+    fn node_config_toml_round_trip_drops_retention_field() {
+        // `retention` is `#[serde(skip)]` — it's built by gateway code, not
+        // read from per-user config.toml. Round-tripping through TOML therefore
+        // resets it to None regardless of what was set in memory.
+        let cfg = NodeConfig {
+            data_dir: PathBuf::from("/tmp/wires-test"),
+            root_pubkey_hex: "deadbeef".into(),
+            host: None,
+            retention: Some(crate::config::RetentionPolicy {
+                ttl: std::time::Duration::from_secs(3600),
+                max_bytes_per_user: 1024,
+            }),
+        };
+        let s = toml::to_string_pretty(&cfg).unwrap();
+        let back: NodeConfig = toml::from_str(&s).unwrap();
+        assert!(back.retention.is_none(), "retention must be skipped on serde");
+    }
+
+    #[test]
+    fn node_config_without_retention_deserializes_to_none() {
+        let s = r#"
+            data_dir = "/tmp/wires-test"
+            root_pubkey_hex = "deadbeef"
+        "#;
+        let cfg: NodeConfig = toml::from_str(s).unwrap();
+        assert!(cfg.retention.is_none());
         assert!(cfg.host.is_none());
     }
 }
