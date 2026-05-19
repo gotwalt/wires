@@ -82,19 +82,24 @@ pub fn app(state: ServiceState) -> Router {
         )
         .layer(axum::middleware::from_fn(log_oauth_brief));
 
+    // Mount the MCP JSON-RPC handler at both `/` and `/mcp`. Real-world
+    // MCP clients (Claude) treat the PRM `resource` URI — our `public_url`
+    // — as the MCP endpoint URL itself and POST to `/`. We keep `/mcp` as
+    // an alias so unit tests and any clients that hardcode that path keep
+    // working.
+    let mcp_handler = axum::routing::post(crate::mcp::router::handler).layer(
+        axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::oauth::middleware::bearer,
+        ),
+    );
+
     Router::new()
         .route("/_health", axum::routing::get(health))
         .merge(json_oauth_routes)
         .merge(html_oauth_routes)
-        .route(
-            "/mcp",
-            axum::routing::post(crate::mcp::router::handler).layer(
-                axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    crate::oauth::middleware::bearer,
-                ),
-            ),
-        )
+        .route("/", mcp_handler.clone())
+        .route("/mcp", mcp_handler)
         .with_state(state)
 }
 
