@@ -1,6 +1,7 @@
 //! `GET /oauth/authorize` — entry point to the consent UX. Validates the
-//! request, creates an `auth_sessions` row + a `pending_pairs` row + a
-//! `pending_signins` row (both QRs always shown), renders the consent HTML.
+//! request, creates an `auth_sessions` row + a `pending_signins` row, and
+//! renders the consent HTML with a single `SessionTicket` QR. Pair endpoint
+//! allocation is deferred to `POST /oauth/session/probe`.
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -9,7 +10,6 @@ use chrono::Utc;
 use serde::Deserialize;
 
 use crate::http::ServiceState;
-use crate::sign_in::SignInChallenge;
 use crate::store::{
     AuthSessionKind, AuthSessionRecord, PendingSigninRecord,
 };
@@ -36,8 +36,7 @@ pub const SIGNIN_CHALLENGE_TTL_MS: i64 = 300_000;
 pub struct AuthorizeContext {
     pub session_id: String,
     pub client_name: String,
-    pub pair_token_b64: String,
-    pub signin_challenge_b64: String,
+    pub session_ticket_b64: String,
 }
 
 pub async fn handler(
@@ -100,17 +99,12 @@ pub async fn validate_and_create(
         (StatusCode::INTERNAL_SERVER_ERROR, oauth_err("server_error", "store"))
     })?;
 
-    // Sign-in QR: a fresh challenge always rendered.
+    // Persist the sign-in nonce eagerly (cheap). The probe endpoint will
+    // reconstruct the full SignInChallenge from this stored nonce if the
+    // root is a known user.
     let mut nonce = [0u8; 32];
     use rand_core::RngCore as _;
     rand_core::OsRng.fill_bytes(&mut nonce);
-    let challenge = SignInChallenge::new(
-        &state.config.public_url,
-        &session_id,
-        nonce,
-        now_ms,
-        SIGNIN_CHALLENGE_TTL_MS,
-    );
     state
         .store
         .put_pending_signin(&PendingSigninRecord {
@@ -120,22 +114,15 @@ pub async fn validate_and_create(
         })
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, oauth_err("server_error", "store")))?;
 
-    // Start the pair-listen window: generates a fresh identity + iroh endpoint,
-    // persists the PendingPairRecord internally, returns the base64 PairRequest token.
-    let pair_token_b64 = state
-        .pair_bridge
-        .start(&session_id, &client.client_name)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "pair_bridge.start");
-            (StatusCode::INTERNAL_SERVER_ERROR, oauth_err("server_error", "pair_bridge"))
-        })?;
+    let ticket = crate::oauth::session_ticket::SessionTicket::new(
+        &state.config.public_url,
+        &session_id,
+    );
 
     Ok(AuthorizeContext {
         session_id,
         client_name: client.client_name,
-        pair_token_b64,
-        signin_challenge_b64: challenge.encode_url_safe_b64(),
+        session_ticket_b64: ticket.encode_url_safe_b64(),
     })
 }
 
@@ -178,15 +165,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn happy_path_creates_session_pending_pair_pending_signin() {
+    async fn happy_path_creates_session_and_pending_signin() {
         let (_t, st) = state();
         let ctx = validate_and_create(&st, &params()).await.unwrap();
         assert!(!ctx.session_id.is_empty());
         assert_eq!(ctx.client_name, "Claude Desktop");
-        assert!(!ctx.signin_challenge_b64.is_empty());
+        assert!(!ctx.session_ticket_b64.is_empty());
         assert!(st.store.get_auth_session(&ctx.session_id).unwrap().is_some());
         assert!(st.store.get_pending_signin(&ctx.session_id).unwrap().is_some());
-        assert!(st.store.get_pending_pair(&ctx.session_id).unwrap().is_some());
+        // pending_pair is NOT created at /authorize — only at probe time.
+        assert!(st.store.get_pending_pair(&ctx.session_id).unwrap().is_none());
     }
 
     #[tokio::test]
