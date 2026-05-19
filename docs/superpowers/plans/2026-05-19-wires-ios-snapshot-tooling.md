@@ -598,7 +598,7 @@ extension WiresClient {
             },
             parsePairRequest: { _ in
                 PairRequestPreview(
-                    handle: PendingPairHandle(opaque: Data()),
+                    handle: PendingPairHandle(id: "fixture-pair"),
                     agentPubkeyHex: String(repeating: "ef", count: 32),
                     role: "agent",
                     description: "Aaron's Mac",
@@ -1046,14 +1046,17 @@ case .enrollApprovePristine:
     )
     var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
     let preview = PairRequestPreview(
-        handle: PendingPairHandle(opaque: Data()),
+        handle: PendingPairHandle(id: "fixture-pair"),
         agentPubkeyHex: String(repeating: "ef", count: 32),
         role: "agent",
         description: "Aaron's Mac",
+        issuedAtMs: 0,
+        expiresAtMs: 0,
         requestedScopes: [
-            RequestedScope(topicName: "family", rights: [.read, .write]),
-            RequestedScope(topicName: "calendar", rights: [.read])
-        ]
+            RequestedScopePreview(topicName: "family", rights: [.read, .write]),
+            RequestedScopePreview(topicName: "calendar", rights: [.read])
+        ],
+        dialSummary: ""
     )
     home.nodeEnrollment = .approve(ApprovalFeature.State(preview: preview, host: host))
     return .home(home)
@@ -1067,14 +1070,17 @@ case .enrollApprovePartial:
     )
     var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
     let preview = PairRequestPreview(
-        handle: PendingPairHandle(opaque: Data()),
+        handle: PendingPairHandle(id: "fixture-pair"),
         agentPubkeyHex: String(repeating: "ef", count: 32),
         role: "agent",
         description: "Aaron's Mac",
+        issuedAtMs: 0,
+        expiresAtMs: 0,
         requestedScopes: [
-            RequestedScope(topicName: "family", rights: [.read, .write]),
-            RequestedScope(topicName: "calendar", rights: [.read])
-        ]
+            RequestedScopePreview(topicName: "family", rights: [.read, .write]),
+            RequestedScopePreview(topicName: "calendar", rights: [.read])
+        ],
+        dialSummary: ""
     )
     var approve = ApprovalFeature.State(preview: preview, host: host)
     // Default state grants everything. Mutate to partial:
@@ -1094,11 +1100,14 @@ case .enrollApprovePartial:
 case .enrollDone:
     var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
     let preview = PairRequestPreview(
-        handle: PendingPairHandle(opaque: Data()),
+        handle: PendingPairHandle(id: "fixture-pair"),
         agentPubkeyHex: String(repeating: "ef", count: 32),
         role: "agent",
         description: "Aaron's Mac",
-        requestedScopes: []
+        issuedAtMs: 0,
+        expiresAtMs: 0,
+        requestedScopes: [],
+        dialSummary: ""
     )
     let ack = PairAckRecord(
         installedCapIdHex: String(repeating: "11", count: 32),
@@ -1110,9 +1119,9 @@ case .enrollDone:
 
 (Leave `.oauthScan, …, .oauthError` going to `.launching`.)
 
-- [ ] **Step 3: Verify the `RequestedScope` initializer**
+- [ ] **Step 3: Verify the `RequestedScopePreview` initializer**
 
-`RequestedScope(topicName:rights:)` is from WiresKit. Field names may differ. If the build errors complain, open `Wires/WiresKit/Sources/WiresKit/Wires.swift` and search for `struct RequestedScope` to confirm. Likewise verify `Right.read` / `Right.write` enum cases (if it's `.READ` / `.WRITE`, adjust accordingly — UniFFI keeps Rust's casing in some configs).
+`RequestedScopePreview(topicName:rights:)` is from WiresKit (note: the type is `RequestedScopePreview` post-T3 — the unprefixed `RequestedScope` is a different FFI type used in the approve flow, not the preview). Field names may differ. If the build errors complain, open `Wires/WiresKit/Sources/WiresKit/WiresKit.swift` and search for `struct RequestedScopePreview` to confirm. Likewise verify `Right.read` / `Right.write` enum cases (if it's `.READ` / `.WRITE`, adjust accordingly — UniFFI keeps Rust's casing in some configs).
 
 - [ ] **Step 4: Build**
 
@@ -1216,13 +1225,16 @@ case .oauthPairApprove:
     )
     var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
     let preview = PairRequestPreview(
-        handle: PendingPairHandle(opaque: Data()),
+        handle: PendingPairHandle(id: "fixture-pair"),
         agentPubkeyHex: String(repeating: "ef", count: 32),
         role: "agent",
         description: "wires-mcp gateway",
+        issuedAtMs: 0,
+        expiresAtMs: 0,
         requestedScopes: [
-            RequestedScope(topicName: "wires-mcp:claude.ai", rights: [.read, .write])
-        ]
+            RequestedScopePreview(topicName: "wires-mcp:claude.ai", rights: [.read, .write])
+        ],
+        dialSummary: ""
     )
     home.oauthSignIn = .pairApprove(ApprovalFeature.State(preview: preview, host: host))
     return .home(home)
