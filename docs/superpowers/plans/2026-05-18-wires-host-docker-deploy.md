@@ -19,7 +19,7 @@ All new files live under `docker/` at the repo root.
 | Path | Responsibility |
 |---|---|
 | `docker/Dockerfile` | Multi-stage build that produces `wires-host:local` from the workspace. |
-| `docker/.dockerignore` | Prunes the build context (excludes `target/`, `Wires/`, etc.). |
+| `docker/Dockerfile.dockerignore` | Prunes the build context (excludes `target/`, `Wires/`, etc.). |
 | `docker/compose.yaml` | Single-service compose file with host networking + named volume. |
 | `docker/deploy.sh` | Operator script: pull → build → up → verify → print ticket. |
 | `docker/funnel.sh` | Tailscale Funnel helper: `up` / `down` / `status` subcommands. |
@@ -43,17 +43,17 @@ Expected: `Docker Compose version v2.x` or newer. If `docker compose` is not rec
 
 ---
 
-## Task 1: Add `.dockerignore`
+## Task 1: Add `Dockerfile.dockerignore`
 
 **Why first:** Without this, the build context includes `target/` (several GB) and the `Wires/` Xcode app, both of which slow `docker build` and force cache invalidation on unrelated changes.
 
 **Files:**
-- Create: `docker/.dockerignore`
+- Create: `docker/Dockerfile.dockerignore`
 
 - [ ] **Step 1: Create the file**
 
 ```
-# docker/.dockerignore
+# docker/Dockerfile.dockerignore
 target/
 data/
 Wires/
@@ -72,15 +72,15 @@ Run from the repo root:
 docker build -f docker/Dockerfile --target nonexistent .. 2>&1 | head -5
 ```
 
-You don't have a Dockerfile yet, so the build will fail — but watch the `transferring context:` line printed by BuildKit before the failure. It should be in the low MBs (workspace source), not GBs. If it's huge, something in `.dockerignore` is wrong.
+You don't have a Dockerfile yet, so the build will fail — but watch the `transferring context:` line printed by BuildKit before the failure. It should be in the low MBs (workspace source), not GBs. If it's huge, something in `Dockerfile.dockerignore` is wrong.
 
 Skip this step if BuildKit isn't available; the real verification happens in Task 2.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add docker/.dockerignore
-git commit -m "docker: add .dockerignore to prune the build context"
+git add docker/Dockerfile.dockerignore
+git commit -m "docker: add Dockerfile.dockerignore to prune the build context"
 ```
 
 ---
