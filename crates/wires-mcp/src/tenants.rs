@@ -212,6 +212,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervisor_retention_evicts_expired_user_messages() {
+        use std::time::Duration;
+        let tmp = TempDir::new().unwrap();
+        let users = tmp.path().join("users");
+        std::fs::create_dir_all(&users).unwrap();
+        let sub = "cd".repeat(32);
+        let dir = users.join(&sub);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = NodeConfig {
+            data_dir: dir.clone(),
+            root_pubkey_hex: sub.clone(),
+            host: None,
+            retention: None,
+        };
+        std::fs::write(dir.join("config.toml"), toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        std::fs::write(dir.join("iroh.secret"), [3u8; 32]).unwrap();
+
+        // Tight TTL so we can sleep past it within the test.
+        let policy = wires_node::RetentionPolicy {
+            ttl: Duration::from_millis(50),
+            max_bytes_per_user: 0,
+        };
+        let sup = TenantSupervisor::new(users.clone(), Duration::from_secs(60), Some(policy));
+        let rt = sup.get_or_open(&sub).await.unwrap();
+        let node = rt.node.clone();
+
+        // Plant a row directly into the IngestIndex and the per-topic log.
+        let topic = [42u8; 32];
+        let sender = [9u8; 32];
+        let log = node.logs.get_or_open(&topic).unwrap();
+        let msg = wires_core::WireMessage {
+            topic_id: topic,
+            epoch: 0,
+            kind: wires_core::MessageKind::Public,
+            sender,
+            cap_id: [0u8; 16],
+            seq: 0,
+            prev_hash: [0u8; 32],
+            timestamp: 0,
+            payload_len: 0,
+            signature: [0u8; 64],
+            ciphertext: vec![],
+        };
+        log.append(&msg).unwrap();
+        let bytes = serde_json::to_vec(&msg).unwrap().len() as u32;
+        let ix = node.ingest_index.as_ref().unwrap();
+        ix.record(
+            &wires_store::IngestEntry {
+                topic_id: topic,
+                sender,
+                seq: 0,
+                bytes,
+                ingested_at_ms: wires_net::unix_now_ms(),
+            },
+            wires_net::unix_now_ms(),
+        )
+        .unwrap();
+
+        // Sleep past TTL, then trigger the sweep.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        node.sweep(wires_net::unix_now_ms()).unwrap();
+
+        assert_eq!(ix.total_bytes().unwrap(), 0);
+        assert!(log.read_after(&sender, None, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn supervisor_injects_retention_into_per_user_runtime() {
         use std::time::Duration;
         let tmp = TempDir::new().unwrap();
