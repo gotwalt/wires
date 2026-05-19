@@ -64,7 +64,7 @@ async fn first_time_pair_then_publish_then_tail() {
         retention: None,
     };
     let store = Store::open(&cfg.gateway_db_path()).unwrap();
-    let supervisor = TenantSupervisor::new(cfg.users_dir(), Duration::from_secs(60));
+    let supervisor = TenantSupervisor::new(cfg.users_dir(), Duration::from_secs(60), None);
     let pair_bridge = Arc::new(PairBridge::new(
         cfg.pending_pairs_dir(),
         cfg.public_url.clone(),
