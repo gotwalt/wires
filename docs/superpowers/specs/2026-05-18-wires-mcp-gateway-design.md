@@ -283,7 +283,7 @@ Gateway handler:
 2. Validates `root_pubkey_hex` is 32 bytes hex.
 3. Looks up `users[root_pubkey_hex]`.
 4. **Known user** → returns `{ "kind": "signin", "challenge_b64": "<URL-safe base64 of canonical SignInChallenge JSON>" }`. Reuses the existing `pending_signins[session_id]` row.
-5. **Unknown user** → calls `pair_bridge.start(session_id, client_name)` (idempotent: if `pending_pairs[session_id]` already exists, returns the cached token instead of allocating again), returns `{ "kind": "pair", "pair_token_b64": "..." }`.
+5. **Unknown user** → calls `pair_bridge.start(session_id, client_name)` (idempotent: if `pending_pairs[session_id]` already exists, returns the cached token instead of allocating again), returns `{ "kind": "pair", "pair_token_b64": "..." }`. (`client_name` retrieved from the `auth_sessions` row → DCR `oauth_clients` registration).
 
 Probe is idempotent per `session_id`: a second call returns the same kind. This matters because mobile networks retry; iOS must be able to call probe twice without burning a new iroh endpoint.
 
@@ -291,7 +291,7 @@ Probe is idempotent per `session_id`: a second call returns the same kind. This 
 
 The pair flow itself is unchanged once iOS receives `kind: "pair"`. Steps 1–10 below remain, except step 1 ("Gateway creates pending_pairs…") now happens during the probe call instead of during `/authorize`.
 
-1. Gateway creates `pending_pairs/<session_id>/` (mode 0700) and generates fresh `identity.ed25519`, `identity.x25519`, `iroh.secret`.
+1. *(performed during probe, see §5.1b)* Gateway creates `pending_pairs/<session_id>/` (mode 0700) and generates fresh `identity.ed25519`, `identity.x25519`, `iroh.secret`.
 2. Gateway binds an **iroh endpoint** with the new `iroh.secret`, registers the standard `PairProtocol` on it.
 3. Gateway constructs the `PairRequest`:
    - `role`: `"mcp-gateway"`.
@@ -300,7 +300,7 @@ The pair flow itself is unchanged once iOS receives `kind: "pair"`. Steps 1–10
    - `dial`: the temp endpoint's `EndpointAddr`.
    - `nonce`, `issued_at`, `expires` per the existing pair-spec rules (default TTL 5 min).
    - signed by the temp `identity.ed25519`.
-4. Encode as URL-safe base64, render as QR + base64 text on the consent page.
+4. Encode as URL-safe base64; returned to iOS in the probe response as `pair_token_b64` (the consent page itself only renders the SessionTicket QR).
 5. iOS scans → standard `pair-approve` UX (operator narrows topics if desired) → dials the temp endpoint over `/wires/pair/0` → sends a sealed `PairGrant`.
 6. The gateway's `PairHandler` runs `install_grant` against the temp data dir. On success the `on_paired` callback fires with `{ root_pubkey_hex, cap_id, installed_at }`.
 7. `pair_bridge` enforces:
@@ -313,7 +313,7 @@ The pair flow itself is unchanged once iOS receives `kind: "pair"`. Steps 1–10
 
 iOS receives `kind: "signin"` from the probe (rather than scanning a sign-in QR directly), base64-decodes the `challenge_b64` field to obtain the `SignInChallenge`, biometric-signs the canonical bytes, and POSTs the assertion back.
 
-`SignInChallenge` shape (canonical JSON, URL-safe base64-encoded for QR transport):
+`SignInChallenge` shape (canonical JSON, URL-safe base64-encoded for probe-response transport):
 
 ```json
 {
@@ -575,7 +575,7 @@ The existing `wires-cli pair-listen` doesn't set this field; only the gateway do
 
 The gateway's callback runs the `pair_bridge` flow synchronously (it's already on a tokio worker):
 
-1. Check `users` table for an existing entry under `PairInstallSummary.root_pubkey_hex`. If present → return `Err(OnPairedError::AlreadyPaired)`. The handler converts this to `Reject(AlreadyPaired)` and the operator is told to use the sign-in QR instead.
+1. Check `users` table for an existing entry under `PairInstallSummary.root_pubkey_hex`. If present → return `Err(OnPairedError::AlreadyPaired)`. Under the new dispatch (§5.1b), the gateway never reaches this branch for an already-paired root because the probe routes them to sign-in instead. `AlreadyPaired` survives as a defense-in-depth check for malformed/raced clients.
 2. Rename `pending_pairs/<session_id>/` → `users/<root_pubkey_hex>/`. On filesystem error → `Err(OnPairedError::Internal(source))` → `Reject(InternalError)`.
 3. Insert the `users` row in `gateway.redb`.
 4. Call `TenantSupervisor::bind`.
@@ -677,7 +677,7 @@ Real iroh endpoints, `MemoryLookup` cross-registration to dodge pkarr warm-up:
 ## 13. v1 acceptance criteria
 
 1. A user with no prior relationship to the gateway can complete first-time `/authorize` end-to-end (scan QR on iOS → approve → browser redirects with code → client exchanges for token).
-2. The same user, on a second MCP client or after token expiry, can complete returning `/authorize` via the sign-in QR.
+2. The same user, on a second MCP client or after token expiry, can complete returning `/authorize` via the SessionTicket QR (probe returns `kind: "signin"`).
 3. `wires.publish` from an MCP client lands on the wires bus as a `Standard`-mode envelope signed by the gateway-agent's `identity.ed25519`, with `cap_id` matching the installed cap. `wires-host` sees only ciphertext.
 4. `wires.tail` returns those same messages with decrypted content + a cursor that, when fed back, resumes correctly.
 5. `wires.list_topics` reflects exactly the caps the operator approved at pair time.
@@ -711,7 +711,7 @@ Real iroh endpoints, `MemoryLookup` cross-registration to dodge pkarr warm-up:
 5. **Default `type` value.** Proposing the literal `"message"`. Open to a different default, or to making it operator-configurable.
 6. **Idle-GC TTL** for quiescent `NodeRuntime`s. Proposing 10 min.
 7. **Operator UX for `user-delete`.** Should it also try to publish a `__cap.revoke` if the operator's `root.ed25519` is colocated on the gateway box (it isn't, by design — roots live on iOS)? Recommend: no, keep clean separation. Operator does cap-revoke separately on iOS if they want to.
-8. **Sign-in iOS UX.** What's shown to the user when scanning a sign-in QR vs. a pair QR? The two paths feel quite different from the operator's point of view; the iOS app needs a clear "this is sign-in" vs. "this is a new agent" affordance. Probably an iOS-side spec concern, but flagging here.
+8. **Sign-in iOS UX.** What UI does iOS show when the probe returns `kind: 'signin'` vs. `kind: 'pair'`? The two paths feel quite different from the operator's point of view; the iOS app needs a clear "this is sign-in" vs. "this is a new agent" affordance. Probably an iOS-side spec concern, but flagging here.
 
 ## 16. Notes on iOS-side work
 
