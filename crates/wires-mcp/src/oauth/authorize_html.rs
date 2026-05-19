@@ -2,7 +2,6 @@
 //! inline as SVG. A small JS polling loop hits
 //! `/oauth/authorize/status/<session_id>` and performs the OAuth redirect when
 //! either the pair or sign-in path completes.
-// TODO Task 6: full single-QR design goes here; this is the compile shim from Task 5.
 
 use axum::response::Html;
 
