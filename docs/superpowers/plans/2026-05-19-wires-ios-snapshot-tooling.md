@@ -792,8 +792,9 @@ var initialAppState: AppFeature.State {
         )
         s.completed = BootstrapFeature.State.Completed(
             registration: TenantRegistration(
+                capsTopicIdHex: String(repeating: "cd", count: 32),
                 hostEndpointIdHex: host.endpointIdHex,
-                capsTopicIdHex: String(repeating: "cd", count: 32)
+                serverTimeMs: 0
             ),
             host: host,
             rootPubkeyHex: String(repeating: "ab", count: 32)
@@ -1201,15 +1202,19 @@ case .oauthScan:
 case .oauthSigninConfirm:
     var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
     let ticket = SessionTicket(
+        version: 1,
+        kind: SessionTicket.kindV1,
         gatewayURL: "https://wires-mcp.example.org",
-        sessionID: "fixture-session-id-abc",
-        version: 1
+        sessionID: "fixture-session-id-abc"
     )
     let challenge = SignInChallenge(
+        version: 1,
+        kind: SignInChallenge.kindV1,
         gatewayURL: "https://wires-mcp.example.org",
         sessionID: "fixture-session-id-abc",
-        nonce: Data(repeating: 0, count: 16),
-        expiresAtMs: 0
+        nonce: String(repeating: "0", count: 64),
+        issuedAt: 0,
+        expires: 0
     )
     home.oauthSignIn = .signinConfirm(ticket: ticket, challenge: challenge)
     return .home(home)
