@@ -8,6 +8,7 @@ import UIKit
 /// store via `decoded(_:)`. The reducer handles parsing and error display.
 struct ScanView<Payload: Equatable & Sendable>: View {
     @Bindable var store: StoreOf<ScanFeature<Payload>>
+    @Dependency(\.cameraPreviewKind) private var previewKind
 
     var body: some View {
         ZStack {
@@ -18,10 +19,17 @@ struct ScanView<Payload: Equatable & Sendable>: View {
             case .denied:
                 permissionDeniedView
             case .granted:
-                CameraCaptureView { payload in
-                    store.send(.decoded(payload))
+                Group {
+                    switch previewKind {
+                    case .live:
+                        CameraCaptureView { payload in
+                            store.send(.decoded(payload))
+                        }
+                        .ignoresSafeArea()
+                    case .placeholder:
+                        FixtureCameraPlaceholder()
+                    }
                 }
-                .ignoresSafeArea()
 
                 if let err = store.error {
                     errorBanner(err)
