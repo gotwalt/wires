@@ -15,10 +15,12 @@ final class SnapshotSweep: XCTestCase {
 
     // MARK: - Test methods (one per LaunchFixture)
 
-    func test_bootstrap_scan_denied()        throws { try snap("bootstrap_scan_denied",        flow: "bootstrap", short: "scan-denied") }
-    func test_bootstrap_scan_granted()       throws { try snap("bootstrap_scan_granted",       flow: "bootstrap", short: "scan-granted") }
-    func test_bootstrap_confirm()            throws { try snap("bootstrap_confirm",            flow: "bootstrap", short: "confirm") }
-    func test_bootstrap_done()               throws { try snap("bootstrap_done",               flow: "bootstrap", short: "done") }
+    func test_onboarding_welcome()           throws { try snap("onboarding_welcome",    flow: "onboarding", short: "welcome") }
+    func test_onboarding_scan()              throws { try snap("onboarding_scan",       flow: "onboarding", short: "scan") }
+    func test_onboarding_scan_error()        throws { try snap("onboarding_scan_error", flow: "onboarding", short: "scan-error") }
+    func test_onboarding_confirm()           throws { try snap("onboarding_confirm",    flow: "onboarding", short: "confirm") }
+    func test_onboarding_face_id()           throws { try snap("onboarding_face_id",    flow: "onboarding", short: "face-id") }
+    func test_onboarding_done()              throws { try snap("onboarding_done",       flow: "onboarding", short: "done") }
 
     func test_home_loading()                 throws { try snap("home_loading",                 flow: "home",     short: "loading") }
     func test_home_empty()                   throws { try snap("home_empty",                   flow: "home",     short: "empty") }
