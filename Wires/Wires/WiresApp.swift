@@ -55,9 +55,9 @@ struct AppView: View {
         switch store.state {
         case .launching:
             ProgressView()
-        case .bootstrap:
-            if let scoped = store.scope(state: \.bootstrap, action: \.bootstrap) {
-                BootstrapView(store: scoped)
+        case .onboarding:
+            if let scoped = store.scope(state: \.onboarding, action: \.onboarding) {
+                OnboardingView(store: scoped)
             }
         case .main:
             if let scoped = store.scope(state: \.main, action: \.main) {
