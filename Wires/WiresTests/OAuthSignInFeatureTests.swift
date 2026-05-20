@@ -60,6 +60,7 @@ struct OAuthSignInFeatureTests {
 
     @Test
     func probe_pair_branch_transitions_to_pair_loading() async throws {
+        struct DeferredError: Error {}
         let ticket = makeTicket()
 
         let store = TestStore(
@@ -71,32 +72,19 @@ struct OAuthSignInFeatureTests {
                 .pair(pairTokenB64: "PAIR_TOKEN")
             }
             // Background work after .pairLoading: parsePairRequest throws,
-            // householdClient.loadHousehold returns nil. Either failure path
-            // surfaces as .pairLoadFailed and ends the test cleanly.
-            $0.wiresClient.parsePairRequest = { _ in
-                throw NSError(domain: "test", code: 0, userInfo: [NSLocalizedDescriptionKey: "deferred"])
-            }
+            // surfacing as .pairLoadFailed and transitioning to .error.
+            $0.wiresClient.parsePairRequest = { _ in throw DeferredError() }
             $0.householdClient.loadHousehold = { nil }
         }
 
         await store.send(.probeStarted)
 
-        // Confirm the state transitions into .pairLoading with the right token.
-        await store.receive(\.probeResolvedPair) { newState in
-            if case let .pairLoading(t, token) = newState {
-                #expect(token == "PAIR_TOKEN")
-                #expect(t == ticket)
-            } else {
-                Issue.record("Expected .pairLoading state, got \(newState)")
-            }
+        await store.receive(\.probeResolvedPair) {
+            $0 = .pairLoading(ticket: ticket, pairTokenB64: "PAIR_TOKEN")
         }
 
-        // Background async block fails (parsePairRequest throws), producing
-        // pairLoadFailed → .error. Exhaust both transitions.
-        await store.receive(\.pairLoadFailed) { newState in
-            if case .error = newState { /* ok */ } else {
-                Issue.record("Expected .error state after pairLoadFailed")
-            }
+        await store.receive(\.pairLoadFailed) {
+            $0 = .error(message: "DeferredError()")
         }
     }
 
