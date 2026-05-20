@@ -39,6 +39,7 @@ mod tests {
             addrs: vec!["127.0.0.1:11204".into()],
             relay: Some("https://relay.example/".into()),
             hint_expires_at: 1_700_000_000_000,
+            server_name: None,
         }
     }
 
