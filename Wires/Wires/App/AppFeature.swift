@@ -7,14 +7,14 @@ struct AppFeature {
     @ObservableState
     enum State: Equatable {
         case launching
-        case bootstrap(BootstrapFeature.State)
+        case onboarding(OnboardingFeature.State)
         case main(MainFeature.State)
     }
 
     enum Action {
         case onAppear
         case householdLoaded(HouseholdSummary?)
-        case bootstrap(BootstrapFeature.Action)
+        case onboarding(OnboardingFeature.Action)
         case main(MainFeature.Action)
     }
 
@@ -58,10 +58,10 @@ struct AppFeature {
                         selectedTab: .network
                     ))
                 } else {
-                    state = .bootstrap(BootstrapFeature.State())
+                    state = .onboarding(OnboardingFeature.State())
                 }
                 return .none
-            case let .bootstrap(.bootstrapCompleted(rootPubkeyHex)):
+            case let .onboarding(.onboardingCompleted(rootPubkeyHex)):
                 state = .main(MainFeature.State(
                     home: HomeFeature.State(rootPubkeyHex: rootPubkeyHex),
                     settings: SettingsFeature.State(),
@@ -74,15 +74,15 @@ struct AppFeature {
                 // wiped the local + remote state. Drop back to .launching
                 // and re-run onAppear so prepareWiresApp regenerates keys
                 // against the empty Keychain and routes us back through
-                // bootstrap.
+                // onboarding.
                 state = .launching
                 return .send(.onAppear)
 
-            case .bootstrap, .main:
+            case .onboarding, .main:
                 return .none
             }
         }
-        .ifCaseLet(\.bootstrap, action: \.bootstrap) { BootstrapFeature() }
+        .ifCaseLet(\.onboarding, action: \.onboarding) { OnboardingFeature() }
         .ifCaseLet(\.main, action: \.main) { MainFeature() }
     }
 }
