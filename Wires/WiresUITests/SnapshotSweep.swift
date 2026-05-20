@@ -22,10 +22,14 @@ final class SnapshotSweep: XCTestCase {
     func test_onboarding_face_id()           throws { try snap("onboarding_face_id",    flow: "onboarding", short: "face-id") }
     func test_onboarding_done()              throws { try snap("onboarding_done",       flow: "onboarding", short: "done") }
 
-    func test_home_loading()                 throws { try snap("home_loading",                 flow: "home",     short: "loading") }
-    func test_home_empty()                   throws { try snap("home_empty",                   flow: "home",     short: "empty") }
-    func test_home_one_cap()                 throws { try snap("home_one_cap",                 flow: "home",     short: "one-cap") }
-    func test_home_three_caps_one_revoked()  throws { try snap("home_three_caps_one_revoked",  flow: "home",     short: "three-caps-one-revoked") }
+    func test_network_empty()                      throws { try snap("network_empty",                      flow: "network", short: "empty") }
+    func test_network_loading()                    throws { try snap("network_loading",                    flow: "network", short: "loading") }
+    func test_network_one_service()                throws { try snap("network_one_service",                flow: "network", short: "one-service") }
+    func test_network_three_services_one_revoked() throws { try snap("network_three_services_one_revoked", flow: "network", short: "three-services-one-revoked") }
+    func test_network_load_error()                 throws { try snap("network_load_error",                 flow: "network", short: "load-error") }
+    func test_service_detail_connected()           throws { try snap("service_detail_connected",           flow: "service", short: "detail-connected") }
+    func test_service_detail_revoked()             throws { try snap("service_detail_revoked",             flow: "service", short: "detail-revoked") }
+    func test_service_detail_advanced_expanded()   throws { try snap("service_detail_advanced_expanded",   flow: "service", short: "detail-advanced-expanded") }
 
     func test_oauth_scan()                   throws { try snap("oauth_scan",                   flow: "oauth",    short: "scan") }
     func test_oauth_signin_confirm()         throws { try snap("oauth_signin_confirm",         flow: "oauth",    short: "signin-confirm") }
