@@ -20,11 +20,12 @@ struct LaunchFixtureTests {
     /// Catches accidental case drops. After the NodeEnrollment scanner
     /// was unified into the OAuth/SessionTicket flow (commit 4057e29),
     /// the 4 enroll fixtures were dropped and one oauth_pair_approve_partial
-    /// fixture was added to preserve partial-grant coverage. Net 14
+    /// fixture was added to preserve partial-grant coverage. Phase 3 of
+    /// the iOS HIG redesign added the 4 settings_* fixtures. Net 18
     /// fixtures. Update this number deliberately if the catalogue changes.
     @Test
     func allCases_count_matches_spec() {
-        #expect(LaunchFixture.allCases.count == 14)
+        #expect(LaunchFixture.allCases.count == 18)
     }
 
     /// `flowAndShortName` is consumed by the snapshot harness to derive

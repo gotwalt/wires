@@ -32,6 +32,11 @@ final class SnapshotSweep: XCTestCase {
     func test_oauth_done()                   throws { try snap("oauth_done",                   flow: "oauth",    short: "done") }
     func test_oauth_error()                  throws { try snap("oauth_error",                  flow: "oauth",    short: "error") }
 
+    func test_settings_root()                throws { try snap("settings_root",                flow: "settings", short: "root") }
+    func test_settings_face_id_off()         throws { try snap("settings_face_id_off",         flow: "settings", short: "face-id-off") }
+    func test_settings_account_detail()      throws { try snap("settings_account_detail",      flow: "settings", short: "account-detail") }
+    func test_settings_delete_confirm()      throws { try snap("settings_delete_confirm",      flow: "settings", short: "delete-confirm") }
+
     // MARK: - Helper
 
     private enum Appearance: String, CaseIterable {

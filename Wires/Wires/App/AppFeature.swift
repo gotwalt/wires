@@ -69,11 +69,12 @@ struct AppFeature {
                 ))
                 return .none
 
-            case .main(.home(.didReset)):
-                // Home wiped the local + remote state. Drop back to
-                // .launching and re-run onAppear so prepareWiresApp
-                // regenerates keys against the empty Keychain and routes
-                // us back through bootstrap.
+            case .main(.didReset):
+                // Either Home (debug reset) or Settings (delete account)
+                // wiped the local + remote state. Drop back to .launching
+                // and re-run onAppear so prepareWiresApp regenerates keys
+                // against the empty Keychain and routes us back through
+                // bootstrap.
                 state = .launching
                 return .send(.onAppear)
 
