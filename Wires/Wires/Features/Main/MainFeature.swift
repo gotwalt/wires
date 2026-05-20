@@ -5,7 +5,7 @@ import Foundation
 struct MainFeature {
     @ObservableState
     struct State: Equatable {
-        var home: HomeFeature.State
+        var network: NetworkFeature.State
         var settings: SettingsFeature.State
         var selectedTab: Tab
 
@@ -13,26 +13,26 @@ struct MainFeature {
     }
 
     enum Action {
-        case home(HomeFeature.Action)
+        case network(NetworkFeature.Action)
         case settings(SettingsFeature.Action)
         case tabSelected(State.Tab)
-        /// Delegate fired when either Home (debug reset) or Settings
-        /// (delete-account) wipes the household. AppFeature observes this
-        /// and transitions back to `.launching`.
+        /// Delegate fired when Settings (delete-account) wipes the
+        /// household. AppFeature observes this and transitions back
+        /// to `.launching`.
         case didReset
     }
 
     var body: some Reducer<State, Action> {
-        Scope(state: \.home, action: \.home) { HomeFeature() }
+        Scope(state: \.network, action: \.network) { NetworkFeature() }
         Scope(state: \.settings, action: \.settings) { SettingsFeature() }
         Reduce { state, action in
             switch action {
             case let .tabSelected(tab):
                 state.selectedTab = tab
                 return .none
-            case .settings(.accountDeleted), .home(.didReset):
+            case .settings(.accountDeleted):
                 return .send(.didReset)
-            case .home, .settings, .didReset:
+            case .network, .settings, .didReset:
                 return .none
             }
         }

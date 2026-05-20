@@ -53,7 +53,7 @@ struct AppFeature {
             case let .householdLoaded(summary):
                 if let summary, summary.tenantRegisteredAt != nil {
                     state = .main(MainFeature.State(
-                        home: HomeFeature.State(rootPubkeyHex: summary.rootPubkeyHex),
+                        network: NetworkFeature.State(rootPubkeyHex: summary.rootPubkeyHex),
                         settings: SettingsFeature.State(),
                         selectedTab: .network
                     ))
@@ -63,7 +63,7 @@ struct AppFeature {
                 return .none
             case let .onboarding(.onboardingCompleted(rootPubkeyHex)):
                 state = .main(MainFeature.State(
-                    home: HomeFeature.State(rootPubkeyHex: rootPubkeyHex),
+                    network: NetworkFeature.State(rootPubkeyHex: rootPubkeyHex),
                     settings: SettingsFeature.State(),
                     selectedTab: .network
                 ))

@@ -4,11 +4,11 @@ import Testing
 
 @Suite("MainFeature")
 struct MainFeatureTests {
-    @Test("forwards home actions to the home child")
-    func forwardsHome() async {
+    @Test("forwards network actions to the network child")
+    func forwardsNetwork() async {
         let store = await TestStore(
             initialState: MainFeature.State(
-                home: HomeFeature.State(rootPubkeyHex: "ab"),
+                network: NetworkFeature.State(rootPubkeyHex: "ab"),
                 settings: SettingsFeature.State(),
                 selectedTab: .network
             )
