@@ -13,6 +13,7 @@ import WiresKit
 ///   3. Add an arm to `initialAppState` returning the AppFeature.State
 ///      the app should land in.
 ///   4. Add a test method in WiresUITests/SnapshotSweep.swift.
+///   5. Update the count assertion in WiresTests/LaunchFixtureTests.swift.
 enum LaunchFixture: String, CaseIterable {
     case bootstrapScanDenied        = "bootstrap_scan_denied"
     case bootstrapScanGranted       = "bootstrap_scan_granted"
@@ -22,13 +23,10 @@ enum LaunchFixture: String, CaseIterable {
     case homeEmpty                  = "home_empty"
     case homeOneCap                 = "home_one_cap"
     case homeThreeCapsOneRevoked    = "home_three_caps_one_revoked"
-    case enrollScan                 = "enroll_scan"
-    case enrollApprovePristine      = "enroll_approve_pristine"
-    case enrollApprovePartial       = "enroll_approve_partial"
-    case enrollDone                 = "enroll_done"
     case oauthScan                  = "oauth_scan"
     case oauthSigninConfirm         = "oauth_signin_confirm"
     case oauthPairApprove           = "oauth_pair_approve"
+    case oauthPairApprovePartial    = "oauth_pair_approve_partial"
     case oauthDone                  = "oauth_done"
     case oauthError                 = "oauth_error"
 
@@ -50,7 +48,6 @@ enum LaunchFixture: String, CaseIterable {
         }
     }
 
-    /// (filled in by Task 3 + 4a–4d)
     func applyDependencies(to values: inout DependencyValues) {
         // Default placeholder dependencies that work for every fixture:
         // .placeholder camera so no AVCaptureSession spins up.
@@ -156,31 +153,10 @@ enum LaunchFixture: String, CaseIterable {
             )
             values.mcpGatewayClient = .fixture()
 
-        case .enrollScan:
-            values.cameraPermissionClient = .fixture(.granted)
-            values.wiresClient = .fixture()
-            values.householdClient = .fixture(
-                household: Household(
-                    rootPubkeyHex: String(repeating: "ab", count: 32),
-                    hostEndpointIdHex: String(repeating: "cd", count: 32)
-                )
-            )
-            values.mcpGatewayClient = .fixture()
-
-        case .enrollApprovePristine, .enrollApprovePartial, .enrollDone:
-            values.cameraPermissionClient = .fixture(.granted)
-            values.wiresClient = .fixture()
-            values.householdClient = .fixture(
-                household: Household(
-                    rootPubkeyHex: String(repeating: "ab", count: 32),
-                    hostEndpointIdHex: String(repeating: "cd", count: 32)
-                )
-            )
-            values.mcpGatewayClient = .fixture()
-
         case .oauthScan,
              .oauthSigninConfirm,
              .oauthPairApprove,
+             .oauthPairApprovePartial,
              .oauthDone,
              .oauthError:
             values.cameraPermissionClient = .fixture(.granted)
@@ -195,7 +171,6 @@ enum LaunchFixture: String, CaseIterable {
         }
     }
 
-    /// (filled in by Task 4a–4d)
     var initialAppState: AppFeature.State {
         switch self {
         case .bootstrapScanDenied:
@@ -246,107 +221,9 @@ enum LaunchFixture: String, CaseIterable {
 
         case .homeEmpty, .homeOneCap, .homeThreeCapsOneRevoked:
             // HomeFeature.onAppear will call householdClient.listCaps which the
-            // per-fixture override returns immediately. Set loading=false so
-            // the brief flash before the effect resolves isn't .loading; the
-            // effect resolves and overwrites caps from the client.
+            // per-fixture override returns immediately. The effect then
+            // overwrites caps from the client.
             return .home(HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32)))
-
-        case .enrollScan:
-            let host = HostInfo(
-                endpointIdHex: String(repeating: "cd", count: 32),
-                addrs: [],
-                relay: nil,
-                hintExpiresAtMs: 0
-            )
-            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
-            var enroll = NodeEnrollmentFeature.State.initial(host: host)
-            // Pre-grant camera so the scan view shows the placeholder, not the
-            // permission-request spinner.
-            if case .scan(var scanStep) = enroll {
-                scanStep.scan.cameraPermission = .granted
-                enroll = .scan(scanStep)
-            }
-            home.nodeEnrollment = enroll
-            return .home(home)
-
-        case .enrollApprovePristine:
-            let host = HostInfo(
-                endpointIdHex: String(repeating: "cd", count: 32),
-                addrs: [],
-                relay: nil,
-                hintExpiresAtMs: 0
-            )
-            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
-            let preview = PairRequestPreview(
-                handle: PendingPairHandle(id: "fixture-pair"),
-                agentPubkeyHex: String(repeating: "ef", count: 32),
-                role: "agent",
-                description: "Aaron's Mac",
-                issuedAtMs: 0,
-                expiresAtMs: 0,
-                requestedScopes: [
-                    RequestedScopePreview(topicName: "family", rights: [.read, .write]),
-                    RequestedScopePreview(topicName: "calendar", rights: [.read])
-                ],
-                dialSummary: ""
-            )
-            home.nodeEnrollment = .approve(ApprovalFeature.State(preview: preview, host: host))
-            return .home(home)
-
-        case .enrollApprovePartial:
-            let host = HostInfo(
-                endpointIdHex: String(repeating: "cd", count: 32),
-                addrs: [],
-                relay: nil,
-                hintExpiresAtMs: 0
-            )
-            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
-            let preview = PairRequestPreview(
-                handle: PendingPairHandle(id: "fixture-pair"),
-                agentPubkeyHex: String(repeating: "ef", count: 32),
-                role: "agent",
-                description: "Aaron's Mac",
-                issuedAtMs: 0,
-                expiresAtMs: 0,
-                requestedScopes: [
-                    RequestedScopePreview(topicName: "family", rights: [.read, .write]),
-                    RequestedScopePreview(topicName: "calendar", rights: [.read])
-                ],
-                dialSummary: ""
-            )
-            var approve = ApprovalFeature.State(preview: preview, host: host)
-            // Default state grants everything. Mutate to partial:
-            //   - family: only .read granted (drop .write)
-            //   - calendar: scope toggled off entirely
-            if var fam = approve.decisions[id: "family"] {
-                fam.grantedRights = [.read]
-                approve.decisions[id: "family"] = fam
-            }
-            if var cal = approve.decisions[id: "calendar"] {
-                cal.granted = false
-                approve.decisions[id: "calendar"] = cal
-            }
-            home.nodeEnrollment = .approve(approve)
-            return .home(home)
-
-        case .enrollDone:
-            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
-            let preview = PairRequestPreview(
-                handle: PendingPairHandle(id: "fixture-pair"),
-                agentPubkeyHex: String(repeating: "ef", count: 32),
-                role: "agent",
-                description: "Aaron's Mac",
-                issuedAtMs: 0,
-                expiresAtMs: 0,
-                requestedScopes: [],
-                dialSummary: ""
-            )
-            let ack = PairAckRecord(
-                installedCapIdHex: String(repeating: "11", count: 32),
-                installedAtMs: 0
-            )
-            home.nodeEnrollment = .done(NodeEnrollmentFeature.DoneStepState(ack: ack, preview: preview))
-            return .home(home)
 
         case .oauthScan:
             var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
@@ -379,29 +256,26 @@ enum LaunchFixture: String, CaseIterable {
             return .home(home)
 
         case .oauthPairApprove:
-            // The OAuth pair-approve state was rewired (commit b1bf0fa) to embed
-            // ApprovalFeature.State directly — same payload as enrollApprovePristine.
-            let host = HostInfo(
-                endpointIdHex: String(repeating: "cd", count: 32),
-                addrs: [],
-                relay: nil,
-                hintExpiresAtMs: 0
-            )
-            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
-            let preview = PairRequestPreview(
-                handle: PendingPairHandle(id: "fixture-pair"),
-                agentPubkeyHex: String(repeating: "ef", count: 32),
-                role: "agent",
-                description: "wires-mcp gateway",
-                issuedAtMs: 0,
-                expiresAtMs: 0,
-                requestedScopes: [
-                    RequestedScopePreview(topicName: "wires-mcp:claude.ai", rights: [.read, .write])
-                ],
-                dialSummary: ""
-            )
-            home.oauthSignIn = .pairApprove(ApprovalFeature.State(preview: preview, host: host))
-            return .home(home)
+            // Pair-approve embeds ApprovalFeature.State directly with the full
+            // scope set granted. The "partial" variant is a sibling fixture
+            // (oauthPairApprovePartial) that mutates one scope.
+            return .home(homeWithPairApprove(modifier: { _ in }))
+
+        case .oauthPairApprovePartial:
+            // Same preview as oauthPairApprove but the user has dropped .write
+            // from "family" and toggled "calendar" entirely off. Captures the
+            // partial-grant UX that the unified OAuth flow inherited from the
+            // (now-removed) enroll flow.
+            return .home(homeWithPairApprove { approve in
+                if var fam = approve.decisions[id: "family"] {
+                    fam.grantedRights = [.read]
+                    approve.decisions[id: "family"] = fam
+                }
+                if var cal = approve.decisions[id: "calendar"] {
+                    cal.granted = false
+                    approve.decisions[id: "calendar"] = cal
+                }
+            })
 
         case .oauthDone:
             var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
@@ -413,6 +287,39 @@ enum LaunchFixture: String, CaseIterable {
             home.oauthSignIn = .error(message: "gateway returned 500")
             return .home(home)
         }
+    }
+
+    /// Builds a Home state seeded with an OAuth pair-approve sheet showing
+    /// two requested scopes (family read+write, calendar read). The
+    /// `modifier` closure can mutate the approval decisions to capture
+    /// partial-grant states.
+    private func homeWithPairApprove(
+        modifier: (inout ApprovalFeature.State) -> Void
+    ) -> HomeFeature.State {
+        let host = HostInfo(
+            endpointIdHex: String(repeating: "cd", count: 32),
+            addrs: [],
+            relay: nil,
+            hintExpiresAtMs: 0
+        )
+        var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+        let preview = PairRequestPreview(
+            handle: PendingPairHandle(id: "fixture-pair"),
+            agentPubkeyHex: String(repeating: "ef", count: 32),
+            role: "agent",
+            description: "Aaron's Mac",
+            issuedAtMs: 0,
+            expiresAtMs: 0,
+            requestedScopes: [
+                RequestedScopePreview(topicName: "family", rights: [.read, .write]),
+                RequestedScopePreview(topicName: "calendar", rights: [.read])
+            ],
+            dialSummary: ""
+        )
+        var approve = ApprovalFeature.State(preview: preview, host: host)
+        modifier(&approve)
+        home.oauthSignIn = .pairApprove(approve)
+        return home
     }
 
     /// Maps each fixture to a (flow folder, short filename) tuple. Used

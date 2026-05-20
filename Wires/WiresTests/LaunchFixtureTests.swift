@@ -17,12 +17,14 @@ struct LaunchFixtureTests {
         }
     }
 
-    /// Catches accidental case drops. v1 ships exactly 17 fixtures per
-    /// the spec §4.4. Update this number deliberately if the fixture
-    /// catalogue changes.
+    /// Catches accidental case drops. After the NodeEnrollment scanner
+    /// was unified into the OAuth/SessionTicket flow (commit 4057e29),
+    /// the 4 enroll fixtures were dropped and one oauth_pair_approve_partial
+    /// fixture was added to preserve partial-grant coverage. Net 14
+    /// fixtures. Update this number deliberately if the catalogue changes.
     @Test
     func allCases_count_matches_spec() {
-        #expect(LaunchFixture.allCases.count == 17)
+        #expect(LaunchFixture.allCases.count == 14)
     }
 
     /// `flowAndShortName` is consumed by the snapshot harness to derive
