@@ -96,7 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // additionally get a QR rendered to stderr.
     {
         use std::io::IsTerminal as _;
-        let ticket = wires_net::HostTicket::from_endpoint(&endpoint, *args.ticket_hint_ttl)?;
+        let ticket =
+            wires_net::HostTicket::from_endpoint(&endpoint, *args.ticket_hint_ttl, None)?;
         let encoded = ticket.encode()?;
         tracing::info!("host ticket: {encoded}");
         let show_qr = args.qr || (!args.no_qr && std::io::stderr().is_terminal());
@@ -293,7 +294,7 @@ async fn run_ticket_subcommand(args: &Args) -> Result<(), Box<dyn std::error::Er
     let secret_path = args.data_dir.join("iroh.secret");
     let secret = load_or_create_secret(&secret_path)?;
     let endpoint = wires_net::bind_cloud(SecretKey::from_bytes(&secret), vec![]).await?;
-    let ticket = wires_net::HostTicket::from_endpoint(&endpoint, *args.ticket_hint_ttl)?;
+    let ticket = wires_net::HostTicket::from_endpoint(&endpoint, *args.ticket_hint_ttl, None)?;
     let encoded = ticket.encode()?;
     println!("{encoded}");
     let show_qr = args.qr || (!args.no_qr && std::io::stderr().is_terminal());
