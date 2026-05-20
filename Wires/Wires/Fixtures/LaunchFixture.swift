@@ -217,13 +217,21 @@ enum LaunchFixture: String, CaseIterable {
         case .homeLoading:
             var s = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
             s.loading = true
-            return .home(s)
+            return .main(MainFeature.State(
+                home: s,
+                settings: SettingsFeature.State(),
+                selectedTab: .network
+            ))
 
         case .homeEmpty, .homeOneCap, .homeThreeCapsOneRevoked:
             // HomeFeature.onAppear will call householdClient.listCaps which the
             // per-fixture override returns immediately. The effect then
             // overwrites caps from the client.
-            return .home(HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32)))
+            return .main(MainFeature.State(
+                home: HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32)),
+                settings: SettingsFeature.State(),
+                selectedTab: .network
+            ))
 
         case .oauthScan:
             var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
@@ -233,7 +241,11 @@ enum LaunchFixture: String, CaseIterable {
                 oauth = .scan(scanState)
             }
             home.oauthSignIn = oauth
-            return .home(home)
+            return .main(MainFeature.State(
+                home: home,
+                settings: SettingsFeature.State(),
+                selectedTab: .network
+            ))
 
         case .oauthSigninConfirm:
             var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
@@ -253,39 +265,59 @@ enum LaunchFixture: String, CaseIterable {
                 expires: 0
             )
             home.oauthSignIn = .signinConfirm(ticket: ticket, challenge: challenge)
-            return .home(home)
+            return .main(MainFeature.State(
+                home: home,
+                settings: SettingsFeature.State(),
+                selectedTab: .network
+            ))
 
         case .oauthPairApprove:
             // Pair-approve embeds ApprovalFeature.State directly with the full
             // scope set granted. The "partial" variant is a sibling fixture
             // (oauthPairApprovePartial) that mutates one scope.
-            return .home(homeWithPairApprove(modifier: { _ in }))
+            return .main(MainFeature.State(
+                home: homeWithPairApprove(modifier: { _ in }),
+                settings: SettingsFeature.State(),
+                selectedTab: .network
+            ))
 
         case .oauthPairApprovePartial:
             // Same preview as oauthPairApprove but the user has dropped .write
             // from "family" and toggled "calendar" entirely off. Captures the
             // partial-grant UX that the unified OAuth flow inherited from the
             // (now-removed) enroll flow.
-            return .home(homeWithPairApprove { approve in
-                if var fam = approve.decisions[id: "family"] {
-                    fam.grantedRights = [.read]
-                    approve.decisions[id: "family"] = fam
-                }
-                if var cal = approve.decisions[id: "calendar"] {
-                    cal.granted = false
-                    approve.decisions[id: "calendar"] = cal
-                }
-            })
+            return .main(MainFeature.State(
+                home: homeWithPairApprove { approve in
+                    if var fam = approve.decisions[id: "family"] {
+                        fam.grantedRights = [.read]
+                        approve.decisions[id: "family"] = fam
+                    }
+                    if var cal = approve.decisions[id: "calendar"] {
+                        cal.granted = false
+                        approve.decisions[id: "calendar"] = cal
+                    }
+                },
+                settings: SettingsFeature.State(),
+                selectedTab: .network
+            ))
 
         case .oauthDone:
             var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
             home.oauthSignIn = .done(message: "Signed in")
-            return .home(home)
+            return .main(MainFeature.State(
+                home: home,
+                settings: SettingsFeature.State(),
+                selectedTab: .network
+            ))
 
         case .oauthError:
             var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
             home.oauthSignIn = .error(message: "gateway returned 500")
-            return .home(home)
+            return .main(MainFeature.State(
+                home: home,
+                settings: SettingsFeature.State(),
+                selectedTab: .network
+            ))
         }
     }
 

@@ -8,14 +8,14 @@ struct AppFeature {
     enum State: Equatable {
         case launching
         case bootstrap(BootstrapFeature.State)
-        case home(HomeFeature.State)
+        case main(MainFeature.State)
     }
 
     enum Action {
         case onAppear
         case householdLoaded(HouseholdSummary?)
         case bootstrap(BootstrapFeature.Action)
-        case home(HomeFeature.Action)
+        case main(MainFeature.Action)
     }
 
     struct HouseholdSummary: Equatable, Sendable {
@@ -52,16 +52,24 @@ struct AppFeature {
                 }
             case let .householdLoaded(summary):
                 if let summary, summary.tenantRegisteredAt != nil {
-                    state = .home(HomeFeature.State(rootPubkeyHex: summary.rootPubkeyHex))
+                    state = .main(MainFeature.State(
+                        home: HomeFeature.State(rootPubkeyHex: summary.rootPubkeyHex),
+                        settings: SettingsFeature.State(),
+                        selectedTab: .network
+                    ))
                 } else {
                     state = .bootstrap(BootstrapFeature.State())
                 }
                 return .none
             case let .bootstrap(.bootstrapCompleted(rootPubkeyHex)):
-                state = .home(HomeFeature.State(rootPubkeyHex: rootPubkeyHex))
+                state = .main(MainFeature.State(
+                    home: HomeFeature.State(rootPubkeyHex: rootPubkeyHex),
+                    settings: SettingsFeature.State(),
+                    selectedTab: .network
+                ))
                 return .none
 
-            case .home(.didReset):
+            case .main(.home(.didReset)):
                 // Home wiped the local + remote state. Drop back to
                 // .launching and re-run onAppear so prepareWiresApp
                 // regenerates keys against the empty Keychain and routes
@@ -69,12 +77,12 @@ struct AppFeature {
                 state = .launching
                 return .send(.onAppear)
 
-            case .bootstrap, .home:
+            case .bootstrap, .main:
                 return .none
             }
         }
         .ifCaseLet(\.bootstrap, action: \.bootstrap) { BootstrapFeature() }
-        .ifCaseLet(\.home, action: \.home) { HomeFeature() }
+        .ifCaseLet(\.main, action: \.main) { MainFeature() }
     }
 }
 
