@@ -5,7 +5,7 @@ import Testing
 
 @MainActor
 @Suite
-struct OAuthSignInFeatureTests {
+struct ConnectFeatureTests {
 
     // Convenience: a minimal SessionTicket.
     private func makeTicket(sessionID: String = "sid") -> SessionTicket {
@@ -41,9 +41,9 @@ struct OAuthSignInFeatureTests {
         let challengeB64 = challenge.signingBytes().base64URLEncodedNoPad()
 
         let store = TestStore(
-            initialState: OAuthSignInFeature.State.probing(ticket: ticket, rootPubkeyHex: "ab")
+            initialState: ConnectFeature.State.probing(ticket: ticket, rootPubkeyHex: "ab")
         ) {
-            OAuthSignInFeature()
+            ConnectFeature()
         } withDependencies: {
             $0.mcpGatewayClient.probe = { _, _, _ in
                 .signin(challengeB64: challengeB64)
@@ -56,22 +56,25 @@ struct OAuthSignInFeatureTests {
         }
     }
 
-    // MARK: - Test 2: probe dispatches to pair branch
+    // MARK: - Test 2: probe dispatches to pair branch and surfaces failures
 
+    /// The pair branch now stays in `.probing` while it parses the pair
+    /// preview and loads the household's HostInfo. A failed parse should
+    /// surface as `.error` without ever leaving `.probing`.
     @Test
-    func probe_pair_branch_transitions_to_pair_loading() async throws {
+    func probe_pair_branch_stays_in_probing_then_surfaces_error() async throws {
         struct DeferredError: Error {}
         let ticket = makeTicket()
 
         let store = TestStore(
-            initialState: OAuthSignInFeature.State.probing(ticket: ticket, rootPubkeyHex: "ab")
+            initialState: ConnectFeature.State.probing(ticket: ticket, rootPubkeyHex: "ab")
         ) {
-            OAuthSignInFeature()
+            ConnectFeature()
         } withDependencies: {
             $0.mcpGatewayClient.probe = { _, _, _ in
                 .pair(pairTokenB64: "PAIR_TOKEN")
             }
-            // Background work after .pairLoading: parsePairRequest throws,
+            // Background work after .probing: parsePairRequest throws,
             // surfacing as .pairLoadFailed and transitioning to .error.
             $0.wiresClient.parsePairRequest = { _ in throw DeferredError() }
             $0.householdClient.loadHousehold = { nil }
@@ -79,9 +82,9 @@ struct OAuthSignInFeatureTests {
 
         await store.send(.probeStarted)
 
-        await store.receive(\.probeResolvedPair) {
-            $0 = .pairLoading(ticket: ticket, pairTokenB64: "PAIR_TOKEN")
-        }
+        // No state change on the pair probe response — we remain in
+        // `.probing` while the preview + host load runs.
+        await store.receive(\.probeResolvedPair)
 
         await store.receive(\.pairLoadFailed) {
             $0 = .error(message: "DeferredError()")
@@ -96,9 +99,9 @@ struct OAuthSignInFeatureTests {
         let challenge = makeChallenge()
 
         let store = TestStore(
-            initialState: OAuthSignInFeature.State.signinConfirm(ticket: ticket, challenge: challenge)
+            initialState: ConnectFeature.State.signinConfirm(ticket: ticket, challenge: challenge)
         ) {
-            OAuthSignInFeature()
+            ConnectFeature()
         } withDependencies: {
             $0.keychainClient.signWithBiometric = { _, _ in Data(repeating: 0xAA, count: 64) }
             $0.mcpGatewayClient.postAssertion = { _, _, _, _ in () }
