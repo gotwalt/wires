@@ -25,14 +25,10 @@ final class SnapshotSweep: XCTestCase {
     func test_home_one_cap()                 throws { try snap("home_one_cap",                 flow: "home",     short: "one-cap") }
     func test_home_three_caps_one_revoked()  throws { try snap("home_three_caps_one_revoked",  flow: "home",     short: "three-caps-one-revoked") }
 
-    func test_enroll_scan()                  throws { try snap("enroll_scan",                  flow: "enroll",   short: "scan") }
-    func test_enroll_approve_pristine()      throws { try snap("enroll_approve_pristine",      flow: "enroll",   short: "approve-pristine") }
-    func test_enroll_approve_partial()       throws { try snap("enroll_approve_partial",       flow: "enroll",   short: "approve-partial") }
-    func test_enroll_done()                  throws { try snap("enroll_done",                  flow: "enroll",   short: "done") }
-
     func test_oauth_scan()                   throws { try snap("oauth_scan",                   flow: "oauth",    short: "scan") }
     func test_oauth_signin_confirm()         throws { try snap("oauth_signin_confirm",         flow: "oauth",    short: "signin-confirm") }
     func test_oauth_pair_approve()           throws { try snap("oauth_pair_approve",           flow: "oauth",    short: "pair-approve") }
+    func test_oauth_pair_approve_partial()   throws { try snap("oauth_pair_approve_partial",   flow: "oauth",    short: "pair-approve-partial") }
     func test_oauth_done()                   throws { try snap("oauth_done",                   flow: "oauth",    short: "done") }
     func test_oauth_error()                  throws { try snap("oauth_error",                  flow: "oauth",    short: "error") }
 
