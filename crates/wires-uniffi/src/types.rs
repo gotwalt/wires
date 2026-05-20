@@ -6,6 +6,9 @@ pub struct HostInfo {
     pub addrs: Vec<String>,
     pub relay: Option<String>,
     pub hint_expires_at_ms: i64,
+    /// Operator-supplied friendly name for the host, surfaced to the user
+    /// during onboarding. Absent on tickets that pre-date the field.
+    pub server_name: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -90,6 +93,7 @@ mod tests {
             addrs: vec!["1.2.3.4:5".into()],
             relay: None,
             hint_expires_at_ms: 1_700_000_000_000,
+            server_name: None,
         };
         let _ = Right::Read;
         let _ = PairAckRecord {

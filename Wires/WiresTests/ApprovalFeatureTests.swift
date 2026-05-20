@@ -10,7 +10,8 @@ struct ApprovalFeatureTests {
         endpointIdHex: String(repeating: "cd", count: 32),
         addrs: ["127.0.0.1:11204"],
         relay: nil,
-        hintExpiresAtMs: 0
+        hintExpiresAtMs: 0,
+        serverName: nil
     )
 
     static let nodePubkey = String(repeating: "ee", count: 32)

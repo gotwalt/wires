@@ -15,7 +15,8 @@ extension WiresClient {
                     endpointIdHex: String(repeating: "ab", count: 32),
                     addrs: ["10.0.0.1:4242"],
                     relay: nil,
-                    hintExpiresAtMs: 0
+                    hintExpiresAtMs: 0,
+                    serverName: nil
                 )
             },
             registerWithHostedService: { _ in
