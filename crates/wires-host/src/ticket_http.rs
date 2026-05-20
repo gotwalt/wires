@@ -215,6 +215,7 @@ footer {
 struct AppState {
     endpoint: iroh::Endpoint,
     hint_ttl: Duration,
+    server_name: Option<String>,
 }
 
 /// Bind a TCP listener, spawn the axum server, and return both the bound
@@ -227,13 +228,18 @@ pub async fn spawn(
     endpoint: iroh::Endpoint,
     bind: SocketAddr,
     hint_ttl: Duration,
+    server_name: Option<String>,
     shutdown: CancellationToken,
 ) -> Result<(SocketAddr, JoinHandle<Result<()>>)> {
     let listener = TcpListener::bind(bind)
         .await
         .context(HttpBindSnafu { bind })?;
     let bound = listener.local_addr().context(HttpBindSnafu { bind })?;
-    let state = Arc::new(AppState { endpoint, hint_ttl });
+    let state = Arc::new(AppState {
+        endpoint,
+        hint_ttl,
+        server_name,
+    });
     let router = build_router(state);
     let handle = tokio::spawn(async move {
         axum::serve(listener, router)
@@ -255,7 +261,8 @@ fn build_router(state: Arc<AppState>) -> Router {
 
 /// Build the current ticket from the live endpoint. Re-derived per request.
 fn current_ticket(state: &AppState) -> Result<HostTicket> {
-    HostTicket::from_endpoint(&state.endpoint, state.hint_ttl, None).context(HostTicketSnafu)
+    HostTicket::from_endpoint(&state.endpoint, state.hint_ttl, state.server_name.clone())
+        .context(HostTicketSnafu)
 }
 
 async fn serve_txt(State(state): State<Arc<AppState>>) -> Result<Response> {
