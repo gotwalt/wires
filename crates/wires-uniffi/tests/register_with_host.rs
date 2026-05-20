@@ -104,7 +104,7 @@ async fn register_with_hosted_service_round_trip() {
         .spawn();
 
     // Build a real HostTicket off the live host endpoint.
-    let ticket = HostTicket::from_endpoint(&host_ep, Duration::from_secs(300)).unwrap();
+    let ticket = HostTicket::from_endpoint(&host_ep, Duration::from_secs(300), None).unwrap();
     let token = ticket.encode().unwrap();
 
     // Construct the WiresApp with a process-local signer.
