@@ -16,6 +16,10 @@ struct MainFeature {
         case home(HomeFeature.Action)
         case settings(SettingsFeature.Action)
         case tabSelected(State.Tab)
+        /// Delegate fired when either Home (debug reset) or Settings
+        /// (delete-account) wipes the household. AppFeature observes this
+        /// and transitions back to `.launching`.
+        case didReset
     }
 
     var body: some Reducer<State, Action> {
@@ -26,7 +30,9 @@ struct MainFeature {
             case let .tabSelected(tab):
                 state.selectedTab = tab
                 return .none
-            case .home, .settings:
+            case .settings(.accountDeleted), .home(.didReset):
+                return .send(.didReset)
+            case .home, .settings, .didReset:
                 return .none
             }
         }

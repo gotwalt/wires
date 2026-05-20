@@ -29,6 +29,10 @@ enum LaunchFixture: String, CaseIterable {
     case oauthPairApprovePartial    = "oauth_pair_approve_partial"
     case oauthDone                  = "oauth_done"
     case oauthError                 = "oauth_error"
+    case settingsRoot               = "settings_root"
+    case settingsFaceIDOff          = "settings_face_id_off"
+    case settingsAccountDetail      = "settings_account_detail"
+    case settingsDeleteConfirm      = "settings_delete_confirm"
 
     /// Given a raw fixture name (typically
     /// `ProcessInfo.processInfo.environment["WIRES_FIXTURE"]`), installs
@@ -165,6 +169,21 @@ enum LaunchFixture: String, CaseIterable {
                 household: Household(
                     rootPubkeyHex: String(repeating: "ab", count: 32),
                     hostEndpointIdHex: String(repeating: "cd", count: 32)
+                )
+            )
+            values.mcpGatewayClient = .fixture()
+
+        case .settingsRoot,
+             .settingsFaceIDOff,
+             .settingsAccountDetail,
+             .settingsDeleteConfirm:
+            values.cameraPermissionClient = .fixture(.granted)
+            values.wiresClient = .fixture()
+            values.householdClient = .fixture(
+                household: Household(
+                    rootPubkeyHex: String(repeating: "ab", count: 32),
+                    hostEndpointIdHex: String(repeating: "cd", count: 32),
+                    hostRelayURL: "https://wires.example.org"
                 )
             )
             values.mcpGatewayClient = .fixture()
@@ -318,7 +337,49 @@ enum LaunchFixture: String, CaseIterable {
                 settings: SettingsFeature.State(),
                 selectedTab: .network
             ))
+
+        case .settingsRoot:
+            return mainStateOnSettings(faceIDEnabled: true)
+
+        case .settingsFaceIDOff:
+            return mainStateOnSettings(faceIDEnabled: false)
+
+        case .settingsAccountDetail:
+            var main = mainStateOnSettings(faceIDEnabled: true)
+            if case .main(var s) = main {
+                s.settings.showingAccountDetail = true
+                main = .main(s)
+            }
+            return main
+
+        case .settingsDeleteConfirm:
+            var main = mainStateOnSettings(faceIDEnabled: true)
+            if case .main(var s) = main {
+                s.settings.deleteSheet = DeleteAccountFeature.State()
+                main = .main(s)
+            }
+            return main
         }
+    }
+
+    /// Shared scaffold for every settings_* fixture: lands the app in the
+    /// Settings tab with a populated SettingsFeature.State that mirrors what
+    /// `SettingsFeature.onAppear` would have produced from a populated
+    /// household. Bypasses the on-appear effect so the fixture renders
+    /// the loaded-state directly.
+    private func mainStateOnSettings(faceIDEnabled: Bool) -> AppFeature.State {
+        let home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+        var settings = SettingsFeature.State()
+        settings.loading = false
+        settings.serverName = "Wires"
+        settings.serverURL = "https://wires.example.org"
+        settings.rootPubkeyHex = String(repeating: "ab", count: 32)
+        settings.faceIDEnabled = faceIDEnabled
+        return .main(MainFeature.State(
+            home: home,
+            settings: settings,
+            selectedTab: .settings
+        ))
     }
 
     /// Builds a Home state seeded with an OAuth pair-approve sheet showing
