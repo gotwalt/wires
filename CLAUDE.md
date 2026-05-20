@@ -12,7 +12,8 @@ Prototype. Three slices have landed on `main`:
 - **MCP gateway v1** — `wires-mcp` is a multi-tenant authenticated MCP gateway. It joins each household as a normal wires agent via the responder pair flow, exposes OAuth 2.1 (PRM + AS + DCR) with the household root pubkey as `sub` and iOS as the universal authenticator. MCP tools: `wires_list_topics`, `wires_publish`, `wires_tail` (renamed from dotted names; Claude's MCP client validates `^[a-zA-Z0-9_-]{1,64}$`). Spec: `docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md`.
 - **Per-user retention v1** (landed 2026-05-19) — `wires-mcp` enforces a TTL + byte-budget eviction policy on each user's `TopicLogs`. `wires-store`'s `IngestIndex` rows now carry `ingested_at_ms`, with new `evict_older_than` / `evict_oldest_until` / backfill helpers. `wires-node` opens an `IngestIndex` when `NodeConfig.retention` is `Some(_)`, hooks record+sweep into publish and inbound, runs `reconcile_ingest_index` at open (backfill + crash-window safety net), and `NodeRuntime` spawns a 60 s `spawn_blocking` sweep loop. `GatewayConfig::retention_policy()` resolves operator TOML (`[retention] ttl_secs / max_bytes_per_user`) or defaults (1 h / 50 MiB); `TenantSupervisor::new(.., retention)` injects per-user. Spec: `docs/superpowers/specs/2026-05-18-wires-mcp-retention-design.md`.
 - **MCP single-QR consent dispatch** (landed 2026-05-19) — `/oauth/authorize` now renders ONE `SessionTicket` QR; iOS POSTs `/oauth/session/probe { session_id, root_pubkey_hex }` and the gateway dispatches into the pair flow (unknown root) or sign-in flow (known root). `pair_bridge.start` is now idempotent per session so probe retries reuse the cached iroh endpoint. iOS gained `OAuthSignInFeature` for the returning-user biometric-sign path (full `ApprovalFeature` composition for the pair branch is a v1 deferral). Eliminates the dual-QR camera-framing hazard and the "do first-time twice → `AlreadyPaired`" cliff. Spec §5 updated.
-- **iOS UI snapshot tooling v1** (landed 2026-05-19) — `scripts/snapshot-ios.sh` drives `WiresUITests/SnapshotSweep` to capture every notable iOS UI state as PNGs under `Wires/screenshots/<run-id>/`. 14 fixtures × light/dark on iPhone 17 Pro (iOS 26.4). Fixture mode swaps every external client via `prepareDependencies`, seeds `AppFeature.State` directly into the target screen, and renders a static `FixtureCameraPlaceholder` instead of the live `CameraCaptureView`. Spec: `docs/superpowers/specs/2026-05-19-wires-ios-snapshot-tooling-design.md`. Plan: `docs/superpowers/plans/2026-05-19-wires-ios-snapshot-tooling.md`. (Initial v1 had 17 fixtures — 4 enroll cases were dropped when NodeEnrollment was unified into the OAuth/SessionTicket flow, replaced by one `oauth_pair_approve_partial` fixture.)
+- **iOS UI snapshot tooling v1** (landed 2026-05-19) — `scripts/snapshot-ios.sh` drives `WiresUITests/SnapshotSweep` to capture every notable iOS UI state as PNGs under `Wires/screenshots/<run-id>/`. 14 fixtures × light/dark on iPhone 17 Pro (iOS 26.4). Fixture mode swaps every external client via `prepareDependencies`, seeds `AppFeature.State` directly into the target screen, and renders a static `FixtureCameraPlaceholder` instead of the live `CameraCaptureView`. Spec: `docs/superpowers/specs/2026-05-19-wires-ios-snapshot-tooling-design.md`. Plan: `docs/superpowers/plans/2026-05-19-wires-ios-snapshot-tooling.md`. (Initial v1 had 17 fixtures — 4 enroll cases were dropped when NodeEnrollment was unified into the OAuth/SessionTicket flow, replaced by one `oauth_pair_approve_partial` fixture.) Superseded by the HIG redesign's 26-fixture sweep.
+- **iOS HIG redesign v1** (landed 2026-05-20) — Apple Passwords-sibling visual treatment, 5-step Apple Pay-style onboarding, TabView with Network + Settings ready for a future Conversations tab, indigo accent + wire-key brand glyph, `ScopeDescriptor` indirection isolating views from cap-shape churn, optional `HostTicket.server_name` plumbed end-to-end (Rust → UniFFI → Swift). Retires `BootstrapFeature` / `HomeFeature` / `OAuthSignInFeature` in favor of `OnboardingFeature` / `NetworkFeature` (with `ServiceDetailFeature`) / `ConnectFeature`. 26 snapshot fixtures × light/dark = 52 PNGs (`onboarding/`, `network/`, `service/`, `connect/`, `settings/`). Spec: `docs/superpowers/specs/2026-05-19-wires-ios-hig-redesign-design.md`. Plan: `docs/superpowers/plans/2026-05-19-wires-ios-hig-redesign.md`.
 
 A Home Assistant ingestion daemon (`wires-ha`) also exists as a working example of an agent that participates in gossip + replay.
 
@@ -108,11 +109,11 @@ and for catching regressions before merging iOS changes.
 ### Running a sweep
 
 ```bash
-# Full sweep — 17 fixtures × light/dark = 34 PNGs, ~5 minutes:
+# Full sweep — 26 fixtures × light/dark = 52 PNGs, ~6 minutes:
 ./scripts/snapshot-ios.sh
 
 # Single fixture — useful while iterating on one screen:
-./scripts/snapshot-ios.sh --fixture home_one_cap
+./scripts/snapshot-ios.sh --fixture network_one_service
 
 # Output:
 #   Wires/screenshots/<YYYY-MM-DD-HHMM>/<flow>/<short>-<appearance>.png
@@ -145,10 +146,11 @@ xcrun simctl create "iPhone 17 Pro - 26.4" \
 
 `Wires/screenshots/latest/` is the entry point for UI/UX review:
 
-- `bootstrap/` — first-run scan/confirm/done states
-- `home/` — household view in empty/loading/populated states
-- `enroll/` — node enrollment sheet (scan/approve/done)
-- `oauth/` — wires-mcp OAuth sheet (scan/signin/pair/done/error)
+- `onboarding/` — 5-step Apple Pay-style onboarding (welcome/scan/confirm/face-id/done) + scan error
+- `network/` — Network tab service list (empty/loading/one-service/three-services/load-error)
+- `service/` — service detail page (connected/revoked/advanced-expanded)
+- `connect/` — connect-a-service ceremony (scan/probing/signin/approve/done/errors)
+- `settings/` — Settings tab (root/face-id-off/account-detail/delete-confirm)
 - `.meta.json` — run id, commit SHA, simulator runtime, macOS version
 
 Use Claude's `Read` tool directly on a `.png` to view the image. Each
@@ -161,24 +163,25 @@ To track a baseline historically, copy a curated run into
 ### Adding a new fixture
 
 A "fixture" is one screenshot-worthy moment of the app's state. To add
-one (e.g. `home_load_error`):
+one (e.g. `network_load_error`):
 
 1. **`Wires/Wires/Fixtures/LaunchFixture.swift`** — add an enum case
    with a stable raw value (snake_case, flow-prefixed):
    ```swift
-   case homeLoadError = "home_load_error"
+   case networkLoadError = "network_load_error"
    ```
 
 2. Same file — add an arm to `applyDependencies(to:)` that installs the
-   right per-dependency fixture clients. The flow-default arms (e.g.
-   the four bootstrap arms) are good templates; adjust the
+   right per-dependency fixture clients. Existing flow-default arms
+   (e.g. the network arms) are good templates; adjust the
    `HouseholdClient.fixture(...)` parameters to seed the state your
    screenshot needs.
 
 3. Same file — add an arm to `initialAppState` that returns the
    seeded `AppFeature.State` for this fixture. Construct
-   `BootstrapFeature.State` / `HomeFeature.State` / etc. directly and
-   wrap in the appropriate `AppFeature.State` case.
+   `OnboardingFeature.State` / `NetworkFeature.State` / etc. directly
+   and wrap in the appropriate `AppFeature.State` case (typically
+   `.main(MainFeature.State(network: ..., settings: ..., selectedTab: .network))`).
 
 4. **`Wires/WiresUITests/SnapshotSweep.swift`** — add a `test_*`
    method that calls `try snap(rawValue, flow: "...", short: "...")`.
@@ -188,8 +191,8 @@ one (e.g. `home_load_error`):
 
 6. Run the new fixture in isolation to verify:
    ```bash
-   ./scripts/snapshot-ios.sh --fixture home_load_error
-   open Wires/screenshots/latest/home/load-error-light.png
+   ./scripts/snapshot-ios.sh --fixture network_load_error
+   open Wires/screenshots/latest/network/load-error-light.png
    ```
 
 ### Adding a new screen or flow
