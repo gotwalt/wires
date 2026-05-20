@@ -6,7 +6,7 @@ struct MainView: View {
 
     var body: some View {
         TabView(selection: $store.selectedTab.sending(\.tabSelected)) {
-            HomeView(store: store.scope(state: \.home, action: \.home))
+            NetworkView(store: store.scope(state: \.network, action: \.network))
                 .tabItem {
                     Label("Network", systemImage: "circle.hexagongrid")
                 }
