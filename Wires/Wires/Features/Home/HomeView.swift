@@ -16,15 +16,6 @@ struct HomeView: View {
                             Label("Connect", systemImage: "qrcode.viewfinder")
                         }
                     }
-                    #if DEBUG
-                    ToolbarItem(placement: .secondaryAction) {
-                        Button(role: .destructive) {
-                            store.send(.resetHouseholdTapped)
-                        } label: {
-                            Label("Reset household (debug)", systemImage: "trash")
-                        }
-                    }
-                    #endif
                 }
                 .task { store.send(.onAppear) }
                 .sheet(item: $store.scope(state: \.oauthSignIn, action: \.oauthSignIn)) { childStore in
