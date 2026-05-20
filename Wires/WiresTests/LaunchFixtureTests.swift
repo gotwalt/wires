@@ -23,11 +23,13 @@ struct LaunchFixtureTests {
     /// fixture was added to preserve partial-grant coverage. Phase 3 of
     /// the iOS HIG redesign added the 4 settings_* fixtures. Phase 5
     /// replaced the 4 bootstrap_* fixtures with 6 onboarding_* fixtures
-    /// (welcome + scan + scan-error + confirm + face-id + done). Net 20
-    /// fixtures. Update this number deliberately if the catalogue changes.
+    /// (welcome + scan + scan-error + confirm + face-id + done). Phase 6
+    /// retired the 4 home_* fixtures and added 5 network_* + 3
+    /// service_detail_* fixtures (net +4 → 24). Update this number
+    /// deliberately if the catalogue changes.
     @Test
     func allCases_count_matches_spec() {
-        #expect(LaunchFixture.allCases.count == 20)
+        #expect(LaunchFixture.allCases.count == 24)
     }
 
     /// `flowAndShortName` is consumed by the snapshot harness to derive
@@ -40,9 +42,9 @@ struct LaunchFixtureTests {
         #expect(onboarding.flow == "onboarding")
         #expect(onboarding.short == "scan-error")
 
-        let home = LaunchFixture.homeThreeCapsOneRevoked.flowAndShortName
-        #expect(home.flow == "home")
-        #expect(home.short == "three-caps-one-revoked")
+        let network = LaunchFixture.networkThreeServicesOneRevoked.flowAndShortName
+        #expect(network.flow == "network")
+        #expect(network.short == "three-services-one-revoked")
 
         let oauth = LaunchFixture.oauthSigninConfirm.flowAndShortName
         #expect(oauth.flow == "oauth")
