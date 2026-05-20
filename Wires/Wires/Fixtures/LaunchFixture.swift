@@ -212,7 +212,7 @@ enum LaunchFixture: String, CaseIterable {
             var s = BootstrapFeature.State()
             s.scan.cameraPermission = .granted
             s.confirmedHost = HostInfo(
-                endpointIdHex: String(repeating: "ab", count: 32),
+                endpointIdHex: String(repeating: "cd", count: 32),
                 addrs: ["192.168.1.20:4242"],
                 relay: "https://relay.example.org",
                 hintExpiresAtMs: 0
@@ -223,14 +223,14 @@ enum LaunchFixture: String, CaseIterable {
             var s = BootstrapFeature.State()
             s.scan.cameraPermission = .granted
             let host = HostInfo(
-                endpointIdHex: String(repeating: "ab", count: 32),
+                endpointIdHex: String(repeating: "cd", count: 32),
                 addrs: ["192.168.1.20:4242"],
                 relay: "https://relay.example.org",
                 hintExpiresAtMs: 0
             )
             s.completed = BootstrapFeature.State.Completed(
                 registration: TenantRegistration(
-                    capsTopicIdHex: String(repeating: "cd", count: 32),
+                    capsTopicIdHex: String(repeating: "ee", count: 32),
                     hostEndpointIdHex: host.endpointIdHex,
                     serverTimeMs: 0
                 ),
