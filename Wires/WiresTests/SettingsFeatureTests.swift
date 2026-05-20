@@ -27,12 +27,12 @@ struct SettingsFeatureTests {
         }
         await store.send(.loaded(
             serverName: "Wires",
-            serverURL: "https://wires.example.org",
+            relayURL: "https://usw1-1.relay.n0.iroh-canary.iroh.link./",
             rootPubkeyHex: "ab",
             faceIDEnabled: true
         )) {
             $0.serverName = "Wires"
-            $0.serverURL = "https://wires.example.org"
+            $0.relayURL = "https://usw1-1.relay.n0.iroh-canary.iroh.link./"
             $0.rootPubkeyHex = "ab"
             $0.faceIDEnabled = true
             $0.loading = false

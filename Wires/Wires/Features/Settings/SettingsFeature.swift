@@ -5,22 +5,38 @@ import Foundation
 struct SettingsFeature {
     @ObservableState
     struct State: Equatable {
+        /// Operator-set friendly label from `HostTicket.server_name`. Empty
+        /// if the host didn't provide one. Don't fall back to hex — use
+        /// `serverDisplayName` for presentation.
         var serverName: String = ""
-        var serverURL: String = ""
+        /// iroh relay URL used as a NAT-traversal fallback when devices can't
+        /// reach the server directly. Diagnostic / informational only.
+        var relayURL: String = ""
         var rootPubkeyHex: String = ""
         var faceIDEnabled: Bool = false
         var loading: Bool = true
         var showingAccountDetail = false
+        /// When true, the Account detail sheet renders its Advanced
+        /// disclosure expanded. Snapshot fixtures use this to capture the
+        /// fingerprint-readout state.
+        var accountAdvancedInitiallyExpanded = false
         @Presents var deleteSheet: DeleteAccountFeature.State?
 
         var appVersion: String {
             Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
         }
+
+        /// Human-friendly server label for use everywhere a name shows up.
+        /// Falls back to a generic stand-in so the hex EndpointId never
+        /// surfaces as a "name".
+        var serverDisplayName: String {
+            serverName.isEmpty ? "Wires server" : serverName
+        }
     }
 
     enum Action {
         case onAppear
-        case loaded(serverName: String, serverURL: String, rootPubkeyHex: String, faceIDEnabled: Bool)
+        case loaded(serverName: String, relayURL: String, rootPubkeyHex: String, faceIDEnabled: Bool)
         case accountRowTapped
         case accountDetailDismissed
         case faceIDToggled(Bool)
@@ -52,15 +68,15 @@ struct SettingsFeature {
                     )) != nil
                     await send(.loaded(
                         serverName: summary.serverName,
-                        serverURL: summary.serverURL,
+                        relayURL: summary.relayURL,
                         rootPubkeyHex: summary.rootPubkeyHex,
                         faceIDEnabled: faceIDEnabled
                     ))
                 }
 
-            case let .loaded(serverName, serverURL, rootPubkeyHex, faceIDEnabled):
+            case let .loaded(serverName, relayURL, rootPubkeyHex, faceIDEnabled):
                 state.serverName = serverName
-                state.serverURL = serverURL
+                state.relayURL = relayURL
                 state.rootPubkeyHex = rootPubkeyHex
                 state.faceIDEnabled = faceIDEnabled
                 state.loading = false
@@ -110,7 +126,7 @@ struct SettingsFeature {
 /// safely.
 private struct HouseholdSummaryFields: Sendable {
     let serverName: String
-    let serverURL: String
+    let relayURL: String
     let rootPubkeyHex: String
 }
 
@@ -120,11 +136,9 @@ private func loadHouseholdSummary(
 ) async throws -> HouseholdSummaryFields? {
     guard let h = try await household.loadHousehold() else { return nil }
     return await MainActor.run {
-        // hostEndpointIdHex stands in for serverName until Phase 4 lands
-        // the HostTicket.server_name FFI surface.
         HouseholdSummaryFields(
-            serverName: h.hostEndpointIdHex ?? "",
-            serverURL: h.hostRelayURL ?? "",
+            serverName: h.hostServerName ?? "",
+            relayURL: h.hostRelayURL ?? "",
             rootPubkeyHex: h.rootPubkeyHex
         )
     }
