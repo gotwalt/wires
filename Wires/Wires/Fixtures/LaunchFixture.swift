@@ -40,6 +40,7 @@ enum LaunchFixture: String, CaseIterable {
     case settingsRoot                        = "settings_root"
     case settingsFaceIDOff                   = "settings_face_id_off"
     case settingsAccountDetail               = "settings_account_detail"
+    case settingsAccountFingerprint          = "settings_account_fingerprint"
     case settingsDeleteConfirm               = "settings_delete_confirm"
 
     /// Given a raw fixture name (typically
@@ -133,6 +134,7 @@ enum LaunchFixture: String, CaseIterable {
         case .settingsRoot,
              .settingsFaceIDOff,
              .settingsAccountDetail,
+             .settingsAccountFingerprint,
              .settingsDeleteConfirm:
             values.cameraPermissionClient = .fixture(.granted)
             values.wiresClient = .fixture()
@@ -140,7 +142,8 @@ enum LaunchFixture: String, CaseIterable {
                 household: Household(
                     rootPubkeyHex: String(repeating: "ab", count: 32),
                     hostEndpointIdHex: String(repeating: "cd", count: 32),
-                    hostRelayURL: "https://wires.example.org"
+                    hostServerName: "Wires",
+                    hostRelayURL: "https://usw1-1.relay.n0.iroh-canary.iroh.link./"
                 )
             )
             values.mcpGatewayClient = .fixture()
@@ -407,6 +410,15 @@ enum LaunchFixture: String, CaseIterable {
             }
             return main
 
+        case .settingsAccountFingerprint:
+            var main = mainStateOnSettings(faceIDEnabled: true)
+            if case .main(var s) = main {
+                s.settings.showingAccountDetail = true
+                s.settings.accountAdvancedInitiallyExpanded = true
+                main = .main(s)
+            }
+            return main
+
         case .settingsDeleteConfirm:
             var main = mainStateOnSettings(faceIDEnabled: true)
             if case .main(var s) = main {
@@ -441,7 +453,7 @@ enum LaunchFixture: String, CaseIterable {
         var settings = SettingsFeature.State()
         settings.loading = false
         settings.serverName = "Wires"
-        settings.serverURL = "https://wires.example.org"
+        settings.relayURL = "https://usw1-1.relay.n0.iroh-canary.iroh.link./"
         settings.rootPubkeyHex = String(repeating: "ab", count: 32)
         settings.faceIDEnabled = faceIDEnabled
         return .main(MainFeature.State(

@@ -43,6 +43,7 @@ final class SnapshotSweep: XCTestCase {
     func test_settings_root()                throws { try snap("settings_root",                flow: "settings", short: "root") }
     func test_settings_face_id_off()         throws { try snap("settings_face_id_off",         flow: "settings", short: "face-id-off") }
     func test_settings_account_detail()      throws { try snap("settings_account_detail",      flow: "settings", short: "account-detail") }
+    func test_settings_account_fingerprint() throws { try snap("settings_account_fingerprint", flow: "settings", short: "account-fingerprint") }
     func test_settings_delete_confirm()      throws { try snap("settings_delete_confirm",      flow: "settings", short: "delete-confirm") }
 
     // MARK: - Helper

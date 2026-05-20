@@ -16,18 +16,22 @@ struct AccountDetailSheet: View {
 
                     Text("Your Wires")
                         .font(.title.bold())
-                    Text(store.serverName.isEmpty ? store.serverURL : store.serverName)
+                    Text(store.serverDisplayName)
                         .font(.body)
                         .foregroundStyle(.secondary)
 
-                    AdvancedDisclosure(title: "Advanced") {
+                    AdvancedDisclosure(
+                        title: "Advanced",
+                        initialExpanded: store.accountAdvancedInitiallyExpanded
+                    ) {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("Account key fingerprint")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
-                            Text(store.rootPubkeyHex)
+                            Text(HexFormatter.quadGrouped(store.rootPubkeyHex))
                                 .font(.system(.footnote, design: .monospaced))
                                 .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
