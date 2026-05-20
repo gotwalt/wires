@@ -20,19 +20,32 @@ struct SettingsView: View {
                         }
 
                         Section {
-                            LabeledContent("Server name", value: store.serverName.isEmpty ? "—" : store.serverName)
-                            LabeledContent("Server URL", value: store.serverURL.isEmpty ? "—" : store.serverURL)
+                            LabeledContent("Name", value: store.serverDisplayName)
                         } header: {
                             Text("Server")
                         } footer: {
-                            Text("Your account lives on this server. You can't move it to a different server.")
+                            Text("Your account lives on this server. You can't move it to a different one.")
+                        }
+
+                        Section {
+                            LabeledContent("URL") {
+                                Text(store.relayURL.isEmpty ? "—" : store.relayURL)
+                                    .font(.subheadline)
+                                    .multilineTextAlignment(.trailing)
+                                    .lineLimit(2)
+                                    .truncationMode(.middle)
+                            }
+                        } header: {
+                            Text("Relay")
+                        } footer: {
+                            Text("The relay helps devices in your network reach each other when a direct connection isn't possible.")
                         }
 
                         Section("About") {
                             LabeledContent("Version", value: store.appVersion)
                         }
                     }
-                    .frame(minHeight: 400)
+                    .frame(minHeight: 560)
                     .scrollDisabled(true)
 
                     DestructiveFooterButton(title: "Delete account") {
@@ -72,7 +85,7 @@ struct SettingsView: View {
                     Text("Your Wires")
                         .font(.title3.bold())
                         .foregroundStyle(.primary)
-                    Text(store.serverName.isEmpty ? store.serverURL : store.serverName)
+                    Text(store.serverDisplayName)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }

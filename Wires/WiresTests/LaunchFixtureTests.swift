@@ -30,11 +30,12 @@ struct LaunchFixtureTests {
     /// (scan + probing + signin-confirm + approve-collapsed + done +
     /// error-parse + error-network + already-connected; the proposed
     /// approve-expanded variant was dropped in v1 per Task 7.3 Step 2)
-    /// — net +2 → 26. Update this number deliberately if the catalogue
-    /// changes.
+    /// — net +2 → 26. The typography pass added `settings_account_fingerprint`
+    /// (Account → Advanced expanded) → 27. Update this number deliberately
+    /// if the catalogue changes.
     @Test
     func allCases_count_matches_spec() {
-        #expect(LaunchFixture.allCases.count == 26)
+        #expect(LaunchFixture.allCases.count == 27)
     }
 
     /// `flowAndShortName` is consumed by the snapshot harness to derive
