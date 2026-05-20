@@ -59,9 +59,9 @@ struct AppView: View {
             if let scoped = store.scope(state: \.bootstrap, action: \.bootstrap) {
                 BootstrapView(store: scoped)
             }
-        case .home:
-            if let scoped = store.scope(state: \.home, action: \.home) {
-                HomeView(store: scoped)
+        case .main:
+            if let scoped = store.scope(state: \.main, action: \.main) {
+                MainView(store: scoped)
             }
         }
     }
