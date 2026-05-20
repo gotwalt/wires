@@ -31,12 +31,14 @@ final class SnapshotSweep: XCTestCase {
     func test_service_detail_revoked()             throws { try snap("service_detail_revoked",             flow: "service", short: "detail-revoked") }
     func test_service_detail_advanced_expanded()   throws { try snap("service_detail_advanced_expanded",   flow: "service", short: "detail-advanced-expanded") }
 
-    func test_oauth_scan()                   throws { try snap("oauth_scan",                   flow: "oauth",    short: "scan") }
-    func test_oauth_signin_confirm()         throws { try snap("oauth_signin_confirm",         flow: "oauth",    short: "signin-confirm") }
-    func test_oauth_pair_approve()           throws { try snap("oauth_pair_approve",           flow: "oauth",    short: "pair-approve") }
-    func test_oauth_pair_approve_partial()   throws { try snap("oauth_pair_approve_partial",   flow: "oauth",    short: "pair-approve-partial") }
-    func test_oauth_done()                   throws { try snap("oauth_done",                   flow: "oauth",    short: "done") }
-    func test_oauth_error()                  throws { try snap("oauth_error",                  flow: "oauth",    short: "error") }
+    func test_connect_scan()              throws { try snap("connect_scan",              flow: "connect", short: "scan") }
+    func test_connect_probing()           throws { try snap("connect_probing",           flow: "connect", short: "probing") }
+    func test_connect_signin_confirm()    throws { try snap("connect_signin_confirm",    flow: "connect", short: "signin-confirm") }
+    func test_connect_approve_collapsed() throws { try snap("connect_approve_collapsed", flow: "connect", short: "approve-collapsed") }
+    func test_connect_done()              throws { try snap("connect_done",              flow: "connect", short: "done") }
+    func test_connect_error_parse()       throws { try snap("connect_error_parse",       flow: "connect", short: "error-parse") }
+    func test_connect_error_network()     throws { try snap("connect_error_network",     flow: "connect", short: "error-network") }
+    func test_connect_already_connected() throws { try snap("connect_already_connected", flow: "connect", short: "already-connected") }
 
     func test_settings_root()                throws { try snap("settings_root",                flow: "settings", short: "root") }
     func test_settings_face_id_off()         throws { try snap("settings_face_id_off",         flow: "settings", short: "face-id-off") }

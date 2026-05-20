@@ -29,12 +29,14 @@ enum LaunchFixture: String, CaseIterable {
     case serviceDetailConnected              = "service_detail_connected"
     case serviceDetailRevoked                = "service_detail_revoked"
     case serviceDetailAdvancedExpanded       = "service_detail_advanced_expanded"
-    case oauthScan                           = "oauth_scan"
-    case oauthSigninConfirm                  = "oauth_signin_confirm"
-    case oauthPairApprove                    = "oauth_pair_approve"
-    case oauthPairApprovePartial             = "oauth_pair_approve_partial"
-    case oauthDone                           = "oauth_done"
-    case oauthError                          = "oauth_error"
+    case connectScan                         = "connect_scan"
+    case connectProbing                      = "connect_probing"
+    case connectSigninConfirm                = "connect_signin_confirm"
+    case connectApproveCollapsed             = "connect_approve_collapsed"
+    case connectDone                         = "connect_done"
+    case connectErrorParse                   = "connect_error_parse"
+    case connectErrorNetwork                 = "connect_error_network"
+    case connectAlreadyConnected             = "connect_already_connected"
     case settingsRoot                        = "settings_root"
     case settingsFaceIDOff                   = "settings_face_id_off"
     case settingsAccountDetail               = "settings_account_detail"
@@ -110,12 +112,14 @@ enum LaunchFixture: String, CaseIterable {
             )
             values.mcpGatewayClient = .fixture()
 
-        case .oauthScan,
-             .oauthSigninConfirm,
-             .oauthPairApprove,
-             .oauthPairApprovePartial,
-             .oauthDone,
-             .oauthError:
+        case .connectScan,
+             .connectProbing,
+             .connectSigninConfirm,
+             .connectApproveCollapsed,
+             .connectDone,
+             .connectErrorParse,
+             .connectErrorNetwork,
+             .connectAlreadyConnected:
             values.cameraPermissionClient = .fixture(.granted)
             values.wiresClient = .fixture()
             values.householdClient = .fixture(
@@ -341,21 +345,53 @@ enum LaunchFixture: String, CaseIterable {
                 selectedTab: .network
             ))
 
-        case .oauthScan,
-             .oauthSigninConfirm,
-             .oauthPairApprove,
-             .oauthPairApprovePartial,
-             .oauthDone,
-             .oauthError:
-            // Phase 6 retires the home.oauthSignIn → connect plumbing.
-            // ConnectFeature is a stub until Phase 7 rebuilds the
-            // ceremony; these fixtures render bare Network in the
-            // meantime and are replaced wholesale in Task 7.3.
-            return .main(MainFeature.State(
-                network: NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32)),
-                settings: SettingsFeature.State(),
-                selectedTab: .network
-            ))
+        case .connectScan:
+            var connect = ConnectFeature.State.initial()
+            if case .scan(var scanState) = connect {
+                scanState.cameraPermission = .granted
+                connect = .scan(scanState)
+            }
+            return mainStateWithConnect(connect)
+
+        case .connectProbing:
+            let ticket = SessionTicket(
+                version: 1, kind: SessionTicket.kindV1,
+                gatewayURL: "https://wires-mcp.example.org",
+                sessionID: "fixture-session-id"
+            )
+            return mainStateWithConnect(
+                .probing(ticket: ticket, rootPubkeyHex: String(repeating: "ab", count: 32))
+            )
+
+        case .connectSigninConfirm:
+            let ticket = SessionTicket(
+                version: 1, kind: SessionTicket.kindV1,
+                gatewayURL: "https://wires-mcp.example.org",
+                sessionID: "fixture-session-id"
+            )
+            let challenge = SignInChallenge(
+                version: 1, kind: SignInChallenge.kindV1,
+                gatewayURL: "https://wires-mcp.example.org",
+                sessionID: "fixture-session-id",
+                nonce: String(repeating: "0", count: 64),
+                issuedAt: 0, expires: 0
+            )
+            return mainStateWithConnect(.signinConfirm(ticket: ticket, challenge: challenge))
+
+        case .connectApproveCollapsed:
+            return mainStateWithConnect(.pairApprove(approvalStateForFixture()))
+
+        case .connectDone:
+            return mainStateWithConnect(.done(message: "Chase is now on your network."))
+
+        case .connectErrorParse:
+            return mainStateWithConnect(.error(message: "Couldn't read this code. Try again."))
+
+        case .connectErrorNetwork:
+            return mainStateWithConnect(.error(message: "Couldn't reach your server."))
+
+        case .connectAlreadyConnected:
+            return mainStateWithConnect(.done(message: "Chase is already connected."))
 
         case .settingsRoot:
             return mainStateOnSettings(faceIDEnabled: true)
@@ -413,6 +449,45 @@ enum LaunchFixture: String, CaseIterable {
             settings: settings,
             selectedTab: .settings
         ))
+    }
+
+    /// Shared scaffold for every connect_* fixture: presents the Network
+    /// tab with the connect sheet hosting the given ConnectFeature.State.
+    private func mainStateWithConnect(_ connect: ConnectFeature.State) -> AppFeature.State {
+        var network = NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+        network.connect = connect
+        return .main(MainFeature.State(
+            network: network,
+            settings: SettingsFeature.State(),
+            selectedTab: .network
+        ))
+    }
+
+    /// Canned ApprovalFeature.State used by connect_approve_* fixtures.
+    /// Models a node request from "Chase" asking for read+write on
+    /// `family` and read on `calendar`.
+    private func approvalStateForFixture() -> ApprovalFeature.State {
+        let host = HostInfo(
+            endpointIdHex: String(repeating: "cd", count: 32),
+            addrs: [],
+            relay: nil,
+            hintExpiresAtMs: 0,
+            serverName: "Wires"
+        )
+        let preview = PairRequestPreview(
+            handle: PendingPairHandle(id: "fixture-pair"),
+            agentPubkeyHex: String(repeating: "ef", count: 32),
+            role: "agent",
+            description: "Chase",
+            issuedAtMs: 0,
+            expiresAtMs: 0,
+            requestedScopes: [
+                RequestedScopePreview(topicName: "family", rights: [.read, .write]),
+                RequestedScopePreview(topicName: "calendar", rights: [.read])
+            ],
+            dialSummary: ""
+        )
+        return ApprovalFeature.State(preview: preview, host: host)
     }
 
     /// Maps each fixture to a (flow folder, short filename) tuple. Used
