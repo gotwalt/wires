@@ -67,7 +67,7 @@ struct ConnectFeature {
                     let rootHex: String?
                     do { rootHex = try await household.loadHousehold()?.rootPubkeyHex } catch { rootHex = nil }
                     guard let rootHex, !rootHex.isEmpty else {
-                        await send(.probeFailed("no household — bootstrap first"))
+                        await send(.probeFailed("Set up your account first"))
                         return
                     }
                     await send(.probeBegin(ticket: ticket, rootPubkeyHex: rootHex))
