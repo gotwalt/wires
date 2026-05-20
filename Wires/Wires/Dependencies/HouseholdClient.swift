@@ -27,6 +27,10 @@ struct HouseholdClient {
     var markTopicRegistered: @Sendable (_ topicIdHex: String) async throws -> Void
     var listCaps: @Sendable () async throws -> [CapRecord]
     var saveCap: @Sendable (_ cap: CapRecord) async throws -> Void
+    /// Mark a cap as locally revoked. Thin wrapper that sets
+    /// `revokedAt = .now` on the matching CapRecord row. The
+    /// substrate-level revoke broadcast lands in a later phase.
+    var revokeCap: @Sendable (_ capIdHex: String) async throws -> Void
     /// Delete every Household, TopicRecord, and CapRecord row.
     var wipeAll: @Sendable () async throws -> Void
 }
@@ -54,6 +58,7 @@ extension HouseholdClient: DependencyKey {
             markTopicRegistered: { try await store.markTopicRegistered(topicIdHex: $0) },
             listCaps: { try await store.listCaps() },
             saveCap: { try await store.save($0) },
+            revokeCap: { try await store.revokeCap(capIdHex: $0) },
             wipeAll: { try await store.wipeAll() }
         )
     }
@@ -161,6 +166,18 @@ private final class HouseholdStore {
     func save(_ cap: CapRecord) throws {
         let ctx = ModelContext(container)
         ctx.insert(cap)
+        try ctx.save()
+    }
+
+    func revokeCap(capIdHex: String) throws {
+        let ctx = ModelContext(container)
+        let descriptor = FetchDescriptor<CapRecord>(
+            predicate: #Predicate { $0.capIdHex == capIdHex }
+        )
+        guard let cap = try ctx.fetch(descriptor).first else {
+            throw HouseholdError.notFound
+        }
+        cap.revokedAt = .now
         try ctx.save()
     }
 
