@@ -29,6 +29,7 @@ async fn ticket_http_serves_all_three_routes() {
         endpoint.clone(),
         bind,
         Duration::from_secs(60),
+        None,
         shutdown.clone(),
     )
     .await
