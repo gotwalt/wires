@@ -14,3 +14,7 @@ Cargo.lock
 
 # Operator-edited wires-mcp config (template lives at docker/wires-mcp.toml.example)
 docker/wires-mcp.toml
+
+# iOS UI snapshot sweep artifacts. Curate selected runs into
+# docs/ui-baselines/<date>/ to track historically.
+Wires/screenshots/
