@@ -30,6 +30,15 @@ struct NetworkFeature {
         Reduce { state, action in
             switch action {
             case .onAppear:
+                // Don't clobber state that a fixture (or a prior load)
+                // has already populated. Snapshot fixtures seed
+                // `services` directly and rely on this short-circuit
+                // so the .task-driven refresh doesn't overwrite the
+                // seeded list with an empty CapRecord query.
+                if FixtureRuntime.isActive
+                    && (!state.services.isEmpty || state.loading || state.loadError != nil) {
+                    return .none
+                }
                 state.loading = true
                 state.loadError = nil
                 let household = self.household

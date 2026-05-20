@@ -2,7 +2,7 @@ import Foundation
 
 /// Process-wide register of which fixture is active. Set once at app
 /// launch by `LaunchFixture.install(named:)`. Views consult `isActive`
-/// to skip work that would clobber seeded state (e.g. HomeView's
+/// to skip work that would clobber seeded state (e.g. NetworkView's
 /// onAppear).
 ///
 /// In production builds nothing writes to this; `activeFixture` stays
