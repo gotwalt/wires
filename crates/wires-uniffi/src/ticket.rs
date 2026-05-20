@@ -19,6 +19,7 @@ pub fn parse_host_ticket(payload: &str) -> Result<HostInfo, WiresError> {
         addrs: t.addrs,
         relay: t.relay,
         hint_expires_at_ms: t.hint_expires_at,
+        server_name: t.server_name,
     })
 }
 
