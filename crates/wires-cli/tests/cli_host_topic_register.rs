@@ -51,7 +51,8 @@ async fn topic_register_round_trip() {
         .expect("host endpoint did not come online within 10s");
 
     // Build the host ticket the operator would scan.
-    let ticket = HostTicket::from_endpoint(&host_ep, std::time::Duration::from_secs(60)).unwrap();
+    let ticket =
+        HostTicket::from_endpoint(&host_ep, std::time::Duration::from_secs(60), None).unwrap();
     let token = ticket.encode().unwrap();
 
     // Init + pair via ticket.

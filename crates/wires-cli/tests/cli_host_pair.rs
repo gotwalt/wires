@@ -53,7 +53,8 @@ async fn host_pair_persists_host_to_config() {
         .expect("host endpoint did not come online within 10s");
 
     // ---- build the host ticket the operator would scan ------------------
-    let ticket = HostTicket::from_endpoint(&host_ep, std::time::Duration::from_secs(60)).unwrap();
+    let ticket =
+        HostTicket::from_endpoint(&host_ep, std::time::Duration::from_secs(60), None).unwrap();
     let token = ticket.encode().unwrap();
 
     // ---- run `wires init` then `wires host pair --ticket <T>` ----------

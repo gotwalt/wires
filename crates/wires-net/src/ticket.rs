@@ -33,6 +33,10 @@ pub struct HostTicket {
     /// Unix ms after which `addrs`/`relay` are treated as zero-weight hints by
     /// the consumer. `endpoint_id` itself never expires.
     pub hint_expires_at: i64,
+    /// Operator-supplied friendly name for the host. Optional and additive —
+    /// pre-server_name tickets decode with `server_name = None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
 }
 
 impl HostTicket {
@@ -73,8 +77,14 @@ impl HostTicket {
     }
 
     /// Build a ticket from a live iroh `Endpoint`. Pulls `EndpointId`, direct
-    /// socket addrs, and the optional relay url off `endpoint.addr()`.
-    pub fn from_endpoint(endpoint: &iroh::Endpoint, hint_ttl: std::time::Duration) -> Result<Self> {
+    /// socket addrs, and the optional relay url off `endpoint.addr()`. The
+    /// optional `server_name` is the operator-supplied friendly name surfaced
+    /// to clients during onboarding.
+    pub fn from_endpoint(
+        endpoint: &iroh::Endpoint,
+        hint_ttl: std::time::Duration,
+        server_name: Option<String>,
+    ) -> Result<Self> {
         let endpoint_id = hex::encode(endpoint.id().as_bytes());
         let endpoint_addr = endpoint.addr();
         let mut addrs: Vec<String> = Vec::new();
@@ -97,6 +107,7 @@ impl HostTicket {
             addrs,
             relay,
             hint_expires_at: now_ms + hint_ttl.as_millis() as i64,
+            server_name,
         })
     }
 
@@ -189,6 +200,7 @@ mod tests {
             addrs: vec!["127.0.0.1:11204".into(), "192.0.2.5:11204".into()],
             relay: Some("https://relay.example/".into()),
             hint_expires_at: 1_700_000_000_000,
+            server_name: None,
         }
     }
 
@@ -264,13 +276,43 @@ mod tests {
         assert_eq!(back.hint_expires_at, 0);
     }
 
+    #[test]
+    fn decode_pre_server_name_ticket_succeeds() {
+        let pre = HostTicket {
+            version: TICKET_VERSION,
+            endpoint_id: valid_endpoint_id_hex(),
+            addrs: vec!["127.0.0.1:4242".to_string()],
+            relay: None,
+            hint_expires_at: 0,
+            server_name: None,
+        };
+        let s = pre.encode().unwrap();
+        let back = HostTicket::decode(&s).unwrap();
+        assert_eq!(back.server_name, None);
+    }
+
+    #[test]
+    fn server_name_round_trips() {
+        let t = HostTicket {
+            version: TICKET_VERSION,
+            endpoint_id: valid_endpoint_id_hex(),
+            addrs: vec![],
+            relay: None,
+            hint_expires_at: 0,
+            server_name: Some("Wires".to_string()),
+        };
+        let s = t.encode().unwrap();
+        let back = HostTicket::decode(&s).unwrap();
+        assert_eq!(back.server_name, Some("Wires".to_string()));
+    }
+
     #[tokio::test]
     async fn from_endpoint_roundtrips_endpoint_id() {
         use iroh::SecretKey;
         let ep = crate::bind_lan(SecretKey::generate(), vec![])
             .await
             .unwrap();
-        let t = HostTicket::from_endpoint(&ep, std::time::Duration::from_secs(60)).unwrap();
+        let t = HostTicket::from_endpoint(&ep, std::time::Duration::from_secs(60), None).unwrap();
         assert_eq!(t.endpoint_id, hex::encode(ep.id().as_bytes()));
         assert_eq!(t.version, TICKET_VERSION);
         assert!(t.hint_expires_at > 0, "hint_expires_at must be set");

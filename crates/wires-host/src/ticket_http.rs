@@ -255,7 +255,7 @@ fn build_router(state: Arc<AppState>) -> Router {
 
 /// Build the current ticket from the live endpoint. Re-derived per request.
 fn current_ticket(state: &AppState) -> Result<HostTicket> {
-    HostTicket::from_endpoint(&state.endpoint, state.hint_ttl).context(HostTicketSnafu)
+    HostTicket::from_endpoint(&state.endpoint, state.hint_ttl, None).context(HostTicketSnafu)
 }
 
 async fn serve_txt(State(state): State<Arc<AppState>>) -> Result<Response> {

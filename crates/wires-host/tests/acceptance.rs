@@ -46,7 +46,8 @@ async fn end_to_end_register_via_host_ticket() {
         .spawn();
 
     // ---- operator builds the ticket the iOS-app / CLI would scan -------
-    let ticket = HostTicket::from_endpoint(&host_ep, std::time::Duration::from_secs(60)).unwrap();
+    let ticket =
+        HostTicket::from_endpoint(&host_ep, std::time::Duration::from_secs(60), None).unwrap();
     let token = ticket.encode().unwrap();
 
     // ---- fresh agent: init then pair -----------------------------------
