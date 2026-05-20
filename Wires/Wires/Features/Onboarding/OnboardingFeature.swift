@@ -147,6 +147,7 @@ struct OnboardingFeature {
                         let h = Household(
                             rootPubkeyHex: pubkeyHex,
                             hostEndpointIdHex: registration.hostEndpointIdHex,
+                            hostServerName: host.serverName,
                             hostDirectAddrs: host.addrs,
                             hostRelayURL: host.relay,
                             hostHintExpiresAtMs: host.hintExpiresAtMs,
