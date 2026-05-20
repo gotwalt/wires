@@ -88,11 +88,14 @@ xcrun simctl bootstatus "$DEVICE_UDID" -b >/dev/null
 xcrun simctl privacy "$DEVICE_UDID" grant camera "$BUNDLE_ID" 2>/dev/null || true
 
 # ----- Compute run dir + export env for the UITest --------------------
+# xcodebuild forwards variables prefixed with TEST_RUNNER_ to the
+# simulator-side UITest runner process (with the prefix stripped).
+# Host-side env (no prefix) is *not* visible to the test runner.
 RUN_ID="$(date +%Y-%m-%d-%H%M)"
 RUN_DIR="$REPO_ROOT/Wires/screenshots/$RUN_ID"
 mkdir -p "$RUN_DIR"
-export WIRES_SCREENSHOT_DIR="$RUN_DIR"
-export WIRES_RUN_ID="$RUN_ID"
+export TEST_RUNNER_WIRES_SCREENSHOT_DIR="$RUN_DIR"
+export TEST_RUNNER_WIRES_RUN_ID="$RUN_ID"
 
 # ----- Build the -only-testing argument -------------------------------
 if [[ -n "$FIXTURE_FILTER" ]]; then
@@ -131,9 +134,11 @@ cat > "$RUN_DIR/.meta.json" <<JSON
 JSON
 
 # ----- Refresh `latest` symlink atomically ---------------------------
+# `ln -sfn` on macOS replaces an existing symlink in place. The previous
+# `ln -sfn; mv -f` dance was a no-op because `mv -f latest` follows the
+# existing symlink and moves the source *into* the target directory.
 cd "$REPO_ROOT/Wires/screenshots"
-ln -sfn "$RUN_ID" .latest.tmp
-mv -f .latest.tmp latest
+ln -sfn "$RUN_ID" latest
 cd "$REPO_ROOT"
 
 # ----- Print manifest --------------------------------------------------
