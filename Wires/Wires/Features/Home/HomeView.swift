@@ -33,7 +33,13 @@ struct HomeView: View {
                     }
                     #endif
                 }
-                .task { store.send(.onAppear) }
+                .task {
+                    if !FixtureRuntime.isActive {
+                        store.send(.onAppear)
+                    } else if shouldFireOnAppearInFixtureMode {
+                        store.send(.onAppear)
+                    }
+                }
                 .sheet(item: $store.scope(state: \.nodeEnrollment, action: \.nodeEnrollment)) { childStore in
                     NodeEnrollmentView(store: childStore)
                 }
@@ -42,6 +48,14 @@ struct HomeView: View {
                 }
                 .alert($store.scope(state: \.alert, action: \.alert))
         }
+    }
+
+    private var shouldFireOnAppearInFixtureMode: Bool {
+        // Every home-targeting fixture (homeLoading/Empty/OneCap/etc.) wants
+        // onAppear to fire so the fixture HouseholdClient gets called.
+        // Non-home fixtures don't render HomeView so this code doesn't
+        // execute. The guard exists for symmetry with AppView.
+        return true
     }
 
     @ViewBuilder
