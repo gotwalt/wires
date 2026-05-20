@@ -214,7 +214,8 @@ private func loadHostInfo(household: HouseholdClient) async throws -> HostInfo? 
             endpointIdHex: endpointIdHex,
             addrs: hh.hostDirectAddrs,
             relay: hh.hostRelayURL,
-            hintExpiresAtMs: hh.hostHintExpiresAtMs ?? 0
+            hintExpiresAtMs: hh.hostHintExpiresAtMs ?? 0,
+            serverName: nil
         )
     }
 }

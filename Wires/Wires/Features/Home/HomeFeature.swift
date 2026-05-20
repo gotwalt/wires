@@ -193,6 +193,7 @@ private func hostInfo(from household: Household) -> HostInfo? {
         endpointIdHex: endpointIdHex,
         addrs: household.hostDirectAddrs,
         relay: household.hostRelayURL,
-        hintExpiresAtMs: household.hostHintExpiresAtMs ?? 0
+        hintExpiresAtMs: household.hostHintExpiresAtMs ?? 0,
+        serverName: nil
     )
 }

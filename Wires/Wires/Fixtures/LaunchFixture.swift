@@ -209,7 +209,8 @@ enum LaunchFixture: String, CaseIterable {
                 endpointIdHex: String(repeating: "cd", count: 32),
                 addrs: ["192.168.1.20:4242"],
                 relay: "https://relay.example.org",
-                hintExpiresAtMs: 0
+                hintExpiresAtMs: 0,
+                serverName: nil
             )
             return .bootstrap(s)
 
@@ -220,7 +221,8 @@ enum LaunchFixture: String, CaseIterable {
                 endpointIdHex: String(repeating: "cd", count: 32),
                 addrs: ["192.168.1.20:4242"],
                 relay: "https://relay.example.org",
-                hintExpiresAtMs: 0
+                hintExpiresAtMs: 0,
+                serverName: nil
             )
             s.completed = BootstrapFeature.State.Completed(
                 registration: TenantRegistration(
@@ -393,7 +395,8 @@ enum LaunchFixture: String, CaseIterable {
             endpointIdHex: String(repeating: "cd", count: 32),
             addrs: [],
             relay: nil,
-            hintExpiresAtMs: 0
+            hintExpiresAtMs: 0,
+            serverName: nil
         )
         var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
         let preview = PairRequestPreview(

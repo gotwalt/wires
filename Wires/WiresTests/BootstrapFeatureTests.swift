@@ -13,7 +13,8 @@ struct BootstrapFeatureTests {
         endpointIdHex: String(repeating: "cd", count: 32),
         addrs: ["127.0.0.1:11204"],
         relay: "https://relay.example/",
-        hintExpiresAtMs: 1_700_000_000_000
+        hintExpiresAtMs: 1_700_000_000_000,
+        serverName: nil
     )
 
     static let sampleRegistration = TenantRegistration(
