@@ -15,10 +15,12 @@ import WiresKit
 ///   4. Add a test method in WiresUITests/SnapshotSweep.swift.
 ///   5. Update the count assertion in WiresTests/LaunchFixtureTests.swift.
 enum LaunchFixture: String, CaseIterable {
-    case bootstrapScanDenied        = "bootstrap_scan_denied"
-    case bootstrapScanGranted       = "bootstrap_scan_granted"
-    case bootstrapConfirm           = "bootstrap_confirm"
-    case bootstrapDone              = "bootstrap_done"
+    case onboardingWelcome          = "onboarding_welcome"
+    case onboardingScan             = "onboarding_scan"
+    case onboardingScanError        = "onboarding_scan_error"
+    case onboardingConfirm          = "onboarding_confirm"
+    case onboardingFaceID           = "onboarding_face_id"
+    case onboardingDone             = "onboarding_done"
     case homeLoading                = "home_loading"
     case homeEmpty                  = "home_empty"
     case homeOneCap                 = "home_one_cap"
@@ -58,25 +60,8 @@ enum LaunchFixture: String, CaseIterable {
         values.cameraPreviewKind = .placeholder
 
         switch self {
-        case .bootstrapScanDenied:
-            values.cameraPermissionClient = .fixture(.denied)
-            values.wiresClient = .fixture()
-            values.householdClient = .fixture()
-            values.mcpGatewayClient = .fixture()
-
-        case .bootstrapScanGranted:
-            values.cameraPermissionClient = .fixture(.granted)
-            values.wiresClient = .fixture()
-            values.householdClient = .fixture()
-            values.mcpGatewayClient = .fixture()
-
-        case .bootstrapConfirm:
-            values.cameraPermissionClient = .fixture(.granted)
-            values.wiresClient = .fixture()
-            values.householdClient = .fixture()
-            values.mcpGatewayClient = .fixture()
-
-        case .bootstrapDone:
+        case .onboardingWelcome, .onboardingScan, .onboardingScanError,
+             .onboardingConfirm, .onboardingFaceID, .onboardingDone:
             values.cameraPermissionClient = .fixture(.granted)
             values.wiresClient = .fixture()
             values.householdClient = .fixture()
@@ -192,48 +177,68 @@ enum LaunchFixture: String, CaseIterable {
 
     var initialAppState: AppFeature.State {
         switch self {
-        case .bootstrapScanDenied:
-            var s = BootstrapFeature.State()
-            s.scan.cameraPermission = .denied
-            return .bootstrap(s)
+        case .onboardingWelcome:
+            return .onboarding(OnboardingFeature.State(step: .welcome))
 
-        case .bootstrapScanGranted:
-            var s = BootstrapFeature.State()
+        case .onboardingScan:
+            var s = OnboardingFeature.State(step: .scan)
             s.scan.cameraPermission = .granted
-            return .bootstrap(s)
+            return .onboarding(s)
 
-        case .bootstrapConfirm:
-            var s = BootstrapFeature.State()
+        case .onboardingScanError:
+            var s = OnboardingFeature.State(step: .scan)
             s.scan.cameraPermission = .granted
+            s.scan.error = .parseFailed("Couldn't read this code")
+            return .onboarding(s)
+
+        case .onboardingConfirm:
+            var s = OnboardingFeature.State(step: .confirm)
             s.confirmedHost = HostInfo(
                 endpointIdHex: String(repeating: "cd", count: 32),
                 addrs: ["192.168.1.20:4242"],
-                relay: "https://relay.example.org",
+                relay: "https://wires.example.org",
                 hintExpiresAtMs: 0,
-                serverName: nil
+                serverName: "Wires"
             )
-            return .bootstrap(s)
+            return .onboarding(s)
 
-        case .bootstrapDone:
-            var s = BootstrapFeature.State()
-            s.scan.cameraPermission = .granted
-            let host = HostInfo(
-                endpointIdHex: String(repeating: "cd", count: 32),
-                addrs: ["192.168.1.20:4242"],
-                relay: "https://relay.example.org",
-                hintExpiresAtMs: 0,
-                serverName: nil
-            )
-            s.completed = BootstrapFeature.State.Completed(
+        case .onboardingFaceID:
+            var s = OnboardingFeature.State(step: .faceID)
+            s.completed = OnboardingFeature.State.Completed(
                 registration: TenantRegistration(
                     capsTopicIdHex: String(repeating: "ee", count: 32),
-                    hostEndpointIdHex: host.endpointIdHex,
+                    hostEndpointIdHex: String(repeating: "cd", count: 32),
                     serverTimeMs: 0
                 ),
-                host: host,
+                host: HostInfo(
+                    endpointIdHex: String(repeating: "cd", count: 32),
+                    addrs: [],
+                    relay: "https://wires.example.org",
+                    hintExpiresAtMs: 0,
+                    serverName: "Wires"
+                ),
                 rootPubkeyHex: String(repeating: "ab", count: 32)
             )
-            return .bootstrap(s)
+            return .onboarding(s)
+
+        case .onboardingDone:
+            var s = OnboardingFeature.State(step: .done)
+            s.completed = OnboardingFeature.State.Completed(
+                registration: TenantRegistration(
+                    capsTopicIdHex: String(repeating: "ee", count: 32),
+                    hostEndpointIdHex: String(repeating: "cd", count: 32),
+                    serverTimeMs: 0
+                ),
+                host: HostInfo(
+                    endpointIdHex: String(repeating: "cd", count: 32),
+                    addrs: [],
+                    relay: "https://wires.example.org",
+                    hintExpiresAtMs: 0,
+                    serverName: "Wires"
+                ),
+                rootPubkeyHex: String(repeating: "ab", count: 32)
+            )
+            return .onboarding(s)
 
         case .homeLoading:
             var s = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
