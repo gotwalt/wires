@@ -241,106 +241,36 @@ enum LaunchFixture: String, CaseIterable {
             return .onboarding(s)
 
         case .homeLoading:
-            var s = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            var s = NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
             s.loading = true
             return .main(MainFeature.State(
-                home: s,
+                network: s,
                 settings: SettingsFeature.State(),
                 selectedTab: .network
             ))
 
         case .homeEmpty, .homeOneCap, .homeThreeCapsOneRevoked:
-            // HomeFeature.onAppear will call householdClient.listCaps which the
-            // per-fixture override returns immediately. The effect then
-            // overwrites caps from the client.
+            // NetworkFeature.onAppear will call householdClient.listCaps
+            // which the per-fixture override returns immediately. The
+            // effect then maps caps → services via CapToServiceMapper.
             return .main(MainFeature.State(
-                home: HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32)),
+                network: NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32)),
                 settings: SettingsFeature.State(),
                 selectedTab: .network
             ))
 
-        case .oauthScan:
-            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
-            var oauth = OAuthSignInFeature.State.initial()
-            if case .scan(var scanState) = oauth {
-                scanState.cameraPermission = .granted
-                oauth = .scan(scanState)
-            }
-            home.oauthSignIn = oauth
+        case .oauthScan,
+             .oauthSigninConfirm,
+             .oauthPairApprove,
+             .oauthPairApprovePartial,
+             .oauthDone,
+             .oauthError:
+            // Phase 6 retires the home.oauthSignIn → connect plumbing.
+            // ConnectFeature is a stub until Phase 7 rebuilds the
+            // ceremony; these fixtures render bare Network in the
+            // meantime and are replaced wholesale in Task 7.3.
             return .main(MainFeature.State(
-                home: home,
-                settings: SettingsFeature.State(),
-                selectedTab: .network
-            ))
-
-        case .oauthSigninConfirm:
-            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
-            let ticket = SessionTicket(
-                version: 1,
-                kind: SessionTicket.kindV1,
-                gatewayURL: "https://wires-mcp.example.org",
-                sessionID: "fixture-session-id-abc"
-            )
-            let challenge = SignInChallenge(
-                version: 1,
-                kind: SignInChallenge.kindV1,
-                gatewayURL: "https://wires-mcp.example.org",
-                sessionID: "fixture-session-id-abc",
-                nonce: String(repeating: "0", count: 64),
-                issuedAt: 0,
-                expires: 0
-            )
-            home.oauthSignIn = .signinConfirm(ticket: ticket, challenge: challenge)
-            return .main(MainFeature.State(
-                home: home,
-                settings: SettingsFeature.State(),
-                selectedTab: .network
-            ))
-
-        case .oauthPairApprove:
-            // Pair-approve embeds ApprovalFeature.State directly with the full
-            // scope set granted. The "partial" variant is a sibling fixture
-            // (oauthPairApprovePartial) that mutates one scope.
-            return .main(MainFeature.State(
-                home: homeWithPairApprove(modifier: { _ in }),
-                settings: SettingsFeature.State(),
-                selectedTab: .network
-            ))
-
-        case .oauthPairApprovePartial:
-            // Same preview as oauthPairApprove but the user has dropped .write
-            // from "family" and toggled "calendar" entirely off. Captures the
-            // partial-grant UX that the unified OAuth flow inherited from the
-            // (now-removed) enroll flow.
-            return .main(MainFeature.State(
-                home: homeWithPairApprove { approve in
-                    if var fam = approve.decisions[id: "family"] {
-                        fam.grantedRights = [.read]
-                        approve.decisions[id: "family"] = fam
-                    }
-                    if var cal = approve.decisions[id: "calendar"] {
-                        cal.granted = false
-                        approve.decisions[id: "calendar"] = cal
-                    }
-                },
-                settings: SettingsFeature.State(),
-                selectedTab: .network
-            ))
-
-        case .oauthDone:
-            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
-            home.oauthSignIn = .done(message: "Signed in")
-            return .main(MainFeature.State(
-                home: home,
-                settings: SettingsFeature.State(),
-                selectedTab: .network
-            ))
-
-        case .oauthError:
-            var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
-            home.oauthSignIn = .error(message: "gateway returned 500")
-            return .main(MainFeature.State(
-                home: home,
+                network: NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32)),
                 settings: SettingsFeature.State(),
                 selectedTab: .network
             ))
@@ -375,7 +305,7 @@ enum LaunchFixture: String, CaseIterable {
     /// household. Bypasses the on-appear effect so the fixture renders
     /// the loaded-state directly.
     private func mainStateOnSettings(faceIDEnabled: Bool) -> AppFeature.State {
-        let home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+        let network = NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
         var settings = SettingsFeature.State()
         settings.loading = false
         settings.serverName = "Wires"
@@ -383,44 +313,10 @@ enum LaunchFixture: String, CaseIterable {
         settings.rootPubkeyHex = String(repeating: "ab", count: 32)
         settings.faceIDEnabled = faceIDEnabled
         return .main(MainFeature.State(
-            home: home,
+            network: network,
             settings: settings,
             selectedTab: .settings
         ))
-    }
-
-    /// Builds a Home state seeded with an OAuth pair-approve sheet showing
-    /// two requested scopes (family read+write, calendar read). The
-    /// `modifier` closure can mutate the approval decisions to capture
-    /// partial-grant states.
-    private func homeWithPairApprove(
-        modifier: (inout ApprovalFeature.State) -> Void
-    ) -> HomeFeature.State {
-        let host = HostInfo(
-            endpointIdHex: String(repeating: "cd", count: 32),
-            addrs: [],
-            relay: nil,
-            hintExpiresAtMs: 0,
-            serverName: nil
-        )
-        var home = HomeFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
-        let preview = PairRequestPreview(
-            handle: PendingPairHandle(id: "fixture-pair"),
-            agentPubkeyHex: String(repeating: "ef", count: 32),
-            role: "agent",
-            description: "Aaron's Mac",
-            issuedAtMs: 0,
-            expiresAtMs: 0,
-            requestedScopes: [
-                RequestedScopePreview(topicName: "family", rights: [.read, .write]),
-                RequestedScopePreview(topicName: "calendar", rights: [.read])
-            ],
-            dialSummary: ""
-        )
-        var approve = ApprovalFeature.State(preview: preview, host: host)
-        modifier(&approve)
-        home.oauthSignIn = .pairApprove(approve)
-        return home
     }
 
     /// Maps each fixture to a (flow folder, short filename) tuple. Used
