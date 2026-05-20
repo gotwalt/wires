@@ -15,26 +15,30 @@ import WiresKit
 ///   4. Add a test method in WiresUITests/SnapshotSweep.swift.
 ///   5. Update the count assertion in WiresTests/LaunchFixtureTests.swift.
 enum LaunchFixture: String, CaseIterable {
-    case onboardingWelcome          = "onboarding_welcome"
-    case onboardingScan             = "onboarding_scan"
-    case onboardingScanError        = "onboarding_scan_error"
-    case onboardingConfirm          = "onboarding_confirm"
-    case onboardingFaceID           = "onboarding_face_id"
-    case onboardingDone             = "onboarding_done"
-    case homeLoading                = "home_loading"
-    case homeEmpty                  = "home_empty"
-    case homeOneCap                 = "home_one_cap"
-    case homeThreeCapsOneRevoked    = "home_three_caps_one_revoked"
-    case oauthScan                  = "oauth_scan"
-    case oauthSigninConfirm         = "oauth_signin_confirm"
-    case oauthPairApprove           = "oauth_pair_approve"
-    case oauthPairApprovePartial    = "oauth_pair_approve_partial"
-    case oauthDone                  = "oauth_done"
-    case oauthError                 = "oauth_error"
-    case settingsRoot               = "settings_root"
-    case settingsFaceIDOff          = "settings_face_id_off"
-    case settingsAccountDetail      = "settings_account_detail"
-    case settingsDeleteConfirm      = "settings_delete_confirm"
+    case onboardingWelcome                   = "onboarding_welcome"
+    case onboardingScan                      = "onboarding_scan"
+    case onboardingScanError                 = "onboarding_scan_error"
+    case onboardingConfirm                   = "onboarding_confirm"
+    case onboardingFaceID                    = "onboarding_face_id"
+    case onboardingDone                      = "onboarding_done"
+    case networkEmpty                        = "network_empty"
+    case networkLoading                      = "network_loading"
+    case networkOneService                   = "network_one_service"
+    case networkThreeServicesOneRevoked      = "network_three_services_one_revoked"
+    case networkLoadError                    = "network_load_error"
+    case serviceDetailConnected              = "service_detail_connected"
+    case serviceDetailRevoked                = "service_detail_revoked"
+    case serviceDetailAdvancedExpanded       = "service_detail_advanced_expanded"
+    case oauthScan                           = "oauth_scan"
+    case oauthSigninConfirm                  = "oauth_signin_confirm"
+    case oauthPairApprove                    = "oauth_pair_approve"
+    case oauthPairApprovePartial             = "oauth_pair_approve_partial"
+    case oauthDone                           = "oauth_done"
+    case oauthError                          = "oauth_error"
+    case settingsRoot                        = "settings_root"
+    case settingsFaceIDOff                   = "settings_face_id_off"
+    case settingsAccountDetail               = "settings_account_detail"
+    case settingsDeleteConfirm               = "settings_delete_confirm"
 
     /// Given a raw fixture name (typically
     /// `ProcessInfo.processInfo.environment["WIRES_FIXTURE"]`), installs
@@ -67,13 +71,22 @@ enum LaunchFixture: String, CaseIterable {
             values.householdClient = .fixture()
             values.mcpGatewayClient = .fixture()
 
-        case .homeLoading:
+        case .networkLoading:
             values.cameraPermissionClient = .fixture(.granted)
             values.wiresClient = .fixture()
             values.householdClient = .fixture(listCapsBehavior: .block)
             values.mcpGatewayClient = .fixture()
 
-        case .homeEmpty:
+        case .networkEmpty,
+             .networkOneService,
+             .networkThreeServicesOneRevoked,
+             .serviceDetailConnected,
+             .serviceDetailRevoked,
+             .serviceDetailAdvancedExpanded:
+            // Services are seeded directly into `NetworkFeature.State.services`
+            // by `initialAppState`, so listCaps doesn't need to round-trip
+            // through CapToServiceMapper. Returning `[]` keeps onAppear's
+            // refresh-effect from overwriting the seeded list.
             values.cameraPermissionClient = .fixture(.granted)
             values.wiresClient = .fixture()
             values.householdClient = .fixture(
@@ -85,60 +98,15 @@ enum LaunchFixture: String, CaseIterable {
             )
             values.mcpGatewayClient = .fixture()
 
-        case .homeOneCap:
+        case .networkLoadError:
             values.cameraPermissionClient = .fixture(.granted)
             values.wiresClient = .fixture()
-            let cap = CapRecord(
-                capIdHex: String(repeating: "11", count: 32),
-                nodePubkeyHex: String(repeating: "aa", count: 32),
-                nodeAlias: "Aaron's Mac",
-                topicNames: ["family"],
-                rights: ["read", "write"],
-                issuedAt: Date(timeIntervalSince1970: 1_715_000_000)
-            )
             values.householdClient = .fixture(
                 household: Household(
                     rootPubkeyHex: String(repeating: "ab", count: 32),
                     hostEndpointIdHex: String(repeating: "cd", count: 32)
                 ),
-                caps: [cap]
-            )
-            values.mcpGatewayClient = .fixture()
-
-        case .homeThreeCapsOneRevoked:
-            values.cameraPermissionClient = .fixture(.granted)
-            values.wiresClient = .fixture()
-            let macFamily = CapRecord(
-                capIdHex: String(repeating: "11", count: 32),
-                nodePubkeyHex: String(repeating: "aa", count: 32),
-                nodeAlias: "Aaron's Mac",
-                topicNames: ["family"],
-                rights: ["read", "write"],
-                issuedAt: Date(timeIntervalSince1970: 1_715_000_000)
-            )
-            let iPadCalendar = CapRecord(
-                capIdHex: String(repeating: "22", count: 32),
-                nodePubkeyHex: String(repeating: "bb", count: 32),
-                nodeAlias: "Kitchen iPad",
-                topicNames: ["calendar"],
-                rights: ["read"],
-                issuedAt: Date(timeIntervalSince1970: 1_715_100_000),
-                revokedAt: Date(timeIntervalSince1970: 1_715_200_000)
-            )
-            let hassMqtt = CapRecord(
-                capIdHex: String(repeating: "33", count: 32),
-                nodePubkeyHex: String(repeating: "cc", count: 32),
-                nodeAlias: nil,
-                topicNames: ["mqtt:hass"],
-                rights: ["read", "write"],
-                issuedAt: Date(timeIntervalSince1970: 1_715_300_000)
-            )
-            values.householdClient = .fixture(
-                household: Household(
-                    rootPubkeyHex: String(repeating: "ab", count: 32),
-                    hostEndpointIdHex: String(repeating: "cd", count: 32)
-                ),
-                caps: [macFamily, iPadCalendar, hassMqtt]
+                listCapsBehavior: .failing("Couldn't reach your server. Check your connection and try again.")
             )
             values.mcpGatewayClient = .fixture()
 
@@ -240,21 +208,135 @@ enum LaunchFixture: String, CaseIterable {
             )
             return .onboarding(s)
 
-        case .homeLoading:
-            var s = NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
-            s.loading = true
+        case .networkEmpty:
+            return mainStateOnNetwork(services: [])
+
+        case .networkLoading:
+            var network = NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            network.loading = true
             return .main(MainFeature.State(
-                network: s,
+                network: network,
                 settings: SettingsFeature.State(),
                 selectedTab: .network
             ))
 
-        case .homeEmpty, .homeOneCap, .homeThreeCapsOneRevoked:
-            // NetworkFeature.onAppear will call householdClient.listCaps
-            // which the per-fixture override returns immediately. The
-            // effect then maps caps → services via CapToServiceMapper.
+        case .networkOneService:
+            return mainStateOnNetwork(services: [
+                ServiceSummary(
+                    id: "1", name: "Chase",
+                    deviceName: "Aaron's Mac mini",
+                    category: .banking, status: .connected,
+                    scopes: [
+                        ScopeDescriptor(
+                            id: "family",
+                            label: "family",
+                            summary: "Read messages · Send messages",
+                            detail: [
+                                .init(label: "Read messages", granted: true, kind: .read),
+                                .init(label: "Send messages", granted: true, kind: .write)
+                            ]
+                        )
+                    ],
+                    connectedAt: Date(timeIntervalSince1970: 1_715_000_000),
+                    lastActivityAt: nil
+                )
+            ])
+
+        case .networkThreeServicesOneRevoked:
+            return mainStateOnNetwork(services: [
+                ServiceSummary(
+                    id: "1", name: "Chase", deviceName: "Aaron's Mac mini",
+                    category: .banking, status: .connected, scopes: [],
+                    connectedAt: Date(timeIntervalSince1970: 1_715_000_000), lastActivityAt: nil
+                ),
+                ServiceSummary(
+                    id: "2", name: "Home Assistant", deviceName: "Kitchen iPad",
+                    category: .smartHome, status: .connected, scopes: [],
+                    connectedAt: Date(timeIntervalSince1970: 1_715_100_000), lastActivityAt: nil
+                ),
+                ServiceSummary(
+                    id: "3", name: "Calendar", deviceName: "Kitchen iPad",
+                    category: .unknown, status: .revoked, scopes: [],
+                    connectedAt: Date(timeIntervalSince1970: 1_715_200_000), lastActivityAt: nil
+                )
+            ])
+
+        case .networkLoadError:
+            var network = NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            network.loadError = "Couldn't reach your server. Check your connection and try again."
             return .main(MainFeature.State(
-                network: NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32)),
+                network: network,
+                settings: SettingsFeature.State(),
+                selectedTab: .network
+            ))
+
+        case .serviceDetailConnected:
+            let summary = ServiceSummary(
+                id: "1", name: "Chase", deviceName: "Aaron's Mac mini",
+                category: .banking, status: .connected,
+                scopes: [
+                    ScopeDescriptor(
+                        id: "family",
+                        label: "family",
+                        summary: "Read messages · Send messages",
+                        detail: [
+                            .init(label: "Read messages", granted: true, kind: .read),
+                            .init(label: "Send messages", granted: true, kind: .write)
+                        ]
+                    )
+                ],
+                connectedAt: Date(timeIntervalSince1970: 1_715_000_000),
+                lastActivityAt: nil
+            )
+            var network = NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            network.path.append(ServiceDetailFeature.State(summary: summary))
+            return .main(MainFeature.State(
+                network: network,
+                settings: SettingsFeature.State(),
+                selectedTab: .network
+            ))
+
+        case .serviceDetailRevoked:
+            let summary = ServiceSummary(
+                id: "3", name: "Calendar", deviceName: "Kitchen iPad",
+                category: .unknown, status: .revoked, scopes: [],
+                connectedAt: Date(timeIntervalSince1970: 1_715_200_000),
+                lastActivityAt: nil
+            )
+            var network = NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            network.path.append(ServiceDetailFeature.State(summary: summary))
+            return .main(MainFeature.State(
+                network: network,
+                settings: SettingsFeature.State(),
+                selectedTab: .network
+            ))
+
+        case .serviceDetailAdvancedExpanded:
+            // Same as serviceDetailConnected but with the Advanced
+            // disclosure forced open via ServiceDetailFeature.State.
+            let summary = ServiceSummary(
+                id: "1", name: "Chase", deviceName: "Aaron's Mac mini",
+                category: .banking, status: .connected,
+                scopes: [
+                    ScopeDescriptor(
+                        id: "family",
+                        label: "family",
+                        summary: "Read messages · Send messages",
+                        detail: [
+                            .init(label: "Read messages", granted: true, kind: .read),
+                            .init(label: "Send messages", granted: true, kind: .write)
+                        ]
+                    )
+                ],
+                connectedAt: Date(timeIntervalSince1970: 1_715_000_000),
+                lastActivityAt: nil
+            )
+            var detail = ServiceDetailFeature.State(summary: summary)
+            detail.advancedInitiallyExpanded = true
+            var network = NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+            network.path.append(detail)
+            return .main(MainFeature.State(
+                network: network,
                 settings: SettingsFeature.State(),
                 selectedTab: .network
             ))
@@ -297,6 +379,20 @@ enum LaunchFixture: String, CaseIterable {
             }
             return main
         }
+    }
+
+    /// Shared scaffold for every network_* fixture that just wants a
+    /// populated services list. Leaves `loading=false` and `loadError=nil`
+    /// so the view renders the populated list directly.
+    private func mainStateOnNetwork(services: [ServiceSummary]) -> AppFeature.State {
+        var network = NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
+        network.services = services
+        network.loading = false
+        return .main(MainFeature.State(
+            network: network,
+            settings: SettingsFeature.State(),
+            selectedTab: .network
+        ))
     }
 
     /// Shared scaffold for every settings_* fixture: lands the app in the
