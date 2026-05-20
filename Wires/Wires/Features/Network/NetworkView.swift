@@ -100,18 +100,3 @@ struct NetworkView: View {
     }
 }
 
-struct ConnectView: View {
-    let store: StoreOf<ConnectFeature>
-    var body: some View {
-        Text("Connect — placeholder until Phase 7")
-            .padding()
-    }
-}
-
-struct ServiceDetailView: View {
-    let store: StoreOf<ServiceDetailFeature>
-    var body: some View {
-        Text("Service detail — placeholder")
-            .padding()
-    }
-}
