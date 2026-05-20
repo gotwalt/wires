@@ -21,11 +21,13 @@ struct LaunchFixtureTests {
     /// was unified into the OAuth/SessionTicket flow (commit 4057e29),
     /// the 4 enroll fixtures were dropped and one oauth_pair_approve_partial
     /// fixture was added to preserve partial-grant coverage. Phase 3 of
-    /// the iOS HIG redesign added the 4 settings_* fixtures. Net 18
+    /// the iOS HIG redesign added the 4 settings_* fixtures. Phase 5
+    /// replaced the 4 bootstrap_* fixtures with 6 onboarding_* fixtures
+    /// (welcome + scan + scan-error + confirm + face-id + done). Net 20
     /// fixtures. Update this number deliberately if the catalogue changes.
     @Test
     func allCases_count_matches_spec() {
-        #expect(LaunchFixture.allCases.count == 18)
+        #expect(LaunchFixture.allCases.count == 20)
     }
 
     /// `flowAndShortName` is consumed by the snapshot harness to derive
@@ -34,9 +36,9 @@ struct LaunchFixtureTests {
     /// out and confirm the no-underscore fallback.
     @Test
     func flowAndShortName_splits_at_first_underscore() {
-        let bootstrap = LaunchFixture.bootstrapScanDenied.flowAndShortName
-        #expect(bootstrap.flow == "bootstrap")
-        #expect(bootstrap.short == "scan-denied")
+        let onboarding = LaunchFixture.onboardingScanError.flowAndShortName
+        #expect(onboarding.flow == "onboarding")
+        #expect(onboarding.short == "scan-error")
 
         let home = LaunchFixture.homeThreeCapsOneRevoked.flowAndShortName
         #expect(home.flow == "home")
