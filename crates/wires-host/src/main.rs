@@ -52,6 +52,11 @@ struct Args {
     #[arg(long, global = true)]
     no_http: bool,
 
+    /// Operator-supplied friendly name baked into emitted host tickets so
+    /// clients can display "Connecting to <name>" during onboarding. Optional.
+    #[arg(long = "server-name", global = true)]
+    server_name: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -96,8 +101,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // additionally get a QR rendered to stderr.
     {
         use std::io::IsTerminal as _;
-        let ticket =
-            wires_net::HostTicket::from_endpoint(&endpoint, *args.ticket_hint_ttl, None)?;
+        let ticket = wires_net::HostTicket::from_endpoint(
+            &endpoint,
+            *args.ticket_hint_ttl,
+            args.server_name.clone(),
+        )?;
         let encoded = ticket.encode()?;
         tracing::info!("host ticket: {encoded}");
         let show_qr = args.qr || (!args.no_qr && std::io::stderr().is_terminal());
@@ -246,6 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             endpoint.clone(),
             args.http_bind,
             *args.ticket_hint_ttl,
+            args.server_name.clone(),
             shutdown.clone(),
         )
         .await?;
@@ -294,7 +303,11 @@ async fn run_ticket_subcommand(args: &Args) -> Result<(), Box<dyn std::error::Er
     let secret_path = args.data_dir.join("iroh.secret");
     let secret = load_or_create_secret(&secret_path)?;
     let endpoint = wires_net::bind_cloud(SecretKey::from_bytes(&secret), vec![]).await?;
-    let ticket = wires_net::HostTicket::from_endpoint(&endpoint, *args.ticket_hint_ttl, None)?;
+    let ticket = wires_net::HostTicket::from_endpoint(
+        &endpoint,
+        *args.ticket_hint_ttl,
+        args.server_name.clone(),
+    )?;
     let encoded = ticket.encode()?;
     println!("{encoded}");
     let show_qr = args.qr || (!args.no_qr && std::io::stderr().is_terminal());
