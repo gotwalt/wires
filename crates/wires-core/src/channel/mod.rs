@@ -5,7 +5,7 @@ pub mod derive;
 pub mod schemas;
 pub mod types;
 
-pub use derive::{dm_topic_id, dm_topic_name, sort_participants};
+pub use derive::{EpochKey, dm_epoch_key, dm_topic_id, dm_topic_name, sort_participants};
 pub use schemas::{
     ChannelCreate, ChannelInvite, ChannelMemberMeta, TYPE_CREATE, TYPE_INVITE, TYPE_MEMBER_META,
 };

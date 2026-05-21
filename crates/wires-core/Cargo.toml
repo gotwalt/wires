@@ -11,7 +11,9 @@ serde_bytes = { workspace = true }
 hex = { workspace = true }
 uuid = { workspace = true }
 ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
 blake3 = { workspace = true }
+rand_core = { workspace = true }
 snafu = { workspace = true }
 
 [dev-dependencies]
