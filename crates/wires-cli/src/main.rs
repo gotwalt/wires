@@ -102,6 +102,10 @@ enum ChannelCmd {
         #[arg(long)]
         description: Option<String>,
     },
+    /// List channels this agent is a full member of.
+    List,
+    /// Show the member roster for a channel.
+    Members { name: String },
 }
 
 #[derive(Subcommand)]
@@ -147,6 +151,8 @@ async fn main() -> std::process::ExitCode {
         Cmd::Channel(ChannelCmd::Create { name, description }) => {
             cmd::channel::create(&data_dir, &name, description.as_deref()).await
         }
+        Cmd::Channel(ChannelCmd::List) => cmd::channel::list(&data_dir).await,
+        Cmd::Channel(ChannelCmd::Members { name }) => cmd::channel::members(&data_dir, &name).await,
         Cmd::Publish {
             topic,
             cap,
