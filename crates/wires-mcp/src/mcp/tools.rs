@@ -10,9 +10,10 @@ use crate::token::Claims;
 
 pub fn list_descriptors() -> Value {
     serde_json::json!({"tools": [
-        {"name": "wires_list_topics", "description": "List topics this agent can access", "inputSchema": {"type":"object","properties":{}}},
-        {"name": "wires_publish",     "description": "Publish a message to a topic",       "inputSchema": {"type":"object","properties":{"topic":{"type":"string"},"text":{"type":"string"},"data":{"type":"object"}},"required":["topic","text"]}},
-        {"name": "wires_tail",        "description": "Read recent messages from a topic",  "inputSchema": {"type":"object","properties":{"topic":{"type":"string"},"since":{"type":"string"},"limit":{"type":"integer"}},"required":["topic"]}}
+        {"name": "wires_list_topics",       "description": "List topics this agent can access",                  "inputSchema": {"type":"object","properties":{}}},
+        {"name": "wires_publish",           "description": "Publish a message to a topic",                       "inputSchema": {"type":"object","properties":{"topic":{"type":"string"},"text":{"type":"string"},"data":{"type":"object"}},"required":["topic","text"]}},
+        {"name": "wires_tail",              "description": "Read recent messages from a topic",                  "inputSchema": {"type":"object","properties":{"topic":{"type":"string"},"since":{"type":"string"},"limit":{"type":"integer"}},"required":["topic"]}},
+        {"name": "wires_create_channel",    "description": "Create a named channel",                             "inputSchema": {"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"}},"required":["name"]}}
     ]})
 }
 
@@ -159,6 +160,43 @@ fn pick_cap_for(
 
 fn error_result(msg: &str) -> Value {
     serde_json::json!({"content": [{"type": "text", "text": msg}], "isError": true})
+}
+
+/// Load member identity from `me.json` in the user's data dir, falling back to
+/// `(MemberKind::Api, "wires-mcp", None)` if absent or malformed.
+fn load_me_meta(
+    data_dir: &std::path::Path,
+) -> (
+    wires_core::channel::types::MemberKind,
+    String,
+    Option<String>,
+) {
+    use wires_core::channel::types::MemberKind;
+    let p = data_dir.join("me.json");
+    let default = (MemberKind::Api, "wires-mcp".to_string(), None);
+    let raw = match std::fs::read_to_string(&p) {
+        Ok(s) => s,
+        Err(_) => return default,
+    };
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return default,
+    };
+    let kind = v
+        .get("kind")
+        .and_then(|x| x.as_str())
+        .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
+        .unwrap_or(MemberKind::Api);
+    let display_name = v
+        .get("display_name")
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "wires-mcp".to_string());
+    let description = v
+        .get("description")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+    (kind, display_name, description)
 }
 
 async fn publish_tool(
@@ -315,6 +353,94 @@ async fn tail_tool(
     Ok(serde_json::json!({"content": [{"type": "text", "text": text}], "isError": false}))
 }
 
+// ── create_channel ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+struct CreateChannelArgs {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CreateChannelOutput {
+    topic_id: String,
+    name: String,
+}
+
+async fn create_channel_tool(
+    state: &ServiceState,
+    claims: &Claims,
+    args: CreateChannelArgs,
+) -> Result<Value, JsonRpcError> {
+    let runtime = state
+        .supervisor
+        .get_or_open(&claims.sub)
+        .await
+        .map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("unknown_user: {e}"),
+        })?;
+    let topic_name = if args.name.starts_with("channels.") {
+        args.name.clone()
+    } else {
+        format!("channels.{}", args.name)
+    };
+
+    let (topic_id, _epoch_key) = match wires_node::channel::allocate_named(&runtime.node) {
+        Ok(pair) => pair,
+        Err(e) => return Ok(error_result(&format!("allocate_named: {e}"))),
+    };
+
+    if let Err(e) = wires_node::upsert_topic_names(
+        &runtime.node.config.data_dir,
+        [(topic_name.clone(), topic_id)],
+    ) {
+        return Ok(error_result(&format!("upsert_topic_names: {e}")));
+    }
+
+    // MCP cannot auto-mint a self-cap (no root key in the gateway). The user
+    // must already hold a write-covering cap for `topic_name`.
+    let cap_id = match wires_node::channel::find_cap_for(
+        &runtime.node,
+        &topic_name,
+        wires_core::Right::Write,
+    ) {
+        Some(id) => id,
+        None => {
+            return Ok(error_result(&format!(
+                "permission_denied: no cap covers '{topic_name}' for Write"
+            )));
+        }
+    };
+
+    let now = wires_net::unix_now_ms();
+    let (kind, display_name, _description) = load_me_meta(&runtime.node.config.data_dir);
+
+    if let Err(e) = wires_node::channel::publish_create_and_meta(
+        &runtime.node,
+        topic_id,
+        &topic_name,
+        cap_id,
+        args.description.as_deref(),
+        &display_name,
+        kind,
+        now,
+    ) {
+        return Ok(error_result(&format!("publish_create_and_meta: {e}")));
+    }
+
+    let out = CreateChannelOutput {
+        topic_id: hex::encode(topic_id),
+        name: topic_name,
+    };
+    let text = serde_json::to_string(&out).map_err(|e| JsonRpcError {
+        code: -32000,
+        message: e.to_string(),
+    })?;
+    Ok(serde_json::json!({"content": [{"type": "text", "text": text}], "isError": false}))
+}
+
 fn encode_cursor(prev: &TailCursor, msgs: &[wires_node::DecryptedMessage]) -> String {
     let mut cur = prev.clone();
     for m in msgs {
@@ -352,6 +478,14 @@ pub async fn call(
                 message: format!("invalid arguments: {e}"),
             })?;
             tail_tool(&state, claims, args).await
+        }
+        "wires_create_channel" => {
+            let args: CreateChannelArgs =
+                serde_json::from_value(p.arguments).map_err(|e| JsonRpcError {
+                    code: -32602,
+                    message: format!("invalid arguments: {e}"),
+                })?;
+            create_channel_tool(&state, claims, args).await
         }
         other => Err(JsonRpcError {
             code: -32601,

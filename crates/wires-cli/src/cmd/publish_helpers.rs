@@ -78,19 +78,8 @@ pub fn register_peer_addresses(runtime: &NodeRuntime) -> Result<()> {
 
 /// Return the first non-revoked cap held by the local node that covers
 /// `topic_name` for `Right::Write`. Returns `None` if no such cap exists.
+/// Thin wrapper around `wires_node::channel::find_cap_for` so the CLI's
+/// existing call sites keep compiling.
 pub fn find_write_cap_for(node: &wires_node::Node, topic_name: &str) -> Option<wires_core::CapId> {
-    let caps = node.caps.all().ok()?;
-    for (cap_id, entry) in caps {
-        if entry.revoked {
-            continue;
-        }
-        if entry
-            .cap
-            .allows(topic_name, wires_core::Right::Write)
-            .is_ok()
-        {
-            return Some(cap_id);
-        }
-    }
-    None
+    wires_node::channel::find_cap_for(node, topic_name, wires_core::Right::Write)
 }

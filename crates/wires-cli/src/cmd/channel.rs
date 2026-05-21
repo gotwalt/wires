@@ -2,14 +2,11 @@
 
 use std::path::Path;
 
-use rand_core::{OsRng, RngCore};
 use snafu::ResultExt;
 use wires_core::CanonicalContent;
 use wires_core::Capability;
 use wires_core::cap::Right;
-use wires_core::channel::schemas::{
-    ChannelCreate, ChannelInvite, ChannelMemberMeta, TYPE_CREATE, TYPE_INVITE, TYPE_MEMBER_META,
-};
+use wires_core::channel::schemas::{ChannelInvite, TYPE_INVITE};
 use wires_core::channel::types::MemberKind;
 use wires_core::wire::MessageKind;
 use wires_net::unix_now_ms;
@@ -33,12 +30,7 @@ pub async fn create(data_dir: &Path, name: &str, description: Option<&str>) -> R
     let cfg: NodeConfig = toml::from_str(&raw).context(TomlParseSnafu)?;
     let node = Node::open(cfg).context(NodeSnafu)?;
 
-    let mut topic_id = [0u8; 32];
-    OsRng.fill_bytes(&mut topic_id);
-    let mut epoch_key = [0u8; 32];
-    OsRng.fill_bytes(&mut epoch_key);
-    node.install_epoch_key(topic_id, 0, epoch_key)
-        .context(NodeSnafu)?;
+    let (topic_id, _epoch_key) = wires_node::channel::allocate_named(&node).context(NodeSnafu)?;
     upsert_topic_names(data_dir, [(topic_name.clone(), topic_id)]).context(NodeSnafu)?;
 
     // Auto-mint self-cap if this dir holds a root key and no covering cap exists.
@@ -69,40 +61,19 @@ pub async fn create(data_dir: &Path, name: &str, description: Option<&str>) -> R
         .ok_or_else(|| invalid!("no cap covers '{topic_name}' for Write"))?;
 
     let now = unix_now_ms();
-
-    let create_value = serde_json::to_value(&ChannelCreate {
-        name: topic_name.clone(),
-        description: description.map(str::to_string),
-        created_at: now,
-    })
-    .map_err(|e| invalid!("serialize __channel.create: {e}", e = e))?;
-    publish_public(
-        &node,
-        topic_id,
-        cap_id,
-        TYPE_CREATE,
-        &format!("created channel {topic_name}"),
-        create_value,
-        now,
-    )?;
-
     let display_name = load_display_name(data_dir).unwrap_or_else(|| "wires-cli".to_string());
-    let meta_value = serde_json::to_value(&ChannelMemberMeta {
-        kind: MemberKind::Cli,
-        display_name: display_name.clone(),
-        description: None,
-        asserted_at: now,
-    })
-    .map_err(|e| invalid!("serialize __channel.member_meta: {e}", e = e))?;
-    publish_public(
+
+    wires_node::channel::publish_create_and_meta(
         &node,
         topic_id,
+        &topic_name,
         cap_id,
-        TYPE_MEMBER_META,
-        &format!("member {display_name}"),
-        meta_value,
+        description,
+        &display_name,
+        MemberKind::Cli,
         now,
-    )?;
+    )
+    .context(NodeSnafu)?;
 
     println!(
         "Created channel '{topic_name}' with id {}",
@@ -112,7 +83,9 @@ pub async fn create(data_dir: &Path, name: &str, description: Option<&str>) -> R
 }
 
 /// Publish a `MessageKind::Public` envelope containing `content` to `topic_id`.
-/// Reused by Tasks 17, 18, 20.
+/// Thin wrapper around `wires_node::channel::publish_public`. Used by
+/// `cmd::channel::invite`, `cmd::dm::open`, and `cmd::me::set` until Tasks
+/// 24/25 lift those flows into `wires-node` too.
 pub(super) fn publish_public(
     node: &Node,
     topic_id: [u8; 32],
@@ -122,23 +95,16 @@ pub(super) fn publish_public(
     content: serde_json::Value,
     timestamp: i64,
 ) -> Result<()> {
-    let canonical = CanonicalContent::new(content_type, text).with_data(content);
-    let (seq, prev_hash) = node.next_seq_and_prev_hash(&topic_id).context(NodeSnafu)?;
-    let params = PublishParams {
+    wires_node::channel::publish_public(
+        node,
         topic_id,
-        sender_sk: &node.ed_sk,
         cap_id,
-        kind: MessageKind::Public,
-        content: canonical,
-        epoch: 0,
-        seq,
-        prev_hash,
+        content_type,
+        text,
+        content,
         timestamp,
-        keying: KeyingMaterial::Public,
-    };
-    let msg = build_message(&params).context(NodeSnafu)?;
-    node.append_local(&msg).context(NodeSnafu)?;
-    Ok(())
+    )
+    .context(NodeSnafu)
 }
 
 fn load_display_name(data_dir: &Path) -> Option<String> {
