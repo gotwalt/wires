@@ -121,3 +121,18 @@ fn load_display_name(data_dir: &Path) -> Option<String> {
         .and_then(|x| x.as_str())
         .map(str::to_string)
 }
+
+pub async fn list(data_dir: &Path) -> Result<()> {
+    let names = wires_node::load_topic_names(data_dir).context(IoSnafu)?;
+    let mut found = 0;
+    for (name, topic_id) in names {
+        if name.starts_with("channels.dm.") {
+            println!("{name}  {}", hex::encode(topic_id));
+            found += 1;
+        }
+    }
+    if found == 0 {
+        println!("(no DMs)");
+    }
+    Ok(())
+}
