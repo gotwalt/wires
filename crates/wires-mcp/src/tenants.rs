@@ -54,7 +54,10 @@ impl TenantSupervisor {
     pub async fn get_or_open(&self, sub: &str) -> Result<Arc<NodeRuntime>> {
         let dir = self.users_dir.join(sub);
         if !dir.exists() {
-            return UnknownUserSnafu { sub: sub.to_string() }.fail();
+            return UnknownUserSnafu {
+                sub: sub.to_string(),
+            }
+            .fail();
         }
         let mut g = self.inner.lock().await;
         if let Some(slot) = g.runtimes.get_mut(sub) {
@@ -66,10 +69,11 @@ impl TenantSupervisor {
             source: e,
             location: snafu::location!(),
         })?;
-        let mut cfg: NodeConfig = toml::from_str(&s).map_err(|e| crate::error::GatewayError::Io {
-            source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
-            location: snafu::location!(),
-        })?;
+        let mut cfg: NodeConfig =
+            toml::from_str(&s).map_err(|e| crate::error::GatewayError::Io {
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
+                location: snafu::location!(),
+            })?;
         cfg.data_dir = dir.clone();
         cfg.retention = self.retention.clone();
         let runtime = NodeRuntime::open(cfg).await.context(OpenRuntimeSnafu)?;
@@ -96,9 +100,11 @@ impl TenantSupervisor {
             location: snafu::location!(),
         })?;
         let dest = self.users_dir.join(sub);
-        std::fs::rename(source_dir, &dest).map_err(|e| crate::error::GatewayError::TempDataDirMove {
-            source: e,
-            location: snafu::location!(),
+        std::fs::rename(source_dir, &dest).map_err(|e| {
+            crate::error::GatewayError::TempDataDirMove {
+                source: e,
+                location: snafu::location!(),
+            }
         })?;
         self.get_or_open(sub).await
     }
@@ -147,7 +153,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let s = TenantSupervisor::new(tmp.path().to_path_buf(), Duration::from_secs(60), None);
         let err = s.get_or_open("nope").await.err().expect("expected error");
-        assert!(matches!(err, crate::error::GatewayError::UnknownUser { .. }));
+        assert!(matches!(
+            err,
+            crate::error::GatewayError::UnknownUser { .. }
+        ));
     }
 
     #[tokio::test]
@@ -167,7 +176,8 @@ mod tests {
         std::fs::write(
             pending.join("config.toml"),
             toml::to_string_pretty(&cfg).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(pending.join("iroh.secret"), [7u8; 32]).unwrap();
 
         let sup = TenantSupervisor::new(users.clone(), Duration::from_secs(60), None);
@@ -192,7 +202,11 @@ mod tests {
             host: None,
             retention: None,
         };
-        std::fs::write(dir.join("config.toml"), toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            toml::to_string_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
         std::fs::write(dir.join("iroh.secret"), [5u8; 32]).unwrap();
 
         let sup = TenantSupervisor::new(users.clone(), Duration::from_millis(50), None);
@@ -226,7 +240,11 @@ mod tests {
             host: None,
             retention: None,
         };
-        std::fs::write(dir.join("config.toml"), toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            toml::to_string_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
         std::fs::write(dir.join("iroh.secret"), [3u8; 32]).unwrap();
 
         // Tight TTL so we can sleep past it within the test.
@@ -293,14 +311,19 @@ mod tests {
             host: None,
             retention: None, // per-user config.toml does not set retention
         };
-        std::fs::write(dir.join("config.toml"), toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            toml::to_string_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
         std::fs::write(dir.join("iroh.secret"), [5u8; 32]).unwrap();
 
         let policy = wires_node::RetentionPolicy {
             ttl: Duration::from_secs(60),
             max_bytes_per_user: 1024,
         };
-        let sup = TenantSupervisor::new(users.clone(), Duration::from_secs(60), Some(policy.clone()));
+        let sup =
+            TenantSupervisor::new(users.clone(), Duration::from_secs(60), Some(policy.clone()));
         let rt = sup.get_or_open(&sub).await.unwrap();
         assert!(
             rt.node.ingest_index.is_some(),

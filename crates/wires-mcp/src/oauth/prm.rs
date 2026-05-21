@@ -53,7 +53,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let prm: PrmDocument = serde_json::from_slice(&body).unwrap();
         assert_eq!(prm.resource, "https://mcp.example.com");
         assert_eq!(prm.authorization_servers, vec!["https://mcp.example.com"]);

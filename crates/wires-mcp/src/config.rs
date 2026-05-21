@@ -86,10 +86,19 @@ mod tests {
             data_dir: PathBuf::from("/tmp/wires-mcp"),
             retention: None,
         };
-        assert_eq!(cfg.token_signing_path(), Path::new("/tmp/wires-mcp/token_signing.ed25519"));
-        assert_eq!(cfg.gateway_db_path(), Path::new("/tmp/wires-mcp/gateway.redb"));
+        assert_eq!(
+            cfg.token_signing_path(),
+            Path::new("/tmp/wires-mcp/token_signing.ed25519")
+        );
+        assert_eq!(
+            cfg.gateway_db_path(),
+            Path::new("/tmp/wires-mcp/gateway.redb")
+        );
         assert_eq!(cfg.users_dir(), Path::new("/tmp/wires-mcp/users"));
-        assert_eq!(cfg.pending_pairs_dir(), Path::new("/tmp/wires-mcp/pending_pairs"));
+        assert_eq!(
+            cfg.pending_pairs_dir(),
+            Path::new("/tmp/wires-mcp/pending_pairs")
+        );
     }
 
     #[test]
@@ -166,7 +175,13 @@ mod tests {
             max_bytes_per_user = 1024
         "#;
         let cfg: GatewayConfig = toml::from_str(s).unwrap();
-        let err = cfg.retention_policy().err().expect("must reject ttl_secs = 0");
-        assert!(matches!(err, crate::error::GatewayError::InvalidRetention { .. }));
+        let err = cfg
+            .retention_policy()
+            .err()
+            .expect("must reject ttl_secs = 0");
+        assert!(matches!(
+            err,
+            crate::error::GatewayError::InvalidRetention { .. }
+        ));
     }
 }

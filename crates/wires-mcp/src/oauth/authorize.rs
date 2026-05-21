@@ -10,9 +10,7 @@ use chrono::Utc;
 use serde::Deserialize;
 
 use crate::http::ServiceState;
-use crate::store::{
-    AuthSessionKind, AuthSessionRecord, PendingSigninRecord,
-};
+use crate::store::{AuthSessionKind, AuthSessionRecord, PendingSigninRecord};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthorizeParams {
@@ -54,31 +52,59 @@ pub async fn validate_and_create(
     p: &AuthorizeParams,
 ) -> std::result::Result<AuthorizeContext, (StatusCode, serde_json::Value)> {
     if p.response_type != "code" {
-        return Err((StatusCode::BAD_REQUEST, oauth_err("unsupported_response_type", "only `code` is supported")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            oauth_err("unsupported_response_type", "only `code` is supported"),
+        ));
     }
     if p.code_challenge_method != "S256" {
-        return Err((StatusCode::BAD_REQUEST, oauth_err("invalid_request", "code_challenge_method must be S256")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            oauth_err("invalid_request", "code_challenge_method must be S256"),
+        ));
     }
     if p.resource.trim_end_matches('/') != state.config.public_url.trim_end_matches('/') {
-        return Err((StatusCode::BAD_REQUEST, oauth_err("invalid_target", "resource does not match issuer")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            oauth_err("invalid_target", "resource does not match issuer"),
+        ));
     }
     if let Some(scope) = &p.scope {
         for s in scope.split_whitespace() {
             if s != "mcp:wires" {
-                return Err((StatusCode::BAD_REQUEST, oauth_err("invalid_scope", "only mcp:wires is supported")));
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    oauth_err("invalid_scope", "only mcp:wires is supported"),
+                ));
             }
         }
     }
     let client = state
         .store
         .get_oauth_client(&p.client_id)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, oauth_err("server_error", "store")))?
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, oauth_err("invalid_client", "unknown client_id")))?;
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                oauth_err("server_error", "store"),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                oauth_err("invalid_client", "unknown client_id"),
+            )
+        })?;
     if client.revoked {
-        return Err((StatusCode::BAD_REQUEST, oauth_err("invalid_client", "client revoked")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            oauth_err("invalid_client", "client revoked"),
+        ));
     }
     if !client.redirect_uris.iter().any(|u| u == &p.redirect_uri) {
-        return Err((StatusCode::BAD_REQUEST, oauth_err("invalid_request", "redirect_uri not registered")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            oauth_err("invalid_request", "redirect_uri not registered"),
+        ));
     }
 
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -96,7 +122,10 @@ pub async fn validate_and_create(
         expires_ms: now_ms + AUTH_SESSION_TTL_MS,
     };
     state.store.put_auth_session(&session).map_err(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, oauth_err("server_error", "store"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            oauth_err("server_error", "store"),
+        )
     })?;
 
     // Persist the sign-in nonce eagerly (cheap). The probe endpoint will
@@ -112,12 +141,15 @@ pub async fn validate_and_create(
             challenge_nonce_hex: hex::encode(nonce),
             ttl_expires_ms: now_ms + SIGNIN_CHALLENGE_TTL_MS,
         })
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, oauth_err("server_error", "store")))?;
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                oauth_err("server_error", "store"),
+            )
+        })?;
 
-    let ticket = crate::oauth::session_ticket::SessionTicket::new(
-        &state.config.public_url,
-        &session_id,
-    );
+    let ticket =
+        crate::oauth::session_ticket::SessionTicket::new(&state.config.public_url, &session_id);
 
     Ok(AuthorizeContext {
         session_id,
@@ -140,14 +172,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let st = crate::http::test_state(tmp.path());
         // Pre-populate the client used by all authorize tests.
-        st.store.put_oauth_client(&OauthClientRecord {
-            client_id: "c1".into(),
-            client_name: "Claude Desktop".into(),
-            redirect_uris: vec!["http://localhost:33333/callback".into()],
-            grant_types: vec!["authorization_code".into()],
-            created_at_ms: 0,
-            revoked: false,
-        }).unwrap();
+        st.store
+            .put_oauth_client(&OauthClientRecord {
+                client_id: "c1".into(),
+                client_name: "Claude Desktop".into(),
+                redirect_uris: vec!["http://localhost:33333/callback".into()],
+                grant_types: vec!["authorization_code".into()],
+                created_at_ms: 0,
+                revoked: false,
+            })
+            .unwrap();
         (tmp, st)
     }
 
@@ -171,10 +205,25 @@ mod tests {
         assert!(!ctx.session_id.is_empty());
         assert_eq!(ctx.client_name, "Claude Desktop");
         assert!(!ctx.session_ticket_b64.is_empty());
-        assert!(st.store.get_auth_session(&ctx.session_id).unwrap().is_some());
-        assert!(st.store.get_pending_signin(&ctx.session_id).unwrap().is_some());
+        assert!(
+            st.store
+                .get_auth_session(&ctx.session_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            st.store
+                .get_pending_signin(&ctx.session_id)
+                .unwrap()
+                .is_some()
+        );
         // pending_pair is NOT created at /authorize — only at probe time.
-        assert!(st.store.get_pending_pair(&ctx.session_id).unwrap().is_none());
+        assert!(
+            st.store
+                .get_pending_pair(&ctx.session_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -92,10 +92,7 @@ pub fn app(state: ServiceState) -> Router {
     // an alias so unit tests and any clients that hardcode that path keep
     // working.
     let mcp_handler = axum::routing::post(crate::mcp::router::handler).layer(
-        axum::middleware::from_fn_with_state(
-            state.clone(),
-            crate::oauth::middleware::bearer,
-        ),
+        axum::middleware::from_fn_with_state(state.clone(), crate::oauth::middleware::bearer),
     );
 
     Router::new()
@@ -230,8 +227,11 @@ pub fn test_state(tmp: &std::path::Path) -> ServiceState {
         retention: None,
     };
     let store = Store::open(&cfg.gateway_db_path()).unwrap();
-    let supervisor =
-        crate::tenants::TenantSupervisor::new(cfg.users_dir(), std::time::Duration::from_secs(60), None);
+    let supervisor = crate::tenants::TenantSupervisor::new(
+        cfg.users_dir(),
+        std::time::Duration::from_secs(60),
+        None,
+    );
     let pair_bridge = Arc::new(crate::pair_bridge::PairBridge::new(
         cfg.pending_pairs_dir(),
         cfg.public_url.clone(),

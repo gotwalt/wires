@@ -26,9 +26,7 @@ pub async fn register_with_hosted_service(
     let peer = decode_endpoint_id(&host.endpoint_id_hex)?;
     register_hint_addrs(&endpoint, host);
 
-    let adapter = SwiftRootSignerAdapter {
-        inner: root_signer,
-    };
+    let adapter = SwiftRootSignerAdapter { inner: root_signer };
     let host_eid_bytes = *peer.as_bytes();
     let now = now_ms()?;
 
@@ -110,9 +108,7 @@ pub async fn register_topic(
     let peer = decode_endpoint_id(&host.endpoint_id_hex)?;
     register_hint_addrs(&endpoint, host);
 
-    let adapter = SwiftRootSignerAdapter {
-        inner: root_signer,
-    };
+    let adapter = SwiftRootSignerAdapter { inner: root_signer };
     let host_eid_bytes = *peer.as_bytes();
     let now = now_ms()?;
 

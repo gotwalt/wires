@@ -33,15 +33,13 @@ pub async fn approve_pair_request(
     let root_pubkey = <SwiftRootSignerAdapter as RootSigner>::pubkey(&adapter);
 
     // 1. Build the Capability covering every granted topic.
-    let topic_names: Vec<String> = granted_scopes.iter().map(|g| g.topic_name.clone()).collect();
+    let topic_names: Vec<String> = granted_scopes
+        .iter()
+        .map(|g| g.topic_name.clone())
+        .collect();
     let rights: Vec<CoreRight> = combined_rights(&granted_scopes);
-    let mut cap = Capability::new_unsigned(
-        request.agent_pubkey,
-        topic_names.clone(),
-        rights,
-        now,
-        None,
-    );
+    let mut cap =
+        Capability::new_unsigned(request.agent_pubkey, topic_names.clone(), rights, now, None);
     cap.sign(&adapter).map_err(|e| {
         InternalSnafu {
             message: format!("cap sign failed: {e}"),

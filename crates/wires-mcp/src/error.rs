@@ -118,7 +118,9 @@ pub enum GatewayError {
     },
 
     // --- Pair bridge ---
-    #[snafu(display("Pair install rejected: a wires user already exists for root {root_pubkey_hex}, at {location}"))]
+    #[snafu(display(
+        "Pair install rejected: a wires user already exists for root {root_pubkey_hex}, at {location}"
+    ))]
     AlreadyPaired {
         root_pubkey_hex: String,
         #[snafu(implicit)]
@@ -214,7 +216,9 @@ pub enum GatewayError {
         location: Location,
     },
 
-    #[snafu(display("Permission denied for topic_id {topic_id_hex} (need {right}), at {location}"))]
+    #[snafu(display(
+        "Permission denied for topic_id {topic_id_hex} (need {right}), at {location}"
+    ))]
     PermissionDenied {
         topic_id_hex: String,
         right: String,

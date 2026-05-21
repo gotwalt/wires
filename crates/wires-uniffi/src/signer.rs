@@ -28,10 +28,12 @@ impl RootSigner for SwiftRootSignerAdapter {
     }
 
     fn sign(&self, message: &[u8]) -> Result<[u8; 64], SignError> {
-        let sig = self
-            .inner
-            .sign(message.to_vec())
-            .map_err(|e| RejectedSnafu { message: format!("{e}") }.build())?;
+        let sig = self.inner.sign(message.to_vec()).map_err(|e| {
+            RejectedSnafu {
+                message: format!("{e}"),
+            }
+            .build()
+        })?;
         if sig.len() != 64 {
             return Err(RejectedSnafu {
                 message: format!("signer returned {} bytes, expected 64", sig.len()),

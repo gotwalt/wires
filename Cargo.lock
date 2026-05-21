@@ -5238,6 +5238,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "uuid",
+ "x25519-dalek",
 ]
 
 [[package]]

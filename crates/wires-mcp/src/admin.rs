@@ -20,7 +20,9 @@ pub fn keys_rotate(cfg: &GatewayConfig) -> Result<()> {
     let path = cfg.token_signing_path();
     if path.exists() {
         let now_s = chrono::Utc::now().timestamp();
-        let archived = cfg.data_dir.join(format!("token_signing.ed25519.archived.{now_s}"));
+        let archived = cfg
+            .data_dir
+            .join(format!("token_signing.ed25519.archived.{now_s}"));
         std::fs::rename(&path, &archived).context(IoSnafu)?;
         println!("archived old signing key to {}", archived.display());
     }
@@ -45,12 +47,13 @@ pub fn client_list(cfg: &GatewayConfig) -> Result<()> {
 
 pub fn client_revoke(cfg: &GatewayConfig, client_id: &str) -> Result<()> {
     let store = Store::open(&cfg.gateway_db_path())?;
-    let mut rec = store
-        .get_oauth_client(client_id)?
-        .ok_or_else(|| crate::error::GatewayError::Io {
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "unknown client_id"),
-            location: snafu::location!(),
-        })?;
+    let mut rec =
+        store
+            .get_oauth_client(client_id)?
+            .ok_or_else(|| crate::error::GatewayError::Io {
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "unknown client_id"),
+                location: snafu::location!(),
+            })?;
     rec.revoked = true;
     store.put_oauth_client(&rec)?;
     println!("client {client_id} revoked");
@@ -105,7 +108,9 @@ mod tests {
         };
         // Create (and immediately drop) the store so the db file exists,
         // then let user_list open it exclusively.
-        { let _store = Store::open(&cfg.gateway_db_path()).unwrap(); }
+        {
+            let _store = Store::open(&cfg.gateway_db_path()).unwrap();
+        }
         user_list(&cfg).unwrap();
     }
 
@@ -121,12 +126,14 @@ mod tests {
         // Seed data, drop the handle, then let user_list open exclusively.
         {
             let store = Store::open(&cfg.gateway_db_path()).unwrap();
-            store.put_user(&UserRecord {
-                root_pubkey_hex: "ab".repeat(32),
-                data_dir: "/tmp/x".into(),
-                created_at_ms: 1,
-                last_seen_ms: 2,
-            }).unwrap();
+            store
+                .put_user(&UserRecord {
+                    root_pubkey_hex: "ab".repeat(32),
+                    data_dir: "/tmp/x".into(),
+                    created_at_ms: 1,
+                    last_seen_ms: 2,
+                })
+                .unwrap();
         }
         user_list(&cfg).unwrap();
         // Re-open to verify the row is still there.
@@ -146,20 +153,24 @@ mod tests {
         let sub = "cd".repeat(32);
         {
             let store = Store::open(&cfg.gateway_db_path()).unwrap();
-            store.put_user(&UserRecord {
-                root_pubkey_hex: sub.clone(),
-                data_dir: "x".into(),
-                created_at_ms: 0,
-                last_seen_ms: 0,
-            }).unwrap();
-            store.put_refresh_token(&crate::store::RefreshTokenRecord {
-                token_hash_hex: "h1".into(),
-                sub: sub.clone(),
-                client_id: "c".into(),
-                issued_at_ms: 0,
-                expires_ms: i64::MAX,
-                rotated_to_hash_hex: None,
-            }).unwrap();
+            store
+                .put_user(&UserRecord {
+                    root_pubkey_hex: sub.clone(),
+                    data_dir: "x".into(),
+                    created_at_ms: 0,
+                    last_seen_ms: 0,
+                })
+                .unwrap();
+            store
+                .put_refresh_token(&crate::store::RefreshTokenRecord {
+                    token_hash_hex: "h1".into(),
+                    sub: sub.clone(),
+                    client_id: "c".into(),
+                    issued_at_ms: 0,
+                    expires_ms: i64::MAX,
+                    rotated_to_hash_hex: None,
+                })
+                .unwrap();
         }
         let user_dir = cfg.users_dir().join(&sub);
         std::fs::create_dir_all(&user_dir).unwrap();
@@ -185,14 +196,16 @@ mod tests {
         };
         {
             let store = Store::open(&cfg.gateway_db_path()).unwrap();
-            store.put_oauth_client(&crate::store::OauthClientRecord {
-                client_id: "c1".into(),
-                client_name: "C".into(),
-                redirect_uris: vec!["http://x".into()],
-                grant_types: vec!["authorization_code".into()],
-                created_at_ms: 0,
-                revoked: false,
-            }).unwrap();
+            store
+                .put_oauth_client(&crate::store::OauthClientRecord {
+                    client_id: "c1".into(),
+                    client_name: "C".into(),
+                    redirect_uris: vec!["http://x".into()],
+                    grant_types: vec!["authorization_code".into()],
+                    created_at_ms: 0,
+                    revoked: false,
+                })
+                .unwrap();
         }
         client_revoke(&cfg, "c1").unwrap();
         let store2 = Store::open(&cfg.gateway_db_path()).unwrap();
@@ -218,7 +231,8 @@ mod tests {
         // The implementation should produce *something* with that prefix.
         let archived = std::fs::read_dir(&cfg.data_dir).unwrap().any(|e| {
             let n = e.unwrap().file_name();
-            n.to_string_lossy().starts_with("token_signing.ed25519.archived")
+            n.to_string_lossy()
+                .starts_with("token_signing.ed25519.archived")
         });
         assert!(archived, "expected archived key in {:?}", archive_glob);
     }
