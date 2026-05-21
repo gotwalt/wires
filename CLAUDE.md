@@ -19,6 +19,17 @@ A Home Assistant ingestion daemon (`wires-ha`) also exists as a working example 
 
 What does **not** exist yet: iOS companion (still a stock SwiftUI scaffold — the spec/plan need revision against the post-hosted-service architecture), `__cap.*` gossip propagation, `__topic.epoch_advance` distribution. See "Out of scope" in each design spec.
 
+## Vocabulary boundary: Fabric vs. Tenant
+
+Wires has one user-facing concept for "the unit of organization rooted in one human": **fabric**. The codebase uses two words for it depending on layer:
+
+- **Fabric** is the user-facing term. Every CLI string, error message, MCP OAuth page, iOS UI label, README sentence, and new spec uses "fabric."
+- **Tenant** is host-internal jargon. It appears in `wires-host` (which is genuinely multi-tenant infrastructure: one host, many fabrics), in the `/wires/tenant/0` ALPN and `wires-net::tenant` protocol module, in on-disk paths (`host/tenants/<root_hex>/`), in redb table names (`tenants.redb`, `ingest_<root>.redb`), and in the MCP gateway's per-user supervisor (`wires-mcp::tenants::TenantSupervisor`). These are wire-format and on-disk identifiers; renaming them is a breaking change with no user benefit.
+
+"Household" is not used. Earlier iOS and README drafts called the concept a "household"; that vocabulary has been retired in favor of "fabric." If you see "household" in code or docs that aren't historical specs, fix it.
+
+Rule of thumb: if a user reads the string, it says "fabric." If a JSON wire field, an ALPN, a redb table name, or a directory path contains the string, it says "tenant."
+
 ## Authoritative docs
 
 - **Substrate spec** — `docs/superpowers/specs/2026-05-14-wires-substrate-design.md`. Wire format, encryption modes, capability model, reserved message types, host blindness contract. Load-bearing.
