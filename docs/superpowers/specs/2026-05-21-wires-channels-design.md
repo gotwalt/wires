@@ -27,13 +27,13 @@ All channel traffic continues to flow through the existing hosted relay (`wires-
 | Channel ↔ topic | one topic per channel |
 | Member identity | one ed25519 agent pubkey per member |
 | Transport | hosted relay only (no new agent↔agent ALPN) |
-| DM authorization | broad `dm.**` cap pre-minted to every paired agent |
-| Named-channel authorization | broad `channels.**` cap pre-minted to every paired agent |
+| Cap authorization | single broad `channels.**` cap pre-minted to every paired agent — covers both named channels and DMs |
 | Create authority | any cap-holder with Read+Write on the topic |
-| Invite authority | any current member (publishes invite + sealed history_grant) |
+| Invite authority (named) | any current member (publishes invite + sealed history_grant) |
 | Member removal | network-layer cap revocation — no channel-layer kick / leave / ban |
 | Member meta | mandatory, enforced at replay-fold time |
-| DM derivation | `BLAKE3("wires.dm.v1\0" \|\| root_pubkey \|\| "\0" \|\| sorted_pubkey_concat)` |
+| DM topic_id | `BLAKE3("wires.dm.v1\0" \|\| root_pubkey \|\| "\0" \|\| sorted_pubkey_concat)` |
+| DM epoch key | `BLAKE3(X25519(self_sk, other_pk) \|\| "wires.dm.epoch.v1\0" \|\| root \|\| sorted_pubkey_concat)` — both parties compute independently |
 | Scope | single-household for v1; multitenant-safe by construction |
 | Layering | `wires-core::channel` + `wires-node::channel`, no new crate |
 
@@ -88,7 +88,11 @@ pub enum MemberKind { Agent, Api, Cli, Human, Unknown }
 
 The layer adds no new crates. Today's `wires topic create` continues to exist as the raw-primitive command for firehose-style topics (`wires.firehose.v1`, `wires.caps.v1`, well-known service categories, HA's ingestion topic). The new `wires channel create` / `wires dm` commands sit alongside.
 
-## 5. DM topic_id derivation
+## 5. DM derivation
+
+A DM is a channel whose topic_id *and* epoch key are both derived from the participant set. Neither needs to be exchanged on-wire — both sides independently compute the same values from each other's already-public pubkeys.
+
+### 5.1 Topic_id
 
 ```
 topic_id = BLAKE3("wires.dm.v1\0" || root_pubkey || "\0" || sorted_pubkey_concat)
@@ -96,14 +100,25 @@ topic_id = BLAKE3("wires.dm.v1\0" || root_pubkey || "\0" || sorted_pubkey_concat
 
 `sorted_pubkey_concat` is the 32-byte ed25519 pubkeys of all participants, sorted byte-lexicographically and concatenated with no separators. Null separators between the namespace literal, the root, and the sorted-pubkey block prevent prefix-collision ambiguities (the same pattern used by the well-known topics proposal at `docs/superpowers/specs/2026-05-15-wires-well-known-topics-proposal.md`).
 
-Properties:
+### 5.2 Epoch key
 
-- **Deterministic across participants.** Each agent independently computes the same topic_id from the same input set.
-- **Tenant-namespaced.** Including `root_pubkey` in the derivation ensures the same agent pubkeys in different households produce different topic ids. The hosted relay's `topic_index.redb` requires one tenant per topic_id, so cross-tenant collisions would break routing; the root-in-derivation rule rules them out by construction.
-- **N ≥ 2 participants.** Two-party DMs are the common case; the derivation extends transparently to 3+ via a longer sorted-concat. v1 ships only the 2-party `wires dm` command, but the derivation and replay layer support any N.
-- **Domain-separated.** The literal `"wires.dm.v1\0"` prefix prevents collision with named-channel random ids (which come from `OsRng`), with `derived_topic_id("wires.firehose.v1", root)`, and with future deterministic schemes.
+```
+shared = X25519(self.x25519_secret, other.x25519_public)   // ECDH; commutative
+epoch_key = BLAKE3(shared || "wires.dm.epoch.v1\0" || root_pubkey || sorted_pubkey_concat)
+```
 
-Future cross-household DMs will use a distinct namespace (e.g. `"wires.dm.cross.v1\0" || sorted_root_pubkeys || "\0" || sorted_participant_pubkeys`) so they cannot collide with intra-household DMs.
+Each party computes the shared secret from their own x25519 secret and the other party's x25519 public key (already known from the household roster), then derives the per-DM AEAD key. Because X25519 is commutative, both sides arrive at the same `epoch_key` without exchanging it on-wire. There is no DM analogue of `__topic.history_grant`.
+
+This is what makes DMs "zero-setup": neither party needs to be online when the other initiates; whichever side publishes first registers the topic_id with the host (idempotent — second-mover finds it already registered for this tenant) and starts publishing. The receiving side, on first checking the DM, derives the same key locally and reads the history.
+
+### 5.3 Properties
+
+- **Deterministic across participants.** Each agent independently computes the same topic_id and epoch key from the same input set.
+- **Tenant-namespaced.** Including `root_pubkey` in both derivations ensures the same agent pubkeys in different households produce different topic ids and keys. The hosted relay's `topic_index.redb` requires one tenant per topic_id, so cross-tenant collisions would break routing; the root-in-derivation rule rules them out by construction.
+- **N ≥ 2 participants supported by derivation, 2-party in v1 CLI.** The math extends transparently to 3+ participants via a longer sorted-concat. v1 only exposes 2-party DMs through the CLI; group DMs are deferred per §3.
+- **Domain-separated.** The literal `"wires.dm.v1\0"` and `"wires.dm.epoch.v1\0"` prefixes prevent collisions with named-channel random ids (which come from `OsRng`), with `derived_topic_id("wires.firehose.v1", root)`, and with future deterministic schemes.
+
+Future cross-household DMs will use distinct namespaces (e.g. `"wires.dm.cross.v1\0" || sorted_root_pubkeys || ...`) so they cannot collide with intra-household DMs.
 
 ## 6. Reserved message types
 
@@ -160,20 +175,19 @@ Replay is idempotent under double-replay (the same log produces the same `Channe
 
 ## 8. Capability model
 
-Two new broad globs are added to the cap minted at `pair-approve` time. `Capability::topics` is already `Vec<String>`, so the existing single-cap PairGrant carries them with no schema change:
+One new broad glob is added to the cap minted at `pair-approve` time. `Capability::topics` is already `Vec<String>`, so the existing single-cap PairGrant carries it with no schema change:
 
-- `dm.**` — Read + Write — every paired agent gets this glob. Enables the agent to DM any other household agent without per-DM operator action.
-- `channels.**` — Read + Write — every paired agent gets this glob. Enables the agent to create named channels, accept invites to them, and publish into them.
+- `channels.**` — Read + Write — every paired agent gets this glob. Covers both named channels (names `channels.<user-name>`) and DMs (names `channels.dm.<hex(topic_id)>`).
 
-The change is in `crates/wires-cli/src/cmd/pair_approve.rs`: the cap_topics vector pushes both globs by default. The cap is root-signed; the receiver checks `cap.verify(root_pk)` so caps minted by a different household's root never validate against this household's receivers.
+The change is in `crates/wires-cli/src/cmd/pair_approve.rs`: the `cap_topics` vector pushes `channels.**` by default. The cap is root-signed; the receiver checks `cap.verify(root_pk)` so caps minted by a different household's root never validate against this household's receivers.
 
-Today's per-topic globs (the ones `pair-approve` already adds to the cap for specific named topics) continue to work unchanged. The two new broad globs are additive.
+Today's per-topic globs (the ones `pair-approve` already adds to the cap for specific named topics) continue to work unchanged. `channels.**` is additive.
 
-An operator who wants to restrict the layer narrows the globs or omits one entirely (e.g. `dm.**` granted Read-only, or `channels.work.**` only). The state-machine rules in §7 still apply; the cap just restricts which topic names the agent can publish onto.
+An operator who wants to restrict the layer narrows the glob (e.g. `channels.work.**` only, or `channels.**` granted Read-only). The state-machine rules in §7 still apply; the cap just restricts which topic names the agent can publish onto.
 
-The cap glob system is unchanged — the existing `glob_matches` in `crates/wires-core/src/cap.rs:163` already handles `dm.**` and `channels.**` correctly.
+The cap glob system is unchanged — the existing `glob_matches` in `crates/wires-core/src/cap.rs:163` already handles `channels.**` correctly.
 
-### Invite flow
+### Invite flow (named channels only)
 
 When a current member runs `wires channel invite <name> <agent_pubkey>`:
 
@@ -181,6 +195,8 @@ When a current member runs `wires channel invite <name> <agent_pubkey>`:
 2. **Second publish:** `__channel.invite { agent: <agent_pubkey>, invited_at: now }` (Public).
 
 The order matters: if the second publish fails, the first leaves a sealed grant that the invitee cannot act on (no invite event → not in roster → won't try to join). The next successful invite attempt republishes both; the duplicate sealed grant is harmless. The reverse order would leave a public invite with no key, an invitee visible-but-locked-out.
+
+DMs have no invite flow — both the topic_id and the epoch key are derived from the participant set per §5, so there is nothing to exchange. The first publisher registers the topic_id with the host (idempotent) and starts publishing.
 
 ## 9. Multitenancy
 
@@ -206,9 +222,10 @@ wires channel invite <name> <agent_pubkey>
     Publishes __topic.history_grant (sealed to invitee) then __channel.invite.
 
 wires dm <agent_pubkey>
-    Derives the DM topic_id from sorted (self, target, root) pubkeys, joins,
-    enters an interactive read/publish loop. First publish auto-publishes
-    __channel.member_meta if not yet on-log from self.
+    Derives the DM topic_id and epoch key from the participant set per §5,
+    registers the topic_id with the host (idempotent), joins, enters an
+    interactive read/publish loop. No key exchange. First publish auto-
+    publishes __channel.member_meta if not yet on-log from self.
 
 wires dm list
     Lists DM topics this agent has on-disk (epoch key present + ≥1 log entry).
@@ -248,7 +265,12 @@ The existing `wires_list_topics` / `wires_publish` / `wires_tail` stay — they'
 ### New observable surfaces
 
 - **Pattern of channel-event publishes is host-visible.** The host sees envelope counts per topic_id; bursts around invites and member_meta refreshes are observable as traffic. Mitigation: not in v1 — this is the same shape as `__cap.grant` / `__topic.epoch_advance` traffic visibility.
-- **DM derivation enables targeted enumeration by household insiders.** A paired-in agent that learns another agent's pubkey can compute the DM topic_id for that pair and trial-join. It still cannot decrypt without the epoch key. This is the same reduction-in-defense-in-depth discussed for the well-known-topics proposal §4.2.2; the search space for DM ids shrinks from 2^256 to "pairs of agents I have learned exist."
+- **DM derivation enables targeted enumeration by household insiders.** A paired-in agent that learns another agent's pubkey can compute the DM topic_id for that pair and trial-join. It still cannot decrypt — the DM epoch key requires the X25519 secret of one of the two participants, which the third party doesn't have. This is the same reduction-in-defense-in-depth discussed for the well-known-topics proposal §4.2.2; the search space for DM ids shrinks from 2^256 to "pairs of agents I have learned exist."
+
+### Properties new with DH-derived DM keys
+
+- **No DM key ever transits the wire.** The host never sees the DM epoch key, even encrypted — there is no DM analogue of `__topic.history_grant`. A compromised host cannot decrypt past or future DM traffic, even one that retains ciphertext forever, *unless* it also compromises one of the participants' x25519 secret.
+- **No forward secrecy on agent compromise.** If an agent's x25519 secret leaks, every DM that agent has ever participated in (past and future) is decryptable from retained ciphertext. This is symmetric with named channels (epoch key compromise has the same property) and is bounded by the retention policy. v2 epoch-rotation work would address both.
 
 ### Properties unchanged but worth restating
 
@@ -258,7 +280,7 @@ The existing `wires_list_topics` / `wires_publish` / `wires_tail` stay — they'
 
 ### Unit tests in `wires-core::channel`
 
-- DM derivation determinism: same input set → same topic_id, independent of which side computes; sort canonicity; root-in-derivation makes the same agents in different households produce different ids; null-separator collision resistance.
+- DM derivation determinism: same input set → same topic_id *and* epoch key, independent of which side computes; sort canonicity; root-in-derivation makes the same agents in different households produce different ids and keys; X25519 commutativity holds for the epoch-key derivation; null-separator collision resistance.
 - State-machine fold determinism: same log → same `ChannelView` under any replay order consistent with the per-publisher hash chain; idempotent under double-replay.
 - Member-meta enforcement: messages from a publisher with no on-log meta are dropped; the same publisher's later messages are folded after their first `__channel.member_meta`.
 - Self-only meta: meta from a publisher whose envelope-signer does not equal the meta's implicit subject is rejected.
@@ -268,7 +290,7 @@ The existing `wires_list_topics` / `wires_publish` / `wires_tail` stay — they'
 ### Integration tests across `wires-cli`
 
 - `wires channel create` → `wires channel invite` (publishes history_grant then invite) → invitee opens topic, decrypts, publishes their own `__channel.member_meta`, is folded into roster.
-- `wires dm` between two agents in the same household: independent derivation yields the same topic_id; both see each other's `member_meta` after first publish.
+- `wires dm` between two agents in the same household: independent derivation yields the same topic_id and epoch key with no key-exchange messages on-wire; both can encrypt/decrypt each other's `member_meta` after first publish.
 - After cap revocation: subject's later publishes are rejected at the receiver's cap check before reaching the channel fold; historical entries remain in `members`.
 - `wires me set` republishes member_meta into every joined channel.
 
@@ -284,7 +306,7 @@ Sizing only — a separate `docs/superpowers/plans/` document covers the task br
 |---|---|
 | `wires-core` | New `channel` module: `ChannelView`, `ChannelVariant`, `MemberMeta`, `MemberKind`, three content schemas, `replay` fold function, DM derivation (2-party). Three new entries in `reserved::required_mode_for`. New `MemberKind` serde round-trips. |
 | `wires-node` | New `channel.rs` with the thin I/O wrapper over `TopicLog` (read-side: produces `ChannelView` from a stored log; write-side: helpers that publish the five reserved types via the existing publish path). |
-| `wires-cli` | New `cmd::channel` and `cmd::dm` modules; new `cmd::me` with `set`. `cmd::pair_approve` extended to push `dm.**` and `channels.**` into the cap's `topics` vector by default. All publishes go through the existing publish pipeline. |
+| `wires-cli` | New `cmd::channel` and `cmd::dm` modules; new `cmd::me` with `set`. `cmd::pair_approve` extended to push `channels.**` into the cap's `topics` vector by default. All publishes go through the existing publish pipeline. |
 | `wires-mcp` | Six new MCP tool registrations + handlers, all sharing the per-user `NodeRuntime`. |
 | `wires-host` | No changes. The host is unaware of the channel layer. |
 
@@ -294,7 +316,8 @@ No new dependencies; no wire-format changes beyond the three reserved-type entri
 
 These were open during design; recording the answers so the implementation plan doesn't relitigate them.
 
-1. **Cap glob literals.** `dm.**` and `channels.**` are literal prefixes. Not parameterized per-household; tenant separation is already enforced by cap signatures.
+1. **Single cap glob.** One broad glob, `channels.**`, covers both named channels and DMs. The earlier `dm.**` glob is dropped — DMs use names of the form `channels.dm.<hex>` which fall under `channels.**`. Tenant separation is enforced by cap signatures, not by separate globs.
 2. **Existing paired agents.** Backwards compatibility is not a concern for v1. Agents paired before this lands re-pair if they want to use the channel layer. No `wires cap mint` path.
 3. **`channels.<name>` cap-glob fit.** Cap glob applies to the topic *name*, not the topic_id. `channels.**` covers any name the create-flow chooses. Operators can narrow at pair time.
 4. **DM topic_id discovery on open.** v1 supports 2-party DMs only. `ChannelView::open` checks the topic_id against `BLAKE3("wires.dm.v1\0" || root || "\0" || sort(self_pubkey, other_pubkey))` for each other known agent pubkey — O(n) over the household's agent count, which is bounded at low hundreds. Group DMs (N > 2) are out of scope per §3; if v2 adds them, the caller will pass an explicit participant set to `open`.
+5. **DM epoch key is derived, not exchanged.** Both parties compute `epoch_key = BLAKE3(X25519(self_sk, other_pk) || "wires.dm.epoch.v1\0" || root || sorted_pubkey_concat)` independently. No `__topic.history_grant` on DM topics. This is what makes DMs zero-setup; the substantive difference between named and DM channels (everything else is consequence).
