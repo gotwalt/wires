@@ -1,16 +1,16 @@
 //! Acceptance test for spec §11 scenario #2: `wires-host` restart with data dir
-//! intact preserves tenants, topic registrations, and retained messages.
+//! intact preserves fabrics, topic registrations, and retained messages.
 
 use std::sync::Arc;
 
 use tempfile::TempDir;
 use wires_core::{MessageKind, WireMessage};
-use wires_host::per_tenant_logs::PerTenantLogs;
+use wires_host::fabric_registry::{
+    FabricRecord, FabricRegistry, FabricStatus, TopicRegisterOutcome,
+};
+use wires_host::per_fabric_logs::PerFabricLogs;
 use wires_host::retention::Retention;
 use wires_host::routing::{Router, WriteRateLimiter};
-use wires_host::tenant_registry::{
-    TenantRecord, TenantRegistry, TenantStatus, TopicRegisterOutcome,
-};
 
 fn mk_msg(topic: [u8; 32], sender: u8, seq: u64) -> WireMessage {
     WireMessage {
@@ -45,14 +45,14 @@ fn mk_msg_sized(topic: [u8; 32], sender: u8, seq: u64, payload_size: usize) -> W
 }
 
 #[test]
-fn restart_preserves_tenants_topics_and_messages() {
+fn restart_preserves_fabrics_topics_and_messages() {
     // ========== FIRST SESSION: Register and route ==========
     let tmp = TempDir::new().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
     {
-        let registry = Arc::new(TenantRegistry::open(tmp_path.as_path()).unwrap());
-        let logs = Arc::new(PerTenantLogs::new(tmp_path.as_path()));
+        let registry = Arc::new(FabricRegistry::open(tmp_path.as_path()).unwrap());
+        let logs = Arc::new(PerFabricLogs::new(tmp_path.as_path()));
         let retention = Arc::new(Retention::new(tmp_path.as_path(), Arc::clone(&logs)));
         let rate = Arc::new(WriteRateLimiter::new(1_000_000));
         let router = Router::new(
@@ -67,18 +67,18 @@ fn restart_preserves_tenants_topics_and_messages() {
         let topic_a = [0x11u8; 32];
         let topic_b = [0x22u8; 32];
 
-        // Register two tenants with one topic each.
+        // Register two fabrics with one topic each.
         for (r, t) in [(root_a, topic_a), (root_b, topic_b)] {
-            let rec = TenantRecord {
+            let rec = FabricRecord {
                 registered_at: 1000,
-                status: TenantStatus::Active,
+                status: FabricStatus::Active,
                 retention_budget_bytes: u64::MAX,
             };
             registry.insert_if_absent(&r, rec).unwrap();
             registry.register_topic(&r, &t).unwrap();
         }
 
-        // Route one message to each tenant.
+        // Route one message to each fabric.
         router.route(&mk_msg(topic_a, 7, 0)).unwrap();
         router.route(&mk_msg(topic_b, 8, 0)).unwrap();
 
@@ -86,11 +86,11 @@ fn restart_preserves_tenants_topics_and_messages() {
         assert_eq!(registry.get(&root_a).unwrap().unwrap().registered_at, 1000);
         assert_eq!(registry.get(&root_b).unwrap().unwrap().registered_at, 1000);
         assert_eq!(
-            registry.lookup_topic_tenant(&topic_a).unwrap(),
+            registry.lookup_topic_fabric(&topic_a).unwrap(),
             Some(root_a)
         );
         assert_eq!(
-            registry.lookup_topic_tenant(&topic_b).unwrap(),
+            registry.lookup_topic_fabric(&topic_b).unwrap(),
             Some(root_b)
         );
         assert_eq!(registry.topic_count_for(&root_a).unwrap(), 1);
@@ -101,16 +101,16 @@ fn restart_preserves_tenants_topics_and_messages() {
         let log_b = logs.get_or_open(&root_b, &topic_b).unwrap();
         let msgs_a = log_a.read_after(&[7u8; 32], None, 10).unwrap();
         let msgs_b = log_b.read_after(&[8u8; 32], None, 10).unwrap();
-        assert_eq!(msgs_a.len(), 1, "expected 1 message in tenant A's log");
-        assert_eq!(msgs_b.len(), 1, "expected 1 message in tenant B's log");
+        assert_eq!(msgs_a.len(), 1, "expected 1 message in fabric A's log");
+        assert_eq!(msgs_b.len(), 1, "expected 1 message in fabric B's log");
         assert_eq!(msgs_a[0].seq, 0);
         assert_eq!(msgs_b[0].seq, 0);
     } // Drop handles; simulate host process stop.
 
     // ========== SECOND SESSION: Restart and verify persistence ==========
     {
-        let registry = Arc::new(TenantRegistry::open(tmp_path.as_path()).unwrap());
-        let logs = Arc::new(PerTenantLogs::new(tmp_path.as_path()));
+        let registry = Arc::new(FabricRegistry::open(tmp_path.as_path()).unwrap());
+        let logs = Arc::new(PerFabricLogs::new(tmp_path.as_path()));
         let retention = Arc::new(Retention::new(tmp_path.as_path(), Arc::clone(&logs)));
         let rate = Arc::new(WriteRateLimiter::new(1_000_000));
         let router = Router::new(
@@ -125,36 +125,36 @@ fn restart_preserves_tenants_topics_and_messages() {
         let topic_a = [0x11u8; 32];
         let topic_b = [0x22u8; 32];
 
-        // Verify tenants survived restart.
+        // Verify fabrics survived restart.
         let rec_a = registry.get(&root_a).unwrap();
         let rec_b = registry.get(&root_b).unwrap();
-        assert!(rec_a.is_some(), "tenant A not found after restart");
-        assert!(rec_b.is_some(), "tenant B not found after restart");
+        assert!(rec_a.is_some(), "fabric A not found after restart");
+        assert!(rec_b.is_some(), "fabric B not found after restart");
         assert_eq!(rec_a.unwrap().registered_at, 1000);
         assert_eq!(rec_b.unwrap().registered_at, 1000);
 
         // Verify topic registrations survived.
         assert_eq!(
-            registry.lookup_topic_tenant(&topic_a).unwrap(),
+            registry.lookup_topic_fabric(&topic_a).unwrap(),
             Some(root_a),
-            "topic A not found for tenant A after restart"
+            "topic A not found for fabric A after restart"
         );
         assert_eq!(
-            registry.lookup_topic_tenant(&topic_b).unwrap(),
+            registry.lookup_topic_fabric(&topic_b).unwrap(),
             Some(root_b),
-            "topic B not found for tenant B after restart"
+            "topic B not found for fabric B after restart"
         );
 
         // Verify topic counts survived.
         assert_eq!(
             registry.topic_count_for(&root_a).unwrap(),
             1,
-            "tenant A should have 1 topic after restart"
+            "fabric A should have 1 topic after restart"
         );
         assert_eq!(
             registry.topic_count_for(&root_b).unwrap(),
             1,
-            "tenant B should have 1 topic after restart"
+            "fabric B should have 1 topic after restart"
         );
 
         // Verify persisted messages are present.
@@ -165,23 +165,23 @@ fn restart_preserves_tenants_topics_and_messages() {
         assert_eq!(
             msgs_a.len(),
             1,
-            "expected 1 message in tenant A's log after restart"
+            "expected 1 message in fabric A's log after restart"
         );
         assert_eq!(
             msgs_b.len(),
             1,
-            "expected 1 message in tenant B's log after restart"
+            "expected 1 message in fabric B's log after restart"
         );
         assert_eq!(msgs_a[0].seq, 0);
         assert_eq!(msgs_b[0].seq, 0);
         assert_eq!(&msgs_a[0].sender, &[7u8; 32]);
         assert_eq!(&msgs_b[0].sender, &[8u8; 32]);
 
-        // Test idempotent re-registration of tenant: insert_if_absent should
+        // Test idempotent re-registration of fabric: insert_if_absent should
         // return the original record if called again.
-        let new_rec = TenantRecord {
+        let new_rec = FabricRecord {
             registered_at: 2000, // Different timestamp.
-            status: TenantStatus::Suspended,
+            status: FabricStatus::Suspended,
             retention_budget_bytes: 1000,
         };
         let returned = registry.insert_if_absent(&root_a, new_rec).unwrap();
@@ -191,8 +191,8 @@ fn restart_preserves_tenants_topics_and_messages() {
         );
         assert_eq!(
             returned.status,
-            TenantStatus::Active,
-            "original tenant status should be preserved"
+            FabricStatus::Active,
+            "original fabric status should be preserved"
         );
 
         // Test idempotent re-registration of topic: register_topic called
@@ -227,8 +227,8 @@ fn retention_persists_across_restart() {
 
     // ========== FIRST SESSION: Exceed budget and trigger eviction ==========
     {
-        let registry = Arc::new(TenantRegistry::open(tmp_path.as_path()).unwrap());
-        let logs = Arc::new(PerTenantLogs::new(tmp_path.as_path()));
+        let registry = Arc::new(FabricRegistry::open(tmp_path.as_path()).unwrap());
+        let logs = Arc::new(PerFabricLogs::new(tmp_path.as_path()));
         let retention = Arc::new(Retention::new(tmp_path.as_path(), Arc::clone(&logs)));
         let rate = Arc::new(WriteRateLimiter::new(1_000_000));
 
@@ -243,9 +243,9 @@ fn retention_persists_across_restart() {
         registry
             .insert_if_absent(
                 &root,
-                TenantRecord {
+                FabricRecord {
                     registered_at: 0,
-                    status: TenantStatus::Active,
+                    status: FabricStatus::Active,
                     retention_budget_bytes: budget,
                 },
             )
@@ -290,8 +290,8 @@ fn retention_persists_across_restart() {
 
     // ========== SECOND SESSION: Restart and verify eviction state persisted ==========
     {
-        let registry = Arc::new(TenantRegistry::open(tmp_path.as_path()).unwrap());
-        let logs = Arc::new(PerTenantLogs::new(tmp_path.as_path()));
+        let registry = Arc::new(FabricRegistry::open(tmp_path.as_path()).unwrap());
+        let logs = Arc::new(PerFabricLogs::new(tmp_path.as_path()));
         let retention = Arc::new(Retention::new(tmp_path.as_path(), Arc::clone(&logs)));
         let rate = Arc::new(WriteRateLimiter::new(1_000_000));
         let router = Router::new(

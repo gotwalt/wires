@@ -75,7 +75,7 @@ mod tests {
         let res = first_reachable(
             &ep,
             &[],
-            b"/wires/tenant/0",
+            b"/wires/fabric/0",
             std::time::Duration::from_millis(50),
         )
         .await;

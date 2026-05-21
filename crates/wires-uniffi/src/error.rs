@@ -2,11 +2,11 @@
 //! Swift. Flat (no associated data on the Swift side) for v1: Swift sees the
 //! variant tag plus the Display string. Code-specific copy in alerts is
 //! achieved by substring-matching the Display string, which embeds the
-//! relevant `TenantErrorCode` / `PairRejectCode` value via Debug.
+//! relevant `FabricErrorCode` / `PairRejectCode` value via Debug.
 
 use snafu::{Location, Snafu};
+use wires_net::fabric::FabricErrorCode;
 use wires_net::pair::PairRejectCode;
-use wires_net::tenant::TenantErrorCode;
 
 #[derive(Debug, Snafu, uniffi::Error)]
 #[uniffi(flat_error)]
@@ -19,16 +19,16 @@ pub enum WiresError {
         location: Location,
     },
 
-    #[snafu(display("Tenant register stream failed: {message}, at {location}"))]
-    TenantStream {
+    #[snafu(display("Fabric register stream failed: {message}, at {location}"))]
+    FabricStream {
         message: String,
         #[snafu(implicit)]
         location: Location,
     },
 
-    #[snafu(display("Host rejected tenant register: {code:?}: {message}, at {location}"))]
-    TenantRejected {
-        code: TenantErrorCode,
+    #[snafu(display("Host rejected fabric register: {code:?}: {message}, at {location}"))]
+    FabricRejected {
+        code: FabricErrorCode,
         message: String,
         #[snafu(implicit)]
         location: Location,
@@ -43,7 +43,7 @@ pub enum WiresError {
 
     #[snafu(display("Host rejected topic register: {code:?}: {message}, at {location}"))]
     TopicRegisterRejected {
-        code: TenantErrorCode,
+        code: FabricErrorCode,
         message: String,
         #[snafu(implicit)]
         location: Location,
@@ -115,9 +115,9 @@ mod tests {
     }
 
     #[test]
-    fn tenant_rejected_carries_code_in_display() {
-        let e: WiresError = TenantRejectedSnafu {
-            code: TenantErrorCode::BadSignature,
+    fn fabric_rejected_carries_code_in_display() {
+        let e: WiresError = FabricRejectedSnafu {
+            code: FabricErrorCode::BadSignature,
             message: "nope".to_string(),
         }
         .build();

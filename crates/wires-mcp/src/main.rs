@@ -9,7 +9,7 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Cmd {
-    /// Run the gateway HTTPS service + tenant supervisor.
+    /// Run the gateway HTTPS service + fabric supervisor.
     Serve,
     /// List all registered users.
     UserList {
@@ -85,7 +85,7 @@ fn main() -> std::process::ExitCode {
                     return std::process::ExitCode::FAILURE;
                 }
             };
-            let supervisor = wires_mcp::tenants::TenantSupervisor::new(
+            let supervisor = wires_mcp::fabrics::FabricSupervisor::new(
                 cfg.users_dir(),
                 std::time::Duration::from_secs(600),
                 Some(retention_policy),

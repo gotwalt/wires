@@ -8,27 +8,27 @@ use ed25519_dalek::SigningKey;
 use iroh::SecretKey;
 use rand_core::OsRng;
 use tempfile::TempDir;
-use wires_host::per_tenant_logs::PerTenantLogs;
+use wires_host::fabric_registry::{FabricHandlerConfig, FabricHandlerImpl, FabricRegistry};
+use wires_host::per_fabric_logs::PerFabricLogs;
 use wires_host::retention::Retention;
-use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
 use wires_net::HostTicket;
-use wires_net::tenant::{ALPN as TENANT_ALPN, TenantProtocol};
+use wires_net::fabric::{ALPN as FABRIC_ALPN, FabricProtocol};
 
 #[tokio::test]
 async fn topic_register_round_trip() {
     let host_tmp = TempDir::new().unwrap();
-    let registry = Arc::new(TenantRegistry::open(host_tmp.path()).unwrap());
-    let logs = Arc::new(PerTenantLogs::new(host_tmp.path()));
+    let registry = Arc::new(FabricRegistry::open(host_tmp.path()).unwrap());
+    let logs = Arc::new(PerFabricLogs::new(host_tmp.path()));
     let retention = Arc::new(Retention::new(host_tmp.path(), Arc::clone(&logs)));
-    let host_ep = wires_net::bind_cloud(SecretKey::generate(), vec![TENANT_ALPN.to_vec()])
+    let host_ep = wires_net::bind_cloud(SecretKey::generate(), vec![FABRIC_ALPN.to_vec()])
         .await
         .unwrap();
     let host_eid: [u8; 32] = host_ep.id().as_bytes().to_owned();
-    let handler = Arc::new(TenantHandlerImpl {
+    let handler = Arc::new(FabricHandlerImpl {
         registry: Arc::clone(&registry),
         retention,
         host_endpoint_id: host_eid,
-        config: TenantHandlerConfig::default(),
+        config: FabricHandlerConfig::default(),
         now_ms: Arc::new(|| {
             use std::time::{SystemTime, UNIX_EPOCH};
             SystemTime::now()
@@ -38,10 +38,10 @@ async fn topic_register_round_trip() {
         }),
         on_topic_registered: Arc::new(|_, _| {}),
         on_topic_unregistered: Arc::new(|_, _| {}),
-        on_tenant_unregistered: Arc::new(|_, _| {}),
+        on_fabric_unregistered: Arc::new(|_, _| {}),
     });
     let _router = iroh::protocol::Router::builder(host_ep.clone())
-        .accept(TENANT_ALPN, TenantProtocol::new(handler))
+        .accept(FABRIC_ALPN, FabricProtocol::new(handler))
         .spawn();
 
     // Wait for the host endpoint to come online so socket addresses are
@@ -82,7 +82,7 @@ async fn topic_register_round_trip() {
         .unwrap();
     let root_pubkey = root.verifying_key().to_bytes();
     assert_eq!(
-        registry.lookup_topic_tenant(&topic).unwrap(),
+        registry.lookup_topic_fabric(&topic).unwrap(),
         Some(root_pubkey)
     );
 
@@ -90,5 +90,5 @@ async fn topic_register_round_trip() {
     wires_cli::cmd::host::topic_unregister(agent_dir.path(), &hex::encode(topic))
         .await
         .unwrap();
-    assert!(registry.lookup_topic_tenant(&topic).unwrap().is_none());
+    assert!(registry.lookup_topic_fabric(&topic).unwrap().is_none());
 }

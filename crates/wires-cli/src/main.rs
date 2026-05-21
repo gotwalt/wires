@@ -149,12 +149,10 @@ enum HostCmd {
     /// Unregister a topic: the host stops persisting new envelopes (existing
     /// data is retained until eviction).
     TopicUnregister { topic: String },
-    /// Unregister this fabric from the host: the host drops its tenant record,
-    /// every topic_index entry for this root, and the on-disk tenant directory.
-    /// ("Tenant" is the host-internal name for this fabric's footprint; see
-    /// `CLAUDE.md`'s vocabulary section.) Clears the local `config.toml` host
-    /// block on success.
-    TenantUnregister {
+    /// Unregister this fabric from the host: the host drops its fabric record,
+    /// every topic_index entry for this root, and the on-disk fabric directory.
+    /// Clears the local `config.toml` host block on success.
+    FabricUnregister {
         /// Skip the interactive confirmation prompt.
         #[arg(long)]
         yes: bool,
@@ -210,8 +208,8 @@ async fn main() -> std::process::ExitCode {
         Cmd::Host(HostCmd::TopicUnregister { topic }) => {
             cmd::host::topic_unregister(&data_dir, &topic).await
         }
-        Cmd::Host(HostCmd::TenantUnregister { yes }) => {
-            cmd::host::tenant_unregister(&data_dir, yes).await
+        Cmd::Host(HostCmd::FabricUnregister { yes }) => {
+            cmd::host::fabric_unregister(&data_dir, yes).await
         }
         Cmd::Host(HostCmd::Status) => cmd::host::status(&data_dir).await,
         Cmd::PairListen {

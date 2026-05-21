@@ -1,5 +1,5 @@
 //! Integration test: handle_status returns real topic_count, bytes_stored,
-//! and oldest_retained_at after a tenant registers a topic and routes messages.
+//! and oldest_retained_at after a fabric registers a topic and routes messages.
 
 use std::sync::Arc;
 
@@ -7,12 +7,12 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
 use tempfile::TempDir;
 use wires_core::{MessageKind, WireMessage};
-use wires_host::per_tenant_logs::PerTenantLogs;
+use wires_host::fabric_registry::{FabricHandlerConfig, FabricHandlerImpl, FabricRegistry};
+use wires_host::per_fabric_logs::PerFabricLogs;
 use wires_host::retention::Retention;
 use wires_host::routing::{Router, WriteRateLimiter};
-use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
-use wires_net::tenant::{
-    TenantHandler, TenantOp, TenantRegisterRequest, TenantResponse, TenantStatusRequest,
+use wires_net::fabric::{
+    FabricHandler, FabricOp, FabricRegisterRequest, FabricResponse, FabricStatusRequest,
     TopicRegisterRequest, signing_bytes,
 };
 
@@ -35,8 +35,8 @@ fn mk_msg(topic: [u8; 32], sender: [u8; 32], seq: u64, timestamp: i64) -> WireMe
 #[test]
 fn handle_status_returns_real_values() {
     let tmp = TempDir::new().unwrap();
-    let registry = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
-    let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+    let registry = Arc::new(FabricRegistry::open(tmp.path()).unwrap());
+    let logs = Arc::new(PerFabricLogs::new(tmp.path()));
     let retention = Arc::new(Retention::new(tmp.path(), Arc::clone(&logs)));
     let rate = Arc::new(WriteRateLimiter::new(1_000_000));
 
@@ -46,28 +46,28 @@ fn handle_status_returns_real_values() {
     let signing_key = SigningKey::generate(&mut OsRng);
     let root_pubkey = signing_key.verifying_key().to_bytes();
 
-    let handler = TenantHandlerImpl {
+    let handler = FabricHandlerImpl {
         registry: Arc::clone(&registry),
         retention: Arc::clone(&retention),
         host_endpoint_id,
-        config: TenantHandlerConfig::default(),
+        config: FabricHandlerConfig::default(),
         now_ms: Arc::new(move || now_ms),
         on_topic_registered: Arc::new(|_, _| {}),
         on_topic_unregistered: Arc::new(|_, _| {}),
-        on_tenant_unregistered: Arc::new(|_, _| {}),
+        on_fabric_unregistered: Arc::new(|_, _| {}),
     };
 
-    // 1. Register the tenant.
+    // 1. Register the fabric.
     let nonce1 = [0x01u8; 16];
     let reg_bytes = signing_bytes(
-        TenantOp::Register,
+        FabricOp::Register,
         &root_pubkey,
         now_ms,
         &nonce1,
         &host_endpoint_id,
     );
     let reg_sig = signing_key.sign(&reg_bytes).to_bytes();
-    let reg_resp = handler.handle_register(TenantRegisterRequest {
+    let reg_resp = handler.handle_register(FabricRegisterRequest {
         version: 1,
         root_pubkey,
         timestamp: now_ms,
@@ -75,7 +75,7 @@ fn handle_status_returns_real_values() {
         signature: reg_sig,
     });
     match reg_resp {
-        TenantResponse::Register(r) => assert!(r.ok),
+        FabricResponse::Register(r) => assert!(r.ok),
         other => panic!("expected Register OK, got {:?}", other),
     }
 
@@ -83,7 +83,7 @@ fn handle_status_returns_real_values() {
     let topic = [0x55u8; 32];
     let nonce2 = [0x02u8; 16];
     let topic_reg_bytes = signing_bytes(
-        TenantOp::TopicRegister(&topic),
+        FabricOp::TopicRegister(&topic),
         &root_pubkey,
         now_ms,
         &nonce2,
@@ -99,7 +99,7 @@ fn handle_status_returns_real_values() {
         signature: topic_reg_sig,
     });
     match topic_resp {
-        TenantResponse::TopicRegister(r) => assert!(r.ok),
+        FabricResponse::TopicRegister(r) => assert!(r.ok),
         other => panic!("expected TopicRegister OK, got {:?}", other),
     }
 
@@ -121,14 +121,14 @@ fn handle_status_returns_real_values() {
     // 4. Query status.
     let nonce3 = [0x03u8; 16];
     let status_bytes = signing_bytes(
-        TenantOp::Status,
+        FabricOp::Status,
         &root_pubkey,
         now_ms,
         &nonce3,
         &host_endpoint_id,
     );
     let status_sig = signing_key.sign(&status_bytes).to_bytes();
-    let status_resp = handler.handle_status(TenantStatusRequest {
+    let status_resp = handler.handle_status(FabricStatusRequest {
         version: 1,
         root_pubkey,
         timestamp: now_ms,
@@ -137,7 +137,7 @@ fn handle_status_returns_real_values() {
     });
 
     match status_resp {
-        TenantResponse::Status(s) => {
+        FabricResponse::Status(s) => {
             // handle_register auto-creates the caps topic, so topic_count includes
             // the caps topic (1) plus our explicit topic (1) = 2.
             assert_eq!(
@@ -162,8 +162,8 @@ fn handle_status_returns_real_values() {
 #[test]
 fn handle_status_zero_when_no_messages() {
     let tmp = TempDir::new().unwrap();
-    let registry = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
-    let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+    let registry = Arc::new(FabricRegistry::open(tmp.path()).unwrap());
+    let logs = Arc::new(PerFabricLogs::new(tmp.path()));
     let retention = Arc::new(Retention::new(tmp.path(), Arc::clone(&logs)));
 
     let now_ms = 3_000_000i64;
@@ -172,28 +172,28 @@ fn handle_status_zero_when_no_messages() {
     let signing_key = SigningKey::generate(&mut OsRng);
     let root_pubkey = signing_key.verifying_key().to_bytes();
 
-    let handler = TenantHandlerImpl {
+    let handler = FabricHandlerImpl {
         registry: Arc::clone(&registry),
         retention: Arc::clone(&retention),
         host_endpoint_id,
-        config: TenantHandlerConfig::default(),
+        config: FabricHandlerConfig::default(),
         now_ms: Arc::new(move || now_ms),
         on_topic_registered: Arc::new(|_, _| {}),
         on_topic_unregistered: Arc::new(|_, _| {}),
-        on_tenant_unregistered: Arc::new(|_, _| {}),
+        on_fabric_unregistered: Arc::new(|_, _| {}),
     };
 
-    // Register tenant only — no messages routed.
+    // Register fabric only — no messages routed.
     let nonce1 = [0x11u8; 16];
     let reg_bytes = signing_bytes(
-        TenantOp::Register,
+        FabricOp::Register,
         &root_pubkey,
         now_ms,
         &nonce1,
         &host_endpoint_id,
     );
     let reg_sig = signing_key.sign(&reg_bytes).to_bytes();
-    handler.handle_register(TenantRegisterRequest {
+    handler.handle_register(FabricRegisterRequest {
         version: 1,
         root_pubkey,
         timestamp: now_ms,
@@ -203,14 +203,14 @@ fn handle_status_zero_when_no_messages() {
 
     let nonce2 = [0x22u8; 16];
     let status_bytes = signing_bytes(
-        TenantOp::Status,
+        FabricOp::Status,
         &root_pubkey,
         now_ms,
         &nonce2,
         &host_endpoint_id,
     );
     let status_sig = signing_key.sign(&status_bytes).to_bytes();
-    let status_resp = handler.handle_status(TenantStatusRequest {
+    let status_resp = handler.handle_status(FabricStatusRequest {
         version: 1,
         root_pubkey,
         timestamp: now_ms,
@@ -219,7 +219,7 @@ fn handle_status_zero_when_no_messages() {
     });
 
     match status_resp {
-        TenantResponse::Status(s) => {
+        FabricResponse::Status(s) => {
             assert_eq!(s.bytes_stored, 0);
             assert_eq!(s.oldest_retained_at, 0);
         }

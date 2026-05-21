@@ -1,15 +1,15 @@
-//! Two tenants register, each registers a distinct topic, each publishes
-//! through the router. On-disk per-tenant directories are populated and
+//! Two fabrics register, each registers a distinct topic, each publishes
+//! through the router. On-disk per-fabric directories are populated and
 //! do not cross-contaminate.
 
 use std::sync::Arc;
 
 use tempfile::TempDir;
 use wires_core::{MessageKind, WireMessage};
-use wires_host::per_tenant_logs::PerTenantLogs;
+use wires_host::fabric_registry::{FabricRecord, FabricRegistry, FabricStatus};
+use wires_host::per_fabric_logs::PerFabricLogs;
 use wires_host::retention::Retention;
 use wires_host::routing::{Router, WriteRateLimiter};
-use wires_host::tenant_registry::{TenantRecord, TenantRegistry, TenantStatus};
 
 fn mk_msg(topic: [u8; 32], sender: u8, seq: u64) -> WireMessage {
     WireMessage {
@@ -28,10 +28,10 @@ fn mk_msg(topic: [u8; 32], sender: u8, seq: u64) -> WireMessage {
 }
 
 #[test]
-fn two_tenants_isolated() {
+fn two_fabrics_isolated() {
     let tmp = TempDir::new().unwrap();
-    let registry = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
-    let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+    let registry = Arc::new(FabricRegistry::open(tmp.path()).unwrap());
+    let logs = Arc::new(PerFabricLogs::new(tmp.path()));
     let retention = Arc::new(Retention::new(tmp.path(), Arc::clone(&logs)));
     let rate = Arc::new(WriteRateLimiter::new(1_000_000));
     let router = Router::new(
@@ -49,9 +49,9 @@ fn two_tenants_isolated() {
         registry
             .insert_if_absent(
                 &r,
-                TenantRecord {
+                FabricRecord {
                     registered_at: 0,
-                    status: TenantStatus::Active,
+                    status: FabricStatus::Active,
                     retention_budget_bytes: u64::MAX,
                 },
             )
@@ -62,8 +62,8 @@ fn two_tenants_isolated() {
     router.route(&mk_msg(topic_a, 7, 0)).unwrap();
     router.route(&mk_msg(topic_b, 8, 0)).unwrap();
 
-    let dir_a = tmp.path().join("tenants").join(hex::encode(root_a));
-    let dir_b = tmp.path().join("tenants").join(hex::encode(root_b));
+    let dir_a = tmp.path().join("fabrics").join(hex::encode(root_a));
+    let dir_b = tmp.path().join("fabrics").join(hex::encode(root_b));
     assert!(
         dir_a
             .join(format!("log_{}.redb", hex::encode(topic_a)))

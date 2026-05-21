@@ -26,7 +26,7 @@ pub struct NodeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostConfig {
     /// Peer hints harvested from discovery or an invite token. Tried in order
-    /// when bootstrapping gossip and when dialing the tenant/replay ALPNs.
+    /// when bootstrapping gossip and when dialing the fabric and replay ALPNs.
     pub peer_hints: Vec<PeerHint>,
 }
 

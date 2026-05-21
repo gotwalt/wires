@@ -1,4 +1,4 @@
-//! Length-prefixed JSON framing shared between replay and tenant protocols.
+//! Length-prefixed JSON framing shared between replay and fabric protocols.
 //!
 //! Frame: `[u32 BE length][serde_json bytes]`. Length is the number of bytes
 //! that follow, capped per-call by the caller.

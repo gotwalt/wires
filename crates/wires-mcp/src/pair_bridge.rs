@@ -19,8 +19,8 @@ use wires_node::{Node, NodeConfig};
 use x25519_dalek::{PublicKey as XPub, StaticSecret as XSecret};
 
 use crate::error::{IoSnafu, OpenRuntimeSnafu, Result};
+use crate::fabrics::FabricSupervisor;
 use crate::store::{AuthCodeRecord, AuthSessionKind, PendingPairRecord, UserRecord};
-use crate::tenants::TenantSupervisor;
 
 /// Default 5-minute pair TTL, matching the spec.
 pub const PAIR_TTL: Duration = Duration::from_secs(300);
@@ -41,7 +41,7 @@ pub struct PairBridge {
     pending_pairs_dir: PathBuf,
     public_url: String,
     store: crate::store::Store,
-    supervisor: TenantSupervisor,
+    supervisor: FabricSupervisor,
     routers: Arc<parking_lot::Mutex<HashMap<String, RouterSlot>>>,
 }
 
@@ -51,7 +51,7 @@ pub struct PairBridge {
 #[derive(Clone)]
 pub(crate) struct PairBridgeHandle {
     store: crate::store::Store,
-    supervisor: TenantSupervisor,
+    supervisor: FabricSupervisor,
     users_dir: PathBuf,
     pending_dir: PathBuf,
     routers: Arc<parking_lot::Mutex<HashMap<String, RouterSlot>>>,
@@ -175,7 +175,7 @@ impl PairBridge {
         pending_pairs_dir: PathBuf,
         public_url: String,
         store: crate::store::Store,
-        supervisor: TenantSupervisor,
+        supervisor: FabricSupervisor,
     ) -> Self {
         Self {
             pending_pairs_dir,
@@ -414,7 +414,7 @@ mod tests {
             retention: None,
         };
         let store = Store::open(&cfg.gateway_db_path()).unwrap();
-        let supervisor = TenantSupervisor::new(cfg.users_dir(), Duration::from_secs(60), None);
+        let supervisor = FabricSupervisor::new(cfg.users_dir(), Duration::from_secs(60), None);
         let pending_dir = cfg.pending_pairs_dir().join(session_id);
         std::fs::create_dir_all(&pending_dir).unwrap();
 
@@ -573,7 +573,7 @@ mod tests {
             retention: None,
         };
         let store = Store::open(&cfg.gateway_db_path()).unwrap();
-        let supervisor = TenantSupervisor::new(cfg.users_dir(), Duration::from_secs(60), None);
+        let supervisor = FabricSupervisor::new(cfg.users_dir(), Duration::from_secs(60), None);
         let bridge = PairBridge::new(
             cfg.pending_pairs_dir(),
             cfg.public_url.clone(),

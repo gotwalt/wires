@@ -1,5 +1,5 @@
-//! Per-tenant retention manager. Tracks an IngestIndex per tenant and applies
-//! FIFO eviction against `PerTenantLogs` when the tenant's stored bytes exceed
+//! Per-fabric retention manager. Tracks an IngestIndex per fabric and applies
+//! FIFO eviction against `PerFabricLogs` when the fabric's stored bytes exceed
 //! its budget.
 
 use std::collections::HashMap;
@@ -10,16 +10,16 @@ use snafu::ResultExt as _;
 use wires_store::{IngestEntry, IngestIndex, open_ingest_index};
 
 use crate::error::{Result, RetentionEvictionFailedSnafu, StoreSnafu};
-use crate::per_tenant_logs::PerTenantLogs;
+use crate::per_fabric_logs::PerFabricLogs;
 
 pub struct Retention {
     root: PathBuf,
     indices: RwLock<HashMap<[u8; 32], Arc<IngestIndex>>>,
-    logs: Arc<PerTenantLogs>,
+    logs: Arc<PerFabricLogs>,
 }
 
 impl Retention {
-    pub fn new(root: &Path, logs: Arc<PerTenantLogs>) -> Self {
+    pub fn new(root: &Path, logs: Arc<PerFabricLogs>) -> Self {
         Self {
             root: root.to_path_buf(),
             indices: RwLock::new(HashMap::new()),
@@ -34,7 +34,7 @@ impl Retention {
                 return Ok(Arc::clone(idx));
             }
         }
-        let dir = self.root.join("tenants").join(hex::encode(root_pubkey));
+        let dir = self.root.join("fabrics").join(hex::encode(root_pubkey));
         std::fs::create_dir_all(&dir).ok();
         let db = open_ingest_index(&dir, &hex::encode(root_pubkey)).context(StoreSnafu)?;
         let idx = Arc::new(IngestIndex::new(Arc::new(db)));
@@ -85,9 +85,9 @@ impl Retention {
     }
 
     /// Returns the host-side timestamp (ms) of the oldest retained message
-    /// for this tenant, by reading the oldest IngestEntry, looking up the
+    /// for this fabric, by reading the oldest IngestEntry, looking up the
     /// matching WireMessage, and returning its `timestamp`. Returns 0 if no
-    /// entries exist for this tenant.
+    /// entries exist for this fabric.
     pub fn oldest_retained_at(&self, root_pubkey: &[u8; 32]) -> Result<i64> {
         let idx = self.index_for(root_pubkey)?;
         let oldest = idx.oldest_entry().context(StoreSnafu)?;
@@ -101,9 +101,9 @@ impl Retention {
         Ok(msgs.first().map(|m| m.timestamp).unwrap_or(0))
     }
 
-    /// Drop the cached `IngestIndex` for this tenant. The caller is responsible
-    /// for then deleting `tenants/<root_pubkey_hex>/` on disk.
-    pub fn clear_tenant(&self, root_pubkey: &[u8; 32]) {
+    /// Drop the cached `IngestIndex` for this fabric. The caller is responsible
+    /// for then deleting `fabrics/<root_pubkey_hex>/` on disk.
+    pub fn clear_fabric(&self, root_pubkey: &[u8; 32]) {
         let mut map = self.indices.write().unwrap();
         map.remove(root_pubkey);
     }
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn eviction_drops_oldest_when_over_budget() {
         let tmp = TempDir::new().unwrap();
-        let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+        let logs = Arc::new(PerFabricLogs::new(tmp.path()));
         let retention = Retention::new(tmp.path(), Arc::clone(&logs));
         let root = [1u8; 32];
         let topic = [9u8; 32];
@@ -178,15 +178,15 @@ mod tests {
     }
 
     #[test]
-    fn clear_tenant_drops_cached_index() {
+    fn clear_fabric_drops_cached_index() {
         let tmp = TempDir::new().unwrap();
-        let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+        let logs = Arc::new(PerFabricLogs::new(tmp.path()));
         let retention = Retention::new(tmp.path(), Arc::clone(&logs));
         let root_a = [1u8; 32];
         let root_b = [2u8; 32];
         let topic = [9u8; 32];
 
-        // Force index creation for both tenants.
+        // Force index creation for both fabrics.
         retention
             .on_append(&root_a, &topic, &[7u8; 32], 0, 100, u64::MAX)
             .unwrap();
@@ -194,7 +194,7 @@ mod tests {
             .on_append(&root_b, &topic, &[7u8; 32], 0, 100, u64::MAX)
             .unwrap();
         assert_eq!(retention.cache_len(), 2);
-        retention.clear_tenant(&root_a);
+        retention.clear_fabric(&root_a);
         assert_eq!(retention.cache_len(), 1);
     }
 }

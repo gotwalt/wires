@@ -28,7 +28,7 @@ pub const EPOCH_KEYS: TableDefinition<u32, &[u8]> = TableDefinition::new("epoch_
 /// Meta key/value (e.g. topic name).
 pub const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 
-/// Per-tenant FIFO index over ingested messages. Key = u64 BE ingest_seq.
+/// Per-fabric FIFO index over ingested messages. Key = u64 BE ingest_seq.
 /// Value layout (84 bytes):
 ///   [0..32]  topic_id
 ///   [32..64] sender

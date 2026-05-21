@@ -1,4 +1,4 @@
-//! Publishing enough bytes for a tenant to exceed its retention budget causes
+//! Publishing enough bytes for a fabric to exceed its retention budget causes
 //! the oldest messages to be evicted; the underlying log reads return only
 //! the surviving suffix.
 
@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 use wires_core::{MessageKind, WireMessage};
-use wires_host::per_tenant_logs::PerTenantLogs;
+use wires_host::fabric_registry::{FabricRecord, FabricRegistry, FabricStatus};
+use wires_host::per_fabric_logs::PerFabricLogs;
 use wires_host::retention::Retention;
 use wires_host::routing::{Router, WriteRateLimiter};
-use wires_host::tenant_registry::{TenantRecord, TenantRegistry, TenantStatus};
 
 fn mk_msg(topic: [u8; 32], sender: u8, seq: u64, payload_size: usize) -> WireMessage {
     WireMessage {
@@ -30,8 +30,8 @@ fn mk_msg(topic: [u8; 32], sender: u8, seq: u64, payload_size: usize) -> WireMes
 #[test]
 fn retention_eviction_drops_oldest_first() {
     let tmp = TempDir::new().unwrap();
-    let registry = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
-    let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+    let registry = Arc::new(FabricRegistry::open(tmp.path()).unwrap());
+    let logs = Arc::new(PerFabricLogs::new(tmp.path()));
     let retention = Arc::new(Retention::new(tmp.path(), Arc::clone(&logs)));
     let rate = Arc::new(WriteRateLimiter::new(1_000_000));
 
@@ -44,9 +44,9 @@ fn retention_eviction_drops_oldest_first() {
     registry
         .insert_if_absent(
             &root,
-            TenantRecord {
+            FabricRecord {
                 registered_at: 0,
-                status: TenantStatus::Active,
+                status: FabricStatus::Active,
                 retention_budget_bytes: budget,
             },
         )
