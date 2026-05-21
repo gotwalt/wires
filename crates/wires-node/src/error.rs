@@ -122,6 +122,14 @@ pub enum NodeError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Decrypt channel envelope failed on topic {topic_id_hex}, at {location}"))]
+    ChannelDecrypt {
+        topic_id_hex: String,
+        #[snafu(source)]
+        source: wires_crypto::CryptoError,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = NodeError> = core::result::Result<T, E>;
