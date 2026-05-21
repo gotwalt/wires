@@ -3,17 +3,11 @@
 use std::path::Path;
 
 use snafu::ResultExt;
-use wires_core::CanonicalContent;
 use wires_core::Capability;
 use wires_core::cap::Right;
-use wires_core::channel::schemas::{ChannelInvite, TYPE_INVITE};
 use wires_core::channel::types::MemberKind;
-use wires_core::wire::MessageKind;
 use wires_net::unix_now_ms;
-use wires_node::{
-    KeyingMaterial, Node, NodeConfig, PublishParams, build_message, load_root_signing_key,
-    upsert_topic_names,
-};
+use wires_node::{Node, NodeConfig, load_root_signing_key, upsert_topic_names};
 
 use crate::cmd::publish_helpers::find_write_cap_for;
 use crate::error::{CoreSnafu, IoSnafu, NodeSnafu, Result, StoreSnafu, TomlParseSnafu};
@@ -217,45 +211,8 @@ pub async fn invite(data_dir: &Path, name: &str, agent_pubkey_hex: &str) -> Resu
         .ok_or_else(|| invalid!("no epoch key for {topic_name}",))?;
     let now = unix_now_ms();
 
-    // Publish FIRST: sealed __topic.history_grant to the invitee.
-    let grant_canonical =
-        CanonicalContent::new("__topic.history_grant", "epoch key for new member").with_data(
-            serde_json::json!({
-                "epoch": 0,
-                "key_hex": hex::encode(key),
-            }),
-        );
-    let (seq, prev_hash) = node.next_seq_and_prev_hash(&topic_id).context(NodeSnafu)?;
-    let grant_params = PublishParams {
-        topic_id,
-        sender_sk: &node.ed_sk,
-        cap_id,
-        kind: MessageKind::SealedTo(agent),
-        content: grant_canonical,
-        epoch: 0,
-        seq,
-        prev_hash,
-        timestamp: now,
-        keying: KeyingMaterial::SealedRecipient(&agent),
-    };
-    let grant_msg = build_message(&grant_params).context(NodeSnafu)?;
-    node.append_local(&grant_msg).context(NodeSnafu)?;
-
-    // THEN: public __channel.invite.
-    let invite_value = serde_json::to_value(&ChannelInvite {
-        agent,
-        invited_at: now,
-    })
-    .map_err(|e| invalid!("serialize __channel.invite: {e}", e = e))?;
-    publish_public(
-        &node,
-        topic_id,
-        cap_id,
-        TYPE_INVITE,
-        &format!("invited {agent_pubkey_hex}"),
-        invite_value,
-        now,
-    )?;
+    wires_node::channel::invite_member(&node, topic_id, cap_id, agent, &key, now)
+        .context(NodeSnafu)?;
 
     println!("Invited {agent_pubkey_hex} to {topic_name}");
     Ok(())

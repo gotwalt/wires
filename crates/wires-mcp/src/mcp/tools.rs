@@ -15,7 +15,8 @@ pub fn list_descriptors() -> Value {
         {"name": "wires_tail",              "description": "Read recent messages from a topic",                  "inputSchema": {"type":"object","properties":{"topic":{"type":"string"},"since":{"type":"string"},"limit":{"type":"integer"}},"required":["topic"]}},
         {"name": "wires_list_channels",     "description": "List channels (named + DMs) this agent is in",       "inputSchema": {"type":"object","properties":{}}},
         {"name": "wires_create_channel",    "description": "Create a named channel",                             "inputSchema": {"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"}},"required":["name"]}},
-        {"name": "wires_channel_members",   "description": "Return the roster (members + pending) of a channel", "inputSchema": {"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}
+        {"name": "wires_channel_members",   "description": "Return the roster (members + pending) of a channel", "inputSchema": {"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
+        {"name": "wires_invite_to_channel", "description": "Invite an agent to a named channel",                 "inputSchema": {"type":"object","properties":{"name":{"type":"string"},"agent_pubkey":{"type":"string"}},"required":["name","agent_pubkey"]}}
     ]})
 }
 
@@ -629,6 +630,80 @@ async fn channel_members_tool(
     Ok(serde_json::json!({"content": [{"type": "text", "text": text}], "isError": false}))
 }
 
+// ── invite_to_channel ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+struct InviteToChannelArgs {
+    name: String,
+    agent_pubkey: String,
+}
+
+async fn invite_to_channel_tool(
+    state: &ServiceState,
+    claims: &Claims,
+    args: InviteToChannelArgs,
+) -> Result<Value, JsonRpcError> {
+    let runtime = state
+        .supervisor
+        .get_or_open(&claims.sub)
+        .await
+        .map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("unknown_user: {e}"),
+        })?;
+    let topic_name = if args.name.starts_with("channels.") {
+        args.name.clone()
+    } else {
+        format!("channels.{}", args.name)
+    };
+    let agent_bytes = match hex::decode(&args.agent_pubkey) {
+        Ok(b) => b,
+        Err(e) => return Ok(error_result(&format!("agent_pubkey not hex: {e}"))),
+    };
+    let agent: [u8; 32] = match agent_bytes.try_into() {
+        Ok(a) => a,
+        Err(_) => return Ok(error_result("agent_pubkey must be 32 bytes")),
+    };
+    let topic_id = match wires_node::resolve_topic(&runtime.node.config.data_dir, &topic_name) {
+        Ok(t) => t,
+        Err(e) => return Ok(error_result(&format!("topic_not_found: {e}"))),
+    };
+    let cap_id = match wires_node::channel::find_cap_for(
+        &runtime.node,
+        &topic_name,
+        wires_core::Right::Write,
+    ) {
+        Some(id) => id,
+        None => {
+            return Ok(error_result(&format!(
+                "permission_denied: no cap covers '{topic_name}'"
+            )));
+        }
+    };
+    let keys = match runtime.node.epoch_keys_for(&topic_id) {
+        Ok(k) => k,
+        Err(e) => return Ok(error_result(&format!("epoch_keys: {e}"))),
+    };
+    let (_epoch, key) = match keys.latest() {
+        Ok(Some(pair)) => pair,
+        Ok(None) => return Ok(error_result(&format!("no epoch key for {topic_name}"))),
+        Err(e) => return Ok(error_result(&format!("epoch_keys.latest: {e}"))),
+    };
+    let now = wires_net::unix_now_ms();
+    if let Err(e) =
+        wires_node::channel::invite_member(&runtime.node, topic_id, cap_id, agent, &key, now)
+    {
+        return Ok(error_result(&format!("invite_member: {e}")));
+    }
+    let out =
+        serde_json::json!({"ok": true, "topic_id": hex::encode(topic_id), "name": topic_name});
+    let text = serde_json::to_string(&out).map_err(|e| JsonRpcError {
+        code: -32000,
+        message: e.to_string(),
+    })?;
+    Ok(serde_json::json!({"content": [{"type": "text", "text": text}], "isError": false}))
+}
+
 fn encode_cursor(prev: &TailCursor, msgs: &[wires_node::DecryptedMessage]) -> String {
     let mut cur = prev.clone();
     for m in msgs {
@@ -683,6 +758,14 @@ pub async fn call(
                     message: format!("invalid arguments: {e}"),
                 })?;
             channel_members_tool(&state, claims, args).await
+        }
+        "wires_invite_to_channel" => {
+            let args: InviteToChannelArgs =
+                serde_json::from_value(p.arguments).map_err(|e| JsonRpcError {
+                    code: -32602,
+                    message: format!("invalid arguments: {e}"),
+                })?;
+            invite_to_channel_tool(&state, claims, args).await
         }
         other => Err(JsonRpcError {
             code: -32601,
