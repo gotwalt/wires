@@ -282,6 +282,31 @@ impl Node {
         Ok(())
     }
 
+    /// Read the next (seq, prev_hash) for `topic_id` from this agent's local log,
+    /// suitable for constructing a `PublishParams` directly (rather than going
+    /// through `publish_standard`).
+    pub fn next_seq_and_prev_hash(&self, topic_id: &[u8; 32]) -> Result<(u64, [u8; 32])> {
+        let log = self.logs.get_or_open(topic_id)?;
+        let sender_pk = self.ed_sk.verifying_key().to_bytes();
+        next_seq_and_prev_hash(&log, &sender_pk)
+    }
+
+    /// Append a locally-built `WireMessage` to its topic log. Used by `wires-cli`
+    /// channel/dm commands that build envelopes via `publish::build_message`
+    /// instead of going through `publish_standard`.
+    pub fn append_local(&self, msg: &wires_core::WireMessage) -> Result<()> {
+        let log = self.logs.get_or_open(&msg.topic_id)?;
+        log.append(msg).context(StoreSnafu)?;
+        Ok(())
+    }
+
+    /// Open the per-topic log handle for the channel command surface. Equivalent
+    /// to `self.logs.get_or_open(topic_id)` but doesn't expose `TopicLogs` to
+    /// callers in the upper layer.
+    pub fn open_topic_log(&self, topic_id: &[u8; 32]) -> Result<Arc<wires_store::TopicLog>> {
+        self.logs.get_or_open(topic_id)
+    }
+
     /// Apply the configured retention policy: evict TTL-expired entries from
     /// the ingest index and (if a byte budget is set) evict oldest entries
     /// until the user is under budget. For each dropped entry, deletes the

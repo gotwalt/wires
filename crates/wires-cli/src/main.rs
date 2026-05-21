@@ -27,6 +27,9 @@ enum Cmd {
     /// Topic management
     #[command(subcommand)]
     Topic(TopicCmd),
+    /// Channel management (spec: wires-channels-design)
+    #[command(subcommand)]
+    Channel(ChannelCmd),
     /// Publish a message to a topic
     Publish {
         #[arg(long)]
@@ -92,6 +95,16 @@ enum TopicCmd {
 }
 
 #[derive(Subcommand)]
+enum ChannelCmd {
+    /// Create a named channel.
+    Create {
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum HostCmd {
     /// Pair with a host: decode a HostTicket, register this tenant (signed by
     /// your local root key), persist the host info.
@@ -131,6 +144,9 @@ async fn main() -> std::process::ExitCode {
         Cmd::Init { new_root } => cmd::init::run(&data_dir, new_root).await,
         Cmd::Status => cmd::status::run(&data_dir).await,
         Cmd::Topic(TopicCmd::Create { name }) => cmd::topic::create(&data_dir, &name).await,
+        Cmd::Channel(ChannelCmd::Create { name, description }) => {
+            cmd::channel::create(&data_dir, &name, description.as_deref()).await
+        }
         Cmd::Publish {
             topic,
             cap,

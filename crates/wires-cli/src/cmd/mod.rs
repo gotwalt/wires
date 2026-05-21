@@ -1,4 +1,5 @@
 pub mod cat;
+pub mod channel;
 pub mod host;
 pub mod init;
 pub mod pair_approve;
