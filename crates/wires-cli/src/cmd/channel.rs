@@ -8,7 +8,7 @@ use wires_core::CanonicalContent;
 use wires_core::Capability;
 use wires_core::cap::Right;
 use wires_core::channel::schemas::{
-    ChannelCreate, ChannelMemberMeta, TYPE_CREATE, TYPE_MEMBER_META,
+    ChannelCreate, ChannelInvite, ChannelMemberMeta, TYPE_CREATE, TYPE_INVITE, TYPE_MEMBER_META,
 };
 use wires_core::channel::types::MemberKind;
 use wires_core::wire::MessageKind;
@@ -223,5 +223,74 @@ pub async fn members(data_dir: &Path, name: &str) -> Result<()> {
             println!("{}  (no meta yet)", hex::encode(pk));
         }
     }
+    Ok(())
+}
+
+pub async fn invite(data_dir: &Path, name: &str, agent_pubkey_hex: &str) -> Result<()> {
+    let topic_name = if name.starts_with("channels.") {
+        name.to_string()
+    } else {
+        format!("channels.{name}")
+    };
+    let agent_bytes =
+        hex::decode(agent_pubkey_hex).map_err(|e| invalid!("agent pubkey not hex: {e}", e = e))?;
+    let agent: [u8; 32] = agent_bytes
+        .try_into()
+        .map_err(|_| invalid!("agent pubkey must be 32 bytes",))?;
+
+    let raw = std::fs::read_to_string(data_dir.join("config.toml")).context(IoSnafu)?;
+    let cfg: NodeConfig = toml::from_str(&raw).context(TomlParseSnafu)?;
+    let node = Node::open(cfg).context(NodeSnafu)?;
+    let topic_id = wires_node::resolve_topic(data_dir, &topic_name).context(IoSnafu)?;
+    let cap_id = find_write_cap_for(&node, &topic_name)
+        .ok_or_else(|| invalid!("no cap covers '{topic_name}'",))?;
+    let keys = node.epoch_keys_for(&topic_id).context(NodeSnafu)?;
+    let (_epoch, key) = keys
+        .latest()
+        .context(StoreSnafu)?
+        .ok_or_else(|| invalid!("no epoch key for {topic_name}",))?;
+    let now = unix_now_ms();
+
+    // Publish FIRST: sealed __topic.history_grant to the invitee.
+    let grant_canonical =
+        CanonicalContent::new("__topic.history_grant", "epoch key for new member").with_data(
+            serde_json::json!({
+                "epoch": 0,
+                "key_hex": hex::encode(key),
+            }),
+        );
+    let (seq, prev_hash) = node.next_seq_and_prev_hash(&topic_id).context(NodeSnafu)?;
+    let grant_params = PublishParams {
+        topic_id,
+        sender_sk: &node.ed_sk,
+        cap_id,
+        kind: MessageKind::SealedTo(agent),
+        content: grant_canonical,
+        epoch: 0,
+        seq,
+        prev_hash,
+        timestamp: now,
+        keying: KeyingMaterial::SealedRecipient(&agent),
+    };
+    let grant_msg = build_message(&grant_params).context(NodeSnafu)?;
+    node.append_local(&grant_msg).context(NodeSnafu)?;
+
+    // THEN: public __channel.invite.
+    let invite_value = serde_json::to_value(&ChannelInvite {
+        agent,
+        invited_at: now,
+    })
+    .map_err(|e| invalid!("serialize __channel.invite: {e}", e = e))?;
+    publish_public(
+        &node,
+        topic_id,
+        cap_id,
+        TYPE_INVITE,
+        &format!("invited {agent_pubkey_hex}"),
+        invite_value,
+        now,
+    )?;
+
+    println!("Invited {agent_pubkey_hex} to {topic_name}");
     Ok(())
 }
