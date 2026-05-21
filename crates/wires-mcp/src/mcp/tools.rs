@@ -14,7 +14,8 @@ pub fn list_descriptors() -> Value {
         {"name": "wires_publish",           "description": "Publish a message to a topic",                       "inputSchema": {"type":"object","properties":{"topic":{"type":"string"},"text":{"type":"string"},"data":{"type":"object"}},"required":["topic","text"]}},
         {"name": "wires_tail",              "description": "Read recent messages from a topic",                  "inputSchema": {"type":"object","properties":{"topic":{"type":"string"},"since":{"type":"string"},"limit":{"type":"integer"}},"required":["topic"]}},
         {"name": "wires_list_channels",     "description": "List channels (named + DMs) this agent is in",       "inputSchema": {"type":"object","properties":{}}},
-        {"name": "wires_create_channel",    "description": "Create a named channel",                             "inputSchema": {"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"}},"required":["name"]}}
+        {"name": "wires_create_channel",    "description": "Create a named channel",                             "inputSchema": {"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"}},"required":["name"]}},
+        {"name": "wires_channel_members",   "description": "Return the roster (members + pending) of a channel", "inputSchema": {"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}
     ]})
 }
 
@@ -530,6 +531,104 @@ async fn create_channel_tool(
     Ok(serde_json::json!({"content": [{"type": "text", "text": text}], "isError": false}))
 }
 
+// ── channel_members ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChannelMembersArgs {
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChannelMembersOutput {
+    topic_id: String,
+    name: String,
+    members: Vec<MemberEntry>,
+    pending: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MemberEntry {
+    pubkey: String,
+    kind: String,
+    display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+async fn channel_members_tool(
+    state: &ServiceState,
+    claims: &Claims,
+    args: ChannelMembersArgs,
+) -> Result<Value, JsonRpcError> {
+    let runtime = state
+        .supervisor
+        .get_or_open(&claims.sub)
+        .await
+        .map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("unknown_user: {e}"),
+        })?;
+    let topic_name = if args.name.starts_with("channels.") {
+        args.name.clone()
+    } else {
+        format!("channels.{}", args.name)
+    };
+    let topic_id = match wires_node::resolve_topic(&runtime.node.config.data_dir, &topic_name) {
+        Ok(t) => t,
+        Err(e) => return Ok(error_result(&format!("topic_not_found: {e}"))),
+    };
+    let log = match runtime.node.open_topic_log(&topic_id) {
+        Ok(l) => l,
+        Err(e) => return Ok(error_result(&format!("open_topic_log: {e}"))),
+    };
+    let keys = match runtime.node.epoch_keys_for(&topic_id) {
+        Ok(k) => k,
+        Err(e) => return Ok(error_result(&format!("epoch_keys: {e}"))),
+    };
+    let (_epoch, key) = match keys.latest() {
+        Ok(Some(pair)) => pair,
+        Ok(None) => return Ok(error_result(&format!("no epoch key for {topic_name}"))),
+        Err(e) => return Ok(error_result(&format!("epoch_keys.latest: {e}"))),
+    };
+    let is_dm = topic_name.starts_with("channels.dm.");
+    let view = if is_dm {
+        match wires_node::channel::open_dm(topic_id, vec![], &log, &key) {
+            Ok(v) => v,
+            Err(e) => return Ok(error_result(&format!("open_dm: {e}"))),
+        }
+    } else {
+        match wires_node::channel::open_named(topic_id, &log, &key) {
+            Ok(v) => v,
+            Err(e) => return Ok(error_result(&format!("open_named: {e}"))),
+        }
+    };
+    let members: Vec<MemberEntry> = view
+        .members
+        .iter()
+        .map(|(pk, meta)| MemberEntry {
+            pubkey: hex::encode(pk),
+            kind: serde_json::to_value(meta.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string()),
+            display_name: meta.display_name.clone(),
+            description: meta.description.clone(),
+        })
+        .collect();
+    let pending: Vec<String> = view.pending.iter().map(hex::encode).collect();
+    let out = ChannelMembersOutput {
+        topic_id: hex::encode(topic_id),
+        name: topic_name,
+        members,
+        pending,
+    };
+    let text = serde_json::to_string(&out).map_err(|e| JsonRpcError {
+        code: -32000,
+        message: e.to_string(),
+    })?;
+    Ok(serde_json::json!({"content": [{"type": "text", "text": text}], "isError": false}))
+}
+
 fn encode_cursor(prev: &TailCursor, msgs: &[wires_node::DecryptedMessage]) -> String {
     let mut cur = prev.clone();
     for m in msgs {
@@ -576,6 +675,14 @@ pub async fn call(
                     message: format!("invalid arguments: {e}"),
                 })?;
             create_channel_tool(&state, claims, args).await
+        }
+        "wires_channel_members" => {
+            let args: ChannelMembersArgs =
+                serde_json::from_value(p.arguments).map_err(|e| JsonRpcError {
+                    code: -32602,
+                    message: format!("invalid arguments: {e}"),
+                })?;
+            channel_members_tool(&state, claims, args).await
         }
         other => Err(JsonRpcError {
             code: -32601,
