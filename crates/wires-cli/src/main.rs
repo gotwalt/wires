@@ -30,6 +30,9 @@ enum Cmd {
     /// Channel management (spec: wires-channels-design)
     #[command(subcommand)]
     Channel(ChannelCmd),
+    /// Direct messages.
+    #[command(subcommand)]
+    Dm(DmCmd),
     /// Publish a message to a topic
     Publish {
         #[arg(long)]
@@ -111,6 +114,16 @@ enum ChannelCmd {
 }
 
 #[derive(Subcommand)]
+enum DmCmd {
+    /// Open or send to a DM with another agent (by their ed25519 pubkey hex).
+    Open {
+        agent: String,
+        #[arg(long)]
+        message: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum HostCmd {
     /// Pair with a host: decode a HostTicket, register this tenant (signed by
     /// your local root key), persist the host info.
@@ -157,6 +170,9 @@ async fn main() -> std::process::ExitCode {
         Cmd::Channel(ChannelCmd::Members { name }) => cmd::channel::members(&data_dir, &name).await,
         Cmd::Channel(ChannelCmd::Invite { name, agent }) => {
             cmd::channel::invite(&data_dir, &name, &agent).await
+        }
+        Cmd::Dm(DmCmd::Open { agent, message }) => {
+            cmd::dm::open(&data_dir, &agent, message.as_deref()).await
         }
         Cmd::Publish {
             topic,
