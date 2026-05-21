@@ -152,3 +152,76 @@ fn load_display_name(data_dir: &Path) -> Option<String> {
         .and_then(|x| x.as_str())
         .map(str::to_string)
 }
+
+pub async fn list(data_dir: &Path) -> Result<()> {
+    let raw = std::fs::read_to_string(data_dir.join("config.toml")).context(IoSnafu)?;
+    let cfg: NodeConfig = toml::from_str(&raw).context(TomlParseSnafu)?;
+    let node = Node::open(cfg).context(NodeSnafu)?;
+    let names = wires_node::load_topic_names(data_dir).context(IoSnafu)?;
+    let self_pk = node.ed_sk.verifying_key().to_bytes();
+
+    let mut shown = 0;
+    for (name, topic_id) in &names {
+        if !name.starts_with("channels.") || name.starts_with("channels.dm.") {
+            continue;
+        }
+        let log = node.open_topic_log(topic_id).context(NodeSnafu)?;
+        let keys = node.epoch_keys_for(topic_id).context(NodeSnafu)?;
+        let (_epoch, key) = match keys.latest().context(StoreSnafu)? {
+            Some(pair) => pair,
+            None => continue,
+        };
+        let view = wires_node::channel::open_named(*topic_id, &log, &key).context(NodeSnafu)?;
+        if view.members.contains_key(&self_pk) {
+            if let wires_core::channel::ChannelVariant::Named { name: n, .. } = &view.variant {
+                println!(
+                    "{}  {}  members={}  pending={}",
+                    n,
+                    hex::encode(topic_id),
+                    view.members.len(),
+                    view.pending.len()
+                );
+            }
+            shown += 1;
+        }
+    }
+    if shown == 0 {
+        println!("(no channels)");
+    }
+    Ok(())
+}
+
+pub async fn members(data_dir: &Path, name: &str) -> Result<()> {
+    let topic_name = if name.starts_with("channels.") {
+        name.to_string()
+    } else {
+        format!("channels.{name}")
+    };
+    let raw = std::fs::read_to_string(data_dir.join("config.toml")).context(IoSnafu)?;
+    let cfg: NodeConfig = toml::from_str(&raw).context(TomlParseSnafu)?;
+    let node = Node::open(cfg).context(NodeSnafu)?;
+    let topic_id = wires_node::resolve_topic(data_dir, &topic_name).context(IoSnafu)?;
+    let log = node.open_topic_log(&topic_id).context(NodeSnafu)?;
+    let keys = node.epoch_keys_for(&topic_id).context(NodeSnafu)?;
+    let (_epoch, key) = keys
+        .latest()
+        .context(StoreSnafu)?
+        .ok_or_else(|| invalid!("no epoch key for {topic_name}",))?;
+    let view = wires_node::channel::open_named(topic_id, &log, &key).context(NodeSnafu)?;
+    for (pk, meta) in &view.members {
+        println!(
+            "{}  {:?}  {}  {}",
+            hex::encode(pk),
+            meta.kind,
+            meta.display_name,
+            meta.description.as_deref().unwrap_or("")
+        );
+    }
+    if !view.pending.is_empty() {
+        println!("--- pending ---");
+        for pk in &view.pending {
+            println!("{}  (no meta yet)", hex::encode(pk));
+        }
+    }
+    Ok(())
+}
