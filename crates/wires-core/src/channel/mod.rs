@@ -3,6 +3,8 @@
 
 pub mod types;
 
+pub use types::{ChannelVariant, ChannelView, MemberKind, MemberMeta};
+
 /// Version stamp for the channel-layer wire vocabulary. Bumped only when
 /// breaking schema changes ship.
 pub const MODULE_VERSION: u32 = 1;
