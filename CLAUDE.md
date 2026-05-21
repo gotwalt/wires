@@ -185,7 +185,7 @@ one (e.g. `network_load_error`):
 2. Same file — add an arm to `applyDependencies(to:)` that installs the
    right per-dependency fixture clients. Existing flow-default arms
    (e.g. the network arms) are good templates; adjust the
-   `HouseholdClient.fixture(...)` parameters to seed the state your
+   `FabricClient.fixture(...)` parameters to seed the state your
    screenshot needs.
 
 3. Same file — add an arm to `initialAppState` that returns the
@@ -228,7 +228,7 @@ If the screen depends on a new TCA dependency that doesn't have a
 `.fixture(...)` constructor yet:
 
 - Add a `Fixtures+<Client>.swift` file under `Wires/Wires/Fixtures/`
-  that mirrors the pattern in `Fixtures+Household.swift` —
+  that mirrors the pattern in `Fixtures+Fabric.swift` —
   `static func fixture(...) -> <Client>` returning a no-op or
   parameterized stub. Keep the constructor minimal (canned data, no
   I/O, no throwing).
@@ -259,7 +259,7 @@ If the screen depends on a new TCA dependency that doesn't have a
   `WiresIOSApp`'s `static let store` closure, before the store reads
   any dependency.
 - **`home_loading` is the only "blocking" fixture.** It seeds
-  `loading=true` and the fixture `HouseholdClient.listCaps` sleeps
+  `loading=true` and the fixture `FabricClient.listCaps` sleeps
   60s so the spinner stays on screen past the 600 ms settle. If a
   new fixture needs a similar "captures a transient state" behavior,
   use the `listCapsBehavior: .block` pattern (or extend

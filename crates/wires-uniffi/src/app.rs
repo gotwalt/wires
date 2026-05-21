@@ -15,10 +15,10 @@ use tokio::sync::OnceCell;
 use wires_net::pair::PairRequest;
 
 use crate::error::{InternalSnafu, UnknownPairHandleSnafu, WiresError};
+use crate::fabric as fabric_flow;
 use crate::pair as pair_flow;
 use crate::parse;
 use crate::signer::SwiftRootSigner;
-use crate::fabric as fabric_flow;
 use crate::ticket;
 use crate::topic::generate_topic_id_and_epoch0 as gen_topic;
 use crate::types::{
