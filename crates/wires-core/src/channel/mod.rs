@@ -2,10 +2,12 @@
 //! docs/superpowers/specs/2026-05-21-wires-channels-design.md
 
 pub mod derive;
+pub mod replay;
 pub mod schemas;
 pub mod types;
 
 pub use derive::{EpochKey, dm_epoch_key, dm_topic_id, dm_topic_name, sort_participants};
+pub use replay::{Event, fold};
 pub use schemas::{
     ChannelCreate, ChannelInvite, ChannelMemberMeta, TYPE_CREATE, TYPE_INVITE, TYPE_MEMBER_META,
 };
