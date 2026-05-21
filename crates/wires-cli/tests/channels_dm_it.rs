@@ -1,6 +1,6 @@
 //! Integration test for wires channels v1 — DM independent derivation.
 //!
-//! Two `Node` instances share a household root. Both compute the DM
+//! Two `Node` instances share a fabric root. Both compute the DM
 //! topic_id and epoch key independently from public material + their
 //! own x25519 secret; the keys must match without any on-wire exchange.
 //! Alice publishes a Standard-encrypted message; Bob installs the
@@ -45,7 +45,7 @@ fn mint_cap(
 
 #[test]
 fn dm_independent_derivation_and_no_key_exchange() {
-    // 1. Household root + two agents in distinct data dirs.
+    // 1. Fabric root + two agents in distinct data dirs.
     let root_sk = SigningKey::generate(&mut OsRng);
     let root_pk = root_sk.verifying_key().to_bytes();
 

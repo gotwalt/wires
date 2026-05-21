@@ -8,7 +8,7 @@ use wires_net::PeerHint;
 pub struct NodeConfig {
     /// Filesystem root for persistent state (~/.wires by default).
     pub data_dir: PathBuf,
-    /// Hex of the root pubkey for this household; needed to derive
+    /// Hex of the root pubkey for this fabric; needed to derive
     /// firehose/__caps topic ids.
     pub root_pubkey_hex: String,
     /// Optional host this agent has paired with. `None` for purely
@@ -59,7 +59,7 @@ impl NodeConfig {
     }
 }
 
-/// Read the household root signing key from `<data_dir>/root.ed25519`.
+/// Read the fabric root signing key from `<data_dir>/root.ed25519`.
 /// Returns an error if the file is missing or not exactly 32 bytes — callers
 /// surface the message verbatim since each path that needs this also wants to
 /// instruct the operator to run `wires init --new-root`.

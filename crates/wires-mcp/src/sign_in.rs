@@ -1,5 +1,5 @@
 //! `SignInChallenge` — what the returning-user QR encodes. The iOS app
-//! signs the canonical JSON (with `signature` zeroed) using the household
+//! signs the canonical JSON (with `signature` zeroed) using the fabric
 //! root ed25519 and POSTs the signature back to /oauth/signin/assertion.
 
 use base64::Engine;

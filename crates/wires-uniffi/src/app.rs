@@ -1,7 +1,7 @@
 //! `WiresApp` — the UniFFI Object the iOS app instantiates once and drives.
 //!
 //! Lazily binds a single iroh `Endpoint` on first network call. All state on
-//! the Rust side is in-memory and process-lifetime: durable household state
+//! the Rust side is in-memory and process-lifetime: durable fabric state
 //! lives on the Swift side in SwiftData + Keychain. The only Rust state that
 //! survives across calls is the bound endpoint and the in-flight pair-request
 //! map (keyed by an opaque handle so Swift never sees the raw token).
