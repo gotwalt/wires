@@ -3,6 +3,7 @@ pub mod channel;
 pub mod dm;
 pub mod host;
 pub mod init;
+pub mod me;
 pub mod pair_approve;
 pub mod pair_listen;
 pub mod publish;

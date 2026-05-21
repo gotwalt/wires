@@ -33,6 +33,16 @@ enum Cmd {
     /// Direct messages.
     #[command(subcommand)]
     Dm(DmCmd),
+    /// Update this agent's self-described member metadata (kind/display_name/description).
+    /// Republishes into every channels.* topic the agent participates in.
+    Me {
+        #[arg(long)]
+        kind: String,
+        #[arg(long = "display-name")]
+        display_name: String,
+        #[arg(long)]
+        description: Option<String>,
+    },
     /// Publish a message to a topic
     Publish {
         #[arg(long)]
@@ -177,6 +187,11 @@ async fn main() -> std::process::ExitCode {
             cmd::dm::open(&data_dir, &agent, message.as_deref()).await
         }
         Cmd::Dm(DmCmd::List) => cmd::dm::list(&data_dir).await,
+        Cmd::Me {
+            kind,
+            display_name,
+            description,
+        } => cmd::me::set(&data_dir, &kind, &display_name, description.as_deref()).await,
         Cmd::Publish {
             topic,
             cap,
