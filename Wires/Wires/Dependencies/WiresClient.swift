@@ -121,7 +121,7 @@ extension DependencyValues {
 
 /// `SwiftRootSigner` implementation that reads the cached root pubkey from
 /// Keychain and delegates signing to `KeychainClient.signWithBiometric`.
-/// Created at app startup once the household exists.
+/// Created at app startup once the fabric exists.
 final class KeychainBackedRootSigner: SwiftRootSigner, @unchecked Sendable {
     enum Account {
         static let signingKey = "wires.root.signingkey"
@@ -137,7 +137,7 @@ final class KeychainBackedRootSigner: SwiftRootSigner, @unchecked Sendable {
     }
 
     /// Try to construct one by reading the cached pubkey from Keychain.
-    /// Returns nil if no household has been bootstrapped yet.
+    /// Returns nil if no fabric has been bootstrapped yet.
     static func tryLoad(keychain: KeychainClient) throws -> KeychainBackedRootSigner? {
         guard let pk = try keychain.getData(Account.pubkey) else { return nil }
         return KeychainBackedRootSigner(keychain: keychain, pubkey: pk)

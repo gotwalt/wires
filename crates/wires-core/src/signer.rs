@@ -1,4 +1,4 @@
-//! `RootSigner` — the household's root-of-trust signing abstraction. Implemented
+//! `RootSigner` — the fabric's root-of-trust signing abstraction. Implemented
 //! by an in-process `SigningKey` for CLI/daemon use and by a callback-backed
 //! adapter from `wires-uniffi` for iOS Keychain biometric signing.
 

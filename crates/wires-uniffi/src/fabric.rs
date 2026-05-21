@@ -1,4 +1,5 @@
-//! Thin wrappers around `wires-net::tenant` that the iOS app drives.
+//! Fabric-side wrappers around `wires-net::tenant` (the host-internal name
+//! for a fabric's host footprint) that the iOS app drives.
 //! Stateless — each call uses the caller's bound endpoint, registers the
 //! host's address hints into the endpoint's address-lookup table, and sends
 //! one signed request. Host info reaches these via `parse_host_ticket`

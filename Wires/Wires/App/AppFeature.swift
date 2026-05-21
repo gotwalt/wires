@@ -13,17 +13,17 @@ struct AppFeature {
 
     enum Action {
         case onAppear
-        case householdLoaded(HouseholdSummary?)
+        case fabricLoaded(FabricSummary?)
         case onboarding(OnboardingFeature.Action)
         case main(MainFeature.Action)
     }
 
-    struct HouseholdSummary: Equatable, Sendable {
+    struct FabricSummary: Equatable, Sendable {
         let rootPubkeyHex: String
         let tenantRegisteredAt: Date?
     }
 
-    @Dependency(\.householdClient) var household
+    @Dependency(\.fabricClient) var fabric
     @Dependency(\.keychainClient) var keychain
     @Dependency(\.wiresClient) var wires
 
@@ -33,14 +33,14 @@ struct AppFeature {
             case .onAppear:
                 let keychain = self.keychain
                 let wires = self.wires
-                let household = self.household
+                let fabric = self.fabric
                 return .run { send in
                     await prepareWiresApp(keychain: keychain, wires: wires)
 
-                    let snapshot: HouseholdSummary?
-                    if let h = try? await household.loadHousehold() {
+                    let snapshot: FabricSummary?
+                    if let h = try? await fabric.loadFabric() {
                         snapshot = await MainActor.run {
-                            HouseholdSummary(
+                            FabricSummary(
                                 rootPubkeyHex: h.rootPubkeyHex,
                                 tenantRegisteredAt: h.tenantRegisteredAt
                             )
@@ -48,9 +48,9 @@ struct AppFeature {
                     } else {
                         snapshot = nil
                     }
-                    await send(.householdLoaded(snapshot))
+                    await send(.fabricLoaded(snapshot))
                 }
-            case let .householdLoaded(summary):
+            case let .fabricLoaded(summary):
                 if let summary, summary.tenantRegisteredAt != nil {
                     state = .main(MainFeature.State(
                         network: NetworkFeature.State(rootPubkeyHex: summary.rootPubkeyHex),

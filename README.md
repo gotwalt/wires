@@ -1,6 +1,6 @@
 # wires
 
-End-to-end encrypted gossip substrate for a household's AI agents. Think "a private group chat that machines can read and write to, hosted by a server that cannot."
+End-to-end encrypted gossip substrate for a fabric — your network of agents, services, and devices, rooted in your identity. Think "a private group chat that machines can read and write to, hosted by a server that cannot."
 
 **Status: prototype.** Five slices have landed on `main`:
 
@@ -12,7 +12,7 @@ End-to-end encrypted gossip substrate for a household's AI agents. Think "a priv
 
 A working Home Assistant ingestion daemon (`wires-ha`) ships as a separate binary.
 
-Not built yet: iOS companion app (still a stock SwiftUI scaffold pending revised plan), `__cap.*` gossip propagation, `__topic.epoch_advance` distribution. In channels v1, DMs are operator-initiated only — the `PairGrant` doesn't yet carry the operator's x25519, so paired agents can't `wires dm open <operator>` back at the household root holder.
+Not built yet: iOS companion app (still a stock SwiftUI scaffold pending revised plan), `__cap.*` gossip propagation, `__topic.epoch_advance` distribution. In channels v1, DMs are operator-initiated only — the `PairGrant` doesn't yet carry the operator's x25519, so paired agents can't `wires dm open <operator>` back at the fabric root holder.
 
 ## Build
 
@@ -32,11 +32,11 @@ For the walkthrough below it's convenient to also `cargo install --path crates/w
 
 ## Concepts in one paragraph each
 
-- **Identity.** Every agent has an Ed25519 signing key and an X25519 secret. The root key for a household is a separate Ed25519 keypair held by the operator; capabilities are signed by it. `wires init` generates the agent identity; with no `--root` it also generates a local root key.
+- **Identity.** Every agent has an Ed25519 signing key and an X25519 secret. The root key for a fabric is a separate Ed25519 keypair held by the operator; capabilities are signed by it. `wires init` generates the agent identity; with no `--root` it also generates a local root key.
 - **Capability.** A signed grant of `read` and/or `write` on a topic to a specific agent pubkey. Capabilities are the only way to publish. Operators (root-key holders) mint them in response to a pair request from an agent via `wires pair-approve`; caps live in each agent's `caps.db`.
 - **Topic.** A 32-byte id with a per-epoch symmetric key. Messages on a topic are encrypted under the current epoch key. Topic names (e.g. `home.notes`) are a CLI-side convenience that maps to a random id at creation time.
 - **Host.** A `wires-host` process is a blind multi-tenant relay: it persists ciphertext per tenant, serves replay, and routes by `topic_id → tenant`. It cannot decrypt anything.
-- **Tenant.** A household paired with a host. Created via the `/wires/tenant/0` ALPN, signed by the root key. One tenant per root pubkey per host.
+- **Fabric.** The unit of organization rooted in one human: identity, all paired agents/services, and the channels they share. The host calls this a "tenant" internally (the ALPN is `/wires/tenant/0`, the on-disk path is `tenants/<root>/`) — same thing, different layer.
 
 ## Quick start: a local proof-of-concept in four terminals
 
@@ -56,7 +56,7 @@ Leave it running for the rest of the walkthrough. The `host ticket: …` line is
 
 ### Tab 2 — Alice, the operator
 
-Alice is the root-key holder for this household. Capture the host ticket first (Tab 1 must already be running):
+Alice is the root-key holder for this fabric. Capture the host ticket first (Tab 1 must already be running):
 
 ```bash
 TICKET=$(wires-host --data-dir ./host ticket --no-qr)
@@ -90,7 +90,7 @@ wires --data-dir ./alice host status
 
 ### Tab 3 — Bob, an invited agent
 
-Bob is a second agent. Identity only — no root pubkey, no caps, no household awareness until Alice pairs him in.
+Bob is a second agent. Identity only — no root pubkey, no caps, no fabric awareness until Alice pairs him in.
 
 ```bash
 # 1. Identity-only init. No root, no caps.
@@ -124,7 +124,7 @@ wires --data-dir ./alice pair-approve <BOB_TOKEN>
 # → Paired: cap <BOB_CAP_HEX> installed at <MILLIS> on agent <BOB_AGENT_HEX>
 ```
 
-Bob's pair-listen exits with `Paired. Installed cap: <BOB_CAP_HEX>`. The grant carried Alice's root pubkey, the cap, the topic name and id, the current epoch key, and her host info — Bob is now a fully-onboarded household member.
+Bob's pair-listen exits with `Paired. Installed cap: <BOB_CAP_HEX>`. The grant carried Alice's root pubkey, the cap, the topic name and id, the current epoch key, and her host info — Bob is now a fully-onboarded fabric member.
 
 Scope narrowing is available: `pair-approve --scope home.notes:read` to grant read-only, `pair-approve --topics home.notes` to whitelist a subset of requested topics, `pair-approve --no-host` to skip the host-info portion, `pair-approve --yes` to skip the confirmation prompt.
 
@@ -281,8 +281,8 @@ docs/superpowers/
 ## MCP gateway
 
 `wires-mcp` exposes a small authenticated MCP surface so AI-agent clients
-(Claude Desktop, Cursor, VS Code, etc.) can act on a household's behalf.
-It pairs into each household as a normal wires agent — `wires-host`'s
+(Claude Desktop, Cursor, VS Code, etc.) can act on a fabric's behalf.
+It pairs into each fabric as a normal wires agent — `wires-host`'s
 blindness contract is unchanged.
 
 ### Operator walkthrough (running directly)
@@ -307,7 +307,7 @@ wires-mcp serve
 # 3. List onboarded users.
 wires-mcp user-list
 
-# 4. Remove a user (e.g. household-side cap was revoked).
+# 4. Remove a user (e.g. fabric-side cap was revoked).
 wires-mcp user-delete <root_pubkey_hex>
 ```
 
@@ -353,7 +353,7 @@ issuer survive rollouts.
    Returning users scan the **right** one to authenticate with their root
    key.
 4. The browser redirects back; the MCP client now has an access token
-   bound to the user's household root pubkey.
+   bound to the user's fabric root pubkey.
 5. The client can call MCP tools against the user's agent's caps:
    - **Substrate:** `wires_list_topics`, `wires_publish`, `wires_tail`.
    - **Channels:** `wires_list_channels`, `wires_create_channel`,

@@ -43,7 +43,7 @@ fn mint_cap(
 
 #[test]
 fn named_channel_create_invite_roster() {
-    // 1. Alice — household root + agent identity.
+    // 1. Alice — fabric root + agent identity.
     let root_sk = SigningKey::generate(&mut OsRng);
     let root_pk = root_sk.verifying_key().to_bytes();
 
@@ -56,7 +56,7 @@ fn named_channel_create_invite_roster() {
     let bob = open_node(bob_dir.path(), &root_pk);
     let bob_pk = bob.ed_sk.verifying_key().to_bytes();
 
-    // Both agents need caps covering `channels.**` signed by the household root.
+    // Both agents need caps covering `channels.**` signed by the fabric root.
     let now: i64 = 1_700_000_000_000;
     let alice_cap = mint_cap(
         &root_sk,
@@ -86,7 +86,7 @@ fn named_channel_create_invite_roster() {
         topic_id,
         topic_name,
         alice_cap_id,
-        Some("household coordination"),
+        Some("fabric coordination"),
         "alice",
         MemberKind::Cli,
         now,

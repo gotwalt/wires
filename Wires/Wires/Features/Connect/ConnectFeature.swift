@@ -40,7 +40,7 @@ struct ConnectFeature {
         case signinApproveTapped
         case signinSucceeded
         case signinFailed(String)
-        /// Fired once both PairRequest parsing and household → HostInfo lookup
+        /// Fired once both PairRequest parsing and fabric → HostInfo lookup
         /// complete. Carries the data ApprovalFeature needs.
         case pairReadyToApprove(PairRequestPreview, HostInfo)
         case pairLoadFailed(String)
@@ -51,7 +51,7 @@ struct ConnectFeature {
     @Dependency(\.wiresClient) var wires
     @Dependency(\.mcpGatewayClient) var gateway
     @Dependency(\.keychainClient) var keychain
-    @Dependency(\.householdClient) var household
+    @Dependency(\.fabricClient) var fabric
 
     var body: some Reducer<State, Action> {
         Reduce { state, action in
@@ -60,12 +60,12 @@ struct ConnectFeature {
             // MARK: Scan step
 
             case let .scan(.decodedPayload(ticket)):
-                // Look up the household's root pubkey from SwiftData (already a
-                // hex string on Household — no encoding needed).
-                let household = self.household
+                // Look up the fabric's root pubkey from SwiftData (already a
+                // hex string on Fabric — no encoding needed).
+                let fabric = self.fabric
                 return .run { send in
                     let rootHex: String?
-                    do { rootHex = try await household.loadHousehold()?.rootPubkeyHex } catch { rootHex = nil }
+                    do { rootHex = try await fabric.loadFabric()?.rootPubkeyHex } catch { rootHex = nil }
                     guard let rootHex, !rootHex.isEmpty else {
                         await send(.probeFailed("Set up your account first"))
                         return
@@ -111,13 +111,13 @@ struct ConnectFeature {
                 // `.probing` so the spinner copy doesn't flicker.
                 guard case .probing = state else { return .none }
                 let wires = self.wires
-                let household = self.household
+                let fabric = self.fabric
                 return .run { send in
                     do {
                         // Parse the pair request preview (FFI) and fetch the
-                        // household's HostInfo (SwiftData) in parallel.
+                        // fabric's HostInfo (SwiftData) in parallel.
                         async let previewTask = wires.parsePairRequest(token)
-                        async let hostTask = loadHostInfo(household: household)
+                        async let hostTask = loadHostInfo(fabric: fabric)
                         let preview = try await previewTask
                         guard let host = try await hostTask else {
                             await send(.pairLoadFailed("no host — bootstrap first"))
@@ -140,14 +140,14 @@ struct ConnectFeature {
                 state = .signingIn(ticket: ticket, challenge: challenge)
                 let keychain = self.keychain
                 let gateway = self.gateway
-                let household = self.household
+                let fabric = self.fabric
                 return .run { send in
                     do {
                         let sig = try await keychain.signWithBiometric(
                             KeychainBackedRootSigner.Account.signingKey,
                             challenge.signingBytes()
                         )
-                        let rootHex = (try? await household.loadHousehold()?.rootPubkeyHex) ?? ""
+                        let rootHex = (try? await fabric.loadFabric()?.rootPubkeyHex) ?? ""
                         try await gateway.postAssertion(
                             ticket.gatewayURL,
                             ticket.sessionID,
@@ -202,10 +202,10 @@ struct ConnectFeature {
     }
 }
 
-/// Read the household once and convert its host columns to a `HostInfo` on
+/// Read the fabric once and convert its host columns to a `HostInfo` on
 /// `MainActor` (SwiftData `@Model` properties require it).
-private func loadHostInfo(household: HouseholdClient) async throws -> HostInfo? {
-    guard let hh = try await household.loadHousehold() else { return nil }
+private func loadHostInfo(fabric: FabricClient) async throws -> HostInfo? {
+    guard let hh = try await fabric.loadFabric() else { return nil }
     return await MainActor.run {
         guard let endpointIdHex = hh.hostEndpointIdHex else { return nil as HostInfo? }
         return HostInfo(

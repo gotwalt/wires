@@ -78,7 +78,7 @@ fn aad_for(msg: &WireMessage) -> std::result::Result<Vec<u8>, wires_core::CoreEr
 
 /// Detect a DM topic_id against a known set of (root, candidate-other-pubkey)
 /// pairs. Returns the sorted participant list on a match, or `None` if `topic_id`
-/// is not a DM in this household.
+/// is not a DM in this fabric.
 pub fn detect_dm(
     topic_id: &TopicId,
     self_pubkey: &Pubkey,

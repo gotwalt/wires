@@ -59,7 +59,7 @@ struct ConnectFeatureTests {
     // MARK: - Test 2: probe dispatches to pair branch and surfaces failures
 
     /// The pair branch now stays in `.probing` while it parses the pair
-    /// preview and loads the household's HostInfo. A failed parse should
+    /// preview and loads the fabric's HostInfo. A failed parse should
     /// surface as `.error` without ever leaving `.probing`.
     @Test
     func probe_pair_branch_stays_in_probing_then_surfaces_error() async throws {
@@ -77,7 +77,7 @@ struct ConnectFeatureTests {
             // Background work after .probing: parsePairRequest throws,
             // surfacing as .pairLoadFailed and transitioning to .error.
             $0.wiresClient.parsePairRequest = { _ in throw DeferredError() }
-            $0.householdClient.loadHousehold = { nil }
+            $0.fabricClient.loadFabric = { nil }
         }
 
         await store.send(.probeStarted)
@@ -105,8 +105,8 @@ struct ConnectFeatureTests {
         } withDependencies: {
             $0.keychainClient.signWithBiometric = { _, _ in Data(repeating: 0xAA, count: 64) }
             $0.mcpGatewayClient.postAssertion = { _, _, _, _ in () }
-            $0.householdClient.loadHousehold = {
-                Household(rootPubkeyHex: String(repeating: "ab", count: 32))
+            $0.fabricClient.loadFabric = {
+                Fabric(rootPubkeyHex: String(repeating: "ab", count: 32))
             }
         }
 

@@ -30,7 +30,7 @@ pub async fn run(data_dir: &Path, new_root: bool) -> Result<()> {
     println!("Initialized at {}", data_dir.display());
     if root_pubkey_hex.is_empty() {
         println!(
-            "(no root pinned — pair with an operator via `wires pair-listen` to attach to a household)"
+            "(no root pinned — pair with an operator via `wires pair-listen` to attach to a fabric)"
         );
     } else {
         println!("Root pubkey: {root_pubkey_hex}");

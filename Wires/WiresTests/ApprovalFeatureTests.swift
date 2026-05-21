@@ -62,8 +62,8 @@ struct ApprovalFeatureTests {
                 approveCalled.withValue { $0 += 1 }
                 return Self.ack
             }
-            $0.householdClient.saveTopic = { t in savedTopics.withValue { $0.append(t) } }
-            $0.householdClient.saveCap = { c in savedCaps.withValue { $0.append(c) } }
+            $0.fabricClient.saveTopic = { t in savedTopics.withValue { $0.append(t) } }
+            $0.fabricClient.saveCap = { c in savedCaps.withValue { $0.append(c) } }
             $0.keychainClient.setData = { account, _, _ in
                 savedEpochAccounts.withValue { $0.append(account) }
             }
@@ -112,8 +112,8 @@ struct ApprovalFeatureTests {
                 #expect(scopes.first?.rights == [.read])
                 return Self.ack
             }
-            $0.householdClient.saveTopic = { _ in }
-            $0.householdClient.saveCap = { c in savedCaps.withValue { $0.append(c) } }
+            $0.fabricClient.saveTopic = { _ in }
+            $0.fabricClient.saveCap = { c in savedCaps.withValue { $0.append(c) } }
             $0.keychainClient.setData = { _, _, _ in }
         }
 
@@ -156,8 +156,8 @@ struct ApprovalFeatureTests {
                 granted.withValue { $0 = scopes }
                 return Self.ack
             }
-            $0.householdClient.saveTopic = { _ in }
-            $0.householdClient.saveCap = { _ in }
+            $0.fabricClient.saveTopic = { _ in }
+            $0.fabricClient.saveCap = { _ in }
             $0.keychainClient.setData = { _, _, _ in }
         }
 
@@ -194,8 +194,8 @@ struct ApprovalFeatureTests {
                 if n == 1 { throw WiresError.TopicRegisterRejected(message: "transient") }
             }
             $0.wiresClient.approvePairRequest = { _, _, _ in Self.ack }
-            $0.householdClient.saveTopic = { _ in }
-            $0.householdClient.saveCap = { _ in }
+            $0.fabricClient.saveTopic = { _ in }
+            $0.fabricClient.saveCap = { _ in }
             $0.keychainClient.setData = { _, _, _ in }
         }
 
@@ -232,8 +232,8 @@ struct ApprovalFeatureTests {
             $0.wiresClient.approvePairRequest = { _, _, _ in
                 throw WiresError.PairRejected(message: "node refused")
             }
-            $0.householdClient.saveTopic = { _ in }
-            $0.householdClient.saveCap = { _ in }
+            $0.fabricClient.saveTopic = { _ in }
+            $0.fabricClient.saveCap = { _ in }
             $0.keychainClient.setData = { _, _, _ in }
         }
 
@@ -263,8 +263,8 @@ struct ApprovalFeatureTests {
             $0.wiresClient.approvePairRequest = { _, _, _ in
                 throw WiresError.PairRequestExpired(message: "ttl elapsed")
             }
-            $0.householdClient.saveTopic = { _ in }
-            $0.householdClient.saveCap = { _ in }
+            $0.fabricClient.saveTopic = { _ in }
+            $0.fabricClient.saveCap = { _ in }
             $0.keychainClient.setData = { _, _, _ in }
         }
 

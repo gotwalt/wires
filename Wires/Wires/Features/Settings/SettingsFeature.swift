@@ -45,7 +45,7 @@ struct SettingsFeature {
         case accountDeleted
     }
 
-    @Dependency(\.householdClient) var household
+    @Dependency(\.fabricClient) var fabric
     @Dependency(\.keychainClient) var keychain
 
     var body: some Reducer<State, Action> {
@@ -53,11 +53,11 @@ struct SettingsFeature {
             switch action {
             case .onAppear:
                 state.loading = true
-                let household = self.household
+                let fabric = self.fabric
                 let keychain = self.keychain
                 return .run { send in
-                    guard let summary = try? await loadHouseholdSummary(
-                        household: household
+                    guard let summary = try? await loadFabricSummary(
+                        fabric: fabric
                     ) else { return }
                     // The root signing key is stored under a biometry-current-set
                     // ACL today. We treat "key exists in Keychain" as
@@ -102,10 +102,10 @@ struct SettingsFeature {
 
             case .deleteSheet(.presented(.confirmed)):
                 state.deleteSheet = nil
-                let household = self.household
+                let fabric = self.fabric
                 let keychain = self.keychain
                 return .run { send in
-                    try? await household.wipeAll()
+                    try? await fabric.wipeAll()
                     try? keychain.wipeAllWiresAccounts()
                     await send(.accountDeleted)
                 }
@@ -124,19 +124,19 @@ struct SettingsFeature {
 /// A reducer-side snapshot of the fields Settings cares about. Built on the
 /// main actor via a hop so SwiftData @Model fields can be read off-actor
 /// safely.
-private struct HouseholdSummaryFields: Sendable {
+private struct FabricSummaryFields: Sendable {
     let serverName: String
     let relayURL: String
     let rootPubkeyHex: String
 }
 
 @Sendable
-private func loadHouseholdSummary(
-    household: HouseholdClient
-) async throws -> HouseholdSummaryFields? {
-    guard let h = try await household.loadHousehold() else { return nil }
+private func loadFabricSummary(
+    fabric: FabricClient
+) async throws -> FabricSummaryFields? {
+    guard let h = try await fabric.loadFabric() else { return nil }
     return await MainActor.run {
-        HouseholdSummaryFields(
+        FabricSummaryFields(
             serverName: h.hostServerName ?? "",
             relayURL: h.hostRelayURL ?? "",
             rootPubkeyHex: h.rootPubkeyHex

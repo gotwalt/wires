@@ -85,7 +85,7 @@ fn drain_new(
 #[test]
 #[ignore = "Acceptance scenario — runs under --ignored. Drives 3 wires-nodes via channel-layer helpers + simulated host replay, no live iroh."]
 fn three_agent_named_channel_acceptance() {
-    // ---- 1. Bootstrap: one household root, three agents. ---------------
+    // ---- 1. Bootstrap: one fabric root, three agents. -------------------
     let root_sk = SigningKey::generate(&mut OsRng);
     let root_pk = root_sk.verifying_key().to_bytes();
 
@@ -104,7 +104,7 @@ fn three_agent_named_channel_acceptance() {
     let carol_x_pk = carol.x_pk;
 
     // Each agent gets a root-signed cap over `channels.**`. In a real
-    // household these would land via the pair-approve flow.
+    // fabric these would land via the pair-approve flow.
     let now: i64 = 1_700_000_000_000;
     let alice_cap = mint_cap(
         &root_sk,
@@ -149,7 +149,7 @@ fn three_agent_named_channel_acceptance() {
         topic_id,
         topic_name,
         alice_cap_id,
-        Some("household coordination"),
+        Some("fabric coordination"),
         "alice",
         MemberKind::Cli,
         now,
