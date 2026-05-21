@@ -5,11 +5,9 @@
 //! It is pure: same input sequence → same `ChannelView` regardless of how many
 //! times you call it.
 
-#[allow(unused_imports)]
 use crate::channel::schemas::{
     ChannelCreate, ChannelInvite, ChannelMemberMeta, TYPE_CREATE, TYPE_INVITE, TYPE_MEMBER_META,
 };
-#[allow(unused_imports)]
 use crate::channel::types::{ChannelVariant, ChannelView, MemberMeta};
 use crate::wire::Pubkey;
 
@@ -36,20 +34,13 @@ pub fn fold(view: &mut ChannelView, events: impl IntoIterator<Item = Event>) {
 
 fn apply(view: &mut ChannelView, ev: &Event) {
     let is_meta = ev.content_type == TYPE_MEMBER_META;
-    if !is_meta && !publisher_has_meta(view, &ev.sender) {
-        // Rule 3: drop messages from publishers with no on-log meta.
-        // Exception: __channel.create is also exempt — it is the bootstrap
-        // event that the creator publishes immediately before their own meta;
-        // its only effect is on `name/creator/created_at`, none of which
-        // depend on the publisher being a "member."
-        if ev.content_type != TYPE_CREATE {
-            return;
-        }
+    if !is_meta && !publisher_has_meta(view, &ev.sender) && ev.content_type != TYPE_CREATE {
+        return;
     }
     match ev.content_type.as_str() {
         TYPE_CREATE => apply_create(view, ev),
+        TYPE_INVITE => apply_invite(view, ev),
         TYPE_MEMBER_META => apply_member_meta(view, ev),
-        // INVITE arm added in next task
         _ => {}
     }
 }
@@ -77,6 +68,29 @@ fn apply_create(view: &mut ChannelView, ev: &Event) {
     };
     view.creator = Some(ev.sender);
     view.created_at = Some(parsed.created_at);
+}
+
+fn apply_invite(view: &mut ChannelView, ev: &Event) {
+    // Rule 2: DM topics reject invites.
+    if matches!(view.variant, ChannelVariant::Dm { .. }) {
+        return;
+    }
+    // Rule 6: publisher must be a full member.
+    if !view.members.contains_key(&ev.sender) {
+        return;
+    }
+    let parsed: ChannelInvite = match ev
+        .data
+        .as_ref()
+        .and_then(|d| serde_json::from_value(d.clone()).ok())
+    {
+        Some(v) => v,
+        None => return,
+    };
+    if view.members.contains_key(&parsed.agent) || view.pending.contains(&parsed.agent) {
+        return; // already in roster; no-op
+    }
+    view.pending.insert(parsed.agent);
 }
 
 fn apply_member_meta(view: &mut ChannelView, ev: &Event) {
@@ -316,5 +330,177 @@ mod tests {
             v.pending.is_empty(),
             "invite from unmeta'd publisher must be dropped"
         );
+    }
+
+    #[test]
+    fn invite_from_full_member_places_agent_in_pending() {
+        let alice: Pubkey = [1u8; 32];
+        let bob: Pubkey = [2u8; 32];
+        let mut v = ChannelView::empty_named([7u8; 32]);
+        fold(
+            &mut v,
+            [
+                ev(
+                    alice,
+                    TYPE_CREATE,
+                    &ChannelCreate {
+                        name: "c".to_string(),
+                        description: None,
+                        created_at: 1,
+                    },
+                ),
+                ev(
+                    alice,
+                    TYPE_MEMBER_META,
+                    &ChannelMemberMeta {
+                        kind: MemberKind::Agent,
+                        display_name: "alice".to_string(),
+                        description: None,
+                        asserted_at: 2,
+                    },
+                ),
+                ev(
+                    alice,
+                    TYPE_INVITE,
+                    &ChannelInvite {
+                        agent: bob,
+                        invited_at: 3,
+                    },
+                ),
+            ],
+        );
+        assert!(v.pending.contains(&bob));
+        assert!(!v.members.contains_key(&bob));
+    }
+
+    #[test]
+    fn bob_publishing_meta_after_invite_moves_him_to_members() {
+        let alice: Pubkey = [1u8; 32];
+        let bob: Pubkey = [2u8; 32];
+        let mut v = ChannelView::empty_named([7u8; 32]);
+        fold(
+            &mut v,
+            [
+                ev(
+                    alice,
+                    TYPE_CREATE,
+                    &ChannelCreate {
+                        name: "c".to_string(),
+                        description: None,
+                        created_at: 1,
+                    },
+                ),
+                ev(
+                    alice,
+                    TYPE_MEMBER_META,
+                    &ChannelMemberMeta {
+                        kind: MemberKind::Agent,
+                        display_name: "alice".to_string(),
+                        description: None,
+                        asserted_at: 2,
+                    },
+                ),
+                ev(
+                    alice,
+                    TYPE_INVITE,
+                    &ChannelInvite {
+                        agent: bob,
+                        invited_at: 3,
+                    },
+                ),
+                ev(
+                    bob,
+                    TYPE_MEMBER_META,
+                    &ChannelMemberMeta {
+                        kind: MemberKind::Agent,
+                        display_name: "bob".to_string(),
+                        description: None,
+                        asserted_at: 4,
+                    },
+                ),
+            ],
+        );
+        assert!(!v.pending.contains(&bob));
+        assert!(v.members.contains_key(&bob));
+    }
+
+    #[test]
+    fn invite_on_dm_topic_rejected() {
+        let alice: Pubkey = [1u8; 32];
+        let bob: Pubkey = [2u8; 32];
+        let carol: Pubkey = [3u8; 32];
+        let mut v = ChannelView::empty_dm([7u8; 32], vec![alice, bob]);
+        fold(
+            &mut v,
+            [
+                ev(
+                    alice,
+                    TYPE_MEMBER_META,
+                    &ChannelMemberMeta {
+                        kind: MemberKind::Agent,
+                        display_name: "alice".to_string(),
+                        description: None,
+                        asserted_at: 1,
+                    },
+                ),
+                ev(
+                    alice,
+                    TYPE_INVITE,
+                    &ChannelInvite {
+                        agent: carol,
+                        invited_at: 2,
+                    },
+                ),
+            ],
+        );
+        assert!(v.pending.is_empty(), "DM topics reject invites");
+    }
+
+    #[test]
+    fn duplicate_invite_is_noop() {
+        let alice: Pubkey = [1u8; 32];
+        let bob: Pubkey = [2u8; 32];
+        let mut v = ChannelView::empty_named([7u8; 32]);
+        fold(
+            &mut v,
+            [
+                ev(
+                    alice,
+                    TYPE_CREATE,
+                    &ChannelCreate {
+                        name: "c".to_string(),
+                        description: None,
+                        created_at: 1,
+                    },
+                ),
+                ev(
+                    alice,
+                    TYPE_MEMBER_META,
+                    &ChannelMemberMeta {
+                        kind: MemberKind::Agent,
+                        display_name: "alice".to_string(),
+                        description: None,
+                        asserted_at: 2,
+                    },
+                ),
+                ev(
+                    alice,
+                    TYPE_INVITE,
+                    &ChannelInvite {
+                        agent: bob,
+                        invited_at: 3,
+                    },
+                ),
+                ev(
+                    alice,
+                    TYPE_INVITE,
+                    &ChannelInvite {
+                        agent: bob,
+                        invited_at: 5,
+                    },
+                ),
+            ],
+        );
+        assert_eq!(v.pending.len(), 1);
     }
 }
