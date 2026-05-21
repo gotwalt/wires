@@ -68,10 +68,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let m: AsMetadata = serde_json::from_slice(&body).unwrap();
         assert_eq!(m.issuer, "https://mcp.example.com");
-        assert_eq!(m.authorization_endpoint, "https://mcp.example.com/oauth/authorize");
+        assert_eq!(
+            m.authorization_endpoint,
+            "https://mcp.example.com/oauth/authorize"
+        );
         assert_eq!(m.token_endpoint, "https://mcp.example.com/oauth/token");
         assert_eq!(m.code_challenge_methods_supported, vec!["S256"]);
         assert_eq!(m.token_endpoint_auth_methods_supported, vec!["none"]);

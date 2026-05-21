@@ -45,12 +45,18 @@ impl TopicLogs {
                 location: snafu::location!(),
             })?;
             let name = entry.file_name();
-            let Some(hex_id) = name.to_str() else { continue };
+            let Some(hex_id) = name.to_str() else {
+                continue;
+            };
             if hex_id.len() != 64 {
                 continue;
             }
-            let Ok(raw) = hex::decode(hex_id) else { continue };
-            let Ok(arr) = <[u8; 32]>::try_from(raw.as_slice()) else { continue };
+            let Ok(raw) = hex::decode(hex_id) else {
+                continue;
+            };
+            let Ok(arr) = <[u8; 32]>::try_from(raw.as_slice()) else {
+                continue;
+            };
             // Only count directories that actually have a log.db.
             if entry.path().join("log.db").is_file() {
                 out.push(arr);

@@ -25,13 +25,15 @@ pub fn kid_for(verifying_key: &ed25519_dalek::VerifyingKey) -> String {
 pub fn load_or_create(path: &Path) -> Result<SigningKey> {
     if path.exists() {
         let bytes = std::fs::read(path).context(IoSnafu)?;
-        let arr: [u8; 32] = bytes.try_into().map_err(|_| crate::error::GatewayError::Io {
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "token_signing.ed25519 must be exactly 32 bytes",
-            ),
-            location: snafu::location!(),
-        })?;
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| crate::error::GatewayError::Io {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "token_signing.ed25519 must be exactly 32 bytes",
+                ),
+                location: snafu::location!(),
+            })?;
         return Ok(SigningKey::from_bytes(&arr));
     }
     let sk = SigningKey::generate(&mut rand_core::OsRng);

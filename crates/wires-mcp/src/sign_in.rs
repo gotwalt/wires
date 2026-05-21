@@ -2,18 +2,18 @@
 //! signs the canonical JSON (with `signature` zeroed) using the household
 //! root ed25519 and POSTs the signature back to /oauth/signin/assertion.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use serde::{Deserialize, Serialize};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignInChallenge {
     pub version: u8,
-    pub kind: String,           // always "wires.signin.v1"
+    pub kind: String, // always "wires.signin.v1"
     pub gateway_url: String,
     pub session_id: String,
-    pub nonce: String,          // hex of 32 bytes
+    pub nonce: String, // hex of 32 bytes
     pub issued_at: i64,
     pub expires: i64,
 }
@@ -21,7 +21,13 @@ pub struct SignInChallenge {
 impl SignInChallenge {
     pub const KIND: &'static str = "wires.signin.v1";
 
-    pub fn new(gateway_url: &str, session_id: &str, nonce: [u8; 32], now_ms: i64, ttl_ms: i64) -> Self {
+    pub fn new(
+        gateway_url: &str,
+        session_id: &str,
+        nonce: [u8; 32],
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Self {
         Self {
             version: 1,
             kind: Self::KIND.into(),
@@ -86,10 +92,18 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
 
-    fn sk(seed: u8) -> SigningKey { SigningKey::from_bytes(&[seed; 32]) }
+    fn sk(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
 
     fn ch() -> SignInChallenge {
-        SignInChallenge::new("https://mcp.example.com", "sess-1", [7u8; 32], 1_000, 60_000)
+        SignInChallenge::new(
+            "https://mcp.example.com",
+            "sess-1",
+            [7u8; 32],
+            1_000,
+            60_000,
+        )
     }
 
     #[test]
@@ -136,5 +150,4 @@ mod tests {
         let c = SignInChallenge::new("https://mcp.example.com", "sess-1", [7u8; 32], 1000, 60_000);
         println!("{}", String::from_utf8_lossy(&c.signing_bytes()));
     }
-
 }

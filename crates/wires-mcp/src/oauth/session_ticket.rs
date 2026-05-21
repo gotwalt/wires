@@ -42,7 +42,8 @@ impl SessionTicket {
         if t.kind != Self::KIND {
             use serde::de::Error;
             return Err(serde_json::Error::custom(format!(
-                "unknown ticket kind: {}", t.kind
+                "unknown ticket kind: {}",
+                t.kind
             )));
         }
         Ok(t)

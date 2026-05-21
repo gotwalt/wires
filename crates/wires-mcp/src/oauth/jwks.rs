@@ -14,7 +14,7 @@ pub struct Jwk {
     pub kty: String, // "OKP"
     pub crv: String, // "Ed25519"
     pub kid: String,
-    pub x: String, // base64url(pubkey)
+    pub x: String,   // base64url(pubkey)
     pub alg: String, // "EdDSA"
     #[serde(rename = "use")]
     pub use_: String, // "sig"
@@ -66,11 +66,17 @@ mod tests {
         let (_t, st) = state([3u8; 32]);
         let expected_kid = crate::keys::kid_for(&st.signing_key.verifying_key());
         let resp = app(st)
-            .oneshot(Request::get("/.well-known/jwks.json").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/.well-known/jwks.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let jwks: Jwks = serde_json::from_slice(&body).unwrap();
         assert_eq!(jwks.keys.len(), 1);
         let k = &jwks.keys[0];

@@ -49,8 +49,10 @@ pub async fn handler(
 
     // Reconstruct the original challenge and verify signature.
     let nonce: [u8; 32] = {
-        let v = hex::decode(&pending.challenge_nonce_hex).map_err(|_| err(StatusCode::BAD_REQUEST, "bad_nonce"))?;
-        v.try_into().map_err(|_| err(StatusCode::BAD_REQUEST, "bad_nonce"))?
+        let v = hex::decode(&pending.challenge_nonce_hex)
+            .map_err(|_| err(StatusCode::BAD_REQUEST, "bad_nonce"))?;
+        v.try_into()
+            .map_err(|_| err(StatusCode::BAD_REQUEST, "bad_nonce"))?
     };
     let challenge = SignInChallenge::new(
         &state.config.public_url,
@@ -60,12 +62,18 @@ pub async fn handler(
         crate::oauth::authorize::SIGNIN_CHALLENGE_TTL_MS,
     );
     let root_arr: [u8; 32] = {
-        let v = hex::decode(&req.root_pubkey).map_err(|_| err(StatusCode::BAD_REQUEST, "bad_root"))?;
-        v.try_into().map_err(|_| err(StatusCode::BAD_REQUEST, "bad_root"))?
+        let v =
+            hex::decode(&req.root_pubkey).map_err(|_| err(StatusCode::BAD_REQUEST, "bad_root"))?;
+        v.try_into()
+            .map_err(|_| err(StatusCode::BAD_REQUEST, "bad_root"))?
     };
-    let vk = VerifyingKey::from_bytes(&root_arr).map_err(|_| err(StatusCode::BAD_REQUEST, "bad_root"))?;
-    let sig_bytes = hex::decode(&req.signature).map_err(|_| err(StatusCode::BAD_REQUEST, "bad_signature"))?;
-    let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| err(StatusCode::BAD_REQUEST, "bad_signature"))?;
+    let vk = VerifyingKey::from_bytes(&root_arr)
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad_root"))?;
+    let sig_bytes =
+        hex::decode(&req.signature).map_err(|_| err(StatusCode::BAD_REQUEST, "bad_signature"))?;
+    let sig_arr: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "bad_signature"))?;
     let sig = Signature::from_bytes(&sig_arr);
     if !challenge.verify(&vk, &sig) {
         return Err(err(StatusCode::UNAUTHORIZED, "bad_signature"));
@@ -78,7 +86,12 @@ pub async fn handler(
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))?;
 
     // The household must already have a user record on this gateway.
-    if state.store.get_user(&req.root_pubkey).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))?.is_none() {
+    if state
+        .store
+        .get_user(&req.root_pubkey)
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))?
+        .is_none()
+    {
         return Err(err(StatusCode::NOT_FOUND, "unknown_root_pubkey"));
     }
 
@@ -95,18 +108,24 @@ pub async fn handler(
     let updated_state = updated.state.clone();
     let updated_client_id = updated.client_id.clone();
     let updated_code_challenge = updated.code_challenge.clone();
-    state.store.put_auth_session(&updated).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))?;
-    state.store.put_auth_code(&AuthCodeRecord {
-        code,
-        session_id: req.session_id,
-        sub: req.root_pubkey,
-        client_id: updated_client_id,
-        redirect_uri: updated_redirect,
-        code_challenge: updated_code_challenge,
-        issued_at_ms: now_ms,
-        expires_ms: now_ms + crate::pair_bridge::AUTH_CODE_TTL_MS,
-        consumed: false,
-    }).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))?;
+    state
+        .store
+        .put_auth_session(&updated)
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))?;
+    state
+        .store
+        .put_auth_code(&AuthCodeRecord {
+            code,
+            session_id: req.session_id,
+            sub: req.root_pubkey,
+            client_id: updated_client_id,
+            redirect_uri: updated_redirect,
+            code_challenge: updated_code_challenge,
+            issued_at_ms: now_ms,
+            expires_ms: now_ms + crate::pair_bridge::AUTH_CODE_TTL_MS,
+            consumed: false,
+        })
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))?;
     let _ = updated_state;
     Ok((StatusCode::OK, Json(SignInAck { ok: true })))
 }
@@ -132,39 +151,47 @@ mod tests {
         let st = test_state(tmp.path());
         let root = SigningKey::from_bytes(&[42u8; 32]);
         let root_pubkey_hex = hex::encode(root.verifying_key().to_bytes());
-        st.store.put_user(&UserRecord {
-            root_pubkey_hex: root_pubkey_hex.clone(),
-            data_dir: "x".into(),
-            created_at_ms: 0,
-            last_seen_ms: 0,
-        }).unwrap();
-        st.store.put_oauth_client(&OauthClientRecord {
-            client_id: "c1".into(),
-            client_name: "C".into(),
-            redirect_uris: vec!["http://x".into()],
-            grant_types: vec!["authorization_code".into()],
-            created_at_ms: 0,
-            revoked: false,
-        }).unwrap();
+        st.store
+            .put_user(&UserRecord {
+                root_pubkey_hex: root_pubkey_hex.clone(),
+                data_dir: "x".into(),
+                created_at_ms: 0,
+                last_seen_ms: 0,
+            })
+            .unwrap();
+        st.store
+            .put_oauth_client(&OauthClientRecord {
+                client_id: "c1".into(),
+                client_name: "C".into(),
+                redirect_uris: vec!["http://x".into()],
+                grant_types: vec!["authorization_code".into()],
+                created_at_ms: 0,
+                revoked: false,
+            })
+            .unwrap();
         let now_ms = Utc::now().timestamp_millis();
         let nonce = [9u8; 32];
-        st.store.put_pending_signin(&PendingSigninRecord {
-            session_id: "sid".into(),
-            challenge_nonce_hex: hex::encode(nonce),
-            ttl_expires_ms: now_ms + crate::oauth::authorize::SIGNIN_CHALLENGE_TTL_MS,
-        }).unwrap();
-        st.store.put_auth_session(&AuthSessionRecord {
-            session_id: "sid".into(),
-            client_id: "c1".into(),
-            redirect_uri: "http://x".into(),
-            code_challenge: "cc".into(),
-            code_challenge_method: "S256".into(),
-            resource: st.config.public_url.clone(),
-            state: "st".into(),
-            kind: AuthSessionKind::Pending,
-            issued_at_ms: now_ms,
-            expires_ms: now_ms + 60_000,
-        }).unwrap();
+        st.store
+            .put_pending_signin(&PendingSigninRecord {
+                session_id: "sid".into(),
+                challenge_nonce_hex: hex::encode(nonce),
+                ttl_expires_ms: now_ms + crate::oauth::authorize::SIGNIN_CHALLENGE_TTL_MS,
+            })
+            .unwrap();
+        st.store
+            .put_auth_session(&AuthSessionRecord {
+                session_id: "sid".into(),
+                client_id: "c1".into(),
+                redirect_uri: "http://x".into(),
+                code_challenge: "cc".into(),
+                code_challenge_method: "S256".into(),
+                resource: st.config.public_url.clone(),
+                state: "st".into(),
+                kind: AuthSessionKind::Pending,
+                issued_at_ms: now_ms,
+                expires_ms: now_ms + 60_000,
+            })
+            .unwrap();
         (tmp, st, root, root_pubkey_hex)
     }
 
@@ -183,15 +210,23 @@ mod tests {
     async fn happy_path_mints_auth_code_and_marks_done() {
         let (_t, st, root, root_hex) = setup();
         let pending = st.store.get_pending_signin("sid").unwrap().unwrap();
-        let nonce: [u8; 32] = hex::decode(&pending.challenge_nonce_hex).unwrap().try_into().unwrap();
+        let nonce: [u8; 32] = hex::decode(&pending.challenge_nonce_hex)
+            .unwrap()
+            .try_into()
+            .unwrap();
         let issued = pending.ttl_expires_ms - crate::oauth::authorize::SIGNIN_CHALLENGE_TTL_MS;
         let sig = sign(&root, &st, nonce, issued);
-        let body = serde_json::json!({"session_id": "sid", "root_pubkey": root_hex, "signature": sig});
+        let body =
+            serde_json::json!({"session_id": "sid", "root_pubkey": root_hex, "signature": sig});
         let resp = app(st.clone())
-            .oneshot(Request::post("/oauth/signin/assertion")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string())).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::post("/oauth/signin/assertion")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let sess = st.store.get_auth_session("sid").unwrap().unwrap();
         match sess.kind {
@@ -210,15 +245,23 @@ mod tests {
         let other = SigningKey::from_bytes(&[99u8; 32]);
         let other_hex = hex::encode(other.verifying_key().to_bytes());
         let pending = st.store.get_pending_signin("sid").unwrap().unwrap();
-        let nonce: [u8; 32] = hex::decode(&pending.challenge_nonce_hex).unwrap().try_into().unwrap();
+        let nonce: [u8; 32] = hex::decode(&pending.challenge_nonce_hex)
+            .unwrap()
+            .try_into()
+            .unwrap();
         let issued = pending.ttl_expires_ms - crate::oauth::authorize::SIGNIN_CHALLENGE_TTL_MS;
         let sig = sign(&other, &st, nonce, issued);
-        let body = serde_json::json!({"session_id": "sid", "root_pubkey": other_hex, "signature": sig});
+        let body =
+            serde_json::json!({"session_id": "sid", "root_pubkey": other_hex, "signature": sig});
         let resp = app(st)
-            .oneshot(Request::post("/oauth/signin/assertion")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string())).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::post("/oauth/signin/assertion")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND); // unknown_root_pubkey
     }
 
@@ -231,10 +274,14 @@ mod tests {
             "signature": hex::encode([0u8; 64]),
         });
         let resp = app(st)
-            .oneshot(Request::post("/oauth/signin/assertion")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string())).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::post("/oauth/signin/assertion")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

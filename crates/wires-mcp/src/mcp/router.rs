@@ -107,22 +107,27 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let st = test_state(tmp.path());
         let sub = "ab".repeat(32);
-        st.store.put_user(&UserRecord {
-            root_pubkey_hex: sub.clone(),
-            data_dir: "x".into(),
-            created_at_ms: 0,
-            last_seen_ms: 0,
-        }).unwrap();
-        st.store.put_oauth_client(&OauthClientRecord {
-            client_id: "c1".into(),
-            client_name: "C".into(),
-            redirect_uris: vec!["http://x".into()],
-            grant_types: vec!["authorization_code".into()],
-            created_at_ms: 0,
-            revoked: false,
-        }).unwrap();
+        st.store
+            .put_user(&UserRecord {
+                root_pubkey_hex: sub.clone(),
+                data_dir: "x".into(),
+                created_at_ms: 0,
+                last_seen_ms: 0,
+            })
+            .unwrap();
+        st.store
+            .put_oauth_client(&OauthClientRecord {
+                client_id: "c1".into(),
+                client_name: "C".into(),
+                redirect_uris: vec!["http://x".into()],
+                grant_types: vec!["authorization_code".into()],
+                created_at_ms: 0,
+                revoked: false,
+            })
+            .unwrap();
         let token = bearer(&st, &sub, "c1");
-        let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        let body =
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
         let resp = crate::http::app(st)
             .oneshot(
                 Request::post("/mcp")
@@ -134,7 +139,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let b = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(v["jsonrpc"], "2.0");
         assert_eq!(v["id"], 1);

@@ -74,9 +74,12 @@ pub async fn handler(
             issued_at,
             crate::oauth::authorize::SIGNIN_CHALLENGE_TTL_MS,
         );
-        return Ok((StatusCode::OK, Json(ProbeResponse::Signin {
-            challenge_b64: challenge.encode_url_safe_b64(),
-        })));
+        return Ok((
+            StatusCode::OK,
+            Json(ProbeResponse::Signin {
+                challenge_b64: challenge.encode_url_safe_b64(),
+            }),
+        ));
     }
 
     // Unknown user → lazy pair allocation.
@@ -93,7 +96,12 @@ pub async fn handler(
             tracing::error!(error = %e, "session_probe: pair_bridge.start");
             err(StatusCode::INTERNAL_SERVER_ERROR, "pair_alloc_failed")
         })?;
-    Ok((StatusCode::OK, Json(ProbeResponse::Pair { pair_token_b64: token })))
+    Ok((
+        StatusCode::OK,
+        Json(ProbeResponse::Pair {
+            pair_token_b64: token,
+        }),
+    ))
 }
 
 fn err(status: StatusCode, code: &str) -> (StatusCode, Json<serde_json::Value>) {
@@ -115,44 +123,57 @@ mod tests {
 
     fn seed(tmp: &TempDir) -> ServiceState {
         let st = test_state(tmp.path());
-        st.store.put_oauth_client(&OauthClientRecord {
-            client_id: "c1".into(),
-            client_name: "Claude Desktop".into(),
-            redirect_uris: vec!["http://x/cb".into()],
-            grant_types: vec!["authorization_code".into()],
-            created_at_ms: 0,
-            revoked: false,
-        }).unwrap();
+        st.store
+            .put_oauth_client(&OauthClientRecord {
+                client_id: "c1".into(),
+                client_name: "Claude Desktop".into(),
+                redirect_uris: vec!["http://x/cb".into()],
+                grant_types: vec!["authorization_code".into()],
+                created_at_ms: 0,
+                revoked: false,
+            })
+            .unwrap();
         let now_ms = Utc::now().timestamp_millis();
-        st.store.put_auth_session(&AuthSessionRecord {
-            session_id: "sid".into(),
-            client_id: "c1".into(),
-            redirect_uri: "http://x/cb".into(),
-            code_challenge: "cc".into(),
-            code_challenge_method: "S256".into(),
-            resource: st.config.public_url.clone(),
-            state: "st".into(),
-            kind: AuthSessionKind::Pending,
-            issued_at_ms: now_ms,
-            expires_ms: now_ms + 60_000,
-        }).unwrap();
-        st.store.put_pending_signin(&PendingSigninRecord {
-            session_id: "sid".into(),
-            challenge_nonce_hex: hex::encode([7u8; 32]),
-            ttl_expires_ms: now_ms + crate::oauth::authorize::SIGNIN_CHALLENGE_TTL_MS,
-        }).unwrap();
+        st.store
+            .put_auth_session(&AuthSessionRecord {
+                session_id: "sid".into(),
+                client_id: "c1".into(),
+                redirect_uri: "http://x/cb".into(),
+                code_challenge: "cc".into(),
+                code_challenge_method: "S256".into(),
+                resource: st.config.public_url.clone(),
+                state: "st".into(),
+                kind: AuthSessionKind::Pending,
+                issued_at_ms: now_ms,
+                expires_ms: now_ms + 60_000,
+            })
+            .unwrap();
+        st.store
+            .put_pending_signin(&PendingSigninRecord {
+                session_id: "sid".into(),
+                challenge_nonce_hex: hex::encode([7u8; 32]),
+                ttl_expires_ms: now_ms + crate::oauth::authorize::SIGNIN_CHALLENGE_TTL_MS,
+            })
+            .unwrap();
         st
     }
 
     async fn probe(st: ServiceState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
         let resp = app(st)
-            .oneshot(Request::post("/oauth/session/probe")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string())).unwrap())
-            .await.unwrap();
+            .oneshot(
+                Request::post("/oauth/session/probe")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({}));
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({}));
         (status, json)
     }
 
@@ -174,12 +195,14 @@ mod tests {
         let st = seed(&tmp);
         let root = SigningKey::from_bytes(&[42u8; 32]);
         let root_hex = hex::encode(root.verifying_key().to_bytes());
-        st.store.put_user(&UserRecord {
-            root_pubkey_hex: root_hex.clone(),
-            data_dir: "x".into(),
-            created_at_ms: 0,
-            last_seen_ms: 0,
-        }).unwrap();
+        st.store
+            .put_user(&UserRecord {
+                root_pubkey_hex: root_hex.clone(),
+                data_dir: "x".into(),
+                created_at_ms: 0,
+                last_seen_ms: 0,
+            })
+            .unwrap();
         let body = serde_json::json!({"session_id": "sid", "root_pubkey_hex": root_hex});
         let (status, json) = probe(st, body).await;
         assert_eq!(status, StatusCode::OK);
@@ -191,7 +214,8 @@ mod tests {
     async fn unknown_session_404s() {
         let tmp = TempDir::new().unwrap();
         let st = seed(&tmp);
-        let body = serde_json::json!({"session_id": "missing", "root_pubkey_hex": hex::encode([1u8; 32])});
+        let body =
+            serde_json::json!({"session_id": "missing", "root_pubkey_hex": hex::encode([1u8; 32])});
         let (status, _) = probe(st, body).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
@@ -215,12 +239,14 @@ mod tests {
         let st = seed(&tmp);
         let root = SigningKey::from_bytes(&[42u8; 32]);
         let root_hex = hex::encode(root.verifying_key().to_bytes());
-        st.store.put_user(&UserRecord {
-            root_pubkey_hex: root_hex.clone(),
-            data_dir: "x".into(),
-            created_at_ms: 0,
-            last_seen_ms: 0,
-        }).unwrap();
+        st.store
+            .put_user(&UserRecord {
+                root_pubkey_hex: root_hex.clone(),
+                data_dir: "x".into(),
+                created_at_ms: 0,
+                last_seen_ms: 0,
+            })
+            .unwrap();
 
         let body = serde_json::json!({"session_id": "sid", "root_pubkey_hex": root_hex});
         let (s1, j1) = probe(st.clone(), body.clone()).await;
@@ -229,6 +255,9 @@ mod tests {
         assert_eq!(s2, StatusCode::OK);
         assert_eq!(j1["kind"], "signin");
         assert_eq!(j2["kind"], "signin");
-        assert_eq!(j1["challenge_b64"], j2["challenge_b64"], "challenge must be deterministic across retries");
+        assert_eq!(
+            j1["challenge_b64"], j2["challenge_b64"],
+            "challenge must be deterministic across retries"
+        );
     }
 }

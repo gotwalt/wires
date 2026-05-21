@@ -11,7 +11,9 @@ use snafu::ResultExt;
 use tokio::sync::broadcast;
 use wires_core::{CanonicalContent, MessageKind, WireMessage};
 use wires_crypto::{X25519Public, X25519Secret};
-use wires_store::{CapTable, EpochKey, EpochKeyStore, IngestIndex, open_caps, open_ingest_index, open_topic_keys};
+use wires_store::{
+    CapTable, EpochKey, EpochKeyStore, IngestIndex, open_caps, open_ingest_index, open_topic_keys,
+};
 
 use crate::config::NodeConfig;
 use crate::error::{IoSnafu, NetSnafu, Result, StoreSnafu};
@@ -75,8 +77,8 @@ impl Node {
         let caps = Arc::new(CapTable::new(Arc::new(caps_db)));
         let (retention, ingest_index) = match &config.retention {
             Some(policy) => {
-                let ingest_db =
-                    open_ingest_index(&config.data_dir, &config.root_pubkey_hex).context(StoreSnafu)?;
+                let ingest_db = open_ingest_index(&config.data_dir, &config.root_pubkey_hex)
+                    .context(StoreSnafu)?;
                 let idx = Arc::new(IngestIndex::new(Arc::new(ingest_db)));
                 (Some(policy.clone()), Some(idx))
             }
@@ -142,7 +144,9 @@ impl Node {
         })?;
         log.append(&msg).context(StoreSnafu)?;
         if let (Some(ix), Some(_)) = (&self.ingest_index, &self.retention) {
-            let bytes = serde_json::to_vec(&msg).context(crate::error::SerdeSnafu)?.len() as u32;
+            let bytes = serde_json::to_vec(&msg)
+                .context(crate::error::SerdeSnafu)?
+                .len() as u32;
             let now = wires_net::unix_now_ms();
             ix.record(
                 &wires_store::IngestEntry {
@@ -286,8 +290,12 @@ impl Node {
     /// No-op when `retention` is `None`. Safe to call concurrently with
     /// inbound/publish — each step is a single redb write transaction.
     pub fn sweep(&self, now_ms: i64) -> Result<()> {
-        let Some(policy) = &self.retention else { return Ok(()); };
-        let Some(ix) = &self.ingest_index else { return Ok(()); };
+        let Some(policy) = &self.retention else {
+            return Ok(());
+        };
+        let Some(ix) = &self.ingest_index else {
+            return Ok(());
+        };
 
         let deadline = now_ms.saturating_sub(policy.ttl.as_millis() as i64);
         let dropped_ttl = ix.evict_older_than(deadline).context(StoreSnafu)?;
@@ -322,7 +330,9 @@ impl Node {
     /// Orphans get a fresh TTL window starting at `now_ms` and age out
     /// normally. Idempotent; safe to call on every open.
     fn reconcile_ingest_index(&self, now_ms: i64) -> Result<()> {
-        let Some(ix) = &self.ingest_index else { return Ok(()); };
+        let Some(ix) = &self.ingest_index else {
+            return Ok(());
+        };
         let known: std::collections::HashSet<([u8; 32], [u8; 32], u64)> = ix
             .iter_all_entries()
             .context(StoreSnafu)?
@@ -336,7 +346,9 @@ impl Node {
                 if known.contains(&(topic_id, msg.sender, msg.seq)) {
                     continue;
                 }
-                let bytes = serde_json::to_vec(&msg).context(crate::error::SerdeSnafu)?.len() as u32;
+                let bytes = serde_json::to_vec(&msg)
+                    .context(crate::error::SerdeSnafu)?
+                    .len() as u32;
                 ix.record(
                     &wires_store::IngestEntry {
                         topic_id,
@@ -357,11 +369,15 @@ impl Node {
     }
 
     fn record_and_sweep(&self, msg: &wires_core::WireMessage) -> Result<()> {
-        let Some(ix) = &self.ingest_index else { return Ok(()); };
+        let Some(ix) = &self.ingest_index else {
+            return Ok(());
+        };
         if self.retention.is_none() {
             return Ok(());
         }
-        let bytes = serde_json::to_vec(msg).context(crate::error::SerdeSnafu)?.len() as u32;
+        let bytes = serde_json::to_vec(msg)
+            .context(crate::error::SerdeSnafu)?
+            .len() as u32;
         let now = wires_net::unix_now_ms();
         ix.record(
             &wires_store::IngestEntry {
@@ -615,7 +631,11 @@ mod tests {
         // Budget = 200; per-entry bytes ≈ 200+, so we expect at most 1 entry to
         // remain (or possibly 0).
         let after = log.read_after(&sender, None, 100).unwrap();
-        assert!(after.len() <= 1, "budget eviction left too much: {}", after.len());
+        assert!(
+            after.len() <= 1,
+            "budget eviction left too much: {}",
+            after.len()
+        );
         assert!(ix.total_bytes().unwrap() <= 200);
     }
 
@@ -687,12 +707,19 @@ mod tests {
         .unwrap();
 
         let ix = node.ingest_index.as_ref().unwrap();
-        assert!(ix.total_bytes().unwrap() > 0, "publish must record an entry");
+        assert!(
+            ix.total_bytes().unwrap() > 0,
+            "publish must record an entry"
+        );
 
         // Sleep past TTL, then call sweep — the entry must be evicted.
         std::thread::sleep(Duration::from_millis(5));
         node.sweep(wires_net::unix_now_ms()).unwrap();
-        assert_eq!(ix.total_bytes().unwrap(), 0, "TTL sweep must drop the entry");
+        assert_eq!(
+            ix.total_bytes().unwrap(),
+            0,
+            "TTL sweep must drop the entry"
+        );
     }
 
     #[test]
@@ -744,9 +771,16 @@ mod tests {
         rx_node.caps.upsert_grant(&cap).unwrap();
         rx_node.install_epoch_key(topic_id, 0, [9u8; 32]).unwrap();
         let outcome = rx_node.handle_inbound(msg).unwrap();
-        matches!(outcome, crate::inbound::Inbound::Accepted { .. } | crate::inbound::Inbound::AcceptedOpaque { .. });
+        matches!(
+            outcome,
+            crate::inbound::Inbound::Accepted { .. }
+                | crate::inbound::Inbound::AcceptedOpaque { .. }
+        );
         let ix = rx_node.ingest_index.as_ref().unwrap();
-        assert!(ix.total_bytes().unwrap() > 0, "inbound must record an entry");
+        assert!(
+            ix.total_bytes().unwrap() > 0,
+            "inbound must record an entry"
+        );
     }
 
     #[test]
@@ -840,7 +874,11 @@ mod tests {
         let node = Node::open(cfg).unwrap();
         let ix = node.ingest_index.as_ref().unwrap();
         let all = ix.iter_all_entries().unwrap();
-        assert_eq!(all.len(), 1, "second open must reconcile orphan log entries");
+        assert_eq!(
+            all.len(),
+            1,
+            "second open must reconcile orphan log entries"
+        );
     }
 
     #[tokio::test]

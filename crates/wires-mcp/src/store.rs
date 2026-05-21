@@ -124,26 +124,44 @@ impl Store {
 
     pub fn put_user(&self, rec: &UserRecord) -> Result<()> {
         let bytes = serde_json::to_vec(rec).context(JsonSnafu)?;
-        let write = self.db.begin_write().map_err(|e| e.into()).context(RedbSnafu)?;
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|e| e.into())
+            .context(RedbSnafu)?;
         {
-            let mut t = write.open_table(USERS).map_err(|e| e.into()).context(RedbSnafu)?;
+            let mut t = write
+                .open_table(USERS)
+                .map_err(|e| e.into())
+                .context(RedbSnafu)?;
             t.insert(rec.root_pubkey_hex.as_str(), bytes.as_slice())
-                .map_err(|e| e.into()).context(RedbSnafu)?;
+                .map_err(|e| e.into())
+                .context(RedbSnafu)?;
         }
         write.commit().map_err(|e| e.into()).context(RedbSnafu)
     }
 
     pub fn get_user(&self, root_pubkey_hex: &str) -> Result<Option<UserRecord>> {
-        let read = self.db.begin_read().map_err(|e| e.into()).context(RedbSnafu)?;
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| e.into())
+            .context(RedbSnafu)?;
         let t = match read.open_table(USERS) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(e) => return Err(crate::error::GatewayError::Redb {
-                source: e.into(),
-                location: snafu::location!(),
-            }),
+            Err(e) => {
+                return Err(crate::error::GatewayError::Redb {
+                    source: e.into(),
+                    location: snafu::location!(),
+                });
+            }
         };
-        let v = match t.get(root_pubkey_hex).map_err(|e| e.into()).context(RedbSnafu)? {
+        let v = match t
+            .get(root_pubkey_hex)
+            .map_err(|e| e.into())
+            .context(RedbSnafu)?
+        {
             Some(v) => v,
             None => return Ok(None),
         };
@@ -152,14 +170,20 @@ impl Store {
     }
 
     pub fn list_users(&self) -> Result<Vec<UserRecord>> {
-        let read = self.db.begin_read().map_err(|e| e.into()).context(RedbSnafu)?;
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| e.into())
+            .context(RedbSnafu)?;
         let t = match read.open_table(USERS) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![]),
-            Err(e) => return Err(crate::error::GatewayError::Redb {
-                source: e.into(),
-                location: snafu::location!(),
-            }),
+            Err(e) => {
+                return Err(crate::error::GatewayError::Redb {
+                    source: e.into(),
+                    location: snafu::location!(),
+                });
+            }
         };
         let mut out = Vec::new();
         for r in t.iter().map_err(|e| e.into()).context(RedbSnafu)? {
@@ -171,11 +195,22 @@ impl Store {
     }
 
     pub fn delete_user(&self, root_pubkey_hex: &str) -> Result<bool> {
-        let write = self.db.begin_write().map_err(|e| e.into()).context(RedbSnafu)?;
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|e| e.into())
+            .context(RedbSnafu)?;
         let existed;
         {
-            let mut t = write.open_table(USERS).map_err(|e| e.into()).context(RedbSnafu)?;
-            existed = t.remove(root_pubkey_hex).map_err(|e| e.into()).context(RedbSnafu)?.is_some();
+            let mut t = write
+                .open_table(USERS)
+                .map_err(|e| e.into())
+                .context(RedbSnafu)?;
+            existed = t
+                .remove(root_pubkey_hex)
+                .map_err(|e| e.into())
+                .context(RedbSnafu)?
+                .is_some();
         }
         write.commit().map_err(|e| e.into()).context(RedbSnafu)?;
         Ok(existed)
@@ -189,23 +224,37 @@ macro_rules! json_record_accessors {
         impl Store {
             pub fn $put(&self, rec: &$rec) -> Result<()> {
                 let bytes = serde_json::to_vec(rec).context(JsonSnafu)?;
-                let write = self.db.begin_write().map_err(|e| e.into()).context(RedbSnafu)?;
+                let write = self
+                    .db
+                    .begin_write()
+                    .map_err(|e| e.into())
+                    .context(RedbSnafu)?;
                 {
-                    let mut t = write.open_table($table).map_err(|e| e.into()).context(RedbSnafu)?;
+                    let mut t = write
+                        .open_table($table)
+                        .map_err(|e| e.into())
+                        .context(RedbSnafu)?;
                     t.insert(rec.$key_field.as_str(), bytes.as_slice())
-                        .map_err(|e| e.into()).context(RedbSnafu)?;
+                        .map_err(|e| e.into())
+                        .context(RedbSnafu)?;
                 }
                 write.commit().map_err(|e| e.into()).context(RedbSnafu)
             }
             pub fn $get(&self, key: &str) -> Result<Option<$rec>> {
-                let read = self.db.begin_read().map_err(|e| e.into()).context(RedbSnafu)?;
+                let read = self
+                    .db
+                    .begin_read()
+                    .map_err(|e| e.into())
+                    .context(RedbSnafu)?;
                 let t = match read.open_table($table) {
                     Ok(t) => t,
                     Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-                    Err(e) => return Err(crate::error::GatewayError::Redb {
-                        source: e.into(),
-                        location: snafu::location!(),
-                    }),
+                    Err(e) => {
+                        return Err(crate::error::GatewayError::Redb {
+                            source: e.into(),
+                            location: snafu::location!(),
+                        });
+                    }
                 };
                 let v = match t.get(key).map_err(|e| e.into()).context(RedbSnafu)? {
                     Some(v) => v,
@@ -215,11 +264,22 @@ macro_rules! json_record_accessors {
                 Ok(Some(rec))
             }
             pub fn $delete(&self, key: &str) -> Result<bool> {
-                let write = self.db.begin_write().map_err(|e| e.into()).context(RedbSnafu)?;
+                let write = self
+                    .db
+                    .begin_write()
+                    .map_err(|e| e.into())
+                    .context(RedbSnafu)?;
                 let existed;
                 {
-                    let mut t = write.open_table($table).map_err(|e| e.into()).context(RedbSnafu)?;
-                    existed = t.remove(key).map_err(|e| e.into()).context(RedbSnafu)?.is_some();
+                    let mut t = write
+                        .open_table($table)
+                        .map_err(|e| e.into())
+                        .context(RedbSnafu)?;
+                    existed = t
+                        .remove(key)
+                        .map_err(|e| e.into())
+                        .context(RedbSnafu)?
+                        .is_some();
                 }
                 write.commit().map_err(|e| e.into()).context(RedbSnafu)?;
                 Ok(existed)
@@ -228,24 +288,79 @@ macro_rules! json_record_accessors {
     };
 }
 
-json_record_accessors!(put_oauth_client, get_oauth_client, delete_oauth_client, OAUTH_CLIENTS, OauthClientRecord, client_id);
-json_record_accessors!(put_auth_session, get_auth_session, delete_auth_session, AUTH_SESSIONS, AuthSessionRecord, session_id);
-json_record_accessors!(put_pending_pair, get_pending_pair, delete_pending_pair, PENDING_PAIRS, PendingPairRecord, session_id);
-json_record_accessors!(put_pending_signin, get_pending_signin, delete_pending_signin, PENDING_SIGNINS, PendingSigninRecord, session_id);
-json_record_accessors!(put_auth_code, get_auth_code, delete_auth_code, AUTH_CODES, AuthCodeRecord, code);
-json_record_accessors!(put_refresh_token, get_refresh_token, delete_refresh_token, REFRESH_TOKENS, RefreshTokenRecord, token_hash_hex);
-json_record_accessors!(put_revoked_jti, get_revoked_jti, delete_revoked_jti, REVOKED_JTIS, RevokedJtiRecord, jti);
+json_record_accessors!(
+    put_oauth_client,
+    get_oauth_client,
+    delete_oauth_client,
+    OAUTH_CLIENTS,
+    OauthClientRecord,
+    client_id
+);
+json_record_accessors!(
+    put_auth_session,
+    get_auth_session,
+    delete_auth_session,
+    AUTH_SESSIONS,
+    AuthSessionRecord,
+    session_id
+);
+json_record_accessors!(
+    put_pending_pair,
+    get_pending_pair,
+    delete_pending_pair,
+    PENDING_PAIRS,
+    PendingPairRecord,
+    session_id
+);
+json_record_accessors!(
+    put_pending_signin,
+    get_pending_signin,
+    delete_pending_signin,
+    PENDING_SIGNINS,
+    PendingSigninRecord,
+    session_id
+);
+json_record_accessors!(
+    put_auth_code,
+    get_auth_code,
+    delete_auth_code,
+    AUTH_CODES,
+    AuthCodeRecord,
+    code
+);
+json_record_accessors!(
+    put_refresh_token,
+    get_refresh_token,
+    delete_refresh_token,
+    REFRESH_TOKENS,
+    RefreshTokenRecord,
+    token_hash_hex
+);
+json_record_accessors!(
+    put_revoked_jti,
+    get_revoked_jti,
+    delete_revoked_jti,
+    REVOKED_JTIS,
+    RevokedJtiRecord,
+    jti
+);
 
 impl Store {
     pub fn list_oauth_clients(&self) -> Result<Vec<OauthClientRecord>> {
-        let read = self.db.begin_read().map_err(|e| e.into()).context(RedbSnafu)?;
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| e.into())
+            .context(RedbSnafu)?;
         let t = match read.open_table(OAUTH_CLIENTS) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![]),
-            Err(e) => return Err(crate::error::GatewayError::Redb {
-                source: e.into(),
-                location: snafu::location!(),
-            }),
+            Err(e) => {
+                return Err(crate::error::GatewayError::Redb {
+                    source: e.into(),
+                    location: snafu::location!(),
+                });
+            }
         };
         let mut out = Vec::new();
         for r in t.iter().map_err(|e| e.into()).context(RedbSnafu)? {
@@ -257,13 +372,18 @@ impl Store {
     }
 
     pub fn revoke_refresh_tokens_for_sub(&self, sub: &str) -> Result<usize> {
-        let read = self.db.begin_read().map_err(|e| e.into()).context(RedbSnafu)?;
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| e.into())
+            .context(RedbSnafu)?;
         let hashes: Vec<String> = match read.open_table(REFRESH_TOKENS) {
             Ok(t) => {
                 let mut keys = Vec::new();
                 for r in t.iter().map_err(|e| e.into()).context(RedbSnafu)? {
                     let (_, v) = r.map_err(|e| e.into()).context(RedbSnafu)?;
-                    let rec: RefreshTokenRecord = serde_json::from_slice(v.value()).context(JsonSnafu)?;
+                    let rec: RefreshTokenRecord =
+                        serde_json::from_slice(v.value()).context(JsonSnafu)?;
                     if rec.sub == sub {
                         keys.push(rec.token_hash_hex);
                     }
@@ -271,10 +391,12 @@ impl Store {
                 keys
             }
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
-            Err(e) => return Err(crate::error::GatewayError::Redb {
-                source: e.into(),
-                location: snafu::location!(),
-            }),
+            Err(e) => {
+                return Err(crate::error::GatewayError::Redb {
+                    source: e.into(),
+                    location: snafu::location!(),
+                });
+            }
         };
         drop(read);
         let mut n = 0;

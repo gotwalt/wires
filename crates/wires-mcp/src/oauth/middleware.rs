@@ -14,11 +14,7 @@ use crate::token::{Claims, verify};
 
 const WWW_AUTHENTICATE_HEADER: &str = "WWW-Authenticate";
 
-pub async fn bearer(
-    State(state): State<ServiceState>,
-    mut req: Request,
-    next: Next,
-) -> Response {
+pub async fn bearer(State(state): State<ServiceState>, mut req: Request, next: Next) -> Response {
     let header_val = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -30,9 +26,7 @@ pub async fn bearer(
             return challenge(&state, "missing or non-bearer Authorization header");
         }
     };
-    let is_jti_revoked = |jti: &str| {
-        matches!(state.store.get_revoked_jti(jti), Ok(Some(_)))
-    };
+    let is_jti_revoked = |jti: &str| matches!(state.store.get_revoked_jti(jti), Ok(Some(_)));
     let claims = match verify(
         &state.signing_key.verifying_key(),
         &state.config.public_url,
@@ -63,15 +57,11 @@ fn challenge(state: &ServiceState, _detail: &str) -> Response {
         "{}/.well-known/oauth-protected-resource",
         state.config.public_url.trim_end_matches('/')
     );
-    let www = format!(
-        "Bearer realm=\"mcp\", resource_metadata=\"{prm}\""
-    );
+    let www = format!("Bearer realm=\"mcp\", resource_metadata=\"{prm}\"");
     let mut resp = Response::new(axum::body::Body::empty());
     *resp.status_mut() = StatusCode::UNAUTHORIZED;
-    resp.headers_mut().insert(
-        WWW_AUTHENTICATE_HEADER,
-        www.parse().expect("static header"),
-    );
+    resp.headers_mut()
+        .insert(WWW_AUTHENTICATE_HEADER, www.parse().expect("static header"));
     resp
 }
 
@@ -99,7 +89,9 @@ mod tests {
     }
 
     fn protected_app(state: ServiceState) -> Router {
-        async fn handler() -> &'static str { "ok" }
+        async fn handler() -> &'static str {
+            "ok"
+        }
         Router::new()
             .route("/mcp", get(handler))
             .route_layer(axum::middleware::from_fn_with_state(state.clone(), bearer))
@@ -107,17 +99,22 @@ mod tests {
     }
 
     fn register_client(state: &ServiceState, client_id: &str) {
-        state.store.put_oauth_client(&OauthClientRecord {
-            client_id: client_id.into(),
-            client_name: "test".into(),
-            redirect_uris: vec!["http://x".into()],
-            grant_types: vec!["authorization_code".into()],
-            created_at_ms: 0,
-            revoked: false,
-        }).unwrap();
+        state
+            .store
+            .put_oauth_client(&OauthClientRecord {
+                client_id: client_id.into(),
+                client_name: "test".into(),
+                redirect_uris: vec!["http://x".into()],
+                grant_types: vec!["authorization_code".into()],
+                created_at_ms: 0,
+                revoked: false,
+            })
+            .unwrap();
     }
 
-    fn ts() -> i64 { chrono::Utc::now().timestamp() }
+    fn ts() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
 
     #[tokio::test]
     async fn no_bearer_returns_401_with_www_authenticate() {
@@ -127,7 +124,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let www = resp.headers().get("WWW-Authenticate").unwrap().to_str().unwrap();
+        let www = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(www.contains("Bearer"));
         assert!(www.contains("resource_metadata="));
     }
@@ -146,7 +148,8 @@ mod tests {
                 ttl_s: 60,
                 client_id: "c1",
             },
-        ).unwrap();
+        )
+        .unwrap();
         let resp = protected_app(st)
             .oneshot(
                 Request::get("/mcp")
@@ -162,14 +165,16 @@ mod tests {
     #[tokio::test]
     async fn revoked_client_returns_401() {
         let (_t, st) = state();
-        st.store.put_oauth_client(&OauthClientRecord {
-            client_id: "c1".into(),
-            client_name: "test".into(),
-            redirect_uris: vec!["http://x".into()],
-            grant_types: vec!["authorization_code".into()],
-            created_at_ms: 0,
-            revoked: true,
-        }).unwrap();
+        st.store
+            .put_oauth_client(&OauthClientRecord {
+                client_id: "c1".into(),
+                client_name: "test".into(),
+                redirect_uris: vec!["http://x".into()],
+                grant_types: vec!["authorization_code".into()],
+                created_at_ms: 0,
+                revoked: true,
+            })
+            .unwrap();
         let token = mint(
             &st.signing_key,
             &MintInput {
@@ -180,7 +185,8 @@ mod tests {
                 ttl_s: 60,
                 client_id: "c1",
             },
-        ).unwrap();
+        )
+        .unwrap();
         let resp = protected_app(st)
             .oneshot(
                 Request::get("/mcp")

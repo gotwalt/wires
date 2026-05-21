@@ -114,7 +114,9 @@ impl IngestIndex {
                 let (k, v) = entry_r.context(StorageIoSnafu)?;
                 let mut kbuf = [0u8; 8];
                 kbuf.copy_from_slice(k.value());
-                let Some(ent) = decode_row(v.value()) else { continue };
+                let Some(ent) = decode_row(v.value()) else {
+                    continue;
+                };
                 let bytes = ent.bytes;
                 total = total.saturating_sub(bytes as u64);
                 victim_keys.push(kbuf);
@@ -156,7 +158,9 @@ impl IngestIndex {
             let mut victim_entries: Vec<IngestEntry> = Vec::new();
             for entry_r in idx_t.iter().context(StorageIoSnafu)? {
                 let (k, v) = entry_r.context(StorageIoSnafu)?;
-                let Some(ent) = decode_row(v.value()) else { continue };
+                let Some(ent) = decode_row(v.value()) else {
+                    continue;
+                };
                 if ent.ingested_at_ms >= deadline_ms {
                     break; // short-circuit
                 }
@@ -502,10 +506,8 @@ mod tests {
         idx.record(&entry(2, 8, 1, 200), 3_000).unwrap();
         let all = idx.iter_all_entries().unwrap();
         assert_eq!(all.len(), 3);
-        let keys: std::collections::HashSet<_> = all
-            .iter()
-            .map(|e| (e.topic_id, e.sender, e.seq))
-            .collect();
+        let keys: std::collections::HashSet<_> =
+            all.iter().map(|e| (e.topic_id, e.sender, e.seq)).collect();
         assert!(keys.contains(&([1u8; 32], [9u8; 32], 0)));
         assert!(keys.contains(&([2u8; 32], [8u8; 32], 0)));
         assert!(keys.contains(&([2u8; 32], [8u8; 32], 1)));

@@ -181,7 +181,10 @@ mod tests {
         };
         let s = toml::to_string_pretty(&cfg).unwrap();
         let back: NodeConfig = toml::from_str(&s).unwrap();
-        assert!(back.retention.is_none(), "retention must be skipped on serde");
+        assert!(
+            back.retention.is_none(),
+            "retention must be skipped on serde"
+        );
     }
 
     #[test]

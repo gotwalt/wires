@@ -121,8 +121,8 @@ async fn first_time_pair_then_publish_then_tail() {
     let html = auth_resp.text().await.unwrap();
     let ticket_b64 = extract_meta(&html, "wires-mcp-session-ticket")
         .expect("wires-mcp-session-ticket meta tag missing");
-    let ticket = SessionTicket::decode_url_safe_b64(&ticket_b64)
-        .expect("failed to decode SessionTicket");
+    let ticket =
+        SessionTicket::decode_url_safe_b64(&ticket_b64).expect("failed to decode SessionTicket");
     let session_id = ticket.session_id.clone();
 
     // ── 3a. POST /oauth/session/probe → get pair token ────────────────────────
@@ -139,7 +139,10 @@ async fn first_time_pair_then_publish_then_tail() {
         .unwrap();
     assert_eq!(probe_resp.status(), 200);
     let probe_body: serde_json::Value = probe_resp.json().await.unwrap();
-    assert_eq!(probe_body["kind"], "pair", "expected pair branch: {probe_body}");
+    assert_eq!(
+        probe_body["kind"], "pair",
+        "expected pair branch: {probe_body}"
+    );
     let pair_token = probe_body["pair_token_b64"]
         .as_str()
         .expect("pair_token_b64 missing")

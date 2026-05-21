@@ -39,15 +39,19 @@ pub struct TopicEntry {
 }
 
 async fn list_topics(state: &ServiceState, claims: &Claims) -> Result<Value, JsonRpcError> {
-    let runtime = state.supervisor.get_or_open(&claims.sub).await.map_err(|e| {
-        JsonRpcError { code: -32000, message: format!("unknown_user: {e}") }
-    })?;
+    let runtime = state
+        .supervisor
+        .get_or_open(&claims.sub)
+        .await
+        .map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("unknown_user: {e}"),
+        })?;
     let caps = runtime.node.caps.all().map_err(|e| JsonRpcError {
         code: -32000,
         message: format!("caps: {e}"),
     })?;
-    let names =
-        wires_node::load_topic_names(&runtime.node.config.data_dir).unwrap_or_default();
+    let names = wires_node::load_topic_names(&runtime.node.config.data_dir).unwrap_or_default();
     let mut topics = Vec::new();
     for (cap_id, entry) in caps {
         if entry.revoked {
@@ -76,8 +80,10 @@ async fn list_topics(state: &ServiceState, claims: &Claims) -> Result<Value, Jso
         }
     }
     let body = TopicListing { topics };
-    let text = serde_json::to_string(&body)
-        .map_err(|e| JsonRpcError { code: -32000, message: e.to_string() })?;
+    let text = serde_json::to_string(&body).map_err(|e| JsonRpcError {
+        code: -32000,
+        message: e.to_string(),
+    })?;
     Ok(serde_json::json!({"content": [{"type": "text", "text": text}], "isError": false}))
 }
 
@@ -108,22 +114,22 @@ fn resolve_topic_id(
     topic: &str,
 ) -> Result<[u8; 32], String> {
     // 64-char lowercase hex → topic_id literal; else look up in topic_names.json.
-    if topic.len() == 64 && topic.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+    if topic.len() == 64
+        && topic
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
         let bytes = hex::decode(topic).map_err(|e| format!("topic_not_found: bad hex: {e}"))?;
         return bytes.try_into().map_err(|_| "topic_not_found".to_string());
     }
-    let names =
-        wires_node::load_topic_names(&runtime.node.config.data_dir).unwrap_or_default();
+    let names = wires_node::load_topic_names(&runtime.node.config.data_dir).unwrap_or_default();
     names
         .iter()
         .find_map(|(n, id)| (n == topic).then_some(*id))
         .ok_or_else(|| format!("topic_not_found: {topic}"))
 }
 
-fn topic_name_for_id(
-    runtime: &wires_node::runtime::NodeRuntime,
-    id: &[u8; 32],
-) -> Option<String> {
+fn topic_name_for_id(runtime: &wires_node::runtime::NodeRuntime, id: &[u8; 32]) -> Option<String> {
     let names = wires_node::load_topic_names(&runtime.node.config.data_dir).ok()?;
     names.into_iter().find_map(|(n, t)| (t == *id).then_some(n))
 }
@@ -134,8 +140,7 @@ fn pick_cap_for(
     topic_id: &[u8; 32],
     right: wires_core::Right,
 ) -> Result<wires_core::CapId, String> {
-    let name = topic_name_for_id(runtime, topic_id)
-        .unwrap_or_else(|| name_or_id.to_string());
+    let name = topic_name_for_id(runtime, topic_id).unwrap_or_else(|| name_or_id.to_string());
     let caps = runtime.node.caps.all().map_err(|e| format!("caps: {e}"))?;
     for (cid, entry) in caps {
         if entry.revoked {
@@ -161,9 +166,14 @@ async fn publish_tool(
     claims: &Claims,
     args: PublishArgs,
 ) -> Result<Value, JsonRpcError> {
-    let runtime = state.supervisor.get_or_open(&claims.sub).await.map_err(|e| {
-        JsonRpcError { code: -32000, message: format!("unknown_user: {e}") }
-    })?;
+    let runtime = state
+        .supervisor
+        .get_or_open(&claims.sub)
+        .await
+        .map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("unknown_user: {e}"),
+        })?;
     let topic_id = match resolve_topic_id(&runtime, &args.topic) {
         Ok(t) => t,
         Err(msg) => return Ok(error_result(&msg)),
@@ -171,7 +181,10 @@ async fn publish_tool(
     // Defense: refuse the __caps topic.
     let caps_topic = runtime.node.config.caps_topic_id();
     if topic_id == caps_topic {
-        return Ok(error_result(&format!("reserved_topic: {}", hex::encode(topic_id))));
+        return Ok(error_result(&format!(
+            "reserved_topic: {}",
+            hex::encode(topic_id)
+        )));
     }
     let cap_id = match pick_cap_for(&runtime, &args.topic, &topic_id, wires_core::Right::Write) {
         Ok(c) => c,
@@ -189,7 +202,10 @@ async fn publish_tool(
     let msg = runtime
         .publish_and_broadcast(topic_id, cap_id, content)
         .await
-        .map_err(|e| JsonRpcError { code: -32000, message: format!("publish: {e}") })?;
+        .map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("publish: {e}"),
+        })?;
     let message_hash = hex::encode(msg.message_hash().unwrap_or_default());
     let out = PublishOutput {
         topic_id: hex::encode(topic_id),
@@ -199,8 +215,10 @@ async fn publish_tool(
         timestamp: msg.timestamp,
         message_hash,
     };
-    let text = serde_json::to_string(&out)
-        .map_err(|e| JsonRpcError { code: -32000, message: e.to_string() })?;
+    let text = serde_json::to_string(&out).map_err(|e| JsonRpcError {
+        code: -32000,
+        message: e.to_string(),
+    })?;
     Ok(serde_json::json!({"content": [{"type": "text", "text": text}], "isError": false}))
 }
 
@@ -229,9 +247,14 @@ async fn tail_tool(
     claims: &Claims,
     args: TailArgs,
 ) -> Result<Value, JsonRpcError> {
-    let runtime = state.supervisor.get_or_open(&claims.sub).await.map_err(|e| {
-        JsonRpcError { code: -32000, message: format!("unknown_user: {e}") }
-    })?;
+    let runtime = state
+        .supervisor
+        .get_or_open(&claims.sub)
+        .await
+        .map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("unknown_user: {e}"),
+        })?;
     let topic_id = match resolve_topic_id(&runtime, &args.topic) {
         Ok(t) => t,
         Err(msg) => return Ok(error_result(&msg)),
@@ -267,7 +290,10 @@ async fn tail_tool(
     let msgs = runtime
         .node
         .read_decrypted_since(&topic_id, &cursor.hwm, limit)
-        .map_err(|e| JsonRpcError { code: -32000, message: format!("tail: {e}") })?;
+        .map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("tail: {e}"),
+        })?;
     let next_cursor = encode_cursor(&cursor, &msgs);
     let body = serde_json::json!({
         "messages": msgs.iter().map(|m| serde_json::json!({
@@ -282,8 +308,10 @@ async fn tail_tool(
         "next_cursor": next_cursor,
         "exhausted":   msgs.len() < limit,
     });
-    let text = serde_json::to_string(&body)
-        .map_err(|e| JsonRpcError { code: -32000, message: e.to_string() })?;
+    let text = serde_json::to_string(&body).map_err(|e| JsonRpcError {
+        code: -32000,
+        message: e.to_string(),
+    })?;
     Ok(serde_json::json!({"content": [{"type": "text", "text": text}], "isError": false}))
 }
 
@@ -311,20 +339,17 @@ pub async fn call(
     match p.name.as_str() {
         "wires_list_topics" => list_topics(&state, claims).await,
         "wires_publish" => {
-            let args: PublishArgs = serde_json::from_value(p.arguments).map_err(|e| {
-                JsonRpcError {
+            let args: PublishArgs =
+                serde_json::from_value(p.arguments).map_err(|e| JsonRpcError {
                     code: -32602,
                     message: format!("invalid arguments: {e}"),
-                }
-            })?;
+                })?;
             publish_tool(&state, claims, args).await
         }
         "wires_tail" => {
-            let args: TailArgs = serde_json::from_value(p.arguments).map_err(|e| {
-                JsonRpcError {
-                    code: -32602,
-                    message: format!("invalid arguments: {e}"),
-                }
+            let args: TailArgs = serde_json::from_value(p.arguments).map_err(|e| JsonRpcError {
+                code: -32602,
+                message: format!("invalid arguments: {e}"),
             })?;
             tail_tool(&state, claims, args).await
         }
@@ -396,7 +421,10 @@ mod tests {
         runtime.node.caps.upsert_grant(&cap).unwrap();
 
         // Install an epoch key so publish works.
-        runtime.node.install_epoch_key(topic_id, 0, [9u8; 32]).unwrap();
+        runtime
+            .node
+            .install_epoch_key(topic_id, 0, [9u8; 32])
+            .unwrap();
 
         wires_node::upsert_topic_names(
             &user_dir,

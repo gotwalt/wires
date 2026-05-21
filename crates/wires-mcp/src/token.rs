@@ -2,12 +2,10 @@
 //! Claims per spec §4.5. Verification is offline (signature + claims +
 //! optional caller-supplied JTI revocation check).
 
+use crate::error::{ExpiredTokenSnafu, GatewayError, MissingScopeSnafu, Result, RevokedJtiSnafu};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
-use crate::error::{
-    ExpiredTokenSnafu, GatewayError, MissingScopeSnafu, RevokedJtiSnafu, Result,
-};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Claims {
@@ -155,7 +153,15 @@ mod tests {
             },
         )
         .unwrap();
-        let c = verify(&vk, "https://mcp.example", "https://mcp.example", |_| false, &token, now + 5).unwrap();
+        let c = verify(
+            &vk,
+            "https://mcp.example",
+            "https://mcp.example",
+            |_| false,
+            &token,
+            now + 5,
+        )
+        .unwrap();
         assert_eq!(c.sub.len(), 64);
         assert_eq!(c.scope, SCOPE_MCP_WIRES);
         assert_eq!(c.client_id, "client-1");
