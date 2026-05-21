@@ -13,6 +13,7 @@ pub fn list_descriptors() -> Value {
         {"name": "wires_list_topics",       "description": "List topics this agent can access",                  "inputSchema": {"type":"object","properties":{}}},
         {"name": "wires_publish",           "description": "Publish a message to a topic",                       "inputSchema": {"type":"object","properties":{"topic":{"type":"string"},"text":{"type":"string"},"data":{"type":"object"}},"required":["topic","text"]}},
         {"name": "wires_tail",              "description": "Read recent messages from a topic",                  "inputSchema": {"type":"object","properties":{"topic":{"type":"string"},"since":{"type":"string"},"limit":{"type":"integer"}},"required":["topic"]}},
+        {"name": "wires_list_channels",     "description": "List channels (named + DMs) this agent is in",       "inputSchema": {"type":"object","properties":{}}},
         {"name": "wires_create_channel",    "description": "Create a named channel",                             "inputSchema": {"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"}},"required":["name"]}}
     ]})
 }
@@ -353,6 +354,94 @@ async fn tail_tool(
     Ok(serde_json::json!({"content": [{"type": "text", "text": text}], "isError": false}))
 }
 
+// ── list_channels ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+struct ChannelListing {
+    channels: Vec<ChannelEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChannelEntry {
+    topic_id: String,
+    name: String,
+    kind: String, // "named" | "dm"
+    member_count: usize,
+    pending_count: usize,
+}
+
+async fn list_channels(state: &ServiceState, claims: &Claims) -> Result<Value, JsonRpcError> {
+    let runtime = state
+        .supervisor
+        .get_or_open(&claims.sub)
+        .await
+        .map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("unknown_user: {e}"),
+        })?;
+    let data_dir = &runtime.node.config.data_dir;
+    let names = wires_node::load_topic_names(data_dir).unwrap_or_default();
+    let self_pk = runtime.node.ed_sk.verifying_key().to_bytes();
+
+    let mut channels: Vec<ChannelEntry> = Vec::new();
+    for (name, topic_id) in &names {
+        if !name.starts_with("channels.") {
+            continue;
+        }
+        let log = match runtime.node.open_topic_log(topic_id) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let keys = match runtime.node.epoch_keys_for(topic_id) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        let (_epoch, key) = match keys.latest() {
+            Ok(Some(pair)) => pair,
+            _ => continue,
+        };
+        let is_dm = name.starts_with("channels.dm.");
+        if is_dm {
+            // For DMs, we don't have on-hand the sorted participants; ChannelView::empty_dm
+            // requires them. The participant list is implicit in the topic_id; we re-fold
+            // members from log entries (member_meta) regardless of variant for counts.
+            let view = match wires_node::channel::open_dm(*topic_id, vec![], &log, &key) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if view.members.contains_key(&self_pk) {
+                channels.push(ChannelEntry {
+                    topic_id: hex::encode(topic_id),
+                    name: name.clone(),
+                    kind: "dm".to_string(),
+                    member_count: view.members.len(),
+                    pending_count: view.pending.len(),
+                });
+            }
+        } else {
+            let view = match wires_node::channel::open_named(*topic_id, &log, &key) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if view.members.contains_key(&self_pk) {
+                channels.push(ChannelEntry {
+                    topic_id: hex::encode(topic_id),
+                    name: name.clone(),
+                    kind: "named".to_string(),
+                    member_count: view.members.len(),
+                    pending_count: view.pending.len(),
+                });
+            }
+        }
+    }
+    let body = ChannelListing { channels };
+    let text = serde_json::to_string(&body).map_err(|e| JsonRpcError {
+        code: -32000,
+        message: e.to_string(),
+    })?;
+    Ok(serde_json::json!({"content": [{"type": "text", "text": text}], "isError": false}))
+}
+
 // ── create_channel ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -479,6 +568,7 @@ pub async fn call(
             })?;
             tail_tool(&state, claims, args).await
         }
+        "wires_list_channels" => list_channels(&state, claims).await,
         "wires_create_channel" => {
             let args: CreateChannelArgs =
                 serde_json::from_value(p.arguments).map_err(|e| JsonRpcError {
