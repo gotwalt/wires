@@ -17,7 +17,8 @@ pub fn list_descriptors() -> Value {
         {"name": "wires_create_channel",    "description": "Create a named channel",                             "inputSchema": {"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"}},"required":["name"]}},
         {"name": "wires_channel_members",   "description": "Return the roster (members + pending) of a channel", "inputSchema": {"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
         {"name": "wires_invite_to_channel", "description": "Invite an agent to a named channel",                 "inputSchema": {"type":"object","properties":{"name":{"type":"string"},"agent_pubkey":{"type":"string"}},"required":["name","agent_pubkey"]}},
-        {"name": "wires_dm_open",           "description": "Open or refresh a DM with another agent",            "inputSchema": {"type":"object","properties":{"agent_pubkey":{"type":"string"}},"required":["agent_pubkey"]}}
+        {"name": "wires_dm_open",           "description": "Open or refresh a DM with another agent",            "inputSchema": {"type":"object","properties":{"agent_pubkey":{"type":"string"}},"required":["agent_pubkey"]}},
+        {"name": "wires_set_member_meta",   "description": "Update this agent's member metadata across joined channels", "inputSchema": {"type":"object","properties":{"kind":{"type":"string"},"display_name":{"type":"string"},"description":{"type":"string"}},"required":["kind","display_name"]}}
     ]})
 }
 
@@ -791,6 +792,108 @@ fn lookup_x25519_pubkey(data_dir: &std::path::Path, agent: &[u8; 32]) -> Option<
     bytes.try_into().ok()
 }
 
+// ── set_member_meta ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+struct SetMemberMetaArgs {
+    kind: String,
+    display_name: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SetMemberMetaOutput {
+    updated_channels: usize,
+}
+
+async fn set_member_meta_tool(
+    state: &ServiceState,
+    claims: &Claims,
+    args: SetMemberMetaArgs,
+) -> Result<Value, JsonRpcError> {
+    use wires_core::channel::schemas::{ChannelMemberMeta, TYPE_MEMBER_META};
+    use wires_core::channel::types::MemberKind;
+
+    let runtime = state
+        .supervisor
+        .get_or_open(&claims.sub)
+        .await
+        .map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("unknown_user: {e}"),
+        })?;
+
+    let parsed_kind: MemberKind = match serde_json::from_str(&format!("\"{}\"", args.kind)) {
+        Ok(k) => k,
+        Err(_) => {
+            return Ok(error_result(
+                "kind must be one of: agent, api, cli, human, unknown",
+            ));
+        }
+    };
+
+    let data_dir = &runtime.node.config.data_dir;
+    let me = serde_json::json!({
+        "kind": args.kind,
+        "display_name": args.display_name,
+        "description": args.description,
+    });
+    if let Err(e) = std::fs::write(
+        data_dir.join("me.json"),
+        serde_json::to_vec_pretty(&me).expect("JSON serializes"),
+    ) {
+        return Ok(error_result(&format!("write me.json: {e}")));
+    }
+
+    let names = wires_node::load_topic_names(data_dir).unwrap_or_default();
+    let now = wires_net::unix_now_ms();
+    let mut count = 0usize;
+
+    for (name, topic_id) in names {
+        if !name.starts_with("channels.") {
+            continue;
+        }
+        let cap_id =
+            match wires_node::channel::find_cap_for(&runtime.node, &name, wires_core::Right::Write)
+            {
+                Some(id) => id,
+                None => continue,
+            };
+        let meta = ChannelMemberMeta {
+            kind: parsed_kind,
+            display_name: args.display_name.clone(),
+            description: args.description.clone(),
+            asserted_at: now,
+        };
+        let value = match serde_json::to_value(&meta) {
+            Ok(v) => v,
+            Err(e) => return Ok(error_result(&format!("serialize meta: {e}"))),
+        };
+        if let Err(e) = wires_node::channel::publish_public(
+            &runtime.node,
+            topic_id,
+            cap_id,
+            TYPE_MEMBER_META,
+            &format!("member {}", args.display_name),
+            value,
+            now,
+        ) {
+            return Ok(error_result(&format!("publish member_meta: {e}")));
+        }
+        count += 1;
+    }
+
+    let out = SetMemberMetaOutput {
+        updated_channels: count,
+    };
+    let text = serde_json::to_string(&out).map_err(|e| JsonRpcError {
+        code: -32000,
+        message: e.to_string(),
+    })?;
+    Ok(serde_json::json!({"content": [{"type": "text", "text": text}], "isError": false}))
+}
+
 fn encode_cursor(prev: &TailCursor, msgs: &[wires_node::DecryptedMessage]) -> String {
     let mut cur = prev.clone();
     for m in msgs {
@@ -861,6 +964,14 @@ pub async fn call(
                     message: format!("invalid arguments: {e}"),
                 })?;
             dm_open_tool(&state, claims, args).await
+        }
+        "wires_set_member_meta" => {
+            let args: SetMemberMetaArgs =
+                serde_json::from_value(p.arguments).map_err(|e| JsonRpcError {
+                    code: -32602,
+                    message: format!("invalid arguments: {e}"),
+                })?;
+            set_member_meta_tool(&state, claims, args).await
         }
         other => Err(JsonRpcError {
             code: -32601,
