@@ -34,10 +34,22 @@ pub fn fold(view: &mut ChannelView, events: impl IntoIterator<Item = Event>) {
     }
 }
 
-#[allow(clippy::single_match)]
 fn apply(view: &mut ChannelView, ev: &Event) {
+    let is_meta = ev.content_type == TYPE_MEMBER_META;
+    if !is_meta && !publisher_has_meta(view, &ev.sender) {
+        // Rule 3: drop messages from publishers with no on-log meta.
+        // Exception: __channel.create is also exempt — it is the bootstrap
+        // event that the creator publishes immediately before their own meta;
+        // its only effect is on `name/creator/created_at`, none of which
+        // depend on the publisher being a "member."
+        if ev.content_type != TYPE_CREATE {
+            return;
+        }
+    }
     match ev.content_type.as_str() {
         TYPE_CREATE => apply_create(view, ev),
+        TYPE_MEMBER_META => apply_member_meta(view, ev),
+        // INVITE arm added in next task
         _ => {}
     }
 }
@@ -67,9 +79,41 @@ fn apply_create(view: &mut ChannelView, ev: &Event) {
     view.created_at = Some(parsed.created_at);
 }
 
+fn apply_member_meta(view: &mut ChannelView, ev: &Event) {
+    // Rule 4: self-only. The publisher's pubkey IS the subject; there is no
+    // explicit subject field in the content. So self-only is satisfied by
+    // construction — we apply the meta to `ev.sender` only.
+    let parsed: ChannelMemberMeta = match ev
+        .data
+        .as_ref()
+        .and_then(|d| serde_json::from_value(d.clone()).ok())
+    {
+        Some(v) => v,
+        None => return,
+    };
+    let meta = MemberMeta {
+        kind: parsed.kind,
+        display_name: parsed.display_name,
+        description: parsed.description,
+        asserted_at: parsed.asserted_at,
+    };
+    // Rule 5: latest-wins (BTreeMap insert overwrites).
+    view.members.insert(ev.sender, meta);
+    // Promote from pending if applicable.
+    view.pending.remove(&ev.sender);
+}
+
+/// Rule 3: returns true iff `sender` has already published a member_meta on
+/// this view. `__channel.member_meta` itself is exempt — it is its own
+/// admission ticket.
+fn publisher_has_meta(view: &ChannelView, sender: &Pubkey) -> bool {
+    view.members.contains_key(sender)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::types::MemberKind;
 
     fn ev(sender: Pubkey, type_: &str, content: &impl serde::Serialize) -> Event {
         Event {
@@ -184,5 +228,93 @@ mod tests {
         } else {
             panic!("expected Dm variant preserved");
         }
+    }
+
+    #[test]
+    fn member_meta_self_publish_admits_into_members() {
+        let alice: Pubkey = [1u8; 32];
+        let mut v = ChannelView::empty_named([7u8; 32]);
+        fold(
+            &mut v,
+            [ev(
+                alice,
+                TYPE_MEMBER_META,
+                &ChannelMemberMeta {
+                    kind: MemberKind::Agent,
+                    display_name: "alice-bot".to_string(),
+                    description: None,
+                    asserted_at: 5,
+                },
+            )],
+        );
+        assert!(v.members.contains_key(&alice));
+    }
+
+    #[test]
+    fn member_meta_latest_wins() {
+        let alice: Pubkey = [1u8; 32];
+        let mut v = ChannelView::empty_named([7u8; 32]);
+        fold(
+            &mut v,
+            [
+                ev(
+                    alice,
+                    TYPE_MEMBER_META,
+                    &ChannelMemberMeta {
+                        kind: MemberKind::Agent,
+                        display_name: "old".to_string(),
+                        description: None,
+                        asserted_at: 5,
+                    },
+                ),
+                ev(
+                    alice,
+                    TYPE_MEMBER_META,
+                    &ChannelMemberMeta {
+                        kind: MemberKind::Agent,
+                        display_name: "new".to_string(),
+                        description: None,
+                        asserted_at: 10,
+                    },
+                ),
+            ],
+        );
+        assert_eq!(v.members[&alice].display_name, "new");
+    }
+
+    #[test]
+    fn pre_meta_events_from_publisher_are_dropped() {
+        // alice tries to invite bob before publishing her own member_meta.
+        // The invite should not be folded.
+        let alice: Pubkey = [1u8; 32];
+        let bob: Pubkey = [2u8; 32];
+        let mut v = ChannelView::empty_named([7u8; 32]);
+        fold(
+            &mut v,
+            [
+                ev(
+                    alice,
+                    TYPE_CREATE,
+                    &ChannelCreate {
+                        name: "c".to_string(),
+                        description: None,
+                        created_at: 1,
+                    },
+                ),
+                // No alice member_meta yet.
+                ev(
+                    alice,
+                    TYPE_INVITE,
+                    &ChannelInvite {
+                        agent: bob,
+                        invited_at: 2,
+                    },
+                ),
+            ],
+        );
+        assert!(
+            v.pending.is_empty(),
+            "invite from unmeta'd publisher must be dropped"
+        );
     }
 }
