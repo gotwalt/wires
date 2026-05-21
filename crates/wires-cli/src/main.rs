@@ -106,6 +106,8 @@ enum ChannelCmd {
     List,
     /// Show the member roster for a channel.
     Members { name: String },
+    /// Invite an agent to a channel (publishes a sealed history_grant + a public invite).
+    Invite { name: String, agent: String },
 }
 
 #[derive(Subcommand)]
@@ -153,6 +155,9 @@ async fn main() -> std::process::ExitCode {
         }
         Cmd::Channel(ChannelCmd::List) => cmd::channel::list(&data_dir).await,
         Cmd::Channel(ChannelCmd::Members { name }) => cmd::channel::members(&data_dir, &name).await,
+        Cmd::Channel(ChannelCmd::Invite { name, agent }) => {
+            cmd::channel::invite(&data_dir, &name, &agent).await
+        }
         Cmd::Publish {
             topic,
             cap,
