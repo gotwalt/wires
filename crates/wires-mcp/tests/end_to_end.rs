@@ -39,12 +39,12 @@ use tempfile::TempDir;
 use wires_core::Capability;
 use wires_core::cap::Right;
 use wires_mcp::config::GatewayConfig;
+use wires_mcp::fabrics::FabricSupervisor;
 use wires_mcp::http::{self, ServiceState};
 use wires_mcp::oauth::session_ticket::SessionTicket;
 use wires_mcp::pair_bridge::PairBridge;
 use wires_mcp::rate_limit::RateLimiter;
 use wires_mcp::store::Store;
-use wires_mcp::tenants::TenantSupervisor;
 use wires_net::pair::{
     PairClient, PairGrant, PairGrantEnvelope, PairRequest, TopicEpochKey, TopicNameEntry,
 };
@@ -67,7 +67,7 @@ async fn first_time_pair_then_publish_then_tail() {
         retention: None,
     };
     let store = Store::open(&cfg.gateway_db_path()).unwrap();
-    let supervisor = TenantSupervisor::new(cfg.users_dir(), Duration::from_secs(60), None);
+    let supervisor = FabricSupervisor::new(cfg.users_dir(), Duration::from_secs(60), None);
     let pair_bridge = Arc::new(PairBridge::new(
         cfg.pending_pairs_dir(),
         cfg.public_url.clone(),

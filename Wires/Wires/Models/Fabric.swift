@@ -17,7 +17,7 @@ final class Fabric {
     var hostRelayURL: String?
     var hostHintExpiresAtMs: Int64?
     var capsTopicIdHex: String?
-    var tenantRegisteredAt: Date?
+    var fabricRegisteredAt: Date?
 
     @Relationship(deleteRule: .cascade) var topics: [TopicRecord]
     @Relationship(deleteRule: .cascade) var caps: [CapRecord]
@@ -31,7 +31,7 @@ final class Fabric {
         hostRelayURL: String? = nil,
         hostHintExpiresAtMs: Int64? = nil,
         capsTopicIdHex: String? = nil,
-        tenantRegisteredAt: Date? = nil
+        fabricRegisteredAt: Date? = nil
     ) {
         self.rootPubkeyHex = rootPubkeyHex
         self.createdAt = createdAt
@@ -41,7 +41,7 @@ final class Fabric {
         self.hostRelayURL = hostRelayURL
         self.hostHintExpiresAtMs = hostHintExpiresAtMs
         self.capsTopicIdHex = capsTopicIdHex
-        self.tenantRegisteredAt = tenantRegisteredAt
+        self.fabricRegisteredAt = fabricRegisteredAt
         self.topics = []
         self.caps = []
     }

@@ -20,14 +20,14 @@ extension WiresClient {
                 )
             },
             registerWithHostedService: { _ in
-                TenantRegistration(
+                FabricRegistration(
                     capsTopicIdHex: String(repeating: "cd", count: 32),
                     hostEndpointIdHex: String(repeating: "ab", count: 32),
                     serverTimeMs: 0
                 )
             },
             registerTopic: { _, _ in },
-            unregisterTenant: { _ in
+            unregisterFabric: { _ in
                 UnregisterResult(ok: true, topicsRemoved: 0)
             },
             parsePairRequest: { _ in

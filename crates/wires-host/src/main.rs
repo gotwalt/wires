@@ -1,5 +1,5 @@
-//! Blind multi-tenant relay/replay-server. Topics arrive dynamically via the
-//! tenant control protocol; no `--topic` flags.
+//! Blind multi-fabric relay/replay-server. Topics arrive dynamically via the
+//! fabric control protocol; no `--topic` flags.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,20 +9,20 @@ use iroh::SecretKey;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wires_core::WireMessage;
-use wires_host::per_tenant_logs::PerTenantLogs;
-use wires_host::replay_source::PerTenantReplaySource;
+use wires_host::fabric_registry::{FabricHandlerConfig, FabricHandlerImpl, FabricRegistry};
+use wires_host::per_fabric_logs::PerFabricLogs;
+use wires_host::replay_source::PerFabricReplaySource;
 use wires_host::retention::Retention;
 use wires_host::routing::{Router as MsgRouter, WriteRateLimiter};
-use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
 use wires_host::ticket_http;
+use wires_net::fabric::{ALPN as FABRIC_ALPN, FabricProtocol};
 use wires_net::replay::{ALPN as REPLAY_ALPN, ReplayProtocol};
-use wires_net::tenant::{ALPN as TENANT_ALPN, TenantProtocol};
 use wires_net::{GOSSIP_ALPN, GossipNode, load_or_create_secret, unix_now_ms};
 
 #[derive(Parser)]
 #[command(
     name = "wires-host",
-    about = "Blind multi-tenant relay for the wires network"
+    about = "Blind multi-fabric relay for the wires network"
 )]
 struct Args {
     #[arg(long)]
@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SecretKey::from_bytes(&secret),
         vec![
             GOSSIP_ALPN.to_vec(),
-            TENANT_ALPN.to_vec(),
+            FABRIC_ALPN.to_vec(),
             REPLAY_ALPN.to_vec(),
         ],
     )
@@ -117,8 +117,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Storage + state -------------------------------------------------------
-    let registry = Arc::new(TenantRegistry::open(&args.data_dir)?);
-    let logs = Arc::new(PerTenantLogs::new(&args.data_dir));
+    let registry = Arc::new(FabricRegistry::open(&args.data_dir)?);
+    let logs = Arc::new(PerFabricLogs::new(&args.data_dir));
     let retention = Arc::new(Retention::new(&args.data_dir, Arc::clone(&logs)));
     let rate = Arc::new(WriteRateLimiter::new(1_000));
     let router_state = Arc::new(MsgRouter::new(
@@ -181,21 +181,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Resubscribe to every topic persisted in topic_index before any control
     // RPC can arrive. Otherwise a restarted host stays silent until each
-    // tenant re-issues `topic-register`.
+    // fabric re-issues `topic-register`.
     for topic_id in registry.all_topic_ids()? {
         let _ = subscribe_tx.send(topic_id);
     }
 
-    // Tenant handler --------------------------------------------------------
+    // Fabric handler --------------------------------------------------------
     let subscribe_tx_clone = subscribe_tx.clone();
     let logs_for_cb = Arc::clone(&logs);
     let retention_for_cb = Arc::clone(&retention);
     let data_dir_for_cb = args.data_dir.clone();
-    let handler = Arc::new(TenantHandlerImpl {
+    let handler = Arc::new(FabricHandlerImpl {
         registry: Arc::clone(&registry),
         retention: Arc::clone(&retention),
         host_endpoint_id: endpoint_id_bytes,
-        config: TenantHandlerConfig::default(),
+        config: FabricHandlerConfig::default(),
         now_ms: Arc::new(unix_now_ms),
         on_topic_registered: Arc::new(move |_root, topic| {
             let _ = subscribe_tx_clone.send(topic);
@@ -203,24 +203,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         on_topic_unregistered: Arc::new(|_root, _topic| {
             // v1: subscription stays live; future spec adds a teardown signal.
         }),
-        on_tenant_unregistered: Arc::new(move |root, _topics| {
+        on_fabric_unregistered: Arc::new(move |root, _topics| {
             // Drop in-memory caches first so the open redb handles get released,
-            // then remove the on-disk tenant directory. Cache clearing is
+            // then remove the on-disk fabric directory. Cache clearing is
             // synchronous; the rm is best-effort and logged on failure.
-            logs_for_cb.clear_tenant(&root);
-            retention_for_cb.clear_tenant(&root);
-            let tenant_dir = data_dir_for_cb.join("tenants").join(hex::encode(root));
-            if tenant_dir.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&tenant_dir) {
+            logs_for_cb.clear_fabric(&root);
+            retention_for_cb.clear_fabric(&root);
+            let fabric_dir = data_dir_for_cb.join("fabrics").join(hex::encode(root));
+            if fabric_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&fabric_dir) {
                     tracing::warn!(
                         error = %e,
-                        dir = %tenant_dir.display(),
-                        "failed to remove tenant directory on unregister",
+                        dir = %fabric_dir.display(),
+                        "failed to remove fabric directory on unregister",
                     );
                 } else {
                     tracing::info!(
-                        dir = %tenant_dir.display(),
-                        "removed tenant directory on unregister",
+                        dir = %fabric_dir.display(),
+                        "removed fabric directory on unregister",
                     );
                 }
             }
@@ -228,14 +228,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Register ALPNs --------------------------------------------------------
-    let replay_protocol = ReplayProtocol::new(Arc::new(PerTenantReplaySource::new(
+    let replay_protocol = ReplayProtocol::new(Arc::new(PerFabricReplaySource::new(
         Arc::clone(&registry),
         Arc::clone(&logs),
     )));
     let _router = iroh::protocol::Router::builder(endpoint.clone())
         .accept(GOSSIP_ALPN, gossip_handler)
         .accept(REPLAY_ALPN, replay_protocol)
-        .accept(TENANT_ALPN, TenantProtocol::new(Arc::clone(&handler)))
+        .accept(FABRIC_ALPN, FabricProtocol::new(Arc::clone(&handler)))
         .spawn();
 
     // Shared shutdown signal. Ctrl+C cancels the token; the HTTP task and

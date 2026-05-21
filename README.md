@@ -5,9 +5,9 @@ End-to-end encrypted gossip substrate for a fabric — your network of agents, s
 **Status: prototype.** Five slices have landed on `main`:
 
 - **Substrate v1** — identity, topics, capabilities, encrypted publish/subscribe, replay between peers, persisted hash-chained logs. Drives the CLI end-to-end. Spec: [`docs/superpowers/specs/2026-05-14-wires-substrate-design.md`](docs/superpowers/specs/2026-05-14-wires-substrate-design.md).
-- **Hosted service v1** — `wires-host` is a multi-tenant blind relay with a `/wires/tenant/0` control-plane ALPN, per-tenant rolling retention, and an HTTPS service-discovery endpoint. Spec: [`docs/superpowers/specs/2026-05-14-wires-hosted-service-design.md`](docs/superpowers/specs/2026-05-14-wires-hosted-service-design.md).
+- **Hosted service v1** — `wires-host` is a multi-fabric blind relay with a `/wires/fabric/0` control-plane ALPN, per-fabric rolling retention, and an HTTPS service-discovery endpoint. Spec: [`docs/superpowers/specs/2026-05-14-wires-hosted-service-design.md`](docs/superpowers/specs/2026-05-14-wires-hosted-service-design.md).
 - **Responder-driven pairing v1** — agents declare a role + requested scopes via `wires pair-listen`; the operator consents and dials in via `wires pair-approve` over `/wires/pair/0` with a sealed, signed `PairGrant`. Spec: [`docs/superpowers/specs/2026-05-15-wires-responder-driven-pairing-design.md`](docs/superpowers/specs/2026-05-15-wires-responder-driven-pairing-design.md).
-- **MCP gateway v1** — `wires-mcp` is a multi-tenant authenticated MCP gateway. OAuth 2.1 (PRM + AS + DCR), iOS as universal authenticator. Per-user TTL + byte-budget retention (defaults: 1 h / 50 MiB; operator-tunable via `[retention]`). Specs: [gateway](docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md), [retention](docs/superpowers/specs/2026-05-18-wires-mcp-retention-design.md).
+- **MCP gateway v1** — `wires-mcp` is a multi-fabric authenticated MCP gateway. OAuth 2.1 (PRM + AS + DCR), iOS as universal authenticator. Per-user TTL + byte-budget retention (defaults: 1 h / 50 MiB; operator-tunable via `[retention]`). Specs: [gateway](docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md), [retention](docs/superpowers/specs/2026-05-18-wires-mcp-retention-design.md).
 - **Channels v1** — named (operator-introduced, persistent name) and DM (DH-derived, zero-setup) channels share one wire vocabulary, one cap glob (`channels.**`), and one `ChannelView` fold. Three new reserved types (`__channel.create/invite/member_meta`). Spec: [`docs/superpowers/specs/2026-05-21-wires-channels-design.md`](docs/superpowers/specs/2026-05-21-wires-channels-design.md).
 
 A working Home Assistant ingestion daemon (`wires-ha`) ships as a separate binary.
@@ -25,7 +25,7 @@ cargo build --release
 Three binaries land in `target/release/`:
 
 - **`wires`** — the agent/human CLI. One data directory per agent.
-- **`wires-host`** — a multi-tenant blind relay/replay server. Holds no keys; persists ciphertext only for tenants and topics that have registered via the tenant control protocol.
+- **`wires-host`** — a multi-fabric blind relay/replay server. Holds no keys; persists ciphertext only for fabrics and topics that have registered via the fabric control protocol.
 - **`wires-ha`** — Home Assistant ingestion daemon. Subscribes to a HA WebSocket and publishes `state_changed` events onto a configured wires topic.
 
 For the walkthrough below it's convenient to also `cargo install --path crates/wires-cli` and `cargo install --path crates/wires-host` so `wires` and `wires-host` are on your `$PATH`.
@@ -35,8 +35,8 @@ For the walkthrough below it's convenient to also `cargo install --path crates/w
 - **Identity.** Every agent has an Ed25519 signing key and an X25519 secret. The root key for a fabric is a separate Ed25519 keypair held by the operator; capabilities are signed by it. `wires init` generates the agent identity; with no `--root` it also generates a local root key.
 - **Capability.** A signed grant of `read` and/or `write` on a topic to a specific agent pubkey. Capabilities are the only way to publish. Operators (root-key holders) mint them in response to a pair request from an agent via `wires pair-approve`; caps live in each agent's `caps.db`.
 - **Topic.** A 32-byte id with a per-epoch symmetric key. Messages on a topic are encrypted under the current epoch key. Topic names (e.g. `home.notes`) are a CLI-side convenience that maps to a random id at creation time.
-- **Host.** A `wires-host` process is a blind multi-tenant relay: it persists ciphertext per tenant, serves replay, and routes by `topic_id → tenant`. It cannot decrypt anything.
-- **Fabric.** The unit of organization rooted in one human: identity, all paired agents/services, and the channels they share. The host calls this a "tenant" internally (the ALPN is `/wires/tenant/0`, the on-disk path is `tenants/<root>/`) — same thing, different layer.
+- **Host.** A `wires-host` process is a blind multi-fabric relay: it persists ciphertext per fabric, serves replay, and routes by `topic_id → fabric`. It cannot decrypt anything.
+- **Fabric.** The unit of organization rooted in one human: identity, all paired agents/services, and the channels they share. The host serves many fabrics from one address.
 
 ## Quick start: a local proof-of-concept in four terminals
 
@@ -84,7 +84,7 @@ wires --data-dir ./alice topic create home.notes
 wires --data-dir ./alice host topic-register home.notes
 # → Registered topic <TOPIC_HEX>
 
-# 5. Check what the host reports for this tenant.
+# 5. Check what the host reports for this fabric.
 wires --data-dir ./alice host status
 ```
 
@@ -161,19 +161,19 @@ Within a second or two Bob's `cat --tail` prints the message:
 
 ```bash
 ls ./host
-# iroh.secret  tenants.redb  topic_index.redb  nonces.redb  tenants/
+# iroh.secret  fabrics.redb  topic_index.redb  nonces.redb  fabrics/
 
-ls ./host/tenants
-# <root_pubkey_hex>/        ← one directory per registered tenant
+ls ./host/fabrics
+# <root_pubkey_hex>/        ← one directory per registered fabric
 
-ls ./host/tenants/<ROOT_HEX>
+ls ./host/fabrics/<ROOT_HEX>
 # log_<TOPIC_HEX>.redb      ← per-topic ciphertext log
-# ingest_<ROOT_HEX>.redb    ← per-tenant FIFO eviction index
+# ingest_<ROOT_HEX>.redb    ← per-fabric FIFO eviction index
 ```
 
-The host has zero per-tenant secrets — no caps, no epoch keys. Verify with `ls`: you'll see only the four host-level redb files plus a per-tenant subdir of opaque ciphertext logs. The host literally cannot decrypt the content.
+The host has zero per-fabric secrets — no caps, no epoch keys. Verify with `ls`: you'll see only the four host-level redb files plus a per-fabric subdir of opaque ciphertext logs. The host literally cannot decrypt the content.
 
-### Tenant status from the operator's side
+### Fabric status from the operator's side
 
 ```bash
 wires --data-dir ./alice host status
@@ -181,20 +181,20 @@ wires --data-dir ./alice host status
 
 Re-run after publishing a few messages — `bytes_stored` will grow, `topic_count` reflects registered topics, and `oldest_retained_at` advances forward as the retention budget evicts.
 
-### Inspect on-disk per-tenant size
+### Inspect on-disk per-fabric size
 
 ```bash
-du -h ./host/tenants/<ROOT_HEX>
+du -h ./host/fabrics/<ROOT_HEX>
 ```
 
-This is what a hosted-service operator would graph per tenant.
+This is what a hosted-service operator would graph per fabric.
 
 ## Resilience: kill the host and watch replay catch up
 
 1. In Tab 2, publish several more messages over a few seconds.
 2. In Tab 1, `Ctrl-C` the host.
 3. In Tab 2, publish a few more — these go peer-to-peer (Alice + Bob still see each other via gossip) but are NOT persisted by the host because it's down.
-4. Restart Tab 1: `wires-host --data-dir ./host`. The host reloads its tenants.redb and topic_index.redb, re-subscribes to every previously-registered topic.
+4. Restart Tab 1: `wires-host --data-dir ./host`. The host reloads its fabrics.redb and topic_index.redb, re-subscribes to every previously-registered topic.
 5. In a fresh Tab 4, run a "cold" Bob — copy `./bob` to `./bob2`, then `wires --data-dir ./bob2 cat home.notes`. The replay client pulls every message the host retains, and Bob2 sees everything published while the host was alive. Messages published while the host was down are visible to live Bob (via gossip) but not to cold Bob2 (because they were never persisted) — exactly the substrate's hash-chained "gap detection" property.
 
 ## Other useful commands
@@ -256,7 +256,7 @@ below).
 - Transport is [iroh](https://www.iroh.computer) (`0.98`). Discovery uses iroh's N0 preset by default, plus mDNS on the LAN.
 - Gossip runs over iroh-gossip on the topic id directly.
 - Replay (catching up after downtime) uses a custom QUIC stream on ALPN `/wires/replay/0`.
-- Tenant control (registration + topic register/unregister + status) uses ALPN `/wires/tenant/0` with length-prefixed JSON frames.
+- Fabric control (registration + topic register/unregister + status) uses ALPN `/wires/fabric/0` with length-prefixed JSON frames.
 - Pairing (operator approving an agent) uses ALPN `/wires/pair/0` with a sealed, signed `PairGrant`.
 - Host discovery is out-of-band: the host emits a base64 `HostTicket` on startup (and a terminal QR when stderr is a TTY) that carries the host's `endpoint_id`, direct addrs, and relay URL. Operators paste the ticket into `wires host pair --ticket <…>`; the `endpoint_id` is permanent while the addrs/relay are a short-TTL hint that iroh re-resolves as needed.
 
@@ -267,10 +267,10 @@ crates/
   wires-core    pure types (WireMessage, Capability, content, sign/verify) + channel layer (ChannelView, derivation, replay fold)
   wires-crypto  AEAD (chacha20-poly1305), sealed-box (x25519), public envelopes
   wires-store   redb-backed hash-chained logs, cap table, epoch keys, ingest index
-  wires-net     iroh gossip + replay protocol + tenant control protocol + pair protocol + host ticket
+  wires-net     iroh gossip + replay protocol + fabric control protocol + pair protocol + host ticket
   wires-node    Node runtime (publish, inbound, sync, NetGlue, NodeRuntime) + channel I/O (open_named, open_dm, shared helpers for CLI/MCP)
   wires-cli     `wires` binary (init/host/topic/publish/cat/pair-* plus channel/dm/me)
-  wires-host    `wires-host` multi-tenant relay (lib + bin: tenant registry, retention, routing, host-ticket emission)
+  wires-host    `wires-host` multi-fabric relay (lib + bin: fabric registry, retention, routing, host-ticket emission)
   wires-ha      `wires-ha` Home Assistant ingestion daemon
   wires-mcp     `wires-mcp` authenticated MCP gateway (lib + bin: OAuth 2.1, per-user NodeRuntime, MCP tools)
 docs/superpowers/
@@ -340,7 +340,7 @@ ${EDITOR:-nano} docker/wires-mcp.toml
 
 Subsequent rollouts: `git push origin main && ssh <host> ./docker/deploy.sh`.
 The named volumes `wires-host-data` and `wires-mcp-data` carry iroh secrets,
-tenant state, the gateway JWT signing key, and per-user agent data through
+fabric state, the gateway JWT signing key, and per-user agent data through
 container recreates, so the host's `EndpointId` and the gateway's JWT
 issuer survive rollouts.
 

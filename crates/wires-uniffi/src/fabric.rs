@@ -1,5 +1,4 @@
-//! Fabric-side wrappers around `wires-net::tenant` (the host-internal name
-//! for a fabric's host footprint) that the iOS app drives.
+//! Fabric-side wrappers around `wires-net::fabric` that the iOS app drives.
 //! Stateless — each call uses the caller's bound endpoint, registers the
 //! host's address hints into the endpoint's address-lookup table, and sends
 //! one signed request. Host info reaches these via `parse_host_ticket`
@@ -9,21 +8,21 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use iroh::{Endpoint, EndpointAddr, TransportAddr};
+use wires_net::fabric::{FabricClient, FabricResponse};
 use wires_net::peer_hint::endpoint_id_from_hex;
-use wires_net::tenant::{TenantClient, TenantResponse};
 
 use crate::error::{
-    InternalSnafu, TenantRejectedSnafu, TenantStreamSnafu, TopicRegisterRejectedSnafu,
+    FabricRejectedSnafu, FabricStreamSnafu, InternalSnafu, TopicRegisterRejectedSnafu,
     TopicRegisterStreamSnafu, WiresError,
 };
 use crate::signer::{SwiftRootSigner, SwiftRootSignerAdapter};
-use crate::types::{HostInfo, TenantRegistration, UnregisterResult};
+use crate::types::{FabricRegistration, HostInfo, UnregisterResult};
 
 pub async fn register_with_hosted_service(
     endpoint: Endpoint,
     root_signer: Arc<dyn SwiftRootSigner>,
     host: &HostInfo,
-) -> Result<TenantRegistration, WiresError> {
+) -> Result<FabricRegistration, WiresError> {
     let peer = decode_endpoint_id(&host.endpoint_id_hex)?;
     register_hint_addrs(&endpoint, host);
 
@@ -31,30 +30,30 @@ pub async fn register_with_hosted_service(
     let host_eid_bytes = *peer.as_bytes();
     let now = now_ms()?;
 
-    let client = TenantClient::new(endpoint);
+    let client = FabricClient::new(endpoint);
     let resp = client
-        .register_tenant(peer, &adapter, &host_eid_bytes, now)
+        .register_fabric(peer, &adapter, &host_eid_bytes, now)
         .await
         .map_err(|e| {
-            TenantStreamSnafu {
+            FabricStreamSnafu {
                 message: format!("{e}"),
             }
             .build()
         })?;
 
     match resp {
-        TenantResponse::Register(r) if r.ok => Ok(TenantRegistration {
+        FabricResponse::Register(r) if r.ok => Ok(FabricRegistration {
             caps_topic_id_hex: hex::encode(r.caps_topic_id),
             host_endpoint_id_hex: r.host_endpoint_id,
             server_time_ms: r.server_time,
         }),
-        TenantResponse::Error(err) => Err(TenantRejectedSnafu {
+        FabricResponse::Error(err) => Err(FabricRejectedSnafu {
             code: err.code,
             message: err.message,
         }
         .build()),
         other => Err(InternalSnafu {
-            message: format!("unexpected tenant response: {other:?}"),
+            message: format!("unexpected fabric response: {other:?}"),
         }
         .build()),
     }
@@ -72,29 +71,29 @@ pub async fn unregister_with_hosted_service(
     let host_eid_bytes = *peer.as_bytes();
     let now = now_ms()?;
 
-    let client = TenantClient::new(endpoint);
+    let client = FabricClient::new(endpoint);
     let resp = client
-        .unregister_tenant(peer, &adapter, &host_eid_bytes, now)
+        .unregister_fabric(peer, &adapter, &host_eid_bytes, now)
         .await
         .map_err(|e| {
-            TenantStreamSnafu {
+            FabricStreamSnafu {
                 message: format!("{e}"),
             }
             .build()
         })?;
 
     match resp {
-        TenantResponse::Unregister(r) => Ok(UnregisterResult {
+        FabricResponse::Unregister(r) => Ok(UnregisterResult {
             ok: r.ok,
             topics_removed: r.topics_removed,
         }),
-        TenantResponse::Error(err) => Err(TenantRejectedSnafu {
+        FabricResponse::Error(err) => Err(FabricRejectedSnafu {
             code: err.code,
             message: err.message,
         }
         .build()),
         other => Err(InternalSnafu {
-            message: format!("unexpected tenant response: {other:?}"),
+            message: format!("unexpected fabric response: {other:?}"),
         }
         .build()),
     }
@@ -113,7 +112,7 @@ pub async fn register_topic(
     let host_eid_bytes = *peer.as_bytes();
     let now = now_ms()?;
 
-    let client = TenantClient::new(endpoint);
+    let client = FabricClient::new(endpoint);
     let resp = client
         .register_topic(peer, &adapter, topic_id, &host_eid_bytes, now)
         .await
@@ -125,14 +124,14 @@ pub async fn register_topic(
         })?;
 
     match resp {
-        TenantResponse::TopicRegister(r) if r.ok => Ok(()),
-        TenantResponse::Error(err) => Err(TopicRegisterRejectedSnafu {
+        FabricResponse::TopicRegister(r) if r.ok => Ok(()),
+        FabricResponse::Error(err) => Err(TopicRegisterRejectedSnafu {
             code: err.code,
             message: err.message,
         }
         .build()),
         other => Err(InternalSnafu {
-            message: format!("unexpected tenant response: {other:?}"),
+            message: format!("unexpected fabric response: {other:?}"),
         }
         .build()),
     }

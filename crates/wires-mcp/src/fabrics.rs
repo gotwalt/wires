@@ -15,7 +15,7 @@ use wires_node::runtime::NodeRuntime;
 use crate::error::{OpenRuntimeSnafu, Result, UnknownUserSnafu};
 
 #[derive(Clone)]
-pub struct TenantSupervisor {
+pub struct FabricSupervisor {
     inner: Arc<tokio::sync::Mutex<Inner>>,
     users_dir: PathBuf,
     idle_ttl: Duration,
@@ -31,7 +31,7 @@ struct Slot {
     last_touched: Instant,
 }
 
-impl TenantSupervisor {
+impl FabricSupervisor {
     pub fn users_dir(&self) -> &Path {
         &self.users_dir
     }
@@ -151,7 +151,7 @@ mod tests {
     #[tokio::test]
     async fn get_or_open_errors_for_unknown_sub() {
         let tmp = TempDir::new().unwrap();
-        let s = TenantSupervisor::new(tmp.path().to_path_buf(), Duration::from_secs(60), None);
+        let s = FabricSupervisor::new(tmp.path().to_path_buf(), Duration::from_secs(60), None);
         let err = s.get_or_open("nope").await.err().expect("expected error");
         assert!(matches!(
             err,
@@ -180,7 +180,7 @@ mod tests {
         .unwrap();
         std::fs::write(pending.join("iroh.secret"), [7u8; 32]).unwrap();
 
-        let sup = TenantSupervisor::new(users.clone(), Duration::from_secs(60), None);
+        let sup = FabricSupervisor::new(users.clone(), Duration::from_secs(60), None);
         sup.bind(&sub, &pending).await.unwrap();
 
         assert!(users.join(&sub).exists());
@@ -209,7 +209,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("iroh.secret"), [5u8; 32]).unwrap();
 
-        let sup = TenantSupervisor::new(users.clone(), Duration::from_millis(50), None);
+        let sup = FabricSupervisor::new(users.clone(), Duration::from_millis(50), None);
         let _ = sup.get_or_open(&sub).await.unwrap();
         assert!(sup.is_open(&sub).await);
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -220,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_gc_returns_a_join_handle_that_cancels() {
         let tmp = TempDir::new().unwrap();
-        let sup = TenantSupervisor::new(tmp.path().to_path_buf(), Duration::from_millis(50), None);
+        let sup = FabricSupervisor::new(tmp.path().to_path_buf(), Duration::from_millis(50), None);
         let h = sup.clone().spawn_gc(Duration::from_millis(10));
         h.abort();
     }
@@ -252,7 +252,7 @@ mod tests {
             ttl: Duration::from_millis(50),
             max_bytes_per_user: 0,
         };
-        let sup = TenantSupervisor::new(users.clone(), Duration::from_secs(60), Some(policy));
+        let sup = FabricSupervisor::new(users.clone(), Duration::from_secs(60), Some(policy));
         let rt = sup.get_or_open(&sub).await.unwrap();
         let node = rt.node.clone();
 
@@ -323,7 +323,7 @@ mod tests {
             max_bytes_per_user: 1024,
         };
         let sup =
-            TenantSupervisor::new(users.clone(), Duration::from_secs(60), Some(policy.clone()));
+            FabricSupervisor::new(users.clone(), Duration::from_secs(60), Some(policy.clone()));
         let rt = sup.get_or_open(&sub).await.unwrap();
         assert!(
             rt.node.ingest_index.is_some(),

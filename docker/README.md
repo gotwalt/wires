@@ -77,7 +77,7 @@ single source of truth for which wires service holds which Funnel slot.
 ./docker/deploy.sh --no-verify      # skip the HTTP healthcheck polls on :10000 and :10001
 ```
 
-The named volume `wires-host-data` carries `iroh.secret` and all tenant
+The named volume `wires-host-data` carries `iroh.secret` and all fabric
 state through container recreates, so the host's `EndpointId` (and thus
 the published ticket) is stable across rollouts.
 
@@ -238,5 +238,5 @@ sharing a port via sub-paths or moving an existing service.
   TOML's `public_url` is part of every issued JWT. If you change it, all
   outstanding tokens become invalid; clients must re-authorize.
 - **EndpointId changed after redeploy** — the named volume was destroyed.
-  Restore from backup if available; otherwise every paired tenant must
+  Restore from backup if available; otherwise every paired fabric must
   re-pair against the new ticket.

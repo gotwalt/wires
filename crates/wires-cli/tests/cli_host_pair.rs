@@ -1,4 +1,4 @@
-//! Integration test: spin up a minimal tenant-only host in-process, build a
+//! Integration test: spin up a minimal fabric-only host in-process, build a
 //! `HostTicket` from it, point `wires host pair` at it via `--ticket`, and
 //! verify config.toml is updated with the host's peer hint.
 
@@ -8,28 +8,28 @@ use ed25519_dalek::SigningKey;
 use iroh::SecretKey;
 use rand_core::OsRng;
 use tempfile::TempDir;
-use wires_host::per_tenant_logs::PerTenantLogs;
+use wires_host::fabric_registry::{FabricHandlerConfig, FabricHandlerImpl, FabricRegistry};
+use wires_host::per_fabric_logs::PerFabricLogs;
 use wires_host::retention::Retention;
-use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
 use wires_net::HostTicket;
-use wires_net::tenant::{ALPN as TENANT_ALPN, TenantProtocol};
+use wires_net::fabric::{ALPN as FABRIC_ALPN, FabricProtocol};
 
 #[tokio::test]
 async fn host_pair_persists_host_to_config() {
-    // ---- spin up a tenant-aware host -----------------------------------
+    // ---- spin up a fabric-aware host -----------------------------------
     let host_tmp = TempDir::new().unwrap();
-    let registry = Arc::new(TenantRegistry::open(host_tmp.path()).unwrap());
-    let logs = Arc::new(PerTenantLogs::new(host_tmp.path()));
+    let registry = Arc::new(FabricRegistry::open(host_tmp.path()).unwrap());
+    let logs = Arc::new(PerFabricLogs::new(host_tmp.path()));
     let retention = Arc::new(Retention::new(host_tmp.path(), Arc::clone(&logs)));
-    let host_ep = wires_net::bind_cloud(SecretKey::generate(), vec![TENANT_ALPN.to_vec()])
+    let host_ep = wires_net::bind_cloud(SecretKey::generate(), vec![FABRIC_ALPN.to_vec()])
         .await
         .unwrap();
     let host_eid: [u8; 32] = host_ep.id().as_bytes().to_owned();
-    let handler = Arc::new(TenantHandlerImpl {
+    let handler = Arc::new(FabricHandlerImpl {
         registry: Arc::clone(&registry),
         retention,
         host_endpoint_id: host_eid,
-        config: TenantHandlerConfig::default(),
+        config: FabricHandlerConfig::default(),
         now_ms: Arc::new(|| {
             use std::time::{SystemTime, UNIX_EPOCH};
             SystemTime::now()
@@ -39,10 +39,10 @@ async fn host_pair_persists_host_to_config() {
         }),
         on_topic_registered: Arc::new(|_, _| {}),
         on_topic_unregistered: Arc::new(|_, _| {}),
-        on_tenant_unregistered: Arc::new(|_, _| {}),
+        on_fabric_unregistered: Arc::new(|_, _| {}),
     });
     let _router = iroh::protocol::Router::builder(host_ep.clone())
-        .accept(TENANT_ALPN, TenantProtocol::new(handler))
+        .accept(FABRIC_ALPN, FabricProtocol::new(handler))
         .spawn();
 
     // Wait for the host endpoint to come online so its socket addresses are
@@ -85,7 +85,7 @@ async fn host_pair_persists_host_to_config() {
     assert_eq!(h.peer_hints.len(), 1);
     assert_eq!(h.peer_hints[0].node_id, hex::encode(host_eid));
 
-    // Tenant must be in the host's registry.
+    // Fabric must be in the host's registry.
     let root_pubkey = root.verifying_key().to_bytes();
     assert!(registry.get(&root_pubkey).unwrap().is_some());
 }

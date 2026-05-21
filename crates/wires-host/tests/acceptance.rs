@@ -1,14 +1,14 @@
-//! Acceptance scenario: end-to-end tenant register via a host ticket.
+//! Acceptance scenario: end-to-end fabric register via a host ticket.
 
 use std::sync::Arc;
 
 use iroh::SecretKey;
 use rand_core::OsRng;
 use tempfile::TempDir;
-use wires_host::per_tenant_logs::PerTenantLogs;
+use wires_host::fabric_registry::{FabricHandlerConfig, FabricHandlerImpl, FabricRegistry};
+use wires_host::per_fabric_logs::PerFabricLogs;
 use wires_host::retention::Retention;
-use wires_host::tenant_registry::{TenantHandlerConfig, TenantHandlerImpl, TenantRegistry};
-use wires_net::tenant::{ALPN as TENANT_ALPN, TenantProtocol, TenantResponse};
+use wires_net::fabric::{ALPN as FABRIC_ALPN, FabricProtocol, FabricResponse};
 
 #[tokio::test]
 #[ignore]
@@ -18,18 +18,18 @@ async fn end_to_end_register_via_host_ticket() {
 
     // ---- host setup ----------------------------------------------------
     let host_tmp = TempDir::new().unwrap();
-    let registry = Arc::new(TenantRegistry::open(host_tmp.path()).unwrap());
-    let logs = Arc::new(PerTenantLogs::new(host_tmp.path()));
+    let registry = Arc::new(FabricRegistry::open(host_tmp.path()).unwrap());
+    let logs = Arc::new(PerFabricLogs::new(host_tmp.path()));
     let retention = Arc::new(Retention::new(host_tmp.path(), Arc::clone(&logs)));
-    let host_ep = wires_net::bind_cloud(SecretKey::generate(), vec![TENANT_ALPN.to_vec()])
+    let host_ep = wires_net::bind_cloud(SecretKey::generate(), vec![FABRIC_ALPN.to_vec()])
         .await
         .unwrap();
     let host_eid_bytes: [u8; 32] = host_ep.id().as_bytes().to_owned();
-    let handler = Arc::new(TenantHandlerImpl {
+    let handler = Arc::new(FabricHandlerImpl {
         registry: Arc::clone(&registry),
         retention,
         host_endpoint_id: host_eid_bytes,
-        config: TenantHandlerConfig::default(),
+        config: FabricHandlerConfig::default(),
         now_ms: Arc::new(|| {
             use std::time::{SystemTime, UNIX_EPOCH};
             SystemTime::now()
@@ -39,10 +39,10 @@ async fn end_to_end_register_via_host_ticket() {
         }),
         on_topic_registered: Arc::new(|_, _| {}),
         on_topic_unregistered: Arc::new(|_, _| {}),
-        on_tenant_unregistered: Arc::new(|_, _| {}),
+        on_fabric_unregistered: Arc::new(|_, _| {}),
     });
     let _router = iroh::protocol::Router::builder(host_ep.clone())
-        .accept(TENANT_ALPN, TenantProtocol::new(handler))
+        .accept(FABRIC_ALPN, FabricProtocol::new(handler))
         .spawn();
 
     // ---- operator builds the ticket the iOS-app / CLI would scan -------
@@ -70,15 +70,15 @@ async fn end_to_end_register_via_host_ticket() {
         .await
         .unwrap();
 
-    // ---- assert tenant registered --------------------------------------
+    // ---- assert fabric registered --------------------------------------
     let root_pubkey = root.verifying_key().to_bytes();
     assert!(registry.get(&root_pubkey).unwrap().is_some());
 }
 
-// Acceptance #1: two distinct tenants (representing two CLI agents under
+// Acceptance #1: two distinct fabrics (representing two CLI agents under
 // two different roots) on one host process. Each registers their own topic.
 // Each publishes via gossip. The host persists each into the correct
-// per-tenant directory. No cross-tenant content leakage.
+// per-fabric directory. No cross-fabric content leakage.
 
 use ed25519_dalek::SigningKey as DalekSk;
 use std::time::Duration;
@@ -88,15 +88,15 @@ use wires_host::routing::{Router as MsgRouter, WriteRateLimiter};
 use wires_net::{ALPN as REPLAY_ALPN, GossipNode};
 
 use iroh::{Endpoint, endpoint::presets};
-use wires_net::tenant::TenantClient;
+use wires_net::fabric::FabricClient;
 
 #[tokio::test]
 #[ignore]
-async fn two_tenants_share_one_host_no_leakage() {
+async fn two_fabrics_share_one_host_no_leakage() {
     let _ = tracing_subscriber::fmt::try_init();
     let host_tmp = TempDir::new().unwrap();
-    let registry = Arc::new(TenantRegistry::open(host_tmp.path()).unwrap());
-    let logs = Arc::new(PerTenantLogs::new(host_tmp.path()));
+    let registry = Arc::new(FabricRegistry::open(host_tmp.path()).unwrap());
+    let logs = Arc::new(PerFabricLogs::new(host_tmp.path()));
     let retention = Arc::new(Retention::new(host_tmp.path(), Arc::clone(&logs)));
     let rate = Arc::new(WriteRateLimiter::new(1_000));
     let router_state = Arc::new(MsgRouter::new(
@@ -108,12 +108,12 @@ async fn two_tenants_share_one_host_no_leakage() {
 
     // Host endpoint with all three ALPNs (matches production main.rs setup
     // after Task 18.5's fix: GOSSIP_ALPN must be registered on the same Router
-    // that owns TENANT_ALPN + REPLAY_ALPN, otherwise gossip QUIC handshakes
+    // that owns FABRIC_ALPN + REPLAY_ALPN, otherwise gossip QUIC handshakes
     // silently fail to dispatch).
     let host_ep = Endpoint::builder(presets::N0)
         .secret_key(SecretKey::generate())
         .alpns(vec![
-            TENANT_ALPN.to_vec(),
+            FABRIC_ALPN.to_vec(),
             REPLAY_ALPN.to_vec(),
             wires_net::GOSSIP_ALPN.to_vec(),
         ])
@@ -123,7 +123,7 @@ async fn two_tenants_share_one_host_no_leakage() {
     let host_eid_bytes: [u8; 32] = host_ep.id().as_bytes().to_owned();
 
     // Gossip on the host using new_without_router so we can multiplex with
-    // the tenant + replay ALPNs on one combined Router below.
+    // the fabric + replay ALPNs on one combined Router below.
     let (gossip, gossip_handler) = GossipNode::new_without_router(host_ep.clone())
         .await
         .unwrap();
@@ -153,13 +153,13 @@ async fn two_tenants_share_one_host_no_leakage() {
         });
     }
 
-    // Tenant handler with the matching subscribe hook.
+    // Fabric handler with the matching subscribe hook.
     let subscribe_tx_for_handler = subscribe_tx.clone();
-    let handler = Arc::new(TenantHandlerImpl {
+    let handler = Arc::new(FabricHandlerImpl {
         registry: Arc::clone(&registry),
         retention: Arc::clone(&retention),
         host_endpoint_id: host_eid_bytes,
-        config: TenantHandlerConfig::default(),
+        config: FabricHandlerConfig::default(),
         now_ms: Arc::new(|| {
             use std::time::{SystemTime, UNIX_EPOCH};
             SystemTime::now()
@@ -171,11 +171,11 @@ async fn two_tenants_share_one_host_no_leakage() {
             let _ = subscribe_tx_for_handler.send(topic);
         }),
         on_topic_unregistered: Arc::new(|_, _| {}),
-        on_tenant_unregistered: Arc::new(|_, _| {}),
+        on_fabric_unregistered: Arc::new(|_, _| {}),
     });
     let _proto_router = iroh::protocol::Router::builder(host_ep.clone())
         .accept(wires_net::GOSSIP_ALPN, gossip_handler)
-        .accept(TENANT_ALPN, TenantProtocol::new(handler))
+        .accept(FABRIC_ALPN, FabricProtocol::new(handler))
         .spawn();
 
     // Bring the host endpoint online so peer endpoints have a concrete addr
@@ -185,7 +185,7 @@ async fn two_tenants_share_one_host_no_leakage() {
         .await
         .expect("host endpoint did not come online");
 
-    // Two tenants: distinct roots, distinct topic ids.
+    // Two fabrics: distinct roots, distinct topic ids.
     let root_a = DalekSk::generate(&mut OsRng);
     let root_b = DalekSk::generate(&mut OsRng);
     let topic_a = [0xAAu8; 32];
@@ -199,7 +199,7 @@ async fn two_tenants_share_one_host_no_leakage() {
             .as_millis() as i64
     };
 
-    // Tenant A endpoint + MemoryLookup pointing at host (avoids pkarr DNS).
+    // Fabric A endpoint + MemoryLookup pointing at host (avoids pkarr DNS).
     let caller_ep_a = Endpoint::builder(presets::N0)
         .secret_key(SecretKey::generate())
         .alpns(vec![wires_net::GOSSIP_ALPN.to_vec()])
@@ -219,19 +219,19 @@ async fn two_tenants_share_one_host_no_leakage() {
         iroh::address_lookup::memory::MemoryLookup::from_endpoint_info(vec![caller_ep_a.addr()]),
     );
 
-    let client_a = TenantClient::new(caller_ep_a.clone());
+    let client_a = FabricClient::new(caller_ep_a.clone());
     let r = client_a
-        .register_tenant(host_ep.id(), &root_a, &host_eid_bytes, now())
+        .register_fabric(host_ep.id(), &root_a, &host_eid_bytes, now())
         .await
         .unwrap();
-    assert!(matches!(r, TenantResponse::Register(_)));
+    assert!(matches!(r, FabricResponse::Register(_)));
     let r = client_a
         .register_topic(host_ep.id(), &root_a, &topic_a, &host_eid_bytes, now())
         .await
         .unwrap();
-    assert!(matches!(r, TenantResponse::TopicRegister(_)));
+    assert!(matches!(r, FabricResponse::TopicRegister(_)));
 
-    // Tenant B endpoint + MemoryLookup.
+    // Fabric B endpoint + MemoryLookup.
     let caller_ep_b = Endpoint::builder(presets::N0)
         .secret_key(SecretKey::generate())
         .alpns(vec![wires_net::GOSSIP_ALPN.to_vec()])
@@ -249,9 +249,9 @@ async fn two_tenants_share_one_host_no_leakage() {
         iroh::address_lookup::memory::MemoryLookup::from_endpoint_info(vec![caller_ep_b.addr()]),
     );
 
-    let client_b = TenantClient::new(caller_ep_b.clone());
+    let client_b = FabricClient::new(caller_ep_b.clone());
     let _ = client_b
-        .register_tenant(host_ep.id(), &root_b, &host_eid_bytes, now())
+        .register_fabric(host_ep.id(), &root_b, &host_eid_bytes, now())
         .await
         .unwrap();
     let _ = client_b
@@ -302,14 +302,14 @@ async fn two_tenants_share_one_host_no_leakage() {
         .unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Assert: on-disk per-tenant directories contain only their own log.
+    // Assert: on-disk per-fabric directories contain only their own log.
     let dir_a = host_tmp
         .path()
-        .join("tenants")
+        .join("fabrics")
         .join(hex::encode(root_a.verifying_key().to_bytes()));
     let dir_b = host_tmp
         .path()
-        .join("tenants")
+        .join("fabrics")
         .join(hex::encode(root_b.verifying_key().to_bytes()));
     let entries_a: Vec<_> = std::fs::read_dir(&dir_a).unwrap().flatten().collect();
     let entries_b: Vec<_> = std::fs::read_dir(&dir_b).unwrap().flatten().collect();

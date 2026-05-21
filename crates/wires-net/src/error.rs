@@ -111,8 +111,8 @@ pub enum NetError {
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Root signer rejected the tenant request, at {location}"))]
-    TenantSignerRejected {
+    #[snafu(display("Root signer rejected the fabric request, at {location}"))]
+    FabricSignerRejected {
         #[snafu(source)]
         source: wires_core::SignError,
         #[snafu(implicit)]
