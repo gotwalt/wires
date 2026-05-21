@@ -2,7 +2,7 @@ import Foundation
 import SwiftData
 
 @Model
-final class Household {
+final class Fabric {
     @Attribute(.unique) var rootPubkeyHex: String
     var createdAt: Date
 

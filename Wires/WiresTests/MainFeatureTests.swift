@@ -15,7 +15,7 @@ struct MainFeatureTests {
         ) {
             MainFeature()
         } withDependencies: {
-            $0.householdClient = .testValue
+            $0.fabricClient = .testValue
             $0.wiresClient = .testValue
             $0.keychainClient = .testValue
         }

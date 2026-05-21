@@ -3,19 +3,19 @@ import Dependencies
 import Foundation
 import SwiftData
 
-/// Errors `HouseholdClient` operations can surface.
-enum HouseholdError: Error, Equatable {
+/// Errors `FabricClient` operations can surface.
+enum FabricError: Error, Equatable {
     case notFound
     case persistenceFailed(String)
 }
 
-/// Persistence facade for the household root, topic registry, and cap
+/// Persistence facade for the fabric root, topic registry, and cap
 /// registry. The `liveValue` is backed by a `ModelContainer`; reducers stay
 /// I/O-free and exercise this client through `withDependencies`.
 @DependencyClient
-struct HouseholdClient {
-    var loadHousehold: @Sendable () async throws -> Household?
-    var saveHousehold: @Sendable (_ household: Household) async throws -> Void
+struct FabricClient {
+    var loadFabric: @Sendable () async throws -> Fabric?
+    var saveFabric: @Sendable (_ fabric: Fabric) async throws -> Void
     var refreshHostInfo: @Sendable (
         _ endpointIdHex: String,
         _ addrs: [String],
@@ -31,20 +31,20 @@ struct HouseholdClient {
     /// `revokedAt = .now` on the matching CapRecord row. The
     /// substrate-level revoke broadcast lands in a later phase.
     var revokeCap: @Sendable (_ capIdHex: String) async throws -> Void
-    /// Delete every Household, TopicRecord, and CapRecord row.
+    /// Delete every Fabric, TopicRecord, and CapRecord row.
     var wipeAll: @Sendable () async throws -> Void
 }
 
-extension HouseholdClient: DependencyKey {
-    static let liveValue: HouseholdClient = .live()
+extension FabricClient: DependencyKey {
+    static let liveValue: FabricClient = .live()
 
     static func live(
-        container: ModelContainer = HouseholdClient.makeDefaultContainer()
-    ) -> HouseholdClient {
-        let store = HouseholdStore(container: container)
-        return HouseholdClient(
-            loadHousehold: { try await store.loadHousehold() },
-            saveHousehold: { try await store.save($0) },
+        container: ModelContainer = FabricClient.makeDefaultContainer()
+    ) -> FabricClient {
+        let store = FabricStore(container: container)
+        return FabricClient(
+            loadFabric: { try await store.loadFabric() },
+            saveFabric: { try await store.save($0) },
             refreshHostInfo: { eid, addrs, relay, hint in
                 try await store.refreshHostInfo(
                     endpointIdHex: eid,
@@ -65,7 +65,7 @@ extension HouseholdClient: DependencyKey {
 
     static func makeDefaultContainer() -> ModelContainer {
         do {
-            let schema = Schema([Household.self, TopicRecord.self, CapRecord.self])
+            let schema = Schema([Fabric.self, TopicRecord.self, CapRecord.self])
             let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
             return try ModelContainer(for: schema, configurations: [config])
         } catch {
@@ -75,7 +75,7 @@ extension HouseholdClient: DependencyKey {
 
     static func makeInMemoryContainer() -> ModelContainer {
         do {
-            let schema = Schema([Household.self, TopicRecord.self, CapRecord.self])
+            let schema = Schema([Fabric.self, TopicRecord.self, CapRecord.self])
             let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
             return try ModelContainer(for: schema, configurations: [config])
         } catch {
@@ -85,9 +85,9 @@ extension HouseholdClient: DependencyKey {
 }
 
 extension DependencyValues {
-    var householdClient: HouseholdClient {
-        get { self[HouseholdClient.self] }
-        set { self[HouseholdClient.self] = newValue }
+    var fabricClient: FabricClient {
+        get { self[FabricClient.self] }
+        set { self[FabricClient.self] = newValue }
     }
 }
 
@@ -95,23 +95,23 @@ extension DependencyValues {
 /// `ModelContext` on the main actor, performs the read/write, and returns
 /// detached value snapshots so callers don't hold long-lived model refs.
 @MainActor
-private final class HouseholdStore {
+private final class FabricStore {
     let container: ModelContainer
 
     init(container: ModelContainer) {
         self.container = container
     }
 
-    func loadHousehold() throws -> Household? {
+    func loadFabric() throws -> Fabric? {
         let ctx = ModelContext(container)
-        let descriptor = FetchDescriptor<Household>()
+        let descriptor = FetchDescriptor<Fabric>()
         let all = try ctx.fetch(descriptor)
         return all.first
     }
 
-    func save(_ household: Household) throws {
+    func save(_ fabric: Fabric) throws {
         let ctx = ModelContext(container)
-        ctx.insert(household)
+        ctx.insert(fabric)
         try ctx.save()
     }
 
@@ -122,9 +122,9 @@ private final class HouseholdStore {
         hintExpiresAtMs: Int64
     ) throws {
         let ctx = ModelContext(container)
-        let descriptor = FetchDescriptor<Household>()
+        let descriptor = FetchDescriptor<Fabric>()
         guard let h = try ctx.fetch(descriptor).first else {
-            throw HouseholdError.notFound
+            throw FabricError.notFound
         }
         h.hostEndpointIdHex = endpointIdHex
         h.hostDirectAddrs = addrs
@@ -151,7 +151,7 @@ private final class HouseholdStore {
             predicate: #Predicate { $0.topicIdHex == topicIdHex }
         )
         guard let t = try ctx.fetch(descriptor).first else {
-            throw HouseholdError.notFound
+            throw FabricError.notFound
         }
         t.registeredWithHost = true
         try ctx.save()
@@ -175,7 +175,7 @@ private final class HouseholdStore {
             predicate: #Predicate { $0.capIdHex == capIdHex }
         )
         guard let cap = try ctx.fetch(descriptor).first else {
-            throw HouseholdError.notFound
+            throw FabricError.notFound
         }
         cap.revokedAt = .now
         try ctx.save()
@@ -185,7 +185,7 @@ private final class HouseholdStore {
         let ctx = ModelContext(container)
         // Delete in dependency-free order. The schema has no cascades wired
         // up, so each entity is dropped independently.
-        for h in try ctx.fetch(FetchDescriptor<Household>()) {
+        for h in try ctx.fetch(FetchDescriptor<Fabric>()) {
             ctx.delete(h)
         }
         for t in try ctx.fetch(FetchDescriptor<TopicRecord>()) {

@@ -24,7 +24,7 @@ struct NetworkFeature {
         case rowTapped(ServiceSummary)
     }
 
-    @Dependency(\.householdClient) var household
+    @Dependency(\.fabricClient) var fabric
 
     var body: some Reducer<State, Action> {
         Reduce { state, action in
@@ -41,10 +41,10 @@ struct NetworkFeature {
                 }
                 state.loading = true
                 state.loadError = nil
-                let household = self.household
+                let fabric = self.fabric
                 return .run { send in
                     do {
-                        let caps = try await household.listCaps()
+                        let caps = try await fabric.listCaps()
                         let summaries = caps.map(CapToServiceMapper.summary(from:))
                         await send(.loaded(summaries))
                     } catch {
