@@ -4,17 +4,11 @@ use std::path::Path;
 
 use snafu::ResultExt;
 use wires_core::CanonicalContent;
-use wires_core::channel::derive::{dm_epoch_key, dm_topic_id, dm_topic_name, sort_participants};
-use wires_core::channel::schemas::{ChannelMemberMeta, TYPE_MEMBER_META};
 use wires_core::channel::types::MemberKind;
 use wires_core::wire::MessageKind;
 use wires_net::unix_now_ms;
-use wires_node::{
-    KeyingMaterial, Node, NodeConfig, PublishParams, build_message, load_dm_roster,
-    upsert_topic_names,
-};
+use wires_node::{KeyingMaterial, Node, NodeConfig, PublishParams, build_message, load_dm_roster};
 
-use crate::cmd::channel::publish_public;
 use crate::cmd::publish_helpers::find_write_cap_for;
 use crate::error::{IoSnafu, NodeSnafu, Result, TomlParseSnafu};
 use crate::invalid;
@@ -34,57 +28,37 @@ pub async fn open(data_dir: &Path, other_pubkey_hex: &str, message: Option<&str>
         .try_into()
         .map_err(|_| invalid!("root pubkey must be 32 bytes",))?;
     let node = Node::open(cfg).context(NodeSnafu)?;
-    let self_pk = node.ed_sk.verifying_key().to_bytes();
-
-    let participants = sort_participants(vec![self_pk, other]);
-    let topic_id = dm_topic_id(&cfg_root, &participants);
 
     let other_x_pk = lookup_x25519_pubkey(data_dir, &other).ok_or_else(|| {
         invalid!("no x25519 pubkey on file for {other_pubkey_hex} — pair with them first",)
     })?;
-    let self_x_sk_bytes = node.x_sk.to_bytes();
-    let epoch_key = dm_epoch_key(&self_x_sk_bytes, &other_x_pk, &cfg_root, &participants);
-
-    node.install_epoch_key(topic_id, 0, epoch_key)
-        .context(NodeSnafu)?;
-    let topic_name = dm_topic_name(&topic_id);
-    upsert_topic_names(data_dir, [(topic_name.clone(), topic_id)]).context(NodeSnafu)?;
-
-    let cap_id = find_write_cap_for(&node, &topic_name)
-        .ok_or_else(|| invalid!("no cap covers '{topic_name}'",))?;
 
     let now = unix_now_ms();
-
-    // Publish member_meta if we haven't already.
-    let log = node.open_topic_log(&topic_id).context(NodeSnafu)?;
-    let view = wires_node::channel::open_dm(topic_id, participants.clone(), &log, &epoch_key)
-        .context(NodeSnafu)?;
-    if !view.members.contains_key(&self_pk) {
-        let display_name = load_display_name(data_dir).unwrap_or_else(|| "wires-cli".to_string());
-        let meta_value = serde_json::to_value(&ChannelMemberMeta {
-            kind: MemberKind::Cli,
-            display_name: display_name.clone(),
-            description: None,
-            asserted_at: now,
-        })
-        .map_err(|e| invalid!("serialize meta: {e}", e = e))?;
-        publish_public(
-            &node,
-            topic_id,
-            cap_id,
-            TYPE_MEMBER_META,
-            &format!("member {display_name}"),
-            meta_value,
-            now,
-        )?;
-    }
+    let display_name = load_display_name(data_dir).unwrap_or_else(|| "wires-cli".to_string());
+    let opened = wires_node::channel::dm_open(
+        &node,
+        data_dir,
+        &cfg_root,
+        other,
+        other_x_pk,
+        &display_name,
+        MemberKind::Cli,
+        now,
+    )
+    .context(NodeSnafu)?;
 
     if let Some(msg_text) = message {
-        // Standard-encrypted note.
+        // Standard-encrypted note. Requires a write cap; dm_open does not
+        // demand one (it best-effort skips member_meta publish if absent),
+        // so re-check here.
+        let cap_id = find_write_cap_for(&node, &opened.topic_name)
+            .ok_or_else(|| invalid!("no cap covers '{name}'", name = opened.topic_name))?;
         let canonical = CanonicalContent::new("agent.note", msg_text);
-        let (seq, prev_hash) = node.next_seq_and_prev_hash(&topic_id).context(NodeSnafu)?;
+        let (seq, prev_hash) = node
+            .next_seq_and_prev_hash(&opened.topic_id)
+            .context(NodeSnafu)?;
         let params = PublishParams {
-            topic_id,
+            topic_id: opened.topic_id,
             sender_sk: &node.ed_sk,
             cap_id,
             kind: MessageKind::Standard,
@@ -93,13 +67,13 @@ pub async fn open(data_dir: &Path, other_pubkey_hex: &str, message: Option<&str>
             seq,
             prev_hash,
             timestamp: unix_now_ms(),
-            keying: KeyingMaterial::StandardEpochKey(&epoch_key),
+            keying: KeyingMaterial::StandardEpochKey(&opened.epoch_key),
         };
         let msg = build_message(&params).context(NodeSnafu)?;
         node.append_local(&msg).context(NodeSnafu)?;
     }
 
-    println!("DM topic {topic_name}");
+    println!("DM topic {}", opened.topic_name);
     Ok(())
 }
 
