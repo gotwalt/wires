@@ -4,13 +4,13 @@ import Testing
 @testable import Wires
 
 @MainActor
-struct HouseholdClientTests {
-    @Test func saveAndLoadHousehold() async throws {
-        let container = HouseholdClient.makeInMemoryContainer()
-        let client = HouseholdClient.live(container: container)
+struct FabricClientTests {
+    @Test func saveAndLoadFabric() async throws {
+        let container = FabricClient.makeInMemoryContainer()
+        let client = FabricClient.live(container: container)
 
-        try await client.saveHousehold(
-            Household(
+        try await client.saveFabric(
+            Fabric(
                 rootPubkeyHex: String(repeating: "ab", count: 32),
                 hostEndpointIdHex: String(repeating: "cd", count: 32),
                 hostDirectAddrs: ["127.0.0.1:11204"],
@@ -19,7 +19,7 @@ struct HouseholdClientTests {
             )
         )
 
-        let loaded = try await client.loadHousehold()
+        let loaded = try await client.loadFabric()
         #expect(loaded != nil)
         #expect(loaded?.rootPubkeyHex == String(repeating: "ab", count: 32))
         #expect(loaded?.hostEndpointIdHex == String(repeating: "cd", count: 32))
@@ -28,8 +28,8 @@ struct HouseholdClientTests {
     }
 
     @Test func saveAndListTopics() async throws {
-        let container = HouseholdClient.makeInMemoryContainer()
-        let client = HouseholdClient.live(container: container)
+        let container = FabricClient.makeInMemoryContainer()
+        let client = FabricClient.live(container: container)
 
         try await client.saveTopic(
             TopicRecord(topicIdHex: String(repeating: "04", count: 32), name: "home.notes")
@@ -45,8 +45,8 @@ struct HouseholdClientTests {
     }
 
     @Test func saveAndListCaps() async throws {
-        let container = HouseholdClient.makeInMemoryContainer()
-        let client = HouseholdClient.live(container: container)
+        let container = FabricClient.makeInMemoryContainer()
+        let client = FabricClient.live(container: container)
 
         try await client.saveCap(
             CapRecord(
@@ -64,11 +64,11 @@ struct HouseholdClientTests {
     }
 
     @Test func refreshHostInfoUpdatesPersistedFields() async throws {
-        let container = HouseholdClient.makeInMemoryContainer()
-        let client = HouseholdClient.live(container: container)
+        let container = FabricClient.makeInMemoryContainer()
+        let client = FabricClient.live(container: container)
 
-        try await client.saveHousehold(
-            Household(rootPubkeyHex: String(repeating: "ab", count: 32))
+        try await client.saveFabric(
+            Fabric(rootPubkeyHex: String(repeating: "ab", count: 32))
         )
         try await client.refreshHostInfo(
             String(repeating: "cd", count: 32),
@@ -77,7 +77,7 @@ struct HouseholdClientTests {
             1_800_000_000_000
         )
 
-        let loaded = try await client.loadHousehold()
+        let loaded = try await client.loadFabric()
         #expect(loaded?.hostEndpointIdHex == String(repeating: "cd", count: 32))
         #expect(loaded?.hostDirectAddrs == ["10.0.0.5:11204"])
         #expect(loaded?.hostRelayURL == nil)

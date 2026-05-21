@@ -17,8 +17,8 @@ struct SettingsFeatureTests {
         let store = await TestStore(initialState: SettingsFeature.State()) {
             SettingsFeature()
         } withDependencies: {
-            $0.householdClient = .fixture(
-                household: Household(
+            $0.fabricClient = .fixture(
+                fabric: Fabric(
                     rootPubkeyHex: "ab",
                     hostEndpointIdHex: "cd",
                     hostRelayURL: "https://wires.example.org"

@@ -27,7 +27,7 @@ struct ServiceDetailFeature {
         case reconnectTapped // navigates the parent to ConnectFeature
     }
 
-    @Dependency(\.householdClient) var household
+    @Dependency(\.fabricClient) var fabric
     @Dependency(\.wiresClient) var wires
 
     var body: some Reducer<State, Action> {
@@ -47,10 +47,10 @@ struct ServiceDetailFeature {
             case .disconnectConfirmTapped:
                 state.disconnecting = true
                 let capId = state.summary.id
-                let household = self.household
+                let fabric = self.fabric
                 return .run { send in
                     do {
-                        try await household.revokeCap(capId)
+                        try await fabric.revokeCap(capId)
                         await send(.disconnectSucceeded)
                     } catch {
                         await send(.disconnectFailed(String(describing: error)))
