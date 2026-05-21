@@ -5,7 +5,7 @@ pub mod error;
 pub mod pair;
 pub mod parse;
 pub mod signer;
-pub mod tenant;
+pub mod fabric;
 pub mod ticket;
 pub mod topic;
 pub mod types;

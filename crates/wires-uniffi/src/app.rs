@@ -18,7 +18,7 @@ use crate::error::{InternalSnafu, UnknownPairHandleSnafu, WiresError};
 use crate::pair as pair_flow;
 use crate::parse;
 use crate::signer::SwiftRootSigner;
-use crate::tenant as tenant_flow;
+use crate::fabric as fabric_flow;
 use crate::ticket;
 use crate::topic::generate_topic_id_and_epoch0 as gen_topic;
 use crate::types::{
@@ -62,7 +62,7 @@ impl WiresApp {
         host: HostInfo,
     ) -> Result<TenantRegistration, WiresError> {
         let ep = self.endpoint().await?;
-        tenant_flow::register_with_hosted_service(ep, self.root_signer.clone(), &host).await
+        fabric_flow::register_with_hosted_service(ep, self.root_signer.clone(), &host).await
     }
 
     pub async fn unregister_with_hosted_service(
@@ -70,7 +70,7 @@ impl WiresApp {
         host: HostInfo,
     ) -> Result<UnregisterResult, WiresError> {
         let ep = self.endpoint().await?;
-        tenant_flow::unregister_with_hosted_service(ep, self.root_signer.clone(), &host).await
+        fabric_flow::unregister_with_hosted_service(ep, self.root_signer.clone(), &host).await
     }
 
     pub async fn register_topic(
@@ -87,7 +87,7 @@ impl WiresApp {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&topic_id);
         let ep = self.endpoint().await?;
-        tenant_flow::register_topic(ep, self.root_signer.clone(), &host, &arr).await
+        fabric_flow::register_topic(ep, self.root_signer.clone(), &host, &arr).await
     }
 
     pub fn parse_pair_request(&self, payload: String) -> Result<PairRequestPreview, WiresError> {
