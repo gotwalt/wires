@@ -172,8 +172,9 @@ pub async fn tenant_unregister(data_dir: &Path, yes: bool) -> Result<()> {
     if !yes {
         use std::io::Write as _;
         eprint!(
-            "This will tell the host to drop this tenant's record, every \
-             topic_index entry, and the on-disk tenant directory.\n\
+            "This will tell the host to drop this fabric's tenant record, \
+             every topic_index entry, and the on-disk tenant directory \
+             (`tenant` is the host-internal name for this fabric's footprint).\n\
              It will also clear the local config.toml host block.\n\
              Continue? [y/N] "
         );
@@ -195,11 +196,11 @@ pub async fn tenant_unregister(data_dir: &Path, yes: bool) -> Result<()> {
         TenantResponse::Unregister(r) => {
             if r.ok {
                 println!(
-                    "Unregistered tenant on host; host dropped {} topic(s)",
+                    "Unregistered fabric on host; host dropped {} topic(s)",
                     r.topics_removed
                 );
             } else {
-                println!("Host did not have a record for this tenant (already gone)");
+                println!("Host had no record for this fabric (already gone)");
             }
         }
         TenantResponse::Error(e) => return Err(host_rejected(e)),
@@ -239,7 +240,7 @@ pub async fn status(data_dir: &Path) -> Result<()> {
         .context(NetSnafu)?;
     match resp {
         TenantResponse::Status(s) => {
-            println!("Tenant status (as reported by host):");
+            println!("Fabric status (as reported by host):");
             println!("  registered_at         : {}", s.registered_at);
             println!("  topic_count           : {}", s.topic_count);
             println!("  bytes_stored          : {}", s.bytes_stored);
