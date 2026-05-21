@@ -20,8 +20,8 @@ struct NetworkFeatureTests {
         ) {
             NetworkFeature()
         } withDependencies: {
-            $0.householdClient = .fixture(
-                household: Household(rootPubkeyHex: "ab"),
+            $0.fabricClient = .fixture(
+                fabric: Fabric(rootPubkeyHex: "ab"),
                 caps: [cap]
             )
             $0.wiresClient = .fixture()

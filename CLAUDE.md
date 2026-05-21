@@ -1,6 +1,6 @@
 # wires — Notes for future Claude sessions
 
-End-to-end encrypted gossip substrate for a household's AI agents. Rust workspace, iroh-powered, blind hosting, capability-gated.
+End-to-end encrypted gossip substrate for a fabric — one human's network of AI agents, services, and devices. Rust workspace, iroh-powered, blind hosting, capability-gated.
 
 ## Status
 
@@ -9,7 +9,7 @@ Prototype. Three slices have landed on `main`:
 - **Substrate v1** (merge `fefbbfc`) — identity, topic creation, capability mint/revoke, publish with AEAD, gossip + replay between peers, decrypt on receive, persisted hash-chained logs. Drives the CLI end-to-end.
 - **Hosted service v1** (merge `3da4ec8`) — `wires-host` is multi-tenant: tenant registration over a `/wires/tenant/0` ALPN, per-tenant rolling retention with FIFO eviction, topic→tenant routing, write-rate ceiling, host-ticket discovery (base64 + terminal QR; `wires-host ticket` and startup-time emission). The host became a `lib + bin` crate.
 - **Responder-driven pairing v1** — agents declare a role + requested scopes via `wires pair-listen`; the operator consents and dials in via `wires pair-approve` over the new `/wires/pair/0` ALPN with a sealed, signed `PairGrant` carrying root pubkey, root-signed cap, per-topic epoch keys, and host info. Replaces the deleted `InviteToken` / `wires invite` / `wires join` surface. Spec: `docs/superpowers/specs/2026-05-15-wires-responder-driven-pairing-design.md`.
-- **MCP gateway v1** — `wires-mcp` is a multi-tenant authenticated MCP gateway. It joins each household as a normal wires agent via the responder pair flow, exposes OAuth 2.1 (PRM + AS + DCR) with the household root pubkey as `sub` and iOS as the universal authenticator. MCP tools: `wires_list_topics`, `wires_publish`, `wires_tail` (renamed from dotted names; Claude's MCP client validates `^[a-zA-Z0-9_-]{1,64}$`). Spec: `docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md`.
+- **MCP gateway v1** — `wires-mcp` is a multi-tenant authenticated MCP gateway. It joins each fabric as a normal wires agent via the responder pair flow, exposes OAuth 2.1 (PRM + AS + DCR) with the fabric root pubkey as `sub` and iOS as the universal authenticator. MCP tools: `wires_list_topics`, `wires_publish`, `wires_tail` (renamed from dotted names; Claude's MCP client validates `^[a-zA-Z0-9_-]{1,64}$`). Spec: `docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md`.
 - **Per-user retention v1** (landed 2026-05-19) — `wires-mcp` enforces a TTL + byte-budget eviction policy on each user's `TopicLogs`. `wires-store`'s `IngestIndex` rows now carry `ingested_at_ms`, with new `evict_older_than` / `evict_oldest_until` / backfill helpers. `wires-node` opens an `IngestIndex` when `NodeConfig.retention` is `Some(_)`, hooks record+sweep into publish and inbound, runs `reconcile_ingest_index` at open (backfill + crash-window safety net), and `NodeRuntime` spawns a 60 s `spawn_blocking` sweep loop. `GatewayConfig::retention_policy()` resolves operator TOML (`[retention] ttl_secs / max_bytes_per_user`) or defaults (1 h / 50 MiB); `TenantSupervisor::new(.., retention)` injects per-user. Spec: `docs/superpowers/specs/2026-05-18-wires-mcp-retention-design.md`.
 - **MCP single-QR consent dispatch** (landed 2026-05-19) — `/oauth/authorize` now renders ONE `SessionTicket` QR; iOS POSTs `/oauth/session/probe { session_id, root_pubkey_hex }` and the gateway dispatches into the pair flow (unknown root) or sign-in flow (known root). `pair_bridge.start` is now idempotent per session so probe retries reuse the cached iroh endpoint. iOS gained `OAuthSignInFeature` for the returning-user biometric-sign path (full `ApprovalFeature` composition for the pair branch is a v1 deferral). Eliminates the dual-QR camera-framing hazard and the "do first-time twice → `AlreadyPaired`" cliff. Spec §5 updated.
 - **iOS UI snapshot tooling v1** (landed 2026-05-19) — `scripts/snapshot-ios.sh` drives `WiresUITests/SnapshotSweep` to capture every notable iOS UI state as PNGs under `Wires/screenshots/<run-id>/`. 14 fixtures × light/dark on iPhone 17 Pro (iOS 26.4). Fixture mode swaps every external client via `prepareDependencies`, seeds `AppFeature.State` directly into the target screen, and renders a static `FixtureCameraPlaceholder` instead of the live `CameraCaptureView`. Spec: `docs/superpowers/specs/2026-05-19-wires-ios-snapshot-tooling-design.md`. Plan: `docs/superpowers/plans/2026-05-19-wires-ios-snapshot-tooling.md`. (Initial v1 had 17 fixtures — 4 enroll cases were dropped when NodeEnrollment was unified into the OAuth/SessionTicket flow, replaced by one `oauth_pair_approve_partial` fixture.) Superseded by the HIG redesign's 26-fixture sweep.
@@ -18,6 +18,17 @@ Prototype. Three slices have landed on `main`:
 A Home Assistant ingestion daemon (`wires-ha`) also exists as a working example of an agent that participates in gossip + replay.
 
 What does **not** exist yet: iOS companion (still a stock SwiftUI scaffold — the spec/plan need revision against the post-hosted-service architecture), `__cap.*` gossip propagation, `__topic.epoch_advance` distribution. See "Out of scope" in each design spec.
+
+## Vocabulary boundary: Fabric vs. Tenant
+
+Wires has one user-facing concept for "the unit of organization rooted in one human": **fabric**. The codebase uses two words for it depending on layer:
+
+- **Fabric** is the user-facing term. Every CLI string, error message, MCP OAuth page, iOS UI label, README sentence, and new spec uses "fabric."
+- **Tenant** is host-internal jargon. It appears in `wires-host` (which is genuinely multi-tenant infrastructure: one host, many fabrics), in the `/wires/tenant/0` ALPN and `wires-net::tenant` protocol module, in on-disk paths (`host/tenants/<root_hex>/`), in redb table names (`tenants.redb`, `ingest_<root>.redb`), and in the MCP gateway's per-user supervisor (`wires-mcp::tenants::TenantSupervisor`). These are wire-format and on-disk identifiers; renaming them is a breaking change with no user benefit.
+
+"Household" is not used. Earlier iOS and README drafts called the concept a "household"; that vocabulary has been retired in favor of "fabric." If you see "household" in code or docs that aren't historical specs, fix it.
+
+Rule of thumb: if a user reads the string, it says "fabric." If a JSON wire field, an ALPN, a redb table name, or a directory path contains the string, it says "tenant."
 
 ## Authoritative docs
 
@@ -174,7 +185,7 @@ one (e.g. `network_load_error`):
 2. Same file — add an arm to `applyDependencies(to:)` that installs the
    right per-dependency fixture clients. Existing flow-default arms
    (e.g. the network arms) are good templates; adjust the
-   `HouseholdClient.fixture(...)` parameters to seed the state your
+   `FabricClient.fixture(...)` parameters to seed the state your
    screenshot needs.
 
 3. Same file — add an arm to `initialAppState` that returns the
@@ -217,7 +228,7 @@ If the screen depends on a new TCA dependency that doesn't have a
 `.fixture(...)` constructor yet:
 
 - Add a `Fixtures+<Client>.swift` file under `Wires/Wires/Fixtures/`
-  that mirrors the pattern in `Fixtures+Household.swift` —
+  that mirrors the pattern in `Fixtures+Fabric.swift` —
   `static func fixture(...) -> <Client>` returning a no-op or
   parameterized stub. Keep the constructor minimal (canned data, no
   I/O, no throwing).
@@ -248,7 +259,7 @@ If the screen depends on a new TCA dependency that doesn't have a
   `WiresIOSApp`'s `static let store` closure, before the store reads
   any dependency.
 - **`home_loading` is the only "blocking" fixture.** It seeds
-  `loading=true` and the fixture `HouseholdClient.listCaps` sleeps
+  `loading=true` and the fixture `FabricClient.listCaps` sleeps
   60s so the spinner stays on screen past the 600 ms settle. If a
   new fixture needs a similar "captures a transient state" behavior,
   use the `listCapsBehavior: .block` pattern (or extend

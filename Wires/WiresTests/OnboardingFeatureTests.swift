@@ -11,7 +11,7 @@ struct OnboardingFeatureTests {
             OnboardingFeature()
         } withDependencies: {
             $0.wiresClient = .fixture()
-            $0.householdClient = .fixture()
+            $0.fabricClient = .fixture()
             $0.cameraPermissionClient = .fixture(.granted)
         }
         #expect(store.state.step == .welcome)
@@ -33,7 +33,7 @@ struct OnboardingFeatureTests {
             OnboardingFeature()
         } withDependencies: {
             $0.wiresClient = .fixture()
-            $0.householdClient = .fixture()
+            $0.fabricClient = .fixture()
         }
         await store.send(.scan(.decodedPayload(host))) {
             $0.confirmedHost = host

@@ -1,7 +1,7 @@
 import Foundation
 
 /// Returning-user challenge the wires-mcp gateway embeds in the sign-in QR.
-/// iOS decodes this, biometric-signs `signingBytes()` with the household root
+/// iOS decodes this, biometric-signs `signingBytes()` with the fabric root
 /// key, and POSTs the signature to `/oauth/signin/assertion`.
 ///
 /// The canonical byte encoding MUST match `SignInChallenge::signing_bytes()` in

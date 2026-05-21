@@ -54,7 +54,7 @@ struct ApprovalFeature {
     }
 
     @Dependency(\.wiresClient) var wires
-    @Dependency(\.householdClient) var household
+    @Dependency(\.fabricClient) var fabric
     @Dependency(\.keychainClient) var keychain
 
     var body: some Reducer<State, Action> {
@@ -83,7 +83,7 @@ struct ApprovalFeature {
                 let host = state.host
                 let decisions = Array(state.decisions)
                 let wires = self.wires
-                let household = self.household
+                let fabric = self.fabric
                 let keychain = self.keychain
                 return .run { send in
                     do {
@@ -95,7 +95,7 @@ struct ApprovalFeature {
                                 return
                             }
                             try await wires.registerTopic(host, topicId)
-                            try await household.saveTopic(TopicRecord(
+                            try await fabric.saveTopic(TopicRecord(
                                 topicIdHex: newTopic.topicIdHex,
                                 name: d.topicName,
                                 registeredWithHost: true
@@ -113,7 +113,7 @@ struct ApprovalFeature {
                             ))
                         }
                         let ack = try await wires.approvePairRequest(preview.handle, granted, host)
-                        try await household.saveCap(CapRecord(
+                        try await fabric.saveCap(CapRecord(
                             capIdHex: ack.installedCapIdHex,
                             nodePubkeyHex: preview.agentPubkeyHex,
                             nodeAlias: preview.description.isEmpty ? nil : preview.description,

@@ -62,7 +62,7 @@ struct OnboardingFeature {
     }
 
     @Dependency(\.wiresClient) var wires
-    @Dependency(\.householdClient) var household
+    @Dependency(\.fabricClient) var fabric
     @Dependency(\.keychainClient) var keychain
 
     private static let rootPubkeyAccount = KeychainBackedRootSigner.Account.pubkey
@@ -133,7 +133,7 @@ struct OnboardingFeature {
                 state.registering = true
                 state.registerError = nil
                 let wires = self.wires
-                let household = self.household
+                let fabric = self.fabric
                 let keychain = self.keychain
                 let pubkeyAccount = Self.rootPubkeyAccount
                 return .run { send in
@@ -144,7 +144,7 @@ struct OnboardingFeature {
                             return
                         }
                         let pubkeyHex = pubkeyData.map { String(format: "%02x", $0) }.joined()
-                        let h = Household(
+                        let h = Fabric(
                             rootPubkeyHex: pubkeyHex,
                             hostEndpointIdHex: registration.hostEndpointIdHex,
                             hostServerName: host.serverName,
@@ -154,7 +154,7 @@ struct OnboardingFeature {
                             capsTopicIdHex: registration.capsTopicIdHex,
                             tenantRegisteredAt: .now
                         )
-                        try await household.saveHousehold(h)
+                        try await fabric.saveFabric(h)
                         await send(.registerSucceeded(.init(
                             registration: registration,
                             host: host,

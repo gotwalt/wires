@@ -2,10 +2,10 @@ uniffi::setup_scaffolding!();
 
 pub mod app;
 pub mod error;
+pub mod fabric;
 pub mod pair;
 pub mod parse;
 pub mod signer;
-pub mod tenant;
 pub mod ticket;
 pub mod topic;
 pub mod types;

@@ -78,7 +78,7 @@ mod tests {
     }
 
     #[test]
-    fn dm_topic_id_distinct_per_household() {
+    fn dm_topic_id_distinct_per_fabric() {
         let alice: Pubkey = [1u8; 32];
         let bob: Pubkey = [2u8; 32];
         let participants = sort_participants(vec![alice, bob]);

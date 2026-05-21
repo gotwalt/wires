@@ -17,7 +17,7 @@ struct MainFeature {
         case settings(SettingsFeature.Action)
         case tabSelected(State.Tab)
         /// Delegate fired when Settings (delete-account) wipes the
-        /// household. AppFeature observes this and transitions back
+        /// fabric. AppFeature observes this and transitions back
         /// to `.launching`.
         case didReset
     }

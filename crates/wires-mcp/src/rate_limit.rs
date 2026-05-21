@@ -53,7 +53,7 @@ impl RateLimiter {
 /// `wires-mcp` behind a reverse proxy that terminates TLS and injects
 /// `X-Forwarded-For`. Falls back to `X-Real-IP`, then to a single shared
 /// `"unknown"` bucket — which is the correct behavior for a non-proxied
-/// deployment serving a single household: every request is the same source.
+/// deployment serving a single fabric: every request is the same source.
 pub fn source_ip_key(headers: &axum::http::HeaderMap) -> String {
     if let Some(h) = headers.get("x-forwarded-for")
         && let Ok(s) = h.to_str()

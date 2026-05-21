@@ -1,21 +1,21 @@
 import Foundation
 import WiresKit
 
-extension HouseholdClient {
-    /// Canned in-memory household for snapshot fixtures. Returns
+extension FabricClient {
+    /// Canned in-memory fabric for snapshot fixtures. Returns
     /// fully-constructed (but never persisted) SwiftData @Model
     /// instances. Writes are no-ops. Use the `block` flag on
     /// `listCapsBehavior` to simulate the loading spinner, or
     /// `.failing(_)` to surface a load-error banner.
     static func fixture(
-        household: Household? = nil,
+        fabric: Fabric? = nil,
         caps: [CapRecord] = [],
         topics: [TopicRecord] = [],
         listCapsBehavior: ListBehavior = .return
-    ) -> HouseholdClient {
-        HouseholdClient(
-            loadHousehold: { household },
-            saveHousehold: { _ in },
+    ) -> FabricClient {
+        FabricClient(
+            loadFabric: { fabric },
+            saveFabric: { _ in },
             refreshHostInfo: { _, _, _, _ in },
             listTopics: { topics },
             saveTopic: { _ in },

@@ -104,7 +104,7 @@ pub fn upsert_entries<I: IntoIterator<Item = (String, [u8; 32])>>(
 /// `<data_dir>/dm_roster.json`. The file is a flat `HashMap<String, String>` —
 /// later entries overwrite earlier ones for the same key.
 ///
-/// Mode bits are not strictly enforced here; the file may contain household
+/// Mode bits are not strictly enforced here; the file may contain fabric
 /// secrets indirectly via the x25519 pubkey of trusted peers, but the
 /// pubkey itself is not secret. We rely on the data_dir's 0700 directory
 /// mode for confidentiality (same as `identity.*`).

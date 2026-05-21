@@ -21,7 +21,7 @@ use crate::framing::{read_frame, write_frame};
 pub const ALPN: &[u8] = b"/wires/replay/0";
 
 /// Per-frame size cap. Individual frames carry one `WireMessage`; 1 MiB is well
-/// above any plausible single-message ciphertext at household scale and short
+/// above any plausible single-message ciphertext at fabric scale and short
 /// of denial-of-service territory.
 pub const MAX_FRAME_LEN: u32 = 1024 * 1024;
 

@@ -17,8 +17,8 @@ enum Cmd {
     /// Initialize identity (Ed25519 + X25519) in the data directory.
     Init {
         /// Generate a fresh local root key in addition to identity. Use this for
-        /// the household operator (Alice). Without it, `init` writes identity
-        /// only and the agent has no household pinning until paired.
+        /// the fabric operator (Alice). Without it, `init` writes identity
+        /// only and the agent has no fabric pinning until paired.
         #[arg(long)]
         new_root: bool,
     },
@@ -63,7 +63,7 @@ enum Cmd {
     },
     /// Revoke a capability by id
     Revoke { cap_id: String },
-    /// Tenant control: pair with a host, register topics, view status.
+    /// Host control: pair this fabric with a host, register topics, view status.
     #[command(subcommand)]
     Host(HostCmd),
     /// Start a pair-listen window; print a PairRequest token; wait for a
@@ -137,7 +137,7 @@ enum DmCmd {
 
 #[derive(Subcommand)]
 enum HostCmd {
-    /// Pair with a host: decode a HostTicket, register this tenant (signed by
+    /// Pair with a host: decode a HostTicket, register this fabric (signed by
     /// your local root key), persist the host info.
     Pair {
         /// HostTicket string (base64), or `@<path>` to read from a file.
@@ -149,15 +149,17 @@ enum HostCmd {
     /// Unregister a topic: the host stops persisting new envelopes (existing
     /// data is retained until eviction).
     TopicUnregister { topic: String },
-    /// Unregister this tenant entirely: the host drops the tenant row, every
-    /// topic_index entry for this root, and the on-disk tenant directory.
-    /// Clears the local `config.toml` host block on success.
+    /// Unregister this fabric from the host: the host drops its tenant record,
+    /// every topic_index entry for this root, and the on-disk tenant directory.
+    /// ("Tenant" is the host-internal name for this fabric's footprint; see
+    /// `CLAUDE.md`'s vocabulary section.) Clears the local `config.toml` host
+    /// block on success.
     TenantUnregister {
         /// Skip the interactive confirmation prompt.
         #[arg(long)]
         yes: bool,
     },
-    /// Print this tenant's status as the host reports it.
+    /// Print this fabric's host-side status.
     Status,
 }
 

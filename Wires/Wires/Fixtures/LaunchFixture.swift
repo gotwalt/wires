@@ -71,13 +71,13 @@ enum LaunchFixture: String, CaseIterable {
              .onboardingConfirm, .onboardingFaceID, .onboardingDone:
             values.cameraPermissionClient = .fixture(.granted)
             values.wiresClient = .fixture()
-            values.householdClient = .fixture()
+            values.fabricClient = .fixture()
             values.mcpGatewayClient = .fixture()
 
         case .networkLoading:
             values.cameraPermissionClient = .fixture(.granted)
             values.wiresClient = .fixture()
-            values.householdClient = .fixture(listCapsBehavior: .block)
+            values.fabricClient = .fixture(listCapsBehavior: .block)
             values.mcpGatewayClient = .fixture()
 
         case .networkEmpty,
@@ -92,8 +92,8 @@ enum LaunchFixture: String, CaseIterable {
             // refresh-effect from overwriting the seeded list.
             values.cameraPermissionClient = .fixture(.granted)
             values.wiresClient = .fixture()
-            values.householdClient = .fixture(
-                household: Household(
+            values.fabricClient = .fixture(
+                fabric: Fabric(
                     rootPubkeyHex: String(repeating: "ab", count: 32),
                     hostEndpointIdHex: String(repeating: "cd", count: 32)
                 ),
@@ -104,8 +104,8 @@ enum LaunchFixture: String, CaseIterable {
         case .networkLoadError:
             values.cameraPermissionClient = .fixture(.granted)
             values.wiresClient = .fixture()
-            values.householdClient = .fixture(
-                household: Household(
+            values.fabricClient = .fixture(
+                fabric: Fabric(
                     rootPubkeyHex: String(repeating: "ab", count: 32),
                     hostEndpointIdHex: String(repeating: "cd", count: 32)
                 ),
@@ -123,8 +123,8 @@ enum LaunchFixture: String, CaseIterable {
              .connectAlreadyConnected:
             values.cameraPermissionClient = .fixture(.granted)
             values.wiresClient = .fixture()
-            values.householdClient = .fixture(
-                household: Household(
+            values.fabricClient = .fixture(
+                fabric: Fabric(
                     rootPubkeyHex: String(repeating: "ab", count: 32),
                     hostEndpointIdHex: String(repeating: "cd", count: 32)
                 )
@@ -138,8 +138,8 @@ enum LaunchFixture: String, CaseIterable {
              .settingsDeleteConfirm:
             values.cameraPermissionClient = .fixture(.granted)
             values.wiresClient = .fixture()
-            values.householdClient = .fixture(
-                household: Household(
+            values.fabricClient = .fixture(
+                fabric: Fabric(
                     rootPubkeyHex: String(repeating: "ab", count: 32),
                     hostEndpointIdHex: String(repeating: "cd", count: 32),
                     hostServerName: "Wires",
@@ -446,7 +446,7 @@ enum LaunchFixture: String, CaseIterable {
     /// Shared scaffold for every settings_* fixture: lands the app in the
     /// Settings tab with a populated SettingsFeature.State that mirrors what
     /// `SettingsFeature.onAppear` would have produced from a populated
-    /// household. Bypasses the on-appear effect so the fixture renders
+    /// fabric. Bypasses the on-appear effect so the fixture renders
     /// the loaded-state directly.
     private func mainStateOnSettings(faceIDEnabled: Bool) -> AppFeature.State {
         let network = NetworkFeature.State(rootPubkeyHex: String(repeating: "ab", count: 32))
