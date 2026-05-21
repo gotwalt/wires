@@ -18,6 +18,9 @@ pub enum RequiredMode {
 /// - `__cap.root_rotation`   → Public   (must be globally readable for adoption)
 /// - `__topic.epoch_advance` → SealedTo (one per current member at each rotation)
 /// - `__topic.history_grant` → SealedTo (sealed to the new member)
+/// - `__channel.create`      → Public   (roster state must be replayable by every reader)
+/// - `__channel.invite`      → Public   (roster state must be replayable by every reader)
+/// - `__channel.member_meta` → Public   (roster state must be replayable by every reader)
 pub fn required_mode_for(type_: &str) -> Option<RequiredMode> {
     match type_ {
         "__cap.grant" => Some(RequiredMode::SealedTo),
@@ -25,6 +28,9 @@ pub fn required_mode_for(type_: &str) -> Option<RequiredMode> {
         "__cap.root_rotation" => Some(RequiredMode::Public),
         "__topic.epoch_advance" => Some(RequiredMode::SealedTo),
         "__topic.history_grant" => Some(RequiredMode::SealedTo),
+        "__channel.create" => Some(RequiredMode::Public),
+        "__channel.invite" => Some(RequiredMode::Public),
+        "__channel.member_meta" => Some(RequiredMode::Public),
         _ => None,
     }
 }
@@ -105,5 +111,32 @@ mod tests {
         assert!(is_reserved("__topic.epoch_advance"));
         assert!(!is_reserved("home.fridge.temp"));
         assert!(!is_reserved("__cap.unknown"));
+    }
+
+    #[test]
+    fn channel_create_requires_public() {
+        check_kind_matches("__channel.create", &MessageKind::Public).unwrap();
+        assert!(check_kind_matches("__channel.create", &MessageKind::Standard).is_err());
+        assert!(check_kind_matches("__channel.create", &MessageKind::SealedTo([0u8; 32])).is_err());
+    }
+
+    #[test]
+    fn channel_invite_requires_public() {
+        check_kind_matches("__channel.invite", &MessageKind::Public).unwrap();
+        assert!(check_kind_matches("__channel.invite", &MessageKind::Standard).is_err());
+    }
+
+    #[test]
+    fn channel_member_meta_requires_public() {
+        check_kind_matches("__channel.member_meta", &MessageKind::Public).unwrap();
+        assert!(check_kind_matches("__channel.member_meta", &MessageKind::Standard).is_err());
+    }
+
+    #[test]
+    fn channel_types_are_reserved() {
+        assert!(is_reserved("__channel.create"));
+        assert!(is_reserved("__channel.invite"));
+        assert!(is_reserved("__channel.member_meta"));
+        assert!(!is_reserved("__channel.unknown"));
     }
 }
