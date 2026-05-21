@@ -1,5 +1,6 @@
 pub mod cap;
 pub mod chain;
+pub mod channel;
 pub mod content;
 pub mod error;
 pub mod reserved;
