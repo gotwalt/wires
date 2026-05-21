@@ -31,8 +31,7 @@ All channel traffic continues to flow through the existing hosted relay (`wires-
 | Named-channel authorization | broad `channels.**` cap pre-minted to every paired agent |
 | Create authority | any cap-holder with Read+Write on the topic |
 | Invite authority | any current member (publishes invite + sealed history_grant) |
-| Kick authority | the channel's creator only (v1) |
-| Leave authority | self only |
+| Member removal | network-layer cap revocation — no channel-layer kick / leave / ban |
 | Member meta | mandatory, enforced at replay-fold time |
 | DM derivation | `BLAKE3("wires.dm.v1\0" \|\| root_pubkey \|\| "\0" \|\| sorted_pubkey_concat)` |
 | Scope | single-household for v1; multitenant-safe by construction |
@@ -40,11 +39,11 @@ All channel traffic continues to flow through the existing hosted relay (`wires-
 
 ## 3. Non-goals
 
-- **Cross-household channels.** Federation between roots, dual-host routing, cross-tenant cap acceptance. Substantial design surface, deferred to a separate spec.
-- **Forward secrecy on kick.** Removing a kicked member from future ciphertext requires per-channel epoch rotation, which depends on the as-yet-unimplemented `__topic.epoch_advance` distribution flow. v1 ships kick as a roster-only removal; kicked members retain the epoch key until manual rotation.
-- **Per-channel admin delegation.** Only the creator can kick. A `__channel.grant_admin` event is a v2 concern.
+- **Per-channel removal of members.** wires is a trusted substrate. Every channel participant was explicitly authorized by the household operator at pair time (utility-company API, smart-home agent, the operator's own assistant, etc.). Bad actors are removed by revoking their cap at the network layer — which removes them from *every* topic and channel at once — not by a per-channel mechanism. The channel layer therefore has no `__channel.kick`, `__channel.leave`, or `__channel.ban`. This is a deliberate departure from Discord-shaped semantics: those exist because Discord channels operate over a low-trust substrate where per-channel moderation is the only available lever. wires does not have that constraint.
 - **Channel rename / re-describe.** `__channel.update` is not in v1.
-- **Banning.** Kick removes from roster but does not prevent re-invite. Adding a ban list is a v2 concern.
+- **Forward secrecy on cap revocation.** When an agent's cap is revoked, the channel's epoch key is still in their possession until manual rotation. Per-channel epoch rotation depends on the as-yet-unimplemented `__topic.epoch_advance` distribution flow and is out of scope.
+- **Cross-household channels.** Federation between roots, dual-host routing, cross-tenant cap acceptance. Substantial design surface, deferred to a separate spec.
+- **Group DMs (N > 2).** The DM derivation supports arbitrary N, but v1 CLI ships only 2-party DMs. For 3+ participants, use a named channel. Group DMs may land in v2 with an explicit-participants flag.
 - **Per-channel retention policy.** All channels share `wires-mcp`'s per-user TTL + byte budget. A future `__channel.retention` event read by the host could override.
 - **Replay-as-a-service.** Abstracting `wires-host`'s replay role into a "history provider" member is a future direction; v1's channel layer is forward-compatible (a non-host history service joins as a normal member).
 - **Within-household communication patterns.** Default rosters, auto-introduce flows, operator policy levers for who-can-talk-to-whom are deliberately a separate design. This spec only fixes the substrate.
@@ -60,7 +59,7 @@ pub struct ChannelView {
     pub members: BTreeMap<Pubkey, MemberMeta>,     // full members (invited + meta'd)
     pub pending: BTreeSet<Pubkey>,                 // invited but not yet meta'd
     pub created_at: Option<i64>,                   // Some(_) for Named only
-    pub creator: Option<Pubkey>,                   // Some(_) for Named only
+    pub creator: Option<Pubkey>,                   // Some(_) for Named only — display/audit only, no policy role
 }
 
 pub enum ChannelVariant {
@@ -83,7 +82,7 @@ pub enum MemberKind { Agent, Api, Cli, Human, Unknown }
 1. If `topic_id` matches `BLAKE3("wires.dm.v1\0" || root || "\0" || sorted_pubkey_concat)` for any combination of the locally-known root and pubkey subsets, the variant is `Dm` with the matching participant list.
 2. Otherwise the topic is treated as `Named`; the `name`, `description`, `creator`, and `created_at` come from the first `__channel.create` event on the log.
 3. `__channel.member_meta` events fold into `members`, latest-wins per publisher.
-4. `__channel.invite`, `__channel.kick`, `__channel.leave` adjust the roster per the state-machine rules in §7.
+4. `__channel.invite` adjusts the roster (placing the invitee in `pending`) per the state-machine rules in §7.
 
 `ChannelView` lives in `wires-core::channel` (types + fold function, pure). `wires-node::channel` provides a thin wrapper that reads from the on-disk `TopicLog` and produces a `ChannelView` — that wrapper is the I/O boundary.
 
@@ -108,19 +107,17 @@ Future cross-household DMs will use a distinct namespace (e.g. `"wires.dm.cross.
 
 ## 6. Reserved message types
 
-Five new reserved types are added to `wires-core::reserved`:
+Three new reserved types are added to `wires-core::reserved`:
 
 | Type | Required mode | Who publishes |
 |---|---|---|
 | `__channel.create` | `Public` | one of the channel's cap-holders, once per named channel |
 | `__channel.invite` | `Public` | any current member |
-| `__channel.kick` | `Public` | the channel's creator (named channels only) |
-| `__channel.leave` | `Public` | the leaving member |
 | `__channel.member_meta` | `Public` | the member describing themselves |
 
-All five are `Public` because their state must be replayable by every reader — current members and future joiners alike — to rebuild the roster deterministically. The confidentiality of who-is-in-the-channel relies on the existing topic-epoch-key gating: the host sees envelopes per topic but cannot decrypt payloads.
+All three are `Public` because their state must be replayable by every reader — current members and future joiners alike — to rebuild the roster deterministically. The confidentiality of who-is-in-the-channel relies on the existing topic-epoch-key gating: the host sees envelopes per topic but cannot decrypt payloads.
 
-`required_mode_for` in `crates/wires-core/src/reserved.rs:21` gains the five entries.
+`required_mode_for` in `crates/wires-core/src/reserved.rs:21` gains the three entries.
 
 Content schemas (serialized as JSON in `WireMessage::content`):
 
@@ -134,17 +131,6 @@ struct ChannelCreate {
 struct ChannelInvite {
     agent: Pubkey,
     invited_at: i64,
-}
-
-struct ChannelKick {
-    agent: Pubkey,
-    kicked_at: i64,
-    reason: Option<String>,
-}
-
-struct ChannelLeave {
-    left_at: i64,
-    reason: Option<String>,
 }
 
 struct ChannelMemberMeta {
@@ -162,13 +148,13 @@ The invite flow also publishes a `__topic.history_grant` (SealedTo the invitee) 
 The fold function in `ChannelView::replay` enforces these rules. Messages that violate them are dropped at fold time without aborting the replay.
 
 1. **Create acceptance.** `__channel.create` is accepted from any publisher whose envelope was signed by an ed25519 key whose root-signed cap covers this topic with both `Read` and `Write` rights. First `__channel.create` wins; subsequent ones on the same topic are ignored. Establishes `name`, `description`, `creator` (the signer), `created_at`.
-2. **DM topics reject explicit roster events.** `__channel.create`, `__channel.invite`, `__channel.kick` on a DM-derived topic are rejected — the roster is the derivation input, not the log.
+2. **DM topics reject explicit roster events.** `__channel.create` and `__channel.invite` on a DM-derived topic are rejected — the roster is the derivation input, not the log.
 3. **Member meta is mandatory.** A message from publisher `P` on topic `T` is folded into state only if `P` has already published a `__channel.member_meta` on `T`, or this message *is* the `__channel.member_meta`. Messages from non-meta'd publishers are dropped at fold time. There are no anonymous members.
 4. **Member meta self-only.** `__channel.member_meta` is accepted only when the envelope's signing pubkey equals the implicit subject (the publisher describes themselves, not someone else).
 5. **Member meta latest-wins.** When multiple `__channel.member_meta` events from the same publisher are present, the latest one (by per-publisher chain position) replaces earlier ones.
-6. **Invite acceptance.** `__channel.invite { agent }` is accepted only when the publisher is currently a full member (in `members`). The invitee is placed in `pending`; when they publish their first `__channel.member_meta`, they move from `pending` to `members`. A `__channel.leave` or `__channel.kick` targeting a pending invitee removes them from `pending` without ever entering `members`. Re-inviting an already-pending or already-full member is a no-op.
-7. **Kick acceptance.** `__channel.kick { agent }` is accepted only on named channels and only when the publisher equals `creator` from the corresponding `__channel.create`. The subject is removed from the roster. Forward secrecy on kick is out of scope (see §3).
-8. **Leave acceptance.** `__channel.leave` is accepted from any current member, removing the publisher from the roster.
+6. **Invite acceptance.** `__channel.invite { agent }` is accepted only when the publisher is currently a full member (in `members`). The invitee is placed in `pending`; when they publish their first `__channel.member_meta`, they move from `pending` to `members`. Re-inviting an already-pending or already-full member is a no-op.
+
+There is deliberately no rule for removing members. An agent retired by the operator has its cap revoked at the network layer (see §3); any subsequent publish from that agent is rejected by every receiver's existing cap check, well before it reaches the channel fold. The member's historical record on the channel log stays — this is by design for the M2M audit story.
 
 Replay is idempotent under double-replay (the same log produces the same `ChannelView`). Total order within a per-publisher chain is given by the hash chain; total order across publishers is given by the host's ingest order during replay (the substrate already exposes this; the channel fold consumes it as-is).
 
@@ -186,10 +172,6 @@ Today's per-topic globs (the ones `pair-approve` already adds to the cap for spe
 An operator who wants to restrict the layer narrows the globs or omits one entirely (e.g. `dm.**` granted Read-only, or `channels.work.**` only). The state-machine rules in §7 still apply; the cap just restricts which topic names the agent can publish onto.
 
 The cap glob system is unchanged — the existing `glob_matches` in `crates/wires-core/src/cap.rs:163` already handles `dm.**` and `channels.**` correctly.
-
-### Migration for already-paired agents
-
-Agents paired before this lands have a cap whose `topics` vector does not contain `dm.**` or `channels.**`, so they cannot participate in the channel layer until they re-pair. There is no `wires cap mint` command today; re-pairing is the only path. This is a v1 cutover and is documented in the release notes. The on-wire format does not change, so non-channel substrate operations continue to work without re-pair.
 
 ### Invite flow
 
@@ -223,12 +205,6 @@ wires channel members <name>
 wires channel invite <name> <agent_pubkey>
     Publishes __topic.history_grant (sealed to invitee) then __channel.invite.
 
-wires channel leave <name>
-    Publishes __channel.leave from self.
-
-wires channel kick <name> <agent_pubkey> [--reason "..."]
-    Publishes __channel.kick. Creator-only; replay rejects from non-creators.
-
 wires dm <agent_pubkey>
     Derives the DM topic_id from sorted (self, target, root) pubkeys, joins,
     enters an interactive read/publish loop. First publish auto-publishes
@@ -255,8 +231,6 @@ Mirrors the CLI; tool names follow the existing `^[a-zA-Z0-9_-]{1,64}$` constrai
 | `wires_create_channel` | name, optional description → creates and joins |
 | `wires_channel_members` | channel name or topic_id → roster |
 | `wires_invite_to_channel` | channel + target pubkey → publish history_grant + invite |
-| `wires_leave_channel` | channel → publish leave |
-| `wires_kick_from_channel` | channel + pubkey + reason → publish kick (creator only) |
 | `wires_dm_open` | target pubkey → derive id, return topic_id + existing roster |
 | `wires_set_member_meta` | kind, display_name, description? → update self meta and republish into all joined channels |
 
@@ -273,7 +247,7 @@ The existing `wires_list_topics` / `wires_publish` / `wires_tail` stay — they'
 
 ### New observable surfaces
 
-- **Pattern of channel-event publishes is host-visible.** The host sees envelope counts per topic_id; bursts around invites/kicks are observable as traffic. Mitigation: not in v1 — this is the same shape as `__cap.grant` / `__topic.epoch_advance` traffic visibility.
+- **Pattern of channel-event publishes is host-visible.** The host sees envelope counts per topic_id; bursts around invites and member_meta refreshes are observable as traffic. Mitigation: not in v1 — this is the same shape as `__cap.grant` / `__topic.epoch_advance` traffic visibility.
 - **DM derivation enables targeted enumeration by household insiders.** A paired-in agent that learns another agent's pubkey can compute the DM topic_id for that pair and trial-join. It still cannot decrypt without the epoch key. This is the same reduction-in-defense-in-depth discussed for the well-known-topics proposal §4.2.2; the search space for DM ids shrinks from 2^256 to "pairs of agents I have learned exist."
 
 ### Properties unchanged but worth restating
@@ -288,19 +262,19 @@ The existing `wires_list_topics` / `wires_publish` / `wires_tail` stay — they'
 - State-machine fold determinism: same log → same `ChannelView` under any replay order consistent with the per-publisher hash chain; idempotent under double-replay.
 - Member-meta enforcement: messages from a publisher with no on-log meta are dropped; the same publisher's later messages are folded after their first `__channel.member_meta`.
 - Self-only meta: meta from a publisher whose envelope-signer does not equal the meta's implicit subject is rejected.
-- Roster mutations: invite by non-member rejected; invite of someone already in roster is a no-op; kick by non-creator rejected; kick on a DM topic rejected; leave from a non-member is a no-op.
-- Wire-format round-trips: all five content schemas serialize/deserialize cleanly.
+- Roster mutations: invite by non-member rejected; invite of someone already pending or already a full member is a no-op; invite on a DM topic rejected.
+- Wire-format round-trips: all three content schemas serialize/deserialize cleanly.
 
 ### Integration tests across `wires-cli`
 
 - `wires channel create` → `wires channel invite` (publishes history_grant then invite) → invitee opens topic, decrypts, publishes their own `__channel.member_meta`, is folded into roster.
 - `wires dm` between two agents in the same household: independent derivation yields the same topic_id; both see each other's `member_meta` after first publish.
-- `wires channel kick` rejected when run by non-creator; accepted when run by creator; subject's later messages no longer fold.
+- After cap revocation: subject's later publishes are rejected at the receiver's cap check before reaching the channel fold; historical entries remain in `members`.
 - `wires me set` republishes member_meta into every joined channel.
 
 ### Acceptance scenario (`#[ignore]`-marked, real iroh endpoints)
 
-Three-agent named-channel coordination: agent A creates `channels.coord`, invites B, B invites C, A goes offline, B and C exchange messages, A comes back and sees the missed messages via host replay.
+Three-agent named-channel coordination: agent A creates `channels.coord`, invites B, B invites C (after B has joined as full member), A goes offline, B and C exchange messages, A comes back and sees the missed messages via host replay.
 
 ## 14. Implementation sketch
 
@@ -308,17 +282,19 @@ Sizing only — a separate `docs/superpowers/plans/` document covers the task br
 
 | Crate | Change |
 |---|---|
-| `wires-core` | New `channel` module: `ChannelView`, `ChannelVariant`, `MemberMeta`, `MemberKind`, five content schemas, `replay` fold function, DM derivation. Five new entries in `reserved::required_mode_for`. New `MemberKind` serde round-trips. |
+| `wires-core` | New `channel` module: `ChannelView`, `ChannelVariant`, `MemberMeta`, `MemberKind`, three content schemas, `replay` fold function, DM derivation (2-party). Three new entries in `reserved::required_mode_for`. New `MemberKind` serde round-trips. |
 | `wires-node` | New `channel.rs` with the thin I/O wrapper over `TopicLog` (read-side: produces `ChannelView` from a stored log; write-side: helpers that publish the five reserved types via the existing publish path). |
 | `wires-cli` | New `cmd::channel` and `cmd::dm` modules; new `cmd::me` with `set`. `cmd::pair_approve` extended to push `dm.**` and `channels.**` into the cap's `topics` vector by default. All publishes go through the existing publish pipeline. |
-| `wires-mcp` | Eight new MCP tool registrations + handlers, all sharing the per-user `NodeRuntime`. |
+| `wires-mcp` | Six new MCP tool registrations + handlers, all sharing the per-user `NodeRuntime`. |
 | `wires-host` | No changes. The host is unaware of the channel layer. |
 
-No new dependencies; no wire-format changes beyond the five reserved-type entries; no new ALPNs.
+No new dependencies; no wire-format changes beyond the three reserved-type entries; no new ALPNs.
 
-## 15. Open questions for spec review
+## 15. Resolved decisions
 
-1. **Cap glob literals.** §8 specifies `dm.**` and `channels.**` as literal prefixes. Confirm we are not parameterizing them per-household (the prefix is meaningful as a substrate-wide convention, and tenant separation is already enforced by cap signatures).
-2. **Existing paired agents.** Agents paired before this lands have a cap whose `topics` vector does not contain the two new broad globs. Documented in §8 as "re-pair to participate; no in-place cap-extend path." Acceptable cutover for v1?
-3. **`channels.<name>` cap-glob fit.** When `wires channel create coordinate-grocery` runs, the agent's cap must cover the *name* `channels.coordinate-grocery`. The default broad cap `channels.**` covers it. If the operator minted a narrower glob, names outside it are rejected at publish time with the existing `CapDenied` snafu variant. Confirm this is the desired behavior (i.e. cap-glob == name-glob, not topic-id-glob).
-4. **DM topic_id discovery on open.** `ChannelView::open` recognizes DM topics by matching the topic_id against derivations over locally-known agent pubkey subsets. For small households this is fine. For households with many agents, the candidate set grows combinatorially. Mitigation: bound the open-time check to the 2-party case for v1 (which is what the CLI ships) and let larger groups carry an explicit hint. Acceptable?
+These were open during design; recording the answers so the implementation plan doesn't relitigate them.
+
+1. **Cap glob literals.** `dm.**` and `channels.**` are literal prefixes. Not parameterized per-household; tenant separation is already enforced by cap signatures.
+2. **Existing paired agents.** Backwards compatibility is not a concern for v1. Agents paired before this lands re-pair if they want to use the channel layer. No `wires cap mint` path.
+3. **`channels.<name>` cap-glob fit.** Cap glob applies to the topic *name*, not the topic_id. `channels.**` covers any name the create-flow chooses. Operators can narrow at pair time.
+4. **DM topic_id discovery on open.** v1 supports 2-party DMs only. `ChannelView::open` checks the topic_id against `BLAKE3("wires.dm.v1\0" || root || "\0" || sort(self_pubkey, other_pubkey))` for each other known agent pubkey — O(n) over the household's agent count, which is bounded at low hundreds. Group DMs (N > 2) are out of scope per §3; if v2 adds them, the caller will pass an explicit participant set to `open`.
