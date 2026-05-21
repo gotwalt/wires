@@ -103,6 +103,10 @@ pub async fn run(
         .deliver_grant(&request.dial, envelope)
         .await
         .context(NetSnafu)?;
+    let ed_hex = hex::encode(request.agent_pubkey);
+    let x_hex = hex::encode(request.agent_x25519);
+    wires_node::upsert_dm_roster(data_dir, [(ed_hex.as_str(), x_hex.as_str())])
+        .context(NodeSnafu)?;
     println!(
         "Paired: cap {} installed at {} on agent {}",
         hex::encode(cap_id),

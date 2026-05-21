@@ -11,6 +11,7 @@ use crate::atomic_write::atomic_write;
 use crate::error::{NodeError, Result, TopicNamesWriteSnafu};
 
 const FILE: &str = "topic_names.json";
+const DM_ROSTER_FILE: &str = "dm_roster.json";
 
 /// Resolve `topic` to a 32-byte id. Accepts either a 64-character hex id or a
 /// human name listed in `<data_dir>/topic_names.json`. Returns an io error if
@@ -97,4 +98,46 @@ pub fn upsert_entries<I: IntoIterator<Item = (String, [u8; 32])>>(
     let serialized = serde_json::to_string_pretty(&map).expect("HashMap serializes");
     atomic_write(&p, serialized.as_bytes(), None).context(TopicNamesWriteSnafu)?;
     Ok(())
+}
+
+/// Merge `(agent_ed25519_hex, agent_x25519_hex)` entries into
+/// `<data_dir>/dm_roster.json`. The file is a flat `HashMap<String, String>` —
+/// later entries overwrite earlier ones for the same key.
+///
+/// Mode bits are not strictly enforced here; the file may contain household
+/// secrets indirectly via the x25519 pubkey of trusted peers, but the
+/// pubkey itself is not secret. We rely on the data_dir's 0700 directory
+/// mode for confidentiality (same as `identity.*`).
+pub fn upsert_dm_roster<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
+    data_dir: &Path,
+    entries: I,
+) -> Result<()> {
+    let p = data_dir.join(DM_ROSTER_FILE);
+    let mut map: HashMap<String, String> = if p.exists() {
+        let s = std::fs::read_to_string(&p).context(TopicNamesWriteSnafu)?;
+        serde_json::from_str(&s).map_err(|e| NodeError::TopicNamesWrite {
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+            location: snafu::location!(),
+        })?
+    } else {
+        HashMap::new()
+    };
+    for (ed_hex, x_hex) in entries {
+        map.insert(ed_hex.to_string(), x_hex.to_string());
+    }
+    let serialized = serde_json::to_string_pretty(&map).expect("HashMap serializes");
+    atomic_write(&p, serialized.as_bytes(), None).context(TopicNamesWriteSnafu)?;
+    Ok(())
+}
+
+/// Read `dm_roster.json` into a `agent_ed25519_hex -> agent_x25519_hex` map.
+/// Returns an empty map if the file does not exist.
+pub fn load_dm_roster(data_dir: &Path) -> std::io::Result<HashMap<String, String>> {
+    let p = data_dir.join(DM_ROSTER_FILE);
+    if !p.exists() {
+        return Ok(HashMap::new());
+    }
+    let s = std::fs::read_to_string(&p)?;
+    serde_json::from_str(&s)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }

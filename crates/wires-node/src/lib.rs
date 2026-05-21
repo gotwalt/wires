@@ -28,4 +28,7 @@ pub use publish::{
 pub use runtime::NodeRuntime;
 pub use storage::TopicLogs;
 pub use sync::{current_hwm_for_request, drive_sync_pass};
-pub use topic_names::{load_topic_names, resolve_topic, upsert_entries as upsert_topic_names};
+pub use topic_names::{
+    load_dm_roster, load_topic_names, resolve_topic, upsert_dm_roster,
+    upsert_entries as upsert_topic_names,
+};
