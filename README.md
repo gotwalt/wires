@@ -2,16 +2,17 @@
 
 End-to-end encrypted gossip substrate for a household's AI agents. Think "a private group chat that machines can read and write to, hosted by a server that cannot."
 
-**Status: prototype.** Two slices have landed on `main`:
+**Status: prototype.** Five slices have landed on `main`:
 
 - **Substrate v1** — identity, topics, capabilities, encrypted publish/subscribe, replay between peers, persisted hash-chained logs. Drives the CLI end-to-end. Spec: [`docs/superpowers/specs/2026-05-14-wires-substrate-design.md`](docs/superpowers/specs/2026-05-14-wires-substrate-design.md).
 - **Hosted service v1** — `wires-host` is a multi-tenant blind relay with a `/wires/tenant/0` control-plane ALPN, per-tenant rolling retention, and an HTTPS service-discovery endpoint. Spec: [`docs/superpowers/specs/2026-05-14-wires-hosted-service-design.md`](docs/superpowers/specs/2026-05-14-wires-hosted-service-design.md).
 - **Responder-driven pairing v1** — agents declare a role + requested scopes via `wires pair-listen`; the operator consents and dials in via `wires pair-approve` over `/wires/pair/0` with a sealed, signed `PairGrant`. Spec: [`docs/superpowers/specs/2026-05-15-wires-responder-driven-pairing-design.md`](docs/superpowers/specs/2026-05-15-wires-responder-driven-pairing-design.md).
-- **MCP gateway v1** — `wires-mcp` is a multi-tenant authenticated MCP gateway. OAuth 2.1 (PRM + AS + DCR), iOS as universal authenticator, MCP tools: `wires_list_topics`, `wires_publish`, `wires_tail`. Per-user TTL + byte-budget retention (defaults: 1 h / 50 MiB; operator-tunable via `[retention]`). Specs: [gateway](docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md), [retention](docs/superpowers/specs/2026-05-18-wires-mcp-retention-design.md).
+- **MCP gateway v1** — `wires-mcp` is a multi-tenant authenticated MCP gateway. OAuth 2.1 (PRM + AS + DCR), iOS as universal authenticator. Per-user TTL + byte-budget retention (defaults: 1 h / 50 MiB; operator-tunable via `[retention]`). Specs: [gateway](docs/superpowers/specs/2026-05-18-wires-mcp-gateway-design.md), [retention](docs/superpowers/specs/2026-05-18-wires-mcp-retention-design.md).
+- **Channels v1** — named (operator-introduced, persistent name) and DM (DH-derived, zero-setup) channels share one wire vocabulary, one cap glob (`channels.**`), and one `ChannelView` fold. Three new reserved types (`__channel.create/invite/member_meta`). Spec: [`docs/superpowers/specs/2026-05-21-wires-channels-design.md`](docs/superpowers/specs/2026-05-21-wires-channels-design.md).
 
 A working Home Assistant ingestion daemon (`wires-ha`) ships as a separate binary.
 
-Not built yet: iOS companion app (still a stock SwiftUI scaffold pending revised plan), `__cap.*` gossip propagation, `__topic.epoch_advance` distribution.
+Not built yet: iOS companion app (still a stock SwiftUI scaffold pending revised plan), `__cap.*` gossip propagation, `__topic.epoch_advance` distribution. In channels v1, DMs are operator-initiated only — the `PairGrant` doesn't yet carry the operator's x25519, so paired agents can't `wires dm open <operator>` back at the household root holder.
 
 ## Build
 
@@ -204,6 +205,52 @@ wires --data-dir ./alice revoke <CAP_HEX>                  # tomb a cap (substra
 wires --data-dir ./alice cat home.notes                    # no --tail: print local log and exit
 ```
 
+## Channels and DMs
+
+Every paired agent gets the `channels.**` cap glob (Read+Write) by default,
+so the channel surface is usable end-to-end once Alice has paired Bob via
+`wires pair-approve`. Continuing the walkthrough:
+
+```bash
+# 1. Set your member metadata (kind/display-name/description). Persists to
+#    me.json and is auto-attached to channels you join.
+wires --data-dir ./alice me set --kind human --display-name "Alice"
+wires --data-dir ./bob   me set --kind cli   --display-name "Bob's CLI"
+
+# 2. Alice creates a named channel. A random topic_id + epoch key are
+#    minted; the broad channels.** cap is auto-resolved for the publish.
+wires --data-dir ./alice channel create coord --description "weekly grocery"
+# → Created channel 'channels.coord' with id <TOPIC_HEX>
+
+# 3. Alice invites Bob. This publishes a sealed __topic.history_grant
+#    carrying the epoch key, then a public __channel.invite event.
+wires --data-dir ./alice channel invite coord <BOB_AGENT_HEX>
+# → Invited <BOB_AGENT_HEX> to channels.coord
+
+# 4. Once Bob has replayed the channel from the host (any wires command
+#    that joins the topic — `cat` works — drains pending envelopes), he
+#    publishes his own __channel.member_meta to graduate from pending to
+#    full member. `wires me set` already did this if his data dir had any
+#    channels.* topics; otherwise re-running `wires me set` after replay
+#    catches Bob up.
+
+# 5. Inspect rosters.
+wires --data-dir ./alice channel list           # channels alice is a full member of
+wires --data-dir ./alice channel members coord  # full + pending roster
+
+# 6. DMs. Topic_id and epoch key are derived deterministically from
+#    sort(self, other, root_pubkey) via X25519 — no on-wire key exchange.
+#    The lookup table is dm_roster.json, populated by `pair-approve` with
+#    the requester's x25519 pubkey.
+wires --data-dir ./alice dm open <BOB_AGENT_HEX> --message "hi bob"
+wires --data-dir ./alice dm list
+```
+
+The MCP gateway exposes the same surface as tools: `wires_create_channel`,
+`wires_list_channels`, `wires_channel_members`, `wires_invite_to_channel`,
+`wires_dm_open`, `wires_set_member_meta` (see the MCP gateway section
+below).
+
 ## Networking notes
 
 - Transport is [iroh](https://www.iroh.computer) (`0.98`). Discovery uses iroh's N0 preset by default, plus mDNS on the LAN.
@@ -217,12 +264,12 @@ wires --data-dir ./alice cat home.notes                    # no --tail: print lo
 
 ```
 crates/
-  wires-core    pure types (WireMessage, Capability, content, sign/verify)
+  wires-core    pure types (WireMessage, Capability, content, sign/verify) + channel layer (ChannelView, derivation, replay fold)
   wires-crypto  AEAD (chacha20-poly1305), sealed-box (x25519), public envelopes
   wires-store   redb-backed hash-chained logs, cap table, epoch keys, ingest index
   wires-net     iroh gossip + replay protocol + tenant control protocol + pair protocol + host ticket
-  wires-node    Node runtime (publish, inbound, sync, NetGlue, NodeRuntime)
-  wires-cli     `wires` binary
+  wires-node    Node runtime (publish, inbound, sync, NetGlue, NodeRuntime) + channel I/O (open_named, open_dm, shared helpers for CLI/MCP)
+  wires-cli     `wires` binary (init/host/topic/publish/cat/pair-* plus channel/dm/me)
   wires-host    `wires-host` multi-tenant relay (lib + bin: tenant registry, retention, routing, host-ticket emission)
   wires-ha      `wires-ha` Home Assistant ingestion daemon
   wires-mcp     `wires-mcp` authenticated MCP gateway (lib + bin: OAuth 2.1, per-user NodeRuntime, MCP tools)
@@ -307,8 +354,11 @@ issuer survive rollouts.
    key.
 4. The browser redirects back; the MCP client now has an access token
    bound to the user's household root pubkey.
-5. The client can call `wires_list_topics`, `wires_publish`, `wires_tail`
-   against the user's agent's caps.
+5. The client can call MCP tools against the user's agent's caps:
+   - **Substrate:** `wires_list_topics`, `wires_publish`, `wires_tail`.
+   - **Channels:** `wires_list_channels`, `wires_create_channel`,
+     `wires_channel_members`, `wires_invite_to_channel`,
+     `wires_dm_open`, `wires_set_member_meta`.
 
 ### Known limitations (v1)
 
@@ -324,6 +374,11 @@ issuer survive rollouts.
 - The end-to-end acceptance test (`tests/end_to_end.rs`, marked `#[ignore]`)
   is a structural scaffold; filling in the test body requires factoring
   the pair-approve helper out of `wires-cli` and is tracked separately.
+- DMs are operator-initiated only. `PairGrant` doesn't yet carry the
+  operator's x25519 pubkey, so a paired agent's `dm_roster.json` knows
+  every requester it has approved but doesn't know the operator. The
+  operator can `wires dm open <agent>` outbound; the reverse direction
+  needs a PairGrant extension.
 
 ## License
 
