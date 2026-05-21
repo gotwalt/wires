@@ -1,5 +1,5 @@
 //! Pair-grant installation logic. Verifies a decrypted PairGrant and writes
-//! every artifact Bob needs to become a fully-onboarded household member.
+//! every artifact Bob needs to become a fully-onboarded fabric member.
 
 use std::path::Path;
 
@@ -101,7 +101,7 @@ pub enum PairOutcome {
     Paired { cap_id: [u8; 16] },
 }
 
-/// Summary of a successful pair install. Carries the household root pubkey
+/// Summary of a successful pair install. Carries the fabric root pubkey
 /// (so the caller can route on OAuth `sub`) plus the installed cap id and a
 /// timestamp. The gateway uses this in `on_paired` to bind the temp data
 /// dir to `users/<root>/` and complete the OAuth `/authorize` flow.

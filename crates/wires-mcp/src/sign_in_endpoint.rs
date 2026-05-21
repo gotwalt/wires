@@ -85,7 +85,7 @@ pub async fn handler(
         .delete_pending_signin(&req.session_id)
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))?;
 
-    // The household must already have a user record on this gateway.
+    // The fabric must already have a user record on this gateway.
     if state
         .store
         .get_user(&req.root_pubkey)
