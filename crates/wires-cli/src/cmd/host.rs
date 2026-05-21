@@ -1,5 +1,5 @@
 //! `wires host *` subcommands. Each one loads the local root key from
-//! `<data_dir>/root.ed25519`, opens a fresh iroh endpoint, dials a `TenantClient`,
+//! `<data_dir>/root.ed25519`, opens a fresh iroh endpoint, dials a `FabricClient`,
 //! and runs one request.
 
 use std::path::Path;
@@ -8,7 +8,7 @@ use ed25519_dalek::SigningKey;
 use iroh::{Endpoint, SecretKey};
 use snafu::ResultExt;
 use tracing;
-use wires_net::tenant::{TenantClient, TenantResponse};
+use wires_net::fabric::{FabricClient, FabricResponse};
 use wires_net::{endpoint_id_from_hex, load_or_create_secret, unix_now_ms};
 use wires_node::{HostConfig, NodeConfig, load_root_signing_key, resolve_topic};
 
@@ -35,19 +35,19 @@ pub async fn pair(data_dir: &Path, ticket_arg: &str) -> Result<()> {
     let secret = load_or_create_secret(&secret_path).context(NetSnafu)?;
     let ep = bind_endpoint(secret).await?;
     register_hint_addrs(&ep, &hint);
-    let client = TenantClient::new(ep);
+    let client = FabricClient::new(ep);
     let resp = client
-        .register_tenant(host_eid, &root, &host_eid_bytes, unix_now_ms())
+        .register_fabric(host_eid, &root, &host_eid_bytes, unix_now_ms())
         .await
         .context(NetSnafu)?;
     match resp {
-        TenantResponse::Register(r) if r.ok => {
+        FabricResponse::Register(r) if r.ok => {
             println!(
                 "Paired with host {} (server_time={})",
                 r.host_endpoint_id, r.server_time
             );
         }
-        TenantResponse::Error(e) => return Err(host_rejected(e)),
+        FabricResponse::Error(e) => return Err(host_rejected(e)),
         other => return unexpected(other),
     }
     cfg.host = Some(HostConfig {
@@ -71,7 +71,7 @@ fn read_ticket_arg(arg: &str) -> Result<String> {
 
 async fn open_paired_client(
     data_dir: &Path,
-) -> Result<(TenantClient, iroh::EndpointId, [u8; 32], SigningKey)> {
+) -> Result<(FabricClient, iroh::EndpointId, [u8; 32], SigningKey)> {
     let raw = std::fs::read_to_string(data_dir.join("config.toml")).context(IoSnafu)?;
     let cfg: NodeConfig = toml::from_str(&raw).context(TomlParseSnafu)?;
     let host = cfg
@@ -91,7 +91,7 @@ async fn open_paired_client(
     let secret = load_or_create_secret(&data_dir.join("iroh.secret")).context(NetSnafu)?;
     let ep = bind_endpoint(secret).await?;
     register_hint_addrs(&ep, &first);
-    Ok((TenantClient::new(ep), host_eid, host_eid_bytes, root))
+    Ok((FabricClient::new(ep), host_eid, host_eid_bytes, root))
 }
 
 /// Register the addresses from a `PeerHint` into the endpoint's address-lookup
@@ -142,11 +142,11 @@ pub async fn topic_register(data_dir: &Path, topic: &str) -> Result<()> {
         .await
         .context(NetSnafu)?;
     match resp {
-        TenantResponse::TopicRegister(r) if r.ok => {
+        FabricResponse::TopicRegister(r) if r.ok => {
             println!("Registered topic {}", hex::encode(r.topic_id));
             Ok(())
         }
-        TenantResponse::Error(e) => Err(host_rejected(e)),
+        FabricResponse::Error(e) => Err(host_rejected(e)),
         other => unexpected(other),
     }
 }
@@ -159,22 +159,22 @@ pub async fn topic_unregister(data_dir: &Path, topic: &str) -> Result<()> {
         .await
         .context(NetSnafu)?;
     match resp {
-        TenantResponse::TopicUnregister(r) if r.ok => {
+        FabricResponse::TopicUnregister(r) if r.ok => {
             println!("Unregistered topic {}", hex::encode(r.topic_id));
             Ok(())
         }
-        TenantResponse::Error(e) => Err(host_rejected(e)),
+        FabricResponse::Error(e) => Err(host_rejected(e)),
         other => unexpected(other),
     }
 }
 
-pub async fn tenant_unregister(data_dir: &Path, yes: bool) -> Result<()> {
+pub async fn fabric_unregister(data_dir: &Path, yes: bool) -> Result<()> {
     if !yes {
         use std::io::Write as _;
         eprint!(
-            "This will tell the host to drop this fabric's tenant record, \
-             every topic_index entry, and the on-disk tenant directory \
-             (`tenant` is the host-internal name for this fabric's footprint).\n\
+            "This will tell the host to drop this fabric.s host-side record, \
+             every topic_index entry, and the on-disk fabric directory \
+             (`fabric` is what this host stores name for this fabric.s footprint).\n\
              It will also clear the local config.toml host block.\n\
              Continue? [y/N] "
         );
@@ -189,11 +189,11 @@ pub async fn tenant_unregister(data_dir: &Path, yes: bool) -> Result<()> {
     }
     let (client, host_eid, host_eid_bytes, root) = open_paired_client(data_dir).await?;
     let resp = client
-        .unregister_tenant(host_eid, &root, &host_eid_bytes, unix_now_ms())
+        .unregister_fabric(host_eid, &root, &host_eid_bytes, unix_now_ms())
         .await
         .context(NetSnafu)?;
     match resp {
-        TenantResponse::Unregister(r) => {
+        FabricResponse::Unregister(r) => {
             if r.ok {
                 println!(
                     "Unregistered fabric on host; host dropped {} topic(s)",
@@ -203,7 +203,7 @@ pub async fn tenant_unregister(data_dir: &Path, yes: bool) -> Result<()> {
                 println!("Host had no record for this fabric (already gone)");
             }
         }
-        TenantResponse::Error(e) => return Err(host_rejected(e)),
+        FabricResponse::Error(e) => return Err(host_rejected(e)),
         other => return unexpected(other),
     }
 
@@ -219,13 +219,13 @@ pub async fn tenant_unregister(data_dir: &Path, yes: bool) -> Result<()> {
         match toml::to_string_pretty(&cfg) {
             Ok(serialized) => {
                 if let Err(e) = std::fs::write(&cfg_path, serialized) {
-                    tracing::warn!(error = %e, "failed to rewrite config.toml after tenant-unregister");
+                    tracing::warn!(error = %e, "failed to rewrite config.toml after fabric-unregister");
                 } else {
                     println!("Cleared host block in {}", cfg_path.display());
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "failed to serialize cleared config.toml after tenant-unregister");
+                tracing::warn!(error = %e, "failed to serialize cleared config.toml after fabric-unregister");
             }
         }
     }
@@ -235,11 +235,11 @@ pub async fn tenant_unregister(data_dir: &Path, yes: bool) -> Result<()> {
 pub async fn status(data_dir: &Path) -> Result<()> {
     let (client, host_eid, host_eid_bytes, root) = open_paired_client(data_dir).await?;
     let resp = client
-        .tenant_status(host_eid, &root, &host_eid_bytes, unix_now_ms())
+        .fabric_status(host_eid, &root, &host_eid_bytes, unix_now_ms())
         .await
         .context(NetSnafu)?;
     match resp {
-        TenantResponse::Status(s) => {
+        FabricResponse::Status(s) => {
             println!("Fabric status (as reported by host):");
             println!("  registered_at         : {}", s.registered_at);
             println!("  topic_count           : {}", s.topic_count);
@@ -253,12 +253,12 @@ pub async fn status(data_dir: &Path) -> Result<()> {
             println!("  status                : {:?}", s.status);
             Ok(())
         }
-        TenantResponse::Error(e) => Err(host_rejected(e)),
+        FabricResponse::Error(e) => Err(host_rejected(e)),
         other => unexpected(other),
     }
 }
 
-fn host_rejected(e: wires_net::tenant::TenantErrorResponse) -> CliError {
+fn host_rejected(e: wires_net::fabric::FabricErrorResponse) -> CliError {
     HostRejectedSnafu {
         code: e.code,
         message: e.message,
@@ -266,7 +266,7 @@ fn host_rejected(e: wires_net::tenant::TenantErrorResponse) -> CliError {
     .build()
 }
 
-fn unexpected(other: TenantResponse) -> Result<()> {
+fn unexpected(other: FabricResponse) -> Result<()> {
     Err(UnexpectedResponseSnafu {
         message: format!("{other:?}"),
     }

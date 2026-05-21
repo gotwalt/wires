@@ -1,25 +1,25 @@
-//! `ReplaySource` impl that routes per-tenant via the topic_index.
+//! `ReplaySource` impl that routes per-fabric via the topic_index.
 
 use std::sync::Arc;
 
 use wires_core::WireMessage;
 use wires_net::replay::{Pubkey, ReplaySource};
 
-use crate::per_tenant_logs::PerTenantLogs;
-use crate::tenant_registry::TenantRegistry;
+use crate::fabric_registry::FabricRegistry;
+use crate::per_fabric_logs::PerFabricLogs;
 
-pub struct PerTenantReplaySource {
-    registry: Arc<TenantRegistry>,
-    logs: Arc<PerTenantLogs>,
+pub struct PerFabricReplaySource {
+    registry: Arc<FabricRegistry>,
+    logs: Arc<PerFabricLogs>,
 }
 
-impl PerTenantReplaySource {
-    pub fn new(registry: Arc<TenantRegistry>, logs: Arc<PerTenantLogs>) -> Self {
+impl PerFabricReplaySource {
+    pub fn new(registry: Arc<FabricRegistry>, logs: Arc<PerFabricLogs>) -> Self {
         Self { registry, logs }
     }
 }
 
-impl ReplaySource for PerTenantReplaySource {
+impl ReplaySource for PerFabricReplaySource {
     fn read_after(
         &self,
         topic_id: &[u8; 32],
@@ -27,7 +27,7 @@ impl ReplaySource for PerTenantReplaySource {
         after_seq: Option<u64>,
         limit: usize,
     ) -> std::result::Result<Vec<WireMessage>, Box<dyn std::error::Error + Send + Sync>> {
-        let root = match self.registry.lookup_topic_tenant(topic_id) {
+        let root = match self.registry.lookup_topic_fabric(topic_id) {
             Ok(Some(r)) => r,
             Ok(None) => return Ok(vec![]),
             Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
@@ -44,7 +44,7 @@ impl ReplaySource for PerTenantReplaySource {
         &self,
         topic_id: &[u8; 32],
     ) -> std::result::Result<Vec<Pubkey>, Box<dyn std::error::Error + Send + Sync>> {
-        let root = match self.registry.lookup_topic_tenant(topic_id) {
+        let root = match self.registry.lookup_topic_fabric(topic_id) {
             Ok(Some(r)) => r,
             Ok(None) => return Ok(vec![]),
             Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),

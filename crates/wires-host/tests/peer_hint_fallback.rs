@@ -6,50 +6,50 @@ use std::time::Duration;
 
 use iroh::{Endpoint, SecretKey, endpoint::presets};
 use wires_net::PeerHint;
-use wires_net::peer_hint::first_reachable;
-use wires_net::tenant::{
-    ALPN as TENANT_ALPN, TenantErrorCode, TenantErrorResponse, TenantHandler, TenantProtocol,
-    TenantRegisterRequest, TenantResponse, TenantStatusRequest, TenantUnregisterRequest,
+use wires_net::fabric::{
+    ALPN as FABRIC_ALPN, FabricErrorCode, FabricErrorResponse, FabricHandler, FabricProtocol,
+    FabricRegisterRequest, FabricResponse, FabricStatusRequest, FabricUnregisterRequest,
     TopicRegisterRequest, TopicUnregisterRequest,
 };
+use wires_net::peer_hint::first_reachable;
 
 /// A stub handler that rejects all requests. Only used to satisfy
-/// `TenantProtocol::new`; `first_reachable` drops the connection before
+/// `FabricProtocol::new`; `first_reachable` drops the connection before
 /// sending any request, so this code is never actually called in this test.
 struct RejectAll;
 
-impl TenantHandler for RejectAll {
-    fn handle_register(&self, _req: TenantRegisterRequest) -> TenantResponse {
-        TenantResponse::Error(TenantErrorResponse {
-            code: TenantErrorCode::Internal,
+impl FabricHandler for RejectAll {
+    fn handle_register(&self, _req: FabricRegisterRequest) -> FabricResponse {
+        FabricResponse::Error(FabricErrorResponse {
+            code: FabricErrorCode::Internal,
             message: "test stub".into(),
         })
     }
 
-    fn handle_unregister(&self, _req: TenantUnregisterRequest) -> TenantResponse {
-        TenantResponse::Error(TenantErrorResponse {
-            code: TenantErrorCode::Internal,
+    fn handle_unregister(&self, _req: FabricUnregisterRequest) -> FabricResponse {
+        FabricResponse::Error(FabricErrorResponse {
+            code: FabricErrorCode::Internal,
             message: "test stub".into(),
         })
     }
 
-    fn handle_topic_register(&self, _req: TopicRegisterRequest) -> TenantResponse {
-        TenantResponse::Error(TenantErrorResponse {
-            code: TenantErrorCode::Internal,
+    fn handle_topic_register(&self, _req: TopicRegisterRequest) -> FabricResponse {
+        FabricResponse::Error(FabricErrorResponse {
+            code: FabricErrorCode::Internal,
             message: "test stub".into(),
         })
     }
 
-    fn handle_topic_unregister(&self, _req: TopicUnregisterRequest) -> TenantResponse {
-        TenantResponse::Error(TenantErrorResponse {
-            code: TenantErrorCode::Internal,
+    fn handle_topic_unregister(&self, _req: TopicUnregisterRequest) -> FabricResponse {
+        FabricResponse::Error(FabricErrorResponse {
+            code: FabricErrorCode::Internal,
             message: "test stub".into(),
         })
     }
 
-    fn handle_status(&self, _req: TenantStatusRequest) -> TenantResponse {
-        TenantResponse::Error(TenantErrorResponse {
-            code: TenantErrorCode::Internal,
+    fn handle_status(&self, _req: FabricStatusRequest) -> FabricResponse {
+        FabricResponse::Error(FabricErrorResponse {
+            code: FabricErrorCode::Internal,
             message: "test stub".into(),
         })
     }
@@ -77,20 +77,20 @@ fn bogus_endpoint_hex() -> String {
 
 #[tokio::test]
 async fn peer_hint_fallback_picks_second_when_first_unreachable() {
-    // Spin up a real host endpoint that advertises the tenant ALPN.
+    // Spin up a real host endpoint that advertises the fabric ALPN.
     // The handler is never invoked because `first_reachable` drops the
     // connection before opening a request stream.
     let host_secret = SecretKey::generate();
     let host_ep = Endpoint::builder(presets::N0)
         .secret_key(host_secret)
-        .alpns(vec![TENANT_ALPN.to_vec()])
+        .alpns(vec![FABRIC_ALPN.to_vec()])
         .bind()
         .await
         .unwrap();
     let real_endpoint_hex = hex::encode(host_ep.id().as_bytes());
 
     let _router = iroh::protocol::Router::builder(host_ep.clone())
-        .accept(TENANT_ALPN, TenantProtocol::new(Arc::new(RejectAll)))
+        .accept(FABRIC_ALPN, FabricProtocol::new(Arc::new(RejectAll)))
         .spawn();
 
     // Client endpoint
@@ -116,7 +116,7 @@ async fn peer_hint_fallback_picks_second_when_first_unreachable() {
         },
     ];
 
-    let chosen = first_reachable(&client_ep, &hints, TENANT_ALPN, Duration::from_secs(5)).await;
+    let chosen = first_reachable(&client_ep, &hints, FABRIC_ALPN, Duration::from_secs(5)).await;
 
     assert!(
         chosen.is_some(),

@@ -27,14 +27,14 @@ pub enum HostError {
         location: Location,
     },
 
-    #[snafu(display("Tenant signature invalid, at {location}"))]
-    TenantSignatureInvalid {
+    #[snafu(display("Fabric signature invalid, at {location}"))]
+    FabricSignatureInvalid {
         #[snafu(implicit)]
         location: Location,
     },
 
-    #[snafu(display("Tenant suspended (root={root_hex}), at {location}"))]
-    TenantSuspended {
+    #[snafu(display("Fabric suspended (root={root_hex}), at {location}"))]
+    FabricSuspended {
         root_hex: String,
         #[snafu(implicit)]
         location: Location,

@@ -84,7 +84,7 @@ pub enum CliError {
     },
     #[snafu(display("host rejected request: {code:?} — {message}, at {location}"))]
     HostRejected {
-        code: wires_net::tenant::TenantErrorCode,
+        code: wires_net::fabric::FabricErrorCode,
         message: String,
         #[snafu(implicit)]
         location: Location,

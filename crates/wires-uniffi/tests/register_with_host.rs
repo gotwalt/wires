@@ -1,11 +1,11 @@
 //! Integration test: WiresApp.parse_host_ticket + register_with_hosted_service
-//! against an in-process iroh endpoint running a stub `TenantHandler`.
+//! against an in-process iroh endpoint running a stub `FabricHandler`.
 //!
 //! Verifies the FFI shape end-to-end: a base64 `HostTicket` round-trips into
 //! `HostInfo`, the WiresApp binds its own endpoint lazily, registers the
-//! host's address hints, signs a `TenantRegisterRequest` via the
-//! `SwiftRootSigner` callback, dials over `/wires/tenant/0`, and lifts the
-//! `TenantRegisterResponse` into a `TenantRegistration`.
+//! host's address hints, signs a `FabricRegisterRequest` via the
+//! `SwiftRootSigner` callback, dials over `/wires/fabric/0`, and lifts the
+//! `FabricRegisterResponse. into a .FabricRegistration`.
 //!
 //! The fuller end-to-end (parse_pair_request → approve_pair_request against
 //! a `wires-host` + `wires-node` pair) remains a follow-up integration test
@@ -16,9 +16,9 @@ use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::OsRng;
-use wires_net::tenant::{
-    ALPN as TENANT_ALPN, TenantHandler, TenantOp, TenantProtocol, TenantRegisterRequest,
-    TenantRegisterResponse, TenantResponse, TenantStatusRequest, TenantUnregisterRequest,
+use wires_net::fabric::{
+    ALPN as FABRIC_ALPN, FabricHandler, FabricOp, FabricProtocol, FabricRegisterRequest,
+    FabricRegisterResponse, FabricResponse, FabricStatusRequest, FabricUnregisterRequest,
     TopicRegisterRequest, TopicUnregisterRequest, signing_bytes,
 };
 use wires_net::ticket::HostTicket;
@@ -42,10 +42,10 @@ struct AcceptingHandler {
     now_ms: i64,
 }
 
-impl TenantHandler for AcceptingHandler {
-    fn handle_register(&self, req: TenantRegisterRequest) -> TenantResponse {
+impl FabricHandler for AcceptingHandler {
+    fn handle_register(&self, req: FabricRegisterRequest) -> FabricResponse {
         let bytes = signing_bytes(
-            TenantOp::Register,
+            FabricOp::Register,
             &req.root_pubkey,
             req.timestamp,
             &req.nonce,
@@ -53,23 +53,23 @@ impl TenantHandler for AcceptingHandler {
         );
         let vk = VerifyingKey::from_bytes(&req.root_pubkey).unwrap();
         vk.verify(&bytes, &req.signature.into()).unwrap();
-        TenantResponse::Register(TenantRegisterResponse {
+        FabricResponse::Register(FabricRegisterResponse {
             ok: true,
             host_endpoint_id: hex::encode(self.host_id),
             server_time: self.now_ms,
             caps_topic_id: self.caps_topic_id,
         })
     }
-    fn handle_unregister(&self, _r: TenantUnregisterRequest) -> TenantResponse {
+    fn handle_unregister(&self, _r: FabricUnregisterRequest) -> FabricResponse {
         unreachable!()
     }
-    fn handle_topic_register(&self, _r: TopicRegisterRequest) -> TenantResponse {
+    fn handle_topic_register(&self, _r: TopicRegisterRequest) -> FabricResponse {
         unreachable!()
     }
-    fn handle_topic_unregister(&self, _r: TopicUnregisterRequest) -> TenantResponse {
+    fn handle_topic_unregister(&self, _r: TopicUnregisterRequest) -> FabricResponse {
         unreachable!()
     }
-    fn handle_status(&self, _r: TenantStatusRequest) -> TenantResponse {
+    fn handle_status(&self, _r: FabricStatusRequest) -> FabricResponse {
         unreachable!()
     }
 }
@@ -88,7 +88,7 @@ async fn register_with_hosted_service_round_trip() {
     let host_secret = iroh::SecretKey::generate();
     let host_ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(host_secret)
-        .alpns(vec![TENANT_ALPN.to_vec()])
+        .alpns(vec![FABRIC_ALPN.to_vec()])
         .bind()
         .await
         .unwrap();
@@ -100,7 +100,7 @@ async fn register_with_hosted_service_round_trip() {
         now_ms: 4242,
     });
     let _router = iroh::protocol::Router::builder(host_ep.clone())
-        .accept(TENANT_ALPN, TenantProtocol::new(handler))
+        .accept(FABRIC_ALPN, FabricProtocol::new(handler))
         .spawn();
 
     // Build a real HostTicket off the live host endpoint.

@@ -24,7 +24,7 @@ struct OnboardingFeature {
         var completed: Completed?
 
         struct Completed: Equatable {
-            let registration: TenantRegistration
+            let registration: FabricRegistration
             let host: HostInfo
             let rootPubkeyHex: String
         }
@@ -152,7 +152,7 @@ struct OnboardingFeature {
                             hostRelayURL: host.relay,
                             hostHintExpiresAtMs: host.hintExpiresAtMs,
                             capsTopicIdHex: registration.capsTopicIdHex,
-                            tenantRegisteredAt: .now
+                            fabricRegisteredAt: .now
                         )
                         try await fabric.saveFabric(h)
                         await send(.registerSucceeded(.init(

@@ -22,8 +22,8 @@ use crate::signer::SwiftRootSigner;
 use crate::ticket;
 use crate::topic::generate_topic_id_and_epoch0 as gen_topic;
 use crate::types::{
-    GrantedScope, HostInfo, NewTopic, PairAckRecord, PairRequestPreview, PendingPairHandle,
-    TenantRegistration, UnregisterResult,
+    FabricRegistration, GrantedScope, HostInfo, NewTopic, PairAckRecord, PairRequestPreview,
+    PendingPairHandle, UnregisterResult,
 };
 
 struct PendingPair {
@@ -60,7 +60,7 @@ impl WiresApp {
     pub async fn register_with_hosted_service(
         &self,
         host: HostInfo,
-    ) -> Result<TenantRegistration, WiresError> {
+    ) -> Result<FabricRegistration, WiresError> {
         let ep = self.endpoint().await?;
         fabric_flow::register_with_hosted_service(ep, self.root_signer.clone(), &host).await
     }
