@@ -57,9 +57,6 @@ pub async fn run(
 
     let mut topic_keys = Vec::new();
     let mut topic_names = Vec::new();
-    let mut cap_topics: Vec<String> = Vec::new();
-    let mut cap_rights: Vec<Right> = Vec::new();
-    let mut seen_rights = std::collections::HashSet::new();
     for scope in &scopes {
         let topic_id = name_map
             .get(&scope.topic_name)
@@ -78,13 +75,8 @@ pub async fn run(
             topic_id: *topic_id,
             name: scope.topic_name.clone(),
         });
-        cap_topics.push(scope.topic_name.clone());
-        for r in &scope.rights {
-            if seen_rights.insert(*r) {
-                cap_rights.push(*r);
-            }
-        }
     }
+    let (cap_topics, cap_rights) = build_cap_globs(&scopes);
 
     let mut cap = Capability::new_unsigned(request.agent_pubkey, cap_topics, cap_rights, now, None);
     cap.sign(&root_sk).context(CoreSnafu)?;
@@ -156,6 +148,31 @@ fn prompt_yes_no(prompt: &str) -> Result<bool> {
     ))
 }
 
+pub(super) fn build_cap_globs(requested: &[RequestedScope]) -> (Vec<String>, Vec<Right>) {
+    let mut topics: Vec<String> = Vec::new();
+    let mut rights: Vec<Right> = Vec::new();
+    let mut seen_rights = std::collections::HashSet::new();
+    for scope in requested {
+        topics.push(scope.topic_name.clone());
+        for r in &scope.rights {
+            if seen_rights.insert(*r) {
+                rights.push(*r);
+            }
+        }
+    }
+    // Channels broad glob — every paired agent participates in the channel layer.
+    if !topics.iter().any(|t| t == "channels.**") {
+        topics.push("channels.**".to_string());
+    }
+    if !rights.contains(&Right::Read) {
+        rights.push(Right::Read);
+    }
+    if !rights.contains(&Right::Write) {
+        rights.push(Right::Write);
+    }
+    (topics, rights)
+}
+
 fn filter_scopes(
     requested: &[RequestedScope],
     narrow_scopes: &[String],
@@ -190,4 +207,31 @@ fn filter_scopes(
         return Err(invalid!("after narrowing, no scopes remain to grant"));
     }
     Ok(base)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_cap_globs_always_adds_channels_glob() {
+        let scopes = vec![RequestedScope {
+            topic_name: "home.notes".to_string(),
+            rights: vec![Right::Read],
+        }];
+        let (topics, rights) = build_cap_globs(&scopes);
+        assert!(topics.contains(&"channels.**".to_string()));
+        assert!(rights.contains(&Right::Read));
+        assert!(rights.contains(&Right::Write));
+    }
+
+    #[test]
+    fn build_cap_globs_no_duplicate_channels_glob() {
+        let scopes = vec![RequestedScope {
+            topic_name: "channels.**".to_string(),
+            rights: vec![Right::Read, Right::Write],
+        }];
+        let (topics, _rights) = build_cap_globs(&scopes);
+        assert_eq!(topics.iter().filter(|t| *t == "channels.**").count(), 1);
+    }
 }
