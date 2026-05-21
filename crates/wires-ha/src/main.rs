@@ -123,12 +123,12 @@ async fn register_topic_best_effort(
     let host_eid = endpoint_id_from_hex(&hint.node_id).ok_or("host node_id is not 32-byte hex")?;
     let host_eid_bytes = *host_eid.as_bytes();
     let root = load_root_signing_key(data_dir)?;
-    let client = wires_net::tenant::TenantClient::new(endpoint.clone());
+    let client = wires_net::fabric::FabricClient::new(endpoint.clone());
     let resp = client
         .register_topic(host_eid, &root, topic_id, &host_eid_bytes, unix_now_ms())
         .await?;
     match resp {
-        wires_net::tenant::TenantResponse::TopicRegister(r) if r.ok => Ok(()),
+        wires_net::fabric::FabricResponse::TopicRegister(r) if r.ok => Ok(()),
         other => Err(format!("host responded: {other:?}").into()),
     }
 }

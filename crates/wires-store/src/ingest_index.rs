@@ -9,7 +9,7 @@ use crate::schema::{INGEST_INDEX, INGEST_META};
 const META_KEY: &[u8] = b"m";
 const BACKFILLED_KEY: &[u8] = b"b";
 
-/// A single entry in the per-tenant ingest order.
+/// A single entry in the per-fabric ingest order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestEntry {
     pub topic_id: [u8; 32],
@@ -181,7 +181,7 @@ impl IngestIndex {
         Ok(dropped)
     }
 
-    /// Whether the one-time per-tenant backfill has already been performed.
+    /// Whether the one-time per-fabric backfill has already been performed.
     /// Defaults to `false` on a fresh index.
     pub fn is_backfilled(&self) -> Result<bool> {
         let read = self.db.begin_read().context(BeginTxnSnafu)?;

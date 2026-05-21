@@ -1,5 +1,5 @@
-//! Inbound envelope router: resolves topic → tenant, applies write-rate
-//! limits, appends to per-tenant log, records in retention.
+//! Inbound envelope router: resolves topic → fabric, applies write-rate
+//! limits, appends to per-fabric log, records in retention.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -9,9 +9,9 @@ use snafu::ResultExt as _;
 use wires_core::WireMessage;
 
 use crate::error::{Result, StoreSnafu};
-use crate::per_tenant_logs::PerTenantLogs;
+use crate::fabric_registry::{FabricRecord, FabricRegistry, FabricStatus};
+use crate::per_fabric_logs::PerFabricLogs;
 use crate::retention::Retention;
-use crate::tenant_registry::{TenantRecord, TenantRegistry, TenantStatus};
 
 pub struct WriteRateLimiter {
     per_sec: u32,
@@ -26,7 +26,7 @@ impl WriteRateLimiter {
         }
     }
 
-    /// Returns `true` if the request is within the per-tenant per-second cap.
+    /// Returns `true` if the request is within the per-fabric per-second cap.
     pub fn try_acquire(&self, root_pubkey: &[u8; 32]) -> bool {
         let mut map = self.buckets.write().unwrap();
         let now = Instant::now();
@@ -43,8 +43,8 @@ impl WriteRateLimiter {
 }
 
 pub struct Router {
-    registry: Arc<TenantRegistry>,
-    logs: Arc<PerTenantLogs>,
+    registry: Arc<FabricRegistry>,
+    logs: Arc<PerFabricLogs>,
     retention: Arc<Retention>,
     rate: Arc<WriteRateLimiter>,
 }
@@ -60,8 +60,8 @@ pub enum RouteOutcome {
 
 impl Router {
     pub fn new(
-        registry: Arc<TenantRegistry>,
-        logs: Arc<PerTenantLogs>,
+        registry: Arc<FabricRegistry>,
+        logs: Arc<PerFabricLogs>,
         retention: Arc<Retention>,
         rate: Arc<WriteRateLimiter>,
     ) -> Self {
@@ -74,15 +74,15 @@ impl Router {
     }
 
     pub fn route(&self, msg: &WireMessage) -> Result<RouteOutcome> {
-        let root_pubkey = match self.registry.lookup_topic_tenant(&msg.topic_id)? {
+        let root_pubkey = match self.registry.lookup_topic_fabric(&msg.topic_id)? {
             Some(r) => r,
             None => return Ok(RouteOutcome::DroppedUnknownTopic),
         };
-        let rec: TenantRecord = match self.registry.get(&root_pubkey)? {
+        let rec: FabricRecord = match self.registry.get(&root_pubkey)? {
             Some(r) => r,
             None => return Ok(RouteOutcome::DroppedUnknownTopic),
         };
-        if rec.status == TenantStatus::Suspended {
+        if rec.status == FabricStatus::Suspended {
             return Ok(RouteOutcome::DroppedSuspended);
         }
         if !self.rate.try_acquire(&root_pubkey) {
@@ -112,7 +112,7 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tenant_registry::{TenantRecord, TenantStatus};
+    use crate::fabric_registry::{FabricRecord, FabricStatus};
     use tempfile::TempDir;
     use wires_core::{MessageKind, WireMessage};
 
@@ -132,18 +132,18 @@ mod tests {
         }
     }
 
-    fn router_with_one_tenant(tmp: &TempDir, topic: [u8; 32]) -> (Router, [u8; 32]) {
-        let registry = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
-        let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+    fn router_with_one_fabric(tmp: &TempDir, topic: [u8; 32]) -> (Router, [u8; 32]) {
+        let registry = Arc::new(FabricRegistry::open(tmp.path()).unwrap());
+        let logs = Arc::new(PerFabricLogs::new(tmp.path()));
         let retention = Arc::new(Retention::new(tmp.path(), Arc::clone(&logs)));
         let rate = Arc::new(WriteRateLimiter::new(1_000_000));
         let root = [3u8; 32];
         registry
             .insert_if_absent(
                 &root,
-                TenantRecord {
+                FabricRecord {
                     registered_at: 0,
-                    status: TenantStatus::Active,
+                    status: FabricStatus::Active,
                     retention_budget_bytes: u64::MAX,
                 },
             )
@@ -155,8 +155,8 @@ mod tests {
     #[test]
     fn unknown_topic_is_dropped() {
         let tmp = TempDir::new().unwrap();
-        let registry = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
-        let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+        let registry = Arc::new(FabricRegistry::open(tmp.path()).unwrap());
+        let logs = Arc::new(PerFabricLogs::new(tmp.path()));
         let retention = Arc::new(Retention::new(tmp.path(), Arc::clone(&logs)));
         let rate = Arc::new(WriteRateLimiter::new(1_000));
         let router = Router::new(registry, logs, retention, rate);
@@ -169,7 +169,7 @@ mod tests {
     fn registered_topic_appends() {
         let tmp = TempDir::new().unwrap();
         let topic = [5u8; 32];
-        let (router, _root) = router_with_one_tenant(&tmp, topic);
+        let (router, _root) = router_with_one_fabric(&tmp, topic);
         let msg = dummy_msg(topic, 7, 0);
         let out = router.route(&msg).unwrap();
         assert!(matches!(out, RouteOutcome::Appended));
@@ -179,17 +179,17 @@ mod tests {
     fn rate_limit_blocks_excess() {
         let tmp = TempDir::new().unwrap();
         let topic = [5u8; 32];
-        let registry = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
-        let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+        let registry = Arc::new(FabricRegistry::open(tmp.path()).unwrap());
+        let logs = Arc::new(PerFabricLogs::new(tmp.path()));
         let retention = Arc::new(Retention::new(tmp.path(), Arc::clone(&logs)));
         let rate = Arc::new(WriteRateLimiter::new(1)); // 1/sec
         let root = [3u8; 32];
         registry
             .insert_if_absent(
                 &root,
-                TenantRecord {
+                FabricRecord {
                     registered_at: 0,
-                    status: TenantStatus::Active,
+                    status: FabricStatus::Active,
                     retention_budget_bytes: u64::MAX,
                 },
             )

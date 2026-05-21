@@ -1,4 +1,4 @@
-//! Tenants, topic→tenant index, and registration nonces.
+//! Fabrics, topic→fabric index, and registration nonces.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,8 +11,8 @@ use crate::error::{
     CommitSnafu, DbOpenSnafu, IoSnafu, Result, SerdeSnafu, StorageIoSnafu, TableSnafu, TxnSnafu,
 };
 
-/// Key = root_pubkey (32 bytes). Value = JSON `TenantRecord`.
-pub const TENANTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("tenants");
+/// Key = root_pubkey (32 bytes). Value = JSON `FabricRecord`.
+pub const FABRICS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("fabrics");
 
 /// Key = topic_id (32 bytes). Value = root_pubkey (32 bytes).
 pub const TOPIC_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("topic_index");
@@ -20,19 +20,19 @@ pub const TOPIC_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("top
 /// Key = root_pubkey (32) || nonce (16) = 48 bytes. Value = u64 BE expires_at_unix_ms.
 pub const NONCES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("nonces");
 
-/// Default per-tenant retention budget: 1 GiB.
+/// Default per-fabric retention budget: 1 GiB.
 pub const DEFAULT_RETENTION_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum TenantStatus {
+pub enum FabricStatus {
     Active,
     Suspended,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TenantRecord {
+pub struct FabricRecord {
     pub registered_at: i64,
-    pub status: TenantStatus,
+    pub status: FabricStatus,
     pub retention_budget_bytes: u64,
 }
 
@@ -44,40 +44,40 @@ pub enum TopicRegisterOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TenantDeleteOutcome {
-    /// Whether a tenant row was found before deletion.
+pub struct FabricDeleteOutcome {
+    /// Whether a fabric row was found before deletion.
     pub existed: bool,
     /// Every topic_id that was removed from the topic_index as part of this delete.
     pub topics_removed: Vec<[u8; 32]>,
 }
 
-pub struct TenantRegistry {
+pub struct FabricRegistry {
     pub root: PathBuf,
-    tenants_db: Arc<Database>,
+    fabrics_db: Arc<Database>,
     topic_index_db: Arc<Database>,
     nonces_db: Arc<Database>,
 }
 
-impl TenantRegistry {
+impl FabricRegistry {
     pub fn open(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root).context(IoSnafu)?;
-        let tenants_db =
-            Arc::new(Database::create(root.join("tenants.redb")).context(DbOpenSnafu)?);
+        let fabrics_db =
+            Arc::new(Database::create(root.join("fabrics.redb")).context(DbOpenSnafu)?);
         let topic_index_db =
             Arc::new(Database::create(root.join("topic_index.redb")).context(DbOpenSnafu)?);
         let nonces_db = Arc::new(Database::create(root.join("nonces.redb")).context(DbOpenSnafu)?);
         Ok(Self {
             root: root.to_path_buf(),
-            tenants_db,
+            fabrics_db,
             topic_index_db,
             nonces_db,
         })
     }
 
-    /// Look up an existing tenant.
-    pub fn get(&self, root_pubkey: &[u8; 32]) -> Result<Option<TenantRecord>> {
-        let read = self.tenants_db.begin_read().context(TxnSnafu)?;
-        let table = match read.open_table(TENANTS) {
+    /// Look up an existing fabric.
+    pub fn get(&self, root_pubkey: &[u8; 32]) -> Result<Option<FabricRecord>> {
+        let read = self.fabrics_db.begin_read().context(TxnSnafu)?;
+        let table = match read.open_table(FABRICS) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(e) => {
@@ -89,27 +89,27 @@ impl TenantRegistry {
         };
         match table.get(&root_pubkey[..]).context(StorageIoSnafu)? {
             Some(v) => {
-                let rec: TenantRecord = serde_json::from_slice(v.value()).context(SerdeSnafu)?;
+                let rec: FabricRecord = serde_json::from_slice(v.value()).context(SerdeSnafu)?;
                 Ok(Some(rec))
             }
             None => Ok(None),
         }
     }
 
-    /// Insert a new tenant (idempotent: returns Ok with the existing record if
+    /// Insert a new fabric (idempotent: returns Ok with the existing record if
     /// already present).
     pub fn insert_if_absent(
         &self,
         root_pubkey: &[u8; 32],
-        rec: TenantRecord,
-    ) -> Result<TenantRecord> {
+        rec: FabricRecord,
+    ) -> Result<FabricRecord> {
         if let Some(existing) = self.get(root_pubkey)? {
             return Ok(existing);
         }
         let json = serde_json::to_vec(&rec).context(SerdeSnafu)?;
-        let write = self.tenants_db.begin_write().context(TxnSnafu)?;
+        let write = self.fabrics_db.begin_write().context(TxnSnafu)?;
         {
-            let mut t = write.open_table(TENANTS).context(TableSnafu)?;
+            let mut t = write.open_table(FABRICS).context(TableSnafu)?;
             t.insert(&root_pubkey[..], json.as_slice())
                 .context(StorageIoSnafu)?;
         }
@@ -117,7 +117,7 @@ impl TenantRegistry {
         Ok(rec)
     }
 
-    pub fn lookup_topic_tenant(&self, topic_id: &[u8; 32]) -> Result<Option<[u8; 32]>> {
+    pub fn lookup_topic_fabric(&self, topic_id: &[u8; 32]) -> Result<Option<[u8; 32]>> {
         let read = self.topic_index_db.begin_read().context(TxnSnafu)?;
         let table = match read.open_table(TOPIC_INDEX) {
             Ok(t) => t,
@@ -177,7 +177,7 @@ impl TenantRegistry {
     /// Every registered topic id. Used on host startup to resubscribe to the
     /// gossip mesh for all topics persisted from prior runs — without this,
     /// the host wakes up unsubscribed and silently misses traffic until each
-    /// tenant re-registers.
+    /// fabric re-registers.
     pub fn all_topic_ids(&self) -> Result<Vec<[u8; 32]>> {
         let read = self.topic_index_db.begin_read().context(TxnSnafu)?;
         let table = match read.open_table(TOPIC_INDEX) {
@@ -249,13 +249,13 @@ impl TenantRegistry {
         Ok(removed)
     }
 
-    /// Remove the tenant row and every topic_index entry that maps to this
+    /// Remove the fabric row and every topic_index entry that maps to this
     /// `root_pubkey`. The two writes happen in separate transactions: topic
-    /// index first (so routing stops immediately), then the tenant row. Each
-    /// step is idempotent; calling on an unknown tenant returns
+    /// index first (so routing stops immediately), then the fabric row. Each
+    /// step is idempotent; calling on an unknown fabric returns
     /// `existed: false, topics_removed: vec![]`.
-    pub fn delete_tenant(&self, root_pubkey: &[u8; 32]) -> Result<TenantDeleteOutcome> {
-        // 1. Collect every topic_id owned by this tenant.
+    pub fn delete_fabric(&self, root_pubkey: &[u8; 32]) -> Result<FabricDeleteOutcome> {
+        // 1. Collect every topic_id owned by this fabric.
         let mut topics_removed: Vec<[u8; 32]> = Vec::new();
         {
             let read = self.topic_index_db.begin_read().context(TxnSnafu)?;
@@ -292,11 +292,11 @@ impl TenantRegistry {
             write.commit().context(CommitSnafu)?;
         }
 
-        // 3. Delete the tenant row.
+        // 3. Delete the fabric row.
         let existed: bool = {
-            let write = self.tenants_db.begin_write().context(TxnSnafu)?;
+            let write = self.fabrics_db.begin_write().context(TxnSnafu)?;
             let was_present = {
-                match write.open_table(TENANTS) {
+                match write.open_table(FABRICS) {
                     Ok(mut table) => table
                         .remove(&root_pubkey[..])
                         .context(StorageIoSnafu)?
@@ -314,7 +314,7 @@ impl TenantRegistry {
             was_present
         };
 
-        Ok(TenantDeleteOutcome {
+        Ok(FabricDeleteOutcome {
             existed,
             topics_removed,
         })
@@ -360,22 +360,22 @@ impl TenantRegistry {
 }
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use wires_net::tenant::{
-    TenantErrorCode, TenantErrorResponse, TenantOp, TenantRegisterRequest, TenantRegisterResponse,
-    TenantResponse, TenantStatusKind, TenantStatusRequest, TenantStatusResponse,
-    TenantUnregisterRequest, TenantUnregisterResponse, TopicRegisterRequest, TopicRegisterResponse,
+use wires_net::fabric::{
+    FabricErrorCode, FabricErrorResponse, FabricOp, FabricRegisterRequest, FabricRegisterResponse,
+    FabricResponse, FabricStatusKind, FabricStatusRequest, FabricStatusResponse,
+    FabricUnregisterRequest, FabricUnregisterResponse, TopicRegisterRequest, TopicRegisterResponse,
     TopicUnregisterRequest, TopicUnregisterResponse, signing_bytes,
 };
 
-/// Tunable behaviour for `TenantHandlerImpl`.
+/// Tunable behaviour for `FabricHandlerImpl`.
 #[derive(Clone, Copy)]
-pub struct TenantHandlerConfig {
+pub struct FabricHandlerConfig {
     pub max_clock_skew_ms: i64,
     pub nonce_ttl_ms: i64,
     pub write_rate_limit_per_sec: u32,
 }
 
-impl Default for TenantHandlerConfig {
+impl Default for FabricHandlerConfig {
     fn default() -> Self {
         Self {
             max_clock_skew_ms: 60_000,
@@ -385,23 +385,23 @@ impl Default for TenantHandlerConfig {
     }
 }
 
-pub struct TenantHandlerImpl {
-    pub registry: Arc<TenantRegistry>,
+pub struct FabricHandlerImpl {
+    pub registry: Arc<FabricRegistry>,
     pub retention: Arc<crate::retention::Retention>,
     pub host_endpoint_id: [u8; 32],
-    pub config: TenantHandlerConfig,
+    pub config: FabricHandlerConfig,
     pub now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
     pub on_topic_registered: Arc<dyn Fn([u8; 32], [u8; 32]) + Send + Sync>,
     pub on_topic_unregistered: Arc<dyn Fn([u8; 32], [u8; 32]) + Send + Sync>,
-    /// Fires after a successful `handle_unregister` removes the tenant's row
+    /// Fires after a successful `handle_unregister` removes the fabric's row
     /// and topic_index entries. `Vec<[u8; 32]>` is the list of topic_ids that
     /// were dropped from the index. The host wires this to clear filesystem
-    /// state for the tenant.
+    /// state for the fabric.
     #[allow(clippy::type_complexity)]
-    pub on_tenant_unregistered: Arc<dyn Fn([u8; 32], Vec<[u8; 32]>) + Send + Sync>,
+    pub on_fabric_unregistered: Arc<dyn Fn([u8; 32], Vec<[u8; 32]>) + Send + Sync>,
 }
 
-impl TenantHandlerImpl {
+impl FabricHandlerImpl {
     fn caps_topic_id_for(root_pubkey: &[u8; 32]) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
         h.update(b"wires.caps.v1");
@@ -411,8 +411,8 @@ impl TenantHandlerImpl {
         out
     }
 
-    fn err(code: TenantErrorCode, message: &str) -> TenantResponse {
-        TenantResponse::Error(TenantErrorResponse {
+    fn err(code: FabricErrorCode, message: &str) -> FabricResponse {
+        FabricResponse::Error(FabricErrorResponse {
             code,
             message: message.to_string(),
         })
@@ -425,40 +425,40 @@ impl TenantHandlerImpl {
         nonce: &[u8; 16],
         signature: &[u8; 64],
         signing_bytes: &[u8],
-    ) -> std::result::Result<(), TenantResponse> {
+    ) -> std::result::Result<(), FabricResponse> {
         let now = (self.now_ms)();
         if (now - timestamp).abs() > self.config.max_clock_skew_ms {
             return Err(Self::err(
-                TenantErrorCode::StaleTimestamp,
+                FabricErrorCode::StaleTimestamp,
                 "timestamp out of range",
             ));
         }
         let vk = match VerifyingKey::from_bytes(root_pubkey) {
             Ok(k) => k,
-            Err(_) => return Err(Self::err(TenantErrorCode::BadSignature, "bad pubkey")),
+            Err(_) => return Err(Self::err(FabricErrorCode::BadSignature, "bad pubkey")),
         };
         let sig = Signature::from_bytes(signature);
         if vk.verify(signing_bytes, &sig).is_err() {
-            return Err(Self::err(TenantErrorCode::BadSignature, "signature failed"));
+            return Err(Self::err(FabricErrorCode::BadSignature, "signature failed"));
         }
         match self
             .registry
             .nonce_seen(root_pubkey, nonce, now, self.config.nonce_ttl_ms)
         {
             Ok(true) => Err(Self::err(
-                TenantErrorCode::ReplayedNonce,
+                FabricErrorCode::ReplayedNonce,
                 "nonce already seen",
             )),
             Ok(false) => Ok(()),
-            Err(_) => Err(Self::err(TenantErrorCode::Internal, "nonce store error")),
+            Err(_) => Err(Self::err(FabricErrorCode::Internal, "nonce store error")),
         }
     }
 }
 
-impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
-    fn handle_register(&self, req: TenantRegisterRequest) -> TenantResponse {
+impl wires_net::fabric::FabricHandler for FabricHandlerImpl {
+    fn handle_register(&self, req: FabricRegisterRequest) -> FabricResponse {
         let sig_bytes = signing_bytes(
-            TenantOp::Register,
+            FabricOp::Register,
             &req.root_pubkey,
             req.timestamp,
             &req.nonce,
@@ -475,9 +475,9 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
         }
 
         let now = (self.now_ms)();
-        let rec = TenantRecord {
+        let rec = FabricRecord {
             registered_at: now,
-            status: TenantStatus::Active,
+            status: FabricStatus::Active,
             retention_budget_bytes: DEFAULT_RETENTION_BUDGET_BYTES,
         };
         if self
@@ -485,7 +485,7 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
             .insert_if_absent(&req.root_pubkey, rec)
             .is_err()
         {
-            return Self::err(TenantErrorCode::Internal, "tenant table write failed");
+            return Self::err(FabricErrorCode::Internal, "fabrics table write failed");
         }
 
         let caps_topic_id = Self::caps_topic_id_for(&req.root_pubkey);
@@ -497,7 +497,7 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
             (self.on_topic_registered)(req.root_pubkey, caps_topic_id);
         }
 
-        TenantResponse::Register(TenantRegisterResponse {
+        FabricResponse::Register(FabricRegisterResponse {
             ok: true,
             host_endpoint_id: hex::encode(self.host_endpoint_id),
             server_time: now,
@@ -505,9 +505,9 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
         })
     }
 
-    fn handle_unregister(&self, req: TenantUnregisterRequest) -> TenantResponse {
+    fn handle_unregister(&self, req: FabricUnregisterRequest) -> FabricResponse {
         let sig_bytes = signing_bytes(
-            TenantOp::Unregister,
+            FabricOp::Unregister,
             &req.root_pubkey,
             req.timestamp,
             &req.nonce,
@@ -523,24 +523,24 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
             return e;
         }
 
-        match self.registry.delete_tenant(&req.root_pubkey) {
+        match self.registry.delete_fabric(&req.root_pubkey) {
             Ok(outcome) => {
                 let n = outcome.topics_removed.len() as u32;
                 if outcome.existed {
-                    (self.on_tenant_unregistered)(req.root_pubkey, outcome.topics_removed);
+                    (self.on_fabric_unregistered)(req.root_pubkey, outcome.topics_removed);
                 }
-                TenantResponse::Unregister(TenantUnregisterResponse {
+                FabricResponse::Unregister(FabricUnregisterResponse {
                     ok: outcome.existed,
                     topics_removed: n,
                 })
             }
-            Err(_) => Self::err(TenantErrorCode::Internal, "tenant delete failed"),
+            Err(_) => Self::err(FabricErrorCode::Internal, "fabric delete failed"),
         }
     }
 
-    fn handle_topic_register(&self, req: TopicRegisterRequest) -> TenantResponse {
+    fn handle_topic_register(&self, req: TopicRegisterRequest) -> FabricResponse {
         let sig_bytes = signing_bytes(
-            TenantOp::TopicRegister(&req.topic_id),
+            FabricOp::TopicRegister(&req.topic_id),
             &req.root_pubkey,
             req.timestamp,
             &req.nonce,
@@ -557,10 +557,10 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
         }
 
         match self.registry.get(&req.root_pubkey) {
-            Ok(Some(rec)) if rec.status == TenantStatus::Active => {}
-            Ok(Some(_)) => return Self::err(TenantErrorCode::TenantSuspended, "tenant suspended"),
-            Ok(None) => return Self::err(TenantErrorCode::TenantNotFound, "register tenant first"),
-            Err(_) => return Self::err(TenantErrorCode::Internal, "tenant lookup failed"),
+            Ok(Some(rec)) if rec.status == FabricStatus::Active => {}
+            Ok(Some(_)) => return Self::err(FabricErrorCode::FabricSuspended, "fabric suspended"),
+            Ok(None) => return Self::err(FabricErrorCode::FabricNotFound, "register fabric first"),
+            Err(_) => return Self::err(FabricErrorCode::Internal, "fabric lookup failed"),
         }
 
         match self
@@ -569,22 +569,22 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
         {
             Ok(TopicRegisterOutcome::Inserted) | Ok(TopicRegisterOutcome::AlreadyOwned) => {
                 (self.on_topic_registered)(req.root_pubkey, req.topic_id);
-                TenantResponse::TopicRegister(TopicRegisterResponse {
+                FabricResponse::TopicRegister(TopicRegisterResponse {
                     ok: true,
                     topic_id: req.topic_id,
                 })
             }
             Ok(TopicRegisterOutcome::Conflict { .. }) => Self::err(
-                TenantErrorCode::TopicAlreadyRegistered,
-                "topic owned by another tenant",
+                FabricErrorCode::TopicAlreadyRegistered,
+                "topic owned by another fabric",
             ),
-            Err(_) => Self::err(TenantErrorCode::Internal, "topic register write failed"),
+            Err(_) => Self::err(FabricErrorCode::Internal, "topic register write failed"),
         }
     }
 
-    fn handle_topic_unregister(&self, req: TopicUnregisterRequest) -> TenantResponse {
+    fn handle_topic_unregister(&self, req: TopicUnregisterRequest) -> FabricResponse {
         let sig_bytes = signing_bytes(
-            TenantOp::TopicUnregister(&req.topic_id),
+            FabricOp::TopicUnregister(&req.topic_id),
             &req.root_pubkey,
             req.timestamp,
             &req.nonce,
@@ -606,22 +606,22 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
         {
             Ok(true) => {
                 (self.on_topic_unregistered)(req.root_pubkey, req.topic_id);
-                TenantResponse::TopicUnregister(TopicUnregisterResponse {
+                FabricResponse::TopicUnregister(TopicUnregisterResponse {
                     ok: true,
                     topic_id: req.topic_id,
                 })
             }
-            Ok(false) => TenantResponse::TopicUnregister(TopicUnregisterResponse {
+            Ok(false) => FabricResponse::TopicUnregister(TopicUnregisterResponse {
                 ok: false,
                 topic_id: req.topic_id,
             }),
-            Err(_) => Self::err(TenantErrorCode::Internal, "topic unregister failed"),
+            Err(_) => Self::err(FabricErrorCode::Internal, "topic unregister failed"),
         }
     }
 
-    fn handle_status(&self, req: TenantStatusRequest) -> TenantResponse {
+    fn handle_status(&self, req: FabricStatusRequest) -> FabricResponse {
         let sig_bytes = signing_bytes(
-            TenantOp::Status,
+            FabricOp::Status,
             &req.root_pubkey,
             req.timestamp,
             &req.nonce,
@@ -639,7 +639,7 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
 
         let rec = match self.registry.get(&req.root_pubkey) {
             Ok(Some(rec)) => rec,
-            _ => return Self::err(TenantErrorCode::TenantNotFound, "no such tenant"),
+            _ => return Self::err(FabricErrorCode::FabricNotFound, "no such fabric"),
         };
 
         let topic_count = self.registry.topic_count_for(&req.root_pubkey).unwrap_or(0);
@@ -649,7 +649,7 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
             .oldest_retained_at(&req.root_pubkey)
             .unwrap_or(0);
 
-        TenantResponse::Status(TenantStatusResponse {
+        FabricResponse::Status(FabricStatusResponse {
             registered_at: rec.registered_at,
             topic_count,
             bytes_stored,
@@ -657,8 +657,8 @@ impl wires_net::tenant::TenantHandler for TenantHandlerImpl {
             oldest_retained_at,
             write_rate_limit_per_sec: self.config.write_rate_limit_per_sec,
             status: match rec.status {
-                TenantStatus::Active => TenantStatusKind::Active,
-                TenantStatus::Suspended => TenantStatusKind::Suspended,
+                FabricStatus::Active => FabricStatusKind::Active,
+                FabricStatus::Suspended => FabricStatusKind::Suspended,
             },
         })
     }
@@ -672,12 +672,12 @@ mod tests {
     #[test]
     fn insert_then_get_roundtrips() {
         let tmp = TempDir::new().unwrap();
-        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let reg = FabricRegistry::open(tmp.path()).unwrap();
         let root = [7u8; 32];
         assert!(reg.get(&root).unwrap().is_none());
-        let rec = TenantRecord {
+        let rec = FabricRecord {
             registered_at: 1,
-            status: TenantStatus::Active,
+            status: FabricStatus::Active,
             retention_budget_bytes: DEFAULT_RETENTION_BUDGET_BYTES,
         };
         let got = reg.insert_if_absent(&root, rec.clone()).unwrap();
@@ -687,20 +687,20 @@ mod tests {
             read_back.retention_budget_bytes,
             DEFAULT_RETENTION_BUDGET_BYTES
         );
-        assert_eq!(read_back.status, TenantStatus::Active);
+        assert_eq!(read_back.status, FabricStatus::Active);
     }
 
     #[test]
     fn insert_is_idempotent() {
         let tmp = TempDir::new().unwrap();
-        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let reg = FabricRegistry::open(tmp.path()).unwrap();
         let root = [7u8; 32];
         let first = reg
             .insert_if_absent(
                 &root,
-                TenantRecord {
+                FabricRecord {
                     registered_at: 1,
-                    status: TenantStatus::Active,
+                    status: FabricStatus::Active,
                     retention_budget_bytes: 100,
                 },
             )
@@ -708,9 +708,9 @@ mod tests {
         let again = reg
             .insert_if_absent(
                 &root,
-                TenantRecord {
+                FabricRecord {
                     registered_at: 2,
-                    status: TenantStatus::Suspended,
+                    status: FabricStatus::Suspended,
                     retention_budget_bytes: 200,
                 },
             )
@@ -723,13 +723,13 @@ mod tests {
     #[test]
     fn topic_index_register_and_lookup() {
         let tmp = TempDir::new().unwrap();
-        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let reg = FabricRegistry::open(tmp.path()).unwrap();
         let root = [7u8; 32];
         let topic = [1u8; 32];
-        assert!(reg.lookup_topic_tenant(&topic).unwrap().is_none());
+        assert!(reg.lookup_topic_fabric(&topic).unwrap().is_none());
         let outcome = reg.register_topic(&root, &topic).unwrap();
         assert!(matches!(outcome, TopicRegisterOutcome::Inserted));
-        assert_eq!(reg.lookup_topic_tenant(&topic).unwrap(), Some(root));
+        assert_eq!(reg.lookup_topic_fabric(&topic).unwrap(), Some(root));
         let again = reg.register_topic(&root, &topic).unwrap();
         assert!(matches!(again, TopicRegisterOutcome::AlreadyOwned));
     }
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn topic_index_rejects_conflict() {
         let tmp = TempDir::new().unwrap();
-        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let reg = FabricRegistry::open(tmp.path()).unwrap();
         let root_a = [7u8; 32];
         let root_b = [8u8; 32];
         let topic = [1u8; 32];
@@ -749,7 +749,7 @@ mod tests {
     #[test]
     fn all_topic_ids_returns_every_registered_topic() {
         let tmp = TempDir::new().unwrap();
-        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let reg = FabricRegistry::open(tmp.path()).unwrap();
         assert!(reg.all_topic_ids().unwrap().is_empty());
 
         let root_a = [7u8; 32];
@@ -769,7 +769,7 @@ mod tests {
     #[test]
     fn topic_count_for_returns_correct_count() {
         let tmp = TempDir::new().unwrap();
-        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let reg = FabricRegistry::open(tmp.path()).unwrap();
         let root_a = [0xAAu8; 32];
         let root_b = [0xBBu8; 32];
         let topic1 = [0x11u8; 32];
@@ -792,7 +792,7 @@ mod tests {
     #[test]
     fn nonce_first_seen_then_replay_detected() {
         let tmp = TempDir::new().unwrap();
-        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let reg = FabricRegistry::open(tmp.path()).unwrap();
         let root = [7u8; 32];
         let nonce = [3u8; 16];
         let now = 100_000i64;
@@ -804,7 +804,7 @@ mod tests {
     #[test]
     fn nonce_expires_past_ttl() {
         let tmp = TempDir::new().unwrap();
-        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let reg = FabricRegistry::open(tmp.path()).unwrap();
         let root = [7u8; 32];
         let nonce = [3u8; 16];
         let now = 100_000i64;
@@ -818,9 +818,9 @@ mod tests {
     }
 
     #[test]
-    fn delete_tenant_drops_record_and_indexed_topics() {
+    fn delete_fabric_drops_record_and_indexed_topics() {
         let tmp = TempDir::new().unwrap();
-        let reg = TenantRegistry::open(tmp.path()).unwrap();
+        let reg = FabricRegistry::open(tmp.path()).unwrap();
         let root_a = [0xAAu8; 32];
         let root_b = [0xBBu8; 32];
         let topic1 = [0x11u8; 32];
@@ -829,18 +829,18 @@ mod tests {
 
         reg.insert_if_absent(
             &root_a,
-            TenantRecord {
+            FabricRecord {
                 registered_at: 1,
-                status: TenantStatus::Active,
+                status: FabricStatus::Active,
                 retention_budget_bytes: 100,
             },
         )
         .unwrap();
         reg.insert_if_absent(
             &root_b,
-            TenantRecord {
+            FabricRecord {
                 registered_at: 1,
-                status: TenantStatus::Active,
+                status: FabricStatus::Active,
                 retention_budget_bytes: 100,
             },
         )
@@ -849,40 +849,40 @@ mod tests {
         reg.register_topic(&root_a, &topic2).unwrap();
         reg.register_topic(&root_b, &topic3).unwrap();
 
-        let dropped = reg.delete_tenant(&root_a).unwrap();
+        let dropped = reg.delete_fabric(&root_a).unwrap();
         assert!(dropped.existed);
         let mut topics = dropped.topics_removed;
         topics.sort();
         assert_eq!(topics, vec![topic1, topic2]);
 
-        // Tenant A is gone; tenant B is intact.
+        // Fabric A is gone; fabric B is intact.
         assert!(reg.get(&root_a).unwrap().is_none());
         assert!(reg.get(&root_b).unwrap().is_some());
-        assert!(reg.lookup_topic_tenant(&topic1).unwrap().is_none());
-        assert!(reg.lookup_topic_tenant(&topic2).unwrap().is_none());
-        assert_eq!(reg.lookup_topic_tenant(&topic3).unwrap(), Some(root_b));
+        assert!(reg.lookup_topic_fabric(&topic1).unwrap().is_none());
+        assert!(reg.lookup_topic_fabric(&topic2).unwrap().is_none());
+        assert_eq!(reg.lookup_topic_fabric(&topic3).unwrap(), Some(root_b));
     }
 
     #[test]
-    fn delete_tenant_unknown_returns_not_existed() {
+    fn delete_fabric_unknown_returns_not_existed() {
         let tmp = TempDir::new().unwrap();
-        let reg = TenantRegistry::open(tmp.path()).unwrap();
-        let dropped = reg.delete_tenant(&[7u8; 32]).unwrap();
+        let reg = FabricRegistry::open(tmp.path()).unwrap();
+        let dropped = reg.delete_fabric(&[7u8; 32]).unwrap();
         assert!(!dropped.existed);
         assert!(dropped.topics_removed.is_empty());
     }
 
     #[test]
-    fn handle_register_signs_and_records_tenant() {
-        use crate::per_tenant_logs::PerTenantLogs;
+    fn handle_register_signs_and_records_fabric() {
+        use crate::per_fabric_logs::PerFabricLogs;
         use ed25519_dalek::{Signer, SigningKey};
         use rand_core::OsRng;
         use std::sync::Arc;
-        use wires_net::tenant::{TenantHandler, TenantRegisterRequest, TenantResponse};
+        use wires_net::fabric::{FabricHandler, FabricRegisterRequest, FabricResponse};
 
         let tmp = TempDir::new().unwrap();
-        let reg = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
-        let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+        let reg = Arc::new(FabricRegistry::open(tmp.path()).unwrap());
+        let logs = Arc::new(PerFabricLogs::new(tmp.path()));
         let retention = Arc::new(crate::retention::Retention::new(tmp.path(), logs));
 
         let signing_key = SigningKey::generate(&mut OsRng);
@@ -890,20 +890,20 @@ mod tests {
         let host_endpoint_id = [42u8; 32];
         let now_ms = 1_000_000i64;
 
-        let handler = TenantHandlerImpl {
+        let handler = FabricHandlerImpl {
             registry: Arc::clone(&reg),
             retention,
             host_endpoint_id,
-            config: TenantHandlerConfig::default(),
+            config: FabricHandlerConfig::default(),
             now_ms: Arc::new(move || now_ms),
             on_topic_registered: Arc::new(|_root, _topic| {}),
             on_topic_unregistered: Arc::new(|_root, _topic| {}),
-            on_tenant_unregistered: Arc::new(|_root, _topics| {}),
+            on_fabric_unregistered: Arc::new(|_root, _topics| {}),
         };
 
         let nonce = [9u8; 16];
-        let bytes = wires_net::tenant::signing_bytes(
-            TenantOp::Register,
+        let bytes = wires_net::fabric::signing_bytes(
+            FabricOp::Register,
             &root_pubkey,
             now_ms,
             &nonce,
@@ -911,7 +911,7 @@ mod tests {
         );
         let sig = signing_key.sign(&bytes).to_bytes();
 
-        let req = TenantRegisterRequest {
+        let req = FabricRegisterRequest {
             version: 1,
             root_pubkey,
             timestamp: now_ms,
@@ -920,32 +920,32 @@ mod tests {
         };
         let resp = handler.handle_register(req);
         match resp {
-            TenantResponse::Register(r) => {
+            FabricResponse::Register(r) => {
                 assert!(r.ok);
                 assert_eq!(r.host_endpoint_id, hex::encode(host_endpoint_id));
             }
             other => panic!("expected Register response, got {:?}", other),
         }
 
-        // Tenant row now exists.
+        // Fabric row now exists.
         let rec = reg.get(&root_pubkey).unwrap().unwrap();
-        assert_eq!(rec.status, TenantStatus::Active);
+        assert_eq!(rec.status, FabricStatus::Active);
     }
 
     #[test]
-    fn handle_unregister_drops_tenant_and_fires_hook() {
-        use crate::per_tenant_logs::PerTenantLogs;
+    fn handle_unregister_drops_fabric_and_fires_hook() {
+        use crate::per_fabric_logs::PerFabricLogs;
         use ed25519_dalek::{Signer, SigningKey};
         use rand_core::OsRng;
         use std::sync::Arc;
         use std::sync::Mutex;
-        use wires_net::tenant::{
-            TenantHandler, TenantRegisterRequest, TenantResponse, TenantUnregisterRequest,
+        use wires_net::fabric::{
+            FabricHandler, FabricRegisterRequest, FabricResponse, FabricUnregisterRequest,
         };
 
         let tmp = TempDir::new().unwrap();
-        let reg = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
-        let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+        let reg = Arc::new(FabricRegistry::open(tmp.path()).unwrap());
+        let logs = Arc::new(PerFabricLogs::new(tmp.path()));
         let retention = Arc::new(crate::retention::Retention::new(tmp.path(), logs));
 
         let signing_key = SigningKey::generate(&mut OsRng);
@@ -953,34 +953,34 @@ mod tests {
         let host_endpoint_id = [42u8; 32];
         let now_ms = 1_000_000i64;
 
-        type ObservedTenantUnregisters = Arc<Mutex<Vec<([u8; 32], Vec<[u8; 32]>)>>>;
-        let observed: ObservedTenantUnregisters = Arc::new(Mutex::new(Vec::new()));
+        type ObservedFabricUnregisters = Arc<Mutex<Vec<([u8; 32], Vec<[u8; 32]>)>>>;
+        let observed: ObservedFabricUnregisters = Arc::new(Mutex::new(Vec::new()));
         let observed_for_cb = Arc::clone(&observed);
 
-        let handler = TenantHandlerImpl {
+        let handler = FabricHandlerImpl {
             registry: Arc::clone(&reg),
             retention,
             host_endpoint_id,
-            config: TenantHandlerConfig::default(),
+            config: FabricHandlerConfig::default(),
             now_ms: Arc::new(move || now_ms),
             on_topic_registered: Arc::new(|_root, _topic| {}),
             on_topic_unregistered: Arc::new(|_root, _topic| {}),
-            on_tenant_unregistered: Arc::new(move |root, topics| {
+            on_fabric_unregistered: Arc::new(move |root, topics| {
                 observed_for_cb.lock().unwrap().push((root, topics));
             }),
         };
 
         // Register first so we have something to unregister.
         let nonce_reg = [1u8; 16];
-        let bytes_reg = wires_net::tenant::signing_bytes(
-            TenantOp::Register,
+        let bytes_reg = wires_net::fabric::signing_bytes(
+            FabricOp::Register,
             &root_pubkey,
             now_ms,
             &nonce_reg,
             &host_endpoint_id,
         );
         let sig_reg = signing_key.sign(&bytes_reg).to_bytes();
-        let _ = handler.handle_register(TenantRegisterRequest {
+        let _ = handler.handle_register(FabricRegisterRequest {
             version: 1,
             root_pubkey,
             timestamp: now_ms,
@@ -991,15 +991,15 @@ mod tests {
 
         // Unregister.
         let nonce_un = [2u8; 16];
-        let bytes_un = wires_net::tenant::signing_bytes(
-            TenantOp::Unregister,
+        let bytes_un = wires_net::fabric::signing_bytes(
+            FabricOp::Unregister,
             &root_pubkey,
             now_ms,
             &nonce_un,
             &host_endpoint_id,
         );
         let sig_un = signing_key.sign(&bytes_un).to_bytes();
-        let resp = handler.handle_unregister(TenantUnregisterRequest {
+        let resp = handler.handle_unregister(FabricUnregisterRequest {
             version: 1,
             root_pubkey,
             timestamp: now_ms,
@@ -1007,16 +1007,16 @@ mod tests {
             signature: sig_un,
         });
         match resp {
-            TenantResponse::Unregister(r) => {
+            FabricResponse::Unregister(r) => {
                 assert!(r.ok);
-                // handle_register inserted the caps_topic_id for this tenant
-                // (see TenantHandlerImpl::handle_register), so topics_removed
+                // handle_register inserted the caps_topic_id for this fabric
+                // (see FabricHandlerImpl::handle_register), so topics_removed
                 // must reflect that.
                 assert_eq!(r.topics_removed, 1);
             }
             other => panic!("expected Unregister, got {:?}", other),
         }
-        // Tenant gone, hook fired with one topic.
+        // Fabric gone, hook fired with one topic.
         assert!(reg.get(&root_pubkey).unwrap().is_none());
         let obs = observed.lock().unwrap();
         assert_eq!(obs.len(), 1);
@@ -1025,16 +1025,16 @@ mod tests {
     }
 
     #[test]
-    fn handle_unregister_unknown_tenant_returns_ok_false() {
-        use crate::per_tenant_logs::PerTenantLogs;
+    fn handle_unregister_unknown_fabric_returns_ok_false() {
+        use crate::per_fabric_logs::PerFabricLogs;
         use ed25519_dalek::{Signer, SigningKey};
         use rand_core::OsRng;
         use std::sync::Arc;
-        use wires_net::tenant::{TenantHandler, TenantResponse, TenantUnregisterRequest};
+        use wires_net::fabric::{FabricHandler, FabricResponse, FabricUnregisterRequest};
 
         let tmp = TempDir::new().unwrap();
-        let reg = Arc::new(TenantRegistry::open(tmp.path()).unwrap());
-        let logs = Arc::new(PerTenantLogs::new(tmp.path()));
+        let reg = Arc::new(FabricRegistry::open(tmp.path()).unwrap());
+        let logs = Arc::new(PerFabricLogs::new(tmp.path()));
         let retention = Arc::new(crate::retention::Retention::new(tmp.path(), logs));
 
         let signing_key = SigningKey::generate(&mut OsRng);
@@ -1042,27 +1042,27 @@ mod tests {
         let host_endpoint_id = [42u8; 32];
         let now_ms = 1_000_000i64;
 
-        let handler = TenantHandlerImpl {
+        let handler = FabricHandlerImpl {
             registry: Arc::clone(&reg),
             retention,
             host_endpoint_id,
-            config: TenantHandlerConfig::default(),
+            config: FabricHandlerConfig::default(),
             now_ms: Arc::new(move || now_ms),
             on_topic_registered: Arc::new(|_, _| {}),
             on_topic_unregistered: Arc::new(|_, _| {}),
-            on_tenant_unregistered: Arc::new(|_, _| {}),
+            on_fabric_unregistered: Arc::new(|_, _| {}),
         };
 
         let nonce = [9u8; 16];
-        let bytes = wires_net::tenant::signing_bytes(
-            TenantOp::Unregister,
+        let bytes = wires_net::fabric::signing_bytes(
+            FabricOp::Unregister,
             &root_pubkey,
             now_ms,
             &nonce,
             &host_endpoint_id,
         );
         let sig = signing_key.sign(&bytes).to_bytes();
-        let resp = handler.handle_unregister(TenantUnregisterRequest {
+        let resp = handler.handle_unregister(FabricUnregisterRequest {
             version: 1,
             root_pubkey,
             timestamp: now_ms,
@@ -1070,7 +1070,7 @@ mod tests {
             signature: sig,
         });
         match resp {
-            TenantResponse::Unregister(r) => {
+            FabricResponse::Unregister(r) => {
                 assert!(!r.ok);
                 assert_eq!(r.topics_removed, 0);
             }

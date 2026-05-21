@@ -15,9 +15,9 @@ struct WiresClient {
     var bootstrap: @Sendable (_ irohSecret: Data, _ rootSigner: any SwiftRootSigner) async -> Void = { _, _ in }
 
     var parseHostTicket: @Sendable (_ payload: String) async throws -> HostInfo
-    var registerWithHostedService: @Sendable (_ host: HostInfo) async throws -> TenantRegistration
+    var registerWithHostedService: @Sendable (_ host: HostInfo) async throws -> FabricRegistration
     var registerTopic: @Sendable (_ host: HostInfo, _ topicId: Data) async throws -> Void
-    var unregisterTenant: @Sendable (_ host: HostInfo) async throws -> UnregisterResult
+    var unregisterFabric: @Sendable (_ host: HostInfo) async throws -> UnregisterResult
     var parsePairRequest: @Sendable (_ payload: String) async throws -> PairRequestPreview
     /// Non-throwing default: empty topic id + zero-byte key. Real impl
     /// returns 32-byte random hex + 32-byte symmetric key.
@@ -78,7 +78,7 @@ extension WiresClient: DependencyKey {
             registerTopic: { host, topicId in
                 try await holder.require().registerTopic(host: host, topicId: topicId)
             },
-            unregisterTenant: { host in
+            unregisterFabric: { host in
                 try await holder.require().unregisterWithHostedService(host: host)
             },
             parsePairRequest: { payload in

@@ -23,7 +23,7 @@ pub struct ServiceState {
     pub config: Arc<GatewayConfig>,
     pub store: Store,
     pub signing_key: Arc<SigningKey>,
-    pub supervisor: crate::tenants::TenantSupervisor,
+    pub supervisor: crate::fabrics::FabricSupervisor,
     pub pair_bridge: Arc<crate::pair_bridge::PairBridge>,
     pub rate_limit: crate::rate_limit::RateLimiter,
 }
@@ -227,7 +227,7 @@ pub fn test_state(tmp: &std::path::Path) -> ServiceState {
         retention: None,
     };
     let store = Store::open(&cfg.gateway_db_path()).unwrap();
-    let supervisor = crate::tenants::TenantSupervisor::new(
+    let supervisor = crate::fabrics::FabricSupervisor::new(
         cfg.users_dir(),
         std::time::Duration::from_secs(60),
         None,

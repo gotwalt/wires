@@ -20,7 +20,7 @@ struct AppFeature {
 
     struct FabricSummary: Equatable, Sendable {
         let rootPubkeyHex: String
-        let tenantRegisteredAt: Date?
+        let fabricRegisteredAt: Date?
     }
 
     @Dependency(\.fabricClient) var fabric
@@ -42,7 +42,7 @@ struct AppFeature {
                         snapshot = await MainActor.run {
                             FabricSummary(
                                 rootPubkeyHex: h.rootPubkeyHex,
-                                tenantRegisteredAt: h.tenantRegisteredAt
+                                fabricRegisteredAt: h.fabricRegisteredAt
                             )
                         }
                     } else {
@@ -51,7 +51,7 @@ struct AppFeature {
                     await send(.fabricLoaded(snapshot))
                 }
             case let .fabricLoaded(summary):
-                if let summary, summary.tenantRegisteredAt != nil {
+                if let summary, summary.fabricRegisteredAt != nil {
                     state = .main(MainFeature.State(
                         network: NetworkFeature.State(rootPubkeyHex: summary.rootPubkeyHex),
                         settings: SettingsFeature.State(),

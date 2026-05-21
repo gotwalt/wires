@@ -192,7 +192,7 @@ pub enum GatewayError {
         location: Location,
     },
 
-    // --- Tenants ---
+    // --- Fabrics ---
     #[snafu(display("Unknown wires user for sub {sub}, at {location}"))]
     UnknownUser {
         sub: String,

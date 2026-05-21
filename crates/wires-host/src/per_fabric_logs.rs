@@ -1,4 +1,4 @@
-//! Per-tenant scoped TopicLogs. Each tenant gets a subdirectory under the host
+//! Per-fabric scoped TopicLogs. Each fabric gets a subdirectory under the host
 //! data dir; per-topic redb files live inside as `log_<topic_hex>.redb`,
 //! matching the host-spec storage layout (§5).
 
@@ -14,12 +14,12 @@ use crate::error::{DbOpenSnafu, IoSnafu, Result};
 
 type TopicLogCache = HashMap<([u8; 32], [u8; 32]), Arc<TopicLog>>;
 
-pub struct PerTenantLogs {
+pub struct PerFabricLogs {
     root: PathBuf,
     cache: RwLock<TopicLogCache>,
 }
 
-impl PerTenantLogs {
+impl PerFabricLogs {
     pub fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
@@ -27,8 +27,8 @@ impl PerTenantLogs {
         }
     }
 
-    pub fn tenant_dir(&self, root_pubkey: &[u8; 32]) -> PathBuf {
-        self.root.join("tenants").join(hex::encode(root_pubkey))
+    pub fn fabric_dir(&self, root_pubkey: &[u8; 32]) -> PathBuf {
+        self.root.join("fabrics").join(hex::encode(root_pubkey))
     }
 
     pub fn get_or_open(
@@ -42,7 +42,7 @@ impl PerTenantLogs {
                 return Ok(Arc::clone(log));
             }
         }
-        let dir = self.tenant_dir(root_pubkey);
+        let dir = self.fabric_dir(root_pubkey);
         std::fs::create_dir_all(&dir).context(IoSnafu)?;
         let path = dir.join(format!("log_{}.redb", hex::encode(topic_id)));
         let db = Database::create(&path).context(DbOpenSnafu)?;
@@ -56,9 +56,9 @@ impl PerTenantLogs {
         Ok(log)
     }
 
-    /// Drop every cached `TopicLog` handle for this tenant. The caller is
-    /// responsible for then deleting the on-disk `tenant_dir(root_pubkey)`.
-    pub fn clear_tenant(&self, root_pubkey: &[u8; 32]) {
+    /// Drop every cached `TopicLog` handle for this fabric. The caller is
+    /// responsible for then deleting the on-disk `fabric_dir(root_pubkey)`.
+    pub fn clear_fabric(&self, root_pubkey: &[u8; 32]) {
         let mut map = self.cache.write().unwrap();
         map.retain(|(root, _topic), _| root != root_pubkey);
     }
@@ -92,9 +92,9 @@ mod tests {
     }
 
     #[test]
-    fn separates_tenants_on_disk() {
+    fn separates_fabrics_on_disk() {
         let tmp = TempDir::new().unwrap();
-        let logs = PerTenantLogs::new(tmp.path());
+        let logs = PerFabricLogs::new(tmp.path());
         let root_a = [1u8; 32];
         let root_b = [2u8; 32];
         let topic = [9u8; 32];
@@ -102,24 +102,24 @@ mod tests {
         let log_b = logs.get_or_open(&root_b, &topic).unwrap();
         log_a.append(&dummy_msg(7, 0)).unwrap();
         log_b.append(&dummy_msg(8, 0)).unwrap();
-        assert!(logs.tenant_dir(&root_a).exists());
-        assert!(logs.tenant_dir(&root_b).exists());
+        assert!(logs.fabric_dir(&root_a).exists());
+        assert!(logs.fabric_dir(&root_b).exists());
         assert!(
-            logs.tenant_dir(&root_a)
+            logs.fabric_dir(&root_a)
                 .join(format!("log_{}.redb", hex::encode(topic)))
                 .exists()
         );
         assert!(
-            logs.tenant_dir(&root_b)
+            logs.fabric_dir(&root_b)
                 .join(format!("log_{}.redb", hex::encode(topic)))
                 .exists()
         );
     }
 
     #[test]
-    fn clear_tenant_drops_cached_handles() {
+    fn clear_fabric_drops_cached_handles() {
         let tmp = TempDir::new().unwrap();
-        let logs = PerTenantLogs::new(tmp.path());
+        let logs = PerFabricLogs::new(tmp.path());
         let root_a = [1u8; 32];
         let root_b = [2u8; 32];
         let topic1 = [9u8; 32];
@@ -128,7 +128,7 @@ mod tests {
         let _ = logs.get_or_open(&root_a, &topic2).unwrap();
         let _ = logs.get_or_open(&root_b, &topic1).unwrap();
         assert_eq!(logs.cache_len(), 3);
-        logs.clear_tenant(&root_a);
+        logs.clear_fabric(&root_a);
         assert_eq!(logs.cache_len(), 1);
     }
 }

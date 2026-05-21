@@ -12,7 +12,7 @@ pub struct HostInfo {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct TenantRegistration {
+pub struct FabricRegistration {
     pub caps_topic_id_hex: String,
     pub host_endpoint_id_hex: String,
     pub server_time_ms: i64,
@@ -20,7 +20,7 @@ pub struct TenantRegistration {
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct UnregisterResult {
-    /// True iff the host had a tenant record to remove. False is a successful
+    /// True iff the host had a fabric record to remove. False is a successful
     /// no-op (idempotent on retry).
     pub ok: bool,
     /// Number of topic_index entries the host dropped.

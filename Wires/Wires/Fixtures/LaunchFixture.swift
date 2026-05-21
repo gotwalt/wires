@@ -180,7 +180,7 @@ enum LaunchFixture: String, CaseIterable {
         case .onboardingFaceID:
             var s = OnboardingFeature.State(step: .faceID)
             s.completed = OnboardingFeature.State.Completed(
-                registration: TenantRegistration(
+                registration: FabricRegistration(
                     capsTopicIdHex: String(repeating: "ee", count: 32),
                     hostEndpointIdHex: String(repeating: "cd", count: 32),
                     serverTimeMs: 0
@@ -199,7 +199,7 @@ enum LaunchFixture: String, CaseIterable {
         case .onboardingDone:
             var s = OnboardingFeature.State(step: .done)
             s.completed = OnboardingFeature.State.Completed(
-                registration: TenantRegistration(
+                registration: FabricRegistration(
                     capsTopicIdHex: String(repeating: "ee", count: 32),
                     hostEndpointIdHex: String(repeating: "cd", count: 32),
                     serverTimeMs: 0

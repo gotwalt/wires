@@ -5,6 +5,7 @@
 pub mod admin;
 pub mod config;
 pub mod error;
+pub mod fabrics;
 pub mod http;
 pub mod keys;
 pub mod mcp;
@@ -14,7 +15,6 @@ pub mod rate_limit;
 pub mod sign_in;
 pub mod sign_in_endpoint;
 pub mod store;
-pub mod tenants;
 pub mod token;
 
 #[cfg(test)]
