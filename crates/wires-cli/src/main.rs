@@ -121,6 +121,8 @@ enum DmCmd {
         #[arg(long)]
         message: Option<String>,
     },
+    /// List local DM topics.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -174,6 +176,7 @@ async fn main() -> std::process::ExitCode {
         Cmd::Dm(DmCmd::Open { agent, message }) => {
             cmd::dm::open(&data_dir, &agent, message.as_deref()).await
         }
+        Cmd::Dm(DmCmd::List) => cmd::dm::list(&data_dir).await,
         Cmd::Publish {
             topic,
             cap,
