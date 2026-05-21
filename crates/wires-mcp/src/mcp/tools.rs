@@ -16,7 +16,8 @@ pub fn list_descriptors() -> Value {
         {"name": "wires_list_channels",     "description": "List channels (named + DMs) this agent is in",       "inputSchema": {"type":"object","properties":{}}},
         {"name": "wires_create_channel",    "description": "Create a named channel",                             "inputSchema": {"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"}},"required":["name"]}},
         {"name": "wires_channel_members",   "description": "Return the roster (members + pending) of a channel", "inputSchema": {"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
-        {"name": "wires_invite_to_channel", "description": "Invite an agent to a named channel",                 "inputSchema": {"type":"object","properties":{"name":{"type":"string"},"agent_pubkey":{"type":"string"}},"required":["name","agent_pubkey"]}}
+        {"name": "wires_invite_to_channel", "description": "Invite an agent to a named channel",                 "inputSchema": {"type":"object","properties":{"name":{"type":"string"},"agent_pubkey":{"type":"string"}},"required":["name","agent_pubkey"]}},
+        {"name": "wires_dm_open",           "description": "Open or refresh a DM with another agent",            "inputSchema": {"type":"object","properties":{"agent_pubkey":{"type":"string"}},"required":["agent_pubkey"]}}
     ]})
 }
 
@@ -704,6 +705,92 @@ async fn invite_to_channel_tool(
     Ok(serde_json::json!({"content": [{"type": "text", "text": text}], "isError": false}))
 }
 
+// ── dm_open ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+struct DmOpenArgs {
+    agent_pubkey: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DmOpenOutput {
+    topic_id: String,
+    name: String,
+    participants: Vec<String>,
+}
+
+async fn dm_open_tool(
+    state: &ServiceState,
+    claims: &Claims,
+    args: DmOpenArgs,
+) -> Result<Value, JsonRpcError> {
+    let runtime = state
+        .supervisor
+        .get_or_open(&claims.sub)
+        .await
+        .map_err(|e| JsonRpcError {
+            code: -32000,
+            message: format!("unknown_user: {e}"),
+        })?;
+    let other_bytes = match hex::decode(&args.agent_pubkey) {
+        Ok(b) => b,
+        Err(e) => return Ok(error_result(&format!("agent_pubkey not hex: {e}"))),
+    };
+    let other: [u8; 32] = match other_bytes.try_into() {
+        Ok(a) => a,
+        Err(_) => return Ok(error_result("agent_pubkey must be 32 bytes")),
+    };
+    let cfg_root_bytes = match hex::decode(&runtime.node.config.root_pubkey_hex) {
+        Ok(b) => b,
+        Err(e) => return Ok(error_result(&format!("root_pubkey_hex bad hex: {e}"))),
+    };
+    let cfg_root: [u8; 32] = match cfg_root_bytes.try_into() {
+        Ok(r) => r,
+        Err(_) => return Ok(error_result("root_pubkey_hex must be 32 bytes")),
+    };
+    let other_x_pk = match lookup_x25519_pubkey(&runtime.node.config.data_dir, &other) {
+        Some(p) => p,
+        None => {
+            return Ok(error_result(&format!(
+                "no x25519 pubkey on file for {} — pair with them first",
+                args.agent_pubkey
+            )));
+        }
+    };
+    let now = wires_net::unix_now_ms();
+    let (kind, display_name, _description) = load_me_meta(&runtime.node.config.data_dir);
+    let opened = match wires_node::channel::dm_open(
+        &runtime.node,
+        &runtime.node.config.data_dir,
+        &cfg_root,
+        other,
+        other_x_pk,
+        &display_name,
+        kind,
+        now,
+    ) {
+        Ok(o) => o,
+        Err(e) => return Ok(error_result(&format!("dm_open: {e}"))),
+    };
+    let out = DmOpenOutput {
+        topic_id: hex::encode(opened.topic_id),
+        name: opened.topic_name,
+        participants: opened.participants.iter().map(hex::encode).collect(),
+    };
+    let text = serde_json::to_string(&out).map_err(|e| JsonRpcError {
+        code: -32000,
+        message: e.to_string(),
+    })?;
+    Ok(serde_json::json!({"content": [{"type": "text", "text": text}], "isError": false}))
+}
+
+fn lookup_x25519_pubkey(data_dir: &std::path::Path, agent: &[u8; 32]) -> Option<[u8; 32]> {
+    let map = wires_node::load_dm_roster(data_dir).ok()?;
+    let hex_key = map.get(&hex::encode(agent))?;
+    let bytes = hex::decode(hex_key).ok()?;
+    bytes.try_into().ok()
+}
+
 fn encode_cursor(prev: &TailCursor, msgs: &[wires_node::DecryptedMessage]) -> String {
     let mut cur = prev.clone();
     for m in msgs {
@@ -766,6 +853,14 @@ pub async fn call(
                     message: format!("invalid arguments: {e}"),
                 })?;
             invite_to_channel_tool(&state, claims, args).await
+        }
+        "wires_dm_open" => {
+            let args: DmOpenArgs =
+                serde_json::from_value(p.arguments).map_err(|e| JsonRpcError {
+                    code: -32602,
+                    message: format!("invalid arguments: {e}"),
+                })?;
+            dm_open_tool(&state, claims, args).await
         }
         other => Err(JsonRpcError {
             code: -32601,
