@@ -1,0 +1,12 @@
+[package]
+name = "wires"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "wires"
+path = "src/main.rs"
+
+[dependencies]
+wires-core = { workspace = true }
+clap = { workspace = true }

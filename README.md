@@ -1,10 +1,9 @@
 # Wires
 
-    # This is executable Markdown that's tested on CI.
-    # How is that possible? See https://gist.github.com/bwoods/1c25cb7723a06a076c2152a2781d4d49
-    set -o errexit -o nounset -o xtrace
-    alias ~~~=":<<'~~~sh'";:<<'~~~sh'
-
+# This is executable Markdown that's tested on CI.
+# How is that possible? See https://gist.github.com/bwoods/1c25cb7723a06a076c2152a2781d4d49
+set -o errexit -o nounset -o xtrace
+alias ~~~=":<<'~~~sh'";:<<'~~~sh'
 ## Setup dev environment
 
 First, we recommend you setup a Bazel-based developer environment with homebrew.
@@ -22,14 +21,11 @@ TODO
 The clever core of wires is one idea: **a capability-addressed transport
 whose native protocol data unit is stdio — and, one frame up, MCP.** This
 document is just that idea and the two reference protocols that sit on it
-(stdio-over-wires and MCP-over-wires). It deliberately leaves out the
-fabric / gossip / retention machinery that lives elsewhere in the repo;
-that's a separate concern and it only obscures the layer.
+(stdio-over-wires and MCP-over-wires).
 
 > **Status: conceptual.** The pieces this builds on (identity-addressed,
 > NAT-traversing iroh streams and the human-rooted capability model) exist
-> today; `wires-ha` is the working example of the node shape. The
-> stdio/MCP session framing described here is the reference *protocol* on
+> today. The stdio/MCP session framing described here is the reference *protocol* on
 > the layer, marked where it is a convention to build rather than a
 > guarantee.
 
@@ -107,7 +103,6 @@ flowchart LR
         b2 -->|"stdout / stderr / exit"| s
     end
 ```
-
 The binary is unchanged and unaware of wires. It reads stdin and writes
 stdout/stderr exactly as always. The wrapper node is the adapter between
 "process I/O" and "the session," and it owns the only new thing: an
@@ -167,7 +162,6 @@ flowchart LR
     shim -->|"dial capability,<br/>open session"| resp["wires responder node<br/>(server machine, egress-only)"]
     resp -->|"spawn child,<br/>pipe stdio"| srv["MCP server binary<br/>(unmodified)"]
 ```
-
 - On the **server machine** (e.g. inside a VPC): a wires **responder**
   node. It holds an identity and an installed grant, binds an iroh
   endpoint (egress-only, dialable by key, *no inbound port*), and listens
@@ -231,7 +225,6 @@ sequenceDiagram
     T->>Cl: tool.exit — code 0
     Note over Cl: had no local rg, networked to a node that did
 ```
-
 ## What the layer gives you for free
 
 These are properties of the session layer itself — the agent and the tool

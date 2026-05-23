@@ -3,6 +3,8 @@
 See https://bazel.build/rules/lib/globals/repo
 """
 ignore_directories([
+    # Cargo build output (present when building via plain `cargo`).
+    "target",
     "**/node_modules",
     "**/.pytest_cache",
     "**/__pycache__",
