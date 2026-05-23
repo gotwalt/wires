@@ -33,7 +33,12 @@ Net result: **two binaries.**
 One executable, role-distinct subcommands.
 
 **Trust-root / admin (the human's side)**
-- `wires keygen` — generate the root identity key and node identity keys.
+- `wires keygen` — generate two distinct keys (see **Cryptographic
+  material** below): the **node key** (the iroh transport identity —
+  forced to Ed25519) and the **root key** (signs grants — algorithm is our
+  choice, so it can be brought from a hardware token, the Secure Enclave,
+  an HSM, etc.). Supports importing/seed-deriving the node key rather than
+  generating it fresh.
 - `wires grant` — mint a **capability**: root-signs a grant binding a
   specific *subject node pubkey* to a *scope* (a named tool/endpoint +
   permitted use) with a `not_after` TTL. Emits a base64 **capability
@@ -76,14 +81,53 @@ with no inbound reachability can still connect.
 
 ### Shared mechanics (conceptual, used by every subcommand)
 
-- **identity** — ed25519 node + root keys.
+- **identity** — see **Cryptographic material** below.
 - **grant / capability** — root-signed, bound to a subject node key,
-  scoped, TTL'd; non-transferability enforced because the subject must
+  scoped, TTL'd, and carrying an **algorithm id** so the responder knows
+  how to verify it; non-transferability enforced because the subject must
   equal the iroh-authenticated peer on the connection.
 - **session protocol** — a session ALPN, a handshake frame that presents
   and verifies the grant, then a tagged stdio framing
   (`stdin | stdout | stderr | exit`) over the iroh bi-stream.
 - **policy** — TTL + CRL/allowlist checked at accept time.
+
+### Cryptographic material
+
+There are two keys with very different constraints, because **iroh only
+ever sees the node key — it never sees the root key.**
+
+**Node key — iroh dictates it.** iroh's node identity *is* an Ed25519
+keypair: `SecretKey` is Ed25519, the `NodeId` is the 32-byte Ed25519
+public key, the QUIC/TLS handshake authenticates the peer to that key
+(this is the "iroh authenticates both node identities" step in the flows),
+and pkarr discovery signs its DHT/DNS records with the same key. So there
+is **no algorithm alternative** for the node key. What a user *can* bring
+is the bytes: import an existing Ed25519 secret, or deterministically
+derive it from a seed/mnemonic (e.g. SLIP-0010) so one held seed
+regenerates every node key.
+
+> **Gotcha:** the Apple Secure Enclave can only hold non-extractable
+> **P-256** keys — it cannot store an Ed25519 key. So an iroh node key
+> can't be a Secure-Enclave key; it lives in the Keychain or a file.
+
+**Root key — our construct, so bring almost anything.** The root key's
+only job is to sign grants that `wires serve` verifies in application code;
+iroh has no idea it exists. So the user has full freedom of scheme:
+- **P-256 / ECDSA** — which *can* be a non-extractable Secure Enclave key
+  unlocked by Face ID (the natural choice for an iOS-held root).
+- **A hardware token** — YubiKey/PIV, OpenPGP card, any PKCS#11/FIDO signer.
+- **An HSM / cloud KMS**, an **air-gapped offline signer**, or a
+  **threshold / MPC** scheme ("N-of-M of my devices co-sign a grant").
+- **Ed25519** as the zero-config default.
+
+The only cost of this freedom is the grant's **algorithm id** + the
+responder recording which scheme its `--trust-root` uses.
+
+**No separate encryption key needed.** The old substrate kept an x25519
+key to seal grants offline; here the session is already
+encrypted+authenticated by iroh, so grants travel over an authenticated
+`wires pair` session. If sealing-at-rest is ever wanted, derive an X25519
+key from the Ed25519 node key rather than storing another key.
 
 ## End-to-end flows
 
