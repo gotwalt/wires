@@ -1,9 +1,0 @@
-# docker/Dockerfile.dockerignore
-target/
-data/
-Wires/
-.git/
-docs/
-*.md
-.DS_Store
-.claude/
