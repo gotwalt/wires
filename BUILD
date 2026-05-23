@@ -28,6 +28,11 @@ gazelle(
 # Rust BUILD file generation via gazelle_rust.
 # Uses a separate gazelle binary since the Aspect CLI multitool binary does not include Rust.
 # Run with: bazel run //:gazelle_rust
+#
+# generate_from_cargo: emit one rust target per crate (driven by each crate's
+# Cargo.toml), placing the BUILD next to the Cargo.toml — rather than the
+# default one-target-per-file behavior.
+# gazelle:rust_mode generate_from_cargo
 # gazelle:rust_cargo_lockfile Cargo.lock
 # gazelle:rust_crates_prefix @crates//:
 # gazelle:rust_default_edition 2024

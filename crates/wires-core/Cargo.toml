@@ -1,0 +1,12 @@
+[package]
+name = "wires-core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "wires_core"
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
