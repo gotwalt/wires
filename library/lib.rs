@@ -1,4 +1,4 @@
-//! `wires-core`: shared types for the wires session layer.
+//! `library`: shared types for the wires session layer.
 //!
 //! This is a structural scaffold. The module layout mirrors the "Shared
 //! mechanics" in `docs/new_plan.md` (identity, grant/capability, session
@@ -18,4 +18,12 @@ pub use error::{Error, Result};
 /// while the real surface is still being built out.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn version_is_nonempty() {
+        assert!(!super::version().is_empty());
+    }
 }

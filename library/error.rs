@@ -1,9 +1,9 @@
-//! Error type for `wires-core`.
+//! Error type for `library`.
 
 /// Crate-wide result alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Errors produced by `wires-core`.
+/// Errors produced by `library`.
 ///
 /// Placeholder — real variants land alongside the logic that produces them.
 #[derive(Debug, thiserror::Error)]

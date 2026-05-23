@@ -1,12 +1,12 @@
 [package]
-name = "wires-relay"
+name = "wires"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "wires-relay"
-path = "src/main.rs"
+name = "wires"
+path = "main.rs"
 
 [dependencies]
-wires-core = { workspace = true }
+library = { workspace = true }
 clap = { workspace = true }
