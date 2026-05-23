@@ -1,5 +1,0 @@
-[bindings.swift]
-module_name = "WiresKit"
-ffi_module_name = "wires_uniffi"
-generate_module_map = true
-omit_argument_labels = false

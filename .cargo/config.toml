@@ -1,7 +1,0 @@
-# Route test/bench binaries on macOS through a wrapper that ad-hoc codesigns
-# them with a stable identifier. This makes the macOS Application Firewall
-# remember its allow/deny decision across cargo rebuilds, instead of
-# re-prompting for every freshly hashed test binary that opens an iroh
-# endpoint.
-[target.'cfg(target_os = "macos")']
-runner = "./scripts/macos-test-runner.sh"
