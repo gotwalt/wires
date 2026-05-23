@@ -1,3 +1,22 @@
+# Wires
+
+    # This is executable Markdown that's tested on CI.
+    # How is that possible? See https://gist.github.com/bwoods/1c25cb7723a06a076c2152a2781d4d49
+    set -o errexit -o nounset -o xtrace
+    alias ~~~=":<<'~~~sh'";:<<'~~~sh'
+
+## Setup dev environment
+
+First, we recommend you setup a Bazel-based developer environment with homebrew.
+
+1. Run `make setup`
+
+This will install `bazelisk` and `direnv` and add all the bazel-controlled tools to the path in this directory.
+
+### Try it out
+
+TODO
+
 # Wires as a session layer: stdio and MCP over a capability-addressed network
 
 The clever core of wires is one idea: **a capability-addressed transport
@@ -187,11 +206,9 @@ the exposure is scoped to **exactly that one binary** instead of a shell.
 Your "local" MCP server now runs in a VPC, an air-gapped enclave, or on
 another machine — and the MCP spec did not change at all.
 
-Note the relationship to the existing `wires-mcp` gateway: that gateway
-exposes a fabric *to* MCP clients (MCP-as-RPC-convention, working today;
-see [`mcp-gateway.md`](mcp-gateway.md)). MCP-over-wires as described here
-is the dual — carrying an MCP *server's* stdio across the session layer —
-and is the conceptual reference protocol, not a shipped component.
+MCP-over-wires as described here carries  an MCP *server's* stdio across
+the session layer — and is the conceptual reference protocol, not a
+shipped component.
 
 ## Agents like Claude Code are just endpoints
 
@@ -256,11 +273,3 @@ authorization, encryption, and NAT traversal **once**, as a layer — and
 then "make any stdin/stdout a secure, networked, revocable endpoint" and
 "make a local MCP server remote" are both *reference protocols on that
 layer*, not new protocols.
-
-## See also
-
-- [`tech_overview.md`](tech_overview.md) — the conceptual model and the
-  "CLI over Wires" worked example.
-- [`mcp-gateway.md`](mcp-gateway.md) — `wires-mcp`, MCP-as-RPC-convention
-  on the substrate, working today (the dual of MCP-over-wires).
-- [`quickstart.md`](quickstart.md) — the end-to-end CLI walkthrough.

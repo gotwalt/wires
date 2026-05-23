@@ -2,7 +2,7 @@
 
 ## Context
 
-`docs/tools-over-wires.md` argues the *real* invention in wires is one
+`../README.md` argues the *real* invention in wires is one
 thing: **a capability-addressed transport whose native PDU is stdio (and,
 one frame up, MCP).** The address is a capability, not `(IP, port)`; the
 credential is a non-transferable, human-issued grant; and "networking a
