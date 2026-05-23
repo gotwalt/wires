@@ -1,4 +1,4 @@
-# Ab-initio binaries for the wires session-layer core
+### Binaries for the wires session-layer core
 
 ## Context
 
@@ -8,7 +8,7 @@ one frame up, MCP).** The address is a capability, not `(IP, port)`; the
 credential is a non-transferable, human-issued grant; and "networking a
 tool" and "speaking to a tool" become the same act.
 
-This document answers: *if we started tabula rasa, keeping only iroh, what
+This document answers: *if we started from scratch, keeping only iroh, what
 binaries would we actually build to support that core?* It deliberately
 discards the existing Rust/iOS code.
 
@@ -19,6 +19,7 @@ identity on every connection, and discovery (pkarr/DNS + mDNS). The relay
 *implementation* also ships in iroh; we only wrap/operate it.
 
 Decisions taken:
+
 - **Packaging:** one multi-call `wires` binary with subcommands.
 - **Rendezvous:** rely on iroh built-ins *and* offer a self-hosted relay.
 - **Revocation:** offline — grant TTL + a responder-side allowlist / CRL.
@@ -33,6 +34,7 @@ Net result: **two binaries.**
 One executable, role-distinct subcommands.
 
 **Trust-root / admin (the human's side)**
+
 - `wires keygen` — generate two distinct keys (see **Cryptographic
   material** below): the **node key** (the iroh transport identity —
   forced to Ed25519) and the **root key** (signs grants — algorithm is our
@@ -52,6 +54,7 @@ One executable, role-distinct subcommands.
   around `grant`.)
 
 **Server side — the responder (`wires serve`)**
+
 - Binds an iroh endpoint, listens on the session ALPN (egress-only, *no
   inbound port*). Per inbound connection: iroh has already authenticated
   the caller's node id → verify the presented grant (root signature chains
@@ -62,6 +65,7 @@ One executable, role-distinct subcommands.
   and exec-scoped to one binary.
 
 **Client side — the dialer (`wires connect`)**
+
 - Presents a **local stdio interface**: an agent or MCP client spawns it
   exactly as it would spawn a local stdio program. Resolves the target
   node id from the capability ticket, dials via iroh, opens a session,
@@ -113,6 +117,7 @@ regenerates every node key.
 **Root key — our construct, so bring almost anything.** The root key's
 only job is to sign grants that `wires serve` verifies in application code;
 iroh has no idea it exists. So the user has full freedom of scheme:
+
 - **P-256 / ECDSA** — which *can* be a non-extractable Secure Enclave key
   unlocked by Face ID (the natural choice for an iOS-held root).
 - **A hardware token** — YubiKey/PIV, OpenPGP card, any PKCS#11/FIDO signer.
