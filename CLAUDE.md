@@ -39,13 +39,15 @@ format
 # Format a single file
 format path/to/file
 
-# Regenerate BUILD files
-bazel run gazelle        # Starlark
-bazel run gazelle_rust   # Rust
+# Regenerate Starlark BUILD files
+bazel run gazelle
 
 # Stamped release build
 bazel build --config=release //...
 ```
+
+Rust `BUILD` files are **hand-written** and marked `# gazelle:ignore` (see
+`//library`, `//src`, `//relay`) — gazelle does not own them.
 
 ## Dev Environment Setup
 
@@ -56,10 +58,13 @@ Uses `direnv` to put Bazel-managed tools on PATH. After cloning:
 
 ## Adding Dependencies
 
-**Rust**: `cargo add <crate>` (uses the hermetic cargo from PATH) → `bazel run gazelle_rust`
+**Rust**: add the dep to the package's `Cargo.toml` (and the root
+`[workspace.dependencies]` if shared) → `cargo build` (refreshes `Cargo.lock`)
+→ hand-edit that package's `BUILD` to add the matching `@crates//:<dep>` to its
+`deps`.
 
 Crate resolution is driven by `rules_rs` from the root `Cargo.toml` / `Cargo.lock`
-(a Cargo workspace). Crates are exposed under `@crates//:`.
+(a Cargo workspace). External crates are exposed under `@crates//:`.
 
 ## Containers (OCI)
 
@@ -78,8 +83,11 @@ make push-containers   # runs every oci_push target
 - `MODULE.bazel` — Central dependency declaration. Rust (`rules_rust` + `rules_rs`),
   CC toolchains (`toolchains_llvm` for the host, `hermetic_cc_toolchain`/Zig for
   Linux cross-compiles — both retained only to link Rust), `rules_oci`, shell,
-  lint/format, and `gazelle` (for `gazelle_rust`).
-- `Cargo.toml` / `Cargo.lock` — the Rust workspace; crate members live under `crates/`.
+  lint/format, and `gazelle` (Starlark BUILD maintenance).
+- `Cargo.toml` / `Cargo.lock` — the Rust workspace. Members are flat top-level
+  packages: `//library` (the `library` crate), `//src` (the `wires` binary),
+  and `//relay` (the `wires-relay` binary). Each package holds its `*.rs` files
+  directly (no `src/` subdir), a `BUILD`, and a `Cargo.toml`.
 - `tools/` — Build tooling: formatters (`tools/format/`), linters (`tools/lint/`),
   OCI image macro (`tools/oci/`), platform definitions (`tools/platforms/`),
   platform-transition helpers (`tools/transitions/`).

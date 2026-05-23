@@ -39,5 +39,8 @@ fn main() {
         Command::Serve => "serve",
         Command::Connect => "connect",
     };
-    eprintln!("wires {name} (core {}): not implemented", wires_core::version());
+    eprintln!(
+        "wires {name} (library {}): not implemented",
+        library::version()
+    );
 }

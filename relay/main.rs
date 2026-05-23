@@ -17,8 +17,8 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
     eprintln!(
-        "wires-relay (core {}): not implemented (listen={})",
-        wires_core::version(),
+        "wires-relay (library {}): not implemented (listen={})",
+        library::version(),
         cli.listen
     );
 }

@@ -1,10 +1,11 @@
 [package]
-name = "wires-core"
+name = "library"
 version.workspace = true
 edition.workspace = true
 
 [lib]
-name = "wires_core"
+name = "library"
+path = "lib.rs"
 
 [dependencies]
 ed25519-dalek = { workspace = true }

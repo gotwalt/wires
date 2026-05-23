@@ -261,6 +261,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "library"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -471,16 +480,7 @@ name = "wires"
 version = "0.1.0"
 dependencies = [
  "clap",
- "wires-core",
-]
-
-[[package]]
-name = "wires-core"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "serde",
- "thiserror",
+ "library",
 ]
 
 [[package]]
@@ -488,7 +488,7 @@ name = "wires-relay"
 version = "0.1.0"
 dependencies = [
  "clap",
- "wires-core",
+ "library",
 ]
 
 [[package]]
