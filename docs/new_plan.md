@@ -48,8 +48,13 @@ and the byte-for-byte stdio bridge, covered by a real loopback QUIC test
 (dial → handshake → exec `cat` → echo → exit). Keys and the CRL **persist in an
 on-disk keystore** (`wires/keystore.rs`: `$WIRES_HOME` / XDG / `~/.config/wires`,
 `0600` seed files), resolved flag → env → `--…-file` → keystore, so the network
-commands need no secrets on the command line. Still pending: `pair`'s
-announce/consent flow, the `//relay` loop, and the `rust_image` OCI targets.
+commands need no secrets on the command line. The **`//relay`** binary runs a
+self-hosted `iroh-relay` server (nodes point at it with `--relay-url`), and both
+binaries ship **distroless OCI images** (`//wires:image`, `//relay:image`) that
+cross-compile to Linux. See [deployment.md](deployment.md) / [testing.md](testing.md).
+Still pending: `pair`'s announce/consent flow, and fully self-contained
+(air-gapped) address discovery — `--relay-url` covers rendezvous, but node-id →
+address resolution still uses n0 DNS.
 
 ## The binaries
 

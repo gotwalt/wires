@@ -35,6 +35,10 @@ bazel run   //wires -- --help
 Run a subcommand with `bazel run //wires -- <subcommand> …`, or build once and
 call the binary directly at `bazel-bin/wires/wires`.
 
+For production deployment — containers, Kubernetes manifests, and self-hosting
+the relay — see [docs/deployment.md](docs/deployment.md); for the test suite and
+manual recipes see [docs/testing.md](docs/testing.md).
+
 ### The command surface
 
 | Command          | Role                      | What it does                                                                 |
