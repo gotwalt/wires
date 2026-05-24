@@ -47,7 +47,7 @@ bazel build --config=release //...
 ```
 
 Rust `BUILD` files are **hand-written** and marked `# gazelle:ignore` (see
-`//library`, `//src`, `//relay`) — gazelle does not own them.
+`//library`, `//wires`, `//relay`) — gazelle does not own them.
 
 ## Dev Environment Setup
 
@@ -117,7 +117,7 @@ make push-containers   # runs every oci_push target
   Linux cross-compiles — both retained only to link Rust), `rules_oci`, shell,
   lint/format, and `gazelle` (Starlark BUILD maintenance).
 - `Cargo.toml` / `Cargo.lock` — the Rust workspace. Members are flat top-level
-  packages: `//library` (the `library` crate), `//src` (the `wires` binary),
+  packages: `//library` (the `library` crate), `//wires` (the `wires` binary),
   and `//relay` (the `relay` binary). Each package holds its `*.rs` files
   directly (no `src/` subdir), a `BUILD`, and a `Cargo.toml`.
 - `tools/` — Build tooling: formatters (`tools/format/`), linters (`tools/lint/`),

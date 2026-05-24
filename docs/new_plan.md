@@ -33,14 +33,14 @@ Built as flat top-level Bazel packages in one Cargo workspace (hand-written
 `# gazelle:ignore` BUILD files; see `CLAUDE.md`):
 
 - **`//library`** — the `library` crate; holds the shared mechanics below.
-- **`//src:wires`** — the multi-call `wires` binary.
+- **`//wires`** — the multi-call `wires` binary.
 - **`//relay`** — the self-hosted relay binary.
 
 Build & test are Bazel-only (`bazel build //...`, `bazel test //...`); the
 `Cargo.lock` that `rules_rs` reads is refreshed with the Bazel-vendored cargo.
 
 **Status.** The `//library` core (identity, grant, ticket, policy) is
-implemented and tested (property + unit + doctests). The `//src:wires`
+implemented and tested (property + unit + doctests). The `//wires`
 subcommands and `//relay` are still scaffolding stubs that print
 "not implemented" — wiring them to `//library`, the `session` protocol, and the
 iroh transport are the upcoming phases.

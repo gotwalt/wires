@@ -30,7 +30,7 @@ gazelle(
 # Run with: bazel run //:gazelle_rust
 #
 # Per-crate BUILD files are hand-written and marked `# gazelle:ignore` (see
-# //library, //src, //relay) — gazelle_rust is kept available but does not own
+# //library, //wires, //relay) — gazelle_rust is kept available but does not own
 # them. These directives configure dependency resolution if it is ever run.
 # gazelle:rust_cargo_lockfile Cargo.lock
 # gazelle:rust_crates_prefix @crates//:
