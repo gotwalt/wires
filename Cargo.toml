@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "library",
-    "src",
+    "wires",
     "relay",
 ]
 
