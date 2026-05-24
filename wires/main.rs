@@ -6,6 +6,8 @@
 //! / env / stdin↔stdout (no on-disk state yet). The network subcommands
 //! (`serve`, `connect`, `pair`) remain stubs until the iroh transport phase.
 
+mod transport;
+
 use std::fmt;
 use std::io::Read;
 
@@ -31,9 +33,9 @@ enum Command {
     /// Operator side of pairing.
     Pair,
     /// Responder: verify a grant, exec a command, bridge its stdio.
-    Serve,
+    Serve(ServeArgs),
     /// Dial a capability and pipe local stdio over the session.
-    Connect,
+    Connect(ConnectArgs),
 }
 
 /// `keygen` arguments: optional seeds to re-derive instead of generating.
@@ -79,6 +81,37 @@ struct RevokeArgs {
     /// Existing CRL JSON; if omitted, read from stdin (empty stdin = empty CRL).
     #[arg(long)]
     crl_json: Option<String>,
+}
+
+/// `serve` arguments: the responder key, what it trusts, and the child to exec.
+#[derive(Args)]
+struct ServeArgs {
+    /// Hex 32-byte seed of this responder's node key. Falls back to `$WIRES_NODE_SEED`.
+    #[arg(long)]
+    node_seed: Option<String>,
+    /// Hex node id of the trusted fabric root whose grants are honored.
+    #[arg(long)]
+    trust_root: String,
+    /// The scope this responder serves; a grant's scope must match exactly.
+    #[arg(long)]
+    scope: String,
+    /// Optional CRL JSON of revoked subjects.
+    #[arg(long)]
+    crl_json: Option<String>,
+    /// The command (program + args) to exec per session, after `--`.
+    #[arg(last = true, required = true)]
+    command: Vec<String>,
+}
+
+/// `connect` arguments: the dialer key and the capability ticket to present.
+#[derive(Args)]
+struct ConnectArgs {
+    /// Hex 32-byte seed of this dialer's node key. Falls back to `$WIRES_NODE_SEED`.
+    #[arg(long)]
+    node_seed: Option<String>,
+    /// The base64 capability ticket (target + scope + grant).
+    #[arg(long)]
+    ticket: String,
 }
 
 /// The four lines `keygen` prints: each key's seed and derived node id (hex).
@@ -168,7 +201,7 @@ fn resolve_not_after(
 }
 
 /// Current unix time in seconds.
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -185,42 +218,99 @@ fn read_stdin() -> Result<String, String> {
     Ok(s)
 }
 
+/// Resolve a node-key seed from the flag or `$WIRES_NODE_SEED`.
+fn node_seed(flag: Option<String>) -> Result<String, String> {
+    flag.or_else(|| std::env::var("WIRES_NODE_SEED").ok())
+        .ok_or_else(|| "missing --node-seed (or $WIRES_NODE_SEED)".into())
+}
+
+/// `serve`: bind, verify grants against the trust root, exec + bridge.
+async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
+    let node = NodeIdentity::from_seed_hex(&node_seed(a.node_seed).map_err(anyhow::Error::msg)?)?;
+    let trust_root = NodeId::from_hex(&a.trust_root)?;
+    let scope = Scope::new(a.scope);
+    let crl = match a.crl_json {
+        Some(s) => Crl::from_json(&s)?,
+        None => Crl::new(),
+    };
+    transport::serve(node, trust_root, scope, crl, a.command).await
+}
+
+/// `connect`: dial the ticket's target, present its grant, bridge local stdio.
+/// Returns the child's exit code.
+async fn connect_cmd(a: ConnectArgs) -> anyhow::Result<i32> {
+    let node = NodeIdentity::from_seed_hex(&node_seed(a.node_seed).map_err(anyhow::Error::msg)?)?;
+    let ticket = CapabilityTicket::decode(&a.ticket)?;
+    let target = transport::endpoint_addr(&ticket.target)?;
+    transport::connect_io(
+        node,
+        target,
+        ticket.grant,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        tokio::io::stderr(),
+    )
+    .await
+}
+
+/// Build a multi-threaded tokio runtime for the network subcommands.
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Runtime::new().expect("building tokio runtime")
+}
+
 fn main() {
     let cli = Cli::parse();
-    let result: Result<String, String> = match cli.command {
+    match cli.command {
+        // Offline admin commands print to stdout (or fail with a message).
+        Command::Keygen(_) | Command::Grant(_) | Command::Revoke(_) | Command::Pair => {
+            match cli_admin(cli.command) {
+                Ok(out) => println!("{out}"),
+                Err(e) => {
+                    eprintln!("wires: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Serve(a) => {
+            if let Err(e) = runtime().block_on(serve_cmd(a)) {
+                eprintln!("wires: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        Command::Connect(a) => match runtime().block_on(connect_cmd(a)) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("wires: {e:#}");
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
+/// Run an offline admin subcommand, returning its stdout text.
+fn cli_admin(command: Command) -> Result<String, String> {
+    match command {
         Command::Keygen(a) => run_keygen(a.node_seed.as_deref(), a.root_seed.as_deref())
             .map(|o| o.to_string())
             .map_err(|e| e.to_string()),
         Command::Grant(a) => {
             let root_seed = a
                 .root_seed
-                .or_else(|| std::env::var("WIRES_ROOT_SEED").ok());
-            match (root_seed, resolve_not_after(a.ttl, a.not_after, now_unix())) {
-                (None, _) => Err("missing --root-seed (or $WIRES_ROOT_SEED)".into()),
-                (_, Err(e)) => Err(e),
-                (Some(root_seed), Ok(not_after)) => {
-                    run_grant(&root_seed, &a.subject, &a.target, &a.scope, not_after)
-                        .map_err(|e| e.to_string())
-                }
-            }
+                .or_else(|| std::env::var("WIRES_ROOT_SEED").ok())
+                .ok_or_else(|| "missing --root-seed (or $WIRES_ROOT_SEED)".to_string())?;
+            let not_after = resolve_not_after(a.ttl, a.not_after, now_unix())?;
+            run_grant(&root_seed, &a.subject, &a.target, &a.scope, not_after)
+                .map_err(|e| e.to_string())
         }
         Command::Revoke(a) => {
             let existing = match a.crl_json {
-                Some(s) => Ok(s),
-                None => read_stdin(),
+                Some(s) => s,
+                None => read_stdin()?,
             };
-            existing.and_then(|s| run_revoke(Some(&s), &a.subject).map_err(|e| e.to_string()))
+            run_revoke(Some(&existing), &a.subject).map_err(|e| e.to_string())
         }
-        Command::Pair => Err("pair: not implemented (network phase)".into()),
-        Command::Serve => Err("serve: not implemented (network phase)".into()),
-        Command::Connect => Err("connect: not implemented (network phase)".into()),
-    };
-    match result {
-        Ok(out) => println!("{out}"),
-        Err(e) => {
-            eprintln!("wires: {e}");
-            std::process::exit(1);
-        }
+        Command::Pair => Err("pair: not implemented (network phase)".to_string()),
+        Command::Serve(_) | Command::Connect(_) => unreachable!("handled in main"),
     }
 }
 
