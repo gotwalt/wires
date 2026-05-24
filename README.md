@@ -57,6 +57,16 @@ For production deployment — containers, Kubernetes manifests, and self-hosting
 the relay — see [docs/deployment.md](docs/deployment.md); for the test suite and
 manual recipes see [docs/testing.md](docs/testing.md).
 
+**Try it locally in two terminals.** `.scripts/serve-rg.sh` provisions demo keys,
+boots a responder running `rg`, and mints a ticket; `.scripts/connect.sh` pipes
+its stdin over wires to that `rg` and prints the matches. Both log to stderr so
+you can watch the handshake and session:
+
+```bash
+./.scripts/serve-rg.sh                                   # terminal 1
+printf 'a\nTODO: ship it\nb\n' | ./.scripts/connect.sh   # terminal 2 → "2:TODO: ship it"
+```
+
 ### The command surface
 
 | Command          | Role                      | What it does                                                                 |
