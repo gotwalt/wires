@@ -14,12 +14,30 @@ This will install `bazelisk` and `direnv` and add all the bazel-controlled tools
 
 ## Usage
 
-> **What works today:** the `library` core (identity, grants, tickets, policy,
-> session frame codec) and the `wires` binary's `keygen` / `grant` / `revoke`
-> (offline admin) and `serve` / `connect` (the live, capability-scoped stdio
-> bridge over iroh). Keys and the CRL persist in an on-disk **keystore**
-> (`~/.config/wires`), so the network commands need no secrets on the command
-> line. `pair`, the self-hosted `relay`, and OCI images are not implemented yet.
+> **Status:** the design is implemented end-to-end — the `library` core
+> (identity, grants, tickets, policy, the session frame codec), the `wires`
+> multi-call binary (`keygen` / `grant` / `revoke` / `pair` / `serve` /
+> `connect`), a self-hosted `relay`, distroless OCI images, an on-disk keystore,
+> direct-address tickets, and offline revocation. What's left is convention, not
+> plumbing: a standardized stdio-frame vocabulary (see the thesis at the bottom).
+
+### Layout
+
+Three flat Bazel packages in one Cargo workspace (build & test are Bazel-only —
+`bazel build //...`, `bazel test //...`; see [CLAUDE.md](CLAUDE.md) and
+[docs/rust-bazel-layout.md](docs/rust-bazel-layout.md)):
+
+- **`//library`** — the `library` crate: the pure, transport-free core — identity,
+  grant, ticket, policy, and the session `Frame` codec. No iroh/tokio; property +
+  unit + doctested.
+- **`//wires`** — the multi-call binary: the whole layer surface as subcommands.
+  The iroh transport (`wires/transport.rs`), keystore (`wires/keystore.rs`), and
+  pairing (`wires/pair.rs`) live here so `library` stays pure.
+- **`//relay`** — a self-hosted [`iroh-relay`](https://docs.rs/iroh-relay)
+  rendezvous server.
+
+Both binaries also build as distroless OCI images — `//wires:image` and
+`//relay:image` (`bazel run //relay:image.load` to `docker load`).
 
 ### Build and test
 
@@ -266,7 +284,8 @@ relays (needs outbound internet). Two ways to avoid that:
 - **Discovery without hints:** a hintless ticket (no `--addr`) still relies on
   n0 DNS to resolve a node id to an address.
 - **Scope is exact-match:** a grant's scope must equal the responder's `--scope`.
-- **`pair` is a stub:** mint grants directly with `grant` for now.
+- **stdio framing is raw bytes:** the richer `tool.exec`/`tool.stdout` frame
+  vocabulary in the thesis below is still a convention to build, not shipped.
 
 # Wires as a session layer: stdio and MCP over a capability-addressed network
 
@@ -275,11 +294,12 @@ whose native protocol data unit is stdio — and, one frame up, MCP.** This
 document is just that idea and the two reference protocols that sit on it
 (stdio-over-wires and MCP-over-wires).
 
-> **Status: conceptual.** The pieces this builds on (identity-addressed,
-> NAT-traversing iroh streams and the human-rooted capability model) exist
-> today. The stdio/MCP session framing described here is the reference *protocol* on
-> the layer, marked where it is a convention to build rather than a
-> guarantee.
+> **Status.** The layer itself is built (see [Usage](#usage) above): the
+> capability-addressed transport, the human-rooted grant model, and the
+> dial-a-capability-get-a-stdio-session ALPN all run today on iroh. What remains
+> *conceptual* is the richer reference **protocol** — the `tool.exec` /
+> `tool.stdout` frame vocabulary below — which is a convention on the layer; the
+> shipped bridge moves raw stdio bytes.
 
 ## The thesis
 

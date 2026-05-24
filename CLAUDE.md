@@ -10,8 +10,9 @@ support building/linting/formatting Rust and shell, plus `rules_oci` for
 cutting Docker images from Rust binaries. (Go, Python, JavaScript/TypeScript,
 Java, C++ as a first-class language, and protobuf were removed.)
 
-The conceptual design lives in `docs/` — see `docs/tools-over-wires.md` (the
-session-layer thesis) and `docs/new_plan.md` (the binaries to build).
+The session-layer thesis, the binary layout, and full usage live in
+`README.md`. Deployment and testing patterns live in `docs/deployment.md` and
+`docs/testing.md`.
 
 ## Build System
 
