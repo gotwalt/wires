@@ -10,7 +10,10 @@ rust_binary(
     visibility = ["//visibility:public"],
     deps = [
         "//library",
+        "@crates//:anyhow",
         "@crates//:clap",
+        "@crates//:iroh",
+        "@crates//:tokio",
     ],
 )
 

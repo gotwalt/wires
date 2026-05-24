@@ -43,9 +43,12 @@ Build & test are Bazel-only (`bazel build //...`, `bazel test //...`); the
 `session` frame codec) is implemented and tested (property + unit + doctests).
 The `//wires` offline admin subcommands — `keygen`, `grant`, `revoke` — are
 wired to `//library` (keys/CRL move through flags / env / stdin↔stdout; no
-on-disk state yet). `serve`, `connect`, `pair`, and `//relay` remain stubs
-pending the iroh transport phase (async session framing over the iroh
-bi-stream + the relay loop).
+on-disk state yet). **`serve` and `connect` are implemented over the iroh
+transport** (`wires/transport.rs`): bind/dial by node id, the grant handshake,
+and the byte-for-byte stdio bridge, covered by a real loopback QUIC test
+(dial → handshake → exec `cat` → echo → exit). Still pending: `pair`'s
+announce/consent flow, the `//relay` loop, on-disk key/CRL persistence, and the
+`rust_image` OCI targets.
 
 ## The binaries
 
@@ -117,12 +120,15 @@ These live in the `//library` crate as modules; ✅ = implemented, ◐ = partial
 - ✅ **ticket** (`library/ticket.rs`) — the base64 `CapabilityTicket` (target + scope
   + grant) that *is* the address a dialer presents.
 - ✅ **policy** (`library/policy.rs`) — TTL + CRL/allowlist checked at accept time.
-- ◐ **session protocol** (`library/session.rs`) — the `Frame`
-  (`handshake | stdin | stdout | stderr | exit`) **wire codec is done**: a pure,
-  async-free, length-prefixed `encode`/`decode` (with a `Chunk` newtype for stdio
-  payloads). Still pending: the session ALPN, the async read/write that pumps frames
-  over the iroh bi-stream, and grant verification on the handshake — all with the iroh
-  phase.
+- ✅ **session protocol** — split across two homes so `//library` stays pure:
+  - `library/session.rs` holds the `Frame`
+    (`handshake | stdin | stdout | stderr | exit`) **wire codec**: a pure, async-free,
+    length-prefixed `encode`/`decode` with a `Chunk` newtype for stdio payloads.
+  - `wires/transport.rs` holds the **iroh transport**: the session ALPN, the
+    `NodeIdentity`↔iroh-`SecretKey` / `NodeId`↔`EndpointId` key bridge, async
+    `read_frame`/`write_frame` over the bi-stream, and the `serve`/`connect` stdio
+    bridge with handshake verification via `check_accept` against the
+    iroh-authenticated caller.
 
 ### Cryptographic material
 
