@@ -126,6 +126,9 @@ struct ServeArgs {
     /// Read the CRL from this file (else the keystore's `crl.json`, else empty).
     #[arg(long)]
     crl_file: Option<PathBuf>,
+    /// Use a self-hosted relay at this URL instead of the n0 default.
+    #[arg(long)]
+    relay_url: Option<String>,
     /// The command (program + args) to exec per session, after `--`.
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -141,6 +144,9 @@ struct ConnectArgs {
     /// Read the node key seed (hex) from this file instead of the keystore.
     #[arg(long)]
     node_seed_file: Option<PathBuf>,
+    /// Use a self-hosted relay at this URL instead of the n0 default.
+    #[arg(long)]
+    relay_url: Option<String>,
     /// The base64 capability ticket (target + scope + grant).
     #[arg(long)]
     ticket: String,
@@ -246,7 +252,15 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     let trust_root = NodeId::from_hex(&a.trust_root)?;
     let scope = Scope::new(a.scope);
     let crl = keystore::load_crl(a.crl_json.as_deref(), a.crl_file.as_deref())?;
-    transport::serve(node, trust_root, scope, crl, a.command).await
+    transport::serve(
+        node,
+        trust_root,
+        scope,
+        crl,
+        a.relay_url.as_deref(),
+        a.command,
+    )
+    .await
 }
 
 /// `connect`: dial the ticket's target, present its grant, bridge local stdio.
@@ -259,6 +273,7 @@ async fn connect_cmd(a: ConnectArgs) -> anyhow::Result<i32> {
         node,
         target,
         ticket.grant,
+        a.relay_url.as_deref(),
         tokio::io::stdin(),
         tokio::io::stdout(),
         tokio::io::stderr(),

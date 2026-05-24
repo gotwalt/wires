@@ -52,11 +52,18 @@ pub fn endpoint_addr(node: &NodeId) -> Result<EndpointAddr> {
 }
 
 /// Bind an iroh endpoint for `identity` on the session ALPN, using the n0
-/// preset for discovery + relays.
-pub async fn bind(identity: &NodeIdentity) -> Result<Endpoint> {
-    Endpoint::builder(N0)
+/// preset for discovery + relays. If `relay_url` is given, that relay is used
+/// instead of the n0 default (for a self-hosted `//relay`).
+pub async fn bind(identity: &NodeIdentity, relay_url: Option<&str>) -> Result<Endpoint> {
+    let mut builder = Endpoint::builder(N0)
         .secret_key(secret_key(identity))
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec()]);
+    if let Some(url) = relay_url {
+        let map = iroh::RelayMap::try_from_iter([url])
+            .with_context(|| format!("parsing relay url {url}"))?;
+        builder = builder.relay_mode(iroh::endpoint::RelayMode::Custom(map));
+    }
+    builder
         .bind()
         .await
         .map_err(|e| anyhow!("binding iroh endpoint: {e}"))
@@ -128,9 +135,10 @@ pub async fn serve(
     trust_root: NodeId,
     scope: Scope,
     crl: Crl,
+    relay_url: Option<&str>,
     command: Vec<String>,
 ) -> Result<()> {
-    let endpoint = bind(&node).await?;
+    let endpoint = bind(&node, relay_url).await?;
     serve_on(endpoint, trust_root, scope, crl, command).await
 }
 
@@ -250,10 +258,12 @@ async fn handle_connection(
 // ---------------------------------------------------------------------------
 
 /// Bind for `node` and dial `target` (see [`connect_on`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn connect_io<R, W, E>(
     node: NodeIdentity,
     target: EndpointAddr,
     grant: Grant,
+    relay_url: Option<&str>,
     stdin: R,
     stdout: W,
     stderr: E,
@@ -263,7 +273,7 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    let endpoint = bind(&node).await?;
+    let endpoint = bind(&node, relay_url).await?;
     connect_on(endpoint, target, grant, stdin, stdout, stderr).await
 }
 
