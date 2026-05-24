@@ -17,6 +17,8 @@ rust_binary(
         "@crates//:serde",
         "@crates//:serde_json",
         "@crates//:tokio",
+        "@crates//:tracing",
+        "@crates//:tracing-subscriber",
     ],
 )
 

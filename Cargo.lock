@@ -4906,6 +4906,8 @@ dependencies = [
  "serde_json",
  "signature 3.0.0-rc.10",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

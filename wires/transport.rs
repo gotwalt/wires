@@ -179,10 +179,11 @@ pub async fn serve_on(
     crl: Crl,
     command: Vec<String>,
 ) -> Result<()> {
-    eprintln!(
-        "wires serve: node {} on {:?}",
-        to_node_id(&endpoint.id()).hex(),
-        endpoint.bound_sockets()
+    tracing::info!(
+        node = %to_node_id(&endpoint.id()).hex(),
+        sockets = ?endpoint.bound_sockets(),
+        scope = %scope.as_str(),
+        "serving session ALPN (egress-only)"
     );
     let scope = Arc::new(scope);
     let crl = Arc::new(crl);
@@ -193,7 +194,7 @@ pub async fn serve_on(
         let command = Arc::clone(&command);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(incoming, trust_root, &scope, &crl, &command).await {
-                eprintln!("wires serve: connection error: {e:#}");
+                tracing::warn!("connection rejected or failed: {e:#}");
             }
         });
     }
@@ -210,6 +211,7 @@ async fn handle_connection(
 ) -> Result<()> {
     let conn = incoming.await.context("accepting connection")?;
     let caller = to_node_id(&conn.remote_id());
+    tracing::info!(caller = %caller.hex(), "connection accepted (iroh-authenticated)");
     let (mut send, mut recv) = conn.accept_bi().await.context("accepting bi-stream")?;
 
     // The first frame must be the grant-bearing handshake.
@@ -229,9 +231,11 @@ async fn handle_connection(
     }
 
     // Spawn the configured child with piped stdio.
+    tracing::info!(scope = %scope.as_str(), caller = %caller.hex(), "grant accepted");
     let (program, args) = command
         .split_first()
         .ok_or_else(|| anyhow!("empty serve command"))?;
+    tracing::info!(program = %program, "spawning child and bridging stdio");
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::piped())
@@ -277,9 +281,13 @@ async fn handle_connection(
     let _ = stdin_task.await;
 
     let code = status.code().unwrap_or(-1);
+    tracing::info!(code, "child exited; closing session");
     tx.send(Frame::Exit(code)).await.ok();
     drop(tx);
     writer.await.context("writer task")??;
+    // Wait for the dialer to read the final frames and close, so we don't tear
+    // the connection down mid-flush. Bounded so a vanished dialer can't pin us.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
     Ok(())
 }
 
@@ -322,11 +330,13 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
+    tracing::info!("dialing the capability over wires");
     let conn = endpoint
         .connect(target, ALPN)
         .await
         .map_err(|e| anyhow!("dialing target: {e}"))?;
     let (mut send, mut recv) = conn.open_bi().await.context("opening bi-stream")?;
+    tracing::info!("session open; presenting grant and bridging stdio");
 
     write_frame(&mut send, &Frame::Handshake { grant }).await?;
 
@@ -357,6 +367,7 @@ where
             Some(Frame::Stderr(chunk)) => stderr.write_all(chunk.as_bytes()).await?,
             Some(Frame::Exit(c)) => {
                 code = c;
+                tracing::info!(code, "remote child exited");
                 break;
             }
             Some(_) => {} // ignore unexpected frames from the responder
@@ -366,6 +377,9 @@ where
     stdout.flush().await.ok();
     stderr.flush().await.ok();
     stdin_task.abort();
+    // Close gracefully so our CONNECTION_CLOSE flushes (lets the responder's
+    // teardown return promptly, and avoids iroh's "dropped without close" warn).
+    endpoint.close().await;
     Ok(code)
 }
 

@@ -338,6 +338,7 @@ pub(crate) fn now_unix() -> i64 {
 
 /// `serve`: bind, verify grants against the trust root, exec + bridge.
 async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
+    init_logging();
     let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
     let trust_root = NodeId::from_hex(&a.trust_root)?;
     let scope = Scope::new(a.scope);
@@ -356,6 +357,7 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
 /// `connect`: dial the ticket's target, present its grant, bridge local stdio.
 /// Returns the child's exit code.
 async fn connect_cmd(a: ConnectArgs) -> anyhow::Result<i32> {
+    init_logging();
     let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
     let ticket = CapabilityTicket::decode(&a.ticket)?;
     // `--relay-url` overrides the ticket's relay hint; both feed the dialed
@@ -377,6 +379,19 @@ async fn connect_cmd(a: ConnectArgs) -> anyhow::Result<i32> {
 /// Build a multi-threaded tokio runtime for the network subcommands.
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().expect("building tokio runtime")
+}
+
+/// Initialize tracing for the network subcommands, writing to **stderr** so it
+/// never corrupts `connect`'s piped stdout. Controlled by `$RUST_LOG`
+/// (default `info`).
+fn init_logging() {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 fn main() {
@@ -429,6 +444,7 @@ async fn pair_cmd(a: PairArgs) -> anyhow::Result<Option<String>> {
 }
 
 async fn pair_accept_cmd(a: PairAcceptArgs) -> anyhow::Result<()> {
+    init_logging();
     let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
     let root = keystore::root_identity(a.root_seed.as_deref(), a.root_seed_file.as_deref())?;
     let not_after =
@@ -456,6 +472,7 @@ async fn pair_accept_cmd(a: PairAcceptArgs) -> anyhow::Result<()> {
 }
 
 async fn pair_request_cmd(a: PairRequestArgs) -> anyhow::Result<String> {
+    init_logging();
     let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
     let operator = transport::endpoint_addr(
         &NodeId::from_hex(&a.operator)?,
