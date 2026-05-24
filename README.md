@@ -12,9 +12,184 @@ First, we recommend you setup a Bazel-based developer environment with homebrew.
 
 This will install `bazelisk` and `direnv` and add all the bazel-controlled tools to the path in this directory.
 
-### Try it out
+## Usage
 
-TODO
+> **What works today:** the `library` core (identity, grants, tickets, policy,
+> session frame codec) and the `wires` binary's `keygen` / `grant` / `revoke`
+> (offline admin) and `serve` / `connect` (the live, capability-scoped stdio
+> bridge over iroh). Keys and the CRL are passed via flags / env / stdin — there
+> is **no on-disk keystore yet**. `pair`, the self-hosted `relay`, and OCI images
+> are not implemented yet.
+
+### Build and test
+
+Everything goes through Bazel (see [CLAUDE.md](CLAUDE.md) for the dependency
+workflow — never `cargo build`/`cargo test`):
+
+```bash
+bazel build //...          # build the library + binaries
+bazel test  //...          # unit + property + doctests + the loopback QUIC test
+bazel run   //wires -- --help
+```
+
+Run a subcommand with `bazel run //wires -- <subcommand> …`, or build once and
+call the binary directly at `bazel-bin/wires/wires`.
+
+### The command surface
+
+| Command          | Role                      | What it does                                                                 |
+| ---------------- | ------------------------- | ---------------------------------------------------------------------------- |
+| `wires keygen`   | trust-root / host setup   | Generate (or re-derive) a **node key** and a **root key**; print seeds + ids |
+| `wires grant`    | trust root (the human)    | Root-sign a capability and emit a base64 **ticket** (the address)            |
+| `wires revoke`   | trust root / responder    | Add a subject to a CRL (read on stdin / `--crl-json`), print the new CRL     |
+| `wires serve`    | responder (the tool host) | Verify a dialer's grant, exec a command, bridge its stdio over the session   |
+| `wires connect`  | dialer (the agent side)   | Dial a ticket's target, present the grant, pipe local stdin/stdout/stderr    |
+| `wires pair`     | —                         | Not implemented yet (mint grants with `grant` for now)                       |
+
+### Two keys
+
+There are two Ed25519 keys with different jobs (see the design notes below):
+
+- **Node key** — a node's iroh transport identity. Its public half *is* the
+  node id you dial. Every participant (the responder host and each dialer) has
+  one.
+- **Root key** — the human trust root that signs grants. Its public node id is
+  what a responder is told to `--trust-root`. It never touches iroh.
+
+`keygen` emits both as `<label> <hex>` lines:
+
+```bash
+$ bazel run -q //wires -- keygen
+node_seed 0202…0202   # 32-byte Ed25519 seed (secret) for the node key
+node_id   8139…b394   # the node's public id — what others dial
+root_seed 0101…0101   # secret seed for the root signing key
+root_id   8a88…6f5c   # the trust-root id others verify against
+```
+
+Pass `--node-seed <hex>` / `--root-seed <hex>` to re-derive deterministically
+instead of generating fresh keys.
+
+### End-to-end: drive a remote `rg` over wires (Flow A)
+
+Three roles, which may be three machines. Replace the `<…_ID>` / `<…_SEED>`
+placeholders with the hex values printed by `keygen`.
+
+**1. The human mints the trust root** (keep `root_seed` secret):
+
+```bash
+bazel run -q //wires -- keygen          # → ROOT_SEED, ROOT_ID
+```
+
+**2. Each host/agent makes a node key:**
+
+```bash
+bazel run -q //wires -- keygen          # on the tool host → SERVER_SEED, SERVER_ID
+bazel run -q //wires -- keygen          # on the agent box → AGENT_SEED,  AGENT_ID
+```
+
+**3. The human grants the agent the right to reach the tool**, binding the
+agent's node id to a scope, targeting the tool host, with a 1-hour TTL. This
+prints the capability **ticket** (the address):
+
+```bash
+TICKET=$(bazel run -q //wires -- grant \
+  --root-seed "$ROOT_SEED" \
+  --subject   "$AGENT_ID" \
+  --target    "$SERVER_ID" \
+  --scope     tools.rg \
+  --ttl       3600)
+```
+
+`--root-seed` also reads `$WIRES_ROOT_SEED`. Use `--not-after <unix>` instead of
+`--ttl` for an absolute expiry.
+
+**4. The tool host serves the scope**, exec-scoped to one command, egress-only
+(no inbound port). A session is accepted only if the caller's grant is signed by
+`--trust-root`, its subject equals the authenticated caller, its scope matches,
+its TTL is valid, and it is not in the CRL:
+
+```bash
+bazel run -q //wires -- serve \
+  --node-seed  "$SERVER_SEED" \
+  --trust-root "$ROOT_ID" \
+  --scope      tools.rg \
+  -- rg --line-number TODO
+```
+
+Everything after `--` is the child command (program + args) exec'd per session.
+
+**5. The agent dials the capability** — exactly like running a local stdio
+program. Its stdin is forwarded to the child; the child's stdout/stderr stream
+back; the child's exit code becomes `connect`'s exit code:
+
+```bash
+echo "search input" | bazel run -q //wires -- connect \
+  --node-seed "$AGENT_SEED" \
+  --ticket    "$TICKET"
+```
+
+The dialer's `--node-seed` **must** be the grant's subject (`AGENT_ID`) — the
+responder checks that the iroh-authenticated caller equals the grant's subject,
+so a ticket cannot be used by anyone else. `--node-seed` also reads
+`$WIRES_NODE_SEED`.
+
+### MCP over wires (Flow B) — no extra code
+
+`serve` doesn't care whether the child is `rg` or an MCP server. Point `serve` at
+your MCP server binary, and configure the MCP **client** to spawn `wires connect`
+as its stdio server command. wires carries the JSON-RPC bytes opaquely.
+
+On the server machine (e.g. inside a VPC; its secrets stay local):
+
+```bash
+bazel run -q //wires -- serve \
+  --node-seed "$SERVER_SEED" --trust-root "$ROOT_ID" --scope mcp.myserver \
+  -- my-mcp-server --config /etc/my-mcp.toml
+```
+
+In the MCP client config, replace the local command with the dialer:
+
+```json
+{
+  "mcpServers": {
+    "myserver": {
+      "command": "wires",
+      "args": ["connect", "--node-seed", "<AGENT_SEED>", "--ticket", "<TICKET>"]
+    }
+  }
+}
+```
+
+The client believes it launched a local stdio server; the server believes it was
+launched locally. Neither knows a network is involved.
+
+### Revocation (offline)
+
+Revocation is offline: short grant TTLs plus a responder-side CRL. Build or
+extend a CRL by piping the current one through `revoke`, then hand it to `serve`:
+
+```bash
+# First revocation (empty input → a one-entry CRL):
+echo '' | bazel run -q //wires -- revoke --subject "$AGENT_ID" > crl.json
+
+# Add another subject to the existing CRL:
+bazel run -q //wires -- revoke --subject "$OTHER_ID" --crl-json "$(cat crl.json)" > crl.json
+
+# Enforce it on the responder:
+bazel run -q //wires -- serve \
+  --node-seed "$SERVER_SEED" --trust-root "$ROOT_ID" --scope tools.rg \
+  --crl-json "$(cat crl.json)" -- rg --line-number TODO
+```
+
+### Notes and current limits
+
+- **Reachability:** `connect` resolves the target purely by node id via iroh's
+  default (n0) discovery + relays, so both ends need outbound egress to a relay
+  for NAT traversal. A self-hosted `//relay` is not implemented yet.
+- **No persistence yet:** seeds and the CRL live only in flags / env / files you
+  manage; there is no `~/.config/wires` keystore.
+- **Scope is exact-match:** a grant's scope must equal the responder's `--scope`.
+- **`pair` is a stub:** mint grants directly with `grant` for now.
 
 # Wires as a session layer: stdio and MCP over a capability-addressed network
 
