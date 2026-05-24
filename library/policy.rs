@@ -4,12 +4,17 @@
 //! session: it ties together grant verification, the non-transferability check
 //! (subject == authenticated caller), expiry, and the revocation list.
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Error, Result};
 use crate::grant::Grant;
 use crate::identity::NodeId;
 
 /// A revocation list of subject node ids whose grants must be refused.
-#[derive(Clone, Default, Debug)]
+///
+/// Serializes as `{"revoked": [<hex node id>, …]}`, so a responder can persist
+/// it and `wires revoke` can round-trip it as JSON.
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Crl {
     revoked: Vec<NodeId>,
 }
@@ -30,6 +35,40 @@ impl Crl {
     /// Whether `subject` is revoked.
     pub fn contains(&self, subject: &NodeId) -> bool {
         self.revoked.contains(subject)
+    }
+
+    /// The number of revoked subjects.
+    pub fn len(&self) -> usize {
+        self.revoked.len()
+    }
+
+    /// Whether the revocation list is empty.
+    pub fn is_empty(&self) -> bool {
+        self.revoked.is_empty()
+    }
+
+    /// Parse a CRL from its JSON form (the inverse of [`to_json`](Self::to_json)).
+    ///
+    /// ```
+    /// use library::Crl;
+    /// let crl = Crl::from_json(r#"{"revoked":[]}"#).unwrap();
+    /// assert!(crl.is_empty());
+    /// ```
+    pub fn from_json(s: &str) -> Result<Crl> {
+        serde_json::from_str(s).map_err(Error::Decode)
+    }
+
+    /// Serialize the CRL to its JSON form.
+    ///
+    /// ```
+    /// use library::{Crl, NodeIdentity};
+    /// let mut crl = Crl::new();
+    /// crl.insert(NodeIdentity::from_seed([1u8; 32]).node_id());
+    /// let json = crl.to_json().unwrap();
+    /// assert_eq!(Crl::from_json(&json).unwrap(), crl);
+    /// ```
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string(self).map_err(Error::Encode)
     }
 }
 
@@ -105,6 +144,18 @@ mod tests {
 
             let ok = check_accept(&grant, root.node_id(), caller, now, &crl).is_ok();
             prop_assert_eq!(ok, same_caller && now <= not_after && !revoke);
+        }
+
+        /// A CRL survives a JSON round-trip unchanged.
+        #[test]
+        fn crl_json_roundtrips(seeds in proptest::collection::vec(seed(), 0..6)) {
+            let mut crl = Crl::new();
+            for s in &seeds {
+                crl.insert(NodeIdentity::from_seed(*s).node_id());
+            }
+            let json = serde_json::to_string(&crl).unwrap();
+            let back: Crl = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(crl, back);
         }
     }
 

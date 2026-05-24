@@ -44,4 +44,12 @@ pub enum Error {
     /// A byte slice had the wrong length for the key or signature it decodes to.
     #[error("bad key or signature length")]
     BadKeyLength,
+
+    /// A hex string was not valid hex for the value it decodes to.
+    #[error("bad hex: {0}")]
+    BadHex(#[from] hex::FromHexError),
+
+    /// A session frame had an unknown tag or a malformed body.
+    #[error("bad frame")]
+    BadFrame,
 }
