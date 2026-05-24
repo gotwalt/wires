@@ -16,3 +16,8 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 ed25519-dalek = "2"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+rand = "0.8"
+proptest = "1"
