@@ -14,6 +14,8 @@ rust_binary(
         "@crates//:anyhow",
         "@crates//:clap",
         "@crates//:iroh",
+        "@crates//:serde",
+        "@crates//:serde_json",
         "@crates//:tokio",
     ],
 )
