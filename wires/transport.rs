@@ -66,13 +66,23 @@ pub fn endpoint_addr(
     Ok(addr)
 }
 
-/// Bind an iroh endpoint for `identity` on the session ALPN, using the n0
-/// preset for discovery + relays. If `relay_url` is given, that relay is used
-/// instead of the n0 default (for a self-hosted `//relay`).
+/// Bind an iroh endpoint for `identity` on the session [`ALPN`] (see
+/// [`bind_with_alpn`]).
 pub async fn bind(identity: &NodeIdentity, relay_url: Option<&str>) -> Result<Endpoint> {
+    bind_with_alpn(identity, relay_url, ALPN).await
+}
+
+/// Bind an iroh endpoint for `identity` advertising `alpn`, using the n0 preset
+/// for discovery + relays. If `relay_url` is given, that relay is used instead
+/// of the n0 default (for a self-hosted `//relay`).
+pub async fn bind_with_alpn(
+    identity: &NodeIdentity,
+    relay_url: Option<&str>,
+    alpn: &[u8],
+) -> Result<Endpoint> {
     let mut builder = Endpoint::builder(N0)
         .secret_key(secret_key(identity))
-        .alpns(vec![ALPN.to_vec()]);
+        .alpns(vec![alpn.to_vec()]);
     if let Some(url) = relay_url {
         let map = iroh::RelayMap::try_from_iter([url])
             .with_context(|| format!("parsing relay url {url}"))?;

@@ -7,6 +7,7 @@
 //! network commands work without seeds on the command line.
 
 mod keystore;
+mod pair;
 mod transport;
 
 use std::fmt;
@@ -32,8 +33,8 @@ enum Command {
     Grant(GrantArgs),
     /// Add a subject to the CRL (keystore by default) and print the result.
     Revoke(RevokeArgs),
-    /// Operator side of pairing.
-    Pair,
+    /// Issue a grant over the wire (announce/consent), instead of pasting ids.
+    Pair(PairArgs),
     /// Responder: verify a grant, exec a command, bridge its stdio.
     Serve(ServeArgs),
     /// Dial a capability and pipe local stdio over the session.
@@ -158,6 +159,87 @@ struct ConnectArgs {
     /// The base64 capability ticket (target + scope + grant).
     #[arg(long)]
     ticket: String,
+}
+
+/// `pair` has two sides: `accept` (operator, holds the root key) and `request`
+/// (the node that wants a capability).
+#[derive(Args)]
+struct PairArgs {
+    #[command(subcommand)]
+    cmd: PairCmd,
+}
+
+#[derive(Subcommand)]
+enum PairCmd {
+    /// Operator: listen, consent, and mint a ticket bound to the requester.
+    Accept(PairAcceptArgs),
+    /// Requester: dial the operator, announce a scope, print the issued ticket.
+    Request(PairRequestArgs),
+}
+
+/// `pair accept` arguments: the operator's keys, the terms to grant, and how
+/// requesters reach the operator.
+#[derive(Args)]
+struct PairAcceptArgs {
+    /// Operator node key seed (hex). Falls back to env / file / keystore.
+    #[arg(long)]
+    node_seed: Option<String>,
+    /// Read the operator node key seed (hex) from this file.
+    #[arg(long)]
+    node_seed_file: Option<PathBuf>,
+    /// Root signing key seed (hex). Falls back to env / file / keystore.
+    #[arg(long)]
+    root_seed: Option<String>,
+    /// Read the root key seed (hex) from this file.
+    #[arg(long)]
+    root_seed_file: Option<PathBuf>,
+    /// Hex node id of the responder the issued ticket points at.
+    #[arg(long)]
+    target: String,
+    /// The scope to grant (authoritative).
+    #[arg(long)]
+    scope: String,
+    /// Direct address hints for the target, embedded in the issued ticket.
+    #[arg(long = "target-addr")]
+    target_addr: Vec<SocketAddr>,
+    /// Seconds from now until expiry (mutually exclusive with `--not-after`).
+    #[arg(long, conflicts_with = "not_after")]
+    ttl: Option<i64>,
+    /// Absolute expiry, unix seconds (mutually exclusive with `--ttl`).
+    #[arg(long)]
+    not_after: Option<i64>,
+    /// Relay URL: reaches the operator *and* is embedded in the issued ticket.
+    #[arg(long)]
+    relay_url: Option<String>,
+    /// Consent to every request without prompting (for automation).
+    #[arg(long)]
+    yes: bool,
+    /// Exit after the first pairing instead of staying up.
+    #[arg(long)]
+    once: bool,
+}
+
+/// `pair request` arguments: the requester's key and how to reach the operator.
+#[derive(Args)]
+struct PairRequestArgs {
+    /// Requester node key seed (hex). Falls back to env / file / keystore.
+    #[arg(long)]
+    node_seed: Option<String>,
+    /// Read the requester node key seed (hex) from this file.
+    #[arg(long)]
+    node_seed_file: Option<PathBuf>,
+    /// Hex node id of the operator to pair with.
+    #[arg(long)]
+    operator: String,
+    /// Direct address where the operator is reachable (repeatable).
+    #[arg(long = "addr")]
+    addr: Vec<SocketAddr>,
+    /// Relay URL to reach the operator through.
+    #[arg(long)]
+    relay_url: Option<String>,
+    /// The scope being requested (advisory; the operator decides).
+    #[arg(long)]
+    scope: String,
 }
 
 /// The four lines `keygen` prints: each key's seed and derived node id (hex).
@@ -301,7 +383,7 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         // Offline admin commands print to stdout (or fail with a message).
-        Command::Keygen(_) | Command::Grant(_) | Command::Revoke(_) | Command::Pair => {
+        Command::Keygen(_) | Command::Grant(_) | Command::Revoke(_) => {
             match cli_admin(cli.command) {
                 Ok(out) => println!("{out}"),
                 Err(e) => {
@@ -310,6 +392,14 @@ fn main() {
                 }
             }
         }
+        Command::Pair(a) => match runtime().block_on(pair_cmd(a)) {
+            Ok(Some(out)) => println!("{out}"),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("wires: {e:#}");
+                std::process::exit(1);
+            }
+        },
         Command::Serve(a) => {
             if let Err(e) = runtime().block_on(serve_cmd(a)) {
                 eprintln!("wires: {e:#}");
@@ -324,6 +414,55 @@ fn main() {
             }
         },
     }
+}
+
+/// `pair`: dispatch to the operator (`accept`) or requester (`request`) side.
+/// Returns `Some(ticket)` for `request` (printed), `None` for `accept`.
+async fn pair_cmd(a: PairArgs) -> anyhow::Result<Option<String>> {
+    match a.cmd {
+        PairCmd::Accept(x) => {
+            pair_accept_cmd(x).await?;
+            Ok(None)
+        }
+        PairCmd::Request(x) => Ok(Some(pair_request_cmd(x).await?)),
+    }
+}
+
+async fn pair_accept_cmd(a: PairAcceptArgs) -> anyhow::Result<()> {
+    let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
+    let root = keystore::root_identity(a.root_seed.as_deref(), a.root_seed_file.as_deref())?;
+    let not_after =
+        resolve_not_after(a.ttl, a.not_after, now_unix()).map_err(anyhow::Error::msg)?;
+    let terms = pair::PairTerms {
+        target: NodeId::from_hex(&a.target)?,
+        scope: Scope::new(a.scope),
+        not_after,
+        addrs: a.target_addr,
+        relay_url: a.relay_url.clone(),
+    };
+    let yes = a.yes;
+    let consent = move |requester: NodeId, scope: &str| -> bool {
+        if yes {
+            return true;
+        }
+        eprint!("wires pair: grant '{scope}' to {}? [y/N] ", requester.hex());
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        matches!(line.trim(), "y" | "Y" | "yes")
+    };
+    pair::pair_accept(node, root, terms, a.relay_url.as_deref(), consent, a.once).await
+}
+
+async fn pair_request_cmd(a: PairRequestArgs) -> anyhow::Result<String> {
+    let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
+    let operator = transport::endpoint_addr(
+        &NodeId::from_hex(&a.operator)?,
+        &a.addr,
+        a.relay_url.as_deref(),
+    )?;
+    pair::pair_request(node, operator, Scope::new(a.scope), a.relay_url.as_deref()).await
 }
 
 /// Run an offline admin subcommand, returning its stdout text.
@@ -346,8 +485,9 @@ fn cli_admin(command: Command) -> Result<String, String> {
             .map_err(stringify)
         }
         Command::Revoke(a) => run_revoke_cmd(a).map_err(stringify),
-        Command::Pair => Err("pair: not implemented (network phase)".to_string()),
-        Command::Serve(_) | Command::Connect(_) => unreachable!("handled in main"),
+        Command::Pair(_) | Command::Serve(_) | Command::Connect(_) => {
+            unreachable!("handled in main")
+        }
     }
 }
 

@@ -13,6 +13,8 @@ clap = { workspace = true }
 iroh = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 # Lockfile pins for iroh's `ed25519-dalek 3.0.0-pre.1` crypto cluster (not used
 # directly; see the root Cargo.toml note). Intentionally absent from BUILD deps.

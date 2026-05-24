@@ -48,7 +48,7 @@ manual recipes see [docs/testing.md](docs/testing.md).
 | `wires revoke`   | trust root / responder    | Add a subject to the CRL (keystore `crl.json` by default) and print it       |
 | `wires serve`    | responder (the tool host) | Verify a dialer's grant, exec a command, bridge its stdio over the session   |
 | `wires connect`  | dialer (the agent side)   | Dial a ticket's target, present the grant, pipe local stdin/stdout/stderr    |
-| `wires pair`     | —                         | Not implemented yet (mint grants with `grant` for now)                       |
+| `wires pair`     | operator ⇄ requester      | Issue a grant over the wire: `accept` (operator consents) ⇄ `request` (node)  |
 
 ### Two keys
 
@@ -196,6 +196,30 @@ key comes from the agent's keystore):
 
 The client believes it launched a local stdio server; the server believes it was
 launched locally. Neither knows a network is involved.
+
+### Pairing: issue a grant over the wire
+
+`grant` requires pasting the subject's node id. `pair` collects it over an
+authenticated channel instead: the requester dials the operator and announces a
+scope; the operator consents and mints a ticket whose **subject is the
+requester's iroh-authenticated node id** — so a paired ticket is
+non-transferable by construction.
+
+```bash
+# Operator (holds the root key): listen, auto-consent once. Logs its node id +
+# bound sockets so the requester knows where to dial.
+bazel run -q //wires -- pair accept \
+  --target "$SERVER_ID" --scope tools.rg --ttl 3600 --yes --once
+
+# Requester (the agent box): dial the operator directly, print the issued ticket.
+TICKET=$(bazel run -q //wires -- pair request \
+  --operator "$OPERATOR_ID" --addr 198.51.100.9:4433 --scope tools.rg)
+```
+
+Drop `--yes` to be prompted per request (`grant '<scope>' to <node id>? [y/N]`),
+and `--once` to keep serving. The operator reaches requesters / the requester
+reaches the operator the same way as everywhere else — direct `--addr`,
+`--relay-url`, or n0 discovery.
 
 ### Revocation (offline)
 

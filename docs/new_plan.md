@@ -53,9 +53,11 @@ self-hosted `iroh-relay` server (nodes point at it with `--relay-url`), and both
 binaries ship **distroless OCI images** (`//wires:image`, `//relay:image`) that
 cross-compile to Linux. Tickets can carry **direct socket addresses + a relay
 URL** (`wires grant --addr/--relay-url`), so a dialer reaches the target with no
-discovery service — air-gapped deployments work without n0. See
-[deployment.md](deployment.md) / [testing.md](testing.md). Still pending:
-`pair`'s announce/consent flow (mint grants manually with `grant` for now).
+discovery service — air-gapped deployments work without n0. **`pair`** issues a
+grant over an authenticated channel (`pair accept` ⇄ `pair request`), binding the
+ticket's subject to the requester's iroh-authenticated node id. See
+[deployment.md](deployment.md) / [testing.md](testing.md). The original
+binary/flow design below is now fully realized.
 
 ## The binaries
 

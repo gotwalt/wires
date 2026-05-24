@@ -4902,6 +4902,8 @@ dependencies = [
  "library",
  "pkcs8 0.11.0-rc.11",
  "proptest",
+ "serde",
+ "serde_json",
  "signature 3.0.0-rc.10",
  "tokio",
 ]
