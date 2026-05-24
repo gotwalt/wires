@@ -8,5 +8,9 @@ name = "relay"
 path = "main.rs"
 
 [dependencies]
-library = { workspace = true }
 clap = { workspace = true }
+iroh-relay = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
