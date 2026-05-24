@@ -190,16 +190,28 @@ Nodes point at it with `--relay-url http://wires-relay.<ns>.svc:3340`.
   and keyless, so failover is just "restart it" — but don't round-robin two
   peers onto different replicas.
 
-## Reachability and discovery (current limits)
+## Reachability and discovery
 
-- The relay provides **rendezvous, holepunch, and relayed transport**. Address
-  **discovery** (resolving a node id → its current addresses) still uses iroh's
-  default n0 DNS (pkarr), so nodes currently need outbound reach to that even
-  with `--relay-url`. A fully air-gapped discovery story (e.g. carrying a direct
-  address in the ticket, or relay-served discovery) is not wired yet — track it
-  before relying on a no-internet deployment.
-- `pair` is not implemented; mint grants out-of-band with `wires grant` and
-  distribute tickets (e.g. as a `Secret` in the agent's namespace).
+Three layers, most-self-contained first:
+
+- **Direct addresses in the ticket** (air-gapped friendly). At grant time,
+  embed where the responder is reachable:
+  `wires grant … --addr <ip:port> [--addr …] [--relay-url <url>]`. The dialer
+  uses these directly and needs **no discovery service**. The responder logs its
+  node id and bound sockets at startup; combine that port with the responder's
+  reachable IP / Service / LoadBalancer address. These hints are unsigned —
+  iroh still authenticates the peer to the target's key, so a wrong address only
+  fails to connect.
+- **Self-hosted relay** (`--relay-url`) for NAT traversal / holepunch between
+  egress-only peers that can both reach the relay.
+- **n0 DNS discovery** (the default) when a ticket carries no `--addr`: resolves
+  a node id → addresses, but needs outbound internet.
+
+For a private / air-gapped cluster, prefer **`--addr` + a self-hosted relay**
+so nothing depends on n0.
+
+`pair` is not implemented; mint grants out-of-band with `wires grant` and
+distribute tickets (e.g. as a `Secret` in the agent's namespace).
 
 ## Provisioning and rotation
 
