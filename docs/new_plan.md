@@ -27,6 +27,18 @@ Decisions taken:
 
 Net result: **two binaries.**
 
+## Realized layout
+
+Built as flat top-level Bazel packages in one Cargo workspace (hand-written
+`# gazelle:ignore` BUILD files; see `CLAUDE.md`):
+
+- **`//library`** — the `library` crate; holds the shared mechanics below.
+- **`//src:wires`** — the multi-call `wires` binary.
+- **`//relay:wires-relay`** — the self-hosted relay binary.
+
+Build & test are Bazel-only (`bazel build //...`, `bazel test //...`); the
+`Cargo.lock` that `rules_rs` reads is refreshed with the Bazel-vendored cargo.
+
 ## The binaries
 
 ### 1. `wires` — the entire layer surface (multi-call)
@@ -85,15 +97,21 @@ with no inbound reachability can still connect.
 
 ### Shared mechanics (conceptual, used by every subcommand)
 
-- **identity** — see **Cryptographic material** below.
-- **grant / capability** — root-signed, bound to a subject node key,
-  scoped, TTL'd, and carrying an **algorithm id** so the responder knows
-  how to verify it; non-transferability enforced because the subject must
-  equal the iroh-authenticated peer on the connection.
-- **session protocol** — a session ALPN, a handshake frame that presents
-  and verifies the grant, then a tagged stdio framing
-  (`stdin | stdout | stderr | exit`) over the iroh bi-stream.
-- **policy** — TTL + CRL/allowlist checked at accept time.
+These live in the `//library` crate as modules; ✅ = implemented, ⏳ = pending.
+
+- ✅ **identity** (`library/identity.rs`) — Ed25519 `NodeIdentity`; `NodeId` /
+  `Signature` newtypes; generate / sign / verify. See **Cryptographic material** below.
+- ✅ **grant / capability** (`library/grant.rs`) — root-signed, bound to a subject
+  node key, scoped, TTL'd, and carrying an **algorithm id** so the responder knows
+  how to verify it; non-transferability enforced because the subject must equal the
+  iroh-authenticated peer on the connection.
+- ✅ **ticket** (`library/ticket.rs`) — the base64 `CapabilityTicket` (target + scope
+  + grant) that *is* the address a dialer presents.
+- ✅ **policy** (`library/policy.rs`) — TTL + CRL/allowlist checked at accept time.
+- ⏳ **session protocol** (`library/session.rs`) — a session ALPN, a handshake frame
+  that presents and verifies the grant, then a tagged stdio framing
+  (`stdin | stdout | stderr | exit`) over the iroh bi-stream. (Types only so far; the
+  framing + transport land with the iroh phase.)
 
 ### Cryptographic material
 
