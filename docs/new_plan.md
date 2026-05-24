@@ -51,10 +51,11 @@ on-disk keystore** (`wires/keystore.rs`: `$WIRES_HOME` / XDG / `~/.config/wires`
 commands need no secrets on the command line. The **`//relay`** binary runs a
 self-hosted `iroh-relay` server (nodes point at it with `--relay-url`), and both
 binaries ship **distroless OCI images** (`//wires:image`, `//relay:image`) that
-cross-compile to Linux. See [deployment.md](deployment.md) / [testing.md](testing.md).
-Still pending: `pair`'s announce/consent flow, and fully self-contained
-(air-gapped) address discovery — `--relay-url` covers rendezvous, but node-id →
-address resolution still uses n0 DNS.
+cross-compile to Linux. Tickets can carry **direct socket addresses + a relay
+URL** (`wires grant --addr/--relay-url`), so a dialer reaches the target with no
+discovery service — air-gapped deployments work without n0. See
+[deployment.md](deployment.md) / [testing.md](testing.md). Still pending:
+`pair`'s announce/consent flow (mint grants manually with `grant` for now).
 
 ## The binaries
 

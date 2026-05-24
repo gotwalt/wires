@@ -44,7 +44,7 @@ manual recipes see [docs/testing.md](docs/testing.md).
 | Command          | Role                      | What it does                                                                 |
 | ---------------- | ------------------------- | ---------------------------------------------------------------------------- |
 | `wires keygen`   | trust-root / host setup   | Generate (or re-derive) a **node key** and **root key**; print, and `--save-*` to the keystore |
-| `wires grant`    | trust root (the human)    | Root-sign a capability and emit a base64 **ticket** (the address)            |
+| `wires grant`    | trust root (the human)    | Root-sign a capability and emit a base64 **ticket**, optionally with `--addr`/`--relay-url` hints |
 | `wires revoke`   | trust root / responder    | Add a subject to the CRL (keystore `crl.json` by default) and print it       |
 | `wires serve`    | responder (the tool host) | Verify a dialer's grant, exec a command, bridge its stdio over the session   |
 | `wires connect`  | dialer (the agent side)   | Dial a ticket's target, present the grant, pipe local stdin/stdout/stderr    |
@@ -216,11 +216,31 @@ To manage the CRL elsewhere (e.g. a Kubernetes ConfigMap mounted at a path),
 <path>` reads it; `--crl-json <literal>` is a one-shot transform printed to
 stdout.
 
-### Notes and current limits
+### Reachability: relays and direct addresses
 
-- **Reachability:** `connect` resolves the target purely by node id via iroh's
-  default (n0) discovery + relays, so both ends need outbound egress to a relay
-  for NAT traversal. A self-hosted `//relay` is not implemented yet.
+By default `connect` resolves the target by node id via iroh's n0 discovery +
+relays (needs outbound internet). Two ways to avoid that:
+
+- **Self-hosted relay** — run the `relay` binary and point both ends at it with
+  `--relay-url http://relay-host:3340` (see [docs/deployment.md](docs/deployment.md)).
+- **Direct addresses in the ticket** — at grant time, embed where the responder
+  is reachable so the dialer needs *no* discovery at all:
+
+  ```bash
+  bazel run -q //wires -- grant --subject "$AGENT_ID" --target "$SERVER_ID" \
+    --scope tools.rg --ttl 3600 \
+    --addr 198.51.100.7:4433 --relay-url http://relay-host:3340
+  ```
+
+  `--addr` (repeatable) and `--relay-url` are baked into the ticket. They are
+  *unsigned hints*: iroh still authenticates the peer to the target's key, so a
+  wrong address can only fail to connect, never impersonate. `serve` logs its
+  node id and bound sockets at startup to help you fill these in.
+
+### Other current limits
+
+- **Discovery without hints:** a hintless ticket (no `--addr`) still relies on
+  n0 DNS to resolve a node id to an address.
 - **Scope is exact-match:** a grant's scope must equal the responder's `--scope`.
 - **`pair` is a stub:** mint grants directly with `grant` for now.
 

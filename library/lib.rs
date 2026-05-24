@@ -25,7 +25,7 @@
 //! let grant = Grant::mint(&root, agent.node_id(), scope.clone(), i64::MAX).unwrap();
 //!
 //! // Pack it into a ticket (the address the dialer presents) and round-trip it.
-//! let ticket = CapabilityTicket { target, scope, grant: grant.clone() };
+//! let ticket = CapabilityTicket::new(target, scope, grant.clone());
 //! let decoded = CapabilityTicket::decode(&ticket.encode().unwrap()).unwrap();
 //! assert_eq!(decoded, ticket);
 //!

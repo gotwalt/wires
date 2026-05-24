@@ -10,6 +10,7 @@ mod keystore;
 mod transport;
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -78,6 +79,13 @@ struct GrantArgs {
     /// Scope name to authorize (e.g. `tools.rg`).
     #[arg(long)]
     scope: String,
+    /// Direct socket address where the target is reachable, embedded in the
+    /// ticket so the dialer needs no discovery. Repeatable.
+    #[arg(long = "addr")]
+    addr: Vec<SocketAddr>,
+    /// Relay URL to reach the target through, embedded in the ticket.
+    #[arg(long)]
+    relay_url: Option<String>,
     /// Seconds from now until expiry (mutually exclusive with `--not-after`).
     #[arg(long, conflicts_with = "not_after")]
     ttl: Option<i64>,
@@ -198,17 +206,17 @@ fn run_grant(
     target: &str,
     scope: &str,
     not_after: i64,
+    addrs: Vec<SocketAddr>,
+    relay_url: Option<String>,
 ) -> library::Result<String> {
     let subject = NodeId::from_hex(subject)?;
     let target = NodeId::from_hex(target)?;
     let scope = Scope::new(scope);
     let grant = Grant::mint(root, subject, scope.clone(), not_after)?;
-    let ticket = CapabilityTicket {
-        target,
-        scope,
-        grant,
-    };
-    ticket.encode()
+    CapabilityTicket::new(target, scope, grant)
+        .with_addrs(addrs)
+        .with_relay_url(relay_url)
+        .encode()
 }
 
 /// Insert `subject` into `existing` (or a fresh CRL when `None`/blank) and
@@ -268,12 +276,15 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
 async fn connect_cmd(a: ConnectArgs) -> anyhow::Result<i32> {
     let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
     let ticket = CapabilityTicket::decode(&a.ticket)?;
-    let target = transport::endpoint_addr(&ticket.target)?;
+    // `--relay-url` overrides the ticket's relay hint; both feed the dialed
+    // address and the endpoint's relay configuration.
+    let relay = a.relay_url.or(ticket.relay_url);
+    let target = transport::endpoint_addr(&ticket.target, &ticket.addrs, relay.as_deref())?;
     transport::connect_io(
         node,
         target,
         ticket.grant,
-        a.relay_url.as_deref(),
+        relay.as_deref(),
         tokio::io::stdin(),
         tokio::io::stdout(),
         tokio::io::stderr(),
@@ -323,7 +334,16 @@ fn cli_admin(command: Command) -> Result<String, String> {
             let root = keystore::root_identity(a.root_seed.as_deref(), a.root_seed_file.as_deref())
                 .map_err(stringify)?;
             let not_after = resolve_not_after(a.ttl, a.not_after, now_unix())?;
-            run_grant(&root, &a.subject, &a.target, &a.scope, not_after).map_err(stringify)
+            run_grant(
+                &root,
+                &a.subject,
+                &a.target,
+                &a.scope,
+                not_after,
+                a.addr,
+                a.relay_url,
+            )
+            .map_err(stringify)
         }
         Command::Revoke(a) => run_revoke_cmd(a).map_err(stringify),
         Command::Pair => Err("pair: not implemented (network phase)".to_string()),
@@ -424,7 +444,7 @@ mod tests {
             let subject = NodeIdentity::from_seed(ss).node_id();
             let target = NodeIdentity::from_seed(ts).node_id();
 
-            let text = run_grant(&root, &subject.hex(), &target.hex(), &scope, not_after).unwrap();
+            let text = run_grant(&root, &subject.hex(), &target.hex(), &scope, not_after, Vec::new(), None).unwrap();
             let ticket = CapabilityTicket::decode(&text).unwrap();
 
             prop_assert_eq!(ticket.target, target);
@@ -438,7 +458,18 @@ mod tests {
     fn grant_rejects_bad_subject() {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let target = NodeIdentity::from_seed([2u8; 32]).node_id();
-        assert!(run_grant(&root, "nothex", &target.hex(), "tools.rg", 1).is_err());
+        assert!(
+            run_grant(
+                &root,
+                "nothex",
+                &target.hex(),
+                "tools.rg",
+                1,
+                Vec::new(),
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -45,10 +45,25 @@ pub fn to_node_id(id: &EndpointId) -> NodeId {
     NodeId::from_bytes(*id.as_bytes())
 }
 
-/// The bare [`EndpointAddr`] for a node id (no direct IP; resolved via
-/// discovery / relays at dial time).
-pub fn endpoint_addr(node: &NodeId) -> Result<EndpointAddr> {
-    Ok(EndpointAddr::from(endpoint_id(node)?))
+/// Build the [`EndpointAddr`] to dial `node`, attaching any direct socket
+/// addresses and relay URL from the ticket. With no hints this is a bare addr
+/// resolved via discovery at dial time; with hints the dialer needs no
+/// discovery service. The address is only a hint — iroh still authenticates the
+/// peer to `node`'s key.
+pub fn endpoint_addr(
+    node: &NodeId,
+    addrs: &[std::net::SocketAddr],
+    relay_url: Option<&str>,
+) -> Result<EndpointAddr> {
+    let mut addr = EndpointAddr::new(endpoint_id(node)?);
+    for sock in addrs {
+        addr = addr.with_ip_addr(*sock);
+    }
+    if let Some(url) = relay_url {
+        let relay: iroh::RelayUrl = url.parse().with_context(|| format!("relay url {url}"))?;
+        addr = addr.with_relay_url(relay);
+    }
+    Ok(addr)
 }
 
 /// Bind an iroh endpoint for `identity` on the session ALPN, using the n0
@@ -154,6 +169,11 @@ pub async fn serve_on(
     crl: Crl,
     command: Vec<String>,
 ) -> Result<()> {
+    eprintln!(
+        "wires serve: node {} on {:?}",
+        to_node_id(&endpoint.id()).hex(),
+        endpoint.bound_sockets()
+    );
     let scope = Arc::new(scope);
     let crl = Arc::new(crl);
     let command = Arc::new(command);
@@ -353,12 +373,14 @@ mod tests {
             .unwrap()
     }
 
-    /// The endpoint's address with wildcard binds rewritten to localhost, so a
-    /// dialer can reach it directly without discovery.
-    fn local_endpoint_addr(endpoint: &Endpoint) -> EndpointAddr {
-        let mut addr = EndpointAddr::new(endpoint.id());
-        for sock in endpoint.bound_sockets() {
-            let local = match sock {
+    /// The endpoint's bound sockets with wildcard binds rewritten to localhost,
+    /// for use as a ticket's direct `addrs` (so a dialer reaches it without
+    /// discovery).
+    fn localhost_socks(endpoint: &Endpoint) -> Vec<std::net::SocketAddr> {
+        endpoint
+            .bound_sockets()
+            .into_iter()
+            .map(|sock| match sock {
                 std::net::SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
                     std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
                         std::net::Ipv4Addr::LOCALHOST,
@@ -374,10 +396,8 @@ mod tests {
                     ))
                 }
                 other => other,
-            };
-            addr = addr.with_ip_addr(local);
-        }
-        addr
+            })
+            .collect()
     }
 
     #[test]
@@ -424,7 +444,9 @@ mod tests {
         let grant = Grant::mint(&root, client.node_id(), scope.clone(), i64::MAX).unwrap();
 
         let server_ep = test_endpoint(&server).await;
-        let addr = local_endpoint_addr(&server_ep);
+        // Dial via the production `endpoint_addr` using direct socket hints —
+        // the same path a ticket's `addrs` take, no discovery involved.
+        let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
         let srv = tokio::spawn(serve_on(
             server_ep,
             root.node_id(),
@@ -464,7 +486,9 @@ mod tests {
         let grant = Grant::mint(&evil_root, client.node_id(), scope.clone(), i64::MAX).unwrap();
 
         let server_ep = test_endpoint(&server).await;
-        let addr = local_endpoint_addr(&server_ep);
+        // Dial via the production `endpoint_addr` using direct socket hints —
+        // the same path a ticket's `addrs` take, no discovery involved.
+        let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
         let srv = tokio::spawn(serve_on(
             server_ep,
             trusted_root.node_id(),
