@@ -1,6 +1,6 @@
 # gazelle:ignore
 
-load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 
 # The main multi-call binary: //wires
 rust_binary(
@@ -12,4 +12,10 @@ rust_binary(
         "//library",
         "@crates//:clap",
     ],
+)
+
+rust_test(
+    name = "wires_test",
+    crate = ":wires",
+    deps = ["@crates//:proptest"],
 )

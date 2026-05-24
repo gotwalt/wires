@@ -35,6 +35,23 @@ impl NodeId {
         hex::encode(self.0)
     }
 
+    /// Parse a `NodeId` from its lowercase-hex rendering (the inverse of
+    /// [`hex`](Self::hex)). Used to accept node ids as CLI input.
+    ///
+    /// Returns [`Error::BadHex`] for non-hex text and [`Error::BadKeyLength`]
+    /// when the decoded byte count is not 32.
+    ///
+    /// ```
+    /// use library::{NodeId, NodeIdentity};
+    /// let id = NodeIdentity::from_seed([5u8; 32]).node_id();
+    /// assert_eq!(NodeId::from_hex(&id.hex()).unwrap(), id);
+    /// ```
+    pub fn from_hex(s: &str) -> Result<NodeId> {
+        let bytes = hex::decode(s)?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| Error::BadKeyLength)?;
+        Ok(NodeId(arr))
+    }
+
     /// Verify that `signature` over `message` was produced by the key this
     /// `NodeId` names.
     ///
@@ -103,9 +120,38 @@ impl NodeIdentity {
         }
     }
 
+    /// Reconstruct an identity from the lowercase-hex of its 32-byte seed (the
+    /// inverse of `hex::encode(seed_bytes())`). Used to accept key seeds as CLI
+    /// input.
+    ///
+    /// Returns [`Error::BadHex`] for non-hex text and [`Error::BadKeyLength`]
+    /// when the decoded byte count is not 32.
+    ///
+    /// ```
+    /// use library::NodeIdentity;
+    /// let id = NodeIdentity::from_seed_hex(&"01".repeat(32)).unwrap();
+    /// assert_eq!(id.seed_bytes(), [1u8; 32]);
+    /// ```
+    pub fn from_seed_hex(s: &str) -> Result<NodeIdentity> {
+        let bytes = hex::decode(s)?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| Error::BadKeyLength)?;
+        Ok(Self::from_seed(arr))
+    }
+
     /// The 32-byte Ed25519 seed (for persistence). Round-trips with `from_seed`.
     pub fn seed_bytes(&self) -> [u8; 32] {
         self.signing_key.to_bytes()
+    }
+
+    /// Lowercase-hex of the 32-byte seed (the inverse of [`from_seed_hex`](Self::from_seed_hex)).
+    ///
+    /// ```
+    /// use library::NodeIdentity;
+    /// let id = NodeIdentity::from_seed([1u8; 32]);
+    /// assert_eq!(NodeIdentity::from_seed_hex(&id.seed_hex()).unwrap().seed_bytes(), id.seed_bytes());
+    /// ```
+    pub fn seed_hex(&self) -> String {
+        hex::encode(self.seed_bytes())
     }
 
     /// This identity's public `NodeId` (its address).
@@ -196,6 +242,33 @@ mod tests {
             let back: NodeId = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(id, back);
         }
+
+        /// `NodeId::from_hex` inverts `NodeId::hex`.
+        #[test]
+        fn node_id_from_hex_roundtrips(s in seed()) {
+            let id = NodeIdentity::from_seed(s).node_id();
+            prop_assert_eq!(NodeId::from_hex(&id.hex()).unwrap(), id);
+        }
+
+        /// `NodeIdentity::from_seed_hex` inverts `hex::encode(seed_bytes())`.
+        #[test]
+        fn from_seed_hex_roundtrips(s in seed()) {
+            let id = NodeIdentity::from_seed_hex(&hex::encode(s)).unwrap();
+            prop_assert_eq!(id.seed_bytes(), s);
+        }
+    }
+
+    #[test]
+    fn from_hex_rejects_wrong_length() {
+        assert!(matches!(NodeId::from_hex("00"), Err(Error::BadKeyLength)));
+    }
+
+    #[test]
+    fn from_hex_rejects_non_hex() {
+        assert!(matches!(
+            NodeId::from_hex(&"z".repeat(64)),
+            Err(Error::BadHex(_))
+        ));
     }
 
     #[test]

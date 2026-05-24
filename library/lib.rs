@@ -7,7 +7,7 @@
 //! - [`grant`] — root-signed, identity-bound, scoped, expiring [`Grant`]s.
 //! - [`ticket`] — the base64 [`CapabilityTicket`] a dialer presents (the address).
 //! - [`policy`] — [`check_accept`], the responder's accept-time gate.
-//! - [`session`] — session frame types (transport lands in a later phase).
+//! - [`session`] — the [`Frame`] wire codec (the async transport lands later).
 //! - [`error`] — the crate [`Error`] and [`Result`].
 //!
 //! # Example: mint a capability, pack a ticket, accept it
@@ -46,6 +46,7 @@ pub use error::{Error, Result};
 pub use grant::{AlgorithmId, Grant, Scope};
 pub use identity::{NodeId, NodeIdentity, Signature};
 pub use policy::{Crl, check_accept};
+pub use session::{Chunk, Frame};
 pub use ticket::CapabilityTicket;
 
 /// Crate version, surfaced so the binaries have something concrete to call

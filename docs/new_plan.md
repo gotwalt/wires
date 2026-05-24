@@ -39,11 +39,13 @@ Built as flat top-level Bazel packages in one Cargo workspace (hand-written
 Build & test are Bazel-only (`bazel build //...`, `bazel test //...`); the
 `Cargo.lock` that `rules_rs` reads is refreshed with the Bazel-vendored cargo.
 
-**Status.** The `//library` core (identity, grant, ticket, policy) is
-implemented and tested (property + unit + doctests). The `//wires`
-subcommands and `//relay` are still scaffolding stubs that print
-"not implemented" — wiring them to `//library`, the `session` protocol, and the
-iroh transport are the upcoming phases.
+**Status.** The `//library` core (identity, grant, ticket, policy, and the
+`session` frame codec) is implemented and tested (property + unit + doctests).
+The `//wires` offline admin subcommands — `keygen`, `grant`, `revoke` — are
+wired to `//library` (keys/CRL move through flags / env / stdin↔stdout; no
+on-disk state yet). `serve`, `connect`, `pair`, and `//relay` remain stubs
+pending the iroh transport phase (async session framing over the iroh
+bi-stream + the relay loop).
 
 ## The binaries
 
@@ -103,7 +105,8 @@ with no inbound reachability can still connect.
 
 ### Shared mechanics (conceptual, used by every subcommand)
 
-These live in the `//library` crate as modules; ✅ = implemented, ⏳ = pending.
+These live in the `//library` crate as modules; ✅ = implemented, ◐ = partial,
+⏳ = pending.
 
 - ✅ **identity** (`library/identity.rs`) — Ed25519 `NodeIdentity`; `NodeId` /
   `Signature` newtypes; generate / sign / verify. See **Cryptographic material** below.
@@ -114,10 +117,12 @@ These live in the `//library` crate as modules; ✅ = implemented, ⏳ = pending
 - ✅ **ticket** (`library/ticket.rs`) — the base64 `CapabilityTicket` (target + scope
   + grant) that *is* the address a dialer presents.
 - ✅ **policy** (`library/policy.rs`) — TTL + CRL/allowlist checked at accept time.
-- ⏳ **session protocol** (`library/session.rs`) — a session ALPN, a handshake frame
-  that presents and verifies the grant, then a tagged stdio framing
-  (`stdin | stdout | stderr | exit`) over the iroh bi-stream. (Types only so far; the
-  framing + transport land with the iroh phase.)
+- ◐ **session protocol** (`library/session.rs`) — the `Frame`
+  (`handshake | stdin | stdout | stderr | exit`) **wire codec is done**: a pure,
+  async-free, length-prefixed `encode`/`decode` (with a `Chunk` newtype for stdio
+  payloads). Still pending: the session ALPN, the async read/write that pumps frames
+  over the iroh bi-stream, and grant verification on the handshake — all with the iroh
+  phase.
 
 ### Cryptographic material
 
