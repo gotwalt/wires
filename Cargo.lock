@@ -916,7 +916,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wires-relay"
+name = "relay"
 version = "0.1.0"
 dependencies = [
  "clap",

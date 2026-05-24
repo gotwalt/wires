@@ -34,7 +34,7 @@ Built as flat top-level Bazel packages in one Cargo workspace (hand-written
 
 - **`//library`** — the `library` crate; holds the shared mechanics below.
 - **`//src:wires`** — the multi-call `wires` binary.
-- **`//relay:wires-relay`** — the self-hosted relay binary.
+- **`//relay`** — the self-hosted relay binary.
 
 Build & test are Bazel-only (`bazel build //...`, `bazel test //...`); the
 `Cargo.lock` that `rules_rs` reads is refreshed with the Bazel-vendored cargo.
@@ -94,7 +94,7 @@ One executable, role-distinct subcommands.
 as its child; the MCP client is configured to use `wires connect` as its
 stdio server command. wires carries the JSON-RPC bytes opaquely.
 
-### 2. `wires-relay` — self-hosted rendezvous
+### 2. `relay` — self-hosted rendezvous
 
 A thin wrapper over iroh's relay server, for private / air-gapped networks
 that don't want to depend on n0's public relays. Provides holepunch
@@ -168,7 +168,7 @@ sequenceDiagram
     participant Op as Operator (root key)
     participant Ag as Agent
     participant C as wires connect (client box)
-    participant R as wires-relay
+    participant R as relay
     participant S as wires serve (server box)
     participant Ch as rg (child binary)
 
@@ -197,7 +197,7 @@ What the binaries are doing: `wires grant` is the trust root minting an
 address. `wires connect` is a dumb pipe that turns "a local stdio program"
 into "a dialed capability." `wires serve` is the gatekeeper-plus-exec: it
 proves the caller is allowed (using the node identity iroh already
-authenticated), runs the real binary, and shuttles bytes. `wires-relay`
+authenticated), runs the real binary, and shuttles bytes. `relay`
 only helps the two endpoints find a path; it sees ciphertext.
 
 ### Flow B — MCP-over-wires: a local MCP server, run remotely, unchanged

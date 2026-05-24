@@ -1,10 +1,10 @@
 [package]
-name = "wires-relay"
+name = "relay"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "wires-relay"
+name = "relay"
 path = "main.rs"
 
 [dependencies]

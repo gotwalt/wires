@@ -70,6 +70,34 @@ Crate resolution is driven by `rules_rs`, which **reads** the root `Cargo.toml` 
 `Cargo.lock` (it does not regenerate the lock — hence step 2). External crates are
 exposed under `@crates//:`. Build and test exclusively via `bazel build` / `bazel test`.
 
+## Development Approach
+
+Work type-driven, in this strict order (don't skip ahead):
+
+1. **Types + signatures first.** Define every type and public function with a
+   compiling stub body (`todo!("…")`). Give each public module, type, field, and
+   function a correct `///` docstring up front.
+2. **Tests before implementations.** Write the full suite against those
+   signatures — **property tests (`proptest`)** *and* example/known-answer
+   **unit tests** — so it compiles and fails (red).
+3. **Implement** until `bazel test //...` is green.
+4. **Doctests.** Add runnable `///` examples on the public API (a `rust_doc_test`
+   target runs them under `bazel test`).
+5. **Readability pass.** Re-assess module split, names, and re-exports; refactor.
+
+Conventions:
+- **Newtypes, not primitives.** No public API exposes a bare `[u8; N]` or
+  `Vec<u8>`; wrap identifiers/blobs in newtypes (e.g. `NodeId`, `Signature`) so
+  the type system tells them apart.
+- **Docstrings everywhere**, with doctests wherever an example is feasible.
+- **One concept per module**; `lib.rs` re-exports the public surface; keep
+  internals `pub(crate)`/private (e.g. the `codec` module, `GrantBody`).
+- **Bazel-only**: build, test, run, and doctests go through `bazel` (see Adding
+  Dependencies for the one lockfile-only cargo touchpoint). Run `make lint`
+  (clippy + shellcheck) and `format` (rustfmt) before committing.
+
+Each `//library` module is a worked example of the above.
+
 ## Containers (OCI)
 
 Rust binaries are packaged into distroless OCI images via the `rust_image` macro
@@ -90,7 +118,7 @@ make push-containers   # runs every oci_push target
   lint/format, and `gazelle` (Starlark BUILD maintenance).
 - `Cargo.toml` / `Cargo.lock` — the Rust workspace. Members are flat top-level
   packages: `//library` (the `library` crate), `//src` (the `wires` binary),
-  and `//relay` (the `wires-relay` binary). Each package holds its `*.rs` files
+  and `//relay` (the `relay` binary). Each package holds its `*.rs` files
   directly (no `src/` subdir), a `BUILD`, and a `Cargo.toml`.
 - `tools/` — Build tooling: formatters (`tools/format/`), linters (`tools/lint/`),
   OCI image macro (`tools/oci/`), platform definitions (`tools/platforms/`),

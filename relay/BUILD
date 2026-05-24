@@ -2,9 +2,9 @@
 
 load("@rules_rust//rust:defs.bzl", "rust_binary")
 
-# The self-hosted rendezvous relay: //relay:wires-relay
+# The self-hosted rendezvous relay: //relay:relay
 rust_binary(
-    name = "wires-relay",
+    name = "relay",
     srcs = glob(["*.rs"]),
     edition = "2024",
     visibility = ["//visibility:public"],
