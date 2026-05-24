@@ -42,13 +42,14 @@ Build & test are Bazel-only (`bazel build //...`, `bazel test //...`); the
 **Status.** The `//library` core (identity, grant, ticket, policy, and the
 `session` frame codec) is implemented and tested (property + unit + doctests).
 The `//wires` offline admin subcommands — `keygen`, `grant`, `revoke` — are
-wired to `//library` (keys/CRL move through flags / env / stdin↔stdout; no
-on-disk state yet). **`serve` and `connect` are implemented over the iroh
+wired to `//library`. **`serve` and `connect` are implemented over the iroh
 transport** (`wires/transport.rs`): bind/dial by node id, the grant handshake,
 and the byte-for-byte stdio bridge, covered by a real loopback QUIC test
-(dial → handshake → exec `cat` → echo → exit). Still pending: `pair`'s
-announce/consent flow, the `//relay` loop, on-disk key/CRL persistence, and the
-`rust_image` OCI targets.
+(dial → handshake → exec `cat` → echo → exit). Keys and the CRL **persist in an
+on-disk keystore** (`wires/keystore.rs`: `$WIRES_HOME` / XDG / `~/.config/wires`,
+`0600` seed files), resolved flag → env → `--…-file` → keystore, so the network
+commands need no secrets on the command line. Still pending: `pair`'s
+announce/consent flow, the `//relay` loop, and the `rust_image` OCI targets.
 
 ## The binaries
 
