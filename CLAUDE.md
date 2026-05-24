@@ -4,11 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-"Wires" — a Bazel monorepo built with **Rust** only. The repo was scaffolded
-from Aspect CLI's kitchen-sink preset, then pruned down to the toolchains that
-support building/linting/formatting Rust and shell, plus `rules_oci` for
-cutting Docker images from Rust binaries. (Go, Python, JavaScript/TypeScript,
-Java, C++ as a first-class language, and protobuf were removed.)
+"Wires" — a Bazel monorepo written in **Rust**. The toolchains are scoped to
+building / linting / formatting Rust and shell, plus `rules_oci` for cutting
+distroless Docker images from the Rust binaries.
 
 The session-layer thesis, the binary layout, and full usage live in
 `README.md`. Deployment and testing patterns live in `docs/deployment.md` and
