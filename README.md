@@ -4,6 +4,34 @@
 # How is that possible? See https://gist.github.com/bwoods/1c25cb7723a06a076c2152a2781d4d49
 set -o errexit -o nounset -o xtrace
 alias ~~~=":<<'~~~sh'";:<<'~~~sh'
+## What wires is — securely networked tools for agents
+
+**Wires reframes how you harness an agent.** Today you give an agent power by
+*co-locating* tools and secrets next to it: install binaries in its sandbox,
+mount API keys into its environment, spawn MCP servers as local child
+processes, hand it a shell. The agent can do whatever happens to sit beside it —
+which couples capability to location and spills secrets into the agent's box.
+
+Wires makes a tool a **capability you dial**, not a binary you bundle. Any
+program's stdin/stdout becomes an authenticated, capability-scoped, revocable
+network endpoint. Harnessing an agent becomes *granting it capabilities*: you
+issue a non-transferable, human-rooted grant to reach one specific tool —
+wherever that tool actually runs (a VPC, another machine, an air-gapped
+enclave) — and the agent holds only that grant, never the tool's secrets. The
+tool's database password or API key stays with the tool; revoke the grant and
+the agent loses the tool, with no key rotation and nothing to re-image.
+
+Because the session's native payload *is* stdio (and, one frame up, MCP),
+"networking a tool" and "speaking to a tool" become the same act — your existing
+CLIs and MCP servers work unmodified. It is `ssh user@host -- tool`, but the
+address is a capability instead of an IP, the credential is an identity-bound
+grant instead of a copyable key, and the far end is one scoped tool instead of a
+whole shell.
+
+→ Jump to [Usage](#usage) to run it; read the
+[full thesis](#wires-as-a-session-layer-stdio-and-mcp-over-a-capability-addressed-network)
+for the layer model and where it sits in the stack.
+
 ## Setup dev environment
 
 First, we recommend you setup a Bazel-based developer environment with homebrew.
@@ -370,8 +398,8 @@ of that, the session layer is:
 > may dial what.**
 
 A tool call is a **session**, not a broadcast: open → stream
-stdin/stdout/stderr → close. No persisted log, no gossip, no retention is
-required for that to be true.
+stdin/stdout/stderr → close. It needs no persisted log, message broker, or
+retention — just a direct, encrypted stream between the two endpoints.
 
 ```mermaid
 flowchart LR
@@ -393,7 +421,7 @@ identity, and the capability that says which channel/peer may drive it.
 ## Reference protocol 1: stdio-over-wires
 
 A stdio tool node maps process I/O directly onto the session. The frames
-(this is the *reference convention*, not a substrate rule):
+(this is the *reference convention*, not part of the layer):
 
 
 | Direction     | Process concept | Frame                                                          |
@@ -402,11 +430,6 @@ A stdio tool node maps process I/O directly onto the session. The frames
 | tool → agent | stdout          | `tool.stdout` (chunk)                                          |
 | tool → agent | stderr          | `tool.stderr` (chunk)                                          |
 | tool → agent | exit code       | `tool.exit` (code)                                             |
-
-Every frame still carries the substrate's mandatory human-readable
-summary alongside its structured body, so a consumer that has never seen
-this tool's schema can still act on plain text ("exited 0", "3 matches")
-and graduate to parsing structure once it has learned the surface.
 
 Three interaction shapes fall out of the same session primitive:
 
