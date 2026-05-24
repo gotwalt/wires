@@ -1,15 +1,16 @@
 //! `wires` — the multi-call CLI for the session layer.
 //!
-//! This phase implements the offline trust-root/admin subcommands —
-//! [`keygen`](run_keygen), [`grant`](run_grant), [`revoke`](run_revoke) — as
-//! pure functions over `library`, moving key material and the CRL through flags
-//! / env / stdin↔stdout (no on-disk state yet). The network subcommands
-//! (`serve`, `connect`, `pair`) remain stubs until the iroh transport phase.
+//! Offline admin (`keygen` / `grant` / `revoke`) is built from pure functions
+//! over `library`; the network commands (`serve` / `connect`) run on the iroh
+//! transport in [`transport`]. Secrets and the CRL resolve through
+//! flag → env → `--…-file` → on-disk keystore (see [`keystore`]), so the
+//! network commands work without seeds on the command line.
 
+mod keystore;
 mod transport;
 
 use std::fmt;
-use std::io::Read;
+use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use library::{CapabilityTicket, Crl, Grant, NodeId, NodeIdentity, Scope};
@@ -28,7 +29,7 @@ enum Command {
     Keygen(KeygenArgs),
     /// Mint a capability grant and print its base64 ticket.
     Grant(GrantArgs),
-    /// Add a subject to a CRL (read on stdin / `--crl-json`) and print the result.
+    /// Add a subject to the CRL (keystore by default) and print the result.
     Revoke(RevokeArgs),
     /// Operator side of pairing.
     Pair,
@@ -38,7 +39,7 @@ enum Command {
     Connect(ConnectArgs),
 }
 
-/// `keygen` arguments: optional seeds to re-derive instead of generating.
+/// `keygen` arguments: optional seeds to re-derive, and whether to persist.
 #[derive(Args)]
 struct KeygenArgs {
     /// Hex 32-byte seed to use for the node key (else a random one is generated).
@@ -47,14 +48,27 @@ struct KeygenArgs {
     /// Hex 32-byte seed to use for the root key (else a random one is generated).
     #[arg(long)]
     root_seed: Option<String>,
+    /// Also write the node key to the keystore (`node.seed`).
+    #[arg(long)]
+    save_node: bool,
+    /// Also write the root key to the keystore (`root.seed`).
+    #[arg(long)]
+    save_root: bool,
+    /// Overwrite existing keystore files when saving.
+    #[arg(long)]
+    force: bool,
 }
 
 /// `grant` arguments: the root key, who/what/where, and an expiry.
 #[derive(Args)]
 struct GrantArgs {
-    /// Hex 32-byte seed of the root (signing) key. Falls back to `$WIRES_ROOT_SEED`.
+    /// Hex 32-byte seed of the root (signing) key. Falls back to `$WIRES_ROOT_SEED`,
+    /// then `--root-seed-file`, then the keystore (`root.seed`).
     #[arg(long)]
     root_seed: Option<String>,
+    /// Read the root key seed (hex) from this file instead of the keystore.
+    #[arg(long)]
+    root_seed_file: Option<PathBuf>,
     /// Hex node id of the subject this grant authorizes.
     #[arg(long)]
     subject: String,
@@ -72,32 +86,46 @@ struct GrantArgs {
     not_after: Option<i64>,
 }
 
-/// `revoke` arguments: the subject to revoke and the CRL to extend.
+/// `revoke` arguments: the subject to revoke and which CRL to extend.
+///
+/// With neither `--crl-json` nor `--crl-file`, the keystore's `crl.json` is read
+/// and rewritten in place. `--crl-file` is read and rewritten in place;
+/// `--crl-json` is a one-shot transform printed to stdout.
 #[derive(Args)]
 struct RevokeArgs {
     /// Hex node id of the subject to revoke.
     #[arg(long)]
     subject: String,
-    /// Existing CRL JSON; if omitted, read from stdin (empty stdin = empty CRL).
-    #[arg(long)]
+    /// Start from this CRL JSON literal and print the result (no file written).
+    #[arg(long, conflicts_with = "crl_file")]
     crl_json: Option<String>,
+    /// Read/update this CRL file in place (absent file = empty CRL).
+    #[arg(long)]
+    crl_file: Option<PathBuf>,
 }
 
 /// `serve` arguments: the responder key, what it trusts, and the child to exec.
 #[derive(Args)]
 struct ServeArgs {
-    /// Hex 32-byte seed of this responder's node key. Falls back to `$WIRES_NODE_SEED`.
+    /// Hex 32-byte seed of this responder's node key. Falls back to
+    /// `$WIRES_NODE_SEED`, then `--node-seed-file`, then the keystore (`node.seed`).
     #[arg(long)]
     node_seed: Option<String>,
+    /// Read the node key seed (hex) from this file instead of the keystore.
+    #[arg(long)]
+    node_seed_file: Option<PathBuf>,
     /// Hex node id of the trusted fabric root whose grants are honored.
     #[arg(long)]
     trust_root: String,
     /// The scope this responder serves; a grant's scope must match exactly.
     #[arg(long)]
     scope: String,
-    /// Optional CRL JSON of revoked subjects.
-    #[arg(long)]
+    /// CRL JSON literal of revoked subjects (overrides `--crl-file` / keystore).
+    #[arg(long, conflicts_with = "crl_file")]
     crl_json: Option<String>,
+    /// Read the CRL from this file (else the keystore's `crl.json`, else empty).
+    #[arg(long)]
+    crl_file: Option<PathBuf>,
     /// The command (program + args) to exec per session, after `--`.
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -106,9 +134,13 @@ struct ServeArgs {
 /// `connect` arguments: the dialer key and the capability ticket to present.
 #[derive(Args)]
 struct ConnectArgs {
-    /// Hex 32-byte seed of this dialer's node key. Falls back to `$WIRES_NODE_SEED`.
+    /// Hex 32-byte seed of this dialer's node key. Falls back to
+    /// `$WIRES_NODE_SEED`, then `--node-seed-file`, then the keystore (`node.seed`).
     #[arg(long)]
     node_seed: Option<String>,
+    /// Read the node key seed (hex) from this file instead of the keystore.
+    #[arg(long)]
+    node_seed_file: Option<PathBuf>,
     /// The base64 capability ticket (target + scope + grant).
     #[arg(long)]
     ticket: String,
@@ -155,17 +187,16 @@ fn run_keygen(node_seed: Option<&str>, root_seed: Option<&str>) -> library::Resu
 /// Mint a grant binding `subject` to `scope` until `not_after`, then pack it
 /// into a [`CapabilityTicket`] for `target` and return its base64 text.
 fn run_grant(
-    root_seed: &str,
+    root: &NodeIdentity,
     subject: &str,
     target: &str,
     scope: &str,
     not_after: i64,
 ) -> library::Result<String> {
-    let root = NodeIdentity::from_seed_hex(root_seed)?;
     let subject = NodeId::from_hex(subject)?;
     let target = NodeId::from_hex(target)?;
     let scope = Scope::new(scope);
-    let grant = Grant::mint(&root, subject, scope.clone(), not_after)?;
+    let grant = Grant::mint(root, subject, scope.clone(), not_after)?;
     let ticket = CapabilityTicket {
         target,
         scope,
@@ -209,37 +240,19 @@ pub(crate) fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Read all of stdin into a string (used when `revoke` has no `--crl-json`).
-fn read_stdin() -> Result<String, String> {
-    let mut s = String::new();
-    std::io::stdin()
-        .read_to_string(&mut s)
-        .map_err(|e| format!("reading stdin: {e}"))?;
-    Ok(s)
-}
-
-/// Resolve a node-key seed from the flag or `$WIRES_NODE_SEED`.
-fn node_seed(flag: Option<String>) -> Result<String, String> {
-    flag.or_else(|| std::env::var("WIRES_NODE_SEED").ok())
-        .ok_or_else(|| "missing --node-seed (or $WIRES_NODE_SEED)".into())
-}
-
 /// `serve`: bind, verify grants against the trust root, exec + bridge.
 async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
-    let node = NodeIdentity::from_seed_hex(&node_seed(a.node_seed).map_err(anyhow::Error::msg)?)?;
+    let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
     let trust_root = NodeId::from_hex(&a.trust_root)?;
     let scope = Scope::new(a.scope);
-    let crl = match a.crl_json {
-        Some(s) => Crl::from_json(&s)?,
-        None => Crl::new(),
-    };
+    let crl = keystore::load_crl(a.crl_json.as_deref(), a.crl_file.as_deref())?;
     transport::serve(node, trust_root, scope, crl, a.command).await
 }
 
 /// `connect`: dial the ticket's target, present its grant, bridge local stdio.
 /// Returns the child's exit code.
 async fn connect_cmd(a: ConnectArgs) -> anyhow::Result<i32> {
-    let node = NodeIdentity::from_seed_hex(&node_seed(a.node_seed).map_err(anyhow::Error::msg)?)?;
+    let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
     let ticket = CapabilityTicket::decode(&a.ticket)?;
     let target = transport::endpoint_addr(&ticket.target)?;
     transport::connect_io(
@@ -290,28 +303,56 @@ fn main() {
 /// Run an offline admin subcommand, returning its stdout text.
 fn cli_admin(command: Command) -> Result<String, String> {
     match command {
-        Command::Keygen(a) => run_keygen(a.node_seed.as_deref(), a.root_seed.as_deref())
-            .map(|o| o.to_string())
-            .map_err(|e| e.to_string()),
+        Command::Keygen(a) => run_keygen_cmd(a).map_err(stringify),
         Command::Grant(a) => {
-            let root_seed = a
-                .root_seed
-                .or_else(|| std::env::var("WIRES_ROOT_SEED").ok())
-                .ok_or_else(|| "missing --root-seed (or $WIRES_ROOT_SEED)".to_string())?;
+            let root = keystore::root_identity(a.root_seed.as_deref(), a.root_seed_file.as_deref())
+                .map_err(stringify)?;
             let not_after = resolve_not_after(a.ttl, a.not_after, now_unix())?;
-            run_grant(&root_seed, &a.subject, &a.target, &a.scope, not_after)
-                .map_err(|e| e.to_string())
+            run_grant(&root, &a.subject, &a.target, &a.scope, not_after).map_err(stringify)
         }
-        Command::Revoke(a) => {
-            let existing = match a.crl_json {
-                Some(s) => s,
-                None => read_stdin()?,
-            };
-            run_revoke(Some(&existing), &a.subject).map_err(|e| e.to_string())
-        }
+        Command::Revoke(a) => run_revoke_cmd(a).map_err(stringify),
         Command::Pair => Err("pair: not implemented (network phase)".to_string()),
         Command::Serve(_) | Command::Connect(_) => unreachable!("handled in main"),
     }
+}
+
+/// Render any error as a string for the admin-command error channel.
+fn stringify<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
+}
+
+/// `keygen`: generate/re-derive keys, optionally persist them, and print.
+fn run_keygen_cmd(a: KeygenArgs) -> anyhow::Result<String> {
+    let out = run_keygen(a.node_seed.as_deref(), a.root_seed.as_deref())?;
+    if a.save_node || a.save_root {
+        let ks = keystore::Keystore::resolve()?;
+        if a.save_node {
+            ks.save_node(&NodeIdentity::from_seed_hex(&out.node_seed)?, a.force)?;
+        }
+        if a.save_root {
+            ks.save_root(&NodeIdentity::from_seed_hex(&out.root_seed)?, a.force)?;
+        }
+    }
+    Ok(out.to_string())
+}
+
+/// `revoke`: insert `subject` into the chosen CRL and persist it in place
+/// (keystore by default, or `--crl-file`), or transform a `--crl-json` literal.
+fn run_revoke_cmd(a: RevokeArgs) -> anyhow::Result<String> {
+    if let Some(json) = a.crl_json.as_deref() {
+        return Ok(run_revoke(Some(json), &a.subject)?);
+    }
+    if let Some(path) = a.crl_file.as_deref() {
+        let start = keystore::read_crl_text(path)?;
+        let out = run_revoke(start.as_deref(), &a.subject)?;
+        keystore::write_crl_text(path, &out)?;
+        return Ok(out);
+    }
+    let ks = keystore::Keystore::resolve()?;
+    let start = ks.read_crl_json()?;
+    let out = run_revoke(start.as_deref(), &a.subject)?;
+    ks.save_crl_json(&out)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -368,7 +409,7 @@ mod tests {
             let subject = NodeIdentity::from_seed(ss).node_id();
             let target = NodeIdentity::from_seed(ts).node_id();
 
-            let text = run_grant(&root.seed_hex(), &subject.hex(), &target.hex(), &scope, not_after).unwrap();
+            let text = run_grant(&root, &subject.hex(), &target.hex(), &scope, not_after).unwrap();
             let ticket = CapabilityTicket::decode(&text).unwrap();
 
             prop_assert_eq!(ticket.target, target);
@@ -382,7 +423,7 @@ mod tests {
     fn grant_rejects_bad_subject() {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let target = NodeIdentity::from_seed([2u8; 32]).node_id();
-        assert!(run_grant(&root.seed_hex(), "nothex", &target.hex(), "tools.rg", 1).is_err());
+        assert!(run_grant(&root, "nothex", &target.hex(), "tools.rg", 1).is_err());
     }
 
     #[test]
