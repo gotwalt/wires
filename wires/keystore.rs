@@ -232,24 +232,34 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 }
 
 /// Write a secret file with mode `0600`, refusing to clobber unless `force`.
+///
+/// Uses `O_EXCL` (`create_new`) for the non-`force` path so the
+/// refuse-if-exists check and the create are one atomic syscall — no
+/// time-of-check/time-of-use gap and no following a planted symlink.
 fn write_secret(path: &Path, contents: &str, force: bool) -> Result<()> {
-    if !force && path.exists() {
-        bail!(
-            "{} already exists (pass --force to overwrite)",
-            path.display()
-        );
-    }
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true);
+    if force {
+        opts.create(true).truncate(true);
+    } else {
+        opts.create_new(true);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts
-        .open(path)
-        .with_context(|| format!("writing {}", path.display()))?;
+    let mut f = match opts.open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "{} already exists (pass --force to overwrite)",
+                path.display()
+            );
+        }
+        Err(e) => return Err(e).with_context(|| format!("writing {}", path.display())),
+    };
     writeln!(f, "{contents}").with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
@@ -334,6 +344,38 @@ mod tests {
     #[test]
     fn rejects_bad_inline_seed() {
         assert!(node_identity(Some("nothex"), None).is_err());
+    }
+
+    #[test]
+    fn load_crl_from_inline_then_file() {
+        let mut crl = Crl::new();
+        crl.insert(NodeIdentity::from_seed([4u8; 32]).node_id());
+        let json = crl.to_json().unwrap();
+
+        // Inline JSON wins and touches no filesystem.
+        assert_eq!(load_crl(Some(&json), None).unwrap(), crl);
+
+        // A file is read when present, treated as empty when absent.
+        let dir = temp_dir();
+        let path = dir.join("crl.json");
+        write_crl_text(&path, &json).unwrap();
+        assert_eq!(load_crl(None, Some(&path)).unwrap(), crl);
+        assert!(
+            load_crl(None, Some(&dir.join("absent.json")))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn crl_text_round_trips_and_is_none_when_absent() {
+        let path = temp_dir().join("c.json");
+        assert!(read_crl_text(&path).unwrap().is_none());
+        write_crl_text(&path, r#"{"revoked":[]}"#).unwrap();
+        assert_eq!(
+            read_crl_text(&path).unwrap().as_deref(),
+            Some(r#"{"revoked":[]}"#)
+        );
     }
 
     #[cfg(unix)]
