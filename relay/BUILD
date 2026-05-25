@@ -1,6 +1,6 @@
 # gazelle:ignore
 
-load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 load("//tools/oci:rust_image.bzl", "rust_image")
 
 # The self-hosted rendezvous relay: //relay:relay
@@ -17,6 +17,11 @@ rust_binary(
         "@crates//:tracing",
         "@crates//:tracing-subscriber",
     ],
+)
+
+rust_test(
+    name = "relay_test",
+    crate = ":relay",
 )
 
 # Distroless OCI image: //relay:image (and //relay:image.load for `docker load`).

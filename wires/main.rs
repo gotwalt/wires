@@ -656,4 +656,64 @@ mod tests {
         let out = run_revoke(Some("   "), &a.hex()).unwrap();
         assert_eq!(Crl::from_json(&out).unwrap().len(), 1);
     }
+
+    #[test]
+    fn revoke_cmd_crl_json_is_one_shot() {
+        // `--crl-json` is a pure transform: insert and print, write nothing.
+        let a = NodeIdentity::from_seed([7u8; 32]).node_id();
+        let out = run_revoke_cmd(RevokeArgs {
+            subject: a.hex(),
+            crl_json: Some(String::new()),
+            crl_file: None,
+        })
+        .unwrap();
+        assert!(Crl::from_json(&out).unwrap().contains(&a));
+    }
+
+    #[test]
+    fn revoke_cmd_crl_file_updates_in_place() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let base = std::env::var_os("TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = base.join(format!(
+            "wires-revtest-{}-{}.json",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let a = NodeIdentity::from_seed([7u8; 32]).node_id();
+        let b = NodeIdentity::from_seed([8u8; 32]).node_id();
+
+        // First revoke creates the file; the printed output equals what's on disk.
+        let out = run_revoke_cmd(RevokeArgs {
+            subject: a.hex(),
+            crl_json: None,
+            crl_file: Some(path.clone()),
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), out);
+        assert!(Crl::from_json(&out).unwrap().contains(&a));
+
+        // Re-revoking the same subject is idempotent; a new one grows the list.
+        let again = run_revoke_cmd(RevokeArgs {
+            subject: a.hex(),
+            crl_json: None,
+            crl_file: Some(path.clone()),
+        })
+        .unwrap();
+        assert_eq!(Crl::from_json(&again).unwrap().len(), 1);
+
+        let two = run_revoke_cmd(RevokeArgs {
+            subject: b.hex(),
+            crl_json: None,
+            crl_file: Some(path.clone()),
+        })
+        .unwrap();
+        assert_eq!(Crl::from_json(&two).unwrap().len(), 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -10,7 +10,7 @@
 //! length-prefixed bytes and [`Frame::decode`] parses one frame back out of a
 //! buffer (returning `None` until a whole frame has arrived, so a reader can
 //! split frames off a growing stream). The async glue that pumps these over an
-//! iroh stream lands with the transport phase.
+//! iroh stream lives in the `wires` binary's transport module.
 //!
 //! # Wire format
 //!

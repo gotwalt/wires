@@ -246,7 +246,9 @@ mod tests {
         let acc = tokio::spawn(pair_accept_on(op_ep, root, terms, |_, _| true, true));
 
         let req_ep = test_ep(&requester).await;
-        let text = pair_request_on(req_ep, op_addr, Scope::new("tools.rg"))
+        // The requester *asks* for a different scope; the operator's terms are
+        // authoritative, so the issued ticket carries the operator's scope.
+        let text = pair_request_on(req_ep, op_addr, Scope::new("tools.requested"))
             .await
             .unwrap();
         let ticket = CapabilityTicket::decode(&text).unwrap();
@@ -281,5 +283,14 @@ mod tests {
         let result = pair_request_on(req_ep, op_addr, Scope::new("tools.rg")).await;
         assert!(result.is_err());
         let _ = acc.await;
+    }
+
+    #[tokio::test]
+    async fn read_json_rejects_oversized_message() {
+        // A length prefix beyond MAX_MSG must be refused without allocating it.
+        let big = (MAX_MSG as u32 + 1).to_be_bytes();
+        let mut cur = std::io::Cursor::new(big.to_vec());
+        let parsed: Result<PairRequest> = read_json(&mut cur).await;
+        assert!(parsed.is_err());
     }
 }

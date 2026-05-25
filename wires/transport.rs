@@ -25,6 +25,15 @@ pub const ALPN: &[u8] = b"wires/session/0";
 /// Read buffer size for pumping child / local stdio into frames.
 const PUMP_BUF: usize = 64 * 1024;
 
+/// Largest frame body accepted off the wire. Bounds the allocation a peer can
+/// induce from the (untrusted) length prefix; generous versus the 64 KiB stdio
+/// chunk size, but far below "exhaust memory".
+const MAX_FRAME: usize = 16 * 1024 * 1024;
+
+/// How long a responder waits for the opening handshake before giving up, so a
+/// peer that connects but never speaks can't hold a session task open.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 // ---------------------------------------------------------------------------
 // Key bridge: our `library` identities <-> iroh's
 // ---------------------------------------------------------------------------
@@ -114,6 +123,11 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>> {
         Err(e) => return Err(e).context("reading frame length"),
     }
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME {
+        // Refuse before allocating: the length prefix is attacker-controlled
+        // (this runs even for the pre-auth handshake frame).
+        bail!("frame too large: {len} bytes (max {MAX_FRAME})");
+    }
     let mut full = Vec::with_capacity(4 + len);
     full.extend_from_slice(&len_buf);
     full.resize(4 + len, 0);
@@ -170,8 +184,8 @@ pub async fn serve(
 /// Accept connections on `endpoint`, verifying each caller's grant against
 /// `trust_root` / `scope` / `crl`, then exec `command` and bridge its stdio.
 ///
-/// One spawned task per connection; a rejected or failed connection logs to
-/// stderr and does not bring down the listener.
+/// One spawned task per connection; a rejected or failed connection is logged
+/// at `warn` (via `tracing`) and does not bring down the listener.
 pub async fn serve_on(
     endpoint: Endpoint,
     trust_root: NodeId,
@@ -201,7 +215,7 @@ pub async fn serve_on(
     Ok(())
 }
 
-/// Verify one inbound connection's handshake, then exec + bridge.
+/// Accept one inbound iroh connection, then run the session over its bi-stream.
 async fn handle_connection(
     incoming: iroh::endpoint::Incoming,
     trust_root: NodeId,
@@ -212,10 +226,40 @@ async fn handle_connection(
     let conn = incoming.await.context("accepting connection")?;
     let caller = to_node_id(&conn.remote_id());
     tracing::info!(caller = %caller.hex(), "connection accepted (iroh-authenticated)");
-    let (mut send, mut recv) = conn.accept_bi().await.context("accepting bi-stream")?;
+    let (send, recv) = conn.accept_bi().await.context("accepting bi-stream")?;
 
-    // The first frame must be the grant-bearing handshake.
-    let grant = match read_frame(&mut recv).await? {
+    serve_session(send, recv, caller, trust_root, scope, crl, command).await?;
+
+    // Wait for the dialer to read the final frames and close, so we don't tear
+    // the connection down mid-flush. Bounded so a vanished dialer can't pin us.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
+    Ok(())
+}
+
+/// The responder half of a session over an established, already-authenticated
+/// bi-stream: read and verify the handshake against `caller`, then exec
+/// `command` and bridge its stdio. Transport-agnostic (tested over in-memory
+/// pipes); `caller` must already be authenticated by whoever supplies the
+/// streams.
+async fn serve_session<S, R>(
+    send: S,
+    mut recv: R,
+    caller: NodeId,
+    trust_root: NodeId,
+    scope: &Scope,
+    crl: &Crl,
+    command: &[String],
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    // The first frame must be the grant-bearing handshake (bounded by a timeout
+    // so a silent peer can't hold the task open).
+    let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut recv))
+        .await
+        .context("timed out waiting for handshake")??;
+    let grant = match first {
         Some(Frame::Handshake { grant }) => grant,
         Some(_) => bail!("first frame was not a handshake"),
         None => bail!("connection closed before handshake"),
@@ -229,9 +273,9 @@ async fn handle_connection(
             scope.as_str()
         );
     }
+    tracing::info!(scope = %scope.as_str(), caller = %caller.hex(), "grant accepted");
 
     // Spawn the configured child with piped stdio.
-    tracing::info!(scope = %scope.as_str(), caller = %caller.hex(), "grant accepted");
     let (program, args) = command
         .split_first()
         .ok_or_else(|| anyhow!("empty serve command"))?;
@@ -250,10 +294,11 @@ async fn handle_connection(
     // A single writer task serializes all server->client frames.
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
     let writer = tokio::spawn(async move {
+        let mut send = send;
         while let Some(frame) = rx.recv().await {
             write_frame(&mut send, &frame).await?;
         }
-        let _ = send.finish();
+        send.shutdown().await.ok();
         Ok::<(), anyhow::Error>(())
     });
 
@@ -276,8 +321,8 @@ async fn handle_connection(
     let err_task = tokio::spawn(pump_reader(child_stderr, Frame::Stderr, tx.clone()));
 
     let status = child.wait().await.context("waiting for child")?;
-    let _ = out_task.await.context("stdout pump")?;
-    let _ = err_task.await.context("stderr pump")?;
+    out_task.await.context("stdout pump")??;
+    err_task.await.context("stderr pump")??;
     let _ = stdin_task.await;
 
     let code = status.code().unwrap_or(-1);
@@ -285,9 +330,6 @@ async fn handle_connection(
     tx.send(Frame::Exit(code)).await.ok();
     drop(tx);
     writer.await.context("writer task")??;
-    // Wait for the dialer to read the final frames and close, so we don't tear
-    // the connection down mid-flush. Bounded so a vanished dialer can't pin us.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
     Ok(())
 }
 
@@ -322,8 +364,8 @@ pub async fn connect_on<R, W, E>(
     target: EndpointAddr,
     grant: Grant,
     stdin: R,
-    mut stdout: W,
-    mut stderr: E,
+    stdout: W,
+    stderr: E,
 ) -> Result<i32>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -335,12 +377,42 @@ where
         .connect(target, ALPN)
         .await
         .map_err(|e| anyhow!("dialing target: {e}"))?;
-    let (mut send, mut recv) = conn.open_bi().await.context("opening bi-stream")?;
+    let (send, recv) = conn.open_bi().await.context("opening bi-stream")?;
     tracing::info!("session open; presenting grant and bridging stdio");
 
+    let result = dial_session(send, recv, grant, stdin, stdout, stderr).await;
+
+    // Close gracefully so our CONNECTION_CLOSE flushes (lets the responder's
+    // teardown return promptly, and avoids iroh's "dropped without close" warn),
+    // whether the session succeeded or failed.
+    endpoint.close().await;
+    result
+}
+
+/// The dialer half of a session over an established bi-stream: present `grant`,
+/// pump local stdin in, and stream the child's stdout/stderr out, returning its
+/// exit code. Transport-agnostic (tested over in-memory pipes).
+///
+/// Errors if the session ends **without** an [`Frame::Exit`] — a responder that
+/// closes mid-session is a failure, not a silent success.
+async fn dial_session<S, R, I, W, E>(
+    mut send: S,
+    mut recv: R,
+    grant: Grant,
+    stdin: I,
+    mut stdout: W,
+    mut stderr: E,
+) -> Result<i32>
+where
+    S: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin,
+    I: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
     write_frame(&mut send, &Frame::Handshake { grant }).await?;
 
-    // Local stdin -> Stdin frames, then finish the send direction (signals EOF).
+    // Local stdin -> Stdin frames, then shut down the send direction (EOF).
     let stdin_task = tokio::spawn(async move {
         let mut stdin = stdin;
         let mut buf = vec![0u8; PUMP_BUF];
@@ -355,18 +427,20 @@ where
             )
             .await?;
         }
-        let _ = send.finish();
+        send.shutdown().await.ok();
         Ok::<(), anyhow::Error>(())
     });
 
     // Server frames -> local stdout/stderr; Exit ends the session.
     let mut code = 0;
+    let mut saw_exit = false;
     loop {
         match read_frame(&mut recv).await? {
             Some(Frame::Stdout(chunk)) => stdout.write_all(chunk.as_bytes()).await?,
             Some(Frame::Stderr(chunk)) => stderr.write_all(chunk.as_bytes()).await?,
             Some(Frame::Exit(c)) => {
                 code = c;
+                saw_exit = true;
                 tracing::info!(code, "remote child exited");
                 break;
             }
@@ -377,9 +451,9 @@ where
     stdout.flush().await.ok();
     stderr.flush().await.ok();
     stdin_task.abort();
-    // Close gracefully so our CONNECTION_CLOSE flushes (lets the responder's
-    // teardown return promptly, and avoids iroh's "dropped without close" warn).
-    endpoint.close().await;
+    if !saw_exit {
+        bail!("session ended without an exit code (responder closed early?)");
+    }
     Ok(code)
 }
 
@@ -455,6 +529,131 @@ mod tests {
             got.push(f);
         }
         assert_eq!(got, frames);
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_oversized_length() {
+        // A length prefix claiming ~4 GiB must be refused without allocating it.
+        let mut cur = std::io::Cursor::new(vec![0xff, 0xff, 0xff, 0xff]);
+        assert!(read_frame(&mut cur).await.is_err());
+    }
+
+    /// Run a full session over two in-memory duplex pipes (no iroh): returns the
+    /// dialer's exit result plus captured stdout/stderr.
+    async fn run_session(
+        command: Vec<String>,
+        input: &[u8],
+        served_scope: &str,
+    ) -> (Result<i32>, Vec<u8>, Vec<u8>) {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let grant = Grant::mint(&root, caller, Scope::new(served_scope), i64::MAX).unwrap();
+
+        let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024); // dialer -> responder
+        let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024); // responder -> dialer
+
+        let scope = Scope::new(served_scope);
+        let root_id = root.node_id();
+        let srv = tokio::spawn(async move {
+            serve_session(s2c_w, c2s_r, caller, root_id, &scope, &Crl::new(), &command).await
+        });
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = dial_session(
+            c2s_w,
+            s2c_r,
+            grant,
+            std::io::Cursor::new(input.to_vec()),
+            &mut out,
+            &mut err,
+        )
+        .await;
+        let _ = srv.await;
+        (code, out, err)
+    }
+
+    /// Whether the responder rejects a handshake bearing `grant`.
+    async fn serve_rejects(
+        grant: Grant,
+        trust_root: NodeId,
+        served_scope: &str,
+        crl: Crl,
+        caller: NodeId,
+    ) -> bool {
+        let recv = std::io::Cursor::new(Frame::Handshake { grant }.encode().unwrap());
+        let send: Vec<u8> = Vec::new();
+        serve_session(
+            send,
+            recv,
+            caller,
+            trust_root,
+            &Scope::new(served_scope),
+            &crl,
+            &["cat".to_string()],
+        )
+        .await
+        .is_err()
+    }
+
+    #[tokio::test]
+    async fn session_echoes_stdin() {
+        let (code, out, err) =
+            run_session(vec!["cat".to_string()], b"hello over wires", "tools.cat").await;
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(out, b"hello over wires");
+        assert!(err.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_propagates_nonzero_exit() {
+        let (code, _out, _err) = run_session(
+            vec!["sh".into(), "-c".into(), "exit 3".into()],
+            b"",
+            "tools.sh",
+        )
+        .await;
+        assert_eq!(code.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn session_routes_stderr_separately() {
+        let (code, out, err) = run_session(
+            vec!["sh".into(), "-c".into(), "printf oops 1>&2".into()],
+            b"",
+            "tools.sh",
+        )
+        .await;
+        assert_eq!(code.unwrap(), 0);
+        assert!(out.is_empty());
+        assert_eq!(err, b"oops");
+    }
+
+    #[tokio::test]
+    async fn session_rejects_scope_mismatch() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let grant = Grant::mint(&root, caller, Scope::new("tools.b"), i64::MAX).unwrap();
+        assert!(serve_rejects(grant, root.node_id(), "tools.a", Crl::new(), caller).await);
+    }
+
+    #[tokio::test]
+    async fn session_rejects_expired_grant() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        // not_after = 0 (1970) is always in the past.
+        let grant = Grant::mint(&root, caller, Scope::new("s"), 0).unwrap();
+        assert!(serve_rejects(grant, root.node_id(), "s", Crl::new(), caller).await);
+    }
+
+    #[tokio::test]
+    async fn session_rejects_revoked_subject() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let grant = Grant::mint(&root, caller, Scope::new("s"), i64::MAX).unwrap();
+        let mut crl = Crl::new();
+        crl.insert(caller);
+        assert!(serve_rejects(grant, root.node_id(), "s", crl, caller).await);
     }
 
     /// Full Flow A over a real (loopback) iroh connection: dial → handshake →

@@ -23,6 +23,22 @@ struct Cli {
     listen: SocketAddr,
 }
 
+/// Build the plain-HTTP relay server config bound to `listen` (no TLS, open
+/// access). Factored out so it can be exercised in tests.
+fn server_config(listen: SocketAddr) -> ServerConfig<(), ()> {
+    ServerConfig {
+        relay: Some(RelayConfig {
+            http_bind_addr: listen,
+            tls: None,
+            limits: Limits::default(),
+            key_cache_capacity: None,
+            access: AccessConfig::Everyone,
+        }),
+        quic: None,
+        metrics_addr: None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -34,20 +50,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let relay = RelayConfig::<(), ()> {
-        http_bind_addr: cli.listen,
-        tls: None,
-        limits: Limits::default(),
-        key_cache_capacity: None,
-        access: AccessConfig::Everyone,
-    };
-    let config = ServerConfig::<(), ()> {
-        relay: Some(relay),
-        quic: None,
-        metrics_addr: None,
-    };
-
-    let mut server = Server::spawn(config)
+    let mut server = Server::spawn(server_config(cli.listen))
         .await
         .context("starting the relay server")?;
     match server.http_addr() {
@@ -61,4 +64,18 @@ async fn main() -> Result<()> {
         .await
         .context("relay supervisor task")??;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The config actually spawns a relay that binds and reports an address.
+    #[tokio::test]
+    async fn server_binds_and_reports_an_address() {
+        let listen = "127.0.0.1:0".parse().unwrap();
+        let mut server = Server::spawn(server_config(listen)).await.unwrap();
+        assert!(server.http_addr().is_some());
+        server.shutdown().await.ok();
+    }
 }

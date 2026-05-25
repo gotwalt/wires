@@ -38,8 +38,10 @@ impl Scope {
     }
 }
 
-/// Signature scheme a grant was signed with. The root key is pluggable; this
-/// tag tells a verifier how to check `sig`.
+/// Signature scheme a grant was signed with. Only [`Ed25519`](Self::Ed25519) is
+/// implemented today; the tag travels on the wire so a verifier can reject a
+/// grant signed with a scheme it does not support, and so other schemes can be
+/// added later without a format change.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlgorithmId {
