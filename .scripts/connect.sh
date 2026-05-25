@@ -29,20 +29,23 @@ if [ ! -x "$WIRES" ]; then
 	bazel build //wires >/dev/null 2>&1
 fi
 
-# Wait for serve-rg.sh to publish the ticket (and the agent key it provisioned).
+# Wait for serve-rg.sh to publish the ticket + membership (and the agent key it
+# provisioned).
 log "waiting for $DEMO/ticket (start ./.scripts/serve-rg.sh first) ..."
 for _ in $(seq 1 100); do
-	[ -s "$DEMO/ticket" ] && [ -f "$agt/node.seed" ] && break
+	[ -s "$DEMO/ticket" ] && [ -s "$DEMO/membership" ] && [ -f "$agt/node.seed" ] && break
 	sleep 0.2
 done
-if [ ! -s "$DEMO/ticket" ] || [ ! -f "$agt/node.seed" ]; then
-	log "no ticket yet — is ./.scripts/serve-rg.sh running?"
+if [ ! -s "$DEMO/ticket" ] || [ ! -s "$DEMO/membership" ] || [ ! -f "$agt/node.seed" ]; then
+	log "no ticket/membership yet — is ./.scripts/serve-rg.sh running?"
 	exit 1
 fi
 
 ticket="$(cat "$DEMO/ticket")"
+membership="$(cat "$DEMO/membership")"
 log "dialing the rg responder over wires (piping stdin through to rg) ..."
 
-# Use the agent's node key (the grant's subject). connect bridges our stdio.
+# Use the agent's node key (the membership's member and the grant's subject).
+# connect presents the membership + ticket and bridges our stdio.
 exec env WIRES_HOME="$agt" RUST_LOG="${RUST_LOG:-info}" \
-	"$WIRES" connect --ticket "$ticket"
+	"$WIRES" connect --ticket "$ticket" --membership "$membership"

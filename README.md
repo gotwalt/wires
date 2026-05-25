@@ -43,11 +43,16 @@ This will install `bazelisk` and `direnv` and add all the bazel-controlled tools
 ## Usage
 
 > **Status:** the design is implemented end-to-end — the `library` core
-> (identity, grants, tickets, policy, the session frame codec), the `wires`
-> multi-call binary (`keygen` / `grant` / `revoke` / `pair` / `serve` /
-> `connect`), a self-hosted `relay`, distroless OCI images, an on-disk keystore,
-> direct-address tickets, and offline revocation. What's left is convention, not
-> plumbing: a standardized stdio-frame vocabulary (see the thesis at the bottom).
+> (identity, grants, **fabric membership**, tickets, policy, the session frame
+> codec), the `wires` multi-call binary (`keygen` / `grant` / `member` /
+> `revoke` / `pair` / `serve` / `connect`), a self-hosted `relay`, distroless OCI
+> images, an on-disk keystore, direct-address tickets, and offline revocation.
+> Every session also proves **fabric membership** and hands the verified caller
+> identity to the served tool (see
+> [Fabric membership](#fabric-membership-identity-on-every-session) and the
+> companion [docs/fabric-vision.md](docs/fabric-vision.md)). What's left is
+> convention, not plumbing: a standardized stdio-frame vocabulary (see the thesis
+> at the bottom).
 
 ### Layout
 
@@ -101,9 +106,10 @@ printf 'a\nTODO: ship it\nb\n' | ./.scripts/connect.sh   # terminal 2 → "2:TOD
 | ---------------- | ------------------------- | ---------------------------------------------------------------------------- |
 | `wires keygen`   | trust-root / host setup   | Generate (or re-derive) a **node key** and **root key**; print, and `--save-*` to the keystore |
 | `wires grant`    | trust root (the human)    | Root-sign a capability and emit a base64 **ticket**, optionally with `--addr`/`--relay-url` hints |
+| `wires member`   | trust root (the human)    | Root-sign a **fabric membership** for a node and emit a base64 token (`--save` to the keystore) |
 | `wires revoke`   | trust root / responder    | Add a subject to the CRL (keystore `crl.json` by default) and print it       |
-| `wires serve`    | responder (the tool host) | Verify a dialer's grant, exec a command, bridge its stdio over the session   |
-| `wires connect`  | dialer (the agent side)   | Dial a ticket's target, present the grant, pipe local stdin/stdout/stderr    |
+| `wires serve`    | responder (the tool host) | Verify the dialer's **membership** (and, with `--scope`, a matching grant), exec a command, bridge its stdio — injecting the verified caller identity into the child |
+| `wires connect`  | dialer (the agent side)   | Present the **membership** and dial a `--ticket` (scoped) or `--target` (inclusion-only), piping local stdin/stdout/stderr |
 | `wires pair`     | operator ⇄ requester      | Issue a grant over the wire: `accept` (operator consents) ⇄ `request` (node)  |
 
 ### Two keys
@@ -136,11 +142,12 @@ shell history, and — for `serve`, which execs a child — the child's
 environment), keys and the CRL live in a **keystore** directory, resolved as
 `$WIRES_HOME`, else `$XDG_CONFIG_HOME/wires`, else `~/.config/wires`:
 
-| File        | Written by              | Read by                          |
-| ----------- | ----------------------- | -------------------------------- |
-| `node.seed` | `keygen --save-node`    | `serve` / `connect` node key     |
-| `root.seed` | `keygen --save-root`    | `grant` signing key              |
-| `crl.json`  | `revoke` (default)      | `serve` revocation check         |
+| File              | Written by           | Read by                          |
+| ----------------- | -------------------- | -------------------------------- |
+| `node.seed`       | `keygen --save-node` | `serve` / `connect` node key     |
+| `root.seed`       | `keygen --save-root` | `grant` / `member` signing key   |
+| `crl.json`        | `revoke` (default)   | `serve` revocation check         |
+| `membership.json` | `member --save`      | `connect` fabric membership      |
 
 `keygen --save-node` / `--save-root` write `0600` seed files (refusing to
 clobber unless `--force`). On the tool host you save the node key; on the
@@ -157,7 +164,9 @@ Every secret/CRL input resolves in the same order: **inline flag → environment
 variable → `--…-file <path>` → keystore**. So with the keystore populated, the
 commands below need no seed at all — and for Kubernetes you mount a `Secret` and
 point at it with `--node-seed-file /etc/wires/node.seed` (the `--…-file` forms
-exist for exactly that).
+exist for exactly that). The dialer's membership resolves the same way
+(`--membership <token>` → `$WIRES_MEMBERSHIP` → `--membership-file` →
+`membership.json`); unlike the seeds it is a *public* credential (mode `0644`).
 
 ### End-to-end: drive a remote `rg` over wires (Flow A)
 
@@ -177,12 +186,18 @@ bazel run -q //wires -- keygen --save-node   # on the tool host → note SERVER_
 bazel run -q //wires -- keygen --save-node   # on the agent box → note AGENT_ID
 ```
 
-**3. The human grants the agent the right to reach the tool**, binding the
-agent's node id to a scope, targeting the tool host, with a 1-hour TTL. The root
-key comes from the keystore, so no `--root-seed` is needed. This prints the
+**3. The human admits the agent to the fabric and grants it the tool.** First a
+**membership** — the agent's scope-independent fabric identity, required on every
+session (explained [below](#fabric-membership-identity-on-every-session)) — then
+a scoped **grant**. Both are root-signed; the root key comes from the keystore,
+so no `--root-seed` is needed. These print a membership **token** and a
 capability **ticket** (the address):
 
 ```bash
+MEMBERSHIP=$(bazel run -q //wires -- member \
+  --subject "$AGENT_ID" \
+  --ttl     3600)
+
 TICKET=$(bazel run -q //wires -- grant \
   --subject "$AGENT_ID" \
   --target  "$SERVER_ID" \
@@ -194,9 +209,9 @@ Use `--not-after <unix>` instead of `--ttl` for an absolute expiry.
 
 **4. The tool host serves the scope**, exec-scoped to one command, egress-only
 (no inbound port). The node key comes from the keystore. A session is accepted
-only if the caller's grant is signed by `--trust-root`, its subject equals the
-authenticated caller, its scope matches, its TTL is valid, and it is not in the
-CRL:
+only if the caller presents a valid **membership** (signed by `--trust-root`,
+for the authenticated caller, unexpired, not revoked) **and** a matching grant
+(same root, subject equals the caller, scope matches, valid TTL, not revoked):
 
 ```bash
 bazel run -q //wires -- serve \
@@ -208,19 +223,66 @@ bazel run -q //wires -- serve \
 Everything after `--` is the child command (program + args) exec'd per session.
 
 **5. The agent dials the capability** — exactly like running a local stdio
-program. Its node key comes from the keystore; its stdin is forwarded to the
-child; the child's stdout/stderr stream back; its exit code becomes `connect`'s:
+program. It presents its membership and the ticket; its node key comes from the
+keystore; its stdin is forwarded to the child; the child's stdout/stderr stream
+back; its exit code becomes `connect`'s:
 
 ```bash
-echo "search input" | bazel run -q //wires -- connect --ticket "$TICKET"
+echo "search input" | bazel run -q //wires -- connect \
+  --ticket "$TICKET" --membership "$MEMBERSHIP"
 ```
 
-The dialer's node key **must** be the grant's subject (`AGENT_ID`) — the
-responder checks that the iroh-authenticated caller equals the grant's subject,
-so a ticket cannot be used by anyone else. (If you'd rather not use the
-keystore, every command also accepts the seed inline via `--node-seed` /
+The dialer's node key **must** be both the membership's member and the grant's
+subject (`AGENT_ID`) — the responder checks that the iroh-authenticated caller
+equals each, so neither can be used by anyone else. The served `rg` is handed the
+verified caller in its environment (`WIRES_CALLER_NODE` / `WIRES_FABRIC_ROOT`),
+so a tool can authorize per caller with no extra round-trip. (If you'd rather not
+use the keystore, every command also accepts secrets inline via `--node-seed` /
 `--root-seed`, via `$WIRES_NODE_SEED` / `$WIRES_ROOT_SEED`, or from a file via
-`--node-seed-file` / `--root-seed-file`.)
+`--node-seed-file` / `--root-seed-file`; the membership likewise via
+`--membership` / `$WIRES_MEMBERSHIP` / `--membership-file`.)
+
+### Fabric membership: identity on every session
+
+A **grant** authorizes one scope; a **membership** answers a different question —
+*"is this node part of my fabric, and who is it?"* — independent of any tool. The
+human mints one per node with `wires member` (root-signed, non-transferable,
+offline-verifiable against the pinned `--trust-root`), and the dialer presents it
+on **every** session. A membership is a *public* credential: pass it inline with
+`--membership`, via `$WIRES_MEMBERSHIP` / `--membership-file`, or save it to the
+keystore as `membership.json`.
+
+```bash
+# The human (holds the root key) admits a node to the fabric:
+bazel run -q //wires -- member --subject "$AGENT_ID" --ttl 3600
+```
+
+It buys two things:
+
+- **Verified identity delivered to the tool, with no extra round-trip.** Once a
+  responder verifies the membership it injects the verified caller into the
+  child's environment — `WIRES_CALLER_NODE` (the iroh-authenticated peer),
+  `WIRES_FABRIC_ROOT` (the responder's own trust root), and
+  `WIRES_MEMBERSHIP_NOT_AFTER`. The served binary finally learns *who* is driving
+  it. These are server-derived, never a dialer claim, and any inherited `WIRES_*`
+  is scrubbed before the child starts.
+- **Inclusion-only responders.** Run `serve` *without* `--scope` (and with the
+  explicit `--allow-any-member`) and any fabric member may open a session; the
+  served binary authorizes from the injected identity. This is the enterprise-MCP
+  shape — one responder, per-caller authorization in the tool itself:
+
+  ```bash
+  bazel run -q //wires -- serve --trust-root "$ROOT_ID" --allow-any-member \
+    -- my-mcp-server --config /etc/my-mcp.toml
+  ```
+
+  Without `--scope` *and* without `--allow-any-member`, `serve` refuses to start:
+  execing for any member is an intentional authorization downgrade that must be
+  asked for.
+
+Membership is **slice 1** of a larger plan (committed rosters, then
+delegation/federation) — see [docs/fabric-vision.md](docs/fabric-vision.md) and
+[docs/provable-fabric-inclusion.md](docs/provable-fabric-inclusion.md).
 
 ### MCP over wires (Flow B) — no extra code
 
@@ -237,7 +299,8 @@ bazel run -q //wires -- serve \
 ```
 
 In the MCP client config, replace the local command with the dialer (its node
-key comes from the agent's keystore):
+key and membership come from the agent's keystore — drop `membership.json` there
+once and the args stay clean; otherwise add `--membership <token>`):
 
 ```json
 {
@@ -251,7 +314,11 @@ key comes from the agent's keystore):
 ```
 
 The client believes it launched a local stdio server; the server believes it was
-launched locally. Neither knows a network is involved.
+launched locally. Neither knows a network is involved. (For a multi-tenant MCP
+server, run the responder
+[inclusion-only](#fabric-membership-identity-on-every-session) with
+`--allow-any-member` and authorize each caller inside the server from
+`WIRES_CALLER_NODE`.)
 
 ### Pairing: issue a grant over the wire
 
@@ -535,9 +602,11 @@ sequenceDiagram
 These are properties of the session layer itself — the agent and the tool
 implement none of them:
 
-- **Identity on every session.** The session is authenticated to the
-  caller's key. The tool knows *which* endpoint is driving it,
-  cryptographically — never "whoever reached the socket."
+- **Identity on every session.** The session is authenticated to the caller's
+  key, and the caller proves **fabric membership**; the responder hands that
+  verified identity to the served tool as environment variables
+  (`WIRES_CALLER_NODE` / `WIRES_FABRIC_ROOT`). The tool knows *which* endpoint is
+  driving it, cryptographically — never "whoever reached the socket."
 - **Authorization is the address.** You can only dial a capability you
   hold. There is no separate auth layer in the tool; its access policy
   *is* who you granted the capability to.
