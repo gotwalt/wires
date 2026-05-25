@@ -83,13 +83,72 @@ universal base (and the whole of the first slice). The revocation strategy is a
 
 ### Committed roster — the personal-fabric strategy
 
-A single cold root, a small set (a human's handful of devices and agents).
-Publish a **signed, versioned Merkle snapshot** of the member set; inclusion
-becomes credential + Merkle path to the current commitment; revocation is
-re-signing the snapshot without the departed member. You also get **enumeration**
-for free — "show me everything in my fabric" — which is exactly what a personal
-fabric's owner wants. Re-signing on every change is cheap when the set is tens of
-members and the human is the signer.
+A single cold root, a small set (a human's handful of devices and agents). The
+root keeps a **versioned commitment** to the member set and re-signs it when
+membership changes; a verifier checks a member's inclusion against the latest
+commitment, and revocation is just re-signing without the departed member. The
+root also gets **enumeration** — "show me everything in my fabric."
+
+The naïve framing — "publish the signed member list" — hides two questions worth
+separating.
+
+**What is committed, and is it confidential?** A flat signed list leaks the whole
+membership to anyone who can verify it — the org-chart leak, now at personal
+scale. So the commitment is a **Merkle root**: the head is a 32-byte hash that
+reveals nothing, a member proves inclusion with a path without exposing the
+others, and the *full* set lives only in a blob **sealed to a fabric epoch key**
+(the blind-host + epoch-key model `main` already built), readable by members and
+the root alone. Merkle earns its place here for **confidentiality**, not compact
+proofs — a clean split between a **public signed head** (leaks nothing) and an
+**encrypted full-set blob** (confidential).
+
+**Where does the head live, and how do verifiers learn it?** This is the part an
+earlier draft hand-waved. The answer leans on iroh intrinsics plus one
+reintroduced piece of infrastructure — three jobs, one primitive each:
+
+- **iroh-blobs — the immutable content.** A roster snapshot is a content-addressed
+  blob; its BLAKE3 hash *is* its name and self-verifies its bytes, so any party can
+  serve it and integrity is independent of who did (and the bytes are sealed, so a
+  server learns nothing).
+- **iroh-gossip — the mutable pointer.** Content-addressing has a chicken-and-egg:
+  fetching "the latest roster" needs its hash, but the hash changes each version.
+  So the fabric has a gossip topic (derived from the fabric id) onto which the root
+  publishes a tiny signed head — `(fabric, version, blob_hash, not_after, sig)`.
+  Nodes adopt the highest version they see; gossip does propagation, blobs do
+  content + integrity.
+- **A blind always-on fabric node — persistence + availability.** The root is
+  cold/occasional, so *something* must stay awake to hold the latest head and pin
+  the blobs when the root and most members are offline. This node holds **no keys**:
+  it can only relay and persist root-signed heads and sealed, content-addressed
+  blobs — it cannot forge a roster or read one. It is the spiritual return of
+  `main`'s `wires-host`, scoped to signed/sealed persistence rather than
+  message-log retention, reusing the same blindness contract (persist what you
+  cannot forge or read; everything served is independently verifiable).
+
+The headline capability stays intact: a verifier never hits the node in the hot
+path. It syncs the current head from gossip in the background and verifies a
+caller's presented inclusion proof **offline** against the head it holds.
+
+This shape is not new crypto. It is **Certificate Transparency's signed tree head
++ gossip + a log mirror**: the roster is a transparency log of membership, the head
+is an STH, gossip is the anti-split-view mechanism, the blind node is a mirror.
+
+**The residual risk is freshness, not forgery.** The node is zero-trust for
+integrity — it cannot fabricate membership or roster state — but it *can* withhold
+an update or serve a stale-but-validly-signed head to suppress a revocation. The
+mitigations are CT's: monotonic versions (a verifier who has seen version *V*
+rejects *V−1*), a `not_after` in the signed head so stale heads self-expire, and
+gossip's multi-path propagation making an eclipse hard. A bounded, well-understood
+price for the persistence convenience.
+
+**Reintroducing a node is a deliberate choice, not a regression.** Removing the
+always-on host was necessary to find wires' first principles — to prove the core
+(offline-verifiable, non-transferable credentials) needs no server. Having proven
+that, we add a *blind* node back for one specific job — persistence and revocation
+freshness — eyes open, rather than sliding into a trusted server. Two
+sub-questions stay open: whether this is the **same box** as the `relay` (one
+always-on host doing both rendezvous and blind persistence) or a separate role,
+and whether it is **per-fabric or multi-fabric** (as `wires-host` was).
 
 ### Delegation / federation — the enterprise strategy
 
@@ -138,7 +197,7 @@ that **knows who it is talking to** before it does any work.
 | Slice | Adds | Revocation | Status |
 |---|---|---|---|
 | **1 — Provable inclusion** | Root-signed `Membership` credential; verified caller identity passed to the served child via env vars | CRL + short TTL | **Specified** ([spec](./provable-fabric-inclusion.md)) |
-| **2 — Personal fabric** | Pairing issues memberships; committed roster (signed Merkle snapshot) + enumeration | Re-signed roster | Deferred |
+| **2 — Personal fabric** | Pairing issues memberships; committed roster (Merkle head via gossip, sealed full set via blobs, blind persistence node) + enumeration | Re-signed roster head | Deferred |
 | **3 — Federation** | `authority_chain` delegation; federated identity claims (org, role, email) | Short-TTL renewal | Deferred |
 
 Each slice is buildable on its own and leaves the credential wire-format
