@@ -17,17 +17,25 @@
 //! Each frame is a 4-byte big-endian length `N` followed by `N` payload bytes.
 //! The payload is a 1-byte tag then a tag-specific body:
 //!
-//! | tag  | variant     | body                              |
-//! |------|-------------|-----------------------------------|
-//! | `0`  | `Handshake` | canonical-JSON of the [`Grant`]   |
-//! | `1`  | `Stdin`     | raw chunk bytes                   |
-//! | `2`  | `Stdout`    | raw chunk bytes                   |
-//! | `3`  | `Stderr`    | raw chunk bytes                   |
-//! | `4`  | `Exit`      | 4-byte big-endian `i32`           |
+//! | tag  | variant     | body                                       |
+//! |------|-------------|--------------------------------------------|
+//! | `0`  | `Handshake` | canonical-JSON of the handshake envelope   |
+//! | `1`  | `Stdin`     | raw chunk bytes                            |
+//! | `2`  | `Stdout`    | raw chunk bytes                            |
+//! | `3`  | `Stderr`    | raw chunk bytes                            |
+//! | `4`  | `Exit`      | 4-byte big-endian `i32`                    |
+//!
+//! The handshake envelope is the canonical JSON of a [`Membership`] plus an
+//! optional [`Grant`]. The envelope itself is *unsigned* — the signed objects
+//! are the membership and grant nested inside, each with its own fixed signed
+//! body — so omitting the absent grant via `skip_serializing_if` is safe here.
+
+use serde::{Deserialize, Serialize};
 
 use crate::codec::canonical_bytes;
 use crate::error::{Error, Result};
 use crate::grant::Grant;
+use crate::membership::Membership;
 
 const TAG_HANDSHAKE: u8 = 0;
 const TAG_STDIN: u8 = 1;
@@ -64,13 +72,35 @@ impl Chunk {
     }
 }
 
+/// The unsigned wire envelope for a [`Frame::Handshake`]: a mandatory
+/// membership and an optional scope grant, serialized as one canonical-JSON
+/// blob. `skip_serializing_if` is safe here precisely because this struct is
+/// *not* signed — the membership and grant it carries are each signed
+/// independently over their own fixed bodies.
+#[derive(Serialize, Deserialize)]
+struct HandshakeBody {
+    membership: Membership,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grant: Option<Grant>,
+}
+
 /// One framed message on a capability-scoped session.
+///
+/// The `Handshake` variant (membership + optional grant) is much larger than the
+/// stdio variants, but it is sent exactly once per session while the small
+/// chunk frames dominate; boxing it would only add indirection to the
+/// public API for no meaningful gain on the hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Frame {
-    /// Opening frame: the dialer presents its grant for verification.
+    /// Opening frame: the dialer presents its fabric membership (always) and,
+    /// for a scoped session, the matching grant.
     Handshake {
-        /// The grant proving the dialer may open this session.
-        grant: Grant,
+        /// The membership proving the dialer belongs to the fabric.
+        membership: Membership,
+        /// The grant authorizing a specific scope, when one is being requested.
+        /// `None` for an inclusion-only session.
+        grant: Option<Grant>,
     },
     /// A chunk of the child process's stdin.
     Stdin(Chunk),
@@ -98,9 +128,13 @@ impl Frame {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut payload = Vec::new();
         match self {
-            Frame::Handshake { grant } => {
+            Frame::Handshake { membership, grant } => {
                 payload.push(TAG_HANDSHAKE);
-                payload.extend_from_slice(&canonical_bytes(grant)?);
+                let body = HandshakeBody {
+                    membership: membership.clone(),
+                    grant: grant.clone(),
+                };
+                payload.extend_from_slice(&canonical_bytes(&body)?);
             }
             Frame::Stdin(chunk) => {
                 payload.push(TAG_STDIN);
@@ -146,8 +180,11 @@ impl Frame {
         let (&tag, body) = payload.split_first().ok_or(Error::BadFrame)?;
         let frame = match tag {
             TAG_HANDSHAKE => {
-                let grant = serde_json::from_slice(body).map_err(Error::Decode)?;
-                Frame::Handshake { grant }
+                let hs: HandshakeBody = serde_json::from_slice(body).map_err(Error::Decode)?;
+                Frame::Handshake {
+                    membership: hs.membership,
+                    grant: hs.grant,
+                }
             }
             TAG_STDIN => Frame::Stdin(Chunk::from_bytes(body.to_vec())),
             TAG_STDOUT => Frame::Stdout(Chunk::from_bytes(body.to_vec())),
@@ -177,15 +214,20 @@ mod tests {
         proptest::collection::vec(any::<u8>(), 0..256)
     }
 
-    /// An arbitrary frame of any variant.
+    /// An arbitrary frame of any variant. The handshake covers both a scoped
+    /// session (grant present) and an inclusion-only one (grant absent).
     fn frame() -> impl Strategy<Value = Frame> {
         prop_oneof![
-            (seed(), seed(), "[a-z.]{1,16}", any::<i64>()).prop_map(|(rs, ss, sc, na)| {
-                let root = NodeIdentity::from_seed(rs);
-                let subject = NodeIdentity::from_seed(ss).node_id();
-                let grant = Grant::mint(&root, subject, Scope::new(sc), na).unwrap();
-                Frame::Handshake { grant }
-            }),
+            (seed(), seed(), "[a-z.]{1,16}", any::<i64>(), any::<bool>()).prop_map(
+                |(rs, ss, sc, na, with_grant)| {
+                    let root = NodeIdentity::from_seed(rs);
+                    let member = NodeIdentity::from_seed(ss).node_id();
+                    let membership = Membership::mint(&root, member, 0, na).unwrap();
+                    let grant =
+                        with_grant.then(|| Grant::mint(&root, member, Scope::new(sc), na).unwrap());
+                    Frame::Handshake { membership, grant }
+                }
+            ),
             bytes().prop_map(|b| Frame::Stdin(Chunk::from_bytes(b))),
             bytes().prop_map(|b| Frame::Stdout(Chunk::from_bytes(b))),
             bytes().prop_map(|b| Frame::Stderr(Chunk::from_bytes(b))),

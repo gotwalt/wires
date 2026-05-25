@@ -6,15 +6,18 @@
 //!
 //! - `node.seed` / `root.seed`: hex-encoded 32-byte Ed25519 seeds (mode `0600`).
 //! - `crl.json`: the responder's revocation list.
+//! - `membership.json`: the dialer's fabric membership token (mode `0644` — a
+//!   *public* signed credential, not a secret).
 //!
-//! The resolver helpers ([`node_identity`], [`root_identity`], [`load_crl`])
-//! encode the precedence the CLI uses: an inline flag wins, then the matching
-//! environment variable, then an explicit `--…-file` path, then the keystore.
+//! The resolver helpers ([`node_identity`], [`root_identity`], [`load_crl`],
+//! [`membership`]) encode the precedence the CLI uses: an inline flag wins, then
+//! the matching environment variable, then an explicit `--…-file` path, then the
+//! keystore.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use library::{Crl, NodeIdentity};
+use library::{Crl, Membership, NodeIdentity};
 
 /// Resolve the wires home directory (does not create it).
 pub fn home() -> Result<PathBuf> {
@@ -100,6 +103,33 @@ impl Keystore {
         write_text(&path, json)?;
         Ok(path)
     }
+
+    /// Read `membership.json` as a [`Membership`]; `None` if the file is absent.
+    pub fn read_membership(&self) -> Result<Option<Membership>> {
+        let path = self.path("membership.json");
+        match read_to_string_opt(&path)? {
+            Some(text) => Ok(Some(
+                Membership::decode(text.trim())
+                    .with_context(|| format!("parsing {}", path.display()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist `membership` to `membership.json` as its base64 token (mode
+    /// `0644` — a membership is a *public* signed credential, not a secret).
+    /// Returns the written path.
+    pub fn save_membership(&self, membership: &Membership) -> Result<PathBuf> {
+        ensure_dir(&self.dir)?;
+        let path = self.path("membership.json");
+        write_text(&path, &membership.encode()?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
+        }
+        Ok(path)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +160,36 @@ pub fn root_identity(inline: Option<&str>, file: Option<&Path>) -> Result<NodeId
         "root",
         "WIRES_ROOT_SEED",
     )
+}
+
+/// Resolve the dialer's membership for `connect`: an inline `--membership`
+/// token wins, then `$WIRES_MEMBERSHIP`, then an explicit `--membership-file`,
+/// then the keystore (`membership.json`). Errors if none is found.
+pub fn membership(inline: Option<&str>, file: Option<&Path>) -> Result<Membership> {
+    if let Some(token) = inline {
+        return Membership::decode(token).context("--membership");
+    }
+    if let Some(token) = std::env::var("WIRES_MEMBERSHIP")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return Membership::decode(&token).context("$WIRES_MEMBERSHIP");
+    }
+    if let Some(path) = file {
+        let text = read_to_string_opt(path)?
+            .ok_or_else(|| anyhow!("membership file not found: {}", path.display()))?;
+        return Membership::decode(text.trim())
+            .with_context(|| format!("parsing {}", path.display()));
+    }
+    let ks = Keystore::resolve()?;
+    if let Some(m) = ks.read_membership()? {
+        return Ok(m);
+    }
+    bail!(
+        "no membership: pass --membership <token>, set $WIRES_MEMBERSHIP, use \
+         --membership-file, or run `wires member --subject <id> --save` (looked for {})",
+        ks.path("membership.json").display()
+    );
 }
 
 fn resolve_identity(
@@ -388,5 +448,41 @@ mod tests {
             .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    fn fixture_membership() -> Membership {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let member = NodeIdentity::from_seed([2u8; 32]).node_id();
+        Membership::mint(&root, member, 0, i64::MAX).unwrap()
+    }
+
+    #[test]
+    fn membership_round_trips_and_is_none_when_absent() {
+        let ks = Keystore::at(temp_dir());
+        assert!(ks.read_membership().unwrap().is_none());
+        let m = fixture_membership();
+        ks.save_membership(&m).unwrap();
+        assert_eq!(ks.read_membership().unwrap().unwrap(), m);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn membership_file_is_0644() {
+        use std::os::unix::fs::PermissionsExt;
+        let ks = Keystore::at(temp_dir());
+        let path = ks.save_membership(&fixture_membership()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
+    }
+
+    #[test]
+    fn membership_resolver_prefers_inline_then_file() {
+        let m = fixture_membership();
+        // Inline token wins, touching no filesystem.
+        assert_eq!(membership(Some(&m.encode().unwrap()), None).unwrap(), m);
+        // Else an explicit file is decoded.
+        let path = temp_dir().join("membership.json");
+        write_text(&path, &m.encode().unwrap()).unwrap();
+        assert_eq!(membership(None, Some(&path)).unwrap(), m);
     }
 }
