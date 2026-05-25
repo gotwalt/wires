@@ -14,8 +14,8 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
-use library::{CapabilityTicket, Crl, Grant, NodeId, NodeIdentity, Scope};
+use clap::{ArgGroup, Args, Parser, Subcommand};
+use library::{CapabilityTicket, Crl, Grant, Membership, NodeId, NodeIdentity, Scope};
 
 /// wires: a capability-addressed stdio/MCP session layer.
 #[derive(Parser)]
@@ -31,6 +31,8 @@ enum Command {
     Keygen(KeygenArgs),
     /// Mint a capability grant and print its base64 ticket.
     Grant(GrantArgs),
+    /// Mint a fabric membership and print its base64 token.
+    Member(MemberArgs),
     /// Add a subject to the CRL (keystore by default) and print the result.
     Revoke(RevokeArgs),
     /// Issue a grant over the wire (announce/consent), instead of pasting ids.
@@ -95,6 +97,32 @@ struct GrantArgs {
     not_after: Option<i64>,
 }
 
+/// `member` arguments: the root key, who to include, and an expiry. All offline
+/// (no network); the fabric id is the root's node id and is recoverable from the
+/// minted token, so nothing else need cross machines.
+#[derive(Args)]
+struct MemberArgs {
+    /// Hex 32-byte seed of the root (signing) key. Falls back to `$WIRES_ROOT_SEED`,
+    /// then `--root-seed-file`, then the keystore (`root.seed`).
+    #[arg(long)]
+    root_seed: Option<String>,
+    /// Read the root key seed (hex) from this file instead of the keystore.
+    #[arg(long)]
+    root_seed_file: Option<PathBuf>,
+    /// Hex node id of the member this membership includes.
+    #[arg(long)]
+    subject: String,
+    /// Seconds from now until expiry (mutually exclusive with `--not-after`).
+    #[arg(long, conflicts_with = "not_after")]
+    ttl: Option<i64>,
+    /// Absolute expiry, unix seconds (mutually exclusive with `--ttl`).
+    #[arg(long)]
+    not_after: Option<i64>,
+    /// Also write the minted membership to the keystore (`membership.json`).
+    #[arg(long)]
+    save: bool,
+}
+
 /// `revoke` arguments: the subject to revoke and which CRL to extend.
 ///
 /// With neither `--crl-json` nor `--crl-file`, the keystore's `crl.json` is read
@@ -123,12 +151,19 @@ struct ServeArgs {
     /// Read the node key seed (hex) from this file instead of the keystore.
     #[arg(long)]
     node_seed_file: Option<PathBuf>,
-    /// Hex node id of the trusted fabric root whose grants are honored.
+    /// Hex node id of the trusted fabric root whose memberships and grants are
+    /// honored.
     #[arg(long)]
     trust_root: String,
-    /// The scope this responder serves; a grant's scope must match exactly.
+    /// The scope this responder serves; a grant's scope must match exactly. Omit
+    /// for an inclusion-only responder (then `--allow-any-member` is required).
     #[arg(long)]
-    scope: String,
+    scope: Option<String>,
+    /// Serve any fabric member when no `--scope` is set (inclusion-only). An
+    /// explicit acknowledgement of the authorization downgrade: the child execs
+    /// for any member and must authorize from the injected identity.
+    #[arg(long)]
+    allow_any_member: bool,
     /// CRL JSON literal of revoked subjects (overrides `--crl-file` / keystore).
     #[arg(long, conflicts_with = "crl_file")]
     crl_json: Option<String>,
@@ -143,8 +178,12 @@ struct ServeArgs {
     command: Vec<String>,
 }
 
-/// `connect` arguments: the dialer key and the capability ticket to present.
+/// `connect` arguments: the dialer key, its membership, and where to dial.
+///
+/// Exactly one of `--ticket` (a scoped session, grant from the ticket) or
+/// `--target` (an inclusion-only session, no grant) is required.
 #[derive(Args)]
+#[command(group(ArgGroup::new("dest").required(true).args(["ticket", "target"])))]
 struct ConnectArgs {
     /// Hex 32-byte seed of this dialer's node key. Falls back to
     /// `$WIRES_NODE_SEED`, then `--node-seed-file`, then the keystore (`node.seed`).
@@ -156,9 +195,25 @@ struct ConnectArgs {
     /// Use a self-hosted relay at this URL instead of the n0 default.
     #[arg(long)]
     relay_url: Option<String>,
-    /// The base64 capability ticket (target + scope + grant).
+    /// The base64 capability ticket (target + scope + grant) for a scoped
+    /// session. Mutually exclusive with `--target`.
     #[arg(long)]
-    ticket: String,
+    ticket: Option<String>,
+    /// Hex node id of the target for an inclusion-only session (membership only,
+    /// no grant). Mutually exclusive with `--ticket`.
+    #[arg(long)]
+    target: Option<String>,
+    /// Direct socket address where the `--target` is reachable, so the dialer
+    /// needs no discovery. Repeatable; only used with `--target`.
+    #[arg(long = "addr")]
+    addr: Vec<SocketAddr>,
+    /// The base64 membership token to present. Falls back to `$WIRES_MEMBERSHIP`,
+    /// then `--membership-file`, then the keystore (`membership.json`).
+    #[arg(long)]
+    membership: Option<String>,
+    /// Read the membership token from this file instead of the keystore.
+    #[arg(long)]
+    membership_file: Option<PathBuf>,
 }
 
 /// `pair` has two sides: `accept` (operator, holds the root key) and `request`
@@ -301,6 +356,19 @@ fn run_grant(
         .encode()
 }
 
+/// Mint a fabric membership binding `subject` to the root's fabric until
+/// `not_after`. The fabric id is `root.node_id()` and is recoverable from the
+/// returned credential.
+fn run_member(
+    root: &NodeIdentity,
+    subject: &str,
+    issued: i64,
+    not_after: i64,
+) -> library::Result<Membership> {
+    let subject = NodeId::from_hex(subject)?;
+    Membership::mint(root, subject, issued, not_after)
+}
+
 /// Insert `subject` into `existing` (or a fresh CRL when `None`/blank) and
 /// return the updated CRL as JSON. Idempotent in `subject`.
 fn run_revoke(existing: Option<&str>, subject: &str) -> library::Result<String> {
@@ -336,12 +404,19 @@ pub(crate) fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// `serve`: bind, verify grants against the trust root, exec + bridge.
+/// `serve`: bind, verify membership (and, when scoped, a grant) against the
+/// trust root, exec + bridge. A missing `--scope` requires `--allow-any-member`.
 async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     init_logging();
     let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
     let trust_root = NodeId::from_hex(&a.trust_root)?;
-    let scope = Scope::new(a.scope);
+    let scope = a.scope.map(Scope::new);
+    if scope.is_none() && !a.allow_any_member {
+        anyhow::bail!(
+            "refusing to serve: pass --scope <name>, or --allow-any-member for an \
+             inclusion-only responder (any fabric member may connect)"
+        );
+    }
     let crl = keystore::load_crl(a.crl_json.as_deref(), a.crl_file.as_deref())?;
     transport::serve(
         node,
@@ -354,20 +429,39 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     .await
 }
 
-/// `connect`: dial the ticket's target, present its grant, bridge local stdio.
+/// `connect`: present the dialer's membership, dial the target (from a ticket or
+/// `--target`), present the ticket's grant when scoped, and bridge local stdio.
 /// Returns the child's exit code.
 async fn connect_cmd(a: ConnectArgs) -> anyhow::Result<i32> {
     init_logging();
     let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
-    let ticket = CapabilityTicket::decode(&a.ticket)?;
+    let membership = keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?;
+
+    // Resolve where to dial and whether a grant rides along. The clap group
+    // guarantees exactly one of `--ticket` / `--target`.
+    let (target_id, addrs, grant, ticket_relay) = match a.ticket.as_deref() {
+        Some(text) => {
+            let t = CapabilityTicket::decode(text)?;
+            (t.target, t.addrs, Some(t.grant), t.relay_url)
+        }
+        None => {
+            let id = NodeId::from_hex(
+                a.target
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--ticket or --target is required"))?,
+            )?;
+            (id, a.addr.clone(), None, None)
+        }
+    };
     // `--relay-url` overrides the ticket's relay hint; both feed the dialed
     // address and the endpoint's relay configuration.
-    let relay = a.relay_url.or(ticket.relay_url);
-    let target = transport::endpoint_addr(&ticket.target, &ticket.addrs, relay.as_deref())?;
+    let relay = a.relay_url.or(ticket_relay);
+    let target = transport::endpoint_addr(&target_id, &addrs, relay.as_deref())?;
     transport::connect_io(
         node,
         target,
-        ticket.grant,
+        membership,
+        grant,
         relay.as_deref(),
         tokio::io::stdin(),
         tokio::io::stdout(),
@@ -398,7 +492,7 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         // Offline admin commands print to stdout (or fail with a message).
-        Command::Keygen(_) | Command::Grant(_) | Command::Revoke(_) => {
+        Command::Keygen(_) | Command::Grant(_) | Command::Member(_) | Command::Revoke(_) => {
             match cli_admin(cli.command) {
                 Ok(out) => println!("{out}"),
                 Err(e) => {
@@ -501,11 +595,26 @@ fn cli_admin(command: Command) -> Result<String, String> {
             )
             .map_err(stringify)
         }
+        Command::Member(a) => run_member_cmd(a),
         Command::Revoke(a) => run_revoke_cmd(a).map_err(stringify),
         Command::Pair(_) | Command::Serve(_) | Command::Connect(_) => {
             unreachable!("handled in main")
         }
     }
+}
+
+/// `member`: mint a membership for `--subject`, optionally persist it to the
+/// keystore (`membership.json`), and return its base64 token.
+fn run_member_cmd(a: MemberArgs) -> Result<String, String> {
+    let root = keystore::root_identity(a.root_seed.as_deref(), a.root_seed_file.as_deref())
+        .map_err(stringify)?;
+    let not_after = resolve_not_after(a.ttl, a.not_after, now_unix())?;
+    let membership = run_member(&root, &a.subject, now_unix(), not_after).map_err(stringify)?;
+    if a.save {
+        let ks = keystore::Keystore::resolve().map_err(stringify)?;
+        ks.save_membership(&membership).map_err(stringify)?;
+    }
+    membership.encode().map_err(stringify)
 }
 
 /// Render any error as a string for the admin-command error channel.
@@ -627,6 +736,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    proptest! {
+        /// A minted membership token decodes back, names the right member and
+        /// fabric, and is accepted for that member before expiry.
+        #[test]
+        fn member_token_is_includable(rs in seed(), ms in seed(), not_after in 1i64..=i64::MAX) {
+            let root = NodeIdentity::from_seed(rs);
+            let member = NodeIdentity::from_seed(ms).node_id();
+            let token = run_member(&root, &member.hex(), 0, not_after).unwrap().encode().unwrap();
+            let m = Membership::decode(&token).unwrap();
+            prop_assert_eq!(m.member, member);
+            prop_assert_eq!(m.fabric, root.node_id());
+            prop_assert!(library::check_inclusion(&m, root.node_id(), member, 0, &Crl::new()).is_ok());
+        }
+    }
+
+    #[test]
+    fn member_rejects_bad_subject() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        assert!(run_member(&root, "nothex", 0, 1).is_err());
     }
 
     #[test]
