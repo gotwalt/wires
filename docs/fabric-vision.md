@@ -1,0 +1,159 @@
+# The fabric: provable membership over the wires layer
+
+The [README](../README.md) makes wires' thesis precise: a **capability-addressed
+transport whose native PDU is stdio**. The address is a capability, the
+credential is a non-transferable human-issued grant, and a tool call is an
+authenticated session. That layer is built.
+
+This document is the companion thesis for the part the layer *implies* but does
+not yet make first-class: the **fabric** — the graph of nodes one trust root
+vouches for — and the ability for any participant to **prove membership in it
+offline, non-interactively**, so that a tool learns *who* is driving it the
+instant the session opens, with no extra round-trip.
+
+> **Status.** This is a design north-star, not shipped code. The first concrete
+> step — a root-signed membership credential — is specified in
+> [provable-fabric-inclusion.md](./provable-fabric-inclusion.md). The roster and
+> federation layers described below are **deferred** and called out as such.
+
+## Where the gap is
+
+The README's "what the layer gives you for free" already promises *identity on
+every session*: "the tool knows which endpoint is driving it, cryptographically."
+Two things keep that promise from being fully real today:
+
+1. **The served binary can't actually see the caller.** `serve` authenticates the
+   dialer to its key and then execs a child over piped stdio — but it never tells
+   the child *who* it authenticated. An MCP server behind `serve` knows it was
+   spawned; it does not know which fabric member is on the other end.
+2. **There is no notion of *membership* distinct from a per-scope grant.** A node
+   is "in" only in the sense that it happens to hold some `Grant{subject, scope,
+   not_after}`. There is no scope-independent, durable answer to "is this node a
+   member of my fabric, and who is it?" — the question an identity-aware tool
+   actually wants to ask.
+
+Closing (1) and (2) is what turns "a pile of grants" into a **fabric**.
+
+## The one primitive
+
+Inclusion is a credential signed by an **authority**, which a verifier trusts
+because either:
+
+- it **is** the pinned root the verifier was configured with (a *personal*
+  fabric — chain length 0), or
+- a **delegation chain** leads back to that pinned root (an *enterprise* fabric).
+
+```mermaid
+flowchart TD
+    subgraph personal["Personal fabric (chain length 0)"]
+        r1["root (a human)"] -->|signs membership| m1["laptop"]
+        r1 -->|signs membership| m2["agent"]
+        r1 -->|signs membership| m3["phone"]
+    end
+
+    subgraph enterprise["Enterprise fabric (delegated)"]
+        o["org root (cold)"] -->|delegates| d1["eng sub-root"]
+        o -->|delegates| d2["sales sub-root"]
+        d1 -->|signs membership| e1["alice's agent"]
+        d1 -->|signs membership| e2["CI runner"]
+        d2 -->|signs membership| e3["bob's agent"]
+    end
+```
+
+A personal fabric is the **degenerate case of the enterprise one**: same
+credential, same verification, the chain is just empty. We get to design the
+personal experience and the enterprise experience as one mechanism with a knob,
+not two systems.
+
+## Two concerns the word "membership" smuggles together
+
+The reason a naïve "publish the member list" design feels right for a household
+and wrong for a company is that *membership* bundles two separable concerns:
+
+| Concern | Question | Where it lives |
+|---|---|---|
+| **Inclusion proof** | "Is this a legitimate member?" | Offline, non-interactive, **identical** for personal & enterprise. A signed credential answers it. |
+| **Revocation / freshness** | "Is this member *still* current, right now?" | Where the two worlds **diverge.** The classic CRL / OCSP / short-lived-cert tradeoff: offline + instant revocation are in tension. |
+
+Separate them, and the architecture falls out. The inclusion proof is the
+universal base (and the whole of the first slice). The revocation strategy is a
+*layer on top*, and there are two good ones for two different worlds.
+
+## Two deferred layers, one credential
+
+### Committed roster — the personal-fabric strategy
+
+A single cold root, a small set (a human's handful of devices and agents).
+Publish a **signed, versioned Merkle snapshot** of the member set; inclusion
+becomes credential + Merkle path to the current commitment; revocation is
+re-signing the snapshot without the departed member. You also get **enumeration**
+for free — "show me everything in my fabric" — which is exactly what a personal
+fabric's owner wants. Re-signing on every change is cheap when the set is tens of
+members and the human is the signer.
+
+### Delegation / federation — the enterprise strategy
+
+A single flat roster is the *wrong* tool for a company, for three concrete
+reasons:
+
+- **Single signer.** Enterprises delegate — org → department → team — and are
+  often fed by an existing IdP (Okta, Entra). One key signing the whole list is
+  an organizational mismatch.
+- **Hot key.** Constant churn (hires, departures, contractors) means re-signing
+  constantly, which forces the root key online — throwing away the cold-root
+  security that made the model attractive.
+- **Org-chart leak.** A global, verifiable member list hands the entire org chart
+  to anyone who can verify it.
+
+Enterprises reach instead for **federation + short TTLs**: the org root (cold)
+signs *delegations* to issuing authorities (hot, IdP-adjacent); those authorities
+mint **short-lived** membership credentials; a verifier checks them offline
+against the pinned org root by walking the `authority_chain`; revocation is
+simply *stop renewing* a departed member. This is how SPIFFE/SVID and OIDC
+already work at enterprise scale — present a short-lived signed identity, verify
+offline, no roster. It is also where **federated identity claims** (org, role,
+email) naturally attach to the credential.
+
+Both layers are additions to the **same** credential — one whose authority is
+either the pinned root or a chain back to it. We build the credential once; the
+roster and the chain are non-breaking extensions behind an explicit version.
+
+## The capability this unlocks
+
+> An MCP server behind `wires serve` learns the **verified identity of its
+> caller** with **no additional network traffic.**
+
+The caller presents its membership credential in the session handshake; the
+responder verifies it offline against a pinned fabric root (no callback to an
+identity server); and the responder hands the verified identity to the served
+binary. For a personal fabric that's "my agent, on my fabric." For an enterprise
+fabric — once federation lands — that's "alice@corp, role=engineer, vouched for
+by the eng sub-root under the org root," delivered to an unmodified MCP server as
+data it can authorize on. That is the difference between *the agent stack as it is
+configured today* (co-located tools, ambient trust, bearer tokens) and a tool
+that **knows who it is talking to** before it does any work.
+
+## Roadmap
+
+| Slice | Adds | Revocation | Status |
+|---|---|---|---|
+| **1 — Provable inclusion** | Root-signed `Membership` credential; verified caller identity passed to the served child via env vars | CRL + short TTL | **Specified** ([spec](./provable-fabric-inclusion.md)) |
+| **2 — Personal fabric** | Pairing issues memberships; committed roster (signed Merkle snapshot) + enumeration | Re-signed roster | Deferred |
+| **3 — Federation** | `authority_chain` delegation; federated identity claims (org, role, email) | Short-TTL renewal | Deferred |
+
+Each slice is buildable on its own and leaves the credential wire-format
+forward-compatible for the next (see the versioning discipline in the spec).
+
+## Relationship to `main`
+
+An earlier line of work (the `main` branch) attacked membership **bottom-up** —
+gossip, epoch keys, hash-chained per-topic logs, channel rosters, a blind relay.
+Its primitives are individually sound, but it never produced a *non-interactive,
+offline membership proof*, and its revocation story (local CRL flags with no
+fabric-wide propagation, no epoch rotation on membership change) was incomplete.
+This line inverts the approach: start from James's **top-down capability model**,
+which already has the right primitive — a root-signed, offline-verifiable,
+non-transferable credential — and grow the fabric on it. `main` will be
+**archived as the initial proof of concept**; its lessons (what a sound
+membership proof must guarantee, where revocation actually bites) are folded into
+this design.
