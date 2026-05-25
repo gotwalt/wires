@@ -201,7 +201,7 @@ mod tests {
     use library::{Crl, check_accept};
 
     async fn test_ep(id: &NodeIdentity) -> Endpoint {
-        Endpoint::empty_builder()
+        Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(transport::secret_key(id))
             .alpns(vec![PAIR_ALPN.to_vec()])
             .bind()

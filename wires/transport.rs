@@ -463,7 +463,7 @@ mod tests {
 
     /// Build an endpoint with no discovery/relay (hermetic) for loopback tests.
     async fn test_endpoint(identity: &NodeIdentity) -> Endpoint {
-        Endpoint::empty_builder()
+        Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key(identity))
             .alpns(vec![ALPN.to_vec()])
             .bind()
