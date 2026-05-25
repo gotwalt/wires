@@ -74,7 +74,7 @@ mod tests {
     #[tokio::test]
     async fn server_binds_and_reports_an_address() {
         let listen = "127.0.0.1:0".parse().unwrap();
-        let mut server = Server::spawn(server_config(listen)).await.unwrap();
+        let server = Server::spawn(server_config(listen)).await.unwrap();
         assert!(server.http_addr().is_some());
         server.shutdown().await.ok();
     }
