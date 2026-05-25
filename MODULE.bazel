@@ -34,18 +34,24 @@ use_repo(multitool, "multitool")
 #########################
 # C/C++ toolchains — retained only to link Rust binaries (host) and to
 # cross-compile Rust to Linux for OCI images. We do not develop C/C++ here.
-bazel_dep(name = "rules_cc", version = "0.2.16")
-bazel_dep(name = "toolchains_llvm", version = "1.6.0")
+bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "toolchains_llvm", version = "1.7.0")
 
 # Hermetic LLVM toolchain for the host (relieves the dependency on a locally
 # installed CC for linking Rust).
 llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
 llvm.toolchain(
-    # NB: llvm doesn't release for all platforms on every patch release
+    # NB: llvm doesn't release for all platforms on every patch release, so the
+    # versions diverge per platform. The bundled ld64.lld must be new enough to
+    # link against the host Xcode SDK's tbd stubs; LLD 15 cannot link arm64
+    # against the macOS 26 SDK (its umbrella libSystem.tbd lists only arm64e),
+    # so darwin-aarch64 is pinned to 18.1.8 — the newest arm64-macOS build the
+    # ruleset ships. x86_64 (unaffected: the SDK still carries x86_64-macos)
+    # tops out at 17.0.6.
     llvm_versions = {
         "": "15.0.6",
-        "darwin-aarch64": "15.0.7",
-        "darwin-x86_64": "15.0.7",
+        "darwin-aarch64": "18.1.8",
+        "darwin-x86_64": "17.0.6",
     },
 )
 use_repo(llvm, "llvm_toolchain", "llvm_toolchain_llvm")
