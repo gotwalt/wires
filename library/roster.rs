@@ -653,7 +653,10 @@ mod tests {
         let imposter = NodeIdentity::from_seed([2u8; 32]);
         let mut r = Roster::new(root.node_id());
         r.insert(NodeId::from_bytes([9u8; 32]));
-        assert!(matches!(r.commit(&imposter, 0, 1), Err(Error::FabricMismatch)));
+        assert!(matches!(
+            r.commit(&imposter, 0, 1),
+            Err(Error::FabricMismatch)
+        ));
     }
 
     /// A future format is rejected outright (locks discriminant dispatch).

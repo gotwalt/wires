@@ -603,15 +603,13 @@ fn main() {
         | Command::Grant(_)
         | Command::Member(_)
         | Command::Revoke(_)
-        | Command::Roster(_) => {
-            match cli_admin(cli.command) {
-                Ok(out) => println!("{out}"),
-                Err(e) => {
-                    eprintln!("wires: {e}");
-                    std::process::exit(1);
-                }
+        | Command::Roster(_) => match cli_admin(cli.command) {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("wires: {e}");
+                std::process::exit(1);
             }
-        }
+        },
         Command::Pair(a) => match runtime().block_on(pair_cmd(a)) {
             Ok(Some(out)) => println!("{out}"),
             Ok(None) => {}

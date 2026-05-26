@@ -350,7 +350,10 @@ where
         .env_remove("WIRES_ROSTER_VERSION")
         .env("WIRES_CALLER_NODE", caller.hex())
         .env("WIRES_FABRIC_ROOT", config.trust_root.hex())
-        .env("WIRES_MEMBERSHIP_NOT_AFTER", membership.not_after.to_string());
+        .env(
+            "WIRES_MEMBERSHIP_NOT_AFTER",
+            membership.not_after.to_string(),
+        );
     if let Some(v) = roster_version {
         cmd.env("WIRES_ROSTER_VERSION", v.to_string());
     }
