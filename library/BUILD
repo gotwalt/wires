@@ -4,6 +4,7 @@ load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
 
 _DEPS = [
     "@crates//:base64",
+    "@crates//:blake3",
     "@crates//:ed25519-dalek",
     "@crates//:hex",
     "@crates//:rand",
