@@ -51,7 +51,7 @@ log "server   node id : $SERVER_ID"
 log "agent    node id : $AGENT_ID"
 
 # Start the responder; tee its log so we can read the bound UDP port from it.
-rm -f "$DEMO/ticket"
+rm -f "$DEMO/ticket" "$DEMO/membership"
 srvlog="$DEMO/serve.log"
 : >"$srvlog"
 log "starting: wires serve --scope $SCOPE -- rg --line-number --color never $PATTERN"
@@ -88,6 +88,14 @@ ticket="$(WIRES_HOME="$op" "$WIRES" grant \
 	--addr "127.0.0.1:$port")"
 printf '%s\n' "$ticket" >"$DEMO/ticket"
 log "minted ticket -> $DEMO/ticket"
+
+# Mint the agent's fabric membership (root-signed). The dialer must present it
+# on every session — serve verifies inclusion before checking the grant.
+membership="$(WIRES_HOME="$op" "$WIRES" member \
+	--subject "$AGENT_ID" \
+	--ttl 3600)"
+printf '%s\n' "$membership" >"$DEMO/membership"
+log "minted membership -> $DEMO/membership"
 log "ready: run ./.scripts/connect.sh in another terminal (Ctrl-C here to stop)."
 
 wait "$serve_pid"

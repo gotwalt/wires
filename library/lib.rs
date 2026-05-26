@@ -5,8 +5,10 @@
 //! - [`identity`] — the Ed25519 [`NodeIdentity`] and the [`NodeId`] / [`Signature`]
 //!   byte-newtypes.
 //! - [`grant`] — root-signed, identity-bound, scoped, expiring [`Grant`]s.
+//! - [`membership`] — root-signed, offline-verifiable [`Membership`] proof that a
+//!   node belongs to a fabric (scope-independent identity).
 //! - [`ticket`] — the base64 [`CapabilityTicket`] a dialer presents (the address).
-//! - [`policy`] — [`check_accept`], the responder's accept-time gate.
+//! - [`policy`] — [`check_accept`] and [`check_inclusion`], the responder's gates.
 //! - [`session`] — the [`Frame`] wire codec (the async transport lands later).
 //! - [`error`] — the crate [`Error`] and [`Result`].
 //!
@@ -36,6 +38,7 @@
 pub mod error;
 pub mod grant;
 pub mod identity;
+pub mod membership;
 pub mod policy;
 pub mod session;
 pub mod ticket;
@@ -45,7 +48,8 @@ mod codec;
 pub use error::{Error, Result};
 pub use grant::{AlgorithmId, Grant, Scope};
 pub use identity::{NodeId, NodeIdentity, Signature};
-pub use policy::{Crl, check_accept};
+pub use membership::{MEMBERSHIP_V1, Membership};
+pub use policy::{Crl, check_accept, check_inclusion};
 pub use session::{Chunk, Frame};
 pub use ticket::CapabilityTicket;
 
