@@ -241,6 +241,15 @@ impl RosterHead {
 
     /// base64url-no-pad of `canonical_bytes(self)` — one copy-pasteable head
     /// token. The fabric id is recoverable from the decoded head.
+    ///
+    /// ```
+    /// use library::{NodeIdentity, Roster, RosterHead};
+    /// let root = NodeIdentity::from_seed([1u8; 32]);
+    /// let mut roster = Roster::new(root.node_id());
+    /// roster.insert(NodeIdentity::from_seed([2u8; 32]).node_id());
+    /// let (head, _) = roster.commit(&root, 0, i64::MAX).unwrap();
+    /// assert_eq!(RosterHead::decode(&head.encode().unwrap()).unwrap(), head);
+    /// ```
     pub fn encode(&self) -> Result<String> {
         Ok(B64.encode(canonical_bytes(self)?))
     }
@@ -348,6 +357,17 @@ impl Roster {
     /// Bump `version`, build the tree, sign a head, and emit every member's
     /// fresh proof. The signing key must be the fabric root
     /// (`root.node_id() == self.fabric`), else [`Error::FabricMismatch`].
+    ///
+    /// ```
+    /// use library::{NodeIdentity, Roster};
+    /// let root = NodeIdentity::from_seed([1u8; 32]);
+    /// let member = NodeIdentity::from_seed([2u8; 32]).node_id();
+    /// let mut roster = Roster::new(root.node_id());
+    /// roster.insert(member);
+    /// let (head, proofs) = roster.commit(&root, 0, i64::MAX).unwrap();
+    /// assert!(head.verify(root.node_id()).is_ok());
+    /// assert_eq!(proofs[0].1.recompute_root(), head.root);
+    /// ```
     pub fn commit(
         &mut self,
         root: &NodeIdentity,
