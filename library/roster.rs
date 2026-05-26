@@ -218,18 +218,37 @@ impl RosterHead {
     /// Does NOT check freshness or any member — that is
     /// [`crate::policy::check_roster_inclusion`].
     pub fn verify(&self, fabric_root: NodeId) -> Result<()> {
-        todo!("verify head")
+        if self.alg != AlgorithmId::Ed25519 {
+            return Err(Error::UnsupportedAlgorithm);
+        }
+        if self.format != ROSTER_HEAD_V1 {
+            return Err(Error::UnsupportedVersion);
+        }
+        if self.fabric != fabric_root {
+            return Err(Error::InvalidSignature);
+        }
+        let body = RosterHeadBody {
+            format: self.format,
+            fabric: &self.fabric,
+            version: self.version.0,
+            root: &self.root,
+            issued: self.issued,
+            not_after: self.not_after,
+            alg: &self.alg,
+        };
+        fabric_root.verify(&canonical_bytes(&body)?, &self.sig)
     }
 
     /// base64url-no-pad of `canonical_bytes(self)` — one copy-pasteable head
     /// token. The fabric id is recoverable from the decoded head.
     pub fn encode(&self) -> Result<String> {
-        todo!("encode head")
+        Ok(B64.encode(canonical_bytes(self)?))
     }
 
     /// Decode a head from its base64url-no-pad token.
     pub fn decode(text: &str) -> Result<RosterHead> {
-        todo!("decode head")
+        let bytes = B64.decode(text)?;
+        serde_json::from_slice(&bytes).map_err(Error::Decode)
     }
 }
 
@@ -249,12 +268,13 @@ impl InclusionProof {
 
     /// base64url-no-pad of `canonical_bytes(self)`.
     pub fn encode(&self) -> Result<String> {
-        todo!("encode proof")
+        Ok(B64.encode(canonical_bytes(self)?))
     }
 
     /// Decode a proof from its base64url-no-pad token.
     pub fn decode(text: &str) -> Result<InclusionProof> {
-        todo!("decode proof")
+        let bytes = B64.decode(text)?;
+        serde_json::from_slice(&bytes).map_err(Error::Decode)
     }
 }
 
@@ -334,7 +354,38 @@ impl Roster {
         issued: i64,
         not_after: i64,
     ) -> Result<(RosterHead, Vec<(NodeId, InclusionProof)>)> {
-        todo!("commit")
+        if root.node_id() != self.fabric {
+            return Err(Error::FabricMismatch);
+        }
+        self.version = RosterVersion(self.version.0 + 1);
+        let merkle_root = self.root_hash();
+        let alg = AlgorithmId::Ed25519;
+        let body = RosterHeadBody {
+            format: ROSTER_HEAD_V1,
+            fabric: &self.fabric,
+            version: self.version.0,
+            root: &merkle_root,
+            issued,
+            not_after,
+            alg: &alg,
+        };
+        let sig = root.sign(&canonical_bytes(&body)?);
+        let head = RosterHead {
+            format: ROSTER_HEAD_V1,
+            fabric: self.fabric,
+            version: self.version,
+            root: merkle_root,
+            issued,
+            not_after,
+            alg,
+            sig,
+        };
+        let proofs = self
+            .members
+            .iter()
+            .map(|m| (*m, self.proof_for(m).expect("member has a proof")))
+            .collect();
+        Ok((head, proofs))
     }
 }
 
@@ -481,5 +532,145 @@ mod tests {
         r.insert(a);
         r.insert(b);
         assert_eq!(r.root_hash(), expect);
+    }
+
+    proptest! {
+        /// `commit` bumps the version, signs a head that verifies under the
+        /// root, and emits a proof per member that recomputes to the head root.
+        #[test]
+        fn commit_then_verify_roundtrips(
+            rs in seed(),
+            seeds in proptest::collection::vec(seed(), 0..8),
+            issued in any::<i64>(),
+            not_after in any::<i64>(),
+        ) {
+            let root = NodeIdentity::from_seed(rs);
+            let mut r = Roster::new(root.node_id());
+            for s in &seeds {
+                r.insert(NodeId::from_bytes(*s));
+            }
+            let before = r.version;
+            let (head, proofs) = r.commit(&root, issued, not_after).unwrap();
+
+            prop_assert_eq!(head.version.0, before.0 + 1);
+            prop_assert_eq!(r.version.0, before.0 + 1, "commit persists the bump");
+            prop_assert_eq!(head.fabric, root.node_id());
+            prop_assert_eq!(head.root, r.root_hash());
+            prop_assert!(head.verify(root.node_id()).is_ok());
+            prop_assert_eq!(proofs.len(), r.members.len());
+            for (m, proof) in proofs {
+                prop_assert_eq!(proof.version, head.version);
+                prop_assert_eq!(proof.recompute_root(), head.root);
+                prop_assert!(r.contains(&m));
+            }
+        }
+
+        /// A head/proof token survives an encode/decode round-trip.
+        #[test]
+        fn head_and_proof_encode_decode_roundtrip(
+            rs in seed(),
+            seeds in proptest::collection::vec(seed(), 1..6),
+        ) {
+            let root = NodeIdentity::from_seed(rs);
+            let mut r = Roster::new(root.node_id());
+            for s in &seeds {
+                r.insert(NodeId::from_bytes(*s));
+            }
+            let (head, proofs) = r.commit(&root, 0, i64::MAX).unwrap();
+            prop_assert_eq!(RosterHead::decode(&head.encode().unwrap()).unwrap(), head);
+            let (_, proof) = &proofs[0];
+            prop_assert_eq!(InclusionProof::decode(&proof.encode().unwrap()).unwrap(), proof.clone());
+        }
+
+        /// Tampering with any signed head field breaks verification.
+        #[test]
+        fn tampered_head_fails(rs in seed(), os in seed(), v in any::<u64>()) {
+            prop_assume!(rs != os);
+            let root = NodeIdentity::from_seed(rs);
+            let other = NodeIdentity::from_seed(os).node_id();
+            let mut r = Roster::new(root.node_id());
+            r.insert(NodeId::from_bytes([7u8; 32]));
+            let (head, _) = r.commit(&root, 100, 200).unwrap();
+
+            let mut t = head.clone();
+            t.version = RosterVersion(v ^ head.version.0 ^ 0x9e3779b9);
+            prop_assert!(t.verify(root.node_id()).is_err());
+
+            let mut t = head.clone();
+            t.root = MerkleRoot::from_bytes([0xab; 32]);
+            prop_assert!(matches!(t.verify(root.node_id()), Err(Error::InvalidSignature)));
+
+            let mut t = head.clone();
+            t.issued = head.issued.wrapping_add(1);
+            prop_assert!(matches!(t.verify(root.node_id()), Err(Error::InvalidSignature)));
+
+            let mut t = head.clone();
+            t.not_after = head.not_after.wrapping_add(1);
+            prop_assert!(matches!(t.verify(root.node_id()), Err(Error::InvalidSignature)));
+
+            // Wrong root → fabric pin trips first (InvalidSignature).
+            prop_assert!(matches!(head.verify(other), Err(Error::InvalidSignature)));
+
+            // Rewriting the (unsigned-position) fabric to `other` and verifying
+            // against `other` still fails — the sig was over the original fabric.
+            let mut t = head.clone();
+            t.fabric = other;
+            prop_assert!(t.verify(other).is_err());
+        }
+
+        /// Arbitrary text decodes to `Err`, never a panic.
+        #[test]
+        fn garbage_decode_never_panics(s in ".*") {
+            let _ = RosterHead::decode(&s);
+            let _ = InclusionProof::decode(&s);
+        }
+    }
+
+    /// `commit` with a signing key that is not the fabric root is a usage error.
+    #[test]
+    fn commit_requires_the_fabric_root() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let imposter = NodeIdentity::from_seed([2u8; 32]);
+        let mut r = Roster::new(root.node_id());
+        r.insert(NodeId::from_bytes([9u8; 32]));
+        assert!(matches!(r.commit(&imposter, 0, 1), Err(Error::FabricMismatch)));
+    }
+
+    /// A future format is rejected outright (locks discriminant dispatch).
+    #[test]
+    fn future_format_is_unsupported() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let mut r = Roster::new(root.node_id());
+        r.insert(NodeId::from_bytes([3u8; 32]));
+        let (mut head, _) = r.commit(&root, 0, i64::MAX).unwrap();
+        head.format = 2;
+        assert!(matches!(
+            head.verify(root.node_id()),
+            Err(Error::UnsupportedVersion)
+        ));
+    }
+
+    /// Known-answer: the signed head body canonicalizes to exactly these bytes
+    /// (sorted keys, compact, hex roots). Guards the canonicalization invariant.
+    #[test]
+    fn head_body_canonical_bytes_known_answer() {
+        let fabric = NodeId::from_bytes([0u8; 32]);
+        let root = MerkleRoot::from_bytes([0x22u8; 32]);
+        let alg = AlgorithmId::Ed25519;
+        let body = RosterHeadBody {
+            format: ROSTER_HEAD_V1,
+            fabric: &fabric,
+            version: 7,
+            root: &root,
+            issued: 1000,
+            not_after: 2000,
+            alg: &alg,
+        };
+        let expected = format!(
+            r#"{{"alg":"ed25519","fabric":"{}","format":1,"issued":1000,"not_after":2000,"root":"{}","version":7}}"#,
+            "00".repeat(32),
+            "22".repeat(32),
+        );
+        assert_eq!(canonical_bytes(&body).unwrap(), expected.into_bytes());
     }
 }
