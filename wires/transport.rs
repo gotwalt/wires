@@ -1199,4 +1199,302 @@ mod tests {
         assert!(out.is_empty());
         srv.abort();
     }
+
+    use library::Roster;
+
+    /// Build a head-enforcing config for `member` plus the member's proof.
+    fn head_enforcing(
+        root: &NodeIdentity,
+        server: NodeId,
+        member: NodeId,
+        command: Vec<String>,
+    ) -> (ServeConfig, InclusionProof) {
+        let mut roster = Roster::new(root.node_id());
+        roster.insert(member);
+        roster.insert(server);
+        let (head, proofs) = roster.commit(root, 0, i64::MAX).unwrap();
+        let proof = proofs.into_iter().find(|(m, _)| *m == member).unwrap().1;
+        let config = ServeConfig {
+            trust_root: root.node_id(),
+            scope: None,
+            crl: Crl::new(),
+            roster_head: Some(head),
+            membership: Membership::mint(root, server, 0, i64::MAX).unwrap(),
+            proof: None,
+            command,
+        };
+        (config, proof)
+    }
+
+    /// Drive `serve_session` against a one-shot handshake; returns the result.
+    async fn serve_once(config: ServeConfig, caller: NodeId, handshake: Frame) -> Result<()> {
+        let recv = std::io::Cursor::new(handshake.encode().unwrap());
+        let send: Vec<u8> = Vec::new();
+        serve_session(send, recv, caller, &config).await
+    }
+
+    #[tokio::test]
+    async fn head_enforcing_accepts_member_with_matching_proof() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let server = NodeIdentity::from_seed([3u8; 32]).node_id();
+        let (config, proof) = head_enforcing(&root, server, caller, vec!["cat".to_string()]);
+        let membership = Membership::mint(&root, caller, 0, i64::MAX).unwrap();
+        let ok = serve_once(
+            config,
+            caller,
+            Frame::Handshake {
+                membership,
+                grant: None,
+                proof: Some(proof),
+            },
+        )
+        .await;
+        assert!(ok.is_ok());
+    }
+
+    #[tokio::test]
+    async fn head_enforcing_rejects_missing_proof() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let server = NodeIdentity::from_seed([3u8; 32]).node_id();
+        let (config, _proof) = head_enforcing(&root, server, caller, vec!["cat".to_string()]);
+        let membership = Membership::mint(&root, caller, 0, i64::MAX).unwrap();
+        let res = serve_once(
+            config,
+            caller,
+            Frame::Handshake {
+                membership,
+                grant: None,
+                proof: None,
+            },
+        )
+        .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn head_enforcing_rejects_proof_for_other_member() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let other = NodeIdentity::from_seed([8u8; 32]).node_id();
+        let server = NodeIdentity::from_seed([3u8; 32]).node_id();
+        // Head/proof are built for `other`; `caller` presents other's proof.
+        let (config, other_proof) = head_enforcing(&root, server, other, vec!["cat".to_string()]);
+        let membership = Membership::mint(&root, caller, 0, i64::MAX).unwrap();
+        let res = serve_once(
+            config,
+            caller,
+            Frame::Handshake {
+                membership,
+                grant: None,
+                proof: Some(other_proof),
+            },
+        )
+        .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn head_enforcing_rejects_stale_proof_after_recommit() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let server = NodeIdentity::from_seed([3u8; 32]).node_id();
+        // Build a v1 proof, then advance the enforced head to v2.
+        let (mut config, v1_proof) = head_enforcing(&root, server, caller, vec!["cat".to_string()]);
+        let mut roster = Roster::new(root.node_id());
+        roster.insert(caller);
+        roster.insert(server);
+        let _ = roster.commit(&root, 0, i64::MAX).unwrap(); // v1
+        let (v2_head, _) = roster.commit(&root, 0, i64::MAX).unwrap(); // v2
+        config.roster_head = Some(v2_head);
+        let membership = Membership::mint(&root, caller, 0, i64::MAX).unwrap();
+        let res = serve_once(
+            config,
+            caller,
+            Frame::Handshake {
+                membership,
+                grant: None,
+                proof: Some(v1_proof),
+            },
+        )
+        .await;
+        assert!(res.is_err());
+    }
+
+    /// A root commits a roster of {client, server}; an inclusion-only,
+    /// head-enforcing responder admits the client over a real loopback
+    /// connection; the child prints WIRES_CALLER_NODE / WIRES_ROSTER_VERSION.
+    #[tokio::test]
+    async fn loopback_head_enforcing_admits_member() {
+        let root = NodeIdentity::from_seed([50u8; 32]);
+        let server = NodeIdentity::from_seed([51u8; 32]);
+        let client = NodeIdentity::from_seed([52u8; 32]);
+
+        let mut roster = Roster::new(root.node_id());
+        roster.insert(client.node_id());
+        roster.insert(server.node_id());
+        let (head, proofs) = roster.commit(&root, 0, i64::MAX).unwrap();
+        let head_version = head.version.0;
+        let client_proof = proofs
+            .into_iter()
+            .find(|(m, _)| *m == client.node_id())
+            .unwrap()
+            .1;
+
+        let server_ep = test_endpoint(&server).await;
+        let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
+        let config = ServeConfig {
+            trust_root: root.node_id(),
+            scope: None,
+            crl: Crl::new(),
+            roster_head: Some(head),
+            membership: Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
+            proof: None,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                r#"printf "%s,%s" "$WIRES_CALLER_NODE" "$WIRES_ROSTER_VERSION""#.to_string(),
+            ],
+        };
+        let srv = tokio::spawn(serve_on(server_ep, config));
+
+        let client_ep = test_endpoint(&client).await;
+        let membership = Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = connect_on(
+            client_ep,
+            addr,
+            membership,
+            None,
+            Some(client_proof),
+            true, // ticket-less
+            std::io::Cursor::new(Vec::new()),
+            &mut out,
+            &mut err,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, 0);
+        let expected = format!("{},{}", client.node_id().hex(), head_version);
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+        srv.abort();
+    }
+
+    /// After the client is removed and the roster re-committed, the client's old
+    /// proof is rejected and the child never runs.
+    #[tokio::test]
+    async fn loopback_head_enforcing_rejects_removed_member() {
+        let root = NodeIdentity::from_seed([60u8; 32]);
+        let server = NodeIdentity::from_seed([61u8; 32]);
+        let client = NodeIdentity::from_seed([62u8; 32]);
+
+        let mut roster = Roster::new(root.node_id());
+        roster.insert(client.node_id());
+        roster.insert(server.node_id());
+        let (_v1, v1_proofs) = roster.commit(&root, 0, i64::MAX).unwrap();
+        let client_proof = v1_proofs
+            .into_iter()
+            .find(|(m, _)| *m == client.node_id())
+            .unwrap()
+            .1;
+        // Remove the client and re-commit; the enforced head is now v2.
+        roster.remove(&client.node_id());
+        let (v2, _) = roster.commit(&root, 0, i64::MAX).unwrap();
+
+        let server_ep = test_endpoint(&server).await;
+        let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
+        let config = ServeConfig {
+            trust_root: root.node_id(),
+            scope: None,
+            crl: Crl::new(),
+            roster_head: Some(v2),
+            membership: Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
+            proof: None,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo SHOULD_NOT_RUN".to_string(),
+            ],
+        };
+        let srv = tokio::spawn(serve_on(server_ep, config));
+
+        let client_ep = test_endpoint(&client).await;
+        let membership = Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result = connect_on(
+            client_ep,
+            addr,
+            membership,
+            None,
+            Some(client_proof),
+            true,
+            std::io::Cursor::new(Vec::new()),
+            &mut out,
+            &mut err,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(out.is_empty());
+        srv.abort();
+    }
+
+    /// Mutual inclusion: a ticket-less dialer aborts (no stdin echoed) when the
+    /// responder's ack membership is signed by a different root; succeeds when it
+    /// is signed by the trusted root.
+    #[tokio::test]
+    async fn loopback_mutual_inclusion_checks_the_responder() {
+        let root = NodeIdentity::from_seed([70u8; 32]);
+        let evil = NodeIdentity::from_seed([71u8; 32]);
+        let client = NodeIdentity::from_seed([73u8; 32]);
+        let membership = Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap();
+
+        // Serve with the server's own membership signed by `signer`.
+        async fn run(
+            signer: &NodeIdentity,
+            client_membership: Membership,
+            client: &NodeIdentity,
+        ) -> Result<i32> {
+            let server = NodeIdentity::from_seed([72u8; 32]);
+            let trust_root = NodeIdentity::from_seed([70u8; 32]).node_id();
+            let server_ep = test_endpoint(&server).await;
+            let addr =
+                endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
+            let config = ServeConfig {
+                trust_root,
+                scope: None,
+                crl: Crl::new(),
+                roster_head: None,
+                membership: Membership::mint(signer, server.node_id(), 0, i64::MAX).unwrap(),
+                proof: None,
+                command: vec!["cat".to_string()],
+            };
+            let srv = tokio::spawn(serve_on(server_ep, config));
+            let client_ep = test_endpoint(client).await;
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = connect_on(
+                client_ep,
+                addr,
+                client_membership,
+                None,
+                None,
+                true, // ticket-less → verify the responder
+                std::io::Cursor::new(b"ping".to_vec()),
+                &mut out,
+                &mut err,
+            )
+            .await;
+            srv.abort();
+            code
+        }
+
+        // Server membership signed by the trusted root → success.
+        assert!(run(&root, membership.clone(), &client).await.is_ok());
+        // Server membership signed by a different root → dialer aborts.
+        assert!(run(&evil, membership, &client).await.is_err());
+    }
 }
