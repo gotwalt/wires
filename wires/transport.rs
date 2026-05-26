@@ -19,8 +19,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::presets::N0;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use library::{
-    Chunk, Crl, Frame, Grant, Membership, NodeId, NodeIdentity, Scope, check_accept,
-    check_inclusion,
+    Chunk, Crl, Frame, Grant, InclusionProof, Membership, NodeId, NodeIdentity, RosterHead, Scope,
+    check_accept, check_inclusion, check_roster_inclusion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
@@ -28,9 +28,10 @@ use tokio::sync::mpsc;
 
 /// The custom ALPN identifying a wires capability session.
 ///
-/// Bumped to `/1` for the membership-bearing handshake: a peer speaking the
-/// old `/0` protocol fails cleanly at connect time rather than mid-handshake.
-pub const ALPN: &[u8] = b"wires/session/1";
+/// Bumped to `/2` for the mutual-inclusion handshake (a proof in the dialer's
+/// handshake and a `HandshakeAck` carrying the responder's own membership): a
+/// peer speaking `/1` fails cleanly at connect time rather than mid-handshake.
+pub const ALPN: &[u8] = b"wires/session/2";
 
 /// Read buffer size for pumping child / local stdio into frames.
 const PUMP_BUF: usize = 64 * 1024;
@@ -43,6 +44,27 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// How long a responder waits for the opening handshake before giving up, so a
 /// peer that connects but never speaks can't hold a session task open.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The responder's static configuration: what it trusts, what it serves, the
+/// optional roster head it enforces, the identity it presents in the ack, and
+/// the child to exec. Built once per `serve` and shared across connections.
+pub struct ServeConfig {
+    /// The trusted fabric root whose memberships, grants, and head are honored.
+    pub trust_root: NodeId,
+    /// The scope this responder serves; `None` is inclusion-only.
+    pub scope: Option<Scope>,
+    /// The revocation list applied to the slice-1 credential checks.
+    pub crl: Crl,
+    /// When `Some`, the head a caller's inclusion proof is checked against.
+    pub roster_head: Option<RosterHead>,
+    /// The responder's own membership, presented in the `HandshakeAck`.
+    pub membership: Membership,
+    /// The responder's own inclusion proof, presented if set (unused by the
+    /// dialer in this slice; reverse roster-freshness is deferred).
+    pub proof: Option<InclusionProof>,
+    /// The command (program + args) to exec per session.
+    pub command: Vec<String>,
+}
 
 // ---------------------------------------------------------------------------
 // Key bridge: our `library` identities <-> iroh's
@@ -179,53 +201,31 @@ async fn pump_reader<R: AsyncRead + Unpin>(
 // ---------------------------------------------------------------------------
 
 /// Bind for `node` and serve the session ALPN (see [`serve_on`]).
-pub async fn serve(
-    node: NodeIdentity,
-    trust_root: NodeId,
-    scope: Option<Scope>,
-    crl: Crl,
-    relay_url: Option<&str>,
-    command: Vec<String>,
-) -> Result<()> {
+pub async fn serve(node: NodeIdentity, config: ServeConfig, relay_url: Option<&str>) -> Result<()> {
     let endpoint = bind(&node, relay_url).await?;
-    serve_on(endpoint, trust_root, scope, crl, command).await
+    serve_on(endpoint, config).await
 }
 
-/// Accept connections on `endpoint`, verifying each caller's membership (and,
-/// when `scope` is `Some`, a matching grant) against `trust_root` / `crl`, then
-/// exec `command` and bridge its stdio.
-///
-/// A `None` scope is an **inclusion-only** responder: any fabric member may open
-/// a session and the served child authorizes from the injected identity. One
-/// spawned task per connection; a rejected or failed connection is logged at
-/// `warn` (via `tracing`) and does not bring down the listener.
-pub async fn serve_on(
-    endpoint: Endpoint,
-    trust_root: NodeId,
-    scope: Option<Scope>,
-    crl: Crl,
-    command: Vec<String>,
-) -> Result<()> {
+/// Accept connections on `endpoint`, verifying each caller against `config`, then
+/// exec `config.command` and bridge its stdio. One task per connection; a
+/// rejected or failed connection is logged at `warn` and does not stop the
+/// listener.
+pub async fn serve_on(endpoint: Endpoint, config: ServeConfig) -> Result<()> {
     tracing::info!(
         node = %to_node_id(&endpoint.id()).hex(),
-        scope = ?scope.as_ref().map(Scope::as_str),
+        scope = ?config.scope.as_ref().map(Scope::as_str),
+        enforcing_head = config.roster_head.is_some(),
         sockets = ?endpoint.bound_sockets(),
         "serving session ALPN (egress-only)"
     );
-    if scope.is_none() {
+    if config.scope.is_none() {
         tracing::warn!("inclusion-only: any fabric member may connect");
     }
-    let scope = Arc::new(scope);
-    let crl = Arc::new(crl);
-    let command = Arc::new(command);
+    let config = Arc::new(config);
     while let Some(incoming) = endpoint.accept().await {
-        let scope = Arc::clone(&scope);
-        let crl = Arc::clone(&crl);
-        let command = Arc::clone(&command);
+        let config = Arc::clone(&config);
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(incoming, trust_root, (*scope).as_ref(), &crl, &command).await
-            {
+            if let Err(e) = handle_connection(incoming, &config).await {
                 tracing::warn!("connection rejected or failed: {e:#}");
             }
         });
@@ -234,19 +234,13 @@ pub async fn serve_on(
 }
 
 /// Accept one inbound iroh connection, then run the session over its bi-stream.
-async fn handle_connection(
-    incoming: iroh::endpoint::Incoming,
-    trust_root: NodeId,
-    scope: Option<&Scope>,
-    crl: &Crl,
-    command: &[String],
-) -> Result<()> {
+async fn handle_connection(incoming: iroh::endpoint::Incoming, config: &ServeConfig) -> Result<()> {
     let conn = incoming.await.context("accepting connection")?;
     let caller = to_node_id(&conn.remote_id());
     tracing::info!(caller = %caller.hex(), "connection accepted (iroh-authenticated)");
     let (send, recv) = conn.accept_bi().await.context("accepting bi-stream")?;
 
-    serve_session(send, recv, caller, trust_root, scope, crl, command).await?;
+    serve_session(send, recv, caller, config).await?;
 
     // Wait for the dialer to read the final frames and close, so we don't tear
     // the connection down mid-flush. Bounded so a vanished dialer can't pin us.
@@ -255,18 +249,14 @@ async fn handle_connection(
 }
 
 /// The responder half of a session over an established, already-authenticated
-/// bi-stream: read and verify the handshake against `caller`, then exec
-/// `command` and bridge its stdio. Transport-agnostic (tested over in-memory
-/// pipes); `caller` must already be authenticated by whoever supplies the
-/// streams.
+/// bi-stream: read and verify the handshake against `caller` and `config`, send a
+/// `HandshakeAck`, then exec `config.command` and bridge its stdio. `caller` must
+/// already be authenticated by whoever supplies the streams.
 async fn serve_session<S, R>(
-    send: S,
+    mut send: S,
     mut recv: R,
     caller: NodeId,
-    trust_root: NodeId,
-    scope: Option<&Scope>,
-    crl: &Crl,
-    command: &[String],
+    config: &ServeConfig,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin + Send + 'static,
@@ -277,8 +267,12 @@ where
     let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut recv))
         .await
         .context("timed out waiting for handshake")??;
-    let (membership, grant) = match first {
-        Some(Frame::Handshake { membership, grant }) => (membership, grant),
+    let (membership, grant, proof) = match first {
+        Some(Frame::Handshake {
+            membership,
+            grant,
+            proof,
+        }) => (membership, grant, proof),
         Some(_) => bail!("first frame was not a handshake"),
         None => bail!("connection closed before handshake"),
     };
@@ -286,15 +280,15 @@ where
 
     // Inclusion is always required: the caller must prove fabric membership,
     // bound to its iroh-authenticated key.
-    check_inclusion(&membership, trust_root, caller, now, crl)
+    check_inclusion(&membership, config.trust_root, caller, now, &config.crl)
         .map_err(|e| anyhow!("membership rejected: {e}"))?;
 
     // A scoped responder additionally requires a matching, accepted grant.
-    if let Some(scope) = scope {
+    if let Some(scope) = config.scope.as_ref() {
         let grant = grant
             .as_ref()
             .ok_or_else(|| anyhow!("scoped session requires a grant; none presented"))?;
-        check_accept(grant, trust_root, caller, now, crl)
+        check_accept(grant, config.trust_root, caller, now, &config.crl)
             .map_err(|e| anyhow!("grant rejected: {e}"))?;
         if grant.scope.as_str() != scope.as_str() {
             bail!(
@@ -313,33 +307,54 @@ where
     {
         bail!("grant subject does not match membership member");
     }
+
+    // Roster head gate: when a head is configured, require a proof and check the
+    // caller's *current* membership; remember the admitting version.
+    let roster_version = roster_gate(config, proof.as_ref(), caller, now)?;
+
     tracing::info!(
         caller = %caller.hex(),
-        scope = ?scope.map(Scope::as_str),
+        scope = ?config.scope.as_ref().map(Scope::as_str),
+        roster_version = ?roster_version,
         "session accepted"
     );
 
+    // Mutual inclusion: present our own membership (+ optional proof) so a
+    // ticket-less dialer can verify us before streaming stdin. Written directly
+    // on `send` so it is the first frame back, before any child output.
+    write_frame(
+        &mut send,
+        &Frame::HandshakeAck {
+            membership: config.membership.clone(),
+            proof: config.proof.clone(),
+        },
+    )
+    .await?;
+
     // Spawn the configured child with piped stdio, injecting the verified caller
-    // identity. Scrub any inherited `WIRES_*` first so a malicious parent
-    // environment cannot smuggle a stale identity to a child that trusts it.
-    // These are *server-derived, post-verification* values — `caller` is the
-    // iroh-authenticated peer, never a handshake claim — and are public ids, not
-    // secrets.
-    let (program, args) = command
+    // identity (and the admitting roster version, if any). Scrub any inherited
+    // `WIRES_*` first so a malicious parent environment cannot smuggle a stale
+    // identity to a child that trusts it. These are *server-derived,
+    // post-verification* values — `caller` is the iroh-authenticated peer, never a
+    // handshake claim — and are public ids, not secrets.
+    let (program, args) = config
+        .command
         .split_first()
         .ok_or_else(|| anyhow!("empty serve command"))?;
     tracing::info!(program = %program, "spawning child and bridging stdio");
-    let mut child = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .env_remove("WIRES_CALLER_NODE")
         .env_remove("WIRES_FABRIC_ROOT")
         .env_remove("WIRES_MEMBERSHIP_NOT_AFTER")
+        .env_remove("WIRES_ROSTER_VERSION")
         .env("WIRES_CALLER_NODE", caller.hex())
-        .env("WIRES_FABRIC_ROOT", trust_root.hex())
-        .env(
-            "WIRES_MEMBERSHIP_NOT_AFTER",
-            membership.not_after.to_string(),
-        )
+        .env("WIRES_FABRIC_ROOT", config.trust_root.hex())
+        .env("WIRES_MEMBERSHIP_NOT_AFTER", membership.not_after.to_string());
+    if let Some(v) = roster_version {
+        cmd.env("WIRES_ROSTER_VERSION", v.to_string());
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -391,6 +406,25 @@ where
     Ok(())
 }
 
+/// The roster head gate. When `config.roster_head` is `None`, returns `Ok(None)`
+/// (slice-1 behavior). When `Some`, requires `proof` and checks the caller's
+/// *current* membership against the head, returning the admitting version for
+/// `WIRES_ROSTER_VERSION`.
+fn roster_gate(
+    config: &ServeConfig,
+    proof: Option<&InclusionProof>,
+    caller: NodeId,
+    now: i64,
+) -> Result<Option<u64>> {
+    let Some(head) = config.roster_head.as_ref() else {
+        return Ok(None);
+    };
+    let proof = proof.ok_or(library::Error::InclusionProofRequired)?;
+    check_roster_inclusion(head, proof, config.trust_root, caller, now)
+        .map_err(|e| anyhow!("roster inclusion rejected: {e}"))?;
+    Ok(Some(head.version.0))
+}
+
 // ---------------------------------------------------------------------------
 // Dialer (`wires connect`)
 // ---------------------------------------------------------------------------
@@ -402,6 +436,8 @@ pub async fn connect_io<R, W, E>(
     target: EndpointAddr,
     membership: Membership,
     grant: Option<Grant>,
+    proof: Option<InclusionProof>,
+    ticketless: bool,
     relay_url: Option<&str>,
     stdin: R,
     stdout: W,
@@ -413,17 +449,23 @@ where
     E: AsyncWrite + Unpin,
 {
     let endpoint = bind(&node, relay_url).await?;
-    connect_on(endpoint, target, membership, grant, stdin, stdout, stderr).await
+    connect_on(
+        endpoint, target, membership, grant, proof, ticketless, stdin, stdout, stderr,
+    )
+    .await
 }
 
-/// Dial `target` on `endpoint`, present `membership` (and `grant`, if any), then
-/// bridge local stdio over the session and return the child's exit code.
+/// Dial `target` on `endpoint`, present `membership` (+ `grant`/`proof` if any),
+/// then bridge local stdio and return the child's exit code. When `ticketless`,
+/// verify the responder's `HandshakeAck` membership before forwarding any stdin.
 #[allow(clippy::too_many_arguments)]
 pub async fn connect_on<R, W, E>(
     endpoint: Endpoint,
     target: EndpointAddr,
     membership: Membership,
     grant: Option<Grant>,
+    proof: Option<InclusionProof>,
+    ticketless: bool,
     stdin: R,
     stdout: W,
     stderr: E,
@@ -438,10 +480,23 @@ where
         .connect(target, ALPN)
         .await
         .map_err(|e| anyhow!("dialing target: {e}"))?;
+    let target_id = to_node_id(&conn.remote_id());
     let (send, recv) = conn.open_bi().await.context("opening bi-stream")?;
     tracing::info!("session open; presenting membership and bridging stdio");
 
-    let result = dial_session(send, recv, membership, grant, stdin, stdout, stderr).await;
+    let verify_target = ticketless.then_some(target_id);
+    let result = dial_session(
+        send,
+        recv,
+        membership,
+        grant,
+        proof,
+        verify_target,
+        stdin,
+        stdout,
+        stderr,
+    )
+    .await;
 
     // Close gracefully so our CONNECTION_CLOSE flushes (lets the responder's
     // teardown return promptly, and avoids iroh's "dropped without close" warn),
@@ -450,10 +505,11 @@ where
     result
 }
 
-/// The dialer half of a session over an established bi-stream: present
-/// `membership` (and `grant`, if any), pump local stdin in, and stream the
-/// child's stdout/stderr out, returning its exit code. Transport-agnostic
-/// (tested over in-memory pipes).
+/// The dialer half of a session over an established bi-stream. Presents the
+/// handshake, then reads the responder's `HandshakeAck`; when `verify_target` is
+/// `Some` (ticket-less mode), verifies the responder's membership against the
+/// dialer's own fabric root and the authenticated target id **before** any stdin
+/// is forwarded. On failure, aborts with no stdin sent.
 ///
 /// Errors if the session ends **without** an [`Frame::Exit`] — a responder that
 /// closes mid-session is a failure, not a silent success.
@@ -463,6 +519,8 @@ async fn dial_session<S, R, I, W, E>(
     mut recv: R,
     membership: Membership,
     grant: Option<Grant>,
+    proof: Option<InclusionProof>,
+    verify_target: Option<NodeId>,
     stdin: I,
     mut stdout: W,
     mut stderr: E,
@@ -474,7 +532,36 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    write_frame(&mut send, &Frame::Handshake { membership, grant }).await?;
+    // The dialer's own fabric root is the authority for verifying the responder.
+    let fabric_root = membership.fabric;
+    write_frame(
+        &mut send,
+        &Frame::Handshake {
+            membership,
+            grant,
+            proof,
+        },
+    )
+    .await?;
+
+    // Read the responder's ack first (it is always the responder's first frame).
+    let ack_membership = match read_frame(&mut recv).await? {
+        Some(Frame::HandshakeAck { membership, .. }) => membership,
+        Some(_) => bail!("responder's first frame was not a handshake ack"),
+        None => bail!("responder closed before sending a handshake ack"),
+    };
+    // Ticket-less: verify the service is a fabric member before streaming stdin.
+    // Credential-only (root-vouched + TTL); reverse roster-freshness is deferred.
+    if let Some(target_id) = verify_target {
+        check_inclusion(
+            &ack_membership,
+            fabric_root,
+            target_id,
+            crate::now_unix(),
+            &Crl::new(),
+        )
+        .map_err(|e| anyhow!("responder membership rejected (no stdin sent): {e}"))?;
+    }
 
     // Local stdin -> Stdin frames, then shut down the send direction (EOF).
     let stdin_task = tokio::spawn(async move {
@@ -578,8 +665,13 @@ mod tests {
         let grant = Grant::mint(&root, subject, Scope::new("tools.rg"), i64::MAX).unwrap();
         let frames = vec![
             Frame::Handshake {
-                membership,
+                membership: membership.clone(),
                 grant: Some(grant),
+                proof: None,
+            },
+            Frame::HandshakeAck {
+                membership,
+                proof: None,
             },
             Frame::Stdin(Chunk::from_bytes(b"hi".to_vec())),
             Frame::Stdout(Chunk::from_bytes(Vec::new())),
@@ -606,8 +698,28 @@ mod tests {
         assert!(read_frame(&mut cur).await.is_err());
     }
 
+    /// A responder config for tests: server is a fabric member under `root`.
+    fn test_config(
+        root: &NodeIdentity,
+        server: NodeId,
+        scope: Option<&str>,
+        crl: Crl,
+        command: Vec<String>,
+    ) -> ServeConfig {
+        ServeConfig {
+            trust_root: root.node_id(),
+            scope: scope.map(Scope::new),
+            crl,
+            roster_head: None,
+            membership: Membership::mint(root, server, 0, i64::MAX).unwrap(),
+            proof: None,
+            command,
+        }
+    }
+
     /// Run a full session over two in-memory duplex pipes (no iroh): returns the
-    /// dialer's exit result plus captured stdout/stderr.
+    /// dialer's exit result plus captured stdout/stderr. Ticketed (grant present,
+    /// ack ignored).
     async fn run_session(
         command: Vec<String>,
         input: &[u8],
@@ -615,26 +727,15 @@ mod tests {
     ) -> (Result<i32>, Vec<u8>, Vec<u8>) {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
         let membership = Membership::mint(&root, caller, 0, i64::MAX).unwrap();
         let grant = Grant::mint(&root, caller, Scope::new(served_scope), i64::MAX).unwrap();
 
         let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024); // dialer -> responder
         let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024); // responder -> dialer
 
-        let scope = Scope::new(served_scope);
-        let root_id = root.node_id();
-        let srv = tokio::spawn(async move {
-            serve_session(
-                s2c_w,
-                c2s_r,
-                caller,
-                root_id,
-                Some(&scope),
-                &Crl::new(),
-                &command,
-            )
-            .await
-        });
+        let config = test_config(&root, server, Some(served_scope), Crl::new(), command);
+        let srv = tokio::spawn(async move { serve_session(s2c_w, c2s_r, caller, &config).await });
 
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -643,6 +744,8 @@ mod tests {
             s2c_r,
             membership,
             Some(grant),
+            None, // dialer proof
+            None, // verify_target: ticketed → ignore ack
             std::io::Cursor::new(input.to_vec()),
             &mut out,
             &mut err,
@@ -662,20 +765,37 @@ mod tests {
         crl: Crl,
         caller: NodeId,
     ) -> bool {
-        let recv = std::io::Cursor::new(Frame::Handshake { membership, grant }.encode().unwrap());
+        let recv = std::io::Cursor::new(
+            Frame::Handshake {
+                membership,
+                grant,
+                proof: None,
+            }
+            .encode()
+            .unwrap(),
+        );
         let send: Vec<u8> = Vec::new();
-        let scope = served_scope.map(Scope::new);
-        serve_session(
-            send,
-            recv,
-            caller,
-            trust_root,
-            scope.as_ref(),
-            &crl,
-            &["cat".to_string()],
+        // The server's own membership is signed under seed [1]; rejection happens
+        // during dialer verification, before the (unreached) ack, so the signer is
+        // irrelevant to these negative tests.
+        let server = NodeIdentity::from_seed([44u8; 32]);
+        let server_membership = Membership::mint(
+            &NodeIdentity::from_seed([1u8; 32]),
+            server.node_id(),
+            0,
+            i64::MAX,
         )
-        .await
-        .is_err()
+        .unwrap();
+        let config = ServeConfig {
+            trust_root,
+            scope: served_scope.map(Scope::new),
+            crl,
+            roster_head: None,
+            membership: server_membership,
+            proof: None,
+            command: vec!["cat".to_string()],
+        };
+        serve_session(send, recv, caller, &config).await.is_err()
     }
 
     #[tokio::test]
@@ -772,23 +892,13 @@ mod tests {
         // No scope: any fabric member may connect; `cat` echoes stdin.
         let root = NodeIdentity::from_seed([1u8; 32]);
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
         let membership = valid_membership(&root, caller);
 
         let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
         let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
-        let root_id = root.node_id();
-        let srv = tokio::spawn(async move {
-            serve_session(
-                s2c_w,
-                c2s_r,
-                caller,
-                root_id,
-                None,
-                &Crl::new(),
-                &["cat".to_string()],
-            )
-            .await
-        });
+        let config = test_config(&root, server, None, Crl::new(), vec!["cat".to_string()]);
+        let srv = tokio::spawn(async move { serve_session(s2c_w, c2s_r, caller, &config).await });
 
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -797,6 +907,8 @@ mod tests {
             s2c_r,
             membership,
             None,
+            None,
+            None, // ticketed-style call: do not verify ack
             std::io::Cursor::new(b"hi inclusion".to_vec()),
             &mut out,
             &mut err,
@@ -902,10 +1014,13 @@ mod tests {
         let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
         let srv = tokio::spawn(serve_on(
             server_ep,
-            root.node_id(),
-            Some(scope),
-            Crl::new(),
-            vec!["cat".to_string()],
+            test_config(
+                &root,
+                server.node_id(),
+                Some("tools.cat"),
+                Crl::new(),
+                vec!["cat".to_string()],
+            ),
         ));
 
         let client_ep = test_endpoint(&client).await;
@@ -916,6 +1031,8 @@ mod tests {
             addr,
             membership,
             Some(grant),
+            None,  // proof
+            false, // ticketed
             std::io::Cursor::new(b"hello world".to_vec()),
             &mut out,
             &mut err,
@@ -943,15 +1060,18 @@ mod tests {
         let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
         let srv = tokio::spawn(serve_on(
             server_ep,
-            root.node_id(),
-            None, // inclusion-only
-            Crl::new(),
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                r#"printf "%s,%s,%s" "$WIRES_CALLER_NODE" "$WIRES_FABRIC_ROOT" "$WIRES_MEMBERSHIP_NOT_AFTER""#
-                    .to_string(),
-            ],
+            test_config(
+                &root,
+                server.node_id(),
+                None,
+                Crl::new(),
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    r#"printf "%s,%s,%s" "$WIRES_CALLER_NODE" "$WIRES_FABRIC_ROOT" "$WIRES_MEMBERSHIP_NOT_AFTER""#
+                        .to_string(),
+                ],
+            ),
         ));
 
         let client_ep = test_endpoint(&client).await;
@@ -962,6 +1082,8 @@ mod tests {
             addr,
             membership,
             None,
+            None, // proof
+            true, // ticket-less → verify the responder's ack
             std::io::Cursor::new(Vec::new()),
             &mut out,
             &mut err,
@@ -997,10 +1119,13 @@ mod tests {
         let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
         let srv = tokio::spawn(serve_on(
             server_ep,
-            trusted_root.node_id(),
-            Some(scope),
-            Crl::new(),
-            vec!["cat".to_string()],
+            test_config(
+                &trusted_root,
+                server.node_id(),
+                Some("tools.cat"),
+                Crl::new(),
+                vec!["cat".to_string()],
+            ),
         ));
 
         let client_ep = test_endpoint(&client).await;
@@ -1013,6 +1138,8 @@ mod tests {
             addr,
             membership,
             Some(grant),
+            None,  // proof
+            false, // ticketed
             std::io::Cursor::new(Vec::new()),
             &mut out,
             &mut err,
@@ -1040,14 +1167,17 @@ mod tests {
         let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
         let srv = tokio::spawn(serve_on(
             server_ep,
-            trusted_root.node_id(),
-            None, // inclusion-only
-            Crl::new(),
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "echo SHOULD_NOT_RUN".to_string(),
-            ],
+            test_config(
+                &trusted_root,
+                server.node_id(),
+                None,
+                Crl::new(),
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "echo SHOULD_NOT_RUN".to_string(),
+                ],
+            ),
         ));
 
         let client_ep = test_endpoint(&client).await;
@@ -1058,6 +1188,8 @@ mod tests {
             addr,
             membership,
             None,
+            None, // proof
+            true, // ticket-less
             std::io::Cursor::new(Vec::new()),
             &mut out,
             &mut err,
