@@ -166,17 +166,50 @@ pub struct Roster {
 
 /// `blake3(0x00 || member bytes)` — the domain-separated leaf hash.
 fn leaf_hash(member: &NodeId) -> MerkleRoot {
-    todo!("leaf hash")
+    let mut h = blake3::Hasher::new();
+    h.update(&[LEAF_PREFIX]);
+    h.update(member.as_bytes());
+    MerkleRoot(*h.finalize().as_bytes())
 }
 
 /// `blake3(0x01 || left || right)` — the domain-separated internal-node hash.
 fn node_hash(left: &MerkleRoot, right: &MerkleRoot) -> MerkleRoot {
-    todo!("node hash")
+    let mut h = blake3::Hasher::new();
+    h.update(&[NODE_PREFIX]);
+    h.update(&left.0);
+    h.update(&right.0);
+    MerkleRoot(*h.finalize().as_bytes())
 }
 
 /// The Merkle root of the empty set: a fixed sentinel, `blake3` of empty input.
 fn empty_root() -> MerkleRoot {
-    todo!("empty sentinel")
+    MerkleRoot(*blake3::hash(&[]).as_bytes())
+}
+
+/// Build the tree levels bottom-up from `leaves` (level 0 = the leaves). An odd
+/// node at any level carries up unchanged (the CT rule). `leaves` must be the
+/// leaf hashes of the *sorted* member set. Returns `None` for an empty set.
+fn build_levels(leaves: Vec<MerkleRoot>) -> Option<Vec<Vec<MerkleRoot>>> {
+    if leaves.is_empty() {
+        return None;
+    }
+    let mut levels = vec![leaves];
+    while levels.last().expect("non-empty").len() > 1 {
+        let cur = levels.last().expect("non-empty");
+        let mut next = Vec::with_capacity(cur.len().div_ceil(2));
+        let mut i = 0;
+        while i < cur.len() {
+            if i + 1 < cur.len() {
+                next.push(node_hash(&cur[i], &cur[i + 1]));
+                i += 2;
+            } else {
+                next.push(cur[i]); // odd node carries up unchanged
+                i += 1;
+            }
+        }
+        levels.push(next);
+    }
+    Some(levels)
 }
 
 impl RosterHead {
@@ -221,27 +254,35 @@ impl InclusionProof {
 impl Roster {
     /// A fresh, empty roster for `fabric` at version 0.
     pub fn new(fabric: NodeId) -> Roster {
-        todo!("new roster")
+        Roster {
+            fabric,
+            version: RosterVersion(0),
+            members: BTreeSet::new(),
+        }
     }
 
     /// Add `member`; returns whether the set changed.
     pub fn insert(&mut self, member: NodeId) -> bool {
-        todo!("insert")
+        self.members.insert(member)
     }
 
     /// Remove `member`; returns whether the set changed.
     pub fn remove(&mut self, member: &NodeId) -> bool {
-        todo!("remove")
+        self.members.remove(member)
     }
 
     /// Whether `member` is in the set.
     pub fn contains(&self, member: &NodeId) -> bool {
-        todo!("contains")
+        self.members.contains(member)
     }
 
     /// The current Merkle root over the sorted member set (no signing).
     pub fn root_hash(&self) -> MerkleRoot {
-        todo!("root hash")
+        let leaves: Vec<MerkleRoot> = self.members.iter().map(leaf_hash).collect();
+        match build_levels(leaves) {
+            None => empty_root(),
+            Some(levels) => levels.last().expect("non-empty")[0],
+        }
     }
 
     /// The inclusion path for `member`, or `None` if not a member.
@@ -259,5 +300,93 @@ impl Roster {
         not_after: i64,
     ) -> Result<(RosterHead, Vec<(NodeId, InclusionProof)>)> {
         todo!("commit")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(b: u8) -> NodeId {
+        NodeId::from_bytes([b; 32])
+    }
+
+    /// The leaf hash is `blake3(0x00 || member)` — pinned against raw blake3.
+    #[test]
+    fn leaf_hash_is_domain_separated() {
+        let m = id(0x11);
+        let mut h = blake3::Hasher::new();
+        h.update(&[LEAF_PREFIX]);
+        h.update(m.as_bytes());
+        assert_eq!(leaf_hash(&m).as_bytes(), h.finalize().as_bytes());
+    }
+
+    /// The node hash is `blake3(0x01 || left || right)` — pinned against raw blake3.
+    #[test]
+    fn node_hash_is_domain_separated() {
+        let l = MerkleRoot::from_bytes([1u8; 32]);
+        let r = MerkleRoot::from_bytes([2u8; 32]);
+        let mut h = blake3::Hasher::new();
+        h.update(&[NODE_PREFIX]);
+        h.update(&[1u8; 32]);
+        h.update(&[2u8; 32]);
+        assert_eq!(node_hash(&l, &r).as_bytes(), h.finalize().as_bytes());
+    }
+
+    /// The leaf and node prefixes differ, so an internal node can never be
+    /// passed off as a leaf (second-preimage resistance).
+    #[test]
+    fn leaf_and_node_prefixes_differ() {
+        assert_ne!(LEAF_PREFIX, NODE_PREFIX);
+    }
+
+    /// Empty set → the fixed sentinel `blake3(&[])`.
+    #[test]
+    fn empty_set_root_is_sentinel() {
+        let r = Roster::new(id(0));
+        assert_eq!(r.root_hash().as_bytes(), blake3::hash(&[]).as_bytes());
+    }
+
+    /// One member → its leaf hash (RFC 6962 single-leaf rule).
+    #[test]
+    fn single_member_root_is_its_leaf() {
+        let mut r = Roster::new(id(0));
+        r.insert(id(0x11));
+        assert_eq!(r.root_hash(), leaf_hash(&id(0x11)));
+    }
+
+    /// Two members → `node(leaf(min), leaf(max))`, sorted by bytes regardless of
+    /// insertion order.
+    #[test]
+    fn two_member_root_is_node_of_sorted_leaves() {
+        let a = id(0x11);
+        let b = id(0x22);
+        let expect = node_hash(&leaf_hash(&a), &leaf_hash(&b));
+
+        let mut r1 = Roster::new(id(0));
+        r1.insert(a);
+        r1.insert(b);
+        let mut r2 = Roster::new(id(0));
+        r2.insert(b); // reverse insertion order
+        r2.insert(a);
+
+        assert_eq!(r1.root_hash(), expect);
+        assert_eq!(r2.root_hash(), expect, "root must be order-independent");
+    }
+
+    /// Three members → `node(node(leaf(a),leaf(b)), leaf(c))` — the odd node `c`
+    /// carries up unchanged (CT rule), with a<b<c by bytes.
+    #[test]
+    fn three_member_root_carries_odd_node() {
+        let a = id(0x01);
+        let b = id(0x02);
+        let c = id(0x03);
+        let expect = node_hash(&node_hash(&leaf_hash(&a), &leaf_hash(&b)), &leaf_hash(&c));
+
+        let mut r = Roster::new(id(0));
+        r.insert(c);
+        r.insert(a);
+        r.insert(b);
+        assert_eq!(r.root_hash(), expect);
     }
 }
