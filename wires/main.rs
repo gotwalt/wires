@@ -14,6 +14,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use anyhow::Context;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use library::{CapabilityTicket, Crl, Grant, Membership, NodeId, NodeIdentity, Scope};
 
@@ -33,6 +34,8 @@ enum Command {
     Grant(GrantArgs),
     /// Mint a fabric membership and print its base64 token.
     Member(MemberArgs),
+    /// Author the fabric roster (add/remove members, sign a committed head).
+    Roster(RosterArgs),
     /// Add a subject to the CRL (keystore by default) and print the result.
     Revoke(RevokeArgs),
     /// Issue a grant over the wire (announce/consent), instead of pasting ids.
@@ -123,6 +126,61 @@ struct MemberArgs {
     save: bool,
 }
 
+/// `roster` has four offline operations on the local `roster.json`.
+#[derive(Args)]
+struct RosterArgs {
+    #[command(subcommand)]
+    cmd: RosterCmd,
+}
+
+#[derive(Subcommand)]
+enum RosterCmd {
+    /// Add a member to the local roster (no signing).
+    Add(RosterMemberArgs),
+    /// Remove a member from the local roster (no signing).
+    Remove(RosterMemberArgs),
+    /// Bump the version, build the tree, sign a head, and emit per-member proofs.
+    Commit(RosterCommitArgs),
+    /// Print the current head token (from the keystore `roster-head.json`).
+    Head,
+}
+
+/// `roster add` / `roster remove`: the member to (de)list and an optional fabric
+/// override (defaults to the keystore root identity's node id).
+#[derive(Args)]
+struct RosterMemberArgs {
+    /// Hex node id of the member to add/remove.
+    #[arg(long)]
+    member: String,
+    /// Hex node id of the fabric (defaults to the keystore root key's node id),
+    /// used only when creating a fresh `roster.json`.
+    #[arg(long)]
+    fabric: Option<String>,
+}
+
+/// `roster commit`: the root signing key, the head's expiry, and where to write
+/// the emitted per-member proofs.
+#[derive(Args)]
+struct RosterCommitArgs {
+    /// Hex 32-byte seed of the root (signing) key. Falls back to env / file /
+    /// keystore (`root.seed`).
+    #[arg(long)]
+    root_seed: Option<String>,
+    /// Read the root key seed (hex) from this file instead of the keystore.
+    #[arg(long)]
+    root_seed_file: Option<PathBuf>,
+    /// Seconds from now until the head expires (mutually exclusive with `--not-after`).
+    #[arg(long, conflicts_with = "not_after")]
+    ttl: Option<i64>,
+    /// Absolute head expiry, unix seconds (mutually exclusive with `--ttl`).
+    #[arg(long)]
+    not_after: Option<i64>,
+    /// Directory to write each member's `<node-id>.proof` token into. When
+    /// omitted, the proofs are printed to stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
 /// `revoke` arguments: the subject to revoke and which CRL to extend.
 ///
 /// With neither `--crl-json` nor `--crl-file`, the keystore's `crl.json` is read
@@ -173,6 +231,29 @@ struct ServeArgs {
     /// Use a self-hosted relay at this URL instead of the n0 default.
     #[arg(long)]
     relay_url: Option<String>,
+    /// The responder's own membership token, presented in the handshake ack so a
+    /// ticket-less dialer can verify it. Falls back to `$WIRES_MEMBERSHIP`, then
+    /// `--membership-file`, then the keystore (`membership.json`).
+    #[arg(long)]
+    membership: Option<String>,
+    /// Read the responder's membership token from this file.
+    #[arg(long)]
+    membership_file: Option<PathBuf>,
+    /// The signed roster head this responder enforces (inclusion proof required
+    /// from callers). Falls back to `$WIRES_ROSTER_HEAD`, then
+    /// `--roster-head-file`, then the keystore (`roster-head.json`). Absent ⇒
+    /// slice-1 behavior (membership + CRL + TTL only).
+    #[arg(long)]
+    roster_head: Option<String>,
+    /// Read the roster head token from this file.
+    #[arg(long)]
+    roster_head_file: Option<PathBuf>,
+    /// The responder's own inclusion proof token (optional; presented in the ack).
+    #[arg(long)]
+    inclusion_proof: Option<String>,
+    /// Read the responder's inclusion proof from this file.
+    #[arg(long)]
+    inclusion_proof_file: Option<PathBuf>,
     /// The command (program + args) to exec per session, after `--`.
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -214,6 +295,14 @@ struct ConnectArgs {
     /// Read the membership token from this file instead of the keystore.
     #[arg(long)]
     membership_file: Option<PathBuf>,
+    /// The inclusion proof token to present (required by a head-enforcing
+    /// responder). Falls back to `$WIRES_INCLUSION_PROOF`, then
+    /// `--inclusion-proof-file`, then the keystore (`inclusion-proof.json`).
+    #[arg(long)]
+    inclusion_proof: Option<String>,
+    /// Read the inclusion proof token from this file.
+    #[arg(long)]
+    inclusion_proof_file: Option<PathBuf>,
 }
 
 /// `pair` has two sides: `accept` (operator, holds the root key) and `request`
@@ -418,15 +507,23 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         );
     }
     let crl = keystore::load_crl(a.crl_json.as_deref(), a.crl_file.as_deref())?;
-    transport::serve(
-        node,
+    let membership = keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?;
+    let roster_head =
+        keystore::roster_head(a.roster_head.as_deref(), a.roster_head_file.as_deref())?;
+    let proof = keystore::inclusion_proof(
+        a.inclusion_proof.as_deref(),
+        a.inclusion_proof_file.as_deref(),
+    )?;
+    let config = transport::ServeConfig {
         trust_root,
         scope,
         crl,
-        a.relay_url.as_deref(),
-        a.command,
-    )
-    .await
+        roster_head,
+        membership,
+        proof,
+        command: a.command,
+    };
+    transport::serve(node, config, a.relay_url.as_deref()).await
 }
 
 /// `connect`: present the dialer's membership, dial the target (from a ticket or
@@ -436,6 +533,14 @@ async fn connect_cmd(a: ConnectArgs) -> anyhow::Result<i32> {
     init_logging();
     let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
     let membership = keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?;
+    let proof = keystore::inclusion_proof(
+        a.inclusion_proof.as_deref(),
+        a.inclusion_proof_file.as_deref(),
+    )?;
+
+    // A bare `--target` (no ticket) is a ticket-less session: verify the
+    // responder's ack before streaming stdin.
+    let ticketless = a.ticket.is_none();
 
     // Resolve where to dial and whether a grant rides along. The clap group
     // guarantees exactly one of `--ticket` / `--target`.
@@ -462,6 +567,8 @@ async fn connect_cmd(a: ConnectArgs) -> anyhow::Result<i32> {
         target,
         membership,
         grant,
+        proof,
+        ticketless,
         relay.as_deref(),
         tokio::io::stdin(),
         tokio::io::stdout(),
@@ -492,7 +599,11 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         // Offline admin commands print to stdout (or fail with a message).
-        Command::Keygen(_) | Command::Grant(_) | Command::Member(_) | Command::Revoke(_) => {
+        Command::Keygen(_)
+        | Command::Grant(_)
+        | Command::Member(_)
+        | Command::Revoke(_)
+        | Command::Roster(_) => {
             match cli_admin(cli.command) {
                 Ok(out) => println!("{out}"),
                 Err(e) => {
@@ -596,6 +707,7 @@ fn cli_admin(command: Command) -> Result<String, String> {
             .map_err(stringify)
         }
         Command::Member(a) => run_member_cmd(a),
+        Command::Roster(a) => run_roster_cmd(a),
         Command::Revoke(a) => run_revoke_cmd(a).map_err(stringify),
         Command::Pair(_) | Command::Serve(_) | Command::Connect(_) => {
             unreachable!("handled in main")
@@ -615,6 +727,103 @@ fn run_member_cmd(a: MemberArgs) -> Result<String, String> {
         ks.save_membership(&membership).map_err(stringify)?;
     }
     membership.encode().map_err(stringify)
+}
+
+/// `roster`: dispatch the four offline roster operations.
+fn run_roster_cmd(a: RosterArgs) -> Result<String, String> {
+    match a.cmd {
+        RosterCmd::Add(m) => roster_edit(&m, true).map_err(stringify),
+        RosterCmd::Remove(m) => roster_edit(&m, false).map_err(stringify),
+        RosterCmd::Commit(c) => roster_commit(c).map_err(stringify),
+        RosterCmd::Head => roster_head_token().map_err(stringify),
+    }
+}
+
+/// Add or remove `member` in the keystore `roster.json`, persisting the result.
+/// Creates the roster (fabric = `--fabric` or the root key's node id) on first use.
+fn roster_edit(a: &RosterMemberArgs, add: bool) -> anyhow::Result<String> {
+    let ks = keystore::Keystore::resolve()?;
+    let member = NodeId::from_hex(&a.member)?;
+    let mut roster = match ks.read_roster()? {
+        Some(r) => r,
+        None => {
+            let fabric = match a.fabric.as_deref() {
+                Some(hex) => NodeId::from_hex(hex)?,
+                None => keystore::root_identity(None, None)
+                    .context("resolving fabric id from the root key (or pass --fabric)")?
+                    .node_id(),
+            };
+            library::Roster::new(fabric)
+        }
+    };
+    let changed = if add {
+        roster.insert(member)
+    } else {
+        roster.remove(&member)
+    };
+    ks.save_roster(&roster)?;
+    Ok(format!(
+        "{} {} ({} members, version {})",
+        if !changed {
+            "no change for"
+        } else if add {
+            "added"
+        } else {
+            "removed"
+        },
+        member.hex(),
+        roster.members.len(),
+        roster.version.0,
+    ))
+}
+
+/// Sign a head over the current `roster.json`, persist the bumped roster and the
+/// head, and emit each member's proof (to `--out` or stdout). Returns the head token.
+fn roster_commit(a: RosterCommitArgs) -> anyhow::Result<String> {
+    let ks = keystore::Keystore::resolve()?;
+    let root = keystore::root_identity(a.root_seed.as_deref(), a.root_seed_file.as_deref())?;
+    let not_after =
+        resolve_not_after(a.ttl, a.not_after, now_unix()).map_err(anyhow::Error::msg)?;
+    let mut roster = ks.read_roster()?.ok_or_else(|| {
+        anyhow::anyhow!("no roster.json; run `wires roster add --member <id>` first")
+    })?;
+
+    let (head, proofs) = roster.commit(&root, now_unix(), not_after)?;
+    ks.save_roster(&roster)?; // persist the version bump
+    ks.save_roster_head(&head)?;
+
+    let mut lines = Vec::new();
+    for (member, proof) in &proofs {
+        let token = proof.encode()?;
+        match a.out.as_deref() {
+            Some(dir) => {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("creating {}", dir.display()))?;
+                let path = dir.join(format!("{}.proof", member.hex()));
+                std::fs::write(&path, &token)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                lines.push(format!("proof {} -> {}", member.hex(), path.display()));
+            }
+            None => lines.push(format!("proof {} {}", member.hex(), token)),
+        }
+    }
+    let head_token = head.encode()?;
+    Ok(format!(
+        "committed roster version {} ({} members)\nhead {}\n{}",
+        head.version.0,
+        proofs.len(),
+        head_token,
+        lines.join("\n")
+    ))
+}
+
+/// Print the current head token from the keystore `roster-head.json`.
+fn roster_head_token() -> anyhow::Result<String> {
+    let ks = keystore::Keystore::resolve()?;
+    let head = ks
+        .read_roster_head()?
+        .ok_or_else(|| anyhow::anyhow!("no roster-head.json; run `wires roster commit` first"))?;
+    head.encode().map_err(Into::into)
 }
 
 /// Render any error as a string for the admin-command error channel.
@@ -845,5 +1054,32 @@ mod tests {
         assert_eq!(Crl::from_json(&two).unwrap().len(), 2);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn roster_commit_emits_includable_proofs() {
+        // Build a roster directly (the CLI editing path is exercised via keystore
+        // tests); assert commit's proofs pass check_roster_inclusion.
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let member = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let mut roster = library::Roster::new(root.node_id());
+        roster.insert(member);
+        let before = roster.version.0;
+        let (head, proofs) = roster.commit(&root, 0, i64::MAX).unwrap();
+        assert_eq!(head.version.0, before + 1);
+        let proof = proofs.into_iter().find(|(m, _)| *m == member).unwrap().1;
+        assert!(library::check_roster_inclusion(&head, &proof, root.node_id(), member, 0).is_ok());
+    }
+
+    #[test]
+    fn roster_add_remove_changes_membership() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let m = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let mut roster = library::Roster::new(root.node_id());
+        assert!(roster.insert(m));
+        assert!(!roster.insert(m)); // idempotent
+        assert!(roster.contains(&m));
+        assert!(roster.remove(&m));
+        assert!(!roster.contains(&m));
     }
 }
