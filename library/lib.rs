@@ -52,7 +52,7 @@ pub use error::{Error, Result};
 pub use grant::{AlgorithmId, Grant, Scope};
 pub use identity::{NodeId, NodeIdentity, Signature};
 pub use membership::{MEMBERSHIP_V1, Membership};
-pub use policy::{Crl, check_accept, check_inclusion};
+pub use policy::{Crl, check_accept, check_inclusion, check_roster_inclusion};
 pub use roster::{
     InclusionProof, MerkleRoot, MerkleStep, ROSTER_HEAD_V1, Roster, RosterHead, RosterVersion, Side,
 };
