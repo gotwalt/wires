@@ -237,7 +237,14 @@ impl InclusionProof {
     /// Recompute the Merkle root this path implies for `member`. A verifier
     /// compares the result to the `root` in a head it trusts.
     pub fn recompute_root(&self) -> MerkleRoot {
-        todo!("recompute root")
+        let mut acc = leaf_hash(&self.member);
+        for step in &self.path {
+            acc = match step.side {
+                Side::Left => node_hash(&step.hash, &acc),
+                Side::Right => node_hash(&acc, &step.hash),
+            };
+        }
+        acc
     }
 
     /// base64url-no-pad of `canonical_bytes(self)`.
@@ -287,7 +294,35 @@ impl Roster {
 
     /// The inclusion path for `member`, or `None` if not a member.
     pub fn proof_for(&self, member: &NodeId) -> Option<InclusionProof> {
-        todo!("proof for")
+        // Position of `member` among the sorted leaves.
+        let mut idx = self.members.iter().position(|m| m == member)?;
+        let leaves: Vec<MerkleRoot> = self.members.iter().map(leaf_hash).collect();
+        let mut path = Vec::new();
+        if let Some(levels) = build_levels(leaves) {
+            // Walk every level except the root, recording the sibling (if any).
+            for level in &levels[..levels.len() - 1] {
+                if idx % 2 == 1 {
+                    // We are the right child; sibling is on the left.
+                    path.push(MerkleStep {
+                        hash: level[idx - 1],
+                        side: Side::Left,
+                    });
+                } else if idx + 1 < level.len() {
+                    // We are the left child; sibling is on the right.
+                    path.push(MerkleStep {
+                        hash: level[idx + 1],
+                        side: Side::Right,
+                    });
+                }
+                // else: odd node carried up — no sibling at this level.
+                idx /= 2;
+            }
+        }
+        Some(InclusionProof {
+            member: *member,
+            version: self.version,
+            path,
+        })
     }
 
     /// Bump `version`, build the tree, sign a head, and emit every member's
@@ -307,8 +342,66 @@ impl Roster {
 mod tests {
     use super::*;
 
+    use proptest::prelude::*;
+
     fn id(b: u8) -> NodeId {
         NodeId::from_bytes([b; 32])
+    }
+
+    fn seed() -> impl Strategy<Value = [u8; 32]> {
+        proptest::array::uniform32(any::<u8>())
+    }
+
+    proptest! {
+        /// Every member's `proof_for` recomputes to the roster root.
+        #[test]
+        fn member_proof_recomputes_to_root(seeds in proptest::collection::vec(seed(), 1..12)) {
+            let mut r = Roster::new(id(0));
+            for s in &seeds {
+                r.insert(NodeId::from_bytes(*s));
+            }
+            let root = r.root_hash();
+            for m in r.members.clone() {
+                let proof = r.proof_for(&m).expect("member has a proof");
+                prop_assert_eq!(proof.member, m);
+                prop_assert_eq!(proof.recompute_root(), root);
+            }
+        }
+
+        /// A non-member has no proof, and a hand-built path for it does not
+        /// recompute to the root.
+        #[test]
+        fn non_member_has_no_proof(seeds in proptest::collection::vec(seed(), 1..8), os in seed()) {
+            let mut r = Roster::new(id(0));
+            for s in &seeds {
+                r.insert(NodeId::from_bytes(*s));
+            }
+            let outsider = NodeId::from_bytes(os);
+            prop_assume!(!r.contains(&outsider));
+            prop_assert!(r.proof_for(&outsider).is_none());
+
+            // Borrow some member's path but swap in the outsider as the leaf:
+            // it must not recompute to the real root.
+            let some = *r.members.iter().next().unwrap();
+            if let Some(borrowed) = r.proof_for(&some) {
+                let forged = InclusionProof {
+                    member: outsider,
+                    version: borrowed.version,
+                    path: borrowed.path,
+                };
+                prop_assert_ne!(forged.recompute_root(), r.root_hash());
+            }
+        }
+    }
+
+    /// A single member's proof is the empty path (it *is* the root).
+    #[test]
+    fn single_member_proof_is_empty_path() {
+        let mut r = Roster::new(id(0));
+        r.insert(id(0x11));
+        let proof = r.proof_for(&id(0x11)).unwrap();
+        assert!(proof.path.is_empty());
+        assert_eq!(proof.recompute_root(), r.root_hash());
     }
 
     /// The leaf hash is `blake3(0x00 || member)` — pinned against raw blake3.
