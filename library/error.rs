@@ -26,6 +26,14 @@ pub enum Error {
     #[error("unsupported algorithm")]
     UnsupportedAlgorithm,
 
+    /// A credential declared a format version this build does not understand.
+    ///
+    /// Membership credentials carry a *signed* `version` discriminant; a
+    /// verifier rejects any version it was not built for rather than silently
+    /// ignoring fields it cannot interpret (see [`crate::membership`]).
+    #[error("unsupported version")]
+    UnsupportedVersion,
+
     /// The grant's `not_after` is in the past relative to the checked time.
     #[error("grant expired at {not_after}")]
     Expired {
