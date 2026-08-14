@@ -22,10 +22,16 @@
 
 use std::net::SocketAddr;
 
+use base64::Engine;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::error::Result;
+use crate::codec::canonical_bytes;
+use crate::error::{Error, Result};
 use crate::identity::NodeId;
+
+/// The base64 alphabet for ticket text: URL-safe, no padding (matches
+/// [`CapabilityTicket`](crate::CapabilityTicket) and [`Membership`](crate::Membership)).
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// The blake3 `derive_key` context string for topic ids. Frozen: changing it
 /// renames every topic in existence.
@@ -43,8 +49,20 @@ impl TopicId {
     /// Derive the topic id for `name` under the fabric rooted at `fabric`.
     ///
     /// `blake3::derive_key(TOPIC_ID_CONTEXT, fabric_bytes ‖ name_utf8)`.
+    ///
+    /// ```
+    /// use library::{NodeIdentity, TopicId};
+    /// let fabric = NodeIdentity::from_seed([1u8; 32]).node_id();
+    /// // Deriving is pure: two members who type the same name agree.
+    /// assert_eq!(TopicId::derive(fabric, "ops"), TopicId::derive(fabric, "ops"));
+    /// // The name and the fabric both scope the result.
+    /// assert_ne!(TopicId::derive(fabric, "ops"), TopicId::derive(fabric, "eng"));
+    /// ```
     pub fn derive(fabric: NodeId, name: &str) -> TopicId {
-        todo!("derive_key over fabric bytes concatenated with the name")
+        let mut material = Vec::with_capacity(32 + name.len());
+        material.extend_from_slice(fabric.as_bytes());
+        material.extend_from_slice(name.as_bytes());
+        TopicId(blake3::derive_key(TOPIC_ID_CONTEXT, &material))
     }
 
     /// Borrow the raw 32 topic bytes.
@@ -165,12 +183,255 @@ impl TopicTicket {
     }
 
     /// Encode to the base64url (no-pad) text form shared out of band.
+    ///
+    /// ```
+    /// use library::{NodeIdentity, TopicPeer, TopicTicket};
+    /// let fabric = NodeIdentity::from_seed([1u8; 32]).node_id();
+    /// let peer = TopicPeer::new(NodeIdentity::from_seed([2u8; 32]).node_id());
+    /// let ticket = TopicTicket::new(fabric, "ops", vec![peer]);
+    /// assert_eq!(TopicTicket::decode(&ticket.encode().unwrap()).unwrap(), ticket);
+    /// ```
     pub fn encode(&self) -> Result<String> {
-        todo!("base64url-no-pad of the ticket's canonical JSON")
+        Ok(B64.encode(canonical_bytes(self)?))
     }
 
     /// Decode from the base64url (no-pad) text form.
+    ///
+    /// Returns [`crate::Error::TicketDecode`] for non-base64 text and
+    /// [`crate::Error::Decode`] when the bytes are not a ticket.
     pub fn decode(text: &str) -> Result<TopicTicket> {
-        todo!("base64url decode then JSON parse")
+        let bytes = B64.decode(text)?;
+        serde_json::from_slice(&bytes).map_err(Error::Decode)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::NodeIdentity;
+    use proptest::prelude::*;
+
+    fn seed() -> impl Strategy<Value = [u8; 32]> {
+        proptest::array::uniform32(any::<u8>())
+    }
+
+    fn peer() -> impl Strategy<Value = TopicPeer> {
+        (seed(), any::<bool>(), any::<bool>()).prop_map(|(s, with_addrs, with_relay)| {
+            let node = NodeIdentity::from_seed(s).node_id();
+            let addrs = if with_addrs {
+                vec![
+                    "127.0.0.1:3340".parse().unwrap(),
+                    "[2001:db8::1]:4433".parse().unwrap(),
+                ]
+            } else {
+                Vec::new()
+            };
+            TopicPeer::new(node)
+                .with_addrs(addrs)
+                .with_relay_url(with_relay.then(|| "http://relay.example:3340".to_string()))
+        })
+    }
+
+    proptest! {
+        /// Derivation is a pure function of `(fabric, name)`.
+        #[test]
+        fn derive_is_deterministic(fs in seed(), name in ".*") {
+            let fabric = NodeIdentity::from_seed(fs).node_id();
+            prop_assert_eq!(TopicId::derive(fabric, &name), TopicId::derive(fabric, &name));
+        }
+
+        /// Different names under one fabric are different topics.
+        #[test]
+        fn distinct_names_are_distinct_topics(fs in seed(), a in ".*", b in ".*") {
+            prop_assume!(a != b);
+            let fabric = NodeIdentity::from_seed(fs).node_id();
+            prop_assert_ne!(TopicId::derive(fabric, &a), TopicId::derive(fabric, &b));
+        }
+
+        /// The same name under different fabrics is a different topic — the
+        /// scoping property that keeps two fabrics' `ops` channels apart.
+        #[test]
+        fn distinct_fabrics_are_distinct_topics(a in seed(), b in seed(), name in ".*") {
+            prop_assume!(a != b);
+            let (fa, fb) = (
+                NodeIdentity::from_seed(a).node_id(),
+                NodeIdentity::from_seed(b).node_id(),
+            );
+            prop_assert_ne!(TopicId::derive(fa, &name), TopicId::derive(fb, &name));
+        }
+
+        /// Concatenation is unambiguous because `fabric` is fixed-width: no
+        /// `(fabric, name)` pair collides with another by shifting the
+        /// boundary. Prefixing the name with an extra byte cannot reproduce
+        /// the id.
+        #[test]
+        fn derivation_boundary_is_unambiguous(fs in seed(), name in "[a-z]{0,8}", extra in "[a-z]") {
+            let fabric = NodeIdentity::from_seed(fs).node_id();
+            let shifted = format!("{extra}{name}");
+            prop_assert_ne!(
+                TopicId::derive(fabric, &name),
+                TopicId::derive(fabric, &shifted)
+            );
+        }
+
+        /// `TopicId` survives a serde (hex-string) round-trip.
+        #[test]
+        fn topic_id_serde_roundtrips(fs in seed(), name in ".*") {
+            let id = TopicId::derive(NodeIdentity::from_seed(fs).node_id(), &name);
+            let json = serde_json::to_string(&id).unwrap();
+            let back: TopicId = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(id, back);
+        }
+
+        /// `TopicId::from_hex` inverts `TopicId::hex`, and `from_bytes` inverts
+        /// `as_bytes`.
+        #[test]
+        fn topic_id_hex_and_bytes_roundtrip(fs in seed(), name in ".*") {
+            let id = TopicId::derive(NodeIdentity::from_seed(fs).node_id(), &name);
+            prop_assert_eq!(TopicId::from_hex(&id.hex()).unwrap(), id);
+            prop_assert_eq!(TopicId::from_bytes(*id.as_bytes()), id);
+        }
+
+        /// A ticket survives an encode/decode round-trip unchanged, and the
+        /// decoded ticket names the same topic.
+        #[test]
+        fn ticket_roundtrips(fs in seed(), name in ".*", peers in proptest::collection::vec(peer(), 0..4)) {
+            let fabric = NodeIdentity::from_seed(fs).node_id();
+            let ticket = TopicTicket::new(fabric, name, peers);
+            let decoded = TopicTicket::decode(&ticket.encode().unwrap()).unwrap();
+            prop_assert_eq!(&decoded, &ticket);
+            prop_assert_eq!(decoded.topic_id(), ticket.topic_id());
+        }
+
+        /// Arbitrary text decodes to an `Err`, never a panic.
+        #[test]
+        fn garbage_decode_never_panics(s in ".*") {
+            let _ = TopicTicket::decode(&s);
+        }
+
+        /// Arbitrary text hex-parses to an `Err`, never a panic.
+        #[test]
+        fn garbage_from_hex_never_panics(s in ".*") {
+            let _ = TopicId::from_hex(&s);
+        }
+    }
+
+    /// Known answer: the derivation for a fixed `(fabric, name)` is frozen.
+    /// Changing [`TOPIC_ID_CONTEXT`], the concatenation order, or the hash
+    /// renames every topic in existence, so the exact bytes are pinned here.
+    #[test]
+    fn derive_known_answer() {
+        let fabric = NodeIdentity::from_seed([1u8; 32]).node_id();
+        assert_eq!(
+            fabric.hex(),
+            "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+        );
+        assert_eq!(
+            TopicId::derive(fabric, "ops").hex(),
+            "d8aef584e4dc206686ba2c10f4fdc398fe217f0b51272e9993dee4f9f1f7cb19",
+        );
+    }
+
+    /// The derivation matches the documented formula computed a second way
+    /// (streaming `Hasher::new_derive_key` instead of the one-shot
+    /// `derive_key`), so the known answer above is not merely self-consistent.
+    #[test]
+    fn derive_matches_documented_formula() {
+        let fabric = NodeIdentity::from_seed([1u8; 32]).node_id();
+        let mut hasher = blake3::Hasher::new_derive_key(TOPIC_ID_CONTEXT);
+        hasher.update(fabric.as_bytes());
+        hasher.update(b"ops");
+        let expected: [u8; 32] = *hasher.finalize().as_bytes();
+        assert_eq!(TopicId::derive(fabric, "ops").as_bytes(), &expected);
+    }
+
+    /// The context string is frozen (a rename is a fabric-wide breaking change).
+    #[test]
+    fn context_string_is_frozen() {
+        assert_eq!(TOPIC_ID_CONTEXT, "wires topic-id v1");
+    }
+
+    #[test]
+    fn topic_id_serializes_as_hex_string() {
+        let id = TopicId::from_bytes([0u8; 32]);
+        assert_eq!(
+            serde_json::to_string(&id).unwrap(),
+            format!("\"{}\"", "0".repeat(64))
+        );
+    }
+
+    #[test]
+    fn from_hex_rejects_wrong_length() {
+        assert!(matches!(TopicId::from_hex("00"), Err(Error::BadKeyLength)));
+    }
+
+    #[test]
+    fn from_hex_rejects_non_hex() {
+        assert!(matches!(
+            TopicId::from_hex(&"z".repeat(64)),
+            Err(Error::BadHex(_))
+        ));
+    }
+
+    fn fixture() -> TopicTicket {
+        let fabric = NodeIdentity::from_seed([1u8; 32]).node_id();
+        let peer = TopicPeer::new(NodeIdentity::from_seed([2u8; 32]).node_id());
+        TopicTicket::new(fabric, "ops", vec![peer])
+    }
+
+    #[test]
+    fn routing_hints_round_trip() {
+        let fabric = NodeIdentity::from_seed([1u8; 32]).node_id();
+        let peer = TopicPeer::new(NodeIdentity::from_seed([2u8; 32]).node_id())
+            .with_addrs(vec![
+                "127.0.0.1:3340".parse().unwrap(),
+                "[2001:db8::1]:4433".parse().unwrap(),
+            ])
+            .with_relay_url(Some("http://relay.example:3340".to_string()));
+        let ticket = TopicTicket::new(fabric, "ops", vec![peer]);
+        let decoded = TopicTicket::decode(&ticket.encode().unwrap()).unwrap();
+        assert_eq!(decoded, ticket);
+        assert_eq!(decoded.peers[0].addrs.len(), 2);
+        assert_eq!(
+            decoded.peers[0].relay_url.as_deref(),
+            Some("http://relay.example:3340")
+        );
+    }
+
+    /// `skip_serializing_if` means a hintless ticket encodes without the
+    /// `peers` / `addrs` / `relay_url` keys, and decoding fills the defaults.
+    #[test]
+    fn hintless_ticket_decodes_with_empty_defaults() {
+        let fabric = NodeIdentity::from_seed([1u8; 32]).node_id();
+        let bare = TopicTicket::new(fabric, "ops", Vec::new());
+        let json = String::from_utf8(canonical_bytes(&bare).unwrap()).unwrap();
+        assert!(!json.contains("peers"), "{json}");
+        assert!(
+            TopicTicket::decode(&bare.encode().unwrap())
+                .unwrap()
+                .peers
+                .is_empty()
+        );
+
+        let decoded = TopicTicket::decode(&fixture().encode().unwrap()).unwrap();
+        assert!(decoded.peers[0].addrs.is_empty());
+        assert!(decoded.peers[0].relay_url.is_none());
+    }
+
+    /// A ticket's `topic_id()` is exactly `TopicId::derive(fabric, name)` — the
+    /// ticket carries no independent id that could disagree with it.
+    #[test]
+    fn ticket_topic_id_is_the_derivation() {
+        let t = fixture();
+        assert_eq!(t.topic_id(), TopicId::derive(t.fabric, &t.name));
+    }
+
+    /// The ticket is unsigned by construction: tampering with the peer list
+    /// still decodes cleanly (it can only fail to connect, never admit).
+    #[test]
+    fn tampered_ticket_still_decodes_because_it_is_unsigned() {
+        let mut t = fixture();
+        t.peers[0].node = NodeIdentity::from_seed([9u8; 32]).node_id();
+        assert_eq!(TopicTicket::decode(&t.encode().unwrap()).unwrap(), t);
     }
 }
