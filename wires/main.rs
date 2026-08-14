@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use library::{
-    CapabilityTicket, Crl, Grant, InclusionProof, Membership, NodeId, NodeIdentity, RosterHead,
-    Scope,
+    CapabilityTicket, Crl, FabricKey, Grant, InclusionProof, Membership, NodeId, NodeIdentity,
+    RosterHead, Scope, SealedFabricKey,
 };
 
 /// wires: a capability-addressed stdio/MCP session layer.
@@ -51,8 +51,8 @@ enum Command {
     Roster(RosterArgs),
     /// Add a subject to the CRL (keystore by default) and print the result.
     Revoke(RevokeArgs),
-    /// Install credentials (membership, inclusion proof, roster head) into the
-    /// keystore.
+    /// Install credentials (membership, inclusion proof, roster head, sealed
+    /// fabric key) into the keystore.
     Import(ImportArgs),
     /// Issue a grant over the wire (announce/consent), instead of pasting ids.
     Pair(PairArgs),
@@ -175,7 +175,7 @@ struct RosterMemberArgs {
 }
 
 /// `roster commit`: the root signing key, the head's expiry, and where to write
-/// the emitted per-member proofs.
+/// the emitted per-member proofs and sealed fabric keys.
 #[derive(Args)]
 struct RosterCommitArgs {
     /// Hex 32-byte seed of the root (signing) key. Falls back to env / file /
@@ -191,8 +191,8 @@ struct RosterCommitArgs {
     /// Absolute head expiry, unix seconds (mutually exclusive with `--ttl`).
     #[arg(long)]
     not_after: Option<i64>,
-    /// Directory to write each member's `<node-id>.proof` token into. When
-    /// omitted, the proofs are printed to stdout.
+    /// Directory to write each member's `<node-id>.proof` and `<node-id>.key`
+    /// tokens into. When omitted, both are printed to stdout.
     #[arg(long)]
     out: Option<PathBuf>,
 }
@@ -215,7 +215,7 @@ struct RevokeArgs {
     crl_file: Option<PathBuf>,
 }
 
-/// `import` arguments: any combination of the three credentials an agent
+/// `import` arguments: any combination of the four credentials an agent
 /// receives from its operator, inline or as a file.
 ///
 /// This is the last provisioning step, and it is entirely offline. The operator
@@ -225,7 +225,7 @@ struct RevokeArgs {
 /// bare `command` in an MCP client config.
 #[derive(Args)]
 #[command(group(ArgGroup::new("creds").required(true).multiple(true)
-    .args(["membership", "membership_file", "inclusion_proof", "inclusion_proof_file", "roster_head", "roster_head_file"])))]
+    .args(["membership", "membership_file", "inclusion_proof", "inclusion_proof_file", "roster_head", "roster_head_file", "fabric_key", "fabric_key_file"])))]
 struct ImportArgs {
     /// The base64 membership token to install as `membership.json`.
     #[arg(long, conflicts_with = "membership_file")]
@@ -246,6 +246,13 @@ struct ImportArgs {
     /// Read the roster head token from this file.
     #[arg(long)]
     roster_head_file: Option<PathBuf>,
+    /// The base64 sealed fabric key to open and install as `keyring/<version>.key`.
+    #[arg(long, conflicts_with = "fabric_key_file")]
+    fabric_key: Option<String>,
+    /// Read the sealed fabric key from this file (`roster commit --out DIR`
+    /// writes `<node-id>.key`).
+    #[arg(long)]
+    fabric_key_file: Option<PathBuf>,
 }
 
 /// `serve` arguments: the responder key, what it trusts, and the child to exec.
@@ -881,7 +888,22 @@ fn roster_edit(a: &RosterMemberArgs, add: bool) -> anyhow::Result<String> {
 /// Sign a head over the current `roster.json`, persist the bumped roster and the
 /// head, and emit each member's proof (to `--out` or stdout). Returns the head token.
 fn roster_commit(a: RosterCommitArgs) -> anyhow::Result<String> {
-    let ks = keystore::Keystore::resolve()?;
+    roster_commit_in(&keystore::Keystore::resolve()?, a)
+}
+
+/// [`roster_commit`] against an explicit keystore (the testable form).
+///
+/// Each commit also mints one fresh [`FabricKey`] — the data key every envelope
+/// published under this roster version is encrypted with — and seals a copy to
+/// each member beside their proof. Rotating on every commit is what makes
+/// removal *confidential* immediately: a member dropped by this commit is not a
+/// recipient of this key, so nothing published after it is readable by them,
+/// whatever the network does about eviction.
+///
+/// The root does **not** retain the plaintext key: it is generated here, sealed
+/// N times, and dropped. The authority that decides who is in the fabric is
+/// deliberately not an authority that can read the fabric's traffic.
+fn roster_commit_in(ks: &keystore::Keystore, a: RosterCommitArgs) -> anyhow::Result<String> {
     let root = keystore::root_identity(a.root_seed.as_deref(), a.root_seed_file.as_deref())?;
     let not_after =
         resolve_not_after(a.ttl, a.not_after, now_unix()).map_err(anyhow::Error::msg)?;
@@ -893,24 +915,31 @@ fn roster_commit(a: RosterCommitArgs) -> anyhow::Result<String> {
     ks.save_roster(&roster)?; // persist the version bump
     ks.save_roster_head(&head)?;
 
+    // Minted once per commit, sealed per member, never written down here.
+    let key = FabricKey::generate();
+
     let mut lines = Vec::new();
     for (member, proof) in &proofs {
-        let token = proof.encode()?;
-        match a.out.as_deref() {
-            Some(dir) => {
-                std::fs::create_dir_all(dir)
-                    .with_context(|| format!("creating {}", dir.display()))?;
-                let path = dir.join(format!("{}.proof", member.hex()));
-                std::fs::write(&path, &token)
-                    .with_context(|| format!("writing {}", path.display()))?;
-                lines.push(format!("proof {} -> {}", member.hex(), path.display()));
+        let sealed = SealedFabricKey::seal(&root, *member, head.version, &key)
+            .with_context(|| format!("sealing the fabric key to {}", member.hex()))?;
+        for (kind, token) in [("proof", proof.encode()?), ("key", sealed.encode()?)] {
+            match a.out.as_deref() {
+                Some(dir) => {
+                    std::fs::create_dir_all(dir)
+                        .with_context(|| format!("creating {}", dir.display()))?;
+                    let path = dir.join(format!("{}.{kind}", member.hex()));
+                    std::fs::write(&path, &token)
+                        .with_context(|| format!("writing {}", path.display()))?;
+                    lines.push(format!("{kind} {} -> {}", member.hex(), path.display()));
+                }
+                None => lines.push(format!("{kind} {} {token}", member.hex())),
             }
-            None => lines.push(format!("proof {} {}", member.hex(), token)),
         }
     }
     let head_token = head.encode()?;
     Ok(format!(
-        "committed roster version {} ({} members)\nhead {}\n{}",
+        "committed roster version {} ({} members, each with a proof and a sealed fabric key)\
+         \nhead {}\n{}",
         head.version.0,
         proofs.len(),
         head_token,
@@ -951,7 +980,16 @@ fn token_arg(
 /// under the name the network commands look for. Returns one `wrote <path>`
 /// line per installed credential.
 fn run_import_cmd(a: ImportArgs) -> anyhow::Result<String> {
-    let ks = keystore::Keystore::resolve()?;
+    run_import_in(&keystore::Keystore::resolve()?, a)
+}
+
+/// [`run_import_cmd`] against an explicit keystore (the testable form).
+///
+/// The credentials are installed in dependency order: the membership first,
+/// because a sealed fabric key is verified against *its* fabric root, so
+/// `wires import --membership <m> --fabric-key <k>` works as one command on a
+/// blank keystore.
+fn run_import_in(ks: &keystore::Keystore, a: ImportArgs) -> anyhow::Result<String> {
     let mut lines = Vec::new();
 
     if let Some(text) = token_arg(
@@ -984,7 +1022,52 @@ fn run_import_cmd(a: ImportArgs) -> anyhow::Result<String> {
         let head = RosterHead::decode(&text).context("--roster-head")?;
         lines.push(format!("wrote {}", ks.save_roster_head(&head)?.display()));
     }
+    if let Some(text) = token_arg(
+        a.fabric_key.as_deref(),
+        a.fabric_key_file.as_deref(),
+        "--fabric-key",
+    )? {
+        lines.push(format!("wrote {}", import_fabric_key(ks, &text)?.display()));
+    }
     Ok(lines.join("\n"))
+}
+
+/// Open the sealed fabric key `token` as this node and install the plaintext in
+/// the keyring, returning the written path.
+///
+/// The trust anchor is the installed membership's `fabric`: the same root that
+/// vouches for this node's *presence* in the fabric is the only one whose keys
+/// it will install, so a key token pasted from a stranger's fabric is refused
+/// rather than silently added to the keyring. The member binding (this node is
+/// the sealed recipient) and the root signature are checked by
+/// [`SealedFabricKey::open`] itself.
+fn import_fabric_key(ks: &keystore::Keystore, token: &str) -> anyhow::Result<PathBuf> {
+    let sealed = SealedFabricKey::decode(token).context("--fabric-key")?;
+    let membership = ks.read_membership()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--fabric-key: no membership installed, so there is no fabric root to check the key \
+             against; import the membership first (`wires import --membership <token>`, or pass \
+             both in one command) — looked for {}",
+            ks.path("membership.json").display()
+        )
+    })?;
+    let node = keystore::node_identity_in(ks)?;
+    if sealed.member != node.node_id() {
+        anyhow::bail!(
+            "--fabric-key: sealed to {} but this node is {}; ask the operator for this node's own \
+             <node-id>.key from `wires roster commit --out DIR`",
+            sealed.member.hex(),
+            node.node_id().hex()
+        );
+    }
+    let key = sealed.open(&node, membership.fabric).with_context(|| {
+        format!(
+            "--fabric-key: opening the roster version {} key against fabric {}",
+            sealed.version.0,
+            membership.fabric.hex()
+        )
+    })?;
+    ks.save_fabric_key(sealed.version, &key)
 }
 
 /// Render any error as a string for the admin-command error channel.
@@ -1302,6 +1385,302 @@ mod tests {
         assert_eq!(head.version.0, before + 1);
         let proof = proofs.into_iter().find(|(m, _)| *m == member).unwrap().1;
         assert!(library::check_roster_inclusion(&head, &proof, root.node_id(), member, 0).is_ok());
+    }
+
+    /// A fresh empty directory, under `$TEST_TMPDIR` when bazel provides one.
+    fn temp_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let base = std::env::var_os("TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!(
+            "wires-cli-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `roster commit` arguments with everything but the root seed defaulted.
+    fn commit_args(root: &NodeIdentity, out: Option<PathBuf>) -> RosterCommitArgs {
+        RosterCommitArgs {
+            root_seed: Some(root.seed_hex()),
+            root_seed_file: None,
+            ttl: None,
+            not_after: Some(i64::MAX),
+            out,
+        }
+    }
+
+    /// `import` arguments with no credential selected.
+    fn import_args() -> ImportArgs {
+        ImportArgs {
+            membership: None,
+            membership_file: None,
+            inclusion_proof: None,
+            inclusion_proof_file: None,
+            roster_head: None,
+            roster_head_file: None,
+            fabric_key: None,
+            fabric_key_file: None,
+        }
+    }
+
+    /// A keystore holding a two-member `roster.json`, plus the root and the two
+    /// member identities.
+    fn fabric_fixture() -> (keystore::Keystore, NodeIdentity, NodeIdentity, NodeIdentity) {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let alice = NodeIdentity::from_seed([2u8; 32]);
+        let bob = NodeIdentity::from_seed([3u8; 32]);
+        let ks = keystore::Keystore::at(temp_dir());
+        let mut roster = library::Roster::new(root.node_id());
+        roster.insert(alice.node_id());
+        roster.insert(bob.node_id());
+        ks.save_roster(&roster).unwrap();
+        (ks, root, alice, bob)
+    }
+
+    #[test]
+    fn commit_writes_a_sealed_key_per_member_openable_only_by_that_member() {
+        let (ks, root, alice, bob) = fabric_fixture();
+        let out = temp_dir();
+        let summary = roster_commit_in(&ks, commit_args(&root, Some(out.clone()))).unwrap();
+
+        // One `<node-id>.key` beside each `<node-id>.proof`, and the summary
+        // says so.
+        assert!(summary.contains("sealed fabric key"), "{summary}");
+        let head = ks.read_roster_head().unwrap().unwrap();
+        let mut keys = Vec::new();
+        for member in [&alice, &bob] {
+            let hex = member.node_id().hex();
+            assert!(out.join(format!("{hex}.proof")).is_file());
+            let token = std::fs::read_to_string(out.join(format!("{hex}.key"))).unwrap();
+            assert!(summary.contains(&format!("key {hex} -> ")), "{summary}");
+
+            let sealed = SealedFabricKey::decode(token.trim()).unwrap();
+            assert_eq!(sealed.version, head.version);
+            keys.push(sealed.open(member, root.node_id()).unwrap());
+        }
+
+        // Every member's copy is the same key (one data key per commit) …
+        assert_eq!(keys[0], keys[1]);
+        // … and it is *their* copy: Bob's node cannot open Alice's.
+        let alices = SealedFabricKey::decode(
+            std::fs::read_to_string(out.join(format!("{}.key", alice.node_id().hex())))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert!(alices.open(&bob, root.node_id()).is_err());
+        // Nor can anyone check it against a root that did not sign it.
+        assert!(alices.open(&alice, bob.node_id()).is_err());
+    }
+
+    #[test]
+    fn commit_without_out_prints_key_tokens_and_root_keeps_nothing() {
+        let (ks, root, alice, _bob) = fabric_fixture();
+        let summary = roster_commit_in(&ks, commit_args(&root, None)).unwrap();
+
+        // The key rides on stdout next to the proof, same shape.
+        let hex = alice.node_id().hex();
+        let token = summary
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("key {hex} ")))
+            .unwrap_or_else(|| panic!("no key line for {hex} in:\n{summary}"));
+        assert!(
+            summary
+                .lines()
+                .any(|l| l.starts_with(&format!("proof {hex} ")))
+        );
+        SealedFabricKey::decode(token)
+            .unwrap()
+            .open(&alice, root.node_id())
+            .unwrap();
+
+        // Blind root: committing wrote no plaintext key into the root's own
+        // keystore, so compromising the operator reads no traffic.
+        assert!(ks.read_keyring().unwrap().is_empty());
+    }
+
+    #[test]
+    fn commit_rotates_the_key_on_every_commit() {
+        let (ks, root, alice, _bob) = fabric_fixture();
+        let key_of = |summary: &str| {
+            let hex = alice.node_id().hex();
+            let token = summary
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("key {hex} ")))
+                .unwrap();
+            SealedFabricKey::decode(token)
+                .unwrap()
+                .open(&alice, root.node_id())
+                .unwrap()
+        };
+        let first = roster_commit_in(&ks, commit_args(&root, None)).unwrap();
+        let second = roster_commit_in(&ks, commit_args(&root, None)).unwrap();
+        // A removed member's last key must not decrypt what comes after them.
+        assert_ne!(key_of(&first), key_of(&second));
+    }
+
+    /// A member's keystore (node seed + installed membership) and the sealed
+    /// key token that `roster commit` emitted for them.
+    fn member_fixture(member: &NodeIdentity) -> (keystore::Keystore, NodeIdentity, String) {
+        let (root_ks, root, _alice, _bob) = fabric_fixture();
+        let summary = roster_commit_in(&root_ks, commit_args(&root, None)).unwrap();
+        let token = summary
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("key {} ", member.node_id().hex())))
+            .unwrap_or_else(|| panic!("no key line in:\n{summary}"))
+            .to_string();
+
+        let ks = keystore::Keystore::at(temp_dir());
+        ks.save_node(member, false).unwrap();
+        (ks, root, token)
+    }
+
+    #[test]
+    fn import_installs_a_sealed_fabric_key_into_the_keyring() {
+        let alice = NodeIdentity::from_seed([2u8; 32]);
+        let (ks, root, token) = member_fixture(&alice);
+        let membership = Membership::mint(&root, alice.node_id(), 0, i64::MAX).unwrap();
+
+        // Membership and key in one command: the membership installed first is
+        // the trust anchor the key is checked against.
+        let out = run_import_in(
+            &ks,
+            ImportArgs {
+                membership: Some(membership.encode().unwrap()),
+                fabric_key: Some(token.clone()),
+                ..import_args()
+            },
+        )
+        .unwrap();
+
+        let version = SealedFabricKey::decode(&token).unwrap().version;
+        let path = ks.fabric_key_path(version);
+        assert!(out.contains(&format!("wrote {}", path.display())), "{out}");
+        let installed = ks.read_fabric_key(version).unwrap().unwrap();
+        assert_eq!(
+            ks.latest_fabric_key().unwrap().unwrap(),
+            (version, installed.clone())
+        );
+        assert_eq!(
+            SealedFabricKey::decode(&token)
+                .unwrap()
+                .open(&alice, root.node_id())
+                .unwrap(),
+            installed
+        );
+
+        // Re-running the same import is a no-op, not an error.
+        run_import_in(
+            &ks,
+            ImportArgs {
+                fabric_key: Some(token),
+                ..import_args()
+            },
+        )
+        .unwrap();
+        assert_eq!(ks.read_fabric_key(version).unwrap().unwrap(), installed);
+    }
+
+    #[test]
+    fn import_refuses_a_key_sealed_to_another_member() {
+        // Bob's keystore, Alice's copy of the key.
+        let alice = NodeIdentity::from_seed([2u8; 32]);
+        let bob = NodeIdentity::from_seed([3u8; 32]);
+        let (_alice_ks, root, alices_token) = member_fixture(&alice);
+        let ks = keystore::Keystore::at(temp_dir());
+        ks.save_node(&bob, false).unwrap();
+        ks.save_membership(&Membership::mint(&root, bob.node_id(), 0, i64::MAX).unwrap())
+            .unwrap();
+
+        let err = run_import_in(
+            &ks,
+            ImportArgs {
+                fabric_key: Some(alices_token),
+                ..import_args()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&alice.node_id().hex()), "{msg}");
+        assert!(msg.contains(&bob.node_id().hex()), "{msg}");
+        assert!(ks.read_keyring().unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_refuses_a_key_from_a_foreign_fabric() {
+        // A membership from a different root: the key is genuine, but not from
+        // the authority this node trusts.
+        let alice = NodeIdentity::from_seed([2u8; 32]);
+        let (ks, _root, token) = member_fixture(&alice);
+        let impostor = NodeIdentity::from_seed([9u8; 32]);
+        ks.save_membership(&Membership::mint(&impostor, alice.node_id(), 0, i64::MAX).unwrap())
+            .unwrap();
+
+        let err = run_import_in(
+            &ks,
+            ImportArgs {
+                fabric_key: Some(token),
+                ..import_args()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&impostor.node_id().hex()),
+            "{err:#}"
+        );
+        assert!(ks.read_keyring().unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_fabric_key_without_a_membership_names_the_remedy() {
+        let alice = NodeIdentity::from_seed([2u8; 32]);
+        let (ks, _root, token) = member_fixture(&alice); // node.seed only
+
+        let err = run_import_in(
+            &ks,
+            ImportArgs {
+                fabric_key: Some(token),
+                ..import_args()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("wires import --membership"), "{msg}");
+        assert!(
+            msg.contains(&ks.path("membership.json").display().to_string()),
+            "{msg}"
+        );
+        assert!(ks.read_keyring().unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_accepts_the_fabric_key_flags() {
+        // The key is a credential of the `creds` group: it alone is a valid
+        // invocation, and inline-plus-file is still ambiguous.
+        let cli = Cli::try_parse_from(["wires", "import", "--fabric-key-file", "k"]).unwrap();
+        match cli.command {
+            Command::Import(a) => {
+                assert_eq!(a.fabric_key_file.as_deref(), Some(Path::new("k")));
+                assert!(a.fabric_key.is_none());
+            }
+            _ => panic!("expected the import subcommand"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "wires",
+                "import",
+                "--fabric-key",
+                "tok",
+                "--fabric-key-file",
+                "k"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

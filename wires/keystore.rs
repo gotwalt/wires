@@ -12,6 +12,10 @@
 //!   membership, so private).
 //! - `roster-head.json`: the signed roster head token (mode `0644` — public).
 //! - `inclusion-proof.json`: a member's own inclusion-proof token (mode `0644`).
+//! - `keyring/<version>.key`: the hex fabric data key for one roster version
+//!   (mode `0600`, directory `0700`) — the plaintext half of the
+//!   [`SealedFabricKey`](library::SealedFabricKey) an operator handed over.
+//!   Old versions are kept forever: replayed history stays readable.
 //!
 //! The resolver helpers ([`node_identity`], [`root_identity`], [`crl_source`],
 //! [`membership`]) encode the precedence the CLI uses: an inline flag wins, then
@@ -20,10 +24,13 @@
 //! head — resolve to a *source* ([`crl_source`], [`roster_head_source`]) that the
 //! responder re-reads per connection, not to a value frozen at startup.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use library::{Crl, InclusionProof, Membership, NodeIdentity, Roster, RosterHead};
+use library::{
+    Crl, FabricKey, InclusionProof, Membership, NodeIdentity, Roster, RosterHead, RosterVersion,
+};
 
 use crate::transport::{CrlSource, HeadSource};
 
@@ -198,6 +205,108 @@ impl Keystore {
         set_mode(&path, 0o644);
         Ok(path)
     }
+
+    /// The keyring directory (`<home>/keyring`, mode `0700`), holding one
+    /// `<version>.key` file per roster version whose fabric key this node holds.
+    pub fn keyring_dir(&self) -> PathBuf {
+        self.dir.join("keyring")
+    }
+
+    /// The path of the fabric key file for roster `version`.
+    pub fn fabric_key_path(&self, version: RosterVersion) -> PathBuf {
+        self.keyring_dir().join(format!("{}.key", version.0))
+    }
+
+    /// Persist `key` as `keyring/<version>.key` (hex, mode `0600`), returning
+    /// the written path.
+    ///
+    /// Unlike [`save_node`](Self::save_node) this **overwrites**: a key is
+    /// identified by its roster version, so re-importing the same
+    /// [`SealedFabricKey`](library::SealedFabricKey) rewrites identical bytes
+    /// and re-running `wires import` is safe. (A *different* key for a version
+    /// already held would also overwrite — but only the root mints keys, and it
+    /// mints exactly one per commit, so there is no second key to install.)
+    pub fn save_fabric_key(&self, version: RosterVersion, key: &FabricKey) -> Result<PathBuf> {
+        ensure_dir(&self.dir)?; // `0700` on the home too, if this is its first file
+        ensure_dir(&self.keyring_dir())?;
+        let path = self.fabric_key_path(version);
+        write_secret(&path, &key.hex(), true)?;
+        // `write_secret`'s mode applies at creation only; re-assert it so an
+        // overwrite cannot inherit looser permissions from a pre-existing file.
+        set_mode(&path, 0o600);
+        Ok(path)
+    }
+
+    /// Read the fabric key for `version`; `None` when this node does not hold
+    /// it (the late-joiner case — pre-join history stays unreadable).
+    pub fn read_fabric_key(&self, version: RosterVersion) -> Result<Option<FabricKey>> {
+        let path = self.fabric_key_path(version);
+        match read_to_string_opt(&path)? {
+            Some(text) => Ok(Some(parse_fabric_key(&path, &text)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read every key in the keyring, ordered by roster version.
+    ///
+    /// An absent keyring directory is an empty map (a node that has never run
+    /// `wires import --fabric-key`), and files that are not named
+    /// `<decimal>.key` are ignored rather than fatal — but a `<decimal>.key`
+    /// whose contents are not a 32-byte hex key is an error naming the file, so
+    /// a truncated write is reported instead of silently losing history.
+    pub fn read_keyring(&self) -> Result<BTreeMap<RosterVersion, FabricKey>> {
+        let dir = self.keyring_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        };
+        let mut keyring = BTreeMap::new();
+        for entry in entries {
+            let path = entry
+                .with_context(|| format!("listing {}", dir.display()))?
+                .path();
+            let Some(version) = keyring_file_version(&path) else {
+                continue;
+            };
+            // A file that vanished between the listing and the read is simply
+            // not in the keyring.
+            if let Some(text) = read_to_string_opt(&path)? {
+                keyring.insert(version, parse_fabric_key(&path, &text)?);
+            }
+        }
+        Ok(keyring)
+    }
+
+    /// The highest-versioned key in the keyring — the one a fresh `publish`
+    /// seals under. `None` when the keyring is empty.
+    pub fn latest_fabric_key(&self) -> Result<Option<(RosterVersion, FabricKey)>> {
+        Ok(self.read_keyring()?.into_iter().next_back())
+    }
+}
+
+/// The roster version a keyring filename encodes, or `None` when the file is
+/// not a `<decimal>.key` (editor backups and the like are not keys).
+fn keyring_file_version(path: &Path) -> Option<RosterVersion> {
+    if path.extension()? != "key" {
+        return None;
+    }
+    path.file_stem()?
+        .to_str()?
+        .parse::<u64>()
+        .ok()
+        .map(RosterVersion)
+}
+
+/// Parse a keyring file's hex contents, naming the file and the remedy.
+fn parse_fabric_key(path: &Path, text: &str) -> Result<FabricKey> {
+    FabricKey::from_hex(text.trim()).with_context(|| {
+        format!(
+            "parsing {} (expected 64 hex characters; delete it and re-run \
+             `wires import --fabric-key <token>`)",
+            path.display()
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +324,28 @@ pub fn node_identity(inline: Option<&str>, file: Option<&Path>) -> Result<NodeId
         "node",
         "WIRES_NODE_SEED",
     )
+}
+
+/// Resolve the node identity for an offline command that already holds a
+/// keystore handle (`wires import --fabric-key`, which must open a sealed key
+/// as *this* node): `$WIRES_NODE_SEED` wins — the same environment variable the
+/// network commands honour — then `ks`'s own `node.seed`.
+///
+/// There is no inline-flag tier because `import` takes no key flags: the point
+/// of the command is to fill the keystore the other commands read from.
+pub fn node_identity_in(ks: &Keystore) -> Result<NodeIdentity> {
+    if let Some(hex) = std::env::var("WIRES_NODE_SEED")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return NodeIdentity::from_seed_hex(&hex).context("$WIRES_NODE_SEED");
+    }
+    ks.read_node_identity()?.ok_or_else(|| {
+        anyhow!(
+            "no node key: set $WIRES_NODE_SEED or run `wires keygen --save-node` (looked for {})",
+            ks.path("node.seed").display()
+        )
+    })
 }
 
 /// Resolve the root signing identity for `grant`.
@@ -712,6 +843,106 @@ mod tests {
         let from_file = roster_head_source(None, Some(path)).unwrap();
         assert!(matches!(from_file, HeadSource::File(_)));
         assert_eq!(from_file.load().unwrap().unwrap(), head);
+    }
+
+    #[test]
+    fn fabric_key_round_trips_through_the_keyring() {
+        let ks = Keystore::at(temp_dir().join("nested")); // also exercises dir creation
+        assert!(ks.read_fabric_key(RosterVersion(3)).unwrap().is_none());
+
+        let key = FabricKey::generate();
+        let path = ks.save_fabric_key(RosterVersion(3), &key).unwrap();
+        assert!(path.ends_with("keyring/3.key"));
+        assert_eq!(ks.read_fabric_key(RosterVersion(3)).unwrap().unwrap(), key);
+        // Overwrite-idempotent: re-importing the same key is not an error.
+        ks.save_fabric_key(RosterVersion(3), &key).unwrap();
+        assert_eq!(ks.read_fabric_key(RosterVersion(3)).unwrap().unwrap(), key);
+    }
+
+    #[test]
+    fn keyring_is_empty_before_any_import() {
+        let ks = Keystore::at(temp_dir());
+        assert!(ks.read_keyring().unwrap().is_empty());
+        assert!(ks.latest_fabric_key().unwrap().is_none());
+    }
+
+    #[test]
+    fn latest_fabric_key_is_the_highest_version() {
+        let ks = Keystore::at(temp_dir());
+        let (v2, v10, v7) = (
+            FabricKey::generate(),
+            FabricKey::generate(),
+            FabricKey::generate(),
+        );
+        ks.save_fabric_key(RosterVersion(2), &v2).unwrap();
+        ks.save_fabric_key(RosterVersion(10), &v10).unwrap();
+        ks.save_fabric_key(RosterVersion(7), &v7).unwrap();
+        // Numeric, not lexicographic: "10" must beat "7".
+        assert_eq!(
+            ks.latest_fabric_key().unwrap().unwrap(),
+            (RosterVersion(10), v10)
+        );
+
+        // Old versions are kept forever so replayed history stays readable.
+        let keyring = ks.read_keyring().unwrap();
+        assert_eq!(keyring.len(), 3);
+        assert_eq!(keyring[&RosterVersion(2)], v2);
+        assert_eq!(keyring[&RosterVersion(7)], v7);
+
+        // A file that is not `<decimal>.key` is ignored, not fatal.
+        write_text(&ks.keyring_dir().join("notes.txt"), "hello").unwrap();
+        write_text(&ks.keyring_dir().join("backup.key"), "hello").unwrap();
+        assert_eq!(ks.read_keyring().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn corrupt_keyring_file_names_the_file_and_the_remedy() {
+        let ks = Keystore::at(temp_dir());
+        ks.save_fabric_key(RosterVersion(1), &FabricKey::generate())
+            .unwrap();
+        let path = ks.fabric_key_path(RosterVersion(1));
+        write_text(&path, "not-a-key").unwrap();
+
+        for err in [
+            ks.read_fabric_key(RosterVersion(1)).unwrap_err(),
+            ks.read_keyring().unwrap_err(),
+        ] {
+            let msg = format!("{err:#}");
+            assert!(msg.contains(&path.display().to_string()), "{msg}");
+            assert!(msg.contains("wires import --fabric-key"), "{msg}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keyring_files_are_0600_in_a_0700_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let ks = Keystore::at(temp_dir());
+        let path = ks
+            .save_fabric_key(RosterVersion(4), &FabricKey::generate())
+            .unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&ks.keyring_dir()), 0o700);
+    }
+
+    #[test]
+    fn node_identity_in_reads_the_given_keystore() {
+        let ks = Keystore::at(temp_dir());
+        // Nothing installed yet: the error names the remedy and the path.
+        let msg = match node_identity_in(&ks) {
+            Ok(_) => panic!("an empty keystore has no node key"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(msg.contains("wires keygen --save-node"), "{msg}");
+        assert!(
+            msg.contains(&ks.path("node.seed").display().to_string()),
+            "{msg}"
+        );
+
+        let id = NodeIdentity::from_seed([11u8; 32]);
+        ks.save_node(&id, false).unwrap();
+        assert_eq!(node_identity_in(&ks).unwrap().node_id(), id.node_id());
     }
 
     #[test]
