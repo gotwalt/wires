@@ -4,7 +4,10 @@
 //! stream: an opening [`Frame::Handshake`] that presents the dialer's grant,
 //! then tagged stdio chunks ([`Frame::Stdin`] / [`Frame::Stdout`] /
 //! [`Frame::Stderr`]) and a final [`Frame::Exit`] carrying the child's exit
-//! code.
+//! code. A responder that refuses the handshake answers with a terminal
+//! [`Frame::Denied`] carrying the human-readable reason instead of an ack, so
+//! the dialer can say *why* it was turned away rather than reporting a bare
+//! dropped connection.
 //!
 //! This module is **pure and async-free**: [`Frame::encode`] produces the
 //! length-prefixed bytes and [`Frame::decode`] parses one frame back out of a
@@ -25,6 +28,7 @@
 //! | `3`  | `Stderr`    | raw chunk bytes                            |
 //! | `4`  | `Exit`      | 4-byte big-endian `i32`                    |
 //! | `5`  | `HandshakeAck` | canonical-JSON of the ack envelope      |
+//! | `6`  | `Denied`    | UTF-8 reason bytes                         |
 //!
 //! The handshake envelope is the canonical JSON of a [`Membership`] plus an
 //! optional [`Grant`]. The envelope itself is *unsigned* — the signed objects
@@ -45,6 +49,7 @@ const TAG_STDOUT: u8 = 2;
 const TAG_STDERR: u8 = 3;
 const TAG_EXIT: u8 = 4;
 const TAG_HANDSHAKE_ACK: u8 = 5;
+const TAG_DENIED: u8 = 6;
 
 /// A chunk of stdio bytes carried in a [`Frame`].
 ///
@@ -136,6 +141,14 @@ pub enum Frame {
     Stderr(Chunk),
     /// The child process's exit code.
     Exit(i32),
+    /// Terminal frame from the responder: the handshake was refused, with a
+    /// human-readable reason. Sent instead of a `HandshakeAck`, after which the
+    /// responder closes. Carries no secrets — the reason describes the dialer's
+    /// own credential.
+    Denied {
+        /// Why the session was refused (e.g. `membership rejected: revoked`).
+        reason: String,
+    },
 }
 
 impl Frame {
@@ -150,6 +163,11 @@ impl Frame {
     /// assert_eq!(consumed, bytes.len());
     /// // A partial buffer yields `None` until the whole frame has arrived.
     /// assert!(Frame::decode(&bytes[..bytes.len() - 1]).unwrap().is_none());
+    ///
+    /// // A refusal round-trips its reason verbatim.
+    /// let denied = Frame::Denied { reason: "membership rejected: revoked".into() };
+    /// let bytes = denied.encode().unwrap();
+    /// assert_eq!(Frame::decode(&bytes).unwrap().unwrap().0, denied);
     /// ```
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut payload = Vec::new();
@@ -190,6 +208,10 @@ impl Frame {
             Frame::Exit(code) => {
                 payload.push(TAG_EXIT);
                 payload.extend_from_slice(&code.to_be_bytes());
+            }
+            Frame::Denied { reason } => {
+                payload.push(TAG_DENIED);
+                payload.extend_from_slice(reason.as_bytes());
             }
         }
         let len: u32 = payload.len().try_into().map_err(|_| Error::BadFrame)?;
@@ -240,6 +262,9 @@ impl Frame {
                 let arr: [u8; 4] = body.try_into().map_err(|_| Error::BadFrame)?;
                 Frame::Exit(i32::from_be_bytes(arr))
             }
+            TAG_DENIED => Frame::Denied {
+                reason: String::from_utf8(body.to_vec()).map_err(|_| Error::BadFrame)?,
+            },
             _ => return Err(Error::BadFrame),
         };
         Ok(Some((frame, end)))
@@ -307,6 +332,7 @@ mod tests {
             bytes().prop_map(|b| Frame::Stdout(Chunk::from_bytes(b))),
             bytes().prop_map(|b| Frame::Stderr(Chunk::from_bytes(b))),
             any::<i32>().prop_map(Frame::Exit),
+            any::<String>().prop_map(|reason| Frame::Denied { reason }),
         ]
     }
 
@@ -352,6 +378,39 @@ mod tests {
         fn garbage_never_panics(b in proptest::collection::vec(any::<u8>(), 0..64)) {
             let _ = Frame::decode(&b);
         }
+
+        /// A denial's reason survives a round-trip verbatim, for any string.
+        #[test]
+        fn denied_reason_roundtrips(reason in any::<String>()) {
+            let f = Frame::Denied { reason };
+            let enc = f.encode().unwrap();
+            let (dec, consumed) = Frame::decode(&enc).unwrap().unwrap();
+            prop_assert_eq!(dec, f);
+            prop_assert_eq!(consumed, enc.len());
+        }
+    }
+
+    #[test]
+    fn denied_roundtrips_empty_ascii_and_unicode() {
+        for reason in ["", "membership rejected: revoked", "refusé — 拒否 🚫"] {
+            let f = Frame::Denied {
+                reason: reason.to_string(),
+            };
+            let enc = f.encode().unwrap();
+            // Body is exactly the tag plus the reason's UTF-8 bytes.
+            assert_eq!(enc[4], TAG_DENIED);
+            assert_eq!(&enc[5..], reason.as_bytes());
+            assert_eq!(Frame::decode(&enc).unwrap().unwrap().0, f);
+        }
+    }
+
+    #[test]
+    fn denied_with_invalid_utf8_is_bad_frame() {
+        // len = 2: TAG_DENIED plus a lone 0xff, which is not valid UTF-8.
+        assert!(matches!(
+            Frame::decode(&[0, 0, 0, 2, TAG_DENIED, 0xff]),
+            Err(Error::BadFrame)
+        ));
     }
 
     #[test]

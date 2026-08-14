@@ -34,15 +34,23 @@ pub enum Error {
     #[error("unsupported version")]
     UnsupportedVersion,
 
-    /// The grant's `not_after` is in the past relative to the checked time.
-    #[error("grant expired at {not_after}")]
+    /// A credential's `not_after` is in the past relative to the checked time.
+    ///
+    /// Shared by grants, memberships, and roster heads — the caller prefixes
+    /// which credential it was checking (`membership rejected: …`,
+    /// `grant rejected: …`, `roster inclusion rejected: …`), so the display
+    /// deliberately does *not* name one.
+    #[error("expired at {not_after}")]
     Expired {
-        /// The grant's expiry, unix seconds.
+        /// The credential's expiry, unix seconds.
         not_after: i64,
     },
 
-    /// The grant's subject is present on the revocation list.
-    #[error("grant revoked")]
+    /// The checked credential's subject is present on the revocation list.
+    ///
+    /// Like [`Error::Expired`], shared by the grant and membership gates, so the
+    /// display names no single credential — the caller supplies that prefix.
+    #[error("revoked")]
     Revoked,
 
     /// The grant's subject does not match the authenticated caller.

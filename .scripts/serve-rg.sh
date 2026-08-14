@@ -8,7 +8,13 @@
 # it where connect.sh can read it. Everything logs to stderr so you can watch
 # the handshake and session.
 #
-# Run this in one terminal, then run ./.scripts/connect.sh in another.
+# Run this in one terminal, then run ./.scripts/connect.sh in another. Run both
+# directly from the repo root -- NOT via `bazel run //.scripts:...`.
+#
+# This pair deliberately keeps its state in the sticky $WIRES_DEMO_DIR so you
+# can iterate on the happy path without re-provisioning keys. The revocation
+# demo (.scripts/demo-revoke.sh) uses a fresh `mktemp -d` instead, because a
+# stale state dir silently poisons a rerun there.
 #
 #   WIRES_DEMO_DIR   shared state dir (default /tmp/wires-demo)
 #   WIRES_PATTERN    the pattern rg searches stdin for (default TODO)
@@ -49,6 +55,13 @@ AGENT_ID="$(node_id "$agt")"
 log "operator root id : $ROOT_ID"
 log "server   node id : $SERVER_ID"
 log "agent    node id : $AGENT_ID"
+
+# The responder needs its OWN membership before it can serve: the `/2`
+# handshake is mutual, and `serve` presents its membership in the HandshakeAck
+# so a ticket-less dialer can verify the service it just reached.
+WIRES_HOME="$op" "$WIRES" member --subject "$SERVER_ID" --ttl 3600 >"$DEMO/server-membership"
+WIRES_HOME="$srv" "$WIRES" import --membership-file "$DEMO/server-membership" >/dev/null
+log "installed the server's own membership"
 
 # Start the responder; tee its log so we can read the bound UDP port from it.
 rm -f "$DEMO/ticket" "$DEMO/membership"

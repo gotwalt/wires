@@ -222,7 +222,11 @@ the operator consents); distribute the resulting ticket to the agent (e.g. as a
   agent. The root key never leaves that machine.
 - **Revoke:** edit the responder's CRL `ConfigMap` (or `wires revoke
   --crl-file <path>` against a synced copy) and `kubectl apply`; the projected
-  file updates. Pair short TTLs with the CRL so revocation is bounded even
-  without a restart.
+  file updates. `serve` re-reads the CRL (and `roster-head.json`, if it is
+  enforcing one) **once per connection**, so revocation takes effect on the
+  next dial — no restart, no rollout. The only lag is however long the
+  projected volume takes to reflect the `ConfigMap`. A refused dial exits `77`
+  with `wires: denied by responder: <reason>` on the dialer's stderr. Keep
+  short TTLs anyway, as defense in depth for a responder you cannot reach.
 - **Rotate a node key:** write a new `Secret`, re-issue tickets/grants for the
   new node id (the id changes with the key).

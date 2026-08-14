@@ -111,17 +111,35 @@ config files, mcp-remote proxies), and MCP going stateless makes stdio
 bridging *cleaner*. James-core is already ~90% of the way here
 (`wires serve` / `wires connect`, mutual inclusion on ALPN `/2`).
 
-1. Polish `wires connect` as a **drop-in `command` for any MCP client
-   config** (Claude Code, Claude Desktop): zero flags beyond the grant/ticket.
-2. End-to-end demo: an unmodified MCP server behind `wires serve` on one
-   machine; Claude Code on another with `"command": "wires", "args":
-   ["connect", ...]`. Neither side knows a network is involved.
-3. **Revocation demo**: `wires revoke` → next dial fails with a clear error;
-   nothing re-keyed, nothing re-imaged. This is the money shot — script it.
-4. Verify against MCP 2026-07-28 explicitly (stateless per-request version
-   in `_meta`, `server/discover` probe) and say so in the README.
-5. Record the 5-minute demo (asciinema or GIF) and put it at the top of the
-   README.
+1. ✅ **Drop-in `command` for any MCP client config.** `wires import`
+   installs the membership / inclusion proof / roster head into the keystore,
+   after which `wires connect --ticket <T>` needs no other flag. A dial that
+   is refused now exits `77` and prints `wires: denied by responder:
+   <reason>` on stderr instead of a transport-level mystery; a preflight check
+   catches a ticket minted for another node before any connection opens.
+2. ✅ **End-to-end demo**: `.scripts/demo-mcp.sh` — an unmodified stdio MCP
+   server (`.scripts/fake-mcp-server.py`) behind `wires serve`, driven over a
+   real session by a dialer holding only a ticket. It asserts that the
+   captured stdout is byte-clean JSON-RPC and that the tool's answer carries
+   the *verified* caller id. Not yet done: pointing a real Claude Code /
+   Claude Desktop at a responder on a second machine (item 2's literal
+   wording) — the config block is in the README, untested against a client.
+3. ✅ **Revocation demo**: `.scripts/demo-revoke.sh` — same dial before and
+   after, `--mode roster` (head advance) or `--mode crl`. The responder is
+   never restarted; the second dial exits 77 with zero bytes on stdout. This
+   needed the CRL and head to be re-read *per connection*, which is now how
+   `serve` works.
+4. ✅ Verified against MCP 2026-07-28 — see the README subsection. The
+   per-request `_meta` key was confirmed against the published spec as
+   `io.modelcontextprotocol/protocolVersion` (camelCase). Note `server/discover`
+   does not appear in the shipped rev; the stateless per-request metadata does,
+   and the bundled fake server exercises it.
+5. ⬜ **Record the 5-minute demo** (asciinema or GIF) and put it at the top of
+   the README. Neither `asciinema` nor `agg` is installed on the dev machine,
+   so this is the one open item. Both scripts are written for capture —
+   self-pacing, 80-column output, no prompts — and the README carries the
+   `brew install asciinema agg && asciinema rec -c ./.scripts/demo-revoke.sh`
+   line for whoever records it.
 
 **Gate:** show the demo to two people who run remote MCP servers today. If
 neither says "I want that," stop and re-examine before Phase 2.

@@ -13,15 +13,19 @@
 //! - `roster-head.json`: the signed roster head token (mode `0644` — public).
 //! - `inclusion-proof.json`: a member's own inclusion-proof token (mode `0644`).
 //!
-//! The resolver helpers ([`node_identity`], [`root_identity`], [`load_crl`],
+//! The resolver helpers ([`node_identity`], [`root_identity`], [`crl_source`],
 //! [`membership`]) encode the precedence the CLI uses: an inline flag wins, then
 //! the matching environment variable, then an explicit `--…-file` path, then the
-//! keystore.
+//! keystore. The two `serve` gates that must stay live — the CRL and the roster
+//! head — resolve to a *source* ([`crl_source`], [`roster_head_source`]) that the
+//! responder re-reads per connection, not to a value frozen at startup.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use library::{Crl, InclusionProof, Membership, NodeIdentity, Roster, RosterHead};
+
+use crate::transport::{CrlSource, HeadSource};
 
 /// Resolve the wires home directory (does not create it).
 pub fn home() -> Result<PathBuf> {
@@ -85,14 +89,6 @@ impl Keystore {
         let path = self.path(name);
         write_secret(&path, &id.seed_hex(), force)?;
         Ok(path)
-    }
-
-    /// Read `crl.json` as a [`Crl`]; an absent file is an empty CRL.
-    pub fn read_crl(&self) -> Result<Crl> {
-        match self.read_crl_json()? {
-            Some(json) => Ok(Crl::from_json(&json)?),
-            None => Ok(Crl::new()),
-        }
     }
 
     /// Read the raw `crl.json` text; `None` if absent.
@@ -191,11 +187,10 @@ impl Keystore {
     }
 
     /// Persist `proof` to `inclusion-proof.json` as its token (mode `0644`). The
-    /// symmetric half of [`read_inclusion_proof`](Self::read_inclusion_proof);
-    /// members install a proof received by file copy. No CLI wires it yet (a
-    /// member passes `--inclusion-proof-file` directly), so it is exercised only
-    /// by tests for now.
-    #[allow(dead_code)]
+    /// symmetric half of [`read_inclusion_proof`](Self::read_inclusion_proof):
+    /// `wires import --inclusion-proof-file <p>` installs the proof an operator
+    /// emitted with `wires roster commit --out DIR`, after which `wires connect`
+    /// finds it with no flags.
     pub fn save_inclusion_proof(&self, proof: &InclusionProof) -> Result<PathBuf> {
         ensure_dir(&self.dir)?;
         let path = self.path("inclusion-proof.json");
@@ -265,30 +260,38 @@ pub fn membership(inline: Option<&str>, file: Option<&Path>) -> Result<Membershi
     );
 }
 
-/// Resolve a roster head for `serve`: inline `--roster-head` token, then
-/// `$WIRES_ROSTER_HEAD`, then `--roster-head-file`, then the keystore
-/// (`roster-head.json`). `None` when none is configured (slice-1 behavior).
-pub fn roster_head(inline: Option<&str>, file: Option<&Path>) -> Result<Option<RosterHead>> {
+/// Resolve *where* `serve` reads its enforced roster head from: an inline
+/// `--roster-head` token, then `$WIRES_ROSTER_HEAD` (both pinned for the
+/// process's life), then `--roster-head-file`, then the keystore's
+/// `roster-head.json` — the two file cases are re-read per connection.
+///
+/// The keystore case is [`HeadSource::Keystore`], which re-checks *existence*
+/// per connection rather than at startup: a responder started before its head
+/// was imported enforces from the dial after `wires import --roster-head…`
+/// lands, with no restart. Until a head has ever been seen it enforces nothing
+/// (the pre-roster membership + CRL + TTL behavior); once one has, a missing or
+/// malformed file fails closed, like [`HeadSource::File`].
+pub fn roster_head_source(inline: Option<&str>, file: Option<PathBuf>) -> Result<HeadSource> {
     if let Some(token) = inline {
-        return Ok(Some(RosterHead::decode(token).context("--roster-head")?));
+        return Ok(HeadSource::Fixed(
+            RosterHead::decode(token).context("--roster-head")?,
+        ));
     }
     if let Some(token) = std::env::var("WIRES_ROSTER_HEAD")
         .ok()
         .filter(|s| !s.is_empty())
     {
-        return Ok(Some(
+        return Ok(HeadSource::Fixed(
             RosterHead::decode(&token).context("$WIRES_ROSTER_HEAD")?,
         ));
     }
     if let Some(path) = file {
-        let text = read_to_string_opt(path)?
-            .ok_or_else(|| anyhow!("roster head file not found: {}", path.display()))?;
-        return Ok(Some(
-            RosterHead::decode(text.trim())
-                .with_context(|| format!("parsing {}", path.display()))?,
-        ));
+        return Ok(HeadSource::File(path));
     }
-    Keystore::resolve()?.read_roster_head()
+    Ok(HeadSource::Keystore {
+        path: Keystore::resolve()?.path("roster-head.json"),
+        armed: std::sync::atomic::AtomicBool::new(false),
+    })
 }
 
 /// Resolve an inclusion proof: inline `--inclusion-proof` token, then
@@ -355,19 +358,18 @@ fn resolve_identity(
     );
 }
 
-/// Load the CRL for read-only use (`serve`): inline JSON, else a file, else the
-/// keystore, else empty.
-pub fn load_crl(inline: Option<&str>, file: Option<&Path>) -> Result<Crl> {
+/// Resolve *where* `serve` reads its revocation list from: inline `--crl-json`
+/// (parsed once, pinned), else `--crl-file`, else the keystore's `crl.json` —
+/// the two file cases are re-read per connection, so `wires revoke` lands
+/// without a restart. A missing file is an empty list.
+pub fn crl_source(inline: Option<&str>, file: Option<PathBuf>) -> Result<CrlSource> {
     if let Some(json) = inline {
-        return Ok(Crl::from_json(json)?);
+        return Ok(CrlSource::Fixed(Crl::from_json(json)?));
     }
     if let Some(path) = file {
-        return match read_to_string_opt(path)? {
-            Some(json) => Ok(Crl::from_json(&json)?),
-            None => Ok(Crl::new()),
-        };
+        return Ok(CrlSource::File(path));
     }
-    Keystore::resolve()?.read_crl()
+    Ok(CrlSource::File(Keystore::resolve()?.path("crl.json")))
 }
 
 /// Read a CRL text file; `None` if absent (used by `revoke --crl-file`).
@@ -523,12 +525,15 @@ mod tests {
     #[test]
     fn crl_round_trips_and_is_empty_when_absent() {
         let ks = Keystore::at(temp_dir());
-        assert!(ks.read_crl().unwrap().is_empty());
+        let source = CrlSource::File(ks.path("crl.json"));
+        assert!(source.load().unwrap().is_empty());
 
         let mut crl = Crl::new();
         crl.insert(NodeIdentity::from_seed([7u8; 32]).node_id());
         ks.save_crl_json(&crl.to_json().unwrap()).unwrap();
-        assert_eq!(ks.read_crl().unwrap(), crl);
+        // Same source object, re-read: what makes `wires revoke` land without a
+        // responder restart.
+        assert_eq!(source.load().unwrap(), crl);
     }
 
     #[test]
@@ -558,21 +563,25 @@ mod tests {
     }
 
     #[test]
-    fn load_crl_from_inline_then_file() {
+    fn crl_source_prefers_inline_then_file() {
         let mut crl = Crl::new();
         crl.insert(NodeIdentity::from_seed([4u8; 32]).node_id());
         let json = crl.to_json().unwrap();
 
-        // Inline JSON wins and touches no filesystem.
-        assert_eq!(load_crl(Some(&json), None).unwrap(), crl);
+        // Inline JSON is parsed once and pinned; no filesystem is touched.
+        let inline = crl_source(Some(&json), None).unwrap();
+        assert!(matches!(inline, CrlSource::Fixed(_)));
+        assert_eq!(inline.load().unwrap(), crl);
 
-        // A file is read when present, treated as empty when absent.
+        // An explicit file becomes a re-read-per-connection source.
         let dir = temp_dir();
         let path = dir.join("crl.json");
         write_crl_text(&path, &json).unwrap();
-        assert_eq!(load_crl(None, Some(&path)).unwrap(), crl);
+        assert_eq!(crl_source(None, Some(path)).unwrap().load().unwrap(), crl);
         assert!(
-            load_crl(None, Some(&dir.join("absent.json")))
+            crl_source(None, Some(dir.join("absent.json")))
+                .unwrap()
+                .load()
                 .unwrap()
                 .is_empty()
         );
@@ -692,18 +701,17 @@ mod tests {
     }
 
     #[test]
-    fn roster_head_resolver_prefers_inline_then_file() {
+    fn roster_head_source_prefers_inline_then_file() {
         let (root, mut roster) = fixture_roster();
         let (head, _) = roster.commit(&root, 0, i64::MAX).unwrap();
-        assert_eq!(
-            roster_head(Some(&head.encode().unwrap()), None)
-                .unwrap()
-                .unwrap(),
-            head
-        );
+        let inline = roster_head_source(Some(&head.encode().unwrap()), None).unwrap();
+        assert_eq!(inline.load().unwrap().unwrap(), head);
+
         let path = temp_dir().join("roster-head.json");
         write_text(&path, &head.encode().unwrap()).unwrap();
-        assert_eq!(roster_head(None, Some(&path)).unwrap().unwrap(), head);
+        let from_file = roster_head_source(None, Some(path)).unwrap();
+        assert!(matches!(from_file, HeadSource::File(_)));
+        assert_eq!(from_file.load().unwrap().unwrap(), head);
     }
 
     #[test]

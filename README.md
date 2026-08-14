@@ -16,6 +16,42 @@ neither side knows a network is involved — see
 [MCP over wires](#mcp-over-wires-flow-b--no-extra-code) for the two-command
 setup, or [Usage](#usage) for the full walkthrough.
 
+## Quickstart: run the demos
+
+Two unattended scripts stand the whole thing up on loopback — three keystores,
+a committed roster, a responder wrapped around an **unmodified** stdio MCP
+server, and a real MCP conversation across it. Each asserts its own result, so
+a green run is a passing test, not a screenshot:
+
+```bash
+bazel build //wires
+./.scripts/demo-mcp.sh      # an MCP server on "another machine", dialed by ticket
+./.scripts/demo-revoke.sh   # revoke → the same dial dies, nothing re-keyed
+```
+
+- **`demo-mcp.sh`** (~7 s) — watch the final line. The tool answers with the
+  *caller's* node id, which it learned from wires' environment injection, not
+  from anything the request claimed. The script asserts that every byte on the
+  dialer's stdout parsed as JSON-RPC: no banner, no log line, no framing.
+- **`demo-revoke.sh`** (~10 s) — watch the responder's pid stay the same across
+  the revocation, then watch the identical dial exit `77` with **zero bytes**
+  on stdout and the reason printed on the dialer's own terminal. Default
+  `--mode roster` advances the signed head; `--mode crl` appends to the
+  responder's `crl.json`.
+
+Both take `--quiet` (assertions only) and `--keep` (leave the state dir).
+Both provision into a fresh `mktemp -d` and never touch `~/.config/wires`.
+
+The five-minute screencast is not recorded yet; the scripts are written for
+capture (self-pacing, 80 columns, no prompts):
+
+```bash
+brew install asciinema agg
+asciinema rec -c ./.scripts/demo-revoke.sh demo.cast && agg demo.cast demo.gif
+```
+
+The resulting GIF belongs at the top of this file.
+
 ## Why you'd want this
 
 Today you give an agent power by *co-locating* tools and secrets next to it:
@@ -73,8 +109,9 @@ This will install `bazelisk` and `direnv` and add all the bazel-controlled tools
 > **Status:** the design is implemented end-to-end — the `library` core
 > (identity, grants, **fabric membership**, tickets, policy, the session frame
 > codec), the `wires` multi-call binary (`keygen` / `grant` / `member` /
-> `revoke` / `pair` / `serve` / `connect`), a self-hosted `relay`, distroless OCI
-> images, an on-disk keystore, direct-address tickets, and offline revocation.
+> `roster` / `revoke` / `import` / `pair` / `serve` / `connect`), a self-hosted
+> `relay`, distroless OCI images, an on-disk keystore, direct-address tickets,
+> and offline revocation that lands on the next dial without a restart.
 > Every session also proves **fabric membership** and hands the verified caller
 > identity to the served tool (see
 > [Fabric membership](#fabric-membership-identity-on-every-session) and the
@@ -128,6 +165,11 @@ you can watch the handshake and session:
 printf 'a\nTODO: ship it\nb\n' | ./.scripts/connect.sh   # terminal 2 → "2:TODO: ship it"
 ```
 
+These two keep their state in a sticky `$WIRES_DEMO_DIR` (default
+`/tmp/wires-demo`) so you can re-dial without re-provisioning. The unattended
+[quickstart demos](#quickstart-run-the-demos) use a fresh `mktemp -d` instead.
+Run all four directly from the repo root, not via `bazel run //.scripts:…`.
+
 ### The command surface
 
 | Command          | Role                      | What it does                                                                 |
@@ -137,6 +179,7 @@ printf 'a\nTODO: ship it\nb\n' | ./.scripts/connect.sh   # terminal 2 → "2:TOD
 | `wires member`   | trust root (the human)    | Root-sign a **fabric membership** for a node and emit a base64 token (`--save` to the keystore) |
 | `wires roster`   | trust root (the human)    | Author a **committed roster**: `add`/`remove` members, `commit` a signed head + per-member proofs, `head` to print the current head token |
 | `wires revoke`   | trust root / responder    | Add a subject to the CRL (keystore `crl.json` by default) and print it       |
+| `wires import`   | anyone receiving creds    | Install a membership / inclusion proof / roster head into the keystore, so later commands need no flags |
 | `wires serve`    | responder (the tool host) | Verify the dialer's **membership** (and, with `--scope`, a matching grant), exec a command, bridge its stdio — injecting the verified caller identity into the child |
 | `wires connect`  | dialer (the agent side)   | Present the **membership** and dial a `--ticket` (scoped) or `--target` (inclusion-only), piping local stdin/stdout/stderr |
 | `wires pair`     | operator ⇄ requester      | Issue a grant over the wire: `accept` (operator consents) ⇄ `request` (node)  |
@@ -176,10 +219,10 @@ environment), keys and the CRL live in a **keystore** directory, resolved as
 | `node.seed`       | `keygen --save-node` | `serve` / `connect` node key     |
 | `root.seed`       | `keygen --save-root` | `grant` / `member` signing key   |
 | `crl.json`        | `revoke` (default)   | `serve` revocation check         |
-| `membership.json` | `member --save`      | `connect` fabric membership      |
+| `membership.json` | `member --save` / `import` | `connect` + `serve` fabric membership |
 | `roster.json`        | `roster add`/`commit` | the root's full member set (`0600`, private) |
-| `roster-head.json`   | `roster commit`       | `serve --roster-head` (the signed head, public) |
-| `inclusion-proof.json` | a member (file copy) | `connect --inclusion-proof` (the member's own path, public) |
+| `roster-head.json`   | `roster commit` / `import` | `serve` (the signed head it enforces, public) |
+| `inclusion-proof.json` | `import`            | `connect` (the member's own proof, public) |
 
 `keygen --save-node` / `--save-root` write `0600` seed files (refusing to
 clobber unless `--force`). On the tool host you save the node key; on the
@@ -230,6 +273,10 @@ MEMBERSHIP=$(bazel run -q //wires -- member \
   --subject "$AGENT_ID" \
   --ttl     3600)
 
+SERVER_MEMBERSHIP=$(bazel run -q //wires -- member \
+  --subject "$SERVER_ID" \
+  --ttl     3600)
+
 TICKET=$(bazel run -q //wires -- grant \
   --subject "$AGENT_ID" \
   --target  "$SERVER_ID" \
@@ -238,6 +285,14 @@ TICKET=$(bazel run -q //wires -- grant \
 ```
 
 Use `--not-after <unix>` instead of `--ttl` for an absolute expiry.
+
+The **responder needs a membership too**: inclusion is mutual, and `serve`
+presents its own in the handshake ack so a ticket-less dialer can verify the
+service it just reached. Install it on the tool host before starting `serve`:
+
+```bash
+bazel run -q //wires -- import --membership "$SERVER_MEMBERSHIP"   # on the tool host
+```
 
 **4. The tool host serves the scope**, exec-scoped to one command, egress-only
 (no inbound port). The node key comes from the keystore. A session is accepted
@@ -254,14 +309,22 @@ bazel run -q //wires -- serve \
 
 Everything after `--` is the child command (program + args) exec'd per session.
 
-**5. The agent dials the capability** — exactly like running a local stdio
-program. It presents its membership and the ticket; its node key comes from the
-keystore; its stdin is forwarded to the child; the child's stdout/stderr stream
-back; its exit code becomes `connect`'s:
+**5. The agent installs its membership once**, with `wires import`. After this
+the dial takes no flags but the ticket — which is exactly what makes `wires
+connect` droppable into an MCP client config:
 
 ```bash
-echo "search input" | bazel run -q //wires -- connect \
-  --ticket "$TICKET" --membership "$MEMBERSHIP"
+bazel run -q //wires -- import --membership "$MEMBERSHIP"
+# → wrote ~/.config/wires/membership.json
+```
+
+**6. The agent dials the capability** — exactly like running a local stdio
+program. It presents the installed membership and the ticket; its node key
+comes from the keystore; its stdin is forwarded to the child; the child's
+stdout/stderr stream back; its exit code becomes `connect`'s:
+
+```bash
+echo "search input" | bazel run -q //wires -- connect --ticket "$TICKET"
 ```
 
 The dialer's node key **must** be both the membership's member and the grant's
@@ -272,7 +335,8 @@ so a tool can authorize per caller with no extra round-trip. (If you'd rather no
 use the keystore, every command also accepts secrets inline via `--node-seed` /
 `--root-seed`, via `$WIRES_NODE_SEED` / `$WIRES_ROOT_SEED`, or from a file via
 `--node-seed-file` / `--root-seed-file`; the membership likewise via
-`--membership` / `$WIRES_MEMBERSHIP` / `--membership-file`.)
+`--membership` / `$WIRES_MEMBERSHIP` / `--membership-file` — `import` just
+writes the keystore copy for you so the dial stays flagless.)
 
 ### Fabric membership: identity on every session
 
@@ -337,17 +401,41 @@ bazel run -q //wires -- roster commit --ttl 3600 --out ./proofs
 # → writes keystore roster-head.json, prints the head token, and emits
 #   ./proofs/<node-id>.proof for each member.
 
-# The service enforces the head (any member with a valid current proof may connect):
-bazel run -q //wires -- serve --trust-root "$ROOT_ID" --allow-any-member \
-  --roster-head-file ./roster-head.json \
-  -- printenv WIRES_CALLER_NODE WIRES_ROSTER_VERSION
+# The same human mints each side's membership and copies the head out:
+bazel run -q //wires -- member --subject "$SVC_ID"    --ttl 3600 >./svc-membership
+bazel run -q //wires -- member --subject "$MEMBER_ID" --ttl 3600 >./member-membership
+bazel run -q //wires -- roster head                                >./roster-head
 
-# The member dials, presenting its membership and inclusion proof:
-bazel run -q //wires -- connect --target "$SVC_ID" \
+# Each side installs what it needs, once, with `import` (no hand-copying into
+# membership.json / inclusion-proof.json). On the service:
+bazel run -q //wires -- import \
+  --membership-file ./svc-membership \
+  --inclusion-proof-file "./proofs/$SVC_ID.proof" \
+  --roster-head-file ./roster-head
+# On the member:
+bazel run -q //wires -- import \
+  --membership-file ./member-membership \
   --inclusion-proof-file "./proofs/$MEMBER_ID.proof"
+
+# The service enforces the head it just installed (any member with a valid
+# current proof may connect):
+bazel run -q //wires -- serve --trust-root "$ROOT_ID" --allow-any-member \
+  -- sh -c 'echo "caller=$WIRES_CALLER_NODE roster=$WIRES_ROSTER_VERSION"'
+
+# The member dials — membership and proof come from its keystore:
+bazel run -q //wires -- connect --target "$SVC_ID"
 # → the child sees WIRES_CALLER_NODE and the WIRES_ROSTER_VERSION that admitted it.
-# Now `roster remove --member "$MEMBER_ID" && roster commit` and the same dial is rejected.
 ```
+
+Now `roster remove --member "$MEMBER_ID" && roster commit` and the *same* dial
+is rejected — on the **next connection**, with no responder restart, because
+`serve` re-reads `roster-head.json` per connection. The removed member is never
+issued a newer proof: revocation here is omission, not a blocklist entry. Run
+`./.scripts/demo-revoke.sh` to watch it happen end to end.
+
+A commit bumps the version and therefore invalidates *every* member's proof,
+including the service's own — so a head advance means re-distributing one small
+proof per remaining member alongside the new head.
 
 A ticket-less (`--target`) dialer also verifies the **responder's** membership
 from the handshake ack before sending any stdin — *mutual inclusion*, so the
@@ -367,9 +455,21 @@ bazel run -q //wires -- serve \
   -- my-mcp-server --config /etc/my-mcp.toml
 ```
 
-In the MCP client config, replace the local command with the dialer (its node
-key and membership come from the agent's keystore — drop `membership.json` there
-once and the args stay clean; otherwise add `--membership <token>`):
+On the agent machine, install the credentials once and put `wires` on `PATH`:
+
+```bash
+bazel run -q //wires -- import --membership "$MEMBERSHIP"
+# and, if the responder enforces a roster head:
+#   --inclusion-proof-file ./proofs/$AGENT_ID.proof
+
+bazel build -c opt //wires && cp bazel-bin/wires/wires ~/.local/bin/wires
+```
+
+Copy, don't symlink: `bazel-bin/` is itself a symlink into the Bazel cache and
+moves on `bazel clean`.
+
+Then in the MCP client config, replace the local command with the dialer. After
+the `import` above, the ticket is the *only* argument it needs:
 
 ```json
 {
@@ -382,12 +482,68 @@ once and the args stay clean; otherwise add `--membership <token>`):
 }
 ```
 
+**GUI clients need absolute paths.** Claude Desktop (and anything else launched
+from the Dock/Finder rather than a shell) spawns servers with a minimal `PATH`
+and without your shell's environment — use `"command":
+"/Users/you/.local/bin/wires"`. It also won't have `$XDG_CONFIG_HOME` set, so
+the keystore it reads is `~/.config/wires`; run the `import` as the same user
+the client runs as.
+
 The client believes it launched a local stdio server; the server believes it was
 launched locally. Neither knows a network is involved. (For a multi-tenant MCP
 server, run the responder
 [inclusion-only](#fabric-membership-identity-on-every-session) with
 `--allow-any-member` and authorize each caller inside the server from
 `WIRES_CALLER_NODE`.)
+
+#### Verified against MCP 2026-07-28
+
+wires is a byte-transparent stdio bridge: it never parses, rewrites, or buffers
+JSON-RPC. What the [2026-07-28
+rev](https://modelcontextprotocol.io/specification/2026-07-28) requires of a
+*stdio server* is therefore a property of the bridge, not of the protocol. Each
+of these was measured on a live session against this tree — reproduce with
+`./.scripts/demo-mcp.sh`:
+
+- **stdout carries only the server's bytes.** A captured session's stdout
+  parsed line-for-line as JSON-RPC with nothing else in it; every failure path
+  wrote zero bytes. `demo-mcp.sh` and `demo-revoke.sh` both assert this, and it
+  is what makes the bridge safe to drop into a `command` field at all.
+- **all diagnostics go to stderr** — wires' own logging, the remote child's
+  stderr (forwarded back over the session), and denial reasons.
+- **exit codes are meaningful.** The remote child's exit code becomes
+  `connect`'s; a local or transport failure is `1`; an authorization refusal is
+  **77**, with `wires: denied by responder: <reason>` on stderr.
+- **full duplex before EOF.** Five `ping`s were issued one at a time on a single
+  open session, each with a 400 ms pause and stdin never closed: first
+  round trip ~34 ms, steady state ~3 ms on loopback. A long-lived client session
+  behaves as if it had spawned the server locally, rather than as a batch pipe.
+- **one child per session.** Two sequential dials against one responder exec'd
+  two distinct child pids, and a dialer that disappears has its remote child
+  killed rather than orphaned (covered by a test in `wires/transport.rs`).
+
+Protocol-level features of the rev — stateless requests, the per-request
+protocol version and client capabilities in `_meta`, `resultType` — ride through
+untouched; conformance to *those* belongs to whatever MCP server you put behind
+`wires serve`, not to wires. The bundled `.scripts/fake-mcp-server.py` exercises
+them so the demos have something honest to talk to: it answers `tools/call` with
+no prior `initialize` (stateless), returns a deterministic single-item
+`tools/list`, stamps `resultType: "complete"` and
+`io.modelcontextprotocol/serverInfo` on every result, and echoes the request's
+protocol version back in the result's `_meta`.
+
+Two caveats, stated plainly:
+
+- The canonical request key is `io.modelcontextprotocol/protocolVersion`
+  (camelCase), confirmed against the published spec's "Per-request protocol
+  fields" table. The fake server *also* accepts
+  `io.modelcontextprotocol/protocol-version`, `protocolVersion`, and
+  `protocol-version` so hand-typed demo JSON still round-trips; only the first
+  spelling is normative.
+- No MCP client has been driven against the bridge yet. The demos speak
+  JSON-RPC directly at `wires connect`; wiring Claude Code or Claude Desktop to
+  a remote responder is the next thing to try, and the config block above is
+  what it would use.
 
 ### Pairing: issue a grant over the wire
 
@@ -415,17 +571,42 @@ reaches the operator the same way as everywhere else — direct `--addr`,
 
 ### Revocation (offline)
 
-Revocation is offline: short grant TTLs plus a responder-side CRL. On the tool
-host, `revoke` updates the keystore's `crl.json` in place, and `serve` reads it
-by default — so revoking a subject is a one-liner:
+Revocation is offline — no auth server, no token introspection endpoint. On the
+tool host, `revoke` updates the keystore's `crl.json` in place, and `serve`
+reads it by default, so revoking a subject is a one-liner:
 
 ```bash
-# Append a subject to the keystore crl.json (idempotent):
-bazel run -q //wires -- revoke --subject "$AGENT_ID"
-
 # serve reads ~/.config/wires/crl.json automatically:
 bazel run -q //wires -- serve --trust-root "$ROOT_ID" --scope tools.rg -- rg --line-number TODO
+
+# ...and in another terminal, append a subject to that crl.json (idempotent):
+bazel run -q //wires -- revoke --subject "$AGENT_ID"
 ```
+
+**It takes effect on the next dial, with no responder restart.** `serve`
+re-reads both `crl.json` and `roster-head.json` once per connection, so
+`wires revoke` and `roster commit` land immediately; a session already open is
+deliberately unaffected. A refused dial prints one line on the *dialer's*
+stderr — `wires: denied by responder: membership rejected: revoked` — writes
+zero bytes to stdout, and exits **77**. (Short TTLs remain worth setting, as
+defense in depth for a responder you cannot reach.)
+
+A responder started *before* any head was imported is not stuck at "no
+enforcement": the keystore's `roster-head.json` is checked for on every
+connection, so the first dial after `wires import --roster-head …` is the first
+one gated on inclusion. (`--roster-head <token>` and `$WIRES_ROSTER_HEAD` are
+the exception — an inline head is pinned for the process's life by definition.)
+
+Caveat: once a responder has seen a head, *deleting* its `roster-head.json`
+fails closed — every subsequent dial is denied with `responder configuration
+error` until the file is restored.
+
+The [committed roster](#committed-roster-current-membership--fabric-wide-revocation)
+is the stronger of the two stories: instead of adding an id to a blocklist that
+every responder must receive, the operator re-signs a head that simply omits the
+member, and no newer inclusion proof will ever exist for them — revocation by
+omission. `./.scripts/demo-revoke.sh` scripts both paths (`--mode roster`, the
+default, and `--mode crl`).
 
 To manage the CRL elsewhere (e.g. a Kubernetes ConfigMap mounted at a path),
 `revoke --crl-file <path>` updates that file in place and `serve --crl-file

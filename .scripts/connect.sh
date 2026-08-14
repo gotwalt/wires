@@ -11,6 +11,12 @@
 #   printf 'a\nTODO: x\nb\n' | ./.scripts/connect.sh
 #   ./.scripts/connect.sh < some-file.txt
 #
+# Run this directly from the repo root -- NOT via `bazel run //.scripts:...`.
+#
+# Like serve-rg.sh, this keeps its state in the sticky $WIRES_DEMO_DIR so you
+# can iterate on the happy path without re-provisioning keys. The revocation
+# demo (.scripts/demo-revoke.sh) uses a fresh `mktemp -d` instead.
+#
 #   WIRES_DEMO_DIR   shared state dir (default /tmp/wires-demo)
 #   RUST_LOG         log level (default info)
 
@@ -42,10 +48,14 @@ if [ ! -s "$DEMO/ticket" ] || [ ! -s "$DEMO/membership" ] || [ ! -f "$agt/node.s
 fi
 
 ticket="$(cat "$DEMO/ticket")"
-membership="$(cat "$DEMO/membership")"
+
+# Install the membership once, into the agent's keystore. After this the dial
+# is the drop-in form -- `wires connect --ticket <T>` and nothing else, which
+# is exactly what goes in an MCP client's `command` / `args`.
+WIRES_HOME="$agt" "$WIRES" import --membership-file "$DEMO/membership" >/dev/null
 log "dialing the rg responder over wires (piping stdin through to rg) ..."
 
 # Use the agent's node key (the membership's member and the grant's subject).
-# connect presents the membership + ticket and bridges our stdio.
+# connect presents the installed membership + the ticket and bridges our stdio.
 exec env WIRES_HOME="$agt" RUST_LOG="${RUST_LOG:-info}" \
-	"$WIRES" connect --ticket "$ticket" --membership "$membership"
+	"$WIRES" connect --ticket "$ticket"

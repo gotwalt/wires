@@ -11,7 +11,19 @@
 //! [`library::check_accept`]) against the iroh-authenticated caller, then execs
 //! the configured child — with the verified caller identity injected into its
 //! environment — and bridges its stdio over tagged frames.
+//!
+//! Two properties this module exists to preserve:
+//!
+//! - **Refusals are legible.** A responder that turns a caller away sends a
+//!   [`Frame::Denied`] carrying the reason before closing, which the dialer
+//!   surfaces as a [`Denied`] error (`wires connect` exits 77). Nothing the
+//!   dialer sends or receives on a refused session ever reaches its stdout.
+//! - **Refusals are current.** The CRL and the enforced roster head are
+//!   *sources* ([`CrlSource`] / [`HeadSource`]), re-read on every connection, so
+//!   `wires revoke` and `wires roster commit` take effect on the next dial
+//!   rather than the next restart.
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -45,6 +57,11 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// peer that connects but never speaks can't hold a session task open.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long `connect` waits for the target to answer before giving up; an
+/// unreachable responder must fail fast rather than look like a hung MCP server
+/// to the client.
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The responder's static configuration: what it trusts, what it serves, the
 /// optional roster head it enforces, the identity it presents in the ack, and
 /// the child to exec. Built once per `serve` and shared across connections.
@@ -53,10 +70,10 @@ pub struct ServeConfig {
     pub trust_root: NodeId,
     /// The scope this responder serves; `None` is inclusion-only.
     pub scope: Option<Scope>,
-    /// The revocation list applied to the slice-1 credential checks.
-    pub crl: Crl,
-    /// When `Some`, the head a caller's inclusion proof is checked against.
-    pub roster_head: Option<RosterHead>,
+    /// Where the revocation list applied to the credential checks comes from.
+    pub crl: CrlSource,
+    /// Where the enforced roster head comes from (or that none is enforced).
+    pub head: HeadSource,
     /// The responder's own membership, presented in the `HandshakeAck`.
     pub membership: Membership,
     /// The responder's own inclusion proof, presented if set (unused by the
@@ -64,6 +81,155 @@ pub struct ServeConfig {
     pub proof: Option<InclusionProof>,
     /// The command (program + args) to exec per session.
     pub command: Vec<String>,
+}
+
+/// Where the responder reads its revocation list from.
+///
+/// `File` is re-read on **every connection**, so `wires revoke` takes effect on
+/// the next dial without restarting the responder. `Fixed` pins a list supplied
+/// inline at startup (`--crl-json`), which is by definition static.
+#[derive(Debug)]
+pub enum CrlSource {
+    /// A list fixed at startup.
+    Fixed(Crl),
+    /// A path re-read per connection.
+    File(PathBuf),
+}
+
+/// Where the responder reads the enforced roster head from.
+///
+/// `None` disables head enforcement (membership + CRL + TTL only); `File` and
+/// `Keystore` are re-read per connection, so `wires roster commit` takes effect
+/// on the next dial without a restart.
+#[derive(Debug)]
+pub enum HeadSource {
+    /// No head enforcement.
+    None,
+    /// A head fixed at startup (an inline token or environment variable).
+    Fixed(RosterHead),
+    /// An explicitly configured path (`--roster-head-file`), re-read per
+    /// connection. Enforcing from the start: a missing file is an error.
+    File(PathBuf),
+    /// The keystore default (`roster-head.json`), whose *existence* is
+    /// re-checked per connection.
+    ///
+    /// Enforcement arms itself the first time the file is seen: before that a
+    /// missing file means "this responder has no head" (the pre-roster
+    /// membership + CRL + TTL behavior); after that it means the head was
+    /// deleted, and every dial is refused. That is what makes `wires import
+    /// --roster-head…` land on a responder that started with no head at all —
+    /// without it, a later-installed head would never be consulted and the
+    /// omitted member would stay admitted.
+    Keystore {
+        /// The keystore's `roster-head.json`.
+        path: PathBuf,
+        /// Set once a head has been read from `path`; from then on the source
+        /// fails closed.
+        armed: std::sync::atomic::AtomicBool,
+    },
+}
+
+impl CrlSource {
+    /// Resolve the revocation list as it stands right now.
+    ///
+    /// A missing `File` is an **empty** list — the same thing "no `crl.json`
+    /// yet" meant at startup before the CRL was read per connection. A
+    /// malformed one is an error: a garbled list must never read as "nobody is
+    /// revoked".
+    pub fn load(&self) -> Result<Crl> {
+        match self {
+            CrlSource::Fixed(crl) => Ok(crl.clone()),
+            CrlSource::File(path) => match std::fs::read_to_string(path) {
+                Ok(text) => {
+                    Crl::from_json(&text).with_context(|| format!("parsing CRL {}", path.display()))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Crl::new()),
+                Err(e) => Err(e).with_context(|| format!("reading CRL {}", path.display())),
+            },
+        }
+    }
+}
+
+impl HeadSource {
+    /// Resolve the head to enforce right now.
+    ///
+    /// **Fails closed.** A `File` source that is missing or malformed is an
+    /// error, not "no enforcement": head enforcement was deliberately
+    /// configured, so losing the file must refuse callers rather than silently
+    /// re-admit the whole fabric. A responder that wants no enforcement says so
+    /// with [`HeadSource::None`].
+    ///
+    /// A `Keystore` source is the one case that can *become* enforcing: while
+    /// `roster-head.json` has never been seen it resolves to `None`, and from
+    /// the first read onward it behaves exactly like `File`.
+    pub fn load(&self) -> Result<Option<RosterHead>> {
+        match self {
+            HeadSource::None => Ok(None),
+            HeadSource::Fixed(head) => Ok(Some(head.clone())),
+            HeadSource::File(path) => Ok(Some(read_head(path)?)),
+            HeadSource::Keystore { path, armed } => {
+                use std::sync::atomic::Ordering;
+                match std::fs::read_to_string(path) {
+                    Ok(text) => {
+                        let head = RosterHead::decode(text.trim())
+                            .with_context(|| format!("parsing roster head {}", path.display()))?;
+                        if !armed.swap(true, Ordering::SeqCst) {
+                            tracing::info!(
+                                path = %path.display(),
+                                version = ?head.version,
+                                "roster head installed; enforcing inclusion from this dial on"
+                            );
+                        }
+                        Ok(Some(head))
+                    }
+                    // Never seen a head: pre-roster behavior (membership + CRL
+                    // + TTL only). Seen one before: it was deleted — refuse.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        if armed.load(Ordering::SeqCst) {
+                            Err(anyhow!(
+                                "roster head {} has gone missing after being enforced; \
+                                 restore it or restart `wires serve`",
+                                path.display()
+                            ))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    Err(e) => {
+                        Err(e).with_context(|| format!("reading roster head {}", path.display()))
+                    }
+                }
+            }
+        }
+    }
+
+    /// How this source reports at startup: `"yes"`, `"no"`, or `"when-present"`
+    /// for the keystore default, which arms itself the first time a head
+    /// appears.
+    pub fn enforcement(&self) -> &'static str {
+        match self {
+            HeadSource::None => "no",
+            HeadSource::Fixed(_) | HeadSource::File(_) => "yes",
+            HeadSource::Keystore { .. } => "when-present",
+        }
+    }
+}
+
+/// Read and decode a roster head from `path`; missing or malformed is an error.
+fn read_head(path: &Path) -> Result<RosterHead> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading roster head {}", path.display()))?;
+    RosterHead::decode(text.trim())
+        .with_context(|| format!("parsing roster head {}", path.display()))
+}
+
+/// The revocation list and roster head as loaded for **one** connection.
+///
+/// Loaded fresh in [`serve_session`] rather than frozen in [`ServeConfig`], so a
+/// revocation lands on the next dial instead of the next restart.
+struct LoadedPolicy {
+    crl: Crl,
+    head: Option<RosterHead>,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +338,33 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>> {
     }
 }
 
+/// The largest denial reason put on the wire. A refusal is a short sentence;
+/// the cap keeps a pathological `{e:#}` chain from becoming a frame.
+const MAX_REASON: usize = 512;
+
+/// Clamp a denial reason to [`MAX_REASON`] bytes, cutting on a char boundary so
+/// the frame body stays valid UTF-8.
+fn truncate_reason(mut s: String) -> String {
+    if s.len() > MAX_REASON {
+        let mut end = MAX_REASON;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
+/// Tell the dialer *why* it was refused, then close our side.
+///
+/// Best-effort: a peer that already vanished simply never reads it, and the
+/// caller still returns the original error for logging.
+async fn deny<W: AsyncWrite + Unpin>(send: &mut W, reason: String) {
+    let reason = truncate_reason(reason);
+    let _ = write_frame(send, &Frame::Denied { reason }).await;
+    send.shutdown().await.ok();
+}
+
 /// Pump a child output stream into `tx` as frames built by `make`
 /// ([`Frame::Stdout`] / [`Frame::Stderr`]).
 async fn pump_reader<R: AsyncRead + Unpin>(
@@ -214,9 +407,14 @@ pub async fn serve_on(endpoint: Endpoint, config: ServeConfig) -> Result<()> {
     tracing::info!(
         node = %to_node_id(&endpoint.id()).hex(),
         scope = ?config.scope.as_ref().map(Scope::as_str),
-        enforcing_head = config.roster_head.is_some(),
+        enforcing_head = config.head.enforcement(),
         sockets = ?endpoint.bound_sockets(),
         "serving session ALPN (egress-only)"
+    );
+    tracing::info!(
+        crl = ?config.crl,
+        head = ?config.head,
+        "credential sources (re-read per connection)"
     );
     if config.scope.is_none() {
         tracing::warn!("inclusion-only: any fabric member may connect");
@@ -240,23 +438,44 @@ async fn handle_connection(incoming: iroh::endpoint::Incoming, config: &ServeCon
     tracing::info!(caller = %caller.hex(), "connection accepted (iroh-authenticated)");
     let (send, recv) = conn.accept_bi().await.context("accepting bi-stream")?;
 
-    serve_session(send, recv, caller, config).await?;
+    // The transport's own liveness signal: when the dialer goes away (clean
+    // close, SIGKILL, network loss), the child dies with it instead of being
+    // stranded on this host. `Connection` is cheap to clone.
+    let closed = conn.clone();
+    let result = serve_session(send, recv, caller, config, async move {
+        closed.closed().await;
+    })
+    .await;
 
     // Wait for the dialer to read the final frames and close, so we don't tear
     // the connection down mid-flush. Bounded so a vanished dialer can't pin us.
+    // This runs on the **refusal** path too: dropping `conn` here would discard
+    // the buffered `Frame::Denied` and the dialer would see nothing but a lost
+    // connection — which is exactly the error this frame exists to replace.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
-    Ok(())
+    result
 }
 
 /// The responder half of a session over an established, already-authenticated
 /// bi-stream: read and verify the handshake against `caller` and `config`, send a
 /// `HandshakeAck`, then exec `config.command` and bridge its stdio. `caller` must
 /// already be authenticated by whoever supplies the streams.
+///
+/// A refused handshake is answered with a [`Frame::Denied`] carrying the reason
+/// before the connection drops, and no child is spawned. (A peer that connects
+/// and then says nothing at all hits the handshake *timeout* instead and is
+/// dropped in silence — there is nobody listening to tell.)
+///
+/// `shutdown` resolves when the transport says the dialer is gone; the child is
+/// then killed rather than left running. MCP clients restart their stdio
+/// servers routinely, so without this every restart would strand a process on
+/// the tool host.
 async fn serve_session<S, R>(
     mut send: S,
     mut recv: R,
     caller: NodeId,
     config: &ServeConfig,
+    shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin + Send + 'static,
@@ -273,44 +492,49 @@ where
             grant,
             proof,
         }) => (membership, grant, proof),
-        Some(_) => bail!("first frame was not a handshake"),
-        None => bail!("connection closed before handshake"),
+        // A peer is on the other end and spoke out of turn (or hung up): say so
+        // on the wire before failing, so it need not guess.
+        Some(_) => {
+            let e = anyhow!("first frame was not a handshake");
+            deny(&mut send, format!("{e:#}")).await;
+            return Err(e);
+        }
+        None => {
+            let e = anyhow!("connection closed before handshake");
+            deny(&mut send, format!("{e:#}")).await;
+            return Err(e);
+        }
     };
     let now = crate::now_unix();
 
-    // Inclusion is always required: the caller must prove fabric membership,
-    // bound to its iroh-authenticated key.
-    check_inclusion(&membership, config.trust_root, caller, now, &config.crl)
-        .map_err(|e| anyhow!("membership rejected: {e}"))?;
-
-    // A scoped responder additionally requires a matching, accepted grant.
-    if let Some(scope) = config.scope.as_ref() {
-        let grant = grant
-            .as_ref()
-            .ok_or_else(|| anyhow!("scoped session requires a grant; none presented"))?;
-        check_accept(grant, config.trust_root, caller, now, &config.crl)
-            .map_err(|e| anyhow!("grant rejected: {e}"))?;
-        if grant.scope.as_str() != scope.as_str() {
-            bail!(
-                "grant scope {:?} does not match served scope {:?}",
-                grant.scope.as_str(),
-                scope.as_str()
-            );
+    // Re-read the CRL and the enforced head for *this* connection, so a
+    // revocation or a fresh roster head applies to the very next dial. A source
+    // we cannot read is fatal for this session, but the dialer is told only that
+    // the responder is misconfigured — never the path.
+    let policy = match load_policy(config) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("credential sources unusable: {e:#}");
+            deny(&mut send, "responder configuration error".to_string()).await;
+            return Err(e.context("loading credential sources"));
         }
-    }
+    };
 
-    // Defense-in-depth: if a grant rode along, it must name the same node as the
-    // membership. Redundant (both are pinned to `caller`) but cheap, and it
-    // guards against a future refactor that loosens one path.
-    if let Some(grant) = grant.as_ref()
-        && grant.subject != membership.member
-    {
-        bail!("grant subject does not match membership member");
-    }
-
-    // Roster head gate: when a head is configured, require a proof and check the
-    // caller's *current* membership; remember the admitting version.
-    let roster_version = roster_gate(config, proof.as_ref(), caller, now)?;
+    let roster_version = match authorize(
+        config,
+        &policy,
+        &membership,
+        grant.as_ref(),
+        proof.as_ref(),
+        caller,
+        now,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            deny(&mut send, format!("{e:#}")).await;
+            return Err(e);
+        }
+    };
 
     tracing::info!(
         caller = %caller.hex(),
@@ -396,7 +620,21 @@ where
     let out_task = tokio::spawn(pump_reader(child_stdout, Frame::Stdout, tx.clone()));
     let err_task = tokio::spawn(pump_reader(child_stderr, Frame::Stderr, tx.clone()));
 
-    let status = child.wait().await.context("waiting for child")?;
+    // Wait for the child, unless the dialer vanishes first — in which case kill
+    // it and reap, rather than leaving an orphan behind. (The `child.wait()`
+    // future is dropped when the select ends, releasing its borrow of `child`.)
+    let finished = tokio::select! {
+        status = child.wait() => Some(status.context("waiting for child")?),
+        _ = shutdown => None,
+    };
+    let status = match finished {
+        Some(status) => status,
+        None => {
+            tracing::warn!("dialer disconnected; killing child");
+            child.start_kill().ok();
+            child.wait().await.context("reaping killed child")?
+        }
+    };
     out_task.await.context("stdout pump")??;
     err_task.await.context("stderr pump")??;
     let _ = stdin_task.await;
@@ -409,17 +647,81 @@ where
     Ok(())
 }
 
-/// The roster head gate. When `config.roster_head` is `None`, returns `Ok(None)`
-/// (slice-1 behavior). When `Some`, requires `proof` and checks the caller's
-/// *current* membership against the head, returning the admitting version for
-/// `WIRES_ROSTER_VERSION`.
-fn roster_gate(
+/// Load this connection's view of the responder's credential sources.
+fn load_policy(config: &ServeConfig) -> Result<LoadedPolicy> {
+    Ok(LoadedPolicy {
+        crl: config.crl.load()?,
+        head: config.head.load()?,
+    })
+}
+
+/// Every credential check a caller must pass, in one place.
+///
+/// Runs, in order: fabric inclusion (always), the scope grant (when the
+/// responder serves a scope), the grant/membership subject agreement, and the
+/// roster head gate. Returns the roster version that admitted the caller, or
+/// `None` when no head is enforced.
+///
+/// The error messages are user-facing: they are what the responder logs *and*
+/// what it sends back in a [`Frame::Denied`], so each keeps a prefix naming the
+/// credential at fault (`membership rejected: …`, `grant rejected: …`,
+/// `roster inclusion rejected: …`).
+fn authorize(
     config: &ServeConfig,
+    policy: &LoadedPolicy,
+    membership: &Membership,
+    grant: Option<&Grant>,
     proof: Option<&InclusionProof>,
     caller: NodeId,
     now: i64,
 ) -> Result<Option<u64>> {
-    let Some(head) = config.roster_head.as_ref() else {
+    // Inclusion is always required: the caller must prove fabric membership,
+    // bound to its iroh-authenticated key.
+    check_inclusion(membership, config.trust_root, caller, now, &policy.crl)
+        .map_err(|e| anyhow!("membership rejected: {e}"))?;
+
+    // A scoped responder additionally requires a matching, accepted grant.
+    if let Some(scope) = config.scope.as_ref() {
+        let grant =
+            grant.ok_or_else(|| anyhow!("scoped session requires a grant; none presented"))?;
+        check_accept(grant, config.trust_root, caller, now, &policy.crl)
+            .map_err(|e| anyhow!("grant rejected: {e}"))?;
+        if grant.scope.as_str() != scope.as_str() {
+            bail!(
+                "grant scope {:?} does not match served scope {:?}",
+                grant.scope.as_str(),
+                scope.as_str()
+            );
+        }
+    }
+
+    // Defense-in-depth: if a grant rode along, it must name the same node as the
+    // membership. Redundant (both are pinned to `caller`) but cheap, and it
+    // guards against a future refactor that loosens one path.
+    if let Some(grant) = grant
+        && grant.subject != membership.member
+    {
+        bail!("grant subject does not match membership member");
+    }
+
+    // Roster head gate: when a head is enforced, require a proof and check the
+    // caller's *current* membership; remember the admitting version.
+    roster_gate(config, policy.head.as_ref(), proof, caller, now)
+}
+
+/// The roster head gate. With no enforced `head`, returns `Ok(None)` (slice-1
+/// behavior). With one, requires `proof` and checks the caller's *current*
+/// membership against that head, returning the admitting version for
+/// `WIRES_ROSTER_VERSION`. `head` is the freshly loaded head for this
+/// connection, not a value frozen at startup.
+fn roster_gate(
+    config: &ServeConfig,
+    head: Option<&RosterHead>,
+    proof: Option<&InclusionProof>,
+    caller: NodeId,
+    now: i64,
+) -> Result<Option<u64>> {
+    let Some(head) = head else {
         return Ok(None);
     };
     let proof = proof.ok_or(library::Error::InclusionProofRequired)?;
@@ -431,6 +733,39 @@ fn roster_gate(
 // ---------------------------------------------------------------------------
 // Dialer (`wires connect`)
 // ---------------------------------------------------------------------------
+
+/// The responder refused the handshake and said why.
+///
+/// Distinguishes an *authorization* failure (the credential this dialer
+/// presented was not acceptable — revoked, expired, off the roster) from every
+/// local or transport failure, so `wires connect` can exit with a dedicated
+/// code and print the responder's own words. Hand-rolled rather than derived:
+/// `//wires` deliberately carries no `thiserror` dependency.
+#[derive(Debug)]
+pub struct Denied {
+    reason: String,
+}
+
+impl Denied {
+    /// Wrap the responder's stated reason.
+    fn new(reason: String) -> Self {
+        Self { reason }
+    }
+
+    /// The responder's stated reason, verbatim (e.g. `membership rejected:
+    /// revoked`).
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for Denied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "denied by responder: {}", self.reason)
+    }
+}
+
+impl std::error::Error for Denied {}
 
 /// Bind for `node` and dial `target` (see [`connect_on`]).
 #[allow(clippy::too_many_arguments)]
@@ -479,10 +814,24 @@ where
     E: AsyncWrite + Unpin,
 {
     tracing::info!("dialing the capability over wires");
-    let conn = endpoint
-        .connect(target, ALPN)
-        .await
-        .map_err(|e| anyhow!("dialing target: {e}"))?;
+    let conn = match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(target, ALPN)).await {
+        Ok(Ok(conn)) => conn,
+        // Close on the failure paths too: an endpoint dropped without
+        // `close()` makes iroh log an alarming abort line over the actual
+        // error the user needs to read.
+        Ok(Err(e)) => {
+            endpoint.close().await;
+            return Err(anyhow!("dialing target: {e}"));
+        }
+        Err(_) => {
+            endpoint.close().await;
+            return Err(anyhow!(
+                "dialing target: no answer within {}s — is `wires serve` running on the target, \
+                 and are the ticket's --addr hints still current?",
+                DIAL_TIMEOUT.as_secs()
+            ));
+        }
+    };
     let target_id = to_node_id(&conn.remote_id());
     let (send, recv) = conn.open_bi().await.context("opening bi-stream")?;
     tracing::info!("session open; presenting membership and bridging stdio");
@@ -550,6 +899,9 @@ where
     // Read the responder's ack first (it is always the responder's first frame).
     let ack_membership = match read_frame(&mut recv).await? {
         Some(Frame::HandshakeAck { membership, .. }) => membership,
+        // Refused: surface the responder's reason. No stdin task has been
+        // spawned yet, so nothing was forwarded and nothing hit local stdout.
+        Some(Frame::Denied { reason }) => return Err(Denied::new(reason).into()),
         Some(_) => bail!("responder's first frame was not a handshake ack"),
         None => bail!("responder closed before sending a handshake ack"),
     };
@@ -598,6 +950,12 @@ where
                 tracing::info!(code, "remote child exited");
                 break;
             }
+            // A responder may also refuse mid-stream (e.g. a future re-check);
+            // treat it exactly like a refusal at the ack.
+            Some(Frame::Denied { reason }) => {
+                stdin_task.abort();
+                return Err(Denied::new(reason).into());
+            }
             Some(_) => {} // ignore unexpected frames from the responder
             None => break,
         }
@@ -614,6 +972,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shutdown signal that never fires: the dialer stays present for the
+    /// whole session, which is what every test but
+    /// [`child_is_killed_when_the_dialer_vanishes`] wants.
+    fn never() -> std::future::Pending<()> {
+        std::future::pending::<()>()
+    }
 
     /// Build an endpoint with no discovery/relay (hermetic) for loopback tests.
     async fn test_endpoint(identity: &NodeIdentity) -> Endpoint {
@@ -712,8 +1077,8 @@ mod tests {
         ServeConfig {
             trust_root: root.node_id(),
             scope: scope.map(Scope::new),
-            crl,
-            roster_head: None,
+            crl: CrlSource::Fixed(crl),
+            head: HeadSource::None,
             membership: Membership::mint(root, server, 0, i64::MAX).unwrap(),
             proof: None,
             command,
@@ -738,7 +1103,10 @@ mod tests {
         let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024); // responder -> dialer
 
         let config = test_config(&root, server, Some(served_scope), Crl::new(), command);
-        let srv = tokio::spawn(async move { serve_session(s2c_w, c2s_r, caller, &config).await });
+        let srv =
+            tokio::spawn(
+                async move { serve_session(s2c_w, c2s_r, caller, &config, never()).await },
+            );
 
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -792,13 +1160,361 @@ mod tests {
         let config = ServeConfig {
             trust_root,
             scope: served_scope.map(Scope::new),
-            crl,
-            roster_head: None,
+            crl: CrlSource::Fixed(crl),
+            head: HeadSource::None,
             membership: server_membership,
             proof: None,
             command: vec!["cat".to_string()],
         };
-        serve_session(send, recv, caller, &config).await.is_err()
+        serve_session(send, recv, caller, &config, never())
+            .await
+            .is_err()
+    }
+
+    /// Drive one dial/serve pair over duplex pipes with an explicit responder
+    /// config and dialer credentials; returns the dialer's result plus whatever
+    /// reached its stdout (which must stay empty on every refusal path).
+    async fn run_with_config(
+        config: ServeConfig,
+        caller: NodeId,
+        membership: Membership,
+        grant: Option<Grant>,
+        proof: Option<InclusionProof>,
+    ) -> (Result<i32>, Vec<u8>) {
+        let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
+        let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
+        let srv =
+            tokio::spawn(
+                async move { serve_session(s2c_w, c2s_r, caller, &config, never()).await },
+            );
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let res = dial_session(
+            c2s_w,
+            s2c_r,
+            membership,
+            grant,
+            proof,
+            None, // ticketed → ignore the ack
+            std::io::Cursor::new(Vec::new()),
+            &mut out,
+            &mut err,
+        )
+        .await;
+        let _ = srv.await;
+        (res, out)
+    }
+
+    #[tokio::test]
+    async fn denied_session_reports_reason_and_writes_no_stdout() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let membership = valid_membership(&root, caller);
+        let mut crl = Crl::new();
+        crl.insert(caller);
+
+        let config = test_config(&root, server, None, crl, vec!["cat".to_string()]);
+        let (res, out) = run_with_config(config, caller, membership, None, None).await;
+
+        let e = res.expect_err("a revoked caller must be refused");
+        let denied = e
+            .downcast_ref::<Denied>()
+            .unwrap_or_else(|| panic!("expected a Denied error, got: {e:#}"));
+        assert!(
+            denied.reason().contains("revoked"),
+            "reason should name revocation, got: {}",
+            denied.reason()
+        );
+        assert!(
+            out.is_empty(),
+            "a refused dial must write nothing to stdout"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_roster_removal_reports_the_roster_reason() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let server = NodeIdentity::from_seed([3u8; 32]).node_id();
+        // A v1 proof against a head that has since advanced to v2 — what a
+        // removed member holds.
+        let (mut config, v1_proof) = head_enforcing(&root, server, caller, vec!["cat".to_string()]);
+        let mut roster = Roster::new(root.node_id());
+        roster.insert(caller);
+        roster.insert(server);
+        let _ = roster.commit(&root, 0, i64::MAX).unwrap(); // v1
+        let (v2_head, _) = roster.commit(&root, 0, i64::MAX).unwrap(); // v2
+        config.head = HeadSource::Fixed(v2_head);
+
+        let membership = valid_membership(&root, caller);
+        let (res, out) = run_with_config(config, caller, membership, None, Some(v1_proof)).await;
+
+        let e = res.expect_err("a stale proof must be refused");
+        let denied = e
+            .downcast_ref::<Denied>()
+            .unwrap_or_else(|| panic!("expected a Denied error, got: {e:#}"));
+        assert!(
+            denied.reason().contains("roster inclusion rejected"),
+            "reason should name the roster gate, got: {}",
+            denied.reason()
+        );
+        assert!(out.is_empty());
+    }
+
+    /// A fresh, unique directory for tests that need real files (mirrors the
+    /// `TEST_TMPDIR`-aware helper in `keystore`'s tests).
+    fn temp_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let base = std::env::var_os("TEST_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!(
+            "wires-transport-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn crl_source_missing_file_is_empty_malformed_is_an_error() {
+        let dir = temp_dir();
+        // Absent: "nothing revoked yet", the pre-existing startup semantics.
+        assert!(
+            CrlSource::File(dir.join("absent.json"))
+                .load()
+                .unwrap()
+                .is_empty()
+        );
+        // Garbled: must not silently read as "nobody is revoked".
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, "{ not json").unwrap();
+        assert!(CrlSource::File(bad).load().is_err());
+    }
+
+    #[test]
+    fn head_source_fails_closed_on_a_missing_or_malformed_file() {
+        let dir = temp_dir();
+        assert!(HeadSource::None.load().unwrap().is_none());
+        // Enforcement was configured, so a vanished head refuses rather than
+        // re-admitting the whole fabric.
+        assert!(HeadSource::File(dir.join("absent.json")).load().is_err());
+        let bad = dir.join("bad-head.json");
+        std::fs::write(&bad, "not-a-token").unwrap();
+        assert!(HeadSource::File(bad).load().is_err());
+    }
+
+    /// The keystore default re-checks *existence* per connection: a responder
+    /// that started with no `roster-head.json` must still enforce the head an
+    /// operator imports later. Once it has seen one, it fails closed like
+    /// [`HeadSource::File`].
+    #[test]
+    fn head_source_keystore_arms_when_a_head_appears() {
+        let path = temp_dir().join("roster-head.json");
+        let source = HeadSource::Keystore {
+            path: path.clone(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+        };
+        // Never had a head: pre-roster behavior, no enforcement.
+        assert!(source.load().unwrap().is_none());
+        assert_eq!(source.enforcement(), "when-present");
+
+        // `wires import --roster-head …` lands while `serve` is running.
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let mut roster = Roster::new(root.node_id());
+        roster.insert(NodeIdentity::from_seed([2u8; 32]).node_id());
+        let (head, _) = roster.commit(&root, 0, i64::MAX).unwrap();
+        std::fs::write(&path, head.encode().unwrap()).unwrap();
+        // Same source object, no restart.
+        assert_eq!(source.load().unwrap().unwrap(), head);
+
+        // Now armed: deleting the head refuses callers instead of re-admitting
+        // the whole fabric.
+        std::fs::remove_file(&path).unwrap();
+        assert!(source.load().is_err());
+    }
+
+    /// The other money shot: a responder that came up with *no* head enforces
+    /// the one imported between two connections. Without the per-connection
+    /// existence check this fails **open** — the omitted member stays admitted.
+    #[tokio::test]
+    async fn roster_head_installed_between_connections_takes_effect() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let head_path = temp_dir().join("roster-head.json");
+        let config = ServeConfig {
+            trust_root: root.node_id(),
+            scope: None,
+            crl: CrlSource::Fixed(Crl::new()),
+            head: HeadSource::Keystore {
+                path: head_path.clone(),
+                armed: std::sync::atomic::AtomicBool::new(false),
+            },
+            membership: Membership::mint(&root, server, 0, i64::MAX).unwrap(),
+            proof: None,
+            command: vec!["cat".to_string()],
+        };
+        // The caller holds a perfectly good proof from roster v1.
+        let mut roster = Roster::new(root.node_id());
+        roster.insert(caller);
+        roster.insert(server);
+        let (_v1, v1_proofs) = roster.commit(&root, 0, i64::MAX).unwrap();
+        let v1_proof = v1_proofs.into_iter().find(|(m, _)| *m == caller).unwrap().1;
+        let handshake = || Frame::Handshake {
+            membership: Membership::mint(&root, caller, 0, i64::MAX).unwrap(),
+            grant: None,
+            proof: Some(v1_proof.clone()),
+        };
+
+        // No roster-head.json yet → admitted on membership alone.
+        serve_once_with(&config, caller, handshake())
+            .await
+            .expect("no head installed yet: membership + CRL + TTL only");
+
+        // The operator re-commits a roster that omits the caller and imports
+        // the new head into the running responder's keystore.
+        roster.remove(&caller);
+        let (v2, _) = roster.commit(&root, 0, i64::MAX).unwrap();
+        std::fs::write(&head_path, v2.encode().unwrap()).unwrap();
+
+        // Same config object, next dial → denied by the roster gate.
+        let e = serve_once_with(&config, caller, handshake())
+            .await
+            .expect_err("the omitted caller must now be refused");
+        assert!(
+            format!("{e:#}").contains("roster inclusion"),
+            "expected a roster-gate denial, got: {e:#}"
+        );
+    }
+
+    /// The money shot: with a long-lived responder config, writing a revoking
+    /// `crl.json` between two connections denies the second one — no restart,
+    /// no rebuilt `ServeConfig`.
+    #[tokio::test]
+    async fn revocation_takes_effect_between_connections() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let crl_path = temp_dir().join("crl.json");
+        let config = Arc::new(ServeConfig {
+            trust_root: root.node_id(),
+            scope: None,
+            crl: CrlSource::File(crl_path.clone()),
+            head: HeadSource::None,
+            membership: Membership::mint(&root, server, 0, i64::MAX).unwrap(),
+            proof: None,
+            command: vec!["cat".to_string()],
+        });
+
+        /// One session against a shared config; returns the dialer's result and
+        /// stdout.
+        async fn dial_once(
+            config: Arc<ServeConfig>,
+            caller: NodeId,
+            membership: Membership,
+            input: &[u8],
+        ) -> (Result<i32>, Vec<u8>) {
+            let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
+            let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
+            let srv = tokio::spawn(async move {
+                serve_session(s2c_w, c2s_r, caller, config.as_ref(), never()).await
+            });
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let res = dial_session(
+                c2s_w,
+                s2c_r,
+                membership,
+                None,
+                None,
+                None,
+                std::io::Cursor::new(input.to_vec()),
+                &mut out,
+                &mut err,
+            )
+            .await;
+            let _ = srv.await;
+            (res, out)
+        }
+
+        let membership = Membership::mint(&root, caller, 0, i64::MAX).unwrap();
+
+        // No crl.json yet → admitted, and `cat` echoes.
+        let (res, out) =
+            dial_once(Arc::clone(&config), caller, membership.clone(), b"before").await;
+        assert_eq!(res.unwrap(), 0);
+        assert_eq!(out, b"before");
+
+        // Operator revokes between connections.
+        let mut crl = Crl::new();
+        crl.insert(caller);
+        std::fs::write(&crl_path, crl.to_json().unwrap()).unwrap();
+
+        // Same config object, next dial → denied, nothing on stdout.
+        let (res, out) = dial_once(config, caller, membership, b"after").await;
+        let e = res.expect_err("the revoked caller must now be refused");
+        assert!(
+            e.downcast_ref::<Denied>()
+                .is_some_and(|d| d.reason().contains("revoked")),
+            "expected a revocation denial, got: {e:#}"
+        );
+        assert!(out.is_empty());
+    }
+
+    /// A dialer that vanishes mid-session takes the remote child with it: the
+    /// session returns promptly instead of waiting out a `sleep 30`.
+    #[tokio::test]
+    async fn child_is_killed_when_the_dialer_vanishes() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let config = test_config(
+            &root,
+            server,
+            None,
+            Crl::new(),
+            vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+        );
+        let handshake = Frame::Handshake {
+            membership: valid_membership(&root, caller),
+            grant: None,
+            proof: None,
+        };
+        let recv = std::io::Cursor::new(handshake.encode().unwrap());
+        let send: Vec<u8> = Vec::new();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let srv = tokio::spawn(async move {
+            serve_session(send, recv, caller, &config, async move {
+                let _ = rx.await;
+            })
+            .await
+        });
+
+        // The dialer disappears.
+        tx.send(()).ok();
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), srv).await;
+        assert!(
+            finished.is_ok(),
+            "serve_session must return once the dialer is gone, not outlive the child"
+        );
+    }
+
+    #[test]
+    fn truncate_reason_cuts_on_a_char_boundary() {
+        let short = "membership rejected: revoked".to_string();
+        assert_eq!(truncate_reason(short.clone()), short);
+        // 400 multi-byte chars (1200 bytes) must clamp to <= 512 bytes and stay
+        // valid UTF-8 (the type guarantees it; the boundary walk is what's tested).
+        let long = "é拒".repeat(400);
+        let cut = truncate_reason(long);
+        assert!(cut.len() <= MAX_REASON);
+        assert!(cut.len() > MAX_REASON - 4);
     }
 
     #[tokio::test]
@@ -901,7 +1617,10 @@ mod tests {
         let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
         let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
         let config = test_config(&root, server, None, Crl::new(), vec!["cat".to_string()]);
-        let srv = tokio::spawn(async move { serve_session(s2c_w, c2s_r, caller, &config).await });
+        let srv =
+            tokio::spawn(
+                async move { serve_session(s2c_w, c2s_r, caller, &config, never()).await },
+            );
 
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -1220,8 +1939,8 @@ mod tests {
         let config = ServeConfig {
             trust_root: root.node_id(),
             scope: None,
-            crl: Crl::new(),
-            roster_head: Some(head),
+            crl: CrlSource::Fixed(Crl::new()),
+            head: HeadSource::Fixed(head),
             membership: Membership::mint(root, server, 0, i64::MAX).unwrap(),
             proof: None,
             command,
@@ -1231,9 +1950,15 @@ mod tests {
 
     /// Drive `serve_session` against a one-shot handshake; returns the result.
     async fn serve_once(config: ServeConfig, caller: NodeId, handshake: Frame) -> Result<()> {
+        serve_once_with(&config, caller, handshake).await
+    }
+
+    /// [`serve_once`] against a *borrowed* config, for tests that dial the same
+    /// long-lived `ServeConfig` more than once.
+    async fn serve_once_with(config: &ServeConfig, caller: NodeId, handshake: Frame) -> Result<()> {
         let recv = std::io::Cursor::new(handshake.encode().unwrap());
         let send: Vec<u8> = Vec::new();
-        serve_session(send, recv, caller, &config).await
+        serve_session(send, recv, caller, config, never()).await
     }
 
     #[tokio::test]
@@ -1310,7 +2035,7 @@ mod tests {
         roster.insert(server);
         let _ = roster.commit(&root, 0, i64::MAX).unwrap(); // v1
         let (v2_head, _) = roster.commit(&root, 0, i64::MAX).unwrap(); // v2
-        config.roster_head = Some(v2_head);
+        config.head = HeadSource::Fixed(v2_head);
         let membership = Membership::mint(&root, caller, 0, i64::MAX).unwrap();
         let res = serve_once(
             config,
@@ -1350,8 +2075,8 @@ mod tests {
         let config = ServeConfig {
             trust_root: root.node_id(),
             scope: None,
-            crl: Crl::new(),
-            roster_head: Some(head),
+            crl: CrlSource::Fixed(Crl::new()),
+            head: HeadSource::Fixed(head),
             membership: Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
             proof: None,
             command: vec![
@@ -1412,8 +2137,8 @@ mod tests {
         let config = ServeConfig {
             trust_root: root.node_id(),
             scope: None,
-            crl: Crl::new(),
-            roster_head: Some(v2),
+            crl: CrlSource::Fixed(Crl::new()),
+            head: HeadSource::Fixed(v2),
             membership: Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
             proof: None,
             command: vec![
@@ -1469,8 +2194,8 @@ mod tests {
             let config = ServeConfig {
                 trust_root,
                 scope: None,
-                crl: Crl::new(),
-                roster_head: None,
+                crl: CrlSource::Fixed(Crl::new()),
+                head: HeadSource::None,
                 membership: Membership::mint(signer, server.node_id(), 0, i64::MAX).unwrap(),
                 proof: None,
                 command: vec!["cat".to_string()],

@@ -1,10 +1,18 @@
 //! `wires` — the multi-call CLI for the session layer.
 //!
-//! Offline admin (`keygen` / `grant` / `revoke`) is built from pure functions
-//! over `library`; the network commands (`serve` / `connect`) run on the iroh
-//! transport in [`transport`]. Secrets and the CRL resolve through
+//! Offline admin (`keygen` / `grant` / `revoke` / `import`) is built from pure
+//! functions over `library`; the network commands (`serve` / `connect`) run on
+//! the iroh transport in [`transport`]. Secrets and the CRL resolve through
 //! flag → env → `--…-file` → on-disk keystore (see [`keystore`]), so the
-//! network commands work without seeds on the command line.
+//! network commands work without seeds on the command line — and, once
+//! `wires import` has installed an agent's credentials, `wires connect --ticket
+//! <T>` needs no other flags, which is what lets it drop straight into an MCP
+//! client's config as `"command": "wires"`.
+//!
+//! `connect` keeps stdout **byte-pure** (only the bridged session bytes): every
+//! diagnostic goes to stderr, and the exit code carries the outcome —
+//! the child's own code on success, [`EXIT_DENIED`] when the responder refused
+//! the credentials, `1` for any local or transport failure.
 
 mod keystore;
 mod pair;
@@ -12,11 +20,14 @@ mod transport;
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{ArgGroup, Args, Parser, Subcommand};
-use library::{CapabilityTicket, Crl, Grant, Membership, NodeId, NodeIdentity, Scope};
+use library::{
+    CapabilityTicket, Crl, Grant, InclusionProof, Membership, NodeId, NodeIdentity, RosterHead,
+    Scope,
+};
 
 /// wires: a capability-addressed stdio/MCP session layer.
 #[derive(Parser)]
@@ -38,6 +49,9 @@ enum Command {
     Roster(RosterArgs),
     /// Add a subject to the CRL (keystore by default) and print the result.
     Revoke(RevokeArgs),
+    /// Install credentials (membership, inclusion proof, roster head) into the
+    /// keystore.
+    Import(ImportArgs),
     /// Issue a grant over the wire (announce/consent), instead of pasting ids.
     Pair(PairArgs),
     /// Responder: verify a grant, exec a command, bridge its stdio.
@@ -199,6 +213,39 @@ struct RevokeArgs {
     crl_file: Option<PathBuf>,
 }
 
+/// `import` arguments: any combination of the three credentials an agent
+/// receives from its operator, inline or as a file.
+///
+/// This is the last provisioning step, and it is entirely offline. The operator
+/// mints tokens (`wires member`, `wires roster commit --out DIR`) and hands them
+/// over; the agent runs `wires import` **once**; after that `wires connect
+/// --ticket <T>` needs no other flags — which is what makes `wires` usable as a
+/// bare `command` in an MCP client config.
+#[derive(Args)]
+#[command(group(ArgGroup::new("creds").required(true).multiple(true)
+    .args(["membership", "membership_file", "inclusion_proof", "inclusion_proof_file", "roster_head", "roster_head_file"])))]
+struct ImportArgs {
+    /// The base64 membership token to install as `membership.json`.
+    #[arg(long, conflicts_with = "membership_file")]
+    membership: Option<String>,
+    /// Read the membership token from this file (e.g. the operator's output).
+    #[arg(long)]
+    membership_file: Option<PathBuf>,
+    /// The base64 inclusion proof token to install as `inclusion-proof.json`.
+    #[arg(long, conflicts_with = "inclusion_proof_file")]
+    inclusion_proof: Option<String>,
+    /// Read the inclusion proof from this file (`roster commit --out DIR` writes
+    /// `<node-id>.proof`).
+    #[arg(long)]
+    inclusion_proof_file: Option<PathBuf>,
+    /// The base64 roster head token to install as `roster-head.json`.
+    #[arg(long, conflicts_with = "roster_head_file")]
+    roster_head: Option<String>,
+    /// Read the roster head token from this file.
+    #[arg(long)]
+    roster_head_file: Option<PathBuf>,
+}
+
 /// `serve` arguments: the responder key, what it trusts, and the child to exec.
 #[derive(Args)]
 struct ServeArgs {
@@ -241,8 +288,9 @@ struct ServeArgs {
     membership_file: Option<PathBuf>,
     /// The signed roster head this responder enforces (inclusion proof required
     /// from callers). Falls back to `$WIRES_ROSTER_HEAD`, then
-    /// `--roster-head-file`, then the keystore (`roster-head.json`). Absent ⇒
-    /// slice-1 behavior (membership + CRL + TTL only).
+    /// `--roster-head-file`, then the keystore (`roster-head.json`, re-checked
+    /// per connection — a head imported later enforces on the next dial, with
+    /// no restart). With no head at all: membership + CRL + TTL only.
     #[arg(long)]
     roster_head: Option<String>,
     /// Read the roster head token from this file.
@@ -484,6 +532,12 @@ fn resolve_not_after(
     }
 }
 
+/// Exit code for an authorization refusal by the responder (sysexits
+/// `EX_NOPERM`), distinct from 1 = local/transport failure. An MCP client that
+/// wraps `wires connect` can tell "you are not allowed" apart from "the network
+/// is down" without parsing text.
+const EXIT_DENIED: i32 = 77;
+
 /// Current unix time in seconds.
 pub(crate) fn now_unix() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -506,10 +560,12 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
              inclusion-only responder (any fabric member may connect)"
         );
     }
-    let crl = keystore::load_crl(a.crl_json.as_deref(), a.crl_file.as_deref())?;
+    // Credential *sources*, not values: a file-backed CRL or head is re-read on
+    // every connection, so `wires revoke` / `wires roster commit` take effect on
+    // the next dial without bouncing this process.
+    let crl = keystore::crl_source(a.crl_json.as_deref(), a.crl_file.clone())?;
     let membership = keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?;
-    let roster_head =
-        keystore::roster_head(a.roster_head.as_deref(), a.roster_head_file.as_deref())?;
+    let head = keystore::roster_head_source(a.roster_head.as_deref(), a.roster_head_file.clone())?;
     let proof = keystore::inclusion_proof(
         a.inclusion_proof.as_deref(),
         a.inclusion_proof_file.as_deref(),
@@ -518,12 +574,40 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         trust_root,
         scope,
         crl,
-        roster_head,
+        head,
         membership,
         proof,
         command: a.command,
     };
     transport::serve(node, config, a.relay_url.as_deref()).await
+}
+
+/// Local consistency checks run before dialing: the ticket's grant and the
+/// membership must both name *this* keystore's node.
+///
+/// Catches the two most common misconfigurations — a ticket copied to the wrong
+/// machine, a membership from another fabric — without a network round-trip, so
+/// they never masquerade as a refusal by the responder.
+fn preflight(node: NodeId, membership: &Membership, grant: Option<&Grant>) -> Result<(), String> {
+    if let Some(grant) = grant
+        && grant.subject != node
+    {
+        return Err(format!(
+            "this ticket was issued to node {}, but this keystore's node is {} — use the \
+             keystore that requested the ticket (or re-issue it)",
+            grant.subject.hex(),
+            node.hex()
+        ));
+    }
+    if membership.member != node {
+        return Err(format!(
+            "this membership was issued to node {}, but this keystore's node is {} — import \
+             the membership minted for this node (`wires import --membership …`)",
+            membership.member.hex(),
+            node.hex()
+        ));
+    }
+    Ok(())
 }
 
 /// `connect`: present the dialer's membership, dial the target (from a ticket or
@@ -546,7 +630,8 @@ async fn connect_cmd(a: ConnectArgs) -> anyhow::Result<i32> {
     // guarantees exactly one of `--ticket` / `--target`.
     let (target_id, addrs, grant, ticket_relay) = match a.ticket.as_deref() {
         Some(text) => {
-            let t = CapabilityTicket::decode(text)?;
+            let t = CapabilityTicket::decode(text)
+                .context("--ticket (is the pasted base64 ticket complete?)")?;
             (t.target, t.addrs, Some(t.grant), t.relay_url)
         }
         None => {
@@ -558,6 +643,10 @@ async fn connect_cmd(a: ConnectArgs) -> anyhow::Result<i32> {
             (id, a.addr.clone(), None, None)
         }
     };
+    // Fail locally, before any network I/O, when the credentials on hand were
+    // not issued to this node.
+    preflight(node.node_id(), &membership, grant.as_ref()).map_err(anyhow::Error::msg)?;
+
     // `--relay-url` overrides the ticket's relay hint; both feed the dialed
     // address and the endpoint's relay configuration.
     let relay = a.relay_url.or(ticket_relay);
@@ -583,13 +672,17 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 /// Initialize tracing for the network subcommands, writing to **stderr** so it
-/// never corrupts `connect`'s piped stdout. Controlled by `$RUST_LOG`
-/// (default `info`).
+/// never corrupts `connect`'s piped stdout.
+///
+/// The default filter is `warn,wires=info`: wires' own startup / accept /
+/// reject lines print, while iroh's relay and discovery chatter stays out of an
+/// MCP client's server-log pane. `$RUST_LOG` overrides it entirely (e.g.
+/// `RUST_LOG=iroh=debug`).
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,wires=info")),
         )
         .with_writer(std::io::stderr)
         .try_init();
@@ -603,6 +696,7 @@ fn main() {
         | Command::Grant(_)
         | Command::Member(_)
         | Command::Revoke(_)
+        | Command::Import(_)
         | Command::Roster(_) => match cli_admin(cli.command) {
             Ok(out) => println!("{out}"),
             Err(e) => {
@@ -627,6 +721,12 @@ fn main() {
         Command::Connect(a) => match runtime().block_on(connect_cmd(a)) {
             Ok(code) => std::process::exit(code),
             Err(e) => {
+                // An authorization refusal is its own outcome: print the
+                // responder's own words and exit 77, not the generic 1.
+                if let Some(d) = e.downcast_ref::<transport::Denied>() {
+                    eprintln!("wires: denied by responder: {}", d.reason());
+                    std::process::exit(EXIT_DENIED);
+                }
                 eprintln!("wires: {e:#}");
                 std::process::exit(1);
             }
@@ -707,6 +807,7 @@ fn cli_admin(command: Command) -> Result<String, String> {
         Command::Member(a) => run_member_cmd(a),
         Command::Roster(a) => run_roster_cmd(a),
         Command::Revoke(a) => run_revoke_cmd(a).map_err(stringify),
+        Command::Import(a) => run_import_cmd(a).map_err(|e| format!("{e:#}")),
         Command::Pair(_) | Command::Serve(_) | Command::Connect(_) => {
             unreachable!("handled in main")
         }
@@ -822,6 +923,66 @@ fn roster_head_token() -> anyhow::Result<String> {
         .read_roster_head()?
         .ok_or_else(|| anyhow::anyhow!("no roster-head.json; run `wires roster commit` first"))?;
     head.encode().map_err(Into::into)
+}
+
+/// Read a credential token from an inline flag or a file, trimming whitespace.
+/// `None` when neither was supplied.
+fn token_arg(
+    inline: Option<&str>,
+    file: Option<&Path>,
+    flag: &str,
+) -> anyhow::Result<Option<String>> {
+    if let Some(text) = inline {
+        return Ok(Some(text.trim().to_string()));
+    }
+    match file {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("{flag}-file: reading {}", path.display()))?;
+            Ok(Some(text.trim().to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// `import`: decode each supplied credential and write it into the keystore
+/// under the name the network commands look for. Returns one `wrote <path>`
+/// line per installed credential.
+fn run_import_cmd(a: ImportArgs) -> anyhow::Result<String> {
+    let ks = keystore::Keystore::resolve()?;
+    let mut lines = Vec::new();
+
+    if let Some(text) = token_arg(
+        a.membership.as_deref(),
+        a.membership_file.as_deref(),
+        "--membership",
+    )? {
+        let membership = Membership::decode(&text).context("--membership")?;
+        lines.push(format!(
+            "wrote {}",
+            ks.save_membership(&membership)?.display()
+        ));
+    }
+    if let Some(text) = token_arg(
+        a.inclusion_proof.as_deref(),
+        a.inclusion_proof_file.as_deref(),
+        "--inclusion-proof",
+    )? {
+        let proof = InclusionProof::decode(&text).context("--inclusion-proof")?;
+        lines.push(format!(
+            "wrote {}",
+            ks.save_inclusion_proof(&proof)?.display()
+        ));
+    }
+    if let Some(text) = token_arg(
+        a.roster_head.as_deref(),
+        a.roster_head_file.as_deref(),
+        "--roster-head",
+    )? {
+        let head = RosterHead::decode(&text).context("--roster-head")?;
+        lines.push(format!("wrote {}", ks.save_roster_head(&head)?.display()));
+    }
+    Ok(lines.join("\n"))
 }
 
 /// Render any error as a string for the admin-command error channel.
@@ -1052,6 +1213,78 @@ mod tests {
         assert_eq!(Crl::from_json(&two).unwrap().len(), 2);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn import_requires_at_least_one_credential() {
+        // Bare `wires import` is a usage error: there is nothing to install.
+        assert!(Cli::try_parse_from(["wires", "import"]).is_err());
+    }
+
+    #[test]
+    fn import_parses_a_single_credential_flag() {
+        let cli = Cli::try_parse_from(["wires", "import", "--membership-file", "x"]).unwrap();
+        match cli.command {
+            Command::Import(a) => {
+                assert_eq!(a.membership_file.as_deref(), Some(Path::new("x")));
+                assert!(a.membership.is_none());
+            }
+            _ => panic!("expected the import subcommand"),
+        }
+    }
+
+    #[test]
+    fn import_rejects_a_credential_given_twice() {
+        // Inline and file for the same credential is ambiguous, not additive.
+        assert!(
+            Cli::try_parse_from([
+                "wires",
+                "import",
+                "--membership",
+                "tok",
+                "--membership-file",
+                "x"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn preflight_accepts_credentials_issued_to_this_node() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let me = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let membership = Membership::mint(&root, me, 0, i64::MAX).unwrap();
+        let grant = Grant::mint(&root, me, Scope::new("tools.rg"), i64::MAX).unwrap();
+        assert_eq!(preflight(me, &membership, Some(&grant)), Ok(()));
+        assert_eq!(preflight(me, &membership, None), Ok(()));
+    }
+
+    #[test]
+    fn preflight_rejects_a_ticket_for_another_node() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let me = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let other = NodeIdentity::from_seed([3u8; 32]).node_id();
+        let membership = Membership::mint(&root, me, 0, i64::MAX).unwrap();
+        // A ticket minted for someone else — the "copied to the wrong machine" case.
+        let grant = Grant::mint(&root, other, Scope::new("tools.rg"), i64::MAX).unwrap();
+        let msg = preflight(me, &membership, Some(&grant)).unwrap_err();
+        assert!(
+            msg.contains(&other.hex()) && msg.contains(&me.hex()),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_a_membership_for_another_node() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let me = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let other = NodeIdentity::from_seed([3u8; 32]).node_id();
+        let membership = Membership::mint(&root, other, 0, i64::MAX).unwrap();
+        let msg = preflight(me, &membership, None).unwrap_err();
+        assert!(
+            msg.contains(&other.hex()) && msg.contains(&me.hex()),
+            "{msg}"
+        );
     }
 
     #[test]
