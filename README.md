@@ -1,36 +1,64 @@
-# Wires
+# wires
 
-# This is executable Markdown that's tested on CI.
-# How is that possible? See https://gist.github.com/bwoods/1c25cb7723a06a076c2152a2781d4d49
-set -o errexit -o nounset -o xtrace
-alias ~~~=":<<'~~~sh'";:<<'~~~sh'
-## What wires is — securely networked tools for agents
+> **Your agents get a private, end-to-end-encrypted group chat — with each
+> other, with your tools, and with you — and any MCP server can be dialed
+> into it.**
 
-**Wires reframes how you harness an agent.** Today you give an agent power by
-*co-locating* tools and secrets next to it: install binaries in its sandbox,
-mount API keys into its environment, spawn MCP servers as local child
-processes, hand it a shell. The agent can do whatever happens to sit beside it —
-which couples capability to location and spills secrets into the agent's box.
+The group chat is where this is going ([roadmap](docs/restart.md)). What runs
+today is the dial-in half, and it solves a real problem on its own:
 
-Wires makes a tool a **capability you dial**, not a binary you bundle. Any
-program's stdin/stdout becomes an authenticated, capability-scoped, revocable
-network endpoint. Harnessing an agent becomes *granting it capabilities*: you
-issue a non-transferable, human-rooted grant to reach one specific tool —
-wherever that tool actually runs (a VPC, another machine, an air-gapped
-enclave) — and the agent holds only that grant, never the tool's secrets. The
-tool's database password or API key stays with the tool; revoke the grant and
-the agent loses the tool, with no key rotation and nothing to re-image.
+**Run any stdio MCP server on another machine as if it were local.** The
+caller's identity is verified before the first byte; access is revocable
+without rotating a single key. No OAuth bolt-on, no bearer token pasted into a
+config file, no inbound port on the server. Point your MCP client at
+`wires connect`, point `wires serve` at the unmodified server binary, and
+neither side knows a network is involved — see
+[MCP over wires](#mcp-over-wires-flow-b--no-extra-code) for the two-command
+setup, or [Usage](#usage) for the full walkthrough.
 
-Because the session's native payload *is* stdio (and, one frame up, MCP),
-"networking a tool" and "speaking to a tool" become the same act — your existing
-CLIs and MCP servers work unmodified. It is `ssh user@host -- tool`, but the
-address is a capability instead of an IP, the credential is an identity-bound
-grant instead of a copyable key, and the far end is one scoped tool instead of a
-whole shell.
+## Why you'd want this
 
-→ Jump to [Usage](#usage) to run it; read the
-[full thesis](#wires-as-a-session-layer-stdio-and-mcp-over-a-capability-addressed-network)
-for the layer model and where it sits in the stack.
+Today you give an agent power by *co-locating* tools and secrets next to it:
+install binaries in its sandbox, mount API keys into its environment, spawn
+MCP servers as local child processes, hand it a shell. The agent can do
+whatever happens to sit beside it — which couples capability to location and
+spills secrets into the agent's box.
+
+Wires makes a tool something you **dial**, not a binary you bundle. Any
+program's stdin/stdout becomes an authenticated, revocable network endpoint.
+Harnessing an agent becomes *granting it access*: you issue a
+non-transferable, human-rooted grant to reach one specific tool — wherever
+that tool actually runs (a VPC, another machine, an air-gapped enclave) — and
+the agent holds only that grant, never the tool's secrets. The tool's database
+password or API key stays with the tool; revoke the grant and the agent loses
+the tool, with no key rotation and nothing to re-image.
+
+It is `ssh user@host -- tool`, but the address is a grant instead of an IP,
+the credential is bound to the caller's identity instead of being a copyable
+key, and the far end is one scoped tool instead of a whole shell. Your
+existing CLIs and MCP servers work unmodified, because the session's native
+payload *is* stdio (and, one frame up, MCP).
+
+Because access is granted *to your network* rather than configured *into each
+service*, the result is data sovereignty that survives switching agents or
+platforms. Services join your network; you don't join each service. Switch
+LLM providers and grant the new agent access to the same tools the old one
+had — your house, your data, and your services don't need to be reconnected.
+Lock-in becomes a property of whom you chose to grant access, not of any
+single service's data hoard.
+
+## Where this is going
+
+MCP is a superb tool protocol and keeps narrowing itself into an even better
+one — one client, one server, request/response. What it leaves permanently
+out of scope is *communication*: several agents and a human sharing context,
+an agent noticing something and telling the others, push, persistence,
+identity that travels with you. Filling that gap — the group chat, built on
+the membership and revocation machinery that already runs here — is the
+product. The plan, its reasoning, its phase gates, and its kill criteria live
+in [docs/restart.md](docs/restart.md); the layer model underneath is the
+[thesis](#wires-as-a-session-layer-stdio-and-mcp-over-a-capability-addressed-network)
+at the bottom of this file.
 
 ## Setup dev environment
 

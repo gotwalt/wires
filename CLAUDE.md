@@ -12,6 +12,11 @@ The session-layer thesis, the binary layout, and full usage live in
 `README.md`. Deployment and testing patterns live in `docs/deployment.md` and
 `docs/testing.md`.
 
+**Read `docs/restart.md` before planning any new work.** It holds the
+project's re-founded pitch (2026-08-13), the phase plan with gates, and the
+kill criteria. The pre-restart prototype is tagged `archive/poc-2026-05` —
+reference it freely, never merge from it.
+
 ## Build System
 
 All builds, tests, and linting go through Bazel. A `Makefile` provides shorthand targets — run `make help` to list them.
