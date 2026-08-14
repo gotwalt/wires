@@ -34,12 +34,27 @@
 //! addressed to it, and therefore read all history that member could read.
 //! Ratcheting is deferred, not solved.
 
+use base64::Engine;
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::error::Result;
+use crate::codec::canonical_bytes;
+use crate::error::{Error, Result};
 use crate::grant::AlgorithmId;
 use crate::identity::{NodeId, NodeIdentity, Signature};
 use crate::roster::RosterVersion;
+
+/// The base64 alphabet for the sealed-key text form: URL-safe, no padding
+/// (matches [`Membership`](crate::Membership)).
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+/// The all-zero AEAD nonce. Sound because every seal derives a *fresh* AEAD key
+/// from a fresh ephemeral Diffie–Hellman, so no key is ever used twice.
+const ZERO_NONCE: [u8; 12] = [0u8; 12];
+
+/// Bytes of the ephemeral X25519 public key prefixed to every sealed blob.
+const EPHEMERAL_PUB_LEN: usize = 32;
 
 /// The current (and only) sealed-fabric-key format version.
 pub const SEALED_KEY_V1: u8 = 1;
@@ -177,6 +192,40 @@ struct SealedKeyBody<'a> {
     alg: &'a AlgorithmId,
 }
 
+impl SealedKeyContext<'_> {
+    /// The AEAD associated data: this context's canonical JSON bytes.
+    fn aad(&self) -> Result<Vec<u8>> {
+        canonical_bytes(self)
+    }
+}
+
+/// The X25519 public key an Ed25519 [`NodeId`] converts to, for sealing *to*
+/// that node. Returns [`Error::SealedKeyOpen`] when the bytes are not a valid
+/// Ed25519 point (so not a real node id at all).
+fn montgomery_public(node: &NodeId) -> Result<x25519_dalek::PublicKey> {
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(node.as_bytes())
+        .map_err(|_| Error::SealedKeyOpen)?;
+    Ok(x25519_dalek::PublicKey::from(
+        verifying.to_montgomery().to_bytes(),
+    ))
+}
+
+/// The X25519 secret an [`NodeIdentity`]'s Ed25519 seed converts to, for
+/// opening what was sealed to its [`NodeId`].
+///
+/// The 2-to-3 dalek split is crossed with **byte arrays only** — never with a
+/// `curve25519-dalek` type, which would not typecheck across major versions.
+fn montgomery_secret(identity: &NodeIdentity) -> x25519_dalek::StaticSecret {
+    let signing = ed25519_dalek::SigningKey::from_bytes(&identity.seed_bytes());
+    x25519_dalek::StaticSecret::from(signing.to_scalar_bytes())
+}
+
+/// The per-seal AEAD cipher for a Diffie–Hellman shared secret.
+fn cipher_for(shared: &[u8; 32]) -> ChaCha20Poly1305 {
+    let aead_key = blake3::derive_key(SEALED_KEY_CONTEXT, shared);
+    ChaCha20Poly1305::new(&Key::from(aead_key))
+}
+
 /// A root-signed, member-sealed [`FabricKey`] for one roster version.
 ///
 /// The signature proves the root minted this key for this `(version, member)`
@@ -209,13 +258,83 @@ impl SealedFabricKey {
     ///
     /// The `fabric` field is `root.node_id()` — the credential names its own
     /// authority, exactly as [`Membership`](crate::Membership) does.
+    ///
+    /// Returns [`crate::Error::SealedKeyOpen`] when `member` is not a valid
+    /// Ed25519 public key (so there is no X25519 key to seal to).
+    ///
+    /// ```
+    /// use library::{FabricKey, NodeIdentity, RosterVersion, SealedFabricKey};
+    /// let root = NodeIdentity::from_seed([1u8; 32]);
+    /// let member = NodeIdentity::from_seed([2u8; 32]);
+    /// let key = FabricKey::generate();
+    /// let sealed = SealedFabricKey::seal(&root, member.node_id(), RosterVersion(7), &key).unwrap();
+    /// assert_eq!(sealed.open(&member, root.node_id()).unwrap(), key);
+    /// ```
     pub fn seal(
         root: &NodeIdentity,
         member: NodeId,
         version: RosterVersion,
         key: &FabricKey,
     ) -> Result<SealedFabricKey> {
-        todo!("X25519 seal to member, then sign the canonical body as root")
+        let alg = AlgorithmId::Ed25519;
+        let fabric = root.node_id();
+        let aad = SealedKeyContext {
+            format: SEALED_KEY_V1,
+            fabric: &fabric,
+            version: version.0,
+            member: &member,
+            alg: &alg,
+        }
+        .aad()?;
+
+        // Fresh ephemeral secret per seal — the uniqueness that makes the
+        // all-zero nonce safe. (x25519-dalek's `EphemeralSecret::random` needs
+        // the `getrandom` feature and a rand_core-0.10 RNG; the crate is built
+        // without either, so the ephemeral scalar is drawn from the same
+        // `OsRng` the rest of the crate uses and wrapped as a `StaticSecret`.
+        // It is still used exactly once and dropped here.)
+        let mut ephemeral_bytes = [0u8; 32];
+        {
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut ephemeral_bytes);
+        }
+        let ephemeral = x25519_dalek::StaticSecret::from(ephemeral_bytes);
+        let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral);
+        let shared = ephemeral.diffie_hellman(&montgomery_public(&member)?);
+
+        let ciphertext = cipher_for(shared.as_bytes())
+            .encrypt(
+                &Nonce::from(ZERO_NONCE),
+                Payload {
+                    msg: key.as_bytes(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| Error::SealedKeyOpen)?;
+
+        let mut blob = Vec::with_capacity(EPHEMERAL_PUB_LEN + ciphertext.len());
+        blob.extend_from_slice(ephemeral_pub.as_bytes());
+        blob.extend_from_slice(&ciphertext);
+        let sealed = SealedBox::from_bytes(blob);
+
+        let sig = root.sign(&canonical_bytes(&SealedKeyBody {
+            format: SEALED_KEY_V1,
+            fabric: &fabric,
+            version: version.0,
+            member: &member,
+            sealed: &sealed,
+            alg: &alg,
+        })?);
+
+        Ok(SealedFabricKey {
+            format: SEALED_KEY_V1,
+            fabric,
+            version,
+            member,
+            sealed,
+            alg,
+            sig,
+        })
     }
 
     /// Open this sealed key as `recipient`, checking it came from
@@ -229,16 +348,578 @@ impl SealedFabricKey {
     /// [`crate::Error::UnsupportedVersion`], [`crate::Error::InvalidSignature`],
     /// [`crate::Error::SubjectMismatch`], [`crate::Error::SealedKeyOpen`].
     pub fn open(&self, recipient: &NodeIdentity, fabric_root: NodeId) -> Result<FabricKey> {
-        todo!("verify sig/format/alg/fabric/member, then X25519 open the sealed box")
+        if self.alg != AlgorithmId::Ed25519 {
+            return Err(Error::UnsupportedAlgorithm);
+        }
+        if self.format != SEALED_KEY_V1 {
+            return Err(Error::UnsupportedVersion);
+        }
+        // The credential names its own authority; refuse to check it against
+        // any root but the one it claims (and the one the recipient trusts).
+        if self.fabric != fabric_root {
+            return Err(Error::InvalidSignature);
+        }
+        fabric_root.verify(&self.signing_bytes()?, &self.sig)?;
+        if self.member != recipient.node_id() {
+            return Err(Error::SubjectMismatch);
+        }
+
+        let blob = self.sealed.as_bytes();
+        if blob.len() <= EPHEMERAL_PUB_LEN {
+            return Err(Error::SealedKeyOpen);
+        }
+        let (ephemeral_pub, ciphertext) = blob.split_at(EPHEMERAL_PUB_LEN);
+        let ephemeral_pub: [u8; 32] = ephemeral_pub.try_into().expect("split at 32");
+        let shared = montgomery_secret(recipient)
+            .diffie_hellman(&x25519_dalek::PublicKey::from(ephemeral_pub));
+
+        let aad = SealedKeyContext {
+            format: self.format,
+            fabric: &self.fabric,
+            version: self.version.0,
+            member: &self.member,
+            alg: &self.alg,
+        }
+        .aad()?;
+        let plaintext = cipher_for(shared.as_bytes())
+            .decrypt(
+                &Nonce::from(ZERO_NONCE),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| Error::SealedKeyOpen)?;
+        let key: [u8; 32] = plaintext.try_into().map_err(|_| Error::SealedKeyOpen)?;
+        Ok(FabricKey::from_bytes(key))
+    }
+
+    /// The exact canonical bytes covered by [`sig`](Self::sig) — every field
+    /// except the signature itself. Private: the spec's public surface is
+    /// `seal` / `open` / `encode` / `decode`, and nothing outside this module
+    /// has any business re-deriving what the root signed.
+    fn signing_bytes(&self) -> Result<Vec<u8>> {
+        canonical_bytes(&SealedKeyBody {
+            format: self.format,
+            fabric: &self.fabric,
+            version: self.version.0,
+            member: &self.member,
+            sealed: &self.sealed,
+            alg: &self.alg,
+        })
     }
 
     /// Encode to the base64url (no-pad) text form (`--fabric-key` input).
+    ///
+    /// ```
+    /// use library::{FabricKey, NodeIdentity, RosterVersion, SealedFabricKey};
+    /// let root = NodeIdentity::from_seed([1u8; 32]);
+    /// let member = NodeIdentity::from_seed([2u8; 32]).node_id();
+    /// let sealed =
+    ///     SealedFabricKey::seal(&root, member, RosterVersion(1), &FabricKey::generate()).unwrap();
+    /// assert_eq!(SealedFabricKey::decode(&sealed.encode().unwrap()).unwrap(), sealed);
+    /// ```
     pub fn encode(&self) -> Result<String> {
-        todo!("base64url-no-pad of the sealed key's canonical JSON")
+        Ok(B64.encode(canonical_bytes(self)?))
     }
 
     /// Decode from the base64url (no-pad) text form.
     pub fn decode(text: &str) -> Result<SealedFabricKey> {
-        todo!("base64url decode then JSON parse")
+        let bytes = B64.decode(text)?;
+        serde_json::from_slice(&bytes).map_err(Error::Decode)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn seed() -> impl Strategy<Value = [u8; 32]> {
+        proptest::array::uniform32(any::<u8>())
+    }
+
+    fn key_bytes() -> impl Strategy<Value = [u8; 32]> {
+        proptest::array::uniform32(any::<u8>())
+    }
+
+    proptest! {
+        /// The round-trip that everything else rests on: what the root seals to
+        /// a member, that member opens back to the identical key.
+        #[test]
+        fn seal_then_open_roundtrips(rs in seed(), ms in seed(), v in any::<u64>(), k in key_bytes()) {
+            let root = NodeIdentity::from_seed(rs);
+            let member = NodeIdentity::from_seed(ms);
+            let key = FabricKey::from_bytes(k);
+            let sealed =
+                SealedFabricKey::seal(&root, member.node_id(), RosterVersion(v), &key).unwrap();
+
+            prop_assert_eq!(sealed.format, SEALED_KEY_V1);
+            prop_assert_eq!(sealed.fabric, root.node_id());
+            prop_assert_eq!(sealed.member, member.node_id());
+            prop_assert_eq!(sealed.version, RosterVersion(v));
+            prop_assert_eq!(sealed.open(&member, root.node_id()).unwrap(), key);
+        }
+
+        /// Sealing the same key twice produces different blobs (fresh ephemeral
+        /// per seal) that both open to the same key. This is what makes the
+        /// all-zero nonce safe.
+        #[test]
+        fn each_seal_uses_a_fresh_ephemeral(rs in seed(), ms in seed(), k in key_bytes()) {
+            let root = NodeIdentity::from_seed(rs);
+            let member = NodeIdentity::from_seed(ms);
+            let key = FabricKey::from_bytes(k);
+            let a = SealedFabricKey::seal(&root, member.node_id(), RosterVersion(1), &key).unwrap();
+            let b = SealedFabricKey::seal(&root, member.node_id(), RosterVersion(1), &key).unwrap();
+            prop_assert_ne!(a.sealed.as_bytes(), b.sealed.as_bytes());
+            prop_assert_eq!(a.open(&member, root.node_id()).unwrap(), key.clone());
+            prop_assert_eq!(b.open(&member, root.node_id()).unwrap(), key);
+        }
+
+        /// A key sealed to one member is not openable by another: the
+        /// member binding is checked before the AEAD is even attempted.
+        #[test]
+        fn wrong_recipient_is_subject_mismatch(rs in seed(), ms in seed(), os in seed(), k in key_bytes()) {
+            prop_assume!(ms != os);
+            let root = NodeIdentity::from_seed(rs);
+            let member = NodeIdentity::from_seed(ms);
+            let other = NodeIdentity::from_seed(os);
+            let sealed = SealedFabricKey::seal(
+                &root,
+                member.node_id(),
+                RosterVersion(3),
+                &FabricKey::from_bytes(k),
+            )
+            .unwrap();
+            prop_assert!(matches!(
+                sealed.open(&other, root.node_id()),
+                Err(Error::SubjectMismatch)
+            ));
+        }
+
+        /// Checking against a root the credential does not name fails the pin,
+        /// even for the correct recipient.
+        #[test]
+        fn wrong_root_fails_the_pin(rs in seed(), ms in seed(), os in seed(), k in key_bytes()) {
+            prop_assume!(rs != os);
+            let root = NodeIdentity::from_seed(rs);
+            let member = NodeIdentity::from_seed(ms);
+            let other_root = NodeIdentity::from_seed(os).node_id();
+            let sealed = SealedFabricKey::seal(
+                &root,
+                member.node_id(),
+                RosterVersion(3),
+                &FabricKey::from_bytes(k),
+            )
+            .unwrap();
+            prop_assert!(matches!(
+                sealed.open(&member, other_root),
+                Err(Error::InvalidSignature)
+            ));
+        }
+
+        /// Tampering with **every** signed field in turn breaks `open`. The
+        /// signed set is `{format, fabric, version, member, sealed, alg}`, and
+        /// each rewrite is checked against the field's own failure mode.
+        #[test]
+        fn tampering_any_signed_field_fails(rs in seed(), ms in seed(), os in seed(), v in 0u64..u64::MAX, k in key_bytes()) {
+            prop_assume!(rs != os && ms != os);
+            let root = NodeIdentity::from_seed(rs);
+            let member = NodeIdentity::from_seed(ms);
+            let other = NodeIdentity::from_seed(os);
+            let base = SealedFabricKey::seal(
+                &root,
+                member.node_id(),
+                RosterVersion(v),
+                &FabricKey::from_bytes(k),
+            )
+            .unwrap();
+
+            // format — a signed discriminant, rejected before the signature.
+            let mut t = base.clone();
+            t.format = SEALED_KEY_V1 + 1;
+            prop_assert!(matches!(
+                t.open(&member, root.node_id()),
+                Err(Error::UnsupportedVersion)
+            ));
+
+            // fabric — rewriting it and checking against the rewritten root
+            // still fails: the signature was over the original fabric.
+            let mut t = base.clone();
+            t.fabric = other.node_id();
+            prop_assert!(matches!(
+                t.open(&member, root.node_id()),
+                Err(Error::InvalidSignature)
+            ));
+            prop_assert!(t.open(&member, other.node_id()).is_err());
+
+            // version — the slot this key belongs to.
+            let mut t = base.clone();
+            t.version = RosterVersion(v.wrapping_add(1));
+            prop_assert!(matches!(
+                t.open(&member, root.node_id()),
+                Err(Error::InvalidSignature)
+            ));
+
+            // member — the non-transferability binding.
+            let mut t = base.clone();
+            t.member = other.node_id();
+            prop_assert!(matches!(
+                t.open(&other, root.node_id()),
+                Err(Error::InvalidSignature)
+            ));
+
+            // sealed — the ciphertext itself.
+            let mut blob = base.sealed.as_bytes().to_vec();
+            blob[0] ^= 0x01;
+            let mut t = base.clone();
+            t.sealed = SealedBox::from_bytes(blob);
+            prop_assert!(matches!(
+                t.open(&member, root.node_id()),
+                Err(Error::InvalidSignature)
+            ));
+
+            // alg — no second algorithm exists yet, so this is the
+            // unsupported-algorithm path rather than a signature failure.
+            // (Locked here so adding one cannot silently skip the check.)
+            prop_assert_eq!(base.alg, AlgorithmId::Ed25519);
+
+            // sig — the signature itself is not covered by itself.
+            let mut t = base.clone();
+            let mut sig = *t.sig.as_bytes();
+            sig[0] ^= 0x01;
+            t.sig = Signature::from_bytes(sig);
+            prop_assert!(matches!(
+                t.open(&member, root.node_id()),
+                Err(Error::InvalidSignature)
+            ));
+        }
+
+        /// Re-signing a tampered body with the *member's* key does not help:
+        /// the fabric pin means only the named root's signature counts.
+        #[test]
+        fn member_cannot_forge_a_key_for_itself(rs in seed(), ms in seed(), k in key_bytes()) {
+            prop_assume!(rs != ms);
+            let root = NodeIdentity::from_seed(rs);
+            let member = NodeIdentity::from_seed(ms);
+            // The member mints a sealed key naming *itself* as the fabric.
+            let forged = SealedFabricKey::seal(
+                &member,
+                member.node_id(),
+                RosterVersion(9),
+                &FabricKey::from_bytes(k),
+            )
+            .unwrap();
+            prop_assert!(matches!(
+                forged.open(&member, root.node_id()),
+                Err(Error::InvalidSignature)
+            ));
+        }
+
+        /// The AAD binds the ciphertext to its `(format, fabric, version,
+        /// member)` slot: moving a valid sealed blob into a different slot and
+        /// re-signing it as the root still fails the AEAD.
+        #[test]
+        fn aad_binds_the_blob_to_its_slot(rs in seed(), ms in seed(), v in 0u64..u64::MAX, k in key_bytes()) {
+            let root = NodeIdentity::from_seed(rs);
+            let member = NodeIdentity::from_seed(ms);
+            let base = SealedFabricKey::seal(
+                &root,
+                member.node_id(),
+                RosterVersion(v),
+                &FabricKey::from_bytes(k),
+            )
+            .unwrap();
+
+            // Same blob, different version, correctly re-signed by the root.
+            let moved_version = RosterVersion(v.wrapping_add(1));
+            let sig = root.sign(
+                &canonical_bytes(&SealedKeyBody {
+                    format: base.format,
+                    fabric: &base.fabric,
+                    version: moved_version.0,
+                    member: &base.member,
+                    sealed: &base.sealed,
+                    alg: &base.alg,
+                })
+                .unwrap(),
+            );
+            let moved = SealedFabricKey {
+                version: moved_version,
+                sig,
+                ..base.clone()
+            };
+            // The signature now verifies, so failure comes from the AEAD.
+            prop_assert!(matches!(
+                moved.open(&member, root.node_id()),
+                Err(Error::SealedKeyOpen)
+            ));
+        }
+
+        /// Diffie–Hellman agrees in both directions across the
+        /// dalek-2-to-x25519-dalek-3 byte bridge: the sealer's
+        /// `ephemeral × recipient_public` equals the recipient's
+        /// `recipient_secret × ephemeral_public`.
+        #[test]
+        fn dh_agrees_in_both_directions(ms in seed(), es in seed()) {
+            let member = NodeIdentity::from_seed(ms);
+
+            // Sealer side: ephemeral secret against the member's converted
+            // Ed25519 public key.
+            let ephemeral = x25519_dalek::StaticSecret::from(es);
+            let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral);
+            let sealer_shared = ephemeral.diffie_hellman(&montgomery_public(&member.node_id()).unwrap());
+
+            // Recipient side: converted Ed25519 secret against the ephemeral
+            // public key.
+            let recipient_shared =
+                montgomery_secret(&member).diffie_hellman(&ephemeral_pub);
+
+            prop_assert_eq!(sealer_shared.as_bytes(), recipient_shared.as_bytes());
+        }
+
+        /// The Ed25519-to-X25519 conversion is consistent: the public key
+        /// derived from the converted secret equals the converted public key.
+        #[test]
+        fn ed25519_to_x25519_conversion_is_consistent(ms in seed()) {
+            let identity = NodeIdentity::from_seed(ms);
+            let from_secret = x25519_dalek::PublicKey::from(&montgomery_secret(&identity));
+            let from_public = montgomery_public(&identity.node_id()).unwrap();
+            prop_assert_eq!(from_secret.as_bytes(), from_public.as_bytes());
+        }
+
+        /// An encode/decode round-trip is the identity, and the decoded key
+        /// still opens.
+        #[test]
+        fn encode_decode_roundtrips(rs in seed(), ms in seed(), v in any::<u64>(), k in key_bytes()) {
+            let root = NodeIdentity::from_seed(rs);
+            let member = NodeIdentity::from_seed(ms);
+            let key = FabricKey::from_bytes(k);
+            let sealed =
+                SealedFabricKey::seal(&root, member.node_id(), RosterVersion(v), &key).unwrap();
+            let decoded = SealedFabricKey::decode(&sealed.encode().unwrap()).unwrap();
+            prop_assert_eq!(&decoded, &sealed);
+            prop_assert_eq!(decoded.open(&member, root.node_id()).unwrap(), key);
+        }
+
+        /// Arbitrary text decodes to an `Err`, never a panic.
+        #[test]
+        fn garbage_decode_never_panics(s in ".*") {
+            let _ = SealedFabricKey::decode(&s);
+        }
+
+        /// A truncated or oversized sealed blob is an `Err`, never a panic —
+        /// the blob is attacker-supplied once it is on the wire.
+        #[test]
+        fn malformed_sealed_blob_never_panics(rs in seed(), ms in seed(), blob in proptest::collection::vec(any::<u8>(), 0..96)) {
+            let root = NodeIdentity::from_seed(rs);
+            let member = NodeIdentity::from_seed(ms);
+            let base = SealedFabricKey::seal(
+                &root,
+                member.node_id(),
+                RosterVersion(1),
+                &FabricKey::generate(),
+            )
+            .unwrap();
+            let sealed = SealedBox::from_bytes(blob);
+            let sig = root.sign(
+                &canonical_bytes(&SealedKeyBody {
+                    format: base.format,
+                    fabric: &base.fabric,
+                    version: base.version.0,
+                    member: &base.member,
+                    sealed: &sealed,
+                    alg: &base.alg,
+                })
+                .unwrap(),
+            );
+            let mangled = SealedFabricKey { sealed, sig, ..base };
+            prop_assert!(matches!(
+                mangled.open(&member, root.node_id()),
+                Err(Error::SealedKeyOpen)
+            ));
+        }
+
+        /// `FabricKey` hex round-trips, and its `Debug` never leaks the bytes.
+        #[test]
+        fn fabric_key_hex_roundtrips_and_debug_is_redacted(k in key_bytes()) {
+            let key = FabricKey::from_bytes(k);
+            prop_assert_eq!(FabricKey::from_hex(&key.hex()).unwrap(), key.clone());
+            let rendered = format!("{:?}", key);
+            prop_assert_eq!(&rendered, "FabricKey(<redacted>)");
+            prop_assert!(!rendered.contains(&key.hex()));
+        }
+    }
+
+    /// Known-answer: the sealing context (the AAD) canonicalizes to exactly
+    /// these bytes. Guards the canonicalization the AEAD binding depends on.
+    #[test]
+    fn context_canonical_bytes_known_answer() {
+        let fabric = NodeId::from_bytes([0u8; 32]);
+        let member = NodeId::from_bytes([0x11u8; 32]);
+        let alg = AlgorithmId::Ed25519;
+        let ctx = SealedKeyContext {
+            format: SEALED_KEY_V1,
+            fabric: &fabric,
+            version: 7,
+            member: &member,
+            alg: &alg,
+        };
+        let expected = format!(
+            r#"{{"alg":"ed25519","fabric":"{}","format":1,"member":"{}","version":7}}"#,
+            "00".repeat(32),
+            "11".repeat(32),
+        );
+        assert_eq!(ctx.aad().unwrap(), expected.into_bytes());
+    }
+
+    /// Known-answer: the signed body canonicalizes to exactly these bytes —
+    /// the AAD's fields plus `sealed`, in sorted-key order.
+    #[test]
+    fn body_canonical_bytes_known_answer() {
+        let fabric = NodeId::from_bytes([0u8; 32]);
+        let member = NodeId::from_bytes([0x11u8; 32]);
+        let alg = AlgorithmId::Ed25519;
+        let sealed = SealedBox::from_bytes(vec![0xab, 0xcd]);
+        let body = SealedKeyBody {
+            format: SEALED_KEY_V1,
+            fabric: &fabric,
+            version: 7,
+            member: &member,
+            sealed: &sealed,
+            alg: &alg,
+        };
+        let expected = format!(
+            r#"{{"alg":"ed25519","fabric":"{}","format":1,"member":"{}","sealed":"abcd","version":7}}"#,
+            "00".repeat(32),
+            "11".repeat(32),
+        );
+        assert_eq!(canonical_bytes(&body).unwrap(), expected.into_bytes());
+    }
+
+    /// The signed body covers every field of the credential except `sig` — the
+    /// same guard the envelope carries, applied to the sealed key.
+    #[test]
+    fn signing_bytes_covers_every_non_signature_field() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let member = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let sealed =
+            SealedFabricKey::seal(&root, member, RosterVersion(7), &FabricKey::generate()).unwrap();
+
+        let full: serde_json::Value =
+            serde_json::from_slice(&canonical_bytes(&sealed).unwrap()).unwrap();
+        let signed: serde_json::Value =
+            serde_json::from_slice(&sealed.signing_bytes().unwrap()).unwrap();
+        let mut expected = full.as_object().unwrap().clone();
+        assert!(expected.remove("sig").is_some(), "sig must be present");
+        assert_eq!(signed.as_object().unwrap(), &expected);
+    }
+
+    /// The derive-key context is frozen: changing it makes every previously
+    /// sealed key unopenable.
+    #[test]
+    fn context_string_is_frozen() {
+        assert_eq!(SEALED_KEY_CONTEXT, "wires sealed-fabric-key v1");
+        assert_eq!(SEALED_KEY_V1, 1);
+    }
+
+    /// A future format version is rejected outright — locks discriminant
+    /// dispatch before any v2 body exists.
+    #[test]
+    fn future_version_is_unsupported() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let member = NodeIdentity::from_seed([2u8; 32]);
+        let mut sealed = SealedFabricKey::seal(
+            &root,
+            member.node_id(),
+            RosterVersion(1),
+            &FabricKey::generate(),
+        )
+        .unwrap();
+        sealed.format = 2;
+        assert!(matches!(
+            sealed.open(&member, root.node_id()),
+            Err(Error::UnsupportedVersion)
+        ));
+    }
+
+    /// The sealed blob is `ephemeral_pub(32) ‖ ct+tag`: 32 + 32 key bytes + a
+    /// 16-byte Poly1305 tag.
+    #[test]
+    fn sealed_blob_has_the_documented_shape() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let member = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let sealed =
+            SealedFabricKey::seal(&root, member, RosterVersion(1), &FabricKey::generate()).unwrap();
+        assert_eq!(sealed.sealed.len(), EPHEMERAL_PUB_LEN + 32 + 16);
+        assert!(!sealed.sealed.is_empty());
+        assert_eq!(sealed.sealed.hex().len(), sealed.sealed.len() * 2);
+    }
+
+    /// A sealed blob with no room for the ephemeral public key is refused
+    /// before any curve arithmetic happens.
+    #[test]
+    fn short_sealed_blob_is_refused() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let member = NodeIdentity::from_seed([2u8; 32]);
+        let sealed = SealedBox::from_bytes(vec![0u8; EPHEMERAL_PUB_LEN]);
+        let alg = AlgorithmId::Ed25519;
+        let fabric = root.node_id();
+        let member_id = member.node_id();
+        let sig = root.sign(
+            &canonical_bytes(&SealedKeyBody {
+                format: SEALED_KEY_V1,
+                fabric: &fabric,
+                version: 1,
+                member: &member_id,
+                sealed: &sealed,
+                alg: &alg,
+            })
+            .unwrap(),
+        );
+        let short = SealedFabricKey {
+            format: SEALED_KEY_V1,
+            fabric,
+            version: RosterVersion(1),
+            member: member_id,
+            sealed,
+            alg,
+            sig,
+        };
+        assert!(matches!(
+            short.open(&member, root.node_id()),
+            Err(Error::SealedKeyOpen)
+        ));
+    }
+
+    /// `FabricKey` is deliberately not `Serialize`: a plaintext data key must
+    /// only ever leave the process sealed or through the 0600 keystore hex.
+    /// (Compile-time proof lives in the type system; this pins the hex shape.)
+    #[test]
+    fn fabric_key_hex_is_64_chars() {
+        assert_eq!(FabricKey::from_bytes([0u8; 32]).hex(), "0".repeat(64));
+        assert!(matches!(
+            FabricKey::from_hex("00"),
+            Err(Error::BadKeyLength)
+        ));
+        assert!(matches!(
+            FabricKey::from_hex(&"z".repeat(64)),
+            Err(Error::BadHex(_))
+        ));
+    }
+
+    /// Two independently generated keys differ (the generator is not a stub).
+    #[test]
+    fn generate_produces_distinct_keys() {
+        assert_ne!(FabricKey::generate(), FabricKey::generate());
+    }
+
+    /// `SealedBox` serializes as a lowercase-hex string.
+    #[test]
+    fn sealed_box_serializes_as_hex_string() {
+        let b = SealedBox::from_bytes(vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(serde_json::to_string(&b).unwrap(), "\"deadbeef\"");
+        let back: SealedBox = serde_json::from_str("\"deadbeef\"").unwrap();
+        assert_eq!(back, b);
     }
 }
