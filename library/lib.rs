@@ -14,6 +14,17 @@
 //! - [`session`] — the [`Frame`] wire codec (the async transport lands later).
 //! - [`error`] — the crate [`Error`] and [`Result`].
 //!
+//! Multiway topics (`docs/phase2-topics.md`) build on the same pieces:
+//!
+//! - [`topic`] — the derived [`TopicId`] and the unsigned [`TopicTicket`].
+//! - [`fabric_key`] — the [`FabricKey`] minted per roster commit and its
+//!   root-signed, member-sealed [`SealedFabricKey`].
+//! - [`envelope`] — the signed, encrypted, hash-linked [`TopicEnvelope`].
+//! - [`chain`] — [`classify_link`], the per-publisher chain truth table.
+//! - [`admission`] — the [`AdmitFrame`] codec and [`check_topic_admission`],
+//!   the roster gate in front of the gossip mesh.
+//! - [`replay`] — the [`ReplayFrame`] codec for peer-symmetric catch-up.
+//!
 //! # Example: mint a capability, pack a ticket, accept it
 //!
 //! ```
@@ -37,27 +48,39 @@
 //! assert!(check_accept(&grant, root.node_id(), agent.node_id(), 0, &Crl::new()).is_ok());
 //! ```
 
+pub mod admission;
+pub mod chain;
+pub mod envelope;
 pub mod error;
+pub mod fabric_key;
 pub mod grant;
 pub mod identity;
 pub mod membership;
 pub mod policy;
+pub mod replay;
 pub mod roster;
 pub mod session;
 pub mod ticket;
+pub mod topic;
 
 mod codec;
 
+pub use admission::{Admission, AdmitFrame, TOPIC_ADMIT_ALPN, check_topic_admission};
+pub use chain::{ChainState, LinkStatus, classify_link, next_prev_hash};
+pub use envelope::{Ciphertext, ENVELOPE_V1, MessageHash, Seq, TopicEnvelope};
 pub use error::{Error, Result};
+pub use fabric_key::{FabricKey, SEALED_KEY_V1, SealedBox, SealedFabricKey};
 pub use grant::{AlgorithmId, Grant, Scope};
 pub use identity::{NodeId, NodeIdentity, Signature};
 pub use membership::{MEMBERSHIP_V1, Membership};
 pub use policy::{Crl, check_accept, check_inclusion, check_roster_inclusion};
+pub use replay::{ReplayFrame, TOPIC_REPLAY_ALPN};
 pub use roster::{
     InclusionProof, MerkleRoot, MerkleStep, ROSTER_HEAD_V1, Roster, RosterHead, RosterVersion, Side,
 };
 pub use session::{Chunk, Frame};
 pub use ticket::CapabilityTicket;
+pub use topic::{TopicId, TopicPeer, TopicTicket};
 
 /// Crate version, surfaced so the binaries have something concrete to call
 /// while the real surface is still being built out.

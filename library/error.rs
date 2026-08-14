@@ -95,4 +95,37 @@ pub enum Error {
     /// roster).
     #[error("signing key is not the fabric root")]
     FabricMismatch,
+
+    /// A [`SealedFabricKey`](crate::SealedFabricKey) did not unseal: the AEAD
+    /// tag failed, or the blob was truncated or malformed.
+    ///
+    /// Distinct from [`Error::InvalidSignature`] (the root's signature over the
+    /// sealed key) and [`Error::SubjectMismatch`] (sealed to a different
+    /// member) — those are checked first, so reaching this means the envelope
+    /// was well-formed and correctly addressed but the ciphertext was not.
+    #[error("sealed fabric key failed to open")]
+    SealedKeyOpen,
+
+    /// An envelope is encrypted under a roster version whose fabric key this
+    /// node does not hold.
+    ///
+    /// Not fatal: the message is stored provisionally and displays once the key
+    /// arrives via `wires import` (late joiners never hold pre-join versions,
+    /// so for them this is permanent by design).
+    #[error("no fabric key held for roster version {version}")]
+    KeyVersionUnknown {
+        /// The roster version the envelope names.
+        version: u64,
+    },
+
+    /// A publisher's chain forked: a different message occupies a sequence
+    /// number already filled, or a link hash does not match the predecessor.
+    ///
+    /// Detect and refuse — this layer picks no winner (see [`crate::chain`]).
+    #[error("chain fork detected")]
+    ChainFork,
+
+    /// An envelope's `topic` is not the topic it was received on.
+    #[error("envelope is for a different topic")]
+    TopicMismatch,
 }
