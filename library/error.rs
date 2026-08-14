@@ -60,4 +60,31 @@ pub enum Error {
     /// A session frame had an unknown tag or a malformed body.
     #[error("bad frame")]
     BadFrame,
+
+    /// A roster inclusion proof did not recompute to the head's Merkle root —
+    /// the presented node is not a member under that head.
+    #[error("not a member of the roster")]
+    NotInRoster,
+
+    /// An inclusion proof targets a different roster version than the head it
+    /// was checked against (the member must refresh its proof against the
+    /// current head).
+    #[error("stale inclusion proof: proof targets version {proof}, head is version {head}")]
+    StaleProof {
+        /// The roster version the proof was issued against.
+        proof: u64,
+        /// The roster version of the head it was checked against.
+        head: u64,
+    },
+
+    /// A responder configured with a roster head required an inclusion proof in
+    /// the handshake, but none was presented.
+    #[error("inclusion proof required")]
+    InclusionProofRequired,
+
+    /// `Roster::commit` was handed a signing key whose node id is not the
+    /// roster's `fabric` — a usage error (the fabric root must sign its own
+    /// roster).
+    #[error("signing key is not the fabric root")]
+    FabricMismatch,
 }

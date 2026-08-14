@@ -8,6 +8,10 @@
 //! - `crl.json`: the responder's revocation list.
 //! - `membership.json`: the dialer's fabric membership token (mode `0644` — a
 //!   *public* signed credential, not a secret).
+//! - `roster.json`: the root's full member set + version (mode `0600` — reveals
+//!   membership, so private).
+//! - `roster-head.json`: the signed roster head token (mode `0644` — public).
+//! - `inclusion-proof.json`: a member's own inclusion-proof token (mode `0644`).
 //!
 //! The resolver helpers ([`node_identity`], [`root_identity`], [`load_crl`],
 //! [`membership`]) encode the precedence the CLI uses: an inline flag wins, then
@@ -17,7 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use library::{Crl, Membership, NodeIdentity};
+use library::{Crl, InclusionProof, Membership, NodeIdentity, Roster, RosterHead};
 
 /// Resolve the wires home directory (does not create it).
 pub fn home() -> Result<PathBuf> {
@@ -130,6 +134,75 @@ impl Keystore {
         }
         Ok(path)
     }
+
+    /// Read `roster.json` as a [`Roster`]; `None` if the file is absent.
+    pub fn read_roster(&self) -> Result<Option<Roster>> {
+        let path = self.path("roster.json");
+        match read_to_string_opt(&path)? {
+            Some(text) => Ok(Some(
+                serde_json::from_str(&text)
+                    .with_context(|| format!("parsing {}", path.display()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the root's member set to `roster.json` (mode `0600` — it reveals
+    /// membership). Returns the written path.
+    pub fn save_roster(&self, roster: &Roster) -> Result<PathBuf> {
+        ensure_dir(&self.dir)?;
+        let path = self.path("roster.json");
+        let json = serde_json::to_string(roster).context("encoding roster")?;
+        write_secret_overwrite(&path, &json)?;
+        Ok(path)
+    }
+
+    /// Read `roster-head.json` as a [`RosterHead`]; `None` if absent.
+    pub fn read_roster_head(&self) -> Result<Option<RosterHead>> {
+        let path = self.path("roster-head.json");
+        match read_to_string_opt(&path)? {
+            Some(text) => Ok(Some(
+                RosterHead::decode(text.trim())
+                    .with_context(|| format!("parsing {}", path.display()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist `head` to `roster-head.json` as its token (mode `0644` — public).
+    pub fn save_roster_head(&self, head: &RosterHead) -> Result<PathBuf> {
+        ensure_dir(&self.dir)?;
+        let path = self.path("roster-head.json");
+        write_text(&path, &head.encode()?)?;
+        set_mode(&path, 0o644);
+        Ok(path)
+    }
+
+    /// Read `inclusion-proof.json` as an [`InclusionProof`]; `None` if absent.
+    pub fn read_inclusion_proof(&self) -> Result<Option<InclusionProof>> {
+        let path = self.path("inclusion-proof.json");
+        match read_to_string_opt(&path)? {
+            Some(text) => Ok(Some(
+                InclusionProof::decode(text.trim())
+                    .with_context(|| format!("parsing {}", path.display()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist `proof` to `inclusion-proof.json` as its token (mode `0644`). The
+    /// symmetric half of [`read_inclusion_proof`](Self::read_inclusion_proof);
+    /// members install a proof received by file copy. No CLI wires it yet (a
+    /// member passes `--inclusion-proof-file` directly), so it is exercised only
+    /// by tests for now.
+    #[allow(dead_code)]
+    pub fn save_inclusion_proof(&self, proof: &InclusionProof) -> Result<PathBuf> {
+        ensure_dir(&self.dir)?;
+        let path = self.path("inclusion-proof.json");
+        write_text(&path, &proof.encode()?)?;
+        set_mode(&path, 0o644);
+        Ok(path)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +263,63 @@ pub fn membership(inline: Option<&str>, file: Option<&Path>) -> Result<Membershi
          --membership-file, or run `wires member --subject <id> --save` (looked for {})",
         ks.path("membership.json").display()
     );
+}
+
+/// Resolve a roster head for `serve`: inline `--roster-head` token, then
+/// `$WIRES_ROSTER_HEAD`, then `--roster-head-file`, then the keystore
+/// (`roster-head.json`). `None` when none is configured (slice-1 behavior).
+pub fn roster_head(inline: Option<&str>, file: Option<&Path>) -> Result<Option<RosterHead>> {
+    if let Some(token) = inline {
+        return Ok(Some(RosterHead::decode(token).context("--roster-head")?));
+    }
+    if let Some(token) = std::env::var("WIRES_ROSTER_HEAD")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(Some(
+            RosterHead::decode(&token).context("$WIRES_ROSTER_HEAD")?,
+        ));
+    }
+    if let Some(path) = file {
+        let text = read_to_string_opt(path)?
+            .ok_or_else(|| anyhow!("roster head file not found: {}", path.display()))?;
+        return Ok(Some(
+            RosterHead::decode(text.trim())
+                .with_context(|| format!("parsing {}", path.display()))?,
+        ));
+    }
+    Keystore::resolve()?.read_roster_head()
+}
+
+/// Resolve an inclusion proof: inline `--inclusion-proof` token, then
+/// `$WIRES_INCLUSION_PROOF`, then `--inclusion-proof-file`, then the keystore
+/// (`inclusion-proof.json`). `None` when none is configured.
+pub fn inclusion_proof(
+    inline: Option<&str>,
+    file: Option<&Path>,
+) -> Result<Option<InclusionProof>> {
+    if let Some(token) = inline {
+        return Ok(Some(
+            InclusionProof::decode(token).context("--inclusion-proof")?,
+        ));
+    }
+    if let Some(token) = std::env::var("WIRES_INCLUSION_PROOF")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(Some(
+            InclusionProof::decode(&token).context("$WIRES_INCLUSION_PROOF")?,
+        ));
+    }
+    if let Some(path) = file {
+        let text = read_to_string_opt(path)?
+            .ok_or_else(|| anyhow!("inclusion proof file not found: {}", path.display()))?;
+        return Ok(Some(
+            InclusionProof::decode(text.trim())
+                .with_context(|| format!("parsing {}", path.display()))?,
+        ));
+    }
+    Keystore::resolve()?.read_inclusion_proof()
 }
 
 fn resolve_identity(
@@ -326,6 +456,27 @@ fn write_secret(path: &Path, contents: &str, force: bool) -> Result<()> {
 
 fn write_text(path: &Path, contents: &str) -> Result<()> {
     std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Set a file's unix mode (best-effort; no-op on non-unix).
+fn set_mode(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).ok();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+}
+
+/// Write a secret file at mode `0600`, overwriting any existing file (used for
+/// `roster.json`, rewritten in place by `roster add`/`remove`/`commit`).
+fn write_secret_overwrite(path: &Path, contents: &str) -> Result<()> {
+    write_text(path, contents)?;
+    set_mode(path, 0o600);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -484,5 +635,90 @@ mod tests {
         let path = temp_dir().join("membership.json");
         write_text(&path, &m.encode().unwrap()).unwrap();
         assert_eq!(membership(None, Some(&path)).unwrap(), m);
+    }
+
+    fn fixture_roster() -> (NodeIdentity, library::Roster) {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let mut roster = library::Roster::new(root.node_id());
+        roster.insert(NodeIdentity::from_seed([2u8; 32]).node_id());
+        roster.insert(NodeIdentity::from_seed([3u8; 32]).node_id());
+        (root, roster)
+    }
+
+    #[test]
+    fn roster_round_trips_and_is_none_when_absent() {
+        let ks = Keystore::at(temp_dir());
+        assert!(ks.read_roster().unwrap().is_none());
+        let (_root, roster) = fixture_roster();
+        ks.save_roster(&roster).unwrap();
+        assert_eq!(ks.read_roster().unwrap().unwrap(), roster);
+    }
+
+    #[test]
+    fn roster_head_and_proof_round_trip() {
+        let ks = Keystore::at(temp_dir());
+        let (root, mut roster) = fixture_roster();
+        let (head, proofs) = roster.commit(&root, 0, i64::MAX).unwrap();
+        ks.save_roster_head(&head).unwrap();
+        assert_eq!(ks.read_roster_head().unwrap().unwrap(), head);
+
+        let proof = proofs.into_iter().next().unwrap().1;
+        ks.save_inclusion_proof(&proof).unwrap();
+        assert_eq!(ks.read_inclusion_proof().unwrap().unwrap(), proof);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn roster_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let ks = Keystore::at(temp_dir());
+        let (root, mut roster) = fixture_roster();
+        let (head, proofs) = roster.commit(&root, 0, i64::MAX).unwrap();
+        let rp = ks.save_roster(&roster).unwrap();
+        let hp = ks.save_roster_head(&head).unwrap();
+        let pp = ks.save_inclusion_proof(&proofs[0].1).unwrap();
+        assert_eq!(
+            std::fs::metadata(&rp).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&hp).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            std::fs::metadata(&pp).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn roster_head_resolver_prefers_inline_then_file() {
+        let (root, mut roster) = fixture_roster();
+        let (head, _) = roster.commit(&root, 0, i64::MAX).unwrap();
+        assert_eq!(
+            roster_head(Some(&head.encode().unwrap()), None)
+                .unwrap()
+                .unwrap(),
+            head
+        );
+        let path = temp_dir().join("roster-head.json");
+        write_text(&path, &head.encode().unwrap()).unwrap();
+        assert_eq!(roster_head(None, Some(&path)).unwrap().unwrap(), head);
+    }
+
+    #[test]
+    fn inclusion_proof_resolver_prefers_inline_then_file() {
+        let (root, mut roster) = fixture_roster();
+        let (_head, proofs) = roster.commit(&root, 0, i64::MAX).unwrap();
+        let proof = proofs.into_iter().next().unwrap().1;
+        assert_eq!(
+            inclusion_proof(Some(&proof.encode().unwrap()), None)
+                .unwrap()
+                .unwrap(),
+            proof
+        );
+        let path = temp_dir().join("inclusion-proof.json");
+        write_text(&path, &proof.encode().unwrap()).unwrap();
+        assert_eq!(inclusion_proof(None, Some(&path)).unwrap().unwrap(), proof);
     }
 }

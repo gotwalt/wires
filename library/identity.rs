@@ -12,7 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::error::{Error, Result};
 
 /// An Ed25519 public key — a node's address on the network (32 bytes).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct NodeId([u8; 32]);
 
 /// A detached Ed25519 signature (64 bytes).
