@@ -35,7 +35,8 @@ bazel build //wires
   *caller's* node id, which it learned from wires' environment injection, not
   from anything the request claimed. The script asserts that every byte on the
   dialer's stdout parsed as JSON-RPC: no banner, no log line, no framing.
-- **`demo-revoke.sh`** (~10 s) — watch the responder's pid stay the same across
+- **`demo-revoke.sh`** (~40 s paced for watching; ~7 s under `--quiet`) —
+  watch the responder's pid stay the same across
   the revocation, then watch the identical dial exit `77` with **zero bytes**
   on stdout and the reason printed on the dialer's own terminal. Default
   `--mode roster` advances the signed head; `--mode crl` appends to the

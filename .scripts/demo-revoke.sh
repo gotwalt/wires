@@ -98,9 +98,12 @@ bad() {
 step() {
 	[ -n "$QUIET" ] || {
 		printf '\n\033[1;36m[demo] %s\033[0m\n' "$*" >&2
-		sleep 0.6
+		sleep 1.5
 	}
 }
+# A reading pause after a line the viewer must absorb. The GIF at the top of
+# the README is this script recorded as-is: pacing here IS the edit suite.
+beat() { [ -n "$QUIET" ] || sleep "$1"; }
 
 if [ ! -x "$WIRES" ]; then
 	say "building //wires (first run) ..."
@@ -175,9 +178,14 @@ TICKET="$(WIRES_HOME="$op" "$WIRES" grant \
 	--ttl 3600 \
 	--addr "127.0.0.1:$port")"
 
+say "An agent holds a ticket to an MCP server running behind \`wires serve\`."
+say "Watch what revoking that access takes -- and what the agent sees after."
+beat 3
+[ -n "$QUIET" ] || printf '\n' >&2
 say "mode          : $MODE"
 say "agent  node   : ${AGENT_ID:0:16}..."
 say "responder pid : $SERVE_PID on 127.0.0.1:$port (roster v1)"
+beat 2
 
 # ==========================================================================
 step "ACT 1  it works"
@@ -206,6 +214,7 @@ case "$SECRET_TEXT" in
 esac
 ok "act 1: exit 0, 3 JSON-RPC responses, secret revealed"
 [ -n "$QUIET" ] || printf '\033[1m     %s\033[0m\n' "$SECRET_TEXT" >&2
+beat 3
 
 # ==========================================================================
 step "ACT 2  the operator changes their mind -- one line"
@@ -223,8 +232,10 @@ if [ "$MODE" = "roster" ]; then
 	WIRES_HOME="$srv" "$WIRES" import \
 		--inclusion-proof-file "$D/proofs2/$SERVER_ID.proof" \
 		--roster-head "$HEAD2" | indent
+	beat 1.5
 	say "the removed agent gets no new proof. Revocation IS omission --"
 	say "the operator will never mint a newer proof for a removed member."
+	beat 2.5
 else
 	run "wires revoke --subject A        # appends to the server's crl.json"
 	WIRES_HOME="$srv" "$WIRES" revoke --subject "$AGENT_ID" | indent
@@ -236,6 +247,7 @@ if kill -0 "$SERVE_PID" 2>/dev/null; then
 else
 	bad "act 2: the responder died; the point of this demo is that it does not"
 fi
+beat 3
 
 # ==========================================================================
 step "ACT 3  the same dial, now dead"
@@ -251,9 +263,11 @@ set -e
 	bad "act 3: connect exited $rc_after, expected $EXIT_DENIED"
 }
 ok "act 3: connect exited $EXIT_DENIED (denied)"
+beat 1.5
 
 [ ! -s "$D/after.json" ] || bad "act 3: stdout was not empty -- the client saw bytes!"
 ok "act 3: 0 bytes on stdout -- the MCP client never saw a byte of the tool"
+beat 1.5
 
 # The reason arrives on the DIALER's terminal. serve.log is not consulted.
 REASON="$(grep -m1 'denied by responder' "$D/after.err" || true)"
@@ -262,10 +276,12 @@ REASON="$(grep -m1 'denied by responder' "$D/after.err" || true)"
 	bad "act 3: the dialer printed no denial reason"
 }
 [ -n "$QUIET" ] || wrapped 31 "$REASON"
+beat 3
 
 [ "$(kill -0 "$SERVE_PID" 2>/dev/null && echo "$SERVE_PID")" = "$PID_BEFORE" ] ||
 	bad "act 3: the responder is not the same live process it was in act 1"
 ok "act 3: responder still pid $PID_BEFORE -- never restarted"
+beat 1.5
 
 # ==========================================================================
 step "SUMMARY"
@@ -276,3 +292,5 @@ printf '     before: exit %-2s · %s responses · secret revealed to %s\n' \
 printf '     after : exit %-2s · %s bytes on stdout · denied:\n' \
 	"$rc_after" "$(wc -c <"$D/after.json" | tr -d ' ')" >&2
 wrapped 1 "$short_reason"
+# Hold the final frame so a looping GIF doesn't snap back mid-read.
+beat 5
