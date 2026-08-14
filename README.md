@@ -107,6 +107,7 @@ printf 'a\nTODO: ship it\nb\n' | ./.scripts/connect.sh   # terminal 2 → "2:TOD
 | `wires keygen`   | trust-root / host setup   | Generate (or re-derive) a **node key** and **root key**; print, and `--save-*` to the keystore |
 | `wires grant`    | trust root (the human)    | Root-sign a capability and emit a base64 **ticket**, optionally with `--addr`/`--relay-url` hints |
 | `wires member`   | trust root (the human)    | Root-sign a **fabric membership** for a node and emit a base64 token (`--save` to the keystore) |
+| `wires roster`   | trust root (the human)    | Author a **committed roster**: `add`/`remove` members, `commit` a signed head + per-member proofs, `head` to print the current head token |
 | `wires revoke`   | trust root / responder    | Add a subject to the CRL (keystore `crl.json` by default) and print it       |
 | `wires serve`    | responder (the tool host) | Verify the dialer's **membership** (and, with `--scope`, a matching grant), exec a command, bridge its stdio — injecting the verified caller identity into the child |
 | `wires connect`  | dialer (the agent side)   | Present the **membership** and dial a `--ticket` (scoped) or `--target` (inclusion-only), piping local stdin/stdout/stderr |
@@ -148,6 +149,9 @@ environment), keys and the CRL live in a **keystore** directory, resolved as
 | `root.seed`       | `keygen --save-root` | `grant` / `member` signing key   |
 | `crl.json`        | `revoke` (default)   | `serve` revocation check         |
 | `membership.json` | `member --save`      | `connect` fabric membership      |
+| `roster.json`        | `roster add`/`commit` | the root's full member set (`0600`, private) |
+| `roster-head.json`   | `roster commit`       | `serve --roster-head` (the signed head, public) |
+| `inclusion-proof.json` | a member (file copy) | `connect --inclusion-proof` (the member's own path, public) |
 
 `keygen --save-node` / `--save-root` write `0600` seed files (refusing to
 clobber unless `--force`). On the tool host you save the node key; on the
@@ -283,6 +287,43 @@ It buys two things:
 Membership is **slice 1** of a larger plan (committed rosters, then
 delegation/federation) — see [docs/fabric-vision.md](docs/fabric-vision.md) and
 [docs/provable-fabric-inclusion.md](docs/provable-fabric-inclusion.md).
+
+### Committed roster: current membership + fabric-wide revocation
+
+A membership says the root vouched for a node *at issue time* (bounded by its
+TTL). The **committed roster** adds *current* membership: the root keeps a
+versioned member set and signs a tiny 32-byte **head** (a Merkle root) whenever
+it changes; a verifier holding the latest head checks a caller's **inclusion
+proof** against it, offline, and learns *present* membership. Removing a member
+and re-signing is fabric-wide revocation with no CRL to distribute. The head
+leaks nothing about the set; a proof reveals only its holder's id and `O(log n)`
+sibling hashes. This is **slice 2b** — see
+[docs/committed-roster.md](docs/committed-roster.md); head/proof distribution
+(gossip, sealed blobs, a blind node) is the deferred slice 2c.
+
+```bash
+# The human authors the roster (offline) and signs a head + per-member proofs.
+bazel run -q //wires -- roster add --member "$MEMBER_ID"
+bazel run -q //wires -- roster add --member "$SVC_ID"      # the service is a member too
+bazel run -q //wires -- roster commit --ttl 3600 --out ./proofs
+# → writes keystore roster-head.json, prints the head token, and emits
+#   ./proofs/<node-id>.proof for each member.
+
+# The service enforces the head (any member with a valid current proof may connect):
+bazel run -q //wires -- serve --trust-root "$ROOT_ID" --allow-any-member \
+  --roster-head-file ./roster-head.json \
+  -- printenv WIRES_CALLER_NODE WIRES_ROSTER_VERSION
+
+# The member dials, presenting its membership and inclusion proof:
+bazel run -q //wires -- connect --target "$SVC_ID" \
+  --inclusion-proof-file "./proofs/$MEMBER_ID.proof"
+# → the child sees WIRES_CALLER_NODE and the WIRES_ROSTER_VERSION that admitted it.
+# Now `roster remove --member "$MEMBER_ID" && roster commit` and the same dial is rejected.
+```
+
+A ticket-less (`--target`) dialer also verifies the **responder's** membership
+from the handshake ack before sending any stdin — *mutual inclusion*, so the
+agent never streams to a service outside its fabric.
 
 ### MCP over wires (Flow B) — no extra code
 
