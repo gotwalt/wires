@@ -17,7 +17,9 @@
 mod admission;
 mod keystore;
 mod pair;
+mod replay;
 mod store;
+mod topics;
 mod transport;
 
 use std::fmt;
