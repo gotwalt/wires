@@ -344,7 +344,7 @@ const MAX_REASON: usize = 512;
 
 /// Clamp a denial reason to [`MAX_REASON`] bytes, cutting on a char boundary so
 /// the frame body stays valid UTF-8.
-fn truncate_reason(mut s: String) -> String {
+pub(crate) fn truncate_reason(mut s: String) -> String {
     if s.len() > MAX_REASON {
         let mut end = MAX_REASON;
         while end > 0 && !s.is_char_boundary(end) {
@@ -748,7 +748,7 @@ pub struct Denied {
 
 impl Denied {
     /// Wrap the responder's stated reason.
-    fn new(reason: String) -> Self {
+    pub(crate) fn new(reason: String) -> Self {
         Self { reason }
     }
 
