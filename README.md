@@ -4,6 +4,8 @@
 > other, with your tools, and with you — and any MCP server can be dialed
 > into it.**
 
+![revocation demo: the same dial before and after a roster head-advance — exit 77, zero bytes, responder never restarted](docs/demo-revoke.gif)
+
 The group chat is where this is going ([roadmap](docs/restart.md)). What runs
 today is the dial-in half, and it solves a real problem on its own:
 
@@ -42,15 +44,12 @@ bazel build //wires
 Both take `--quiet` (assertions only) and `--keep` (leave the state dir).
 Both provision into a fresh `mktemp -d` and never touch `~/.config/wires`.
 
-The five-minute screencast is not recorded yet; the scripts are written for
-capture (self-pacing, 80 columns, no prompts):
+The screencast at the top of this file is `demo-revoke.sh` recorded as-is; to
+re-record after a change:
 
 ```bash
-brew install asciinema agg
-asciinema rec -c ./.scripts/demo-revoke.sh demo.cast && agg demo.cast demo.gif
+asciinema rec -c ./.scripts/demo-revoke.sh demo.cast && agg demo.cast docs/demo-revoke.gif
 ```
-
-The resulting GIF belongs at the top of this file.
 
 ## Why you'd want this
 
@@ -540,10 +539,15 @@ Two caveats, stated plainly:
   `io.modelcontextprotocol/protocol-version`, `protocolVersion`, and
   `protocol-version` so hand-typed demo JSON still round-trips; only the first
   spelling is normative.
-- No MCP client has been driven against the bridge yet. The demos speak
-  JSON-RPC directly at `wires connect`; wiring Claude Code or Claude Desktop to
-  a remote responder is the next thing to try, and the config block above is
-  what it would use.
+- A real MCP client has been driven against the bridge (2026-08-13): a
+  headless Claude Code session (`claude -p --mcp-config …`) given only the
+  config block above completed the full MCP handshake through
+  `wires connect`, called the demo tool, and reported the responder-verified
+  caller id. After a roster head-advance — responder not restarted — the
+  identical session no longer saw the server at all: `wires connect` exited
+  `77` at the handshake with zero bytes on stdout, so from the client's side
+  the tool simply ceased to exist. Re-admitting the member (new commit +
+  `wires import` of the fresh proof) restored it, same ticket and all.
 
 ### Pairing: issue a grant over the wire
 

@@ -121,9 +121,13 @@ bridging *cleaner*. James-core is already ~90% of the way here
    server (`.scripts/fake-mcp-server.py`) behind `wires serve`, driven over a
    real session by a dialer holding only a ticket. It asserts that the
    captured stdout is byte-clean JSON-RPC and that the tool's answer carries
-   the *verified* caller id. Not yet done: pointing a real Claude Code /
-   Claude Desktop at a responder on a second machine (item 2's literal
-   wording) — the config block is in the README, untested against a client.
+   the *verified* caller id. A real client has now been driven through the
+   bridge too (2026-08-13): a headless Claude Code session with only the
+   README config block completed the MCP handshake, called the tool, and got
+   the responder-verified caller id; after a roster head-advance (responder
+   not restarted) the identical session saw no server at all (`connect` exit
+   77, zero stdout bytes); re-admission restored it on the same ticket. Still
+   untried: a second physical machine (loopback so far) and Claude Desktop.
 3. ✅ **Revocation demo**: `.scripts/demo-revoke.sh` — same dial before and
    after, `--mode roster` (head advance) or `--mode crl`. The responder is
    never restarted; the second dial exits 77 with zero bytes on stdout. This
@@ -134,12 +138,13 @@ bridging *cleaner*. James-core is already ~90% of the way here
    `io.modelcontextprotocol/protocolVersion` (camelCase). Note `server/discover`
    does not appear in the shipped rev; the stateless per-request metadata does,
    and the bundled fake server exercises it.
-5. ⬜ **Record the 5-minute demo** (asciinema or GIF) and put it at the top of
-   the README. Neither `asciinema` nor `agg` is installed on the dev machine,
-   so this is the one open item. Both scripts are written for capture —
-   self-pacing, 80-column output, no prompts — and the README carries the
-   `brew install asciinema agg && asciinema rec -c ./.scripts/demo-revoke.sh`
-   line for whoever records it.
+5. ✅ **Demo recorded** (2026-08-13): `demo-revoke.sh` captured with
+   asciinema, converted with agg, committed as `docs/demo-revoke.gif`, and
+   embedded at the top of the README. Re-record with the one-liner in the
+   README quickstart after any demo-visible change.
+
+**Phase 1 is complete.** Remaining before Phase 2: the gate — show the demo
+to two people who run remote MCP servers today.
 
 **Gate:** show the demo to two people who run remote MCP servers today. If
 neither says "I want that," stop and re-examine before Phase 2.
