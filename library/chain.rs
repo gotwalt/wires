@@ -241,7 +241,10 @@ mod tests {
         /// Seal the next message in the chain *without* advancing the local
         /// state, so a caller can classify it against the pre-append state.
         fn next(&self, body: &[u8]) -> TopicEnvelope {
-            let seq = self.state.map_or(Seq::ZERO, |s| s.seq.next());
+            let seq = self
+                .state
+                .map_or(Some(Seq::ZERO), |s| s.seq.checked_next())
+                .expect("test chains never reach Seq::MAX");
             TopicEnvelope::seal(
                 &self.identity,
                 self.topic,
@@ -558,13 +561,73 @@ mod tests {
     fn saturated_high_water_mark_does_not_overflow() {
         let (_, envs, _) = chain();
         let state = Some(ChainState::new(
-            Seq(u64::MAX),
+            Seq::MAX,
             MessageHash::from_bytes([0xaa; 32]),
         ));
         // envs[1] is seq 1, far below the mark, with no held hash → Fork.
         assert_eq!(
             classify_link(&envs[1], state, None).unwrap(),
             LinkStatus::Fork
+        );
+    }
+
+    /// Seal one envelope at an arbitrary `(seq, prev_hash)`, bypassing the
+    /// `Publisher` walk — the only way to reach the top of the sequence space.
+    fn env_at(seq: Seq, prev_hash: MessageHash) -> TopicEnvelope {
+        TopicEnvelope::seal(
+            &NodeIdentity::from_seed([2u8; 32]),
+            TopicId::from_bytes([7u8; 32]),
+            seq,
+            prev_hash,
+            RosterVersion(1),
+            &FabricKey::from_bytes([7u8; 32]),
+            1_700_000_000,
+            b"at the ceiling",
+        )
+        .unwrap()
+    }
+
+    /// The last legal link in a publisher's life: `u64::MAX - 1` → `u64::MAX`
+    /// classifies `Ok`, and there is then no next slot to allocate. Both halves
+    /// matter — the classifier's `checked_add` must not refuse the legal link,
+    /// and the allocator's `checked_next` must refuse the illegal one.
+    #[test]
+    fn the_last_legal_link_is_ok_and_has_no_successor() {
+        let prev = MessageHash::from_bytes([0xaa; 32]);
+        let state = ChainState::new(Seq(u64::MAX - 1), prev);
+        let env = env_at(Seq::MAX, prev);
+        assert_eq!(
+            classify_link(&env, Some(state), None).unwrap(),
+            LinkStatus::Ok
+        );
+        assert_eq!(env.seq.checked_next(), None);
+    }
+
+    /// Re-delivery *at* the ceiling is a `Duplicate`, not an overflow and not a
+    /// fork: `state.seq == env.seq == u64::MAX`.
+    #[test]
+    fn duplicate_at_the_ceiling_is_a_duplicate() {
+        let env = env_at(Seq::MAX, MessageHash::from_bytes([0xaa; 32]));
+        let state = ChainState::new(Seq::MAX, env.message_hash().unwrap());
+        assert_eq!(
+            classify_link(&env, Some(state), None).unwrap(),
+            LinkStatus::Duplicate
+        );
+    }
+
+    /// A peer-asserted high-water mark of `u64::MAX` — a value any admitted
+    /// peer can simply put in a replay `Request` — never yields a next-slot
+    /// cursor, so a server computing "the slot after what you hold" gets
+    /// `None` rather than a panic or a wrap to genesis.
+    #[test]
+    fn a_saturated_peer_hwm_yields_no_read_cursor() {
+        let hostile = ChainState::new(Seq::MAX, MessageHash::from_bytes([0xff; 32]));
+        assert_eq!(hostile.seq.checked_next(), None);
+        assert_eq!(
+            ChainState::new(Seq(u64::MAX - 1), hostile.hash)
+                .seq
+                .checked_next(),
+            Some(Seq::MAX)
         );
     }
 

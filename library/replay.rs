@@ -38,6 +38,21 @@ use crate::topic::TopicId;
 /// `Router` as gossip and admission.
 pub const TOPIC_REPLAY_ALPN: &[u8] = b"wires/topic-replay/1";
 
+/// The largest replay frame this protocol will encode or decode: 1 MiB.
+///
+/// Like [`MAX_ADMIT_FRAME`](crate::MAX_ADMIT_FRAME), the ceiling lives next to
+/// the codec so the three readers in this codebase cannot each pick their own
+/// (or forget). Replay runs *after* admission, so an unadmitted peer cannot
+/// reach it — but "admitted" is a large set, and both unbounded collections in
+/// these frames (the [`hwm`](ReplayFrame::Request) map and an envelope's
+/// ciphertext) are attacker-chosen once a peer is in. A four-byte length prefix
+/// with no cap lets any admitted peer make the server buffer 4 GiB per stream.
+///
+/// 1 MiB is generous for both shapes: one envelope carries a chat-sized
+/// hex-encoded payload, and a high-water-mark map costs ~170 bytes per
+/// publisher, so the cap clears several thousand publishers on one topic.
+pub const MAX_REPLAY_FRAME: usize = 1024 * 1024;
+
 const TAG_REQUEST: u8 = 0;
 const TAG_ITEM: u8 = 1;
 const TAG_END: u8 = 2;
@@ -149,6 +164,9 @@ impl ReplayFrame {
                 payload.extend_from_slice(reason.as_bytes());
             }
         }
+        if payload.len() > MAX_REPLAY_FRAME {
+            return Err(Error::BadFrame);
+        }
         let len: u32 = payload.len().try_into().map_err(|_| Error::BadFrame)?;
         let mut out = Vec::with_capacity(4 + payload.len());
         out.extend_from_slice(&len.to_be_bytes());
@@ -162,11 +180,18 @@ impl ReplayFrame {
     /// `Ok(Some((frame, consumed)))` otherwise, and
     /// [`crate::Error::BadFrame`] / [`crate::Error::Decode`] on a malformed
     /// frame. Never panics.
+    ///
+    /// A length prefix claiming more than [`MAX_REPLAY_FRAME`] bytes is
+    /// [`crate::Error::BadFrame`] immediately — *not* `Ok(None)` — so a reader
+    /// that stops on `Err` never buffers more than the cap.
     pub fn decode(buf: &[u8]) -> Result<Option<(ReplayFrame, usize)>> {
         if buf.len() < 4 {
             return Ok(None);
         }
         let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if len > MAX_REPLAY_FRAME {
+            return Err(Error::BadFrame);
+        }
         let end = 4 + len;
         if buf.len() < end {
             return Ok(None);
@@ -201,7 +226,7 @@ impl ReplayFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envelope::{Ciphertext, ENVELOPE_V1, MessageHash, Seq, TopicEnvelope};
+    use crate::envelope::{Ciphertext, ENVELOPE_V1, MessageHash, MessageNonce, Seq, TopicEnvelope};
     use crate::error::Error;
     use crate::grant::AlgorithmId;
     use crate::identity::Signature;
@@ -239,21 +264,25 @@ mod tests {
             seed(),
             any::<u64>(),
             any::<i64>(),
+            proptest::array::uniform12(any::<u8>()),
             bytes(),
             signature(),
         )
             .prop_map(
-                |(topic, sender, seq, prev, key_version, timestamp, ct, sig)| TopicEnvelope {
-                    format: ENVELOPE_V1,
-                    topic: TopicId::from_bytes(topic),
-                    sender: NodeId::from_bytes(sender),
-                    seq: Seq(seq),
-                    prev_hash: MessageHash::from_bytes(prev),
-                    key_version: RosterVersion(key_version),
-                    timestamp,
-                    ciphertext: Ciphertext::from_bytes(ct),
-                    alg: AlgorithmId::Ed25519,
-                    sig,
+                |(topic, sender, seq, prev, key_version, timestamp, nonce, ct, sig)| {
+                    TopicEnvelope {
+                        format: ENVELOPE_V1,
+                        topic: TopicId::from_bytes(topic),
+                        sender: NodeId::from_bytes(sender),
+                        seq: Seq(seq),
+                        prev_hash: MessageHash::from_bytes(prev),
+                        key_version: RosterVersion(key_version),
+                        timestamp,
+                        nonce: MessageNonce::from_bytes(nonce),
+                        ciphertext: Ciphertext::from_bytes(ct),
+                        alg: AlgorithmId::Ed25519,
+                        sig,
+                    }
                 },
             )
     }
@@ -296,6 +325,7 @@ mod tests {
             prev_hash: MessageHash::from_bytes([0x33; 32]),
             key_version: RosterVersion(9),
             timestamp: -5,
+            nonce: MessageNonce::from_bytes([0x55; 12]),
             ciphertext: Ciphertext::from_bytes(vec![0xde, 0xad, 0xbe, 0xef]),
             alg: AlgorithmId::Ed25519,
             sig: Signature::from_bytes([0x44; 64]),
@@ -474,9 +504,10 @@ mod tests {
         let body = format!(
             concat!(
                 r#"{{"alg":"ed25519","ciphertext":"deadbeef","format":1,"key_version":9,"#,
-                r#""prev_hash":"{prev}","sender":"{sender}","seq":3,"sig":"{sig}","#,
-                r#""timestamp":-5,"topic":"{topic}"}}"#
+                r#""nonce":"{nonce}","prev_hash":"{prev}","sender":"{sender}","seq":3,"#,
+                r#""sig":"{sig}","timestamp":-5,"topic":"{topic}"}}"#
             ),
+            nonce = "55".repeat(12),
             prev = "33".repeat(32),
             sender = "22".repeat(32),
             sig = "44".repeat(64),
@@ -576,14 +607,38 @@ mod tests {
         }
     }
 
+    /// The memory bound on the reader. A peer that claims 4 GiB and then
+    /// dribbles bytes must be refused the moment the length prefix lands, not
+    /// waited on — waiting is what turns a four-byte write into a remote OOM.
     #[test]
-    fn a_huge_length_prefix_just_waits() {
-        // 4 GiB claimed, one byte delivered: incomplete, not an error, and no
-        // attempt to reserve the claimed size.
-        assert!(
-            ReplayFrame::decode(&[0xff, 0xff, 0xff, 0xff, TAG_END])
-                .unwrap()
-                .is_none()
-        );
+    fn a_huge_length_prefix_is_refused_immediately() {
+        assert!(matches!(
+            ReplayFrame::decode(&[0xff, 0xff, 0xff, 0xff, TAG_END]),
+            Err(Error::BadFrame)
+        ));
+        // One byte over the cap is over the cap; the cap itself still waits for
+        // the body, since a frame that size is legal.
+        let over = ((MAX_REPLAY_FRAME + 1) as u32).to_be_bytes();
+        assert!(matches!(ReplayFrame::decode(&over), Err(Error::BadFrame)));
+        let at = (MAX_REPLAY_FRAME as u32).to_be_bytes();
+        assert!(ReplayFrame::decode(&at).unwrap().is_none());
+    }
+
+    /// The cap is symmetric: a frame too big to decode is too big to encode, so
+    /// this side never emits something a conforming peer must drop.
+    #[test]
+    fn an_oversized_frame_is_refused_by_encode() {
+        let huge = ReplayFrame::Denied {
+            reason: "x".repeat(MAX_REPLAY_FRAME + 1),
+        };
+        assert!(matches!(huge.encode(), Err(Error::BadFrame)));
+
+        // And the largest legal frame still round-trips.
+        let big = ReplayFrame::Denied {
+            reason: "x".repeat(MAX_REPLAY_FRAME - 1),
+        };
+        let enc = big.encode().unwrap();
+        assert_eq!(enc.len(), 4 + MAX_REPLAY_FRAME);
+        assert_eq!(ReplayFrame::decode(&enc).unwrap().unwrap().0, big);
     }
 }

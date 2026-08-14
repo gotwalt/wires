@@ -21,11 +21,35 @@
 //! (secret side), so a node needs no second keypair. The sealer generates a
 //! fresh ephemeral X25519 secret, does a Diffie–Hellman against the recipient's
 //! converted public key, and derives the AEAD key with
-//! `blake3::derive_key("wires sealed-fabric-key v1", dh_shared)`. The nonce is
-//! all-zero — sound because the AEAD key is unique per seal (fresh ephemeral) —
-//! and the AAD is the canonical JSON of the sealing context, binding the
-//! ciphertext to `(format, fabric, version, member, alg)`. The `sealed` blob is
+//! `blake3::derive_key("wires sealed-fabric-key v1",
+//! dh_shared ‖ ephemeral_pub ‖ member_pub)`. The nonce is all-zero — sound
+//! because the AEAD key is unique per seal (fresh ephemeral) — and the AAD is
+//! the canonical JSON of the sealing context, binding the ciphertext to
+//! `(format, fabric, version, member, alg)`. The `sealed` blob is
 //! `ephemeral_pub(32) ‖ ct+tag`.
+//!
+//! # Why the key derivation names both parties
+//!
+//! Deriving from the raw Diffie–Hellman output alone would make the AEAD key a
+//! function of one value an attacker can sometimes force. Ed25519 point
+//! decompression accepts **small-order** points: `0100…00` and friends are
+//! well-formed 64-hex "node ids" that decompress and then make *every*
+//! Diffie–Hellman against them return the all-zero shared secret, because a
+//! clamped scalar is a multiple of the cofactor and kills a low-order point. A sealed key addressed to such a "member" would be
+//! encrypted under `derive_key(ctx, 0…0)` — a key anybody can compute, holding
+//! no secret at all — and since the blob is a base64 token designed to be
+//! pasted through untrusted channels, that is a plaintext-equivalent leak of
+//! the fabric-wide data key.
+//!
+//! Two guards, belt and braces:
+//!
+//! 1. [`NodeId`]s that are weak (low-order) points are refused outright, on the
+//!    sealing side and the opening side, and the exchange must be
+//!    *contributory* (a non-zero shared secret).
+//! 2. The derivation mixes both public keys in, so the AEAD key is bound to the
+//!    `(ephemeral, member)` pair rather than to a bare curve output. That is
+//!    what closes unknown-key-share variants generically, not just the one
+//!    known family of bad inputs.
 //!
 //! # Forward secrecy, honestly
 //!
@@ -212,11 +236,19 @@ impl SealedKeyContext<'_> {
 }
 
 /// The X25519 public key an Ed25519 [`NodeId`] converts to, for sealing *to*
-/// that node. Returns [`Error::SealedKeyOpen`] when the bytes are not a valid
-/// Ed25519 point (so not a real node id at all).
+/// that node.
+///
+/// Returns [`Error::SealedKeyOpen`] when the bytes are not a valid Ed25519
+/// point (so not a real node id at all) **or** when they are a valid but *weak*
+/// (low-order) point. The second case is the dangerous one: low-order points
+/// decompress happily, convert to the Montgomery identity, and would make the
+/// derived AEAD key publicly computable — see the module docs.
 fn montgomery_public(node: &NodeId) -> Result<x25519_dalek::PublicKey> {
     let verifying = ed25519_dalek::VerifyingKey::from_bytes(node.as_bytes())
         .map_err(|_| Error::SealedKeyOpen)?;
+    if verifying.is_weak() {
+        return Err(Error::SealedKeyOpen);
+    }
     Ok(x25519_dalek::PublicKey::from(
         verifying.to_montgomery().to_bytes(),
     ))
@@ -232,10 +264,31 @@ fn montgomery_secret(identity: &NodeIdentity) -> x25519_dalek::StaticSecret {
     x25519_dalek::StaticSecret::from(signing.to_scalar_bytes())
 }
 
-/// The per-seal AEAD cipher for a Diffie–Hellman shared secret.
-fn cipher_for(shared: &[u8; 32]) -> ChaCha20Poly1305 {
-    let aead_key = blake3::derive_key(SEALED_KEY_CONTEXT, shared);
-    ChaCha20Poly1305::new(&Key::from(aead_key))
+/// The per-seal AEAD cipher: `blake3::derive_key(ctx,
+/// dh_shared ‖ ephemeral_pub ‖ member_pub)`.
+///
+/// Both public keys are mixed in so the key is bound to *this pair of parties*
+/// and not merely to a curve output an attacker might be able to force.
+///
+/// Returns [`Error::SealedKeyOpen`] when the exchange was **not contributory** —
+/// i.e. the shared secret came out all-zero, which is what a low-order public
+/// key on either side produces. [`montgomery_public`] already refuses weak
+/// recipients; this catches the same shape arriving as the *ephemeral* half of
+/// an attacker-supplied sealed blob.
+fn cipher_for(
+    shared: &x25519_dalek::SharedSecret,
+    ephemeral_pub: &[u8; 32],
+    member_pub: &[u8; 32],
+) -> Result<ChaCha20Poly1305> {
+    if !shared.was_contributory() {
+        return Err(Error::SealedKeyOpen);
+    }
+    let mut material = [0u8; 96];
+    material[..32].copy_from_slice(shared.as_bytes());
+    material[32..64].copy_from_slice(ephemeral_pub);
+    material[64..].copy_from_slice(member_pub);
+    let aead_key = blake3::derive_key(SEALED_KEY_CONTEXT, &material);
+    Ok(ChaCha20Poly1305::new(&Key::from(aead_key)))
 }
 
 /// A root-signed, member-sealed [`FabricKey`] for one roster version.
@@ -271,8 +324,12 @@ impl SealedFabricKey {
     /// The `fabric` field is `root.node_id()` — the credential names its own
     /// authority, exactly as [`Membership`](crate::Membership) does.
     ///
-    /// Returns [`crate::Error::SealedKeyOpen`] when `member` is not a valid
-    /// Ed25519 public key (so there is no X25519 key to seal to).
+    /// Returns [`crate::Error::SealedKeyOpen`] when `member` is not a usable
+    /// Ed25519 public key — either it does not decompress at all, or it is a
+    /// weak (low-order) point, which would make the derived AEAD key publicly
+    /// computable (see the module docs). Nothing upstream validates the bytes
+    /// an operator types into `roster add`, so this is the check that stops a
+    /// planted "node id" from turning a sealed key into plaintext.
     ///
     /// ```
     /// use library::{FabricKey, NodeIdentity, RosterVersion, SealedFabricKey};
@@ -312,9 +369,10 @@ impl SealedFabricKey {
         }
         let ephemeral = x25519_dalek::StaticSecret::from(ephemeral_bytes);
         let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral);
-        let shared = ephemeral.diffie_hellman(&montgomery_public(&member)?);
+        let member_pub = montgomery_public(&member)?;
+        let shared = ephemeral.diffie_hellman(&member_pub);
 
-        let ciphertext = cipher_for(shared.as_bytes())
+        let ciphertext = cipher_for(&shared, ephemeral_pub.as_bytes(), member_pub.as_bytes())?
             .encrypt(
                 &Nonce::from(ZERO_NONCE),
                 Payload {
@@ -382,8 +440,12 @@ impl SealedFabricKey {
         }
         let (ephemeral_pub, ciphertext) = blob.split_at(EPHEMERAL_PUB_LEN);
         let ephemeral_pub: [u8; 32] = ephemeral_pub.try_into().expect("split at 32");
-        let shared = montgomery_secret(recipient)
-            .diffie_hellman(&x25519_dalek::PublicKey::from(ephemeral_pub));
+        // The recipient's own Montgomery public key — the second half of the
+        // derivation binding. Recomputed from the secret rather than converted
+        // from `self.member`, so it is this node's real key by construction.
+        let secret = montgomery_secret(recipient);
+        let member_pub = x25519_dalek::PublicKey::from(&secret);
+        let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(ephemeral_pub));
 
         let aad = SealedKeyContext {
             format: self.format,
@@ -393,7 +455,7 @@ impl SealedFabricKey {
             alg: &self.alg,
         }
         .aad()?;
-        let plaintext = cipher_for(shared.as_bytes())
+        let plaintext = cipher_for(&shared, &ephemeral_pub, member_pub.as_bytes())?
             .decrypt(
                 &Nonce::from(ZERO_NONCE),
                 Payload {
@@ -924,6 +986,135 @@ mod tests {
     #[test]
     fn generate_produces_distinct_keys() {
         assert_ne!(FabricKey::generate(), FabricKey::generate());
+    }
+
+    /// The canonical small-order Ed25519 encodings that *decompress* — the
+    /// ones that get past `VerifyingKey::from_bytes` and would otherwise be
+    /// accepted as node ids. Every one of them converts to the Montgomery
+    /// identity, so a Diffie–Hellman against it yields the all-zero secret.
+    const WEAK_NODE_IDS: [&str; 4] = [
+        // The Edwards identity: y = 1.
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        // y = 0 — a point of order 4.
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        // y = -1 — the point of order 2.
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        // A standard order-8 point.
+        "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+    ];
+
+    /// A well-formed 32 bytes that is not a curve point at all: `y = 2` has no
+    /// `x` on Ed25519.
+    const NOT_A_POINT: &str = "0200000000000000000000000000000000000000000000000000000000000000";
+
+    /// The hole this guards: a low-order "node id" is a well-formed 64-hex
+    /// string that every other check in the crate waves through, but sealing to
+    /// it would derive the AEAD key from an all-zero Diffie–Hellman — i.e. a key
+    /// anyone can compute from the public blob alone. Sealing must refuse.
+    #[test]
+    fn weak_member_keys_are_refused_by_seal() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        for encoded in WEAK_NODE_IDS {
+            let member = NodeId::from_hex(encoded).unwrap();
+
+            // The premise: these really do decompress and really are weak, so
+            // nothing before this point would have caught them.
+            let verifying = ed25519_dalek::VerifyingKey::from_bytes(member.as_bytes())
+                .unwrap_or_else(|_| panic!("{encoded} should decompress"));
+            assert!(verifying.is_weak(), "{encoded} should be a weak point");
+            // Whatever it converts to, every Diffie-Hellman against it is
+            // non-contributory: clamped scalars are multiples of the cofactor,
+            // so a low-order point multiplies to the identity.
+            let converted = x25519_dalek::PublicKey::from(verifying.to_montgomery().to_bytes());
+            let shared = x25519_dalek::StaticSecret::from([9u8; 32]).diffie_hellman(&converted);
+            assert_eq!(
+                shared.as_bytes(),
+                &[0u8; 32],
+                "{encoded} should produce an all-zero shared secret"
+            );
+            assert!(!shared.was_contributory());
+
+            assert!(
+                matches!(montgomery_public(&member), Err(Error::SealedKeyOpen)),
+                "{encoded} was accepted as a sealing recipient"
+            );
+            assert!(
+                matches!(
+                    SealedFabricKey::seal(&root, member, RosterVersion(1), &FabricKey::generate()),
+                    Err(Error::SealedKeyOpen)
+                ),
+                "{encoded} was sealed to"
+            );
+        }
+    }
+
+    /// Node ids that are not points at all are refused too — the pre-existing
+    /// half of the check, pinned so a refactor cannot drop it.
+    #[test]
+    fn undecompressable_member_keys_are_refused_by_seal() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        // A `y` whose corresponding `x^2` is a quadratic non-residue: no point
+        // on the curve has this compressed form.
+        let member = NodeId::from_hex(NOT_A_POINT).unwrap();
+        assert!(ed25519_dalek::VerifyingKey::from_bytes(member.as_bytes()).is_err());
+        assert!(matches!(
+            SealedFabricKey::seal(&root, member, RosterVersion(1), &FabricKey::generate()),
+            Err(Error::SealedKeyOpen)
+        ));
+    }
+
+    /// The second guard, tested directly: a non-contributory exchange (all-zero
+    /// shared secret) never yields a cipher, whichever side produced it.
+    #[test]
+    fn a_non_contributory_exchange_yields_no_cipher() {
+        let secret = x25519_dalek::StaticSecret::from([7u8; 32]);
+        // u = 0 is the Montgomery identity: every scalar multiple is zero.
+        let identity = x25519_dalek::PublicKey::from([0u8; 32]);
+        let shared = secret.diffie_hellman(&identity);
+        assert_eq!(shared.as_bytes(), &[0u8; 32]);
+        assert!(!shared.was_contributory());
+        assert!(matches!(
+            cipher_for(&shared, identity.as_bytes(), &[1u8; 32]),
+            Err(Error::SealedKeyOpen)
+        ));
+    }
+
+    /// The same guard on the opening side: an attacker-supplied blob whose
+    /// ephemeral public key is the Montgomery identity is refused rather than
+    /// decrypted under a publicly computable key.
+    #[test]
+    fn a_zero_ephemeral_public_is_refused_by_open() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let member = NodeIdentity::from_seed([2u8; 32]);
+        let member_id = member.node_id();
+        let alg = AlgorithmId::Ed25519;
+        let fabric = root.node_id();
+        // 32 zero bytes of "ephemeral public key" plus a plausible ct+tag.
+        let sealed = SealedBox::from_bytes(vec![0u8; EPHEMERAL_PUB_LEN + 32 + 16]);
+        let sig = root.sign(
+            &canonical_bytes(&SealedKeyBody {
+                format: SEALED_KEY_V1,
+                fabric: &fabric,
+                version: 1,
+                member: &member_id,
+                sealed: &sealed,
+                alg: &alg,
+            })
+            .unwrap(),
+        );
+        let blob = SealedFabricKey {
+            format: SEALED_KEY_V1,
+            fabric,
+            version: RosterVersion(1),
+            member: member_id,
+            sealed,
+            alg,
+            sig,
+        };
+        assert!(matches!(
+            blob.open(&member, root.node_id()),
+            Err(Error::SealedKeyOpen)
+        ));
     }
 
     /// `SealedBox` serializes as a lowercase-hex string.

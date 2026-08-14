@@ -52,7 +52,18 @@ pub enum AdmitFrame {
 }
 // encode() -> Result<Vec<u8>>; decode(buf) -> Result<Option<(AdmitFrame, usize)>>
 // (None until a whole frame arrives; garbage never panics)
+pub const MAX_ADMIT_FRAME: usize = 64 * 1024;
 ```
+
+The ceiling is part of the codec, not of the reader. `wires/topic-admit/1` is
+the one surface that runs **before any authorization** — the responder must read
+a whole `Request` before `check_topic_admission` can say anything — so a
+four-byte `FF FF FF FF` followed by a dribble would otherwise buffer 4 GiB per
+connection with no credential presented. `decode` returns `BadFrame` the instant
+an over-long length prefix lands (never `Ok(None)`), and `encode` refuses to
+emit one, so all three readers in the tree inherit one bound instead of each
+picking their own. (`wires/transport.rs`'s private `MAX_FRAME` is the Phase 1
+equivalent and stays as-is.)
 
 The envelope is unsigned; the signed objects inside (head; proof via root
 recomputation) carry the authority. Caller identity is NEVER a wire field — it is
@@ -80,9 +91,35 @@ pub fn check_topic_admission(
 Head selection: adopt the presented head iff `presented.version > local.version`
 AND `presented.verify(fabric_root)` passes AND it is fresh (not_after). Otherwise
 check against the local head. Then `policy::check_roster_inclusion(check_head,
-proof, fabric_root, caller, now)`. Anti-rollback is free: only strictly-newer
-verified heads are adopted; `roster-head.json` is highest-seen state. A proof
-against an older head fails `StaleProof`; the remedy is `wires import`.
+proof, fabric_root, caller, now)`. A proof against an older head fails
+`StaleProof`; the remedy is `wires import`.
+
+Anti-rollback is **not** free, because `local_head` is a snapshot the caller
+passed in and §2.3 has each admission independently re-loading `HeadSource`.
+Two admissions landing together — an honest peer with v5 (attacker removed) and
+the attacker with a genuine v4 — both read v3, both compute "advances", and a
+plain read-modify-write persists whichever lands last. The attacker picks its own
+dial timing, so it can lose that race on purpose and pin the victim on v4, which
+also defeats the §2.4 watchdog (it re-checks against the rolled-back head).
+
+The write is therefore a library-owned compare-and-swap:
+
+```rust
+pub fn adopt_if_newer(stored: &RosterHead, candidate: &RosterHead,
+                      fabric_root: NodeId, now_unix: i64) -> Option<RosterHead>;
+```
+
+Same predicate, re-run against the head as re-read at write time; the candidate
+is fully re-verified. Caller obligation, stated in the docs: **re-read, call,
+write, all under one exclusive lock.** `Admission.adopt` is never persisted
+directly. With that, `roster-head.json` really is highest-seen state and a
+rollback attempt really is a no-op.
+
+Known and accepted: a genuine newer head with a *nearer* `not_after` displaces a
+longer-lived older one. The root is the authority on the validity window as well
+as the member set, and keeping a superseded roster (with a removed member still
+admitted) is the worse failure; the cost is that a nearly-expired advance can
+leave a node admitting nobody until the next `wires import`.
 
 CRL is NOT consulted for topics: topic revocation is head-advance only.
 
@@ -137,10 +174,22 @@ CRL is NOT consulted for topics: topic revocation is head-advance only.
   `PublicKey::from` (the 2/3 split crosses only byte arrays, never types);
   recipient secret = `SigningKey::to_scalar_bytes()` → `StaticSecret::from`.
   Fresh `EphemeralSecret` per seal; AEAD key =
-  `blake3::derive_key("wires sealed-fabric-key v1", dh_shared)`;
+  `blake3::derive_key("wires sealed-fabric-key v1",
+  dh_shared ‖ ephemeral_pub ‖ member_pub)`;
   ChaCha20-Poly1305 with zero nonce (unique key per seal); AAD = canonical bytes
   of the sealing context `{format, fabric, version, member, alg}`.
   `sealed` = `ephemeral_pub(32) ‖ ct+tag`.
+- **Weak-key rejection (load-bearing).** Ed25519 decompression accepts
+  small-order points, and nothing upstream validates the bytes an operator types
+  into `roster add` — `0100…00` is a well-formed 64-hex "node id" that passes
+  every existing check. Sealing to one derives the AEAD key from an all-zero
+  Diffie–Hellman, i.e. a key anyone can compute from the public blob, which for a
+  token designed to be pasted through untrusted channels is a plaintext-
+  equivalent leak of the fabric-wide data key. So: `VerifyingKey::is_weak()`
+  refuses such recipients (`SealedKeyOpen`), `SharedSecret::was_contributory()`
+  is asserted on both the seal and open paths, and the derivation names both
+  public keys, which closes unknown-key-share variants generically rather than
+  one known family of bad inputs.
 - Forward secrecy honesty (module doc): rotation-at-commit only; long-term-seed
   compromise reads all history sealed to it; ratcheting deferred.
 
@@ -158,7 +207,9 @@ joiners can't read pre-join history). `wires import --fabric-key[-file]` opens
 ```rust
 pub const ENVELOPE_V1: u8 = 1;
 pub struct Seq(pub u64);                 // 0-based, dense, per publisher
+                                         // Seq::checked_next() -> Option<Seq>
 pub struct MessageHash([u8; 32]);        // hex serde; MessageHash::ZERO
+pub struct MessageNonce([u8; 12]);       // hex serde; MessageNonce::ZERO
 pub struct Ciphertext(Vec<u8>);          // hex serde
 
 pub struct TopicEnvelope {
@@ -169,6 +220,7 @@ pub struct TopicEnvelope {
     pub prev_hash: MessageHash,   // ZERO iff seq == 0
     pub key_version: RosterVersion,
     pub timestamp: i64,           // unix secs; informational, unverifiable
+    pub nonce: MessageNonce,      // synthetic IV (below)
     pub ciphertext: Ciphertext,
     pub alg: AlgorithmId,
     pub sig: Signature,           // sender-signed over canonical body
@@ -177,9 +229,32 @@ pub struct TopicEnvelope {
 
 - `seal(sender: &NodeIdentity, topic, seq, prev_hash, key_version, key,
   timestamp, plaintext) -> Result<TopicEnvelope>` — encrypt-then-sign. AAD =
-  canonical body with empty ciphertext; nonce =
-  `blake3(topic ‖ sender ‖ seq_le)[..12]` — deterministic, sound because publish
-  has a single seq allocator per (node, topic) (§7).
+  canonical body with empty ciphertext (the nonce is inside it); nonce =
+  **synthetic IV**, `blake3::derive_key("wires topic-envelope nonce v1",
+  key ‖ slot ‖ plaintext)[..12]`, where `slot` is the canonical body with an
+  empty ciphertext and a zero nonce.
+- **Why an SIV and not `blake3(topic ‖ sender ‖ seq)`.** The slot-keyed form
+  makes any seq rollback a keystream reuse under a still-current key: keys rotate
+  only on a root `roster commit`, while the seq allocator is the per-topic redb
+  file, so restoring `$WIRES_HOME` from an older backup, losing the topic db, or
+  pointing a second home at the same `--node-seed` republishes seq `0..N` with
+  different plaintexts under the same `key_version` — `C1 ⊕ C2 = P1 ⊕ P2`, and
+  the Poly1305 one-time key with it. The chain classifier calls the second
+  envelope a `Fork`, but only after it has been broadcast, which hands exactly
+  the adversary of `late_joiner_cannot_read_pre_join_history` the plaintext it is
+  not supposed to have. The SIV keeps every property the deterministic nonce was
+  chosen for — re-sealing an identical message in an identical slot is still
+  byte-identical, so an idempotent republish is a `Duplicate` — while making
+  reuse require the same plaintext too. `open` re-derives the nonce from the
+  recovered plaintext and rejects a mismatch, so a rolled-back or hostile sender
+  cannot serve two messages under one (key, nonce) pair either. Keying on the
+  fabric key means the nonce leaks nothing to a non-holder. The single-allocator
+  rule (§7) remains the primary guarantee; this is the defence behind it.
+- `Seq::checked_next() -> Option<Seq>`, never an unchecked `+ 1`: the value it
+  gets applied to arrives off the wire (`ReplayFrame::Request.hwm` carries a
+  peer-chosen `Seq` per publisher), where `u64::MAX` would panic under
+  `fastbuild`/`dbg` overflow checks and wrap to genesis — re-streaming a whole
+  log — under `--config=release`.
 - `verify()` — structure + sig only (no decrypt, no chain): envelopes are
   storable before their key arrives; a late-imported key heals display.
 - `open(&self, key: &FabricKey) -> Result<Vec<u8>>`.
@@ -230,8 +305,13 @@ pub enum ReplayFrame {
     End,
     Denied { reason: String },
 }
+pub const MAX_REPLAY_FRAME: usize = 1024 * 1024;
 ```
 
+- Same codec-owned ceiling as §2.1, and for the same reason: `hwm` and an
+  envelope's ciphertext are both unbounded collections chosen by the peer, and
+  "admitted" is a large set. `decode` refuses an over-long length prefix rather
+  than waiting for the body.
 - Server verifies presented hwm hashes against `hash_at`; on mismatch streams
   that sender FROM GENESIS so the requester's `classify_link` surfaces the fork
   (PoC never verified — silent divergence).
@@ -293,7 +373,14 @@ guarantee (PoC's publish-lock hazard resolved structurally).
   known-answer canonical bytes; seal/open roundtrips; wrong recipient/root/key;
   chain truth table; `check_topic_admission` matrix {older/equal/newer} ×
   {valid/forged/expired} × {fresh/stale/non-member} incl. "newer forged head is
-  NOT adopted"; DH agreement both directions.
+  NOT adopted"; DH agreement both directions. Plus the adversarial-review
+  regressions: weak/undecompressable member keys refused by `seal`, a
+  non-contributory exchange yields no cipher, a zero ephemeral public refused by
+  `open`; two different plaintexts in one slot never share a nonce (no two-time
+  pad) and a substituted nonce is refused by `open`; `Seq::MAX.checked_next()` is
+  `None` and the classifier is exercised at the ceiling; `adopt_if_newer` is
+  monotone under any interleaving (the late-older-writer race); an over-long
+  length prefix is `BadFrame` on both codecs, on decode and encode.
 - wires: store (idempotent/fork/fresh-empty/reopen/backfill); duplex admission
   tests; hermetic loopback QUIC (`presets::Minimal`, 2–3 endpoints, injected
   timeouts) — money shots: `revocation_evicts_neighbor_between_rechecks`,

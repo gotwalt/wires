@@ -133,16 +133,20 @@ pub mod topic;
 
 mod codec;
 
-pub use admission::{Admission, AdmitFrame, TOPIC_ADMIT_ALPN, check_topic_admission};
+pub use admission::{
+    Admission, AdmitFrame, MAX_ADMIT_FRAME, TOPIC_ADMIT_ALPN, adopt_if_newer, check_topic_admission,
+};
 pub use chain::{ChainState, LinkStatus, classify_link, next_prev_hash};
-pub use envelope::{Ciphertext, ENVELOPE_V1, MessageHash, Seq, TopicEnvelope};
+pub use envelope::{
+    Ciphertext, ENVELOPE_NONCE_CONTEXT, ENVELOPE_V1, MessageHash, MessageNonce, Seq, TopicEnvelope,
+};
 pub use error::{Error, Result};
-pub use fabric_key::{FabricKey, SEALED_KEY_V1, SealedBox, SealedFabricKey};
+pub use fabric_key::{FabricKey, SEALED_KEY_CONTEXT, SEALED_KEY_V1, SealedBox, SealedFabricKey};
 pub use grant::{AlgorithmId, Grant, Scope};
 pub use identity::{NodeId, NodeIdentity, Signature};
 pub use membership::{MEMBERSHIP_V1, Membership};
 pub use policy::{Crl, check_accept, check_inclusion, check_roster_inclusion};
-pub use replay::{ReplayFrame, TOPIC_REPLAY_ALPN};
+pub use replay::{MAX_REPLAY_FRAME, ReplayFrame, TOPIC_REPLAY_ALPN};
 pub use roster::{
     InclusionProof, MerkleRoot, MerkleStep, ROSTER_HEAD_V1, Roster, RosterHead, RosterVersion, Side,
 };

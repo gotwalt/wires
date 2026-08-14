@@ -16,13 +16,45 @@
 //! - **Chain link** — `prev_hash` is checked by [`crate::chain`], not here, so
 //!   verification never depends on having the rest of the log.
 //!
-//! # Nonce discipline
+//! # Nonce discipline: a synthetic IV, not a slot counter
 //!
-//! The AEAD nonce is `blake3(topic ‖ sender ‖ seq_le)[..12]` — deterministic,
-//! which is only safe because a `(node, topic)` pair has exactly one sequence
-//! allocator (the resident `wires tail` process). Reusing a seq under the same
-//! key would reuse a nonce, so seq allocation is structurally single-writer
-//! rather than lock-protected.
+//! The AEAD nonce is a **synthetic IV**: a keyed hash of the message and
+//! everything it claims about itself,
+//! `blake3::derive_key(ctx, fabric_key ‖ slot_bytes ‖ plaintext)[..12]`, carried
+//! on the wire as the signed [`nonce`](TopicEnvelope::nonce) field and
+//! re-derived and *checked* by [`open`](TopicEnvelope::open).
+//!
+//! It is deterministic — re-sealing an identical message in an identical slot
+//! is byte-identical, so an idempotent republish is a
+//! [`Duplicate`](crate::LinkStatus::Duplicate) rather than a fork — while a
+//! change in *anything*, the payload included, produces a fresh nonce.
+//!
+//! The obvious alternative, `blake3(topic ‖ sender ‖ seq)`, is what this
+//! replaces, and the reason is that it makes any sequence rollback a keystream
+//! reuse under a still-current fabric key. Keys rotate only on a root
+//! `roster commit`, while the seq allocator is a per-topic database: restore
+//! `$WIRES_HOME` from an older backup, lose the topic db, or point a second
+//! home at the same `--node-seed`, and the node republishes seq `0..N` with
+//! different plaintexts under the same key version. Same key, same nonce, two
+//! messages: `C1 ⊕ C2 = P1 ⊕ P2`, crib-draggable for chat text, and the
+//! Poly1305 one-time key for that nonce falls out with it. The chain classifier
+//! would call the second envelope a `Fork` — but only *after* it had been
+//! broadcast to every peer. A late joiner that is not supposed to be able to
+//! read pre-join history would hold the pair.
+//!
+//! With a synthetic IV, reuse requires the same key, the same slot, the same
+//! `prev_hash`, `key_version` and `timestamp`, **and** the same plaintext — at
+//! which point the two envelopes are the same envelope and reuse is harmless.
+//! [`open`](TopicEnvelope::open) re-derives the nonce after decrypting and
+//! rejects an envelope whose nonce is not the one its own contents imply, so a
+//! buggy or malicious sender cannot hand a reader a reused nonce either.
+//!
+//! Because the derivation is keyed on the fabric key, the nonce also leaks
+//! nothing to an observer who does not hold it.
+//!
+//! The operational rule still stands: a `(node, topic)` pair has exactly one
+//! sequence allocator (the resident `wires tail` process). This is what makes a
+//! rollback survivable rather than catastrophic, not a licence to skip it.
 //!
 //! # What is deliberately absent
 //!
@@ -50,23 +82,86 @@ pub const ENVELOPE_V1: u8 = 1;
 /// is used.
 const NONCE_LEN: usize = 12;
 
-/// The deterministic AEAD nonce for one `(topic, sender, seq)` slot:
-/// `blake3(topic ‖ sender ‖ seq_le)[..12]`.
+/// The blake3 `derive_key` context for the synthetic IV. Frozen: changing it
+/// makes every stored message unopenable.
+pub const ENVELOPE_NONCE_CONTEXT: &str = "wires topic-envelope nonce v1";
+
+/// An envelope's AEAD nonce: a synthetic IV, 12 bytes, lowercase-hex serde.
 ///
-/// Deterministic rather than random so that a re-seal of the same slot is
-/// byte-identical, and *safe* only because a `(node, topic)` pair has exactly
-/// one sequence allocator (see the module docs). `seq` is encoded
-/// little-endian; the three inputs are fixed-width except `seq`, which is last,
-/// so the concatenation is unambiguous.
-fn nonce_for(topic: &TopicId, sender: &NodeId, seq: Seq) -> [u8; NONCE_LEN] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(topic.as_bytes());
-    hasher.update(sender.as_bytes());
-    hasher.update(&seq.0.to_le_bytes());
-    let digest = hasher.finalize();
+/// A newtype rather than a bare `[u8; 12]` so it cannot be confused with the
+/// other byte blobs riding in the envelope, and so it canonicalizes the same
+/// way they do.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct MessageNonce([u8; NONCE_LEN]);
+
+impl MessageNonce {
+    /// The all-zero nonce — the placeholder used while deriving the real one
+    /// (see [`TopicEnvelope::seal`]), never a value a sealer emits except by a
+    /// 1-in-2^96 coincidence.
+    pub const ZERO: MessageNonce = MessageNonce([0u8; NONCE_LEN]);
+
+    /// Wrap raw nonce bytes.
+    pub fn from_bytes(bytes: [u8; NONCE_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the raw 12 nonce bytes.
+    pub fn as_bytes(&self) -> &[u8; NONCE_LEN] {
+        &self.0
+    }
+
+    /// Lowercase-hex rendering of the nonce.
+    pub fn hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    /// Parse a nonce from its lowercase-hex rendering.
+    ///
+    /// Returns [`crate::Error::BadHex`] for non-hex text and
+    /// [`crate::Error::BadKeyLength`] when the decoded byte count is not 12.
+    pub fn from_hex(s: &str) -> Result<MessageNonce> {
+        let bytes = hex::decode(s)?;
+        let arr: [u8; NONCE_LEN] = bytes.try_into().map_err(|_| Error::BadKeyLength)?;
+        Ok(MessageNonce(arr))
+    }
+}
+
+impl Serialize for MessageNonce {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for MessageNonce {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        let arr: [u8; NONCE_LEN] = bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("MessageNonce expects 12 bytes"))?;
+        Ok(MessageNonce(arr))
+    }
+}
+
+/// Derive the synthetic IV:
+/// `blake3::derive_key(ENVELOPE_NONCE_CONTEXT, key ‖ slot ‖ plaintext)[..12]`.
+///
+/// `slot` is the canonical JSON of the envelope body with an empty ciphertext
+/// and a [`MessageNonce::ZERO`] nonce — i.e. everything the envelope claims
+/// about itself, minus the two fields that depend on this derivation. Keying it
+/// on the fabric key makes the nonce a pseudorandom function of the message
+/// rather than a public fingerprint of it.
+///
+/// The three inputs are absorbed as separate `update` calls over a fixed-width
+/// key and a self-delimiting JSON object, so the concatenation is unambiguous.
+fn nonce_for(key: &FabricKey, slot: &[u8], plaintext: &[u8]) -> MessageNonce {
+    let mut hasher = blake3::Hasher::new_derive_key(ENVELOPE_NONCE_CONTEXT);
+    hasher.update(key.as_bytes());
+    hasher.update(slot);
+    hasher.update(plaintext);
     let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&digest.as_bytes()[..NONCE_LEN]);
-    nonce
+    hasher.finalize_xof().fill(&mut nonce);
+    MessageNonce(nonce)
 }
 
 /// A per-sender message sequence number: 0-based and dense (no holes), so a
@@ -78,9 +173,27 @@ impl Seq {
     /// The genesis sequence number.
     pub const ZERO: Seq = Seq(0);
 
-    /// The next sequence number after this one.
-    pub fn next(self) -> Seq {
-        Seq(self.0 + 1)
+    /// The last sequence number a publisher can ever occupy.
+    pub const MAX: Seq = Seq(u64::MAX);
+
+    /// The next sequence number after this one, or `None` at
+    /// [`Seq::MAX`] — the publisher's log is full and there is no slot to
+    /// allocate.
+    ///
+    /// Checked, not wrapping, because the value this is applied to comes off
+    /// the wire: a replay [`Request`](crate::ReplayFrame::Request) carries a
+    /// peer-chosen [`ChainState`](crate::ChainState) per publisher, and "the
+    /// slot after what you told me you hold" is the natural read cursor. An
+    /// unchecked `+ 1` there is a panic in a debug build and a silent wrap to
+    /// genesis — replaying a whole log from scratch — in a release one.
+    ///
+    /// ```
+    /// use library::Seq;
+    /// assert_eq!(Seq::ZERO.checked_next(), Some(Seq(1)));
+    /// assert_eq!(Seq::MAX.checked_next(), None);
+    /// ```
+    pub fn checked_next(self) -> Option<Seq> {
+        self.0.checked_add(1).map(Seq)
     }
 }
 
@@ -198,9 +311,18 @@ impl<'de> Deserialize<'de> for Ciphertext {
 /// canonical JSON to produce the exact bytes the sender signs and a verifier
 /// recomputes.
 ///
-/// The same struct, with `ciphertext` set to an empty [`Ciphertext`], is the
-/// AEAD associated data — so the encryption is bound to the topic, sender,
-/// sequence, link, key version, and timestamp it claims.
+/// The same struct serves three purposes, distinguished by what is put in its
+/// two derived fields:
+///
+/// | `ciphertext` | `nonce` | what the bytes are |
+/// |---|---|---|
+/// | real | real | the signing bytes |
+/// | empty | real | the AEAD associated data |
+/// | empty | [`MessageNonce::ZERO`] | the *slot* fed to [`nonce_for`] |
+///
+/// So the encryption is bound to the topic, sender, sequence, link, key
+/// version, timestamp and nonce it claims, and the nonce in turn is bound to
+/// everything but itself and the payload it protects.
 #[derive(Serialize)]
 struct EnvelopeBody<'a> {
     format: u8,
@@ -210,6 +332,7 @@ struct EnvelopeBody<'a> {
     prev_hash: &'a MessageHash,
     key_version: u64,
     timestamp: i64,
+    nonce: &'a MessageNonce,
     ciphertext: &'a Ciphertext,
     alg: &'a AlgorithmId,
 }
@@ -235,6 +358,10 @@ pub struct TopicEnvelope {
     /// The sender's clock at publish time, unix seconds. **Informational and
     /// unverifiable** — used only for display ordering, never for any decision.
     pub timestamp: i64,
+    /// The AEAD nonce: a synthetic IV over the fabric key, this body, and the
+    /// plaintext (see the module docs). Signed, and re-derived and checked by
+    /// [`open`](Self::open), so it is not a value a peer gets to choose freely.
+    pub nonce: MessageNonce,
     /// The encrypted payload.
     pub ciphertext: Ciphertext,
     /// Which scheme `sig` was produced with.
@@ -249,9 +376,11 @@ impl TopicEnvelope {
     ///
     /// The caller supplies `seq` and `prev_hash` from its chain state (see
     /// [`crate::chain::next_prev_hash`]) and `key_version` from the fabric key
-    /// it holds. The nonce is derived from `(topic, sender, seq)`, so calling
-    /// this twice with the same triple under the same key is a nonce reuse —
-    /// the single-allocator rule in the module docs is what prevents it.
+    /// it holds. The nonce is derived from the whole signed body, so calling
+    /// this twice with an identical body under the same key re-seals the same
+    /// envelope byte-for-byte (harmless), while a republish of the same slot
+    /// with anything else changed gets a fresh nonce. The single-allocator rule
+    /// in the module docs is still the primary guarantee.
     ///
     /// ```
     /// use library::{FabricKey, MessageHash, NodeIdentity, RosterVersion, Seq, TopicEnvelope, TopicId};
@@ -282,27 +411,36 @@ impl TopicEnvelope {
     ) -> Result<TopicEnvelope> {
         let alg = AlgorithmId::Ed25519;
         let sender_id = sender.node_id();
+        let empty = Ciphertext::from_bytes(Vec::new());
+        let body = |nonce: &MessageNonce, ciphertext: &Ciphertext| -> Result<Vec<u8>> {
+            canonical_bytes(&EnvelopeBody {
+                format: ENVELOPE_V1,
+                topic: &topic,
+                sender: &sender_id,
+                seq: seq.0,
+                prev_hash: &prev_hash,
+                key_version: key_version.0,
+                timestamp,
+                nonce,
+                ciphertext,
+                alg: &alg,
+            })
+        };
+
+        // The synthetic IV: derived from the slot (this body with no nonce and
+        // no ciphertext yet) *and* the plaintext, so no two distinct messages
+        // ever share one. See the module docs on nonce discipline.
+        let nonce = nonce_for(key, &body(&MessageNonce::ZERO, &empty)?, plaintext);
 
         // The AAD is the body with an *empty* ciphertext — the same bytes both
         // sides can compute, binding the payload to every other field.
-        let empty = Ciphertext::from_bytes(Vec::new());
-        let aad = canonical_bytes(&EnvelopeBody {
-            format: ENVELOPE_V1,
-            topic: &topic,
-            sender: &sender_id,
-            seq: seq.0,
-            prev_hash: &prev_hash,
-            key_version: key_version.0,
-            timestamp,
-            ciphertext: &empty,
-            alg: &alg,
-        })?;
+        let aad = body(&nonce, &empty)?;
 
         let cipher = ChaCha20Poly1305::new(&Key::from(*key.as_bytes()));
         let ciphertext = Ciphertext::from_bytes(
             cipher
                 .encrypt(
-                    &Nonce::from(nonce_for(&topic, &sender_id, seq)),
+                    &Nonce::from(*nonce.as_bytes()),
                     Payload {
                         msg: plaintext,
                         aad: &aad,
@@ -311,17 +449,7 @@ impl TopicEnvelope {
                 .map_err(|_| Error::SealedKeyOpen)?,
         );
 
-        let sig = sender.sign(&canonical_bytes(&EnvelopeBody {
-            format: ENVELOPE_V1,
-            topic: &topic,
-            sender: &sender_id,
-            seq: seq.0,
-            prev_hash: &prev_hash,
-            key_version: key_version.0,
-            timestamp,
-            ciphertext: &ciphertext,
-            alg: &alg,
-        })?);
+        let sig = sender.sign(&body(&nonce, &ciphertext)?);
 
         Ok(TopicEnvelope {
             format: ENVELOPE_V1,
@@ -331,16 +459,18 @@ impl TopicEnvelope {
             prev_hash,
             key_version,
             timestamp,
+            nonce,
             ciphertext,
             alg,
             sig,
         })
     }
 
-    /// This envelope's body, with `ciphertext` replaced by `ciphertext` —
-    /// the real payload for [`signing_bytes`](Self::signing_bytes), an empty
-    /// one for the AEAD associated data.
-    fn body<'a>(&'a self, ciphertext: &'a Ciphertext) -> EnvelopeBody<'a> {
+    /// This envelope's body with `ciphertext` and `nonce` substituted — the
+    /// real values for [`signing_bytes`](Self::signing_bytes), an empty
+    /// ciphertext for the AEAD associated data, and a zero nonce on top of that
+    /// for the slot bytes [`nonce_for`] hashes.
+    fn body<'a>(&'a self, nonce: &'a MessageNonce, ciphertext: &'a Ciphertext) -> EnvelopeBody<'a> {
         EnvelopeBody {
             format: self.format,
             topic: &self.topic,
@@ -349,6 +479,7 @@ impl TopicEnvelope {
             prev_hash: &self.prev_hash,
             key_version: self.key_version.0,
             timestamp: self.timestamp,
+            nonce,
             ciphertext,
             alg: &self.alg,
         }
@@ -378,25 +509,38 @@ impl TopicEnvelope {
     /// [`crate::Error::SealedKeyOpen`] — the crate's single "an AEAD open
     /// failed" error, kept distinct from the sender-signature failure
     /// [`verify`](Self::verify) reports.
+    ///
+    /// After a successful decryption the synthetic IV is **re-derived from the
+    /// recovered plaintext and compared**. An envelope whose `nonce` is not the
+    /// one its own contents imply is rejected, also as
+    /// [`crate::Error::SealedKeyOpen`]: that is what stops a sender — buggy,
+    /// rolled back, or hostile — from handing readers two different messages
+    /// under one (key, nonce) pair.
     pub fn open(&self, key: &FabricKey) -> Result<Vec<u8>> {
         let empty = Ciphertext::from_bytes(Vec::new());
-        let aad = canonical_bytes(&self.body(&empty))?;
+        let aad = canonical_bytes(&self.body(&self.nonce, &empty))?;
         let cipher = ChaCha20Poly1305::new(&Key::from(*key.as_bytes()));
-        cipher
+        let plaintext = cipher
             .decrypt(
-                &Nonce::from(nonce_for(&self.topic, &self.sender, self.seq)),
+                &Nonce::from(*self.nonce.as_bytes()),
                 Payload {
                     msg: self.ciphertext.as_bytes(),
                     aad: &aad,
                 },
             )
-            .map_err(|_| Error::SealedKeyOpen)
+            .map_err(|_| Error::SealedKeyOpen)?;
+
+        let slot = canonical_bytes(&self.body(&MessageNonce::ZERO, &empty))?;
+        if nonce_for(key, &slot, &plaintext) != self.nonce {
+            return Err(Error::SealedKeyOpen);
+        }
+        Ok(plaintext)
     }
 
     /// The exact canonical bytes covered by [`sig`](Self::sig) — every field
     /// except the signature itself.
     pub fn signing_bytes(&self) -> Result<Vec<u8>> {
-        canonical_bytes(&self.body(&self.ciphertext))
+        canonical_bytes(&self.body(&self.nonce, &self.ciphertext))
     }
 
     /// This message's link hash: `blake3(signing_bytes())`. The value a
@@ -448,6 +592,14 @@ mod tests {
 
     fn payload() -> impl Strategy<Value = Vec<u8>> {
         proptest::collection::vec(any::<u8>(), 0..256)
+    }
+
+    /// The synthetic IV an envelope *should* carry, recomputed from the outside
+    /// the way [`TopicEnvelope::open`] does.
+    fn expected_nonce(env: &TopicEnvelope, key: &FabricKey, plaintext: &[u8]) -> MessageNonce {
+        let empty = Ciphertext::from_bytes(Vec::new());
+        let slot = canonical_bytes(&env.body(&MessageNonce::ZERO, &empty)).unwrap();
+        nonce_for(key, &slot, plaintext)
     }
 
     /// The pieces every envelope needs, drawn together so each property test
@@ -630,6 +782,14 @@ mod tests {
             prop_assert!(matches!(t.verify(), Err(Error::InvalidSignature)));
             prop_assert!(t.open(&key).is_err());
 
+            // nonce — signed, and inside the AAD, so both gates catch it.
+            let mut t = base.clone();
+            let mut nonce = *t.nonce.as_bytes();
+            nonce[0] ^= 0x01;
+            t.nonce = MessageNonce::from_bytes(nonce);
+            prop_assert!(matches!(t.verify(), Err(Error::InvalidSignature)));
+            prop_assert!(matches!(t.open(&key), Err(Error::SealedKeyOpen)));
+
             // ciphertext — signed, and its own AEAD tag also catches it.
             let mut t = base.clone();
             let mut ct = t.ciphertext.as_bytes().to_vec();
@@ -668,44 +828,111 @@ mod tests {
             prop_assert!(matches!(t.open(&p.key()), Err(Error::SealedKeyOpen)));
         }
 
-        /// The nonce is a deterministic function of `(topic, sender, seq)` and
-        /// nothing else.
+        /// The synthetic IV an envelope carries is exactly the one its own
+        /// contents imply, and it is reproducible: re-sealing the same message
+        /// in the same slot under the same key derives the same nonce.
         #[test]
-        fn nonce_is_deterministic(p in parts()) {
-            let (topic, sender) = (p.topic(), p.sender().node_id());
-            prop_assert_eq!(
-                nonce_for(&topic, &sender, Seq(p.seq)),
-                nonce_for(&topic, &sender, Seq(p.seq))
-            );
+        fn nonce_is_the_synthetic_iv_of_its_own_contents(p in parts(), msg in payload()) {
+            let env = p.seal(&msg);
+            prop_assert_eq!(env.nonce, expected_nonce(&env, &p.key(), &msg));
+            prop_assert_eq!(env.nonce, p.seal(&msg).nonce);
         }
 
         /// Distinct sequence numbers give distinct nonces — the property the
         /// single-allocator rule turns into nonce-reuse safety.
         #[test]
-        fn nonce_differs_per_seq(p in parts(), other in any::<u64>()) {
+        fn nonce_differs_per_seq(p in parts(), msg in payload(), other in any::<u64>()) {
             prop_assume!(other != p.seq);
-            let (topic, sender) = (p.topic(), p.sender().node_id());
-            prop_assert_ne!(
-                nonce_for(&topic, &sender, Seq(p.seq)),
-                nonce_for(&topic, &sender, Seq(other))
-            );
+            let mut q = p.clone();
+            q.seq = other;
+            prop_assert_ne!(p.seal(&msg).nonce, q.seal(&msg).nonce);
         }
 
         /// Distinct senders and distinct topics also give distinct nonces, so
         /// two publishers sharing a fabric key never collide.
         #[test]
-        fn nonce_differs_per_sender_and_topic(p in parts(), other in seed()) {
+        fn nonce_differs_per_sender_and_topic(p in parts(), msg in payload(), other in seed()) {
             prop_assume!(other != p.sender_seed && other != p.fabric_seed);
-            let (topic, sender) = (p.topic(), p.sender().node_id());
-            let other_id = NodeIdentity::from_seed(other).node_id();
-            prop_assert_ne!(
-                nonce_for(&topic, &sender, Seq(p.seq)),
-                nonce_for(&topic, &other_id, Seq(p.seq))
-            );
-            prop_assert_ne!(
-                nonce_for(&topic, &sender, Seq(p.seq)),
-                nonce_for(&TopicId::derive(other_id, "elsewhere"), &sender, Seq(p.seq))
-            );
+            let base = p.seal(&msg).nonce;
+
+            let mut q = p.clone();
+            q.sender_seed = other;
+            prop_assert_ne!(base, q.seal(&msg).nonce);
+
+            let mut q = p.clone();
+            q.fabric_seed = other;
+            prop_assert_ne!(base, q.seal(&msg).nonce);
+        }
+
+        /// Distinct *keys* give distinct nonces: the synthetic IV is keyed, so
+        /// it is a pseudorandom function of the message rather than a public
+        /// fingerprint an observer could match against a guessed plaintext.
+        #[test]
+        fn nonce_differs_per_key(p in parts(), msg in payload(), other in seed()) {
+            prop_assume!(other != p.key_bytes);
+            let mut q = p.clone();
+            q.key_bytes = other;
+            prop_assert_ne!(p.seal(&msg).nonce, q.seal(&msg).nonce);
+        }
+
+        /// **The rollback property.** Two different messages in the *same slot*
+        /// under the *same key* — what a node restored from an old backup
+        /// republishes — never share a nonce, so they never share a keystream.
+        ///
+        /// This is the whole reason the nonce is a synthetic IV rather than
+        /// `blake3(topic ‖ sender ‖ seq)`: under that derivation these two
+        /// ciphertexts would XOR to the XOR of their plaintexts, handing anyone
+        /// who holds both (a late joiner replaying history, say) the plaintext
+        /// of messages it was never given a key for.
+        #[test]
+        fn republishing_a_slot_with_different_content_never_reuses_the_keystream(
+            p in parts(),
+            a in payload(),
+            b in payload(),
+        ) {
+            prop_assume!(a != b);
+            // Byte-for-byte the same slot: same topic, sender, seq, prev_hash,
+            // key_version, key — and the same timestamp, so not even the clock
+            // is doing the work here.
+            let before = p.seal(&a);
+            let after = p.seal(&b);
+
+            prop_assert_eq!(before.seq, after.seq);
+            prop_assert_eq!(before.sender, after.sender);
+            prop_assert_eq!(before.topic, after.topic);
+            prop_assert_eq!(before.timestamp, after.timestamp);
+            prop_assert_ne!(before.nonce, after.nonce);
+
+            // The concrete consequence: no two-time pad. Under a shared
+            // keystream the ciphertexts' XOR would equal the plaintexts' XOR
+            // over the overlapping prefix.
+            let n = a.len().min(b.len());
+            if n > 0 {
+                let ct_xor: Vec<u8> = before.ciphertext.as_bytes()[..n]
+                    .iter()
+                    .zip(&after.ciphertext.as_bytes()[..n])
+                    .map(|(x, y)| x ^ y)
+                    .collect();
+                let pt_xor: Vec<u8> = a[..n].iter().zip(&b[..n]).map(|(x, y)| x ^ y).collect();
+                prop_assert_ne!(ct_xor, pt_xor);
+            }
+        }
+
+        /// A hand-picked nonce is not accepted: `open` re-derives the synthetic
+        /// IV from the recovered plaintext, so a sender cannot serve two
+        /// messages under one (key, nonce) pair even by re-signing.
+        #[test]
+        fn a_substituted_nonce_is_refused_by_open(p in parts(), msg in payload(), fake in proptest::array::uniform12(any::<u8>())) {
+            let base = p.seal(&msg);
+            prop_assume!(fake != *base.nonce.as_bytes());
+
+            let mut t = base.clone();
+            t.nonce = MessageNonce::from_bytes(fake);
+            // Re-signed, so the signature is genuine again...
+            t.sig = p.sender().sign(&t.signing_bytes().unwrap());
+            prop_assert!(t.verify().is_ok());
+            // ...and the AEAD refuses it, because the nonce is in the AAD.
+            prop_assert!(matches!(t.open(&p.key()), Err(Error::SealedKeyOpen)));
         }
 
         /// Sealing the same slot twice is byte-identical: the nonce is
@@ -774,6 +1001,9 @@ mod tests {
         }
     }
 
+    /// The frozen synthetic IV of [`fixture`]'s envelope.
+    const NONCE_KNOWN_ANSWER: &str = "ab26c73b6e96e3a875c9b4ee";
+
     fn fixture() -> (Parts, TopicEnvelope) {
         let p = Parts {
             sender_seed: [2u8; 32],
@@ -806,13 +1036,16 @@ mod tests {
     }
 
     /// The AAD is the signing body with an emptied `ciphertext` — same key set,
-    /// one differing value. Pins the "AAD = body minus payload" rule.
+    /// one differing value. Pins the "AAD = body minus payload" rule, and that
+    /// the nonce rides *inside* the AAD (which is what makes a substituted
+    /// nonce fail the tag).
     #[test]
     fn aad_is_the_body_with_an_empty_ciphertext() {
         let (_, env) = fixture();
         let empty = Ciphertext::from_bytes(Vec::new());
         let aad: serde_json::Value =
-            serde_json::from_slice(&canonical_bytes(&env.body(&empty)).unwrap()).unwrap();
+            serde_json::from_slice(&canonical_bytes(&env.body(&env.nonce, &empty)).unwrap())
+                .unwrap();
         let signed: serde_json::Value =
             serde_json::from_slice(&env.signing_bytes().unwrap()).unwrap();
 
@@ -822,6 +1055,18 @@ mod tests {
         );
         assert_eq!(aad["ciphertext"], serde_json::json!(""));
         assert_ne!(signed["ciphertext"], serde_json::json!(""));
+        assert_eq!(aad["nonce"], serde_json::json!(env.nonce.hex()));
+
+        // And the slot bytes are the AAD with the nonce zeroed — the only
+        // difference, so the nonce derivation cannot depend on itself.
+        let slot: serde_json::Value = serde_json::from_slice(
+            &canonical_bytes(&env.body(&MessageNonce::ZERO, &empty)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(slot["nonce"], serde_json::json!("0".repeat(24)));
+        let mut expected = aad.as_object().unwrap().clone();
+        expected["nonce"] = serde_json::json!("0".repeat(24));
+        assert_eq!(slot.as_object().unwrap(), &expected);
     }
 
     /// Known answer: the signed body canonicalizes to exactly these bytes
@@ -834,6 +1079,7 @@ mod tests {
         let prev_hash = MessageHash::ZERO;
         let ciphertext = Ciphertext::from_bytes(vec![0xab, 0xcd]);
         let alg = AlgorithmId::Ed25519;
+        let nonce = MessageNonce::from_bytes([0xee; NONCE_LEN]);
         let body = EnvelopeBody {
             format: ENVELOPE_V1,
             topic: &topic,
@@ -842,11 +1088,13 @@ mod tests {
             prev_hash: &prev_hash,
             key_version: 5,
             timestamp: 1_700_000_000,
+            nonce: &nonce,
             ciphertext: &ciphertext,
             alg: &alg,
         };
         let expected = format!(
-            r#"{{"alg":"ed25519","ciphertext":"abcd","format":1,"key_version":5,"prev_hash":"{}","sender":"{}","seq":0,"timestamp":1700000000,"topic":"{}"}}"#,
+            r#"{{"alg":"ed25519","ciphertext":"abcd","format":1,"key_version":5,"nonce":"{}","prev_hash":"{}","sender":"{}","seq":0,"timestamp":1700000000,"topic":"{}"}}"#,
+            "ee".repeat(12),
             "00".repeat(32),
             "11".repeat(32),
             "22".repeat(32),
@@ -854,36 +1102,79 @@ mod tests {
         assert_eq!(canonical_bytes(&body).unwrap(), expected.into_bytes());
     }
 
-    /// Known answer: the nonce derivation for a fixed slot is frozen — a change
-    /// would make every stored message unopenable.
+    /// Known answer: the synthetic-IV derivation is frozen — a change would make
+    /// every stored message unopenable.
     #[test]
     fn nonce_known_answer() {
-        let topic = TopicId::from_bytes([0x22u8; 32]);
-        let sender = NodeId::from_bytes([0x11u8; 32]);
+        let (_, env) = fixture();
         assert_eq!(
-            hex::encode(nonce_for(&topic, &sender, Seq(0))),
-            "c87a7c727b6b4b03cad0c623"
+            env.nonce.hex(),
+            NONCE_KNOWN_ANSWER,
+            "the nonce derivation is frozen; changing it orphans stored history"
         );
-        assert_eq!(
-            hex::encode(nonce_for(&topic, &sender, Seq(1))),
-            "0bd074e2fe7049c653056490"
-        );
+        assert_eq!(ENVELOPE_NONCE_CONTEXT, "wires topic-envelope nonce v1");
     }
 
-    /// The nonce matches the documented formula computed a second way.
+    /// The nonce matches the documented formula computed a second way: the
+    /// first 12 bytes of `derive_key(context, key ‖ slot ‖ plaintext)`, where
+    /// the slot is the signed body with an empty ciphertext and a zero nonce.
     #[test]
     fn nonce_matches_documented_formula() {
-        let topic = TopicId::from_bytes([0x22u8; 32]);
-        let sender = NodeId::from_bytes([0x11u8; 32]);
-        let mut material = Vec::new();
-        material.extend_from_slice(topic.as_bytes());
-        material.extend_from_slice(sender.as_bytes());
-        material.extend_from_slice(&7u64.to_le_bytes());
-        let expected = blake3::hash(&material);
+        let (p, env) = fixture();
+        let empty = Ciphertext::from_bytes(Vec::new());
+        let slot = canonical_bytes(&env.body(&MessageNonce::ZERO, &empty)).unwrap();
+
+        let mut hasher = blake3::Hasher::new_derive_key(ENVELOPE_NONCE_CONTEXT);
+        hasher.update(p.key().as_bytes());
+        hasher.update(&slot);
+        hasher.update(b"ship it");
+        let mut expected = [0u8; NONCE_LEN];
+        hasher.finalize_xof().fill(&mut expected);
+
+        assert_eq!(env.nonce, MessageNonce::from_bytes(expected));
+        assert_eq!(env.nonce, expected_nonce(&env, &p.key(), b"ship it"));
+    }
+
+    /// The payload is part of the derivation, so two different messages in one
+    /// slot get different nonces even when every signed field but the payload
+    /// matches — the case a body-only derivation would miss. Written as a
+    /// known-answer pair so a regression to `blake3(topic ‖ sender ‖ seq)` (or
+    /// to any slot-only formula) fails here loudly.
+    #[test]
+    fn the_payload_is_part_of_the_nonce() {
+        let (p, env) = fixture();
+        // Same length, so even the ciphertext length is identical.
+        let other = p.seal(b"other!!");
+        assert_eq!(env.ciphertext.len(), other.ciphertext.len());
+        assert_eq!(env.seq, other.seq);
+        assert_eq!(env.timestamp, other.timestamp);
+        assert_ne!(env.nonce, other.nonce);
+        assert_eq!(env.nonce.hex(), NONCE_KNOWN_ANSWER);
+    }
+
+    /// `MessageNonce` hex round-trips and rejects the wrong width.
+    #[test]
+    fn message_nonce_hex_roundtrips() {
+        let nonce = MessageNonce::from_bytes([0xab; NONCE_LEN]);
+        assert_eq!(nonce.hex(), "ab".repeat(12));
+        assert_eq!(MessageNonce::from_hex(&nonce.hex()).unwrap(), nonce);
         assert_eq!(
-            nonce_for(&topic, &sender, Seq(7)),
-            expected.as_bytes()[..NONCE_LEN]
+            serde_json::to_string(&nonce).unwrap(),
+            format!("\"{}\"", "ab".repeat(12))
         );
+        assert_eq!(
+            serde_json::from_str::<MessageNonce>(&format!("\"{}\"", nonce.hex())).unwrap(),
+            nonce
+        );
+        assert!(matches!(
+            MessageNonce::from_hex("00"),
+            Err(Error::BadKeyLength)
+        ));
+        assert!(matches!(
+            MessageNonce::from_hex(&"z".repeat(24)),
+            Err(Error::BadHex(_))
+        ));
+        assert_eq!(MessageNonce::ZERO.hex(), "0".repeat(24));
     }
 
     /// A future format version is rejected outright.
@@ -894,12 +1185,23 @@ mod tests {
         assert!(matches!(env.verify(), Err(Error::UnsupportedVersion)));
     }
 
-    /// `Seq` helpers behave: `ZERO` is genesis and `next` increments.
+    /// `Seq` helpers behave: `ZERO` is genesis, `checked_next` increments — and
+    /// stops at the ceiling instead of overflowing.
+    ///
+    /// The ceiling is not hypothetical: a replay `Request` carries a peer-chosen
+    /// `ChainState` per publisher, so `u64::MAX` is a value an admitted peer can
+    /// simply assert. An unchecked `+ 1` would panic the connection task in a
+    /// debug build and wrap to genesis — re-streaming an entire log — in a
+    /// release one.
     #[test]
     fn seq_helpers() {
         assert_eq!(Seq::ZERO, Seq(0));
-        assert_eq!(Seq::ZERO.next(), Seq(1));
+        assert_eq!(Seq::ZERO.checked_next(), Some(Seq(1)));
         assert!(Seq(1) > Seq(0));
+
+        assert_eq!(Seq::MAX, Seq(u64::MAX));
+        assert_eq!(Seq(u64::MAX - 1).checked_next(), Some(Seq::MAX));
+        assert_eq!(Seq::MAX.checked_next(), None);
     }
 
     /// `MessageHash::ZERO` is the genesis link and nothing else.

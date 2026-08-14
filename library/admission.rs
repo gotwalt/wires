@@ -28,12 +28,36 @@
 //! # Head selection and anti-rollback
 //!
 //! A peer may present a head newer than the local one. It is adopted only if it
-//! is strictly newer, verifies under the fabric root, and is fresh; the caller
-//! then persists it, which makes admission a passive distribution channel for
-//! head advances. Because only strictly-newer verified heads are ever adopted,
-//! the stored head is a highest-seen watermark and a rollback attempt is a
-//! no-op. A proof against an older head fails with
-//! [`crate::Error::StaleProof`]; the remedy is `wires import`.
+//! is strictly newer *than the head it was compared against*, verifies under
+//! the fabric root, and is fresh; the caller then persists it, which makes
+//! admission a passive distribution channel for head advances. A proof against
+//! an older head fails with [`crate::Error::StaleProof`]; the remedy is
+//! `wires import`.
+//!
+//! **"Strictly newer" is only monotone if the persist step says so.**
+//! [`check_topic_admission`] compares against the `local_head` snapshot the
+//! caller passed in, and that snapshot goes stale the moment another admission
+//! adopts something. Two connections landing together — an honest peer with v5
+//! in which an attacker was removed, the attacker itself with a genuine v4 in
+//! which it is still a member — both read v3, both compute "advances", and a
+//! plain read-modify-write persists whichever finishes last. The attacker
+//! controls its own dial timing and retry count, so it can lose that race on
+//! purpose until v4 lands after v5 and pins the victim on a roster it has been
+//! removed from, defeating the watchdog that re-checks against the stored head.
+//!
+//! The fix is not more checking here; it is that the *write* must be a
+//! compare-and-swap. [`adopt_if_newer`] is that comparison, re-run against the
+//! head as freshly re-read under the caller's exclusive lock. Callers persist
+//! through it and nothing else; then the stored head really is a highest-seen
+//! watermark and a rollback attempt really is a no-op.
+//!
+//! One consequence is deliberate and worth naming: a genuinely root-signed
+//! newer head with a *nearer* `not_after` displaces a longer-lived older one.
+//! The root is the authority on both the member set and the validity window,
+//! and preferring the older head would mean preferring a roster the root has
+//! superseded — a removed member staying admitted is the worse failure. The
+//! visible cost is that a nearly-expired advance can leave a node admitting
+//! nobody until the next `wires import`.
 //!
 //! Note the CRL is **not** consulted here. On topics, revocation is head
 //! advance and nothing else — one mechanism, no second list to keep in sync.
@@ -51,6 +75,24 @@ use crate::topic::TopicId;
 /// `Router` as gossip and replay — a second `Router` would clobber the first's
 /// ALPN set.
 pub const TOPIC_ADMIT_ALPN: &[u8] = b"wires/topic-admit/1";
+
+/// The largest admission frame this protocol will encode or decode: 64 KiB.
+///
+/// The ceiling lives next to the codec, not in the reader, because
+/// [`TOPIC_ADMIT_ALPN`] is the one surface that runs **before any
+/// authorization**: the responder must read a whole
+/// [`Request`](AdmitFrame::Request) before [`check_topic_admission`] can say
+/// anything about the peer. Without a cap, `FF FF FF FF` followed by a dribble
+/// of bytes makes the responder buffer 4 GiB per connection for free — a remote
+/// OOM needing no credential at all. [`AdmitFrame::decode`] refuses an
+/// over-long length prefix the instant the four length bytes land, so a reader
+/// that stops on `Err` never allocates past this bound.
+///
+/// 64 KiB is roughly three orders of magnitude of headroom: the frame carries
+/// one [`RosterHead`] plus one [`InclusionProof`], whose Merkle path is
+/// logarithmic in the roster size (a million-member roster proves in twenty
+/// hex-encoded hashes).
+pub const MAX_ADMIT_FRAME: usize = 64 * 1024;
 
 const TAG_REQUEST: u8 = 0;
 const TAG_ACK: u8 = 1;
@@ -164,6 +206,9 @@ impl AdmitFrame {
                 payload.extend_from_slice(reason.as_bytes());
             }
         }
+        if payload.len() > MAX_ADMIT_FRAME {
+            return Err(Error::BadFrame);
+        }
         let len: u32 = payload.len().try_into().map_err(|_| Error::BadFrame)?;
         let mut out = Vec::with_capacity(4 + payload.len());
         out.extend_from_slice(&len.to_be_bytes());
@@ -177,11 +222,19 @@ impl AdmitFrame {
     /// `Ok(Some((frame, consumed)))` otherwise, and
     /// [`crate::Error::BadFrame`] / [`crate::Error::Decode`] on a malformed
     /// frame. Never panics.
+    ///
+    /// A length prefix claiming more than [`MAX_ADMIT_FRAME`] bytes is
+    /// [`crate::Error::BadFrame`] immediately — *not* `Ok(None)` — so a reader
+    /// that stops on `Err` never buffers more than the cap. This is the whole
+    /// memory bound on the pre-authorization surface; see [`MAX_ADMIT_FRAME`].
     pub fn decode(buf: &[u8]) -> Result<Option<(AdmitFrame, usize)>> {
         if buf.len() < 4 {
             return Ok(None);
         }
         let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if len > MAX_ADMIT_FRAME {
+            return Err(Error::BadFrame);
+        }
         let end = 4 + len;
         if buf.len() < end {
             return Ok(None);
@@ -224,6 +277,10 @@ pub struct Admission {
     /// one and verified: the caller persists it, which is how head advances
     /// spread without a separate distribution channel. `None` means the local
     /// head was used as-is.
+    ///
+    /// Persist it **through [`adopt_if_newer`]**, under the same lock that
+    /// re-reads the stored head — this value was judged against a snapshot, and
+    /// a bare write of it is a rollback waiting for a concurrent admission.
     pub adopt: Option<RosterHead>,
 }
 
@@ -277,15 +334,14 @@ pub fn check_topic_admission(
     // A head advance is only an advance if it is strictly newer, genuinely the
     // fabric root's, and still alive. Anything else — an older head, a
     // re-presentation of the one we hold, a forged "v+1", an expired commit —
-    // leaves the local head in charge, which is what makes the stored head a
-    // highest-seen watermark and a rollback attempt a no-op.
-    let advances = presented_head.version > local_head.version
-        && presented_head.verify(fabric_root).is_ok()
-        && now_unix <= presented_head.not_after;
-    let (head, adopt) = if advances {
-        (presented_head, Some(presented_head.clone()))
+    // leaves the local head in charge. The same predicate runs again in
+    // `adopt_if_newer` when the caller actually writes, which is what makes the
+    // stored head monotone under concurrent admissions.
+    let adopt = adopt_if_newer(local_head, presented_head, fabric_root, now_unix);
+    let head = if adopt.is_some() {
+        presented_head
     } else {
-        (local_head, None)
+        local_head
     };
     // The chosen head is re-verified here (freshness, fabric pin, signature)
     // together with the proof, so the local-head path fails closed too.
@@ -294,6 +350,54 @@ pub fn check_topic_admission(
         version: head.version,
         adopt,
     })
+}
+
+/// The compare-and-swap behind persisting an
+/// [`Admission::adopt`]: `Some(candidate)` iff `candidate` is *still* a genuine
+/// advance over `stored`, `None` otherwise (in which case the caller writes
+/// nothing).
+///
+/// [`check_topic_admission`] judged the candidate against a snapshot taken when
+/// the connection arrived. This re-judges it against the head as it is at the
+/// moment of writing, which is the only comparison that makes the stored head
+/// monotone. The caller's obligation is the ordinary one for a
+/// compare-and-swap: **re-read `stored`, call this, and write, all under the
+/// same exclusive lock** — otherwise two connections can still interleave a
+/// read-modify-write and the later, older writer wins.
+///
+/// The candidate is fully re-verified here (root signature, fabric pin,
+/// freshness), not taken on trust from the earlier decision: by the time a head
+/// is being written to disk it may have crossed a task boundary, and a
+/// re-verification costs one signature check.
+///
+/// ```
+/// use library::{adopt_if_newer, NodeIdentity, Roster, RosterVersion};
+/// let root = NodeIdentity::from_seed([1u8; 32]);
+/// let member = NodeIdentity::from_seed([2u8; 32]).node_id();
+/// let mut roster = Roster::new(root.node_id());
+/// roster.insert(member);
+///
+/// let (v1, _) = roster.commit(&root, 0, i64::MAX).unwrap();
+/// roster.insert(NodeIdentity::from_seed([3u8; 32]).node_id());
+/// let (v2, _) = roster.commit(&root, 0, i64::MAX).unwrap();
+///
+/// // The advance is taken...
+/// assert_eq!(adopt_if_newer(&v1, &v2, root.node_id(), 0).as_ref(), Some(&v2));
+/// // ...and the racing writer that still believes v1 is current is a no-op,
+/// // rather than rolling the stored head back a version.
+/// assert_eq!(adopt_if_newer(&v2, &v1, root.node_id(), 0), None);
+/// assert_eq!(adopt_if_newer(&v2, &v2, root.node_id(), 0), None);
+/// ```
+pub fn adopt_if_newer(
+    stored: &RosterHead,
+    candidate: &RosterHead,
+    fabric_root: NodeId,
+    now_unix: i64,
+) -> Option<RosterHead> {
+    let advances = candidate.version > stored.version
+        && candidate.verify(fabric_root).is_ok()
+        && now_unix <= candidate.not_after;
+    advances.then(|| candidate.clone())
 }
 
 #[cfg(test)]
@@ -486,6 +590,61 @@ mod tests {
             AdmitFrame::decode(&[0, 0, 0, 1, 9]),
             Err(Error::BadFrame)
         ));
+    }
+
+    /// The memory bound on the *pre-authorization* surface. An unadmitted peer
+    /// that writes `FF FF FF FF` and then dribbles must be refused as soon as
+    /// the length prefix lands: waiting for the body is exactly the 4-GiB
+    /// buffer this cap exists to prevent, and on this ALPN the peer has
+    /// presented no credential yet.
+    #[test]
+    fn an_oversized_length_prefix_is_refused_before_any_buffering() {
+        assert!(matches!(
+            AdmitFrame::decode(&[0xff, 0xff, 0xff, 0xff]),
+            Err(Error::BadFrame)
+        ));
+        // One byte over is over; the cap itself is a legal frame size and so
+        // still reports "not yet complete".
+        let over = ((MAX_ADMIT_FRAME + 1) as u32).to_be_bytes();
+        assert!(matches!(AdmitFrame::decode(&over), Err(Error::BadFrame)));
+        let at = (MAX_ADMIT_FRAME as u32).to_be_bytes();
+        assert!(AdmitFrame::decode(&at).unwrap().is_none());
+    }
+
+    /// The cap is symmetric: what cannot be decoded cannot be encoded either.
+    #[test]
+    fn an_oversized_frame_is_refused_by_encode() {
+        let huge = AdmitFrame::Denied {
+            reason: "x".repeat(MAX_ADMIT_FRAME + 1),
+        };
+        assert!(matches!(huge.encode(), Err(Error::BadFrame)));
+
+        let big = AdmitFrame::Denied {
+            reason: "x".repeat(MAX_ADMIT_FRAME - 1),
+        };
+        let enc = big.encode().unwrap();
+        assert_eq!(enc.len(), 4 + MAX_ADMIT_FRAME);
+        assert_eq!(AdmitFrame::decode(&enc).unwrap().unwrap().0, big);
+    }
+
+    /// A real `Request` — head plus inclusion proof — is orders of magnitude
+    /// under the cap, so the bound is a DoS guard rather than a limit anyone
+    /// legitimately runs into.
+    #[test]
+    fn a_real_request_is_far_under_the_cap() {
+        let (head, proof) = fixture_head_and_proof();
+        let enc = AdmitFrame::Request {
+            topic: TopicId::from_bytes([0u8; 32]),
+            head,
+            proof,
+        }
+        .encode()
+        .unwrap();
+        assert!(
+            enc.len() * 32 < MAX_ADMIT_FRAME,
+            "a real admit frame is {} bytes; the cap is {MAX_ADMIT_FRAME}",
+            enc.len()
+        );
     }
 
     #[test]
@@ -993,6 +1152,128 @@ mod tests {
             check_topic_admission(&local, &local.clone(), &proof, wrong, member(), NOW),
             Err(Error::InvalidSignature)
         ));
+    }
+
+    // -------------------------------------------------- persistence (CAS)
+
+    /// **The rollback race.** Two admissions land together, both having read
+    /// v3: an honest peer carrying v5 (in which the attacker was removed) and
+    /// the attacker carrying a genuine v4 (in which it is still a member). The
+    /// attacker controls its own dial timing, so it arranges to write last.
+    ///
+    /// A bare write of `Admission::adopt` would leave the victim pinned on v4
+    /// and the attacker admitted indefinitely, because the watchdog re-checks
+    /// against the stored head. Persisting through `adopt_if_newer` — re-read
+    /// under the lock — makes the late, older writer a no-op.
+    #[test]
+    fn a_late_older_writer_cannot_roll_the_stored_head_back() {
+        let root = fabric_root().node_id();
+        let v3 = commit_at(LOCAL_VERSION, FRESH).0;
+        let v4 = commit_at(LOCAL_VERSION + 1, FRESH).0;
+        let v5 = commit_at(LOCAL_VERSION + 2, FRESH).0;
+
+        // Both handlers snapshot v3 and both are told to adopt.
+        let honest = check_topic_admission(
+            &v3,
+            &v5,
+            &proof_at(LOCAL_VERSION + 2, member()),
+            root,
+            member(),
+            NOW,
+        )
+        .unwrap();
+        let attacker = check_topic_admission(
+            &v3,
+            &v4,
+            &proof_at(LOCAL_VERSION + 1, member()),
+            root,
+            member(),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(honest.adopt.as_ref(), Some(&v5));
+        assert_eq!(attacker.adopt.as_ref(), Some(&v4));
+
+        // The honest write lands first...
+        let mut stored = v3.clone();
+        if let Some(head) = adopt_if_newer(&stored, honest.adopt.as_ref().unwrap(), root, NOW) {
+            stored = head;
+        }
+        assert_eq!(stored.version, v5.version);
+
+        // ...and the attacker's deliberately-late write is refused.
+        assert_eq!(
+            adopt_if_newer(&stored, attacker.adopt.as_ref().unwrap(), root, NOW),
+            None
+        );
+        assert_eq!(stored.version, v5.version);
+    }
+
+    proptest! {
+        /// Applied in any order, any number of times, the stored head only ever
+        /// moves forward — the "highest-seen watermark" claim, stated as a
+        /// property rather than an aspiration.
+        #[test]
+        fn persisting_through_the_cas_is_monotone(order in proptest::collection::vec(1u64..7, 0..12)) {
+            let root = fabric_root().node_id();
+            let mut stored = commit_at(1, FRESH).0;
+            for v in order {
+                let candidate = commit_at(v, FRESH).0;
+                let before = stored.version;
+                if let Some(head) = adopt_if_newer(&stored, &candidate, root, NOW) {
+                    prop_assert!(head.version > before);
+                    stored = head;
+                }
+                prop_assert!(stored.version >= before);
+            }
+        }
+    }
+
+    #[test]
+    fn the_cas_refuses_forged_and_expired_candidates() {
+        let root = fabric_root().node_id();
+        let stored = commit_at(LOCAL_VERSION, FRESH).0;
+
+        // Newer but not the root's.
+        let forged = forge(&commit_at(LOCAL_VERSION + 1, FRESH).0);
+        assert_eq!(adopt_if_newer(&stored, &forged, root, NOW), None);
+
+        // Newer, genuinely signed, but already dead.
+        let expired = commit_at(LOCAL_VERSION + 1, PAST).0;
+        assert!(expired.verify(root).is_ok());
+        assert_eq!(adopt_if_newer(&stored, &expired, root, NOW), None);
+
+        // Newer and genuine, but checked against a root we do not trust.
+        let genuine = commit_at(LOCAL_VERSION + 1, FRESH).0;
+        assert_eq!(
+            adopt_if_newer(&stored, &genuine, imposter().node_id(), NOW),
+            None
+        );
+        // ...and against the right root, it is taken.
+        assert_eq!(adopt_if_newer(&stored, &genuine, root, NOW), Some(genuine));
+    }
+
+    /// The decision and the write agree by construction: whatever
+    /// `check_topic_admission` offers for adoption, the CAS accepts against the
+    /// same snapshot it was judged under. The CAS is a guard against the
+    /// snapshot going stale, not a second, stricter policy.
+    #[test]
+    fn the_cas_agrees_with_the_decision_against_an_unchanged_snapshot() {
+        let root = fabric_root().node_id();
+        let local = commit_at(LOCAL_VERSION, FRESH).0;
+        for (age, validity, kind, _) in matrix() {
+            let (presented, proof, caller) = cell(age, validity, kind);
+            let Ok(admission) =
+                check_topic_admission(&local, &presented, &proof, root, caller, NOW)
+            else {
+                continue;
+            };
+            let cas = adopt_if_newer(&local, &presented, root, NOW);
+            assert_eq!(
+                admission.adopt, cas,
+                "{age:?}/{validity:?}/{kind:?}: decision and write disagree"
+            );
+        }
     }
 
     proptest! {
