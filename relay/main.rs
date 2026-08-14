@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use iroh_relay::server::{AccessConfig, Limits, RelayConfig, Server, ServerConfig};
+use iroh_relay::server::{RelayConfig, Server, ServerConfig};
 
 /// relay: self-hosted rendezvous for egress-only nodes.
 #[derive(Parser)]
@@ -23,20 +23,19 @@ struct Cli {
     listen: SocketAddr,
 }
 
-/// Build the plain-HTTP relay server config bound to `listen` (no TLS, open
-/// access). Factored out so it can be exercised in tests.
-fn server_config(listen: SocketAddr) -> ServerConfig<(), ()> {
-    ServerConfig {
-        relay: Some(RelayConfig {
-            http_bind_addr: listen,
-            tls: None,
-            limits: Limits::default(),
-            key_cache_capacity: None,
-            access: AccessConfig::Everyone,
-        }),
-        quic: None,
-        metrics_addr: None,
-    }
+/// Build the plain-HTTP relay server config bound to `listen`. Factored out so
+/// it can be exercised in tests.
+///
+/// `RelayConfig::new` supplies exactly the posture we want: no TLS, default
+/// rate limits, no key cache bound, and `AllowAll` access control. QUIC address
+/// discovery and the metrics endpoint stay disabled.
+fn server_config(listen: SocketAddr) -> ServerConfig {
+    // `ServerConfig` and `RelayConfig` are `#[non_exhaustive]`, so they can only
+    // be built through `Default` / `new` and then adjusted field by field.
+    #[allow(clippy::field_reassign_with_default)]
+    let mut config = ServerConfig::default();
+    config.relay = Some(RelayConfig::new(listen));
+    config
 }
 
 #[tokio::main]
@@ -59,10 +58,7 @@ async fn main() -> Result<()> {
     }
 
     // Run until the supervisor task ends (or the process is signalled).
-    server
-        .task_handle()
-        .await
-        .context("relay supervisor task")??;
+    server.join().await.context("relay supervisor task")??;
     Ok(())
 }
 

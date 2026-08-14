@@ -22,18 +22,9 @@ hex = "0.4"
 rand = "0.8"
 blake3 = "1"
 proptest = "1"
-iroh = "0.98.2"
-iroh-relay = { version = "0.98", features = ["server"] }
+iroh = "1.0.3"
+iroh-relay = { version = "1.0.3", features = ["server"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Pin the RustCrypto v3 cluster that iroh's `ed25519-dalek 3.0.0-pre.1` was
-# written against: it does not compile against the *released* `signature 3.0.0`
-# / `pkcs8 0.11.0`, only the rc series. These are referenced (unused) from
-# `//wires` purely to force the lockfile resolution; remove once iroh moves to a
-# released `ed25519-dalek`.
-ed25519 = "=3.0.0-rc.4"
-signature = "=3.0.0-rc.10"
-pkcs8 = "=0.11.0-rc.10"

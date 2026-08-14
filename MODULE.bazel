@@ -94,7 +94,7 @@ rust.toolchain(
         "aarch64-unknown-linux-gnu",
         "x86_64-unknown-linux-gnu",
     ],
-    versions = ["1.90.0"],
+    versions = ["1.91.0"],
 )
 
 crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
