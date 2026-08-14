@@ -248,6 +248,15 @@ pub struct AdmitHandler {
     /// the far side can gate us in turn.
     pub proof: InclusionProof,
     /// Where an adopted head is persisted (`roster-head.json`).
+    ///
+    /// **Must be the same file [`head`](Self::head) reads.** Passive head
+    /// distribution (§2.2) only works if the head this writes is the head the
+    /// next admission loads: pair this with [`HeadSource::Keystore`] over this
+    /// keystore's `roster-head.json`. A `HeadSource::File` pointed elsewhere
+    /// makes every adoption a write nobody reads, and a pinned
+    /// `HeadSource::Fixed` (`--roster-head` / `$WIRES_ROSTER_HEAD`) deliberately
+    /// overrides the file for the process's life — adoptions are still recorded
+    /// for the *next* run, but do not take effect in this one.
     pub keystore: Arc<Keystore>,
     /// The registry this handler admits into.
     pub admitted: Admitted,

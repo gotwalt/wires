@@ -912,16 +912,31 @@ fn roster_commit_in(ks: &keystore::Keystore, a: RosterCommitArgs) -> anyhow::Res
     })?;
 
     let (head, proofs) = roster.commit(&root, now_unix(), not_after)?;
-    ks.save_roster(&roster)?; // persist the version bump
-    ks.save_roster_head(&head)?;
 
     // Minted once per commit, sealed per member, never written down here.
     let key = FabricKey::generate();
 
+    // Seal to *every* member before anything is persisted. Sealing is the one
+    // step here that can fail on operator input — `SealedFabricKey::seal`
+    // refuses a weak or undecompressable member key (spec §3), and nothing
+    // upstream validates the 64 hex characters typed into `roster add`. Doing
+    // it first keeps a bad member from advancing the roster version and
+    // publishing a head that no member holds a key for: the command errors
+    // with the keystore untouched, the operator fixes the member, and re-runs.
+    let sealed: Vec<_> = proofs
+        .iter()
+        .map(|(member, proof)| {
+            let sealed = SealedFabricKey::seal(&root, *member, head.version, &key)
+                .with_context(|| format!("sealing the fabric key to {}", member.hex()))?;
+            anyhow::Ok((member, proof, sealed))
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    ks.save_roster(&roster)?; // persist the version bump
+    ks.save_roster_head(&head)?;
+
     let mut lines = Vec::new();
-    for (member, proof) in &proofs {
-        let sealed = SealedFabricKey::seal(&root, *member, head.version, &key)
-            .with_context(|| format!("sealing the fabric key to {}", member.hex()))?;
+    for (member, proof, sealed) in &sealed {
         for (kind, token) in [("proof", proof.encode()?), ("key", sealed.encode()?)] {
             match a.out.as_deref() {
                 Some(dir) => {
@@ -1522,6 +1537,37 @@ mod tests {
         let second = roster_commit_in(&ks, commit_args(&root, None)).unwrap();
         // A removed member's last key must not decrypt what comes after them.
         assert_ne!(key_of(&first), key_of(&second));
+    }
+
+    #[test]
+    fn a_member_that_cannot_be_sealed_to_aborts_the_commit_before_it_persists() {
+        let (ks, root, _alice, _bob) = fabric_fixture();
+        roster_commit_in(&ks, commit_args(&root, None)).unwrap();
+        let committed = ks.read_roster_head().unwrap().unwrap();
+
+        // A small-order point: 64 well-formed hex characters that decompress to
+        // a weak key, which is exactly what an operator can paste into
+        // `roster add` and what `SealedFabricKey::seal` refuses (spec §3).
+        let mut weak = [0u8; 32];
+        weak[0] = 1;
+        let mut roster = ks.read_roster().unwrap().unwrap();
+        roster.insert(library::NodeId::from_bytes(weak));
+        ks.save_roster(&roster).unwrap();
+
+        let err = roster_commit_in(&ks, commit_args(&root, None)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("sealing the fabric key"),
+            "{err:#}"
+        );
+
+        // The version bump and the head are still the previous commit's: the
+        // failure left nothing half-committed for the members to import.
+        let after = ks.read_roster_head().unwrap().unwrap();
+        assert_eq!(after.version, committed.version);
+        assert_eq!(
+            ks.read_roster().unwrap().unwrap().version,
+            committed.version
+        );
     }
 
     /// A member's keystore (node seed + installed membership) and the sealed
