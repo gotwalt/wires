@@ -178,17 +178,25 @@ TICKET="$(WIRES_HOME="$op" "$WIRES" grant \
 	--ttl 3600 \
 	--addr "127.0.0.1:$port")"
 
-say "An agent holds a ticket to an MCP server running behind \`wires serve\`."
-say "Watch what revoking that access takes -- and what the agent sees after."
-beat 3
+say "The cast: a HUMAN with a master key, a TOOL (an ordinary MCP server"
+say "on another machine), and an AI AGENT that wants to use the tool."
+beat 4
 [ -n "$QUIET" ] || printf '\n' >&2
-say "mode          : $MODE"
-say "agent  node   : ${AGENT_ID:0:16}..."
-say "responder pid : $SERVE_PID on 127.0.0.1:$port (roster v1)"
-beat 2
+say "The human gave the agent a TICKET: a signed pass saying \"this one"
+say "agent may use this one tool\". The ticket is also the address -- the"
+say "agent dials it directly. No account, no API key, no VPN."
+beat 5
+[ -n "$QUIET" ] || printf '\n' >&2
+say "The question: when the human changes their mind, what does it take"
+say "to shut the agent out -- and what does the agent see afterwards?"
+beat 4
+[ -n "$QUIET" ] || printf '\n' >&2
+say "agent         : ${AGENT_ID:0:16}..."
+say "tool server   : pid $SERVE_PID on 127.0.0.1:$port -- watch this pid"
+beat 3
 
 # ==========================================================================
-step "ACT 1  it works"
+step "ACT 1  the agent uses its ticket"
 # ==========================================================================
 run "printf '<3 JSON-RPC lines>' | wires connect --ticket \$TICKET"
 set +e
@@ -214,12 +222,19 @@ case "$SECRET_TEXT" in
 esac
 ok "act 1: exit 0, 3 JSON-RPC responses, secret revealed"
 [ -n "$QUIET" ] || printf '\033[1m     %s\033[0m\n' "$SECRET_TEXT" >&2
-beat 3
+beat 2
+say "it works -- and note \"caller\": the tool knows WHICH agent dialed."
+say "wires verified the caller's identity and told the tool. No password"
+say "or API key was sent, because none exists to steal."
+beat 4
 
 # ==========================================================================
-step "ACT 2  the operator changes their mind -- one line"
+step "ACT 2  the human takes the access away -- one command"
 # ==========================================================================
 if [ "$MODE" = "roster" ]; then
+	say "the human keeps a signed list of who is in their network. Removing"
+	say "the agent and re-signing the list is the ENTIRE revocation:"
+	beat 3
 	run "wires roster remove --member ${AGENT_ID:0:16}...  &&  wires roster commit"
 	WIRES_HOME="$op" "$WIRES" roster remove --member "$AGENT_ID" | indent
 	commit2="$(WIRES_HOME="$op" "$WIRES" roster commit --ttl 3600 --out "$D/proofs2")"
@@ -233,9 +248,10 @@ if [ "$MODE" = "roster" ]; then
 		--inclusion-proof-file "$D/proofs2/$SERVER_ID.proof" \
 		--roster-head "$HEAD2" | indent
 	beat 1.5
-	say "the removed agent gets no new proof. Revocation IS omission --"
-	say "the operator will never mint a newer proof for a removed member."
-	beat 2.5
+	say "everyone still on the list gets a fresh pass stamped with the new"
+	say "list version. The removed agent simply... doesn't. That absence IS"
+	say "the revocation -- there is nothing to confiscate."
+	beat 3.5
 else
 	run "wires revoke --subject A        # appends to the server's crl.json"
 	WIRES_HOME="$srv" "$WIRES" revoke --subject "$AGENT_ID" | indent
@@ -250,8 +266,10 @@ fi
 beat 3
 
 # ==========================================================================
-step "ACT 3  the same dial, now dead"
+step "ACT 3  the agent tries the exact same ticket again"
 # ==========================================================================
+say "same ticket, same key, same command, same still-running tool server:"
+beat 2
 run "printf '<3 JSON-RPC lines>' | wires connect --ticket \$TICKET   # identical"
 set +e
 dial "$D/after.json" "$D/after.err"
@@ -276,7 +294,11 @@ REASON="$(grep -m1 'denied by responder' "$D/after.err" || true)"
 	bad "act 3: the dialer printed no denial reason"
 }
 [ -n "$QUIET" ] || wrapped 31 "$REASON"
-beat 3
+beat 2
+say "translation: \"your pass is from list version 1; the list is now"
+say "version 2, and you are not on it.\" The ticket still exists -- it"
+say "just no longer opens anything."
+beat 4
 
 [ "$(kill -0 "$SERVE_PID" 2>/dev/null && echo "$SERVE_PID")" = "$PID_BEFORE" ] ||
 	bad "act 3: the responder is not the same live process it was in act 1"
