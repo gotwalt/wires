@@ -13,6 +13,7 @@ rust_binary(
         "//library",
         "@crates//:anyhow",
         "@crates//:clap",
+        "@crates//:futures-core",
         "@crates//:iroh",
         "@crates//:iroh-gossip",
         "@crates//:redb",

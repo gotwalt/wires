@@ -4713,6 +4713,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-core",
  "iroh",
  "iroh-gossip",
  "library",
