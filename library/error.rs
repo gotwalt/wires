@@ -96,14 +96,27 @@ pub enum Error {
     #[error("signing key is not the fabric root")]
     FabricMismatch,
 
-    /// A [`SealedFabricKey`](crate::SealedFabricKey) did not unseal: the AEAD
-    /// tag failed, or the blob was truncated or malformed.
+    /// A sealed payload did not open, or could not be sealed in the first
+    /// place. The crate's single "the AEAD layer did not work out" error, raised
+    /// at three points:
     ///
-    /// Distinct from [`Error::InvalidSignature`] (the root's signature over the
-    /// sealed key) and [`Error::SubjectMismatch`] (sealed to a different
-    /// member) — those are checked first, so reaching this means the envelope
-    /// was well-formed and correctly addressed but the ciphertext was not.
-    #[error("sealed fabric key failed to open")]
+    /// - [`SealedFabricKey::open`](crate::SealedFabricKey::open) — the AEAD tag
+    ///   failed, or the blob was truncated or malformed.
+    /// - [`TopicEnvelope::open`](crate::TopicEnvelope::open) — the wrong fabric
+    ///   key, or a tampered body (the AAD covers every signed field).
+    /// - [`SealedFabricKey::seal`](crate::SealedFabricKey::seal) — the *sealing*
+    ///   direction: the recipient's `NodeId` is not a valid Ed25519 point, so
+    ///   there is no X25519 key to seal to.
+    ///
+    /// Distinct from [`Error::InvalidSignature`] (a signature over the sealed
+    /// object) and [`Error::SubjectMismatch`] (sealed to a different member) —
+    /// both are checked first, so reaching this means the object was
+    /// well-formed and correctly addressed but the ciphertext was not. Also
+    /// distinct from [`Error::KeyVersionUnknown`], which says the node holds no
+    /// key for the version at all; this one says a key was tried and rejected.
+    #[error(
+        "sealed payload did not open (wrong key, tampered ciphertext, or unusable recipient key)"
+    )]
     SealedKeyOpen,
 
     /// An envelope is encrypted under a roster version whose fabric key this

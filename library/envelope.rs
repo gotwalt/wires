@@ -252,6 +252,7 @@ impl TopicEnvelope {
     /// it holds. The nonce is derived from `(topic, sender, seq)`, so calling
     /// this twice with the same triple under the same key is a nonce reuse —
     /// the single-allocator rule in the module docs is what prevents it.
+    ///
     /// ```
     /// use library::{FabricKey, MessageHash, NodeIdentity, RosterVersion, Seq, TopicEnvelope, TopicId};
     /// let sender = NodeIdentity::from_seed([2u8; 32]);
@@ -409,6 +410,22 @@ impl TopicEnvelope {
     /// The wire form: canonical JSON bytes. Gossip and replay are binary
     /// channels, so there is no base64 layer here (unlike the human-pasted
     /// tickets and credentials).
+    ///
+    /// ```
+    /// use library::{FabricKey, MessageHash, NodeIdentity, RosterVersion, Seq, TopicEnvelope, TopicId};
+    /// let sender = NodeIdentity::from_seed([2u8; 32]);
+    /// let topic = TopicId::from_bytes([7u8; 32]);
+    /// let key = FabricKey::generate();
+    /// let env = TopicEnvelope::seal(
+    ///     &sender, topic, Seq::ZERO, MessageHash::ZERO, RosterVersion(1), &key, 0, b"hello",
+    /// ).unwrap();
+    ///
+    /// // Round-tripping the wire form preserves the signed bytes exactly.
+    /// let back = TopicEnvelope::from_wire(&env.to_wire().unwrap()).unwrap();
+    /// assert_eq!(back, env);
+    /// assert!(back.verify().is_ok());
+    /// assert_eq!(back.message_hash().unwrap(), env.message_hash().unwrap());
+    /// ```
     pub fn to_wire(&self) -> Result<Vec<u8>> {
         canonical_bytes(self)
     }

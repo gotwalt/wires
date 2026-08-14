@@ -1,6 +1,6 @@
 //! `library`: shared types for the wires session layer.
 //!
-//! The module layout mirrors `docs/new_plan.md`'s "Shared mechanics":
+//! The module layout mirrors the shared mechanics of `docs/committed-roster.md`:
 //!
 //! - [`identity`] — the Ed25519 [`NodeIdentity`] and the [`NodeId`] / [`Signature`]
 //!   byte-newtypes.
@@ -46,6 +46,74 @@
 //!
 //! // The responder accepts only when the authenticated caller is the subject.
 //! assert!(check_accept(&grant, root.node_id(), agent.node_id(), 0, &Crl::new()).is_ok());
+//! ```
+//!
+//! # Example: commit a roster, publish to a topic, read it back
+//!
+//! The multiway path in one pass — commit the member set, mint and seal the
+//! fabric key, derive the topic, then seal, admit, verify, chain-check, and
+//! open a message. Every step here is pure; the async/iroh half lives in the
+//! `wires` binary.
+//!
+//! ```
+//! use library::{
+//!     check_topic_admission, classify_link, next_prev_hash, FabricKey, LinkStatus,
+//!     NodeIdentity, Roster, RosterVersion, SealedFabricKey, Seq, TopicEnvelope, TopicId,
+//! };
+//!
+//! let root = NodeIdentity::from_seed([1u8; 32]);
+//! let alice = NodeIdentity::from_seed([2u8; 32]);
+//! let bob = NodeIdentity::from_seed([3u8; 32]);
+//!
+//! // The root commits the member set; each member gets an inclusion proof.
+//! let mut roster = Roster::new(root.node_id());
+//! roster.insert(alice.node_id());
+//! roster.insert(bob.node_id());
+//! let (head, proofs) = roster.commit(&root, 0, i64::MAX).unwrap();
+//! let proof_of = |who| proofs.iter().find(|(m, _)| *m == who).unwrap().1.clone();
+//!
+//! // Bob admits Alice: her proof recomputes the root of a head he trusts.
+//! // Neither side takes the other's word for who is calling — `caller` is the
+//! // key iroh authenticated, never a wire field.
+//! let admission =
+//!     check_topic_admission(&head, &head, &proof_of(alice.node_id()), root.node_id(), alice.node_id(), 0)
+//!         .unwrap();
+//! assert_eq!(admission.version, head.version);
+//! assert_eq!(admission.adopt, None); // same head — nothing new to persist
+//!
+//! // That commit mints one fabric key, sealed to each member individually.
+//! let key = FabricKey::generate();
+//! let for_bob = SealedFabricKey::seal(&root, bob.node_id(), head.version, &key).unwrap();
+//! let bobs_key = for_bob.open(&bob, root.node_id()).unwrap();
+//!
+//! // Alice publishes. The topic id is derived, not registered: Bob computes
+//! // the identical id from the same fabric and name.
+//! let topic = TopicId::derive(root.node_id(), "ops");
+//! let genesis = TopicEnvelope::seal(
+//!     &alice,
+//!     topic,
+//!     Seq::ZERO,
+//!     next_prev_hash(None),
+//!     head.version,
+//!     &key,
+//!     1_700_000_000,
+//!     b"ship it",
+//! )
+//! .unwrap();
+//!
+//! // Bob ingests: verify the signature, classify the chain link, then decrypt.
+//! assert!(genesis.verify().is_ok());
+//! assert_eq!(classify_link(&genesis, None, None).unwrap(), LinkStatus::Ok);
+//! assert_eq!(genesis.open(&bobs_key).unwrap(), b"ship it");
+//!
+//! // A member removed by the next commit keeps its signing key, but the key
+//! // that commit mints is never sealed to it — confidentiality loss is
+//! // immediate, not "eventually, once the mesh notices".
+//! let evicted = NodeIdentity::from_seed([4u8; 32]);
+//! assert!(SealedFabricKey::seal(&root, bob.node_id(), RosterVersion(2), &key)
+//!     .unwrap()
+//!     .open(&evicted, root.node_id())
+//!     .is_err());
 //! ```
 
 pub mod admission;

@@ -105,6 +105,52 @@ pub enum LinkStatus {
 /// [`LinkStatus::Fork`]: logs are dense, so a reader claiming `s` necessarily
 /// holds everything below it, and an unlinkable fill-in for a slot it cannot
 /// produce is exactly the "refuse, do not guess" case.
+///
+/// ```
+/// use library::{
+///     classify_link, next_prev_hash, ChainState, FabricKey, LinkStatus, MessageHash,
+///     NodeIdentity, Seq, TopicEnvelope, TopicId,
+/// };
+///
+/// let sender = NodeIdentity::from_seed([2u8; 32]);
+/// let topic = TopicId::from_bytes([7u8; 32]);
+/// let key = FabricKey::generate();
+/// let version = library::RosterVersion(1);
+/// let publish = |seq, prev, text: &str| {
+///     TopicEnvelope::seal(&sender, topic, seq, prev, version, &key, 0, text.as_bytes()).unwrap()
+/// };
+///
+/// // A reader holding nothing accepts a well-formed genesis.
+/// let first = publish(Seq::ZERO, next_prev_hash(None), "one");
+/// assert_eq!(classify_link(&first, None, None).unwrap(), LinkStatus::Ok);
+///
+/// // Now the reader is caught up to seq 0, so seq 1 linking to it is next.
+/// let state = ChainState::new(first.seq, first.message_hash().unwrap());
+/// let second = publish(Seq(1), next_prev_hash(Some(state)), "two");
+/// assert_eq!(classify_link(&second, Some(state), None).unwrap(), LinkStatus::Ok);
+///
+/// // Re-delivery of the message at the high-water mark is a Duplicate, not an
+/// // error — this is the dedupe that keeps live and replay from double-printing.
+/// assert_eq!(
+///     classify_link(&first, Some(state), None).unwrap(),
+///     LinkStatus::Duplicate
+/// );
+///
+/// // Skipping ahead reports a Gap: don't store it, go run a replay pass.
+/// let jumped = publish(Seq(9), MessageHash::from_bytes([9u8; 32]), "later");
+/// assert_eq!(
+///     classify_link(&jumped, Some(state), None).unwrap(),
+///     LinkStatus::Gap { have: Some(Seq(0)) }
+/// );
+///
+/// // A different message claiming a slot the reader already filled is a Fork:
+/// // detected and refused, never resolved.
+/// let rewritten = publish(Seq::ZERO, MessageHash::ZERO, "not what was said");
+/// assert_eq!(
+///     classify_link(&rewritten, Some(state), None).unwrap(),
+///     LinkStatus::Fork
+/// );
+/// ```
 pub fn classify_link(
     env: &TopicEnvelope,
     state: Option<ChainState>,

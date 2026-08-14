@@ -92,6 +92,18 @@ impl FabricKey {
     }
 
     /// Lowercase-hex rendering — the keystore file format, nothing else.
+    ///
+    /// [`FabricKey`] has no `Serialize`, so this is the only way it leaves the
+    /// process, and it is meant for `$WIRES_HOME/keyring/<version>.key` alone.
+    ///
+    /// ```
+    /// use library::FabricKey;
+    /// let key = FabricKey::generate();
+    /// // What the keystore writes is what the keystore reads back.
+    /// assert_eq!(FabricKey::from_hex(&key.hex()).unwrap(), key);
+    /// // `Debug` redacts, so a key cannot land in a log line by accident.
+    /// assert!(!format!("{key:?}").contains(&key.hex()));
+    /// ```
     pub fn hex(&self) -> String {
         hex::encode(self.0)
     }

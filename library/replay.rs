@@ -137,7 +137,11 @@ impl ReplayFrame {
             }
             ReplayFrame::Item(envelope) => {
                 payload.push(TAG_ITEM);
-                payload.extend_from_slice(&canonical_bytes(envelope)?);
+                // Deliberately the envelope's own wire accessor rather than a
+                // second call to `canonical_bytes`: the two are byte-identical
+                // today, and going through `to_wire` is what keeps them so if
+                // the envelope's wire form ever changes.
+                payload.extend_from_slice(&envelope.to_wire()?);
             }
             ReplayFrame::End => payload.push(TAG_END),
             ReplayFrame::Denied { reason } => {
@@ -178,11 +182,7 @@ impl ReplayFrame {
                     limit: req.limit,
                 }
             }
-            TAG_ITEM => {
-                let envelope: TopicEnvelope =
-                    serde_json::from_slice(body).map_err(Error::Decode)?;
-                ReplayFrame::Item(envelope)
-            }
+            TAG_ITEM => ReplayFrame::Item(TopicEnvelope::from_wire(body)?),
             TAG_END => {
                 if !body.is_empty() {
                     return Err(Error::BadFrame);
