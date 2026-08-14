@@ -14,8 +14,10 @@
 //! the child's own code on success, [`EXIT_DENIED`] when the responder refused
 //! the credentials, `1` for any local or transport failure.
 
+mod admission;
 mod keystore;
 mod pair;
+mod store;
 mod transport;
 
 use std::fmt;
