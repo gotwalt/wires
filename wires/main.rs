@@ -15,6 +15,7 @@
 //! the credentials, `1` for any local or transport failure.
 
 mod admission;
+mod ipc;
 mod keystore;
 mod pair;
 mod replay;
@@ -22,15 +23,20 @@ mod store;
 mod topics;
 mod transport;
 
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use library::{
-    CapabilityTicket, Crl, FabricKey, Grant, InclusionProof, Membership, NodeId, NodeIdentity,
-    RosterHead, Scope, SealedFabricKey,
+    CapabilityTicket, ChainState, Crl, FabricKey, Grant, InclusionProof, Membership, NodeId,
+    NodeIdentity, RosterHead, RosterVersion, Scope, SealedFabricKey, Seq, TopicEnvelope, TopicId,
+    TopicPeer, TopicTicket,
 };
 
 /// wires: a capability-addressed stdio/MCP session layer.
@@ -62,6 +68,12 @@ enum Command {
     Serve(ServeArgs),
     /// Dial a capability and pipe local stdio over the session.
     Connect(ConnectArgs),
+    /// Publish a message to a topic (through a resident `wires tail`, or
+    /// one-shot when none is running).
+    Publish(PublishArgs),
+    /// Join a topic and stream it: the resident node (store, mesh, admission,
+    /// replay, control socket).
+    Tail(TailArgs),
 }
 
 /// `keygen` arguments: optional seeds to re-derive, and whether to persist.
@@ -362,6 +374,73 @@ struct ConnectArgs {
     /// Read the inclusion proof token from this file.
     #[arg(long)]
     inclusion_proof_file: Option<PathBuf>,
+}
+
+/// The arguments `publish` and `tail` share: which topic, who to bootstrap
+/// from, and the same credential resolution `connect` uses (spec §7.2).
+///
+/// The topic is a *name*, not an id: every member derives the same
+/// [`TopicId`] from its own membership's fabric plus this name, so there is no
+/// `topic create` and nothing to register (spec §1).
+#[derive(Args, Clone, Debug, Default)]
+struct TopicArgs {
+    /// The topic name, derived under this node's fabric (e.g. `ops`).
+    topic: String,
+    /// A base64 topic ticket to bootstrap from. Repeatable; every peer in every
+    /// ticket is tried, and the ones that answer are remembered.
+    #[arg(long = "peer")]
+    peer: Vec<String>,
+    /// Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`,
+    /// then `--node-seed-file`, then the keystore (`node.seed`).
+    #[arg(long)]
+    node_seed: Option<String>,
+    /// Read the node key seed (hex) from this file instead of the keystore.
+    #[arg(long)]
+    node_seed_file: Option<PathBuf>,
+    /// Use a self-hosted relay at this URL instead of the n0 default.
+    #[arg(long)]
+    relay_url: Option<String>,
+    /// The base64 membership token to use. Falls back to the keystore
+    /// (`membership.json`); its `fabric` is the topic's fabric root.
+    #[arg(long, conflicts_with = "membership_file")]
+    membership: Option<String>,
+    /// Read the membership token from this file instead of the keystore.
+    #[arg(long)]
+    membership_file: Option<PathBuf>,
+    /// The base64 inclusion proof presented at admission. Falls back to the
+    /// keystore (`inclusion-proof.json`).
+    #[arg(long, conflicts_with = "inclusion_proof_file")]
+    inclusion_proof: Option<String>,
+    /// Read the inclusion proof from this file instead of the keystore.
+    #[arg(long)]
+    inclusion_proof_file: Option<PathBuf>,
+}
+
+/// `tail` arguments: the shared topic arguments plus what to print.
+#[derive(Args)]
+struct TailArgs {
+    #[command(flatten)]
+    common: TopicArgs,
+    /// How many stored messages to print before going live.
+    #[arg(long, default_value_t = DEFAULT_BACKFILL)]
+    backfill: usize,
+    /// Print NDJSON objects instead of `HH:MM:SS <sender8> <text>` lines.
+    #[arg(long)]
+    json: bool,
+}
+
+/// `publish` arguments: the shared topic arguments plus the message.
+///
+/// With no `--message`, stdin is read and **each line is published
+/// separately** — so `tail -f log | wires publish ops` is a live feed and not
+/// one enormous message.
+#[derive(Args)]
+struct PublishArgs {
+    #[command(flatten)]
+    common: TopicArgs,
+    /// The message text. Omit to publish one message per line of stdin.
+    #[arg(long, short = 'm')]
+    message: Option<String>,
 }
 
 /// `pair` has two sides: `accept` (operator, holds the root key) and `request`
@@ -731,18 +810,37 @@ fn main() {
         }
         Command::Connect(a) => match runtime().block_on(connect_cmd(a)) {
             Ok(code) => std::process::exit(code),
-            Err(e) => {
-                // An authorization refusal is its own outcome: print the
-                // responder's own words and exit 77, not the generic 1.
-                if let Some(d) = e.downcast_ref::<transport::Denied>() {
-                    eprintln!("wires: denied by responder: {}", d.reason());
-                    std::process::exit(EXIT_DENIED);
-                }
-                eprintln!("wires: {e:#}");
-                std::process::exit(1);
-            }
+            Err(e) => exit_with(e),
         },
+        // Both topic commands keep stdout for messages and report the same way
+        // `connect` does — including exit 77 when the refusal came from the
+        // roster rather than from the network.
+        Command::Publish(a) => {
+            if let Err(e) = runtime().block_on(publish_cmd(a)) {
+                exit_with(e);
+            }
+        }
+        Command::Tail(a) => {
+            if let Err(e) = runtime().block_on(tail_cmd(a)) {
+                exit_with(e);
+            }
+        }
     }
+}
+
+/// Report a network-command failure and exit.
+///
+/// An authorization refusal is its own outcome: print the responder's own
+/// words and exit [`EXIT_DENIED`], not the generic 1. The downcast walks
+/// anyhow's context chain, so a `Denied` wrapped in "peer X refused this node's
+/// admission" still lands here.
+fn exit_with(e: anyhow::Error) -> ! {
+    if let Some(d) = e.downcast_ref::<transport::Denied>() {
+        eprintln!("wires: denied by responder: {}", d.reason());
+        std::process::exit(EXIT_DENIED);
+    }
+    eprintln!("wires: {e:#}");
+    std::process::exit(1);
 }
 
 /// `pair`: dispatch to the operator (`accept`) or requester (`request`) side.
@@ -819,7 +917,11 @@ fn cli_admin(command: Command) -> Result<String, String> {
         Command::Roster(a) => run_roster_cmd(a),
         Command::Revoke(a) => run_revoke_cmd(a).map_err(stringify),
         Command::Import(a) => run_import_cmd(a).map_err(|e| format!("{e:#}")),
-        Command::Pair(_) | Command::Serve(_) | Command::Connect(_) => {
+        Command::Pair(_)
+        | Command::Serve(_)
+        | Command::Connect(_)
+        | Command::Publish(_)
+        | Command::Tail(_) => {
             unreachable!("handled in main")
         }
     }
@@ -1124,6 +1226,1094 @@ fn run_revoke_cmd(a: RevokeArgs) -> anyhow::Result<String> {
     let out = run_revoke(start.as_deref(), &a.subject)?;
     ks.save_crl_json(&out)?;
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Topics: `wires tail` and `wires publish` (spec §7)
+// ---------------------------------------------------------------------------
+
+/// How many stored messages `wires tail` prints before it goes live.
+const DEFAULT_BACKFILL: usize = 200;
+
+/// How long a one-shot `wires publish` waits for its first mesh neighbor before
+/// giving up and storing the message locally.
+///
+/// A bound, not a sleep: the wait ends on the first
+/// [`TopicEvent::NeighborUp`](crate::topics::TopicEvent::NeighborUp), and this
+/// is only how long "nobody is there" takes to establish.
+const PUBLISH_NEIGHBOR_WAIT: Duration = Duration::from_secs(15);
+
+/// How long a one-shot `wires publish` stays up after broadcasting, so gossip
+/// can actually put the bytes on the wire before the endpoint closes.
+const PUBLISH_LINGER: Duration = Duration::from_secs(1);
+
+/// First redial delay after the mesh empties (spec §7).
+const REDIAL_MIN: Duration = Duration::from_secs(5);
+
+/// Longest redial delay; the backoff doubles up to this and stays there.
+const REDIAL_MAX: Duration = Duration::from_secs(60);
+
+/// How long a tail waits after a `Lagged` or a chain gap before catching up, so
+/// a burst of them costs one replay pass instead of one each.
+const TAIL_CATCHUP_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// How many control-socket publishes may queue for the tail loop at once.
+const CONTROL_QUEUE: usize = 32;
+
+/// Everything the topic commands resolve *before* touching the network
+/// (spec §7.2).
+///
+/// The preflight exists so that a missing credential is a local error naming
+/// the command that fixes it, rather than a QUIC dial that eventually fails
+/// with something about a handshake. Five things must be on hand — a node key,
+/// a membership, an inclusion proof, a roster head, and at least one fabric key
+/// — and every one of them has a one-line remedy.
+struct TopicContext {
+    /// This node's signing identity (also the endpoint's key).
+    node: NodeIdentity,
+    /// The membership whose `fabric` is the trusted root here.
+    membership: Membership,
+    /// This node's inclusion proof, presented at every admission.
+    proof: InclusionProof,
+    /// Where the roster head is re-read from, per admission and per watchdog
+    /// pass. Armed: preflight proved a head exists, so a later missing one
+    /// fails closed.
+    head_source: Arc<transport::HeadSource>,
+    /// The keystore the keyring, the head, and adopted heads live in.
+    keystore: Arc<keystore::Keystore>,
+    /// The wires home — the parent of `topics/` and `run/`.
+    home: PathBuf,
+    /// The topic name as typed.
+    name: String,
+    /// The derived topic id.
+    topic: TopicId,
+    /// `membership.fabric`: the root every signature is checked against.
+    fabric_root: NodeId,
+    /// Peers named by `--peer` tickets.
+    ticket_peers: Vec<TopicPeer>,
+    /// A self-hosted relay, if one was configured.
+    relay_url: Option<String>,
+}
+
+impl fmt::Debug for TopicContext {
+    /// Names the topic and the fabric, never the identity: this struct holds
+    /// the node's signing key, and a `Debug` that prints it would put a seed in
+    /// a log line the first time something goes wrong.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TopicContext")
+            .field("name", &self.name)
+            .field("topic", &self.topic.hex())
+            .field("fabric_root", &self.fabric_root.hex())
+            .field("node", &self.node.node_id().hex())
+            .field("home", &self.home)
+            .field("ticket_peers", &self.ticket_peers.len())
+            .field("relay_url", &self.relay_url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TopicContext {
+    /// Resolve every credential the topic commands need against `ks`, or fail
+    /// with a message naming the `wires` command that supplies what is missing.
+    ///
+    /// The testable form (the `_in` pattern): `wires tail` and `wires publish`
+    /// call it with the resolved keystore and home.
+    fn resolve(
+        ks: Arc<keystore::Keystore>,
+        home: PathBuf,
+        a: &TopicArgs,
+    ) -> anyhow::Result<TopicContext> {
+        if a.topic.trim().is_empty() {
+            anyhow::bail!("the topic name is empty; pass one, e.g. `wires tail ops`");
+        }
+        let node = match (a.node_seed.as_deref(), a.node_seed_file.as_deref()) {
+            (Some(hex), _) => NodeIdentity::from_seed_hex(hex).context("--node-seed")?,
+            (None, Some(path)) => keystore::read_identity_file(path)?,
+            (None, None) => keystore::node_identity_in(&ks)?,
+        };
+        let membership = match token_arg(
+            a.membership.as_deref(),
+            a.membership_file.as_deref(),
+            "--membership",
+        )? {
+            Some(text) => Membership::decode(&text).context("--membership")?,
+            None => ks.read_membership()?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no membership: run `wires import --membership <token>` with the token your \
+                     operator minted (looked for {})",
+                    ks.path("membership.json").display()
+                )
+            })?,
+        };
+        // The same two consistency checks `connect` runs, for the same reason:
+        // credentials issued to another node must not masquerade as a network
+        // failure later.
+        preflight(node.node_id(), &membership, None).map_err(anyhow::Error::msg)?;
+
+        let proof = match token_arg(
+            a.inclusion_proof.as_deref(),
+            a.inclusion_proof_file.as_deref(),
+            "--inclusion-proof",
+        )? {
+            Some(text) => InclusionProof::decode(&text).context("--inclusion-proof")?,
+            None => ks.read_inclusion_proof()?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no inclusion proof: topics admit peers by roster inclusion, so this node \
+                     needs its own proof — run `wires import --inclusion-proof-file \
+                     <node-id>.proof` from `wires roster commit --out DIR` (looked for {})",
+                    ks.path("inclusion-proof.json").display()
+                )
+            })?,
+        };
+        let head = ks.read_roster_head()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no roster head: admission checks every peer's proof against a signed head, so \
+                 this node needs the current one — run `wires import --roster-head <token>` \
+                 (looked for {})",
+                ks.path("roster-head.json").display()
+            )
+        })?;
+        if ks.latest_fabric_key()?.is_none() {
+            anyhow::bail!(
+                "no fabric key in the keyring: topics are end-to-end encrypted, so a member with \
+                 no key can neither publish nor read — run `wires import --fabric-key-file \
+                 <node-id>.key` from `wires roster commit --out DIR` (looked in {})",
+                ks.keyring_dir().display()
+            );
+        }
+
+        let fabric_root = membership.fabric;
+        let topic = TopicId::derive(fabric_root, &a.topic);
+        let mut ticket_peers = Vec::new();
+        for text in &a.peer {
+            let ticket = TopicTicket::decode(text.trim())
+                .context("--peer (is the pasted base64 ticket complete?)")?;
+            if ticket.fabric != fabric_root {
+                anyhow::bail!(
+                    "--peer: this ticket is for fabric {}, but this node's membership is in \
+                     fabric {}; a ticket from another fabric can never be admitted",
+                    ticket.fabric.hex(),
+                    fabric_root.hex()
+                );
+            }
+            if ticket.name != a.topic {
+                anyhow::bail!(
+                    "--peer: this ticket is for topic {:?}, not {:?}; the peers on it are on a \
+                     different mesh",
+                    ticket.name,
+                    a.topic
+                );
+            }
+            ticket_peers.extend(ticket.peers);
+        }
+        tracing::debug!(
+            topic = %topic.hex(),
+            head = head.version.0,
+            peers = ticket_peers.len(),
+            "preflight ok"
+        );
+        Ok(TopicContext {
+            node,
+            membership,
+            proof,
+            head_source: Arc::new(transport::HeadSource::Keystore {
+                path: ks.path("roster-head.json"),
+                // Seen: a head that disappears later must fail closed, not
+                // silently drop back to admitting nobody's proof.
+                armed: std::sync::atomic::AtomicBool::new(true),
+            }),
+            keystore: ks,
+            home,
+            name: a.topic.clone(),
+            topic,
+            fabric_root,
+            ticket_peers,
+            relay_url: a.relay_url.clone(),
+        })
+    }
+
+    /// The node config for this context's topic.
+    fn node_config(&self, store: Arc<store::TopicStore>) -> topics::TopicNodeConfig {
+        let mut cfg = topics::TopicNodeConfig::new(
+            self.topic,
+            self.fabric_root,
+            Arc::clone(&self.head_source),
+            self.proof.clone(),
+            Arc::clone(&self.keystore),
+            store,
+        );
+        cfg.relay_url = self.relay_url.clone();
+        cfg
+    }
+
+    /// This topic's control socket path.
+    fn socket_path(&self) -> PathBuf {
+        ipc::socket_path(&self.home, self.topic)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Printing
+// ---------------------------------------------------------------------------
+
+/// The keys a tail opens messages with, reloaded when an unknown version shows
+/// up.
+///
+/// Envelopes are storable before their key arrives (spec §4.1), so an unknown
+/// `key_version` is not an error: the message is in the log, and the display
+/// heals the moment `wires import --fabric-key …` lands — which is why a miss
+/// re-reads the keyring before giving up. The warning is **once per version**,
+/// because the alternative is one line of stderr per message for as long as the
+/// key is missing.
+struct Keyring {
+    /// Where the keyring is re-read from.
+    keystore: Arc<keystore::Keystore>,
+    /// Versions this tail holds keys for.
+    keys: BTreeMap<RosterVersion, FabricKey>,
+    /// Versions already complained about.
+    warned: BTreeSet<RosterVersion>,
+}
+
+impl Keyring {
+    /// Load the installed keyring.
+    fn load(keystore: Arc<keystore::Keystore>) -> anyhow::Result<Self> {
+        let keys = keystore.read_keyring()?;
+        Ok(Self {
+            keystore,
+            keys,
+            warned: BTreeSet::new(),
+        })
+    }
+
+    /// Decrypt `envelope`, or `None` when this node holds no key for it.
+    fn open(&mut self, envelope: &TopicEnvelope) -> Option<Vec<u8>> {
+        let version = envelope.key_version;
+        if !self.keys.contains_key(&version) {
+            // A key imported since startup is the common case here.
+            match self.keystore.read_keyring() {
+                Ok(keys) => self.keys = keys,
+                Err(e) => tracing::warn!("re-reading the keyring: {e:#}"),
+            }
+        }
+        match self.keys.get(&version) {
+            Some(key) => match envelope.open(key) {
+                Ok(plaintext) => Some(plaintext),
+                Err(e) => {
+                    tracing::warn!(
+                        sender = %envelope.sender.hex(),
+                        seq = envelope.seq.0,
+                        version = version.0,
+                        "stored but undecryptable: {e:#}"
+                    );
+                    None
+                }
+            },
+            None => {
+                if self.warned.insert(version) {
+                    eprintln!(
+                        "wires tail: no key for roster version {} — those messages are stored but \
+                         not shown; run `wires import --fabric-key-file <node-id>.key` for that \
+                         commit and they appear",
+                        version.0
+                    );
+                }
+                None
+            }
+        }
+    }
+}
+
+/// How a tail renders a message on **stdout**.
+///
+/// stdout is byte-pure message lines and nothing else — every diagnostic in
+/// this file goes to stderr or through [`init_logging`] — so a tail can be
+/// piped into a file, a pager, or another program without a filter.
+struct Printer {
+    /// NDJSON instead of the human line.
+    json: bool,
+}
+
+/// One `--json` output record: the machine-readable form of a message line.
+#[derive(serde::Serialize)]
+struct JsonLine {
+    /// The sender's claimed unix timestamp (informational, spec §4.1).
+    ts: i64,
+    /// The sender's full node id, hex.
+    sender: String,
+    /// The message's sequence in that sender's chain.
+    seq: u64,
+    /// The decrypted UTF-8 text (lossy for non-UTF-8 payloads).
+    text: String,
+}
+
+impl Printer {
+    /// Render one message, or nothing when no key opens it.
+    ///
+    /// Called only for an envelope whose append reported
+    /// [`Appended::Inserted`](crate::store::Appended) — which is what makes
+    /// deduplication across live gossip, replay, and restart structural rather
+    /// than a remembered set of ids (spec §7).
+    fn emit(&self, envelope: &TopicEnvelope, keyring: &mut Keyring) {
+        let Some(plaintext) = keyring.open(envelope) else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&plaintext);
+        let line = self.render(envelope, &text);
+        let mut out = std::io::stdout().lock();
+        // Piped stdout is block-buffered, so an unflushed tail looks hung.
+        if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
+            // A closed stdout (the pager quit) is not this tail's problem to
+            // report on every message.
+            tracing::debug!("stdout closed");
+        }
+    }
+
+    /// The exact text of one output line (the testable half of
+    /// [`emit`](Self::emit)).
+    fn render(&self, envelope: &TopicEnvelope, text: &str) -> String {
+        if self.json {
+            let line = JsonLine {
+                ts: envelope.timestamp,
+                sender: envelope.sender.hex(),
+                seq: envelope.seq.0,
+                text: text.to_string(),
+            };
+            serde_json::to_string(&line).unwrap_or_else(|e| format!("{{\"err\":\"{e}\"}}"))
+        } else {
+            format!(
+                "{} {} {text}",
+                format_clock(envelope.timestamp),
+                short_id(envelope.sender)
+            )
+        }
+    }
+}
+
+/// `HH:MM:SS` **UTC** for a unix timestamp.
+///
+/// UTC and not local time on purpose: the timestamp is sender-chosen and
+/// unverifiable (spec §4.1), so two members reading the same transcript should
+/// at least see the same clock. Dateless because a tail is a live feed; the
+/// full timestamp is one `--json` away.
+fn format_clock(ts: i64) -> String {
+    let secs = ts.rem_euclid(86_400);
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+/// The first 8 hex characters of a node id — enough to tell members apart in a
+/// transcript, short enough to leave room for the message.
+fn short_id(node: NodeId) -> String {
+    let hex = node.hex();
+    hex[..8.min(hex.len())].to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Persisted peers
+// ---------------------------------------------------------------------------
+
+/// The peers this node knows on a topic, persisted across restarts.
+///
+/// There is no discovery service (spec §10): a tail that is restarted with no
+/// `--peer` must still find its way back to the mesh, so every peer learned
+/// from a ticket or from a `NeighborUp` is written to
+/// `topics/<topic-hex>.peers.json`. Hints only — admission still decides who is
+/// in — so a stale file costs a failed dial, never an admission.
+struct PeerBook {
+    /// Where the list is persisted.
+    path: PathBuf,
+    /// Known peers by node id; a hint with addresses replaces one without.
+    peers: HashMap<NodeId, TopicPeer>,
+}
+
+impl PeerBook {
+    /// Load the persisted peers for `topic` (an unreadable file is a warning
+    /// and an empty book — a corrupt hint list must not stop a tail).
+    fn open(home: &Path, topic: TopicId) -> Self {
+        let path = peers_path(home, topic);
+        let peers = match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<Vec<TopicPeer>>(&text) {
+                Ok(list) => list.into_iter().map(|p| (p.node, p)).collect(),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), "ignoring an unreadable peer list: {e}");
+                    HashMap::new()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "ignoring an unreadable peer list: {e}");
+                HashMap::new()
+            }
+        };
+        Self { path, peers }
+    }
+
+    /// Record `peer`, returning whether anything changed.
+    ///
+    /// A hint that carries addresses wins over one that does not: the ticket
+    /// form knows where the peer was, and a `NeighborUp` only knows who it is.
+    fn record(&mut self, peer: TopicPeer) -> bool {
+        match self.peers.get(&peer.node) {
+            Some(held) if held == &peer => false,
+            Some(held)
+                if peer.addrs.is_empty() && peer.relay_url.is_none() && !held.addrs.is_empty() =>
+            {
+                false
+            }
+            _ => {
+                self.peers.insert(peer.node, peer);
+                true
+            }
+        }
+    }
+
+    /// The known peers, in node-id order (so the file is stable).
+    fn list(&self) -> Vec<TopicPeer> {
+        let mut peers: Vec<_> = self.peers.values().cloned().collect();
+        peers.sort_by_key(|p| p.node);
+        peers
+    }
+
+    /// Persist the list (best effort: a tail that cannot write its hints is
+    /// still a working tail).
+    fn save(&self) {
+        if let Err(e) = self.try_save() {
+            tracing::warn!(path = %self.path.display(), "could not persist the peer list: {e:#}");
+        }
+    }
+
+    fn try_save(&self) -> anyhow::Result<()> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let text = serde_json::to_string_pretty(&self.list())?;
+        std::fs::write(&self.path, text)
+            .with_context(|| format!("writing {}", self.path.display()))?;
+        Ok(())
+    }
+}
+
+/// Where a topic's persisted peer hints live.
+fn peers_path(home: &Path, topic: TopicId) -> PathBuf {
+    home.join("topics")
+        .join(format!("{}.peers.json", topic.hex()))
+}
+
+// ---------------------------------------------------------------------------
+// The single sequence allocator
+// ---------------------------------------------------------------------------
+
+/// Allocate this node's next sequence on `topic`, seal `text` under `key`, and
+/// append it — the one place a message is minted (spec §7).
+///
+/// Sequence and previous-hash both come from the store's chain state, inside
+/// the process that holds the store's exclusive lock, which is what makes "one
+/// allocator per (node, topic)" structural rather than a convention. A
+/// [`Duplicate`](crate::store::Appended::Duplicate) here would mean two
+/// allocators raced, so it is an error, not a shrug.
+fn append_local(
+    store: &store::TopicStore,
+    node: &NodeIdentity,
+    topic: TopicId,
+    version: RosterVersion,
+    key: &FabricKey,
+    text: &str,
+    now: i64,
+) -> anyhow::Result<TopicEnvelope> {
+    let state = store
+        .chain_state(node.node_id())
+        .context("reading this node's chain state")?;
+    let seq = match state {
+        None => Seq::ZERO,
+        Some(state) => state.seq.checked_next().ok_or_else(|| {
+            anyhow::anyhow!("this node's chain on the topic is full (sequence u64::MAX)")
+        })?,
+    };
+    let envelope = TopicEnvelope::seal(
+        node,
+        topic,
+        seq,
+        library::next_prev_hash(state),
+        version,
+        key,
+        now,
+        text.as_bytes(),
+    )
+    .context("sealing the message")?;
+    match store.append(&envelope)? {
+        store::Appended::Inserted => Ok(envelope),
+        store::Appended::Duplicate => anyhow::bail!(
+            "sequence {} was already stored for this node: another process is allocating \
+             sequences on this topic",
+            seq.0
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `wires tail`
+// ---------------------------------------------------------------------------
+
+/// `tail`: preflight, then run the resident node.
+async fn tail_cmd(a: TailArgs) -> anyhow::Result<()> {
+    init_logging();
+    let ks = Arc::new(keystore::Keystore::resolve()?);
+    let home = keystore::home()?;
+    let ctx = TopicContext::resolve(ks, home, &a.common)?;
+    run_tail(&ctx, a.backfill, a.json).await
+}
+
+/// The resident node: store, backfill, mesh, control socket, catch-up, live
+/// loop (spec §7.3).
+///
+/// Returns `Ok(())` on `SIGINT`/`SIGTERM`, having closed the mesh and unlinked
+/// the control socket. Every failure that is a *refusal* carries a
+/// [`Denied`](crate::transport::Denied) so `main` can exit 77.
+async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Result<()> {
+    let printer = Printer { json };
+    let mut keyring = Keyring::load(Arc::clone(&ctx.keystore))?;
+    let store = Arc::new(store::TopicStore::open(&ctx.home, ctx.topic)?);
+
+    // 1. What is already known, before anything touches the network. Printed
+    //    from the log, so a restart shows the same transcript the last run did.
+    for envelope in store.read_backfill(backfill)? {
+        printer.emit(&envelope, &mut keyring);
+    }
+
+    // 2. Bootstrap set: this run's tickets, unioned with what previous runs saw.
+    let mut book = PeerBook::open(&ctx.home, ctx.topic);
+    let mut changed = false;
+    for peer in &ctx.ticket_peers {
+        changed |= book.record(peer.clone());
+    }
+    if changed {
+        book.save();
+    }
+
+    // 3. The node, then the banner (it needs the bound sockets), then the join
+    //    — which is where a revoked node finds out, before it prints anything.
+    let node = topics::TopicNode::spawn(&ctx.node, ctx.node_config(Arc::clone(&store))).await?;
+    let socket_path = ctx.socket_path();
+    tail_banner(&node, ctx, &socket_path);
+    let (mut sender, mut events) = node.join(ctx.topic, &book.list()).await?;
+
+    // 4. The control socket, and with it `wires publish`.
+    let socket = ipc::ControlSocket::bind(&socket_path).await?;
+    let (tx, mut requests) = tokio::sync::mpsc::channel(CONTROL_QUEUE);
+    let server = socket.spawn(tx);
+
+    // 5. Whatever the peers have that this node does not.
+    catch_up_and_print(&node, &store, &printer, &mut keyring).await;
+
+    // Live state: who the neighbors are, when to redial, when to catch up.
+    let mut neighbors: HashSet<NodeId> = HashSet::new();
+    let mut backoff = REDIAL_MIN;
+    let mut redial_at: Option<tokio::time::Instant> = None;
+    let mut catchup_at: Option<tokio::time::Instant> = None;
+    let mut sigint = signal_stream(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigterm = signal_stream(tokio::signal::unix::SignalKind::terminate())?;
+
+    loop {
+        tokio::select! {
+            _ = sigint.recv() => break,
+            _ = sigterm.recv() => break,
+
+            // A publish from `wires publish`, allocated and sealed here — the
+            // single allocator, on the one task that owns the store.
+            request = requests.recv() => {
+                let Some(request) = request else {
+                    tracing::warn!("the control socket server ended; publishes will not arrive");
+                    continue;
+                };
+                let outcome = publish_from_tail(ctx, &store, &sender, &request.text).await;
+                let answer = match outcome {
+                    Ok(envelope) => {
+                        printer.emit(&envelope, &mut keyring);
+                        Ok(envelope.seq.0)
+                    }
+                    Err(e) => {
+                        tracing::warn!("refusing a control-socket publish: {e:#}");
+                        Err(format!("{e:#}"))
+                    }
+                };
+                let _ = request.reply.send(answer);
+            }
+
+            event = events.recv() => match event {
+                Some(topics::TopicEvent::Message(envelope)) => {
+                    match replay::ingest(&store, ctx.topic, &envelope) {
+                        Ok(replay::Ingested::Inserted) => printer.emit(&envelope, &mut keyring),
+                        Ok(replay::Ingested::Duplicate) => {}
+                        // The hole heals by replay and the message comes back
+                        // in order; printing it now would print it twice.
+                        Ok(replay::Ingested::Gap { have }) => {
+                            tracing::debug!(
+                                sender = %envelope.sender.hex(),
+                                seq = envelope.seq.0,
+                                have = ?have.map(|s| s.0),
+                                "chain gap; scheduling a catch-up"
+                            );
+                            catchup_at.get_or_insert(deadline(TAIL_CATCHUP_DEBOUNCE));
+                        }
+                        Err(e) => tracing::warn!(
+                            sender = %envelope.sender.hex(),
+                            seq = envelope.seq.0,
+                            "refusing a message: {e:#}"
+                        ),
+                    }
+                }
+                Some(topics::TopicEvent::NeighborUp(peer)) => {
+                    tracing::info!(peer = %peer.hex(), "neighbor up");
+                    neighbors.insert(peer);
+                    backoff = REDIAL_MIN;
+                    redial_at = None;
+                    if book.record(TopicPeer::new(peer)) {
+                        book.save();
+                    }
+                    // A new neighbor is the likeliest source of history this
+                    // node is missing.
+                    catchup_at.get_or_insert(deadline(TAIL_CATCHUP_DEBOUNCE));
+                }
+                Some(topics::TopicEvent::NeighborDown(peer)) => {
+                    neighbors.remove(&peer);
+                    tracing::info!(peer = %peer.hex(), left = neighbors.len(), "neighbor down");
+                    if neighbors.is_empty() {
+                        redial_at.get_or_insert(deadline(backoff));
+                    }
+                }
+                Some(topics::TopicEvent::Lagged) => {
+                    // Terminal for the subscription: re-join and replay what
+                    // was dropped. Never a quiet exit (spec §7.4).
+                    tracing::warn!("subscription lagged; re-joining and catching up");
+                    match node.join(ctx.topic, &book.list()).await {
+                        Ok((s, r)) => { sender = s; events = r; }
+                        Err(e) => tracing::warn!("re-join after lag failed: {e:#}"),
+                    }
+                    catchup_at.get_or_insert(deadline(TAIL_CATCHUP_DEBOUNCE));
+                }
+                None => {
+                    // The bridge task ended (the subscription closed). Same
+                    // remedy as a lag.
+                    tracing::warn!("the event bridge ended; re-joining");
+                    match node.join(ctx.topic, &book.list()).await {
+                        Ok((s, r)) => { sender = s; events = r; }
+                        Err(e) => {
+                            tracing::warn!("re-join failed: {e:#}");
+                            redial_at.get_or_insert(deadline(backoff));
+                        }
+                    }
+                }
+            },
+
+            _ = tokio::time::sleep_until(redial_at.unwrap_or_else(now_instant)),
+                if redial_at.is_some() =>
+            {
+                redial_at = None;
+                match redial(&node, &sender, &book).await {
+                    Ok(0) => {
+                        backoff = (backoff * 2).min(REDIAL_MAX);
+                        redial_at = Some(deadline(backoff));
+                        tracing::warn!(retry_in = ?backoff, "no peer answered the redial");
+                    }
+                    Ok(n) => {
+                        tracing::info!(peers = n, "redial re-admitted peers");
+                        backoff = REDIAL_MIN;
+                        catchup_at.get_or_insert(deadline(TAIL_CATCHUP_DEBOUNCE));
+                    }
+                    // Every known peer refused us: this node is off the roster,
+                    // and that is the one outcome worth exiting for.
+                    Err(e) => return Err(e),
+                }
+            }
+
+            _ = tokio::time::sleep_until(catchup_at.unwrap_or_else(now_instant)),
+                if catchup_at.is_some() =>
+            {
+                catchup_at = None;
+                catch_up_and_print(&node, &store, &printer, &mut keyring).await;
+            }
+        }
+    }
+
+    eprintln!("wires tail: shutting down");
+    server.abort();
+    node.shutdown().await?;
+    Ok(())
+}
+
+/// `now + delay` as a tokio deadline.
+fn deadline(delay: Duration) -> tokio::time::Instant {
+    tokio::time::Instant::now() + delay
+}
+
+/// Now, as a tokio deadline (the disabled-branch placeholder in `select!`).
+fn now_instant() -> tokio::time::Instant {
+    tokio::time::Instant::now()
+}
+
+/// A unix signal stream, named in any failure.
+fn signal_stream(
+    kind: tokio::signal::unix::SignalKind,
+) -> anyhow::Result<tokio::signal::unix::Signal> {
+    tokio::signal::unix::signal(kind).context("installing a signal handler")
+}
+
+/// The startup banner, on **stderr** (stdout is messages only).
+///
+/// The last line is the whole bootstrap story: another member runs
+/// `wires tail <topic> --peer <token>` with it and the two meshes become one.
+fn tail_banner(node: &topics::TopicNode, ctx: &TopicContext, socket: &Path) {
+    eprintln!(
+        "wires tail: topic {:?} ({}) as {}",
+        ctx.name,
+        ctx.topic.hex(),
+        node.node_id().hex()
+    );
+    match ctx
+        .keystore
+        .read_roster_head()
+        .ok()
+        .flatten()
+        .map(|h| h.version.0)
+    {
+        Some(version) => eprintln!(
+            "wires tail: fabric {}, roster version {version}",
+            ctx.membership.fabric.hex()
+        ),
+        None => eprintln!("wires tail: fabric {}", ctx.membership.fabric.hex()),
+    }
+    // Not enforced here — topic admission is roster inclusion, not membership
+    // TTL — but an expired membership is the usual reason a peer's `serve`
+    // refuses this node, so it is worth saying out loud once.
+    if ctx.membership.not_after < now_unix() {
+        eprintln!(
+            "wires tail: warning — this node's membership expired at {}; ask the operator to \
+             re-mint it (`wires member --subject {} --ttl …`)",
+            ctx.membership.not_after,
+            ctx.node.node_id().hex()
+        );
+    }
+    eprintln!("wires tail: control socket {}", socket.display());
+    match node.ticket(&ctx.name).and_then(|t| Ok(t.encode()?)) {
+        Ok(token) => eprintln!("share to bootstrap: {token}"),
+        Err(e) => eprintln!("wires tail: could not build this node's ticket: {e:#}"),
+    }
+}
+
+/// Seal, append, and broadcast one message from the tail loop.
+///
+/// The fabric key is re-read per publish, not cached, so a `wires import
+/// --fabric-key …` after a `roster commit` takes effect on the next message
+/// with no restart. A broadcast failure is **not** an error: the message is
+/// already in the log and replay will carry it, so the publisher gets its
+/// sequence and a warning goes to the log.
+async fn publish_from_tail(
+    ctx: &TopicContext,
+    store: &store::TopicStore,
+    sender: &topics::TopicSender,
+    text: &str,
+) -> anyhow::Result<TopicEnvelope> {
+    let (version, key) = ctx.keystore.latest_fabric_key()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no fabric key in the keyring; run `wires import --fabric-key-file <node-id>.key`"
+        )
+    })?;
+    let envelope = append_local(store, &ctx.node, ctx.topic, version, &key, text, now_unix())?;
+    if let Err(e) = sender.broadcast(&envelope).await {
+        tracing::warn!(
+            seq = envelope.seq.0,
+            "stored but not broadcast (replay will carry it): {e:#}"
+        );
+    }
+    Ok(envelope)
+}
+
+/// Run a catch-up pass and print whatever it inserted.
+///
+/// The printing is a before/after diff of the per-publisher high-water marks:
+/// [`catch_up`](crate::replay::catch_up) ingests straight into the store, and
+/// what it *inserted* is exactly what the marks moved over — which keeps the
+/// "print on `Inserted`" rule intact without threading a callback through
+/// replay.
+async fn catch_up_and_print(
+    node: &topics::TopicNode,
+    store: &store::TopicStore,
+    printer: &Printer,
+    keyring: &mut Keyring,
+) {
+    let before = match store.hwm_all() {
+        Ok(marks) => marks,
+        Err(e) => {
+            tracing::warn!("reading the high-water marks before catch-up: {e:#}");
+            return;
+        }
+    };
+    match replay::catch_up(
+        node.endpoint(),
+        node.admit(),
+        store,
+        node.topic(),
+        replay::REPLAY_LIMIT,
+    )
+    .await
+    {
+        Ok(counts) => {
+            tracing::info!(
+                peers = counts.peers,
+                inserted = counts.inserted,
+                duplicates = counts.duplicates,
+                refused = counts.refused,
+                "catch-up pass"
+            );
+            if counts.inserted > 0
+                && let Err(e) = print_new_since(store, &before, printer, keyring)
+            {
+                tracing::warn!("printing caught-up messages: {e:#}");
+            }
+        }
+        Err(e) => tracing::warn!("catch-up failed: {e:#}"),
+    }
+}
+
+/// Print every message stored past the marks in `before`, in display order.
+fn print_new_since(
+    store: &store::TopicStore,
+    before: &BTreeMap<NodeId, ChainState>,
+    printer: &Printer,
+    keyring: &mut Keyring,
+) -> anyhow::Result<()> {
+    let mut fresh = Vec::new();
+    for (sender, state) in store.hwm_all()? {
+        let from = before.get(&sender).map(|held| held.seq);
+        if from == Some(state.seq) {
+            continue;
+        }
+        // Bounded by what just landed: `read_after` starts at the old mark.
+        fresh.extend(store.read_after(sender, from, usize::MAX)?);
+    }
+    fresh.sort_by_key(|envelope| (envelope.timestamp, envelope.sender, envelope.seq));
+    for envelope in &fresh {
+        printer.emit(envelope, keyring);
+    }
+    Ok(())
+}
+
+/// Re-admit every known peer and hand the survivors to gossip.
+///
+/// Re-admission is not a formality: the responder re-loads its head, so a peer
+/// that was removed from the roster since the last dial learns about it here,
+/// as a [`Denied`](crate::transport::Denied). One peer refusing is that peer's
+/// verdict; **every** peer refusing is the roster's, and it comes back as an
+/// error so the tail exits 77 rather than redialing a fabric it is no longer
+/// in.
+async fn redial(
+    node: &topics::TopicNode,
+    sender: &topics::TopicSender,
+    book: &PeerBook,
+) -> anyhow::Result<usize> {
+    let now = now_unix();
+    let mut admitted = Vec::new();
+    let mut denial: Option<anyhow::Error> = None;
+    let mut tried = 0usize;
+    for peer in book.list() {
+        if peer.node == node.node_id() {
+            continue;
+        }
+        tried += 1;
+        match admission::admit_peer(node.endpoint(), node.admit(), &peer, now).await {
+            Ok(_) => admitted.push(peer.node),
+            Err(e) => {
+                if e.downcast_ref::<transport::Denied>().is_some() {
+                    denial.get_or_insert(e.context(format!(
+                        "peer {} refused this node's admission",
+                        peer.node.hex()
+                    )));
+                } else {
+                    tracing::debug!(peer = %peer.node.hex(), "redial failed: {e:#}");
+                }
+            }
+        }
+    }
+    if admitted.is_empty()
+        && tried > 0
+        && let Some(denial) = denial
+    {
+        return Err(denial);
+    }
+    sender.join_peers(&admitted).await?;
+    Ok(admitted.len())
+}
+
+// ---------------------------------------------------------------------------
+// `wires publish`
+// ---------------------------------------------------------------------------
+
+/// Where a `wires publish` invocation's messages come from.
+///
+/// Streaming rather than collected, so `tail -f app.log | wires publish ops`
+/// publishes each line as it appears instead of waiting for an end of input
+/// that never comes.
+enum Messages {
+    /// A single `--message`, once.
+    One(Option<String>),
+    /// One message per line of stdin.
+    Stdin(tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>),
+}
+
+impl Messages {
+    /// The next message, skipping blank lines; `None` at the end.
+    async fn next(&mut self) -> anyhow::Result<Option<String>> {
+        match self {
+            Messages::One(text) => Ok(text.take()),
+            Messages::Stdin(lines) => loop {
+                match lines.next_line().await.context("reading stdin")? {
+                    Some(line) if line.trim().is_empty() => continue,
+                    other => return Ok(other),
+                }
+            },
+        }
+    }
+}
+
+/// `publish`: hand the message to the resident tail if there is one, else do it
+/// one-shot (spec §7.2).
+async fn publish_cmd(a: PublishArgs) -> anyhow::Result<()> {
+    init_logging();
+    let ks = Arc::new(keystore::Keystore::resolve()?);
+    let home = keystore::home()?;
+    let ctx = TopicContext::resolve(ks, home, &a.common)?;
+    let mut messages = match a.message {
+        Some(text) => Messages::One(Some(text)),
+        None => {
+            use tokio::io::AsyncBufReadExt as _;
+            Messages::Stdin(tokio::io::BufReader::new(tokio::io::stdin()).lines())
+        }
+    };
+
+    if let Some(mut client) = ipc::ControlClient::connect(&ctx.socket_path()).await? {
+        let mut published = 0usize;
+        while let Some(text) = messages.next().await? {
+            let seq = client.publish(&text).await?;
+            tracing::info!(seq, "published through the resident tail");
+            published += 1;
+        }
+        if published == 0 {
+            eprintln!("wires publish: nothing to publish");
+        }
+        return Ok(());
+    }
+    publish_one_shot(&ctx, messages, PUBLISH_NEIGHBOR_WAIT, PUBLISH_LINGER).await
+}
+
+/// Publish without a resident tail: bind, admit, join, wait for one neighbor,
+/// then seal/append/broadcast each message and linger.
+///
+/// With no reachable peer the messages are still appended locally and the
+/// command exits 0 with a warning: the log is the authority, and the next tail
+/// on this node replays them out (spec §7.2).
+async fn publish_one_shot(
+    ctx: &TopicContext,
+    mut messages: Messages,
+    wait: Duration,
+    linger: Duration,
+) -> anyhow::Result<()> {
+    let store = Arc::new(store::TopicStore::open(&ctx.home, ctx.topic)?);
+    let node = topics::TopicNode::spawn(&ctx.node, ctx.node_config(Arc::clone(&store))).await?;
+
+    let mut book = PeerBook::open(&ctx.home, ctx.topic);
+    let mut changed = false;
+    for peer in &ctx.ticket_peers {
+        changed |= book.record(peer.clone());
+    }
+    if changed {
+        book.save();
+    }
+    let bootstrap = book.list();
+    let (sender, mut events) = node.join(ctx.topic, &bootstrap).await?;
+
+    let neighbor = if bootstrap.is_empty() {
+        // Nothing to wait *for*: this endpoint bound a moment ago on a random
+        // port and no peer has been told about it, so the 15 seconds would buy
+        // only a 15-second pause on every publish from a node that has never
+        // been given a ticket.
+        eprintln!(
+            "wires publish: no known peer on topic {:?} — storing locally (pass `--peer <ticket>`, \
+             or keep a `wires tail` running)",
+            ctx.name
+        );
+        None
+    } else {
+        wait_for_neighbor(&mut events, wait).await
+    };
+    match neighbor {
+        Some(peer) => {
+            tracing::info!(peer = %peer.hex(), "neighbor up; publishing");
+            if book.record(TopicPeer::new(peer)) {
+                book.save();
+            }
+        }
+        None if !bootstrap.is_empty() => eprintln!(
+            "wires publish: no reachable peer on topic {:?} after {}s — the message is stored \
+             locally and reaches the topic on the next catch-up",
+            ctx.name,
+            wait.as_secs()
+        ),
+        None => {}
+    }
+
+    let (version, key) = ctx.keystore.latest_fabric_key()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no fabric key in the keyring; run `wires import --fabric-key-file <node-id>.key`"
+        )
+    })?;
+    let mut published = 0usize;
+    while let Some(text) = messages.next().await? {
+        let envelope = append_local(
+            &store,
+            &ctx.node,
+            ctx.topic,
+            version,
+            &key,
+            &text,
+            now_unix(),
+        )?;
+        if neighbor.is_some() {
+            sender.broadcast(&envelope).await?;
+        }
+        tracing::info!(seq = envelope.seq.0, "published");
+        published += 1;
+    }
+    if published == 0 {
+        eprintln!("wires publish: nothing to publish");
+    } else if neighbor.is_some() {
+        // Gossip needs a moment to actually put the bytes on the wire; closing
+        // the endpoint first would drop them.
+        tokio::time::sleep(linger).await;
+    }
+    node.shutdown().await?;
+    Ok(())
+}
+
+/// Wait up to `wait` for the first mesh neighbor, discarding other events.
+async fn wait_for_neighbor(
+    events: &mut tokio::sync::mpsc::Receiver<topics::TopicEvent>,
+    wait: Duration,
+) -> Option<NodeId> {
+    let until = deadline(wait);
+    loop {
+        match tokio::time::timeout_at(until, events.recv()).await {
+            Ok(Some(topics::TopicEvent::NeighborUp(peer))) => return Some(peer),
+            // Nothing else here is worth waiting on: a one-shot publish neither
+            // prints nor ingests.
+            Ok(Some(_)) => continue,
+            Ok(None) => return None,
+            Err(_) => return None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1729,6 +2919,480 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Topics: preflight, printing, peers, and the control socket (spec §7)
+    // -----------------------------------------------------------------------
+
+    /// A member keystore provisioned exactly as `wires import` would leave it:
+    /// node key, membership, inclusion proof, roster head, and one fabric key.
+    ///
+    /// The keystore directory doubles as `$WIRES_HOME`, which is what it is in
+    /// production — `topics/` and `run/` sit beside `node.seed`.
+    struct Member {
+        /// The provisioned keystore (also the home directory).
+        ks: Arc<keystore::Keystore>,
+        /// That keystore's directory.
+        home: PathBuf,
+        /// The fabric root that signed everything.
+        root: NodeIdentity,
+        /// This member's identity.
+        node: NodeIdentity,
+        /// The data key the (single) commit minted.
+        key: FabricKey,
+        /// The version that key belongs to.
+        version: RosterVersion,
+    }
+
+    /// Provision `who` as a member of a two-member fabric.
+    fn provisioned(who: [u8; 32]) -> Member {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let node = NodeIdentity::from_seed(who);
+        let other = NodeIdentity::from_seed([9u8; 32]);
+        let mut roster = library::Roster::new(root.node_id());
+        roster.insert(node.node_id());
+        roster.insert(other.node_id());
+        let (head, proofs) = roster.commit(&root, 0, i64::MAX).unwrap();
+        let proof = proofs
+            .into_iter()
+            .find(|(m, _)| *m == node.node_id())
+            .unwrap()
+            .1;
+        let key = FabricKey::generate();
+
+        let home = temp_dir();
+        let ks = keystore::Keystore::at(&home);
+        ks.save_node(&node, true).unwrap();
+        ks.save_membership(&Membership::mint(&root, node.node_id(), 0, i64::MAX).unwrap())
+            .unwrap();
+        ks.save_inclusion_proof(&proof).unwrap();
+        ks.save_roster_head(&head).unwrap();
+        ks.save_fabric_key(head.version, &key).unwrap();
+        Member {
+            ks: Arc::new(ks),
+            home,
+            root,
+            node,
+            key,
+            version: head.version,
+        }
+    }
+
+    impl Member {
+        /// `--topic ops --node-seed <this member>`, nothing else.
+        fn args(&self) -> TopicArgs {
+            TopicArgs {
+                topic: "ops".into(),
+                node_seed: Some(self.node.seed_hex()),
+                ..TopicArgs::default()
+            }
+        }
+
+        /// Resolve a context against this keystore.
+        fn resolve(&self, args: &TopicArgs) -> anyhow::Result<TopicContext> {
+            TopicContext::resolve(Arc::clone(&self.ks), self.home.clone(), args)
+        }
+
+        /// The message log for the resolved topic.
+        fn store(&self) -> store::TopicStore {
+            store::TopicStore::open(&self.home, TopicId::derive(self.root.node_id(), "ops"))
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn tail_parses_the_documented_flags() {
+        let cli = Cli::try_parse_from(["wires", "tail", "ops"]).unwrap();
+        match cli.command {
+            Command::Tail(a) => {
+                assert_eq!(a.common.topic, "ops");
+                assert_eq!(a.backfill, DEFAULT_BACKFILL, "the spec's default is 200");
+                assert!(!a.json);
+                assert!(a.common.peer.is_empty());
+            }
+            _ => panic!("expected tail"),
+        }
+        // `--peer` is repeatable; the rest mirror `connect`.
+        let cli = Cli::try_parse_from([
+            "wires",
+            "tail",
+            "ops",
+            "--peer",
+            "t1",
+            "--peer",
+            "t2",
+            "--backfill",
+            "7",
+            "--json",
+            "--relay-url",
+            "https://r",
+            "--node-seed",
+            "ab",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Tail(a) => {
+                assert_eq!(a.common.peer, vec!["t1".to_string(), "t2".to_string()]);
+                assert_eq!(a.backfill, 7);
+                assert!(a.json);
+                assert_eq!(a.common.relay_url.as_deref(), Some("https://r"));
+                assert_eq!(a.common.node_seed.as_deref(), Some("ab"));
+            }
+            _ => panic!("expected tail"),
+        }
+        // A topic is required.
+        assert!(Cli::try_parse_from(["wires", "tail"]).is_err());
+    }
+
+    #[test]
+    fn publish_parses_the_documented_flags() {
+        let cli = Cli::try_parse_from(["wires", "publish", "ops", "-m", "ship it"]).unwrap();
+        match cli.command {
+            Command::Publish(a) => {
+                assert_eq!(a.common.topic, "ops");
+                assert_eq!(a.message.as_deref(), Some("ship it"));
+            }
+            _ => panic!("expected publish"),
+        }
+        // No `--message` is the stdin form, not an error.
+        let cli = Cli::try_parse_from(["wires", "publish", "ops"]).unwrap();
+        match cli.command {
+            Command::Publish(a) => assert!(a.message.is_none()),
+            _ => panic!("expected publish"),
+        }
+    }
+
+    #[test]
+    fn preflight_resolves_a_provisioned_member() {
+        let member = provisioned([2u8; 32]);
+        let ctx = member.resolve(&member.args()).unwrap();
+        assert_eq!(ctx.fabric_root, member.root.node_id());
+        assert_eq!(ctx.topic, TopicId::derive(member.root.node_id(), "ops"));
+        assert_eq!(ctx.membership.member, member.node.node_id());
+        assert_eq!(ctx.name, "ops");
+        assert!(ctx.ticket_peers.is_empty());
+        // The socket and the log live under the same home.
+        assert!(ctx.socket_path().starts_with(&member.home));
+        assert_eq!(
+            ctx.socket_path().file_name().unwrap().to_string_lossy(),
+            format!("{}.sock", ctx.topic.hex())
+        );
+    }
+
+    #[test]
+    fn preflight_names_the_import_for_a_missing_membership() {
+        let member = provisioned([2u8; 32]);
+        std::fs::remove_file(member.ks.path("membership.json")).unwrap();
+        let err = member.resolve(&member.args()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("wires import --membership"), "{msg}");
+    }
+
+    #[test]
+    fn preflight_names_the_import_for_a_missing_proof() {
+        let member = provisioned([2u8; 32]);
+        std::fs::remove_file(member.ks.path("inclusion-proof.json")).unwrap();
+        let err = member.resolve(&member.args()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("wires import --inclusion-proof"), "{msg}");
+        assert!(msg.contains("roster commit --out"), "{msg}");
+    }
+
+    #[test]
+    fn preflight_names_the_import_for_a_missing_head() {
+        let member = provisioned([2u8; 32]);
+        std::fs::remove_file(member.ks.path("roster-head.json")).unwrap();
+        let err = member.resolve(&member.args()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("wires import --roster-head"), "{msg}");
+    }
+
+    #[test]
+    fn preflight_names_the_import_for_an_empty_keyring() {
+        let member = provisioned([2u8; 32]);
+        std::fs::remove_dir_all(member.ks.keyring_dir()).unwrap();
+        let err = member.resolve(&member.args()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("wires import --fabric-key"), "{msg}");
+        assert!(msg.contains("end-to-end encrypted"), "{msg}");
+    }
+
+    #[test]
+    fn preflight_refuses_a_credential_issued_to_another_node() {
+        // Bob's keystore, but Alice's node seed on the command line.
+        let member = provisioned([2u8; 32]);
+        let stranger = NodeIdentity::from_seed([7u8; 32]);
+        let args = TopicArgs {
+            node_seed: Some(stranger.seed_hex()),
+            ..member.args()
+        };
+        let msg = format!("{:#}", member.resolve(&args).unwrap_err());
+        assert!(msg.contains(&stranger.node_id().hex()), "{msg}");
+        assert!(msg.contains("wires import --membership"), "{msg}");
+    }
+
+    #[test]
+    fn preflight_refuses_a_ticket_from_another_fabric_or_topic() {
+        let member = provisioned([2u8; 32]);
+        let stranger = NodeIdentity::from_seed([8u8; 32]).node_id();
+
+        let foreign = TopicTicket::new(stranger, "ops", vec![TopicPeer::new(stranger)])
+            .encode()
+            .unwrap();
+        let args = TopicArgs {
+            peer: vec![foreign],
+            ..member.args()
+        };
+        let msg = format!("{:#}", member.resolve(&args).unwrap_err());
+        assert!(
+            msg.contains("another fabric") || msg.contains("for fabric"),
+            "{msg}"
+        );
+
+        let other_topic = TopicTicket::new(member.root.node_id(), "eng", Vec::new())
+            .encode()
+            .unwrap();
+        let args = TopicArgs {
+            peer: vec![other_topic],
+            ..member.args()
+        };
+        let msg = format!("{:#}", member.resolve(&args).unwrap_err());
+        assert!(msg.contains("\"eng\""), "{msg}");
+    }
+
+    #[test]
+    fn preflight_takes_the_peers_off_a_good_ticket() {
+        let member = provisioned([2u8; 32]);
+        let peer = TopicPeer::new(NodeIdentity::from_seed([9u8; 32]).node_id())
+            .with_addrs(vec!["127.0.0.1:4242".parse().unwrap()]);
+        let ticket = TopicTicket::new(member.root.node_id(), "ops", vec![peer.clone()])
+            .encode()
+            .unwrap();
+        let args = TopicArgs {
+            peer: vec![ticket],
+            ..member.args()
+        };
+        let ctx = member.resolve(&args).unwrap();
+        assert_eq!(ctx.ticket_peers, vec![peer]);
+    }
+
+    #[test]
+    fn append_local_allocates_a_dense_chain() {
+        // The one-shot publish path with no network in it at all: allocate,
+        // seal, append. Two calls must produce seq 0 then 1, linked.
+        let member = provisioned([2u8; 32]);
+        let ctx = member.resolve(&member.args()).unwrap();
+        let store = member.store();
+
+        let first = append_local(
+            &store,
+            &member.node,
+            ctx.topic,
+            member.version,
+            &member.key,
+            "one",
+            1_000,
+        )
+        .unwrap();
+        let second = append_local(
+            &store,
+            &member.node,
+            ctx.topic,
+            member.version,
+            &member.key,
+            "two",
+            1_001,
+        )
+        .unwrap();
+
+        assert_eq!(first.seq, Seq(0));
+        assert_eq!(second.seq, Seq(1));
+        assert!(first.prev_hash.is_zero(), "genesis links to nothing");
+        assert_eq!(second.prev_hash, first.message_hash().unwrap());
+        assert_eq!(first.open(&member.key).unwrap(), b"one");
+
+        // Both are in the log, and the chain state agrees with the last one.
+        let state = store.chain_state(member.node.node_id()).unwrap().unwrap();
+        assert_eq!(state.seq, Seq(1));
+        assert_eq!(state.hash, second.message_hash().unwrap());
+        assert_eq!(store.read_backfill(10).unwrap(), vec![first, second]);
+    }
+
+    #[tokio::test]
+    async fn publish_reaches_a_minimal_tail_loop_over_the_control_socket() {
+        let member = provisioned([2u8; 32]);
+        let ctx = member.resolve(&member.args()).unwrap();
+        let store = Arc::new(member.store());
+
+        // The socket lives under a short scratch path on purpose: a unix socket
+        // path is capped at ~104 bytes and Bazel's temp root is longer than
+        // that. `socket_path`'s own shape is asserted in `ipc`'s suite.
+        let scratch = ipc::ScratchDir::new("pub");
+        let path = scratch.socket("p.sock");
+        let socket = ipc::ControlSocket::bind(&path).await.unwrap();
+        let (tx, mut requests) = tokio::sync::mpsc::channel(4);
+        let server = socket.spawn(tx);
+
+        // The tail loop, reduced to the part `wires publish` talks to: the
+        // single sequence allocator.
+        let loop_store = Arc::clone(&store);
+        let node = NodeIdentity::from_seed([2u8; 32]);
+        let (topic, version, key) = (ctx.topic, member.version, member.key.clone());
+        let tail = tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                let answer =
+                    append_local(&loop_store, &node, topic, version, &key, &request.text, 5)
+                        .map(|envelope| envelope.seq.0)
+                        .map_err(|e| format!("{e:#}"));
+                let _ = request.reply.send(answer);
+            }
+        });
+
+        let mut client = ipc::ControlClient::connect(&path).await.unwrap().unwrap();
+        assert_eq!(client.publish("hello").await.unwrap(), 0);
+        assert_eq!(client.publish("again").await.unwrap(), 1);
+
+        // The tail — not the publisher — allocated and stored them.
+        let stored = store.read_backfill(10).unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].open(&member.key).unwrap(), b"hello");
+        assert_eq!(stored[1].open(&member.key).unwrap(), b"again");
+        assert_eq!(stored[1].prev_hash, stored[0].message_hash().unwrap());
+
+        drop(client);
+        server.abort();
+        tail.abort();
+    }
+
+    #[test]
+    fn a_message_line_has_a_fixed_shape() {
+        let member = provisioned([2u8; 32]);
+        let ctx = member.resolve(&member.args()).unwrap();
+        let store = member.store();
+        // 01:02:05 UTC, fixed, so the line is byte-comparable.
+        let envelope = append_local(
+            &store,
+            &member.node,
+            ctx.topic,
+            member.version,
+            &member.key,
+            "ship it",
+            3_725,
+        )
+        .unwrap();
+
+        let printer = Printer { json: false };
+        assert_eq!(
+            printer.render(&envelope, "ship it"),
+            format!("01:02:05 {} ship it", &member.node.node_id().hex()[..8])
+        );
+        // The clock is dateless and wraps by day; a pre-epoch timestamp still
+        // renders rather than panicking.
+        assert_eq!(format_clock(0), "00:00:00");
+        assert_eq!(format_clock(86_399), "23:59:59");
+        assert_eq!(format_clock(86_400 + 61), "00:01:01");
+        assert_eq!(format_clock(-1), "23:59:59");
+    }
+
+    #[test]
+    fn the_json_line_carries_the_documented_fields() {
+        let member = provisioned([2u8; 32]);
+        let ctx = member.resolve(&member.args()).unwrap();
+        let store = member.store();
+        let envelope = append_local(
+            &store,
+            &member.node,
+            ctx.topic,
+            member.version,
+            &member.key,
+            "ship it",
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let line = Printer { json: true }.render(&envelope, "ship it");
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["ts"], 1_700_000_000i64);
+        assert_eq!(value["sender"], member.node.node_id().hex());
+        assert_eq!(value["seq"], 0);
+        assert_eq!(value["text"], "ship it");
+        // One line, so NDJSON stays NDJSON.
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn an_unknown_key_version_warns_once_and_heals_on_import() {
+        let member = provisioned([2u8; 32]);
+        let ctx = member.resolve(&member.args()).unwrap();
+        let store = member.store();
+        let envelope = append_local(
+            &store,
+            &member.node,
+            ctx.topic,
+            member.version,
+            &member.key,
+            "later",
+            1,
+        )
+        .unwrap();
+
+        // A keystore with no keyring at all: the message is stored, not shown.
+        let empty = Arc::new(keystore::Keystore::at(temp_dir()));
+        let mut keyring = Keyring::load(Arc::clone(&empty)).unwrap();
+        assert!(keyring.open(&envelope).is_none());
+        assert!(keyring.open(&envelope).is_none());
+        assert_eq!(
+            keyring.warned.len(),
+            1,
+            "one warning per version, not per message"
+        );
+
+        // The key arrives; the next message opens without a restart.
+        empty.save_fabric_key(member.version, &member.key).unwrap();
+        assert_eq!(keyring.open(&envelope).unwrap(), b"later");
+    }
+
+    #[test]
+    fn the_peer_book_unions_hints_and_survives_a_restart() {
+        let home = temp_dir();
+        let topic = TopicId::derive(NodeIdentity::from_seed([1u8; 32]).node_id(), "ops");
+        let node = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let hinted = TopicPeer::new(node).with_addrs(vec!["127.0.0.1:9".parse().unwrap()]);
+
+        let mut book = PeerBook::open(&home, topic);
+        assert!(book.list().is_empty());
+        assert!(book.record(hinted.clone()));
+        assert!(
+            !book.record(hinted.clone()),
+            "recording twice changes nothing"
+        );
+        // A bare `NeighborUp` for a peer whose addresses are known must not
+        // erase them — a hint with no address is not an improvement.
+        assert!(!book.record(TopicPeer::new(node)));
+        assert_eq!(book.list(), vec![hinted.clone()]);
+        book.save();
+
+        // A second peer, learned live, joins the file.
+        let live = NodeIdentity::from_seed([3u8; 32]).node_id();
+        assert!(book.record(TopicPeer::new(live)));
+        book.save();
+
+        let reopened = PeerBook::open(&home, topic);
+        let mut expected = vec![hinted, TopicPeer::new(live)];
+        expected.sort_by_key(|p| p.node);
+        assert_eq!(reopened.list(), expected);
+        assert!(peers_path(&home, topic).is_file());
+    }
+
+    #[test]
+    fn a_corrupt_peer_file_is_ignored_rather_than_fatal() {
+        let home = temp_dir();
+        let topic = TopicId::derive(NodeIdentity::from_seed([1u8; 32]).node_id(), "ops");
+        let path = peers_path(&home, topic);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(PeerBook::open(&home, topic).list().is_empty());
     }
 
     #[test]
