@@ -615,7 +615,7 @@ impl TopicNode {
             );
         }
         let me = TopicPeer::new(self.node_id())
-            .with_addrs(self.endpoint.bound_sockets())
+            .with_addrs(ticket_addrs(&self.endpoint))
             .with_relay_url(self.relay_url.clone());
         Ok(TopicTicket::new(self.fabric_root, name, vec![me]))
     }
@@ -645,6 +645,48 @@ impl TopicNode {
         self.endpoint.close().await;
         Ok(())
     }
+}
+
+/// The socket addresses to advertise in this node's [`TopicTicket`].
+///
+/// **Not `Endpoint::bound_sockets()`**, which is what the endpoint *bound* and
+/// not what anyone can dial: with the default wildcard bind those are
+/// `0.0.0.0:p` and `[::]:p`, and the unspecified address is not an address a
+/// peer can connect to. Handing them out produced a ticket that failed between
+/// machines always and on one machine intermittently — some stacks route a
+/// connect to `0.0.0.0` to loopback, some let it time out — which reads as a
+/// flaky mesh rather than as a bad hint.
+///
+/// So the primary source is [`Endpoint::addr`], iroh's own view of where this
+/// endpoint is reachable (real interface addresses, discovered and kept
+/// current). Loopback forms of the bound ports are appended behind it, because
+/// two nodes on one machine are the demo, the soak, and most of development,
+/// and on a host with no usable interface (an offline laptop, a sandboxed CI
+/// runner) `addr()` is legitimately empty.
+///
+/// Every entry is a *hint*: iroh authenticates the far side to the ticket's
+/// node id regardless of which address answered, so a hint that reaches the
+/// wrong host fails the handshake rather than connecting to an impostor. The
+/// cost of an extra one is a dial that fails fast.
+fn ticket_addrs(endpoint: &Endpoint) -> Vec<std::net::SocketAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let mut addrs: Vec<SocketAddr> = endpoint.addr().ip_addrs().copied().collect();
+    for sock in endpoint.bound_sockets() {
+        let dialable = match sock {
+            SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
+                SocketAddr::from((Ipv4Addr::LOCALHOST, v4.port()))
+            }
+            SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
+                SocketAddr::from((Ipv6Addr::LOCALHOST, v6.port()))
+            }
+            other => other,
+        };
+        if !addrs.contains(&dialable) {
+            addrs.push(dialable);
+        }
+    }
+    addrs
 }
 
 /// Pump one gossip subscription into `tx` as [`TopicEvent`]s.
@@ -1077,7 +1119,21 @@ mod tests {
         assert_eq!(ticket.topic_id(), fabric.topic);
         assert_eq!(ticket.peers.len(), 1);
         assert_eq!(ticket.peers[0].node, node.node_id());
-        assert_eq!(ticket.peers[0].addrs, node.endpoint().bound_sockets());
+        // Dialable hints, not the wildcard binds: every advertised address must
+        // be one a peer can actually connect to (see `ticket_addrs`).
+        assert!(!ticket.peers[0].addrs.is_empty());
+        for addr in &ticket.peers[0].addrs {
+            assert!(!addr.ip().is_unspecified(), "{addr} is not dialable");
+        }
+        // And the loopback form of every bound port is in there, so a second
+        // node on this machine can reach it with no discovery at all.
+        for sock in localhost_socks(node.endpoint()) {
+            assert!(
+                ticket.peers[0].addrs.contains(&sock),
+                "{sock} missing from {:?}",
+                ticket.peers[0].addrs
+            );
+        }
         assert_eq!(
             TopicTicket::decode(&ticket.encode().unwrap()).unwrap(),
             ticket
