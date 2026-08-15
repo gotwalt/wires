@@ -23,6 +23,17 @@ mod store;
 mod topics;
 mod transport;
 
+/// The five money-shot integration tests of spec §9 — the whole stack over
+/// hermetic loopback, in one place because none of them belongs to a single
+/// module's seam.
+///
+/// Declared `#[cfg(test)]` rather than carrying an inner `#![cfg(test)]`: the
+/// `srcs = glob(["*.rs"])` in `BUILD` hands `e2e.rs` to both the binary and the
+/// test target, and gating the `mod` item is what keeps it out of the shipped
+/// binary entirely instead of compiling to an empty module.
+#[cfg(test)]
+mod e2e;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io::Write as _;
