@@ -3087,7 +3087,7 @@ mod tests {
         assert!(ctx.socket_path().starts_with(&member.home));
         assert_eq!(
             ctx.socket_path().file_name().unwrap().to_string_lossy(),
-            format!("{}.sock", ctx.topic.hex())
+            format!("{}.sock", &ctx.topic.hex()[..16])
         );
     }
 

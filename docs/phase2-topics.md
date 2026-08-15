@@ -327,7 +327,9 @@ pub const MAX_REPLAY_FRAME: usize = 1024 * 1024;
 
 Ownership: redb is single-process and one endpoint identity must not run twice →
 **`wires tail` is the resident node** (store + endpoint + gossip + admission +
-replay server + unix control socket `$WIRES_HOME/run/<topic-hex>.sock`, 0600,
+replay server + unix control socket `$WIRES_HOME/run/<topic-hex[..16]>.sock`
+(the full 64 does not fit in `sockaddr_un::sun_path` — 104 bytes on macOS —
+once the home is any deeper than `~/.config/wires`), 0600,
 unlinked on exit, stale-socket probe). `wires publish`:
 1. Socket accepts → `{"publish":{"text":…}}` NDJSON; tail allocates seq, seals,
    appends, broadcasts; reply `{"ok":{"seq":N}}` / `{"err":…}`.

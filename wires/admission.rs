@@ -246,6 +246,10 @@ pub struct AdmitHandler {
     pub head: Arc<HeadSource>,
     /// This node's own inclusion proof, presented in the request and the ack so
     /// the far side can gate us in turn.
+    ///
+    /// The *startup* proof — the floor, not the last word. Every handshake asks
+    /// [`load_proof`](Self::load_proof) instead, which prefers a newer one from
+    /// the keystore, for the reason spelled out there.
     pub proof: InclusionProof,
     /// Where an adopted head is persisted (`roster-head.json`).
     ///
@@ -346,6 +350,47 @@ impl AdmitHandler {
         match self.head.load()? {
             Some(head) => Ok(head),
             None => bail!("no roster head available; topic admission requires one"),
+        }
+    }
+
+    /// This node's own inclusion proof to present right now: the keystore's, if
+    /// it is for a strictly newer roster version than the one this handler
+    /// started with, and the startup proof otherwise.
+    ///
+    /// **The mirror of [`load_head`](Self::load_head), and needed for the same
+    /// reason.** Every `roster commit` invalidates *every* member's proof,
+    /// including the survivors' — so the commit that removes one member hands
+    /// each of the others a new `<node-id>.proof`, and `wires import` installs
+    /// it. A resident `wires tail` that kept presenting the proof it read at
+    /// startup would pair a freshly re-read head with a proof issued against
+    /// the previous one, and the far side is right to refuse that: `stale
+    /// inclusion proof: proof targets version 1, head is version 2`. The effect
+    /// was that after any commit, a running tail could no longer be admitted by
+    /// *anyone* until it was restarted — which is precisely the restart the
+    /// revocation story (spec §2.4) claims not to need.
+    ///
+    /// Only *forward*: a keystore proof for an older version is ignored, so a
+    /// pinned `--inclusion-proof` still wins over a stale file, and a keystore
+    /// that has been rolled back cannot walk this node's credential backwards.
+    /// A proof issued to some other node is ignored too — presenting it would
+    /// be a refusal on the far side at best, since admission binds the proof to
+    /// the connection's authenticated key.
+    ///
+    /// Failing to read the keystore is not fatal here: the startup proof is
+    /// still a real credential, and a handshake attempted with it beats no
+    /// handshake at all.
+    fn load_proof(&self) -> InclusionProof {
+        match self.keystore.read_inclusion_proof() {
+            Ok(Some(fresh))
+                if fresh.version > self.proof.version && fresh.member == self.proof.member =>
+            {
+                fresh
+            }
+            Ok(_) => self.proof.clone(),
+            Err(e) => {
+                tracing::warn!("re-reading this node's inclusion proof: {e:#}");
+                self.proof.clone()
+            }
         }
     }
 }
@@ -564,7 +609,7 @@ where
         &AdmitFrame::Ack {
             topic: handler.topic,
             head: local,
-            proof: handler.proof.clone(),
+            proof: handler.load_proof(),
         },
     )
     .await?;
@@ -602,7 +647,7 @@ where
         &AdmitFrame::Request {
             topic: handler.topic,
             head: local.clone(),
-            proof: handler.proof.clone(),
+            proof: handler.load_proof(),
         },
     )
     .await?;
@@ -1171,6 +1216,86 @@ mod tests {
             .await
             .expect_err("4 GiB of unauthenticated buffering must be refused");
         assert!(format!("{e:#}").contains("too large"));
+    }
+
+    // -------------------------------------------------- our own credential
+
+    /// The regression behind [`AdmitHandler::load_proof`], found by
+    /// `.scripts/demo-topic-revoke.sh`: a resident tail that kept presenting
+    /// its startup proof paired it with a freshly re-read head one version
+    /// ahead, and every peer correctly refused the mismatch — so a `roster
+    /// commit` locked the running tail out of the mesh until it was restarted,
+    /// which is the restart spec §2.4 promises is unnecessary.
+    #[tokio::test]
+    async fn an_imported_newer_proof_is_presented_without_a_restart() {
+        let (root, me, peer) = (root(), me(), peer());
+        let mut roster = roster_of(&root, &[me.node_id(), peer.node_id()]);
+        let (v1, v1_proofs) = commit(&mut roster, &root);
+        let (v2, v2_proofs) = commit(&mut roster, &root);
+
+        let dir = temp_dir();
+        let handler = handler_with(&dir, &v1, v1_proofs[&me.node_id()].clone());
+        assert_eq!(handler.load_proof().version, v1.version, "nothing imported");
+
+        // `wires import --inclusion-proof-file <me>.proof` from the v2 commit.
+        handler
+            .keystore
+            .save_inclusion_proof(&v2_proofs[&me.node_id()])
+            .unwrap();
+        assert_eq!(
+            handler.load_proof().version,
+            v2.version,
+            "the imported proof must be the one presented"
+        );
+
+        // And the far side accepts what we now present: v2 head, v2 proof.
+        let theirs = handler_with(&temp_dir(), &v2, v2_proofs[&peer.node_id()].clone());
+        let (result, _) = serve_once(
+            &theirs,
+            me.node_id(),
+            AdmitFrame::Request {
+                topic: theirs.topic,
+                head: v2.clone(),
+                proof: handler.load_proof(),
+            },
+            0,
+        )
+        .await;
+        result.expect("a member presenting its current proof is admitted");
+    }
+
+    /// Only forward, and only ours: a keystore proof that is older, or issued
+    /// to somebody else, must not displace the one this node started with.
+    #[test]
+    fn a_stale_or_foreign_keystore_proof_is_ignored() {
+        let (root, me, peer) = (root(), me(), peer());
+        let mut roster = roster_of(&root, &[me.node_id(), peer.node_id()]);
+        let (v1, v1_proofs) = commit(&mut roster, &root);
+        let (v2, v2_proofs) = commit(&mut roster, &root);
+
+        let dir = temp_dir();
+        let handler = handler_with(&dir, &v2, v2_proofs[&me.node_id()].clone());
+
+        // Rolled back to the previous commit's proof: ignored.
+        handler
+            .keystore
+            .save_inclusion_proof(&v1_proofs[&me.node_id()])
+            .unwrap();
+        assert_eq!(handler.load_proof().version, v2.version);
+        assert_ne!(v1.version, v2.version, "the two commits differ");
+
+        // Another member's proof, however new: ignored. Presenting it would be
+        // refused anyway — admission binds the proof to the connection's key —
+        // but this node must not try.
+        let mut roster3 = roster;
+        let (_, v3_proofs) = commit(&mut roster3, &root);
+        handler
+            .keystore
+            .save_inclusion_proof(&v3_proofs[&peer.node_id()])
+            .unwrap();
+        let presented = handler.load_proof();
+        assert_eq!(presented.member, me.node_id());
+        assert_eq!(presented.version, v2.version);
     }
 
     // ------------------------------------------------------- head adoption

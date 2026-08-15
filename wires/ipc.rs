@@ -10,7 +10,7 @@
 //! synthetic IV exists to survive rather than to invite (spec §4.1).
 //!
 //! So publishing is a *request to the tail*, over a unix socket at
-//! `$WIRES_HOME/run/<topic-hex>.sock`:
+//! `$WIRES_HOME/run/<topic-hex-prefix>.sock` (see [`socket_path`]):
 //!
 //! ```text
 //! publish → {"publish":{"text":"ship it"}}
@@ -69,17 +69,38 @@ pub fn run_dir(home: &Path) -> PathBuf {
     home.join(RUN_DIR)
 }
 
+/// How many hex characters of the topic id name a control socket.
+///
+/// **Not all 64, and that is not an aesthetic choice.** A unix socket path is
+/// not a path like any other: the whole absolute path has to fit in
+/// `sockaddr_un::sun_path`, which is 104 bytes on macOS and 108 on Linux, and
+/// overflowing it is not a truncation but a hard `bind`/`connect` failure
+/// (`path must be shorter than SUN_LEN`). `<home>/run/<64 hex>.sock` spends 74
+/// of those bytes before the home is counted, which leaves under 30 for the
+/// home on macOS: `/Users/<name>/.config/wires` just fits, and nothing deeper
+/// does. Every test harness and demo script on this platform puts its home
+/// under `/var/folders/…/T/tmp.XXXXXXXX`, and those could not publish at all.
+///
+/// Sixteen hex characters is 64 bits of a `blake3::derive_key` output. The
+/// collision it risks is two topics *inside one keystore* sharing one socket —
+/// not something reachable from outside the home, which is 0700 — at 2^-64 per
+/// pair, against a certainty of unusable paths at 64 characters.
+const SOCKET_NAME_HEX: usize = 16;
+
 /// The control socket path for `topic` under the wires home `home`:
-/// `<home>/run/<topic-hex>.sock`.
+/// `<home>/run/<topic-hex-prefix>.sock`, where the prefix is the first
+/// [`SOCKET_NAME_HEX`] characters of the topic id.
 ///
 /// Named by topic id rather than by name, so two fabrics' `ops` topics do not
 /// collide and the path is derivable by any process that can derive the id.
 ///
 /// ```text
-/// ~/.config/wires/run/1f0c…9ab3.sock
+/// ~/.config/wires/run/1f0c9ab3a1b2c3d4.sock
 /// ```
 pub fn socket_path(home: &Path, topic: TopicId) -> PathBuf {
-    run_dir(home).join(format!("{}.sock", topic.hex()))
+    let hex = topic.hex();
+    let name = &hex[..SOCKET_NAME_HEX.min(hex.len())];
+    run_dir(home).join(format!("{name}.sock"))
 }
 
 // ---------------------------------------------------------------------------
@@ -562,8 +583,36 @@ mod tests {
             path,
             PathBuf::from("/wires-home")
                 .join(RUN_DIR)
-                .join(format!("{}.sock", topic.hex()))
+                .join(format!("{}.sock", &topic.hex()[..SOCKET_NAME_HEX]))
         );
+    }
+
+    /// The regression behind [`SOCKET_NAME_HEX`]: a home under the platform
+    /// temp directory — which is where every harness and demo script puts one —
+    /// must still produce a bindable path. macOS caps `sun_path` at 104 bytes,
+    /// so this is the assertion that the name is short enough to leave room for
+    /// a real home.
+    #[test]
+    fn socket_path_fits_in_a_unix_sockaddr() {
+        /// The smaller of the two platform limits (macOS 104, Linux 108), minus
+        /// the NUL terminator.
+        const SUN_LEN: usize = 103;
+        let fabric = library::NodeIdentity::from_seed([7u8; 32]).node_id();
+        let topic = TopicId::derive(fabric, "ops");
+        // A macOS `mktemp -d` home, plus a per-node subdirectory: the exact
+        // shape `.scripts/demo-topic.sh` provisions.
+        let home = Path::new("/var/folders/zb/x2_9m2_n3759fz_fy3b5w4yr0000gn/T/tmp.gAtytESDox")
+            .join("agent-b");
+        let path = socket_path(&home, topic);
+        let len = path.as_os_str().as_encoded_bytes().len();
+        assert!(len <= SUN_LEN, "{} is {len} bytes", path.display());
+        // And binding it really works, which is the property the length is a
+        // proxy for.
+        let scratch = ScratchDir::new("sockaddr");
+        let real = socket_path(scratch.path(), topic);
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&real).unwrap();
+        drop(listener);
     }
 
     #[test]
