@@ -143,11 +143,21 @@ impl TopicStore {
     }
 
     /// The topic this log belongs to.
+    ///
+    /// `#[cfg(test)]`: every production entry point compares against the field
+    /// directly, so this is the fixtures' way of asserting a log was opened for
+    /// the topic they asked for.
+    #[cfg(test)]
     pub fn topic(&self) -> TopicId {
         self.topic
     }
 
     /// Where this log lives on disk.
+    ///
+    /// `#[cfg(test)]`: the field is what error messages interpolate; the
+    /// accessor exists so the suite can assert the home layout and the `0600`
+    /// mode of a file it did not choose the path of.
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }

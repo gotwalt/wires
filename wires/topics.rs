@@ -66,7 +66,7 @@ use crate::admission::{
     ADMIT_RECHECK, AdmitHandler, Admitted, GatedGossip, admit_peer, spawn_watchdog,
 };
 use crate::keystore::Keystore;
-use crate::replay::{REPLAY_DEBOUNCE, REPLAY_LIMIT, ReplayHandler};
+use crate::replay::{REPLAY_LIMIT, ReplayHandler};
 use crate::store::TopicStore;
 use crate::transport::{Denied, HeadSource, endpoint_id, secret_key, to_node_id};
 
@@ -120,9 +120,6 @@ pub struct TopicNodeConfig {
     /// current head — the revocation-latency number (default
     /// [`ADMIT_RECHECK`]).
     pub admit_recheck: Duration,
-    /// How long a live chain gap waits before triggering a catch-up pass
-    /// (default [`REPLAY_DEBOUNCE`]).
-    pub replay_debounce: Duration,
     /// Maximum items this node will stream in one replay pass (default
     /// [`REPLAY_LIMIT`]).
     pub replay_limit: u32,
@@ -150,7 +147,6 @@ impl TopicNodeConfig {
             store,
             relay_url: None,
             admit_recheck: ADMIT_RECHECK,
-            replay_debounce: REPLAY_DEBOUNCE,
             replay_limit: REPLAY_LIMIT,
             channel_cap: EVENT_CHANNEL_CAP,
         }
@@ -165,7 +161,6 @@ impl std::fmt::Debug for TopicNodeConfig {
             .field("head", &self.head)
             .field("relay_url", &self.relay_url)
             .field("admit_recheck", &self.admit_recheck)
-            .field("replay_debounce", &self.replay_debounce)
             .field("replay_limit", &self.replay_limit)
             .field("channel_cap", &self.channel_cap)
             .finish_non_exhaustive()
@@ -219,6 +214,11 @@ impl TopicSender {
     }
 
     /// The topic this sender broadcasts on.
+    ///
+    /// `#[cfg(test)]`: the production path reads the field directly in
+    /// [`broadcast`](Self::broadcast)'s guard, so this exists only for the
+    /// fixtures that assert a sender came back bound to the topic they joined.
+    #[cfg(test)]
     pub fn topic(&self) -> TopicId {
         self.topic
     }
@@ -459,12 +459,6 @@ impl TopicNode {
     /// [`admit_peer`](crate::admission::admit_peer).
     pub fn admit(&self) -> &Arc<AdmitHandler> {
         &self.admit
-    }
-
-    /// The shared allowlist — also the dial set for replay catch-up
-    /// ([`Admitted::peers`]).
-    pub fn admitted(&self) -> &Admitted {
-        &self.admitted
     }
 
     /// The topic log.
@@ -972,8 +966,8 @@ mod tests {
 
         assert_eq!(wait_neighbor_up(&mut rx_a).await, b.node_id());
         assert_eq!(wait_neighbor_up(&mut rx_b).await, a.node_id());
-        assert!(node_a.admitted().peers().contains(&b.node_id()));
-        assert!(node_b.admitted().peers().contains(&a.node_id()));
+        assert!(node_a.admit().admitted.peers().contains(&b.node_id()));
+        assert!(node_b.admit().admitted.peers().contains(&a.node_id()));
 
         let envelope = sealed(&a, &fabric, 0, MessageHash::ZERO, "ship it");
         send_a.broadcast(&envelope).await.unwrap();
@@ -1031,7 +1025,11 @@ mod tests {
         }
 
         assert!(
-            !node_b.admitted().peers().contains(&outsider.node_id()),
+            !node_b
+                .admit()
+                .admitted
+                .peers()
+                .contains(&outsider.node_id()),
             "an unadmitted dial must not put anyone in the registry"
         );
         assert!(

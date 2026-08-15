@@ -214,6 +214,11 @@ impl ControlSocket {
     }
 
     /// Where this socket lives.
+    ///
+    /// `#[cfg(test)]`: the field drives the unlink on drop and the error
+    /// messages; the accessor exists so the suite can assert the socket bound
+    /// where it was asked to.
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -61,6 +61,9 @@ D="$(mktemp -d)"
 A_PID=""
 B_PID=""
 C_PID=""
+# Declared before the trap that uses it: a `for` variable that first appears
+# inside a trap string reads as unassigned to shellcheck (SC2154).
+p=""
 trap 'for p in $A_PID $B_PID $C_PID; do kill "$p" 2>/dev/null || true; done; [ -n "$KEEP" ] || rm -rf "$D"' EXIT INT TERM
 
 say() { [ -n "$QUIET" ] || printf '\033[36m[demo]\033[0m %s\n' "$*" >&2; }
@@ -127,7 +130,6 @@ WIRES_HOME="$op" "$WIRES" keygen --save-root >/dev/null
 for h in "$a" "$b" "$c"; do WIRES_HOME="$h" "$WIRES" keygen --save-node >/dev/null; done
 
 node_id() { "$WIRES" keygen --node-seed "$(tr -d '\n' <"$1/node.seed")" | awk '/^node_id/{print $2}'; }
-ROOT_ID="$("$WIRES" keygen --root-seed "$(tr -d '\n' <"$op/root.seed")" | awk '/^root_id/{print $2}')"
 A_ID="$(node_id "$a")"
 B_ID="$(node_id "$b")"
 C_ID="$(node_id "$c")"

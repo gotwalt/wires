@@ -47,7 +47,6 @@
 //! one pass per message.
 
 use std::collections::HashSet;
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,8 +58,6 @@ use library::{
     ChainState, LinkStatus, NodeId, ReplayFrame, Seq, TopicEnvelope, TopicId, classify_link,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 use crate::admission::{AdmitHandler, Admitted};
 use crate::store::{Appended, TopicStore};
@@ -68,11 +65,12 @@ use crate::transport::{Denied, to_node_id};
 
 /// How long a detected chain gap waits before triggering a catch-up pass.
 ///
-/// **Injectable.** This is the default the resident node reads into
-/// [`TopicNodeConfig::replay_debounce`](crate::topics::TopicNodeConfig::replay_debounce);
-/// every code path that waits takes the duration as an argument, so
-/// `live_gap_triggers_replay_and_heals` runs in milliseconds and no test in the
-/// suite sleeps for two seconds.
+/// The resident tail's own constant: `run_tail` folds a gap, a new neighbor, a
+/// lag, and a successful redial into one pending catch-up deadline, so the
+/// window coalesces every reason to replay rather than only this one. Tests
+/// that need a fast window run their own ingest loop with their own duration —
+/// there is deliberately no injectable knob here, because a debounce nothing
+/// but a test reads is a knob that lies.
 ///
 /// Two seconds is chosen to coalesce, not to be quick: reordered deliveries
 /// arrive within milliseconds of each other, so one window swallows a burst,
@@ -604,99 +602,6 @@ pub(crate) fn ingest(
 }
 
 // ---------------------------------------------------------------------------
-// The debounced gap heal
-// ---------------------------------------------------------------------------
-
-/// The handle a live ingest path raises when it sees a [`Ingested::Gap`].
-///
-/// Cheap to clone, and deliberately *not* an async API: raising a gap must never
-/// block the reader that found it, and must never fail — a signal that cannot be
-/// queued is one that is already queued, which is the whole coalescing story in
-/// one sentence.
-#[derive(Clone, Debug)]
-pub struct GapSignal {
-    /// Capacity **one**, written with `try_send`. A full channel means a heal is
-    /// already pending, so the extra signal is redundant rather than lost.
-    tx: mpsc::Sender<()>,
-}
-
-impl GapSignal {
-    /// Note that the chain has a hole. Returns immediately; the heal happens
-    /// [`REPLAY_DEBOUNCE`] later, on the [`heal_gaps`] task.
-    pub fn raise(&self) {
-        let _ = self.tx.try_send(());
-    }
-}
-
-/// A [`GapSignal`] and the receiver [`heal_gaps`] consumes.
-pub fn gap_channel() -> (GapSignal, mpsc::Receiver<()>) {
-    let (tx, rx) = mpsc::channel(1);
-    (GapSignal { tx }, rx)
-}
-
-/// Turn a stream of gap signals into debounced, coalesced catch-up passes.
-///
-/// One signal starts a `debounce` window; every signal that lands inside it —
-/// and a burst of out-of-order deliveries is exactly that — is folded into the
-/// *same* pass, so a reordered run costs one replay, not one per message. A
-/// signal raised while a pass is running schedules the next one, because the
-/// hole it saw may not be the hole that pass filled.
-///
-/// Generic over the pass so the coalescing is testable without a network:
-/// [`spawn_gap_healer`] supplies the real one.
-///
-/// Ends when every [`GapSignal`] has been dropped.
-pub async fn heal_gaps<F, Fut>(mut signals: mpsc::Receiver<()>, debounce: Duration, mut pass: F)
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    while signals.recv().await.is_some() {
-        tokio::time::sleep(debounce).await;
-        // Everything that arrived during the window belongs to this pass.
-        while signals.try_recv().is_ok() {}
-        pass().await;
-    }
-}
-
-/// Spawn the gap healer for a live topic: gap signals in, [`catch_up`] passes
-/// out.
-///
-/// Every collaborator is owned (an [`Endpoint`] clone and two `Arc`s) because
-/// the task outlives the caller's stack frame; `debounce` and `limit` are
-/// parameters rather than the constants so the heal test runs in milliseconds.
-pub fn spawn_gap_healer(
-    endpoint: Endpoint,
-    admit: Arc<AdmitHandler>,
-    store: Arc<TopicStore>,
-    topic: TopicId,
-    limit: u32,
-    debounce: Duration,
-) -> (GapSignal, JoinHandle<()>) {
-    let (signal, signals) = gap_channel();
-    let task = tokio::spawn(async move {
-        heal_gaps(signals, debounce, move || {
-            let endpoint = endpoint.clone();
-            let admit = Arc::clone(&admit);
-            let store = Arc::clone(&store);
-            async move {
-                match catch_up(&endpoint, &admit, &store, topic, limit).await {
-                    Ok(counts) => tracing::info!(
-                        peers = counts.peers,
-                        inserted = counts.inserted,
-                        refused = counts.refused,
-                        "healed a chain gap by replay"
-                    ),
-                    Err(e) => tracing::warn!("gap heal failed: {e:#}"),
-                }
-            }
-        })
-        .await;
-    });
-    (signal, task)
-}
-
-// ---------------------------------------------------------------------------
 // Frame I/O
 // ---------------------------------------------------------------------------
 
@@ -755,7 +660,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::path::PathBuf;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use iroh::protocol::Router;
     use library::{
@@ -1378,56 +1283,5 @@ mod tests {
         };
         let stray = seal_genesis(&elsewhere, &alice, "not ours");
         assert!(ingest(&store, fab.topic, &stray).is_err());
-    }
-
-    // -------------------------------------------------------- the gap healer
-
-    /// A burst of gap signals coalesces into exactly one debounced pass, and a
-    /// signal raised after that pass gets its own.
-    #[tokio::test]
-    async fn gap_signals_coalesce_into_one_debounced_pass() {
-        let (signal, signals) = gap_channel();
-        let (done, mut passes) = mpsc::channel::<usize>(8);
-        let ran = Arc::new(AtomicUsize::new(0));
-        let task = tokio::spawn({
-            let ran = Arc::clone(&ran);
-            async move {
-                heal_gaps(signals, Duration::from_millis(5), move || {
-                    let ran = Arc::clone(&ran);
-                    let done = done.clone();
-                    async move {
-                        let n = ran.fetch_add(1, Ordering::SeqCst) + 1;
-                        done.send(n).await.ok();
-                    }
-                })
-                .await;
-            }
-        });
-
-        for _ in 0..5 {
-            signal.raise();
-        }
-        let first = tokio::time::timeout(DEADLINE, passes.recv())
-            .await
-            .expect("the debounce must fire")
-            .unwrap();
-        assert_eq!(first, 1);
-        assert!(
-            passes.try_recv().is_err(),
-            "five signals in one window are one pass"
-        );
-
-        signal.raise();
-        let second = tokio::time::timeout(DEADLINE, passes.recv())
-            .await
-            .expect("a later gap gets its own pass")
-            .unwrap();
-        assert_eq!(second, 2);
-
-        drop(signal);
-        tokio::time::timeout(DEADLINE, task)
-            .await
-            .expect("the healer ends when the last signal is dropped")
-            .unwrap();
     }
 }

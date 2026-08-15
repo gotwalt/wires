@@ -239,6 +239,13 @@ impl Keystore {
 
     /// Read the fabric key for `version`; `None` when this node does not hold
     /// it (the late-joiner case — pre-join history stays unreadable).
+    ///
+    /// `#[cfg(test)]`: the resident node loads the whole keyring
+    /// ([`read_keyring`](Self::read_keyring)) once and keeps it, because a
+    /// message can name any past version; reading one version at a time is how
+    /// the suite asserts *which* keys a member ended up holding — the
+    /// late-joiner claim in particular.
+    #[cfg(test)]
     pub fn read_fabric_key(&self, version: RosterVersion) -> Result<Option<FabricKey>> {
         let path = self.fabric_key_path(version);
         match read_to_string_opt(&path)? {

@@ -68,13 +68,12 @@ P_PID=""
 T1_PID=""
 T2_PID=""
 PUB_PID=""
-cleanup() {
-	# SIGCONT first: a stopped process cannot act on a TERM.
-	for p in $T2_PID $T1_PID $P_PID $PUB_PID; do kill -CONT "$p" 2>/dev/null || true; done
-	for p in $PUB_PID $T1_PID $T2_PID $P_PID; do kill "$p" 2>/dev/null || true; done
-	[ -n "$KEEP" ] || rm -rf "$D"
-}
-trap cleanup EXIT INT TERM
+# Inline rather than a `cleanup` function, and with the loop variable declared
+# up front: shellcheck does not model the EXIT trap of a script that ends in an
+# explicit `exit` (SC2329), nor a `for` variable first seen inside a trap string
+# (SC2154). SIGCONT comes first because a stopped process cannot act on a TERM.
+p=""
+trap 'for p in $T2_PID $T1_PID $P_PID $PUB_PID; do kill -CONT "$p" 2>/dev/null || true; done; for p in $PUB_PID $T1_PID $T2_PID $P_PID; do kill "$p" 2>/dev/null || true; done; [ -n "$KEEP" ] || rm -rf "$D"' EXIT INT TERM
 
 say() { [ -n "$QUIET" ] || printf '\033[36m[soak]\033[0m %s\n' "$*" >&2; }
 ok() { printf '\033[32m[ok]\033[0m   %s\n' "$*" >&2; }

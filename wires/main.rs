@@ -1264,10 +1264,6 @@ const REDIAL_MIN: Duration = Duration::from_secs(5);
 /// Longest redial delay; the backoff doubles up to this and stays there.
 const REDIAL_MAX: Duration = Duration::from_secs(60);
 
-/// How long a tail waits after a `Lagged` or a chain gap before catching up, so
-/// a burst of them costs one replay pass instead of one each.
-const TAIL_CATCHUP_DEBOUNCE: Duration = Duration::from_secs(2);
-
 /// How many control-socket publishes may queue for the tail loop at once.
 const CONTROL_QUEUE: usize = 32;
 
@@ -1818,7 +1814,7 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
     let server = socket.spawn(tx);
 
     // 5. Whatever the peers have that this node does not.
-    catch_up_and_print(&node, &store, &printer, &mut keyring).await;
+    catch_up_and_print(&node, &printer, &mut keyring).await;
 
     // Live state: who the neighbors are, when to redial, when to catch up.
     let mut neighbors: HashSet<NodeId> = HashSet::new();
@@ -1868,7 +1864,7 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
                                 have = ?have.map(|s| s.0),
                                 "chain gap; scheduling a catch-up"
                             );
-                            catchup_at.get_or_insert(deadline(TAIL_CATCHUP_DEBOUNCE));
+                            catchup_at.get_or_insert(deadline(replay::REPLAY_DEBOUNCE));
                         }
                         Err(e) => tracing::warn!(
                             sender = %envelope.sender.hex(),
@@ -1887,7 +1883,7 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
                     }
                     // A new neighbor is the likeliest source of history this
                     // node is missing.
-                    catchup_at.get_or_insert(deadline(TAIL_CATCHUP_DEBOUNCE));
+                    catchup_at.get_or_insert(deadline(replay::REPLAY_DEBOUNCE));
                 }
                 Some(topics::TopicEvent::NeighborDown(peer)) => {
                     neighbors.remove(&peer);
@@ -1904,7 +1900,7 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
                         Ok((s, r)) => { sender = s; events = r; }
                         Err(e) => tracing::warn!("re-join after lag failed: {e:#}"),
                     }
-                    catchup_at.get_or_insert(deadline(TAIL_CATCHUP_DEBOUNCE));
+                    catchup_at.get_or_insert(deadline(replay::REPLAY_DEBOUNCE));
                 }
                 None => {
                     // The bridge task ended (the subscription closed). Same
@@ -1933,7 +1929,7 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
                     Ok(n) => {
                         tracing::info!(peers = n, "redial re-admitted peers");
                         backoff = REDIAL_MIN;
-                        catchup_at.get_or_insert(deadline(TAIL_CATCHUP_DEBOUNCE));
+                        catchup_at.get_or_insert(deadline(replay::REPLAY_DEBOUNCE));
                     }
                     // Every known peer refused us: this node is off the roster,
                     // and that is the one outcome worth exiting for.
@@ -1945,7 +1941,7 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
                 if catchup_at.is_some() =>
             {
                 catchup_at = None;
-                catch_up_and_print(&node, &store, &printer, &mut keyring).await;
+                catch_up_and_print(&node, &printer, &mut keyring).await;
             }
         }
     }
@@ -2050,12 +2046,11 @@ async fn publish_from_tail(
 /// what it *inserted* is exactly what the marks moved over — which keeps the
 /// "print on `Inserted`" rule intact without threading a callback through
 /// replay.
-async fn catch_up_and_print(
-    node: &topics::TopicNode,
-    store: &store::TopicStore,
-    printer: &Printer,
-    keyring: &mut Keyring,
-) {
+async fn catch_up_and_print(node: &topics::TopicNode, printer: &Printer, keyring: &mut Keyring) {
+    // The node's own log, never a second handle: `catch_up` ingests into the
+    // store the replay server reads, and the before/after diff below is only
+    // the set of newly inserted messages if it is diffing that same store.
+    let store = node.store();
     let before = match store.hwm_all() {
         Ok(marks) => marks,
         Err(e) => {

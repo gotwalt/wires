@@ -16,9 +16,11 @@
 //! (with [`presets::Minimal`](iroh::endpoint::presets::Minimal): no DNS, no
 //! pkarr, no relay, nothing that leaves the machine), opens real redb logs under
 //! `$TEST_TMPDIR`, and runs the real admission handshake, the real watchdog, and
-//! the real replay server. What they do *not* do is wait: every interval the
-//! production code reads from a constant is a [`TopicNodeConfig`] field, so the
-//! watchdog runs at 20 ms here and the whole suite finishes in seconds.
+//! the real replay server. What they do *not* do is wait: the watchdog interval
+//! is a [`TopicNodeConfig`] field, so it runs at 20 ms here, and the one
+//! interval that is not injectable — the tail's catch-up debounce — is mirrored
+//! at [`GAP_DEBOUNCE`] by the pump that stands in for the tail loop. The whole
+//! suite finishes in seconds.
 //!
 //! # The five claims
 //!
@@ -88,6 +90,15 @@ const FAST_RECHECK: Duration = Duration::from_millis(20);
 /// (the confidentiality test in particular must fail if the *key* rotation stops
 /// working, not pass because the peer happened to be evicted first).
 const SLOW_RECHECK: Duration = Duration::from_secs(3600);
+
+/// The catch-up debounce the gap-heal pump runs at, standing in for
+/// [`REPLAY_DEBOUNCE`](crate::replay::REPLAY_DEBOUNCE)'s two seconds.
+///
+/// The tail's window is a constant rather than a config knob (a debounce only a
+/// test reads is a knob that lies), so the test mirrors the *shape* — one
+/// pending deadline that later gaps fold into — with a window short enough to
+/// assert against.
+const GAP_DEBOUNCE: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // The fabric
@@ -280,7 +291,6 @@ impl Member {
             store,
         );
         cfg.admit_recheck = recheck;
-        cfg.replay_debounce = Duration::from_millis(50);
         let lookup = MemoryLookup::new();
         let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key(&self.identity))
@@ -555,7 +565,7 @@ async fn revocation_evicts_neighbor_between_rechecks() {
     wait_neighbor_up(&mut rx_a, b.id()).await;
     wait_neighbor_up(&mut rx_b, a.id()).await;
     assert!(
-        node_a.admitted().peers().contains(&b.id()),
+        node_a.admit().admitted.peers().contains(&b.id()),
         "the mesh is up because both sides completed admission"
     );
 
@@ -564,7 +574,7 @@ async fn revocation_evicts_neighbor_between_rechecks() {
     a.import(fab.at(v2));
 
     settle(
-        || !node_a.admitted().peers().contains(&b.id()),
+        || !node_a.admit().admitted.peers().contains(&b.id()),
         "the watchdog to evict the removed member",
     )
     .await;
@@ -592,7 +602,7 @@ async fn revocation_evicts_neighbor_between_rechecks() {
         denied.reason()
     );
     assert!(
-        !node_a.admitted().peers().contains(&b.id()),
+        !node_a.admit().admitted.peers().contains(&b.id()),
         "a refused handshake must not put the peer back in the registry"
     );
 
@@ -983,10 +993,13 @@ async fn tail_catches_up_after_offline() {
 /// 1 never does, seq 2 arrives and cannot be chained.
 ///
 /// The pump below is the ingest arm of the tail loop
-/// ([`run_tail`](crate::run_tail)) with nothing else in it: ingest, and on a
-/// [`Ingested::Gap`] raise the signal. The debounce and the pass are the real
-/// [`spawn_gap_healer`](crate::replay::spawn_gap_healer), at 50 ms instead of
-/// two seconds.
+/// ([`run_tail`](crate::run_tail)) with nothing else in it, and it is the same
+/// shape: ingest, and on a [`Ingested::Gap`] arm a single pending catch-up
+/// deadline that later gaps fold into (`catchup_at.get_or_insert`). The pass it
+/// eventually runs is the real [`catch_up`](crate::replay::catch_up); only the
+/// window is different — [`GAP_DEBOUNCE`] here, and
+/// [`REPLAY_DEBOUNCE`](crate::replay::REPLAY_DEBOUNCE)'s two seconds in the
+/// tail.
 #[tokio::test]
 async fn live_gap_triggers_replay_and_heals() {
     let a = Member::new("ea", [2u8; 32]);
@@ -1004,33 +1017,50 @@ async fn live_gap_triggers_replay_and_heals() {
     wait_neighbor_up(&mut rx_b, a.id()).await;
 
     let store_b = Arc::clone(node_b.store());
-    let (signal, healer) = replay::spawn_gap_healer(
-        node_b.endpoint().clone(),
-        Arc::clone(node_b.admit()),
-        Arc::clone(node_b.store()),
-        fab.topic,
-        replay::REPLAY_LIMIT,
-        Duration::from_millis(50),
-    );
-
     let gaps = Arc::new(AtomicUsize::new(0));
     let pump = tokio::spawn({
+        let endpoint = node_b.endpoint().clone();
+        let admit = Arc::clone(node_b.admit());
         let store = Arc::clone(&store_b);
         let gaps = Arc::clone(&gaps);
         let topic = fab.topic;
-        let signal = signal.clone();
         async move {
-            while let Some(event) = rx_b.recv().await {
-                let TopicEvent::Message(envelope) = event else {
-                    continue;
-                };
-                match replay::ingest(&store, topic, &envelope) {
-                    Ok(Ingested::Gap { .. }) => {
-                        gaps.fetch_add(1, Ordering::SeqCst);
-                        signal.raise();
+            // `run_tail`'s `catchup_at`: `None` until something asks for a
+            // pass, then a deadline every later ask folds into.
+            let mut catchup_at: Option<tokio::time::Instant> = None;
+            loop {
+                tokio::select! {
+                    event = rx_b.recv() => {
+                        let Some(TopicEvent::Message(envelope)) = event else {
+                            continue;
+                        };
+                        match replay::ingest(&store, topic, &envelope) {
+                            Ok(Ingested::Gap { .. }) => {
+                                gaps.fetch_add(1, Ordering::SeqCst);
+                                catchup_at.get_or_insert(
+                                    tokio::time::Instant::now() + GAP_DEBOUNCE,
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("the pump refused a message: {e:#}"),
+                        }
                     }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("the pump refused a message: {e:#}"),
+                    _ = tokio::time::sleep_until(
+                        catchup_at.unwrap_or_else(tokio::time::Instant::now),
+                    ), if catchup_at.is_some() => {
+                        catchup_at = None;
+                        if let Err(e) = replay::catch_up(
+                            &endpoint,
+                            &admit,
+                            &store,
+                            topic,
+                            replay::REPLAY_LIMIT,
+                        )
+                        .await
+                        {
+                            tracing::warn!("the pump's catch-up failed: {e:#}");
+                        }
+                    }
                 }
             }
         }
@@ -1080,7 +1110,6 @@ async fn live_gap_triggers_replay_and_heals() {
     );
 
     pump.abort();
-    healer.abort();
     node_a.shutdown().await.unwrap();
     node_b.shutdown().await.unwrap();
 }
