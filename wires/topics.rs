@@ -33,9 +33,12 @@
 //! [`mpsc`] channel of [`TopicEvent`] so the tail loop can `select!` over it
 //! alongside the control socket and the redial timer. The channel is bounded at
 //! [`EVENT_CHANNEL_CAP`] (256) — unbounded would turn a wedged printer into
-//! unbounded memory — and the bridge **logs every drop** rather than discarding
-//! silently: a message that never reached stdout must leave a trace, because
-//! replay heals a gap in the *store* and a drop here is a gap in the *display*.
+//! unbounded memory — and a full channel makes the bridge **wait**, never drop.
+//! Dropping looks cheap and is not: the tail task is the only ingester, so a
+//! dropped `Message` was never written to this node's log, and the bridge has no
+//! way to schedule the catch-up that would fetch it again. Waiting pushes the
+//! pressure up to iroh-gossip instead, which answers it with `Lagged` — the one
+//! signal that *is* wired to a re-join and a catch-up.
 //!
 //! [`TopicEvent::Lagged`] gets the same treatment for the same reason. When a
 //! subscriber falls behind, iroh-gossip emits `Lagged` and closes the
@@ -63,7 +66,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::admission::{
-    ADMIT_RECHECK, AdmitHandler, Admitted, GatedGossip, admit_peer, spawn_watchdog,
+    ADMIT_RECHECK, AdmitHandler, Admitted, GatedGossip, MAX_INFLIGHT_ADMISSIONS, admit_peer,
+    spawn_watchdog,
 };
 use crate::keystore::Keystore;
 use crate::replay::{REPLAY_LIMIT, ReplayHandler};
@@ -76,10 +80,18 @@ use crate::transport::{Denied, HeadSource, endpoint_id, secret_key, to_node_id};
 /// Bounded on purpose. The producer is the network and the consumer is a
 /// terminal — the one arrangement where an unbounded channel converts a slow
 /// reader into an out-of-memory kill. At 256 the buffer absorbs a replay burst
-/// without dropping anything, and past it the bridge drops the *newest* event
-/// and says so in the log, which is recoverable: the message is in the store,
-/// and the next `catch_up` re-offers it.
+/// without dropping anything, and past it the bridge *waits* rather than
+/// dropping — the pressure travels up to iroh-gossip, which answers it with
+/// `Lagged`, the one signal wired to a re-join and a catch-up.
 pub const EVENT_CHANNEL_CAP: usize = 256;
+
+/// How long [`TopicNode::join`] spends admitting bootstrap peers before it gives
+/// the rest to the redial timer.
+///
+/// Startup and every re-join run this loop, and it is sequential: without a
+/// budget, a peer book full of stale entries turns "join the mesh" into minutes
+/// of dialing before the control socket is even usable.
+pub const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(30);
 
 /// Everything a [`TopicNode`] needs besides its signing identity.
 ///
@@ -399,6 +411,7 @@ impl TopicNode {
             keystore: Arc::clone(&cfg.keystore),
             admitted: admitted.clone(),
             head_lock: Arc::new(Mutex::new(())),
+            inflight: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_ADMISSIONS)),
         });
         let replay = Arc::new(ReplayHandler {
             topic: cfg.topic,
@@ -514,10 +527,16 @@ impl TopicNode {
 
         let (tx, rx) = mpsc::channel(self.channel_cap);
         let bridge = tokio::spawn(bridge_events(recv, topic, tx));
-        self.bridges
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(bridge);
+        {
+            let mut bridges = self
+                .bridges
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A week of re-joins would otherwise leave a week of finished handles
+            // here, held only to be aborted at shutdown.
+            bridges.retain(|handle| !handle.is_finished());
+            bridges.push(bridge);
+        }
         Ok((TopicSender::new(send, topic), rx))
     }
 
@@ -533,16 +552,35 @@ impl TopicNode {
     ///
     /// A peer that is merely *unreachable* is logged and skipped: a tail must
     /// still come up on a stale ticket, and replay makes it eventually
-    /// consistent. A peer that **refuses** us is not skipped — a
-    /// [`Denied`] is the roster saying this node is out, and the spec's answer
-    /// to that is exit 77, not a quiet start on an empty mesh.
+    /// consistent. A [`Denied`] is different — it is a peer saying this node is
+    /// not in the roster, which spec §7 answers with exit 77 — but it is only
+    /// evidence when **nothing** admitted this node. One peer refusing is that
+    /// peer's verdict, and a refusal is not even always about the roster: a peer
+    /// that imported a commit this node has not yet answers `stale inclusion
+    /// proof`, and a peer whose own head is briefly unreadable answers
+    /// `responder configuration error`. So the refusal is carried to the end of
+    /// the round and returned only if no peer admitted us.
     async fn admit_bootstrap(&self, bootstrap: &[TopicPeer]) -> Result<Vec<iroh::EndpointId>> {
         let now = crate::now_unix();
+        let until = tokio::time::Instant::now() + BOOTSTRAP_BUDGET;
         let mut ids = Vec::with_capacity(bootstrap.len());
         let mut failures = Vec::new();
+        let mut denial: Option<anyhow::Error> = None;
         for peer in bootstrap {
             if peer.node == self.node_id() {
                 continue;
+            }
+            // Each handshake is bounded (`TOPIC_DIAL_TIMEOUT` +
+            // `TOPIC_HANDSHAKE_TIMEOUT`), but a peer book with fifty stale
+            // entries would still make a tail's startup — or a re-join in the
+            // live loop — take minutes. The rest of the book is left to the
+            // redial timer, which is designed for exactly that.
+            if tokio::time::Instant::now() >= until {
+                tracing::warn!(
+                    remaining = bootstrap.len() - ids.len(),
+                    "bootstrap budget spent; the redial timer will keep trying the rest"
+                );
+                break;
             }
             let addr = match crate::transport::endpoint_addr(
                 &peer.node,
@@ -563,10 +601,11 @@ impl TopicNode {
                 && let Err(e) = admit_peer(&self.endpoint, &self.admit, peer, now).await
             {
                 if e.downcast_ref::<Denied>().is_some() {
-                    return Err(e.context(format!(
+                    denial.get_or_insert(e.context(format!(
                         "peer {} refused this node's admission",
                         peer.node.hex()
                     )));
+                    continue;
                 }
                 tracing::warn!(
                     peer = %peer.node.hex(),
@@ -579,6 +618,11 @@ impl TopicNode {
                 Ok(id) => ids.push(id),
                 Err(e) => failures.push(format!("{}: {e:#}", peer.node.hex())),
             }
+        }
+        if ids.is_empty()
+            && let Some(denial) = denial
+        {
+            return Err(denial);
         }
         if ids.is_empty() && !failures.is_empty() {
             tracing::warn!(
@@ -744,19 +788,19 @@ async fn bridge_events(mut recv: GossipReceiver, topic: TopicId, tx: mpsc::Sende
                 return;
             }
         };
-        match tx.try_send(mapped) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(dropped)) => {
-                tracing::warn!(
-                    topic = %topic.hex(),
-                    event = ?dropped,
-                    "event channel full; dropping an event (the store still has it — catch_up re-offers)"
-                );
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::debug!(topic = %topic.hex(), "event receiver gone; bridge ending");
-                return;
-            }
+        // Backpressure, not a drop. The bridge used to `try_send` and log a
+        // dropped event on a full channel, with the comment that "the store
+        // still has it — catch_up re-offers": both halves were wrong. The tail
+        // task is the only ingester, so a dropped `Message` was never written to
+        // *this* node's log, and the drop happened on a task with no way to
+        // schedule a catch-up — so if the dropped message was the newest from
+        // its publisher, no later `Gap` would ever surface it and the line was
+        // simply never printed. Waiting instead pushes the pressure one layer
+        // up, where iroh-gossip answers it with `Lagged`, which *is* wired to a
+        // re-join and a catch-up.
+        if tx.send(mapped).await.is_err() {
+            tracing::debug!(topic = %topic.hex(), "event receiver gone; bridge ending");
+            return;
         }
     }
 }
@@ -812,7 +856,13 @@ mod tests {
     impl Fabric {
         /// Commit a roster over `members` and mint their data key.
         fn of(members: &[NodeId]) -> Self {
-            let root = NodeIdentity::from_seed([1u8; 32]);
+            Self::of_under([1u8; 32], members)
+        }
+
+        /// [`of`](Self::of) under an explicit root seed, for the tests that need
+        /// two fabrics that do not recognise each other.
+        fn of_under(root_seed: [u8; 32], members: &[NodeId]) -> Self {
+            let root = NodeIdentity::from_seed(root_seed);
             let mut roster = Roster::new(root.node_id());
             for m in members {
                 roster.insert(*m);
@@ -838,6 +888,16 @@ mod tests {
     /// idiom from `transport.rs`, plus the [`MemoryLookup`] that stands in for
     /// the discovery this endpoint deliberately does not have.
     async fn spawn_node(identity: &NodeIdentity, fabric: &Fabric) -> TopicNode {
+        spawn_node_with(identity, fabric, |_| {}).await
+    }
+
+    /// [`spawn_node`] with a hook over the config, for the one or two tests that
+    /// need a non-default interval or channel size.
+    async fn spawn_node_with(
+        identity: &NodeIdentity,
+        fabric: &Fabric,
+        tweak: impl FnOnce(&mut TopicNodeConfig),
+    ) -> TopicNode {
         let dir = temp_dir();
         let keystore = Keystore::at(&dir);
         keystore.save_roster_head(&fabric.head).unwrap();
@@ -856,6 +916,8 @@ mod tests {
             Arc::new(keystore),
             store,
         );
+        let mut cfg = cfg;
+        tweak(&mut cfg);
         let lookup = MemoryLookup::new();
         let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key(identity))
@@ -1038,6 +1100,246 @@ mod tests {
         );
 
         c.close().await;
+        node_b.shutdown().await.unwrap();
+    }
+
+    /// One peer's refusal is that peer's verdict, not the roster's.
+    ///
+    /// `admit_bootstrap` used to return on the *first* `Denied`, which the tail
+    /// reports as exit 77 ("you are off the roster"). But a peer that imported a
+    /// commit before this node did answers `stale inclusion proof` to a member
+    /// in good standing, and a peer whose own `roster-head.json` is briefly
+    /// unreadable answers `responder configuration error` — so one misconfigured
+    /// machine could take down every tail that had it in its peer book. The
+    /// refusal only becomes a verdict when nothing admitted this node.
+    #[tokio::test]
+    async fn one_peers_refusal_does_not_stop_a_join_that_another_peer_admits() {
+        let (a, b) = (
+            NodeIdentity::from_seed([2u8; 32]),
+            NodeIdentity::from_seed([3u8; 32]),
+        );
+        let d = NodeIdentity::from_seed([4u8; 32]);
+        let stranger = NodeIdentity::from_seed([9u8; 32]);
+        let ours = Fabric::of(&[a.node_id(), b.node_id(), d.node_id()]);
+        // A node in a fabric that has never heard of us: it answers our request
+        // with a `Denied`, exactly as a stale or misconfigured peer would.
+        let theirs = Fabric::of_under([7u8; 32], &[stranger.node_id()]);
+
+        let node_a = spawn_node(&a, &ours).await;
+        let node_b = spawn_node(&b, &ours).await;
+        let node_x = spawn_node(&stranger, &theirs).await;
+
+        // The refusing peer is dialed first, so a "return on the first Denied"
+        // never reaches the peer that would have admitted us.
+        let (_send_b, mut rx_b) = node_b
+            .join(ours.topic, &[hint(&node_x), hint(&node_a)])
+            .await
+            .expect("a member with one good peer must still join");
+        let (_send_a, mut rx_a) = node_a.join(ours.topic, &[]).await.unwrap();
+        assert_eq!(wait_neighbor_up(&mut rx_b).await, a.node_id());
+        assert_eq!(wait_neighbor_up(&mut rx_a).await, b.node_id());
+        assert!(
+            !node_b
+                .admit()
+                .admitted
+                .peers()
+                .contains(&stranger.node_id())
+        );
+
+        // With *only* the refusing peer, the refusal is the whole answer — the
+        // exit-77 path is intact.
+        let node_c = spawn_node(&d, &ours).await;
+        let refusal = node_c
+            .join(ours.topic, &[hint(&node_x)])
+            .await
+            .expect_err("nothing admitted this node, so the denial stands");
+        assert!(
+            refusal.downcast_ref::<Denied>().is_some(),
+            "the error must still be a policy refusal (exit 77), got: {refusal:#}"
+        );
+
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
+        node_c.shutdown().await.unwrap();
+        node_x.shutdown().await.unwrap();
+    }
+
+    /// A slow reader costs latency, never a message.
+    ///
+    /// The bridge used to `try_send` and log a dropped event when the channel
+    /// filled, with the comment that "the store still has it — catch_up
+    /// re-offers". Both halves were wrong: the tail task is the only ingester,
+    /// so a dropped `Message` was never written to this node's log at all, and
+    /// the drop happened on a task with no way to schedule a catch-up — if the
+    /// dropped message was the newest from its publisher, no later `Gap` would
+    /// ever surface it and the line simply never appeared. The tail loop is
+    /// routinely busy for exactly this long (a catch-up pass against a peer with
+    /// a long history), so this is the ordinary case, not the pathological one.
+    #[tokio::test]
+    async fn a_full_event_channel_waits_rather_than_dropping_a_message() {
+        let (a, b) = (
+            NodeIdentity::from_seed([2u8; 32]),
+            NodeIdentity::from_seed([3u8; 32]),
+        );
+        let fabric = Fabric::of(&[a.node_id(), b.node_id()]);
+        let node_a = spawn_node(&a, &fabric).await;
+        // B's bridge can buffer two events. Everything past that has to wait for
+        // the reader, which is not reading yet.
+        let node_b = spawn_node_with(&b, &fabric, |cfg| cfg.channel_cap = 2).await;
+
+        let (send_a, mut rx_a) = node_a.join(fabric.topic, &[]).await.unwrap();
+        let (_send_b, mut rx_b) = node_b.join(fabric.topic, &[hint(&node_a)]).await.unwrap();
+        wait_neighbor_up(&mut rx_a).await;
+        wait_neighbor_up(&mut rx_b).await;
+
+        // Eight messages into a channel that holds two, with nobody draining.
+        let mut sent = Vec::new();
+        let mut prev = MessageHash::ZERO;
+        for seq in 0..8u64 {
+            let envelope = sealed(&a, &fabric, seq, prev, &format!("line {seq}"));
+            prev = envelope.message_hash().unwrap();
+            send_a.broadcast(&envelope).await.unwrap();
+            sent.push(envelope);
+        }
+
+        // Now drain. Every one of them is still there, in order.
+        let mut received = Vec::new();
+        while received.len() < sent.len() {
+            received.push(next_message(&mut rx_b).await);
+        }
+        assert_eq!(received, sent, "a full channel must not lose a message");
+
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
+    }
+
+    /// The check and the tracking are **one** operation, and a connection that
+    /// loses the race is closed rather than left attached.
+    ///
+    /// The regression this pins: `GatedGossip::accept` used to call
+    /// `is_admitted(peer)` and then `attach_conn(peer, conn)`, and `attach_conn`
+    /// was a silent no-op for a peer that was not in the map. An eviction
+    /// landing between the two removed the entry, the attach dropped the handle
+    /// on the floor, and iroh-gossip got the connection anyway — a revoked peer
+    /// with a live mesh connection that no later watchdog pass would even list,
+    /// let alone close. A peer about to be removed only had to open connections
+    /// in a loop until one landed in the window.
+    #[tokio::test]
+    async fn attaching_a_connection_is_the_admission_check() {
+        let (a, b) = (
+            NodeIdentity::from_seed([2u8; 32]),
+            NodeIdentity::from_seed([3u8; 32]),
+        );
+        let fabric = Fabric::of(&[a.node_id(), b.node_id()]);
+        let node_b = spawn_node(&b, &fabric).await;
+
+        // Any real `Connection` will do: what is under test is the registry's
+        // decision, not the bytes on it.
+        let endpoint_a = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(secret_key(&a))
+            .bind()
+            .await
+            .unwrap();
+        let target = crate::transport::endpoint_addr(
+            &node_b.node_id(),
+            &localhost_socks(node_b.endpoint()),
+            None,
+        )
+        .unwrap();
+        let conn = timeout(
+            PATIENCE,
+            endpoint_a.connect(target, library::TOPIC_ADMIT_ALPN),
+        )
+        .await
+        .expect("dial timed out")
+        .expect("the admit ALPN is registered");
+
+        let registry = Admitted::new();
+        let entry = |expires| crate::admission::AdmittedPeer {
+            proof: fabric.proofs[&a.node_id()].clone(),
+            version: fabric.head.version,
+            expires,
+            conns: Vec::new(),
+        };
+
+        assert!(
+            !registry.attach_conn(a.node_id(), conn.clone(), 0),
+            "a peer that is not in the registry is not admitted by attaching"
+        );
+        registry.insert(a.node_id(), entry(100));
+        assert!(registry.attach_conn(a.node_id(), conn.clone(), 100));
+        assert!(
+            !registry.attach_conn(a.node_id(), conn.clone(), 101),
+            "a lapsed lease refuses at the same edge `is_admitted` does"
+        );
+
+        // And the attach is what makes eviction able to close: the connection
+        // tracked above dies with the peer.
+        registry.evict(a.node_id());
+        assert!(
+            !registry.attach_conn(a.node_id(), conn.clone(), 100),
+            "an evicted peer cannot re-attach without a fresh admission"
+        );
+        assert!(
+            timeout(PATIENCE, conn.closed()).await.is_ok(),
+            "evicting the peer must close the connection it was tracked on"
+        );
+
+        endpoint_a.close().await;
+        node_b.shutdown().await.unwrap();
+    }
+
+    /// The pre-authorization surface is bounded: with every in-flight permit
+    /// taken, a new admission dial is refused instead of buying a task and a
+    /// 64 KiB buffer.
+    ///
+    /// `MAX_ADMIT_FRAME` bounds one frame, which was mistaken for bounding the
+    /// surface — iroh spawns a task per accepted connection with no cap, so an
+    /// attacker holding no credential at all could open thousands, write a
+    /// length prefix on each, and stall.
+    #[tokio::test]
+    async fn the_pre_authorization_surface_is_bounded() {
+        let (a, b) = (
+            NodeIdentity::from_seed([2u8; 32]),
+            NodeIdentity::from_seed([3u8; 32]),
+        );
+        let fabric = Fabric::of(&[a.node_id(), b.node_id()]);
+        let node_a = spawn_node(&a, &fabric).await;
+        let node_b = spawn_node(&b, &fabric).await;
+
+        // Every permit B has, held by "handshakes" that are not going anywhere.
+        let hogged = node_b
+            .admit()
+            .inflight
+            .clone()
+            .acquire_many_owned(MAX_INFLIGHT_ADMISSIONS as u32)
+            .await
+            .unwrap();
+
+        let refused = timeout(
+            PATIENCE,
+            admit_peer(node_a.endpoint(), node_a.admit(), &hint(&node_b), 0),
+        )
+        .await
+        .expect("the refusal must be prompt, not a hang");
+        assert!(
+            refused.is_err(),
+            "a saturated pre-authorization surface admits nobody"
+        );
+        assert!(!node_b.admit().admitted.peers().contains(&a.node_id()));
+
+        // Released, the very same dial succeeds — the bound is a bound, not a
+        // broken gate.
+        drop(hogged);
+        timeout(
+            PATIENCE,
+            admit_peer(node_a.endpoint(), node_a.admit(), &hint(&node_b), 0),
+        )
+        .await
+        .expect("admission timed out")
+        .expect("both nodes are members under the same head");
+
+        node_a.shutdown().await.unwrap();
         node_b.shutdown().await.unwrap();
     }
 

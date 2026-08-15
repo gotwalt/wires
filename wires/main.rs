@@ -278,6 +278,12 @@ struct ImportArgs {
     /// writes `<node-id>.key`).
     #[arg(long)]
     fabric_key_file: Option<PathBuf>,
+    /// Install a roster head that is *older* than the one already stored.
+    ///
+    /// Refused by default: the stored head is a highest-seen watermark, and
+    /// walking it backwards re-admits everyone the newer commit removed.
+    #[arg(long)]
+    force: bool,
 }
 
 /// `serve` arguments: the responder key, what it trusts, and the child to exec.
@@ -1150,6 +1156,23 @@ fn run_import_in(ks: &keystore::Keystore, a: ImportArgs) -> anyhow::Result<Strin
         "--roster-head",
     )? {
         let head = RosterHead::decode(&text).context("--roster-head")?;
+        // Monotone, like the admission path's compare-and-swap (spec §2.2). The
+        // stored head is what the running tail enforces on every handshake and
+        // every watchdog pass, so importing an older one immediately downgrades
+        // the live roster and re-admits members a later commit removed — and a
+        // head token is public, freely copyable, and held by every past member,
+        // so "paste the head you were given" is a realistic thing to induce an
+        // operator to do. There is no reason to walk it backwards except to undo
+        // a mistake, which is what `--force` is for.
+        match ks.read_roster_head()? {
+            Some(stored) if head.version < stored.version && !a.force => anyhow::bail!(
+                "--roster-head: refusing to install roster version {} over the stored version {}: \
+                 a head only ever moves forward (pass --force if you really mean to roll it back)",
+                head.version.0,
+                stored.version.0
+            ),
+            _ => {}
+        }
         lines.push(format!("wrote {}", ks.save_roster_head(&head)?.display()));
     }
     if let Some(text) = token_arg(
@@ -1266,6 +1289,60 @@ const REDIAL_MAX: Duration = Duration::from_secs(60);
 
 /// How many control-socket publishes may queue for the tail loop at once.
 const CONTROL_QUEUE: usize = 32;
+
+/// How often the resident tail runs a catch-up pass even when nothing happened.
+///
+/// Every other trigger is edge-driven — a live `Gap`, a new neighbor, a lag, a
+/// successful redial — so a hole whose only holder is asleep stays open until
+/// some unrelated event fires. On a quiet, stable mesh that is never, and the
+/// hole is invisible: both messages are in the publisher's log the whole time.
+/// A periodic pass is what turns "eventually consistent" into a promise with a
+/// period on it.
+const CATCHUP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often the resident tail refreshes admissions that are about to lapse.
+///
+/// Half of [`ADMIT_REFRESH`](crate::admission::ADMIT_REFRESH), so two attempts
+/// fit in the window before an admission actually expires and the far side's
+/// watchdog closes the connection.
+const READMIT_INTERVAL: Duration = Duration::from_secs(admission::ADMIT_REFRESH.as_secs() / 2);
+
+/// How long an operation waits for another process to release the topic log's
+/// exclusive redb lock.
+///
+/// `wires tail` and `wires publish` both open the same file, and the window
+/// between them is routine: a login script that starts a tail and publishes in
+/// the next line, or a tail restarting while a one-shot publish is lingering.
+/// Without a wait, whichever loses fails hard — and if the *tail* loses, a
+/// routine publish killed the resident node.
+const STORE_LOCK_WAIT: Duration = Duration::from_secs(20);
+
+/// How many times a streaming `wires publish` retries one line before dropping
+/// it and moving on to the next.
+const PUBLISH_ATTEMPTS: usize = 3;
+
+/// How long a streaming `wires publish` waits before reconnecting to a tail that
+/// just refused it or hung up.
+const PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// How long one round of dialing peers — a redial, or a refresh of admissions
+/// about to lapse — may take before the rest is left to the next round.
+///
+/// Each dial is individually bounded, but a peer book with fifty stale entries
+/// is fifty deadlines in a row, and the tail loop awaits these inline: signals,
+/// live messages and control-socket publishes all wait behind them.
+const PEER_ROUND_BUDGET: Duration = Duration::from_secs(30);
+
+/// How many consecutive rounds in which every reachable peer refused this node
+/// before the tail concludes it is off the roster and exits 77.
+///
+/// One round is not evidence. A peer that imported a new commit before this node
+/// did answers `stale inclusion proof: proof targets version 1, head is version
+/// 2` — a `Denied` — to a node that is still very much a member and only needs
+/// `wires import`; a peer whose own `roster-head.json` is briefly unreadable
+/// answers `responder configuration error`. Exiting on the first of those turns
+/// somebody else's misconfiguration into this node's death.
+const DENIAL_STRIKES: usize = 3;
 
 /// Everything the topic commands resolve *before* touching the network
 /// (spec §7.2).
@@ -1783,7 +1860,7 @@ async fn tail_cmd(a: TailArgs) -> anyhow::Result<()> {
 async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Result<()> {
     let printer = Printer { json };
     let mut keyring = Keyring::load(Arc::clone(&ctx.keystore))?;
-    let store = Arc::new(store::TopicStore::open(&ctx.home, ctx.topic)?);
+    let store = Arc::new(open_topic_store(&ctx.home, ctx.topic, STORE_LOCK_WAIT).await?);
 
     // 1. What is already known, before anything touches the network. Printed
     //    from the log, so a restart shows the same transcript the last run did.
@@ -1801,26 +1878,47 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
         book.save();
     }
 
-    // 3. The node, then the banner (it needs the bound sockets), then the join
-    //    — which is where a revoked node finds out, before it prints anything.
+    // 3. The node, then the banner (it needs the bound sockets).
     let node = topics::TopicNode::spawn(&ctx.node, ctx.node_config(Arc::clone(&store))).await?;
     let socket_path = ctx.socket_path();
     tail_banner(&node, ctx, &socket_path);
-    let (mut sender, mut events) = node.join(ctx.topic, &book.list()).await?;
 
-    // 4. The control socket, and with it `wires publish`.
+    // 4. The control socket, **before** the network join. The join dials every
+    //    peer in the book, which is seconds at best; a `wires publish` in that
+    //    window used to find no socket, fall through to the one-shot path, and
+    //    collide with this process on the topic log's exclusive redb lock —
+    //    killing whichever lost. Bound first and the publish simply queues.
     let socket = ipc::ControlSocket::bind(&socket_path).await?;
     let (tx, mut requests) = tokio::sync::mpsc::channel(CONTROL_QUEUE);
     let server = socket.spawn(tx);
 
-    // 5. Whatever the peers have that this node does not.
+    // 5. The mesh — which is where a revoked node finds out (exit 77).
+    let (mut sender, mut events) = node.join(ctx.topic, &book.list()).await?;
+
+    // 6. Whatever the peers have that this node does not.
     catch_up_and_print(&node, &printer, &mut keyring).await;
 
-    // Live state: who the neighbors are, when to redial, when to catch up.
+    // Live state: who the neighbors are, and when the four timers are due.
     let mut neighbors: HashSet<NodeId> = HashSet::new();
     let mut backoff = REDIAL_MIN;
-    let mut redial_at: Option<tokio::time::Instant> = None;
-    let mut catchup_at: Option<tokio::time::Instant> = None;
+    let mut rejoin_backoff = REDIAL_MIN;
+    let mut strikes = Refusals::default();
+    // The empty-mesh invariant below is reconciled after every select pass, so
+    // it needs a starting point: a tail that came up with peers in its book and
+    // no neighbor yet must already have a redial pending.
+    let mut redial_at: Option<tokio::time::Instant> = book
+        .list()
+        .iter()
+        .any(|peer| peer.node != node.node_id())
+        .then(|| deadline(backoff));
+    let mut catchup_at: Option<tokio::time::Instant> = Some(deadline(CATCHUP_INTERVAL));
+    let mut readmit_at: Option<tokio::time::Instant> = Some(deadline(READMIT_INTERVAL));
+    let mut rejoin_at: Option<tokio::time::Instant> = None;
+    // Both of these arms are over channels that stay *permanently ready* once
+    // they close, so an arm that logs and continues is a hot loop. They are
+    // disabled instead, and re-armed by the thing that can actually fix them.
+    let mut live = true;
+    let mut control_open = true;
     let mut sigint = signal_stream(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = signal_stream(tokio::signal::unix::SignalKind::terminate())?;
 
@@ -1831,9 +1929,13 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
 
             // A publish from `wires publish`, allocated and sealed here — the
             // single allocator, on the one task that owns the store.
-            request = requests.recv() => {
+            request = requests.recv(), if control_open => {
                 let Some(request) = request else {
+                    // Every sender is gone: the socket server task died. The
+                    // receiver is now ready forever, so this arm disables
+                    // itself rather than spinning on a dead channel.
                     tracing::warn!("the control socket server ended; publishes will not arrive");
+                    control_open = false;
                     continue;
                 };
                 let outcome = publish_from_tail(ctx, &store, &sender, &request.text).await;
@@ -1850,9 +1952,9 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
                 let _ = request.reply.send(answer);
             }
 
-            event = events.recv() => match event {
+            event = events.recv(), if live => match event {
                 Some(topics::TopicEvent::Message(envelope)) => {
-                    match replay::ingest(&store, ctx.topic, &envelope) {
+                    match ingest_live(&node, &store, ctx.topic, &envelope) {
                         Ok(replay::Ingested::Inserted) => printer.emit(&envelope, &mut keyring),
                         Ok(replay::Ingested::Duplicate) => {}
                         // The hole heals by replay and the message comes back
@@ -1864,7 +1966,7 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
                                 have = ?have.map(|s| s.0),
                                 "chain gap; scheduling a catch-up"
                             );
-                            catchup_at.get_or_insert(deadline(replay::REPLAY_DEBOUNCE));
+                            arm(&mut catchup_at, replay::REPLAY_DEBOUNCE);
                         }
                         Err(e) => tracing::warn!(
                             sender = %envelope.sender.hex(),
@@ -1878,62 +1980,104 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
                     neighbors.insert(peer);
                     backoff = REDIAL_MIN;
                     redial_at = None;
+                    strikes.admitted();
                     if book.record(TopicPeer::new(peer)) {
                         book.save();
                     }
                     // A new neighbor is the likeliest source of history this
                     // node is missing.
-                    catchup_at.get_or_insert(deadline(replay::REPLAY_DEBOUNCE));
+                    arm(&mut catchup_at, replay::REPLAY_DEBOUNCE);
                 }
                 Some(topics::TopicEvent::NeighborDown(peer)) => {
                     neighbors.remove(&peer);
                     tracing::info!(peer = %peer.hex(), left = neighbors.len(), "neighbor down");
-                    if neighbors.is_empty() {
-                        redial_at.get_or_insert(deadline(backoff));
-                    }
                 }
                 Some(topics::TopicEvent::Lagged) => {
                     // Terminal for the subscription: re-join and replay what
                     // was dropped. Never a quiet exit (spec §7.4).
                     tracing::warn!("subscription lagged; re-joining and catching up");
-                    match node.join(ctx.topic, &book.list()).await {
-                        Ok((s, r)) => { sender = s; events = r; }
-                        Err(e) => tracing::warn!("re-join after lag failed: {e:#}"),
-                    }
-                    catchup_at.get_or_insert(deadline(replay::REPLAY_DEBOUNCE));
+                    live = false;
+                    arm(&mut rejoin_at, Duration::ZERO);
+                    arm(&mut catchup_at, replay::REPLAY_DEBOUNCE);
                 }
                 None => {
                     // The bridge task ended (the subscription closed). Same
-                    // remedy as a lag.
+                    // remedy as a lag — and, like a lag, the arm goes quiet
+                    // until the re-join timer has actually replaced `events`.
                     tracing::warn!("the event bridge ended; re-joining");
-                    match node.join(ctx.topic, &book.list()).await {
-                        Ok((s, r)) => { sender = s; events = r; }
-                        Err(e) => {
-                            tracing::warn!("re-join failed: {e:#}");
-                            redial_at.get_or_insert(deadline(backoff));
-                        }
-                    }
+                    live = false;
+                    arm(&mut rejoin_at, Duration::ZERO);
                 }
             },
+
+            // Re-subscribe after a lag or a dead bridge. On its own timer, with
+            // its own backoff: a `join` that keeps failing must not become a
+            // spin that re-dials the whole peer book as fast as the CPU allows.
+            _ = tokio::time::sleep_until(rejoin_at.unwrap_or_else(now_instant)),
+                if rejoin_at.is_some() && !live =>
+            {
+                rejoin_at = None;
+                match node.join(ctx.topic, &book.list()).await {
+                    Ok((s, r)) => {
+                        sender = s;
+                        events = r;
+                        live = true;
+                        rejoin_backoff = REDIAL_MIN;
+                        strikes.admitted();
+                        // The old subscription's membership is not this one's:
+                        // a peer that vanished while the bridge was down never
+                        // produces a `NeighborDown` here, and a stale entry
+                        // left in the set means the mesh looks populated
+                        // forever and the redial timer is never armed again.
+                        neighbors.clear();
+                        arm(&mut catchup_at, replay::REPLAY_DEBOUNCE);
+                    }
+                    Err(e) => {
+                        if e.downcast_ref::<transport::Denied>().is_some() && strikes.refused() {
+                            return Err(e);
+                        }
+                        tracing::warn!(retry_in = ?rejoin_backoff, "re-join failed: {e:#}");
+                        rejoin_at = Some(deadline(rejoin_backoff));
+                        rejoin_backoff = (rejoin_backoff * 2).min(REDIAL_MAX);
+                    }
+                }
+            }
 
             _ = tokio::time::sleep_until(redial_at.unwrap_or_else(now_instant)),
                 if redial_at.is_some() =>
             {
                 redial_at = None;
-                match redial(&node, &sender, &book).await {
-                    Ok(0) => {
-                        backoff = (backoff * 2).min(REDIAL_MAX);
-                        redial_at = Some(deadline(backoff));
+                let outcome = redial(&node, &sender, &book).await;
+                if outcome.admitted > 0 {
+                    tracing::info!(peers = outcome.admitted, "redial re-admitted peers");
+                    backoff = REDIAL_MIN;
+                    strikes.admitted();
+                    arm(&mut catchup_at, replay::REPLAY_DEBOUNCE);
+                    // Deliberately *not* "done": `admit_peer` proves the
+                    // handshake, never that the gossip mesh formed. The
+                    // reconciliation below re-arms this timer for as long as
+                    // the neighbor count stays zero.
+                } else {
+                    // Every peer this node could reach refused it — which is
+                    // the roster's verdict only if it keeps saying so.
+                    match outcome.denial {
+                        Some(denial) if outcome.denials == outcome.tried && strikes.refused() => {
+                            return Err(denial);
+                        }
+                        Some(denial) => tracing::warn!(
+                            strikes = strikes.consecutive,
+                            "a peer refused this node's admission: {denial:#}"
+                        ),
+                        None => {}
+                    }
+                    backoff = (backoff * 2).min(REDIAL_MAX);
+                    if outcome.tried == 0 {
+                        // A tail that is first on its topic, which is ordinary:
+                        // there is nobody to dial and nothing to report.
+                        tracing::debug!(retry_in = ?backoff, "no known peer to redial");
+                    } else {
                         tracing::warn!(retry_in = ?backoff, "no peer answered the redial");
                     }
-                    Ok(n) => {
-                        tracing::info!(peers = n, "redial re-admitted peers");
-                        backoff = REDIAL_MIN;
-                        catchup_at.get_or_insert(deadline(replay::REPLAY_DEBOUNCE));
-                    }
-                    // Every known peer refused us: this node is off the roster,
-                    // and that is the one outcome worth exiting for.
-                    Err(e) => return Err(e),
                 }
             }
 
@@ -1942,7 +2086,29 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
             {
                 catchup_at = None;
                 catch_up_and_print(&node, &printer, &mut keyring).await;
+                // Always re-armed: every other trigger is edge-driven, and a
+                // gap whose only holder is asleep needs a pass that is not.
+                arm(&mut catchup_at, CATCHUP_INTERVAL);
             }
+
+            _ = tokio::time::sleep_until(readmit_at.unwrap_or_else(now_instant)),
+                if readmit_at.is_some() =>
+            {
+                readmit_at = None;
+                refresh_admissions(&node, &book).await;
+                arm(&mut readmit_at, READMIT_INTERVAL);
+            }
+        }
+
+        // One invariant, reconciled every pass instead of at each of the six
+        // places that can break it: **an empty mesh always has a redial
+        // pending**. `NeighborDown` reaching zero is not the only way to get
+        // here — a re-join clears the set, a redial can report success without
+        // a neighbor ever coming up, and a peer can vanish while the bridge is
+        // down — and every one of those used to leave the tail sitting on an
+        // empty mesh with no timer armed, silently printing nothing.
+        if live && neighbors.is_empty() && redial_at.is_none() {
+            redial_at = Some(deadline(backoff));
         }
     }
 
@@ -1950,6 +2116,96 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
     server.abort();
     node.shutdown().await?;
     Ok(())
+}
+
+/// Consecutive rounds in which every peer this node could reach refused it.
+///
+/// The counter behind [`DENIAL_STRIKES`]: a refusal is evidence, not a verdict,
+/// and the verdict ("this node is off the roster, exit 77") is only reached when
+/// the evidence repeats with nothing admitting this node in between.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Refusals {
+    /// How many rounds in a row ended in nothing but refusals.
+    consecutive: usize,
+}
+
+impl Refusals {
+    /// Record a round that ended in refusals only; `true` once that has
+    /// happened [`DENIAL_STRIKES`] times in a row.
+    fn refused(&mut self) -> bool {
+        self.consecutive += 1;
+        self.consecutive >= DENIAL_STRIKES
+    }
+
+    /// Record any evidence that this node is still in the roster.
+    fn admitted(&mut self) {
+        self.consecutive = 0;
+    }
+}
+
+/// Ingest a live gossip message under this node's current epoch floor.
+///
+/// The floor is re-read per message for the same reason the admission handler
+/// re-reads the head per handshake: a `wires import` of a newer head must take
+/// effect on the next message, not the next restart. A head that will not load
+/// refuses the message — fail closed, like every other reader of it.
+fn ingest_live(
+    node: &topics::TopicNode,
+    store: &store::TopicStore,
+    topic: TopicId,
+    envelope: &TopicEnvelope,
+) -> anyhow::Result<replay::Ingested> {
+    let floor = node
+        .admit()
+        .current_version()
+        .context("resolving the epoch floor for ingest")?;
+    replay::ingest(store, topic, envelope, Some(floor))
+}
+
+/// Schedule `slot` for `delay` from now, keeping whichever deadline is sooner.
+///
+/// `Option::get_or_insert` was the bug: once a periodic pass is pending an hour
+/// out, an urgent two-second debounce inserted with it never moves the deadline
+/// and the urgent reason waits for the periodic one.
+fn arm(slot: &mut Option<tokio::time::Instant>, delay: Duration) {
+    let at = deadline(delay);
+    *slot = Some(match *slot {
+        Some(existing) if existing <= at => existing,
+        _ => at,
+    });
+}
+
+/// Open the topic log, waiting out an exclusive redb lock held by another
+/// process for up to `wait`.
+///
+/// redb locks the file for the life of the handle, and two `wires` commands
+/// legitimately want it seconds apart — a tail starting while a one-shot publish
+/// lingers, a publish landing while a tail is coming up. Failing immediately
+/// makes the loser's work disappear (and, when the loser is the tail, takes the
+/// resident node with it); waiting makes the overlap a pause.
+async fn open_topic_store(
+    home: &Path,
+    topic: TopicId,
+    wait: Duration,
+) -> anyhow::Result<store::TopicStore> {
+    let until = tokio::time::Instant::now() + wait;
+    let mut warned = false;
+    loop {
+        match store::TopicStore::open(home, topic) {
+            Ok(store) => return Ok(store),
+            Err(e) if tokio::time::Instant::now() < until => {
+                if !warned {
+                    warned = true;
+                    tracing::info!(
+                        "the topic log is locked by another wires process; waiting up to {}s: {e:#}",
+                        wait.as_secs()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// `now + delay` as a tokio deadline.
@@ -2024,11 +2280,7 @@ async fn publish_from_tail(
     sender: &topics::TopicSender,
     text: &str,
 ) -> anyhow::Result<TopicEnvelope> {
-    let (version, key) = ctx.keystore.latest_fabric_key()?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no fabric key in the keyring; run `wires import --fabric-key-file <node-id>.key`"
-        )
-    })?;
+    let (version, key) = current_fabric_key(&ctx.keystore)?;
     let envelope = append_local(store, &ctx.node, ctx.topic, version, &key, text, now_unix())?;
     if let Err(e) = sender.broadcast(&envelope).await {
         tracing::warn!(
@@ -2037,6 +2289,38 @@ async fn publish_from_tail(
         );
     }
     Ok(envelope)
+}
+
+/// The fabric key to publish under, refusing a superseded one.
+///
+/// Re-read per publish, not cached, so a `wires import --fabric-key …` after a
+/// `roster commit` takes effect on the next message with no restart.
+///
+/// The version check is the publish-side half of the epoch floor
+/// ([`replay::ingest`]): once the roster has moved, a message sealed under the
+/// previous commit's key is refused at ingest by every peer that holds the new
+/// head. Sealing it anyway would put a line in this node's log that no one else
+/// will ever accept — a silent one-way loss. Failing here instead names the one
+/// command that fixes it.
+fn current_fabric_key(ks: &keystore::Keystore) -> anyhow::Result<(RosterVersion, FabricKey)> {
+    let (version, key) = ks.latest_fabric_key()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no fabric key in the keyring; run `wires import --fabric-key-file <node-id>.key`"
+        )
+    })?;
+    if let Some(head) = ks.read_roster_head()?
+        && version < head.version
+    {
+        anyhow::bail!(
+            "this node's newest fabric key is for roster version {}, but the roster is at version \
+             {}: a message sealed under a superseded key is refused by every peer that holds the \
+             current head — run `wires import --fabric-key-file <node-id>.key` from the latest \
+             `wires roster commit --out DIR`",
+            version.0,
+            head.version.0
+        );
+    }
+    Ok((version, key))
 }
 
 /// Run a catch-up pass and print whatever it inserted.
@@ -2108,33 +2392,55 @@ fn print_new_since(
     Ok(())
 }
 
+/// What one [`redial`] round found.
+///
+/// Counts rather than a `Result`, because "every peer refused" and "nobody
+/// answered" and "one peer refused while four timed out" are three different
+/// situations and only the first is evidence about *this* node's standing. The
+/// caller decides; the round only reports.
+#[derive(Debug, Default)]
+struct Redial {
+    /// Peers dialed (excluding this node itself).
+    tried: usize,
+    /// Peers that completed the mutual admission handshake.
+    admitted: usize,
+    /// Peers that answered with a `Denied` frame.
+    denials: usize,
+    /// The first refusal's reason, for the exit-77 error.
+    denial: Option<anyhow::Error>,
+}
+
 /// Re-admit every known peer and hand the survivors to gossip.
 ///
 /// Re-admission is not a formality: the responder re-loads its head, so a peer
 /// that was removed from the roster since the last dial learns about it here,
-/// as a [`Denied`](crate::transport::Denied). One peer refusing is that peer's
-/// verdict; **every** peer refusing is the roster's, and it comes back as an
-/// error so the tail exits 77 rather than redialing a fabric it is no longer
-/// in.
-async fn redial(
-    node: &topics::TopicNode,
-    sender: &topics::TopicSender,
-    book: &PeerBook,
-) -> anyhow::Result<usize> {
+/// as a [`Denied`](crate::transport::Denied). But one peer refusing is that
+/// peer's verdict, and a refusal is not even always about the roster — a peer
+/// whose own head is briefly unreadable, or whose clock is skewed, or that
+/// imported a commit this node has not yet, all answer `Denied` to a node that
+/// is still a member. So this returns what happened and the caller applies
+/// [`DENIAL_STRIKES`]; a failure to hand the survivors to gossip is likewise a
+/// warning, not a reason to kill a resident tail.
+async fn redial(node: &topics::TopicNode, sender: &topics::TopicSender, book: &PeerBook) -> Redial {
     let now = now_unix();
+    let until = tokio::time::Instant::now() + PEER_ROUND_BUDGET;
     let mut admitted = Vec::new();
-    let mut denial: Option<anyhow::Error> = None;
-    let mut tried = 0usize;
+    let mut out = Redial::default();
     for peer in book.list() {
         if peer.node == node.node_id() {
             continue;
         }
-        tried += 1;
+        if tokio::time::Instant::now() >= until {
+            tracing::warn!("redial budget spent; the next round takes the rest of the book");
+            break;
+        }
+        out.tried += 1;
         match admission::admit_peer(node.endpoint(), node.admit(), &peer, now).await {
             Ok(_) => admitted.push(peer.node),
             Err(e) => {
                 if e.downcast_ref::<transport::Denied>().is_some() {
-                    denial.get_or_insert(e.context(format!(
+                    out.denials += 1;
+                    out.denial.get_or_insert(e.context(format!(
                         "peer {} refused this node's admission",
                         peer.node.hex()
                     )));
@@ -2144,14 +2450,57 @@ async fn redial(
             }
         }
     }
-    if admitted.is_empty()
-        && tried > 0
-        && let Some(denial) = denial
+    out.admitted = admitted.len();
+    if !admitted.is_empty()
+        && let Err(e) = sender.join_peers(&admitted).await
     {
-        return Err(denial);
+        // A dead subscription (the usual cause) is the re-join timer's problem,
+        // not a reason to end the process on a transient, local condition.
+        tracing::warn!("handing re-admitted peers to gossip: {e:#}");
     }
-    sender.join_peers(&admitted).await?;
-    Ok(admitted.len())
+    out
+}
+
+/// Re-establish admissions that are about to lapse.
+///
+/// An admission is a lease of [`ADMIT_TTL`](crate::admission::ADMIT_TTL), and
+/// before this existed nothing renewed one on a healthy mesh: `admit_peer` ran
+/// at bootstrap and on a redial, and a redial only happens when the neighbor
+/// count reaches zero. So a perfectly stable topic tore its own mesh down every
+/// five minutes — every peer's lease lapsed within one watchdog pass of the
+/// others (they were all derived from the same wall clock), every gossip
+/// connection was closed, and every node redialed at once. Over a week that is
+/// some two thousand synchronized outages per node, each one passing through the
+/// "zero neighbors, re-admitting" state that the rest of this loop's failure
+/// modes live in.
+async fn refresh_admissions(node: &topics::TopicNode, book: &PeerBook) {
+    let now = now_unix();
+    let soon = now.saturating_add(admission::ADMIT_REFRESH.as_secs() as i64);
+    let due = node.admit().admitted.expiring_before(soon);
+    if due.is_empty() {
+        return;
+    }
+    let until = tokio::time::Instant::now() + PEER_ROUND_BUDGET;
+    let hints: HashMap<NodeId, TopicPeer> = book.list().into_iter().map(|p| (p.node, p)).collect();
+    for peer in due {
+        if tokio::time::Instant::now() >= until {
+            tracing::warn!("admission-refresh budget spent; the next round takes the rest");
+            break;
+        }
+        // The book's hint if there is one (it carries addresses), else the bare
+        // id — the endpoint already has a path to an admitted peer.
+        let hint = hints
+            .get(&peer)
+            .cloned()
+            .unwrap_or_else(|| TopicPeer::new(peer));
+        match admission::admit_peer(node.endpoint(), node.admit(), &hint, now).await {
+            Ok(_) => tracing::debug!(peer = %peer.hex(), "refreshed an admission before it lapsed"),
+            // Not fatal and not even unusual: the peer may have gone away, in
+            // which case the lease lapses, the watchdog closes the connection,
+            // and the redial timer takes over.
+            Err(e) => tracing::warn!(peer = %peer.hex(), "could not refresh an admission: {e:#}"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2192,7 +2541,7 @@ async fn publish_cmd(a: PublishArgs) -> anyhow::Result<()> {
     let ks = Arc::new(keystore::Keystore::resolve()?);
     let home = keystore::home()?;
     let ctx = TopicContext::resolve(ks, home, &a.common)?;
-    let mut messages = match a.message {
+    let messages = match a.message {
         Some(text) => Messages::One(Some(text)),
         None => {
             use tokio::io::AsyncBufReadExt as _;
@@ -2200,19 +2549,93 @@ async fn publish_cmd(a: PublishArgs) -> anyhow::Result<()> {
         }
     };
 
-    if let Some(mut client) = ipc::ControlClient::connect(&ctx.socket_path()).await? {
-        let mut published = 0usize;
-        while let Some(text) = messages.next().await? {
-            let seq = client.publish(&text).await?;
-            tracing::info!(seq, "published through the resident tail");
-            published += 1;
-        }
-        if published == 0 {
-            eprintln!("wires publish: nothing to publish");
-        }
-        return Ok(());
+    if let Some(client) = ipc::ControlClient::connect(&ctx.socket_path()).await? {
+        return publish_through_tail(&ctx, client, messages).await;
     }
     publish_one_shot(&ctx, messages, PUBLISH_NEIGHBOR_WAIT, PUBLISH_LINGER).await
+}
+
+/// Stream every message through the resident tail, surviving a refusal.
+///
+/// `tail -f app.log | wires publish ops` is the documented use, and it used to
+/// end on the first error: a `{"err":…}` reply — which the tail sends for
+/// something as ordinary as "no fabric key for the current commit yet", in the
+/// window between a `roster commit` and the operator's `wires import` — or the
+/// socket closing because the tail was restarted. The pipe died permanently and
+/// every subsequent line was silently never published.
+///
+/// So a failure retries the same line, reconnecting first (a closed socket is
+/// the common case, and the tail may be back), and only after
+/// [`PUBLISH_ATTEMPTS`] does it give up on *that line* and move to the next.
+/// The command fails only if nothing at all got through.
+async fn publish_through_tail(
+    ctx: &TopicContext,
+    client: ipc::ControlClient,
+    mut messages: Messages,
+) -> anyhow::Result<()> {
+    let socket = ctx.socket_path();
+    let mut client = Some(client);
+    let (mut published, mut dropped) = (0usize, 0usize);
+    while let Some(text) = messages.next().await? {
+        match publish_line(&mut client, &socket, &text, PUBLISH_RETRY_DELAY).await {
+            Ok(seq) => {
+                tracing::info!(seq, "published through the resident tail");
+                published += 1;
+            }
+            Err(e) => {
+                dropped += 1;
+                eprintln!(
+                    "wires publish: dropping a line after {PUBLISH_ATTEMPTS} attempts: {e:#}"
+                );
+            }
+        }
+    }
+    match (published, dropped) {
+        (0, 0) => eprintln!("wires publish: nothing to publish"),
+        (0, _) => anyhow::bail!("no message could be published through the resident tail"),
+        (_, 0) => {}
+        (_, n) => eprintln!("wires publish: {n} line(s) were not published"),
+    }
+    Ok(())
+}
+
+/// Publish one line through the resident tail, reconnecting between attempts.
+///
+/// `client` is taken as a slot rather than a value because a failure discards
+/// the connection: a `{"err":…}` reply leaves it usable and a closed socket does
+/// not, and reconnecting costs less than telling those apart. The caller keeps
+/// the slot across lines, so a healthy stream reconnects zero times.
+async fn publish_line(
+    client: &mut Option<ipc::ControlClient>,
+    socket: &Path,
+    text: &str,
+    retry_delay: Duration,
+) -> anyhow::Result<u64> {
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 0..PUBLISH_ATTEMPTS {
+        if client.is_none() {
+            if attempt > 0 {
+                tokio::time::sleep(retry_delay).await;
+            }
+            *client = ipc::ControlClient::connect(socket).await.unwrap_or(None);
+        }
+        let Some(open) = client.as_mut() else {
+            last = Some(anyhow::anyhow!(
+                "no resident tail on {} to publish through",
+                socket.display()
+            ));
+            continue;
+        };
+        match open.publish(text).await {
+            Ok(seq) => return Ok(seq),
+            Err(e) => {
+                tracing::warn!(attempt = attempt + 1, "publish refused: {e:#}");
+                *client = None;
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("the publish was never attempted")))
 }
 
 /// Publish without a resident tail: bind, admit, join, wait for one neighbor,
@@ -2227,7 +2650,11 @@ async fn publish_one_shot(
     wait: Duration,
     linger: Duration,
 ) -> anyhow::Result<()> {
-    let store = Arc::new(store::TopicStore::open(&ctx.home, ctx.topic)?);
+    // The tail may be *starting*: it binds its control socket before it joins,
+    // but a publish that arrived a moment earlier saw no socket and got here.
+    // Waiting out the redb lock turns that race into a pause instead of a lost
+    // message (or, in the other order, a dead resident node).
+    let store = Arc::new(open_topic_store(&ctx.home, ctx.topic, STORE_LOCK_WAIT).await?);
     let node = topics::TopicNode::spawn(&ctx.node, ctx.node_config(Arc::clone(&store))).await?;
 
     let mut book = PeerBook::open(&ctx.home, ctx.topic);
@@ -2271,11 +2698,7 @@ async fn publish_one_shot(
         None => {}
     }
 
-    let (version, key) = ctx.keystore.latest_fabric_key()?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no fabric key in the keyring; run `wires import --fabric-key-file <node-id>.key`"
-        )
-    })?;
+    let (version, key) = current_fabric_key(&ctx.keystore)?;
     let mut published = 0usize;
     while let Some(text) = messages.next().await? {
         let envelope = append_local(
@@ -2287,8 +2710,19 @@ async fn publish_one_shot(
             &text,
             now_unix(),
         )?;
-        if neighbor.is_some() {
-            sender.broadcast(&envelope).await?;
+        if neighbor.is_some()
+            && let Err(e) = sender.broadcast(&envelope).await
+        {
+            // Warned, never fatal — the same rule the tail's publish path
+            // follows, and for the same reason: the sequence is *already*
+            // allocated and the message is already in the log, so aborting here
+            // would drop every remaining line and invite a retry that
+            // republishes this one under a fresh sequence (a duplicate line on
+            // the topic, from a peer restart).
+            tracing::warn!(
+                seq = envelope.seq.0,
+                "stored but not broadcast (replay will carry it): {e:#}"
+            );
         }
         tracing::info!(seq = envelope.seq.0, "published");
         published += 1;
@@ -2630,6 +3064,7 @@ mod tests {
     /// `import` arguments with no credential selected.
     fn import_args() -> ImportArgs {
         ImportArgs {
+            force: false,
             membership: None,
             membership_file: None,
             inclusion_proof: None,
@@ -2828,6 +3263,172 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ks.read_fabric_key(version).unwrap().unwrap(), installed);
+    }
+
+    /// A head only ever moves forward, on the import path too.
+    ///
+    /// `persist_head` exists because two concurrent admissions could roll the
+    /// stored head backwards — but the compare-and-swap covered only the two
+    /// network adoption paths. `wires import --roster-head` wrote whatever token
+    /// it was handed, with no comparison and no lock, and the running tail
+    /// re-reads that file on every handshake and every watchdog pass: importing
+    /// an older head downgraded the enforced roster in place and re-admitted
+    /// every member the newer commit removed. A head token is public and every
+    /// past member holds one, so "paste the head you were given" is a realistic
+    /// thing to induce.
+    #[test]
+    fn import_refuses_a_roster_head_that_walks_backwards() {
+        let (ks, root, _alice, _bob) = fabric_fixture();
+        roster_commit_in(&ks, commit_args(&root, None)).unwrap();
+        let v1 = ks.read_roster_head().unwrap().unwrap();
+        roster_commit_in(&ks, commit_args(&root, None)).unwrap();
+        let v2 = ks.read_roster_head().unwrap().unwrap();
+        assert!(v2.version > v1.version);
+
+        let err = run_import_in(
+            &ks,
+            ImportArgs {
+                roster_head: Some(v1.encode().unwrap()),
+                ..import_args()
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("only ever moves forward") && msg.contains("--force"),
+            "the refusal must name the remedy: {msg}"
+        );
+        assert_eq!(
+            ks.read_roster_head().unwrap().unwrap(),
+            v2,
+            "the enforced head must not have moved"
+        );
+
+        // The same version again is not a rollback, and neither is a newer one.
+        run_import_in(
+            &ks,
+            ImportArgs {
+                roster_head: Some(v2.encode().unwrap()),
+                ..import_args()
+            },
+        )
+        .unwrap();
+        assert_eq!(ks.read_roster_head().unwrap().unwrap(), v2);
+
+        // ...and an operator who really means it can still undo a mistake.
+        run_import_in(
+            &ks,
+            ImportArgs {
+                roster_head: Some(v1.encode().unwrap()),
+                force: true,
+                ..import_args()
+            },
+        )
+        .unwrap();
+        assert_eq!(ks.read_roster_head().unwrap().unwrap(), v1);
+    }
+
+    /// Publishing under a superseded fabric key is refused at the source.
+    ///
+    /// The receiving half of this rule is [`replay::ingest`]'s epoch floor: once
+    /// the roster has moved, a message sealed under the previous commit's key is
+    /// refused by every peer that holds the new head. Sealing it anyway would
+    /// put a line in this node's log that nobody else will ever accept — a
+    /// silent, one-way loss — so the publish fails here instead, naming the one
+    /// command that fixes it.
+    #[test]
+    fn publishing_refuses_a_superseded_fabric_key() {
+        let (ks, root, alice, _bob) = fabric_fixture();
+        ks.save_node(&alice, false).unwrap();
+        roster_commit_in(&ks, commit_args(&root, None)).unwrap();
+        let v1 = ks.read_roster_head().unwrap().unwrap().version;
+        ks.save_fabric_key(v1, &FabricKey::generate()).unwrap();
+
+        let (version, _key) = current_fabric_key(&ks).expect("v1 key under a v1 head");
+        assert_eq!(version, v1);
+
+        // The root commits again; this node imported the head (or adopted it at
+        // admission) but not yet the key.
+        roster_commit_in(&ks, commit_args(&root, None)).unwrap();
+        let v2 = ks.read_roster_head().unwrap().unwrap().version;
+        let err = current_fabric_key(&ks).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("superseded") && msg.contains("--fabric-key-file"),
+            "the refusal must name the remedy: {msg}"
+        );
+
+        // The import it asked for makes publishing work again, with no restart.
+        ks.save_fabric_key(v2, &FabricKey::generate()).unwrap();
+        assert_eq!(current_fabric_key(&ks).unwrap().0, v2);
+    }
+
+    /// The two scheduling primitives the tail loop's liveness rests on.
+    #[test]
+    fn a_pending_deadline_keeps_the_sooner_of_the_two() {
+        let mut slot: Option<tokio::time::Instant> = None;
+        arm(&mut slot, Duration::from_secs(60));
+        let far = slot.unwrap();
+        arm(&mut slot, Duration::from_secs(2));
+        let near = slot.unwrap();
+        assert!(
+            near < far,
+            "an urgent reason must move a pending periodic deadline in"
+        );
+        arm(&mut slot, Duration::from_secs(60));
+        assert_eq!(slot.unwrap(), near, "and a lazy one must not push it out");
+    }
+
+    /// Exit 77 is a verdict, and one refusal is not evidence enough for it.
+    ///
+    /// A peer that imported a commit before this node did answers `stale
+    /// inclusion proof` — a `Denied` — to a node that is still a member and only
+    /// needs `wires import`; a peer whose own head is briefly unreadable answers
+    /// `responder configuration error`. Exiting on the first of those turned
+    /// somebody else's misconfiguration into this node's death.
+    #[test]
+    fn a_refusal_becomes_a_verdict_only_when_it_repeats() {
+        let mut strikes = Refusals::default();
+        for _ in 1..DENIAL_STRIKES {
+            assert!(!strikes.refused(), "one round is not a verdict");
+        }
+        assert!(strikes.refused(), "{DENIAL_STRIKES} in a row is");
+
+        // Any evidence that this node is still in the roster resets the count.
+        let mut strikes = Refusals::default();
+        assert!(!strikes.refused());
+        strikes.admitted();
+        for _ in 1..DENIAL_STRIKES {
+            assert!(!strikes.refused());
+        }
+    }
+
+    /// A publish and a tail racing for the topic log wait for each other.
+    ///
+    /// redb locks the file for the life of the handle, and the window between
+    /// the two commands is routine — a login script that starts a tail and
+    /// publishes on the next line. Failing immediately made the loser's message
+    /// disappear, or, when the loser was the tail, killed the resident node.
+    #[tokio::test]
+    async fn opening_the_topic_log_waits_out_another_process() {
+        let home = temp_dir();
+        let topic = TopicId::derive(NodeIdentity::from_seed([1u8; 32]).node_id(), "ops");
+        let held = store::TopicStore::open(&home, topic).unwrap();
+
+        // While it is held, the wait expires and the error is the lock's.
+        let e = open_topic_store(&home, topic, Duration::from_millis(200))
+            .await
+            .expect_err("two handles on one redb file cannot both open");
+        assert!(format!("{e:#}").to_lowercase().contains("lock"), "{e:#}");
+
+        // Released mid-wait, the second open succeeds — the race is a pause.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(held);
+        });
+        open_topic_store(&home, topic, Duration::from_secs(10))
+            .await
+            .expect("the log must open once the other process lets go");
     }
 
     #[test]
@@ -3269,6 +3870,78 @@ mod tests {
         drop(client);
         server.abort();
         tail.abort();
+    }
+
+    /// A streaming publish survives a refusal and a tail restart.
+    ///
+    /// `tail -f app.log | wires publish ops` used to end on the first error —
+    /// and the tail answers `{"err":…}` for something as ordinary as "no fabric
+    /// key for the current commit yet", in the window between a `roster commit`
+    /// and the operator's `wires import`. The pipe died permanently and every
+    /// later line was silently never published.
+    #[tokio::test]
+    async fn a_streaming_publish_survives_a_refusal_and_a_reconnect() {
+        let scratch = ipc::ScratchDir::new("retry");
+        let path = scratch.socket("r.sock");
+
+        // A "tail" that refuses the first line the way a keyless one does, then
+        // answers normally.
+        let socket = ipc::ControlSocket::bind(&path).await.unwrap();
+        let (tx, mut requests) = tokio::sync::mpsc::channel(4);
+        let server = socket.spawn(tx);
+        let tail = tokio::spawn(async move {
+            let mut seen = 0u64;
+            while let Some(request) = requests.recv().await {
+                let answer = if seen == 0 {
+                    Err("no fabric key in the keyring".to_string())
+                } else {
+                    Ok(seen)
+                };
+                seen += 1;
+                let _ = request.reply.send(answer);
+            }
+        });
+
+        let mut client = ipc::ControlClient::connect(&path).await.unwrap();
+        assert!(client.is_some(), "the fixture tail is listening");
+        let seq = publish_line(&mut client, &path, "first", Duration::from_millis(10))
+            .await
+            .expect("a refusal must cost a retry, not the whole feed");
+        assert_eq!(seq, 1, "the retry is what got through");
+        let seq = publish_line(&mut client, &path, "second", Duration::from_millis(10))
+            .await
+            .expect("and the stream carries on");
+        assert_eq!(seq, 2);
+
+        // The tail goes away mid-stream: the line is reported, once, after its
+        // attempts — never a silent stop.
+        tail.abort();
+        server.abort();
+        std::fs::remove_file(&path).ok();
+        let e = publish_line(&mut client, &path, "third", Duration::from_millis(10))
+            .await
+            .expect_err("with no tail there is nothing to publish through");
+        assert!(format!("{e:#}").contains("no resident tail"), "{e:#}");
+    }
+
+    /// A publisher does not wait forever on a tail that never answers.
+    #[tokio::test]
+    async fn a_publish_gives_up_on_a_tail_that_never_answers() {
+        let scratch = ipc::ScratchDir::new("mute");
+        let path = scratch.socket("m.sock");
+        let socket = ipc::ControlSocket::bind(&path).await.unwrap();
+        // Bound and accepting, but nothing ever reads the request channel: the
+        // shape of a tail wedged on a slow peer.
+        let (tx, _requests) = tokio::sync::mpsc::channel(4);
+        let server = socket.spawn(tx);
+
+        let mut client = ipc::ControlClient::connect(&path).await.unwrap().unwrap();
+        let e = client
+            .publish_within("anyone there?", Duration::from_millis(50))
+            .await
+            .expect_err("a wedged tail must be reported, not waited on");
+        assert!(format!("{e:#}").contains("did not answer"), "{e:#}");
+        server.abort();
     }
 
     #[test]

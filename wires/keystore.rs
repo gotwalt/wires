@@ -129,12 +129,7 @@ impl Keystore {
     pub fn save_membership(&self, membership: &Membership) -> Result<PathBuf> {
         ensure_dir(&self.dir)?;
         let path = self.path("membership.json");
-        write_text(&path, &membership.encode()?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
-        }
+        write_text_mode(&path, &membership.encode()?, Some(0o644))?;
         Ok(path)
     }
 
@@ -176,8 +171,7 @@ impl Keystore {
     pub fn save_roster_head(&self, head: &RosterHead) -> Result<PathBuf> {
         ensure_dir(&self.dir)?;
         let path = self.path("roster-head.json");
-        write_text(&path, &head.encode()?)?;
-        set_mode(&path, 0o644);
+        write_text_mode(&path, &head.encode()?, Some(0o644))?;
         Ok(path)
     }
 
@@ -201,8 +195,7 @@ impl Keystore {
     pub fn save_inclusion_proof(&self, proof: &InclusionProof) -> Result<PathBuf> {
         ensure_dir(&self.dir)?;
         let path = self.path("inclusion-proof.json");
-        write_text(&path, &proof.encode()?)?;
-        set_mode(&path, 0o644);
+        write_text_mode(&path, &proof.encode()?, Some(0o644))?;
         Ok(path)
     }
 
@@ -594,8 +587,52 @@ fn write_secret(path: &Path, contents: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Write `contents` to `path` **atomically**: a temporary file in the same
+/// directory, then a `rename` over the target.
+///
+/// Every file this module writes is also read, concurrently, by something that
+/// takes no lock — `roster-head.json` most of all, which the admission handler
+/// and the watchdog re-read on every handshake and every pass while `wires
+/// import` and `wires roster commit` rewrite it from other processes. A plain
+/// `std::fs::write` is `O_TRUNC` followed by a write, so a reader landing in
+/// that window sees an empty or half-written token; the admission path answers
+/// "responder configuration error" and the watchdog treats an unloadable head as
+/// *evict everyone*, tearing the whole mesh down over a scheduling accident.
+///
+/// `rename(2)` within a directory is atomic, so a reader sees either the
+/// previous contents or the new ones and never a splice of the two. The mode is
+/// set on the temporary file *before* the rename, so the target is never
+/// momentarily world-readable either.
+fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tmp".to_string());
+    // Unique per process *and* per call: two threads in one process rewriting
+    // the same head (the admission CAS and an operator command) must not share
+    // a temporary path, or one would rename the other's half-written file.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
+
+    let result = (|| -> Result<()> {
+        std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
+        if let Some(mode) = mode {
+            set_mode(&tmp, mode);
+        }
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} onto {}", tmp.display(), path.display()))
+    })();
+    if result.is_err() {
+        std::fs::remove_file(&tmp).ok();
+    }
+    result
+}
+
+/// [`write_text_mode`] without a mode change (the file keeps the default).
 fn write_text(path: &Path, contents: &str) -> Result<()> {
-    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
+    write_text_mode(path, contents, None)
 }
 
 /// Set a file's unix mode (best-effort; no-op on non-unix).
@@ -614,9 +651,7 @@ fn set_mode(path: &Path, mode: u32) {
 /// Write a secret file at mode `0600`, overwriting any existing file (used for
 /// `roster.json`, rewritten in place by `roster add`/`remove`/`commit`).
 fn write_secret_overwrite(path: &Path, contents: &str) -> Result<()> {
-    write_text(path, contents)?;
-    set_mode(path, 0o600);
-    Ok(())
+    write_text_mode(path, contents, Some(0o600))
 }
 
 #[cfg(test)]
@@ -836,6 +871,59 @@ mod tests {
             std::fs::metadata(&pp).unwrap().permissions().mode() & 0o777,
             0o644
         );
+    }
+
+    /// A reader that takes no lock must never see a half-written head.
+    ///
+    /// The regression: `save_roster_head` used to be `O_TRUNC` + write, and
+    /// every reader of `roster-head.json` — the admission handler on each
+    /// handshake, the watchdog on each pass, in this process and in the `wires
+    /// import` / `wires roster commit` ones — reads it with no lock at all. A
+    /// reader landing in the truncation window got a decode error, which the
+    /// watchdog reads as *evict every peer*: one scheduling accident tore the
+    /// whole mesh down. With the write atomic (temp file + rename) the reader
+    /// sees the old token or the new one, never a splice.
+    #[test]
+    fn a_concurrent_reader_never_sees_a_torn_roster_head() {
+        let (root, mut roster) = fixture_roster();
+        let ks = std::sync::Arc::new(Keystore::at(temp_dir()));
+        let mut heads = Vec::new();
+        for _ in 0..40 {
+            heads.push(roster.commit(&root, 0, i64::MAX).unwrap().0);
+        }
+        ks.save_roster_head(&heads[0]).unwrap();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (ks, stop) = (std::sync::Arc::clone(&ks), std::sync::Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut reads = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Any `Err` here is a torn read; `None` would mean the file
+                    // vanished, which a rename never does either.
+                    let head = ks.read_roster_head().expect("a torn roster head");
+                    assert!(head.is_some(), "the head file must never disappear");
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for head in &heads {
+            ks.save_roster_head(head).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0, "the reader must have run");
+        assert_eq!(
+            ks.read_roster_head().unwrap().unwrap(),
+            *heads.last().unwrap()
+        );
+        // No temp file is left behind for the next reader to trip over.
+        let strays: Vec<_> = std::fs::read_dir(ks.path("."))
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "temporary files left behind: {strays:?}");
     }
 
     #[test]

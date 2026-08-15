@@ -64,6 +64,19 @@ pub const RUN_DIR: &str = "run";
 /// far past any message a human types and far short of anything that hurts.
 pub const MAX_REQUEST_LINE: usize = 1024 * 1024;
 
+/// How long `wires publish` waits for the tail's reply to one line.
+///
+/// The tail answers from its select loop, which also serves the mesh, so a reply
+/// can be delayed by a catch-up pass or a slow peer — every one of those is now
+/// itself bounded, and this is the outer bound behind them. A publisher that
+/// waits forever turns a wedged tail into a wedged pipeline with nothing in the
+/// log to say so.
+/// Two minutes rather than one: a tail that is still starting has bound this
+/// socket but not yet entered its loop (it binds before joining the mesh, so a
+/// publish racing a start queues instead of colliding on the redb lock), and its
+/// bootstrap plus first catch-up are each allowed thirty seconds.
+pub const PUBLISH_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// The run directory for control sockets under the wires home `home`.
 pub fn run_dir(home: &Path) -> PathBuf {
     home.join(RUN_DIR)
@@ -425,6 +438,15 @@ impl ControlClient {
     /// A `{"err":…}` reply becomes an error carrying the tail's own words, the
     /// same shape an admission refusal takes.
     pub async fn publish(&mut self, text: &str) -> Result<u64> {
+        self.publish_within(text, PUBLISH_REPLY_TIMEOUT).await
+    }
+
+    /// [`publish`](Self::publish) with an explicit reply deadline.
+    ///
+    /// The deadline is a parameter so the "the tail never answered" path is
+    /// asserted in milliseconds rather than by waiting out
+    /// [`PUBLISH_REPLY_TIMEOUT`].
+    pub async fn publish_within(&mut self, text: &str, budget: std::time::Duration) -> Result<u64> {
         let request = Request::Publish(Publish {
             text: text.to_string(),
         });
@@ -437,7 +459,23 @@ impl ControlClient {
         self.writer.flush().await.context("flushing a publish")?;
 
         let mut line = Vec::new();
-        if !read_capped_line(&mut self.reader, &mut line, MAX_REQUEST_LINE).await? {
+        // Bounded, because the tail is a program too: it can be wedged on a slow
+        // peer or a long catch-up, and a publisher that waits forever is a
+        // pipeline that has silently stopped rather than one that reported a
+        // problem. Generous enough that an ordinary busy tail always answers.
+        let answered = tokio::time::timeout(
+            budget,
+            read_capped_line(&mut self.reader, &mut line, MAX_REQUEST_LINE),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "the tail on {} did not answer within {:?}",
+                self.path.display(),
+                budget
+            )
+        })??;
+        if !answered {
             bail!(
                 "the tail closed the control socket {} without answering",
                 self.path.display()

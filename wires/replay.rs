@@ -87,6 +87,48 @@ pub const REPLAY_DEBOUNCE: Duration = Duration::from_secs(2);
 /// [`TopicNodeConfig::replay_limit`](crate::topics::TopicNodeConfig::replay_limit).
 pub const REPLAY_LIMIT: u32 = 512;
 
+/// How long one replay pass against one peer may take, dial included.
+///
+/// A pass is a request and a bounded run of items, so a peer that has anything
+/// to say says it quickly. Without a deadline, an admitted peer that opens the
+/// stream and then dribbles — or says nothing at all while its QUIC stack keeps
+/// the connection alive — pins the tail loop that awaits this inline: no
+/// printing, no control-socket publishes, no signal handling.
+pub const REPLAY_PASS_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The whole [`catch_up`] call's budget, across every peer and every round.
+///
+/// The loop's termination condition ("a round that inserted nothing") is
+/// attacker-controlled: a peer with one genuinely new, correctly chained
+/// envelope to hand over on every round keeps it productive forever. The budget
+/// and [`MAX_CATCH_UP_ROUNDS`] are what make the call finite regardless; what
+/// is left over is picked up by the next pass, which is scheduled anyway.
+/// It is also what bounds how long the tail loop can be unresponsive: the loop
+/// awaits a pass inline, so signals, live messages and control-socket publishes
+/// all wait on this.
+pub const CATCH_UP_BUDGET: Duration = Duration::from_secs(30);
+
+/// The most rounds one [`catch_up`] call makes before returning, however
+/// productive they are.
+pub const MAX_CATCH_UP_ROUNDS: usize = 32;
+
+/// How many per-publisher marks one `Request` carries.
+///
+/// [`hwm_all`](crate::store::TopicStore::hwm_all) grows with every distinct
+/// sender ever stored, and `sender` is a wire field: an admitted member can mint
+/// genesis envelopes under fresh keypairs, and at a few thousand of them the
+/// request frame no longer fits [`MAX_REPLAY_FRAME`](library::MAX_REPLAY_FRAME)
+/// — after which *every* replay this node attempts fails at encode, forever,
+/// with the pollution on disk so a restart does not clear it. Catch-up is the
+/// mechanism that heals gaps, so that is a permanent, remotely-triggerable
+/// brick.
+///
+/// Capping the map keeps the frame encodable. Omitting a mark is safe, only
+/// wasteful: the server answers an unclaimed publisher from genesis and the
+/// requester classifies the run as duplicates. Successive rounds rotate the
+/// window ([`hwm_window`]) so every publisher is claimed eventually.
+pub const MAX_HWM_ENTRIES: usize = 1024;
+
 /// The QUIC application error code a replay refusal closes with.
 ///
 /// Deliberately the same number [`crate::admission`] closes an ungated gossip
@@ -142,7 +184,14 @@ impl ProtocolHandler for ReplayHandler {
     /// [`catch_up`] makes several passes and a stream carries exactly one.
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
         let caller = to_node_id(&connection.remote_id());
-        if !self.admitted.is_admitted(caller, crate::now_unix()) {
+        // Checked and tracked in one locked operation (see
+        // [`Admitted::attach_conn`]): an eviction racing this accept must not
+        // leave a replay connection live and untracked, streaming this node's
+        // whole history to a peer nobody can close.
+        if !self
+            .admitted
+            .attach_conn(caller, connection.clone(), crate::now_unix())
+        {
             tracing::warn!(
                 caller = %caller.hex(),
                 "replay request from a peer with no admission; refusing"
@@ -161,11 +210,9 @@ impl ProtocolHandler for ReplayHandler {
                 anyhow!("peer {} is not admitted to this topic", caller.hex()).into(),
             ));
         }
-        // Tracked so an eviction closes the replay connection too — a peer
-        // removed from the roster mid-stream must stop being served, not run to
-        // the end of its pass.
-        self.admitted.attach_conn(caller, connection.clone());
-
+        // The attach above is also what lets an eviction close this connection:
+        // a peer removed from the roster mid-stream stops being served rather
+        // than running to the end of its pass.
         while let Ok((send, recv)) = connection.accept_bi().await {
             match serve_replay(send, recv, caller, self, crate::now_unix()).await {
                 Ok(items) => {
@@ -264,7 +311,15 @@ where
         return Err(e);
     }
 
-    let (topic, hwm, asked) = match read_replay_frame(&mut recv).await? {
+    // Bounded like every other read on this surface: a peer that opens a stream
+    // and then says nothing costs one deadline, not a task held forever.
+    let first = crate::admission::within(
+        REPLAY_PASS_TIMEOUT,
+        &format!("the replay request from {}", caller.hex()),
+        read_replay_frame(&mut recv),
+    )
+    .await?;
+    let (topic, hwm, asked) = match first {
         Some(ReplayFrame::Request { topic, hwm, limit }) => (topic, hwm, limit),
         Some(_) => {
             let e = anyhow!("first frame was not a replay request");
@@ -367,21 +422,37 @@ pub async fn catch_up(
     topic: TopicId,
     limit: u32,
 ) -> Result<CatchUp> {
+    // Fail closed, like every other reader of the head. The version is what
+    // bounds *who* is asked: only peers whose admission was decided under the
+    // roster this node currently enforces (spec §2.4), so a member the head no
+    // longer includes is not a source of history even in the window before the
+    // watchdog evicts it.
+    let floor = admit
+        .current_version()
+        .context("resolving the current roster version for catch-up")?;
+    let until = tokio::time::Instant::now() + CATCH_UP_BUDGET;
     let mut total = CatchUp {
-        peers: admit.admitted.peers().len(),
+        peers: admit.admitted.peers_since(floor).len(),
         ..CatchUp::default()
     };
-    loop {
+    for round in 0..MAX_CATCH_UP_ROUNDS {
         // Re-read the registry every round rather than snapshotting once: the
         // watchdog can evict a peer mid-loop, and a revoked peer must stop
         // being asked at the next round, not at the end of the call.
-        let peers = admit.admitted.peers();
+        let peers = admit.admitted.peers_since(floor);
         if peers.is_empty() {
             break;
         }
         let mut inserted_this_round = 0usize;
         for peer in peers {
-            match replay_from(endpoint, peer, store, topic, limit).await {
+            if tokio::time::Instant::now() >= until {
+                tracing::warn!(
+                    rounds = round,
+                    "catch-up budget spent; the next pass picks up the rest"
+                );
+                return Ok(total);
+            }
+            match replay_from(endpoint, peer, store, topic, limit, round).await {
                 Ok(pass) => {
                     inserted_this_round += pass.inserted;
                     total.absorb(pass);
@@ -412,15 +483,27 @@ async fn replay_from(
     store: &TopicStore,
     topic: TopicId,
     limit: u32,
+    round: usize,
 ) -> Result<CatchUp> {
-    let conn = endpoint
-        .connect(peer_addr(endpoint, peer).await?, library::TOPIC_REPLAY_ALPN)
-        .await
-        .map_err(|e| anyhow!("connecting to {} for replay: {e}", peer.hex()))?;
-    let (send, recv) = conn.open_bi().await.context("opening a replay stream")?;
-    let pass = request_replay(send, recv, store, topic, limit).await;
-    conn.close(VarInt::from_u32(0), b"replay pass complete");
-    pass
+    // One deadline over the whole pass — dial, stream, and every frame read.
+    // The caller awaits this inline in its `select!`, so an admitted peer that
+    // stalls must cost a timeout rather than the tail's liveness.
+    let pass = async {
+        let conn = endpoint
+            .connect(peer_addr(endpoint, peer).await?, library::TOPIC_REPLAY_ALPN)
+            .await
+            .map_err(|e| anyhow!("connecting to {} for replay: {e}", peer.hex()))?;
+        let (send, recv) = conn.open_bi().await.context("opening a replay stream")?;
+        let pass = request_replay(send, recv, store, topic, limit, round).await;
+        conn.close(VarInt::from_u32(0), b"replay pass complete");
+        pass
+    };
+    crate::admission::within(
+        REPLAY_PASS_TIMEOUT,
+        &format!("the replay pass against {}", peer.hex()),
+        pass,
+    )
+    .await
 }
 
 /// The address to dial `peer` on, from what the endpoint already knows.
@@ -454,14 +537,18 @@ async fn request_replay<S, R>(
     store: &TopicStore,
     topic: TopicId,
     limit: u32,
+    round: usize,
 ) -> Result<CatchUp>
 where
     S: AsyncWrite + Unpin + Send,
     R: AsyncRead + Unpin + Send,
 {
-    let hwm = store
-        .hwm_all()
-        .context("reading the local high-water marks")?;
+    let hwm = hwm_window(
+        store
+            .hwm_all()
+            .context("reading the local high-water marks")?,
+        round,
+    );
     write_replay_frame(&mut send, &ReplayFrame::Request { topic, hwm, limit }).await?;
     // Exactly one request rides this stream, so the write half is done.
     send.shutdown().await.ok();
@@ -475,13 +562,33 @@ where
     // gap; the run is dropped and the next pass re-asks from an unchanged mark.
     let mut stopped: HashSet<NodeId> = HashSet::new();
     loop {
+        // The server clamps its own output; this clamps what the *client* will
+        // take, which is a different promise. Nothing stops a hostile peer from
+        // streaming items past the limit it was asked for — each one costs a
+        // signature verification, and each distinct forged `sender` adds an
+        // entry to `stopped` — so the requester ends the pass at its own budget
+        // and re-asks from a mark that has moved.
+        if pass.items >= limit as usize {
+            tracing::warn!(
+                items = pass.items,
+                "replay peer streamed past the requested limit; ending the pass"
+            );
+            break;
+        }
         match read_replay_frame(&mut recv).await? {
             Some(ReplayFrame::Item(envelope)) => {
                 pass.items += 1;
                 if stopped.contains(&envelope.sender) {
                     continue;
                 }
-                match ingest(store, topic, &envelope) {
+                // No epoch floor on replayed items, and it is not an oversight:
+                // a publisher's chain is dense, so refusing its pre-commit run
+                // would leave every later message from it permanently
+                // unlinkable — a late joiner, or any member offline across a
+                // commit, could never catch up on anything again. History is
+                // ingested; what bounds the *removed member* here is which
+                // peers this node is willing to ask (see `catch_up`).
+                match ingest(store, topic, &envelope, None) {
                     Ok(Ingested::Inserted) => pass.inserted += 1,
                     Ok(Ingested::Duplicate) => pass.duplicates += 1,
                     // Replay is what heals gaps, so a gap *inside* a replay
@@ -518,6 +625,36 @@ where
     Ok(pass)
 }
 
+/// The marks one request carries: at most [`MAX_HWM_ENTRIES`], taken as a
+/// window that rotates with the round number.
+///
+/// `hwm_all` is unbounded — one entry per distinct sender ever stored, and
+/// `sender` is a field an admitted peer chooses — while the request frame is
+/// bounded by [`MAX_REPLAY_FRAME`](library::MAX_REPLAY_FRAME). Sending the whole
+/// map is therefore a remotely-triggerable, permanent encode failure (see
+/// [`MAX_HWM_ENTRIES`]); sending a window is not, and costs only duplicate items
+/// for the publishers left out of it. Rotating the window by round means a
+/// polluted log still converges: every publisher is claimed within
+/// `ceil(n / MAX_HWM_ENTRIES)` rounds.
+fn hwm_window(
+    all: std::collections::BTreeMap<NodeId, ChainState>,
+    round: usize,
+) -> std::collections::BTreeMap<NodeId, ChainState> {
+    if all.len() <= MAX_HWM_ENTRIES {
+        return all;
+    }
+    let windows = all.len().div_ceil(MAX_HWM_ENTRIES);
+    let skip = (round % windows) * MAX_HWM_ENTRIES;
+    tracing::warn!(
+        senders = all.len(),
+        window = MAX_HWM_ENTRIES,
+        skip,
+        "the topic log holds more publishers than one replay request can claim; \
+         asking for a rotating window"
+    );
+    all.into_iter().skip(skip).take(MAX_HWM_ENTRIES).collect()
+}
+
 /// What ingesting one envelope did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ingested {
@@ -539,12 +676,27 @@ pub enum Ingested {
     },
 }
 
-/// Ingest one envelope: **verify → classify → append**, in that order, for both
-/// the live mesh and replay.
+/// Ingest one envelope: **epoch → verify → classify → append**, in that order,
+/// for both the live mesh and replay.
 ///
 /// The order is the acceptance rule of spec §4.1, and each step exists to stop
 /// the next one from being reached on bad input:
 ///
+/// 0. The **epoch floor** (`floor`, spec §2.4): an envelope sealed under a
+///    fabric key older than the roster version this node enforces is refused.
+///    This is the step that makes revocation an *ingest* property rather than
+///    only a confidentiality one. A signature proves who wrote a message, never
+///    that they are still in the roster, and a removed member keeps every key
+///    ever sealed to it — so without this check a member removed at v2 can go on
+///    minting v1 envelopes that verify, chain, store, decrypt under the v1 key
+///    every survivor also keeps, and print as authentic. There is nothing in an
+///    envelope that distinguishes such a message from genuine pre-commit
+///    history, so the rule has to be positional: once this node holds the head
+///    that rotated the key, only the new epoch is accepted, on *every* path
+///    (a permissive replay path would just be the same hole reached one hop
+///    later). The cost, stated in spec §3: history sealed under a superseded
+///    epoch that this node did not already hold is not retrofitted.
+///    `None` disables the gate, for callers that have no head to enforce.
 /// 1. [`verify`](library::TopicEnvelope::verify) — structure and signature
 ///    only. No decryption: an envelope whose `key_version` this node has no key
 ///    for is still storable, and a later `wires import` heals the display
@@ -566,12 +718,25 @@ pub(crate) fn ingest(
     store: &TopicStore,
     topic: TopicId,
     envelope: &TopicEnvelope,
+    floor: Option<library::RosterVersion>,
 ) -> Result<Ingested> {
     if envelope.topic != topic {
         bail!(
             "envelope is addressed to topic {} but this node is on {}",
             envelope.topic.hex(),
             topic.hex()
+        );
+    }
+    if let Some(floor) = floor
+        && envelope.key_version < floor
+    {
+        bail!(
+            "envelope from {} is sealed under roster version {} but this node enforces version \
+             {}: messages under a superseded fabric key are not accepted (the publisher must \
+             `wires import --fabric-key-file <node-id>.key` for the current commit)",
+            envelope.sender.hex(),
+            envelope.key_version.0,
+            floor.0
         );
     }
     envelope
@@ -664,11 +829,11 @@ mod tests {
 
     use iroh::protocol::Router;
     use library::{
-        FabricKey, InclusionProof, MessageHash, NodeIdentity, Roster, RosterHead, TopicPeer,
-        next_prev_hash,
+        FabricKey, InclusionProof, MessageHash, NodeIdentity, Roster, RosterHead, RosterVersion,
+        TopicPeer, next_prev_hash,
     };
 
-    use crate::admission::{AdmittedPeer, admit_peer};
+    use crate::admission::{AdmittedPeer, MAX_INFLIGHT_ADMISSIONS, admit_peer};
     use crate::keystore::Keystore;
     use crate::transport::{HeadSource, endpoint_addr, secret_key};
 
@@ -746,6 +911,7 @@ mod tests {
             keystore: Arc::new(keystore),
             admitted: admitted.clone(),
             head_lock: Arc::new(Mutex::new(())),
+            inflight: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_ADMISSIONS)),
         });
         let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key(&identity))
@@ -1240,25 +1406,183 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            ingest(&store, fab.topic, &second).unwrap(),
+            ingest(&store, fab.topic, &second, None).unwrap(),
             Ingested::Gap { have: None }
         );
         assert!(store.hwm_all().unwrap().is_empty(), "nothing was stored");
 
         assert_eq!(
-            ingest(&store, fab.topic, &first).unwrap(),
+            ingest(&store, fab.topic, &first, None).unwrap(),
             Ingested::Inserted
         );
         assert_eq!(
-            ingest(&store, fab.topic, &second).unwrap(),
+            ingest(&store, fab.topic, &second, None).unwrap(),
             Ingested::Inserted,
             "the gap healed once its predecessor landed"
         );
         assert_eq!(
-            ingest(&store, fab.topic, &second).unwrap(),
+            ingest(&store, fab.topic, &second, None).unwrap(),
             Ingested::Duplicate,
             "re-delivery is routine, not an error"
         );
+    }
+
+    /// **Spec §2.4, claim 2.** A message sealed under a superseded fabric key is
+    /// refused on the live path, and history is still ingestible on the replay
+    /// path.
+    ///
+    /// The hole this closes: `ingest` was `verify → classify → append`, and a
+    /// signature proves *who* wrote a message, never that they are still in the
+    /// roster. A member removed at v2 keeps the v1 key that was sealed to it and
+    /// every survivor keeps that key too (spec §3 keeps them forever), so the
+    /// removed member could go on minting envelopes that verified, chained,
+    /// stored, decrypted and **printed as authentic** — with nothing marking
+    /// them as sealed under a dead epoch.
+    ///
+    /// The floor is not applied to replayed items, and that is a decision, not
+    /// an omission: a publisher's chain is dense, so refusing its pre-commit run
+    /// would leave every later message from it unlinkable forever — no late
+    /// joiner and no member offline across a commit could ever catch up again.
+    /// What bounds the removed member on that path is `peers_since`: catch-up
+    /// only asks peers admitted under the roster this node now enforces.
+    #[test]
+    fn ingest_refuses_a_superseded_epoch_on_the_live_path() {
+        let alice = NodeIdentity::from_seed([2u8; 32]);
+        let fab = fabric(&[alice.node_id()]);
+        let dir = temp_dir();
+        let store = TopicStore::open_at(&dir.join("topic.db"), fab.topic).unwrap();
+
+        // The fixture's commit is v1; the node has since moved to v2.
+        let v1 = fab.head.version;
+        let v2 = RosterVersion(v1.0 + 1);
+        let old = seal_genesis(&fab, &alice, "still here?");
+        assert_eq!(old.key_version, v1);
+
+        let refused = ingest(&store, fab.topic, &old, Some(v2))
+            .expect_err("a message under a superseded key is not a message");
+        let reason = format!("{refused:#}");
+        assert!(
+            reason.contains("superseded") && reason.contains("version 1"),
+            "the refusal must name the epoch, not read as a signature failure: {reason}"
+        );
+        assert!(
+            store.hwm_all().unwrap().is_empty(),
+            "and nothing about it reaches the log"
+        );
+
+        // The same envelope is accepted where the floor does not apply: this is
+        // ordinary history, and the chain needs it.
+        assert_eq!(
+            ingest(&store, fab.topic, &old, None).unwrap(),
+            Ingested::Inserted
+        );
+
+        // A message under the *current* epoch is unaffected, and so is one from
+        // a node running ahead of this one's head.
+        let store2 = TopicStore::open_at(&dir.join("topic2.db"), fab.topic).unwrap();
+        assert_eq!(
+            ingest(&store2, fab.topic, &old, Some(v1)).unwrap(),
+            Ingested::Inserted,
+            "the floor is a floor, not an equality"
+        );
+    }
+
+    /// The requester caps what it will take, not just what it asked for.
+    ///
+    /// A hostile peer can stream items past the limit it was given — each one
+    /// costing a signature verification, and each distinct forged `sender`
+    /// growing the `stopped` set — so the client ends the pass at its own
+    /// budget. Nothing on the server's side of the stream is trusted to stop.
+    #[tokio::test]
+    async fn a_replay_peer_cannot_stream_past_the_requested_limit() {
+        let alice = NodeIdentity::from_seed([2u8; 32]);
+        let fab = fabric(&[alice.node_id()]);
+        let dir = temp_dir();
+        // The source log the hostile "server" reads its items out of.
+        let theirs = TopicStore::open_at(&dir.join("theirs.db"), fab.topic).unwrap();
+        for i in 0..12 {
+            publish(&fab, &alice, &theirs, &format!("item {i}"));
+        }
+        // A response of twelve items and no `End`, against a limit of three.
+        let mut response: Vec<u8> = Vec::new();
+        for env in theirs.read_after(alice.node_id(), None, 100).unwrap() {
+            response.extend(ReplayFrame::Item(env).encode().unwrap());
+        }
+
+        let ours = TopicStore::open_at(&dir.join("ours.db"), fab.topic).unwrap();
+        let mut request: Vec<u8> = Vec::new();
+        let pass = request_replay(
+            &mut request,
+            std::io::Cursor::new(response),
+            &ours,
+            fab.topic,
+            3,
+            0,
+        )
+        .await
+        .expect("an over-talkative peer is unproductive, not fatal");
+
+        assert_eq!(
+            pass.items, 3,
+            "the pass stops at the requester's own budget"
+        );
+        assert_eq!(pass.inserted, 3);
+        assert_eq!(
+            ours.read_after(alice.node_id(), None, 100).unwrap().len(),
+            3,
+            "and only what it took is stored"
+        );
+    }
+
+    /// The request's high-water map is capped and rotates.
+    ///
+    /// `hwm_all` grows with every distinct sender ever stored and `sender` is a
+    /// wire field, so an admitted member minting genesis envelopes under fresh
+    /// keypairs could push the request frame past `MAX_REPLAY_FRAME` — after
+    /// which *every* replay from this node fails at encode, forever, with the
+    /// pollution on disk so a restart does not clear it.
+    #[test]
+    fn the_high_water_map_is_capped_and_rotates() {
+        let mut all = std::collections::BTreeMap::new();
+        for i in 0..(MAX_HWM_ENTRIES * 2 + 7) {
+            // Distinct ids, cheaply: the index in the first eight bytes.
+            let mut raw = [0u8; 32];
+            raw[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            let id = NodeId::from_bytes(raw);
+            all.insert(
+                id,
+                ChainState {
+                    seq: Seq(i as u64),
+                    hash: MessageHash::ZERO,
+                },
+            );
+        }
+        let total = all.len();
+
+        let first = hwm_window(all.clone(), 0);
+        assert_eq!(first.len(), MAX_HWM_ENTRIES, "the frame stays encodable");
+        assert!(
+            ReplayFrame::Request {
+                topic: TopicId::derive(NodeIdentity::from_seed([1u8; 32]).node_id(), "ops"),
+                hwm: first.clone(),
+                limit: 64,
+            }
+            .encode()
+            .is_ok(),
+            "the whole point: the request still encodes"
+        );
+
+        // Successive rounds cover the rest, so a polluted log still converges.
+        let mut seen: std::collections::BTreeSet<NodeId> = first.keys().copied().collect();
+        for round in 1..total.div_ceil(MAX_HWM_ENTRIES) {
+            seen.extend(hwm_window(all.clone(), round).keys().copied());
+        }
+        assert_eq!(seen.len(), total, "every publisher is claimed eventually");
+
+        // A map that already fits is passed through untouched.
+        let small: std::collections::BTreeMap<_, _> =
+            all.into_iter().take(MAX_HWM_ENTRIES).collect();
+        assert_eq!(hwm_window(small.clone(), 7), small);
     }
 
     /// Ingest verifies before it classifies: a tampered envelope never reaches
@@ -1272,7 +1596,7 @@ mod tests {
 
         let mut forged = seal_genesis(&fab, &alice, "one");
         forged.timestamp += 1;
-        assert!(ingest(&store, fab.topic, &forged).is_err());
+        assert!(ingest(&store, fab.topic, &forged, None).is_err());
         assert!(store.hwm_all().unwrap().is_empty());
 
         // An envelope addressed to another topic is refused by the ingest path,
@@ -1282,6 +1606,6 @@ mod tests {
             ..fabric(&[alice.node_id()])
         };
         let stray = seal_genesis(&elsewhere, &alice, "not ours");
-        assert!(ingest(&store, fab.topic, &stray).is_err());
+        assert!(ingest(&store, fab.topic, &stray, None).is_err());
     }
 }

@@ -10,8 +10,11 @@
 #
 #   1. confidentiality  -- immediate. The commit that removed B minted a new
 #                          fabric key sealed only to A and C.
-#   2. ingest integrity -- immediate. B cannot mint anything the survivors will
-#                          accept under the new key.
+#   2. ingest integrity -- immediate. Asserted in act 2, in the only window
+#                          where it means anything: B is still meshed and still
+#                          admitted, and A refuses its message anyway, because
+#                          it is sealed under the superseded key. (Asserting
+#                          this after the eviction proves claim 3 twice.)
 #   3. mesh eviction    -- within one watchdog interval (30s by default) of A
 #                          holding the new head. Asserted against A's own log.
 #   4. re-admission     -- refused outright: B's next cold publish exits 77.
@@ -221,6 +224,45 @@ run "wires import --inclusion-proof-file P2 --roster-head H2 --fabric-key-file K
 refresh "$a" "$A_ID" "$D/v2" "$HEAD2"
 refresh "$c" "$C_ID" "$D/v2" "$HEAD2"
 ok "act 2: A and C picked up version 2 (B has nothing new to pick up)"
+
+# --------------------------------------------------------------------------
+# Claim #2, in the only window where it means anything: B is STILL a neighbor
+# and STILL admitted -- the watchdog has not run yet -- so if A's transcript
+# stays put here it is ingest refusing the message, not the mesh having already
+# dropped it. Asserting this after the eviction (as this script used to) proves
+# claim 3 twice and claim 2 never.
+# --------------------------------------------------------------------------
+say "before A drops B from the mesh, B talks. It is still connected, still"
+say "admitted, and still holding the old key."
+beat 3
+before_ingest="$(count "$D/a.out")"
+run "wires publish $TOPIC -m 'B: sealed under the old key'   # B, pre-eviction"
+WIRES_HOME="$b" "$WIRES" publish "$TOPIC" -m "B: sealed under the old key" \
+	2>"$D/b-pub-epoch.err" || true
+# Long enough for a live gossip delivery, which is milliseconds; the eviction
+# budget is 30s away.
+sleep 3
+grep "admission no longer holds" "$D/a.err" | grep -q "$B_ID" &&
+	bad "act 2: A evicted B before the ingest claim could be tested; the window is gone"
+[ "$(count "$D/a.out")" -eq "$before_ingest" ] ||
+	bad "act 2: A's transcript grew while B was still meshed -- ingest accepted a dead epoch"
+grep -q "B: sealed under the old key" "$D/a.out" &&
+	bad "act 2: A printed a message sealed under the superseded key"
+if wait_for "$D/a.err" "superseded" 100; then
+	ok "act 2: A refused B's message at ingest, while still meshed with it -- claim #2"
+	[ -n "$QUIET" ] || grep -m1 "superseded" "$D/a.err" | sed 's/^/     /' >&2
+elif grep -q "superseded" "$D/b-pub-epoch.err"; then
+	# B's own tail adopted the new head at a handshake (passive distribution)
+	# before it was asked to publish, so it refused to seal under the dead key
+	# at the source. Same claim, one hop earlier, and strictly better.
+	ok "act 2: B could not even seal under the superseded key -- claim #2 at the source"
+	[ -n "$QUIET" ] || grep -m1 "superseded" "$D/b-pub-epoch.err" | sed 's/^/     /' >&2
+else
+	sed 's/^/  A| /' "$D/a.err" | tail -10 >&2
+	sed 's/^/  B| /' "$D/b-pub-epoch.err" | tail -10 >&2
+	bad "act 2: nobody refused the message and nobody printed it -- nothing was tested"
+fi
+beat 3
 [ "$(kill -0 "$A_PID" 2>/dev/null && echo live)" = "live" ] ||
 	bad "act 2: A's tail died; the point of this demo is that it does not"
 say "A's tail is still pid $A_PID. It re-reads the list per handshake and"
@@ -337,6 +379,7 @@ beat 2
 step "SUMMARY"
 # ==========================================================================
 printf '     confidentiality : immediate -- v2 key never sealed to %s\n' "$B8" >&2
+printf '     ingest integrity: immediate -- %s refused a pre-eviction message from %s\n' "$A8" "$B8" >&2
 printf '     mesh eviction   : < %ss  -- A evicted %s on its own watchdog\n' "$EVICT_BUDGET" "$B8" >&2
 printf '     re-admission    : exit %s -- B refused against roster v2\n' "$EXIT_DENIED" >&2
 printf '     bystanders      : 0     -- %s published and was read after the removal\n' "$C8" >&2

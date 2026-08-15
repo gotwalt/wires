@@ -29,22 +29,44 @@
 //!    [`FabricKey`](library::FabricKey), sealed only to the members who
 //!    survived. Nothing published after it is readable by the removed node,
 //!    whatever it is still connected to.
-//! 2. **Ingest integrity: immediate.** Envelopes are verified at ingest, and a
-//!    removed member cannot mint ciphertext that opens under a key it does not
-//!    hold. Its messages are refused, not merely ignored.
+//! 2. **Ingest integrity: immediate, and it is the *epoch* that does it.** A
+//!    signature proves who wrote a message, never that they are still in the
+//!    roster — and a removed member keeps every fabric key ever sealed to it,
+//!    as does every survivor (spec §3 keeps old keys forever so history stays
+//!    readable). So "it cannot mint ciphertext that opens" is false as stated:
+//!    it can mint under the key it holds, and survivors could read it. What is
+//!    true, and what the code enforces, is that a node holding the new head
+//!    accepts nothing sealed under a superseded one:
+//!    [`ingest`](crate::replay::ingest) refuses live envelopes below its epoch
+//!    floor, and [`catch_up`](crate::replay::catch_up) only asks peers admitted
+//!    under the head it currently enforces. Replay itself is epoch-permissive
+//!    by necessity — a publisher's chain is dense, so refusing pre-commit
+//!    history would strand every later message from that publisher — which
+//!    leaves the residual in (4).
 //! 3. **Mesh eviction: within one [`ADMIT_RECHECK`] interval** of this node
 //!    holding the new head — the watchdog re-checks every stored proof against
 //!    the freshly loaded head and evicts the ones that no longer verify,
 //!    closing their tracked gossip connections. The gate is inbound, so a
 //!    revoked peer also cannot re-admit itself: the next handshake is refused
 //!    against the new head.
-//! 4. **Residual, and deliberately not fixed here:** *outbound* dials are not
-//!    gated. iroh-gossip's peer exchange can hand this node the address of a
-//!    peer that has since been removed, and it will dial it. What that peer
-//!    learns is bounded by (1) and (2) — it can neither read the traffic nor
-//!    inject into it — so the honest deferral (spec §10) is to gate inbound
-//!    connections only and say so, rather than to ship a half-gate that reads
-//!    as complete.
+//! 4. **Residuals, deliberately not fixed here:**
+//!    - *Outbound* dials are not gated. iroh-gossip's peer exchange can hand
+//!      this node the address of a peer that has since been removed, and it
+//!      will dial it. What that peer learns is bounded by (1) and (2) — it can
+//!      neither read the traffic nor inject into it.
+//!    - A member that has **not yet imported** the new head still enforces the
+//!      old epoch, so it will accept and store a removed member's later
+//!      messages. It cannot pass them on to an upgraded node's live path (the
+//!      epoch floor refuses them) but it can serve them as history once it
+//!      upgrades and is admitted again. Closing that needs proof-carrying
+//!      envelopes and chained heads, which is Phase 3 work; the honest
+//!      statement is that revocation is complete against every node that holds
+//!      the head, and eventually complete for the rest.
+//!
+//! An admission is a **lease** ([`ADMIT_TTL`]), and the resident tail refreshes
+//! it at [`ADMIT_REFRESH`] rather than letting it lapse: nothing else renews
+//! one, so an unrefreshed mesh would tear itself down and re-handshake every
+//! five minutes, in lockstep across the whole topic.
 //!
 //! The head this all turns on spreads passively: an admission that presents a
 //! strictly newer, verified, unexpired head causes this node to adopt it (spec
@@ -93,6 +115,39 @@ pub const ADMIT_TTL: Duration = Duration::from_secs(300);
 /// only the default the CLI supplies. The eviction test injects milliseconds
 /// and asserts the neighbor drops; nothing in the suite waits 30 seconds.
 pub const ADMIT_RECHECK: Duration = Duration::from_secs(30);
+
+/// How long before an admission lapses the resident node re-establishes it.
+///
+/// A third of the TTL: long enough that a refresh is not chatty, short enough
+/// that two refresh attempts can fail before the lease actually runs out.
+pub const ADMIT_REFRESH: Duration = Duration::from_secs(ADMIT_TTL.as_secs() / 3);
+
+/// How long a dial for the admit ALPN may take before it is abandoned.
+///
+/// The topic layer had no deadline anywhere at all — `transport.rs` wraps the
+/// session ALPN in `DIAL_TIMEOUT`/`HANDSHAKE_TIMEOUT` and this path inherited
+/// neither — so a peer that accepted a connection and then said nothing hung
+/// `wires tail` at startup, before the control socket was even bound, with no
+/// diagnostic. Every await on this surface now has a bound.
+pub const TOPIC_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the admission exchange itself may take, once connected.
+///
+/// Applies on both sides: the dialer's request/ack round trip, and the
+/// responder's `accept_bi` + read. A silent peer costs this much and no more.
+pub const TOPIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many admission handshakes this process will run at once.
+///
+/// [`MAX_ADMIT_FRAME`](library::MAX_ADMIT_FRAME) bounds *one frame*, not the
+/// surface: iroh spawns a task per accepted connection with no concurrency cap,
+/// so an attacker holding no credential at all could open connections in bulk,
+/// write a 64 KiB length prefix on each, and pin a buffer and a task per
+/// connection. Admission is the one exchange that must read before it can
+/// decide anything, so the bound on how much of it can be in flight is the
+/// bound on that surface; past it, callers are refused immediately rather than
+/// queued (a queue is the same memory with a longer name).
+pub const MAX_INFLIGHT_ADMISSIONS: usize = 64;
 
 /// The QUIC application error code this gate closes connections with, so a peer
 /// can tell a policy refusal apart from a transport failure.
@@ -181,11 +236,31 @@ impl Admitted {
         }
     }
 
-    /// Track `conn` against an admitted `peer` so a later eviction closes it.
-    /// A connection from a peer that is not admitted is not tracked.
-    pub fn attach_conn(&self, peer: NodeId, conn: Connection) {
-        if let Some(entry) = self.guard().get_mut(&peer) {
-            entry.conns.push(conn);
+    /// Check `peer`'s admission and track `conn` against it **under one lock**,
+    /// returning whether the connection is admitted (and therefore tracked).
+    ///
+    /// The check and the attach are one operation on purpose. Splitting them —
+    /// `is_admitted(peer)` in the caller, then `attach_conn` — is a
+    /// time-of-check/time-of-use hole with a permanent consequence: an eviction
+    /// landing between the two removes the map entry, the attach then finds
+    /// nothing and silently drops the handle, and the connection stays live and
+    /// **untracked** for the rest of the process's life. The peer is out of the
+    /// registry, so no later watchdog pass even lists it to evict again, while
+    /// its gossip connection keeps carrying mesh traffic. A peer about to be
+    /// removed only has to open connections in a loop until one lands in that
+    /// window.
+    ///
+    /// So a caller that gets `false` must close the connection: this is the
+    /// gate, not a bookkeeping detail.
+    #[must_use = "a connection that was not admitted must be closed"]
+    pub fn attach_conn(&self, peer: NodeId, conn: Connection, now_unix: i64) -> bool {
+        let mut map = self.guard();
+        match map.get_mut(&peer) {
+            Some(entry) if now_unix <= entry.expires => {
+                entry.conns.push(conn);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -201,9 +276,59 @@ impl Admitted {
         out
     }
 
-    /// The admitted peers, in id order — the dial set for replay catch-up.
+    /// The admitted peers, in id order — the whole registry, whatever roster
+    /// version each admission was decided under.
+    ///
+    /// The *observability* view: what the gate currently holds. Callers that are
+    /// about to act on a peer want [`peers_since`](Self::peers_since) instead,
+    /// which excludes admissions made under a superseded head.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn peers(&self) -> Vec<NodeId> {
         let mut out: Vec<NodeId> = self.guard().keys().copied().collect();
+        out.sort();
+        out
+    }
+
+    /// The admitted peers whose admission was decided under roster version
+    /// `version` or later, in id order — the dial set for replay catch-up.
+    ///
+    /// Asking only peers whose credential was checked against the roster this
+    /// node *currently* enforces is what keeps replay from undoing the epoch
+    /// gate. A member removed at v2 keeps every key ever sealed to it, so it can
+    /// go on minting envelopes that verify and chain; the live path refuses them
+    /// (their `key_version` is superseded), but replay cannot — a publisher's
+    /// chain is dense, so refusing pre-commit history would strand every later
+    /// message from that publisher. What replay *can* do is not ask. A peer
+    /// admitted under v1 is one the watchdog is about to evict anyway; until it
+    /// does, catch-up simply skips it.
+    pub fn peers_since(&self, version: RosterVersion) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = self
+            .guard()
+            .iter()
+            .filter(|(_, entry)| entry.version >= version)
+            .map(|(peer, _)| *peer)
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The admitted peers whose admission lapses at or before `deadline`, in id
+    /// order — the set the resident node re-admits *before* it expires.
+    ///
+    /// An admission is a lease ([`ADMIT_TTL`]), and nothing about a healthy mesh
+    /// renews it: `admit_peer` runs at bootstrap and on a redial, and a redial
+    /// only happens when the neighbor count reaches zero. Left alone, every peer
+    /// therefore lapses on the TTL, the watchdog closes its connections, and the
+    /// whole mesh flaps every five minutes — in near lockstep, because the
+    /// expiries were all derived from the same wall clock. This is what lets the
+    /// tail refresh a lease before it runs out instead.
+    pub fn expiring_before(&self, deadline: i64) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = self
+            .guard()
+            .iter()
+            .filter(|(_, entry)| entry.expires <= deadline)
+            .map(|(peer, _)| *peer)
+            .collect();
         out.sort();
         out
     }
@@ -269,6 +394,10 @@ pub struct AdmitHandler {
     /// write — the compare-and-swap discipline spec §2.2 requires, without
     /// which two concurrent admissions can roll the stored head backwards.
     pub head_lock: Arc<Mutex<()>>,
+    /// Permits for handshakes in flight on the pre-authorization surface
+    /// ([`MAX_INFLIGHT_ADMISSIONS`]). Not a queue: a caller that cannot take a
+    /// permit is refused now.
+    pub inflight: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for AdmitHandler {
@@ -353,6 +482,17 @@ impl AdmitHandler {
         }
     }
 
+    /// The roster version this node currently enforces, or an error when no
+    /// head can be loaded (fail closed, like every other reader of the head).
+    ///
+    /// The **epoch floor** for ingest (spec §2.4 / §4.1): a message sealed under
+    /// a fabric key older than the roster this node holds is not accepted, which
+    /// is what turns "the commit rotated the key" into a property of ingest
+    /// rather than only of confidentiality.
+    pub fn current_version(&self) -> Result<RosterVersion> {
+        Ok(self.load_head()?.version)
+    }
+
     /// This node's own inclusion proof to present right now: the keystore's, if
     /// it is for a strictly newer roster version than the one this handler
     /// started with, and the startup proof otherwise.
@@ -405,16 +545,47 @@ impl ProtocolHandler for AdmitHandler {
     /// learns *why* it is out rather than seeing a connection failure.
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
         let caller = to_node_id(&connection.remote_id());
-        let (send, recv) = connection
-            .accept_bi()
-            .await
-            .map_err(AcceptError::from_err)?;
-        match serve_admission(send, recv, caller, self, crate::now_unix()).await {
+        // Before anything is read: this peer has presented no credential yet,
+        // and a permit is what bounds how many such peers can be mid-handshake.
+        let Ok(_permit) = self.inflight.clone().try_acquire_owned() else {
+            tracing::warn!(
+                caller = %caller.hex(),
+                "too many admission handshakes in flight; refusing"
+            );
+            connection.close(VarInt::from_u32(CLOSE_NOT_ADMITTED), b"admission busy");
+            return Err(AcceptError::from_boxed(
+                anyhow!("too many admission handshakes in flight").into(),
+            ));
+        };
+        // Every await from here is bounded. A peer that opens a connection and
+        // then never speaks costs one permit for one timeout, not a task and a
+        // buffer forever.
+        let exchange = async {
+            let (send, recv) = connection.accept_bi().await.context("accepting a stream")?;
+            serve_admission(send, recv, caller, self, crate::now_unix()).await
+        };
+        match within(TOPIC_HANDSHAKE_TIMEOUT, "admission handshake", exchange).await {
             Ok(admission) => {
                 // Tracked *after* the decision, so a refused peer never leaves
                 // a connection in the registry — and kept alive by this task
-                // until the peer hangs up or an eviction closes it.
-                self.admitted.attach_conn(caller, connection.clone());
+                // until the peer hangs up or an eviction closes it. The check
+                // and the attach are one locked operation: an eviction that
+                // landed during the handshake must take this connection with
+                // it, not leave it untracked and live.
+                if !self
+                    .admitted
+                    .attach_conn(caller, connection.clone(), crate::now_unix())
+                {
+                    tracing::warn!(
+                        caller = %caller.hex(),
+                        "admission was revoked during the handshake; closing"
+                    );
+                    connection.close(
+                        VarInt::from_u32(CLOSE_NOT_ADMITTED),
+                        b"not admitted to this topic",
+                    );
+                    return Ok(());
+                }
                 tracing::info!(
                     caller = %caller.hex(),
                     version = admission.version.0,
@@ -462,12 +633,21 @@ impl GatedGossip {
 
 impl ProtocolHandler for GatedGossip {
     /// Refuse a gossip connection from a node with no live admission — close it
-    /// and warn — before delegating to [`Gossip`]. An admitted peer's
-    /// connection is tracked in the registry first, so evicting the peer later
-    /// tears this connection down with it.
+    /// and warn — before delegating to [`Gossip`].
+    ///
+    /// The check *is* the tracking: [`Admitted::attach_conn`] decides and
+    /// records under one lock, so an eviction racing this accept either happens
+    /// first (the attach fails and the connection is closed here) or happens
+    /// second (the connection is in the registry and the eviction closes it).
+    /// There is no interleaving in which a revoked peer keeps an untracked
+    /// gossip connection, which is what a separate `is_admitted` check followed
+    /// by an attach allowed.
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
         let peer = to_node_id(&connection.remote_id());
-        if !self.admitted.is_admitted(peer, crate::now_unix()) {
+        if !self
+            .admitted
+            .attach_conn(peer, connection.clone(), crate::now_unix())
+        {
             tracing::warn!(
                 peer = %peer.hex(),
                 "gossip connection from a peer with no admission; closing"
@@ -480,7 +660,6 @@ impl ProtocolHandler for GatedGossip {
                 anyhow!("peer {} is not admitted to this topic", peer.hex()).into(),
             ));
         }
-        self.admitted.attach_conn(peer, connection.clone());
         self.inner.accept(connection).await
     }
 
@@ -707,17 +886,46 @@ pub async fn admit_peer(
     now_unix: i64,
 ) -> Result<Admission> {
     let addr = crate::transport::endpoint_addr(&peer.node, &peer.addrs, peer.relay_url.as_deref())?;
-    let conn = endpoint
-        .connect(addr, library::TOPIC_ADMIT_ALPN)
-        .await
-        .map_err(|e| anyhow!("connecting to {} for admission: {e}", peer.node.hex()))?;
+    // Both halves are bounded (spec §2.3): the tail loop awaits this inline, and
+    // an unreachable-but-answering peer must cost a deadline, not the process.
+    let dial = async {
+        endpoint
+            .connect(addr, library::TOPIC_ADMIT_ALPN)
+            .await
+            .map_err(|e| anyhow!("connecting to {} for admission: {e}", peer.node.hex()))
+    };
+    let conn = within(
+        TOPIC_DIAL_TIMEOUT,
+        &format!("dialing {} for admission", peer.node.hex()),
+        dial,
+    )
+    .await?;
     // Not `peer.node`: what iroh authenticated is the only identity that counts,
     // and the two agree only because the dial succeeded.
     let responder = to_node_id(&conn.remote_id());
-    let (send, recv) = conn.open_bi().await.context("opening admission stream")?;
-    let admission = request_admission(send, recv, responder, handler, now_unix).await?;
-    // Tracked so evicting this peer later closes the connection we opened.
-    handler.admitted.attach_conn(responder, conn);
+    let exchange = async {
+        let (send, recv) = conn.open_bi().await.context("opening admission stream")?;
+        request_admission(send, recv, responder, handler, now_unix).await
+    };
+    let admission = within(
+        TOPIC_HANDSHAKE_TIMEOUT,
+        &format!("the admission handshake with {}", responder.hex()),
+        exchange,
+    )
+    .await?;
+    // Tracked so evicting this peer later closes the connection we opened. A
+    // `false` here means the watchdog evicted the peer while the handshake ran;
+    // the connection is closed rather than left attached and untracked.
+    if !handler
+        .admitted
+        .attach_conn(responder, conn.clone(), now_unix)
+    {
+        conn.close(VarInt::from_u32(CLOSE_NOT_ADMITTED), b"admission revoked");
+        bail!(
+            "peer {} was evicted while the admission handshake ran",
+            responder.hex()
+        );
+    }
     Ok(admission)
 }
 
@@ -780,6 +988,27 @@ fn recheck_admissions(handler: &AdmitHandler, now_unix: i64) {
     }
 }
 
+/// Run `work` under a deadline, turning a lapse into an error that names what
+/// took too long.
+///
+/// Every await on the topic surface goes through this. The session transport has
+/// had `DIAL_TIMEOUT`/`HANDSHAKE_TIMEOUT` since Phase 1; the topic layer had
+/// nothing, so a peer that accepted a connection and then went quiet could hang
+/// a `wires tail` at startup — before the control socket was bound — or, in the
+/// live loop, pin the whole select on one unresponsive member.
+///
+/// `budget` is a parameter rather than a constant read inside, so the timeout
+/// path is asserted in milliseconds instead of ten seconds.
+pub(crate) async fn within<T, F>(budget: Duration, what: &str, work: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match tokio::time::timeout(budget, work).await {
+        Ok(result) => result,
+        Err(_) => bail!("{what} timed out after {}s", budget.as_secs_f32()),
+    }
+}
+
 /// Tell the dialer *why* it was refused, then close our side.
 ///
 /// Best-effort, like the session transport's: a peer that already vanished
@@ -821,12 +1050,20 @@ async fn read_admit_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<libr
             library::MAX_ADMIT_FRAME
         );
     }
-    let mut full = Vec::with_capacity(4 + len);
+    // Grown as bytes actually arrive, never pre-allocated from the peer's
+    // length prefix: this runs before the caller has proved anything, and
+    // `with_capacity(len)` would let a four-byte write commit the whole ceiling
+    // per connection while the peer dribbles or stalls.
+    let mut full = Vec::new();
     full.extend_from_slice(&len_buf);
-    full.resize(4 + len, 0);
-    r.read_exact(&mut full[4..])
+    let read = r
+        .take(len as u64)
+        .read_to_end(&mut full)
         .await
         .context("reading admission frame body")?;
+    if read != len {
+        bail!("truncated admission frame: {read} of {len} bytes");
+    }
     match AdmitFrame::decode(&full)? {
         Some((frame, _)) => Ok(Some(frame)),
         None => bail!("truncated admission frame"),
@@ -907,6 +1144,7 @@ mod tests {
             keystore: Arc::new(keystore),
             admitted: Admitted::new(),
             head_lock: Arc::new(Mutex::new(())),
+            inflight: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_ADMISSIONS)),
         }
     }
 
@@ -977,6 +1215,101 @@ mod tests {
         assert!(admitted.snapshot().is_empty());
         // Evicting an unknown peer is a no-op, not a panic.
         admitted.evict(me().node_id());
+    }
+
+    /// The lease view the resident tail refreshes from, and the version view
+    /// catch-up dials from.
+    ///
+    /// Both exist because of the same discovery: an admission is a lease nobody
+    /// renewed. Left alone every peer lapsed on [`ADMIT_TTL`], the watchdog
+    /// closed its connections, and a stable mesh tore itself down every five
+    /// minutes — in lockstep, since the expiries all came from one wall clock.
+    #[test]
+    fn the_registry_reports_leases_by_deadline_and_by_version() {
+        let admitted = Admitted::new();
+        let (root, me, peer) = (root(), me(), peer());
+        let mut roster = roster_of(&root, &[me.node_id(), peer.node_id()]);
+        let (v1, v1_proofs) = commit(&mut roster, &root);
+        let (v2, v2_proofs) = commit(&mut roster, &root);
+
+        admitted.insert(
+            peer.node_id(),
+            AdmittedPeer {
+                proof: v1_proofs[&peer.node_id()].clone(),
+                version: v1.version,
+                expires: 1_000,
+                conns: Vec::new(),
+            },
+        );
+        admitted.insert(
+            me.node_id(),
+            AdmittedPeer {
+                proof: v2_proofs[&me.node_id()].clone(),
+                version: v2.version,
+                expires: 9_000,
+                conns: Vec::new(),
+            },
+        );
+
+        assert_eq!(admitted.expiring_before(999), Vec::<NodeId>::new());
+        assert_eq!(
+            admitted.expiring_before(1_000),
+            vec![peer.node_id()],
+            "the edge is due: a lease refreshed only *after* it lapses is no lease"
+        );
+        assert_eq!(admitted.expiring_before(9_000).len(), 2);
+
+        // Catch-up asks only peers admitted under the roster this node now
+        // enforces — the peer admitted under v1 is one the watchdog is about to
+        // evict, and its history is not worth the round trip.
+        assert_eq!(admitted.peers_since(v1.version).len(), 2);
+        assert_eq!(admitted.peers_since(v2.version), vec![me.node_id()]);
+        assert!(admitted.peers_since(RosterVersion(99)).is_empty());
+    }
+
+    /// A handshake that never finishes must cost a deadline, not a task.
+    ///
+    /// The topic layer had no timeout anywhere: `transport.rs` wraps the session
+    /// ALPN in `DIAL_TIMEOUT`/`HANDSHAKE_TIMEOUT`, and this path inherited
+    /// neither, so a peer that accepted a connection and then said nothing hung
+    /// `wires tail` at startup — before the control socket was bound — with no
+    /// diagnostic. The budget is a parameter precisely so this asserts in
+    /// milliseconds.
+    #[tokio::test]
+    async fn a_silent_peer_cannot_hang_the_handshake() {
+        let (root, me, peer) = (root(), me(), peer());
+        let mut roster = roster_of(&root, &[me.node_id(), peer.node_id()]);
+        let (head, proofs) = commit(&mut roster, &root);
+        let dir = temp_dir();
+        let handler = handler_with(&dir, &head, proofs[&me.node_id()].clone());
+
+        // The far side of each duplex is held open and never written to — a
+        // peer that connected and then went quiet, which is what defeats the
+        // QUIC idle timeout in the field.
+        let (mut ours, _theirs) = tokio::io::duplex(64 * 1024);
+        let mut sink: Vec<u8> = Vec::new();
+        let e = within(
+            Duration::from_millis(50),
+            "the admission handshake",
+            serve_admission(&mut sink, &mut ours, peer.node_id(), &handler, 0),
+        )
+        .await
+        .expect_err("a responder must not wait forever for a request");
+        assert!(format!("{e:#}").contains("timed out"), "{e:#}");
+
+        // ...and the dialer's half is bounded by the same wrapper: the request
+        // goes out and the ack never comes.
+        let (mut theirs, _ours) = tokio::io::duplex(64 * 1024);
+        let mut out: Vec<u8> = Vec::new();
+        let e = within(
+            Duration::from_millis(50),
+            "the admission handshake",
+            request_admission(&mut out, &mut theirs, peer.node_id(), &handler, 0),
+        )
+        .await
+        .expect_err("a dialer must not wait forever for an ack");
+        assert!(format!("{e:#}").contains("timed out"), "{e:#}");
+        assert!(!out.is_empty(), "the request itself was written");
     }
 
     #[test]

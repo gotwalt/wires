@@ -1,4 +1,4 @@
-//! The five money-shot integration tests of spec §9: the whole Phase 2 stack —
+//! The six money-shot integration tests of spec §9: the whole Phase 2 stack —
 //! roster gate, gossip mesh, hash-chained log, per-commit fabric keys, and
 //! peer-symmetric replay — driven over hermetic loopback QUIC.
 //!
@@ -22,11 +22,12 @@
 //! at [`GAP_DEBOUNCE`] by the pump that stands in for the tail loop. The whole
 //! suite finishes in seconds.
 //!
-//! # The five claims
+//! # The six claims
 //!
 //! | test | spec | the claim |
 //! |------|------|-----------|
 //! | [`revocation_evicts_neighbor_between_rechecks`] | §2.4.3 | mesh eviction within one watchdog interval of the head landing, and no way back in |
+//! | [`a_removed_members_later_messages_are_refused_at_ingest`] | §2.4.2 | ingest refuses a superseded epoch, and replay does not ask a stale-epoch peer |
 //! | [`removed_member_cannot_read_after_head_advance`] | §2.4.1 | confidentiality is immediate and independent of eviction |
 //! | [`late_joiner_cannot_read_pre_join_history`] | §3 | replay hands over the whole log; the keyring is what bounds what is readable |
 //! | [`tail_catches_up_after_offline`] | §6 | exactly-once delivery across a restart |
@@ -40,7 +41,7 @@
 //! inclusion proof under it, and the [`FabricKey`] that commit minted; a
 //! [`Member`] "imports" a commit by writing exactly what `wires import` writes,
 //! into a real keystore. A member that is not handed a commit simply does not
-//! hold its key, which is the entire mechanism behind two of the five tests.
+//! hold its key, which is the entire mechanism behind two of these tests.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -611,6 +612,128 @@ async fn revocation_evicts_neighbor_between_rechecks() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. Ingest integrity: what a removed member publishes is refused
+// ---------------------------------------------------------------------------
+
+/// **Spec §2.4.2.** A survivor that holds the head which removed B refuses what
+/// B publishes afterwards — on the live path at ingest, and on the replay path
+/// by not asking B at all.
+///
+/// This is the claim the demo asserted only by proxy, and it was false as
+/// implemented. `ingest` was `verify → classify → append`, and a signature
+/// proves *who* wrote a message, never that they are still in the roster. B
+/// keeps the v1 fabric key that was sealed to it, and every survivor keeps that
+/// key too (spec §3 keeps them forever so history stays readable) — so B could
+/// go on minting envelopes that verified, chained cleanly onto its own log,
+/// stored, decrypted under the retained v1 key and **printed as authentic**,
+/// with nothing marking them as sealed under a dead epoch. The only thing
+/// standing in the way was mesh eviction, which is a delivery gate on a
+/// different clock (claim 3), not an ingest gate.
+///
+/// Both watchdogs are parked at [`SLOW_RECHECK`], so B is still admitted and
+/// still meshed when it speaks. If eviction were doing the work here, this test
+/// would pass for the wrong reason and keep passing while the hole was open.
+#[tokio::test]
+async fn a_removed_members_later_messages_are_refused_at_ingest() {
+    let a = Member::new("ea", [2u8; 32]);
+    let b = Member::new("eb", [3u8; 32]);
+    let mut fab = Fabric::new("ops");
+    let v1 = fab.commit(&[a.id(), b.id()]);
+    a.import(fab.at(v1));
+    b.import(fab.at(v1));
+
+    let node_a = a.spawn(&fab, v1, SLOW_RECHECK).await;
+    let node_b = b.spawn(&fab, v1, SLOW_RECHECK).await;
+    let (_send_a, mut rx_a) = node_a.join(fab.topic, &[]).await.unwrap();
+    let (send_b, mut rx_b) = node_b.join(fab.topic, &[hint(&node_a)]).await.unwrap();
+    wait_neighbor_up(&mut rx_a, b.id()).await;
+    wait_neighbor_up(&mut rx_b, a.id()).await;
+
+    // Before the commit, B is an ordinary member and A accepts its messages.
+    let before = publish(&fab, v1, &b.identity, node_b.store(), &send_b, "morning").await;
+    let at_a = next_message(&mut rx_a).await;
+    let floor = node_a.admit().current_version().unwrap();
+    assert_eq!(
+        replay::ingest(node_a.store(), fab.topic, &at_a, Some(floor)).unwrap(),
+        Ingested::Inserted
+    );
+    assert_eq!(at_a, before);
+
+    // The root removes B and A imports the new head. B is told nothing, holds
+    // its v1 key, and keeps publishing on its own chain.
+    let v2 = fab.commit(&[a.id()]);
+    a.import(fab.at(v2));
+    let after = publish(
+        &fab,
+        v1,
+        &b.identity,
+        node_b.store(),
+        &send_b,
+        "still here?",
+    )
+    .await;
+    assert_eq!(
+        after.key_version, v1,
+        "B can only seal under the key it has"
+    );
+
+    // It arrives — B is still meshed — and A refuses it, naming the epoch.
+    let at_a = next_message(&mut rx_a).await;
+    assert_eq!(
+        at_a, after,
+        "the bytes crossed; this is not a delivery claim"
+    );
+    let floor = node_a.admit().current_version().unwrap();
+    assert_eq!(floor, v2, "A holds the head that removed B");
+    let refused = replay::ingest(node_a.store(), fab.topic, &at_a, Some(floor))
+        .expect_err("a survivor must not accept a superseded epoch");
+    assert!(
+        format!("{refused:#}").contains("superseded"),
+        "the refusal must name the epoch: {refused:#}"
+    );
+    assert_eq!(
+        node_a.store().read_after(b.id(), None, 10).unwrap(),
+        vec![before.clone()],
+        "A's log holds B's pre-commit history and nothing after it"
+    );
+
+    // ...and replay is not a way around it: B is still in A's registry (its
+    // watchdog is parked), but it was admitted under v1, so catch-up does not
+    // ask it. Otherwise the refused message would arrive by the other door.
+    assert!(
+        node_a.admit().admitted.peers().contains(&b.id()),
+        "B is still admitted — eviction is deliberately not what is being tested"
+    );
+    assert!(
+        node_a.admit().admitted.peers_since(v2).is_empty(),
+        "but nobody in the registry was admitted under the current head"
+    );
+    let counts = timeout(
+        PATIENCE,
+        replay::catch_up(
+            node_a.endpoint(),
+            node_a.admit(),
+            node_a.store(),
+            fab.topic,
+            replay::REPLAY_LIMIT,
+        ),
+    )
+    .await
+    .expect("catch-up timed out")
+    .unwrap();
+    assert_eq!(counts.peers, 0, "a stale-epoch peer is not a source");
+    assert_eq!(counts.inserted, 0);
+    assert_eq!(
+        node_a.store().read_after(b.id(), None, 10).unwrap(),
+        vec![before],
+        "and the log is still what it was"
+    );
+
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // 2. Confidentiality does not wait for eviction
 // ---------------------------------------------------------------------------
 
@@ -675,7 +798,13 @@ async fn removed_member_cannot_read_after_head_advance() {
     let at_b = next_message(&mut rx_b).await;
     assert_eq!(at_b, secret, "the ciphertext crosses unchanged");
     assert_eq!(
-        replay::ingest(node_b.store(), fab.topic, &at_b).unwrap(),
+        replay::ingest(
+            node_b.store(),
+            fab.topic,
+            &at_b,
+            Some(node_b.admit().current_version().unwrap()),
+        )
+        .unwrap(),
         Ingested::Inserted,
         "it verifies and chains, so it is stored provisionally (spec §4.1)"
     );
@@ -701,7 +830,13 @@ async fn removed_member_cannot_read_after_head_advance() {
     let at_c = next_message(&mut rx_c).await;
     assert_eq!(at_c, secret);
     assert_eq!(
-        replay::ingest(node_c.store(), fab.topic, &at_c).unwrap(),
+        replay::ingest(
+            node_c.store(),
+            fab.topic,
+            &at_c,
+            Some(node_c.admit().current_version().unwrap()),
+        )
+        .unwrap(),
         Ingested::Inserted
     );
     let mut keyring_c = c.keyring();
@@ -881,7 +1016,13 @@ async fn tail_catches_up_after_offline() {
     let at_b = next_message(&mut rx_b).await;
     assert_eq!(at_b, live);
     assert_eq!(
-        replay::ingest(node_b.store(), fab.topic, &at_b).unwrap(),
+        replay::ingest(
+            node_b.store(),
+            fab.topic,
+            &at_b,
+            Some(node_b.admit().current_version().unwrap()),
+        )
+        .unwrap(),
         Ingested::Inserted
     );
 
@@ -1034,7 +1175,8 @@ async fn live_gap_triggers_replay_and_heals() {
                         let Some(TopicEvent::Message(envelope)) = event else {
                             continue;
                         };
-                        match replay::ingest(&store, topic, &envelope) {
+                        let floor = admit.current_version().unwrap();
+                        match replay::ingest(&store, topic, &envelope, Some(floor)) {
                             Ok(Ingested::Gap { .. }) => {
                                 gaps.fetch_add(1, Ordering::SeqCst);
                                 catchup_at.get_or_insert(

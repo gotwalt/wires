@@ -128,7 +128,20 @@ CRL is NOT consulted for topics: topic revocation is head-advance only.
 - `Admitted` — `Arc<Mutex<HashMap<NodeId, AdmittedPeer>>>`;
   `AdmittedPeer { proof, version, expires, conns: Vec<Connection> }`. Expiry =
   `min(now + ADMIT_TTL, head.not_after)`. API: `is_admitted`, `insert`, `evict`
-  (closes tracked conns), `attach_conn`.
+  (closes tracked conns), `attach_conn`, `peers_since`, `expiring_before`.
+  - **`attach_conn` is the gate, not bookkeeping.** It re-checks admission and
+    records the connection *under one lock*, returning `false` when the peer is
+    not (or no longer) admitted, and a caller that gets `false` must close the
+    connection. Checking with `is_admitted` and then attaching is a TOCTOU with a
+    permanent consequence: an eviction landing between the two removes the map
+    entry, the attach silently no-ops, and the connection stays live and
+    *untracked* — out of the registry, so no later watchdog pass lists it, and
+    never closed.
+  - **An admission is a lease, and leases are refreshed.** `ADMIT_TTL` with
+    nothing renewing it means every peer lapses, the watchdog closes its
+    connections, and a stable mesh tears itself down every five minutes — in
+    lockstep, since the expiries all derive from one wall clock. The resident
+    tail re-admits peers within `ADMIT_REFRESH` (TTL/3) of their expiry.
 - `AdmitHandler` — ProtocolHandler for `wires/topic-admit/1`; re-loads
   `HeadSource` per admission (fails closed, like `serve`); on success inserts,
   persists adopted heads via keystore, sends `Ack`.
@@ -141,17 +154,62 @@ CRL is NOT consulted for topics: topic revocation is head-advance only.
   conns for eviction.
 - Watchdog task every `ADMIT_RECHECK` (default 30s, injectable): reload
   `HeadSource`; re-run `check_roster_inclusion` on each stored proof; evict
-  failures (closing their gossip conns).
+  failures (closing their gossip conns) and sweep lapsed leases.
+- **Every await on this surface is bounded** (`TOPIC_DIAL_TIMEOUT`,
+  `TOPIC_HANDSHAKE_TIMEOUT`, both 10s, applied through one `within` helper that
+  takes the budget as an argument so the timeout path is asserted in
+  milliseconds). `transport.rs` has had this since Phase 1 and the topic layer
+  inherited none of it: a peer that accepted a connection and then said nothing
+  hung `wires tail` at startup, before the control socket was bound.
+- **The pre-authorization surface is bounded too.** `MAX_ADMIT_FRAME` bounds one
+  frame, not the surface: iroh spawns a task per accepted connection with no cap.
+  `MAX_INFLIGHT_ADMISSIONS` (64) permits are taken *before* the first read and
+  a caller that cannot get one is refused immediately, and the frame body is
+  grown as bytes arrive rather than pre-allocated from the peer's length prefix.
 
 ### 2.4 Revocation latency story (demo-asserted)
 
 1. **Confidentiality: immediate.** The commit that removed the member minted a
    new fabric key sealed only to survivors.
-2. **Ingest integrity: immediate.** Envelopes are verify-at-ingest; a removed
-   member can't mint ciphertext that opens under keys it doesn't hold.
+2. **Ingest integrity: immediate against any node that holds the new head —
+   enforced by an epoch floor, not by the signature.** The original wording here
+   ("a removed member can't mint ciphertext that opens under keys it doesn't
+   hold") was true and did not imply what it was used to claim. `verify()` is a
+   signature check: it says who wrote an envelope, never that the writer is still
+   in the roster. A removed member keeps every key ever sealed to it, and §3
+   keeps those keys on *every* survivor forever, so a member removed at v2 can go
+   on sealing v1 envelopes that verify, chain onto its own log, store, decrypt
+   and print as authentic. Nothing in an envelope distinguishes one of those from
+   genuine pre-commit history, so the rule is positional:
+
+   - **Live path (gossip):** `ingest` refuses any envelope whose `key_version` is
+     below the roster version this node currently enforces (its `roster-head.json`,
+     re-read per message like every other reader of the head). The refusal names
+     the epoch.
+   - **Publish path:** symmetrically, `wires publish` refuses to seal under a key
+     older than the stored head — such a message would be refused by every
+     up-to-date peer, and failing at the source names the `wires import` that
+     fixes it instead of losing the line silently.
+   - **Replay path:** epoch-**permissive**, deliberately. A publisher's chain is
+     dense, so refusing its pre-commit run would leave every later message from
+     it permanently unlinkable — no late joiner and no member offline across a
+     commit could ever catch up again. What bounds the removed member here is the
+     *dial set*: `catch_up` asks only peers whose admission was decided under the
+     head this node currently enforces (`Admitted::peers_since`), so a peer
+     admitted under the superseded head is not a source of history even in the
+     window before the watchdog evicts it.
 3. **Mesh eviction: ≤ watchdog interval** after a node holds the new head.
-4. **Residual (documented deferral):** outbound dials to PEX-learned revoked
-   peers are not gated (inbound-only gate); harm bounded by (1)+(2).
+4. **Residuals (documented deferrals):**
+   - Outbound dials to PEX-learned revoked peers are not gated (inbound-only
+     gate); harm bounded by (1)+(2).
+   - A member that has not yet imported the new head still enforces the old
+     epoch, so it accepts and stores the removed member's later messages. It
+     cannot inject them into an upgraded node's live path, but it can serve them
+     as history once it has upgraded and been re-admitted. Closing this needs
+     proof-carrying envelopes plus heads that chain (so an old proof is
+     verifiable against a new head) — Phase 3, out of scope here. The honest
+     claim is: **complete against every node that holds the head, eventually
+     complete for the rest.**
 
 ## 3. E2EE keys — `library/fabric_key.rs`
 
@@ -193,12 +251,21 @@ CRL is NOT consulted for topics: topic revocation is head-advance only.
 - Forward secrecy honesty (module doc): rotation-at-commit only; long-term-seed
   compromise reads all history sealed to it; ratcheting deferred.
 
+Ingest reads this rule in the other direction (§2.4.2): keys are kept so that
+*stored* history stays readable, not so that a superseded epoch stays
+publishable. New live traffic under an old key is refused; replayed history under
+one is not.
+
 Distribution: `roster_commit` mints one `FabricKey` per commit and writes
 `<node-id>.key` beside `<node-id>.proof`; the root does NOT retain the plaintext
 key (blind-root posture). Keystore: `$WIRES_HOME/keyring/<version>.key` (hex,
 0600, dir 0700); old keys kept forever (replayed history stays readable; late
 joiners can't read pre-join history). `wires import --fabric-key[-file]` opens
-(verifying root sig + member binding) and installs.
+(verifying root sig + member binding) and installs. `wires import --roster-head`
+applies the same monotonicity rule the admission CAS does — a strictly older head
+is refused without `--force` — because the stored head is what a running tail
+enforces on every handshake and every watchdog pass, and a head token is public
+and held by every past member.
 
 ## 4. Envelope + chain — `library/envelope.rs`, `library/chain.rs`
 
@@ -264,8 +331,9 @@ pub struct TopicEnvelope {
 - Dropped from the PoC envelope: `cap_id` (authorization = roster inclusion +
   key possession), `kind` (Standard-only; control messages would be a new
   format), `payload_len` (retention out of scope), `epoch` (→ `key_version`).
-- Ingest acceptance rule: `verify()` ∧ chain classifies Ok/Duplicate ∧ (if key
-  held) `open()` succeeds; without the key, store provisionally.
+- Ingest acceptance rule: (epoch floor, §2.4.2, live path only) ∧ `verify()` ∧
+  chain classifies Ok/Duplicate ∧ (if key held) `open()` succeeds; without the
+  key, store provisionally.
 - Payload convention: CLI sends UTF-8 text; binary representable, no surface.
 
 ### 4.2 Chain
@@ -316,9 +384,24 @@ pub const MAX_REPLAY_FRAME: usize = 1024 * 1024;
   that sender FROM GENESIS so the requester's `classify_link` surfaces the fork
   (PoC never verified — silent divergence).
 - `ReplayHandler` requires admission (same `Admitted` registry as gossip).
-- `catch_up(endpoint, peers, store, topic, ...)`: per admitted peer, Request
-  with local `hwm_all()`, ingest Items via verify → classify → append; loop
-  until a full pass adds nothing.
+- `catch_up(endpoint, peers, store, topic, ...)`: per peer admitted under the
+  current head (§2.4.2), Request with local `hwm_all()`, ingest Items via verify
+  → classify → append; loop until a full pass adds nothing, **or** until
+  `MAX_CATCH_UP_ROUNDS` (32) or `CATCH_UP_BUDGET` (60s) is spent. The
+  "adds nothing" condition alone is attacker-controlled: a peer with one
+  genuinely new, correctly chained envelope per round keeps it productive
+  forever, and the tail awaits this inline.
+- Bounds on the client side of a pass, none of which the server is trusted to
+  respect: `REPLAY_PASS_TIMEOUT` (20s) over dial + stream + every frame read;
+  the requester stops at the item limit it asked for (a hostile peer can stream
+  past it, and every item costs a signature verification and a `stopped`-set
+  entry); and the request's `hwm` carries at most `MAX_HWM_ENTRIES` (1024) marks
+  in a window that rotates by round. That last one is not tidiness: `hwm_all`
+  grows with every distinct sender ever stored and `sender` is a wire field, so
+  an admitted member minting genesis envelopes under fresh keypairs could push
+  the request past `MAX_REPLAY_FRAME` — after which every replay from that node
+  fails at encode, forever, with the pollution on disk so a restart does not
+  clear it. Omitting a mark only costs duplicates.
 - Live `Gap` at ingest: don't store the gapped message; schedule debounced
   (~2s) `catch_up`; the gap heals and the message re-arrives via replay.
 - Peer-symmetric: every tail runs the handler; there is no host.
@@ -332,11 +415,25 @@ replay server + unix control socket `$WIRES_HOME/run/<topic-hex[..16]>.sock`
 once the home is any deeper than `~/.config/wires`), 0600,
 unlinked on exit, stale-socket probe). `wires publish`:
 1. Socket accepts → `{"publish":{"text":…}}` NDJSON; tail allocates seq, seals,
-   appends, broadcasts; reply `{"ok":{"seq":N}}` / `{"err":…}`.
+   appends, broadcasts; reply `{"ok":{"seq":N}}` / `{"err":…}`. A refusal or a
+   dropped connection costs the *line* up to `PUBLISH_ATTEMPTS` (3) reconnecting
+   retries, never the rest of the feed: `tail -f app.log | wires publish ops`
+   must survive the window between a `roster commit` and the operator's `wires
+   import`, and must survive the tail restarting. The client's wait for a reply
+   is bounded (`PUBLISH_REPLY_TIMEOUT`).
 2. Else one-shot: open store, bind endpoint, admit vs known peers, subscribe,
    wait first NeighborUp (≤15s — no blind sleeps), seal+append+broadcast,
    linger ~1s, exit. No reachable peer → append locally + stderr warning
-   (replay makes it eventually consistent).
+   (replay makes it eventually consistent). A broadcast failure is a warning for
+   the same reason it is in the tail path: the sequence is already allocated and
+   the message is already in the log, so aborting would drop the remaining lines
+   and invite a retry that republishes this one under a fresh sequence.
+
+The tail binds its **control socket before it joins the network**, and both
+commands wait out the topic log's exclusive redb lock for `STORE_LOCK_WAIT`
+(20s). Otherwise a publish issued while a tail is starting finds no socket, falls
+through to the one-shot path, and collides on the lock — killing whichever loses,
+including the resident node.
 
 Single seq allocator per (node, topic) = the deterministic-nonce soundness
 guarantee (PoC's publish-lock hazard resolved structurally).
@@ -351,16 +448,41 @@ guarantee (PoC's publish-lock hazard resolved structurally).
   `append == Inserted` → structural dedupe across live/replay/restart.
 - Missing key version: one stderr warning per version; skip on stdout until the
   key arrives.
-- Liveness: persist peers to `topics/<hex>.peers.json` (tickets ∪ NeighborUp);
-  neighbor count 0 → backoff redial 5s→60s → re-admit (fresh head check — a
-  revoked peer learns via Denied) → catch_up → resume. `Lagged` → schedule
-  catch_up, never die silently (PoC trap). Admission refusal at startup =
-  exit 77 (`EXIT_DENIED`), same reporting shape as `connect`.
+- Liveness. The loop keeps one invariant, reconciled after every pass rather
+  than at each of the places that can break it: **an empty mesh always has a
+  redial pending.** Persist peers to `topics/<hex>.peers.json` (tickets ∪
+  NeighborUp); backoff redial 5s→60s → re-admit (fresh head check — a revoked
+  peer learns via Denied) → catch_up → resume. Specifically:
+  - `neighbors` is cleared on every re-join: a peer that vanished while the
+    bridge was down never produces a `NeighborDown` on the new subscription, and
+    one stale entry means the mesh looks populated forever and the redial timer
+    is never armed again.
+  - A successful redial does **not** disarm the timer. `admit_peer` proves the
+    handshake, never that the gossip mesh formed; the invariant above re-arms it
+    until a `NeighborUp` actually arrives.
+  - `Lagged` and a dead event bridge disable the event arm and schedule a
+    re-join on its own backoff (a closed channel is permanently ready, so an arm
+    that logs and continues is a hot spin). Same for a dead control socket.
+  - Catch-up is also **periodic** (`CATCHUP_INTERVAL`, 60s), not only
+    edge-triggered: a hole whose only holder is asleep is never healed by an
+    event that does not come. Deadlines are folded with a "keep the sooner"
+    helper, so an urgent debounce moves a pending periodic pass in.
+  - Exit 77 (`EXIT_DENIED`) on admission refusal at startup, and in the live loop
+    only after `DENIAL_STRIKES` (3) consecutive rounds in which every reachable
+    peer refused. One refusal is not evidence: a peer that imported a commit
+    first answers `stale inclusion proof` to a node that is still a member, and a
+    peer whose own head is briefly unreadable answers `responder configuration
+    error`.
 - `wires/topics.rs`: `TopicNode::{spawn(identity, cfg), join(topic, bootstrap)
   -> (TopicSender, mpsc::Receiver<TopicEvent>), ticket(name)}`;
   `TopicEvent::{Message(TopicEnvelope), NeighborUp(NodeId),
   NeighborDown(NodeId), Lagged}`. Gossip built via `Gossip::builder()` and
-  registered on the single Router. Channel cap 256; bridge logs drops.
+  registered on the single Router. Channel cap 256; a full channel makes the
+  bridge **wait**, never drop — the tail task is the only ingester, so a dropped
+  `Message` was never stored here and the bridge cannot schedule the catch-up
+  that would re-fetch it; backpressure surfaces upstream as `Lagged`, which is
+  wired to a re-join and a catch-up. `join` is bounded by `BOOTSTRAP_BUDGET`
+  (30s) over the whole peer book; the rest is the redial timer's job.
 
 ## 8. Errors (library/error.rs additions)
 
@@ -390,12 +512,28 @@ guarantee (PoC's publish-lock hazard resolved structurally).
   `late_joiner_cannot_read_pre_join_history`, `tail_catches_up_after_offline`,
   `live_gap_triggers_replay_and_heals`, plus join/refusal, replay-denied,
   ipc socket tests.
+- Plus the integration-review regressions: a removed member's later messages are
+  refused at ingest and its history is not pulled by replay (§2.4.2, e2e);
+  `attach_conn` is the admission check, and an evicted peer's tracked connection
+  is closed; the pre-authorization surface refuses past `MAX_INFLIGHT_ADMISSIONS`
+  and every handshake await times out (asserted in milliseconds, via the
+  budget-taking `within`); the requester stops at its own item limit and the
+  `hwm` window caps and rotates; a full event channel waits instead of dropping;
+  `wires import --roster-head` refuses a rollback; publishing under a superseded
+  key is refused; a torn `roster-head.json` is impossible under a concurrent
+  reader; `arm` keeps the sooner deadline; a refusal becomes exit 77 only after
+  `DENIAL_STRIKES`; the topic log's lock is waited out; a streaming publish
+  survives a refusal and a reconnect, and gives up on a mute tail.
 - Demos: self-asserting `.scripts/demo-topic.sh`, `demo-topic-revoke.sh`,
   `soak-topic.sh` (SIGSTOP/SIGCONT + kill/restart, transcript audit).
+  `demo-topic-revoke.sh` asserts all four §2.4 claims, and asserts claim 2 in the
+  window **before** eviction — otherwise it is claim 3 wearing claim 2's label.
 
 ## 10. Honest deferrals
 
-Inbound-only gossip gating; forward secrecy = commit rotation only; fork =
+Proof-carrying envelopes and chained heads (§2.4.4: what would make ingest
+integrity complete against a member that has not imported the new head);
+inbound-only gossip gating; forward secrecy = commit rotation only; fork =
 detect-and-refuse; single fabric per keystore; no discovery service (tickets +
 persisted peers); timestamps informational; per-commit `wires import` stays a
 manual member tax (head adoption at admission is the only distribution sliver
