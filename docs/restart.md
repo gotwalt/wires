@@ -143,11 +143,29 @@ bridging *cleaner*. James-core is already ~90% of the way here
    embedded at the top of the README. Re-record with the one-liner in the
    README quickstart after any demo-visible change.
 
-**Phase 1 is complete.** Remaining before Phase 2: the gate — show the demo
-to two people who run remote MCP servers today.
+**Phase 1 is complete**, and its gate has been run.
 
 **Gate:** show the demo to two people who run remote MCP servers today. If
 neither says "I want that," stop and re-examine before Phase 2.
+
+*Gate run 2026-08-14. Feedback: "interesting; value prop needs 10x clarity."
+Nobody said "I want that"; nobody said no either. Assessed against
+[storytelling.md §1](storytelling.md): that is the ceiling of a client–server
+pitch, not a fixable demo. In a one-client/one-server shape the server
+operator already holds every authority the wedge is selling — admit, refuse,
+scope, revoke — so more polish buys a nicer implementation of something that
+already works, not a clearer value prop. The kill criterion is "fails twice";
+this is once, and the diagnosis points at the pitch's shape rather than at the
+machinery, which is the case the criterion was written to distinguish.
+Proceeded to Phase 2, where authority spans many peers and there is no server
+to concede it to.*
+
+*On the demo's story: three attempts to build a broader Phase 1 story slate
+each died to a one-line rebuttal, because a one-client/one-server story sells
+authorities the server operator already has. See
+[docs/storytelling.md](storytelling.md) for the rebuttal test, what it killed,
+and the demo-as-short-story process — pointed at Phases 2–3, not at
+manufacturing more Phase 1 stories.*
 
 ### Phase 2 — The fabric minimum: multiway lands on the roster (~3–4 weeks)
 
@@ -157,19 +175,65 @@ entry, revocation is head-advance. This is the piece neither rev had: main
 had topics without finished membership; james-core has membership without
 topics.*
 
-1. **Topics over iroh-gossip**, entry gated by roster inclusion proof.
-   Reference (not merge): `main`'s `wires-net/src/gossip.rs`.
-2. **Minimal persistence + replay**: per-publisher hash-chained log, enough
-   for "catch up on what I missed." Reference: `wires-store` /
-   `wires-net/src/replay.rs`. Resist porting epochs/retention/eviction until
-   something needs them; key distribution rides the roster head.
-3. **Human in the loop via CLI only**: `wires publish` / `wires tail`.
+The implementation spec — written first, and the contract the code follows —
+is [docs/phase2-topics.md](phase2-topics.md).
+
+1. ✅ **Topics over iroh-gossip**, entry gated by roster inclusion proof.
+   iroh-gossip has no auth hook, so admission is a mutual handshake on its own
+   ALPN (`wires/topic-admit/1`) feeding an allowlist a `GatedGossip` wrapper
+   consults before delegating; a 30 s watchdog re-checks every stored proof
+   against a re-read head and evicts the peer — closing its connections — when
+   a commit drops it. Head advances ride the handshake, written through a
+   library-owned compare-and-swap so a rollback is a no-op. Topics are
+   implicit (blake3 of fabric ‖ name): no `topic create`, no registry.
+   `2d87c78`…`b5b50c1`, hardened in `7ddaad9`.
+2. ✅ **Minimal persistence + replay**: one redb log per topic, hash-chained
+   per publisher, with an `Ok`/`Duplicate`/`Gap`/`Fork` classifier (fork =
+   detect and refuse; no fork choice). Replay is **peer-symmetric** on
+   `wires/topic-replay/1` — every tail serves history, there is no host — and
+   verifies a requester's high-water hashes, streaming a publisher from
+   genesis when they disagree so divergence surfaces instead of hiding. A live
+   gap schedules a debounced catch-up rather than dropping the message, and
+   catch-up also runs periodically, so a hole whose only holder was asleep
+   still heals. Epochs, retention, and eviction stayed out, as planned.
+   `bc7ccca` (frames), `76182a1` (the redb log), `308dbb3` (the glue).
+3. ✅ **Human in the loop via CLI only**: `wires tail` is the resident node
+   (store + endpoint + gossip + admission + replay server + a unix control
+   socket) and `wires publish` is either a client of that socket or a one-shot
+   node of its own — the split that keeps exactly one sequence allocator per
+   (node, topic). Backfill, `--json`, structural dedupe across live/replay/
+   restart (print only on `Inserted`), exit 77 on refusal. `f545481`; demos in
+   `c4e1dd4`, e2e suite in `5b0fef6`, integration gate in `49237a8`.
 4. Explicitly **out of scope**: iOS app, OAuth gateway, HA daemon,
    Docker/Funnel deploy, blind-host retention machinery. Each returns only
-   when something in-scope demands it.
+   when something in-scope demands it. ✅ Held — none of them came back.
+
+**Beyond the plan: E2EE from day one** (`549382e`…`7eeaa0a` in `//library`,
+plumbed through the keystore and CLI in `f5d4934`). The wording above said only
+"key distribution rides the roster head," which taken literally is plaintext on
+the wire until some later phase. That contradicts the first non-negotiable in
+§7, and it makes the deliverable unshowable: the pitch is
+"a private, end-to-end-encrypted group chat," and a demo of an unencrypted one
+argues for nothing. So `roster commit` now mints a data key per commit and
+seals a copy to each member (X25519 → ChaCha20-Poly1305, root-signed, weak
+recipient keys refused); `wires import --fabric-key-file <node-id>.key`
+installs it. It also bought the revocation story: the commit that removes a
+member re-keys everyone else in the same act, so confidentiality is immediate
+rather than watchdog-latent. The costs are honest and written down — one more
+file per member per commit, and rotation-at-commit is the only forward secrecy
+there is (spec §10).
+
+**Phase 2's build is complete** — spec §§1–9 implemented, `bazel test //...`
+green, three self-asserting scripts (`.scripts/demo-topic.sh`,
+`demo-topic-revoke.sh`, `soak-topic.sh`).
 
 **Gate:** you, personally, keep a topic open in a terminal for a week and
 find it useful. If it's a demo you never reopen, Phase 3 won't save it.
+
+*Gate armed 2026-08-14. Nothing technical stands in front of it — there is no
+remaining task, only the week itself: keep `wires tail` open on real work and
+find out whether it gets reopened. Phase 3 waits on that answer, and so does
+the second kill criterion below.*
 
 ### Phase 3 — Agents join the chat (~2 weeks)
 

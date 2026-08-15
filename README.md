@@ -6,8 +6,10 @@
 
 ![revocation demo: the same dial before and after a roster head-advance — exit 77, zero bytes, responder never restarted](docs/demo-revoke.gif)
 
-The group chat is where this is going ([roadmap](docs/restart.md)). What runs
-today is the dial-in half, and it solves a real problem on its own:
+Two halves run today. The group chat is the newer one — several agents and you
+on one encrypted topic, no server in the middle: see
+[Topics](#topics-several-agents-and-you-one-conversation). The dial-in half is
+the older one, and solves a real problem on its own:
 
 **Run any stdio MCP server on another machine as if it were local.** The
 caller's identity is verified before the first byte; access is revocable
@@ -52,6 +54,53 @@ re-record after a change:
 asciinema rec -c ./.scripts/demo-revoke.sh demo.cast && agg demo.cast docs/demo-revoke.gif
 ```
 
+## Topics: several agents and you, one conversation
+
+Everything above is one client and one server. A **topic** is the other shape:
+your agents and you in one encrypted conversation, with no server in the
+middle and no account anywhere. You sign a list of who's in; anyone on it can
+talk; taking someone out is one command on the machine that holds your key,
+and nobody restarts.
+
+Three steps, after the usual `keygen` (see [Usage](#usage)):
+
+```bash
+# 1. You, holding the root key: sign the member list. Per member it writes an
+#    inclusion proof and that member's sealed copy of the group's data key.
+wires roster add --member "$AGENT_ID"
+wires roster commit --ttl 3600 --out ./proofs      # prints the head token
+wires member --subject "$AGENT_ID" --ttl 3600 > agent.pass
+
+# 2. Each member, once: all four credentials in a single command.
+wires import --membership-file ./agent.pass \
+             --inclusion-proof-file ./proofs/$AGENT_ID.proof \
+             --roster-head "$HEAD" \
+             --fabric-key-file ./proofs/$AGENT_ID.key
+
+# 3. Talk. `tail` is the resident node — log, mesh, admission, replay — and
+#    prints its own bootstrap ticket on stderr.
+wires tail ops                                     # → share to bootstrap: <ticket>
+wires publish ops -m "deploying build 41" --peer "$TICKET"
+```
+
+The topic isn't created anywhere; both sides compute the same name from the
+group they belong to. `publish` on a machine with a running `tail` hands the
+text to it over a unix socket; on a cold machine it stands up a one-shot node,
+delivers, and exits. Either way the line in the transcript is stamped with the
+key that signed it — no display name to spoof — and a member who was offline
+catches up from any other member, because every tail serves history.
+
+Two more self-asserting scripts, same rules as above (`--quiet`, `--keep`,
+never touch `~/.config/wires`):
+
+```bash
+./.scripts/demo-topic.sh          # two agents, one topic, nobody in the middle
+./.scripts/demo-topic-revoke.sh   # cut one out mid-conversation; same pid throughout
+```
+
+Design, threat model, and the four revocation latencies the second script
+asserts: [docs/phase2-topics.md](docs/phase2-topics.md).
+
 ## Why you'd want this
 
 Today you give an agent power by *co-locating* tools and secrets next to it:
@@ -91,7 +140,10 @@ out of scope is *communication*: several agents and a human sharing context,
 an agent noticing something and telling the others, push, persistence,
 identity that travels with you. Filling that gap — the group chat, built on
 the membership and revocation machinery that already runs here — is the
-product. The plan, its reasoning, its phase gates, and its kill criteria live
+product; its minimum ships today as [Topics](#topics-several-agents-and-you-one-conversation),
+CLI-only. Next is the on-ramp in the other direction, so an agent joins a
+topic through its own MCP config instead of a terminal. The plan, its
+reasoning, its phase gates, and its kill criteria live
 in [docs/restart.md](docs/restart.md); the layer model underneath is the
 [thesis](#wires-as-a-session-layer-stdio-and-mcp-over-a-capability-addressed-network)
 at the bottom of this file.
@@ -168,7 +220,8 @@ printf 'a\nTODO: ship it\nb\n' | ./.scripts/connect.sh   # terminal 2 → "2:TOD
 These two keep their state in a sticky `$WIRES_DEMO_DIR` (default
 `/tmp/wires-demo`) so you can re-dial without re-provisioning. The unattended
 [quickstart demos](#quickstart-run-the-demos) use a fresh `mktemp -d` instead.
-Run all four directly from the repo root, not via `bazel run //.scripts:…`.
+Every script in `.scripts/` runs directly from the repo root, not via
+`bazel run //.scripts:…`.
 
 ### The command surface
 
@@ -179,7 +232,9 @@ Run all four directly from the repo root, not via `bazel run //.scripts:…`.
 | `wires member`   | trust root (the human)    | Root-sign a **fabric membership** for a node and emit a base64 token (`--save` to the keystore) |
 | `wires roster`   | trust root (the human)    | Author a **committed roster**: `add`/`remove` members, `commit` a signed head + per-member proofs, `head` to print the current head token |
 | `wires revoke`   | trust root / responder    | Add a subject to the CRL (keystore `crl.json` by default) and print it       |
-| `wires import`   | anyone receiving creds    | Install a membership / inclusion proof / roster head into the keystore, so later commands need no flags |
+| `wires import`   | anyone receiving creds    | Install a membership / inclusion proof / roster head / topic data key into the keystore, so later commands need no flags |
+| `wires tail`     | any member (resident)     | Own a **topic**: the message log, the mesh, the admission gate, the replay server, and a control socket; print the transcript and its own bootstrap ticket |
+| `wires publish`  | any member                | Put a message on a topic — through a running `tail`'s socket, or as a one-shot node when there isn't one |
 | `wires serve`    | responder (the tool host) | Verify the dialer's **membership** (and, with `--scope`, a matching grant), exec a command, bridge its stdio — injecting the verified caller identity into the child |
 | `wires connect`  | dialer (the agent side)   | Present the **membership** and dial a `--ticket` (scoped) or `--target` (inclusion-only), piping local stdin/stdout/stderr |
 | `wires pair`     | operator ⇄ requester      | Issue a grant over the wire: `accept` (operator consents) ⇄ `request` (node)  |

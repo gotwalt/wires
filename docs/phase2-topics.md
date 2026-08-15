@@ -6,6 +6,10 @@ made against the exploration of both this tree and the archived PoC
 sources. The spec is the contract: code follows this document, and deviations are
 edits to this document first.*
 
+*Status: implemented and merged 2026-08-14 (`2d87c78`…`7ddaad9`);
+`bazel test //...` green. This document has since been reconciled line-by-line
+against the tree, so it describes what shipped, not what was planned.*
+
 Scope: topics over iroh-gossip gated by roster inclusion; per-publisher
 hash-chained logs with peer-symmetric replay; E2EE from day one (fabric data key
 minted per `roster commit`, sealed per member); `wires publish` / `wires tail`.
@@ -384,11 +388,15 @@ pub const MAX_REPLAY_FRAME: usize = 1024 * 1024;
   that sender FROM GENESIS so the requester's `classify_link` surfaces the fork
   (PoC never verified — silent divergence).
 - `ReplayHandler` requires admission (same `Admitted` registry as gossip).
-- `catch_up(endpoint, peers, store, topic, ...)`: per peer admitted under the
-  current head (§2.4.2), Request with local `hwm_all()`, ingest Items via verify
-  → classify → append; loop until a full pass adds nothing, **or** until
-  `MAX_CATCH_UP_ROUNDS` (32) or `CATCH_UP_BUDGET` (60s) is spent. The
-  "adds nothing" condition alone is attacker-controlled: a peer with one
+- `catch_up(endpoint, admit: &AdmitHandler, store, topic, limit)`: the dial set
+  is `admit.admitted.peers_since(admit.current_version()?)` — peers admitted
+  under the head this node currently enforces (§2.4.2), re-read every round so a
+  mid-loop eviction stops the asking. The handler is passed rather than a peer
+  list precisely so that set is recomputed from live state instead of
+  snapshotted by the caller. Per peer: Request with local `hwm_all()`, ingest
+  Items via verify → classify → append; loop until a full pass adds nothing,
+  **or** until `MAX_CATCH_UP_ROUNDS` (32) or `CATCH_UP_BUDGET` (30s) is spent.
+  The "adds nothing" condition alone is attacker-controlled: a peer with one
   genuinely new, correctly chained envelope per round keeps it productive
   forever, and the tail awaits this inline.
 - Bounds on the client side of a pass, none of which the server is trusted to
@@ -473,8 +481,15 @@ guarantee (PoC's publish-lock hazard resolved structurally).
     first answers `stale inclusion proof` to a node that is still a member, and a
     peer whose own head is briefly unreadable answers `responder configuration
     error`.
-- `wires/topics.rs`: `TopicNode::{spawn(identity, cfg), join(topic, bootstrap)
-  -> (TopicSender, mpsc::Receiver<TopicEvent>), ticket(name)}`;
+- `wires/topics.rs`: `TopicNode::{spawn(identity, cfg: TopicNodeConfig),
+  spawn_on(endpoint, lookup, cfg), join(topic, bootstrap)
+  -> (TopicSender, mpsc::Receiver<TopicEvent>), ticket(name), shutdown()}`.
+  `spawn` is `spawn_on` plus the bind, split for the same reason
+  `transport::serve_on` is: the hermetic loopback tests bind with
+  `presets::Minimal` and hand the endpoint (and the `MemoryLookup` registered
+  on it) in. `spawn` deliberately does **not** join or dial — a caller admits
+  its bootstrap peers first, so it can learn it has been revoked (exit 77)
+  before it ever subscribes. Events are
   `TopicEvent::{Message(TopicEnvelope), NeighborUp(NodeId),
   NeighborDown(NodeId), Lagged}`. Gossip built via `Gossip::builder()` and
   registered on the single Router. Channel cap 256; a full channel makes the

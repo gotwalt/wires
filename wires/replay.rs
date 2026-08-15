@@ -400,10 +400,11 @@ impl CatchUp {
 /// Ask every admitted peer for what this node is missing, until a full pass
 /// adds nothing.
 ///
-/// The dial set is [`Admitted::peers`] — replay is only ever requested from a
-/// peer that completed the mutual admission handshake, which is also why no
-/// address hints are needed here: the endpoint already has a path to everyone
-/// in that registry.
+/// The dial set is [`Admitted::peers_since`] at the roster version this node
+/// currently enforces (spec §2.4.2) — replay is only ever requested from a peer
+/// that completed the mutual admission handshake *under the current head*,
+/// which is also why no address hints are needed here: the endpoint already has
+/// a path to everyone in that registry.
 ///
 /// `admit` is the same [`AdmitHandler`] the node serves with, used as the
 /// client-side context (its `admitted` registry, its topic, its head): a peer
