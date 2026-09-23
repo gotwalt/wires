@@ -23,6 +23,7 @@ use library::{
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::admin::keystore;
+use crate::caller::shape::{EXIT_SHAPE, Shape, ShapeArgs, exit_code};
 use crate::caller::tools::{RemoteTool, ToolTarget, ToolsConfig, tool_from_scope};
 use crate::host::transport;
 
@@ -256,11 +257,14 @@ pub struct CredArgs {
     pub relay_url: Option<String>,
 }
 
-/// `wires call <tool> [-- args…]`.
+/// `wires call [--jq F] [--head N] [--max-bytes N] <tool> [-- args…]`.
 #[derive(Args)]
 pub struct CallArgs {
     #[command(flatten)]
     pub creds: CredArgs,
+    /// Local output shaping (no shell needed); goes before the tool name.
+    #[command(flatten)]
+    pub shape: ShapeArgs,
     /// The tool's local name in `tools.json`.
     pub tool: String,
     /// Extra arguments appended to the remote command. Use `--` before any
@@ -283,7 +287,22 @@ pub fn lookup<'a>(config: &'a ToolsConfig, name: &str) -> Result<&'a RemoteTool>
 }
 
 /// `wires call`: stream local stdio to the remote tool; returns its exit code.
+///
+/// With a shaping flag (`--jq`/`--head`/`--max-bytes`), the remote stdout is
+/// buffered and shaped in-process before it is written; stderr still
+/// streams. A filter that doesn't compile fails with [`EXIT_SHAPE`] before
+/// anything is dialed.
+///
+/// The shaping flags are local: they are not part of the [`Invocation`], so
+/// the host never sees them and its call record holds only `(tool, argv)`.
 pub async fn call_cmd(a: CallArgs) -> Result<i32> {
+    let shape = match Shape::new(&a.shape) {
+        Ok(shape) => shape,
+        Err(e) => {
+            eprintln!("wires: {e}");
+            return Ok(EXIT_SHAPE);
+        }
+    };
     let config = ToolsConfig::load(&crate::caller::tools::resolve_path(
         a.creds.tools_file.as_deref(),
     )?)?;
@@ -291,14 +310,58 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
     let argv = Argv::new(a.args).context("arguments")?;
     let plan = Dial::resolve(tool, argv)?;
     let creds = Credentials::resolve(&a.creds)?;
-    dial(
+    if shape.is_identity() {
+        return dial(
+            &creds,
+            plan,
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+            tokio::io::stderr(),
+        )
+        .await;
+    }
+    let mut stdout = Vec::new();
+    let remote = dial(
         &creds,
         plan,
         tokio::io::stdin(),
+        &mut stdout,
+        tokio::io::stderr(),
+    )
+    .await?;
+    write_shaped(
+        &shape,
+        remote,
+        &stdout,
         tokio::io::stdout(),
         tokio::io::stderr(),
     )
     .await
+}
+
+/// Shape a finished call's `stdout`, write it to `out` and any notes to
+/// `err`, and return the exit code: the remote one, unless that was 0 and
+/// shaping failed ([`EXIT_SHAPE`]).
+pub async fn write_shaped<W, E>(
+    shape: &Shape,
+    remote: i32,
+    stdout: &[u8],
+    mut out: W,
+    mut err: E,
+) -> Result<i32>
+where
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let shaped = shape.apply(stdout);
+    out.write_all(&shaped.stdout).await?;
+    out.flush().await?;
+    for note in shaped.stderr_lines() {
+        err.write_all(format!("{note}\n").as_bytes()).await?;
+    }
+    err.flush().await?;
+    Ok(exit_code(remote, &shaped))
 }
 
 #[cfg(test)]
@@ -417,6 +480,171 @@ mod tests {
         Cli::try_parse_from(std::iter::once("call").chain(argv.iter().copied()))
             .unwrap()
             .call
+    }
+
+    #[test]
+    fn shaping_flags_go_before_the_tool_and_after_it_belong_to_the_tool() {
+        let a = parse(&[
+            "--jq",
+            ".[].name",
+            "--head",
+            "3",
+            "--max-bytes",
+            "100",
+            "gh",
+            "--",
+            "api",
+            "x",
+        ]);
+        assert_eq!(a.shape.jq.as_deref(), Some(".[].name"));
+        assert_eq!((a.shape.head, a.shape.max_bytes), (Some(3), Some(100)));
+        assert_eq!(a.args, ["api", "x"]);
+        // After `--`, `--jq` is the remote command's own flag (gh's).
+        let a = parse(&["gh", "--", "api", "x", "--jq", ".name"]);
+        assert_eq!(a.shape, ShapeArgs::default());
+        assert_eq!(a.args, ["api", "x", "--jq", ".name"]);
+    }
+
+    fn shape(jq: Option<&str>, head: Option<usize>, max_bytes: Option<usize>) -> Shape {
+        Shape::new(&ShapeArgs {
+            jq: jq.map(str::to_owned),
+            head,
+            max_bytes,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn write_shaped_filters_stdout_and_notes_on_stderr() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = write_shaped(
+            &shape(Some(".[].n"), None, Some(3)),
+            0,
+            br#"[{"n":"abc"},{"n":"def"}]"#,
+            &mut out,
+            &mut err,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(out, b"abc");
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "wires: stdout truncated to 3 of 8 bytes (--max-bytes 3)\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_shaped_never_masks_a_remote_failure() {
+        let jq = shape(Some(".a"), None, None);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = write_shaped(&jq, 4, b"gh: Not Found", &mut out, &mut err)
+            .await
+            .unwrap();
+        assert_eq!(code, 4, "the remote exit code wins");
+        assert!(String::from_utf8(err).unwrap().contains("not JSON"));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = write_shaped(&jq, 0, b"not json", &mut out, &mut err)
+            .await
+            .unwrap();
+        assert_eq!(code, EXIT_SHAPE);
+    }
+
+    /// End to end over a loopback responder: the remote stdout is shaped
+    /// after it arrives, and the remote exit code passes through.
+    #[tokio::test]
+    async fn shaping_over_a_loopback_host() {
+        use crate::host::transport::{
+            ALPN, CrlSource, HeadSource, ServeConfig, call_on, endpoint_addr, secret_key, serve_on,
+        };
+        use library::{Crl, Membership};
+        use std::collections::BTreeMap;
+
+        let root = NodeIdentity::from_seed([70; 32]);
+        let server = NodeIdentity::from_seed([71; 32]);
+        let client = NodeIdentity::from_seed([72; 32]);
+        let tool = |name: &str, script: &str| {
+            (
+                ToolName::new(name).unwrap(),
+                vec!["sh".into(), "-c".into(), script.into()],
+            )
+        };
+        let config = ServeConfig {
+            tools: BTreeMap::from([
+                tool(
+                    "json",
+                    r#"printf '{"items":[{"name":"é-one"},{"name":"two"},{"name":"three"}]}'"#,
+                ),
+                tool("fail", "echo 'HTTP 404'; exit 3"),
+            ]),
+            audit: None,
+            identity: None,
+            trust_root: root.node_id(),
+            require_grant: false,
+            crl: CrlSource::Fixed(Crl::new()),
+            head: HeadSource::None,
+            membership: Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
+            proof: None,
+        };
+        let endpoint = |id: &NodeIdentity| {
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .secret_key(secret_key(id))
+                .alpns(vec![ALPN.to_vec()])
+                .bind()
+        };
+        let server_ep = endpoint(&server).await.unwrap();
+        let addrs: Vec<SocketAddr> = server_ep
+            .bound_sockets()
+            .into_iter()
+            .filter(SocketAddr::is_ipv4)
+            .map(|s| SocketAddr::from(([127, 0, 0, 1], s.port())))
+            .collect();
+        let target = endpoint_addr(&server.node_id(), &addrs, None).unwrap();
+        let srv = tokio::spawn(serve_on(server_ep, config));
+
+        let run = async |name: &str, shape: Shape| {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let remote = call_on(
+                endpoint(&client).await.unwrap(),
+                target.clone(),
+                Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap(),
+                None,
+                None,
+                true,
+                Invocation {
+                    tool: ToolName::new(name).unwrap(),
+                    argv: Argv::default(),
+                },
+                std::io::Cursor::new(Vec::new()),
+                &mut stdout,
+                &mut stderr,
+            )
+            .await
+            .unwrap();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = write_shaped(&shape, remote, &stdout, &mut out, &mut err)
+                .await
+                .unwrap();
+            (
+                code,
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+
+        let (code, out, err) = run("json", shape(Some(".items[].name"), Some(2), None)).await;
+        assert_eq!((code, out.as_str(), err.as_str()), (0, "é-one\ntwo\n", ""));
+        // `é` is 2 bytes: a 1-byte cap backs off to 0 rather than emit half
+        // a character.
+        let (code, out, err) = run("json", shape(Some(".items[0].name"), None, Some(1))).await;
+        assert_eq!((code, out.as_str()), (0, ""));
+        assert!(err.contains("truncated to 0 of"), "{err}");
+        let (code, out, err) = run("fail", shape(Some(".x"), None, None)).await;
+        assert_eq!(code, 3, "remote exit code passes through: {err}");
+        assert_eq!(out, "");
+        assert!(err.contains("HTTP 404"), "{err}");
+        srv.abort();
     }
 
     #[test]

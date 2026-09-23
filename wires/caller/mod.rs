@@ -6,6 +6,7 @@
 //! only speak MCP).
 //!
 //! - [`call`] — dial a tool and bridge stdio; the exit code is the remote one.
+//! - [`shape`] — `--jq` / `--head` / `--max-bytes`: output shaping, in-process.
 //! - [`mcp`] — the same calls as MCP tools over stdio (backward compatibility).
 //! - [`tools`] — `tools.json`: the local name → responder map.
 //! - [`login`] — OIDC sign-in, nonce-bound to this node's key.
@@ -26,4 +27,5 @@ pub mod mcp;
 #[cfg(any(test, feature = "dev-mock-idp"))]
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod mock_idp;
+pub mod shape;
 pub mod tools;
