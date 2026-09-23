@@ -118,9 +118,13 @@ impl CallAudit {
     /// responder's identity index holds one (see [`crate::host::identity`]) — so
     /// the record names the person, not only the key.
     ///
+    /// `role` is the `host.json` role the host's policy admitted the caller
+    /// under (see [`crate::host::policy`]).
+    ///
     /// `args` are the call's arguments as the record should show them; an
     /// argument list too large for an [`Argv`] is logged and recorded empty
     /// rather than failing a call that is already running.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         sink: Option<&AuditSink>,
         caller: NodeId,
@@ -128,6 +132,7 @@ impl CallAudit {
         tool: ToolName,
         args: &[String],
         roster_version: Option<u64>,
+        role: Option<String>,
     ) -> Option<Self> {
         let sink = sink?.clone();
         let argv = Argv::new(args.to_vec()).unwrap_or_else(|e| {
@@ -142,6 +147,7 @@ impl CallAudit {
             tool,
             argv,
             roster_version,
+            role,
             at_ms: now_ms(),
         });
         Some(Self {
@@ -306,6 +312,7 @@ mod tests {
             org: None,
             groups: vec![],
             not_after: 0,
+            claims: Default::default(),
         }
     }
 
@@ -324,6 +331,7 @@ mod tests {
                 tool: db_query(),
                 argv: Argv::new(vec!["-n".into()]).unwrap(),
                 roster_version: Some(1),
+                role: Some("analyst".into()),
                 at_ms: 1,
             },
             AuditRecord::Finished {
@@ -394,7 +402,7 @@ mod tests {
 
     #[test]
     fn no_sink_means_no_records_and_no_handle() {
-        assert!(CallAudit::start(None, caller(), None, db_query(), &[], None).is_none());
+        assert!(CallAudit::start(None, caller(), None, db_query(), &[], None, None).is_none());
         denied(None, caller(), None, "whatever"); // must not panic
     }
 
@@ -423,6 +431,7 @@ mod tests {
             db_query(),
             &["a b".to_string()],
             Some(7),
+            Some("analyst".into()),
         )
         .unwrap();
         let mut out = tap_stdout(Some(&audit), &b"hello world"[..]);
@@ -442,11 +451,13 @@ mod tests {
             tool,
             argv,
             roster_version,
+            role,
             ..
         }) = rx.try_recv()
         else {
             panic!("expected Started first");
         };
+        assert_eq!(role.as_deref(), Some("analyst"));
         assert_eq!(c, caller());
         assert_eq!(principal, Some(alice()), "the record names the person");
         assert_eq!(tool.as_str(), "db_query");

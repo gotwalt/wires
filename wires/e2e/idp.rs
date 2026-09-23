@@ -1,7 +1,7 @@
 //! Card 04's end-to-end claim: **a node logs in, publishes its identity on a
-//! topic, and an observer verifies it independently.** And card 05's: **a
-//! responder gates calls on those identities (`serve --require-idp`), across
-//! two IdPs, and its call records name the person.**
+//! topic, and an observer verifies it independently.** And cards 05/13's: **a
+//! host gates calls on those identities (`host.json` roles), across two IdPs,
+//! and its call records name the person and the role.**
 //!
 //! A child of [`crate::e2e`] so it reuses the
 //! fabric/member fixtures without widening their visibility. The IdP is the
@@ -67,10 +67,10 @@ async fn a_published_login_claim_is_verified_by_an_independent_observer() {
         panic!("the message is an identity record");
     };
     let fetcher_o = KeyFetcher::new(Some(o.home.path().join("jwks"))).unwrap();
-    let trust = IdpTrust {
-        issuers: vec![idp.issuer.clone()],
-        audiences: vec![Audience::new(idp.client_id.clone())],
-    };
+    let trust = IdpTrust::per_issuer(vec![(
+        idp.issuer.clone(),
+        vec![Audience::new(idp.client_id.clone())],
+    )]);
     let line = render_identity(&fetcher_o, &trust, &claim, crate::now_unix()).await;
     assert_eq!(
         line,
@@ -97,7 +97,7 @@ async fn a_published_login_claim_is_verified_by_an_independent_observer() {
 }
 
 // ---------------------------------------------------------------------------
-// Card 05: `serve --require-idp`
+// Cards 05 + 13: `host.json` roles over verified identities
 // ---------------------------------------------------------------------------
 
 /// `m` signs in at `idp` (browser replaced by the mock's redirect) and its
@@ -132,6 +132,17 @@ async fn call_as(
     version: RosterVersion,
     target: &iroh::EndpointAddr,
 ) -> (anyhow::Result<i32>, Vec<u8>) {
+    call_tool_as("cat", m, fab, version, target).await
+}
+
+/// One `wires call <tool>` from `m` to `target`, stdin `ping`.
+async fn call_tool_as(
+    tool: &str,
+    m: &Member,
+    fab: &Fabric,
+    version: RosterVersion,
+    target: &iroh::EndpointAddr,
+) -> (anyhow::Result<i32>, Vec<u8>) {
     let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(secret_key(&m.identity))
         .bind()
@@ -149,7 +160,7 @@ async fn call_as(
             Some(fab.at(version).proofs[&m.id()].clone()),
             false,
             library::Invocation {
-                tool: library::ToolName::new("cat").unwrap(),
+                tool: library::ToolName::new(tool).unwrap(),
                 argv: library::Argv::new(Vec::new()).unwrap(),
             },
             std::io::Cursor::new(b"ping".to_vec()),
@@ -186,27 +197,36 @@ async fn expect_denied(
     assert_eq!(reason, told, "the record carries the reason the caller got");
 }
 
-/// O's view of an admitted call: `Started` names the person, then `Finished`.
+/// O's view of an admitted call: `Started` names the person (if any) and the
+/// admitting role, then `Finished`.
 async fn expect_ran_as(
     rx: &mut mpsc::Receiver<TopicEvent>,
     keyring: &mut Keyring,
     who: NodeId,
-    email: &str,
+    email: Option<&str>,
+    as_role: &str,
 ) {
     let started = next_record(rx, keyring).await;
     let library::AuditRecord::Started {
-        caller, principal, ..
+        caller,
+        principal,
+        role,
+        ..
     } = &started
     else {
         panic!("expected Started, got {started:?}");
     };
     assert_eq!(*caller, who);
-    assert_eq!(
-        principal.as_ref().and_then(|p| p.email.as_deref()),
-        Some(email)
-    );
+    assert_eq!(principal.as_ref().and_then(|p| p.email.as_deref()), email);
+    assert_eq!(role.as_deref(), Some(as_role));
     let line = crate::channel::render::audit_line(&started);
-    assert!(line.contains(email), "the observer sees the name: {line}");
+    if let Some(email) = email {
+        assert!(line.contains(email), "the observer sees the name: {line}");
+    }
+    assert!(
+        line.contains(&format!("[{as_role}]")),
+        "the observer sees the role: {line}"
+    );
     let finished = next_record(rx, keyring).await;
     assert!(
         matches!(finished, library::AuditRecord::Finished { exit: 0, .. }),
@@ -214,21 +234,24 @@ async fn expect_ran_as(
     );
 }
 
-/// **Card 05.** R serves `cat` with `--audit-topic ops` and two
-/// `--require-idp` rules — `*@example.com` at the corp IdP, `*@partner.org`
-/// at a partner IdP (federation: two issuers, one channel). O observes.
+/// **Cards 05 + 13.** R serves a `host.json` on channel `ops`: `cat` for role
+/// `analyst` — `*@example.com` at the corp IdP **or** `*@partner.org` at a
+/// partner IdP (federation: two issuers, one channel) — and `status` for the
+/// built-in `member`. O observes.
 ///
-/// Alice calls before logging in and is refused (no claim); she logs in, her
-/// claim lands on the topic, and her **next** call runs — no restart — with
-/// `Started.principal` naming her. Bob, from the partner IdP, is allowed by
-/// the second rule. Eve's IdP is trusted (her token verifies) but no rule
-/// admits `eve@evil.net`, so she is refused by name. Every refusal is on the
-/// channel with the reason the caller got.
+/// Alice calls `cat` before logging in and is refused (no claim, and the rule
+/// that needed one), yet runs `status` as `member` with no IdP at all. She
+/// logs in, her claim lands on the topic, and her **next** `cat` runs — no
+/// restart — with `Started` naming her and `[analyst]`. Bob, from the
+/// partner IdP, is an analyst by the second matcher. Eve's IdP is trusted
+/// (her token verifies) but she is in no allowed role, so she is refused by
+/// name with the rule she failed. Every refusal is on the channel with the
+/// reason the caller got.
 #[tokio::test]
-async fn require_idp_admits_verified_federated_identities_only() {
+async fn host_json_roles_admit_verified_federated_identities_only() {
     use crate::caller::mock_idp::MOCK_CLIENT_ID;
+    use crate::host::config::HostConfig;
     use crate::host::identity::{Identities, IdentityGate};
-    use crate::host::idp_policy::IdpPolicy;
     use crate::host::transport::{AuditSink, CrlSource, ServeConfig, SessionProtocol};
 
     let corp = MockIdp::start("alice@example.com").await;
@@ -247,25 +270,36 @@ async fn require_idp_admits_verified_federated_identities_only() {
         m.import(fab.at(v1));
     }
 
-    // R's identity index and gate, as `serve_identities` builds them from
-    // `--require-idp … --oidc-audience …` (the third issuer via
-    // `--oidc-issuer`: trusted, just not allowed).
+    // R's host.json: all three IdPs trusted (the third just in no role).
+    let host = HostConfig::parse(&format!(
+        r#"{{
+          "version": 1,
+          "channel": "ops",
+          "identity": {{ "issuers": [
+            {{ "issuer": "{corp}", "audiences": ["{aud}"] }},
+            {{ "issuer": "{partner}", "audiences": ["{aud}"] }},
+            {{ "issuer": "{stranger}", "audiences": ["{aud}"] }}
+          ] }},
+          "roles": {{ "analyst": [
+            {{ "issuer": "{corp}", "email": "*@example.com" }},
+            {{ "issuer": "{partner}", "email": "*@partner.org" }}
+          ] }},
+          "tools": {{
+            "cat": {{ "command": ["cat"], "allow": ["analyst"] }},
+            "status": {{ "command": ["printf", "up"], "allow": ["member"] }}
+          }}
+        }}"#,
+        corp = corp.issuer.as_str(),
+        partner = partner.issuer.as_str(),
+        stranger = stranger.issuer.as_str(),
+        aud = MOCK_CLIENT_ID,
+    ))
+    .unwrap();
+    // R's identity index, as `serve_identities` builds it from host.json.
     let identities = Arc::new(Identities::new(
         KeyFetcher::new(None).unwrap(),
-        IdpTrust {
-            issuers: vec![
-                corp.issuer.clone(),
-                partner.issuer.clone(),
-                stranger.issuer.clone(),
-            ],
-            audiences: vec![Audience::new(MOCK_CLIENT_ID)],
-        },
+        host.trust(),
     ));
-    let policy = IdpPolicy::parse(&[
-        format!("iss={},email=*@example.com", corp.issuer.as_str()),
-        format!("iss={},email=*@partner.org", partner.issuer.as_str()),
-    ])
-    .unwrap();
     let (sink, records) = AuditSink::channel(crate::host::audit::AUDIT_QUEUE);
     let r_membership = library::Membership::mint(&fab.root, r.id(), 0, i64::MAX).unwrap();
     let serve = ServeConfig {
@@ -278,16 +312,10 @@ async fn require_idp_admits_verified_federated_identities_only() {
         },
         membership: r_membership.clone(),
         proof: None,
-        tools: std::collections::BTreeMap::from([(
-            library::ToolName::new("cat").unwrap(),
-            vec!["cat".to_string()],
-        )]),
+        tools: host.commands(),
         audit: Some(sink),
-        identity: Some(Arc::new(IdentityGate::new(
-            Arc::clone(&identities),
-            policy,
-            "ops",
-        ))),
+        identity: Some(Arc::new(IdentityGate::new(Arc::clone(&identities), "ops"))),
+        policy: Arc::new(host.policy()),
     };
     let store_r = r.store(&fab);
     let mut cfg = TopicNodeConfig::new(
@@ -374,13 +402,23 @@ async fn require_idp_admits_verified_federated_identities_only() {
             .unwrap();
     let mut keyring_o = o.keyring();
 
-    // 1. Alice, before logging in: refused, with the remedy.
+    // 1. Alice, before logging in: refused `cat`, with the remedy and the
+    //    rule that needed an identity ...
     let (res, out) = call_as(&alice, &fab, v1, &target).await;
     let told = denied_reason(res);
     assert!(out.is_empty(), "nothing ran");
     assert!(told.starts_with("no identity claim for"), "{told}");
     assert!(told.contains("wires login --topic ops"), "{told}");
+    assert!(
+        told.contains("cat needs a verified identity in role analyst (issuer="),
+        "{told}"
+    );
     expect_denied(&mut rx_o, &mut keyring_o, alice.id(), &told).await;
+    // ... but `member` needs no IdP, because host.json says so explicitly.
+    let (res, out) = call_tool_as("status", &alice, &fab, v1, &target).await;
+    assert_eq!(res.unwrap(), 0);
+    assert_eq!(out, b"up");
+    expect_ran_as(&mut rx_o, &mut keyring_o, alice.id(), None, "member").await;
 
     // 2. She logs in; once R has seen the claim, her next call runs.
     log_in_and_publish(&corp, &alice, &fab, v1, &send_o).await;
@@ -392,9 +430,17 @@ async fn require_idp_admits_verified_federated_identities_only() {
     let (res, out) = call_as(&alice, &fab, v1, &target).await;
     assert_eq!(res.unwrap(), 0);
     assert_eq!(out, b"ping");
-    expect_ran_as(&mut rx_o, &mut keyring_o, alice.id(), "alice@example.com").await;
+    expect_ran_as(
+        &mut rx_o,
+        &mut keyring_o,
+        alice.id(),
+        Some("alice@example.com"),
+        "analyst",
+    )
+    .await;
 
-    // 3. Federation: Bob, from the partner IdP, is admitted by the second rule.
+    // 3. Federation: Bob, from the partner IdP, is an analyst by the second
+    //    matcher.
     log_in_and_publish(&partner, &bob, &fab, v1, &send_o).await;
     settle(
         || identities.current(bob.id(), crate::now_unix()).is_some(),
@@ -403,9 +449,16 @@ async fn require_idp_admits_verified_federated_identities_only() {
     .await;
     let (res, _) = call_as(&bob, &fab, v1, &target).await;
     assert_eq!(res.unwrap(), 0);
-    expect_ran_as(&mut rx_o, &mut keyring_o, bob.id(), "bob@partner.org").await;
+    expect_ran_as(
+        &mut rx_o,
+        &mut keyring_o,
+        bob.id(),
+        Some("bob@partner.org"),
+        "analyst",
+    )
+    .await;
 
-    // 4. Eve's token verifies, but no rule admits her.
+    // 4. Eve's token verifies, but she is in no role allowed to run `cat`.
     log_in_and_publish(&stranger, &eve, &fab, v1, &send_o).await;
     settle(
         || identities.current(eve.id(), crate::now_unix()).is_some(),
@@ -416,7 +469,10 @@ async fn require_idp_admits_verified_federated_identities_only() {
     let told = denied_reason(res);
     assert!(out.is_empty(), "nothing ran");
     assert!(
-        told.starts_with("identity eve@evil.net") && told.contains("not allowed"),
+        told.starts_with(&format!(
+            "identity eve@evil.net (from {}) is in no role allowed to run cat: analyst (",
+            stranger.issuer.as_str()
+        )),
         "{told}"
     );
     expect_denied(&mut rx_o, &mut keyring_o, eve.id(), &told).await;
