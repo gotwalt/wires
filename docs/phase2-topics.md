@@ -389,8 +389,10 @@ pub const MAX_REPLAY_FRAME: usize = 1024 * 1024;
   (PoC never verified — silent divergence).
 - `ReplayHandler` requires admission (same `Admitted` registry as gossip).
 - `catch_up(endpoint, admit: &AdmitHandler, store, topic, limit)`: the dial set
-  is `admit.admitted.peers_since(admit.current_version()?)` — peers admitted
-  under the head this node currently enforces (§2.4.2), re-read every round so a
+  is `admit.admitted.replay_targets(admit.current_version()?)` — peers admitted
+  under the head this node currently enforces (§2.4.2), minus any whose tracked
+  connections have all closed (a one-shot publisher that exited; skipped, not
+  evicted — a fresh admission makes it a target again), re-read every round so a
   mid-loop eviction stops the asking. The handler is passed rather than a peer
   list precisely so that set is recomputed from live state instead of
   snapshotted by the caller. Per peer: Request with local `hwm_all()`, ingest
@@ -398,9 +400,16 @@ pub const MAX_REPLAY_FRAME: usize = 1024 * 1024;
   **or** until `MAX_CATCH_UP_ROUNDS` (32) or `CATCH_UP_BUDGET` (30s) is spent.
   The "adds nothing" condition alone is attacker-controlled: a peer with one
   genuinely new, correctly chained envelope per round keeps it productive
-  forever, and the tail awaits this inline.
+  forever.
+- **The tail never awaits a catch-up inline.** It runs one `catch_up_collect`
+  at a time as a task beside its loop and prints the envelopes that call
+  inserted when it finishes; deadlines that come due meanwhile wait for it. The
+  loop is the single seq allocator (§7), and `serve --audit-topic` feeds call
+  records through it, so a pass stuck on a quiet peer must not hold a publish
+  (board card 11: a departed `wires login --topic` node held audit records 20s).
 - Bounds on the client side of a pass, none of which the server is trusted to
-  respect: `REPLAY_PASS_TIMEOUT` (20s) over dial + stream + every frame read;
+  respect: `REPLAY_PASS_TIMEOUT` (20s) over dial + stream + every frame read,
+  of which the dial and stream open get `REPLAY_CONNECT_TIMEOUT` (5s);
   the requester stops at the item limit it asked for (a hostile peer can stream
   past it, and every item costs a signature verification and a `stopped`-set
   entry); and the request's `hwm` carries at most `MAX_HWM_ENTRIES` (1024) marks

@@ -61,9 +61,9 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use library::{
-    CapabilityTicket, ChainState, Crl, FabricKey, Grant, InclusionProof, Membership, NodeId,
-    NodeIdentity, RosterHead, RosterVersion, Scope, SealedFabricKey, Seq, TopicEnvelope, TopicId,
-    TopicPeer, TopicTicket,
+    CapabilityTicket, Crl, FabricKey, Grant, InclusionProof, Membership, NodeId, NodeIdentity,
+    RosterHead, RosterVersion, Scope, SealedFabricKey, Seq, TopicEnvelope, TopicId, TopicPeer,
+    TopicTicket,
 };
 
 /// wires: a capability-addressed stdio/MCP session layer.
@@ -2065,6 +2065,29 @@ async fn run_tail(
     json: bool,
     hosted: Option<audit::Hosted>,
 ) -> anyhow::Result<()> {
+    run_tail_on(ctx, backfill, json, hosted, async |cfg| {
+        topics::TopicNode::spawn(&ctx.node, cfg).await
+    })
+    .await
+}
+
+/// [`run_tail`] over a node stood up by `bind` instead of
+/// [`TopicNode::spawn`](topics::TopicNode::spawn).
+///
+/// The same split as [`TopicNode::spawn_on`](topics::TopicNode::spawn_on): the
+/// loopback e2e tests bind a hermetic endpoint (no relay, no DNS) and drive the
+/// production loop over it, which is the only way to assert what the *loop*
+/// does — e.g. that call records keep flowing while a replay pass is stuck.
+async fn run_tail_on<B>(
+    ctx: &TopicContext,
+    backfill: usize,
+    json: bool,
+    hosted: Option<audit::Hosted>,
+    bind: B,
+) -> anyhow::Result<()>
+where
+    B: AsyncFnOnce(topics::TopicNodeConfig) -> anyhow::Result<topics::TopicNode>,
+{
     // Identity claims are verified by this reader itself: a responder under
     // its serve flags, a plain tail under `WIRES_OIDC_ISSUER` /
     // `WIRES_OIDC_AUDIENCE`.
@@ -2113,7 +2136,7 @@ async fn run_tail(
     if let Some(session) = session {
         cfg.protocols.push((transport::ALPN, session.into()));
     }
-    let node = topics::TopicNode::spawn(&ctx.node, cfg).await?;
+    let node = bind(cfg).await?;
     let socket_path = ctx.socket_path();
     tail_banner(&node, ctx, &socket_path);
 
@@ -2130,8 +2153,9 @@ async fn run_tail(
     // 5. The mesh — which is where a revoked node finds out (exit 77).
     let (mut sender, mut events) = node.join(ctx.topic, &book.list()).await?;
 
-    // 6. Whatever the peers have that this node does not.
-    catch_up_and_print(&node, &printer, &mut keyring).await;
+    // 6. Whatever the peers have that this node does not — as the first
+    //    catch-up, which like every one after it runs beside the loop (see
+    //    `catching_up`), never inline.
 
     // Live state: who the neighbors are, and when the four timers are due.
     let mut neighbors: HashSet<NodeId> = HashSet::new();
@@ -2146,7 +2170,13 @@ async fn run_tail(
         .iter()
         .any(|peer| peer.node != node.node_id())
         .then(|| deadline(backoff));
-    let mut catchup_at: Option<tokio::time::Instant> = Some(deadline(CATCHUP_INTERVAL));
+    let mut catchup_at: Option<tokio::time::Instant> = Some(now_instant());
+    // The catch-up in flight, if any. A task, not an inline await: a pass can
+    // take up to `REPLAY_PASS_TIMEOUT` against a peer that has gone quiet, and
+    // this loop is the single allocator every publish — `serve --audit-topic`'s
+    // call records included — waits on. One at a time: a deadline that comes
+    // due while a pass runs waits for it (the timer arm is gated on this).
+    let mut catching_up: Option<CatchUpTask> = None;
     let mut readmit_at: Option<tokio::time::Instant> = Some(deadline(READMIT_INTERVAL));
     let mut rejoin_at: Option<tokio::time::Instant> = None;
     // Both of these arms are over channels that stay *permanently ready* once
@@ -2317,12 +2347,24 @@ async fn run_tail(
             }
 
             _ = tokio::time::sleep_until(catchup_at.unwrap_or_else(now_instant)),
-                if catchup_at.is_some() =>
+                if catchup_at.is_some() && catching_up.is_none() =>
             {
                 catchup_at = None;
-                catch_up_and_print(&node, &printer, &mut keyring).await;
+                catching_up = Some(spawn_catch_up(&node));
+            }
+
+            done = async {
+                match catching_up.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            }, if catching_up.is_some() => {
+                catching_up = None;
+                print_caught_up(done, &printer, &mut keyring).await;
                 // Always re-armed: every other trigger is edge-driven, and a
                 // gap whose only holder is asleep needs a pass that is not.
+                // `arm` keeps the sooner deadline, so a gap or a new neighbor
+                // that asked for a pass while this one ran still gets one.
                 arm(&mut catchup_at, CATCHUP_INTERVAL);
             }
 
@@ -2349,6 +2391,9 @@ async fn run_tail(
 
     eprintln!("wires tail: shutting down");
     server.abort();
+    if let Some(task) = catching_up {
+        task.abort();
+    }
     if let Some(forwarder) = forwarder {
         forwarder.abort();
     }
@@ -2561,73 +2606,63 @@ fn current_fabric_key(ks: &keystore::Keystore) -> anyhow::Result<(RosterVersion,
     Ok((version, key))
 }
 
-/// Run a catch-up pass and print whatever it inserted.
+/// A catch-up running beside the tail loop: its counts and what it inserted.
+type CatchUpTask = tokio::task::JoinHandle<anyhow::Result<replay::CaughtUp>>;
+
+/// Start a catch-up pass as a task.
 ///
-/// The printing is a before/after diff of the per-publisher high-water marks:
-/// [`catch_up`](crate::replay::catch_up) ingests straight into the store, and
-/// what it *inserted* is exactly what the marks moved over — which keeps the
-/// "print on `Inserted`" rule intact without threading a callback through
-/// replay.
-async fn catch_up_and_print(node: &topics::TopicNode, printer: &Printer, keyring: &mut Keyring) {
-    // The node's own log, never a second handle: `catch_up` ingests into the
-    // store the replay server reads, and the before/after diff below is only
-    // the set of newly inserted messages if it is diffing that same store.
-    let store = node.store();
-    let before = match store.hwm_all() {
-        Ok(marks) => marks,
+/// Everything it needs is shared state the node already hands out — the
+/// endpoint, the admission registry, the node's own log (never a second handle:
+/// redb locks the file, and the replay server reads the same one) — so the
+/// pass and the loop run side by side. The store serializes their writes, and
+/// every append is classified against the chain inside one write transaction,
+/// so a live message and a replayed copy of it land once.
+fn spawn_catch_up(node: &topics::TopicNode) -> CatchUpTask {
+    let endpoint = node.endpoint().clone();
+    let admit = Arc::clone(node.admit());
+    let store = Arc::clone(node.store());
+    let topic = node.topic();
+    tokio::spawn(async move {
+        replay::catch_up_collect(&endpoint, &admit, &store, topic, replay::REPLAY_LIMIT).await
+    })
+}
+
+/// Log a finished catch-up and print what it inserted, in display order.
+///
+/// Only what *this* pass inserted: live messages and this node's own publishes
+/// were printed by their own arms as they landed, and each envelope is inserted
+/// exactly once, so "print on `Inserted`" stays exact with the pass running
+/// concurrently.
+async fn print_caught_up(
+    done: Result<anyhow::Result<replay::CaughtUp>, tokio::task::JoinError>,
+    printer: &Printer,
+    keyring: &mut Keyring,
+) {
+    let mut caught = match done {
+        Ok(Ok(caught)) => caught,
+        Ok(Err(e)) => {
+            tracing::warn!("catch-up failed: {e:#}");
+            return;
+        }
         Err(e) => {
-            tracing::warn!("reading the high-water marks before catch-up: {e:#}");
+            tracing::warn!("the catch-up task ended abnormally: {e}");
             return;
         }
     };
-    match replay::catch_up(
-        node.endpoint(),
-        node.admit(),
-        store,
-        node.topic(),
-        replay::REPLAY_LIMIT,
-    )
-    .await
-    {
-        Ok(counts) => {
-            tracing::info!(
-                peers = counts.peers,
-                inserted = counts.inserted,
-                duplicates = counts.duplicates,
-                refused = counts.refused,
-                "catch-up pass"
-            );
-            if counts.inserted > 0
-                && let Err(e) = print_new_since(store, &before, printer, keyring).await
-            {
-                tracing::warn!("printing caught-up messages: {e:#}");
-            }
-        }
-        Err(e) => tracing::warn!("catch-up failed: {e:#}"),
-    }
-}
-
-/// Print every message stored past the marks in `before`, in display order.
-async fn print_new_since(
-    store: &store::TopicStore,
-    before: &BTreeMap<NodeId, ChainState>,
-    printer: &Printer,
-    keyring: &mut Keyring,
-) -> anyhow::Result<()> {
-    let mut fresh = Vec::new();
-    for (sender, state) in store.hwm_all()? {
-        let from = before.get(&sender).map(|held| held.seq);
-        if from == Some(state.seq) {
-            continue;
-        }
-        // Bounded by what just landed: `read_after` starts at the old mark.
-        fresh.extend(store.read_after(sender, from, usize::MAX)?);
-    }
-    fresh.sort_by_key(|envelope| (envelope.timestamp, envelope.sender, envelope.seq));
-    for envelope in &fresh {
+    let counts = caught.counts;
+    tracing::info!(
+        peers = counts.peers,
+        inserted = counts.inserted,
+        duplicates = counts.duplicates,
+        refused = counts.refused,
+        "catch-up pass"
+    );
+    caught
+        .fresh
+        .sort_by_key(|envelope| (envelope.timestamp, envelope.sender, envelope.seq));
+    for envelope in &caught.fresh {
         printer.emit(envelope, keyring).await;
     }
-    Ok(())
 }
 
 /// What one [`redial`] round found.

@@ -172,6 +172,17 @@ pub struct AdmittedPeer {
     pub conns: Vec<Connection>,
 }
 
+impl AdmittedPeer {
+    /// Whether every connection tracked for this peer has closed — the peer
+    /// hung up on all of them (a one-shot publisher exiting, a laptop closing).
+    ///
+    /// `false` with nothing tracked: an admission whose connection is not yet
+    /// attached has not departed.
+    fn departed(&self) -> bool {
+        !self.conns.is_empty() && self.conns.iter().all(|c| c.close_reason().is_some())
+    }
+}
+
 /// The per-process allowlist: who has proved roster membership for this topic.
 ///
 /// Cheap to clone — every clone shares one map — because the admit handler, the
@@ -217,7 +228,14 @@ impl Admitted {
     pub fn insert(&self, peer: NodeId, mut entry: AdmittedPeer) {
         let mut map = self.guard();
         if let Some(previous) = map.remove(&peer) {
-            entry.conns.extend(previous.conns);
+            // Only the live ones: a re-admission is the peer coming back, and
+            // its old closed handles must not make it look departed.
+            entry.conns.extend(
+                previous
+                    .conns
+                    .into_iter()
+                    .filter(|c| c.close_reason().is_none()),
+            );
         }
         map.insert(peer, entry);
     }
@@ -257,6 +275,9 @@ impl Admitted {
         let mut map = self.guard();
         match map.get_mut(&peer) {
             Some(entry) if now_unix <= entry.expires => {
+                // Closed handles are dead weight (and would make a returning
+                // peer look departed forever to `replay_targets`).
+                entry.conns.retain(|c| c.close_reason().is_none());
                 entry.conns.push(conn);
                 true
             }
@@ -290,7 +311,7 @@ impl Admitted {
     }
 
     /// The admitted peers whose admission was decided under roster version
-    /// `version` or later, in id order — the dial set for replay catch-up.
+    /// `version` or later, in id order — the roster half of replay's dial set.
     ///
     /// Asking only peers whose credential was checked against the roster this
     /// node *currently* enforces is what keeps replay from undoing the epoch
@@ -300,12 +321,38 @@ impl Admitted {
     /// chain is dense, so refusing pre-commit history would strand every later
     /// message from that publisher. What replay *can* do is not ask. A peer
     /// admitted under v1 is one the watchdog is about to evict anyway; until it
-    /// does, catch-up simply skips it.
+    /// does, catch-up simply skips it. (Catch-up itself dials
+    /// [`replay_targets`](Self::replay_targets): this set, minus departed peers.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn peers_since(&self, version: RosterVersion) -> Vec<NodeId> {
         let mut out: Vec<NodeId> = self
             .guard()
             .iter()
             .filter(|(_, entry)| entry.version >= version)
+            .map(|(peer, _)| *peer)
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The peers worth *asking* for history: [`peers_since`](Self::peers_since)
+    /// at `version`, minus every peer whose tracked connections have all closed.
+    ///
+    /// A one-shot `wires publish` / `wires login --topic` is admitted, gossips
+    /// one message, and exits — its admission stays on the books until the TTL
+    /// runs out, but the node behind it is gone. Dialing it for replay costs a
+    /// full pass timeout and can never yield anything, so a peer that has hung
+    /// up on every connection it had is skipped. Skipped, not evicted: it holds
+    /// a valid admission, and the moment it comes back (a fresh admission
+    /// attaches a live connection) it is a target again.
+    ///
+    /// A peer with **no** tracked connection is kept: that is an admission
+    /// whose connection has not been attached yet, not a departure.
+    pub fn replay_targets(&self, version: RosterVersion) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = self
+            .guard()
+            .iter()
+            .filter(|(_, entry)| entry.version >= version && !entry.departed())
             .map(|(peer, _)| *peer)
             .collect();
         out.sort();

@@ -213,13 +213,11 @@ wait_for "$D/wb.err" "share to bootstrap: " 300 || {
 	sed 's/^/  workbench| /' "$D/wb.err" >&2
 	bad "1: the workbench never printed its audit-topic ticket"
 }
+# The one thing the workbench hands out: its audit-topic ticket. The observer
+# bootstraps from it, and the agent's `tools add --topic-ticket` takes the
+# workbench's key and addresses from it -- nothing is decoded by hand.
 TICKET="$(grep -m1 '^share to bootstrap: ' "$D/wb.err" | sed 's/^share to bootstrap: //')"
-# The ticket is base64url(JSON) carrying the workbench's bound sockets; the
-# agent dials the same endpoint directly on loopback.
-b64="$(printf '%s' "$TICKET" | tr '_-' '/+')"
-while [ $((${#b64} % 4)) -ne 0 ]; do b64="$b64="; done
-PORT="$(printf '%s' "$b64" | base64 -d 2>/dev/null | grep -oE '127\.0\.0\.1:[0-9]+' | head -1 | cut -d: -f2 || true)"
-[ -n "$PORT" ] || bad "1: no 127.0.0.1 address in the workbench's ticket"
+[ -n "$TICKET" ] || bad "1: the workbench printed an empty ticket"
 ok "1: workbench is pid $WB_PID, reachable by key ${WB_ID:0:8}... -- one tool, nothing else"
 beat 2
 
@@ -240,9 +238,13 @@ beat 2
 # ==========================================================================
 step "3  the agent calls before signing in -- refused, and the refusal is public"
 # ==========================================================================
-run "wires tools add db_query --node ${WB_ID:0:8}... --addr 127.0.0.1:$PORT --description '…'"
-WIRES_HOME="$agent" "$WIRES" tools add db_query --node "$WB_ID" --addr "127.0.0.1:$PORT" \
+run "wires tools add db_query --topic-ticket \$TICKET --description '…'"
+WIRES_HOME="$agent" "$WIRES" tools add db_query --topic-ticket "$TICKET" \
 	--description "Read-only SQL (sqlite3) over the workbench's orders.db; pass the SQL statement as the argument." >/dev/null
+grep -q "\"$WB_ID\"" "$agent/tools.json" || {
+	dump "$agent/tools.json"
+	bad "3: tools add --topic-ticket did not target the workbench's key"
+}
 run "wires call db_query -- 'select count(*) from orders'"
 set +e
 WIRES_HOME="$agent" "$WIRES" call db_query -- "select count(*) from orders" >"$D/c0.out" 2>"$D/c0.err"

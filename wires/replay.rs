@@ -92,9 +92,19 @@ pub const REPLAY_LIMIT: u32 = 512;
 /// A pass is a request and a bounded run of items, so a peer that has anything
 /// to say says it quickly. Without a deadline, an admitted peer that opens the
 /// stream and then dribbles — or says nothing at all while its QUIC stack keeps
-/// the connection alive — pins the tail loop that awaits this inline: no
-/// printing, no control-socket publishes, no signal handling.
+/// the connection alive — pins the catch-up task forever, and with it every
+/// later catch-up (the tail runs one call at a time).
 pub const REPLAY_PASS_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How much of [`REPLAY_PASS_TIMEOUT`] the dial and the stream open may take.
+///
+/// A peer that is there answers a dial in well under a second over a known
+/// path (replay is only asked of admitted peers, so the endpoint already has
+/// one). A peer that is *gone* — a one-shot publisher that exited without its
+/// close reaching us, a laptop that went to sleep — never answers, and waiting
+/// the whole pass timeout for it only fills the log with 20 s timeouts. The
+/// rest of the pass keeps the full budget.
+pub const REPLAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The whole [`catch_up`] call's budget, across every peer and every round.
 ///
@@ -103,9 +113,9 @@ pub const REPLAY_PASS_TIMEOUT: Duration = Duration::from_secs(20);
 /// envelope to hand over on every round keeps it productive forever. The budget
 /// and [`MAX_CATCH_UP_ROUNDS`] are what make the call finite regardless; what
 /// is left over is picked up by the next pass, which is scheduled anyway.
-/// It is also what bounds how long the tail loop can be unresponsive: the loop
-/// awaits a pass inline, so signals, live messages and control-socket publishes
-/// all wait on this.
+/// The tail runs a call as a task beside its loop, never inline — publishing
+/// (call records included) must not wait on a peer — so this bounds how long
+/// the *next* catch-up can be delayed, not how long the loop is unresponsive.
 pub const CATCH_UP_BUDGET: Duration = Duration::from_secs(30);
 
 /// The most rounds one [`catch_up`] call makes before returning, however
@@ -362,7 +372,8 @@ where
 }
 
 /// What one [`catch_up`] call did — counts only, so a tail can log a pass in one
-/// line and a test can assert progress without inspecting the store.
+/// line and a test can assert progress without inspecting the store. The
+/// envelopes themselves come back from [`catch_up_collect`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct CatchUp {
     /// Admitted peers this call asked. Zero means there was nobody to ask —
@@ -400,11 +411,12 @@ impl CatchUp {
 /// Ask every admitted peer for what this node is missing, until a full pass
 /// adds nothing.
 ///
-/// The dial set is [`Admitted::peers_since`] at the roster version this node
+/// The dial set is [`Admitted::replay_targets`] at the roster version this node
 /// currently enforces (spec §2.4.2) — replay is only ever requested from a peer
 /// that completed the mutual admission handshake *under the current head*,
 /// which is also why no address hints are needed here: the endpoint already has
-/// a path to everyone in that registry.
+/// a path to everyone in that registry. Peers that have hung up on every
+/// connection are left out: they cannot answer, and asking costs a timeout.
 ///
 /// `admit` is the same [`AdmitHandler`] the node serves with, used as the
 /// client-side context (its `admitted` registry, its topic, its head): a peer
@@ -416,6 +428,7 @@ impl CatchUp {
 /// that keeps answering with duplicates ends the loop rather than extending it.
 /// A peer that fails mid-pass is logged and skipped — one unreachable peer must
 /// not abort catch-up from the others.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn catch_up(
     endpoint: &Endpoint,
     admit: &AdmitHandler,
@@ -423,6 +436,37 @@ pub async fn catch_up(
     topic: TopicId,
     limit: u32,
 ) -> Result<CatchUp> {
+    Ok(catch_up_collect(endpoint, admit, store, topic, limit)
+        .await?
+        .counts)
+}
+
+/// What [`catch_up_collect`] returns: the counts, and every envelope the call
+/// inserted.
+#[derive(Clone, Debug, Default)]
+pub struct CaughtUp {
+    /// The same counts [`catch_up`] returns.
+    pub counts: CatchUp,
+    /// Every envelope this call inserted into the log, in arrival order. The
+    /// only ones a tail prints for the call: an envelope is inserted exactly
+    /// once, by whichever path (live, replay, own publish) got there first,
+    /// so printing what *this* call inserted keeps "print on `Inserted`" exact
+    /// even while the live path appends concurrently.
+    pub fresh: Vec<TopicEnvelope>,
+}
+
+/// [`catch_up`], also handing back the envelopes it inserted.
+///
+/// What the resident tail runs: it performs the call in a task beside its
+/// loop, so the loop cannot diff the high-water marks before and after — live
+/// messages and its own publishes move them in between.
+pub async fn catch_up_collect(
+    endpoint: &Endpoint,
+    admit: &AdmitHandler,
+    store: &TopicStore,
+    topic: TopicId,
+    limit: u32,
+) -> Result<CaughtUp> {
     // Fail closed, like every other reader of the head. The version is what
     // bounds *who* is asked: only peers whose admission was decided under the
     // roster this node currently enforces (spec §2.4), so a member the head no
@@ -433,14 +477,17 @@ pub async fn catch_up(
         .context("resolving the current roster version for catch-up")?;
     let until = tokio::time::Instant::now() + CATCH_UP_BUDGET;
     let mut total = CatchUp {
-        peers: admit.admitted.peers_since(floor).len(),
+        peers: admit.admitted.replay_targets(floor).len(),
         ..CatchUp::default()
     };
+    let mut fresh = Vec::new();
     for round in 0..MAX_CATCH_UP_ROUNDS {
         // Re-read the registry every round rather than snapshotting once: the
         // watchdog can evict a peer mid-loop, and a revoked peer must stop
-        // being asked at the next round, not at the end of the call.
-        let peers = admit.admitted.peers_since(floor);
+        // being asked at the next round, not at the end of the call. Peers
+        // that hung up on every connection are skipped
+        // ([`Admitted::replay_targets`]): they cannot answer.
+        let peers = admit.admitted.replay_targets(floor);
         if peers.is_empty() {
             break;
         }
@@ -451,9 +498,12 @@ pub async fn catch_up(
                     rounds = round,
                     "catch-up budget spent; the next pass picks up the rest"
                 );
-                return Ok(total);
+                return Ok(CaughtUp {
+                    counts: total,
+                    fresh,
+                });
             }
-            match replay_from(endpoint, peer, store, topic, limit, round).await {
+            match replay_from(endpoint, peer, store, topic, limit, round, &mut fresh).await {
                 Ok(pass) => {
                     inserted_this_round += pass.inserted;
                     total.absorb(pass);
@@ -469,7 +519,10 @@ pub async fn catch_up(
             break;
         }
     }
-    Ok(total)
+    Ok(CaughtUp {
+        counts: total,
+        fresh,
+    })
 }
 
 /// One pass against one peer: dial the replay ALPN, run [`request_replay`] over
@@ -485,17 +538,27 @@ async fn replay_from(
     topic: TopicId,
     limit: u32,
     round: usize,
+    fresh: &mut Vec<TopicEnvelope>,
 ) -> Result<CatchUp> {
-    // One deadline over the whole pass — dial, stream, and every frame read.
-    // The caller awaits this inline in its `select!`, so an admitted peer that
-    // stalls must cost a timeout rather than the tail's liveness.
+    // One deadline over the whole pass — dial, stream, and every frame read —
+    // and a shorter one over the dial: a stalled peer costs a timeout, and a
+    // departed one costs a short one.
     let pass = async {
-        let conn = endpoint
-            .connect(peer_addr(endpoint, peer).await?, library::TOPIC_REPLAY_ALPN)
-            .await
-            .map_err(|e| anyhow!("connecting to {} for replay: {e}", peer.hex()))?;
-        let (send, recv) = conn.open_bi().await.context("opening a replay stream")?;
-        let pass = request_replay(send, recv, store, topic, limit, round).await;
+        let dial = async {
+            let conn = endpoint
+                .connect(peer_addr(endpoint, peer).await?, library::TOPIC_REPLAY_ALPN)
+                .await
+                .map_err(|e| anyhow!("connecting to {} for replay: {e}", peer.hex()))?;
+            let (send, recv) = conn.open_bi().await.context("opening a replay stream")?;
+            Ok((conn, send, recv))
+        };
+        let (conn, send, recv) = crate::admission::within(
+            REPLAY_CONNECT_TIMEOUT,
+            &format!("dialing {} for replay", peer.hex()),
+            dial,
+        )
+        .await?;
+        let pass = request_replay(send, recv, store, topic, limit, round, fresh).await;
         conn.close(VarInt::from_u32(0), b"replay pass complete");
         pass
     };
@@ -525,7 +588,7 @@ async fn peer_addr(endpoint: &Endpoint, peer: NodeId) -> Result<EndpointAddr> {
 /// One replay pass against one peer, over an established bi-stream.
 ///
 /// Writes a `Request` carrying [`hwm_all`](crate::store::TopicStore::hwm_all),
-/// then ingests `Item`s until `End`. Every item goes through [`ingest`] — the
+/// then ingests `Item`s until `End`, pushing each one it inserted onto `fresh`. Every item goes through [`ingest`] — the
 /// items are *not* trusted because they came from an admitted peer: a peer can
 /// be a member in good standing and still relay a forged or forked envelope.
 ///
@@ -539,6 +602,7 @@ async fn request_replay<S, R>(
     topic: TopicId,
     limit: u32,
     round: usize,
+    fresh: &mut Vec<TopicEnvelope>,
 ) -> Result<CatchUp>
 where
     S: AsyncWrite + Unpin + Send,
@@ -590,7 +654,10 @@ where
                 // ingested; what bounds the *removed member* here is which
                 // peers this node is willing to ask (see `catch_up`).
                 match ingest(store, topic, &envelope, None) {
-                    Ok(Ingested::Inserted) => pass.inserted += 1,
+                    Ok(Ingested::Inserted) => {
+                        pass.inserted += 1;
+                        fresh.push(envelope);
+                    }
                     Ok(Ingested::Duplicate) => pass.duplicates += 1,
                     // Replay is what heals gaps, so a gap *inside* a replay
                     // stream is not something to schedule more replay for: the
@@ -1238,22 +1305,28 @@ mod tests {
 
         let first = publish(&fab, &a.identity, &a.store, "one");
         let second = publish(&fab, &a.identity, &a.store, "two");
-        publish(&fab, &a.identity, &a.store, "three");
+        let third = publish(&fab, &a.identity, &a.store, "three");
         // B was there for the first two and missed the third.
         b.store.append(&first).unwrap();
         b.store.append(&second).unwrap();
 
         admit(&b, &a).await;
-        let counts = tokio::time::timeout(
+        let caught = tokio::time::timeout(
             DEADLINE,
-            catch_up(&b.endpoint, &b.admit, &b.store, fab.topic, REPLAY_LIMIT),
+            catch_up_collect(&b.endpoint, &b.admit, &b.store, fab.topic, REPLAY_LIMIT),
         )
         .await
         .expect("catch-up timed out")
         .unwrap();
+        let counts = caught.counts;
 
         assert_eq!(counts.items, 1, "only the missing message was sent");
         assert_eq!(counts.inserted, 1);
+        assert_eq!(
+            caught.fresh,
+            vec![third],
+            "the inserted envelope is handed back for printing, and nothing else"
+        );
         assert_eq!(counts.duplicates, 0, "nothing below the mark came back");
         assert_eq!(transcript(&fab, &b.store), vec!["one", "two", "three"]);
     }
@@ -1512,6 +1585,7 @@ mod tests {
 
         let ours = TopicStore::open_at(&dir.join("ours.db"), fab.topic).unwrap();
         let mut request: Vec<u8> = Vec::new();
+        let mut fresh = Vec::new();
         let pass = request_replay(
             &mut request,
             std::io::Cursor::new(response),
@@ -1519,9 +1593,11 @@ mod tests {
             fab.topic,
             3,
             0,
+            &mut fresh,
         )
         .await
         .expect("an over-talkative peer is unproductive, not fatal");
+        assert_eq!(fresh.len(), pass.inserted, "every insert is handed back");
 
         assert_eq!(
             pass.items, 3,
