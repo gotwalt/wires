@@ -437,34 +437,19 @@ async fn deny<W: AsyncWrite + Unpin>(send: &mut W, reason: String) {
     send.shutdown().await.ok();
 }
 
-/// What one child output pump saw: its byte count and a running BLAKE3 over
-/// those bytes (the stdout digest a `Finished` audit record carries).
-struct Pumped {
-    /// Bytes read from the child stream.
-    bytes: u64,
-    /// BLAKE3 over exactly those bytes, in order.
-    hasher: blake3::Hasher,
-}
-
 /// Pump a child output stream into `tx` as frames built by `make`
-/// ([`Frame::Stdout`] / [`Frame::Stderr`]), counting and hashing what passes.
+/// ([`Frame::Stdout`] / [`Frame::Stderr`]).
 async fn pump_reader<R: AsyncRead + Unpin>(
     mut r: R,
     make: fn(Chunk) -> Frame,
     tx: mpsc::Sender<Frame>,
-) -> Result<Pumped> {
+) -> Result<()> {
     let mut buf = vec![0u8; PUMP_BUF];
-    let mut seen = Pumped {
-        bytes: 0,
-        hasher: blake3::Hasher::new(),
-    };
     loop {
         let n = r.read(&mut buf).await.context("reading child output")?;
         if n == 0 {
             break;
         }
-        seen.bytes += n as u64;
-        seen.hasher.update(&buf[..n]);
         if tx
             .send(make(Chunk::from_bytes(buf[..n].to_vec())))
             .await
@@ -473,7 +458,7 @@ async fn pump_reader<R: AsyncRead + Unpin>(
             break;
         }
     }
-    Ok(seen)
+    Ok(())
 }
 
 /// Parse `wires serve --expose` specs and an optional `--expose-file` into the
@@ -604,6 +589,39 @@ pub async fn serve_on(endpoint: Endpoint, config: ServeConfig) -> Result<()> {
 /// Accept one inbound iroh connection, then run the session over its bi-stream.
 async fn handle_connection(incoming: iroh::endpoint::Incoming, config: &ServeConfig) -> Result<()> {
     let conn = incoming.await.context("accepting connection")?;
+    serve_connection(conn, config).await
+}
+
+/// The session ALPN as a router protocol, for a responder whose endpoint is
+/// owned by a [`TopicNode`](crate::topics::TopicNode) (`serve --audit-topic`):
+/// one endpoint per node key, so the session rides the topic node's router
+/// instead of a second bind.
+#[derive(Clone)]
+pub struct SessionProtocol(pub Arc<ServeConfig>);
+
+impl std::fmt::Debug for SessionProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionProtocol")
+            .field("trust_root", &self.0.trust_root.hex())
+            .finish_non_exhaustive()
+    }
+}
+
+impl iroh::protocol::ProtocolHandler for SessionProtocol {
+    /// Serve one session exactly as [`serve_on`]'s accept loop does.
+    async fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+        serve_connection(conn, &self.0).await.map_err(|e| {
+            tracing::warn!("connection rejected or failed: {e:#}");
+            iroh::protocol::AcceptError::from_boxed(e.into())
+        })
+    }
+}
+
+/// Run the session over an accepted connection's bi-stream.
+async fn serve_connection(conn: iroh::endpoint::Connection, config: &ServeConfig) -> Result<()> {
     let caller = to_node_id(&conn.remote_id());
     tracing::info!(caller = %caller.hex(), "connection accepted (iroh-authenticated)");
     let (send, recv) = conn.accept_bi().await.context("accepting bi-stream")?;
@@ -673,13 +691,13 @@ where
         // on the wire before failing, so it need not guess.
         Some(_) => {
             let e = anyhow!("first frame was not a handshake");
-            // audit: Denied { caller, tool: None, reason: e }
+            crate::audit::denied(config.audit.as_ref(), caller, None, &format!("{e:#}")); // audit: denied
             deny(&mut send, format!("{e:#}")).await;
             return Err(e);
         }
         None => {
             let e = anyhow!("connection closed before handshake");
-            // audit: Denied { caller, tool: None, reason: e }
+            crate::audit::denied(config.audit.as_ref(), caller, None, &format!("{e:#}")); // audit: denied
             deny(&mut send, format!("{e:#}")).await;
             return Err(e);
         }
@@ -694,7 +712,7 @@ where
         match read_invocation(&mut recv).await {
             Ok(invocation) => Some(invocation),
             Err(e) => {
-                // audit: Denied { caller, tool: None, reason: DENY_INVOKE_REQUIRED }
+                crate::audit::denied(config.audit.as_ref(), caller, None, DENY_INVOKE_REQUIRED); // audit: denied
                 deny(&mut send, DENY_INVOKE_REQUIRED.to_string()).await;
                 return Err(e.context(DENY_INVOKE_REQUIRED));
             }
@@ -711,8 +729,9 @@ where
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("credential sources unusable: {e:#}");
-            // audit: Denied { caller, tool, reason: "responder configuration error" }
-            deny(&mut send, "responder configuration error".to_string()).await;
+            let reason = "responder configuration error".to_string();
+            crate::audit::denied(config.audit.as_ref(), caller, tool.cloned(), &reason); // audit: denied
+            deny(&mut send, reason).await;
             return Err(e.context("loading credential sources"));
         }
     };
@@ -729,7 +748,12 @@ where
     ) {
         Ok(v) => v,
         Err(e) => {
-            // audit: Denied { caller, tool, reason: format!("{e:#}") }
+            crate::audit::denied(
+                config.audit.as_ref(),
+                caller,
+                tool.cloned(),
+                &format!("{e:#}"),
+            ); // audit: denied
             deny(&mut send, format!("{e:#}")).await;
             return Err(e);
         }
@@ -739,7 +763,7 @@ where
     let argv = match resolve_command(config, invocation.as_ref()) {
         Ok(argv) => argv,
         Err(reason) => {
-            // audit: Denied { caller, tool, reason }
+            crate::audit::denied(config.audit.as_ref(), caller, tool.cloned(), &reason); // audit: denied
             deny(&mut send, reason.clone()).await;
             return Err(anyhow!(reason));
         }
@@ -764,10 +788,6 @@ where
         },
     )
     .await?;
-
-    // audit: Started { call: CallId::generate(), caller, principal: None,
-    //   tool (single-command: "stdio"), argv: invocation's Argv (single-command:
-    //   the fixed command), roster_version, at_ms: now }
 
     // Spawn the child with piped stdio, injecting the verified caller identity
     // (and the admitting roster version, if any, and the invoked tool). Scrub
@@ -799,16 +819,26 @@ where
     if let Some(tool) = tool {
         cmd.env("WIRES_TOOL", tool.as_str());
     }
-    let spawned_at = std::time::Instant::now();
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {program}"))?;
+    // audit: started — multi-tool mode records the tool and the *caller's*
+    // arguments; single-command mode reports tool "stdio" + the command's args.
+    let audit = crate::audit::CallAudit::start(
+        config.audit.as_ref(),
+        caller,
+        tool.cloned().unwrap_or_else(crate::audit::stdio_tool),
+        invocation.as_ref().map_or(args, |i| i.argv.as_slice()),
+        roster_version,
+    );
     let mut child_stdin = child.stdin.take().context("child stdin")?;
-    let child_stdout = child.stdout.take().context("child stdout")?;
-    let child_stderr = child.stderr.take().context("child stderr")?;
+    let child_stdout =
+        crate::audit::tap_stdout(audit.as_ref(), child.stdout.take().context("child stdout")?);
+    let child_stderr =
+        crate::audit::tap_stderr(audit.as_ref(), child.stderr.take().context("child stderr")?);
 
     // A single writer task serializes all server->client frames.
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
@@ -878,8 +908,12 @@ where
             stdin_task.abort();
             let _ = out_task.await;
             let _ = err_task.await;
-            // audit: Denied { caller, tool: None, reason: DENY_SINGLE_COMMAND }
-            // (a Started was already recorded above; lane B decides how to close it)
+            // audit: the child already started, so close its record (killed,
+            // exit -1) and record the refusal the caller is about to get.
+            if let Some(audit) = audit {
+                audit.finish(-1);
+            }
+            crate::audit::denied(config.audit.as_ref(), caller, None, DENY_SINGLE_COMMAND);
             tx.send(Frame::Denied {
                 reason: DENY_SINGLE_COMMAND.to_string(),
             })
@@ -890,24 +924,15 @@ where
             bail!(DENY_SINGLE_COMMAND);
         }
     };
-    let stdout = out_task.await.context("stdout pump")??;
-    let stderr = err_task.await.context("stderr pump")??;
+    out_task.await.context("stdout pump")??;
+    err_task.await.context("stderr pump")??;
     let _ = stdin_task.await;
-    let elapsed = spawned_at.elapsed();
 
     let code = status.code().unwrap_or(-1);
-    let stdout_digest = stdout.hasher.finalize();
-    tracing::info!(
-        code,
-        duration_ms = elapsed.as_millis() as u64,
-        stdout_bytes = stdout.bytes,
-        stderr_bytes = stderr.bytes,
-        stdout_blake3 = %stdout_digest,
-        "child exited; closing session"
-    );
-    // audit: Finished { call, exit: code, duration_ms: elapsed, stdout_bytes:
-    //   stdout.bytes, stderr_bytes: stderr.bytes,
-    //   stdout_digest: OutputDigest::from_hash(stdout_digest) }
+    tracing::info!(code, "child exited; closing session");
+    if let Some(audit) = audit {
+        audit.finish(code); // audit: finished
+    }
     tx.send(Frame::Exit(code)).await.ok();
     drop(tx);
     writer.await.context("writer task")??;
@@ -2792,6 +2817,50 @@ mod tests {
                     reason: DENY_INVOKE_REQUIRED.to_string()
                 }]
             );
+        }
+    }
+
+    /// Multi-tool calls are audited with the invoked tool and the *caller's*
+    /// arguments (not the tool's fixed argv); a refusal after the invoke names
+    /// the tool it asked for.
+    #[tokio::test]
+    async fn multi_tool_calls_are_audited_with_tool_and_caller_args() {
+        use library::AuditRecord;
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let (sink, mut records) = AuditSink::channel(16);
+
+        let mut config = tools_config(&root, server, None, &[("say", &["printf", "%s"])]);
+        config.audit = Some(sink.clone());
+        let (res, out, _) = run_call(config, &root, None, Some(invoke("say", &["hi"])), b"").await;
+        assert_eq!(res.unwrap(), 0);
+        assert_eq!(out, b"hi");
+        match records.recv().await.unwrap() {
+            AuditRecord::Started { tool, argv, .. } => {
+                assert_eq!(tool.as_str(), "say");
+                assert_eq!(argv.as_slice(), ["hi"]);
+            }
+            other => panic!("expected Started, got {other:?}"),
+        }
+        match records.recv().await.unwrap() {
+            AuditRecord::Finished {
+                exit, stdout_bytes, ..
+            } => assert_eq!((exit, stdout_bytes), (0, 2)),
+            other => panic!("expected Finished, got {other:?}"),
+        }
+
+        let mut config = tools_config(&root, server, None, &[("say", &["printf", "%s"])]);
+        config.audit = Some(sink);
+        let (res, _, _) = run_call(config, &root, None, Some(invoke("nope", &[])), b"").await;
+        let reason = denied_reason(res);
+        match records.recv().await.unwrap() {
+            AuditRecord::Denied {
+                tool, reason: r, ..
+            } => {
+                assert_eq!(tool.unwrap().as_str(), "nope");
+                assert_eq!(r, reason);
+            }
+            other => panic!("expected Denied, got {other:?}"),
         }
     }
 
