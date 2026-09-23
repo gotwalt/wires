@@ -38,6 +38,11 @@
 //! hosts its audit topic publishes `Started`/`Finished` for a call and
 //! `Denied` for a revoked caller, and a third member observes all of it.
 //!
+//! And two for card 11, over the production tail loop
+//! ([`run_tail_on`](crate::run_tail_on)):
+//! [`a_stalled_replay_pass_does_not_hold_back_call_records`] and
+//! [`a_departed_one_shot_publisher_does_not_delay_the_next_call`].
+//!
 //! # Reading the fixtures
 //!
 //! [`Fabric`] is a root that can commit more than once — the one thing the
@@ -502,10 +507,11 @@ fn seqs(store: &TopicStore, sender: NodeId) -> Vec<u64> {
 
 /// The lines a tail would print for everything stored past `before`.
 ///
-/// A mirror of [`print_new_since`](crate::print_new_since) that returns the
-/// lines instead of writing them to stdout, over the same two halves of
-/// [`Printer::emit`](crate::Printer): the high-water-mark diff decides *what* is
-/// new, [`Keyring::open`](crate::Keyring::open) decides whether it can be shown,
+/// What a tail prints after a catch-up, as lines rather than stdout, over the
+/// same two halves of [`Printer::emit`](crate::Printer): a high-water-mark diff
+/// decides *what* is new (with nothing else writing to the log during the
+/// test, it is exactly the set [`catch_up_collect`](crate::replay::catch_up_collect)
+/// hands the tail), [`Keyring::open`](crate::Keyring::open) decides whether it can be shown,
 /// and [`Printer::render`](crate::Printer::render) is the production formatter.
 /// A message with no key is silently absent here for the same reason it is
 /// silently absent from stdout.
@@ -994,8 +1000,8 @@ async fn late_joiner_cannot_read_pre_join_history() {
 /// seen ids across the restart. B's high-water marks are in its log, the replay
 /// request carries them, the server streams only past them, and the printer
 /// fires on `Inserted`. The assertion is therefore a before/after diff of those
-/// marks — the same diff [`print_new_since`](crate::print_new_since) uses to
-/// decide what a caught-up tail puts on stdout.
+/// marks, which with nothing else writing is exactly what the pass inserted —
+/// and so what a caught-up tail puts on stdout.
 ///
 /// The restart is real: the node is shut down, the redb handle dropped, and a
 /// fresh [`TopicNode`] opened over the same home with the same identity.
@@ -1524,4 +1530,340 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
     publisher.abort();
     node_o.shutdown().await.unwrap();
     node_r.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 8. Replay never holds the audit records back (board card 11)
+// ---------------------------------------------------------------------------
+
+/// How long an observer may wait for a call's `Started` record (card 11).
+///
+/// Far under [`REPLAY_PASS_TIMEOUT`](crate::replay::REPLAY_PASS_TIMEOUT): a
+/// record that waits behind a replay pass misses this by a wide margin.
+const RECORD_PROMPTNESS: Duration = Duration::from_secs(2);
+
+/// What [`hosted_responder`] hands back once its node is bound.
+type ResponderReady = (TopicPeer, Arc<crate::admission::AdmitHandler>);
+
+/// A `serve --audit-topic ops` responder serving `cat`, running the
+/// **production** tail loop ([`run_tail_on`](crate::run_tail_on)) over a
+/// hermetic endpoint.
+///
+/// Returns the loop as a future (the caller polls it beside the test body) and
+/// a receiver that yields the responder's loopback hint and its admission
+/// registry as soon as the node is up.
+fn hosted_responder(
+    fab: &Fabric,
+    r: &Member,
+    r_seed: [u8; 32],
+    version: RosterVersion,
+) -> (
+    impl std::future::Future<Output = anyhow::Result<()>>,
+    tokio::sync::oneshot::Receiver<ResponderReady>,
+) {
+    use crate::transport::{AuditSink, CrlSource, ServeConfig, SessionProtocol};
+
+    let (sink, records) = AuditSink::channel(crate::audit::AUDIT_QUEUE);
+    let membership = library::Membership::mint(&fab.root, r.id(), 0, i64::MAX).unwrap();
+    let serve = ServeConfig {
+        trust_root: fab.id(),
+        scope: None,
+        crl: CrlSource::Fixed(library::Crl::new()),
+        head: HeadSource::Keystore {
+            path: r.keystore.path("roster-head.json"),
+            armed: AtomicBool::new(true),
+        },
+        membership: membership.clone(),
+        proof: None,
+        command: vec!["cat".to_string()],
+        tools: Default::default(),
+        audit: Some(sink),
+        identity: None,
+    };
+    let hosted = crate::audit::Hosted {
+        session: SessionProtocol(Arc::new(serve)),
+        records,
+        identities: Arc::new(crate::identity::Identities::new(
+            crate::jwks::KeyFetcher::new(None).unwrap(),
+            crate::idp_view::IdpTrust::from_vars(None, None),
+        )),
+    };
+    let ctx = crate::TopicContext {
+        node: NodeIdentity::from_seed(r_seed),
+        membership,
+        proof: fab.at(version).proofs[&r.id()].clone(),
+        head_source: Arc::new(HeadSource::Keystore {
+            path: r.keystore.path("roster-head.json"),
+            armed: AtomicBool::new(true),
+        }),
+        keystore: Arc::clone(&r.keystore),
+        home: r.home.path().to_path_buf(),
+        name: "ops".into(),
+        topic: fab.topic,
+        fabric_root: fab.id(),
+        ticket_peers: Vec::new(),
+        relay_url: None,
+    };
+    let (ready, ready_rx) = tokio::sync::oneshot::channel();
+    let run = async move {
+        crate::run_tail_on(&ctx, 0, false, Some(hosted), async move |cfg| {
+            let lookup = MemoryLookup::new();
+            let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .secret_key(secret_key(&NodeIdentity::from_seed(r_seed)))
+                .address_lookup(lookup.clone())
+                .bind()
+                .await
+                .map_err(|e| anyhow::anyhow!("binding the responder: {e}"))?;
+            let node = TopicNode::spawn_on(endpoint, lookup, cfg).await?;
+            let _ = ready.send((hint(&node), Arc::clone(node.admit())));
+            Ok(node)
+        })
+        .await
+    };
+    (run, ready_rx)
+}
+
+/// One `wires call` of the responder's `cat`, as member `seed`, over loopback.
+async fn call_cat(
+    fab: &Fabric,
+    seed: [u8; 32],
+    target: &TopicPeer,
+    version: RosterVersion,
+) -> (anyhow::Result<i32>, Vec<u8>) {
+    let identity = NodeIdentity::from_seed(seed);
+    let membership = library::Membership::mint(&fab.root, identity.node_id(), 0, i64::MAX).unwrap();
+    let proof = fab.at(version).proofs[&identity.node_id()].clone();
+    let target = crate::transport::endpoint_addr(&target.node, &target.addrs, None).unwrap();
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(secret_key(&identity))
+        .bind()
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let result = timeout(
+        PATIENCE,
+        crate::transport::connect_on(
+            endpoint,
+            target,
+            membership,
+            None,
+            Some(proof),
+            false,
+            std::io::Cursor::new(b"card 11".to_vec()),
+            &mut out,
+            &mut err,
+        ),
+    )
+    .await
+    .expect("the call timed out");
+    (result, out)
+}
+
+/// Assert the next record on `rx` is the `Started` for a call, and that it
+/// arrived within [`RECORD_PROMPTNESS`].
+async fn expect_prompt_started(rx: &mut mpsc::Receiver<TopicEvent>, keyring: &mut Keyring) {
+    let started = timeout(RECORD_PROMPTNESS, next_record(rx, keyring))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the call's Started record did not reach the observer within \
+                 {RECORD_PROMPTNESS:?} — held behind a replay pass?"
+            )
+        });
+    assert!(
+        matches!(started, library::AuditRecord::Started { .. }),
+        "expected Started, got {started:?}"
+    );
+}
+
+/// A replay handler that accepts the connection and then says nothing — an
+/// admitted peer whose replay server is wedged. It reports each connection on
+/// `hit`, so the test knows the responder's pass is in flight.
+#[derive(Debug, Clone)]
+struct WedgedReplay {
+    /// Signalled once per replay connection accepted.
+    hit: Arc<tokio::sync::Notify>,
+}
+
+impl iroh::protocol::ProtocolHandler for WedgedReplay {
+    async fn accept(
+        &self,
+        connection: iroh::endpoint::Connection,
+    ) -> Result<(), iroh::protocol::AcceptError> {
+        self.hit.notify_one();
+        connection.closed().await;
+        Ok(())
+    }
+}
+
+/// **Card 11, the invariant.** A replay pass in flight never holds back the
+/// responder's call records.
+///
+/// S is an admitted member whose replay server accepts and then stalls — the
+/// shape of a peer that is gone but still looks connected, and of a hostile
+/// one. R's tail loop runs a catch-up against it (O's arrival schedules one);
+/// while that pass waits out its timeout, C calls R, and O must see the
+/// `Started` promptly. With the pass awaited inline in the loop, the record sat
+/// in the publish queue until the pass gave up (20 s in production).
+#[tokio::test]
+async fn a_stalled_replay_pass_does_not_hold_back_call_records() {
+    let r_seed = [31u8; 32];
+    let c_seed = [33u8; 32];
+    let r = Member::new("wr", r_seed);
+    let o = Member::new("wo", [32u8; 32]);
+    let c = Member::new("wc", c_seed);
+    let s = Member::new("ws", [34u8; 32]);
+    let mut fab = Fabric::new("ops");
+    let v1 = fab.commit(&[r.id(), o.id(), c.id(), s.id()]);
+    for m in [&r, &o, &c, &s] {
+        m.import(fab.at(v1));
+    }
+
+    let (responder, ready) = hosted_responder(&fab, &r, r_seed, v1);
+    let body = async {
+        let (r_hint, _r_admit) = timeout(PATIENCE, ready).await.unwrap().unwrap();
+
+        // S: admitted to R (a real handshake, a connection R keeps tracked),
+        // with a replay server that never answers.
+        let hit = Arc::new(tokio::sync::Notify::new());
+        let s_endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(secret_key(&s.identity))
+            .bind()
+            .await
+            .unwrap();
+        let s_router = iroh::protocol::Router::builder(s_endpoint.clone())
+            .accept(
+                library::TOPIC_REPLAY_ALPN,
+                WedgedReplay {
+                    hit: Arc::clone(&hit),
+                },
+            )
+            .spawn();
+        let s_admit = crate::admission::AdmitHandler {
+            topic: fab.topic,
+            fabric_root: fab.id(),
+            head: Arc::new(HeadSource::Keystore {
+                path: s.keystore.path("roster-head.json"),
+                armed: AtomicBool::new(false),
+            }),
+            proof: fab.at(v1).proofs[&s.id()].clone(),
+            keystore: Arc::clone(&s.keystore),
+            admitted: crate::admission::Admitted::new(),
+            head_lock: Arc::new(std::sync::Mutex::new(())),
+            inflight: Arc::new(tokio::sync::Semaphore::new(4)),
+        };
+        admit_peer(&s_endpoint, &s_admit, &r_hint, crate::now_unix())
+            .await
+            .unwrap();
+
+        // O joins; its NeighborUp schedules R's catch-up, which asks S.
+        let node_o = o.spawn(&fab, v1, SLOW_RECHECK).await;
+        let (_send_o, mut rx_o) = node_o
+            .join(fab.topic, std::slice::from_ref(&r_hint))
+            .await
+            .unwrap();
+        wait_neighbor_up(&mut rx_o, r.id()).await;
+        timeout(PATIENCE, hit.notified())
+            .await
+            .expect("R's catch-up never asked S for replay");
+
+        // The pass against S is now in flight. A call made right now must be
+        // on the channel without waiting for it.
+        let (code, out) = call_cat(&fab, c_seed, &r_hint, v1).await;
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(out, b"card 11");
+        let mut keyring = o.keyring();
+        expect_prompt_started(&mut rx_o, &mut keyring).await;
+
+        node_o.shutdown().await.unwrap();
+        s_router.shutdown().await.unwrap();
+    };
+    tokio::select! {
+        ended = responder => panic!("the responder's tail loop ended early: {ended:?}"),
+        () = body => {}
+    }
+}
+
+/// **Card 11, the camera run.** A one-shot publisher (`wires login --topic`,
+/// `wires publish`) joins, publishes, and exits; the responder stops treating
+/// it as a replay source, and a call made right afterwards is on the observer
+/// within [`RECORD_PROMPTNESS`].
+///
+/// The departed peer keeps its admission (it has not been revoked, only gone),
+/// so the assertion is on the dial set, [`replay_targets`], not on the
+/// registry.
+///
+/// [`replay_targets`]: crate::admission::Admitted::replay_targets
+#[tokio::test]
+async fn a_departed_one_shot_publisher_does_not_delay_the_next_call() {
+    let r_seed = [41u8; 32];
+    let c_seed = [43u8; 32];
+    let r = Member::new("dr", r_seed);
+    let o = Member::new("do", [42u8; 32]);
+    let c = Member::new("dc", c_seed);
+    let p = Member::new("dp", [44u8; 32]);
+    let mut fab = Fabric::new("ops");
+    let v1 = fab.commit(&[r.id(), o.id(), c.id(), p.id()]);
+    for m in [&r, &o, &c, &p] {
+        m.import(fab.at(v1));
+    }
+
+    let (responder, ready) = hosted_responder(&fab, &r, r_seed, v1);
+    let body = async {
+        let (r_hint, r_admit) = timeout(PATIENCE, ready).await.unwrap().unwrap();
+
+        let node_o = o.spawn(&fab, v1, SLOW_RECHECK).await;
+        let (_send_o, mut rx_o) = node_o
+            .join(fab.topic, std::slice::from_ref(&r_hint))
+            .await
+            .unwrap();
+        wait_neighbor_up(&mut rx_o, r.id()).await;
+
+        // P: the one-shot. Join, publish one line, leave.
+        let node_p = p.spawn(&fab, v1, SLOW_RECHECK).await;
+        let (send_p, mut rx_p) = node_p
+            .join(fab.topic, std::slice::from_ref(&r_hint))
+            .await
+            .unwrap();
+        wait_neighbor_up(&mut rx_p, r.id()).await;
+        let sent = publish(&fab, v1, &p.identity, node_p.store(), &send_p, "logged in").await;
+        assert_eq!(next_message(&mut rx_o).await, sent, "O got P's line via R");
+        settle(
+            || r_admit.admitted.replay_targets(v1).contains(&p.id()),
+            "R to count the live P as a replay target",
+        )
+        .await;
+        drop(send_p);
+        node_p.shutdown().await.unwrap();
+
+        settle(
+            || !r_admit.admitted.replay_targets(v1).contains(&p.id()),
+            "R to stop counting the departed P as a replay target",
+        )
+        .await;
+        assert!(
+            r_admit.admitted.peers().contains(&p.id()),
+            "departed is not revoked: P's admission stands"
+        );
+        assert!(
+            r_admit.admitted.replay_targets(v1).contains(&o.id()),
+            "the observer, still connected, is still asked"
+        );
+
+        // Past R's catch-up debounce, so the pass P's arrival scheduled has run
+        // (or is running) when the call lands.
+        tokio::time::sleep(crate::replay::REPLAY_DEBOUNCE + Duration::from_millis(500)).await;
+        let (code, out) = call_cat(&fab, c_seed, &r_hint, v1).await;
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(out, b"card 11");
+        let mut keyring = o.keyring();
+        expect_prompt_started(&mut rx_o, &mut keyring).await;
+
+        node_o.shutdown().await.unwrap();
+    };
+    tokio::select! {
+        ended = responder => panic!("the responder's tail loop ended early: {ended:?}"),
+        () = body => {}
+    }
 }
