@@ -261,11 +261,11 @@ fn input_schema() -> Value {
             "args": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Arguments appended to the remote command."
+                "description": "The primary way to pass input: arguments appended to the remote command, e.g. the SQL statement. Each element is one argument; no shell quoting is needed."
             },
             "stdin": {
                 "type": "string",
-                "description": "Text fed to the remote command's stdin."
+                "description": "Secondary: text fed to the remote command's stdin, for input too large or too structured to pass as arguments. Prefer `args` when the command accepts its input that way."
             }
         },
         "additionalProperties": false
@@ -535,6 +535,19 @@ mod tests {
 
     fn schema() -> Value {
         input_schema()
+    }
+
+    /// The first live run's agent piped its SQL on stdin, where an observer
+    /// saw none of it; the schema steers an agent to `args` first, and keeps
+    /// `stdin` available.
+    #[test]
+    fn the_schema_leads_with_args_and_keeps_stdin() {
+        let props = &input_schema()["properties"];
+        let args = props["args"]["description"].as_str().unwrap();
+        let stdin = props["stdin"]["description"].as_str().unwrap();
+        assert!(args.contains("primary"), "{args}");
+        assert!(args.contains("SQL statement"), "{args}");
+        assert!(stdin.starts_with("Secondary"), "{stdin}");
     }
 
     #[test]

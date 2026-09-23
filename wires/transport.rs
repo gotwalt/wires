@@ -842,6 +842,7 @@ where
         roster_version,
     );
     let mut child_stdin = child.stdin.take().context("child stdin")?;
+    let stdin_tap = crate::audit::tap_stdin(audit.as_ref());
     let child_stdout =
         crate::audit::tap_stdout(audit.as_ref(), child.stdout.take().context("child stdout")?);
     let child_stderr =
@@ -869,6 +870,7 @@ where
         loop {
             match read_frame(&mut recv).await? {
                 Some(Frame::Stdin(chunk)) => {
+                    stdin_tap.feed(chunk.as_bytes()); // audit: stdin
                     child_stdin.write_all(chunk.as_bytes()).await?;
                 }
                 Some(Frame::Invoke(_)) if single_command => {
@@ -2882,8 +2884,15 @@ mod tests {
         }
         match records.recv().await.unwrap() {
             AuditRecord::Finished {
-                exit, stdout_bytes, ..
-            } => assert_eq!((exit, stdout_bytes), (0, 2)),
+                exit,
+                stdout_bytes,
+                stdin_bytes,
+                stdin_head,
+                ..
+            } => {
+                assert_eq!((exit, stdout_bytes), (0, 2));
+                assert_eq!((stdin_bytes, stdin_head), (0, None));
+            }
             other => panic!("expected Finished, got {other:?}"),
         }
 

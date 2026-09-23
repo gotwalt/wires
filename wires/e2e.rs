@@ -1300,7 +1300,8 @@ async fn next_record(
 /// **Card 02.** R serves `cat` with `--audit-topic ops`, hosting the topic
 /// node itself (the session ALPN on the same router); O tails `ops`; C calls.
 /// O sees `Started` (caller = C, as iroh authenticated it) then `Finished`
-/// (exit 0, the byte count, BLAKE3 of the output). The roster then drops C;
+/// (exit 0, the byte count, BLAKE3 of the output, and the stdin C piped in —
+/// count, digest and quoted head). The roster then drops C;
 /// C's next call is refused, and O sees `Denied` with the very reason C got.
 ///
 /// R's publishing runs the production path: [`audit::forward`](crate::audit::forward)
@@ -1470,6 +1471,9 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
         exit,
         stdout_bytes,
         stdout_digest,
+        stdin_bytes,
+        stdin_digest,
+        stdin_head,
         ..
     } = finished
     else {
@@ -1481,6 +1485,10 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
     assert_eq!(exit, 0);
     assert_eq!(stdout_bytes, 12);
     assert_eq!(stdout_digest, expect.finish(), "BLAKE3 of what C received");
+    // C sent its input on stdin, not as args: the observer still sees it.
+    assert_eq!(stdin_bytes, 12);
+    assert_eq!(stdin_digest, expect.finish(), "BLAKE3 of what C sent");
+    assert_eq!(stdin_head.as_deref(), Some("hello, audit"));
 
     // Revoke C: the operator commits a roster without it, and R and O import
     // the new head and key. C still holds only its v1 proof.

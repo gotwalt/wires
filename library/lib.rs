@@ -151,7 +151,9 @@ mod idp_vectors;
 pub use admission::{
     Admission, AdmitFrame, MAX_ADMIT_FRAME, TOPIC_ADMIT_ALPN, adopt_if_newer, check_topic_admission,
 };
-pub use audit::{AuditRecord, CallId, OutputDigest, OutputHasher};
+pub use audit::{
+    AuditRecord, CallId, OutputDigest, OutputHasher, STDIN_HEAD_MAX, StdinCapture, stdin_head,
+};
 pub use chain::{ChainState, LinkStatus, classify_link, next_prev_hash};
 pub use envelope::{
     Ciphertext, ENVELOPE_NONCE_CONTEXT, ENVELOPE_V1, MessageHash, MessageNonce, Seq, TopicEnvelope,
