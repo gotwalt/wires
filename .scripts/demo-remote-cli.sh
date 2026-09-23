@@ -5,8 +5,9 @@
 #
 # Four keystores on one machine, all loopback:
 #
-#   workbench -- `wires serve --expose db_query=sqlite3 -safe -readonly …
-#                --audit-topic ops --require-idp …`. Hosts the audit topic.
+#   workbench -- `wires serve host.json` (.scripts/fixtures/host.json: one
+#                tool, db_query, for role analyst = *@example.com, on
+#                channel ops). Hosts the channel.
 #   observer  -- `wires watch ops`: holds neither the agent's nor the
 #                workbench's credentials, and sees every call anyway.
 #   agent     -- `wires login` (IdP) then `wires call db_query …` and
@@ -200,14 +201,23 @@ beat 5
 # ==========================================================================
 step "1  the workbench exposes ONE CLI, and requires a verified identity"
 # ==========================================================================
-run "wires serve --expose 'db_query=sqlite3 -safe -readonly -header -column orders.db' \\"
-run "    --audit-topic $TOPIC --require-idp 'iss=$ISSUER,email=*@example.com' --oidc-audience $CLIENT_ID"
-WIRES_HOME="$wb" "$WIRES" serve --trust-root "$ROOT_ID" --allow-any-member \
-	--expose "db_query=sqlite3 -safe -readonly -header -column $DB" \
-	--audit-topic "$TOPIC" \
-	--require-idp "iss=$ISSUER,email=*@example.com" \
-	--oidc-audience "$CLIENT_ID" \
-	>"$D/wb.out" 2>"$D/wb.err" &
+# host.json is the fixture with the stand-in IdP's issuer and client id filled
+# in; its db_query command names `orders.db`, relative to the workbench's cwd.
+HOST_JSON="$D/host.json"
+sed -e "s|__ISSUER__|$ISSUER|" -e "s|__CLIENT_ID__|$CLIENT_ID|" \
+	"$repo/.scripts/fixtures/host.json" >"$HOST_JSON"
+run "wires serve --check host.json"
+"$WIRES" serve --check "$HOST_JSON" >"$D/check.out" 2>&1 || {
+	dump "$D/check.out"
+	bad "1: serve --check rejected host.json"
+}
+grep -qF "db_query  may run: analyst" "$D/check.out" || {
+	dump "$D/check.out"
+	bad "1: serve --check did not say who may run db_query"
+}
+show "$D/check.out"
+run "wires serve host.json"
+(cd "$D" && WIRES_HOME="$wb" exec "$WIRES" serve "$HOST_JSON" >"$D/wb.out" 2>"$D/wb.err") &
 WB_PID=$!
 wait_for "$D/wb.err" "share to bootstrap: " 300 || {
 	sed 's/^/  workbench| /' "$D/wb.err" >&2
@@ -313,7 +323,7 @@ grep -qx "$ORDERS" <(tr -d ' ' <"$D/c1.out") || {
 	bad "5: a successful call wrote to stderr"
 }
 show "$D/c1.out"
-S1="$(wait_line "$D/obs.out" "▶" "$EMAIL" "db_query \"select count(*) from orders\"")" || {
+S1="$(wait_line "$D/obs.out" "▶" "$EMAIL" "[analyst] db_query \"select count(*) from orders\"")" || {
 	dump
 	bad "5: no ▶ for the args call"
 }
