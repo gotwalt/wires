@@ -190,7 +190,7 @@ impl Keystore {
     /// Persist `proof` to `inclusion-proof.json` as its token (mode `0644`). The
     /// symmetric half of [`read_inclusion_proof`](Self::read_inclusion_proof):
     /// `wires import --inclusion-proof-file <p>` installs the proof an operator
-    /// emitted with `wires roster commit --out DIR`, after which `wires connect`
+    /// emitted with `wires roster commit --out DIR`, after which `wires call`
     /// finds it with no flags.
     pub fn save_inclusion_proof(&self, proof: &InclusionProof) -> Result<PathBuf> {
         ensure_dir(&self.dir)?;
@@ -313,7 +313,7 @@ fn parse_fabric_key(path: &Path, text: &str) -> Result<FabricKey> {
 // CLI resolvers (flag > env > file > keystore)
 // ---------------------------------------------------------------------------
 
-/// Resolve a node identity for `serve` / `connect`.
+/// Resolve a node identity for `serve` / `call`.
 pub fn node_identity(inline: Option<&str>, file: Option<&Path>) -> Result<NodeIdentity> {
     let env = std::env::var("WIRES_NODE_SEED").ok();
     resolve_identity(
@@ -361,7 +361,7 @@ pub fn root_identity(inline: Option<&str>, file: Option<&Path>) -> Result<NodeId
     )
 }
 
-/// Resolve the dialer's membership for `connect`: an inline `--membership`
+/// Resolve the dialer's membership for `call`: an inline `--membership`
 /// token wins, then `$WIRES_MEMBERSHIP`, then an explicit `--membership-file`,
 /// then the keystore (`membership.json`). Errors if none is found.
 pub fn membership(inline: Option<&str>, file: Option<&Path>) -> Result<Membership> {

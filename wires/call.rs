@@ -123,7 +123,7 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    /// Resolve credentials the way `wires connect` does (flag, env, file,
+    /// Resolve credentials the way `wires serve` does (flag, env, file,
     /// keystore).
     pub fn resolve(a: &CredArgs) -> Result<Self> {
         Ok(Self {
@@ -144,7 +144,7 @@ impl Credentials {
 /// Dial `plan` with `creds` and bridge the given stdio; returns the remote
 /// exit code. A refusal surfaces as a [`transport::Denied`] error.
 ///
-/// Runs the same local preflight as `wires connect` first, so a ticket or
+/// Runs the same local preflight as the topic commands first, so a ticket or
 /// membership issued to another node fails here, not at the responder.
 pub async fn dial<R, W, E>(
     creds: &Credentials,

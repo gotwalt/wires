@@ -5,27 +5,22 @@
 //! capability-addressed session meets the iroh QUIC endpoint. The session ALPN
 //! is [`ALPN`]. A dialer opens a bi-stream and sends a
 //! [`Frame::Handshake`](library::Frame::Handshake) bearing its fabric
-//! [`Membership`](library::Membership) and (for a scoped session) a
-//! [`Grant`](library::Grant); the responder verifies inclusion with
-//! [`library::check_inclusion`] (and, when scoped, the grant with
-//! [`library::check_accept`]) against the iroh-authenticated caller, then execs
-//! the configured child — with the verified caller identity injected into its
-//! environment — and bridges its stdio over tagged frames.
-//!
-//! A responder runs in one of two modes. **Single-command** (`wires serve --
-//! <cmd>`) execs one fixed command per session. **Multi-tool** (`wires serve
-//! --expose name=cmd …`, [`ServeConfig::tools`] non-empty) fronts several CLIs:
-//! the dialer follows its handshake with a [`Frame::Invoke`] naming one of
-//! them plus per-call arguments ([`call_on`]); the responder authorizes the
-//! caller for *that tool* (grant scope `tool:<name>` or [`TOOL_SCOPE_ANY`]) and
-//! execs the tool's fixed argv with the caller's arguments appended — never
-//! through a shell.
+//! [`Membership`](library::Membership) and (when the responder requires one) a
+//! [`Grant`](library::Grant), followed at once by a [`Frame::Invoke`] naming
+//! one of the responder's tools plus per-call arguments ([`call_on`]). The
+//! responder verifies inclusion with [`library::check_inclusion`] (and, when
+//! grants are required, the grant with [`library::check_accept`]) against the
+//! iroh-authenticated caller, authorizes it for *that tool* (grant scope
+//! `tool:<name>` or [`TOOL_SCOPE_ANY`]), then execs the tool's fixed argv with
+//! the caller's arguments appended — never through a shell — with the verified
+//! caller identity injected into its environment, and bridges its stdio over
+//! tagged frames.
 //!
 //! Two properties this module exists to preserve:
 //!
 //! - **Refusals are legible.** A responder that turns a caller away sends a
 //!   [`Frame::Denied`] carrying the reason before closing, which the dialer
-//!   surfaces as a [`Denied`] error (`wires connect` exits 77). Nothing the
+//!   surfaces as a [`Denied`] error (`wires call` exits 77). Nothing the
 //!   dialer sends or receives on a refused session ever reaches its stdout.
 //! - **Refusals are current.** The CRL and the enforced roster head are
 //!   *sources* ([`CrlSource`] / [`HeadSource`]), re-read on every connection, so
@@ -68,27 +63,24 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// peer that connects but never speaks can't hold a session task open.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long `connect` waits for the target to answer before giving up; an
+/// How long a dialer (`wires call`, `wires mcp`) waits for the target to answer before giving up; an
 /// unreachable responder must fail fast rather than look like a hung MCP server
 /// to the client.
 const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The grant scope that admits a caller to **every** tool on a multi-tool
-/// responder. A grant scoped [`tool_scope`]`(name)` admits it to one.
+/// The grant scope that admits a caller to **every** tool on a responder. A
+/// grant scoped [`tool_scope`]`(name)` admits it to one.
 pub const TOOL_SCOPE_ANY: &str = "tool:*";
 
-/// The grant scope that admits a caller to exactly `tool` on a multi-tool
-/// responder: `tool:<name>`.
+/// The grant scope that admits a caller to exactly `tool` on a responder:
+/// `tool:<name>`.
 pub fn tool_scope(tool: &ToolName) -> Scope {
     Scope::new(format!("tool:{tool}"))
 }
 
-/// Denial reason: a multi-tool responder got something other than an
+/// Denial reason: the responder got something other than an
 /// [`Frame::Invoke`] after the handshake.
 pub const DENY_INVOKE_REQUIRED: &str = "invoke required";
-
-/// Denial reason: a single-command responder got an [`Frame::Invoke`].
-pub const DENY_SINGLE_COMMAND: &str = "this responder runs a single command; drop --tool";
 
 /// Denial reason for an [`Invocation`] naming a tool this responder does not
 /// expose.
@@ -96,20 +88,18 @@ fn deny_unknown_tool(tool: &ToolName) -> String {
     format!("unknown tool: {tool}")
 }
 
-/// The responder's static configuration: what it trusts, what it serves, the
-/// optional roster head it enforces, the identity it presents in the ack, and
-/// the child to exec. Built once per `serve` and shared across connections.
+/// The responder's static configuration: what it trusts, which tools it
+/// exposes, the optional roster head it enforces, and the identity it presents
+/// in the ack. Built once per `serve` and shared across connections.
 pub struct ServeConfig {
     /// The trusted fabric root whose memberships, grants, and head are honored.
     pub trust_root: NodeId,
-    /// The scope this responder serves; `None` is inclusion-only.
+    /// Whether a caller must present a grant; `false` is inclusion-only (any
+    /// fabric member, `wires serve --allow-any-member`).
     ///
-    /// In multi-tool mode ([`tools`](Self::tools) non-empty) the value is not
-    /// compared: `Some(_)` means "a grant is required", and the grant's scope
-    /// must be [`tool_scope`] of the invoked tool or [`TOOL_SCOPE_ANY`].
-    /// `wires serve --expose` sets it to [`TOOL_SCOPE_ANY`] unless
-    /// `--allow-any-member`.
-    pub scope: Option<Scope>,
+    /// When set, the grant's scope must be [`tool_scope`] of the invoked tool
+    /// or [`TOOL_SCOPE_ANY`].
+    pub require_grant: bool,
     /// Where the revocation list applied to the credential checks comes from.
     pub crl: CrlSource,
     /// Where the enforced roster head comes from (or that none is enforced).
@@ -119,13 +109,9 @@ pub struct ServeConfig {
     /// The responder's own inclusion proof, presented if set (unused by the
     /// dialer in this slice; reverse roster-freshness is deferred).
     pub proof: Option<InclusionProof>,
-    /// The command (program + args) to exec per session in single-command
-    /// mode. Ignored when [`tools`](Self::tools) is non-empty.
-    pub command: Vec<String>,
-    /// Multi-tool mode (`--expose name=cmd`): each exposed tool's fixed argv.
-    /// When non-empty the dialer must send a [`Frame::Invoke`] naming one of
-    /// these; its `argv` is appended to the tool's fixed argv (never through a
-    /// shell). Empty means single-command mode.
+    /// The exposed tools (`--expose name=cmd`): each tool's fixed argv. The
+    /// dialer sends a [`Frame::Invoke`] naming one of these; its `argv` is
+    /// appended to the tool's fixed argv (never through a shell).
     pub tools: BTreeMap<ToolName, Vec<String>>,
     /// Where call records go (`--audit-topic`), if anywhere.
     pub audit: Option<AuditSink>,
@@ -178,7 +164,9 @@ pub enum CrlSource {
 /// on the next dial without a restart.
 #[derive(Debug)]
 pub enum HeadSource {
-    /// No head enforcement.
+    /// No head enforcement. Built only by tests: the CLI's "no head yet" case
+    /// is an unarmed [`Keystore`](Self::Keystore) source.
+    #[cfg_attr(not(test), allow(dead_code))]
     None,
     /// A head fixed at startup (an inline token or environment variable).
     Fixed(RosterHead),
@@ -511,30 +499,27 @@ pub fn exposed_tools(
     Ok(tools)
 }
 
-/// The argv to exec for this session: the single command, or the invoked
-/// tool's fixed argv with the caller's [`Argv`](library::Argv) appended element by element.
+/// The argv to exec for this session: the invoked tool's fixed argv with the
+/// caller's [`Argv`](library::Argv) appended element by element.
 ///
 /// `Err` carries the denial reason for an invocation naming a tool this
-/// responder does not expose. The mode mismatches (an `Invoke` sent to a
-/// single-command responder, or none sent to a multi-tool one) are caught
-/// before this is reached.
+/// responder does not expose.
 fn resolve_command(
     config: &ServeConfig,
-    invocation: Option<&Invocation>,
+    invocation: &Invocation,
 ) -> std::result::Result<Vec<String>, String> {
-    match invocation {
-        None => Ok(config.command.clone()),
-        Some(inv) => {
-            let base = config
-                .tools
-                .get(&inv.tool)
-                .ok_or_else(|| deny_unknown_tool(&inv.tool))?;
-            Ok(base.iter().chain(inv.argv.as_slice()).cloned().collect())
-        }
-    }
+    let base = config
+        .tools
+        .get(&invocation.tool)
+        .ok_or_else(|| deny_unknown_tool(&invocation.tool))?;
+    Ok(base
+        .iter()
+        .chain(invocation.argv.as_slice())
+        .cloned()
+        .collect())
 }
 
-/// Read the [`Frame::Invoke`] a multi-tool dialer sends right after its
+/// Read the [`Frame::Invoke`] a dialer sends right after its
 /// handshake (bounded by [`HANDSHAKE_TIMEOUT`]).
 async fn read_invocation<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Invocation> {
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(recv))
@@ -558,13 +543,13 @@ pub async fn serve(node: NodeIdentity, config: ServeConfig, relay_url: Option<&s
 }
 
 /// Accept connections on `endpoint`, verifying each caller against `config`, then
-/// exec `config.command` and bridge its stdio. One task per connection; a
+/// exec the invoked tool and bridge its stdio. One task per connection; a
 /// rejected or failed connection is logged at `warn` and does not stop the
 /// listener.
 pub async fn serve_on(endpoint: Endpoint, config: ServeConfig) -> Result<()> {
     tracing::info!(
         node = %to_node_id(&endpoint.id()).hex(),
-        scope = ?config.scope.as_ref().map(Scope::as_str),
+        require_grant = config.require_grant,
         enforcing_head = config.head.enforcement(),
         sockets = ?endpoint.bound_sockets(),
         "serving session ALPN (egress-only)"
@@ -574,7 +559,7 @@ pub async fn serve_on(endpoint: Endpoint, config: ServeConfig) -> Result<()> {
         head = ?config.head,
         "credential sources (re-read per connection)"
     );
-    if config.scope.is_none() {
+    if !config.require_grant {
         tracing::warn!("inclusion-only: any fabric member may connect");
     }
     let config = Arc::new(config);
@@ -649,15 +634,12 @@ async fn serve_connection(conn: iroh::endpoint::Connection, config: &ServeConfig
 
 /// The responder half of a session over an established, already-authenticated
 /// bi-stream: read and verify the handshake against `caller` and `config`, send a
-/// `HandshakeAck`, then exec the session's command and bridge its stdio. `caller`
+/// `HandshakeAck`, then exec the invoked tool and bridge its stdio. `caller`
 /// must already be authenticated by whoever supplies the streams.
 ///
-/// In multi-tool mode ([`ServeConfig::tools`] non-empty) the handshake must be
-/// followed by a [`Frame::Invoke`]; the caller is authorized for the named tool
-/// and the tool's argv plus the invocation's arguments are exec'd (with
-/// `WIRES_TOOL` set). In single-command mode an `Invoke` is refused with
-/// [`DENY_SINGLE_COMMAND`] — detected on the stdin stream, so the child has
-/// already been spawned (for a caller authorized to run it) and is killed.
+/// The handshake must be followed by a [`Frame::Invoke`]; the caller is
+/// authorized for the named tool and the tool's argv plus the invocation's
+/// arguments are exec'd (with `WIRES_TOOL` set).
 ///
 /// A refused handshake is answered with a [`Frame::Denied`] carrying the reason
 /// before the connection drops, and no child is spawned. (A peer that connects
@@ -706,22 +688,18 @@ where
         }
     };
 
-    // Multi-tool mode: the dialer sends its `Invoke` right behind the handshake
-    // without waiting for the ack, so it is read here, before authorization
-    // (which is per tool).
-    let invocation = if config.tools.is_empty() {
-        None
-    } else {
-        match read_invocation(&mut recv).await {
-            Ok(invocation) => Some(invocation),
-            Err(e) => {
-                crate::audit::denied(config.audit.as_ref(), caller, None, DENY_INVOKE_REQUIRED); // audit: denied
-                deny(&mut send, DENY_INVOKE_REQUIRED.to_string()).await;
-                return Err(e.context(DENY_INVOKE_REQUIRED));
-            }
+    // The dialer sends its `Invoke` right behind the handshake without waiting
+    // for the ack, so it is read here, before authorization (which is per
+    // tool).
+    let invocation = match read_invocation(&mut recv).await {
+        Ok(invocation) => invocation,
+        Err(e) => {
+            crate::audit::denied(config.audit.as_ref(), caller, None, DENY_INVOKE_REQUIRED); // audit: denied
+            deny(&mut send, DENY_INVOKE_REQUIRED.to_string()).await;
+            return Err(e.context(DENY_INVOKE_REQUIRED));
         }
     };
-    let tool = invocation.as_ref().map(|i| &i.tool);
+    let tool = &invocation.tool;
     let now = crate::now_unix();
 
     // Re-read the CRL and the enforced head for *this* connection, so a
@@ -733,7 +711,7 @@ where
         Err(e) => {
             tracing::warn!("credential sources unusable: {e:#}");
             let reason = "responder configuration error".to_string();
-            crate::audit::denied(config.audit.as_ref(), caller, tool.cloned(), &reason); // audit: denied
+            crate::audit::denied(config.audit.as_ref(), caller, Some(tool.clone()), &reason); // audit: denied
             deny(&mut send, reason).await;
             return Err(e.context("loading credential sources"));
         }
@@ -757,7 +735,7 @@ where
             crate::audit::denied(
                 config.audit.as_ref(),
                 caller,
-                tool.cloned(),
+                Some(tool.clone()),
                 &format!("{e:#}"),
             ); // audit: denied
             deny(&mut send, format!("{e:#}")).await;
@@ -766,10 +744,10 @@ where
     };
 
     // Only an authorized caller learns whether the tool it named exists.
-    let argv = match resolve_command(config, invocation.as_ref()) {
+    let argv = match resolve_command(config, &invocation) {
         Ok(argv) => argv,
         Err(reason) => {
-            crate::audit::denied(config.audit.as_ref(), caller, tool.cloned(), &reason); // audit: denied
+            crate::audit::denied(config.audit.as_ref(), caller, Some(tool.clone()), &reason); // audit: denied
             deny(&mut send, reason.clone()).await;
             return Err(anyhow!(reason));
         }
@@ -777,8 +755,7 @@ where
 
     tracing::info!(
         caller = %caller.hex(),
-        scope = ?config.scope.as_ref().map(Scope::as_str),
-        tool = ?tool.map(ToolName::as_str),
+        tool = %tool,
         roster_version = ?roster_version,
         "session accepted"
     );
@@ -804,7 +781,7 @@ where
     // not secrets.
     let (program, args) = argv
         .split_first()
-        .ok_or_else(|| anyhow!("empty serve command"))?;
+        .ok_or_else(|| anyhow!("empty tool command"))?;
     tracing::info!(program = %program, "spawning child and bridging stdio");
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -822,23 +799,21 @@ where
     if let Some(v) = roster_version {
         cmd.env("WIRES_ROSTER_VERSION", v.to_string());
     }
-    if let Some(tool) = tool {
-        cmd.env("WIRES_TOOL", tool.as_str());
-    }
+    cmd.env("WIRES_TOOL", tool.as_str());
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {program}"))?;
-    // audit: started — multi-tool mode records the tool and the *caller's*
-    // arguments; single-command mode reports tool "stdio" + the command's args.
+    // audit: started — the tool and the *caller's* arguments (not the tool's
+    // fixed argv).
     let audit = crate::audit::CallAudit::start(
         config.audit.as_ref(),
         caller,
         principal,
-        tool.cloned().unwrap_or_else(crate::audit::stdio_tool),
-        invocation.as_ref().map_or(args, |i| i.argv.as_slice()),
+        tool.clone(),
+        invocation.argv.as_slice(),
         roster_version,
     );
     let mut child_stdin = child.stdin.take().context("child stdin")?;
@@ -860,24 +835,12 @@ where
     });
 
     // client stdin frames -> child stdin (closes child stdin at end of stream).
-    // A single-command responder that sees an `Invoke` signals `stray_invoke`
-    // and then holds the child's stdin open, so the child cannot exit on EOF
-    // and race the refusal.
-    let single_command = invocation.is_none();
-    let (stray_tx, mut stray_invoke) = tokio::sync::oneshot::channel::<()>();
     let stdin_task = tokio::spawn(async move {
-        let mut stray_tx = Some(stray_tx);
         loop {
             match read_frame(&mut recv).await? {
                 Some(Frame::Stdin(chunk)) => {
                     stdin_tap.feed(chunk.as_bytes()); // audit: stdin
                     child_stdin.write_all(chunk.as_bytes()).await?;
-                }
-                Some(Frame::Invoke(_)) if single_command => {
-                    if let Some(tx) = stray_tx.take() {
-                        let _ = tx.send(());
-                    }
-                    std::future::pending::<()>().await;
                 }
                 Some(_) => {} // ignore unexpected frames from the dialer
                 None => break,
@@ -893,44 +856,12 @@ where
     // Wait for the child, unless the dialer vanishes first — in which case kill
     // it and reap, rather than leaving an orphan behind. (The `child.wait()`
     // future is dropped when the select ends, releasing its borrow of `child`.)
-    enum Ending {
-        Exited(std::process::ExitStatus),
-        DialerGone,
-        StrayInvoke,
-    }
-    let ending = tokio::select! {
-        status = child.wait() => Ending::Exited(status.context("waiting for child")?),
-        _ = shutdown => Ending::DialerGone,
-        Ok(()) = &mut stray_invoke => Ending::StrayInvoke,
-    };
-    let status = match ending {
-        Ending::Exited(status) => status,
-        Ending::DialerGone => {
+    let status = tokio::select! {
+        status = child.wait() => status.context("waiting for child")?,
+        _ = shutdown => {
             tracing::warn!("dialer disconnected; killing child");
             child.start_kill().ok();
             child.wait().await.context("reaping killed child")?
-        }
-        Ending::StrayInvoke => {
-            tracing::warn!("invoke sent to a single-command responder; killing child");
-            child.start_kill().ok();
-            child.wait().await.context("reaping killed child")?;
-            stdin_task.abort();
-            let _ = out_task.await;
-            let _ = err_task.await;
-            // audit: the child already started, so close its record (killed,
-            // exit -1) and record the refusal the caller is about to get.
-            if let Some(audit) = audit {
-                audit.finish(-1);
-            }
-            crate::audit::denied(config.audit.as_ref(), caller, None, DENY_SINGLE_COMMAND);
-            tx.send(Frame::Denied {
-                reason: DENY_SINGLE_COMMAND.to_string(),
-            })
-            .await
-            .ok();
-            drop(tx);
-            writer.await.context("writer task")??;
-            bail!(DENY_SINGLE_COMMAND);
         }
     };
     out_task.await.context("stdout pump")??;
@@ -974,8 +905,8 @@ struct Admitted {
 
 /// Every credential check a caller must pass, in one place.
 ///
-/// Runs, in order: fabric inclusion (always), the scope grant (when the
-/// responder serves a scope), the grant/membership subject agreement, the
+/// Runs, in order: fabric inclusion (always), the tool grant (when the
+/// responder requires one), the grant/membership subject agreement, the
 /// roster head gate, and last the identity gate (`--require-idp`), which only
 /// ever sees a caller whose key already passed everything else. Returns the
 /// admitting roster version and the caller's principal, if known.
@@ -985,10 +916,8 @@ struct Admitted {
 /// credential at fault (`membership rejected: …`, `grant rejected: …`,
 /// `roster inclusion rejected: …`).
 ///
-/// `tool` is the invoked tool on a multi-tool responder (`None` in
-/// single-command mode). With a tool, a scoped responder's grant must be
-/// scoped [`tool_scope`]`(tool)` or [`TOOL_SCOPE_ANY`] instead of matching
-/// [`ServeConfig::scope`] exactly.
+/// `tool` is the invoked tool: when grants are required, the grant must be
+/// scoped [`tool_scope`]`(tool)` or [`TOOL_SCOPE_ANY`].
 #[allow(clippy::too_many_arguments)]
 fn authorize(
     config: &ServeConfig,
@@ -998,41 +927,28 @@ fn authorize(
     proof: Option<&InclusionProof>,
     caller: NodeId,
     now: i64,
-    tool: Option<&ToolName>,
+    tool: &ToolName,
 ) -> Result<Admitted> {
     // Inclusion is always required: the caller must prove fabric membership,
     // bound to its iroh-authenticated key.
     check_inclusion(membership, config.trust_root, caller, now, &policy.crl)
         .map_err(|e| anyhow!("membership rejected: {e}"))?;
 
-    // A scoped responder additionally requires a matching, accepted grant.
-    if let Some(scope) = config.scope.as_ref() {
+    // A grant-gated responder additionally requires an accepted grant that
+    // covers the invoked tool.
+    if config.require_grant {
         let grant =
             grant.ok_or_else(|| anyhow!("scoped session requires a grant; none presented"))?;
         check_accept(grant, config.trust_root, caller, now, &policy.crl)
             .map_err(|e| anyhow!("grant rejected: {e}"))?;
-        match tool {
-            None => {
-                if grant.scope.as_str() != scope.as_str() {
-                    bail!(
-                        "grant scope {:?} does not match served scope {:?}",
-                        grant.scope.as_str(),
-                        scope.as_str()
-                    );
-                }
-            }
-            Some(tool) => {
-                let needed = tool_scope(tool);
-                if grant.scope.as_str() != needed.as_str() && grant.scope.as_str() != TOOL_SCOPE_ANY
-                {
-                    bail!(
-                        "grant scope {:?} does not cover tool {tool} (needs {:?} or {:?})",
-                        grant.scope.as_str(),
-                        needed.as_str(),
-                        TOOL_SCOPE_ANY
-                    );
-                }
-            }
+        let needed = tool_scope(tool);
+        if grant.scope.as_str() != needed.as_str() && grant.scope.as_str() != TOOL_SCOPE_ANY {
+            bail!(
+                "grant scope {:?} does not cover tool {tool} (needs {:?} or {:?})",
+                grant.scope.as_str(),
+                needed.as_str(),
+                TOOL_SCOPE_ANY
+            );
         }
     }
 
@@ -1083,14 +999,14 @@ fn roster_gate(
 }
 
 // ---------------------------------------------------------------------------
-// Dialer (`wires connect`)
+// Dialer (`wires call`, `wires mcp`)
 // ---------------------------------------------------------------------------
 
 /// The responder refused the handshake and said why.
 ///
 /// Distinguishes an *authorization* failure (the credential this dialer
 /// presented was not acceptable — revoked, expired, off the roster) from every
-/// local or transport failure, so `wires connect` can exit with a dedicated
+/// local or transport failure, so `wires call` can exit with a dedicated
 /// code and print the responder's own words. Hand-rolled rather than derived:
 /// `//wires` deliberately carries no `thiserror` dependency.
 #[derive(Debug)]
@@ -1119,68 +1035,17 @@ impl std::fmt::Display for Denied {
 
 impl std::error::Error for Denied {}
 
-/// Bind for `node` and dial `target` (see [`connect_on`]).
-#[allow(clippy::too_many_arguments)]
-pub async fn connect_io<R, W, E>(
-    node: NodeIdentity,
-    target: EndpointAddr,
-    membership: Membership,
-    grant: Option<Grant>,
-    proof: Option<InclusionProof>,
-    ticketless: bool,
-    relay_url: Option<&str>,
-    stdin: R,
-    stdout: W,
-    stderr: E,
-) -> Result<i32>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin,
-    E: AsyncWrite + Unpin,
-{
-    let endpoint = bind(&node, relay_url).await?;
-    connect_on(
-        endpoint, target, membership, grant, proof, ticketless, stdin, stdout, stderr,
-    )
-    .await
-}
-
-/// Dial `target` on `endpoint`, present `membership` (+ `grant`/`proof` if any),
-/// then bridge local stdio and return the child's exit code. When `ticketless`,
-/// verify the responder's `HandshakeAck` membership before forwarding any stdin.
-#[allow(clippy::too_many_arguments)]
-pub async fn connect_on<R, W, E>(
-    endpoint: Endpoint,
-    target: EndpointAddr,
-    membership: Membership,
-    grant: Option<Grant>,
-    proof: Option<InclusionProof>,
-    ticketless: bool,
-    stdin: R,
-    stdout: W,
-    stderr: E,
-) -> Result<i32>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin,
-    E: AsyncWrite + Unpin,
-{
-    dial_on(
-        endpoint, target, membership, grant, proof, ticketless, None, stdin, stdout, stderr,
-    )
-    .await
-}
-
-/// Like [`connect_on`], but for a multi-tool responder: sends
-/// [`Frame::Invoke`] with `invocation` right after the handshake (before the
-/// ack arrives), then bridges stdio exactly as `connect_on` does. The entry
-/// point for `wires call`, `wires mcp`, and `wires connect --tool`.
+/// Dial `target` on `endpoint`, present `membership` (+ `grant`/`proof` if
+/// any), send [`Frame::Invoke`] with `invocation` right after the handshake
+/// (before the ack arrives), then bridge local stdio. When `ticketless`,
+/// verify the responder's `HandshakeAck` membership before forwarding any
+/// stdin. The entry point for `wires call` and `wires mcp`.
 ///
 /// Returns the remote child's exit code. A refusal — including
-/// [`DENY_INVOKE_REQUIRED`]-style protocol refusals, `unknown tool: <name>`,
-/// and [`DENY_SINGLE_COMMAND`] from a single-command responder — is an `Err`
-/// that downcasts to [`Denied`]; nothing reaches `stdout` on the refusal paths
-/// that happen before the ack. Consumes `endpoint` and closes it on return.
+/// [`DENY_INVOKE_REQUIRED`]-style protocol refusals and `unknown tool: <name>`
+/// — is an `Err` that downcasts to [`Denied`]; nothing reaches `stdout` on the
+/// refusal paths that happen before the ack. Consumes `endpoint` and closes it
+/// on return.
 #[allow(clippy::too_many_arguments)]
 pub async fn call_on<R, W, E>(
     endpoint: Endpoint,
@@ -1190,41 +1055,6 @@ pub async fn call_on<R, W, E>(
     proof: Option<InclusionProof>,
     ticketless: bool,
     invocation: Invocation,
-    stdin: R,
-    stdout: W,
-    stderr: E,
-) -> Result<i32>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin,
-    E: AsyncWrite + Unpin,
-{
-    dial_on(
-        endpoint,
-        target,
-        membership,
-        grant,
-        proof,
-        ticketless,
-        Some(invocation),
-        stdin,
-        stdout,
-        stderr,
-    )
-    .await
-}
-
-/// The shared body of [`connect_on`] and [`call_on`]: dial, open the
-/// bi-stream, run [`dial_session`], and close the endpoint whatever happened.
-#[allow(clippy::too_many_arguments)]
-async fn dial_on<R, W, E>(
-    endpoint: Endpoint,
-    target: EndpointAddr,
-    membership: Membership,
-    grant: Option<Grant>,
-    proof: Option<InclusionProof>,
-    ticketless: bool,
-    invocation: Option<Invocation>,
     stdin: R,
     stdout: W,
     stderr: E,
@@ -1285,8 +1115,8 @@ where
 /// dialer's own fabric root and the authenticated target id **before** any stdin
 /// is forwarded. On failure, aborts with no stdin sent.
 ///
-/// With an `invocation` (multi-tool responder), a [`Frame::Invoke`] follows
-/// the handshake immediately, without waiting for the ack.
+/// The [`Frame::Invoke`] carrying `invocation` follows the handshake
+/// immediately, without waiting for the ack.
 ///
 /// Errors if the session ends **without** an [`Frame::Exit`] — a responder that
 /// closes mid-session is a failure, not a silent success.
@@ -1297,7 +1127,7 @@ async fn dial_session<S, R, I, W, E>(
     membership: Membership,
     grant: Option<Grant>,
     proof: Option<InclusionProof>,
-    invocation: Option<Invocation>,
+    invocation: Invocation,
     verify_target: Option<NodeId>,
     stdin: I,
     mut stdout: W,
@@ -1321,9 +1151,7 @@ where
         },
     )
     .await?;
-    if let Some(invocation) = invocation {
-        write_frame(&mut send, &Frame::Invoke(invocation)).await?;
-    }
+    write_frame(&mut send, &Frame::Invoke(invocation)).await?;
 
     // Read the responder's ack first (it is always the responder's first frame).
     let ack_membership = match read_frame(&mut recv).await? {
@@ -1495,46 +1323,69 @@ mod tests {
         assert!(read_frame(&mut cur).await.is_err());
     }
 
-    /// A responder config for tests: server is a fabric member under `root`.
+    /// The one tool most tests expose: [`test_config`] maps it to the test's
+    /// command, and every dial invokes it.
+    const TEST_TOOL: &str = "t";
+
+    /// A tools map exposing `command` as [`TEST_TOOL`].
+    fn tool_map(command: Vec<String>) -> BTreeMap<ToolName, Vec<String>> {
+        BTreeMap::from([(ToolName::new(TEST_TOOL).unwrap(), command)])
+    }
+
+    /// An invocation of [`TEST_TOOL`] with no arguments.
+    fn invoke_test_tool() -> Invocation {
+        invoke(TEST_TOOL, &[])
+    }
+
+    /// The grant scope that covers [`TEST_TOOL`].
+    fn test_tool_scope() -> Scope {
+        tool_scope(&ToolName::new(TEST_TOOL).unwrap())
+    }
+
+    /// A responder config for tests: server is a fabric member under `root`,
+    /// exposing `command` as [`TEST_TOOL`].
     fn test_config(
         root: &NodeIdentity,
         server: NodeId,
-        scope: Option<&str>,
+        require_grant: bool,
         crl: Crl,
         command: Vec<String>,
     ) -> ServeConfig {
         ServeConfig {
-            tools: Default::default(),
+            tools: tool_map(command),
             audit: None,
             identity: None,
             trust_root: root.node_id(),
-            scope: scope.map(Scope::new),
+            require_grant,
             crl: CrlSource::Fixed(crl),
             head: HeadSource::None,
             membership: Membership::mint(root, server, 0, i64::MAX).unwrap(),
             proof: None,
-            command,
         }
     }
 
+    /// The bytes a dialer sends before any stdin: `handshake`, then an
+    /// invocation of [`TEST_TOOL`].
+    fn opening(handshake: Frame) -> Vec<u8> {
+        let mut bytes = handshake.encode().unwrap();
+        bytes.extend(Frame::Invoke(invoke_test_tool()).encode().unwrap());
+        bytes
+    }
+
     /// Run a full session over two in-memory duplex pipes (no iroh): returns the
-    /// dialer's exit result plus captured stdout/stderr. Ticketed (grant present,
-    /// ack ignored).
-    async fn run_session(
-        command: Vec<String>,
-        input: &[u8],
-        served_scope: &str,
-    ) -> (Result<i32>, Vec<u8>, Vec<u8>) {
+    /// dialer's exit result plus captured stdout/stderr. Ticketed (a grant for
+    /// [`TEST_TOOL`] present, ack ignored).
+    async fn run_session(command: Vec<String>, input: &[u8]) -> (Result<i32>, Vec<u8>, Vec<u8>) {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
         let membership = Membership::mint(&root, caller, 0, i64::MAX).unwrap();
-        let grant = Grant::mint(&root, caller, Scope::new(served_scope), i64::MAX).unwrap();
+        let grant = Grant::mint(&root, caller, test_tool_scope(), i64::MAX).unwrap();
 
         let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024); // dialer -> responder
         let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024); // responder -> dialer
 
-        let config = test_config(&root, server, Some(served_scope), Crl::new(), command);
+        let config = test_config(&root, server, true, Crl::new(), command);
         let srv =
             tokio::spawn(
                 async move { serve_session(s2c_w, c2s_r, caller, &config, never()).await },
@@ -1548,7 +1399,7 @@ mod tests {
             membership,
             Some(grant),
             None, // dialer proof
-            None, // invocation
+            invoke_test_tool(),
             None, // verify_target: ticketed → ignore ack
             std::io::Cursor::new(input.to_vec()),
             &mut out,
@@ -1560,24 +1411,21 @@ mod tests {
     }
 
     /// Whether the responder rejects a handshake bearing `membership` / `grant`
-    /// for a session serving `served_scope` (`None` = inclusion-only).
+    /// (then an invocation of [`TEST_TOOL`]) on a responder that requires a
+    /// grant or not (inclusion-only).
     async fn serve_rejects(
         membership: Membership,
         grant: Option<Grant>,
         trust_root: NodeId,
-        served_scope: Option<&str>,
+        require_grant: bool,
         crl: Crl,
         caller: NodeId,
     ) -> bool {
-        let recv = std::io::Cursor::new(
-            Frame::Handshake {
-                membership,
-                grant,
-                proof: None,
-            }
-            .encode()
-            .unwrap(),
-        );
+        let recv = std::io::Cursor::new(opening(Frame::Handshake {
+            membership,
+            grant,
+            proof: None,
+        }));
         let send: Vec<u8> = Vec::new();
         // The server's own membership is signed under seed [1]; rejection happens
         // during dialer verification, before the (unreached) ack, so the signer is
@@ -1591,16 +1439,15 @@ mod tests {
         )
         .unwrap();
         let config = ServeConfig {
-            tools: Default::default(),
+            tools: tool_map(vec!["cat".to_string()]),
             audit: None,
             identity: None,
             trust_root,
-            scope: served_scope.map(Scope::new),
+            require_grant,
             crl: CrlSource::Fixed(crl),
             head: HeadSource::None,
             membership: server_membership,
             proof: None,
-            command: vec!["cat".to_string()],
         };
         serve_session(send, recv, caller, &config, never())
             .await
@@ -1632,7 +1479,7 @@ mod tests {
             membership,
             grant,
             proof,
-            None, // invocation
+            invoke_test_tool(),
             None, // ticketed → ignore the ack
             std::io::Cursor::new(Vec::new()),
             &mut out,
@@ -1652,7 +1499,7 @@ mod tests {
         let mut crl = Crl::new();
         crl.insert(caller);
 
-        let config = test_config(&root, server, None, crl, vec!["cat".to_string()]);
+        let config = test_config(&root, server, false, crl, vec!["cat".to_string()]);
         let (res, out) = run_with_config(config, caller, membership, None, None).await;
 
         let e = res.expect_err("a revoked caller must be refused");
@@ -1785,11 +1632,10 @@ mod tests {
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
         let head_path = temp_dir().join("roster-head.json");
         let config = ServeConfig {
-            tools: Default::default(),
             audit: None,
             identity: None,
             trust_root: root.node_id(),
-            scope: None,
+            require_grant: false,
             crl: CrlSource::Fixed(Crl::new()),
             head: HeadSource::Keystore {
                 path: head_path.clone(),
@@ -1797,7 +1643,7 @@ mod tests {
             },
             membership: Membership::mint(&root, server, 0, i64::MAX).unwrap(),
             proof: None,
-            command: vec!["cat".to_string()],
+            tools: tool_map(vec!["cat".to_string()]),
         };
         // The caller holds a perfectly good proof from roster v1.
         let mut roster = Roster::new(root.node_id());
@@ -1842,16 +1688,15 @@ mod tests {
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
         let crl_path = temp_dir().join("crl.json");
         let config = Arc::new(ServeConfig {
-            tools: Default::default(),
             audit: None,
             identity: None,
             trust_root: root.node_id(),
-            scope: None,
+            require_grant: false,
             crl: CrlSource::File(crl_path.clone()),
             head: HeadSource::None,
             membership: Membership::mint(&root, server, 0, i64::MAX).unwrap(),
             proof: None,
-            command: vec!["cat".to_string()],
+            tools: tool_map(vec!["cat".to_string()]),
         });
 
         /// One session against a shared config; returns the dialer's result and
@@ -1875,7 +1720,7 @@ mod tests {
                 membership,
                 None,
                 None,
-                None, // invocation
+                invoke_test_tool(),
                 None,
                 std::io::Cursor::new(input.to_vec()),
                 &mut out,
@@ -1920,7 +1765,7 @@ mod tests {
         let config = test_config(
             &root,
             server,
-            None,
+            false,
             Crl::new(),
             vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
         );
@@ -1929,7 +1774,7 @@ mod tests {
             grant: None,
             proof: None,
         };
-        let recv = std::io::Cursor::new(handshake.encode().unwrap());
+        let recv = std::io::Cursor::new(opening(handshake));
         let send: Vec<u8> = Vec::new();
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -1963,8 +1808,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_echoes_stdin() {
-        let (code, out, err) =
-            run_session(vec!["cat".to_string()], b"hello over wires", "tools.cat").await;
+        let (code, out, err) = run_session(vec!["cat".to_string()], b"hello over wires").await;
         assert_eq!(code.unwrap(), 0);
         assert_eq!(out, b"hello over wires");
         assert!(err.is_empty());
@@ -1972,12 +1816,8 @@ mod tests {
 
     #[tokio::test]
     async fn session_propagates_nonzero_exit() {
-        let (code, _out, _err) = run_session(
-            vec!["sh".into(), "-c".into(), "exit 3".into()],
-            b"",
-            "tools.sh",
-        )
-        .await;
+        let (code, _out, _err) =
+            run_session(vec!["sh".into(), "-c".into(), "exit 3".into()], b"").await;
         assert_eq!(code.unwrap(), 3);
     }
 
@@ -1986,7 +1826,6 @@ mod tests {
         let (code, out, err) = run_session(
             vec!["sh".into(), "-c".into(), "printf oops 1>&2".into()],
             b"",
-            "tools.sh",
         )
         .await;
         assert_eq!(code.unwrap(), 0);
@@ -2004,11 +1843,11 @@ mod tests {
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
         let membership = Membership::mint(&root, caller, 0, i64::MAX).unwrap();
-        let grant = Grant::mint(&root, caller, Scope::new("tools.sh"), i64::MAX).unwrap();
+        let grant = Grant::mint(&root, caller, test_tool_scope(), i64::MAX).unwrap();
         let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
         let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
         let command = vec!["sh".into(), "-c".into(), "printf done".into()];
-        let config = test_config(&root, server, Some("tools.sh"), Crl::new(), command);
+        let config = test_config(&root, server, true, Crl::new(), command);
         let srv =
             tokio::spawn(
                 async move { serve_session(s2c_w, c2s_r, caller, &config, never()).await },
@@ -2025,7 +1864,7 @@ mod tests {
                 membership,
                 Some(grant),
                 None,
-                None,
+                invoke_test_tool(),
                 None,
                 stdin,
                 &mut out,
@@ -2054,18 +1893,9 @@ mod tests {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let m = valid_membership(&root, caller);
-        let grant = Grant::mint(&root, caller, Scope::new("tools.b"), i64::MAX).unwrap();
-        assert!(
-            serve_rejects(
-                m,
-                Some(grant),
-                root.node_id(),
-                Some("tools.a"),
-                Crl::new(),
-                caller
-            )
-            .await
-        );
+        // A grant for another tool does not cover the one invoked.
+        let grant = Grant::mint(&root, caller, Scope::new("tool:b"), i64::MAX).unwrap();
+        assert!(serve_rejects(m, Some(grant), root.node_id(), true, Crl::new(), caller).await);
     }
 
     #[tokio::test]
@@ -2074,18 +1904,8 @@ mod tests {
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let m = valid_membership(&root, caller);
         // not_after = 0 (1970) is always in the past.
-        let grant = Grant::mint(&root, caller, Scope::new("s"), 0).unwrap();
-        assert!(
-            serve_rejects(
-                m,
-                Some(grant),
-                root.node_id(),
-                Some("s"),
-                Crl::new(),
-                caller
-            )
-            .await
-        );
+        let grant = Grant::mint(&root, caller, test_tool_scope(), 0).unwrap();
+        assert!(serve_rejects(m, Some(grant), root.node_id(), true, Crl::new(), caller).await);
     }
 
     #[tokio::test]
@@ -2093,10 +1913,10 @@ mod tests {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let m = valid_membership(&root, caller);
-        let grant = Grant::mint(&root, caller, Scope::new("s"), i64::MAX).unwrap();
+        let grant = Grant::mint(&root, caller, test_tool_scope(), i64::MAX).unwrap();
         let mut crl = Crl::new();
         crl.insert(caller);
-        assert!(serve_rejects(m, Some(grant), root.node_id(), Some("s"), crl, caller).await);
+        assert!(serve_rejects(m, Some(grant), root.node_id(), true, crl, caller).await);
     }
 
     #[tokio::test]
@@ -2109,7 +1929,7 @@ mod tests {
 
         let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
         let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
-        let config = test_config(&root, server, None, Crl::new(), vec!["cat".to_string()]);
+        let config = test_config(&root, server, false, Crl::new(), vec!["cat".to_string()]);
         let srv =
             tokio::spawn(
                 async move { serve_session(s2c_w, c2s_r, caller, &config, never()).await },
@@ -2123,7 +1943,7 @@ mod tests {
             membership,
             None,
             None,
-            None, // invocation
+            invoke_test_tool(),
             None, // ticketed-style call: do not verify ack
             std::io::Cursor::new(b"hi inclusion".to_vec()),
             &mut out,
@@ -2142,7 +1962,7 @@ mod tests {
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         // Signed by other_root; the responder trusts root.
         let m = Membership::mint(&other_root, caller, 0, i64::MAX).unwrap();
-        assert!(serve_rejects(m, None, root.node_id(), None, Crl::new(), caller).await);
+        assert!(serve_rejects(m, None, root.node_id(), false, Crl::new(), caller).await);
     }
 
     #[tokio::test]
@@ -2150,7 +1970,7 @@ mod tests {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let m = Membership::mint(&root, caller, 0, 0).unwrap(); // not_after 1970
-        assert!(serve_rejects(m, None, root.node_id(), None, Crl::new(), caller).await);
+        assert!(serve_rejects(m, None, root.node_id(), false, Crl::new(), caller).await);
     }
 
     #[tokio::test]
@@ -2160,7 +1980,7 @@ mod tests {
         let m = valid_membership(&root, caller);
         let mut crl = Crl::new();
         crl.insert(caller);
-        assert!(serve_rejects(m, None, root.node_id(), None, crl, caller).await);
+        assert!(serve_rejects(m, None, root.node_id(), false, crl, caller).await);
     }
 
     #[tokio::test]
@@ -2170,7 +1990,7 @@ mod tests {
         let member = NodeIdentity::from_seed([2u8; 32]).node_id();
         let caller = NodeIdentity::from_seed([3u8; 32]).node_id();
         let m = valid_membership(&root, member);
-        assert!(serve_rejects(m, None, root.node_id(), None, Crl::new(), caller).await);
+        assert!(serve_rejects(m, None, root.node_id(), false, Crl::new(), caller).await);
     }
 
     #[tokio::test]
@@ -2179,17 +1999,7 @@ mod tests {
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let m = valid_membership(&root, caller);
         // A scope is served but no grant is presented.
-        assert!(
-            serve_rejects(
-                m,
-                None,
-                root.node_id(),
-                Some("tools.cat"),
-                Crl::new(),
-                caller
-            )
-            .await
-        );
+        assert!(serve_rejects(m, None, root.node_id(), true, Crl::new(), caller).await);
     }
 
     #[tokio::test]
@@ -2198,18 +2008,8 @@ mod tests {
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let other = NodeIdentity::from_seed([7u8; 32]).node_id();
         let m = valid_membership(&root, caller);
-        let grant = Grant::mint(&root, other, Scope::new("tools.cat"), i64::MAX).unwrap();
-        assert!(
-            serve_rejects(
-                m,
-                Some(grant),
-                root.node_id(),
-                Some("tools.cat"),
-                Crl::new(),
-                caller
-            )
-            .await
-        );
+        let grant = Grant::mint(&root, other, test_tool_scope(), i64::MAX).unwrap();
+        assert!(serve_rejects(m, Some(grant), root.node_id(), true, Crl::new(), caller).await);
     }
 
     /// Full scoped flow over a real (loopback) iroh connection: dial →
@@ -2220,7 +2020,7 @@ mod tests {
         let root = NodeIdentity::from_seed([10u8; 32]);
         let server = NodeIdentity::from_seed([11u8; 32]);
         let client = NodeIdentity::from_seed([12u8; 32]);
-        let scope = Scope::new("tools.cat");
+        let scope = test_tool_scope();
         let membership = Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap();
         let grant = Grant::mint(&root, client.node_id(), scope.clone(), i64::MAX).unwrap();
 
@@ -2233,7 +2033,7 @@ mod tests {
             test_config(
                 &root,
                 server.node_id(),
-                Some("tools.cat"),
+                true,
                 Crl::new(),
                 vec!["cat".to_string()],
             ),
@@ -2242,13 +2042,14 @@ mod tests {
         let client_ep = test_endpoint(&client).await;
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
-        let code = connect_on(
+        let code = call_on(
             client_ep,
             addr,
             membership,
             Some(grant),
             None,  // proof
             false, // ticketed
+            invoke_test_tool(),
             std::io::Cursor::new(b"hello world".to_vec()),
             &mut out,
             &mut err,
@@ -2279,7 +2080,7 @@ mod tests {
             test_config(
                 &root,
                 server.node_id(),
-                None,
+                false,
                 Crl::new(),
                 vec![
                     "sh".to_string(),
@@ -2293,13 +2094,14 @@ mod tests {
         let client_ep = test_endpoint(&client).await;
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
-        let code = connect_on(
+        let code = call_on(
             client_ep,
             addr,
             membership,
             None,
             None, // proof
             true, // ticket-less → verify the responder's ack
+            invoke_test_tool(),
             std::io::Cursor::new(Vec::new()),
             &mut out,
             &mut err,
@@ -2326,7 +2128,7 @@ mod tests {
         let evil_root = NodeIdentity::from_seed([21u8; 32]);
         let server = NodeIdentity::from_seed([22u8; 32]);
         let client = NodeIdentity::from_seed([23u8; 32]);
-        let scope = Scope::new("tools.cat");
+        let scope = test_tool_scope();
         let membership = Membership::mint(&trusted_root, client.node_id(), 0, i64::MAX).unwrap();
         // Signed by evil_root, but the server only trusts trusted_root.
         let grant = Grant::mint(&evil_root, client.node_id(), scope.clone(), i64::MAX).unwrap();
@@ -2338,7 +2140,7 @@ mod tests {
             test_config(
                 &trusted_root,
                 server.node_id(),
-                Some("tools.cat"),
+                true,
                 Crl::new(),
                 vec!["cat".to_string()],
             ),
@@ -2349,13 +2151,14 @@ mod tests {
         let mut err: Vec<u8> = Vec::new();
         // The responder refuses the handshake and drops the connection, so the
         // dialer's session fails (no child ran, nothing on stdout).
-        let result = connect_on(
+        let result = call_on(
             client_ep,
             addr,
             membership,
             Some(grant),
             None,  // proof
             false, // ticketed
+            invoke_test_tool(),
             std::io::Cursor::new(Vec::new()),
             &mut out,
             &mut err,
@@ -2386,7 +2189,7 @@ mod tests {
             test_config(
                 &trusted_root,
                 server.node_id(),
-                None,
+                false,
                 Crl::new(),
                 vec![
                     "sh".to_string(),
@@ -2399,13 +2202,14 @@ mod tests {
         let client_ep = test_endpoint(&client).await;
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
-        let result = connect_on(
+        let result = call_on(
             client_ep,
             addr,
             membership,
             None,
             None, // proof
             true, // ticket-less
+            invoke_test_tool(),
             std::io::Cursor::new(Vec::new()),
             &mut out,
             &mut err,
@@ -2431,21 +2235,21 @@ mod tests {
         let (head, proofs) = roster.commit(root, 0, i64::MAX).unwrap();
         let proof = proofs.into_iter().find(|(m, _)| *m == member).unwrap().1;
         let config = ServeConfig {
-            tools: Default::default(),
             audit: None,
             identity: None,
             trust_root: root.node_id(),
-            scope: None,
+            require_grant: false,
             crl: CrlSource::Fixed(Crl::new()),
             head: HeadSource::Fixed(head),
             membership: Membership::mint(root, server, 0, i64::MAX).unwrap(),
             proof: None,
-            command,
+            tools: tool_map(command),
         };
         (config, proof)
     }
 
-    /// Drive `serve_session` against a one-shot handshake; returns the result.
+    /// Drive `serve_session` against a one-shot handshake (and an invocation of
+    /// [`TEST_TOOL`]); returns the result.
     async fn serve_once(config: ServeConfig, caller: NodeId, handshake: Frame) -> Result<()> {
         serve_once_with(&config, caller, handshake).await
     }
@@ -2453,7 +2257,7 @@ mod tests {
     /// [`serve_once`] against a *borrowed* config, for tests that dial the same
     /// long-lived `ServeConfig` more than once.
     async fn serve_once_with(config: &ServeConfig, caller: NodeId, handshake: Frame) -> Result<()> {
-        let recv = std::io::Cursor::new(handshake.encode().unwrap());
+        let recv = std::io::Cursor::new(opening(handshake));
         let send: Vec<u8> = Vec::new();
         serve_session(send, recv, caller, config, never()).await
     }
@@ -2570,20 +2374,19 @@ mod tests {
         let server_ep = test_endpoint(&server).await;
         let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
         let config = ServeConfig {
-            tools: Default::default(),
             audit: None,
             identity: None,
             trust_root: root.node_id(),
-            scope: None,
+            require_grant: false,
             crl: CrlSource::Fixed(Crl::new()),
             head: HeadSource::Fixed(head),
             membership: Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
             proof: None,
-            command: vec![
+            tools: tool_map(vec![
                 "sh".to_string(),
                 "-c".to_string(),
                 r#"printf "%s,%s" "$WIRES_CALLER_NODE" "$WIRES_ROSTER_VERSION""#.to_string(),
-            ],
+            ]),
         };
         let srv = tokio::spawn(serve_on(server_ep, config));
 
@@ -2591,13 +2394,14 @@ mod tests {
         let membership = Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = connect_on(
+        let code = call_on(
             client_ep,
             addr,
             membership,
             None,
             Some(client_proof),
             true, // ticket-less
+            invoke_test_tool(),
             std::io::Cursor::new(Vec::new()),
             &mut out,
             &mut err,
@@ -2635,20 +2439,19 @@ mod tests {
         let server_ep = test_endpoint(&server).await;
         let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
         let config = ServeConfig {
-            tools: Default::default(),
             audit: None,
             identity: None,
             trust_root: root.node_id(),
-            scope: None,
+            require_grant: false,
             crl: CrlSource::Fixed(Crl::new()),
             head: HeadSource::Fixed(v2),
             membership: Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
             proof: None,
-            command: vec![
+            tools: tool_map(vec![
                 "sh".to_string(),
                 "-c".to_string(),
                 "echo SHOULD_NOT_RUN".to_string(),
-            ],
+            ]),
         };
         let srv = tokio::spawn(serve_on(server_ep, config));
 
@@ -2656,13 +2459,14 @@ mod tests {
         let membership = Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let result = connect_on(
+        let result = call_on(
             client_ep,
             addr,
             membership,
             None,
             Some(client_proof),
             true,
+            invoke_test_tool(),
             std::io::Cursor::new(Vec::new()),
             &mut out,
             &mut err,
@@ -2695,28 +2499,28 @@ mod tests {
             let addr =
                 endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
             let config = ServeConfig {
-                tools: Default::default(),
                 audit: None,
                 identity: None,
                 trust_root,
-                scope: None,
+                require_grant: false,
                 crl: CrlSource::Fixed(Crl::new()),
                 head: HeadSource::None,
                 membership: Membership::mint(signer, server.node_id(), 0, i64::MAX).unwrap(),
                 proof: None,
-                command: vec!["cat".to_string()],
+                tools: tool_map(vec!["cat".to_string()]),
             };
             let srv = tokio::spawn(serve_on(server_ep, config));
             let client_ep = test_endpoint(client).await;
             let mut out = Vec::new();
             let mut err = Vec::new();
-            let code = connect_on(
+            let code = call_on(
                 client_ep,
                 addr,
                 client_membership,
                 None,
                 None,
                 true, // ticket-less → verify the responder
+                invoke_test_tool(),
                 std::io::Cursor::new(b"ping".to_vec()),
                 &mut out,
                 &mut err,
@@ -2733,21 +2537,21 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Multi-tool mode (`serve --expose`, `call_on`)
+    // Tools (`serve --expose`, `call_on`)
     // -----------------------------------------------------------------------
 
     use library::Argv;
 
     /// A multi-tool responder config: `server` is a member under `root`, the
-    /// tools are `(name, argv)` pairs, and `scope` is `Some(TOOL_SCOPE_ANY)` for
-    /// a grant-gated responder or `None` for `--allow-any-member`.
+    /// tools are `(name, argv)` pairs, and `require_grant` is `true` for a
+    /// grant-gated responder or `false` for `--allow-any-member`.
     fn tools_config(
         root: &NodeIdentity,
         server: NodeId,
-        scope: Option<&str>,
+        require_grant: bool,
         tools: &[(&str, &[&str])],
     ) -> ServeConfig {
-        let mut config = test_config(root, server, scope, Crl::new(), Vec::new());
+        let mut config = test_config(root, server, require_grant, Crl::new(), Vec::new());
         config.tools = tools
             .iter()
             .map(|(name, argv)| {
@@ -2775,7 +2579,7 @@ mod tests {
         config: ServeConfig,
         root: &NodeIdentity,
         grant_scope: Option<&str>,
-        invocation: Option<Invocation>,
+        invocation: Invocation,
         input: &[u8],
     ) -> (Result<i32>, Vec<u8>, Vec<u8>) {
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
@@ -2842,12 +2646,7 @@ mod tests {
     async fn invoke_execs_the_tool_argv_plus_args_literally() {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
-        let config = tools_config(
-            &root,
-            server,
-            Some(TOOL_SCOPE_ANY),
-            &[("lines", &["printf", "%s\\n"])],
-        );
+        let config = tools_config(&root, server, true, &[("lines", &["printf", "%s\\n"])]);
         let args = [
             "two words",
             "'single'",
@@ -2863,7 +2662,7 @@ mod tests {
             config,
             &root,
             Some("tool:lines"),
-            Some(invoke("lines", &args)),
+            invoke("lines", &args),
             b"",
         )
         .await;
@@ -2879,16 +2678,16 @@ mod tests {
         let config = tools_config(
             &root,
             server,
-            None,
+            false,
             &[("who", &["sh", "-c", "printf '%s:' \"$WIRES_TOOL\"; cat"])],
         );
-        let (res, out, _) = run_call(config, &root, None, Some(invoke("who", &[])), b"piped").await;
+        let (res, out, _) = run_call(config, &root, None, invoke("who", &[]), b"piped").await;
         assert_eq!(res.unwrap(), 0);
         assert_eq!(out, b"who:piped");
     }
 
     #[tokio::test]
-    async fn multi_tool_responder_requires_an_invoke() {
+    async fn a_responder_requires_an_invoke() {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
@@ -2902,7 +2701,7 @@ mod tests {
             vec![handshake.clone()],
             vec![handshake, Frame::Stdin(Chunk::from_bytes(b"x".to_vec()))],
         ] {
-            let config = tools_config(&root, server, None, &[("a", &["cat"])]);
+            let config = tools_config(&root, server, false, &[("a", &["cat"])]);
             let (res, back) = serve_raw(config, caller, &frames).await;
             assert!(res.is_err());
             assert_eq!(
@@ -2924,9 +2723,9 @@ mod tests {
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
         let (sink, mut records) = AuditSink::channel(16);
 
-        let mut config = tools_config(&root, server, None, &[("say", &["printf", "%s"])]);
+        let mut config = tools_config(&root, server, false, &[("say", &["printf", "%s"])]);
         config.audit = Some(sink.clone());
-        let (res, out, _) = run_call(config, &root, None, Some(invoke("say", &["hi"])), b"").await;
+        let (res, out, _) = run_call(config, &root, None, invoke("say", &["hi"]), b"").await;
         assert_eq!(res.unwrap(), 0);
         assert_eq!(out, b"hi");
         match records.recv().await.unwrap() {
@@ -2950,9 +2749,9 @@ mod tests {
             other => panic!("expected Finished, got {other:?}"),
         }
 
-        let mut config = tools_config(&root, server, None, &[("say", &["printf", "%s"])]);
+        let mut config = tools_config(&root, server, false, &[("say", &["printf", "%s"])]);
         config.audit = Some(sink);
-        let (res, _, _) = run_call(config, &root, None, Some(invoke("nope", &[])), b"").await;
+        let (res, _, _) = run_call(config, &root, None, invoke("nope", &[]), b"").await;
         let reason = denied_reason(res);
         match records.recv().await.unwrap() {
             AuditRecord::Denied {
@@ -2969,26 +2768,9 @@ mod tests {
     async fn unknown_tool_is_refused_by_name() {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
-        let config = tools_config(&root, server, None, &[("a", &["cat"])]);
-        let (res, out, _) = run_call(config, &root, None, Some(invoke("nope", &[])), b"").await;
+        let config = tools_config(&root, server, false, &[("a", &["cat"])]);
+        let (res, out, _) = run_call(config, &root, None, invoke("nope", &[]), b"").await;
         assert_eq!(denied_reason(res), "unknown tool: nope");
-        assert!(out.is_empty());
-    }
-
-    #[tokio::test]
-    async fn single_command_responder_refuses_an_invoke() {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
-        let config = test_config(&root, server, None, Crl::new(), vec!["cat".to_string()]);
-        let (res, out, _) = run_call(
-            config,
-            &root,
-            None,
-            Some(invoke("cat", &[])),
-            b"never forwarded",
-        )
-        .await;
-        assert_eq!(denied_reason(res), DENY_SINGLE_COMMAND);
         assert!(out.is_empty());
     }
 
@@ -2999,10 +2781,10 @@ mod tests {
         let tools: &[(&str, &[&str])] = &[("a", &["printf", "A"]), ("b", &["printf", "B"])];
 
         let (res, out, _) = run_call(
-            tools_config(&root, server, Some(TOOL_SCOPE_ANY), tools),
+            tools_config(&root, server, true, tools),
             &root,
             Some("tool:a"),
-            Some(invoke("a", &[])),
+            invoke("a", &[]),
             b"",
         )
         .await;
@@ -3010,10 +2792,10 @@ mod tests {
         assert_eq!(out, b"A");
 
         let (res, out, _) = run_call(
-            tools_config(&root, server, Some(TOOL_SCOPE_ANY), tools),
+            tools_config(&root, server, true, tools),
             &root,
             Some("tool:a"),
-            Some(invoke("b", &[])),
+            invoke("b", &[]),
             b"",
         )
         .await;
@@ -3029,10 +2811,10 @@ mod tests {
         let tools: &[(&str, &[&str])] = &[("a", &["printf", "A"]), ("b", &["printf", "B"])];
         for (tool, want) in [("a", b"A"), ("b", b"B")] {
             let (res, out, _) = run_call(
-                tools_config(&root, server, Some(TOOL_SCOPE_ANY), tools),
+                tools_config(&root, server, true, tools),
                 &root,
                 Some(TOOL_SCOPE_ANY),
-                Some(invoke(tool, &[])),
+                invoke(tool, &[]),
                 b"",
             )
             .await;
@@ -3048,10 +2830,10 @@ mod tests {
         let tools: &[(&str, &[&str])] = &[("a", &["printf", "A"])];
         for grant in [None, Some("tools.a"), Some("a")] {
             let (res, out, _) = run_call(
-                tools_config(&root, server, Some(TOOL_SCOPE_ANY), tools),
+                tools_config(&root, server, true, tools),
                 &root,
                 grant,
-                Some(invoke("a", &[])),
+                invoke("a", &[]),
                 b"",
             )
             .await;
@@ -3067,11 +2849,11 @@ mod tests {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
-        let mut config = tools_config(&root, server, None, &[("a", &["cat"])]);
+        let mut config = tools_config(&root, server, false, &[("a", &["cat"])]);
         let mut crl = Crl::new();
         crl.insert(caller);
         config.crl = CrlSource::Fixed(crl);
-        let (res, _, _) = run_call(config, &root, None, Some(invoke("nope", &[])), b"").await;
+        let (res, _, _) = run_call(config, &root, None, invoke("nope", &[]), b"").await;
         let reason = denied_reason(res);
         assert!(reason.contains("revoked"), "{reason}");
     }
@@ -3126,12 +2908,12 @@ mod tests {
             let (res, out, _) = rt.block_on(async {
                 let root = NodeIdentity::from_seed([1u8; 32]);
                 let server = NodeIdentity::from_seed([4u8; 32]).node_id();
-                let config = tools_config(&root, server, None, &[("echo", &["printf", "%s\\0", "MARK"])]);
+                let config = tools_config(&root, server, false, &[("echo", &["printf", "%s\\0", "MARK"])]);
                 let invocation = Invocation {
                     tool: ToolName::new("echo").unwrap(),
                     argv: Argv::new(args.clone()).unwrap(),
                 };
-                run_call(config, &root, None, Some(invocation), b"").await
+                run_call(config, &root, None, invocation, b"").await
             });
             proptest::prop_assert_eq!(res.unwrap(), 0);
             let mut expected = b"MARK\0".to_vec();
@@ -3143,7 +2925,7 @@ mod tests {
         }
     }
 
-    /// `serve --expose` + `connect --tool` over a real loopback endpoint: the
+    /// `serve --expose` + `wires call` over a real loopback endpoint: the
     /// tools map comes from the same parser the CLI uses, the caller holds a
     /// `tool:shout` grant, and `call_on` carries the invocation.
     #[tokio::test]
@@ -3157,13 +2939,7 @@ mod tests {
 
         let server_ep = test_endpoint(&server).await;
         let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
-        let mut config = test_config(
-            &root,
-            server.node_id(),
-            Some(TOOL_SCOPE_ANY),
-            Crl::new(),
-            Vec::new(),
-        );
+        let mut config = test_config(&root, server.node_id(), true, Crl::new(), Vec::new());
         config.tools = exposed_tools(
             &[
                 "shout=tr a-z A-Z".to_string(),

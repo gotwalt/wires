@@ -851,7 +851,7 @@ where
 /// [`AdmitHandler::admitted`] and any newer head it presented is persisted
 /// through the same compare-and-swap; a `Denied` frame comes back as an error
 /// carrying the responder's stated reason, which the CLI reports the way
-/// `connect` reports a refusal (exit 77).
+/// `call` reports a refusal (exit 77).
 pub async fn request_admission<S, R>(
     mut send: S,
     mut recv: R,

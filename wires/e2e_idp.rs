@@ -125,7 +125,7 @@ async fn log_in_and_publish(
     relay.broadcast(&envelope).await.unwrap();
 }
 
-/// One `wires connect`-style call from `m` to `target`, stdin `ping`.
+/// One `wires call cat` from `m` to `target`, stdin `ping`.
 async fn call_as(
     m: &Member,
     fab: &Fabric,
@@ -141,13 +141,17 @@ async fn call_as(
     let mut err = Vec::new();
     let result = timeout(
         PATIENCE,
-        crate::transport::connect_on(
+        crate::transport::call_on(
             endpoint,
             target.clone(),
             library::Membership::mint(&fab.root, m.id(), 0, i64::MAX).unwrap(),
             None,
             Some(fab.at(version).proofs[&m.id()].clone()),
             false,
+            library::Invocation {
+                tool: library::ToolName::new("cat").unwrap(),
+                argv: library::Argv::new(Vec::new()).unwrap(),
+            },
             std::io::Cursor::new(b"ping".to_vec()),
             &mut out,
             &mut err,
@@ -266,7 +270,7 @@ async fn require_idp_admits_verified_federated_identities_only() {
     let r_membership = library::Membership::mint(&fab.root, r.id(), 0, i64::MAX).unwrap();
     let serve = ServeConfig {
         trust_root: fab.id(),
-        scope: None,
+        require_grant: false,
         crl: CrlSource::Fixed(library::Crl::new()),
         head: HeadSource::Keystore {
             path: r.keystore.path("roster-head.json"),
@@ -274,8 +278,10 @@ async fn require_idp_admits_verified_federated_identities_only() {
         },
         membership: r_membership.clone(),
         proof: None,
-        command: vec!["cat".to_string()],
-        tools: Default::default(),
+        tools: std::collections::BTreeMap::from([(
+            library::ToolName::new("cat").unwrap(),
+            vec!["cat".to_string()],
+        )]),
         audit: Some(sink),
         identity: Some(Arc::new(IdentityGate::new(
             Arc::clone(&identities),

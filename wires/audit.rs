@@ -63,10 +63,6 @@ use crate::transport::{self, AuditSink};
 /// the sink starts dropping (and logging) them.
 pub const AUDIT_QUEUE: usize = 256;
 
-/// The tool name a single-command responder (`wires serve -- <cmd>`) reports:
-/// it exposes exactly one CLI, bridged over stdio, under no name of its own.
-pub const STDIO_TOOL: &str = "stdio";
-
 /// Unix milliseconds now (the `at_ms` of a record).
 pub fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -74,11 +70,6 @@ pub fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-/// The [`ToolName`] for [`STDIO_TOOL`].
-pub fn stdio_tool() -> ToolName {
-    ToolName::new(STDIO_TOOL).expect("\"stdio\" is a valid tool name")
 }
 
 /// Record a refusal of `caller` (asking for `tool`, if it named one) with the
@@ -318,6 +309,11 @@ mod tests {
         }
     }
 
+    /// The tool the sample calls invoke.
+    fn db_query() -> ToolName {
+        ToolName::new("db_query").unwrap()
+    }
+
     fn samples() -> Vec<AuditRecord> {
         let call = CallId::from_hex("0123456789abcdef0123456789abcdef").unwrap();
         vec![
@@ -325,7 +321,7 @@ mod tests {
                 call,
                 caller: caller(),
                 principal: None,
-                tool: stdio_tool(),
+                tool: db_query(),
                 argv: Argv::new(vec!["-n".into()]).unwrap(),
                 roster_version: Some(1),
                 at_ms: 1,
@@ -398,7 +394,7 @@ mod tests {
 
     #[test]
     fn no_sink_means_no_records_and_no_handle() {
-        assert!(CallAudit::start(None, caller(), None, stdio_tool(), &[], None).is_none());
+        assert!(CallAudit::start(None, caller(), None, db_query(), &[], None).is_none());
         denied(None, caller(), None, "whatever"); // must not panic
     }
 
@@ -424,7 +420,7 @@ mod tests {
             Some(&sink),
             caller(),
             Some(alice()),
-            stdio_tool(),
+            db_query(),
             &["a b".to_string()],
             Some(7),
         )
@@ -453,7 +449,7 @@ mod tests {
         };
         assert_eq!(c, caller());
         assert_eq!(principal, Some(alice()), "the record names the person");
-        assert_eq!(tool.as_str(), "stdio");
+        assert_eq!(tool.as_str(), "db_query");
         assert_eq!(argv.as_slice(), ["a b"]);
         assert_eq!(roster_version, Some(7));
         let Ok(AuditRecord::Finished {

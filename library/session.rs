@@ -31,10 +31,9 @@
 //! | `6`  | `Denied`    | UTF-8 reason bytes                         |
 //! | `7`  | `Invoke`    | canonical-JSON of the [`Invocation`]       |
 //!
-//! A dialer calling a multi-tool responder sends [`Frame::Invoke`] immediately
-//! after its `Handshake`, without waiting for the ack — the responder reads
-//! both, authorizes them together, and only then answers with `HandshakeAck`
-//! or `Denied`. A single-command responder never expects one.
+//! A dialer sends [`Frame::Invoke`] immediately after its `Handshake`, without
+//! waiting for the ack — the responder reads both, authorizes them together,
+//! and only then answers with `HandshakeAck` or `Denied`.
 //!
 //! The handshake envelope is the canonical JSON of a [`Membership`] plus an
 //! optional [`Grant`]. The envelope itself is *unsigned* — the signed objects

@@ -1303,6 +1303,22 @@ async fn next_record(
     }
 }
 
+/// The responder's one tool: `--expose cat=cat`.
+fn cat_tool() -> BTreeMap<library::ToolName, Vec<String>> {
+    BTreeMap::from([(
+        library::ToolName::new("cat").unwrap(),
+        vec!["cat".to_string()],
+    )])
+}
+
+/// A call of [`cat_tool`] with no arguments (`wires call cat`).
+fn cat_invocation() -> library::Invocation {
+    library::Invocation {
+        tool: library::ToolName::new("cat").unwrap(),
+        argv: library::Argv::new(Vec::new()).unwrap(),
+    }
+}
+
 /// **Card 02.** R serves `cat` with `--audit-topic ops`, hosting the topic
 /// node itself (the session ALPN on the same router); O tails `ops`; C calls.
 /// O sees `Started` (caller = C, as iroh authenticated it) then `Finished`
@@ -1333,7 +1349,7 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
     let r_membership = library::Membership::mint(&fab.root, r.id(), 0, i64::MAX).unwrap();
     let serve = ServeConfig {
         trust_root: fab.id(),
-        scope: None,
+        require_grant: false,
         crl: CrlSource::Fixed(library::Crl::new()),
         head: HeadSource::Keystore {
             path: r.keystore.path("roster-head.json"),
@@ -1341,8 +1357,7 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
         },
         membership: r_membership.clone(),
         proof: None,
-        command: vec!["cat".to_string()],
-        tools: Default::default(),
+        tools: cat_tool(),
         audit: Some(sink),
         identity: None,
     };
@@ -1431,13 +1446,14 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
             let mut err = Vec::new();
             let result = timeout(
                 PATIENCE,
-                crate::transport::connect_on(
+                crate::transport::call_on(
                     endpoint,
                     target,
                     membership,
                     None,
                     Some(proof),
                     false,
+                    cat_invocation(),
                     std::io::Cursor::new(b"hello, audit".to_vec()),
                     &mut out,
                     &mut err,
@@ -1467,8 +1483,8 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
         panic!("expected Started first, got {started:?}");
     };
     assert_eq!(caller, c.id(), "the caller iroh authenticated");
-    assert_eq!(tool.as_str(), "stdio");
-    assert!(argv.as_slice().is_empty(), "`cat` has no fixed args");
+    assert_eq!(tool.as_str(), "cat");
+    assert!(argv.as_slice().is_empty(), "C passed no arguments");
     assert_eq!(roster_version, Some(v1.0));
 
     let finished = next_record(&mut rx_o, &mut keyring).await;
@@ -1522,7 +1538,11 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
         panic!("expected Denied, got {denied:?}");
     };
     assert_eq!(caller, c.id());
-    assert_eq!(tool, None, "single-command mode: the caller named no tool");
+    assert_eq!(
+        tool.as_ref().map(library::ToolName::as_str),
+        Some("cat"),
+        "the refusal names the tool C asked for"
+    );
     assert_eq!(reason, told, "the record carries the reason C was sent");
     assert!(reason.contains("roster inclusion rejected"), "{reason}");
 
@@ -1567,7 +1587,7 @@ fn hosted_responder(
     let membership = library::Membership::mint(&fab.root, r.id(), 0, i64::MAX).unwrap();
     let serve = ServeConfig {
         trust_root: fab.id(),
-        scope: None,
+        require_grant: false,
         crl: CrlSource::Fixed(library::Crl::new()),
         head: HeadSource::Keystore {
             path: r.keystore.path("roster-head.json"),
@@ -1575,8 +1595,7 @@ fn hosted_responder(
         },
         membership: membership.clone(),
         proof: None,
-        command: vec!["cat".to_string()],
-        tools: Default::default(),
+        tools: cat_tool(),
         audit: Some(sink),
         identity: None,
     };
@@ -1643,13 +1662,14 @@ async fn call_cat(
     let mut err = Vec::new();
     let result = timeout(
         PATIENCE,
-        crate::transport::connect_on(
+        crate::transport::call_on(
             endpoint,
             target,
             membership,
             None,
             Some(proof),
             false,
+            cat_invocation(),
             std::io::Cursor::new(b"card 11".to_vec()),
             &mut out,
             &mut err,

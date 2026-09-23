@@ -1,15 +1,15 @@
 //! `wires` — the multi-call CLI for the session layer.
 //!
 //! Offline admin (`keygen` / `grant` / `revoke` / `import`) is built from pure
-//! functions over `library`; the network commands (`serve` / `connect`) run on
+//! functions over `library`; the network commands (`serve` / `call`) run on
 //! the iroh transport in [`transport`]. Secrets and the CRL resolve through
 //! flag → env → `--…-file` → on-disk keystore (see [`keystore`]), so the
 //! network commands work without seeds on the command line — and, once
-//! `wires import` has installed an agent's credentials, `wires connect --ticket
-//! <T>` needs no other flags, which is what lets it drop straight into an MCP
-//! client's config as `"command": "wires"`.
+//! `wires import` has installed an agent's credentials, `wires call <tool>`
+//! and `wires mcp` need no other flags, which is what lets `wires mcp` drop
+//! straight into an MCP client's config as `"command": "wires"`.
 //!
-//! `connect` keeps stdout **byte-pure** (only the bridged session bytes): every
+//! `call` keeps stdout **byte-pure** (only the remote CLI's bytes): every
 //! diagnostic goes to stderr, and the exit code carries the outcome —
 //! the child's own code on success, [`EXIT_DENIED`] when the responder refused
 //! the credentials, `1` for any local or transport failure.
@@ -89,10 +89,9 @@ enum Command {
     /// Install credentials (membership, inclusion proof, roster head, sealed
     /// fabric key) into the keystore.
     Import(ImportArgs),
-    /// Responder: verify a grant, exec a command, bridge its stdio.
+    /// Responder: expose CLIs as named tools, verify each caller, exec the
+    /// tool, bridge its stdio.
     Serve(ServeArgs),
-    /// Dial a capability and pipe local stdio over the session.
-    Connect(ConnectArgs),
     /// Publish a message to a topic (through a resident `wires tail`, or
     /// one-shot when none is running).
     Publish(PublishArgs),
@@ -294,8 +293,8 @@ struct RevokeArgs {
 ///
 /// This is the last provisioning step, and it is entirely offline. The operator
 /// mints tokens (`wires member`, `wires roster commit --out DIR`) and hands them
-/// over; the agent runs `wires import` **once**; after that `wires connect
-/// --ticket <T>` needs no other flags — which is what makes `wires` usable as a
+/// over; the agent runs `wires import` **once**; after that `wires call` and
+/// `wires mcp` need no other flags — which is what makes `wires` usable as a
 /// bare `command` in an MCP client config.
 #[derive(Args)]
 #[command(group(ArgGroup::new("creds").required(true).multiple(true)
@@ -335,7 +334,8 @@ struct ImportArgs {
     force: bool,
 }
 
-/// `serve` arguments: the responder key, what it trusts, and the child to exec.
+/// `serve` arguments: the responder key, what it trusts, and the tools it
+/// exposes.
 #[derive(Args)]
 struct ServeArgs {
     /// Hex 32-byte seed of this responder's node key. Falls back to
@@ -349,15 +349,10 @@ struct ServeArgs {
     /// honored.
     #[arg(long)]
     trust_root: String,
-    /// The scope this responder serves; a grant's scope must match exactly. Omit
-    /// for an inclusion-only responder (then `--allow-any-member` is required).
-    /// Not used with `--expose`, where a grant must be scoped `tool:<name>` or
-    /// `tool:*`.
-    #[arg(long, conflicts_with_all = ["expose", "expose_file"])]
-    scope: Option<String>,
-    /// Serve any fabric member when no `--scope` is set (inclusion-only). An
-    /// explicit acknowledgement of the authorization downgrade: the child execs
-    /// for any member and must authorize from the injected identity.
+    /// Serve any fabric member, with no grant (inclusion-only). An explicit
+    /// acknowledgement of the authorization downgrade: the tool execs for any
+    /// member and must authorize from the injected identity (or `--require-idp`
+    /// does).
     #[arg(long)]
     allow_any_member: bool,
     /// CRL JSON literal of revoked subjects (overrides `--crl-file` / keystore).
@@ -399,7 +394,11 @@ struct ServeArgs {
     /// `tool:NAME` (or `tool:*`) unless `--allow-any-member`. For a SQL tool
     /// use sqlite3's `-safe` flag (3.37+), which disables dot-commands like
     /// `.shell`/`.system`: `--expose 'db_query=sqlite3 -safe -readonly orders.db'`.
-    #[arg(long, value_name = "NAME=COMMAND")]
+    #[arg(
+        long,
+        value_name = "NAME=COMMAND",
+        required_unless_present = "expose_file"
+    )]
     expose: Vec<String>,
     /// Expose the tools in this JSON file, `{"NAME": ["program", "arg", …]}`,
     /// for argv that needs spaces. Combines with `--expose`.
@@ -431,71 +430,10 @@ struct ServeArgs {
     /// trusted too.
     #[arg(long, value_name = "URL")]
     oidc_issuer: Vec<String>,
-    /// The command (program + args) to exec per session, after `--`
-    /// (single-command mode; mutually exclusive with `--expose`).
-    #[arg(
-        last = true,
-        required_unless_present_any = ["expose", "expose_file"],
-        conflicts_with_all = ["expose", "expose_file"]
-    )]
-    command: Vec<String>,
-}
-
-/// `connect` arguments: the dialer key, its membership, and where to dial.
-///
-/// Exactly one of `--ticket` (a scoped session, grant from the ticket) or
-/// `--target` (an inclusion-only session, no grant) is required.
-#[derive(Args)]
-#[command(group(ArgGroup::new("dest").required(true).args(["ticket", "target"])))]
-struct ConnectArgs {
-    /// Hex 32-byte seed of this dialer's node key. Falls back to
-    /// `$WIRES_NODE_SEED`, then `--node-seed-file`, then the keystore (`node.seed`).
-    #[arg(long)]
-    node_seed: Option<String>,
-    /// Read the node key seed (hex) from this file instead of the keystore.
-    #[arg(long)]
-    node_seed_file: Option<PathBuf>,
-    /// Use a self-hosted relay at this URL instead of the n0 default.
-    #[arg(long)]
-    relay_url: Option<String>,
-    /// The base64 capability ticket (target + scope + grant) for a scoped
-    /// session. Mutually exclusive with `--target`.
-    #[arg(long)]
-    ticket: Option<String>,
-    /// Hex node id of the target for an inclusion-only session (membership only,
-    /// no grant). Mutually exclusive with `--ticket`.
-    #[arg(long)]
-    target: Option<String>,
-    /// Direct socket address where the `--target` is reachable, so the dialer
-    /// needs no discovery. Repeatable; only used with `--target`.
-    #[arg(long = "addr")]
-    addr: Vec<SocketAddr>,
-    /// The base64 membership token to present. Falls back to `$WIRES_MEMBERSHIP`,
-    /// then `--membership-file`, then the keystore (`membership.json`).
-    #[arg(long)]
-    membership: Option<String>,
-    /// Read the membership token from this file instead of the keystore.
-    #[arg(long)]
-    membership_file: Option<PathBuf>,
-    /// The inclusion proof token to present (required by a head-enforcing
-    /// responder). Falls back to `$WIRES_INCLUSION_PROOF`, then
-    /// `--inclusion-proof-file`, then the keystore (`inclusion-proof.json`).
-    #[arg(long)]
-    inclusion_proof: Option<String>,
-    /// Read the inclusion proof token from this file.
-    #[arg(long)]
-    inclusion_proof_file: Option<PathBuf>,
-    /// Call this tool on a multi-tool responder (`wires serve --expose`).
-    #[arg(long)]
-    tool: Option<String>,
-    /// Arguments for `--tool`, after `--`; appended to the tool's command on
-    /// the responder, never through a shell.
-    #[arg(last = true, requires = "tool")]
-    args: Vec<String>,
 }
 
 /// The arguments `publish` and `tail` share: which topic, who to bootstrap
-/// from, and the same credential resolution `connect` uses (spec §7.2).
+/// from, and the same credential resolution `call` uses (spec §7.2).
 ///
 /// The topic is a *name*, not an id: every member derives the same
 /// [`TopicId`] from its own membership's fabric plus this name, so there is no
@@ -660,9 +598,9 @@ fn resolve_not_after(
 }
 
 /// Exit code for an authorization refusal by the responder (sysexits
-/// `EX_NOPERM`), distinct from 1 = local/transport failure. An MCP client that
-/// wraps `wires connect` can tell "you are not allowed" apart from "the network
-/// is down" without parsing text.
+/// `EX_NOPERM`), distinct from 1 = local/transport failure. An agent running
+/// `wires call` can tell "you are not allowed" apart from "the network is
+/// down" without parsing text.
 const EXIT_DENIED: i32 = 77;
 
 /// Current unix time in seconds.
@@ -674,8 +612,8 @@ pub(crate) fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// `serve`: bind, verify membership (and, when scoped, a grant) against the
-/// trust root, exec + bridge. A missing `--scope` requires `--allow-any-member`.
+/// `serve`: bind, verify membership (and, unless `--allow-any-member`, a tool
+/// grant) against the trust root, exec the invoked tool + bridge.
 async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     init_logging();
     let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
@@ -698,17 +636,10 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         None => None,
     };
     let tools = transport::exposed_tools(&a.expose, a.expose_file.as_deref())?;
-    // Multi-tool: grants are per tool (`tool:<name>` / `tool:*`), so the served
-    // scope only says "a grant is required".
-    let scope = if tools.is_empty() {
-        a.scope.map(Scope::new)
-    } else {
-        (!a.allow_any_member).then(|| Scope::new(transport::TOOL_SCOPE_ANY))
-    };
-    if tools.is_empty() && scope.is_none() && !a.allow_any_member {
+    if tools.is_empty() {
         anyhow::bail!(
-            "refusing to serve: pass --scope <name>, or --allow-any-member for an \
-             inclusion-only responder (any fabric member may connect)"
+            "refusing to serve: nothing is exposed; pass --expose NAME=COMMAND (or \
+             --expose-file)"
         );
     }
     // Credential *sources*, not values: a file-backed CRL or head is re-read on
@@ -741,12 +672,11 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         audit: sink,
         identity: gate,
         trust_root,
-        scope,
+        require_grant: !a.allow_any_member,
         crl,
         head,
         membership,
         proof,
-        command: a.command,
     };
     match (audit_ctx, records) {
         (Some(ctx), Some(records)) => {
@@ -854,90 +784,13 @@ fn preflight(node: NodeId, membership: &Membership, grant: Option<&Grant>) -> Re
     Ok(())
 }
 
-/// `connect`: present the dialer's membership, dial the target (from a ticket or
-/// `--target`), present the ticket's grant when scoped, and bridge local stdio.
-/// Returns the child's exit code.
-async fn connect_cmd(a: ConnectArgs) -> anyhow::Result<i32> {
-    init_quiet_logging();
-    let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
-    let membership = keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?;
-    let proof = keystore::inclusion_proof(
-        a.inclusion_proof.as_deref(),
-        a.inclusion_proof_file.as_deref(),
-    )?;
-
-    // A bare `--target` (no ticket) is a ticket-less session: verify the
-    // responder's ack before streaming stdin.
-    let ticketless = a.ticket.is_none();
-
-    // Resolve where to dial and whether a grant rides along. The clap group
-    // guarantees exactly one of `--ticket` / `--target`.
-    let (target_id, addrs, grant, ticket_relay) = match a.ticket.as_deref() {
-        Some(text) => {
-            let t = CapabilityTicket::decode(text)
-                .context("--ticket (is the pasted base64 ticket complete?)")?;
-            (t.target, t.addrs, Some(t.grant), t.relay_url)
-        }
-        None => {
-            let id = NodeId::from_hex(
-                a.target
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("--ticket or --target is required"))?,
-            )?;
-            (id, a.addr.clone(), None, None)
-        }
-    };
-    // Fail locally, before any network I/O, when the credentials on hand were
-    // not issued to this node.
-    preflight(node.node_id(), &membership, grant.as_ref()).map_err(anyhow::Error::msg)?;
-
-    // `--relay-url` overrides the ticket's relay hint; both feed the dialed
-    // address and the endpoint's relay configuration.
-    let relay = a.relay_url.or(ticket_relay);
-    let target = transport::endpoint_addr(&target_id, &addrs, relay.as_deref())?;
-    if let Some(tool) = a.tool {
-        let invocation = library::Invocation {
-            tool: library::ToolName::new(tool.as_str())
-                .with_context(|| format!("--tool {tool:?}"))?,
-            argv: library::Argv::new(a.args).context("--tool arguments")?,
-        };
-        let endpoint = transport::bind(&node, relay.as_deref()).await?;
-        return transport::call_on(
-            endpoint,
-            target,
-            membership,
-            grant,
-            proof,
-            ticketless,
-            invocation,
-            tokio::io::stdin(),
-            tokio::io::stdout(),
-            tokio::io::stderr(),
-        )
-        .await;
-    }
-    transport::connect_io(
-        node,
-        target,
-        membership,
-        grant,
-        proof,
-        ticketless,
-        relay.as_deref(),
-        tokio::io::stdin(),
-        tokio::io::stdout(),
-        tokio::io::stderr(),
-    )
-    .await
-}
-
 /// Build a multi-threaded tokio runtime for the network subcommands.
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().expect("building tokio runtime")
 }
 
 /// Initialize tracing for the network subcommands, writing to **stderr** so it
-/// never corrupts `connect`'s piped stdout.
+/// never corrupts a command's piped stdout.
 ///
 /// The default filter is [`LOG_FILTER`]: wires' own startup / accept /
 /// reject lines print, while iroh's relay and discovery chatter stays out of an
@@ -947,7 +800,7 @@ fn init_logging() {
     init_logging_with(LOG_FILTER);
 }
 
-/// [`init_logging`] for the dialing commands (`call`, `mcp`, `connect`), whose
+/// [`init_logging`] for the dialing commands (`call`, `mcp`), whose
 /// stderr belongs to the remote CLI: [`QUIET_LOG_FILTER`] by default, so a
 /// successful call leaves nothing of wires' own on it.
 fn init_quiet_logging() {
@@ -996,12 +849,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Connect(a) => match runtime().block_on(connect_cmd(a)) {
-            Ok(code) => std::process::exit(code),
-            Err(e) => exit_with(e),
-        },
         // Both topic commands keep stdout for messages and report the same way
-        // `connect` does — including exit 77 when the refusal came from the
+        // `call` does — including exit 77 when the refusal came from the
         // roster rather than from the network.
         Command::Publish(a) => {
             if let Err(e) = runtime().block_on(publish_cmd(a)) {
@@ -1088,7 +937,6 @@ fn cli_admin(command: Command) -> Result<String, String> {
         Command::Revoke(a) => run_revoke_cmd(a).map_err(stringify),
         Command::Import(a) => run_import_cmd(a).map_err(|e| format!("{e:#}")),
         Command::Serve(_)
-        | Command::Connect(_)
         | Command::Publish(_)
         | Command::Tail(_)
         | Command::Call(_)
@@ -1587,7 +1435,7 @@ impl TopicContext {
                 )
             })?,
         };
-        // The same two consistency checks `connect` runs, for the same reason:
+        // The same two consistency checks `call` runs, for the same reason:
         // credentials issued to another node must not masquerade as a network
         // failure later.
         preflight(node.node_id(), &membership, None).map_err(anyhow::Error::msg)?;
@@ -3064,7 +2912,7 @@ mod tests {
     }
 
     #[test]
-    fn serve_takes_expose_or_a_command_but_not_both() {
+    fn serve_requires_an_exposed_tool() {
         let base = ["wires", "serve", "--trust-root", "00"];
         let parse = |extra: &[&str]| Cli::try_parse_from(base.iter().chain(extra));
         let Command::Serve(a) = parse(&["--expose", "a=cat", "--expose", "b=rg -n"])
@@ -3074,27 +2922,17 @@ mod tests {
             panic!("expected serve");
         };
         assert_eq!(a.expose, ["a=cat", "b=rg -n"]);
-        assert!(a.command.is_empty());
         assert!(parse(&["--expose-file", "t.json"]).is_ok());
-        assert!(parse(&["--", "cat"]).is_ok());
-        assert!(parse(&[]).is_err(), "neither --expose nor a command");
+        assert!(parse(&[]).is_err(), "nothing exposed");
+        // The single-command form and its `--scope` are gone.
+        assert!(parse(&["--", "cat"]).is_err());
         assert!(parse(&["--expose", "a=cat", "--", "cat"]).is_err());
         assert!(parse(&["--expose", "a=cat", "--scope", "s"]).is_err());
     }
 
     #[test]
-    fn connect_tool_takes_trailing_args() {
-        let cli = Cli::try_parse_from([
-            "wires", "connect", "--target", "00", "--tool", "db", "--", "-c", "select 1",
-        ])
-        .unwrap();
-        let Command::Connect(a) = cli.command else {
-            panic!("expected connect");
-        };
-        assert_eq!(a.tool.as_deref(), Some("db"));
-        assert_eq!(a.args, ["-c", "select 1"]);
-        // Arguments without a tool have nowhere to go.
-        assert!(Cli::try_parse_from(["wires", "connect", "--target", "00", "--", "x"]).is_err());
+    fn connect_is_gone() {
+        assert!(Cli::try_parse_from(["wires", "connect", "--target", "00"]).is_err());
     }
 
     #[test]
@@ -3927,7 +3765,7 @@ mod tests {
             }
             _ => panic!("expected tail"),
         }
-        // `--peer` is repeatable; the rest mirror `connect`.
+        // `--peer` is repeatable; the rest mirror `call`.
         let cli = Cli::try_parse_from([
             "wires",
             "tail",
@@ -4330,8 +4168,8 @@ mod tests {
             "ops",
             "--audit-peer",
             "t1",
-            "--",
-            "cat",
+            "--expose",
+            "cat=cat",
         ])
         .unwrap();
         match cli.command {
@@ -4367,8 +4205,8 @@ mod tests {
                 "ab",
                 "--audit-peer",
                 "t",
-                "--",
-                "cat"
+                "--expose",
+                "cat=cat"
             ])
             .is_err()
         );
