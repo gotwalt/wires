@@ -12,7 +12,7 @@
 //! - **observer** — `wires watch`: streams the channel ([`channel`], which
 //!   every role meets on).
 //!
-//! Secrets and the CRL resolve through flag → env → `--…-file` → on-disk
+//! Secrets resolve through flag → env → `--…-file` → on-disk
 //! keystore ([`admin::keystore`]), so once the admin's credentials are
 //! installed, `wires call <tool>` and `wires mcp` need no other flags — which
 //! is what lets `wires mcp` drop straight into an MCP client's config as
@@ -64,7 +64,7 @@ Admin — decides who's in (holds the root key):
   init      Start a fabric: root key, this node, the first commit, a channel
   invite    Add a node and print its one join token; re-key the channel
   remove    Drop a node; re-key the channel so the rest carry on untouched
-  advanced  Plumbing: keys, grants, memberships, roster, CRL, import, publish
+  advanced  Plumbing: memberships, roster, import, publish
 
 Host — decides what runs and who may run it:
   serve     Expose CLIs as named tools; verify every caller; record every call
@@ -108,8 +108,8 @@ enum Command {
     /// Remove a node (by `--name` label or id); the commit is published on the
     /// channel, and every host that adopts it refuses the node's next call.
     Remove(admin::invite::RemoveArgs),
-    /// Plumbing for every role: keys, grants, memberships, the roster, the
-    /// CRL, credential import, and publishing to a channel.
+    /// Plumbing for every role: memberships, the roster, credential import,
+    /// and publishing to a channel.
     Advanced(advanced::AdvancedArgs),
 
     // --- host ---
@@ -407,7 +407,7 @@ mod tests {
         let lines = help.lines().count();
         assert!(lines <= 30, "{lines} lines:\n{help}");
         // The plumbing is not on it.
-        for plumbing in ["keygen", "grant", "roster", "import", "tail"] {
+        for plumbing in ["member", "roster", "import", "tail"] {
             assert!(
                 !help.contains(&format!("  {plumbing} ")),
                 "{plumbing} is listed:\n{help}"
@@ -444,9 +444,7 @@ mod tests {
     /// `tail` is `watch` (with `advanced tail` kept as a hidden alias).
     #[test]
     fn plumbing_is_under_advanced() {
-        for old in [
-            "keygen", "grant", "member", "roster", "revoke", "import", "publish", "tail",
-        ] {
+        for old in ["member", "roster", "import", "publish", "tail"] {
             assert!(
                 Cli::try_parse_from(["wires", old, "--help"])
                     .is_err_and(|e| e.kind() == ErrorKind::InvalidSubcommand),
@@ -459,5 +457,18 @@ mod tests {
             );
         }
         assert!(Cli::try_parse_from(["wires", "watch", "ops"]).is_ok());
+    }
+
+    /// Card 25: grants, the CRL and loose key generation are gone (`wires
+    /// id` / `init` make keys; roster removal replaces revocation).
+    #[test]
+    fn removed_plumbing_is_gone() {
+        for gone in ["keygen", "grant", "revoke"] {
+            assert!(
+                Cli::try_parse_from(["wires", "advanced", gone, "--help"])
+                    .is_err_and(|e| e.kind() == ErrorKind::InvalidSubcommand),
+                "`wires advanced {gone}` still parses"
+            );
+        }
     }
 }

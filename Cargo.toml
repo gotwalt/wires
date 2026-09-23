@@ -3,12 +3,12 @@ resolver = "2"
 members = [
     "library",
     "wires",
-    "relay",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.91"
 
 [workspace.dependencies]
 library = { path = "library" }
@@ -23,7 +23,6 @@ rand = "0.8"
 blake3 = "1"
 proptest = "1"
 iroh = "1.0.3"
-iroh-relay = { version = "1.0.3", features = ["server"] }
 iroh-gossip = "0.101"
 redb = "4"
 x25519-dalek = { version = "3", features = ["static_secrets"] }

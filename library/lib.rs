@@ -6,32 +6,31 @@
 //! [`error`] (and the private canonical-JSON `codec`):
 //!
 //! - `membership/` — who is in: identities, memberships, the committed
-//!   roster, grants, tickets, the accept gates, and the per-commit fabric key.
+//!   roster, the accept gates, and the per-commit fabric key.
 //! - `channel/` — the encrypted channel: topic ids, envelopes, the chain
 //!   rules, admission, replay, and the records that ride it.
 //! - `calls/` — remote CLI calls: the session frames, invocations, audit
 //!   records, and IdP identity claims.
 //!
 //! The folders are a filing system, not a namespace: every module is still
-//! declared here at the crate root (`library::grant`, `library::topic`, …),
+//! declared here at the crate root (`library::roster`, `library::topic`, …),
 //! so the public paths and the re-exports below are the same as before the
 //! folders existed.
 //!
-//! The module layout mirrors the shared mechanics of `docs/committed-roster.md`:
+//! The module layout mirrors the shared mechanics of `docs/protocol.md`:
 //!
-//! - [`identity`] — the Ed25519 [`NodeIdentity`] and the [`NodeId`] / [`Signature`]
-//!   byte-newtypes.
-//! - [`grant`] — root-signed, identity-bound, scoped, expiring [`Grant`]s.
+//! - [`identity`] — the Ed25519 [`NodeIdentity`], the [`NodeId`] / [`Signature`]
+//!   byte-newtypes, and the [`AlgorithmId`] every signed object carries.
 //! - [`membership`] — root-signed, offline-verifiable [`Membership`] proof that a
 //!   node belongs to a fabric (scope-independent identity).
 //! - [`roster`] — the root-signed, versioned [`Roster`] commitment: the
 //!   [`RosterHead`], the Merkle [`InclusionProof`], and offline verification.
-//! - [`ticket`] — the base64 [`CapabilityTicket`] a dialer presents (the address).
-//! - [`policy`] — [`check_accept`] and [`check_inclusion`], the responder's gates.
-//! - [`session`] — the [`Frame`] wire codec (the async transport lands later).
+//! - [`policy`] — [`check_inclusion`] and [`check_roster_inclusion`], the
+//!   responder's gates.
+//! - [`session`] — the [`Frame`] wire codec (the async transport is in `wires`).
 //! - [`error`] — the crate [`Error`] and [`Result`].
 //!
-//! Multiway topics (`docs/phase2-topics.md`) build on the same pieces:
+//! The encrypted channel builds on the same pieces:
 //!
 //! - [`topic`] — the derived [`TopicId`] and the unsigned [`TopicTicket`].
 //! - [`fabric_key`] — the [`FabricKey`] minted per roster commit and its
@@ -59,29 +58,6 @@
 //! - [`idp`] — [`IdentityClaim`]: an IdP-signed ID token bound to a node key,
 //!   and [`verify_claim`], which every reader runs against the issuer's [`Jwks`].
 //! - [`record`] — [`ChannelRecord`], how both ride a topic as message text.
-//!
-//! # Example: mint a capability, pack a ticket, accept it
-//!
-//! ```
-//! use library::{check_accept, CapabilityTicket, Crl, Grant, NodeIdentity, Scope};
-//!
-//! // The fabric root, the agent being granted access, and the tool node.
-//! let root = NodeIdentity::generate();
-//! let agent = NodeIdentity::generate();
-//! let target = NodeIdentity::generate().node_id();
-//!
-//! // Root mints a non-transferable grant binding the agent to a scope.
-//! let scope = Scope::new("tools.rg");
-//! let grant = Grant::mint(&root, agent.node_id(), scope.clone(), i64::MAX).unwrap();
-//!
-//! // Pack it into a ticket (the address the dialer presents) and round-trip it.
-//! let ticket = CapabilityTicket::new(target, scope, grant.clone());
-//! let decoded = CapabilityTicket::decode(&ticket.encode().unwrap()).unwrap();
-//! assert_eq!(decoded, ticket);
-//!
-//! // The responder accepts only when the authenticated caller is the subject.
-//! assert!(check_accept(&grant, root.node_id(), agent.node_id(), 0, &Crl::new()).is_ok());
-//! ```
 //!
 //! # Example: commit a roster, publish to a topic, read it back
 //!
@@ -156,8 +132,6 @@ pub mod error;
 // membership/ — who is in.
 #[path = "membership/fabric_key.rs"]
 pub mod fabric_key;
-#[path = "membership/grant.rs"]
-pub mod grant;
 #[path = "membership/identity.rs"]
 pub mod identity;
 #[path = "membership/invite.rs"]
@@ -170,8 +144,6 @@ pub mod policy;
 pub mod rekey;
 #[path = "membership/roster.rs"]
 pub mod roster;
-#[path = "membership/ticket.rs"]
-pub mod ticket;
 
 // channel/ — the encrypted channel.
 #[path = "channel/admission.rs"]
@@ -230,8 +202,7 @@ pub use envelope::{
 };
 pub use error::{Error, IdTokenError, Result};
 pub use fabric_key::{FabricKey, SEALED_KEY_CONTEXT, SEALED_KEY_V1, SealedBox, SealedFabricKey};
-pub use grant::{AlgorithmId, Grant, Scope};
-pub use identity::{NodeId, NodeIdentity, Signature};
+pub use identity::{AlgorithmId, NodeId, NodeIdentity, Signature};
 pub use idp::{
     Audience, CLOCK_SKEW_SECS, IdToken, IdentityClaim, Issuer, Jwk, Jwks, OIDC_NONCE_CONTEXT,
     OidcNonce, Principal, verify_claim,
@@ -239,7 +210,7 @@ pub use idp::{
 pub use invite::{INVITE_V1, Invite};
 pub use invoke::{Argv, Invocation, MAX_ARGS, MAX_ARGV_BYTES, MAX_TOOL_NAME, ToolName};
 pub use membership::{MEMBERSHIP_V1, Membership};
-pub use policy::{Crl, check_accept, check_inclusion, check_roster_inclusion};
+pub use policy::{check_inclusion, check_roster_inclusion};
 pub use push::{
     INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_FRAME, MAX_PUSH_BODY, MAX_SUBJECT, PushBody,
     PushId, PushMessage, Subject,
@@ -253,7 +224,6 @@ pub use roster::{
     InclusionProof, MerkleRoot, MerkleStep, ROSTER_HEAD_V1, Roster, RosterHead, RosterVersion, Side,
 };
 pub use session::{Chunk, Frame};
-pub use ticket::CapabilityTicket;
 pub use topic::{TopicId, TopicPeer, TopicTicket};
 
 /// Crate version, surfaced so the binaries have something concrete to call

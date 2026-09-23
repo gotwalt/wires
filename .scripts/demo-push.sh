@@ -54,8 +54,8 @@ done
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
-WIRES="${WIRES_BIN:-$repo/bazel-bin/wires/wires}"
-WIRES_DEV="${WIRES_DEV_BIN:-$repo/bazel-bin/wires/wires_dev}"
+WIRES="${WIRES_BIN:-$repo/target/release/wires}"
+WIRES_DEV="${WIRES_DEV_BIN:-$repo/target/release/wires-mock-idp}"
 TOPIC="ops"
 EMAIL="alice@example.com"
 JOB_SECS=3
@@ -122,9 +122,13 @@ alive() { kill -0 "$1" 2>/dev/null; }
 # The agent: locked mode, so it can steer nothing but the tool and its args.
 agent_wires() { WIRES_HOME="$agent" WIRES_LOCKED=1 "$WIRES" "$@"; }
 
-if [ ! -x "$WIRES" ] || [ ! -x "$WIRES_DEV" ]; then
-	say "building //wires:wires and //wires:wires_dev (first run) ..."
-	bazel build //wires:wires //wires:wires_dev >/dev/null 2>&1
+if [ -z "${WIRES_BIN:-}" ]; then
+	say "cargo build --release (the mock-IdP build first, then the shipped one) ..."
+	# Both builds write target/release/wires: copy the feature build aside first.
+	# rm before cp: overwriting a signed binary in place gets it killed on macOS.
+	(cd "$repo" && cargo build -q --release -p wires --features dev-mock-idp)
+	rm -f "$WIRES_DEV" && cp "$repo/target/release/wires" "$WIRES_DEV"
+	(cd "$repo" && cargo build -q --release -p wires)
 fi
 command -v curl >/dev/null || bad "curl is not on PATH"
 command -v perl >/dev/null || bad "perl is not on PATH (the mock CI's clock)"

@@ -17,8 +17,8 @@
 #                `wires remove agent` -- re-keys ride the channel, so nobody
 #                imports anything.
 #
-# The IdP is a hermetic loopback OIDC issuer (`wires dev-mock-idp`, built only
-# into //wires:wires_dev -- never the shipped binary). `wires login
+# The IdP is a hermetic loopback OIDC issuer (`wires dev-mock-idp`, compiled
+# only with `--features dev-mock-idp` -- never the shipped binary). `wires login
 # --no-browser` prints the sign-in URL and `curl` plays the browser: the mock
 # redirects straight back to the login's loopback callback with a code.
 # Card 08 swaps it for real Google.
@@ -38,7 +38,7 @@
 # refused at send and at fetch (77); the responder is one
 # process (same pid) throughout.
 #
-# Run it directly from the repo root -- NOT via `bazel run //.scripts:...`.
+# Builds with Cargo (release) on first use; WIRES_BIN / WIRES_DEV_BIN override.
 #
 #   ./.scripts/demo-remote-cli.sh                narrated, paced for watching
 #   ./.scripts/demo-remote-cli.sh --quiet        assertions only
@@ -75,10 +75,10 @@ done
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
-# One crate, two builds: `wires_dev` adds only the hidden `dev-mock-idp`
+# One crate, two builds: `wires-mock-idp` adds only the hidden `dev-mock-idp`
 # subcommand. Everything the demo proves runs on the shipped `wires`.
-WIRES="${WIRES_BIN:-$repo/bazel-bin/wires/wires}"
-WIRES_DEV="${WIRES_DEV_BIN:-$repo/bazel-bin/wires/wires_dev}"
+WIRES="${WIRES_BIN:-$repo/target/release/wires}"
+WIRES_DEV="${WIRES_DEV_BIN:-$repo/target/release/wires-mock-idp}"
 TOPIC="ops"
 EMAIL="alice@example.com"
 EXIT_DENIED=77
@@ -146,9 +146,13 @@ alive() { kill -0 "$1" 2>/dev/null; }
 # pinned to its ▶.
 call_id() { printf '%s\n' "$1" | awk '{print $4}'; }
 
-if [ ! -x "$WIRES" ] || [ ! -x "$WIRES_DEV" ]; then
-	say "building //wires:wires and //wires:wires_dev (first run) ..."
-	bazel build //wires:wires //wires:wires_dev >/dev/null 2>&1
+if [ -z "${WIRES_BIN:-}" ]; then
+	say "cargo build --release (the mock-IdP build first, then the shipped one) ..."
+	# Same target dir, so the second build only recompiles the wires crate; the
+	# feature build is copied aside before the shipped build replaces it.
+	cargo build -q --release -p wires --features dev-mock-idp
+	rm -f "$WIRES_DEV" && cp target/release/wires "$WIRES_DEV"
+	cargo build -q --release -p wires
 fi
 command -v sqlite3 >/dev/null || bad "sqlite3 is not on PATH"
 command -v curl >/dev/null || bad "curl is not on PATH"

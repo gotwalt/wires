@@ -59,8 +59,8 @@
 //! visible cost is that a nearly-expired advance can leave a node admitting
 //! nobody until the next `wires advanced import`.
 //!
-//! Note the CRL is **not** consulted here. On topics, revocation is head
-//! advance and nothing else — one mechanism, no second list to keep in sync.
+//! On topics, removal is head advance and nothing else — one mechanism, no
+//! second list to keep in sync.
 
 use serde::{Deserialize, Serialize};
 

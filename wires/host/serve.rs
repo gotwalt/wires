@@ -42,12 +42,6 @@ pub(crate) struct ServeArgs {
     /// Read the node key seed (hex) from this file instead of the keystore.
     #[arg(long)]
     pub(crate) node_seed_file: Option<PathBuf>,
-    /// CRL JSON literal of revoked subjects (overrides `--crl-file` / keystore).
-    #[arg(long, conflicts_with = "crl_file")]
-    pub(crate) crl_json: Option<String>,
-    /// Read the CRL from this file (else the keystore's `crl.json`, else empty).
-    #[arg(long)]
-    pub(crate) crl_file: Option<PathBuf>,
     /// Use a self-hosted relay at this URL instead of the n0 default.
     #[arg(long)]
     pub(crate) relay_url: Option<String>,
@@ -64,7 +58,7 @@ pub(crate) struct ServeArgs {
     /// from callers). Falls back to `$WIRES_ROSTER_HEAD`, then
     /// `--roster-head-file`, then the keystore (`roster-head.json`, re-checked
     /// per connection — a head imported later enforces on the next dial, with
-    /// no restart). With no head at all: membership + CRL + TTL only.
+    /// no restart). With no head at all: membership + TTL only.
     #[arg(long)]
     pub(crate) roster_head: Option<String>,
     /// Read the roster head token from this file.
@@ -111,10 +105,9 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         Some(ctx) => Some(serve_identities(&host, &ctx.home)?),
         None => None,
     };
-    // Credential *sources*, not values: a file-backed CRL or head is re-read on
-    // every connection, so `wires advanced revoke` / `wires advanced roster commit` take effect on
+    // A credential *source*, not a value: a file-backed head is re-read on
+    // every connection, so a roster commit (`wires remove`) takes effect on
     // the next dial without bouncing this process.
-    let crl = keystore::crl_source(a.crl_json.as_deref(), a.crl_file.clone())?;
     let head = keystore::roster_head_source(a.roster_head.as_deref(), a.roster_head_file.clone())?;
     let proof = keystore::inclusion_proof(
         a.inclusion_proof.as_deref(),
@@ -148,8 +141,6 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         identity: gate,
         policy,
         trust_root,
-        require_grant: false,
-        crl,
         head,
         membership,
         proof,

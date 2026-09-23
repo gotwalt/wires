@@ -22,7 +22,7 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 D="${BENCH_PUSH_DIR:-/tmp/wb24}"
 WIRES="${WIRES_BIN:-$D/bin/wires}"
 [ -x "$WIRES" ] || {
-	echo "up: no wires binary at $WIRES (bazel build //wires; copy bazel-bin/wires/wires there)" >&2
+	echo "up: no wires binary at $WIRES (cargo build --release -p wires; copy target/release/wires there)" >&2
 	exit 1
 }
 [ $# -ge 1 ] || {

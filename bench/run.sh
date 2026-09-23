@@ -2,7 +2,7 @@
 #
 # MCP vs CLI token benchmark (board card 16). Reproduce with:
 #
-#   bazel build //wires && ./bench/run.sh                 # full: 4 arms x 5 tasks x 5 reps
+#   ./bench/run.sh                                        # full: 4 arms x 5 tasks x 5 reps
 #   ./bench/run.sh --reps 1                               # smoke test
 #   ./bench/run.sh --arms mcp,gh --tasks t1-release       # a slice
 #
@@ -20,8 +20,8 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 D="${BENCH_WIRES_DIR:-/tmp/wb16}" # short: macOS 104-byte unix-socket paths
 mkdir -p "$D/bin"
 if [ -z "${WIRES_BIN:-}" ]; then
-	[ -x "$repo/bazel-bin/wires/wires" ] || (cd "$repo" && bazel build //wires)
-	cp -f "$repo/bazel-bin/wires/wires" "$D/bin/wires"
+	(cd "$repo" && cargo build -q --release -p wires)
+	cp -f "$repo/target/release/wires" "$D/bin/wires"
 	chmod u+w "$D/bin/wires"
 fi
 

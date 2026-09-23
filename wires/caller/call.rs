@@ -21,16 +21,13 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
-use library::{
-    Argv, CapabilityTicket, Grant, InclusionProof, Invocation, Membership, NodeId, NodeIdentity,
-    ToolName,
-};
+use library::{Argv, InclusionProof, Invocation, Membership, NodeId, NodeIdentity, ToolName};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::admin::keystore;
 use crate::caller::lock::{EXIT_LOCKED, Lock, check_process_stdin};
 use crate::caller::shape::{EXIT_SHAPE, Shape, ShapeArgs, exit_code};
-use crate::caller::tools::{RemoteTool, ToolTarget, ToolsConfig, tool_from_scope};
+use crate::caller::tools::{RemoteTool, ToolTarget, ToolsConfig};
 use crate::host::transport;
 
 /// What one remote call came to, fully buffered.
@@ -73,48 +70,27 @@ pub struct Dial {
     pub addrs: Vec<SocketAddr>,
     /// The relay to dial through, if any.
     pub relay_url: Option<String>,
-    /// The ticket's grant, for a scoped session; `None` when inclusion-only.
-    pub grant: Option<Grant>,
-    /// Inclusion-only session: verify the responder's ack before sending stdin.
-    pub ticketless: bool,
     /// The remote tool name plus the per-call argv.
     pub invocation: Invocation,
 }
 
 impl Dial {
-    /// Resolve `tool` into a dial plan carrying `argv`.
-    ///
-    /// The remote tool name is the entry's explicit `remote_tool`; else, for a
-    /// ticket scoped `tool:<x>`, `x`; else the local name.
+    /// Resolve `tool` into a dial plan carrying `argv`. The remote tool name
+    /// is the entry's explicit `remote_tool`, else the local name.
     pub fn resolve(tool: &RemoteTool, argv: Argv) -> Result<Self> {
-        let (target, addrs, relay_url, grant, scoped) = match &tool.target {
-            ToolTarget::Ticket(text) => {
-                let t = CapabilityTicket::decode(text).with_context(|| {
-                    format!(
-                        "tool `{}`: its ticket in tools.json does not decode",
-                        tool.name
-                    )
-                })?;
-                let scoped = tool_from_scope(&t.scope);
-                (t.target, t.addrs, t.relay_url, Some(t.grant), scoped)
-            }
-            ToolTarget::Node {
-                node,
-                relay_url,
-                addrs,
-            } => (*node, addrs.clone(), relay_url.clone(), None, None),
-        };
-        let remote: ToolName = tool
+        let ToolTarget::Node {
+            node,
+            relay_url,
+            addrs,
+        } = &tool.target;
+        let remote = tool
             .remote_tool
             .clone()
-            .or(scoped)
             .unwrap_or_else(|| tool.name.clone());
         Ok(Self {
-            target,
-            addrs,
-            relay_url,
-            ticketless: grant.is_none(),
-            grant,
+            target: *node,
+            addrs: addrs.clone(),
+            relay_url: relay_url.clone(),
             invocation: Invocation { tool: remote, argv },
         })
     }
@@ -151,7 +127,7 @@ impl Credentials {
 /// Dial `plan` with `creds` and bridge the given stdio; returns the remote
 /// exit code. A refusal surfaces as a [`transport::Denied`] error.
 ///
-/// Runs the same local preflight as the topic commands first, so a ticket or
+/// Runs the same local preflight as the topic commands first, so a
 /// membership issued to another node fails here, not at the responder.
 pub async fn dial<R, W, E>(
     creds: &Credentials,
@@ -165,7 +141,7 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    crate::admin::keystore::preflight(creds.node.node_id(), &creds.membership, plan.grant.as_ref())
+    crate::admin::keystore::preflight(creds.node.node_id(), &creds.membership)
         .map_err(anyhow::Error::msg)?;
     let relay = creds.relay_override.clone().or(plan.relay_url);
     let target = transport::endpoint_addr(&plan.target, &plan.addrs, relay.as_deref())?;
@@ -174,9 +150,7 @@ where
         endpoint,
         target,
         creds.membership.clone(),
-        plan.grant,
         creds.proof.clone(),
-        plan.ticketless,
         plan.invocation,
         stdin,
         stdout,
@@ -391,9 +365,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::caller::tools::tests::ticket;
     use clap::Parser;
-    use library::Scope;
 
     fn tool(target: ToolTarget, remote: Option<&str>) -> RemoteTool {
         RemoteTool {
@@ -409,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn node_target_is_ticketless_and_keeps_the_local_name() {
+    fn node_target_keeps_the_local_name() {
         let addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
         let t = tool(
             ToolTarget::Node {
@@ -420,8 +392,6 @@ mod tests {
             None,
         );
         let d = Dial::resolve(&t, Argv::new(vec!["x".into()]).unwrap()).unwrap();
-        assert!(d.ticketless);
-        assert!(d.grant.is_none());
         assert_eq!(d.target, node());
         assert_eq!(d.addrs, vec![addr]);
         assert_eq!(d.relay_url.as_deref(), Some("https://relay.example"));
@@ -430,33 +400,17 @@ mod tests {
     }
 
     #[test]
-    fn tool_scoped_ticket_defaults_the_remote_name() {
-        let t = tool(ToolTarget::Ticket(ticket("tool:db_query")), None);
-        let d = Dial::resolve(&t, Argv::default()).unwrap();
-        assert!(!d.ticketless);
-        assert_eq!(d.grant.as_ref().unwrap().scope, Scope::new("tool:db_query"));
-        assert_eq!(d.invocation.tool.as_str(), "db_query");
-    }
-
-    #[test]
-    fn explicit_remote_name_wins_over_the_scope() {
-        let t = tool(ToolTarget::Ticket(ticket("tool:db_query")), Some("psql"));
+    fn explicit_remote_name_wins_over_the_local_name() {
+        let t = tool(
+            ToolTarget::Node {
+                node: node(),
+                relay_url: None,
+                addrs: vec![],
+            },
+            Some("psql"),
+        );
         let d = Dial::resolve(&t, Argv::default()).unwrap();
         assert_eq!(d.invocation.tool.as_str(), "psql");
-    }
-
-    #[test]
-    fn other_scopes_fall_back_to_the_local_name() {
-        let t = tool(ToolTarget::Ticket(ticket("tools.rg")), None);
-        let d = Dial::resolve(&t, Argv::default()).unwrap();
-        assert_eq!(d.invocation.tool.as_str(), "local");
-    }
-
-    #[test]
-    fn undecodable_ticket_names_the_tool() {
-        let t = tool(ToolTarget::Ticket("garbage".into()), None);
-        let err = Dial::resolve(&t, Argv::default()).unwrap_err();
-        assert!(format!("{err:#}").contains("tool `local`"), "{err:#}");
     }
 
     #[test]
@@ -482,7 +436,14 @@ mod tests {
     fn lookup_lists_known_tools_on_a_miss() {
         let config = ToolsConfig {
             audit_topic: None,
-            tools: vec![tool(ToolTarget::Ticket(ticket("tools.rg")), None)],
+            tools: vec![tool(
+                ToolTarget::Node {
+                    node: node(),
+                    relay_url: None,
+                    addrs: vec![],
+                },
+                None,
+            )],
             locked: false,
         };
         assert!(lookup(&config, "local").is_ok());
@@ -592,9 +553,9 @@ mod tests {
     #[tokio::test]
     async fn shaping_over_a_loopback_host() {
         use crate::host::transport::{
-            ALPN, CrlSource, HeadSource, ServeConfig, call_on, endpoint_addr, secret_key, serve_on,
+            ALPN, HeadSource, ServeConfig, call_on, endpoint_addr, secret_key, serve_on,
         };
-        use library::{Crl, Membership};
+        use library::Membership;
         use std::collections::BTreeMap;
 
         let root = NodeIdentity::from_seed([70; 32]);
@@ -617,8 +578,6 @@ mod tests {
             audit: None,
             identity: None,
             trust_root: root.node_id(),
-            require_grant: false,
-            crl: CrlSource::Fixed(Crl::new()),
             head: HeadSource::None,
             membership: Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
             proof: None,
@@ -648,8 +607,6 @@ mod tests {
                 target.clone(),
                 Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap(),
                 None,
-                None,
-                true,
                 Invocation {
                     tool: ToolName::new(name).unwrap(),
                     argv: Argv::default(),

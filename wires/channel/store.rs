@@ -383,7 +383,7 @@ impl TopicStore {
     /// index that is already in timestamp order, and per-sender tails cannot be
     /// truncated before the merge without risking dropping a message that sorts
     /// into the window. This runs once, at `wires watch` startup, over a log with
-    /// no retention policy yet (out of scope, restart.md) — the day it needs to
+    /// no retention policy yet (out of scope for now) — the day it needs to
     /// be incremental is the day retention lands.
     pub fn read_backfill(&self, limit: usize) -> Result<Vec<TopicEnvelope>> {
         if limit == 0 {

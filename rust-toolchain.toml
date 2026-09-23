@@ -1,0 +1,4 @@
+# The toolchain Bazel pinned (rules_rust 1.91.0); iroh 1.0.3 needs >= 1.91.
+[toolchain]
+channel = "1.91.0"
+components = ["clippy", "rustfmt"]

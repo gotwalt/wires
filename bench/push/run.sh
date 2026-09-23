@@ -2,7 +2,7 @@
 #
 # Push vs poll benchmark (board card 24). Reproduce with:
 #
-#   bazel build //wires && ./bench/push/run.sh              # full: 3 arms x {60 s, 300 s} x 5 reps
+#   cargo build --release -p wires && ./bench/push/run.sh              # full: 3 arms x {60 s, 300 s} x 5 reps
 #   ./bench/push/run.sh --reps 1 --secs 20                  # smoke test
 #   ./bench/push/run.sh --arms poll,wait --secs 60          # a slice
 #
@@ -16,10 +16,10 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 D="${BENCH_PUSH_DIR:-/tmp/wb24}" # short: macOS 104-byte unix-socket paths
 mkdir -p "$D/bin"
 if [ -z "${WIRES_BIN:-}" ]; then
-	[ -x "$repo/bazel-bin/wires/wires" ] || (cd "$repo" && bazel build //wires)
+	[ -x "$repo/target/release/wires" ] || (cd "$repo" && cargo build -q --release -p wires)
 	# rm first: overwriting a signed binary in place gets it SIGKILLed on macOS
 	rm -f "$D/bin/wires"
-	cp "$repo/bazel-bin/wires/wires" "$D/bin/wires"
+	cp "$repo/target/release/wires" "$D/bin/wires"
 	chmod u+w "$D/bin/wires"
 fi
 

@@ -17,39 +17,26 @@ set -euo pipefail
 D="${BENCH_WIRES_DIR:-/tmp/wb16}"
 WIRES="${WIRES_BIN:-$D/bin/wires}"
 [ -x "$WIRES" ] || {
-	echo "wires-up: no wires binary at $WIRES (bazel build //wires; copy bazel-bin/wires/wires there)" >&2
+	echo "wires-up: no wires binary at $WIRES (cargo build --release -p wires; copy target/release/wires there)" >&2
 	exit 1
 }
 
-root="$D/root"
 wb="$D/wb"
 agent="$D/agent"
 if [ -f "$D/wb.pid" ] && kill -0 "$(cat "$D/wb.pid")" 2>/dev/null; then
 	kill "$(cat "$D/wb.pid")" || true
 fi
-rm -rf "$root" "$wb" "$agent" "$D/v1" "$D"/*.member
-mkdir -p "$root" "$wb" "$agent"
+rm -rf "$wb" "$agent"
+mkdir -p "$wb" "$agent"
 
-WIRES_HOME="$root" "$WIRES" advanced keygen --save-root >/dev/null
-for h in "$wb" "$agent"; do WIRES_HOME="$h" "$WIRES" advanced keygen --save-node >/dev/null; done
-node_id() { "$WIRES" advanced keygen --node-seed "$(tr -d '\n' <"$1/node.seed")" | awk '/^node_id/{print $2}'; }
-WB_ID="$(node_id "$wb")"
-AG_ID="$(node_id "$agent")"
-
-for id in "$WB_ID" "$AG_ID"; do
-	WIRES_HOME="$root" "$WIRES" advanced roster add --member "$id" >/dev/null
-	WIRES_HOME="$root" "$WIRES" advanced member --subject "$id" --ttl 86400 >"$D/$id.member"
-done
-HEAD1="$(WIRES_HOME="$root" "$WIRES" advanced roster commit --ttl 86400 --out "$D/v1" | awk '/^head /{print $2}')"
-for pair in "$wb:$WB_ID" "$agent:$AG_ID"; do
-	h="${pair%%:*}"
-	id="${pair#*:}"
-	WIRES_HOME="$h" "$WIRES" advanced import \
-		--membership-file "$D/$id.member" \
-		--inclusion-proof-file "$D/v1/$id.proof" \
-		--roster-head "$HEAD1" \
-		--fabric-key-file "$D/v1/$id.key" >/dev/null
-done
+# The responder is also the admin (so every commit lands in its own keystore
+# with no channel round-trip); the agent makes its key and joins with the one
+# token `wires invite` prints for it.
+WIRES_HOME="$wb" "$WIRES" init --channel bench >/dev/null 2>&1
+AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
+token="$(WIRES_HOME="$wb" "$WIRES" invite "$AG_ID" --name agent 2>/dev/null)"
+WIRES_HOME="$agent" "$WIRES" join "$token" >/dev/null
+WB_ID="$(WIRES_HOME="$wb" "$WIRES" id 2>/dev/null)"
 
 cat >"$D/host.json" <<'JSON'
 {

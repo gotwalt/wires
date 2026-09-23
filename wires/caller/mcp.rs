@@ -517,11 +517,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
+    /// One recorded call: tool name, argv, stdin.
+    type RecordedCall = (String, Vec<String>, Vec<u8>);
+
     /// A scripted [`Caller`]: answers per tool name and records every call.
     #[derive(Default)]
     struct FakeCaller {
         answers: BTreeMap<String, std::result::Result<CallOutcome, String>>,
-        calls: Mutex<Vec<(String, Vec<String>, Vec<u8>)>>,
+        calls: Mutex<Vec<RecordedCall>>,
     }
 
     impl FakeCaller {

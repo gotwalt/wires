@@ -92,7 +92,7 @@ denials) come from `python3 bench/push/report.py bench/push/results/2026-09-23.j
 ## Reproduce
 
 ```bash
-bazel build //wires && ./bench/push/run.sh                 # 3 arms x {60, 300 s} x 5
+cargo build --release -p wires && ./bench/push/run.sh                 # 3 arms x {60, 300 s} x 5
 ./bench/push/run.sh --arms poll-loop --secs 60,300         # the extra arm
 python3 bench/push/report.py bench/push/results/2026-09-23.jsonl
 ```

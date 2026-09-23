@@ -68,4 +68,4 @@ Today every member of the org channel receives, stores and can decrypt every cal
 
 ## Related
 
-- [18 — front door (OPEN)](18-front-door-OPEN.md): the directory and host-list question overlaps with how people and hosts enter the org.
+- [18 — front door (OPEN)](../backlog/18-front-door-OPEN.md): the directory and host-list question overlaps with how people and hosts enter the org.

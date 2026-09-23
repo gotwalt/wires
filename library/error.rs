@@ -22,7 +22,7 @@ pub enum Error {
     #[error("invalid signature")]
     InvalidSignature,
 
-    /// The grant declared a signature algorithm this build does not support.
+    /// A signed object declared a signature algorithm this build does not support.
     #[error("unsupported algorithm")]
     UnsupportedAlgorithm,
 
@@ -36,9 +36,9 @@ pub enum Error {
 
     /// A credential's `not_after` is in the past relative to the checked time.
     ///
-    /// Shared by grants, memberships, and roster heads — the caller prefixes
-    /// which credential it was checking (`membership rejected: …`,
-    /// `grant rejected: …`, `roster inclusion rejected: …`), so the display
+    /// Shared by memberships and roster heads — the caller prefixes which
+    /// credential it was checking (`membership rejected: …`,
+    /// `roster inclusion rejected: …`), so the display
     /// deliberately does *not* name one.
     #[error("expired at {not_after}")]
     Expired {
@@ -46,15 +46,9 @@ pub enum Error {
         not_after: i64,
     },
 
-    /// The checked credential's subject is present on the revocation list.
-    ///
-    /// Like [`Error::Expired`], shared by the grant and membership gates, so the
-    /// display names no single credential — the caller supplies that prefix.
-    #[error("revoked")]
-    Revoked,
-
-    /// The grant's subject does not match the authenticated caller.
-    #[error("grant subject does not match caller")]
+    /// The credential's subject (a membership's member, a proof's member) does
+    /// not match the authenticated caller.
+    #[error("credential subject does not match caller")]
     SubjectMismatch,
 
     /// A byte slice had the wrong length for the key or signature it decodes to.

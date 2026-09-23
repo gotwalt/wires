@@ -19,6 +19,18 @@ pub struct NodeId([u8; 32]);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Signature([u8; 64]);
 
+/// Signature scheme a signed object (membership, roster head, envelope) was
+/// signed with. Only [`Ed25519`](Self::Ed25519) is implemented today; the tag
+/// travels on the wire so a verifier can reject an object signed with a scheme
+/// it does not support, and so other schemes can be added later without a
+/// format change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlgorithmId {
+    /// Ed25519 — the zero-config default root scheme.
+    Ed25519,
+}
+
 impl NodeId {
     /// Borrow the raw 32 public-key bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -93,7 +105,7 @@ impl Signature {
 /// A node's signing identity: the Ed25519 secret key plus its derived address.
 ///
 /// Both fabric-root keys and node keys are `NodeIdentity` values — the role is
-/// a matter of how the key is used (signing grants vs. authenticating a
+/// a matter of how the key is used (signing memberships vs. authenticating a
 /// session), not of the type.
 pub struct NodeIdentity {
     signing_key: SigningKey,

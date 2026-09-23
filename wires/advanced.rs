@@ -8,7 +8,7 @@
 
 use clap::{Args, Subcommand};
 
-use crate::admin::{import, keys, roster, stringify};
+use crate::admin::{import, keys, roster};
 use crate::channel::{publish, watch};
 use crate::{exit_with, runtime};
 
@@ -22,16 +22,10 @@ pub(crate) struct AdvancedArgs {
 /// The plumbing commands.
 #[derive(Subcommand)]
 pub(crate) enum Advanced {
-    /// Generate (or re-derive) the node + root keys and print their seeds + ids.
-    Keygen(keys::KeygenArgs),
-    /// Mint a capability grant and print its base64 ticket.
-    Grant(keys::GrantArgs),
     /// Mint a fabric membership and print its base64 token.
     Member(keys::MemberArgs),
     /// Author the fabric roster (add/remove members, sign a committed head).
     Roster(roster::RosterArgs),
-    /// Add a subject to the CRL (keystore by default) and print the result.
-    Revoke(keys::RevokeArgs),
     /// Install credentials (membership, inclusion proof, roster head, sealed
     /// fabric key) into the keystore.
     Import(import::ImportArgs),
@@ -71,11 +65,8 @@ pub(crate) fn run(a: AdvancedArgs) {
 /// Run an offline admin subcommand, returning its stdout text.
 fn run_offline(command: Advanced) -> Result<String, String> {
     match command {
-        Advanced::Keygen(a) => keys::run_keygen_cmd(a).map_err(stringify),
-        Advanced::Grant(a) => keys::run_grant_cmd(a),
         Advanced::Member(a) => keys::run_member_cmd(a),
         Advanced::Roster(a) => roster::run_roster_cmd(a),
-        Advanced::Revoke(a) => keys::run_revoke_cmd(a).map_err(stringify),
         Advanced::Import(a) => import::run_import_cmd(a).map_err(|e| format!("{e:#}")),
         Advanced::Publish(_) | Advanced::Tail(_) => unreachable!("handled in run"),
     }

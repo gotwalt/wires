@@ -1,20 +1,13 @@
-# User-specific settings file for this repo. May contain secrets such as API tokens.
-user.bazelrc
 .env
 *.DS_Store
 
-# Symlinks created by Bazel into the output tree
+# Cargo build output
+/target/
+
+# Old Bazel symlinks, if a pre-Cargo checkout left them behind
 /bazel-*
 
-
-node_modules/
-
-
 *.venv/
-
-
-vendor/bundle/
-/target/
 
 # Claude Code local state (worktrees, scratch keystores with seeds/tokens); only the shared settings are tracked
 .claude/*

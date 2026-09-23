@@ -32,9 +32,9 @@ export WIRES_OIDC_CLIENT_SECRET=<secret>
 export WIRES_OIDC_AUDIENCE=$WIRES_OIDC_CLIENT_ID               # watch accepts this client id
 ```
 
-**workbench.** Build natively. The macOS → x86_64 Linux cross-compile is
-broken (card 08 notes). Use the user-local bazelisk, and `ssh -o
-RemoteCommand=none` because the ssh config forces a remote command. Put
+**workbench.** Build natively there (`cargo build --release -p wires`, or
+`docker build .`); nothing cross-compiles. Use `ssh -o RemoteCommand=none`
+because the ssh config forces a remote command. Put
 `orders.db` in the directory `wires serve` runs from, and this `host.json`
 beside it:
 

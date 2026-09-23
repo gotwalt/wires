@@ -38,7 +38,7 @@
 //!
 //! An observer is any roster member holding the current fabric key: `wires
 //! import` its membership, proof, head and key, then `wires watch <topic>
-//! --peer <responder's topic ticket>`. It holds no grant for any exposed tool
+//! --peer <responder's topic ticket>`. It may run no exposed tool
 //! and no credential of the caller, and it sees every call live.
 //!
 //! [`TopicNodeConfig::protocols`]: crate::channel::topics::TopicNodeConfig::protocols

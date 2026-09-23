@@ -8,8 +8,8 @@ name = "wires"
 path = "main.rs"
 
 [features]
-# Hidden `wires dev-mock-idp` (hermetic OIDC issuer) for the demo script;
-# built only by //wires:wires_dev.
+# Hidden `wires dev-mock-idp` (hermetic OIDC issuer) for the demo script:
+# `cargo build --features dev-mock-idp`. Never in a release or the image.
 dev-mock-idp = []
 
 [dependencies]

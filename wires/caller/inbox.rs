@@ -48,7 +48,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use iroh::{Endpoint, EndpointAddr};
 use library::{
-    Crl, INBOX_ALPN, InboxFrame, InclusionProof, MAX_BATCH, Membership, NodeId, PushId, PushMessage,
+    INBOX_ALPN, InboxFrame, InclusionProof, MAX_BATCH, Membership, NodeId, PushId, PushMessage,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -505,7 +505,7 @@ impl InboxReceiver {
         proof: Option<&InclusionProof>,
         now: i64,
     ) -> std::result::Result<(), String> {
-        library::check_inclusion(membership, self.fabric, peer, now, &Crl::new())
+        library::check_inclusion(membership, self.fabric, peer, now)
             .map_err(|e| format!("membership rejected: {e}"))?;
         if let Some(head) = self.head.load().map_err(|e| format!("{e:#}"))? {
             let directory = crate::channel::rekey::directory_for(&self.head);
@@ -1030,13 +1030,13 @@ mod tests {
         assert_eq!(s.fresh, 2);
         assert_eq!(s.ids, [a.id, b.id]);
         // A re-delivery (lost ack) is acknowledged but not stored twice.
-        let s = mb.store(&[a.clone()]).unwrap();
+        let s = mb.store(std::slice::from_ref(&a)).unwrap();
         assert_eq!((s.fresh, s.ids.clone()), (0, vec![a.id]));
         let taken = mb.take_unread().unwrap();
         assert_eq!(taken, [a.clone(), b.clone()]);
         assert!(!mb.has_unread());
         // Read, and delivered again: still a duplicate.
-        assert_eq!(mb.store(&[b.clone()]).unwrap().fresh, 0);
+        assert_eq!(mb.store(std::slice::from_ref(&b)).unwrap().fresh, 0);
         assert!(mb.take_unread().unwrap().is_empty());
     }
 

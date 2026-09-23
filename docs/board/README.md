@@ -1,7 +1,16 @@
 # Board — remote CLIs, verified callers, observable calls
 
-*Opened 2026-09-22. Supersedes the phase plan in [restart.md](../restart.md)
-for the current push; restart.md's non-negotiables (§7) still hold.*
+*Opened 2026-09-22. Supersedes the 2026-08-13 restart plan (deleted by card
+25; it is in the git log).*
+
+**Non-negotiables** (carried over from the restart): E2EE with a blind relay
+(no host or relay holds a key it doesn't need); offline-verifiable membership
+(no auth-server round-trip; removal by omission); the spec is the contract
+(README and docs first, code second). **Kill criteria:** if no one wants
+remote CLIs by key after the recorded demo, write it up and stop; if wires is
+something we demo but never use ourselves, mothball it with a postmortem; if
+MCP or A2A ships portable user identity plus infra-level call records, narrow
+to what's still unserved or call it obsolete.
 
 ## The one idea
 
@@ -67,7 +76,7 @@ The IdP is *bound* at the caller (`login`), *enforced* at the host (`host.json`)
 | [21](done/21-camera-polish.md) | P2 | 12–20 | Camera polish: heartbeat noise, quiet admin commands, clear removal reason, seal announcements only to current members |
 | [23](done/23-inbox.md) | I | 21 | Push to callers: `wires inbox` (local read / `--wait`), host `wires push`, queue + dial-back by key, `host.json` `push` roles, audited |
 | [24](done/24-push-demo.md) | E2 | 23 | Push demo (deploy → callback → follow-up) + push-vs-poll benchmark |
-| [25](backlog/25-cargo-and-strip.md) | X | 23, 24 | Down to essentials: Bazel → plain Cargo + Dockerfile; remove grants/tickets/CRL/relay/manual targets and outdated docs (git history is the archive) |
+| [25](done/25-cargo-and-strip.md) | X | 23, 24 | Down to essentials: Bazel → plain Cargo + Dockerfile; remove grants/tickets/CRL/relay/manual targets and outdated docs (git history is the archive) |
 | [27](backlog/27-services-not-hosts.md) | S3 | 25 | **Services, not hosts; drop the channel.** Admin-signed members + service registry; local `wires services`; identity in the handshake; delete gossip/fabric keys/re-keys/announcements (~20k LOC) |
 | [26](backlog/26-host-held-records.md) | H2 | 27 | Call records: host-held signed log, `watch <service>` for authorized readers + own calls, optional OTel export |
 | [22](done/22-gossip-role-OPEN.md) | — | decided | **Decided 2026-09-23: drop the channel** → cards 27 and 26 |
@@ -81,7 +90,7 @@ The IdP is *bound* at the caller (`login`), *enforced* at the host (`host.json`)
 
 - **Move your card**: `git mv docs/board/backlog/NN-*.md docs/board/doing/` when you start, to `review/` when your acceptance list is green. Only the integrator moves cards to `done/`.
 - **Stay in your lane's files** (listed per card). If you must touch another lane's file, keep the diff minimal and say so in the card's *Notes* section.
-- **CLAUDE.md order**: types/signatures → tests (proptest + examples, red) → implement → doctests → readability pass. Bazel only. `bazel test //...`, `aspect lint //...` and `bazel run //tools/format:format.check` green before `review/`.
+- **CLAUDE.md order**: types/signatures → tests (proptest + examples, red) → implement → doctests → readability pass. Cargo: `cargo test --workspace`, `make lint` (clippy `-D warnings` + shellcheck) and `cargo fmt --check` green before `review/`.
 - **Errors**: `library` uses `thiserror` (`library/error.rs`); the binary uses `anyhow`. Newtypes, not primitives, on public APIs.
 - **Don't** touch `archive/poc-2026-05`, the relay package, or anything iOS.
 - Append what you learned / decided to the card's *Notes*; the integrator reads them at merge.
