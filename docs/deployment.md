@@ -4,6 +4,14 @@ Patterns for running wires in production — containers, Kubernetes, and a
 self-hosted relay. For the command reference and the local walkthrough see the
 [README](../README.md); for tests see [testing.md](testing.md).
 
+> **Partly out of date (card 12, 2026-09-23).** Single-command
+> `wires serve -- <cmd>`, `serve --scope` and `wires connect` are gone: a host
+> serves named tools (`--expose name=cmd`), callers use `wires call` (or
+> `wires mcp` for MCP-only clients), and the admin plumbing is spelled
+> `wires advanced grant | member | roster | import …`. The pod and argv
+> examples below still show the old shapes; the image, key-handling and relay
+> guidance stands.
+
 ## What you deploy
 
 | Piece | Binary | Inbound port? | Container image |
@@ -196,7 +204,7 @@ Three layers, most-self-contained first:
 
 - **Direct addresses in the ticket** (air-gapped friendly). At grant time,
   embed where the responder is reachable:
-  `wires grant … --addr <ip:port> [--addr …] [--relay-url <url>]`. The dialer
+  `wires advanced grant … --addr <ip:port> [--addr …] [--relay-url <url>]`. The dialer
   uses these directly and needs **no discovery service**. The responder logs its
   node id and bound sockets at startup; combine that port with the responder's
   reachable IP / Service / LoadBalancer address. These hints are unsigned —
@@ -210,16 +218,16 @@ Three layers, most-self-contained first:
 For a private / air-gapped cluster, prefer **`--addr` + a self-hosted relay**
 so nothing depends on n0.
 
-Grants are minted out-of-band with `wires grant` (paste the subject node id);
+Grants are minted out-of-band with `wires advanced grant` (paste the subject node id);
 distribute the resulting ticket to the agent (e.g. as a `Secret` in its
 namespace).
 
 ## Provisioning and rotation
 
-- **Issue:** on the operator's machine, `wires grant --subject <agent-id>
+- **Issue:** on the operator's machine, `wires advanced grant --subject <agent-id>
   --target <responder-id> --scope <s> --ttl <secs>` → hand the ticket to the
   agent. The root key never leaves that machine.
-- **Revoke:** edit the responder's CRL `ConfigMap` (or `wires revoke
+- **Revoke:** edit the responder's CRL `ConfigMap` (or `wires advanced revoke
   --crl-file <path>` against a synced copy) and `kubectl apply`; the projected
   file updates. `serve` re-reads the CRL (and `roster-head.json`, if it is
   enforcing one) **once per connection**, so revocation takes effect on the
