@@ -7,9 +7,9 @@
 //! only the signed [`State`] and the caller's verified [`Principal`]; there
 //! is no network and no clock (the principal handed in is already fresh).
 //!
-//! **Lane 27c implements [`authorize`]** (the host is the ground truth);
-//! [`allowed_services`] is defined in terms of it, so 27b gets it for free.
-//! Until then both panic, and their tests are `#[ignore = "27c"]`.
+//! The host is the ground truth: [`allowed_services`] is defined in terms of
+//! [`authorize`], so the listing never shows a service the host would refuse
+//! on registry grounds (a host's `also_require` can still narrow it).
 
 use std::fmt;
 
@@ -96,14 +96,65 @@ impl fmt::Display for Refusal {
 /// Does **not** check that the service is assigned to any particular host
 /// ([`State::assigns`]) or the host's own `also_require`: those are the
 /// host's, on top of this.
+///
+/// ```
+/// use library::{authorize, NodeIdentity, Refusal, RoleName, Service, ServiceName, State};
+///
+/// let host = NodeIdentity::from_seed([2u8; 32]).node_id();
+/// let mut state = State::new(NodeIdentity::from_seed([1u8; 32]).node_id());
+/// state.members.insert(host);
+/// state.hosts.insert(host);
+/// let status = ServiceName::new("status").unwrap();
+/// state.services.insert(status.clone(), Service {
+///     description: String::new(),
+///     allow: vec![RoleName::member()],
+///     hosts: vec![host],
+///     readers: vec![],
+/// });
+/// assert_eq!(authorize(&state, host, None, &status), Ok(RoleName::member()));
+/// let stranger = NodeIdentity::from_seed([9u8; 32]).node_id();
+/// assert_eq!(authorize(&state, stranger, None, &status), Err(Refusal::NotAMember));
+/// ```
 pub fn authorize(
     state: &State,
     caller: NodeId,
     principal: Option<&Principal>,
     service: &ServiceName,
 ) -> Result<RoleName, Refusal> {
-    let _ = (state, caller, principal, service);
-    todo!("27c: registry authorization")
+    if !state.is_member(caller) {
+        return Err(Refusal::NotAMember);
+    }
+    let Some(svc) = state.services.get(service) else {
+        return Err(Refusal::UnknownService(service.clone()));
+    };
+    if svc.allow.is_empty() {
+        return Err(Refusal::NobodyAllowed(service.clone()));
+    }
+    if let Some(role) = svc
+        .allow
+        .iter()
+        .find(|role| role_admits(state, role, principal))
+    {
+        return Ok(role.clone());
+    }
+    Err(Refusal::NotInRole {
+        service: service.clone(),
+        allow: svc.allow.clone(),
+        principal: principal.map(|p| p.email.clone().unwrap_or_else(|| p.subject.clone())),
+    })
+}
+
+/// Whether `role` admits a member presenting `principal`: `member` always;
+/// a defined role when one of its matchers matches; an undefined role never
+/// (a validated state has none, but a failure here must deny).
+pub fn role_admits(state: &State, role: &RoleName, principal: Option<&Principal>) -> bool {
+    if role.is_member() {
+        return true;
+    }
+    let (Some(p), Some(matchers)) = (principal, state.roles.get(role)) else {
+        return false;
+    };
+    matchers.iter().any(|m| m.matches(p))
 }
 
 /// Every service [`authorize`] would admit `caller` to, with the admitting
@@ -135,6 +186,7 @@ mod tests {
     use crate::registry::Service;
     use crate::role::Matcher;
     use crate::state::StateVersion;
+    use proptest::prelude::*;
 
     fn node(b: u8) -> NodeId {
         NodeIdentity::from_seed([b; 32]).node_id()
@@ -186,7 +238,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "27c"]
     fn analyst_may_call_orders_db() {
         let alice = who("alice@example.com");
         assert_eq!(
@@ -196,7 +247,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "27c"]
     fn refusals_are_precise() {
         let s = state();
         let bob = who("bob@example.com");
@@ -229,7 +279,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "27c"]
     fn member_role_needs_no_identity() {
         assert_eq!(
             authorize(&state(), node(3), None, &name("status")),
@@ -238,7 +287,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "27c"]
     fn listing_shows_only_what_you_may_call() {
         let s = state();
         let alice = who("alice@example.com");
@@ -253,6 +301,64 @@ mod tests {
             .collect();
         assert_eq!(listed, vec![name("status")]);
         assert!(allowed_services(&s, node(9), Some(&alice)).is_empty());
+    }
+
+    #[test]
+    fn first_admitting_role_wins_and_undefined_roles_deny() {
+        let mut s = state();
+        let analyst = RoleName::new("analyst").unwrap();
+        s.services.get_mut(&name("status")).unwrap().allow =
+            vec![analyst.clone(), RoleName::member()];
+        let alice = who("alice@example.com");
+        assert_eq!(
+            authorize(&s, node(2), Some(&alice), &name("status")),
+            Ok(analyst)
+        );
+        assert_eq!(
+            authorize(&s, node(3), None, &name("status")),
+            Ok(RoleName::member())
+        );
+        let ghost = RoleName::new("ghost").unwrap();
+        assert!(!role_admits(&s, &ghost, Some(&alice)));
+    }
+
+    #[test]
+    fn principal_without_email_is_named_by_subject() {
+        let mut p = who("x");
+        p.email = None;
+        p.subject = "sub-42".into();
+        assert!(matches!(
+            authorize(&state(), node(3), Some(&p), &name("orders-db")),
+            Err(Refusal::NotInRole { principal: Some(ref w), .. }) if w == "sub-42"
+        ));
+    }
+
+    proptest! {
+        /// The listing is exactly the services `authorize` admits, with the
+        /// same role; a non-member is refused everything first.
+        #[test]
+        fn listing_agrees_with_authorize(
+            caller in 1u8..12,
+            email in prop::option::of(prop::sample::select(vec![
+                "alice@example.com", "bob@example.com", "eve@evil.net",
+            ])),
+        ) {
+            let s = state();
+            let p = email.map(who);
+            let listed = allowed_services(&s, node(caller), p.as_ref());
+            for (svc, _) in &s.services {
+                let got = authorize(&s, node(caller), p.as_ref(), svc);
+                let shown = listed.iter().find(|g| &g.service == svc);
+                prop_assert_eq!(got.clone().ok(), shown.map(|g| g.role.clone()));
+                if !s.is_member(node(caller)) {
+                    prop_assert_eq!(got.clone(), Err(Refusal::NotAMember));
+                }
+                if let Ok(role) = got {
+                    prop_assert!(s.services[svc].allow.contains(&role));
+                    prop_assert!(role_admits(&s, &role, p.as_ref()));
+                }
+            }
+        }
     }
 
     #[test]

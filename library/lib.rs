@@ -202,7 +202,7 @@ mod codec;
 #[path = "calls/idp_vectors.rs"]
 mod idp_vectors;
 
-pub use access::{Grant, Refusal, allowed_services, authorize};
+pub use access::{Grant, Refusal, allowed_services, authorize, role_admits};
 pub use admission::{
     Admission, AdmitFrame, MAX_ADMIT_FRAME, TOPIC_ADMIT_ALPN, adopt_if_newer,
     check_topic_admission, check_topic_admission_via,
