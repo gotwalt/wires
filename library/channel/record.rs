@@ -91,6 +91,7 @@ mod tests {
                 tool: ToolName::new("db_query").unwrap(),
                 argv: Argv::new(vec!["select 1".into()]).unwrap(),
                 roster_version: Some(3),
+                role: Some("analyst".into()),
                 at_ms: 1,
             }),
             ChannelRecord::Audit(AuditRecord::Finished {

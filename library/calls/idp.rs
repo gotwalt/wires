@@ -255,6 +255,15 @@ pub struct Principal {
     pub groups: Vec<String>,
     /// The token's `exp`, Unix seconds: the claim is stale after this.
     pub not_after: i64,
+    /// The token's whole verified payload, every claim as the IdP signed it.
+    ///
+    /// The fields above are the ones wires reads today; this keeps the rest
+    /// (Okta `groups`, Entra `roles`, custom claims) so a later host policy
+    /// can match any claim without a wire change. Reader-local: it is derived
+    /// by verification like everything else here and is never serialized, so
+    /// a [`Principal`] read back from a call record has it empty.
+    #[serde(skip)]
+    pub claims: Map<String, Value>,
 }
 
 /// "Node *K* is held by the person this ID token names" — published on a
@@ -365,6 +374,7 @@ pub fn verify_claim(
         org,
         groups,
         not_after: exp,
+        claims: p.clone(),
     })
 }
 
@@ -750,8 +760,11 @@ mod tests {
                     org: Some("example.com".into()),
                     groups: vec![],
                     not_after: NOW + 3600,
+                    claims: p.claims.clone(),
                 }
             );
+            assert_eq!(p.claims["nonce"], OidcNonce::for_node(&node()).as_str());
+            assert_eq!(p.claims["hd"], "example.com");
         }
     }
 

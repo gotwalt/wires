@@ -265,6 +265,11 @@ pub enum AuditRecord {
         /// The roster version the caller was admitted under, when enforced.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         roster_version: Option<u64>,
+        /// The host policy role that admitted the caller (`host.json`'s
+        /// `roles`, or the built-in `member`). `None` in records written
+        /// before roles existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
         /// Unix milliseconds at authorization.
         at_ms: i64,
     },
@@ -362,6 +367,35 @@ mod tests {
         );
         let parsed: AuditRecord = serde_json::from_str(&old).unwrap();
         assert_eq!(parsed, finished(None));
+    }
+
+    /// `role` is written when set and omitted when not; a `Started` from a
+    /// host that predates roles still parses, as "no role".
+    #[test]
+    fn started_role_is_optional_on_the_wire() {
+        let node = crate::NodeIdentity::from_seed([1u8; 32]).node_id();
+        let started = |role: Option<&str>| AuditRecord::Started {
+            call: CallId::from_hex("0123456789abcdef0123456789abcdef").unwrap(),
+            caller: node,
+            principal: None,
+            tool: ToolName::new("db_query").unwrap(),
+            argv: Argv::default(),
+            roster_version: None,
+            role: role.map(str::to_string),
+            at_ms: 1,
+        };
+        let with = serde_json::to_string(&started(Some("analyst"))).unwrap();
+        assert!(with.contains(r#""role":"analyst""#), "{with}");
+        assert_eq!(
+            serde_json::from_str::<AuditRecord>(&with).unwrap(),
+            started(Some("analyst"))
+        );
+        let without = serde_json::to_string(&started(None)).unwrap();
+        assert!(!without.contains("role"), "{without}");
+        assert_eq!(
+            serde_json::from_str::<AuditRecord>(&without).unwrap(),
+            started(None)
+        );
     }
 
     #[test]
