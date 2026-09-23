@@ -51,7 +51,7 @@ Verify each is unused on the current tree before removing it; if something is st
 | `docs/testing.md` | rewrite for Cargo (short) | Bazel-era. |
 | `docs/storytelling.md` | keep, trimmed to the rebuttal test (§1) and anything the board references | It's still how pitch sentences get checked. |
 | `docs/demo.md`, `docs/agent-sandbox.md` | keep; update commands for Cargo | Current. |
-| `docs/research/agent-comms-2026-08/` (8 files) | **ask the human**: keep `executive-summary.md` + `synthesis.md`, delete the six lanes? | Market research is still cited in cards 22/23; lanes are raw material. |
+| `docs/research/agent-comms-2026-08/` (7 files left) | **ask the human** whether to delete; the executive summary was rewritten for the current product and moved to `docs/executive-summary.md` (2026-09-23) and cites the research's figures | The lanes and synthesis describe the retired group-chat pitch; cards 22/23 cite lane 2. |
 | `docs/board/done/*` | keep until after the demo; then optionally collapse into `docs/board/HISTORY.md` (one paragraph per card) | Cards carry decisions and Notes still being referenced. |
 | `CLAUDE.md`, `README.md` | fix every link to a deleted doc | — |
 
