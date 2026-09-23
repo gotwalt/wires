@@ -16,7 +16,7 @@ Why each clause earns its place (the rebuttals it has to survive):
 | Claim | Why it isn't "just use X" |
 |---|---|
 | **Reached by key, not network path** | Tailscale/VPN gives the agent's machine a route to the *host*; you then trust every port on it. Wires gives a route to *one allowlisted CLI* and nothing else — there is no network path to widen. |
-| **CLIs, not MCP servers** | CLIs are the idiom models already know, one generic verb, and output is filtered by pipes *before* it hits context — measurably cheaper than MCP tool schemas + JSON results, even post-2026-07-28. `wires call` is the native path; `wires mcp` is the on-ramp for workflows that only speak MCP. |
+| **CLIs, not MCP servers** | CLIs are the idiom models already know, one generic verb, and output is filtered by pipes *before* it hits context — meaningfully more efficient than MCP tool schemas + JSON results, even post-2026-07-28. `wires call` is the native path; `wires mcp` is the on-ramp for workflows that only speak MCP. |
 | **IdP-authenticated caller** | The ID token is bound to the node key (OIDC `nonce` = hash of the key) and published on the channel. Every reader verifies the IdP's signature *itself* — no wires attestor to trust, and two orgs' IdPs can share one channel (federation). |
 | **Observable at the infra layer** | The *responder* writes a signed, hash-chained record of every call, refusal, and exit — stamped with the caller identity it verified. The agent can't forge it, no gateway owns it, and an observer holds neither end's credentials. A CLI has no such story; an MCP gateway's log belongs to whoever runs the gateway. |
 
@@ -36,14 +36,15 @@ honest line from someone who runs remote MCP servers behind Tailscale today.
 | Card | Lane | Depends on | Summary |
 |---|---|---|---|
 | [00](done/00-shared-types.md) | 0 | — | Shared types: `Invocation`, `AuditRecord`, `IdentityClaim`, `ChannelRecord`, `ServeConfig.{tools,audit}`, `tools.json` |
-| [01](backlog/01-serve-expose.md) | A | 00 | `serve --expose name=cmd`: multi-tool responder, per-call argv |
-| [02](backlog/02-audit-channel.md) | B | 00 | `serve --audit-topic`: responder hosts the topic node, publishes call records; `tail` renders them |
-| [03](backlog/03-client-call-and-mcp.md) | C | 00 | `wires call` + `wires mcp` (stdio MCP server) over `tools.json` |
-| [04](backlog/04-idp-login.md) | F | 00 | `wires login` (Google OIDC, nonce-bound), claim published on channel, independent verification |
+| [01](done/01-serve-expose.md) | A | 00 | `serve --expose name=cmd`: multi-tool responder, per-call argv |
+| [02](done/02-audit-channel.md) | B | 00 | `serve --audit-topic`: responder hosts the topic node, publishes call records; `tail` renders them |
+| [03](done/03-client-call-and-mcp.md) | C | 00 | `wires call` + `wires mcp` (stdio MCP server) over `tools.json` |
+| [04](review/04-idp-login.md) | F | 00 | `wires login` (Google OIDC, nonce-bound), claim published on channel, independent verification |
 | [05](backlog/05-idp-policy.md) | F | 01, 02, 04 | `serve --require-idp`: gate on verified claims; principal in audit records |
-| [06](backlog/06-cleanup-and-pitch.md) | D | — | Cut noise, README rewritten around the one idea, restart.md reconciled |
+| [06](done/06-cleanup-and-pitch.md) | D | — | Cut noise, README rewritten around the one idea, restart.md reconciled |
 | [07](backlog/07-demo-local.md) | E | 01–05 | Self-asserting loopback demo script (the gate for the two-machine run) |
 | [08](backlog/08-demo-two-machine.md) | E | 07 | Real run: laptop ↔ workbench over relay, Claude Code as the agent, recording |
+| [10](backlog/10-live-run-fixes.md) | G | 01–04 | Live-run fixes: stdin in call records, quiet stderr, short control-socket path |
 | [09](backlog/09-witness.md) | stretch | 02 | Key-less witness: stores and verifies call records without decrypting them |
 
 ## Rules for workers
