@@ -163,6 +163,8 @@ pub mod ticket;
 // channel/ — the encrypted channel.
 #[path = "channel/admission.rs"]
 pub mod admission;
+#[path = "channel/announce.rs"]
+pub mod announce;
 #[path = "channel/chain.rs"]
 pub mod chain;
 #[path = "channel/envelope.rs"]
@@ -191,6 +193,10 @@ mod idp_vectors;
 
 pub use admission::{
     Admission, AdmitFrame, MAX_ADMIT_FRAME, TOPIC_ADMIT_ALPN, adopt_if_newer, check_topic_admission,
+};
+pub use announce::{
+    ANNOUNCE_CONTEXT, ANNOUNCE_V1, HostAnnouncement, HostListing, LISTING_PAD, ListedTool,
+    SealedListing,
 };
 pub use audit::{
     AuditRecord, CallId, OutputDigest, OutputHasher, STDIN_HEAD_MAX, StdinCapture, stdin_head,

@@ -276,6 +276,7 @@ fn montgomery_secret(identity: &NodeIdentity) -> x25519_dalek::StaticSecret {
 /// recipients; this catches the same shape arriving as the *ephemeral* half of
 /// an attacker-supplied sealed blob.
 fn cipher_for(
+    context: &str,
     shared: &x25519_dalek::SharedSecret,
     ephemeral_pub: &[u8; 32],
     member_pub: &[u8; 32],
@@ -287,8 +288,94 @@ fn cipher_for(
     material[..32].copy_from_slice(shared.as_bytes());
     material[32..64].copy_from_slice(ephemeral_pub);
     material[64..].copy_from_slice(member_pub);
-    let aead_key = blake3::derive_key(SEALED_KEY_CONTEXT, &material);
+    let aead_key = blake3::derive_key(context, &material);
     Ok(ChaCha20Poly1305::new(&Key::from(aead_key)))
+}
+
+/// Seal `plaintext` to `member` alone: a fresh ephemeral X25519 exchange
+/// against `member`'s converted key, the AEAD key derived under `context`
+/// (see [`cipher_for`]), `aad` bound in. Returns the blob
+/// `ephemeral_pub(32) ‖ ct+tag`.
+///
+/// The one sealing primitive: [`SealedFabricKey::seal`] uses it for fabric
+/// keys and [`crate::announce`] for host announcements. Each use has its own
+/// frozen `context`, so a blob sealed for one never opens as the other.
+///
+/// Returns [`Error::SealedKeyOpen`] for a `member` that is not a usable
+/// Ed25519 key (not a point, or a weak one — see the module docs).
+pub(crate) fn seal_box(
+    member: &NodeId,
+    context: &str,
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<SealedBox> {
+    // Fresh ephemeral secret per seal — the uniqueness that makes the
+    // all-zero nonce safe. (x25519-dalek's `EphemeralSecret::random` needs
+    // the `getrandom` feature and a rand_core-0.10 RNG; the crate is built
+    // without either, so the ephemeral scalar is drawn from the same
+    // `OsRng` the rest of the crate uses and wrapped as a `StaticSecret`.
+    // It is still used exactly once and dropped here.)
+    let mut ephemeral_bytes = [0u8; 32];
+    {
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut ephemeral_bytes);
+    }
+    let ephemeral = x25519_dalek::StaticSecret::from(ephemeral_bytes);
+    let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral);
+    let member_pub = montgomery_public(member)?;
+    let shared = ephemeral.diffie_hellman(&member_pub);
+
+    let ciphertext = cipher_for(
+        context,
+        &shared,
+        ephemeral_pub.as_bytes(),
+        member_pub.as_bytes(),
+    )?
+    .encrypt(
+        &Nonce::from(ZERO_NONCE),
+        Payload {
+            msg: plaintext,
+            aad,
+        },
+    )
+    .map_err(|_| Error::SealedKeyOpen)?;
+
+    let mut blob = Vec::with_capacity(EPHEMERAL_PUB_LEN + ciphertext.len());
+    blob.extend_from_slice(ephemeral_pub.as_bytes());
+    blob.extend_from_slice(&ciphertext);
+    Ok(SealedBox::from_bytes(blob))
+}
+
+/// Open a [`seal_box`] blob as `recipient`, under the same `context` and
+/// `aad`. [`Error::SealedKeyOpen`] when it is not for `recipient`, was
+/// tampered with, is malformed, or carries a non-contributory ephemeral.
+pub(crate) fn open_box(
+    recipient: &NodeIdentity,
+    context: &str,
+    aad: &[u8],
+    sealed: &SealedBox,
+) -> Result<Vec<u8>> {
+    let blob = sealed.as_bytes();
+    if blob.len() <= EPHEMERAL_PUB_LEN {
+        return Err(Error::SealedKeyOpen);
+    }
+    let (ephemeral_pub, ciphertext) = blob.split_at(EPHEMERAL_PUB_LEN);
+    let ephemeral_pub: [u8; 32] = ephemeral_pub.try_into().expect("split at 32");
+    // The recipient's own Montgomery public key — the second half of the
+    // derivation binding. Recomputed from the secret rather than converted
+    // from a claimed id, so it is this node's real key by construction.
+    let secret = montgomery_secret(recipient);
+    let member_pub = x25519_dalek::PublicKey::from(&secret);
+    let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(ephemeral_pub));
+    cipher_for(context, &shared, &ephemeral_pub, member_pub.as_bytes())?
+        .decrypt(
+            &Nonce::from(ZERO_NONCE),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| Error::SealedKeyOpen)
 }
 
 /// A root-signed, member-sealed [`FabricKey`] for one roster version.
@@ -356,36 +443,7 @@ impl SealedFabricKey {
         }
         .aad()?;
 
-        // Fresh ephemeral secret per seal — the uniqueness that makes the
-        // all-zero nonce safe. (x25519-dalek's `EphemeralSecret::random` needs
-        // the `getrandom` feature and a rand_core-0.10 RNG; the crate is built
-        // without either, so the ephemeral scalar is drawn from the same
-        // `OsRng` the rest of the crate uses and wrapped as a `StaticSecret`.
-        // It is still used exactly once and dropped here.)
-        let mut ephemeral_bytes = [0u8; 32];
-        {
-            use rand::RngCore;
-            rand::rngs::OsRng.fill_bytes(&mut ephemeral_bytes);
-        }
-        let ephemeral = x25519_dalek::StaticSecret::from(ephemeral_bytes);
-        let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral);
-        let member_pub = montgomery_public(&member)?;
-        let shared = ephemeral.diffie_hellman(&member_pub);
-
-        let ciphertext = cipher_for(&shared, ephemeral_pub.as_bytes(), member_pub.as_bytes())?
-            .encrypt(
-                &Nonce::from(ZERO_NONCE),
-                Payload {
-                    msg: key.as_bytes(),
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| Error::SealedKeyOpen)?;
-
-        let mut blob = Vec::with_capacity(EPHEMERAL_PUB_LEN + ciphertext.len());
-        blob.extend_from_slice(ephemeral_pub.as_bytes());
-        blob.extend_from_slice(&ciphertext);
-        let sealed = SealedBox::from_bytes(blob);
+        let sealed = seal_box(&member, SEALED_KEY_CONTEXT, &aad, key.as_bytes())?;
 
         let sig = root.sign(&canonical_bytes(&SealedKeyBody {
             format: SEALED_KEY_V1,
@@ -434,19 +492,6 @@ impl SealedFabricKey {
             return Err(Error::SubjectMismatch);
         }
 
-        let blob = self.sealed.as_bytes();
-        if blob.len() <= EPHEMERAL_PUB_LEN {
-            return Err(Error::SealedKeyOpen);
-        }
-        let (ephemeral_pub, ciphertext) = blob.split_at(EPHEMERAL_PUB_LEN);
-        let ephemeral_pub: [u8; 32] = ephemeral_pub.try_into().expect("split at 32");
-        // The recipient's own Montgomery public key — the second half of the
-        // derivation binding. Recomputed from the secret rather than converted
-        // from `self.member`, so it is this node's real key by construction.
-        let secret = montgomery_secret(recipient);
-        let member_pub = x25519_dalek::PublicKey::from(&secret);
-        let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(ephemeral_pub));
-
         let aad = SealedKeyContext {
             format: self.format,
             fabric: &self.fabric,
@@ -455,15 +500,7 @@ impl SealedFabricKey {
             alg: &self.alg,
         }
         .aad()?;
-        let plaintext = cipher_for(&shared, &ephemeral_pub, member_pub.as_bytes())?
-            .decrypt(
-                &Nonce::from(ZERO_NONCE),
-                Payload {
-                    msg: ciphertext,
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| Error::SealedKeyOpen)?;
+        let plaintext = open_box(recipient, SEALED_KEY_CONTEXT, &aad, &self.sealed)?;
         let key: [u8; 32] = plaintext.try_into().map_err(|_| Error::SealedKeyOpen)?;
         Ok(FabricKey::from_bytes(key))
     }
@@ -1074,7 +1111,7 @@ mod tests {
         assert_eq!(shared.as_bytes(), &[0u8; 32]);
         assert!(!shared.was_contributory());
         assert!(matches!(
-            cipher_for(&shared, identity.as_bytes(), &[1u8; 32]),
+            cipher_for(SEALED_KEY_CONTEXT, &shared, identity.as_bytes(), &[1u8; 32]),
             Err(Error::SealedKeyOpen)
         ));
     }

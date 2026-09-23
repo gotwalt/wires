@@ -2,7 +2,8 @@
 //!
 //! A topic message is UTF-8 text (spec §4.1). Most of it is conversation;
 //! some of it is machine-written metadata — call logs from responders
-//! ([`AuditRecord`]) and IdP identity claims ([`IdentityClaim`]). A
+//! ([`AuditRecord`]), IdP identity claims ([`IdentityClaim`]) and host
+//! announcements ([`HostAnnouncement`]). A
 //! [`ChannelRecord`] is that metadata, encoded as a single JSON object tagged
 //! with [`RECORD_V1`] so a reader can tell it from a chat line that merely
 //! happens to be JSON:
@@ -30,6 +31,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::announce::HostAnnouncement;
 use crate::audit::AuditRecord;
 use crate::error::{Error, Result};
 use crate::idp::IdentityClaim;
@@ -45,6 +47,9 @@ pub enum ChannelRecord {
     Audit(AuditRecord),
     /// A node's IdP identity claim.
     Identity(IdentityClaim),
+    /// A host's announcement of the tools it serves (sealed per allowed
+    /// member; see [`crate::announce`]). The sender must be its `node`.
+    Host(HostAnnouncement),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -109,6 +114,13 @@ mod tests {
                 node,
                 id_token: IdToken::new("a.b.c"),
             }),
+            ChannelRecord::Host(crate::announce::HostAnnouncement::new(
+                node,
+                3,
+                600_000,
+                Some(crate::announce::HostListing::default()),
+                vec![],
+            )),
         ]
     }
 
