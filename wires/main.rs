@@ -20,6 +20,7 @@ mod keystore;
 mod pair;
 mod replay;
 mod store;
+mod tools;
 mod topics;
 mod transport;
 
@@ -678,6 +679,8 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         a.inclusion_proof_file.as_deref(),
     )?;
     let config = transport::ServeConfig {
+        tools: Default::default(),
+        audit: None,
         trust_root,
         scope,
         crl,

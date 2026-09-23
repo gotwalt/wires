@@ -79,8 +79,40 @@ pub struct ServeConfig {
     /// The responder's own inclusion proof, presented if set (unused by the
     /// dialer in this slice; reverse roster-freshness is deferred).
     pub proof: Option<InclusionProof>,
-    /// The command (program + args) to exec per session.
+    /// The command (program + args) to exec per session in single-command
+    /// mode. Ignored when [`tools`](Self::tools) is non-empty.
     pub command: Vec<String>,
+    /// Multi-tool mode (`--expose name=cmd`): each exposed tool's fixed argv.
+    /// When non-empty the dialer must send a [`Frame::Invoke`] naming one of
+    /// these; its `argv` is appended to the tool's fixed argv (never through a
+    /// shell). Empty means single-command mode.
+    pub tools: std::collections::BTreeMap<library::ToolName, Vec<String>>,
+    /// Where call records go (`--audit-topic`), if anywhere.
+    pub audit: Option<AuditSink>,
+}
+
+/// The responder's handle for publishing [`AuditRecord`](library::AuditRecord)s.
+///
+/// Cloneable and non-blocking: a session never waits on the audit channel. A
+/// full or closed sink is logged and the record dropped — the call itself is
+/// not failed. (Whether a *missing* audit path should fail closed is the
+/// audit lane's decision; see `docs/board`.)
+#[derive(Clone, Debug)]
+pub struct AuditSink(tokio::sync::mpsc::Sender<library::AuditRecord>);
+
+impl AuditSink {
+    /// A sink and the receiver the audit publisher drains.
+    pub fn channel(cap: usize) -> (Self, tokio::sync::mpsc::Receiver<library::AuditRecord>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(cap);
+        (Self(tx), rx)
+    }
+
+    /// Queue `record` for publishing without waiting.
+    pub fn record(&self, record: library::AuditRecord) {
+        if let Err(e) = self.0.try_send(record) {
+            tracing::warn!("audit record dropped: {e}");
+        }
+    }
 }
 
 /// Where the responder reads its revocation list from.
@@ -857,6 +889,34 @@ where
     result
 }
 
+/// Like [`connect_on`], but for a multi-tool responder: sends
+/// [`Frame::Invoke`] with `invocation` right after the handshake (before the
+/// ack arrives), then bridges stdio exactly as `connect_on` does. The entry
+/// point for `wires call` and `wires mcp`.
+#[allow(clippy::too_many_arguments)]
+pub async fn call_on<R, W, E>(
+    endpoint: Endpoint,
+    target: EndpointAddr,
+    membership: Membership,
+    grant: Option<Grant>,
+    proof: Option<InclusionProof>,
+    ticketless: bool,
+    invocation: library::Invocation,
+    stdin: R,
+    stdout: W,
+    stderr: E,
+) -> Result<i32>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    let _ = (
+        endpoint, target, membership, grant, proof, ticketless, invocation, stdin, stdout, stderr,
+    );
+    todo!("serve-expose lane: send Frame::Invoke after the handshake")
+}
+
 /// The dialer half of a session over an established bi-stream. Presents the
 /// handshake, then reads the responder's `HandshakeAck`; when `verify_target` is
 /// `Some` (ticket-less mode), verifies the responder's membership against the
@@ -1075,6 +1135,8 @@ mod tests {
         command: Vec<String>,
     ) -> ServeConfig {
         ServeConfig {
+            tools: Default::default(),
+            audit: None,
             trust_root: root.node_id(),
             scope: scope.map(Scope::new),
             crl: CrlSource::Fixed(crl),
@@ -1158,6 +1220,8 @@ mod tests {
         )
         .unwrap();
         let config = ServeConfig {
+            tools: Default::default(),
+            audit: None,
             trust_root,
             scope: served_scope.map(Scope::new),
             crl: CrlSource::Fixed(crl),
@@ -1348,6 +1412,8 @@ mod tests {
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
         let head_path = temp_dir().join("roster-head.json");
         let config = ServeConfig {
+            tools: Default::default(),
+            audit: None,
             trust_root: root.node_id(),
             scope: None,
             crl: CrlSource::Fixed(Crl::new()),
@@ -1402,6 +1468,8 @@ mod tests {
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
         let crl_path = temp_dir().join("crl.json");
         let config = Arc::new(ServeConfig {
+            tools: Default::default(),
+            audit: None,
             trust_root: root.node_id(),
             scope: None,
             crl: CrlSource::File(crl_path.clone()),
@@ -1937,6 +2005,8 @@ mod tests {
         let (head, proofs) = roster.commit(root, 0, i64::MAX).unwrap();
         let proof = proofs.into_iter().find(|(m, _)| *m == member).unwrap().1;
         let config = ServeConfig {
+            tools: Default::default(),
+            audit: None,
             trust_root: root.node_id(),
             scope: None,
             crl: CrlSource::Fixed(Crl::new()),
@@ -2073,6 +2143,8 @@ mod tests {
         let server_ep = test_endpoint(&server).await;
         let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
         let config = ServeConfig {
+            tools: Default::default(),
+            audit: None,
             trust_root: root.node_id(),
             scope: None,
             crl: CrlSource::Fixed(Crl::new()),
@@ -2135,6 +2207,8 @@ mod tests {
         let server_ep = test_endpoint(&server).await;
         let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
         let config = ServeConfig {
+            tools: Default::default(),
+            audit: None,
             trust_root: root.node_id(),
             scope: None,
             crl: CrlSource::Fixed(Crl::new()),
@@ -2192,6 +2266,8 @@ mod tests {
             let addr =
                 endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
             let config = ServeConfig {
+                tools: Default::default(),
+                audit: None,
                 trust_root,
                 scope: None,
                 crl: CrlSource::Fixed(Crl::new()),

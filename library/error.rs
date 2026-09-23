@@ -141,4 +141,12 @@ pub enum Error {
     /// An envelope's `topic` is not the topic it was received on.
     #[error("envelope is for a different topic")]
     TopicMismatch,
+
+    /// A tool name broke the [`ToolName`](crate::ToolName) rules.
+    #[error("invalid tool name")]
+    InvalidToolName,
+
+    /// An argument list broke the [`Argv`](crate::Argv) limits.
+    #[error("invalid argv")]
+    InvalidArgv,
 }

@@ -25,6 +25,14 @@
 //!   the roster gate in front of the gossip mesh.
 //! - [`replay`] — the [`ReplayFrame`] codec for peer-symmetric catch-up.
 //!
+//! Remote CLIs with an observable call log build on both:
+//!
+//! - [`invoke`] — the [`Invocation`] (tool + [`Argv`]) a dialer asks a
+//!   multi-tool responder to run.
+//! - [`audit`] — the [`AuditRecord`]s a responder publishes about each call.
+//! - [`idp`] — [`IdentityClaim`]: an IdP-signed ID token bound to a node key.
+//! - [`record`] — [`ChannelRecord`], how both ride a topic as message text.
+//!
 //! # Example: mint a capability, pack a ticket, accept it
 //!
 //! ```
@@ -117,14 +125,18 @@
 //! ```
 
 pub mod admission;
+pub mod audit;
 pub mod chain;
 pub mod envelope;
 pub mod error;
 pub mod fabric_key;
 pub mod grant;
 pub mod identity;
+pub mod idp;
+pub mod invoke;
 pub mod membership;
 pub mod policy;
+pub mod record;
 pub mod replay;
 pub mod roster;
 pub mod session;
@@ -136,6 +148,7 @@ mod codec;
 pub use admission::{
     Admission, AdmitFrame, MAX_ADMIT_FRAME, TOPIC_ADMIT_ALPN, adopt_if_newer, check_topic_admission,
 };
+pub use audit::{AuditRecord, CallId, OutputDigest};
 pub use chain::{ChainState, LinkStatus, classify_link, next_prev_hash};
 pub use envelope::{
     Ciphertext, ENVELOPE_NONCE_CONTEXT, ENVELOPE_V1, MessageHash, MessageNonce, Seq, TopicEnvelope,
@@ -144,8 +157,11 @@ pub use error::{Error, Result};
 pub use fabric_key::{FabricKey, SEALED_KEY_CONTEXT, SEALED_KEY_V1, SealedBox, SealedFabricKey};
 pub use grant::{AlgorithmId, Grant, Scope};
 pub use identity::{NodeId, NodeIdentity, Signature};
+pub use idp::{IdToken, IdentityClaim, OIDC_NONCE_CONTEXT, OidcNonce, Principal};
+pub use invoke::{Argv, Invocation, MAX_ARGS, MAX_ARGV_BYTES, MAX_TOOL_NAME, ToolName};
 pub use membership::{MEMBERSHIP_V1, Membership};
 pub use policy::{Crl, check_accept, check_inclusion, check_roster_inclusion};
+pub use record::{ChannelRecord, RECORD_V1};
 pub use replay::{MAX_REPLAY_FRAME, ReplayFrame, TOPIC_REPLAY_ALPN};
 pub use roster::{
     InclusionProof, MerkleRoot, MerkleStep, ROSTER_HEAD_V1, Roster, RosterHead, RosterVersion, Side,

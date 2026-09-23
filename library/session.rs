@@ -29,6 +29,12 @@
 //! | `4`  | `Exit`      | 4-byte big-endian `i32`                    |
 //! | `5`  | `HandshakeAck` | canonical-JSON of the ack envelope      |
 //! | `6`  | `Denied`    | UTF-8 reason bytes                         |
+//! | `7`  | `Invoke`    | canonical-JSON of the [`Invocation`]       |
+//!
+//! A dialer calling a multi-tool responder sends [`Frame::Invoke`] immediately
+//! after its `Handshake`, without waiting for the ack — the responder reads
+//! both, authorizes them together, and only then answers with `HandshakeAck`
+//! or `Denied`. A single-command responder never expects one.
 //!
 //! The handshake envelope is the canonical JSON of a [`Membership`] plus an
 //! optional [`Grant`]. The envelope itself is *unsigned* — the signed objects
@@ -40,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use crate::codec::canonical_bytes;
 use crate::error::{Error, Result};
 use crate::grant::Grant;
+use crate::invoke::Invocation;
 use crate::membership::Membership;
 use crate::roster::InclusionProof;
 
@@ -50,6 +57,7 @@ const TAG_STDERR: u8 = 3;
 const TAG_EXIT: u8 = 4;
 const TAG_HANDSHAKE_ACK: u8 = 5;
 const TAG_DENIED: u8 = 6;
+const TAG_INVOKE: u8 = 7;
 
 /// A chunk of stdio bytes carried in a [`Frame`].
 ///
@@ -149,6 +157,9 @@ pub enum Frame {
         /// Why the session was refused (e.g. `membership rejected: revoked`).
         reason: String,
     },
+    /// Dialer → multi-tool responder, right after `Handshake`: which exposed
+    /// tool to run and the per-call arguments.
+    Invoke(Invocation),
 }
 
 impl Frame {
@@ -213,6 +224,10 @@ impl Frame {
                 payload.push(TAG_DENIED);
                 payload.extend_from_slice(reason.as_bytes());
             }
+            Frame::Invoke(invocation) => {
+                payload.push(TAG_INVOKE);
+                payload.extend_from_slice(&canonical_bytes(invocation)?);
+            }
         }
         let len: u32 = payload.len().try_into().map_err(|_| Error::BadFrame)?;
         let mut out = Vec::with_capacity(4 + payload.len());
@@ -265,6 +280,7 @@ impl Frame {
             TAG_DENIED => Frame::Denied {
                 reason: String::from_utf8(body.to_vec()).map_err(|_| Error::BadFrame)?,
             },
+            TAG_INVOKE => Frame::Invoke(serde_json::from_slice(body).map_err(Error::Decode)?),
             _ => return Err(Error::BadFrame),
         };
         Ok(Some((frame, end)))
@@ -333,6 +349,14 @@ mod tests {
             bytes().prop_map(|b| Frame::Stderr(Chunk::from_bytes(b))),
             any::<i32>().prop_map(Frame::Exit),
             any::<String>().prop_map(|reason| Frame::Denied { reason }),
+            (
+                "[a-z][a-z0-9_-]{0,20}",
+                proptest::collection::vec("[^\u{0}]{0,16}", 0..6)
+            )
+                .prop_map(|(tool, args)| Frame::Invoke(crate::invoke::Invocation {
+                    tool: crate::invoke::ToolName::new(tool).unwrap(),
+                    argv: crate::invoke::Argv::new(args).unwrap(),
+                })),
         ]
     }
 
