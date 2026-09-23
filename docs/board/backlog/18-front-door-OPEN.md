@@ -11,7 +11,7 @@ it know it's the *real* lobby? The target UX floated: `wires join acmecorp.com`.
 
 - DNS `_wires.<domain>` TXT publishes the lobby's **public** root key and a front-desk (enrollment) node id. Publishing an invite token there is **unsafe**: it's a bearer credential.
 - Fake-lobby risk (DNS spoofing or registrar hijack): cross-check against `https://<domain>/.well-known/wires` (WebPKI), pin on first join, optional `--root <fingerprint>`, check the IdP `hd`/org claim.
-- A front desk admits anyone whose IdP identity matches a rule; it holds a **limited delegation** signed by the offline apex key, not the apex key itself. Needs a delegation chain in membership verification (unbuilt; the old "authority chain" idea in `docs/archive/fabric-vision.md`).
+- A front desk admits anyone whose IdP identity matches a rule; it holds a **limited delegation** signed by the offline apex key, not the apex key itself. Needs a delegation chain in membership verification (unbuilt; the old "authority chain" idea is in git history).
 
 ## Related, and separately decided
 

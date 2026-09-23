@@ -28,8 +28,8 @@ Usage lives in `README.md`. Deployment and testing patterns live in
 `docs/committed-roster.md` (membership and revocation) and
 `docs/phase2-topics.md` (the encrypted channels). `docs/restart.md` is
 history: the phase plan, kill criteria, and non-negotiables (§7 still holds).
-`docs/archive/` holds superseded design docs, including the session-layer
-thesis. The pre-restart prototype is tagged `archive/poc-2026-05`: reference
+**Git history is the archive:** outdated docs are deleted, not moved aside.
+The product summary is `docs/executive-summary.md`. The pre-restart prototype is tagged `archive/poc-2026-05`: reference
 it freely, but never merge from it. That includes the old HTTP/OAuth
 `wires-mcp` gateway, which `wires mcp` replaces; don't port it.
 

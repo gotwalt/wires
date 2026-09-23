@@ -23,7 +23,7 @@ and a live revocation.
 - [ ] Token comparison: same task via `wires call` (Bash) vs `wires mcp` — record
       input/output token counts from the session for the CLI-efficiency claim. Report
       honestly even if the gap is small.
-- [ ] Record (asciinema + agg, or screen capture) → replace `docs/demo-revoke.gif` in README.
+- [ ] Record (asciinema + agg, or screen capture) → add the recording to the README (the old `demo-revoke.gif` was deleted).
 
 ## Notes
 

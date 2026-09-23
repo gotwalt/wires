@@ -43,15 +43,13 @@ Verify each is unused on the current tree before removing it; if something is st
 
 | File | Default | Why |
 |---|---|---|
-| `docs/archive/*` (5 files: fabric vision, provable inclusion, roster plan, rust-bazel layout, session-layer thesis) | **delete** | Superseded history; the Bazel layout doc dies with Part A. |
-| `docs/demo-revoke.gif` | **delete** | Records the Phase 1 `connect`/revoke demo, which no longer exists. |
+| `docs/archive/*`, `docs/demo-revoke.gif`, `docs/research/` | ✅ **deleted 2026-09-23** (the human: "git history provides the backup") | — |
 | `docs/restart.md` | **delete**, after carrying its still-live content (the §7 non-negotiables and kill criteria) into `docs/board/README.md` in ≤ 10 lines | The phase plan is superseded by the board. |
 | `docs/committed-roster.md`, `docs/phase2-topics.md` | **rewrite into one current spec** (`docs/protocol.md`): roster, re-key, channel, records, as built; drop grants/CRL/Phase-2 framing | They describe removed features and old names. |
 | `docs/deployment.md` | rewrite for the Dockerfile + `wires serve host.json`, or delete if under ~20 useful lines | k8s/Bazel-era. |
 | `docs/testing.md` | rewrite for Cargo (short) | Bazel-era. |
 | `docs/storytelling.md` | keep, trimmed to the rebuttal test (§1) and anything the board references | It's still how pitch sentences get checked. |
 | `docs/demo.md`, `docs/agent-sandbox.md` | keep; update commands for Cargo | Current. |
-| `docs/research/agent-comms-2026-08/` (7 files left) | **ask the human** whether to delete; the executive summary was rewritten for the current product and moved to `docs/executive-summary.md` (2026-09-23) and cites the research's figures | The lanes and synthesis describe the retired group-chat pitch; cards 22/23 cite lane 2. |
 | `docs/board/done/*` | keep until after the demo; then optionally collapse into `docs/board/HISTORY.md` (one paragraph per card) | Cards carry decisions and Notes still being referenced. |
 | `CLAUDE.md`, `README.md` | fix every link to a deleted doc | — |
 

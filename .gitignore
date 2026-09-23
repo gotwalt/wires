@@ -16,6 +16,6 @@ node_modules/
 vendor/bundle/
 /target/
 
-# Claude Code local state
-.claude/settings.local.json
-.claude/worktrees/
+# Claude Code local state (worktrees, scratch keystores with seeds/tokens); only the shared settings are tracked
+.claude/*
+!.claude/settings.json

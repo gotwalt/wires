@@ -154,7 +154,7 @@ commit the `.cast` beside the `.gif` (diffable, cheap to re-encode), and a
 README:
 
 ```bash
-asciinema rec -c ./.scripts/demo-revoke.sh demo.cast && agg demo.cast docs/demo-revoke.gif
+asciinema rec -c ./.scripts/demo-remote-cli.sh demo.cast && agg demo.cast docs/demo.gif
 ```
 
 ## 5. Conventions

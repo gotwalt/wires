@@ -1,9 +1,9 @@
 # Design: the committed roster (slice 2)
 
-The second concrete step toward the [fabric vision](./archive/fabric-vision.md): a
+The second concrete step toward the fabric vision (deleted; see git history): a
 **root-signed, versioned commitment to the member set**, so a verifier can
 decide not just "did the root vouch for this node *once*" (the slice-1
-[membership credential](./archive/provable-fabric-inclusion.md)) but "is this node a
+membership credential) but "is this node a
 member *right now*" — offline, against a 32-byte head it already holds, with no
 extra network traffic. Revocation becomes "re-sign the head without that node."
 
@@ -277,7 +277,7 @@ presented credential proves *root-vouched identity with a TTL*. Richer leaves
 ## Forward-compat: the same discipline as slice 1
 
 The head is signed bytes from `canonical_bytes`, so the
-[slice-1 rule](./archive/provable-fabric-inclusion.md) applies verbatim: **optional-but-signed
+slice-1 rule applies verbatim: **optional-but-signed
 is forbidden.** The `format` field is signed and **each format serializes a fixed,
 total set of fields**; a future v2 head defines a separate `RosterHeadBodyV2`
 (say, adding a `prev` hash to chain heads) and `verify` dispatches on

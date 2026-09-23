@@ -5,7 +5,7 @@
 ## Why
 
 MCP's 2026-07-28 spec removed server-initiated streams, and its long-running-work
-extension is poll-based (`tasks/get`) (`docs/research/…/lane-2-agent-protocols.md`).
+extension is poll-based (`tasks/get`) (MCP spec blog, https://blog.modelcontextprotocol.io/posts/2026-07-28/; summarised in `docs/executive-summary.md`).
 Everyone else pushes with webhooks, which need the **receiver** to have a public,
 routable HTTPS endpoint; an agent on a laptop, in a sandbox, or behind NAT has
 none. Today an agent can call things, but nothing can call the agent back.
