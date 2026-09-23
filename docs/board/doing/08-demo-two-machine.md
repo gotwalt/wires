@@ -58,3 +58,6 @@ Fresh provisioning with `init` / `id` / `invite` / `join`; workbench runs `wires
 2. `wires remove` prints two WARN lines (`gossip connection from a peer with no admission`, from the admin's one-shot node); `remove`/`invite` should be quiet by default.
 3. A removed member's refusal reads `stale inclusion proof: proof targets version 4, head is version 5`. It should say "not in the current roster (removed at version 5)".
 4. After `remove agent`, the host's re-announcement still carries **1 sealed entry**, and the only qualifying identity was the removed agent's. It looks like announcements are sealed to verified identities without checking current roster membership. The removed member can't open it (it's under the new channel key), but the recipient set should be the current roster ∩ allowed.
+
+
+**Order agreed with the human (2026-09-23):** 24 → 25 (Cargo + strip) → 26 (records off the broadcast channel) → recording.

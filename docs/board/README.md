@@ -68,6 +68,7 @@ The IdP is *bound* at the caller (`login`), *enforced* at the host (`host.json`)
 | [23](review/23-inbox.md) | I | 21 | Push to callers: `wires inbox` (local read / `--wait`), host `wires push`, queue + dial-back by key, `host.json` `push` roles, audited |
 | [24](backlog/24-push-demo.md) | E2 | 23 | Push demo (deploy → callback → follow-up) + push-vs-poll benchmark |
 | [25](backlog/25-cargo-and-strip.md) | X | 23, 24 | Down to essentials: Bazel → plain Cargo + Dockerfile; remove grants/tickets/CRL/relay/manual targets and outdated docs (git history is the archive) |
+| [26](backlog/26-host-held-records.md) | H2 | 25 | Call records off the broadcast channel: host-held signed log, per-host `watch` for authorized readers + own calls, optional OTel export |
 | [22](backlog/22-gossip-role-OPEN.md) | — | parked | **Open question, don't build:** does the core need gossip? Admin-signed host list + direct discovery + OTel sinks; notes the tool-name-squatting weakness |
 | [18](backlog/18-front-door-OPEN.md) | — | parked | **Open question, don't build:** apex key, invites, `wires join <domain>` |
 | [16](done/16-token-benchmark.md) | bench | 01–03 | MCP (GitHub server, many tools; ± tool search) vs `gh` via `wires call` vs bare `gh`: 5 tasks × 5 runs |
