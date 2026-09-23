@@ -115,6 +115,19 @@ pub(crate) fn join_in(ks: &Keystore, home: &Path, token: &str, now: i64) -> anyh
         now,
     )?;
     ks.save_channel(&invite.channel)?;
+    // Card 27: the admin-signed state (verified above) and where to pull
+    // newer ones from. An older copy never replaces a newer one held here.
+    let state_line = match &invite.state {
+        Some(state) => {
+            crate::state::store::adopt_if_newer(ks, state, fabric, now)?;
+            crate::state::store::mark_checked(ks, now)?;
+            format!(", state version {}", state.state.version.0)
+        }
+        None => String::new(),
+    };
+    if let Some(admin) = invite.admin {
+        crate::state::store::save_admin(ks, admin)?;
+    }
     let mut book = PeerBook::open(home, TopicId::derive(fabric, &invite.channel));
     for peer in &invite.peers {
         book.record(peer.clone());
@@ -122,7 +135,7 @@ pub(crate) fn join_in(ks: &Keystore, home: &Path, token: &str, now: i64) -> anyh
     book.save();
 
     let mut out = format!(
-        "joined fabric {}… as {}… on channel {:?} (roster version {})",
+        "joined fabric {}… as {}… on channel {:?} (roster version {}{state_line})",
         &fabric.hex()[..8],
         &me.node_id().hex()[..8],
         invite.channel,
@@ -215,6 +228,54 @@ mod tests {
         let err = join_in(&bare, &home, &invite.encode().unwrap(), 0).unwrap_err();
         assert!(format!("{err:#}").contains("wires id"), "{err:#}");
         assert!(join_in(&ks, &home, "garbage!", 0).is_err());
+    }
+
+    #[test]
+    fn join_stores_the_signed_state_and_never_rolls_it_back() {
+        use library::{State, StateVersion};
+        let home = temp_dir();
+        let ks = Keystore::at(&home);
+        let (me, _) = id_in(&ks).unwrap();
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let admin = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let signed = |v: u64| {
+            let mut s = State::new(root.node_id());
+            s.version = StateVersion(v);
+            s.not_after = i64::MAX;
+            s.members.insert(me);
+            s.sign(&root).unwrap()
+        };
+        let (invite, _) = invite_for(me, Vec::new());
+        let out = join_in(
+            &ks,
+            &home,
+            &invite
+                .clone()
+                .with_state(signed(3), admin)
+                .encode()
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+        assert!(out.contains("state version 3"), "{out}");
+        let held = crate::state::store::read(&ks, root.node_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.state.version, StateVersion(3));
+        assert_eq!(crate::state::store::read_admin(&ks).unwrap(), Some(admin));
+
+        // Re-joining with an older token keeps the newer state.
+        join_in(
+            &ks,
+            &home,
+            &invite.with_state(signed(2), admin).encode().unwrap(),
+            0,
+        )
+        .unwrap();
+        let held = crate::state::store::read(&ks, root.node_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.state.version, StateVersion(3));
     }
 
     #[test]

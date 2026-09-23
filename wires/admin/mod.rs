@@ -13,8 +13,8 @@
 //!   flag → env → file → keystore resolution every command uses.
 //! - [`keys`] — `member`.
 //! - [`roster`] — `roster add | remove | commit | head`.
-//! - [`service`] — `wires service add | rm | set`: the registry (card 27,
-//!   27a stub).
+//! - [`service`] — `wires service add | set | rm` and `wires role set | rm`:
+//!   edit the admin-signed state (card 27) and push it.
 //! - [`import`] — installing the credentials the admin hands out.
 
 pub mod commit;

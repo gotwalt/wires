@@ -76,13 +76,17 @@ pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
     let rekey = commit_locally(ks, &root, &me, &mut roster, not_after)?;
     ks.save_channel(&channel)?;
     ks.save_names(&BTreeMap::new())?;
+    // Card 27: the first admin-signed state, this node its one member.
+    let state = super::service::edit_state(ks, a.ttl, |_| Ok(()))?;
+    crate::state::store::save_admin(ks, me.node_id())?;
 
     Ok(format!(
-        "fabric {}\nnode {}\nchannel {channel:?} (roster version {}, 1 member: this node)\n\
+        "fabric {}\nnode {}\nchannel {channel:?} (roster version {}, state version {}, 1 member: this node)\n\
          next: on each joining machine run `wires id`, then here `wires invite <node-id> --name <label>`",
         root.node_id().hex(),
         me.node_id().hex(),
         rekey.head.version.0,
+        state.state.version.0,
     ))
 }
 
@@ -122,6 +126,15 @@ mod tests {
             Some(head.version)
         );
         assert_eq!(ks.read_channel().unwrap().as_deref(), Some("ops"));
+        let state = crate::state::store::read(&ks, root.node_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.state.version, library::StateVersion(1));
+        assert_eq!(state.state.members, [me.node_id()].into());
+        assert_eq!(
+            crate::state::store::read_admin(&ks).unwrap(),
+            Some(me.node_id())
+        );
         // The topic commands resolve with no flags at all.
         let ctx = crate::channel::context::TopicContext::resolve(
             std::sync::Arc::new(Keystore::at(ks.path(""))),

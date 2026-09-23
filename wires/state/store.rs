@@ -6,9 +6,6 @@
 //! require it to be strictly newer, write atomically. Without the lock a
 //! removed member presenting a genuine older state could roll a node back.
 
-// Nothing calls these until lanes 27a/27b/27c wire them in.
-#![allow(dead_code)]
-
 use std::fs::OpenOptions;
 
 use anyhow::{Context, Result, bail};
@@ -83,6 +80,51 @@ pub(crate) fn adopt_if_newer(
     // `lock` drops here, releasing the file lock.
 }
 
+/// The admin's node id (`state-admin.txt`): where a member pulls newer
+/// states from, besides the hosts. An unsigned hint from `init` or the
+/// invite token.
+const ADMIN_FILE: &str = "state-admin.txt";
+
+/// When this node last checked its copy with a peer (`state-checked.txt`,
+/// unix seconds): what "older than 10 minutes" is measured against.
+const CHECKED_FILE: &str = "state-checked.txt";
+
+/// The fabric root this keystore belongs to (its membership's `fabric`);
+/// `None` before `init` or `join`.
+pub(crate) fn fabric(ks: &Keystore) -> Result<Option<NodeId>> {
+    Ok(ks.read_membership()?.map(|m| m.fabric))
+}
+
+/// The recorded admin node id, if any.
+pub(crate) fn read_admin(ks: &Keystore) -> Result<Option<NodeId>> {
+    match std::fs::read_to_string(ks.path(ADMIN_FILE)) {
+        Ok(text) => Ok(Some(
+            NodeId::from_hex(text.trim()).context("parsing state-admin.txt")?,
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).context("reading state-admin.txt"),
+    }
+}
+
+/// Record the admin's node id.
+pub(crate) fn save_admin(ks: &Keystore, admin: NodeId) -> Result<()> {
+    write_text_mode(&ks.path(ADMIN_FILE), &format!("{}\n", admin.hex()), None)
+}
+
+/// Record that this node's copy was checked against a peer at `now`.
+pub(crate) fn mark_checked(ks: &Keystore, now: i64) -> Result<()> {
+    write_text_mode(&ks.path(CHECKED_FILE), &format!("{now}\n"), None)
+}
+
+/// Whether this node's copy was last checked more than `max_age` seconds
+/// before `now` (or never).
+pub(crate) fn is_stale(ks: &Keystore, now: i64, max_age: i64) -> bool {
+    std::fs::read_to_string(ks.path(CHECKED_FILE))
+        .ok()
+        .and_then(|t| t.trim().parse::<i64>().ok())
+        .is_none_or(|at| now.saturating_sub(at) > max_age)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +181,18 @@ mod tests {
         forged.state.version = StateVersion(9);
         std::fs::write(&path, format!("{}\n", forged.encode().unwrap())).unwrap();
         assert!(read(&ks, root.node_id()).is_err());
+    }
+
+    #[test]
+    fn staleness_and_the_admin_hint() {
+        let ks = keystore();
+        assert!(is_stale(&ks, 1_000, 600), "never checked is stale");
+        mark_checked(&ks, 1_000).unwrap();
+        assert!(!is_stale(&ks, 1_600, 600));
+        assert!(is_stale(&ks, 1_601, 600));
+        assert_eq!(read_admin(&ks).unwrap(), None);
+        let admin = NodeIdentity::generate().node_id();
+        save_admin(&ks, admin).unwrap();
+        assert_eq!(read_admin(&ks).unwrap(), Some(admin));
     }
 }
