@@ -7,6 +7,8 @@
 //!
 //! - [`call`] — dial a tool and bridge stdio; the exit code is the remote one.
 //! - [`shape`] — `--jq` / `--head` / `--max-bytes`: output shaping, in-process.
+//! - [`lock`] — locked mode: `WIRES_LOCKED=1` refuses the override flags so a
+//!   sandboxed agent can't steer `call`/`mcp` off the operator's config.
 //! - [`mcp`] — the same calls as MCP tools over stdio (backward compatibility).
 //! - [`resolve`] — the channel is the directory: hosts' announcements, cached
 //!   in `directory.json`, resolve a name to a host (card 15).
@@ -20,6 +22,7 @@
 pub mod call;
 pub mod join;
 pub mod jwks;
+pub mod lock;
 pub mod login;
 pub mod mcp;
 /// A hermetic OIDC issuer for the `wires login` tests (card 04), also served

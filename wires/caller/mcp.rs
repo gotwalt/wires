@@ -481,7 +481,12 @@ pub struct McpArgs {
 }
 
 /// `wires mcp`: load `tools.json` and credentials, then serve MCP on stdio.
+///
+/// In locked mode ([`Lock`](crate::caller::lock::Lock)) an override flag is
+/// refused before anything loads. A tool's `stdin` field is still accepted:
+/// it is text in the client's request, never a file this process reads.
 pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
+    crate::caller::lock::Lock::detect()?.check(&a.creds)?;
     let path = crate::caller::tools::resolve_path(a.creds.tools_file.as_deref())?;
     let config = ToolsConfig::load(&path)?;
     // Plus every tool the channel's hosts announce to this node (card 15).
@@ -578,6 +583,7 @@ mod tests {
                 entry("locked", "Refused"),
                 entry("offline", "Unreachable"),
             ],
+            locked: false,
         };
         let caller = FakeCaller::default()
             .answer("db_query", Ok(exited(0, "id\n1\n", "")))

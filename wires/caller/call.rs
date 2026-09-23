@@ -23,6 +23,7 @@ use library::{
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::admin::keystore;
+use crate::caller::lock::{EXIT_LOCKED, Lock, check_process_stdin};
 use crate::caller::shape::{EXIT_SHAPE, Shape, ShapeArgs, exit_code};
 use crate::caller::tools::{RemoteTool, ToolTarget, ToolsConfig, tool_from_scope};
 use crate::host::transport;
@@ -226,6 +227,10 @@ fn outcome(result: Result<i32>, stdout: Vec<u8>, stderr: Vec<u8>) -> Result<Call
 }
 
 /// Credential and config flags shared by `wires call` and `wires mcp`.
+///
+/// Every one of them is refused in locked mode (`WIRES_LOCKED=1`, see
+/// [`crate::caller::lock`]): they are how a caller is steered off the
+/// operator's configuration.
 #[derive(Args, Clone, Debug, Default)]
 pub struct CredArgs {
     /// Use this file instead of `$WIRES_HOME/tools.json`.
@@ -297,13 +302,30 @@ pub fn lookup<'a>(config: &'a ToolsConfig, name: &str) -> Result<&'a RemoteTool>
 ///
 /// The shaping flags are local: they are not part of the [`Invocation`], so
 /// the host never sees them and its call record holds only `(tool, argv)`.
+///
+/// In locked mode ([`Lock`]), an override flag, or data on stdin the operator
+/// didn't allow, fails with [`EXIT_LOCKED`] before anything is dialed.
 pub async fn call_cmd(a: CallArgs) -> Result<i32> {
+    let lock = Lock::detect()?;
+    if let Err(e) = lock.check(&a.creds) {
+        eprintln!("wires: {e}");
+        return Ok(EXIT_LOCKED);
+    }
     let shape = match Shape::new(&a.shape) {
         Ok(shape) => shape,
         Err(e) => {
             eprintln!("wires: {e}");
             return Ok(EXIT_SHAPE);
         }
+    };
+    let stdin: Box<dyn AsyncRead + Unpin + Send> = if lock.refuses_stdin() {
+        if let Err(e) = check_process_stdin().await {
+            eprintln!("wires: {e}");
+            return Ok(EXIT_LOCKED);
+        }
+        Box::new(tokio::io::empty())
+    } else {
+        Box::new(tokio::io::stdin())
     };
     let config = ToolsConfig::load(&crate::caller::tools::resolve_path(
         a.creds.tools_file.as_deref(),
@@ -317,21 +339,14 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
         return dial(
             &creds,
             plan,
-            tokio::io::stdin(),
+            stdin,
             tokio::io::stdout(),
             tokio::io::stderr(),
         )
         .await;
     }
     let mut stdout = Vec::new();
-    let remote = dial(
-        &creds,
-        plan,
-        tokio::io::stdin(),
-        &mut stdout,
-        tokio::io::stderr(),
-    )
-    .await?;
+    let remote = dial(&creds, plan, stdin, &mut stdout, tokio::io::stderr()).await?;
     write_shaped(
         &shape,
         remote,
@@ -462,6 +477,7 @@ mod tests {
         let config = ToolsConfig {
             audit_topic: None,
             tools: vec![tool(ToolTarget::Ticket(ticket("tools.rg")), None)],
+            locked: false,
         };
         assert!(lookup(&config, "local").is_ok());
         let err = lookup(&config, "nope").unwrap_err().to_string();
