@@ -8,7 +8,7 @@
 //! - **Signature** — anyone can verify authorship and integrity with
 //!   [`verify`](TopicEnvelope::verify) alone, holding no key material. That is
 //!   what lets a node *store* messages whose fabric key it does not have yet;
-//!   when a late `wires import` installs the key, the history heals and
+//!   when a late `wires advanced import` installs the key, the history heals and
 //!   displays.
 //! - **Encryption** — [`open`](TopicEnvelope::open) needs the key for
 //!   `key_version`. Authorization is roster inclusion plus key possession;
@@ -53,7 +53,7 @@
 //! nothing to an observer who does not hold it.
 //!
 //! The operational rule still stands: a `(node, topic)` pair has exactly one
-//! sequence allocator (the resident `wires tail` process). This is what makes a
+//! sequence allocator (the resident `wires watch` process). This is what makes a
 //! rollback survivable rather than catastrophic, not a licence to skip it.
 //!
 //! # What is deliberately absent

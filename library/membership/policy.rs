@@ -15,7 +15,7 @@ use crate::roster::{InclusionProof, RosterHead};
 /// A revocation list of subject node ids whose grants must be refused.
 ///
 /// Serializes as `{"revoked": [<hex node id>, …]}`, so a responder can persist
-/// it and `wires revoke` can round-trip it as JSON.
+/// it and `wires advanced revoke` can round-trip it as JSON.
 #[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Crl {
     revoked: Vec<NodeId>,

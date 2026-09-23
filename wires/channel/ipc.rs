@@ -1,8 +1,8 @@
-//! The control socket: how `wires publish` reaches the resident `wires tail`
+//! The control socket: how `wires advanced publish` reaches the resident `wires watch`
 //! (spec §7.1).
 //!
 //! redb locks a topic's log to one process and one endpoint identity must not
-//! run twice, so `wires tail` is the resident node — it owns the store, the
+//! run twice, so `wires watch` is the resident node — it owns the store, the
 //! endpoint, and, decisively, the **sequence allocator**. A second process that
 //! wanted to publish by opening the same log would either fail on the lock or,
 //! worse, hand out a sequence number the tail has already used, which is a
@@ -20,7 +20,7 @@
 //! ```
 //!
 //! NDJSON, one request per line, replies in order on the same connection — so a
-//! `wires publish` fed a hundred lines of stdin sends a hundred requests over
+//! `wires advanced publish` fed a hundred lines of stdin sends a hundred requests over
 //! one connection and the tail allocates a hundred consecutive sequences.
 //!
 //! # Who may connect
@@ -66,7 +66,7 @@ pub const RUN_DIR: &str = "run";
 /// far past any message a human types and far short of anything that hurts.
 pub const MAX_REQUEST_LINE: usize = 1024 * 1024;
 
-/// How long `wires publish` waits for the tail's reply to one line.
+/// How long `wires advanced publish` waits for the tail's reply to one line.
 ///
 /// The tail answers from its select loop, which also serves the mesh, so a reply
 /// can be delayed by a catch-up pass or a slow peer — every one of those is now
@@ -179,7 +179,7 @@ fn owner_uid(_path: &Path) -> Option<u32> {
 // The wire protocol
 // ---------------------------------------------------------------------------
 
-/// One request from `wires publish` to the resident tail.
+/// One request from `wires advanced publish` to the resident tail.
 ///
 /// Externally tagged, so the JSON is `{"publish":{"text":"…"}}` — an object with
 /// one key naming the operation, which leaves room for later operations without
@@ -217,7 +217,7 @@ pub struct Published {
 }
 
 // ---------------------------------------------------------------------------
-// Server side (owned by `wires tail`)
+// Server side (owned by `wires watch`)
 // ---------------------------------------------------------------------------
 
 /// A publish handed to the tail loop, with the channel its answer goes back on.
@@ -262,7 +262,7 @@ impl ControlSocket {
         if path.exists() {
             if is_live(path).await {
                 bail!(
-                    "another `wires tail` is already serving this topic (its control socket at \
+                    "another `wires watch` is already serving this topic (its control socket at \
                      {} answered); stop it before starting a second one — a topic's log and \
                      sequence allocator belong to exactly one process",
                     path.display()
@@ -442,12 +442,12 @@ async fn read_capped_line<R: AsyncBufRead + Unpin>(
 }
 
 // ---------------------------------------------------------------------------
-// Client side (owned by `wires publish`)
+// Client side (owned by `wires advanced publish`)
 // ---------------------------------------------------------------------------
 
 /// A connection to a resident tail's control socket.
 ///
-/// Holds the connection open across many publishes, so a `wires publish` reading
+/// Holds the connection open across many publishes, so a `wires advanced publish` reading
 /// stdin sends every line down one connection and the tail allocates one
 /// contiguous run of sequences.
 #[derive(Debug)]
@@ -838,7 +838,7 @@ mod tests {
 
     #[test]
     fn the_wire_forms_are_the_documented_ones() {
-        // The protocol is the contract with `wires publish`, including anything
+        // The protocol is the contract with `wires advanced publish`, including anything
         // an operator debugs with `socat`; pin the exact JSON.
         let request = Request::Publish(Publish {
             text: "ship it".into(),

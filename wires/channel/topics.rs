@@ -1,5 +1,5 @@
 //! The resident topic node: one endpoint, one router, one gossip mesh, and the
-//! event stream `wires tail` prints from (spec §7.4).
+//! event stream `wires watch` prints from (spec §7.4).
 //!
 //! [`TopicNode::spawn`] binds the iroh endpoint and stands up everything the
 //! multiway path needs on top of it; [`TopicNode::join`] subscribes to the
@@ -299,7 +299,7 @@ impl TopicSender {
     }
 }
 
-/// The resident node behind `wires tail`: endpoint, router, gated mesh,
+/// The resident node behind `wires watch`: endpoint, router, gated mesh,
 /// admission gate, replay server, and topic log, all for one topic.
 ///
 /// Owns the iroh endpoint and the [`Router`] registering all three ALPNs (see
@@ -515,7 +515,7 @@ impl TopicNode {
     ///
     /// Returns immediately, before any neighbor is up: waiting for the first
     /// [`TopicEvent::NeighborUp`] (with a timeout — never a blind sleep) is the
-    /// caller's decision, because `wires publish` needs it and `wires tail`
+    /// caller's decision, because `wires advanced publish` needs it and `wires watch`
     /// does not.
     pub async fn join(
         &self,
@@ -533,8 +533,8 @@ impl TopicNode {
 
         // `subscribe`, not `subscribe_and_join`: with an empty bootstrap set the
         // joining form waits for a neighbor that is never going to arrive, and
-        // the first `wires tail` on a topic has exactly that. Waiting is the
-        // caller's decision (`wires publish` waits, `wires tail` does not).
+        // the first `wires watch` on a topic has exactly that. Waiting is the
+        // caller's decision (`wires advanced publish` waits, `wires watch` does not).
         let sub = self
             .gossip
             .gossip()
@@ -657,7 +657,7 @@ impl TopicNode {
     /// This node's own [`TopicTicket`] for `name`: the fabric, the name, and
     /// this node as a peer hint with its direct sockets and relay.
     ///
-    /// What `wires tail` prints in its startup banner (`share to bootstrap:
+    /// What `wires watch` prints in its startup banner (`share to bootstrap:
     /// <token>`). Unsigned, and safe to be: it carries no authority, and a
     /// tampered copy can only fail to connect.
     ///
@@ -684,7 +684,7 @@ impl TopicNode {
     /// Aborts the watchdog and the bridge tasks, shuts the router down (which
     /// shuts gossip down, sending `Disconnect` to neighbors instead of leaving
     /// them to time out), and closes the endpoint. The topic log is released
-    /// with the [`TopicStore`], so the next `wires tail` can open it.
+    /// with the [`TopicStore`], so the next `wires watch` can open it.
     pub async fn shutdown(self) -> Result<()> {
         self.watchdog.abort();
         for bridge in self
@@ -1030,7 +1030,7 @@ mod tests {
     }
 
     /// Two members, mutually admitted, exchange one sealed envelope over the
-    /// gated mesh: the end-to-end shape of `wires publish` reaching `wires
+    /// gated mesh: the end-to-end shape of `wires advanced publish` reaching `wires
     /// tail`.
     #[tokio::test]
     async fn two_admitted_nodes_exchange_envelope() {

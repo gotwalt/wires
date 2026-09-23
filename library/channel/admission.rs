@@ -32,7 +32,7 @@
 //! the fabric root, and is fresh; the caller then persists it, which makes
 //! admission a passive distribution channel for head advances. A proof against
 //! an older head fails with [`crate::Error::StaleProof`]; the remedy is
-//! `wires import`.
+//! `wires advanced import`.
 //!
 //! **"Strictly newer" is only monotone if the persist step says so.**
 //! [`check_topic_admission`] compares against the `local_head` snapshot the
@@ -57,7 +57,7 @@
 //! and preferring the older head would mean preferring a roster the root has
 //! superseded — a removed member staying admitted is the worse failure. The
 //! visible cost is that a nearly-expired advance can leave a node admitting
-//! nobody until the next `wires import`.
+//! nobody until the next `wires advanced import`.
 //!
 //! Note the CRL is **not** consulted here. On topics, revocation is head
 //! advance and nothing else — one mechanism, no second list to keep in sync.

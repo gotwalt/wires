@@ -39,7 +39,7 @@
 //! `Denied` for a revoked caller, and a third member observes all of it.
 //!
 //! And two for card 11, over the production tail loop
-//! ([`run_tail_on`](crate::run_tail_on)):
+//! ([`run_tail_on`](crate::channel::watch::run_tail_on)):
 //! [`a_stalled_replay_pass_does_not_hold_back_call_records`] and
 //! [`a_departed_one_shot_publisher_does_not_delay_the_next_call`].
 //!
@@ -49,7 +49,7 @@
 //! per-module fixtures in `topics.rs` and `replay.rs` cannot do, and the thing
 //! every test here turns on. Each [`Commit`] carries the head, every member's
 //! inclusion proof under it, and the [`FabricKey`] that commit minted; a
-//! [`Member`] "imports" a commit by writing exactly what `wires import` writes,
+//! [`Member`] "imports" a commit by writing exactly what `wires advanced import` writes,
 //! into a real keystore. A member that is not handed a commit simply does not
 //! hold its key, which is the entire mechanism behind two of these tests.
 
@@ -71,11 +71,11 @@ use tokio::time::timeout;
 use crate::admin::keystore::Keystore;
 use crate::channel::admission::admit_peer;
 use crate::channel::ipc::ScratchDir;
+use crate::channel::printer::{Keyring, Printer};
 use crate::channel::replay::{self, Ingested};
 use crate::channel::store::{Appended, TopicStore};
 use crate::channel::topics::{TopicEvent, TopicNode, TopicNodeConfig, TopicSender};
 use crate::host::transport::{Denied, HeadSource, secret_key};
-use crate::{Keyring, Printer};
 
 /// Card 04's login → publish → independent-verification test: a child module
 /// so it shares these fixtures without widening their visibility.
@@ -125,7 +125,7 @@ const GAP_DEBOUNCE: Duration = Duration::from_millis(50);
 /// The key is generated here rather than sealed per member because these tests
 /// exercise *possession*, not distribution: `library/fabric_key.rs` proves
 /// sealing and opening, and a member "imports" by having the plaintext key
-/// written into its keyring — byte-identical to what `wires import
+/// written into its keyring — byte-identical to what `wires advanced import
 /// --fabric-key-file` leaves behind.
 struct Commit {
     /// The root-signed head this commit produced.
@@ -254,7 +254,7 @@ impl Member {
         self.identity.node_id()
     }
 
-    /// What `wires import --roster-head … --fabric-key-file <node-id>.key` does:
+    /// What `wires advanced import --roster-head … --fabric-key-file <node-id>.key` does:
     /// install this commit's head and its data key.
     ///
     /// The per-commit member tax of spec §10, spelled out. A member who is not
@@ -268,7 +268,7 @@ impl Member {
             .unwrap();
     }
 
-    /// This member's topic log, opened from its home the way `wires tail` opens
+    /// This member's topic log, opened from its home the way `wires watch` opens
     /// it. redb locks the file, so at most one live handle at a time.
     fn store(&self, fab: &Fabric) -> Arc<TopicStore> {
         Arc::new(TopicStore::open(self.home.path(), fab.topic).unwrap())
@@ -278,7 +278,7 @@ impl Member {
     /// router with all three ALPNs, a fresh log, and a watchdog at `recheck`.
     ///
     /// `version` selects which commit's inclusion proof this node presents —
-    /// the proof is a startup input in production too (`wires tail` reads it
+    /// the proof is a startup input in production too (`wires watch` reads it
     /// once), so a node that has not re-imported after a commit keeps presenting
     /// the old one.
     async fn spawn(&self, fab: &Fabric, version: RosterVersion, recheck: Duration) -> TopicNode {
@@ -438,7 +438,7 @@ async fn settle<F: FnMut() -> bool>(mut cond: F, what: &str) {
 // ---------------------------------------------------------------------------
 
 /// Seal `text` as `who`'s next message under `version`'s key and append it —
-/// [`publish_from_tail`](crate::publish_from_tail) without the broadcast.
+/// [`publish_from_tail`](crate::channel::watch::publish_from_tail) without the broadcast.
 ///
 /// Split from [`publish`] so a test can decide which messages reach the mesh:
 /// `live_gap_triggers_replay_and_heals` needs a message that exists in the
@@ -474,7 +474,7 @@ fn append(
     envelope
 }
 
-/// [`append`] and then broadcast — the whole of `wires publish` against a
+/// [`append`] and then broadcast — the whole of `wires advanced publish` against a
 /// resident tail, minus the control socket.
 async fn publish(
     fab: &Fabric,
@@ -507,11 +507,11 @@ fn seqs(store: &TopicStore, sender: NodeId) -> Vec<u64> {
 /// The lines a tail would print for everything stored past `before`.
 ///
 /// What a tail prints after a catch-up, as lines rather than stdout, over the
-/// same two halves of [`Printer::emit`](crate::Printer): a high-water-mark diff
+/// same two halves of [`Printer::emit`](crate::channel::printer::Printer): a high-water-mark diff
 /// decides *what* is new (with nothing else writing to the log during the
 /// test, it is exactly the set [`catch_up_collect`](crate::channel::replay::catch_up_collect)
-/// hands the tail), [`Keyring::open`](crate::Keyring::open) decides whether it can be shown,
-/// and [`Printer::render`](crate::Printer::render) is the production formatter.
+/// hands the tail), [`Keyring::open`](crate::channel::printer::Keyring::open) decides whether it can be shown,
+/// and [`Printer::render`](crate::channel::printer::Printer::render) is the production formatter.
 /// A message with no key is silently absent here for the same reason it is
 /// silently absent from stdout.
 fn new_since(
@@ -761,7 +761,7 @@ async fn a_removed_members_later_messages_are_refused_at_ingest() {
 /// because eviction got there first. B receives the ciphertext, verifies it,
 /// stores it — every step short of reading it — and the store keeps it
 /// provisionally (spec §4.1: an envelope whose key never arrives is still a
-/// storable envelope, because a later `wires import` heals the display).
+/// storable envelope, because a later `wires advanced import` heals the display).
 ///
 /// C, who survived the commit and holds the new key, reads the same bytes.
 #[tokio::test]
@@ -1155,7 +1155,7 @@ async fn tail_catches_up_after_offline() {
 /// 1 never does, seq 2 arrives and cannot be chained.
 ///
 /// The pump below is the ingest arm of the tail loop
-/// ([`run_tail`](crate::run_tail)) with nothing else in it, and it is the same
+/// ([`run_tail`](crate::channel::watch::run_tail)) with nothing else in it, and it is the same
 /// shape: ingest, and on a [`Ingested::Gap`] arm a single pending catch-up
 /// deadline that later gaps fold into (`catchup_at.get_or_insert`). The pass it
 /// eventually runs is the real [`catch_up`](crate::channel::replay::catch_up); only the
@@ -1289,7 +1289,7 @@ async fn next_record(
     let envelope = next_message(rx).await;
     let plaintext = keyring.open(&envelope).expect("the observer holds the key");
     let text = String::from_utf8(plaintext).unwrap();
-    // What `wires tail` prints for it is a record line, never the raw JSON.
+    // What `wires watch` prints for it is a record line, never the raw JSON.
     let line = Printer {
         json: false,
         identities: None,
@@ -1326,7 +1326,7 @@ fn cat_invocation() -> library::Invocation {
 /// C's next call is refused, and O sees `Denied` with the very reason C got.
 ///
 /// R's publishing runs the production path: [`audit::forward`](crate::host::audit::forward)
-/// feeding [`publish_from_tail`](crate::publish_from_tail) — the tail loop's
+/// feeding [`publish_from_tail`](crate::channel::watch::publish_from_tail) — the tail loop's
 /// control-socket arm, the single allocator — with the loop around it reduced
 /// to that one arm.
 #[tokio::test]
@@ -1395,7 +1395,7 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
     wait_neighbor_up(&mut rx_o, r.id()).await;
 
     // R's tail loop, reduced to its publish arm.
-    let ctx = crate::TopicContext {
+    let ctx = crate::channel::context::TopicContext {
         node: NodeIdentity::from_seed(r_seed),
         membership: r_membership,
         proof: fab.at(v1).proofs[&r.id()].clone(),
@@ -1417,10 +1417,11 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
         let store = Arc::clone(&store_r);
         async move {
             while let Some(request) = requests.recv().await {
-                let outcome = crate::publish_from_tail(&ctx, &store, &send_r, &request.text)
-                    .await
-                    .map(|envelope| envelope.seq.0)
-                    .map_err(|e| format!("{e:#}"));
+                let outcome =
+                    crate::channel::watch::publish_from_tail(&ctx, &store, &send_r, &request.text)
+                        .await
+                        .map(|envelope| envelope.seq.0)
+                        .map_err(|e| format!("{e:#}"));
                 let _ = request.reply.send(outcome);
             }
         }
@@ -1565,7 +1566,7 @@ const RECORD_PROMPTNESS: Duration = Duration::from_secs(2);
 type ResponderReady = (TopicPeer, Arc<crate::channel::admission::AdmitHandler>);
 
 /// A `serve --audit-topic ops` responder serving `cat`, running the
-/// **production** tail loop ([`run_tail_on`](crate::run_tail_on)) over a
+/// **production** tail loop ([`run_tail_on`](crate::channel::watch::run_tail_on)) over a
 /// hermetic endpoint.
 ///
 /// Returns the loop as a future (the caller polls it beside the test body) and
@@ -1606,7 +1607,7 @@ fn hosted_responder(
             crate::channel::idp_view::IdpTrust::from_vars(None, None),
         )),
     };
-    let ctx = crate::TopicContext {
+    let ctx = crate::channel::context::TopicContext {
         node: NodeIdentity::from_seed(r_seed),
         membership,
         proof: fab.at(version).proofs[&r.id()].clone(),
@@ -1624,7 +1625,7 @@ fn hosted_responder(
     };
     let (ready, ready_rx) = tokio::sync::oneshot::channel();
     let run = async move {
-        crate::run_tail_on(&ctx, 0, false, Some(hosted), async move |cfg| {
+        crate::channel::watch::run_tail_on(&ctx, 0, false, Some(hosted), async move |cfg| {
             let lookup = MemoryLookup::new();
             let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .secret_key(secret_key(&NodeIdentity::from_seed(r_seed)))
@@ -1805,7 +1806,7 @@ async fn a_stalled_replay_pass_does_not_hold_back_call_records() {
 }
 
 /// **Card 11, the camera run.** A one-shot publisher (`wires login --topic`,
-/// `wires publish`) joins, publishes, and exits; the responder stops treating
+/// `wires advanced publish`) joins, publishes, and exits; the responder stops treating
 /// it as a replay source, and a call made right afterwards is on the observer
 /// within [`RECORD_PROMPTNESS`].
 ///

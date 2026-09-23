@@ -15,7 +15,7 @@
 //!    [`REFRESH_TOKEN_FILE`] when the IdP granted one;
 //! 3. with `--topic`, `ChannelRecord::Identity` is published — through the
 //!    resident tail's control socket if one is running, else one-shot, exactly
-//!    as `wires publish` does.
+//!    as `wires advanced publish` does.
 //!
 //! Configuration (flag, else environment): `--client-id` /
 //! `WIRES_OIDC_CLIENT_ID` (required), `--client-secret` /
@@ -44,9 +44,9 @@ use url::Url;
 
 use crate::admin::keystore;
 use crate::caller::jwks::{Discovery, KeyFetcher};
+use crate::channel::context::{TopicArgs, TopicContext};
 use crate::channel::idp_view::DEFAULT_ISSUER;
 use crate::channel::ipc;
-use crate::{TopicArgs, TopicContext};
 
 /// The raw ID token, in the keystore (mode `0600`).
 pub(crate) const ID_TOKEN_FILE: &str = "idp-token.jwt";
@@ -80,7 +80,7 @@ const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL
 /// `login` arguments.
 #[derive(Args, Debug, Default)]
 pub(crate) struct LoginArgs {
-    /// Publish the identity claim on this topic (name, as for `wires publish`).
+    /// Publish the identity claim on this topic (name, as for `wires advanced publish`).
     #[arg(long)]
     pub topic: Option<String>,
     /// A base64 topic ticket to bootstrap from (with `--topic`). Repeatable.
@@ -780,18 +780,18 @@ pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
     Ok(())
 }
 
-/// Publish `claim` on `ctx`'s topic the way `wires publish` does.
+/// Publish `claim` on `ctx`'s topic the way `wires advanced publish` does.
 async fn publish_claim(ctx: &TopicContext, claim: &IdentityClaim) -> Result<()> {
     let text = ChannelRecord::Identity(claim.clone()).to_text()?;
-    let messages = crate::Messages::One(Some(text));
+    let messages = crate::channel::publish::Messages::One(Some(text));
     if let Some(client) = ipc::ControlClient::connect(&ctx.socket_path()).await? {
-        return crate::publish_through_tail(ctx, client, messages).await;
+        return crate::channel::publish::publish_through_tail(ctx, client, messages).await;
     }
-    crate::publish_one_shot(
+    crate::channel::publish::publish_one_shot(
         ctx,
         messages,
-        crate::PUBLISH_NEIGHBOR_WAIT,
-        crate::PUBLISH_LINGER,
+        crate::channel::publish::PUBLISH_NEIGHBOR_WAIT,
+        crate::channel::publish::PUBLISH_LINGER,
     )
     .await
 }

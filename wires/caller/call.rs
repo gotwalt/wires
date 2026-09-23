@@ -158,7 +158,7 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    crate::preflight(creds.node.node_id(), &creds.membership, plan.grant.as_ref())
+    crate::admin::keystore::preflight(creds.node.node_id(), &creds.membership, plan.grant.as_ref())
         .map_err(anyhow::Error::msg)?;
     let relay = creds.relay_override.clone().or(plan.relay_url);
     let target = transport::endpoint_addr(&plan.target, &plan.addrs, relay.as_deref())?;

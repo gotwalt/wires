@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use library::{
-    Crl, FabricKey, InclusionProof, Membership, NodeIdentity, Roster, RosterHead, RosterVersion,
+    Crl, FabricKey, Grant, InclusionProof, Membership, NodeId, NodeIdentity, Roster, RosterHead,
+    RosterVersion,
 };
 
 use crate::host::transport::{CrlSource, HeadSource};
@@ -189,8 +190,8 @@ impl Keystore {
 
     /// Persist `proof` to `inclusion-proof.json` as its token (mode `0644`). The
     /// symmetric half of [`read_inclusion_proof`](Self::read_inclusion_proof):
-    /// `wires import --inclusion-proof-file <p>` installs the proof an operator
-    /// emitted with `wires roster commit --out DIR`, after which `wires call`
+    /// `wires advanced import --inclusion-proof-file <p>` installs the proof an operator
+    /// emitted with `wires advanced roster commit --out DIR`, after which `wires call`
     /// finds it with no flags.
     pub fn save_inclusion_proof(&self, proof: &InclusionProof) -> Result<PathBuf> {
         ensure_dir(&self.dir)?;
@@ -216,7 +217,7 @@ impl Keystore {
     /// Unlike [`save_node`](Self::save_node) this **overwrites**: a key is
     /// identified by its roster version, so re-importing the same
     /// [`SealedFabricKey`](library::SealedFabricKey) rewrites identical bytes
-    /// and re-running `wires import` is safe. (A *different* key for a version
+    /// and re-running `wires advanced import` is safe. (A *different* key for a version
     /// already held would also overwrite — but only the root mints keys, and it
     /// mints exactly one per commit, so there is no second key to install.)
     pub fn save_fabric_key(&self, version: RosterVersion, key: &FabricKey) -> Result<PathBuf> {
@@ -250,7 +251,7 @@ impl Keystore {
     /// Read every key in the keyring, ordered by roster version.
     ///
     /// An absent keyring directory is an empty map (a node that has never run
-    /// `wires import --fabric-key`), and files that are not named
+    /// `wires advanced import --fabric-key`), and files that are not named
     /// `<decimal>.key` are ignored rather than fatal — but a `<decimal>.key`
     /// whose contents are not a 32-byte hex key is an error naming the file, so
     /// a truncated write is reported instead of silently losing history.
@@ -303,7 +304,7 @@ fn parse_fabric_key(path: &Path, text: &str) -> Result<FabricKey> {
     FabricKey::from_hex(text.trim()).with_context(|| {
         format!(
             "parsing {} (expected 64 hex characters; delete it and re-run \
-             `wires import --fabric-key <token>`)",
+             `wires advanced import --fabric-key <token>`)",
             path.display()
         )
     })
@@ -327,7 +328,7 @@ pub fn node_identity(inline: Option<&str>, file: Option<&Path>) -> Result<NodeId
 }
 
 /// Resolve the node identity for an offline command that already holds a
-/// keystore handle (`wires import --fabric-key`, which must open a sealed key
+/// keystore handle (`wires advanced import --fabric-key`, which must open a sealed key
 /// as *this* node): `$WIRES_NODE_SEED` wins — the same environment variable the
 /// network commands honour — then `ks`'s own `node.seed`.
 ///
@@ -342,7 +343,7 @@ pub fn node_identity_in(ks: &Keystore) -> Result<NodeIdentity> {
     }
     ks.read_node_identity()?.ok_or_else(|| {
         anyhow!(
-            "no node key: set $WIRES_NODE_SEED or run `wires keygen --save-node` (looked for {})",
+            "no node key: set $WIRES_NODE_SEED or run `wires advanced keygen --save-node` (looked for {})",
             ks.path("node.seed").display()
         )
     })
@@ -386,7 +387,7 @@ pub fn membership(inline: Option<&str>, file: Option<&Path>) -> Result<Membershi
     }
     bail!(
         "no membership: pass --membership <token>, set $WIRES_MEMBERSHIP, use \
-         --membership-file, or run `wires member --subject <id> --save` (looked for {})",
+         --membership-file, or run `wires advanced member --subject <id> --save` (looked for {})",
         ks.path("membership.json").display()
     );
 }
@@ -398,7 +399,7 @@ pub fn membership(inline: Option<&str>, file: Option<&Path>) -> Result<Membershi
 ///
 /// The keystore case is [`HeadSource::Keystore`], which re-checks *existence*
 /// per connection rather than at startup: a responder started before its head
-/// was imported enforces from the dial after `wires import --roster-head…`
+/// was imported enforces from the dial after `wires advanced import --roster-head…`
 /// lands, with no restart. Until a head has ever been seen it enforces nothing
 /// (the pre-roster membership + CRL + TTL behavior); once one has, a missing or
 /// malformed file fails closed, like [`HeadSource::File`].
@@ -484,14 +485,14 @@ fn resolve_identity(
     }
     bail!(
         "no {role} key: pass --{role}-seed, set ${env_name}, use --{role}-seed-file, \
-         or run `wires keygen --save-{role}` (looked for {})",
+         or run `wires advanced keygen --save-{role}` (looked for {})",
         ks.path(ks_name).display()
     );
 }
 
 /// Resolve *where* `serve` reads its revocation list from: inline `--crl-json`
 /// (parsed once, pinned), else `--crl-file`, else the keystore's `crl.json` —
-/// the two file cases are re-read per connection, so `wires revoke` lands
+/// the two file cases are re-read per connection, so `wires advanced revoke` lands
 /// without a restart. A missing file is an empty list.
 pub fn crl_source(inline: Option<&str>, file: Option<PathBuf>) -> Result<CrlSource> {
     if let Some(json) = inline {
@@ -593,7 +594,7 @@ fn write_secret(path: &Path, contents: &str, force: bool) -> Result<()> {
 /// Every file this module writes is also read, concurrently, by something that
 /// takes no lock — `roster-head.json` most of all, which the admission handler
 /// and the watchdog re-read on every handshake and every pass while `wires
-/// import` and `wires roster commit` rewrite it from other processes. A plain
+/// import` and `wires advanced roster commit` rewrite it from other processes. A plain
 /// `std::fs::write` is `O_TRUNC` followed by a write, so a reader landing in
 /// that window sees an empty or half-written token; the admission path answers
 /// "responder configuration error" and the watchdog treats an unloadable head as
@@ -654,6 +655,58 @@ fn write_secret_overwrite(path: &Path, contents: &str) -> Result<()> {
     write_text_mode(path, contents, Some(0o600))
 }
 
+/// Read a credential token from an inline flag or a file, trimming whitespace.
+/// `None` when neither was supplied.
+pub(crate) fn token_arg(
+    inline: Option<&str>,
+    file: Option<&Path>,
+    flag: &str,
+) -> anyhow::Result<Option<String>> {
+    if let Some(text) = inline {
+        return Ok(Some(text.trim().to_string()));
+    }
+    match file {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("{flag}-file: reading {}", path.display()))?;
+            Ok(Some(text.trim().to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Local consistency checks run before dialing: the ticket's grant and the
+/// membership must both name *this* keystore's node.
+///
+/// Catches the two most common misconfigurations — a ticket copied to the wrong
+/// machine, a membership from another fabric — without a network round-trip, so
+/// they never masquerade as a refusal by the responder.
+pub(crate) fn preflight(
+    node: NodeId,
+    membership: &Membership,
+    grant: Option<&Grant>,
+) -> Result<(), String> {
+    if let Some(grant) = grant
+        && grant.subject != node
+    {
+        return Err(format!(
+            "this ticket was issued to node {}, but this keystore's node is {} — use the \
+             keystore that requested the ticket (or re-issue it)",
+            grant.subject.hex(),
+            node.hex()
+        ));
+    }
+    if membership.member != node {
+        return Err(format!(
+            "this membership was issued to node {}, but this keystore's node is {} — import \
+             the membership minted for this node (`wires advanced import --membership …`)",
+            membership.member.hex(),
+            node.hex()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,7 +757,7 @@ mod tests {
         let mut crl = Crl::new();
         crl.insert(NodeIdentity::from_seed([7u8; 32]).node_id());
         ks.save_crl_json(&crl.to_json().unwrap()).unwrap();
-        // Same source object, re-read: what makes `wires revoke` land without a
+        // Same source object, re-read: what makes `wires advanced revoke` land without a
         // responder restart.
         assert_eq!(source.load().unwrap(), crl);
     }
@@ -878,7 +931,7 @@ mod tests {
     /// The regression: `save_roster_head` used to be `O_TRUNC` + write, and
     /// every reader of `roster-head.json` — the admission handler on each
     /// handshake, the watchdog on each pass, in this process and in the `wires
-    /// import` / `wires roster commit` ones — reads it with no lock at all. A
+    /// import` / `wires advanced roster commit` ones — reads it with no lock at all. A
     /// reader landing in the truncation window got a decode error, which the
     /// watchdog reads as *evict every peer*: one scheduling accident tore the
     /// whole mesh down. With the write atomic (temp file + rename) the reader
@@ -1004,7 +1057,7 @@ mod tests {
         ] {
             let msg = format!("{err:#}");
             assert!(msg.contains(&path.display().to_string()), "{msg}");
-            assert!(msg.contains("wires import --fabric-key"), "{msg}");
+            assert!(msg.contains("wires advanced import --fabric-key"), "{msg}");
         }
     }
 
@@ -1029,7 +1082,7 @@ mod tests {
             Ok(_) => panic!("an empty keystore has no node key"),
             Err(e) => format!("{e:#}"),
         };
-        assert!(msg.contains("wires keygen --save-node"), "{msg}");
+        assert!(msg.contains("wires advanced keygen --save-node"), "{msg}");
         assert!(
             msg.contains(&ks.path("node.seed").display().to_string()),
             "{msg}"
@@ -1054,5 +1107,45 @@ mod tests {
         let path = temp_dir().join("inclusion-proof.json");
         write_text(&path, &proof.encode().unwrap()).unwrap();
         assert_eq!(inclusion_proof(None, Some(&path)).unwrap().unwrap(), proof);
+    }
+
+    use library::Scope;
+
+    #[test]
+    fn preflight_accepts_credentials_issued_to_this_node() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let me = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let membership = Membership::mint(&root, me, 0, i64::MAX).unwrap();
+        let grant = Grant::mint(&root, me, Scope::new("tools.rg"), i64::MAX).unwrap();
+        assert_eq!(preflight(me, &membership, Some(&grant)), Ok(()));
+        assert_eq!(preflight(me, &membership, None), Ok(()));
+    }
+
+    #[test]
+    fn preflight_rejects_a_ticket_for_another_node() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let me = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let other = NodeIdentity::from_seed([3u8; 32]).node_id();
+        let membership = Membership::mint(&root, me, 0, i64::MAX).unwrap();
+        // A ticket minted for someone else — the "copied to the wrong machine" case.
+        let grant = Grant::mint(&root, other, Scope::new("tools.rg"), i64::MAX).unwrap();
+        let msg = preflight(me, &membership, Some(&grant)).unwrap_err();
+        assert!(
+            msg.contains(&other.hex()) && msg.contains(&me.hex()),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_a_membership_for_another_node() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let me = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let other = NodeIdentity::from_seed([3u8; 32]).node_id();
+        let membership = Membership::mint(&root, other, 0, i64::MAX).unwrap();
+        let msg = preflight(me, &membership, None).unwrap_err();
+        assert!(
+            msg.contains(&other.hex()) && msg.contains(&me.hex()),
+            "{msg}"
+        );
     }
 }

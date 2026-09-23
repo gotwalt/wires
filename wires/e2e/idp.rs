@@ -323,7 +323,7 @@ async fn require_idp_admits_verified_federated_identities_only() {
     // R's tail loop, reduced to the two arms that matter here: the publish arm
     // (audit records out) and the live arm, printing every message through
     // the production `Printer::emit` — which is what feeds the index.
-    let ctx = crate::TopicContext {
+    let ctx = crate::channel::context::TopicContext {
         node: NodeIdentity::from_seed(r_seed),
         membership: r_membership,
         proof: fab.at(v1).proofs[&r.id()].clone(),
@@ -345,10 +345,11 @@ async fn require_idp_admits_verified_federated_identities_only() {
         let store = Arc::clone(&store_r);
         async move {
             while let Some(request) = requests.recv().await {
-                let outcome = crate::publish_from_tail(&ctx, &store, &send_r, &request.text)
-                    .await
-                    .map(|envelope| envelope.seq.0)
-                    .map_err(|e| format!("{e:#}"));
+                let outcome =
+                    crate::channel::watch::publish_from_tail(&ctx, &store, &send_r, &request.text)
+                        .await
+                        .map(|envelope| envelope.seq.0)
+                        .map_err(|e| format!("{e:#}"));
                 let _ = request.reply.send(outcome);
             }
         }

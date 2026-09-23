@@ -1,4 +1,4 @@
-//! How `wires tail` shows a [`ChannelRecord`] to a human.
+//! How `wires watch` shows a [`ChannelRecord`] to a human.
 //!
 //! A topic message is text. Most of it is conversation and prints as-is; the
 //! rest is machine-written metadata — a responder's call log

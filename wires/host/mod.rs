@@ -6,6 +6,7 @@
 //! its stdio. Every call, refusal, and exit is published to the audit channel
 //! by the host itself, stamped with the identity it verified.
 //!
+//! - [`serve`] — `wires serve`: flags, credentials, the audit channel.
 //! - [`transport`] — the session protocol: bind/dial, the handshake, the
 //!   credential checks (`authorize`), exec + stdio bridge.
 //! - [`audit`] — the call records the host publishes to its audit topic.
@@ -19,4 +20,5 @@
 pub mod audit;
 pub mod identity;
 pub mod idp_policy;
+pub mod serve;
 pub mod transport;

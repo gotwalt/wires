@@ -32,12 +32,12 @@
 //! the tail loop refuses, is logged at `warn` and the call proceeds. The
 //! fail-closed part is *startup*: `--audit-topic` refuses to start unless this
 //! node is a provisioned member of the channel (membership, inclusion proof,
-//! roster head and fabric key), with an error naming the `wires import` flag.
+//! roster head and fabric key), with an error naming the `wires advanced import` flag.
 //!
 //! # Observer setup
 //!
 //! An observer is any roster member holding the current fabric key: `wires
-//! import` its membership, proof, head and key, then `wires tail <topic>
+//! import` its membership, proof, head and key, then `wires watch <topic>
 //! --peer <responder's topic ticket>`. It holds no grant for any exposed tool
 //! and no credential of the caller, and it sees every call live.
 //!

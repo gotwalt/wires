@@ -7,7 +7,7 @@
 //! caches the key set:
 //!
 //! - **in memory** per [`KeyFetcher`], and
-//! - **on disk** under `$WIRES_HOME/jwks/`, so a short-lived `wires tail` or
+//! - **on disk** under `$WIRES_HOME/jwks/`, so a short-lived `wires watch` or
 //!   a restarted responder does not refetch on every start.
 //!
 //! The cache TTL is the response's `Cache-Control: max-age`, clamped to

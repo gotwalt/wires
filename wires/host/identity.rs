@@ -154,7 +154,12 @@ impl Identities {
     /// Index every identity claim already in `store` that `keyring` opens —
     /// what a responder does at startup, since it prints no backfill but must
     /// know callers who logged in before it started.
-    pub(crate) async fn prime(&self, store: &TopicStore, keyring: &mut crate::Keyring, now: i64) {
+    pub(crate) async fn prime(
+        &self,
+        store: &TopicStore,
+        keyring: &mut crate::channel::printer::Keyring,
+        now: i64,
+    ) {
         let envelopes = match store.read_backfill(usize::MAX) {
             Ok(all) => all,
             Err(e) => {

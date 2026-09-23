@@ -1,7 +1,7 @@
 //! How a reader shows an [`IdentityClaim`] it saw on a channel (card 04).
 //!
 //! Every reader verifies the claim **itself** (see [`crate::caller::jwks`]); this
-//! module turns the verdict into the one line a `wires tail` prints, and holds
+//! module turns the verdict into the one line a `wires watch` prints, and holds
 //! the reader's trust settings ([`IdpTrust`]).
 //!
 //! `render.rs` calls [`describe_identity`] for every `ChannelRecord::Identity`

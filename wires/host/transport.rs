@@ -24,7 +24,7 @@
 //!   dialer sends or receives on a refused session ever reaches its stdout.
 //! - **Refusals are current.** The CRL and the enforced roster head are
 //!   *sources* ([`CrlSource`] / [`HeadSource`]), re-read on every connection, so
-//!   `wires revoke` and `wires roster commit` take effect on the next dial
+//!   `wires advanced revoke` and `wires advanced roster commit` take effect on the next dial
 //!   rather than the next restart.
 
 use std::path::{Path, PathBuf};
@@ -146,7 +146,7 @@ impl AuditSink {
 
 /// Where the responder reads its revocation list from.
 ///
-/// `File` is re-read on **every connection**, so `wires revoke` takes effect on
+/// `File` is re-read on **every connection**, so `wires advanced revoke` takes effect on
 /// the next dial without restarting the responder. `Fixed` pins a list supplied
 /// inline at startup (`--crl-json`), which is by definition static.
 #[derive(Debug)]
@@ -160,7 +160,7 @@ pub enum CrlSource {
 /// Where the responder reads the enforced roster head from.
 ///
 /// `None` disables head enforcement (membership + CRL + TTL only); `File` and
-/// `Keystore` are re-read per connection, so `wires roster commit` takes effect
+/// `Keystore` are re-read per connection, so `wires advanced roster commit` takes effect
 /// on the next dial without a restart.
 #[derive(Debug)]
 pub enum HeadSource {
@@ -179,7 +179,7 @@ pub enum HeadSource {
     /// Enforcement arms itself the first time the file is seen: before that a
     /// missing file means "this responder has no head" (the pre-roster
     /// membership + CRL + TTL behavior); after that it means the head was
-    /// deleted, and every dial is refused. That is what makes `wires import
+    /// deleted, and every dial is refused. That is what makes `wires advanced import
     /// --roster-head…` land on a responder that started with no head at all —
     /// without it, a later-installed head would never be consulted and the
     /// omitted member would stay admitted.
@@ -1611,7 +1611,7 @@ mod tests {
         assert!(source.load().unwrap().is_none());
         assert_eq!(source.enforcement(), "when-present");
 
-        // `wires import --roster-head …` lands while `serve` is running.
+        // `wires advanced import --roster-head …` lands while `serve` is running.
         let root = NodeIdentity::from_seed([1u8; 32]);
         let mut roster = Roster::new(root.node_id());
         roster.insert(NodeIdentity::from_seed([2u8; 32]).node_id());

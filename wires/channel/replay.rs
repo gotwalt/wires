@@ -8,8 +8,8 @@
 //! admitted peer, a [`ReplayFrame::Request`](library::ReplayFrame) carrying this
 //! node's high-water marks, a run of `Item`s back, then `End`.
 //!
-//! There is no host. Every `wires tail` runs [`ReplayHandler`] and every
-//! `wires tail` runs [`catch_up`], so the node that has the history is whichever
+//! There is no host. Every `wires watch` runs [`ReplayHandler`] and every
+//! `wires watch` runs [`catch_up`], so the node that has the history is whichever
 //! one happens to have it. Nobody is a required participant.
 //!
 //! # Admission is the gate here too
@@ -726,7 +726,7 @@ fn hwm_window(
 /// What ingesting one envelope did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ingested {
-    /// New, verified, in the log. The only outcome `wires tail` prints on —
+    /// New, verified, in the log. The only outcome `wires watch` prints on —
     /// which is what makes deduplication across live, replay, and restart
     /// structural rather than a set of remembered ids.
     Inserted,
@@ -767,7 +767,7 @@ pub enum Ingested {
 ///    `None` disables the gate, for callers that have no head to enforce.
 /// 1. [`verify`](library::TopicEnvelope::verify) — structure and signature
 ///    only. No decryption: an envelope whose `key_version` this node has no key
-///    for is still storable, and a later `wires import` heals the display
+///    for is still storable, and a later `wires advanced import` heals the display
 ///    without re-fetching anything. Deliberately not "and it must be from an
 ///    admitted peer": the *publisher* is authenticated by its signature, and
 ///    the peer that relayed it is a separate question already answered by the
@@ -801,7 +801,7 @@ pub(crate) fn ingest(
         bail!(
             "envelope from {} is sealed under roster version {} but this node enforces version \
              {}: messages under a superseded fabric key are not accepted (the publisher must \
-             `wires import --fabric-key-file <node-id>.key` for the current commit)",
+             `wires advanced import --fabric-key-file <node-id>.key` for the current commit)",
             envelope.sender.hex(),
             envelope.key_version.0,
             floor.0

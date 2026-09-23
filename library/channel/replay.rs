@@ -6,7 +6,7 @@
 //! request, [`ReplayFrame::Request`] out, a run of [`ReplayFrame::Item`]s back,
 //! then [`ReplayFrame::End`].
 //!
-//! The protocol is **peer-symmetric**: every `wires tail` both serves replay
+//! The protocol is **peer-symmetric**: every `wires watch` both serves replay
 //! and requests it. There is no host, and no node is a required participant.
 //!
 //! The request carries the requester's high-water marks — a [`ChainState`] per

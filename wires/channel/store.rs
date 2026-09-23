@@ -16,12 +16,12 @@
 //!
 //! **redb takes an exclusive file lock: exactly one process may hold a topic
 //! database open.** This is not a detail of the storage engine that callers can
-//! route around — it is why `wires tail` is the resident node (spec §7) and why
-//! `wires publish` talks to it over the control socket instead of opening the
+//! route around — it is why `wires watch` is the resident node (spec §7) and why
+//! `wires advanced publish` talks to it over the control socket instead of opening the
 //! same file. It is also half of the seq-allocator argument: a single writer per
 //! `(node, topic)` is what keeps sequence numbers from being handed out twice,
 //! and a repeated `(key_version, seq)` slot is what the envelope's synthetic IV
-//! exists to survive (spec §4.1). A second `wires tail` on the same
+//! exists to survive (spec §4.1). A second `wires watch` on the same
 //! `$WIRES_HOME` and topic therefore fails to open, loudly, rather than forking
 //! the log.
 //!
@@ -63,7 +63,7 @@ const HWM_VALUE_LEN: usize = 40;
 
 /// What an [`TopicStore::append`] did.
 ///
-/// The distinction is load-bearing beyond bookkeeping: `wires tail` prints a
+/// The distinction is load-bearing beyond bookkeeping: `wires watch` prints a
 /// message only when the append reports [`Appended::Inserted`], which is what
 /// makes deduplication structural across the live gossip path, replay catch-up,
 /// and a restart that re-reads the backfill (spec §7).
@@ -130,8 +130,8 @@ impl TopicStore {
         create_private_file(path)?;
         let db = Database::create(path).with_context(|| {
             format!(
-                "opening the topic log {} (redb locks it exclusively — `wires tail` \
-                 owns a topic's log; `wires publish` goes through its control socket)",
+                "opening the topic log {} (redb locks it exclusively — `wires watch` \
+                 owns a topic's log; `wires advanced publish` goes through its control socket)",
                 path.display()
             )
         })?;
@@ -382,7 +382,7 @@ impl TopicStore {
     /// Merging on a sender-chosen key means reading the whole log: there is no
     /// index that is already in timestamp order, and per-sender tails cannot be
     /// truncated before the merge without risking dropping a message that sorts
-    /// into the window. This runs once, at `wires tail` startup, over a log with
+    /// into the window. This runs once, at `wires watch` startup, over a log with
     /// no retention policy yet (out of scope, restart.md) — the day it needs to
     /// be incremental is the day retention lands.
     pub fn read_backfill(&self, limit: usize) -> Result<Vec<TopicEnvelope>> {

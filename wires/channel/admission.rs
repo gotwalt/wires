@@ -127,7 +127,7 @@ pub const ADMIT_REFRESH: Duration = Duration::from_secs(ADMIT_TTL.as_secs() / 3)
 /// The topic layer had no deadline anywhere at all — `transport.rs` wraps the
 /// session ALPN in `DIAL_TIMEOUT`/`HANDSHAKE_TIMEOUT` and this path inherited
 /// neither — so a peer that accepted a connection and then said nothing hung
-/// `wires tail` at startup, before the control socket was even bound, with no
+/// `wires watch` at startup, before the control socket was even bound, with no
 /// diagnostic. Every await on this surface now has a bound.
 pub const TOPIC_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -338,7 +338,7 @@ impl Admitted {
     /// The peers worth *asking* for history: [`peers_since`](Self::peers_since)
     /// at `version`, minus every peer whose tracked connections have all closed.
     ///
-    /// A one-shot `wires publish` / `wires login --topic` is admitted, gossips
+    /// A one-shot `wires advanced publish` / `wires login --topic` is admitted, gossips
     /// one message, and exits — its admission stays on the books until the TTL
     /// runs out, but the node behind it is gone. Dialing it for replay costs a
     /// full pass timeout and can never yield anything, so a peer that has hung
@@ -547,8 +547,8 @@ impl AdmitHandler {
     /// **The mirror of [`load_head`](Self::load_head), and needed for the same
     /// reason.** Every `roster commit` invalidates *every* member's proof,
     /// including the survivors' — so the commit that removes one member hands
-    /// each of the others a new `<node-id>.proof`, and `wires import` installs
-    /// it. A resident `wires tail` that kept presenting the proof it read at
+    /// each of the others a new `<node-id>.proof`, and `wires advanced import` installs
+    /// it. A resident `wires watch` that kept presenting the proof it read at
     /// startup would pair a freshly re-read head with a proof issued against
     /// the previous one, and the far side is right to refuse that: `stale
     /// inclusion proof: proof targets version 1, head is version 2`. The effect
@@ -770,7 +770,7 @@ where
         return Err(e);
     }
 
-    // Re-read the head for *this* admission, so a `wires import` between two
+    // Re-read the head for *this* admission, so a `wires advanced import` between two
     // handshakes applies to the second one. A source we cannot read is fatal
     // here, and the caller is told only that we are misconfigured — never the
     // path, which would hand an unauthenticated peer our filesystem layout.
@@ -1042,7 +1042,7 @@ fn recheck_admissions(handler: &AdmitHandler, now_unix: i64) {
 /// Every await on the topic surface goes through this. The session transport has
 /// had `DIAL_TIMEOUT`/`HANDSHAKE_TIMEOUT` since Phase 1; the topic layer had
 /// nothing, so a peer that accepted a connection and then went quiet could hang
-/// a `wires tail` at startup — before the control socket was bound — or, in the
+/// a `wires watch` at startup — before the control socket was bound — or, in the
 /// live loop, pin the whole select on one unresponsive member.
 ///
 /// `budget` is a parameter rather than a constant read inside, so the timeout
@@ -1320,7 +1320,7 @@ mod tests {
     /// The topic layer had no timeout anywhere: `transport.rs` wraps the session
     /// ALPN in `DIAL_TIMEOUT`/`HANDSHAKE_TIMEOUT`, and this path inherited
     /// neither, so a peer that accepted a connection and then said nothing hung
-    /// `wires tail` at startup — before the control socket was bound — with no
+    /// `wires watch` at startup — before the control socket was bound — with no
     /// diagnostic. The budget is a parameter precisely so this asserts in
     /// milliseconds.
     #[tokio::test]
@@ -1618,7 +1618,7 @@ mod tests {
         let handler = handler_with(&dir, &v1, v1_proofs[&me.node_id()].clone());
         assert_eq!(handler.load_proof().version, v1.version, "nothing imported");
 
-        // `wires import --inclusion-proof-file <me>.proof` from the v2 commit.
+        // `wires advanced import --inclusion-proof-file <me>.proof` from the v2 commit.
         handler
             .keystore
             .save_inclusion_proof(&v2_proofs[&me.node_id()])
