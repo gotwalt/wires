@@ -8,7 +8,12 @@ Every member of the org channel currently receives, stores and can decrypt
 every call record: caller identity, argv, the first 4 KiB of stdin. *"Unintentionally
 receiving an entire organization's tool call data is bad and a huge bandwidth
 suck."* Sealing records per reader would fix reading but not delivery. See
-[card 22](22-gossip-role-OPEN.md), "Decision input".
+[card 22](../done/22-gossip-role-OPEN.md), "Decision input".
+
+## Split for parallel work (2026-09-23)
+
+- **26a (can start now, independent of 27):** the host-side log store (append-only, signed, hash-linked, retention, sequence numbers, tamper detection) and the optional OTLP exporter, as self-contained modules with their own tests. Emit into them from the existing audit path.
+- **26b (after 27):** the `watch <service>` record-stream protocol, reader authorization from the registry, `--mine`, and removal of records from everything else.
 
 ## Design
 
