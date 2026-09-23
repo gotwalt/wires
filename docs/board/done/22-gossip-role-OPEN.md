@@ -1,6 +1,6 @@
 # 22 — OPEN QUESTION: does the core need the gossip channel?
 
-**Status: DECIDED 2026-09-23 — drop the channel.** The human: the requirements are that only authorized users can call a service and can list what's available to them; the channel serves neither, and users should address services, not hosts. Implemented by [card 27](../backlog/27-services-not-hosts.md) (services, not hosts; drop the channel) and [card 26](../backlog/26-host-held-records.md) (host-held records). The analysis below is kept as the record of why.
+**Status: DECIDED 2026-09-23 — drop the channel.** The human: the requirements are that only authorized users can call a service and can list what's available to them; the channel serves neither, and users should address services, not hosts. Implemented by [card 27](../doing/27-services-not-hosts.md) (services, not hosts; drop the channel) and [card 26](../backlog/26-host-held-records.md) (host-held records). The analysis below is kept as the record of why.
 
 ## The question
 

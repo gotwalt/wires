@@ -153,6 +153,24 @@ pub enum Error {
     #[error("invalid tool name")]
     InvalidToolName,
 
+    /// A service name broke the [`ServiceName`](crate::ServiceName) rules.
+    #[error("invalid service name")]
+    InvalidServiceName,
+
+    /// A role name broke the [`RoleName`](crate::RoleName) rules.
+    #[error("invalid role name (expected 1-64 of [A-Za-z0-9_.-])")]
+    InvalidRoleName,
+
+    /// An `email` matcher was neither an address nor `*@domain` (see
+    /// [`EmailPattern`](crate::EmailPattern)).
+    #[error("invalid email pattern (an address, or `*@domain`)")]
+    InvalidEmailPattern,
+
+    /// A [`State`](crate::State) broke a structural rule of
+    /// [`State::validate`](crate::State::validate); the string names which.
+    #[error("invalid signed state: {0}")]
+    InvalidState(String),
+
     /// An argument list broke the [`Argv`](crate::Argv) limits.
     #[error("invalid argv")]
     InvalidArgv,

@@ -28,6 +28,7 @@ mod advanced;
 mod caller;
 mod channel;
 mod host;
+mod state;
 
 /// The money-shot integration tests of spec §9 — the whole stack over
 /// hermetic loopback, in one place because none of them belongs to a single

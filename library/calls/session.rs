@@ -30,6 +30,8 @@
 //! | `5`  | `HandshakeAck` | canonical-JSON of the ack envelope      |
 //! | `6`  | `Denied`    | UTF-8 reason bytes                         |
 //! | `7`  | `Invoke`    | canonical-JSON of the [`Invocation`]       |
+//! | `8`  | `Hello`     | canonical-JSON of the [`Hello`] (card 27)  |
+//! | `9`  | `HelloAck`  | canonical-JSON of the [`HelloAck`] (card 27) |
 //!
 //! A dialer sends [`Frame::Invoke`] immediately after its `Handshake`, without
 //! waiting for the ack — the responder reads both, authorizes them together,
@@ -40,14 +42,25 @@
 //! objects are the membership and the head a proof is checked against, each
 //! with its own fixed signed body — so omitting an absent proof via
 //! `skip_serializing_if` is safe here.
+//!
+//! # Card 27: `Hello` replaces `Handshake`
+//!
+//! [`Frame::Hello`] / [`Frame::HelloAck`] are the services-era handshake: the
+//! dialer presents its membership, the version of the signed state it holds,
+//! and its IdP ID token (so the host no longer reads identities off a
+//! channel). The old `Handshake` / `HandshakeAck` pair still decodes so the
+//! current transport keeps working; lanes 27b (dial) and 27c (accept) switch
+//! over, and 27d removes the old pair.
 
 use serde::{Deserialize, Serialize};
 
 use crate::codec::canonical_bytes;
 use crate::error::{Error, Result};
+use crate::idp::IdToken;
 use crate::invoke::Invocation;
 use crate::membership::Membership;
 use crate::roster::InclusionProof;
+use crate::state::{SignedState, StateVersion};
 
 const TAG_HANDSHAKE: u8 = 0;
 const TAG_STDIN: u8 = 1;
@@ -57,6 +70,42 @@ const TAG_EXIT: u8 = 4;
 const TAG_HANDSHAKE_ACK: u8 = 5;
 const TAG_DENIED: u8 = 6;
 const TAG_INVOKE: u8 = 7;
+const TAG_HELLO: u8 = 8;
+const TAG_HELLO_ACK: u8 = 9;
+
+/// The services-era opening frame (card 27), dialer → host, followed at once
+/// by [`Frame::Invoke`]. Unsigned envelope: each part verifies on its own
+/// (the membership under the root, the token under the IdP's keys and the
+/// nonce binding to the iroh-authenticated caller).
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hello {
+    /// The dialer's root-signed membership.
+    pub membership: Membership,
+    /// The signed-state version the dialer holds (0: none). A host holding a
+    /// newer one answers with it in [`HelloAck::newer_state`] or refuses a
+    /// removed member; a host holding an older one pulls (lane 27a).
+    pub state_version: StateVersion,
+    /// The dialer's IdP ID token (nonce-bound to its node key), when it has
+    /// logged in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<IdToken>,
+}
+
+/// The host's answer to an admitted [`Hello`]: its own membership (the
+/// dialer verifies it before sending stdin), its state version, and, when the
+/// dialer's copy is older, the newer state so the dialer can adopt it.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelloAck {
+    /// The host's root-signed membership.
+    pub membership: Membership,
+    /// The signed-state version the host decided under.
+    pub state_version: StateVersion,
+    /// The host's newer state, when the dialer's was older.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newer_state: Option<SignedState>,
+}
 
 /// A chunk of stdio bytes carried in a [`Frame`].
 ///
@@ -153,6 +202,10 @@ pub enum Frame {
     /// Dialer → multi-tool responder, right after `Handshake`: which exposed
     /// tool to run and the per-call arguments.
     Invoke(Invocation),
+    /// Card 27's opening frame: membership, state version, ID token.
+    Hello(Hello),
+    /// Card 27's ack to an admitted [`Hello`].
+    HelloAck(HelloAck),
 }
 
 impl Frame {
@@ -216,6 +269,14 @@ impl Frame {
                 payload.push(TAG_INVOKE);
                 payload.extend_from_slice(&canonical_bytes(invocation)?);
             }
+            Frame::Hello(hello) => {
+                payload.push(TAG_HELLO);
+                payload.extend_from_slice(&canonical_bytes(hello)?);
+            }
+            Frame::HelloAck(ack) => {
+                payload.push(TAG_HELLO_ACK);
+                payload.extend_from_slice(&canonical_bytes(ack)?);
+            }
         }
         let len: u32 = payload.len().try_into().map_err(|_| Error::BadFrame)?;
         let mut out = Vec::with_capacity(4 + payload.len());
@@ -268,6 +329,8 @@ impl Frame {
                 reason: String::from_utf8(body.to_vec()).map_err(|_| Error::BadFrame)?,
             },
             TAG_INVOKE => Frame::Invoke(serde_json::from_slice(body).map_err(Error::Decode)?),
+            TAG_HELLO => Frame::Hello(serde_json::from_slice(body).map_err(Error::Decode)?),
+            TAG_HELLO_ACK => Frame::HelloAck(serde_json::from_slice(body).map_err(Error::Decode)?),
             _ => return Err(Error::BadFrame),
         };
         Ok(Some((frame, end)))
@@ -329,6 +392,34 @@ mod tests {
                     tool: crate::invoke::ToolName::new(tool).unwrap(),
                     argv: crate::invoke::Argv::new(args).unwrap(),
                 })),
+            (
+                seed(),
+                seed(),
+                any::<u64>(),
+                proptest::option::of("[a-zA-Z0-9._-]{1,40}")
+            )
+                .prop_map(|(rs, ss, v, token)| {
+                    let root = NodeIdentity::from_seed(rs);
+                    let member = NodeIdentity::from_seed(ss).node_id();
+                    Frame::Hello(Hello {
+                        membership: Membership::mint(&root, member, 0, 1).unwrap(),
+                        state_version: StateVersion(v),
+                        id_token: token.map(IdToken::new),
+                    })
+                }),
+            (seed(), any::<u64>(), any::<bool>()).prop_map(|(rs, v, with_state)| {
+                let root = NodeIdentity::from_seed(rs);
+                let newer_state = with_state.then(|| {
+                    let mut s = crate::state::State::new(root.node_id());
+                    s.version = StateVersion(v);
+                    s.sign(&root).unwrap()
+                });
+                Frame::HelloAck(HelloAck {
+                    membership: Membership::mint(&root, root.node_id(), 0, 1).unwrap(),
+                    state_version: StateVersion(v),
+                    newer_state,
+                })
+            }),
         ]
     }
 
@@ -435,9 +526,9 @@ mod tests {
 
     #[test]
     fn unknown_tag_is_bad_frame() {
-        // len = 1, tag = 9 (unknown).
+        // len = 1, tag = 10 (unknown).
         assert!(matches!(
-            Frame::decode(&[0, 0, 0, 1, 9]),
+            Frame::decode(&[0, 0, 0, 1, 10]),
             Err(Error::BadFrame)
         ));
     }

@@ -4,7 +4,7 @@ This document describes the protocol as the code implements it today: `library/`
 codecs) and `wires/` (the iroh transport and CLI). If this document and the code disagree, the
 code is correct and this document should be fixed.
 
-> **Scheduled for removal.** [Card 27](board/backlog/27-services-not-hosts.md) replaces the
+> **Scheduled for removal.** [Card 27](board/doing/27-services-not-hosts.md) replaces the
 > channel (§6), fabric keys and re-keys (§7), and the records that ride the channel (§8) with
 > admin-signed service registry state that is pushed and pulled directly. After card 27,
 > [card 26](board/backlog/26-host-held-records.md) moves call records into host-held logs.

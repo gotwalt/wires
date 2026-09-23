@@ -50,3 +50,33 @@ The gossip mesh and topic node; `library/channel/*` (topic, envelope, chain, adm
 - [ ] Tests, clippy, fmt green (Cargo).
 
 ## Notes
+
+### 27.0 types first (2026-09-23)
+
+**Library (`library/services/`, re-exported at the crate root):**
+
+- `role.rs`: `RoleName`, `EmailPattern`, `Matcher`, `MEMBER_ROLE`. This is card 13's matcher shape copied out of `wires/host/policy.rs` with `thiserror` errors. The binary's copy stays until v1 `host.json` goes (27d).
+- `registry.rs`: `ServiceName` (the same rules as `ToolName`, with `From` in both directions, so `Invocation` is unchanged) and `Service { description: String, allow: Vec<RoleName>, hosts: Vec<NodeId>, readers: Vec<RoleName> }`. All fields are required. "Audit readers optional" is an **empty `readers`**, because a signed body may not have an optional field (protocol.md §1).
+- `state.rs`: `State { format, fabric, version: StateVersion, issued, not_after, members: BTreeSet<NodeId>, hosts: BTreeSet<NodeId>, roles: BTreeMap<RoleName, Vec<Matcher>>, services: BTreeMap<ServiceName, Service> }` and `SignedState { state, alg, sig }`. The signed bytes are `"wires/state/v1\0"` followed by the canonical `{alg, state}`; the prefix gives domain separation from memberships and heads, which the same root signs. Both types use `deny_unknown_fields`. The functions are real: `State::sign(&root)` (validate, then sign as given; the caller bumps the version), `SignedState::verify(root)` (alg, format, fabric pin, sig, validate), `check_fresh(now)`, `is_newer_than(&other)` (same fabric and strictly higher version), `encode`/`decode`, and `State::{validate, is_member, is_host, service, assigns}`. `validate` checks: hosts ⊆ members; `member` is never redefined; no empty role or matcher; `allow`/`readers` name only defined roles; every service host is a host, listed once.
+- `access.rs`: `authorize(state, caller, principal, service) -> Result<RoleName, Refusal>` is **`todo!("27c")`**. `allowed_services(state, caller, principal) -> Vec<Grant>` is written in terms of `authorize`, so it is also red until 27c lands. `Refusal` gives the precise reasons (`NotAMember`, `UnknownService`, `NobodyAllowed`, `NotInRole{principal: None}` → "run `wires login`").
+- `sync.rs`: `StateFrame { Offer{state}, Have{version}, Denied{reason} }` on ALPN `wires/state/1`, with `MAX_STATE_FRAME` of 4 MiB. The codec is **`todo!("27a")`**.
+- **Handshake** (`calls/session.rs`, done, not a stub): new `Frame::Hello(Hello { membership, state_version, id_token: Option<IdToken> })` with tag 8, and `Frame::HelloAck(HelloAck { membership, state_version, newer_state: Option<SignedState> })` with tag 9. `newer_state` is the cheapest pull: when the caller's copy is older, the host hands back its own. The old `Handshake`/`HandshakeAck` pair is untouched.
+- New `Error` variants: `InvalidServiceName`, `InvalidRoleName`, `InvalidEmailPattern`, `InvalidState(String)`.
+
+**`host.json` v2** (`wires/host/config_v2.rs`, parser done): `{version: 2, identity, services: {name: {command, cwd?, env?, also_require?: [roles]}}, push?: {allow: [roles], log_body}, audit?: {otlp}}` with `deny_unknown_fields` at every level. It refuses `WIRES_*` names and malformed names in `env`. `AnyHostConfig::parse` dispatches on `version` (1 → the existing v1 parser, unchanged). `also_require` holds **registry role names** that the caller must *also* be in; they can only narrow. `push.allow` also moves to registry roles. `check_against(state, me)` is **`todo!("27c")`**: it refuses to serve a name the registry doesn't assign to this host, and refuses undefined roles.
+
+**Red tests**, all `#[ignore = "27x"]`, so the suite is green. Run `cargo test --workspace -- --ignored` to see them:
+- 27a: `sync::tests::*`
+- 27b: `caller::pick::tests::*`
+- 27c: `access::tests::*` (4), `host::gate::tests::*`, `host::config_v2::tests::refuses_services_not_assigned_here`
+
+### Lane ownership (files)
+
+| Lane | Owns (creates/edits freely) | Shared: minimal diffs only |
+|---|---|---|
+| **27a distribution** | `library/services/sync.rs`; `wires/state/{mod,store,sync}.rs` (stubs: `store::read`, `store::adopt_if_newer`, `sync::{push_all, pull, respond}`); `wires/admin/service.rs` (`add`/`set`/`rm` + `ServiceEdit`); `wires/admin/{init,invite,commit,keystore}.rs`; `wires/caller/join.rs`; `library/membership/invite.rs` (the invite carries the `SignedState`) | `wires/main.rs` (`service` subcommand); `library/services/state.rs` (e.g. a `State::next(issued, not_after)` helper) |
+| **27b caller** | `wires/caller/{services,pick,hello}.rs` (stubs: `services::{run, render}`, `pick::candidates`, `hello::build`); `wires/caller/{call,mcp,login,tools,resolve}.rs` | `wires/main.rs` (`services`, `login` without `--topic`); the **dial half** of `wires/host/transport.rs` (`call_on` and below) |
+| **27c host** | `library/services/access.rs` (`authorize`, the ground truth for 27b's listing); `wires/host/{gate,config_v2,config,policy,serve,push,identity}.rs` (stubs: `gate::admit`, `HostConfigV2::check_against`) | the **accept half** of `wires/host/transport.rs` (`serve_on`, `authorize`, `check_member`) |
+| **27d delete + docs** | `library/channel/*`, `library/membership/{fabric_key,rekey,roster}.rs`, the channel re-exports in `library/lib.rs`; `wires/channel/*`, `wires/host/announce.rs`, `wires/caller/resolve.rs` (after 27b), `wires/advanced.rs`; `.scripts/*`, README, `docs/*`, CLAUDE.md | anything the others still import: delete only after a/b/c merge |
+
+**Order inside the fan-out:** 27a should land `wires/state/store.rs` first (read plus CAS, about 40 lines), because 27b's listing and 27c's gate both read the stored state. Until then they can test against an in-memory `SignedState`. 27c's `authorize` unblocks 27b's `allowed_services`. `library/lib.rs` is shared by 27a, 27c and 27d: add re-exports only, as one-line diffs.

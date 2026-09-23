@@ -13,6 +13,8 @@
 //!   flag → env → file → keystore resolution every command uses.
 //! - [`keys`] — `member`.
 //! - [`roster`] — `roster add | remove | commit | head`.
+//! - [`service`] — `wires service add | rm | set`: the registry (card 27,
+//!   27a stub).
 //! - [`import`] — installing the credentials the admin hands out.
 
 pub mod commit;
@@ -22,6 +24,7 @@ pub mod invite;
 pub mod keys;
 pub mod keystore;
 pub mod roster;
+pub mod service;
 
 /// Render any error as a string for the admin-command error channel.
 pub(crate) fn stringify<E: std::fmt::Display>(e: E) -> String {
