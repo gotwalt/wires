@@ -58,6 +58,14 @@ Pitch the demo to the MCP contact and note which part lands: "identity-bound CLI
 
 Asynchronous push to intermittently online callers (store-and-forward, catch-up) is exactly what the channel already does. Card 23 builds push on a direct dial-back plus a host-side queue so that it doesn't prejudge this card, but push is the strongest argument yet for keeping *a* channel. Weigh it here.
 
+## Decision input (the human, 2026-09-23): call records must not be broadcast
+
+Today every member of the org channel receives, stores and can decrypt every call record (principal, argv, the first 4 KiB of stdin). The human: *"unintentionally receiving an entire organization's tool call data is bad and a huge bandwidth suck."*
+
+- **Sealing records to the caller plus audit readers** (as card 15 did for announcements) fixes *reading* but not *delivery*: gossip still ships every sealed record to every member, and each member's store keeps it. Bandwidth and storage scale with org call volume, and cold `call`/`tools` catch-ups pull it too.
+- **Direction:** call records leave the broadcast channel. Each host keeps its own signed, hash-linked, append-only log; authorized readers (a `host.json` audit-reader role, plus each caller for their own calls) **subscribe per host** over a direct iroh connection (`wires watch <host>`, reusing card 23's dial-by-key and catch-up); an OTel export serves orgs with a SIEM. The channel, if it stays, carries only small control data (re-keys, announcements).
+- **Cost accepted:** no automatic replication at write time, so a compromised host can withhold or truncate its own history. Hash links still make rewrites detectable against any copy a subscriber or SIEM already holds. Cross-org "log the host can't rewrite" becomes an opt-in sink rather than the default.
+
 ## Related
 
 - [18 — front door (OPEN)](18-front-door-OPEN.md): the directory and host-list question overlaps with how people and hosts enter the org.
