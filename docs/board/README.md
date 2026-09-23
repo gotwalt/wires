@@ -65,7 +65,7 @@ The IdP is *bound* at the caller (`login`), *enforced* at the host (`host.json`)
 | [19](done/19-no-shell-caller.md) | S | 12 | No-shell caller: `wires call --jq/--head/--max-bytes` in-process; wires-only sandbox recipe; benchmark arm 5 |
 | [20](done/20-locked-caller.md) | S2 | 19 | Locked caller mode: `WIRES_LOCKED=1` rejects override flags so a sandboxed agent can't steer `wires call` |
 | [21](done/21-camera-polish.md) | P2 | 12–20 | Camera polish: heartbeat noise, quiet admin commands, clear removal reason, seal announcements only to current members |
-| [23](backlog/23-inbox.md) | I | 21 | Push to callers: `wires inbox` (local read / `--wait`), host `wires push`, queue + dial-back by key, `host.json` `push` roles, audited |
+| [23](review/23-inbox.md) | I | 21 | Push to callers: `wires inbox` (local read / `--wait`), host `wires push`, queue + dial-back by key, `host.json` `push` roles, audited |
 | [24](backlog/24-push-demo.md) | E2 | 23 | Push demo (deploy → callback → follow-up) + push-vs-poll benchmark |
 | [22](backlog/22-gossip-role-OPEN.md) | — | parked | **Open question, don't build:** does the core need gossip? Admin-signed host list + direct discovery + OTel sinks; notes the tool-name-squatting weakness |
 | [18](backlog/18-front-door-OPEN.md) | — | parked | **Open question, don't build:** apex key, invites, `wires join <domain>` |

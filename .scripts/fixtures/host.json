@@ -15,5 +15,6 @@
       "command": ["sqlite3", "-safe", "-readonly", "-header", "-column", "orders.db"],
       "allow": ["analyst"]
     }
-  }
+  },
+  "push": { "allow": ["analyst"] }
 }

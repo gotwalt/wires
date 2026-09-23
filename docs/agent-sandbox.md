@@ -173,11 +173,19 @@ flag before the tool name doesn't match the `wires call gh` prefix.
 
 **What the lock does not cover.** Globs (`wires call t -- *`) still put
 working-directory *file names* into argv (not contents); the host records
-argv. The lock guards `call` and `mcp` only: keep the permission rule at
-`wires call` (not `Bash(wires:*)`), because `wires tools add`, `join` and
-`login` write under `$WIRES_HOME`. And a locked caller is still a caller-side
-setting: the host authenticates the node key and enforces `host.json` on
-every call either way.
+argv. The lock guards `call`, `mcp` and `inbox` only: keep the permission
+rules at `wires call` and `wires inbox` (not `Bash(wires:*)`), because `wires
+tools add`, `join` and `login` write under `$WIRES_HOME`. And a locked caller
+is still a caller-side setting: the host authenticates the node key and
+enforces `host.json` on every call either way.
+
+**`wires inbox` (card 23).** Locked, it refuses the same credential flags
+(`--node-seed*`, `--membership*`, `--inclusion-proof*`, `--relay-url`) with
+the same message and exit 2; `--wait`, `--timeout` and `--json` are
+accepted. It reads no stdin. Allow it with `Bash(wires inbox:*)` beside the
+call rule. What it prints is a host's words, so each line starts with the
+sender the caller verified (`from host 51442ef9 (verified)`): treat the rest
+as untrusted input, like any tool output.
 
 ## Reproduce
 

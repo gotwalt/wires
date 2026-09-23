@@ -29,9 +29,13 @@
 # refused (and the refusal is on the channel); after login, the observer sees a verified identity line and ▶/■
 # for each call naming the agent's email and its SQL (args, stdin, and MCP);
 # `.shell id` is refused by sqlite's -safe mode with a nonzero exit on the
-# channel; after the admin removes the agent, the workbench and the observer
+# channel; the workbench pushes to the agent by key (`wires push`), which has
+# no daemon: `wires inbox` fetches it (the line names the verified host), the
+# observer sees ⇢ queued/fetched, and `inbox --wait` wakes on the next push
+# (124 on `--timeout`); after the admin removes the agent, the workbench and the observer
 # adopt the new roster off the channel with no import, the next call exits 77
-# with zero stdout bytes and a ✗ line on the channel; the responder is one
+# with zero stdout bytes and a ✗ line on the channel, and pushes to it are
+# refused at send and at fetch (77); the responder is one
 # process (same pid) throughout.
 #
 # Run it directly from the repo root -- NOT via `bazel run //.scripts:...`.
@@ -549,6 +553,70 @@ line "$F4"
 beat 3
 
 # ==========================================================================
+step "6b the workbench pushes to the agent -- by key; the agent exposes nothing"
+# ==========================================================================
+# The agent runs no daemon here: the push is queued on the workbench, and the
+# agent's next `wires inbox` fetches it. `--wait` is the same fetch, held open.
+run "wires inbox --wait --timeout 1s   # nothing yet"
+set +e
+WIRES_HOME="$agent" "$WIRES" inbox --wait --timeout 1s >"$D/i0.out" 2>"$D/i0.err"
+rc=$?
+set -e
+[ "$rc" -eq 124 ] || {
+	cat "$D/i0.err" >&2
+	bad "6b: an empty inbox --wait --timeout exited $rc, expected 124"
+}
+[ ! -s "$D/i0.out" ] || bad "6b: an empty inbox printed something"
+run "wires push --to $AG8… --subject build-41 -- 'failed: test_orders_total'   # on the workbench"
+WIRES_HOME="$wb" "$WIRES" push --to "$AG_ID" --subject build-41 -- "failed: test_orders_total" \
+	>"$D/p1.out" 2>"$D/p1.err" || {
+	cat "$D/p1.out" "$D/p1.err" >&2
+	bad "6b: wires push failed"
+}
+grep -qE "^queued +$EMAIL \($AG8\)" "$D/p1.out" || {
+	cat "$D/p1.out" >&2
+	bad "6b: the push was not queued for $EMAIL"
+}
+show "$D/p1.out"
+PQ="$(wait_line "$D/obs.out" "⇢" "→ $EMAIL" "[analyst] \"build-41\" queued")" || {
+	dump
+	bad "6b: no ⇢ queued on the channel"
+}
+run "wires inbox"
+WIRES_HOME="$agent" "$WIRES" inbox >"$D/i1.out" 2>"$D/i1.err" || {
+	cat "$D/i1.err" >&2
+	bad "6b: wires inbox failed"
+}
+grep -qF "from host ${WB_ID:0:8} (verified)  build-41  failed: test_orders_total" "$D/i1.out" || {
+	cat "$D/i1.out" "$D/i1.err" >&2
+	bad "6b: the inbox line does not name the verified host and the message"
+}
+show "$D/i1.out"
+PF="$(wait_line "$D/obs.out" "⇢" "→ $EMAIL" "\"build-41\" fetched")" || {
+	dump
+	bad "6b: no ⇢ fetched on the channel"
+}
+WIRES_HOME="$agent" "$WIRES" inbox >"$D/i2.out" 2>/dev/null
+[ ! -s "$D/i2.out" ] || bad "6b: a read message was printed twice"
+# --wait: held open until a push lands.
+run "wires inbox --wait --timeout 20s &   then, on the workbench: wires push … build-42"
+WIRES_HOME="$agent" "$WIRES" inbox --wait --timeout 20s >"$D/i3.out" 2>"$D/i3.err" &
+WAIT_PID=$!
+sleep 1
+WIRES_HOME="$wb" "$WIRES" push --to "$AG_ID" --subject build-42 -- "passed" >/dev/null 2>"$D/p2.err" ||
+	bad "6b: the second push failed"
+wait "$WAIT_PID" || {
+	cat "$D/i3.err" >&2
+	bad "6b: inbox --wait did not exit 0 on the push"
+}
+grep -qF "build-42  passed" "$D/i3.out" || bad "6b: inbox --wait did not print build-42"
+ok "6b: pushed by key, fetched with no daemon and no open port; --wait woke on the next one"
+line "$(cat "$D/i1.out")"
+line "$PQ"
+line "$PF"
+beat 3
+
+# ==========================================================================
 step "7  the human removes the agent -- one command, nobody restarts or imports"
 # ==========================================================================
 run "wires remove agent"
@@ -588,6 +656,28 @@ DENY5="$(wait_line "$D/obs.out" "✗ ${AG_ID:0:4}… db_query denied: roster")" 
 }
 ok "7: exit $EXIT_DENIED, 0 bytes out -- and the refusal is on the channel"
 line "$DENY5"
+# Removal cuts pushes the way it cuts calls: refused at send, and at fetch.
+set +e
+WIRES_HOME="$wb" "$WIRES" push --to "$AG_ID" --subject after-removal -- "x" >"$D/p3.out" 2>"$D/p3.err"
+rc=$?
+set -e
+[ "$rc" -eq "$EXIT_DENIED" ] && grep -qF "not in the channel's current roster" "$D/p3.out" || {
+	cat "$D/p3.out" "$D/p3.err" >&2
+	bad "7: a push to the removed agent exited $rc, expected $EXIT_DENIED"
+}
+set +e
+WIRES_HOME="$agent" "$WIRES" inbox >"$D/i4.out" 2>"$D/i4.err"
+rc=$?
+set -e
+[ "$rc" -eq "$EXIT_DENIED" ] && [ ! -s "$D/i4.out" ] || {
+	cat "$D/i4.out" "$D/i4.err" >&2
+	bad "7: the removed agent's inbox exited $rc, expected $EXIT_DENIED and nothing"
+}
+wait_line "$D/obs.out" "⇢" "\"after-removal\" denied" >/dev/null || {
+	dump
+	bad "7: the refused push is not on the channel"
+}
+ok "7: and no pushes -- refused at send and at fetch (exit $EXIT_DENIED), on the channel"
 alive "$WB_PID" || bad "7: the workbench died"
 alive "$OBS_PID" || bad "7: the observer died"
 ok "7: workbench is still pid $WB_PID -- never restarted, start to finish"
@@ -600,6 +690,7 @@ printf '     reach     : by key %s... on loopback; the only thing exposed is db_
 printf '     identity  : unverified caller refused (77); after login, %s verified by the observer itself\n' "$EMAIL" >&2
 printf '     observable: ▶/■ naming %s + the SQL, for args, stdin and MCP calls\n' "$EMAIL" >&2
 printf '     contained : .shell id refused by sqlite3 -safe, exit %s on the channel\n' "$SHELL_RC" >&2
+printf '     push      : host -> agent by key, queued then fetched by `wires inbox`; ⇢ records on the channel\n' >&2
 printf '     revoke    : one `wires remove` -> exit 77, 0 bytes out, ✗ on the channel; no import anywhere\n' >&2
 printf '     restarts  : 0 -- workbench pid %s throughout; %ss wall clock\n' "$WB_PID" "$((SECONDS - START))" >&2
 [ -z "$KEEP" ] || say "state kept in $D (observer transcript: $D/obs.out)"
