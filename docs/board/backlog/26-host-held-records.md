@@ -1,6 +1,6 @@
-# 26 — Call records off the broadcast channel: host-held logs, per-host subscriptions
+# 26 — Call records: host-held signed logs, streamed per service to authorized readers
 
-**Lane:** H2 · **Depends on:** 25 merged (it removes code this card would otherwise have to rework) · **Blocks:** the recording (card 08) · **Files:** `wires/host/audit.rs` and log storage, a new record-stream protocol, `wires/channel/watch.rs`, `host.json` (`audit` section), render, `demo-remote-cli.sh`, docs
+**Lane:** H2 · **Depends on:** 27 merged (services, not hosts; no channel) · **Blocks:** the recording (card 08) · **Files:** `wires/host/audit.rs` and log storage, a new record-stream protocol, `wires/channel/watch.rs`, `host.json` (`audit` section), render, `demo-remote-cli.sh`, docs
 
 ## Why (the human, 2026-09-23)
 
@@ -13,14 +13,14 @@ suck."* Sealing records per reader would fix reading but not delivery. See
 ## Design
 
 - **The host keeps its own log.** An append-only store of `AuditRecord`s, each **signed by the host key and hash-linked** to the previous one (reuse `library` chain/envelope pieces where they fit; records no longer need channel encryption, only signatures). Bounded retention in `host.json` (default 30 days). Stable per-record sequence numbers.
-- **Who may read (`host.json`):** `"audit": { "readers": ["security"] }` names roles that may stream **all** records. **Every caller may stream its own** records (matched by verified node id). Everyone else is refused. Default deny.
+- **Who may read (the service's registry entry, card 27):** `"audit": { "readers": ["security"] }` names roles that may stream **all** records. **Every caller may stream its own** records (matched by verified node id). Everyone else is refused. Default deny.
 - **Reading = subscribing to a host directly.**
-  - `wires watch <host|tool>` resolves the host through the directory, dials it by key on a record-stream ALPN, sends `since=<seq>`, and gets backlog then live records (like card 23's long-poll/stream). It can watch several hosts at once; `wires watch` with no argument watches every host listed in its directory that allows it anything.
+  - `wires watch <service>` resolves the service's hosts through the signed registry (card 27), dials each by key on a record-stream ALPN, sends `since=<seq>`, and gets backlog then live records (like card 23's long-poll/stream), merged into one stream per service; the user never names a host. `wires watch` with no argument watches every service whose records it may read.
   - `wires watch --mine` shows only your own calls.
   - Verify each record's signature and hash link on receipt; report gaps and forks loudly.
   - The watcher remembers its high-water mark per host, so a restart resumes.
 - **OTel export (optional, host side):** `"audit": { "otlp": "http://collector:4318" }` sends each record as an OTLP log record (attributes: caller node, principal email/iss/sub, role, tool, argv, exit, duration, stdout digest, host id, record hash and signature), so orgs with a SIEM get it where their other logs live. Keep it minimal and behind the config key; no exporter unless configured.
-- **Remove call records from the broadcast channel.** `AuditRecord` stops being published there. The channel keeps only control data (re-keys, host announcements, and identity claims until card 22 decides otherwise). Check the cold `call`/`tools` catch-up no longer pulls call traffic.
+- The broadcast channel is gone after card 27, so records exist only in host logs, subscriber copies and OTel.
 - **Push records (card 23)** follow the same path: in the host log, streamed to the recipient and readers, not broadcast.
 
 ## Acceptance

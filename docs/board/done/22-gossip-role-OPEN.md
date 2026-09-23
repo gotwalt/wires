@@ -1,6 +1,6 @@
 # 22 — OPEN QUESTION: does the core need the gossip channel?
 
-**Status:** discussed with the human on 2026-09-23 and written down, **not scheduled. Don't build anything from this card until it's decided.** The current demo (gossip channel for discovery, identity claims, re-keys and call records) stays as is.
+**Status: DECIDED 2026-09-23 — drop the channel.** The human: the requirements are that only authorized users can call a service and can list what's available to them; the channel serves neither, and users should address services, not hosts. Implemented by [card 27](../backlog/27-services-not-hosts.md) (services, not hosts; drop the channel) and [card 26](../backlog/26-host-held-records.md) (host-held records). The analysis below is kept as the record of why.
 
 ## The question
 

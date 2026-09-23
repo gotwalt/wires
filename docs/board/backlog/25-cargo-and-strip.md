@@ -28,6 +28,8 @@ The repo is single-language Rust, three crates, with **no remote cache and no CI
 
 ## Part B — code and files the product no longer uses (audit, then remove)
 
+**Out of scope here:** the channel machinery (topics, gossip, fabric keys, re-keys, announcements, directory). Card 27 removes it as part of the services redesign; don't touch it in this card.
+
 Verify each is unused on the current tree before removing it; if something is still referenced, say where in Notes and leave it.
 
 - [ ] **Grants and capability tickets.** `serve host.json` never checks grants (card 13); roles replace them. Candidates: `library` `grant.rs`, `ticket.rs` (`CapabilityTicket`), the `grant` field of `Frame::Handshake`, `ServeConfig.require_grant`, `wires advanced grant`, `tools.json` ticket targets (`ToolTarget::Ticket`), and `tools add --ticket`.

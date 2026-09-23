@@ -68,11 +68,14 @@ The IdP is *bound* at the caller (`login`), *enforced* at the host (`host.json`)
 | [23](review/23-inbox.md) | I | 21 | Push to callers: `wires inbox` (local read / `--wait`), host `wires push`, queue + dial-back by key, `host.json` `push` roles, audited |
 | [24](backlog/24-push-demo.md) | E2 | 23 | Push demo (deploy → callback → follow-up) + push-vs-poll benchmark |
 | [25](backlog/25-cargo-and-strip.md) | X | 23, 24 | Down to essentials: Bazel → plain Cargo + Dockerfile; remove grants/tickets/CRL/relay/manual targets and outdated docs (git history is the archive) |
-| [26](backlog/26-host-held-records.md) | H2 | 25 | Call records off the broadcast channel: host-held signed log, per-host `watch` for authorized readers + own calls, optional OTel export |
-| [22](backlog/22-gossip-role-OPEN.md) | — | parked | **Open question, don't build:** does the core need gossip? Admin-signed host list + direct discovery + OTel sinks; notes the tool-name-squatting weakness |
+| [27](backlog/27-services-not-hosts.md) | S3 | 25 | **Services, not hosts; drop the channel.** Admin-signed members + service registry; local `wires services`; identity in the handshake; delete gossip/fabric keys/re-keys/announcements (~20k LOC) |
+| [26](backlog/26-host-held-records.md) | H2 | 27 | Call records: host-held signed log, `watch <service>` for authorized readers + own calls, optional OTel export |
+| [22](done/22-gossip-role-OPEN.md) | — | decided | **Decided 2026-09-23: drop the channel** → cards 27 and 26 |
 | [18](backlog/18-front-door-OPEN.md) | — | parked | **Open question, don't build:** apex key, invites, `wires join <domain>` |
 | [16](done/16-token-benchmark.md) | bench | 01–03 | MCP (GitHub server, many tools; ± tool search) vs `gh` via `wires call` vs bare `gh`: 5 tasks × 5 runs |
 | [09](backlog/09-witness.md) | stretch | 02 | Key-less witness: stores and verifies call records without decrypting them |
+
+**Order (agreed 2026-09-23):** 24 → 25 (Cargo + strip) → 27 (services, not hosts; drop the channel) → 26 (host-held records) → recording (08).
 
 ## Rules for workers
 
