@@ -8,14 +8,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 building / linting / formatting Rust and shell, plus `rules_oci` for cutting
 distroless Docker images from the Rust binaries.
 
-The session-layer thesis, the binary layout, and full usage live in
-`README.md`. Deployment and testing patterns live in `docs/deployment.md` and
-`docs/testing.md`.
+**The current assignment (2026-09-22):** agents run CLIs on other machines.
+The machine is reached by public key, never by network path. The caller is
+authenticated by their IdP, via an ID token bound to the node key and
+published as channel metadata. Every call is recorded by the responder on an
+E2EE gossip channel that authorized observers can watch without access to
+the caller or the machine running the CLI. `wires call` is the CLI-native
+path; `wires mcp` is the stdio MCP on-ramp for clients that only speak MCP.
+The goal is a sharp demo for the MCP team.
 
-**Read `docs/restart.md` before planning any new work.** It holds the
-project's re-founded pitch (2026-08-13), the phase plan with gates, and the
-kill criteria. The pre-restart prototype is tagged `archive/poc-2026-05` —
-reference it freely, never merge from it.
+**Read `docs/board/README.md` before planning any work.** It holds the pitch,
+the rebuttals it must survive, the demo target, the lanes, and the worker
+rules. Cards move `backlog/ → doing/ → review/ → done/`; only the integrator
+moves a card to `done/`. Every README or narration sentence must pass the
+rebuttal test in `docs/storytelling.md` §1.
+
+Usage lives in `README.md`. Deployment and testing patterns live in
+`docs/deployment.md` and `docs/testing.md`. Specs for code that runs:
+`docs/committed-roster.md` (membership and revocation) and
+`docs/phase2-topics.md` (the encrypted channels). `docs/restart.md` is
+history: the phase plan, kill criteria, and non-negotiables (§7 still holds).
+`docs/archive/` holds superseded design docs, including the session-layer
+thesis. The pre-restart prototype is tagged `archive/poc-2026-05`: reference
+it freely, but never merge from it. That includes the old HTTP/OAuth
+`wires-mcp` gateway, which `wires mcp` replaces; don't port it.
+
+**Case-insensitive FS gotcha:** the package directory is `wires/`. If a new
+file shows up in `git status` as `Wires/…`, add it by its lowercase path.
 
 ## Build System
 
