@@ -12,6 +12,15 @@
 //! the configured child — with the verified caller identity injected into its
 //! environment — and bridges its stdio over tagged frames.
 //!
+//! A responder runs in one of two modes. **Single-command** (`wires serve --
+//! <cmd>`) execs one fixed command per session. **Multi-tool** (`wires serve
+//! --expose name=cmd …`, [`ServeConfig::tools`] non-empty) fronts several CLIs:
+//! the dialer follows its handshake with a [`Frame::Invoke`] naming one of
+//! them plus per-call arguments ([`call_on`]); the responder authorizes the
+//! caller for *that tool* (grant scope `tool:<name>` or [`TOOL_SCOPE_ANY`]) and
+//! execs the tool's fixed argv with the caller's arguments appended — never
+//! through a shell.
+//!
 //! Two properties this module exists to preserve:
 //!
 //! - **Refusals are legible.** A responder that turns a caller away sends a
@@ -30,9 +39,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::presets::N0;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use std::collections::BTreeMap;
+
 use library::{
-    Chunk, Crl, Frame, Grant, InclusionProof, Membership, NodeId, NodeIdentity, RosterHead, Scope,
-    check_accept, check_inclusion, check_roster_inclusion,
+    Chunk, Crl, Frame, Grant, InclusionProof, Invocation, Membership, NodeId, NodeIdentity,
+    RosterHead, Scope, ToolName, check_accept, check_inclusion, check_roster_inclusion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
@@ -62,6 +73,29 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// to the client.
 const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The grant scope that admits a caller to **every** tool on a multi-tool
+/// responder. A grant scoped [`tool_scope`]`(name)` admits it to one.
+pub const TOOL_SCOPE_ANY: &str = "tool:*";
+
+/// The grant scope that admits a caller to exactly `tool` on a multi-tool
+/// responder: `tool:<name>`.
+pub fn tool_scope(tool: &ToolName) -> Scope {
+    Scope::new(format!("tool:{tool}"))
+}
+
+/// Denial reason: a multi-tool responder got something other than an
+/// [`Frame::Invoke`] after the handshake.
+pub const DENY_INVOKE_REQUIRED: &str = "invoke required";
+
+/// Denial reason: a single-command responder got an [`Frame::Invoke`].
+pub const DENY_SINGLE_COMMAND: &str = "this responder runs a single command; drop --tool";
+
+/// Denial reason for an [`Invocation`] naming a tool this responder does not
+/// expose.
+fn deny_unknown_tool(tool: &ToolName) -> String {
+    format!("unknown tool: {tool}")
+}
+
 /// The responder's static configuration: what it trusts, what it serves, the
 /// optional roster head it enforces, the identity it presents in the ack, and
 /// the child to exec. Built once per `serve` and shared across connections.
@@ -69,6 +103,12 @@ pub struct ServeConfig {
     /// The trusted fabric root whose memberships, grants, and head are honored.
     pub trust_root: NodeId,
     /// The scope this responder serves; `None` is inclusion-only.
+    ///
+    /// In multi-tool mode ([`tools`](Self::tools) non-empty) the value is not
+    /// compared: `Some(_)` means "a grant is required", and the grant's scope
+    /// must be [`tool_scope`] of the invoked tool or [`TOOL_SCOPE_ANY`].
+    /// `wires serve --expose` sets it to [`TOOL_SCOPE_ANY`] unless
+    /// `--allow-any-member`.
     pub scope: Option<Scope>,
     /// Where the revocation list applied to the credential checks comes from.
     pub crl: CrlSource,
@@ -86,7 +126,7 @@ pub struct ServeConfig {
     /// When non-empty the dialer must send a [`Frame::Invoke`] naming one of
     /// these; its `argv` is appended to the tool's fixed argv (never through a
     /// shell). Empty means single-command mode.
-    pub tools: std::collections::BTreeMap<library::ToolName, Vec<String>>,
+    pub tools: BTreeMap<ToolName, Vec<String>>,
     /// Where call records go (`--audit-topic`), if anywhere.
     pub audit: Option<AuditSink>,
 }
@@ -421,6 +461,89 @@ async fn pump_reader<R: AsyncRead + Unpin>(
     Ok(())
 }
 
+/// Parse `wires serve --expose` specs and an optional `--expose-file` into the
+/// multi-tool map for [`ServeConfig::tools`].
+///
+/// Each spec is `name=command args…`; the command is split on ASCII
+/// whitespace — no quoting, no shell. Argv that needs spaces goes in the file
+/// instead: a JSON object `{"name": ["program", "arg with spaces", …]}`. Every
+/// name must be a valid [`ToolName`], every argv non-empty, and a name may be
+/// exposed only once across both sources.
+pub fn exposed_tools(
+    specs: &[String],
+    file: Option<&Path>,
+) -> Result<BTreeMap<ToolName, Vec<String>>> {
+    let mut tools = BTreeMap::new();
+    let mut add = |name: &str, argv: Vec<String>| -> Result<()> {
+        let tool = ToolName::new(name).map_err(|e| anyhow!("tool name {name:?}: {e}"))?;
+        if argv.is_empty() {
+            bail!("tool {tool}: empty command");
+        }
+        if tools.insert(tool.clone(), argv).is_some() {
+            bail!("tool {tool} is exposed more than once");
+        }
+        Ok(())
+    };
+    for spec in specs {
+        let (name, command) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--expose {spec:?}: expected name=command"))?;
+        add(
+            name,
+            command
+                .split_ascii_whitespace()
+                .map(str::to_string)
+                .collect(),
+        )?;
+    }
+    if let Some(path) = file {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --expose-file {}", path.display()))?;
+        let map: BTreeMap<String, Vec<String>> = serde_json::from_str(&text)
+            .with_context(|| format!("parsing --expose-file {}", path.display()))?;
+        for (name, argv) in map {
+            add(&name, argv)?;
+        }
+    }
+    Ok(tools)
+}
+
+/// The argv to exec for this session: the single command, or the invoked
+/// tool's fixed argv with the caller's [`Argv`](library::Argv) appended element by element.
+///
+/// `Err` carries the denial reason for an invocation naming a tool this
+/// responder does not expose. The mode mismatches (an `Invoke` sent to a
+/// single-command responder, or none sent to a multi-tool one) are caught
+/// before this is reached.
+fn resolve_command(
+    config: &ServeConfig,
+    invocation: Option<&Invocation>,
+) -> std::result::Result<Vec<String>, String> {
+    match invocation {
+        None => Ok(config.command.clone()),
+        Some(inv) => {
+            let base = config
+                .tools
+                .get(&inv.tool)
+                .ok_or_else(|| deny_unknown_tool(&inv.tool))?;
+            Ok(base.iter().chain(inv.argv.as_slice()).cloned().collect())
+        }
+    }
+}
+
+/// Read the [`Frame::Invoke`] a multi-tool dialer sends right after its
+/// handshake (bounded by [`HANDSHAKE_TIMEOUT`]).
+async fn read_invocation<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Invocation> {
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(recv))
+        .await
+        .context("timed out waiting for invoke")??
+    {
+        Some(Frame::Invoke(invocation)) => Ok(invocation),
+        Some(_) => bail!("second frame was not an invoke"),
+        None => bail!("connection closed before invoke"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Responder (`wires serve`)
 // ---------------------------------------------------------------------------
@@ -523,8 +646,15 @@ async fn serve_connection(conn: iroh::endpoint::Connection, config: &ServeConfig
 
 /// The responder half of a session over an established, already-authenticated
 /// bi-stream: read and verify the handshake against `caller` and `config`, send a
-/// `HandshakeAck`, then exec `config.command` and bridge its stdio. `caller` must
-/// already be authenticated by whoever supplies the streams.
+/// `HandshakeAck`, then exec the session's command and bridge its stdio. `caller`
+/// must already be authenticated by whoever supplies the streams.
+///
+/// In multi-tool mode ([`ServeConfig::tools`] non-empty) the handshake must be
+/// followed by a [`Frame::Invoke`]; the caller is authorized for the named tool
+/// and the tool's argv plus the invocation's arguments are exec'd (with
+/// `WIRES_TOOL` set). In single-command mode an `Invoke` is refused with
+/// [`DENY_SINGLE_COMMAND`] — detected on the stdin stream, so the child has
+/// already been spawned (for a caller authorized to run it) and is killed.
 ///
 /// A refused handshake is answered with a [`Frame::Denied`] carrying the reason
 /// before the connection drops, and no child is spawned. (A peer that connects
@@ -572,6 +702,23 @@ where
             return Err(e);
         }
     };
+
+    // Multi-tool mode: the dialer sends its `Invoke` right behind the handshake
+    // without waiting for the ack, so it is read here, before authorization
+    // (which is per tool).
+    let invocation = if config.tools.is_empty() {
+        None
+    } else {
+        match read_invocation(&mut recv).await {
+            Ok(invocation) => Some(invocation),
+            Err(e) => {
+                crate::audit::denied(config.audit.as_ref(), caller, None, DENY_INVOKE_REQUIRED); // audit: denied
+                deny(&mut send, DENY_INVOKE_REQUIRED.to_string()).await;
+                return Err(e.context(DENY_INVOKE_REQUIRED));
+            }
+        }
+    };
+    let tool = invocation.as_ref().map(|i| &i.tool);
     let now = crate::now_unix();
 
     // Re-read the CRL and the enforced head for *this* connection, so a
@@ -583,7 +730,7 @@ where
         Err(e) => {
             tracing::warn!("credential sources unusable: {e:#}");
             let reason = "responder configuration error".to_string();
-            crate::audit::denied(config.audit.as_ref(), caller, None, &reason); // audit: denied
+            crate::audit::denied(config.audit.as_ref(), caller, tool.cloned(), &reason); // audit: denied
             deny(&mut send, reason).await;
             return Err(e.context("loading credential sources"));
         }
@@ -597,18 +744,35 @@ where
         proof.as_ref(),
         caller,
         now,
+        tool,
     ) {
         Ok(v) => v,
         Err(e) => {
-            crate::audit::denied(config.audit.as_ref(), caller, None, &format!("{e:#}")); // audit: denied
+            crate::audit::denied(
+                config.audit.as_ref(),
+                caller,
+                tool.cloned(),
+                &format!("{e:#}"),
+            ); // audit: denied
             deny(&mut send, format!("{e:#}")).await;
             return Err(e);
+        }
+    };
+
+    // Only an authorized caller learns whether the tool it named exists.
+    let argv = match resolve_command(config, invocation.as_ref()) {
+        Ok(argv) => argv,
+        Err(reason) => {
+            crate::audit::denied(config.audit.as_ref(), caller, tool.cloned(), &reason); // audit: denied
+            deny(&mut send, reason.clone()).await;
+            return Err(anyhow!(reason));
         }
     };
 
     tracing::info!(
         caller = %caller.hex(),
         scope = ?config.scope.as_ref().map(Scope::as_str),
+        tool = ?tool.map(ToolName::as_str),
         roster_version = ?roster_version,
         "session accepted"
     );
@@ -625,14 +789,14 @@ where
     )
     .await?;
 
-    // Spawn the configured child with piped stdio, injecting the verified caller
-    // identity (and the admitting roster version, if any). Scrub any inherited
-    // `WIRES_*` first so a malicious parent environment cannot smuggle a stale
-    // identity to a child that trusts it. These are *server-derived,
-    // post-verification* values — `caller` is the iroh-authenticated peer, never a
-    // handshake claim — and are public ids, not secrets.
-    let (program, args) = config
-        .command
+    // Spawn the child with piped stdio, injecting the verified caller identity
+    // (and the admitting roster version, if any, and the invoked tool). Scrub
+    // any inherited `WIRES_*` first so a malicious parent environment cannot
+    // smuggle a stale identity to a child that trusts it. These are
+    // *server-derived, post-verification* values — `caller` is the
+    // iroh-authenticated peer, never a handshake claim — and are public ids,
+    // not secrets.
+    let (program, args) = argv
         .split_first()
         .ok_or_else(|| anyhow!("empty serve command"))?;
     tracing::info!(program = %program, "spawning child and bridging stdio");
@@ -642,6 +806,7 @@ where
         .env_remove("WIRES_FABRIC_ROOT")
         .env_remove("WIRES_MEMBERSHIP_NOT_AFTER")
         .env_remove("WIRES_ROSTER_VERSION")
+        .env_remove("WIRES_TOOL")
         .env("WIRES_CALLER_NODE", caller.hex())
         .env("WIRES_FABRIC_ROOT", config.trust_root.hex())
         .env(
@@ -651,18 +816,22 @@ where
     if let Some(v) = roster_version {
         cmd.env("WIRES_ROSTER_VERSION", v.to_string());
     }
+    if let Some(tool) = tool {
+        cmd.env("WIRES_TOOL", tool.as_str());
+    }
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {program}"))?;
-    // audit: started (single-command mode reports tool "stdio" + the command's args)
+    // audit: started — multi-tool mode records the tool and the *caller's*
+    // arguments; single-command mode reports tool "stdio" + the command's args.
     let audit = crate::audit::CallAudit::start(
         config.audit.as_ref(),
         caller,
-        crate::audit::stdio_tool(),
-        args,
+        tool.cloned().unwrap_or_else(crate::audit::stdio_tool),
+        invocation.as_ref().map_or(args, |i| i.argv.as_slice()),
         roster_version,
     );
     let mut child_stdin = child.stdin.take().context("child stdin")?;
@@ -683,11 +852,23 @@ where
     });
 
     // client stdin frames -> child stdin (closes child stdin at end of stream).
+    // A single-command responder that sees an `Invoke` signals `stray_invoke`
+    // and then holds the child's stdin open, so the child cannot exit on EOF
+    // and race the refusal.
+    let single_command = invocation.is_none();
+    let (stray_tx, mut stray_invoke) = tokio::sync::oneshot::channel::<()>();
     let stdin_task = tokio::spawn(async move {
+        let mut stray_tx = Some(stray_tx);
         loop {
             match read_frame(&mut recv).await? {
                 Some(Frame::Stdin(chunk)) => {
                     child_stdin.write_all(chunk.as_bytes()).await?;
+                }
+                Some(Frame::Invoke(_)) if single_command => {
+                    if let Some(tx) = stray_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    std::future::pending::<()>().await;
                 }
                 Some(_) => {} // ignore unexpected frames from the dialer
                 None => break,
@@ -703,16 +884,44 @@ where
     // Wait for the child, unless the dialer vanishes first — in which case kill
     // it and reap, rather than leaving an orphan behind. (The `child.wait()`
     // future is dropped when the select ends, releasing its borrow of `child`.)
-    let finished = tokio::select! {
-        status = child.wait() => Some(status.context("waiting for child")?),
-        _ = shutdown => None,
+    enum Ending {
+        Exited(std::process::ExitStatus),
+        DialerGone,
+        StrayInvoke,
+    }
+    let ending = tokio::select! {
+        status = child.wait() => Ending::Exited(status.context("waiting for child")?),
+        _ = shutdown => Ending::DialerGone,
+        Ok(()) = &mut stray_invoke => Ending::StrayInvoke,
     };
-    let status = match finished {
-        Some(status) => status,
-        None => {
+    let status = match ending {
+        Ending::Exited(status) => status,
+        Ending::DialerGone => {
             tracing::warn!("dialer disconnected; killing child");
             child.start_kill().ok();
             child.wait().await.context("reaping killed child")?
+        }
+        Ending::StrayInvoke => {
+            tracing::warn!("invoke sent to a single-command responder; killing child");
+            child.start_kill().ok();
+            child.wait().await.context("reaping killed child")?;
+            stdin_task.abort();
+            let _ = out_task.await;
+            let _ = err_task.await;
+            // audit: the child already started, so close its record (killed,
+            // exit -1) and record the refusal the caller is about to get.
+            if let Some(audit) = audit {
+                audit.finish(-1);
+            }
+            crate::audit::denied(config.audit.as_ref(), caller, None, DENY_SINGLE_COMMAND);
+            tx.send(Frame::Denied {
+                reason: DENY_SINGLE_COMMAND.to_string(),
+            })
+            .await
+            .ok();
+            drop(tx);
+            writer.await.context("writer task")??;
+            bail!(DENY_SINGLE_COMMAND);
         }
     };
     out_task.await.context("stdout pump")??;
@@ -749,6 +958,12 @@ fn load_policy(config: &ServeConfig) -> Result<LoadedPolicy> {
 /// what it sends back in a [`Frame::Denied`], so each keeps a prefix naming the
 /// credential at fault (`membership rejected: …`, `grant rejected: …`,
 /// `roster inclusion rejected: …`).
+///
+/// `tool` is the invoked tool on a multi-tool responder (`None` in
+/// single-command mode). With a tool, a scoped responder's grant must be
+/// scoped [`tool_scope`]`(tool)` or [`TOOL_SCOPE_ANY`] instead of matching
+/// [`ServeConfig::scope`] exactly.
+#[allow(clippy::too_many_arguments)]
 fn authorize(
     config: &ServeConfig,
     policy: &LoadedPolicy,
@@ -757,6 +972,7 @@ fn authorize(
     proof: Option<&InclusionProof>,
     caller: NodeId,
     now: i64,
+    tool: Option<&ToolName>,
 ) -> Result<Option<u64>> {
     // Inclusion is always required: the caller must prove fabric membership,
     // bound to its iroh-authenticated key.
@@ -769,12 +985,28 @@ fn authorize(
             grant.ok_or_else(|| anyhow!("scoped session requires a grant; none presented"))?;
         check_accept(grant, config.trust_root, caller, now, &policy.crl)
             .map_err(|e| anyhow!("grant rejected: {e}"))?;
-        if grant.scope.as_str() != scope.as_str() {
-            bail!(
-                "grant scope {:?} does not match served scope {:?}",
-                grant.scope.as_str(),
-                scope.as_str()
-            );
+        match tool {
+            None => {
+                if grant.scope.as_str() != scope.as_str() {
+                    bail!(
+                        "grant scope {:?} does not match served scope {:?}",
+                        grant.scope.as_str(),
+                        scope.as_str()
+                    );
+                }
+            }
+            Some(tool) => {
+                let needed = tool_scope(tool);
+                if grant.scope.as_str() != needed.as_str() && grant.scope.as_str() != TOOL_SCOPE_ANY
+                {
+                    bail!(
+                        "grant scope {:?} does not cover tool {tool} (needs {:?} or {:?})",
+                        grant.scope.as_str(),
+                        needed.as_str(),
+                        TOOL_SCOPE_ANY
+                    );
+                }
+            }
         }
     }
 
@@ -896,6 +1128,75 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
+    dial_on(
+        endpoint, target, membership, grant, proof, ticketless, None, stdin, stdout, stderr,
+    )
+    .await
+}
+
+/// Like [`connect_on`], but for a multi-tool responder: sends
+/// [`Frame::Invoke`] with `invocation` right after the handshake (before the
+/// ack arrives), then bridges stdio exactly as `connect_on` does. The entry
+/// point for `wires call`, `wires mcp`, and `wires connect --tool`.
+///
+/// Returns the remote child's exit code. A refusal — including
+/// [`DENY_INVOKE_REQUIRED`]-style protocol refusals, `unknown tool: <name>`,
+/// and [`DENY_SINGLE_COMMAND`] from a single-command responder — is an `Err`
+/// that downcasts to [`Denied`]; nothing reaches `stdout` on the refusal paths
+/// that happen before the ack. Consumes `endpoint` and closes it on return.
+#[allow(clippy::too_many_arguments)]
+pub async fn call_on<R, W, E>(
+    endpoint: Endpoint,
+    target: EndpointAddr,
+    membership: Membership,
+    grant: Option<Grant>,
+    proof: Option<InclusionProof>,
+    ticketless: bool,
+    invocation: Invocation,
+    stdin: R,
+    stdout: W,
+    stderr: E,
+) -> Result<i32>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    dial_on(
+        endpoint,
+        target,
+        membership,
+        grant,
+        proof,
+        ticketless,
+        Some(invocation),
+        stdin,
+        stdout,
+        stderr,
+    )
+    .await
+}
+
+/// The shared body of [`connect_on`] and [`call_on`]: dial, open the
+/// bi-stream, run [`dial_session`], and close the endpoint whatever happened.
+#[allow(clippy::too_many_arguments)]
+async fn dial_on<R, W, E>(
+    endpoint: Endpoint,
+    target: EndpointAddr,
+    membership: Membership,
+    grant: Option<Grant>,
+    proof: Option<InclusionProof>,
+    ticketless: bool,
+    invocation: Option<Invocation>,
+    stdin: R,
+    stdout: W,
+    stderr: E,
+) -> Result<i32>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
     tracing::info!("dialing the capability over wires");
     let conn = match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(target, ALPN)).await {
         Ok(Ok(conn)) => conn,
@@ -926,6 +1227,7 @@ where
         membership,
         grant,
         proof,
+        invocation,
         verify_target,
         stdin,
         stdout,
@@ -940,39 +1242,14 @@ where
     result
 }
 
-/// Like [`connect_on`], but for a multi-tool responder: sends
-/// [`Frame::Invoke`] with `invocation` right after the handshake (before the
-/// ack arrives), then bridges stdio exactly as `connect_on` does. The entry
-/// point for `wires call` and `wires mcp`.
-#[allow(clippy::too_many_arguments)]
-pub async fn call_on<R, W, E>(
-    endpoint: Endpoint,
-    target: EndpointAddr,
-    membership: Membership,
-    grant: Option<Grant>,
-    proof: Option<InclusionProof>,
-    ticketless: bool,
-    invocation: library::Invocation,
-    stdin: R,
-    stdout: W,
-    stderr: E,
-) -> Result<i32>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin,
-    E: AsyncWrite + Unpin,
-{
-    let _ = (
-        endpoint, target, membership, grant, proof, ticketless, invocation, stdin, stdout, stderr,
-    );
-    todo!("serve-expose lane: send Frame::Invoke after the handshake")
-}
-
 /// The dialer half of a session over an established bi-stream. Presents the
 /// handshake, then reads the responder's `HandshakeAck`; when `verify_target` is
 /// `Some` (ticket-less mode), verifies the responder's membership against the
 /// dialer's own fabric root and the authenticated target id **before** any stdin
 /// is forwarded. On failure, aborts with no stdin sent.
+///
+/// With an `invocation` (multi-tool responder), a [`Frame::Invoke`] follows
+/// the handshake immediately, without waiting for the ack.
 ///
 /// Errors if the session ends **without** an [`Frame::Exit`] — a responder that
 /// closes mid-session is a failure, not a silent success.
@@ -983,6 +1260,7 @@ async fn dial_session<S, R, I, W, E>(
     membership: Membership,
     grant: Option<Grant>,
     proof: Option<InclusionProof>,
+    invocation: Option<Invocation>,
     verify_target: Option<NodeId>,
     stdin: I,
     mut stdout: W,
@@ -1006,6 +1284,9 @@ where
         },
     )
     .await?;
+    if let Some(invocation) = invocation {
+        write_frame(&mut send, &Frame::Invoke(invocation)).await?;
+    }
 
     // Read the responder's ack first (it is always the responder's first frame).
     let ack_membership = match read_frame(&mut recv).await? {
@@ -1229,6 +1510,7 @@ mod tests {
             membership,
             Some(grant),
             None, // dialer proof
+            None, // invocation
             None, // verify_target: ticketed → ignore ack
             std::io::Cursor::new(input.to_vec()),
             &mut out,
@@ -1311,6 +1593,7 @@ mod tests {
             membership,
             grant,
             proof,
+            None, // invocation
             None, // ticketed → ignore the ack
             std::io::Cursor::new(Vec::new()),
             &mut out,
@@ -1551,6 +1834,7 @@ mod tests {
                 membership,
                 None,
                 None,
+                None, // invocation
                 None,
                 std::io::Cursor::new(input.to_vec()),
                 &mut out,
@@ -1749,6 +2033,7 @@ mod tests {
             membership,
             None,
             None,
+            None, // invocation
             None, // ticketed-style call: do not verify ack
             std::io::Cursor::new(b"hi inclusion".to_vec()),
             &mut out,
@@ -2351,5 +2636,482 @@ mod tests {
         assert!(run(&root, membership.clone(), &client).await.is_ok());
         // Server membership signed by a different root → dialer aborts.
         assert!(run(&evil, membership, &client).await.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-tool mode (`serve --expose`, `call_on`)
+    // -----------------------------------------------------------------------
+
+    use library::Argv;
+
+    /// A multi-tool responder config: `server` is a member under `root`, the
+    /// tools are `(name, argv)` pairs, and `scope` is `Some(TOOL_SCOPE_ANY)` for
+    /// a grant-gated responder or `None` for `--allow-any-member`.
+    fn tools_config(
+        root: &NodeIdentity,
+        server: NodeId,
+        scope: Option<&str>,
+        tools: &[(&str, &[&str])],
+    ) -> ServeConfig {
+        let mut config = test_config(root, server, scope, Crl::new(), Vec::new());
+        config.tools = tools
+            .iter()
+            .map(|(name, argv)| {
+                (
+                    ToolName::new(*name).unwrap(),
+                    argv.iter().map(|a| a.to_string()).collect(),
+                )
+            })
+            .collect();
+        config
+    }
+
+    /// An invocation of `tool` with `args`.
+    fn invoke(tool: &str, args: &[&str]) -> Invocation {
+        Invocation {
+            tool: ToolName::new(tool).unwrap(),
+            argv: Argv::new(args.iter().map(|a| a.to_string()).collect()).unwrap(),
+        }
+    }
+
+    /// One dial/serve pair over duplex pipes carrying `invocation`; the caller
+    /// (seed 2) holds a membership under `root` and, when `grant_scope` is set,
+    /// a grant for that scope. Returns the dialer's result, stdout, stderr.
+    async fn run_call(
+        config: ServeConfig,
+        root: &NodeIdentity,
+        grant_scope: Option<&str>,
+        invocation: Option<Invocation>,
+        input: &[u8],
+    ) -> (Result<i32>, Vec<u8>, Vec<u8>) {
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let membership = valid_membership(root, caller);
+        let grant =
+            grant_scope.map(|s| Grant::mint(root, caller, Scope::new(s), i64::MAX).unwrap());
+        let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
+        let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
+        let srv =
+            tokio::spawn(
+                async move { serve_session(s2c_w, c2s_r, caller, &config, never()).await },
+            );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let res = dial_session(
+            c2s_w,
+            s2c_r,
+            membership,
+            grant,
+            None,
+            invocation,
+            None,
+            std::io::Cursor::new(input.to_vec()),
+            &mut out,
+            &mut err,
+        )
+        .await;
+        let _ = srv.await;
+        (res, out, err)
+    }
+
+    /// Feed `serve_session` exactly `frames` (then EOF) and return its result
+    /// plus every frame it wrote back — for protocol violations a well-behaved
+    /// dialer cannot produce.
+    async fn serve_raw(
+        config: ServeConfig,
+        caller: NodeId,
+        frames: &[Frame],
+    ) -> (Result<()>, Vec<Frame>) {
+        let mut input = Vec::new();
+        for f in frames {
+            input.extend(f.encode().unwrap());
+        }
+        let (s2c_w, mut s2c_r) = tokio::io::duplex(64 * 1024);
+        let res = serve_session(s2c_w, std::io::Cursor::new(input), caller, &config, never()).await;
+        let mut back = Vec::new();
+        while let Some(f) = read_frame(&mut s2c_r).await.unwrap() {
+            back.push(f);
+        }
+        (res, back)
+    }
+
+    /// The reason carried by a dialer-side [`Denied`], or a panic naming what
+    /// came back instead.
+    fn denied_reason(res: Result<i32>) -> String {
+        let e = res.expect_err("expected a refusal");
+        e.downcast_ref::<Denied>()
+            .unwrap_or_else(|| panic!("expected a Denied error, got: {e:#}"))
+            .reason()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn invoke_execs_the_tool_argv_plus_args_literally() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let config = tools_config(
+            &root,
+            server,
+            Some(TOOL_SCOPE_ANY),
+            &[("lines", &["printf", "%s\\n"])],
+        );
+        let args = [
+            "two words",
+            "'single'",
+            "\"double\"",
+            "a; rm -rf /",
+            "$(whoami)",
+            "`id`",
+            "*",
+            "$HOME",
+            "",
+        ];
+        let (res, out, err) = run_call(
+            config,
+            &root,
+            Some("tool:lines"),
+            Some(invoke("lines", &args)),
+            b"",
+        )
+        .await;
+        assert_eq!(res.unwrap(), 0, "stderr: {}", String::from_utf8_lossy(&err));
+        let expected: String = args.iter().map(|a| format!("{a}\n")).collect();
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn invoke_injects_the_tool_name_and_bridges_stdin() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let config = tools_config(
+            &root,
+            server,
+            None,
+            &[("who", &["sh", "-c", "printf '%s:' \"$WIRES_TOOL\"; cat"])],
+        );
+        let (res, out, _) = run_call(config, &root, None, Some(invoke("who", &[])), b"piped").await;
+        assert_eq!(res.unwrap(), 0);
+        assert_eq!(out, b"who:piped");
+    }
+
+    #[tokio::test]
+    async fn multi_tool_responder_requires_an_invoke() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let handshake = Frame::Handshake {
+            membership: valid_membership(&root, caller),
+            grant: None,
+            proof: None,
+        };
+        // Handshake then EOF, and handshake then a stdin frame: both refused.
+        for frames in [
+            vec![handshake.clone()],
+            vec![handshake, Frame::Stdin(Chunk::from_bytes(b"x".to_vec()))],
+        ] {
+            let config = tools_config(&root, server, None, &[("a", &["cat"])]);
+            let (res, back) = serve_raw(config, caller, &frames).await;
+            assert!(res.is_err());
+            assert_eq!(
+                back,
+                vec![Frame::Denied {
+                    reason: DENY_INVOKE_REQUIRED.to_string()
+                }]
+            );
+        }
+    }
+
+    /// Multi-tool calls are audited with the invoked tool and the *caller's*
+    /// arguments (not the tool's fixed argv); a refusal after the invoke names
+    /// the tool it asked for.
+    #[tokio::test]
+    async fn multi_tool_calls_are_audited_with_tool_and_caller_args() {
+        use library::AuditRecord;
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let (sink, mut records) = AuditSink::channel(16);
+
+        let mut config = tools_config(&root, server, None, &[("say", &["printf", "%s"])]);
+        config.audit = Some(sink.clone());
+        let (res, out, _) = run_call(config, &root, None, Some(invoke("say", &["hi"])), b"").await;
+        assert_eq!(res.unwrap(), 0);
+        assert_eq!(out, b"hi");
+        match records.recv().await.unwrap() {
+            AuditRecord::Started { tool, argv, .. } => {
+                assert_eq!(tool.as_str(), "say");
+                assert_eq!(argv.as_slice(), ["hi"]);
+            }
+            other => panic!("expected Started, got {other:?}"),
+        }
+        match records.recv().await.unwrap() {
+            AuditRecord::Finished {
+                exit, stdout_bytes, ..
+            } => assert_eq!((exit, stdout_bytes), (0, 2)),
+            other => panic!("expected Finished, got {other:?}"),
+        }
+
+        let mut config = tools_config(&root, server, None, &[("say", &["printf", "%s"])]);
+        config.audit = Some(sink);
+        let (res, _, _) = run_call(config, &root, None, Some(invoke("nope", &[])), b"").await;
+        let reason = denied_reason(res);
+        match records.recv().await.unwrap() {
+            AuditRecord::Denied {
+                tool, reason: r, ..
+            } => {
+                assert_eq!(tool.unwrap().as_str(), "nope");
+                assert_eq!(r, reason);
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_is_refused_by_name() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let config = tools_config(&root, server, None, &[("a", &["cat"])]);
+        let (res, out, _) = run_call(config, &root, None, Some(invoke("nope", &[])), b"").await;
+        assert_eq!(denied_reason(res), "unknown tool: nope");
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn single_command_responder_refuses_an_invoke() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let config = test_config(&root, server, None, Crl::new(), vec!["cat".to_string()]);
+        let (res, out, _) = run_call(
+            config,
+            &root,
+            None,
+            Some(invoke("cat", &[])),
+            b"never forwarded",
+        )
+        .await;
+        assert_eq!(denied_reason(res), DENY_SINGLE_COMMAND);
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_scoped_grant_admits_only_its_tool() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let tools: &[(&str, &[&str])] = &[("a", &["printf", "A"]), ("b", &["printf", "B"])];
+
+        let (res, out, _) = run_call(
+            tools_config(&root, server, Some(TOOL_SCOPE_ANY), tools),
+            &root,
+            Some("tool:a"),
+            Some(invoke("a", &[])),
+            b"",
+        )
+        .await;
+        assert_eq!(res.unwrap(), 0);
+        assert_eq!(out, b"A");
+
+        let (res, out, _) = run_call(
+            tools_config(&root, server, Some(TOOL_SCOPE_ANY), tools),
+            &root,
+            Some("tool:a"),
+            Some(invoke("b", &[])),
+            b"",
+        )
+        .await;
+        let reason = denied_reason(res);
+        assert!(reason.contains("does not cover tool b"), "{reason}");
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wildcard_grant_admits_every_tool() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let tools: &[(&str, &[&str])] = &[("a", &["printf", "A"]), ("b", &["printf", "B"])];
+        for (tool, want) in [("a", b"A"), ("b", b"B")] {
+            let (res, out, _) = run_call(
+                tools_config(&root, server, Some(TOOL_SCOPE_ANY), tools),
+                &root,
+                Some(TOOL_SCOPE_ANY),
+                Some(invoke(tool, &[])),
+                b"",
+            )
+            .await;
+            assert_eq!(res.unwrap(), 0);
+            assert_eq!(out, want);
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_gated_tools_refuse_a_missing_or_foreign_grant() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let tools: &[(&str, &[&str])] = &[("a", &["printf", "A"])];
+        for grant in [None, Some("tools.a"), Some("a")] {
+            let (res, out, _) = run_call(
+                tools_config(&root, server, Some(TOOL_SCOPE_ANY), tools),
+                &root,
+                grant,
+                Some(invoke("a", &[])),
+                b"",
+            )
+            .await;
+            denied_reason(res);
+            assert!(out.is_empty(), "grant {grant:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn membership_is_checked_before_the_tool_is_resolved() {
+        // A revoked caller naming an unknown tool learns it is revoked, not
+        // which tools exist.
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let mut config = tools_config(&root, server, None, &[("a", &["cat"])]);
+        let mut crl = Crl::new();
+        crl.insert(caller);
+        config.crl = CrlSource::Fixed(crl);
+        let (res, _, _) = run_call(config, &root, None, Some(invoke("nope", &[])), b"").await;
+        let reason = denied_reason(res);
+        assert!(reason.contains("revoked"), "{reason}");
+    }
+
+    #[test]
+    fn exposed_tools_parses_specs_and_files() {
+        let specs = vec![
+            "db_query=sqlite3 -safe  -readonly\t/data/orders.db".to_string(),
+            "rg=rg --no-config".to_string(),
+        ];
+        let file = temp_dir().join("tools.json");
+        std::fs::write(&file, r#"{"say": ["printf", "%s %s\n", "two words"]}"#).unwrap();
+        let tools = exposed_tools(&specs, Some(&file)).unwrap();
+        let get = |n: &str| tools.get(&ToolName::new(n).unwrap()).unwrap().clone();
+        assert_eq!(
+            get("db_query"),
+            ["sqlite3", "-safe", "-readonly", "/data/orders.db"]
+        );
+        assert_eq!(get("rg"), ["rg", "--no-config"]);
+        assert_eq!(get("say"), ["printf", "%s %s\n", "two words"]);
+        assert!(exposed_tools(&[], None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exposed_tools_rejects_bad_specs() {
+        let file = temp_dir().join("tools.json");
+        std::fs::write(&file, r#"{"rg": ["rg"]}"#).unwrap();
+        for (specs, file) in [
+            (vec!["no-equals-sign"], None),
+            (vec!["Bad Name=cat"], None),
+            (vec!["empty=  "], None),
+            (vec!["rg=rg", "rg=grep"], None),
+            (vec!["rg=rg"], Some(file.as_path())),
+        ] {
+            let specs: Vec<String> = specs.into_iter().map(String::from).collect();
+            assert!(exposed_tools(&specs, file).is_err(), "{specs:?}");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+
+        /// Whatever valid `Argv` a caller sends reaches the child's argv
+        /// byte-for-byte: `printf '%s\0'` echoes each argument NUL-terminated
+        /// (a NUL can't occur inside an `Argv`), after a fixed marker that
+        /// separates the tool's own argv from the caller's.
+        #[test]
+        fn any_argv_reaches_the_child_verbatim(
+            args in proptest::collection::vec("[^\u{0}]{0,16}", 0..8),
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let (res, out, _) = rt.block_on(async {
+                let root = NodeIdentity::from_seed([1u8; 32]);
+                let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+                let config = tools_config(&root, server, None, &[("echo", &["printf", "%s\\0", "MARK"])]);
+                let invocation = Invocation {
+                    tool: ToolName::new("echo").unwrap(),
+                    argv: Argv::new(args.clone()).unwrap(),
+                };
+                run_call(config, &root, None, Some(invocation), b"").await
+            });
+            proptest::prop_assert_eq!(res.unwrap(), 0);
+            let mut expected = b"MARK\0".to_vec();
+            for a in &args {
+                expected.extend_from_slice(a.as_bytes());
+                expected.push(0);
+            }
+            proptest::prop_assert_eq!(out, expected);
+        }
+    }
+
+    /// `serve --expose` + `connect --tool` over a real loopback endpoint: the
+    /// tools map comes from the same parser the CLI uses, the caller holds a
+    /// `tool:shout` grant, and `call_on` carries the invocation.
+    #[tokio::test]
+    async fn loopback_expose_and_call() {
+        let root = NodeIdentity::from_seed([80u8; 32]);
+        let server = NodeIdentity::from_seed([81u8; 32]);
+        let client = NodeIdentity::from_seed([82u8; 32]);
+        let membership = Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap();
+        let grant =
+            Grant::mint(&root, client.node_id(), Scope::new("tool:shout"), i64::MAX).unwrap();
+
+        let server_ep = test_endpoint(&server).await;
+        let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
+        let mut config = test_config(
+            &root,
+            server.node_id(),
+            Some(TOOL_SCOPE_ANY),
+            Crl::new(),
+            Vec::new(),
+        );
+        config.tools = exposed_tools(
+            &[
+                "shout=tr a-z A-Z".to_string(),
+                "echo=printf %s|".to_string(),
+            ],
+            None,
+        )
+        .unwrap();
+        let srv = tokio::spawn(serve_on(server_ep, config));
+
+        let client_ep = test_endpoint(&client).await;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = call_on(
+            client_ep,
+            addr.clone(),
+            membership.clone(),
+            Some(grant.clone()),
+            None,
+            false,
+            invoke("shout", &[]),
+            std::io::Cursor::new(b"hello over wires".to_vec()),
+            &mut out,
+            &mut err,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        assert_eq!(out, b"HELLO OVER WIRES");
+
+        // Same grant, other tool: refused with the scope reason.
+        let client_ep = test_endpoint(&client).await;
+        let mut out = Vec::new();
+        let res = call_on(
+            client_ep,
+            addr,
+            membership,
+            Some(grant),
+            None,
+            false,
+            invoke("echo", &["a b"]),
+            std::io::Cursor::new(Vec::new()),
+            &mut out,
+            &mut Vec::new(),
+        )
+        .await;
+        let reason = denied_reason(res);
+        assert!(reason.contains("does not cover tool echo"), "{reason}");
+        assert!(out.is_empty());
+        srv.abort();
     }
 }
