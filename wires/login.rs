@@ -56,6 +56,22 @@ pub(crate) const CALLBACK_WAIT: Duration = Duration::from_secs(300);
 pub(crate) const SCOPES: &str = "openid email";
 /// Largest HTTP request head + body the loopback server reads.
 const MAX_REQUEST: usize = 64 * 1024;
+/// How long the loopback listener keeps answering after the sign-in landed.
+///
+/// Browsers open more than one connection to a page they are loading (Safari
+/// speculatively, others for `favicon.ico` or a retry). Closing the listener
+/// the instant the code arrives leaves those finding nothing listening, and
+/// the browser shows "Can't connect to the server" over a login that worked.
+/// The login itself does not wait for this: it runs in the background while
+/// the token exchange and the publish carry on.
+pub(crate) const CALLBACK_LINGER: Duration = Duration::from_secs(3);
+/// How long an answered loopback connection is drained before it is dropped.
+///
+/// Dropping a socket with unread request bytes makes the kernel send a reset
+/// instead of a clean close, and a reset can make the browser discard the page
+/// it was just sent. So the rest of the request is read and thrown away, until
+/// the browser hangs up or this runs out.
+const DRAIN_WAIT: Duration = Duration::from_secs(2);
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -265,7 +281,7 @@ pub(crate) async fn run_flow(
         &pkce,
     );
     open(&url);
-    let code = tokio::time::timeout(wait, await_callback(&listener, &state))
+    let code = tokio::time::timeout(wait, await_callback(listener, &state, CALLBACK_LINGER))
         .await
         .map_err(|_| anyhow!("no sign-in came back within {}s", wait.as_secs()))??;
     let form = [
@@ -399,7 +415,21 @@ async fn finish(
 /// Anything other than `GET /callback` (a browser's `favicon.ico`) gets a 404
 /// and the wait continues. A wrong `state` is refused outright (RFC 6749
 /// §10.12: a forged redirect), as is an `error=` redirect.
-async fn await_callback(listener: &TcpListener, state: &str) -> Result<String> {
+///
+/// Every answered connection is closed gracefully ([`drain`]), and on success
+/// the listener is handed to [`linger_signed_in`] for `linger`, so the
+/// browser's other connections still find a server.
+async fn await_callback(listener: TcpListener, state: &str, linger: Duration) -> Result<String> {
+    let code = accept_callback(&listener, state).await?;
+    tokio::spawn(linger_signed_in(listener, linger));
+    Ok(code)
+}
+
+/// The "signed in" page, as [`accept_callback`] and [`linger_signed_in`] serve it.
+const SIGNED_IN: &str = "wires: signed in. You can close this tab.";
+
+/// [`await_callback`]'s accept loop.
+async fn accept_callback(listener: &TcpListener, state: &str) -> Result<String> {
     loop {
         let (mut stream, _) = listener.accept().await?;
         let request = match read_request(&mut stream).await {
@@ -413,6 +443,7 @@ async fn await_callback(listener: &TcpListener, state: &str) -> Result<String> {
             .unwrap_or_else(|_| Url::parse("http://127.0.0.1/").expect("static URL"));
         if request.method != "GET" || url.path() != "/callback" {
             let _ = write_response(&mut stream, 404, "text/plain", &[], b"not found").await;
+            tokio::spawn(drain(stream));
             continue;
         }
         let param = |k: &str| {
@@ -422,6 +453,7 @@ async fn await_callback(listener: &TcpListener, state: &str) -> Result<String> {
         };
         if let Some(error) = param("error") {
             let _ = page(&mut stream, 400, "Sign-in failed; see the terminal.").await;
+            tokio::spawn(drain(stream));
             bail!(
                 "the IdP returned an error: {error}{}",
                 param("error_description")
@@ -431,20 +463,64 @@ async fn await_callback(listener: &TcpListener, state: &str) -> Result<String> {
         }
         if param("state").as_deref() != Some(state) {
             let _ = page(&mut stream, 400, "State mismatch; sign-in refused.").await;
+            tokio::spawn(drain(stream));
             bail!("the redirect's state does not match this login (a forged or stale redirect)");
         }
         let Some(code) = param("code") else {
             let _ = page(&mut stream, 400, "No authorization code.").await;
+            tokio::spawn(drain(stream));
             bail!("the redirect carried no authorization code");
         };
-        let _ = page(
-            &mut stream,
-            200,
-            "wires: signed in. You can close this tab.",
-        )
-        .await;
+        let _ = page(&mut stream, 200, SIGNED_IN).await;
+        tokio::spawn(drain(stream));
         return Ok(code);
     }
+}
+
+/// Keep answering the loopback listener for `linger` after a successful
+/// sign-in: `GET /callback` (whatever its query) gets the same "signed in"
+/// page, anything else a 404. Then the listener closes.
+///
+/// Nothing here is trusted or acted on — the code has already been taken, and
+/// a second redirect carrying another one is simply thanked and ignored.
+async fn linger_signed_in(listener: TcpListener, linger: Duration) {
+    let until = tokio::time::Instant::now() + linger;
+    while let Ok(Ok((mut stream, _))) = tokio::time::timeout_at(until, listener.accept()).await {
+        tokio::spawn(async move {
+            let Ok(Ok(request)) = tokio::time::timeout(DRAIN_WAIT, read_request(&mut stream)).await
+            else {
+                return;
+            };
+            let path = request
+                .target
+                .split_once('?')
+                .map_or(request.target.as_str(), |(path, _)| path);
+            if request.method == "GET" && path == "/callback" {
+                let _ = page(&mut stream, 200, SIGNED_IN).await;
+            } else {
+                let _ = write_response(&mut stream, 404, "text/plain", &[], b"not found").await;
+            }
+            drain(stream).await;
+        });
+    }
+}
+
+/// Close an answered connection gracefully: the response is written and the
+/// write half shut down ([`write_response`] does both), so read and discard
+/// whatever the client still sends — up to [`MAX_REQUEST`] bytes, for at most
+/// [`DRAIN_WAIT`] — before dropping it. See [`DRAIN_WAIT`] for why.
+async fn drain(mut stream: TcpStream) {
+    let mut left = MAX_REQUEST;
+    let mut sink = [0u8; 4096];
+    let _ = tokio::time::timeout(DRAIN_WAIT, async {
+        while left > 0 {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => left = left.saturating_sub(n),
+            }
+        }
+    })
+    .await;
 }
 
 /// A minimal HTML page.
@@ -875,6 +951,80 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("invalid_client"), "{err:#}");
+    }
+
+    /// Write `request` on a fresh loopback connection to `port` and read the
+    /// whole reply — an error if the server reset the connection instead.
+    async fn raw_exchange(port: u16, request: &[u8]) -> std::io::Result<String> {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+        stream.write_all(request).await?;
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await?;
+        Ok(String::from_utf8_lossy(&reply).into_owned())
+    }
+
+    /// Card 11: a browser that sends more than the request head we parse (a
+    /// pipelined or speculative tail) still gets the whole "signed in" page,
+    /// not a reset — which Safari showed as "Can't connect to the server".
+    #[tokio::test]
+    async fn the_signed_in_page_survives_unread_request_bytes() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let waiter = tokio::spawn(async move {
+            await_callback(listener, "st", Duration::from_millis(200)).await
+        });
+        let mut request =
+            b"GET /callback?code=c0de&state=st HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_vec();
+        request.extend(std::iter::repeat_n(b'x', 32 * 1024));
+        let reply = tokio::time::timeout(PATIENCE, raw_exchange(port, &request))
+            .await
+            .unwrap()
+            .expect("a complete response, not a connection reset");
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+        assert!(reply.contains(SIGNED_IN), "{reply}");
+        assert_eq!(waiter.await.unwrap().unwrap(), "c0de");
+    }
+
+    /// Card 11: after the code is taken, the listener still answers for the
+    /// linger window — `/callback` with the same page, anything else 404 — and
+    /// then closes.
+    #[tokio::test]
+    async fn the_listener_keeps_answering_briefly_after_sign_in() {
+        let linger = Duration::from_millis(500);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let waiter = tokio::spawn(async move { await_callback(listener, "st", linger).await });
+        let first = raw_exchange(
+            port,
+            b"GET /callback?code=c0de&state=st HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        assert!(first.contains(SIGNED_IN), "{first}");
+        assert_eq!(waiter.await.unwrap().unwrap(), "c0de");
+
+        // The browser's second (speculative, or retried) connection.
+        let again = raw_exchange(
+            port,
+            b"GET /callback?code=c0de&state=st HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        assert!(again.starts_with("HTTP/1.1 200 OK"), "{again}");
+        assert!(again.contains(SIGNED_IN), "{again}");
+        let favicon = raw_exchange(
+            port,
+            b"GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        assert!(favicon.starts_with("HTTP/1.1 404"), "{favicon}");
+
+        tokio::time::sleep(linger + Duration::from_millis(300)).await;
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).await.is_err(),
+            "the listener closes once the linger window is over"
+        );
     }
 
     #[tokio::test]
