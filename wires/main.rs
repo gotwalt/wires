@@ -61,12 +61,17 @@ const HELP_TEMPLATE: &str = "\
 {usage-heading} {usage}
 
 Admin — decides who's in (holds the root key):
+  init      Start a fabric: root key, this node, the first commit, a channel
+  invite    Add a node and print its one join token; re-key the channel
+  remove    Drop a node; re-key the channel so the rest carry on untouched
   advanced  Plumbing: keys, grants, memberships, roster, CRL, import, publish
 
 Host — decides what runs and who may run it:
   serve     Expose CLIs as named tools; verify every caller; record every call
 
-Caller — runs remote CLIs:
+Caller — runs remote CLIs (every role joins the same way):
+  id        Print this node's id: what you send the admin
+  join      Install the admin's invite token: credentials, channel, peers
   login     Sign in with your IdP, binding this node's key to your identity
   call      Run a remote CLI: stdio passes through, its exit code is ours
   tools     Edit tools.json, the local map of remote CLIs (add / list / rm)
@@ -92,6 +97,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     // --- admin ---
+    /// Start a fabric: create the root key and this machine's node key, add
+    /// this node to the roster, commit, and record the channel.
+    Init(admin::init::InitArgs),
+    /// Add a node to the roster and print its join token (stdout); the
+    /// commit is published on the channel so current members adopt it.
+    Invite(admin::invite::InviteArgs),
+    /// Remove a node (by `--name` label or id); the commit is published on the
+    /// channel, and every host that adopts it refuses the node's next call.
+    Remove(admin::invite::RemoveArgs),
     /// Plumbing for every role: keys, grants, memberships, the roster, the
     /// CRL, credential import, and publishing to a channel.
     Advanced(advanced::AdvancedArgs),
@@ -101,7 +115,14 @@ enum Command {
     /// its stdio — and, with `--audit-topic`, record every call.
     Serve(host::serve::ServeArgs),
 
-    // --- caller ---
+    // --- caller (and every joiner) ---
+    /// Print this node's id (creating its key on first use): what a joiner
+    /// sends the admin.
+    Id,
+    /// Install an invite token from `wires invite`: membership, proof, head,
+    /// fabric key, the channel and its bootstrap peers. Without a token,
+    /// print this node's id.
+    Join(caller::join::JoinArgs),
     /// Sign in with your IdP (OIDC), binding this node's key to your identity;
     /// with `--topic`, publish the claim for every reader to verify.
     Login(caller::login::LoginArgs),
@@ -207,6 +228,23 @@ fn init_logging_with(default: &str) {
 
 fn main() {
     match Cli::parse().command {
+        Command::Init(a) => print_or_exit(admin::init::init_cmd(a)),
+        Command::Invite(a) => {
+            init_logging();
+            match runtime().block_on(admin::invite::invite_cmd(a)) {
+                Ok(report) => print_report(report),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::Remove(a) => {
+            init_logging();
+            match runtime().block_on(admin::invite::remove_cmd(a)) {
+                Ok(report) => print_report(report),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::Id => print_or_exit(caller::join::id_cmd()),
+        Command::Join(a) => print_or_exit(caller::join::join_cmd(a)),
         Command::Advanced(a) => advanced::run(a),
         Command::Serve(a) => {
             if let Err(e) = runtime().block_on(host::serve::serve_cmd(a)) {
@@ -256,6 +294,26 @@ fn main() {
             }
         }
     }
+}
+
+/// Print an offline command's result on stdout, or its error and exit 1.
+fn print_or_exit(result: anyhow::Result<String>) {
+    match result {
+        Ok(out) => println!("{out}"),
+        Err(e) => {
+            eprintln!("wires: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Print an admin command's notes on stderr and its result on stdout (the
+/// token, for `invite` — so `$(wires invite …)` is the token alone).
+fn print_report(report: admin::invite::Report) {
+    for note in &report.notes {
+        eprintln!("wires: {note}");
+    }
+    println!("{}", report.stdout);
 }
 
 /// Report a network-command failure and exit.
@@ -319,6 +377,26 @@ mod tests {
                 "{plumbing} is listed:\n{help}"
             );
         }
+    }
+
+    /// Card 14's onboarding commands parse as documented.
+    #[test]
+    fn onboarding_commands_parse() {
+        let id = "ab".repeat(32);
+        assert!(Cli::try_parse_from(["wires", "init"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "init", "--channel", "eng", "--ttl", "7d"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "init", "--ttl", "soon"]).is_err());
+        assert!(Cli::try_parse_from(["wires", "invite", &id, "--name", "alice"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["wires", "invite", &id, "--peer", "t1", "--peer", "t2"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["wires", "invite"]).is_err());
+        assert!(Cli::try_parse_from(["wires", "remove", "alice"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "id"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "join"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "join", "tok"]).is_ok());
+        // `watch` needs no topic once a channel is joined.
+        assert!(Cli::try_parse_from(["wires", "watch"]).is_ok());
     }
 
     #[test]

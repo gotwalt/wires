@@ -81,6 +81,10 @@ use crate::host::transport::{Denied, HeadSource, secret_key};
 /// so it shares these fixtures without widening their visibility.
 mod idp;
 
+/// Card 14's init → invite → join → remove test: a child module for the
+/// same fixtures.
+mod onboard;
+
 /// The outer bound on any single wait here.
 ///
 /// Generous because a QUIC handshake plus a gossip join on a loaded CI machine
