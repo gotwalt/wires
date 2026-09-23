@@ -968,7 +968,10 @@ async fn late_joiner_cannot_read_pre_join_history() {
     );
 
     // The same verdict through the printer: one line, not three.
-    let printer = Printer { json: false };
+    let printer = Printer {
+        json: false,
+        identities: None,
+    };
     assert_eq!(
         new_since(node_c.store(), &BTreeMap::new(), &printer, &mut keyring_c).len(),
         1,
@@ -1093,7 +1096,10 @@ async fn tail_catches_up_after_offline() {
 
     // The diff a tail would print: three lines, in order, with the message from
     // before the restart absent because it was already shown.
-    let printer = Printer { json: false };
+    let printer = Printer {
+        json: false,
+        identities: None,
+    };
     let mut keyring = b.keyring();
     let printed = new_since(node_b.store(), &before, &printer, &mut keyring);
     assert_eq!(
@@ -1279,7 +1285,11 @@ async fn next_record(
     let plaintext = keyring.open(&envelope).expect("the observer holds the key");
     let text = String::from_utf8(plaintext).unwrap();
     // What `wires tail` prints for it is a record line, never the raw JSON.
-    let line = Printer { json: false }.render(&envelope, &text);
+    let line = Printer {
+        json: false,
+        identities: None,
+    }
+    .render(&envelope, &text);
     assert!(!line.contains("record/v1"), "rendered, not raw: {line}");
     match library::ChannelRecord::parse(&text) {
         Some(library::ChannelRecord::Audit(record)) => record,
@@ -1327,6 +1337,7 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
         command: vec!["cat".to_string()],
         tools: Default::default(),
         audit: Some(sink),
+        identity: None,
     };
     let store_r = r.store(&fab);
     let mut cfg = TopicNodeConfig::new(

@@ -17,6 +17,8 @@
 mod admission;
 mod audit;
 mod call;
+mod identity;
+mod idp_policy;
 mod idp_view;
 mod ipc;
 mod jwks;
@@ -384,6 +386,23 @@ struct ServeArgs {
     /// A base64 topic ticket to bootstrap the audit topic from (repeatable).
     #[arg(long = "audit-peer", requires = "audit_topic")]
     audit_peer: Vec<String>,
+    /// Only run tools for callers whose node key is bound to a verified IdP
+    /// identity matching this rule: `key=value,…` with keys `iss`, `email`
+    /// (exact or `*@domain`), `org`, `group`; all must match. Repeatable: any
+    /// rule may match. Identities come from `wires login --topic <audit
+    /// topic>` claims, so this needs `--audit-topic`.
+    #[arg(long, value_name = "RULE", requires = "audit_topic")]
+    require_idp: Vec<String>,
+    /// An accepted ID-token audience (OAuth client id); repeatable or
+    /// comma-separated. Default: `$WIRES_OIDC_AUDIENCE`, else
+    /// `$WIRES_OIDC_CLIENT_ID`.
+    #[arg(long, value_name = "CLIENT_ID")]
+    oidc_audience: Vec<String>,
+    /// A trusted ID-token issuer; repeatable or comma-separated. Default:
+    /// `$WIRES_OIDC_ISSUER`, else Google. Every `--require-idp iss=` is
+    /// trusted too.
+    #[arg(long, value_name = "URL")]
+    oidc_issuer: Vec<String>,
     /// The command (program + args) to exec per session, after `--`
     /// (single-command mode; mutually exclusive with `--expose`).
     #[arg(
@@ -646,6 +665,10 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         )?),
         None => None,
     };
+    let identities = match &audit_ctx {
+        Some(ctx) => Some(serve_identities(&a, &ctx.home)?),
+        None => None,
+    };
     let tools = transport::exposed_tools(&a.expose, a.expose_file.as_deref())?;
     // Multi-tool: grants are per tool (`tool:<name>` / `tool:*`), so the served
     // scope only says "a grant is required".
@@ -677,9 +700,18 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         }
         None => (None, None),
     };
+    let gate = match (&identities, &audit_ctx) {
+        (Some((ids, policy)), Some(ctx)) => Some(Arc::new(identity::IdentityGate::new(
+            Arc::clone(ids),
+            policy.clone(),
+            ctx.name.clone(),
+        ))),
+        _ => None,
+    };
     let config = transport::ServeConfig {
         tools,
         audit: sink,
+        identity: gate,
         trust_root,
         scope,
         crl,
@@ -694,11 +726,35 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
             let hosted = audit::Hosted {
                 session: transport::SessionProtocol(Arc::new(config)),
                 records,
+                identities: identities.expect("built with the audit context").0,
             };
             run_tail(&ctx, 0, false, Some(hosted)).await
         }
         _ => transport::serve(node, config, a.relay_url.as_deref()).await,
     }
+}
+
+/// The responder's identity index and `--require-idp` policy.
+///
+/// Trusted issuers are `--oidc-issuer` (else `$WIRES_OIDC_ISSUER`, else
+/// Google) plus every rule's `iss`; audiences are `--oidc-audience` (else the
+/// environment). A policy with no accepted audience could never admit anyone,
+/// so it is refused here rather than at the first call.
+fn serve_identities(
+    a: &ServeArgs,
+    home: &Path,
+) -> anyhow::Result<(Arc<identity::Identities>, idp_policy::IdpPolicy)> {
+    let policy = idp_policy::IdpPolicy::parse(&a.require_idp)?;
+    let trust = idp_view::IdpTrust::from_flags_or_env(&a.oidc_issuer, &a.oidc_audience)
+        .trusting(policy.issuers());
+    if !policy.is_empty() && trust.audiences.is_empty() {
+        anyhow::bail!(
+            "--require-idp needs an accepted audience: pass --oidc-audience <client id> or set \
+             WIRES_OIDC_AUDIENCE"
+        );
+    }
+    let fetcher = jwks::KeyFetcher::new(Some(home.join("jwks")))?;
+    Ok((Arc::new(identity::Identities::new(fetcher, trust)), policy))
 }
 
 /// Resolve `serve --audit-topic <name>` into the same [`TopicContext`] `wires
@@ -1660,6 +1716,9 @@ impl Keyring {
 struct Printer {
     /// NDJSON instead of the human line.
     json: bool,
+    /// Verifies and indexes identity claims (human output only); `None`
+    /// prints them as not checked.
+    identities: Option<Arc<identity::Identities>>,
 }
 
 /// One `--json` output record: the machine-readable form of a message line.
@@ -1687,12 +1746,21 @@ impl Printer {
     /// [`Appended::Inserted`](crate::store::Appended) — which is what makes
     /// deduplication across live gossip, replay, and restart structural rather
     /// than a remembered set of ids (spec §7).
-    fn emit(&self, envelope: &TopicEnvelope, keyring: &mut Keyring) {
+    ///
+    /// An identity claim is verified (and indexed) before its line is
+    /// printed; the first claim from an issuer costs one key fetch.
+    async fn emit(&self, envelope: &TopicEnvelope, keyring: &mut Keyring) {
         let Some(plaintext) = keyring.open(envelope) else {
             return;
         };
         let text = String::from_utf8_lossy(&plaintext);
-        let line = self.render(envelope, &text);
+        let verdict = match (&self.identities, library::ChannelRecord::parse(&text)) {
+            (Some(ids), Some(library::ChannelRecord::Identity(claim))) if !self.json => {
+                Some(ids.observe(envelope.sender, &claim, now_unix()).await)
+            }
+            _ => None,
+        };
+        let line = self.render_checked(envelope, &text, verdict.as_ref());
         let mut out = std::io::stdout().lock();
         // Piped stdout is block-buffered, so an unflushed tail looks hung.
         if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
@@ -1702,13 +1770,26 @@ impl Printer {
         }
     }
 
+    /// [`render_checked`](Self::render_checked) with no identity verdict (an
+    /// identity claim renders as not checked).
+    #[cfg(test)]
+    fn render(&self, envelope: &TopicEnvelope, text: &str) -> String {
+        self.render_checked(envelope, text, None)
+    }
+
     /// The exact text of one output line (the testable half of
     /// [`emit`](Self::emit)).
     ///
     /// A message whose text is a [`ChannelRecord`](library::ChannelRecord)
     /// renders through [`render::record_line`] (or, with `--json`, as the
-    /// parsed `record` object instead of `text`).
-    fn render(&self, envelope: &TopicEnvelope, text: &str) -> String {
+    /// parsed `record` object instead of `text`), with `identity` — this
+    /// reader's verdict on it, when it is an identity claim that was checked.
+    fn render_checked(
+        &self,
+        envelope: &TopicEnvelope,
+        text: &str,
+        identity: Option<&identity::Verdict>,
+    ) -> String {
         let record = library::ChannelRecord::parse(text);
         if self.json {
             let line = JsonLine {
@@ -1721,7 +1802,7 @@ impl Printer {
             serde_json::to_string(&line).unwrap_or_else(|e| format!("{{\"err\":\"{e}\"}}"))
         } else {
             let body = match &record {
-                Some(record) => render::record_line(record),
+                Some(record) => render::record_line(record, identity),
                 None => text.to_string(),
             };
             format!(
@@ -1927,14 +2008,33 @@ async fn run_tail(
     json: bool,
     hosted: Option<audit::Hosted>,
 ) -> anyhow::Result<()> {
-    let printer = Printer { json };
+    // Identity claims are verified by this reader itself: a responder under
+    // its serve flags, a plain tail under `WIRES_OIDC_ISSUER` /
+    // `WIRES_OIDC_AUDIENCE`.
+    let identities = match &hosted {
+        Some(h) => Arc::clone(&h.identities),
+        None => Arc::new(identity::Identities::new(
+            jwks::KeyFetcher::new(Some(ctx.home.join("jwks")))?,
+            idp_view::IdpTrust::from_env(),
+        )),
+    };
+    let printer = Printer {
+        json,
+        identities: Some(Arc::clone(&identities)),
+    };
     let mut keyring = Keyring::load(Arc::clone(&ctx.keystore))?;
     let store = Arc::new(open_topic_store(&ctx.home, ctx.topic, STORE_LOCK_WAIT).await?);
+
+    // A responder prints no backfill, but its gate must know every caller that
+    // logged in before it started.
+    if hosted.is_some() {
+        identities.prime(&store, &mut keyring, now_unix()).await;
+    }
 
     // 1. What is already known, before anything touches the network. Printed
     //    from the log, so a restart shows the same transcript the last run did.
     for envelope in store.read_backfill(backfill)? {
-        printer.emit(&envelope, &mut keyring);
+        printer.emit(&envelope, &mut keyring).await;
     }
 
     // 2. Bootstrap set: this run's tickets, unioned with what previous runs saw.
@@ -2019,7 +2119,7 @@ async fn run_tail(
                 let outcome = publish_from_tail(ctx, &store, &sender, &request.text).await;
                 let answer = match outcome {
                     Ok(envelope) => {
-                        printer.emit(&envelope, &mut keyring);
+                        printer.emit(&envelope, &mut keyring).await;
                         Ok(envelope.seq.0)
                     }
                     Err(e) => {
@@ -2033,7 +2133,7 @@ async fn run_tail(
             event = events.recv(), if live => match event {
                 Some(topics::TopicEvent::Message(envelope)) => {
                     match ingest_live(&node, &store, ctx.topic, &envelope) {
-                        Ok(replay::Ingested::Inserted) => printer.emit(&envelope, &mut keyring),
+                        Ok(replay::Ingested::Inserted) => printer.emit(&envelope, &mut keyring).await,
                         Ok(replay::Ingested::Duplicate) => {}
                         // The hole heals by replay and the message comes back
                         // in order; printing it now would print it twice.
@@ -2441,7 +2541,7 @@ async fn catch_up_and_print(node: &topics::TopicNode, printer: &Printer, keyring
                 "catch-up pass"
             );
             if counts.inserted > 0
-                && let Err(e) = print_new_since(store, &before, printer, keyring)
+                && let Err(e) = print_new_since(store, &before, printer, keyring).await
             {
                 tracing::warn!("printing caught-up messages: {e:#}");
             }
@@ -2451,7 +2551,7 @@ async fn catch_up_and_print(node: &topics::TopicNode, printer: &Printer, keyring
 }
 
 /// Print every message stored past the marks in `before`, in display order.
-fn print_new_since(
+async fn print_new_since(
     store: &store::TopicStore,
     before: &BTreeMap<NodeId, ChainState>,
     printer: &Printer,
@@ -2468,7 +2568,7 @@ fn print_new_since(
     }
     fresh.sort_by_key(|envelope| (envelope.timestamp, envelope.sender, envelope.seq));
     for envelope in &fresh {
-        printer.emit(envelope, keyring);
+        printer.emit(envelope, keyring).await;
     }
     Ok(())
 }
@@ -4076,7 +4176,10 @@ mod tests {
         )
         .unwrap();
 
-        let printer = Printer { json: false };
+        let printer = Printer {
+            json: false,
+            identities: None,
+        };
         assert_eq!(
             printer.render(&envelope, "ship it"),
             format!("01:02:05 {} ship it", &member.node.node_id().hex()[..8])
@@ -4105,7 +4208,11 @@ mod tests {
         )
         .unwrap();
 
-        let line = Printer { json: true }.render(&envelope, "ship it");
+        let line = Printer {
+            json: true,
+            identities: None,
+        }
+        .render(&envelope, "ship it");
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["ts"], 1_700_000_000i64);
         assert_eq!(value["sender"], member.node.node_id().hex());
@@ -4249,13 +4356,21 @@ mod tests {
         let short = &member.node.node_id().hex()[..8];
 
         assert_eq!(
-            Printer { json: false }.render(&envelope, &text),
+            Printer {
+                json: false,
+                identities: None,
+            }
+            .render(&envelope, &text),
             format!(
                 "01:02:05 {short} ✗ {}… denied: roster inclusion rejected: revoked",
                 &short[..4]
             )
         );
-        let line = Printer { json: true }.render(&envelope, &text);
+        let line = Printer {
+            json: true,
+            identities: None,
+        }
+        .render(&envelope, &text);
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert!(value.get("text").is_none(), "a record replaces the text");
         assert_eq!(value["record"]["type"], "audit");

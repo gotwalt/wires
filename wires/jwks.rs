@@ -294,6 +294,10 @@ pub(crate) enum VerifyError {
     /// Every check passes except freshness: the token was valid for this
     /// principal until [`Principal::not_after`].
     Expired(Principal),
+    /// The claim arrived in an envelope signed by this node, not by the node
+    /// it names. The nonce binds a token to a (public) node id; only the key
+    /// holder publishing it on its own chain proves the binding.
+    WrongSender(library::NodeId),
 }
 
 impl From<library::Error> for VerifyError {
@@ -318,6 +322,11 @@ impl std::fmt::Display for VerifyError {
             VerifyError::Unavailable(e) => write!(f, "issuer keys unavailable: {e}"),
             VerifyError::Rejected(e) => write!(f, "{e}"),
             VerifyError::Expired(p) => write!(f, "expired at {}", p.not_after),
+            VerifyError::WrongSender(sender) => write!(
+                f,
+                "published by {}, not by the node it names",
+                &sender.hex()[..8]
+            ),
         }
     }
 }

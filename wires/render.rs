@@ -10,7 +10,7 @@
 //! ▶ 3fa2 alice@corp (a1b2…) db_query "select count(*) from orders"
 //! ■ 3fa2 exit 0 · 41 ms · 3.1 KiB out · blake3 9c1e…
 //! ✗ a1b2… db_query denied: membership rejected: revoked
-//! 🪪 a1b2… claims identity (unverified)
+//! 🪪 identity a1b2c3d4 is alice@corp (verified by https://accounts.google.com)
 //! ```
 //!
 //! The first four hex characters of the [`CallId`](library::CallId) pair a
@@ -22,19 +22,26 @@
 //! channel member, and a member must not be able to smuggle a newline (a
 //! forged second line) or an escape sequence into an observer's screen.
 //!
-//! [`identity_line`] is the seam the IdP lane replaces: today it says
-//! "unverified"; once claims are verified it names the principal.
+//! An identity claim is shown with the verdict *this reader* reached on it
+//! (see [`crate::identity`]): the verified principal, `(expired)`, or the
+//! precise reason it did not verify.
 
 use library::{AuditRecord, ChannelRecord, IdentityClaim, NodeId, Principal};
+
+use crate::identity::Verdict;
+use crate::idp_view::describe_identity;
 
 /// How many hex characters of a node id or digest a record line shows.
 const SHORT_HEX: usize = 4;
 
 /// One human line for `record` (no clock/sender prefix — the caller adds it).
-pub fn record_line(record: &ChannelRecord) -> String {
+///
+/// `identity` is the verdict on an identity claim, when the reader checked
+/// it; it is ignored for every other record.
+pub fn record_line(record: &ChannelRecord, identity: Option<&Verdict>) -> String {
     match record {
         ChannelRecord::Audit(audit) => audit_line(audit),
-        ChannelRecord::Identity(claim) => identity_line(claim),
+        ChannelRecord::Identity(claim) => identity_line(claim, identity),
     }
 }
 
@@ -89,13 +96,17 @@ pub fn audit_line(record: &AuditRecord) -> String {
     }
 }
 
-/// One human line for an IdP identity claim.
-///
-/// **Owned by the IdP lane (card 04) from here on**: it replaces
-/// "(unverified)" with the principal it verified from the claim's token. The
-/// signature is the contract — one claim in, one line out.
-pub fn identity_line(claim: &IdentityClaim) -> String {
-    format!("🪪 {} claims identity (unverified)", short_node(claim.node))
+/// One human line for an IdP identity claim, given this reader's verdict on
+/// it ([`describe_identity`]), or `(not checked)` when it has none. Every
+/// wire-derived string is escaped.
+pub fn identity_line(claim: &IdentityClaim, verdict: Option<&Verdict>) -> String {
+    match verdict {
+        Some(verdict) => format!("🪪 {}", escape(&describe_identity(claim, verdict))),
+        None => format!(
+            "🪪 {} claims identity (not checked)",
+            short_node(claim.node)
+        ),
+    }
 }
 
 /// A caller as a record line names it: `alice@corp (a1b2…)` when the
@@ -283,15 +294,48 @@ mod tests {
     }
 
     #[test]
-    fn identity_line_is_unverified_for_now() {
+    fn identity_line_shows_the_verdict() {
+        use crate::jwks::VerifyError;
         let claim = IdentityClaim {
             node: node(3),
             id_token: IdToken::new("a.b.c"),
         };
+        let short8 = &node(3).hex()[..8];
+        let record = ChannelRecord::Identity(claim);
         assert_eq!(
-            record_line(&ChannelRecord::Identity(claim)),
-            format!("🪪 {}… claims identity (unverified)", &node(3).hex()[..4])
+            record_line(&record, None),
+            format!("🪪 {}… claims identity (not checked)", &node(3).hex()[..4])
         );
+        let mut p = principal(Some("alice@corp"));
+        p.org = None;
+        assert_eq!(
+            record_line(&record, Some(&Ok(p.clone()))),
+            format!("🪪 identity {short8} is alice@corp (verified by https://accounts.google.com)")
+        );
+        assert_eq!(
+            record_line(&record, Some(&Err(VerifyError::Expired(p)))),
+            format!("🪪 identity {short8} is alice@corp (expired)")
+        );
+        let line = record_line(&record, Some(&Err(VerifyError::Unavailable("down".into()))));
+        assert!(
+            line.contains("UNVERIFIED: issuer keys unavailable: down"),
+            "{line}"
+        );
+    }
+
+    /// A verified email is still attacker-influenced text (anyone can set up
+    /// an IdP account); it cannot break the line.
+    #[test]
+    fn a_hostile_email_cannot_break_the_identity_line() {
+        let claim = IdentityClaim {
+            node: node(3),
+            id_token: IdToken::new("a.b.c"),
+        };
+        let line = identity_line(
+            &claim,
+            Some(&Ok(principal(Some("a@b\n12:00:00 forged\u{1b}[2J")))),
+        );
+        assert!(!line.chars().any(char::is_control), "{line:?}");
     }
 
     #[test]

@@ -129,6 +129,9 @@ pub struct ServeConfig {
     pub tools: BTreeMap<ToolName, Vec<String>>,
     /// Where call records go (`--audit-topic`), if anywhere.
     pub audit: Option<AuditSink>,
+    /// Who callers are, per the IdP claims on the audit topic, and what
+    /// `--require-idp` demands of them. `None` without an audit topic.
+    pub identity: Option<Arc<crate::identity::IdentityGate>>,
 }
 
 /// The responder's handle for publishing [`AuditRecord`](library::AuditRecord)s.
@@ -736,7 +739,10 @@ where
         }
     };
 
-    let roster_version = match authorize(
+    let Admitted {
+        roster_version,
+        principal,
+    } = match authorize(
         config,
         &policy,
         &membership,
@@ -830,6 +836,7 @@ where
     let audit = crate::audit::CallAudit::start(
         config.audit.as_ref(),
         caller,
+        principal,
         tool.cloned().unwrap_or_else(crate::audit::stdio_tool),
         invocation.as_ref().map_or(args, |i| i.argv.as_slice()),
         roster_version,
@@ -947,12 +954,24 @@ fn load_policy(config: &ServeConfig) -> Result<LoadedPolicy> {
     })
 }
 
+/// What [`authorize`] admitted a caller with.
+#[derive(Debug)]
+struct Admitted {
+    /// The roster version that admitted the caller, or `None` when no head is
+    /// enforced.
+    roster_version: Option<u64>,
+    /// The caller's fresh verified IdP principal, when the responder knows one
+    /// (see [`ServeConfig::identity`]).
+    principal: Option<library::Principal>,
+}
+
 /// Every credential check a caller must pass, in one place.
 ///
 /// Runs, in order: fabric inclusion (always), the scope grant (when the
-/// responder serves a scope), the grant/membership subject agreement, and the
-/// roster head gate. Returns the roster version that admitted the caller, or
-/// `None` when no head is enforced.
+/// responder serves a scope), the grant/membership subject agreement, the
+/// roster head gate, and last the identity gate (`--require-idp`), which only
+/// ever sees a caller whose key already passed everything else. Returns the
+/// admitting roster version and the caller's principal, if known.
 ///
 /// The error messages are user-facing: they are what the responder logs *and*
 /// what it sends back in a [`Frame::Denied`], so each keeps a prefix naming the
@@ -973,7 +992,7 @@ fn authorize(
     caller: NodeId,
     now: i64,
     tool: Option<&ToolName>,
-) -> Result<Option<u64>> {
+) -> Result<Admitted> {
     // Inclusion is always required: the caller must prove fabric membership,
     // bound to its iroh-authenticated key.
     check_inclusion(membership, config.trust_root, caller, now, &policy.crl)
@@ -1021,7 +1040,18 @@ fn authorize(
 
     // Roster head gate: when a head is enforced, require a proof and check the
     // caller's *current* membership; remember the admitting version.
-    roster_gate(config, policy.head.as_ref(), proof, caller, now)
+    let roster_version = roster_gate(config, policy.head.as_ref(), proof, caller, now)?;
+
+    // Identity: looked up per call, so a claim that lands after a refusal
+    // admits the next call.
+    let principal = match config.identity.as_deref() {
+        Some(gate) => gate.admit(caller, now).map_err(|reason| anyhow!(reason))?,
+        None => None,
+    };
+    Ok(Admitted {
+        roster_version,
+        principal,
+    })
 }
 
 /// The roster head gate. With no enforced `head`, returns `Ok(None)` (slice-1
@@ -1469,6 +1499,7 @@ mod tests {
         ServeConfig {
             tools: Default::default(),
             audit: None,
+            identity: None,
             trust_root: root.node_id(),
             scope: scope.map(Scope::new),
             crl: CrlSource::Fixed(crl),
@@ -1555,6 +1586,7 @@ mod tests {
         let config = ServeConfig {
             tools: Default::default(),
             audit: None,
+            identity: None,
             trust_root,
             scope: served_scope.map(Scope::new),
             crl: CrlSource::Fixed(crl),
@@ -1748,6 +1780,7 @@ mod tests {
         let config = ServeConfig {
             tools: Default::default(),
             audit: None,
+            identity: None,
             trust_root: root.node_id(),
             scope: None,
             crl: CrlSource::Fixed(Crl::new()),
@@ -1804,6 +1837,7 @@ mod tests {
         let config = Arc::new(ServeConfig {
             tools: Default::default(),
             audit: None,
+            identity: None,
             trust_root: root.node_id(),
             scope: None,
             crl: CrlSource::File(crl_path.clone()),
@@ -2343,6 +2377,7 @@ mod tests {
         let config = ServeConfig {
             tools: Default::default(),
             audit: None,
+            identity: None,
             trust_root: root.node_id(),
             scope: None,
             crl: CrlSource::Fixed(Crl::new()),
@@ -2481,6 +2516,7 @@ mod tests {
         let config = ServeConfig {
             tools: Default::default(),
             audit: None,
+            identity: None,
             trust_root: root.node_id(),
             scope: None,
             crl: CrlSource::Fixed(Crl::new()),
@@ -2545,6 +2581,7 @@ mod tests {
         let config = ServeConfig {
             tools: Default::default(),
             audit: None,
+            identity: None,
             trust_root: root.node_id(),
             scope: None,
             crl: CrlSource::Fixed(Crl::new()),
@@ -2604,6 +2641,7 @@ mod tests {
             let config = ServeConfig {
                 tools: Default::default(),
                 audit: None,
+                identity: None,
                 trust_root,
                 scope: None,
                 crl: CrlSource::Fixed(Crl::new()),
