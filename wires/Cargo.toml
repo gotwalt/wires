@@ -7,6 +7,11 @@ edition.workspace = true
 name = "wires"
 path = "main.rs"
 
+[features]
+# Hidden `wires dev-mock-idp` (hermetic OIDC issuer) for the demo script;
+# built only by //wires:wires_dev.
+dev-mock-idp = []
+
 [dependencies]
 library = { workspace = true }
 clap = { workspace = true }
