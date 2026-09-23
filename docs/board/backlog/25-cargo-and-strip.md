@@ -35,8 +35,27 @@ Verify each is unused on the current tree before removing it; if something is st
 - [ ] **Manual targets now that the channel is the directory** (card 15): `tools add --topic-ticket`, `--node` targets, `wires advanced import` of individual credentials (superseded by `join`). Keep aliases in `tools.json` only if something uses them.
 - [ ] **`relay/`** (a self-hosted iroh relay): unused by every demo and doc flow (n0 relays are used). Remove the crate. Keep a README line on `--relay-url` for people who self-host iroh-relay upstream.
 - [ ] **`.scripts/soak-topic.sh`**: keep only if it still runs against the new surface; otherwise remove.
-- [ ] **Docs:** `docs/archive/` (keep, since it's history), but check `docs/committed-roster.md` and `docs/phase2-topics.md` against the code (grants/CRL sections trimmed or marked historical); `docs/deployment.md` (k8s/Docker notes) is updated for the Dockerfile or cut; `docs/testing.md` is rewritten for Cargo.
 - [ ] **Plumbing under `wires advanced`:** after the removals, list what's left and whether each command still has a user; drop the ones with none.
+
+## Part C — unused and outdated docs (the human, 2026-09-23)
+
+**Rule: git history is the archive.** A doc that doesn't describe the code as it runs today, or guide current work, is deleted, not moved to `docs/archive/`. The tag `archive/poc-2026-05` and the git log keep everything. Default per file (verify before deleting; if a doc is still linked from something kept, fix the link or keep the doc and say why):
+
+| File | Default | Why |
+|---|---|---|
+| `docs/archive/*` (5 files: fabric vision, provable inclusion, roster plan, rust-bazel layout, session-layer thesis) | **delete** | Superseded history; the Bazel layout doc dies with Part A. |
+| `docs/demo-revoke.gif` | **delete** | Records the Phase 1 `connect`/revoke demo, which no longer exists. |
+| `docs/restart.md` | **delete**, after carrying its still-live content (the §7 non-negotiables and kill criteria) into `docs/board/README.md` in ≤ 10 lines | The phase plan is superseded by the board. |
+| `docs/committed-roster.md`, `docs/phase2-topics.md` | **rewrite into one current spec** (`docs/protocol.md`): roster, re-key, channel, records, as built; drop grants/CRL/Phase-2 framing | They describe removed features and old names. |
+| `docs/deployment.md` | rewrite for the Dockerfile + `wires serve host.json`, or delete if under ~20 useful lines | k8s/Bazel-era. |
+| `docs/testing.md` | rewrite for Cargo (short) | Bazel-era. |
+| `docs/storytelling.md` | keep, trimmed to the rebuttal test (§1) and anything the board references | It's still how pitch sentences get checked. |
+| `docs/demo.md`, `docs/agent-sandbox.md` | keep; update commands for Cargo | Current. |
+| `docs/research/agent-comms-2026-08/` (8 files) | **ask the human**: keep `executive-summary.md` + `synthesis.md`, delete the six lanes? | Market research is still cited in cards 22/23; lanes are raw material. |
+| `docs/board/done/*` | keep until after the demo; then optionally collapse into `docs/board/HISTORY.md` (one paragraph per card) | Cards carry decisions and Notes still being referenced. |
+| `CLAUDE.md`, `README.md` | fix every link to a deleted doc | — |
+
+- [ ] After Part C, `git ls-files docs | wc -l` and a dead-link check (`grep -o '](docs/[^)#]*' -r README.md CLAUDE.md docs | …`) are recorded in Notes; no link points at a deleted file.
 
 ## Acceptance
 
