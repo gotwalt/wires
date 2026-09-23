@@ -121,25 +121,25 @@ t1="$D/reader-1"
 t2="$D/reader-2"
 mkdir -p "$op" "$p" "$t1" "$t2"
 
-WIRES_HOME="$op" "$WIRES" keygen --save-root >/dev/null
-for h in "$p" "$t1" "$t2"; do WIRES_HOME="$h" "$WIRES" keygen --save-node >/dev/null; done
+WIRES_HOME="$op" "$WIRES" advanced keygen --save-root >/dev/null
+for h in "$p" "$t1" "$t2"; do WIRES_HOME="$h" "$WIRES" advanced keygen --save-node >/dev/null; done
 
-node_id() { "$WIRES" keygen --node-seed "$(tr -d '\n' <"$1/node.seed")" | awk '/^node_id/{print $2}'; }
+node_id() { "$WIRES" advanced keygen --node-seed "$(tr -d '\n' <"$1/node.seed")" | awk '/^node_id/{print $2}'; }
 P_ID="$(node_id "$p")"
 T1_ID="$(node_id "$t1")"
 T2_ID="$(node_id "$t2")"
 P8="${P_ID:0:8}"
 
 for id in "$P_ID" "$T1_ID" "$T2_ID"; do
-	WIRES_HOME="$op" "$WIRES" roster add --member "$id" >/dev/null
-	WIRES_HOME="$op" "$WIRES" member --subject "$id" --ttl 7200 >"$D/$id.member"
+	WIRES_HOME="$op" "$WIRES" advanced roster add --member "$id" >/dev/null
+	WIRES_HOME="$op" "$WIRES" advanced member --subject "$id" --ttl 7200 >"$D/$id.member"
 done
-commit="$(WIRES_HOME="$op" "$WIRES" roster commit --ttl 7200 --out "$D/v1")"
+commit="$(WIRES_HOME="$op" "$WIRES" advanced roster commit --ttl 7200 --out "$D/v1")"
 HEAD="$(printf '%s\n' "$commit" | awk '/^head /{print $2}')"
 for pair in "$p:$P_ID" "$t1:$T1_ID" "$t2:$T2_ID"; do
 	home="${pair%%:*}"
 	id="${pair##*:}"
-	WIRES_HOME="$home" "$WIRES" import \
+	WIRES_HOME="$home" "$WIRES" advanced import \
 		--membership-file "$D/$id.member" \
 		--inclusion-proof-file "$D/v1/$id.proof" \
 		--roster-head "$HEAD" \
@@ -150,14 +150,14 @@ say "roster v1: publisher $P8 plus two readers; $N messages every ${INTERVAL}s"
 # ==========================================================================
 # Stand the mesh up: P first (it owns the ticket everyone bootstraps from).
 # ==========================================================================
-WIRES_HOME="$p" "$WIRES" tail "$TOPIC" >"$D/p.out" 2>"$D/p.err" &
+WIRES_HOME="$p" "$WIRES" watch "$TOPIC" >"$D/p.out" 2>"$D/p.err" &
 P_PID=$!
 wait_for "$D/p.err" '^share to bootstrap: ' 300 || bad "P never printed a ticket"
 TICKET_P="$(ticket_of "$D/p.err")"
 
-WIRES_HOME="$t1" "$WIRES" tail "$TOPIC" --peer "$TICKET_P" >"$D/t1a.out" 2>"$D/t1a.err" &
+WIRES_HOME="$t1" "$WIRES" watch "$TOPIC" --peer "$TICKET_P" >"$D/t1a.out" 2>"$D/t1a.err" &
 T1_PID=$!
-WIRES_HOME="$t2" "$WIRES" tail "$TOPIC" --peer "$TICKET_P" >"$D/t2.out" 2>"$D/t2.err" &
+WIRES_HOME="$t2" "$WIRES" watch "$TOPIC" --peer "$TICKET_P" >"$D/t2.out" 2>"$D/t2.err" &
 T2_PID=$!
 wait_for "$D/t1a.err" 'neighbor up' 600 || bad "T1 never joined the mesh"
 wait_for "$D/t2.err" 'neighbor up' 600 || bad "T2 never joined the mesh"
@@ -170,7 +170,7 @@ say "mesh up: P=$P_PID T1=$T1_PID T2=$T2_PID"
 publisher() {
 	local i
 	for i in $(seq 1 "$N"); do
-		WIRES_HOME="$p" "$WIRES" publish "$TOPIC" \
+		WIRES_HOME="$p" "$WIRES" advanced publish "$TOPIC" \
 			-m "$(printf 'soak %03d' "$i")" 2>>"$D/pub.err" ||
 			printf 'publish %d FAILED\n' "$i" >>"$D/pub.err"
 		printf '%d\n' "$i" >>"$D/progress"
@@ -194,7 +194,7 @@ wait "$T1_PID" 2>/dev/null || true
 say "T1 ($T1_PID) killed -9 at message $KILL_AT -- restarting from its own state"
 # No `--peer`: the restart must find its way back from `topics/<id>.peers.json`
 # alone, which is the whole point of persisting it (spec §7).
-WIRES_HOME="$t1" "$WIRES" tail "$TOPIC" >"$D/t1b.out" 2>"$D/t1b.err" &
+WIRES_HOME="$t1" "$WIRES" watch "$TOPIC" >"$D/t1b.out" 2>"$D/t1b.err" &
 T1_PID=$!
 wait_for "$D/t1b.err" '^share to bootstrap: ' 600 || bad "T1 did not come back up"
 

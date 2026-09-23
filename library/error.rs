@@ -123,7 +123,7 @@ pub enum Error {
     /// node does not hold.
     ///
     /// Not fatal: the message is stored provisionally and displays once the key
-    /// arrives via `wires import` (late joiners never hold pre-join versions,
+    /// arrives via `wires advanced import` (late joiners never hold pre-join versions,
     /// so for them this is permanent by design).
     #[error("no fabric key held for roster version {version}")]
     KeyVersionUnknown {

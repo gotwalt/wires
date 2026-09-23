@@ -57,51 +57,36 @@ export WIRES_HOME="$(mktemp -d)/wires"
 bazel build //wires
 bin=bazel-bin/wires/wires
 
-"$bin" keygen --save-node --save-root        # writes 0600 node.seed + root.seed
+"$bin" advanced keygen --save-node --save-root        # writes 0600 node.seed + root.seed
 ls -l "$WIRES_HOME"                          # confirm permissions
 
 # the saved node id (re-derive from the seed file to read it back):
-NODE_ID=$("$bin" keygen --node-seed "$(tr -d '\n' < "$WIRES_HOME/node.seed")" \
+NODE_ID=$("$bin" advanced keygen --node-seed "$(tr -d '\n' < "$WIRES_HOME/node.seed")" \
   | awk '/^node_id/{print $2}')
 
-TICKET=$("$bin" grant --subject "$NODE_ID" --target "$NODE_ID" --scope tools.rg --ttl 3600)
+TICKET=$("$bin" advanced grant --subject "$NODE_ID" --target "$NODE_ID" --scope tool:rg --ttl 3600)
 echo "ticket: ${TICKET:0:32}…"
 
-"$bin" revoke --subject "$NODE_ID"           # updates $WIRES_HOME/crl.json in place
+"$bin" advanced revoke --subject "$NODE_ID"           # updates $WIRES_HOME/crl.json in place
 cat "$WIRES_HOME/crl.json"
 ```
 
-## Manual: a live session (two terminals)
+## Manual: a live session
 
-`serve`/`connect` need a relay to rendezvous (the default n0 relays, which
-require internet, or a self-hosted one). Using a **local relay**:
+`.scripts/demo-remote-cli.sh` is the live session: a host exposing one tool
+with `--audit-topic`, a caller that logs in and runs `wires call` / `wires mcp`,
+and an observer on `wires watch`, all on loopback in a fresh `mktemp -d`, every
+step asserted. Run it with `--keep` to poke at the state afterwards.
 
-```bash
-# terminal 1 — the relay
-bazel run //relay -- --listen 127.0.0.1:3340
-
-# terminal 2 — a responder serving `cat` under scope tools.cat
-export WIRES_HOME="$(mktemp -d)/wires"
-bazel run //wires -- keygen --save-node          # note SERVER_ID
-bazel run //wires -- keygen --save-root          # note ROOT_ID
-bazel run //wires -- serve \
-  --trust-root "$ROOT_ID" --scope tools.cat \
-  --relay-url http://127.0.0.1:3340 -- cat
-
-# terminal 3 — a dialer (its own keystore + a grant for it)
-export WIRES_HOME="$(mktemp -d)/wires-agent"
-bazel run //wires -- keygen --save-node          # note AGENT_ID
-TICKET=$(WIRES_HOME=<operator-home> bazel run -q //wires -- grant \
-  --subject "$AGENT_ID" --target "$SERVER_ID" --scope tools.cat --ttl 3600)
-echo "hello over wires" | bazel run -q //wires -- connect \
-  --relay-url http://127.0.0.1:3340 --ticket "$TICKET"
-# → prints "hello over wires", exits 0
-```
+Across machines, `serve` and the callers need a relay to rendezvous (the
+default n0 relays, which require internet, or a self-hosted one:
+`bazel run //relay -- --listen 127.0.0.1:3340`, then `--relay-url` on each
+side).
 
 > **Note:** even with `--relay-url`, address discovery (node id → address)
 > currently uses iroh's n0 DNS, so a no-internet box may not resolve the peer
 > yet. See the discovery limits in [deployment.md](deployment.md). The
-> automated loopback test avoids this by addressing localhost directly.
+> automated loopback tests avoid this by addressing localhost directly.
 
 ## CI
 

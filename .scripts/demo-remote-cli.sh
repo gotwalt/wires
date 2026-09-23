@@ -7,7 +7,7 @@
 #
 #   workbench -- `wires serve --expose db_query=sqlite3 -safe -readonly …
 #                --audit-topic ops --require-idp …`. Hosts the audit topic.
-#   observer  -- `wires tail ops`: holds neither the agent's nor the
+#   observer  -- `wires watch ops`: holds neither the agent's nor the
 #                workbench's credentials, and sees every call anyway.
 #   agent     -- `wires login` (IdP) then `wires call db_query …` and
 #                `wires mcp` (JSON-RPC over pipes).
@@ -151,10 +151,10 @@ agent="$D/agent"
 obs="$D/observer"
 mkdir -p "$root" "$wb" "$agent" "$obs"
 
-WIRES_HOME="$root" "$WIRES" keygen --save-root >/dev/null
-for h in "$wb" "$agent" "$obs"; do WIRES_HOME="$h" "$WIRES" keygen --save-node >/dev/null; done
-ROOT_ID="$(WIRES_HOME="$root" "$WIRES" keygen --root-seed "$(tr -d '\n' <"$root/root.seed")" | awk '/^root_id/{print $2}')"
-node_id() { "$WIRES" keygen --node-seed "$(tr -d '\n' <"$1/node.seed")" | awk '/^node_id/{print $2}'; }
+WIRES_HOME="$root" "$WIRES" advanced keygen --save-root >/dev/null
+for h in "$wb" "$agent" "$obs"; do WIRES_HOME="$h" "$WIRES" advanced keygen --save-node >/dev/null; done
+ROOT_ID="$(WIRES_HOME="$root" "$WIRES" advanced keygen --root-seed "$(tr -d '\n' <"$root/root.seed")" | awk '/^root_id/{print $2}')"
+node_id() { "$WIRES" advanced keygen --node-seed "$(tr -d '\n' <"$1/node.seed")" | awk '/^node_id/{print $2}'; }
 WB_ID="$(node_id "$wb")"
 AG_ID="$(node_id "$agent")"
 OB_ID="$(node_id "$obs")"
@@ -163,13 +163,13 @@ OB_ID="$(node_id "$obs")"
 AG8="${AG_ID:0:8}"
 
 for id in "$WB_ID" "$AG_ID" "$OB_ID"; do
-	WIRES_HOME="$root" "$WIRES" roster add --member "$id" >/dev/null
-	WIRES_HOME="$root" "$WIRES" member --subject "$id" --ttl 3600 >"$D/$id.member"
+	WIRES_HOME="$root" "$WIRES" advanced roster add --member "$id" >/dev/null
+	WIRES_HOME="$root" "$WIRES" advanced member --subject "$id" --ttl 3600 >"$D/$id.member"
 done
-commit1="$(WIRES_HOME="$root" "$WIRES" roster commit --ttl 3600 --out "$D/v1")"
+commit1="$(WIRES_HOME="$root" "$WIRES" advanced roster commit --ttl 3600 --out "$D/v1")"
 HEAD1="$(printf '%s\n' "$commit1" | awk '/^head /{print $2}')"
 refresh() { # $1 = home, $2 = node id, $3 = proof dir, $4 = head token
-	WIRES_HOME="$1" "$WIRES" import \
+	WIRES_HOME="$1" "$WIRES" advanced import \
 		--membership-file "$D/$2.member" \
 		--inclusion-proof-file "$3/$2.proof" \
 		--roster-head "$4" \
@@ -224,9 +224,9 @@ beat 2
 # ==========================================================================
 step "2  the observer tails the channel -- no key to the agent or the workbench"
 # ==========================================================================
-run "WIRES_OIDC_ISSUER=$ISSUER WIRES_OIDC_AUDIENCE=$CLIENT_ID wires tail $TOPIC --peer \$TICKET"
+run "WIRES_OIDC_ISSUER=$ISSUER WIRES_OIDC_AUDIENCE=$CLIENT_ID wires watch $TOPIC --peer \$TICKET"
 WIRES_HOME="$obs" WIRES_OIDC_ISSUER="$ISSUER" WIRES_OIDC_AUDIENCE="$CLIENT_ID" \
-	"$WIRES" tail "$TOPIC" --peer "$TICKET" >"$D/obs.out" 2>"$D/obs.err" &
+	"$WIRES" watch "$TOPIC" --peer "$TICKET" >"$D/obs.out" 2>"$D/obs.err" &
 OBS_PID=$!
 wait_for "$D/obs.err" "neighbor up" 300 || {
 	sed 's/^/  observer| /' "$D/obs.err" >&2
@@ -456,12 +456,12 @@ beat 3
 # ==========================================================================
 step "7  the human removes the agent -- one commit, nobody restarts"
 # ==========================================================================
-run "wires roster remove --member ${AG8}...  &&  wires roster commit"
-WIRES_HOME="$root" "$WIRES" roster remove --member "$AG_ID" >/dev/null
-commit2="$(WIRES_HOME="$root" "$WIRES" roster commit --ttl 3600 --out "$D/v2")"
+run "wires advanced roster remove --member ${AG8}...  &&  wires advanced roster commit"
+WIRES_HOME="$root" "$WIRES" advanced roster remove --member "$AG_ID" >/dev/null
+commit2="$(WIRES_HOME="$root" "$WIRES" advanced roster commit --ttl 3600 --out "$D/v2")"
 HEAD2="$(printf '%s\n' "$commit2" | awk '/^head /{print $2}')"
 [ -f "$D/v2/$AG_ID.proof" ] && bad "7: the new roster still includes the agent"
-run "wires import --roster-head H2 …   # on the workbench and the observer"
+run "wires advanced import --roster-head H2 …   # on the workbench and the observer"
 refresh "$wb" "$WB_ID" "$D/v2" "$HEAD2"
 refresh "$obs" "$OB_ID" "$D/v2" "$HEAD2"
 run "wires call db_query -- 'select count(*) from orders'"

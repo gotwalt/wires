@@ -141,8 +141,20 @@ make push-containers   # runs every oci_push target
   lint/format, and `gazelle` (Starlark BUILD maintenance).
 - `Cargo.toml` / `Cargo.lock` — the Rust workspace. Members are flat top-level
   packages: `//library` (the `library` crate), `//wires` (the `wires` binary),
-  and `//relay` (the `relay` binary). Each package holds its `*.rs` files
-  directly (no `src/` subdir), a `BUILD`, and a `Cargo.toml`.
+  and `//relay` (the `relay` binary). Each package holds its sources at the
+  package root (no `src/` subdir), a `BUILD` (`srcs = glob(["**/*.rs"])`),
+  and a `Cargo.toml`, with the sources filed by role:
+  - `//wires`: `main.rs` is argument parsing and dispatch only; each role owns
+    a folder with a `mod.rs` — `admin/` (keystore, the root's offline
+    commands), `host/` (`serve`, the session transport, the caller checks, IdP
+    policy, audit records), `caller/` (`login`, `call`, `tools`, `mcp`),
+    `channel/` (the topic node every role meets on, `watch`); `advanced.rs` is
+    the `wires advanced` plumbing dispatch; `e2e/` holds the loopback
+    integration tests and `testutil.rs` the shared test fixtures. See
+    `docs/board/README.md` § Roles.
+  - `//library`: `membership/`, `channel/`, `calls/` are folders only — every
+    module is declared at the crate root with `#[path]`, so public paths
+    (`library::grant`, …) and the `lib.rs` re-exports don't depend on them.
 - `tools/` — Build tooling: formatters (`tools/format/`), linters (`tools/lint/`),
   OCI image macro (`tools/oci/`), platform definitions (`tools/platforms/`),
   platform-transition helpers (`tools/transitions/`).

@@ -1,5 +1,22 @@
 //! `library`: shared types for the wires session layer.
 //!
+//! # Layout
+//!
+//! The source tree is grouped by concern, three folders beside the crate-wide
+//! [`error`] (and the private canonical-JSON `codec`):
+//!
+//! - `membership/` — who is in: identities, memberships, the committed
+//!   roster, grants, tickets, the accept gates, and the per-commit fabric key.
+//! - `channel/` — the encrypted channel: topic ids, envelopes, the chain
+//!   rules, admission, replay, and the records that ride it.
+//! - `calls/` — remote CLI calls: the session frames, invocations, audit
+//!   records, and IdP identity claims.
+//!
+//! The folders are a filing system, not a namespace: every module is still
+//! declared here at the crate root (`library::grant`, `library::topic`, …),
+//! so the public paths and the re-exports below are the same as before the
+//! folders existed.
+//!
 //! The module layout mirrors the shared mechanics of `docs/committed-roster.md`:
 //!
 //! - [`identity`] — the Ed25519 [`NodeIdentity`] and the [`NodeId`] / [`Signature`]
@@ -125,27 +142,51 @@
 //!     .is_err());
 //! ```
 
-pub mod admission;
-pub mod audit;
-pub mod chain;
-pub mod envelope;
 pub mod error;
+
+// membership/ — who is in.
+#[path = "membership/fabric_key.rs"]
 pub mod fabric_key;
+#[path = "membership/grant.rs"]
 pub mod grant;
+#[path = "membership/identity.rs"]
 pub mod identity;
-pub mod idp;
-pub mod invoke;
+#[path = "membership/membership.rs"]
 pub mod membership;
+#[path = "membership/policy.rs"]
 pub mod policy;
-pub mod record;
-pub mod replay;
+#[path = "membership/roster.rs"]
 pub mod roster;
-pub mod session;
+#[path = "membership/ticket.rs"]
 pub mod ticket;
+
+// channel/ — the encrypted channel.
+#[path = "channel/admission.rs"]
+pub mod admission;
+#[path = "channel/chain.rs"]
+pub mod chain;
+#[path = "channel/envelope.rs"]
+pub mod envelope;
+#[path = "channel/record.rs"]
+pub mod record;
+#[path = "channel/replay.rs"]
+pub mod replay;
+#[path = "channel/topic.rs"]
 pub mod topic;
+
+// calls/ — remote CLI calls.
+#[path = "calls/audit.rs"]
+pub mod audit;
+#[path = "calls/idp.rs"]
+pub mod idp;
+#[path = "calls/invoke.rs"]
+pub mod invoke;
+#[path = "calls/session.rs"]
+pub mod session;
 
 mod codec;
 #[cfg(test)]
+#[path = "calls/idp_vectors.rs"]
 mod idp_vectors;
 
 pub use admission::{

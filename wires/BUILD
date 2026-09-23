@@ -26,7 +26,7 @@ WIRES_DEPS = [
 # The main multi-call binary: //wires
 rust_binary(
     name = "wires",
-    srcs = glob(["*.rs"]),
+    srcs = glob(["**/*.rs"]),
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = WIRES_DEPS,
@@ -37,7 +37,7 @@ rust_binary(
 # packaged: the image and releases use `:wires`, which does not compile the mock.
 rust_binary(
     name = "wires_dev",
-    srcs = glob(["*.rs"]),
+    srcs = glob(["**/*.rs"]),
     crate_features = ["dev-mock-idp"],
     crate_name = "wires",
     crate_root = "main.rs",
@@ -52,8 +52,8 @@ rust_test(
 )
 
 # Distroless OCI image of the `wires` binary: //wires:image (+ //wires:image.load).
-# Self-contained for the dialer/shim side (`wires connect`); for a responder,
-# compose an image that also contains the tool/MCP-server binary it execs.
+# Self-contained for the caller side (`wires call` / `wires mcp`); for a responder,
+# compose an image that also contains the CLIs it exposes.
 rust_image(
     name = "image",
     binary = ":wires",
