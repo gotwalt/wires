@@ -22,7 +22,8 @@
 //! [`CallAudit`] is the per-call handle `serve_session` holds: `start` emits
 //! [`Started`](AuditRecord::Started) once the child is spawned, the [`Tap`]s
 //! it hands out count (and, for stdout, BLAKE3-hash) what the child writes,
-//! and `finish` emits [`Finished`](AuditRecord::Finished). A refusal emits a
+//! the [`StdinTap`] hashes, counts and quotes the head of what the caller
+//! sent on stdin, and `finish` emits [`Finished`](AuditRecord::Finished). A refusal emits a
 //! lone [`Denied`](AuditRecord::Denied) via [`denied`] carrying the exact
 //! reason the caller was sent. The caller is always the iroh-authenticated
 //! peer, never a handshake claim.
@@ -48,7 +49,9 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use library::{Argv, AuditRecord, CallId, ChannelRecord, NodeId, OutputHasher, ToolName};
+use library::{
+    Argv, AuditRecord, CallId, ChannelRecord, NodeId, OutputHasher, StdinCapture, ToolName,
+};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
@@ -109,6 +112,8 @@ pub struct CallAudit {
     stdout: Tally,
     /// Everything the child wrote to stderr (only the count is reported).
     stderr: Tally,
+    /// Everything the caller sent on stdin.
+    stdin: Arc<Mutex<StdinCapture>>,
 }
 
 impl CallAudit {
@@ -148,6 +153,7 @@ impl CallAudit {
             spawned: Instant::now(),
             stdout: Tally::default(),
             stderr: Tally::default(),
+            stdin: Arc::default(),
         })
     }
 
@@ -159,6 +165,10 @@ impl CallAudit {
             (h.bytes(), h.finish())
         };
         let stderr_bytes = self.stderr.lock().expect("stderr tally poisoned").bytes();
+        let (stdin_bytes, stdin_digest, stdin_head) = {
+            let c = self.stdin.lock().expect("stdin capture poisoned");
+            (c.bytes(), c.digest(), c.head())
+        };
         self.sink.record(AuditRecord::Finished {
             call: self.call,
             exit,
@@ -166,6 +176,9 @@ impl CallAudit {
             stdout_bytes,
             stderr_bytes,
             stdout_digest,
+            stdin_bytes,
+            stdin_digest,
+            stdin_head,
         });
     }
 }
@@ -183,6 +196,29 @@ pub fn tap_stderr<R>(audit: Option<&CallAudit>, inner: R) -> Tap<R> {
     Tap {
         inner,
         tally: audit.map(|a| Arc::clone(&a.stderr)),
+    }
+}
+
+/// A handle for recording the caller's stdin as the session pump forwards it
+/// to the child. Stdin arrives as frames rather than through a reader, so
+/// this is fed explicitly ([`StdinTap::feed`]) instead of wrapping a stream.
+pub fn tap_stdin(audit: Option<&CallAudit>) -> StdinTap {
+    StdinTap(audit.map(|a| Arc::clone(&a.stdin)))
+}
+
+/// See [`tap_stdin`]. With no audit it records nothing.
+#[derive(Debug)]
+pub struct StdinTap(Option<Arc<Mutex<StdinCapture>>>);
+
+impl StdinTap {
+    /// Record one chunk of stdin, in the order the caller sent it.
+    pub fn feed(&self, chunk: &[u8]) {
+        if let Some(capture) = &self.0 {
+            capture
+                .lock()
+                .expect("stdin capture poisoned")
+                .update(chunk);
+        }
     }
 }
 
@@ -281,6 +317,9 @@ mod tests {
                 stdout_bytes: 0,
                 stderr_bytes: 0,
                 stdout_digest: OutputHasher::new().finish(),
+                stdin_bytes: 0,
+                stdin_digest: OutputHasher::new().finish(),
+                stdin_head: None,
             },
             AuditRecord::Denied {
                 caller: caller(),
@@ -371,6 +410,9 @@ mod tests {
         .unwrap();
         let mut out = tap_stdout(Some(&audit), &b"hello world"[..]);
         let mut err = tap_stderr(Some(&audit), &b"warn"[..]);
+        let stdin = tap_stdin(Some(&audit));
+        stdin.feed(b"select ");
+        stdin.feed(b"1");
         let mut sink_buf = Vec::new();
         out.read_to_end(&mut sink_buf).await.unwrap();
         err.read_to_end(&mut sink_buf).await.unwrap();
@@ -397,11 +439,19 @@ mod tests {
             stdout_bytes,
             stderr_bytes,
             stdout_digest,
+            stdin_bytes,
+            stdin_digest,
+            stdin_head,
             ..
         }) = rx.try_recv()
         else {
             panic!("expected Finished second");
         };
+        assert_eq!(stdin_bytes, 8);
+        assert_eq!(stdin_head.as_deref(), Some("select 1"));
+        let mut expect_in = OutputHasher::new();
+        expect_in.update(b"select 1");
+        assert_eq!(stdin_digest, expect_in.finish());
         assert_eq!(call, started);
         assert_eq!(exit, 3);
         assert_eq!(stdout_bytes, 11);
@@ -409,6 +459,11 @@ mod tests {
         let mut expect = OutputHasher::new();
         expect.update(b"hello world");
         assert_eq!(stdout_digest, expect.finish());
+    }
+
+    #[test]
+    fn an_untallied_stdin_tap_records_nothing() {
+        tap_stdin(None).feed(b"ignored"); // must not panic
     }
 
     #[tokio::test]

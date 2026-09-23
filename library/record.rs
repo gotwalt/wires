@@ -100,6 +100,9 @@ mod tests {
                 stdout_bytes: 2,
                 stderr_bytes: 0,
                 stdout_digest: OutputDigest::from_hash(blake3::hash(b"1\n")),
+                stdin_bytes: 8,
+                stdin_digest: OutputDigest::from_hash(blake3::hash(b"select 1")),
+                stdin_head: Some("select 1".into()),
             }),
             ChannelRecord::Identity(IdentityClaim {
                 node,

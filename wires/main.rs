@@ -774,7 +774,7 @@ fn preflight(node: NodeId, membership: &Membership, grant: Option<&Grant>) -> Re
 /// `--target`), present the ticket's grant when scoped, and bridge local stdio.
 /// Returns the child's exit code.
 async fn connect_cmd(a: ConnectArgs) -> anyhow::Result<i32> {
-    init_logging();
+    init_quiet_logging();
     let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
     let membership = keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?;
     let proof = keystore::inclusion_proof(
@@ -855,15 +855,36 @@ fn runtime() -> tokio::runtime::Runtime {
 /// Initialize tracing for the network subcommands, writing to **stderr** so it
 /// never corrupts `connect`'s piped stdout.
 ///
-/// The default filter is `warn,wires=info`: wires' own startup / accept /
+/// The default filter is [`LOG_FILTER`]: wires' own startup / accept /
 /// reject lines print, while iroh's relay and discovery chatter stays out of an
 /// MCP client's server-log pane. `$RUST_LOG` overrides it entirely (e.g.
 /// `RUST_LOG=iroh=debug`).
 fn init_logging() {
+    init_logging_with(LOG_FILTER);
+}
+
+/// [`init_logging`] for the dialing commands (`call`, `mcp`, `connect`), whose
+/// stderr belongs to the remote CLI: [`QUIET_LOG_FILTER`] by default, so a
+/// successful call leaves nothing of wires' own on it.
+fn init_quiet_logging() {
+    init_logging_with(QUIET_LOG_FILTER);
+}
+
+/// The default log filter of the long-running commands.
+const LOG_FILTER: &str = "warn,wires=info";
+
+/// The default log filter of the dialing commands: only warnings from wires
+/// itself, and iroh (plus `iroh_*`, which the target prefix also matches)
+/// entirely off — its endpoint teardown logs `ERROR … relay_recv_channel
+/// closed` at the end of every perfectly normal call.
+const QUIET_LOG_FILTER: &str = "warn,iroh=off";
+
+/// Install the stderr subscriber with `default` unless `$RUST_LOG` is set.
+fn init_logging_with(default: &str) {
     use tracing_subscriber::EnvFilter;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,wires=info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default)),
         )
         .with_writer(std::io::stderr)
         .try_init();
@@ -909,14 +930,14 @@ fn main() {
             }
         }
         Command::Call(a) => {
-            init_logging();
+            init_quiet_logging();
             match runtime().block_on(call::call_cmd(a)) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => exit_with(e),
             }
         }
         Command::Mcp(a) => {
-            init_logging();
+            init_quiet_logging();
             if let Err(e) = runtime().block_on(mcp::mcp_cmd(a)) {
                 eprintln!("wires: {e:#}");
                 std::process::exit(1);
@@ -3794,12 +3815,10 @@ mod tests {
         assert_eq!(ctx.membership.member, member.node.node_id());
         assert_eq!(ctx.name, "ops");
         assert!(ctx.ticket_peers.is_empty());
-        // The socket and the log live under the same home.
-        assert!(ctx.socket_path().starts_with(&member.home));
-        assert_eq!(
-            ctx.socket_path().file_name().unwrap().to_string_lossy(),
-            format!("{}.sock", &ctx.topic.hex()[..16])
-        );
+        // The socket is the one this home's topic resolves to (under the home,
+        // or — for a home as deep as the test sandbox's — the short fallback;
+        // `ipc`'s suite asserts both shapes).
+        assert_eq!(ctx.socket_path(), ipc::socket_path(&member.home, ctx.topic));
     }
 
     #[test]
