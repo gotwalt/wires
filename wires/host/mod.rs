@@ -36,5 +36,6 @@ pub mod identity;
 pub mod otlp;
 pub mod policy;
 pub mod push;
+pub mod record_stream;
 pub mod serve;
 pub mod transport;
