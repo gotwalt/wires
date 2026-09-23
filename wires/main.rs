@@ -60,7 +60,7 @@ const HELP_TEMPLATE: &str = "\
 {usage-heading} {usage}
 
 Admin — signs who's in and what runs where (holds the root key):
-  init      Start a fabric: root key, this node, the first signed state
+  init      Create the root key, this node, and the first signed state
   invite    Add a node and print its one join token
   remove    Drop a node; hosts refuse its next call
   service   Register services: add / set / rm (name, allowed roles, hosts)
@@ -79,7 +79,7 @@ Caller — runs remote CLIs by service name (every role joins the same way):
   mcp       Serve those services as MCP tools over stdio (compatibility)
   inbox     Read what hosts pushed to you; --wait blocks until something arrives
 
-Observer — reads the hosts' call records:
+Reader — reads the hosts' call records:
   watch     Stream call records from your services' hosts, verified (--mine)
 
 Options:
@@ -99,7 +99,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     // --- admin ---
-    /// Start a fabric: create the root key and this machine's node key, and
+    /// Create the root key and this machine's node key, and
     /// sign the first state (this node its one member).
     Init(admin::init::InitArgs),
     /// Add a node to the signed state and print its join token (stdout); the
@@ -136,7 +136,7 @@ enum Command {
     /// List the services you may call (evaluated locally against the signed
     /// state), with what each does and the role that admits you.
     Services(caller::services::ServicesArgs),
-    /// Run a service by name (or a `tools.json` alias): stdio passes through,
+    /// Run a service by name: stdio passes through,
     /// its exit code becomes ours, a refusal exits 77.
     Call(caller::call::CallArgs),
     /// The old name of `wires services`; `add` / `list` / `rm` edit the local
@@ -151,9 +151,9 @@ enum Command {
     /// `--timeout`).
     Inbox(caller::inbox::InboxArgs),
 
-    // --- observer ---
+    // --- reader ---
     /// Stream call records from the hosts of your services: every record of
-    /// a service you are a reader of, otherwise your own (card 26b).
+    /// a service you are a reader of, otherwise your own.
     Watch(caller::watch_records::WatchArgs),
 
     /// Dev build only: run the hermetic mock OIDC issuer on a loopback port
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn help_shows_the_roles_on_one_screen() {
         let help = Cli::command().render_help().to_string();
-        for role in ["Admin", "Host", "Caller", "Observer"] {
+        for role in ["Admin", "Host", "Caller", "Reader"] {
             assert!(help.contains(&format!("{role} — ")), "{help}");
         }
         let lines = help.lines().count();

@@ -407,7 +407,8 @@ pub struct CallArgs {
     /// Say on stderr which host answered (callers don't normally care).
     #[arg(long)]
     pub verbose: bool,
-    /// The service's name (`wires services`), or an alias from `tools.json`.
+    /// The service's name (`wires services`).
+    #[arg(value_name = "SERVICE")]
     pub tool: String,
     /// Extra arguments appended to the remote command. Use `--` before any
     /// that start with `-`.
