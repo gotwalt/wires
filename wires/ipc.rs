@@ -10,7 +10,9 @@
 //! synthetic IV exists to survive rather than to invite (spec §4.1).
 //!
 //! So publishing is a *request to the tail*, over a unix socket at
-//! `$WIRES_HOME/run/<topic-hex-prefix>.sock` (see [`socket_path`]):
+//! `$WIRES_HOME/run/<topic-hex-prefix>.sock` (see [`socket_path`]; a home too
+//! deep for a unix socket path falls back to
+//! `$TMPDIR/wires-<uid>/<hash>.sock`, or the same under `/tmp`):
 //!
 //! ```text
 //! publish → {"publish":{"text":"ship it"}}
@@ -110,10 +112,67 @@ const SOCKET_NAME_HEX: usize = 16;
 /// ```text
 /// ~/.config/wires/run/1f0c9ab3a1b2c3d4.sock
 /// ```
+///
+/// When that path would not fit in a `sockaddr_un` (a deep `$WIRES_HOME`), it
+/// is swapped for a short one under the system temp directory — see
+/// [`short_socket_path`]. Binding (`tail`, `serve --audit-topic`) and
+/// connecting (`publish`) both come through here, so they always agree.
 pub fn socket_path(home: &Path, topic: TopicId) -> PathBuf {
     let hex = topic.hex();
     let name = &hex[..SOCKET_NAME_HEX.min(hex.len())];
-    run_dir(home).join(format!("{name}.sock"))
+    let full = run_dir(home).join(format!("{name}.sock"));
+    if fits_sockaddr(&full) {
+        return full;
+    }
+    let Some(uid) = owner_uid(home) else {
+        // No home to take an owner from: keep the long path, whose bind fails
+        // with the kernel's own "shorter than SUN_LEN" message.
+        return full;
+    };
+    let bases = [std::env::temp_dir(), PathBuf::from("/tmp")];
+    short_socket_path(&full, uid, &bases).unwrap_or(full)
+}
+
+/// The size of `sockaddr_un::sun_path`, NUL terminator included: 104 bytes on
+/// macOS (and the BSDs), 108 on Linux.
+pub const SUN_PATH_BYTES: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
+
+/// Whether `path` can be bound as a unix socket (it leaves room for the NUL).
+pub fn fits_sockaddr(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().len() < SUN_PATH_BYTES
+}
+
+/// A short stand-in for a control socket path too long to bind:
+/// `<base>/wires-<uid>/<16 hex of BLAKE3(full path)>.sock`, under the first
+/// of `bases` that yields a path which fits; `None` if none does.
+///
+/// Hashing the *full* path keeps the property the long path had — one socket
+/// per (home, topic) — and lets every process that can compute the long path
+/// find the short one. The `wires-<uid>` directory is created `0700` by
+/// [`ControlSocket::bind`] (which refuses one it cannot make private), so a
+/// shared `/tmp` does not open the socket to other users.
+pub fn short_socket_path(full: &Path, uid: u32, bases: &[PathBuf]) -> Option<PathBuf> {
+    let mut hasher = library::OutputHasher::new();
+    hasher.update(full.as_os_str().as_encoded_bytes());
+    let digest = hasher.finish().hex();
+    let name = format!("{}.sock", &digest[..SOCKET_NAME_HEX]);
+    bases
+        .iter()
+        .map(|base| base.join(format!("wires-{uid}")).join(&name))
+        .find(|path| fits_sockaddr(path))
+}
+
+/// The uid that owns `path` (the wires home), naming the fallback directory.
+#[cfg(unix)]
+fn owner_uid(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.uid())
+}
+
+/// Off unix there are no unix sockets to shorten.
+#[cfg(not(unix))]
+fn owner_uid(_path: &Path) -> Option<u32> {
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -514,10 +573,28 @@ async fn is_live(path: &Path) -> bool {
     }
 }
 
-/// Create `dir` (and parents) and set it to `0700`.
+/// Create `dir` (and parents), set it to `0700`, and check that it took.
+///
+/// The check matters for the short fallback directory under a shared `/tmp`
+/// ([`short_socket_path`]): another user could have made `wires-<uid>` first.
+/// We cannot chmod a directory we do not own, so one that is a symlink, or
+/// still open to group/other after the chmod, is refused rather than used.
 fn ensure_private_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     set_mode(dir, 0o700);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::symlink_metadata(dir)
+            .with_context(|| format!("inspecting {}", dir.display()))?;
+        if !meta.is_dir() || meta.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "the control socket directory {} is not a private (0700) directory this user \
+                 owns; remove it or set WIRES_HOME to a shorter path",
+                dir.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -656,6 +733,107 @@ mod tests {
         std::fs::create_dir_all(real.parent().unwrap()).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&real).unwrap();
         drop(listener);
+    }
+
+    #[test]
+    fn a_short_socket_path_is_stable_distinct_and_fits() {
+        let long = PathBuf::from(format!("/{}", "d".repeat(120))).join("run/abcd.sock");
+        let other = PathBuf::from(format!("/{}", "e".repeat(120))).join("run/abcd.sock");
+        let bases = [PathBuf::from("/tmp")];
+        let a = short_socket_path(&long, 501, &bases).unwrap();
+        assert_eq!(a, short_socket_path(&long, 501, &bases).unwrap());
+        assert_ne!(a, short_socket_path(&other, 501, &bases).unwrap());
+        assert!(a.starts_with("/tmp/wires-501"), "{}", a.display());
+        assert!(fits_sockaddr(&a));
+        let name = a.file_name().unwrap().to_string_lossy();
+        assert_eq!(name.len(), SOCKET_NAME_HEX + ".sock".len(), "{name}");
+        // A base that is itself too deep is skipped for the next one.
+        let deep = PathBuf::from(format!("/{}", "t".repeat(100)));
+        let b = short_socket_path(&long, 501, &[deep.clone(), PathBuf::from("/tmp")]).unwrap();
+        assert_eq!(b, a);
+        assert_eq!(short_socket_path(&long, 501, &[deep]), None);
+    }
+
+    #[test]
+    fn a_short_home_keeps_its_socket_under_the_home() {
+        let home = ScratchDir::new("keep");
+        let topic = TopicId::derive(library::NodeIdentity::from_seed([3u8; 32]).node_id(), "ops");
+        assert!(socket_path(home.path(), topic).starts_with(home.path()));
+    }
+
+    /// **Card 10.** A home deep enough that `<home>/run/<name>.sock` overflows
+    /// `sun_path` (the first live run died on this with `path must be shorter
+    /// than SUN_LEN`) still gets a control socket: a tail binds the fallback
+    /// path, and a publisher — resolving the path the same way — reaches it.
+    #[tokio::test]
+    async fn a_deep_home_falls_back_to_a_short_socket_that_publish_reaches() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = ScratchDir::new("deep");
+        let mut home = scratch.path().to_path_buf();
+        while home.as_os_str().len() < 120 {
+            home.push("nested-wires-home");
+        }
+        std::fs::create_dir_all(&home).unwrap();
+        let topic = TopicId::derive(library::NodeIdentity::from_seed([9u8; 32]).node_id(), "ops");
+        assert!(
+            !fits_sockaddr(&run_dir(&home).join("0123456789abcdef.sock")),
+            "the home must be deep enough to need the fallback"
+        );
+
+        let path = socket_path(&home, topic);
+        assert!(!path.starts_with(&home), "{}", path.display());
+        assert!(fits_sockaddr(&path), "{}", path.display());
+        assert_eq!(path, socket_path(&home, topic), "deterministic");
+
+        let socket = ControlSocket::bind(&path).await.unwrap();
+        #[cfg(unix)]
+        {
+            let dir = path.parent().unwrap();
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "the fallback directory must be private"
+            );
+        }
+        let (tx, rx) = mpsc::channel(8);
+        let tail = fake_tail(rx, 1);
+        let server = socket.spawn(tx);
+
+        let mut client = ControlClient::connect(&socket_path(&home, topic))
+            .await
+            .unwrap()
+            .expect("publish finds the tail at the fallback path");
+        assert_eq!(
+            timeout(PATIENCE, client.publish("deep"))
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        drop(client);
+        server.abort();
+        let seen = timeout(PATIENCE, tail).await.unwrap().unwrap();
+        assert_eq!(seen, ["deep"]);
+    }
+
+    /// A socket directory that is not a private directory of ours — here a
+    /// symlink, as another user could plant under a shared `/tmp` — is refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_socket_directory_is_refused() {
+        let scratch = ScratchDir::new("link");
+        let real = scratch.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = scratch.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = ControlSocket::bind(&link.join("t.sock"))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("not a private"), "{err:#}");
     }
 
     #[test]

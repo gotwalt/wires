@@ -3815,12 +3815,10 @@ mod tests {
         assert_eq!(ctx.membership.member, member.node.node_id());
         assert_eq!(ctx.name, "ops");
         assert!(ctx.ticket_peers.is_empty());
-        // The socket and the log live under the same home.
-        assert!(ctx.socket_path().starts_with(&member.home));
-        assert_eq!(
-            ctx.socket_path().file_name().unwrap().to_string_lossy(),
-            format!("{}.sock", &ctx.topic.hex()[..16])
-        );
+        // The socket is the one this home's topic resolves to (under the home,
+        // or — for a home as deep as the test sandbox's — the short fallback;
+        // `ipc`'s suite asserts both shapes).
+        assert_eq!(ctx.socket_path(), ipc::socket_path(&member.home, ctx.topic));
     }
 
     #[test]
