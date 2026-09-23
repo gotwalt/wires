@@ -166,6 +166,69 @@ If someone asks about MCP, show that the same tool works through `wires mcp`
 for clients that can't run a CLI, and say it exists only for backward
 compatibility.
 
+### 5b. The workbench calls back (push)
+
+Self-asserting on one machine: `./.scripts/demo-push.sh` (`--quiet`: about
+20 s). For the recording, add the mock CI to the workbench's `host.json`
+beside `db_query`. Copy `.scripts/fixtures/ci.sh` to the workbench and use
+its absolute path as `<ci>`:
+
+```json
+  "tools": {
+    "db_query": { … },
+    "deploy": { "command": ["<ci>", "deploy"], "allow": ["analyst"],
+                "description": "Start a CI build in the background: deploy -- build <n>. Returns at once; the result is pushed to your wires inbox." },
+    "logs":   { "command": ["<ci>", "logs"],   "allow": ["analyst"],
+                "description": "A build's log: logs -- build <n> [--tail N]." }
+  },
+  "push": { "allow": ["analyst"] }
+```
+
+Start `wires serve` with `CI_JOB_SECS=90 CI_JOBS=~/ci-jobs` in its
+environment. The build's background job runs `wires push --to
+"$WIRES_CALLER_NODE" …`, which reaches the running `serve` over its control
+socket, because the job inherits serve's `WIRES_HOME`. Let Claude Code run
+`wires inbox` as well: `--allowedTools 'Bash(wires call:*),Bash(wires inbox:*)'`.
+
+Prompt in Claude Code:
+
+> *Start build 41 with `wires call deploy -- build 41`. The CI pushes you a
+> message when it finishes: run `wires inbox --wait --timeout 10m` in the
+> background, and when it returns, read the log with `wires call logs --
+> build 41 --tail 50` and tell me which test failed and why.*
+
+```bash
+agent$ wires call deploy -- build 41                  # returns at once: started build-41
+agent$ wires inbox --wait --timeout 10m               # background command; the agent goes quiet
+# ~90 s later, on the workbench, the job runs:  wires push --to "$WIRES_CALLER_NODE" --subject build-41 -- "failed: …"
+agent$ # inbox exits:  2026-…Z  from host <wb8> (verified)  build-41  failed: test_orders_total …
+agent$ wires call logs -- build 41 --tail 50
+```
+
+> "The agent started a build and went quiet. It isn't polling. When the build
+> failed, the workbench pushed the result to the agent's key. My laptop has
+> no webhook URL and no open port, and the agent was never reachable from
+> the internet. The message names the host key that sent it, and the agent
+> checked that key when it connected. Woken, the agent reads the log from the
+> same host, and the observer sees the whole chain: deploy, then the push,
+> then the logs call, each line stamped with who."
+
+Point at `▶ … deploy build 41`, then `⇢ … "build-41" fetched`, then
+`▶ … logs build 41 --tail 50`.
+
+If the agent had been asleep (no inbox running), the push waits on the
+workbench (`⇢ … queued`), and the agent's next `wires inbox` fetches it.
+
+Pushed text is input to the model from someone else. The line names the
+verified sender so the model (and you) can tell who said it; it doesn't make
+the content trustworthy.
+
+What waiting costs, measured (`bench/push/REPORT.md`): with `--wait`, 4 turns
+and about 15k input tokens whatever the build length, and about 2 s from failure
+to the follow-up. Polling a status tool, or `wires inbox` on a loop, costs the
+same as each other and grows with the wait (28k tokens at 60 s, 39k at 300 s),
+with a reaction time of 20–180 s.
+
 ### 6. Revoke
 
 ```bash
@@ -206,3 +269,7 @@ inclusion rejected: …`.
 | **"Our MCP gateway already logs every call."** | The gateway's log belongs to whoever runs the gateway and covers only traffic routed through it; this record is written by the machine that ran the command, and a member reads it without either end's credentials. |
 | **"We already have Okta / enterprise-managed auth."** | Good, wires uses it: the host enforces your IdP's signed token, bound to the caller's key, and every reader verifies it against your IdP directly, with no wires identity service and no auth code in the CLI. |
 | **"A leaner MCP server would close the gap."** | Mostly, yes, because the token win comes from output size; a CLI gets it without rewriting anything, and wires doesn't rest on tokens anyway, it rests on reach, identity and the host-written record. |
+| **"Use webhooks."** | The laptop agent has no public endpoint; ngrok or Funnel would put one on the internet. Wires pushes to the agent's key, with nothing exposed. |
+| **"Just poll."** | Polling (status tool or inbox loop) cost 28k→39k tokens as the build went 60→300 s and reacted in 20–180 s; `inbox --wait` cost 15k flat and reacted in ~2 s (bench/push/REPORT.md). |
+| **"A2A has push."** | Through webhooks to a public URL, the same problem. |
+| **"The MCP tasks extension."** | Poll-based by design (`tasks/get`): the "just poll" row. |

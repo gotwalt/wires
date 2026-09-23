@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "channel": "ops",
+  "identity": {
+    "issuers": [
+      { "issuer": "__ISSUER__", "audiences": ["__CLIENT_ID__"] }
+    ]
+  },
+  "roles": {
+    "analyst": [ { "email": "*@example.com" } ]
+  },
+  "tools": {
+    "deploy": {
+      "description": "Start a CI build in the background: `deploy -- build <n>`. Returns at once; the result is pushed to your `wires inbox` when the build finishes.",
+      "command": ["__CI__", "deploy"],
+      "allow": ["analyst"]
+    },
+    "status": {
+      "description": "A build's state: `status -- build <n>` (running / failed).",
+      "command": ["__CI__", "status"],
+      "allow": ["analyst"]
+    },
+    "logs": {
+      "description": "A build's log: `logs -- build <n> [--tail N]` (default: last 50 lines).",
+      "command": ["__CI__", "logs"],
+      "allow": ["analyst"]
+    }
+  },
+  "push": { "allow": ["analyst"] }
+}
