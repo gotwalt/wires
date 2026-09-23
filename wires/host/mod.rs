@@ -13,6 +13,9 @@
 //! - [`transport`] — the session protocol: bind/dial, the handshake, the
 //!   credential checks and the policy call (`authorize`), exec + stdio bridge.
 //! - [`audit`] — the call records the host publishes to its channel.
+//! - [`call_log`] — the host's own signed, hash-linked log of those records,
+//!   on disk with retention (card 26a).
+//! - [`otlp`] — optional OTLP/HTTP export of that log (`audit.otlp`).
 //! - [`identity`] — the index of verified IdP claims and the per-call lookup.
 //! - [`announce`] — the host's tools, announced on the channel and sealed per
 //!   member by [`Policy::allowed_tools`](policy::Policy::allowed_tools) (card 15).
@@ -21,8 +24,10 @@
 
 pub mod announce;
 pub mod audit;
+pub mod call_log;
 pub mod config;
 pub mod identity;
+pub mod otlp;
 pub mod policy;
 pub mod push;
 pub mod serve;

@@ -46,6 +46,10 @@
 //!   pushes from this host (`wires push`; default deny, like a tool), and
 //!   `log_body` (default `false`) records each push's body on the channel, not
 //!   only its subject. Needs a `channel`.
+//! - `audit` (card 26a): `otlp` is an OTLP/HTTP collector base URL (e.g.
+//!   `http://collector:4318`); every entry of the host's call log is also
+//!   exported there as an OTLP log record (see [`otlp`](crate::host::otlp)).
+//!   Absent: no exporter. The host's own signed log is kept either way.
 //!
 //! The file becomes a [`RoleTable`] (the [`Policy`](crate::host::policy::Policy)),
 //! the exposed command map, and the [`IdpTrust`] the host verifies claims
@@ -86,6 +90,18 @@ pub(crate) struct HostConfig {
     /// Who may receive pushes from this host (card 23). Absent: nobody.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) push: Option<PushConfig>,
+    /// Where the host's call log is exported (card 26a). Absent: nowhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) audit: Option<AuditConfig>,
+}
+
+/// `audit`: optional sinks for the host's call log, beyond the log itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AuditConfig {
+    /// An OTLP/HTTP collector base URL (`/v1/logs` is appended).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) otlp: Option<String>,
 }
 
 /// `push`: which roles may receive pushes from this host, and what its call
@@ -260,7 +276,15 @@ impl HostConfig {
                 }
             }
         }
+        if let Some(url) = self.otlp_endpoint() {
+            crate::host::otlp::logs_url(url).context("audit.otlp")?;
+        }
         Ok(())
+    }
+
+    /// The OTLP/HTTP collector the call log is exported to, if any.
+    pub(crate) fn otlp_endpoint(&self) -> Option<&str> {
+        self.audit.as_ref().and_then(|a| a.otlp.as_deref())
     }
 
     /// Whether `role` is defined here or is the built-in [`MEMBER`].
@@ -665,6 +689,26 @@ mod tests {
         );
     }
 
+    /// `audit.otlp` is optional, must be an http(s) URL, and admits no other
+    /// key (card 26a).
+    #[test]
+    fn the_audit_section_names_an_otlp_endpoint() {
+        assert_eq!(HostConfig::parse(CARD).unwrap().otlp_endpoint(), None);
+        let with = HostConfig::parse(&edit(|v| {
+            v["audit"] = serde_json::json!({"otlp": "http://collector:4318"})
+        }))
+        .unwrap();
+        assert_eq!(with.otlp_endpoint(), Some("http://collector:4318"));
+        let e = err(&edit(|v| {
+            v["audit"] = serde_json::json!({"otlp": "ftp://x"})
+        }));
+        assert!(e.contains("audit.otlp"), "{e}");
+        let e = err(&edit(|v| {
+            v["audit"] = serde_json::json!({"readers": ["security"]})
+        }));
+        assert!(e.contains("unknown field `readers`"), "{e}");
+    }
+
     /// `push` parses, defaults to nobody and no bodies, and becomes the
     /// policy's push decision.
     #[test]
@@ -743,6 +787,7 @@ mod tests {
                     })
                     .collect(),
                 push: None,
+                audit: None,
             };
             config.validate().unwrap();
             let text = serde_json::to_string_pretty(&config).unwrap();

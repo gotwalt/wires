@@ -16,7 +16,7 @@ use clap::Args;
 use library::NodeId;
 
 use super::config::HostConfig;
-use super::{announce, audit, identity, push, transport};
+use super::{announce, audit, call_log, identity, otlp, push, transport};
 use crate::admin::keystore;
 use crate::caller::jwks;
 use crate::channel::context::{TopicArgs, TopicContext};
@@ -120,13 +120,20 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         a.inclusion_proof.as_deref(),
         a.inclusion_proof_file.as_deref(),
     )?;
-    let (sink, records) = match audit_ctx {
-        Some(_) => {
-            let (sink, rx) = transport::AuditSink::channel(audit::AUDIT_QUEUE);
-            (Some(sink), Some(rx))
-        }
-        None => (None, None),
+    // Card 26a: every record lands in the host's own signed log (always), is
+    // exported over OTLP when `audit.otlp` is set, and still reaches the
+    // channel publisher when there is a channel (card 27 removes that).
+    let exporter = match host.otlp_endpoint() {
+        Some(url) => Some(otlp::Exporter::spawn(url)?.0),
+        None => None,
     };
+    let log = call_log::CallLog::open(
+        &keystore::home()?.join(call_log::LOG_FILE),
+        library::NodeIdentity::from_seed(node.seed_bytes()),
+        library::Retention::default(),
+    )?;
+    let (sink, records, _tee) = call_log::start(log, exporter, audit_ctx.is_some());
+    let sink = Some(sink);
     let gate = match (&identities, &audit_ctx) {
         (Some(ids), Some(ctx)) => Some(Arc::new(identity::IdentityGate::new(
             Arc::clone(ids),
