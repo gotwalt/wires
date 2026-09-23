@@ -346,7 +346,7 @@ mod tests {
             let s = state();
             let p = email.map(who);
             let listed = allowed_services(&s, node(caller), p.as_ref());
-            for (svc, _) in &s.services {
+            for svc in s.services.keys() {
                 let got = authorize(&s, node(caller), p.as_ref(), svc);
                 let shown = listed.iter().find(|g| &g.service == svc);
                 prop_assert_eq!(got.clone().ok(), shown.map(|g| g.role.clone()));

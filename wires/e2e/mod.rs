@@ -93,6 +93,9 @@ mod directory;
 /// resident receiver, or fetched by `wires inbox` — gated and recorded.
 mod push;
 
+/// Card 27c's host side: a `host.json` v2 host decides by the signed state.
+mod services_host;
+
 /// The outer bound on any single wait here.
 ///
 /// Generous because a QUIC handshake plus a gossip join on a loaded CI machine

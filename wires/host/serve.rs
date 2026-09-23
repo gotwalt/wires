@@ -16,7 +16,8 @@ use clap::Args;
 use library::NodeId;
 
 use super::config::HostConfig;
-use super::{announce, audit, call_log, identity, otlp, push, transport};
+use super::config_v2::{AnyHostConfig, HostConfigV2};
+use super::{announce, audit, call_log, gate, identity, otlp, push, transport};
 use crate::admin::keystore;
 use crate::caller::jwks;
 use crate::channel::context::{TopicArgs, TopicContext};
@@ -78,7 +79,10 @@ pub(crate) struct ServeArgs {
 /// `serve`: load `host.json`, bind, verify every caller's fabric membership
 /// and roster inclusion, ask the host's policy, exec the invoked tool + bridge.
 pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
-    let host = HostConfig::load(&a.config)?;
+    let host = match AnyHostConfig::load(&a.config)? {
+        AnyHostConfig::V1(host) => host,
+        AnyHostConfig::V2(host) => return serve_v2(a, host).await,
+    };
     if a.check {
         print!("{}", host.summary());
         return Ok(());
@@ -196,6 +200,110 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         }
         _ => transport::serve(node, config, a.relay_url.as_deref()).await,
     }
+}
+
+/// `serve` for a `host.json` v2 (card 27): no channel. Refuses to start
+/// unless this node holds a fresh signed state that assigns every service
+/// in the file to it; then serves the session ALPN (and, with `push`, the
+/// inbox ALPN plus a local control socket for `wires push`), deciding every
+/// call by the signed state as it stands at that connection.
+async fn serve_v2(a: ServeArgs, config: HostConfigV2) -> anyhow::Result<()> {
+    if a.check {
+        print!("{}", config.summary());
+        return Ok(());
+    }
+    init_logging();
+    let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
+    let membership = keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?;
+    let home = keystore::home()?;
+    let mut host = services_host(
+        node.node_id(),
+        membership,
+        Arc::new(keystore::Keystore::resolve()?),
+        &home,
+        config,
+    )?;
+    let state = host.preflight(crate::now_unix())?;
+    tracing::info!(
+        state_version = state.state.version.0,
+        services = host.config.services.len(),
+        "signed state assigns every host.json service to this host"
+    );
+    let exporter = match host.config.audit.as_ref().and_then(|a| a.otlp.as_deref()) {
+        Some(url) => Some(otlp::Exporter::spawn(url)?.0),
+        None => None,
+    };
+    let log = call_log::CallLog::open(
+        &home.join(call_log::LOG_FILE),
+        library::NodeIdentity::from_seed(node.seed_bytes()),
+        library::Retention::default(),
+    )?;
+    let (sink, _, _tee) = call_log::start(log, exporter, false);
+    host.audit = Some(sink);
+    let host = Arc::new(host);
+    let push = host.config.push.is_some().then(|| {
+        Arc::new(
+            push::PushHost::from_state(Arc::clone(&host))
+                .persisted_queue(home.join(push::QUEUE_FILE)),
+        )
+    });
+    let endpoint = transport::bind(&node, a.relay_url.as_deref()).await?;
+    let _router = services_router(endpoint, Arc::clone(&host), push.clone());
+    match push {
+        Some(push) => {
+            let socket =
+                crate::channel::ipc::ControlSocket::bind(&push::host_socket(&home)).await?;
+            let (commands_tx, commands) = tokio::sync::mpsc::channel(16);
+            // `wires push` is the only request this socket answers.
+            let (publish_tx, _publish_rx) = tokio::sync::mpsc::channel(1);
+            let _control = socket.spawn_with(publish_tx, Some(commands_tx));
+            tokio::select! {
+                () = push.run(commands) => Ok(()),
+                r = tokio::signal::ctrl_c() => r.context("waiting for ctrl-c"),
+            }
+        }
+        None => tokio::signal::ctrl_c().await.context("waiting for ctrl-c"),
+    }
+}
+
+/// A v2 host for `me` (before its call log is attached): its identity
+/// verifier trusts exactly `config`'s issuers, caching JWKS under `home`.
+pub(crate) fn services_host(
+    me: NodeId,
+    membership: library::Membership,
+    keystore: Arc<keystore::Keystore>,
+    home: &Path,
+    config: HostConfigV2,
+) -> anyhow::Result<gate::ServicesHost> {
+    let fetcher = jwks::KeyFetcher::new(Some(home.join("jwks")))?;
+    let identities = Arc::new(identity::Identities::new(fetcher, config.identity.trust()));
+    Ok(gate::ServicesHost {
+        me,
+        trust_root: membership.fabric,
+        membership,
+        keystore,
+        config,
+        identities,
+        audit: None,
+    })
+}
+
+/// Serve a v2 host on `endpoint`: the session ALPN, plus the inbox ALPN when
+/// it pushes (and push's direct deliveries dial from this endpoint). Keep
+/// the router alive for as long as the host serves.
+pub(crate) fn services_router(
+    endpoint: iroh::Endpoint,
+    host: Arc<gate::ServicesHost>,
+    push: Option<Arc<push::PushHost>>,
+) -> iroh::protocol::Router {
+    let mut builder = iroh::protocol::Router::builder(endpoint.clone())
+        .accept(transport::ALPN, transport::ServicesProtocol(host));
+    if let Some(push) = push {
+        push.attach(endpoint);
+        builder = builder.accept(library::INBOX_ALPN, push::PushFetch(push));
+    }
+    tracing::info!("serving services (host.json v2)");
+    builder.spawn()
 }
 
 /// The host's identity index, verifying claims under `host.json`'s

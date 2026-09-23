@@ -10,8 +10,9 @@
 //! - [`serve`] — `wires serve host.json` / `--check`: credentials, the channel.
 //! - [`config`] — `host.json`: parsing, validation, the `--check` summary.
 //! - [`config_v2`] — card 27's `host.json` v2 (services it implements, local
-//!   trust, `also_require`), beside v1 until lane 27c switches `serve`.
-//! - [`gate`] — card 27's call gate over the signed state (27c stub).
+//!   trust, `also_require`); `serve` picks v1 or v2 by the file's `version`.
+//! - [`gate`] — card 27's call gate over the signed state, and the
+//!   [`ServicesHost`](gate::ServicesHost) a v2 host decides with.
 //! - [`policy`] — the [`Policy`](policy::Policy) seam and v1's role table.
 //! - [`transport`] — the session protocol: bind/dial, the handshake, the
 //!   credential checks and the policy call (`authorize`), exec + stdio bridge.

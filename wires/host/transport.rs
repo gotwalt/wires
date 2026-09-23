@@ -691,23 +691,46 @@ where
         cmd.env("WIRES_ROSTER_VERSION", v.to_string());
     }
     cmd.env("WIRES_TOOL", tool.as_str());
+    bridge_child(send, recv, cmd, program, shutdown, || {
+        // audit: started — the tool and the *caller's* arguments (not the
+        // tool's fixed argv).
+        crate::host::audit::CallAudit::start(
+            config.audit.as_ref(),
+            caller,
+            principal,
+            tool.clone(),
+            invocation.argv.as_slice(),
+            roster_version,
+            role.map(String::from),
+        )
+    })
+    .await
+}
+
+/// Spawn `cmd` (`program` names it in errors) with piped stdio, emit the
+/// call's `Started` record via `start_audit`, and bridge the child's stdio
+/// over the session until it exits (or kill it when `shutdown` says the
+/// dialer is gone), then send its [`Frame::Exit`]. The ack has already been
+/// written. Shared by the v1 and the services (v2) sessions.
+async fn bridge_child<S, R>(
+    send: S,
+    mut recv: R,
+    mut cmd: Command,
+    program: &str,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+    start_audit: impl FnOnce() -> Option<crate::host::audit::CallAudit>,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+{
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {program}"))?;
-    // audit: started — the tool and the *caller's* arguments (not the tool's
-    // fixed argv).
-    let audit = crate::host::audit::CallAudit::start(
-        config.audit.as_ref(),
-        caller,
-        principal,
-        tool.clone(),
-        invocation.argv.as_slice(),
-        roster_version,
-        role.map(String::from),
-    );
+    let audit = start_audit();
     let mut child_stdin = child.stdin.take().context("child stdin")?;
     let stdin_tap = crate::host::audit::tap_stdin(audit.as_ref());
     let child_stdout = crate::host::audit::tap_stdout(
@@ -912,6 +935,215 @@ fn roster_gate(
     )
     .map_err(|e| anyhow!("roster inclusion rejected: {e}"))?;
     Ok(Some(head.version.0))
+}
+
+// ---------------------------------------------------------------------------
+// Responder, services era (card 27: `host.json` v2, `Hello`)
+// ---------------------------------------------------------------------------
+
+/// Denial reason for a v1 [`Frame::Handshake`] sent to a v2 host.
+pub const DENY_HELLO_REQUIRED: &str =
+    "this host serves services (host.json v2): the caller must open with Hello (upgrade wires)";
+
+/// The session ALPN for a v2 host, as a router protocol (see
+/// [`serve_services_session`]).
+#[derive(Clone, Debug)]
+pub(crate) struct ServicesProtocol(pub(crate) Arc<crate::host::gate::ServicesHost>);
+
+impl iroh::protocol::ProtocolHandler for ServicesProtocol {
+    async fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+        let caller = to_node_id(&conn.remote_id());
+        tracing::info!(caller = %caller.hex(), "connection accepted (iroh-authenticated)");
+        let result = async {
+            let (send, recv) = conn.accept_bi().await.context("accepting bi-stream")?;
+            let closed = conn.clone();
+            serve_services_session(send, recv, caller, &self.0, async move {
+                closed.closed().await;
+            })
+            .await
+        }
+        .await;
+        // As in `serve_connection`: let the dialer read a `Denied` before the
+        // connection is torn down.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
+        result.map_err(|e| {
+            tracing::warn!("connection rejected or failed: {e:#}");
+            iroh::protocol::AcceptError::from_boxed(e.into())
+        })
+    }
+}
+
+/// Refuse `caller`: record it in the call log and send the reason.
+async fn refuse<W: AsyncWrite + Unpin>(
+    send: &mut W,
+    audit: Option<&AuditSink>,
+    caller: NodeId,
+    tool: Option<ToolName>,
+    reason: String,
+) -> anyhow::Error {
+    crate::host::audit::denied(audit, caller, tool, &reason); // audit: denied
+    deny(send, reason.clone()).await;
+    anyhow!(reason)
+}
+
+/// The v2 responder over an authenticated bi-stream: read the
+/// [`Frame::Hello`] and the [`Frame::Invoke`], then decide by **this host's**
+/// signed state (re-read now, so a removal applies on the next dial): the
+/// caller's membership credential, its ID token (verified under
+/// `identity.issuers`, bound to `caller`), then
+/// [`gate::admit`](crate::host::gate::admit) — member → registered and
+/// assigned here → registry role → `also_require`. Only then is the service
+/// looked up in `host.json`. A refusal is a [`Frame::Denied`] plus a call-log
+/// record.
+///
+/// Admitted: a [`Frame::HelloAck`] carrying this host's membership and state
+/// version, plus the state itself when the caller's copy is older (the
+/// cheapest pull), then the service's command with the caller's argv
+/// appended (never a shell), in its `cwd` with its `env`, and the
+/// server-derived `WIRES_*` variables.
+pub(crate) async fn serve_services_session<S, R>(
+    mut send: S,
+    mut recv: R,
+    caller: NodeId,
+    host: &crate::host::gate::ServicesHost,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let audit = host.audit.as_ref();
+    let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut recv))
+        .await
+        .context("timed out waiting for hello")??;
+    let hello = match first {
+        Some(Frame::Hello(hello)) => hello,
+        Some(Frame::Handshake { .. }) => {
+            return Err(refuse(&mut send, audit, caller, None, DENY_HELLO_REQUIRED.into()).await);
+        }
+        Some(_) => {
+            let reason = "first frame was not a hello".to_string();
+            return Err(refuse(&mut send, audit, caller, None, reason).await);
+        }
+        None => {
+            let reason = "connection closed before hello".to_string();
+            return Err(refuse(&mut send, audit, caller, None, reason).await);
+        }
+    };
+    let invocation = match read_invocation(&mut recv).await {
+        Ok(invocation) => invocation,
+        Err(e) => {
+            let _ = refuse(&mut send, audit, caller, None, DENY_INVOKE_REQUIRED.into()).await;
+            return Err(e.context(DENY_INVOKE_REQUIRED));
+        }
+    };
+    let tool = invocation.tool.clone();
+    let service = library::ServiceName::from(tool.clone());
+    let now = crate::now_unix();
+
+    let state = match host.state() {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::warn!("signed state unusable: {e:#}");
+            let reason = "responder configuration error".to_string();
+            return Err(refuse(&mut send, audit, caller, Some(tool), reason).await);
+        }
+    };
+    if let Err(e) = check_inclusion(&hello.membership, host.trust_root, caller, now) {
+        let reason = format!("membership rejected: {e}");
+        return Err(refuse(&mut send, audit, caller, Some(tool), reason).await);
+    }
+    let (principal, missing) = host.principal(caller, hello.id_token.as_ref(), now).await;
+    let admitted = match host.decide(
+        &state,
+        caller,
+        principal.as_ref(),
+        missing.as_deref(),
+        &service,
+        now,
+    ) {
+        Ok(admitted) => admitted,
+        Err(reason) => return Err(refuse(&mut send, audit, caller, Some(tool), reason).await),
+    };
+    // Only an admitted caller learns whether this host implements it.
+    let Some(svc) = host.config.services.get(&service) else {
+        let reason = format!("service {service} is not implemented on this host");
+        return Err(refuse(&mut send, audit, caller, Some(tool), reason).await);
+    };
+    let version = admitted.state_version;
+    if hello.state_version > version {
+        // The caller saw a newer state than ours; we still decide by ours
+        // (lane 27a's pull catches this host up).
+        tracing::info!(
+            caller = %caller.hex(),
+            theirs = hello.state_version.0,
+            ours = version.0,
+            "caller holds a newer signed state"
+        );
+    }
+    tracing::info!(
+        caller = %caller.hex(),
+        service = %service,
+        role = %admitted.role,
+        state_version = version.0,
+        "session accepted"
+    );
+    write_frame(
+        &mut send,
+        &Frame::HelloAck(library::HelloAck {
+            membership: host.membership.clone(),
+            state_version: version,
+            newer_state: (hello.state_version < version).then(|| state.clone()),
+        }),
+    )
+    .await?;
+
+    let (program, fixed) = svc
+        .command
+        .split_first()
+        .ok_or_else(|| anyhow!("empty service command"))?;
+    let mut cmd = Command::new(program);
+    cmd.args(fixed).args(invocation.argv.as_slice());
+    if let Some(cwd) = &svc.cwd {
+        cmd.current_dir(cwd);
+    }
+    // Scrub every inherited `WIRES_*`, then the service's own env, then the
+    // server-derived values (which always win; `host.json` can't set them).
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("WIRES_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.envs(&svc.env)
+        .env("WIRES_CALLER_NODE", caller.hex())
+        .env("WIRES_FABRIC_ROOT", host.trust_root.hex())
+        .env(
+            "WIRES_MEMBERSHIP_NOT_AFTER",
+            hello.membership.not_after.to_string(),
+        )
+        .env("WIRES_STATE_VERSION", version.0.to_string())
+        .env("WIRES_SERVICE", service.as_str())
+        .env("WIRES_TOOL", tool.as_str())
+        .env("WIRES_ROLE", admitted.role.as_str());
+    if let Some(email) = principal.as_ref().and_then(|p| p.email.as_deref()) {
+        cmd.env("WIRES_CALLER_EMAIL", email);
+    }
+    let role = admitted.role;
+    bridge_child(send, recv, cmd, program, shutdown, || {
+        crate::host::audit::CallAudit::start(
+            audit,
+            caller,
+            principal,
+            tool,
+            invocation.argv.as_slice(),
+            Some(version.0),
+            Some(role.as_str().to_string()),
+        )
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------

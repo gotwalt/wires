@@ -108,6 +108,33 @@ impl Identities {
         verdict
     }
 
+    /// Verify the ID token `node` presented in its session `Hello` (card
+    /// 27) and record the verdict. The iroh-authenticated key presented it
+    /// itself, so the nonce binding to `node` is the whole proof; there is no
+    /// envelope sender to compare.
+    pub(crate) async fn verify_token(
+        &self,
+        node: NodeId,
+        id_token: &library::IdToken,
+        now: i64,
+    ) -> Verdict {
+        let claim = IdentityClaim {
+            node,
+            id_token: id_token.clone(),
+        };
+        let verdict = self
+            .fetcher
+            .verify(
+                &claim,
+                &self.trust.issuers,
+                self.trust.audiences_for_claim(&claim),
+                now,
+            )
+            .await;
+        self.record(node, &verdict);
+        verdict
+    }
+
     /// The synchronous half of [`observe`](Self::observe): fold one verdict
     /// about `node` into the index.
     ///
