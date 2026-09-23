@@ -1,5 +1,7 @@
 # Rust Crate Layout for Bazel + Gazelle
 
+> **Archived 2026-09-22.** Superseded by CLAUDE.md: packages are flat with hand-written `# gazelle:ignore` BUILD files, so the gazelle_rust sub-package scheme below no longer applies.
+
 ## Problem
 
 `gazelle_rust` scans for `.rs` files and generates BUILD files in every directory
