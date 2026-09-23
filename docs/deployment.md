@@ -210,10 +210,9 @@ Three layers, most-self-contained first:
 For a private / air-gapped cluster, prefer **`--addr` + a self-hosted relay**
 so nothing depends on n0.
 
-Grants are minted out-of-band with `wires grant` (paste the subject node id) or
-`wires pair` (the requester announces itself over an authenticated channel and
-the operator consents); distribute the resulting ticket to the agent (e.g. as a
-`Secret` in its namespace).
+Grants are minted out-of-band with `wires grant` (paste the subject node id);
+distribute the resulting ticket to the agent (e.g. as a `Secret` in its
+namespace).
 
 ## Provisioning and rotation
 
