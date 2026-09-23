@@ -57,7 +57,7 @@ The IdP is *bound* at the caller (`login`), *enforced* at the host (`host.json`)
 | [08](doing/08-demo-two-machine.md) | E | 07 | Real run: laptop ↔ workbench over relay, Claude Code as the agent, recording |
 | [10](review/10-live-run-fixes.md) | G | 01–04 | Live-run fixes: stdin in call records, quiet stderr, short control-socket path |
 | [11](done/11-camera-blockers.md) | H | 04, 05, 07 | Camera blockers: 20 s audit stall after login, Safari callback error, `tools add --topic-ticket` |
-| [12](backlog/12-roles-and-tree.md) | R | 11 | Organize by role: 4-role CLI (`advanced` for plumbing), role folders, drop single-command serve/connect + old demos |
+| [12](done/12-roles-and-tree.md) | R | 11 | Organize by role: 4-role CLI (`advanced` for plumbing), role folders, drop single-command serve/connect + old demos |
 | [13](backlog/13-host-json-policy.md) | P | 12 | `host.json`: tools + IdP roles + default deny; `Policy` seam for org rules later |
 | [14](backlog/14-invite-join.md) | O | 12 | `init` / `invite` / `join` / `remove`; re-key distributed over the channel |
 | [15](backlog/15-channel-directory.md) | D2 | 12, 13 | Hosts announce tools on the channel; callers resolve by name — one invite is the only out-of-band step |
