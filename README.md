@@ -8,10 +8,10 @@
 
 ## The demo
 
-> **Status: in progress.** The flags below are being built now (see
-> [the board](docs/board/README.md)); the self-asserting script lands as
-> `.scripts/demo-remote-cli.sh`. Until then, [What runs today](#what-runs-today)
-> lists the demos that pass on this tree.
+> **Status:** this whole story runs on one machine, self-asserting, as
+> `./.scripts/demo-remote-cli.sh` (see [What runs today](#what-runs-today)),
+> with a local stand-in IdP. The two-machine run with real Google sign-in is
+> [card 08](docs/board/README.md#lanes).
 
 1. **workbench** exposes one read-only SQL CLI and puts every call on the
    `ops` channel:
@@ -111,19 +111,30 @@ restarts anything.
 
 ## What runs today
 
-Four unattended scripts stand up the working parts on loopback, each in a
+Five unattended scripts stand up the working parts on loopback, each in a
 fresh `mktemp -d` that never touches `~/.config/wires`. Each asserts its own
 result, so a green run is a passing test, not a screenshot. All take
 `--quiet` (assertions only) and `--keep` (leave the state dir).
 
 ```bash
-bazel build //wires
+bazel build //wires //wires:wires_dev
+./.scripts/demo-remote-cli.sh     # the demo above: IdP-gated remote SQL, every call on the channel
 ./.scripts/demo-mcp.sh            # a stdio MCP server on "another machine", dialed by key
 ./.scripts/demo-revoke.sh         # one roster commit → the same dial dies, nothing restarted
 ./.scripts/demo-topic.sh          # two members on one encrypted channel, nobody in the middle
 ./.scripts/demo-topic-revoke.sh   # cut one member out mid-conversation
 ```
 
+- **`demo-remote-cli.sh`** (~1 min narrated, ~8 s with `--quiet`): the
+  [demo](#the-demo) end to end. An observer with no key to either end sees
+  the IdP identity verified, then `▶`/`■` naming the caller's email and its
+  SQL for `wires call` (args and stdin) and `wires mcp` calls. A caller with
+  no identity is refused, `.shell id` is refused by `sqlite3 -safe`, and after
+  one roster commit the next call exits `77` with zero bytes out. Each refusal
+  shows up on the channel, and the responder never restarts. The IdP is a
+  loopback mock that only the dev build (`//wires:wires_dev`) contains.
+  `--with-claude` adds a headless `claude -p` turn through `wires mcp`. It is
+  opt-in because it needs auth and costs money.
 - **`demo-mcp.sh`** (~7 s): an unmodified stdio MCP server behind
   `wires serve`, reached with `wires connect`. The tool answers with the
   *caller's* node id, which it learned from the responder's environment
@@ -142,8 +153,6 @@ bazel build //wires
 
 The recording is `demo-revoke.sh` as-is (the remote-CLI demo will replace it);
 to re-record: `asciinema rec -c ./.scripts/demo-revoke.sh demo.cast && agg demo.cast docs/demo-revoke.gif`.
-
-<!-- card 07: .scripts/demo-remote-cli.sh goes here — one line + what it asserts. -->
 
 ## The channel the calls land on
 

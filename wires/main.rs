@@ -43,8 +43,11 @@ mod transport;
 #[cfg(test)]
 mod e2e;
 
-/// A hermetic OIDC issuer for the `wires login` tests (card 04).
-#[cfg(test)]
+/// A hermetic OIDC issuer for the `wires login` tests (card 04), also served
+/// by the dev-only `//wires:wires_dev` build (`wires dev-mock-idp`) for
+/// `.scripts/demo-remote-cli.sh`. Never compiled into the shipped `//wires`.
+#[cfg(any(test, feature = "dev-mock-idp"))]
+#[cfg_attr(not(test), allow(dead_code))]
 mod mock_idp;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -106,6 +109,31 @@ enum Command {
     /// Sign in with your IdP (OIDC), binding this node's key to your identity;
     /// with `--topic`, publish the claim for every reader to verify.
     Login(login::LoginArgs),
+    /// Dev build only: run the hermetic mock OIDC issuer on a loopback port
+    /// until killed. Prints `issuer <url>` and `client_id <id>` on stdout.
+    #[cfg(feature = "dev-mock-idp")]
+    #[command(hide = true)]
+    DevMockIdp(DevMockIdpArgs),
+}
+
+/// `dev-mock-idp` arguments (dev build only).
+#[cfg(feature = "dev-mock-idp")]
+#[derive(Args)]
+struct DevMockIdpArgs {
+    /// The email every sign-in resolves to.
+    #[arg(long)]
+    email: String,
+}
+
+/// `dev-mock-idp`: serve [`mock_idp::MockIdp`] until the process is killed.
+#[cfg(feature = "dev-mock-idp")]
+async fn dev_mock_idp_cmd(a: DevMockIdpArgs) -> anyhow::Result<()> {
+    let idp = mock_idp::MockIdp::start(&a.email).await;
+    println!("issuer {}", idp.issuer.as_str());
+    println!("client_id {}", idp.client_id);
+    std::io::stdout().flush()?;
+    std::future::pending::<()>().await;
+    Ok(())
 }
 
 /// `keygen` arguments: optional seeds to re-derive, and whether to persist.
@@ -1012,6 +1040,12 @@ fn main() {
                 exit_with(e);
             }
         }
+        #[cfg(feature = "dev-mock-idp")]
+        Command::DevMockIdp(a) => {
+            if let Err(e) = runtime().block_on(dev_mock_idp_cmd(a)) {
+                exit_with(e);
+            }
+        }
     }
 }
 
@@ -1063,6 +1097,8 @@ fn cli_admin(command: Command) -> Result<String, String> {
         | Command::Login(_) => {
             unreachable!("handled in main")
         }
+        #[cfg(feature = "dev-mock-idp")]
+        Command::DevMockIdp(_) => unreachable!("handled in main"),
     }
 }
 
