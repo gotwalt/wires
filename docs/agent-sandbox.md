@@ -19,7 +19,7 @@ before the tool name). A permission rule scoped to one tool,
 `Bash(wires call gh:*)`, still matches a shaped call. The flags never reach
 the host. The host's call record holds exactly what ran there. A tool's own
 filter flags, such as `gh … --jq`, are part of argv, so they are recorded.
-`wires tools list` and every `wires mcp` tool description tell the model this.
+Every `wires mcp` tool description tells the model this.
 
 ## What `Bash(wires call:*)` does and doesn't prevent
 
@@ -82,7 +82,7 @@ In order of how much it relies on Claude Code's command parser:
    `Bash` tool: `--tools=` (plus `ToolSearch` if tool search is wanted) and
    `--allowedTools=mcp__wires`, with `wires mcp` in the MCP config and
    `WIRES_LOCKED=1` in that server's `env`. The permission surface is then
-   exactly the tools your channel's hosts let you run, as with any MCP
+   exactly the services the signed state lets you call, as with any MCP
    server. The `jq` / `head` / `max_bytes` fields give it the same
    in-process filtering as `wires call`. The benchmark measured the CLI path
    (arm 5), not this one; see `bench/REPORT.md`.
@@ -96,9 +96,9 @@ In order of how much it relies on Claude Code's command parser:
      `export` under this rule);
    - `$WIRES_HOME/tools.json` owned by the operator and read-only to the
      agent's user, optionally with `"locked": true` in it so the lock holds
-     even if the environment is lost. `wires` still writes its own cache
-     (`directory.json`, the channel log) under `$WIRES_HOME`, so only the
-     config and credential files need to be read-only.
+     even if the environment is lost. `wires` still writes its own state
+     (`state.json`, `last-good.json`, `inbox/`) under `$WIRES_HOME`, so
+     only the config and credential files need to be read-only.
 
    There, `cat` and friends don't exist: a probe showed Claude Code refuses
    absolute-path binaries like `/bin/cat`, and a bare `cat` would just fail
@@ -116,8 +116,7 @@ In order of how much it relies on Claude Code's command parser:
 
 Without the lock, the agent controls **`wires call`'s own flags** under any
 `Bash(wires call…)` rule: `--tools-file`, `--node-seed`, `--node-seed-file`,
-`--membership`, `--membership-file`, `--inclusion-proof`,
-`--inclusion-proof-file` and `--relay-url`. With them it could point the
+`--membership`, `--membership-file` and `--relay-url`. With them it could point the
 caller at another tools map or relay, present another key, or feed a local
 file in as a credential (an unlocked `--tools-file canary.txt` reads the
 file: `wires: parsing canary.txt: …`).
@@ -141,7 +140,7 @@ or a heredoc (bash and zsh use either a temp file or a pipe for heredocs), so
 the lock refuses stdin data as a whole. The cost: a heredoc of the model's own
 text (`<<'EOF' select … EOF`) is refused too, so a locked agent passes SQL as
 an argument (`wires call db_query -- 'select …'`), which is also what the MCP
-schema and `wires tools` teach. On the MCP path, `stdin` is a string inside
+schema teaches. On the MCP path, `stdin` is a string inside
 the client's JSON-RPC request, the model's own text; `wires mcp` never reads
 a file for it, so nothing local can ride along, and MCP clients that send SQL
 that way keep working. Operators whose tools genuinely need piped input set
@@ -157,7 +156,6 @@ binary with an empty scratch `WIRES_HOME`, so nothing was dialed).** Raw rows:
 | `--tools-file canary.txt` | honored (file parsed) | **refused** by wires |
 | `--node-seed <hex>` · `--node-seed-file canary.txt` | honored | **refused** by wires |
 | `--membership AAAA` · `--membership-file canary.txt` | honored | **refused** by wires |
-| `--inclusion-proof AAAA` · `--inclusion-proof-file canary.txt` | honored | **refused** by wires |
 | `--relay-url https://relay.invalid` (before the tool) | honored | **refused** by wires |
 | `--jq . --head 1 --max-bytes 64` | accepted | accepted |
 | `-- api x < canary.txt` | forwarded | **refused** by wires |
@@ -177,10 +175,10 @@ argv. The lock guards `call`, `mcp` and `inbox` only: keep the permission
 rules at `wires call` and `wires inbox` (not `Bash(wires:*)`), because `wires
 tools add`, `join` and `login` write under `$WIRES_HOME`. And a locked caller
 is still a caller-side setting: the host authenticates the node key and
-enforces `host.json` on every call either way.
+decides every call by its signed state either way.
 
 **`wires inbox` (card 23).** Locked, it refuses the same credential flags
-(`--node-seed*`, `--membership*`, `--inclusion-proof*`, `--relay-url`) with
+(`--node-seed*`, `--membership*`, `--relay-url`) with
 the same message and exit 2; `--wait`, `--timeout` and `--json` are
 accepted. It reads no stdin. Allow it with `Bash(wires inbox:*)` beside the
 call rule. What it prints is a host's words, so each line starts with the

@@ -53,8 +53,6 @@ pub const OVERRIDE_FLAGS: &[&str] = &[
     "--node-seed-file",
     "--membership",
     "--membership-file",
-    "--inclusion-proof",
-    "--inclusion-proof-file",
     "--relay-url",
 ];
 
@@ -182,8 +180,6 @@ fn overrides(creds: &CredArgs) -> Vec<&'static str> {
         node_seed_file,
         membership,
         membership_file,
-        inclusion_proof,
-        inclusion_proof_file,
         relay_url,
     } = creds;
     let set = [
@@ -192,8 +188,6 @@ fn overrides(creds: &CredArgs) -> Vec<&'static str> {
         node_seed_file.is_some(),
         membership.is_some(),
         membership_file.is_some(),
-        inclusion_proof.is_some(),
-        inclusion_proof_file.is_some(),
         relay_url.is_some(),
     ];
     OVERRIDE_FLAGS

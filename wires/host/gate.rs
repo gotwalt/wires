@@ -34,9 +34,8 @@ use library::{
 
 use crate::admin::keystore::Keystore;
 use crate::caller::jwks::VerifyError;
-use crate::channel::idp_view::principal_name;
 use crate::host::config_v2::HostConfigV2;
-use crate::host::identity::Identities;
+use crate::host::identity::{Identities, principal_name};
 use crate::host::transport::AuditSink;
 
 /// A call the gate admitted.
@@ -306,7 +305,12 @@ impl ServicesHost {
             now,
         )
         .map_err(|r| match missing {
-            Some(why) if r.needs_identity() => format!("{why}; {r}"),
+            Some(why) if r.needs_identity() => {
+                // Both say "run `wires login`"; say it once.
+                let r = r.to_string();
+                let r = r.strip_suffix("; run `wires login`").unwrap_or(&r);
+                format!("{why}; {r}")
+            }
             _ => r.to_string(),
         })
     }

@@ -1,48 +1,49 @@
 //! The host pushes to callers (board card 23): `wires push --to <node|role>
-//! --subject S -- body`, queued per recipient, delivered by key, recorded.
+//! --subject S -- body`, queued per recipient, delivered by key, logged.
 //!
 //! # Sending
 //!
-//! `wires push` is host-local: it hands a [`PushSpec`] to the resident
-//! `wires serve` over its control socket (the same single-allocator path the
-//! call records take), and prints the [`PushReport`]. A tool can address its
-//! own caller: the host puts the verified caller's id in each tool's
-//! environment as `WIRES_CALLER_NODE`, so a tool that starts background work
-//! can later run `wires push --to "$WIRES_CALLER_NODE" …`.
+//! `wires push` is host-local: it hands a [`PushSpec`] to the running `wires
+//! serve` over its control socket ([`host_socket`],
+//! [`control`](crate::host::control)), and prints the [`PushReport`]. A
+//! service can address its own caller: the host puts the verified caller's id
+//! in each service's environment as `WIRES_CALLER_NODE`, so a service that
+//! starts background work can later run `wires push --to "$WIRES_CALLER_NODE" …`.
 //!
 //! # Who may receive
 //!
-//! `host.json`'s `push.allow` (default deny), asked of the host's
-//! [`Policy`](crate::host::policy::Policy) **at send, at delivery and at
-//! fetch** — each time with the recipient's verified identity as it stands
-//! then — and only for nodes the channel's **current roster** holds (the
-//! same [`CurrentRoster`](crate::host::announce::CurrentRoster) the
-//! announcer seals to; a fetch additionally passes the session's own
-//! membership and roster gate). A removed member gets nothing: its queue is
-//! dropped (recorded `denied`), and its fetch is refused on the channel.
+//! The host's **signed state** decides, asked **at send, at delivery and at
+//! fetch** ([`ServicesHost::decide_push`]): the recipient must be a member of
+//! the current state, in a registry role that `host.json`'s `push.allow`
+//! names (default: nobody). A removed member gets nothing: its queue is
+//! dropped (logged `denied`), and its fetch is refused.
 //!
-//! A `host.json` v2 host (card 27) asks its **signed state** instead
-//! ([`ServicesHost::decide_push`]): the recipient must be a member of it, in
-//! a registry role that v2's `push.allow` names, with the identity it last
-//! verified as in a `Hello` to this host. Its `wires push` socket is
-//! [`host_socket`] (there is no channel).
+//! **The identity rule.** `push.allow: ["member"]` needs no identity. Any
+//! other role needs the recipient's verified principal, and a host only knows
+//! the principals that were presented *to it*: the ID token in a call's
+//! `Hello`, or in an inbox fetch's `Hello` (`wires inbox` always sends the
+//! token `wires login` stored). So a caller who has logged in is reachable
+//! by role once it has called this host **or** run `wires inbox` since the
+//! host started; `--to <role>` names exactly those members. Nothing about
+//! identities is broadcast, so a host never learns of a member that has not
+//! spoken to it.
 //!
 //! # Delivery
 //!
 //! Each message joins its recipient's queue ([`Queue`]: at most
 //! [`QUEUE_PER_RECIPIENT`], oldest dropped first; TTL [`DEFAULT_TTL`], at most
-//! [`MAX_TTL`]), and the host dials the recipient's resident receiver by key
-//! at once (relay allowed; [`DIRECT_BUDGET`]). If that fails, the message
-//! waits for the recipient's next `wires inbox` fetch, which this host
-//! serves on the inbox ALPN ([`PushFetch`]), holding the stream open up to
-//! [`FETCH_WAIT_MAX`] for a long poll. Each attempt is at least once; the
-//! recipient de-duplicates by id, and only an acknowledged message leaves
-//! the queue. The queue is kept in `$WIRES_HOME/push-queue.json` (`0600`), so
-//! a host restart loses nothing.
+//! [`MAX_TTL`]), and the host dials the recipient by key at once (relay
+//! allowed; [`DIRECT_BUDGET`]) — a `wires inbox --wait` in progress accepts
+//! it. If that fails, the message waits for the recipient's next `wires
+//! inbox` fetch, which this host serves on the inbox ALPN ([`PushFetch`]),
+//! holding the stream open up to [`FETCH_WAIT_MAX`] for a long poll. Each
+//! attempt is at least once; the recipient de-duplicates by id, and only an
+//! acknowledged message leaves the queue. The queue is kept in
+//! `$WIRES_HOME/push-queue.json` (`0600`), so a host restart loses nothing.
 //!
 //! # Records
 //!
-//! Every milestone is an [`AuditRecord::Push`] on the host's channel —
+//! Every milestone is an [`AuditRecord::Push`] in the host's call log —
 //! `queued`, `delivered`, `fetched`, `expired`, `dropped`, `denied` — with
 //! the subject, and the body only under `"push": {"log_body": true}`.
 
@@ -64,13 +65,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use super::announce::RosterView;
 use super::gate::ServicesHost;
-use super::identity::{Identities, IdentityGate};
-use super::policy::RoleName;
-use super::transport::{self, AuditSink, ServeConfig};
-use crate::admin::commit::Ttl;
-use crate::admin::keystore::Keystore;
+use super::transport::{self, AuditSink};
+use crate::admin::ttl::Ttl;
 use crate::caller::inbox::{deny, read_frame, write_frame};
 
 /// How long a push waits for its recipient when `--ttl` isn't given.
@@ -103,10 +100,10 @@ pub(crate) const QUEUE_FILE: &str = "push-queue.json";
 // The request and its answer (the control socket's `push` operation)
 // ---------------------------------------------------------------------------
 
-/// What `wires push` asks the resident host to send.
+/// What `wires push` asks the running host to send.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PushSpec {
-    /// A node id (64 hex) or a role name (`host.json`'s roles, or `member`).
+    /// A node id (64 hex) or a role name (from the signed state, or `member`).
     pub(crate) to: String,
     /// One line.
     pub(crate) subject: Subject,
@@ -288,18 +285,14 @@ impl Queue {
 // The service
 // ---------------------------------------------------------------------------
 
-/// A host's push service: the queue, the policy checks, direct delivery, and
-/// the fetch side of the inbox ALPN. Shared (`Arc`) by the control socket's
+/// A host's push service: the queue, the checks, direct delivery, and the
+/// fetch side of the inbox ALPN. Shared (`Arc`) by the control socket's
 /// commands, the fetch handler and the expiry sweep.
 pub(crate) struct PushHost {
     /// This host.
     me: NodeId,
-    /// Who decides who may receive.
-    authority: Authority,
-    /// The verified identities (for `--to <role>`).
-    identities: Arc<Identities>,
-    /// Where the host's own proof is re-read from (for its `Hello`).
-    keystore: Option<Arc<Keystore>>,
+    /// Who decides who may receive: the host's signed state.
+    host: Arc<ServicesHost>,
     /// `push.log_body`.
     log_body: bool,
     /// The queues.
@@ -312,24 +305,6 @@ pub(crate) struct PushHost {
     endpoint: OnceLock<Endpoint>,
 }
 
-/// Who decides who may receive: a v1 host asks its channel's roster and
-/// `host.json` roles; a v2 host (card 27) asks its signed state and the
-/// registry roles in `push.allow`.
-enum Authority {
-    /// v1 (`host.json` version 1, with a channel).
-    Roster {
-        /// The host's session config: trust root, head source, policy,
-        /// identity gate, audit sink, own membership.
-        serve: Arc<ServeConfig>,
-        /// Who the channel's current roster holds.
-        roster: RosterView,
-        /// The per-call identity lookup.
-        gate: Option<Arc<IdentityGate>>,
-    },
-    /// v2 (`host.json` version 2): the signed state decides.
-    State(Arc<ServicesHost>),
-}
-
 impl std::fmt::Debug for PushHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PushHost")
@@ -340,46 +315,13 @@ impl std::fmt::Debug for PushHost {
 }
 
 impl PushHost {
-    /// A push service for the host `me` serving `serve`.
-    pub(crate) fn new(
-        me: NodeId,
-        serve: Arc<ServeConfig>,
-        roster: RosterView,
-        identities: Arc<Identities>,
-        log_body: bool,
-    ) -> Self {
-        let gate = serve.identity.clone();
-        Self::with_authority(
-            me,
-            Authority::Roster {
-                serve,
-                roster,
-                gate,
-            },
-            identities,
-            log_body,
-        )
-    }
-
-    /// A push service for the v2 host `host` (card 27): recipients are
-    /// members of its signed state in a registry role `push.allow` names.
+    /// A push service for `host`: recipients are members of its signed
+    /// state in a registry role `push.allow` names.
     pub(crate) fn from_state(host: Arc<ServicesHost>) -> Self {
-        let identities = Arc::clone(&host.identities);
         let log_body = host.config.push.as_ref().is_some_and(|p| p.log_body);
-        Self::with_authority(host.me, Authority::State(host), identities, log_body)
-    }
-
-    fn with_authority(
-        me: NodeId,
-        authority: Authority,
-        identities: Arc<Identities>,
-        log_body: bool,
-    ) -> Self {
         Self {
-            me,
-            authority,
-            identities,
-            keystore: None,
+            me: host.me,
+            host,
             log_body,
             queue: Mutex::new(Queue::default()),
             path: None,
@@ -388,16 +330,7 @@ impl PushHost {
         }
     }
 
-    /// Persist the queue at `path` (loading what is there), and present the
-    /// proof in `keystore` when dialing receivers.
-    pub(crate) fn persisted(self, path: PathBuf, keystore: Arc<Keystore>) -> Self {
-        let mut me = self.persisted_queue(path);
-        me.keystore = Some(keystore);
-        me
-    }
-
-    /// Persist the queue at `path` (loading what is there); a v2 host has
-    /// no proof to present.
+    /// Persist the queue at `path` (loading what is there).
     pub(crate) fn persisted_queue(mut self, path: PathBuf) -> Self {
         match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Queue>(&text) {
@@ -420,10 +353,7 @@ impl PushHost {
 
     /// Where records go.
     fn audit(&self) -> Option<&AuditSink> {
-        match &self.authority {
-            Authority::Roster { serve, .. } => serve.audit.as_ref(),
-            Authority::State(host) => host.audit.as_ref(),
-        }
+        self.host.audit.as_ref()
     }
 
     /// Record one milestone of `entry` in the call log.
@@ -471,99 +401,37 @@ impl PushHost {
         out
     }
 
-    /// Whether `node` may receive from this host at `now`: in the current
-    /// roster (v2: the signed state), and admitted by `push.allow` with its
-    /// identity as it stands. `Ok` names the principal and role; `Err` the
-    /// reason, and whether it is membership (not the push rule) that refused.
+    /// Whether `node` may receive from this host at `now`: a member of the
+    /// current signed state, admitted by `push.allow` with its identity as
+    /// it stands. `Ok` names the principal and role; `Err` the reason, and
+    /// whether it is membership (not the push rule) that refused.
     pub(crate) fn authorize(
         &self,
         node: NodeId,
         now: i64,
     ) -> std::result::Result<(Option<Principal>, Option<String>), (String, bool)> {
-        let (serve, roster, gate) = match &self.authority {
-            Authority::State(host) => {
-                return host
-                    .decide_push(node, now)
-                    .map(|(p, role)| (p, Some(role.as_str().to_string())));
-            }
-            Authority::Roster {
-                serve,
-                roster,
-                gate,
-            } => (serve, roster, gate),
-        };
-        if !roster(now).admits(node) {
-            return Err((
-                format!(
-                    "{} is not in the channel's current roster",
-                    &node.hex()[..8]
-                ),
-                true,
-            ));
-        }
-        let (principal, missing) = match gate.as_deref().map(|g| g.resolve(node, now)) {
-            Some(Ok(p)) => (Some(p), None),
-            Some(Err(why)) => (None, Some(why)),
-            None => (None, None),
-        };
-        let d = serve.policy.decide_push(principal.as_ref(), node);
-        if d.allow {
-            return Ok((principal, d.role.map(|r| r.as_str().to_string())));
-        }
-        Err((
-            match missing {
-                Some(why) => format!("{why}; {}", d.reason),
-                None => d.reason,
-            },
-            false,
-        ))
+        self.host
+            .decide_push(node, now)
+            .map(|(p, role)| (p, Some(role.as_str().to_string())))
     }
 
-    /// The recipients `to` names at `now`: a node id, or every node with a
-    /// verified identity in that role (plus, for `member`, every node the
-    /// current roster's directory lists).
+    /// The recipients `to` names at `now`: a node id, or every member in that
+    /// role (`member`: every member; any other role: the members whose
+    /// verified identity this host holds and the role admits).
     fn recipients(&self, to: &str, now: i64) -> Result<Vec<NodeId>> {
         if to.len() == 64
             && let Ok(node) = NodeId::from_hex(to)
         {
             return Ok(vec![node]);
         }
-        let role = RoleName::new(to)
+        let role = library::RoleName::new(to)
             .map_err(|_| anyhow!("--to {to:?} is neither a node id (64 hex) nor a role name"))?;
-        let (serve, roster, gate) = match &self.authority {
-            Authority::State(host) => {
-                let role = library::RoleName::new(to).map_err(|_| anyhow!("bad role {to:?}"))?;
-                let nodes = host.push_recipients(&role, now);
-                if nodes.is_empty() {
-                    bail!("no member with a verified identity is in role {role} right now");
-                }
-                return Ok(nodes);
-            }
-            Authority::Roster {
-                serve,
-                roster,
-                gate,
-            } => (serve, roster, gate),
-        };
-        let mut nodes: Vec<NodeId> = self
-            .identities
-            .nodes()
-            .into_iter()
-            .filter(|n| *n != self.me)
-            .filter(|n| {
-                let p = gate.as_deref().and_then(|g| g.resolve(*n, now).ok());
-                serve.policy.in_role(&role, p.as_ref())
-            })
-            .collect();
-        if role.is_member()
-            && let super::announce::CurrentRoster::Members(members) = roster(now)
-        {
-            nodes.extend(members.into_iter().filter(|n| *n != self.me));
-        }
-        nodes.sort();
-        nodes.dedup();
+        let nodes = self.host.push_recipients(&role, now);
         if nodes.is_empty() {
-            bail!("no member with a verified identity is in role {role} right now");
+            bail!(
+                "no member with a verified identity is in role {role} right now (a member's \
+                 identity reaches this host when it calls here or runs `wires inbox`)"
+            );
         }
         Ok(nodes)
     }
@@ -666,10 +534,11 @@ impl PushHost {
         Ok(report)
     }
 
-    /// Dial `to`'s resident receiver and hand it what is queued for it (one
-    /// batch). Returns the ids it acknowledged, which leave the queue and are
-    /// recorded `delivered`. Re-checks authorization first: a recipient the
-    /// roster no longer holds loses its queue (recorded `denied`).
+    /// Dial `to`'s receiver (a `wires inbox --wait` in progress) and hand it
+    /// what is queued for it (one batch). Returns the ids it acknowledged,
+    /// which leave the queue and are recorded `delivered`. Re-checks
+    /// authorization first: a recipient the signed state no longer holds
+    /// loses its queue (recorded `denied`).
     pub(crate) async fn deliver_direct(&self, to: NodeId) -> Result<Vec<PushId>> {
         let now = crate::now_unix();
         if let Err((reason, roster)) = self.authorize(to, now) {
@@ -717,42 +586,11 @@ impl PushHost {
         Ok(gone.into_iter().map(|e| e.message.id).collect())
     }
 
-    /// This host's `Hello`: its membership and current proof.
+    /// This host's `Hello`: its membership (a host presents no ID token).
     fn hello(&self) -> InboxFrame {
-        match &self.authority {
-            Authority::Roster { serve, .. } => InboxFrame::Hello {
-                membership: serve.membership.clone(),
-                proof: self
-                    .keystore
-                    .as_ref()
-                    .and_then(|ks| ks.read_inclusion_proof().ok().flatten())
-                    .or_else(|| serve.proof.clone()),
-            },
-            Authority::State(host) => InboxFrame::Hello {
-                membership: host.membership.clone(),
-                proof: None,
-            },
-        }
-    }
-
-    /// The credential check a fetch passes before the push rule: v1, the
-    /// session's membership and roster gate; v2, the membership credential
-    /// (membership of the signed state is in [`authorize`](Self::authorize)).
-    fn check_fetcher(
-        &self,
-        membership: &library::Membership,
-        proof: Option<&library::InclusionProof>,
-        caller: NodeId,
-        now: i64,
-    ) -> Result<()> {
-        match &self.authority {
-            Authority::Roster { serve, .. } => {
-                transport::check_member(serve, membership, proof, caller, now).map(|_| ())
-            }
-            Authority::State(host) => {
-                library::check_inclusion(membership, host.trust_root, caller, now)
-                    .map_err(|e| anyhow!("membership rejected: {e}"))
-            }
+        InboxFrame::Hello {
+            membership: self.host.membership.clone(),
+            id_token: None,
         }
     }
 
@@ -768,8 +606,11 @@ impl PushHost {
         S: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
     {
-        let (membership, proof) = match read_frame(&mut recv, FRAME_TIMEOUT).await? {
-            Some(InboxFrame::Hello { membership, proof }) => (membership, proof),
+        let (membership, id_token) = match read_frame(&mut recv, FRAME_TIMEOUT).await? {
+            Some(InboxFrame::Hello {
+                membership,
+                id_token,
+            }) => (membership, id_token),
             _ => {
                 deny(&mut send, "expected hello").await;
                 bail!("a fetcher spoke out of turn");
@@ -783,16 +624,26 @@ impl PushHost {
             }
         };
         let now = crate::now_unix();
-        let refusal = match self.check_fetcher(&membership, proof.as_ref(), caller, now) {
+        let credential = library::check_inclusion(&membership, self.host.trust_root, caller, now)
+            .map_err(|e| anyhow!("membership rejected: {e}"));
+        // The fetcher's ID token (from `wires login`) is how this host learns
+        // who it is, and so its roles: verified and indexed before the push
+        // rule is asked.
+        if credential.is_ok()
+            && let Some(token) = &id_token
+        {
+            let _ = self.host.identities.verify_token(caller, token, now).await;
+        }
+        let refusal = match credential {
             Err(e) => Some((format!("{e:#}"), true)),
-            Ok(_) => self.authorize(caller, now).err(),
+            Ok(()) => self.authorize(caller, now).err(),
         };
         if let Some((reason, roster)) = refusal {
             let reason = format!("inbox fetch refused: {reason}");
             // A credential refusal (not a member, removed) is recorded like a
-            // refused call. A policy one is only answered: a member's resident
-            // receiver asks every host now and then, and a host it may not
-            // hear from would otherwise log it every time.
+            // refused call. A policy one is only answered: `wires inbox` asks
+            // every host of the member's services, and a host it may not hear
+            // from would otherwise log it every time.
             if roster {
                 crate::host::audit::denied(self.audit(), caller, None, &reason);
                 for e in self.with_queue(|q| q.purge(caller)) {
@@ -905,22 +756,20 @@ fn now_ms() -> i64 {
 /// `wires push --to <node|role> --subject S [--ttl D] [-- body…]`.
 #[derive(Args, Clone, Debug)]
 pub(crate) struct PushArgs {
-    /// Who receives it: a node id (a tool's `$WIRES_CALLER_NODE` is its
-    /// caller's), or a role from host.json (every member with a verified
-    /// identity in it right now; `member` for every member).
+    /// Who receives it: a node id (a service's `$WIRES_CALLER_NODE` is its
+    /// caller's), or a role from the signed state (every member whose
+    /// verified identity this host holds and the role admits; `member` for
+    /// every member).
     #[arg(long)]
     pub(crate) to: String,
-    /// One line, recorded on the channel (the body is not, unless host.json
-    /// says `"push": {"log_body": true}`).
+    /// One line, recorded in the host's call log (the body is not, unless
+    /// host.json says `"push": {"log_body": true}`).
     #[arg(long)]
     pub(crate) subject: String,
     /// How long the host keeps it for a recipient that isn't listening
     /// (e.g. `90m`, `2d`; default 24h, at most 7d).
     #[arg(long)]
     pub(crate) ttl: Option<Ttl>,
-    /// The channel of the host that sends it (default: the joined channel).
-    #[arg(long)]
-    pub(crate) channel: Option<String>,
     /// The body. Read from stdin when none is given (and stdin isn't a
     /// terminal).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -948,31 +797,12 @@ pub(crate) async fn push_cmd(a: PushArgs) -> Result<i32> {
         body,
         ttl_secs: a.ttl.map(|t| t.duration().as_secs()),
     };
-    // A v2 host (card 27) has no channel: its `serve` listens on the host
-    // socket.
-    if a.channel.is_none()
-        && let Some(mut client) = crate::channel::ipc::ControlClient::connect(&host_socket(
-            &crate::admin::keystore::home()?,
-        ))
-        .await?
-    {
-        return report(client.push(spec).await?);
-    }
-    let args = crate::channel::context::TopicArgs {
-        topic: a.channel.unwrap_or_default(),
-        ..Default::default()
-    };
-    let ctx = crate::channel::context::TopicContext::resolve(
-        Arc::new(Keystore::resolve()?),
-        crate::admin::keystore::home()?,
-        &args,
-    )?;
-    let Some(mut client) = crate::channel::ipc::ControlClient::connect(&ctx.socket_path()).await?
-    else {
+    let socket = host_socket(&crate::admin::keystore::home()?);
+    let Some(mut client) = crate::host::control::ControlClient::connect(&socket).await? else {
         bail!(
-            "no `wires serve` is running for channel {:?} on this machine (`wires push` hands \
-             the message to it)",
-            ctx.name
+            "no `wires serve` is running on this machine (`wires push` hands the message to it; \
+             looked for {})",
+            socket.display()
         );
     };
     report(client.push(spec).await?)
@@ -988,11 +818,11 @@ fn report(report: PushReport) -> Result<i32> {
     })
 }
 
-/// The control socket a v2 host's `serve` answers `wires push` on:
+/// The control socket a host's `serve` answers `wires push` on:
 /// `$WIRES_HOME/run/serve.sock`, or a short stand-in when that path is too
 /// long to bind.
 pub(crate) fn host_socket(home: &std::path::Path) -> PathBuf {
-    use crate::channel::ipc::{fits_sockaddr, run_dir, short_socket_path};
+    use crate::host::control::{fits_sockaddr, run_dir, short_socket_path};
     let full = run_dir(home).join("serve.sock");
     if fits_sockaddr(&full) {
         return full;

@@ -17,27 +17,27 @@ Three things organizations are now asking for sit in that gap:
 
 ## What Wires is
 
-> **Run a CLI on another machine from your agent. The machine is reached by public key, never by network path; the caller is authenticated by your IdP; and every call lands on an encrypted channel that anyone you authorize can watch, without access to the caller or the machine running the CLI.**
+> **Run a CLI on another machine from your agent, by service name. The machine is reached by public key, never by network path; the caller is authenticated by your IdP and checked against an admin-signed list of who may call what; and the machine that ran each call keeps a signed record of it that the people you name can read, without access to the caller or the machine.**
 
 There are four roles, each with a few commands:
 
-- **Admin** (`init`, `invite`, `remove`): decides who's in.
-- **Host** (`wires serve host.json`): decides what runs and who may run it. One file lists the exposed CLIs, the trusted identity providers, and which roles may use which tool; everything else is denied.
-- **Caller** (`join`, `login`, `tools`, `call`, `inbox`): the agent. `wires login` binds the person's Google/Okta sign-in to the agent's key once. `wires tools` shows only the tools that person may use.
-- **Observer** (`watch`): sees every call, refusal and identity as it happens, and holds neither end's credentials.
+- **Admin** (`init`, `invite`, `remove`, `role`, `service`): signs one versioned document that says who's in, which roles exist (matched on IdP identity), which services exist, which hosts run each one, and who may call and read each. It is pushed to the machines by key.
+- **Host** (`wires serve host.json`): implements the services assigned to it. One file says how each runs, which identity providers it trusts, and any stricter local rule; it checks every call against the signed list.
+- **Caller** (`join`, `login`, `services`, `call`, `inbox`): the agent. `wires login` binds the person's Google/Okta sign-in to the agent's key once. `wires services` shows only the services that person may call; the caller never names a machine, and a service can have several hosts.
+- **Reader** (`watch`): a member the admin allows to read a service's records sees every call and refusal from the hosts' own logs, holding neither end's credentials. Everyone else sees only their own calls.
 
-`wires mcp` exists only so clients that can't run a command can still use the same tools. **The product is the CLI.**
+`wires mcp` exists only so clients that can't run a command can still use the same services. **The product is the CLI.**
 
 ## What's been demonstrated (two machines, 2026-09-23)
 
 A laptop and a Linux workstation, reached by key through public relays:
 
 - The host had **no TCP listener and no opened firewall port**. Unauthenticated peers are refused at the handshake.
-- Before signing in, the agent saw no tools, and calling one by name was refused with the reason. After a real Google sign-in, the observer verified the identity **itself**, and the tool appeared.
-- A Claude Code session in locked mode, whose PATH held `wires` plus the system basics and which was only allowed to run `wires call` and `wires tools`, found the tool, queried a remote database and answered correctly. The observer logged each query under the person's email and role.
+- Before signing in, the agent saw no tools, and calling one by name was refused with the reason. After a real Google sign-in, the tool appeared.
+- A Claude Code session in locked mode, whose PATH held `wires` plus the system basics and which was only allowed to run `wires call` and the tool listing, found the tool, queried a remote database and answered correctly. Each query was logged under the person's email and role.
 - `wires remove` cut the agent off at once, with no restart and no manual key rotation anywhere, and the refusal was on the log.
 
-On one machine so far (the self-checking demo script), a host **pushed** a message back to the agent that called it ("build 41 failed") with no endpoint on the agent's side. The agent read it with `wires inbox`, a plain command any agent can run, including after being offline when it was sent. The two-machine run of push is next.
+That run used the earlier design, where hosts published records to a shared encrypted channel. The current one (services in an admin-signed registry, records kept by each host) passes the same self-checking demo on one machine, plus: a service with two hosts that keeps answering when one is down, a reader who sees every call while the agent sees only its own, and a host **pushing** a message back to the agent that called it ("build 41 failed") with no endpoint on the agent's side, read with `wires inbox`. The two-machine run of this version is next.
 
 ## What's been measured
 
@@ -53,17 +53,17 @@ Most of the saving is **not** tool descriptions (Claude Code's tool search alrea
 ## Why it's built this way
 
 - **Reached by key.** Tailscale-style networks give the agent's machine a route to the host; Wires gives a route to one allowlisted CLI and nothing else.
-- **Identity is the IdP's own signature**, tied to the agent's key, and checked by the host and every reader. No Wires-run identity service exists to trust.
-- **The host writes the log**, signed and hash-linked, so the agent can't forge it and the observer needs nothing from either end.
+- **Identity is the IdP's own signature**, tied to the agent's key and checked by the host. No Wires-run identity service exists to trust.
+- **One signed list, checked locally.** Who's in, the roles and the services are one admin-signed document every machine holds. Hosts decide each call from it with no auth server; callers list what they may call from it. Only the admin can bind a service name to a host.
+- **The host writes the log**, signed and hash-linked, so the agent can't forge it, and a reader the admin names needs nothing from either end. Nothing is broadcast: a record leaves a host only when an allowed reader asks.
 - **A sandbox that allows only `wires`** gives CLI efficiency with a permission surface as narrow as MCP's. We tested this: a permission rule alone isn't airtight (the agent can still run `cat`, read files, and pass `wires`' own override flags), so `WIRES_LOCKED=1` makes `wires` refuse those flags itself.
 
 ## Honest limits
 
 - **Joining an organization is still a hand-issued invite.** Joining by domain ("`wires join acmecorp.com`") is an open question, not yet designed.
-- **Removing someone reveals the remaining member list to them**; memberships expire after 30 days and don't renew yet.
-- **Open question:** whether the shared encrypted channel belongs in the core, or whether hosts should emit identity-stamped telemetry (OTel) directly. It turns on whether cross-organization audit or push to offline agents is the product. See [card 22](board/done/22-gossip-role-OPEN.md).
-- **Any member can currently offer a tool under any name.** An admin-approved host list would close this.
+- **Every member holds the whole signed list** (member keys, roles, service names). It is signed, not secret. Memberships and the list expire after 30 days and don't renew yet.
+- **A host can withhold or truncate its own log.** Tampering and gaps are detectable only against a copy a reader holds (an OTel export, or a witness: [card 09](board/backlog/09-witness.md)).
 
 ## The next step
 
-Show the two-machine demo to someone who builds MCP and note which part lands: **verified identity on every call**, **CLI efficiency without a shell**, **push to agents without an endpoint**, or **a log the host can't rewrite**. That answer decides card 22 and what gets built next.
+Show the two-machine demo to someone who builds MCP and note which part lands: **verified identity on every call**, **CLI efficiency without a shell**, **push to agents without an endpoint**, or **a log the host can't rewrite**. That answer decides what gets built next.

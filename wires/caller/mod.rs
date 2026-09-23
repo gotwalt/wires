@@ -1,27 +1,26 @@
 //! The **caller** role: an agent or a person running remote CLIs.
 //!
-//! The caller binds its node key to an IdP identity (`wires login`), finds
-//! remote CLIs by name on its channel (`wires tools`), and runs them (`wires
-//! call`, the CLI-native path; `wires mcp`, the stdio MCP adapter kept for clients that
-//! only speak MCP).
+//! The caller binds its node key to an IdP identity (`wires login`), lists
+//! the services the signed state lets it call (`wires services`), and runs
+//! them by name (`wires call`, the CLI-native path; `wires mcp`, the stdio
+//! MCP adapter kept for clients that only speak MCP).
 //!
 //! - [`call`] — dial a tool and bridge stdio; the exit code is the remote one.
 //! - [`shape`] — `--jq` / `--head` / `--max-bytes`: output shaping, in-process.
 //! - [`inbox`] — `wires inbox`: what hosts pushed to this caller (card 23),
-//!   fetched or received by a resident `wires watch`.
+//!   fetched from the hosts of its services, or received while `--wait`s.
 //! - [`lock`] — locked mode: `WIRES_LOCKED=1` refuses the override flags so a
 //!   sandboxed agent can't steer `call`/`mcp` off the operator's config.
 //! - [`mcp`] — the same calls as MCP tools over stdio (backward compatibility).
-//! - [`resolve`] — the channel is the directory: hosts' announcements, cached
-//!   in `directory.json`, resolve a name to a host (card 15).
-//! - [`tools`] — `wires tools`, and `tools.json`: local aliases (name → host).
+//! - [`tools`] — `tools.json`: locked mode, and local aliases (name → one
+//!   host, with address hints).
 //! - [`login`] — OIDC sign-in, nonce-bound to this node's key.
 //! - [`jwks`] — issuer discovery and key fetching for ID-token verification.
 //! - `mock_idp` — a hermetic OIDC issuer (tests and the dev build only).
 //! - [`services`] — `wires services`: what this caller may call, evaluated
-//!   locally (card 27).
-//! - [`pick`] — service name → host, with failover (card 27).
-//! - [`hello`] — the caller's card-27 handshake frame.
+//!   locally.
+//! - [`pick`] — service name → host, with failover; the local dial hints.
+//! - [`hello`] — the caller's session `Hello`.
 //! - [`join`] — `wires id` and `wires join <token>` (card 14; every role
 //!   joins this way, the host and the observer included).
 
@@ -40,7 +39,6 @@ pub mod mcp;
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod mock_idp;
 pub mod pick;
-pub mod resolve;
 pub mod services;
 pub mod shape;
 pub mod tools;

@@ -1,19 +1,13 @@
 {
-  "version": 1,
-  "channel": "ops",
+  "version": 2,
   "identity": {
     "issuers": [
       { "issuer": "__ISSUER__", "audiences": ["__CLIENT_ID__"] }
     ]
   },
-  "roles": {
-    "analyst": [ { "email": "*@example.com" } ]
-  },
-  "tools": {
-    "db_query": {
-      "description": "Read-only SQL (sqlite3) over the workbench's orders.db; pass the SQL statement as the argument.",
-      "command": ["sqlite3", "-safe", "-readonly", "-header", "-column", "orders.db"],
-      "allow": ["analyst"]
+  "services": {
+    "orders-db": {
+      "command": ["sqlite3", "-safe", "-readonly", "-header", "-column", "orders.db"]
     }
   },
   "push": { "allow": ["analyst"] }

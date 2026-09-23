@@ -1,6 +1,6 @@
 //! Canonical-JSON codec (internal).
 //!
-//! Memberships and roster heads are signed over — and tokens are
+//! Memberships and signed states are signed over — and tokens are
 //! base64-encoded from — a *canonical* JSON encoding: object keys sorted recursively, with no
 //! insignificant whitespace. Canonicalization makes the byte string
 //! deterministic across re-serialization, which is what makes signing and

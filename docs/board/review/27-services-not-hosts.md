@@ -44,10 +44,10 @@ The gossip mesh and topic node; `library/channel/*` (topic, envelope, chain, adm
 
 ## Acceptance
 
-- [ ] e2e: Alice (analyst) sees `orders-db` in `wires services` and can call it; Bob (not analyst) sees nothing and is refused by name; two hosts implement `orders-db` and a call succeeds with one of them down; a non-host member can't serve `orders-db` (the host refuses to start, and callers never resolve to it); `remove alice` → her next call is refused, with no restart; `wires inbox` push still works.
-- [ ] Nothing is broadcast: a member who makes no calls receives no traffic about others' calls or services (measure it).
-- [ ] `demo-remote-cli.sh` and the push demo rewritten for services; README, `docs/demo.md`, `docs/executive-summary.md` and CLAUDE.md updated (roles table, "where each guarantee lives"). Record the before/after LOC in Notes.
-- [ ] Tests, clippy, fmt green (Cargo).
+- [x] e2e: Alice (analyst) sees `orders-db` in `wires services` and can call it; Bob (not analyst) sees nothing and is refused by name; two hosts implement `orders-db` and a call succeeds with one of them down; a non-host member can't serve `orders-db` (the host refuses to start, and callers never resolve to it); `remove alice` → her next call is refused, with no restart; `wires inbox` push still works.
+- [x] Nothing is broadcast: a member who makes no calls receives no traffic about others' calls or services (measure it).
+- [x] `demo-remote-cli.sh` and the push demo rewritten for services; README, `docs/demo.md`, `docs/executive-summary.md` and CLAUDE.md updated (roles table, "where each guarantee lives"). Record the before/after LOC in Notes.
+- [x] Tests, clippy, fmt green (Cargo).
 
 ## Notes
 
@@ -80,3 +80,78 @@ The gossip mesh and topic node; `library/channel/*` (topic, envelope, chain, adm
 | **27d delete + docs** | `library/channel/*`, `library/membership/{fabric_key,rekey,roster}.rs`, the channel re-exports in `library/lib.rs`; `wires/channel/*`, `wires/host/announce.rs`, `wires/caller/resolve.rs` (after 27b), `wires/advanced.rs`; `.scripts/*`, README, `docs/*`, CLAUDE.md | anything the others still import: delete only after a/b/c merge |
 
 **Order inside the fan-out:** 27a should land `wires/state/store.rs` first (read plus CAS, about 40 lines), because 27b's listing and 27c's gate both read the stored state. Until then they can test against an in-memory `SignedState`. 27c's `authorize` unblocks 27b's `allowed_services`. `library/lib.rs` is shared by 27a, 27c and 27d: add re-exports only, as one-line diffs.
+
+### 27d delete + docs (2026-09-23)
+
+**LOC (Rust, `library/` + `wires/`):** 54,411 at 3f61cfa (a/b/c merged) and
+56,390 with 26b merged in → **25,651** after (96 → 60 files; 26b's are
+kept). Deps gone: `iroh-gossip`, `redb`,
+`x25519-dalek`, `chacha20poly1305`, `futures-core` (Cargo.lock pruned, nothing
+bumped).
+
+**Deleted:** `library/channel/*`; `library/membership/{fabric_key,rekey,roster}.rs`
+and `check_roster_inclusion`; `Frame::Handshake/HandshakeAck` (tags 0 and 5
+retired, session ALPN → `wires/session/3`); `wires/channel/*` (topic node,
+store, replay, admission watchdog, publish, the channel `watch`, peer book,
+render); `wires/host/{announce,config,policy}.rs` (v1 `host.json`, v1 roles,
+sealed announcements); `wires/caller/resolve.rs` (`directory.json`);
+`wires/admin/{commit,roster,keys,import}.rs` and `wires/advanced.rs`; the
+channel-era e2e suites (`e2e/{directory,onboard,idp,push}.rs`, the six
+money-shot tests); keystore roster-head / proof / directory / keyring /
+channel files; error variants only they used. `host.json` version 1 is refused
+with a pointer to `wires service` / `wires role`.
+
+**The committed-roster Merkle goes too.** Its point was that a member could
+prove inclusion without seeing the member set. But every member now holds the
+signed state (members, hosts, roles, registry) to evaluate `wires services`
+locally, so there is no set left to hide: a signed member list is the
+membership proof, and the host's per-connection `is_member` is the check.
+
+**Kept, moved:** the push control socket (`host/control.rs`, push only);
+`IdpTrust` + `principal_name` (`host/identity.rs`, fed only by tokens presented
+in person); `Ttl` (`admin/ttl.rs`); `tools.json` aliases (they now open with
+the same `Hello`, so an alias is "this service, on this one host, at these
+addresses" and the host still decides by its state). `Invite` v2 = membership +
+signed state + admin id. `init` / `invite` / `remove` are state edits plus a
+push.
+
+**Integration gaps closed:**
+1. `serve` registers `StateResponder` on its router (hosts answer pulls and
+   take the admin's pushes) and runs `refresh_loop`.
+2. Addressing is by key via n0 discovery. The local, unsigned override is
+   `$WIRES_HOME/hints` (`<node hex> <ip:port>…` per line); every endpoint
+   `transport::bind` makes registers it in a `MemoryLookup`, so calls, state
+   sync, push and inbox all use it. `wires serve` writes its own line to
+   `run/hint` for scripts to copy. `wires inbox` and 26b's `wires watch` take
+   hosts from the signed state.
+3. Push identity rule (documented in `host/push.rs`): `push.allow: [member]`
+   needs no identity; any other role needs the recipient's verified principal,
+   which a host learns only from tokens presented to it — a call's `Hello` or
+   an inbox fetch's `Hello` (`InboxFrame::Hello { membership, id_token }`,
+   ALPN `wires/inbox/2`). So a logged-in caller is reachable by role once it
+   has called that host or run `wires inbox`. Direct delivery lands while
+   `wires inbox --wait` runs (it serves the inbox ALPN, admitting hosts of its
+   signed state). e2e: `a_fetch_with_a_token_makes_a_caller_reachable_by_role`.
+4. `wires login` has no `--topic` (or `--peer`/`--relay-url`); scripts updated.
+
+**Also:** a service's environment gets `WIRES_HOME` (the host's home); the
+scrub of inherited `WIRES_*` had dropped it, so a service's own `wires push`
+found no running `serve`.
+
+**Acceptance evidence:** e2e `services_host` (registry decides; also_require
+narrows; an unassigned service refuses to start; removal refuses the next call
+with no restart; push by the state; reachable by role after a fetch;
+`nothing_is_broadcast_to_a_bystander` — a member that takes part in nothing is
+offered zero connections on any wires ALPN while others call, are refused,
+push and fetch); `caller::call` failover tests. The only thing every member
+receives is the admin's signed state itself (by design: it is the registry
+`wires services` evaluates). Both demos pass `--quiet`: `demo-remote-cli.sh`
+(services, refusals by name, args/stdin/MCP, sqlite `-safe`, the security
+reader's `wires watch` sees all while the agent sees only its own, push and
+inbox, failover to the spare, remove → 77) and `demo-push.sh`.
+
+**Known gap:** a host offline when the admin assigns it a service can't start
+(`serve` preflight) until it gets the new state; the admin is a one-shot CLI,
+so the demos re-issue the host's invite (`wires invite <id>` again; re-join
+never rolls back). A `wires serve` pull from the admin before preflight needs
+the admin to be reachable — left for a follow-up.

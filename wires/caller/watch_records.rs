@@ -505,11 +505,7 @@ pub(crate) async fn watch_cmd(a: WatchArgs) -> Result<i32> {
         mine: a.mine,
         follow: !a.once,
     };
-    let fabric = ks
-        .read_membership()?
-        .context("this node has no membership: run `wires join <token>` first")?
-        .fabric;
-    let hints = Hints::load(&ks, fabric);
+    let hints = Hints::load(&ks);
     let endpoint = transport::bind(&node, a.relay_url.as_deref()).await?;
     let json = a.json;
     let mut out = |o: Output| match o {
@@ -531,7 +527,7 @@ pub(crate) async fn watch_cmd(a: WatchArgs) -> Result<i32> {
 }
 
 // ---------------------------------------------------------------------------
-// Rendering (copied from the channel-era `wires watch`, which is going away)
+// Rendering (the channel-era `wires watch` line formats)
 // ---------------------------------------------------------------------------
 
 /// How many hex characters of a node id or digest a record line shows.

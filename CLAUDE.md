@@ -7,14 +7,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 "Wires" — a two-crate Rust workspace built with plain Cargo, plus a
 `Dockerfile` for a distroless image of the `wires` binary.
 
-**The current assignment (2026-09-22):** agents run CLIs on other machines.
-The machine is reached by public key, never by network path. The caller is
-authenticated by their IdP, via an ID token bound to the node key and
-published as channel metadata. Every call is recorded by the responder on an
-E2EE gossip channel that authorized observers can watch without access to
-the caller or the machine running the CLI. `wires call` is the CLI-native
-path; `wires mcp` is the stdio MCP on-ramp for clients that only speak MCP.
-The goal is a sharp demo for the MCP team.
+**The current assignment (2026-09-22, reshaped by card 27):** agents run
+CLIs on other machines, by **service name**. The machine is reached by public
+key, never by network path. One admin-signed, versioned state says who's in,
+which roles exist, which services exist, which hosts run each, and who may
+call and read each; it is pushed to members by key, and every host decides
+every call from its copy. The caller is authenticated by their IdP, via an ID
+token bound to the node key and presented in the session handshake. Every
+call is recorded by the host in its own signed, hash-linked log, which the
+readers the registry names stream with `wires watch`. Nothing is broadcast
+(there is no channel). `wires call` is the CLI-native path; `wires mcp` is
+the stdio MCP on-ramp for clients that only speak MCP. The goal is a sharp
+demo for the MCP team.
 
 **Read `docs/board/README.md` before planning any work.** It holds the pitch,
 the rebuttals it must survive, the demo target, the lanes, and the worker
@@ -24,7 +28,8 @@ rebuttal test in `docs/storytelling.md` §1.
 
 Usage lives in `README.md`. Deployment and testing patterns live in
 `docs/deployment.md` and `docs/testing.md`. The spec for the code that runs
-(roster, handshake, re-keys, channel, records) is `docs/protocol.md`. The
+(membership, the signed state and its sync, the session handshake and gate,
+push, the call log and record stream, hints) is `docs/protocol.md`. The
 non-negotiables and kill criteria are at the top of `docs/board/README.md`.
 **Git history is the archive:** outdated docs are deleted, not moved aside.
 The product summary is `docs/executive-summary.md`. The pre-restart prototype is tagged `archive/poc-2026-05`: reference
@@ -92,7 +97,7 @@ Conventions:
   the type system tells them apart.
 - **Docstrings everywhere**, with doctests wherever an example is feasible.
 - **One concept per module**; `lib.rs` re-exports the public surface; keep
-  internals `pub(crate)`/private (e.g. the `codec` module, `RosterHeadBody`).
+  internals `pub(crate)`/private (e.g. the `codec` module, `SignedBody`).
 - Run `make lint` (clippy + shellcheck) and `make fmt` before committing.
 
 Each `library` module is a worked example of the above.
@@ -112,16 +117,18 @@ host exposing CLIs needs an image that also has those CLIs.
   `wires/` (the `wires` binary, `[[bin]] path = "main.rs"`). No `src/`
   subdir; the sources are filed by role:
   - `wires/`: `main.rs` is argument parsing and dispatch only; each role owns
-    a folder with a `mod.rs` — `admin/` (keystore, the root's offline
-    commands), `host/` (`serve`, the session transport, the caller checks, IdP
-    policy, audit records, push), `caller/` (`join`, `login`, `call`, `tools`,
-    `mcp`, `inbox`), `channel/` (the topic node every role meets on, `watch`);
-    `advanced.rs` is the `wires advanced` plumbing dispatch; `e2e/` holds the
-    loopback integration tests and `testutil.rs` the shared test fixtures.
-    See `docs/board/README.md` § Roles.
-  - `library/`: `membership/`, `channel/`, `calls/` are folders only — every
+    a folder with a `mod.rs` — `admin/` (keystore, `init`/`invite`/`remove`,
+    `service`/`role` edits of the signed state, `--ttl`), `host/` (`serve`,
+    `host.json` v2, the gate over the signed state, the session transport,
+    verified identities, the call log and OTLP export, the record stream, push
+    and its control socket), `caller/` (`join`, `login`, `services`, `call`
+    with service → host failover and the local hints file, `mcp`, `inbox`,
+    `watch`), `state/` (the signed state on this node: the store, and push /
+    pull by key); `e2e/` holds the loopback integration tests and
+    `testutil.rs` the shared test fixtures. See `docs/board/README.md` § Roles.
+  - `library/`: `membership/`, `calls/`, `services/` are folders only — every
     module is declared at the crate root with `#[path]`, so public paths
-    (`library::roster`, …) and the `lib.rs` re-exports don't depend on them.
+    (`library::state`, …) and the `lib.rs` re-exports don't depend on them.
 - `.scripts/` — the self-asserting demo(s) and their fixtures; `bench/` — the
   token benchmark (card 16) and its results.
 - Rust edition 2024, toolchain 1.91.0 (`rust-toolchain.toml`).

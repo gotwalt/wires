@@ -2,11 +2,11 @@
 #
 # Provision a loopback wires pair for the benchmark's `wires` arm:
 #
-#   responder -- `wires serve host.json`, host.json exposing one tool `gh`
-#                (the local `gh`, with its own auth) to any roster member;
-#                no channel, so no audit and no IdP (card 13's member-only host)
-#   agent     -- `tools.json` entry `gh` pointing at the responder by node id
-#                + loopback address, so the agent runs `wires call gh -- …`
+#   responder -- `wires serve host.json`, implementing one service `gh` (the
+#                local `gh`, with its own auth), registered for role `member`
+#                (any member; no IdP)
+#   agent     -- the responder's hint line in its local `hints` file (loopback
+#                address by key), so the agent runs `wires call gh -- …`
 #
 # State lives under $BENCH_WIRES_DIR (default /tmp/wb16): short on purpose,
 # since macOS caps unix-socket paths at 104 bytes. Prints `export` lines for
@@ -29,25 +29,21 @@ fi
 rm -rf "$wb" "$agent"
 mkdir -p "$wb" "$agent"
 
-# The responder is also the admin (so every commit lands in its own keystore
-# with no channel round-trip); the agent makes its key and joins with the one
-# token `wires invite` prints for it.
-WIRES_HOME="$wb" "$WIRES" init --channel bench >/dev/null 2>&1
+# The responder is also the admin (so every state lands in its own keystore
+# with no round-trip); the agent makes its key and joins with the one token
+# `wires invite` prints for it.
+WIRES_HOME="$wb" "$WIRES" init >/dev/null 2>&1
+WB_ID="$(WIRES_HOME="$wb" "$WIRES" id 2>/dev/null)"
+WIRES_HOME="$wb" "$WIRES" service add gh --allow member --host "$WB_ID" \
+	--description "The GitHub CLI (gh), run on a remote machine that is already authenticated. Pass gh's arguments after --." >/dev/null 2>&1
 AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
 token="$(WIRES_HOME="$wb" "$WIRES" invite "$AG_ID" --name agent 2>/dev/null)"
 WIRES_HOME="$agent" "$WIRES" join "$token" >/dev/null
-WB_ID="$(WIRES_HOME="$wb" "$WIRES" id 2>/dev/null)"
 
 cat >"$D/host.json" <<'JSON'
 {
-  "version": 1,
-  "tools": {
-    "gh": {
-      "description": "The GitHub CLI (gh), run on this host with its own auth",
-      "command": ["gh"],
-      "allow": ["member"]
-    }
-  }
+  "version": 2,
+  "services": { "gh": { "command": ["gh"] } }
 }
 JSON
 WIRES_HOME="$wb" "$WIRES" serve --check "$D/host.json" >/dev/null
@@ -58,17 +54,18 @@ kill -0 "$(cat "$D/wb.pid")" || {
 	cat "$D/wb.err" >&2
 	exit 1
 }
-# serve logs its bound sockets (`sockets=[0.0.0.0:PORT, [::]:PORT]`); the agent
-# dials the IPv4 one on loopback, so no discovery or relay is involved.
-PORT="$(sed 's/\x1b\[[0-9;]*m//g' "$D/wb.err" | grep -oE 'sockets=\[0\.0\.0\.0:[0-9]+' | head -1 | sed 's/.*://')"
-[ -n "$PORT" ] || {
+# Addressing is by key: the responder's own hint line (its loopback
+# address) goes into the agent's local hints file, so no discovery or relay is
+# involved.
+for _ in $(seq 1 50); do
+	[ -s "$wb/run/hint" ] && break
+	sleep 0.1
+done
+cp "$wb/run/hint" "$agent/hints" || {
 	cat "$D/wb.err" >&2
-	echo "wires-up: could not read the responder's port" >&2
+	echo "wires-up: the responder wrote no hint line" >&2
 	exit 1
 }
-
-WIRES_HOME="$agent" "$WIRES" tools add gh --node "$WB_ID" --addr "127.0.0.1:$PORT" \
-	--description "The GitHub CLI (gh), run on a remote machine that is already authenticated. Pass gh's arguments after --." >/dev/null
 
 {
 	printf 'export WIRES_HOME=%q\n' "$agent"

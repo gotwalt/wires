@@ -1,32 +1,19 @@
-//! The **admin** role: holds the root key and decides who is in.
+//! The **admin** role: holds the root key and signs the state.
 //!
-//! `wires init` / `invite` / `remove` (card 14) are the whole job: start a
-//! fabric, admit a node with one token, drop one — each commit published on
-//! the channel as a re-key, so no member imports anything by hand. Under them
-//! is the offline plumbing of `wires advanced` — memberships, the committed
-//! roster, and installing what the admin hands out.
+//! The admin-signed state (card 27) is one versioned document: who is in,
+//! which members host, the role definitions, and the service registry. Every
+//! command here edits it, signs the next version, and pushes it (hosts
+//! first) — there is nothing else to distribute.
 //!
-//! - [`init`] — `wires init`: root key, node key, first commit, channel.
+//! - [`init`] — `wires init`: root key, node key, the first signed state.
 //! - [`invite`] — `wires invite` (one token per joiner) and `wires remove`.
-//! - [`commit`] — the commit both run: sign, publish the re-key, install.
-//! - [`keystore`] — the on-disk home: keys, credentials, the keyring, and the
+//! - [`service`] — `wires service add | set | rm` and `wires role set | rm`.
+//! - [`keystore`] — the on-disk home: keys, the membership, and the
 //!   flag → env → file → keystore resolution every command uses.
-//! - [`keys`] — `member`.
-//! - [`roster`] — `roster add | remove | commit | head`.
-//! - [`service`] — `wires service add | set | rm` and `wires role set | rm`:
-//!   edit the admin-signed state (card 27) and push it.
-//! - [`import`] — installing the credentials the admin hands out.
+//! - [`ttl`] — the `--ttl` / `--timeout` lifetimes.
 
-pub mod commit;
-pub mod import;
 pub mod init;
 pub mod invite;
-pub mod keys;
 pub mod keystore;
-pub mod roster;
 pub mod service;
-
-/// Render any error as a string for the admin-command error channel.
-pub(crate) fn stringify<E: std::fmt::Display>(e: E) -> String {
-    e.to_string()
-}
+pub mod ttl;

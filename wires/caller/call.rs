@@ -5,8 +5,8 @@
 //! ([`crate::caller::pick`]), and the session opens with the card-27
 //! [`Hello`](library::Hello) (membership, state version, ID token). A newer
 //! state a host hands back is adopted. An alias in `tools.json` wins over a
-//! service; with no signed state yet, the channel's host announcements (the
-//! legacy directory) still resolve names until card 27d removes them.
+//! service: it pins a name to one host (and address hints), and that host
+//! still decides by its signed state.
 //! Locked mode ([`crate::caller::lock`]) refuses the override flags a
 //! sandboxed agent could steer this with.
 //!
@@ -27,8 +27,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use library::{
-    Argv, InclusionProof, Invocation, Membership, NodeId, NodeIdentity, ServiceName, SignedState,
-    ToolName,
+    Argv, Invocation, Membership, NodeId, NodeIdentity, ServiceName, SignedState, ToolName,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -116,12 +115,10 @@ impl Dial {
     }
 }
 
-/// This node's credentials for dialing: the node key, its membership, and
-/// (for a head-enforcing responder) its inclusion proof.
+/// This node's credentials for dialing: the node key and its membership.
 pub struct Credentials {
     node: NodeIdentity,
     membership: Membership,
-    proof: Option<InclusionProof>,
     relay_override: Option<String>,
 }
 
@@ -135,20 +132,18 @@ impl Credentials {
                 a.membership.as_deref(),
                 a.membership_file.as_deref(),
             )?,
-            proof: keystore::inclusion_proof(
-                a.inclusion_proof.as_deref(),
-                a.inclusion_proof_file.as_deref(),
-            )?,
             relay_override: a.relay_url.clone(),
         })
     }
 }
 
-/// Dial `plan` with `creds` and bridge the given stdio; returns the remote
-/// exit code. A refusal surfaces as a [`transport::Denied`] error.
+/// Dial `plan` (an alias: one pinned host) with `creds` and bridge the given
+/// stdio; returns the remote exit code. The session opens with the same
+/// [`Hello`](library::Hello) a service call does, so the host still decides
+/// by its signed state. A refusal surfaces as a [`transport::Denied`] error.
 ///
-/// Runs the same local preflight as the topic commands first, so a
-/// membership issued to another node fails here, not at the responder.
+/// Runs a local preflight first, so a membership issued to another node
+/// fails here, not at the host.
 pub async fn dial<R, W, E>(
     creds: &Credentials,
     plan: Dial,
@@ -165,18 +160,22 @@ where
         .map_err(anyhow::Error::msg)?;
     let relay = creds.relay_override.clone().or(plan.relay_url);
     let target = transport::endpoint_addr(&plan.target, &plan.addrs, relay.as_deref())?;
+    let ks = Keystore::resolve()?;
+    let hello = crate::caller::hello::with_membership(&ks, creds.membership.clone())?;
     let endpoint = transport::bind(&creds.node, relay.as_deref()).await?;
-    transport::call_on(
-        endpoint,
-        target,
-        creds.membership.clone(),
-        creds.proof.clone(),
+    let done = transport::call_service_on(
+        &endpoint,
+        &[target],
+        SERVICE_DIAL_TIMEOUT,
+        hello,
         plan.invocation,
         stdin,
         stdout,
         stderr,
     )
-    .await
+    .await;
+    endpoint.close().await;
+    Ok(done?.dialed.exit)
 }
 
 /// The live [`Caller`]: dials over wires with this node's [`Credentials`].
@@ -280,7 +279,7 @@ where
     let endpoint = transport::bind(&creds.node, relay).await?;
     let dial = ServiceDial {
         endpoint: &endpoint,
-        hints: Hints::load(ks, creds.membership.fabric),
+        hints: Hints::load(ks),
         timeout: SERVICE_DIAL_TIMEOUT,
     };
     let result = call_service_with(
@@ -390,13 +389,6 @@ pub struct CredArgs {
     /// Read the membership token from this file instead of the keystore.
     #[arg(long)]
     pub membership_file: Option<PathBuf>,
-    /// The inclusion proof token to present. Falls back to
-    /// `$WIRES_INCLUSION_PROOF`, then `--inclusion-proof-file`, then the keystore.
-    #[arg(long)]
-    pub inclusion_proof: Option<String>,
-    /// Read the inclusion proof token from this file.
-    #[arg(long)]
-    pub inclusion_proof_file: Option<PathBuf>,
     /// Dial through this relay, overriding the tool entry's own.
     #[arg(long)]
     pub relay_url: Option<String>,
@@ -478,11 +470,7 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
     let route = route(&config, &a.tool, &creds)?;
     let plan = match &route {
         Route::Service { .. } => None,
-        // An alias, else (no signed state yet) the channel's announcements.
-        Route::Legacy => Some(Dial::resolve(
-            &crate::caller::resolve::resolve_tool(&config, &a.tool, &a.creds).await?,
-            argv.clone(),
-        )?),
+        Route::Alias => Some(Dial::resolve(lookup(&config, &a.tool)?, argv.clone())?),
     };
     let run = async |stdout: &mut (dyn AsyncWrite + Unpin + Send)| match (&route, plan) {
         (Route::Service { ks, state, service }, _) => {
@@ -499,8 +487,8 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
             )
             .await
         }
-        (Route::Legacy, Some(plan)) => dial(&creds, plan, stdin, stdout, tokio::io::stderr()).await,
-        (Route::Legacy, None) => unreachable!("a legacy route always has a plan"),
+        (Route::Alias, Some(plan)) => dial(&creds, plan, stdin, stdout, tokio::io::stderr()).await,
+        (Route::Alias, None) => unreachable!("an alias route always has a plan"),
     };
     if shape.is_identity() {
         return run(&mut tokio::io::stdout()).await;
@@ -529,20 +517,19 @@ enum Route {
         /// The service.
         service: ServiceName,
     },
-    /// An alias in `tools.json`, or (no signed state) the legacy directory.
-    Legacy,
+    /// An alias in `tools.json`.
+    Alias,
 }
 
-/// An alias wins; else a service registered in the stored state; else, only
-/// when this node holds no signed state yet, the legacy directory. A name the
+/// An alias wins; else a service registered in the stored state. A name the
 /// state doesn't register is an error that points at `wires services`.
 fn route(config: &ToolsConfig, name: &str, creds: &Credentials) -> Result<Route> {
     if lookup(config, name).is_ok() {
-        return Ok(Route::Legacy);
+        return Ok(Route::Alias);
     }
     let ks = Keystore::resolve()?;
     let Some(state) = stored_state(&ks, creds)? else {
-        return Ok(Route::Legacy);
+        bail!("this node holds no signed state yet: run `wires join <token>` first");
     };
     let service = ServiceName::new(name).map_err(|e| anyhow!("`{name}`: {e}"))?;
     if state.state.service(&service).is_none() {
@@ -649,7 +636,6 @@ mod tests {
     #[test]
     fn lookup_lists_known_tools_on_a_miss() {
         let config = ToolsConfig {
-            audit_topic: None,
             tools: vec![tool(
                 ToolTarget::Node {
                     node: node(),
@@ -762,41 +748,52 @@ mod tests {
         assert_eq!(code, EXIT_SHAPE);
     }
 
-    /// End to end over a loopback responder: the remote stdout is shaped
+    /// End to end over a real loopback host: the remote stdout is shaped
     /// after it arrives, and the remote exit code passes through.
     #[tokio::test]
     async fn shaping_over_a_loopback_host() {
-        use crate::host::transport::{
-            ALPN, HeadSource, ServeConfig, call_on, endpoint_addr, secret_key, serve_on,
-        };
-        use library::Membership;
-        use std::collections::BTreeMap;
+        use crate::host::config_v2::HostConfigV2;
+        use crate::host::transport::{ALPN, endpoint_addr, secret_key};
+        use library::{Hello, Membership, RoleName, Service, State, StateVersion};
 
         let root = NodeIdentity::from_seed([70; 32]);
         let server = NodeIdentity::from_seed([71; 32]);
         let client = NodeIdentity::from_seed([72; 32]);
-        let tool = |name: &str, script: &str| {
-            (
-                ToolName::new(name).unwrap(),
-                vec!["sh".into(), "-c".into(), script.into()],
-            )
-        };
-        let config = ServeConfig {
-            tools: BTreeMap::from([
-                tool(
-                    "json",
-                    r#"printf '{"items":[{"name":"é-one"},{"name":"two"},{"name":"three"}]}'"#,
-                ),
-                tool("fail", "echo 'HTTP 404'; exit 3"),
-            ]),
-            audit: None,
-            identity: None,
-            trust_root: root.node_id(),
-            head: HeadSource::None,
-            membership: Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
-            proof: None,
-            policy: std::sync::Arc::new(crate::host::policy::AnyMember),
-        };
+        let mut s = State::new(root.node_id());
+        s.version = StateVersion(1);
+        s.issued = 1;
+        s.not_after = i64::MAX;
+        s.members.extend([server.node_id(), client.node_id()]);
+        s.hosts.insert(server.node_id());
+        for name in ["json", "fail"] {
+            s.services.insert(
+                ServiceName::new(name).unwrap(),
+                Service {
+                    description: String::new(),
+                    allow: vec![RoleName::member()],
+                    hosts: vec![server.node_id()],
+                    readers: vec![],
+                },
+            );
+        }
+        let home = crate::testutil::temp_dir();
+        let ks = Keystore::at(&home);
+        crate::state::store::adopt_if_newer(&ks, &s.sign(&root).unwrap(), root.node_id(), 10)
+            .unwrap();
+        let config = HostConfigV2::parse(
+            r#"{"version":2,"services":{
+                "json":{"command":["sh","-c","printf '{\"items\":[{\"name\":\"é-one\"},{\"name\":\"two\"},{\"name\":\"three\"}]}'"]},
+                "fail":{"command":["sh","-c","echo 'HTTP 404'; exit 3"]}}}"#,
+        )
+        .unwrap();
+        let host = crate::host::serve::services_host(
+            server.node_id(),
+            Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
+            std::sync::Arc::new(ks),
+            &home,
+            config,
+        )
+        .unwrap();
         let endpoint = |id: &NodeIdentity| {
             iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .secret_key(secret_key(id))
@@ -811,16 +808,22 @@ mod tests {
             .map(|s| SocketAddr::from(([127, 0, 0, 1], s.port())))
             .collect();
         let target = endpoint_addr(&server.node_id(), &addrs, None).unwrap();
-        let srv = tokio::spawn(serve_on(server_ep, config));
+        let _router =
+            crate::host::serve::services_router(server_ep, std::sync::Arc::new(host), None);
+        let client_ep = endpoint(&client).await.unwrap();
 
         let run = async |name: &str, shape: Shape| {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
-            let remote = call_on(
-                endpoint(&client).await.unwrap(),
-                target.clone(),
-                Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap(),
-                None,
+            let remote = transport::call_service_on(
+                &client_ep,
+                std::slice::from_ref(&target),
+                SERVICE_DIAL_TIMEOUT,
+                Hello {
+                    membership: Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap(),
+                    state_version: StateVersion(1),
+                    id_token: None,
+                },
                 Invocation {
                     tool: ToolName::new(name).unwrap(),
                     argv: Argv::default(),
@@ -830,7 +833,9 @@ mod tests {
                 &mut stderr,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .dialed
+            .exit;
             let (mut out, mut err) = (Vec::new(), Vec::new());
             let code = write_shaped(&shape, remote, &stdout, &mut out, &mut err)
                 .await
@@ -853,7 +858,6 @@ mod tests {
         assert_eq!(code, 3, "remote exit code passes through: {err}");
         assert_eq!(out, "");
         assert!(err.contains("HTTP 404"), "{err}");
-        srv.abort();
     }
 
     #[test]
@@ -871,8 +875,8 @@ mod tests {
         assert!(parse(&["rg"]).args.is_empty());
     }
 
-    /// Card 27, the dial side against a minimal in-test acceptor (the host's
-    /// accept side is lane 27c): what a host answers a `Hello` with.
+    /// The dial side against a minimal in-test acceptor (the host's accept
+    /// side has its own tests): what a host answers a `Hello` with.
     #[derive(Clone)]
     #[allow(clippy::large_enum_variant)]
     enum Answer {
@@ -1002,7 +1006,6 @@ mod tests {
             creds: Credentials {
                 node: me,
                 membership,
-                proof: None,
                 relay_override: None,
             },
             root,

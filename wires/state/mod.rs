@@ -2,8 +2,8 @@
 //! kept, and how it moves between nodes.
 //!
 //! Every role reads it: the caller lists and resolves services from it, the
-//! host authorizes calls with it, the admin writes it. Only lane 27a writes
-//! these files; the other lanes call [`store::read`] and
+//! host authorizes calls with it, the admin writes it. Everything else
+//! calls [`store::read`] and
 //! [`store::adopt_if_newer`].
 //!
 //! - [`store`] — `$WIRES_HOME/state.json`: read, and adopt a newer verified

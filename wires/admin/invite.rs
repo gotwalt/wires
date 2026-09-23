@@ -1,29 +1,25 @@
 //! `wires invite` and `wires remove`: admitting and removing a member, one
 //! command each.
 //!
-//! Both are a roster edit plus [`commit_and_distribute`]: the commit is
-//! published on the channel as a re-key, so the members already in adopt it
-//! with no manual import. `invite` then bundles the new member's part into
-//! one [`Invite`] token; `remove` has nothing to hand out — the removed node
-//! is simply not in the re-key, and every host that adopts it refuses the
-//! node's next call (revocation stays immediate at every node holding the new
-//! head, as before).
+//! Both are an edit of the admin-signed state ([`edit_state`]), pushed to
+//! every member by key (hosts first). `invite` also mints the new member's
+//! membership and bundles it with the new state into one [`Invite`] token;
+//! `remove` has nothing to hand out — the removed node is simply not in the
+//! new state, and every host refuses its next call (the host re-reads its
+//! state per connection, so no restart). There is no key to rotate: nothing
+//! is encrypted to the member set.
 //!
 //! Names (`--name alice`) are the admin's local labels in `names.json`, for
 //! `wires remove alice`. They are not identity: nothing on the wire carries
 //! them.
 
-use std::path::Path;
-use std::sync::Arc;
-
 use anyhow::{Context, bail};
 use clap::Args;
-use library::{Invite, Membership, NodeId, TopicId, TopicPeer, TopicTicket};
+use library::{Invite, Membership, NodeId, SignedState};
 
-use super::commit::{Committed, Timing, Ttl, commit_and_distribute};
 use super::keystore::{self, Keystore};
-use crate::channel::peers::PeerBook;
-use crate::channel::topics;
+use super::service::edit_state;
+use super::ttl::Ttl;
 use crate::now_unix;
 
 /// `invite` arguments.
@@ -32,18 +28,14 @@ pub(crate) struct InviteArgs {
     /// The joiner's node id, hex (what `wires id` prints on the joining
     /// machine).
     pub(crate) node_id: String,
-    /// A local label for this member, for `wires remove <name>`.
+    /// A local label for this member, for `wires remove <name>` and
+    /// `wires service add --host <name>`.
     #[arg(long)]
     pub(crate) name: Option<String>,
-    /// Lifetime of the invitee's membership and of the new roster head (`30d`,
-    /// `12h`, … or seconds).
+    /// Lifetime of the invitee's membership and of the new signed state
+    /// (`30d`, `12h`, … or seconds).
     #[arg(long, default_value = Ttl::DEFAULT)]
     pub(crate) ttl: Ttl,
-    /// A channel ticket to remember as a bootstrap peer (e.g. the `share to
-    /// bootstrap:` line of a host's `wires serve`). Repeatable; remembered for
-    /// every later invite and re-key.
-    #[arg(long = "peer")]
-    pub(crate) peer: Vec<String>,
 }
 
 /// `remove` arguments.
@@ -52,7 +44,7 @@ pub(crate) struct RemoveArgs {
     /// The member to remove: a name given to `wires invite --name`, or a hex
     /// node id.
     pub(crate) member: String,
-    /// Lifetime of the new roster head (`30d`, `12h`, … or seconds).
+    /// Lifetime of the new signed state (`30d`, `12h`, … or seconds).
     #[arg(long, default_value = Ttl::DEFAULT)]
     pub(crate) ttl: Ttl,
 }
@@ -67,15 +59,10 @@ pub(crate) struct Report {
     pub(crate) notes: Vec<String>,
 }
 
-/// `invite` against the resolved keystore, publishing through a real
-/// endpoint.
+/// `invite` against the resolved keystore, then push the new state.
 pub(crate) async fn invite_cmd(a: InviteArgs) -> anyhow::Result<Report> {
-    let ks = Arc::new(Keystore::resolve()?);
-    let home = keystore::home()?;
-    let mut report = invite_in(&ks, &home, a, Timing::CLI, async |cfg| {
-        topics::TopicNode::spawn(&keystore::node_identity_in(&ks)?, cfg).await
-    })
-    .await?;
+    let ks = Keystore::resolve()?;
+    let mut report = invite_in(&ks, a)?;
     report
         .notes
         .insert(report.notes.len() - 1, push_note(&ks).await);
@@ -90,29 +77,14 @@ async fn push_note(ks: &Keystore) -> String {
     }
 }
 
-/// [`invite_cmd`] against an explicit keystore, with the one-shot node stood
-/// up by `bind` (the testable form).
-pub(crate) async fn invite_in<B>(
-    ks: &Arc<Keystore>,
-    home: &Path,
-    a: InviteArgs,
-    timing: Timing,
-    bind: B,
-) -> anyhow::Result<Report>
-where
-    B: AsyncFnOnce(topics::TopicNodeConfig) -> anyhow::Result<topics::TopicNode>,
-{
+/// [`invite_cmd`] against an explicit keystore, without the push (the
+/// testable form).
+pub(crate) fn invite_in(ks: &Keystore, a: InviteArgs) -> anyhow::Result<Report> {
     let invitee = NodeId::from_hex(a.node_id.trim())
         .context("the node id to invite (64 hex characters, as `wires id` prints it)")?;
     let root = ks
         .read_root_identity()?
         .ok_or_else(|| anyhow::anyhow!("no root key here; run `wires init` first"))?;
-    let channel = ks
-        .read_channel()?
-        .ok_or_else(|| anyhow::anyhow!("no channel here; run `wires init` first"))?;
-    let mut roster = ks
-        .read_roster()?
-        .ok_or_else(|| anyhow::anyhow!("no roster here; run `wires init` first"))?;
     let mut names = ks.read_names()?;
     if let Some(name) = &a.name {
         check_name(name)?;
@@ -125,119 +97,73 @@ where
             );
         }
     }
-
-    // Bootstrap hints: this invite's tickets join the ones remembered.
-    let topic = TopicId::derive(roster.fabric, &channel);
-    let mut book = PeerBook::open(home, topic);
-    for text in &a.peer {
-        let ticket = TopicTicket::decode(text.trim())
-            .context("--peer (is the pasted base64 ticket complete?)")?;
-        if ticket.fabric != roster.fabric || ticket.name != channel {
-            bail!(
-                "--peer: this ticket is for channel {:?} of fabric {}…, not {channel:?} of this \
-                 fabric",
-                ticket.name,
-                &ticket.fabric.hex()[..8]
-            );
-        }
-        for peer in ticket.peers {
-            book.record(peer);
-        }
-    }
-    book.save();
-
     let now = now_unix();
-    let not_after = a.ttl.not_after(now);
-    let rejoin = !roster.insert(invitee);
-    let committed = commit_and_distribute(
-        ks,
-        home,
-        &root,
-        &mut roster,
-        (!rejoin).then_some(invitee),
-        not_after,
-        timing,
-        bind,
-    )
-    .await?;
-    let entry = committed
-        .entry_for(invitee)
-        .context("the commit has no entry for the invitee")?
-        .clone();
+    let membership = Membership::mint(&root, invitee, now, a.ttl.not_after(now))?;
+    let rejoin =
+        crate::state::store::read(ks, root.node_id())?.is_some_and(|s| s.state.is_member(invitee));
+    let state = edit_state(ks, a.ttl, |s| {
+        s.members.insert(invitee);
+        Ok(())
+    })?;
     if let Some(name) = &a.name {
         names.insert(name.clone(), invitee);
         ks.save_names(&names)?;
     }
-
-    // Re-read: a one-shot distribution records the neighbors it reached.
-    let peers: Vec<TopicPeer> = PeerBook::open(home, topic)
-        .list()
-        .into_iter()
-        .filter(|p| p.node != invitee)
-        .collect();
-    let membership = Membership::mint(&root, invitee, now, not_after)?;
-    // Card 27: the invitee joins the admin-signed state, which rides in the
-    // token; the other members get it by push (`invite_cmd`).
-    let state = super::service::edit_state(ks, a.ttl, |s| {
-        s.members.insert(invitee);
-        Ok(())
-    })?;
     let token = Invite::new(
-        channel.clone(),
         membership,
-        committed.rekey.head.clone(),
-        entry,
-        peers.clone(),
+        state.clone(),
+        keystore::node_identity_in(ks)?.node_id(),
     )
-    .with_state(state, keystore::node_identity_in(ks)?.node_id())
     .encode()?;
-
-    let mut notes = vec![
+    let notes = vec![
         format!(
-            "{} {}{} (roster version {}, {} members)",
+            "{} {}{} (state version {}, {} members)",
             if rejoin { "re-invited" } else { "invited" },
             invitee.hex(),
             a.name
                 .as_deref()
                 .map(|n| format!(" as {n:?}"))
                 .unwrap_or_default(),
-            committed.rekey.head.version.0,
-            roster.members.len()
+            state.state.version.0,
+            state.state.members.len()
         ),
-        committed.told_line(),
+        format!("on the joining machine: wires join {token}"),
     ];
-    if peers.is_empty() {
-        notes.push(
-            "no bootstrap peer is known yet, so the token carries none: the joiner can still \
-             serve (and be everyone else's bootstrap) — pass its ticket to the next \
-             `wires invite --peer <ticket>`"
-                .into(),
-        );
-    }
-    notes.push(format!("on the joining machine: wires join {token}"));
     Ok(Report {
         stdout: token,
         notes,
     })
 }
 
-/// `remove` against the resolved keystore.
+/// `remove` against the resolved keystore: out of the signed state, then
+/// pushed (hosts first).
 pub(crate) async fn remove_cmd(a: RemoveArgs) -> anyhow::Result<Report> {
-    let ks = Arc::new(Keystore::resolve()?);
-    let home = keystore::home()?;
-    // Card 27: out of the signed state and pushed (hosts first) *before* the
-    // channel re-key, which can take seconds to find a neighbor.
-    let (member, _) = resolve_removal(&ks, &a.member)?;
-    let pushed = match drop_from_state(&ks, member, a.ttl)? {
-        Some(_) => Some(push_note(&ks).await),
-        None => None,
-    };
-    let mut report = remove_in(&ks, &home, a, Timing::CLI, async |cfg| {
-        topics::TopicNode::spawn(&keystore::node_identity_in(&ks)?, cfg).await
-    })
-    .await?;
-    report.notes.extend(pushed);
+    let ks = Keystore::resolve()?;
+    let mut report = remove_in(&ks, a)?;
+    report.notes.push(push_note(&ks).await);
     Ok(report)
+}
+
+/// [`remove_cmd`] against an explicit keystore, without the push (the
+/// testable form).
+pub(crate) fn remove_in(ks: &Keystore, a: RemoveArgs) -> anyhow::Result<Report> {
+    let (member, label) = resolve_removal(ks, &a.member)?;
+    let Some(state) = drop_from_state(ks, member, a.ttl)? else {
+        bail!("{} is not a member", member.hex());
+    };
+    let mut names = ks.read_names()?;
+    names.retain(|_, id| *id != member);
+    ks.save_names(&names)?;
+    Ok(Report {
+        stdout: format!(
+            "removed {}{} (state version {}, {} members)",
+            member.hex(),
+            label.map(|n| format!(" ({n})")).unwrap_or_default(),
+            state.state.version.0,
+            state.state.members.len()
+        ),
+        notes: Vec::new(),
+    })
 }
 
 /// The member `wires remove <text>` means, refusing this machine's own node.
@@ -245,8 +171,8 @@ fn resolve_removal(ks: &Keystore, text: &str) -> anyhow::Result<(NodeId, Option<
     let (member, label) = resolve_member(&ks.read_names()?, text)?;
     if member == keystore::node_identity_in(ks)?.node_id() {
         bail!(
-            "{} is this machine's own node: removing it would leave nobody to publish the next \
-             re-key from",
+            "{} is this machine's own node: removing it would leave nobody to sign and push the \
+             next state from",
             member.hex()
         );
     }
@@ -255,11 +181,7 @@ fn resolve_removal(ks: &Keystore, text: &str) -> anyhow::Result<(NodeId, Option<
 
 /// Drop `member` from the signed state (and from every service it hosted);
 /// `None` when it is already out.
-fn drop_from_state(
-    ks: &Keystore,
-    member: NodeId,
-    ttl: Ttl,
-) -> anyhow::Result<Option<library::SignedState>> {
+fn drop_from_state(ks: &Keystore, member: NodeId, ttl: Ttl) -> anyhow::Result<Option<SignedState>> {
     let Some(root) = ks.read_root_identity()? else {
         return Ok(None);
     };
@@ -267,7 +189,7 @@ fn drop_from_state(
     if held.is_some_and(|s| !s.state.is_member(member)) {
         return Ok(None);
     }
-    super::service::edit_state(ks, ttl, |s| {
+    edit_state(ks, ttl, |s| {
         s.members.remove(&member);
         for svc in s.services.values_mut() {
             svc.hosts.retain(|h| *h != member);
@@ -275,64 +197,6 @@ fn drop_from_state(
         Ok(())
     })
     .map(Some)
-}
-
-/// [`remove_cmd`] against an explicit keystore (the testable form).
-pub(crate) async fn remove_in<B>(
-    ks: &Arc<Keystore>,
-    home: &Path,
-    a: RemoveArgs,
-    timing: Timing,
-    bind: B,
-) -> anyhow::Result<Report>
-where
-    B: AsyncFnOnce(topics::TopicNodeConfig) -> anyhow::Result<topics::TopicNode>,
-{
-    let root = ks
-        .read_root_identity()?
-        .ok_or_else(|| anyhow::anyhow!("no root key here; run `wires init` first"))?;
-    let mut roster = ks
-        .read_roster()?
-        .ok_or_else(|| anyhow::anyhow!("no roster here; run `wires init` first"))?;
-    let mut names = ks.read_names()?;
-    let (member, label) = resolve_removal(ks, &a.member)?;
-    let dropped = drop_from_state(ks, member, a.ttl)?.is_some();
-    if !roster.remove(&member) {
-        if dropped {
-            return Ok(Report {
-                stdout: format!("removed {} from the signed state", member.hex()),
-                notes: Vec::new(),
-            });
-        }
-        bail!("{} is not in the roster", member.hex());
-    }
-    let committed: Committed = commit_and_distribute(
-        ks,
-        home,
-        &root,
-        &mut roster,
-        None,
-        a.ttl.not_after(now_unix()),
-        timing,
-        bind,
-    )
-    .await?;
-    if let Some(label) = &label {
-        names.remove(label);
-    }
-    names.retain(|_, id| *id != member);
-    ks.save_names(&names)?;
-
-    Ok(Report {
-        stdout: format!(
-            "removed {}{} (roster version {}, {} members)",
-            member.hex(),
-            label.map(|n| format!(" ({n})")).unwrap_or_default(),
-            committed.rekey.head.version.0,
-            roster.members.len()
-        ),
-        notes: vec![committed.told_line()],
-    })
 }
 
 /// A name or a hex node id → the member, and the label it was known by.
@@ -404,5 +268,61 @@ mod tests {
         assert!(check_name("").is_err());
         assert!(check_name("two words").is_err());
         assert!(check_name(&NodeIdentity::from_seed([2u8; 32]).node_id().hex()).is_err());
+    }
+
+    #[test]
+    fn invite_then_remove_edits_the_signed_state() {
+        use crate::admin::init::{InitArgs, init_in};
+        let ks = Keystore::at(crate::testutil::temp_dir());
+        init_in(
+            &ks,
+            InitArgs {
+                ttl: Ttl::DEFAULT.parse().unwrap(),
+            },
+        )
+        .unwrap();
+        let root = ks.read_root_identity().unwrap().unwrap();
+        let alice = NodeIdentity::from_seed([2u8; 32]);
+        let report = invite_in(
+            &ks,
+            InviteArgs {
+                node_id: alice.node_id().hex(),
+                name: Some("alice".into()),
+                ttl: Ttl::DEFAULT.parse().unwrap(),
+            },
+        )
+        .unwrap();
+        let invite = Invite::decode(&report.stdout).unwrap();
+        invite.verify(&alice, now_unix()).unwrap();
+        assert_eq!(invite.state.state.version, library::StateVersion(2));
+        let removed = remove_in(
+            &ks,
+            RemoveArgs {
+                member: "alice".into(),
+                ttl: Ttl::DEFAULT.parse().unwrap(),
+            },
+        )
+        .unwrap();
+        assert!(
+            removed.stdout.contains("state version 3"),
+            "{}",
+            removed.stdout
+        );
+        let state = crate::state::store::read(&ks, root.node_id())
+            .unwrap()
+            .unwrap();
+        assert!(!state.state.is_member(alice.node_id()));
+        assert!(ks.read_names().unwrap().is_empty());
+        // Removing again, or removing this machine's own node, is refused.
+        let again = RemoveArgs {
+            member: alice.node_id().hex(),
+            ttl: Ttl::DEFAULT.parse().unwrap(),
+        };
+        assert!(remove_in(&ks, again).is_err());
+        let me = RemoveArgs {
+            member: keystore::node_identity_in(&ks).unwrap().node_id().hex(),
+            ttl: Ttl::DEFAULT.parse().unwrap(),
+        };
+        assert!(format!("{:#}", remove_in(&ks, me).unwrap_err()).contains("own node"));
     }
 }

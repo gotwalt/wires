@@ -1,20 +1,24 @@
 //! `wires` — run a CLI on another machine from your agent.
 //!
-//! The binary is organized by the four roles in `docs/board/README.md`, one
-//! folder each, and this file is only argument parsing and dispatch:
+//! The binary is organized by role, one folder each, and this file is only
+//! argument parsing and dispatch:
 //!
-//! - **admin** ([`admin`]) — holds the root key and decides who is in. Its
-//!   offline plumbing sits under `wires advanced` ([`advanced`]).
-//! - **host** ([`host`]) — `wires serve`: runs CLIs, decides what is exposed
-//!   and who may call, and records every call on the channel.
-//! - **caller** ([`caller`]) — `wires login | call | tools | mcp`: runs remote
-//!   CLIs (`mcp` is the adapter for clients that only speak MCP).
-//! - **observer** — `wires watch`: streams the channel ([`channel`], which
-//!   every role meets on).
+//! - **admin** ([`admin`]) — holds the root key and signs the state: who is
+//!   in, which roles exist, which services run where and who may call them.
+//! - **host** ([`host`]) — `wires serve`: implements the services the signed
+//!   state assigns to it, checks every caller against that state, and keeps
+//!   its own log of every call.
+//! - **caller** ([`caller`]) — `wires login | services | call | mcp | inbox`:
+//!   runs remote CLIs by service name (`mcp` is the adapter for clients that
+//!   only speak MCP).
+//! - **observer** — `wires watch`: streams call records from the hosts' own
+//!   logs, to readers the registry names (card 26b, [`caller::watch_records`]).
+//!
+//! [`state`] is where the signed state lives on every node and how it moves.
 //!
 //! Secrets resolve through flag → env → `--…-file` → on-disk
 //! keystore ([`admin::keystore`]), so once the admin's credentials are
-//! installed, `wires call <tool>` and `wires mcp` need no other flags — which
+//! installed, `wires call <service>` and `wires mcp` need no other flags — which
 //! is what lets `wires mcp` drop straight into an MCP client's config as
 //! `"command": "wires"`.
 //!
@@ -24,20 +28,14 @@
 //! credentials, `1` for any local or transport failure.
 
 mod admin;
-mod advanced;
 mod caller;
-mod channel;
 mod host;
 mod state;
 
-/// The money-shot integration tests of spec §9 — the whole stack over
-/// hermetic loopback, in one place because none of them belongs to a single
-/// module's seam.
+/// The integration tests — the whole stack over hermetic loopback, in one
+/// place because none of them belongs to a single module's seam.
 ///
-/// Declared `#[cfg(test)]` rather than carrying an inner `#![cfg(test)]`: the
-/// `srcs = glob(["**/*.rs"])` in `BUILD` hands `e2e/` to both the binary and
-/// the test target, and gating the `mod` item is what keeps it out of the
-/// shipped binary entirely instead of compiling to an empty module.
+/// Declared `#[cfg(test)]` so it is out of the shipped binary entirely.
 #[cfg(test)]
 mod e2e;
 
@@ -61,35 +59,34 @@ const HELP_TEMPLATE: &str = "\
 {about-with-newline}
 {usage-heading} {usage}
 
-Admin — decides who's in (holds the root key):
-  init      Start a fabric: root key, this node, the first commit, a channel
-  invite    Add a node and print its one join token; re-key the channel
-  remove    Drop a node; re-key the channel so the rest carry on untouched
+Admin — signs who's in and what runs where (holds the root key):
+  init      Start a fabric: root key, this node, the first signed state
+  invite    Add a node and print its one join token
+  remove    Drop a node; hosts refuse its next call
   service   Register services: add / set / rm (name, allowed roles, hosts)
   role      Define roles from IdP identity: set / rm
-  advanced  Plumbing: memberships, roster, import, publish
 
-Host — decides what runs and who may run it:
-  serve     Expose CLIs as named tools; verify every caller; record every call
-  push      Send a caller a message by key (to its inbox); recorded on the channel
+Host — implements the services assigned to it:
+  serve     Run host.json's services; check every caller; log every call
+  push      Send a caller a message by key (to its inbox); logged
 
-Caller — runs remote CLIs (every role joins the same way):
+Caller — runs remote CLIs by service name (every role joins the same way):
   id        Print this node's id: what you send the admin
-  join      Install the admin's invite token: credentials, channel, peers
+  join      Install the admin's invite token: membership and signed state
   login     Sign in with your IdP, binding this node's key to your identity
   services  List the services you may call, and the role that lets you
   call      Run a service by name: stdio passes through, its exit code is ours
   mcp       Serve those services as MCP tools over stdio (compatibility)
   inbox     Read what hosts pushed to you; --wait blocks until something arrives
 
-Observer — watches calls:
+Observer — reads the hosts' call records:
   watch     Stream call records from your services' hosts, verified (--mine)
 
 Options:
 {options}";
 
-/// wires: run a CLI on another machine, reached by key, with every call on an
-/// encrypted channel.
+/// wires: run a CLI on another machine by service name, reached by key, with
+/// every caller checked against an admin-signed list.
 #[derive(Parser)]
 #[command(name = "wires", version, about, help_template = HELP_TEMPLATE)]
 struct Cli {
@@ -102,39 +99,36 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     // --- admin ---
-    /// Start a fabric: create the root key and this machine's node key, add
-    /// this node to the roster, commit, and record the channel.
+    /// Start a fabric: create the root key and this machine's node key, and
+    /// sign the first state (this node its one member).
     Init(admin::init::InitArgs),
-    /// Add a node to the roster and print its join token (stdout); the
-    /// commit is published on the channel so current members adopt it.
+    /// Add a node to the signed state and print its join token (stdout); the
+    /// new state is pushed to every member.
     Invite(admin::invite::InviteArgs),
-    /// Remove a node (by `--name` label or id); the commit is published on the
-    /// channel, and every host that adopts it refuses the node's next call.
+    /// Remove a node (by `--name` label or id) from the signed state; it is
+    /// pushed to hosts first, and every host refuses the node's next call.
     Remove(admin::invite::RemoveArgs),
     /// Edit the service registry in the signed state, and push it.
     Service(admin::service::ServiceArgs),
     /// Edit the role definitions in the signed state, and push them.
     Role(admin::service::RoleArgs),
-    /// Plumbing for every role: memberships, the roster, credential import,
-    /// and publishing to a channel.
-    Advanced(advanced::AdvancedArgs),
 
     // --- host ---
-    /// Expose CLIs as named tools, verify every caller, exec the tool, bridge
-    /// its stdio — and, with a `channel` in host.json, record every call.
+    /// Implement the services host.json names (and the signed state assigns
+    /// here): check every caller, exec the service, bridge its stdio, log
+    /// every call.
     Serve(host::serve::ServeArgs),
-    /// Send a caller a message, addressed by its key (a tool's
+    /// Send a caller a message, addressed by its key (a service's
     /// `$WIRES_CALLER_NODE`) or a role: through this machine's running
-    /// `wires serve`, to the caller's inbox; recorded on the channel.
+    /// `wires serve`, to the caller's inbox; logged.
     Push(host::push::PushArgs),
 
     // --- caller (and every joiner) ---
     /// Print this node's id (creating its key on first use): what a joiner
     /// sends the admin.
     Id,
-    /// Install an invite token from `wires invite`: membership, proof, head,
-    /// fabric key, the channel and its bootstrap peers. Without a token,
-    /// print this node's id.
+    /// Install an invite token from `wires invite`: membership and the
+    /// signed state. Without a token, print this node's id.
     Join(caller::join::JoinArgs),
     /// Sign in with your IdP (OIDC), binding this node's key to your identity;
     /// the token is stored locally and presented when you call.
@@ -221,11 +215,10 @@ fn init_logging() {
     init_logging_with(LOG_FILTER);
 }
 
-/// [`init_logging`] for the dialing commands (`call`, `tools`, `mcp`), whose
-/// stderr belongs to the remote CLI, and the admin's one-shot commands
-/// (`init`, `invite`, `remove`), whose brief channel node would otherwise
-/// print mesh admission WARNs: [`QUIET_LOG_FILTER`] by default, so a
-/// successful run leaves nothing of wires' own on stderr but its notes.
+/// [`init_logging`] for the dialing commands (`call`, `services`, `mcp`),
+/// whose stderr belongs to the remote CLI, and the admin's one-shot commands:
+/// [`QUIET_LOG_FILTER`] by default, so a successful run leaves nothing of
+/// wires' own on stderr but its notes.
 fn init_quiet_logging() {
     init_logging_with(QUIET_LOG_FILTER);
 }
@@ -236,10 +229,8 @@ const LOG_FILTER: &str = "warn,wires=info";
 /// The default log filter of the dialing commands: only warnings from wires
 /// itself, and iroh (plus `iroh_*`, which the target prefix also matches)
 /// entirely off — its endpoint teardown logs `ERROR … relay_recv_channel
-/// closed` at the end of every perfectly normal call. The channel node a cold
-/// call joins to read the directory (card 15) keeps only its errors: its mesh
-/// chatter is not the remote CLI's stderr.
-const QUIET_LOG_FILTER: &str = "warn,iroh=off,wires::channel=error";
+/// closed` at the end of every perfectly normal call.
+const QUIET_LOG_FILTER: &str = "warn,iroh=off";
 
 /// Install the stderr subscriber with `default` unless `$RUST_LOG` is set.
 fn init_logging_with(default: &str) {
@@ -288,7 +279,6 @@ fn main() {
         }
         Command::Id => print_or_exit(caller::join::id_cmd()),
         Command::Join(a) => print_or_exit(caller::join::join_cmd(a)),
-        Command::Advanced(a) => advanced::run(a),
         Command::Serve(a) => {
             if let Err(e) = runtime().block_on(host::serve::serve_cmd(a)) {
                 eprintln!("wires: {e:#}");
@@ -351,9 +341,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        // Keeps stdout for messages and reports the same way `call` does —
-        // including exit 77 when the refusal came from the roster rather than
-        // from the network.
+        // Exit 77 when every host refused the stream.
         Command::Watch(a) => {
             init_quiet_logging();
             match runtime().block_on(caller::watch_records::watch_cmd(a)) {
@@ -435,22 +423,15 @@ mod tests {
         );
     }
 
-    /// The top-level help names the four roles and fits on one screen.
+    /// The top-level help names the roles and fits on one screen.
     #[test]
-    fn help_shows_the_four_roles_on_one_screen() {
+    fn help_shows_the_roles_on_one_screen() {
         let help = Cli::command().render_help().to_string();
         for role in ["Admin", "Host", "Caller", "Observer"] {
             assert!(help.contains(&format!("{role} — ")), "{help}");
         }
         let lines = help.lines().count();
         assert!(lines <= 32, "{lines} lines:\n{help}");
-        // The plumbing is not on it.
-        for plumbing in ["member", "roster", "import", "tail"] {
-            assert!(
-                !help.contains(&format!("  {plumbing} ")),
-                "{plumbing} is listed:\n{help}"
-            );
-        }
     }
 
     /// Card 14's onboarding commands parse as documented.
@@ -458,54 +439,28 @@ mod tests {
     fn onboarding_commands_parse() {
         let id = "ab".repeat(32);
         assert!(Cli::try_parse_from(["wires", "init"]).is_ok());
-        assert!(Cli::try_parse_from(["wires", "init", "--channel", "eng", "--ttl", "7d"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "init", "--ttl", "7d"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "init", "--ttl", "soon"]).is_err());
         assert!(Cli::try_parse_from(["wires", "invite", &id, "--name", "alice"]).is_ok());
-        assert!(
-            Cli::try_parse_from(["wires", "invite", &id, "--peer", "t1", "--peer", "t2"]).is_ok()
-        );
         assert!(Cli::try_parse_from(["wires", "invite"]).is_err());
         assert!(Cli::try_parse_from(["wires", "remove", "alice"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "id"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "join"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "join", "tok"]).is_ok());
-        // `watch` needs no topic once a channel is joined.
-        assert!(Cli::try_parse_from(["wires", "watch"]).is_ok());
     }
 
+    /// Card 27: the channel and its plumbing are gone.
     #[test]
-    fn connect_is_gone() {
-        assert!(Cli::try_parse_from(["wires", "connect", "--target", "00"]).is_err());
-    }
-
-    /// The plumbing that used to be top-level now lives under `advanced`, and
-    /// `tail` is `watch` (with `advanced tail` kept as a hidden alias).
-    #[test]
-    fn plumbing_is_under_advanced() {
-        for old in ["member", "roster", "import", "publish", "tail"] {
+    fn the_channel_commands_are_gone() {
+        for gone in [
+            &["wires", "advanced", "--help"][..],
+            &["wires", "connect", "--target", "00"],
+            &["wires", "tail", "ops"],
+            &["wires", "init", "--channel", "ops"],
+        ] {
             assert!(
-                Cli::try_parse_from(["wires", old, "--help"])
-                    .is_err_and(|e| e.kind() == ErrorKind::InvalidSubcommand),
-                "`wires {old}` still parses at top level"
-            );
-            assert!(
-                Cli::try_parse_from(["wires", "advanced", old, "--help"])
-                    .is_err_and(|e| e.kind() == ErrorKind::DisplayHelp),
-                "`wires advanced {old}` is missing"
-            );
-        }
-        assert!(Cli::try_parse_from(["wires", "watch", "ops"]).is_ok());
-    }
-
-    /// Card 25: grants, the CRL and loose key generation are gone (`wires
-    /// id` / `init` make keys; roster removal replaces revocation).
-    #[test]
-    fn removed_plumbing_is_gone() {
-        for gone in ["keygen", "grant", "revoke"] {
-            assert!(
-                Cli::try_parse_from(["wires", "advanced", gone, "--help"])
-                    .is_err_and(|e| e.kind() == ErrorKind::InvalidSubcommand),
-                "`wires advanced {gone}` still parses"
+                Cli::try_parse_from(gone.iter()).is_err_and(|e| e.kind() != ErrorKind::DisplayHelp),
+                "{gone:?} still parses"
             );
         }
     }

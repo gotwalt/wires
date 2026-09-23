@@ -10,7 +10,8 @@ the [README](../README.md); for the recorded two-machine run see
 | ----- | ------- | -------- |
 | **Host** (runs the CLIs) | `wires serve host.json` | No TCP listener, no firewall port opened; binds UDP for QUIC |
 | **Caller** (the agent side) | `wires call`, or `wires mcp` for MCP-only clients | No |
-| **Observer** | `wires watch` | No |
+| **Reader** | `wires watch` | No |
+| **Admin** | `wires init` / `invite` / `remove` / `role` / `service`, one-shot | No |
 
 A host dials out (to peers directly, or through a relay), and unauthenticated
 peers are refused at the QUIC handshake.
@@ -33,20 +34,24 @@ A host is a member like any other. It joins once, then runs `serve`:
 ```bash
 wires id                       # send this to the admin
 wires join <token>             # the admin's `wires invite <id>` output
-wires serve --check host.json  # validate; print who may run what
-wires serve host.json          # prints "share to bootstrap: <ticket>" for the admin's next invite
+wires serve --check host.json  # validate; print what it implements
+wires serve host.json          # refuses to start unless the signed state assigns every service here
 ```
 
 Run `serve` under a process supervisor (card 08 used `systemd-run --user`),
 from the directory that relative paths in `host.json` commands resolve
 against.
 
+The admin assigns services to the host (`wires service add … --host
+<name>`) before it starts. If the host was offline when that state was
+pushed, it needs the newer state first: a fresh `wires invite` token for it
+carries it (re-joining never rolls back).
+
 **The keystore must be writable and must persist.** `$WIRES_HOME` holds the
-host's node key and credentials, and the host rewrites them at runtime: every
-`wires invite` and `wires remove` re-keys the channel, and the host adopts the
-new roster head, proof directory and channel key from the channel. It also
-holds the channel log (`topics/`) and the control socket (`run/`). A read-only
-or throwaway keystore loses those on restart.
+host's node key and membership, and the host rewrites its signed state at
+runtime: every admin change is pushed to it (`state.json`). It also holds the
+call log (`call-log.jsonl`), the push queue and the control socket (`run/`).
+A read-only or throwaway keystore loses those on restart.
 
 **Secrets.** Every secret input resolves **flag → environment variable →
 `--…-file` → keystore**. Don't pass `--node-seed` on the command line or in
@@ -64,14 +69,14 @@ replicas sharing a key are not a load balancer), and no `Service` or
 
 Three layers, most self-contained first:
 
-- **Addresses from the channel.** A host's announcement on the channel
-  carries its direct addresses and relay URL, so a caller that has read it
-  dials without a discovery service. The addresses are unsigned hints: iroh
-  still authenticates the peer's key, so a wrong address can only fail to
-  connect.
+- **A local hints file.** `$WIRES_HOME/hints`: one line per node, `<node
+  id> <ip:port>…`. A running `serve` writes its own line to `run/hint`;
+  copy it into the callers', readers' and admin's hints. Every endpoint
+  `wires` binds uses it. The addresses are unsigned hints: iroh still
+  authenticates the peer's key, so a wrong address can only fail to connect.
 - **Self-hosted relay**: run upstream
   [`iroh-relay`](https://docs.rs/iroh-relay) and pass `--relay-url` to
-  `serve`, `call`, `watch` and `login`, for NAT traversal between egress-only
+  `serve`, `call`, `mcp`, `inbox` and `watch`, for NAT traversal between egress-only
   peers that can both reach it. Keep it one logical endpoint: two peers only
   rendezvous on the *same* relay.
 - **n0 DNS discovery and relays** (the default): resolves a node id to
@@ -85,12 +90,13 @@ n0.
 - **Add a member:** the joiner runs `wires id`; the admin runs
   `wires invite <id> --name <label>` and hands back the token; the joiner runs
   `wires join <token>`. The root key never leaves the admin's machine.
-- **Remove a member:** `wires remove <label>`. The re-key goes out on the
-  channel, and hosts adopt it with no import and no restart. `serve` re-reads
-  the roster head once per connection, so the removed member's next call is
-  refused: exit `77`, `wires: denied by responder: <reason>` on its stderr,
-  and a `✗` record on the channel.
-- **Expiry:** memberships and roster heads expire after `--ttl` (default
-  `30d`), and nothing renews them yet. Re-issue with `wires invite <id>`.
+- **Remove a member:** `wires remove <label>`. The new signed state is pushed
+  to the hosts first, with no import and no restart. `serve` re-reads its
+  state once per connection, so the removed member's next call is refused:
+  exit `77`, `wires: denied by responder: <reason>` on its stderr, and a `✗`
+  record in the host's log. There is no shared key to rotate.
+- **Expiry:** memberships and the signed state expire after `--ttl` (default
+  `30d`), and nothing renews them yet. Any admin command signs a fresh state;
+  re-issue memberships with `wires invite <id>`.
 - **Rotate a node key:** the node id changes with the key, so remove the old
   id and invite the new one.

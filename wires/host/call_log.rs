@@ -32,8 +32,8 @@
 //! [`start`] hands `serve` the [`AuditSink`] every session and push writes
 //! to, and runs a [`tee`] that appends each record to this log (always),
 //! offers the signed entry to the OTLP [`Exporter`] (when `host.json` has
-//! `audit.otlp`), and passes the record on to the channel publisher (while the
-//! host still has a channel; card 27 removes that).
+//! `audit.otlp`), and optionally passes the record on to one more receiver
+//! (`serve` passes none).
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
@@ -236,8 +236,8 @@ fn read_repairing(path: &Path) -> Result<Vec<LogEntry>> {
 }
 
 /// Build the host's audit path: a sink for sessions and pushes, a [`tee`]
-/// running on a blocking thread, and — when `channel` is set — the receiver
-/// the channel publisher drains (as before card 26a).
+/// running on a blocking thread, and — when `channel` is set — a receiver
+/// that gets every record too.
 pub fn start(
     log: CallLog,
     exporter: Option<Exporter>,

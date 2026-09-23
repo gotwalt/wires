@@ -1,25 +1,26 @@
 # The recorded demo: laptop ↔ workbench, Claude Code as the agent
 
 *Script for [card 08](board/doing/08-demo-two-machine.md)'s two-machine run.
-Every command here is the current CLI (cards 12–15, 19). The same sequence
-runs self-asserting on one machine as `./.scripts/demo-remote-cli.sh`: run
-that first, and if it's red, don't record.*
+Every command here is the current CLI. The same sequence runs self-asserting
+on one machine as `./.scripts/demo-remote-cli.sh`: run that first, and if
+it's red, don't record.*
 
 Every sentence of narration has to survive one honest line from someone who
 runs remote MCP servers behind Tailscale today ([storytelling.md](storytelling.md) §1).
-The answers to the four rebuttals we expect are [at the end](#rebuttals-one-line-each).
+The answers to the rebuttals we expect are [at the end](#rebuttals-one-line-each).
 
 ## Cast
 
 | Terminal | Machine | `WIRES_HOME` | Role |
 |---|---|---|---|
-| **admin** | laptop | `~/.wires-admin` | holds the root key; invites and removes |
-| **workbench** | workbench (x86_64 Linux, no inbound ports) | `~/.wires-demo` | `wires serve host.json`: one tool, `db_query` |
-| **agent** | laptop | `~/.wires-agent` | Claude Code, calling `wires call db_query` from Bash |
-| **observer** | laptop (or a second laptop) | `~/.wires-obs` | `wires watch` |
+| **admin** | laptop | `~/.wires-admin` | holds the root key; signs roles, services and members |
+| **workbench** | workbench (x86_64 Linux, no inbound ports) | `~/.wires-demo` | `wires serve host.json`: implements `orders-db` |
+| **spare** (optional) | a second host | `~/.wires-spare` | implements `orders-db` too, for the failover beat |
+| **agent** | laptop | `~/.wires-agent` | Claude Code, calling `wires call orders-db` from Bash |
+| **reader** | laptop (or a second laptop) | `~/.wires-reader` | a member in role `security`: `wires watch orders-db` |
 
-Keep `WIRES_HOME` short: the control socket lives under it, and macOS limits
-socket paths to 104 bytes.
+Keep `WIRES_HOME` short: a host's control socket lives under it, and macOS
+limits socket paths to 104 bytes.
 
 ## Before recording (off camera)
 
@@ -29,69 +30,74 @@ secret isn't confidential for that client type. On the laptop:
 ```bash
 export WIRES_OIDC_CLIENT_ID=<id>.apps.googleusercontent.com   # login reads these
 export WIRES_OIDC_CLIENT_SECRET=<secret>
-export WIRES_OIDC_AUDIENCE=$WIRES_OIDC_CLIENT_ID               # watch accepts this client id
 ```
 
 **workbench.** Build natively there (`cargo build --release -p wires`, or
 `docker build .`); nothing cross-compiles. Use `ssh -o RemoteCommand=none`
-because the ssh config forces a remote command. Put
-`orders.db` in the directory `wires serve` runs from, and this `host.json`
-beside it:
+because the ssh config forces a remote command. Put `orders.db` in the
+directory `wires serve` runs from, and this `host.json` beside it:
 
 ```json
 {
-  "version": 1,
-  "channel": "ops",
+  "version": 2,
   "identity": { "issuers": [
     { "issuer": "https://accounts.google.com", "audiences": ["<id>.apps.googleusercontent.com"] }
   ] },
-  "roles": { "analyst": [ { "email": "<your address>@gmail.com" } ] },
-  "tools": {
-    "db_query": {
-      "description": "Read-only SQL (sqlite3) over the workbench's orders.db; pass the SQL statement as the argument.",
-      "command": ["sqlite3", "-safe", "-readonly", "-header", "-column", "orders.db"],
-      "allow": ["analyst"]
-    }
-  }
+  "services": {
+    "orders-db": { "command": ["sqlite3", "-safe", "-readonly", "-header", "-column", "orders.db"] }
+  },
+  "push": { "allow": ["analyst"] }
 }
 ```
 
 **Provision** (this can be on camera, but it's slow viewing):
 
 ```bash
-admin$     WIRES_HOME=~/.wires-admin wires init --channel ops
+admin$     WIRES_HOME=~/.wires-admin wires init
+admin$     WIRES_HOME=~/.wires-admin wires role set analyst '<your address>@gmail.com'
+admin$     WIRES_HOME=~/.wires-admin wires role set security '<the reader's address>'
 workbench$ WIRES_HOME=~/.wires-demo  wires id        # → send to admin
 admin$     WIRES_HOME=~/.wires-admin wires invite <workbench id> --name workbench
+admin$     WIRES_HOME=~/.wires-admin wires service add orders-db \
+             --description "Read-only SQL (sqlite3) over the orders database; pass the SQL statement as the argument." \
+             --allow analyst --reader security --host workbench     # (--host spare too, if you have one)
+admin$     WIRES_HOME=~/.wires-admin wires invite <workbench id> --name workbench   # a token with the service in it
 workbench$ WIRES_HOME=~/.wires-demo  wires join <token>
 workbench$ WIRES_HOME=~/.wires-demo  wires serve --check host.json
 workbench$ WIRES_HOME=~/.wires-demo  wires serve host.json    # under a supervisor (card 08 used systemd-run --user)
-                                                              # note its "share to bootstrap:" ticket
-agent$     WIRES_HOME=~/.wires-agent wires id
-observer$  WIRES_HOME=~/.wires-obs   wires id
-admin$     WIRES_HOME=~/.wires-admin wires invite <agent id> --name agent --peer <workbench ticket>
-admin$     WIRES_HOME=~/.wires-admin wires invite <observer id> --name observer
-agent$     WIRES_HOME=~/.wires-agent wires join <token>
-observer$  WIRES_HOME=~/.wires-obs   wires join <token>
+agent$     WIRES_HOME=~/.wires-agent  wires id
+reader$    WIRES_HOME=~/.wires-reader wires id
+admin$     WIRES_HOME=~/.wires-admin wires invite <agent id> --name agent      # pushed to the running workbench
+admin$     WIRES_HOME=~/.wires-admin wires invite <reader id> --name reader
+agent$     WIRES_HOME=~/.wires-agent  wires join <token>
+reader$    WIRES_HOME=~/.wires-reader wires join <token>
+reader$    WIRES_HOME=~/.wires-reader wires login     # as the reader's address
 ```
 
+The workbench is invited twice because it was offline when the service was
+assigned to it: the second token carries the newer state (re-joining never
+rolls one back). Every later admin change reaches the running workbench by
+push. Machines find each other by key through n0 discovery; on a network
+without it, copy the workbench's `run/hint` line into the others'
+`$WIRES_HOME/hints`.
+
 **Claude Code for the agent.** Run it with `WIRES_HOME=~/.wires-agent` in its
-environment and allow only the one tool:
+environment and allow only the one service:
 
 ```bash
-WIRES_HOME=~/.wires-agent claude --allowedTools 'Bash(wires call db_query:*)'
+WIRES_HOME=~/.wires-agent claude --allowedTools 'Bash(wires call orders-db:*)'
 ```
 
 Don't present that Bash rule as a sandbox. Claude Code still auto-allows
 read-only commands like `cat` in the working directory
 ([agent-sandbox.md](agent-sandbox.md)), so start Claude Code from an empty
 directory. If asked, the airtight setups are a container whose `PATH` holds
-only `wires` (plus locked mode once card 20 lands), or `wires mcp` with no
-Bash tool at all.
+only `wires` with `WIRES_LOCKED=1`, or `wires mcp` with no Bash tool at all.
 
 ## The recording
 
-Show three panes: workbench, agent (Claude Code), and observer. Keep admin in
-a fourth pane or a tab.
+Show three panes: workbench, agent (Claude Code), and reader. Keep admin in a
+fourth pane or a tab.
 
 ### 1. The workbench has no way in
 
@@ -100,95 +106,91 @@ workbench$ ss -ltnp          # TCP listeners: nothing from wires
 workbench$ ss -lunp | grep wires   # UDP sockets: iroh's QUIC
 ```
 
-> "This is the workbench. It's running `wires serve` with one tool: read-only
-> SQL on an orders database. It has no TCP listener, and no firewall port
-> opened. Unauthenticated peers are refused at the handshake. What it does
-> have is a key."
+> "This is the workbench. It implements one service: read-only SQL on an
+> orders database. It has no TCP listener, and no firewall port opened.
+> Unauthenticated peers are refused at the handshake. What it does have is a
+> key."
 
 Never say "no ports". iroh binds UDP for QUIC, and `ss -lunp` shows it.
 
-### 2. The observer is watching
+### 2. Before sign-in the agent sees nothing, and is refused
 
 ```bash
-observer$ WIRES_HOME=~/.wires-obs wires watch
+agent$ WIRES_HOME=~/.wires-agent wires services      # nothing
+agent$ WIRES_HOME=~/.wires-agent wires call orders-db -- "select count(*) from orders"   # exit 77
 ```
 
-> "This is someone I trust to watch. They have no credentials for my laptop
-> or for the workbench. They're a member of the channel, and that's all."
+> "My agent's machine joined with one invite from me. The admin-signed list
+> it holds says `orders-db` is for analysts, and it hasn't said who it is yet,
+> so it sees nothing, and asking by name is refused with the reason."
 
-### 3. Before sign-in the agent sees nothing, and is refused
-
-```bash
-agent$ WIRES_HOME=~/.wires-agent wires tools
-agent$ WIRES_HOME=~/.wires-agent wires call db_query -- "select count(*) from orders"   # exit 77
-```
-
-> "My agent's machine joined with one invite from me. It knows the workbench
-> exists, because the workbench announced itself on the channel. It can't see
-> any tools yet. The workbench only runs `db_query` for a verified analyst, so
-> this call is refused. The refusal shows up for the observer too."
-
-Point at the observer's `✗ … no identity claim …` line.
-
-### 4. Sign in once
+### 3. Sign in once
 
 ```bash
-agent$ WIRES_HOME=~/.wires-agent wires login --topic ops     # browser: Google
-agent$ WIRES_HOME=~/.wires-agent wires tools                 # db_query  on <host8>  Read-only SQL …
+agent$ WIRES_HOME=~/.wires-agent wires login       # browser: Google
+agent$ WIRES_HOME=~/.wires-agent wires services    # orders-db  Read-only SQL …  (analyst)
 ```
 
 > "I sign in with Google. The ID token names this machine's key, because the
-> key's hash is the sign-in nonce. The observer checks Google's signature
-> itself. There's no wires service in the middle vouching for me. The
-> workbench checked it too, found me in `analyst`, and now shows me
-> `db_query`, and only me."
+> key's hash is the sign-in nonce. `wires services` checks my identity
+> against the list the admin signed, right here, with no network: I'm an
+> analyst, so I see `orders-db`. I never name a machine."
 
-Point at `🪪 identity … is <you>@gmail.com (verified by https://accounts.google.com)`.
-
-### 5. The agent works
+### 4. The agent works
 
 Prompt in Claude Code:
 
-> *Using `wires call db_query -- "<sql>"` (SQLite, table
+> *Using `wires call orders-db -- "<sql>"` (SQLite, table
 > `orders(customer, total, placed_at)`), which customer has the highest total
 > spend, and what share of all revenue is that?*
 
-> "Claude Code is calling the remote CLI the way it calls any CLI. Each call
-> appears for the observer as it happens: my email, the role that let it
-> through, the SQL, the exit code, and how many bytes came back. The
-> workbench wrote those lines under its own key, and the agent can't write a
-> line that carries that key."
+> "Claude Code is calling the remote CLI the way it calls any CLI. The
+> workbench checks my token and the signed list on every call, runs sqlite3,
+> and writes each call into its own signed log."
 
-Point at the `▶ … <you>@gmail.com … [analyst] db_query "select …"` and
-`■ … exit 0 · … ms · … B out` pairs.
-
-If someone asks about MCP, show that the same tool works through `wires mcp`
-for clients that can't run a CLI, and say it exists only for backward
+If someone asks about MCP, show that the same service works through `wires
+mcp` for clients that can't run a CLI, and say it exists only for backward
 compatibility.
+
+### 5. The reader reads the records
+
+```bash
+reader$ WIRES_HOME=~/.wires-reader wires watch orders-db
+```
+
+> "This is someone the admin put in the `security` role, which may read
+> `orders-db`'s records. They have no credentials for my laptop or for the
+> workbench, and they can't call the service. They see every call: my email,
+> the role that let it through, the SQL, the exit code, how many bytes came
+> back. The workbench wrote and signed those lines, and the reader checks
+> every signature and every link."
+
+Point at the `▶ … <you>@gmail.com (…) [analyst] orders-db "select …"` and
+`■ … exit 0 · … ms · … B out` pairs, and at the `✗` line for the refusal in
+beat 2. The agent's own `wires watch` shows only its own calls.
 
 ### 5b. The workbench calls back (push)
 
-Self-asserting on one machine: `./.scripts/demo-push.sh` (`--quiet`: about
-20 s). For the recording, add the mock CI to the workbench's `host.json`
-beside `db_query`. Copy `.scripts/fixtures/ci.sh` to the workbench and use
-its absolute path as `<ci>`:
+Self-asserting on one machine: `./.scripts/demo-push.sh --quiet`. For the
+recording, copy `.scripts/fixtures/ci.sh` to the workbench, add its
+services to `host.json` (absolute path as `<ci>`):
 
 ```json
-  "tools": {
-    "db_query": { … },
-    "deploy": { "command": ["<ci>", "deploy"], "allow": ["analyst"],
-                "description": "Start a CI build in the background: deploy -- build <n>. Returns at once; the result is pushed to your wires inbox." },
-    "logs":   { "command": ["<ci>", "logs"],   "allow": ["analyst"],
-                "description": "A build's log: logs -- build <n> [--tail N]." }
+  "services": {
+    "orders-db": { … },
+    "deploy": { "command": ["<ci>", "deploy"] },
+    "logs":   { "command": ["<ci>", "logs"] }
   },
-  "push": { "allow": ["analyst"] }
 ```
 
-Start `wires serve` with `CI_JOB_SECS=90 CI_JOBS=~/ci-jobs` in its
+register them (`wires service add deploy --allow analyst --host workbench
+--description "Start a CI build in the background: deploy -- build <n>. Returns
+at once; the result is pushed to your wires inbox."`, likewise `logs`), and
+restart `wires serve` with `CI_JOB_SECS=90 CI_JOBS=~/ci-jobs` in its
 environment. The build's background job runs `wires push --to
 "$WIRES_CALLER_NODE" …`, which reaches the running `serve` over its control
-socket, because the job inherits serve's `WIRES_HOME`. Let Claude Code run
-`wires inbox` as well: `--allowedTools 'Bash(wires call:*),Bash(wires inbox:*)'`.
+socket (the host sets `WIRES_HOME` for every service it runs). Let Claude Code
+run `wires inbox` as well: `--allowedTools 'Bash(wires call:*),Bash(wires inbox:*)'`.
 
 Prompt in Claude Code:
 
@@ -207,17 +209,15 @@ agent$ wires call logs -- build 41 --tail 50
 
 > "The agent started a build and went quiet. It isn't polling. When the build
 > failed, the workbench pushed the result to the agent's key. My laptop has
-> no webhook URL and no open port, and the agent was never reachable from
-> the internet. The message names the host key that sent it, and the agent
-> checked that key when it connected. Woken, the agent reads the log from the
-> same host, and the observer sees the whole chain: deploy, then the push,
-> then the logs call, each line stamped with who."
+> no webhook URL, and the agent was never reachable from the internet. The
+> message names the host key that sent it, and the agent checked that key
+> when it connected. Woken, the agent reads the log from the same host."
 
-Point at `▶ … deploy build 41`, then `⇢ … "build-41" fetched`, then
-`▶ … logs build 41 --tail 50`.
+`wires watch` (the agent's own) shows the chain: `▶ … deploy build 41`, then
+`⇢ … "build-41" delivered|fetched`, then `▶ … logs build 41 --tail 50`.
 
 If the agent had been asleep (no inbox running), the push waits on the
-workbench (`⇢ … queued`), and the agent's next `wires inbox` fetches it.
+workbench (`queued`), and the agent's next `wires inbox` fetches it.
 
 Pushed text is input to the model from someone else. The line names the
 verified sender so the model (and you) can tell who said it; it doesn't make
@@ -225,9 +225,16 @@ the content trustworthy.
 
 What waiting costs, measured (`bench/push/REPORT.md`): with `--wait`, 4 turns
 and about 15k input tokens whatever the build length, and about 2 s from failure
-to the follow-up. Polling a status tool, or `wires inbox` on a loop, costs the
+to the follow-up. Polling a status service, or `wires inbox` on a loop, costs the
 same as each other and grows with the wait (28k tokens at 60 s, 39k at 300 s),
 with a reaction time of 20–180 s.
+
+### 5c. (With a spare) the workbench goes down
+
+Stop `wires serve` on the workbench and ask the question again.
+
+> "Same command. The admin listed two hosts for `orders-db`; the workbench
+> didn't answer, so the call went to the spare. The agent never named either."
 
 ### 6. Revoke
 
@@ -237,19 +244,19 @@ admin$ WIRES_HOME=~/.wires-admin wires remove agent
 
 Then ask Claude Code the question again.
 
-> "One command. The channel is re-keyed. The workbench picked up the new
-> roster from the channel, with no import and no restart. The agent's next
-> call exits 77 with nothing on stdout, and the refusal is on the channel as
-> well."
+> "One command. The admin signed a new list without the agent and pushed it
+> to the workbench first. The workbench reads it on the next call, with no
+> restart and no key to rotate. The agent's next call exits 77 with nothing on
+> stdout, and the refusal is in the log the reader sees."
 
-Point at `🔑 re-key to roster version …` and then `✗ … db_query denied: roster
-inclusion rejected: …`.
+Point at `wires: denied by responder: not a member of the current signed
+state (version …)` and the reader's `✗` line.
 
 ### Closing line
 
-> "One CLI on another machine, reached by key; the caller verified by my IdP;
-> every call recorded by the machine that ran it, where anyone I trust can
-> watch."
+> "One CLI on another machine, called by name and reached by key; the caller
+> verified by my IdP against a list I signed; every call recorded by the
+> machine that ran it, for the people I chose."
 
 ## Things not to say
 
@@ -259,17 +266,19 @@ inclusion rejected: …`.
   win comes from filtering output before it reaches context (bench/REPORT.md).
 - "The agent can only run wires." That's true of a container that holds only
   `wires`, not of a Bash permission rule.
+- "Encrypted", "channel", "everyone can watch". Records are read from each
+  host by the readers the registry names.
 - "Join by domain." It isn't built (card 18).
 
 ## Rebuttals, one line each
 
 | They say | We say |
 |---|---|
-| **"Tailscale already does this."** | Tailscale exposes the service to your machine, a network path to the host; wires gives a key-addressed path to one allowlisted CLI, with no TCP listener and no firewall port opened. |
-| **"Our MCP gateway already logs every call."** | The gateway's log belongs to whoever runs the gateway and covers only traffic routed through it; this record is written by the machine that ran the command, and a member reads it without either end's credentials. |
-| **"We already have Okta / enterprise-managed auth."** | Good, wires uses it: the host enforces your IdP's signed token, bound to the caller's key, and every reader verifies it against your IdP directly, with no wires identity service and no auth code in the CLI. |
+| **"Tailscale already does this."** | Tailscale exposes the service to your machine, a network path to the host; wires gives a key-addressed path to the services a signed list lets you call, with no TCP listener and no firewall port opened. |
+| **"Our MCP gateway already logs every call."** | The gateway's log belongs to whoever runs the gateway and covers only traffic routed through it; this record is written and signed by the machine that ran the command, and the readers the admin names read it without either end's credentials. |
+| **"We already have Okta / enterprise-managed auth."** | Good, wires uses it: the host checks your IdP's signed token, bound to the caller's key, against one admin-signed list of who may call what, with no wires identity service and no auth code in the CLI. |
 | **"A leaner MCP server would close the gap."** | Mostly, yes, because the token win comes from output size; a CLI gets it without rewriting anything, and wires doesn't rest on tokens anyway, it rests on reach, identity and the host-written record. |
 | **"Use webhooks."** | The laptop agent has no public endpoint; ngrok or Funnel would put one on the internet. Wires pushes to the agent's key, with nothing exposed. |
-| **"Just poll."** | Polling (status tool or inbox loop) cost 28k→39k tokens as the build went 60→300 s and reacted in 20–180 s; `inbox --wait` cost 15k flat and reacted in ~2 s (bench/push/REPORT.md). |
+| **"Just poll."** | Polling (status service or inbox loop) cost 28k→39k tokens as the build went 60→300 s and reacted in 20–180 s; `inbox --wait` cost 15k flat and reacted in ~2 s (bench/push/REPORT.md). |
 | **"A2A has push."** | Through webhooks to a public URL, the same problem. |
 | **"The MCP tasks extension."** | Poll-based by design (`tasks/get`): the "just poll" row. |

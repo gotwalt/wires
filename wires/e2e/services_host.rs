@@ -5,7 +5,7 @@
 //! host's keystore exactly as `wires/state` does
 //! ([`adopt_if_newer`](crate::state::store::adopt_if_newer)). Callers dial
 //! the real session ALPN over loopback with a hand-rolled `Hello` + `Invoke`
-//! (the dial half is lane 27b's), presenting ID tokens minted by
+//! (the dial half has its own tests in `caller::call`), presenting ID tokens minted by
 //! [`MockIdp`]s that the host trusts.
 //!
 //! - [`the_registry_decides_who_runs_what`]: an allowed role runs; a
@@ -17,10 +17,17 @@
 //!   applies with no restart; an older caller copy gets the newer state back.
 //! - [`push_follows_the_signed_state`]: card 23's push and inbox fetch,
 //!   authorized by the registry roles in `push.allow`.
+//! - [`a_fetch_with_a_token_makes_a_caller_reachable_by_role`]: a logged-in
+//!   member who never called is reachable by role once its `wires inbox`
+//!   fetch presented its token, and a direct push lands in a waiting inbox.
+//! - [`nothing_is_broadcast_to_a_bystander`]: calls, refusals and pushes
+//!   between others send a member that takes part in none of them nothing.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr};
 use library::{
@@ -34,7 +41,7 @@ use tokio::time::timeout;
 
 use super::{PATIENCE, localhost_socks};
 use crate::admin::keystore::Keystore;
-use crate::caller::inbox::{Fetched, Mailbox, fetch_from};
+use crate::caller::inbox::{Fetched, InboxReceiver, Mailbox, fetch_from};
 use crate::caller::mock_idp::{MOCK_CLIENT_ID, MockIdp};
 use crate::host::config_v2::HostConfigV2;
 use crate::host::push::{PushHost, PushSpec};
@@ -173,6 +180,8 @@ fn service(s: &str) -> ServiceName {
 struct Host {
     _router: Router,
     addr: EndpointAddr,
+    /// The host endpoint's address book: where it can dial members (push).
+    book: MemoryLookup,
     keystore: Arc<Keystore>,
     records: mpsc::Receiver<AuditRecord>,
     push: Option<Arc<PushHost>>,
@@ -201,8 +210,10 @@ impl Host {
             .push
             .is_some()
             .then(|| Arc::new(PushHost::from_state(Arc::clone(&host))));
+        let book = MemoryLookup::new();
         let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key(&w.host))
+            .address_lookup(book.clone())
             .bind()
             .await
             .unwrap();
@@ -211,6 +222,7 @@ impl Host {
         Ok(Host {
             _router: router,
             addr,
+            book,
             keystore,
             records,
             push,
@@ -573,10 +585,10 @@ async fn push_follows_the_signed_state() {
     assert!(!report.any_accepted(), "{}", report.render());
 
     assert!(matches!(
-        fetch(&w, &w.alice, &host).await,
+        fetch(&w, &w.alice, &host, None).await,
         Fetched::Messages(1)
     ));
-    let Fetched::Refused(why) = fetch(&w, &w.bob, &host).await else {
+    let Fetched::Refused(why) = fetch(&w, &w.bob, &host, None).await else {
         panic!("bob may not fetch");
     };
     assert!(why.contains("no role allowed to receive pushes"), "{why}");
@@ -584,7 +596,7 @@ async fn push_follows_the_signed_state() {
     // Removed from the state: her queue is dropped and her fetch refused.
     push.send(spec(&w.alice)).await.unwrap();
     host.adopt(&w, &w.state(2, &[w.bob.node_id(), w.carol.node_id()]));
-    let Fetched::Refused(why) = fetch(&w, &w.alice, &host).await else {
+    let Fetched::Refused(why) = fetch(&w, &w.alice, &host, None).await else {
         panic!("a removed member may not fetch");
     };
     assert!(
@@ -593,8 +605,13 @@ async fn push_follows_the_signed_state() {
     );
 }
 
-/// `wires inbox`'s fetch from `host`, as `who`.
-async fn fetch(w: &World, who: &NodeIdentity, host: &Host) -> Fetched {
+/// `wires inbox`'s fetch from `host`, as `who`, presenting `id_token`.
+async fn fetch(
+    w: &World,
+    who: &NodeIdentity,
+    host: &Host,
+    id_token: Option<library::IdToken>,
+) -> Fetched {
     let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(secret_key(who))
         .bind()
@@ -603,7 +620,7 @@ async fn fetch(w: &World, who: &NodeIdentity, host: &Host) -> Fetched {
     let mailbox = Mailbox::open(&crate::testutil::temp_dir()).unwrap();
     let hello = library::InboxFrame::Hello {
         membership: w.membership(who),
-        proof: None,
+        id_token,
     };
     let fetched = timeout(
         PATIENCE,
@@ -620,4 +637,146 @@ async fn fetch(w: &World, who: &NodeIdentity, host: &Host) -> Fetched {
     .unwrap();
     endpoint.close().await;
     fetched
+}
+
+/// A member's endpoint that counts every connection it is offered, on every
+/// ALPN a wires node speaks, and answers none.
+async fn counting_node(who: &NodeIdentity) -> (Router, EndpointAddr, Arc<AtomicUsize>) {
+    #[derive(Clone, Debug)]
+    struct Count(Arc<AtomicUsize>);
+    impl iroh::protocol::ProtocolHandler for Count {
+        async fn accept(
+            &self,
+            conn: iroh::endpoint::Connection,
+        ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            conn.close(0u32.into(), b"counted");
+            Ok(())
+        }
+    }
+    let seen = Arc::new(AtomicUsize::new(0));
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(secret_key(who))
+        .bind()
+        .await
+        .unwrap();
+    let addr = endpoint_addr(&who.node_id(), &localhost_socks(&endpoint), None).unwrap();
+    let mut router = Router::builder(endpoint);
+    for alpn in [
+        ALPN,
+        library::INBOX_ALPN,
+        library::STATE_ALPN,
+        crate::host::record_stream::ALPN,
+    ] {
+        router = router.accept(alpn, Count(Arc::clone(&seen)));
+    }
+    (router.spawn(), addr, seen)
+}
+
+#[tokio::test]
+async fn a_fetch_with_a_token_makes_a_caller_reachable_by_role() {
+    let w = World::new().await;
+    let state = w.state(1, &w.everyone());
+    let host = Host::start(&w, w.host_json(SERVICES, true), &state)
+        .await
+        .unwrap();
+    let push = host.push.clone().unwrap();
+    let to_analysts = || PushSpec {
+        to: "analyst".into(),
+        subject: Subject::new("report").unwrap(),
+        body: PushBody::new("ready").unwrap(),
+        ttl_secs: None,
+    };
+    // carol (an analyst) has never called this host: nobody is reachable.
+    let e = format!("{:#}", push.send(to_analysts()).await.unwrap_err());
+    assert!(e.contains("wires inbox"), "{e}");
+
+    // Her `wires inbox` presents her token: now the host knows who she is.
+    let token = w.hello(&w.carol, 1, true).id_token;
+    assert!(matches!(
+        fetch(&w, &w.carol, &host, token).await,
+        Fetched::Messages(0)
+    ));
+
+    // And while `wires inbox --wait` runs, a push is delivered directly.
+    let home = crate::testutil::temp_dir();
+    let ks = Arc::new(Keystore::at(&home));
+    crate::state::store::adopt_if_newer(&ks, &state, w.root.node_id(), crate::now_unix()).unwrap();
+    let mailbox = Mailbox::open(&home).unwrap();
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(secret_key(&w.carol))
+        .bind()
+        .await
+        .unwrap();
+    host.book.add_endpoint_info(
+        endpoint_addr(&w.carol.node_id(), &localhost_socks(&endpoint), None).unwrap(),
+    );
+    let _receiver = Router::builder(endpoint)
+        .accept(
+            library::INBOX_ALPN,
+            InboxReceiver {
+                me: w.carol.node_id(),
+                fabric: w.root.node_id(),
+                keystore: Arc::clone(&ks),
+                mailbox: mailbox.clone(),
+            },
+        )
+        .spawn();
+    let report = push.send(to_analysts()).await.unwrap();
+    assert_eq!(report.results.len(), 1, "{}", report.render());
+    assert_eq!(report.results[0].to, w.carol.node_id());
+    assert_eq!(
+        report.results[0].outcome,
+        library::PushOutcome::Delivered,
+        "{}",
+        report.render()
+    );
+    let unread = mailbox.take_unread().unwrap();
+    assert_eq!(unread.len(), 1);
+    assert_eq!(unread[0].from, w.host.node_id());
+}
+
+#[tokio::test]
+async fn nothing_is_broadcast_to_a_bystander() {
+    let w = World::new().await;
+    let host = Host::start(&w, w.host_json(SERVICES, true), &w.state(1, &w.everyone()))
+        .await
+        .unwrap();
+    // carol is a member the host could dial, and takes part in nothing.
+    let (_carol, carol_addr, seen) = counting_node(&w.carol).await;
+    host.book.add_endpoint_info(carol_addr);
+
+    // alice calls (twice), bob is refused, the host pushes to alice and
+    // she fetches it.
+    let out = call(
+        &w.alice,
+        &host,
+        w.hello(&w.alice, 1, true),
+        "orders-db",
+        &["1"],
+    )
+    .await;
+    assert_eq!(out.stdout(), "rows: 1\n");
+    call(&w.alice, &host, w.hello(&w.alice, 1, true), "status", &[]).await;
+    let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "orders-db", &[]).await;
+    out.denied();
+    let push = host.push.clone().unwrap();
+    let report = push
+        .send(PushSpec {
+            to: w.alice.node_id().hex(),
+            subject: Subject::new("done").unwrap(),
+            body: PushBody::new("ok").unwrap(),
+            ttl_secs: None,
+        })
+        .await
+        .unwrap();
+    assert!(report.any_accepted(), "{}", report.render());
+    assert!(matches!(
+        fetch(&w, &w.alice, &host, None).await,
+        Fetched::Messages(1)
+    ));
+
+    // The bystander heard nothing about any of it: no connection at all.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(seen.load(Ordering::SeqCst), 0);
 }

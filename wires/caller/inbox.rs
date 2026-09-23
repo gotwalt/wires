@@ -1,21 +1,22 @@
 //! `wires inbox`: messages hosts push to this caller (board card 23).
 //!
 //! A host reaches a caller by **key**: it needs no address, and the caller
-//! exposes nothing. Messages land in the local mailbox
+//! exposes nothing it doesn't choose to. Messages land in the local mailbox
 //! (`$WIRES_HOME/inbox/`, `0700`) one of two ways:
 //!
-//! - **pushed** to a resident receiver: a running `wires watch` serves the
-//!   inbox ALPN ([`INBOX_ALPN`]) and accepts deliveries ([`InboxReceiver`])
-//!   from roster members that announce as hosts on the channel;
-//! - **fetched** by `wires inbox` itself when no watch is running: a bounded
-//!   catch-up from every host in the caller's channel directory (like `wires
-//!   call`'s cold path), after which the host forgets what was acknowledged.
+//! - **fetched** by `wires inbox`: a bounded catch-up from every host of the
+//!   services this node may call (from its signed state), after which the
+//!   host forgets what was acknowledged. The fetch presents this node's ID
+//!   token (`wires login`), which is how a host learns who it is for pushes
+//!   addressed to a role;
+//! - **pushed** while `wires inbox --wait` runs: it serves the inbox ALPN
+//!   ([`INBOX_ALPN`]) and accepts deliveries ([`InboxReceiver`]) from members
+//!   the signed state names as hosts, besides long-polling each host.
 //!
 //! `wires inbox` then prints what is unread — one line per message, or
-//! `--json` — and marks it read. With a resident receiver it never touches
-//! the network, so an agent can run it on a loop for free; `--wait` blocks
-//! until a message arrives (exit [`EXIT_TIMEOUT`] on `--timeout`), which a
-//! harness with background tasks turns into a wake-up that costs no turns.
+//! `--json` — and marks it read. `--wait` blocks until a message arrives
+//! (exit [`EXIT_TIMEOUT`] on `--timeout`), which a harness with background
+//! tasks turns into a wake-up that costs no turns.
 //!
 //! # Pushed content is untrusted
 //!
@@ -36,7 +37,7 @@
 //! delivery is at least once, and this is the de-duplication), and `notes/`
 //! what `wires inbox` should tell its reader (messages evicted because more
 //! than [`MAX_UNREAD`] piled up unread; the oldest go first). Every write is
-//! a rename, so the resident receiver and `wires inbox` never see half a
+//! a rename, so a receiver and a concurrent `wires inbox` never see half a
 //! message, and marking read is a rename too: two readers never both print
 //! one.
 
@@ -48,17 +49,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use iroh::{Endpoint, EndpointAddr};
 use library::{
-    INBOX_ALPN, InboxFrame, InclusionProof, MAX_BATCH, Membership, NodeId, PushId, PushMessage,
+    INBOX_ALPN, InboxFrame, MAX_BATCH, Membership, NodeId, NodeIdentity, PushId, PushMessage,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::admin::commit::Ttl;
+use crate::admin::keystore::{self, Keystore};
+use crate::admin::ttl::Ttl;
 use crate::caller::call::CredArgs;
 use crate::caller::lock::{EXIT_LOCKED, Lock};
-use crate::caller::resolve::Directory;
-use crate::channel::context::TopicContext;
-use crate::host::transport::{self, Denied, HeadSource};
+use crate::host::transport::{self, Denied};
 
 /// The mailbox directory under `$WIRES_HOME`.
 pub(crate) const INBOX_DIR: &str = "inbox";
@@ -79,21 +79,14 @@ pub(crate) const EXIT_TIMEOUT: i32 = 124;
 const FETCH_BUDGET: Duration = Duration::from_secs(3);
 
 /// How long one fetch asks a host to hold the stream open for a message
-/// (`--wait` with no resident receiver). The host caps it too.
+/// (`--wait`). The host caps it too.
 pub(crate) const LONG_POLL: Duration = Duration::from_secs(25);
-
-/// How often `--wait` looks at the mailbox a resident receiver fills.
-const MAILBOX_POLL: Duration = Duration::from_millis(100);
 
 /// How long to wait for a peer's frame (beyond any long poll).
 const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a fetch waits for a host to answer the dial.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How often a resident receiver fetches what hosts queued while it was not
-/// listening (and at start).
-pub(crate) const RESIDENT_FETCH: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Frame I/O (shared with the host's side, `host::push`)
@@ -460,28 +453,22 @@ fn civil(days: i64) -> (i64, i64, i64) {
 }
 
 // ---------------------------------------------------------------------------
-// The resident receiver (inside `wires watch`)
+// The receiver (inside `wires inbox --wait`)
 // ---------------------------------------------------------------------------
 
-/// The inbox ALPN on a caller's resident node: accepts deliveries from hosts.
+/// The inbox ALPN on a waiting caller: accepts deliveries from hosts.
 ///
-/// A delivery is accepted only from a peer that proves fabric membership,
-/// is in the current roster (its proof, or the proof directory beside this
-/// node's head), and is a **host on the channel** — it announced there
-/// (`directory.json`, kept fresh by the same watch). Each message must be
-/// from that peer and to this node.
+/// A delivery is accepted only from a peer that proves fabric membership
+/// and that this node's **signed state names as a host** (re-read per
+/// delivery). Each message must be from that peer and to this node.
 #[derive(Clone)]
 pub(crate) struct InboxReceiver {
     /// This node.
     pub(crate) me: NodeId,
-    /// The fabric root memberships must chain to.
+    /// The fabric root memberships and the state must chain to.
     pub(crate) fabric: NodeId,
-    /// This node's enforced roster head.
-    pub(crate) head: Arc<HeadSource>,
-    /// Where `directory.json` is.
-    pub(crate) home: PathBuf,
-    /// The channel the directory is for.
-    pub(crate) channel: String,
+    /// Where this node's signed state is.
+    pub(crate) keystore: Arc<Keystore>,
     /// Where messages go.
     pub(crate) mailbox: Mailbox,
 }
@@ -490,42 +477,30 @@ impl std::fmt::Debug for InboxReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InboxReceiver")
             .field("me", &self.me.hex())
-            .field("channel", &self.channel)
             .finish_non_exhaustive()
     }
 }
 
 impl InboxReceiver {
-    /// Whether `peer` may deliver here: a member, in the current roster, a
-    /// host on the channel. `Err` is the reason it is told.
+    /// Whether `peer` may deliver here: a member, and a host in this node's
+    /// signed state. `Err` is the reason it is told.
     pub(crate) fn admit(
         &self,
         peer: NodeId,
         membership: &Membership,
-        proof: Option<&InclusionProof>,
         now: i64,
     ) -> std::result::Result<(), String> {
         library::check_inclusion(membership, self.fabric, peer, now)
             .map_err(|e| format!("membership rejected: {e}"))?;
-        if let Some(head) = self.head.load().map_err(|e| format!("{e:#}"))? {
-            let directory = crate::channel::rekey::directory_for(&self.head);
-            library::check_roster_inclusion_via(
-                &head,
-                proof,
-                directory.as_ref(),
-                self.fabric,
-                peer,
-                now,
-            )
-            .map_err(|e| format!("roster inclusion rejected: {e}"))?;
-        }
-        let dir = Directory::load(&Directory::path(&self.home), &self.channel);
-        if !dir.hosts.iter().any(|h| h.node == peer) {
+        let state = crate::state::store::read(&self.keystore, self.fabric)
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or("this node holds no signed state")?;
+        if !state.state.is_host(peer) {
             return Err(format!(
-                "{} has not announced as a host on channel {:?}; this inbox takes pushes from \
-                 hosts only",
+                "{} is not a host in the signed state (version {}); this inbox takes pushes \
+                 from hosts only",
                 &peer.hex()[..8],
-                self.channel
+                state.state.version.0
             ));
         }
         Ok(())
@@ -537,14 +512,14 @@ impl InboxReceiver {
         S: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
     {
-        let (membership, proof) = match read_frame(&mut recv, FRAME_TIMEOUT).await? {
-            Some(InboxFrame::Hello { membership, proof }) => (membership, proof),
+        let membership = match read_frame(&mut recv, FRAME_TIMEOUT).await? {
+            Some(InboxFrame::Hello { membership, .. }) => membership,
             _ => {
                 deny(&mut send, "expected hello").await;
                 bail!("a peer spoke out of turn");
             }
         };
-        if let Err(reason) = self.admit(peer, &membership, proof.as_ref(), crate::now_unix()) {
+        if let Err(reason) = self.admit(peer, &membership, crate::now_unix()) {
             tracing::warn!(peer = %peer.hex(), "refusing a push: {reason}");
             deny(&mut send, &reason).await;
             return Ok(());
@@ -653,46 +628,13 @@ pub(crate) async fn fetch_from(
     }
 }
 
-/// The `Hello` this node presents: its membership and current proof.
-pub(crate) fn hello(ctx: &TopicContext) -> InboxFrame {
+/// The `Hello` this node presents: its membership and the ID token `wires
+/// login` stored (so the host learns who it is, for pushes by role).
+pub(crate) fn hello(ks: &Keystore, membership: &Membership) -> InboxFrame {
     InboxFrame::Hello {
-        membership: ctx.membership.clone(),
-        proof: ctx
-            .keystore
-            .read_inclusion_proof()
-            .ok()
-            .flatten()
-            .or_else(|| Some(ctx.proof.clone())),
+        membership: membership.clone(),
+        id_token: crate::caller::hello::stored_token(ks),
     }
-}
-
-/// Every host in `dir`, as a dial target: the directory's hints, else the
-/// bootstrap `peers`' (and `relay` when neither names one).
-pub(crate) fn host_targets(
-    dir: &Directory,
-    peers: &[library::TopicPeer],
-    relay: Option<&str>,
-) -> Vec<(NodeId, EndpointAddr)> {
-    dir.hosts
-        .iter()
-        .filter_map(|h| {
-            let hint = peers.iter().find(|p| p.node == h.node);
-            let addrs = if h.listing.addrs.is_empty() {
-                hint.map(|p| p.addrs.clone()).unwrap_or_default()
-            } else {
-                h.listing.addrs.clone()
-            };
-            let relay = h
-                .listing
-                .relay_url
-                .clone()
-                .or_else(|| hint.and_then(|p| p.relay_url.clone()))
-                .or_else(|| relay.map(str::to_string));
-            transport::endpoint_addr(&h.node, &addrs, relay.as_deref())
-                .ok()
-                .map(|a| (h.node, a))
-        })
-        .collect()
 }
 
 /// Fetch from every host in `targets` at once, each bounded by `budget`
@@ -736,50 +678,6 @@ pub(crate) async fn fetch_all(
     out
 }
 
-/// A resident receiver's catch-up: fetch from every known host now and then
-/// every [`RESIDENT_FETCH`], so what was queued while it was not listening
-/// still arrives. A host that refuses it is not asked again by this run
-/// (live pushes from it are still accepted). Runs until aborted.
-pub(crate) async fn resident_fetch(
-    endpoint: Endpoint,
-    home: PathBuf,
-    channel: String,
-    hello: InboxFrame,
-    peers: Vec<library::TopicPeer>,
-    mailbox: Mailbox,
-) {
-    let mut refused: std::collections::BTreeSet<NodeId> = Default::default();
-    loop {
-        let dir = Directory::load(&Directory::path(&home), &channel);
-        let targets: Vec<(NodeId, EndpointAddr)> = host_targets(&dir, &peers, None)
-            .into_iter()
-            .filter(|(node, _)| !refused.contains(node))
-            .collect();
-        for (host, fetched) in fetch_all(
-            &endpoint,
-            &targets,
-            &hello,
-            Duration::ZERO,
-            FETCH_BUDGET,
-            &mailbox,
-        )
-        .await
-        {
-            match fetched {
-                Fetched::Messages(0) => {}
-                Fetched::Messages(n) => {
-                    tracing::info!(host = %host.hex(), fetched = n, "fetched queued pushes")
-                }
-                Fetched::Refused(reason) => {
-                    tracing::debug!(host = %host.hex(), "inbox fetch refused: {reason}");
-                    refused.insert(host);
-                }
-            }
-        }
-        tokio::time::sleep(RESIDENT_FETCH).await;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // `wires inbox`
 // ---------------------------------------------------------------------------
@@ -812,12 +710,6 @@ pub(crate) struct InboxArgs {
     /// Read the membership token from this file (refused in locked mode).
     #[arg(long)]
     pub(crate) membership_file: Option<PathBuf>,
-    /// The inclusion proof to present (refused in locked mode).
-    #[arg(long)]
-    pub(crate) inclusion_proof: Option<String>,
-    /// Read the inclusion proof from this file (refused in locked mode).
-    #[arg(long)]
-    pub(crate) inclusion_proof_file: Option<PathBuf>,
     /// Dial hosts through this relay (refused in locked mode).
     #[arg(long)]
     pub(crate) relay_url: Option<String>,
@@ -825,7 +717,7 @@ pub(crate) struct InboxArgs {
 
 impl InboxArgs {
     /// The credential flags, as `call` / `mcp` take them (what locked mode
-    /// checks, and how the channel context resolves).
+    /// checks).
     pub(crate) fn creds(&self) -> CredArgs {
         CredArgs {
             tools_file: None,
@@ -833,15 +725,14 @@ impl InboxArgs {
             node_seed_file: self.node_seed_file.clone(),
             membership: self.membership.clone(),
             membership_file: self.membership_file.clone(),
-            inclusion_proof: self.inclusion_proof.clone(),
-            inclusion_proof_file: self.inclusion_proof_file.clone(),
             relay_url: self.relay_url.clone(),
         }
     }
 }
 
-/// `wires inbox`: fetch (unless a resident receiver is running), print what
-/// is unread, mark it read; returns the exit code.
+/// `wires inbox`: fetch from the hosts of this node's services (and, with
+/// `--wait`, accept direct deliveries meanwhile), print what is unread, mark
+/// it read; returns the exit code.
 pub(crate) async fn inbox_cmd(a: InboxArgs) -> Result<i32> {
     let lock = Lock::detect()?;
     let creds = a.creds();
@@ -849,39 +740,44 @@ pub(crate) async fn inbox_cmd(a: InboxArgs) -> Result<i32> {
         eprintln!("wires: {e}");
         return Ok(EXIT_LOCKED);
     }
-    let ctx = crate::caller::resolve::caller_context(&creds)
-        .context("`wires inbox` reads the pushes of your joined channel's hosts")?;
-    let mailbox = Mailbox::open(&ctx.home)?;
-    let resident = crate::channel::ipc::ControlClient::connect(&ctx.socket_path())
-        .await
-        .ok()
-        .flatten()
-        .is_some();
+    let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
+    let membership = keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?;
+    keystore::preflight(node.node_id(), &membership).map_err(anyhow::Error::msg)?;
+    let ks = Arc::new(Keystore::resolve()?);
+    let mailbox = Mailbox::open(&keystore::home()?)?;
     let deadline = a
         .timeout
         .map(|t| tokio::time::Instant::now() + t.duration());
-    let fetcher = if resident {
-        None
-    } else {
-        Some(cold_fetcher(&ctx).await?)
-    };
-    let code = read_loop(&a, &mailbox, fetcher.as_ref(), deadline).await;
-    if let Some((endpoint, ..)) = fetcher {
-        endpoint.close().await;
-    }
+    let fetcher = cold_fetcher(&ks, &node, &membership, a.relay_url.as_deref()).await?;
+    // While waiting, a host's direct delivery lands here too.
+    let _receiver = a.wait.then(|| {
+        iroh::protocol::Router::builder(fetcher.0.clone())
+            .accept(
+                INBOX_ALPN,
+                InboxReceiver {
+                    me: node.node_id(),
+                    fabric: membership.fabric,
+                    keystore: Arc::clone(&ks),
+                    mailbox: mailbox.clone(),
+                },
+            )
+            .spawn()
+    });
+    let code = read_loop(&a, &mailbox, &fetcher, deadline).await;
+    fetcher.0.close().await;
     code
 }
 
-/// A cold `wires inbox`'s way to the hosts: its endpoint, their dial
-/// targets, and the `Hello` it presents.
+/// `wires inbox`'s way to the hosts: its endpoint, their dial targets, and
+/// the `Hello` it presents.
 type Fetcher = (Endpoint, Vec<(NodeId, EndpointAddr)>, InboxFrame);
 
-/// Fetch (when `fetcher` is set), print what is unread, and — with
-/// `--wait` — repeat until something is printed or `deadline` passes.
+/// Fetch, print what is unread, and — with `--wait` — repeat until
+/// something is printed or `deadline` passes.
 async fn read_loop(
     a: &InboxArgs,
     mailbox: &Mailbox,
-    fetcher: Option<&Fetcher>,
+    fetcher: &Fetcher,
     deadline: Option<tokio::time::Instant>,
 ) -> Result<i32> {
     let mut out = tokio::io::stdout();
@@ -889,7 +785,8 @@ async fn read_loop(
         let round = tokio::time::Instant::now();
         // Every host refused this node: an answer, not "nothing yet" (77).
         let mut refused_by_all: Option<String> = None;
-        if let Some((endpoint, targets, hello)) = fetcher {
+        {
+            let (endpoint, targets, hello) = fetcher;
             let wait = if a.wait && !mailbox.has_unread() {
                 deadline
                     .map_or(LONG_POLL, |d| d.saturating_duration_since(round))
@@ -901,9 +798,14 @@ async fn read_loop(
             for (host, fetched) in
                 fetch_all(endpoint, targets, hello, wait, FETCH_BUDGET, mailbox).await
             {
-                if let Fetched::Refused(reason) = fetched {
-                    eprintln!("wires inbox: host {} refused: {reason}", &host.hex()[..8]);
-                    refusals.push(reason);
+                match fetched {
+                    Fetched::Refused(reason) => {
+                        eprintln!("wires inbox: host {} refused: {reason}", &host.hex()[..8]);
+                        refusals.push(reason);
+                    }
+                    Fetched::Messages(n) => {
+                        tracing::debug!(host = %host.hex(), fetched = n, "inbox fetch")
+                    }
                 }
             }
             if !targets.is_empty() && refusals.len() == targets.len() {
@@ -935,62 +837,39 @@ async fn read_loop(
             eprintln!("wires inbox: nothing arrived before the timeout");
             return Ok(EXIT_TIMEOUT);
         }
-        // A resident receiver fills the mailbox: look again shortly. A cold
-        // fetch long-polls, so a round that came back early (a host that
+        // A fetch long-polls, so a round that came back early (a host that
         // could not be reached) waits out a second before the next.
-        let pause = if fetcher.is_some() {
-            Duration::from_secs(1)
-        } else {
-            MAILBOX_POLL
-        };
-        tokio::time::sleep_until(round + pause).await;
+        tokio::time::sleep_until(round + Duration::from_secs(1)).await;
     }
 }
 
-/// The hosts of every service this node may call (card 27), once each; `None`
-/// when it holds no signed state yet (the channel directory stands in).
-async fn service_hosts(ctx: &TopicContext) -> Result<Option<Vec<NodeId>>> {
-    if crate::state::store::read(&ctx.keystore, ctx.membership.fabric)?.is_none() {
-        return Ok(None);
+/// A fetcher: this node's endpoint, the hosts of every service it may call
+/// (from its signed state; no network read), and its `Hello`.
+async fn cold_fetcher(
+    ks: &Keystore,
+    node: &NodeIdentity,
+    membership: &Membership,
+    relay_url: Option<&str>,
+) -> Result<Fetcher> {
+    if crate::state::store::read(ks, membership.fabric)?.is_none() {
+        bail!("this node holds no signed state yet: run `wires join <token>` first");
     }
-    let allowed = crate::caller::services::allowed(&ctx.keystore).await?;
-    Ok(Some(crate::caller::pick::hosts_of(
+    let allowed = crate::caller::services::allowed(ks).await?;
+    let hosts: Vec<NodeId> = crate::caller::pick::hosts_of(
         &allowed.state.state,
         allowed.grants.iter().map(|g| &g.service),
-    )))
-}
-
-/// A cold fetcher: this node's endpoint, the channel's hosts (refreshing
-/// the directory from the channel when it knows none), and the `Hello`.
-async fn cold_fetcher(
-    ctx: &TopicContext,
-) -> Result<(Endpoint, Vec<(NodeId, EndpointAddr)>, InboxFrame)> {
-    // Card 27: the hosts of the services this node may call, from its signed
-    // state (no channel read, no directory).
-    if let Some(hosts) = service_hosts(ctx).await? {
-        let hints = crate::caller::pick::Hints::load(&ctx.keystore, ctx.membership.fabric);
-        let targets = hosts
-            .iter()
-            .copied()
-            .zip(hints.targets(&hosts, ctx.relay_url.as_deref()))
-            .collect();
-        let endpoint = transport::bind(&ctx.node, ctx.relay_url.as_deref()).await?;
-        return Ok((endpoint, targets, hello(ctx)));
-    }
-    let path = Directory::path(&ctx.home);
-    let mut dir = Directory::load(&path, &ctx.name);
-    if dir.hosts.is_empty() {
-        dir = crate::caller::resolve::fresh_directory(
-            ctx,
-            crate::caller::resolve::CATCH_UP_BUDGET,
-            None,
-        )
-        .await?;
-    }
-    let peers = crate::channel::peers::PeerBook::open(&ctx.home, ctx.topic).list();
-    let targets = host_targets(&dir, &peers, ctx.relay_url.as_deref());
-    let endpoint = transport::bind(&ctx.node, ctx.relay_url.as_deref()).await?;
-    Ok((endpoint, targets, hello(ctx)))
+    )
+    .into_iter()
+    .filter(|h| *h != node.node_id())
+    .collect();
+    let hints = crate::caller::pick::Hints::load(ks);
+    let targets = hosts
+        .iter()
+        .copied()
+        .zip(hints.targets(&hosts, relay_url))
+        .collect();
+    let endpoint = transport::bind(node, relay_url).await?;
+    Ok((endpoint, targets, hello(ks, membership)))
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 //! `host.json` version 2: how this host implements the services the signed
-//! state assigns to it (card 27, lane **27c**).
+//! state assigns to it (card 27).
 //!
 //! Who may call a service is no longer the host's to say: the admin-signed
 //! registry names each service's roles and hosts. The host file shrinks to
@@ -25,8 +25,8 @@
 //! ```
 //!
 //! - `version` (required, `2`). **Unknown keys are errors** at every level.
-//! - `identity.issuers`: the IdPs whose ID tokens this host verifies (the
-//!   same shape as v1). Local trust: the registry's roles match principals,
+//! - `identity.issuers`: the IdPs whose ID tokens this host verifies, each
+//!   with the OAuth client ids it accepts as `aud`. Local trust: the registry's roles match principals,
 //!   but which IdPs to believe is the host's call.
 //! - `services`: name → `command` (argv, never a shell; each call's
 //!   arguments are appended), optional `cwd`, optional `env` (set on top of
@@ -35,22 +35,23 @@
 //!   `allow`. It can only narrow.
 //! - `push`: which registry roles may receive pushes from this host, and
 //!   whether the call log keeps push bodies (card 23).
-//! - `audit.otlp`: as v1 (card 26a).
+//! - `audit.otlp`: an OTLP/HTTP collector the call log is also exported to
+//!   (card 26a).
 //!
 //! What this parser checks is the file on its own. Checks against the signed
 //! state (every service here is assigned to this host; every role named is
 //! defined) are [`HostConfigV2::check_against`], which `serve` runs before
-//! it binds. v1 ([`HostConfig`](crate::host::config::HostConfig)) still
-//! parses; [`AnyHostConfig::parse`] picks by `version`.
+//! it binds. Version 1 (tools and roles decided by the host, card 13) is
+//! refused with a pointer to the signed state.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use library::{NodeId, RoleName, ServiceName, State};
+use library::{Audience, Issuer, NodeId, RoleName, ServiceName, State};
 use serde::{Deserialize, Serialize};
 
-use crate::host::config::{AuditConfig, HostConfig, IdentityConfig};
+use crate::host::identity::IdpTrust;
 
 /// The `host.json` version this module reads.
 pub(crate) const HOST_CONFIG_V2: u32 = 2;
@@ -106,44 +107,80 @@ pub(crate) struct PushV2 {
     pub(crate) log_body: bool,
 }
 
-/// Either version of `host.json`, picked by its `version` key.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum AnyHostConfig {
-    /// Card 13's shape: the host decides tools and roles.
-    V1(HostConfig),
-    /// Card 27's shape: the registry decides; the host implements.
-    V2(HostConfigV2),
+/// `audit`: optional sinks for the host's call log, beyond the log itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AuditConfig {
+    /// An OTLP/HTTP collector base URL (`/v1/logs` is appended).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) otlp: Option<String>,
 }
 
-impl AnyHostConfig {
-    /// Read and validate `host.json` at `path`, either version.
+/// `identity`: the IdPs the host verifies ID tokens from.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IdentityConfig {
+    /// The trusted issuers.
+    #[serde(default)]
+    pub(crate) issuers: Vec<TrustedIssuer>,
+}
+
+impl IdentityConfig {
+    /// The IdPs and per-issuer audiences to verify ID tokens under.
+    pub(crate) fn trust(&self) -> IdpTrust {
+        IdpTrust::per_issuer(
+            self.issuers
+                .iter()
+                .map(|t| {
+                    (
+                        Issuer::new(t.issuer.clone()),
+                        t.audiences
+                            .iter()
+                            .filter(|a| !a.trim().is_empty())
+                            .map(|a| Audience::new(a.clone()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+/// One trusted IdP.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TrustedIssuer {
+    /// The token `iss`, exactly (e.g. `https://accounts.google.com`).
+    pub(crate) issuer: String,
+    /// The OAuth client ids accepted as `aud` from this issuer.
+    pub(crate) audiences: Vec<String>,
+}
+
+impl HostConfigV2 {
+    /// Read and validate `host.json` at `path`.
     pub(crate) fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         Self::parse(&text).with_context(|| format!("{} is not a valid host.json", path.display()))
     }
 
-    /// Parse either version: `version` 1 goes to the v1 parser, 2 to
-    /// [`HostConfigV2::parse`]; anything else is an error.
+    /// Parse and validate v2 text: the schema, then
+    /// [`validate`](Self::validate).
     pub(crate) fn parse(text: &str) -> Result<Self> {
         #[derive(Deserialize)]
         struct Peek {
             version: Option<u32>,
         }
-        let peek: Peek = serde_json::from_str(text)?;
-        match peek.version {
-            Some(1) => Ok(Self::V1(HostConfig::parse(text)?)),
-            Some(HOST_CONFIG_V2) => Ok(Self::V2(HostConfigV2::parse(text)?)),
-            Some(v) => bail!("version {v} is not supported (this host reads 1 and 2)"),
+        match serde_json::from_str::<Peek>(text)?.version {
+            Some(HOST_CONFIG_V2) => {}
+            Some(1) => bail!(
+                "version 1 (tools and roles decided by the host) is no longer served: services \
+                 and roles live in the admin-signed state (`wires service add`, `wires role \
+                 set`), and host.json version 2 says how this host implements them"
+            ),
+            Some(v) => bail!("version {v} is not supported (this host reads version 2)"),
             None => bail!("missing `version`"),
         }
-    }
-}
-
-impl HostConfigV2 {
-    /// Parse and validate v2 text: the schema, then
-    /// [`validate`](Self::validate).
-    pub(crate) fn parse(text: &str) -> Result<Self> {
         let config: Self = serde_json::from_str(text)?;
         config.validate()?;
         Ok(config)
@@ -312,9 +349,7 @@ mod tests {
 
     #[test]
     fn parses_the_example() {
-        let AnyHostConfig::V2(c) = AnyHostConfig::parse(EXAMPLE).unwrap() else {
-            panic!("expected v2");
-        };
+        let c = HostConfigV2::parse(EXAMPLE).unwrap();
         let svc = &c.services[&ServiceName::new("orders-db").unwrap()];
         assert_eq!(svc.cwd.as_deref(), Some(Path::new("/srv/orders")));
         assert_eq!(svc.also_require, vec![RoleName::new("sre").unwrap()]);
@@ -322,12 +357,10 @@ mod tests {
     }
 
     #[test]
-    fn v1_still_parses() {
+    fn v1_is_refused_with_the_way_forward() {
         let v1 = r#"{"version":1,"tools":{"echo":{"command":["echo"],"allow":["member"]}}}"#;
-        assert!(matches!(
-            AnyHostConfig::parse(v1).unwrap(),
-            AnyHostConfig::V1(_)
-        ));
+        let e = format!("{:#}", HostConfigV2::parse(v1).unwrap_err());
+        assert!(e.contains("wires service add"), "{e}");
     }
 
     #[test]
@@ -353,7 +386,7 @@ mod tests {
             r#"{"version":2,"services":{"a":{"command":["x"]}},"audit":{"otlp":"ftp://x"}}"#,
             r#"{"version":3,"services":{"a":{"command":["x"]}}}"#,
         ] {
-            assert!(AnyHostConfig::parse(bad).is_err(), "{bad}");
+            assert!(HostConfigV2::parse(bad).is_err(), "{bad}");
         }
     }
 
