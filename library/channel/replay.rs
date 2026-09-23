@@ -228,7 +228,7 @@ mod tests {
     use super::*;
     use crate::envelope::{Ciphertext, ENVELOPE_V1, MessageHash, MessageNonce, Seq, TopicEnvelope};
     use crate::error::Error;
-    use crate::grant::AlgorithmId;
+    use crate::identity::AlgorithmId;
     use crate::identity::Signature;
     use crate::roster::RosterVersion;
     use proptest::prelude::*;

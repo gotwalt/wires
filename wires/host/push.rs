@@ -287,7 +287,7 @@ impl Queue {
 pub(crate) struct PushHost {
     /// This host.
     me: NodeId,
-    /// The host's session config: trust root, CRL/head sources, policy,
+    /// The host's session config: trust root, head source, policy,
     /// identity gate, audit sink, own membership.
     serve: Arc<ServeConfig>,
     /// Who the channel's current roster holds.

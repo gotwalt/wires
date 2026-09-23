@@ -38,7 +38,7 @@ use crate::host::announce::Announcer;
 use crate::host::config::HostConfig;
 use crate::host::identity::{Identities, IdentityGate};
 use crate::host::transport::{
-    AuditSink, CrlSource, Denied, HeadSource, ServeConfig, SessionProtocol, secret_key,
+    AuditSink, Denied, HeadSource, ServeConfig, SessionProtocol, secret_key,
 };
 use crate::now_unix;
 
@@ -83,8 +83,6 @@ pub(super) fn serve_pushing(
     let (sink, records) = AuditSink::channel(crate::host::audit::AUDIT_QUEUE);
     let serve = ServeConfig {
         trust_root: ctx.fabric_root,
-        require_grant: false,
-        crl: CrlSource::Fixed(library::Crl::new()),
         head: HeadSource::Keystore {
             path: m.ks.path("roster-head.json"),
             armed: AtomicBool::new(true),
@@ -206,9 +204,7 @@ async fn call(
             endpoint,
             target,
             m.ks.read_membership().unwrap().unwrap(),
-            None,
             m.ks.read_inclusion_proof().unwrap(),
-            plan.ticketless,
             plan.invocation,
             std::io::Cursor::new(stdin.to_vec()),
             &mut out,

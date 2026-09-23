@@ -156,9 +156,7 @@ async fn call_tool_as(
             endpoint,
             target.clone(),
             library::Membership::mint(&fab.root, m.id(), 0, i64::MAX).unwrap(),
-            None,
             Some(fab.at(version).proofs[&m.id()].clone()),
-            false,
             library::Invocation {
                 tool: library::ToolName::new(tool).unwrap(),
                 argv: library::Argv::new(Vec::new()).unwrap(),
@@ -252,7 +250,7 @@ async fn host_json_roles_admit_verified_federated_identities_only() {
     use crate::caller::mock_idp::MOCK_CLIENT_ID;
     use crate::host::config::HostConfig;
     use crate::host::identity::{Identities, IdentityGate};
-    use crate::host::transport::{AuditSink, CrlSource, ServeConfig, SessionProtocol};
+    use crate::host::transport::{AuditSink, ServeConfig, SessionProtocol};
 
     let corp = MockIdp::start("alice@example.com").await;
     let partner = MockIdp::start("bob@partner.org").await;
@@ -304,8 +302,6 @@ async fn host_json_roles_admit_verified_federated_identities_only() {
     let r_membership = library::Membership::mint(&fab.root, r.id(), 0, i64::MAX).unwrap();
     let serve = ServeConfig {
         trust_root: fab.id(),
-        require_grant: false,
-        crl: CrlSource::Fixed(library::Crl::new()),
         head: HeadSource::Keystore {
             path: r.keystore.path("roster-head.json"),
             armed: AtomicBool::new(true),

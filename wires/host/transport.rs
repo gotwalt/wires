@@ -1,18 +1,16 @@
-//! The iroh session transport: bind/dial, the grant handshake, and the stdio
-//! bridge.
+//! The iroh session transport: bind/dial, the membership handshake, and the
+//! stdio bridge.
 //!
 //! `library` stays pure (no iroh/tokio); this module is where the
 //! capability-addressed session meets the iroh QUIC endpoint. The session ALPN
 //! is [`ALPN`]. A dialer opens a bi-stream and sends a
 //! [`Frame::Handshake`](library::Frame::Handshake) bearing its fabric
-//! [`Membership`](library::Membership) and (when the responder requires one) a
-//! [`Grant`](library::Grant), followed at once by a [`Frame::Invoke`] naming
-//! one of the responder's tools plus per-call arguments ([`call_on`]). The
-//! responder verifies inclusion with [`library::check_inclusion`] (and, when
-//! grants are required, the grant with [`library::check_accept`]) against the
-//! iroh-authenticated caller, authorizes it for *that tool* (grant scope
-//! `tool:<name>` or [`TOOL_SCOPE_ANY`]), then execs the tool's fixed argv with
-//! the caller's arguments appended — never through a shell — with the verified
+//! [`Membership`](library::Membership) (and roster inclusion proof), followed
+//! at once by a [`Frame::Invoke`] naming one of the responder's tools plus
+//! per-call arguments ([`call_on`]). The responder verifies inclusion with
+//! [`library::check_inclusion`] and the roster head against the
+//! iroh-authenticated caller, asks the host's policy whether it may run *that
+//! tool*, then execs the tool's fixed argv with the caller's arguments appended — never through a shell — with the verified
 //! caller identity injected into its environment, and bridges its stdio over
 //! tagged frames.
 //!
@@ -22,10 +20,9 @@
 //!   [`Frame::Denied`] carrying the reason before closing, which the dialer
 //!   surfaces as a [`Denied`] error (`wires call` exits 77). Nothing the
 //!   dialer sends or receives on a refused session ever reaches its stdout.
-//! - **Refusals are current.** The CRL and the enforced roster head are
-//!   *sources* ([`CrlSource`] / [`HeadSource`]), re-read on every connection, so
-//!   `wires advanced revoke` and `wires advanced roster commit` take effect on the next dial
-//!   rather than the next restart.
+//! - **Refusals are current.** The enforced roster head is a *source*
+//!   ([`HeadSource`]), re-read on every connection, so a `wires remove` (a new
+//!   roster commit) takes effect on the next dial rather than the next restart.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -37,8 +34,8 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use std::collections::BTreeMap;
 
 use library::{
-    Chunk, Crl, Frame, Grant, InclusionProof, Invocation, Membership, NodeId, NodeIdentity,
-    RosterHead, Scope, ToolName, check_accept, check_inclusion,
+    Chunk, Frame, InclusionProof, Invocation, Membership, NodeId, NodeIdentity, RosterHead,
+    ToolName, check_inclusion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
@@ -68,16 +65,6 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// to the client.
 const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The grant scope that admits a caller to **every** tool on a responder. A
-/// grant scoped [`tool_scope`]`(name)` admits it to one.
-pub const TOOL_SCOPE_ANY: &str = "tool:*";
-
-/// The grant scope that admits a caller to exactly `tool` on a responder:
-/// `tool:<name>`.
-pub fn tool_scope(tool: &ToolName) -> Scope {
-    Scope::new(format!("tool:{tool}"))
-}
-
 /// Denial reason: the responder got something other than an
 /// [`Frame::Invoke`] after the handshake.
 pub const DENY_INVOKE_REQUIRED: &str = "invoke required";
@@ -92,17 +79,8 @@ fn deny_unknown_tool(tool: &ToolName) -> String {
 /// exposes, the optional roster head it enforces, and the identity it presents
 /// in the ack. Built once per `serve` and shared across connections.
 pub struct ServeConfig {
-    /// The trusted fabric root whose memberships, grants, and head are honored.
+    /// The trusted fabric root whose memberships and head are honored.
     pub trust_root: NodeId,
-    /// Whether a caller must present a grant; `false` is inclusion-only (any
-    /// fabric member) and leaves who may run what to [`policy`](Self::policy).
-    /// `wires serve host.json` never requires one.
-    ///
-    /// When set, the grant's scope must be [`tool_scope`] of the invoked tool
-    /// or [`TOOL_SCOPE_ANY`].
-    pub require_grant: bool,
-    /// Where the revocation list applied to the credential checks comes from.
-    pub crl: CrlSource,
     /// Where the enforced roster head comes from (or that none is enforced).
     pub head: HeadSource,
     /// The responder's own membership, presented in the `HandshakeAck`.
@@ -148,22 +126,9 @@ impl AuditSink {
     }
 }
 
-/// Where the responder reads its revocation list from.
-///
-/// `File` is re-read on **every connection**, so `wires advanced revoke` takes effect on
-/// the next dial without restarting the responder. `Fixed` pins a list supplied
-/// inline at startup (`--crl-json`), which is by definition static.
-#[derive(Debug)]
-pub enum CrlSource {
-    /// A list fixed at startup.
-    Fixed(Crl),
-    /// A path re-read per connection.
-    File(PathBuf),
-}
-
 /// Where the responder reads the enforced roster head from.
 ///
-/// `None` disables head enforcement (membership + CRL + TTL only); `File` and
+/// `None` disables head enforcement (membership + TTL only); `File` and
 /// `Keystore` are re-read per connection, so `wires advanced roster commit` takes effect
 /// on the next dial without a restart.
 #[derive(Debug)]
@@ -182,7 +147,7 @@ pub enum HeadSource {
     ///
     /// Enforcement arms itself the first time the file is seen: before that a
     /// missing file means "this responder has no head" (the pre-roster
-    /// membership + CRL + TTL behavior); after that it means the head was
+    /// membership + TTL behavior); after that it means the head was
     /// deleted, and every dial is refused. That is what makes `wires advanced import
     /// --roster-head…` land on a responder that started with no head at all —
     /// without it, a later-installed head would never be consulted and the
@@ -194,27 +159,6 @@ pub enum HeadSource {
         /// fails closed.
         armed: std::sync::atomic::AtomicBool,
     },
-}
-
-impl CrlSource {
-    /// Resolve the revocation list as it stands right now.
-    ///
-    /// A missing `File` is an **empty** list — the same thing "no `crl.json`
-    /// yet" meant at startup before the CRL was read per connection. A
-    /// malformed one is an error: a garbled list must never read as "nobody is
-    /// revoked".
-    pub fn load(&self) -> Result<Crl> {
-        match self {
-            CrlSource::Fixed(crl) => Ok(crl.clone()),
-            CrlSource::File(path) => match std::fs::read_to_string(path) {
-                Ok(text) => {
-                    Crl::from_json(&text).with_context(|| format!("parsing CRL {}", path.display()))
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Crl::new()),
-                Err(e) => Err(e).with_context(|| format!("reading CRL {}", path.display())),
-            },
-        }
-    }
 }
 
 impl HeadSource {
@@ -249,8 +193,8 @@ impl HeadSource {
                         }
                         Ok(Some(head))
                     }
-                    // Never seen a head: pre-roster behavior (membership + CRL
-                    // + TTL only). Seen one before: it was deleted — refuse.
+                    // Never seen a head: pre-roster behavior (membership +
+                    // TTL only). Seen one before: it was deleted — refuse.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         if armed.load(Ordering::SeqCst) {
                             Err(anyhow!(
@@ -290,12 +234,11 @@ fn read_head(path: &Path) -> Result<RosterHead> {
         .with_context(|| format!("parsing roster head {}", path.display()))
 }
 
-/// The revocation list and roster head as loaded for **one** connection.
+/// The roster head as loaded for **one** connection.
 ///
 /// Loaded fresh in [`serve_session`] rather than frozen in [`ServeConfig`], so a
-/// revocation lands on the next dial instead of the next restart.
+/// removal lands on the next dial instead of the next restart.
 struct LoadedPolicy {
-    crl: Crl,
     head: Option<RosterHead>,
 }
 
@@ -320,7 +263,7 @@ pub fn to_node_id(id: &EndpointId) -> NodeId {
 }
 
 /// Build the [`EndpointAddr`] to dial `node`, attaching any direct socket
-/// addresses and relay URL from the ticket. With no hints this is a bare addr
+/// addresses and relay URL from the target. With no hints this is a bare addr
 /// resolved via discovery at dial time; with hints the dialer needs no
 /// discovery service. The address is only a hint — iroh still authenticates the
 /// peer to `node`'s key.
@@ -506,19 +449,14 @@ pub async fn serve(node: NodeIdentity, config: ServeConfig, relay_url: Option<&s
 pub async fn serve_on(endpoint: Endpoint, config: ServeConfig) -> Result<()> {
     tracing::info!(
         node = %to_node_id(&endpoint.id()).hex(),
-        require_grant = config.require_grant,
         enforcing_head = config.head.enforcement(),
         sockets = ?endpoint.bound_sockets(),
         "serving session ALPN (egress-only)"
     );
     tracing::info!(
-        crl = ?config.crl,
         head = ?config.head,
-        "credential sources (re-read per connection)"
+        "credential source (re-read per connection)"
     );
-    if !config.require_grant {
-        tracing::warn!("inclusion-only: any fabric member may connect");
-    }
     let config = Arc::new(config);
     while let Some(incoming) = endpoint.accept().await {
         let config = Arc::clone(&config);
@@ -623,12 +561,8 @@ where
     let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut recv))
         .await
         .context("timed out waiting for handshake")??;
-    let (membership, grant, proof) = match first {
-        Some(Frame::Handshake {
-            membership,
-            grant,
-            proof,
-        }) => (membership, grant, proof),
+    let (membership, proof) = match first {
+        Some(Frame::Handshake { membership, proof }) => (membership, proof),
         // A peer is on the other end and spoke out of turn (or hung up): say so
         // on the wire before failing, so it need not guess.
         Some(_) => {
@@ -659,8 +593,8 @@ where
     let tool = &invocation.tool;
     let now = crate::now_unix();
 
-    // Re-read the CRL and the enforced head for *this* connection, so a
-    // revocation or a fresh roster head applies to the very next dial. A source
+    // Re-read the enforced head for *this* connection, so a fresh roster head
+    // (a removal) applies to the very next dial. A source
     // we cannot read is fatal for this session, but the dialer is told only that
     // the responder is misconfigured — never the path.
     let policy = match load_policy(config) {
@@ -682,7 +616,6 @@ where
         config,
         &policy,
         &membership,
-        grant.as_ref(),
         proof.as_ref(),
         caller,
         now,
@@ -719,7 +652,7 @@ where
     );
 
     // Mutual inclusion: present our own membership (+ optional proof) so a
-    // ticket-less dialer can verify us before streaming stdin. Written directly
+    // dialer can verify us before streaming stdin. Written directly
     // on `send` so it is the first frame back, before any child output.
     write_frame(
         &mut send,
@@ -850,7 +783,6 @@ where
 /// Load this connection's view of the responder's credential sources.
 fn load_policy(config: &ServeConfig) -> Result<LoadedPolicy> {
     Ok(LoadedPolicy {
-        crl: config.crl.load()?,
         head: config.head.load()?,
     })
 }
@@ -870,28 +802,24 @@ struct Admitted {
 
 /// Every credential check a caller must pass, in one place.
 ///
-/// Runs, in order: fabric inclusion (always), the tool grant (when the
-/// responder requires one), the grant/membership subject agreement, the
-/// roster head gate, and last the host's [`Policy`](crate::host::policy::Policy)
+/// Runs, in order: fabric inclusion (always), the roster head gate, and last
+/// the host's [`Policy`](crate::host::policy::Policy)
 /// (`host.json`), which only ever sees a caller whose key already passed
 /// everything else, with its verified principal if it has one. Returns the
 /// admitting roster version, the caller's principal, and the admitting role.
 ///
 /// The error messages are user-facing: they are what the responder logs *and*
 /// what it sends back in a [`Frame::Denied`], so each keeps a prefix naming the
-/// credential at fault (`membership rejected: …`, `grant rejected: …`,
+/// credential at fault (`membership rejected: …`,
 /// `roster inclusion rejected: …`).
 ///
-/// `invocation` names the tool: when grants are required, the grant must be
-/// scoped [`tool_scope`]`(tool)` or [`TOOL_SCOPE_ANY`]. A policy refusal of a
-/// caller with no verified identity leads with why there is none (and the
+/// `invocation` names the tool the policy is asked about. A policy refusal of
+/// a caller with no verified identity leads with why there is none (and the
 /// `wires login` remedy), then the rule that needed one.
-#[allow(clippy::too_many_arguments)]
 fn authorize(
     config: &ServeConfig,
     policy: &LoadedPolicy,
     membership: &Membership,
-    grant: Option<&Grant>,
     proof: Option<&InclusionProof>,
     caller: NodeId,
     now: i64,
@@ -900,35 +828,8 @@ fn authorize(
     let tool = &invocation.tool;
     // Inclusion is always required: the caller must prove fabric membership,
     // bound to its iroh-authenticated key.
-    check_inclusion(membership, config.trust_root, caller, now, &policy.crl)
+    check_inclusion(membership, config.trust_root, caller, now)
         .map_err(|e| anyhow!("membership rejected: {e}"))?;
-
-    // A grant-gated responder additionally requires an accepted grant that
-    // covers the invoked tool.
-    if config.require_grant {
-        let grant =
-            grant.ok_or_else(|| anyhow!("scoped session requires a grant; none presented"))?;
-        check_accept(grant, config.trust_root, caller, now, &policy.crl)
-            .map_err(|e| anyhow!("grant rejected: {e}"))?;
-        let needed = tool_scope(tool);
-        if grant.scope.as_str() != needed.as_str() && grant.scope.as_str() != TOOL_SCOPE_ANY {
-            bail!(
-                "grant scope {:?} does not cover tool {tool} (needs {:?} or {:?})",
-                grant.scope.as_str(),
-                needed.as_str(),
-                TOOL_SCOPE_ANY
-            );
-        }
-    }
-
-    // Defense-in-depth: if a grant rode along, it must name the same node as the
-    // membership. Redundant (both are pinned to `caller`) but cheap, and it
-    // guards against a future refactor that loosens one path.
-    if let Some(grant) = grant
-        && grant.subject != membership.member
-    {
-        bail!("grant subject does not match membership member");
-    }
 
     // Roster head gate: when a head is enforced, require a proof and check the
     // caller's *current* membership; remember the admitting version.
@@ -962,7 +863,7 @@ fn authorize(
 }
 
 /// The credential half of [`authorize`] for a peer that runs no tool: fabric
-/// inclusion under this connection's CRL, then the roster head gate. What
+/// inclusion, then this connection's roster head gate. What
 /// the inbox protocol (card 23) asks of a caller fetching its pushes before
 /// the host's push policy is consulted. Returns the admitting roster version;
 /// the error carries the same prefixes a call's refusal does.
@@ -977,7 +878,7 @@ pub(crate) fn check_member(
         tracing::warn!("credential sources unusable: {e:#}");
         anyhow!("responder configuration error")
     })?;
-    check_inclusion(membership, config.trust_root, caller, now, &loaded.crl)
+    check_inclusion(membership, config.trust_root, caller, now)
         .map_err(|e| anyhow!("membership rejected: {e}"))?;
     roster_gate(config, loaded.head.as_ref(), proof, caller, now)
 }
@@ -1050,11 +951,11 @@ impl std::fmt::Display for Denied {
 
 impl std::error::Error for Denied {}
 
-/// Dial `target` on `endpoint`, present `membership` (+ `grant`/`proof` if
-/// any), send [`Frame::Invoke`] with `invocation` right after the handshake
-/// (before the ack arrives), then bridge local stdio. When `ticketless`,
-/// verify the responder's `HandshakeAck` membership before forwarding any
-/// stdin. The entry point for `wires call` and `wires mcp`.
+/// Dial `target` on `endpoint`, present `membership` (+ `proof` if any), send
+/// [`Frame::Invoke`] with `invocation` right after the handshake (before the
+/// ack arrives), verify the responder's `HandshakeAck` membership before
+/// forwarding any stdin, then bridge local stdio. The entry point for
+/// `wires call` and `wires mcp`.
 ///
 /// Returns the remote child's exit code. A refusal — including
 /// [`DENY_INVOKE_REQUIRED`]-style protocol refusals and `unknown tool: <name>`
@@ -1066,9 +967,7 @@ pub async fn call_on<R, W, E>(
     endpoint: Endpoint,
     target: EndpointAddr,
     membership: Membership,
-    grant: Option<Grant>,
     proof: Option<InclusionProof>,
-    ticketless: bool,
     invocation: Invocation,
     stdin: R,
     stdout: W,
@@ -1093,7 +992,7 @@ where
             endpoint.close().await;
             return Err(anyhow!(
                 "dialing target: no answer within {}s — is `wires serve` running on the target, \
-                 and are the ticket's --addr hints still current?",
+                 and are its --addr hints still current?",
                 DIAL_TIMEOUT.as_secs()
             ));
         }
@@ -1102,12 +1001,11 @@ where
     let (send, recv) = conn.open_bi().await.context("opening bi-stream")?;
     tracing::info!("session open; presenting membership and bridging stdio");
 
-    let verify_target = ticketless.then_some(target_id);
+    let verify_target = Some(target_id);
     let result = dial_session(
         send,
         recv,
         membership,
-        grant,
         proof,
         invocation,
         verify_target,
@@ -1126,7 +1024,7 @@ where
 
 /// The dialer half of a session over an established bi-stream. Presents the
 /// handshake, then reads the responder's `HandshakeAck`; when `verify_target` is
-/// `Some` (ticket-less mode), verifies the responder's membership against the
+/// `Some` (always, from [`call_on`]), verifies the responder's membership against the
 /// dialer's own fabric root and the authenticated target id **before** any stdin
 /// is forwarded. On failure, aborts with no stdin sent.
 ///
@@ -1140,7 +1038,6 @@ async fn dial_session<S, R, I, W, E>(
     mut send: S,
     mut recv: R,
     membership: Membership,
-    grant: Option<Grant>,
     proof: Option<InclusionProof>,
     invocation: Invocation,
     verify_target: Option<NodeId>,
@@ -1157,15 +1054,7 @@ where
 {
     // The dialer's own fabric root is the authority for verifying the responder.
     let fabric_root = membership.fabric;
-    write_frame(
-        &mut send,
-        &Frame::Handshake {
-            membership,
-            grant,
-            proof,
-        },
-    )
-    .await?;
+    write_frame(&mut send, &Frame::Handshake { membership, proof }).await?;
     write_frame(&mut send, &Frame::Invoke(invocation)).await?;
 
     // Read the responder's ack first (it is always the responder's first frame).
@@ -1177,17 +1066,11 @@ where
         Some(_) => bail!("responder's first frame was not a handshake ack"),
         None => bail!("responder closed before sending a handshake ack"),
     };
-    // Ticket-less: verify the service is a fabric member before streaming stdin.
+    // Verify the service is a fabric member before streaming stdin.
     // Credential-only (root-vouched + TTL); reverse roster-freshness is deferred.
     if let Some(target_id) = verify_target {
-        check_inclusion(
-            &ack_membership,
-            fabric_root,
-            target_id,
-            crate::now_unix(),
-            &Crl::new(),
-        )
-        .map_err(|e| anyhow!("responder membership rejected (no stdin sent): {e}"))?;
+        check_inclusion(&ack_membership, fabric_root, target_id, crate::now_unix())
+            .map_err(|e| anyhow!("responder membership rejected (no stdin sent): {e}"))?;
     }
 
     // Local stdin -> Stdin frames, then shut down the send direction (EOF).
@@ -1263,7 +1146,7 @@ mod tests {
     }
 
     /// The endpoint's bound sockets with wildcard binds rewritten to localhost,
-    /// for use as a ticket's direct `addrs` (so a dialer reaches it without
+    /// for use as a target's direct `addrs` (so a dialer reaches it without
     /// discovery).
     fn localhost_socks(endpoint: &Endpoint) -> Vec<std::net::SocketAddr> {
         endpoint
@@ -1302,11 +1185,9 @@ mod tests {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let subject = NodeIdentity::from_seed([2u8; 32]).node_id();
         let membership = Membership::mint(&root, subject, 0, i64::MAX).unwrap();
-        let grant = Grant::mint(&root, subject, Scope::new("tools.rg"), i64::MAX).unwrap();
         let frames = vec![
             Frame::Handshake {
                 membership: membership.clone(),
-                grant: Some(grant),
                 proof: None,
             },
             Frame::HandshakeAck {
@@ -1352,28 +1233,15 @@ mod tests {
         invoke(TEST_TOOL, &[])
     }
 
-    /// The grant scope that covers [`TEST_TOOL`].
-    fn test_tool_scope() -> Scope {
-        tool_scope(&ToolName::new(TEST_TOOL).unwrap())
-    }
-
     /// A responder config for tests: server is a fabric member under `root`,
     /// exposing `command` as [`TEST_TOOL`].
-    fn test_config(
-        root: &NodeIdentity,
-        server: NodeId,
-        require_grant: bool,
-        crl: Crl,
-        command: Vec<String>,
-    ) -> ServeConfig {
+    fn test_config(root: &NodeIdentity, server: NodeId, command: Vec<String>) -> ServeConfig {
         ServeConfig {
             tools: tool_map(command),
             audit: None,
             identity: None,
             policy: Arc::new(crate::host::policy::AnyMember),
             trust_root: root.node_id(),
-            require_grant,
-            crl: CrlSource::Fixed(crl),
             head: HeadSource::None,
             membership: Membership::mint(root, server, 0, i64::MAX).unwrap(),
             proof: None,
@@ -1389,19 +1257,18 @@ mod tests {
     }
 
     /// Run a full session over two in-memory duplex pipes (no iroh): returns the
-    /// dialer's exit result plus captured stdout/stderr. Ticketed (a grant for
-    /// [`TEST_TOOL`] present, ack ignored).
+    /// dialer's exit result plus captured stdout/stderr (the ack is not
+    /// verified: no iroh, so there is no authenticated target id).
     async fn run_session(command: Vec<String>, input: &[u8]) -> (Result<i32>, Vec<u8>, Vec<u8>) {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
         let membership = Membership::mint(&root, caller, 0, i64::MAX).unwrap();
-        let grant = Grant::mint(&root, caller, test_tool_scope(), i64::MAX).unwrap();
 
         let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024); // dialer -> responder
         let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024); // responder -> dialer
 
-        let config = test_config(&root, server, true, Crl::new(), command);
+        let config = test_config(&root, server, command);
         let srv =
             tokio::spawn(
                 async move { serve_session(s2c_w, c2s_r, caller, &config, never()).await },
@@ -1413,10 +1280,9 @@ mod tests {
             c2s_w,
             s2c_r,
             membership,
-            Some(grant),
             None, // dialer proof
             invoke_test_tool(),
-            None, // verify_target: ticketed → ignore ack
+            None, // verify_target: no iroh here → ignore the ack
             std::io::Cursor::new(input.to_vec()),
             &mut out,
             &mut err,
@@ -1426,20 +1292,11 @@ mod tests {
         (code, out, err)
     }
 
-    /// Whether the responder rejects a handshake bearing `membership` / `grant`
-    /// (then an invocation of [`TEST_TOOL`]) on a responder that requires a
-    /// grant or not (inclusion-only).
-    async fn serve_rejects(
-        membership: Membership,
-        grant: Option<Grant>,
-        trust_root: NodeId,
-        require_grant: bool,
-        crl: Crl,
-        caller: NodeId,
-    ) -> bool {
+    /// Whether the responder rejects a handshake bearing `membership` (then an
+    /// invocation of [`TEST_TOOL`]).
+    async fn serve_rejects(membership: Membership, trust_root: NodeId, caller: NodeId) -> bool {
         let recv = std::io::Cursor::new(opening(Frame::Handshake {
             membership,
-            grant,
             proof: None,
         }));
         let send: Vec<u8> = Vec::new();
@@ -1460,8 +1317,6 @@ mod tests {
             identity: None,
             policy: Arc::new(crate::host::policy::AnyMember),
             trust_root,
-            require_grant,
-            crl: CrlSource::Fixed(crl),
             head: HeadSource::None,
             membership: server_membership,
             proof: None,
@@ -1478,7 +1333,6 @@ mod tests {
         config: ServeConfig,
         caller: NodeId,
         membership: Membership,
-        grant: Option<Grant>,
         proof: Option<InclusionProof>,
     ) -> (Result<i32>, Vec<u8>) {
         let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
@@ -1494,10 +1348,9 @@ mod tests {
             c2s_w,
             s2c_r,
             membership,
-            grant,
             proof,
             invoke_test_tool(),
-            None, // ticketed → ignore the ack
+            None, // no iroh here → ignore the ack
             std::io::Cursor::new(Vec::new()),
             &mut out,
             &mut err,
@@ -1512,20 +1365,19 @@ mod tests {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
-        let membership = valid_membership(&root, caller);
-        let mut crl = Crl::new();
-        crl.insert(caller);
+        // A membership signed by another fabric's root.
+        let membership = valid_membership(&NodeIdentity::from_seed([9u8; 32]), caller);
 
-        let config = test_config(&root, server, false, crl, vec!["cat".to_string()]);
-        let (res, out) = run_with_config(config, caller, membership, None, None).await;
+        let config = test_config(&root, server, vec!["cat".to_string()]);
+        let (res, out) = run_with_config(config, caller, membership, None).await;
 
-        let e = res.expect_err("a revoked caller must be refused");
+        let e = res.expect_err("a foreign membership must be refused");
         let denied = e
             .downcast_ref::<Denied>()
             .unwrap_or_else(|| panic!("expected a Denied error, got: {e:#}"));
         assert!(
-            denied.reason().contains("revoked"),
-            "reason should name revocation, got: {}",
+            denied.reason().contains("membership rejected"),
+            "reason should name the membership, got: {}",
             denied.reason()
         );
         assert!(
@@ -1550,7 +1402,7 @@ mod tests {
         config.head = HeadSource::Fixed(v2_head);
 
         let membership = valid_membership(&root, caller);
-        let (res, out) = run_with_config(config, caller, membership, None, Some(v1_proof)).await;
+        let (res, out) = run_with_config(config, caller, membership, Some(v1_proof)).await;
 
         let e = res.expect_err("a stale proof must be refused");
         let denied = e
@@ -1579,22 +1431,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    #[test]
-    fn crl_source_missing_file_is_empty_malformed_is_an_error() {
-        let dir = temp_dir();
-        // Absent: "nothing revoked yet", the pre-existing startup semantics.
-        assert!(
-            CrlSource::File(dir.join("absent.json"))
-                .load()
-                .unwrap()
-                .is_empty()
-        );
-        // Garbled: must not silently read as "nobody is revoked".
-        let bad = dir.join("bad.json");
-        std::fs::write(&bad, "{ not json").unwrap();
-        assert!(CrlSource::File(bad).load().is_err());
     }
 
     #[test]
@@ -1653,8 +1489,6 @@ mod tests {
             identity: None,
             policy: Arc::new(crate::host::policy::AnyMember),
             trust_root: root.node_id(),
-            require_grant: false,
-            crl: CrlSource::Fixed(Crl::new()),
             head: HeadSource::Keystore {
                 path: head_path.clone(),
                 armed: std::sync::atomic::AtomicBool::new(false),
@@ -1671,14 +1505,13 @@ mod tests {
         let v1_proof = v1_proofs.into_iter().find(|(m, _)| *m == caller).unwrap().1;
         let handshake = || Frame::Handshake {
             membership: Membership::mint(&root, caller, 0, i64::MAX).unwrap(),
-            grant: None,
             proof: Some(v1_proof.clone()),
         };
 
         // No roster-head.json yet → admitted on membership alone.
         serve_once_with(&config, caller, handshake())
             .await
-            .expect("no head installed yet: membership + CRL + TTL only");
+            .expect("no head installed yet: membership + TTL only");
 
         // The operator re-commits a roster that omits the caller and imports
         // the new head into the running responder's keystore.
@@ -1696,84 +1529,6 @@ mod tests {
         );
     }
 
-    /// The money shot: with a long-lived responder config, writing a revoking
-    /// `crl.json` between two connections denies the second one — no restart,
-    /// no rebuilt `ServeConfig`.
-    #[tokio::test]
-    async fn revocation_takes_effect_between_connections() {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
-        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
-        let crl_path = temp_dir().join("crl.json");
-        let config = Arc::new(ServeConfig {
-            audit: None,
-            identity: None,
-            policy: Arc::new(crate::host::policy::AnyMember),
-            trust_root: root.node_id(),
-            require_grant: false,
-            crl: CrlSource::File(crl_path.clone()),
-            head: HeadSource::None,
-            membership: Membership::mint(&root, server, 0, i64::MAX).unwrap(),
-            proof: None,
-            tools: tool_map(vec!["cat".to_string()]),
-        });
-
-        /// One session against a shared config; returns the dialer's result and
-        /// stdout.
-        async fn dial_once(
-            config: Arc<ServeConfig>,
-            caller: NodeId,
-            membership: Membership,
-            input: &[u8],
-        ) -> (Result<i32>, Vec<u8>) {
-            let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
-            let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
-            let srv = tokio::spawn(async move {
-                serve_session(s2c_w, c2s_r, caller, config.as_ref(), never()).await
-            });
-            let mut out = Vec::new();
-            let mut err = Vec::new();
-            let res = dial_session(
-                c2s_w,
-                s2c_r,
-                membership,
-                None,
-                None,
-                invoke_test_tool(),
-                None,
-                std::io::Cursor::new(input.to_vec()),
-                &mut out,
-                &mut err,
-            )
-            .await;
-            let _ = srv.await;
-            (res, out)
-        }
-
-        let membership = Membership::mint(&root, caller, 0, i64::MAX).unwrap();
-
-        // No crl.json yet → admitted, and `cat` echoes.
-        let (res, out) =
-            dial_once(Arc::clone(&config), caller, membership.clone(), b"before").await;
-        assert_eq!(res.unwrap(), 0);
-        assert_eq!(out, b"before");
-
-        // Operator revokes between connections.
-        let mut crl = Crl::new();
-        crl.insert(caller);
-        std::fs::write(&crl_path, crl.to_json().unwrap()).unwrap();
-
-        // Same config object, next dial → denied, nothing on stdout.
-        let (res, out) = dial_once(config, caller, membership, b"after").await;
-        let e = res.expect_err("the revoked caller must now be refused");
-        assert!(
-            e.downcast_ref::<Denied>()
-                .is_some_and(|d| d.reason().contains("revoked")),
-            "expected a revocation denial, got: {e:#}"
-        );
-        assert!(out.is_empty());
-    }
-
     /// A dialer that vanishes mid-session takes the remote child with it: the
     /// session returns promptly instead of waiting out a `sleep 30`.
     #[tokio::test]
@@ -1784,13 +1539,10 @@ mod tests {
         let config = test_config(
             &root,
             server,
-            false,
-            Crl::new(),
             vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
         );
         let handshake = Frame::Handshake {
             membership: valid_membership(&root, caller),
-            grant: None,
             proof: None,
         };
         let recv = std::io::Cursor::new(opening(handshake));
@@ -1862,11 +1614,10 @@ mod tests {
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
         let membership = Membership::mint(&root, caller, 0, i64::MAX).unwrap();
-        let grant = Grant::mint(&root, caller, test_tool_scope(), i64::MAX).unwrap();
         let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
         let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
         let command = vec!["sh".into(), "-c".into(), "printf done".into()];
-        let config = test_config(&root, server, true, Crl::new(), command);
+        let config = test_config(&root, server, command);
         let srv =
             tokio::spawn(
                 async move { serve_session(s2c_w, c2s_r, caller, &config, never()).await },
@@ -1881,7 +1632,6 @@ mod tests {
                 c2s_w,
                 s2c_r,
                 membership,
-                Some(grant),
                 None,
                 invoke_test_tool(),
                 None,
@@ -1901,41 +1651,9 @@ mod tests {
             .unwrap();
     }
 
-    /// Mint a valid membership for `caller` under `root` (used to isolate
-    /// grant-side rejections, which run only after inclusion succeeds).
+    /// Mint a valid membership for `caller` under `root`.
     fn valid_membership(root: &NodeIdentity, caller: NodeId) -> Membership {
         Membership::mint(root, caller, 0, i64::MAX).unwrap()
-    }
-
-    #[tokio::test]
-    async fn session_rejects_scope_mismatch() {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
-        let m = valid_membership(&root, caller);
-        // A grant for another tool does not cover the one invoked.
-        let grant = Grant::mint(&root, caller, Scope::new("tool:b"), i64::MAX).unwrap();
-        assert!(serve_rejects(m, Some(grant), root.node_id(), true, Crl::new(), caller).await);
-    }
-
-    #[tokio::test]
-    async fn session_rejects_expired_grant() {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
-        let m = valid_membership(&root, caller);
-        // not_after = 0 (1970) is always in the past.
-        let grant = Grant::mint(&root, caller, test_tool_scope(), 0).unwrap();
-        assert!(serve_rejects(m, Some(grant), root.node_id(), true, Crl::new(), caller).await);
-    }
-
-    #[tokio::test]
-    async fn session_rejects_revoked_subject() {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
-        let m = valid_membership(&root, caller);
-        let grant = Grant::mint(&root, caller, test_tool_scope(), i64::MAX).unwrap();
-        let mut crl = Crl::new();
-        crl.insert(caller);
-        assert!(serve_rejects(m, Some(grant), root.node_id(), true, crl, caller).await);
     }
 
     #[tokio::test]
@@ -1948,7 +1666,7 @@ mod tests {
 
         let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
         let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
-        let config = test_config(&root, server, false, Crl::new(), vec!["cat".to_string()]);
+        let config = test_config(&root, server, vec!["cat".to_string()]);
         let srv =
             tokio::spawn(
                 async move { serve_session(s2c_w, c2s_r, caller, &config, never()).await },
@@ -1961,9 +1679,8 @@ mod tests {
             s2c_r,
             membership,
             None,
-            None,
             invoke_test_tool(),
-            None, // ticketed-style call: do not verify ack
+            None,
             std::io::Cursor::new(b"hi inclusion".to_vec()),
             &mut out,
             &mut err,
@@ -1981,7 +1698,7 @@ mod tests {
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         // Signed by other_root; the responder trusts root.
         let m = Membership::mint(&other_root, caller, 0, i64::MAX).unwrap();
-        assert!(serve_rejects(m, None, root.node_id(), false, Crl::new(), caller).await);
+        assert!(serve_rejects(m, root.node_id(), caller).await);
     }
 
     #[tokio::test]
@@ -1989,17 +1706,7 @@ mod tests {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let m = Membership::mint(&root, caller, 0, 0).unwrap(); // not_after 1970
-        assert!(serve_rejects(m, None, root.node_id(), false, Crl::new(), caller).await);
-    }
-
-    #[tokio::test]
-    async fn session_rejects_revoked_member() {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
-        let m = valid_membership(&root, caller);
-        let mut crl = Crl::new();
-        crl.insert(caller);
-        assert!(serve_rejects(m, None, root.node_id(), false, crl, caller).await);
+        assert!(serve_rejects(m, root.node_id(), caller).await);
     }
 
     #[tokio::test]
@@ -2009,53 +1716,26 @@ mod tests {
         let member = NodeIdentity::from_seed([2u8; 32]).node_id();
         let caller = NodeIdentity::from_seed([3u8; 32]).node_id();
         let m = valid_membership(&root, member);
-        assert!(serve_rejects(m, None, root.node_id(), false, Crl::new(), caller).await);
+        assert!(serve_rejects(m, root.node_id(), caller).await);
     }
 
-    #[tokio::test]
-    async fn scoped_session_requires_a_grant() {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
-        let m = valid_membership(&root, caller);
-        // A scope is served but no grant is presented.
-        assert!(serve_rejects(m, None, root.node_id(), true, Crl::new(), caller).await);
-    }
-
-    #[tokio::test]
-    async fn scoped_session_rejects_grant_for_other_subject() {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
-        let other = NodeIdentity::from_seed([7u8; 32]).node_id();
-        let m = valid_membership(&root, caller);
-        let grant = Grant::mint(&root, other, test_tool_scope(), i64::MAX).unwrap();
-        assert!(serve_rejects(m, Some(grant), root.node_id(), true, Crl::new(), caller).await);
-    }
-
-    /// Full scoped flow over a real (loopback) iroh connection: dial →
-    /// handshake (membership + grant) → `serve` execs `cat` → stdin echoes back
+    /// Full flow over a real (loopback) iroh connection: dial → handshake
+    /// (membership) → `serve` execs `cat` → stdin echoes back
     /// on stdout → exit 0.
     #[tokio::test]
     async fn loopback_echo_round_trip() {
         let root = NodeIdentity::from_seed([10u8; 32]);
         let server = NodeIdentity::from_seed([11u8; 32]);
         let client = NodeIdentity::from_seed([12u8; 32]);
-        let scope = test_tool_scope();
         let membership = Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap();
-        let grant = Grant::mint(&root, client.node_id(), scope.clone(), i64::MAX).unwrap();
 
         let server_ep = test_endpoint(&server).await;
         // Dial via the production `endpoint_addr` using direct socket hints —
-        // the same path a ticket's `addrs` take, no discovery involved.
+        // the same path a tools.json target's `addrs` take, no discovery involved.
         let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
         let srv = tokio::spawn(serve_on(
             server_ep,
-            test_config(
-                &root,
-                server.node_id(),
-                true,
-                Crl::new(),
-                vec!["cat".to_string()],
-            ),
+            test_config(&root, server.node_id(), vec!["cat".to_string()]),
         ));
 
         let client_ep = test_endpoint(&client).await;
@@ -2065,9 +1745,7 @@ mod tests {
             client_ep,
             addr,
             membership,
-            Some(grant),
-            None,  // proof
-            false, // ticketed
+            None, // no roster proof
             invoke_test_tool(),
             std::io::Cursor::new(b"hello world".to_vec()),
             &mut out,
@@ -2099,8 +1777,6 @@ mod tests {
             test_config(
                 &root,
                 server.node_id(),
-                false,
-                Crl::new(),
                 vec![
                     "sh".to_string(),
                     "-c".to_string(),
@@ -2118,8 +1794,6 @@ mod tests {
             addr,
             membership,
             None,
-            None, // proof
-            true, // ticket-less → verify the responder's ack
             invoke_test_tool(),
             std::io::Cursor::new(Vec::new()),
             &mut out,
@@ -2136,58 +1810,6 @@ mod tests {
             not_after
         );
         assert_eq!(String::from_utf8(out).unwrap(), expected);
-        srv.abort();
-    }
-
-    /// A grant minted by the wrong root is refused (membership is valid, so the
-    /// grant is what's rejected).
-    #[tokio::test]
-    async fn loopback_rejects_untrusted_grant() {
-        let trusted_root = NodeIdentity::from_seed([20u8; 32]);
-        let evil_root = NodeIdentity::from_seed([21u8; 32]);
-        let server = NodeIdentity::from_seed([22u8; 32]);
-        let client = NodeIdentity::from_seed([23u8; 32]);
-        let scope = test_tool_scope();
-        let membership = Membership::mint(&trusted_root, client.node_id(), 0, i64::MAX).unwrap();
-        // Signed by evil_root, but the server only trusts trusted_root.
-        let grant = Grant::mint(&evil_root, client.node_id(), scope.clone(), i64::MAX).unwrap();
-
-        let server_ep = test_endpoint(&server).await;
-        let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
-        let srv = tokio::spawn(serve_on(
-            server_ep,
-            test_config(
-                &trusted_root,
-                server.node_id(),
-                true,
-                Crl::new(),
-                vec!["cat".to_string()],
-            ),
-        ));
-
-        let client_ep = test_endpoint(&client).await;
-        let mut out: Vec<u8> = Vec::new();
-        let mut err: Vec<u8> = Vec::new();
-        // The responder refuses the handshake and drops the connection, so the
-        // dialer's session fails (no child ran, nothing on stdout).
-        let result = call_on(
-            client_ep,
-            addr,
-            membership,
-            Some(grant),
-            None,  // proof
-            false, // ticketed
-            invoke_test_tool(),
-            std::io::Cursor::new(Vec::new()),
-            &mut out,
-            &mut err,
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "dialer should fail when the responder refuses the grant"
-        );
-        assert!(out.is_empty());
         srv.abort();
     }
 
@@ -2208,8 +1830,6 @@ mod tests {
             test_config(
                 &trusted_root,
                 server.node_id(),
-                false,
-                Crl::new(),
                 vec![
                     "sh".to_string(),
                     "-c".to_string(),
@@ -2226,8 +1846,6 @@ mod tests {
             addr,
             membership,
             None,
-            None, // proof
-            true, // ticket-less
             invoke_test_tool(),
             std::io::Cursor::new(Vec::new()),
             &mut out,
@@ -2258,8 +1876,6 @@ mod tests {
             identity: None,
             policy: Arc::new(crate::host::policy::AnyMember),
             trust_root: root.node_id(),
-            require_grant: false,
-            crl: CrlSource::Fixed(Crl::new()),
             head: HeadSource::Fixed(head),
             membership: Membership::mint(root, server, 0, i64::MAX).unwrap(),
             proof: None,
@@ -2294,7 +1910,6 @@ mod tests {
             caller,
             Frame::Handshake {
                 membership,
-                grant: None,
                 proof: Some(proof),
             },
         )
@@ -2314,7 +1929,6 @@ mod tests {
             caller,
             Frame::Handshake {
                 membership,
-                grant: None,
                 proof: None,
             },
         )
@@ -2336,7 +1950,6 @@ mod tests {
             caller,
             Frame::Handshake {
                 membership,
-                grant: None,
                 proof: Some(other_proof),
             },
         )
@@ -2363,7 +1976,6 @@ mod tests {
             caller,
             Frame::Handshake {
                 membership,
-                grant: None,
                 proof: Some(v1_proof),
             },
         )
@@ -2398,8 +2010,6 @@ mod tests {
             identity: None,
             policy: Arc::new(crate::host::policy::AnyMember),
             trust_root: root.node_id(),
-            require_grant: false,
-            crl: CrlSource::Fixed(Crl::new()),
             head: HeadSource::Fixed(head),
             membership: Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
             proof: None,
@@ -2419,9 +2029,7 @@ mod tests {
             client_ep,
             addr,
             membership,
-            None,
             Some(client_proof),
-            true, // ticket-less
             invoke_test_tool(),
             std::io::Cursor::new(Vec::new()),
             &mut out,
@@ -2464,8 +2072,6 @@ mod tests {
             identity: None,
             policy: Arc::new(crate::host::policy::AnyMember),
             trust_root: root.node_id(),
-            require_grant: false,
-            crl: CrlSource::Fixed(Crl::new()),
             head: HeadSource::Fixed(v2),
             membership: Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
             proof: None,
@@ -2485,9 +2091,7 @@ mod tests {
             client_ep,
             addr,
             membership,
-            None,
             Some(client_proof),
-            true,
             invoke_test_tool(),
             std::io::Cursor::new(Vec::new()),
             &mut out,
@@ -2499,7 +2103,7 @@ mod tests {
         srv.abort();
     }
 
-    /// Mutual inclusion: a ticket-less dialer aborts (no stdin echoed) when the
+    /// Mutual inclusion: a dialer aborts (no stdin echoed) when the
     /// responder's ack membership is signed by a different root; succeeds when it
     /// is signed by the trusted root.
     #[tokio::test]
@@ -2525,8 +2129,6 @@ mod tests {
                 identity: None,
                 policy: Arc::new(crate::host::policy::AnyMember),
                 trust_root,
-                require_grant: false,
-                crl: CrlSource::Fixed(Crl::new()),
                 head: HeadSource::None,
                 membership: Membership::mint(signer, server.node_id(), 0, i64::MAX).unwrap(),
                 proof: None,
@@ -2541,8 +2143,6 @@ mod tests {
                 addr,
                 client_membership,
                 None,
-                None,
-                true, // ticket-less → verify the responder
                 invoke_test_tool(),
                 std::io::Cursor::new(b"ping".to_vec()),
                 &mut out,
@@ -2565,16 +2165,10 @@ mod tests {
 
     use library::Argv;
 
-    /// A multi-tool responder config: `server` is a member under `root`, the
-    /// tools are `(name, argv)` pairs, and `require_grant` is `true` for a
-    /// grant-gated responder or `false` for `--allow-any-member`.
-    fn tools_config(
-        root: &NodeIdentity,
-        server: NodeId,
-        require_grant: bool,
-        tools: &[(&str, &[&str])],
-    ) -> ServeConfig {
-        let mut config = test_config(root, server, require_grant, Crl::new(), Vec::new());
+    /// A multi-tool responder config: `server` is a member under `root`, and
+    /// the tools are `(name, argv)` pairs, open to any member.
+    fn tools_config(root: &NodeIdentity, server: NodeId, tools: &[(&str, &[&str])]) -> ServeConfig {
+        let mut config = test_config(root, server, Vec::new());
         config.tools = tools
             .iter()
             .map(|(name, argv)| {
@@ -2596,20 +2190,17 @@ mod tests {
     }
 
     /// One dial/serve pair over duplex pipes carrying `invocation`; the caller
-    /// (seed 2) holds a membership under `root` and, when `grant_scope` is set,
-    /// a grant for that scope. Returns the dialer's result, stdout, stderr.
+    /// (seed 2) holds a membership under `root`. Returns the dialer's result,
+    /// stdout, stderr.
     async fn run_call(
         config: impl Into<Arc<ServeConfig>>,
         root: &NodeIdentity,
-        grant_scope: Option<&str>,
         invocation: Invocation,
         input: &[u8],
     ) -> (Result<i32>, Vec<u8>, Vec<u8>) {
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let membership = valid_membership(root, caller);
         let config: Arc<ServeConfig> = config.into();
-        let grant =
-            grant_scope.map(|s| Grant::mint(root, caller, Scope::new(s), i64::MAX).unwrap());
         let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
         let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
         let srv =
@@ -2622,7 +2213,6 @@ mod tests {
             c2s_w,
             s2c_r,
             membership,
-            grant,
             None,
             invocation,
             None,
@@ -2670,7 +2260,7 @@ mod tests {
     async fn invoke_execs_the_tool_argv_plus_args_literally() {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
-        let config = tools_config(&root, server, true, &[("lines", &["printf", "%s\\n"])]);
+        let config = tools_config(&root, server, &[("lines", &["printf", "%s\\n"])]);
         let args = [
             "two words",
             "'single'",
@@ -2682,14 +2272,7 @@ mod tests {
             "$HOME",
             "",
         ];
-        let (res, out, err) = run_call(
-            config,
-            &root,
-            Some("tool:lines"),
-            invoke("lines", &args),
-            b"",
-        )
-        .await;
+        let (res, out, err) = run_call(config, &root, invoke("lines", &args), b"").await;
         assert_eq!(res.unwrap(), 0, "stderr: {}", String::from_utf8_lossy(&err));
         let expected: String = args.iter().map(|a| format!("{a}\n")).collect();
         assert_eq!(String::from_utf8(out).unwrap(), expected);
@@ -2702,10 +2285,9 @@ mod tests {
         let config = tools_config(
             &root,
             server,
-            false,
             &[("who", &["sh", "-c", "printf '%s:' \"$WIRES_TOOL\"; cat"])],
         );
-        let (res, out, _) = run_call(config, &root, None, invoke("who", &[]), b"piped").await;
+        let (res, out, _) = run_call(config, &root, invoke("who", &[]), b"piped").await;
         assert_eq!(res.unwrap(), 0);
         assert_eq!(out, b"who:piped");
     }
@@ -2717,7 +2299,6 @@ mod tests {
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
         let handshake = Frame::Handshake {
             membership: valid_membership(&root, caller),
-            grant: None,
             proof: None,
         };
         // Handshake then EOF, and handshake then a stdin frame: both refused.
@@ -2725,7 +2306,7 @@ mod tests {
             vec![handshake.clone()],
             vec![handshake, Frame::Stdin(Chunk::from_bytes(b"x".to_vec()))],
         ] {
-            let config = tools_config(&root, server, false, &[("a", &["cat"])]);
+            let config = tools_config(&root, server, &[("a", &["cat"])]);
             let (res, back) = serve_raw(config, caller, &frames).await;
             assert!(res.is_err());
             assert_eq!(
@@ -2747,9 +2328,9 @@ mod tests {
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
         let (sink, mut records) = AuditSink::channel(16);
 
-        let mut config = tools_config(&root, server, false, &[("say", &["printf", "%s"])]);
+        let mut config = tools_config(&root, server, &[("say", &["printf", "%s"])]);
         config.audit = Some(sink.clone());
-        let (res, out, _) = run_call(config, &root, None, invoke("say", &["hi"]), b"").await;
+        let (res, out, _) = run_call(config, &root, invoke("say", &["hi"]), b"").await;
         assert_eq!(res.unwrap(), 0);
         assert_eq!(out, b"hi");
         match records.recv().await.unwrap() {
@@ -2773,9 +2354,9 @@ mod tests {
             other => panic!("expected Finished, got {other:?}"),
         }
 
-        let mut config = tools_config(&root, server, false, &[("say", &["printf", "%s"])]);
+        let mut config = tools_config(&root, server, &[("say", &["printf", "%s"])]);
         config.audit = Some(sink);
-        let (res, _, _) = run_call(config, &root, None, invoke("nope", &[]), b"").await;
+        let (res, _, _) = run_call(config, &root, invoke("nope", &[]), b"").await;
         let reason = denied_reason(res);
         match records.recv().await.unwrap() {
             AuditRecord::Denied {
@@ -2792,78 +2373,10 @@ mod tests {
     async fn unknown_tool_is_refused_by_name() {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
-        let config = tools_config(&root, server, false, &[("a", &["cat"])]);
-        let (res, out, _) = run_call(config, &root, None, invoke("nope", &[]), b"").await;
+        let config = tools_config(&root, server, &[("a", &["cat"])]);
+        let (res, out, _) = run_call(config, &root, invoke("nope", &[]), b"").await;
         assert_eq!(denied_reason(res), "unknown tool: nope");
         assert!(out.is_empty());
-    }
-
-    #[tokio::test]
-    async fn tool_scoped_grant_admits_only_its_tool() {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
-        let tools: &[(&str, &[&str])] = &[("a", &["printf", "A"]), ("b", &["printf", "B"])];
-
-        let (res, out, _) = run_call(
-            tools_config(&root, server, true, tools),
-            &root,
-            Some("tool:a"),
-            invoke("a", &[]),
-            b"",
-        )
-        .await;
-        assert_eq!(res.unwrap(), 0);
-        assert_eq!(out, b"A");
-
-        let (res, out, _) = run_call(
-            tools_config(&root, server, true, tools),
-            &root,
-            Some("tool:a"),
-            invoke("b", &[]),
-            b"",
-        )
-        .await;
-        let reason = denied_reason(res);
-        assert!(reason.contains("does not cover tool b"), "{reason}");
-        assert!(out.is_empty());
-    }
-
-    #[tokio::test]
-    async fn wildcard_grant_admits_every_tool() {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
-        let tools: &[(&str, &[&str])] = &[("a", &["printf", "A"]), ("b", &["printf", "B"])];
-        for (tool, want) in [("a", b"A"), ("b", b"B")] {
-            let (res, out, _) = run_call(
-                tools_config(&root, server, true, tools),
-                &root,
-                Some(TOOL_SCOPE_ANY),
-                invoke(tool, &[]),
-                b"",
-            )
-            .await;
-            assert_eq!(res.unwrap(), 0);
-            assert_eq!(out, want);
-        }
-    }
-
-    #[tokio::test]
-    async fn grant_gated_tools_refuse_a_missing_or_foreign_grant() {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
-        let tools: &[(&str, &[&str])] = &[("a", &["printf", "A"])];
-        for grant in [None, Some("tools.a"), Some("a")] {
-            let (res, out, _) = run_call(
-                tools_config(&root, server, true, tools),
-                &root,
-                grant,
-                invoke("a", &[]),
-                b"",
-            )
-            .await;
-            denied_reason(res);
-            assert!(out.is_empty(), "grant {grant:?}");
-        }
     }
 
     /// The host policy is asked last: a caller that passed every credential
@@ -2884,15 +2397,14 @@ mod tests {
                          "shut":{"command":["printf","never"]}}}"#,
         )
         .unwrap();
-        let mut config = test_config(&root, server, false, Crl::new(), Vec::new());
+        let mut config = test_config(&root, server, Vec::new());
         config.tools = host.commands();
         config.policy = Arc::new(host.policy());
         let (sink, mut records) = AuditSink::channel(16);
         config.audit = Some(sink);
         let config = Arc::new(config);
 
-        let (res, out, _) =
-            run_call(Arc::clone(&config), &root, None, invoke("db", &[]), b"").await;
+        let (res, out, _) = run_call(Arc::clone(&config), &root, invoke("db", &[]), b"").await;
         let reason = denied_reason(res);
         assert!(out.is_empty());
         assert!(
@@ -2905,13 +2417,11 @@ mod tests {
         };
         assert_eq!(logged, reason);
 
-        let (res, _, _) =
-            run_call(Arc::clone(&config), &root, None, invoke("shut", &[]), b"").await;
+        let (res, _, _) = run_call(Arc::clone(&config), &root, invoke("shut", &[]), b"").await;
         assert!(denied_reason(res).contains("shut allows no role"));
         records.try_recv().unwrap();
 
-        let (res, out, _) =
-            run_call(Arc::clone(&config), &root, None, invoke("open", &[]), b"").await;
+        let (res, out, _) = run_call(Arc::clone(&config), &root, invoke("open", &[]), b"").await;
         assert_eq!(res.unwrap(), 0);
         assert_eq!(out, b"ran");
         let Ok(library::AuditRecord::Started {
@@ -2926,18 +2436,15 @@ mod tests {
 
     #[tokio::test]
     async fn membership_is_checked_before_the_tool_is_resolved() {
-        // A revoked caller naming an unknown tool learns it is revoked, not
-        // which tools exist.
+        // A caller from another fabric naming an unknown tool learns its
+        // membership was rejected, not which tools exist.
         let root = NodeIdentity::from_seed([1u8; 32]);
-        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let server = NodeIdentity::from_seed([4u8; 32]).node_id();
-        let mut config = tools_config(&root, server, false, &[("a", &["cat"])]);
-        let mut crl = Crl::new();
-        crl.insert(caller);
-        config.crl = CrlSource::Fixed(crl);
-        let (res, _, _) = run_call(config, &root, None, invoke("nope", &[]), b"").await;
+        let mut config = tools_config(&root, server, &[("a", &["cat"])]);
+        config.trust_root = NodeIdentity::from_seed([9u8; 32]).node_id();
+        let (res, _, _) = run_call(config, &root, invoke("nope", &[]), b"").await;
         let reason = denied_reason(res);
-        assert!(reason.contains("revoked"), "{reason}");
+        assert!(reason.contains("membership rejected"), "{reason}");
     }
 
     proptest::proptest! {
@@ -2955,12 +2462,12 @@ mod tests {
             let (res, out, _) = rt.block_on(async {
                 let root = NodeIdentity::from_seed([1u8; 32]);
                 let server = NodeIdentity::from_seed([4u8; 32]).node_id();
-                let config = tools_config(&root, server, false, &[("echo", &["printf", "%s\\0", "MARK"])]);
+                let config = tools_config(&root, server, &[("echo", &["printf", "%s\\0", "MARK"])]);
                 let invocation = Invocation {
                     tool: ToolName::new("echo").unwrap(),
                     argv: Argv::new(args.clone()).unwrap(),
                 };
-                run_call(config, &root, None, invocation, b"").await
+                run_call(config, &root, invocation, b"").await
             });
             proptest::prop_assert_eq!(res.unwrap(), 0);
             let mut expected = b"MARK\0".to_vec();
@@ -2972,21 +2479,18 @@ mod tests {
         }
     }
 
-    /// Two exposed tools + `wires call` over a real loopback endpoint: the
-    /// caller holds a
-    /// `tool:shout` grant, and `call_on` carries the invocation.
+    /// Two exposed tools + `wires call` over a real loopback endpoint:
+    /// `call_on` carries the invocation, and each call runs its own tool.
     #[tokio::test]
     async fn loopback_expose_and_call() {
         let root = NodeIdentity::from_seed([80u8; 32]);
         let server = NodeIdentity::from_seed([81u8; 32]);
         let client = NodeIdentity::from_seed([82u8; 32]);
         let membership = Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap();
-        let grant =
-            Grant::mint(&root, client.node_id(), Scope::new("tool:shout"), i64::MAX).unwrap();
 
         let server_ep = test_endpoint(&server).await;
         let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
-        let mut config = test_config(&root, server.node_id(), true, Crl::new(), Vec::new());
+        let mut config = test_config(&root, server.node_id(), Vec::new());
         config.tools = BTreeMap::from([
             (
                 ToolName::new("shout").unwrap(),
@@ -3006,9 +2510,7 @@ mod tests {
             client_ep,
             addr.clone(),
             membership.clone(),
-            Some(grant.clone()),
             None,
-            false,
             invoke("shout", &[]),
             std::io::Cursor::new(b"hello over wires".to_vec()),
             &mut out,
@@ -3019,25 +2521,22 @@ mod tests {
         assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
         assert_eq!(out, b"HELLO OVER WIRES");
 
-        // Same grant, other tool: refused with the scope reason.
+        // The other tool, with arguments.
         let client_ep = test_endpoint(&client).await;
         let mut out = Vec::new();
         let res = call_on(
             client_ep,
             addr,
             membership,
-            Some(grant),
             None,
-            false,
             invoke("echo", &["a b"]),
             std::io::Cursor::new(Vec::new()),
             &mut out,
             &mut Vec::new(),
         )
         .await;
-        let reason = denied_reason(res);
-        assert!(reason.contains("does not cover tool echo"), "{reason}");
-        assert!(out.is_empty());
+        assert_eq!(res.unwrap(), 0);
+        assert_eq!(out, b"a b|");
         srv.abort();
     }
 }

@@ -1,7 +1,7 @@
 //! Canonical-JSON codec (internal).
 //!
-//! Grants are signed over — and capability tickets are base64-encoded from —
-//! a *canonical* JSON encoding: object keys sorted recursively, with no
+//! Memberships and roster heads are signed over — and tokens are
+//! base64-encoded from — a *canonical* JSON encoding: object keys sorted recursively, with no
 //! insignificant whitespace. Canonicalization makes the byte string
 //! deterministic across re-serialization, which is what makes signing and
 //! verification stable regardless of struct field or map iteration order.
@@ -12,8 +12,8 @@ use crate::error::{Error, Result};
 
 /// Serialize `value` to canonical JSON bytes (sorted keys, compact).
 ///
-/// This is the exact byte string that gets signed (grants) or base64-encoded
-/// (tickets); both producer and verifier must agree on it byte-for-byte.
+/// This is the exact byte string that gets signed (memberships, heads) or
+/// base64-encoded (tokens); both producer and verifier must agree on it byte-for-byte.
 ///
 /// Routing through `serde_json::Value` is what canonicalizes: `serde_json`'s
 /// object map is a `BTreeMap` (no `preserve_order` feature), so keys come out

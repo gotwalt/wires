@@ -39,7 +39,7 @@ use crate::channel::printer::Keyring;
 use crate::channel::store::TopicStore;
 use crate::channel::topics::{TopicNode, TopicNodeConfig};
 use crate::host::transport::{
-    AuditSink, CrlSource, Denied, HeadSource, ServeConfig, SessionProtocol, secret_key,
+    AuditSink, Denied, HeadSource, ServeConfig, SessionProtocol, secret_key,
 };
 use crate::now_unix;
 use crate::testutil::temp_dir;
@@ -113,8 +113,6 @@ fn resident(m: &Machine, hosted: bool) -> (tokio::task::JoinHandle<()>, oneshot:
         let (sink, records) = AuditSink::channel(crate::host::audit::AUDIT_QUEUE);
         let serve = ServeConfig {
             trust_root: ctx.fabric_root,
-            require_grant: false,
-            crl: CrlSource::Fixed(library::Crl::new()),
             head: HeadSource::Keystore {
                 path: m.ks.path("roster-head.json"),
                 armed: AtomicBool::new(true),
@@ -175,9 +173,7 @@ async fn call(m: &Machine, host: &TopicPeer) -> (anyhow::Result<i32>, Vec<u8>) {
             endpoint,
             target,
             membership,
-            None,
             proof,
-            false,
             cat_invocation(),
             std::io::Cursor::new(b"card 14".to_vec()),
             &mut out,

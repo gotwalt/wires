@@ -2,17 +2,17 @@
 //! that a node belongs to a fabric.
 //!
 //! A [`Membership`] binds a *member* node key to a *fabric* (named by the fabric
-//! root's public key) until `not_after`, signed by that root. Unlike a
-//! [`Grant`](crate::Grant) it is **scope-independent** — it answers "is this node
-//! a member of fabric R, and who is it?", the question an identity-aware tool
-//! asks the instant a session opens. Like a grant it is non-transferable: a
-//! responder accepts it only when the iroh-authenticated caller equals `member`
-//! (see [`crate::policy::check_inclusion`]).
+//! root's public key) until `not_after`, signed by that root. It is
+//! **scope-independent** — it answers "is this node a member of fabric R, and
+//! who is it?", the question an identity-aware tool asks the instant a session
+//! opens. It is non-transferable: a responder accepts it only when the
+//! iroh-authenticated caller equals `member` (see
+//! [`crate::policy::check_inclusion`]).
 //!
-//! Two choices distinguish this from [`Grant`], both load-bearing for soundness:
+//! Two choices are load-bearing for soundness:
 //!
-//! - **`fabric` is a *signed* field.** A grant's trusted root is supplied out of
-//!   band; a membership instead carries `fabric` inside the signed body, and
+//! - **`fabric` is a *signed* field.** Rather than trusting a root supplied out
+//!   of band, a membership carries `fabric` inside the signed body, and
 //!   [`verify`](Membership::verify) asserts `fabric == fabric_root`. The
 //!   credential *names its own authority*, so a responder cannot be steered into
 //!   checking it against the wrong root, and the leaf authority is pinned for a
@@ -30,11 +30,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec::canonical_bytes;
 use crate::error::{Error, Result};
-use crate::grant::AlgorithmId;
+use crate::identity::AlgorithmId;
 use crate::identity::{NodeId, NodeIdentity, Signature};
 
-/// The base64 alphabet for membership tokens: URL-safe, no padding (matches
-/// [`CapabilityTicket`](crate::CapabilityTicket)).
+/// The base64 alphabet for membership tokens: URL-safe, no padding.
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// The current (and only) membership format version.

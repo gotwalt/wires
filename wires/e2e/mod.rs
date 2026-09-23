@@ -1349,7 +1349,7 @@ fn cat_invocation() -> library::Invocation {
 /// to that one arm.
 #[tokio::test]
 async fn every_call_and_refusal_lands_on_the_audit_topic() {
-    use crate::host::transport::{AuditSink, CrlSource, ServeConfig, SessionProtocol};
+    use crate::host::transport::{AuditSink, ServeConfig, SessionProtocol};
 
     let r_seed = [21u8; 32];
     let r = Member::new("ar", r_seed);
@@ -1366,8 +1366,6 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
     let r_membership = library::Membership::mint(&fab.root, r.id(), 0, i64::MAX).unwrap();
     let serve = ServeConfig {
         trust_root: fab.id(),
-        require_grant: false,
-        crl: CrlSource::Fixed(library::Crl::new()),
         head: HeadSource::Keystore {
             path: r.keystore.path("roster-head.json"),
             armed: AtomicBool::new(true),
@@ -1406,7 +1404,7 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
     let node_r = TopicNode::spawn_on(endpoint, lookup, cfg).await.unwrap();
 
     // O: an observer. A member with the fabric key and nothing else — no
-    // grant, no credential of C's.
+    // tool, no credential of C's.
     let node_o = o.spawn(&fab, v1, SLOW_RECHECK).await;
     let (send_r, mut rx_r) = node_r.join(fab.topic, &[]).await.unwrap();
     let (_send_o, mut rx_o) = node_o.join(fab.topic, &[hint(&node_r)]).await.unwrap();
@@ -1469,9 +1467,7 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
                     endpoint,
                     target,
                     membership,
-                    None,
                     Some(proof),
-                    false,
                     cat_invocation(),
                     std::io::Cursor::new(b"hello, audit".to_vec()),
                     &mut out,
@@ -1600,14 +1596,12 @@ fn hosted_responder(
     impl std::future::Future<Output = anyhow::Result<()>>,
     tokio::sync::oneshot::Receiver<ResponderReady>,
 ) {
-    use crate::host::transport::{AuditSink, CrlSource, ServeConfig, SessionProtocol};
+    use crate::host::transport::{AuditSink, ServeConfig, SessionProtocol};
 
     let (sink, records) = AuditSink::channel(crate::host::audit::AUDIT_QUEUE);
     let membership = library::Membership::mint(&fab.root, r.id(), 0, i64::MAX).unwrap();
     let serve = ServeConfig {
         trust_root: fab.id(),
-        require_grant: false,
-        crl: CrlSource::Fixed(library::Crl::new()),
         head: HeadSource::Keystore {
             path: r.keystore.path("roster-head.json"),
             armed: AtomicBool::new(true),
@@ -1688,9 +1682,7 @@ async fn call_cat(
             endpoint,
             target,
             membership,
-            None,
             Some(proof),
-            false,
             cat_invocation(),
             std::io::Cursor::new(b"card 11".to_vec()),
             &mut out,

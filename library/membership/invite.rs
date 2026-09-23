@@ -53,7 +53,7 @@ use crate::error::{Error, Result};
 use crate::fabric_key::FabricKey;
 use crate::identity::{NodeId, NodeIdentity};
 use crate::membership::Membership;
-use crate::policy::{Crl, check_inclusion};
+use crate::policy::check_inclusion;
 use crate::rekey::{Rekey, RekeyEntry};
 use crate::roster::RosterHead;
 use crate::topic::TopicPeer;
@@ -122,13 +122,7 @@ impl Invite {
             return Err(Error::InconsistentRekey("the invite names no channel"));
         }
         let fabric = self.fabric();
-        check_inclusion(
-            &self.membership,
-            fabric,
-            me.node_id(),
-            now_unix,
-            &Crl::new(),
-        )?;
+        check_inclusion(&self.membership, fabric, me.node_id(), now_unix)?;
         if self.entry.member() != me.node_id() {
             return Err(Error::SubjectMismatch);
         }

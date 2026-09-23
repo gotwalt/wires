@@ -1,7 +1,7 @@
 //! Session protocol frames and their self-delimiting wire codec.
 //!
 //! A session carries a small set of [`Frame`]s over a single bidirectional
-//! stream: an opening [`Frame::Handshake`] that presents the dialer's grant,
+//! stream: an opening [`Frame::Handshake`] that presents the dialer's membership,
 //! then tagged stdio chunks ([`Frame::Stdin`] / [`Frame::Stdout`] /
 //! [`Frame::Stderr`]) and a final [`Frame::Exit`] carrying the child's exit
 //! code. A responder that refuses the handshake answers with a terminal
@@ -36,15 +36,15 @@
 //! and only then answers with `HandshakeAck` or `Denied`.
 //!
 //! The handshake envelope is the canonical JSON of a [`Membership`] plus an
-//! optional [`Grant`]. The envelope itself is *unsigned* — the signed objects
-//! are the membership and grant nested inside, each with its own fixed signed
-//! body — so omitting the absent grant via `skip_serializing_if` is safe here.
+//! optional [`InclusionProof`]. The envelope itself is *unsigned* — the signed
+//! objects are the membership and the head a proof is checked against, each
+//! with its own fixed signed body — so omitting an absent proof via
+//! `skip_serializing_if` is safe here.
 
 use serde::{Deserialize, Serialize};
 
 use crate::codec::canonical_bytes;
 use crate::error::{Error, Result};
-use crate::grant::Grant;
 use crate::invoke::Invocation;
 use crate::membership::Membership;
 use crate::roster::InclusionProof;
@@ -87,16 +87,14 @@ impl Chunk {
     }
 }
 
-/// The unsigned wire envelope for a [`Frame::Handshake`]: a mandatory membership,
-/// an optional scope grant, and an optional roster inclusion proof, serialized as
-/// one canonical-JSON blob. `skip_serializing_if` is safe here precisely because
-/// this struct is *not* signed — the membership, grant, and the head a proof is
-/// checked against are each signed independently over their own fixed bodies.
+/// The unsigned wire envelope for a [`Frame::Handshake`]: a mandatory membership
+/// and an optional roster inclusion proof, serialized as one canonical-JSON
+/// blob. `skip_serializing_if` is safe here precisely because this struct is
+/// *not* signed — the membership and the head a proof is checked against are
+/// each signed independently over their own fixed bodies.
 #[derive(Serialize, Deserialize)]
 struct HandshakeBody {
     membership: Membership,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    grant: Option<Grant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proof: Option<InclusionProof>,
 }
@@ -112,22 +110,18 @@ struct HandshakeAckBody {
 
 /// One framed message on a capability-scoped session.
 ///
-/// The `Handshake` variant (membership + optional grant) is much larger than the
+/// The `Handshake` variant (membership + optional proof) is much larger than the
 /// stdio variants, but it is sent exactly once per session while the small
 /// chunk frames dominate; boxing it would only add indirection to the
 /// public API for no meaningful gain on the hot path.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Frame {
-    /// Opening frame: the dialer presents its fabric membership (always), the
-    /// matching grant for a scoped session, and a roster inclusion proof when a
-    /// head-enforcing responder requires one.
+    /// Opening frame: the dialer presents its fabric membership (always) and a
+    /// roster inclusion proof when a head-enforcing responder requires one.
     Handshake {
         /// The membership proving the dialer belongs to the fabric.
         membership: Membership,
-        /// The grant authorizing a specific scope, when one is being requested.
-        /// `None` for an inclusion-only session.
-        grant: Option<Grant>,
         /// The dialer's roster inclusion proof, when presenting one.
         proof: Option<InclusionProof>,
     },
@@ -182,15 +176,10 @@ impl Frame {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut payload = Vec::new();
         match self {
-            Frame::Handshake {
-                membership,
-                grant,
-                proof,
-            } => {
+            Frame::Handshake { membership, proof } => {
                 payload.push(TAG_HANDSHAKE);
                 let body = HandshakeBody {
                     membership: membership.clone(),
-                    grant: grant.clone(),
                     proof: proof.clone(),
                 };
                 payload.extend_from_slice(&canonical_bytes(&body)?);
@@ -258,7 +247,6 @@ impl Frame {
                 let hs: HandshakeBody = serde_json::from_slice(body).map_err(Error::Decode)?;
                 Frame::Handshake {
                     membership: hs.membership,
-                    grant: hs.grant,
                     proof: hs.proof,
                 }
             }
@@ -289,7 +277,6 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grant::Scope;
     use crate::identity::NodeIdentity;
     use proptest::prelude::*;
 
@@ -301,36 +288,22 @@ mod tests {
         proptest::collection::vec(any::<u8>(), 0..256)
     }
 
-    /// An arbitrary frame of any variant, covering Handshake (grant/proof
-    /// present or absent) and HandshakeAck (proof present or absent).
+    /// An arbitrary frame of any variant, covering Handshake (proof present
+    /// or absent) and HandshakeAck (proof present or absent).
     fn frame() -> impl Strategy<Value = Frame> {
         prop_oneof![
-            (
-                seed(),
-                seed(),
-                "[a-z.]{1,16}",
-                any::<i64>(),
-                any::<bool>(),
-                any::<bool>()
-            )
-                .prop_map(|(rs, ss, sc, na, with_grant, with_proof)| {
-                    let root = NodeIdentity::from_seed(rs);
-                    let member = NodeIdentity::from_seed(ss).node_id();
-                    let membership = Membership::mint(&root, member, 0, na).unwrap();
-                    let grant =
-                        with_grant.then(|| Grant::mint(&root, member, Scope::new(sc), na).unwrap());
-                    let proof = with_proof.then(|| {
-                        let mut roster = crate::roster::Roster::new(root.node_id());
-                        roster.insert(member);
-                        let (_head, proofs) = roster.commit(&root, 0, na).unwrap();
-                        proofs.into_iter().next().unwrap().1
-                    });
-                    Frame::Handshake {
-                        membership,
-                        grant,
-                        proof,
-                    }
-                }),
+            (seed(), seed(), any::<i64>(), any::<bool>()).prop_map(|(rs, ss, na, with_proof)| {
+                let root = NodeIdentity::from_seed(rs);
+                let member = NodeIdentity::from_seed(ss).node_id();
+                let membership = Membership::mint(&root, member, 0, na).unwrap();
+                let proof = with_proof.then(|| {
+                    let mut roster = crate::roster::Roster::new(root.node_id());
+                    roster.insert(member);
+                    let (_head, proofs) = roster.commit(&root, 0, na).unwrap();
+                    proofs.into_iter().next().unwrap().1
+                });
+                Frame::Handshake { membership, proof }
+            }),
             (seed(), seed(), any::<i64>(), any::<bool>()).prop_map(|(rs, ss, na, with_proof)| {
                 let root = NodeIdentity::from_seed(rs);
                 let member = NodeIdentity::from_seed(ss).node_id();

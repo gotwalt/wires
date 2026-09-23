@@ -65,7 +65,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::codec::canonical_bytes;
 use crate::error::{Error, Result};
-use crate::grant::AlgorithmId;
+use crate::identity::AlgorithmId;
 use crate::identity::{NodeId, NodeIdentity, Signature};
 use crate::roster::RosterVersion;
 

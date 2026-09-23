@@ -30,7 +30,7 @@ use crate::error::{Error, Result};
 use crate::identity::NodeId;
 
 /// The base64 alphabet for ticket text: URL-safe, no padding (matches
-/// [`CapabilityTicket`](crate::CapabilityTicket) and [`Membership`](crate::Membership)).
+/// [`Membership`](crate::Membership)).
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// The blake3 `derive_key` context string for topic ids. Frozen: changing it
@@ -153,8 +153,8 @@ impl TopicPeer {
 /// The bootstrap blob for joining a topic: which fabric, which topic name, and
 /// where to find peers already on it.
 ///
-/// Text form is base64url-no-pad canonical JSON, like
-/// [`CapabilityTicket`](crate::CapabilityTicket). Entirely unsigned routing
+/// Text form is base64url-no-pad canonical JSON, like a
+/// [`Membership`](crate::Membership) token. Entirely unsigned routing
 /// hints; membership is proved by admission, not by holding this.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct TopicTicket {

@@ -151,7 +151,7 @@ impl TopicContext {
         // The same two consistency checks `call` runs, for the same reason:
         // credentials issued to another node must not masquerade as a network
         // failure later.
-        preflight(node.node_id(), &membership, None).map_err(anyhow::Error::msg)?;
+        preflight(node.node_id(), &membership).map_err(anyhow::Error::msg)?;
 
         let proof = match token_arg(
             a.inclusion_proof.as_deref(),

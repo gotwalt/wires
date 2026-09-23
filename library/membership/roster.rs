@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec::canonical_bytes;
 use crate::error::{Error, Result};
-use crate::grant::AlgorithmId;
+use crate::identity::AlgorithmId;
 use crate::identity::{NodeId, NodeIdentity, Signature};
 
 /// The base64 alphabet for roster tokens: URL-safe, no padding (matches

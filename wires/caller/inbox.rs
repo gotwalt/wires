@@ -48,7 +48,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use iroh::{Endpoint, EndpointAddr};
 use library::{
-    Crl, INBOX_ALPN, InboxFrame, InclusionProof, MAX_BATCH, Membership, NodeId, PushId, PushMessage,
+    INBOX_ALPN, InboxFrame, InclusionProof, MAX_BATCH, Membership, NodeId, PushId, PushMessage,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -505,7 +505,7 @@ impl InboxReceiver {
         proof: Option<&InclusionProof>,
         now: i64,
     ) -> std::result::Result<(), String> {
-        library::check_inclusion(membership, self.fabric, peer, now, &Crl::new())
+        library::check_inclusion(membership, self.fabric, peer, now)
             .map_err(|e| format!("membership rejected: {e}"))?;
         if let Some(head) = self.head.load().map_err(|e| format!("{e:#}"))? {
             let directory = crate::channel::rekey::directory_for(&self.head);

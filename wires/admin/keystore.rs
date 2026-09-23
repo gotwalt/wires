@@ -1,11 +1,10 @@
-//! On-disk key + CRL persistence, so the network commands work without
+//! On-disk key + credential persistence, so the network commands work without
 //! secrets on the command line.
 //!
 //! Files live under the wires home directory — `$WIRES_HOME`, else
 //! `$XDG_CONFIG_HOME/wires`, else `~/.config/wires`:
 //!
 //! - `node.seed` / `root.seed`: hex-encoded 32-byte Ed25519 seeds (mode `0600`).
-//! - `crl.json`: the responder's revocation list.
 //! - `membership.json`: the dialer's fabric membership token (mode `0644` — a
 //!   *public* signed credential, not a secret).
 //! - `roster.json`: the root's full member set + version (mode `0600` — reveals
@@ -21,23 +20,23 @@
 //!   [`SealedFabricKey`](library::SealedFabricKey) an operator handed over.
 //!   Old versions are kept forever: replayed history stays readable.
 //!
-//! The resolver helpers ([`node_identity`], [`root_identity`], [`crl_source`],
-//! [`membership`]) encode the precedence the CLI uses: an inline flag wins, then
-//! the matching environment variable, then an explicit `--…-file` path, then the
-//! keystore. The two `serve` gates that must stay live — the CRL and the roster
-//! head — resolve to a *source* ([`crl_source`], [`roster_head_source`]) that the
-//! responder re-reads per connection, not to a value frozen at startup.
+//! The resolver helpers ([`node_identity`], [`root_identity`], [`membership`])
+//! encode the precedence the CLI uses: an inline flag wins, then the matching
+//! environment variable, then an explicit `--…-file` path, then the keystore.
+//! The `serve` gate that must stay live — the roster head — resolves to a
+//! *source* ([`roster_head_source`]) that the responder re-reads per
+//! connection, not to a value frozen at startup.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use library::{
-    Crl, FabricKey, Grant, InclusionProof, Membership, NodeId, NodeIdentity, ProofDirectory,
-    Roster, RosterHead, RosterVersion,
+    FabricKey, InclusionProof, Membership, NodeId, NodeIdentity, ProofDirectory, Roster,
+    RosterHead, RosterVersion,
 };
 
-use crate::host::transport::{CrlSource, HeadSource};
+use crate::host::transport::HeadSource;
 
 /// The file name of the proof directory, beside `roster-head.json` (see
 /// [`Keystore::read_directory`]).
@@ -111,19 +110,6 @@ impl Keystore {
         ensure_dir(&self.dir)?;
         let path = self.path(name);
         write_secret(&path, &id.seed_hex(), force)?;
-        Ok(path)
-    }
-
-    /// Read the raw `crl.json` text; `None` if absent.
-    pub fn read_crl_json(&self) -> Result<Option<String>> {
-        read_to_string_opt(&self.path("crl.json"))
-    }
-
-    /// Write `crl.json` (overwriting). Returns the written path.
-    pub fn save_crl_json(&self, json: &str) -> Result<PathBuf> {
-        ensure_dir(&self.dir)?;
-        let path = self.path("crl.json");
-        write_text(&path, json)?;
         Ok(path)
     }
 
@@ -432,13 +418,13 @@ pub fn node_identity_in(ks: &Keystore) -> Result<NodeIdentity> {
     }
     ks.read_node_identity()?.ok_or_else(|| {
         anyhow!(
-            "no node key: set $WIRES_NODE_SEED or run `wires advanced keygen --save-node` (looked for {})",
+            "no node key: set $WIRES_NODE_SEED or run `wires id` (looked for {})",
             ks.path("node.seed").display()
         )
     })
 }
 
-/// Resolve the root signing identity for `grant`.
+/// Resolve the root signing identity (the admin's commands).
 pub fn root_identity(inline: Option<&str>, file: Option<&Path>) -> Result<NodeIdentity> {
     let env = std::env::var("WIRES_ROOT_SEED").ok();
     resolve_identity(
@@ -490,7 +476,7 @@ pub fn membership(inline: Option<&str>, file: Option<&Path>) -> Result<Membershi
 /// per connection rather than at startup: a responder started before its head
 /// was imported enforces from the dial after `wires advanced import --roster-head…`
 /// lands, with no restart. Until a head has ever been seen it enforces nothing
-/// (the pre-roster membership + CRL + TTL behavior); once one has, a missing or
+/// (the pre-roster membership + TTL behavior); once one has, a missing or
 /// malformed file fails closed, like [`HeadSource::File`].
 pub fn roster_head_source(inline: Option<&str>, file: Option<PathBuf>) -> Result<HeadSource> {
     if let Some(token) = inline {
@@ -574,37 +560,14 @@ fn resolve_identity(
     }
     bail!(
         "no {role} key: pass --{role}-seed, set ${env_name}, use --{role}-seed-file, \
-         or run `wires advanced keygen --save-{role}` (looked for {})",
+         or run `{}` (looked for {})",
+        if role == "root" {
+            "wires init"
+        } else {
+            "wires id"
+        },
         ks.path(ks_name).display()
     );
-}
-
-/// Resolve *where* `serve` reads its revocation list from: inline `--crl-json`
-/// (parsed once, pinned), else `--crl-file`, else the keystore's `crl.json` —
-/// the two file cases are re-read per connection, so `wires advanced revoke` lands
-/// without a restart. A missing file is an empty list.
-pub fn crl_source(inline: Option<&str>, file: Option<PathBuf>) -> Result<CrlSource> {
-    if let Some(json) = inline {
-        return Ok(CrlSource::Fixed(Crl::from_json(json)?));
-    }
-    if let Some(path) = file {
-        return Ok(CrlSource::File(path));
-    }
-    Ok(CrlSource::File(Keystore::resolve()?.path("crl.json")))
-}
-
-/// Read a CRL text file; `None` if absent (used by `revoke --crl-file`).
-pub fn read_crl_text(path: &Path) -> Result<Option<String>> {
-    read_to_string_opt(path)
-}
-
-/// Write a CRL text file (creating parent dirs).
-pub fn write_crl_text(path: &Path, json: &str) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    write_text(path, json)
 }
 
 /// Read a seed file into an identity, erroring if absent.
@@ -721,6 +684,7 @@ fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) -> Result<()>
 }
 
 /// [`write_text_mode`] without a mode change (the file keeps the default).
+#[cfg(test)]
 fn write_text(path: &Path, contents: &str) -> Result<()> {
     write_text_mode(path, contents, None)
 }
@@ -764,27 +728,12 @@ pub(crate) fn token_arg(
     }
 }
 
-/// Local consistency checks run before dialing: the ticket's grant and the
-/// membership must both name *this* keystore's node.
+/// Local consistency check run before dialing: the membership must name
+/// *this* keystore's node.
 ///
-/// Catches the two most common misconfigurations — a ticket copied to the wrong
-/// machine, a membership from another fabric — without a network round-trip, so
-/// they never masquerade as a refusal by the responder.
-pub(crate) fn preflight(
-    node: NodeId,
-    membership: &Membership,
-    grant: Option<&Grant>,
-) -> Result<(), String> {
-    if let Some(grant) = grant
-        && grant.subject != node
-    {
-        return Err(format!(
-            "this ticket was issued to node {}, but this keystore's node is {} — use the \
-             keystore that requested the ticket (or re-issue it)",
-            grant.subject.hex(),
-            node.hex()
-        ));
-    }
+/// Catches a membership copied to the wrong machine without a network
+/// round-trip, so it never masquerades as a refusal by the responder.
+pub(crate) fn preflight(node: NodeId, membership: &Membership) -> Result<(), String> {
     if membership.member != node {
         return Err(format!(
             "this membership was issued to node {}, but this keystore's node is {} — import \
@@ -838,20 +787,6 @@ mod tests {
     }
 
     #[test]
-    fn crl_round_trips_and_is_empty_when_absent() {
-        let ks = Keystore::at(temp_dir());
-        let source = CrlSource::File(ks.path("crl.json"));
-        assert!(source.load().unwrap().is_empty());
-
-        let mut crl = Crl::new();
-        crl.insert(NodeIdentity::from_seed([7u8; 32]).node_id());
-        ks.save_crl_json(&crl.to_json().unwrap()).unwrap();
-        // Same source object, re-read: what makes `wires advanced revoke` land without a
-        // responder restart.
-        assert_eq!(source.load().unwrap(), crl);
-    }
-
-    #[test]
     fn read_identity_file_errors_when_missing() {
         let path = temp_dir().join("absent.seed");
         assert!(read_identity_file(&path).is_err());
@@ -875,42 +810,6 @@ mod tests {
     #[test]
     fn rejects_bad_inline_seed() {
         assert!(node_identity(Some("nothex"), None).is_err());
-    }
-
-    #[test]
-    fn crl_source_prefers_inline_then_file() {
-        let mut crl = Crl::new();
-        crl.insert(NodeIdentity::from_seed([4u8; 32]).node_id());
-        let json = crl.to_json().unwrap();
-
-        // Inline JSON is parsed once and pinned; no filesystem is touched.
-        let inline = crl_source(Some(&json), None).unwrap();
-        assert!(matches!(inline, CrlSource::Fixed(_)));
-        assert_eq!(inline.load().unwrap(), crl);
-
-        // An explicit file becomes a re-read-per-connection source.
-        let dir = temp_dir();
-        let path = dir.join("crl.json");
-        write_crl_text(&path, &json).unwrap();
-        assert_eq!(crl_source(None, Some(path)).unwrap().load().unwrap(), crl);
-        assert!(
-            crl_source(None, Some(dir.join("absent.json")))
-                .unwrap()
-                .load()
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn crl_text_round_trips_and_is_none_when_absent() {
-        let path = temp_dir().join("c.json");
-        assert!(read_crl_text(&path).unwrap().is_none());
-        write_crl_text(&path, r#"{"revoked":[]}"#).unwrap();
-        assert_eq!(
-            read_crl_text(&path).unwrap().as_deref(),
-            Some(r#"{"revoked":[]}"#)
-        );
     }
 
     #[cfg(unix)]
@@ -1171,7 +1070,7 @@ mod tests {
             Ok(_) => panic!("an empty keystore has no node key"),
             Err(e) => format!("{e:#}"),
         };
-        assert!(msg.contains("wires advanced keygen --save-node"), "{msg}");
+        assert!(msg.contains("wires id"), "{msg}");
         assert!(
             msg.contains(&ks.path("node.seed").display().to_string()),
             "{msg}"
@@ -1198,31 +1097,12 @@ mod tests {
         assert_eq!(inclusion_proof(None, Some(&path)).unwrap().unwrap(), proof);
     }
 
-    use library::Scope;
-
     #[test]
     fn preflight_accepts_credentials_issued_to_this_node() {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let me = NodeIdentity::from_seed([2u8; 32]).node_id();
         let membership = Membership::mint(&root, me, 0, i64::MAX).unwrap();
-        let grant = Grant::mint(&root, me, Scope::new("tools.rg"), i64::MAX).unwrap();
-        assert_eq!(preflight(me, &membership, Some(&grant)), Ok(()));
-        assert_eq!(preflight(me, &membership, None), Ok(()));
-    }
-
-    #[test]
-    fn preflight_rejects_a_ticket_for_another_node() {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let me = NodeIdentity::from_seed([2u8; 32]).node_id();
-        let other = NodeIdentity::from_seed([3u8; 32]).node_id();
-        let membership = Membership::mint(&root, me, 0, i64::MAX).unwrap();
-        // A ticket minted for someone else — the "copied to the wrong machine" case.
-        let grant = Grant::mint(&root, other, Scope::new("tools.rg"), i64::MAX).unwrap();
-        let msg = preflight(me, &membership, Some(&grant)).unwrap_err();
-        assert!(
-            msg.contains(&other.hex()) && msg.contains(&me.hex()),
-            "{msg}"
-        );
+        assert_eq!(preflight(me, &membership), Ok(()));
     }
 
     #[test]
@@ -1231,7 +1111,7 @@ mod tests {
         let me = NodeIdentity::from_seed([2u8; 32]).node_id();
         let other = NodeIdentity::from_seed([3u8; 32]).node_id();
         let membership = Membership::mint(&root, other, 0, i64::MAX).unwrap();
-        let msg = preflight(me, &membership, None).unwrap_err();
+        let msg = preflight(me, &membership).unwrap_err();
         assert!(
             msg.contains(&other.hex()) && msg.contains(&me.hex()),
             "{msg}"
