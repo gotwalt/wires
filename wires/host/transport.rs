@@ -538,7 +538,7 @@ async fn handle_connection(incoming: iroh::endpoint::Incoming, config: &ServeCon
 }
 
 /// The session ALPN as a router protocol, for a responder whose endpoint is
-/// owned by a [`TopicNode`](crate::channel::topics::TopicNode) (`serve --audit-topic`):
+/// owned by a [`TopicNode`](crate::channel::topics::TopicNode) (`serve host.json`):
 /// one endpoint per node key, so the session rides the topic node's router
 /// instead of a second bind.
 #[derive(Clone)]

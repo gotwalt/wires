@@ -112,7 +112,7 @@ enum Command {
 
     // --- host ---
     /// Expose CLIs as named tools, verify every caller, exec the tool, bridge
-    /// its stdio — and, with `--audit-topic`, record every call.
+    /// its stdio — and, with a `channel` in host.json, record every call.
     Serve(host::serve::ServeArgs),
 
     // --- caller (and every joiner) ---
