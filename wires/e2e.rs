@@ -33,6 +33,11 @@
 //! | [`tail_catches_up_after_offline`] | §6 | exactly-once delivery across a restart |
 //! | [`live_gap_triggers_replay_and_heals`] | §6 | a hole in the live stream is healed by replay, not papered over |
 //!
+//! Plus one for the remote-CLI board (card 02):
+//! [`every_call_and_refusal_lands_on_the_audit_topic`] — a responder that
+//! hosts its audit topic publishes `Started`/`Finished` for a call and
+//! `Denied` for a revoked caller, and a third member observes all of it.
+//!
 //! # Reading the fixtures
 //!
 //! [`Fabric`] is a root that can commit more than once — the one thing the
@@ -1254,4 +1259,245 @@ async fn live_gap_triggers_replay_and_heals() {
     pump.abort();
     node_a.shutdown().await.unwrap();
     node_b.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 7. Every call lands on the audit topic (board card 02)
+// ---------------------------------------------------------------------------
+
+/// Read the next message on `rx` as the audit record it must be.
+async fn next_record(
+    rx: &mut mpsc::Receiver<TopicEvent>,
+    keyring: &mut Keyring,
+) -> library::AuditRecord {
+    let envelope = next_message(rx).await;
+    let plaintext = keyring.open(&envelope).expect("the observer holds the key");
+    let text = String::from_utf8(plaintext).unwrap();
+    // What `wires tail` prints for it is a record line, never the raw JSON.
+    let line = Printer { json: false }.render(&envelope, &text);
+    assert!(!line.contains("record/v1"), "rendered, not raw: {line}");
+    match library::ChannelRecord::parse(&text) {
+        Some(library::ChannelRecord::Audit(record)) => record,
+        other => panic!("expected an audit record, got {other:?} from {text:?}"),
+    }
+}
+
+/// **Card 02.** R serves `cat` with `--audit-topic ops`, hosting the topic
+/// node itself (the session ALPN on the same router); O tails `ops`; C calls.
+/// O sees `Started` (caller = C, as iroh authenticated it) then `Finished`
+/// (exit 0, the byte count, BLAKE3 of the output). The roster then drops C;
+/// C's next call is refused, and O sees `Denied` with the very reason C got.
+///
+/// R's publishing runs the production path: [`audit::forward`](crate::audit::forward)
+/// feeding [`publish_from_tail`](crate::publish_from_tail) — the tail loop's
+/// control-socket arm, the single allocator — with the loop around it reduced
+/// to that one arm.
+#[tokio::test]
+async fn every_call_and_refusal_lands_on_the_audit_topic() {
+    use crate::transport::{AuditSink, CrlSource, ServeConfig, SessionProtocol};
+
+    let r_seed = [21u8; 32];
+    let r = Member::new("ar", r_seed);
+    let o = Member::new("ao", [22u8; 32]);
+    let c = Member::new("ac", [23u8; 32]);
+    let mut fab = Fabric::new("ops");
+    let v1 = fab.commit(&[r.id(), o.id(), c.id()]);
+    for m in [&r, &o, &c] {
+        m.import(fab.at(v1));
+    }
+
+    // R: the responder, configured as `serve_cmd` builds it with an audit sink.
+    let (sink, records) = AuditSink::channel(crate::audit::AUDIT_QUEUE);
+    let r_membership = library::Membership::mint(&fab.root, r.id(), 0, i64::MAX).unwrap();
+    let serve = ServeConfig {
+        trust_root: fab.id(),
+        scope: None,
+        crl: CrlSource::Fixed(library::Crl::new()),
+        head: HeadSource::Keystore {
+            path: r.keystore.path("roster-head.json"),
+            armed: AtomicBool::new(true),
+        },
+        membership: r_membership.clone(),
+        proof: None,
+        command: vec!["cat".to_string()],
+        tools: Default::default(),
+        audit: Some(sink),
+    };
+    let store_r = r.store(&fab);
+    let mut cfg = TopicNodeConfig::new(
+        fab.topic,
+        fab.id(),
+        Arc::new(HeadSource::Keystore {
+            path: r.keystore.path("roster-head.json"),
+            armed: AtomicBool::new(false),
+        }),
+        fab.at(v1).proofs[&r.id()].clone(),
+        Arc::clone(&r.keystore),
+        Arc::clone(&store_r),
+    );
+    cfg.admit_recheck = SLOW_RECHECK;
+    cfg.protocols.push((
+        crate::transport::ALPN,
+        SessionProtocol(Arc::new(serve)).into(),
+    ));
+    let lookup = MemoryLookup::new();
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(secret_key(&r.identity))
+        .address_lookup(lookup.clone())
+        .bind()
+        .await
+        .unwrap();
+    let node_r = TopicNode::spawn_on(endpoint, lookup, cfg).await.unwrap();
+
+    // O: an observer. A member with the fabric key and nothing else — no
+    // grant, no credential of C's.
+    let node_o = o.spawn(&fab, v1, SLOW_RECHECK).await;
+    let (send_r, mut rx_r) = node_r.join(fab.topic, &[]).await.unwrap();
+    let (_send_o, mut rx_o) = node_o.join(fab.topic, &[hint(&node_r)]).await.unwrap();
+    wait_neighbor_up(&mut rx_r, o.id()).await;
+    wait_neighbor_up(&mut rx_o, r.id()).await;
+
+    // R's tail loop, reduced to its publish arm.
+    let ctx = crate::TopicContext {
+        node: NodeIdentity::from_seed(r_seed),
+        membership: r_membership,
+        proof: fab.at(v1).proofs[&r.id()].clone(),
+        head_source: Arc::new(HeadSource::Keystore {
+            path: r.keystore.path("roster-head.json"),
+            armed: AtomicBool::new(true),
+        }),
+        keystore: Arc::clone(&r.keystore),
+        home: r.home.path().to_path_buf(),
+        name: "ops".into(),
+        topic: fab.topic,
+        fabric_root: fab.id(),
+        ticket_peers: Vec::new(),
+        relay_url: None,
+    };
+    let (tx, mut requests) = mpsc::channel::<crate::ipc::PublishRequest>(32);
+    let forwarder = tokio::spawn(crate::audit::forward(records, tx));
+    let publisher = tokio::spawn({
+        let store = Arc::clone(&store_r);
+        async move {
+            while let Some(request) = requests.recv().await {
+                let outcome = crate::publish_from_tail(&ctx, &store, &send_r, &request.text)
+                    .await
+                    .map(|envelope| envelope.seq.0)
+                    .map_err(|e| format!("{e:#}"));
+                let _ = request.reply.send(outcome);
+            }
+        }
+    });
+
+    // C: the caller, dialing R's session ALPN by key over loopback.
+    let target =
+        crate::transport::endpoint_addr(&r.id(), &localhost_socks(node_r.endpoint()), None)
+            .unwrap();
+    let c_membership = library::Membership::mint(&fab.root, c.id(), 0, i64::MAX).unwrap();
+    let dial = |proof: InclusionProof| {
+        let target = target.clone();
+        let membership = c_membership.clone();
+        let identity = NodeIdentity::from_seed([23u8; 32]);
+        async move {
+            let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .secret_key(secret_key(&identity))
+                .bind()
+                .await
+                .unwrap();
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let result = timeout(
+                PATIENCE,
+                crate::transport::connect_on(
+                    endpoint,
+                    target,
+                    membership,
+                    None,
+                    Some(proof),
+                    false,
+                    std::io::Cursor::new(b"hello, audit".to_vec()),
+                    &mut out,
+                    &mut err,
+                ),
+            )
+            .await
+            .expect("the call timed out");
+            (result, out)
+        }
+    };
+
+    let mut keyring = o.keyring();
+    let (code, out) = dial(fab.at(v1).proofs[&c.id()].clone()).await;
+    assert_eq!(code.unwrap(), 0);
+    assert_eq!(out, b"hello, audit");
+
+    let started = next_record(&mut rx_o, &mut keyring).await;
+    let library::AuditRecord::Started {
+        call,
+        caller,
+        tool,
+        argv,
+        roster_version,
+        ..
+    } = started
+    else {
+        panic!("expected Started first, got {started:?}");
+    };
+    assert_eq!(caller, c.id(), "the caller iroh authenticated");
+    assert_eq!(tool.as_str(), "stdio");
+    assert!(argv.as_slice().is_empty(), "`cat` has no fixed args");
+    assert_eq!(roster_version, Some(v1.0));
+
+    let finished = next_record(&mut rx_o, &mut keyring).await;
+    let library::AuditRecord::Finished {
+        call: finished_call,
+        exit,
+        stdout_bytes,
+        stdout_digest,
+        ..
+    } = finished
+    else {
+        panic!("expected Finished second, got {finished:?}");
+    };
+    let mut expect = library::OutputHasher::new();
+    expect.update(b"hello, audit");
+    assert_eq!(finished_call, call, "Finished pairs with its Started");
+    assert_eq!(exit, 0);
+    assert_eq!(stdout_bytes, 12);
+    assert_eq!(stdout_digest, expect.finish(), "BLAKE3 of what C received");
+
+    // Revoke C: the operator commits a roster without it, and R and O import
+    // the new head and key. C still holds only its v1 proof.
+    let v2 = fab.commit(&[r.id(), o.id()]);
+    r.import(fab.at(v2));
+    o.import(fab.at(v2));
+
+    let (refused, out) = dial(fab.at(v1).proofs[&c.id()].clone()).await;
+    let e = refused.expect_err("a revoked caller is refused");
+    let told = e
+        .downcast_ref::<Denied>()
+        .unwrap_or_else(|| panic!("a refusal, not a failure: {e:#}"))
+        .reason()
+        .to_string();
+    assert!(out.is_empty(), "nothing ran");
+
+    let denied = next_record(&mut rx_o, &mut keyring).await;
+    let library::AuditRecord::Denied {
+        caller,
+        tool,
+        reason,
+        ..
+    } = denied
+    else {
+        panic!("expected Denied, got {denied:?}");
+    };
+    assert_eq!(caller, c.id());
+    assert_eq!(tool, None, "single-command mode: the caller named no tool");
+    assert_eq!(reason, told, "the record carries the reason C was sent");
+    assert!(reason.contains("roster inclusion rejected"), "{reason}");
+
+    forwarder.abort();
+    publisher.abort();
+    node_o.shutdown().await.unwrap();
+    node_r.shutdown().await.unwrap();
 }

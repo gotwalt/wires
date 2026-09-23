@@ -56,7 +56,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_core::Stream;
 use iroh::Endpoint;
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::protocol::Router;
+use iroh::protocol::{DynProtocolHandler, Router};
 use iroh_gossip::api::{Event as GossipEvent, GossipReceiver, GossipSender, JoinOptions};
 use iroh_gossip::net::{GOSSIP_ALPN, Gossip};
 use library::{
@@ -137,6 +137,11 @@ pub struct TopicNodeConfig {
     pub replay_limit: u32,
     /// Capacity of the [`TopicEvent`] channel (default [`EVENT_CHANNEL_CAP`]).
     pub channel_cap: usize,
+    /// Extra `(ALPN, handler)` pairs to register on the node's one router —
+    /// how `serve --audit-topic` serves the session ALPN from this endpoint
+    /// instead of binding a second one for the same key. Empty by default;
+    /// an ALPN that collides with one of the three above is refused.
+    pub protocols: Vec<(&'static [u8], Box<dyn DynProtocolHandler>)>,
 }
 
 impl TopicNodeConfig {
@@ -161,6 +166,7 @@ impl TopicNodeConfig {
             admit_recheck: ADMIT_RECHECK,
             replay_limit: REPLAY_LIMIT,
             channel_cap: EVENT_CHANNEL_CAP,
+            protocols: Vec::new(),
         }
     }
 }
@@ -422,11 +428,26 @@ impl TopicNode {
 
         // ONE router. See the module docs: a second one over this endpoint would
         // silently unregister these three.
-        let router = Router::builder(endpoint.clone())
+        let mut builder = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
             .accept(library::TOPIC_ADMIT_ALPN, Arc::clone(&admit))
-            .accept(library::TOPIC_REPLAY_ALPN, replay)
-            .spawn();
+            .accept(library::TOPIC_REPLAY_ALPN, replay);
+        for (alpn, handler) in cfg.protocols {
+            if [
+                GOSSIP_ALPN,
+                library::TOPIC_ADMIT_ALPN,
+                library::TOPIC_REPLAY_ALPN,
+            ]
+            .contains(&alpn)
+            {
+                bail!(
+                    "extra protocol {:?} would replace one of the topic node's own",
+                    String::from_utf8_lossy(alpn)
+                );
+            }
+            builder = builder.accept(alpn, handler);
+        }
+        let router = builder.spawn();
         let watchdog = spawn_watchdog(Arc::clone(&admit), cfg.admit_recheck);
 
         tracing::info!(
