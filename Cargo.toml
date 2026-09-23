@@ -43,3 +43,12 @@ ring = "0.17"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 url = "2"
+# `wires call --jq` (board card 19): jq filters evaluated in-process, so an
+# agent can shape remote output without a shell. jaq is the pure-Rust jq
+# (no C; jaq-core forbids unsafe). Default features: `jaq_std::funs()` only
+# exists with all of them, and they bring the date (`fromdateiso8601`, via
+# jiff) and regex (`test`, via regex-bites) filters agents reach for with
+# `gh --jq`. The new crates are small and pure Rust.
+jaq-core = "3.1"
+jaq-std = "3.0"
+jaq-json = "2.0"

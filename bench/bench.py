@@ -17,6 +17,10 @@ Arms (see REPORT.md for why these four):
   wires     `wires call gh -- ...` from Bash, via a loopback `wires serve
             --expose gh=gh` (bench/wires-up.sh).
   gh        bare `gh` from Bash.
+  wires-only  (card 19) `wires call gh` is the ONLY thing the agent may run:
+            `--allowedTools=Bash(wires call gh:*)`, no jq/head/grep helpers.
+            Output shaping comes from gh's own flags or `wires call
+            --jq/--head/--max-bytes` (in-process, no shell).
 
 The GitHub token is read with `gh auth token` at runtime and passed to the
 MCP container through the environment only; it is never written to disk.
@@ -97,6 +101,18 @@ ARMS = {
         "(it runs `gh` on a remote, already-authenticated machine).\n\n",
         "tools": "Bash,ToolSearch",
         "allowed": ["Bash(wires call gh:*)", *PIPE_HELPERS],
+        "mcp": False,
+        "env": {},
+    },
+    "wires-only": {
+        "hint": "The GitHub CLI is available through Bash as `wires call gh -- <gh arguments>` "
+        "(it runs `gh` on a remote, already-authenticated machine). That is the only command you "
+        "can run: there is no shell, so pipes, `jq`, `head` and other local tools are not "
+        "available. Filter output with gh's own flags (`--json`, `--jq`, `--limit`) or with "
+        "wires' flags, which go between the tool name and `--`: "
+        "`wires call gh --jq <filter> --head <N> --max-bytes <N> -- <gh arguments>`.\n\n",
+        "tools": "Bash,ToolSearch",
+        "allowed": ["Bash(wires call gh:*)"],
         "mcp": False,
         "env": {},
     },
@@ -242,7 +258,7 @@ def base_env(extra: dict) -> dict:
 def run_one(arm: str, task: str, rep: int, workdir: pathlib.Path, rawdir: pathlib.Path, token: str) -> dict:
     a = ARMS[arm]
     env = base_env(a["env"])
-    if arm == "wires":
+    if arm in ("wires", "wires-only"):
         env["WIRES_HOME"] = os.environ["WIRES_HOME"]
         env["PATH"] = os.environ["BENCH_WIRES_BIN_DIR"] + ":" + env["PATH"]
     if a["mcp"]:
@@ -321,6 +337,10 @@ def run_one(arm: str, task: str, rep: int, workdir: pathlib.Path, rawdir: pathli
         "duration_api_ms": (result or {}).get("duration_api_ms"),
         "wall_s": round(wall, 2),
         "tool_calls": tool_calls,
+        "permission_denials": len((result or {}).get("permission_denials") or []),
+        "denied_commands": [
+            (d.get("tool_input") or {}).get("command") for d in ((result or {}).get("permission_denials") or [])
+        ],
         "answer": answer_line(text),
         "result_tail": (text or "")[-600:],
     }

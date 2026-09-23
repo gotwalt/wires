@@ -3,7 +3,9 @@
 //!
 //! The on-ramp for workflows that only speak MCP (Claude Desktop, IDEs). Each
 //! `tools.json` entry becomes one MCP tool taking `{ args?: string[], stdin?:
-//! string }`; calling it dials the responder over wires (through a
+//! string, jq?: string, head?: integer, max_bytes?: integer }`; the last three
+//! shape the remote stdout in-process ([`shape`](crate::caller::shape)), as
+//! `wires call --jq/--head/--max-bytes` do. Calling a tool dials the responder over wires (through a
 //! [`Caller`]) and returns the remote output as one text block. There is no
 //! HTTP, no OAuth, and no token: the caller's identity is this node's key.
 //!
@@ -20,6 +22,7 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::caller::call::{CallOutcome, Caller, CredArgs, Credentials, WiresCaller};
+use crate::caller::shape::{Shape, ShapeArgs, exit_code};
 use crate::caller::tools::{RemoteTool, ToolsConfig};
 
 /// The newest MCP revision this server speaks (the stateless one).
@@ -43,6 +46,10 @@ pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 
 /// Most bytes of remote stdout (and, separately, stderr) placed in a result.
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// Appended to every tool's description: how to cut output down without a
+/// shell (board card 19).
+pub const FILTER_HINT: &str = "Filter output with the command's own flags (e.g. `gh … --json f --jq …`) or the `jq`/`head`/`max_bytes` fields; there is no shell, so pipes are not available.";
 
 /// The name this server reports in `serverInfo`.
 pub const SERVER_NAME: &str = "wires";
@@ -211,10 +218,21 @@ impl<C: Caller> McpServer<C> {
             .iter()
             .find(|t| t.name.as_str() == name)
             .ok_or_else(|| RpcError::new(INVALID_PARAMS, format!("unknown tool: {name}")))?;
-        let (argv, stdin) = parse_arguments(params.get("arguments"))
+        let (argv, stdin, shape) = parse_arguments(params.get("arguments"))
             .map_err(|m| RpcError::new(INVALID_PARAMS, m))?;
+        // A bad jq filter is the model's mistake to fix: a tool error it can
+        // read, and nothing is dialed.
+        let shape = match Shape::new(&shape) {
+            Ok(shape) => shape,
+            Err(e) => {
+                return Ok(json!({
+                    "content": [{"type": "text", "text": format!("wires: {}", e.message())}],
+                    "isError": true,
+                }));
+            }
+        };
         let (text, is_error) = match self.caller.call(tool, argv, stdin).await {
-            Ok(outcome) => render_outcome(&outcome),
+            Ok(outcome) => render_outcome(&shaped(&shape, outcome)),
             Err(e) => {
                 tracing::warn!("wires mcp: call to `{name}` failed: {e:#}");
                 (format!("wires: call failed: {e:#}"), true)
@@ -266,6 +284,20 @@ fn input_schema() -> Value {
             "stdin": {
                 "type": "string",
                 "description": "Secondary: text fed to the remote command's stdin, for input too large or too structured to pass as arguments. Prefer `args` when the command accepts its input that way."
+            },
+            "jq": {
+                "type": "string",
+                "description": "Optional jq filter applied to stdout before it is returned (strings print raw, other values as compact JSON). Prefer the command's own filter flags when it has them."
+            },
+            "head": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Optional: keep only the first N lines of stdout (after `jq`)."
+            },
+            "max_bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Optional: keep at most N bytes of stdout (after `jq` and `head`)."
             }
         },
         "additionalProperties": false
@@ -273,28 +305,67 @@ fn input_schema() -> Value {
 }
 
 /// The MCP description for `tool`: its own line, plus where calls are logged
-/// when `tools.json` names an audit topic.
+/// when `tools.json` names an audit topic, then [`FILTER_HINT`].
 fn describe(tool: &RemoteTool, audit_topic: Option<&str>) -> String {
-    match audit_topic {
+    let own = match audit_topic {
         Some(topic) => format!(
             "{} (runs remotely via wires; every call is logged to the {topic} channel)",
             tool.description
         ),
         None => tool.description.clone(),
+    };
+    if own.is_empty() {
+        FILTER_HINT.to_owned()
+    } else {
+        format!("{own} {FILTER_HINT}")
     }
 }
 
-/// Validate `tools/call` arguments into an [`Argv`] and stdin bytes. Both
-/// fields are optional; anything else is an error message for the client.
-fn parse_arguments(arguments: Option<&Value>) -> Result<(Argv, Vec<u8>), String> {
+/// Apply `shape` to an exited call: stdout shaped, notes and any jq error
+/// appended to stderr, exit code per [`exit_code`]. Denials pass through.
+fn shaped(shape: &Shape, outcome: CallOutcome) -> CallOutcome {
+    match outcome {
+        CallOutcome::Exited {
+            exit,
+            stdout,
+            mut stderr,
+        } if !shape.is_identity() => {
+            let shaped = shape.apply(&stdout);
+            for line in shaped.stderr_lines() {
+                if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+                    stderr.push(b'\n');
+                }
+                stderr.extend_from_slice(line.as_bytes());
+                stderr.push(b'\n');
+            }
+            CallOutcome::Exited {
+                exit: exit_code(exit, &shaped),
+                stdout: shaped.stdout,
+                stderr,
+            }
+        }
+        other => other,
+    }
+}
+
+/// The `tools/call` argument names [`parse_arguments`] accepts.
+const ARGUMENTS: &[&str] = &["args", "stdin", "jq", "head", "max_bytes"];
+
+/// Validate `tools/call` arguments into an [`Argv`], stdin bytes and the
+/// shaping fields. All are optional; anything else is an error message for
+/// the client.
+fn parse_arguments(arguments: Option<&Value>) -> Result<(Argv, Vec<u8>, ShapeArgs), String> {
     let map = match arguments {
-        None | Some(Value::Null) => return Ok((Argv::default(), Vec::new())),
+        None | Some(Value::Null) => {
+            return Ok((Argv::default(), Vec::new(), ShapeArgs::default()));
+        }
         Some(Value::Object(map)) => map,
         Some(_) => return Err("arguments must be an object".into()),
     };
-    if let Some(extra) = map.keys().find(|k| *k != "args" && *k != "stdin") {
+    if let Some(extra) = map.keys().find(|k| !ARGUMENTS.contains(&k.as_str())) {
         return Err(format!(
-            "unexpected argument `{extra}` (expected `args`, `stdin`)"
+            "unexpected argument `{extra}` (expected one of `{}`)",
+            ARGUMENTS.join("`, `")
         ));
     }
     let args = match map.get("args") {
@@ -312,7 +383,25 @@ fn parse_arguments(arguments: Option<&Value>) -> Result<(Argv, Vec<u8>), String>
         Some(Value::String(s)) => s.clone().into_bytes(),
         Some(_) => return Err("`stdin` must be a string".into()),
     };
-    Ok((argv, stdin))
+    let jq = match map.get("jq") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err("`jq` must be a string".into()),
+    };
+    let count = |key: &str| match map.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .map(Some)
+            .ok_or(format!("`{key}` must be a non-negative integer")),
+    };
+    let shape = ShapeArgs {
+        jq,
+        head: count("head")?,
+        max_bytes: count("max_bytes")?,
+    };
+    Ok((argv, stdin, shape))
 }
 
 /// Render an outcome as the result's text, plus whether it is an error:
@@ -570,7 +659,9 @@ mod tests {
                 json!({"jsonrpc":"2.0","id":9,"method":"resources/list"}),
             ],
         );
-        let suffix = " (runs remotely via wires; every call is logged to the ops channel)";
+        let suffix = format!(
+            " (runs remotely via wires; every call is logged to the ops channel) {FILTER_HINT}"
+        );
         let expected = vec![
             json!({"jsonrpc":"2.0","id":1,"result":{
                 "protocolVersion":"2025-06-18",
@@ -627,10 +718,10 @@ mod tests {
             out[0],
             json!({"jsonrpc":"2.0","id":"a","result":{
                 "tools":[
-                    {"name":"db_query","description":"Read-only SQL","inputSchema":schema()},
-                    {"name":"fails","description":"Always exits 2","inputSchema":schema()},
-                    {"name":"locked","description":"Refused","inputSchema":schema()},
-                    {"name":"offline","description":"Unreachable","inputSchema":schema()},
+                    {"name":"db_query","description":format!("Read-only SQL {FILTER_HINT}"),"inputSchema":schema()},
+                    {"name":"fails","description":format!("Always exits 2 {FILTER_HINT}"),"inputSchema":schema()},
+                    {"name":"locked","description":format!("Refused {FILTER_HINT}"),"inputSchema":schema()},
+                    {"name":"offline","description":format!("Unreachable {FILTER_HINT}"),"inputSchema":schema()},
                 ],
                 "resultType":"complete","_meta":stamped_meta}})
         );
@@ -725,6 +816,91 @@ mod tests {
             "{}",
             &text[text.len() - 80..]
         );
+    }
+
+    #[test]
+    fn descriptions_say_how_to_filter_without_a_shell() {
+        let d = describe(&entry("gh", "The GitHub CLI"), None);
+        assert!(d.starts_with("The GitHub CLI "), "{d}");
+        assert!(d.contains("--jq"), "{d}");
+        assert!(d.contains("pipes are not available"), "{d}");
+        let props = &input_schema()["properties"];
+        for field in ["jq", "head", "max_bytes"] {
+            assert!(props[field]["description"].is_string(), "{field}");
+        }
+    }
+
+    #[test]
+    fn shaping_fields_filter_the_result() {
+        let mut s = server(None);
+        s.caller = FakeCaller::default().answer(
+            "db_query",
+            Ok(exited(0, r#"[{"n":"a"},{"n":"b"},{"n":"c"}]"#, "")),
+        );
+        let out = transcript(
+            &mut s,
+            &[
+                call(1, "db_query", json!({"jq": ".[].n", "head": 2})),
+                call(2, "db_query", json!({"jq": ".[0]", "max_bytes": 3})),
+                call(3, "db_query", json!({"jq": ".foo"})),
+            ],
+        );
+        assert_eq!(out[0], text_result(1, "a\nb\nexit: 0", false));
+        assert_eq!(
+            out[1],
+            text_result(
+                2,
+                "{\"n\nstderr:\nwires: stdout truncated to 3 of 10 bytes (--max-bytes 3)\nexit: 0",
+                false
+            )
+        );
+        // `.foo` on an array is a jq error: exit 2, since the remote exit was 0.
+        let text = out[2]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("wires: --jq:"), "{text}");
+        assert!(text.ends_with("exit: 2"), "{text}");
+        assert_eq!(out[2]["result"]["isError"], json!(true));
+    }
+
+    #[test]
+    fn a_bad_filter_is_a_tool_error_and_nothing_is_dialed() {
+        let mut s = server(None);
+        let out = transcript(&mut s, &[call(1, "db_query", json!({"jq": ".["}))]);
+        assert_eq!(out[0]["result"]["isError"], json!(true));
+        let text = out[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("wires: --jq: invalid filter"), "{text}");
+        assert!(s.caller.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shaping_fields_are_type_checked() {
+        let mut s = server(None);
+        let out = transcript(
+            &mut s,
+            &[
+                call(1, "db_query", json!({"head": -1})),
+                call(2, "db_query", json!({"max_bytes": "10"})),
+                call(3, "db_query", json!({"jq": 5})),
+            ],
+        );
+        for (i, field) in ["head", "max_bytes", "jq"].iter().enumerate() {
+            assert_eq!(out[i]["error"]["code"], INVALID_PARAMS);
+            let msg = out[i]["error"]["message"].as_str().unwrap();
+            assert!(msg.contains(field), "{msg}");
+        }
+        assert!(s.caller.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_denial_is_not_shaped() {
+        let out = shaped(
+            &Shape::new(&ShapeArgs {
+                jq: Some(".".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+            CallOutcome::Denied("revoked".into()),
+        );
+        assert_eq!(out, CallOutcome::Denied("revoked".into()));
     }
 
     #[test]

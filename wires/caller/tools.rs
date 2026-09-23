@@ -218,7 +218,8 @@ pub enum ToolsCmd {
     /// Add a remote tool, reached by ticket, by responder node id, or by the
     /// responder's audit-topic ticket.
     Add(ToolsAddArgs),
-    /// List the configured tools, one per line.
+    /// List the configured tools, one per line, then a `#` line on how to
+    /// call and filter them.
     List,
     /// Remove a tool by name.
     Rm {
@@ -361,14 +362,19 @@ pub fn target_from_topic_ticket(text: &str) -> Result<(ToolTarget, String)> {
     ))
 }
 
-/// `wires tools list` output: `name<TAB>target<TAB>description`, config order.
+/// `wires tools list` output: `name<TAB>target<TAB>description`, config
+/// order, then (if there are any) [`CALL_HINT`](crate::caller::shape::CALL_HINT)
+/// as a `#` line, so an agent without a shell learns how to filter.
 fn render_list(config: &ToolsConfig) -> String {
-    config
+    let mut lines: Vec<String> = config
         .tools
         .iter()
         .map(|t| format!("{}\t{}\t{}", t.name, t.target_summary(), t.description))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    if !lines.is_empty() {
+        lines.push(format!("# {}", crate::caller::shape::CALL_HINT));
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -540,7 +546,8 @@ pub(crate) mod tests {
         assert!(run(ToolsCmd::Add(bad_ticket)).is_err());
         let list = run(ToolsCmd::List).unwrap();
         assert!(list.starts_with("rg\tticket → "), "{list}");
-        assert!(list.ends_with("\tsearch"), "{list}");
+        assert!(list.lines().next().unwrap().ends_with("\tsearch"), "{list}");
+        assert!(list.ends_with(&format!("\n# {}", crate::caller::shape::CALL_HINT)));
         assert_eq!(
             run(ToolsCmd::Rm { name: "rg".into() }).unwrap(),
             "removed rg"
