@@ -15,8 +15,10 @@
 //! the credentials, `1` for any local or transport failure.
 
 mod admission;
+mod call;
 mod ipc;
 mod keystore;
+mod mcp;
 mod pair;
 mod replay;
 mod store;
@@ -86,6 +88,13 @@ enum Command {
     /// Join a topic and stream it: the resident node (store, mesh, admission,
     /// replay, control socket).
     Tail(TailArgs),
+    /// Run a remote CLI from `tools.json`: stdio passes through, its exit
+    /// code becomes ours, a refusal exits 77.
+    Call(call::CallArgs),
+    /// Serve the `tools.json` CLIs as MCP tools over stdio.
+    Mcp(mcp::McpArgs),
+    /// Edit `tools.json`: the local map of remote CLIs (add / list / rm).
+    Tools(tools::ToolsArgs),
 }
 
 /// `keygen` arguments: optional seeds to re-derive, and whether to persist.
@@ -845,6 +854,28 @@ fn main() {
                 exit_with(e);
             }
         }
+        Command::Call(a) => {
+            init_logging();
+            match runtime().block_on(call::call_cmd(a)) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::Mcp(a) => {
+            init_logging();
+            if let Err(e) = runtime().block_on(mcp::mcp_cmd(a)) {
+                eprintln!("wires: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        Command::Tools(a) => match tools::run_tools_cmd(a) {
+            Ok(out) if out.is_empty() => {}
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("wires: {e:#}");
+                std::process::exit(1);
+            }
+        },
     }
 }
 
@@ -941,7 +972,10 @@ fn cli_admin(command: Command) -> Result<String, String> {
         | Command::Serve(_)
         | Command::Connect(_)
         | Command::Publish(_)
-        | Command::Tail(_) => {
+        | Command::Tail(_)
+        | Command::Call(_)
+        | Command::Mcp(_)
+        | Command::Tools(_) => {
             unreachable!("handled in main")
         }
     }
