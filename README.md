@@ -25,6 +25,10 @@
   wires watch orders-db  ◀──────────────────────┘
 ```
 
+![The loopback demo, narrated](docs/media/demo-remote-cli.gif)
+
+*A recording of `./.scripts/demo-remote-cli.sh`: five keystores on one machine over loopback, signing in through a mock IdP, not the two-machine run ([MP4](docs/media/demo-remote-cli.mp4)).*
+
 **What you just saw**, in the order the demo runs it:
 
 - The admin registers a **service** (`orders-db`), says which roles may call it and read its records, and which hosts implement it. That is one signed document, pushed to the hosts by key.
