@@ -5,7 +5,7 @@
 //! host's keystore exactly as `wires/state` does
 //! ([`adopt_if_newer`](crate::state::store::adopt_if_newer)). Callers dial
 //! the real session ALPN over loopback with a hand-rolled `Hello` + `Invoke`
-//! (the dial half is lane 27b's), presenting ID tokens minted by
+//! (the dial half has its own tests in `caller::call`), presenting ID tokens minted by
 //! [`MockIdp`]s that the host trusts.
 //!
 //! - [`the_registry_decides_who_runs_what`]: an allowed role runs; a

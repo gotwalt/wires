@@ -875,8 +875,8 @@ mod tests {
         assert!(parse(&["rg"]).args.is_empty());
     }
 
-    /// Card 27, the dial side against a minimal in-test acceptor (the host's
-    /// accept side is lane 27c): what a host answers a `Hello` with.
+    /// The dial side against a minimal in-test acceptor (the host's accept
+    /// side has its own tests): what a host answers a `Hello` with.
     #[derive(Clone)]
     #[allow(clippy::large_enum_variant)]
     enum Answer {

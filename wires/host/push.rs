@@ -100,7 +100,7 @@ pub(crate) const QUEUE_FILE: &str = "push-queue.json";
 // The request and its answer (the control socket's `push` operation)
 // ---------------------------------------------------------------------------
 
-/// What `wires push` asks the resident host to send.
+/// What `wires push` asks the running host to send.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PushSpec {
     /// A node id (64 hex) or a role name (from the signed state, or `member`).

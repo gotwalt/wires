@@ -79,7 +79,7 @@ pub(crate) const EXIT_TIMEOUT: i32 = 124;
 const FETCH_BUDGET: Duration = Duration::from_secs(3);
 
 /// How long one fetch asks a host to hold the stream open for a message
-/// (`--wait` with no resident receiver). The host caps it too.
+/// (`--wait`). The host caps it too.
 pub(crate) const LONG_POLL: Duration = Duration::from_secs(25);
 
 /// How long to wait for a peer's frame (beyond any long poll).

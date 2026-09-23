@@ -186,8 +186,8 @@ pub fn resolve_path(explicit: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
-/// `wires tools`: list the tools the hosts on your channel let you run, or
-/// edit the local aliases in `tools.json`.
+/// `wires tools` (hidden): `wires services` plus the aliases, or edit the
+/// local aliases in `tools.json`.
 #[derive(Args)]
 pub struct ToolsArgs {
     /// Use this file instead of `$WIRES_HOME/tools.json`.

@@ -9,8 +9,8 @@
 //!   inbox --wait`) by node id, says [`Hello`](InboxFrame::Hello) with its own
 //!   credentials, and sends [`Deliver`](InboxFrame::Deliver); the receiver
 //!   stores what it accepts and answers [`Ack`](InboxFrame::Ack).
-//! - **fetch**: the recipient dials the host (`wires inbox`, no resident
-//!   receiver needed), says `Hello` and [`Fetch`](InboxFrame::Fetch) —
+//! - **fetch**: the recipient dials the host (`wires inbox`, no receiver
+//!   needed), says `Hello` and [`Fetch`](InboxFrame::Fetch) —
 //!   optionally holding the stream open up to `wait_ms` for a message to
 //!   arrive — and the host answers `Deliver` (possibly empty); the recipient
 //!   stores and `Ack`s, and only acknowledged messages leave the host's queue.
@@ -75,8 +75,8 @@ use crate::identity::NodeId;
 use crate::idp::IdToken;
 use crate::membership::Membership;
 
-/// The ALPN of the inbox protocol: a host's fetch endpoint and a caller's
-/// resident receiver both speak it.
+/// The ALPN of the inbox protocol: a host's fetch endpoint and a waiting
+/// caller's receiver both speak it.
 pub const INBOX_ALPN: &[u8] = b"wires/inbox/2";
 
 /// Longest [`Subject`], in bytes.
@@ -253,9 +253,9 @@ pub struct PushMessage {
     pub from: NodeId,
     /// The recipient. A receiver refuses a message addressed to anyone else.
     pub to: NodeId,
-    /// One line, recorded on the channel.
+    /// One line, recorded in the host's call log.
     pub subject: Subject,
-    /// The text; recorded on the channel only when the host opts in.
+    /// The text; recorded in the call log only when the host opts in.
     pub body: PushBody,
     /// The host's clock when it accepted the push (unix ms).
     pub at_ms: i64,

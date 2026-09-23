@@ -492,7 +492,7 @@ where
     let version = admitted.state_version;
     if hello.state_version > version {
         // The caller saw a newer state than ours; we still decide by ours
-        // (lane 27a's pull catches this host up).
+        // (its state pull catches this host up).
         tracing::info!(
             caller = %caller.hex(),
             theirs = hello.state_version.0,
@@ -572,7 +572,7 @@ where
 /// The responder refused the handshake and said why.
 ///
 /// Distinguishes an *authorization* failure (the credential this dialer
-/// presented was not acceptable — revoked, expired, off the roster) from every
+/// presented was not acceptable — removed, expired, not in a role) from every
 /// local or transport failure, so `wires call` can exit with a dedicated
 /// code and print the responder's own words. Hand-rolled rather than derived:
 /// `//wires` deliberately carries no `thiserror` dependency.

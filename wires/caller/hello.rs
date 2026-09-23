@@ -1,7 +1,6 @@
-//! The caller's half of the card-27 handshake (lane **27b**): build the
-//! [`Hello`] from what this node holds: its membership, the version of its
-//! signed state, and its stored ID token from `wires login` (no `--topic`;
-//! the token travels in the handshake, not on a channel).
+//! The caller's half of the session handshake: build the [`Hello`] from what
+//! this node holds: its membership, the version of its signed state, and its
+//! stored ID token from `wires login` (the token travels in the handshake).
 
 use anyhow::{Context, Result};
 use library::{Hello, IdToken, Membership, StateVersion};

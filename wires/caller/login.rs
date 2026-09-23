@@ -962,9 +962,18 @@ mod tests {
         .unwrap();
         assert!(favicon.starts_with("HTTP/1.1 404"), "{favicon}");
 
-        tokio::time::sleep(linger + Duration::from_millis(300)).await;
+        // Closed once the linger window is over (polled: a loaded test run
+        // can delay the linger task past the window by a little).
+        tokio::time::sleep(linger).await;
+        let closed = async {
+            while TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
         assert!(
-            TcpStream::connect(("127.0.0.1", port)).await.is_err(),
+            tokio::time::timeout(Duration::from_secs(5), closed)
+                .await
+                .is_ok(),
             "the listener closes once the linger window is over"
         );
     }

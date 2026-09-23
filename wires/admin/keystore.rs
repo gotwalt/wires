@@ -148,13 +148,9 @@ pub fn node_identity(inline: Option<&str>, file: Option<&Path>) -> Result<NodeId
     )
 }
 
-/// Resolve the node identity for an offline command that already holds a
-/// keystore handle (`wires advanced import --fabric-key`, which must open a sealed key
-/// as *this* node): `$WIRES_NODE_SEED` wins — the same environment variable the
+/// Resolve the node identity for a command that already holds a keystore
+/// handle: `$WIRES_NODE_SEED` wins — the same environment variable the
 /// network commands honour — then `ks`'s own `node.seed`.
-///
-/// There is no inline-flag tier because `import` takes no key flags: the point
-/// of the command is to fill the keystore the other commands read from.
 pub fn node_identity_in(ks: &Keystore) -> Result<NodeIdentity> {
     if let Some(hex) = std::env::var("WIRES_NODE_SEED")
         .ok()
@@ -195,7 +191,7 @@ pub fn membership(inline: Option<&str>, file: Option<&Path>) -> Result<Membershi
     }
     bail!(
         "no membership: pass --membership <token>, set $WIRES_MEMBERSHIP, use \
-         --membership-file, or run `wires advanced member --subject <id> --save` (looked for {})",
+         --membership-file, or `wires join <token>` (looked for {})",
         ks.path("membership.json").display()
     );
 }
@@ -312,13 +308,12 @@ fn write_secret(path: &Path, contents: &str, force: bool) -> Result<()> {
 /// directory, then a `rename` over the target.
 ///
 /// Every file this module writes is also read, concurrently, by something that
-/// takes no lock — `roster-head.json` most of all, which the admission handler
-/// and the watchdog re-read on every handshake and every pass while `wires
-/// import` and `wires advanced roster commit` rewrite it from other processes. A plain
-/// `std::fs::write` is `O_TRUNC` followed by a write, so a reader landing in
-/// that window sees an empty or half-written token; the admission path answers
-/// "responder configuration error" and the watchdog treats an unloadable head as
-/// *evict everyone*, tearing the whole mesh down over a scheduling accident.
+/// takes no lock — `state.json` most of all, which a host re-reads on every
+/// connection while `wires/state` adopts a newer copy from another task or
+/// process. A plain `std::fs::write` is `O_TRUNC` followed by a write, so a
+/// reader landing in that window sees an empty or half-written file and the
+/// host fails closed ("responder configuration error") over a scheduling
+/// accident.
 ///
 /// `rename(2)` within a directory is atomic, so a reader sees either the
 /// previous contents or the new ones and never a splice of the two. The mode is
@@ -370,8 +365,7 @@ fn set_mode(path: &Path, mode: u32) {
     }
 }
 
-/// Write a secret file at mode `0600`, overwriting any existing file (used for
-/// `roster.json`, rewritten in place by `roster add`/`remove`/`commit`).
+/// Write a secret file at mode `0600`, overwriting any existing file.
 fn write_secret_overwrite(path: &Path, contents: &str) -> Result<()> {
     write_text_mode(path, contents, Some(0o600))
 }

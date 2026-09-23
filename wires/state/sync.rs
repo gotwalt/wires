@@ -1,5 +1,5 @@
-//! Moving the signed state by key over [`STATE_ALPN`](library::STATE_ALPN)
-//! (lane 27a). The frames are [`library::StateFrame`].
+//! Moving the signed state by key over [`STATE_ALPN`](library::STATE_ALPN).
+//! The frames are [`library::StateFrame`].
 //!
 //! - [`push_all`]: after `invite` / `remove` / `service` / `role`, the admin
 //!   offers the new state to every member, **hosts first** (they enforce it),
@@ -7,10 +7,10 @@
 //!   it catches up by [`pull`] (below), or from a host's `HelloAck`.
 //! - [`pull`]: a cold command whose copy was last checked more than
 //!   [`STALE_AFTER_SECS`] ago asks the admin or any host for a newer one
-//!   ([`refresh_cold`]); a resident node does the same on a timer
+//!   ([`refresh_cold`]); a running `wires serve` does the same on a timer
 //!   ([`refresh_loop`]).
-//! - [`respond`] / [`StateResponder`]: the side a host, the admin or a
-//!   resident node runs on the ALPN: answer a pull, adopt an offer.
+//! - [`respond`] / [`StateResponder`]: the side a running host serves on the
+//!   ALPN: answer a pull, adopt an offer.
 //!
 //! One bi-stream per exchange, one frame each way. Nothing is ever adopted
 //! except through [`store::adopt_if_newer`] (verified under the root, fresh,
@@ -307,7 +307,7 @@ pub(crate) async fn refresh_cold() {
     }
 }
 
-/// A resident node's refresh: every [`STALE_AFTER_SECS`], pull if stale (a
+/// A running host's refresh: every [`STALE_AFTER_SECS`], pull if stale (a
 /// push it missed while down). Runs until the endpoint closes.
 pub(crate) async fn refresh_loop(endpoint: Endpoint, ks: Arc<Keystore>) {
     let mut tick = tokio::time::interval(Duration::from_secs(STALE_AFTER_SECS as u64));
@@ -395,7 +395,7 @@ pub(crate) fn answer(
     }
 }
 
-/// [`respond`] as a router protocol on [`STATE_ALPN`], for any resident
+/// [`respond`] as a router protocol on [`STATE_ALPN`], for a running
 /// node (a host's `serve`, a member's `watch`, the admin's).
 #[derive(Clone)]
 pub(crate) struct StateResponder(pub(crate) Arc<Keystore>);

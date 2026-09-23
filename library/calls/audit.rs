@@ -1,15 +1,15 @@
-//! Call records a responder publishes about the CLIs it runs.
+//! Call records a host keeps about the services it runs.
 //!
-//! Every call a `wires serve --audit-topic …` responder handles produces
-//! [`AuditRecord`]s on that channel: a [`Started`](AuditRecord::Started) once
-//! the caller is authorized, a [`Finished`](AuditRecord::Finished) when the
-//! child exits, or a lone [`Denied`](AuditRecord::Denied) when the caller is
-//! turned away. The **responder** writes them, stamping the caller id iroh
-//! authenticated — not anything the caller claimed — and each record rides a
-//! [`TopicEnvelope`](crate::TopicEnvelope) signed by the responder's key and
-//! hash-linked to its previous record. So the log can't be forged by the
-//! agent, isn't held by a gateway, and any member of the channel can observe
-//! it without access to either end of the call.
+//! Every call a `wires serve` host handles produces [`AuditRecord`]s: a
+//! [`Started`](AuditRecord::Started) once the caller is authorized, a
+//! [`Finished`](AuditRecord::Finished) when the child exits, or a lone
+//! [`Denied`](AuditRecord::Denied) when the caller is turned away (plus a
+//! [`Push`](AuditRecord::Push) per push milestone). The **host** writes them,
+//! stamping the caller id iroh authenticated — not anything the caller
+//! claimed — into its own signed, hash-linked [`call_log`](crate::call_log).
+//! So the log can't be forged by the agent, isn't held by a gateway, and a
+//! reader the registry names can check it without access to either end of
+//! the call.
 
 use serde::{Deserialize, Serialize};
 
@@ -263,7 +263,8 @@ pub enum AuditRecord {
         tool: ToolName,
         /// The caller-supplied arguments.
         argv: Argv,
-        /// The roster version the caller was admitted under, when enforced.
+        /// The signed-state version the caller was admitted under (the
+        /// field keeps its channel-era name so older logs still parse).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         roster_version: Option<u64>,
         /// The host policy role that admitted the caller (`host.json`'s
