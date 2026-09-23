@@ -163,6 +163,14 @@ pub enum Error {
     #[error("invalid argv")]
     InvalidArgv,
 
+    /// A push message, or an inbox frame carrying one, broke the limits of
+    /// [`crate::push`]: an empty or oversized subject, a control character in
+    /// it, an oversized body, too many messages in one frame, or a frame
+    /// larger than [`MAX_INBOX_FRAME`](crate::MAX_INBOX_FRAME). The string
+    /// names which.
+    #[error("invalid push: {0}")]
+    InvalidPush(&'static str),
+
     /// A [`Rekey`](crate::Rekey) or [`Invite`](crate::Invite) whose parts do
     /// not belong together: an entry for another roster version, a sealed key
     /// addressed to someone other than its proof's member, a member listed

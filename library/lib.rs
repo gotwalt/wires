@@ -50,7 +50,10 @@
 //!
 //! - [`invoke`] — the [`Invocation`] (tool + [`Argv`]) a dialer asks a
 //!   multi-tool responder to run.
-//! - [`audit`] — the [`AuditRecord`]s a responder publishes about each call.
+//! - [`audit`] — the [`AuditRecord`]s a responder publishes about each call
+//!   (and each push).
+//! - [`push`] — a host's [`PushMessage`] to a caller, and the [`InboxFrame`]
+//!   codec both delivery paths speak (card 23).
 //! - [`idp`] — [`IdentityClaim`]: an IdP-signed ID token bound to a node key,
 //!   and [`verify_claim`], which every reader runs against the issuer's [`Jwks`].
 //! - [`record`] — [`ChannelRecord`], how both ride a topic as message text.
@@ -191,6 +194,8 @@ pub mod audit;
 pub mod idp;
 #[path = "calls/invoke.rs"]
 pub mod invoke;
+#[path = "calls/push.rs"]
+pub mod push;
 #[path = "calls/session.rs"]
 pub mod session;
 
@@ -208,7 +213,8 @@ pub use announce::{
     SealedListing,
 };
 pub use audit::{
-    AuditRecord, CallId, OutputDigest, OutputHasher, STDIN_HEAD_MAX, StdinCapture, stdin_head,
+    AuditRecord, CallId, OutputDigest, OutputHasher, PushOutcome, STDIN_HEAD_MAX, StdinCapture,
+    stdin_head,
 };
 pub use chain::{ChainState, LinkStatus, classify_link, next_prev_hash};
 pub use envelope::{
@@ -226,6 +232,10 @@ pub use invite::{INVITE_V1, Invite};
 pub use invoke::{Argv, Invocation, MAX_ARGS, MAX_ARGV_BYTES, MAX_TOOL_NAME, ToolName};
 pub use membership::{MEMBERSHIP_V1, Membership};
 pub use policy::{Crl, check_accept, check_inclusion, check_roster_inclusion};
+pub use push::{
+    INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_FRAME, MAX_PUSH_BODY, MAX_SUBJECT, PushBody,
+    PushId, PushMessage, Subject,
+};
 pub use record::{ChannelRecord, RECORD_V1};
 pub use rekey::{
     ProofDirectory, REKEY_ENTRIES_PER_RECORD, Rekey, RekeyEntry, check_roster_inclusion_via,

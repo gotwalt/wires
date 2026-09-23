@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::identity::NodeId;
 use crate::idp::Principal;
 use crate::invoke::{Argv, ToolName};
+use crate::push::{PushBody, PushId, Subject};
 
 /// Correlates a call's [`Started`](AuditRecord::Started) and
 /// [`Finished`](AuditRecord::Finished) records. 16 random bytes, hex on the
@@ -300,6 +301,34 @@ pub enum AuditRecord {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stdin_head: Option<String>,
     },
+    /// A push to a caller (card 23) reached a milestone: queued, delivered,
+    /// fetched, expired, dropped or refused. One record per milestone per
+    /// message; the subject is recorded, the body only when the host opts in
+    /// (`host.json` `"push": {"log_body": true}`).
+    Push {
+        /// The message; pairs its milestones.
+        id: PushId,
+        /// The recipient's node.
+        to: NodeId,
+        /// The recipient's IdP identity, when the host verified one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        principal: Option<Principal>,
+        /// The `push.allow` role that admitted the recipient.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        /// The message's subject.
+        subject: Subject,
+        /// What happened.
+        outcome: PushOutcome,
+        /// Why, for [`PushOutcome::Denied`] and [`PushOutcome::Dropped`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// The body, only when the host logs bodies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<PushBody>,
+        /// Unix milliseconds of the milestone.
+        at_ms: i64,
+    },
     /// The caller was refused before anything ran.
     Denied {
         /// The iroh-authenticated caller.
@@ -314,10 +343,75 @@ pub enum AuditRecord {
     },
 }
 
+/// What happened to a push, as its [`AuditRecord::Push`] says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PushOutcome {
+    /// Accepted and held for the recipient (its receiver didn't answer).
+    Queued,
+    /// Handed to the recipient's resident receiver, which acknowledged it.
+    Delivered,
+    /// The recipient fetched it (`wires inbox`) and acknowledged it.
+    Fetched,
+    /// Its time-to-live ran out before the recipient took it.
+    Expired,
+    /// Pushed out of a full queue by a newer message.
+    Dropped,
+    /// Refused: the recipient isn't a current member, or holds no role in
+    /// `push.allow` (at send, delivery or fetch time).
+    Denied,
+}
+
+impl PushOutcome {
+    /// The word a record line shows (`queued`, `delivered`, …).
+    ///
+    /// ```
+    /// assert_eq!(library::PushOutcome::Fetched.as_str(), "fetched");
+    /// ```
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Delivered => "delivered",
+            Self::Fetched => "fetched",
+            Self::Expired => "expired",
+            Self::Dropped => "dropped",
+            Self::Denied => "denied",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// A push record carries the subject, and the body only when set; it
+    /// round-trips through JSON either way.
+    #[test]
+    fn a_push_record_logs_the_subject_and_the_body_only_when_asked() {
+        let node = crate::NodeIdentity::from_seed([1u8; 32]).node_id();
+        let push = |body: Option<&str>| AuditRecord::Push {
+            id: PushId::from_hex("0123456789abcdef0123456789abcdef").unwrap(),
+            to: node,
+            principal: None,
+            role: Some("analyst".into()),
+            subject: Subject::new("build-41").unwrap(),
+            outcome: PushOutcome::Queued,
+            reason: None,
+            body: body.map(|b| PushBody::new(b).unwrap()),
+            at_ms: 1,
+        };
+        let without = serde_json::to_string(&push(None)).unwrap();
+        assert!(without.contains(r#""kind":"push""#), "{without}");
+        assert!(without.contains(r#""outcome":"queued""#), "{without}");
+        assert!(!without.contains("body"), "{without}");
+        let with = serde_json::to_string(&push(Some("failed"))).unwrap();
+        assert!(with.contains(r#""body":"failed""#), "{with}");
+        for record in [push(None), push(Some("failed"))] {
+            let json = serde_json::to_string(&record).unwrap();
+            assert_eq!(serde_json::from_str::<AuditRecord>(&json).unwrap(), record);
+        }
+    }
 
     #[test]
     fn empty_hasher_is_the_digest_of_nothing() {
