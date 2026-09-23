@@ -5,30 +5,30 @@
 # pushes the result to the agent by key, and the agent follows up with the
 # log. Neither side exposes an endpoint: no webhook, no public URL.
 #
-# Four keystores on one machine, all loopback (as in demo-remote-cli.sh):
+# Three keystores on one machine, all loopback (as in demo-remote-cli.sh):
 #
-#   workbench -- `wires serve push-host.json`: three tools from the mock CI
-#                (.scripts/fixtures/ci.sh): deploy, status, logs, for role
-#                analyst = *@example.com; "push": {"allow": ["analyst"]}.
-#   observer  -- `wires watch`: sees ▶ deploy → ⇢ push → ▶ logs, each line
-#                stamped with the verified identity.
-#   agent     -- signs in (mock IdP), then only `wires call` / `wires inbox`,
-#                in locked mode (WIRES_LOCKED=1).
-#   root      -- the admin: init + one invite per machine.
+#   workbench -- `wires serve push-host.json`: implements three services from
+#                the mock CI (.scripts/fixtures/ci.sh): deploy, status, logs;
+#                "push": {"allow": ["analyst"]}.
+#   agent     -- signs in (mock IdP) as an analyst, then only `wires call` /
+#                `wires inbox` / `wires watch`, in locked mode (WIRES_LOCKED=1).
+#   root      -- the admin: init, the analyst role, the three services on the
+#                workbench, one invite per machine.
 #
 # Asserted: `deploy` returns within a few seconds while the build keeps
 # running; `wires inbox --wait` (what an agent would run as a background
 # command) exits 0 when the build's job runs `wires push --to
 # "$WIRES_CALLER_NODE"`, and its line names the verified host; the agent's
-# `logs` call returns the failing assertion; the observer shows ▶ deploy, then
-# ⇢ build-41, then ▶ logs, in that order, all naming the agent's email; and a
-# "sleeping" agent (no receiver running) finds the next build's push queued
-# on the workbench, fetched by its next plain `wires inbox`.
+# `logs` call returns the failing assertion; the agent's own `wires watch`
+# shows ▶ deploy, then ⇢ build-41, then ▶ logs, in that order, from the
+# workbench's signed log; and a "sleeping" agent (nothing running) finds the
+# next build's push queued on the workbench, fetched by its next plain
+# `wires inbox`.
 #
 # Run it from the repo root:
 #
 #   ./.scripts/demo-push.sh            narrated
-#   ./.scripts/demo-push.sh --quiet    assertions only (< 30 s)
+#   ./.scripts/demo-push.sh --quiet    assertions only
 #   ./.scripts/demo-push.sh --keep     leave the state dir behind
 
 set -euo pipefail
@@ -56,7 +56,6 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
 WIRES="${WIRES_BIN:-$repo/target/release/wires}"
 WIRES_DEV="${WIRES_DEV_BIN:-$repo/target/release/wires-mock-idp}"
-TOPIC="ops"
 EMAIL="alice@example.com"
 JOB_SECS=3
 START=$SECONDS
@@ -64,10 +63,9 @@ START=$SECONDS
 D="$(mktemp -d)"
 IDP_PID=""
 WB_PID=""
-OBS_PID=""
 WAIT_PID=""
 p=""
-trap 'for p in $WAIT_PID $OBS_PID $WB_PID $IDP_PID; do kill "$p" 2>/dev/null || true; done; [ -n "$KEEP" ] || rm -rf "$D"' EXIT INT TERM
+trap 'for p in $WAIT_PID $WB_PID $IDP_PID; do kill "$p" 2>/dev/null || true; done; [ -n "$KEEP" ] || rm -rf "$D"' EXIT INT TERM
 
 say() { [ -n "$QUIET" ] || printf '\033[36m[demo]\033[0m %s\n' "$*" >&2; }
 run() { [ -n "$QUIET" ] || printf '\033[2m     $ %s\033[0m\n' "$*" >&2; }
@@ -95,31 +93,18 @@ wait_for() {
 	done
 	return 1
 }
-# Poll for one line of $1 containing every remaining fixed string; prints
-# `<line number>:<line>`. Budget: 20 s.
-wait_line() {
-	local file="$1"
+# The last line of $1 holding every remaining fixed string, as
+# `<line number>:<line>` (or fail).
+the_line() {
+	local file="$1" hits
 	shift
-	for _ in $(seq 1 200); do
-		if [ -e "$file" ]; then
-			local hits
-			hits="$(grep -n '' "$file")"
-			for s in "$@"; do hits="$(printf '%s\n' "$hits" | grep -F -- "$s" || true)"; done
-			if [ -n "$hits" ]; then
-				printf '%s\n' "$hits" | tail -1
-				return 0
-			fi
-		fi
-		sleep 0.1
-	done
-	return 1
-}
-dump() {
-	sed 's/^/  observer| /' "$D/obs.out" >&2 || true
-	[ -z "${1:-}" ] || sed 's/^/  '"$(basename "$1")"'| /' "$1" | tail -20 >&2
+	hits="$(grep -n '' "$file")"
+	for s in "$@"; do hits="$(printf '%s\n' "$hits" | grep -F -- "$s" || true)"; done
+	[ -n "$hits" ] && printf '%s\n' "$hits" | tail -1
 }
 alive() { kill -0 "$1" 2>/dev/null; }
-# The agent: locked mode, so it can steer nothing but the tool and its args.
+admin() { WIRES_HOME="$root" "$WIRES" "$@"; }
+# The agent: locked mode, so it can steer nothing but the service and its args.
 agent_wires() { WIRES_HOME="$agent" WIRES_LOCKED=1 "$WIRES" "$@"; }
 
 if [ -z "${WIRES_BIN:-}" ]; then
@@ -134,24 +119,30 @@ command -v curl >/dev/null || bad "curl is not on PATH"
 command -v perl >/dev/null || bad "perl is not on PATH (the mock CI's clock)"
 
 # ==========================================================================
-# Setup (off camera): four keystores, one roster, one IdP, one mock CI.
+# Setup (off camera): three keystores, one signed state, one IdP, one mock CI.
 # ==========================================================================
 root="$D/root"
 wb="$D/wb"
 agent="$D/agent"
-obs="$D/obs"
-mkdir -p "$root" "$wb" "$agent" "$obs"
+mkdir -p "$root" "$wb" "$agent"
 
-ROOT_ID="$(WIRES_HOME="$root" "$WIRES" init --channel "$TOPIC" | awk '/^fabric /{print $2}')"
+ROOT_ID="$(admin init | awk '/^fabric /{print $2}')"
 WB_ID="$(WIRES_HOME="$wb" "$WIRES" id 2>/dev/null)"
 AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
-OB_ID="$(WIRES_HOME="$obs" "$WIRES" id 2>/dev/null)"
-[ -n "$ROOT_ID" ] && [ -n "$WB_ID" ] && [ -n "$AG_ID" ] && [ -n "$OB_ID" ] ||
-	bad "setup: could not read the key ids"
+[ -n "$ROOT_ID" ] && [ -n "$WB_ID" ] && [ -n "$AG_ID" ] || bad "setup: could not read the key ids"
 AG8="${AG_ID:0:8}"
 WB8="${WB_ID:0:8}"
-WB_TOKEN="$(WIRES_HOME="$root" "$WIRES" invite "$WB_ID" --name workbench 2>/dev/null)"
-WIRES_HOME="$wb" "$WIRES" join "$WB_TOKEN" >/dev/null
+admin role set analyst '*@example.com' >/dev/null 2>&1
+admin invite "$WB_ID" --name workbench >/dev/null 2>&1
+for svc in deploy status logs; do
+	admin service add "$svc" --allow analyst --host workbench \
+		--description "$svc a CI build: \`$svc -- build <n>\`" >/dev/null 2>"$D/svc.err" || {
+		cat "$D/svc.err" >&2
+		bad "setup: wires service add $svc failed"
+	}
+done
+# The workbench was offline for those pushes: its token carries the state.
+WIRES_HOME="$wb" "$WIRES" join "$(admin invite "$WB_ID" --name workbench 2>/dev/null)" >/dev/null
 
 "$WIRES_DEV" dev-mock-idp --email "$EMAIL" >"$D/idp.out" 2>"$D/idp.err" &
 IDP_PID=$!
@@ -172,31 +163,21 @@ mkdir -p "$JOBS"
 (cd "$D" && WIRES_HOME="$wb" CI_JOBS="$JOBS" CI_JOB_SECS="$JOB_SECS" CI_WIRES="$WIRES" \
 	exec "$WIRES" serve "$HOST_JSON" >"$D/wb.out" 2>"$D/wb.err") &
 WB_PID=$!
-wait_for "$D/wb.err" "share to bootstrap: " 300 || {
+wait_for "$wb/run/hint" " " 300 || {
 	sed 's/^/  workbench| /' "$D/wb.err" >&2
-	bad "setup: the workbench never printed its ticket"
+	bad "setup: the workbench never came up"
 }
-TICKET="$(grep -m1 '^share to bootstrap: ' "$D/wb.err" | sed 's/^share to bootstrap: //')"
-AG_TOKEN="$(WIRES_HOME="$root" "$WIRES" invite "$AG_ID" --name agent --peer "$TICKET" 2>"$D/invite.err")" || {
+# Addressing is by key; on loopback, the workbench's own hint line stands in
+# for n0 discovery.
+cp "$wb/run/hint" "$root/hints"
+cp "$wb/run/hint" "$agent/hints"
+AG_TOKEN="$(admin invite "$AG_ID" --name agent 2>"$D/invite.err")" || {
 	cat "$D/invite.err" >&2
 	bad "setup: inviting the agent failed"
 }
-OB_TOKEN="$(WIRES_HOME="$root" "$WIRES" invite "$OB_ID" --name observer 2>>"$D/invite.err")" || {
-	cat "$D/invite.err" >&2
-	bad "setup: inviting the observer failed"
-}
 WIRES_HOME="$agent" "$WIRES" join "$AG_TOKEN" >/dev/null
-WIRES_HOME="$obs" "$WIRES" join "$OB_TOKEN" >/dev/null
 
-WIRES_HOME="$obs" WIRES_OIDC_ISSUER="$ISSUER" WIRES_OIDC_AUDIENCE="$CLIENT_ID" \
-	"$WIRES" watch >"$D/obs.out" 2>"$D/obs.err" &
-OBS_PID=$!
-wait_for "$D/obs.err" "neighbor up" 300 || {
-	sed 's/^/  observer| /' "$D/obs.err" >&2
-	bad "setup: the observer never joined the workbench's mesh"
-}
-
-WIRES_HOME="$agent" "$WIRES" login --topic "$TOPIC" \
+WIRES_HOME="$agent" "$WIRES" login \
 	--issuer "$ISSUER" --client-id "$CLIENT_ID" --client-secret not-so-secret \
 	--no-browser >"$D/login.out" 2>"$D/login.err" &
 LOGIN_PID=$!
@@ -207,34 +188,24 @@ wait "$LOGIN_PID" || {
 	sed 's/^/  login| /' "$D/login.err" >&2
 	bad "setup: wires login failed"
 }
-wait_line "$D/obs.out" "🪪 identity $AG8 is $EMAIL" >/dev/null || {
-	dump "$D/login.err"
-	bad "setup: the observer never verified the agent's identity"
-}
-# The workbench re-announces with the tools sealed to the signed-in analyst.
-for _ in $(seq 1 20); do
-	agent_wires tools >"$D/tools.out" 2>/dev/null || true
-	grep -qF "deploy  on $WB8" "$D/tools.out" && break
-	sleep 0.2
-done
-grep -qF "deploy  on $WB8" "$D/tools.out" || {
-	cat "$D/tools.out" >&2
+agent_wires services >"$D/services.out" 2>/dev/null || true
+grep -qE "^deploy .*\(analyst\)$" "$D/services.out" || {
+	cat "$D/services.out" >&2
 	bad "setup: the signed-in agent does not see deploy"
 }
 
 say "workbench ${WB8}...  runs a mock CI: deploy / status / logs; may push to analysts"
 say "agent     ${AG8}...  signed in as $EMAIL; runs only \`wires call\` and \`wires inbox\` (locked)"
-say "observer  ${OB_ID:0:8}...  watches the channel; holds neither end's keys"
-show "$D/tools.out"
+show "$D/services.out"
 beat 4
 
 # ==========================================================================
-step "1  the agent starts a build -- the tool returns at once"
+step "1  the agent starts a build -- the service returns at once"
 # ==========================================================================
 run "wires call deploy -- build 41"
 t0=$SECONDS
 agent_wires call deploy -- build 41 >"$D/d1.out" 2>"$D/d1.err" || {
-	dump "$D/d1.err"
+	cat "$D/d1.err" >&2
 	bad "1: wires call deploy failed"
 }
 [ $((SECONDS - t0)) -le 3 ] || bad "1: deploy took $((SECONDS - t0)) s; it should return at once"
@@ -251,8 +222,8 @@ beat 2
 step "2  the agent waits -- \`wires inbox --wait\`, a background command in Claude Code"
 # ==========================================================================
 # In Claude Code this is a background Bash command: the agent goes quiet and
-# is woken when it exits. It opens no port: it dials the workbench by key and
-# holds a fetch open.
+# is woken when it exits. It dials the workbench by key and holds a fetch
+# open; while it runs, a push dialed to it by key lands too.
 run "wires inbox --wait --timeout 30s &"
 agent_wires inbox --wait --timeout 30s >"$D/i1.out" 2>"$D/i1.err" &
 WAIT_PID=$!
@@ -261,7 +232,7 @@ alive "$WAIT_PID" || {
 	cat "$D/i1.err" >&2
 	bad "2: inbox --wait exited before anything was pushed"
 }
-ok "2: waiting (pid $WAIT_PID), no listener, no webhook URL"
+ok "2: waiting (pid $WAIT_PID), no webhook URL"
 
 # ==========================================================================
 step "3  the build fails on the workbench; its job pushes to \$WIRES_CALLER_NODE"
@@ -294,7 +265,7 @@ grep -qF "from host $WB8 (verified)  build-41  failed: test_orders_total" "$D/i1
 }
 LAT=$((WOKE_MS - $(cat "$JOBS/build-41/done_ms")))
 show "$D/i1.out"
-ok "3: inbox --wait woke with the push; the sender is the host key the agent dialed, verified"
+ok "3: inbox --wait woke with the push; the sender is the host key, verified"
 beat 3
 
 # ==========================================================================
@@ -302,7 +273,7 @@ step "4  woken, the agent follows up -- the log, from the same host"
 # ==========================================================================
 run "wires call logs -- build 41 --tail 50"
 agent_wires call logs -- build 41 --tail 50 >"$D/l1.out" 2>"$D/l1.err" || {
-	dump "$D/l1.err"
+	cat "$D/l1.err" >&2
 	bad "4: wires call logs failed"
 }
 GOT="$(awk '/^  left: /{print $2}' "$D/l1.out")"
@@ -316,30 +287,35 @@ ok "4: test_orders_total: left $GOT, right 1234.50"
 beat 3
 
 # ==========================================================================
-step "5  the observer saw the whole chain, each line stamped with who"
+step "5  the workbench's own log holds the whole chain -- the agent reads its part"
 # ==========================================================================
-SD="$(wait_line "$D/obs.out" "▶" "$EMAIL" "[analyst] deploy build 41")" || {
-	dump
+run "wires watch --once   # the agent's own calls, and the pushes to it"
+agent_wires watch --once >"$D/w1.out" 2>"$D/w1.err" || {
+	cat "$D/w1.err" >&2
+	bad "5: wires watch failed"
+}
+SD="$(the_line "$D/w1.out" "▶" "$EMAIL" "[analyst] deploy build 41")" || {
+	cat "$D/w1.out" >&2
 	bad "5: no ▶ deploy naming $EMAIL"
 }
-# `delivered` if the host's direct dial reached a resident receiver, else
-# `fetched` by the agent's waiting inbox.
-SP="$(wait_line "$D/obs.out" "⇢" "→ $EMAIL" "[analyst] \"build-41\" ")" || {
-	dump
-	bad "5: no ⇢ build-41 delivered/fetched on the channel"
+# `delivered` if the host's direct dial reached the waiting inbox, else
+# `fetched` by its long poll.
+SP="$(the_line "$D/w1.out" "⇢" "→ $EMAIL" "[analyst] \"build-41\" ")" || {
+	cat "$D/w1.out" >&2
+	bad "5: no ⇢ build-41 in the records"
 }
-SL="$(wait_line "$D/obs.out" "▶" "$EMAIL" "[analyst] logs build 41 --tail 50")" || {
-	dump
+SL="$(the_line "$D/w1.out" "▶" "$EMAIL" "[analyst] logs build 41 --tail 50")" || {
+	cat "$D/w1.out" >&2
 	bad "5: no ▶ logs naming $EMAIL"
 }
 nD="${SD%%:*}"
 nP="${SP%%:*}"
 nL="${SL%%:*}"
 [ "$nD" -lt "$nP" ] && [ "$nP" -lt "$nL" ] || {
-	dump
+	cat "$D/w1.out" >&2
 	bad "5: the chain is out of order (deploy line $nD, push $nP, logs $nL)"
 }
-ok "5: ▶ deploy → ⇢ push → ▶ logs, in order"
+ok "5: ▶ deploy → ⇢ push → ▶ logs, in order, verified against the host's signed log"
 line "${SD#*:}"
 line "${SP#*:}"
 line "${SL#*:}"
@@ -350,7 +326,7 @@ step "6  a sleeping agent: nothing running -- the push waits on the workbench"
 # ==========================================================================
 run "wires call deploy -- build 42   # and then the agent stops; no inbox running"
 agent_wires call deploy -- build 42 >"$D/d2.out" 2>"$D/d2.err" || {
-	dump "$D/d2.err"
+	cat "$D/d2.err" >&2
 	bad "6: wires call deploy (42) failed"
 }
 for _ in $(seq 1 $((JOB_SECS * 10 + 100))); do
@@ -360,14 +336,9 @@ done
 [ -f "$JOBS/build-42/pushed_ms" ] || bad "6: build-42's job never pushed"
 grep -qE "^queued +$EMAIL \($AG8\)" "$JOBS/build-42/push.out" || {
 	cat "$JOBS/build-42/push.out" "$JOBS/build-42/push.err" >&2
-	bad "6: with no receiver, build-42's push was not queued"
-}
-QQ="$(wait_line "$D/obs.out" "⇢" "→ $EMAIL" "\"build-42\" queued")" || {
-	dump
-	bad "6: no ⇢ build-42 queued on the channel"
+	bad "6: with nothing running, build-42's push was not queued"
 }
 ok "6: build-42 failed while the agent slept; the push is queued on the workbench"
-line "${QQ#*:}"
 run "wires inbox   # the agent's next turn, whenever that is"
 agent_wires inbox >"$D/i2.out" 2>"$D/i2.err" || {
 	cat "$D/i2.err" >&2
@@ -378,12 +349,13 @@ grep -qF "from host $WB8 (verified)  build-42  failed: test_orders_total" "$D/i2
 	bad "6: the next wires inbox did not fetch build-42"
 }
 show "$D/i2.out"
-QF="$(wait_line "$D/obs.out" "⇢" "→ $EMAIL" "\"build-42\" fetched")" || {
-	dump
-	bad "6: no ⇢ build-42 fetched on the channel"
-}
 agent_wires inbox >"$D/i3.out" 2>/dev/null
 [ ! -s "$D/i3.out" ] || bad "6: a read message was printed twice"
+agent_wires watch --once >"$D/w2.out" 2>/dev/null || true
+QF="$(the_line "$D/w2.out" "⇢" "→ $EMAIL" "\"build-42\" fetched")" || {
+	cat "$D/w2.out" >&2
+	bad "6: no ⇢ build-42 fetched in the records"
+}
 ok "6: fetched on the next \`wires inbox\` -- once"
 line "${QF#*:}"
 alive "$WB_PID" || bad "6: the workbench died"
@@ -393,7 +365,7 @@ step "SUMMARY"
 # ==========================================================================
 printf '     callback  : build-41 result pushed host -> agent by key; inbox --wait woke %s ms after the build finished\n' "$LAT" >&2
 printf '     follow-up : logs -- build 41 --tail 50 -> test_orders_total left %s\n' "$GOT" >&2
-printf '     observable: ▶ deploy → ⇢ build-41 → ▶ logs, naming %s\n' "$EMAIL" >&2
+printf '     recorded  : ▶ deploy → ⇢ build-41 → ▶ logs in the host'"'"'s signed log, naming %s\n' "$EMAIL" >&2
 printf '     asleep    : build-42 queued on the workbench, fetched by the next `wires inbox`\n' >&2
-printf '     exposed   : nothing on the agent -- no port, no webhook URL; %ss wall clock\n' "$((SECONDS - START))" >&2
-[ -z "$KEEP" ] || say "state kept in $D (observer transcript: $D/obs.out)"
+printf '     exposed   : nothing on the agent -- no webhook URL; %ss wall clock\n' "$((SECONDS - START))" >&2
+[ -z "$KEEP" ] || say "state kept in $D"

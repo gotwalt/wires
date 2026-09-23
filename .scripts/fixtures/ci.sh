@@ -13,8 +13,8 @@
 #
 #   wires push --to "$WIRES_CALLER_NODE" --subject build-<n> -- "failed: …"
 #
-# which reaches the running `wires serve` over its control socket: the job
-# inherits serve's environment, so $WIRES_HOME is the host's keystore.
+# which reaches the running `wires serve` over its control socket: serve sets
+# $WIRES_HOME to the host's keystore for every service it runs.
 #
 # Environment (set on `wires serve`, inherited):
 #   CI_JOBS      state directory (default ./ci-jobs, relative to serve's cwd)

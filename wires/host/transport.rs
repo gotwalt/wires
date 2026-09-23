@@ -543,7 +543,10 @@ where
         .env("WIRES_STATE_VERSION", version.0.to_string())
         .env("WIRES_SERVICE", service.as_str())
         .env("WIRES_TOOL", tool.as_str())
-        .env("WIRES_ROLE", admitted.role.as_str());
+        .env("WIRES_ROLE", admitted.role.as_str())
+        // The host's own home, so a service can `wires push` back to its
+        // caller through this `serve` (card 23).
+        .env("WIRES_HOME", host.keystore.path(""));
     if let Some(email) = principal.as_ref().and_then(|p| p.email.as_deref()) {
         cmd.env("WIRES_CALLER_EMAIL", email);
     }
