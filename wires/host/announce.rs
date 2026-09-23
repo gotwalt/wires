@@ -11,6 +11,11 @@
 //!   newer one replaces it) and the host's [`Policy`] now gives that member a
 //!   different set of tools. That is how a member who just ran `wires login`
 //!   sees its tools within a moment;
+//! - **when the channel re-keys** — every `wires invite` / `wires remove` is a
+//!   commit with a fresh fabric key, and a member who joined after the last
+//!   announcement holds no key for it (late joiners never read pre-join
+//!   history). The announcer re-announces under the new key, so the newcomer
+//!   can read it;
 //! - **on a heartbeat** ([`HEARTBEAT`], default 10 minutes), which is also
 //!   when a member whose claim expired drops out, and how callers tell a live
 //!   host from a stale one (three heartbeats without an announcement).
@@ -23,7 +28,10 @@
 //! principal, the *further* tools [`Policy::allowed_tools`] grants it are
 //! sealed to that member's node key alone (see [`library::announce`]). Members
 //! with nothing further get no entry. Every listing carries the host's dial
-//! hints, so a caller needs nothing but the announcement to reach it.
+//! hints, so a caller needs nothing but the announcement to reach it; the
+//! open listing is always present for that reason, even with no tools in it
+//! (the hints are no secret from a member: the host is its channel's
+//! bootstrap peer).
 //!
 //! This is privacy, not access control: the host's [`Policy`] still decides
 //! every call, and a call to a tool the caller cannot see is refused with the
@@ -54,6 +62,10 @@ pub(crate) const HEARTBEAT_ENV: &str = "WIRES_ANNOUNCE_HEARTBEAT_SECS";
 
 /// How long to let a burst of identity changes settle before re-announcing.
 const DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// How often the announcer looks for a new fabric key (a re-key it must
+/// re-announce under).
+const KEY_POLL: Duration = Duration::from_secs(1);
 
 /// The heartbeat to use: `$WIRES_ANNOUNCE_HEARTBEAT_SECS` if it is a positive
 /// integer, else [`HEARTBEAT`].
@@ -92,6 +104,9 @@ pub(crate) struct Announcer {
     descriptions: BTreeMap<ToolName, String>,
     /// Re-announce at least this often.
     heartbeat: Duration,
+    /// Where the channel's fabric keys are; a new one means re-announce.
+    /// `None`: never checked (unit tests).
+    keystore: Option<Arc<crate::admin::keystore::Keystore>>,
 }
 
 impl std::fmt::Debug for Announcer {
@@ -121,7 +136,21 @@ impl Announcer {
             identities,
             descriptions,
             heartbeat,
+            keystore: None,
         }
+    }
+
+    /// Also re-announce whenever `keystore` gains a newer fabric key.
+    pub(crate) fn watching_keys(mut self, keystore: Arc<crate::admin::keystore::Keystore>) -> Self {
+        self.keystore = Some(keystore);
+        self
+    }
+
+    /// The newest fabric key version held (what the next announcement is
+    /// sealed under), when keys are watched.
+    fn key_version(&self) -> Option<u64> {
+        let ks = self.keystore.as_ref()?;
+        ks.latest_fabric_key().ok().flatten().map(|(v, _)| v.0)
     }
 
     /// The audience at unix time `now`: every node the identity index holds
@@ -174,7 +203,10 @@ impl Announcer {
         reach: &TopicPeer,
         at_ms: i64,
     ) -> HostAnnouncement {
-        let open = (!audience.open.is_empty()).then(|| self.listing(&audience.open, reach));
+        // Always present: it carries the dial hints, so a member shown no
+        // tool can still reach the host and hear why (the hints are no
+        // secret from a member — the host is its channel's bootstrap peer).
+        let open = Some(self.listing(&audience.open, reach));
         let sealed = audience
             .members
             .iter()
@@ -199,25 +231,29 @@ impl Announcer {
     /// heartbeat, until the publish queue closes. `reach` is this host's own
     /// topic peer entry (its addresses and relay).
     pub(crate) async fn run(self, tx: mpsc::Sender<PublishRequest>, reach: TopicPeer) {
-        let mut last: Option<Audience> = None;
+        let mut last: Option<(Audience, Option<u64>)> = None;
         let mut beat = tokio::time::Instant::now();
         loop {
-            let audience = self.audience(now_unix());
-            if tokio::time::Instant::now() >= beat || last.as_ref() != Some(&audience) {
-                let ann = self.announcement(&audience, &reach, now_ms());
+            let now = (self.audience(now_unix()), self.key_version());
+            if tokio::time::Instant::now() >= beat || last.as_ref() != Some(&now) {
+                let audience = &now.0;
+                let ann = self.announcement(audience, &reach, now_ms());
                 if !publish(&tx, ChannelRecord::Host(ann)).await {
                     return;
                 }
                 tracing::info!(
                     open = audience.open.len(),
                     sealed = audience.members.len(),
+                    key = ?now.1,
                     "announced this host's tools"
                 );
-                last = Some(audience);
+                last = Some(now);
                 beat = tokio::time::Instant::now() + self.heartbeat;
             }
+            let poll = tokio::time::Instant::now() + KEY_POLL;
             tokio::select! {
                 _ = tokio::time::sleep_until(beat) => {}
+                _ = tokio::time::sleep_until(poll), if self.keystore.is_some() => {}
                 _ = self.identities.changed() => tokio::time::sleep(DEBOUNCE).await,
             }
         }

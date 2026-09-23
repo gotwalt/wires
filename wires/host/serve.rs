@@ -137,15 +137,18 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     let policy: Arc<dyn super::policy::Policy> = Arc::new(host.policy());
     // The channel directory (card 15): the same policy and identities that
     // decide each call decide what each member sees announced.
-    let announcer = match (&gate, &identities) {
-        (Some(gate), Some(ids)) => Some(announce::Announcer::new(
-            node.node_id(),
-            Arc::clone(&policy),
-            Arc::clone(gate),
-            Arc::clone(ids),
-            host.descriptions(),
-            announce::heartbeat(),
-        )),
+    let announcer = match (&gate, &identities, &audit_ctx) {
+        (Some(gate), Some(ids), Some(ctx)) => Some(
+            announce::Announcer::new(
+                node.node_id(),
+                Arc::clone(&policy),
+                Arc::clone(gate),
+                Arc::clone(ids),
+                host.descriptions(),
+                announce::heartbeat(),
+            )
+            .watching_keys(Arc::clone(&ctx.keystore)),
+        ),
         _ => None,
     };
     let config = transport::ServeConfig {
