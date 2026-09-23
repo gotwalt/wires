@@ -1,165 +1,86 @@
 # Deploying wires
 
-Patterns for running wires in production — containers, Kubernetes, and a
-self-hosted relay. For the command reference and the local walkthrough see the
-[README](../README.md); for tests see [testing.md](testing.md).
-
-> **Partly out of date (card 12, 2026-09-23).** Single-command
-> `wires serve -- <cmd>`, `serve --scope` and `wires connect` are gone: a host
-> serves named tools from `host.json` (`wires serve host.json`, card 13; its
-> trust root is its own membership's, so there is no `--trust-root`), callers use `wires call` (or
-> `wires mcp` for MCP-only clients), and the admin plumbing is spelled
-> `wires advanced grant | member | roster | import …`. The pod and argv
-> examples below still show the old shapes; the image, key-handling and relay
-> guidance stands.
+Patterns for running wires beyond one machine: images, hosts, and a
+self-hosted relay. For the command reference and the walkthrough see the
+[README](../README.md); for the recorded two-machine run see
+[demo.md](demo.md); for tests see [testing.md](testing.md).
 
 ## What you deploy
 
-| Piece | Binary | Inbound port? | Container image |
-| ----- | ------ | ------------- | --------------- |
-| **Responder** (the tool host) | `wires serve` | **No** — egress-only | compose your own (wires + the tool/MCP binary) |
-| **Dialer / shim** (the agent side) | `wires connect` | No — egress-only | `//wires:image` (self-contained) |
-| **Relay** (rendezvous) | `relay` | **Yes** — HTTP | `//relay:image` (self-contained) |
+| Piece | Command | Listens? | Container image |
+| ----- | ------- | -------- | --------------- |
+| **Host** (runs the CLIs) | `wires serve host.json` | No TCP listener, no firewall port opened; binds UDP for QUIC | compose your own: `wires` plus the CLIs it exposes |
+| **Caller** (the agent side) | `wires call`, or `wires mcp` for MCP-only clients | No TCP listener | `//wires:image` |
+| **Observer** | `wires watch` | No TCP listener | `//wires:image` |
+| **Relay** (optional rendezvous) | `relay` | **Yes**, HTTP | `//relay:image` |
 
-The defining property: a **responder has no inbound port**. It dials out to a
-relay and is reachable only by node id + a valid grant. The **relay** is the one
-piece that *does* listen — it's the shared rendezvous point.
+A host dials out (to peers directly, or through a relay), and unauthenticated
+peers are refused at the QUIC handshake. The relay is the one piece that
+listens: it's the shared rendezvous point, and it forwards packets it can't
+read.
 
 ## Building and loading the images
 
-The OCI images cross-compile to a distroless Linux base (via the Zig CC
-toolchain) for both `arm64` and `x86_64`:
+The OCI images cross-compile to a distroless Linux base via the Zig CC
+toolchain:
 
 ```bash
 bazel build //relay:image //wires:image          # build the images
 bazel run   //relay:image.load                    # docker load the relay locally
-docker run --rm -p 3340:3340 relay:latest         # (tag is stamped from git)
+docker run --rm -p 3340:3340 relay:latest         # (the tag is stamped at build time)
 ```
 
 `rust_image` (see `tools/oci/rust_image.bzl`) emits the image filegroup, a
-`<name>.load` target (`docker load`), and git-stamped `repo_tags`. To push to a
+`<name>.load` target (`docker load`), and stamped `repo_tags`. To push to a
 registry, `docker tag` + `docker push` after a load, or add an `oci_push` target.
 
-The **relay** and **dialer** images are self-contained. A **responder** image
-must also contain the binary it execs (`rg`, an MCP server, …), so build an
-app-specific image that layers `wires` plus your tool — `//wires:image` is the
-starting point, or copy the `rust_image` pattern with both binaries in the tar.
+The x86_64 cross-compile from macOS is currently broken (curve25519-dalek's
+SIMD backend; see card 08's notes). Card 08 built natively on the Linux host
+instead.
 
-## Secrets and the keystore in Kubernetes
+A **host** image must also contain the binaries its `host.json` execs
+(`sqlite3`, `gh`, …), so build an app-specific image that layers `wires` plus
+your tools. `//wires:image` is the starting point.
 
-`wires` resolves every secret/CRL input as **flag → env → `--…-file` → keystore**
-(`~/.config/wires`, overridable via `$WIRES_HOME`). In Kubernetes this maps
-cleanly onto **files**:
+## Running a host
 
-- the **node key** → a `Secret`, mounted as a file, read with `--node-seed-file`
-  (do **not** use `--node-seed`/env: argv leaks via `ps`, and `serve` execs a
-  child that inherits its environment);
-- the **trust root** (`--trust-root`) and **scope** → public config in a
-  `ConfigMap`;
-- the **CRL** → a `ConfigMap` file, read with `--crl-file` (edit + `kubectl
-  apply` to revoke);
-- the **root signing key** and **grant minting** stay **off-cluster** (operator
-  laptop / HSM); the cluster never holds `root.seed`.
+A host is a member like any other. It joins once, then runs `serve`:
 
-## Responder on Kubernetes (egress-only)
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata: { name: wires-config }
-data:
-  trust-root: "<ROOT_ID hex>"      # public — the root id grants are verified against
-  scope: "mcp.myserver"
-  crl.json: '{"revoked":[]}'       # re-apply to revoke
----
-apiVersion: v1
-kind: Secret
-metadata: { name: wires-node-key }  # the pod's private identity == its address
-stringData:
-  node.seed: "<32-byte ed25519 seed hex>"   # ideally synced from Vault/KMS
----
-apiVersion: apps/v1
-kind: Deployment
-metadata: { name: wires-responder }
-spec:
-  replicas: 1                        # identity is the address — see "scaling" below
-  selector: { matchLabels: { app: wires-responder } }
-  template:
-    metadata: { labels: { app: wires-responder } }
-    spec:
-      automountServiceAccountToken: false
-      containers:
-        - name: wires
-          image: registry.example.com/my-responder:<tag>   # wires + the tool binary
-          args:
-            - "serve"
-            - "--node-seed-file=/etc/wires/node.seed"
-            - "--trust-root=$(TRUST_ROOT)"
-            - "--scope=$(SCOPE)"
-            - "--crl-file=/etc/wires/crl.json"
-            - "--relay-url=http://wires-relay.wires.svc:3340"   # see relay below
-            - "--"
-            - "my-mcp-server"
-            - "--config=/etc/mcp/config.toml"
-          env:
-            - { name: TRUST_ROOT, valueFrom: { configMapKeyRef: { name: wires-config, key: trust-root } } }
-            - { name: SCOPE,      valueFrom: { configMapKeyRef: { name: wires-config, key: scope } } }
-          volumeMounts:
-            - { name: node-key, mountPath: /etc/wires/node.seed, subPath: node.seed, readOnly: true }
-            - { name: crl,      mountPath: /etc/wires/crl.json,  subPath: crl.json,  readOnly: true }
-          securityContext:
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            allowPrivilegeEscalation: false
-          livenessProbe:                       # no HTTP port to probe
-            exec: { command: ["/bin/sh", "-c", "pgrep -x wires"] }
-      volumes:
-        - { name: node-key, secret:    { secretName: wires-node-key, defaultMode: 0400 } }
-        - { name: crl,      configMap: { name: wires-config, items: [{ key: crl.json, path: crl.json }] } }
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata: { name: wires-responder }
-spec:
-  podSelector: { matchLabels: { app: wires-responder } }
-  policyTypes: [Ingress, Egress]
-  ingress: []                          # nothing reaches it on any port
-  egress:
-    - {}                               # tighten to DNS + the relay in practice
+```bash
+wires id                       # send this to the admin
+wires join <token>             # the admin's `wires invite <id>` output
+wires serve --check host.json  # validate; print who may run what
+wires serve host.json          # prints "share to bootstrap: <ticket>" for the admin's next invite
 ```
 
-There is deliberately **no `Service` and no `Ingress`** — nothing inbound.
+Run `serve` under a process supervisor (card 08 used `systemd-run --user`),
+from the directory that relative paths in `host.json` commands resolve
+against.
 
-**Scaling caveat.** A node id *is* the address, and tickets embed the target
-node id, so identity must be stable (the `Secret` gives that across restarts —
-no PVC needed). But that means `replicas: 1` is intentional: N replicas sharing
-one `node.seed` advertise the *same* node id, which is not a load balancer.
-A wires responder is naturally a single-identity workload; fan a capability out
-by running several responders, each with its own key and a ticket per replica.
+**The keystore must be writable and must persist.** `$WIRES_HOME` holds the
+host's node key and credentials, and the host rewrites them at runtime: every
+`wires invite` and `wires remove` re-keys the channel, and the host adopts the
+new roster head, proof directory and channel key from the channel. It also
+holds the channel log (`topics/`) and the control socket (`run/`). A read-only
+or throwaway keystore loses those on restart.
 
-**The child's secrets** (DB password, API key) are mounted into the same pod and
-**never leave it** — the agent only ever holds a capability to *reach* the
-responder.
+**Secrets.** Every secret input resolves **flag → environment variable →
+`--…-file` → keystore**. Don't pass `--node-seed` on the command line or in
+the environment: argv leaks through `ps`, and `serve` execs children. Keep the
+node key as a file, either in the keystore or mounted and read with
+`--node-seed-file`. The root key (`root.seed`) stays on the admin's machine,
+and a host never holds it.
 
-## Dialer / agent side
-
-The agent (Claude Code, a job, another pod) runs `wires connect` with **its
-own** node key — its own `Secret` if in-cluster — and the ticket it was issued:
-
-```yaml
-args: ["connect",
-       "--node-seed-file=/etc/wires/node.seed",
-       "--relay-url=http://wires-relay.wires.svc:3340",
-       "--ticket=$(TICKET)"]
-```
-
-It dials out and reaches the responder across any boundary — different
-namespace, cluster, or cloud — with no VPC peering and no inbound exposure on
-either side. `//wires:image` is self-contained for this use.
+**Kubernetes.** The manifests that used to be here predated `host.json` and
+assumed a read-only keystore, so they were cut. A manifest needs a
+persistent, writable `$WIRES_HOME` (a PVC or a StatefulSet volume),
+`replicas: 1` (the node key is the host's address, so replicas sharing a key
+are not a load balancer), and no `Service` or `Ingress`. We haven't tested
+one yet.
 
 ## Self-hosted relay on Kubernetes
 
-Unlike the responder, the relay **is** a server: it listens on HTTP and is the
+Unlike a host, the relay **is** a server: it listens on HTTP and is the
 shared rendezvous both peers connect to. So it gets a `Service`.
 
 ```yaml
@@ -190,51 +111,43 @@ spec:
 
 Nodes point at it with `--relay-url http://wires-relay.<ns>.svc:3340`.
 
-- **Plain HTTP / TLS.** The relay runs plain HTTP (no cert) — terminate TLS at
+- **Plain HTTP / TLS.** The relay runs plain HTTP (no cert). Terminate TLS at
   an Ingress/LoadBalancer for external clients (then use an `https://` relay
   URL), or keep it plain inside a trusted network.
 - **One logical relay.** Two peers can only rendezvous if they reach the *same*
   relay, so keep the relay a single logical endpoint: `replicas: 1`, or a
   `Service` with session affinity / a stable external address. It is stateless
-  and keyless, so failover is just "restart it" — but don't round-robin two
+  and keyless, so failover is just "restart it", but don't round-robin two
   peers onto different replicas.
 
 ## Reachability and discovery
 
-Three layers, most-self-contained first:
+Three layers, most self-contained first:
 
-- **Direct addresses in the ticket** (air-gapped friendly). At grant time,
-  embed where the responder is reachable:
-  `wires advanced grant … --addr <ip:port> [--addr …] [--relay-url <url>]`. The dialer
-  uses these directly and needs **no discovery service**. The responder logs its
-  node id and bound sockets at startup; combine that port with the responder's
-  reachable IP / Service / LoadBalancer address. These hints are unsigned —
-  iroh still authenticates the peer to the target's key, so a wrong address only
-  fails to connect.
-- **Self-hosted relay** (`--relay-url`) for NAT traversal / holepunch between
-  egress-only peers that can both reach the relay.
-- **n0 DNS discovery** (the default) when a ticket carries no `--addr`: resolves
-  a node id → addresses, but needs outbound internet.
+- **Addresses from the channel.** A host's announcement on the channel
+  carries its direct addresses and relay URL, so a caller that has read it
+  dials without a discovery service. The addresses are unsigned hints: iroh
+  still authenticates the peer's key, so a wrong address can only fail to
+  connect.
+- **Self-hosted relay** (`--relay-url` on `serve`, `call`, `watch` and
+  `login`) for NAT traversal between egress-only peers that can both reach it.
+- **n0 DNS discovery and relays** (the default): resolves a node id to
+  addresses, but needs outbound internet.
 
-For a private / air-gapped cluster, prefer **`--addr` + a self-hosted relay**
-so nothing depends on n0.
+For a private or air-gapped network, run your own relay so nothing depends on
+n0.
 
-Grants are minted out-of-band with `wires advanced grant` (paste the subject node id);
-distribute the resulting ticket to the agent (e.g. as a `Secret` in its
-namespace).
+## Provisioning and revocation
 
-## Provisioning and rotation
-
-- **Issue:** on the operator's machine, `wires advanced grant --subject <agent-id>
-  --target <responder-id> --scope <s> --ttl <secs>` → hand the ticket to the
-  agent. The root key never leaves that machine.
-- **Revoke:** edit the responder's CRL `ConfigMap` (or `wires advanced revoke
-  --crl-file <path>` against a synced copy) and `kubectl apply`; the projected
-  file updates. `serve` re-reads the CRL (and `roster-head.json`, if it is
-  enforcing one) **once per connection**, so revocation takes effect on the
-  next dial — no restart, no rollout. The only lag is however long the
-  projected volume takes to reflect the `ConfigMap`. A refused dial exits `77`
-  with `wires: denied by responder: <reason>` on the dialer's stderr. Keep
-  short TTLs anyway, as defense in depth for a responder you cannot reach.
-- **Rotate a node key:** write a new `Secret`, re-issue tickets/grants for the
-  new node id (the id changes with the key).
+- **Add a member:** the joiner runs `wires id`; the admin runs
+  `wires invite <id> --name <label>` and hands back the token; the joiner runs
+  `wires join <token>`. The root key never leaves the admin's machine.
+- **Remove a member:** `wires remove <label>`. The re-key goes out on the
+  channel, and hosts adopt it with no import and no restart. `serve` re-reads
+  the roster head once per connection, so the removed member's next call is
+  refused: exit `77`, `wires: denied by responder: <reason>` on its stderr,
+  and a `✗` record on the channel.
+- **Expiry:** memberships and roster heads expire after `--ttl` (default
+  `30d`), and nothing renews them yet. Re-issue with `wires invite <id>`.
+- **Rotate a node key:** the node id changes with the key, so remove the old
+  id and invite the new one.
