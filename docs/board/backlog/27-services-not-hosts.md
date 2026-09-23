@@ -33,6 +33,15 @@ care which host it's on, they should care what service they're calling."*
 
 The gossip mesh and topic node; `library/channel/*` (topic, envelope, chain, admission, replay, record's channel use, announce); `wires/channel/*` except what `watch`/`inbox` still need; fabric keys and sealed keys; Rekey and the proof directory; sealed host announcements and the directory cache (`directory.json`); broadcast identity claims; the committed-roster Merkle privacy **if** nothing still needs inclusion proofs (a signed member list suffices; record the reasoning). Plumbing under `wires advanced` that only served these.
 
+## Parallel plan (integrator)
+
+1. **27.0 types first (one worker, short):** the signed-state document (members, hosts, roles, service registry) with signature/versioning/verification in `library`, the handshake change (membership + state version + ID token), and the `host.json` v2 shape, as compiling stubs with docs, plus tests red.
+2. Then fan out in parallel:
+   - **27a distribution:** admin commands (`service add|rm|set`, `invite`/`remove` bump state), push/pull of signed state, `join` delivering it.
+   - **27b caller:** `wires services` (local evaluation), name → host resolution with failover, identity in the handshake, `mcp` over services, `login` without `--topic`.
+   - **27c host:** registry-driven authorization plus stricter local rules, refusing unassigned names, inbox/push authorization from the registry.
+   - **27d delete + docs:** remove the channel machinery once a/b/c no longer use it; rewrite the demos, README, `docs/demo.md`, the executive summary and CLAUDE.md.
+
 ## Acceptance
 
 - [ ] e2e: Alice (analyst) sees `orders-db` in `wires services` and can call it; Bob (not analyst) sees nothing and is refused by name; two hosts implement `orders-db` and a call succeeds with one of them down; a non-host member can't serve `orders-db` (the host refuses to start, and callers never resolve to it); `remove alice` → her next call is refused, with no restart; `wires inbox` push still works.
