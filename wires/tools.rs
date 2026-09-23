@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Subcommand};
-use library::{CapabilityTicket, NodeId, Scope, ToolName};
+use library::{CapabilityTicket, NodeId, Scope, ToolName, TopicTicket};
 use serde::{Deserialize, Serialize};
 
 /// The file name under `$WIRES_HOME`.
@@ -215,7 +215,8 @@ pub struct ToolsArgs {
 /// The three `wires tools` operations.
 #[derive(Subcommand)]
 pub enum ToolsCmd {
-    /// Add a remote tool, reached by ticket or by responder node id.
+    /// Add a remote tool, reached by ticket, by responder node id, or by the
+    /// responder's audit-topic ticket.
     Add(ToolsAddArgs),
     /// List the configured tools, one per line.
     List,
@@ -228,7 +229,7 @@ pub enum ToolsCmd {
 
 /// `wires tools add`: a name, a description, and where the responder lives.
 #[derive(Args)]
-#[command(group(ArgGroup::new("where").required(true).args(["ticket", "node"])))]
+#[command(group(ArgGroup::new("where").required(true).args(["ticket", "node", "topic_ticket"])))]
 pub struct ToolsAddArgs {
     /// The local tool name (`wires call <name>`, and the MCP tool name).
     pub name: String,
@@ -238,6 +239,12 @@ pub struct ToolsAddArgs {
     /// The responder's hex node id (inclusion-only session, no grant).
     #[arg(long)]
     pub node: Option<String>,
+    /// The topic ticket a `serve --audit-topic` responder prints at startup
+    /// (`share to bootstrap: …`). Its one peer entry *is* the responder, so
+    /// this fills `--node`, its addresses, and its relay — and names the
+    /// audit topic in `tools.json` if none is set yet.
+    #[arg(long)]
+    pub topic_ticket: Option<String>,
     /// Relay to reach a `--node` responder through.
     #[arg(long, requires = "node")]
     pub relay_url: Option<String>,
@@ -268,32 +275,42 @@ pub fn run_tools_cmd(a: ToolsArgs) -> Result<String> {
             Ok(format!("removed {name}"))
         }
         ToolsCmd::Add(add) => {
-            let tool = remote_tool_from_args(add)?;
+            let (tool, audit_topic) = remote_tool_from_args(add)?;
             let line = format!("added {} ({})", tool.name, tool.target_summary());
             config.add(tool)?;
+            if config.audit_topic.is_none() {
+                config.audit_topic = audit_topic;
+            }
             config.save(&path)?;
             Ok(line)
         }
     }
 }
 
-/// Build (and validate) the entry `wires tools add` describes. A ticket must
-/// decode; a node id must be valid hex.
-fn remote_tool_from_args(a: ToolsAddArgs) -> Result<RemoteTool> {
-    let target = match (a.ticket, a.node) {
-        (Some(ticket), None) => {
+/// Build (and validate) the entry `wires tools add` describes, plus the audit
+/// topic a `--topic-ticket` names. A ticket must decode; a node id must be
+/// valid hex.
+fn remote_tool_from_args(a: ToolsAddArgs) -> Result<(RemoteTool, Option<String>)> {
+    let mut audit_topic = None;
+    let target = match (a.ticket, a.node, a.topic_ticket) {
+        (Some(ticket), None, None) => {
             CapabilityTicket::decode(&ticket)
                 .context("--ticket (is the pasted base64 ticket complete?)")?;
             ToolTarget::Ticket(ticket)
         }
-        (None, Some(node)) => ToolTarget::Node {
+        (None, Some(node), None) => ToolTarget::Node {
             node: NodeId::from_hex(&node).context("--node")?,
             relay_url: a.relay_url,
             addrs: a.addr,
         },
-        _ => bail!("pass exactly one of --ticket or --node"),
+        (None, None, Some(text)) => {
+            let (target, topic) = target_from_topic_ticket(&text)?;
+            audit_topic = Some(topic);
+            target
+        }
+        _ => bail!("pass exactly one of --ticket, --node, or --topic-ticket"),
     };
-    Ok(RemoteTool {
+    let tool = RemoteTool {
         name: ToolName::new(a.name).context("tool name")?,
         description: a.description,
         target,
@@ -302,7 +319,46 @@ fn remote_tool_from_args(a: ToolsAddArgs) -> Result<RemoteTool> {
             .map(ToolName::new)
             .transpose()
             .context("--remote-tool")?,
-    })
+    };
+    Ok((tool, audit_topic))
+}
+
+/// The node target a responder's audit-topic ticket describes, and the
+/// topic's name.
+///
+/// A responder's ticket (`share to bootstrap: …`) carries exactly one peer —
+/// the responder itself, with the addresses and relay it is reachable at. A
+/// ticket with several peers (hand-built, or a future multi-peer share) does
+/// not say which of them runs the tool, so it is refused rather than guessed
+/// at; pass `--node` for one of them instead.
+pub fn target_from_topic_ticket(text: &str) -> Result<(ToolTarget, String)> {
+    let ticket = TopicTicket::decode(text.trim())
+        .context("--topic-ticket (is the pasted base64 ticket complete?)")?;
+    let peer = match ticket.peers.as_slice() {
+        [peer] => peer.clone(),
+        [] => bail!(
+            "--topic-ticket for {:?} names no peer; use the ticket the responder printed",
+            ticket.name
+        ),
+        many => bail!(
+            "--topic-ticket for {:?} names {} peers, so it does not say which one is the \
+             responder; pass `--node <id>` for it instead ({})",
+            ticket.name,
+            many.len(),
+            many.iter()
+                .map(|p| p.node.hex())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    Ok((
+        ToolTarget::Node {
+            node: peer.node,
+            relay_url: peer.relay_url,
+            addrs: peer.addrs,
+        },
+        ticket.name,
+    ))
 }
 
 /// `wires tools list` output: `name<TAB>target<TAB>description`, config order.
@@ -464,6 +520,7 @@ pub(crate) mod tests {
             name: name.into(),
             ticket: Some(ticket("tool:rg")),
             node: None,
+            topic_ticket: None,
             relay_url: None,
             addr: vec![],
             description: "search".into(),
@@ -490,6 +547,107 @@ pub(crate) mod tests {
         );
         assert_eq!(run(ToolsCmd::List).unwrap(), "");
         assert!(run(ToolsCmd::Rm { name: "rg".into() }).is_err());
+    }
+
+    /// A responder's audit-topic ticket, as `serve --audit-topic` prints it.
+    fn topic_ticket(peers: Vec<library::TopicPeer>) -> String {
+        TopicTicket::new(NodeIdentity::from_seed([1; 32]).node_id(), "ops", peers)
+            .encode()
+            .unwrap()
+    }
+
+    /// Card 11: `tools add --topic-ticket` fills the node target from the
+    /// ticket's one peer, and names the audit topic.
+    #[test]
+    fn add_from_a_topic_ticket_fills_node_addrs_and_relay() {
+        let path = tmp("topicticket");
+        let responder = NodeIdentity::from_seed([9; 32]).node_id();
+        let addr: SocketAddr = "127.0.0.1:4242".parse().unwrap();
+        let text = topic_ticket(vec![
+            library::TopicPeer::new(responder)
+                .with_addrs(vec![addr])
+                .with_relay_url(Some("https://relay.example".into())),
+        ]);
+        let out = run_tools_cmd(ToolsArgs {
+            tools_file: Some(path.clone()),
+            cmd: ToolsCmd::Add(ToolsAddArgs {
+                name: "db_query".into(),
+                ticket: None,
+                node: None,
+                topic_ticket: Some(format!("{text}\n")),
+                relay_url: None,
+                addr: vec![],
+                description: "SQL".into(),
+                remote_tool: None,
+            }),
+        })
+        .unwrap();
+        assert!(out.starts_with("added db_query (node → "), "{out}");
+        let config = ToolsConfig::load(&path).unwrap();
+        assert_eq!(
+            config.tools[0].target,
+            ToolTarget::Node {
+                node: responder,
+                relay_url: Some("https://relay.example".into()),
+                addrs: vec![addr],
+            }
+        );
+        assert_eq!(config.audit_topic.as_deref(), Some("ops"));
+    }
+
+    #[test]
+    fn a_topic_ticket_must_name_exactly_one_peer() {
+        let one = NodeIdentity::from_seed([9; 32]).node_id();
+        let two = NodeIdentity::from_seed([10; 32]).node_id();
+        let err = target_from_topic_ticket(&topic_ticket(vec![])).unwrap_err();
+        assert!(format!("{err:#}").contains("names no peer"), "{err:#}");
+        let err = target_from_topic_ticket(&topic_ticket(vec![
+            library::TopicPeer::new(one),
+            library::TopicPeer::new(two),
+        ]))
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("--node"), "{err:#}");
+        assert!(target_from_topic_ticket("not-a-ticket").is_err());
+    }
+
+    /// The flag parses, and is exclusive with the other two ways to name the
+    /// responder.
+    #[test]
+    fn topic_ticket_is_one_of_the_three_targets() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            add: ToolsAddArgs,
+        }
+        let text = topic_ticket(vec![library::TopicPeer::new(
+            NodeIdentity::from_seed([9; 32]).node_id(),
+        )]);
+        let ok = Cli::try_parse_from([
+            "t",
+            "db_query",
+            "--topic-ticket",
+            &text,
+            "--description",
+            "SQL",
+        ])
+        .unwrap();
+        assert_eq!(ok.add.topic_ticket.as_deref(), Some(text.as_str()));
+        let hex = NodeIdentity::from_seed([9; 32]).node_id().hex();
+        assert!(
+            Cli::try_parse_from([
+                "t",
+                "db_query",
+                "--topic-ticket",
+                &text,
+                "--node",
+                &hex,
+                "--description",
+                "SQL",
+            ])
+            .is_err(),
+            "--topic-ticket and --node conflict"
+        );
     }
 
     fn arb_tool() -> impl Strategy<Value = RemoteTool> {
