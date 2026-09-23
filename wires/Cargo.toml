@@ -9,7 +9,6 @@ path = "main.rs"
 
 [dependencies]
 library = { workspace = true }
-blake3 = { workspace = true }
 clap = { workspace = true }
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
