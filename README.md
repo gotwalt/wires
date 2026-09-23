@@ -105,11 +105,24 @@ wires serve host.json
 flow and publishes the resulting claim on `ops`. The host admits the call once
 that claim verifies and matches a role in the tool's `allow`.
 
+There is nothing to configure on the laptop: **one invite, then everything —
+hosts, tools, identities, calls — is on the channel.** Each host announces
+its tools there, and each tool's entry is sealed to exactly the members whose
+verified identity the host's policy lets run it. `wires tools` lists what
+*you* can run; everyone else sees only that the host exists. (The host still
+decides every call: naming a tool you can't see gets its refusal, with the
+reason.)
+
 ```bash
 wires login --topic ops
-wires tools add db_query --node "$WORKBENCH_ID" --description "Read-only SQL over orders.db"
+wires tools                                   # db_query  on eacc34e0  Read-only SQL …
 wires call db_query -- "select count(*) from orders"
 ```
+
+A name two hosts serve is ambiguous: `wires call` lists the `eacc34e0/db_query`
+forms, and the qualified one picks a host. A host silent for three heartbeats
+(10 min each) is shown stale. `tools.json` is only for aliases now
+(`wires tools add|list|rm`); the directory is cached in `directory.json`.
 
 For an MCP client, the whole config is:
 
@@ -259,9 +272,9 @@ manual recipes see [docs/testing.md](docs/testing.md). Every script in
 | **admin**    | `wires advanced` | The plumbing below. (`init` / `invite` / `remove` land with [card 14](docs/board/README.md#lanes).) |
 | **host**     | `wires serve`    | `wires serve host.json`: expose the file's tools, verify every caller's membership and roster inclusion, admit it only if a role in the tool's `allow` matches (IdP identity or the built-in `member`), exec the tool per call, and publish a record of every call and refusal on the file's `channel`. `--check` validates the file and prints a summary |
 | **caller**   | `wires login`    | Sign in with your IdP; the ID token is bound to this node's key and, with `--topic`, published on the channel |
-|              | `wires call`     | Run a remote CLI from `tools.json`: stdio passes through, its exit code becomes `call`'s, a refusal exits `77` |
-|              | `wires tools`    | Edit `tools.json`, the local map of remote CLIs (`add` / `list` / `rm`) |
-|              | `wires mcp`      | Serve the `tools.json` CLIs as MCP tools over stdio, for clients that only speak MCP |
+|              | `wires call`     | Run a remote CLI by name (announced on the channel, or a `tools.json` alias): stdio passes through, its exit code becomes `call`'s, a refusal exits `77` |
+|              | `wires tools`    | List the tools the channel's hosts let you run; `add` / `list` / `rm` edit local aliases in `tools.json` |
+|              | `wires mcp`      | Serve those tools as MCP tools over stdio, for clients that only speak MCP |
 | **observer** | `wires watch`    | Own a **topic**: the message log, the mesh, the admission gate, the replay server and a control socket; print every call record, refusal and identity claim, and this node's bootstrap ticket |
 
 `wires advanced` holds the rest, unchanged:
@@ -392,8 +405,9 @@ relays (needs outbound internet). Two ways to avoid that:
 
 - **Self-hosted relay** — run the `relay` binary and point both ends at it with
   `--relay-url http://relay-host:3340` (see [docs/deployment.md](docs/deployment.md)).
-- **Direct addresses** — `wires tools add --topic-ticket <ticket>` takes the
-  host's addresses from its channel ticket, and `advanced grant --addr … --relay-url
-  …` bakes them into a grant ticket. They are *unsigned hints*: iroh still
+- **Direct addresses** — a host's announcement on the channel carries its
+  addresses and relay (so `wires call` needs no discovery), `wires tools add
+  --topic-ticket <ticket>` takes them from a channel ticket, and `advanced grant
+  --addr … --relay-url …` bakes them into a grant ticket. They are *unsigned hints*: iroh still
   authenticates the peer to the host's key, so a wrong address can only fail
   to connect, never impersonate.
