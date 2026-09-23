@@ -18,10 +18,15 @@
 //! - [`login`] — OIDC sign-in, nonce-bound to this node's key.
 //! - [`jwks`] — issuer discovery and key fetching for ID-token verification.
 //! - `mock_idp` — a hermetic OIDC issuer (tests and the dev build only).
+//! - [`services`] — `wires services`: what this caller may call, evaluated
+//!   locally (card 27, 27b stub).
+//! - [`pick`] — service name → host, with failover (card 27, 27b stub).
+//! - [`hello`] — the caller's card-27 handshake frame (27b stub).
 //! - [`join`] — `wires id` and `wires join <token>` (card 14; every role
 //!   joins this way, the host and the observer included).
 
 pub mod call;
+pub mod hello;
 pub mod inbox;
 pub mod join;
 pub mod jwks;
@@ -34,6 +39,8 @@ pub mod mcp;
 #[cfg(any(test, feature = "dev-mock-idp"))]
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod mock_idp;
+pub mod pick;
 pub mod resolve;
+pub mod services;
 pub mod shape;
 pub mod tools;

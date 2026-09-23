@@ -11,6 +11,8 @@
 //!   rules, admission, replay, and the records that ride it.
 //! - `calls/` — remote CLI calls: the session frames, invocations, audit
 //!   records, and IdP identity claims.
+//! - `services/` — card 27's admin-signed state: roles, the service
+//!   registry, the signed [`State`], policy evaluation, and state sync.
 //!
 //! The folders are a filing system, not a namespace: every module is still
 //! declared here at the crate root (`library::roster`, `library::topic`, …),
@@ -58,6 +60,14 @@
 //! - [`idp`] — [`IdentityClaim`]: an IdP-signed ID token bound to a node key,
 //!   and [`verify_claim`], which every reader runs against the issuer's [`Jwks`].
 //! - [`record`] — [`ChannelRecord`], how both ride a topic as message text.
+//!
+//! Services, not hosts (card 27) — replacing the channel:
+//!
+//! - [`role`] — [`RoleName`], [`Matcher`], [`EmailPattern`]: role definitions.
+//! - [`registry`] — [`ServiceName`] and the registry entry [`Service`].
+//! - [`state`] — the admin-signed, versioned [`State`] / [`SignedState`].
+//! - [`access`] — [`authorize`] and [`allowed_services`] over that state.
+//! - [`sync`] — the [`StateFrame`] push/pull protocol on [`STATE_ALPN`].
 //!
 //! # Example: commit a roster, publish to a topic, read it back
 //!
@@ -175,11 +185,24 @@ pub mod push;
 #[path = "calls/session.rs"]
 pub mod session;
 
+// services/ — card 27: the admin-signed state and the service registry.
+#[path = "services/access.rs"]
+pub mod access;
+#[path = "services/registry.rs"]
+pub mod registry;
+#[path = "services/role.rs"]
+pub mod role;
+#[path = "services/state.rs"]
+pub mod state;
+#[path = "services/sync.rs"]
+pub mod sync;
+
 mod codec;
 #[cfg(test)]
 #[path = "calls/idp_vectors.rs"]
 mod idp_vectors;
 
+pub use access::{Grant, Refusal, allowed_services, authorize};
 pub use admission::{
     Admission, AdmitFrame, MAX_ADMIT_FRAME, TOPIC_ADMIT_ALPN, adopt_if_newer,
     check_topic_admission, check_topic_admission_via,
@@ -216,14 +239,18 @@ pub use push::{
     PushId, PushMessage, Subject,
 };
 pub use record::{ChannelRecord, RECORD_V1};
+pub use registry::{Service, ServiceName};
 pub use rekey::{
     ProofDirectory, REKEY_ENTRIES_PER_RECORD, Rekey, RekeyEntry, check_roster_inclusion_via,
 };
 pub use replay::{MAX_REPLAY_FRAME, ReplayFrame, TOPIC_REPLAY_ALPN};
+pub use role::{EmailPattern, MAX_ROLE_NAME, MEMBER_ROLE, Matcher, RoleName};
 pub use roster::{
     InclusionProof, MerkleRoot, MerkleStep, ROSTER_HEAD_V1, Roster, RosterHead, RosterVersion, Side,
 };
-pub use session::{Chunk, Frame};
+pub use session::{Chunk, Frame, Hello, HelloAck};
+pub use state::{STATE_CONTEXT, STATE_V1, SignedState, State, StateVersion};
+pub use sync::{MAX_STATE_FRAME, STATE_ALPN, StateFrame};
 pub use topic::{TopicId, TopicPeer, TopicTicket};
 
 /// Crate version, surfaced so the binaries have something concrete to call

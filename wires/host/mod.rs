@@ -9,6 +9,9 @@
 //!
 //! - [`serve`] — `wires serve host.json` / `--check`: credentials, the channel.
 //! - [`config`] — `host.json`: parsing, validation, the `--check` summary.
+//! - [`config_v2`] — card 27's `host.json` v2 (services it implements, local
+//!   trust, `also_require`), beside v1 until lane 27c switches `serve`.
+//! - [`gate`] — card 27's call gate over the signed state (27c stub).
 //! - [`policy`] — the [`Policy`](policy::Policy) seam and v1's role table.
 //! - [`transport`] — the session protocol: bind/dial, the handshake, the
 //!   credential checks and the policy call (`authorize`), exec + stdio bridge.
@@ -26,6 +29,8 @@ pub mod announce;
 pub mod audit;
 pub mod call_log;
 pub mod config;
+pub mod config_v2;
+pub mod gate;
 pub mod identity;
 pub mod otlp;
 pub mod policy;
