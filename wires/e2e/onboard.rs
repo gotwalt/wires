@@ -134,6 +134,7 @@ fn resident(m: &Machine, hosted: bool) -> (tokio::task::JoinHandle<()>, oneshot:
                 crate::channel::idp_view::IdpTrust::from_vars(None, None),
             )),
             announcer: None,
+            push: None,
         }
     });
     let (ready, ready_rx) = oneshot::channel();

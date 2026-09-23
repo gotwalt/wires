@@ -331,6 +331,23 @@ pub(crate) trait Policy: Send + Sync {
     fn member_tools(&self) -> Vec<ToolName> {
         Vec::new()
     }
+
+    /// Whether `recipient` (with `principal`, if it has logged in) may
+    /// receive pushes from this host (card 23) — asked at send, at delivery
+    /// and at fetch, each time with the principal as it stands then. The
+    /// default refuses everyone.
+    fn decide_push(&self, principal: Option<&Principal>, recipient: NodeId) -> Decision {
+        let _ = (principal, recipient);
+        Decision::deny("this host sends no pushes")
+    }
+
+    /// Whether `principal` (or a member without one) is in `role` — how
+    /// `wires push --to <role>` picks its recipients. The default knows no
+    /// roles.
+    fn in_role(&self, role: &RoleName, principal: Option<&Principal>) -> bool {
+        let _ = (role, principal);
+        false
+    }
 }
 
 /// The v1 policy: roles of matchers, and per tool the roles allowed.
@@ -340,6 +357,9 @@ pub(crate) struct RoleTable {
     roles: BTreeMap<RoleName, Vec<Matcher>>,
     /// Each exposed tool's `allow` list, in `host.json` order.
     allow: BTreeMap<ToolName, Vec<RoleName>>,
+    /// `push.allow`: the roles that may receive pushes, in order. Empty:
+    /// nobody (card 23).
+    push: Vec<RoleName>,
 }
 
 impl RoleTable {
@@ -350,7 +370,18 @@ impl RoleTable {
         roles: BTreeMap<RoleName, Vec<Matcher>>,
         allow: BTreeMap<ToolName, Vec<RoleName>>,
     ) -> Self {
-        Self { roles, allow }
+        Self {
+            roles,
+            allow,
+            push: Vec::new(),
+        }
+    }
+
+    /// The same table, letting the members of `roles` receive pushes
+    /// (`host.json`'s `push.allow`, already validated).
+    pub(crate) fn with_push(mut self, roles: Vec<RoleName>) -> Self {
+        self.push = roles;
+        self
     }
 
     /// Whether `role` admits a caller with `principal`.
@@ -392,10 +423,9 @@ impl Policy for RoleTable {
             ));
         }
         if let Some(role) = allowed.iter().find(|r| self.admits(r, ctx.principal)) {
-            let who = ctx.principal.map_or_else(
-                || format!("node {}", short(ctx.caller)),
-                |p| principal_name(p),
-            );
+            let who = ctx
+                .principal
+                .map_or_else(|| format!("node {}", short(ctx.caller)), principal_name);
             return Decision::allow(
                 role.clone(),
                 format!("{who} is in role {}", self.describe(role)),
@@ -440,6 +470,37 @@ impl Policy for RoleTable {
             .map(|(tool, _)| tool.clone())
             .collect()
     }
+
+    fn in_role(&self, role: &RoleName, principal: Option<&Principal>) -> bool {
+        (role.is_member() || self.roles.contains_key(role)) && self.admits(role, principal)
+    }
+
+    /// `push.allow`, the way a tool's `allow` decides a call: the first role
+    /// that admits the recipient, else a refusal naming the roles.
+    fn decide_push(&self, principal: Option<&Principal>, recipient: NodeId) -> Decision {
+        if self.push.is_empty() {
+            return Decision::deny(
+                "this host's host.json `push.allow` is empty: it pushes to no one",
+            );
+        }
+        let who = principal.map_or_else(|| format!("node {}", short(recipient)), principal_name);
+        if let Some(role) = self.push.iter().find(|r| self.admits(r, principal)) {
+            return Decision::allow(
+                role.clone(),
+                format!("{who} is in role {}", self.describe(role)),
+            );
+        }
+        let roles: Vec<String> = self.push.iter().map(|r| self.describe(r)).collect();
+        let roles = roles.join("; ");
+        Decision::deny(match principal {
+            Some(p) => format!(
+                "identity {} (from {}) is in no role allowed to receive pushes: {roles}",
+                principal_name(p),
+                p.issuer
+            ),
+            None => format!("receiving pushes needs a verified identity in role {roles}"),
+        })
+    }
 }
 
 /// Test-only: admits every call as [`MEMBER`] — the inclusion-only
@@ -457,6 +518,10 @@ impl Policy for AnyMember {
 
     fn allowed_tools(&self, _: Option<&Principal>, _: NodeId) -> Vec<ToolName> {
         Vec::new()
+    }
+
+    fn decide_push(&self, _: Option<&Principal>, _: NodeId) -> Decision {
+        Decision::allow(RoleName::member(), "test policy: any member")
     }
 }
 

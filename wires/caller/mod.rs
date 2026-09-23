@@ -7,6 +7,8 @@
 //!
 //! - [`call`] — dial a tool and bridge stdio; the exit code is the remote one.
 //! - [`shape`] — `--jq` / `--head` / `--max-bytes`: output shaping, in-process.
+//! - [`inbox`] — `wires inbox`: what hosts pushed to this caller (card 23),
+//!   fetched or received by a resident `wires watch`.
 //! - [`lock`] — locked mode: `WIRES_LOCKED=1` refuses the override flags so a
 //!   sandboxed agent can't steer `call`/`mcp` off the operator's config.
 //! - [`mcp`] — the same calls as MCP tools over stdio (backward compatibility).
@@ -20,6 +22,7 @@
 //!   joins this way, the host and the observer included).
 
 pub mod call;
+pub mod inbox;
 pub mod join;
 pub mod jwks;
 pub mod lock;

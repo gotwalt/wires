@@ -57,6 +57,21 @@ fn serve(
     tokio::task::JoinHandle<()>,
     oneshot::Receiver<library::TopicPeer>,
 ) {
+    let (task, ready, _) = serve_pushing(m, host, heartbeat);
+    (task, ready)
+}
+
+/// [`serve`], plus the push service `host.json`'s `push` section asks for
+/// (card 23), handed back so a test can send as `wires push` would.
+pub(super) fn serve_pushing(
+    m: &Machine,
+    host: &HostConfig,
+    heartbeat: Duration,
+) -> (
+    tokio::task::JoinHandle<()>,
+    oneshot::Receiver<library::TopicPeer>,
+    Option<Arc<crate::host::push::PushHost>>,
+) {
     let ctx = m.context();
     let identity = m.node();
     let identities = Arc::new(Identities::new(
@@ -95,11 +110,21 @@ fn serve(
         Arc::clone(&serve),
         Arc::clone(&m.ks),
     ));
+    let push = host.push.as_ref().map(|_| {
+        Arc::new(crate::host::push::PushHost::new(
+            identity.node_id(),
+            Arc::clone(&serve),
+            crate::host::announce::roster_view(Arc::clone(&serve), Arc::clone(&m.ks)),
+            Arc::clone(&identities),
+            host.logs_push_bodies(),
+        ))
+    });
     let hosted = crate::host::audit::Hosted {
         session: SessionProtocol(serve),
         records,
         identities,
         announcer: Some(announcer),
+        push: push.clone(),
     };
     let (ready, ready_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -113,13 +138,16 @@ fn serve(
             panic!("a host ended: {e:#}");
         }
     });
-    (task, ready_rx)
+    (task, ready_rx, push)
 }
 
 /// `m`'s directory after a refresh from the channel: until `until` holds
 /// (`None`: one catch-up) — `wires tools` / `wires call`'s own step, over a
 /// hermetic endpoint.
-async fn refreshed(m: &Machine, until: Option<&dyn Fn(&Directory) -> bool>) -> Directory {
+pub(super) async fn refreshed(
+    m: &Machine,
+    until: Option<&dyn Fn(&Directory) -> bool>,
+) -> Directory {
     let ctx = m.context();
     let identity = m.node();
     let mut dir = Directory::load(&Directory::path(&m.home), &ctx.name);
@@ -134,7 +162,11 @@ async fn refreshed(m: &Machine, until: Option<&dyn Fn(&Directory) -> bool>) -> D
 
 /// Refresh `m`'s directory until `until` holds, retrying (each refresh is
 /// bounded) up to [`PATIENCE`].
-async fn refreshed_until(m: &Machine, what: &str, until: impl Fn(&Directory) -> bool) -> Directory {
+pub(super) async fn refreshed_until(
+    m: &Machine,
+    what: &str,
+    until: impl Fn(&Directory) -> bool,
+) -> Directory {
     let deadline = tokio::time::Instant::now() + PATIENCE;
     loop {
         let dir = refreshed(m, Some(&until)).await;
@@ -190,7 +222,7 @@ async fn call(
 
 /// `wires login --topic ops` on `m` at `idp`: sign in (the browser replaced
 /// by the mock's redirect) and publish the claim one-shot.
-async fn log_in(m: &Machine, idp: &MockIdp) {
+pub(super) async fn log_in(m: &Machine, idp: &MockIdp) {
     let login = run_flow(
         &KeyFetcher::new(None).unwrap(),
         &idp.client(),
@@ -216,7 +248,7 @@ async fn log_in(m: &Machine, idp: &MockIdp) {
 
 /// The admin inits `ops`; each joiner makes its key (`wires id`). Returns
 /// the fabric and the joiners' node ids.
-fn onboard(admin: &Machine, joiners: &[&Machine]) -> (NodeId, Vec<NodeId>) {
+pub(super) fn onboard(admin: &Machine, joiners: &[&Machine]) -> (NodeId, Vec<NodeId>) {
     init_in(
         &admin.ks,
         InitArgs {
@@ -231,7 +263,7 @@ fn onboard(admin: &Machine, joiners: &[&Machine]) -> (NodeId, Vec<NodeId>) {
 }
 
 /// Join `m` with an invite that bootstraps from `peer`.
-async fn join(
+pub(super) async fn join(
     admin: &Machine,
     fabric: NodeId,
     m: &Machine,
@@ -249,7 +281,7 @@ async fn join(
 }
 
 /// The directory's tool names on `host`, in order.
-fn names_on(dir: &Directory, host: NodeId) -> Vec<String> {
+pub(super) fn names_on(dir: &Directory, host: NodeId) -> Vec<String> {
     dir.hosts
         .iter()
         .find(|h| h.node == host)

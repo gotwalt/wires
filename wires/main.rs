@@ -68,6 +68,7 @@ Admin — decides who's in (holds the root key):
 
 Host — decides what runs and who may run it:
   serve     Expose CLIs as named tools; verify every caller; record every call
+  push      Send a caller a message by key (to its inbox); recorded on the channel
 
 Caller — runs remote CLIs (every role joins the same way):
   id        Print this node's id: what you send the admin
@@ -76,6 +77,7 @@ Caller — runs remote CLIs (every role joins the same way):
   call      Run a remote CLI by name: stdio passes through, its exit code is ours
   tools     List the tools your channel's hosts let you run (aliases: add / rm)
   mcp       Serve those tools as MCP tools over stdio (compatibility)
+  inbox     Read what hosts pushed to you; --wait blocks until something arrives
 
 Observer — watches calls:
   watch     Stream a channel: every call, refusal and identity as it happens
@@ -114,6 +116,10 @@ enum Command {
     /// Expose CLIs as named tools, verify every caller, exec the tool, bridge
     /// its stdio — and, with a `channel` in host.json, record every call.
     Serve(host::serve::ServeArgs),
+    /// Send a caller a message, addressed by its key (a tool's
+    /// `$WIRES_CALLER_NODE`) or a role: through this machine's running
+    /// `wires serve`, to the caller's inbox; recorded on the channel.
+    Push(host::push::PushArgs),
 
     // --- caller (and every joiner) ---
     /// Print this node's id (creating its key on first use): what a joiner
@@ -136,6 +142,10 @@ enum Command {
     /// Serve the tools you can run (announced, plus aliases) as MCP tools over
     /// stdio (for clients that only speak MCP).
     Mcp(caller::mcp::McpArgs),
+    /// Print what hosts pushed to you (verified sender first), and mark it
+    /// read; `--wait` blocks until something arrives (exit 124 on
+    /// `--timeout`).
+    Inbox(caller::inbox::InboxArgs),
 
     // --- observer ---
     /// Join a channel and stream it: every call record, refusal and identity
@@ -259,6 +269,20 @@ fn main() {
             if let Err(e) = runtime().block_on(host::serve::serve_cmd(a)) {
                 eprintln!("wires: {e:#}");
                 std::process::exit(1);
+            }
+        }
+        Command::Push(a) => {
+            init_quiet_logging();
+            match runtime().block_on(host::push::push_cmd(a)) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::Inbox(a) => {
+            init_quiet_logging();
+            match runtime().block_on(caller::inbox::inbox_cmd(a)) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => exit_with(e),
             }
         }
         Command::Login(a) => {

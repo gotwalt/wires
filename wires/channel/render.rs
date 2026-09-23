@@ -11,7 +11,12 @@
 //! ■ 3fa2 exit 0 · 41 ms · stdin "select customer, sum(total) …" · 3.1 KiB out · blake3 9c1e…
 //! ✗ a1b2… db_query denied: membership rejected: revoked
 //! 🪪 identity a1b2c3d4 is alice@corp (verified by https://accounts.google.com)
+//! ⇢ 9c1e → alice@corp (a1b2…) [analyst] "build-41" delivered
 //! ```
+//!
+//! A `⇢` is one milestone of a host's push to a caller (card 23): `queued`,
+//! `delivered`, `fetched`, `expired`, `dropped` or `denied` (with the
+//! reason); the first four hex characters of its id pair the milestones.
 //!
 //! The first four hex characters of the [`CallId`](library::CallId) pair a
 //! `▶` with its `■`. A caller is shown by its verified principal's email when
@@ -177,6 +182,36 @@ pub fn audit_line(record: &AuditRecord) -> String {
                 short_hex(&stdout_digest.hex())
             )
         }
+        AuditRecord::Push {
+            id,
+            to,
+            principal,
+            role,
+            subject,
+            outcome,
+            reason,
+            body,
+            ..
+        } => {
+            let role = role
+                .as_deref()
+                .map(|r| format!(" [{}]", escape(r)))
+                .unwrap_or_default();
+            let mut line = format!(
+                "⇢ {} → {}{role} {:?} {}",
+                short_hex(&id.hex()),
+                caller_label(*to, principal.as_ref()),
+                subject.as_str(),
+                outcome.as_str()
+            );
+            if let Some(reason) = reason {
+                line.push_str(&format!(": {}", escape(reason)));
+            }
+            if let Some(body) = body {
+                line.push_str(&format!(" · body {}", stdin_preview(body.as_str(), 0)));
+            }
+            line
+        }
         AuditRecord::Denied {
             caller,
             tool,
@@ -308,6 +343,40 @@ mod tests {
             not_after: 0,
             claims: Default::default(),
         }
+    }
+
+    /// A push line names the recipient as the host verified it, the role, the
+    /// subject and what happened; a reason or a logged body follows, escaped.
+    #[test]
+    fn a_push_line_says_who_what_and_how_it_went() {
+        use library::{PushBody, PushId, PushOutcome, Subject};
+        let push = |outcome, reason: Option<&str>, body: Option<&str>| AuditRecord::Push {
+            id: PushId::from_hex("9c1e0000000000000000000000000000").unwrap(),
+            to: node(2),
+            principal: Some(principal(Some("alice@corp"))),
+            role: Some("analyst".into()),
+            subject: Subject::new("build-41").unwrap(),
+            outcome,
+            reason: reason.map(str::to_string),
+            body: body.map(|b| PushBody::new(b).unwrap()),
+            at_ms: 0,
+        };
+        let to = short_node(node(2));
+        assert_eq!(
+            audit_line(&push(PushOutcome::Delivered, None, None)),
+            format!("⇢ 9c1e → alice@corp ({to}) [analyst] \"build-41\" delivered")
+        );
+        assert_eq!(
+            audit_line(&push(PushOutcome::Denied, Some("not in\nthe roster"), None)),
+            format!(
+                "⇢ 9c1e → alice@corp ({to}) [analyst] \"build-41\" denied: not in\\nthe roster"
+            )
+        );
+        let with_body = audit_line(&push(PushOutcome::Queued, None, Some("failed:\n test")));
+        assert!(
+            with_body.ends_with(" queued · body \"failed: test\""),
+            "{with_body}"
+        );
     }
 
     /// A host announcement shows only what every member may read.

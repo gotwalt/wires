@@ -50,6 +50,12 @@ impl Ttl {
     pub(crate) fn not_after(self, now_unix: i64) -> i64 {
         now_unix.saturating_add(self.0)
     }
+
+    /// The span as a [`Duration`](std::time::Duration) (`wires push --ttl`,
+    /// `wires inbox --timeout` parse the same forms).
+    pub(crate) fn duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.0.max(0) as u64)
+    }
 }
 
 impl FromStr for Ttl {

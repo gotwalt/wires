@@ -185,12 +185,39 @@ where
 
     // 3. The node, then the banner (it needs the bound sockets).
     let mut cfg = ctx.node_config(Arc::clone(&store));
-    let (records, session, announcer) = match hosted {
-        Some(h) => (Some(h.records), Some(h.session), h.announcer),
-        None => (None, None, None),
+    let is_host = hosted.is_some();
+    let (records, session, announcer, push) = match hosted {
+        Some(h) => (Some(h.records), Some(h.session), h.announcer, h.push),
+        None => (None, None, None, None),
     };
     if let Some(session) = session {
         cfg.protocols.push((transport::ALPN, session.into()));
+    }
+    // The inbox ALPN (card 23): a host serves its callers' fetches; any
+    // other resident node is its member's receiver.
+    let mailbox = if is_host {
+        None
+    } else {
+        Some(crate::caller::inbox::Mailbox::open(&ctx.home)?)
+    };
+    if let Some(push) = &push {
+        cfg.protocols.push((
+            library::INBOX_ALPN,
+            crate::host::push::PushFetch(Arc::clone(push)).into(),
+        ));
+    } else if let Some(mailbox) = &mailbox {
+        cfg.protocols.push((
+            library::INBOX_ALPN,
+            crate::caller::inbox::InboxReceiver {
+                me: ctx.node.node_id(),
+                fabric: ctx.fabric_root,
+                head: Arc::clone(&ctx.head_source),
+                home: ctx.home.clone(),
+                channel: ctx.name.clone(),
+                mailbox: mailbox.clone(),
+            }
+            .into(),
+        ));
     }
     let node = bind(cfg).await?;
     let socket_path = ctx.socket_path();
@@ -214,7 +241,28 @@ where
             .unwrap_or_else(|| TopicPeer::new(node.node_id()));
         tokio::spawn(a.run(tx.clone(), reach))
     });
-    let server = socket.spawn(tx);
+    // Pushes from `wires push` arrive over the same socket (card 23).
+    let (pushing, push_tx) = match push {
+        Some(push) => {
+            push.attach(node.endpoint().clone());
+            let (push_tx, commands) = tokio::sync::mpsc::channel(CONTROL_QUEUE);
+            (Some(tokio::spawn(push.run(commands))), Some(push_tx))
+        }
+        None => (None, None),
+    };
+    let server = socket.spawn_with(tx, push_tx);
+    // A member's receiver also fetches what its hosts queued while it was
+    // not listening: now, and every few minutes.
+    let fetching = mailbox.map(|mailbox| {
+        tokio::spawn(crate::caller::inbox::resident_fetch(
+            node.endpoint().clone(),
+            ctx.home.clone(),
+            ctx.name.clone(),
+            crate::caller::inbox::hello(ctx),
+            book.list(),
+            mailbox,
+        ))
+    });
 
     // 5. The mesh — which is where a revoked node finds out (exit 77).
     let (mut sender, mut events) = node.join(ctx.topic, &book.list()).await?;
@@ -473,6 +521,9 @@ where
     }
     if let Some(announcing) = announcing {
         announcing.abort();
+    }
+    for task in [pushing, fetching].into_iter().flatten() {
+        task.abort();
     }
     node.shutdown().await?;
     Ok(())

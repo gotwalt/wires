@@ -42,6 +42,10 @@
 //! - `tools`: name → `command` (argv, never a shell; each call's arguments
 //!   are appended), optional `description`, and `allow` (roles, in order).
 //!   **Default deny**: a tool with no `allow` refuses every call.
+//! - `push` (card 23): `allow` lists the roles whose members may receive
+//!   pushes from this host (`wires push`; default deny, like a tool), and
+//!   `log_body` (default `false`) records each push's body on the channel, not
+//!   only its subject. Needs a `channel`.
 //!
 //! The file becomes a [`RoleTable`] (the [`Policy`](crate::host::policy::Policy)),
 //! the exposed command map, and the [`IdpTrust`] the host verifies claims
@@ -79,6 +83,23 @@ pub(crate) struct HostConfig {
     pub(crate) roles: BTreeMap<RoleName, Vec<Matcher>>,
     /// The exposed tools, by name.
     pub(crate) tools: BTreeMap<ToolName, ToolConfig>,
+    /// Who may receive pushes from this host (card 23). Absent: nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) push: Option<PushConfig>,
+}
+
+/// `push`: which roles may receive pushes from this host, and what its call
+/// log records about them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PushConfig {
+    /// The roles whose members may receive pushes, tried in order (like a
+    /// tool's `allow`). Empty: nobody.
+    #[serde(default)]
+    pub(crate) allow: Vec<RoleName>,
+    /// Record each push's body on the channel, not only its subject.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) log_body: bool,
 }
 
 /// `identity`: the IdPs the host verifies ID tokens from.
@@ -139,7 +160,10 @@ impl HostConfig {
     /// - every `allow` names a defined role or `member`;
     /// - identity roles need `identity.issuers` and a `channel`; a matcher's
     ///   `issuer` must be one of `identity.issuers`;
-    /// - each issuer is listed once, with at least one audience.
+    /// - each issuer is listed once, with at least one audience;
+    /// - `push` needs a `channel` (pushes are recorded there, and the host's
+    ///   resident node is what receivers fetch from), and its `allow` names
+    ///   defined roles or `member`.
     pub(crate) fn validate(&self) -> Result<()> {
         if self.version != HOST_CONFIG_VERSION {
             bail!(
@@ -212,17 +236,48 @@ impl HostConfig {
                 bail!("tool {tool}: empty command");
             }
             for role in &t.allow {
-                if !role.is_member() && !self.roles.contains_key(role) {
-                    let mut known: Vec<&str> = self.roles.keys().map(RoleName::as_str).collect();
-                    known.push(MEMBER);
+                if !self.is_role(role) {
                     bail!(
                         "tool {tool} allows unknown role {role} (roles: {})",
-                        known.join(", ")
+                        self.known_roles()
+                    );
+                }
+            }
+        }
+        if let Some(push) = &self.push {
+            if self.channel.is_none() {
+                bail!(
+                    "`push` needs a `channel`: pushes are recorded there, and receivers fetch \
+                     from the host's node on it"
+                );
+            }
+            for role in &push.allow {
+                if !self.is_role(role) {
+                    bail!(
+                        "push allows unknown role {role} (roles: {})",
+                        self.known_roles()
                     );
                 }
             }
         }
         Ok(())
+    }
+
+    /// Whether `role` is defined here or is the built-in [`MEMBER`].
+    fn is_role(&self, role: &RoleName) -> bool {
+        role.is_member() || self.roles.contains_key(role)
+    }
+
+    /// `analyst, sre, member`: the roles an `allow` may name, for errors.
+    fn known_roles(&self) -> String {
+        let mut known: Vec<&str> = self.roles.keys().map(RoleName::as_str).collect();
+        known.push(MEMBER);
+        known.join(", ")
+    }
+
+    /// Whether the host records push bodies on its channel (`push.log_body`).
+    pub(crate) fn logs_push_bodies(&self) -> bool {
+        self.push.as_ref().is_some_and(|p| p.log_body)
     }
 
     /// Each tool's fixed argv, for [`ServeConfig::tools`](crate::host::transport::ServeConfig::tools).
@@ -250,6 +305,12 @@ impl HostConfig {
                 .iter()
                 .map(|(name, t)| (name.clone(), t.allow.clone()))
                 .collect(),
+        )
+        .with_push(
+            self.push
+                .as_ref()
+                .map(|p| p.allow.clone())
+                .unwrap_or_default(),
         )
     }
 
@@ -318,6 +379,21 @@ impl HostConfig {
                 let _ = writeln!(out, "    {d}");
             }
         }
+        let receivers = match &self.push {
+            Some(p) if !p.allow.is_empty() => p
+                .allow
+                .iter()
+                .map(RoleName::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => "NO ONE".to_string(),
+        };
+        let bodies = if self.logs_push_bodies() {
+            "subject and body logged"
+        } else {
+            "subject logged, body not"
+        };
+        let _ = writeln!(out, "push: may receive: {receivers} ({bodies})");
         out
     }
 }
@@ -461,6 +537,10 @@ mod tests {
                 edit(|v| v["roles"]["analyst"][0]["email"] = "*.example.com".into()),
                 "email pattern",
             ),
+            (
+                edit(|v| v["push"] = serde_json::json!({"allow": [], "ttl": "1h"})),
+                "unknown field `ttl`",
+            ),
         ] {
             let e = err(&text);
             assert!(e.contains(why), "{why}: {e}");
@@ -526,6 +606,20 @@ mod tests {
                 "`identity` needs a `channel`",
             ),
             (edit(|v| v["channel"] = " ".into()), "`channel` is empty"),
+            (
+                edit(|v| v["push"] = json!({"allow": ["admins"]})),
+                "push allows unknown role admins (roles: analyst, sre, member)",
+            ),
+            (
+                edit(|v| {
+                    v.as_object_mut().unwrap().remove("channel");
+                    v.as_object_mut().unwrap().remove("identity");
+                    v.as_object_mut().unwrap().remove("roles");
+                    v["tools"] = json!({"status": {"command": ["uptime"], "allow": ["member"]}});
+                    v["push"] = json!({"allow": ["member"]});
+                }),
+                "`push` needs a `channel`",
+            ),
         ] {
             let e = err(&text);
             assert!(e.contains(why), "{why}: {e}");
@@ -556,9 +650,59 @@ mod tests {
             "    command: sqlite3 -safe -readonly orders.db",
             "  locked  may run: NO ONE (empty allow)",
             "  status  may run: member",
+            "push: may receive: NO ONE (subject logged, body not)",
         ] {
             assert!(s.contains(want), "missing {want:?} in\n{s}");
         }
+        let s = HostConfig::parse(&edit(|v| {
+            v["push"] = serde_json::json!({"allow": ["analyst", "member"], "log_body": true})
+        }))
+        .unwrap()
+        .summary();
+        assert!(
+            s.contains("push: may receive: analyst, member (subject and body logged)"),
+            "{s}"
+        );
+    }
+
+    /// `push` parses, defaults to nobody and no bodies, and becomes the
+    /// policy's push decision.
+    #[test]
+    fn the_push_section_decides_who_may_receive() {
+        let none = HostConfig::parse(CARD).unwrap();
+        assert_eq!(none.push, None);
+        assert!(!none.logs_push_bodies());
+        let empty = HostConfig::parse(&edit(|v| v["push"] = serde_json::json!({}))).unwrap();
+        assert_eq!(empty.push, Some(PushConfig::default()));
+        let c = HostConfig::parse(&edit(|v| {
+            v["push"] = serde_json::json!({"allow": ["analyst"], "log_body": true})
+        }))
+        .unwrap();
+        assert!(c.logs_push_bodies());
+        let node = NodeIdentity::from_seed([1u8; 32]).node_id();
+        let who = |email: &str| Principal {
+            issuer: "https://accounts.google.com".into(),
+            subject: "1".into(),
+            email: Some(email.into()),
+            org: None,
+            groups: vec![],
+            not_after: 0,
+            claims: Default::default(),
+        };
+        for (config, principal, allowed) in [
+            (&c, Some(who("alice@example.com")), true),
+            (&c, Some(who("bob@other.org")), false),
+            (&c, None, false),
+            (&none, Some(who("alice@example.com")), false),
+            (&empty, Some(who("alice@example.com")), false),
+        ] {
+            let d = config.policy().decide_push(principal.as_ref(), node);
+            assert_eq!(d.allow, allowed, "{principal:?}: {d:?}");
+        }
+        let d = c
+            .policy()
+            .decide_push(Some(&who("alice@example.com")), node);
+        assert_eq!(d.role.unwrap().as_str(), "analyst");
     }
 
     proptest! {
@@ -598,6 +742,7 @@ mod tests {
                         )
                     })
                     .collect(),
+                push: None,
             };
             config.validate().unwrap();
             let text = serde_json::to_string_pretty(&config).unwrap();
