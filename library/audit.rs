@@ -89,6 +89,53 @@ impl From<OutputDigest> for String {
     }
 }
 
+/// Streaming BLAKE3 over a call's stdout, finished into an [`OutputDigest`].
+///
+/// The responder feeds it every chunk the child writes, in order, and keeps
+/// the byte count alongside so a [`Finished`](AuditRecord::Finished) record
+/// needs no second pass over output it never buffers.
+///
+/// ```
+/// use library::OutputHasher;
+/// let mut chunked = OutputHasher::new();
+/// chunked.update(b"hello ");
+/// chunked.update(b"world");
+/// let mut whole = OutputHasher::new();
+/// whole.update(b"hello world");
+/// assert_eq!(chunked.bytes(), 11);
+/// assert_eq!(chunked.finish(), whole.finish());
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct OutputHasher {
+    /// The running hash.
+    hasher: blake3::Hasher,
+    /// Bytes fed so far.
+    bytes: u64,
+}
+
+impl OutputHasher {
+    /// An empty hasher (digest of zero bytes).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed the next chunk of output.
+    pub fn update(&mut self, chunk: &[u8]) {
+        self.hasher.update(chunk);
+        self.bytes += chunk.len() as u64;
+    }
+
+    /// Total bytes fed so far.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// The digest of everything fed so far (the hasher stays usable).
+    pub fn finish(&self) -> OutputDigest {
+        OutputDigest::from_hash(self.hasher.finalize())
+    }
+}
+
 /// One entry in a responder's call log. See the module docs.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -139,4 +186,32 @@ pub enum AuditRecord {
         /// Unix milliseconds at refusal.
         at_ms: i64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn empty_hasher_is_the_digest_of_nothing() {
+        let h = OutputHasher::new();
+        assert_eq!(h.bytes(), 0);
+        assert_eq!(h.finish(), OutputDigest::from_hash(blake3::hash(b"")));
+    }
+
+    proptest! {
+        #[test]
+        fn chunking_does_not_change_the_digest(
+            data in proptest::collection::vec(any::<u8>(), 0..2048),
+            cut in 0usize..2048,
+        ) {
+            let cut = cut.min(data.len());
+            let mut h = OutputHasher::new();
+            h.update(&data[..cut]);
+            h.update(&data[cut..]);
+            prop_assert_eq!(h.bytes(), data.len() as u64);
+            prop_assert_eq!(h.finish(), OutputDigest::from_hash(blake3::hash(&data)));
+        }
+    }
 }

@@ -466,6 +466,39 @@ pub async fn serve_on(endpoint: Endpoint, config: ServeConfig) -> Result<()> {
 /// Accept one inbound iroh connection, then run the session over its bi-stream.
 async fn handle_connection(incoming: iroh::endpoint::Incoming, config: &ServeConfig) -> Result<()> {
     let conn = incoming.await.context("accepting connection")?;
+    serve_connection(conn, config).await
+}
+
+/// The session ALPN as a router protocol, for a responder whose endpoint is
+/// owned by a [`TopicNode`](crate::topics::TopicNode) (`serve --audit-topic`):
+/// one endpoint per node key, so the session rides the topic node's router
+/// instead of a second bind.
+#[derive(Clone)]
+pub struct SessionProtocol(pub Arc<ServeConfig>);
+
+impl std::fmt::Debug for SessionProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionProtocol")
+            .field("trust_root", &self.0.trust_root.hex())
+            .finish_non_exhaustive()
+    }
+}
+
+impl iroh::protocol::ProtocolHandler for SessionProtocol {
+    /// Serve one session exactly as [`serve_on`]'s accept loop does.
+    async fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+        serve_connection(conn, &self.0).await.map_err(|e| {
+            tracing::warn!("connection rejected or failed: {e:#}");
+            iroh::protocol::AcceptError::from_boxed(e.into())
+        })
+    }
+}
+
+/// Run the session over an accepted connection's bi-stream.
+async fn serve_connection(conn: iroh::endpoint::Connection, config: &ServeConfig) -> Result<()> {
     let caller = to_node_id(&conn.remote_id());
     tracing::info!(caller = %caller.hex(), "connection accepted (iroh-authenticated)");
     let (send, recv) = conn.accept_bi().await.context("accepting bi-stream")?;
@@ -528,11 +561,13 @@ where
         // on the wire before failing, so it need not guess.
         Some(_) => {
             let e = anyhow!("first frame was not a handshake");
+            crate::audit::denied(config.audit.as_ref(), caller, None, &format!("{e:#}")); // audit: denied
             deny(&mut send, format!("{e:#}")).await;
             return Err(e);
         }
         None => {
             let e = anyhow!("connection closed before handshake");
+            crate::audit::denied(config.audit.as_ref(), caller, None, &format!("{e:#}")); // audit: denied
             deny(&mut send, format!("{e:#}")).await;
             return Err(e);
         }
@@ -547,7 +582,9 @@ where
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("credential sources unusable: {e:#}");
-            deny(&mut send, "responder configuration error".to_string()).await;
+            let reason = "responder configuration error".to_string();
+            crate::audit::denied(config.audit.as_ref(), caller, None, &reason); // audit: denied
+            deny(&mut send, reason).await;
             return Err(e.context("loading credential sources"));
         }
     };
@@ -563,6 +600,7 @@ where
     ) {
         Ok(v) => v,
         Err(e) => {
+            crate::audit::denied(config.audit.as_ref(), caller, None, &format!("{e:#}")); // audit: denied
             deny(&mut send, format!("{e:#}")).await;
             return Err(e);
         }
@@ -619,9 +657,19 @@ where
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {program}"))?;
+    // audit: started (single-command mode reports tool "stdio" + the command's args)
+    let audit = crate::audit::CallAudit::start(
+        config.audit.as_ref(),
+        caller,
+        crate::audit::stdio_tool(),
+        args,
+        roster_version,
+    );
     let mut child_stdin = child.stdin.take().context("child stdin")?;
-    let child_stdout = child.stdout.take().context("child stdout")?;
-    let child_stderr = child.stderr.take().context("child stderr")?;
+    let child_stdout =
+        crate::audit::tap_stdout(audit.as_ref(), child.stdout.take().context("child stdout")?);
+    let child_stderr =
+        crate::audit::tap_stderr(audit.as_ref(), child.stderr.take().context("child stderr")?);
 
     // A single writer task serializes all server->client frames.
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
@@ -673,6 +721,9 @@ where
 
     let code = status.code().unwrap_or(-1);
     tracing::info!(code, "child exited; closing session");
+    if let Some(audit) = audit {
+        audit.finish(code); // audit: finished
+    }
     tx.send(Frame::Exit(code)).await.ok();
     drop(tx);
     writer.await.context("writer task")??;

@@ -15,10 +15,12 @@
 //! the credentials, `1` for any local or transport failure.
 
 mod admission;
+mod audit;
 mod call;
 mod ipc;
 mod keystore;
 mod mcp;
+mod render;
 mod replay;
 mod store;
 mod tools;
@@ -349,6 +351,15 @@ struct ServeArgs {
     /// Read the responder's inclusion proof from this file.
     #[arg(long)]
     inclusion_proof_file: Option<PathBuf>,
+    /// Publish a record of every call (started, finished, denied) to this
+    /// topic. The responder hosts the topic node itself — same endpoint, same
+    /// key — so it must be a provisioned member of the channel (membership,
+    /// inclusion proof, roster head and fabric key in the keystore).
+    #[arg(long)]
+    audit_topic: Option<String>,
+    /// A base64 topic ticket to bootstrap the audit topic from (repeatable).
+    #[arg(long = "audit-peer", requires = "audit_topic")]
+    audit_peer: Vec<String>,
     /// The command (program + args) to exec per session, after `--`.
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -586,6 +597,19 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     init_logging();
     let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
     let trust_root = NodeId::from_hex(&a.trust_root)?;
+    // `--audit-topic`: resolve the channel credentials *before* serving, so a
+    // responder that is not a member of its audit channel fails closed here.
+    let audit_ctx = match a.audit_topic.as_deref() {
+        Some(name) => Some(audit_context_in(
+            Arc::new(keystore::Keystore::resolve()?),
+            keystore::home()?,
+            &a,
+            name,
+            node.node_id(),
+            trust_root,
+        )?),
+        None => None,
+    };
     let scope = a.scope.map(Scope::new);
     if scope.is_none() && !a.allow_any_member {
         anyhow::bail!(
@@ -603,9 +627,16 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         a.inclusion_proof.as_deref(),
         a.inclusion_proof_file.as_deref(),
     )?;
+    let (sink, records) = match audit_ctx {
+        Some(_) => {
+            let (sink, rx) = transport::AuditSink::channel(audit::AUDIT_QUEUE);
+            (Some(sink), Some(rx))
+        }
+        None => (None, None),
+    };
     let config = transport::ServeConfig {
         tools: Default::default(),
-        audit: None,
+        audit: sink,
         trust_root,
         scope,
         crl,
@@ -614,7 +645,58 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         proof,
         command: a.command,
     };
-    transport::serve(node, config, a.relay_url.as_deref()).await
+    match (audit_ctx, records) {
+        (Some(ctx), Some(records)) => {
+            tracing::info!(topic = %ctx.name, "serving the session ALPN on the audit topic's node");
+            let hosted = audit::Hosted {
+                session: transport::SessionProtocol(Arc::new(config)),
+                records,
+            };
+            run_tail(&ctx, 0, false, Some(hosted)).await
+        }
+        _ => transport::serve(node, config, a.relay_url.as_deref()).await,
+    }
+}
+
+/// Resolve `serve --audit-topic <name>` into the same [`TopicContext`] `wires
+/// tail` would build, failing (with the `wires import` remedy) when this node
+/// is not a provisioned member of the channel, or when the channel's fabric is
+/// not the one this responder trusts.
+///
+/// The testable form (the `_in` pattern): `serve` passes the resolved keystore
+/// and home.
+fn audit_context_in(
+    ks: Arc<keystore::Keystore>,
+    home: PathBuf,
+    a: &ServeArgs,
+    name: &str,
+    node: NodeId,
+    trust_root: NodeId,
+) -> anyhow::Result<TopicContext> {
+    let args = TopicArgs {
+        topic: name.to_string(),
+        peer: a.audit_peer.clone(),
+        node_seed: a.node_seed.clone(),
+        node_seed_file: a.node_seed_file.clone(),
+        relay_url: a.relay_url.clone(),
+        membership: a.membership.clone(),
+        membership_file: a.membership_file.clone(),
+        inclusion_proof: a.inclusion_proof.clone(),
+        inclusion_proof_file: a.inclusion_proof_file.clone(),
+    };
+    let ctx = TopicContext::resolve(ks, home, &args)
+        .context("--audit-topic needs this responder to be a member of the channel")?;
+    if ctx.node.node_id() != node {
+        anyhow::bail!("--audit-topic resolved a different node key than the one serving");
+    }
+    if ctx.fabric_root != trust_root {
+        anyhow::bail!(
+            "--audit-topic: this node's membership is in fabric {}, but --trust-root is {}",
+            ctx.fabric_root.hex(),
+            trust_root.hex()
+        );
+    }
+    Ok(ctx)
 }
 
 /// Local consistency checks run before dialing: the ticket's grant and the
@@ -1519,8 +1601,13 @@ struct JsonLine {
     sender: String,
     /// The message's sequence in that sender's chain.
     seq: u64,
-    /// The decrypted UTF-8 text (lossy for non-UTF-8 payloads).
-    text: String,
+    /// The decrypted UTF-8 text (lossy for non-UTF-8 payloads). Absent when
+    /// the text is a [`ChannelRecord`](library::ChannelRecord).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    /// The parsed record, when the text is one (see [`render`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record: Option<library::ChannelRecord>,
 }
 
 impl Printer {
@@ -1547,18 +1634,28 @@ impl Printer {
 
     /// The exact text of one output line (the testable half of
     /// [`emit`](Self::emit)).
+    ///
+    /// A message whose text is a [`ChannelRecord`](library::ChannelRecord)
+    /// renders through [`render::record_line`] (or, with `--json`, as the
+    /// parsed `record` object instead of `text`).
     fn render(&self, envelope: &TopicEnvelope, text: &str) -> String {
+        let record = library::ChannelRecord::parse(text);
         if self.json {
             let line = JsonLine {
                 ts: envelope.timestamp,
                 sender: envelope.sender.hex(),
                 seq: envelope.seq.0,
-                text: text.to_string(),
+                text: record.is_none().then(|| text.to_string()),
+                record,
             };
             serde_json::to_string(&line).unwrap_or_else(|e| format!("{{\"err\":\"{e}\"}}"))
         } else {
+            let body = match &record {
+                Some(record) => render::record_line(record),
+                None => text.to_string(),
+            };
             format!(
-                "{} {} {text}",
+                "{} {} {body}",
                 format_clock(envelope.timestamp),
                 short_id(envelope.sender)
             )
@@ -1741,7 +1838,7 @@ async fn tail_cmd(a: TailArgs) -> anyhow::Result<()> {
     let ks = Arc::new(keystore::Keystore::resolve()?);
     let home = keystore::home()?;
     let ctx = TopicContext::resolve(ks, home, &a.common)?;
-    run_tail(&ctx, a.backfill, a.json).await
+    run_tail(&ctx, a.backfill, a.json, None).await
 }
 
 /// The resident node: store, backfill, mesh, control socket, catch-up, live
@@ -1750,7 +1847,16 @@ async fn tail_cmd(a: TailArgs) -> anyhow::Result<()> {
 /// Returns `Ok(())` on `SIGINT`/`SIGTERM`, having closed the mesh and unlinked
 /// the control socket. Every failure that is a *refusal* carries a
 /// [`Denied`](crate::transport::Denied) so `main` can exit 77.
-async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Result<()> {
+///
+/// `hosted` is `serve --audit-topic`'s addition: the session ALPN rides this
+/// node's router, and call records enter the loop through the same publish
+/// queue as the control socket's requests (see [`audit`]).
+async fn run_tail(
+    ctx: &TopicContext,
+    backfill: usize,
+    json: bool,
+    hosted: Option<audit::Hosted>,
+) -> anyhow::Result<()> {
     let printer = Printer { json };
     let mut keyring = Keyring::load(Arc::clone(&ctx.keystore))?;
     let store = Arc::new(open_topic_store(&ctx.home, ctx.topic, STORE_LOCK_WAIT).await?);
@@ -1772,7 +1878,15 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
     }
 
     // 3. The node, then the banner (it needs the bound sockets).
-    let node = topics::TopicNode::spawn(&ctx.node, ctx.node_config(Arc::clone(&store))).await?;
+    let mut cfg = ctx.node_config(Arc::clone(&store));
+    let (records, session) = match hosted {
+        Some(h) => (Some(h.records), Some(h.session)),
+        None => (None, None),
+    };
+    if let Some(session) = session {
+        cfg.protocols.push((transport::ALPN, session.into()));
+    }
+    let node = topics::TopicNode::spawn(&ctx.node, cfg).await?;
     let socket_path = ctx.socket_path();
     tail_banner(&node, ctx, &socket_path);
 
@@ -1783,6 +1897,7 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
     //    killing whichever lost. Bound first and the publish simply queues.
     let socket = ipc::ControlSocket::bind(&socket_path).await?;
     let (tx, mut requests) = tokio::sync::mpsc::channel(CONTROL_QUEUE);
+    let forwarder = records.map(|rx| tokio::spawn(audit::forward(rx, tx.clone())));
     let server = socket.spawn(tx);
 
     // 5. The mesh — which is where a revoked node finds out (exit 77).
@@ -2007,6 +2122,9 @@ async fn run_tail(ctx: &TopicContext, backfill: usize, json: bool) -> anyhow::Re
 
     eprintln!("wires tail: shutting down");
     server.abort();
+    if let Some(forwarder) = forwarder {
+        forwarder.abort();
+    }
     node.shutdown().await?;
     Ok(())
 }
@@ -3889,8 +4007,159 @@ mod tests {
         assert_eq!(value["sender"], member.node.node_id().hex());
         assert_eq!(value["seq"], 0);
         assert_eq!(value["text"], "ship it");
+        assert!(
+            value.get("record").is_none(),
+            "plain text carries no record"
+        );
         // One line, so NDJSON stays NDJSON.
         assert!(!line.contains('\n'));
+    }
+
+    /// `wires serve --audit-topic ops …` for `member`, parsed from the CLI.
+    fn audit_serve_args(member: &Member) -> ServeArgs {
+        let cli = Cli::try_parse_from([
+            "wires",
+            "serve",
+            "--trust-root",
+            &member.root.node_id().hex(),
+            "--allow-any-member",
+            "--node-seed",
+            &member.node.seed_hex(),
+            "--audit-topic",
+            "ops",
+            "--audit-peer",
+            "t1",
+            "--",
+            "cat",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Serve(a) => a,
+            _ => panic!("expected serve"),
+        }
+    }
+
+    /// Run the serve-side audit preflight against `member`'s keystore.
+    fn audit_preflight(member: &Member, a: &ServeArgs) -> anyhow::Result<TopicContext> {
+        audit_context_in(
+            Arc::clone(&member.ks),
+            member.home.clone(),
+            a,
+            "ops",
+            member.node.node_id(),
+            member.root.node_id(),
+        )
+    }
+
+    #[test]
+    fn serve_parses_the_audit_flags() {
+        let member = provisioned([2u8; 32]);
+        let a = audit_serve_args(&member);
+        assert_eq!(a.audit_topic.as_deref(), Some("ops"));
+        assert_eq!(a.audit_peer, vec!["t1".to_string()]);
+        // `--audit-peer` means nothing without a topic.
+        assert!(
+            Cli::try_parse_from([
+                "wires",
+                "serve",
+                "--trust-root",
+                "ab",
+                "--audit-peer",
+                "t",
+                "--",
+                "cat"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn audit_topic_preflight_accepts_a_provisioned_member() {
+        let member = provisioned([2u8; 32]);
+        let mut a = audit_serve_args(&member);
+        a.audit_peer.clear();
+        let ctx = audit_preflight(&member, &a).unwrap();
+        assert_eq!(ctx.topic, TopicId::derive(member.root.node_id(), "ops"));
+    }
+
+    #[test]
+    fn audit_topic_refuses_to_start_without_a_fabric_key() {
+        let member = provisioned([2u8; 32]);
+        std::fs::remove_dir_all(member.ks.keyring_dir()).unwrap();
+        let mut a = audit_serve_args(&member);
+        a.audit_peer.clear();
+        let e = format!("{:#}", audit_preflight(&member, &a).unwrap_err());
+        assert!(e.contains("--audit-topic"), "{e}");
+        assert!(e.contains("wires import --fabric-key-file"), "{e}");
+    }
+
+    #[test]
+    fn audit_topic_refuses_to_start_without_an_inclusion_proof() {
+        let member = provisioned([2u8; 32]);
+        std::fs::remove_file(member.ks.path("inclusion-proof.json")).unwrap();
+        let mut a = audit_serve_args(&member);
+        a.audit_peer.clear();
+        let e = format!("{:#}", audit_preflight(&member, &a).unwrap_err());
+        assert!(e.contains("wires import --inclusion-proof-file"), "{e}");
+    }
+
+    #[test]
+    fn audit_topic_refuses_a_channel_in_another_fabric() {
+        let member = provisioned([2u8; 32]);
+        let mut a = audit_serve_args(&member);
+        a.audit_peer.clear();
+        let e = audit_context_in(
+            Arc::clone(&member.ks),
+            member.home.clone(),
+            &a,
+            "ops",
+            member.node.node_id(),
+            NodeIdentity::from_seed([77u8; 32]).node_id(),
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("--trust-root"), "{e:#}");
+    }
+
+    #[test]
+    fn a_record_renders_as_its_record_line_and_json_object() {
+        let member = provisioned([2u8; 32]);
+        let ctx = member.resolve(&member.args()).unwrap();
+        let store = member.store();
+        let record = library::ChannelRecord::Audit(library::AuditRecord::Denied {
+            caller: member.node.node_id(),
+            tool: None,
+            reason: "roster inclusion rejected: revoked".into(),
+            at_ms: 0,
+        });
+        let text = record.to_text().unwrap();
+        let envelope = append_local(
+            &store,
+            &member.node,
+            ctx.topic,
+            member.version,
+            &member.key,
+            &text,
+            3_725,
+        )
+        .unwrap();
+        let short = &member.node.node_id().hex()[..8];
+
+        assert_eq!(
+            Printer { json: false }.render(&envelope, &text),
+            format!(
+                "01:02:05 {short} ✗ {}… denied: roster inclusion rejected: revoked",
+                &short[..4]
+            )
+        );
+        let line = Printer { json: true }.render(&envelope, &text);
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(value.get("text").is_none(), "a record replaces the text");
+        assert_eq!(value["record"]["type"], "audit");
+        assert_eq!(value["record"]["kind"], "denied");
+        assert_eq!(
+            serde_json::from_value::<library::ChannelRecord>(value["record"].clone()).unwrap(),
+            record
+        );
     }
 
     #[test]
