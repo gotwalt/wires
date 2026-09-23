@@ -43,7 +43,7 @@ honest line from someone who runs remote MCP servers behind Tailscale today.
 | [05](review/05-idp-policy.md) | F | 01, 02, 04 | `serve --require-idp`: gate on verified claims; principal in audit records |
 | [06](done/06-cleanup-and-pitch.md) | D | — | Cut noise, README rewritten around the one idea, restart.md reconciled |
 | [07](done/07-demo-local.md) | E | 01–05 | Self-asserting loopback demo script (the gate for the two-machine run) |
-| [08](backlog/08-demo-two-machine.md) | E | 07 | Real run: laptop ↔ workbench over relay, Claude Code as the agent, recording |
+| [08](doing/08-demo-two-machine.md) | E | 07 | Real run: laptop ↔ workbench over relay, Claude Code as the agent, recording |
 | [10](review/10-live-run-fixes.md) | G | 01–04 | Live-run fixes: stdin in call records, quiet stderr, short control-socket path |
 | [11](backlog/11-camera-blockers.md) | H | 04, 05, 07 | Camera blockers: 20 s audit stall after login, Safari callback error, `tools add --topic-ticket` |
 | [09](backlog/09-witness.md) | stretch | 02 | Key-less witness: stores and verifies call records without decrypting them |
