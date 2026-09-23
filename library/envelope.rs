@@ -594,6 +594,29 @@ mod tests {
         proptest::collection::vec(any::<u8>(), 0..256)
     }
 
+    /// Two payloads that always differ, each at least 16 bytes long.
+    ///
+    /// The keystream test compares ciphertext XOR against plaintext XOR over
+    /// the shared prefix; with a 1-byte prefix two independent keystreams
+    /// agree by chance 1 time in 256. Sixteen bytes makes that 2^-128. `b` is
+    /// `a` with one byte flipped at `at` and a random tail, so the pair never
+    /// needs `prop_assume!` to be distinct.
+    fn distinct_payloads() -> impl Strategy<Value = (Vec<u8>, Vec<u8>)> {
+        (
+            proptest::collection::vec(any::<u8>(), 16..256),
+            any::<proptest::sample::Index>(),
+            1u8..=255,
+            proptest::collection::vec(any::<u8>(), 0..64),
+        )
+            .prop_map(|(a, at, flip, tail)| {
+                let mut b = a.clone();
+                let i = at.index(b.len());
+                b[i] ^= flip;
+                b.extend(tail);
+                (a, b)
+            })
+    }
+
     /// The synthetic IV an envelope *should* carry, recomputed from the outside
     /// the way [`TopicEnvelope::open`] does.
     fn expected_nonce(env: &TopicEnvelope, key: &FabricKey, plaintext: &[u8]) -> MessageNonce {
@@ -887,10 +910,9 @@ mod tests {
         #[test]
         fn republishing_a_slot_with_different_content_never_reuses_the_keystream(
             p in parts(),
-            a in payload(),
-            b in payload(),
+            (a, b) in distinct_payloads(),
         ) {
-            prop_assume!(a != b);
+            prop_assert_ne!(&a, &b);
             // Byte-for-byte the same slot: same topic, sender, seq, prev_hash,
             // key_version, key — and the same timestamp, so not even the clock
             // is doing the work here.
