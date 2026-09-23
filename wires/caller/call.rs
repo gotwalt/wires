@@ -257,12 +257,14 @@ pub struct CredArgs {
     pub relay_url: Option<String>,
 }
 
-/// `wires call [--jq F] [--head N] [--max-bytes N] <tool> [-- args…]`.
+/// `wires call <tool> [--jq F] [--head N] [--max-bytes N] [-- args…]`.
 #[derive(Args)]
 pub struct CallArgs {
     #[command(flatten)]
     pub creds: CredArgs,
-    /// Local output shaping (no shell needed); goes before the tool name.
+    /// Local output shaping (no shell needed). Goes before `--`, after the
+    /// tool name (so a permission rule scoped to the tool, e.g.
+    /// `Bash(wires call gh:*)`, still matches) or before it.
     #[command(flatten)]
     pub shape: ShapeArgs,
     /// The tool's local name in `tools.json`.
@@ -499,8 +501,20 @@ mod tests {
         assert_eq!(a.shape.jq.as_deref(), Some(".[].name"));
         assert_eq!((a.shape.head, a.shape.max_bytes), (Some(3), Some(100)));
         assert_eq!(a.args, ["api", "x"]);
-        // After `--`, `--jq` is the remote command's own flag (gh's).
+        // Right after the tool name, before `--`, they are still ours — so a
+        // permission rule scoped to one tool (`Bash(wires call gh:*)`) still
+        // matches a shaped call.
+        let a = parse(&["gh", "--jq", ".[].name", "--head", "3", "--", "api", "x"]);
+        assert_eq!(a.tool, "gh");
+        assert_eq!(a.shape.jq.as_deref(), Some(".[].name"));
+        assert_eq!(a.shape.head, Some(3));
+        assert_eq!(a.args, ["api", "x"]);
+        // After `--`, or once the tool's own arguments have begun, `--jq` is
+        // the remote command's flag (gh's).
         let a = parse(&["gh", "--", "api", "x", "--jq", ".name"]);
+        assert_eq!(a.shape, ShapeArgs::default());
+        assert_eq!(a.args, ["api", "x", "--jq", ".name"]);
+        let a = parse(&["gh", "api", "x", "--jq", ".name"]);
         assert_eq!(a.shape, ShapeArgs::default());
         assert_eq!(a.args, ["api", "x", "--jq", ".name"]);
     }
