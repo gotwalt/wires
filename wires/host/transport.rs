@@ -38,7 +38,7 @@ use std::collections::BTreeMap;
 
 use library::{
     Chunk, Crl, Frame, Grant, InclusionProof, Invocation, Membership, NodeId, NodeIdentity,
-    RosterHead, Scope, ToolName, check_accept, check_inclusion, check_roster_inclusion,
+    RosterHead, Scope, ToolName, check_accept, check_inclusion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
@@ -976,9 +976,19 @@ fn roster_gate(
     let Some(head) = head else {
         return Ok(None);
     };
-    let proof = proof.ok_or(library::Error::InclusionProofRequired)?;
-    check_roster_inclusion(head, proof, config.trust_root, caller, now)
-        .map_err(|e| anyhow!("roster inclusion rejected: {e}"))?;
+    // Card 14: a caller that missed the admin's re-key still presents last
+    // commit's proof; the directory that re-key left beside the head has its
+    // current one (and nobody the commit removed).
+    let directory = crate::channel::rekey::directory_for(&config.head);
+    library::check_roster_inclusion_via(
+        head,
+        proof,
+        directory.as_ref(),
+        config.trust_root,
+        caller,
+        now,
+    )
+    .map_err(|e| anyhow!("roster inclusion rejected: {e}"))?;
     Ok(Some(head.version.0))
 }
 

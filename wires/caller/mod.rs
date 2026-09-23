@@ -11,12 +11,14 @@
 //! - [`login`] — OIDC sign-in, nonce-bound to this node's key.
 //! - [`jwks`] — issuer discovery and key fetching for ID-token verification.
 //! - `mock_idp` — a hermetic OIDC issuer (tests and the dev build only).
+//! - [`join`] — `wires id` and `wires join <token>` (card 14; every role
+//!   joins this way, the host and the observer included).
 //!
-//! Where what comes next lands: `wires join` (card 14), and resolving a tool
-//! by name from the hosts' announcements on the channel in `resolve.rs`
-//! (card 15).
+//! Where what comes next lands: resolving a tool by name from the hosts'
+//! announcements on the channel in `resolve.rs` (card 15).
 
 pub mod call;
+pub mod join;
 pub mod jwks;
 pub mod login;
 pub mod mcp;

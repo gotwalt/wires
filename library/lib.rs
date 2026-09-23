@@ -36,6 +36,10 @@
 //! - [`topic`] — the derived [`TopicId`] and the unsigned [`TopicTicket`].
 //! - [`fabric_key`] — the [`FabricKey`] minted per roster commit and its
 //!   root-signed, member-sealed [`SealedFabricKey`].
+//! - [`rekey`] — a commit's head plus every member's proof and sealed key as
+//!   one self-verifying [`Rekey`] record, and the [`ProofDirectory`] a
+//!   verifier keeps from it.
+//! - [`invite`] — the [`Invite`] token `wires join` installs.
 //! - [`envelope`] — the signed, encrypted, hash-linked [`TopicEnvelope`].
 //! - [`chain`] — [`classify_link`], the per-publisher chain truth table.
 //! - [`admission`] — the [`AdmitFrame`] codec and [`check_topic_admission`],
@@ -151,10 +155,14 @@ pub mod fabric_key;
 pub mod grant;
 #[path = "membership/identity.rs"]
 pub mod identity;
+#[path = "membership/invite.rs"]
+pub mod invite;
 #[path = "membership/membership.rs"]
 pub mod membership;
 #[path = "membership/policy.rs"]
 pub mod policy;
+#[path = "membership/rekey.rs"]
+pub mod rekey;
 #[path = "membership/roster.rs"]
 pub mod roster;
 #[path = "membership/ticket.rs"]
@@ -192,7 +200,8 @@ mod codec;
 mod idp_vectors;
 
 pub use admission::{
-    Admission, AdmitFrame, MAX_ADMIT_FRAME, TOPIC_ADMIT_ALPN, adopt_if_newer, check_topic_admission,
+    Admission, AdmitFrame, MAX_ADMIT_FRAME, TOPIC_ADMIT_ALPN, adopt_if_newer,
+    check_topic_admission, check_topic_admission_via,
 };
 pub use announce::{
     ANNOUNCE_CONTEXT, ANNOUNCE_V1, HostAnnouncement, HostListing, LISTING_PAD, ListedTool,
@@ -213,10 +222,14 @@ pub use idp::{
     Audience, CLOCK_SKEW_SECS, IdToken, IdentityClaim, Issuer, Jwk, Jwks, OIDC_NONCE_CONTEXT,
     OidcNonce, Principal, verify_claim,
 };
+pub use invite::{INVITE_V1, Invite};
 pub use invoke::{Argv, Invocation, MAX_ARGS, MAX_ARGV_BYTES, MAX_TOOL_NAME, ToolName};
 pub use membership::{MEMBERSHIP_V1, Membership};
 pub use policy::{Crl, check_accept, check_inclusion, check_roster_inclusion};
 pub use record::{ChannelRecord, RECORD_V1};
+pub use rekey::{
+    ProofDirectory, REKEY_ENTRIES_PER_RECORD, Rekey, RekeyEntry, check_roster_inclusion_via,
+};
 pub use replay::{MAX_REPLAY_FRAME, ReplayFrame, TOPIC_REPLAY_ALPN};
 pub use roster::{
     InclusionProof, MerkleRoot, MerkleStep, ROSTER_HEAD_V1, Roster, RosterHead, RosterVersion, Side,

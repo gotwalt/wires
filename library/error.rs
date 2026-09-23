@@ -150,6 +150,14 @@ pub enum Error {
     #[error("invalid argv")]
     InvalidArgv,
 
+    /// A [`Rekey`](crate::Rekey) or [`Invite`](crate::Invite) whose parts do
+    /// not belong together: an entry for another roster version, a sealed key
+    /// addressed to someone other than its proof's member, a member listed
+    /// twice, or an empty channel name. Every part may verify on its own; this
+    /// is the check that they describe *one* commit.
+    #[error("inconsistent re-key: {0}")]
+    InconsistentRekey(&'static str),
+
     /// An [`IdentityClaim`](crate::IdentityClaim)'s ID token did not verify.
     /// The inner [`IdTokenError`] names the precise reason, so a renderer or
     /// a policy gate can say *why* ("expired", "wrong nonce") rather than

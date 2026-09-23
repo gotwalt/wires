@@ -476,18 +476,7 @@ impl SealedFabricKey {
     /// [`crate::Error::UnsupportedVersion`], [`crate::Error::InvalidSignature`],
     /// [`crate::Error::SubjectMismatch`], [`crate::Error::SealedKeyOpen`].
     pub fn open(&self, recipient: &NodeIdentity, fabric_root: NodeId) -> Result<FabricKey> {
-        if self.alg != AlgorithmId::Ed25519 {
-            return Err(Error::UnsupportedAlgorithm);
-        }
-        if self.format != SEALED_KEY_V1 {
-            return Err(Error::UnsupportedVersion);
-        }
-        // The credential names its own authority; refuse to check it against
-        // any root but the one it claims (and the one the recipient trusts).
-        if self.fabric != fabric_root {
-            return Err(Error::InvalidSignature);
-        }
-        fabric_root.verify(&self.signing_bytes()?, &self.sig)?;
+        self.verify(fabric_root)?;
         if self.member != recipient.node_id() {
             return Err(Error::SubjectMismatch);
         }
@@ -503,6 +492,37 @@ impl SealedFabricKey {
         let plaintext = open_box(recipient, SEALED_KEY_CONTEXT, &aad, &self.sealed)?;
         let key: [u8; 32] = plaintext.try_into().map_err(|_| Error::SealedKeyOpen)?;
         Ok(FabricKey::from_bytes(key))
+    }
+
+    /// Check that `fabric_root` minted this sealed key: the algorithm, the
+    /// `format` discriminant, the `fabric == fabric_root` pin, and the root
+    /// signature — everything [`open`](Self::open) checks except the
+    /// recipient, so a node can vouch for a key sealed to *someone else* (a
+    /// [`Rekey`](crate::Rekey) carries one per member) without being able to
+    /// read it.
+    ///
+    /// ```
+    /// use library::{FabricKey, NodeIdentity, RosterVersion, SealedFabricKey};
+    /// let root = NodeIdentity::from_seed([1u8; 32]);
+    /// let member = NodeIdentity::from_seed([2u8; 32]).node_id();
+    /// let sealed =
+    ///     SealedFabricKey::seal(&root, member, RosterVersion(1), &FabricKey::generate()).unwrap();
+    /// assert!(sealed.verify(root.node_id()).is_ok());
+    /// assert!(sealed.verify(member).is_err()); // not that fabric's root
+    /// ```
+    pub fn verify(&self, fabric_root: NodeId) -> Result<()> {
+        if self.alg != AlgorithmId::Ed25519 {
+            return Err(Error::UnsupportedAlgorithm);
+        }
+        if self.format != SEALED_KEY_V1 {
+            return Err(Error::UnsupportedVersion);
+        }
+        // The credential names its own authority; refuse to check it against
+        // any root but the one it claims (and the one the recipient trusts).
+        if self.fabric != fabric_root {
+            return Err(Error::InvalidSignature);
+        }
+        fabric_root.verify(&self.signing_bytes()?, &self.sig)
     }
 
     /// The exact canonical bytes covered by [`sig`](Self::sig) — every field
