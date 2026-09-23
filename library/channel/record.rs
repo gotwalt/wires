@@ -2,7 +2,8 @@
 //!
 //! A topic message is UTF-8 text (spec §4.1). Most of it is conversation;
 //! some of it is machine-written metadata — call logs from responders
-//! ([`AuditRecord`]) and IdP identity claims ([`IdentityClaim`]). A
+//! ([`AuditRecord`]), IdP identity claims ([`IdentityClaim`]) and the admin's
+//! re-keys ([`Rekey`](crate::Rekey)). A
 //! [`ChannelRecord`] is that metadata, encoded as a single JSON object tagged
 //! with [`RECORD_V1`] so a reader can tell it from a chat line that merely
 //! happens to be JSON:
@@ -33,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::audit::AuditRecord;
 use crate::error::{Error, Result};
 use crate::idp::IdentityClaim;
+use crate::rekey::Rekey;
 
 /// The `wires` tag value that marks a message as a [`ChannelRecord`].
 pub const RECORD_V1: &str = "record/v1";
@@ -45,6 +47,10 @@ pub enum ChannelRecord {
     Audit(AuditRecord),
     /// A node's IdP identity claim.
     Identity(IdentityClaim),
+    /// A roster commit's credentials for its members, published by the
+    /// admin so members adopt the new head, proof and fabric key without a
+    /// manual import. Self-verifying: see [`crate::rekey`].
+    Rekey(Rekey),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -108,7 +114,27 @@ mod tests {
                 node,
                 id_token: IdToken::new("a.b.c"),
             }),
+            ChannelRecord::Rekey(rekey_sample()),
         ]
+    }
+
+    /// A one-member commit as a re-key record.
+    fn rekey_sample() -> Rekey {
+        use crate::fabric_key::{FabricKey, SealedFabricKey};
+        use crate::rekey::RekeyEntry;
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let member = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let mut roster = crate::roster::Roster::new(root.node_id());
+        roster.insert(member);
+        let (head, proofs) = roster.commit(&root, 0, i64::MAX).unwrap();
+        let key = SealedFabricKey::seal(&root, member, head.version, &FabricKey::generate()).unwrap();
+        Rekey::new(
+            head,
+            vec![RekeyEntry {
+                proof: proofs[0].1.clone(),
+                key,
+            }],
+        )
     }
 
     #[test]
