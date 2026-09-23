@@ -1,0 +1,5 @@
+# Sign macOS test and `cargo run` binaries with a stable identity before they
+# run, so the firewall / Local Network approvals survive rebuilds
+# (.scripts/macos-sign.sh; WIRES_SIGN_ID=- to skip). No effect off macOS.
+[target.'cfg(target_os = "macos")']
+runner = [".scripts/macos-sign.sh", "--run"]
