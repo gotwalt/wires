@@ -40,7 +40,7 @@ honest line from someone who runs remote MCP servers behind Tailscale today.
 | [02](done/02-audit-channel.md) | B | 00 | `serve --audit-topic`: responder hosts the topic node, publishes call records; `tail` renders them |
 | [03](done/03-client-call-and-mcp.md) | C | 00 | `wires call` + `wires mcp` (stdio MCP server) over `tools.json` |
 | [04](review/04-idp-login.md) | F | 00 | `wires login` (Google OIDC, nonce-bound), claim published on channel, independent verification |
-| [05](backlog/05-idp-policy.md) | F | 01, 02, 04 | `serve --require-idp`: gate on verified claims; principal in audit records |
+| [05](review/05-idp-policy.md) | F | 01, 02, 04 | `serve --require-idp`: gate on verified claims; principal in audit records |
 | [06](done/06-cleanup-and-pitch.md) | D | — | Cut noise, README rewritten around the one idea, restart.md reconciled |
 | [07](backlog/07-demo-local.md) | E | 01–05 | Self-asserting loopback demo script (the gate for the two-machine run) |
 | [08](backlog/08-demo-two-machine.md) | E | 07 | Real run: laptop ↔ workbench over relay, Claude Code as the agent, recording |

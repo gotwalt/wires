@@ -50,7 +50,8 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use library::{
-    Argv, AuditRecord, CallId, ChannelRecord, NodeId, OutputHasher, StdinCapture, ToolName,
+    Argv, AuditRecord, CallId, ChannelRecord, NodeId, OutputHasher, Principal, StdinCapture,
+    ToolName,
 };
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
@@ -122,12 +123,17 @@ impl CallAudit {
     /// handle that will emit its `Finished`. `None` — and nothing emitted —
     /// when the responder has no audit sink.
     ///
+    /// `principal` is the caller's fresh verified IdP identity, when the
+    /// responder's identity index holds one (see [`crate::identity`]) — so
+    /// the record names the person, not only the key.
+    ///
     /// `args` are the call's arguments as the record should show them; an
     /// argument list too large for an [`Argv`] is logged and recorded empty
     /// rather than failing a call that is already running.
     pub fn start(
         sink: Option<&AuditSink>,
         caller: NodeId,
+        principal: Option<Principal>,
         tool: ToolName,
         args: &[String],
         roster_version: Option<u64>,
@@ -141,7 +147,7 @@ impl CallAudit {
         sink.record(AuditRecord::Started {
             call,
             caller,
-            principal: None,
+            principal,
             tool,
             argv,
             roster_version,
@@ -286,6 +292,9 @@ pub struct Hosted {
     pub session: transport::SessionProtocol,
     /// The receiving end of the [`ServeConfig::audit`](crate::transport::ServeConfig::audit) sink.
     pub records: mpsc::Receiver<AuditRecord>,
+    /// The identity index the session protocol's gate reads; the tail loop
+    /// feeds it every identity claim on the topic.
+    pub identities: Arc<crate::identity::Identities>,
 }
 
 #[cfg(test)]
@@ -296,6 +305,17 @@ mod tests {
 
     fn caller() -> NodeId {
         NodeIdentity::from_seed([5u8; 32]).node_id()
+    }
+
+    fn alice() -> Principal {
+        Principal {
+            issuer: "https://idp.example".into(),
+            subject: "1".into(),
+            email: Some("alice@example.com".into()),
+            org: None,
+            groups: vec![],
+            not_after: 0,
+        }
     }
 
     fn samples() -> Vec<AuditRecord> {
@@ -378,7 +398,7 @@ mod tests {
 
     #[test]
     fn no_sink_means_no_records_and_no_handle() {
-        assert!(CallAudit::start(None, caller(), stdio_tool(), &[], None).is_none());
+        assert!(CallAudit::start(None, caller(), None, stdio_tool(), &[], None).is_none());
         denied(None, caller(), None, "whatever"); // must not panic
     }
 
@@ -403,6 +423,7 @@ mod tests {
         let audit = CallAudit::start(
             Some(&sink),
             caller(),
+            Some(alice()),
             stdio_tool(),
             &["a b".to_string()],
             Some(7),
@@ -421,6 +442,7 @@ mod tests {
         let Ok(AuditRecord::Started {
             call: started,
             caller: c,
+            principal,
             tool,
             argv,
             roster_version,
@@ -430,6 +452,7 @@ mod tests {
             panic!("expected Started first");
         };
         assert_eq!(c, caller());
+        assert_eq!(principal, Some(alice()), "the record names the person");
         assert_eq!(tool.as_str(), "stdio");
         assert_eq!(argv.as_slice(), ["a b"]);
         assert_eq!(roster_version, Some(7));

@@ -4,17 +4,13 @@
 //! module turns the verdict into the one line a `wires tail` prints, and holds
 //! the reader's trust settings ([`IdpTrust`]).
 //!
-//! The integrator hooks [`describe_identity`] into `render.rs` (lane B) for
-//! `ChannelRecord::Identity`, in place of the "unverified" placeholder there;
-//! [`render_identity`] is the async wrapper that fetches keys first.
-
-// Unused by the shipped binary until the integrator wires it into render.rs;
-// remove this once `wires tail` calls `render_identity`.
-#![cfg_attr(not(test), allow(dead_code))]
+//! `render.rs` calls [`describe_identity`] for every `ChannelRecord::Identity`
+//! a tail prints, with the verdict [`crate::identity::Identities`] reached;
+//! [`render_identity`] is the standalone async wrapper that fetches keys first.
 
 use library::{Audience, IdentityClaim, Issuer, Principal};
 
-use crate::jwks::{KeyFetcher, VerifyError};
+use crate::jwks::VerifyError;
 
 /// The default issuer: Google, the demo IdP.
 pub(crate) const DEFAULT_ISSUER: &str = "https://accounts.google.com";
@@ -45,6 +41,36 @@ impl IdpTrust {
         )
     }
 
+    /// `--oidc-issuer` / `--oidc-audience` values when given (each may be a
+    /// comma-separated list), else the environment ([`from_env`](Self::from_env)),
+    /// decided separately for issuers and audiences.
+    pub(crate) fn from_flags_or_env(issuers: &[String], audiences: &[String]) -> Self {
+        let env = Self::from_env();
+        let flags = Self::from_vars(Some(&issuers.join(",")), Some(&audiences.join(",")));
+        Self {
+            issuers: if issuers.is_empty() {
+                env.issuers
+            } else {
+                flags.issuers
+            },
+            audiences: if audiences.is_empty() {
+                env.audiences
+            } else {
+                flags.audiences
+            },
+        }
+    }
+
+    /// Also trust each of `more` (keeping order, skipping duplicates).
+    pub(crate) fn trusting(mut self, more: Vec<Issuer>) -> Self {
+        for iss in more {
+            if !self.issuers.contains(&iss) {
+                self.issuers.push(iss);
+            }
+        }
+        self
+    }
+
     /// The testable half of [`from_env`](Self::from_env).
     pub(crate) fn from_vars(issuers: Option<&str>, audiences: Option<&str>) -> Self {
         let split = |s: &str| -> Vec<String> {
@@ -72,8 +98,12 @@ impl IdpTrust {
 }
 
 /// Verify `claim` with `fetcher` and render the line (the async wrapper).
+///
+/// Test-only: the tail verifies through [`crate::identity::Identities`], which
+/// also indexes the verdict, and renders with [`describe_identity`].
+#[cfg(test)]
 pub(crate) async fn render_identity(
-    fetcher: &KeyFetcher,
+    fetcher: &crate::jwks::KeyFetcher,
     trust: &IdpTrust,
     claim: &IdentityClaim,
     now: i64,
@@ -105,18 +135,20 @@ pub(crate) fn describe_identity(
                 .unwrap_or_default();
             format!(
                 "identity {who} is {} (verified by {}{org})",
-                name(p),
+                principal_name(p),
                 p.issuer
             )
         }
-        Err(VerifyError::Expired(p)) => format!("identity {who} is {} (expired)", name(p)),
+        Err(VerifyError::Expired(p)) => {
+            format!("identity {who} is {} (expired)", principal_name(p))
+        }
         Err(e) => format!("identity {who} UNVERIFIED: {e}"),
     }
 }
 
 /// The human name for a principal: the verified email, else `sub` at the
 /// issuer.
-fn name(p: &Principal) -> String {
+pub(crate) fn principal_name(p: &Principal) -> String {
     match &p.email {
         Some(email) => email.clone(),
         None => format!("{} at {}", p.subject, p.issuer),
@@ -194,5 +226,18 @@ mod tests {
         assert!(t.audiences.is_empty());
         // Whatever the test environment holds, there is always an issuer.
         assert!(!IdpTrust::from_env().issuers.is_empty());
+    }
+
+    #[test]
+    fn flags_override_the_environment_and_rules_add_issuers() {
+        let t = IdpTrust::from_flags_or_env(&["https://a,https://b".into()], &["x".into()])
+            .trusting(vec![Issuer::new("https://b"), Issuer::new("https://c")]);
+        assert_eq!(
+            t.issuers,
+            ["https://a", "https://b", "https://c"]
+                .map(Issuer::new)
+                .to_vec()
+        );
+        assert_eq!(t.audiences, vec![Audience::new("x")]);
     }
 }
