@@ -1,5 +1,7 @@
 # Committed Roster (slice 2b) Implementation Plan
 
+> **Archived 2026-09-22.** An executed implementation plan (merged as PR #7). The spec it implemented is [committed-roster.md](../committed-roster.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a root-signed, versioned Merkle commitment to a fabric's member set (the "committed roster"), so a verifier can decide *"is this node a current member"* offline against a 32-byte head, with mutual-inclusion in ticket-less sessions.
@@ -8,7 +10,7 @@
 
 **Tech Stack:** Rust 2024, Bazel-only build/test, `blake3`, `ed25519-dalek`, `serde_json` (canonical JSON), `iroh` 0.98, `tokio`, `proptest`.
 
-**Spec:** `docs/committed-roster.md`. **Vision:** `docs/fabric-vision.md`.
+**Spec:** `docs/committed-roster.md`. **Vision:** `docs/archive/fabric-vision.md`.
 
 ---
 
