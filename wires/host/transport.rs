@@ -2,7 +2,7 @@
 //! stdio bridge.
 //!
 //! `library` stays pure (no iroh/tokio); this module is where the
-//! capability-addressed session meets the iroh QUIC endpoint. The session ALPN
+//! key-addressed session meets the iroh QUIC endpoint. The session ALPN
 //! is [`ALPN`]. A dialer opens a bi-stream and sends a
 //! [`Frame::Handshake`](library::Frame::Handshake) bearing its fabric
 //! [`Membership`](library::Membership) (and roster inclusion proof), followed
@@ -41,7 +41,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-/// The custom ALPN identifying a wires capability session.
+/// The custom ALPN identifying a wires session.
 ///
 /// Bumped to `/2` for the mutual-inclusion handshake (a proof in the dialer's
 /// handshake and a `HandshakeAck` carrying the responder's own membership): a
@@ -978,7 +978,7 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    tracing::info!("dialing the capability over wires");
+    tracing::info!("dialing the responder over wires");
     let conn = match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(target, ALPN)).await {
         Ok(Ok(conn)) => conn,
         // Close on the failure paths too: an endpoint dropped without

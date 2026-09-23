@@ -108,7 +108,7 @@ struct HandshakeAckBody {
     proof: Option<InclusionProof>,
 }
 
-/// One framed message on a capability-scoped session.
+/// One framed message on a session.
 ///
 /// The `Handshake` variant (membership + optional proof) is much larger than the
 /// stdio variants, but it is sent exactly once per session while the small

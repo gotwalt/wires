@@ -61,7 +61,7 @@ Most of the saving is **not** tool descriptions (Claude Code's tool search alrea
 
 - **Joining an organization is still a hand-issued invite.** Joining by domain ("`wires join acmecorp.com`") is an open question, not yet designed.
 - **Removing someone reveals the remaining member list to them**; memberships expire after 30 days and don't renew yet.
-- **Open question:** whether the shared encrypted channel belongs in the core, or whether hosts should emit identity-stamped telemetry (OTel) directly. It turns on whether cross-organization audit or push to offline agents is the product. See [card 22](board/backlog/22-gossip-role-OPEN.md).
+- **Open question:** whether the shared encrypted channel belongs in the core, or whether hosts should emit identity-stamped telemetry (OTel) directly. It turns on whether cross-organization audit or push to offline agents is the product. See [card 22](board/done/22-gossip-role-OPEN.md).
 - **Any member can currently offer a tool under any name.** An admin-approved host list would close this.
 
 ## The next step

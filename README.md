@@ -46,12 +46,13 @@
 
 Four machines (they can be four `WIRES_HOME` directories on one machine):
 **admin**, **workbench** (the host), **laptop** (the caller: your agent), and
-**observer**. Build with `bazel build //wires`, then copy
-`bazel-bin/wires/wires` onto each machine's `PATH`.
+**observer**. Build with `cargo build --release -p wires` (or `docker build
+.`), then put `target/release/wires` on each machine's `PATH`.
 
 The output below is from a real run on the current binary. It used one
 machine with four short `WIRES_HOME`s, and the stand-in IdP that
-`.scripts/demo-remote-cli.sh` uses (`wires_dev dev-mock-idp`) in place of
+`.scripts/demo-remote-cli.sh` uses (`wires dev-mock-idp`, from a build with
+`--features dev-mock-idp`) in place of
 Google, so `login` there also passed `--issuer`/`--no-browser`. Log lines at
 `INFO` are left out. `./.scripts/demo-remote-cli.sh` runs the same sequence
 and asserts every step.
@@ -233,8 +234,7 @@ SQL sent on stdin, the same tool through `wires mcp`, and `.shell id` refused
 by `sqlite3 -safe`:
 
 ```bash
-bazel build //wires //wires:wires_dev
-./.scripts/demo-remote-cli.sh            # narrated, ~1 min; --quiet for assertions only
+./.scripts/demo-remote-cli.sh            # builds with cargo; narrated, ~1 min; --quiet for assertions only
 ```
 
 ## Why it's built this way
@@ -422,11 +422,8 @@ For an MCP-only client, the whole config is:
 
 | Command | What it does |
 |---|---|
-| `advanced keygen` | Generate (or re-derive) a node key and a root key. |
 | `advanced member` | Root-sign a membership for a node. |
 | `advanced roster` | `add`/`remove` members, `commit` a signed head with per-member proofs and sealed channel keys, `head` to print it. |
-| `advanced grant` | Root-sign a `tool:<name>` grant ticket (not consulted by `serve host.json`). |
-| `advanced revoke` | Add a subject to the CRL. |
 | `advanced import` | Install a membership, inclusion proof, roster head or sealed channel key by hand. |
 | `advanced publish <channel> -m <text>` | Put a message on the channel, through a running `watch` or as a one-shot node. |
 
@@ -489,49 +486,44 @@ a container can mount its node key from a secret with `--node-seed-file`.
 
 ## Revocation
 
-`serve` re-reads the roster head and CRL once per connection, so a removal
+`serve` re-reads the roster head once per connection, so a removal
 takes effect on the next call, with no restart. A refused call prints
 `wires: denied by responder: <reason>` on stderr, writes nothing to stdout,
 exits `77`, and appears on the channel. The commit that removes a member
 re-keys everyone else, so the removed member can't read what comes next.
-Design, threat model and latencies: [docs/committed-roster.md](docs/committed-roster.md)
-and [docs/phase2-topics.md](docs/phase2-topics.md).
+The protocol as built: [docs/protocol.md](docs/protocol.md).
 
 ## Reachability
 
 By default a node is found by id through iroh's n0 discovery and relays,
 which needs outbound internet. A host's announcement carries its addresses and
 relay, so a caller that has read it needs no discovery. To avoid n0's relays,
-run the `relay` binary and pass `--relay-url http://relay-host:3340` to
-`serve`, `call`, `watch` and `login` ([docs/deployment.md](docs/deployment.md)).
+run upstream [`iroh-relay`](https://docs.rs/iroh-relay) yourself and pass
+`--relay-url <its url>` to `serve`, `call`, `watch` and `login`
+([docs/deployment.md](docs/deployment.md)).
 Addresses are unsigned hints: iroh still authenticates the peer's key, so a
 wrong address can only fail to connect.
 
 ## Layout, build and test
 
-Three Bazel packages in one Cargo workspace. Build and test only through
-Bazel ([CLAUDE.md](CLAUDE.md)).
+Two crates in one Cargo workspace ([CLAUDE.md](CLAUDE.md)):
 
-- **`//library`**: the transport-free core. `membership/` (identity,
+- **`library/`**: the transport-free core. `membership/` (identity,
   membership, the committed roster, invites, re-keys, the channel key),
   `channel/` (topics, envelopes, chain, admission, replay, records,
   announcements), `calls/` (session frames, invocations, audit records, IdP
-  claims).
-- **`//wires`**: the binary, filed by role: `admin/`, `host/`, `caller/`,
+  claims, pushes).
+- **`wires/`**: the binary, filed by role: `admin/`, `host/`, `caller/`,
   `channel/`, and `e2e/` for the loopback integration tests.
-- **`//relay`**: a self-hosted [`iroh-relay`](https://docs.rs/iroh-relay).
 
 ```bash
-bazel build //...
-bazel test  //...
+cargo build --workspace
+cargo test --workspace                   # unit, property, e2e and doc tests
 ./.scripts/demo-remote-cli.sh --quiet    # the demo, as a test
-./.scripts/soak-topic.sh                 # the channel through a frozen and a killed node
+docker build -t wires .                  # distroless image, native arch
 ```
 
-`//wires:image` and `//relay:image` build distroless OCI images. Deployment
-notes are in [docs/deployment.md](docs/deployment.md), tests in
+`make help` lists the same as shortcuts. Deployment notes are in
+[docs/deployment.md](docs/deployment.md), tests in
 [docs/testing.md](docs/testing.md), and the benchmark in
 [bench/REPORT.md](bench/REPORT.md).
-
-To set up the dev environment, run `make setup` (installs `bazelisk` and
-`direnv`).

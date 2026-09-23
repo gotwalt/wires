@@ -104,7 +104,7 @@ In order of how much it relies on Claude Code's command parser:
    absolute-path binaries like `/bin/cat`, and a bare `cat` would just fail
    with "command not found". Anything left is shell builtins over an empty
    directory, and `wires call` with the operator's configuration. The
-   `//wires:image` distroless image is close to this, minus a shell.
+   `Dockerfile`'s distroless image is close to this, minus a shell.
 3. **Bash rule plus hygiene, when neither is possible.** As in 2, but on a
    normal machine: also an **empty working directory**, since that is all
    the read-only allowance and `<`/glob can reach, and no secrets in files

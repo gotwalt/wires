@@ -34,7 +34,7 @@ nearly the same ($0.011 MCP vs $0.009 CLI).
 | Claude Code | 2.1.280, `--model opus` → `claude-opus-5-5` (the human's configured default) |
 | MCP server | `ghcr.io/github/github-mcp-server` v1.12.2 (commit 85598ba, digest `sha256:508a0857…cac6`), `docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN … stdio --read-only`, default toolsets (context, copilot, issues, pull_requests, repos, users) |
 | gh | 2.101.0 |
-| wires | this branch's `//wires` binary; loopback `wires serve --expose 'gh=gh'`, agent `tools.json` → `gh` by node id + 127.0.0.1 address (`bench/wires-up.sh`) |
+| wires | this branch's `wires` binary; loopback `wires serve --expose 'gh=gh'`, agent `tools.json` → `gh` by node id + 127.0.0.1 address (`bench/wires-up.sh`) |
 | Session | `claude -p --output-format stream-json --verbose --no-session-persistence --strict-mcp-config --setting-sources project --disable-slash-commands --tools=<arm> --allowedTools=<arm>`, fresh session per run, empty cwd, minimal env (HOME/USER/PATH/…) plus `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` |
 | Built-in tools | MCP arms: `--tools=ToolSearch` (+ the MCP server). CLI arms: `--tools=Bash,ToolSearch` |
 | Permissions | MCP: `mcp__github`. wires: `Bash(wires call gh:*)`, gh: `Bash(gh:*)`, and both get `Bash(jq/head/tail/grep/wc/sort:*)`. Arm 5 (wires-only): `Bash(wires call gh:*)` and nothing else |

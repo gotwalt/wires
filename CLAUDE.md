@@ -23,10 +23,9 @@ moves a card to `done/`. Every README or narration sentence must pass the
 rebuttal test in `docs/storytelling.md` §1.
 
 Usage lives in `README.md`. Deployment and testing patterns live in
-`docs/deployment.md` and `docs/testing.md`. Specs for code that runs:
-`docs/committed-roster.md` (membership and revocation) and
-`docs/phase2-topics.md` (the encrypted channels). `docs/restart.md` is
-history: the phase plan, kill criteria, and non-negotiables (§7 still holds).
+`docs/deployment.md` and `docs/testing.md`. The spec for the code that runs
+(roster, handshake, re-keys, channel, records) is `docs/protocol.md`. The
+non-negotiables and kill criteria are at the top of `docs/board/README.md`.
 **Git history is the archive:** outdated docs are deleted, not moved aside.
 The product summary is `docs/executive-summary.md`. The pre-restart prototype is tagged `archive/poc-2026-05`: reference
 it freely, but never merge from it. That includes the old HTTP/OAuth

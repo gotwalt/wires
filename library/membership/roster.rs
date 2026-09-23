@@ -10,10 +10,9 @@
 //! members of the set; an [`InclusionProof`] reveals only its holder's `NodeId`
 //! and `O(log n)` sibling hashes.
 //!
-//! The full member set ([`Roster`]) lives only on the root's machine; this slice
-//! distributes the head and each member's proof by file copy (the sealed
-//! full-set blob and gossip distribution are deferred — see
-//! `docs/committed-roster.md`).
+//! The full member set ([`Roster`]) lives only on the root's machine; the head
+//! and each member's proof reach members in their invite and, after that, in
+//! the re-keys published on the channel (see `docs/protocol.md`).
 
 use std::collections::BTreeSet;
 
