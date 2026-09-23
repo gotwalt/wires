@@ -23,7 +23,7 @@ There are four roles, each with a few commands:
 
 - **Admin** (`init`, `invite`, `remove`, `role`, `service`): signs one versioned document that says who's in, which roles exist (matched on IdP identity), which services exist, which hosts run each one, and who may call and read each. It is pushed to the machines by key.
 - **Host** (`wires serve host.json`): implements the services assigned to it. One file says how each runs, which identity providers it trusts, and any stricter local rule; it checks every call against the signed list.
-- **Caller** (`join`, `login`, `services`, `call`, `inbox`): the agent. `wires login` binds the person's Google/Okta sign-in to the agent's key once. `wires services` shows only the services that person may call; the caller never names a machine, and a service can have several hosts.
+- **Caller** (`join`, `login`, `services`, `call`, `inbox`): the agent. `wires login` binds the person's IdP sign-in (Google in the demo; any OIDC issuer via `--issuer`) to the agent's key once. `wires services` shows only the services that person may call; the caller never names a machine, and a service can have several hosts.
 - **Reader** (`watch`): a member the admin allows to read a service's records sees every call and refusal from the hosts' own logs, holding neither end's credentials. Everyone else sees only their own calls.
 
 `wires mcp` exists only so clients that can't run a command can still use the same services. **The product is the CLI.**
@@ -37,7 +37,7 @@ A laptop and a Linux workstation, reached by key through public relays:
 - A Claude Code session in locked mode, whose PATH held `wires` plus the system basics and which was only allowed to run `wires call` and the tool listing, found the tool, queried a remote database and answered correctly. Each query was logged under the person's email and role.
 - `wires remove` cut the agent off at once, with no restart and no manual key rotation anywhere, and the refusal was on the log.
 
-That run used the earlier design, where hosts published records to a shared encrypted channel. The current one (services in an admin-signed registry, records kept by each host) passes the same self-checking demo on one machine, plus: a service with two hosts that keeps answering when one is down, a reader who sees every call while the agent sees only its own, and a host **pushing** a message back to the agent that called it ("build 41 failed") with no endpoint on the agent's side, read with `wires inbox`. The two-machine run of this version is next.
+That run used the earlier design, where hosts published records to a shared encrypted channel. The current one (services in an admin-signed registry, records kept by each host) passes the same self-checking demo on one machine, plus: a service with two hosts that keeps answering when one is down, a reader who sees every call while the agent sees only its own, and a host **pushing** a message back to the agent that called it ("build 41 failed") with no endpoint on the agent's side, read with `wires inbox`. The two-machine run of this version, and its recording, is in progress ([card 08](board/doing/08-demo-two-machine.md)).
 
 ## What's been measured
 
@@ -48,11 +48,20 @@ GitHub tasks, 5 tasks × 5 runs each, all answers correct in every setup:
 | GitHub's MCP server | 21,088 | $1.87 |
 | `wires call gh`, agent limited to `wires` only | 10,713 | $0.39 |
 
-Most of the saving is **not** tool descriptions (Claude Code's tool search already handles those). It's output size: MCP returns whole API objects (48 KB release notes, 52 KB of comments), while a CLI filters first (`--jq`), so the model sees about 256 bytes. With the agent limited to `wires` alone, there were zero permission refusals. **Caveats:** one model, one MCP server, small n, and stripped-down sessions, so real-session percentages will be smaller while the absolute savings carry over. A leaner MCP server would close part of the gap.
+Most of the saving is **not** tool descriptions (Claude Code's tool search already handles those). It's output size: MCP returns whole API objects (48 KB release notes, 52 KB of comments), while a CLI filters first (`--jq`), so the model sees about 256 bytes. With the agent limited to `wires` alone, there were zero permission refusals. **Caveats:** one model, one MCP server, small n, and stripped-down sessions, so real-session percentages will be smaller while the absolute savings carry over. A leaner MCP server would close part of the gap. Details: [bench/REPORT.md](../bench/REPORT.md).
+
+Waiting on long work (a mock CI build of 60 s or 300 s, 5 runs per setup, all correct):
+
+| How the agent waited | Turns | Input tokens (median) | Reaction after the build finished |
+|---|---|---|---|
+| Polling a status service, or `wires inbox` on a loop | 9 → 13 | about 28k → 39k | 20–178 s |
+| `wires inbox --wait` (the host pushes to the agent's key) | 4 | 15.4k, flat | about 2 s |
+
+Checking an inbox on a loop costs exactly what polling costs; the saving comes only from waiting on the push. Details: [bench/push/REPORT.md](../bench/push/REPORT.md).
 
 ## Why it's built this way
 
-- **Reached by key.** Tailscale-style networks give the agent's machine a route to the host; Wires gives a route to one allowlisted CLI and nothing else.
+- **Reached by key.** Tailscale-style networks give the agent's machine a route to the host; Wires gives a route to the services a signed list lets the caller call, and nothing else.
 - **Identity is the IdP's own signature**, tied to the agent's key and checked by the host. No Wires-run identity service exists to trust.
 - **One signed list, checked locally.** Who's in, the roles and the services are one admin-signed document every machine holds. Hosts decide each call from it with no auth server; callers list what they may call from it. Only the admin can bind a service name to a host.
 - **The host writes the log**, signed and hash-linked, so the agent can't forge it, and a reader the admin names needs nothing from either end. Nothing is broadcast: a record leaves a host only when an allowed reader asks.
@@ -66,4 +75,4 @@ Most of the saving is **not** tool descriptions (Claude Code's tool search alrea
 
 ## The next step
 
-Show the two-machine demo to someone who builds MCP and note which part lands: **verified identity on every call**, **CLI efficiency without a shell**, **push to agents without an endpoint**, or **a log the host can't rewrite**. That answer decides what gets built next.
+Show the two-machine demo to someone who builds MCP and note which part lands: **verified identity on every call**, **CLI efficiency without a shell**, **push to agents without an endpoint**, or **a call record the agent can't forge, kept by the machine that ran the call**. That answer decides what gets built next.

@@ -1,6 +1,6 @@
 # 18 — OPEN QUESTION: the front door (apex key, invites, `wires join <domain>`)
 
-**Status:** parked by the human on 2026-09-23 ("not crystal clear on the apex / invite; let's not solve that tonight"). **Don't build anything from this card until it's discussed.** The demo uses hand-issued invites (card 14).
+**Status:** parked by the human on 2026-09-23 ("not crystal clear on the apex / invite; let's not solve that tonight"). **Don't build anything from this card until it's discussed.** The demo uses hand-issued invites (`wires invite` / `wires join`).
 
 ## The question
 
@@ -15,4 +15,4 @@ it know it's the *real* lobby? The target UX floated: `wires join acmecorp.com`.
 
 ## Related, and separately decided
 
-- Tools should be visible **only to callers who can use them** (the human, 2026-09-23). Planned under card 15 as announcements sealed to allowed members; the host still enforces on every call.
+- Services should be visible **only to callers who can use them** (the human, 2026-09-23). Done by card 27: `wires services` evaluates the admin-signed state locally and lists only what the caller's verified identity may call; the host still enforces on every call.

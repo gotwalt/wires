@@ -1,25 +1,32 @@
-# 09 — Stretch: key-less witness
+# 09 — Stretch: witness for the host-held call log
 
-**Lane:** stretch · **Depends on:** 02
+**Lane:** stretch · **Depends on:** 26
 
 ## Goal
 
-"Observable at the infra layer" taken literally: a node that stores, orders, and
-verifies call records (signature + per-publisher hash chain) **without** holding
-the channel key — so an infra team can prove "the log is complete and
-untampered" without being able to read argv or identities.
+Close the known limit in [protocol.md](../../protocol.md) §8: a host can
+withhold or truncate its own call log, and a rewrite is detectable only
+against a copy someone holds. A witness is a member that holds that copy, so
+an infra team can show "the log is complete and untampered" from something
+other than the host.
+
+*Rewritten 2026-09-23 after card 27 deleted the channel; the original sketch
+(a key-less node on the gossip topic) is in git history.*
 
 ## Sketch
 
-- Envelopes are already signed over ciphertext and hash-linked (`library/envelope.rs`,
-  `library/chain.rs`), and ingest stores before it can decrypt (`KeyVersionUnknown`).
-- A `wires witness <topic>` mode: admitted to gossip + replay (roster member) but never
-  imports a fabric key; exports a signed checkpoint `(publisher, seq, hash)` per publisher.
-- Open question for the human: should witnesses be a roster *role* (admitted without a
-  sealed key), which touches `roster commit`?
+- Entries are already signed by the host and hash-linked (`LogEntry`,
+  `verify_chain`), and `wires watch` keeps a per-host mark and alarms on a
+  tampered, missing or forked entry.
+- A witness is a reader (a service's `readers` role) that follows the record
+  stream continuously and exports a signed checkpoint `(host, seq, hash)`
+  per host, so a later truncation or rewrite contradicts a checkpoint someone
+  else holds.
+- Open question for the human: should a witness see argv and identities (a
+  plain reader does), or only hashes, which needs a redacted stream?
 
 ## Acceptance
 
-- [ ] Witness detects a dropped or forked record from a responder and says which.
+- [ ] The witness detects a dropped, truncated or forked entry from a host and says which.
 
 ## Notes

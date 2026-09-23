@@ -101,7 +101,7 @@ registry locally has to hold the set anyway.
 as a member. `wires join` stores the membership, adopts the state (never rolling back a newer
 one), and records `admin` in `state-admin.txt` as a place to pull from. The token is not secret.
 It works as **trust on first use**, because the token introduces the root; what vouches for the
-admin is the out-of-band channel the token travels over (see
+admin is whatever carried the token out of band (see
 [card 18](board/backlog/18-front-door-OPEN.md)).
 
 ## 4. Moving the state: `wires/state/1`
@@ -114,10 +114,10 @@ Frames are length-prefixed canonical JSON tagged by `type`, at most 4 MiB
   (concurrently), then the rest, and sends `offer`. The receiver's answer is `have` with the version
   it now holds; a member counts as delivered when that is at least the offered version. Stderr says
   `state version N: pushed to K member(s)`, naming any not reachable.
-- **Pull.** A cold command (`call`, `tools`, `mcp`, `inbox`) whose copy was last checked more than
-  10 minutes ago (`state-checked.txt`) sends `have` to every host in its copy, then the admin, for at
+- **Pull.** A cold command (`call`, `mcp`, `inbox`, and the hidden `tools` alias) whose copy was
+  last checked more than 10 minutes ago (`state-checked.txt`) sends `have` to every host in its copy, then the admin, for at
   most 8 s; the first newer verified `offer` is adopted. A running `serve` does the same every 10
-  minutes.
+  minutes. `wires services` never pulls: it reads the local copy only.
 - **Handshake.** A host whose state is newer than the version in a caller's `Hello` hands it back in
   `HelloAck.newer_state` (§5); the caller adopts it.
 - **The responder** (`StateResponder`, on every `serve`): to an `offer`, it requires the dialer to

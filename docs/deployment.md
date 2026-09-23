@@ -25,7 +25,7 @@ image. The `Dockerfile` builds on whatever architecture the Docker host is
 
 The image holds only `wires`. A **host** image must also contain the binaries
 its `host.json` execs (`sqlite3`, `gh`, …): build your own image from the
-`Dockerfile`'s `build` stage output (`/usr/local/bin/wires`) plus your tools.
+`Dockerfile`'s `build` stage output (`/usr/local/bin/wires`) plus those binaries.
 
 ## Running a host
 

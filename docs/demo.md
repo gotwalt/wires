@@ -7,14 +7,59 @@ it's red, don't record.*
 
 Every sentence of narration has to survive one honest line from someone who
 runs remote MCP servers behind Tailscale today ([storytelling.md](storytelling.md) §1).
-The answers to the rebuttals we expect are [at the end](#rebuttals-one-line-each).
+The one-line answers to the rebuttals we expect are in the
+[cheat sheet](#rebuttals-one-line-each).
+
+## Cheat sheet
+
+Set these once per terminal, so every command below is bare `wires …`:
+
+| Terminal | Environment |
+|---|---|
+| **admin** (laptop) | `export WIRES_HOME=~/.wires-admin` |
+| **workbench** (`ssh -o RemoteCommand=none workbench`) | `export WIRES_HOME=~/.wires-demo`; `cd` to the directory with `host.json` and `orders.db` |
+| **agent** (laptop, Claude Code) | `export WIRES_HOME=~/.wires-agent WIRES_OIDC_CLIENT_ID=… WIRES_OIDC_CLIENT_SECRET=…` |
+| **reader** (laptop or second laptop) | `export WIRES_HOME=~/.wires-reader WIRES_OIDC_CLIENT_ID=… WIRES_OIDC_CLIENT_SECRET=…` |
+
+Off camera: `./.scripts/demo-remote-cli.sh --quiet` is green, [provisioning](#before-recording-off-camera)
+is done, `wires serve host.json` is running on the workbench, and the reader is logged in.
+On camera, in order:
+
+| Beat | Terminal | Command | What appears |
+|---|---|---|---|
+| 1 | workbench | `ss -ltnp` then `ss -lunp \| grep wires` | no TCP listener from wires; UDP sockets (QUIC) only |
+| 2 | agent | `wires services` | nothing on stdout; stderr `wires services: no service allows this node without a login (state vN)` |
+| 2 | agent | `wires call orders-db -- "select count(*) from orders"; echo $?` | ``wires: denied by responder: no ID token presented; run `wires login` ``, then `77` |
+| 3 | agent | `wires login` | browser: Google, then the "signed in" page |
+| 3 | agent | `wires services` | `orders-db  Read-only SQL (sqlite3) over …  (analyst)` |
+| 4 | agent | `claude --allowedTools 'Bash(wires call orders-db:*)'`, then [the prompt](#4-the-agent-works) | Claude Code runs `wires call orders-db -- "…"`; the answer is umbrella, $999.00 of $1,629.84 (61.3%) |
+| 5 | reader | `wires watch orders-db` | `▶ … <you>@gmail.com (…) [analyst] orders-db "select …"`, `■ … exit 0 · … ms · … B out`, and a `✗ … no ID token presented` line for beat 2 |
+| 5 (opt.) | reader (second tab) | `wires call orders-db -- "select 1"` | exit 77: `… is in no role allowed to call orders-db (analyst)`; a `✗` in the watch |
+| 5b (opt.) | agent | [push beat](#5b-the-workbench-calls-back-push): `wires call deploy -- build 41`, `wires inbox --wait --timeout 10m` | `… from host <wb8> (verified)  build-41  failed: …` |
+| 5c (with a spare) | workbench | stop `wires serve`, ask again | the spare answers (`wires call --verbose` names it) |
+| 6 | admin | `wires remove agent` | stderr `state version N: pushed to K member(s)` |
+| 6 | agent | ask Claude Code the question again | exit 77, nothing on stdout: `wires: denied by responder: <id8> is not a member of the current signed state (version N)`; a `✗` in the watch |
+
+### Rebuttals, one line each
+
+| They say | We say |
+|---|---|
+| **"Tailscale already does this."** | Tailscale gives your machine a network path to the host; wires gives a key-addressed path to the services a signed list lets you call, with no TCP listener and no firewall port opened. |
+| **"Our MCP gateway already logs every call."** | The gateway's log belongs to whoever runs the gateway and covers only traffic routed through it; this record is written and signed by the machine that ran the command, and the readers the admin names read it without either end's credentials. |
+| **"We already have Okta / enterprise-managed auth."** | Good, wires uses it: the host checks your IdP's signed token, bound to the caller's key, against one admin-signed list of who may call what, with no wires identity service and no auth code in the CLI. |
+| **"A leaner MCP server would close the gap."** | Mostly, yes, because the token win comes from output size; a CLI gets it without rewriting anything, and wires doesn't rest on tokens anyway, it rests on reach, identity and the host-written record. |
+| **"Can't the host just edit its log?"** | It can withhold or truncate its own history, but a rewrite of anything a reader has already seen breaks the hash chain at that reader's mark, and `wires watch` stops with an alarm. A witness that holds copies is [card 09](board/backlog/09-witness.md), not built. |
+| **"Use webhooks."** | The laptop agent has no public endpoint; ngrok or Funnel would put one on the internet. Wires pushes to the agent's key, with nothing exposed. |
+| **"Just poll."** | Polling (status service or inbox loop) cost 28k→39k tokens as the build went 60→300 s and reacted in 20–180 s; `inbox --wait` cost 15k flat and reacted in ~2 s (bench/push/REPORT.md). |
+| **"A2A has push."** | Through webhooks to a public URL, the same problem. |
+| **"The MCP tasks extension."** | Poll-based by design (`tasks/get`): the "just poll" row. |
 
 ## Cast
 
 | Terminal | Machine | `WIRES_HOME` | Role |
 |---|---|---|---|
 | **admin** | laptop | `~/.wires-admin` | holds the root key; signs roles, services and members |
-| **workbench** | workbench (x86_64 Linux, no inbound ports) | `~/.wires-demo` | `wires serve host.json`: implements `orders-db` |
+| **workbench** | workbench (x86_64 Linux, no firewall port opened) | `~/.wires-demo` | `wires serve host.json`: implements `orders-db` |
 | **spare** (optional) | a second host | `~/.wires-spare` | implements `orders-db` too, for the failover beat |
 | **agent** | laptop | `~/.wires-agent` | Claude Code, calling `wires call orders-db` from Bash |
 | **reader** | laptop (or a second laptop) | `~/.wires-reader` | a member in role `security`: `wires watch orders-db` |
@@ -34,8 +79,10 @@ export WIRES_OIDC_CLIENT_SECRET=<secret>
 
 **workbench.** Build natively there (`cargo build --release -p wires`, or
 `docker build .`); nothing cross-compiles. Use `ssh -o RemoteCommand=none`
-because the ssh config forces a remote command. Put `orders.db` in the
-directory `wires serve` runs from, and this `host.json` beside it:
+because the ssh config forces a remote command. Make `orders.db` in the
+directory `wires serve` runs from (`sqlite3 orders.db < .scripts/fixtures/orders.sql`),
+and put this `host.json` beside it (the loopback demo's
+`.scripts/fixtures/host.json`, with the Google issuer and your client id):
 
 ```json
 {
@@ -172,8 +219,9 @@ beat 2. The agent's own `wires watch` shows only its own calls.
 ### 5b. The workbench calls back (push)
 
 Self-asserting on one machine: `./.scripts/demo-push.sh --quiet`. For the
-recording, copy `.scripts/fixtures/ci.sh` to the workbench, add its
-services to `host.json` (absolute path as `<ci>`):
+recording, copy `.scripts/fixtures/ci.sh` to the workbench and add its
+services to `host.json` (absolute path as `<ci>`; `.scripts/fixtures/push-host.json`
+is the loopback version):
 
 ```json
   "services": {
@@ -270,15 +318,3 @@ state (version …)` and the reader's `✗` line.
   host by the readers the registry names.
 - "Join by domain." It isn't built (card 18).
 
-## Rebuttals, one line each
-
-| They say | We say |
-|---|---|
-| **"Tailscale already does this."** | Tailscale exposes the service to your machine, a network path to the host; wires gives a key-addressed path to the services a signed list lets you call, with no TCP listener and no firewall port opened. |
-| **"Our MCP gateway already logs every call."** | The gateway's log belongs to whoever runs the gateway and covers only traffic routed through it; this record is written and signed by the machine that ran the command, and the readers the admin names read it without either end's credentials. |
-| **"We already have Okta / enterprise-managed auth."** | Good, wires uses it: the host checks your IdP's signed token, bound to the caller's key, against one admin-signed list of who may call what, with no wires identity service and no auth code in the CLI. |
-| **"A leaner MCP server would close the gap."** | Mostly, yes, because the token win comes from output size; a CLI gets it without rewriting anything, and wires doesn't rest on tokens anyway, it rests on reach, identity and the host-written record. |
-| **"Use webhooks."** | The laptop agent has no public endpoint; ngrok or Funnel would put one on the internet. Wires pushes to the agent's key, with nothing exposed. |
-| **"Just poll."** | Polling (status service or inbox loop) cost 28k→39k tokens as the build went 60→300 s and reacted in 20–180 s; `inbox --wait` cost 15k flat and reacted in ~2 s (bench/push/REPORT.md). |
-| **"A2A has push."** | Through webhooks to a public URL, the same problem. |
-| **"The MCP tasks extension."** | Poll-based by design (`tasks/get`): the "just poll" row. |

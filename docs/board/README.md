@@ -55,6 +55,8 @@ The IdP is *bound* at the caller (`login`) and *verified* at the host, against t
 
 ## Lanes
 
+Each summary describes the surface at the time the card was done. Cards 25–27 deleted the channel (gossip topics, announcements, re-keys), `serve --expose`, `--audit-topic` and `wires tail`; the current surface is in [protocol.md](../protocol.md) and the [demo script](../demo.md).
+
 | Card | Lane | Depends on | Summary |
 |---|---|---|---|
 | [00](done/00-shared-types.md) | 0 | — | Shared types: `Invocation`, `AuditRecord`, `IdentityClaim`, `ChannelRecord`, `ServeConfig.{tools,audit}`, `tools.json` |
@@ -86,7 +88,7 @@ The IdP is *bound* at the caller (`login`) and *verified* at the host, against t
 | [16](done/16-token-benchmark.md) | bench | 01–03 | MCP (GitHub server, many tools; ± tool search) vs `gh` via `wires call` vs bare `gh`: 5 tasks × 5 runs |
 | [09](backlog/09-witness.md) | stretch | 02 | Key-less witness: stores and verifies call records without decrypting them |
 
-**Order (agreed 2026-09-23):** 24 → 25 (Cargo + strip) → 27 (services, not hosts; drop the channel) → 26 (host-held records) → recording (08).
+**Order (agreed 2026-09-23):** 24 → 25 (Cargo + strip) → 27 (services, not hosts; drop the channel) → 26 (host-held records) → recording (08, in progress: workbench on HEAD, dry run, record; see its Steps).
 
 ## Rules for workers
 
