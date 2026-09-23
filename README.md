@@ -317,10 +317,18 @@ the host as input. The agent can also pass `wires call`'s own override flags
 
 To make `wires` the boundary, use a structural setup:
 
-- a container or sandbox whose `PATH` holds only `wires`, in an empty working
-  directory with no secrets in the environment. Locked mode (`WIRES_LOCKED=1`,
-  [card 20](docs/board/backlog/20-locked-caller.md)) is coming; it will make
-  `wires call` reject the override flags there;
+- a container or sandbox whose `PATH` holds only `wires`, in an empty
+  working directory with no secrets in the environment, with
+  `WIRES_LOCKED=1` set (or `"locked": true` in a `tools.json` the agent
+  can't write). Locked, `wires call` and `wires mcp` refuse every flag
+  that would point them at other credentials, another tools map or
+  another relay (`--tools-file`, `--*-seed*`, `--membership*`,
+  `--inclusion-proof*`, `--relay-url`); only `--jq`, `--head`,
+  `--max-bytes`, the tool name and its arguments are accepted. `wires call`
+  also refuses data on stdin, so `< file` can't ship a local file to the
+  host; pass input as arguments, or set `WIRES_LOCKED_STDIN=allow` if your
+  tools need piped input. (`wires mcp`'s `stdin` field is unaffected: it
+  is the model's own text.)
 - or `wires mcp` as the agent's only tool, with no Bash tool at all.
 
 ## Known trade-offs
@@ -345,7 +353,6 @@ To make `wires` the boundary, use a structural setup:
   front desk that admits by IdP rule). This is an open question and not
   designed ([card 18](docs/board/backlog/18-front-door-OPEN.md)). Today the
   invite introduces the root key (trust on first use).
-- **Locked caller mode** for sandboxed agents ([card 20](docs/board/backlog/20-locked-caller.md)).
 - **The recorded two-machine demo** with real Google sign-in and Claude Code
   as the agent ([card 08](docs/board/doing/08-demo-two-machine.md);
   script in [docs/demo.md](docs/demo.md)).
