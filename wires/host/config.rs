@@ -57,7 +57,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use library::{Audience, Issuer, ToolName};
@@ -127,6 +126,28 @@ pub(crate) struct IdentityConfig {
     pub(crate) issuers: Vec<TrustedIssuer>,
 }
 
+impl IdentityConfig {
+    /// The IdPs and per-issuer audiences to verify ID tokens under (v1 and
+    /// v2 `host.json` alike).
+    pub(crate) fn trust(&self) -> IdpTrust {
+        IdpTrust::per_issuer(
+            self.issuers
+                .iter()
+                .map(|t| {
+                    (
+                        Issuer::new(t.issuer.clone()),
+                        t.audiences
+                            .iter()
+                            .filter(|a| !a.trim().is_empty())
+                            .map(|a| Audience::new(a.clone()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
 /// One trusted IdP.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -152,13 +173,6 @@ pub(crate) struct ToolConfig {
 }
 
 impl HostConfig {
-    /// Read and validate `host.json` at `path`.
-    pub(crate) fn load(path: &Path) -> Result<Self> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("{} is not a valid host.json", path.display()))
-    }
-
     /// Parse and validate `host.json` text: the schema (unknown keys and a
     /// missing `version` are errors), then [`validate`](Self::validate).
     pub(crate) fn parse(text: &str) -> Result<Self> {
@@ -340,22 +354,7 @@ impl HostConfig {
 
     /// The IdPs and per-issuer audiences the host verifies claims under.
     pub(crate) fn trust(&self) -> IdpTrust {
-        IdpTrust::per_issuer(
-            self.identity
-                .issuers
-                .iter()
-                .map(|t| {
-                    (
-                        Issuer::new(t.issuer.clone()),
-                        t.audiences
-                            .iter()
-                            .filter(|a| !a.trim().is_empty())
-                            .map(|a| Audience::new(a.clone()))
-                            .collect(),
-                    )
-                })
-                .collect(),
-        )
+        self.identity.trust()
     }
 
     /// What `wires serve --check` prints: the channel, the trusted issuers,

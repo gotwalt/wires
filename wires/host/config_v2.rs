@@ -39,12 +39,9 @@
 //!
 //! What this parser checks is the file on its own. Checks against the signed
 //! state (every service here is assigned to this host; every role named is
-//! defined) are [`HostConfigV2::check_against`], a 27c stub. v1
-//! ([`HostConfig`](crate::host::config::HostConfig)) still parses;
-//! [`AnyHostConfig::parse`] picks by `version`.
-
-// Nothing outside tests reads this until lane 27c switches `serve` over.
-#![allow(dead_code)]
+//! defined) are [`HostConfigV2::check_against`], which `serve` runs before
+//! it binds. v1 ([`HostConfig`](crate::host::config::HostConfig)) still
+//! parses; [`AnyHostConfig::parse`] picks by `version`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -213,8 +210,84 @@ impl HostConfigV2 {
     /// defined in `state` (or be `member`). The error names the first
     /// offender.
     pub(crate) fn check_against(&self, state: &State, me: NodeId) -> Result<()> {
-        let _ = (state, me);
-        todo!("27c: host.json v2 against the signed state")
+        let version = state.version.0;
+        let me8 = &me.hex()[..8];
+        for name in self.services.keys() {
+            if state.service(name).is_none() {
+                bail!(
+                    "host.json implements service {name}, but the signed state (version \
+                     {version}) has no such service"
+                );
+            }
+            if !state.assigns(name, me) {
+                bail!(
+                    "host.json implements service {name}, but the signed state (version \
+                     {version}) does not assign it to this host ({me8}); refusing to serve it"
+                );
+            }
+        }
+        let defined = |r: &RoleName| r.is_member() || state.roles.contains_key(r);
+        for (name, svc) in &self.services {
+            if let Some(r) = svc.also_require.iter().find(|r| !defined(r)) {
+                bail!(
+                    "service {name}: also_require names role {r}, which the signed state \
+                     (version {version}) does not define"
+                );
+            }
+        }
+        if let Some(r) = self
+            .push
+            .iter()
+            .flat_map(|p| &p.allow)
+            .find(|r| !defined(r))
+        {
+            bail!(
+                "push.allow names role {r}, which the signed state (version {version}) does not \
+                 define"
+            );
+        }
+        Ok(())
+    }
+
+    /// What `wires serve --check` prints for a v2 file: the services it
+    /// implements, their commands and `also_require`, trusted issuers, and
+    /// push. Who may call is the signed state's, so it is not shown here.
+    pub(crate) fn summary(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let _ = writeln!(out, "host.json ok (version {})", self.version);
+        let _ = writeln!(out, "trusted issuers:");
+        if self.identity.issuers.is_empty() {
+            let _ = writeln!(out, "  (none: only `member` services can be called here)");
+        }
+        for t in &self.identity.issuers {
+            let _ = writeln!(out, "  {}  audiences: {}", t.issuer, t.audiences.join(", "));
+        }
+        let _ = writeln!(
+            out,
+            "services (who may call each is in the admin-signed state):"
+        );
+        for (name, svc) in &self.services {
+            let _ = writeln!(out, "  {name}");
+            let _ = writeln!(out, "    command: {}", svc.command.join(" "));
+            if let Some(cwd) = &svc.cwd {
+                let _ = writeln!(out, "    cwd: {}", cwd.display());
+            }
+            if !svc.also_require.is_empty() {
+                let roles: Vec<&str> = svc.also_require.iter().map(RoleName::as_str).collect();
+                let _ = writeln!(out, "    also requires: {}", roles.join(", "));
+            }
+        }
+        match &self.push {
+            Some(p) if !p.allow.is_empty() => {
+                let roles: Vec<&str> = p.allow.iter().map(RoleName::as_str).collect();
+                let _ = writeln!(out, "push: to roles {}", roles.join(", "));
+            }
+            _ => {
+                let _ = writeln!(out, "push: to no one");
+            }
+        }
+        out
     }
 }
 
@@ -285,7 +358,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "27c"]
     fn refuses_services_not_assigned_here() {
         use library::{NodeIdentity, Service, StateVersion};
         let root = NodeIdentity::from_seed([1u8; 32]);
@@ -308,7 +380,30 @@ mod tests {
         );
         let text = r#"{"version":2,"services":{"orders-db":{"command":["x"]}}}"#;
         let c = HostConfigV2::parse(text).unwrap();
-        assert!(c.check_against(&state, me).is_err());
+        let e = c.check_against(&state, me).unwrap_err().to_string();
+        assert!(
+            e.contains("orders-db") && e.contains("does not assign"),
+            "{e}"
+        );
         assert!(c.check_against(&state, other).is_ok());
+        let check = |text: &str| {
+            HostConfigV2::parse(text)
+                .unwrap()
+                .check_against(&state, other)
+                .map_err(|e| e.to_string())
+        };
+        let e = check(r#"{"version":2,"services":{"ghost":{"command":["x"]}}}"#).unwrap_err();
+        assert!(e.contains("no such service"), "{e}");
+        let e = check(
+            r#"{"version":2,"services":{"orders-db":{"command":["x"],"also_require":["sre"]}}}"#,
+        )
+        .unwrap_err();
+        assert!(e.contains("does not define"), "{e}");
+        assert!(
+            check(
+                r#"{"version":2,"services":{"orders-db":{"command":["x"]}},"push":{"allow":["analyst"]}}"#
+            )
+            .is_err()
+        );
     }
 }
