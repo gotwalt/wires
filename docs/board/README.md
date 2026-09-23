@@ -64,7 +64,7 @@ The IdP is *bound* at the caller (`login`), *enforced* at the host (`host.json`)
 | [17](review/17-readme-why.md) | docs | 12–16 | README: four roles, where each guarantee lives, why it's built this way; `docs/demo.md` |
 | [19](done/19-no-shell-caller.md) | S | 12 | No-shell caller: `wires call --jq/--head/--max-bytes` in-process; wires-only sandbox recipe; benchmark arm 5 |
 | [20](done/20-locked-caller.md) | S2 | 19 | Locked caller mode: `WIRES_LOCKED=1` rejects override flags so a sandboxed agent can't steer `wires call` |
-| [21](backlog/21-camera-polish.md) | P2 | 12–20 | Camera polish: heartbeat noise, quiet admin commands, clear removal reason, seal announcements only to current members |
+| [21](review/21-camera-polish.md) | P2 | 12–20 | Camera polish: heartbeat noise, quiet admin commands, clear removal reason, seal announcements only to current members |
 | [18](backlog/18-front-door-OPEN.md) | — | parked | **Open question, don't build:** apex key, invites, `wires join <domain>` |
 | [16](done/16-token-benchmark.md) | bench | 01–03 | MCP (GitHub server, many tools; ± tool search) vs `gh` via `wires call` vs bare `gh`: 5 tasks × 5 runs |
 | [09](backlog/09-witness.md) | stretch | 02 | Key-less witness: stores and verifies call records without decrypting them |

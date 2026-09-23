@@ -200,7 +200,7 @@ wires: roster version 5: re-key published on the channel (via 00175393…)
 removed a9ab1b64… (laptop) (roster version 5, 3 members)
 
 laptop$ wires call db_query -- "select count(*) from orders"
-wires: denied by responder: roster inclusion rejected: stale inclusion proof: proof targets version 4, head is version 5
+wires: denied by responder: roster inclusion rejected: not in the current roster (removed at version 5)
 $ echo $?
 77
 ```
@@ -219,7 +219,7 @@ stand-in IdP's):
 05:17:47 00175393 ■ 29db exit 0 · 5 ms · 152 B out · blake3 734f…
 05:17:51 e8bb4ff6 🔑 re-key to roster version 5 (3 members)
 05:17:51 00175393 📣 announces tools (none open; 1 sealed entry)
-05:17:55 00175393 ✗ a9ab… db_query denied: roster inclusion rejected: stale inclusion proof: proof targets version 4, head is version 5
+05:17:55 00175393 ✗ a9ab… db_query denied: roster inclusion rejected: not in the current roster (removed at version 5)
 ```
 
 The second column is the node that wrote the line. Call records come from the
