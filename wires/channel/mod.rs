@@ -13,6 +13,8 @@
 //! - [`local`] — this node's own log: open it, pick the key, mint a message.
 //! - [`printer`] — the keyring that opens envelopes and the line printer.
 //! - [`peers`] — the persisted peer hints.
+//! - [`rekey`] — adopting the admin's re-keys (card 14), and the proof
+//!   directory they leave for the gates.
 //! - [`topics`] — the resident topic node: endpoint, gossip, admission and
 //!   replay handlers.
 //! - [`admission`] — the roster gate in front of the mesh, and its watchdog.
@@ -23,7 +25,7 @@
 //! - [`idp_view`] — which issuers/audiences a reader trusts, and how a
 //!   verified identity prints.
 //!
-//! Where what comes next lands: re-key distribution (card 14) and the host
+//! Where what comes next lands: the host
 //! announcement / tool directory records (card 15).
 
 pub mod admission;
@@ -34,6 +36,7 @@ pub mod local;
 pub mod peers;
 pub mod printer;
 pub mod publish;
+pub mod rekey;
 pub mod render;
 pub mod replay;
 pub mod store;

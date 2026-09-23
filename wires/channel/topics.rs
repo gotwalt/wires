@@ -93,6 +93,18 @@ pub const EVENT_CHANNEL_CAP: usize = 256;
 /// of dialing before the control socket is even usable.
 pub const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(30);
 
+/// The largest gossip message this node sends or accepts: 64 KiB, up from
+/// iroh-gossip's 4 KiB default.
+///
+/// An envelope carries its ciphertext as hex, so 4 KiB left under 2 KiB of
+/// text — less than one admin re-key record for a handful of members (card 14:
+/// ~750 bytes of proof and sealed key per member), and less than an audit
+/// record quoting a full stdin head. A message over the limit is not lost —
+/// it is stored and replay carries it — but it misses the live path, which is
+/// the one a re-key must take. Every node runs the same binary, so the limit
+/// is the same on both ends of a connection.
+pub const GOSSIP_MAX_MESSAGE: usize = 64 * 1024;
+
 /// Everything a [`TopicNode`] needs besides its signing identity.
 ///
 /// The identity is *not* a field: it is the one secret in the set, and passing
@@ -408,7 +420,12 @@ impl TopicNode {
         cfg: TopicNodeConfig,
     ) -> Result<Self> {
         let admitted = Admitted::new();
-        let gossip = GatedGossip::new(Gossip::builder().spawn(endpoint.clone()), admitted.clone());
+        let gossip = GatedGossip::new(
+            Gossip::builder()
+                .max_message_size(GOSSIP_MAX_MESSAGE)
+                .spawn(endpoint.clone()),
+            admitted.clone(),
+        );
         let admit = Arc::new(AdmitHandler {
             topic: cfg.topic,
             fabric_root: cfg.fabric_root,

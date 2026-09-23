@@ -84,7 +84,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh_gossip::net::Gossip;
 use library::{
     Admission, AdmitFrame, InclusionProof, NodeId, RosterHead, RosterVersion, TopicId, TopicPeer,
-    check_roster_inclusion, check_topic_admission,
+    check_roster_inclusion_via, check_topic_admission_via,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -540,6 +540,21 @@ impl AdmitHandler {
         Ok(self.load_head()?.version)
     }
 
+    /// The proof directory the admin's last re-key left in the keystore, if
+    /// any: every member's proof under the current head, so a peer that
+    /// missed the re-key and presents last commit's proof is still admitted
+    /// ([`check_topic_admission_via`]). Unreadable is `None` — the directory
+    /// only ever adds admissions, so doing without it fails closed.
+    pub fn load_directory(&self) -> Option<library::ProofDirectory> {
+        match self.keystore.read_directory() {
+            Ok(directory) => directory,
+            Err(e) => {
+                tracing::warn!("ignoring an unreadable proof directory: {e:#}");
+                None
+            }
+        }
+    }
+
     /// This node's own inclusion proof to present right now: the keystore's, if
     /// it is for a strictly newer roster version than the one this handler
     /// started with, and the startup proof otherwise.
@@ -783,10 +798,11 @@ where
         }
     };
 
-    let admission = match check_topic_admission(
+    let admission = match check_topic_admission_via(
         &local,
         &presented,
         &proof,
+        handler.load_directory().as_ref(),
         handler.fabric_root,
         caller,
         now_unix,
@@ -888,10 +904,11 @@ where
         bail!("responder acknowledged a different topic");
     }
 
-    let admission = check_topic_admission(
+    let admission = check_topic_admission_via(
         &local,
         &presented,
         &proof,
+        handler.load_directory().as_ref(),
         handler.fabric_root,
         responder,
         now_unix,
@@ -1017,10 +1034,20 @@ fn recheck_admissions(handler: &AdmitHandler, now_unix: i64) {
             None
         }
     };
+    // A re-key makes every stored proof a commit behind at once; the
+    // directory it left is what keeps the survivors admitted through it.
+    let directory = handler.load_directory();
     for (peer, _version, proof) in handler.admitted.snapshot() {
         let verdict = match &head {
-            Some(head) => check_roster_inclusion(head, &proof, handler.fabric_root, peer, now_unix)
-                .map_err(|e| e.to_string()),
+            Some(head) => check_roster_inclusion_via(
+                head,
+                Some(&proof),
+                directory.as_ref(),
+                handler.fabric_root,
+                peer,
+                now_unix,
+            )
+            .map_err(|e| e.to_string()),
             None => Err("no usable roster head".to_string()),
         };
         if let Err(reason) = verdict {

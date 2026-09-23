@@ -8,11 +8,14 @@
 #   workbench -- `wires serve host.json` (.scripts/fixtures/host.json: one
 #                tool, db_query, for role analyst = *@example.com, on
 #                channel ops). Hosts the channel.
-#   observer  -- `wires watch ops`: holds neither the agent's nor the
+#   observer  -- `wires watch`: holds neither the agent's nor the
 #                workbench's credentials, and sees every call anyway.
 #   agent     -- `wires login` (IdP) then `wires call db_query …` and
 #                `wires mcp` (JSON-RPC over pipes).
-#   root      -- the human: signs the roster, and later removes the agent.
+#   root      -- the admin: `wires init`, one `wires invite` per machine
+#                (each joins with `wires join <token>`), and later
+#                `wires remove agent` -- re-keys ride the channel, so nobody
+#                imports anything.
 #
 # The IdP is a hermetic loopback OIDC issuer (`wires dev-mock-idp`, built only
 # into //wires:wires_dev -- never the shipped binary). `wires login
@@ -24,9 +27,10 @@
 # channel); after login, the observer sees a verified identity line and ▶/■
 # for each call naming the agent's email and its SQL (args, stdin, and MCP);
 # `.shell id` is refused by sqlite's -safe mode with a nonzero exit on the
-# channel; after the root removes the agent, the next call exits 77 with zero
-# stdout bytes and a ✗ line on the channel; the responder is one process
-# (same pid) throughout.
+# channel; after the admin removes the agent, the workbench and the observer
+# adopt the new roster off the channel with no import, the next call exits 77
+# with zero stdout bytes and a ✗ line on the channel; the responder is one
+# process (same pid) throughout.
 #
 # Run it directly from the repo root -- NOT via `bazel run //.scripts:...`.
 #
@@ -152,33 +156,18 @@ agent="$D/agent"
 obs="$D/observer"
 mkdir -p "$root" "$wb" "$agent" "$obs"
 
-WIRES_HOME="$root" "$WIRES" advanced keygen --save-root >/dev/null
-for h in "$wb" "$agent" "$obs"; do WIRES_HOME="$h" "$WIRES" advanced keygen --save-node >/dev/null; done
-ROOT_ID="$(WIRES_HOME="$root" "$WIRES" advanced keygen --root-seed "$(tr -d '\n' <"$root/root.seed")" | awk '/^root_id/{print $2}')"
-node_id() { "$WIRES" advanced keygen --node-seed "$(tr -d '\n' <"$1/node.seed")" | awk '/^node_id/{print $2}'; }
-WB_ID="$(node_id "$wb")"
-AG_ID="$(node_id "$agent")"
-OB_ID="$(node_id "$obs")"
+# The admin starts the fabric (and is a member itself); every other machine
+# makes its key and hands the admin its id. One invite token back each.
+ROOT_ID="$(WIRES_HOME="$root" "$WIRES" init --channel "$TOPIC" | awk '/^fabric /{print $2}')"
+WB_ID="$(WIRES_HOME="$wb" "$WIRES" id 2>/dev/null)"
+AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
+OB_ID="$(WIRES_HOME="$obs" "$WIRES" id 2>/dev/null)"
 [ -n "$ROOT_ID" ] && [ -n "$WB_ID" ] && [ -n "$AG_ID" ] && [ -n "$OB_ID" ] ||
 	bad "setup: could not read the key ids"
 AG8="${AG_ID:0:8}"
-
-for id in "$WB_ID" "$AG_ID" "$OB_ID"; do
-	WIRES_HOME="$root" "$WIRES" advanced roster add --member "$id" >/dev/null
-	WIRES_HOME="$root" "$WIRES" advanced member --subject "$id" --ttl 3600 >"$D/$id.member"
-done
-commit1="$(WIRES_HOME="$root" "$WIRES" advanced roster commit --ttl 3600 --out "$D/v1")"
-HEAD1="$(printf '%s\n' "$commit1" | awk '/^head /{print $2}')"
-refresh() { # $1 = home, $2 = node id, $3 = proof dir, $4 = head token
-	WIRES_HOME="$1" "$WIRES" advanced import \
-		--membership-file "$D/$2.member" \
-		--inclusion-proof-file "$3/$2.proof" \
-		--roster-head "$4" \
-		--fabric-key-file "$3/$2.key" >/dev/null
-}
-refresh "$wb" "$WB_ID" "$D/v1" "$HEAD1"
-refresh "$agent" "$AG_ID" "$D/v1" "$HEAD1"
-refresh "$obs" "$OB_ID" "$D/v1" "$HEAD1"
+# The workbench first: it will be everyone else's bootstrap peer.
+WB_TOKEN="$(WIRES_HOME="$root" "$WIRES" invite "$WB_ID" --name workbench 2>/dev/null)"
+WIRES_HOME="$wb" "$WIRES" join "$WB_TOKEN" >/dev/null
 
 DB="$D/orders.db"
 sqlite3 "$DB" <"$repo/.scripts/fixtures/orders.sql"
@@ -229,14 +218,31 @@ wait_for "$D/wb.err" "share to bootstrap: " 300 || {
 TICKET="$(grep -m1 '^share to bootstrap: ' "$D/wb.err" | sed 's/^share to bootstrap: //')"
 [ -n "$TICKET" ] || bad "1: the workbench printed an empty ticket"
 ok "1: workbench is pid $WB_PID, reachable by key ${WB_ID:0:8}... -- one tool, nothing else"
+# Setup, continued: the agent and the observer are invited now that the
+# workbench is up -- each invite is a commit, published to the workbench as a
+# re-key (no import there) -- and join with their one token.
+AG_TOKEN="$(WIRES_HOME="$root" "$WIRES" invite "$AG_ID" --name agent --peer "$TICKET" 2>"$D/invite.err")" || {
+	cat "$D/invite.err" >&2
+	bad "setup: inviting the agent failed"
+}
+OB_TOKEN="$(WIRES_HOME="$root" "$WIRES" invite "$OB_ID" --name observer 2>>"$D/invite.err")" || {
+	cat "$D/invite.err" >&2
+	bad "setup: inviting the observer failed"
+}
+grep -qF "re-key published on the channel" "$D/invite.err" || {
+	cat "$D/invite.err" >&2
+	bad "setup: the invites' re-keys never reached the workbench"
+}
+WIRES_HOME="$agent" "$WIRES" join "$AG_TOKEN" >/dev/null
+WIRES_HOME="$obs" "$WIRES" join "$OB_TOKEN" >/dev/null
 beat 2
 
 # ==========================================================================
 step "2  the observer tails the channel -- no key to the agent or the workbench"
 # ==========================================================================
-run "WIRES_OIDC_ISSUER=$ISSUER WIRES_OIDC_AUDIENCE=$CLIENT_ID wires watch $TOPIC --peer \$TICKET"
+run "WIRES_OIDC_ISSUER=$ISSUER WIRES_OIDC_AUDIENCE=$CLIENT_ID wires watch   # the channel and peers came with the invite"
 WIRES_HOME="$obs" WIRES_OIDC_ISSUER="$ISSUER" WIRES_OIDC_AUDIENCE="$CLIENT_ID" \
-	"$WIRES" watch "$TOPIC" --peer "$TICKET" >"$D/obs.out" 2>"$D/obs.err" &
+	"$WIRES" watch >"$D/obs.out" 2>"$D/obs.err" &
 OBS_PID=$!
 wait_for "$D/obs.err" "neighbor up" 300 || {
 	sed 's/^/  observer| /' "$D/obs.err" >&2
@@ -280,8 +286,8 @@ beat 3
 # ==========================================================================
 step "4  the agent signs in with its IdP -- the token is bound to its node key"
 # ==========================================================================
-run "wires login --topic $TOPIC --peer \$TICKET --issuer $ISSUER --client-id $CLIENT_ID --no-browser"
-WIRES_HOME="$agent" "$WIRES" login --topic "$TOPIC" --peer "$TICKET" \
+run "wires login --topic $TOPIC --issuer $ISSUER --client-id $CLIENT_ID --no-browser"
+WIRES_HOME="$agent" "$WIRES" login --topic "$TOPIC" \
 	--issuer "$ISSUER" --client-id "$CLIENT_ID" --client-secret not-so-secret \
 	--no-browser >"$D/login.out" 2>"$D/login.err" &
 LOGIN_PID=$!
@@ -464,16 +470,28 @@ line "$F4"
 beat 3
 
 # ==========================================================================
-step "7  the human removes the agent -- one commit, nobody restarts"
+step "7  the human removes the agent -- one command, nobody restarts or imports"
 # ==========================================================================
-run "wires advanced roster remove --member ${AG8}...  &&  wires advanced roster commit"
-WIRES_HOME="$root" "$WIRES" advanced roster remove --member "$AG_ID" >/dev/null
-commit2="$(WIRES_HOME="$root" "$WIRES" advanced roster commit --ttl 3600 --out "$D/v2")"
-HEAD2="$(printf '%s\n' "$commit2" | awk '/^head /{print $2}')"
-[ -f "$D/v2/$AG_ID.proof" ] && bad "7: the new roster still includes the agent"
-run "wires advanced import --roster-head H2 …   # on the workbench and the observer"
-refresh "$wb" "$WB_ID" "$D/v2" "$HEAD2"
-refresh "$obs" "$OB_ID" "$D/v2" "$HEAD2"
+run "wires remove agent"
+WIRES_HOME="$root" "$WIRES" remove agent >"$D/remove.out" 2>"$D/remove.err" || {
+	cat "$D/remove.err" >&2
+	bad "7: wires remove failed"
+}
+grep -qF "re-key published on the channel" "$D/remove.err" || {
+	cat "$D/remove.err" >&2
+	bad "7: the removal's re-key never reached the channel"
+}
+# No import anywhere: the workbench and the observer adopt the re-key off the
+# channel. Their stored heads catching up with the admin's is the proof.
+for h in "$wb" "$obs"; do
+	for _ in $(seq 1 200); do
+		cmp -s "$root/roster-head.json" "$h/roster-head.json" && break
+		sleep 0.1
+	done
+	cmp -s "$root/roster-head.json" "$h/roster-head.json" ||
+		bad "7: $(basename "$h") never adopted the new roster head"
+done
+ok "7: the workbench and the observer adopted the new roster off the channel -- no import"
 run "wires call db_query -- 'select count(*) from orders'"
 set +e
 WIRES_HOME="$agent" "$WIRES" call db_query -- "select count(*) from orders" >"$D/c5.out" 2>"$D/c5.err"
@@ -503,6 +521,6 @@ printf '     reach     : by key %s... on loopback; the only thing exposed is db_
 printf '     identity  : unverified caller refused (77); after login, %s verified by the observer itself\n' "$EMAIL" >&2
 printf '     observable: ▶/■ naming %s + the SQL, for args, stdin and MCP calls\n' "$EMAIL" >&2
 printf '     contained : .shell id refused by sqlite3 -safe, exit %s on the channel\n' "$SHELL_RC" >&2
-printf '     revoke    : one roster commit -> exit 77, 0 bytes out, ✗ on the channel\n' >&2
+printf '     revoke    : one `wires remove` -> exit 77, 0 bytes out, ✗ on the channel; no import anywhere\n' >&2
 printf '     restarts  : 0 -- workbench pid %s throughout; %ss wall clock\n' "$WB_PID" "$((SECONDS - START))" >&2
 [ -z "$KEEP" ] || say "state kept in $D (observer transcript: $D/obs.out)"

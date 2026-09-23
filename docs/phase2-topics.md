@@ -215,6 +215,45 @@ CRL is NOT consulted for topics: topic revocation is head-advance only.
      claim is: **complete against every node that holds the head, eventually
      complete for the rest.**
 
+### 2.5 Re-key distribution (card 14, 2026-09-23)
+
+"Holds the new head" no longer waits on a manual `wires advanced import`.
+`wires invite` / `wires remove` publish each commit on the channel as
+`ChannelRecord::Rekey { head, entries: [{ proof, key: SealedFabricKey }] }`
+(`library/membership/rekey.rs`), and the resident loop (`wires watch`,
+`serve --audit-topic`) adopts it (`wires/channel/rekey.rs`):
+
+- **Self-verifying.** The head is root-signed, each proof must recompute its
+  root, each sealed key is root-signed and sealed to its proof's member.
+  Whoever publishes or replays a Rekey can only advance a reader to a *newer
+  root-signed* head (the same `adopt_if_newer` CAS as admission) and hand it a
+  key the root sealed to it.
+- **Published under the outgoing key**, from the admin's node *before* it
+  installs the commit, so the members it is for can open it and their ingest
+  floor accepts it. The removed member can read it too: it learns the head, the
+  survivors' ids and Merkle paths — never the new key (§2.4.1 holds). Adoption
+  runs on every received envelope whatever its ingest verdict (a node whose head
+  moved via admission first refuses to *store* the record, but still adopts it)
+  and on everything a catch-up inserts.
+- **Install order:** own key → own proof → the proof directory → head (CAS).
+- **Proof directory** (`roster-directory.json`): the current head's proof for
+  every member, from the Rekey. The session gate, topic admission and the
+  watchdog accept a caller's stale proof when the directory for *exactly* the
+  enforced head lists that caller (`check_roster_inclusion_via`) — as strong as
+  the caller presenting it, since the caller is still the key iroh
+  authenticated. This is what keeps a node that missed a re-key (a one-shot
+  `wires call`, a restarted tail) admitted, and keeps the watchdog from
+  evicting every survivor after each commit. A one-shot publish whose newest
+  key is behind its head runs one catch-up pass and adopts the Rekey before
+  sealing.
+- Latencies are unchanged in shape: every guarantee in §2.4 is measured from
+  "holds the new head", which is now "received the Rekey" (live gossip, ~one
+  RTT) or "was admitted by a peer that did" (passive head distribution). A
+  member offline across a commit and never re-admitted by a peer holding the
+  directory still needs a fresh invite (`wires invite <id>` re-issues one).
+- Gossip messages may be 64 KiB (`GOSSIP_MAX_MESSAGE`); a Rekey carries 32
+  members per record (`REKEY_ENTRIES_PER_RECORD`).
+
 ## 3. E2EE keys — `library/fabric_key.rs`
 
 - `FabricKey([u8; 32])` — deliberately NOT Serialize/Deserialize; `generate()`
