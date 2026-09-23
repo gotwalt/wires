@@ -251,7 +251,7 @@ pub struct ToolsAddArgs {
     /// The responder's hex node id (inclusion-only session, no grant).
     #[arg(long)]
     pub node: Option<String>,
-    /// The topic ticket a `serve --audit-topic` responder prints at startup
+    /// The topic ticket a `serve host.json` responder prints at startup
     /// (`share to bootstrap: …`). Its one peer entry *is* the responder, so
     /// this fills `--node`, its addresses, and its relay — and names the
     /// audit topic in `tools.json` if none is set yet.
@@ -601,7 +601,7 @@ pub(crate) mod tests {
         assert!(run(ToolsCmd::Rm { name: "rg".into() }).is_err());
     }
 
-    /// A responder's audit-topic ticket, as `serve --audit-topic` prints it.
+    /// A responder's audit-topic ticket, as `serve host.json` prints it.
     fn topic_ticket(peers: Vec<library::TopicPeer>) -> String {
         TopicTicket::new(NodeIdentity::from_seed([1; 32]).node_id(), "ops", peers)
             .encode()

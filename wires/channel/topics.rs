@@ -150,7 +150,7 @@ pub struct TopicNodeConfig {
     /// Capacity of the [`TopicEvent`] channel (default [`EVENT_CHANNEL_CAP`]).
     pub channel_cap: usize,
     /// Extra `(ALPN, handler)` pairs to register on the node's one router —
-    /// how `serve --audit-topic` serves the session ALPN from this endpoint
+    /// how `serve host.json` serves the session ALPN from this endpoint
     /// instead of binding a second one for the same key. Empty by default;
     /// an ALPN that collides with one of the three above is refused.
     pub protocols: Vec<(&'static [u8], Box<dyn DynProtocolHandler>)>,

@@ -115,7 +115,7 @@ const SOCKET_NAME_HEX: usize = 16;
 ///
 /// When that path would not fit in a `sockaddr_un` (a deep `$WIRES_HOME`), it
 /// is swapped for a short one under the system temp directory — see
-/// [`short_socket_path`]. Binding (`tail`, `serve --audit-topic`) and
+/// [`short_socket_path`]. Binding (`tail`, `serve host.json`) and
 /// connecting (`publish`) both come through here, so they always agree.
 pub fn socket_path(home: &Path, topic: TopicId) -> PathBuf {
     let hex = topic.hex();

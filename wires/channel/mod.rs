@@ -6,7 +6,7 @@
 //! renders; nothing in this folder knows what a tool is.
 //!
 //! - [`watch`] — `wires watch`: the resident node's loop (also the loop
-//!   `serve --audit-topic` runs its channel on).
+//!   `serve host.json` runs its channel on).
 //! - [`publish`] — `wires advanced publish`, through the resident node or
 //!   one-shot.
 //! - [`context`] — the topic arguments and the credentials resolved for them.

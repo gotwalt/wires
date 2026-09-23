@@ -6,7 +6,7 @@
 //! by one root throughout, then installs the membership, inclusion proof,
 //! roster head and fabric key where every other command looks for them, and
 //! records the channel and its bootstrap peers — so `wires watch`, `wires
-//! login` and `serve --audit-topic` need no `--peer`, and `wires watch` needs
+//! login` and `serve host.json` need no `--peer`, and `wires watch` needs
 //! no topic name.
 //!
 //! After this, the admin's re-keys arrive over the channel; nothing needs
@@ -133,7 +133,7 @@ pub(crate) fn join_in(ks: &Keystore, home: &Path, token: &str, now: i64) -> anyh
     }
     out.push_str(&match invite.peers.len() {
         0 => "\nno bootstrap peers in the token: this node is the channel's first — `wires serve \
-              --audit-topic …` or `wires watch` prints the ticket others bootstrap from"
+              host.json` or `wires watch` prints the ticket others bootstrap from"
             .to_string(),
         n => format!("\n{n} bootstrap peer(s) recorded; `wires watch` needs no --peer"),
     });

@@ -1,4 +1,4 @@
-//! `wires serve --audit-topic <name>`: every call the responder handles lands
+//! `wires serve host.json` (with a `channel`): every call the responder handles lands
 //! on an E2EE topic as a signed record.
 //!
 //! # Shape
@@ -30,7 +30,7 @@
 //!
 //! Publishing is best-effort by design: a full or closed sink, or a publish
 //! the tail loop refuses, is logged at `warn` and the call proceeds. The
-//! fail-closed part is *startup*: `--audit-topic` refuses to start unless this
+//! fail-closed part is *startup*: a host.json `channel` refuses to start unless this
 //! node is a provisioned member of the channel (membership, inclusion proof,
 //! roster head and fabric key), with an error naming the `wires advanced import` flag.
 //!
@@ -281,7 +281,7 @@ pub async fn forward(mut records: mpsc::Receiver<AuditRecord>, tx: mpsc::Sender<
     }
 }
 
-/// What a `serve --audit-topic` responder adds to the resident tail loop:
+/// What a `serve host.json` responder adds to the resident tail loop:
 /// the session protocol for the node's router, and the records to publish.
 #[derive(Debug)]
 pub struct Hosted {

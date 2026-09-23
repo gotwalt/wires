@@ -1,7 +1,7 @@
 //! `wires watch <topic>`: the resident node — store, backfill, mesh, control
 //! socket, catch-up and the live loop (spec §7.3).
 //!
-//! The observer's command, and the loop `serve --audit-topic` runs its audit
+//! The observer's command, and the loop `serve host.json` runs its audit
 //! channel on (the host's call records enter through the same publish queue
 //! as the control socket's requests). `wires advanced tail` is a hidden alias.
 
@@ -101,7 +101,7 @@ pub(crate) async fn watch_cmd(a: WatchArgs) -> anyhow::Result<()> {
 /// the control socket. Every failure that is a *refusal* carries a
 /// [`Denied`](crate::host::transport::Denied) so `main` can exit 77.
 ///
-/// `hosted` is `serve --audit-topic`'s addition: the session ALPN rides this
+/// `hosted` is `serve host.json`'s addition: the session ALPN rides this
 /// node's router, and call records enter the loop through the same publish
 /// queue as the control socket's requests (see [`audit`]).
 pub(crate) async fn run_tail(
@@ -238,7 +238,7 @@ where
     let mut catchup_at: Option<tokio::time::Instant> = Some(now_instant());
     // The catch-up in flight, if any. A task, not an inline await: a pass can
     // take up to `REPLAY_PASS_TIMEOUT` against a peer that has gone quiet, and
-    // this loop is the single allocator every publish — `serve --audit-topic`'s
+    // this loop is the single allocator every publish — `serve host.json`'s
     // call records included — waits on. One at a time: a deadline that comes
     // due while a pass runs waits for it (the timer arm is gated on this).
     let mut catching_up: Option<CatchUpTask> = None;
