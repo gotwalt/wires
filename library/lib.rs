@@ -30,7 +30,8 @@
 //! - [`invoke`] — the [`Invocation`] (tool + [`Argv`]) a dialer asks a
 //!   multi-tool responder to run.
 //! - [`audit`] — the [`AuditRecord`]s a responder publishes about each call.
-//! - [`idp`] — [`IdentityClaim`]: an IdP-signed ID token bound to a node key.
+//! - [`idp`] — [`IdentityClaim`]: an IdP-signed ID token bound to a node key,
+//!   and [`verify_claim`], which every reader runs against the issuer's [`Jwks`].
 //! - [`record`] — [`ChannelRecord`], how both ride a topic as message text.
 //!
 //! # Example: mint a capability, pack a ticket, accept it
@@ -144,6 +145,8 @@ pub mod ticket;
 pub mod topic;
 
 mod codec;
+#[cfg(test)]
+mod idp_vectors;
 
 pub use admission::{
     Admission, AdmitFrame, MAX_ADMIT_FRAME, TOPIC_ADMIT_ALPN, adopt_if_newer, check_topic_admission,
@@ -153,11 +156,14 @@ pub use chain::{ChainState, LinkStatus, classify_link, next_prev_hash};
 pub use envelope::{
     Ciphertext, ENVELOPE_NONCE_CONTEXT, ENVELOPE_V1, MessageHash, MessageNonce, Seq, TopicEnvelope,
 };
-pub use error::{Error, Result};
+pub use error::{Error, IdTokenError, Result};
 pub use fabric_key::{FabricKey, SEALED_KEY_CONTEXT, SEALED_KEY_V1, SealedBox, SealedFabricKey};
 pub use grant::{AlgorithmId, Grant, Scope};
 pub use identity::{NodeId, NodeIdentity, Signature};
-pub use idp::{IdToken, IdentityClaim, OIDC_NONCE_CONTEXT, OidcNonce, Principal};
+pub use idp::{
+    Audience, CLOCK_SKEW_SECS, IdToken, IdentityClaim, Issuer, Jwk, Jwks, OIDC_NONCE_CONTEXT,
+    OidcNonce, Principal, verify_claim,
+};
 pub use invoke::{Argv, Invocation, MAX_ARGS, MAX_ARGV_BYTES, MAX_TOOL_NAME, ToolName};
 pub use membership::{MEMBERSHIP_V1, Membership};
 pub use policy::{Crl, check_accept, check_inclusion, check_roster_inclusion};

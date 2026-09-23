@@ -12,16 +12,21 @@ rust_binary(
     deps = [
         "//library",
         "@crates//:anyhow",
+        "@crates//:base64",
         "@crates//:clap",
         "@crates//:futures-core",
         "@crates//:iroh",
         "@crates//:iroh-gossip",
         "@crates//:redb",
+        "@crates//:reqwest",
+        "@crates//:ring",
+        "@crates//:rustls",
         "@crates//:serde",
         "@crates//:serde_json",
         "@crates//:tokio",
         "@crates//:tracing",
         "@crates//:tracing-subscriber",
+        "@crates//:url",
     ],
 )
 

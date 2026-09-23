@@ -1,0 +1,22 @@
+//! Fixed JOSE test vectors for the `idp` tests, generated once with Python
+//! `cryptography` (OpenSSL 3.6) — an implementation independent of `ring`, so
+//! the known-answer tests check interop rather than self-consistency.
+//!
+//! The private keys are test-only fixtures; never use them for anything real.
+
+/// RSA-2048 modulus (JWK `n`).
+pub(crate) const RSA_N: &str = "13_haK5sCvqiAZa7pYv2ypo8imjekkJamp9p4Rn7iqfp0U2uIWDWxkit0jbkqIJOgKysrYo6YnSocJhU0CkyMukubHLVfdV5dmzS4m_NrHzZ1lEQ98qRtFE2CpCbHkYKf-J1I1GXEZcqtPrb-vREocZXoC4NJdSGFFoFMeC1wgqZC_-zeUY5rdXWyRzkbvFRwyoFmLBV2g15J7bARMsKSdSFTnEKtJ_obH7KQ9kqmkHr7L31sW5KFMdj0Ve50vV28CWDiI2l-KfxKq5qL64QAN-zTxbL-LiA0jUc92JmJJBmkIDhABd9q9-Uw7n9lG8jXzHgOUai8Ygu089xCWGPmQ";
+/// RSA public exponent (JWK `e`).
+pub(crate) const RSA_E: &str = "AQAB";
+/// RS256 compact JWS, header `kid` = `rsa-kat`, signed by the RSA key.
+pub(crate) const RSA_JWS: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS1rYXQifQ.eyJpc3MiOiJodHRwczovL2thdC5leGFtcGxlIiwic3ViIjoia2F0In0.ZSXIJyEcR1d6t5iO-4YVO_PypeAWK7qCmKjUVjze7nKKyFgqoPldaESP6rP_czVtHjffwX9Q6axPe3b8Wq4u2FaCQdzYXYIHktdUI1usjX-6M1wGP8hhSAyE-MJWG90Z1tQGlbIU7AycWKcAd_doB3rgVUHsxlwUe4OWX0UWdsjQm00Shmeii_nXZuZFBl_Y4bQDyoOIiinW0pDkIJaX8YFm6oqR-hlqZnjBR06lq8h0RBmJYUUE9OnHUFn3JMcFIwSfBUF4InrQXn0MRUMfgzzpPjurgadstHgbNbmPJJeS1sV5m24gXN1oRgLHmtmAHIbtOneOGXJvtGtxV4tt9w";
+/// The RSA private key, PKCS#8 DER, base64url.
+pub(crate) const RSA_PKCS8: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDXf-FormwK-qIBlruli_bKmjyKaN6SQlqan2nhGfuKp-nRTa4hYNbGSK3SNuSogk6ArKytijpidKhwmFTQKTIy6S5sctV91Xl2bNLib82sfNnWURD3ypG0UTYKkJseRgp_4nUjUZcRlyq0-tv69EShxlegLg0l1IYUWgUx4LXCCpkL_7N5Rjmt1dbJHORu8VHDKgWYsFXaDXkntsBEywpJ1IVOcQq0n-hsfspD2SqaQevsvfWxbkoUx2PRV7nS9XbwJYOIjaX4p_EqrmovrhAA37NPFsv4uIDSNRz3YmYkkGaQgOEAF32r35TDuf2UbyNfMeA5RqLxiC7Tz3EJYY-ZAgMBAAECggEADNBBxH1HV1YuKkIE-x1ZzOCW5CcpwZb7pC4BmBNF1A_5fl4Y3uTPLUMTcs7PK2Xag4D0IFPgkAu3tQ1mhAOvETyxBSnFOZIz6RXxBB3GipClGaUziRUczMf3Z3FpuvpKYLt3LTGj9eiZiK4eqzFTBpUW9Ymt2aeYjiU8IdcZ3f7lxNZG3ooQ8R5paMW1tMLwMy_5I0oXOMGcVHdwtJSnomynMmBop3QZ51FIIEXPbGHhryx4IVaJEYoBlKc8cEbXhWu639z4wUP8JkHdBpfTaTq_caIXwJplQBFCBjaJiA7FtanK1j_HNg3CM-Gott6D3A-bMOhxaAwKfIXhywvCMQKBgQD0fA4lOUFQdYXRItJtwbGzCahkuxiiCuLr4jSqWoKVXMQvd_kQXuLXJwRc0U_5E9kQCbPyudpJUqkjUT38B1NEXUp1f9QINGck_9mWZG9duOdOiDx_VvNmic5m2zljhYO5ZjZpF-z2KhzZbspYdTeKAZq6I0ZOpT5fCh4j85PpUwKBgQDhplRT2_8PD60_dlAHhCj1MnqQhD7gIxiPFGIo4vDiaHI-4ctKSBOyFAYoZFLe3j_-CA3_v2Ddl-yKD8mTDAJjYYCWLkKWyZCx2N6Y5rpwaWllsp9zZhU73KeIeUCf6I4pzJ3KDJLBxrPyWu_Ddu5d9z8dOQcP4_mMy2cY_mtJ4wKBgQDnXkNwvLdv8lg6bA7iaczGV5xx_5G3QEAx5TfcA53SxiCvn4UoFfPskvMQ99EMMdlY0SXnzjSi8UQ5tRfI3BHT_8mIWvmI7jaykCIVrmSqOGNGMa23AM2Fu2KGem7cHS1kljNlz4ukBoSYzL1Xa06tHwmTn_BYWw8kmAmgElJnGwKBgHa1FtXK_WJCAAVLy4w4tYdQl_Pg7mbhb7ENqxoRUWH6SmfURyr7wgjDyf2D0ajXSNjuCddKKb5JhzGWXpfSEIuRpqDbE0LaJRm6mlfbwacTfVP35TRDNtZ4HVaJWzsEj41jzHqXpLj2PII53rp4naunP3ezIYj1iLnN453dcjm7AoGAD43ToROglZ0Xp14rek3l0ZRAjBBbD5dcDrEscUtaDfpLltWtuCeaI7Qm1wNM1rgaEKgR-ldpqmEqUXEzTk_J8PYAPF9tPexrJS80bVf1O7o0zvS-BgVoMi-UeodrlO5GaCabp9pu3KRjA4FzyXok41_LAQ4cxWD4XUycXC4yBq0";
+/// P-256 public x (JWK `x`).
+pub(crate) const EC_X: &str = "u3EEdXCFVQeV3KP6ncjHLdyhqBc63bQatap6NBYVRfA";
+/// P-256 public y (JWK `y`).
+pub(crate) const EC_Y: &str = "pPC00BCWTfCP4XwLnrVFfnhRdzNu5FDIng24dlEBSgA";
+/// ES256 compact JWS, header `kid` = `ec-kat`, signed by the EC key.
+pub(crate) const EC_JWS: &str = "eyJhbGciOiJFUzI1NiIsImtpZCI6ImVjLWthdCJ9.eyJpc3MiOiJodHRwczovL2thdC5leGFtcGxlIiwic3ViIjoia2F0In0.xubdE_KlWSkWIunzjbE7ROjvhtbWLltQmPwmDpggJq8A2tYVn5LOUGJr8KSpFShqnmhh_hrUYpM_TDPLPegR-g";
+/// The P-256 private key, PKCS#8 DER (with public key), base64url.
+pub(crate) const EC_PKCS8: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgoaMlGur1w7t8CgRwaHPPWcwcKDMnUc44ByivXOASSYehRANCAAS7cQR1cIVVB5Xco_qdyMct3KGoFzrdtBq1qno0FhVF8KTwtNAQlk3wj-F8C561RX54UXczbuRQyJ4NuHZRAUoA";

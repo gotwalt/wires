@@ -2028,6 +2028,7 @@ dependencies = [
  "hex",
  "proptest",
  "rand 0.8.7",
+ "ring",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -4712,6 +4713,7 @@ name = "wires"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "futures-core",
  "iroh",
@@ -4719,11 +4721,15 @@ dependencies = [
  "library",
  "proptest",
  "redb",
+ "reqwest",
+ "ring",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
