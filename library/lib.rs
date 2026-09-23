@@ -52,6 +52,8 @@
 //!   multi-tool responder to run.
 //! - [`audit`] — the [`AuditRecord`]s a responder publishes about each call
 //!   (and each push).
+//! - [`call_log`] — the host's own signed, hash-linked [`LogEntry`] log of
+//!   those records, and [`verify_chain`] (card 26a).
 //! - [`push`] — a host's [`PushMessage`] to a caller, and the [`InboxFrame`]
 //!   codec both delivery paths speak (card 23).
 //! - [`idp`] — [`IdentityClaim`]: an IdP-signed ID token bound to a node key,
@@ -190,6 +192,8 @@ pub mod topic;
 // calls/ — remote CLI calls.
 #[path = "calls/audit.rs"]
 pub mod audit;
+#[path = "calls/call_log.rs"]
+pub mod call_log;
 #[path = "calls/idp.rs"]
 pub mod idp;
 #[path = "calls/invoke.rs"]
@@ -215,6 +219,10 @@ pub use announce::{
 pub use audit::{
     AuditRecord, CallId, OutputDigest, OutputHasher, PushOutcome, STDIN_HEAD_MAX, StdinCapture,
     stdin_head,
+};
+pub use call_log::{
+    CALL_LOG_CONTEXT, CALL_LOG_V1, ChainBreak, ChainPoint, EntryHash, LogEntry, LogSeq, Retention,
+    verify_chain,
 };
 pub use chain::{ChainState, LinkStatus, classify_link, next_prev_hash};
 pub use envelope::{
