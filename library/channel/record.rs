@@ -127,7 +127,8 @@ mod tests {
         let mut roster = crate::roster::Roster::new(root.node_id());
         roster.insert(member);
         let (head, proofs) = roster.commit(&root, 0, i64::MAX).unwrap();
-        let key = SealedFabricKey::seal(&root, member, head.version, &FabricKey::generate()).unwrap();
+        let key =
+            SealedFabricKey::seal(&root, member, head.version, &FabricKey::generate()).unwrap();
         Rekey::new(
             head,
             vec![RekeyEntry {

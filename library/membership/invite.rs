@@ -122,7 +122,13 @@ impl Invite {
             return Err(Error::InconsistentRekey("the invite names no channel"));
         }
         let fabric = self.fabric();
-        check_inclusion(&self.membership, fabric, me.node_id(), now_unix, &Crl::new())?;
+        check_inclusion(
+            &self.membership,
+            fabric,
+            me.node_id(),
+            now_unix,
+            &Crl::new(),
+        )?;
         if self.entry.member() != me.node_id() {
             return Err(Error::SubjectMismatch);
         }

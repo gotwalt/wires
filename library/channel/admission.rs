@@ -67,7 +67,7 @@ use serde::{Deserialize, Serialize};
 use crate::codec::canonical_bytes;
 use crate::error::{Error, Result};
 use crate::identity::NodeId;
-use crate::policy::check_roster_inclusion;
+use crate::rekey::{ProofDirectory, check_roster_inclusion_via};
 use crate::roster::{InclusionProof, RosterHead, RosterVersion};
 use crate::topic::TopicId;
 
@@ -331,6 +331,34 @@ pub fn check_topic_admission(
     caller: NodeId,
     now_unix: i64,
 ) -> Result<Admission> {
+    check_topic_admission_via(
+        local_head,
+        presented_head,
+        proof,
+        None,
+        fabric_root,
+        caller,
+        now_unix,
+    )
+}
+
+/// [`check_topic_admission`], also accepting the caller's proof from a
+/// verifier's [`ProofDirectory`] when the one it presented is stale.
+///
+/// The head choice is unchanged — a strictly newer presented head is still
+/// adopted — and the directory is consulted only for exactly the chosen head
+/// ([`check_roster_inclusion_via`]). This is what admits a member that missed
+/// the admin's re-key: it still holds last commit's proof, and a peer that
+/// adopted the re-key holds its current one.
+pub fn check_topic_admission_via(
+    local_head: &RosterHead,
+    presented_head: &RosterHead,
+    proof: &InclusionProof,
+    directory: Option<&ProofDirectory>,
+    fabric_root: NodeId,
+    caller: NodeId,
+    now_unix: i64,
+) -> Result<Admission> {
     // A head advance is only an advance if it is strictly newer, genuinely the
     // fabric root's, and still alive. Anything else — an older head, a
     // re-presentation of the one we hold, a forged "v+1", an expired commit —
@@ -345,7 +373,7 @@ pub fn check_topic_admission(
     };
     // The chosen head is re-verified here (freshness, fabric pin, signature)
     // together with the proof, so the local-head path fails closed too.
-    check_roster_inclusion(head, proof, fabric_root, caller, now_unix)?;
+    check_roster_inclusion_via(head, Some(proof), directory, fabric_root, caller, now_unix)?;
     Ok(Admission {
         version: head.version,
         adopt,
@@ -743,6 +771,51 @@ mod tests {
             set.push(NodeId::from_bytes([0x80 + i as u8; 32]));
         }
         set
+    }
+
+    /// A peer that missed a re-key presents last commit's proof; a verifier
+    /// holding the current head's directory admits it, one without refuses
+    /// it, and the directory never stands in for a head it is not for.
+    #[test]
+    fn the_directory_admits_a_member_a_commit_behind() {
+        let root = fabric_root().node_id();
+        let (local, proofs) = commit_at(LOCAL_VERSION, FRESH);
+        let stale = proof_at(LOCAL_VERSION - 1, member());
+        let directory = ProofDirectory {
+            head: local.clone(),
+            proofs: proofs.into_iter().map(|(_, p)| p).collect(),
+        };
+        assert!(matches!(
+            check_topic_admission(&local, &local, &stale, root, member(), NOW),
+            Err(Error::StaleProof { .. })
+        ));
+        let admitted = check_topic_admission_via(
+            &local,
+            &local,
+            &stale,
+            Some(&directory),
+            root,
+            member(),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(admitted.version, local.version);
+        assert_eq!(admitted.adopt, None);
+
+        let (newer, _) = commit_at(LOCAL_VERSION + 1, FRESH);
+        assert!(
+            check_topic_admission_via(
+                &local,
+                &newer,
+                &stale,
+                Some(&directory),
+                root,
+                member(),
+                NOW
+            )
+            .is_err(),
+            "the directory is for the old head, not the adopted one"
+        );
     }
 
     /// The genuine root-signed head at `version`, with every member's proof.

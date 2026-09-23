@@ -424,7 +424,12 @@ mod tests {
 
         let mut swapped = f.rekey.clone();
         let for_b = swapped.entry_for(b).unwrap().key.clone();
-        swapped.entries.iter_mut().find(|e| e.member() == a).unwrap().key = for_b;
+        swapped
+            .entries
+            .iter_mut()
+            .find(|e| e.member() == a)
+            .unwrap()
+            .key = for_b;
         assert!(matches!(
             swapped.verify(f.root.node_id(), 0),
             Err(Error::InconsistentRekey(_))
@@ -445,9 +450,13 @@ mod tests {
         let mut f = fixture(2);
         let forger = NodeIdentity::from_seed([66u8; 32]);
         let member = f.rekey.entries[0].member();
-        let mut forged =
-            SealedFabricKey::seal(&forger, member, f.rekey.head.version, &FabricKey::generate())
-                .unwrap();
+        let mut forged = SealedFabricKey::seal(
+            &forger,
+            member,
+            f.rekey.head.version,
+            &FabricKey::generate(),
+        )
+        .unwrap();
         forged.fabric = f.root.node_id(); // claim the real root; the sig says otherwise
         f.rekey.entries[0].key = forged;
         assert!(matches!(
@@ -509,9 +518,7 @@ mod tests {
         check_roster_inclusion_via(head, Some(&stale), Some(&dir), fabric, who, 0).unwrap();
         check_roster_inclusion_via(head, None, Some(&dir), fabric, who, 0).unwrap();
         // A directory for another head is no help.
-        assert!(
-            check_roster_inclusion_via(&f.previous, None, Some(&dir), fabric, who, 0).is_err()
-        );
+        assert!(check_roster_inclusion_via(&f.previous, None, Some(&dir), fabric, who, 0).is_err());
         // Nothing presented, nothing known: the proof is required.
         assert!(matches!(
             check_roster_inclusion_via(head, None, None, fabric, who, 0),

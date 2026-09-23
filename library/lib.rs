@@ -198,7 +198,8 @@ mod codec;
 mod idp_vectors;
 
 pub use admission::{
-    Admission, AdmitFrame, MAX_ADMIT_FRAME, TOPIC_ADMIT_ALPN, adopt_if_newer, check_topic_admission,
+    Admission, AdmitFrame, MAX_ADMIT_FRAME, TOPIC_ADMIT_ALPN, adopt_if_newer,
+    check_topic_admission, check_topic_admission_via,
 };
 pub use audit::{
     AuditRecord, CallId, OutputDigest, OutputHasher, STDIN_HEAD_MAX, StdinCapture, stdin_head,
