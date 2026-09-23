@@ -51,27 +51,23 @@ The IdP is *bound* at the caller (`login`), *enforced* at the host (`host.json`)
 | [02](done/02-audit-channel.md) | B | 00 | `serve --audit-topic`: responder hosts the topic node, publishes call records; `tail` renders them |
 | [03](done/03-client-call-and-mcp.md) | C | 00 | `wires call` + `wires mcp` (stdio MCP server) over `tools.json` |
 | [04](done/04-idp-login.md) | F | 00 | `wires login` (Google OIDC, nonce-bound), claim published on channel, independent verification |
-| [05](review/05-idp-policy.md) | F | 01, 02, 04 | `serve --require-idp`: gate on verified claims; principal in audit records |
+| [05](done/05-idp-policy.md) | F | 01, 02, 04 | `serve --require-idp`: gate on verified claims; principal in audit records |
 | [06](done/06-cleanup-and-pitch.md) | D | — | Cut noise, README rewritten around the one idea, restart.md reconciled |
 | [07](done/07-demo-local.md) | E | 01–05 | Self-asserting loopback demo script (the gate for the two-machine run) |
 | [08](doing/08-demo-two-machine.md) | E | 07 | Real run: laptop ↔ workbench over relay, Claude Code as the agent, recording |
-| [10](review/10-live-run-fixes.md) | G | 01–04 | Live-run fixes: stdin in call records, quiet stderr, short control-socket path |
+| [10](done/10-live-run-fixes.md) | G | 01–04 | Live-run fixes: stdin in call records, quiet stderr, short control-socket path |
 | [11](done/11-camera-blockers.md) | H | 04, 05, 07 | Camera blockers: 20 s audit stall after login, Safari callback error, `tools add --topic-ticket` |
 | [12](done/12-roles-and-tree.md) | R | 11 | Organize by role: 4-role CLI (`advanced` for plumbing), role folders, drop single-command serve/connect + old demos |
-| [13](review/13-host-json-policy.md) | P | 12 | `host.json`: tools + IdP roles + default deny; `Policy` seam for org rules later |
+| [13](done/13-host-json-policy.md) | P | 12 | `host.json`: tools + IdP roles + default deny; `Policy` seam for org rules later |
 | [14](done/14-invite-join.md) | O | 12 | `init` / `invite` / `join` / `remove`; re-key distributed over the channel |
-| [15](review/15-channel-directory.md) | D2 | 12, 13 | Hosts announce tools on the channel; callers resolve by name — one invite is the only out-of-band step |
-| [17](review/17-readme-why.md) | docs | 12–16 | README: four roles, where each guarantee lives, why it's built this way; `docs/demo.md` |
+| [15](done/15-channel-directory.md) | D2 | 12, 13 | Hosts announce tools on the channel; callers resolve by name — one invite is the only out-of-band step |
+| [17](done/17-readme-why.md) | docs | 12–16 | README: four roles, where each guarantee lives, why it's built this way; `docs/demo.md` |
 | [19](done/19-no-shell-caller.md) | S | 12 | No-shell caller: `wires call --jq/--head/--max-bytes` in-process; wires-only sandbox recipe; benchmark arm 5 |
 | [20](done/20-locked-caller.md) | S2 | 19 | Locked caller mode: `WIRES_LOCKED=1` rejects override flags so a sandboxed agent can't steer `wires call` |
-<<<<<<< HEAD
 | [21](done/21-camera-polish.md) | P2 | 12–20 | Camera polish: heartbeat noise, quiet admin commands, clear removal reason, seal announcements only to current members |
 | [23](backlog/23-inbox.md) | I | 21 | Push to callers: `wires inbox` (local read / `--wait`), host `wires push`, queue + dial-back by key, `host.json` `push` roles, audited |
 | [24](backlog/24-push-demo.md) | E2 | 23 | Push demo (deploy → callback → follow-up) + push-vs-poll benchmark |
 | [22](backlog/22-gossip-role-OPEN.md) | — | parked | **Open question, don't build:** does the core need gossip? Admin-signed host list + direct discovery + OTel sinks; notes the tool-name-squatting weakness |
-=======
-| [21](review/21-camera-polish.md) | P2 | 12–20 | Camera polish: heartbeat noise, quiet admin commands, clear removal reason, seal announcements only to current members |
->>>>>>> worktree-agent-a327951c082d4fed5
 | [18](backlog/18-front-door-OPEN.md) | — | parked | **Open question, don't build:** apex key, invites, `wires join <domain>` |
 | [16](done/16-token-benchmark.md) | bench | 01–03 | MCP (GitHub server, many tools; ± tool search) vs `gh` via `wires call` vs bare `gh`: 5 tasks × 5 runs |
 | [09](backlog/09-witness.md) | stretch | 02 | Key-less witness: stores and verifies call records without decrypting them |
