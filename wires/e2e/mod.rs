@@ -11,6 +11,8 @@
 //!   every call by the admin-signed state (the registry's roles,
 //!   `also_require`, removal with no restart, refusing unassigned services,
 //!   push by the state), and nothing is broadcast to a bystander.
+//! - [`records`] — card 26b: call records streamed from the host's own log
+//!   to authorized readers (`wires watch`).
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -19,6 +21,9 @@ use iroh::Endpoint;
 
 /// Card 27's host side: a `host.json` v2 host decides by the signed state.
 mod services_host;
+
+/// Card 26b: call records streamed from the host's log to authorized readers.
+mod records;
 
 /// The outer bound on any single wait here: generous, and never reached in
 /// the passing case (every wait is on an event, not a clock).

@@ -11,6 +11,8 @@
 //! - **caller** ([`caller`]) — `wires login | services | call | mcp | inbox`:
 //!   runs remote CLIs by service name (`mcp` is the adapter for clients that
 //!   only speak MCP).
+//! - **observer** — `wires watch`: streams call records from the hosts' own
+//!   logs, to readers the registry names (card 26b, [`caller::watch_records`]).
 //!
 //! [`state`] is where the signed state lives on every node and how it moves.
 //!
@@ -76,6 +78,9 @@ Caller — runs remote CLIs by service name (every role joins the same way):
   call      Run a service by name: stdio passes through, its exit code is ours
   mcp       Serve those services as MCP tools over stdio (compatibility)
   inbox     Read what hosts pushed to you; --wait blocks until something arrives
+
+Observer — reads the hosts' call records:
+  watch     Stream call records from your services' hosts, verified (--mine)
 
 Options:
 {options}";
@@ -146,7 +151,11 @@ enum Command {
     /// `--timeout`).
     Inbox(caller::inbox::InboxArgs),
 
-    // --- observer: `wires watch <service>` lands with card 26b ---
+    // --- observer ---
+    /// Stream call records from the hosts of your services: every record of
+    /// a service you are a reader of, otherwise your own (card 26b).
+    Watch(caller::watch_records::WatchArgs),
+
     /// Dev build only: run the hermetic mock OIDC issuer on a loopback port
     /// until killed. Prints `issuer <url>` and `client_id <id>` on stdout.
     #[cfg(feature = "dev-mock-idp")]
@@ -332,6 +341,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        // Exit 77 when every host refused the stream.
+        Command::Watch(a) => {
+            init_quiet_logging();
+            match runtime().block_on(caller::watch_records::watch_cmd(a)) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => exit_with(e),
+            }
+        }
         #[cfg(feature = "dev-mock-idp")]
         Command::DevMockIdp(a) => {
             if let Err(e) = runtime().block_on(dev_mock_idp_cmd(a)) {
@@ -410,7 +427,7 @@ mod tests {
     #[test]
     fn help_shows_the_roles_on_one_screen() {
         let help = Cli::command().render_help().to_string();
-        for role in ["Admin", "Host", "Caller"] {
+        for role in ["Admin", "Host", "Caller", "Observer"] {
             assert!(help.contains(&format!("{role} — ")), "{help}");
         }
         let lines = help.lines().count();

@@ -42,3 +42,4 @@ pub mod pick;
 pub mod services;
 pub mod shape;
 pub mod tools;
+pub mod watch_records;

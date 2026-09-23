@@ -141,8 +141,9 @@ pub(crate) fn services_host(
 }
 
 /// Serve a host on `endpoint`: the session ALPN, the state ALPN (so members
-/// can pull newer signed states from it, and the admin's pushes land), plus
-/// the inbox ALPN when it pushes (and push's direct deliveries dial from
+/// can pull newer signed states from it, and the admin's pushes land), the
+/// record stream (`wires watch`, card 26b), plus the inbox ALPN when it
+/// pushes (and push's direct deliveries dial from
 /// this endpoint). Keep the router alive for as long as the host serves.
 pub(crate) fn services_router(
     endpoint: iroh::Endpoint,
@@ -154,7 +155,14 @@ pub(crate) fn services_router(
             library::STATE_ALPN,
             crate::state::sync::StateResponder(Arc::clone(&host.keystore)),
         )
-        .accept(transport::ALPN, transport::ServicesProtocol(host));
+        .accept(
+            transport::ALPN,
+            transport::ServicesProtocol(Arc::clone(&host)),
+        )
+        .accept(
+            super::record_stream::ALPN,
+            super::record_stream::RecordStream::new(host),
+        );
     if let Some(push) = push {
         push.attach(endpoint);
         builder = builder.accept(library::INBOX_ALPN, push::PushFetch(push));
