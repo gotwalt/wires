@@ -1,5 +1,7 @@
 # Design: provable fabric inclusion (slice 1)
 
+> **Archived 2026-09-22.** Slice-1 design: implemented, then extended by [committed-roster.md](../committed-roster.md). Kept for its reasoning, not as a current spec; code paths cited below may have moved.
+
 The first concrete step toward the [fabric vision](./fabric-vision.md): a
 **root-signed membership credential** that lets a node prove, offline and
 non-interactively, that it belongs to a fabric — and the plumbing to hand that
@@ -13,7 +15,7 @@ verified identity to a served tool with no extra network traffic.
 ## Motivation
 
 `serve` today authenticates the dialer to its key (iroh QUIC) and checks a
-`Grant` with [`check_accept`](../library/policy.rs) — verify root signature,
+`Grant` with [`check_accept`](../../library/policy.rs) — verify root signature,
 `subject == authenticated caller`, TTL, CRL. That gives authorization (*may you
 reach this scope*) but not two things a fabric needs:
 
@@ -29,7 +31,7 @@ the harder revocation/identity questions to later slices by design.
 ## The `Membership` credential
 
 A new pure module, `//library`'s `membership.rs`, mirroring the established
-[`grant.rs`](../library/grant.rs) shape (private borrowed-field body, derive
+[`grant.rs`](../../library/grant.rs) shape (private borrowed-field body, derive
 `Serialize`, sign over `canonical_bytes`, reuse `AlgorithmId`).
 
 ```rust
@@ -104,7 +106,7 @@ The tempting way to "reserve" fields — `#[serde(skip_serializing_if =
 footgun**: an absent field and a present-but-default field produce different
 byte strings, and an attacker can strip an optional, re-encode, and obtain a
 different-but-plausibly-valid blob. That is the classic JSON-signing downgrade
-hole. It is survivable for [`CapabilityTicket`](../library/ticket.rs) only because
+hole. It is survivable for [`CapabilityTicket`](../../library/ticket.rs) only because
 tickets are *not signed* (the `Grant` inside them is, and a grant body has a
 fixed key set).
 
@@ -122,11 +124,11 @@ never creating a "same body, two valid encodings" hazard.
 > (`CapabilityTicket`).
 
 `Error::UnsupportedVersion` is a one-line addition to
-[`library/error.rs`](../library/error.rs), mirroring `UnsupportedAlgorithm`.
+[`library/error.rs`](../../library/error.rs), mirroring `UnsupportedAlgorithm`.
 
 ## Inclusion policy
 
-Alongside `check_accept` in [`library/policy.rs`](../library/policy.rs), reusing
+Alongside `check_accept` in [`library/policy.rs`](../../library/policy.rs), reusing
 the existing `Crl` and the existing `SubjectMismatch` / `Expired` / `Revoked`
 errors verbatim:
 
@@ -155,7 +157,7 @@ and proves nothing about who is presenting it.
 
 ## The session handshake
 
-[`Frame::Handshake`](../library/session.rs) carries the credential. Today it is
+[`Frame::Handshake`](../../library/session.rs) carries the credential. Today it is
 `Handshake { grant: Grant }`; it becomes:
 
 ```rust
@@ -184,7 +186,7 @@ connect time rather than as a confusing decode error mid-handshake.
 
 ## Responder logic and serve modes
 
-In `serve_session` ([`wires/transport.rs`](../wires/transport.rs)), the served
+In `serve_session` ([`wires/transport.rs`](../../wires/transport.rs)), the served
 `scope` becomes `Option<&Scope>`. After reading the handshake frame:
 
 1. `check_inclusion(&membership, trust_root, caller, now_unix(), crl)?` — **always**.
@@ -196,7 +198,7 @@ In `serve_session` ([`wires/transport.rs`](../wires/transport.rs)), the served
    membership.member`. Redundant (both are pinned to `caller`) but cheap, and it
    defends against a future refactor that loosens one path.
 
-This yields two modes, surfaced in [`wires/main.rs`](../wires/main.rs) by making
+This yields two modes, surfaced in [`wires/main.rs`](../../wires/main.rs) by making
 `--scope` optional on `ServeArgs`:
 
 - **With `--scope`** — membership **and** a matching grant are required (today's
@@ -311,7 +313,7 @@ keeps tickets small.
 ## Implementation roadmap
 
 Build is **Bazel-only** (`bazel test //...`; never `cargo build`/`cargo test` —
-see [CLAUDE.md](../CLAUDE.md)). New `.rs` files are picked up by each package's
+see [CLAUDE.md](../../CLAUDE.md)). New `.rs` files are picked up by each package's
 `glob(["*.rs"])` srcs; no `BUILD` edits are needed because this slice adds **no
 new external crate** (it reuses `serde`, `serde_json`, `base64`, `hex`, and the
 existing identity/Ed25519 plumbing). Follow the repo's type-driven order:

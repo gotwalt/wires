@@ -1,6 +1,8 @@
 # The fabric: provable membership over the wires layer
 
-The [README](../README.md) makes wires' thesis precise: a **capability-addressed
+> **Archived 2026-09-22.** The "fabric" framing was retired by the restart and then by the 2026-09-22 pitch (remote CLIs, IdP-authenticated callers, observable calls — see [docs/board](../board/README.md)). The membership mechanics it motivated live on in [committed-roster.md](../committed-roster.md).
+
+The [README](../../README.md) makes wires' thesis precise: a **capability-addressed
 transport whose native PDU is stdio**. The address is a capability, the
 credential is a non-transferable human-issued grant, and a tool call is an
 authenticated session. That layer is built.
@@ -15,7 +17,7 @@ instant the session opens, with no extra round-trip.
 > step — a root-signed membership credential — is specified in
 > [provable-fabric-inclusion.md](./provable-fabric-inclusion.md). The next — the
 > **committed roster** (its data structure, offline verification, and local
-> wiring) — is specified in [committed-roster.md](./committed-roster.md); the
+> wiring) — is specified in [committed-roster.md](../../committed-roster.md); the
 > roster's *distribution* (gossip head, sealed blobs, blind node) and the
 > federation layer described below remain **deferred** and are called out as such.
 
@@ -87,7 +89,7 @@ universal base (and the whole of the first slice). The revocation strategy is a
 ### Committed roster — the personal-fabric strategy
 
 > The credential, the signed head, the Merkle inclusion proof, and offline
-> verification are specified in [committed-roster.md](./committed-roster.md)
+> verification are specified in [committed-roster.md](../../committed-roster.md)
 > (slice 2b). The *distribution* described in this section — gossip for the head,
 > sealed blobs for the full set, and the blind persistence node — is the deferred
 > follow-on (slice 2c).
@@ -206,7 +208,7 @@ that **knows who it is talking to** before it does any work.
 | Slice | Adds | Revocation | Status |
 |---|---|---|---|
 | **1 — Provable inclusion** | Root-signed `Membership` credential; verified caller identity passed to the served child via env vars | CRL + short TTL | **Specified** ([spec](./provable-fabric-inclusion.md)) |
-| **2 — Personal fabric** | Pairing issues memberships; committed roster (Merkle head via gossip, sealed full set via blobs, blind persistence node) + enumeration | Re-signed roster head | Roster **specified** ([spec](./committed-roster.md)); pairing + distribution deferred |
+| **2 — Personal fabric** | Pairing issues memberships; committed roster (Merkle head via gossip, sealed full set via blobs, blind persistence node) + enumeration | Re-signed roster head | Roster **specified** ([spec](../../committed-roster.md)); pairing + distribution deferred |
 | **3 — Federation** | `authority_chain` delegation; federated identity claims (org, role, email) | Short-TTL renewal | Deferred |
 
 Each slice is buildable on its own and leaves the credential wire-format
