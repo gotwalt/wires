@@ -192,7 +192,7 @@ as untrusted input, like any tool output.
 ```bash
 python3 bench/permission-probe.py --out /tmp/probe.jsonl                    # every probe, ~$0.20 with Haiku
 python3 bench/permission-probe.py --rule 'Bash(wires call gh:*)' --out /tmp/probe.jsonl
-python3 bench/permission-probe.py --real-wires bazel-bin/wires/wires --locked --out /tmp/probe.jsonl   # card 20
+python3 bench/permission-probe.py --real-wires target/release/wires --locked --out /tmp/probe.jsonl   # card 20
 PROBE_MODE=dontAsk python3 bench/permission-probe.py --only control-cat,semicolon-read --out /tmp/probe.jsonl
 python3 bench/permission-probe.py --deny 'Bash(cat:*),Bash(echo:*)' --only control-cat,semicolon-read --out /tmp/probe.jsonl
 ```

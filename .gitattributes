@@ -1,5 +1,2 @@
-# List generated files
-# - prevents GitHub from showing deltas during code review
-# - informs the rules_lint formatter not to apply formatting rules
-maven_install.json     linguist-generated=true
-.githooks/pre-commit    rules-lint-ignored=true
+# Generated files: hide their diffs in code review.
+Cargo.lock linguist-generated=true

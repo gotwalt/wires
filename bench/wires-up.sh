@@ -17,7 +17,7 @@ set -euo pipefail
 D="${BENCH_WIRES_DIR:-/tmp/wb16}"
 WIRES="${WIRES_BIN:-$D/bin/wires}"
 [ -x "$WIRES" ] || {
-	echo "wires-up: no wires binary at $WIRES (bazel build //wires; copy bazel-bin/wires/wires there)" >&2
+	echo "wires-up: no wires binary at $WIRES (cargo build --release -p wires; copy target/release/wires there)" >&2
 	exit 1
 }
 

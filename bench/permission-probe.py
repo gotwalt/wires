@@ -27,7 +27,7 @@ outside the scratch directory.
   python3 bench/permission-probe.py --out bench/results/permission-probe.jsonl
   python3 bench/permission-probe.py --rule 'Bash(wires call gh:*)' --only semicolon-write
 
-Card 20 (locked caller mode): `--real-wires bazel-bin/wires/wires [--locked]`
+Card 20 (locked caller mode): `--real-wires target/release/wires [--locked]`
 swaps the fake for the real binary (empty scratch WIRES_HOME, so nothing is
 dialed) and runs WIRES_PROBES instead: `wires call`'s own override flags and
 stdin, each counted as "ran" unless wires refused it in locked mode.

@@ -1030,13 +1030,13 @@ mod tests {
         assert_eq!(s.fresh, 2);
         assert_eq!(s.ids, [a.id, b.id]);
         // A re-delivery (lost ack) is acknowledged but not stored twice.
-        let s = mb.store(&[a.clone()]).unwrap();
+        let s = mb.store(std::slice::from_ref(&a)).unwrap();
         assert_eq!((s.fresh, s.ids.clone()), (0, vec![a.id]));
         let taken = mb.take_unread().unwrap();
         assert_eq!(taken, [a.clone(), b.clone()]);
         assert!(!mb.has_unread());
         // Read, and delivered again: still a duplicate.
-        assert_eq!(mb.store(&[b.clone()]).unwrap().fresh, 0);
+        assert_eq!(mb.store(std::slice::from_ref(&b)).unwrap().fresh, 0);
         assert!(mb.take_unread().unwrap().is_empty());
     }
 

@@ -918,8 +918,11 @@ mod tests {
             q.insert(e.clone(), 8);
         }
         // Expired messages are never handed out.
-        assert_eq!(q.pending(node(2), 50, 8), [live.message.clone()]);
-        assert_eq!(q.expire(50), [old.clone()]);
+        assert_eq!(
+            q.pending(node(2), 50, 8),
+            std::slice::from_ref(&live.message)
+        );
+        assert_eq!(q.expire(50), std::slice::from_ref(&old));
         assert_eq!(q.remove(node(2), &[other.message.id]), []);
         assert_eq!(q.remove(node(2), &[live.message.id]), [live]);
         assert_eq!(q.len_for(node(2)), 0);

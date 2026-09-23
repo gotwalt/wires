@@ -1,3 +1,0 @@
-# Agent scratch worktrees: each is a full checkout of this repo, so Bazel would
-# otherwise discover a duplicate copy of every package under `//...`.
-.claude

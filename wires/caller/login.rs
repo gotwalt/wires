@@ -1153,7 +1153,7 @@ mod tests {
         let err = fetcher
             .verify(
                 &stale,
-                &[idp.issuer.clone()],
+                std::slice::from_ref(&idp.issuer),
                 &[Audience::new(idp.client_id.clone())],
                 now,
             )

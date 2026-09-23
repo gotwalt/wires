@@ -221,7 +221,7 @@ Three honest limits:
 ## Reproduce
 
 ```bash
-bazel build //wires
+cargo build --release -p wires                # run.sh also does this
 ./bench/tool-surface.sh                       # 26 tools, bytes per tool
 ./bench/run.sh --reps 1                       # smoke: 1 run per arm per task (~$1.50)
 ./bench/run.sh --reps 5                       # full; appends to bench/results/<utc-date>.jsonl
