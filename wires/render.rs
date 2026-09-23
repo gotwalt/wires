@@ -8,14 +8,17 @@
 //!
 //! ```text
 //! ▶ 3fa2 alice@corp (a1b2…) db_query "select count(*) from orders"
-//! ■ 3fa2 exit 0 · 41 ms · 3.1 KiB out · blake3 9c1e…
+//! ■ 3fa2 exit 0 · 41 ms · stdin "select customer, sum(total) …" · 3.1 KiB out · blake3 9c1e…
 //! ✗ a1b2… db_query denied: membership rejected: revoked
 //! 🪪 a1b2… claims identity (unverified)
 //! ```
 //!
 //! The first four hex characters of the [`CallId`](library::CallId) pair a
 //! `▶` with its `■`. A caller is shown by its verified principal's email when
-//! the responder stamped one, else by its short node id.
+//! the responder stamped one, else by its short node id. A `■` quotes the
+//! head of the call's stdin (whitespace collapsed, cut at
+//! [`STDIN_PREVIEW_CHARS`]) when the caller sent any; `--json` carries the
+//! full captured head.
 //!
 //! Every string that came off the wire (arguments, refusal reasons, emails)
 //! is escaped before it reaches the terminal: a record is written by a
@@ -29,6 +32,9 @@ use library::{AuditRecord, ChannelRecord, IdentityClaim, NodeId, Principal};
 
 /// How many hex characters of a node id or digest a record line shows.
 const SHORT_HEX: usize = 4;
+
+/// How many characters of a call's stdin a `■` line quotes.
+pub const STDIN_PREVIEW_CHARS: usize = 80;
 
 /// One human line for `record` (no clock/sender prefix — the caller adds it).
 pub fn record_line(record: &ChannelRecord) -> String {
@@ -66,13 +72,21 @@ pub fn audit_line(record: &AuditRecord) -> String {
             duration_ms,
             stdout_bytes,
             stdout_digest,
+            stdin_bytes,
+            stdin_head,
             ..
-        } => format!(
-            "■ {} exit {exit} · {duration_ms} ms · {} out · blake3 {}…",
-            short_hex(&call.hex()),
-            human_bytes(*stdout_bytes),
-            short_hex(&stdout_digest.hex())
-        ),
+        } => {
+            let stdin = stdin_head
+                .as_deref()
+                .map(|head| format!("stdin {} · ", stdin_preview(head, *stdin_bytes)))
+                .unwrap_or_default();
+            format!(
+                "■ {} exit {exit} · {duration_ms} ms · {stdin}{} out · blake3 {}…",
+                short_hex(&call.hex()),
+                human_bytes(*stdout_bytes),
+                short_hex(&stdout_digest.hex())
+            )
+        }
         AuditRecord::Denied {
             caller,
             tool,
@@ -125,6 +139,20 @@ pub fn human_bytes(bytes: u64) -> String {
         unit += 1;
     }
     format!("{value:.1} {}", UNITS[unit])
+}
+
+/// A call's stdin as a `■` line quotes it: whitespace runs collapsed to one
+/// space, at most [`STDIN_PREVIEW_CHARS`] characters, ` …` when anything was
+/// left out (by this cut, or because `stdin_bytes` is more than the head
+/// holds), and double-quoted with escapes so it stays on one line.
+pub fn stdin_preview(head: &str, stdin_bytes: u64) -> String {
+    let collapsed = head.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview: String = collapsed.chars().take(STDIN_PREVIEW_CHARS).collect();
+    if preview.len() < collapsed.len() || stdin_bytes > head.len() as u64 {
+        preview.truncate(preview.trim_end().len());
+        preview.push_str(" …");
+    }
+    format!("{preview:?}")
 }
 
 /// The leading [`SHORT_HEX`] characters of a hex string.
@@ -246,6 +274,9 @@ mod tests {
             stdout_bytes: h.bytes(),
             stderr_bytes: 0,
             stdout_digest: digest,
+            stdin_bytes: 0,
+            stdin_digest: library::OutputDigest::empty(),
+            stdin_head: None,
         });
         assert_eq!(
             line,
@@ -254,6 +285,48 @@ mod tests {
                 &digest.hex()[..4]
             )
         );
+    }
+
+    #[test]
+    fn finished_line_quotes_the_head_of_stdin() {
+        let sql = "select customer,\n       sum(total)\n  from orders\n group by customer\n order by 2 desc\n limit 10;\n";
+        let mut stdin = library::StdinCapture::new();
+        stdin.update(sql.as_bytes());
+        let digest = OutputHasher::new().finish();
+        let line = audit_line(&AuditRecord::Finished {
+            call: call(),
+            exit: 0,
+            duration_ms: 8,
+            stdout_bytes: 92,
+            stderr_bytes: 0,
+            stdout_digest: digest,
+            stdin_bytes: stdin.bytes(),
+            stdin_digest: stdin.digest(),
+            stdin_head: stdin.head(),
+        });
+        assert_eq!(
+            line,
+            format!(
+                "■ 3fa2 exit 0 · 8 ms · stdin \"select customer, sum(total) from orders group by customer order by 2 desc limit …\" · 92 B out · blake3 {}…",
+                &digest.hex()[..4]
+            )
+        );
+    }
+
+    #[test]
+    fn stdin_preview_cuts_long_and_partial_input() {
+        let long = "word ".repeat(40);
+        let preview = stdin_preview(&long, long.len() as u64);
+        assert!(preview.ends_with(" …\""), "{preview}");
+        assert!(
+            preview.chars().count() <= STDIN_PREVIEW_CHARS + 4,
+            "{preview}"
+        );
+        // A short head, but the call sent more than the head holds.
+        assert_eq!(stdin_preview("abc", 10_000), "\"abc …\"");
+        assert_eq!(stdin_preview("abc", 3), "\"abc\"");
+        // Quotes and control characters are escaped, never raw.
+        assert_eq!(stdin_preview("a\"b\u{1b}c", 5), "\"a\\\"b\\u{1b}c\"");
     }
 
     #[test]
@@ -316,6 +389,22 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn any_stdin_renders_on_one_line(head in "(?s).{0,120}", extra in 0u64..10) {
+            let line = audit_line(&AuditRecord::Finished {
+                call: call(),
+                exit: 0,
+                duration_ms: 0,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+                stdout_digest: OutputHasher::new().finish(),
+                stdin_bytes: head.len() as u64 + extra,
+                stdin_digest: OutputHasher::new().finish(),
+                stdin_head: Some(head),
+            });
+            prop_assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
+
         #[test]
         fn any_argv_renders_on_one_line(args in proptest::collection::vec("[^\u{0}]{0,12}", 0..6)) {
             let line = audit_line(&AuditRecord::Started {
