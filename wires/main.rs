@@ -83,7 +83,7 @@ Caller — runs remote CLIs (every role joins the same way):
   inbox     Read what hosts pushed to you; --wait blocks until something arrives
 
 Observer — watches calls:
-  watch     Stream a channel: every call, refusal and identity as it happens
+  watch     Stream call records from your services' hosts, verified (--mine)
 
 Options:
 {options}";
@@ -158,9 +158,9 @@ enum Command {
     Inbox(caller::inbox::InboxArgs),
 
     // --- observer ---
-    /// Join a channel and stream it: every call record, refusal and identity
-    /// claim, as it happens.
-    Watch(channel::watch::WatchArgs),
+    /// Stream call records from the hosts of your services: every record of
+    /// a service you are a reader of, otherwise your own (card 26b).
+    Watch(caller::watch_records::WatchArgs),
 
     /// Dev build only: run the hermetic mock OIDC issuer on a loopback port
     /// until killed. Prints `issuer <url>` and `client_id <id>` on stdout.
@@ -355,8 +355,10 @@ fn main() {
         // including exit 77 when the refusal came from the roster rather than
         // from the network.
         Command::Watch(a) => {
-            if let Err(e) = runtime().block_on(channel::watch::watch_cmd(a)) {
-                exit_with(e);
+            init_quiet_logging();
+            match runtime().block_on(caller::watch_records::watch_cmd(a)) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => exit_with(e),
             }
         }
         #[cfg(feature = "dev-mock-idp")]

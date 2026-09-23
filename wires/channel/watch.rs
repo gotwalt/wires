@@ -859,9 +859,11 @@ mod tests {
 
     #[test]
     fn watch_parses_the_documented_flags() {
-        let cli = Cli::try_parse_from(["wires", "watch", "ops"]).unwrap();
+        let cli = Cli::try_parse_from(["wires", "advanced", "tail", "ops"]).unwrap();
         match cli.command {
-            Command::Watch(a) => {
+            Command::Advanced(AdvancedArgs {
+                cmd: Advanced::Tail(a),
+            }) => {
                 assert_eq!(a.common.topic, "ops");
                 assert_eq!(a.backfill, DEFAULT_BACKFILL, "the spec's default is 200");
                 assert!(!a.json);
@@ -869,10 +871,13 @@ mod tests {
             }
             _ => panic!("expected watch"),
         }
+        // (`wires watch` is card 26b's record stream now; the channel tail
+        // lives on as `advanced tail` until the channel goes.)
         // `--peer` is repeatable; the rest mirror `call`.
         let cli = Cli::try_parse_from([
             "wires",
-            "watch",
+            "advanced",
+            "tail",
             "ops",
             "--peer",
             "t1",
@@ -888,7 +893,9 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::Watch(a) => {
+            Command::Advanced(AdvancedArgs {
+                cmd: Advanced::Tail(a),
+            }) => {
                 assert_eq!(a.common.peer, vec!["t1".to_string(), "t2".to_string()]);
                 assert_eq!(a.backfill, 7);
                 assert!(a.json);
@@ -898,8 +905,13 @@ mod tests {
             _ => panic!("expected watch"),
         }
         // No topic is the joined channel (card 14), resolved at preflight.
-        match Cli::try_parse_from(["wires", "watch"]).unwrap().command {
-            Command::Watch(a) => assert!(a.common.topic.is_empty()),
+        match Cli::try_parse_from(["wires", "advanced", "tail"])
+            .unwrap()
+            .command
+        {
+            Command::Advanced(AdvancedArgs {
+                cmd: Advanced::Tail(a),
+            }) => assert!(a.common.topic.is_empty()),
             _ => panic!("expected watch"),
         }
         // The old name survives, hidden, under `advanced`.

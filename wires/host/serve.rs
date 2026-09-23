@@ -297,7 +297,14 @@ pub(crate) fn services_router(
     push: Option<Arc<push::PushHost>>,
 ) -> iroh::protocol::Router {
     let mut builder = iroh::protocol::Router::builder(endpoint.clone())
-        .accept(transport::ALPN, transport::ServicesProtocol(host));
+        .accept(
+            transport::ALPN,
+            transport::ServicesProtocol(Arc::clone(&host)),
+        )
+        .accept(
+            super::record_stream::ALPN,
+            super::record_stream::RecordStream::new(host),
+        );
     if let Some(push) = push {
         push.attach(endpoint);
         builder = builder.accept(library::INBOX_ALPN, push::PushFetch(push));

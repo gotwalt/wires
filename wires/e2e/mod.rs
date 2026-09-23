@@ -96,6 +96,9 @@ mod push;
 /// Card 27c's host side: a `host.json` v2 host decides by the signed state.
 mod services_host;
 
+/// Card 26b: call records streamed from the host's log to authorized readers.
+mod records;
+
 /// The outer bound on any single wait here.
 ///
 /// Generous because a QUIC handshake plus a gossip join on a loaded CI machine
