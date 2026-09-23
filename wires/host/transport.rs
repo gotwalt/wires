@@ -961,6 +961,27 @@ fn authorize(
     })
 }
 
+/// The credential half of [`authorize`] for a peer that runs no tool: fabric
+/// inclusion under this connection's CRL, then the roster head gate. What
+/// the inbox protocol (card 23) asks of a caller fetching its pushes before
+/// the host's push policy is consulted. Returns the admitting roster version;
+/// the error carries the same prefixes a call's refusal does.
+pub(crate) fn check_member(
+    config: &ServeConfig,
+    membership: &Membership,
+    proof: Option<&InclusionProof>,
+    caller: NodeId,
+    now: i64,
+) -> Result<Option<u64>> {
+    let loaded = load_policy(config).map_err(|e| {
+        tracing::warn!("credential sources unusable: {e:#}");
+        anyhow!("responder configuration error")
+    })?;
+    check_inclusion(membership, config.trust_root, caller, now, &loaded.crl)
+        .map_err(|e| anyhow!("membership rejected: {e}"))?;
+    roster_gate(config, loaded.head.as_ref(), proof, caller, now)
+}
+
 /// The roster head gate. With no enforced `head`, returns `Ok(None)` (slice-1
 /// behavior). With one, requires `proof` and checks the caller's *current*
 /// membership against that head, returning the admitting version for

@@ -89,6 +89,10 @@ mod onboard;
 /// name, tools are visible only to members allowed to run them.
 mod directory;
 
+/// Card 23's push tests: a host pushes to a caller by key — delivered to a
+/// resident receiver, or fetched by `wires inbox` — gated and recorded.
+mod push;
+
 /// The outer bound on any single wait here.
 ///
 /// Generous because a QUIC handshake plus a gossip join on a loaded CI machine
@@ -1623,6 +1627,7 @@ fn hosted_responder(
             crate::channel::idp_view::IdpTrust::from_vars(None, None),
         )),
         announcer: None,
+        push: None,
     };
     let ctx = crate::channel::context::TopicContext {
         node: NodeIdentity::from_seed(r_seed),

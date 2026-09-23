@@ -577,7 +577,7 @@ where
 
 /// The joined channel's context for a caller with `creds` (the keystore's
 /// channel, peers and credentials; `--node-seed` etc. override).
-fn caller_context(creds: &CredArgs) -> Result<TopicContext> {
+pub(crate) fn caller_context(creds: &CredArgs) -> Result<TopicContext> {
     let args = TopicArgs {
         topic: String::new(),
         peer: Vec::new(),
@@ -603,7 +603,7 @@ fn now_ms() -> i64 {
 
 /// The directory for `ctx`'s channel: the cache if `until` already holds on
 /// it, else refreshed (see [`refresh`]) and saved.
-async fn fresh_directory(
+pub(crate) async fn fresh_directory(
     ctx: &TopicContext,
     budget: Duration,
     until: Until<'_>,

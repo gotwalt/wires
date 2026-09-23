@@ -16,11 +16,14 @@
 //! - [`identity`] — the index of verified IdP claims and the per-call lookup.
 //! - [`announce`] — the host's tools, announced on the channel and sealed per
 //!   member by [`Policy::allowed_tools`](policy::Policy::allowed_tools) (card 15).
+//! - [`push`] — `wires push`: messages to callers by key, queued, delivered
+//!   or fetched, gated by `host.json` `push.allow`, recorded (card 23).
 
 pub mod announce;
 pub mod audit;
 pub mod config;
 pub mod identity;
 pub mod policy;
+pub mod push;
 pub mod serve;
 pub mod transport;

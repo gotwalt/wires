@@ -189,6 +189,9 @@ fn owner_uid(_path: &Path) -> Option<u32> {
 pub enum Request {
     /// Publish `text` as this node's next message on the topic.
     Publish(Publish),
+    /// Push a message to callers (`wires push`, card 23): only a resident
+    /// `wires serve` whose `host.json` has a `push` section answers it.
+    Push(crate::host::push::PushSpec),
 }
 
 /// The body of a [`Request::Publish`].
@@ -204,6 +207,8 @@ pub struct Publish {
 pub enum Response {
     /// Sealed, appended, and broadcast; `seq` is the sequence it was allocated.
     Ok(Published),
+    /// A push was handled: what happened per recipient.
+    Pushed(crate::host::push::PushReport),
     /// Refused, with the tail's own words. Never fatal to the connection: the
     /// next line is still read.
     Err(String),
@@ -302,12 +307,22 @@ impl ControlSocket {
     /// unrecoverably; the caller runs it as a task and drops it at shutdown
     /// (which unlinks the socket, this value being moved in).
     pub async fn serve(self, tx: mpsc::Sender<PublishRequest>) {
+        self.serve_with(tx, None).await
+    }
+
+    /// [`serve`](Self::serve), with `push` requests going to `push`.
+    pub async fn serve_with(
+        self,
+        tx: mpsc::Sender<PublishRequest>,
+        push: Option<mpsc::Sender<crate::host::push::PushCommand>>,
+    ) {
         loop {
             match self.listener.accept().await {
                 Ok((stream, _)) => {
                     let tx = tx.clone();
+                    let push = push.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = serve_stream(stream, tx).await {
+                        if let Err(e) = serve_stream(stream, tx, push).await {
                             tracing::warn!("control connection ended: {e:#}");
                         }
                     });
@@ -326,8 +341,19 @@ impl ControlSocket {
     ///
     /// The socket moves into the task, so aborting the handle (or dropping the
     /// runtime) drops the socket and unlinks the file.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn spawn(self, tx: mpsc::Sender<PublishRequest>) -> JoinHandle<()> {
         tokio::spawn(self.serve(tx))
+    }
+
+    /// [`spawn`](Self::spawn), also answering `push` requests through `push`
+    /// (a host with `host.json` `push`; `None` refuses them).
+    pub fn spawn_with(
+        self,
+        tx: mpsc::Sender<PublishRequest>,
+        push: Option<mpsc::Sender<crate::host::push::PushCommand>>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(self.serve_with(tx, push))
     }
 }
 
@@ -342,9 +368,13 @@ impl Drop for ControlSocket {
 }
 
 /// Serve one accepted connection.
-async fn serve_stream(stream: UnixStream, tx: mpsc::Sender<PublishRequest>) -> Result<()> {
+async fn serve_stream(
+    stream: UnixStream,
+    tx: mpsc::Sender<PublishRequest>,
+    push: Option<mpsc::Sender<crate::host::push::PushCommand>>,
+) -> Result<()> {
     let (recv, send) = stream.into_split();
-    serve_conn(recv, send, tx).await
+    serve_conn_with(recv, send, tx, push).await
 }
 
 /// The NDJSON server loop over one duplex pair — the testable half of
@@ -355,10 +385,26 @@ async fn serve_stream(stream: UnixStream, tx: mpsc::Sender<PublishRequest>) -> R
 /// request is answered with `{"err":…}` rather than by hanging up: a client that
 /// sent one bad line usually has good ones behind it, and a silent close would
 /// look like a dead tail.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn serve_conn<R, W>(
+    recv: R,
+    send: W,
+    tx: mpsc::Sender<PublishRequest>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    serve_conn_with(recv, send, tx, None).await
+}
+
+/// [`serve_conn`], with `push` requests going to `push` (refused when it is
+/// `None`: this process is not a host that pushes).
+pub(crate) async fn serve_conn_with<R, W>(
     recv: R,
     mut send: W,
     tx: mpsc::Sender<PublishRequest>,
+    push: Option<mpsc::Sender<crate::host::push::PushCommand>>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -372,11 +418,39 @@ where
         }
         let response = match serde_json::from_slice::<Request>(&line) {
             Ok(Request::Publish(publish)) => dispatch(&tx, publish.text).await,
+            Ok(Request::Push(spec)) => dispatch_push(push.as_ref(), spec).await,
             Err(e) => Response::Err(truncate_reason(format!("malformed request: {e}"))),
         };
         write_response(&mut send, &response).await?;
     }
     Ok(())
+}
+
+/// Hand one push to the host's push service and wait for its report.
+async fn dispatch_push(
+    push: Option<&mpsc::Sender<crate::host::push::PushCommand>>,
+    spec: crate::host::push::PushSpec,
+) -> Response {
+    let Some(push) = push else {
+        return Response::Err(
+            "this process sends no pushes: run `wires push` on a host whose host.json has a \
+             `push` section, while its `wires serve` is running"
+                .into(),
+        );
+    };
+    let (reply, answer) = oneshot::channel();
+    if push
+        .send(crate::host::push::PushCommand { spec, reply })
+        .await
+        .is_err()
+    {
+        return Response::Err("the host is shutting down".into());
+    }
+    match answer.await {
+        Ok(Ok(report)) => Response::Pushed(report),
+        Ok(Err(reason)) => Response::Err(truncate_reason(reason)),
+        Err(_) => Response::Err("the host dropped the push without answering".into()),
+    }
 }
 
 /// Hand one publish to the tail loop and wait for its verdict.
@@ -509,7 +583,36 @@ impl ControlClient {
         let request = Request::Publish(Publish {
             text: text.to_string(),
         });
-        let mut bytes = serde_json::to_vec(&request).context("encoding a publish request")?;
+        match self.request(&request, budget).await? {
+            Response::Ok(Published { seq }) => Ok(seq),
+            Response::Pushed(_) => bail!("the tail answered a publish with a push report"),
+            Response::Err(reason) => Err(anyhow!("the tail refused the publish: {reason}")),
+        }
+    }
+
+    /// Ask the resident host to push `spec` (card 23); its per-recipient
+    /// report.
+    pub async fn push(
+        &mut self,
+        spec: crate::host::push::PushSpec,
+    ) -> Result<crate::host::push::PushReport> {
+        match self
+            .request(&Request::Push(spec), PUBLISH_REPLY_TIMEOUT)
+            .await?
+        {
+            Response::Pushed(report) => Ok(report),
+            Response::Ok(_) => bail!("the host answered a push with a publish"),
+            Response::Err(reason) => Err(anyhow!("the host refused the push: {reason}")),
+        }
+    }
+
+    /// Send one request line and read its reply line within `budget`.
+    async fn request(
+        &mut self,
+        request: &Request,
+        budget: std::time::Duration,
+    ) -> Result<Response> {
+        let mut bytes = serde_json::to_vec(request).context("encoding a control request")?;
         bytes.push(b'\n');
         self.writer
             .write_all(&bytes)
@@ -540,16 +643,13 @@ impl ControlClient {
                 self.path.display()
             );
         }
-        match serde_json::from_slice::<Response>(&line).with_context(|| {
+        serde_json::from_slice::<Response>(&line).with_context(|| {
             format!(
                 "parsing the tail's reply from {} ({:?})",
                 self.path.display(),
                 String::from_utf8_lossy(&line)
             )
-        })? {
-            Response::Ok(Published { seq }) => Ok(seq),
-            Response::Err(reason) => Err(anyhow!("the tail refused the publish: {reason}")),
-        }
+        })
     }
 }
 

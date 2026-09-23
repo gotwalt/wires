@@ -295,6 +295,10 @@ pub struct Hosted {
     /// Announces the host's tools on the channel (card 15); `None` in
     /// tests that only exercise call records.
     pub announcer: Option<crate::host::announce::Announcer>,
+    /// Pushes to callers (card 23): the inbox ALPN's fetch side, `wires
+    /// push` over the control socket, and the expiry sweep. `None` without a
+    /// `push` section in `host.json`.
+    pub push: Option<Arc<crate::host::push::PushHost>>,
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ use clap::Args;
 use library::NodeId;
 
 use super::config::HostConfig;
-use super::{announce, audit, identity, transport};
+use super::{announce, audit, identity, push, transport};
 use crate::admin::keystore;
 use crate::caller::jwks;
 use crate::channel::context::{TopicArgs, TopicContext};
@@ -172,11 +172,27 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
                 ),
                 _ => None,
             };
+            let identities = identities.expect("built with the audit context");
+            // Pushes to callers (card 23), authorized by the same policy and
+            // roster view, recorded through the same sink.
+            let push = host.push.as_ref().map(|_| {
+                Arc::new(
+                    push::PushHost::new(
+                        node.node_id(),
+                        Arc::clone(&config),
+                        announce::roster_view(Arc::clone(&config), Arc::clone(&ctx.keystore)),
+                        Arc::clone(&identities),
+                        host.logs_push_bodies(),
+                    )
+                    .persisted(ctx.home.join(push::QUEUE_FILE), Arc::clone(&ctx.keystore)),
+                )
+            });
             let hosted = audit::Hosted {
                 session: transport::SessionProtocol(config),
                 records,
-                identities: identities.expect("built with the audit context"),
+                identities,
                 announcer,
+                push,
             };
             run_tail(&ctx, 0, false, Some(hosted)).await
         }

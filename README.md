@@ -304,6 +304,26 @@ the tool and its arguments. Rules a table can't express (CEL, Rego, a webhook)
 would be a second implementation behind a `"policy"` block. That block
 doesn't exist yet.
 
+**Hosts can call the agent back.** A webhook needs the receiver to have a
+public HTTPS endpoint, and an agent on a laptop or in a sandbox has none. A
+caller here is addressed by its key, so a host can push to it with neither
+side exposing anything: `wires push --to "$WIRES_CALLER_NODE" --subject
+build-41 -- "failed: …"` from a tool's background job (every tool gets its
+verified caller's id in that variable). The host queues the message, dials the
+caller's resident `wires watch` by key, and otherwise keeps it (24 h by
+default) for the caller's next `wires inbox`, which fetches it. No harness
+change is needed: an agent runs `wires inbox` on a loop, or `wires inbox
+--wait` as a background command, which costs no turns while it waits.
+`host.json`'s `push.allow` decides who may receive (default nobody), checked
+at send and again at delivery or fetch, so a removed member gets nothing. Each
+push is recorded on the channel (`⇢ … "build-41" fetched`), subject only
+unless `"log_body": true`. Every inbox line starts with the sender as the
+caller verified it, because a push is **untrusted input to a model**:
+
+```
+2026-09-23 16:04:05Z  from host 51442ef9 (verified)  build-41  failed: test_orders_total
+```
+
 ## Giving an agent only `wires`
 
 A Claude Code rule like `Bash(wires call:*)` is **not airtight** on its own.
@@ -382,13 +402,15 @@ To make `wires` the boundary, use a structural setup:
 | | `wires remove <name\|node-id>` | Drop a node; the re-key is published on the channel, and hosts that adopt it refuse the node's next call. |
 | | `wires advanced …` | Plumbing (below). |
 | **host** | `wires serve host.json` | Expose the file's tools, check every caller's membership, roster inclusion and role, exec the tool per call, announce the tools, and record every call and refusal on the file's `channel`. `--check` validates and prints who may run what. |
+| | `wires push --to <node-id\|role> --subject S [--ttl D] -- <body>` | Hand a message for a caller to this machine's running `serve` (body from stdin if none is given). Prints `delivered`, `queued` or `denied` per recipient; exits `77` if every recipient was refused. |
 | **caller** | `wires id` | Print this node's id (creating its key on first use). |
 | | `wires join <token>` | Install an invite: credentials, the channel, bootstrap peers. |
 | | `wires login --topic ops` | Sign in with your IdP (Google by default; `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*`) and publish the key-bound claim. |
 | | `wires call <tool> [--jq F] [--head N] [--max-bytes N] -- <args>` | Run a remote CLI by name. Stdio passes through and its exit code becomes `call`'s. A refusal exits `77`. `host8/tool` picks one host when several serve a name. |
 | | `wires tools` | List the tools the channel's hosts let you run. `add`/`list`/`rm` edit local aliases in `tools.json`. |
 | | `wires mcp` | Serve the same tools as MCP tools over stdio, for clients that can't run a CLI. |
-| **observer** | `wires watch [channel]` | Stream the channel: calls, refusals, identities, announcements and re-keys. Also prints this node's bootstrap ticket. |
+| | `wires inbox [--wait [--timeout D]] [--json]` | Print what hosts pushed to you, sender first, and mark it read. Without a running `watch` it first fetches from the channel's hosts. `--wait` blocks until something arrives; `--timeout` exits `124`; a refusal by every host exits `77`. Obeys locked mode like `call`. |
+| **observer** | `wires watch [channel]` | Stream the channel: calls, refusals, identities, announcements, pushes and re-keys. Also prints this node's bootstrap ticket, and receives this member's pushes into its inbox. |
 
 For an MCP-only client, the whole config is:
 
@@ -417,6 +439,7 @@ For an MCP-only client, the whole config is:
 | `identity.issuers` | The IdPs whose ID tokens the host verifies, each with the OAuth client ids (`audiences`) it accepts **from that issuer**. |
 | `roles` | Name → a list of matchers, any of which may match (OR). A matcher's keys must all match (AND): `issuer` (exact), `email` (exact or `*@domain`), `org` (Google's `hd`), `group`. |
 | `tools` | Name → `command` (argv, no shell), optional `description`, and `allow`: the roles that may run it. |
+| `push` | Optional. `allow`: the roles whose members may receive `wires push` from this host (none by default). `log_body`: also record each push's body on the channel (default `false`: subject only). Needs a `channel`. |
 
 Nothing is allowed by default; a tool with an empty `allow` refuses every
 call. The built-in role `member` admits any roster member with no IdP
@@ -457,6 +480,8 @@ bytes.
 | `directory.json` | `tools`, `call` | The cached host directory. |
 | `tools.json` | `tools add` | Local aliases (optional). |
 | `idp-token.jwt` | `login` | The caller's ID token (0600). |
+| `inbox/` | `inbox`, `watch` | Pushed messages: `new/` unread (at most 256, oldest evicted with a note), `read/` the last 1024 (0700). |
+| `push-queue.json` | `serve` | A host's undelivered pushes (0600). |
 | `topics/`, `run/` | `watch`, `serve` | The channel log and the control socket. |
 
 Secrets resolve **flag → environment variable → `--…-file` → keystore**, so
