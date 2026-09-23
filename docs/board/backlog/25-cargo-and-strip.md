@@ -24,7 +24,7 @@ The repo is single-language Rust, three crates, with **no remote cache and no CI
 - [ ] Dev loop: a `Makefile` of ≤ 30 lines (`build`, `test`, `lint` = clippy + shellcheck, `fmt`, `demo`, `image`), or `justfile` if the human prefers; a `.githooks/pre-commit` that runs `cargo fmt --check` on staged Rust. `.clippy.toml`, `rustfmt.toml`, `.shellcheckrc` stay.
 - [ ] Scripts: `.scripts/*.sh` and `bench/*.sh` build with `cargo build --release [--features dev-mock-idp]` and use `target/…` paths.
 - [ ] `CLAUDE.md`: rewrite Build System, Adding Dependencies (plain `cargo add`; `Cargo.lock` committed), Dev Environment, Containers and Architecture for Cargo. Keep the Development Approach (types → tests → impl → doctests → readability) and conventions.
-- [ ] `.github/workflows/weekly_tag.yaml`: remove (the version stamping it feeds was Bazel's). If there's no CI at all, add a minimal one (`cargo fmt --check`, `clippy -D warnings`, `test`) only if the human agrees; otherwise note it.
+- [ ] `.github/workflows/weekly_tag.yaml`: remove (the version stamping it feeds was Bazel's). **No CI**: the human decided on 2026-09-23 to ignore CI for now, so don't add a workflow.
 
 ## Part B — code and files the product no longer uses (audit, then remove)
 
