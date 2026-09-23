@@ -12,6 +12,10 @@
 //!   membership, so private).
 //! - `roster-head.json`: the signed roster head token (mode `0644` — public).
 //! - `inclusion-proof.json`: a member's own inclusion-proof token (mode `0644`).
+//! - `roster-directory.json`: the current head's proof for every member this
+//!   node has heard of, from the admin's re-keys (mode `0600`).
+//! - `channel.json`: the channel `wires init` / `wires join` recorded.
+//! - `names.json`: the admin's local labels for members (mode `0600`).
 //! - `keyring/<version>.key`: the hex fabric data key for one roster version
 //!   (mode `0600`, directory `0700`) — the plaintext half of the
 //!   [`SealedFabricKey`](library::SealedFabricKey) an operator handed over.
@@ -29,11 +33,22 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use library::{
-    Crl, FabricKey, Grant, InclusionProof, Membership, NodeId, NodeIdentity, Roster, RosterHead,
-    RosterVersion,
+    Crl, FabricKey, Grant, InclusionProof, Membership, NodeId, NodeIdentity, ProofDirectory,
+    Roster, RosterHead, RosterVersion,
 };
 
 use crate::host::transport::{CrlSource, HeadSource};
+
+/// The file name of the proof directory, beside `roster-head.json` (see
+/// [`Keystore::read_directory`]).
+pub const DIRECTORY_FILE: &str = "roster-directory.json";
+
+/// `channel.json`'s shape.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ChannelFile {
+    /// The topic name, e.g. `ops`.
+    name: String,
+}
 
 /// Resolve the wires home directory (does not create it).
 pub fn home() -> Result<PathBuf> {
@@ -197,6 +212,80 @@ impl Keystore {
         ensure_dir(&self.dir)?;
         let path = self.path("inclusion-proof.json");
         write_text_mode(&path, &proof.encode()?, Some(0o644))?;
+        Ok(path)
+    }
+
+    /// Read `roster-directory.json` — the current head's proof for every
+    /// member this node has heard of ([`ProofDirectory`]); `None` if absent.
+    pub fn read_directory(&self) -> Result<Option<ProofDirectory>> {
+        let path = self.path(DIRECTORY_FILE);
+        match read_to_string_opt(&path)? {
+            Some(text) => Ok(Some(
+                serde_json::from_str(&text)
+                    .with_context(|| format!("parsing {}", path.display()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist `directory` to `roster-directory.json` (mode `0600`: it lists
+    /// the member set, like the root's `roster.json`). Atomic, because the
+    /// session gate and the admission handler read it on every connection.
+    pub fn save_directory(&self, directory: &ProofDirectory) -> Result<PathBuf> {
+        ensure_dir(&self.dir)?;
+        let path = self.path(DIRECTORY_FILE);
+        let json = serde_json::to_string(directory).context("encoding the proof directory")?;
+        write_secret_overwrite(&path, &json)?;
+        Ok(path)
+    }
+
+    /// The channel this keystore joined (`channel.json`), set by `wires init`
+    /// and `wires join`; `None` before either.
+    pub fn read_channel(&self) -> Result<Option<String>> {
+        let path = self.path("channel.json");
+        match read_to_string_opt(&path)? {
+            Some(text) => {
+                let channel: ChannelFile = serde_json::from_str(&text)
+                    .with_context(|| format!("parsing {}", path.display()))?;
+                Ok(Some(channel.name))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Record `name` as this keystore's channel (`channel.json`, mode
+    /// `0644` — a topic name is not a secret from the node that holds it).
+    pub fn save_channel(&self, name: &str) -> Result<PathBuf> {
+        ensure_dir(&self.dir)?;
+        let path = self.path("channel.json");
+        let json = serde_json::to_string(&ChannelFile {
+            name: name.to_string(),
+        })
+        .context("encoding channel.json")?;
+        write_text_mode(&path, &json, Some(0o644))?;
+        Ok(path)
+    }
+
+    /// The admin's local labels for members (`names.json`: name → node id).
+    /// Labels, not identity: nothing but `wires remove <name>` reads them.
+    /// Empty when absent.
+    pub fn read_names(&self) -> Result<BTreeMap<String, NodeId>> {
+        let path = self.path("names.json");
+        match read_to_string_opt(&path)? {
+            Some(text) => {
+                serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+            }
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    /// Persist the admin's member labels (`names.json`, mode `0600` — the
+    /// names say who is in).
+    pub fn save_names(&self, names: &BTreeMap<String, NodeId>) -> Result<PathBuf> {
+        ensure_dir(&self.dir)?;
+        let path = self.path("names.json");
+        let json = serde_json::to_string_pretty(names).context("encoding names.json")?;
+        write_secret_overwrite(&path, &json)?;
         Ok(path)
     }
 

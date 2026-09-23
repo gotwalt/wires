@@ -23,6 +23,8 @@ use crate::host::transport;
 #[derive(Args, Clone, Debug, Default)]
 pub(crate) struct TopicArgs {
     /// The topic name, derived under this node's fabric (e.g. `ops`).
+    /// Defaults to the channel `wires init` / `wires join` recorded.
+    #[arg(default_value = "", hide_default_value = true)]
     pub(crate) topic: String,
     /// A base64 topic ticket to bootstrap from. Repeatable; every peer in every
     /// ticket is tried, and the ones that answer are remembered.
@@ -117,9 +119,16 @@ impl TopicContext {
         home: PathBuf,
         a: &TopicArgs,
     ) -> anyhow::Result<TopicContext> {
-        if a.topic.trim().is_empty() {
-            anyhow::bail!("the topic name is empty; pass one, e.g. `wires watch ops`");
-        }
+        let name = if a.topic.trim().is_empty() {
+            ks.read_channel()?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no topic named and no channel joined; pass one (e.g. `wires watch ops`) or \
+                     run `wires join <token>` first"
+                )
+            })?
+        } else {
+            a.topic.clone()
+        };
         let node = match (a.node_seed.as_deref(), a.node_seed_file.as_deref()) {
             (Some(hex), _) => NodeIdentity::from_seed_hex(hex).context("--node-seed")?,
             (None, Some(path)) => keystore::read_identity_file(path)?,
@@ -177,7 +186,7 @@ impl TopicContext {
         }
 
         let fabric_root = membership.fabric;
-        let topic = TopicId::derive(fabric_root, &a.topic);
+        let topic = TopicId::derive(fabric_root, &name);
         let mut ticket_peers = Vec::new();
         for text in &a.peer {
             let ticket = TopicTicket::decode(text.trim())
@@ -190,12 +199,12 @@ impl TopicContext {
                     fabric_root.hex()
                 );
             }
-            if ticket.name != a.topic {
+            if ticket.name != name {
                 anyhow::bail!(
                     "--peer: this ticket is for topic {:?}, not {:?}; the peers on it are on a \
                      different mesh",
                     ticket.name,
-                    a.topic
+                    name
                 );
             }
             ticket_peers.extend(ticket.peers);
@@ -218,7 +227,7 @@ impl TopicContext {
             }),
             keystore: ks,
             home,
-            name: a.topic.clone(),
+            name,
             topic,
             fabric_root,
             ticket_peers,
@@ -348,6 +357,22 @@ mod tests {
         };
         let msg = format!("{:#}", member.resolve(&args).unwrap_err());
         assert!(msg.contains("\"eng\""), "{msg}");
+    }
+
+    #[test]
+    fn no_topic_means_the_joined_channel() {
+        let member = provisioned([2u8; 32]);
+        let args = TopicArgs {
+            topic: String::new(),
+            ..member.args()
+        };
+        let msg = format!("{:#}", member.resolve(&args).unwrap_err());
+        assert!(msg.contains("wires join"), "{msg}");
+
+        member.ks.save_channel("ops").unwrap();
+        let ctx = member.resolve(&args).unwrap();
+        assert_eq!(ctx.name, "ops");
+        assert_eq!(ctx.topic, TopicId::derive(member.root.node_id(), "ops"));
     }
 
     #[test]

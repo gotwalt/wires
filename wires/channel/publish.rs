@@ -13,7 +13,7 @@ use super::context::{TopicArgs, TopicContext};
 use super::local::{STORE_LOCK_WAIT, append_local, current_fabric_key, open_topic_store};
 use super::peers::PeerBook;
 use super::watch::deadline;
-use super::{ipc, topics};
+use super::{ipc, rekey, topics};
 use crate::admin::keystore;
 use crate::{init_logging, now_unix};
 
@@ -61,6 +61,8 @@ pub(crate) enum Messages {
     One(Option<String>),
     /// One message per line of stdin.
     Stdin(tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>),
+    /// A fixed list, in order (the admin's re-key records).
+    Many(std::collections::VecDeque<String>),
 }
 
 impl Messages {
@@ -68,6 +70,7 @@ impl Messages {
     pub(crate) async fn next(&mut self) -> anyhow::Result<Option<String>> {
         match self {
             Messages::One(text) => Ok(text.take()),
+            Messages::Many(texts) => Ok(texts.pop_front()),
             Messages::Stdin(lines) => loop {
                 match lines.next_line().await.context("reading stdin")? {
                     Some(line) if line.trim().is_empty() => continue,
@@ -190,16 +193,42 @@ async fn publish_line(
 /// on this node replays them out (spec §7.2).
 pub(crate) async fn publish_one_shot(
     ctx: &TopicContext,
-    mut messages: Messages,
+    messages: Messages,
     wait: Duration,
     linger: Duration,
 ) -> anyhow::Result<()> {
+    publish_one_shot_on(ctx, messages, wait, linger, async |cfg| {
+        topics::TopicNode::spawn(&ctx.node, cfg).await
+    })
+    .await
+    .map(|_| ())
+}
+
+/// [`publish_one_shot`] over a node stood up by `bind` (the hermetic-endpoint
+/// seam of [`run_tail_on`](super::watch::run_tail_on)), returning the first
+/// neighbor it reached — `None` when the messages were only stored locally.
+///
+/// Card 14: a node whose newest fabric key is a commit behind its head (it
+/// missed the admin's re-key while it was not running — typically a caller's
+/// `wires login`) runs one catch-up pass before sealing, adopting the re-key
+/// it brings back ([`rekey::catch_up_rekeys`]), so the message goes out under
+/// the current key instead of being refused at the source.
+pub(crate) async fn publish_one_shot_on<B>(
+    ctx: &TopicContext,
+    mut messages: Messages,
+    wait: Duration,
+    linger: Duration,
+    bind: B,
+) -> anyhow::Result<Option<NodeId>>
+where
+    B: AsyncFnOnce(topics::TopicNodeConfig) -> anyhow::Result<topics::TopicNode>,
+{
     // The tail may be *starting*: it binds its control socket before it joins,
     // but a publish that arrived a moment earlier saw no socket and got here.
     // Waiting out the redb lock turns that race into a pause instead of a lost
     // message (or, in the other order, a dead resident node).
     let store = Arc::new(open_topic_store(&ctx.home, ctx.topic, STORE_LOCK_WAIT).await?);
-    let node = topics::TopicNode::spawn(&ctx.node, ctx.node_config(Arc::clone(&store))).await?;
+    let node = bind(ctx.node_config(Arc::clone(&store))).await?;
 
     let mut book = PeerBook::open(&ctx.home, ctx.topic);
     let mut changed = false;
@@ -242,6 +271,13 @@ pub(crate) async fn publish_one_shot(
         None => {}
     }
 
+    if neighbor.is_some() && rekey::key_is_stale(&ctx.keystore)? {
+        let adopted = rekey::catch_up_rekeys(&node, &ctx.node).await;
+        tracing::info!(
+            adopted,
+            "this node's key was a commit behind; caught up on re-keys"
+        );
+    }
     let (version, key) = current_fabric_key(&ctx.keystore)?;
     let mut published = 0usize;
     while let Some(text) = messages.next().await? {
@@ -279,7 +315,7 @@ pub(crate) async fn publish_one_shot(
         tokio::time::sleep(linger).await;
     }
     node.shutdown().await?;
-    Ok(())
+    Ok(neighbor)
 }
 
 /// Wait up to `wait` for the first mesh neighbor, discarding other events.

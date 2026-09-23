@@ -18,7 +18,7 @@ use super::context::{TopicArgs, TopicContext};
 use super::local::{STORE_LOCK_WAIT, append_local, current_fabric_key, open_topic_store};
 use super::peers::PeerBook;
 use super::printer::{Keyring, Printer};
-use super::{admission, idp_view, ipc, replay, store, topics};
+use super::{admission, idp_view, ipc, rekey, replay, store, topics};
 use crate::admin::keystore;
 use crate::caller::jwks;
 use crate::host::{audit, identity, transport};
@@ -264,7 +264,15 @@ where
 
             event = events.recv(), if live => match event {
                 Some(topics::TopicEvent::Message(envelope)) => {
-                    match ingest_live(&node, &store, ctx.topic, &envelope) {
+                    let ingested = ingest_live(&node, &store, ctx.topic, &envelope);
+                    // Every verdict but a duplicate: a re-key can arrive after
+                    // an admission already moved this node's head, and the
+                    // epoch floor then refuses to store it — its content is
+                    // still the root's (card 14; see `rekey::observe`).
+                    if !matches!(ingested, Ok(replay::Ingested::Duplicate)) {
+                        rekey::observe(&envelope, &mut keyring, &ctx.node, node.admit(), now_unix());
+                    }
+                    match ingested {
                         Ok(replay::Ingested::Inserted) => printer.emit(&envelope, &mut keyring).await,
                         Ok(replay::Ingested::Duplicate) => {}
                         // The hole heals by replay and the message comes back
@@ -405,7 +413,7 @@ where
                 }
             }, if catching_up.is_some() => {
                 catching_up = None;
-                print_caught_up(done, &printer, &mut keyring).await;
+                print_caught_up(done, &printer, &mut keyring, &ctx.node, node.admit()).await;
                 // Always re-armed: every other trigger is edge-driven, and a
                 // gap whose only holder is asleep needs a pass that is not.
                 // `arm` keeps the sooner deadline, so a gap or a new neighbor
@@ -617,6 +625,8 @@ async fn print_caught_up(
     done: Result<anyhow::Result<replay::CaughtUp>, tokio::task::JoinError>,
     printer: &Printer,
     keyring: &mut Keyring,
+    me: &library::NodeIdentity,
+    admit: &admission::AdmitHandler,
 ) {
     let mut caught = match done {
         Ok(Ok(caught)) => caught,
@@ -641,6 +651,8 @@ async fn print_caught_up(
         .fresh
         .sort_by_key(|envelope| (envelope.timestamp, envelope.sender, envelope.seq));
     for envelope in &caught.fresh {
+        // A re-key this node missed while it was down comes back this way.
+        rekey::observe(envelope, keyring, me, admit, now_unix());
         printer.emit(envelope, keyring).await;
     }
 }
@@ -803,8 +815,11 @@ mod tests {
             }
             _ => panic!("expected watch"),
         }
-        // A topic is required.
-        assert!(Cli::try_parse_from(["wires", "watch"]).is_err());
+        // No topic is the joined channel (card 14), resolved at preflight.
+        match Cli::try_parse_from(["wires", "watch"]).unwrap().command {
+            Command::Watch(a) => assert!(a.common.topic.is_empty()),
+            _ => panic!("expected watch"),
+        }
         // The old name survives, hidden, under `advanced`.
         match Cli::try_parse_from(["wires", "advanced", "tail", "ops", "--json"])
             .unwrap()

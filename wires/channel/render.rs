@@ -48,7 +48,22 @@ pub fn record_line(record: &ChannelRecord, identity: Option<&Verdict>) -> String
     match record {
         ChannelRecord::Audit(audit) => audit_line(audit),
         ChannelRecord::Identity(claim) => identity_line(claim, identity),
+        ChannelRecord::Rekey(rekey) => rekey_line(rekey),
     }
+}
+
+/// One human line for an admin's re-key: the roster version it moves to and
+/// how many members' credentials it carries. Only public facts — the sealed
+/// keys are not the reader's to show. Whether it verified is not this line's
+/// business: the resident node adopts a re-key only after
+/// [`Rekey::verify`](library::Rekey::verify), whatever it prints.
+pub fn rekey_line(rekey: &library::Rekey) -> String {
+    let n = rekey.entries.len();
+    format!(
+        "🔑 re-key to roster version {} ({n} member{})",
+        rekey.head.version.0,
+        if n == 1 { "" } else { "s" }
+    )
 }
 
 /// One human line for a call-log entry.
