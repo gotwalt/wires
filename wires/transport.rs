@@ -935,6 +935,11 @@ where
     };
     out_task.await.context("stdout pump")??;
     err_task.await.context("stderr pump")??;
+    // The child is gone, so there is nobody left to feed. Don't wait for the
+    // dialer's stdin to reach EOF: from a terminal it never does, and a
+    // `wires call tool -- ARGS` whose child ignores stdin would hang until
+    // Ctrl-D. Whatever stdin already arrived is in the audit tap.
+    stdin_task.abort();
     let _ = stdin_task.await;
 
     let code = status.code().unwrap_or(-1);
@@ -1987,6 +1992,55 @@ mod tests {
         assert_eq!(code.unwrap(), 0);
         assert!(out.is_empty());
         assert_eq!(err, b"oops");
+    }
+
+    /// `wires call db_query -- "select 1"` from a terminal: the child takes its
+    /// input from argv and exits without reading stdin, while the dialer's
+    /// stdin (the tty) never reaches EOF. The session must still end with the
+    /// child's exit code instead of waiting for the caller to press Ctrl-D.
+    #[tokio::test]
+    async fn session_ends_when_the_child_exits_with_dialer_stdin_still_open() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let membership = Membership::mint(&root, caller, 0, i64::MAX).unwrap();
+        let grant = Grant::mint(&root, caller, Scope::new("tools.sh"), i64::MAX).unwrap();
+        let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
+        let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
+        let command = vec!["sh".into(), "-c".into(), "printf done".into()];
+        let config = test_config(&root, server, Some("tools.sh"), Crl::new(), command);
+        let srv =
+            tokio::spawn(
+                async move { serve_session(s2c_w, c2s_r, caller, &config, never()).await },
+            );
+        // A stdin that stays open for the whole test: its writer is held below.
+        let (_stdin_held_open, stdin) = tokio::io::duplex(64);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dial_session(
+                c2s_w,
+                s2c_r,
+                membership,
+                Some(grant),
+                None,
+                None,
+                None,
+                stdin,
+                &mut out,
+                &mut err,
+            ),
+        )
+        .await
+        .expect("the session hung waiting for the dialer's stdin to close");
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(out, b"done");
+        tokio::time::timeout(std::time::Duration::from_secs(10), srv)
+            .await
+            .expect("the responder hung after the child exited")
+            .unwrap()
+            .unwrap();
     }
 
     /// Mint a valid membership for `caller` under `root` (used to isolate
