@@ -3,6 +3,11 @@
 **Give your agent tools on other machines, the way it already uses tools on
 its own: as CLIs.**
 
+> **Experimental.** wires is a prototype for exploring these ideas, not
+> production software: the protocol, the file formats and the commands will
+> change without notice, and it has had no security review. Don't rely on it
+> to protect anything that matters yet.
+
 wires does the job of a remote MCP server: it lets an agent harness (Claude
 Code, or anything that can run a command) use tools that live somewhere else.
 The tool is a command-line program, the caller is a person your identity
@@ -140,3 +145,7 @@ More in [docs/usage.md § Known trade-offs](docs/usage.md#known-trade-offs).
 cargo build --release -p wires           # target/release/wires
 ./.scripts/demo-remote-cli.sh            # the narrated loopback demo (--quiet: assertions only)
 ```
+
+## License
+
+[MIT](LICENSE).
