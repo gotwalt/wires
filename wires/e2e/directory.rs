@@ -12,6 +12,9 @@
 //! - [`a_joined_caller_finds_calls_disambiguates_and_sees_a_stopped_host_go_stale`]:
 //!   no manual configuration; two hosts with the same tool are ambiguous
 //!   until qualified; a host that stops announcing is marked stale.
+//! - [`after_remove_the_host_seals_nothing_to_the_removed_member`] (card
+//!   21): the re-announcement after `wires remove` is sealed to the current
+//!   roster only, and the removed member is refused as removed.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -78,6 +81,7 @@ fn serve(
         identity: Some(Arc::clone(&gate)),
         policy: Arc::clone(&policy),
     };
+    let serve = Arc::new(serve);
     let announcer = Announcer::new(
         identity.node_id(),
         policy,
@@ -86,9 +90,13 @@ fn serve(
         host.descriptions(),
         heartbeat,
     )
-    .watching_keys(Arc::clone(&m.ks));
+    .watching_keys(Arc::clone(&m.ks))
+    .within(crate::host::announce::roster_view(
+        Arc::clone(&serve),
+        Arc::clone(&m.ks),
+    ));
     let hosted = crate::host::audit::Hosted {
-        session: SessionProtocol(Arc::new(serve)),
+        session: SessionProtocol(serve),
         records,
         identities,
         announcer: Some(announcer),
@@ -414,4 +422,137 @@ async fn a_joined_caller_finds_calls_disambiguates_and_sees_a_stopped_host_go_st
     assert_eq!(out, b"on a again");
 
     a_task.abort();
+}
+
+/// The newest announcement `host` published under roster version `version`
+/// that `reader` holds in its log (after a refresh), if any.
+fn newest_announcement(
+    reader: &Machine,
+    host: NodeId,
+    version: library::RosterVersion,
+) -> Option<library::HostAnnouncement> {
+    let ctx = reader.context();
+    let store = crate::channel::store::TopicStore::open(&ctx.home, ctx.topic).unwrap();
+    let mut keyring = crate::channel::printer::Keyring::load(Arc::clone(&reader.ks)).unwrap();
+    keyring.quiet = true;
+    store
+        .read_backfill(10_000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.sender == host && e.key_version == version)
+        .filter_map(|e| {
+            let plain = keyring.open(&e)?;
+            match ChannelRecord::parse(&String::from_utf8_lossy(&plain)) {
+                Some(ChannelRecord::Host(ann)) => Some(ann),
+                _ => None,
+            }
+        })
+        .max_by_key(|ann| ann.at_ms)
+}
+
+/// A listing's tool names (empty when there is none).
+fn names(listing: Option<library::HostListing>) -> Vec<String> {
+    listing
+        .map(|l| l.tools.into_iter().map(|t| t.name.to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// **Card 21, item 4.** Two analysts, Alice and Carol, log in; the host seals
+/// `db_query` to each. `wires remove alice`: the host's re-announcement under
+/// the new key carries an entry for Carol only — none that Alice's key opens,
+/// though the host's identity index still holds her verified claim — and
+/// Alice's next call is refused as *removed*, by the roster gate, before any
+/// identity or policy check.
+#[tokio::test]
+async fn after_remove_the_host_seals_nothing_to_the_removed_member() {
+    let corp = MockIdp::start("alice@example.com").await;
+    let corp2 = MockIdp::start("carol@example.com").await;
+    let admin = Machine::new();
+    let host = Machine::new();
+    let alice = Machine::new();
+    let carol = Machine::new();
+    let (fabric, ids) = onboard(&admin, &[&host, &alice, &carol]);
+    let (host_id, alice_id, carol_id) = (ids[0], ids[1], ids[2]);
+    let config = HostConfig::parse(&format!(
+        r#"{{"version":1,"channel":"ops",
+            "identity":{{"issuers":[
+              {{"issuer":"{corp}","audiences":["{aud}"]}},
+              {{"issuer":"{corp2}","audiences":["{aud}"]}}]}},
+            "roles":{{"analyst":[{{"email":"*@example.com"}}]}},
+            "tools":{{"db_query":{{"description":"SQL","command":["cat"],"allow":["analyst"]}}}}}}"#,
+        corp = corp.issuer.as_str(),
+        corp2 = corp2.issuer.as_str(),
+        aud = MOCK_CLIENT_ID,
+    ))
+    .unwrap();
+    join(&admin, fabric, &host, host_id, "host", None).await;
+    let (host_task, ready) = serve(&host, &config, Duration::from_secs(600));
+    let host_hint = timeout(PATIENCE, ready).await.unwrap().unwrap();
+    join(&admin, fabric, &alice, alice_id, "alice", Some(&host_hint)).await;
+    join(&admin, fabric, &carol, carol_id, "carol", Some(&host_hint)).await;
+    log_in(&alice, &corp).await;
+    log_in(&carol, &corp2).await;
+    for m in [&alice, &carol] {
+        refreshed_until(m, "db_query for an analyst", |d| {
+            !names_on(d, host_id).is_empty()
+        })
+        .await;
+    }
+
+    let identity = admin.node();
+    crate::admin::invite::remove_in(
+        &admin.ks,
+        &admin.home,
+        crate::admin::invite::RemoveArgs {
+            member: "alice".into(),
+            ttl: super::onboard::ttl(),
+        },
+        TIMING,
+        async move |cfg| bind_hermetic(&identity, cfg).await,
+    )
+    .await
+    .unwrap();
+    let v_removed = admin.head_version().unwrap();
+
+    // Carol reads the host's announcement under the key the removal minted.
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let ann = loop {
+        refreshed(&carol, None).await;
+        if let Some(ann) = newest_announcement(&carol, host_id, v_removed) {
+            break ann;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no re-announcement under version {v_removed:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        names(ann.listing_for(&carol.node())),
+        ["db_query"],
+        "carol, still a member, keeps her entry"
+    );
+    assert!(
+        names(ann.listing_for(&alice.node())).is_empty(),
+        "no entry opens for the removed alice"
+    );
+    assert_eq!(ann.sealed.len(), 1, "one entry: carol's");
+
+    // Alice's next call: refused by the roster gate, with the precise reason.
+    let dir = Directory::load(&Directory::path(&alice.home), "ops");
+    let (res, out) = call(&alice, &dir, "db_query", b"select 1").await;
+    assert!(out.is_empty(), "nothing ran for alice");
+    let e = res.expect_err("alice is refused");
+    let reason = e
+        .downcast_ref::<Denied>()
+        .unwrap_or_else(|| panic!("a refusal, not a failure: {e:#}"))
+        .reason()
+        .to_string();
+    assert!(
+        reason.starts_with("roster inclusion rejected: not in the current roster (removed ")
+            && reason.contains(&format!("version {}", v_removed.0)),
+        "{reason}"
+    );
+
+    host_task.abort();
 }
