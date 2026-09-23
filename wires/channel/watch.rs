@@ -143,9 +143,15 @@ where
             idp_view::IdpTrust::from_env(),
         )),
     };
+    // A member's watch keeps its channel directory fresh (card 15); a host
+    // needs none.
+    let directory = hosted
+        .is_none()
+        .then(|| Arc::new(crate::caller::resolve::DirectoryHook::new(ctx)));
     let printer = Printer {
         json,
         identities: Some(Arc::clone(&identities)),
+        directory: directory.clone(),
     };
     let mut keyring = Keyring::load(Arc::clone(&ctx.keystore))?;
     let store = Arc::new(open_topic_store(&ctx.home, ctx.topic, STORE_LOCK_WAIT).await?);
@@ -154,6 +160,10 @@ where
     // logged in before it started.
     if hosted.is_some() {
         identities.prime(&store, &mut keyring, now_unix()).await;
+    }
+    // Announcements older than the backfill still name hosts.
+    if let Some(hook) = &directory {
+        hook.prime(&store, &mut keyring);
     }
 
     // 1. What is already known, before anything touches the network. Printed

@@ -6,8 +6,8 @@
 //! - `GET /.well-known/openid-configuration` — discovery;
 //! - `GET /jwks` — one ES256 key, `Cache-Control: max-age=300`, fetches counted;
 //! - `GET /authorize` — records the request and 302s straight back to the
-//!   `redirect_uri` with a code (no consent screen: the "user" is always
-//!   `email`);
+//!   `redirect_uri` with a code (no consent screen: the "user" is `email`, or
+//!   the request's `login_hint` when it has one);
 //! - `POST /token` — `authorization_code` (checks client id, redirect URI and
 //!   the PKCE S256 verifier) and `refresh_token` grants, minting ES256 ID
 //!   tokens with the recorded `nonce`.
@@ -40,6 +40,8 @@ struct Pending {
     redirect_uri: String,
     nonce: String,
     challenge: String,
+    /// Who signs in: the request's `login_hint`, else the issuer's `email`.
+    email: String,
 }
 
 /// Mutable issuer state.
@@ -91,14 +93,19 @@ impl State {
 
     /// An ES256 ID token for `self.email`, optionally with a nonce.
     fn mint(&self, nonce: Option<&str>, exp: i64) -> String {
+        self.mint_as(&self.email, nonce, exp)
+    }
+
+    /// An ES256 ID token for `email`, optionally with a nonce.
+    fn mint_as(&self, email: &str, nonce: Option<&str>, exp: i64) -> String {
         let header = json!({"alg": "ES256", "kid": self.kid, "typ": "JWT"});
         let mut claims = json!({
             "iss": self.issuer,
-            "sub": format!("sub-{}", self.email),
+            "sub": format!("sub-{email}"),
             "aud": MOCK_CLIENT_ID,
             "exp": exp,
             "iat": exp - 3600,
-            "email": self.email,
+            "email": email,
             "email_verified": true,
         });
         if let Some(n) = nonce {
@@ -283,6 +290,11 @@ fn handle(state: &Mutex<State>, method: &str, target: &str, body: &[u8]) -> Repl
             st.counter += 1;
             let code = format!("code-{}", st.counter);
             st.last_nonce = Some(get("nonce"));
+            // A test (or the demo) signs in as someone else by passing
+            // `login_hint`, as a real IdP would pre-fill it.
+            let email = Some(get("login_hint"))
+                .filter(|h| !h.is_empty())
+                .unwrap_or_else(|| st.email.clone());
             st.pending.insert(
                 code.clone(),
                 Pending {
@@ -290,6 +302,7 @@ fn handle(state: &Mutex<State>, method: &str, target: &str, body: &[u8]) -> Repl
                     redirect_uri: get("redirect_uri"),
                     nonce: get("nonce"),
                     challenge: get("code_challenge"),
+                    email,
                 },
             );
             let mut loc = Url::parse(&get("redirect_uri")).unwrap();
@@ -327,7 +340,7 @@ fn handle(state: &Mutex<State>, method: &str, target: &str, body: &[u8]) -> Repl
                     st.counter += 1;
                     let rt = format!("rt-{}", st.counter);
                     st.refresh.insert(rt.clone(), p.nonce.clone());
-                    let id_token = st.mint(Some(&p.nonce), exp);
+                    let id_token = st.mint_as(&p.email, Some(&p.nonce), exp);
                     json_reply(
                         200,
                         json!({"access_token": "at", "token_type": "Bearer", "expires_in": 3600,

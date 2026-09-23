@@ -73,9 +73,9 @@ Caller — runs remote CLIs (every role joins the same way):
   id        Print this node's id: what you send the admin
   join      Install the admin's invite token: credentials, channel, peers
   login     Sign in with your IdP, binding this node's key to your identity
-  call      Run a remote CLI: stdio passes through, its exit code is ours
-  tools     Edit tools.json, the local map of remote CLIs (add / list / rm)
-  mcp       Serve the tools.json CLIs as MCP tools over stdio (compatibility)
+  call      Run a remote CLI by name: stdio passes through, its exit code is ours
+  tools     List the tools your channel's hosts let you run (aliases: add / rm)
+  mcp       Serve those tools as MCP tools over stdio (compatibility)
 
 Observer — watches calls:
   watch     Stream a channel: every call, refusal and identity as it happens
@@ -126,13 +126,15 @@ enum Command {
     /// Sign in with your IdP (OIDC), binding this node's key to your identity;
     /// with `--topic`, publish the claim for every reader to verify.
     Login(caller::login::LoginArgs),
-    /// Run a remote CLI from `tools.json`: stdio passes through, its exit
-    /// code becomes ours, a refusal exits 77.
+    /// Run a remote CLI by name (announced on the channel, or a `tools.json`
+    /// alias): stdio passes through, its exit code becomes ours, a refusal
+    /// exits 77.
     Call(caller::call::CallArgs),
-    /// Edit `tools.json`: the local map of remote CLIs (add / list / rm).
+    /// List the tools the hosts on your channel let you run; `add` / `list` /
+    /// `rm` edit the local aliases in `tools.json`.
     Tools(caller::tools::ToolsArgs),
-    /// Serve the `tools.json` CLIs as MCP tools over stdio (for clients that
-    /// only speak MCP).
+    /// Serve the tools you can run (announced, plus aliases) as MCP tools over
+    /// stdio (for clients that only speak MCP).
     Mcp(caller::mcp::McpArgs),
 
     // --- observer ---
@@ -212,8 +214,10 @@ const LOG_FILTER: &str = "warn,wires=info";
 /// The default log filter of the dialing commands: only warnings from wires
 /// itself, and iroh (plus `iroh_*`, which the target prefix also matches)
 /// entirely off — its endpoint teardown logs `ERROR … relay_recv_channel
-/// closed` at the end of every perfectly normal call.
-const QUIET_LOG_FILTER: &str = "warn,iroh=off";
+/// closed` at the end of every perfectly normal call. The channel node a cold
+/// call joins to read the directory (card 15) keeps only its errors: its mesh
+/// chatter is not the remote CLI's stderr.
+const QUIET_LOG_FILTER: &str = "warn,iroh=off,wires::channel=error";
 
 /// Install the stderr subscriber with `default` unless `$RUST_LOG` is set.
 fn init_logging_with(default: &str) {
@@ -264,14 +268,17 @@ fn main() {
                 Err(e) => exit_with(e),
             }
         }
-        Command::Tools(a) => match caller::tools::run_tools_cmd(a) {
-            Ok(out) if out.is_empty() => {}
-            Ok(out) => println!("{out}"),
-            Err(e) => {
-                eprintln!("wires: {e:#}");
-                std::process::exit(1);
+        Command::Tools(a) => {
+            init_quiet_logging();
+            match runtime().block_on(caller::tools::tools_cmd(a)) {
+                Ok(out) if out.is_empty() => {}
+                Ok(out) => println!("{out}"),
+                Err(e) => {
+                    eprintln!("wires: {e:#}");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         Command::Mcp(a) => {
             init_quiet_logging();
             if let Err(e) = runtime().block_on(caller::mcp::mcp_cmd(a)) {

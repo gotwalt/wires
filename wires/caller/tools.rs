@@ -202,23 +202,27 @@ pub fn resolve_path(explicit: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
-/// `wires tools`: edit the local map of remote CLIs.
+/// `wires tools`: list the tools the hosts on your channel let you run, or
+/// edit the local aliases in `tools.json`.
 #[derive(Args)]
 pub struct ToolsArgs {
     /// Use this file instead of `$WIRES_HOME/tools.json`.
     #[arg(long, global = true)]
     pub tools_file: Option<PathBuf>,
+    /// None: list what the channel's hosts announce to you (card 15), then
+    /// your aliases.
     #[command(subcommand)]
-    pub cmd: ToolsCmd,
+    pub cmd: Option<ToolsCmd>,
 }
 
-/// The three `wires tools` operations.
+/// The `wires tools` alias operations (optional: the channel's host
+/// announcements are the directory; an alias pins a name by hand).
 #[derive(Subcommand)]
 pub enum ToolsCmd {
-    /// Add a remote tool, reached by ticket, by responder node id, or by the
-    /// responder's audit-topic ticket.
+    /// Add an alias: a remote tool reached by ticket, by responder node id, or
+    /// by the responder's audit-topic ticket.
     Add(ToolsAddArgs),
-    /// List the configured tools, one per line.
+    /// List the aliases in `tools.json`, one per line.
     List,
     /// Remove a tool by name.
     Rm {
@@ -259,12 +263,26 @@ pub struct ToolsAddArgs {
     pub remote_tool: Option<String>,
 }
 
-/// Run a `wires tools` subcommand against the tools file; returns what to
-/// print on stdout (possibly empty).
+/// `wires tools`: with no subcommand, the channel directory (see
+/// [`crate::caller::resolve`]); else [`run_tools_cmd`].
+pub async fn tools_cmd(a: ToolsArgs) -> Result<String> {
+    if a.cmd.is_some() {
+        return run_tools_cmd(a);
+    }
+    let path = resolve_path(a.tools_file.as_deref())?;
+    let config = ToolsConfig::load(&path)?;
+    crate::caller::resolve::list_cmd(&config).await
+}
+
+/// Run a `wires tools` alias subcommand against the tools file; returns what
+/// to print on stdout (possibly empty).
 pub fn run_tools_cmd(a: ToolsArgs) -> Result<String> {
     let path = resolve_path(a.tools_file.as_deref())?;
     let mut config = ToolsConfig::load(&path)?;
-    match a.cmd {
+    let Some(cmd) = a.cmd else {
+        bail!("`wires tools` with no subcommand reads the channel (tools_cmd)");
+    };
+    match cmd {
         ToolsCmd::List => Ok(render_list(&config)),
         ToolsCmd::Rm { name } => {
             let name = ToolName::new(name)?;
@@ -362,6 +380,23 @@ pub fn target_from_topic_ticket(text: &str) -> Result<(ToolTarget, String)> {
 }
 
 /// `wires tools list` output: `name<TAB>target<TAB>description`, config order.
+/// The aliases, for the end of `wires tools`: `name  alias: …  description`.
+pub(crate) fn render_aliases(config: &ToolsConfig) -> String {
+    config
+        .tools
+        .iter()
+        .map(|t| {
+            format!(
+                "{}  alias: {}  {}",
+                t.name,
+                t.target_summary(),
+                t.description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn render_list(config: &ToolsConfig) -> String {
     config
         .tools
@@ -513,7 +548,7 @@ pub(crate) mod tests {
         let run = |cmd: ToolsCmd| {
             run_tools_cmd(ToolsArgs {
                 tools_file: Some(path.clone()),
-                cmd,
+                cmd: Some(cmd),
             })
         };
         let add = |name: &str| ToolsAddArgs {
@@ -570,7 +605,7 @@ pub(crate) mod tests {
         ]);
         let out = run_tools_cmd(ToolsArgs {
             tools_file: Some(path.clone()),
-            cmd: ToolsCmd::Add(ToolsAddArgs {
+            cmd: Some(ToolsCmd::Add(ToolsAddArgs {
                 name: "db_query".into(),
                 ticket: None,
                 node: None,
@@ -579,7 +614,7 @@ pub(crate) mod tests {
                 addr: vec![],
                 description: "SQL".into(),
                 remote_tool: None,
-            }),
+            })),
         })
         .unwrap();
         assert!(out.starts_with("added db_query (node → "), "{out}");

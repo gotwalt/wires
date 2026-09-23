@@ -287,9 +287,10 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
     let config = ToolsConfig::load(&crate::caller::tools::resolve_path(
         a.creds.tools_file.as_deref(),
     )?)?;
-    let tool = lookup(&config, &a.tool)?;
+    // An alias in tools.json, else the channel's host announcements (card 15).
+    let tool = crate::caller::resolve::resolve_tool(&config, &a.tool, &a.creds).await?;
     let argv = Argv::new(a.args).context("arguments")?;
-    let plan = Dial::resolve(tool, argv)?;
+    let plan = Dial::resolve(&tool, argv)?;
     let creds = Credentials::resolve(&a.creds)?;
     dial(
         &creds,

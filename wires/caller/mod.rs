@@ -1,21 +1,20 @@
 //! The **caller** role: an agent or a person running remote CLIs.
 //!
-//! The caller binds its node key to an IdP identity (`wires login`), keeps a
-//! local map of remote CLIs (`wires tools`), and runs them (`wires call`, the
-//! CLI-native path; `wires mcp`, the stdio MCP adapter kept for clients that
+//! The caller binds its node key to an IdP identity (`wires login`), finds
+//! remote CLIs by name on its channel (`wires tools`), and runs them (`wires
+//! call`, the CLI-native path; `wires mcp`, the stdio MCP adapter kept for clients that
 //! only speak MCP).
 //!
 //! - [`call`] — dial a tool and bridge stdio; the exit code is the remote one.
 //! - [`mcp`] — the same calls as MCP tools over stdio (backward compatibility).
-//! - [`tools`] — `tools.json`: the local name → responder map.
+//! - [`resolve`] — the channel is the directory: hosts' announcements, cached
+//!   in `directory.json`, resolve a name to a host (card 15).
+//! - [`tools`] — `wires tools`, and `tools.json`: local aliases (name → host).
 //! - [`login`] — OIDC sign-in, nonce-bound to this node's key.
 //! - [`jwks`] — issuer discovery and key fetching for ID-token verification.
 //! - `mock_idp` — a hermetic OIDC issuer (tests and the dev build only).
 //! - [`join`] — `wires id` and `wires join <token>` (card 14; every role
 //!   joins this way, the host and the observer included).
-//!
-//! Where what comes next lands: resolving a tool by name from the hosts'
-//! announcements on the channel in `resolve.rs` (card 15).
 
 pub mod call;
 pub mod join;
@@ -28,4 +27,5 @@ pub mod mcp;
 #[cfg(any(test, feature = "dev-mock-idp"))]
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod mock_idp;
+pub mod resolve;
 pub mod tools;
