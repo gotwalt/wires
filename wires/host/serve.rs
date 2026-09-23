@@ -1,8 +1,12 @@
-//! `wires serve`: the host's one command.
+//! `wires serve host.json`: the host's one command.
 //!
-//! Resolves the host's credentials, the tools it exposes, and — with
-//! `--audit-topic` — the channel it records every call on and the IdP policy
-//! it enforces, then serves the session protocol ([`transport`]).
+//! Everything the host decides — what it exposes, the channel it records
+//! every call on, the IdPs it trusts, and which roles may run which tool —
+//! comes from one file (see [`config`](super::config)). The flags left are
+//! where the host's own credentials live and `--relay-url`.
+//!
+//! `wires serve --check host.json` validates the file and prints what it
+//! means, without touching the keystore or the network.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,35 +15,33 @@ use anyhow::Context;
 use clap::Args;
 use library::NodeId;
 
-use super::{audit, identity, idp_policy, transport};
+use super::config::HostConfig;
+use super::{audit, identity, transport};
 use crate::admin::keystore;
 use crate::caller::jwks;
 use crate::channel::context::{TopicArgs, TopicContext};
-use crate::channel::idp_view;
 use crate::channel::watch::run_tail;
 use crate::init_logging;
 
-/// `serve` arguments: the responder key, what it trusts, and the tools it
-/// exposes.
+/// `serve` arguments: `host.json`, and where this host's own key and
+/// credentials come from.
 #[derive(Args)]
 pub(crate) struct ServeArgs {
-    /// Hex 32-byte seed of this responder's node key. Falls back to
+    /// The host's config: tools, channel, trusted IdPs, roles (see
+    /// `wires serve --check`).
+    #[arg(value_name = "HOST_JSON")]
+    pub(crate) config: PathBuf,
+    /// Validate HOST_JSON, print which roles may run which tools and which
+    /// issuers are trusted, and exit.
+    #[arg(long)]
+    pub(crate) check: bool,
+    /// Hex 32-byte seed of this host's node key. Falls back to
     /// `$WIRES_NODE_SEED`, then `--node-seed-file`, then the keystore (`node.seed`).
     #[arg(long)]
     pub(crate) node_seed: Option<String>,
     /// Read the node key seed (hex) from this file instead of the keystore.
     #[arg(long)]
     pub(crate) node_seed_file: Option<PathBuf>,
-    /// Hex node id of the trusted fabric root whose memberships and grants are
-    /// honored.
-    #[arg(long)]
-    pub(crate) trust_root: String,
-    /// Serve any fabric member, with no grant (inclusion-only). An explicit
-    /// acknowledgement of the authorization downgrade: the tool execs for any
-    /// member and must authorize from the injected identity (or `--require-idp`
-    /// does).
-    #[arg(long)]
-    pub(crate) allow_any_member: bool,
     /// CRL JSON literal of revoked subjects (overrides `--crl-file` / keystore).
     #[arg(long, conflicts_with = "crl_file")]
     pub(crate) crl_json: Option<String>,
@@ -49,15 +51,16 @@ pub(crate) struct ServeArgs {
     /// Use a self-hosted relay at this URL instead of the n0 default.
     #[arg(long)]
     pub(crate) relay_url: Option<String>,
-    /// The responder's own membership token, presented in the handshake ack so a
-    /// ticket-less dialer can verify it. Falls back to `$WIRES_MEMBERSHIP`, then
-    /// `--membership-file`, then the keystore (`membership.json`).
+    /// The host's own membership token: it names the fabric (the trust root)
+    /// whose members may call, and is presented in the handshake ack. Falls
+    /// back to `$WIRES_MEMBERSHIP`, then `--membership-file`, then the
+    /// keystore (`membership.json`).
     #[arg(long)]
     pub(crate) membership: Option<String>,
-    /// Read the responder's membership token from this file.
+    /// Read the host's membership token from this file.
     #[arg(long)]
     pub(crate) membership_file: Option<PathBuf>,
-    /// The signed roster head this responder enforces (inclusion proof required
+    /// The signed roster head this host enforces (inclusion proof required
     /// from callers). Falls back to `$WIRES_ROSTER_HEAD`, then
     /// `--roster-head-file`, then the keystore (`roster-head.json`, re-checked
     /// per connection — a head imported later enforces on the next dial, with
@@ -67,65 +70,33 @@ pub(crate) struct ServeArgs {
     /// Read the roster head token from this file.
     #[arg(long)]
     pub(crate) roster_head_file: Option<PathBuf>,
-    /// The responder's own inclusion proof token (optional; presented in the ack).
+    /// The host's own inclusion proof token (optional; presented in the ack).
     #[arg(long)]
     pub(crate) inclusion_proof: Option<String>,
-    /// Read the responder's inclusion proof from this file.
+    /// Read the host's inclusion proof from this file.
     #[arg(long)]
     pub(crate) inclusion_proof_file: Option<PathBuf>,
-    /// Expose a CLI as a named tool: `NAME=COMMAND ARGS…` (repeatable). The
-    /// command is split on ASCII whitespace — no quoting, no shell — and each
-    /// call's arguments are appended to it. Callers need a grant scoped
-    /// `tool:NAME` (or `tool:*`) unless `--allow-any-member`. For a SQL tool
-    /// use sqlite3's `-safe` flag (3.37+), which disables dot-commands like
-    /// `.shell`/`.system`: `--expose 'db_query=sqlite3 -safe -readonly orders.db'`.
-    #[arg(
-        long,
-        value_name = "NAME=COMMAND",
-        required_unless_present = "expose_file"
-    )]
-    pub(crate) expose: Vec<String>,
-    /// Expose the tools in this JSON file, `{"NAME": ["program", "arg", …]}`,
-    /// for argv that needs spaces. Combines with `--expose`.
+    /// A base64 topic ticket to bootstrap the channel from (repeatable).
     #[arg(long)]
-    pub(crate) expose_file: Option<PathBuf>,
-    /// Publish a record of every call (started, finished, denied) to this
-    /// topic. The responder hosts the topic node itself — same endpoint, same
-    /// key — so it must be a provisioned member of the channel (membership,
-    /// inclusion proof, roster head and fabric key in the keystore).
-    #[arg(long)]
-    pub(crate) audit_topic: Option<String>,
-    /// A base64 topic ticket to bootstrap the audit topic from (repeatable).
-    #[arg(long = "audit-peer", requires = "audit_topic")]
-    pub(crate) audit_peer: Vec<String>,
-    /// Only run tools for callers whose node key is bound to a verified IdP
-    /// identity matching this rule: `key=value,…` with keys `iss`, `email`
-    /// (exact or `*@domain`), `org`, `group`; all must match. Repeatable: any
-    /// rule may match. Identities come from `wires login --topic <audit
-    /// topic>` claims, so this needs `--audit-topic`.
-    #[arg(long, value_name = "RULE", requires = "audit_topic")]
-    pub(crate) require_idp: Vec<String>,
-    /// An accepted ID-token audience (OAuth client id); repeatable or
-    /// comma-separated. Default: `$WIRES_OIDC_AUDIENCE`, else
-    /// `$WIRES_OIDC_CLIENT_ID`.
-    #[arg(long, value_name = "CLIENT_ID")]
-    pub(crate) oidc_audience: Vec<String>,
-    /// A trusted ID-token issuer; repeatable or comma-separated. Default:
-    /// `$WIRES_OIDC_ISSUER`, else Google. Every `--require-idp iss=` is
-    /// trusted too.
-    #[arg(long, value_name = "URL")]
-    pub(crate) oidc_issuer: Vec<String>,
+    pub(crate) peer: Vec<String>,
 }
 
-/// `serve`: bind, verify membership (and, unless `--allow-any-member`, a tool
-/// grant) against the trust root, exec the invoked tool + bridge.
+/// `serve`: load `host.json`, bind, verify every caller's fabric membership
+/// and roster inclusion, ask the host's policy, exec the invoked tool + bridge.
 pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
+    let host = HostConfig::load(&a.config)?;
+    if a.check {
+        print!("{}", host.summary());
+        return Ok(());
+    }
     init_logging();
     let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
-    let trust_root = NodeId::from_hex(&a.trust_root)?;
-    // `--audit-topic`: resolve the channel credentials *before* serving, so a
-    // responder that is not a member of its audit channel fails closed here.
-    let audit_ctx = match a.audit_topic.as_deref() {
+    let membership = keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?;
+    // The fabric this host is a member of is the one whose members it serves.
+    let trust_root = membership.fabric;
+    // `channel`: resolve the channel credentials *before* serving, so a host
+    // that is not a member of its channel fails closed here.
+    let audit_ctx = match host.channel.as_deref() {
         Some(name) => Some(audit_context_in(
             Arc::new(keystore::Keystore::resolve()?),
             keystore::home()?,
@@ -137,21 +108,13 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         None => None,
     };
     let identities = match &audit_ctx {
-        Some(ctx) => Some(serve_identities(&a, &ctx.home)?),
+        Some(ctx) => Some(serve_identities(&host, &ctx.home)?),
         None => None,
     };
-    let tools = transport::exposed_tools(&a.expose, a.expose_file.as_deref())?;
-    if tools.is_empty() {
-        anyhow::bail!(
-            "refusing to serve: nothing is exposed; pass --expose NAME=COMMAND (or \
-             --expose-file)"
-        );
-    }
     // Credential *sources*, not values: a file-backed CRL or head is re-read on
     // every connection, so `wires advanced revoke` / `wires advanced roster commit` take effect on
     // the next dial without bouncing this process.
     let crl = keystore::crl_source(a.crl_json.as_deref(), a.crl_file.clone())?;
-    let membership = keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?;
     let head = keystore::roster_head_source(a.roster_head.as_deref(), a.roster_head_file.clone())?;
     let proof = keystore::inclusion_proof(
         a.inclusion_proof.as_deref(),
@@ -165,19 +128,19 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         None => (None, None),
     };
     let gate = match (&identities, &audit_ctx) {
-        (Some((ids, policy)), Some(ctx)) => Some(Arc::new(identity::IdentityGate::new(
+        (Some(ids), Some(ctx)) => Some(Arc::new(identity::IdentityGate::new(
             Arc::clone(ids),
-            policy.clone(),
             ctx.name.clone(),
         ))),
         _ => None,
     };
     let config = transport::ServeConfig {
-        tools,
+        tools: host.commands(),
         audit: sink,
         identity: gate,
+        policy: Arc::new(host.policy()),
         trust_root,
-        require_grant: !a.allow_any_member,
+        require_grant: false,
         crl,
         head,
         membership,
@@ -185,11 +148,11 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     };
     match (audit_ctx, records) {
         (Some(ctx), Some(records)) => {
-            tracing::info!(topic = %ctx.name, "serving the session ALPN on the audit topic's node");
+            tracing::info!(topic = %ctx.name, "serving the session ALPN on the channel's node");
             let hosted = audit::Hosted {
                 session: transport::SessionProtocol(Arc::new(config)),
                 records,
-                identities: identities.expect("built with the audit context").0,
+                identities: identities.expect("built with the audit context"),
             };
             run_tail(&ctx, 0, false, Some(hosted)).await
         }
@@ -197,33 +160,21 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     }
 }
 
-/// The responder's identity index and `--require-idp` policy.
-///
-/// Trusted issuers are `--oidc-issuer` (else `$WIRES_OIDC_ISSUER`, else
-/// Google) plus every rule's `iss`; audiences are `--oidc-audience` (else the
-/// environment). A policy with no accepted audience could never admit anyone,
-/// so it is refused here rather than at the first call.
+/// The host's identity index, verifying claims under `host.json`'s
+/// `identity.issuers` (each issuer with its own audiences) — never the
+/// environment: what the host trusts is in the file.
 pub(crate) fn serve_identities(
-    a: &ServeArgs,
+    host: &HostConfig,
     home: &Path,
-) -> anyhow::Result<(Arc<identity::Identities>, idp_policy::IdpPolicy)> {
-    let policy = idp_policy::IdpPolicy::parse(&a.require_idp)?;
-    let trust = idp_view::IdpTrust::from_flags_or_env(&a.oidc_issuer, &a.oidc_audience)
-        .trusting(policy.issuers());
-    if !policy.is_empty() && trust.audiences.is_empty() {
-        anyhow::bail!(
-            "--require-idp needs an accepted audience: pass --oidc-audience <client id> or set \
-             WIRES_OIDC_AUDIENCE"
-        );
-    }
+) -> anyhow::Result<Arc<identity::Identities>> {
     let fetcher = jwks::KeyFetcher::new(Some(home.join("jwks")))?;
-    Ok((Arc::new(identity::Identities::new(fetcher, trust)), policy))
+    Ok(Arc::new(identity::Identities::new(fetcher, host.trust())))
 }
 
-/// Resolve `serve --audit-topic <name>` into the same [`TopicContext`] `wires
-/// tail` would build, failing (with the `wires advanced import` remedy) when this node
-/// is not a provisioned member of the channel, or when the channel's fabric is
-/// not the one this responder trusts.
+/// Resolve `host.json`'s `channel` into the same [`TopicContext`] `wires
+/// watch` would build, failing (with the `wires advanced import` remedy) when
+/// this node is not a provisioned member of the channel, or when the channel's
+/// fabric is not the one this host's membership names.
 ///
 /// The testable form (the `_in` pattern): `serve` passes the resolved keystore
 /// and home.
@@ -237,7 +188,7 @@ fn audit_context_in(
 ) -> anyhow::Result<TopicContext> {
     let args = TopicArgs {
         topic: name.to_string(),
-        peer: a.audit_peer.clone(),
+        peer: a.peer.clone(),
         node_seed: a.node_seed.clone(),
         node_seed_file: a.node_seed_file.clone(),
         relay_url: a.relay_url.clone(),
@@ -246,14 +197,15 @@ fn audit_context_in(
         inclusion_proof: a.inclusion_proof.clone(),
         inclusion_proof_file: a.inclusion_proof_file.clone(),
     };
-    let ctx = TopicContext::resolve(ks, home, &args)
-        .context("--audit-topic needs this responder to be a member of the channel")?;
+    let ctx = TopicContext::resolve(ks, home, &args).with_context(|| {
+        format!("host.json channel {name:?} needs this host to be a member of it")
+    })?;
     if ctx.node.node_id() != node {
-        anyhow::bail!("--audit-topic resolved a different node key than the one serving");
+        anyhow::bail!("channel {name:?} resolved a different node key than the one serving");
     }
     if ctx.fabric_root != trust_root {
         anyhow::bail!(
-            "--audit-topic: this node's membership is in fabric {}, but --trust-root is {}",
+            "channel {name:?} is in fabric {}, but this host's membership is in {}",
             ctx.fabric_root.hex(),
             trust_root.hex()
         );
@@ -270,40 +222,71 @@ mod tests {
     use library::{NodeIdentity, TopicId};
 
     #[test]
-    fn serve_requires_an_exposed_tool() {
-        let base = ["wires", "serve", "--trust-root", "00"];
-        let parse = |extra: &[&str]| Cli::try_parse_from(base.iter().chain(extra));
-        let Command::Serve(a) = parse(&["--expose", "a=cat", "--expose", "b=rg -n"])
-            .unwrap()
-            .command
-        else {
+    fn serve_takes_host_json_and_nothing_else_decides() {
+        let parse = |args: &[&str]| Cli::try_parse_from(["wires", "serve"].iter().chain(args));
+        let Command::Serve(a) = parse(&["host.json", "--check"]).unwrap().command else {
             panic!("expected serve");
         };
-        assert_eq!(a.expose, ["a=cat", "b=rg -n"]);
-        assert!(parse(&["--expose-file", "t.json"]).is_ok());
-        assert!(parse(&[]).is_err(), "nothing exposed");
-        // The single-command form and its `--scope` are gone.
-        assert!(parse(&["--", "cat"]).is_err());
-        assert!(parse(&["--expose", "a=cat", "--", "cat"]).is_err());
-        assert!(parse(&["--expose", "a=cat", "--scope", "s"]).is_err());
+        assert_eq!(a.config, PathBuf::from("host.json"));
+        assert!(a.check);
+        assert!(parse(&[]).is_err(), "host.json is required");
+        assert!(parse(&["h.json", "--relay-url", "https://r.example"]).is_ok());
+        assert!(parse(&["h.json", "--peer", "t1", "--peer", "t2"]).is_ok());
+        // The flag-based form is gone: host.json is the only one.
+        for gone in [
+            &["h.json", "--expose", "a=cat"][..],
+            &["h.json", "--expose-file", "t.json"],
+            &["h.json", "--require-idp", "email=*@x.com"],
+            &["h.json", "--oidc-audience", "x"],
+            &["h.json", "--oidc-issuer", "https://x"],
+            &["h.json", "--audit-topic", "ops"],
+            &["h.json", "--allow-any-member"],
+            &["h.json", "--trust-root", "00"],
+            &["h.json", "--", "cat"],
+        ] {
+            assert!(parse(gone).is_err(), "{gone:?}");
+        }
     }
 
-    /// `wires serve --audit-topic ops …` for `member`, parsed from the CLI.
+    /// `serve --check` validates and summarizes without a keystore; a bad
+    /// file fails with the reason.
+    #[tokio::test]
+    async fn check_validates_without_a_keystore() {
+        let dir = crate::testutil::temp_dir();
+        let good = dir.join("host.json");
+        std::fs::write(
+            &good,
+            r#"{"version":1,"tools":{"gh":{"command":["gh"],"allow":["member"]}}}"#,
+        )
+        .unwrap();
+        let args = |path: &Path| {
+            let Command::Serve(a) =
+                Cli::try_parse_from(["wires", "serve", "--check", path.to_str().unwrap()])
+                    .unwrap()
+                    .command
+            else {
+                panic!("expected serve");
+            };
+            a
+        };
+        serve_cmd(args(&good)).await.unwrap();
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, r#"{"version":1,"tools":{},"extra":1}"#).unwrap();
+        let e = format!("{:#}", serve_cmd(args(&bad)).await.unwrap_err());
+        assert!(e.contains("is not a valid host.json"), "{e}");
+        assert!(e.contains("unknown field `extra`"), "{e}");
+    }
+
+    /// `wires serve host.json --peer t1` for `member`, parsed from the CLI.
     fn audit_serve_args(member: &Member) -> ServeArgs {
         let cli = Cli::try_parse_from([
             "wires",
             "serve",
-            "--trust-root",
-            &member.root.node_id().hex(),
-            "--allow-any-member",
+            "host.json",
             "--node-seed",
             &member.node.seed_hex(),
-            "--audit-topic",
-            "ops",
-            "--audit-peer",
+            "--peer",
             "t1",
-            "--expose",
-            "cat=cat",
         ])
         .unwrap();
         match cli.command {
@@ -325,32 +308,17 @@ mod tests {
     }
 
     #[test]
-    fn serve_parses_the_audit_flags() {
+    fn serve_parses_the_peer_flag() {
         let member = provisioned([2u8; 32]);
         let a = audit_serve_args(&member);
-        assert_eq!(a.audit_topic.as_deref(), Some("ops"));
-        assert_eq!(a.audit_peer, vec!["t1".to_string()]);
-        // `--audit-peer` means nothing without a topic.
-        assert!(
-            Cli::try_parse_from([
-                "wires",
-                "serve",
-                "--trust-root",
-                "ab",
-                "--audit-peer",
-                "t",
-                "--expose",
-                "cat=cat"
-            ])
-            .is_err()
-        );
+        assert_eq!(a.peer, vec!["t1".to_string()]);
     }
 
     #[test]
     fn audit_topic_preflight_accepts_a_provisioned_member() {
         let member = provisioned([2u8; 32]);
         let mut a = audit_serve_args(&member);
-        a.audit_peer.clear();
+        a.peer.clear();
         let ctx = audit_preflight(&member, &a).unwrap();
         assert_eq!(ctx.topic, TopicId::derive(member.root.node_id(), "ops"));
     }
@@ -360,9 +328,9 @@ mod tests {
         let member = provisioned([2u8; 32]);
         std::fs::remove_dir_all(member.ks.keyring_dir()).unwrap();
         let mut a = audit_serve_args(&member);
-        a.audit_peer.clear();
+        a.peer.clear();
         let e = format!("{:#}", audit_preflight(&member, &a).unwrap_err());
-        assert!(e.contains("--audit-topic"), "{e}");
+        assert!(e.contains("channel \"ops\" needs this host"), "{e}");
         assert!(e.contains("wires advanced import --fabric-key-file"), "{e}");
     }
 
@@ -371,7 +339,7 @@ mod tests {
         let member = provisioned([2u8; 32]);
         std::fs::remove_file(member.ks.path("inclusion-proof.json")).unwrap();
         let mut a = audit_serve_args(&member);
-        a.audit_peer.clear();
+        a.peer.clear();
         let e = format!("{:#}", audit_preflight(&member, &a).unwrap_err());
         assert!(
             e.contains("wires advanced import --inclusion-proof-file"),
@@ -383,7 +351,7 @@ mod tests {
     fn audit_topic_refuses_a_channel_in_another_fabric() {
         let member = provisioned([2u8; 32]);
         let mut a = audit_serve_args(&member);
-        a.audit_peer.clear();
+        a.peer.clear();
         let e = audit_context_in(
             Arc::clone(&member.ks),
             member.home.clone(),
@@ -393,6 +361,6 @@ mod tests {
             NodeIdentity::from_seed([77u8; 32]).node_id(),
         )
         .unwrap_err();
-        assert!(format!("{e:#}").contains("--trust-root"), "{e:#}");
+        assert!(format!("{e:#}").contains("this host's membership"), "{e:#}");
     }
 }

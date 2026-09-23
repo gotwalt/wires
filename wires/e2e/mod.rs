@@ -1359,6 +1359,7 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
         tools: cat_tool(),
         audit: Some(sink),
         identity: None,
+        policy: Arc::new(crate::host::policy::AnyMember),
     };
     let store_r = r.store(&fab);
     let mut cfg = TopicNodeConfig::new(
@@ -1598,6 +1599,7 @@ fn hosted_responder(
         tools: cat_tool(),
         audit: Some(sink),
         identity: None,
+        policy: Arc::new(crate::host::policy::AnyMember),
     };
     let hosted = crate::host::audit::Hosted {
         session: SessionProtocol(Arc::new(serve)),

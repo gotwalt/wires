@@ -60,10 +60,15 @@ pub fn audit_line(record: &AuditRecord) -> String {
             principal,
             tool,
             argv,
+            role,
             ..
         } => {
+            let role = role
+                .as_deref()
+                .map(|r| format!(" [{}]", escape(r)))
+                .unwrap_or_default();
             let mut line = format!(
-                "▶ {} {} {tool}",
+                "▶ {} {}{role} {tool}",
                 short_hex(&call.hex()),
                 caller_label(*caller, principal.as_ref())
             );
@@ -223,6 +228,7 @@ mod tests {
             org: Some("corp".into()),
             groups: vec![],
             not_after: 0,
+            claims: Default::default(),
         }
     }
 
@@ -236,12 +242,13 @@ mod tests {
             tool: ToolName::new("db_query").unwrap(),
             argv: Argv::new(vec!["select count(*) from orders".into()]).unwrap(),
             roster_version: Some(2),
+            role: Some("analyst".into()),
             at_ms: 0,
         });
         assert_eq!(
             line,
             format!(
-                "▶ 3fa2 alice@corp ({}…) db_query \"select count(*) from orders\"",
+                "▶ 3fa2 alice@corp ({}…) [analyst] db_query \"select count(*) from orders\"",
                 &caller.hex()[..4]
             )
         );
@@ -257,6 +264,7 @@ mod tests {
             tool: ToolName::new("stdio").unwrap(),
             argv: Argv::new(vec!["-n".into(), "".into(), "a b".into()]).unwrap(),
             roster_version: None,
+            role: None,
             at_ms: 0,
         });
         assert_eq!(
@@ -450,7 +458,10 @@ mod tests {
         }
 
         #[test]
-        fn any_argv_renders_on_one_line(args in proptest::collection::vec("[^\u{0}]{0,12}", 0..6)) {
+        fn any_argv_renders_on_one_line(
+            args in proptest::collection::vec("[^\u{0}]{0,12}", 0..6),
+            role in proptest::option::of("(?s).{0,12}"),
+        ) {
             let line = audit_line(&AuditRecord::Started {
                 call: call(),
                 caller: node(4),
@@ -458,6 +469,7 @@ mod tests {
                 tool: ToolName::new("t").unwrap(),
                 argv: Argv::new(args).unwrap(),
                 roster_version: None,
+                role,
                 at_ms: 0,
             });
             prop_assert!(!line.chars().any(char::is_control), "{line:?}");
