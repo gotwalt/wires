@@ -42,3 +42,19 @@ and a live revocation.
 
   n=1. Input is −40% for the CLI, but cost is only −5%, because cached reads dominate and the ~22k cache write is the same for both. Most of the gap is two extra schema-exploration turns on the MCP side. **Don't headline a number from this**; repeat with n≥5 and a harder task before claiming anything.
 - **Still to do:** card 11 fixes (20 s audit stall after login, Safari callback page) → rebuild on workbench → `docs/demo.md` narration → recording.
+
+### Second two-machine run, on the new surface — 2026-09-23 (integrator)
+
+Fresh provisioning with `init` / `id` / `invite` / `join`; workbench runs `wires serve host.json` (role `analyst` = `gotwalt@gmail.com`) as `systemd-run --user --unit wires-demo` from `~/.wires-demo2`; `ss`: **0 TCP listeners**.
+
+- Before login: `wires tools` → `1 host on channel "ops" announces nothing you may use`; `wires call db_query` → exit 77, `db_query needs a verified identity in role analyst (email=gotwalt@gmail.com)`; the refusal is on the channel.
+- Real Google `wires login --topic ops`: **the browser now shows the "signed in" page (Safari fix confirmed by the human)**. Observer: `🪪 identity 4ad01c92 is gotwalt@gmail.com (verified by https://accounts.google.com)`; the announcement went from 0 to 1 sealed entry.
+- After login: `wires tools` lists `db_query on 51442ef9`, with the no-shell hint line; `wires call` returns the rows; observer: `▶ … gotwalt@gmail.com (4ad0…) [analyst] db_query "select …"` / `■ exit 0`.
+- **Claude Code, `WIRES_LOCKED=1`, PATH = only `wires` + /usr/bin:/bin, allowedTools `Bash(wires call:*),Bash(wires tools)`:** found the tool through `wires tools`, answered correctly (umbrella, $999.00, 61.3% of $1,629.84), 4 turns, $0.2131. Both of its queries are on the observer's log with the email and role.
+- `wires remove agent` → roster v5 re-key on the channel → the agent's next call exits 77 with **0 bytes** of stdout, the `✗` is on the channel, and the workbench pid is unchanged (1727711).
+
+**Camera polish (card 21):**
+1. `watch` prints `📣 announces tools` for every 10-minute heartbeat (an overnight watch was a wall of them). Print only when an announcement changes.
+2. `wires remove` prints two WARN lines (`gossip connection from a peer with no admission`, from the admin's one-shot node); `remove`/`invite` should be quiet by default.
+3. A removed member's refusal reads `stale inclusion proof: proof targets version 4, head is version 5`. It should say "not in the current roster (removed at version 5)".
+4. After `remove agent`, the host's re-announcement still carries **1 sealed entry**, and the only qualifying identity was the removed agent's. It looks like announcements are sealed to verified identities without checking current roster membership. The removed member can't open it (it's under the new channel key), but the recipient set should be the current roster ∩ allowed.
