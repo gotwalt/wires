@@ -1,152 +1,171 @@
 # wires
 
-> **Your agents get a private, end-to-end-encrypted group chat — with each
-> other, with your tools, and with you — and any MCP server can be dialed
-> into it.**
+> **Run a CLI on another machine from your agent. The machine is reached by
+> public key, never by network path; the caller is authenticated by your IdP;
+> and every call lands on an encrypted gossip channel that anyone you
+> authorize can watch — without access to the caller or the machine running
+> the CLI.**
 
-![revocation demo: the same dial before and after a roster head-advance — exit 77, zero bytes, responder never restarted](docs/demo-revoke.gif)
+## The demo
 
-Two halves run today. The group chat is the newer one — several agents and you
-on one encrypted topic, no server in the middle: see
-[Topics](#topics-several-agents-and-you-one-conversation). The dial-in half is
-the older one, and solves a real problem on its own:
+> **Status: in progress.** The flags below are being built now (see
+> [the board](docs/board/README.md)); the self-asserting script lands as
+> `.scripts/demo-remote-cli.sh`. Until then, [What runs today](#what-runs-today)
+> lists the demos that pass on this tree.
 
-**Run any stdio MCP server on another machine as if it were local.** The
-caller's identity is verified before the first byte; access is revocable
-without rotating a single key. No OAuth bolt-on, no bearer token pasted into a
-config file, no inbound port on the server. Point your MCP client at
-`wires connect`, point `wires serve` at the unmodified server binary, and
-neither side knows a network is involved — see
-[MCP over wires](#mcp-over-wires-flow-b--no-extra-code) for the two-command
-setup, or [Usage](#usage) for the full walkthrough.
+1. **workbench** exposes one read-only SQL CLI and puts every call on the
+   `ops` channel:
+   `wires serve --expose 'db_query=sqlite3 -safe -readonly orders.db' --audit-topic ops --require-idp 'email=*@example.com' …`
+2. **laptop**: Claude Code runs `wires call db_query -- "select count(*) from orders"`
+   from its shell, or reaches the same tool through `wires mcp` in its MCP config.
+3. **observer** holds no grant for the tool and no credential of either end;
+   `wires tail ops` shows each call as it happens:
+   ```
+   ▶ 3fa2 alice@example.com (a1b2…) db_query "select count(*) from orders"
+   ■ 3fa2 exit 0 · 41 ms · 3.1 KiB out · blake3 9c1e…
+   ```
+4. **revoke**: one `wires roster commit` without the agent. Its next call
+   exits `77` with zero bytes on stdout, and the refusal is on the channel too:
+   `✗ a1b2… db_query denied: membership rejected: revoked`.
 
-## Quickstart: run the demos
+## Why not…
 
-Two unattended scripts stand the whole thing up on loopback — three keystores,
-a committed roster, a responder wrapped around an **unmodified** stdio MCP
-server, and a real MCP conversation across it. Each asserts its own result, so
-a green run is a passing test, not a screenshot:
+| | |
+|---|---|
+| **…Tailscale?** | To reach an MCP server over Tailscale, the server has to listen on a port the agent's machine can reach. The service itself is exposed on the network, and its own auth is all that guards it. A wires responder exposes no service: it runs an allowlisted CLI per verified call, and that is all the agent's machine can reach. |
+| **…an MCP gateway?** | A gateway's log belongs to whoever runs the gateway, and covers only the traffic routed through it. Here the record is written by the responder that ran the command — the one place the call can happen — signed by its key and hash-linked to the previous record. The agent can't forge it, and an observer reads it without the caller's or the responder's credentials. |
+| **…MCP instead of CLIs?** | CLIs are the idiom models already know, one verb covers every tool, and pipes filter output before it reaches context. That is meaningfully more efficient than MCP tool schemas and JSON results, even after the 2026-07-28 rev. What CLIs have never had is an observability story; the channel is that story. `wires mcp` is there for clients that only speak MCP. |
+| **…OAuth on each server?** | `wires login` binds your IdP's ID token to your node key (the OIDC `nonce` is a hash of the key) and publishes it on the channel as metadata. Every reader checks the IdP's signature itself: no wires-run attestor, no auth code in the CLI, and two organizations' IdPs can share one channel. |
+
+## Quickstart
+
+> **Status: in progress.** Steps 1–2 run today. Steps 3–5 use `serve --expose`,
+> `--audit-topic`, `--require-idp`, `wires login`, `wires tools`, `wires call`
+> and `wires mcp`, which are landing now ([cards 01–05](docs/board/README.md#lanes)).
+> Build with `bazel build //wires` and put `bazel-bin/wires/wires` on `PATH`
+> (copy it; `bazel-bin/` moves on `bazel clean`).
+
+**1. Keys.** Each machine makes a node key; you (the person who decides who's
+in) also make a root key, and keep it on your own machine.
+
+```bash
+wires keygen --save-node        # on workbench, laptop, observer — note each node_id
+wires keygen --save-root        # on your machine only — note root_id
+```
+
+**2. The roster.** Sign the list of who's in. Per member, `commit` writes an
+inclusion proof and that member's sealed copy of the channel's data key; each
+member installs its four credentials with one `import`.
+
+```bash
+wires roster add --member "$WORKBENCH_ID"
+wires roster add --member "$LAPTOP_ID"
+wires roster add --member "$OBSERVER_ID"
+wires roster commit --ttl 3600 --out ./proofs              # prints the head token
+wires member --subject "$LAPTOP_ID" --ttl 3600 > laptop.pass
+
+# on each member (laptop shown):
+wires import --membership-file ./laptop.pass \
+             --inclusion-proof-file "./proofs/$LAPTOP_ID.proof" \
+             --roster-head "$HEAD" \
+             --fabric-key-file "./proofs/$LAPTOP_ID.key"
+```
+
+**3. workbench: expose the CLI and log every call.** `--expose` takes
+`name=command`; the command is split on whitespace and exec'd directly, never
+through a shell, with the caller's arguments appended. sqlite3's `-safe` flag
+disables its `.shell`/`.system` dot-commands — use it.
+
+```bash
+wires serve --trust-root "$ROOT_ID" --allow-any-member \
+  --expose 'db_query=sqlite3 -safe -readonly /data/orders.db' \
+  --audit-topic ops \
+  --require-idp 'iss=https://accounts.google.com,email=*@example.com'
+```
+
+**4. laptop: log in once, then call.** `wires login` runs your IdP's browser
+flow and publishes the resulting claim on `ops`; the responder admits the call
+once that claim verifies against `--require-idp`.
+
+```bash
+wires login --topic ops
+wires tools add db_query --node "$WORKBENCH_ID" --description "Read-only SQL over orders.db"
+wires call db_query -- "select count(*) from orders"
+```
+
+For an MCP client, the whole config is:
+
+```json
+{ "mcpServers": { "workbench": { "command": "wires", "args": ["mcp"] } } }
+```
+
+**5. observer: watch.**
+
+```bash
+wires tail ops
+```
+
+To revoke: `wires roster remove --member "$LAPTOP_ID" && wires roster commit …`,
+then import the new head on workbench. The next call is refused; no one
+restarts anything.
+
+## What runs today
+
+Four unattended scripts stand up the working parts on loopback, each in a
+fresh `mktemp -d` that never touches `~/.config/wires`. Each asserts its own
+result, so a green run is a passing test, not a screenshot. All take
+`--quiet` (assertions only) and `--keep` (leave the state dir).
 
 ```bash
 bazel build //wires
-./.scripts/demo-mcp.sh      # an MCP server on "another machine", dialed by ticket
-./.scripts/demo-revoke.sh   # revoke → the same dial dies, nothing re-keyed
+./.scripts/demo-mcp.sh            # a stdio MCP server on "another machine", dialed by key
+./.scripts/demo-revoke.sh         # one roster commit → the same dial dies, nothing restarted
+./.scripts/demo-topic.sh          # two members on one encrypted channel, nobody in the middle
+./.scripts/demo-topic-revoke.sh   # cut one member out mid-conversation
 ```
 
-- **`demo-mcp.sh`** (~7 s) — watch the final line. The tool answers with the
-  *caller's* node id, which it learned from wires' environment injection, not
-  from anything the request claimed. The script asserts that every byte on the
-  dialer's stdout parsed as JSON-RPC: no banner, no log line, no framing.
-- **`demo-revoke.sh`** (~1 min paced and narrated for a first-time viewer;
-  ~7 s under `--quiet`) — watch the responder's pid stay the same across
-  the revocation, then watch the identical dial exit `77` with **zero bytes**
-  on stdout and the reason printed on the dialer's own terminal. Default
-  `--mode roster` advances the signed head; `--mode crl` appends to the
-  responder's `crl.json`.
+- **`demo-mcp.sh`** (~7 s): an unmodified stdio MCP server behind
+  `wires serve`, reached with `wires connect`. The tool answers with the
+  *caller's* node id, which it learned from the responder's environment
+  injection, not from anything the request claimed. The script asserts every
+  byte on the dialer's stdout parsed as JSON-RPC.
+- **`demo-revoke.sh`** (~1 min narrated, ~7 s with `--quiet`): the
+  responder's pid stays the same across the revocation, and the identical dial
+  exits `77` with **zero bytes** on stdout and the reason on the dialer's
+  stderr. `--mode roster` (default) advances the signed head; `--mode crl`
+  appends to the responder's `crl.json`.
+- **`demo-topic.sh`** / **`demo-topic-revoke.sh`**: the channel the calls will
+  land on, exercised on its own. See
+  [the channel](#the-channel-the-calls-land-on) below.
 
-Both take `--quiet` (assertions only) and `--keep` (leave the state dir).
-Both provision into a fresh `mktemp -d` and never touch `~/.config/wires`.
+![revocation demo: the same dial before and after a roster head-advance — exit 77, zero bytes, responder never restarted](docs/demo-revoke.gif)
 
-The screencast at the top of this file is `demo-revoke.sh` recorded as-is; to
-re-record after a change:
+The recording is `demo-revoke.sh` as-is (the remote-CLI demo will replace it);
+to re-record: `asciinema rec -c ./.scripts/demo-revoke.sh demo.cast && agg demo.cast docs/demo-revoke.gif`.
 
-```bash
-asciinema rec -c ./.scripts/demo-revoke.sh demo.cast && agg demo.cast docs/demo-revoke.gif
-```
+<!-- card 07: .scripts/demo-remote-cli.sh goes here — one line + what it asserts. -->
 
-## Topics: several agents and you, one conversation
+## The channel the calls land on
 
-Everything above is one client and one server. A **topic** is the other shape:
-your agents and you in one encrypted conversation, with no server in the
-middle and no account anywhere. You sign a list of who's in; anyone on it can
-talk; taking someone out is one command on the machine that holds your key,
-and nobody restarts.
-
-Three steps, after the usual `keygen` (see [Usage](#usage)):
+The audit channel is a **topic**: an end-to-end-encrypted log shared by the
+members of a roster, with no server in the middle. `wires tail` is a resident
+node (log, gossip mesh, admission, history replay) and `wires publish` puts a
+message on it. A responder with `--audit-topic` is simply a member that
+publishes call records; an observer is any member running `tail`.
 
 ```bash
-# 1. You, holding the root key: sign the member list. Per member it writes an
-#    inclusion proof and that member's sealed copy of the group's data key.
-wires roster add --member "$AGENT_ID"
-wires roster commit --ttl 3600 --out ./proofs      # prints the head token
-wires member --subject "$AGENT_ID" --ttl 3600 > agent.pass
-
-# 2. Each member, once: all four credentials in a single command.
-wires import --membership-file ./agent.pass \
-             --inclusion-proof-file ./proofs/$AGENT_ID.proof \
-             --roster-head "$HEAD" \
-             --fabric-key-file ./proofs/$AGENT_ID.key
-
-# 3. Talk. `tail` is the resident node — log, mesh, admission, replay — and
-#    prints its own bootstrap ticket on stderr.
-wires tail ops                                     # → share to bootstrap: <ticket>
+wires tail ops                                        # → share to bootstrap: <ticket>
 wires publish ops -m "deploying build 41" --peer "$TICKET"
 ```
 
-The topic isn't created anywhere; both sides compute the same name from the
-group they belong to. `publish` on a machine with a running `tail` hands the
-text to it over a unix socket; on a cold machine it stands up a one-shot node,
-delivers, and exits. Either way the line in the transcript is stamped with the
-key that signed it — no display name to spoof — and a member who was offline
-catches up from any other member, because every tail serves history.
+The topic isn't created anywhere; every member computes the same name from
+the roster it belongs to. Each line is stamped with the key that signed it,
+and a member who was offline catches up from any other member, because every
+`tail` serves history. The commit that removes a member re-keys everyone
+else, so a removed member can't read what comes next. Design, threat model,
+and revocation latencies: [docs/phase2-topics.md](docs/phase2-topics.md).
 
-Two more self-asserting scripts, same rules as above (`--quiet`, `--keep`,
-never touch `~/.config/wires`):
-
-```bash
-./.scripts/demo-topic.sh          # two agents, one topic, nobody in the middle
-./.scripts/demo-topic-revoke.sh   # cut one out mid-conversation; same pid throughout
-```
-
-Design, threat model, and the four revocation latencies the second script
-asserts: [docs/phase2-topics.md](docs/phase2-topics.md).
-
-## Why you'd want this
-
-Today you give an agent power by *co-locating* tools and secrets next to it:
-install binaries in its sandbox, mount API keys into its environment, spawn
-MCP servers as local child processes, hand it a shell. The agent can do
-whatever happens to sit beside it — which couples capability to location and
-spills secrets into the agent's box.
-
-Wires makes a tool something you **dial**, not a binary you bundle. Any
-program's stdin/stdout becomes an authenticated, revocable network endpoint.
-Harnessing an agent becomes *granting it access*: you issue a
-non-transferable, human-rooted grant to reach one specific tool — wherever
-that tool actually runs (a VPC, another machine, an air-gapped enclave) — and
-the agent holds only that grant, never the tool's secrets. The tool's database
-password or API key stays with the tool; revoke the grant and the agent loses
-the tool, with no key rotation and nothing to re-image.
-
-It is `ssh user@host -- tool`, but the address is a grant instead of an IP,
-the credential is bound to the caller's identity instead of being a copyable
-key, and the far end is one scoped tool instead of a whole shell. Your
-existing CLIs and MCP servers work unmodified, because the session's native
-payload *is* stdio (and, one frame up, MCP).
-
-Because access is granted *to your network* rather than configured *into each
-service*, the result is data sovereignty that survives switching agents or
-platforms. Services join your network; you don't join each service. Switch
-LLM providers and grant the new agent access to the same tools the old one
-had — your house, your data, and your services don't need to be reconnected.
-Lock-in becomes a property of whom you chose to grant access, not of any
-single service's data hoard.
-
-## Where this is going
-
-MCP is a superb tool protocol and keeps narrowing itself into an even better
-one — one client, one server, request/response. What it leaves permanently
-out of scope is *communication*: several agents and a human sharing context,
-an agent noticing something and telling the others, push, persistence,
-identity that travels with you. Filling that gap — the group chat, built on
-the membership and revocation machinery that already runs here — is the
-product; its minimum ships today as [Topics](#topics-several-agents-and-you-one-conversation),
-CLI-only. Next is the on-ramp in the other direction, so an agent joins a
-topic through its own MCP config instead of a terminal. The plan, its
-reasoning, its phase gates, and its kill criteria live
-in [docs/restart.md](docs/restart.md); the layer model underneath is the
-[thesis](#wires-as-a-session-layer-stdio-and-mcp-over-a-capability-addressed-network)
-at the bottom of this file.
+# Reference
 
 ## Setup dev environment
 
@@ -158,31 +177,26 @@ This will install `bazelisk` and `direnv` and add all the bazel-controlled tools
 
 ## Usage
 
-> **Status:** the design is implemented end-to-end — the `library` core
-> (identity, grants, **fabric membership**, tickets, policy, the session frame
-> codec), the `wires` multi-call binary (`keygen` / `grant` / `member` /
-> `roster` / `revoke` / `import` / `pair` / `serve` / `connect`), a self-hosted
-> `relay`, distroless OCI images, an on-disk keystore, direct-address tickets,
-> and offline revocation that lands on the next dial without a restart.
-> Every session also proves **fabric membership** and hands the verified caller
-> identity to the served tool (see
-> [Fabric membership](#fabric-membership-identity-on-every-session) and the
-> companion [docs/fabric-vision.md](docs/fabric-vision.md)). What's left is
-> convention, not plumbing: a standardized stdio-frame vocabulary (see the thesis
-> at the bottom).
+Everything in this section runs on this tree today: the `library` core
+(identity, grants, **membership**, the committed roster, tickets, policy, topic
+envelopes, the session frame codec), the `wires` multi-call binary, a
+self-hosted `relay`, distroless OCI images, and an on-disk keystore. Every
+session proves roster membership and hands the verified caller identity to
+the served command (see [Membership](#membership-identity-on-every-session)).
+The remote-CLI surface from the [quickstart](#quickstart) is added here as it
+lands.
 
 ### Layout
 
 Three flat Bazel packages in one Cargo workspace (build & test are Bazel-only —
-`bazel build //...`, `bazel test //...`; see [CLAUDE.md](CLAUDE.md) and
-[docs/rust-bazel-layout.md](docs/rust-bazel-layout.md)):
+`bazel build //...`, `bazel test //...`; see [CLAUDE.md](CLAUDE.md)):
 
 - **`//library`** — the `library` crate: the pure, transport-free core — identity,
   grant, ticket, policy, and the session `Frame` codec. No iroh/tokio; property +
   unit + doctested.
-- **`//wires`** — the multi-call binary: the whole layer surface as subcommands.
-  The iroh transport (`wires/transport.rs`), keystore (`wires/keystore.rs`), and
-  pairing (`wires/pair.rs`) live here so `library` stays pure.
+- **`//wires`** — the multi-call binary: every subcommand, plus the iroh
+  transport (`wires/transport.rs`), keystore (`wires/keystore.rs`), and the topic
+  node (`wires/topics.rs`), so `library` stays pure.
 - **`//relay`** — a self-hosted [`iroh-relay`](https://docs.rs/iroh-relay)
   rendezvous server.
 
@@ -219,7 +233,7 @@ printf 'a\nTODO: ship it\nb\n' | ./.scripts/connect.sh   # terminal 2 → "2:TOD
 
 These two keep their state in a sticky `$WIRES_DEMO_DIR` (default
 `/tmp/wires-demo`) so you can re-dial without re-provisioning. The unattended
-[quickstart demos](#quickstart-run-the-demos) use a fresh `mktemp -d` instead.
+[demos](#what-runs-today) use a fresh `mktemp -d` instead.
 Every script in `.scripts/` runs directly from the repo root, not via
 `bazel run //.scripts:…`.
 
@@ -228,8 +242,8 @@ Every script in `.scripts/` runs directly from the repo root, not via
 | Command          | Role                      | What it does                                                                 |
 | ---------------- | ------------------------- | ---------------------------------------------------------------------------- |
 | `wires keygen`   | trust-root / host setup   | Generate (or re-derive) a **node key** and **root key**; print, and `--save-*` to the keystore |
-| `wires grant`    | trust root (the human)    | Root-sign a capability and emit a base64 **ticket**, optionally with `--addr`/`--relay-url` hints |
-| `wires member`   | trust root (the human)    | Root-sign a **fabric membership** for a node and emit a base64 token (`--save` to the keystore) |
+| `wires grant`    | trust root (the human)    | Root-sign a scoped grant and emit a base64 **ticket**, optionally with `--addr`/`--relay-url` hints |
+| `wires member`   | trust root (the human)    | Root-sign a **membership** for a node and emit a base64 token (`--save` to the keystore) |
 | `wires roster`   | trust root (the human)    | Author a **committed roster**: `add`/`remove` members, `commit` a signed head + per-member proofs, `head` to print the current head token |
 | `wires revoke`   | trust root / responder    | Add a subject to the CRL (keystore `crl.json` by default) and print it       |
 | `wires import`   | anyone receiving creds    | Install a membership / inclusion proof / roster head / topic data key into the keystore, so later commands need no flags |
@@ -237,7 +251,9 @@ Every script in `.scripts/` runs directly from the repo root, not via
 | `wires publish`  | any member                | Put a message on a topic — through a running `tail`'s socket, or as a one-shot node when there isn't one |
 | `wires serve`    | responder (the tool host) | Verify the dialer's **membership** (and, with `--scope`, a matching grant), exec a command, bridge its stdio — injecting the verified caller identity into the child |
 | `wires connect`  | dialer (the agent side)   | Present the **membership** and dial a `--ticket` (scoped) or `--target` (inclusion-only), piping local stdin/stdout/stderr |
-| `wires pair`     | operator ⇄ requester      | Issue a grant over the wire: `accept` (operator consents) ⇄ `request` (node)  |
+
+In progress ([board](docs/board/README.md)): `serve --expose` / `--audit-topic` /
+`--require-idp`, `wires call`, `wires mcp`, `wires tools`, and `wires login`.
 
 ### Two keys
 
@@ -274,7 +290,7 @@ environment), keys and the CRL live in a **keystore** directory, resolved as
 | `node.seed`       | `keygen --save-node` | `serve` / `connect` node key     |
 | `root.seed`       | `keygen --save-root` | `grant` / `member` signing key   |
 | `crl.json`        | `revoke` (default)   | `serve` revocation check         |
-| `membership.json` | `member --save` / `import` | `connect` + `serve` fabric membership |
+| `membership.json` | `member --save` / `import` | `connect` + `serve` membership |
 | `roster.json`        | `roster add`/`commit` | the root's full member set (`0600`, private) |
 | `roster-head.json`   | `roster commit` / `import` | `serve` (the signed head it enforces, public) |
 | `inclusion-proof.json` | `import`            | `connect` (the member's own proof, public) |
@@ -316,12 +332,12 @@ bazel run -q //wires -- keygen --save-node   # on the tool host → note SERVER_
 bazel run -q //wires -- keygen --save-node   # on the agent box → note AGENT_ID
 ```
 
-**3. The human admits the agent to the fabric and grants it the tool.** First a
-**membership** — the agent's scope-independent fabric identity, required on every
-session (explained [below](#fabric-membership-identity-on-every-session)) — then
+**3. The human admits the agent and grants it the tool.** First a
+**membership** — the agent's scope-independent identity, required on every
+session (explained [below](#membership-identity-on-every-session)) — then
 a scoped **grant**. Both are root-signed; the root key comes from the keystore,
 so no `--root-seed` is needed. These print a membership **token** and a
-capability **ticket** (the address):
+**ticket** (the address):
 
 ```bash
 MEMBERSHIP=$(bazel run -q //wires -- member \
@@ -373,7 +389,7 @@ bazel run -q //wires -- import --membership "$MEMBERSHIP"
 # → wrote ~/.config/wires/membership.json
 ```
 
-**6. The agent dials the capability** — exactly like running a local stdio
+**6. The agent dials the ticket** — exactly like running a local stdio
 program. It presents the installed membership and the ticket; its node key
 comes from the keystore; its stdin is forwarded to the child; the child's
 stdout/stderr stream back; its exit code becomes `connect`'s:
@@ -393,10 +409,10 @@ use the keystore, every command also accepts secrets inline via `--node-seed` /
 `--membership` / `$WIRES_MEMBERSHIP` / `--membership-file` — `import` just
 writes the keystore copy for you so the dial stays flagless.)
 
-### Fabric membership: identity on every session
+### Membership: identity on every session
 
 A **grant** authorizes one scope; a **membership** answers a different question —
-*"is this node part of my fabric, and who is it?"* — independent of any tool. The
+*"is this node one of mine, and which one?"* — independent of any tool. The
 human mints one per node with `wires member` (root-signed, non-transferable,
 offline-verifiable against the pinned `--trust-root`), and the dialer presents it
 on **every** session. A membership is a *public* credential: pass it inline with
@@ -404,7 +420,7 @@ on **every** session. A membership is a *public* credential: pass it inline with
 keystore as `membership.json`.
 
 ```bash
-# The human (holds the root key) admits a node to the fabric:
+# The human (holds the root key) admits a node:
 bazel run -q //wires -- member --subject "$AGENT_ID" --ttl 3600
 ```
 
@@ -418,7 +434,7 @@ It buys two things:
   it. These are server-derived, never a dialer claim, and any inherited `WIRES_*`
   is scrubbed before the child starts.
 - **Inclusion-only responders.** Run `serve` *without* `--scope` (and with the
-  explicit `--allow-any-member`) and any fabric member may open a session; the
+  explicit `--allow-any-member`) and any member may open a session; the
   served binary authorizes from the injected identity. This is the enterprise-MCP
   shape — one responder, per-caller authorization in the tool itself:
 
@@ -431,22 +447,19 @@ It buys two things:
   execing for any member is an intentional authorization downgrade that must be
   asked for.
 
-Membership is **slice 1** of a larger plan (committed rosters, then
-delegation/federation) — see [docs/fabric-vision.md](docs/fabric-vision.md) and
-[docs/provable-fabric-inclusion.md](docs/provable-fabric-inclusion.md).
+Membership says the root vouched for a node at issue time; the committed
+roster below adds *current* membership.
 
-### Committed roster: current membership + fabric-wide revocation
+### Committed roster: current membership + revocation everywhere
 
 A membership says the root vouched for a node *at issue time* (bounded by its
 TTL). The **committed roster** adds *current* membership: the root keeps a
 versioned member set and signs a tiny 32-byte **head** (a Merkle root) whenever
 it changes; a verifier holding the latest head checks a caller's **inclusion
 proof** against it, offline, and learns *present* membership. Removing a member
-and re-signing is fabric-wide revocation with no CRL to distribute. The head
+and re-signing revokes it at every responder holding the new head, with no CRL to distribute. The head
 leaks nothing about the set; a proof reveals only its holder's id and `O(log n)`
-sibling hashes. This is **slice 2b** — see
-[docs/committed-roster.md](docs/committed-roster.md); head/proof distribution
-(gossip, sealed blobs, a blind node) is the deferred slice 2c.
+sibling hashes. Spec: [docs/committed-roster.md](docs/committed-roster.md).
 
 ```bash
 # The human authors the roster (offline) and signs a head + per-member proofs.
@@ -494,7 +507,7 @@ proof per remaining member alongside the new head.
 
 A ticket-less (`--target`) dialer also verifies the **responder's** membership
 from the handshake ack before sending any stdin — *mutual inclusion*, so the
-agent never streams to a service outside its fabric.
+agent never streams to a service outside its roster.
 
 ### MCP over wires (Flow B) — no extra code
 
@@ -547,7 +560,7 @@ the client runs as.
 The client believes it launched a local stdio server; the server believes it was
 launched locally. Neither knows a network is involved. (For a multi-tenant MCP
 server, run the responder
-[inclusion-only](#fabric-membership-identity-on-every-session) with
+[inclusion-only](#membership-identity-on-every-session) with
 `--allow-any-member` and authorize each caller inside the server from
 `WIRES_CALLER_NODE`.)
 
@@ -605,30 +618,6 @@ Two caveats, stated plainly:
   the tool simply ceased to exist. Re-admitting the member (new commit +
   `wires import` of the fresh proof) restored it, same ticket and all.
 
-### Pairing: issue a grant over the wire
-
-`grant` requires pasting the subject's node id. `pair` collects it over an
-authenticated channel instead: the requester dials the operator and announces a
-scope; the operator consents and mints a ticket whose **subject is the
-requester's iroh-authenticated node id** — so a paired ticket is
-non-transferable by construction.
-
-```bash
-# Operator (holds the root key): listen, auto-consent once. Logs its node id +
-# bound sockets so the requester knows where to dial.
-bazel run -q //wires -- pair accept \
-  --target "$SERVER_ID" --scope tools.rg --ttl 3600 --yes --once
-
-# Requester (the agent box): dial the operator directly, print the issued ticket.
-TICKET=$(bazel run -q //wires -- pair request \
-  --operator "$OPERATOR_ID" --addr 198.51.100.9:4433 --scope tools.rg)
-```
-
-Drop `--yes` to be prompted per request (`grant '<scope>' to <node id>? [y/N]`),
-and `--once` to keep serving. The operator reaches requesters / the requester
-reaches the operator the same way as everywhere else — direct `--addr`,
-`--relay-url`, or n0 discovery.
-
 ### Revocation (offline)
 
 Revocation is offline — no auth server, no token introspection endpoint. On the
@@ -661,7 +650,7 @@ Caveat: once a responder has seen a head, *deleting* its `roster-head.json`
 fails closed — every subsequent dial is denied with `responder configuration
 error` until the file is restored.
 
-The [committed roster](#committed-roster-current-membership--fabric-wide-revocation)
+The [committed roster](#committed-roster-current-membership--revocation-everywhere)
 is the stronger of the two stories: instead of adding an id to a blocklist that
 every responder must receive, the operator re-signs a head that simply omits the
 member, and no newer inclusion proof will ever exist for them — revocation by
@@ -699,254 +688,7 @@ relays (needs outbound internet). Two ways to avoid that:
 - **Discovery without hints:** a hintless ticket (no `--addr`) still relies on
   n0 DNS to resolve a node id to an address.
 - **Scope is exact-match:** a grant's scope must equal the responder's `--scope`.
-- **stdio framing is raw bytes:** the richer `tool.exec`/`tool.stdout` frame
-  vocabulary in the thesis below is still a convention to build, not shipped.
-
-# Wires as a session layer: stdio and MCP over a capability-addressed network
-
-The clever core of wires is one idea: **a capability-addressed transport
-whose native protocol data unit is stdio — and, one frame up, MCP.** This
-document is just that idea and the two reference protocols that sit on it
-(stdio-over-wires and MCP-over-wires).
-
-> **Status.** The layer itself is built (see [Usage](#usage) above): the
-> capability-addressed transport, the human-rooted grant model, and the
-> dial-a-capability-get-a-stdio-session ALPN all run today on iroh. What remains
-> *conceptual* is the richer reference **protocol** — the `tool.exec` /
-> `tool.stdout` frame vocabulary below — which is a convention on the layer; the
-> shipped bridge moves raw stdio bytes.
-
-## The thesis
-
-Every networking layer is defined by two choices: **what is the address,
-and what is the protocol data unit (PDU).** Those two answers are what
-make TCP "TCP" and HTTP "HTTP". For wires:
-
-- **The address is a capability**, not an `(IP, port)`. You do not dial a
-  *host*; you dial *a tool you have been granted the right to use*,
-  identified by key and scoped by a non-transferable, human-issued grant.
-- **The PDU is a stdio stream** (stdin / stdout / stderr / exit), and one
-  frame up, an MCP message. The link's *native* content is exactly what
-  agents and tools already speak.
-
-That second choice is the move. Most systems treat stdio and MCP as
-*application payload you happen to ship over a generic transport*. Wires
-makes them the **native framing of a link layer**, so "networking a tool"
-and "speaking to a tool" become the same act — there is no impedance
-mismatch to bridge, because the wire already speaks pipes.
-
-The one-line form:
-
-> **Wires is the missing session layer of the agent stack: a
-> capability-addressed, identity-bound transport whose native PDU is
-> stdio and MCP. It makes any binary's stdin/stdout a first-class,
-> location-independent network endpoint usable only by whoever you grant —
-> turning "provision the tool next to the agent" into "dial the tool by
-> capability, wherever it runs."**
-
-## Where it sits in the stack
-
-Walk the existing stack and the gap is precise:
-
-
-| Layer                 | Address             | Credential                               | What you get                             | Gap for agent tooling                                   |
-| ----------------------- | --------------------- | ------------------------------------------ | ------------------------------------------ | --------------------------------------------------------- |
-| TCP/IP                | `(IP, port)`        | none                                     | byte pipe                                | no identity, location-bound                             |
-| TLS                   | `(IP, port)` + cert | CA chain                                 | encrypted byte pipe                      | identity bolted on, still location-bound                |
-| SSH                   | reachable IP        | copyable keypair (bearer)                | authenticated remote shell               | coarse (a whole shell), bearer auth, needs reachability |
-| WireGuard / Tailscale | overlay IP          | device key                               | an IP network                            | still L3 — you then run protocols on top               |
-| **wires**             | **a capability**    | **non-transferable, human-issued grant** | **an authenticated stdio / MCP session** | — this is the layer                                    |
-
-Nothing above wires lets you say: *"this binary's stdin/stdout is now a
-first-class network endpoint, addressable by a capability, reachable
-wherever it runs, usable only by whoever I admitted."* That sentence is
-the layer. It is SSH where the address is a capability instead of an IP,
-the credential is an identity-bound grant instead of a copyable key, and
-the far end is a scoped tool instead of a shell.
-
-## The core: dial a capability, get a stream, speak stdio
-
-The novel part wires actually has to add is small. iroh already provides
-dial-by-key, NAT-traversing, encrypted, multiplexed QUIC streams. On top
-of that, the session layer is:
-
-> **an ALPN meaning "open a capability-scoped stdio/MCP session," plus
-> the human-rooted, non-transferable capability model that decides who
-> may dial what.**
-
-A tool call is a **session**, not a broadcast: open → stream
-stdin/stdout/stderr → close. It needs no persisted log, message broker, or
-retention — just a direct, encrypted stream between the two endpoints.
-
-```mermaid
-flowchart LR
-    subgraph before["Today: tool provisioned next to the agent"]
-        a1["agent"] -->|"local exec()"| b1["binary"]
-    end
-
-    subgraph after["Wires: dial the tool by capability"]
-        a2["agent"] -->|"dial capability"| s(["authenticated<br/>stdio session"])
-        s -->|"stdin"| b2["binary<br/>(anywhere, egress-only)"]
-        b2 -->|"stdout / stderr / exit"| s
-    end
-```
-The binary is unchanged and unaware of wires. It reads stdin and writes
-stdout/stderr exactly as always. The wrapper node is the adapter between
-"process I/O" and "the session," and it owns the only new thing: an
-identity, and the capability that says which channel/peer may drive it.
-
-## Reference protocol 1: stdio-over-wires
-
-A stdio tool node maps process I/O directly onto the session. The frames
-(this is the *reference convention*, not part of the layer):
-
-
-| Direction     | Process concept | Frame                                                          |
-| --------------- | ----------------- | ---------------------------------------------------------------- |
-| agent → tool | argv + stdin    | `tool.exec` (argv, optional stdin) / `tool.stdin` (more input) |
-| tool → agent | stdout          | `tool.stdout` (chunk)                                          |
-| tool → agent | stderr          | `tool.stderr` (chunk)                                          |
-| tool → agent | exit code       | `tool.exit` (code)                                             |
-
-Three interaction shapes fall out of the same session primitive:
-
-- **One-shot** (`rg`, `git status`): one `tool.exec` in; a few
-  `tool.stdout`/`tool.stderr` frames and a `tool.exit` out; stream closes.
-- **Streaming** (`tail -f`, a build with progress): the tool keeps
-  emitting `tool.stdout` as output arrives; the agent sees it live.
-- **Interactive / long-running** (a REPL, a shell-like session): the
-  agent feeds further `tool.stdin` while the process stays alive; a
-  correlation id ties a stream of frames to one process instance.
-
-Because CLIs are self-documenting, discovery needs no registry: an agent
-dials the tool and runs `--help` to learn the surface, then uses it
-directly. The project intends to publish a standard stdio-over-wires
-frame format so tools and agents interoperate without negotiating — a
-convention on the layer, not part of it.
-
-## Reference protocol 2: MCP-over-wires
-
-This is the cleanest proof the thesis sits at the right layer. An MCP
-server is normally a **local binary** that the MCP client spawns as a
-child process and talks to over stdio (JSON-RPC framed on stdin/stdout).
-Because the wires session's native PDU *is* stdio, you can relocate that
-binary to another machine and **MCP never notices** — no remote-transport
-story to invent, no HTTP/SSE/OAuth bolt-on.
-
-### What actually runs on each machine
-
-Two thin wires nodes bracket the existing, unmodified pieces. Nothing
-about the MCP client or the MCP server changes.
-
-```mermaid
-flowchart LR
-    client["MCP client / agent<br/>(unmodified)"] -->|"spawns as a<br/>local stdio server"| shim["wires shim node<br/>(client machine)"]
-    shim -->|"dial capability,<br/>open session"| resp["wires responder node<br/>(server machine, egress-only)"]
-    resp -->|"spawn child,<br/>pipe stdio"| srv["MCP server binary<br/>(unmodified)"]
-```
-- On the **server machine** (e.g. inside a VPC): a wires **responder**
-  node. It holds an identity and an installed grant, binds an iroh
-  endpoint (egress-only, dialable by key, *no inbound port*), and listens
-  on the session ALPN. On an inbound capability-scoped session it verifies
-  the caller's grant, spawns the MCP server binary as a child process, and
-  bridges the iroh stream byte-for-byte to the child's stdin/stdout/stderr.
-- On the **client machine** (where the agent runs): a wires **shim** node.
-  The MCP client spawns it exactly as it would spawn a local stdio MCP
-  server. The shim holds the capability to dial the remote, opens a
-  session, and pipes its own stdin/stdout to the iroh stream.
-
-The MCP client believes it launched a local stdio server; the MCP server
-believes it was launched locally by a client. Neither is aware of the
-network between them. wires carries the JSON-RPC bytes opaquely — it never
-parses MCP.
-
-### What has to exist on the server machine
-
-- the **MCP server binary** and everything it needs to do its job
-  *locally* — its config and its secrets. The database password, API key,
-  or service credential an MCP server uses **stays on that machine and
-  never travels to the agent**; the agent only ever holds a capability to
-  *reach* the server, not the secrets the server wields.
-- the **wires responder binary** with a grant installed (issued once via
-  the pairing flow).
-- **outbound network egress** to reach a relay / rendezvous. No inbound
-  ports, no public endpoint, no TLS certificate, no MCP-side auth layer.
-
-### Why this is the right framing
-
-This is essentially `ssh user@host -- mcp-server`, with the three
-differences that make it a *layer* rather than a workaround: the address
-is a **capability** instead of a reachable IP, the credential is a
-**non-transferable identity-bound grant** instead of a copyable key, and
-the exposure is scoped to **exactly that one binary** instead of a shell.
-Your "local" MCP server now runs in a VPC, an air-gapped enclave, or on
-another machine — and the MCP spec did not change at all.
-
-MCP-over-wires as described here carries  an MCP *server's* stdio across
-the session layer — and is the conceptual reference protocol, not a
-shipped component.
-
-## Agents like Claude Code are just endpoints
-
-An agent is not special transport; it is another endpoint on the layer.
-Claude Code stops being the box that *contains* its tools and becomes a
-peer that **dials tools by capability.** Its right to drive a tool is the
-grant it holds, not shell access, not a bundled binary, not an API key in
-its environment.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Cl as Claude Code (endpoint)
-    participant T as rg tool node
-
-    Cl->>T: dial capability for tools.shell, open session
-    Note over T: accept — verify grant, then run rg
-    Cl->>T: tool.exec — argv rg TODO src/
-    T->>Cl: tool.stdout — match in src/a.rs
-    T->>Cl: tool.exit — code 0
-    Note over Cl: had no local rg, networked to a node that did
-```
-## What the layer gives you for free
-
-These are properties of the session layer itself — the agent and the tool
-implement none of them:
-
-- **Identity on every session.** The session is authenticated to the caller's
-  key, and the caller proves **fabric membership**; the responder hands that
-  verified identity to the served tool as environment variables
-  (`WIRES_CALLER_NODE` / `WIRES_FABRIC_ROOT`). The tool knows *which* endpoint is
-  driving it, cryptographically — never "whoever reached the socket."
-- **Authorization is the address.** You can only dial a capability you
-  hold. There is no separate auth layer in the tool; its access policy
-  *is* who you granted the capability to.
-- **Non-transferable, human-issued grants.** Authority is bound to an
-  endpoint's key and rooted in one human's key. It cannot be copied or
-  subleased the way an SSH key or API token can.
-- **Instant revocation.** Withdraw the grant and the endpoint can no
-  longer dial. No key rotation across every place a secret was cached.
-- **End-to-end encryption + NAT traversal**, inherited from iroh: the
-  tool is reachable egress-only, with no public endpoint, and the stream
-  is encrypted between the two endpoints.
-- **Multi-party as session fan-out.** Several agents — and a human
-  watching — can attach to one tool session as additional observers of the
-  same stream.
-
-## Layer vs. convention
-
-To keep the line clear:
-
-- **Layer (the invention):** capability addressing, identity-bound
-  non-transferable grants, the dial-a-capability-get-a-stdio-session
-  ALPN, end-to-end encryption and NAT traversal via iroh.
-- **Reference protocols (conventions on the layer):** the stdio-over-wires
-  frame vocabulary (`tool.exec` / `tool.stdout` / `tool.stderr` /
-  `tool.exit`, correlation ids), and MCP-over-wires (MCP's own JSON-RPC
-  carried byte-for-byte on a stdio session). Two endpoints may negotiate
-  something else; the layer does not care what flows on the session.
-
-The point of the split is that you build identity, capability
-authorization, encryption, and NAT traversal **once**, as a layer — and
-then "make any stdin/stdout a secure, networked, revocable endpoint" and
-"make a local MCP server remote" are both *reference protocols on that
-layer*, not new protocols.
+- **stdio framing is raw bytes:** `connect` sessions carry the child's stdio
+  as-is. The old session-layer framing of this project, including a frame
+  vocabulary that was never built, is archived in
+  [docs/archive/session-layer-thesis.md](docs/archive/session-layer-thesis.md).
