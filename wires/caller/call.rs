@@ -1,4 +1,9 @@
-//! `wires call`: run one remote CLI from `tools.json`, as if it were local.
+//! `wires call`: run one remote CLI by name, as if it were local.
+//!
+//! The name resolves through the channel's host announcements (the
+//! `directory.json` cache, refreshed from the channel when needed); an alias
+//! in `tools.json` wins over it. Locked mode ([`crate::caller::lock`]) refuses
+//! the override flags a sandboxed agent could steer this with.
 //!
 //! The CLI-native front door. An agent runs `wires call <tool> [-- args…]`
 //! from its shell: stdin, stdout and stderr pass straight through, the remote
@@ -233,7 +238,7 @@ fn outcome(result: Result<i32>, stdout: Vec<u8>, stderr: Vec<u8>) -> Result<Call
 /// operator's configuration.
 #[derive(Args, Clone, Debug, Default)]
 pub struct CredArgs {
-    /// Use this file instead of `$WIRES_HOME/tools.json`.
+    /// Read aliases from this file instead of `$WIRES_HOME/tools.json`.
     #[arg(long)]
     pub tools_file: Option<PathBuf>,
     /// Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`,
@@ -272,7 +277,8 @@ pub struct CallArgs {
     /// `Bash(wires call gh:*)`, still matches) or before it.
     #[command(flatten)]
     pub shape: ShapeArgs,
-    /// The tool's local name in `tools.json`.
+    /// The tool's name as your channel's hosts announce it (`wires tools`),
+    /// `<host8>/<name>` to pick one host, or an alias from `tools.json`.
     pub tool: String,
     /// Extra arguments appended to the remote command. Use `--` before any
     /// that start with `-`.

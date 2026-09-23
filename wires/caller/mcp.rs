@@ -1,8 +1,9 @@
-//! `wires mcp`: a stdio MCP server whose tools are the remote CLIs in
-//! `tools.json`.
+//! `wires mcp`: a stdio MCP server whose tools are the remote CLIs your
+//! channel's hosts let you run (their announcements, plus `tools.json`
+//! aliases), resolved once at startup.
 //!
 //! The on-ramp for workflows that only speak MCP (Claude Desktop, IDEs). Each
-//! `tools.json` entry becomes one MCP tool taking `{ args?: string[], stdin?:
+//! tool becomes one MCP tool taking `{ args?: string[], stdin?:
 //! string, jq?: string, head?: integer, max_bytes?: integer }`; the last three
 //! shape the remote stdout in-process ([`shape`](crate::caller::shape)), as
 //! `wires call --jq/--head/--max-bytes` do. Calling a tool dials the responder over wires (through a
@@ -480,7 +481,8 @@ pub struct McpArgs {
     pub creds: CredArgs,
 }
 
-/// `wires mcp`: load `tools.json` and credentials, then serve MCP on stdio.
+/// `wires mcp`: load the announced tools, `tools.json` aliases and
+/// credentials, then serve MCP on stdio.
 ///
 /// In locked mode ([`Lock`](crate::caller::lock::Lock)) an override flag is
 /// refused before anything loads. A tool's `stdin` field is still accepted:
