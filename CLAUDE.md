@@ -84,7 +84,9 @@ Uses `direnv` to put Bazel-managed tools on PATH. After cloning:
 **Rust** (Bazel-only loop — never `cargo build`/`cargo test`):
 1. Add the dep to the package's `Cargo.toml` (and root `[workspace.dependencies]` if shared).
 2. Refresh the lockfile with the **Bazel-vendored cargo** — the only cargo invocation:
-   `bazel run @rules_rust//tools/upstream_wrapper:cargo -- generate-lockfile`
+   `bazel run @rules_rust//tools/upstream_wrapper:cargo -- update --workspace`
+   (adds the new dep without bumping anything else; **don't** use
+   `generate-lockfile`, which re-resolves and bumps every crate)
    (or use the `cargo` that `bazel run //tools:bazel_env` puts on `$PATH`).
 3. Hand-edit that package's `BUILD` to add the matching `@crates//:<dep>` to `deps`
    (test-only deps go on the `rust_test` target).
