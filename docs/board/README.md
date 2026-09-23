@@ -24,6 +24,17 @@ Why each clause earns its place (the rebuttals it has to survive):
 honest line from someone who runs remote MCP servers behind Tailscale today.
 (See [storytelling.md](../storytelling.md) §1.)
 
+## Roles (2026-09-23)
+
+| Role | Decides | Commands |
+|---|---|---|
+| **admin** | who's in (root key) | `init`, `invite`, `remove` |
+| **host** | what runs and who may run it (`host.json`: tools + IdP policy) | `serve host.json` |
+| **caller** | — runs remote CLIs; MCP only for backward compatibility | `join`, `login`, `call`, `tools`, `mcp` |
+| **observer** | — | `watch` |
+
+The IdP is *bound* at the caller (`login`), *enforced* at the host (`host.json`), and *verified independently* by every reader of the channel. The channel carries host announcements, identity claims, and call records; the admin's invite is the only thing handed out of band.
+
 ## The demo we're building toward
 
 1. **workbench** (no inbound ports): `wires serve --expose db_query=… --audit-topic ops --require-idp …`
@@ -46,6 +57,11 @@ honest line from someone who runs remote MCP servers behind Tailscale today.
 | [08](doing/08-demo-two-machine.md) | E | 07 | Real run: laptop ↔ workbench over relay, Claude Code as the agent, recording |
 | [10](review/10-live-run-fixes.md) | G | 01–04 | Live-run fixes: stdin in call records, quiet stderr, short control-socket path |
 | [11](backlog/11-camera-blockers.md) | H | 04, 05, 07 | Camera blockers: 20 s audit stall after login, Safari callback error, `tools add --topic-ticket` |
+| [12](backlog/12-roles-and-tree.md) | R | 11 | Organize by role: 4-role CLI (`advanced` for plumbing), role folders, drop single-command serve/connect + old demos |
+| [13](backlog/13-host-json-policy.md) | P | 12 | `host.json`: tools + IdP roles + default deny; `Policy` seam for org rules later |
+| [14](backlog/14-invite-join.md) | O | 12 | `init` / `invite` / `join` / `remove`; re-key distributed over the channel |
+| [15](backlog/15-channel-directory.md) | D2 | 12, 13 | Hosts announce tools on the channel; callers resolve by name — one invite is the only out-of-band step |
+| [17](backlog/17-readme-why.md) | docs | 12–16 | README: four roles, where each guarantee lives, why it's built this way; `docs/demo.md` |
 | [16](backlog/16-token-benchmark.md) | bench | 01–03 | MCP (GitHub server, many tools; ± tool search) vs `gh` via `wires call` vs bare `gh`: 5 tasks × 5 runs |
 | [09](backlog/09-witness.md) | stretch | 02 | Key-less witness: stores and verifies call records without decrypting them |
 
