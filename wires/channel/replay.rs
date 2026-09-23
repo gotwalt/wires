@@ -30,7 +30,7 @@
 //!
 //! A request carries a [`ChainState`](library::ChainState) per publisher — a
 //! sequence number **and the hash at it**, not just a number. The server checks
-//! the presented hash against its own [`hash_at`](crate::store::TopicStore::hash_at),
+//! the presented hash against its own [`hash_at`](crate::channel::store::TopicStore::hash_at),
 //! and on a mismatch streams that publisher **from genesis** so the requester's
 //! [`classify_link`](library::classify_link) reports a `Fork` instead of quietly
 //! resuming from a divergent point. The PoC never checked, and divergence was
@@ -59,9 +59,9 @@ use library::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::admission::{AdmitHandler, Admitted};
-use crate::store::{Appended, TopicStore};
-use crate::transport::{Denied, to_node_id};
+use crate::channel::admission::{AdmitHandler, Admitted};
+use crate::channel::store::{Appended, TopicStore};
+use crate::host::transport::{Denied, to_node_id};
 
 /// How long a detected chain gap waits before triggering a catch-up pass.
 ///
@@ -84,7 +84,7 @@ pub const REPLAY_DEBOUNCE: Duration = Duration::from_secs(2);
 /// A cap rather than "everything" because the requester loops until a pass adds
 /// nothing — bounded passes keep one enormous history from monopolizing a
 /// stream, and make progress visible between them. Also **injectable**, through
-/// [`TopicNodeConfig::replay_limit`](crate::topics::TopicNodeConfig::replay_limit).
+/// [`TopicNodeConfig::replay_limit`](crate::channel::topics::TopicNodeConfig::replay_limit).
 pub const REPLAY_LIMIT: u32 = 512;
 
 /// How long one replay pass against one peer may take, dial included.
@@ -124,7 +124,7 @@ pub const MAX_CATCH_UP_ROUNDS: usize = 32;
 
 /// How many per-publisher marks one `Request` carries.
 ///
-/// [`hwm_all`](crate::store::TopicStore::hwm_all) grows with every distinct
+/// [`hwm_all`](crate::channel::store::TopicStore::hwm_all) grows with every distinct
 /// sender ever stored, and `sender` is a wire field: an admitted member can mint
 /// genesis envelopes under fresh keypairs, and at a few thousand of them the
 /// request frame no longer fits [`MAX_REPLAY_FRAME`](library::MAX_REPLAY_FRAME)
@@ -141,7 +141,7 @@ pub const MAX_HWM_ENTRIES: usize = 1024;
 
 /// The QUIC application error code a replay refusal closes with.
 ///
-/// Deliberately the same number [`crate::admission`] closes an ungated gossip
+/// Deliberately the same number [`crate::channel::admission`] closes an ungated gossip
 /// connection with: from the peer's side both are the one condition "you are not
 /// in this topic's roster", and a second code would only invite the two gates to
 /// drift apart.
@@ -153,14 +153,14 @@ const CLOSE_NOT_ADMITTED: u32 = 1;
 /// The frame is the entire point of refusing politely — a removed member must
 /// learn *why* it is out — and returning from `accept` drops the connection,
 /// which would discard whatever is still in flight. Mirrors the same wait in
-/// [`crate::admission`].
+/// [`crate::channel::admission`].
 const DENIAL_LINGER: Duration = Duration::from_secs(5);
 
 /// The replay server: the router's handler for
 /// [`TOPIC_REPLAY_ALPN`](library::TOPIC_REPLAY_ALPN).
 ///
 /// Registered on the *same* [`Router`](iroh::protocol::Router) as gossip and
-/// admission (see [`crate::topics`]), sharing the one [`Admitted`] registry the
+/// admission (see [`crate::channel::topics`]), sharing the one [`Admitted`] registry the
 /// admission handshake fills.
 #[derive(Debug)]
 pub struct ReplayHandler {
@@ -182,7 +182,7 @@ impl ProtocolHandler for ReplayHandler {
     ///
     /// The caller is `to_node_id(&connection.remote_id())` — the key iroh
     /// authenticated — never a wire field, exactly as in
-    /// [`crate::admission`].
+    /// [`crate::channel::admission`].
     ///
     /// The gate runs **first**, before a byte of the request is read: an
     /// unadmitted peer gets a `Denied` frame on the stream it opened and nothing
@@ -246,7 +246,7 @@ impl ReplayHandler {
     /// presented for it.
     ///
     /// The fork check lives here: when the presented hash disagrees with
-    /// [`hash_at`](crate::store::TopicStore::hash_at) — or the requester claims
+    /// [`hash_at`](crate::channel::store::TopicStore::hash_at) — or the requester claims
     /// a sequence this node has never seen — the answer is that publisher's
     /// chain **from genesis**, so the requester classifies the divergence
     /// instead of resuming past it.
@@ -291,7 +291,7 @@ impl ReplayHandler {
 /// bi-stream.
 ///
 /// The duplex-testable half, like
-/// [`serve_admission`](crate::admission::serve_admission): the whole protocol
+/// [`serve_admission`](crate::channel::admission::serve_admission): the whole protocol
 /// runs over any `AsyncRead`/`AsyncWrite` pair, so the fork-from-genesis rule
 /// and the admission refusal are asserted with no QUIC in the test.
 ///
@@ -323,7 +323,7 @@ where
 
     // Bounded like every other read on this surface: a peer that opens a stream
     // and then says nothing costs one deadline, not a task held forever.
-    let first = crate::admission::within(
+    let first = crate::channel::admission::within(
         REPLAY_PASS_TIMEOUT,
         &format!("the replay request from {}", caller.hex()),
         read_replay_frame(&mut recv),
@@ -552,7 +552,7 @@ async fn replay_from(
             let (send, recv) = conn.open_bi().await.context("opening a replay stream")?;
             Ok((conn, send, recv))
         };
-        let (conn, send, recv) = crate::admission::within(
+        let (conn, send, recv) = crate::channel::admission::within(
             REPLAY_CONNECT_TIMEOUT,
             &format!("dialing {} for replay", peer.hex()),
             dial,
@@ -562,7 +562,7 @@ async fn replay_from(
         conn.close(VarInt::from_u32(0), b"replay pass complete");
         pass
     };
-    crate::admission::within(
+    crate::channel::admission::within(
         REPLAY_PASS_TIMEOUT,
         &format!("the replay pass against {}", peer.hex()),
         pass,
@@ -578,7 +578,7 @@ async fn replay_from(
 /// backed deployment needs. Either way iroh authenticates the far side to
 /// `peer`'s key, so a wrong hint can only fail to connect.
 async fn peer_addr(endpoint: &Endpoint, peer: NodeId) -> Result<EndpointAddr> {
-    let id = crate::transport::endpoint_id(&peer)?;
+    let id = crate::host::transport::endpoint_id(&peer)?;
     Ok(match endpoint.remote_info(id).await {
         Some(info) => EndpointAddr::from_parts(id, info.into_addrs().map(|addr| addr.into_addr())),
         None => EndpointAddr::new(id),
@@ -587,7 +587,7 @@ async fn peer_addr(endpoint: &Endpoint, peer: NodeId) -> Result<EndpointAddr> {
 
 /// One replay pass against one peer, over an established bi-stream.
 ///
-/// Writes a `Request` carrying [`hwm_all`](crate::store::TopicStore::hwm_all),
+/// Writes a `Request` carrying [`hwm_all`](crate::channel::store::TopicStore::hwm_all),
 /// then ingests `Item`s until `End`, pushing each one it inserted onto `fresh`. Every item goes through [`ingest`] — the
 /// items are *not* trusted because they came from an admitted peer: a peer can
 /// be a member in good standing and still relay a forged or forked envelope.
@@ -773,11 +773,11 @@ pub enum Ingested {
 ///    the peer that relayed it is a separate question already answered by the
 ///    gate.
 /// 2. [`classify_link`](library::classify_link) against the stored
-///    [`chain_state`](crate::store::TopicStore::chain_state) and the hash held
+///    [`chain_state`](crate::channel::store::TopicStore::chain_state) and the hash held
 ///    at that sequence — `Ok` and `Duplicate` proceed, `Gap` returns without
 ///    storing, and `Fork` is an **error**: detected, refused, logged, never
 ///    resolved (spec §4.2, no fork choice).
-/// 3. [`append`](crate::store::TopicStore::append) — one write transaction over
+/// 3. [`append`](crate::channel::store::TopicStore::append) — one write transaction over
 ///    the log and the high-water mark.
 ///
 /// Wrong-topic envelopes are refused here rather than by the store, so the
@@ -840,10 +840,10 @@ pub(crate) fn ingest(
 
 /// Tell the requester *why* it was refused, then close our side.
 ///
-/// Best-effort, like [`crate::admission`]'s: a peer that already vanished never
+/// Best-effort, like [`crate::channel::admission`]'s: a peer that already vanished never
 /// reads it, and the caller still returns the original error.
 async fn deny<W: AsyncWrite + Unpin>(send: &mut W, reason: String) {
-    let reason = crate::transport::truncate_reason(reason);
+    let reason = crate::host::transport::truncate_reason(reason);
     let _ = write_replay_frame(send, &ReplayFrame::Denied { reason }).await;
     send.shutdown().await.ok();
 }
@@ -901,9 +901,9 @@ mod tests {
         TopicPeer, next_prev_hash,
     };
 
-    use crate::admission::{AdmittedPeer, MAX_INFLIGHT_ADMISSIONS, admit_peer};
-    use crate::keystore::Keystore;
-    use crate::transport::{HeadSource, endpoint_addr, secret_key};
+    use crate::admin::keystore::Keystore;
+    use crate::channel::admission::{AdmittedPeer, MAX_INFLIGHT_ADMISSIONS, admit_peer};
+    use crate::host::transport::{HeadSource, endpoint_addr, secret_key};
 
     /// Every awaited network step is bounded by this rather than by the test
     /// runner's patience: nothing in this suite sleeps waiting for a peer, and a

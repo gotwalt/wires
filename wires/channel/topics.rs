@@ -21,7 +21,7 @@
 //! |------|---------|----------------|
 //! | [`GOSSIP_ALPN`](iroh_gossip::net::GOSSIP_ALPN) | [`GatedGossip`] | the mesh, behind the roster gate |
 //! | [`TOPIC_ADMIT_ALPN`](library::TOPIC_ADMIT_ALPN) | [`AdmitHandler`] | the handshake that fills the gate |
-//! | [`TOPIC_REPLAY_ALPN`](library::TOPIC_REPLAY_ALPN) | [`ReplayHandler`](crate::replay::ReplayHandler) | peer-symmetric catch-up |
+//! | [`TOPIC_REPLAY_ALPN`](library::TOPIC_REPLAY_ALPN) | [`ReplayHandler`](crate::channel::replay::ReplayHandler) | peer-symmetric catch-up |
 //!
 //! Gossip is registered **wrapped**, never bare: a raw `Gossip` on the router is
 //! an open mesh that anyone who guesses the topic id can join, which is the
@@ -45,7 +45,7 @@
 //! subscription; the PoC trap was to treat that as a stream end and exit the
 //! loop with no output at all, leaving a tail that looked alive and printed
 //! nothing forever. Here the bridge forwards `Lagged` first, so the tail loop
-//! can schedule a [`catch_up`](crate::replay::catch_up) and re-subscribe, and
+//! can schedule a [`catch_up`](crate::channel::replay::catch_up) and re-subscribe, and
 //! logs at `warn` on the way out. Nothing about falling behind is silent.
 
 use std::pin::Pin;
@@ -65,14 +65,14 @@ use library::{
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::admission::{
+use crate::admin::keystore::Keystore;
+use crate::channel::admission::{
     ADMIT_RECHECK, AdmitHandler, Admitted, GatedGossip, MAX_INFLIGHT_ADMISSIONS, admit_peer,
     spawn_watchdog,
 };
-use crate::keystore::Keystore;
-use crate::replay::{REPLAY_LIMIT, ReplayHandler};
-use crate::store::TopicStore;
-use crate::transport::{Denied, HeadSource, endpoint_id, secret_key, to_node_id};
+use crate::channel::replay::{REPLAY_LIMIT, ReplayHandler};
+use crate::channel::store::TopicStore;
+use crate::host::transport::{Denied, HeadSource, endpoint_id, secret_key, to_node_id};
 
 /// How many [`TopicEvent`]s the bridge will buffer for the tail loop (spec
 /// §7.4).
@@ -206,7 +206,7 @@ pub enum TopicEvent {
     /// The subscription fell behind and messages were dropped by iroh-gossip.
     ///
     /// Terminal for the underlying subscription — iroh-gossip closes it — so
-    /// the tail loop's response is a [`catch_up`](crate::replay::catch_up) and
+    /// the tail loop's response is a [`catch_up`](crate::channel::replay::catch_up) and
     /// a fresh [`TopicNode::join`], never a quiet exit. See the module docs.
     Lagged,
 }
@@ -250,7 +250,7 @@ impl TopicSender {
     /// member in good standing.
     ///
     /// Broadcasting is not storing. The caller appends to the log first, and
-    /// only an [`Appended::Inserted`](crate::store::Appended) goes on the wire.
+    /// only an [`Appended::Inserted`](crate::channel::store::Appended) goes on the wire.
     pub async fn broadcast(&self, envelope: &TopicEnvelope) -> Result<()> {
         if envelope.topic != self.topic {
             bail!(
@@ -322,7 +322,7 @@ pub struct TopicNode {
     admitted: Admitted,
     /// The admission handler — the router's [`TOPIC_ADMIT_ALPN`](library::TOPIC_ADMIT_ALPN)
     /// protocol *and* the client-side context every outbound
-    /// [`admit_peer`](crate::admission::admit_peer) needs.
+    /// [`admit_peer`](crate::channel::admission::admit_peer) needs.
     admit: Arc<AdmitHandler>,
     /// The topic log, shared with the replay handler and the tail loop.
     store: Arc<TopicStore>,
@@ -360,7 +360,7 @@ impl TopicNode {
     /// three ALPNs.
     ///
     /// Does **not** join the topic or dial anyone — [`join`](Self::join) and
-    /// [`admit_peer`](crate::admission::admit_peer) are separate steps, so a
+    /// [`admit_peer`](crate::channel::admission::admit_peer) are separate steps, so a
     /// caller can admit its bootstrap peers (and learn it has been revoked,
     /// exit 77) before it ever subscribes.
     ///
@@ -392,7 +392,7 @@ impl TopicNode {
     /// [`spawn`](Self::spawn), which is this plus the bind).
     ///
     /// The split exists for the same reason
-    /// [`serve_on`](crate::transport::serve_on) does: the hermetic loopback
+    /// [`serve_on`](crate::host::transport::serve_on) does: the hermetic loopback
     /// tests bind with [`presets::Minimal`](iroh::endpoint::presets::Minimal) —
     /// no DNS, no pkarr, no relay, nothing that leaves the machine — and hand
     /// the endpoint in.
@@ -481,7 +481,7 @@ impl TopicNode {
 
     /// This node's own id (the endpoint's authenticated key).
     pub fn node_id(&self) -> NodeId {
-        crate::transport::to_node_id(&self.endpoint.id())
+        crate::host::transport::to_node_id(&self.endpoint.id())
     }
 
     /// The bound endpoint, for dialing admission and replay.
@@ -490,7 +490,7 @@ impl TopicNode {
     }
 
     /// The admission handler, which doubles as the client-side context for
-    /// [`admit_peer`](crate::admission::admit_peer).
+    /// [`admit_peer`](crate::channel::admission::admit_peer).
     pub fn admit(&self) -> &Arc<AdmitHandler> {
         &self.admit
     }
@@ -603,7 +603,7 @@ impl TopicNode {
                 );
                 break;
             }
-            let addr = match crate::transport::endpoint_addr(
+            let addr = match crate::host::transport::endpoint_addr(
                 &peer.node,
                 &peer.addrs,
                 peer.relay_url.as_deref(),
@@ -1086,7 +1086,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let target = crate::transport::endpoint_addr(
+        let target = crate::host::transport::endpoint_addr(
             &node_b.node_id(),
             &localhost_socks(node_b.endpoint()),
             None,
@@ -1261,7 +1261,7 @@ mod tests {
             .bind()
             .await
             .unwrap();
-        let target = crate::transport::endpoint_addr(
+        let target = crate::host::transport::endpoint_addr(
             &node_b.node_id(),
             &localhost_socks(node_b.endpoint()),
             None,
@@ -1276,7 +1276,7 @@ mod tests {
         .expect("the admit ALPN is registered");
 
         let registry = Admitted::new();
-        let entry = |expires| crate::admission::AdmittedPeer {
+        let entry = |expires| crate::channel::admission::AdmittedPeer {
             proof: fabric.proofs[&a.node_id()].clone(),
             version: fabric.head.version,
             expires,

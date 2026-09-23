@@ -19,7 +19,7 @@ _DEPS = [
 # The shared library crate: //library (crate name `library`).
 rust_library(
     name = "library",
-    srcs = glob(["*.rs"]),
+    srcs = glob(["**/*.rs"]),
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = _DEPS,

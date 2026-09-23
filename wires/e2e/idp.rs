@@ -3,7 +3,7 @@
 //! responder gates calls on those identities (`serve --require-idp`), across
 //! two IdPs, and its call records name the person.**
 //!
-//! A child of [`crate::e2e`] (declared there with `#[path]`) so it reuses the
+//! A child of [`crate::e2e`] so it reuses the
 //! fabric/member fixtures without widening their visibility. The IdP is the
 //! hermetic [`MockIdp`]; the two nodes run real endpoints, real admission and
 //! a real gossip mesh over loopback. The observer shares nothing with the
@@ -14,10 +14,10 @@ use super::*;
 
 use library::{Audience, ChannelRecord, IdentityClaim};
 
-use crate::idp_view::{IdpTrust, render_identity};
-use crate::jwks::KeyFetcher;
-use crate::login::run_flow;
-use crate::mock_idp::MockIdp;
+use crate::caller::jwks::KeyFetcher;
+use crate::caller::login::run_flow;
+use crate::caller::mock_idp::MockIdp;
+use crate::channel::idp_view::{IdpTrust, render_identity};
 
 #[tokio::test]
 async fn a_published_login_claim_is_verified_by_an_independent_observer() {
@@ -141,7 +141,7 @@ async fn call_as(
     let mut err = Vec::new();
     let result = timeout(
         PATIENCE,
-        crate::transport::call_on(
+        crate::host::transport::call_on(
             endpoint,
             target.clone(),
             library::Membership::mint(&fab.root, m.id(), 0, i64::MAX).unwrap(),
@@ -205,7 +205,7 @@ async fn expect_ran_as(
         principal.as_ref().and_then(|p| p.email.as_deref()),
         Some(email)
     );
-    let line = crate::render::audit_line(&started);
+    let line = crate::channel::render::audit_line(&started);
     assert!(line.contains(email), "the observer sees the name: {line}");
     let finished = next_record(rx, keyring).await;
     assert!(
@@ -226,10 +226,10 @@ async fn expect_ran_as(
 /// channel with the reason the caller got.
 #[tokio::test]
 async fn require_idp_admits_verified_federated_identities_only() {
-    use crate::identity::{Identities, IdentityGate};
-    use crate::idp_policy::IdpPolicy;
-    use crate::mock_idp::MOCK_CLIENT_ID;
-    use crate::transport::{AuditSink, CrlSource, ServeConfig, SessionProtocol};
+    use crate::caller::mock_idp::MOCK_CLIENT_ID;
+    use crate::host::identity::{Identities, IdentityGate};
+    use crate::host::idp_policy::IdpPolicy;
+    use crate::host::transport::{AuditSink, CrlSource, ServeConfig, SessionProtocol};
 
     let corp = MockIdp::start("alice@example.com").await;
     let partner = MockIdp::start("bob@partner.org").await;
@@ -266,7 +266,7 @@ async fn require_idp_admits_verified_federated_identities_only() {
         format!("iss={},email=*@partner.org", partner.issuer.as_str()),
     ])
     .unwrap();
-    let (sink, records) = AuditSink::channel(crate::audit::AUDIT_QUEUE);
+    let (sink, records) = AuditSink::channel(crate::host::audit::AUDIT_QUEUE);
     let r_membership = library::Membership::mint(&fab.root, r.id(), 0, i64::MAX).unwrap();
     let serve = ServeConfig {
         trust_root: fab.id(),
@@ -303,7 +303,7 @@ async fn require_idp_admits_verified_federated_identities_only() {
     );
     cfg.admit_recheck = SLOW_RECHECK;
     cfg.protocols.push((
-        crate::transport::ALPN,
+        crate::host::transport::ALPN,
         SessionProtocol(Arc::new(serve)).into(),
     ));
     let lookup = MemoryLookup::new();
@@ -339,8 +339,8 @@ async fn require_idp_admits_verified_federated_identities_only() {
         ticket_peers: Vec::new(),
         relay_url: None,
     };
-    let (tx, mut requests) = mpsc::channel::<crate::ipc::PublishRequest>(32);
-    let forwarder = tokio::spawn(crate::audit::forward(records, tx));
+    let (tx, mut requests) = mpsc::channel::<crate::channel::ipc::PublishRequest>(32);
+    let forwarder = tokio::spawn(crate::host::audit::forward(records, tx));
     let publisher = tokio::spawn({
         let store = Arc::clone(&store_r);
         async move {
@@ -369,7 +369,7 @@ async fn require_idp_admits_verified_federated_identities_only() {
     });
 
     let target =
-        crate::transport::endpoint_addr(&r.id(), &localhost_socks(node_r.endpoint()), None)
+        crate::host::transport::endpoint_addr(&r.id(), &localhost_socks(node_r.endpoint()), None)
             .unwrap();
     let mut keyring_o = o.keyring();
 

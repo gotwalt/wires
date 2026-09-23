@@ -68,18 +68,17 @@ use library::{
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use crate::admission::admit_peer;
-use crate::ipc::ScratchDir;
-use crate::keystore::Keystore;
-use crate::replay::{self, Ingested};
-use crate::store::{Appended, TopicStore};
-use crate::topics::{TopicEvent, TopicNode, TopicNodeConfig, TopicSender};
-use crate::transport::{Denied, HeadSource, secret_key};
+use crate::admin::keystore::Keystore;
+use crate::channel::admission::admit_peer;
+use crate::channel::ipc::ScratchDir;
+use crate::channel::replay::{self, Ingested};
+use crate::channel::store::{Appended, TopicStore};
+use crate::channel::topics::{TopicEvent, TopicNode, TopicNodeConfig, TopicSender};
+use crate::host::transport::{Denied, HeadSource, secret_key};
 use crate::{Keyring, Printer};
 
 /// Card 04's login → publish → independent-verification test: a child module
 /// so it shares these fixtures without widening their visibility.
-#[path = "e2e_idp.rs"]
 mod idp;
 
 /// The outer bound on any single wait here.
@@ -94,7 +93,7 @@ const PATIENCE: Duration = Duration::from_secs(30);
 const BEAT: Duration = Duration::from_millis(10);
 
 /// The watchdog interval for a node whose gate is supposed to move during the
-/// test. Milliseconds, because [`ADMIT_RECHECK`](crate::admission::ADMIT_RECHECK)
+/// test. Milliseconds, because [`ADMIT_RECHECK`](crate::channel::admission::ADMIT_RECHECK)
 /// is injectable precisely so no test waits 30 seconds for a revocation.
 const FAST_RECHECK: Duration = Duration::from_millis(20);
 
@@ -108,7 +107,7 @@ const FAST_RECHECK: Duration = Duration::from_millis(20);
 const SLOW_RECHECK: Duration = Duration::from_secs(3600);
 
 /// The catch-up debounce the gap-heal pump runs at, standing in for
-/// [`REPLAY_DEBOUNCE`](crate::replay::REPLAY_DEBOUNCE)'s two seconds.
+/// [`REPLAY_DEBOUNCE`](crate::channel::replay::REPLAY_DEBOUNCE)'s two seconds.
 ///
 /// The tail's window is a constant rather than a config knob (a debounce only a
 /// test reads is a knob that lies), so the test mirrors the *shape* — one
@@ -510,7 +509,7 @@ fn seqs(store: &TopicStore, sender: NodeId) -> Vec<u64> {
 /// What a tail prints after a catch-up, as lines rather than stdout, over the
 /// same two halves of [`Printer::emit`](crate::Printer): a high-water-mark diff
 /// decides *what* is new (with nothing else writing to the log during the
-/// test, it is exactly the set [`catch_up_collect`](crate::replay::catch_up_collect)
+/// test, it is exactly the set [`catch_up_collect`](crate::channel::replay::catch_up_collect)
 /// hands the tail), [`Keyring::open`](crate::Keyring::open) decides whether it can be shown,
 /// and [`Printer::render`](crate::Printer::render) is the production formatter.
 /// A message with no key is silently absent here for the same reason it is
@@ -1159,9 +1158,9 @@ async fn tail_catches_up_after_offline() {
 /// ([`run_tail`](crate::run_tail)) with nothing else in it, and it is the same
 /// shape: ingest, and on a [`Ingested::Gap`] arm a single pending catch-up
 /// deadline that later gaps fold into (`catchup_at.get_or_insert`). The pass it
-/// eventually runs is the real [`catch_up`](crate::replay::catch_up); only the
+/// eventually runs is the real [`catch_up`](crate::channel::replay::catch_up); only the
 /// window is different — [`GAP_DEBOUNCE`] here, and
-/// [`REPLAY_DEBOUNCE`](crate::replay::REPLAY_DEBOUNCE)'s two seconds in the
+/// [`REPLAY_DEBOUNCE`](crate::channel::replay::REPLAY_DEBOUNCE)'s two seconds in the
 /// tail.
 #[tokio::test]
 async fn live_gap_triggers_replay_and_heals() {
@@ -1326,13 +1325,13 @@ fn cat_invocation() -> library::Invocation {
 /// count, digest and quoted head). The roster then drops C;
 /// C's next call is refused, and O sees `Denied` with the very reason C got.
 ///
-/// R's publishing runs the production path: [`audit::forward`](crate::audit::forward)
+/// R's publishing runs the production path: [`audit::forward`](crate::host::audit::forward)
 /// feeding [`publish_from_tail`](crate::publish_from_tail) — the tail loop's
 /// control-socket arm, the single allocator — with the loop around it reduced
 /// to that one arm.
 #[tokio::test]
 async fn every_call_and_refusal_lands_on_the_audit_topic() {
-    use crate::transport::{AuditSink, CrlSource, ServeConfig, SessionProtocol};
+    use crate::host::transport::{AuditSink, CrlSource, ServeConfig, SessionProtocol};
 
     let r_seed = [21u8; 32];
     let r = Member::new("ar", r_seed);
@@ -1345,7 +1344,7 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
     }
 
     // R: the responder, configured as `serve_cmd` builds it with an audit sink.
-    let (sink, records) = AuditSink::channel(crate::audit::AUDIT_QUEUE);
+    let (sink, records) = AuditSink::channel(crate::host::audit::AUDIT_QUEUE);
     let r_membership = library::Membership::mint(&fab.root, r.id(), 0, i64::MAX).unwrap();
     let serve = ServeConfig {
         trust_root: fab.id(),
@@ -1375,7 +1374,7 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
     );
     cfg.admit_recheck = SLOW_RECHECK;
     cfg.protocols.push((
-        crate::transport::ALPN,
+        crate::host::transport::ALPN,
         SessionProtocol(Arc::new(serve)).into(),
     ));
     let lookup = MemoryLookup::new();
@@ -1412,8 +1411,8 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
         ticket_peers: Vec::new(),
         relay_url: None,
     };
-    let (tx, mut requests) = mpsc::channel::<crate::ipc::PublishRequest>(32);
-    let forwarder = tokio::spawn(crate::audit::forward(records, tx));
+    let (tx, mut requests) = mpsc::channel::<crate::channel::ipc::PublishRequest>(32);
+    let forwarder = tokio::spawn(crate::host::audit::forward(records, tx));
     let publisher = tokio::spawn({
         let store = Arc::clone(&store_r);
         async move {
@@ -1429,7 +1428,7 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
 
     // C: the caller, dialing R's session ALPN by key over loopback.
     let target =
-        crate::transport::endpoint_addr(&r.id(), &localhost_socks(node_r.endpoint()), None)
+        crate::host::transport::endpoint_addr(&r.id(), &localhost_socks(node_r.endpoint()), None)
             .unwrap();
     let c_membership = library::Membership::mint(&fab.root, c.id(), 0, i64::MAX).unwrap();
     let dial = |proof: InclusionProof| {
@@ -1446,7 +1445,7 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
             let mut err = Vec::new();
             let result = timeout(
                 PATIENCE,
-                crate::transport::call_on(
+                crate::host::transport::call_on(
                     endpoint,
                     target,
                     membership,
@@ -1558,12 +1557,12 @@ async fn every_call_and_refusal_lands_on_the_audit_topic() {
 
 /// How long an observer may wait for a call's `Started` record (card 11).
 ///
-/// Far under [`REPLAY_PASS_TIMEOUT`](crate::replay::REPLAY_PASS_TIMEOUT): a
+/// Far under [`REPLAY_PASS_TIMEOUT`](crate::channel::replay::REPLAY_PASS_TIMEOUT): a
 /// record that waits behind a replay pass misses this by a wide margin.
 const RECORD_PROMPTNESS: Duration = Duration::from_secs(2);
 
 /// What [`hosted_responder`] hands back once its node is bound.
-type ResponderReady = (TopicPeer, Arc<crate::admission::AdmitHandler>);
+type ResponderReady = (TopicPeer, Arc<crate::channel::admission::AdmitHandler>);
 
 /// A `serve --audit-topic ops` responder serving `cat`, running the
 /// **production** tail loop ([`run_tail_on`](crate::run_tail_on)) over a
@@ -1581,9 +1580,9 @@ fn hosted_responder(
     impl std::future::Future<Output = anyhow::Result<()>>,
     tokio::sync::oneshot::Receiver<ResponderReady>,
 ) {
-    use crate::transport::{AuditSink, CrlSource, ServeConfig, SessionProtocol};
+    use crate::host::transport::{AuditSink, CrlSource, ServeConfig, SessionProtocol};
 
-    let (sink, records) = AuditSink::channel(crate::audit::AUDIT_QUEUE);
+    let (sink, records) = AuditSink::channel(crate::host::audit::AUDIT_QUEUE);
     let membership = library::Membership::mint(&fab.root, r.id(), 0, i64::MAX).unwrap();
     let serve = ServeConfig {
         trust_root: fab.id(),
@@ -1599,12 +1598,12 @@ fn hosted_responder(
         audit: Some(sink),
         identity: None,
     };
-    let hosted = crate::audit::Hosted {
+    let hosted = crate::host::audit::Hosted {
         session: SessionProtocol(Arc::new(serve)),
         records,
-        identities: Arc::new(crate::identity::Identities::new(
-            crate::jwks::KeyFetcher::new(None).unwrap(),
-            crate::idp_view::IdpTrust::from_vars(None, None),
+        identities: Arc::new(crate::host::identity::Identities::new(
+            crate::caller::jwks::KeyFetcher::new(None).unwrap(),
+            crate::channel::idp_view::IdpTrust::from_vars(None, None),
         )),
     };
     let ctx = crate::TopicContext {
@@ -1652,7 +1651,7 @@ async fn call_cat(
     let identity = NodeIdentity::from_seed(seed);
     let membership = library::Membership::mint(&fab.root, identity.node_id(), 0, i64::MAX).unwrap();
     let proof = fab.at(version).proofs[&identity.node_id()].clone();
-    let target = crate::transport::endpoint_addr(&target.node, &target.addrs, None).unwrap();
+    let target = crate::host::transport::endpoint_addr(&target.node, &target.addrs, None).unwrap();
     let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(secret_key(&identity))
         .bind()
@@ -1662,7 +1661,7 @@ async fn call_cat(
     let mut err = Vec::new();
     let result = timeout(
         PATIENCE,
-        crate::transport::call_on(
+        crate::host::transport::call_on(
             endpoint,
             target,
             membership,
@@ -1760,7 +1759,7 @@ async fn a_stalled_replay_pass_does_not_hold_back_call_records() {
                 },
             )
             .spawn();
-        let s_admit = crate::admission::AdmitHandler {
+        let s_admit = crate::channel::admission::AdmitHandler {
             topic: fab.topic,
             fabric_root: fab.id(),
             head: Arc::new(HeadSource::Keystore {
@@ -1769,7 +1768,7 @@ async fn a_stalled_replay_pass_does_not_hold_back_call_records() {
             }),
             proof: fab.at(v1).proofs[&s.id()].clone(),
             keystore: Arc::clone(&s.keystore),
-            admitted: crate::admission::Admitted::new(),
+            admitted: crate::channel::admission::Admitted::new(),
             head_lock: Arc::new(std::sync::Mutex::new(())),
             inflight: Arc::new(tokio::sync::Semaphore::new(4)),
         };
@@ -1814,7 +1813,7 @@ async fn a_stalled_replay_pass_does_not_hold_back_call_records() {
 /// so the assertion is on the dial set, [`replay_targets`], not on the
 /// registry.
 ///
-/// [`replay_targets`]: crate::admission::Admitted::replay_targets
+/// [`replay_targets`]: crate::channel::admission::Admitted::replay_targets
 #[tokio::test]
 async fn a_departed_one_shot_publisher_does_not_delay_the_next_call() {
     let r_seed = [41u8; 32];
@@ -1873,7 +1872,8 @@ async fn a_departed_one_shot_publisher_does_not_delay_the_next_call() {
 
         // Past R's catch-up debounce, so the pass P's arrival scheduled has run
         // (or is running) when the call lands.
-        tokio::time::sleep(crate::replay::REPLAY_DEBOUNCE + Duration::from_millis(500)).await;
+        tokio::time::sleep(crate::channel::replay::REPLAY_DEBOUNCE + Duration::from_millis(500))
+            .await;
         let (code, out) = call_cat(&fab, c_seed, &r_hint, v1).await;
         assert_eq!(code.unwrap(), 0);
         assert_eq!(out, b"card 11");

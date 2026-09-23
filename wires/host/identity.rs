@@ -5,7 +5,7 @@
 //! Principal`. It is fed every [`IdentityClaim`] the resident tail loop
 //! decrypts — live, replayed, or (for a responder) already in the log at
 //! startup — and verifies each one itself with card 04's
-//! [`KeyFetcher`](crate::jwks::KeyFetcher). A claim that fails verification is
+//! [`KeyFetcher`](crate::caller::jwks::KeyFetcher). A claim that fails verification is
 //! logged and never displaces a principal that verified.
 //!
 //! A claim only counts when the envelope carrying it was **signed by the node
@@ -24,10 +24,10 @@ use std::sync::Mutex;
 
 use library::{CLOCK_SKEW_SECS, ChannelRecord, IdentityClaim, NodeId, Principal};
 
-use crate::idp_policy::IdpPolicy;
-use crate::idp_view::{IdpTrust, principal_name};
-use crate::jwks::{KeyFetcher, VerifyError};
-use crate::store::TopicStore;
+use crate::caller::jwks::{KeyFetcher, VerifyError};
+use crate::channel::idp_view::{IdpTrust, principal_name};
+use crate::channel::store::TopicStore;
+use crate::host::idp_policy::IdpPolicy;
 
 /// What verifying one claim concluded.
 pub(crate) type Verdict = Result<Principal, VerifyError>;
@@ -177,7 +177,7 @@ impl Identities {
 }
 
 /// The responder's identity check: the index plus the `--require-idp`
-/// policy. Lives in [`ServeConfig::identity`](crate::transport::ServeConfig::identity).
+/// policy. Lives in [`ServeConfig::identity`](crate::host::transport::ServeConfig::identity).
 pub(crate) struct IdentityGate {
     /// Who is who on the audit topic.
     identities: std::sync::Arc<Identities>,

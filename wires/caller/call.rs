@@ -22,9 +22,9 @@ use library::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::keystore;
-use crate::tools::{RemoteTool, ToolTarget, ToolsConfig, tool_from_scope};
-use crate::transport;
+use crate::admin::keystore;
+use crate::caller::tools::{RemoteTool, ToolTarget, ToolsConfig, tool_from_scope};
+use crate::host::transport;
 
 /// What one remote call came to, fully buffered.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -284,7 +284,9 @@ pub fn lookup<'a>(config: &'a ToolsConfig, name: &str) -> Result<&'a RemoteTool>
 
 /// `wires call`: stream local stdio to the remote tool; returns its exit code.
 pub async fn call_cmd(a: CallArgs) -> Result<i32> {
-    let config = ToolsConfig::load(&crate::tools::resolve_path(a.creds.tools_file.as_deref())?)?;
+    let config = ToolsConfig::load(&crate::caller::tools::resolve_path(
+        a.creds.tools_file.as_deref(),
+    )?)?;
     let tool = lookup(&config, &a.tool)?;
     let argv = Argv::new(a.args).context("arguments")?;
     let plan = Dial::resolve(tool, argv)?;
@@ -302,7 +304,7 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::tests::ticket;
+    use crate::caller::tools::tests::ticket;
     use clap::Parser;
     use library::Scope;
 

@@ -198,7 +198,7 @@ impl ToolsConfig {
 pub fn resolve_path(explicit: Option<&Path>) -> Result<PathBuf> {
     match explicit {
         Some(p) => Ok(p.to_path_buf()),
-        None => Ok(ToolsConfig::path(&crate::keystore::home()?)),
+        None => Ok(ToolsConfig::path(&crate::admin::keystore::home()?)),
     }
 }
 

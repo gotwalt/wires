@@ -4,7 +4,7 @@
 //! # Shape
 //!
 //! A responder with an audit topic is **one process, one endpoint, one
-//! allocator**. It stands up the [`TopicNode`](crate::topics::TopicNode) for
+//! allocator**. It stands up the [`TopicNode`](crate::channel::topics::TopicNode) for
 //! the topic itself and registers the session ALPN ([`transport::ALPN`]) on
 //! that node's router (see [`TopicNodeConfig::protocols`]), rather than binding
 //! a second endpoint for the same node key. It then runs the ordinary resident
@@ -41,8 +41,8 @@
 //! --peer <responder's topic ticket>`. It holds no grant for any exposed tool
 //! and no credential of the caller, and it sees every call live.
 //!
-//! [`TopicNodeConfig::protocols`]: crate::topics::TopicNodeConfig::protocols
-//! [`ServeConfig`]: crate::transport::ServeConfig
+//! [`TopicNodeConfig::protocols`]: crate::channel::topics::TopicNodeConfig::protocols
+//! [`ServeConfig`]: crate::host::transport::ServeConfig
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -56,8 +56,8 @@ use library::{
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::ipc::PublishRequest;
-use crate::transport::{self, AuditSink};
+use crate::channel::ipc::PublishRequest;
+use crate::host::transport::{self, AuditSink};
 
 /// How many records may queue between the sessions and the tail loop before
 /// the sink starts dropping (and logging) them.
@@ -115,7 +115,7 @@ impl CallAudit {
     /// when the responder has no audit sink.
     ///
     /// `principal` is the caller's fresh verified IdP identity, when the
-    /// responder's identity index holds one (see [`crate::identity`]) — so
+    /// responder's identity index holds one (see [`crate::host::identity`]) — so
     /// the record names the person, not only the key.
     ///
     /// `args` are the call's arguments as the record should show them; an
@@ -281,11 +281,11 @@ pub async fn forward(mut records: mpsc::Receiver<AuditRecord>, tx: mpsc::Sender<
 pub struct Hosted {
     /// The session ALPN handler, registered on the topic node's router.
     pub session: transport::SessionProtocol,
-    /// The receiving end of the [`ServeConfig::audit`](crate::transport::ServeConfig::audit) sink.
+    /// The receiving end of the [`ServeConfig::audit`](crate::host::transport::ServeConfig::audit) sink.
     pub records: mpsc::Receiver<AuditRecord>,
     /// The identity index the session protocol's gate reads; the tail loop
     /// feeds it every identity claim on the topic.
-    pub identities: Arc<crate::identity::Identities>,
+    pub identities: Arc<crate::host::identity::Identities>,
 }
 
 #[cfg(test)]

@@ -53,7 +53,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::transport::truncate_reason;
+use crate::host::transport::truncate_reason;
 
 /// The directory under the wires home that holds control sockets.
 pub const RUN_DIR: &str = "run";

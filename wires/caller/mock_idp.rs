@@ -1,6 +1,6 @@
 //! A hermetic OIDC issuer for the test suite (card 04).
 //!
-//! Serves, over plain HTTP on `127.0.0.1` (the one place [`crate::jwks`]
+//! Serves, over plain HTTP on `127.0.0.1` (the one place [`crate::caller::jwks`]
 //! allows `http`):
 //!
 //! - `GET /.well-known/openid-configuration` — discovery;
@@ -27,7 +27,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use url::Url;
 
-use crate::login::{OidcClient, Pkce, read_request, write_response};
+use crate::caller::login::{OidcClient, Pkce, read_request, write_response};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -198,7 +198,11 @@ impl MockIdp {
         |url: &Url| {
             let url = url.clone();
             tokio::spawn(async move {
-                let _ = crate::jwks::http_client().unwrap().get(url).send().await;
+                let _ = crate::caller::jwks::http_client()
+                    .unwrap()
+                    .get(url)
+                    .send()
+                    .await;
             });
         }
     }

@@ -26,13 +26,13 @@
 //! forged second line) or an escape sequence into an observer's screen.
 //!
 //! An identity claim is shown with the verdict *this reader* reached on it
-//! (see [`crate::identity`]): the verified principal, `(expired)`, or the
+//! (see [`crate::host::identity`]): the verified principal, `(expired)`, or the
 //! precise reason it did not verify.
 
 use library::{AuditRecord, ChannelRecord, IdentityClaim, NodeId, Principal};
 
-use crate::identity::Verdict;
-use crate::idp_view::describe_identity;
+use crate::channel::idp_view::describe_identity;
+use crate::host::identity::Verdict;
 
 /// How many hex characters of a node id or digest a record line shows.
 const SHORT_HEX: usize = 4;
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn identity_line_shows_the_verdict() {
-        use crate::jwks::VerifyError;
+        use crate::caller::jwks::VerifyError;
         let claim = IdentityClaim {
             node: node(3),
             id_token: IdToken::new("a.b.c"),

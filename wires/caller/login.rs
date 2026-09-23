@@ -42,9 +42,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 
-use crate::idp_view::DEFAULT_ISSUER;
-use crate::jwks::{Discovery, KeyFetcher};
-use crate::{TopicArgs, TopicContext, ipc, keystore};
+use crate::admin::keystore;
+use crate::caller::jwks::{Discovery, KeyFetcher};
+use crate::channel::idp_view::DEFAULT_ISSUER;
+use crate::channel::ipc;
+use crate::{TopicArgs, TopicContext};
 
 /// The raw ID token, in the keystore (mode `0600`).
 pub(crate) const ID_TOKEN_FILE: &str = "idp-token.jwt";
@@ -797,7 +799,7 @@ async fn publish_claim(ctx: &TopicContext, claim: &IdentityClaim) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock_idp::MockIdp;
+    use crate::caller::mock_idp::MockIdp;
     use library::{IdTokenError, NodeIdentity};
     use proptest::prelude::*;
 
@@ -875,7 +877,7 @@ mod tests {
 
     #[test]
     fn secrets_are_written_0600() {
-        let dir = crate::ipc::ScratchDir::new("sec");
+        let dir = crate::channel::ipc::ScratchDir::new("sec");
         let path = dir.path().join(ID_TOKEN_FILE);
         save_secret(&path, "a").unwrap();
         save_secret(&path, "b").unwrap();
@@ -1045,7 +1047,11 @@ mod tests {
                     .into_owned();
                 tokio::spawn(async move {
                     let forged = format!("{redirect}?code=stolen&state=wrong");
-                    let _ = crate::jwks::http_client().unwrap().get(forged).send().await;
+                    let _ = crate::caller::jwks::http_client()
+                        .unwrap()
+                        .get(forged)
+                        .send()
+                        .await;
                 });
             },
             PATIENCE,
@@ -1073,7 +1079,11 @@ mod tests {
                     .into_owned();
                 tokio::spawn(async move {
                     let denied = format!("{redirect}?error=access_denied");
-                    let _ = crate::jwks::http_client().unwrap().get(denied).send().await;
+                    let _ = crate::caller::jwks::http_client()
+                        .unwrap()
+                        .get(denied)
+                        .send()
+                        .await;
                 });
             },
             PATIENCE,
@@ -1089,7 +1099,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_kid_refetches_and_the_disk_cache_serves_restarts() {
         let idp = MockIdp::start("alice@example.com").await;
-        let dir = crate::ipc::ScratchDir::new("jwk");
+        let dir = crate::channel::ipc::ScratchDir::new("jwk");
         let cache = Some(dir.path().to_path_buf());
         let now = crate::now_unix();
         let aud = [Audience::new(idp.client_id.clone())];
@@ -1126,7 +1136,7 @@ mod tests {
         let err = restarted.verify(&bogus, &iss, &aud, now).await.unwrap_err();
         assert!(matches!(
             err,
-            crate::jwks::VerifyError::Rejected(IdTokenError::UnknownKey { .. })
+            crate::caller::jwks::VerifyError::Rejected(IdTokenError::UnknownKey { .. })
         ));
         assert_eq!(idp.jwks_fetches(), 2);
     }
@@ -1150,7 +1160,7 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            crate::jwks::VerifyError::Expired(p) => {
+            crate::caller::jwks::VerifyError::Expired(p) => {
                 assert_eq!(p.email.as_deref(), Some("alice@example.com"))
             }
             other => panic!("expected Expired, got {other:?}"),
@@ -1174,7 +1184,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, crate::jwks::VerifyError::Untrusted(_)));
+        assert!(matches!(
+            err,
+            crate::caller::jwks::VerifyError::Untrusted(_)
+        ));
         assert_eq!(idp.jwks_fetches(), 0);
     }
 }

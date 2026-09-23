@@ -19,8 +19,8 @@ use library::Argv;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::call::{CallOutcome, Caller, CredArgs, Credentials, WiresCaller};
-use crate::tools::{RemoteTool, ToolsConfig};
+use crate::caller::call::{CallOutcome, Caller, CredArgs, Credentials, WiresCaller};
+use crate::caller::tools::{RemoteTool, ToolsConfig};
 
 /// The newest MCP revision this server speaks (the stateless one).
 pub const LATEST_PROTOCOL_VERSION: &str = "2026-07-28";
@@ -393,7 +393,7 @@ pub struct McpArgs {
 
 /// `wires mcp`: load `tools.json` and credentials, then serve MCP on stdio.
 pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
-    let path = crate::tools::resolve_path(a.creds.tools_file.as_deref())?;
+    let path = crate::caller::tools::resolve_path(a.creds.tools_file.as_deref())?;
     let config = ToolsConfig::load(&path)?;
     let creds = Credentials::resolve(&a.creds)?;
     tracing::info!(
@@ -413,7 +413,7 @@ pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ToolTarget;
+    use crate::caller::tools::ToolTarget;
     use library::{NodeIdentity, ToolName};
     use proptest::prelude::*;
     use std::collections::BTreeMap;

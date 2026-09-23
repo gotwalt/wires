@@ -1,16 +1,16 @@
 //! How a reader shows an [`IdentityClaim`] it saw on a channel (card 04).
 //!
-//! Every reader verifies the claim **itself** (see [`crate::jwks`]); this
+//! Every reader verifies the claim **itself** (see [`crate::caller::jwks`]); this
 //! module turns the verdict into the one line a `wires tail` prints, and holds
 //! the reader's trust settings ([`IdpTrust`]).
 //!
 //! `render.rs` calls [`describe_identity`] for every `ChannelRecord::Identity`
-//! a tail prints, with the verdict [`crate::identity::Identities`] reached;
+//! a tail prints, with the verdict [`crate::host::identity::Identities`] reached;
 //! [`render_identity`] is the standalone async wrapper that fetches keys first.
 
 use library::{Audience, IdentityClaim, Issuer, Principal};
 
-use crate::jwks::VerifyError;
+use crate::caller::jwks::VerifyError;
 
 /// The default issuer: Google, the demo IdP.
 pub(crate) const DEFAULT_ISSUER: &str = "https://accounts.google.com";
@@ -99,11 +99,11 @@ impl IdpTrust {
 
 /// Verify `claim` with `fetcher` and render the line (the async wrapper).
 ///
-/// Test-only: the tail verifies through [`crate::identity::Identities`], which
+/// Test-only: the tail verifies through [`crate::host::identity::Identities`], which
 /// also indexes the verdict, and renders with [`describe_identity`].
 #[cfg(test)]
 pub(crate) async fn render_identity(
-    fetcher: &crate::jwks::KeyFetcher,
+    fetcher: &crate::caller::jwks::KeyFetcher,
     trust: &IdpTrust,
     claim: &IdentityClaim,
     now: i64,

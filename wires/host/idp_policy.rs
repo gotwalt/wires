@@ -21,7 +21,7 @@
 //! `alice@example.com.evil.net`. A rule with no `iss` accepts every issuer the
 //! responder trusts (`WIRES_OIDC_ISSUER`, plus the `iss` of every rule).
 //!
-//! Matching only ever sees a [`Principal`] that [`crate::jwks`] verified; the
+//! Matching only ever sees a [`Principal`] that [`crate::caller::jwks`] verified; the
 //! email is present only when the IdP marked it verified.
 
 use std::fmt;

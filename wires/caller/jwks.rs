@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn a_fresh_disk_cache_is_used_and_a_stale_one_is_not() {
-        let dir = crate::ipc::ScratchDir::new("jwks");
+        let dir = crate::channel::ipc::ScratchDir::new("jwks");
         let issuer = Issuer::new("https://idp.example");
         let a = KeyFetcher::new(Some(dir.path().to_path_buf())).unwrap();
         let jwks = Jwks::from_json(r#"{"keys":[{"kty":"EC","kid":"k"}]}"#).unwrap();

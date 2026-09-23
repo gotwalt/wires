@@ -117,7 +117,7 @@ pub struct ServeConfig {
     pub audit: Option<AuditSink>,
     /// Who callers are, per the IdP claims on the audit topic, and what
     /// `--require-idp` demands of them. `None` without an audit topic.
-    pub identity: Option<Arc<crate::identity::IdentityGate>>,
+    pub identity: Option<Arc<crate::host::identity::IdentityGate>>,
 }
 
 /// The responder's handle for publishing [`AuditRecord`](library::AuditRecord)s.
@@ -581,7 +581,7 @@ async fn handle_connection(incoming: iroh::endpoint::Incoming, config: &ServeCon
 }
 
 /// The session ALPN as a router protocol, for a responder whose endpoint is
-/// owned by a [`TopicNode`](crate::topics::TopicNode) (`serve --audit-topic`):
+/// owned by a [`TopicNode`](crate::channel::topics::TopicNode) (`serve --audit-topic`):
 /// one endpoint per node key, so the session rides the topic node's router
 /// instead of a second bind.
 #[derive(Clone)]
@@ -676,13 +676,13 @@ where
         // on the wire before failing, so it need not guess.
         Some(_) => {
             let e = anyhow!("first frame was not a handshake");
-            crate::audit::denied(config.audit.as_ref(), caller, None, &format!("{e:#}")); // audit: denied
+            crate::host::audit::denied(config.audit.as_ref(), caller, None, &format!("{e:#}")); // audit: denied
             deny(&mut send, format!("{e:#}")).await;
             return Err(e);
         }
         None => {
             let e = anyhow!("connection closed before handshake");
-            crate::audit::denied(config.audit.as_ref(), caller, None, &format!("{e:#}")); // audit: denied
+            crate::host::audit::denied(config.audit.as_ref(), caller, None, &format!("{e:#}")); // audit: denied
             deny(&mut send, format!("{e:#}")).await;
             return Err(e);
         }
@@ -694,7 +694,7 @@ where
     let invocation = match read_invocation(&mut recv).await {
         Ok(invocation) => invocation,
         Err(e) => {
-            crate::audit::denied(config.audit.as_ref(), caller, None, DENY_INVOKE_REQUIRED); // audit: denied
+            crate::host::audit::denied(config.audit.as_ref(), caller, None, DENY_INVOKE_REQUIRED); // audit: denied
             deny(&mut send, DENY_INVOKE_REQUIRED.to_string()).await;
             return Err(e.context(DENY_INVOKE_REQUIRED));
         }
@@ -711,7 +711,7 @@ where
         Err(e) => {
             tracing::warn!("credential sources unusable: {e:#}");
             let reason = "responder configuration error".to_string();
-            crate::audit::denied(config.audit.as_ref(), caller, Some(tool.clone()), &reason); // audit: denied
+            crate::host::audit::denied(config.audit.as_ref(), caller, Some(tool.clone()), &reason); // audit: denied
             deny(&mut send, reason).await;
             return Err(e.context("loading credential sources"));
         }
@@ -732,7 +732,7 @@ where
     ) {
         Ok(v) => v,
         Err(e) => {
-            crate::audit::denied(
+            crate::host::audit::denied(
                 config.audit.as_ref(),
                 caller,
                 Some(tool.clone()),
@@ -747,7 +747,7 @@ where
     let argv = match resolve_command(config, &invocation) {
         Ok(argv) => argv,
         Err(reason) => {
-            crate::audit::denied(config.audit.as_ref(), caller, Some(tool.clone()), &reason); // audit: denied
+            crate::host::audit::denied(config.audit.as_ref(), caller, Some(tool.clone()), &reason); // audit: denied
             deny(&mut send, reason.clone()).await;
             return Err(anyhow!(reason));
         }
@@ -808,7 +808,7 @@ where
         .with_context(|| format!("spawning {program}"))?;
     // audit: started — the tool and the *caller's* arguments (not the tool's
     // fixed argv).
-    let audit = crate::audit::CallAudit::start(
+    let audit = crate::host::audit::CallAudit::start(
         config.audit.as_ref(),
         caller,
         principal,
@@ -817,11 +817,15 @@ where
         roster_version,
     );
     let mut child_stdin = child.stdin.take().context("child stdin")?;
-    let stdin_tap = crate::audit::tap_stdin(audit.as_ref());
-    let child_stdout =
-        crate::audit::tap_stdout(audit.as_ref(), child.stdout.take().context("child stdout")?);
-    let child_stderr =
-        crate::audit::tap_stderr(audit.as_ref(), child.stderr.take().context("child stderr")?);
+    let stdin_tap = crate::host::audit::tap_stdin(audit.as_ref());
+    let child_stdout = crate::host::audit::tap_stdout(
+        audit.as_ref(),
+        child.stdout.take().context("child stdout")?,
+    );
+    let child_stderr = crate::host::audit::tap_stderr(
+        audit.as_ref(),
+        child.stderr.take().context("child stderr")?,
+    );
 
     // A single writer task serializes all server->client frames.
     let (tx, mut rx) = mpsc::channel::<Frame>(64);

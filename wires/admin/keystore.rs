@@ -32,7 +32,7 @@ use library::{
     Crl, FabricKey, InclusionProof, Membership, NodeIdentity, Roster, RosterHead, RosterVersion,
 };
 
-use crate::transport::{CrlSource, HeadSource};
+use crate::host::transport::{CrlSource, HeadSource};
 
 /// Resolve the wires home directory (does not create it).
 pub fn home() -> Result<PathBuf> {

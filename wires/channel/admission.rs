@@ -37,8 +37,8 @@
 //!    it can mint under the key it holds, and survivors could read it. What is
 //!    true, and what the code enforces, is that a node holding the new head
 //!    accepts nothing sealed under a superseded one:
-//!    [`ingest`](crate::replay::ingest) refuses live envelopes below its epoch
-//!    floor, and [`catch_up`](crate::replay::catch_up) only asks peers admitted
+//!    [`ingest`](crate::channel::replay::ingest) refuses live envelopes below its epoch
+//!    floor, and [`catch_up`](crate::channel::replay::catch_up) only asks peers admitted
 //!    under the head it currently enforces. Replay itself is epoch-permissive
 //!    by necessity — a publisher's chain is dense, so refusing pre-commit
 //!    history would strand every later message from that publisher — which
@@ -88,8 +88,8 @@ use library::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::keystore::Keystore;
-use crate::transport::{Denied, HeadSource, to_node_id};
+use crate::admin::keystore::Keystore;
+use crate::host::transport::{Denied, HeadSource, to_node_id};
 
 /// How long an admission stands before it must be re-established.
 ///
@@ -730,14 +730,14 @@ impl ProtocolHandler for GatedGossip {
 /// On refusal it writes a `Denied` frame carrying the reason and returns the
 /// error; on success it returns the [`Admission`] it recorded. `caller` must
 /// already be authenticated by whoever supplied the streams — this function
-/// takes it on trust, exactly as [`crate::transport`] does.
+/// takes it on trust, exactly as [`crate::host::transport`] does.
 ///
 /// Frames are bounded by the codec, not by this reader: an over-long length
 /// prefix is rejected at [`library::MAX_ADMIT_FRAME`] on decode, which matters
 /// here more than anywhere else because this is the one surface that must read
 /// a whole frame *before* it can decide anything (spec §2.1).
 ///
-/// [`serve_session`]: crate::transport
+/// [`serve_session`]: crate::host::transport
 pub async fn serve_admission<S, R>(
     mut send: S,
     mut recv: R,
@@ -932,7 +932,8 @@ pub async fn admit_peer(
     peer: &TopicPeer,
     now_unix: i64,
 ) -> Result<Admission> {
-    let addr = crate::transport::endpoint_addr(&peer.node, &peer.addrs, peer.relay_url.as_deref())?;
+    let addr =
+        crate::host::transport::endpoint_addr(&peer.node, &peer.addrs, peer.relay_url.as_deref())?;
     // Both halves are bounded (spec §2.3): the tail loop awaits this inline, and
     // an unreachable-but-answering peer must cost a deadline, not the process.
     let dial = async {
@@ -1061,7 +1062,7 @@ where
 /// Best-effort, like the session transport's: a peer that already vanished
 /// simply never reads it, and the caller still returns the original error.
 async fn deny<W: AsyncWrite + Unpin>(send: &mut W, reason: String) {
-    let reason = crate::transport::truncate_reason(reason);
+    let reason = crate::host::transport::truncate_reason(reason);
     let _ = write_admit_frame(send, &AdmitFrame::Denied { reason }).await;
     send.shutdown().await.ok();
 }

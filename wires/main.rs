@@ -14,41 +14,28 @@
 //! the child's own code on success, [`EXIT_DENIED`] when the responder refused
 //! the credentials, `1` for any local or transport failure.
 
-mod admission;
-mod audit;
-mod call;
-mod identity;
-mod idp_policy;
-mod idp_view;
-mod ipc;
-mod jwks;
-mod keystore;
-mod login;
-mod mcp;
-mod render;
-mod replay;
-mod store;
-mod tools;
-mod topics;
-mod transport;
+mod admin;
+mod caller;
+mod channel;
+mod host;
 
-/// The five money-shot integration tests of spec §9 — the whole stack over
+/// The money-shot integration tests of spec §9 — the whole stack over
 /// hermetic loopback, in one place because none of them belongs to a single
 /// module's seam.
 ///
 /// Declared `#[cfg(test)]` rather than carrying an inner `#![cfg(test)]`: the
-/// `srcs = glob(["*.rs"])` in `BUILD` hands `e2e.rs` to both the binary and the
-/// test target, and gating the `mod` item is what keeps it out of the shipped
-/// binary entirely instead of compiling to an empty module.
+/// `srcs = glob(["**/*.rs"])` in `BUILD` hands `e2e/` to both the binary and
+/// the test target, and gating the `mod` item is what keeps it out of the
+/// shipped binary entirely instead of compiling to an empty module.
 #[cfg(test)]
 mod e2e;
 
-/// A hermetic OIDC issuer for the `wires login` tests (card 04), also served
-/// by the dev-only `//wires:wires_dev` build (`wires dev-mock-idp`) for
-/// `.scripts/demo-remote-cli.sh`. Never compiled into the shipped `//wires`.
-#[cfg(any(test, feature = "dev-mock-idp"))]
-#[cfg_attr(not(test), allow(dead_code))]
-mod mock_idp;
+use admin::keystore;
+#[cfg(feature = "dev-mock-idp")]
+use caller::mock_idp;
+use caller::{call, jwks, login, mcp, tools};
+use channel::{admission, idp_view, ipc, render, replay, store, topics};
+use host::{audit, identity, idp_policy, transport};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -1279,7 +1266,7 @@ const DEFAULT_BACKFILL: usize = 200;
 /// giving up and storing the message locally.
 ///
 /// A bound, not a sleep: the wait ends on the first
-/// [`TopicEvent::NeighborUp`](crate::topics::TopicEvent::NeighborUp), and this
+/// [`TopicEvent::NeighborUp`](crate::channel::topics::TopicEvent::NeighborUp), and this
 /// is only how long "nobody is there" takes to establish.
 const PUBLISH_NEIGHBOR_WAIT: Duration = Duration::from_secs(15);
 
@@ -1308,7 +1295,7 @@ const CATCHUP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How often the resident tail refreshes admissions that are about to lapse.
 ///
-/// Half of [`ADMIT_REFRESH`](crate::admission::ADMIT_REFRESH), so two attempts
+/// Half of [`ADMIT_REFRESH`](crate::channel::admission::ADMIT_REFRESH), so two attempts
 /// fit in the window before an admission actually expires and the far side's
 /// watchdog closes the connection.
 const READMIT_INTERVAL: Duration = Duration::from_secs(admission::ADMIT_REFRESH.as_secs() / 2);
@@ -1648,7 +1635,7 @@ impl Printer {
     /// Render one message, or nothing when no key opens it.
     ///
     /// Called only for an envelope whose append reported
-    /// [`Appended::Inserted`](crate::store::Appended) — which is what makes
+    /// [`Appended::Inserted`](crate::channel::store::Appended) — which is what makes
     /// deduplication across live gossip, replay, and restart structural rather
     /// than a remembered set of ids (spec §7).
     ///
@@ -1843,7 +1830,7 @@ fn peers_path(home: &Path, topic: TopicId) -> PathBuf {
 /// Sequence and previous-hash both come from the store's chain state, inside
 /// the process that holds the store's exclusive lock, which is what makes "one
 /// allocator per (node, topic)" structural rather than a convention. A
-/// [`Duplicate`](crate::store::Appended::Duplicate) here would mean two
+/// [`Duplicate`](crate::channel::store::Appended::Duplicate) here would mean two
 /// allocators raced, so it is an error, not a shrug.
 fn append_local(
     store: &store::TopicStore,
@@ -1902,7 +1889,7 @@ async fn tail_cmd(a: TailArgs) -> anyhow::Result<()> {
 ///
 /// Returns `Ok(())` on `SIGINT`/`SIGTERM`, having closed the mesh and unlinked
 /// the control socket. Every failure that is a *refusal* carries a
-/// [`Denied`](crate::transport::Denied) so `main` can exit 77.
+/// [`Denied`](crate::host::transport::Denied) so `main` can exit 77.
 ///
 /// `hosted` is `serve --audit-topic`'s addition: the session ALPN rides this
 /// node's router, and call records enter the loop through the same publish
@@ -2535,7 +2522,7 @@ struct Redial {
 ///
 /// Re-admission is not a formality: the responder re-loads its head, so a peer
 /// that was removed from the roster since the last dial learns about it here,
-/// as a [`Denied`](crate::transport::Denied). But one peer refusing is that
+/// as a [`Denied`](crate::host::transport::Denied). But one peer refusing is that
 /// peer's verdict, and a refusal is not even always about the roster — a peer
 /// whose own head is briefly unreadable, or whose clock is skewed, or that
 /// imported a commit this node has not yet, all answer `Denied` to a node that
@@ -2584,7 +2571,7 @@ async fn redial(node: &topics::TopicNode, sender: &topics::TopicSender, book: &P
 
 /// Re-establish admissions that are about to lapse.
 ///
-/// An admission is a lease of [`ADMIT_TTL`](crate::admission::ADMIT_TTL), and
+/// An admission is a lease of [`ADMIT_TTL`](crate::channel::admission::ADMIT_TTL), and
 /// before this existed nothing renewed one on a healthy mesh: `admit_peer` ran
 /// at bootstrap and on a redial, and a redial only happens when the neighbor
 /// count reaches zero. So a perfectly stable topic tore its own mesh down every
