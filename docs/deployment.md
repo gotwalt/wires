@@ -1,7 +1,7 @@
 # Deploying wires
 
 Patterns for running wires beyond one machine. For the command reference see
-the [README](../README.md); for the recorded two-machine run see
+[usage.md](usage.md); for the recorded two-machine run see
 [demo.md](demo.md); for tests see [testing.md](testing.md).
 
 ## What you deploy

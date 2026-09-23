@@ -46,13 +46,13 @@ On camera, in order:
 |---|---|
 | **"Tailscale already does this."** | Tailscale gives your machine a network path to the host; wires gives a key-addressed path to the services a signed list lets you call, with no TCP listener and no firewall port opened. |
 | **"Our MCP gateway already logs every call."** | The gateway's log belongs to whoever runs the gateway and covers only traffic routed through it; this record is written and signed by the machine that ran the command, and the readers the admin names read it without either end's credentials. |
-| **"We already have Okta / enterprise-managed auth."** | Good, wires uses it: the host checks your IdP's signed token, bound to the caller's key, against one admin-signed list of who may call what, with no wires identity service and no auth code in the CLI. |
+| **"We already have Okta / MCP's enterprise-managed auth."** | Good, wires uses the same IdP. In MCP's extension the IdP decides which servers you reach and each server's authorization server still issues its tokens; here every host checks the IdP's own ID token, bound to the caller's key, against one admin-signed list for every service, with no auth code in the CLI. |
 | **"A leaner MCP server would close the gap."** | Mostly, yes, because the token win comes from output size; a CLI gets it without rewriting anything, and wires doesn't rest on tokens anyway, it rests on reach, identity and the host-written record. |
 | **"Can't the host just edit its log?"** | It can withhold or truncate its own history, but a rewrite of anything a reader has already seen breaks the hash chain at that reader's mark, and `wires watch` stops with an alarm. A witness that holds copies is [card 09](board/backlog/09-witness.md), not built. |
 | **"Use webhooks."** | The laptop agent has no public endpoint; ngrok or Funnel would put one on the internet. Wires pushes to the agent's key, with nothing exposed. |
 | **"Just poll."** | Polling (status service or inbox loop) cost 28k→39k tokens as the build went 60→300 s and reacted in 20–180 s; `inbox --wait` cost 15k flat and reacted in ~2 s (bench/push/REPORT.md). |
 | **"A2A has push."** | Through webhooks to a public URL, the same problem. |
-| **"The MCP tasks extension."** | Poll-based by design (`tasks/get`): the "just poll" row. |
+| **"The MCP tasks extension."** | Polling `tasks/get` is its default; status can also arrive as `notifications/tasks` on a `subscriptions/listen` stream the client holds open. Neither reaches an agent that isn't connected; that is working-group work, not in the 2026-07-28 spec. |
 
 ## Cast
 

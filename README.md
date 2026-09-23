@@ -1,481 +1,142 @@
 # wires
 
-> **Run a CLI on another machine from your agent, by service name. The machine
-> is reached by public key, never by network path; the caller is authenticated
-> by your IdP and checked against an admin-signed list of who may call what;
-> and the machine that ran each call keeps a signed record of it that the
-> people you name can read, without access to the caller or the machine.**
+**Give your agent tools on other machines, the way it already uses tools on
+its own: as CLIs.**
 
-```
-      admin: wires init · invite · remove · role set · service add
-      (holds the root key; signs ONE versioned state: members, hosts,
-       roles, and the service registry  orders-db → allow analyst,
-       hosts workbench + spare, readers security)
-                 │ pushed by key, hosts first (pulled if missed)
-        ┌────────┴──────────────────────────┐
-        ▼                                   ▼
-  caller (your agent)                 host: wires serve host.json
-  wires services  (local: what         (how it implements the services
-    the state lets me call)             assigned to it; checks every
-  wires call orders-db -- "…" ─QUIC──▶  caller against the state; keeps
-    dialed by the host's KEY            its own signed call log)
-  wires inbox  ◀── push by key ───────         │
-                                                │ records, on request, to
-  reader (role security)                        │ whoever the registry names
-  wires watch orders-db  ◀──────────────────────┘
-```
+wires does the job of a remote MCP server: it lets an agent harness (Claude
+Code, or anything that can run a command) use tools that live somewhere else.
+The tool is a command-line program, the caller is a person your identity
+provider vouches for, and neither machine opens a firewall port.
+
+- **CLIs, not a new protocol.** `wires call orders-db -- "select …"` runs a
+  command on the machine that has the database; stdin, stdout and the exit
+  code pass through. Models already know how to use CLIs, and they trim
+  output (`--jq`, `--head`) before it reaches their context. On GitHub tasks
+  that halved input tokens against GitHub's MCP server, and cost went from
+  $1.87 to $0.39 over 25 runs ([bench](bench/REPORT.md)).
+- **Your IdP says who's calling.** `wires login` signs in with your OIDC
+  provider and ties that sign-in to the agent's key. Every host checks the
+  IdP's signature itself: there's no wires account and no auth server, and
+  the CLI being run has no auth code.
+- **Discovery by who you are.** An admin signs one registry: the services,
+  the machines that run each, and the roles (matched on IdP identity, e.g.
+  `*@acme.com`) that may call each. `wires services` shows an agent only what
+  its person may call. The agent never names a machine, and a service with
+  two hosts keeps answering when one is down.
+- **Both directions.** The agent calls the host, and the host can message
+  the agent later ("build 41 failed"), addressed by the agent's key, even
+  when the agent isn't connected. `wires inbox --wait` sleeps until it
+  lands: 4 turns and about 2 s to react, against 9–13 turns of polling
+  ([bench](bench/push/REPORT.md)).
+- **No open ports on either side.** wires is built on
+  [iroh](https://iroh.computer): machines dial each other by public key over
+  QUIC, directly or through a relay. The host has no TCP listener and needs
+  no inbound firewall rule, and a peer that isn't in the signed list is refused at
+  the handshake.
+
+Since every call runs on a host that has checked who is calling, the host
+also keeps a signed record of each call and refusal. The people the registry
+names as readers stream it with `wires watch`.
 
 ![The loopback demo, narrated](docs/media/demo-remote-cli.gif)
 
-*A recording of `./.scripts/demo-remote-cli.sh`: five keystores on one machine over loopback, signing in through a mock IdP, not the two-machine run ([MP4](docs/media/demo-remote-cli.mp4)).*
+*A recording of `./.scripts/demo-remote-cli.sh`: five keystores on one
+machine over loopback, signing in through a mock IdP, not the two-machine run
+([MP4](docs/media/demo-remote-cli.mp4)).*
 
-**What you just saw**, in the order the demo runs it:
-
-- The admin registers a **service** (`orders-db`), says which roles may call it and read its records, and which hosts implement it. That is one signed document, pushed to the hosts by key.
-- A host runs `wires serve host.json`, which says only how it implements the services the state assigns to it. It has no TCP listener and opens no firewall port; unauthenticated peers are refused at the handshake.
-- The caller signs in once (`wires login`), which binds your IdP's ID token to its node key. `wires services` lists what it may call, evaluated locally. `wires call orders-db -- "…"` picks a host itself; the caller never names one.
-- A caller in no allowed role sees nothing and is refused by name. The removed caller's next call exits 77; nothing restarts, and there is no key to rotate.
-- The host writes a signed, hash-linked record of every call, refusal and push. A member in the service's `readers` role reads all of them with `wires watch`; every other member reads only its own calls.
-
-## Roles
-
-| Role | Decides | Commands |
-|---|---|---|
-| **admin** | who's in, which roles exist, which services run where, who may call and read each (root key) | `init`, `invite`, `remove`, `role set\|rm`, `service add\|set\|rm` |
-| **host** | how it implements its assigned services; which IdPs it trusts; stricter local rules; push | `serve host.json`, `push` |
-| **caller** | — runs services by name; MCP only for backward compatibility | `id`, `join`, `login`, `services`, `call`, `mcp`, `inbox` |
-| **reader** | — any member; reads the records a service's `readers` role allows, or its own | `watch` |
-
-Every role joins the same way: `wires id`, then `wires join <token>` with the admin's invite.
-
-## Where each guarantee lives
-
-| Guarantee | Lives in | Checked by |
-|---|---|---|
-| **Who's in** | The admin-signed state's member set (and each node's root-signed membership). Removal is a new state without the member. | The host, per connection, against its copy of the state (re-read every dial). |
-| **Who may call what** | The state's registry: each service's `allow` roles, and the role definitions (matchers on the IdP identity). | The host, on every call. `wires services` evaluates the same table locally, for listing only. |
-| **Stricter local rules** | `host.json`'s `also_require` roles per service. They can only narrow. | The host, after the registry. |
-| **Who is calling** | Your IdP's ID token, bound to the caller's node key at `wires login` (the OIDC `nonce` is a hash of the key), presented in the session `Hello`. | The host, against the issuer's JWKS, under the issuers `host.json` trusts. No wires identity service. |
-| **Reach** | The host's node key. Callers dial a key (iroh; n0 discovery, or an optional local `$WIRES_HOME/hints` file); the host binds UDP for QUIC and has no TCP listener. | iroh's handshake authenticates the key; the host then checks the membership and the state. |
-| **Which host** | The registry's `hosts` for the service. Only the admin binds a name to a host, so no host can squat a name. | The caller (it dials only those hosts) and the host (it refuses to start, or to serve, a name not assigned to it). |
-| **Records** | Each host's own call log: every call, refusal and push, signed by the host and hash-linked. | Readers, with `wires watch`: the service's `readers` roles see all of it, everyone else only their own calls; every entry and the chain are verified. |
-| **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. | The host, at send, delivery and fetch: a member of the state, in a `push.allow` role. |
-| **Removal** | A new state, pushed hosts first. No shared key exists, so there is nothing to rotate. | Every host, on the removed member's next call or fetch. |
-
-Nothing is broadcast: a member that takes part in no call receives no traffic about other members' calls, identities or services (the admin's state push aside).
-
-## Walkthrough
-
-Five `WIRES_HOME` directories stand in for five machines: **admin**,
-**workbench** and **spare** (hosts), **agent** (alice@example.com, the
-caller) and **observer** (sec@audit.example, a reader). Build with `cargo
-build --release -p wires` (or `docker build .`) and put `target/release/wires`
-on each machine's `PATH`. The output below is from `./.scripts/demo-remote-cli.sh`,
-which runs this sequence on loopback with a stand-in IdP (`wires
-dev-mock-idp`, from a build with `--features dev-mock-idp`) and asserts every
-step. Node ids are shortened.
-
-**1. admin: start, define roles.**
+## A quick tour
 
 ```console
+# admin: one signed registry, pushed to every machine by key
 admin$ wires init
-fabric 57b09428…
-node 23028cae…
-state version 1 (1 member: this node)
-next: on each joining machine run `wires id`, then here `wires invite <node-id> --name <label>`
-admin$ wires role set analyst '*@example.com'
-role analyst set (state version 2)
-admin$ wires role set security sec@audit.example
-role security set (state version 3)
-```
+admin$ wires role set analyst '*@acme.com'
+admin$ wires invite <node-id> --name workbench     # and one per machine
+admin$ wires service add orders-db --description "Read-only SQL over orders" \
+         --allow analyst --host workbench
 
-**2. Hosts join, and the admin registers the service.** Each machine sends
-its `wires id`; the admin sends back one token.
-
-```console
-workbench$ wires id
-3ef72b11…
-admin$ wires invite 3ef72b11… --name workbench        # likewise the spare
-wires: invited 3ef72b11… as "workbench" (state version 4, 2 members)
-wires: on the joining machine: wires join eyJhZG1pbiI6…
-workbench$ wires join eyJhZG1pbiI6…
-admin$ wires service add orders-db --description "Read-only SQL (sqlite3) over the orders database; …" \
-         --allow analyst --reader security --host workbench --host spare
-service orders-db added (state version 6)
-wires: state version 6: pushed to 0 member(s); 2 not reachable now (3ef72b11…, 511de414…) — they pull it on their next command
-```
-
-The hosts weren't running, so the push missed them; a fresh `wires invite`
-token catches a host up (re-joining never rolls a state back). The token
-isn't a secret: it holds the invitee's membership and the signed state.
-
-**3. The hosts serve.** `host.json` says only how each service runs here. A
-command is an argv, exec'd directly and never through a shell, with the
-caller's arguments appended; sqlite3's `-safe` turns off `.shell`.
-
-```json
-{
-  "version": 2,
-  "identity": { "issuers": [
-    { "issuer": "https://accounts.google.com", "audiences": ["<client id>.apps.googleusercontent.com"] }
-  ] },
-  "services": {
-    "orders-db": { "command": ["sqlite3", "-safe", "-readonly", "-header", "-column", "orders.db"] }
-  },
-  "push": { "allow": ["analyst"] }
-}
-```
-
-```console
-workbench$ wires serve --check host.json
-host.json ok (version 2)
-trusted issuers:
-  https://accounts.google.com  audiences: <client id>.apps.googleusercontent.com
-services (who may call each is in the admin-signed state):
-  orders-db
-    command: sqlite3 -safe -readonly -header -column orders.db
-push: to roles analyst
+# host: how it runs the services the registry gives it
+workbench$ wires join <token>
 workbench$ wires serve host.json
-```
 
-`serve` refuses to start unless its state assigns every service in the file
-to it.
-
-**4. The agent and the observer join.** Each invite is a new state, pushed to
-both hosts:
-
-```console
-admin$ wires invite dd7e7237… --name agent
-wires: invited dd7e7237… as "agent" (state version 9, 4 members)
-wires: state version 9: pushed to 2 member(s); 1 not reachable now (dd7e7237…) — they pull it on their next command
-agent$ wires join eyJhZG1pbiI6…
-```
-
-**5. agent: before sign-in, nothing; after, one service.**
-
-```console
+# agent: sign in once, then call by name
+agent$ wires join <token>
+agent$ wires login                  # browser sign-in; client id from $WIRES_OIDC_CLIENT_ID
 agent$ wires services
-wires services: no service allows this node without a login (state v9)
-agent$ wires call orders-db -- "select count(*) from orders"
-wires: denied by responder: no ID token presented; run `wires login`; orders-db needs a verified identity in role analyst
-agent$ echo $?
-77
-agent$ wires login --client-id <client id> --client-secret <secret>
-wires login: node dd7e7237… is alice@example.com (token stored in …/idp-token.jwt, valid until unix …)
-agent$ wires services
-orders-db  Read-only SQL (sqlite3) over the orders database; pass the SQL statement as the argument.  (analyst)
+orders-db  Read-only SQL over orders  (analyst)
 agent$ wires call orders-db -- "select count(*) from orders"
 count(*)
 --------
        7
-```
 
-A signed-in member in no allowed role sees nothing, and naming the service
-anyway is refused with the reason:
-
-```console
-observer$ wires services
-wires services: no service allows sec@audit.example (state v10)
-observer$ wires call orders-db -- "select 1"
-wires: denied by responder: sec@audit.example is in no role allowed to call orders-db (analyst)
-```
-
-`--jq`, `--head` and `--max-bytes` are applied inside `wires call`; the host
-never sees them, and the remote exit code passes through.
-
-**6. The reader reads the records.** The observer is in `security`, the
-service's `readers` role, so it sees every call and refusal, from the hosts'
-own logs, with no key to either end:
-
-```console
-observer$ wires watch orders-db --once
-21:13:08 orders-db ✗ dd7e… orders-db denied: no ID token presented; run `wires login`; …
-21:13:09 orders-db ✗ f6d6… orders-db denied: sec@audit.example is in no role allowed to call orders-db (analyst)
-21:13:09 orders-db ▶ 8bd5 alice@example.com (dd7e…) [analyst] orders-db "select count(*) from orders"
-21:13:09 orders-db ■ 8bd5 exit 0 · 3 ms · 27 B out · blake3 8b4c…
-21:13:11 orders-db ▶ 3b25 alice@example.com (dd7e…) [analyst] orders-db
-21:13:11 orders-db ■ 3b25 exit 0 · 6 ms · stdin "select customer, sum(total) from orders group by customer order by 2 desc" · 126 B out · blake3 5e99…
-21:13:15 orders-db ▶ 442f alice@example.com (dd7e…) [analyst] orders-db ".shell id"
-21:13:15 orders-db ■ 442f exit 1 · 4 ms · 0 B out · blake3 af13…
-```
-
-The agent's own `wires watch` shows its calls and not the observer's refusal.
-
-**7. Failover and removal.** With the workbench stopped, the same command is
-answered by the spare (`wires call --verbose` says which host answered;
-callers don't normally care). Then:
-
-```console
-admin$ wires remove agent
-wires: state version 11: pushed to 2 member(s); 1 not reachable now (f6d6dae7…) — they pull it on their next command
-removed dd7e7237… (agent) (state version 11, 4 members)
-agent$ wires call orders-db -- "select count(*) from orders"
-wires: denied by responder: not a member of the current signed state (version 11)
-agent$ echo $?
-77
-```
-
-The script also covers SQL on stdin, the same service through `wires mcp`,
-`.shell id` refused by `sqlite3 -safe`, and a push:
-
-```bash
-./.scripts/demo-remote-cli.sh            # builds with cargo; narrated; --quiet for assertions only
-./.scripts/demo-push.sh                  # a host calls the agent back (card 24)
-```
-
-## Why it's built this way
-
-**The CLI first; MCP for backward compatibility only.** Models already know
-CLIs, and a CLI lets the agent pick the fields it wants before anything
-reaches context: `gh … --json tagName --jq …`, or `wires call`'s own
-`--jq/--head/--max-bytes` for commands without a filter. That filtering, not
-tool schemas, is where the measured difference comes from. Claude Code's
-default tool search already keeps MCP schemas down to about 400 tokens. On
-five read-only GitHub tasks (`bench/REPORT.md`):
-
-| arm | median total input | Σ cost, 25 runs | accuracy | permission refusals |
-|---|---|---|---|---|
-| GitHub MCP server, Claude Code default (tool search on) | 21,088 | $1.87 | 25/25 | 0 |
-| GitHub MCP server, tool search off | 30,630 | $1.40 | 25/25 | 0 |
-| `wires call gh`, plus shell pipe helpers | 10,539 | $0.48 | 25/25 | 7 |
-| bare `gh`, plus shell pipe helpers | 6,997 | $0.42 | 25/25 | 8 |
-| `wires call gh` only, no shell (arm 5) | 10,713 | $0.39 | 25/25 | 0 |
-
-Arm 5 shows the efficiency holds when `wires call` is the only thing the agent
-is allowed to run. Caveats: n = 5 per cell, one model (Opus 5.5), one MCP
-server (GitHub's, whose payloads are unusually large), and stripped-down
-sessions, so the percentages overstate what a full session would see. An MCP
-server with field selection would close much of this gap. `wires mcp` serves
-the same services, with the same `jq`/`head`/`max_bytes` fields, to clients
-that can only speak MCP.
-
-**Services, not hosts.** A caller cares what it is calling, not where it
-runs. The admin binds each name to its hosts in the signed state; the caller
-tries the one that last answered, then the others, and fails over only when a
-dial fails (a host that answered has decided). Moving a service changes
-nothing for callers.
-
-**Dial by key, not by host and port.** Tailscale gives the caller's machine a
-network path to the host; its ACLs can narrow that to a port, and the service
-on that port is then guarded by its own auth. Wires gives the caller a
-key-addressed path to the services the state lets it call. On the host there
-is no TCP listener and no firewall port opened; iroh binds UDP for QUIC
-(direct, or through a relay), and unauthenticated peers are refused at the
-handshake. In the two-machine run (card 08), `ss` on the host showed zero TCP
-listeners and two UDP sockets.
-
-**One signed state, checked locally.** Who's in, the roles and the registry
-are one root-signed, versioned document that every member holds. Hosts decide
-every call from their copy, re-read per connection, with no round-trip to an
-auth server; callers list what they may call from theirs. A node never
-accepts an older version, so a removal sticks.
-
-**The host writes the log.** The record of a call is written by the process
-that ran it, signed by its key and hash-linked, so the caller can't forge it
-and no gateway owns it. It leaves the host only when a reader asks and the
-registry lets it see.
-
-**Identity is the IdP's own signature.** `wires login` puts the caller's key
-hash in the OIDC `nonce`, so the ID token names the key it belongs to. The
-host verifies it against the IdP's published keys, under the issuers its
-`host.json` trusts. There's no wires-run attestor to trust and no auth code in
-the CLI being run.
-
-**Hosts can call the agent back.** A webhook needs the receiver to have a
-public HTTPS endpoint, and an agent on a laptop or in a sandbox has none. A
-caller here is addressed by its key, so a host can push to it with neither
-side exposing anything: `wires push --to "$WIRES_CALLER_NODE" --subject
-build-41 -- "failed: …"` from a service's background job (every service gets
-its verified caller's id in that variable). The host dials the caller by key
-(a running `wires inbox --wait` accepts it) and otherwise keeps it (24 h by
-default) for the caller's next `wires inbox`. `host.json`'s `push.allow`
-decides who may receive (default nobody), checked at send and again at
-delivery or fetch, so a removed member gets nothing. Every inbox line starts
-with the sender as the caller verified it, because a push is **untrusted
-input to a model**:
-
-```
+# later, the host messages the agent back by its key (here from a CI job the agent started)
+workbench$ wires push --to "$WIRES_CALLER_NODE" --subject build-41 -- "failed: test_orders_total"
+agent$ wires inbox --wait
 2026-09-23 21:13:20Z  from host 3ef72b11 (verified)  build-41  failed: test_orders_total
 ```
 
-## Giving an agent only `wires`
+`wires mcp` serves the same services over stdio MCP, for clients that can
+only speak MCP. `wires remove <name>` cuts a member off at its next call,
+with nothing to restart and no shared key to rotate.
 
-A Claude Code rule like `Bash(wires call:*)` is **not airtight** on its own.
-Claude Code does check each part of a compound command, but it also
-auto-allows read-only commands such as `cat` and `echo` inside the working
-directory, and `< file` or a glob can send working-directory files to the
-host as input. The agent can also pass `wires call`'s own override flags
-(`--tools-file`, `--*-file`, `--relay-url`). Evidence and method:
-[docs/agent-sandbox.md](docs/agent-sandbox.md).
+## wires and a remote MCP server
 
-To make `wires` the boundary, use a structural setup:
+Checked against the MCP specification, revision
+[2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/changelog).
+wires covers only MCP's tools; it has no prompts or resources.
 
-- a container or sandbox whose `PATH` holds only `wires`, in an empty
-  working directory with no secrets in the environment, with
-  `WIRES_LOCKED=1` set (or `"locked": true` in a `tools.json` the agent
-  can't write). Locked, `wires call`, `wires mcp` and `wires inbox` refuse
-  every flag that would point them at other credentials, another tools map
-  or another relay (`--tools-file`, `--*-seed*`, `--membership*`,
-  `--relay-url`); only `--jq`, `--head`, `--max-bytes`, the service name and
-  its arguments are accepted. `wires call` also refuses data on stdin, so
-  `< file` can't ship a local file to the host; pass input as arguments, or
-  set `WIRES_LOCKED_STDIN=allow` if your services need piped input.
-- or `wires mcp` as the agent's only tool, with no Bash tool at all.
-
-## Known trade-offs
-
-- **Every member holds the whole state**: member and host node ids, role
-  matchers, service names and descriptions. It is signed, not secret.
-- **Memberships and the state don't renew yet.** They expire after `--ttl`
-  (default 30 days); an expired state admits nobody. Any admin command signs
-  a fresh state; re-issue memberships with `wires invite <id>`.
-- **The admin is a one-shot command.** A member offline during a push gets
-  the state by pulling from a host on its next command (after 10 minutes), or
-  from a fresh invite; a host assigned a service while offline needs one of
-  those before `serve` will start.
-- **A host knows only the identities presented to it.** Push to a role
-  reaches members that have called that host, or run `wires inbox`, since it
-  started.
-- **A host can withhold or truncate its own log.** Tampering and gaps are
-  detectable, but only against a copy a reader already holds.
-
-## Not yet
-
-- **Joining by domain** (`wires join acmecorp.com`, a published root key, a
-  front desk that admits by IdP rule). This is an open question and not
-  designed ([card 18](docs/board/backlog/18-front-door-OPEN.md)). Today the
-  invite introduces the root key (trust on first use).
-- **The recorded two-machine demo** with real Google sign-in and Claude Code
-  as the agent ([card 08](docs/board/doing/08-demo-two-machine.md);
-  script in [docs/demo.md](docs/demo.md)).
-- Renewal of memberships and the state; `wires mcp` noticing a new state
-  without a restart; a witness that holds copies of hosts' logs
-  ([card 09](docs/board/backlog/09-witness.md)).
-
-## Why not…
-
-| | |
-|---|---|
-| **…Tailscale?** | Tailscale exposes the service to the caller's machine: a network path to the host, narrowed by ACLs to a port at best. Wires gives a key-addressed path to the services an admin-signed list lets you call: no TCP listener, no firewall port opened, and unauthenticated peers are refused at the handshake. |
-| **…an MCP gateway's logs?** | A gateway's log belongs to whoever runs the gateway, and covers only traffic routed through it. Here the record is written and signed by the host that ran the command, and the readers the registry names read it without either end's credentials. |
-| **…OAuth on each MCP server?** | Each server then integrates your IdP, and who may call what is spread across servers. Here the CLI has no auth code: one signed registry says who may call what, and each host checks the IdP-signed token bound to the caller's key. |
-| **…a leaner MCP server?** | It would close much of the token gap, since the gap comes from output size. The CLI gets it without rewriting anything, and the case for wires rests on reach, identity and the host-written record, not on tokens. |
-
-# Reference
-
-## Commands by role
-
-`wires --help` lists these:
-
-| Role | Command | What it does |
+| | Remote MCP server | wires |
 |---|---|---|
-| **admin** | `wires init [--ttl 30d]` | Create the root key and this node, and sign state version 1 with this node as its one member. |
-| | `wires invite <node-id> [--name l] [--ttl 30d]` | Add a node to the state, mint its membership, print its join token (stdout), push the new state. |
-| | `wires remove <name\|node-id> [--ttl 30d]` | Drop a node (and from every service's hosts); push hosts first. Its next call is refused. |
-| | `wires role set <name> <matcher>…` · `role rm <name>` | Define a role as an OR of matchers: `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…` (all must hold). |
-| | `wires service add\|set <name> [--description D] [--allow role]… [--host member]… [--reader role]…` · `service rm <name>` | Edit the registry. `--host` is an `invite --name` label or a node id; `set` replaces each list given. |
-| **host** | `wires serve host.json` | Refuse to start unless the state assigns every service in the file here; then check every caller against the state, exec the service per call, and log every call, refusal and push. `--check` validates and prints what the file implements. |
-| | `wires push --to <node-id\|role> --subject S [--ttl D] -- <body>` | Hand a message for a caller to this machine's running `serve` (body from stdin if none is given). Prints `delivered`, `queued` or `denied` per recipient; exits `77` if every recipient was refused. |
-| **caller** | `wires id` | Print this node's id (creating its key on first use). |
-| | `wires join <token>` | Install an invite: the membership and the signed state. |
-| | `wires login` | Sign in with your IdP (Google by default; `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*`) and store the key-bound ID token. |
-| | `wires services [--verbose] [--json]` | List the services you may call and the role that admits you, evaluated locally. `--verbose` adds their hosts. |
-| | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name (or a `tools.json` alias). Stdio passes through and its exit code becomes `call`'s. A refusal exits `77`. |
-| | `wires mcp` | Serve the same services as MCP tools over stdio, for clients that can't run a CLI. |
-| | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`. |
-| **reader** | `wires watch [service…] [--mine] [--once] [--json]` | Stream call records from your services' hosts, verified: all records of services whose `readers` role you're in, otherwise your own. |
+| **What the agent calls** | A tool: JSON-RPC `tools/call` with a JSON Schema input; the result is content blocks or structured JSON. The protocol defines no client-side field selection, so trimming is up to each server's design. | A CLI: arguments in, stdout and exit code out. The agent trims with the CLI's own flags, or `wires call --jq/--head/--max-bytes`, before output reaches its context. |
+| **Who's calling** | Optional OAuth 2.1: each server is a resource server and validates its own tokens. Enterprise IdP policy is an opt-in extension ([Enterprise-Managed Authorization](https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization)). | The caller's OIDC ID token, bound to its key and checked by every host against the IdP's published keys. One admin-signed registry says which roles may call which service. |
+| **Finding tools** | A configured URL or command per server; `tools/list` may vary with the caller's authorization. The public [MCP Registry](https://modelcontextprotocol.io/registry/about) (preview) lists public servers, not per user. | `wires services`: every service, across all hosts, that the signed registry lets this identity call. |
+| **Server → agent** | Over a stream the client opened and holds: a request's response, or `subscriptions/listen` (task status arrives there as `notifications/tasks`; polling `tasks/get` is the default). Reaching a client that isn't connected is [working-group](https://modelcontextprotocol.io/community/triggers-events/charter) work, not in the spec. | The host dials the agent's key, or keeps the message (24 h by default) for its next `wires inbox`, so it works after the call has ended. `wires inbox --wait` blocks until one lands. |
+| **Network** | stdio (a local subprocess) or Streamable HTTP (the server listens at a URL the client can reach). | Both sides dial out, by key, over QUIC (iroh), directly or through a relay. No TCP listener and no inbound firewall rule on either side. |
+| **Record of calls** | No audit format; clients SHOULD log tool usage, and trace context can be propagated to OpenTelemetry. | The host signs a hash-linked record of every call and refusal; the registry's readers stream it with `wires watch`. |
 
-For an MCP-only client, the whole config is:
+## Measured
 
-```json
-{ "mcpServers": { "wires": { "command": "wires", "args": ["mcp"] } } }
-```
+GitHub tasks, 5 tasks × 5 runs each, every answer correct in every setup
+([bench/REPORT.md](bench/REPORT.md)):
 
-## host.json
-
-| Key | Meaning |
-|---|---|
-| `version` | Required, `2`. Unknown keys anywhere are an **error**. Version 1 (tools and roles decided by the host) is refused. |
-| `identity.issuers` | The IdPs whose ID tokens the host verifies, each with the OAuth client ids (`audiences`) it accepts **from that issuer**. |
-| `services` | Name → `command` (argv, no shell; each call's arguments are appended), optional `cwd`, optional `env` (no `WIRES_*` names), and `also_require`: roles from the state the caller must **also** be in (only narrows). Every name must be assigned to this host by the state. |
-| `push` | Optional. `allow`: the roles (from the state) whose members may receive `wires push` from this host (none by default). `log_body`: also log each push's body (default `false`: subject only). |
-| `audit.otlp` | Optional. An OTLP/HTTP collector the call log is also exported to. |
-
-Who may call a service is not in this file: it is the registry's `allow`. A
-refusal names the rule that failed (`… is in no role allowed to call
-orders-db (analyst)`, `service orders-db is not assigned to this host …`,
-`not a member of the current signed state (version 11)`).
-
-A host that admits a call passes the verified caller to the service as
-environment: `WIRES_CALLER_NODE`, `WIRES_CALLER_EMAIL` (when verified),
-`WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_AFTER`, `WIRES_STATE_VERSION`,
-`WIRES_SERVICE`, `WIRES_TOOL`, `WIRES_ROLE`, and `WIRES_HOME` (the host's, so
-a service can `wires push`). These are set by the host, never taken from the
-caller, and any inherited `WIRES_*` is scrubbed first.
-
-## The keystore
-
-Each node's state is a directory: `$WIRES_HOME`, else
-`$XDG_CONFIG_HOME/wires`, else `~/.config/wires`. Keep it short on macOS,
-since a host's control socket lives under it and socket paths are limited to
-104 bytes.
-
-| File | Written by | Holds |
+| How the agent reached GitHub | Median input tokens | Cost, 25 runs |
 |---|---|---|
-| `node.seed` | `id`, `init` | This node's secret key (0600). Its public half is the node id. |
-| `root.seed`, `names.json` | `init`, `invite`, `remove` | The admin's root key and member labels (0600). Admin machine only. |
-| `membership.json` | `init`, `join` | This node's root-signed membership. |
-| `state.json`, `state-admin.txt`, `state-checked.txt` | `join`, pushes, pulls, admin commands | The newest verified signed state, where to pull it from, and when it was last checked. |
-| `idp-token.jwt` | `login` | The caller's ID token (0600). |
-| `last-good.json` | `call` | Which host last answered each service. |
-| `hints` | you | Optional local dial hints (below). |
-| `tools.json` | `tools add`, the operator | Locked mode; optional aliases. |
-| `inbox/` | `inbox` | Pushed messages: `new/` unread (at most 256, oldest evicted with a note), `read/` the last 1024 (0700). |
-| `record-marks.json` | `watch` | The last verified record per host. |
-| `call-log.jsonl`, `push-queue.json`, `run/` | `serve` | A host's call log, undelivered pushes, control socket and own hint line. |
+| GitHub's MCP server | 21,088 | $1.87 |
+| `wires call gh`, the agent allowed only `wires` | 10,713 | $0.39 |
 
-Secrets resolve **flag → environment variable → `--…-file` → keystore**, so
-a container can mount its node key from a secret with `--node-seed-file`.
+The saving is output size, not tool schemas: GitHub's MCP server returned whole API objects,
+the CLI filtered first. One model, one MCP server, small n, stripped-down
+sessions; an MCP server with field selection would close much of the gap.
 
-## Revocation
+Waiting on a mock CI build, 5 runs per setup ([bench/push/REPORT.md](bench/push/REPORT.md)):
 
-`serve` re-reads its signed state once per connection, so a removal takes
-effect on the next call, with no restart. A refused call prints `wires:
-denied by responder: <reason>` on stderr, writes nothing to stdout, exits
-`77`, and is in the host's log. There is no shared key, so there is nothing
-to rotate. The protocol as built: [docs/protocol.md](docs/protocol.md).
+| How the agent waited | Turns | Input tokens (median) | Reaction |
+|---|---|---|---|
+| Polling | 9 → 13 | about 28k → 39k | 20–178 s |
+| `wires inbox --wait` | 4 | 15.4k, flat | about 2 s |
 
-## Reachability
+## Limits
 
-By default a node is found by id through iroh's n0 discovery and relays,
-which needs outbound internet. For a network without discovery, put hint
-lines in `$WIRES_HOME/hints` (`<node id> <ip:port>…`, one per node; a
-running `serve` writes its own to `run/hint`). To avoid n0's relays, run
-upstream [`iroh-relay`](https://docs.rs/iroh-relay) yourself and pass
-`--relay-url <its url>` ([docs/deployment.md](docs/deployment.md)). Addresses
-are unsigned hints: iroh still authenticates the peer's key, so a wrong
-address can only fail to connect.
+- Reaching a host through NAT can use a public relay (n0's by default, or
+  your own); traffic through it is end-to-end encrypted.
+- Identity is OIDC ID tokens. Only Google has been tested.
+- Memberships and the signed state expire (30 days by default) and don't
+  renew on their own yet.
+- A host can withhold or truncate its own log; tampering and gaps are
+  detectable only against a copy a reader already holds.
 
-## Layout, build and test
+More in [docs/usage.md § Known trade-offs](docs/usage.md#known-trade-offs).
 
-Two crates in one Cargo workspace ([CLAUDE.md](CLAUDE.md)):
+## More
 
-- **`library/`**: the transport-free core. `membership/` (identity,
-  membership, the invite), `calls/` (session frames, invocations, call
-  records and the call log, IdP identity, pushes), `services/` (roles, the
-  registry, the signed state, authorization, state sync).
-- **`wires/`**: the binary, filed by role: `admin/`, `host/`, `caller/`,
-  `state/` (the signed state on this node and how it moves), and `e2e/` for
-  the loopback integration tests.
+- [docs/usage.md](docs/usage.md): the roles, where each guarantee lives, a
+  full walkthrough with output, design choices, locking an agent down to
+  `wires`, and the command reference.
+- [docs/protocol.md](docs/protocol.md): the protocol spec.
+- [docs/executive-summary.md](docs/executive-summary.md): the product in two
+  pages.
+- [docs/demo.md](docs/demo.md): the two-machine demo script.
 
 ```bash
-cargo build --workspace
-cargo test --workspace                   # unit, property, e2e and doc tests
-./.scripts/demo-remote-cli.sh --quiet    # the demo, as a test
-docker build -t wires .                  # distroless image, native arch
+cargo build --release -p wires           # target/release/wires
+./.scripts/demo-remote-cli.sh            # the narrated loopback demo (--quiet: assertions only)
 ```
-
-`make help` lists the same as shortcuts. Deployment notes are in
-[docs/deployment.md](docs/deployment.md), tests in
-[docs/testing.md](docs/testing.md), and the benchmark in
-[bench/REPORT.md](bench/REPORT.md).

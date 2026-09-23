@@ -4,7 +4,7 @@ This document describes the protocol as the code implements it today: `library/`
 codecs) and `wires/` (the iroh transport and CLI). If this document and the code disagree, the
 code is correct and this document should be fixed.
 
-Usage, roles and the demo are in [README](../README.md), [the board](board/README.md) and
+Usage, roles and the demo are in [usage.md](usage.md), [the board](board/README.md) and
 [demo.md](demo.md). Deployment and testing are in [deployment.md](deployment.md) and
 [testing.md](testing.md).
 

@@ -26,7 +26,7 @@ rules. Cards move `backlog/ → doing/ → review/ → done/`; only the integrat
 moves a card to `done/`. Every README or narration sentence must pass the
 rebuttal test in `docs/storytelling.md` §1.
 
-Usage lives in `README.md`. Deployment and testing patterns live in
+The pitch lives in `README.md`; usage (roles, walkthrough, reference) in `docs/usage.md`. Deployment and testing patterns live in
 `docs/deployment.md` and `docs/testing.md`. The spec for the code that runs
 (membership, the signed state and its sync, the session handshake and gate,
 push, the call log and record stream, hints) is `docs/protocol.md`. The

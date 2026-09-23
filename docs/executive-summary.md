@@ -6,7 +6,7 @@
 
 AI agents do their work by running tools. Today there are two ways to give an agent a tool that lives somewhere else, and each is missing something:
 
-- **An MCP server.** You expose a service on the network so the agent's machine can reach it, and you bolt authentication onto every server separately. Each server keeps its own log, if it keeps one at all. The protocol is strictly request/response: its 2026-07-28 revision removed server-initiated streams, and long-running work is **polled** (`tasks/get`).
+- **An MCP server.** A remote server listens at a URL the agent's machine can reach. Each server is its own OAuth resource server and validates tokens itself (IdP-centralized policy is an opt-in extension), and the protocol defines no audit record. Since the 2026-07-28 revision MCP is stateless: a server reaches a client only over a stream that client opened and holds, and long-running work is polled (`tasks/get`) or streamed over that listen stream. Reaching a client that isn't connected is working-group work, not in the spec.
 - **A command-line tool.** Models already know CLIs, and CLIs let the agent filter output *before* it reaches context. But a CLI has to be installed next to the agent, together with its credentials, and nothing records who ran what.
 
 Three things organizations are now asking for sit in that gap:
@@ -48,7 +48,7 @@ GitHub tasks, 5 tasks × 5 runs each, all answers correct in every setup:
 | GitHub's MCP server | 21,088 | $1.87 |
 | `wires call gh`, agent limited to `wires` only | 10,713 | $0.39 |
 
-Most of the saving is **not** tool descriptions (Claude Code's tool search already handles those). It's output size: MCP returns whole API objects (48 KB release notes, 52 KB of comments), while a CLI filters first (`--jq`), so the model sees about 256 bytes. With the agent limited to `wires` alone, there were zero permission refusals. **Caveats:** one model, one MCP server, small n, and stripped-down sessions, so real-session percentages will be smaller while the absolute savings carry over. A leaner MCP server would close part of the gap. Details: [bench/REPORT.md](../bench/REPORT.md).
+Most of the saving is **not** tool descriptions (Claude Code's tool search already handles those). It's output size: GitHub's MCP server returned whole API objects (48 KB release notes, 52 KB of comments), while a CLI filters first (`--jq`), so the model sees about 256 bytes. With the agent limited to `wires` alone, there were zero permission refusals. **Caveats:** one model, one MCP server, small n, and stripped-down sessions, so real-session percentages will be smaller while the absolute savings carry over. A leaner MCP server would close part of the gap. Details: [bench/REPORT.md](../bench/REPORT.md).
 
 Waiting on long work (a mock CI build of 60 s or 300 s, 5 runs per setup, all correct):
 
