@@ -46,19 +46,19 @@ use crate::testutil::temp_dir;
 
 /// A one-shot distribution's timing here: wait for the host as long as any
 /// other wait in the suite, and linger just long enough for gossip to flush.
-const TIMING: Timing = Timing {
+pub(super) const TIMING: Timing = Timing {
     wait: PATIENCE,
     linger: std::time::Duration::from_millis(500),
 };
 
 /// One machine: a keystore that is also its `$WIRES_HOME`.
-struct Machine {
-    ks: Arc<Keystore>,
-    home: std::path::PathBuf,
+pub(super) struct Machine {
+    pub(super) ks: Arc<Keystore>,
+    pub(super) home: std::path::PathBuf,
 }
 
 impl Machine {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let home = temp_dir();
         Self {
             ks: Arc::new(Keystore::at(&home)),
@@ -66,17 +66,17 @@ impl Machine {
         }
     }
 
-    fn node(&self) -> NodeIdentity {
+    pub(super) fn node(&self) -> NodeIdentity {
         self.ks.read_node_identity().unwrap().unwrap()
     }
 
-    fn head_version(&self) -> Option<RosterVersion> {
+    pub(super) fn head_version(&self) -> Option<RosterVersion> {
         self.ks.read_roster_head().unwrap().map(|h| h.version)
     }
 
     /// The channel context `wires watch` / `serve --audit-topic` resolve here,
     /// with no flags: everything comes from what `init` / `join` installed.
-    fn context(&self) -> TopicContext {
+    pub(super) fn context(&self) -> TopicContext {
         TopicContext::resolve(
             Arc::clone(&self.ks),
             self.home.clone(),
@@ -87,7 +87,10 @@ impl Machine {
 }
 
 /// A hermetic topic node for `identity` (no relay, no DNS).
-async fn bind_hermetic(identity: &NodeIdentity, cfg: TopicNodeConfig) -> anyhow::Result<TopicNode> {
+pub(super) async fn bind_hermetic(
+    identity: &NodeIdentity,
+    cfg: TopicNodeConfig,
+) -> anyhow::Result<TopicNode> {
     let lookup = MemoryLookup::new();
     let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(secret_key(identity))
@@ -130,6 +133,7 @@ fn resident(m: &Machine, hosted: bool) -> (tokio::task::JoinHandle<()>, oneshot:
                 crate::caller::jwks::KeyFetcher::new(None).unwrap(),
                 crate::channel::idp_view::IdpTrust::from_vars(None, None),
             )),
+            announcer: None,
         }
     });
     let (ready, ready_rx) = oneshot::channel();
@@ -184,12 +188,17 @@ async fn call(m: &Machine, host: &TopicPeer) -> (anyhow::Result<i32>, Vec<u8>) {
     (result, out)
 }
 
-fn ttl() -> Ttl {
+pub(super) fn ttl() -> Ttl {
     Ttl::DEFAULT.parse().unwrap()
 }
 
 /// `wires invite <id> --name <name> [--peer <ticket>]` on the admin.
-async fn invite(admin: &Machine, who: NodeId, name: &str, peer: Option<String>) -> String {
+pub(super) async fn invite(
+    admin: &Machine,
+    who: NodeId,
+    name: &str,
+    peer: Option<String>,
+) -> String {
     let identity = admin.node();
     let report = invite_in(
         &admin.ks,

@@ -484,6 +484,8 @@ pub struct McpArgs {
 pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
     let path = crate::caller::tools::resolve_path(a.creds.tools_file.as_deref())?;
     let config = ToolsConfig::load(&path)?;
+    // Plus every tool the channel's hosts announce to this node (card 15).
+    let config = crate::caller::resolve::with_announced(config, &a.creds).await;
     let creds = Credentials::resolve(&a.creds)?;
     tracing::info!(
         "wires mcp: serving {} tool(s) from {}",

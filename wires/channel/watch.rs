@@ -143,9 +143,15 @@ where
             idp_view::IdpTrust::from_env(),
         )),
     };
+    // A member's watch keeps its channel directory fresh (card 15); a host
+    // needs none.
+    let directory = hosted
+        .is_none()
+        .then(|| Arc::new(crate::caller::resolve::DirectoryHook::new(ctx)));
     let printer = Printer {
         json,
         identities: Some(Arc::clone(&identities)),
+        directory: directory.clone(),
     };
     let mut keyring = Keyring::load(Arc::clone(&ctx.keystore))?;
     let store = Arc::new(open_topic_store(&ctx.home, ctx.topic, STORE_LOCK_WAIT).await?);
@@ -154,6 +160,10 @@ where
     // logged in before it started.
     if hosted.is_some() {
         identities.prime(&store, &mut keyring, now_unix()).await;
+    }
+    // Announcements older than the backfill still name hosts.
+    if let Some(hook) = &directory {
+        hook.prime(&store, &mut keyring);
     }
 
     // 1. What is already known, before anything touches the network. Printed
@@ -174,9 +184,9 @@ where
 
     // 3. The node, then the banner (it needs the bound sockets).
     let mut cfg = ctx.node_config(Arc::clone(&store));
-    let (records, session) = match hosted {
-        Some(h) => (Some(h.records), Some(h.session)),
-        None => (None, None),
+    let (records, session, announcer) = match hosted {
+        Some(h) => (Some(h.records), Some(h.session), h.announcer),
+        None => (None, None, None),
     };
     if let Some(session) = session {
         cfg.protocols.push((transport::ALPN, session.into()));
@@ -193,6 +203,16 @@ where
     let socket = ipc::ControlSocket::bind(&socket_path).await?;
     let (tx, mut requests) = tokio::sync::mpsc::channel(CONTROL_QUEUE);
     let forwarder = records.map(|rx| tokio::spawn(audit::forward(rx, tx.clone())));
+    // A host announces its tools (card 15) through the same queue: this
+    // loop stays the one allocator. Its dial hints are this node's own.
+    let announcing = announcer.map(|a| {
+        let reach = node
+            .ticket(&ctx.name)
+            .ok()
+            .and_then(|t| t.peers.into_iter().next())
+            .unwrap_or_else(|| TopicPeer::new(node.node_id()));
+        tokio::spawn(a.run(tx.clone(), reach))
+    });
     let server = socket.spawn(tx);
 
     // 5. The mesh — which is where a revoked node finds out (exit 77).
@@ -449,6 +469,9 @@ where
     }
     if let Some(forwarder) = forwarder {
         forwarder.abort();
+    }
+    if let Some(announcing) = announcing {
+        announcing.abort();
     }
     node.shutdown().await?;
     Ok(())

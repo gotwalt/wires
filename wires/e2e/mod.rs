@@ -85,6 +85,10 @@ mod idp;
 /// same fixtures.
 mod onboard;
 
+/// Card 15's channel-directory tests: hosts announce, callers resolve by
+/// name, tools are visible only to members allowed to run them.
+mod directory;
+
 /// The outer bound on any single wait here.
 ///
 /// Generous because a QUIC handshake plus a gossip join on a loaded CI machine
@@ -980,6 +984,7 @@ async fn late_joiner_cannot_read_pre_join_history() {
     let printer = Printer {
         json: false,
         identities: None,
+        directory: None,
     };
     assert_eq!(
         new_since(node_c.store(), &BTreeMap::new(), &printer, &mut keyring_c).len(),
@@ -1108,6 +1113,7 @@ async fn tail_catches_up_after_offline() {
     let printer = Printer {
         json: false,
         identities: None,
+        directory: None,
     };
     let mut keyring = b.keyring();
     let printed = new_since(node_b.store(), &before, &printer, &mut keyring);
@@ -1297,6 +1303,7 @@ async fn next_record(
     let line = Printer {
         json: false,
         identities: None,
+        directory: None,
     }
     .render(&envelope, &text);
     assert!(!line.contains("record/v1"), "rendered, not raw: {line}");
@@ -1612,6 +1619,7 @@ fn hosted_responder(
             crate::caller::jwks::KeyFetcher::new(None).unwrap(),
             crate::channel::idp_view::IdpTrust::from_vars(None, None),
         )),
+        announcer: None,
     };
     let ctx = crate::channel::context::TopicContext {
         node: NodeIdentity::from_seed(r_seed),

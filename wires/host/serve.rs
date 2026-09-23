@@ -16,7 +16,7 @@ use clap::Args;
 use library::NodeId;
 
 use super::config::HostConfig;
-use super::{audit, identity, transport};
+use super::{announce, audit, identity, transport};
 use crate::admin::keystore;
 use crate::caller::jwks;
 use crate::channel::context::{TopicArgs, TopicContext};
@@ -134,11 +134,28 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         ))),
         _ => None,
     };
+    let policy: Arc<dyn super::policy::Policy> = Arc::new(host.policy());
+    // The channel directory (card 15): the same policy and identities that
+    // decide each call decide what each member sees announced.
+    let announcer = match (&gate, &identities, &audit_ctx) {
+        (Some(gate), Some(ids), Some(ctx)) => Some(
+            announce::Announcer::new(
+                node.node_id(),
+                Arc::clone(&policy),
+                Arc::clone(gate),
+                Arc::clone(ids),
+                host.descriptions(),
+                announce::heartbeat(),
+            )
+            .watching_keys(Arc::clone(&ctx.keystore)),
+        ),
+        _ => None,
+    };
     let config = transport::ServeConfig {
         tools: host.commands(),
         audit: sink,
         identity: gate,
-        policy: Arc::new(host.policy()),
+        policy,
         trust_root,
         require_grant: false,
         crl,
@@ -153,6 +170,7 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
                 session: transport::SessionProtocol(Arc::new(config)),
                 records,
                 identities: identities.expect("built with the audit context"),
+                announcer,
             };
             run_tail(&ctx, 0, false, Some(hosted)).await
         }

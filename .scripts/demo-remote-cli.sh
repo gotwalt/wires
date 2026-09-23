@@ -23,8 +23,10 @@
 # redirects straight back to the login's loopback callback with a code.
 # Card 08 swaps it for real Google.
 #
-# Asserted: an unverified caller is refused (and the refusal is on the
-# channel); after login, the observer sees a verified identity line and ▶/■
+# Asserted: the agent finds db_query through the workbench's announcement on
+# the channel, visible only once it signs in as an analyst; a signed-in
+# non-analyst sees nothing and is refused by name; an unverified caller is
+# refused (and the refusal is on the channel); after login, the observer sees a verified identity line and ▶/■
 # for each call naming the agent's email and its SQL (args, stdin, and MCP);
 # `.shell id` is refused by sqlite's -safe mode with a nonzero exit on the
 # channel; after the admin removes the agent, the workbench and the observer
@@ -212,9 +214,9 @@ wait_for "$D/wb.err" "share to bootstrap: " 300 || {
 	sed 's/^/  workbench| /' "$D/wb.err" >&2
 	bad "1: the workbench never printed its audit-topic ticket"
 }
-# The one thing the workbench hands out: its audit-topic ticket. The observer
-# bootstraps from it, and the agent's `tools add --topic-ticket` takes the
-# workbench's key and addresses from it -- nothing is decoded by hand.
+# The workbench's ticket goes into the invites, so every joiner bootstraps
+# from it; its tools come over the channel (card 15) -- nothing is decoded
+# or configured by hand.
 TICKET="$(grep -m1 '^share to bootstrap: ' "$D/wb.err" | sed 's/^share to bootstrap: //')"
 [ -n "$TICKET" ] || bad "1: the workbench printed an empty ticket"
 ok "1: workbench is pid $WB_PID, reachable by key ${WB_ID:0:8}... -- one tool, nothing else"
@@ -254,13 +256,24 @@ beat 2
 # ==========================================================================
 step "3  the agent calls before signing in -- refused, and the refusal is public"
 # ==========================================================================
-run "wires tools add db_query --topic-ticket \$TICKET --description '…'"
-WIRES_HOME="$agent" "$WIRES" tools add db_query --topic-ticket "$TICKET" \
-	--description "Read-only SQL (sqlite3) over the workbench's orders.db; pass the SQL statement as the argument." >/dev/null
-grep -q "\"$WB_ID\"" "$agent/tools.json" || {
-	dump "$agent/tools.json"
-	bad "3: tools add --topic-ticket did not target the workbench's key"
+# Nothing is configured by hand: the workbench announces its tools on the
+# channel, each one sealed to the members allowed to run it. Before login the
+# agent is allowed nothing, so it sees that the workbench exists -- and no
+# more.
+run "wires tools"
+WIRES_HOME="$agent" "$WIRES" tools >"$D/t0.out" 2>"$D/t0.err" || {
+	cat "$D/t0.err" >&2
+	bad "3: wires tools failed"
 }
+grep -qF "db_query" "$D/t0.out" && {
+	cat "$D/t0.out" >&2
+	bad "3: db_query is visible to the agent before it signed in"
+}
+grep -qF "announces nothing you may use: ${WB_ID:0:8}" "$D/t0.err" || {
+	cat "$D/t0.err" >&2
+	bad "3: the workbench's announcement never reached the agent"
+}
+show "$D/t0.err"
 run "wires call db_query -- 'select count(*) from orders'"
 set +e
 WIRES_HOME="$agent" "$WIRES" call db_query -- "select count(*) from orders" >"$D/c0.out" 2>"$D/c0.err"
@@ -309,6 +322,72 @@ IDLINE="$(wait_line "$D/obs.out" "🪪 identity $AG8 is $EMAIL (verified by $ISS
 }
 ok "4: the observer checked the IdP's signature itself -- no wires attestor"
 line "$IDLINE"
+# The workbench verified the same claim, found the agent in role analyst, and
+# re-announced with db_query sealed to the agent's key.
+run "wires tools"
+for _ in $(seq 1 10); do
+	WIRES_HOME="$agent" "$WIRES" tools >"$D/t1.out" 2>"$D/t1.err" || true
+	grep -qF "db_query  on ${WB_ID:0:8}" "$D/t1.out" && break
+done
+grep -qF "db_query  on ${WB_ID:0:8}" "$D/t1.out" || {
+	cat "$D/t1.out" "$D/t1.err" >&2
+	bad "4: the signed-in analyst does not see db_query"
+}
+show "$D/t1.out"
+ok "4: signed in as an analyst, the agent now sees db_query -- no tools.json, no ticket"
+beat 3
+
+# ==========================================================================
+step "4b a signed-in NON-analyst sees nothing -- and asking by name is refused"
+# ==========================================================================
+# The observer is a member too. It signs in as bob@other.org (the stand-in
+# IdP takes a login_hint), whom host.json puts in no role.
+OTHER="bob@other.org"
+run "wires login --topic $TOPIC …   # as $OTHER, on the observer"
+WIRES_HOME="$obs" "$WIRES" login --topic "$TOPIC" \
+	--issuer "$ISSUER" --client-id "$CLIENT_ID" --client-secret not-so-secret \
+	--no-browser >"$D/login2.out" 2>"$D/login2.err" &
+LOGIN_PID=$!
+wait_for "$D/login2.err" "sign in at" 100 || bad "4b: login printed no sign-in URL"
+URL="$(grep -m1 -E '^  https?://' "$D/login2.err" | sed 's/^  //')"
+curl -fsSL -o /dev/null "$URL&login_hint=$OTHER" || bad "4b: the sign-in round trip failed"
+wait "$LOGIN_PID" || {
+	sed 's/^/  login| /' "$D/login2.err" >&2
+	bad "4b: wires login failed"
+}
+wait_line "$D/obs.out" "🪪 identity ${OB_ID:0:8} is $OTHER" >/dev/null || {
+	dump "$D/login2.err"
+	bad "4b: $OTHER's claim never reached the channel"
+}
+run "wires tools"
+WIRES_HOME="$obs" "$WIRES" tools >"$D/t2.out" 2>"$D/t2.err" || {
+	cat "$D/t2.err" >&2
+	bad "4b: wires tools failed"
+}
+grep -qF "db_query" "$D/t2.out" && {
+	cat "$D/t2.out" >&2
+	bad "4b: $OTHER can see db_query"
+}
+grep -qF "announces nothing you may use: ${WB_ID:0:8}" "$D/t2.err" || {
+	cat "$D/t2.err" >&2
+	bad "4b: the observer's directory does not know the workbench"
+}
+show "$D/t2.err"
+run "wires call db_query -- 'select 1'"
+set +e
+WIRES_HOME="$obs" "$WIRES" call db_query -- "select 1" >"$D/c9.out" 2>"$D/c9.err"
+rc=$?
+set -e
+[ "$rc" -eq "$EXIT_DENIED" ] || {
+	dump "$D/c9.err"
+	bad "4b: $OTHER's call exited $rc, expected $EXIT_DENIED"
+}
+grep -qF "identity $OTHER" "$D/c9.err" && grep -qF "is in no role allowed to run db_query" "$D/c9.err" || {
+	cat "$D/c9.err" >&2
+	bad "4b: refused, but not for the role"
+}
+show "$D/c9.err"
+ok "4b: $OTHER sees no db_query, and naming it anyway gets exit $EXIT_DENIED with the reason"
 beat 3
 
 # ==========================================================================

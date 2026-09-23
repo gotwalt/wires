@@ -29,6 +29,9 @@ pub(crate) struct Keyring {
     pub(crate) keys: BTreeMap<RosterVersion, FabricKey>,
     /// Versions already complained about.
     pub(crate) warned: BTreeSet<RosterVersion>,
+    /// Never complain: a reader that is not a watch (the directory refresh
+    /// of `wires call`, card 15) expects to lack pre-join keys.
+    pub(crate) quiet: bool,
 }
 
 impl Keyring {
@@ -39,6 +42,7 @@ impl Keyring {
             keystore,
             keys,
             warned: BTreeSet::new(),
+            quiet: false,
         })
     }
 
@@ -66,7 +70,7 @@ impl Keyring {
                 }
             },
             None => {
-                if self.warned.insert(version) {
+                if !self.quiet && self.warned.insert(version) {
                     eprintln!(
                         "wires watch: no key for roster version {} — those messages are stored but \
                          not shown; run `wires advanced import --fabric-key-file <node-id>.key` for that \
@@ -91,6 +95,9 @@ pub(crate) struct Printer {
     /// Verifies and indexes identity claims (human output only); `None`
     /// prints them as not checked.
     pub(crate) identities: Option<Arc<identity::Identities>>,
+    /// Folds host announcements into this node's directory cache (a
+    /// resident `wires watch`; card 15). `None`: not kept.
+    pub(crate) directory: Option<Arc<crate::caller::resolve::DirectoryHook>>,
 }
 
 /// One `--json` output record: the machine-readable form of a message line.
@@ -126,7 +133,11 @@ impl Printer {
             return;
         };
         let text = String::from_utf8_lossy(&plaintext);
-        let verdict = match (&self.identities, library::ChannelRecord::parse(&text)) {
+        let record = library::ChannelRecord::parse(&text);
+        if let (Some(hook), Some(library::ChannelRecord::Host(ann))) = (&self.directory, &record) {
+            hook.observe(envelope.sender, ann);
+        }
+        let verdict = match (&self.identities, record) {
             (Some(ids), Some(library::ChannelRecord::Identity(claim))) if !self.json => {
                 Some(ids.observe(envelope.sender, &claim, now_unix()).await)
             }
@@ -235,6 +246,7 @@ mod tests {
         let printer = Printer {
             json: false,
             identities: None,
+            directory: None,
         };
         assert_eq!(
             printer.render(&envelope, "ship it"),
@@ -267,6 +279,7 @@ mod tests {
         let line = Printer {
             json: true,
             identities: None,
+            directory: None,
         }
         .render(&envelope, "ship it");
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -310,6 +323,7 @@ mod tests {
             Printer {
                 json: false,
                 identities: None,
+                directory: None,
             }
             .render(&envelope, &text),
             format!(
@@ -320,6 +334,7 @@ mod tests {
         let line = Printer {
             json: true,
             identities: None,
+            directory: None,
         }
         .render(&envelope, &text);
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
