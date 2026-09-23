@@ -47,8 +47,33 @@ Settle it with numbers a skeptic on the MCP team would accept.
 
 ## Acceptance
 
-- [ ] All arms × tasks × 5 runs completed (or budget stop documented).
-- [ ] REPORT.md with the tables, the exact model/CLI versions and settings, and reproduction steps.
-- [ ] No secrets in the repo (`git grep -i ghp_` / `gho_` is empty).
+- [x] All arms × tasks × 5 runs completed (or budget stop documented).
+- [x] REPORT.md with the tables, the exact model/CLI versions and settings, and reproduction steps.
+- [x] No secrets in the repo (`git grep -i ghp_` / `gho_` is empty).
 
 ## Notes
+
+- **Result (n=5, 100 runs, $4.18, all correct):** median total input / Σ cost over 25 runs:
+  MCP default (tool search on) 21,088 / $1.87 · MCP tool search off 30,630 / $1.40 ·
+  `wires call gh` 10,539 / $0.48 · bare `gh` 6,997 / $0.42. Full tables in `bench/REPORT.md`.
+- **The gap comes from response size, not schemas.** Tool search is the default in Claude Code
+  2.1.280 (`ENABLE_TOOL_SEARCH` unset resolves to always-on), and it cuts the 26-tool / 68 KB
+  surface to ~400 tokens of context. The MCP server returns whole objects (a 48 KB release body,
+  52 KB of comments); with `gh --json/--jq` the model gets back ~256 bytes. The pitch line
+  "more efficient than MCP tool schemas" should become "the agent filters output before it hits
+  context"; the schema-bloat argument doesn't survive tool search. A skeptic will say (rightly)
+  that a leaner MCP server would close much of this.
+- **Tool search setting:** the card asked for "default vs forced on", but the default already
+  *is* on, so the second arm is forced **off** (`ENABLE_TOOL_SEARCH=false`). Values are
+  `true`/unset = on, `false` = off, `auto`/`auto:N` = threshold.
+- **Pitfall:** `claude -p --tools ""` removes `ToolSearch`, and Claude Code then silently loads
+  every MCP schema eagerly. My first smoke run hit this (both MCP arms identical). The bench
+  passes `--tools=ToolSearch` / `--tools=Bash,ToolSearch`.
+- wires over bare gh: +28 tokens of first-turn context. The median +3.5k input is model behavior
+  (re-checking `isLatest`, cross-check calls), not protocol.
+- CLI arms had 15 permission refusals (graphql `{…}` quoting, `for` loops) under the prefix
+  allowlists, and MCP had 0, so the CLI numbers are slightly pessimistic. The CLI arms weren't
+  held to read-only (the gh token can write). The tasks were read-only, and nothing was written.
+- Raw stream-json transcripts are **not** committed (they hold whatever the model printed). Only
+  the per-run summaries in `bench/results/2026-09-23.jsonl` are. `shellcheck` isn't on this
+  worktree's PATH, so the bench scripts aren't shellchecked. There are no Bazel targets in `bench/`.
