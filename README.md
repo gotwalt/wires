@@ -13,15 +13,15 @@
 > with a local stand-in IdP. The two-machine run with real Google sign-in is
 > [card 08](docs/board/README.md#lanes).
 
-1. **workbench** exposes one read-only SQL CLI and puts every call on the
-   `ops` channel:
-   `wires serve --expose 'db_query=sqlite3 -safe -readonly orders.db' --audit-topic ops --require-idp 'email=*@example.com' …`
+1. **workbench** exposes one read-only SQL CLI to the `analyst` role
+   (`*@example.com`, verified by the IdP) and puts every call on the `ops`
+   channel: `wires serve host.json` (see [host.json](#hostjson-what-runs-and-who-may-run-it)).
 2. **laptop**: Claude Code runs `wires call db_query -- "select count(*) from orders"`
    from its shell, or reaches the same tool through `wires mcp` in its MCP config.
 3. **observer** holds no grant for the tool and no credential of either end;
    `wires watch ops` shows each call as it happens:
    ```
-   ▶ 3fa2 alice@example.com (a1b2…) db_query "select count(*) from orders"
+   ▶ 3fa2 alice@example.com (a1b2…) [analyst] db_query "select count(*) from orders"
    ■ 3fa2 exit 0 · 41 ms · 3.1 KiB out · blake3 9c1e…
    ```
 4. **revoke**: one `wires advanced roster commit` without the agent. Its next call
@@ -71,21 +71,39 @@ wires advanced import --membership-file ./laptop.pass \
                       --fabric-key-file "./proofs/$LAPTOP_ID.key"
 ```
 
-**3. workbench: expose the CLI and log every call.** `--expose` takes
-`name=command`; the command is split on whitespace and exec'd directly, never
-through a shell, with the caller's arguments appended. sqlite3's `-safe` flag
-disables its `.shell`/`.system` dot-commands — use it.
+**3. workbench: expose the CLI and log every call.** Everything the host
+decides lives in one file, `host.json`: the tools, the channel, the IdPs it
+trusts, and which roles may run which tool. A command is an argv, exec'd
+directly and never through a shell, with the caller's arguments appended.
+sqlite3's `-safe` flag disables its `.shell`/`.system` dot-commands, so use
+it.
+
+```json
+{
+  "version": 1,
+  "channel": "ops",
+  "identity": { "issuers": [
+    { "issuer": "https://accounts.google.com", "audiences": ["<client id>.apps.googleusercontent.com"] }
+  ] },
+  "roles": { "analyst": [ { "email": "*@example.com" } ] },
+  "tools": {
+    "db_query": {
+      "description": "Read-only SQL against the orders database",
+      "command": ["sqlite3", "-safe", "-readonly", "/data/orders.db"],
+      "allow": ["analyst"]
+    }
+  }
+}
+```
 
 ```bash
-wires serve --trust-root "$ROOT_ID" --allow-any-member \
-  --expose 'db_query=sqlite3 -safe -readonly /data/orders.db' \
-  --audit-topic ops \
-  --require-idp 'iss=https://accounts.google.com,email=*@example.com'
+wires serve --check host.json   # validate; print who may run what, and which IdPs are trusted
+wires serve host.json
 ```
 
 **4. laptop: log in once, then call.** `wires login` runs your IdP's browser
-flow and publishes the resulting claim on `ops`; the responder admits the call
-once that claim verifies against `--require-idp`.
+flow and publishes the resulting claim on `ops`. The host admits the call once
+that claim verifies and matches a role in the tool's `allow`.
 
 ```bash
 wires login --topic ops
@@ -149,8 +167,9 @@ replaces it with a recording of the remote-CLI demo.
 The audit channel is a **topic**: an end-to-end-encrypted log shared by the
 members of a roster, with no server in the middle. `wires watch` is a resident
 node (log, gossip mesh, admission, history replay) and `wires advanced publish`
-puts a message on it by hand. A host with `--audit-topic` is simply a member
-that publishes call records; an observer is any member running `watch`.
+puts a message on it by hand. A host with a `channel` in its `host.json` is
+simply a member that publishes call records; an observer is any member running
+`watch`.
 
 ```bash
 wires watch ops                                                # → share to bootstrap: <ticket>
@@ -238,7 +257,7 @@ manual recipes see [docs/testing.md](docs/testing.md). Every script in
 | Role         | Command          | What it does |
 | ------------ | ---------------- | ------------ |
 | **admin**    | `wires advanced` | The plumbing below. (`init` / `invite` / `remove` land with [card 14](docs/board/README.md#lanes).) |
-| **host**     | `wires serve`    | Expose CLIs as named tools (`--expose name=cmd`), verify every caller's membership, roster inclusion, tool grant (unless `--allow-any-member`) and IdP identity (`--require-idp`), exec the tool per call, and with `--audit-topic` publish a record of every call and refusal |
+| **host**     | `wires serve`    | `wires serve host.json`: expose the file's tools, verify every caller's membership and roster inclusion, admit it only if a role in the tool's `allow` matches (IdP identity or the built-in `member`), exec the tool per call, and publish a record of every call and refusal on the file's `channel`. `--check` validates the file and prints a summary |
 | **caller**   | `wires login`    | Sign in with your IdP; the ID token is bound to this node's key and, with `--topic`, published on the channel |
 |              | `wires call`     | Run a remote CLI from `tools.json`: stdio passes through, its exit code becomes `call`'s, a refusal exits `77` |
 |              | `wires tools`    | Edit `tools.json`, the local map of remote CLIs (`add` / `list` / `rm`) |
@@ -259,6 +278,41 @@ manual recipes see [docs/testing.md](docs/testing.md). Every script in
 
 (`wires advanced tail` is kept, hidden, as the old name of `wires watch`.)
 
+### host.json: what runs and who may run it
+
+`wires serve host.json` is the host's only form. The file:
+
+| Key | Meaning |
+| --- | ------- |
+| `version` | Required, `1`. Unknown keys anywhere are an **error**, so an older host never silently misreads a newer file. |
+| `channel` | The topic every call, refusal and exit is recorded on, and where callers' `wires login` claims are read. The host must be a provisioned member of it. It can be left out only when every tool allows nothing but `member`. |
+| `identity.issuers` | The IdPs whose ID tokens the host verifies, each with the OAuth client ids (`audiences`) it accepts **from that issuer**. |
+| `roles` | Name → a list of matchers, any of which may match (OR). A matcher's keys must all match (AND): `issuer` (exact), `email` (exact or `*@domain`), `org` (Google's `hd`), `group`. |
+| `tools` | Name → `command` (argv), optional `description`, and `allow`: the roles that may run it, tried in order. |
+
+Nothing is allowed by default. A tool with an empty `allow` refuses every call.
+The built-in role `member` admits any roster member with no IdP requirement,
+and it never applies unless a tool's `allow` lists it. An admitted call's
+record names the role (`▶ 3fa2 alice@example.com (a1b2…) [analyst] db_query …`).
+A refusal names the rule that failed:
+
+```
+✗ a1b2… db_query denied: identity bob@other.org (from https://accounts.google.com) is in no role allowed to run db_query: analyst (email=*@example.com)
+✗ c3d4… db_query denied: no identity claim for c3d4e5f6; run `wires login --topic ops`; db_query needs a verified identity in role analyst (email=*@example.com)
+```
+
+The role table is one implementation of the host's `Policy` trait
+(`wires/host/policy.rs`), which gets the whole call: the verified principal
+with every claim the IdP signed, the caller's node, the roster version, the
+tool and its arguments. An organization that needs rules a table can't express
+(CEL or Rego over the claims, or a webhook to its own authorizer) would add a
+second implementation behind a `"policy"` block in `host.json`. That block
+doesn't exist yet; the table is v1.
+
+The flags that remain are where the host's own credentials come from
+(`--node-seed…`, `--membership…`, `--roster-head…`, `--crl…`), `--peer` to
+bootstrap the channel, and `--relay-url`.
+
 ### Two keys
 
 There are two Ed25519 keys with different jobs:
@@ -266,8 +320,8 @@ There are two Ed25519 keys with different jobs:
 - **Node key** — a node's iroh transport identity. Its public half *is* the
   node id callers reach. Every participant (host, caller, observer) has one.
 - **Root key** — the admin's trust root that signs memberships, grants and
-  roster heads. Its public node id is what a host is told to `--trust-root`.
-  It never touches iroh.
+  roster heads. A host trusts the root that signed its own membership. It
+  never touches iroh.
 
 `advanced keygen` emits both as `<label> <hex>` lines:
 
@@ -298,7 +352,7 @@ as `$WIRES_HOME`, else `$XDG_CONFIG_HOME/wires`, else `~/.config/wires`:
 | `roster.json`          | `advanced roster add` / `commit`   | the root's full member set (`0600`, private) |
 | `roster-head.json`     | `advanced roster commit` / `import` | `serve` and `watch` (the signed head they enforce) |
 | `inclusion-proof.json` | `advanced import`                  | `call`, `watch`, `serve` (this node's own proof) |
-| `keyring/<v>.key`      | `advanced import --fabric-key…`    | `watch`, `serve --audit-topic` (the channel's data keys) |
+| `keyring/<v>.key`      | `advanced import --fabric-key…`    | `watch`, `serve` with a `channel` (the channel's data keys) |
 
 Every secret/CRL input resolves in the same order: **inline flag → environment
 variable → `--…-file <path>` → keystore**. So with the keystore populated,
@@ -308,8 +362,8 @@ point at it with `--node-seed-file /etc/wires/node.seed`.
 ### Membership, the roster, and revocation
 
 A **membership** answers *"is this node one of mine, and which one?"*: it is
-root-signed, non-transferable, and verified offline against the host's
-`--trust-root` on every call. A host that admits a caller injects the verified
+root-signed, non-transferable, and verified offline on every call against the
+root that signed the host's own membership. A host that admits a caller injects the verified
 identity into the tool's environment — `WIRES_CALLER_NODE`,
 `WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_AFTER`, `WIRES_ROSTER_VERSION` and
 `WIRES_TOOL` — server-derived, never a caller claim, with any inherited
@@ -327,8 +381,8 @@ read what is published after it. Spec:
 **Revocation takes effect on the next call, with no host restart.** `serve`
 re-reads `crl.json` and `roster-head.json` once per connection. A refused call
 prints `wires: denied by responder: <reason>` on the caller's stderr, writes
-zero bytes to stdout, exits **77**, and — with `--audit-topic` — the refusal is
-on the channel. Once a host has seen a head, deleting its `roster-head.json`
+zero bytes to stdout, exits **77**, and (when the host has a `channel`) the
+refusal is on the channel. Once a host has seen a head, deleting its `roster-head.json`
 fails closed. `.scripts/demo-remote-cli.sh` asserts the roster path end to end.
 
 ### Reachability: relays and direct addresses
