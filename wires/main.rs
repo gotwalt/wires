@@ -15,8 +15,11 @@
 //! the credentials, `1` for any local or transport failure.
 
 mod admission;
+mod idp_view;
 mod ipc;
+mod jwks;
 mod keystore;
+mod login;
 mod replay;
 mod store;
 mod tools;
@@ -33,6 +36,10 @@ mod transport;
 /// binary entirely instead of compiling to an empty module.
 #[cfg(test)]
 mod e2e;
+
+/// A hermetic OIDC issuer for the `wires login` tests (card 04).
+#[cfg(test)]
+mod mock_idp;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -83,6 +90,9 @@ enum Command {
     /// Join a topic and stream it: the resident node (store, mesh, admission,
     /// replay, control socket).
     Tail(TailArgs),
+    /// Sign in with your IdP (OIDC), binding this node's key to your identity;
+    /// with `--topic`, publish the claim for every reader to verify.
+    Login(login::LoginArgs),
 }
 
 /// `keygen` arguments: optional seeds to re-derive, and whether to persist.
@@ -753,6 +763,11 @@ fn main() {
                 exit_with(e);
             }
         }
+        Command::Login(a) => {
+            if let Err(e) = runtime().block_on(login::login_cmd(a)) {
+                exit_with(e);
+            }
+        }
     }
 }
 
@@ -797,7 +812,8 @@ fn cli_admin(command: Command) -> Result<String, String> {
         Command::Serve(_)
         | Command::Connect(_)
         | Command::Publish(_)
-        | Command::Tail(_) => {
+        | Command::Tail(_)
+        | Command::Login(_) => {
             unreachable!("handled in main")
         }
     }

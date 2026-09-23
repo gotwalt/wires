@@ -67,6 +67,11 @@ use crate::topics::{TopicEvent, TopicNode, TopicNodeConfig, TopicSender};
 use crate::transport::{Denied, HeadSource, secret_key};
 use crate::{Keyring, Printer};
 
+/// Card 04's login → publish → independent-verification test: a child module
+/// so it shares these fixtures without widening their visibility.
+#[path = "e2e_idp.rs"]
+mod idp;
+
 /// The outer bound on any single wait here.
 ///
 /// Generous because a QUIC handshake plus a gossip join on a loaded CI machine

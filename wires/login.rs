@@ -1,0 +1,1030 @@
+//! `wires login`: bind this node's key to the user's IdP identity (card 04).
+//!
+//! An ordinary OIDC authorization-code flow with PKCE and a loopback redirect
+//! (`http://127.0.0.1:<port>/callback`, RFC 8252 §7.3), with one twist: the
+//! request's `nonce` is [`OidcNonce::for_node`] of this node's key. The IdP
+//! signs an ID token carrying that nonce, so the token alone proves "the
+//! holder of node key *K* signed in as *alice@corp*" — to anyone who checks
+//! the IdP's signature, with no wires-run attestor in the loop.
+//!
+//! Then:
+//!
+//! 1. the token is verified locally (same [`KeyFetcher::verify`] every reader
+//!    uses), so a misconfigured client fails here and not on the observer;
+//! 2. it is stored in the keystore as [`ID_TOKEN_FILE`] (`0600`), plus
+//!    [`REFRESH_TOKEN_FILE`] when the IdP granted one;
+//! 3. with `--topic`, `ChannelRecord::Identity` is published — through the
+//!    resident tail's control socket if one is running, else one-shot, exactly
+//!    as `wires publish` does.
+//!
+//! Configuration (flag, else environment): `--client-id` /
+//! `WIRES_OIDC_CLIENT_ID` (required), `--client-secret` /
+//! `WIRES_OIDC_CLIENT_SECRET` (Google "Desktop app" clients have a
+//! non-confidential one), `--issuer` / `WIRES_OIDC_ISSUER` (default
+//! `https://accounts.google.com`).
+//!
+//! The small HTTP/1.1 reader/writer here ([`read_request`],
+//! [`write_response`]) serves only the loopback redirect (and the test
+//! suite's mock issuer); it is not a general server.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
+use clap::Args;
+use library::{
+    Audience, ChannelRecord, IdToken, IdentityClaim, Issuer, NodeId, OidcNonce, Principal,
+};
+use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use url::Url;
+
+use crate::idp_view::DEFAULT_ISSUER;
+use crate::jwks::{Discovery, KeyFetcher};
+use crate::{TopicArgs, TopicContext, ipc, keystore};
+
+/// The raw ID token, in the keystore (mode `0600`).
+pub(crate) const ID_TOKEN_FILE: &str = "idp-token.jwt";
+/// The IdP refresh token, when one was granted (mode `0600`).
+pub(crate) const REFRESH_TOKEN_FILE: &str = "idp-refresh-token";
+/// How long the loopback listener waits for the browser to come back.
+pub(crate) const CALLBACK_WAIT: Duration = Duration::from_secs(300);
+/// The scopes requested: an ID token with the email claim, nothing more.
+pub(crate) const SCOPES: &str = "openid email";
+/// Largest HTTP request head + body the loopback server reads.
+const MAX_REQUEST: usize = 64 * 1024;
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+/// `login` arguments.
+#[derive(Args, Debug, Default)]
+pub(crate) struct LoginArgs {
+    /// Publish the identity claim on this topic (name, as for `wires publish`).
+    #[arg(long)]
+    pub topic: Option<String>,
+    /// A base64 topic ticket to bootstrap from (with `--topic`). Repeatable.
+    #[arg(long = "peer")]
+    pub peer: Vec<String>,
+    /// Use a self-hosted relay at this URL (with `--topic`).
+    #[arg(long)]
+    pub relay_url: Option<String>,
+    /// Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`,
+    /// then `--node-seed-file`, then the keystore (`node.seed`).
+    #[arg(long)]
+    pub node_seed: Option<String>,
+    /// Read the node key seed (hex) from this file.
+    #[arg(long)]
+    pub node_seed_file: Option<std::path::PathBuf>,
+    /// OIDC issuer. Falls back to `$WIRES_OIDC_ISSUER`, then Google.
+    #[arg(long)]
+    pub issuer: Option<String>,
+    /// OAuth client id. Falls back to `$WIRES_OIDC_CLIENT_ID`.
+    #[arg(long)]
+    pub client_id: Option<String>,
+    /// OAuth client secret (non-confidential for Desktop-app clients). Falls
+    /// back to `$WIRES_OIDC_CLIENT_SECRET`.
+    #[arg(long)]
+    pub client_secret: Option<String>,
+    /// Use the stored refresh token instead of the browser when possible;
+    /// falls back to the browser flow if the refreshed token is not bound to
+    /// this node (Google omits `nonce` on refresh).
+    #[arg(long, conflicts_with = "reuse")]
+    pub refresh: bool,
+    /// Re-publish the stored ID token (if it still verifies) without signing in.
+    #[arg(long)]
+    pub reuse: bool,
+    /// Print the sign-in URL but do not try to open a browser.
+    #[arg(long)]
+    pub no_browser: bool,
+    /// Fixed loopback port for the redirect (default: any free port) — for
+    /// `ssh -L <port>:127.0.0.1:<port>` when the browser is on another machine.
+    #[arg(long, default_value_t = 0)]
+    pub callback_port: u16,
+}
+
+/// An OAuth client registered with one issuer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OidcClient {
+    /// The issuer the client is registered with.
+    pub issuer: Issuer,
+    /// The client id (also the token's expected `aud`).
+    pub client_id: String,
+    /// The client secret, when the IdP issues one (sent on token requests).
+    pub client_secret: Option<String>,
+}
+
+impl OidcClient {
+    /// Resolve from flags, else the `WIRES_OIDC_*` environment.
+    fn resolve(a: &LoginArgs) -> Result<Self> {
+        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let client_id = a
+            .client_id
+            .clone()
+            .or_else(|| env("WIRES_OIDC_CLIENT_ID"))
+            .ok_or_else(|| {
+                anyhow!(
+                    "no OAuth client id: pass --client-id or set $WIRES_OIDC_CLIENT_ID (for \
+                     Google, create a \"Desktop app\" OAuth client in the Cloud Console)"
+                )
+            })?;
+        Ok(Self {
+            issuer: Issuer::new(
+                a.issuer
+                    .clone()
+                    .or_else(|| env("WIRES_OIDC_ISSUER"))
+                    .unwrap_or_else(|| DEFAULT_ISSUER.to_string()),
+            ),
+            client_id,
+            client_secret: a
+                .client_secret
+                .clone()
+                .or_else(|| env("WIRES_OIDC_CLIENT_SECRET")),
+        })
+    }
+
+    /// The single audience a token for this client must carry.
+    fn audience(&self) -> Audience {
+        Audience::new(self.client_id.clone())
+    }
+}
+
+/// A PKCE verifier and its S256 challenge (RFC 7636).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Pkce {
+    /// The secret sent on the token request.
+    pub verifier: String,
+    /// `base64url(sha256(verifier))`, sent on the authorization request.
+    pub challenge: String,
+}
+
+impl Pkce {
+    /// A fresh random verifier (32 bytes → 43 characters).
+    pub(crate) fn generate() -> Result<Self> {
+        Ok(Self::from_verifier(random_token(32)?))
+    }
+
+    /// The challenge for a given verifier.
+    pub(crate) fn from_verifier(verifier: String) -> Self {
+        let challenge = B64.encode(ring::digest::digest(
+            &ring::digest::SHA256,
+            verifier.as_bytes(),
+        ));
+        Self {
+            verifier,
+            challenge,
+        }
+    }
+}
+
+/// `n` random bytes, base64url.
+fn random_token(n: usize) -> Result<String> {
+    use ring::rand::SecureRandom as _;
+    let mut buf = vec![0u8; n];
+    ring::rand::SystemRandom::new()
+        .fill(&mut buf)
+        .map_err(|_| anyhow!("the system RNG failed"))?;
+    Ok(B64.encode(buf))
+}
+
+/// A completed login: the verified claim and what the IdP handed back.
+#[derive(Clone, Debug)]
+pub(crate) struct Login {
+    /// The claim to publish.
+    pub claim: IdentityClaim,
+    /// Who the IdP says this node's holder is (verified locally).
+    pub principal: Principal,
+    /// The refresh token, when the IdP granted one.
+    pub refresh_token: Option<String>,
+}
+
+/// The token endpoint's JSON reply (success or error form).
+#[derive(Deserialize)]
+struct TokenReply {
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+/// The authorization URL the browser is sent to.
+pub(crate) fn authorization_url(
+    doc: &Discovery,
+    client: &OidcClient,
+    redirect: &Url,
+    state: &str,
+    nonce: &OidcNonce,
+    pkce: &Pkce,
+) -> Url {
+    let mut url = doc.authorization_endpoint.clone();
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &client.client_id)
+        .append_pair("redirect_uri", redirect.as_str())
+        .append_pair("scope", SCOPES)
+        .append_pair("state", state)
+        .append_pair("nonce", nonce.as_str())
+        .append_pair("code_challenge", &pkce.challenge)
+        .append_pair("code_challenge_method", "S256");
+    url
+}
+
+/// Run the whole browser flow for `node` and verify the result.
+///
+/// `open` is handed the authorization URL — production opens a browser; the
+/// tests drive the mock issuer with an HTTP client instead. `wait` bounds how
+/// long the loopback listener waits for the redirect.
+pub(crate) async fn run_flow(
+    fetcher: &KeyFetcher,
+    client: &OidcClient,
+    node: NodeId,
+    port: u16,
+    open: impl FnOnce(&Url),
+    wait: Duration,
+) -> Result<Login> {
+    let doc = fetcher.discover(&client.issuer).await?;
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .with_context(|| format!("binding the loopback redirect listener on port {port}"))?;
+    let port = listener.local_addr()?.port();
+    let redirect = Url::parse(&format!("http://127.0.0.1:{port}/callback"))?;
+    let state = random_token(16)?;
+    let pkce = Pkce::generate()?;
+    let url = authorization_url(
+        &doc,
+        client,
+        &redirect,
+        &state,
+        &OidcNonce::for_node(&node),
+        &pkce,
+    );
+    open(&url);
+    let code = tokio::time::timeout(wait, await_callback(&listener, &state))
+        .await
+        .map_err(|_| anyhow!("no sign-in came back within {}s", wait.as_secs()))??;
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", redirect.as_str()),
+        ("code_verifier", pkce.verifier.as_str()),
+    ];
+    let reply = token_request(fetcher, &doc, client, &form).await?;
+    finish(fetcher, client, node, reply).await
+}
+
+/// Exchange a stored refresh token for a new ID token and verify it.
+pub(crate) async fn refresh(
+    fetcher: &KeyFetcher,
+    client: &OidcClient,
+    node: NodeId,
+    refresh_token: &str,
+) -> Result<Login> {
+    let doc = fetcher.discover(&client.issuer).await?;
+    let form = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+    ];
+    let mut reply = token_request(fetcher, &doc, client, &form).await?;
+    // Refresh responses usually omit the refresh token; keep the one we have.
+    reply
+        .refresh_token
+        .get_or_insert_with(|| refresh_token.to_string());
+    finish(fetcher, client, node, reply).await
+}
+
+/// Verify an already-held token (for `--reuse`).
+pub(crate) async fn verify_held(
+    fetcher: &KeyFetcher,
+    client: &OidcClient,
+    node: NodeId,
+    id_token: IdToken,
+) -> Result<Login> {
+    finish(
+        fetcher,
+        client,
+        node,
+        TokenReply {
+            id_token: Some(id_token.as_str().to_string()),
+            refresh_token: None,
+            error: None,
+            error_description: None,
+        },
+    )
+    .await
+}
+
+/// POST a form to the token endpoint and parse the reply.
+async fn token_request(
+    fetcher: &KeyFetcher,
+    doc: &Discovery,
+    client: &OidcClient,
+    form: &[(&str, &str)],
+) -> Result<TokenReply> {
+    let mut body = url::form_urlencoded::Serializer::new(String::new());
+    body.extend_pairs(form);
+    body.append_pair("client_id", &client.client_id);
+    if let Some(secret) = &client.client_secret {
+        body.append_pair("client_secret", secret);
+    }
+    let resp = fetcher
+        .http()
+        .post(doc.token_endpoint.clone())
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .header(reqwest::header::ACCEPT, "application/json")
+        .body(body.finish())
+        .send()
+        .await
+        .with_context(|| format!("POST {}", doc.token_endpoint))?;
+    let status = resp.status();
+    let bytes = resp.bytes().await?;
+    let reply: TokenReply = serde_json::from_slice(&bytes)
+        .with_context(|| format!("token endpoint replied HTTP {status} with a non-JSON body"))?;
+    if let Some(error) = &reply.error {
+        bail!(
+            "the IdP refused the token request: {error}{}",
+            reply
+                .error_description
+                .as_deref()
+                .map(|d| format!(" ({d})"))
+                .unwrap_or_default()
+        );
+    }
+    if !status.is_success() {
+        bail!("token endpoint replied HTTP {status}");
+    }
+    Ok(reply)
+}
+
+/// Verify the reply's ID token as a claim for `node`, like any reader would.
+async fn finish(
+    fetcher: &KeyFetcher,
+    client: &OidcClient,
+    node: NodeId,
+    reply: TokenReply,
+) -> Result<Login> {
+    let id_token = reply
+        .id_token
+        .ok_or_else(|| anyhow!("the IdP's reply has no id_token (is `openid` in the scope?)"))?;
+    let claim = IdentityClaim {
+        node,
+        id_token: IdToken::new(id_token),
+    };
+    let principal = fetcher
+        .verify(
+            &claim,
+            std::slice::from_ref(&client.issuer),
+            &[client.audience()],
+            crate::now_unix(),
+        )
+        .await
+        .map_err(|e| anyhow!("the IdP's ID token does not verify as a claim for this node: {e}"))?;
+    Ok(Login {
+        claim,
+        principal,
+        refresh_token: reply.refresh_token,
+    })
+}
+
+/// Accept loopback connections until the redirect arrives; return its `code`.
+///
+/// Anything other than `GET /callback` (a browser's `favicon.ico`) gets a 404
+/// and the wait continues. A wrong `state` is refused outright (RFC 6749
+/// §10.12: a forged redirect), as is an `error=` redirect.
+async fn await_callback(listener: &TcpListener, state: &str) -> Result<String> {
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        let request = match read_request(&mut stream).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("ignoring a malformed loopback request: {e:#}");
+                continue;
+            }
+        };
+        let url = Url::parse(&format!("http://127.0.0.1{}", request.target))
+            .unwrap_or_else(|_| Url::parse("http://127.0.0.1/").expect("static URL"));
+        if request.method != "GET" || url.path() != "/callback" {
+            let _ = write_response(&mut stream, 404, "text/plain", &[], b"not found").await;
+            continue;
+        }
+        let param = |k: &str| {
+            url.query_pairs()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.into_owned())
+        };
+        if let Some(error) = param("error") {
+            let _ = page(&mut stream, 400, "Sign-in failed; see the terminal.").await;
+            bail!(
+                "the IdP returned an error: {error}{}",
+                param("error_description")
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default()
+            );
+        }
+        if param("state").as_deref() != Some(state) {
+            let _ = page(&mut stream, 400, "State mismatch; sign-in refused.").await;
+            bail!("the redirect's state does not match this login (a forged or stale redirect)");
+        }
+        let Some(code) = param("code") else {
+            let _ = page(&mut stream, 400, "No authorization code.").await;
+            bail!("the redirect carried no authorization code");
+        };
+        let _ = page(
+            &mut stream,
+            200,
+            "wires: signed in. You can close this tab.",
+        )
+        .await;
+        return Ok(code);
+    }
+}
+
+/// A minimal HTML page.
+async fn page(stream: &mut TcpStream, status: u16, text: &str) -> Result<()> {
+    let body =
+        format!("<!doctype html><meta charset=utf-8><title>wires login</title><p>{text}</p>");
+    write_response(
+        stream,
+        status,
+        "text/html; charset=utf-8",
+        &[],
+        body.as_bytes(),
+    )
+    .await
+}
+
+/// One parsed HTTP/1.1 request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HttpRequest {
+    /// `GET`, `POST`, …
+    pub method: String,
+    /// The request target (`/path?query`).
+    pub target: String,
+    /// The body (`Content-Length` bytes; empty without one).
+    pub body: Vec<u8>,
+}
+
+/// Read one HTTP/1.1 request (head + `Content-Length` body), at most
+/// [`MAX_REQUEST`] bytes.
+pub(crate) async fn read_request<S: AsyncReadExt + Unpin>(stream: &mut S) -> Result<HttpRequest> {
+    let mut buf = Vec::with_capacity(1024);
+    let head_end = loop {
+        if let Some(i) = find(&buf, b"\r\n\r\n") {
+            break i;
+        }
+        if buf.len() >= MAX_REQUEST {
+            bail!("request head too large");
+        }
+        let mut chunk = [0u8; 4096];
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            bail!("connection closed mid-request");
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = std::str::from_utf8(&buf[..head_end]).context("request head is not UTF-8")?;
+    let mut lines = head.split("\r\n");
+    let mut first = lines.next().unwrap_or_default().split(' ');
+    let (Some(method), Some(target)) = (first.next(), first.next()) else {
+        bail!("bad request line");
+    };
+    let mut length = 0usize;
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("content-length")
+        {
+            length = v.trim().parse().context("bad Content-Length")?;
+        }
+    }
+    if head_end + 4 + length > MAX_REQUEST {
+        bail!("request body too large");
+    }
+    let (method, target) = (method.to_string(), target.to_string());
+    let mut body = buf[head_end + 4..].to_vec();
+    while body.len() < length {
+        let mut chunk = vec![0u8; length - body.len()];
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            bail!("connection closed mid-body");
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(length);
+    Ok(HttpRequest {
+        method,
+        target,
+        body,
+    })
+}
+
+/// Write one HTTP/1.1 response and close the exchange (`Connection: close`).
+pub(crate) async fn write_response<S: AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    status: u16,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<()> {
+    let reason = match status {
+        200 => "OK",
+        302 => "Found",
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "Status",
+    };
+    let mut head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         Connection: close\r\nCache-Control: no-store\r\n",
+        body.len()
+    );
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.flush().await?;
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
+/// Index of the first occurrence of `needle` in `hay`.
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Write `contents` to `path` with mode `0600`, atomically (temp + rename).
+pub(crate) fn save_secret(path: &Path, contents: &str) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    std::io::Write::write_all(&mut file, contents.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Print the URL and (unless told not to) try the platform's browser opener.
+fn open_browser(url: &Url, launch: bool) {
+    eprintln!("wires login: sign in at\n\n  {url}\n");
+    if !launch {
+        return;
+    }
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let spawned = std::process::Command::new(opener)
+        .arg(url.as_str())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if spawned.is_err() {
+        eprintln!("wires login: could not launch a browser ({opener}); open the URL yourself");
+    }
+}
+
+/// `wires login`.
+pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
+    crate::init_logging();
+    let ks = Arc::new(keystore::Keystore::resolve()?);
+    let home = keystore::home()?;
+    let ctx = match &a.topic {
+        Some(topic) => Some(TopicContext::resolve(
+            Arc::clone(&ks),
+            home.clone(),
+            &TopicArgs {
+                topic: topic.clone(),
+                peer: a.peer.clone(),
+                node_seed: a.node_seed.clone(),
+                node_seed_file: a.node_seed_file.clone(),
+                relay_url: a.relay_url.clone(),
+                ..TopicArgs::default()
+            },
+        )?),
+        None => None,
+    };
+    let node = match &ctx {
+        Some(ctx) => ctx.node.node_id(),
+        None => {
+            keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?.node_id()
+        }
+    };
+    let client = OidcClient::resolve(&a)?;
+    let fetcher = KeyFetcher::new(Some(home.join("jwks")))?;
+    let token_path = ks.path(ID_TOKEN_FILE);
+    let refresh_path = ks.path(REFRESH_TOKEN_FILE);
+
+    let launch = !a.no_browser;
+    let interactive = || {
+        run_flow(
+            &fetcher,
+            &client,
+            node,
+            a.callback_port,
+            move |url| open_browser(url, launch),
+            CALLBACK_WAIT,
+        )
+    };
+    let login = if a.reuse {
+        let held = std::fs::read_to_string(&token_path)
+            .with_context(|| format!("no stored ID token at {}", token_path.display()))?;
+        verify_held(&fetcher, &client, node, IdToken::new(held.trim())).await?
+    } else if a.refresh {
+        match std::fs::read_to_string(&refresh_path) {
+            Ok(rt) => match refresh(&fetcher, &client, node, rt.trim()).await {
+                Ok(login) => login,
+                Err(e) => {
+                    eprintln!(
+                        "wires login: refresh did not yield a node-bound token ({e:#}); signing in again"
+                    );
+                    interactive().await?
+                }
+            },
+            Err(_) => {
+                eprintln!("wires login: no refresh token stored; signing in again");
+                interactive().await?
+            }
+        }
+    } else {
+        interactive().await?
+    };
+
+    save_secret(&token_path, login.claim.id_token.as_str())?;
+    if let Some(rt) = &login.refresh_token {
+        save_secret(&refresh_path, rt)?;
+    }
+    eprintln!(
+        "wires login: node {} is {} (token stored in {}, valid until unix {})",
+        node.hex(),
+        login
+            .principal
+            .email
+            .as_deref()
+            .unwrap_or(&login.principal.subject),
+        token_path.display(),
+        login.principal.not_after
+    );
+    match &ctx {
+        Some(ctx) => {
+            publish_claim(ctx, &login.claim).await?;
+            eprintln!(
+                "wires login: identity claim published on topic {:?}",
+                ctx.name
+            );
+        }
+        None => eprintln!(
+            "wires login: pass --topic <name> (or rerun with `--reuse --topic <name>`) to publish \
+             the claim"
+        ),
+    }
+    Ok(())
+}
+
+/// Publish `claim` on `ctx`'s topic the way `wires publish` does.
+async fn publish_claim(ctx: &TopicContext, claim: &IdentityClaim) -> Result<()> {
+    let text = ChannelRecord::Identity(claim.clone()).to_text()?;
+    let messages = crate::Messages::One(Some(text));
+    if let Some(client) = ipc::ControlClient::connect(&ctx.socket_path()).await? {
+        return crate::publish_through_tail(ctx, client, messages).await;
+    }
+    crate::publish_one_shot(
+        ctx,
+        messages,
+        crate::PUBLISH_NEIGHBOR_WAIT,
+        crate::PUBLISH_LINGER,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mock_idp::MockIdp;
+    use library::{IdTokenError, NodeIdentity};
+    use proptest::prelude::*;
+
+    const PATIENCE: Duration = Duration::from_secs(20);
+
+    fn node() -> NodeId {
+        NodeIdentity::from_seed([4; 32]).node_id()
+    }
+
+    #[test]
+    fn pkce_matches_the_rfc_7636_appendix_b_vector() {
+        let p = Pkce::from_verifier("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".into());
+        assert_eq!(p.challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    #[test]
+    fn a_fresh_pkce_verifier_is_long_and_unique() {
+        let (a, b) = (Pkce::generate().unwrap(), Pkce::generate().unwrap());
+        assert_eq!(a.verifier.len(), 43);
+        assert_ne!(a.verifier, b.verifier);
+    }
+
+    #[test]
+    fn the_authorization_url_carries_every_binding_parameter() {
+        let doc = Discovery {
+            issuer: "https://idp.example".into(),
+            authorization_endpoint: Url::parse("https://idp.example/auth?x=1").unwrap(),
+            token_endpoint: Url::parse("https://idp.example/token").unwrap(),
+            jwks_uri: Url::parse("https://idp.example/jwks").unwrap(),
+        };
+        let client = OidcClient {
+            issuer: Issuer::new("https://idp.example"),
+            client_id: "cid".into(),
+            client_secret: None,
+        };
+        let redirect = Url::parse("http://127.0.0.1:5555/callback").unwrap();
+        let pkce = Pkce::from_verifier("v".into());
+        let nonce = OidcNonce::for_node(&node());
+        let url = authorization_url(&doc, &client, &redirect, "st", &nonce, &pkce);
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q["x"], "1");
+        assert_eq!(q["response_type"], "code");
+        assert_eq!(q["client_id"], "cid");
+        assert_eq!(q["redirect_uri"], "http://127.0.0.1:5555/callback");
+        assert_eq!(q["scope"], "openid email");
+        assert_eq!(q["state"], "st");
+        assert_eq!(q["nonce"], nonce.as_str());
+        assert_eq!(q["code_challenge"], pkce.challenge);
+        assert_eq!(q["code_challenge_method"], "S256");
+    }
+
+    #[tokio::test]
+    async fn read_request_parses_head_and_body() {
+        let raw = b"POST /token?a=b HTTP/1.1\r\nHost: x\r\ncontent-length: 5\r\n\r\nhello";
+        let mut r = &raw[..];
+        let req = read_request(&mut r).await.unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.target, "/token?a=b");
+        assert_eq!(req.body, b"hello");
+        let mut short = &b"GET / HTTP/1.1\r\n"[..];
+        assert!(read_request(&mut short).await.is_err());
+    }
+
+    proptest! {
+        /// Any body round-trips through the reader, whatever its bytes.
+        #[test]
+        fn read_request_round_trips_bodies(body in proptest::collection::vec(any::<u8>(), 0..2048)) {
+            let mut raw = format!("POST /x HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+            raw.extend_from_slice(&body);
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let req = rt.block_on(async { read_request(&mut &raw[..]).await }).unwrap();
+            prop_assert_eq!(req.body, body);
+        }
+    }
+
+    #[test]
+    fn secrets_are_written_0600() {
+        let dir = crate::ipc::ScratchDir::new("sec");
+        let path = dir.path().join(ID_TOKEN_FILE);
+        save_secret(&path, "a").unwrap();
+        save_secret(&path, "b").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "b");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    /// The whole flow, hermetically: discovery, loopback redirect, PKCE code
+    /// exchange, local verification — with the browser replaced by an HTTP
+    /// client that follows the mock's redirect.
+    #[tokio::test]
+    async fn the_login_flow_runs_end_to_end_against_a_mock_issuer() {
+        let idp = MockIdp::start("alice@example.com").await;
+        let fetcher = KeyFetcher::new(None).unwrap();
+        let login = run_flow(&fetcher, &idp.client(), node(), 0, idp.browser(), PATIENCE)
+            .await
+            .unwrap();
+        assert_eq!(login.claim.node, node());
+        assert_eq!(login.principal.email.as_deref(), Some("alice@example.com"));
+        assert_eq!(login.principal.issuer, idp.issuer.as_str());
+        assert!(login.refresh_token.is_some());
+        // The mock checked the PKCE verifier and saw the node-bound nonce.
+        assert_eq!(
+            idp.last_nonce().as_deref(),
+            Some(OidcNonce::for_node(&node()).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_keeps_the_nonce_yields_a_new_bound_token() {
+        let idp = MockIdp::start("alice@example.com").await;
+        let fetcher = KeyFetcher::new(None).unwrap();
+        let first = run_flow(&fetcher, &idp.client(), node(), 0, idp.browser(), PATIENCE)
+            .await
+            .unwrap();
+        let rt = first.refresh_token.clone().unwrap();
+        let again = refresh(&fetcher, &idp.client(), node(), &rt).await.unwrap();
+        assert_eq!(again.principal.email.as_deref(), Some("alice@example.com"));
+        assert_eq!(again.refresh_token.as_deref(), Some(rt.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_without_the_nonce_is_refused_like_googles() {
+        let idp = MockIdp::start("alice@example.com").await;
+        let fetcher = KeyFetcher::new(None).unwrap();
+        let first = run_flow(&fetcher, &idp.client(), node(), 0, idp.browser(), PATIENCE)
+            .await
+            .unwrap();
+        idp.set_nonce_on_refresh(false);
+        let err = refresh(
+            &fetcher,
+            &idp.client(),
+            node(),
+            &first.refresh_token.unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("nonce"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_client_is_refused_by_the_issuer() {
+        let idp = MockIdp::start("alice@example.com").await;
+        let fetcher = KeyFetcher::new(None).unwrap();
+        let mut client = idp.client();
+        client.client_id = "not-registered".into();
+        let err = run_flow(&fetcher, &client, node(), 0, idp.browser(), PATIENCE)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("invalid_client"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_forged_redirect_with_the_wrong_state_is_refused() {
+        let idp = MockIdp::start("alice@example.com").await;
+        let fetcher = KeyFetcher::new(None).unwrap();
+        let err = run_flow(
+            &fetcher,
+            &idp.client(),
+            node(),
+            0,
+            |url: &Url| {
+                let redirect = url
+                    .query_pairs()
+                    .find(|(k, _)| k == "redirect_uri")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                tokio::spawn(async move {
+                    let forged = format!("{redirect}?code=stolen&state=wrong");
+                    let _ = crate::jwks::http_client().unwrap().get(forged).send().await;
+                });
+            },
+            PATIENCE,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("state"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn an_idp_error_redirect_is_reported() {
+        let idp = MockIdp::start("alice@example.com").await;
+        let fetcher = KeyFetcher::new(None).unwrap();
+        let err = run_flow(
+            &fetcher,
+            &idp.client(),
+            node(),
+            0,
+            |url: &Url| {
+                let redirect = url
+                    .query_pairs()
+                    .find(|(k, _)| k == "redirect_uri")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                tokio::spawn(async move {
+                    let denied = format!("{redirect}?error=access_denied");
+                    let _ = crate::jwks::http_client().unwrap().get(denied).send().await;
+                });
+            },
+            PATIENCE,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("access_denied"), "{err:#}");
+    }
+
+    /// Keys rotate: a token signed under a `kid` the cache has never seen
+    /// triggers exactly one refetch, and the on-disk cache serves a restarted
+    /// reader without any fetch.
+    #[tokio::test]
+    async fn an_unknown_kid_refetches_and_the_disk_cache_serves_restarts() {
+        let idp = MockIdp::start("alice@example.com").await;
+        let dir = crate::ipc::ScratchDir::new("jwk");
+        let cache = Some(dir.path().to_path_buf());
+        let now = crate::now_unix();
+        let aud = [Audience::new(idp.client_id.clone())];
+        let iss = [idp.issuer.clone()];
+
+        let fetcher = KeyFetcher::new(cache.clone()).unwrap();
+        let claim = IdentityClaim {
+            node: node(),
+            id_token: idp.mint(&OidcNonce::for_node(&node()), now + 600),
+        };
+        fetcher.verify(&claim, &iss, &aud, now).await.unwrap();
+        assert_eq!(idp.jwks_fetches(), 1);
+
+        // A restarted reader: served from disk.
+        let restarted = KeyFetcher::new(cache.clone()).unwrap();
+        restarted.verify(&claim, &iss, &aud, now).await.unwrap();
+        assert_eq!(idp.jwks_fetches(), 1);
+
+        // Rotation: a new kid forces one refetch, then verifies.
+        idp.rotate_key();
+        let rotated = IdentityClaim {
+            node: node(),
+            id_token: idp.mint(&OidcNonce::for_node(&node()), now + 600),
+        };
+        restarted.verify(&rotated, &iss, &aud, now).await.unwrap();
+        assert_eq!(idp.jwks_fetches(), 2);
+
+        // A bogus kid right after is not an amplifier: no further fetch.
+        idp.rotate_key();
+        let bogus = IdentityClaim {
+            node: node(),
+            id_token: idp.mint(&OidcNonce::for_node(&node()), now + 600),
+        };
+        let err = restarted.verify(&bogus, &iss, &aud, now).await.unwrap_err();
+        assert!(matches!(
+            err,
+            crate::jwks::VerifyError::Rejected(IdTokenError::UnknownKey { .. })
+        ));
+        assert_eq!(idp.jwks_fetches(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_expired_claim_still_names_its_principal() {
+        let idp = MockIdp::start("alice@example.com").await;
+        let fetcher = KeyFetcher::new(None).unwrap();
+        let now = crate::now_unix();
+        let stale = IdentityClaim {
+            node: node(),
+            id_token: idp.mint(&OidcNonce::for_node(&node()), now - 3600),
+        };
+        let err = fetcher
+            .verify(
+                &stale,
+                &[idp.issuer.clone()],
+                &[Audience::new(idp.client_id.clone())],
+                now,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            crate::jwks::VerifyError::Expired(p) => {
+                assert_eq!(p.email.as_deref(), Some("alice@example.com"))
+            }
+            other => panic!("expected Expired, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_issuer_is_never_fetched() {
+        let idp = MockIdp::start("alice@example.com").await;
+        let fetcher = KeyFetcher::new(None).unwrap();
+        let claim = IdentityClaim {
+            node: node(),
+            id_token: idp.mint(&OidcNonce::for_node(&node()), crate::now_unix() + 600),
+        };
+        let err = fetcher
+            .verify(
+                &claim,
+                &[Issuer::new("https://accounts.google.com")],
+                &[Audience::new(idp.client_id.clone())],
+                crate::now_unix(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::jwks::VerifyError::Untrusted(_)));
+        assert_eq!(idp.jwks_fetches(), 0);
+    }
+}
