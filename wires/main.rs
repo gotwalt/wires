@@ -303,7 +303,9 @@ struct ServeArgs {
     trust_root: String,
     /// The scope this responder serves; a grant's scope must match exactly. Omit
     /// for an inclusion-only responder (then `--allow-any-member` is required).
-    #[arg(long)]
+    /// Not used with `--expose`, where a grant must be scoped `tool:<name>` or
+    /// `tool:*`.
+    #[arg(long, conflicts_with_all = ["expose", "expose_file"])]
     scope: Option<String>,
     /// Serve any fabric member when no `--scope` is set (inclusion-only). An
     /// explicit acknowledgement of the authorization downgrade: the child execs
@@ -343,8 +345,25 @@ struct ServeArgs {
     /// Read the responder's inclusion proof from this file.
     #[arg(long)]
     inclusion_proof_file: Option<PathBuf>,
-    /// The command (program + args) to exec per session, after `--`.
-    #[arg(last = true, required = true)]
+    /// Expose a CLI as a named tool: `NAME=COMMAND ARGS…` (repeatable). The
+    /// command is split on ASCII whitespace — no quoting, no shell — and each
+    /// call's arguments are appended to it. Callers need a grant scoped
+    /// `tool:NAME` (or `tool:*`) unless `--allow-any-member`. For a SQL tool
+    /// use sqlite3's `-safe` flag (3.37+), which disables dot-commands like
+    /// `.shell`/`.system`: `--expose 'db_query=sqlite3 -safe -readonly orders.db'`.
+    #[arg(long, value_name = "NAME=COMMAND")]
+    expose: Vec<String>,
+    /// Expose the tools in this JSON file, `{"NAME": ["program", "arg", …]}`,
+    /// for argv that needs spaces. Combines with `--expose`.
+    #[arg(long)]
+    expose_file: Option<PathBuf>,
+    /// The command (program + args) to exec per session, after `--`
+    /// (single-command mode; mutually exclusive with `--expose`).
+    #[arg(
+        last = true,
+        required_unless_present_any = ["expose", "expose_file"],
+        conflicts_with_all = ["expose", "expose_file"]
+    )]
     command: Vec<String>,
 }
 
@@ -392,6 +411,13 @@ struct ConnectArgs {
     /// Read the inclusion proof token from this file.
     #[arg(long)]
     inclusion_proof_file: Option<PathBuf>,
+    /// Call this tool on a multi-tool responder (`wires serve --expose`).
+    #[arg(long)]
+    tool: Option<String>,
+    /// Arguments for `--tool`, after `--`; appended to the tool's command on
+    /// the responder, never through a shell.
+    #[arg(last = true, requires = "tool")]
+    args: Vec<String>,
 }
 
 /// The arguments `publish` and `tail` share: which topic, who to bootstrap
@@ -661,8 +687,15 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     init_logging();
     let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
     let trust_root = NodeId::from_hex(&a.trust_root)?;
-    let scope = a.scope.map(Scope::new);
-    if scope.is_none() && !a.allow_any_member {
+    let tools = transport::exposed_tools(&a.expose, a.expose_file.as_deref())?;
+    // Multi-tool: grants are per tool (`tool:<name>` / `tool:*`), so the served
+    // scope only says "a grant is required".
+    let scope = if tools.is_empty() {
+        a.scope.map(Scope::new)
+    } else {
+        (!a.allow_any_member).then(|| Scope::new(transport::TOOL_SCOPE_ANY))
+    };
+    if tools.is_empty() && scope.is_none() && !a.allow_any_member {
         anyhow::bail!(
             "refusing to serve: pass --scope <name>, or --allow-any-member for an \
              inclusion-only responder (any fabric member may connect)"
@@ -679,7 +712,7 @@ async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         a.inclusion_proof_file.as_deref(),
     )?;
     let config = transport::ServeConfig {
-        tools: Default::default(),
+        tools,
         audit: None,
         trust_root,
         scope,
@@ -761,6 +794,27 @@ async fn connect_cmd(a: ConnectArgs) -> anyhow::Result<i32> {
     // address and the endpoint's relay configuration.
     let relay = a.relay_url.or(ticket_relay);
     let target = transport::endpoint_addr(&target_id, &addrs, relay.as_deref())?;
+    if let Some(tool) = a.tool {
+        let invocation = library::Invocation {
+            tool: library::ToolName::new(tool.as_str())
+                .with_context(|| format!("--tool {tool:?}"))?,
+            argv: library::Argv::new(a.args).context("--tool arguments")?,
+        };
+        let endpoint = transport::bind(&node, relay.as_deref()).await?;
+        return transport::call_on(
+            endpoint,
+            target,
+            membership,
+            grant,
+            proof,
+            ticketless,
+            invocation,
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+            tokio::io::stderr(),
+        )
+        .await;
+    }
     transport::connect_io(
         node,
         target,
@@ -2791,6 +2845,40 @@ mod tests {
     #[test]
     fn keygen_rejects_bad_seed() {
         assert!(run_keygen(Some("nothex"), None).is_err());
+    }
+
+    #[test]
+    fn serve_takes_expose_or_a_command_but_not_both() {
+        let base = ["wires", "serve", "--trust-root", "00"];
+        let parse = |extra: &[&str]| Cli::try_parse_from(base.iter().chain(extra));
+        let Command::Serve(a) = parse(&["--expose", "a=cat", "--expose", "b=rg -n"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected serve");
+        };
+        assert_eq!(a.expose, ["a=cat", "b=rg -n"]);
+        assert!(a.command.is_empty());
+        assert!(parse(&["--expose-file", "t.json"]).is_ok());
+        assert!(parse(&["--", "cat"]).is_ok());
+        assert!(parse(&[]).is_err(), "neither --expose nor a command");
+        assert!(parse(&["--expose", "a=cat", "--", "cat"]).is_err());
+        assert!(parse(&["--expose", "a=cat", "--scope", "s"]).is_err());
+    }
+
+    #[test]
+    fn connect_tool_takes_trailing_args() {
+        let cli = Cli::try_parse_from([
+            "wires", "connect", "--target", "00", "--tool", "db", "--", "-c", "select 1",
+        ])
+        .unwrap();
+        let Command::Connect(a) = cli.command else {
+            panic!("expected connect");
+        };
+        assert_eq!(a.tool.as_deref(), Some("db"));
+        assert_eq!(a.args, ["-c", "select 1"]);
+        // Arguments without a tool have nowhere to go.
+        assert!(Cli::try_parse_from(["wires", "connect", "--target", "00", "--", "x"]).is_err());
     }
 
     #[test]

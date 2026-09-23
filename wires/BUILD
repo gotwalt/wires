@@ -12,6 +12,7 @@ rust_binary(
     deps = [
         "//library",
         "@crates//:anyhow",
+        "@crates//:blake3",
         "@crates//:clap",
         "@crates//:futures-core",
         "@crates//:iroh",
