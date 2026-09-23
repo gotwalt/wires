@@ -14,42 +14,44 @@ to what's still unserved or call it obsolete.
 
 ## The one idea
 
-> **Run a CLI on another machine from your agent. The machine is reached by
-> public key, never by network path; the caller is authenticated by your IdP;
-> and every call lands on an encrypted gossip channel that anyone you
-> authorize can watch — without access to the caller or the machine
-> running the CLI.**
+> **Run a CLI on another machine from your agent, by service name. The
+> machine is reached by public key, never by network path; the caller is
+> authenticated by your IdP and checked against an admin-signed list of who
+> may call what; and the machine that ran each call keeps a signed record of
+> it that the people you name can read — without access to the caller or the
+> machine.**
 
 Why each clause earns its place (the rebuttals it has to survive):
 
 | Claim | Why it isn't "just use X" |
 |---|---|
-| **Reached by key, not network path** | Tailscale/VPN gives the agent's machine a route to the *host*; you then trust every port on it. Wires gives a route to *one allowlisted CLI* and nothing else — there is no network path to widen. |
-| **CLIs, not MCP servers** | CLIs are the idiom models already know, one generic verb, and output is filtered by pipes *before* it hits context — meaningfully more efficient than MCP tool schemas + JSON results, even post-2026-07-28. `wires call` is the native path; `wires mcp` is the on-ramp for workflows that only speak MCP. |
-| **IdP-authenticated caller** | The ID token is bound to the node key (OIDC `nonce` = hash of the key) and published on the channel. Every reader verifies the IdP's signature *itself* — no wires attestor to trust, and two orgs' IdPs can share one channel (federation). |
-| **Observable at the infra layer** | The *responder* writes a signed, hash-chained record of every call, refusal, and exit — stamped with the caller identity it verified. The agent can't forge it, no gateway owns it, and an observer holds neither end's credentials. A CLI has no such story; an MCP gateway's log belongs to whoever runs the gateway. |
+| **Reached by key, not network path** | Tailscale/VPN gives the agent's machine a route to the *host*; you then trust every port on it. Wires gives a route to *the services a signed list lets you call* and nothing else — there is no network path to widen. |
+| **By service name** | The caller asks for `orders-db`, not a machine; the admin binds names to hosts (failover, moves, no squatting), and the caller never learns an address. |
+| **CLIs, not MCP servers** | CLIs are the idiom models already know, one generic verb, and output is filtered *before* it hits context — meaningfully more efficient than MCP tool schemas + JSON results, even post-2026-07-28. `wires call` is the native path; `wires mcp` is the on-ramp for workflows that only speak MCP. |
+| **IdP-authenticated caller, one signed list** | The ID token is bound to the node key (OIDC `nonce` = hash of the key) and presented in each call's handshake; the host verifies the IdP's signature itself (no wires attestor) and checks it against the admin-signed registry — one list of who may call what, not one per server. |
+| **Recorded at the infra layer** | The *host* writes a signed, hash-chained record of every call, refusal, and exit — stamped with the caller identity it verified. The agent can't forge it, no gateway owns it, and a reader the registry names holds neither end's credentials. A CLI has no such story; an MCP gateway's log belongs to whoever runs the gateway. |
 
 **Pitch rule:** every sentence in README / demo narration must survive one
 honest line from someone who runs remote MCP servers behind Tailscale today.
 (See [storytelling.md](../storytelling.md) §1.)
 
-## Roles (2026-09-23)
+## Roles (card 27)
 
 | Role | Decides | Commands |
 |---|---|---|
-| **admin** | who's in (root key) | `init`, `invite`, `remove` |
-| **host** | what runs and who may run it (`host.json`: tools + IdP policy) | `serve host.json` |
-| **caller** | — runs remote CLIs; MCP only for backward compatibility | `join`, `login`, `call`, `tools`, `mcp` |
-| **observer** | — | `watch` |
+| **admin** | who's in, the roles, which services run where, who may call and read each (root key; one signed state) | `init`, `invite`, `remove`, `role`, `service` |
+| **host** | how it implements its assigned services; trusted IdPs; stricter local rules (`host.json` v2) | `serve host.json`, `push` |
+| **caller** | — runs services by name; MCP only for backward compatibility | `join`, `login`, `services`, `call`, `mcp`, `inbox` |
+| **reader** | — any member: a service's `readers` role reads all its records, everyone else their own | `watch` |
 
-The IdP is *bound* at the caller (`login`), *enforced* at the host (`host.json`), and *verified independently* by every reader of the channel. The channel carries host announcements, identity claims, and call records; the admin's invite is the only thing handed out of band.
+The IdP is *bound* at the caller (`login`) and *verified* at the host, against the admin-signed state it holds. The admin's invite is the only thing handed out of band; every later state is pushed by key (or pulled from a host). Nothing is broadcast.
 
 ## The demo we're building toward
 
-1. **workbench** (no inbound ports): `wires serve --expose db_query=… --audit-topic ops --require-idp …`
-2. **laptop**: Claude Code, with `wires mcp` in its MCP config (and/or calling `wires call db_query …` from Bash).
-3. **observer** (third terminal/machine): `wires tail ops` — each call appears live as `alice@corp ran db_query "select …" → exit 0, 41 ms, 3.1 KiB`.
-4. **Revoke**: one `wires roster commit` → the agent's next call is refused, and the refusal is itself on the channel.
+1. **workbench** (no inbound ports): `wires serve host.json`, implementing `orders-db`, which the admin registered for role `analyst` (`wires service add orders-db --allow analyst --reader security --host workbench`).
+2. **laptop**: Claude Code calling `wires call orders-db -- "…"` from Bash (and/or `wires mcp` in its MCP config).
+3. **reader** (third terminal/machine, role `security`): `wires watch orders-db` — each call appears as `▶ … alice@corp (…) [analyst] orders-db "select …"`, then `■ … exit 0 · 41 ms · 3.1 KiB out`.
+4. **Revoke**: one `wires remove agent` → the agent's next call is refused (exit 77), and the refusal is in the host's log.
 
 ## Lanes
 
@@ -77,8 +79,8 @@ The IdP is *bound* at the caller (`login`), *enforced* at the host (`host.json`)
 | [23](done/23-inbox.md) | I | 21 | Push to callers: `wires inbox` (local read / `--wait`), host `wires push`, queue + dial-back by key, `host.json` `push` roles, audited |
 | [24](done/24-push-demo.md) | E2 | 23 | Push demo (deploy → callback → follow-up) + push-vs-poll benchmark |
 | [25](done/25-cargo-and-strip.md) | X | 23, 24 | Down to essentials: Bazel → plain Cargo + Dockerfile; remove grants/tickets/CRL/relay/manual targets and outdated docs (git history is the archive) |
-| [27](doing/27-services-not-hosts.md) | S3 | 25 | **Services, not hosts; drop the channel.** Admin-signed members + service registry; local `wires services`; identity in the handshake; delete gossip/fabric keys/re-keys/announcements (~20k LOC) |
-| [26](backlog/26-host-held-records.md) | H2 | 27 | Call records: host-held signed log, `watch <service>` for authorized readers + own calls, optional OTel export |
+| [27](review/27-services-not-hosts.md) | S3 | 25 | **Services, not hosts; drop the channel.** Admin-signed members + service registry; local `wires services`; identity in the handshake; delete gossip/fabric keys/re-keys/announcements (~20k LOC) |
+| [26](review/26-host-held-records.md) | H2 | 27 | Call records: host-held signed log, `watch <service>` for authorized readers + own calls, optional OTel export |
 | [22](done/22-gossip-role-OPEN.md) | — | decided | **Decided 2026-09-23: drop the channel** → cards 27 and 26 |
 | [18](backlog/18-front-door-OPEN.md) | — | parked | **Open question, don't build:** apex key, invites, `wires join <domain>` |
 | [16](done/16-token-benchmark.md) | bench | 01–03 | MCP (GitHub server, many tools; ± tool search) vs `gh` via `wires call` vs bare `gh`: 5 tasks × 5 runs |
