@@ -292,6 +292,9 @@ pub struct Hosted {
     /// The identity index the session protocol's gate reads; the tail loop
     /// feeds it every identity claim on the topic.
     pub identities: Arc<crate::host::identity::Identities>,
+    /// Announces the host's tools on the channel (card 15); `None` in
+    /// tests that only exercise call records.
+    pub announcer: Option<crate::host::announce::Announcer>,
 }
 
 #[cfg(test)]

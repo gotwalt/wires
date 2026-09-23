@@ -1612,6 +1612,7 @@ fn hosted_responder(
             crate::caller::jwks::KeyFetcher::new(None).unwrap(),
             crate::channel::idp_view::IdpTrust::from_vars(None, None),
         )),
+        announcer: None,
     };
     let ctx = crate::channel::context::TopicContext {
         node: NodeIdentity::from_seed(r_seed),

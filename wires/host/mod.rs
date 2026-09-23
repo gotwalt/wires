@@ -14,11 +14,10 @@
 //!   credential checks and the policy call (`authorize`), exec + stdio bridge.
 //! - [`audit`] — the call records the host publishes to its channel.
 //! - [`identity`] — the index of verified IdP claims and the per-call lookup.
-//!
-//! Where what comes next lands: announcing the host's tools on the channel in
-//! `announce.rs` (card 15), filtered per member by
-//! [`Policy::allowed_tools`](policy::Policy::allowed_tools).
+//! - [`announce`] — the host's tools, announced on the channel and sealed per
+//!   member by [`Policy::allowed_tools`](policy::Policy::allowed_tools) (card 15).
 
+pub mod announce;
 pub mod audit;
 pub mod config;
 pub mod identity;

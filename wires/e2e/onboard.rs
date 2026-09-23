@@ -130,6 +130,7 @@ fn resident(m: &Machine, hosted: bool) -> (tokio::task::JoinHandle<()>, oneshot:
                 crate::caller::jwks::KeyFetcher::new(None).unwrap(),
                 crate::channel::idp_view::IdpTrust::from_vars(None, None),
             )),
+            announcer: None,
         }
     });
     let (ready, ready_rx) = oneshot::channel();

@@ -65,6 +65,9 @@ pub(crate) struct Identities {
     trust: IdpTrust,
     /// What is known per node.
     known: Mutex<HashMap<NodeId, Known>>,
+    /// Signalled whenever a node's held principal changes — what a host's
+    /// announcer waits on to re-announce (card 15).
+    changed: tokio::sync::Notify,
 }
 
 impl std::fmt::Debug for Identities {
@@ -82,6 +85,7 @@ impl Identities {
             fetcher,
             trust,
             known: Mutex::new(HashMap::new()),
+            changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -123,6 +127,9 @@ impl Identities {
                 {
                     tracing::info!(node = %node.hex(), who = %principal_name(p), "identity verified");
                     entry.principal = Some(p.clone());
+                    // One stored permit: a change while nobody waits is
+                    // still seen by the next `changed().await`.
+                    self.changed.notify_one();
                 }
             }
             Err(e) => {
@@ -130,6 +137,18 @@ impl Identities {
                 entry.failure = Some(e.to_string());
             }
         }
+    }
+
+    /// Resolves after the next change to any node's held principal (or at
+    /// once, if one happened since the last call returned). One waiter.
+    pub(crate) async fn changed(&self) {
+        self.changed.notified().await;
+    }
+
+    /// Every node a claim has been seen for, verified or not.
+    pub(crate) fn nodes(&self) -> Vec<NodeId> {
+        let known = self.known.lock().expect("identity index poisoned");
+        known.keys().copied().collect()
     }
 
     /// What is known about `node`.

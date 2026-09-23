@@ -320,9 +320,17 @@ pub(crate) trait Policy: Send + Sync {
     ///
     /// A tool is listed when some call to it with no arguments would be
     /// allowed; a policy that looks at arguments may still refuse a
-    /// particular call. (Card 15 is the first production caller.)
-    #[allow(dead_code)]
+    /// particular call.
     fn allowed_tools(&self, principal: Option<&Principal>, caller: NodeId) -> Vec<ToolName>;
+
+    /// The tools **every** roster member may run, whoever it is and whether
+    /// or not it has logged in. A host announces these in the clear (to the
+    /// channel, which is already encrypted to exactly the roster) and seals
+    /// everything else per member — so a policy that cannot promise this for
+    /// a tool must leave it out. The default promises nothing.
+    fn member_tools(&self) -> Vec<ToolName> {
+        Vec::new()
+    }
 }
 
 /// The v1 policy: roles of matchers, and per tool the roles allowed.
@@ -420,6 +428,16 @@ impl Policy for RoleTable {
                 .allow
             })
             .cloned()
+            .collect()
+    }
+
+    /// Exactly the tools whose `allow` lists [`MEMBER`]: the table admits
+    /// `member` for anyone, with or without a principal.
+    fn member_tools(&self) -> Vec<ToolName> {
+        self.allow
+            .iter()
+            .filter(|(_, roles)| roles.iter().any(RoleName::is_member))
+            .map(|(tool, _)| tool.clone())
             .collect()
     }
 }
@@ -608,6 +626,11 @@ mod tests {
         assert_eq!(
             t.allowed_tools(Some(&sre), node()),
             vec![tool("restart"), tool("status")]
+        );
+        assert_eq!(t.member_tools(), vec![tool("status")]);
+        assert!(
+            AnyMember.member_tools().is_empty(),
+            "the default promises nothing"
         );
     }
 

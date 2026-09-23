@@ -49,7 +49,30 @@ pub fn record_line(record: &ChannelRecord, identity: Option<&Verdict>) -> String
         ChannelRecord::Audit(audit) => audit_line(audit),
         ChannelRecord::Identity(claim) => identity_line(claim, identity),
         ChannelRecord::Rekey(rekey) => rekey_line(rekey),
+        ChannelRecord::Host(ann) => host_line(ann),
     }
+}
+
+/// One human line for a host announcement (card 15): the tools every member
+/// may see, and how many sealed entries it carries. Only what any member can
+/// read — who the entries are for, and what they say, is not on the line (a
+/// member runs `wires tools` for its own view).
+pub fn host_line(ann: &library::HostAnnouncement) -> String {
+    let open: Vec<String> = ann
+        .open
+        .iter()
+        .flat_map(|l| l.tools.iter().map(|t| escape(t.name.as_str())))
+        .collect();
+    let open = if open.is_empty() {
+        "none open".to_string()
+    } else {
+        format!("open: {}", open.join(", "))
+    };
+    let n = ann.sealed.len();
+    format!(
+        "📣 announces tools ({open}; {n} sealed entr{})",
+        if n == 1 { "y" } else { "ies" }
+    )
 }
 
 /// One human line for an admin's re-key: the roster version it moves to and
@@ -245,6 +268,40 @@ mod tests {
             not_after: 0,
             claims: Default::default(),
         }
+    }
+
+    /// A host announcement shows only what every member may read.
+    #[test]
+    fn a_host_line_names_open_tools_and_counts_sealed_entries() {
+        use library::{
+            HostAnnouncement, HostListing, ListedTool, NodeIdentity, SealedListing, ToolName,
+        };
+        let host = NodeIdentity::from_seed([1u8; 32]).node_id();
+        let member = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let secret = HostListing {
+            tools: vec![ListedTool {
+                name: ToolName::new("db_query").unwrap(),
+                description: String::new(),
+            }],
+            ..HostListing::default()
+        };
+        let entry = SealedListing::seal(host, 1, &member, &secret).unwrap();
+        let ann = HostAnnouncement::new(host, 1, 0, None, vec![entry.clone()]);
+        assert_eq!(
+            host_line(&ann),
+            "📣 announces tools (none open; 1 sealed entry)"
+        );
+        let open = HostListing {
+            tools: vec![ListedTool {
+                name: ToolName::new("status").unwrap(),
+                description: String::new(),
+            }],
+            ..HostListing::default()
+        };
+        let ann = HostAnnouncement::new(host, 1, 0, Some(open), vec![entry.clone(), entry]);
+        let line = record_line(&ChannelRecord::Host(ann), None);
+        assert_eq!(line, "📣 announces tools (open: status; 2 sealed entries)");
+        assert!(!line.contains("db_query"));
     }
 
     #[test]

@@ -233,6 +233,15 @@ impl HostConfig {
             .collect()
     }
 
+    /// Each tool's description (empty when `host.json` gives none) — what
+    /// the host announces on its channel (card 15).
+    pub(crate) fn descriptions(&self) -> BTreeMap<ToolName, String> {
+        self.tools
+            .iter()
+            .map(|(name, t)| (name.clone(), t.description.clone().unwrap_or_default()))
+            .collect()
+    }
+
     /// The v1 policy this file describes.
     pub(crate) fn policy(&self) -> RoleTable {
         RoleTable::new(
