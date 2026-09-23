@@ -1,6 +1,7 @@
-//! `wires mcp`: a stdio MCP server whose tools are the remote CLIs your
-//! channel's hosts let you run (their announcements, plus `tools.json`
-//! aliases), resolved once at startup.
+//! `wires mcp`: a stdio MCP server whose tools are the services you may call
+//! (card 27: evaluated locally against your signed state, as `wires services`
+//! lists them), plus `tools.json` aliases, resolved once at startup. Before a
+//! node holds a signed state, the channel's host announcements stand in.
 //!
 //! The on-ramp for workflows that only speak MCP (Claude Desktop, IDEs). Each
 //! tool becomes one MCP tool taking `{ args?: string[], stdin?:
@@ -24,7 +25,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::caller::call::{CallOutcome, Caller, CredArgs, Credentials, WiresCaller};
 use crate::caller::shape::{Shape, ShapeArgs, exit_code};
-use crate::caller::tools::{RemoteTool, ToolsConfig};
+use crate::caller::tools::{RemoteTool, ToolTarget, ToolsConfig};
 
 /// The newest MCP revision this server speaks (the stateless one).
 pub const LATEST_PROTOCOL_VERSION: &str = "2026-07-28";
@@ -481,7 +482,33 @@ pub struct McpArgs {
     pub creds: CredArgs,
 }
 
-/// `wires mcp`: load the announced tools, `tools.json` aliases and
+/// `config`'s aliases, then one [`ToolTarget::Service`] tool per grant (its
+/// registry description), skipping a name an alias already takes.
+pub(crate) fn with_services(
+    mut config: ToolsConfig,
+    state: &library::State,
+    grants: &[library::Grant],
+) -> ToolsConfig {
+    for g in grants {
+        let name = library::ToolName::from(g.service.clone());
+        if config.get(&name).is_some() {
+            continue;
+        }
+        config.tools.push(RemoteTool {
+            name,
+            description: state
+                .service(&g.service)
+                .map(|s| s.description.clone())
+                .unwrap_or_default(),
+            target: ToolTarget::Service,
+            remote_tool: None,
+        });
+    }
+    config
+}
+
+/// `wires mcp`: load the services this node may call (or, before it holds a
+/// signed state, the announced tools), `tools.json` aliases and
 /// credentials, then serve MCP on stdio.
 ///
 /// In locked mode ([`Lock`](crate::caller::lock::Lock)) an override flag is
@@ -491,9 +518,16 @@ pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
     crate::caller::lock::Lock::detect()?.check(&a.creds)?;
     let path = crate::caller::tools::resolve_path(a.creds.tools_file.as_deref())?;
     let config = ToolsConfig::load(&path)?;
-    // Plus every tool the channel's hosts announce to this node (card 15).
-    let config = crate::caller::resolve::with_announced(config, &a.creds).await;
     let creds = Credentials::resolve(&a.creds)?;
+    let ks = crate::admin::keystore::Keystore::resolve()?;
+    let config = if crate::caller::call::stored_state(&ks, &creds)?.is_some() {
+        // Card 27: every service this node may call, one MCP tool each.
+        let allowed = crate::caller::services::allowed(&ks).await?;
+        with_services(config, &allowed.state.state, &allowed.grants)
+    } else {
+        // No signed state yet: what the channel's hosts announce (card 15).
+        crate::caller::resolve::with_announced(config, &a.creds).await
+    };
     tracing::info!(
         "wires mcp: serving {} tool(s) from {}",
         config.tools.len(),
@@ -511,7 +545,6 @@ pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::caller::tools::ToolTarget;
     use library::{NodeIdentity, ToolName};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
@@ -930,6 +963,43 @@ mod tests {
             render_outcome(&exited(0, "a\n", "")),
             ("a\nexit: 0".into(), false)
         );
+    }
+
+    #[test]
+    fn services_become_tools_after_the_aliases() {
+        use library::{Grant, RoleName, Service, ServiceName, State};
+        let node = |b: u8| NodeIdentity::from_seed([b; 32]).node_id();
+        let mut state = State::new(node(1));
+        state.members.insert(node(4));
+        state.hosts.insert(node(4));
+        for (name, desc) in [("orders-db", "Read-only SQL"), ("db_query", "shadowed")] {
+            state.services.insert(
+                ServiceName::new(name).unwrap(),
+                Service {
+                    description: desc.into(),
+                    allow: vec![RoleName::member()],
+                    hosts: vec![node(4)],
+                    readers: vec![],
+                },
+            );
+        }
+        let grants: Vec<Grant> = ["db_query", "orders-db"]
+            .into_iter()
+            .map(|n| Grant {
+                service: ServiceName::new(n).unwrap(),
+                role: RoleName::member(),
+            })
+            .collect();
+        let aliases = ToolsConfig {
+            tools: vec![entry("db_query", "an alias")],
+            ..ToolsConfig::default()
+        };
+        let config = with_services(aliases, &state, &grants);
+        let names: Vec<_> = config.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["db_query", "orders-db"]);
+        assert_eq!(config.tools[0].description, "an alias");
+        assert_eq!(config.tools[1].target, ToolTarget::Service);
+        assert_eq!(config.tools[1].description, "Read-only SQL");
     }
 
     proptest! {

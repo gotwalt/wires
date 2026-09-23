@@ -75,9 +75,9 @@ Caller — runs remote CLIs (every role joins the same way):
   id        Print this node's id: what you send the admin
   join      Install the admin's invite token: credentials, channel, peers
   login     Sign in with your IdP, binding this node's key to your identity
-  call      Run a remote CLI by name: stdio passes through, its exit code is ours
-  tools     List the tools your channel's hosts let you run (aliases: add / rm)
-  mcp       Serve those tools as MCP tools over stdio (compatibility)
+  services  List the services you may call, and the role that lets you
+  call      Run a service by name: stdio passes through, its exit code is ours
+  mcp       Serve those services as MCP tools over stdio (compatibility)
   inbox     Read what hosts pushed to you; --wait blocks until something arrives
 
 Observer — watches calls:
@@ -131,17 +131,20 @@ enum Command {
     /// print this node's id.
     Join(caller::join::JoinArgs),
     /// Sign in with your IdP (OIDC), binding this node's key to your identity;
-    /// with `--topic`, publish the claim for every reader to verify.
+    /// the token is stored locally and presented when you call.
     Login(caller::login::LoginArgs),
-    /// Run a remote CLI by name (announced on the channel, or a `tools.json`
-    /// alias): stdio passes through, its exit code becomes ours, a refusal
-    /// exits 77.
+    /// List the services you may call (evaluated locally against the signed
+    /// state), with what each does and the role that admits you.
+    Services(caller::services::ServicesArgs),
+    /// Run a service by name (or a `tools.json` alias): stdio passes through,
+    /// its exit code becomes ours, a refusal exits 77.
     Call(caller::call::CallArgs),
-    /// List the tools the hosts on your channel let you run; `add` / `list` /
-    /// `rm` edit the local aliases in `tools.json`.
+    /// The old name of `wires services`; `add` / `list` / `rm` edit the local
+    /// aliases in `tools.json`.
+    #[command(hide = true)]
     Tools(caller::tools::ToolsArgs),
-    /// Serve the tools you can run (announced, plus aliases) as MCP tools over
-    /// stdio (for clients that only speak MCP).
+    /// Serve the services you may call (plus aliases) as MCP tools over stdio
+    /// (for clients that only speak MCP).
     Mcp(caller::mcp::McpArgs),
     /// Print what hosts pushed to you (verified sender first), and mark it
     /// read; `--wait` blocks until something arrives (exit 124 on
@@ -295,6 +298,14 @@ fn main() {
             init_quiet_logging();
             match runtime().block_on(caller::call::call_cmd(a)) {
                 Ok(code) => std::process::exit(code),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::Services(a) => {
+            init_quiet_logging();
+            match runtime().block_on(caller::services::run(&a)) {
+                Ok(out) if out.is_empty() => {}
+                Ok(out) => println!("{out}"),
                 Err(e) => exit_with(e),
             }
         }

@@ -13,9 +13,9 @@
 //!    uses), so a misconfigured client fails here and not on the observer;
 //! 2. it is stored in the keystore as [`ID_TOKEN_FILE`] (`0600`), plus
 //!    [`REFRESH_TOKEN_FILE`] when the IdP granted one;
-//! 3. with `--topic`, `ChannelRecord::Identity` is published — through the
-//!    resident tail's control socket if one is running, else one-shot, exactly
-//!    as `wires advanced publish` does.
+//! 3. nothing is published (card 27): `wires call` presents the stored token
+//!    in its session `Hello`, and the host verifies it there. `--topic` is
+//!    still accepted, and ignored with a note, so old scripts keep running.
 //!
 //! Configuration (flag, else environment): `--client-id` /
 //! `WIRES_OIDC_CLIENT_ID` (required), `--client-secret` /
@@ -28,15 +28,12 @@
 //! suite's mock issuer); it is not a general server.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use clap::Args;
-use library::{
-    Audience, ChannelRecord, IdToken, IdentityClaim, Issuer, NodeId, OidcNonce, Principal,
-};
+use library::{Audience, IdToken, IdentityClaim, Issuer, NodeId, OidcNonce, Principal};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -44,9 +41,7 @@ use url::Url;
 
 use crate::admin::keystore;
 use crate::caller::jwks::{Discovery, KeyFetcher};
-use crate::channel::context::{TopicArgs, TopicContext};
 use crate::channel::idp_view::DEFAULT_ISSUER;
-use crate::channel::ipc;
 
 /// The raw ID token, in the keystore (mode `0600`).
 pub(crate) const ID_TOKEN_FILE: &str = "idp-token.jwt";
@@ -80,14 +75,15 @@ const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL
 /// `login` arguments.
 #[derive(Args, Debug, Default)]
 pub(crate) struct LoginArgs {
-    /// Publish the identity claim on this topic (name, as for `wires advanced publish`).
-    #[arg(long)]
+    /// Ignored (card 27): the token travels in each call's handshake, not
+    /// on a channel. Accepted so old scripts keep working.
+    #[arg(long, hide = true)]
     pub topic: Option<String>,
-    /// A base64 topic ticket to bootstrap from (with `--topic`). Repeatable.
-    #[arg(long = "peer")]
+    /// Ignored, with `--topic`.
+    #[arg(long = "peer", hide = true)]
     pub peer: Vec<String>,
-    /// Use a self-hosted relay at this URL (with `--topic`).
-    #[arg(long)]
+    /// Ignored, with `--topic`.
+    #[arg(long, hide = true)]
     pub relay_url: Option<String>,
     /// Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`,
     /// then `--node-seed-file`, then the keystore (`node.seed`).
@@ -111,7 +107,7 @@ pub(crate) struct LoginArgs {
     /// this node (Google omits `nonce` on refresh).
     #[arg(long, conflicts_with = "reuse")]
     pub refresh: bool,
-    /// Re-publish the stored ID token (if it still verifies) without signing in.
+    /// Re-verify the stored ID token without signing in.
     #[arg(long)]
     pub reuse: bool,
     /// Print the sign-in URL but do not try to open a browser.
@@ -686,29 +682,16 @@ fn open_browser(url: &Url, launch: bool) {
 /// `wires login`.
 pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
     crate::init_logging();
-    let ks = Arc::new(keystore::Keystore::resolve()?);
+    let ks = keystore::Keystore::resolve()?;
     let home = keystore::home()?;
-    let ctx = match &a.topic {
-        Some(topic) => Some(TopicContext::resolve(
-            Arc::clone(&ks),
-            home.clone(),
-            &TopicArgs {
-                topic: topic.clone(),
-                peer: a.peer.clone(),
-                node_seed: a.node_seed.clone(),
-                node_seed_file: a.node_seed_file.clone(),
-                relay_url: a.relay_url.clone(),
-                ..TopicArgs::default()
-            },
-        )?),
-        None => None,
-    };
-    let node = match &ctx {
-        Some(ctx) => ctx.node.node_id(),
-        None => {
-            keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?.node_id()
-        }
-    };
+    if a.topic.is_some() || !a.peer.is_empty() || a.relay_url.is_some() {
+        eprintln!(
+            "wires login: --topic/--peer/--relay-url are ignored: the token is stored and \
+             presented when you call (nothing is published)"
+        );
+    }
+    let node =
+        keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?.node_id();
     let client = OidcClient::resolve(&a)?;
     let fetcher = KeyFetcher::new(Some(home.join("jwks")))?;
     let token_path = ks.path(ID_TOKEN_FILE);
@@ -764,36 +747,7 @@ pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
         token_path.display(),
         login.principal.not_after
     );
-    match &ctx {
-        Some(ctx) => {
-            publish_claim(ctx, &login.claim).await?;
-            eprintln!(
-                "wires login: identity claim published on topic {:?}",
-                ctx.name
-            );
-        }
-        None => eprintln!(
-            "wires login: pass --topic <name> (or rerun with `--reuse --topic <name>`) to publish \
-             the claim"
-        ),
-    }
     Ok(())
-}
-
-/// Publish `claim` on `ctx`'s topic the way `wires advanced publish` does.
-async fn publish_claim(ctx: &TopicContext, claim: &IdentityClaim) -> Result<()> {
-    let text = ChannelRecord::Identity(claim.clone()).to_text()?;
-    let messages = crate::channel::publish::Messages::One(Some(text));
-    if let Some(client) = ipc::ControlClient::connect(&ctx.socket_path()).await? {
-        return crate::channel::publish::publish_through_tail(ctx, client, messages).await;
-    }
-    crate::channel::publish::publish_one_shot(
-        ctx,
-        messages,
-        crate::channel::publish::PUBLISH_NEIGHBOR_WAIT,
-        crate::channel::publish::PUBLISH_LINGER,
-    )
-    .await
 }
 
 #[cfg(test)]

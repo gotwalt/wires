@@ -53,6 +53,10 @@ pub enum ToolTarget {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         addrs: Vec<SocketAddr>,
     },
+    /// A service in this node's signed state (card 27): the host is picked
+    /// at call time, never pinned. Built by `wires mcp`, not written to
+    /// `tools.json` by any command.
+    Service,
 }
 
 /// One remote CLI the caller can invoke.
@@ -72,8 +76,10 @@ pub struct RemoteTool {
 impl RemoteTool {
     /// One short line saying where this tool lives, for `wires tools list`.
     pub fn target_summary(&self) -> String {
-        let ToolTarget::Node { node, .. } = &self.target;
-        format!("node → {}", short(&node.hex()))
+        match &self.target {
+            ToolTarget::Node { node, .. } => format!("node → {}", short(&node.hex())),
+            ToolTarget::Service => "service".to_string(),
+        }
     }
 }
 
@@ -243,9 +249,27 @@ pub async fn tools_cmd(a: ToolsArgs) -> Result<String> {
     if a.cmd.is_some() {
         return run_tools_cmd(a);
     }
+    // Card 27: with a signed state, `wires tools` is `wires services`.
+    if holds_state() {
+        let listing = crate::caller::services::run(&Default::default()).await?;
+        let config = ToolsConfig::load(&resolve_path(a.tools_file.as_deref())?)?;
+        let aliases = render_aliases(&config);
+        return Ok([listing, aliases]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
     let path = resolve_path(a.tools_file.as_deref())?;
     let config = ToolsConfig::load(&path)?;
     crate::caller::resolve::list_cmd(&config).await
+}
+
+/// Whether this node holds a signed state (a `state.json` beside its keys).
+fn holds_state() -> bool {
+    crate::admin::keystore::Keystore::resolve()
+        .map(|ks| ks.path(crate::state::store::STATE_FILE).exists())
+        .unwrap_or(false)
 }
 
 /// Run a `wires tools` alias subcommand against the tools file; returns what

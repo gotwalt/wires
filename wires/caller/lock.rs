@@ -279,7 +279,8 @@ mod tests {
             .filter(|l| !OVERRIDE_FLAGS.contains(&l.as_str()))
             .collect();
         call_flags.sort();
-        assert_eq!(call_flags, ["--head", "--jq", "--max-bytes"]);
+        // `--verbose` only names the host that answered: it steers nothing.
+        assert_eq!(call_flags, ["--head", "--jq", "--max-bytes", "--verbose"]);
     }
 
     #[test]
