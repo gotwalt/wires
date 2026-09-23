@@ -848,10 +848,7 @@ fn cli_admin(command: Command) -> Result<String, String> {
         Command::Roster(a) => run_roster_cmd(a),
         Command::Revoke(a) => run_revoke_cmd(a).map_err(stringify),
         Command::Import(a) => run_import_cmd(a).map_err(|e| format!("{e:#}")),
-        Command::Serve(_)
-        | Command::Connect(_)
-        | Command::Publish(_)
-        | Command::Tail(_) => {
+        Command::Serve(_) | Command::Connect(_) | Command::Publish(_) | Command::Tail(_) => {
             unreachable!("handled in main")
         }
     }
