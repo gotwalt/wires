@@ -812,7 +812,9 @@ mod tests {
         let r = dir.resolve("db_query", 100, &[]).unwrap();
         assert!(r.listed && !r.stale);
         assert_eq!(r.tool.description, "db_query it");
-        let ToolTarget::Node { node, addrs, .. } = &r.tool.target;
+        let ToolTarget::Node { node, addrs, .. } = &r.tool.target else {
+            unreachable!()
+        };
         assert_eq!(*node, id(1).node_id());
         assert_eq!(addrs, &listing(&[]).addrs);
     }
@@ -834,7 +836,9 @@ mod tests {
         let r = dir
             .resolve(&format!("{}/db_query", host8(2)), 100, &[])
             .unwrap();
-        let ToolTarget::Node { node, .. } = r.tool.target;
+        let ToolTarget::Node { node, .. } = r.tool.target else {
+            unreachable!()
+        };
         assert_eq!(node, id(2).node_id());
         assert_eq!(r.tool.name.as_str(), "db_query");
     }
@@ -851,7 +855,9 @@ mod tests {
             ],
         );
         let r = dir.resolve("db_query", 3_500, &[]).unwrap();
-        let ToolTarget::Node { node, .. } = r.tool.target;
+        let ToolTarget::Node { node, .. } = r.tool.target else {
+            unreachable!()
+        };
         assert_eq!(node, id(2).node_id(), "the live one");
         let only_stale = dir_with(&me, &[ann_for(1, 0, &me, &["db_query"])]);
         assert!(only_stale.resolve("db_query", 3_500, &[]).unwrap().stale);
@@ -872,7 +878,9 @@ mod tests {
             vec![TopicPeer::new(id(1).node_id()).with_addrs(vec!["127.0.0.1:9".parse().unwrap()])];
         let r = dir.resolve("db_query", 100, &peers).unwrap();
         assert!(!r.listed);
-        let ToolTarget::Node { addrs, .. } = &r.tool.target;
+        let ToolTarget::Node { addrs, .. } = &r.tool.target else {
+            unreachable!()
+        };
         assert_eq!(addrs, &peers[0].addrs, "dial hints from the join's peers");
 
         let two = dir_with(

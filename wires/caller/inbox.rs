@@ -947,11 +947,36 @@ async fn read_loop(
     }
 }
 
+/// The hosts of every service this node may call (card 27), once each; `None`
+/// when it holds no signed state yet (the channel directory stands in).
+async fn service_hosts(ctx: &TopicContext) -> Result<Option<Vec<NodeId>>> {
+    if crate::state::store::read(&ctx.keystore, ctx.membership.fabric)?.is_none() {
+        return Ok(None);
+    }
+    let allowed = crate::caller::services::allowed(&ctx.keystore).await?;
+    Ok(Some(crate::caller::pick::hosts_of(
+        &allowed.state.state,
+        allowed.grants.iter().map(|g| &g.service),
+    )))
+}
+
 /// A cold fetcher: this node's endpoint, the channel's hosts (refreshing
 /// the directory from the channel when it knows none), and the `Hello`.
 async fn cold_fetcher(
     ctx: &TopicContext,
 ) -> Result<(Endpoint, Vec<(NodeId, EndpointAddr)>, InboxFrame)> {
+    // Card 27: the hosts of the services this node may call, from its signed
+    // state (no channel read, no directory).
+    if let Some(hosts) = service_hosts(ctx).await? {
+        let hints = crate::caller::pick::Hints::load(&ctx.keystore, ctx.membership.fabric);
+        let targets = hosts
+            .iter()
+            .copied()
+            .zip(hints.targets(&hosts, ctx.relay_url.as_deref()))
+            .collect();
+        let endpoint = transport::bind(&ctx.node, ctx.relay_url.as_deref()).await?;
+        return Ok((endpoint, targets, hello(ctx)));
+    }
     let path = Directory::path(&ctx.home);
     let mut dir = Directory::load(&path, &ctx.name);
     if dir.hosts.is_empty() {

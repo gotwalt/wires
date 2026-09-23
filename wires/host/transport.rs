@@ -34,8 +34,8 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use std::collections::BTreeMap;
 
 use library::{
-    Chunk, Frame, InclusionProof, Invocation, Membership, NodeId, NodeIdentity, RosterHead,
-    ToolName, check_inclusion,
+    Chunk, Frame, Hello, InclusionProof, Invocation, Membership, NodeId, NodeIdentity, RosterHead,
+    SignedState, ToolName, check_inclusion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
@@ -316,14 +316,14 @@ pub async fn bind_with_alpn(
 // ---------------------------------------------------------------------------
 
 /// Write one length-prefixed frame.
-async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> Result<()> {
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> Result<()> {
     let bytes = frame.encode().context("encoding frame")?;
     w.write_all(&bytes).await.context("writing frame")?;
     Ok(())
 }
 
 /// Read one length-prefixed frame, or `None` at a clean end of stream.
-async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>> {
+pub(crate) async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>> {
     let mut len_buf = [0u8; 4];
     match r.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -1022,28 +1022,96 @@ where
     result
 }
 
-/// The dialer half of a session over an established bi-stream. Presents the
-/// handshake, then reads the responder's `HandshakeAck`; when `verify_target` is
-/// `Some` (always, from [`call_on`]), verifies the responder's membership against the
-/// dialer's own fabric root and the authenticated target id **before** any stdin
-/// is forwarded. On failure, aborts with no stdin sent.
+/// What a service call came to: [`Dialed`] plus the host that answered.
+#[derive(Debug)]
+pub(crate) struct ServiceDialed {
+    /// The host that ran the call.
+    pub(crate) host: NodeId,
+    /// The remote exit code and any newer state.
+    pub(crate) dialed: Dialed,
+}
+
+/// Card 27's dial: try each of `targets` (a service's hosts, in the caller's
+/// preferred order) until one connects within `dial_timeout`, then open with
+/// `hello`, send `invocation` and bridge stdio on that one.
 ///
-/// The [`Frame::Invoke`] carrying `invocation` follows the handshake
-/// immediately, without waiting for the ack.
-///
-/// Errors if the session ends **without** an [`Frame::Exit`] — a responder that
-/// closes mid-session is a failure, not a silent success.
+/// Fails over **only on a dial failure**: once a host has answered, its
+/// refusal ([`Denied`]) or a mid-session error is final (it decided, and
+/// stdin may already be spent). Errors if no target connects, naming each
+/// failure. Does not close `endpoint`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_service_on<R, W, E>(
+    endpoint: &Endpoint,
+    targets: &[EndpointAddr],
+    dial_timeout: std::time::Duration,
+    hello: Hello,
+    invocation: Invocation,
+    stdin: R,
+    stdout: W,
+    stderr: E,
+) -> Result<ServiceDialed>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    let mut failures = Vec::new();
+    for target in targets {
+        let host = to_node_id(&target.id);
+        let conn = match tokio::time::timeout(dial_timeout, endpoint.connect(target.clone(), ALPN))
+            .await
+        {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                tracing::debug!(host = %host.hex(), "dial failed: {e}");
+                failures.push(format!("{}: {e}", &host.hex()[..8]));
+                continue;
+            }
+            Err(_) => {
+                tracing::debug!(host = %host.hex(), "dial timed out");
+                failures.push(format!(
+                    "{}: no answer within {}s",
+                    &host.hex()[..8],
+                    dial_timeout.as_secs_f32()
+                ));
+                continue;
+            }
+        };
+        let host = to_node_id(&conn.remote_id());
+        let (send, recv) = conn.open_bi().await.context("opening bi-stream")?;
+        let dialed = dial_opened(
+            send,
+            recv,
+            Opening::Hello(hello),
+            invocation,
+            Some(host),
+            stdin,
+            stdout,
+            stderr,
+        )
+        .await;
+        conn.close(0u32.into(), b"done");
+        return dialed.map(|dialed| ServiceDialed { host, dialed });
+    }
+    if failures.is_empty() {
+        bail!("no host to dial");
+    }
+    bail!("no host answered ({})", failures.join("; "))
+}
+
+/// The dialer half of a session over an established bi-stream, with the
+/// legacy `Handshake` opening (see [`dial_opened`]).
 #[allow(clippy::too_many_arguments)]
 async fn dial_session<S, R, I, W, E>(
-    mut send: S,
-    mut recv: R,
+    send: S,
+    recv: R,
     membership: Membership,
     proof: Option<InclusionProof>,
     invocation: Invocation,
     verify_target: Option<NodeId>,
     stdin: I,
-    mut stdout: W,
-    mut stderr: E,
+    stdout: W,
+    stderr: E,
 ) -> Result<i32>
 where
     S: AsyncWrite + Unpin + Send + 'static,
@@ -1052,14 +1120,101 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
+    dial_opened(
+        send,
+        recv,
+        Opening::Handshake { membership, proof },
+        invocation,
+        verify_target,
+        stdin,
+        stdout,
+        stderr,
+    )
+    .await
+    .map(|d| d.exit)
+}
+
+/// How a dialer opens a session: the legacy membership handshake, or the
+/// card-27 [`Hello`] (membership, state version, ID token).
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Opening {
+    /// `Frame::Handshake { membership, proof }`, answered by `HandshakeAck`.
+    Handshake {
+        /// The dialer's membership.
+        membership: Membership,
+        /// Its roster inclusion proof, if any.
+        proof: Option<InclusionProof>,
+    },
+    /// `Frame::Hello`, answered by `HelloAck`.
+    Hello(Hello),
+}
+
+impl Opening {
+    fn fabric(&self) -> NodeId {
+        match self {
+            Opening::Handshake { membership, .. } => membership.fabric,
+            Opening::Hello(h) => h.membership.fabric,
+        }
+    }
+
+    fn into_frame(self) -> Frame {
+        match self {
+            Opening::Handshake { membership, proof } => Frame::Handshake { membership, proof },
+            Opening::Hello(h) => Frame::Hello(h),
+        }
+    }
+}
+
+/// What a finished dial came to: the remote exit code and, when the host's
+/// `HelloAck` carried one, the newer signed state it handed back.
+#[derive(Debug)]
+pub(crate) struct Dialed {
+    /// The remote child's exit code.
+    pub(crate) exit: i32,
+    /// The host's newer state (card 27), for the caller to adopt.
+    pub(crate) newer_state: Option<SignedState>,
+}
+
+/// The dialer half of a session over an established bi-stream. Presents the
+/// `opening`, then reads the responder's ack (`HandshakeAck` or `HelloAck`,
+/// matching the opening); when `verify_target` is `Some` (always, from
+/// [`call_on`]), verifies the responder's membership against the dialer's own
+/// fabric root and the authenticated target id **before** any stdin is
+/// forwarded. On failure, aborts with no stdin sent.
+///
+/// The [`Frame::Invoke`] carrying `invocation` follows the opening
+/// immediately, without waiting for the ack.
+///
+/// Errors if the session ends **without** an [`Frame::Exit`] — a responder that
+/// closes mid-session is a failure, not a silent success.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dial_opened<S, R, I, W, E>(
+    mut send: S,
+    mut recv: R,
+    opening: Opening,
+    invocation: Invocation,
+    verify_target: Option<NodeId>,
+    stdin: I,
+    mut stdout: W,
+    mut stderr: E,
+) -> Result<Dialed>
+where
+    S: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin,
+    I: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
     // The dialer's own fabric root is the authority for verifying the responder.
-    let fabric_root = membership.fabric;
-    write_frame(&mut send, &Frame::Handshake { membership, proof }).await?;
+    let fabric_root = opening.fabric();
+    let hello = matches!(opening, Opening::Hello(_));
+    write_frame(&mut send, &opening.into_frame()).await?;
     write_frame(&mut send, &Frame::Invoke(invocation)).await?;
 
     // Read the responder's ack first (it is always the responder's first frame).
-    let ack_membership = match read_frame(&mut recv).await? {
-        Some(Frame::HandshakeAck { membership, .. }) => membership,
+    let (ack_membership, newer_state) = match read_frame(&mut recv).await? {
+        Some(Frame::HandshakeAck { membership, .. }) if !hello => (membership, None),
+        Some(Frame::HelloAck(ack)) if hello => (ack.membership, ack.newer_state),
         // Refused: surface the responder's reason. No stdin task has been
         // spawned yet, so nothing was forwarded and nothing hit local stdout.
         Some(Frame::Denied { reason }) => return Err(Denied::new(reason).into()),
@@ -1121,7 +1276,10 @@ where
     if !saw_exit {
         bail!("session ended without an exit code (responder closed early?)");
     }
-    Ok(code)
+    Ok(Dialed {
+        exit: code,
+        newer_state,
+    })
 }
 
 #[cfg(test)]

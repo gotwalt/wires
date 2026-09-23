@@ -1,9 +1,14 @@
 //! `wires call`: run one remote CLI by name, as if it were local.
 //!
-//! The name resolves through the channel's host announcements (the
-//! `directory.json` cache, refreshed from the channel when needed); an alias
-//! in `tools.json` wins over it. Locked mode ([`crate::caller::lock`]) refuses
-//! the override flags a sandboxed agent could steer this with.
+//! The name is a **service** (card 27): its hosts come from this node's
+//! admin-signed state, tried last-good first with failover on a dial failure
+//! ([`crate::caller::pick`]), and the session opens with the card-27
+//! [`Hello`](library::Hello) (membership, state version, ID token). A newer
+//! state a host hands back is adopted. An alias in `tools.json` wins over a
+//! service; with no signed state yet, the channel's host announcements (the
+//! legacy directory) still resolve names until card 27d removes them.
+//! Locked mode ([`crate::caller::lock`]) refuses the override flags a
+//! sandboxed agent could steer this with.
 //!
 //! The CLI-native front door. An agent runs `wires call <tool> [-- args…]`
 //! from its shell: stdin, stdout and stderr pass straight through, the remote
@@ -19,16 +24,25 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
-use library::{Argv, InclusionProof, Invocation, Membership, NodeId, NodeIdentity, ToolName};
+use library::{
+    Argv, InclusionProof, Invocation, Membership, NodeId, NodeIdentity, ServiceName, SignedState,
+    ToolName,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::admin::keystore;
+use crate::admin::keystore::{self, Keystore};
 use crate::caller::lock::{EXIT_LOCKED, Lock, check_process_stdin};
+use crate::caller::pick::{self, Hints, LastGood};
 use crate::caller::shape::{EXIT_SHAPE, Shape, ShapeArgs, exit_code};
 use crate::caller::tools::{RemoteTool, ToolTarget, ToolsConfig};
 use crate::host::transport;
+use crate::state::store;
+
+/// How long one host of a service gets to answer a dial before the next is
+/// tried.
+pub(crate) const SERVICE_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What one remote call came to, fully buffered.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -82,7 +96,13 @@ impl Dial {
             node,
             relay_url,
             addrs,
-        } = &tool.target;
+        } = &tool.target
+        else {
+            bail!(
+                "`{}` is a service: it resolves to a host at call time",
+                tool.name
+            );
+        };
         let remote = tool
             .remote_tool
             .clone()
@@ -173,9 +193,30 @@ impl WiresCaller {
 
 impl Caller for WiresCaller {
     async fn call(&self, tool: &RemoteTool, argv: Argv, stdin: Vec<u8>) -> Result<CallOutcome> {
-        let plan = Dial::resolve(tool, argv)?;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        if tool.target == ToolTarget::Service {
+            let result = async {
+                let ks = Keystore::resolve()?;
+                let state = stored_state(&ks, &self.creds)?
+                    .ok_or_else(|| anyhow!("this node holds no signed state"))?;
+                call_service(
+                    &self.creds,
+                    &ks,
+                    &state,
+                    &ServiceName::from(tool.name.clone()),
+                    argv,
+                    std::io::Cursor::new(stdin),
+                    &mut stdout,
+                    &mut stderr,
+                    false,
+                )
+                .await
+            }
+            .await;
+            return outcome(result, stdout, stderr);
+        }
+        let plan = Dial::resolve(tool, argv)?;
         let result = dial(
             &self.creds,
             plan,
@@ -203,6 +244,126 @@ fn outcome(result: Result<i32>, stdout: Vec<u8>, stderr: Vec<u8>) -> Result<Call
             None => Err(e),
         },
     }
+}
+
+/// This node's verified signed state, under the fabric root its membership
+/// names; `None` if it holds none yet.
+pub(crate) fn stored_state(ks: &Keystore, creds: &Credentials) -> Result<Option<SignedState>> {
+    store::read(ks, creds.membership.fabric)
+}
+
+/// Call `service` (card 27): its hosts from `state`, last-good first, failing
+/// over on a dial failure; open with the [`Hello`](library::Hello), bridge
+/// stdio, adopt any newer state the host hands back, remember the host that
+/// answered. `verbose` names that host on stderr. A refusal is a
+/// [`transport::Denied`] error, as in [`dial`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_service<R, W, E>(
+    creds: &Credentials,
+    ks: &Keystore,
+    state: &SignedState,
+    service: &ServiceName,
+    argv: Argv,
+    stdin: R,
+    stdout: W,
+    stderr: E,
+    verbose: bool,
+) -> Result<i32>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    crate::admin::keystore::preflight(creds.node.node_id(), &creds.membership)
+        .map_err(anyhow::Error::msg)?;
+    let relay = creds.relay_override.as_deref();
+    let endpoint = transport::bind(&creds.node, relay).await?;
+    let dial = ServiceDial {
+        endpoint: &endpoint,
+        hints: Hints::load(ks, creds.membership.fabric),
+        timeout: SERVICE_DIAL_TIMEOUT,
+    };
+    let result = call_service_with(
+        creds, ks, state, service, &dial, argv, stdin, stdout, stderr, verbose,
+    )
+    .await;
+    endpoint.close().await;
+    result
+}
+
+/// How [`call_service_with`] reaches hosts.
+pub(crate) struct ServiceDial<'a> {
+    /// This node's bound endpoint (not closed here).
+    pub(crate) endpoint: &'a iroh::Endpoint,
+    /// Address hints for the hosts.
+    pub(crate) hints: Hints,
+    /// How long each host gets to answer a dial.
+    pub(crate) timeout: std::time::Duration,
+}
+
+/// [`call_service`] over a given endpoint and hints.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_service_with<R, W, E>(
+    creds: &Credentials,
+    ks: &Keystore,
+    state: &SignedState,
+    service: &ServiceName,
+    dial: &ServiceDial<'_>,
+    argv: Argv,
+    stdin: R,
+    stdout: W,
+    stderr: E,
+    verbose: bool,
+) -> Result<i32>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    let last_good = LastGood::path(ks);
+    let hosts = pick::candidates(
+        &state.state,
+        service,
+        LastGood::load(&last_good).get(service),
+    );
+    if hosts.is_empty() {
+        bail!("no service named `{service}` with a host (see `wires services`)");
+    }
+    let hello = crate::caller::hello::with_membership(ks, creds.membership.clone())?;
+    let targets = dial.hints.targets(&hosts, creds.relay_override.as_deref());
+    let done = transport::call_service_on(
+        dial.endpoint,
+        &targets,
+        dial.timeout,
+        hello,
+        Invocation {
+            tool: service.clone().into(),
+            argv,
+        },
+        stdin,
+        stdout,
+        stderr,
+    )
+    .await
+    .with_context(|| format!("calling {service}"))?;
+    if verbose {
+        eprintln!(
+            "wires: {service} answered by host {}",
+            pick::short(&done.host)
+        );
+    }
+    LastGood::record(&last_good, service, done.host);
+    if let Some(newer) = &done.dialed.newer_state {
+        match store::adopt_if_newer(ks, newer, creds.membership.fabric, crate::now_unix()) {
+            Ok(true) => tracing::info!(
+                version = newer.state.version.0,
+                "adopted the host's newer signed state"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("the host's newer state was not adopted: {e:#}"),
+        }
+    }
+    Ok(done.dialed.exit)
 }
 
 /// Credential and config flags shared by `wires call` and `wires mcp`.
@@ -251,8 +412,10 @@ pub struct CallArgs {
     /// `Bash(wires call gh:*)`, still matches) or before it.
     #[command(flatten)]
     pub shape: ShapeArgs,
-    /// The tool's name as your channel's hosts announce it (`wires tools`),
-    /// `<host8>/<name>` to pick one host, or an alias from `tools.json`.
+    /// Say on stderr which host answered (callers don't normally care).
+    #[arg(long)]
+    pub verbose: bool,
+    /// The service's name (`wires services`), or an alias from `tools.json`.
     pub tool: String,
     /// Extra arguments appended to the remote command. Use `--` before any
     /// that start with `-`.
@@ -310,23 +473,40 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
     let config = ToolsConfig::load(&crate::caller::tools::resolve_path(
         a.creds.tools_file.as_deref(),
     )?)?;
-    // An alias in tools.json, else the channel's host announcements (card 15).
-    let tool = crate::caller::resolve::resolve_tool(&config, &a.tool, &a.creds).await?;
     let argv = Argv::new(a.args).context("arguments")?;
-    let plan = Dial::resolve(&tool, argv)?;
     let creds = Credentials::resolve(&a.creds)?;
+    let route = route(&config, &a.tool, &creds)?;
+    let plan = match &route {
+        Route::Service { .. } => None,
+        // An alias, else (no signed state yet) the channel's announcements.
+        Route::Legacy => Some(Dial::resolve(
+            &crate::caller::resolve::resolve_tool(&config, &a.tool, &a.creds).await?,
+            argv.clone(),
+        )?),
+    };
+    let run = async |stdout: &mut (dyn AsyncWrite + Unpin + Send)| match (&route, plan) {
+        (Route::Service { ks, state, service }, _) => {
+            call_service(
+                &creds,
+                ks,
+                state,
+                service,
+                argv,
+                stdin,
+                stdout,
+                tokio::io::stderr(),
+                a.verbose,
+            )
+            .await
+        }
+        (Route::Legacy, Some(plan)) => dial(&creds, plan, stdin, stdout, tokio::io::stderr()).await,
+        (Route::Legacy, None) => unreachable!("a legacy route always has a plan"),
+    };
     if shape.is_identity() {
-        return dial(
-            &creds,
-            plan,
-            stdin,
-            tokio::io::stdout(),
-            tokio::io::stderr(),
-        )
-        .await;
+        return run(&mut tokio::io::stdout()).await;
     }
     let mut stdout = Vec::new();
-    let remote = dial(&creds, plan, stdin, &mut stdout, tokio::io::stderr()).await?;
+    let remote = run(&mut stdout).await?;
     write_shaped(
         &shape,
         remote,
@@ -335,6 +515,40 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
         tokio::io::stderr(),
     )
     .await
+}
+
+/// Where `wires call <name>` goes.
+#[allow(clippy::large_enum_variant)]
+enum Route {
+    /// A service in this node's signed state.
+    Service {
+        /// This node's keystore.
+        ks: Keystore,
+        /// The verified state it holds.
+        state: SignedState,
+        /// The service.
+        service: ServiceName,
+    },
+    /// An alias in `tools.json`, or (no signed state) the legacy directory.
+    Legacy,
+}
+
+/// An alias wins; else a service registered in the stored state; else, only
+/// when this node holds no signed state yet, the legacy directory. A name the
+/// state doesn't register is an error that points at `wires services`.
+fn route(config: &ToolsConfig, name: &str, creds: &Credentials) -> Result<Route> {
+    if lookup(config, name).is_ok() {
+        return Ok(Route::Legacy);
+    }
+    let ks = Keystore::resolve()?;
+    let Some(state) = stored_state(&ks, creds)? else {
+        return Ok(Route::Legacy);
+    };
+    let service = ServiceName::new(name).map_err(|e| anyhow!("`{name}`: {e}"))?;
+    if state.state.service(&service).is_none() {
+        bail!("no service named `{name}` (see `wires services`)");
+    }
+    Ok(Route::Service { ks, state, service })
 }
 
 /// Shape a finished call's `stdout`, write it to `out` and any notes to
@@ -655,5 +869,253 @@ mod tests {
         assert_eq!(a.creds.tools_file, Some(PathBuf::from("/t.json")));
         assert_eq!(a.args, ["-n"]);
         assert!(parse(&["rg"]).args.is_empty());
+    }
+
+    /// Card 27, the dial side against a minimal in-test acceptor (the host's
+    /// accept side is lane 27c): what a host answers a `Hello` with.
+    #[derive(Clone)]
+    #[allow(clippy::large_enum_variant)]
+    enum Answer {
+        /// `HelloAck` (with `newer` when the caller's state is older), then
+        /// `out` on stdout and exit 0.
+        Run {
+            out: &'static str,
+            newer: Option<SignedState>,
+        },
+        /// `Denied`.
+        Deny(&'static str),
+    }
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<library::Hello>>>;
+
+    /// A loopback host speaking just enough of the session protocol: it
+    /// records each `Hello` it receives and answers per `answer`.
+    async fn fake_host(
+        root: &NodeIdentity,
+        me: &NodeIdentity,
+        answer: Answer,
+    ) -> (NodeId, SocketAddr, Seen) {
+        use library::{Chunk, Frame, HelloAck};
+        let seen: Seen = Default::default();
+        let ep = test_endpoint(me).await;
+        let addr = loopback(&ep);
+        let membership = Membership::mint(root, me.node_id(), 0, i64::MAX).unwrap();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                let Ok(conn) = incoming.await else { continue };
+                let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+                    continue;
+                };
+                let Ok(Some(Frame::Hello(hello))) = transport::read_frame(&mut recv).await else {
+                    continue;
+                };
+                let _invoke = transport::read_frame(&mut recv).await;
+                let caller_version = hello.state_version;
+                log.lock().unwrap().push(hello);
+                match &answer {
+                    Answer::Deny(reason) => {
+                        let denied = Frame::Denied {
+                            reason: reason.to_string(),
+                        };
+                        let _ = transport::write_frame(&mut send, &denied).await;
+                    }
+                    Answer::Run { out, newer } => {
+                        let ack = Frame::HelloAck(HelloAck {
+                            membership: membership.clone(),
+                            state_version: newer
+                                .as_ref()
+                                .map_or(caller_version, |n| n.state.version),
+                            newer_state: newer.clone().filter(|n| n.state.version > caller_version),
+                        });
+                        let _ = transport::write_frame(&mut send, &ack).await;
+                        let chunk = Chunk::from_bytes(out.as_bytes().to_vec());
+                        let _ = transport::write_frame(&mut send, &Frame::Stdout(chunk)).await;
+                        let _ = transport::write_frame(&mut send, &Frame::Exit(0)).await;
+                    }
+                }
+                let _ = send.finish();
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), conn.closed()).await;
+            }
+        });
+        (me.node_id(), addr, seen)
+    }
+
+    async fn test_endpoint(id: &NodeIdentity) -> iroh::Endpoint {
+        iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(transport::secret_key(id))
+            .alpns(vec![transport::ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    fn loopback(ep: &iroh::Endpoint) -> SocketAddr {
+        ep.bound_sockets()
+            .into_iter()
+            .find(SocketAddr::is_ipv4)
+            .map(|s| SocketAddr::from(([127, 0, 0, 1], s.port())))
+            .unwrap()
+    }
+
+    /// A signed state at `version` in which `hosts` implement `orders-db`.
+    fn signed_state(
+        root: &NodeIdentity,
+        version: u64,
+        caller: NodeId,
+        hosts: &[NodeId],
+    ) -> SignedState {
+        use library::{RoleName, Service, State, StateVersion};
+        let mut s = State::new(root.node_id());
+        s.version = StateVersion(version);
+        s.issued = 1;
+        s.not_after = i64::MAX;
+        s.members.insert(caller);
+        s.members.extend(hosts.iter().copied());
+        s.hosts.extend(hosts.iter().copied());
+        s.services.insert(
+            ServiceName::new("orders-db").unwrap(),
+            Service {
+                description: "Read-only SQL".into(),
+                allow: vec![RoleName::member()],
+                hosts: hosts.to_vec(),
+                readers: vec![],
+            },
+        );
+        s.sign(root).unwrap()
+    }
+
+    struct Fixture {
+        root: NodeIdentity,
+        creds: Credentials,
+        ks: Keystore,
+    }
+
+    fn fixture() -> Fixture {
+        let root = NodeIdentity::from_seed([80; 32]);
+        let me = NodeIdentity::from_seed([81; 32]);
+        let ks = Keystore::at(crate::testutil::temp_dir());
+        std::fs::write(ks.path(crate::caller::login::ID_TOKEN_FILE), "h.p.s\n").unwrap();
+        let membership = Membership::mint(&root, me.node_id(), 0, i64::MAX).unwrap();
+        Fixture {
+            creds: Credentials {
+                node: me,
+                membership,
+                proof: None,
+                relay_override: None,
+            },
+            root,
+            ks,
+        }
+    }
+
+    async fn run_service(f: &Fixture, state: &SignedState, hints: Hints) -> (Result<i32>, String) {
+        let endpoint = test_endpoint(&f.creds.node).await;
+        let dial = ServiceDial {
+            endpoint: &endpoint,
+            hints,
+            timeout: std::time::Duration::from_millis(700),
+        };
+        let mut stdout = Vec::new();
+        let r = call_service_with(
+            &f.creds,
+            &f.ks,
+            state,
+            &ServiceName::new("orders-db").unwrap(),
+            &dial,
+            Argv::default(),
+            std::io::Cursor::new(Vec::new()),
+            &mut stdout,
+            Vec::new(),
+            false,
+        )
+        .await;
+        endpoint.close().await;
+        (r, String::from_utf8(stdout).unwrap())
+    }
+
+    /// Host A is down, host B answers: the call fails over to B, presents a
+    /// `Hello` with this node's membership, state version and stored token,
+    /// adopts the newer state B hands back, and remembers B as last-good.
+    #[tokio::test]
+    async fn a_service_call_fails_over_and_adopts_the_hosts_newer_state() {
+        let f = fixture();
+        let down = NodeIdentity::from_seed([82; 32]).node_id();
+        let b = NodeIdentity::from_seed([83; 32]);
+        let me = f.creds.node.node_id();
+        let v1 = signed_state(&f.root, 1, me, &[down, b.node_id()]);
+        let v2 = signed_state(&f.root, 2, me, &[down, b.node_id()]);
+        store::adopt_if_newer(&f.ks, &v1, f.root.node_id(), 10).unwrap();
+        let answer = Answer::Run {
+            out: "42\n",
+            newer: Some(v2),
+        };
+        let (b_id, b_addr, seen) = fake_host(&f.root, &b, answer).await;
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let hints = Hints::from_pairs([(down, vec![dead]), (b_id, vec![b_addr])]);
+
+        let (r, out) = run_service(&f, &v1, hints.clone()).await;
+        assert_eq!(r.unwrap(), 0);
+        assert_eq!(out, "42\n");
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].membership, f.creds.membership);
+            assert_eq!(seen[0].state_version, library::StateVersion(1));
+            assert_eq!(seen[0].id_token, Some(library::IdToken::new("h.p.s")));
+        }
+        let stored = store::read(&f.ks, f.root.node_id()).unwrap().unwrap();
+        assert_eq!(stored.state.version, library::StateVersion(2));
+        let name = ServiceName::new("orders-db").unwrap();
+        let last = LastGood::load(&LastGood::path(&f.ks));
+        assert_eq!(last.get(&name), Some(b_id));
+
+        // Next call: B is tried first, and presents the adopted version.
+        let (r, _) = run_service(&f, &stored, hints).await;
+        assert_eq!(r.unwrap(), 0);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[1].state_version, library::StateVersion(2));
+    }
+
+    /// A refusal is final: no failover to the next host, and it surfaces as
+    /// `Denied` (exit 77 in `wires call`).
+    #[tokio::test]
+    async fn a_refusal_does_not_fail_over() {
+        let f = fixture();
+        let a = NodeIdentity::from_seed([84; 32]);
+        let b = NodeIdentity::from_seed([85; 32]);
+        let me = f.creds.node.node_id();
+        let state = signed_state(&f.root, 1, me, &[a.node_id(), b.node_id()]);
+        let (a_id, a_addr, _) = fake_host(&f.root, &a, Answer::Deny("not in role analyst")).await;
+        let answer = Answer::Run {
+            out: "",
+            newer: None,
+        };
+        let (b_id, b_addr, b_seen) = fake_host(&f.root, &b, answer).await;
+        let hints = Hints::from_pairs([(a_id, vec![a_addr]), (b_id, vec![b_addr])]);
+        let (r, out) = run_service(&f, &state, hints).await;
+        let err = r.unwrap_err();
+        let denied = err.downcast_ref::<transport::Denied>().expect("a Denied");
+        assert_eq!(denied.reason(), "not in role analyst");
+        assert_eq!(out, "");
+        assert!(
+            b_seen.lock().unwrap().is_empty(),
+            "no failover after a refusal"
+        );
+    }
+
+    /// Every host down: one error naming each.
+    #[tokio::test]
+    async fn no_host_answering_is_an_error_naming_them() {
+        let f = fixture();
+        let a = NodeIdentity::from_seed([86; 32]).node_id();
+        let me = f.creds.node.node_id();
+        let state = signed_state(&f.root, 1, me, &[a]);
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let (r, _) = run_service(&f, &state, Hints::from_pairs([(a, vec![dead])])).await;
+        let err = format!("{:#}", r.unwrap_err());
+        assert!(err.contains("no host answered"), "{err}");
+        assert!(err.contains(&a.hex()[..8]), "{err}");
     }
 }
