@@ -219,7 +219,14 @@ where
             .into(),
         ));
     }
+    // Card 27: every resident node answers state pushes and pulls, and pulls
+    // on a timer if it missed a push.
+    let state = crate::state::sync::StateResponder(Arc::clone(&ctx.keystore));
+    cfg.protocols.push((library::STATE_ALPN, state.into()));
     let node = bind(cfg).await?;
+    let refresh =
+        crate::state::sync::refresh_loop(node.endpoint().clone(), Arc::clone(&ctx.keystore));
+    tokio::spawn(refresh);
     let socket_path = ctx.socket_path();
     tail_banner(&node, ctx, &socket_path);
 

@@ -72,10 +72,22 @@ pub(crate) struct Report {
 pub(crate) async fn invite_cmd(a: InviteArgs) -> anyhow::Result<Report> {
     let ks = Arc::new(Keystore::resolve()?);
     let home = keystore::home()?;
-    invite_in(&ks, &home, a, Timing::CLI, async |cfg| {
+    let mut report = invite_in(&ks, &home, a, Timing::CLI, async |cfg| {
         topics::TopicNode::spawn(&keystore::node_identity_in(&ks)?, cfg).await
     })
-    .await
+    .await?;
+    report
+        .notes
+        .insert(report.notes.len() - 1, push_note(&ks).await);
+    Ok(report)
+}
+
+/// Push the stored state to every member (hosts first) and say how it went.
+async fn push_note(ks: &Keystore) -> String {
+    match crate::state::sync::push_current(ks).await {
+        Ok(line) => line,
+        Err(e) => format!("the new state is stored but was not pushed: {e:#}"),
+    }
 }
 
 /// [`invite_cmd`] against an explicit keystore, with the one-shot node stood
@@ -164,6 +176,12 @@ where
         .filter(|p| p.node != invitee)
         .collect();
     let membership = Membership::mint(&root, invitee, now, not_after)?;
+    // Card 27: the invitee joins the admin-signed state, which rides in the
+    // token; the other members get it by push (`invite_cmd`).
+    let state = super::service::edit_state(ks, a.ttl, |s| {
+        s.members.insert(invitee);
+        Ok(())
+    })?;
     let token = Invite::new(
         channel.clone(),
         membership,
@@ -171,6 +189,7 @@ where
         entry,
         peers.clone(),
     )
+    .with_state(state, keystore::node_identity_in(ks)?.node_id())
     .encode()?;
 
     let mut notes = vec![
@@ -206,10 +225,56 @@ where
 pub(crate) async fn remove_cmd(a: RemoveArgs) -> anyhow::Result<Report> {
     let ks = Arc::new(Keystore::resolve()?);
     let home = keystore::home()?;
-    remove_in(&ks, &home, a, Timing::CLI, async |cfg| {
+    // Card 27: out of the signed state and pushed (hosts first) *before* the
+    // channel re-key, which can take seconds to find a neighbor.
+    let (member, _) = resolve_removal(&ks, &a.member)?;
+    let pushed = match drop_from_state(&ks, member, a.ttl)? {
+        Some(_) => Some(push_note(&ks).await),
+        None => None,
+    };
+    let mut report = remove_in(&ks, &home, a, Timing::CLI, async |cfg| {
         topics::TopicNode::spawn(&keystore::node_identity_in(&ks)?, cfg).await
     })
-    .await
+    .await?;
+    report.notes.extend(pushed);
+    Ok(report)
+}
+
+/// The member `wires remove <text>` means, refusing this machine's own node.
+fn resolve_removal(ks: &Keystore, text: &str) -> anyhow::Result<(NodeId, Option<String>)> {
+    let (member, label) = resolve_member(&ks.read_names()?, text)?;
+    if member == keystore::node_identity_in(ks)?.node_id() {
+        bail!(
+            "{} is this machine's own node: removing it would leave nobody to publish the next \
+             re-key from",
+            member.hex()
+        );
+    }
+    Ok((member, label))
+}
+
+/// Drop `member` from the signed state (and from every service it hosted);
+/// `None` when it is already out.
+fn drop_from_state(
+    ks: &Keystore,
+    member: NodeId,
+    ttl: Ttl,
+) -> anyhow::Result<Option<library::SignedState>> {
+    let Some(root) = ks.read_root_identity()? else {
+        return Ok(None);
+    };
+    let held = crate::state::store::read(ks, root.node_id())?;
+    if held.is_some_and(|s| !s.state.is_member(member)) {
+        return Ok(None);
+    }
+    super::service::edit_state(ks, ttl, |s| {
+        s.members.remove(&member);
+        for svc in s.services.values_mut() {
+            svc.hosts.retain(|h| *h != member);
+        }
+        Ok(())
+    })
+    .map(Some)
 }
 
 /// [`remove_cmd`] against an explicit keystore (the testable form).
@@ -230,15 +295,15 @@ where
         .read_roster()?
         .ok_or_else(|| anyhow::anyhow!("no roster here; run `wires init` first"))?;
     let mut names = ks.read_names()?;
-    let (member, label) = resolve_member(&names, &a.member)?;
-    if member == keystore::node_identity_in(ks)?.node_id() {
-        bail!(
-            "{} is this machine's own node: removing it would leave nobody to publish the next \
-             re-key from",
-            member.hex()
-        );
-    }
+    let (member, label) = resolve_removal(ks, &a.member)?;
+    let dropped = drop_from_state(ks, member, a.ttl)?.is_some();
     if !roster.remove(&member) {
+        if dropped {
+            return Ok(Report {
+                stdout: format!("removed {} from the signed state", member.hex()),
+                notes: Vec::new(),
+            });
+        }
         bail!("{} is not in the roster", member.hex());
     }
     let committed: Committed = commit_and_distribute(
@@ -271,7 +336,7 @@ where
 }
 
 /// A name or a hex node id → the member, and the label it was known by.
-fn resolve_member(
+pub(crate) fn resolve_member(
     names: &std::collections::BTreeMap<String, NodeId>,
     text: &str,
 ) -> anyhow::Result<(NodeId, Option<String>)> {

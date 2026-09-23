@@ -3,8 +3,9 @@
 //! `wires invite <node-id>` adds the node to the roster, commits, and bundles
 //! the result for that one node: its [`Membership`], the new [`RosterHead`],
 //! its [`RekeyEntry`] (inclusion proof + the fabric key sealed to it), the
-//! channel name, and bootstrap peer hints. `wires join <token>` checks and
-//! installs all of it.
+//! channel name, bootstrap peer hints, and (card 27) the current admin-signed
+//! [`SignedState`] plus the admin's node id to pull newer copies from.
+//! `wires join <token>` checks and installs all of it.
 //!
 //! # Not a secret
 //!
@@ -56,6 +57,7 @@ use crate::membership::Membership;
 use crate::policy::check_inclusion;
 use crate::rekey::{Rekey, RekeyEntry};
 use crate::roster::RosterHead;
+use crate::state::SignedState;
 use crate::topic::TopicPeer;
 
 /// The base64 alphabet for the token: URL-safe, no padding (as every other
@@ -81,6 +83,14 @@ pub struct Invite {
     /// Where the channel's members were last seen (unsigned hints).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<TopicPeer>,
+    /// The current admin-signed state (card 27), naming the invitee as a
+    /// member. Self-verifying under the root; absent from pre-27 tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<SignedState>,
+    /// The admin's node id: where the invitee pulls newer states from (an
+    /// unsigned hint, like `peers`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin: Option<NodeId>,
 }
 
 impl Invite {
@@ -99,7 +109,16 @@ impl Invite {
             head,
             entry,
             peers,
+            state: None,
+            admin: None,
         }
+    }
+
+    /// Attach the current signed state and the admin's node id (card 27).
+    pub fn with_state(mut self, state: SignedState, admin: NodeId) -> Self {
+        self.state = Some(state);
+        self.admin = Some(admin);
+        self
     }
 
     /// The fabric root this invite introduces (`membership.fabric`).
@@ -113,7 +132,8 @@ impl Invite {
     /// The membership verifies under its own fabric root, names `me`, and is
     /// unexpired; the head, proof and sealed key form a valid
     /// [`Rekey`] entry under that same root; the entry is `me`'s; and the
-    /// channel name is not empty.
+    /// channel name is not empty. A carried [`SignedState`] must verify under
+    /// that root, be fresh, and list `me` as a member.
     pub fn verify(&self, me: &NodeIdentity, now_unix: i64) -> Result<FabricKey> {
         if self.format != INVITE_V1 {
             return Err(Error::UnsupportedVersion);
@@ -128,6 +148,13 @@ impl Invite {
         }
         let rekey = Rekey::new(self.head.clone(), vec![self.entry.clone()]);
         rekey.verify(fabric, now_unix)?;
+        if let Some(state) = &self.state {
+            state.verify(fabric)?;
+            state.check_fresh(now_unix)?;
+            if !state.state.is_member(me.node_id()) {
+                return Err(Error::SubjectMismatch);
+            }
+        }
         self.entry.key.open(me, fabric)
     }
 
@@ -212,6 +239,34 @@ mod tests {
             invite.verify(&joiner, 0),
             Err(Error::InconsistentRekey(_))
         ));
+    }
+
+    #[test]
+    fn a_carried_state_must_verify_and_name_the_invitee() {
+        let joiner = NodeIdentity::from_seed([2u8; 32]);
+        let (root, invite, _key) = invite_for(&joiner, 0);
+        let mut state = crate::state::State::new(root.node_id());
+        state.version = crate::state::StateVersion(1);
+        state.not_after = i64::MAX;
+        state.members.insert(joiner.node_id());
+        let signed = state.sign(&root).unwrap();
+        let ok = invite.clone().with_state(signed.clone(), root.node_id());
+        let back = Invite::decode(&ok.encode().unwrap()).unwrap();
+        assert_eq!(back.state.as_ref(), Some(&signed));
+        back.verify(&joiner, 0).unwrap();
+
+        // Not naming the invitee, or signed by another root: refused.
+        let mut other = state.clone();
+        other.members.clear();
+        let bad = invite
+            .clone()
+            .with_state(other.sign(&root).unwrap(), root.node_id());
+        assert!(bad.verify(&joiner, 0).is_err());
+        let rogue = NodeIdentity::from_seed([66u8; 32]);
+        let mut forged = state;
+        forged.fabric = rogue.node_id();
+        let bad = invite.with_state(forged.sign(&rogue).unwrap(), root.node_id());
+        assert!(bad.verify(&joiner, 0).is_err());
     }
 
     #[test]

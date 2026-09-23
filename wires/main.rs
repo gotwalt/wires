@@ -65,6 +65,8 @@ Admin — decides who's in (holds the root key):
   init      Start a fabric: root key, this node, the first commit, a channel
   invite    Add a node and print its one join token; re-key the channel
   remove    Drop a node; re-key the channel so the rest carry on untouched
+  service   Register services: add / set / rm (name, allowed roles, hosts)
+  role      Define roles from IdP identity: set / rm
   advanced  Plumbing: memberships, roster, import, publish
 
 Host — decides what runs and who may run it:
@@ -109,6 +111,10 @@ enum Command {
     /// Remove a node (by `--name` label or id); the commit is published on the
     /// channel, and every host that adopts it refuses the node's next call.
     Remove(admin::invite::RemoveArgs),
+    /// Edit the service registry in the signed state, and push it.
+    Service(admin::service::ServiceArgs),
+    /// Edit the role definitions in the signed state, and push them.
+    Role(admin::service::RoleArgs),
     /// Plumbing for every role: memberships, the roster, credential import,
     /// and publishing to a channel.
     Advanced(advanced::AdvancedArgs),
@@ -266,6 +272,20 @@ fn main() {
                 Err(e) => exit_with(e),
             }
         }
+        Command::Service(a) => {
+            init_quiet_logging();
+            match runtime().block_on(admin::service::service_cmd(a)) {
+                Ok(report) => print_report(report),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::Role(a) => {
+            init_quiet_logging();
+            match runtime().block_on(admin::service::role_cmd(a)) {
+                Ok(report) => print_report(report),
+                Err(e) => exit_with(e),
+            }
+        }
         Command::Id => print_or_exit(caller::join::id_cmd()),
         Command::Join(a) => print_or_exit(caller::join::join_cmd(a)),
         Command::Advanced(a) => advanced::run(a),
@@ -284,6 +304,7 @@ fn main() {
         }
         Command::Inbox(a) => {
             init_quiet_logging();
+            runtime().block_on(state::sync::refresh_cold());
             match runtime().block_on(caller::inbox::inbox_cmd(a)) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => exit_with(e),
@@ -296,6 +317,7 @@ fn main() {
         }
         Command::Call(a) => {
             init_quiet_logging();
+            runtime().block_on(state::sync::refresh_cold());
             match runtime().block_on(caller::call::call_cmd(a)) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => exit_with(e),
@@ -311,6 +333,7 @@ fn main() {
         }
         Command::Tools(a) => {
             init_quiet_logging();
+            runtime().block_on(state::sync::refresh_cold());
             match runtime().block_on(caller::tools::tools_cmd(a)) {
                 Ok(out) if out.is_empty() => {}
                 Ok(out) => println!("{out}"),
@@ -322,6 +345,7 @@ fn main() {
         }
         Command::Mcp(a) => {
             init_quiet_logging();
+            runtime().block_on(state::sync::refresh_cold());
             if let Err(e) = runtime().block_on(caller::mcp::mcp_cmd(a)) {
                 eprintln!("wires: {e:#}");
                 std::process::exit(1);
@@ -417,7 +441,7 @@ mod tests {
             assert!(help.contains(&format!("{role} — ")), "{help}");
         }
         let lines = help.lines().count();
-        assert!(lines <= 30, "{lines} lines:\n{help}");
+        assert!(lines <= 32, "{lines} lines:\n{help}");
         // The plumbing is not on it.
         for plumbing in ["member", "roster", "import", "tail"] {
             assert!(
