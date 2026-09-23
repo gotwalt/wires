@@ -201,9 +201,11 @@ fn init_logging() {
     init_logging_with(LOG_FILTER);
 }
 
-/// [`init_logging`] for the dialing commands (`call`, `mcp`), whose
-/// stderr belongs to the remote CLI: [`QUIET_LOG_FILTER`] by default, so a
-/// successful call leaves nothing of wires' own on it.
+/// [`init_logging`] for the dialing commands (`call`, `tools`, `mcp`), whose
+/// stderr belongs to the remote CLI, and the admin's one-shot commands
+/// (`init`, `invite`, `remove`), whose brief channel node would otherwise
+/// print mesh admission WARNs: [`QUIET_LOG_FILTER`] by default, so a
+/// successful run leaves nothing of wires' own on stderr but its notes.
 fn init_quiet_logging() {
     init_logging_with(QUIET_LOG_FILTER);
 }
@@ -232,16 +234,19 @@ fn init_logging_with(default: &str) {
 
 fn main() {
     match Cli::parse().command {
-        Command::Init(a) => print_or_exit(admin::init::init_cmd(a)),
+        Command::Init(a) => {
+            init_quiet_logging();
+            print_or_exit(admin::init::init_cmd(a))
+        }
         Command::Invite(a) => {
-            init_logging();
+            init_quiet_logging();
             match runtime().block_on(admin::invite::invite_cmd(a)) {
                 Ok(report) => print_report(report),
                 Err(e) => exit_with(e),
             }
         }
         Command::Remove(a) => {
-            init_logging();
+            init_quiet_logging();
             match runtime().block_on(admin::invite::remove_cmd(a)) {
                 Ok(report) => print_report(report),
                 Err(e) => exit_with(e),

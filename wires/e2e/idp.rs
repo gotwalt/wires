@@ -387,6 +387,7 @@ async fn host_json_roles_admit_verified_federated_identities_only() {
             json: false,
             identities: Some(Arc::clone(&identities)),
             directory: None,
+            shown: Default::default(),
         };
         let mut keyring = r.keyring();
         async move {

@@ -27,11 +27,14 @@
 //! readable by the whole channel; for each member with a fresh verified
 //! principal, the *further* tools [`Policy::allowed_tools`] grants it are
 //! sealed to that member's node key alone (see [`library::announce`]). Members
-//! with nothing further get no entry. Every listing carries the host's dial
-//! hints, so a caller needs nothing but the announcement to reach it; the
-//! open listing is always present for that reason, even with no tools in it
-//! (the hints are no secret from a member: the host is its channel's
-//! bootstrap peer).
+//! with nothing further get no entry — and neither does a node the channel's
+//! current roster no longer holds ([`CurrentRoster`]): the identity index
+//! keeps a removed member's verified claim until it expires, so the audience
+//! is (current roster members) ∩ (policy-allowed verified principals). Every
+//! listing carries the host's dial hints, so a caller needs nothing but the
+//! announcement to reach it; the open listing is always present for that
+//! reason, even with no tools in it (the hints are no secret from a member:
+//! the host is its channel's bootstrap peer).
 //!
 //! This is privacy, not access control: the host's [`Policy`] still decides
 //! every call, and a call to a tool the caller cannot see is refused with the
@@ -42,8 +45,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use library::{
-    ChannelRecord, HostAnnouncement, HostListing, ListedTool, NodeId, SealedListing, ToolName,
-    TopicPeer,
+    ChannelRecord, HostAnnouncement, HostListing, InclusionProof, ListedTool, NodeId,
+    ProofDirectory, RosterHead, SealedListing, ToolName, TopicPeer,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -90,6 +93,98 @@ pub(crate) struct Audience {
     pub(crate) members: BTreeMap<NodeId, Vec<ToolName>>,
 }
 
+/// Which nodes the channel's current roster holds, as far as this host can
+/// tell — the other half of the audience (see the module docs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CurrentRoster {
+    /// No roster head is enforced (plumbing with no roster): every member
+    /// with a verified claim counts.
+    Unenforced,
+    /// This host joined at the current head and has seen no commit since, so
+    /// every claim it could read was sealed under the head's key by one of
+    /// the head's members: all of them count. (A removal is a commit, and its
+    /// re-key leaves a directory — [`Members`](Self::Members).)
+    JoinedAtHead,
+    /// Exactly these nodes: the proof directory for the current head, each
+    /// proof re-verified against it.
+    Members(BTreeSet<NodeId>),
+    /// A head is enforced but this host holds no directory for it (it
+    /// adopted the head without its re-key): seal to nobody until it does.
+    Unknown,
+}
+
+impl CurrentRoster {
+    /// What the host knows at `now`, from its enforced `head`, the proof
+    /// `directory` beside it, and its `own` inclusion proof, under `fabric`.
+    pub(crate) fn from_parts(
+        head: Option<&RosterHead>,
+        directory: Option<&ProofDirectory>,
+        own: Option<&InclusionProof>,
+        fabric: NodeId,
+        now: i64,
+    ) -> Self {
+        let Some(head) = head else {
+            return Self::Unenforced;
+        };
+        if let Some(dir) = directory.filter(|d| &d.head == head) {
+            return Self::Members(
+                dir.proofs
+                    .iter()
+                    .filter(|p| {
+                        library::check_roster_inclusion(head, p, fabric, p.member, now).is_ok()
+                    })
+                    .map(|p| p.member)
+                    .collect(),
+            );
+        }
+        match own {
+            Some(p) if library::check_roster_inclusion(head, p, fabric, p.member, now).is_ok() => {
+                Self::JoinedAtHead
+            }
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Whether `node` may be sealed to.
+    pub(crate) fn admits(&self, node: NodeId) -> bool {
+        match self {
+            Self::Unenforced | Self::JoinedAtHead => true,
+            Self::Members(members) => members.contains(&node),
+            Self::Unknown => false,
+        }
+    }
+}
+
+/// Reads the host's [`CurrentRoster`] at a unix time.
+pub(crate) type RosterView = Arc<dyn Fn(i64) -> CurrentRoster + Send + Sync>;
+
+/// The [`RosterView`] of a host serving `config`, whose own credentials are
+/// in `keystore`: the head the session gate enforces, the directory beside
+/// it, and the host's own proof — re-read each time, like the gate does.
+pub(crate) fn roster_view(
+    config: Arc<crate::host::transport::ServeConfig>,
+    keystore: Arc<crate::admin::keystore::Keystore>,
+) -> RosterView {
+    Arc::new(move |now| {
+        let head = match config.head.load() {
+            Ok(head) => head,
+            Err(e) => {
+                tracing::debug!("no roster head for the announcement: {e:#}");
+                return CurrentRoster::Unknown;
+            }
+        };
+        let directory = crate::channel::rekey::directory_for(&config.head);
+        let own = keystore.read_inclusion_proof().ok().flatten();
+        CurrentRoster::from_parts(
+            head.as_ref(),
+            directory.as_ref(),
+            own.as_ref(),
+            config.trust_root,
+            now,
+        )
+    })
+}
+
 /// Announces one host's tools on its channel. See the module docs.
 pub(crate) struct Announcer {
     /// The host's node id (the announcement's `node`, never sealed to).
@@ -107,6 +202,9 @@ pub(crate) struct Announcer {
     /// Where the channel's fabric keys are; a new one means re-announce.
     /// `None`: never checked (unit tests).
     keystore: Option<Arc<crate::admin::keystore::Keystore>>,
+    /// Who the channel's current roster holds. `None`: not checked (unit
+    /// tests of the policy half).
+    roster: Option<RosterView>,
 }
 
 impl std::fmt::Debug for Announcer {
@@ -137,7 +235,14 @@ impl Announcer {
             descriptions,
             heartbeat,
             keystore: None,
+            roster: None,
         }
+    }
+
+    /// Seal only to nodes `roster` says the current roster holds.
+    pub(crate) fn within(mut self, roster: RosterView) -> Self {
+        self.roster = Some(roster);
+        self
     }
 
     /// Also re-announce whenever `keystore` gains a newer fabric key.
@@ -154,13 +259,18 @@ impl Announcer {
     }
 
     /// The audience at unix time `now`: every node the identity index holds
-    /// a fresh verified principal for, asked of the policy.
+    /// a fresh verified principal for *and* the current roster holds, asked
+    /// of the policy.
     pub(crate) fn audience(&self, now: i64) -> Audience {
         let open = self.policy.member_tools();
         let everyone: BTreeSet<&ToolName> = open.iter().collect();
+        let roster = self
+            .roster
+            .as_ref()
+            .map_or(CurrentRoster::Unenforced, |view| view(now));
         let mut members = BTreeMap::new();
         for member in self.identities.nodes() {
-            if member == self.node {
+            if member == self.node || !roster.admits(member) {
                 continue;
             }
             let Ok(principal) = self.gate.resolve(member, now) else {
@@ -442,6 +552,101 @@ mod tests {
         };
         assert_eq!(names(ann.listing_for(&id(6))), ["db_query", "status"]);
         task.abort();
+    }
+
+    /// A two-commit roster: nodes 2..=4 at v1, node 2 removed at v2. Returns
+    /// the fabric, both heads, the v2 directory, and each version's proofs.
+    #[allow(clippy::type_complexity)]
+    fn commits() -> (
+        NodeId,
+        RosterHead,
+        RosterHead,
+        ProofDirectory,
+        BTreeMap<NodeId, InclusionProof>,
+        BTreeMap<NodeId, InclusionProof>,
+    ) {
+        let root = id(1);
+        let mut roster = library::Roster::new(root.node_id());
+        for seed in 2..=4 {
+            roster.insert(id(seed).node_id());
+        }
+        let (v1, p1) = roster.commit(&root, 0, i64::MAX).unwrap();
+        roster.remove(&id(2).node_id());
+        let (v2, p2) = roster.commit(&root, 0, i64::MAX).unwrap();
+        let dir = ProofDirectory {
+            head: v2.clone(),
+            proofs: p2.iter().map(|(_, p)| p.clone()).collect(),
+        };
+        (
+            root.node_id(),
+            v1,
+            v2,
+            dir,
+            p1.into_iter().collect(),
+            p2.into_iter().collect(),
+        )
+    }
+
+    #[test]
+    fn the_current_roster_is_the_directory_for_exactly_the_head() {
+        let (fabric, v1, v2, dir, p1, p2) = commits();
+        let me = id(3).node_id();
+        // No head enforced: no filter.
+        assert_eq!(
+            CurrentRoster::from_parts(None, Some(&dir), None, fabric, 0),
+            CurrentRoster::Unenforced
+        );
+        // The directory for the head: its members, and nobody it left out.
+        let r = CurrentRoster::from_parts(Some(&v2), Some(&dir), p2.get(&me), fabric, 0);
+        assert!(r.admits(id(3).node_id()) && r.admits(id(4).node_id()));
+        assert!(!r.admits(id(2).node_id()), "the removed node");
+        // Joined at the head (own proof current), no directory yet: everyone
+        // it could have heard from is a member.
+        assert_eq!(
+            CurrentRoster::from_parts(Some(&v1), None, p1.get(&me), fabric, 0),
+            CurrentRoster::JoinedAtHead
+        );
+        // Head advanced with neither its directory nor a current own proof
+        // (a stale directory for v1 is no help): nobody.
+        let old = ProofDirectory {
+            head: v1.clone(),
+            proofs: p1.values().cloned().collect(),
+        };
+        let r = CurrentRoster::from_parts(Some(&v2), Some(&old), p1.get(&me), fabric, 0);
+        assert_eq!(r, CurrentRoster::Unknown);
+        assert!(!r.admits(id(3).node_id()));
+        // A directory proof that does not verify against the head is dropped.
+        let forged = ProofDirectory {
+            head: v2.clone(),
+            proofs: vec![p1[&id(2).node_id()].clone()],
+        };
+        let r = CurrentRoster::from_parts(Some(&v2), Some(&forged), None, fabric, 0);
+        assert!(!r.admits(id(2).node_id()));
+    }
+
+    /// Card 21, item 4: a removed member's verified claim is still in the
+    /// identity index, but the audience leaves it out.
+    #[test]
+    fn a_removed_member_with_a_fresh_claim_gets_no_entry() {
+        let (fabric, _, v2, dir, _, p2) = commits();
+        let a = announcer(&[
+            (2, Ok(who("alice@example.com"))),
+            (3, Ok(who("carol@example.com"))),
+        ]);
+        let before = a.audience(500);
+        assert_eq!(before.members.len(), 2, "no roster view: both");
+        let own = p2[&id(3).node_id()].clone();
+        let a = a.within(Arc::new(move |now| {
+            CurrentRoster::from_parts(Some(&v2), Some(&dir), Some(&own), fabric, now)
+        }));
+        let after = a.audience(500);
+        assert_eq!(
+            after.members,
+            BTreeMap::from([(id(3).node_id(), vec![tool("db_query")])])
+        );
+        let ann = a.announcement(&after, &reach(), 42);
+        assert_eq!(ann.sealed.len(), 1);
+        assert_eq!(names(ann.listing_for(&id(2))), ["status"]);
     }
 
     #[test]

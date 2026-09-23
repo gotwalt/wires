@@ -98,6 +98,10 @@ pub(crate) struct Printer {
     /// Folds host announcements into this node's directory cache (a
     /// resident `wires watch`; card 15). `None`: not kept.
     pub(crate) directory: Option<Arc<crate::caller::resolve::DirectoryHook>>,
+    /// The last announcement shown per host: the human output prints a `📣`
+    /// line only when a host's announcement changes (card 21); `--json`
+    /// emits every one.
+    pub(crate) shown: render::ShownHosts,
 }
 
 /// One `--json` output record: the machine-readable form of a message line.
@@ -136,6 +140,12 @@ impl Printer {
         let record = library::ChannelRecord::parse(&text);
         if let (Some(hook), Some(library::ChannelRecord::Host(ann))) = (&self.directory, &record) {
             hook.observe(envelope.sender, ann);
+        }
+        if let Some(library::ChannelRecord::Host(ann)) = &record
+            && !self.json
+            && !self.shown.is_news(envelope.sender, ann)
+        {
+            return;
         }
         let verdict = match (&self.identities, record) {
             (Some(ids), Some(library::ChannelRecord::Identity(claim))) if !self.json => {
@@ -247,6 +257,7 @@ mod tests {
             json: false,
             identities: None,
             directory: None,
+            shown: Default::default(),
         };
         assert_eq!(
             printer.render(&envelope, "ship it"),
@@ -280,6 +291,7 @@ mod tests {
             json: true,
             identities: None,
             directory: None,
+            shown: Default::default(),
         }
         .render(&envelope, "ship it");
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -324,6 +336,7 @@ mod tests {
                 json: false,
                 identities: None,
                 directory: None,
+                shown: Default::default(),
             }
             .render(&envelope, &text),
             format!(
@@ -335,6 +348,7 @@ mod tests {
             json: true,
             identities: None,
             directory: None,
+            shown: Default::default(),
         }
         .render(&envelope, &text);
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();

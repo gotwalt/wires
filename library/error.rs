@@ -85,6 +85,19 @@ pub enum Error {
         head: u64,
     },
 
+    /// A member's proof targets an older roster version, and the verifier's
+    /// [`ProofDirectory`](crate::ProofDirectory) for the current head does not
+    /// list it: a commit since `proof` removed it. Tells the caller no more
+    /// than it already knows (it was removed; the head's version is public).
+    #[error("not in the current roster ({})", removal(*.proof, *.head))]
+    RemovedFromRoster {
+        /// The roster version the caller's (last valid) proof was issued
+        /// against.
+        proof: u64,
+        /// The current head's version, which does not list the caller.
+        head: u64,
+    },
+
     /// A responder configured with a roster head required an inclusion proof in
     /// the handshake, but none was presented.
     #[error("inclusion proof required")]
@@ -236,4 +249,16 @@ pub enum IdTokenError {
     /// absent or has the wrong JSON type.
     #[error("missing or mistyped claim {0:?}")]
     MissingClaim(&'static str),
+}
+
+/// When [`Error::RemovedFromRoster`] says the member left: exactly the
+/// head's version when the proof is one commit behind it, else only a range
+/// (the verifier knows the member is absent from the current head, not at
+/// which commit in between it went).
+fn removal(proof: u64, head: u64) -> String {
+    if head == proof.saturating_add(1) {
+        format!("removed at version {head}")
+    } else {
+        format!("removed after version {proof}; head is version {head}")
+    }
 }

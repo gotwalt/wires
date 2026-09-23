@@ -292,7 +292,13 @@ impl ProofDirectory {
 ///
 /// On refusal the error is the presented proof's (a stale proof stays a
 /// "stale inclusion proof", so the caller learns what to fix), or
-/// [`Error::InclusionProofRequired`] when there was neither.
+/// [`Error::InclusionProofRequired`] when there was neither — except that a
+/// stale proof the directory *for exactly `head`* does not vouch for is
+/// [`Error::RemovedFromRoster`]: the directory lists every member that head
+/// kept, so the caller is out, and refreshing its proof cannot help. (It
+/// learns nothing new: it was removed, and the head's version is public to
+/// members.) A directory missing a chunk of its commit's re-key would
+/// mislabel a stale member as removed; the refusal itself is the same.
 ///
 /// The same invariant as `check_roster_inclusion`: only sound when `caller`
 /// is the peer the transport authenticated.
@@ -314,6 +320,15 @@ pub fn check_roster_inclusion_via(
         return Ok(());
     }
     match direct {
+        // The caller's proof is from an older commit, and the directory for
+        // exactly this head (which lists every member the commit kept) does
+        // not list it: a commit since removed it. Say so, rather than
+        // "stale", which invites refreshing a proof that no longer exists.
+        Some(Err(Error::StaleProof { proof, head: at }))
+            if proof < at && directory.is_some_and(|d| &d.head == head) =>
+        {
+            Err(Error::RemovedFromRoster { proof, head: at })
+        }
         Some(err) => err,
         None => Err(Error::InclusionProofRequired),
     }
@@ -547,6 +562,81 @@ mod tests {
         );
     }
 
+    /// A removal commit: `n` members at v1, member 0 removed at v2, v3..=`at`
+    /// further commits of the survivors. Returns the root, the removed
+    /// member's v1 proof, and the final head's directory.
+    fn removed_from(n: u8, at: u64) -> (NodeIdentity, InclusionProof, ProofDirectory) {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let mut roster = Roster::new(root.node_id());
+        for i in 0..n {
+            roster.insert(NodeIdentity::from_seed([10 + i; 32]).node_id());
+        }
+        let gone = NodeIdentity::from_seed([10; 32]).node_id();
+        let (_, v1) = roster.commit(&root, 0, i64::MAX).unwrap();
+        let stale = v1.into_iter().find(|(m, _)| *m == gone).unwrap().1;
+        roster.remove(&gone);
+        let mut last = roster.commit(&root, 0, i64::MAX).unwrap();
+        while last.0.version.0 < at {
+            last = roster.commit(&root, 0, i64::MAX).unwrap();
+        }
+        let (head, proofs) = last;
+        let dir = ProofDirectory {
+            head,
+            proofs: proofs.into_iter().map(|(_, p)| p).collect(),
+        };
+        (root, stale, dir)
+    }
+
+    #[test]
+    fn a_removed_member_is_told_it_was_removed_not_that_its_proof_is_stale() {
+        let (root, stale, dir) = removed_from(3, 2);
+        let refused = check_roster_inclusion_via(
+            &dir.head,
+            Some(&stale),
+            Some(&dir),
+            root.node_id(),
+            stale.member,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            refused,
+            Error::RemovedFromRoster { proof: 1, head: 2 }
+        ));
+        assert_eq!(
+            refused.to_string(),
+            "not in the current roster (removed at version 2)"
+        );
+        // Several commits later, the verifier knows only the range.
+        let (root, stale, dir) = removed_from(3, 4);
+        assert_eq!(
+            check_roster_inclusion_via(
+                &dir.head,
+                Some(&stale),
+                Some(&dir),
+                root.node_id(),
+                stale.member,
+                0
+            )
+            .unwrap_err()
+            .to_string(),
+            "not in the current roster (removed after version 1; head is version 4)"
+        );
+        // Without a directory for this head, the verifier cannot tell a
+        // removal from a member that missed the re-key: still "stale".
+        assert!(matches!(
+            check_roster_inclusion_via(
+                &dir.head,
+                Some(&stale),
+                None,
+                root.node_id(),
+                stale.member,
+                0
+            ),
+            Err(Error::StaleProof { proof: 1, head: 4 })
+        ));
+    }
+
     #[test]
     fn a_rekey_round_trips_through_json() {
         let f = fixture(3);
@@ -583,6 +673,25 @@ mod tests {
                     &f.rekey.head, Some(stale), Some(&dir), f.root.node_id(), *who, 0
                 ).is_ok());
             }
+        }
+
+        /// A member removed at some commit and presenting its last proof is
+        /// always refused as removed, naming the head's version, and the
+        /// exact version only when it is one commit on.
+        #[test]
+        fn a_removed_member_is_always_refused_as_removed(n in 2u8..8, at in 2u64..6) {
+            let (root, stale, dir) = removed_from(n, at);
+            let e = check_roster_inclusion_via(
+                &dir.head, Some(&stale), Some(&dir), root.node_id(), stale.member, 0
+            ).unwrap_err();
+            prop_assert!(
+                matches!(e, Error::RemovedFromRoster { proof: 1, head } if head == at),
+                "{e}"
+            );
+            prop_assert_eq!(
+                e.to_string().contains(&format!("removed at version {at}")),
+                at == 2
+            );
         }
     }
 }
