@@ -305,7 +305,12 @@ impl ServicesHost {
             now,
         )
         .map_err(|r| match missing {
-            Some(why) if r.needs_identity() => format!("{why}; {r}"),
+            Some(why) if r.needs_identity() => {
+                // Both say "run `wires login`"; say it once.
+                let r = r.to_string();
+                let r = r.strip_suffix("; run `wires login`").unwrap_or(&r);
+                format!("{why}; {r}")
+            }
             _ => r.to_string(),
         })
     }

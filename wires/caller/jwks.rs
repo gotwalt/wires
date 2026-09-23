@@ -312,7 +312,7 @@ impl std::fmt::Display for VerifyError {
         match self {
             VerifyError::Untrusted(iss) => write!(
                 f,
-                "issuer {:?} is not trusted here (add it to WIRES_OIDC_ISSUER)",
+                "issuer {:?} is not trusted here (add it to host.json identity.issuers)",
                 iss.as_str()
             ),
             VerifyError::Unavailable(e) => write!(f, "issuer keys unavailable: {e}"),
