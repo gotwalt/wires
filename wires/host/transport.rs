@@ -95,7 +95,8 @@ pub struct ServeConfig {
     /// The trusted fabric root whose memberships, grants, and head are honored.
     pub trust_root: NodeId,
     /// Whether a caller must present a grant; `false` is inclusion-only (any
-    /// fabric member, `wires serve --allow-any-member`).
+    /// fabric member) and leaves who may run what to [`policy`](Self::policy).
+    /// `wires serve host.json` never requires one.
     ///
     /// When set, the grant's scope must be [`tool_scope`] of the invoked tool
     /// or [`TOOL_SCOPE_ANY`].
@@ -109,15 +110,18 @@ pub struct ServeConfig {
     /// The responder's own inclusion proof, presented if set (unused by the
     /// dialer in this slice; reverse roster-freshness is deferred).
     pub proof: Option<InclusionProof>,
-    /// The exposed tools (`--expose name=cmd`): each tool's fixed argv. The
+    /// The exposed tools (`host.json`'s `tools`): each tool's fixed argv. The
     /// dialer sends a [`Frame::Invoke`] naming one of these; its `argv` is
     /// appended to the tool's fixed argv (never through a shell).
     pub tools: BTreeMap<ToolName, Vec<String>>,
-    /// Where call records go (`--audit-topic`), if anywhere.
+    /// Where call records go (`host.json`'s `channel`), if anywhere.
     pub audit: Option<AuditSink>,
-    /// Who callers are, per the IdP claims on the audit topic, and what
-    /// `--require-idp` demands of them. `None` without an audit topic.
+    /// Who callers are, per the IdP claims on the channel. `None` without a
+    /// channel: every caller is then unverified.
     pub identity: Option<Arc<crate::host::identity::IdentityGate>>,
+    /// Who may run which tool (`host.json`'s roles and `allow`): asked last,
+    /// once every credential check has passed. Default deny.
+    pub policy: Arc<dyn crate::host::policy::Policy>,
 }
 
 /// The responder's handle for publishing [`AuditRecord`](library::AuditRecord)s.
@@ -452,53 +456,6 @@ async fn pump_reader<R: AsyncRead + Unpin>(
     Ok(())
 }
 
-/// Parse `wires serve --expose` specs and an optional `--expose-file` into the
-/// multi-tool map for [`ServeConfig::tools`].
-///
-/// Each spec is `name=command args…`; the command is split on ASCII
-/// whitespace — no quoting, no shell. Argv that needs spaces goes in the file
-/// instead: a JSON object `{"name": ["program", "arg with spaces", …]}`. Every
-/// name must be a valid [`ToolName`], every argv non-empty, and a name may be
-/// exposed only once across both sources.
-pub fn exposed_tools(
-    specs: &[String],
-    file: Option<&Path>,
-) -> Result<BTreeMap<ToolName, Vec<String>>> {
-    let mut tools = BTreeMap::new();
-    let mut add = |name: &str, argv: Vec<String>| -> Result<()> {
-        let tool = ToolName::new(name).map_err(|e| anyhow!("tool name {name:?}: {e}"))?;
-        if argv.is_empty() {
-            bail!("tool {tool}: empty command");
-        }
-        if tools.insert(tool.clone(), argv).is_some() {
-            bail!("tool {tool} is exposed more than once");
-        }
-        Ok(())
-    };
-    for spec in specs {
-        let (name, command) = spec
-            .split_once('=')
-            .ok_or_else(|| anyhow!("--expose {spec:?}: expected name=command"))?;
-        add(
-            name,
-            command
-                .split_ascii_whitespace()
-                .map(str::to_string)
-                .collect(),
-        )?;
-    }
-    if let Some(path) = file {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading --expose-file {}", path.display()))?;
-        let map: BTreeMap<String, Vec<String>> = serde_json::from_str(&text)
-            .with_context(|| format!("parsing --expose-file {}", path.display()))?;
-        for (name, argv) in map {
-            add(&name, argv)?;
-        }
-    }
-    Ok(tools)
-}
-
 /// The argv to exec for this session: the invoked tool's fixed argv with the
 /// caller's [`Argv`](library::Argv) appended element by element.
 ///
@@ -720,6 +677,7 @@ where
     let Admitted {
         roster_version,
         principal,
+        role,
     } = match authorize(
         config,
         &policy,
@@ -728,7 +686,7 @@ where
         proof.as_ref(),
         caller,
         now,
-        tool,
+        &invocation,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -815,6 +773,7 @@ where
         tool.clone(),
         invocation.argv.as_slice(),
         roster_version,
+        role.map(String::from),
     );
     let mut child_stdin = child.stdin.take().context("child stdin")?;
     let stdin_tap = crate::host::audit::tap_stdin(audit.as_ref());
@@ -905,23 +864,28 @@ struct Admitted {
     /// The caller's fresh verified IdP principal, when the responder knows one
     /// (see [`ServeConfig::identity`]).
     principal: Option<library::Principal>,
+    /// The policy role that admitted the caller.
+    role: Option<crate::host::policy::RoleName>,
 }
 
 /// Every credential check a caller must pass, in one place.
 ///
 /// Runs, in order: fabric inclusion (always), the tool grant (when the
 /// responder requires one), the grant/membership subject agreement, the
-/// roster head gate, and last the identity gate (`--require-idp`), which only
-/// ever sees a caller whose key already passed everything else. Returns the
-/// admitting roster version and the caller's principal, if known.
+/// roster head gate, and last the host's [`Policy`](crate::host::policy::Policy)
+/// (`host.json`), which only ever sees a caller whose key already passed
+/// everything else, with its verified principal if it has one. Returns the
+/// admitting roster version, the caller's principal, and the admitting role.
 ///
 /// The error messages are user-facing: they are what the responder logs *and*
 /// what it sends back in a [`Frame::Denied`], so each keeps a prefix naming the
 /// credential at fault (`membership rejected: …`, `grant rejected: …`,
 /// `roster inclusion rejected: …`).
 ///
-/// `tool` is the invoked tool: when grants are required, the grant must be
-/// scoped [`tool_scope`]`(tool)` or [`TOOL_SCOPE_ANY`].
+/// `invocation` names the tool: when grants are required, the grant must be
+/// scoped [`tool_scope`]`(tool)` or [`TOOL_SCOPE_ANY`]. A policy refusal of a
+/// caller with no verified identity leads with why there is none (and the
+/// `wires login` remedy), then the rule that needed one.
 #[allow(clippy::too_many_arguments)]
 fn authorize(
     config: &ServeConfig,
@@ -931,8 +895,9 @@ fn authorize(
     proof: Option<&InclusionProof>,
     caller: NodeId,
     now: i64,
-    tool: &ToolName,
+    invocation: &Invocation,
 ) -> Result<Admitted> {
+    let tool = &invocation.tool;
     // Inclusion is always required: the caller must prove fabric membership,
     // bound to its iroh-authenticated key.
     check_inclusion(membership, config.trust_root, caller, now, &policy.crl)
@@ -971,13 +936,28 @@ fn authorize(
 
     // Identity: looked up per call, so a claim that lands after a refusal
     // admits the next call.
-    let principal = match config.identity.as_deref() {
-        Some(gate) => gate.admit(caller, now).map_err(|reason| anyhow!(reason))?,
-        None => None,
+    let (principal, missing) = match config.identity.as_deref().map(|g| g.resolve(caller, now)) {
+        Some(Ok(p)) => (Some(p), None),
+        Some(Err(why)) => (None, Some(why)),
+        None => (None, None),
     };
+    let decision = config.policy.decide(&crate::host::policy::CallContext {
+        principal: principal.as_ref(),
+        caller,
+        roster_version,
+        tool,
+        argv: &invocation.argv,
+    });
+    if !decision.allow {
+        match missing {
+            Some(why) if principal.is_none() => bail!("{why}; {}", decision.reason),
+            _ => bail!("{}", decision.reason),
+        }
+    }
     Ok(Admitted {
         roster_version,
         principal,
+        role: decision.role,
     })
 }
 
@@ -1359,6 +1339,7 @@ mod tests {
             tools: tool_map(command),
             audit: None,
             identity: None,
+            policy: Arc::new(crate::host::policy::AnyMember),
             trust_root: root.node_id(),
             require_grant,
             crl: CrlSource::Fixed(crl),
@@ -1446,6 +1427,7 @@ mod tests {
             tools: tool_map(vec!["cat".to_string()]),
             audit: None,
             identity: None,
+            policy: Arc::new(crate::host::policy::AnyMember),
             trust_root,
             require_grant,
             crl: CrlSource::Fixed(crl),
@@ -1638,6 +1620,7 @@ mod tests {
         let config = ServeConfig {
             audit: None,
             identity: None,
+            policy: Arc::new(crate::host::policy::AnyMember),
             trust_root: root.node_id(),
             require_grant: false,
             crl: CrlSource::Fixed(Crl::new()),
@@ -1694,6 +1677,7 @@ mod tests {
         let config = Arc::new(ServeConfig {
             audit: None,
             identity: None,
+            policy: Arc::new(crate::host::policy::AnyMember),
             trust_root: root.node_id(),
             require_grant: false,
             crl: CrlSource::File(crl_path.clone()),
@@ -2241,6 +2225,7 @@ mod tests {
         let config = ServeConfig {
             audit: None,
             identity: None,
+            policy: Arc::new(crate::host::policy::AnyMember),
             trust_root: root.node_id(),
             require_grant: false,
             crl: CrlSource::Fixed(Crl::new()),
@@ -2380,6 +2365,7 @@ mod tests {
         let config = ServeConfig {
             audit: None,
             identity: None,
+            policy: Arc::new(crate::host::policy::AnyMember),
             trust_root: root.node_id(),
             require_grant: false,
             crl: CrlSource::Fixed(Crl::new()),
@@ -2445,6 +2431,7 @@ mod tests {
         let config = ServeConfig {
             audit: None,
             identity: None,
+            policy: Arc::new(crate::host::policy::AnyMember),
             trust_root: root.node_id(),
             require_grant: false,
             crl: CrlSource::Fixed(Crl::new()),
@@ -2505,6 +2492,7 @@ mod tests {
             let config = ServeConfig {
                 audit: None,
                 identity: None,
+                policy: Arc::new(crate::host::policy::AnyMember),
                 trust_root,
                 require_grant: false,
                 crl: CrlSource::Fixed(Crl::new()),
@@ -2580,7 +2568,7 @@ mod tests {
     /// (seed 2) holds a membership under `root` and, when `grant_scope` is set,
     /// a grant for that scope. Returns the dialer's result, stdout, stderr.
     async fn run_call(
-        config: ServeConfig,
+        config: impl Into<Arc<ServeConfig>>,
         root: &NodeIdentity,
         grant_scope: Option<&str>,
         invocation: Invocation,
@@ -2588,6 +2576,7 @@ mod tests {
     ) -> (Result<i32>, Vec<u8>, Vec<u8>) {
         let caller = NodeIdentity::from_seed([2u8; 32]).node_id();
         let membership = valid_membership(root, caller);
+        let config: Arc<ServeConfig> = config.into();
         let grant =
             grant_scope.map(|s| Grant::mint(root, caller, Scope::new(s), i64::MAX).unwrap());
         let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
@@ -2846,6 +2835,64 @@ mod tests {
         }
     }
 
+    /// The host policy is asked last: a caller that passed every credential
+    /// check is still refused a tool no role of it may run — with the rule,
+    /// on the channel — and admitted to one open to `member`, whose
+    /// `Started` names the role.
+    #[tokio::test]
+    async fn the_policy_decides_last_and_names_the_role() {
+        use crate::host::config::HostConfig;
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let server = NodeIdentity::from_seed([4u8; 32]).node_id();
+        let host = HostConfig::parse(
+            r#"{"version":1,"channel":"ops",
+                "identity":{"issuers":[{"issuer":"https://idp.example","audiences":["a"]}]},
+                "roles":{"analyst":[{"email":"*@example.com"}]},
+                "tools":{"open":{"command":["printf","ran"],"allow":["member"]},
+                         "db":{"command":["printf","secret"],"allow":["analyst"]},
+                         "shut":{"command":["printf","never"]}}}"#,
+        )
+        .unwrap();
+        let mut config = test_config(&root, server, false, Crl::new(), Vec::new());
+        config.tools = host.commands();
+        config.policy = Arc::new(host.policy());
+        let (sink, mut records) = AuditSink::channel(16);
+        config.audit = Some(sink);
+        let config = Arc::new(config);
+
+        let (res, out, _) =
+            run_call(Arc::clone(&config), &root, None, invoke("db", &[]), b"").await;
+        let reason = denied_reason(res);
+        assert!(out.is_empty());
+        assert!(
+            reason
+                .starts_with("db needs a verified identity in role analyst (email=*@example.com)"),
+            "{reason}"
+        );
+        let Ok(library::AuditRecord::Denied { reason: logged, .. }) = records.try_recv() else {
+            panic!("the refusal is recorded");
+        };
+        assert_eq!(logged, reason);
+
+        let (res, _, _) =
+            run_call(Arc::clone(&config), &root, None, invoke("shut", &[]), b"").await;
+        assert!(denied_reason(res).contains("shut allows no role"));
+        records.try_recv().unwrap();
+
+        let (res, out, _) =
+            run_call(Arc::clone(&config), &root, None, invoke("open", &[]), b"").await;
+        assert_eq!(res.unwrap(), 0);
+        assert_eq!(out, b"ran");
+        let Ok(library::AuditRecord::Started {
+            role, principal, ..
+        }) = records.try_recv()
+        else {
+            panic!("expected Started");
+        };
+        assert_eq!(role.as_deref(), Some("member"));
+        assert_eq!(principal, None);
+    }
+
     #[tokio::test]
     async fn membership_is_checked_before_the_tool_is_resolved() {
         // A revoked caller naming an unknown tool learns it is revoked, not
@@ -2860,41 +2907,6 @@ mod tests {
         let (res, _, _) = run_call(config, &root, None, invoke("nope", &[]), b"").await;
         let reason = denied_reason(res);
         assert!(reason.contains("revoked"), "{reason}");
-    }
-
-    #[test]
-    fn exposed_tools_parses_specs_and_files() {
-        let specs = vec![
-            "db_query=sqlite3 -safe  -readonly\t/data/orders.db".to_string(),
-            "rg=rg --no-config".to_string(),
-        ];
-        let file = temp_dir().join("tools.json");
-        std::fs::write(&file, r#"{"say": ["printf", "%s %s\n", "two words"]}"#).unwrap();
-        let tools = exposed_tools(&specs, Some(&file)).unwrap();
-        let get = |n: &str| tools.get(&ToolName::new(n).unwrap()).unwrap().clone();
-        assert_eq!(
-            get("db_query"),
-            ["sqlite3", "-safe", "-readonly", "/data/orders.db"]
-        );
-        assert_eq!(get("rg"), ["rg", "--no-config"]);
-        assert_eq!(get("say"), ["printf", "%s %s\n", "two words"]);
-        assert!(exposed_tools(&[], None).unwrap().is_empty());
-    }
-
-    #[test]
-    fn exposed_tools_rejects_bad_specs() {
-        let file = temp_dir().join("tools.json");
-        std::fs::write(&file, r#"{"rg": ["rg"]}"#).unwrap();
-        for (specs, file) in [
-            (vec!["no-equals-sign"], None),
-            (vec!["Bad Name=cat"], None),
-            (vec!["empty=  "], None),
-            (vec!["rg=rg", "rg=grep"], None),
-            (vec!["rg=rg"], Some(file.as_path())),
-        ] {
-            let specs: Vec<String> = specs.into_iter().map(String::from).collect();
-            assert!(exposed_tools(&specs, file).is_err(), "{specs:?}");
-        }
     }
 
     proptest::proptest! {
@@ -2929,8 +2941,8 @@ mod tests {
         }
     }
 
-    /// `serve --expose` + `wires call` over a real loopback endpoint: the
-    /// tools map comes from the same parser the CLI uses, the caller holds a
+    /// Two exposed tools + `wires call` over a real loopback endpoint: the
+    /// caller holds a
     /// `tool:shout` grant, and `call_on` carries the invocation.
     #[tokio::test]
     async fn loopback_expose_and_call() {
@@ -2944,14 +2956,16 @@ mod tests {
         let server_ep = test_endpoint(&server).await;
         let addr = endpoint_addr(&server.node_id(), &localhost_socks(&server_ep), None).unwrap();
         let mut config = test_config(&root, server.node_id(), true, Crl::new(), Vec::new());
-        config.tools = exposed_tools(
-            &[
-                "shout=tr a-z A-Z".to_string(),
-                "echo=printf %s|".to_string(),
-            ],
-            None,
-        )
-        .unwrap();
+        config.tools = BTreeMap::from([
+            (
+                ToolName::new("shout").unwrap(),
+                ["tr", "a-z", "A-Z"].map(String::from).to_vec(),
+            ),
+            (
+                ToolName::new("echo").unwrap(),
+                ["printf", "%s|"].map(String::from).to_vec(),
+            ),
+        ]);
         let srv = tokio::spawn(serve_on(server_ep, config));
 
         let client_ep = test_endpoint(&client).await;

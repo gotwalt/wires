@@ -20,8 +20,12 @@ pub(crate) const DEFAULT_ISSUER: &str = "https://accounts.google.com";
 pub(crate) struct IdpTrust {
     /// Issuers whose keys this reader will fetch and trust.
     pub issuers: Vec<Issuer>,
-    /// Accepted `aud` values (OAuth client ids).
+    /// Accepted `aud` values (OAuth client ids) from any issuer without an
+    /// entry in `by_issuer`.
     pub audiences: Vec<Audience>,
+    /// Accepted `aud` values per issuer (a host's `host.json`), which
+    /// replace `audiences` for that issuer.
+    pub by_issuer: Vec<(Issuer, Vec<Audience>)>,
 }
 
 impl IdpTrust {
@@ -41,34 +45,32 @@ impl IdpTrust {
         )
     }
 
-    /// `--oidc-issuer` / `--oidc-audience` values when given (each may be a
-    /// comma-separated list), else the environment ([`from_env`](Self::from_env)),
-    /// decided separately for issuers and audiences.
-    pub(crate) fn from_flags_or_env(issuers: &[String], audiences: &[String]) -> Self {
-        let env = Self::from_env();
-        let flags = Self::from_vars(Some(&issuers.join(",")), Some(&audiences.join(",")));
+    /// Exactly these issuers, each with its own accepted audiences (a host's
+    /// `identity.issuers`). An audience accepted from one issuer is not
+    /// accepted from another.
+    pub(crate) fn per_issuer(issuers: Vec<(Issuer, Vec<Audience>)>) -> Self {
         Self {
-            issuers: if issuers.is_empty() {
-                env.issuers
-            } else {
-                flags.issuers
-            },
-            audiences: if audiences.is_empty() {
-                env.audiences
-            } else {
-                flags.audiences
-            },
+            issuers: issuers.iter().map(|(iss, _)| iss.clone()).collect(),
+            audiences: Vec::new(),
+            by_issuer: issuers,
         }
     }
 
-    /// Also trust each of `more` (keeping order, skipping duplicates).
-    pub(crate) fn trusting(mut self, more: Vec<Issuer>) -> Self {
-        for iss in more {
-            if !self.issuers.contains(&iss) {
-                self.issuers.push(iss);
-            }
+    /// The audiences accepted from `issuer`.
+    pub(crate) fn audiences_for(&self, issuer: &Issuer) -> &[Audience] {
+        self.by_issuer
+            .iter()
+            .find(|(iss, _)| iss == issuer)
+            .map_or(&self.audiences, |(_, auds)| auds)
+    }
+
+    /// The audiences to verify `claim` against: those of the issuer it
+    /// names (unverified — verification then checks that very issuer).
+    pub(crate) fn audiences_for_claim(&self, claim: &IdentityClaim) -> &[Audience] {
+        match claim.id_token.unverified_issuer() {
+            Ok(iss) => self.audiences_for(&iss),
+            Err(_) => &self.audiences,
         }
-        self
     }
 
     /// The testable half of [`from_env`](Self::from_env).
@@ -93,6 +95,7 @@ impl IdpTrust {
                 .into_iter()
                 .map(Audience::new)
                 .collect(),
+            by_issuer: Vec::new(),
         }
     }
 }
@@ -109,7 +112,7 @@ pub(crate) async fn render_identity(
     now: i64,
 ) -> String {
     let verdict = fetcher
-        .verify(claim, &trust.issuers, &trust.audiences, now)
+        .verify(claim, &trust.issuers, trust.audiences_for_claim(claim), now)
         .await;
     describe_identity(claim, &verdict)
 }
@@ -181,6 +184,7 @@ mod tests {
             org: None,
             groups: vec![],
             not_after: 0,
+            claims: Default::default(),
         }
     }
 
@@ -229,15 +233,31 @@ mod tests {
     }
 
     #[test]
-    fn flags_override_the_environment_and_rules_add_issuers() {
-        let t = IdpTrust::from_flags_or_env(&["https://a,https://b".into()], &["x".into()])
-            .trusting(vec![Issuer::new("https://b"), Issuer::new("https://c")]);
+    fn per_issuer_audiences_do_not_leak_across_issuers() {
+        let t = IdpTrust::per_issuer(vec![
+            (Issuer::new("https://a"), vec![Audience::new("x")]),
+            (Issuer::new("https://b"), vec![Audience::new("y")]),
+        ]);
         assert_eq!(
             t.issuers,
-            ["https://a", "https://b", "https://c"]
-                .map(Issuer::new)
-                .to_vec()
+            ["https://a", "https://b"].map(Issuer::new).to_vec()
         );
-        assert_eq!(t.audiences, vec![Audience::new("x")]);
+        assert_eq!(
+            t.audiences_for(&Issuer::new("https://a")),
+            [Audience::new("x")]
+        );
+        assert_eq!(
+            t.audiences_for(&Issuer::new("https://b")),
+            [Audience::new("y")]
+        );
+        assert!(t.audiences_for(&Issuer::new("https://c")).is_empty());
+        // A token that doesn't even parse gets no audience at all.
+        assert!(t.audiences_for_claim(&claim()).is_empty());
+        // The environment form keeps one flat list for every issuer.
+        let env = IdpTrust::from_vars(Some("https://a"), Some("z"));
+        assert_eq!(
+            env.audiences_for(&Issuer::new("https://a")),
+            [Audience::new("z")]
+        );
     }
 }

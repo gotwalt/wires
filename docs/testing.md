@@ -74,7 +74,7 @@ cat "$WIRES_HOME/crl.json"
 ## Manual: a live session
 
 `.scripts/demo-remote-cli.sh` is the live session: a host exposing one tool
-with `--audit-topic`, a caller that logs in and runs `wires call` / `wires mcp`,
+from a `host.json` (`.scripts/fixtures/host.json`), a caller that logs in and runs `wires call` / `wires mcp`,
 and an observer on `wires watch`, all on loopback in a fresh `mktemp -d`, every
 step asserted. Run it with `--keep` to poke at the state afterwards.
 

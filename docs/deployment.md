@@ -6,7 +6,8 @@ self-hosted relay. For the command reference and the local walkthrough see the
 
 > **Partly out of date (card 12, 2026-09-23).** Single-command
 > `wires serve -- <cmd>`, `serve --scope` and `wires connect` are gone: a host
-> serves named tools (`--expose name=cmd`), callers use `wires call` (or
+> serves named tools from `host.json` (`wires serve host.json`, card 13; its
+> trust root is its own membership's, so there is no `--trust-root`), callers use `wires call` (or
 > `wires mcp` for MCP-only clients), and the admin plumbing is spelled
 > `wires advanced grant | member | roster | import …`. The pod and argv
 > examples below still show the old shapes; the image, key-handling and relay
