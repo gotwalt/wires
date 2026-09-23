@@ -59,7 +59,7 @@ The IdP is *bound* at the caller (`login`), *enforced* at the host (`host.json`)
 | [11](done/11-camera-blockers.md) | H | 04, 05, 07 | Camera blockers: 20 s audit stall after login, Safari callback error, `tools add --topic-ticket` |
 | [12](done/12-roles-and-tree.md) | R | 11 | Organize by role: 4-role CLI (`advanced` for plumbing), role folders, drop single-command serve/connect + old demos |
 | [13](review/13-host-json-policy.md) | P | 12 | `host.json`: tools + IdP roles + default deny; `Policy` seam for org rules later |
-| [14](backlog/14-invite-join.md) | O | 12 | `init` / `invite` / `join` / `remove`; re-key distributed over the channel |
+| [14](done/14-invite-join.md) | O | 12 | `init` / `invite` / `join` / `remove`; re-key distributed over the channel |
 | [15](backlog/15-channel-directory.md) | D2 | 12, 13 | Hosts announce tools on the channel; callers resolve by name — one invite is the only out-of-band step |
 | [17](backlog/17-readme-why.md) | docs | 12–16 | README: four roles, where each guarantee lives, why it's built this way; `docs/demo.md` |
 | [19](backlog/19-no-shell-caller.md) | S | 12 | No-shell caller: `wires call --jq/--head/--max-bytes` in-process; wires-only sandbox recipe; benchmark arm 5 |

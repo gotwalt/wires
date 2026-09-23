@@ -120,3 +120,5 @@ are stored but not re-printed once the key lands (pre-existing behavior).
 **Numbers.** `wires_test` 333 (was 312), `library_test` 273 (was 253),
 `library_doc_test` 48 (was 45); lint, `format.check` green;
 `demo-remote-cli.sh --quiet` green, 14 s.
+
+**Integrator review (2026-09-23).** The proof directory is sound: `check_roster_inclusion_via` runs the directory's proof through the same `check_roster_inclusion` against the root-signed head as a presented proof. **Known trade-off, recorded:** a Rekey record carries every survivor's id and proof under the old key, so a removed member learns the post-removal member list. That weakens committed-roster.md's "the head hides the member set" property for removed members. Acceptable for the demo; revisit together with card 18. The Rekey cap is 32 members per record (chunked), and gossip messages are now up to 64 KiB. The merge with card 13 needed `policy: AnyMember` in the onboarding e2e fixture.

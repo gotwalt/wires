@@ -121,6 +121,7 @@ fn resident(m: &Machine, hosted: bool) -> (tokio::task::JoinHandle<()>, oneshot:
             tools: cat_tool(),
             audit: Some(sink),
             identity: None,
+            policy: Arc::new(crate::host::policy::AnyMember),
         };
         crate::host::audit::Hosted {
             session: SessionProtocol(Arc::new(serve)),
