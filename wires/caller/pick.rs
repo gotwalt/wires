@@ -1,4 +1,4 @@
-//! Service name → host (card 27, lane **27b**). The caller never names a
+//! Service name → host (card 27). The caller never names a
 //! host: it takes the service's `hosts` from the signed state, tries the
 //! last one that worked first, then the rest in the admin's order, moving to
 //! the next on a dial failure (not on a refusal: a host that refused has
@@ -7,12 +7,33 @@
 //! The last host that answered for each service is remembered in
 //! `$WIRES_HOME/last-good.json` ([`LastGood`]); a hint, never an authority —
 //! a host the state no longer assigns is skipped.
+//!
+//! # Addressing
+//!
+//! Hosts are dialed **by key**: iroh's n0 discovery (DNS/pkarr, plus the
+//! relays) finds where a key is reachable, so by default a caller needs no
+//! address at all. [`Hints`] is the optional, **local, unsigned** override
+//! for networks without discovery (a hermetic loopback demo, an air-gapped
+//! lab): `$WIRES_HOME/hints`, one line per node,
+//!
+//! ```text
+//! # node id (64 hex)                                                 addresses…
+//! 3f2a…c9  127.0.0.1:52011  192.168.1.20:52011
+//! ```
+//!
+//! A hint only says where to try: iroh still authenticates the far side to
+//! the key, so a wrong or stale hint fails the dial, never reaches an
+//! impostor. `wires serve` writes its own line to `$WIRES_HOME/run/hint`
+//! ([`write_own_hint`]) for a script to copy. Every endpoint this binary
+//! binds ([`transport::bind`]) registers the file, so calls, state sync,
+//! push and inbox fetches all use it.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use iroh::EndpointAddr;
-use library::{NodeId, ServiceName, State, TopicId};
+use library::{NodeId, ServiceName, State};
 use serde::{Deserialize, Serialize};
 
 use crate::admin::keystore::Keystore;
@@ -20,6 +41,12 @@ use crate::host::transport;
 
 /// The file name under `$WIRES_HOME`.
 pub(crate) const LAST_GOOD_FILE: &str = "last-good.json";
+
+/// The local address-hint file under `$WIRES_HOME` (see the module docs).
+pub(crate) const HINTS_FILE: &str = "hints";
+
+/// Where `wires serve` writes its own hint line, under `$WIRES_HOME`.
+pub(crate) const OWN_HINT_FILE: &str = "run/hint";
 
 /// The hosts to try for `service`, in order: `last_good` first if it still
 /// implements it, then the registry's order. Empty if the service is unknown
@@ -83,40 +110,53 @@ impl LastGood {
     }
 }
 
-/// Dial hints this node already holds for hosts: address and relay hints
-/// from the channel's `directory.json` and peer book, when a channel is
-/// joined. Dialing by key alone works without them (iroh discovery); they
-/// only make it faster, or possible on a network without discovery.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Hints(BTreeMap<NodeId, (Vec<std::net::SocketAddr>, Option<String>)>);
+/// Local, unsigned dial hints: node → direct addresses (see the module
+/// docs). Empty when there is no hints file, which is the normal case.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Hints(BTreeMap<NodeId, (Vec<SocketAddr>, Option<String>)>);
 
 impl Hints {
-    /// What `ks` knows; empty when no channel is joined.
-    pub(crate) fn load(ks: &Keystore, fabric: NodeId) -> Self {
-        let home = ks.path("");
-        let home = home.as_path();
-        let mut out = BTreeMap::new();
-        let Ok(Some(channel)) = ks.read_channel() else {
-            return Self(out);
-        };
-        let topic = TopicId::derive(fabric, &channel);
-        for p in crate::channel::peers::PeerBook::open(home, topic).list() {
-            out.insert(p.node, (p.addrs, p.relay_url));
+    /// `$WIRES_HOME/hints` of `ks`; missing is empty. A line that doesn't
+    /// parse is skipped with a warning (a hint is never an authority).
+    pub(crate) fn load(ks: &Keystore) -> Self {
+        match std::fs::read_to_string(ks.path(HINTS_FILE)) {
+            Ok(text) => Self::parse(&text),
+            Err(_) => Self::default(),
         }
-        let dir = crate::caller::resolve::Directory::load(
-            &crate::caller::resolve::Directory::path(home),
-            &channel,
-        );
-        for h in dir.hosts {
-            let entry = out.entry(h.node).or_insert_with(|| (Vec::new(), None));
-            if !h.listing.addrs.is_empty() {
-                entry.0 = h.listing.addrs.clone();
-            }
-            if h.listing.relay_url.is_some() {
-                entry.1 = h.listing.relay_url.clone();
+    }
+
+    /// Parse the hints format: `<node hex> <addr>…` per line, `#` comments.
+    pub(crate) fn parse(text: &str) -> Self {
+        let mut out: BTreeMap<NodeId, (Vec<SocketAddr>, Option<String>)> = BTreeMap::new();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            let mut words = line.split_whitespace();
+            let Some(node) = words.next() else { continue };
+            let Ok(node) = NodeId::from_hex(node) else {
+                tracing::warn!("hints: skipping a line with a bad node id: {line:?}");
+                continue;
+            };
+            let entry = out.entry(node).or_default();
+            for word in words {
+                match word.parse::<SocketAddr>() {
+                    Ok(addr) if !entry.0.contains(&addr) => entry.0.push(addr),
+                    Ok(_) => {}
+                    Err(_) => tracing::warn!("hints: skipping {word:?} (not ip:port)"),
+                }
             }
         }
         Self(out)
+    }
+
+    /// Every hinted node as an [`EndpointAddr`] (what [`transport::bind`]
+    /// registers in the endpoint's address lookup).
+    pub(crate) fn endpoint_addrs(&self) -> Vec<EndpointAddr> {
+        self.0
+            .iter()
+            .filter_map(|(n, (addrs, relay))| {
+                transport::endpoint_addr(n, addrs, relay.as_deref()).ok()
+            })
+            .collect()
     }
 
     /// Hints for exactly these hosts, for tests and pinned setups.
@@ -140,6 +180,40 @@ impl Hints {
             })
             .collect()
     }
+}
+
+/// One hints-file line for `node` at `addrs`.
+pub(crate) fn hint_line(node: NodeId, addrs: &[SocketAddr]) -> String {
+    let addrs: Vec<String> = addrs.iter().map(SocketAddr::to_string).collect();
+    format!("{} {}", node.hex(), addrs.join(" "))
+}
+
+/// Write this host's own hint line (its node id and loopback-rewritten
+/// bound sockets, plus iroh's view of its interface addresses) to
+/// `$WIRES_HOME/run/hint`, for a script to append to a caller's `hints`.
+pub(crate) fn write_own_hint(ks: &Keystore, endpoint: &iroh::Endpoint) -> anyhow::Result<()> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    let mut addrs: Vec<SocketAddr> = endpoint.addr().ip_addrs().copied().collect();
+    for sock in endpoint.bound_sockets() {
+        let dialable = match sock {
+            SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
+                SocketAddr::from((Ipv4Addr::LOCALHOST, v4.port()))
+            }
+            SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
+                SocketAddr::from((Ipv6Addr::LOCALHOST, v6.port()))
+            }
+            other => other,
+        };
+        if !addrs.contains(&dialable) {
+            addrs.push(dialable);
+        }
+    }
+    let path = ks.path(OWN_HINT_FILE);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let me = transport::to_node_id(&endpoint.id());
+    crate::admin::keystore::write_text_mode(&path, &format!("{}\n", hint_line(me, &addrs)), None)
 }
 
 /// The short form of a host key that `--verbose` prints.
@@ -231,6 +305,31 @@ mod tests {
             ServiceName::new("nope").unwrap(),
         ];
         assert_eq!(hosts_of(&s, &names), vec![node(3), node(2)]);
+    }
+
+    #[test]
+    fn the_hints_file_parses_and_skips_what_it_cannot_read() {
+        let a: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let b: SocketAddr = "[::1]:4433".parse().unwrap();
+        let text = format!(
+            "# a comment\n{}\n{} 127.0.0.1:4433 # again\nnot-a-node 1.2.3.4:5\n{} nope\n\n",
+            hint_line(node(3), &[a, b]),
+            node(3).hex(),
+            node(2).hex(),
+        );
+        let hints = Hints::parse(&text);
+        assert_eq!(
+            hints,
+            Hints(BTreeMap::from([
+                (node(3), (vec![a, b], None)),
+                (node(2), (vec![], None)),
+            ]))
+        );
+        assert_eq!(hints.endpoint_addrs().len(), 2);
+        let ks = Keystore::at(crate::testutil::temp_dir());
+        assert_eq!(Hints::load(&ks), Hints::default());
+        std::fs::write(ks.path(HINTS_FILE), &text).unwrap();
+        assert_eq!(Hints::load(&ks), hints);
     }
 
     #[test]

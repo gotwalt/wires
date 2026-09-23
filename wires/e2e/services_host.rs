@@ -603,7 +603,7 @@ async fn fetch(w: &World, who: &NodeIdentity, host: &Host) -> Fetched {
     let mailbox = Mailbox::open(&crate::testutil::temp_dir()).unwrap();
     let hello = library::InboxFrame::Hello {
         membership: w.membership(who),
-        proof: None,
+        id_token: None,
     };
     let fetched = timeout(
         PATIENCE,

@@ -14,8 +14,9 @@ pub enum Error {
     #[error("decode: {0}")]
     Decode(serde_json::Error),
 
-    /// A capability-ticket string was not valid base64.
-    #[error("ticket decode: {0}")]
+    /// A token (an invite, a membership, a signed state) was not valid
+    /// base64.
+    #[error("token decode: {0}")]
     TicketDecode(#[from] base64::DecodeError),
 
     /// A signature did not verify against the expected public key.
@@ -36,9 +37,8 @@ pub enum Error {
 
     /// A credential's `not_after` is in the past relative to the checked time.
     ///
-    /// Shared by memberships and roster heads — the caller prefixes which
-    /// credential it was checking (`membership rejected: …`,
-    /// `roster inclusion rejected: …`), so the display
+    /// Shared by memberships and signed states — the caller prefixes which
+    /// credential it was checking (`membership rejected: …`), so the display
     /// deliberately does *not* name one.
     #[error("expired at {not_after}")]
     Expired {
@@ -63,91 +63,11 @@ pub enum Error {
     #[error("bad frame")]
     BadFrame,
 
-    /// A roster inclusion proof did not recompute to the head's Merkle root —
-    /// the presented node is not a member under that head.
-    #[error("not a member of the roster")]
-    NotInRoster,
-
-    /// An inclusion proof targets a different roster version than the head it
-    /// was checked against (the member must refresh its proof against the
-    /// current head).
-    #[error("stale inclusion proof: proof targets version {proof}, head is version {head}")]
-    StaleProof {
-        /// The roster version the proof was issued against.
-        proof: u64,
-        /// The roster version of the head it was checked against.
-        head: u64,
-    },
-
-    /// A member's proof targets an older roster version, and the verifier's
-    /// [`ProofDirectory`](crate::ProofDirectory) for the current head does not
-    /// list it: a commit since `proof` removed it. Tells the caller no more
-    /// than it already knows (it was removed; the head's version is public).
-    #[error("not in the current roster ({})", removal(*.proof, *.head))]
-    RemovedFromRoster {
-        /// The roster version the caller's (last valid) proof was issued
-        /// against.
-        proof: u64,
-        /// The current head's version, which does not list the caller.
-        head: u64,
-    },
-
-    /// A responder configured with a roster head required an inclusion proof in
-    /// the handshake, but none was presented.
-    #[error("inclusion proof required")]
-    InclusionProofRequired,
-
-    /// `Roster::commit` was handed a signing key whose node id is not the
-    /// roster's `fabric` — a usage error (the fabric root must sign its own
-    /// roster).
+    /// [`State::sign`](crate::State::sign) was handed a signing key whose
+    /// node id is not the state's `fabric` — a usage error (the fabric root
+    /// must sign its own state).
     #[error("signing key is not the fabric root")]
     FabricMismatch,
-
-    /// A sealed payload did not open, or could not be sealed in the first
-    /// place. The crate's single "the AEAD layer did not work out" error, raised
-    /// at three points:
-    ///
-    /// - [`SealedFabricKey::open`](crate::SealedFabricKey::open) — the AEAD tag
-    ///   failed, or the blob was truncated or malformed.
-    /// - [`TopicEnvelope::open`](crate::TopicEnvelope::open) — the wrong fabric
-    ///   key, or a tampered body (the AAD covers every signed field).
-    /// - [`SealedFabricKey::seal`](crate::SealedFabricKey::seal) — the *sealing*
-    ///   direction: the recipient's `NodeId` is not a valid Ed25519 point, so
-    ///   there is no X25519 key to seal to.
-    ///
-    /// Distinct from [`Error::InvalidSignature`] (a signature over the sealed
-    /// object) and [`Error::SubjectMismatch`] (sealed to a different member) —
-    /// both are checked first, so reaching this means the object was
-    /// well-formed and correctly addressed but the ciphertext was not. Also
-    /// distinct from [`Error::KeyVersionUnknown`], which says the node holds no
-    /// key for the version at all; this one says a key was tried and rejected.
-    #[error(
-        "sealed payload did not open (wrong key, tampered ciphertext, or unusable recipient key)"
-    )]
-    SealedKeyOpen,
-
-    /// An envelope is encrypted under a roster version whose fabric key this
-    /// node does not hold.
-    ///
-    /// Not fatal: the message is stored provisionally and displays once the key
-    /// arrives via `wires advanced import` (late joiners never hold pre-join versions,
-    /// so for them this is permanent by design).
-    #[error("no fabric key held for roster version {version}")]
-    KeyVersionUnknown {
-        /// The roster version the envelope names.
-        version: u64,
-    },
-
-    /// A publisher's chain forked: a different message occupies a sequence
-    /// number already filled, or a link hash does not match the predecessor.
-    ///
-    /// Detect and refuse — this layer picks no winner (see [`crate::chain`]).
-    #[error("chain fork detected")]
-    ChainFork,
-
-    /// An envelope's `topic` is not the topic it was received on.
-    #[error("envelope is for a different topic")]
-    TopicMismatch,
 
     /// A tool name broke the [`ToolName`](crate::ToolName) rules.
     #[error("invalid tool name")]
@@ -182,14 +102,6 @@ pub enum Error {
     /// names which.
     #[error("invalid push: {0}")]
     InvalidPush(&'static str),
-
-    /// A [`Rekey`](crate::Rekey) or [`Invite`](crate::Invite) whose parts do
-    /// not belong together: an entry for another roster version, a sealed key
-    /// addressed to someone other than its proof's member, a member listed
-    /// twice, or an empty channel name. Every part may verify on its own; this
-    /// is the check that they describe *one* commit.
-    #[error("inconsistent re-key: {0}")]
-    InconsistentRekey(&'static str),
 
     /// An [`IdentityClaim`](crate::IdentityClaim)'s ID token did not verify.
     /// The inner [`IdTokenError`] names the precise reason, so a renderer or
@@ -269,16 +181,4 @@ pub enum IdTokenError {
     /// absent or has the wrong JSON type.
     #[error("missing or mistyped claim {0:?}")]
     MissingClaim(&'static str),
-}
-
-/// When [`Error::RemovedFromRoster`] says the member left: exactly the
-/// head's version when the proof is one commit behind it, else only a range
-/// (the verifier knows the member is absent from the current head, not at
-/// which commit in between it went).
-fn removal(proof: u64, head: u64) -> String {
-    if head == proof.saturating_add(1) {
-        format!("removed at version {head}")
-    } else {
-        format!("removed after version {proof}; head is version {head}")
-    }
 }

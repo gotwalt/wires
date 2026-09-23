@@ -34,9 +34,8 @@ use library::{
 
 use crate::admin::keystore::Keystore;
 use crate::caller::jwks::VerifyError;
-use crate::channel::idp_view::principal_name;
 use crate::host::config_v2::HostConfigV2;
-use crate::host::identity::Identities;
+use crate::host::identity::{Identities, principal_name};
 use crate::host::transport::AuditSink;
 
 /// A call the gate admitted.

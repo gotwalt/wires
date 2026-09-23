@@ -1,8 +1,8 @@
 //! Session protocol frames and their self-delimiting wire codec.
 //!
 //! A session carries a small set of [`Frame`]s over a single bidirectional
-//! stream: an opening [`Frame::Handshake`] that presents the dialer's membership,
-//! then tagged stdio chunks ([`Frame::Stdin`] / [`Frame::Stdout`] /
+//! stream: an opening [`Frame::Hello`] that presents the dialer's membership,
+//! state version and ID token, then tagged stdio chunks ([`Frame::Stdin`] / [`Frame::Stdout`] /
 //! [`Frame::Stderr`]) and a final [`Frame::Exit`] carrying the child's exit
 //! code. A responder that refuses the handshake answers with a terminal
 //! [`Frame::Denied`] carrying the human-readable reason instead of an ack, so
@@ -22,35 +22,25 @@
 //!
 //! | tag  | variant     | body                                       |
 //! |------|-------------|--------------------------------------------|
-//! | `0`  | `Handshake` | canonical-JSON of the handshake envelope   |
+//! | `0`  | —           | retired (the channel-era `Handshake`)      |
 //! | `1`  | `Stdin`     | raw chunk bytes                            |
 //! | `2`  | `Stdout`    | raw chunk bytes                            |
 //! | `3`  | `Stderr`    | raw chunk bytes                            |
 //! | `4`  | `Exit`      | 4-byte big-endian `i32`                    |
-//! | `5`  | `HandshakeAck` | canonical-JSON of the ack envelope      |
+//! | `5`  | —           | retired (the channel-era `HandshakeAck`)   |
 //! | `6`  | `Denied`    | UTF-8 reason bytes                         |
 //! | `7`  | `Invoke`    | canonical-JSON of the [`Invocation`]       |
 //! | `8`  | `Hello`     | canonical-JSON of the [`Hello`] (card 27)  |
 //! | `9`  | `HelloAck`  | canonical-JSON of the [`HelloAck`] (card 27) |
 //!
-//! A dialer sends [`Frame::Invoke`] immediately after its `Handshake`, without
-//! waiting for the ack — the responder reads both, authorizes them together,
-//! and only then answers with `HandshakeAck` or `Denied`.
+//! A dialer sends [`Frame::Invoke`] immediately after its `Hello`, without
+//! waiting for the ack — the host reads both, authorizes them together, and
+//! only then answers with `HelloAck` or `Denied`.
 //!
-//! The handshake envelope is the canonical JSON of a [`Membership`] plus an
-//! optional [`InclusionProof`]. The envelope itself is *unsigned* — the signed
-//! objects are the membership and the head a proof is checked against, each
-//! with its own fixed signed body — so omitting an absent proof via
-//! `skip_serializing_if` is safe here.
-//!
-//! # Card 27: `Hello` replaces `Handshake`
-//!
-//! [`Frame::Hello`] / [`Frame::HelloAck`] are the services-era handshake: the
-//! dialer presents its membership, the version of the signed state it holds,
-//! and its IdP ID token (so the host no longer reads identities off a
-//! channel). The old `Handshake` / `HandshakeAck` pair still decodes so the
-//! current transport keeps working; lanes 27b (dial) and 27c (accept) switch
-//! over, and 27d removes the old pair.
+//! [`Hello`] and [`HelloAck`] are unsigned envelopes: each part verifies on
+//! its own (the membership under the root, the ID token under the IdP's keys
+//! and its nonce binding to the iroh-authenticated caller, the state under
+//! the root), so omitting an absent part via `skip_serializing_if` is safe.
 
 use serde::{Deserialize, Serialize};
 
@@ -59,15 +49,12 @@ use crate::error::{Error, Result};
 use crate::idp::IdToken;
 use crate::invoke::Invocation;
 use crate::membership::Membership;
-use crate::roster::InclusionProof;
 use crate::state::{SignedState, StateVersion};
 
-const TAG_HANDSHAKE: u8 = 0;
 const TAG_STDIN: u8 = 1;
 const TAG_STDOUT: u8 = 2;
 const TAG_STDERR: u8 = 3;
 const TAG_EXIT: u8 = 4;
-const TAG_HANDSHAKE_ACK: u8 = 5;
 const TAG_DENIED: u8 = 6;
 const TAG_INVOKE: u8 = 7;
 const TAG_HELLO: u8 = 8;
@@ -136,53 +123,15 @@ impl Chunk {
     }
 }
 
-/// The unsigned wire envelope for a [`Frame::Handshake`]: a mandatory membership
-/// and an optional roster inclusion proof, serialized as one canonical-JSON
-/// blob. `skip_serializing_if` is safe here precisely because this struct is
-/// *not* signed — the membership and the head a proof is checked against are
-/// each signed independently over their own fixed bodies.
-#[derive(Serialize, Deserialize)]
-struct HandshakeBody {
-    membership: Membership,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    proof: Option<InclusionProof>,
-}
-
-/// The unsigned wire envelope for a [`Frame::HandshakeAck`]: the responder's own
-/// membership and an optional inclusion proof.
-#[derive(Serialize, Deserialize)]
-struct HandshakeAckBody {
-    membership: Membership,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    proof: Option<InclusionProof>,
-}
-
 /// One framed message on a session.
 ///
-/// The `Handshake` variant (membership + optional proof) is much larger than the
-/// stdio variants, but it is sent exactly once per session while the small
-/// chunk frames dominate; boxing it would only add indirection to the
-/// public API for no meaningful gain on the hot path.
+/// The `Hello` variants are much larger than the stdio variants, but each is
+/// sent exactly once per session while the small chunk frames dominate;
+/// boxing them would only add indirection to the public API for no
+/// meaningful gain on the hot path.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Frame {
-    /// Opening frame: the dialer presents its fabric membership (always) and a
-    /// roster inclusion proof when a head-enforcing responder requires one.
-    Handshake {
-        /// The membership proving the dialer belongs to the fabric.
-        membership: Membership,
-        /// The dialer's roster inclusion proof, when presenting one.
-        proof: Option<InclusionProof>,
-    },
-    /// First frame back from the responder: its own membership (so a ticket-less
-    /// dialer can verify the service's fabric membership before streaming stdin)
-    /// and, optionally, its own inclusion proof.
-    HandshakeAck {
-        /// The responder's membership.
-        membership: Membership,
-        /// The responder's inclusion proof, if it presents one.
-        proof: Option<InclusionProof>,
-    },
     /// A chunk of the child process's stdin.
     Stdin(Chunk),
     /// A chunk of the child process's stdout.
@@ -191,20 +140,20 @@ pub enum Frame {
     Stderr(Chunk),
     /// The child process's exit code.
     Exit(i32),
-    /// Terminal frame from the responder: the handshake was refused, with a
-    /// human-readable reason. Sent instead of a `HandshakeAck`, after which the
+    /// Terminal frame from the responder: the call was refused, with a
+    /// human-readable reason. Sent instead of a `HelloAck`, after which the
     /// responder closes. Carries no secrets — the reason describes the dialer's
     /// own credential.
     Denied {
         /// Why the session was refused (e.g. `membership rejected: revoked`).
         reason: String,
     },
-    /// Dialer → multi-tool responder, right after `Handshake`: which exposed
-    /// tool to run and the per-call arguments.
+    /// Dialer → host, right after `Hello`: which service to run and the
+    /// per-call arguments.
     Invoke(Invocation),
-    /// Card 27's opening frame: membership, state version, ID token.
+    /// The opening frame: membership, state version, ID token.
     Hello(Hello),
-    /// Card 27's ack to an admitted [`Hello`].
+    /// The host's ack to an admitted [`Hello`].
     HelloAck(HelloAck),
 }
 
@@ -229,22 +178,6 @@ impl Frame {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut payload = Vec::new();
         match self {
-            Frame::Handshake { membership, proof } => {
-                payload.push(TAG_HANDSHAKE);
-                let body = HandshakeBody {
-                    membership: membership.clone(),
-                    proof: proof.clone(),
-                };
-                payload.extend_from_slice(&canonical_bytes(&body)?);
-            }
-            Frame::HandshakeAck { membership, proof } => {
-                payload.push(TAG_HANDSHAKE_ACK);
-                let body = HandshakeAckBody {
-                    membership: membership.clone(),
-                    proof: proof.clone(),
-                };
-                payload.extend_from_slice(&canonical_bytes(&body)?);
-            }
             Frame::Stdin(chunk) => {
                 payload.push(TAG_STDIN);
                 payload.extend_from_slice(chunk.as_bytes());
@@ -304,20 +237,6 @@ impl Frame {
         let payload = &buf[4..end];
         let (&tag, body) = payload.split_first().ok_or(Error::BadFrame)?;
         let frame = match tag {
-            TAG_HANDSHAKE => {
-                let hs: HandshakeBody = serde_json::from_slice(body).map_err(Error::Decode)?;
-                Frame::Handshake {
-                    membership: hs.membership,
-                    proof: hs.proof,
-                }
-            }
-            TAG_HANDSHAKE_ACK => {
-                let ack: HandshakeAckBody = serde_json::from_slice(body).map_err(Error::Decode)?;
-                Frame::HandshakeAck {
-                    membership: ack.membership,
-                    proof: ack.proof,
-                }
-            }
             TAG_STDIN => Frame::Stdin(Chunk::from_bytes(body.to_vec())),
             TAG_STDOUT => Frame::Stdout(Chunk::from_bytes(body.to_vec())),
             TAG_STDERR => Frame::Stderr(Chunk::from_bytes(body.to_vec())),
@@ -351,34 +270,9 @@ mod tests {
         proptest::collection::vec(any::<u8>(), 0..256)
     }
 
-    /// An arbitrary frame of any variant, covering Handshake (proof present
-    /// or absent) and HandshakeAck (proof present or absent).
+    /// An arbitrary frame of any variant.
     fn frame() -> impl Strategy<Value = Frame> {
         prop_oneof![
-            (seed(), seed(), any::<i64>(), any::<bool>()).prop_map(|(rs, ss, na, with_proof)| {
-                let root = NodeIdentity::from_seed(rs);
-                let member = NodeIdentity::from_seed(ss).node_id();
-                let membership = Membership::mint(&root, member, 0, na).unwrap();
-                let proof = with_proof.then(|| {
-                    let mut roster = crate::roster::Roster::new(root.node_id());
-                    roster.insert(member);
-                    let (_head, proofs) = roster.commit(&root, 0, na).unwrap();
-                    proofs.into_iter().next().unwrap().1
-                });
-                Frame::Handshake { membership, proof }
-            }),
-            (seed(), seed(), any::<i64>(), any::<bool>()).prop_map(|(rs, ss, na, with_proof)| {
-                let root = NodeIdentity::from_seed(rs);
-                let member = NodeIdentity::from_seed(ss).node_id();
-                let membership = Membership::mint(&root, member, 0, na).unwrap();
-                let proof = with_proof.then(|| {
-                    let mut roster = crate::roster::Roster::new(root.node_id());
-                    roster.insert(member);
-                    let (_head, proofs) = roster.commit(&root, 0, na).unwrap();
-                    proofs.into_iter().next().unwrap().1
-                });
-                Frame::HandshakeAck { membership, proof }
-            }),
             bytes().prop_map(|b| Frame::Stdin(Chunk::from_bytes(b))),
             bytes().prop_map(|b| Frame::Stdout(Chunk::from_bytes(b))),
             bytes().prop_map(|b| Frame::Stderr(Chunk::from_bytes(b))),
@@ -522,6 +416,18 @@ mod tests {
         let enc = f.encode().unwrap();
         assert_eq!(enc, vec![0, 0, 0, 1, TAG_STDIN]);
         assert_eq!(Frame::decode(&enc).unwrap().unwrap().0, f);
+    }
+
+    #[test]
+    fn retired_handshake_tags_are_bad_frames() {
+        assert!(matches!(
+            Frame::decode(&[0, 0, 0, 3, 0, b'{', b'}']),
+            Err(Error::BadFrame)
+        ));
+        assert!(matches!(
+            Frame::decode(&[0, 0, 0, 3, 5, b'{', b'}']),
+            Err(Error::BadFrame)
+        ));
     }
 
     #[test]

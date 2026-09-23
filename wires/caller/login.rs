@@ -9,13 +9,13 @@
 //!
 //! Then:
 //!
-//! 1. the token is verified locally (same [`KeyFetcher::verify`] every reader
-//!    uses), so a misconfigured client fails here and not on the observer;
+//! 1. the token is verified locally (the same [`KeyFetcher::verify`] a host
+//!    runs), so a misconfigured client fails here and not at the host;
 //! 2. it is stored in the keystore as [`ID_TOKEN_FILE`] (`0600`), plus
 //!    [`REFRESH_TOKEN_FILE`] when the IdP granted one;
-//! 3. nothing is published (card 27): `wires call` presents the stored token
-//!    in its session `Hello`, and the host verifies it there. `--topic` is
-//!    still accepted, and ignored with a note, so old scripts keep running.
+//! 3. nothing is published: `wires call` presents the stored token in its
+//!    session `Hello` (and `wires inbox` in its fetch), and the host verifies
+//!    it there.
 //!
 //! Configuration (flag, else environment): `--client-id` /
 //! `WIRES_OIDC_CLIENT_ID` (required), `--client-secret` /
@@ -41,7 +41,9 @@ use url::Url;
 
 use crate::admin::keystore;
 use crate::caller::jwks::{Discovery, KeyFetcher};
-use crate::channel::idp_view::DEFAULT_ISSUER;
+
+/// The default issuer: Google, the demo IdP.
+pub(crate) const DEFAULT_ISSUER: &str = "https://accounts.google.com";
 
 /// The raw ID token, in the keystore (mode `0600`).
 pub(crate) const ID_TOKEN_FILE: &str = "idp-token.jwt";
@@ -75,16 +77,6 @@ const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL
 /// `login` arguments.
 #[derive(Args, Debug, Default)]
 pub(crate) struct LoginArgs {
-    /// Ignored (card 27): the token travels in each call's handshake, not
-    /// on a channel. Accepted so old scripts keep working.
-    #[arg(long, hide = true)]
-    pub topic: Option<String>,
-    /// Ignored, with `--topic`.
-    #[arg(long = "peer", hide = true)]
-    pub peer: Vec<String>,
-    /// Ignored, with `--topic`.
-    #[arg(long, hide = true)]
-    pub relay_url: Option<String>,
     /// Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`,
     /// then `--node-seed-file`, then the keystore (`node.seed`).
     #[arg(long)]
@@ -684,12 +676,6 @@ pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
     crate::init_logging();
     let ks = keystore::Keystore::resolve()?;
     let home = keystore::home()?;
-    if a.topic.is_some() || !a.peer.is_empty() || a.relay_url.is_some() {
-        eprintln!(
-            "wires login: --topic/--peer/--relay-url are ignored: the token is stored and \
-             presented when you call (nothing is published)"
-        );
-    }
     let node =
         keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?.node_id();
     let client = OidcClient::resolve(&a)?;
@@ -831,7 +817,7 @@ mod tests {
 
     #[test]
     fn secrets_are_written_0600() {
-        let dir = crate::channel::ipc::ScratchDir::new("sec");
+        let dir = crate::testutil::ScratchDir::new("sec");
         let path = dir.path().join(ID_TOKEN_FILE);
         save_secret(&path, "a").unwrap();
         save_secret(&path, "b").unwrap();
@@ -1053,7 +1039,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_kid_refetches_and_the_disk_cache_serves_restarts() {
         let idp = MockIdp::start("alice@example.com").await;
-        let dir = crate::channel::ipc::ScratchDir::new("jwk");
+        let dir = crate::testutil::ScratchDir::new("jwk");
         let cache = Some(dir.path().to_path_buf());
         let now = crate::now_unix();
         let aud = [Audience::new(idp.client_id.clone())];

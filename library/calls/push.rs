@@ -5,8 +5,8 @@
 //! two ways, both over the inbox ALPN [`INBOX_ALPN`] and both carried in
 //! [`InboxFrame`]s:
 //!
-//! - **direct**: the host dials the recipient's resident receiver (a running
-//!   `wires watch`) by node id, says [`Hello`](InboxFrame::Hello) with its own
+//! - **direct**: the host dials the recipient's receiver (a running `wires
+//!   inbox --wait`) by node id, says [`Hello`](InboxFrame::Hello) with its own
 //!   credentials, and sends [`Deliver`](InboxFrame::Deliver); the receiver
 //!   stores what it accepts and answers [`Ack`](InboxFrame::Ack).
 //! - **fetch**: the recipient dials the host (`wires inbox`, no resident
@@ -14,6 +14,8 @@
 //!   optionally holding the stream open up to `wait_ms` for a message to
 //!   arrive — and the host answers `Deliver` (possibly empty); the recipient
 //!   stores and `Ack`s, and only acknowledged messages leave the host's queue.
+//!   The recipient's `Hello` carries its IdP ID token, so a host learns a
+//!   logged-in recipient's identity (and so its roles) by the fetch alone.
 //!
 //! Either side may answer [`Denied`](InboxFrame::Denied) with a reason
 //! instead.
@@ -70,12 +72,12 @@ use serde::{Deserialize, Serialize};
 use crate::codec::canonical_bytes;
 use crate::error::{Error, Result};
 use crate::identity::NodeId;
+use crate::idp::IdToken;
 use crate::membership::Membership;
-use crate::roster::InclusionProof;
 
 /// The ALPN of the inbox protocol: a host's fetch endpoint and a caller's
 /// resident receiver both speak it.
-pub const INBOX_ALPN: &[u8] = b"wires/inbox/1";
+pub const INBOX_ALPN: &[u8] = b"wires/inbox/2";
 
 /// Longest [`Subject`], in bytes.
 pub const MAX_SUBJECT: usize = 128;
@@ -272,16 +274,16 @@ impl PushMessage {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboxFrame {
-    /// The dialer's opening frame: its fabric membership and (for a
-    /// head-enforcing peer) its roster inclusion proof. The dialer's
-    /// identity is the key iroh authenticated; these only prove it is a
-    /// member.
+    /// The dialer's opening frame: its fabric membership and, from a
+    /// recipient that has logged in, its IdP ID token (nonce-bound to its
+    /// node key). The dialer's identity is the key iroh authenticated; these
+    /// only prove it is a member, and who it signed in as.
     Hello {
         /// The dialer's membership.
         membership: Membership,
-        /// The dialer's inclusion proof, when it holds one.
+        /// The dialer's ID token, when it holds one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        proof: Option<InclusionProof>,
+        id_token: Option<IdToken>,
     },
     /// Recipient → host, after `Hello`: send me what is queued for me,
     /// waiting up to `wait_ms` for something to arrive when nothing is.

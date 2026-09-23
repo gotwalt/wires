@@ -1,62 +1,30 @@
-//! `wires serve host.json` (with a `channel`): every call the responder handles lands
-//! on an E2EE topic as a signed record.
-//!
-//! # Shape
-//!
-//! A responder with an audit topic is **one process, one endpoint, one
-//! allocator**. It stands up the [`TopicNode`](crate::channel::topics::TopicNode) for
-//! the topic itself and registers the session ALPN ([`transport::ALPN`]) on
-//! that node's router (see [`TopicNodeConfig::protocols`]), rather than binding
-//! a second endpoint for the same node key. It then runs the ordinary resident
-//! tail loop, which owns the topic log and is the only thing that allocates
-//! sequences on it.
-//!
-//! Sessions report through an [`AuditSink`] in the [`ServeConfig`]. [`forward`]
-//! drains the sink's receiver and turns each [`AuditRecord`] into exactly one
-//! [`PublishRequest`] on the same channel the control socket feeds — so a call
-//! record is sealed, appended and broadcast by the very code path `wires
-//! publish` uses, never by a second allocator.
+//! The records a host keeps about every call it handles (card 26a): each one
+//! lands in the host's own signed, hash-linked call log
+//! ([`call_log`](crate::host::call_log)), and is exported over OTLP when
+//! `audit.otlp` is set. Nothing is broadcast.
 //!
 //! # Where the records come from
 //!
-//! [`CallAudit`] is the per-call handle `serve_session` holds: `start` emits
+//! [`CallAudit`] is the per-call handle the session holds: `start` emits
 //! [`Started`](AuditRecord::Started) once the child is spawned, the [`Tap`]s
 //! it hands out count (and, for stdout, BLAKE3-hash) what the child writes,
 //! the [`StdinTap`] hashes, counts and quotes the head of what the caller
-//! sent on stdin, and `finish` emits [`Finished`](AuditRecord::Finished). A refusal emits a
-//! lone [`Denied`](AuditRecord::Denied) via [`denied`] carrying the exact
-//! reason the caller was sent. The caller is always the iroh-authenticated
-//! peer, never a handshake claim.
+//! sent on stdin, and `finish` emits [`Finished`](AuditRecord::Finished). A
+//! refusal emits a lone [`Denied`](AuditRecord::Denied) via [`denied`]
+//! carrying the exact reason the caller was sent. The caller is always the
+//! iroh-authenticated peer, never a handshake claim.
 //!
-//! Publishing is best-effort by design: a full or closed sink, or a publish
-//! the tail loop refuses, is logged at `warn` and the call proceeds. The
-//! fail-closed part is *startup*: a host.json `channel` refuses to start unless this
-//! node is a provisioned member of the channel (membership, inclusion proof,
-//! roster head and fabric key), with an error naming the `wires advanced import` flag.
-//!
-//! # Observer setup
-//!
-//! An observer is any roster member holding the current fabric key: `wires
-//! import` its membership, proof, head and key, then `wires watch <topic>
-//! --peer <responder's topic ticket>`. It may run no exposed tool
-//! and no credential of the caller, and it sees every call live.
-//!
-//! [`TopicNodeConfig::protocols`]: crate::channel::topics::TopicNodeConfig::protocols
-//! [`ServeConfig`]: crate::host::transport::ServeConfig
+//! Recording is best-effort by design: a full or closed sink is logged at
+//! `warn` and the call proceeds.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use library::{
-    Argv, AuditRecord, CallId, ChannelRecord, NodeId, OutputHasher, Principal, StdinCapture,
-    ToolName,
-};
+use library::{Argv, AuditRecord, CallId, NodeId, OutputHasher, Principal, StdinCapture, ToolName};
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::{mpsc, oneshot};
 
-use crate::channel::ipc::PublishRequest;
 use crate::host::transport::{self, AuditSink};
 
 /// How many records may queue between the sessions and the tail loop before
@@ -253,54 +221,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for Tap<R> {
     }
 }
 
-/// Drain `records` into the tail loop's publish queue, one
-/// [`PublishRequest`] per record, in order. Returns when either side closes.
-///
-/// Each request's reply is awaited before the next is sent, so the records a
-/// call produces reach the log in the order the call produced them. A refused
-/// publish is logged, never retried: the call it describes has already run.
-pub async fn forward(mut records: mpsc::Receiver<AuditRecord>, tx: mpsc::Sender<PublishRequest>) {
-    while let Some(record) = records.recv().await {
-        let text = match ChannelRecord::Audit(record).to_text() {
-            Ok(text) => text,
-            Err(e) => {
-                tracing::warn!("audit record not encodable; dropped: {e}");
-                continue;
-            }
-        };
-        let (reply, answer) = oneshot::channel();
-        if tx.send(PublishRequest { text, reply }).await.is_err() {
-            tracing::warn!("the tail loop is gone; audit records will not be published");
-            return;
-        }
-        match answer.await {
-            Ok(Ok(seq)) => tracing::debug!(seq, "audit record published"),
-            Ok(Err(e)) => tracing::warn!("audit record not published: {e}"),
-            Err(_) => tracing::warn!("audit record publish went unanswered"),
-        }
-    }
-}
-
-/// What a `serve host.json` responder adds to the resident tail loop:
-/// the session protocol for the node's router, and the records to publish.
-#[derive(Debug)]
-pub struct Hosted {
-    /// The session ALPN handler, registered on the topic node's router.
-    pub session: transport::SessionProtocol,
-    /// The receiving end of the [`ServeConfig::audit`](crate::host::transport::ServeConfig::audit) sink.
-    pub records: mpsc::Receiver<AuditRecord>,
-    /// The identity index the session protocol's gate reads; the tail loop
-    /// feeds it every identity claim on the topic.
-    pub identities: Arc<crate::host::identity::Identities>,
-    /// Announces the host's tools on the channel (card 15); `None` in
-    /// tests that only exercise call records.
-    pub announcer: Option<crate::host::announce::Announcer>,
-    /// Pushes to callers (card 23): the inbox ALPN's fetch side, `wires
-    /// push` over the control socket, and the expiry sweep. `None` without a
-    /// `push` section in `host.json`.
-    pub push: Option<Arc<crate::host::push::PushHost>>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,85 +246,6 @@ mod tests {
     /// The tool the sample calls invoke.
     fn db_query() -> ToolName {
         ToolName::new("db_query").unwrap()
-    }
-
-    fn samples() -> Vec<AuditRecord> {
-        let call = CallId::from_hex("0123456789abcdef0123456789abcdef").unwrap();
-        vec![
-            AuditRecord::Started {
-                call,
-                caller: caller(),
-                principal: None,
-                tool: db_query(),
-                argv: Argv::new(vec!["-n".into()]).unwrap(),
-                roster_version: Some(1),
-                role: Some("analyst".into()),
-                at_ms: 1,
-            },
-            AuditRecord::Finished {
-                call,
-                exit: 0,
-                duration_ms: 3,
-                stdout_bytes: 0,
-                stderr_bytes: 0,
-                stdout_digest: OutputHasher::new().finish(),
-                stdin_bytes: 0,
-                stdin_digest: OutputHasher::new().finish(),
-                stdin_head: None,
-            },
-            AuditRecord::Denied {
-                caller: caller(),
-                tool: None,
-                reason: "no".into(),
-                at_ms: 2,
-            },
-        ]
-    }
-
-    /// The sink → publish loop turns each record into exactly one publish
-    /// request, in order, whose text parses back to that record.
-    #[tokio::test]
-    async fn each_record_becomes_exactly_one_publish() {
-        let (sink, rx) = AuditSink::channel(AUDIT_QUEUE);
-        let (tx, mut requests) = mpsc::channel(4);
-        let forwarder = tokio::spawn(forward(rx, tx));
-        for record in samples() {
-            sink.record(record);
-        }
-        drop(sink);
-
-        let mut seen = Vec::new();
-        while let Some(request) = requests.recv().await {
-            seen.push(ChannelRecord::parse(&request.text).expect("a record"));
-            let _ = request.reply.send(Ok(seen.len() as u64));
-        }
-        forwarder.await.unwrap();
-        assert_eq!(
-            seen,
-            samples()
-                .into_iter()
-                .map(ChannelRecord::Audit)
-                .collect::<Vec<_>>(),
-            "one message per record, in order, no more and no fewer"
-        );
-    }
-
-    /// A refused publish is logged and the forwarder keeps going.
-    #[tokio::test]
-    async fn a_refused_publish_does_not_stop_the_forwarder() {
-        let (sink, rx) = AuditSink::channel(AUDIT_QUEUE);
-        let (tx, mut requests) = mpsc::channel(4);
-        let forwarder = tokio::spawn(forward(rx, tx));
-        for record in samples().into_iter().take(2) {
-            sink.record(record);
-        }
-        drop(sink);
-        let first = requests.recv().await.unwrap();
-        let _ = first.reply.send(Err("no fabric key".into()));
-        let second = requests.recv().await.unwrap();
-        let _ = second.reply.send(Ok(0));
-        assert!(requests.recv().await.is_none());
-        forwarder.await.unwrap();
     }
 
     #[test]

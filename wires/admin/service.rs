@@ -1,5 +1,5 @@
-//! `wires service add | set | rm` and `wires role set | rm` (card 27, lane
-//! **27a**): the admin edits the admin-signed state, signs the next version,
+//! `wires service add | set | rm` and `wires role set | rm` (card 27): the
+//! admin edits the admin-signed state, signs the next version,
 //! and pushes it to every member, hosts first.
 //!
 //! ```text
@@ -22,9 +22,9 @@ use library::{
     EmailPattern, Matcher, NodeId, RoleName, Service, ServiceName, SignedState, State, StateVersion,
 };
 
-use super::commit::Ttl;
 use super::invite::{Report, resolve_member};
 use super::keystore::Keystore;
+use super::ttl::Ttl;
 use crate::now_unix;
 use crate::state::{store, sync};
 
@@ -157,8 +157,7 @@ impl ServiceEdit {
 // ---------------------------------------------------------------------------
 
 /// Sign and store the next version of this keystore's state: the stored one
-/// (or, for a fabric that predates card 27, one seeded from `roster.json`'s
-/// members) changed by `change`, hosts re-derived, version + 1, valid until
+/// (or, for `wires init`, an empty one) changed by `change`, hosts re-derived, version + 1, valid until
 /// `ttl` from now. Validation failures name the broken rule.
 pub(crate) fn edit_state(
     ks: &Keystore,
@@ -171,14 +170,7 @@ pub(crate) fn edit_state(
     let held = store::read(ks, root.node_id())?;
     let mut next = match &held {
         Some(s) => s.state.clone(),
-        None => {
-            let roster = ks
-                .read_roster()?
-                .ok_or_else(|| anyhow!("no roster here; run `wires init` first"))?;
-            let mut s = State::new(root.node_id());
-            s.members = roster.members.clone();
-            s
-        }
+        None => State::new(root.node_id()),
     };
     change(&mut next)?;
     next.hosts = next
@@ -478,7 +470,6 @@ mod tests {
         init_in(
             &ks,
             InitArgs {
-                channel: "ops".into(),
                 ttl: Ttl::DEFAULT.parse().unwrap(),
             },
         )

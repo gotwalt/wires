@@ -1,22 +1,21 @@
-//! The caller's local map of remote CLIs: `$WIRES_HOME/tools.json`.
+//! The caller's local config: `$WIRES_HOME/tools.json`.
 //!
-//! Shared by `wires call <tool> [args…]` (the CLI-native path an agent drives
-//! from its shell) and `wires mcp` (the stdio MCP server that exposes the same
-//! entries as MCP tools). Each entry names a tool, says what it does, and says
-//! where it lives — the responder's node id plus optional address hints and
-//! relay — so the caller dials by public key and never by host. The channel's
-//! host announcements are the usual directory; an entry here pins a name by
-//! hand.
+//! It holds the operator's locked-mode switch ([`crate::caller::lock`]) and,
+//! optionally, **aliases**: a local name pinned to one host, by node id plus
+//! optional address hints and relay. Services from the signed state are the
+//! usual way to call (`wires services`); an alias is for pinning a service to
+//! one host by hand. Either way the session opens with the same `Hello`, and
+//! the host decides by its signed state (the alias's `remote_tool` is the
+//! service name it asks for). Shared by `wires call` and `wires mcp`.
 //!
 //! ```json
 //! {
-//!   "audit_topic": "ops",
 //!   "tools": [
 //!     {
-//!       "name": "db_query",
+//!       "name": "orders",
 //!       "description": "Read-only SQL against the orders database",
-//!       "target": { "node": { "node": "<64 hex chars>" } },
-//!       "remote_tool": "db_query"
+//!       "target": { "node": { "node": "<64 hex chars>", "addrs": ["10.0.0.5:4433"] } },
+//!       "remote_tool": "orders-db"
 //!     }
 //!   ]
 //! }
@@ -91,11 +90,6 @@ fn short(hex: &str) -> &str {
 /// The whole `tools.json`.
 #[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub struct ToolsConfig {
-    /// The channel responders log these calls to, surfaced by `wires mcp`'s
-    /// observation tool. Informational: the responder, not the caller,
-    /// decides where its log goes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audit_topic: Option<String>,
     /// The tools, in display order.
     #[serde(default)]
     pub tools: Vec<RemoteTool>,
@@ -199,14 +193,13 @@ pub struct ToolsArgs {
     /// Use this file instead of `$WIRES_HOME/tools.json`.
     #[arg(long, global = true)]
     pub tools_file: Option<PathBuf>,
-    /// None: list what the channel's hosts announce to you (card 15), then
-    /// your aliases.
+    /// None: `wires services`, then your aliases.
     #[command(subcommand)]
     pub cmd: Option<ToolsCmd>,
 }
 
-/// The `wires tools` alias operations (optional: the channel's host
-/// announcements are the directory; an alias pins a name by hand).
+/// The `wires tools` alias operations (optional: the signed state's services
+/// are the directory; an alias pins a name to one host by hand).
 #[derive(Subcommand)]
 pub enum ToolsCmd {
     /// Add an alias: a remote tool reached by its responder's node id.
@@ -243,33 +236,20 @@ pub struct ToolsAddArgs {
     pub remote_tool: Option<String>,
 }
 
-/// `wires tools`: with no subcommand, the channel directory (see
-/// [`crate::caller::resolve`]); else [`run_tools_cmd`].
+/// `wires tools`: with no subcommand, `wires services` then the aliases;
+/// else [`run_tools_cmd`].
 pub async fn tools_cmd(a: ToolsArgs) -> Result<String> {
     if a.cmd.is_some() {
         return run_tools_cmd(a);
     }
-    // Card 27: with a signed state, `wires tools` is `wires services`.
-    if holds_state() {
-        let listing = crate::caller::services::run(&Default::default()).await?;
-        let config = ToolsConfig::load(&resolve_path(a.tools_file.as_deref())?)?;
-        let aliases = render_aliases(&config);
-        return Ok([listing, aliases]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"));
-    }
-    let path = resolve_path(a.tools_file.as_deref())?;
-    let config = ToolsConfig::load(&path)?;
-    crate::caller::resolve::list_cmd(&config).await
-}
-
-/// Whether this node holds a signed state (a `state.json` beside its keys).
-fn holds_state() -> bool {
-    crate::admin::keystore::Keystore::resolve()
-        .map(|ks| ks.path(crate::state::store::STATE_FILE).exists())
-        .unwrap_or(false)
+    let listing = crate::caller::services::run(&Default::default()).await?;
+    let config = ToolsConfig::load(&resolve_path(a.tools_file.as_deref())?)?;
+    let aliases = render_aliases(&config);
+    Ok([listing, aliases]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// Run a `wires tools` alias subcommand against the tools file; returns what
@@ -278,7 +258,7 @@ pub fn run_tools_cmd(a: ToolsArgs) -> Result<String> {
     let path = resolve_path(a.tools_file.as_deref())?;
     let mut config = ToolsConfig::load(&path)?;
     let Some(cmd) = a.cmd else {
-        bail!("`wires tools` with no subcommand reads the channel (tools_cmd)");
+        bail!("`wires tools` with no subcommand lists services (tools_cmd)");
     };
     match cmd {
         ToolsCmd::List => Ok(render_list(&config)),
@@ -389,12 +369,11 @@ pub(crate) mod tests {
     #[test]
     fn parses_the_documented_example() {
         let json = format!(
-            r#"{{"audit_topic":"ops","tools":[{{"name":"db_query","description":"SQL",
+            r#"{{"tools":[{{"name":"db_query","description":"SQL",
                 "target":{{"node":{{"node":"{}"}}}},"remote_tool":"db_query"}}]}}"#,
             "ab".repeat(32)
         );
         let c: ToolsConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(c.audit_topic.as_deref(), Some("ops"));
         assert_eq!(c.tools[0].name.as_str(), "db_query");
         assert!(matches!(c.tools[0].target, ToolTarget::Node { .. }));
     }
@@ -413,7 +392,6 @@ pub(crate) mod tests {
         let path = tmp("dup");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let c = ToolsConfig {
-            audit_topic: None,
             tools: vec![node_tool("rg"), node_tool("rg")],
             locked: false,
         };
@@ -430,7 +408,6 @@ pub(crate) mod tests {
         let path = tmp("badname");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut v = serde_json::to_value(ToolsConfig {
-            audit_topic: None,
             tools: vec![node_tool("rg")],
             locked: false,
         })
@@ -454,7 +431,6 @@ pub(crate) mod tests {
     fn save_then_load_round_trips() {
         let path = tmp("save");
         let c = ToolsConfig {
-            audit_topic: Some("ops".into()),
             tools: vec![
                 node_tool("rg"),
                 RemoteTool {
@@ -532,11 +508,10 @@ pub(crate) mod tests {
     proptest! {
         #[test]
         fn config_json_round_trips(
-            audit_topic in proptest::option::of("[a-z]{1,8}"),
             tools in proptest::collection::vec(arb_tool(), 0..6),
             locked in any::<bool>(),
         ) {
-            let c = ToolsConfig { audit_topic, tools, locked };
+            let c = ToolsConfig { tools, locked };
             let back: ToolsConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
             prop_assert_eq!(back, c);
         }

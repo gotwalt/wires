@@ -1,26 +1,20 @@
 //! `wires id` and `wires join`: the joiner's two steps, for any role.
 //!
-//! A host, a caller and an observer all join the same way: send the admin
-//! this node's id (`wires id`), paste back the token `wires invite` printed
-//! (`wires join <token>`). Join checks the token is for this node and signed
-//! by one root throughout, then installs the membership, inclusion proof,
-//! roster head and fabric key where every other command looks for them, and
-//! records the channel and its bootstrap peers — so `wires watch`, `wires
-//! login` and `serve host.json` need no `--peer`, and `wires watch` needs
-//! no topic name.
+//! A host and a caller join the same way: send the admin this node's id
+//! (`wires id`), paste back the token `wires invite` printed (`wires join
+//! <token>`). Join checks the token is for this node and signed by one root
+//! throughout, then installs the membership and the admin-signed state where
+//! every other command looks for them, and records the admin's node id to
+//! pull newer states from.
 //!
-//! After this, the admin's re-keys arrive over the channel; nothing needs
-//! importing by hand again.
-
-use std::path::Path;
+//! After this, newer states arrive by push from the admin (or are pulled on
+//! a cold command); nothing needs importing by hand again.
 
 use anyhow::{Context, bail};
 use clap::Args;
-use library::{Invite, NodeId, NodeIdentity, Rekey, TopicId};
+use library::{Invite, NodeId, NodeIdentity};
 
 use crate::admin::keystore::{self, Keystore};
-use crate::channel::peers::PeerBook;
-use crate::channel::rekey;
 use crate::now_unix;
 
 /// `join` arguments.
@@ -55,7 +49,7 @@ pub(crate) fn id_in(ks: &Keystore) -> anyhow::Result<(NodeId, bool)> {
 pub(crate) fn join_cmd(a: JoinArgs) -> anyhow::Result<String> {
     let ks = Keystore::resolve()?;
     match a.token {
-        Some(token) => join_in(&ks, &keystore::home()?, &token, now_unix()),
+        Some(token) => join_in(&ks, &token, now_unix()),
         None => {
             let (id, _) = id_in(&ks)?;
             Ok(format!(
@@ -68,27 +62,27 @@ pub(crate) fn join_cmd(a: JoinArgs) -> anyhow::Result<String> {
     }
 }
 
-/// [`join_cmd`] with a token, against an explicit keystore and home (the
-/// testable form). Returns the summary for stdout.
+/// [`join_cmd`] with a token, against an explicit keystore (the testable
+/// form). Returns the summary for stdout.
 ///
 /// Nothing is written until the whole token has verified. A keystore already
 /// in a *different* fabric is refused (one keystore, one fabric — use another
-/// `$WIRES_HOME`); re-joining the same fabric is how a member that missed
-/// re-keys catches up, and never moves its head backwards.
-pub(crate) fn join_in(ks: &Keystore, home: &Path, token: &str, now: i64) -> anyhow::Result<String> {
+/// `$WIRES_HOME`); re-joining the same fabric never moves the stored state
+/// backwards.
+pub(crate) fn join_in(ks: &Keystore, token: &str, now: i64) -> anyhow::Result<String> {
     let invite = Invite::decode(token).context("the invite token (is the paste complete?)")?;
     let me = keystore::node_identity_in(ks).map_err(|_| {
         anyhow::anyhow!(
             "this keystore has no node key, so this invite (for node {}) cannot be for it — run \
              `wires id` here, and ask the admin to invite that id",
-            invite.entry.member().hex()
+            invite.membership.member.hex()
         )
     })?;
-    if invite.entry.member() != me.node_id() {
+    if invite.membership.member != me.node_id() {
         bail!(
             "this invite is for node {}, but this keystore's node is {} — join from the machine \
              that ran `wires id` for it (or ask for an invite for {})",
-            invite.entry.member().hex(),
+            invite.membership.member.hex(),
             me.node_id().hex(),
             me.node_id().hex()
         );
@@ -107,71 +101,44 @@ pub(crate) fn join_in(ks: &Keystore, home: &Path, token: &str, now: i64) -> anyh
     }
 
     ks.save_membership(&invite.membership)?;
-    let adoption = rekey::install(
-        &Rekey::new(invite.head.clone(), vec![invite.entry.clone()]),
-        &me,
-        fabric,
-        ks,
-        now,
-    )?;
-    ks.save_channel(&invite.channel)?;
-    // Card 27: the admin-signed state (verified above) and where to pull
-    // newer ones from. An older copy never replaces a newer one held here.
-    let state_line = match &invite.state {
-        Some(state) => {
-            crate::state::store::adopt_if_newer(ks, state, fabric, now)?;
-            crate::state::store::mark_checked(ks, now)?;
-            format!(", state version {}", state.state.version.0)
-        }
-        None => String::new(),
-    };
-    if let Some(admin) = invite.admin {
-        crate::state::store::save_admin(ks, admin)?;
-    }
-    let mut book = PeerBook::open(home, TopicId::derive(fabric, &invite.channel));
-    for peer in &invite.peers {
-        book.record(peer.clone());
-    }
-    book.save();
-
-    let mut out = format!(
-        "joined fabric {}… as {}… on channel {:?} (roster version {}{state_line})",
+    // An older copy never replaces a newer one held here.
+    crate::state::store::adopt_if_newer(ks, &invite.state, fabric, now)?;
+    crate::state::store::mark_checked(ks, now)?;
+    crate::state::store::save_admin(ks, invite.admin)?;
+    let held = crate::state::store::read(ks, fabric)?
+        .map_or(invite.state.state.version, |s| s.state.version);
+    Ok(format!(
+        "joined fabric {}… as {}… (state version {})\nnext: `wires login` to sign in, then \
+         `wires services`",
         &fabric.hex()[..8],
         &me.node_id().hex()[..8],
-        invite.channel,
-        invite.head.version.0,
-    );
-    if adoption.superseded {
-        out.push_str("\nthis keystore already holds a newer roster head; kept it");
-    }
-    out.push_str(&match invite.peers.len() {
-        0 => "\nno bootstrap peers in the token: this node is the channel's first — `wires serve \
-              host.json` or `wires watch` prints the ticket others bootstrap from"
-            .to_string(),
-        n => format!("\n{n} bootstrap peer(s) recorded; `wires watch` needs no --peer"),
-    });
-    Ok(out)
+        held.0,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::temp_dir;
-    use library::{FabricKey, Membership, RekeyEntry, Roster, SealedFabricKey, TopicPeer};
+    use library::{Membership, SignedState, State, StateVersion};
 
-    /// An invite for `joiner` in a fresh fabric, and the key it carries.
-    fn invite_for(joiner: NodeId, peers: Vec<TopicPeer>) -> (Invite, FabricKey) {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let mut roster = Roster::new(root.node_id());
-        roster.insert(joiner);
-        let (head, proofs) = roster.commit(&root, 0, i64::MAX).unwrap();
-        let key = FabricKey::generate();
-        let entry = RekeyEntry {
-            proof: proofs[0].1.clone(),
-            key: SealedFabricKey::seal(&root, joiner, head.version, &key).unwrap(),
-        };
-        let membership = Membership::mint(&root, joiner, 0, i64::MAX).unwrap();
-        (Invite::new("ops", membership, head, entry, peers), key)
+    /// A state at `version` naming `members`, signed by `root`.
+    fn signed(root: &NodeIdentity, version: u64, members: &[NodeId]) -> SignedState {
+        let mut s = State::new(root.node_id());
+        s.version = StateVersion(version);
+        s.not_after = i64::MAX;
+        s.members.extend(members.iter().copied());
+        s.sign(root).unwrap()
+    }
+
+    /// An invite for `joiner` in the fabric of `root`, at state `version`.
+    fn invite_for(root: &NodeIdentity, joiner: NodeId, version: u64) -> Invite {
+        let admin = NodeIdentity::from_seed([4u8; 32]).node_id();
+        Invite::new(
+            Membership::mint(root, joiner, 0, i64::MAX).unwrap(),
+            signed(root, version, &[joiner]),
+            admin,
+        )
     }
 
     #[test]
@@ -183,125 +150,63 @@ mod tests {
     }
 
     #[test]
-    fn join_installs_everything_the_other_commands_read() {
-        let home = temp_dir();
-        let ks = Keystore::at(&home);
+    fn join_installs_the_membership_state_and_admin() {
+        let ks = Keystore::at(temp_dir());
         let (me, _) = id_in(&ks).unwrap();
-        let peer = TopicPeer::new(NodeIdentity::from_seed([9u8; 32]).node_id())
-            .with_addrs(vec!["127.0.0.1:4242".parse().unwrap()]);
-        let (invite, key) = invite_for(me, vec![peer.clone()]);
-        let out = join_in(&ks, &home, &invite.encode().unwrap(), 0).unwrap();
-        assert!(out.contains("\"ops\""), "{out}");
-
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let invite = invite_for(&root, me, 3);
+        let out = join_in(&ks, &invite.encode().unwrap(), 0).unwrap();
+        assert!(out.contains("state version 3"), "{out}");
         assert_eq!(
             ks.read_membership().unwrap(),
             Some(invite.membership.clone())
         );
-        assert_eq!(ks.read_roster_head().unwrap(), Some(invite.head.clone()));
+        let held = crate::state::store::read(&ks, root.node_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.state.version, StateVersion(3));
         assert_eq!(
-            ks.read_inclusion_proof().unwrap(),
-            Some(invite.entry.proof.clone())
+            crate::state::store::read_admin(&ks).unwrap(),
+            Some(invite.admin)
         );
-        assert_eq!(
-            ks.latest_fabric_key().unwrap(),
-            Some((invite.head.version, key))
-        );
-        assert_eq!(ks.read_channel().unwrap().as_deref(), Some("ops"));
-        let topic = TopicId::derive(invite.fabric(), "ops");
-        assert_eq!(PeerBook::open(&home, topic).list(), vec![peer]);
+
+        // Re-joining with an older token keeps the newer state.
+        join_in(&ks, &invite_for(&root, me, 2).encode().unwrap(), 0).unwrap();
+        let held = crate::state::store::read(&ks, root.node_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.state.version, StateVersion(3));
     }
 
     #[test]
     fn join_refuses_someone_elses_token_and_writes_nothing() {
-        let home = temp_dir();
-        let ks = Keystore::at(&home);
+        let ks = Keystore::at(temp_dir());
         id_in(&ks).unwrap();
+        let root = NodeIdentity::from_seed([1u8; 32]);
         let other = NodeIdentity::from_seed([7u8; 32]).node_id();
-        let (invite, _) = invite_for(other, Vec::new());
-        let err = join_in(&ks, &home, &invite.encode().unwrap(), 0).unwrap_err();
+        let invite = invite_for(&root, other, 1);
+        let err = join_in(&ks, &invite.encode().unwrap(), 0).unwrap_err();
         assert!(format!("{err:#}").contains(&other.hex()), "{err:#}");
         assert!(ks.read_membership().unwrap().is_none());
-        assert!(ks.read_channel().unwrap().is_none());
 
         // No node key at all is its own, named failure.
         let bare = Keystore::at(temp_dir());
-        let err = join_in(&bare, &home, &invite.encode().unwrap(), 0).unwrap_err();
+        let err = join_in(&bare, &invite.encode().unwrap(), 0).unwrap_err();
         assert!(format!("{err:#}").contains("wires id"), "{err:#}");
-        assert!(join_in(&ks, &home, "garbage!", 0).is_err());
-    }
-
-    #[test]
-    fn join_stores_the_signed_state_and_never_rolls_it_back() {
-        use library::{State, StateVersion};
-        let home = temp_dir();
-        let ks = Keystore::at(&home);
-        let (me, _) = id_in(&ks).unwrap();
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let admin = NodeIdentity::from_seed([4u8; 32]).node_id();
-        let signed = |v: u64| {
-            let mut s = State::new(root.node_id());
-            s.version = StateVersion(v);
-            s.not_after = i64::MAX;
-            s.members.insert(me);
-            s.sign(&root).unwrap()
-        };
-        let (invite, _) = invite_for(me, Vec::new());
-        let out = join_in(
-            &ks,
-            &home,
-            &invite
-                .clone()
-                .with_state(signed(3), admin)
-                .encode()
-                .unwrap(),
-            0,
-        )
-        .unwrap();
-        assert!(out.contains("state version 3"), "{out}");
-        let held = crate::state::store::read(&ks, root.node_id())
-            .unwrap()
-            .unwrap();
-        assert_eq!(held.state.version, StateVersion(3));
-        assert_eq!(crate::state::store::read_admin(&ks).unwrap(), Some(admin));
-
-        // Re-joining with an older token keeps the newer state.
-        join_in(
-            &ks,
-            &home,
-            &invite.with_state(signed(2), admin).encode().unwrap(),
-            0,
-        )
-        .unwrap();
-        let held = crate::state::store::read(&ks, root.node_id())
-            .unwrap()
-            .unwrap();
-        assert_eq!(held.state.version, StateVersion(3));
+        assert!(join_in(&ks, "garbage!", 0).is_err());
     }
 
     #[test]
     fn join_refuses_a_second_fabric() {
-        let home = temp_dir();
-        let ks = Keystore::at(&home);
+        let ks = Keystore::at(temp_dir());
         let (me, _) = id_in(&ks).unwrap();
-        let (invite, _) = invite_for(me, Vec::new());
-        join_in(&ks, &home, &invite.encode().unwrap(), 0).unwrap();
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let invite = invite_for(&root, me, 1);
+        join_in(&ks, &invite.encode().unwrap(), 0).unwrap();
 
         let rogue = NodeIdentity::from_seed([66u8; 32]);
-        let mut roster = Roster::new(rogue.node_id());
-        roster.insert(me);
-        let (head, proofs) = roster.commit(&rogue, 0, i64::MAX).unwrap();
-        let entry = RekeyEntry {
-            proof: proofs[0].1.clone(),
-            key: SealedFabricKey::seal(&rogue, me, head.version, &FabricKey::generate()).unwrap(),
-        };
-        let other = Invite::new(
-            "ops",
-            Membership::mint(&rogue, me, 0, i64::MAX).unwrap(),
-            head,
-            entry,
-            Vec::new(),
-        );
-        let err = join_in(&ks, &home, &other.encode().unwrap(), 0).unwrap_err();
+        let other = invite_for(&rogue, me, 1);
+        let err = join_in(&ks, &other.encode().unwrap(), 0).unwrap_err();
         assert!(
             format!("{err:#}").contains("another $WIRES_HOME"),
             "{err:#}"

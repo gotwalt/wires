@@ -1,7 +1,6 @@
 //! `wires mcp`: a stdio MCP server whose tools are the services you may call
-//! (card 27: evaluated locally against your signed state, as `wires services`
-//! lists them), plus `tools.json` aliases, resolved once at startup. Before a
-//! node holds a signed state, the channel's host announcements stand in.
+//! (evaluated locally against your signed state, as `wires services` lists
+//! them), plus `tools.json` aliases, resolved once at startup.
 //!
 //! The on-ramp for workflows that only speak MCP (Claude Desktop, IDEs). Each
 //! tool becomes one MCP tool taking `{ args?: string[], stdin?:
@@ -200,7 +199,7 @@ impl<C: Caller> McpServer<C> {
             .map(|t| {
                 json!({
                     "name": t.name.as_str(),
-                    "description": describe(t, self.config.audit_topic.as_deref()),
+                    "description": describe(t),
                     "inputSchema": input_schema(),
                 })
             })
@@ -306,20 +305,12 @@ fn input_schema() -> Value {
     })
 }
 
-/// The MCP description for `tool`: its own line, plus where calls are logged
-/// when `tools.json` names an audit topic, then [`FILTER_HINT`].
-fn describe(tool: &RemoteTool, audit_topic: Option<&str>) -> String {
-    let own = match audit_topic {
-        Some(topic) => format!(
-            "{} (runs remotely via wires; every call is logged to the {topic} channel)",
-            tool.description
-        ),
-        None => tool.description.clone(),
-    };
-    if own.is_empty() {
+/// The MCP description for `tool`: its own line, then [`FILTER_HINT`].
+fn describe(tool: &RemoteTool) -> String {
+    if tool.description.is_empty() {
         FILTER_HINT.to_owned()
     } else {
-        format!("{own} {FILTER_HINT}")
+        format!("{} {FILTER_HINT}", tool.description)
     }
 }
 
@@ -507,9 +498,8 @@ pub(crate) fn with_services(
     config
 }
 
-/// `wires mcp`: load the services this node may call (or, before it holds a
-/// signed state, the announced tools), `tools.json` aliases and
-/// credentials, then serve MCP on stdio.
+/// `wires mcp`: load the services this node may call, `tools.json` aliases
+/// and credentials, then serve MCP on stdio.
 ///
 /// In locked mode ([`Lock`](crate::caller::lock::Lock)) an override flag is
 /// refused before anything loads. A tool's `stdin` field is still accepted:
@@ -521,12 +511,12 @@ pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
     let creds = Credentials::resolve(&a.creds)?;
     let ks = crate::admin::keystore::Keystore::resolve()?;
     let config = if crate::caller::call::stored_state(&ks, &creds)?.is_some() {
-        // Card 27: every service this node may call, one MCP tool each.
+        // Every service this node may call, one MCP tool each.
         let allowed = crate::caller::services::allowed(&ks).await?;
         with_services(config, &allowed.state.state, &allowed.grants)
     } else {
-        // No signed state yet: what the channel's hosts announce (card 15).
-        crate::caller::resolve::with_announced(config, &a.creds).await
+        tracing::warn!("this node holds no signed state yet (`wires join`): aliases only");
+        config
     };
     tracing::info!(
         "wires mcp: serving {} tool(s) from {}",
@@ -612,9 +602,8 @@ mod tests {
         }
     }
 
-    fn server(audit_topic: Option<&str>) -> McpServer<FakeCaller> {
+    fn server() -> McpServer<FakeCaller> {
         let config = ToolsConfig {
-            audit_topic: audit_topic.map(str::to_owned),
             tools: vec![
                 entry("db_query", "Read-only SQL"),
                 entry("fails", "Always exits 2"),
@@ -687,7 +676,7 @@ mod tests {
 
     #[test]
     fn golden_classic_session() {
-        let mut s = server(Some("ops"));
+        let mut s = server();
         let out = transcript(
             &mut s,
             &[
@@ -705,9 +694,7 @@ mod tests {
                 json!({"jsonrpc":"2.0","id":9,"method":"resources/list"}),
             ],
         );
-        let suffix = format!(
-            " (runs remotely via wires; every call is logged to the ops channel) {FILTER_HINT}"
-        );
+        let suffix = format!(" {FILTER_HINT}");
         let expected = vec![
             json!({"jsonrpc":"2.0","id":1,"result":{
                 "protocolVersion":"2025-06-18",
@@ -746,7 +733,7 @@ mod tests {
 
     #[test]
     fn golden_stateless_session() {
-        let mut s = server(None);
+        let mut s = server();
         let meta = json!({META_PROTOCOL_VERSION: "2026-07-28"});
         let out = transcript(
             &mut s,
@@ -781,7 +768,7 @@ mod tests {
 
     #[test]
     fn initialize_offers_the_latest_for_an_unknown_version_and_stamps_it() {
-        let mut s = server(None);
+        let mut s = server();
         let out = transcript(
             &mut s,
             &[
@@ -800,7 +787,7 @@ mod tests {
 
     #[test]
     fn malformed_input_gets_json_rpc_errors() {
-        let mut s = server(None);
+        let mut s = server();
         let rt = rt();
         let reply = |s: &mut McpServer<FakeCaller>, line: &str| -> Option<Value> {
             rt.block_on(s.handle_line(line))
@@ -866,7 +853,7 @@ mod tests {
 
     #[test]
     fn descriptions_say_how_to_filter_without_a_shell() {
-        let d = describe(&entry("gh", "The GitHub CLI"), None);
+        let d = describe(&entry("gh", "The GitHub CLI"));
         assert!(d.starts_with("The GitHub CLI "), "{d}");
         assert!(d.contains("--jq"), "{d}");
         assert!(d.contains("pipes are not available"), "{d}");
@@ -878,7 +865,7 @@ mod tests {
 
     #[test]
     fn shaping_fields_filter_the_result() {
-        let mut s = server(None);
+        let mut s = server();
         s.caller = FakeCaller::default().answer(
             "db_query",
             Ok(exited(0, r#"[{"n":"a"},{"n":"b"},{"n":"c"}]"#, "")),
@@ -909,7 +896,7 @@ mod tests {
 
     #[test]
     fn a_bad_filter_is_a_tool_error_and_nothing_is_dialed() {
-        let mut s = server(None);
+        let mut s = server();
         let out = transcript(&mut s, &[call(1, "db_query", json!({"jq": ".["}))]);
         assert_eq!(out[0]["result"]["isError"], json!(true));
         let text = out[0]["result"]["content"][0]["text"].as_str().unwrap();
@@ -919,7 +906,7 @@ mod tests {
 
     #[test]
     fn shaping_fields_are_type_checked() {
-        let mut s = server(None);
+        let mut s = server();
         let out = transcript(
             &mut s,
             &[
@@ -1008,7 +995,7 @@ mod tests {
             args in proptest::collection::vec("[^\u{0}]{0,24}", 0..12),
             stdin in ".{0,64}",
         ) {
-            let mut s = server(None);
+            let mut s = server();
             let out = transcript(
                 &mut s,
                 &[call(1, "db_query", json!({"args": args, "stdin": stdin}))],

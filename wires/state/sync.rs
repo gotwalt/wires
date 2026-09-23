@@ -497,9 +497,9 @@ mod tests {
 
     mod e2e {
         use super::*;
-        use crate::admin::commit::Ttl;
         use crate::admin::init::{InitArgs, init_in};
         use crate::admin::service::{self, ServiceEdit};
+        use crate::admin::ttl::Ttl;
         use iroh::address_lookup::memory::MemoryLookup;
         use iroh::protocol::Router;
         use library::{RoleName, ServiceName};
@@ -557,14 +557,7 @@ mod tests {
 
         fn fabric() -> Fabric {
             let admin = Arc::new(Keystore::at(temp_dir()));
-            init_in(
-                &admin,
-                InitArgs {
-                    channel: "ops".into(),
-                    ttl: ttl(),
-                },
-            )
-            .unwrap();
+            init_in(&admin, InitArgs { ttl: ttl() }).unwrap();
             let root_id = admin.read_root_identity().unwrap().unwrap();
             let me = admin.read_node_identity().unwrap().unwrap().node_id();
             let (host, member) = (NodeIdentity::generate(), NodeIdentity::generate());
