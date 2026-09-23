@@ -656,7 +656,7 @@ fn write_secret(path: &Path, contents: &str, force: bool) -> Result<()> {
 /// previous contents or the new ones and never a splice of the two. The mode is
 /// set on the temporary file *before* the rename, so the target is never
 /// momentarily world-readable either.
-fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) -> Result<()> {
+pub(crate) fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
