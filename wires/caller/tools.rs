@@ -116,6 +116,13 @@ pub struct ToolsConfig {
     /// The tools, in display order.
     #[serde(default)]
     pub tools: Vec<RemoteTool>,
+    /// Locked caller mode (card 20): when `true` in `$WIRES_HOME/tools.json`,
+    /// `wires call` and `wires mcp` refuse every flag that would steer them
+    /// off this configuration. Only the default file is consulted (see
+    /// [`crate::caller::lock`]); the operator sets it, and makes the file
+    /// read-only to the agent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
 }
 
 impl ToolsConfig {
@@ -487,6 +494,7 @@ pub(crate) mod tests {
         let c = ToolsConfig {
             audit_topic: None,
             tools: vec![node_tool("rg"), node_tool("rg")],
+            locked: false,
         };
         std::fs::write(&path, serde_json::to_string(&c).unwrap()).unwrap();
         let err = ToolsConfig::load(&path).unwrap_err();
@@ -503,6 +511,7 @@ pub(crate) mod tests {
         let mut v = serde_json::to_value(ToolsConfig {
             audit_topic: None,
             tools: vec![node_tool("rg")],
+            locked: false,
         })
         .unwrap();
         v["tools"][0]["name"] = "Not Valid".into();
@@ -533,6 +542,7 @@ pub(crate) mod tests {
                     ..node_tool("db_query")
                 },
             ],
+            locked: true,
         };
         c.save(&path).unwrap();
         assert_eq!(ToolsConfig::load(&path).unwrap(), c);
@@ -717,8 +727,9 @@ pub(crate) mod tests {
         fn config_json_round_trips(
             audit_topic in proptest::option::of("[a-z]{1,8}"),
             tools in proptest::collection::vec(arb_tool(), 0..6),
+            locked in any::<bool>(),
         ) {
-            let c = ToolsConfig { audit_topic, tools };
+            let c = ToolsConfig { audit_topic, tools, locked };
             let back: ToolsConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
             prop_assert_eq!(back, c);
         }
