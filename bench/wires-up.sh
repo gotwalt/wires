@@ -69,6 +69,7 @@ cp "$wb/run/hint" "$agent/hints" || {
 
 {
 	printf 'export WIRES_HOME=%q\n' "$agent"
+	# shellcheck disable=SC2016 # $PATH expands in the sourcing shell
 	printf 'export PATH=%q:"$PATH"\n' "$(dirname "$WIRES")"
 	printf 'export BENCH_WIRES_PID=%q\n' "$(cat "$D/wb.pid")"
 } | tee "$D/env.sh"

@@ -57,7 +57,9 @@ cd "$repo"
 WIRES="${WIRES_BIN:-$repo/target/release/wires}"
 WIRES_DEV="${WIRES_DEV_BIN:-$repo/target/release/wires-mock-idp}"
 EMAIL="alice@example.com"
+# Narrated mode pauses ~4.5 s before `inbox --wait` starts; the build must outlast that.
 JOB_SECS=3
+[ -n "$QUIET" ] || JOB_SECS=8
 START=$SECONDS
 
 D="$(mktemp -d)"
@@ -114,6 +116,8 @@ if [ -z "${WIRES_BIN:-}" ]; then
 	(cd "$repo" && cargo build -q --release -p wires --features dev-mock-idp)
 	rm -f "$WIRES_DEV" && cp "$repo/target/release/wires" "$WIRES_DEV"
 	(cd "$repo" && cargo build -q --release -p wires)
+	# A stable signature keeps the macOS firewall from asking again each build.
+	"$repo/.scripts/macos-sign.sh" "$WIRES" "$WIRES_DEV"
 fi
 command -v curl >/dev/null || bad "curl is not on PATH"
 command -v perl >/dev/null || bad "perl is not on PATH (the mock CI's clock)"
@@ -366,6 +370,7 @@ step "SUMMARY"
 printf '     callback  : build-41 result pushed host -> agent by key; inbox --wait woke %s ms after the build finished\n' "$LAT" >&2
 printf '     follow-up : logs -- build 41 --tail 50 -> test_orders_total left %s\n' "$GOT" >&2
 printf '     recorded  : ▶ deploy → ⇢ build-41 → ▶ logs in the host'"'"'s signed log, naming %s\n' "$EMAIL" >&2
+# shellcheck disable=SC2016 # literal backticks in the summary
 printf '     asleep    : build-42 queued on the workbench, fetched by the next `wires inbox`\n' >&2
 printf '     exposed   : nothing on the agent -- no webhook URL; %ss wall clock\n' "$((SECONDS - START))" >&2
 [ -z "$KEEP" ] || say "state kept in $D"

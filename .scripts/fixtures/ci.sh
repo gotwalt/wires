@@ -73,6 +73,7 @@ write_log() {
 		done
 		printf '\nfailures:\n\n---- orders::tests::test_orders_total stdout ----\n'
 		printf "thread 'orders::tests::test_orders_total' panicked at orders/total.rs:88:9:\n"
+		# shellcheck disable=SC2016 # a Rust assertion message, not an expansion
 		printf 'assertion `left == right` failed: sum(total) over the fixture orders\n'
 		printf '  left: %s\n right: 1234.50\n' "$(got)"
 		printf '\nfailures:\n    orders::tests::test_orders_total\n\n'

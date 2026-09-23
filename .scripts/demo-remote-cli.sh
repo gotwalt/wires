@@ -170,6 +170,8 @@ if [ -z "${WIRES_BIN:-}" ]; then
 	cargo build -q --release -p wires --features dev-mock-idp
 	rm -f "$WIRES_DEV" && cp target/release/wires "$WIRES_DEV"
 	cargo build -q --release -p wires
+	# A stable signature keeps the macOS firewall from asking again each build.
+	.scripts/macos-sign.sh "$WIRES" "$WIRES_DEV"
 fi
 command -v sqlite3 >/dev/null || bad "sqlite3 is not on PATH"
 command -v curl >/dev/null || bad "curl is not on PATH"
@@ -632,10 +634,10 @@ set +e
 WIRES_HOME="$wb" "$WIRES" push --to "$AG_ID" --subject after-removal -- "x" >"$D/p3.out" 2>"$D/p3.err"
 rc=$?
 set -e
-[ "$rc" -eq "$EXIT_DENIED" ] && grep -qF "not a member of the current signed state" "$D/p3.out" || {
+if ! { [ "$rc" -eq "$EXIT_DENIED" ] && grep -qF "not a member of the current signed state" "$D/p3.out"; }; then
 	cat "$D/p3.out" "$D/p3.err" >&2
 	bad "9: a push to the removed agent exited $rc, expected $EXIT_DENIED"
-}
+fi
 set +e
 WIRES_HOME="$agent" "$WIRES" inbox >"$D/i4.out" 2>"$D/i4.err"
 rc=$?
@@ -656,7 +658,9 @@ printf '     name      : orders-db, a service; its hosts were never named by the
 printf '     identity  : unverified caller refused (77); %s allowed as analyst, %s refused by name\n' "$EMAIL" "$READER" >&2
 printf '     records   : the security reader saw every call and refusal; the agent only its own\n' >&2
 printf '     contained : .shell id refused by sqlite3 -safe, exit %s\n' "$SHELL_RC" >&2
+# shellcheck disable=SC2016 # literal backticks in the summary
 printf '     push      : host -> agent by key, fetched by `wires inbox`; --wait woke on the next\n' >&2
 printf '     failover  : workbench down -> answered by the spare, same command\n' >&2
+# shellcheck disable=SC2016 # literal backticks in the summary
 printf '     revoke    : one `wires remove` -> exit 77, 0 bytes out; pushes refused; %ss wall clock\n' "$((SECONDS - START))" >&2
 [ -z "$KEEP" ] || say "state kept in $D"
