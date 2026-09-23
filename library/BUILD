@@ -9,6 +9,7 @@ _DEPS = [
     "@crates//:ed25519-dalek",
     "@crates//:hex",
     "@crates//:rand",
+    "@crates//:ring",
     "@crates//:serde",
     "@crates//:serde_json",
     "@crates//:thiserror",

@@ -33,3 +33,13 @@ anyhow = "1"
 futures-core = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# IdP login (board card 04). All four are already in the graph via iroh, so no
+# new crates are compiled: `ring` verifies RS256/ES256 ID tokens (library) and
+# hashes the PKCE verifier (wires); `reqwest` (iroh builds it with
+# `rustls-no-provider`) does OIDC discovery / JWKS / token exchange, with
+# rustls's `ring` provider installed explicitly; `url` builds the auth URL and
+# form bodies.
+ring = "0.17"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+url = "2"

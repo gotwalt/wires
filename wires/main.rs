@@ -17,8 +17,11 @@
 mod admission;
 mod audit;
 mod call;
+mod idp_view;
 mod ipc;
+mod jwks;
 mod keystore;
+mod login;
 mod mcp;
 mod render;
 mod replay;
@@ -37,6 +40,10 @@ mod transport;
 /// binary entirely instead of compiling to an empty module.
 #[cfg(test)]
 mod e2e;
+
+/// A hermetic OIDC issuer for the `wires login` tests (card 04).
+#[cfg(test)]
+mod mock_idp;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -94,6 +101,9 @@ enum Command {
     Mcp(mcp::McpArgs),
     /// Edit `tools.json`: the local map of remote CLIs (add / list / rm).
     Tools(tools::ToolsArgs),
+    /// Sign in with your IdP (OIDC), binding this node's key to your identity;
+    /// with `--topic`, publish the claim for every reader to verify.
+    Login(login::LoginArgs),
 }
 
 /// `keygen` arguments: optional seeds to re-derive, and whether to persist.
@@ -920,6 +930,11 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        Command::Login(a) => {
+            if let Err(e) = runtime().block_on(login::login_cmd(a)) {
+                exit_with(e);
+            }
+        }
     }
 }
 
@@ -967,7 +982,8 @@ fn cli_admin(command: Command) -> Result<String, String> {
         | Command::Tail(_)
         | Command::Call(_)
         | Command::Mcp(_)
-        | Command::Tools(_) => {
+        | Command::Tools(_)
+        | Command::Login(_) => {
             unreachable!("handled in main")
         }
     }
