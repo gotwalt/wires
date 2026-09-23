@@ -54,6 +54,10 @@ directory*, not necessarily gossip.
 
 Pitch the demo to the MCP contact and note which part lands: "identity-bound CLI with verified telemetry" (points to the simpler architecture) or "a log the host can't rewrite / shared across orgs" (points to keeping gossip).
 
+## Input from card 23 (push, 2026-09-23)
+
+Asynchronous push to intermittently online callers (store-and-forward, catch-up) is exactly what the channel already does. Card 23 builds push on a direct dial-back plus a host-side queue so that it doesn't prejudge this card, but push is the strongest argument yet for keeping *a* channel. Weigh it here.
+
 ## Related
 
 - [18 — front door (OPEN)](18-front-door-OPEN.md): the directory and host-list question overlaps with how people and hosts enter the org.
