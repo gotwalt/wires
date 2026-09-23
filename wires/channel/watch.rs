@@ -152,6 +152,7 @@ where
         json,
         identities: Some(Arc::clone(&identities)),
         directory: directory.clone(),
+        shown: Default::default(),
     };
     let mut keyring = Keyring::load(Arc::clone(&ctx.keystore))?;
     let store = Arc::new(open_topic_store(&ctx.home, ctx.topic, STORE_LOCK_WAIT).await?);

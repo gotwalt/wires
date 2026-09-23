@@ -590,9 +590,15 @@ mod tests {
     #[test]
     fn a_removed_member_is_told_it_was_removed_not_that_its_proof_is_stale() {
         let (root, stale, dir) = removed_from(3, 2);
-        let refused =
-            check_roster_inclusion_via(&dir.head, Some(&stale), Some(&dir), root.node_id(), stale.member, 0)
-                .unwrap_err();
+        let refused = check_roster_inclusion_via(
+            &dir.head,
+            Some(&stale),
+            Some(&dir),
+            root.node_id(),
+            stale.member,
+            0,
+        )
+        .unwrap_err();
         assert!(matches!(
             refused,
             Error::RemovedFromRoster { proof: 1, head: 2 }
@@ -604,15 +610,29 @@ mod tests {
         // Several commits later, the verifier knows only the range.
         let (root, stale, dir) = removed_from(3, 4);
         assert_eq!(
-            check_roster_inclusion_via(&dir.head, Some(&stale), Some(&dir), root.node_id(), stale.member, 0)
-                .unwrap_err()
-                .to_string(),
+            check_roster_inclusion_via(
+                &dir.head,
+                Some(&stale),
+                Some(&dir),
+                root.node_id(),
+                stale.member,
+                0
+            )
+            .unwrap_err()
+            .to_string(),
             "not in the current roster (removed after version 1; head is version 4)"
         );
         // Without a directory for this head, the verifier cannot tell a
         // removal from a member that missed the re-key: still "stale".
         assert!(matches!(
-            check_roster_inclusion_via(&dir.head, Some(&stale), None, root.node_id(), stale.member, 0),
+            check_roster_inclusion_via(
+                &dir.head,
+                Some(&stale),
+                None,
+                root.node_id(),
+                stale.member,
+                0
+            ),
             Err(Error::StaleProof { proof: 1, head: 4 })
         ));
     }

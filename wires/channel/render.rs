@@ -75,6 +75,46 @@ pub fn host_line(ann: &library::HostAnnouncement) -> String {
     )
 }
 
+/// What a `📣` line is about: an announcement's content, without what every
+/// heartbeat changes anyway (its time, and fresh ciphertext in each sealed
+/// entry). Two announcements with the same summary render the same line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostSummary {
+    /// The open listing: tools, descriptions, dial hints.
+    open: Option<library::HostListing>,
+    /// How many sealed entries (≈ how many members may use more).
+    sealed: usize,
+    /// The heartbeat it promises.
+    heartbeat_ms: u64,
+}
+
+impl HostSummary {
+    /// The summary of `ann`.
+    pub fn of(ann: &library::HostAnnouncement) -> Self {
+        Self {
+            open: ann.open.clone(),
+            sealed: ann.sealed.len(),
+            heartbeat_ms: ann.heartbeat_ms,
+        }
+    }
+}
+
+/// The last [`HostSummary`] a watch showed per host, so an unchanged
+/// heartbeat does not print another `📣` line (card 21: an overnight watch
+/// was a wall of them).
+#[derive(Debug, Default)]
+pub struct ShownHosts(std::sync::Mutex<std::collections::BTreeMap<NodeId, HostSummary>>);
+
+impl ShownHosts {
+    /// Whether `ann` from `host` says something the last one shown did not
+    /// (always, for a host's first). Remembers it either way.
+    pub fn is_news(&self, host: NodeId, ann: &library::HostAnnouncement) -> bool {
+        let summary = HostSummary::of(ann);
+        let mut shown = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        shown.insert(host, summary.clone()).as_ref() != Some(&summary)
+    }
+}
+
 /// One human line for an admin's re-key: the roster version it moves to and
 /// how many members' credentials it carries. Only public facts — the sealed
 /// keys are not the reader's to show. Whether it verified is not this line's
@@ -302,6 +342,41 @@ mod tests {
         let line = record_line(&ChannelRecord::Host(ann), None);
         assert_eq!(line, "📣 announces tools (open: status; 2 sealed entries)");
         assert!(!line.contains("db_query"));
+    }
+
+    /// A heartbeat that changes nothing a `📣` line shows is not news; a
+    /// change in the open tools, the sealed count or the dial hints is.
+    #[test]
+    fn only_a_changed_announcement_is_news() {
+        use library::{HostAnnouncement, HostListing, ListedTool, SealedListing};
+        let host = node(1);
+        let member = NodeIdentity::from_seed([2u8; 32]).node_id();
+        let open = HostListing {
+            tools: vec![ListedTool {
+                name: ToolName::new("status").unwrap(),
+                description: String::new(),
+            }],
+            ..HostListing::default()
+        };
+        let entry = |at| SealedListing::seal(host, at, &member, &open).unwrap();
+        let ann = |at, sealed: Vec<SealedListing>, open: &HostListing| {
+            HostAnnouncement::new(host, at, 600_000, Some(open.clone()), sealed)
+        };
+        let shown = ShownHosts::default();
+        assert!(shown.is_news(host, &ann(1, vec![entry(1)], &open)), "first");
+        // A heartbeat: new time, freshly sealed entry, same content.
+        assert!(!shown.is_news(host, &ann(2, vec![entry(2)], &open)));
+        // Another host's first announcement is news of its own.
+        assert!(shown.is_news(node(9), &ann(2, vec![entry(2)], &open)));
+        // One entry fewer (a member removed or expired).
+        assert!(shown.is_news(host, &ann(3, vec![], &open)));
+        assert!(!shown.is_news(host, &ann(4, vec![], &open)));
+        // The host moved.
+        let moved = HostListing {
+            addrs: vec!["127.0.0.1:9".parse().unwrap()],
+            ..open.clone()
+        };
+        assert!(shown.is_news(host, &ann(5, vec![], &moved)));
     }
 
     #[test]

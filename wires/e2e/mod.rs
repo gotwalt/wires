@@ -985,6 +985,7 @@ async fn late_joiner_cannot_read_pre_join_history() {
         json: false,
         identities: None,
         directory: None,
+        shown: Default::default(),
     };
     assert_eq!(
         new_since(node_c.store(), &BTreeMap::new(), &printer, &mut keyring_c).len(),
@@ -1114,6 +1115,7 @@ async fn tail_catches_up_after_offline() {
         json: false,
         identities: None,
         directory: None,
+        shown: Default::default(),
     };
     let mut keyring = b.keyring();
     let printed = new_since(node_b.store(), &before, &printer, &mut keyring);
@@ -1304,6 +1306,7 @@ async fn next_record(
         json: false,
         identities: None,
         directory: None,
+        shown: Default::default(),
     }
     .render(&envelope, &text);
     assert!(!line.contains("record/v1"), "rendered, not raw: {line}");
