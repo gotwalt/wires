@@ -585,6 +585,7 @@ mod tests {
             head: HeadSource::None,
             membership: Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
             proof: None,
+            policy: std::sync::Arc::new(crate::host::policy::AnyMember),
         };
         let endpoint = |id: &NodeIdentity| {
             iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
