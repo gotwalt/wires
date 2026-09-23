@@ -27,7 +27,41 @@ tool, and why isn't this just Tailscale plus an MCP gateway.
 
 ## Acceptance
 
-- [ ] Every sentence passes storytelling.md §1.
-- [ ] Every command in the README runs as written against the current binary; the walkthrough is checked by a script, or by running `demo-remote-cli.sh`.
+- [x] Every sentence passes storytelling.md §1.
+- [x] Every command in the README runs as written against the current binary; the walkthrough is checked by a script, or by running `demo-remote-cli.sh`.
 
 ## Notes
+
+*2026-09-23, lane docs (worker).*
+
+**Verified.** The README walkthrough was run command for command against this
+branch's `//wires` (fresh `WIRES_HOME`s under `/tmp/w17`, the mock IdP from
+`//wires:wires_dev dev-mock-idp`, so `login` also took `--issuer`/`--no-browser`
+and `curl` played the browser, and the observer's `watch` also got
+`WIRES_OIDC_ISSUER`). The pasted output is from that run, with INFO logs, the
+full invite tokens and one `advanced publish` test line trimmed.
+`demo-remote-cli.sh --keep` was green (64 s). **Not verified:** the Google
+`login` flags as written (needs the real OAuth client, card 08), the
+`claude --allowedTools` line and `ss` commands in `docs/demo.md`, and
+`soak-topic.sh` (unchanged; not re-run).
+
+**Cut for failing the rebuttal test.**
+- "Tailscale … the service itself is exposed on the network, and its own auth is all that guards it" → ACLs narrow Tailscale to a port; the line now says so.
+- "meaningfully more efficient than MCP tool schemas and JSON results" → tool search neutralises schemas; the win is output filtering (card 16/19).
+- "no server in the middle" for the channel → relays forward its packets; now "no server owns it".
+- "The agent can't forge it" (the call record) → the agent is a member and can publish; now "can't write a record that carries the host's key".
+- "one invite, then everything is on the channel" → the joiner also sends `wires id`, and the admin passes the host's ticket once; now "one exchange with the admin".
+- A2A row: not added (no rebuttal-proof sentence found).
+
+**Stale bits found (Rust, not touched):** `wires join` with no peers prints
+"``wires serve --audit-topic …`` or `wires watch` prints the ticket" (the flag
+is gone since card 13); `wires serve --help` still says "with `--audit-topic`,
+record every call"; `wires call --help` says `<TOOL>` is "the tool's local
+name in `tools.json`" (it resolves from the channel since card 15). A late
+joiner's `watch` prints "no key for roster version N … run `wires advanced
+import`" for pre-join history, which reads like an error.
+
+**docs/deployment.md**: rewritten around `serve host.json`/`join`/`remove`;
+the responder/dialer Kubernetes manifests were cut (they assumed a read-only
+keystore, which re-keys over the channel no longer allow); relay section kept.
+The README's revoke gif (pre-card-12) is no longer referenced.
