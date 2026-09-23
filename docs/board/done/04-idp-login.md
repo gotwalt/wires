@@ -48,7 +48,7 @@ OIDC for the demo; nothing Google-specific in the types.
       token endpoint) drives the full `login` flow without a browser (inject the code).
 - [x] e2e: node A logs in against the mock, publishes the claim; observer O renders
       `alice@example.com` verified.
-- [ ] Manual with real Google: `wires login` → claim on a topic → observer shows the
+- [x] Manual with real Google: `wires login` → claim on a topic → observer shows the
       Gmail address. Record the steps in Notes.
 - [x] `bazel test //...`, `aspect lint //...`, format check green.
 
@@ -162,3 +162,5 @@ Expected on the observer **once render.rs calls `render_identity`** (integration
 observer prints the raw `{"wires":"record/v1",…}` line. Headless node: pass
 `--no-browser --callback-port 8765`, `ssh -L 8765:127.0.0.1:8765 <node>` from the laptop, open the
 printed URL there. Tokens last ~1 h; re-run `wires login --topic ops` (or `--reuse` while valid).
+
+- **Real Google, 2026-09-23 (integrator):** client published *In production* with only `openid email` (no test-user list, no review). `wires login --topic ops` → observer: `🪪 identity ecc8c1cf is gotwalt@gmail.com (verified by https://accounts.google.com)`; `--require-idp email=gotwalt@gmail.com` refused before login (77) and allowed after. Safari showed a connection error on the callback page even though login succeeded → card 11.
