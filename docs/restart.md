@@ -7,6 +7,28 @@ so, from where. Conclusion: yes — re-found on the james-core lineage, aim at
 
 ---
 
+## 0. 2026-09-22 — pitch re-sharpened; see docs/board
+
+The pitch in §4 is superseded for the current push by the one in
+[docs/board/README.md](board/README.md): **remote CLIs, reached by key, with
+an IdP-authenticated caller, and every call on an encrypted channel anyone you
+authorize can watch without access to either end.** The board's lanes replace
+the Phase 3 plan in §5 for now. What still holds from this document: the
+§1 diagnosis, the §6 kill criteria (re-read against the new pitch), and every
+§7 non-negotiable. The group chat from Phase 2 isn't dropped — it becomes the
+channel the calls land on, rather than a second product.
+
+Why the pitch moved, paraphrasing the decision: Tailscale doesn't beat it, because
+over Tailscale you'd have to expose the service to the machine accessing it
+via MCP, and this sidesteps that network risk. CLIs are meaningfully more
+efficient than MCP (even with the 2026-07-28 rev) but have no built-in
+observability story; gossip channels let CLI interactions be logged and
+observed at the infra layer without access to caller or callee. Identity comes
+from the user's IdP, delivered as metadata on the channel. §2 is amended below
+rather than rewritten, so the earlier reasoning stays on the record.
+
+---
+
 ## 1. The diagnosis: two theses, not two drafts
 
 This repo contains two revisions that look like a draft and a rewrite but are
@@ -44,6 +66,20 @@ CLI semantics retain a residual edge (pretrained idiom, one generic verb,
 pipes that filter output *before* it reaches context) — but it's an edge a
 shell wrapper over MCP mostly captures. "Cheaper MCP" is a wash that loses
 to ecosystem gravity. **Drop this leg. Never lead with it again.**
+
+**Amended 2026-09-22 — the CLI-efficiency argument is back, as a secondary
+leg.** The reasoning above still holds against the *old* framing, which sold
+cheaper calls as the product. It doesn't hold against the new one, for two
+reasons. First, the residual edge was never zero: pretrained idiom, one generic
+verb, and pipes that filter output before it reaches context are real savings
+over tool schemas plus JSON results, and they are still real under
+2026-07-28. Second, "a shell wrapper over MCP mostly captures it" assumed that
+the only thing a CLI lacks is transport. What it actually lacks is
+observability — nobody but the caller sees what ran — and that's the gap the
+audit channel fills. So efficiency is the reason to prefer CLIs, and the
+channel is what makes preferring them safe. It stays second in the pitch, after
+reach-by-key and the observable call record; it is never the lead, and it is
+never argued with a token count we haven't measured.
 
 ## 3. What's alive: three structural gaps MCP widened
 
