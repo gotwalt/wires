@@ -2,8 +2,9 @@
 #
 # Provision a loopback wires pair for the benchmark's `wires` arm:
 #
-#   responder -- `wires serve --expose 'gh=gh'` (the local `gh`, with its own
-#                auth; nothing else exposed)
+#   responder -- `wires serve host.json`, host.json exposing one tool `gh`
+#                (the local `gh`, with its own auth) to any roster member;
+#                no channel, so no audit and no IdP (card 13's member-only host)
 #   agent     -- `tools.json` entry `gh` pointing at the responder by node id
 #                + loopback address, so the agent runs `wires call gh -- …`
 #
@@ -29,30 +30,41 @@ fi
 rm -rf "$root" "$wb" "$agent" "$D/v1" "$D"/*.member
 mkdir -p "$root" "$wb" "$agent"
 
-WIRES_HOME="$root" "$WIRES" keygen --save-root >/dev/null
-for h in "$wb" "$agent"; do WIRES_HOME="$h" "$WIRES" keygen --save-node >/dev/null; done
-ROOT_ID="$(WIRES_HOME="$root" "$WIRES" keygen --root-seed "$(tr -d '\n' <"$root/root.seed")" | awk '/^root_id/{print $2}')"
-node_id() { "$WIRES" keygen --node-seed "$(tr -d '\n' <"$1/node.seed")" | awk '/^node_id/{print $2}'; }
+WIRES_HOME="$root" "$WIRES" advanced keygen --save-root >/dev/null
+for h in "$wb" "$agent"; do WIRES_HOME="$h" "$WIRES" advanced keygen --save-node >/dev/null; done
+node_id() { "$WIRES" advanced keygen --node-seed "$(tr -d '\n' <"$1/node.seed")" | awk '/^node_id/{print $2}'; }
 WB_ID="$(node_id "$wb")"
 AG_ID="$(node_id "$agent")"
 
 for id in "$WB_ID" "$AG_ID"; do
-	WIRES_HOME="$root" "$WIRES" roster add --member "$id" >/dev/null
-	WIRES_HOME="$root" "$WIRES" member --subject "$id" --ttl 86400 >"$D/$id.member"
+	WIRES_HOME="$root" "$WIRES" advanced roster add --member "$id" >/dev/null
+	WIRES_HOME="$root" "$WIRES" advanced member --subject "$id" --ttl 86400 >"$D/$id.member"
 done
-HEAD1="$(WIRES_HOME="$root" "$WIRES" roster commit --ttl 86400 --out "$D/v1" | awk '/^head /{print $2}')"
+HEAD1="$(WIRES_HOME="$root" "$WIRES" advanced roster commit --ttl 86400 --out "$D/v1" | awk '/^head /{print $2}')"
 for pair in "$wb:$WB_ID" "$agent:$AG_ID"; do
 	h="${pair%%:*}"
 	id="${pair#*:}"
-	WIRES_HOME="$h" "$WIRES" import \
+	WIRES_HOME="$h" "$WIRES" advanced import \
 		--membership-file "$D/$id.member" \
 		--inclusion-proof-file "$D/v1/$id.proof" \
 		--roster-head "$HEAD1" \
 		--fabric-key-file "$D/v1/$id.key" >/dev/null
 done
 
-WIRES_HOME="$wb" nohup "$WIRES" serve --trust-root "$ROOT_ID" --allow-any-member \
-	--expose 'gh=gh' >"$D/wb.out" 2>"$D/wb.err" </dev/null &
+cat >"$D/host.json" <<'JSON'
+{
+  "version": 1,
+  "tools": {
+    "gh": {
+      "description": "The GitHub CLI (gh), run on this host with its own auth",
+      "command": ["gh"],
+      "allow": ["member"]
+    }
+  }
+}
+JSON
+WIRES_HOME="$wb" "$WIRES" serve --check "$D/host.json" >/dev/null
+WIRES_HOME="$wb" nohup "$WIRES" serve "$D/host.json" >"$D/wb.out" 2>"$D/wb.err" </dev/null &
 echo $! >"$D/wb.pid"
 sleep 2
 kill -0 "$(cat "$D/wb.pid")" || {

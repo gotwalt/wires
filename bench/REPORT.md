@@ -1,7 +1,9 @@
 # MCP vs CLI: token benchmark (card 16)
 
 *Run 2026-09-23 (UTC): 4 arms × 5 tasks × 5 reps = 100 headless Claude Code
-sessions, all 100 scored correct. Total spend $4.18 (smoke tests: about $1.70 more).*
+sessions, all 100 scored correct. Total spend $4.18 (smoke tests: about $1.70 more).
+Arm 5 (card 19, [below](#arm-5-wires-is-the-only-thing-the-agent-can-run)) added
+50 more sessions the same day: $0.83, all correct.*
 
 ## Headline
 
@@ -14,6 +16,7 @@ The CLI arms used **about half to a third of the input tokens** and cost
 | MCP, tool search forced off | 30,630 | $1.40 | 25/25 |
 | `wires call gh` | 10,539 | $0.48 | 25/25 |
 | bare `gh` | 6,997 | $0.42 | 25/25 |
+| **arm 5**: `wires call gh` only, no shell helpers (card 19) | 10,713 | $0.39 | 25/25 |
 
 **The gap does not come mainly from tool definitions.** Claude Code's default
 tool search keeps the 26 GitHub tool schemas out of context: they add ~400
@@ -34,7 +37,7 @@ nearly the same ($0.011 MCP vs $0.009 CLI).
 | wires | this branch's `//wires` binary; loopback `wires serve --expose 'gh=gh'`, agent `tools.json` → `gh` by node id + 127.0.0.1 address (`bench/wires-up.sh`) |
 | Session | `claude -p --output-format stream-json --verbose --no-session-persistence --strict-mcp-config --setting-sources project --disable-slash-commands --tools=<arm> --allowedTools=<arm>`, fresh session per run, empty cwd, minimal env (HOME/USER/PATH/…) plus `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` |
 | Built-in tools | MCP arms: `--tools=ToolSearch` (+ the MCP server). CLI arms: `--tools=Bash,ToolSearch` |
-| Permissions | MCP: `mcp__github`. wires: `Bash(wires call gh:*)`, gh: `Bash(gh:*)`, and both get `Bash(jq/head/tail/grep/wc/sort:*)` |
+| Permissions | MCP: `mcp__github`. wires: `Bash(wires call gh:*)`, gh: `Bash(gh:*)`, and both get `Bash(jq/head/tail/grep/wc/sort:*)`. Arm 5 (wires-only): `Bash(wires call gh:*)` and nothing else |
 | Tool search | **mcp**: `ENABLE_TOOL_SEARCH` unset. In 2.1.280 an unset value resolves to mode `tst` (tool search always on); this is the default users get. **mcp-eager**: `ENABLE_TOOL_SEARCH=false` → mode `standard` (every schema sent up front). Read from the CLI's mode resolver (`auto`/`auto:N` = threshold mode, `true` = on, `false` = off). The card asked for "default vs forced on". Default already *is* on, so the useful second arm is forced **off** |
 | Concurrency | one lane per arm, run in parallel. Each lane runs its 5 tasks in sequence; 5 reps in sequence |
 
@@ -124,6 +127,71 @@ from the model's own choices: it re-checked `isLatest`/`isPrerelease` on t1
 in 4 of 5 runs and made extra cross-check calls. The protocol doesn't
 explain it.
 
+## Arm 5: `wires` is the only thing the agent can run
+
+*Card 19, run 2026-09-23 (UTC), right after card 13 merged. Results:
+`bench/results/2026-09-23-arm5.jsonl`.*
+
+Card 16's CLI arms let the agent pipe into `jq`/`head`/`grep`. A skeptic
+would say the efficiency came from a general shell, and a general shell is
+exactly what a safety reviewer can't reason about. Arm 5 takes that away.
+`--allowedTools=Bash(wires call gh:*)` is the only rule: no pipe helpers.
+The prompt says there is no shell. It says to filter with gh's own flags or
+with `wires call gh --jq/--head/--max-bytes -- …`, which shape the remote
+stdout inside `wires` without spawning anything. The same run repeated the
+card-16 `wires` arm (with pipe helpers) as a same-day control. The binary and
+the host config (`host.json`, card 13) changed between the two runs.
+
+| arm | median total input | Σ cost, 25 runs | median turns | accuracy | permission refusals |
+|---|---|---|---|---|---|
+| MCP, default (card 16) | 21,088 | $1.87 | 3 | 25/25 | 0 |
+| MCP, tool search off (card 16) | 30,630 | $1.40 | 2 | 25/25 | 0 |
+| `wires call gh` + pipe helpers (card 16) | 10,539 | $0.48 | 3 | 25/25 | 7 |
+| bare `gh` + pipe helpers (card 16) | 6,997 | $0.42 | 2 | 25/25 | 8 |
+| `wires call gh` + pipe helpers (same-day control) | 10,332 | $0.44 | 3 | 25/25 | 4 |
+| **arm 5: `wires call gh` only** | **10,713** | **$0.39** | **3** | **25/25** | **0** |
+
+Card 16's refusal counts come from its notes (15 total, split 8 gh / 7 wires).
+Its result rows predate the per-run `permission_denials` field that
+`bench.py` now records.
+
+| task (median input / median cost) | wires control | arm 5 |
+|---|---|---|
+| t1-release | 6,693 / $0.007 | 10,917 / $0.012 |
+| t2-merged-prs | 13,204 / $0.022 | 7,327 / $0.017 |
+| t3-bug-count | 10,332 / $0.018 | 6,981 / $0.009 |
+| t4-commit-files | 6,790 / $0.008 | 7,042 / $0.009 |
+| t5-most-commented | 11,173 / $0.029 | 11,305 / $0.021 |
+
+Tool-result characters over 5 reps were 21,821 for the control and 9,785 for
+arm 5. Arm 5 made 39 calls against the control's 46.
+
+**Does the efficiency survive a wires-only sandbox? Yes, at n = 5.** Arm 5
+matched the same-day control on median input (+4%, inside the IQR) and came
+in lower on total cost (−11%) and turns (64 vs 71). It kept its ~2× input and
+~4.8× cost advantage over the default MCP arm, with **zero** permission
+refusals against the control's 4. The refusals the pipe helpers invited were
+the `gh api graphql -f query='{…}'` cross-checks and a `for` loop. They
+stopped happening: once the prompt says "no shell", the model doesn't reach
+for shell idioms. Most filtering came from **gh's own flags**: 20 of 39 calls
+used `gh … --jq`, and 4 used `wires call --jq` (t4, t5). So the claim that
+survives is about the CLI's vocabulary, not about wires' flags. The in-process
+`--jq` is a fallback for tools that have no filter of their own.
+
+Three honest limits:
+- **t1 cost more under arm 5** (10.9k vs 6.7k median input). The model asked
+  for extra fields (`isLatest`, `isPrerelease`, `isDraft`) and re-checked. The
+  control happened not to. This is model behavior, not a sandbox cost.
+- **The sandbox isn't as tight as its name.** `Bash(wires call gh:*)` does stop
+  every chained or substituted command the probe tried. But Claude Code still
+  auto-allows read-only commands like `cat` inside the working directory
+  (see `docs/agent-sandbox.md`). The benchmark ran in an empty directory, and
+  the model never tried one. An airtight setup is structural: `wires mcp`
+  with no Bash tool, or a container that holds only `wires`.
+- **Same caveats as above:** one model, one tool, n = 5, stripped-down
+  sessions, warm caches. The two same-day arms ran side by side and share a
+  cache prefix.
+
 ## Caveats
 
 - **Stripped-down sessions.** Each arm had only its own tools, and no CLAUDE.md,
@@ -158,7 +226,15 @@ bazel build //wires
 ./bench/run.sh --reps 1                       # smoke: 1 run per arm per task (~$1.50)
 ./bench/run.sh --reps 5                       # full; appends to bench/results/<utc-date>.jsonl
 python3 bench/report.py bench/results/<utc-date>.jsonl
+# arm 5 (card 19) and its same-day control, into their own file (~$0.85):
+BENCH_OUT=bench/results/<utc-date>-arm5.jsonl ./bench/run.sh --reps 5 --arms wires-only,wires
+python3 bench/report.py bench/results/<utc-date>-arm5.jsonl
+python3 bench/permission-probe.py --out /tmp/probe.jsonl   # docs/agent-sandbox.md evidence (~$0.20)
 ```
+
+`bench/wires-up.sh` serves `gh` from a member-only `host.json` (card 13's
+`wires serve host.json`; no channel, so no audit or IdP). Card 16's four
+arms ran the binary of that time, which had `serve --expose 'gh=gh'`.
 
 Needs `claude` logged in, `gh` logged in, docker, and python3. The token is
 read at runtime with `gh auth token`, passed to the container through the

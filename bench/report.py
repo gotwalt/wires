@@ -2,6 +2,7 @@
 """Summarise a bench/results/<date>.jsonl into markdown tables for REPORT.md.
 
   python3 bench/report.py bench/results/2026-09-23.jsonl
+  python3 bench/report.py bench/results/2026-09-23.jsonl bench/results/2026-09-23-arm5.jsonl
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ import json
 import statistics
 import sys
 
-ARMS = ["mcp", "mcp-eager", "wires", "gh"]
+ARMS = ["mcp", "mcp-eager", "wires", "gh", "wires-only"]
 
 
 def q(xs, p):
@@ -27,7 +28,7 @@ def med_iqr(xs, fmt="{:,.0f}"):
 
 
 def main() -> None:
-    rows = [json.loads(l) for l in open(sys.argv[1])]
+    rows = [json.loads(l) for path in sys.argv[1:] for l in open(path)]
     runs = [r for r in rows if r.get("kind") == "run"]
     tasks = sorted({r["task"] for r in runs})
 
@@ -79,15 +80,17 @@ def main() -> None:
             )
         print(f"| {t} | " + " | ".join(cells) + " |")
 
-    print("\n### Tool calls (median per run)\n")
-    print("| arm | tool calls | ToolSearch calls (total) |")
-    print("|---|---|---|")
+    print("\n### Tool calls (median per run) and permission refusals\n")
+    print("| arm | tool calls | ToolSearch calls (total) | permission refusals (total) |")
+    print("|---|---|---|---|")
     for a in ARMS:
         rs = [r for r in runs if r["arm"] == a]
         if rs:
+            # Card 16's runs predate the per-run refusal count.
+            refusals = sum(r["permission_denials"] for r in rs) if all("permission_denials" in r for r in rs) else "–"
             print(
                 f"| {a} | {statistics.median([len(r['tool_calls']) for r in rs]):.0f} "
-                f"| {sum(c == 'ToolSearch' for r in rs for c in r['tool_calls'])} |"
+                f"| {sum(c == 'ToolSearch' for r in rs for c in r['tool_calls'])} | {refusals} |"
             )
     total = sum(r["cost_usd"] for r in runs)
     print(f"\nTotal spend: ${total:.2f} over {len(runs)} runs. Models: {sorted({m for r in runs for m in r['model_usage']})}")
