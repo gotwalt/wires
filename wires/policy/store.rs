@@ -24,10 +24,6 @@ pub(crate) const POLICY_FILE: &str = "policy.json";
 /// The lock file guarding [`POLICY_FILE`] rewrites.
 const LOCK_FILE: &str = "policy.json.lock";
 
-/// When this node last checked its copy with a directory
-/// (`policy-checked.txt`, unix seconds).
-const CHECKED_FILE: &str = "policy-checked.txt";
-
 /// A signed policy this node verified under its root, and the typed
 /// [`Policy`] its items make: what every role decides and lists from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,11 +129,6 @@ pub(crate) fn adopt_if_newer(
 /// `None` before `init` or `join`.
 pub(crate) fn fabric(ks: &Keystore) -> Result<Option<NodeId>> {
     Ok(ks.read_membership()?.map(|m| m.fabric))
-}
-
-/// Record that this node's copy was checked against a directory at `now`.
-pub(crate) fn mark_checked(ks: &Keystore, now: i64) -> Result<()> {
-    write_text_mode(&ks.path(CHECKED_FILE), &format!("{now}\n"), None)
 }
 
 #[cfg(test)]

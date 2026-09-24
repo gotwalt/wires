@@ -46,16 +46,20 @@ const COLD_FETCH_BUDGET: Duration = Duration::from_secs(8);
 /// Which directories took a published policy and which didn't.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PublishReport {
-    /// Directories now holding at least the published version.
+    /// Directories now holding the published policy.
     pub(crate) delivered: Vec<NodeId>,
     /// Directories that couldn't be reached or refused it.
     pub(crate) missed: Vec<NodeId>,
+    /// Directories holding a policy newer than the published one, or
+    /// another at its version, with that version: the publisher's copy is
+    /// stale, and its edit was not taken.
+    pub(crate) newer: Vec<(NodeId, StateVersion)>,
 }
 
 impl PublishReport {
     /// One human line for the admin's stderr.
     pub(crate) fn line(&self, version: StateVersion) -> String {
-        let total = self.delivered.len() + self.missed.len();
+        let total = self.delivered.len() + self.missed.len() + self.newer.len();
         if total == 0 {
             return format!(
                 "policy version {}: no directory to publish to yet (name one with `wires \
@@ -78,6 +82,16 @@ impl PublishReport {
                     .join(", ")
             ));
         }
+        if !self.newer.is_empty() {
+            out.push_str(&format!(
+                "; holding a newer policy: {}",
+                self.newer
+                    .iter()
+                    .map(|(n, v)| format!("{}… (version {})", n.short(), v.0))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         out
     }
 
@@ -92,9 +106,23 @@ impl PublishReport {
 // Publish (admin)
 // ---------------------------------------------------------------------------
 
+/// What one directory made of a publish.
+enum Took {
+    /// It holds the published policy.
+    Delivered,
+    /// Unreachable, or refused it.
+    Missed,
+    /// It holds a newer policy, or another at this version (that version).
+    Newer(StateVersion),
+}
+
 /// Publish `policy` to each of `targets`, concurrently, presenting `badge`
-/// (the admin's own). A target counts as delivered once it answers holding
-/// at least `policy`'s version.
+/// (the admin's own). A target counts as delivered when it answers holding
+/// `policy`'s version and, asked for its head, holds this very head (a
+/// head it can't show leaves the answer standing). One answering a newer
+/// version, or showing another head at this version, is
+/// [`newer`](PublishReport::newer): the publisher's copy was stale, and the
+/// directory kept its own.
 pub(crate) async fn publish_all(
     endpoint: &Endpoint,
     badge: &Membership,
@@ -111,33 +139,46 @@ pub(crate) async fn publish_all(
         let endpoint = endpoint.clone();
         let badge = badge.clone();
         let request = Arc::clone(&request);
-        let want = policy.version();
+        let head = policy.head.clone();
         set.spawn(async move {
-            let ok = match ask(&endpoint, target, &badge, None, &request).await {
-                Ok(DirectoryAnswer::Published { version }) => version >= want,
+            let want = head.head.version;
+            let took = match ask(&endpoint, target, &badge, None, &request).await {
+                Ok(DirectoryAnswer::Published { version }) if version > want => {
+                    Took::Newer(version)
+                }
+                Ok(DirectoryAnswer::Published { version }) if version == want => {
+                    // The same version may be another policy (an admin
+                    // whose copy was one edit behind): ask for the head.
+                    match ask(&endpoint, target, &badge, None, &DirectoryRequest::Head {}).await {
+                        Ok(DirectoryAnswer::Head { head: theirs, .. }) if theirs != head => {
+                            Took::Newer(theirs.head.version)
+                        }
+                        _ => Took::Delivered,
+                    }
+                }
                 Ok(DirectoryAnswer::Denied { reason }) => {
                     tracing::warn!(directory = %target.hex(), "publish refused: {reason}");
-                    false
+                    Took::Missed
                 }
-                Ok(_) => false,
+                Ok(_) => Took::Missed,
                 Err(e) => {
                     tracing::debug!(directory = %target.hex(), "publish failed: {e:#}");
-                    false
+                    Took::Missed
                 }
             };
-            (target, ok)
+            (target, took)
         });
     }
     while let Some(joined) = set.join_next().await {
-        let (target, ok) = joined.context("a publish task panicked")?;
-        if ok {
-            report.delivered.push(target);
-        } else {
-            report.missed.push(target);
+        match joined.context("a publish task panicked")? {
+            (target, Took::Delivered) => report.delivered.push(target),
+            (target, Took::Missed) => report.missed.push(target),
+            (target, Took::Newer(v)) => report.newer.push((target, v)),
         }
     }
     report.delivered.sort();
     report.missed.sort();
+    report.newer.sort();
     Ok(report)
 }
 
@@ -226,8 +267,8 @@ fn stored(ks: &Keystore) -> Result<Held> {
 /// - `current`, with a `Fresh` for the held head from a directory that head
 ///   lists, current at `now`: this node is up to date (`Ok(None)`).
 ///
-/// Only those two mark the copy checked; a refusal, a lapsed or foreign
-/// `Fresh`, or an older policy does not (so the next check asks again).
+/// A refusal, a lapsed or foreign `Fresh`, or an older policy settles
+/// nothing: the next directory is asked.
 pub(crate) async fn fetch(
     endpoint: &Endpoint,
     ks: &Keystore,
@@ -252,7 +293,6 @@ pub(crate) async fn fetch(
                 }
                 match store::adopt_if_newer(ks, &policy, root, now_unix()) {
                     Ok(true) => {
-                        store::mark_checked(ks, now_unix())?;
                         return Ok(Some(policy));
                     }
                     Ok(false) => {}
@@ -282,7 +322,6 @@ pub(crate) async fn fetch(
                 };
                 match store::adopt_if_newer(ks, &next, root, now_unix()) {
                     Ok(true) => {
-                        store::mark_checked(ks, now_unix())?;
                         return Ok(Some(next));
                     }
                     Ok(false) => {}
@@ -295,7 +334,6 @@ pub(crate) async fn fetch(
                 let Some(held) = held else { continue };
                 match fresh.verify(&held.signed.head) {
                     Ok(()) if fresh.is_current(now_unix()) => {
-                        store::mark_checked(ks, now_unix())?;
                         return Ok(None);
                     }
                     Ok(()) => tracing::debug!(directory = %dir.hex(), "a lapsed freshness"),
@@ -372,6 +410,7 @@ mod tests {
         let missed = PublishReport {
             delivered: vec![a],
             missed: vec![b],
+            ..PublishReport::default()
         };
         let line = missed.line(StateVersion(2));
         assert!(line.contains("published to 1 of 2"), "{line}");
@@ -380,6 +419,7 @@ mod tests {
         let all_missed = PublishReport {
             delivered: vec![],
             missed: vec![a, b],
+            ..PublishReport::default()
         };
         assert!(all_missed.reached_none());
     }

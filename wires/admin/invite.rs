@@ -92,7 +92,7 @@ pub(crate) fn invite_in(ks: &Keystore, a: InviteArgs) -> anyhow::Result<Report> 
             );
         }
     }
-    let held = crate::policy::store::require_policy(ks, root.node_id())?;
+    let held = super::service::admin_policy(ks, root.node_id())?;
     let now = now_unix();
     let badge = Membership::mint(&root, invitee, now, ttl.not_after(now))?;
     let rejoin = ledger.contains(invitee);
@@ -164,7 +164,7 @@ pub(crate) fn remove_in(ks: &Keystore, a: RemoveArgs) -> anyhow::Result<Report> 
     let root = ks
         .read_root_identity()?
         .ok_or_else(|| anyhow::anyhow!("no root key here: `wires remove` runs on the admin"))?;
-    let held = crate::policy::store::require_policy(ks, root.node_id())?;
+    let held = super::service::admin_policy(ks, root.node_id())?;
     if let Some(ban) = held.policy.bans.get(&member) {
         bail!(
             "{} is already removed (banned until {})",
@@ -315,6 +315,31 @@ mod tests {
         assert_eq!(resolve_member(&ledger, &bob.hex()).unwrap(), (bob, None));
         let err = resolve_member(&ledger, "carol").unwrap_err();
         assert!(format!("{err:#}").contains("alice"), "{err:#}");
+    }
+
+    /// Under strict freshness, removing the last directory would leave
+    /// nothing to vouch for the policy: refused, naming the way out, and
+    /// nothing changes.
+    #[test]
+    fn removing_the_last_directory_under_strict_is_refused() {
+        let ks = admin();
+        let dir = NodeIdentity::from_seed([4u8; 32]).node_id();
+        invite(&ks, dir, Some("dir"));
+        crate::admin::service::directory_add(&ks, dir, Ttl::default()).unwrap();
+        crate::admin::settings::settings_in(
+            &ks,
+            &crate::admin::settings::SettingsArgs {
+                freshness: Some(crate::admin::settings::Freshness::Strict),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let before = stored(&ks).version();
+        let err = format!("{:#}", remove(&ks, "dir").unwrap_err());
+        assert!(err.contains("freshness is strict"), "{err}");
+        assert!(err.contains("--freshness lenient"), "{err}");
+        assert_eq!(stored(&ks).version(), before);
+        assert_eq!(stored(&ks).directories(), &[dir]);
     }
 
     #[test]

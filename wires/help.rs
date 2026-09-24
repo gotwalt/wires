@@ -141,7 +141,8 @@ Examples:
   wires inbox
   wires inbox --wait --timeout 10m
 
-Exit: 0 with messages printed (or none, without --wait); 124: --timeout ran out.";
+Exit: 0 with messages printed (or none, without --wait); 124: --timeout ran out.
+77: every host refused this node (don't retry; ask your admin).";
 
 /// `wires mcp`: examples.
 pub(crate) const MCP_AFTER: &str = "\

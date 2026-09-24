@@ -54,8 +54,9 @@ directory up, a fresh `wires invite` token for it carries it (re-joining
 never rolls back). While it runs, it follows one directory's subscription
 (the next listed one if that directory goes away): each admin edit arrives
 within a second as one small update, and a signed freshness timestamp every
-5 minutes. An admin edit that reaches no directory exits 1; `wires policy
-push` re-publishes the stored policy once one is up.
+5 minutes. An admin edit that reaches no directory exits 1 (once one has
+taken a publish from the admin); `wires policy push` re-publishes the stored
+policy once one is up.
 
 ### Run services as a separate Unix user
 
@@ -128,23 +129,27 @@ Where to run it:
   for this). It refuses the admin's keystore and a node the policy doesn't
   list.
 
-Either way, a directory's first policy comes in its invite: the admin
-invites the node, lists it, then sends a fresh invite, which carries the
-whole policy because the node is now listed:
+Either way, a directory's first policy comes in its invite: the admin lists
+the node first, then invites it, and the token carries the whole policy
+because the node is listed:
 
 ```bash
 wires id                                   # on the directory node
-wires invite <id> --name dir1              # admin
-wires directory add dir1                   # admin
+wires directory add <id>                   # admin: prints the node's next step
 wires invite <id> --name dir1              # admin: this token carries the policy
 wires join <token>                         # on the directory node
 wires directory serve                      # or `wires serve host.json` on a host
 ```
 
+No step fails: until a directory has taken a publish from the admin, an edit
+that reaches none says no directory is running yet and exits 0. A node
+invited before it was listed needs a fresh invite (`directory add` says so);
+a host already serving runs the directory once `wires serve` restarts.
+
 Run two, on different machines: each follows the other as a replica, so one
 that missed an edit catches up, and hosts and callers fail over between
 them. The admin publishes every edit to all of them (an edit that reaches
-none exits 1). `--max-subscribers` (default 4096) caps the subscriptions one
+none exits 1, once one has taken a publish). `--max-subscribers` (default 4096) caps the subscriptions one
 directory serves at once (hosts, other directories, and long-running callers
 such as `wires mcp` and gateway sessions). Its keystore must persist:
 losing `directory.redb` loses nothing (the admin's `wires policy push`, or a

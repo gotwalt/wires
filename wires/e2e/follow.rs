@@ -13,6 +13,10 @@
 //! - [`with_every_directory_down_lenient_keeps_serving`]
 //! - [`with_every_directory_down_strict_refuses_until_one_is_back`]
 //! - [`a_host_restarted_from_disk_serves_before_any_directory_answers`]
+//! - [`a_directory_serving_an_unadoptable_policy_is_passed_over`]
+//! - [`a_publish_from_a_stale_copy_is_not_delivered`]
+//! - [`a_directory_that_ends_the_subscription_with_denied_is_passed_over`]
+//! - [`a_host_every_directory_refuses_backs_off`]
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -79,10 +83,34 @@ impl World {
     /// both directories listed, `settings`, and `bans` banned nodes; signed
     /// after the previous one, so unchanged entries keep their signature.
     fn policy(&self, version: u64, settings: Settings, bans: u8) -> SignedPolicy {
+        self.policy_until(version, settings, bans, i64::MAX)
+    }
+
+    /// [`policy`](Self::policy), good until `not_after`.
+    fn policy_until(
+        &self,
+        version: u64,
+        settings: Settings,
+        bans: u8,
+        not_after: i64,
+    ) -> SignedPolicy {
+        self.policy_edited(version, settings, bans, not_after, |_| {})
+    }
+
+    /// [`policy_until`](Self::policy_until), changed by `edit` before it is
+    /// signed.
+    fn policy_edited(
+        &self,
+        version: u64,
+        settings: Settings,
+        bans: u8,
+        not_after: i64,
+        edit: impl FnOnce(&mut Policy),
+    ) -> SignedPolicy {
         let mut p = Policy::new(self.root.node_id());
         p.version = StateVersion(version);
         p.issued = now_unix();
-        p.not_after = i64::MAX;
+        p.not_after = not_after;
         p.directories = self.dirs.iter().map(|d| d.node_id()).collect();
         p.settings = settings;
         p.roles.insert(
@@ -104,6 +132,7 @@ impl World {
         for b in 0..bans {
             p.ban(NodeIdentity::from_seed([100 + b; 32]).node_id(), i64::MAX);
         }
+        edit(&mut p);
         crate::testutil::trust_role_issuers(&mut p);
         let mut last = self.last.lock().unwrap();
         let signed = match last.as_ref() {
@@ -458,6 +487,145 @@ async fn with_every_directory_down_strict_refuses_until_one_is_back() {
     let out = eventually("a call after", || async { w.call(&addr).await.ok() }).await;
     assert_eq!(out, "hi\n");
     d.stop().await;
+}
+
+/// A directory that serves a policy the host can't adopt (here, one that
+/// expired after the directory took it) is passed over: the host asks it
+/// for the whole policy once, then fails over to the next directory, which
+/// serves a good one, instead of asking the first again forever.
+#[tokio::test]
+async fn a_directory_serving_an_unadoptable_policy_is_passed_over() {
+    let w = World::new().await;
+    let v1 = w.policy(1, Settings::default(), 0);
+    let first_ks = w.keystore(&w.dirs[0], &v1);
+    let second_ks = w.keystore(&w.dirs[1], &v1);
+    // Two version 2s, so neither directory takes the other's (not newer).
+    // The first directory's expires a moment after it takes it.
+    let expiring = w.policy_until(2, Settings::default(), 1, now_unix() + 1);
+    let good = w.policy(2, Settings::default(), 2);
+    let first = w.directory(0, &first_ks).await;
+    assert!(first.dir.accept(&expiring, now_unix()).unwrap());
+    let second = w.directory(1, &second_ks).await;
+    assert!(second.dir.accept(&good, now_unix()).unwrap());
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+    // The host's policy lists the first directory first.
+    let h = w.follower(0, &w.keystore(&w.hosts[0], &v1)).await;
+    h.until(StateVersion(2)).await;
+    assert_eq!(store::read(&h.ks, h.root).unwrap().unwrap().signed, good);
+    let (_, _, _, resyncs) = h.frames();
+    assert_eq!(
+        resyncs, 2,
+        "the update, then the whole policy, from the first"
+    );
+    h.task.abort();
+    first.stop().await;
+    second.stop().await;
+}
+
+/// An admin publishing from a stale copy: a directory holding a newer
+/// version, or another policy at the version offered, answers with what it
+/// holds and keeps it. The publish reports it as `newer`, never delivered,
+/// and the admin command fails naming the way back.
+#[tokio::test]
+async fn a_publish_from_a_stale_copy_is_not_delivered() {
+    let w = World::new().await;
+    let v1 = w.policy(1, Settings::default(), 0);
+    let d = w.directory(0, &w.keystore(&w.dirs[0], &v1)).await;
+    let (v2, v3) = (
+        w.policy(2, Settings::default(), 1),
+        w.policy(3, Settings::default(), 2),
+    );
+    let now = now_unix();
+    assert!(d.dir.accept(&v2, now).unwrap());
+    assert!(d.dir.accept(&v3, now).unwrap());
+    let admin = w.bind(&w.admin).await;
+    let badge = w.badge(&w.admin);
+    let only = [w.dirs[0].node_id()];
+
+    // Two versions behind: its version 2 is older than the directory's 3.
+    let report = publish_all(&admin, &badge, &v2, &only).await.unwrap();
+    assert_eq!(report.newer, vec![(only[0], StateVersion(3))], "{report:?}");
+    assert!(report.delivered.is_empty(), "{report:?}");
+    // One behind: another version 3, signed from its copy of version 2.
+    let other_v3 = w.policy(3, Settings::default(), 5);
+    assert_ne!(other_v3.head, v3.head);
+    let report = publish_all(&admin, &badge, &other_v3, &only).await.unwrap();
+    assert_eq!(report.newer, vec![(only[0], StateVersion(3))], "{report:?}");
+    let failure =
+        crate::admin::propagate::Propagation::from_publish(Ok((StateVersion(3), report)), false)
+            .failure
+            .expect("the edit fails");
+    assert!(failure.contains("policy.json is stale"), "{failure}");
+    assert_eq!(d.dir.snapshot().unwrap().held.signed, v3, "kept its own");
+
+    // The directory's own version, re-published (`policy push`): delivered.
+    let report = publish_all(&admin, &badge, &v3, &only).await.unwrap();
+    assert_eq!(report.delivered, only.to_vec(), "{report:?}");
+    assert!(report.newer.is_empty());
+    admin.close().await;
+    d.stop().await;
+}
+
+/// A directory that ends the host's subscription with `denied` (here: the
+/// new head no longer lists it) is passed over at once: the host follows
+/// the next directory and takes the new head from it, and doesn't ask the
+/// one that refused again.
+#[tokio::test]
+async fn a_directory_that_ends_the_subscription_with_denied_is_passed_over() {
+    let w = World::new().await;
+    let v1 = w.policy(1, Settings::default(), 0);
+    let first = w.directory(0, &w.keystore(&w.dirs[0], &v1)).await;
+    let second = w.directory(1, &w.keystore(&w.dirs[1], &v1)).await;
+    let h = w.follower(0, &w.keystore(&w.hosts[0], &v1)).await;
+    h.until(StateVersion(1)).await;
+    let beats = |d: &Dir| d.dir.snapshot().unwrap().fresh.is_some();
+    assert!(beats(&first) && beats(&second));
+
+    // Version 2 lists only the second directory; both hold it.
+    let second_only = vec![w.dirs[1].node_id()];
+    let v2 = w.policy_edited(2, Settings::default(), 0, i64::MAX, |p| {
+        p.directories = second_only.clone();
+    });
+    let now = now_unix();
+    assert!(first.dir.accept(&v2, now).unwrap());
+    assert!(second.dir.accept(&v2, now).unwrap());
+    h.until(StateVersion(2)).await;
+    // Past the pause a retry of the first directory would have waited.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(h.stats.denials.load(Ordering::SeqCst), 1, "asked once");
+    h.task.abort();
+    first.stop().await;
+    second.stop().await;
+}
+
+/// A host every directory refuses (here: banned) backs off between rounds
+/// (1 s, 2 s, …): a handful of refusals over seconds, never a tight loop.
+#[tokio::test]
+async fn a_host_every_directory_refuses_backs_off() {
+    let w = World::new().await;
+    let v1 = w.policy(1, Settings::default(), 0);
+    let first = w.directory(0, &w.keystore(&w.dirs[0], &v1)).await;
+    let second = w.directory(1, &w.keystore(&w.dirs[1], &v1)).await;
+    let h = w.follower(0, &w.keystore(&w.hosts[0], &v1)).await;
+    h.until(StateVersion(1)).await;
+    let host = w.hosts[0].node_id();
+    let banned = w.policy_edited(2, Settings::default(), 0, i64::MAX, |p| {
+        for svc in p.services.values_mut() {
+            svc.hosts.retain(|h| *h != host);
+        }
+        p.ban(host, i64::MAX);
+    });
+    let now = now_unix();
+    assert!(first.dir.accept(&banned, now).unwrap());
+    assert!(second.dir.accept(&banned, now).unwrap());
+    tokio::time::sleep(Duration::from_millis(4_500)).await;
+    // Rounds at about 0, 1 and 3 s: two refusals each.
+    let denials = h.stats.denials.load(Ordering::SeqCst);
+    assert!((2..=8).contains(&denials), "{denials} refusals in 4.5 s");
+    h.task.abort();
+    first.stop().await;
+    second.stop().await;
 }
 
 /// A host restarted with its policy on disk serves at once, with no

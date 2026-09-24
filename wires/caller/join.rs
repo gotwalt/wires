@@ -147,7 +147,6 @@ pub(crate) fn join_in(ks: &Keystore, token: &str, now: i64) -> anyhow::Result<Jo
     );
     if let Some(policy) = &invite.policy {
         crate::policy::store::adopt_if_newer(ks, policy, fabric, now)?;
-        crate::policy::store::mark_checked(ks, now)?;
         let held =
             crate::policy::store::read(ks, fabric)?.map_or(policy.version(), |s| s.version());
         summary.push_str(&format!(
@@ -284,6 +283,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(held.version(), StateVersion(3));
+        // Nothing reads when a copy was last checked (the 10-minute re-check
+        // is gone), so nothing records it.
+        assert!(!ks.path("policy-checked.txt").exists());
         // Re-joining with an older token keeps the newer policy.
         let v2 = invite_for(&root, me).with_policy(signed(&root, 2));
         join_in(&ks, &v2.encode().unwrap(), 0).unwrap();

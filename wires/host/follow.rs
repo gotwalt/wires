@@ -21,9 +21,15 @@
 //! (the directory stopped, went silent for two beats, or is no longer
 //! listed) it reconnects, trying the directory it last followed first and
 //! then the others in the head's order, backing off from 1 s to the beat
-//! (at most 30 s) while none answers. The list is re-read from the held
-//! policy each time, so a directory the admin adds is followed without a
-//! restart.
+//! (at most 30 s) while none answers. A directory whose whole policy can't
+//! be taken either (expired, say) is passed over: the next round, after a
+//! pause, starts at the directory after it. So is one that answers `denied`,
+//! at once or ending the stream (this host is not admitted, or may no
+//! longer hold the whole policy; the directory is no longer one, or busy):
+//! the follower tries the next directory at once, and starts its next round
+//! after the one that refused; a round in which every directory refused
+//! waits the growing pause. The list is re-read from the held policy each
+//! time, so a directory the admin adds is followed without a restart.
 //!
 //! A host that is itself a directory also vouches for its own head
 //! ([`vouch_from_local`]); its directory's replica loop keeps its copy in
@@ -72,6 +78,8 @@ pub(crate) struct FollowStats {
     /// Subscriptions started over with `have: 0` after a frame that
     /// couldn't be taken.
     pub(crate) resyncs: AtomicU64,
+    /// `denied` answers, at once or ending a stream.
+    pub(crate) denials: AtomicU64,
 }
 
 /// A running host's subscription to its directories. See the module docs.
@@ -93,13 +101,17 @@ pub(crate) struct Follower {
     pub(crate) stats: Arc<FollowStats>,
 }
 
-/// How one subscription ended, after the directory answered.
+/// How one subscription ended.
 #[derive(Debug)]
 enum Ended {
-    /// The stream closed or went silent: reconnect.
+    /// The stream closed or went silent, after the directory answered:
+    /// reconnect.
     Closed,
     /// A frame couldn't be taken: subscribe again with `have: 0`.
     Resync(anyhow::Error),
+    /// The directory answered `denied`, at once or ending the stream: pass
+    /// it over.
+    Denied(String),
 }
 
 impl Follower {
@@ -149,6 +161,7 @@ impl Follower {
             if let Some(i) = last.and_then(|l| dirs.iter().position(|d| *d == l)) {
                 dirs.rotate_left(i);
             }
+            let order = dirs.clone();
             let mut answered = false;
             for dir in dirs {
                 let have = if whole {
@@ -161,15 +174,31 @@ impl Follower {
                         whole = false;
                         answered = true;
                     }
+                    Ok(Ended::Denied(reason)) => {
+                        tracing::info!(
+                            directory = %dir.hex(),
+                            "policy subscription refused: {reason}; trying the next directory"
+                        );
+                        // Not asked first again: the next round starts
+                        // after it, and this one goes on at once.
+                        last = next_after(&order, dir);
+                        continue;
+                    }
                     Ok(Ended::Resync(e)) => {
                         self.stats.resyncs.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             directory = %dir.hex(),
                             "policy subscription: {e:#}; asking for the whole policy"
                         );
-                        // Twice in a row from the whole policy: try the next
-                        // directory, after a pause.
-                        answered = !whole;
+                        if whole {
+                            // Twice in a row, the second from the whole
+                            // policy: this directory serves one this host
+                            // can't take. Start the next round at the next
+                            // directory, after a pause.
+                            last = next_after(&order, dir);
+                            break;
+                        }
+                        answered = true;
                         whole = true;
                     }
                     Err(e) => {
@@ -192,7 +221,7 @@ impl Follower {
     }
 
     /// One subscription to `dir` from `have`, until it ends. `Err`: the
-    /// directory never answered (unreachable, refused, or closed at once).
+    /// directory never answered (unreachable, or closed at once).
     async fn subscribe_once(&self, dir: NodeId, have: StateVersion) -> Result<Ended> {
         let addr = transport::endpoint_addr(&dir, &[], None)?;
         let conn = tokio::time::timeout(
@@ -237,11 +266,7 @@ impl Follower {
             };
             self.count(&frame);
             if let SubFrame::Denied { reason } = frame {
-                if answered {
-                    tracing::info!(directory = %dir.hex(), "policy subscription ended: {reason}");
-                    return Ok(Ended::Closed);
-                }
-                bail!("refused: {reason}");
+                return Ok(Ended::Denied(reason));
             }
             if !answered {
                 tracing::info!(directory = %dir.hex(), have = have.0, "following the policy");
@@ -271,6 +296,7 @@ impl Follower {
             SubFrame::Policy { .. } => s.wholes.fetch_add(1, Ordering::Relaxed),
             SubFrame::PolicyUpdate { .. } => s.updates.fetch_add(1, Ordering::Relaxed),
             SubFrame::Fresh { .. } => s.beats.fetch_add(1, Ordering::Relaxed),
+            SubFrame::Denied { .. } => s.denials.fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
     }
@@ -289,7 +315,7 @@ impl Follower {
                     .verify(&policy.head)
                     .context("the freshness doesn't vouch for the policy's head")?;
                 self.adopt(&policy, "whole", now)?;
-                self.vouch(&fresh)
+                self.vouch(&fresh, now)
             }
             SubFrame::PolicyUpdate { update, fresh } => {
                 let held = store::read(&self.ks, self.root)?
@@ -302,9 +328,9 @@ impl Follower {
                     .verify(&next.head)
                     .context("the freshness doesn't vouch for the update's head")?;
                 self.adopt(&next, "update", now)?;
-                self.vouch(&fresh)
+                self.vouch(&fresh, now)
             }
-            SubFrame::Fresh { fresh } => self.vouch(&fresh),
+            SubFrame::Fresh { fresh } => self.vouch(&fresh, now),
             SubFrame::Denied { reason } => bail!("refused: {reason}"),
             SubFrame::View { .. } | SubFrame::ViewUpdate { .. } => {
                 bail!("a view frame on a policy subscription")
@@ -332,7 +358,7 @@ impl Follower {
 
     /// Keep `fresh` if it vouches for the head held now. One for another
     /// head (a directory behind this host, say) is skipped, not an error.
-    fn vouch(&self, fresh: &Fresh) -> Result<()> {
+    fn vouch(&self, fresh: &Fresh, now: i64) -> Result<()> {
         let Some(held) = store::read(&self.ks, self.root)? else {
             return Ok(());
         };
@@ -344,9 +370,16 @@ impl Follower {
             );
             return Ok(());
         }
-        self.freshness.offer(fresh, &held.signed.head)?;
+        self.freshness.offer(fresh, &held.signed.head, now)?;
         Ok(())
     }
+}
+
+/// The directory after `dir` in `order` (wrapping), where the next round
+/// starts once `dir` served a policy this host couldn't take.
+fn next_after(order: &[NodeId], dir: NodeId) -> Option<NodeId> {
+    let i = order.iter().position(|d| *d == dir)?;
+    order.get((i + 1) % order.len()).copied()
 }
 
 /// A host that is also a directory: keep every `Fresh` its own directory
@@ -366,7 +399,7 @@ pub(crate) async fn vouch_from_local(
         if let Some(fresh) = fresh
             && let Ok(Some(held)) = store::read(&ks, root)
             && held.version() == fresh.version
-            && let Err(e) = freshness.offer(&fresh, &held.signed.head)
+            && let Err(e) = freshness.offer(&fresh, &held.signed.head, now_unix())
         {
             tracing::debug!("this directory's own freshness: {e:#}");
         }

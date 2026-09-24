@@ -9,8 +9,7 @@
 //!   *public* signed credential, not a secret).
 //! - `issued.json`: the admin's ledger of the badges it minted, with their
 //!   labels (mode `0600`; [`super::ledger`]).
-//! - `policy.json`, `policy-checked.txt`: the admin-signed policy, and when
-//!   it was last checked with a directory ([`crate::policy::store`]);
+//! - `policy.json`: the admin-signed policy ([`crate::policy::store`]);
 //!   `directory.redb` on a directory node ([`crate::directory::db`]).
 //!
 //! The resolver helpers ([`node_identity`], [`membership`])

@@ -107,15 +107,52 @@ pub(crate) fn edit_in(ks: &Keystore, cmd: DirectoryCmd) -> Result<String> {
     ))
 }
 
-/// `wires directory add | rm`: the edit, then the publish.
+/// `wires directory add | rm`: the edit, then the publish; after an `add`,
+/// that node's next step ([`next_step`]).
 pub(crate) async fn edit_cmd(a: DirectoryArgs) -> Result<Report> {
     run_edit(|ks| {
+        let hint = match &a.cmd {
+            DirectoryCmd::Add(e) => Some(next_step(ks, &e.node)?),
+            _ => None,
+        };
         Ok(Report {
             stdout: edit_in(ks, a.cmd)?,
+            hint,
             ..Report::default()
         })
     })
     .await
+}
+
+/// What the node `text` (a label or node id) does next once listed as a
+/// directory: a running host follows the policy and runs the directory at
+/// its next `wires serve`; any other node needs an invite minted now (only
+/// one minted after it is listed carries the policy a directory starts
+/// from), whether or not it was invited before.
+pub(crate) fn next_step(ks: &Keystore, text: &str) -> Result<String> {
+    let ledger = Ledger::load(ks)?;
+    let (node, label) = resolve_member(&ledger, text)?;
+    let hosts = crate::policy::store::fabric(ks)?
+        .and_then(|root| crate::policy::store::read(ks, root).ok().flatten())
+        .is_some_and(|held| held.policy.is_host(node));
+    let who = label.clone().unwrap_or_else(|| node.hex());
+    Ok(if hosts {
+        format!(
+            "next: restart `wires serve` on {who} to run the directory (not serving yet? \
+             re-invite it, `wires invite {who}`, and `wires join` that token there)"
+        )
+    } else if ledger.contains(node) {
+        format!(
+            "next: re-invite it (`wires invite {who}`) and `wires join` that token there: \
+             only an invite minted now carries the policy; then `wires directory serve` there"
+        )
+    } else {
+        format!(
+            "next: `wires invite {} --name <label>`, `wires join` that token there, then \
+             `wires directory serve` there",
+            node.hex()
+        )
+    })
 }
 
 #[cfg(test)]

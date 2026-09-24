@@ -118,6 +118,9 @@ SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kin
   no directory has vouched for its policy recently, §4 *Freshness at the host*), `beat_secs`
   (default 300: how often a directory signs a `Fresh` and beats its subscriptions) and `fresh_secs`
   (default 900: how long a `Fresh` is good for). The admin sets them with `wires policy settings`.
+  `strict` needs at least one directory listed (nothing else could vouch, and every host would
+  refuse every call), so validation refuses `strict` with no directory, whichever edit would
+  make it so: `policy settings`, or `directory rm` or `remove` of the last directory.
 - **Versioning.** Every admin edit (`init`, `remove`, `service`, `role`, `issuer`, `directory
   add|rm`, and the rare `invite` below) is the stored policy changed, expired bans dropped,
   `version + 1`, `issued = now`, `not_after = max(now + --policy-ttl, the stored policy's
@@ -166,8 +169,12 @@ The admin commands and their flags are in [usage.md § Commands by role](usage.m
   stops trusting one, refused while a role's matcher names it. Which issuer invites name, and each
   public secret, stay in the admin's keystore (`login-client.json`, §9), not in the signed policy:
   every host holds the policy, and none needs them.
-- **`directory add <node>`** lists an invited, unbanned node in the head's `directories` (once);
-  **`directory rm <node>`** drops it.
+- **`directory add <node>`** lists an unbanned node in the head's `directories` (once), invited or
+  not yet: listed first, its invite then carries the policy it serves from (the command prints the
+  node's next step); **`directory rm <node>`** drops it.
+- An edit on an admin that holds no `policy.json` is refused, naming the way back: it would sign a
+  version 1 that every directory already holds newer. Copy `policy.json` from any host or directory
+  (it verifies under the root on the way in).
 - **`invite <node>` is not an edit.** It mints the node's badge, records it in the admin's
   ledger, `issued.json` (§9: node → label, latest `not_after`), and puts it in the node's token
   (below): the version doesn't move and nothing is published. Two cases do edit, and then
@@ -326,7 +333,10 @@ more is refused with `denied`.
   view it sent last, and a `fresh` beat in between. A subscriber that can't apply an update
   subscribes again and takes the whole view. The stream ends with `denied` when a head no longer
   admits the subscriber (badge and bans, as above) or stops listing this node. `wires mcp`, each
-  live gateway session and `wires inbox --wait` hold one.
+  live gateway session and `wires inbox --wait` hold one (`wires/caller/view.rs`): the first
+  frame within 10 s, then each within the held `Fresh`'s lifetime plus that again (at most 10 s)
+  of slack, or the stream is taken for dead; a `denied`, at once or ending the stream, moves it to
+  the next directory at once, and a round no directory served pauses from 1 s up to 30 s.
 
 **Replicas.** Each directory subscribes to every other directory its head lists, as `replica`,
 reconnecting after a failure with a pause growing from 1 s to 30 s. A `policy` frame is taken when
@@ -337,12 +347,21 @@ consensus: one author, and "newer" is a version number.
 **Publish (admin).** After every admin edit, and on `wires policy push`, the admin dials,
 concurrently, every directory the new head lists plus every directory the head before the edit
 listed (so a directory the edit drops learns it), never itself, and sends `publish`. It dials no
-host. A directory counts as delivered when it answers `published` with at least the offered
-version. Stderr says `policy version N: published to K of D directory(ies)`, naming any not
-reached. **When D > 0 and K = 0 the command exits 1** (after printing its result, e.g. the invite
-token): the new policy is stored on the admin and nowhere else. `wires policy push` re-publishes
-it. With no directory at all, the line says so and nothing fails; a new node gets the policy in its
-invite token.
+host. A directory counts as delivered when it answers `published` with the offered version and
+then shows the offered head when asked (`head`). Stderr says `policy version N: published to K of
+D directory(ies)`, naming any not reached. **When D > 0 and K = 0 the command exits 1** (after
+printing its result, e.g. the invite token): the new policy is stored on the admin and nowhere
+else. `wires policy push` re-publishes it. With no directory at all, the line says so and nothing
+fails; a new node gets the policy in its invite token. Two exceptions:
+
+- **The first run.** Until a directory the publish aims at has taken one from this admin
+  (`reached.json`, §9), reaching none is a note that no directory is running yet, and exits 0. So
+  starting a network (`init`, `directory add`, edits, the directory's invite, `directory serve`)
+  errors nowhere; from the first publish a directory takes, reaching none exits 1 as above.
+- **A stale copy.** A directory answering a newer version, or showing another head at the offered
+  one, kept its own: this admin's `policy.json` is behind and the edit changed nothing there. The
+  command exits 1 whatever the other directories did, saying to copy `policy.json` from any host
+  or directory and make the edit again.
 
 **Following (hosts).** A running host subscribes as `policy` (`wires/host/follow.rs`) to the
 first directory its held head lists that answers, never itself, trying the one it last followed
@@ -359,16 +378,19 @@ reconnect, so a directory the admin adds is followed without a restart. It takes
 
 Any frame it can't take (an update that doesn't apply, a policy that doesn't verify) makes it
 subscribe again at once with `have: 0` and take the whole policy; a second failure in a row moves
-it to the next directory. When the stream ends (the directory stopped, was unlisted, or sent
-nothing for two beats plus 10 s) it reconnects, pausing from 1 s up to the beat (at most 30 s)
-while none answers. The subscription never holds up serving: a host restarted with `policy.json`
+it to the next directory, where the next round starts too. So does a `denied`, at once or ending
+the stream (not admitted, no longer a host, the directory no longer one, or busy): the next
+directory is tried at once. When the stream ends (the directory stopped, or sent nothing for two
+beats plus 10 s) it reconnects, pausing from 1 s up to the beat (at most 30 s) while none answers,
+so a host every directory refuses asks each at most once per pause. The subscription never holds up serving: a host restarted with `policy.json`
 decides from it before any directory answers. A host that is itself a directory keeps the `Fresh`
 its own directory signs (its replica loop keeps its copy in step with the others). A host that the
 policy newly lists as a directory runs the directory mode only after a restart (it traces so).
 
 **Freshness at the host.** The host keeps the newest `Fresh` that vouches for its held head (by
-version, then `until`) in memory and in `fresh.json` (0600), read back at start if it still
-vouches for the head on disk. Before each call's registry check the gate asks whether a **current**
+version, then a current one over one that isn't current, then `until`: one from a directory
+whose clock runs ahead never displaces a current one) in memory and in `fresh.json` (0600), read
+back at start if it still vouches for the head on disk. Before each call's registry check the gate asks whether a **current**
 `Fresh` (`Fresh::is_current(now)`) names the exact head it decides under, and
 `settings.freshness` decides when none does:
 
@@ -394,8 +416,8 @@ itself, for `policy {have}`, and stops at the first answer that settles it:
 - `current {fresh}` counts only when the `Fresh` verifies against the **held** head and is current
   (`at` at most 60 s ahead, `now <= until`): this node is up to date.
 
-Only those two mark the copy checked (`policy-checked.txt`). A refusal, a `Fresh` from a key the
-head doesn't list, a lapsed one, or an older policy doesn't. So a lying directory can only fail to
+Only those two settle it. A refusal, a `Fresh` from a key the head doesn't list, a lapsed one, or
+an older policy doesn't, and the next directory is asked. So a lying directory can only fail to
 help.
 
 A `serve` whose preflight fails (a host assigned a service while it was offline) fetches from a
@@ -723,10 +745,10 @@ Nothing is broadcast: a record's content leaves a host only when a reader asks f
 | File | Mode | Holder | Content |
 |---|---|---|---|
 | `root.seed`, `node.seed` | 0600 | admin / every node | hex Ed25519 seed |
+| `reached.json` | 0600 | admin | the directories that have taken a publish from this admin: until one a publish aims at has, reaching none is the first run, not a failure (§4) |
 | `issued.json` | 0600 | admin | the ledger of badges it minted: node → label (for `remove` and `service --host`), latest `not_after` (how long a ban must last); never sent |
 | `membership.json` | 0644 | every node | its badge (membership token) |
 | `policy.json` (+ `.lock`) | 0600 | admin, host, directory | the newest verified signed policy (§3); **a caller holds none** |
-| `policy-checked.txt` | 0600 | host, directory | when a directory last vouched for the copy (§4), or the invite brought it; written, not read |
 | `view.json` | 0600 | caller (any node that calls) | its view: the head, the root-signed entries it may call or read, the newest `Fresh`, when a directory last vouched, the newest head a host reported (§4 *Views*) |
 | `directories.json` | 0600 | every joined node | the invite's directory ids: where to ask before a head names them |
 | `login.json` | 0600 | every joined node | the invite's login settings: issuer, client id, public client secret (`wires login`'s defaults) |
