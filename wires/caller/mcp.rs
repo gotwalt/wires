@@ -1494,6 +1494,56 @@ mod tests {
         assert_eq!(config.tools[2].description, "Read-only SQL");
     }
 
+    /// A service this caller may only read is not offered, and naming it
+    /// anyway (as a tool, or through `call_service`) is refused here: the
+    /// caller is never invoked, so no host is dialed. The gateway serves
+    /// the same tools ([`with_services`]).
+    #[test]
+    fn a_read_only_service_is_not_offered_or_called() {
+        let listed = with_services(
+            ToolsConfig::default(),
+            &view_of(&[("orders-db", "SQL")], &["audit-log"]),
+        );
+        let mut s = McpServer::new(listed, FakeCaller::default());
+        let out = transcript(
+            &mut s,
+            &[
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+                call(2, "audit-log", json!({})),
+            ],
+        );
+        let names: Vec<&str> = out[0]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["orders-db"]);
+        let refused = out[1]["error"]["message"].as_str().unwrap();
+        assert!(refused.contains("audit-log"), "{refused}");
+        assert!(s.caller.calls.lock().unwrap().is_empty());
+
+        // Past the threshold, `call_service` refuses it the same way.
+        let many: Vec<(String, String)> = (0..=SEARCH_THRESHOLD)
+            .map(|i| (format!("svc-{i:02}"), "d".to_string()))
+            .collect();
+        let pairs: Vec<(&str, &str)> = many.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
+        let mut s = McpServer::new(
+            with_services(ToolsConfig::default(), &view_of(&pairs, &["audit-log"])),
+            FakeCaller::default(),
+        );
+        let out = transcript(
+            &mut s,
+            &[call(1, CALL_TOOL, json!({"service": "audit-log"}))],
+        );
+        let refused = out[0]["error"]["message"].as_str().unwrap();
+        assert!(
+            refused.contains("no service named `audit-log` that you may call"),
+            "{refused}"
+        );
+        assert!(s.caller.calls.lock().unwrap().is_empty());
+    }
+
     /// Card 37: past [`SEARCH_THRESHOLD`] services, `tools/list` offers
     /// `search_services` and `call_service`; the search finds a service by
     /// name or description, and `call_service` runs it by name.

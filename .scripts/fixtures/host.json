@@ -7,7 +7,8 @@
   },
   "services": {
     "orders-db": {
-      "command": ["sqlite3", "-safe", "-readonly", "-header", "-column", "orders.db"]
+      "command": ["sqlite3", "-safe", "-readonly", "-header", "-column", "orders.db"],
+      "also_require": ["oncall"]
     }
   },
   "push": { "allow": ["analyst"] }

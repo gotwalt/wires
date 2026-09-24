@@ -108,16 +108,15 @@ admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1
 admin invite "$WB_ID" --name workbench >/dev/null 2>&1
 # The workbench is also the network's one directory (card 37: callers ask
 # one for their view). It isn't up yet, so each edit is stored here and
-# reaches no directory; the workbench's token carries the policy.
-admin directory add workbench >/dev/null 2>"$D/dir.err" ||
-	grep -qF "reached none of its" "$D/dir.err" || {
+# notes that no directory is running yet; the workbench's token carries the
+# policy.
+admin directory add workbench >/dev/null 2>"$D/dir.err" || {
 	cat "$D/dir.err" >&2
 	bad "setup: wires directory add workbench failed"
 }
 for svc in deploy status logs; do
 	admin service add "$svc" --allow analyst --host workbench \
-		--description "$svc a CI build: \`$svc -- build <n>\`" >/dev/null 2>"$D/svc.err" ||
-		grep -qF "reached none of its" "$D/svc.err" || {
+		--description "$svc a CI build: \`$svc -- build <n>\`" >/dev/null 2>"$D/svc.err" || {
 		cat "$D/svc.err" >&2
 		bad "setup: wires service add $svc failed"
 	}

@@ -35,9 +35,10 @@ Nothing is broadcast: a node that takes part in no call receives no traffic abou
 
 ## Walkthrough
 
-Five `WIRES_HOME` directories stand in for five machines: **admin**,
+Six `WIRES_HOME` directories stand in for six machines: **admin**,
 **workbench** and **spare** (hosts), **agent** (alice@example.com, the
-caller) and **observer** (sec@audit.example, a reader). Build with `cargo
+caller), **observer** (sec@audit.example, a reader) and **bob**
+(bob@example.com, an analyst the hosts' own rule leaves out). Build with `cargo
 build --release -p wires` (or `docker build .`) and put `target/release/wires`
 on each machine's `PATH`. The output below is from `./.scripts/demo-remote-cli.sh`,
 which runs this sequence on loopback with a stand-in IdP (`wires
@@ -61,6 +62,8 @@ admin$ wires role set analyst '*@example.com'          # issuer: Google unless -
 role analyst set (policy version 2)
 admin$ wires role set security sec@audit.example
 role security set (policy version 3)
+admin$ wires role set oncall alice@example.com        # the hosts' own rule (step 3) names it
+role oncall set (policy version 4)
 ```
 
 **2. Hosts join, become the directories, and the admin registers the
@@ -74,16 +77,16 @@ directories.
 workbench$ wires id
 3ef72b11…
 admin$ wires invite 3ef72b11… --name workbench        # likewise the spare
-wires: invited 3ef72b11… as "workbench" (badge until 1792702980; policy version 3 unchanged)
+wires: invited 3ef72b11… as "workbench" (badge until 1792702980; policy version 4 unchanged)
 wires: on the joining machine: wires join eyJhZG1pbiI6…
 admin$ wires directory add workbench                  # likewise the spare
-wires: policy version 4: no directory is running yet (none has taken a publish from this admin); start one with `wires directory serve` on its node: an invite minted from now on carries this policy
+wires: policy version 5: no directory is running yet (none has taken a publish from this admin); start one with `wires directory serve` on its node: an invite minted from now on carries this policy
 wires: next: re-invite it (`wires invite workbench`) and `wires join` that token there: only an invite minted now carries the policy; then `wires directory serve` there
-directory 3ef72b11… (workbench) added (policy version 4; 1 directory(ies))
+directory 3ef72b11… (workbench) added (policy version 5; 1 directory(ies))
 admin$ wires service add orders-db --description "Read-only SQL (sqlite3) over the orders database; …" \
          --allow analyst --reader security --host workbench --host spare
-wires: policy version 6: no directory is running yet (…)
-service orders-db added (policy version 6)
+wires: policy version 7: no directory is running yet (…)
+service orders-db added (policy version 7)
 admin$ wires invite 3ef72b11… --name workbench        # again: this token carries the policy
 workbench$ wires join eyJhZG1pbiI6…
 ```
@@ -105,14 +108,19 @@ and nothing in it names another node.
 command is an argv, exec'd directly and never through a shell, with the
 caller's arguments appended; sqlite3's `-safe` turns off `.shell`. The
 optional `identity` section narrows the IdPs the policy trusts; it can't add
-one.
+one. A host can also narrow who may call a service here: `also_require` names
+roles from the policy that a caller must be in as well. These hosts serve
+orders-db only to analysts who are also in `oncall`.
 
 ```json
 {
   "version": 2,
   "identity": { "issuers": [ { "issuer": "https://accounts.google.com" } ] },
   "services": {
-    "orders-db": { "command": ["sqlite3", "-safe", "-readonly", "-header", "-column", "orders.db"] }
+    "orders-db": {
+      "command": ["sqlite3", "-safe", "-readonly", "-header", "-column", "orders.db"],
+      "also_require": ["oncall"]
+    }
   },
   "push": { "allow": ["analyst"] }
 }
@@ -126,6 +134,7 @@ trusted issuers: the signed policy's, narrowed to
 services (who may call each is in the admin-signed policy):
   orders-db
     command: sqlite3 -safe -readonly -header -column orders.db
+    also requires: oncall
 push: to roles analyst
 workbench$ wires serve host.json
 ```
@@ -135,16 +144,16 @@ to it. Because the policy lists each host as a directory, `serve` runs the
 directory on the same endpoint too. A node that hosts nothing runs one with
 `wires directory serve`.
 
-**4. The agent and the observer join.** An invite mints a badge and edits
+**4. The agent, the observer and bob join.** An invite mints a badge and edits
 nothing, so the hosts need no new policy: they admit any badge the root
 signed. A caller's token is its badge, the ids of up to two directories and
 the IdP to sign in with: under 1 KB, at any network size. It holds no policy.
 
 ```console
 admin$ wires invite dd7e7237… --name agent
-wires: invited dd7e7237… as "agent" (badge until 1792703101; policy version 6 unchanged)
+wires: invited dd7e7237… as "agent" (badge until 1792703101; policy version 7 unchanged)
 agent$ wires join eyJhZG1pbiI6…
-joined network 57b09428… as dd7e7237… (policy version 6)
+joined network 57b09428… as dd7e7237… (policy version 7)
 next: `wires login` to sign in, then `wires services`
 ```
 
@@ -165,7 +174,7 @@ agent$ echo $?
 1
 agent$ wires login
 wires login: node dd7e7237… is alice@example.com (token stored in …/idp-token.jwt, valid until unix …)
-wires login: 1 service(s) you may call (policy version 6); see `wires services`
+wires login: 1 service(s) you may call (policy version 7); see `wires services`
 agent$ wires services
 orders-db  Read-only SQL (sqlite3) over the orders database; pass the SQL statement as the argument.  (analyst)
 agent$ wires services orders          # search names and descriptions
@@ -178,16 +187,31 @@ count(*)
 
 `wires login` needed no flags: the invite named the IdP and its client. A
 signed-in node in no allowed role sees nothing it may call. The observer may
-read orders-db's records, so the service is in its view (marked `read`), and
-naming it in a call reaches the host, which refuses it with the reason:
+read orders-db's records, so the service is in its view, but marked `read`
+only: naming it in a call stops on the observer's machine, like a name the
+view lacks (exit 1, no host dialed):
 
 ```console
 observer$ wires services
 wires is a network for authenticated remote CLI calls. …
 
-wires services: no service allows you (policy version 6); ask your admin for a role that may call one
+wires services: no service allows you (policy version 7); ask your admin for a role that may call one
 observer$ wires call orders-db -- "select 1"
-wires: denied by host: sec@audit.example is in no role allowed to call orders-db (analyst); don't retry: ask your admin for access
+wires: no service named `orders-db` that you may call; see `wires services`
+observer$ echo $?
+1
+```
+
+Bob is an analyst, so the policy admits him and his view lists orders-db. The
+hosts' own rule also requires `oncall`, which he isn't in, so the host
+refuses the call: exit 77, nothing on stdout, and the refusal is in the
+host's log:
+
+```console
+bob$ wires call orders-db -- "select 1"
+wires: denied by host: bob@example.com is not admitted to orders-db by this host's own rules; don't retry: ask your admin for access
+bob$ echo $?
+77
 ```
 
 `--jq`, `--head` and `--max-bytes` are applied inside `wires call`; the host
@@ -199,7 +223,7 @@ own logs, with no key to either end:
 
 ```console
 observer$ wires watch orders-db --once
-21:13:09 orders-db ✗ f6d6… orders-db denied: sec@audit.example is in no role allowed to call orders-db (analyst)
+21:13:09 orders-db ✗ 5c1e… orders-db denied: bob@example.com is not admitted to orders-db by this host's own rules
 21:13:09 orders-db ▶ 8bd5 alice@example.com (dd7e…) [analyst] orders-db "select count(*) from orders"
 21:13:09 orders-db ■ 8bd5 exit 0 · 3 ms · 27 B out · blake3 8b4c…
 21:13:11 orders-db ▶ 3b25 alice@example.com (dd7e…) [analyst] orders-db
@@ -208,7 +232,8 @@ observer$ wires watch orders-db --once
 21:13:15 orders-db ■ 442f exit 1 · 4 ms · 0 B out · blake3 af13…
 ```
 
-The agent's own `wires watch` shows its calls and not the observer's refusal.
+No line is the observer's: its call never reached a host. The agent's own
+`wires watch` shows its calls and not bob's refusal.
 "Its own" means its person's: the records whose verified identity (issuer and
 subject) is the one the agent's ID token proves, from any node. That is the
 isolation boundary: agents acting for different people can't see each
@@ -224,8 +249,8 @@ callers don't normally care). Then:
 
 ```console
 admin$ wires remove agent
-wires: policy version 7: published to 2 of 2 directory(ies)
-removed dd7e7237… (agent) (banned until 1792703101; policy version 7, 1 ban(s))
+wires: policy version 8: published to 2 of 2 directory(ies)
+removed dd7e7237… (agent) (banned until 1792703101; policy version 8, 1 ban(s))
 agent$ wires call orders-db -- "select count(*) from orders"
 wires: denied by host: not a member of this network; don't retry: ask your admin for access
 agent$ echo $?
@@ -596,7 +621,7 @@ the key errors are snapshot-tested (`wires/snapshots/`).
 | | `wires join <token>` | Install an invite: the badge (membership), the directory ids and the login settings (and, for a host or directory, the signed policy); a caller then asks a directory for the head. |
 | | `wires login [--no-browser] [--callback-port N] [--refresh\|--reuse]` | Sign in with the IdP your invite named (the hidden flags `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*` override it), store the key-bound ID token, and fetch your view: the services you may use. |
 | | `wires services [query] [--verbose] [--json]` | List the services in your view you may call, one per line: `<name>  <description>  (<roles that may call>)`; a `query` keeps those whose name or description contains it. Nothing on stdout when there are none: stderr says why and what to do (with the premise, when the view is empty). `--json` prints one object per line, in a stable shape: `{"service","description","allow":[…],"call","read","hosts":<count>}`, plus `host_ids` with `--verbose`. Refreshes the view first when it is over a day old or a call saw a newer policy. `--verbose` adds the hosts. |
-| | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name, from your view (a name it lacks is asked of a directory; or a `tools.json` alias, which a service in your view of the same name beats). Stdio passes through and its exit code becomes `call`'s, except that a remote exit `77` is reported as `1` (with a note on stderr). A refusal by the host exits `77`, with nothing on stdout; a service you may not use, a local or transport failure, an expired view, or a newer policy head (in the host's handshake) whose entry no longer lists that host exits `1`, before any stdin is sent; a usage error (a `--jq` filter that doesn't compile, a flag locked mode refuses) exits `2`. `--verbose` names the host that answered and prints every cause of an error. On an unchanged network the call is its only connection. |
+| | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name, from your view (a name it lacks is asked of a directory; or a `tools.json` alias, which a service in your view of the same name beats). Stdio passes through and its exit code becomes `call`'s, except that a remote exit `77` is reported as `1` (with a note on stderr). A refusal by the host exits `77`, with nothing on stdout; a service you may not call (not in your view, or only readable there), a local or transport failure, an expired view, or a newer policy head (in the host's handshake) whose entry no longer lists that host exits `1`, before any stdin is sent; a usage error (a `--jq` filter that doesn't compile, a flag locked mode refuses) exits `2`. `--verbose` names the host that answered and prints every cause of an error. On an unchanged network the call is its only connection. |
 | | `wires mcp` | Serve the same services as MCP tools over stdio (Claude Desktop, IDEs), following your view: a grant or revocation reaches the client as `tools/list_changed` within seconds. Each tool is a service, named as `wires services` lists it, and described by the first sentence of its registry description; the `instructions` are the premise plus how to pass arguments and filter output. Past 40 services it offers `search_services` and `call_service` instead of one tool each, whose descriptions state the refusal rule. A refusal is a tool error reading `denied by host: <reason>` and its next step. |
 | | `wires gateway --public-url https://… [--listen addr] [--client-id …] [--client-secret-file F] [--issuer URL]` | Serve them as a remote MCP server (Streamable HTTP + OAuth 2.1) for web clients such as Claude.ai. Each user signs in with Google through the gateway and calls with their own token, from their own view (one subscription per live session) ([deployment](deployment.md#a-web-gateway)). |
 | | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`. |
@@ -640,7 +665,8 @@ For a stdio MCP client, the whole config is:
 
 Who may call a service is not in this file: it is the registry's `allow`. An
 admitted caller's refusal names the rule that failed (`… is in no role allowed to call
-orders-db (analyst)`, `service orders-db is not assigned to this host …`); a
+orders-db (analyst)`, `service orders-db is not assigned to this host …`, `… is not
+admitted to orders-db by this host's own rules` for `also_require`); a
 key without a valid badge, or a banned one, hears only `not a member of this network`.
 
 A service's environment starts empty: only `PATH`, `LANG` and `LC_*` are

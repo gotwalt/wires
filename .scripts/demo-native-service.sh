@@ -163,14 +163,12 @@ admin invite "$HOST_ID" --name nativehost >/dev/null 2>&1
 # The host is also the network's directory (card 37: callers ask one for
 # their view). It isn't up yet, so the edits reach no directory, and a fresh
 # token carries the policy to the host.
-admin directory add nativehost >/dev/null 2>"$D/dir.err" ||
-	grep -qF "reached none of its" "$D/dir.err" || {
+admin directory add nativehost >/dev/null 2>"$D/dir.err" || {
 	dump "$D/dir.err"
 	bad "wires directory add failed"
 }
 admin service add kv --description "A key-value store, one namespace per person ($LANG_NAME)." \
-	--allow analyst --host nativehost >"$D/svc.out" 2>"$D/svc.err" ||
-	grep -qF "reached none of its" "$D/svc.err" || {
+	--allow analyst --host nativehost >"$D/svc.out" 2>"$D/svc.err" || {
 	dump "$D/svc.err"
 	bad "wires service add failed"
 }

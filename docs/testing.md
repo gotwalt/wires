@@ -55,7 +55,8 @@ processes: two hosts implementing one service from
 `.scripts/fixtures/host.json`, both also the network's directories, a caller
 that logs in (a bare `wires login`, against the hermetic `dev-mock-idp`) and
 runs `wires services` / `wires call` / `wires mcp` /
-`wires inbox`, a reader on `wires watch`, failover and removal, all on
+`wires inbox`, a read-only caller stopped on its own machine, an analyst the
+hosts' `also_require` refuses, a reader on `wires watch`, failover and removal, all on
 loopback in a fresh `mktemp -d`, every step asserted.
 `.scripts/demo-push.sh --quiet` does the same for push, and
 `.scripts/demo-native-service.sh --lang python|node` (`make demo-python`,
