@@ -1154,8 +1154,6 @@ mod tests {
         use library::{Grant, RoleName, Service, ServiceName, State};
         let node = |b: u8| NodeIdentity::from_seed([b; 32]).node_id();
         let mut state = State::new(node(1));
-        state.members.insert(node(4));
-        state.hosts.insert(node(4));
         for (name, desc) in [("orders-db", "Read-only SQL"), ("db_query", "shadowed")] {
             state.services.insert(
                 ServiceName::new(name).unwrap(),

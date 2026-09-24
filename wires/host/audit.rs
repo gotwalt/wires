@@ -10,11 +10,11 @@
 //! [`Tap`]s it hands out count (and, for stdout, BLAKE3-hash) what the child
 //! writes, the [`StdinTap`] hashes, counts and quotes the head of what the
 //! caller sent on stdin, and `finish` logs [`Finished`](AuditRecord::Finished)
-//! before the caller hears the exit code. A member's refusal logs a lone
+//! before the caller hears the exit code. An admitted caller's refusal logs a lone
 //! [`Denied`](AuditRecord::Denied) via [`denied`] carrying the exact reason
 //! the caller was sent. The caller is always the iroh-authenticated peer,
-//! never a handshake claim. A peer that is not a member is traced, never
-//! logged (see [`transport`]).
+//! never a handshake claim. A peer that is not admitted (no valid badge, or
+//! banned) is traced, never logged (see [`transport`]).
 //!
 //! # When the log can't take a record
 //!

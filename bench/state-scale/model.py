@@ -6,9 +6,9 @@ Three designs:
   today   every node holds the whole signed state (members, hosts, roles,
           services); the admin pushes it to every host after each edit, and a
           caller pulls it whenever its copy is 10 min stale and has changed.
-  badges  card 29's first step: members leave the state (a node is admitted
-          by its root-signed badge; removal is a ban until the badge expires),
-          so an invite is no edit. Distribution is unchanged.
+  badges  card 35 (built): members and the host list leave the state (a node
+          is admitted by its root-signed badge; removal is a ban until the
+          badge expires), so an invite is no edit. Distribution is unchanged.
   apex    badges, plus a persistent directory (apex): hosts hold a long poll
           to it and get only their own services' entries, bans and a
           freshness timestamp; callers fetch their own view from it. Nothing
@@ -16,7 +16,9 @@ Three designs:
 
 Byte sizes are measured from real signed states
 (`cargo run -q --release -p library --example state_sizes`; pass --measure
-to re-measure). Rates are assumptions, all in ASSUMPTIONS below.
+to re-measure). `member` and `host` are format-1 sizes, frozen: the state has
+had neither since card 35, so --measure keeps them for the *today* rows.
+Rates are assumptions, all in ASSUMPTIONS below.
 
   python3 bench/state-scale/model.py                 # group roles
   python3 bench/state-scale/model.py --email-roles   # Google: roles are email lists
@@ -31,11 +33,13 @@ import math
 import subprocess
 from dataclasses import dataclass
 
-# Measured at 655a96c by the state_sizes example (bytes of serialized JSON).
+# Measured by the state_sizes example (bytes of serialized JSON): `member` and
+# `host` at 655a96c (format 1), the rest at card 35 (format 2).
 SIZES = {
     "base": 578,  # a signed state with 3 roles and nothing else
-    "member": 67,  # one node id in `members`
-    "host": 134,  # a host node: in `members` and in `hosts`
+    "member": 67,  # format 1: one node id in `members`
+    "host": 134,  # format 1: a host node, in `members` and in `hosts`
+    "ban": 78,  # one entry in `bans`: node id → until
     "service": 318,  # 80-char description, 2 hosts, 2 allow roles, 1 reader role
     "role": 73,  # a role with one group matcher
     "email_matcher": 75,  # each further `email=` matcher in a role
@@ -123,9 +127,10 @@ def model(tier, s, a, email_roles):
     today["invite"] = (s["membership"] + today["held_caller"]) * 4 / 3
 
     removals = node_edits / 2
-    bans = removals * a["badge_days"] * (s["member"] + 10)
+    bans = removals * a["badge_days"] * s["ban"]
+    # A host is only its entries in services' `hosts` (inside s["service"]).
     badges = syndicated(
-        s["base"] + hosts * s["host"] + services * s["service"] + role_bytes + bans,
+        s["base"] + services * s["service"] + role_bytes + bans,
         removals + service_edits,
     )
     badges["invite"] = (s["membership"] + badges["held_caller"]) * 4 / 3
@@ -136,7 +141,7 @@ def model(tier, s, a, email_roles):
     host_in = (
         a["heartbeats"] * a["timestamp"]
         + service_edits * a["replicas"] / hosts * entry
-        + removals * (s["member"] + small)
+        + removals * (s["ban"] + small)
     )
     view_changes = service_edits * visible / services
     caller_in = min(view_changes, a["view_checks"]) * (s["base"] + visible * entry) + a[
@@ -200,7 +205,8 @@ def measure() -> dict:
         capture_output=True,
         text=True,
     ).stdout
-    return {k: round(v) for k, v in json.loads(out).items()}
+    measured = {k: round(v) for k, v in json.loads(out).items()}
+    return {**SIZES, **measured}
 
 
 def main() -> None:

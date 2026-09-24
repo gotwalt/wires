@@ -517,8 +517,6 @@ mod tests {
         );
         let mut state = State::new(root.node_id());
         state.version = StateVersion(1);
-        state.members.extend([me, other]);
-        state.hosts.extend([me, other]);
         state.services.insert(
             ServiceName::new("orders-db").unwrap(),
             Service {

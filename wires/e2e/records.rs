@@ -80,13 +80,11 @@ impl World {
         self.state_v(1, |_| {})
     }
 
-    /// The state at `version`, changed by `edit` before it is signed.
+    /// The state at `version`, changed by `edit` before it is signed. It
+    /// bans [`banned`].
     fn state_v(&self, version: u64, edit: impl FnOnce(&mut State)) -> SignedState {
         signed_state(&self.root, version, |s| {
-            for n in [&self.host, &self.alice, &self.alice2, &self.bob, &self.sam] {
-                s.members.insert(n.node_id());
-            }
-            s.hosts.insert(self.host.node_id());
+            s.ban(banned().node_id(), i64::MAX);
             s.roles.insert(
                 role("analyst"),
                 vec![email_at(&self.idp_alice, "alice@example.com")],
@@ -222,6 +220,11 @@ impl Host {
 }
 
 /// `who` calls `name args` on the host ([`super::call`]); whether it ran.
+/// A node every [`World`] state bans (its badge is genuine).
+fn banned() -> NodeIdentity {
+    NodeIdentity::from_seed([66u8; 32])
+}
+
 async fn call(w: &World, who: &NodeIdentity, host: &Host, name: &str, args: &[&str]) -> bool {
     matches!(
         super::call(who, &host.addr, w.hello(who), name, args).await,
@@ -320,8 +323,8 @@ async fn readers_see_all_callers_see_their_own_members_see_nothing() {
     let (_, lines) = watch_once(&w, &w.bob, &bob2, &host, &["status"], false).await;
     assert!(records(&lines).is_empty(), "{lines:#?}");
 
-    // A stranger is refused outright.
-    let stranger = NodeIdentity::from_seed([66u8; 32]);
+    // A banned node (its badge is genuine) is refused outright.
+    let stranger = banned();
     let ks = w.reader(&stranger);
     let (report, lines) = watch_once(&w, &stranger, &ks, &host, &[], false).await;
     assert_eq!(report.refused.len(), 1, "{lines:#?}");
@@ -589,8 +592,8 @@ async fn a_reader_with_no_token_sees_nothing_in_full() {
     assert!(records(&lines).is_empty(), "{lines:#?}");
 }
 
-/// A following reader removed from the network is refused mid-stream and
-/// gets nothing logged after the removal.
+/// A following reader removed from the network (banned) is refused
+/// mid-stream and gets nothing logged after the removal.
 #[tokio::test]
 async fn a_removed_reader_stops_mid_stream() {
     let w = World::new().await;
@@ -603,7 +606,7 @@ async fn a_removed_reader_stops_mid_stream() {
     host.adopt(
         &w,
         &w.state_v(2, |s| {
-            s.members.remove(&sam);
+            s.ban(sam, i64::MAX);
         }),
     );
     assert!(call(&w, &w.alice, &host, "orders-db", &["after"]).await);

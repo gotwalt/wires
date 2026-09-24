@@ -5,8 +5,8 @@
 //! The source tree is grouped by concern, three folders beside the crate-wide
 //! [`error`] (and the private canonical-JSON `codec`):
 //!
-//! - `membership/` — who is in: identities, memberships, the accept gate,
-//!   and the invite token.
+//! - `membership/` — who is in: identities, memberships (badges), the
+//!   accept gate, and the invite token.
 //! - `calls/` — remote CLI calls: the session frames, invocations, audit
 //!   records and the host's call log, pushes, and IdP identity.
 //! - `services/` — the admin-signed state: roles, the service registry, the
@@ -23,7 +23,8 @@
 //!   byte-newtypes, and the [`AlgorithmId`] every signed object carries.
 //! - [`membership`] — root-signed, offline-verifiable [`Membership`] proof that a
 //!   node belongs to a fabric.
-//! - [`policy`] — [`check_inclusion`], the host's credential gate.
+//! - [`policy`] — [`check_inclusion`] and [`check_admitted`]: a node is
+//!   admitted by its badge and not being banned.
 //! - [`invite`] — the [`Invite`] token `wires join` installs.
 //! - [`session`] — the [`Frame`] wire codec, opened by a [`Hello`] (the async
 //!   transport is in `wires`).
@@ -39,7 +40,8 @@
 //!   and [`verify_claim`], which a host runs against the issuer's [`Jwks`].
 //! - [`role`] — [`RoleName`], [`Matcher`], [`EmailPattern`]: role definitions.
 //! - [`registry`] — [`ServiceName`] and the registry entry [`Service`].
-//! - [`state`] — the admin-signed, versioned [`State`] / [`SignedState`].
+//! - [`state`] — the admin-signed, versioned [`State`] / [`SignedState`]:
+//!   roles, services and their hosts, bans.
 //! - [`access`] — [`authorize`] and [`allowed_services`] over that state.
 //! - [`sync`] — the [`StateFrame`] push/pull protocol on [`STATE_ALPN`].
 //! - [`item`] — the policy's leaves: [`Item`] (role, service, ban, issuer,
@@ -62,22 +64,21 @@
 //! ```
 //! use library::{
 //!     Matcher, Membership, NodeIdentity, Principal, RoleName, Service, ServiceName, State,
-//!     StateVersion, authorize, check_inclusion,
+//!     StateVersion, authorize, check_admitted,
 //! };
 //!
 //! let root = NodeIdentity::from_seed([1u8; 32]);
 //! let host = NodeIdentity::from_seed([2u8; 32]);
 //! let alice = NodeIdentity::from_seed([3u8; 32]);
 //!
-//! // The admin signs who is in, which members host, the roles, and the
-//! // service registry — one versioned document.
+//! // The admin signs the roles, the service registry (which hosts run each)
+//! // and the bans — one versioned document. It lists no members: a node is
+//! // admitted by its badge.
 //! let analyst = RoleName::new("analyst").unwrap();
 //! let orders = ServiceName::new("orders-db").unwrap();
 //! let mut s = State::new(root.node_id());
 //! s.version = StateVersion(1);
 //! s.not_after = i64::MAX;
-//! s.members.extend([host.node_id(), alice.node_id()]);
-//! s.hosts.insert(host.node_id());
 //! s.roles.insert(
 //!     analyst.clone(),
 //!     vec![Matcher {
@@ -96,11 +97,11 @@
 //! );
 //! let signed = s.sign(&root).unwrap();
 //!
-//! // A host checks the caller's membership credential (bound to the key iroh
-//! // authenticated), then the registry, against its verified copy.
+//! // A host checks the caller's badge (bound to the key iroh authenticated)
+//! // and the bans, then the registry, against its verified copy.
 //! signed.verify(root.node_id()).unwrap();
-//! let membership = Membership::mint(&root, alice.node_id(), 0, i64::MAX).unwrap();
-//! check_inclusion(&membership, root.node_id(), alice.node_id(), 0).unwrap();
+//! let badge = Membership::mint(&root, alice.node_id(), 0, i64::MAX).unwrap();
+//! check_admitted(&badge, root.node_id(), &signed.state, alice.node_id(), 0).unwrap();
 //! let who = Principal {
 //!     issuer: "https://accounts.google.com".into(),
 //!     subject: "alice".into(),
@@ -203,7 +204,7 @@ pub use item::{
 pub use membership::{MEMBERSHIP_V1, Membership};
 pub use merkle::{InclusionProof, ItemHash, ItemTree, ItemsRoot, MAX_PROOF_DEPTH, ProofPath};
 pub use parts::{ProvedItem, Slice, View, ViewEntry};
-pub use policy::check_inclusion;
+pub use policy::{check_admitted, check_inclusion};
 pub use push::{
     INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_FRAME, MAX_INBOX_HELLO, MAX_PUSH_BODY,
     MAX_SUBJECT, PushBody, PushId, PushMessage, Subject,
@@ -212,5 +213,5 @@ pub use registry::{MAX_SERVICE_NAME, Service, ServiceName};
 pub use role::{EmailPattern, MAX_ROLE_NAME, Matcher, RoleName};
 pub use session::{Chunk, Frame, Hello, HelloAck};
 pub use signed_policy::{Policy, SignedPolicy};
-pub use state::{STATE_CONTEXT, STATE_V1, SignedState, State, StateVersion};
+pub use state::{STATE_CONTEXT, STATE_V2, SignedState, State, StateVersion};
 pub use sync::{MAX_SMALL_STATE_FRAME, MAX_STATE_FRAME, OFFER_BODY_PREFIX, STATE_ALPN, StateFrame};

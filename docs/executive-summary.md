@@ -21,7 +21,7 @@ Three things organizations are now asking for sit in that gap:
 
 There are four roles, each with a few commands:
 
-- **Admin** (`init`, `invite`, `remove`, `role`, `service`, `state push`): signs one versioned document that says who's in, which roles exist (matched on IdP identity), which services exist, which hosts run each one, and who may call and read each. It is pushed to the hosts by key; other machines pull it from a host.
+- **Admin** (`init`, `invite`, `remove`, `role`, `service`, `state push`): mints each machine's badge (what admits it) and signs one versioned document that says which roles exist (matched on IdP identity), which services exist, which hosts run each one, who may call and read each, and which machines are banned. It is pushed to the hosts by key; other machines pull it from a host.
 - **Host** (`wires serve host.json`): implements the services assigned to it. One file says how each runs, which identity providers it trusts, and any stricter local rule; it checks every call against the signed list.
 - **Caller** (`id`, `join`, `login`, `services`, `call`, `mcp`, `gateway`, `inbox`): the agent, or the MCP client it runs in. `wires login` binds the person's IdP sign-in (Google in the demo; any OIDC issuer via `--issuer`) to the agent's key once. `wires services` shows only the services that person may call; the caller never names a machine, and a service can have several hosts.
 - **Reader** (`watch`): a member the admin allows to read a service's records sees every call and every member's refusal from the hosts' own logs, in full (arguments, the first 4 KiB of stdin, exit codes), for logging and compliance, holding neither end's credentials. Everyone else sees only the calls made as them: their verified identity, from any of their machines. Agents working for different people can't see each other's work.
@@ -63,14 +63,14 @@ Checking an inbox on a loop costs exactly what polling costs; the saving comes o
 
 - **Reached by key.** Tailscale-style networks give the agent's machine a route to the host; Wires gives a route to the services a signed list lets the caller call, and nothing else.
 - **Identity is the IdP's own signature**, tied to the agent's key and checked by the host. No Wires-run identity service exists to trust.
-- **One signed list, checked locally.** Who's in, the roles and the services are one admin-signed document every machine holds. Hosts decide each call from it with no auth server; callers list what they may call from it. Only the admin can bind a service name to a host.
+- **One signed list, checked locally.** The roles, the services and the bans are one admin-signed document every machine holds; each machine's own root-signed badge says it is in. Hosts decide each call from it with no auth server; callers list what they may call from it. Only the admin can bind a service name to a host.
 - **The host writes the log**, signed and hash-linked, so the agent can't forge it, and a reader the admin names needs nothing from either end. Nothing is broadcast: a record's content leaves a host only when a reader allowed to see it asks (anyone else asking gets hash links).
 - **A sandbox that allows only `wires`** gives CLI efficiency with a permission surface as narrow as MCP's. We tested this: a permission rule alone isn't airtight (the agent can still run `cat`, read files, and pass `wires`' own override flags), so `WIRES_LOCKED=1` makes `wires` refuse those flags itself.
 
 ## Honest limits
 
 - **Joining an organization is still a hand-issued invite.** Joining by domain ("`wires join acmecorp.com`") is an open question, not yet designed.
-- **Every member holds the whole signed list** (member keys, role matchers, service names): the org chart, growing with the number of members. The redesign is agreed and next: machine badges, and directory nodes that give each host and caller only its own part ([fabric.md](fabric.md); cards 35–37), then day-passes for headless agents (card 29).
+- **Every machine holds the whole signed list** (role matchers, service names, host and banned keys). Machine badges took the member list out of it (card 35); next, directory nodes give each host and caller only its own part ([fabric.md](fabric.md); cards 36–37), then day-passes for headless agents (card 29).
 - **Callbacks only to the agent and person that made the call**, and an `inbox` tool for MCP clients: designed, parked ([card 31](board/backlog/31-inbox-delivery.md)).
 - **A host can withhold or truncate its own log.** Tampering and gaps are detectable only against a copy a reader holds.
 

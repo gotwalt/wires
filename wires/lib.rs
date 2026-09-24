@@ -82,10 +82,10 @@ const HELP_TEMPLATE: &str = "\
 {about-with-newline}
 {usage-heading} {usage}
 
-Admin — signs who's in and what runs where (holds the root key):
+Admin — admits nodes and signs what runs where (holds the root key):
   init      Create the root key, this node, and the first signed state
-  invite    Add a node and print its one join token
-  remove    Drop a node; hosts refuse its next call
+  invite    Admit a node: mint its badge, print its one join token
+  remove    Ban a node; hosts refuse its next call
   service   Register services: add / set / rm (name, allowed roles, hosts)
   role      Define roles from IdP identity: set / rm
   state     Re-send the signed state to every host (push)
@@ -124,15 +124,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     // --- admin ---
-    /// Create the root key and this machine's node key, and
-    /// sign the first state (this node its one member).
+    /// Create the root key and this machine's node key, mint this node's
+    /// badge, and sign the first state.
     Init(admin::init::InitArgs),
-    /// Add a node to the signed state and print its join token (stdout); the
-    /// new state is pushed to the hosts.
+    /// Mint a node's badge and print its join token (stdout). No state edit:
+    /// nothing is pushed (unless it lifts the node's ban).
     Invite(admin::invite::InviteArgs),
-    /// Remove a node (by `--name` label or id) from the signed state; it is
-    /// pushed to the hosts, and every host that has it refuses the node's
-    /// next call.
+    /// Remove a node (by `--name` label or id): a ban in the signed state
+    /// until its badge expires. It is pushed to the hosts, and every host
+    /// that has it refuses the node's next call.
     Remove(admin::invite::RemoveArgs),
     /// Edit the service registry in the signed state, and push it.
     Service(admin::service::ServiceArgs),

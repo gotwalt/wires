@@ -79,12 +79,6 @@ impl World {
         s.version = StateVersion(1);
         s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
-        s.members.extend([
-            self.host.node_id(),
-            self.alice.node_id(),
-            self.bob.node_id(),
-        ]);
-        s.hosts.insert(self.host.node_id());
         s.roles.insert(
             RoleName::new("analyst").unwrap(),
             vec![Matcher {

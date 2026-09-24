@@ -1,6 +1,7 @@
 # State scale: how much metadata each node moves
 
-*Modeled 2026-09-24 at 655a96c. `python3 bench/state-scale/model.py`
+*Modeled 2026-09-24 at 655a96c; the *badges* and *apex* rows re-modeled after
+card 35 built badges (the state's measured ban entry, and no host list). `python3 bench/state-scale/model.py`
 (`--email-roles`, `--measure`). Byte sizes are measured from real signed
 states by `cargo run -q --release -p library --example state_sizes`; rates
 are assumptions, listed in `model.py`'s `ASSUMPTIONS`.*
@@ -10,8 +11,8 @@ re-fetches it after every edit (protocol.md §3–4). How much does each node
 receive, per day, as the org grows, and what would a persistent directory
 (apex) save?
 
-**Measured sizes** (serialized signed JSON): a member 67 B, a host 134 B, a
-service entry 318 B (80-character description, 2 hosts, 2 allow roles,
+**Measured sizes** (serialized signed JSON): a member 67 B, a host 134 B (both
+format 1, before card 35), a ban 78 B (format 2), a service entry 318 B (80-character description, 2 hosts, 2 allow roles,
 1 reader role), a role with one group matcher 73 B, each further email matcher
 75 B, a membership 361 B.
 
@@ -37,21 +38,21 @@ revalidated hourly.
 | admin sends /day | 71.7 KB | 27.1 MB | 26.6 GB | 1.3 TB |
 | whole network /day | 18.4 MB | 1.4 GB | 842.0 GB | 41.6 TB |
 | **Badges only** (members leave the state) |  |  |  |  |
-| every node holds | 4.8 KB | 42.9 KB | 423.9 KB | 1.9 MB |
+| every node holds | 4.1 KB | 36.2 KB | 357.2 KB | 1.8 MB |
 | edits/day | 1 | 2 | 20 | 100 |
-| invite token | 6.8 KB | 57.7 KB | 565.6 KB | 2.6 MB |
-| each caller receives /day | 153.5 KB | 233.9 KB | 7.2 MB | 80.7 MB |
-| each host receives /day | 451.1 KB | 533.1 KB | 9.0 MB | 192.8 MB |
-| each host sends callers /day | 3.1 MB | 9.4 MB | 286.0 MB | 8.1 GB |
-| admin sends /day | 38.8 KB | 4.6 MB | 4.3 GB | 192.7 GB |
-| whole network /day | 17.6 MB | 499.1 MB | 151.9 GB | 8.5 TB |
+| invite token | 5.9 KB | 48.8 KB | 476.7 KB | 2.4 MB |
+| each caller receives /day | 152.9 KB | 220.7 KB | 6.0 MB | 75.1 MB |
+| each host receives /day | 450.4 KB | 519.6 KB | 7.7 MB | 179.5 MB |
+| each host sends callers /day | 3.1 MB | 8.8 MB | 242.0 MB | 7.5 GB |
+| admin sends /day | 35.5 KB | 4.0 MB | 3.6 GB | 179.4 GB |
+| whole network /day | 17.6 MB | 471.3 MB | 128.5 GB | 7.9 TB |
 | **Apex** (directory; slices; views) |  |  |  |  |
-| apex holds | 5.6 KB | 51.2 KB | 506.9 KB | 2.5 MB |
-| each host holds | 2.8 KB | 5.7 KB | 27.0 KB | 124.1 KB |
+| apex holds | 5.6 KB | 51.2 KB | 507.2 KB | 2.5 MB |
+| each host holds | 2.8 KB | 5.7 KB | 27.3 KB | 125.6 KB |
 | each caller holds | 5.3 KB | 14.6 KB | 14.6 KB | 14.6 KB |
 | invite token | 785 B | 785 B | 785 B | 785 B |
 | each caller receives /day | 25.3 KB | 29.2 KB | 29.2 KB | 29.2 KB |
-| each host receives /day | 86.4 KB | 86.6 KB | 88.1 KB | 94.9 KB |
+| each host receives /day | 86.4 KB | 86.6 KB | 88.2 KB | 95.4 KB |
 | apex sends /day | 3.0 MB | 62.7 MB | 627.8 MB | 3.0 GB |
 | whole network /day | 3.0 MB | 62.7 MB | 627.8 MB | 3.0 GB |
 
@@ -73,8 +74,8 @@ views don't change.
    1k users, too big to paste into Slack.
 4. **The 4 MiB frame cap is crossed at about 60k nodes** (the *large* tier),
    where sync fails outright.
-5. **Badges alone cut per-node traffic about 5×,** but it still grows with
-   the org (81 MB per caller per day at *large*).
+5. **Badges alone cut per-node traffic about 5–6×,** but it still grows with
+   the org (75 MB per caller per day at *large*). Card 35 built this.
 6. **The apex makes per-node cost flat:** about 29 KB per caller and 90 KB per
    host per day at every size, and most of that is handshakes and
    heartbeats, not data. The whole network costs what one apex sends.

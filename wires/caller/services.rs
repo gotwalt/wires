@@ -217,8 +217,6 @@ mod tests {
     fn state() -> State {
         let mut s = State::new(node(1));
         s.version = StateVersion(1);
-        s.members.extend([node(2), node(4)]);
-        s.hosts.insert(node(4));
         let svc = |description: &str| Service {
             description: description.into(),
             allow: vec![RoleName::new("staff").unwrap()],

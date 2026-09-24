@@ -3,7 +3,9 @@
 //!
 //! Builds real [`SignedState`]s with the library, serializes them as they
 //! travel (`serde_json`, the `offer` frame's body), and prints the marginal
-//! bytes per member, host, service, role and email matcher as one JSON line.
+//! bytes per ban, service, role and email matcher as one JSON line. The
+//! state lists no members or hosts since card 35 (a host is only its entries
+//! in services' `hosts`), so there is nothing per member to measure.
 //!
 //! ```text
 //! cargo run -q --release -p library --example state_sizes
@@ -27,7 +29,7 @@ fn node(i: u64) -> NodeId {
 /// The shape of one state to measure.
 #[derive(Clone, Copy)]
 struct Shape {
-    members: u64,
+    bans: u64,
     hosts: u64,
     services: u64,
     roles: u64,
@@ -37,7 +39,7 @@ struct Shape {
 
 impl Shape {
     const BASE: Shape = Shape {
-        members: 0,
+        bans: 0,
         hosts: 0,
         services: 0,
         roles: 3,
@@ -53,10 +55,10 @@ fn size(root: &NodeIdentity, shape: Shape) -> usize {
     state.version = StateVersion(123_456);
     state.issued = ISSUED;
     state.not_after = NOT_AFTER;
-    state.members.extend((0..shape.members).map(node));
+    for i in 0..shape.bans {
+        state.ban(node(1_000_000 + i), NOT_AFTER);
+    }
     let hosts: Vec<NodeId> = (0..shape.hosts).map(node).collect();
-    state.members.extend(hosts.iter().copied());
-    state.hosts.extend(hosts.iter().copied());
     for r in 0..shape.roles {
         let matchers = (0..shape.matchers_per_role)
             .map(|j| {
@@ -114,8 +116,7 @@ fn main() {
     let membership = Membership::mint(&root, node(5), ISSUED, NOT_AFTER).expect("a membership");
     let out = serde_json::json!({
         "base": size(&root, base),
-        "member": per(&root, base, Shape { members: n, ..base }, n),
-        "host": per(&root, base, Shape { hosts: n, ..base }, n),
+        "ban": per(&root, base, Shape { bans: n, ..base }, n),
         "service": per(&root, with_hosts, Shape { services: n, ..with_hosts }, n),
         "role": per(&root, base, Shape { roles: 3 + n, ..base }, n),
         "email_matcher": per(&root, emails, Shape { matchers_per_role: 1 + n, ..emails }, 3 * n),

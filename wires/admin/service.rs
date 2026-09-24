@@ -10,12 +10,13 @@
 //! wires service rm  orders-db
 //! ```
 //!
-//! Every edit goes through [`edit_state`]: the stored state, changed, with
-//! the version bumped by one, re-signed (which validates it) and stored
-//! through the compare-and-swap. **The host set is derived:** a member is a
-//! host exactly when some service names it, so assigning a service is what
-//! makes a node a host, and dropping its last service makes it a plain
-//! member again.
+//! Every edit goes through [`edit_state`]: the stored state, changed, its
+//! expired bans dropped, the version bumped by one, re-signed (which
+//! validates it) and stored through the compare-and-swap. **The host set is
+//! derived:** a node is a host exactly when some service names it, so
+//! assigning a service is what makes a node a host, and dropping its last
+//! service makes it a plain node again. A `--host` must be a node this
+//! admin invited (it is in the ledger) and not banned.
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
@@ -26,6 +27,7 @@ use library::{
 
 use super::invite::resolve_member;
 use super::keystore::Keystore;
+use super::ledger::Ledger;
 use super::ttl::Ttl;
 use super::{Report, run_edit};
 use crate::clock::now_unix;
@@ -61,7 +63,7 @@ pub(crate) struct ServiceEditArgs {
     /// Repeatable.
     #[arg(long = "allow")]
     pub(crate) allow: Vec<String>,
-    /// A member that implements it: an `invite --name` label or a node id.
+    /// A node that implements it: an `invite --name` label or a node id.
     /// Repeatable (failover).
     #[arg(long = "host")]
     pub(crate) host: Vec<String>,
@@ -136,7 +138,8 @@ pub(crate) struct ServiceEdit {
     pub(crate) description: Option<String>,
     /// Its `allow` roles, replacing the list.
     pub(crate) allow: Option<Vec<RoleName>>,
-    /// Its hosts, replacing the list (each must be a member).
+    /// Its hosts, replacing the list (each must be a node this admin
+    /// invited, and not banned).
     pub(crate) hosts: Option<Vec<NodeId>>,
     /// Its record readers, replacing the list.
     pub(crate) readers: Option<Vec<RoleName>>,
@@ -165,10 +168,11 @@ impl ServiceEdit {
 // ---------------------------------------------------------------------------
 
 /// Sign and store the next version of this keystore's state: the stored one
-/// (or, for `wires init`, an empty one) changed by `change`, hosts
-/// re-derived, version + 1, valid until `ttl` from now or the stored one's
-/// expiry, whichever is later (an edit never shortens the state's
-/// lifetime). Validation failures name the broken rule.
+/// (or, for `wires init`, an empty one) changed by `change`, bans whose
+/// `until` has passed dropped ([`State::prune_bans`]: the badge each one
+/// cancelled has expired), version + 1, valid until `ttl` from now or the
+/// stored one's expiry, whichever is later (an edit never shortens the
+/// state's lifetime). Validation failures name the broken rule.
 pub(crate) fn edit_state(
     ks: &Keystore,
     ttl: Ttl,
@@ -183,12 +187,8 @@ pub(crate) fn edit_state(
         None => State::new(root.node_id()),
     };
     change(&mut next)?;
-    next.hosts = next
-        .services
-        .values()
-        .flat_map(|s| s.hosts.iter().copied())
-        .collect();
     let now = now_unix();
+    next.prune_bans(now);
     next.version = StateVersion(next.version.0 + 1);
     next.issued = now;
     next.not_after = ttl
@@ -208,11 +208,12 @@ pub(crate) fn add(
     edit: ServiceEdit,
     ttl: Ttl,
 ) -> Result<SignedState> {
+    let ledger = Ledger::load(ks)?;
     edit_state(ks, ttl, |s| {
         if s.services.contains_key(&name) {
             bail!("service {name} already exists; change it with `wires service set`");
         }
-        check_hosts(s, edit.hosts.as_deref())?;
+        check_hosts(s, &ledger, edit.hosts.as_deref())?;
         let mut svc = Service {
             description: String::new(),
             allow: Vec::new(),
@@ -232,8 +233,9 @@ pub(crate) fn set(
     edit: ServiceEdit,
     ttl: Ttl,
 ) -> Result<SignedState> {
+    let ledger = Ledger::load(ks)?;
     edit_state(ks, ttl, |s| {
-        check_hosts(s, edit.hosts.as_deref())?;
+        check_hosts(s, &ledger, edit.hosts.as_deref())?;
         let svc = s
             .services
             .get_mut(&name)
@@ -279,11 +281,21 @@ pub(crate) fn role_rm(ks: &Keystore, name: RoleName, ttl: Ttl) -> Result<SignedS
     })
 }
 
-/// Each proposed host must be a member.
-fn check_hosts(s: &State, hosts: Option<&[NodeId]>) -> Result<()> {
+/// Each proposed host must be a node this admin invited (in its ledger),
+/// and not banned.
+fn check_hosts(s: &State, ledger: &Ledger, hosts: Option<&[NodeId]>) -> Result<()> {
     for h in hosts.unwrap_or_default() {
-        if !s.is_member(*h) {
-            bail!("{} is not a member; `wires invite` it first", h.short());
+        if let Some(until) = s.bans.get(h) {
+            bail!(
+                "{} was removed (banned until {until}); `wires invite` it again first",
+                h.short()
+            );
+        }
+        if !ledger.contains(*h) {
+            bail!(
+                "{} was never invited here; `wires invite` it first",
+                h.short()
+            );
         }
     }
     Ok(())
@@ -361,15 +373,15 @@ fn role_names(texts: &[String]) -> Result<Option<Vec<RoleName>>> {
         .map(Some)
 }
 
-/// `--host` labels or ids → node ids, through the admin's `names.json`.
+/// `--host` labels or ids → node ids, through the admin's ledger.
 fn host_ids(ks: &Keystore, texts: &[String]) -> Result<Option<Vec<NodeId>>> {
     if texts.is_empty() {
         return Ok(None);
     }
-    let names = ks.read_names()?;
+    let ledger = Ledger::load(ks)?;
     let mut out = Vec::new();
     for t in texts {
-        let (id, _) = resolve_member(&names, t)?;
+        let (id, _) = resolve_member(&ledger, t)?;
         if !out.contains(&id) {
             out.push(id);
         }
@@ -470,16 +482,15 @@ mod tests {
     use library::NodeIdentity;
     use proptest::prelude::*;
 
-    /// An initialized admin keystore with `extra` more members in its state.
+    /// An initialized admin keystore that has invited `extra`.
     fn admin_with(extra: &[NodeId]) -> Keystore {
         let ks = Keystore::at(temp_dir());
         init_in(&ks, InitArgs::default()).unwrap();
-        let extra = extra.to_vec();
-        edit_state(&ks, ttl(), |s| {
-            s.members.extend(extra);
-            Ok(())
-        })
-        .unwrap();
+        let mut ledger = Ledger::load(&ks).unwrap();
+        for n in extra {
+            ledger.record(*n, None, i64::MAX);
+        }
+        ledger.save(&ks).unwrap();
         ks
     }
 
@@ -554,13 +565,52 @@ mod tests {
             hosts: Some(vec![stranger]),
             ..Default::default()
         };
-        assert!(add(&ks, svc("x"), edit, ttl()).is_err(), "not a member");
+        assert!(add(&ks, svc("x"), edit, ttl()).is_err(), "never invited");
         let edit = ServiceEdit {
             allow: Some(vec![role("ghost")]),
             ..Default::default()
         };
         assert!(add(&ks, svc("x"), edit, ttl()).is_err(), "undefined role");
         assert_eq!(store::read(&ks, root).unwrap().unwrap(), before);
+    }
+
+    /// Card 35: a ban drops out at the first edit after its `until`, and a
+    /// banned node can't be made a host.
+    #[test]
+    fn a_ban_drops_out_at_the_first_edit_after_its_until() {
+        let (lapsed, live) = (
+            NodeIdentity::generate().node_id(),
+            NodeIdentity::generate().node_id(),
+        );
+        let ks = admin_with(&[lapsed, live]);
+        let root = ks.read_root_identity().unwrap().unwrap();
+        let now = now_unix();
+        // A state someone signed a while ago, holding a ban that has since
+        // lapsed (as if its `until` passed after that edit).
+        let mut s = store::read(&ks, root.node_id()).unwrap().unwrap().state;
+        s.version = StateVersion(s.version.0 + 1);
+        s.ban(lapsed, now - 10);
+        s.ban(live, now + 3_600);
+        let signed = s.sign(&root).unwrap();
+        assert!(store::adopt_if_newer(&ks, &signed, root.node_id(), now).unwrap());
+        assert!(signed.state.is_banned(lapsed), "held until an edit");
+
+        let edit = ServiceEdit {
+            hosts: Some(vec![live]),
+            ..Default::default()
+        };
+        let err = add(&ks, svc("x"), edit, ttl()).unwrap_err();
+        assert!(format!("{err:#}").contains("banned"), "{err:#}");
+
+        let next = role_set(
+            &ks,
+            role("staff"),
+            vec![parse_matcher("*@x.com", GOOGLE_ISSUER).unwrap()],
+            ttl(),
+        )
+        .unwrap();
+        assert!(!next.state.is_banned(lapsed), "dropped at the first edit");
+        assert!(next.state.is_banned(live), "still in force");
     }
 
     #[test]

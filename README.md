@@ -100,9 +100,9 @@ agent$ wires inbox --wait
 The same services work from MCP clients: `wires mcp` in a stdio MCP config,
 or `https://<gateway>/mcp` as a Claude.ai connector
 ([docs/deployment.md § A web gateway](docs/deployment.md#a-web-gateway)).
-`wires remove <name>` pushes a new list to the hosts, and each host that
-has it refuses the member's next call, with nothing to restart and no shared
-key to rotate. An edit that reaches no host fails loudly, and `wires state
+`wires remove <name>` pushes a ban to the hosts, and each host that has it
+refuses that node's next call, with nothing to restart and no shared key to
+rotate. An edit that reaches no host fails loudly, and `wires state
 push` re-sends it.
 
 ## wires and a remote MCP server
@@ -145,10 +145,11 @@ Waiting on a mock CI build, 5 runs per setup ([bench/push/REPORT.md](bench/push/
 
 It's a prototype (see the note at the top). The main limits:
 
-- Every member holds the whole signed registry (every member's key, every
-  role's matchers, every service), and it grows with the number of members.
-  The redesign moves the registry to directory nodes, so each machine holds
-  only what it uses ([docs/fabric.md](docs/fabric.md), cards 35–37).
+- Every machine holds the whole signed registry (every role's matchers, every
+  service and its hosts, every ban). It no longer lists members: a machine is
+  admitted by its root-signed badge. The redesign moves the registry to
+  directory nodes, so each machine holds only what it uses
+  ([docs/fabric.md](docs/fabric.md), cards 36–37).
 - Memberships and the registry expire (30 days by default) and don't renew
   on their own yet.
 - A host can withhold or truncate its own log; tampering and gaps are

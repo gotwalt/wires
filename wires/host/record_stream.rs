@@ -12,7 +12,8 @@
 //!    version, ID token: the same credentials a call presents), the services
 //!    it wants, `since` (its resume point for this view on this host),
 //!    `mine`, `follow`;
-//! 2. host → [`RecordFrame::Denied`] (a non-member gets only
+//! 2. host → [`RecordFrame::Denied`] (a node that isn't admitted: no valid
+//!    badge, or banned, gets only
 //!    [`NOT_ADMITTED`]; nothing else is sent), or [`RecordFrame::Granted`]:
 //!    per requested service assigned to this host, [`Scope::All`] (the
 //!    reader's verified principal is in one of the service's `readers` roles,
@@ -436,8 +437,9 @@ impl View {
 }
 
 /// Decide what `caller` (with `hello`) may read of `wanted` on `host` at
-/// `now`: `Err` is the refusal sent to it. A non-member gets only
-/// [`NOT_ADMITTED`]. Membership is checked before anything else.
+/// `now`: `Err` is the refusal sent to it. A node that isn't admitted gets
+/// only [`NOT_ADMITTED`]. Its badge and the bans are checked before anything
+/// else.
 pub(crate) async fn authorize(
     host: &ServicesHost,
     caller: NodeId,

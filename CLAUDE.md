@@ -11,9 +11,9 @@ the `wires` binary.
 
 **The current assignment (2026-09-22, reshaped by card 27):** agents run
 CLIs on other machines, by **service name**. The machine is reached by public
-key, never by network path. One admin-signed, versioned state says who's in,
-which roles exist, which services exist, which hosts run each, and who may
-call and read each; the admin pushes it to the hosts by key, other members
+key, never by network path. Each node is admitted by its root-signed badge;
+one admin-signed, versioned state says which roles exist, which services
+exist, which hosts run each, who may call and read each, and who is banned; the admin pushes it to the hosts by key, other members
 pull it, and every host decides every call from its copy. The caller is
 authenticated by their IdP, via an ID token bound to the node key and
 presented in the session handshake; every role needs that verified identity

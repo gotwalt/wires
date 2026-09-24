@@ -125,19 +125,22 @@ n0.
 
 - **Add a member:** the joiner runs `wires id`; the admin runs
   `wires invite <id> --name <label>` and hands back the token; the joiner runs
-  `wires join <token>`. The root key never leaves the admin's machine.
-- **Remove a member:** `wires remove <label>`. The new signed state is pushed
-  to the hosts, with no import and no restart. `serve` re-reads its state
-  once per connection, so from the moment a host has the new state, the
-  removed member's next call there is refused: exit `77`, `wires: denied by
-  host: not a member of this network` on its stderr. The host traces the
-  refusal rather than logging it (a key outside the state can't write to the
-  log). A host the push missed enforces the removal once it pulls (every 10
+  `wires join <token>`. The token's badge (its root-signed membership) is
+  what admits the node: the invite edits no state and pushes nothing. The
+  root key never leaves the admin's machine.
+- **Remove a member:** `wires remove <label>`. The node is banned in a new
+  signed state until its badge would expire, and the state is pushed to the
+  hosts, with no import and no restart. `serve` re-reads its state once per
+  connection, so from the moment a host has the new state, the removed
+  node's next call there is refused: exit `77`, `wires: denied by host: not
+  a member of this network` on its stderr. The host traces the refusal
+  rather than logging it (a banned key can't write to the log). A host the push missed enforces the removal once it pulls (every 10
   minutes) or after `wires state push`. There is no shared key to rotate.
-- **Expiry:** a membership expires after its `--ttl`, the signed state after
-  its `--state-ttl` (both default `30d`), and nothing renews them yet. Any
-  admin command signs a fresh state (never shortening its life); re-issue
-  memberships with `wires invite <id>`.
+- **Expiry:** a badge (membership) expires after its `--ttl` (default and
+  most `30d`), the signed state after its `--state-ttl` (default `30d`), and
+  nothing renews them yet. Any admin edit signs a fresh state (never
+  shortening its life), and so does an invite when the stored state has
+  expired; re-issue badges with `wires invite <id>`.
 - **Rotate a node key:** the node id changes with the key, so remove the old
   id and invite the new one.
 

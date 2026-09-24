@@ -38,7 +38,7 @@ On camera, in order:
 | 5b (opt.) | agent | [push beat](#5b-the-workbench-calls-back-push): `wires call deploy -- build 41`, `wires inbox --wait --timeout 10m` | `… from host <wb8> (verified)  build-41  failed: …` |
 | 5c (with a spare) | workbench | stop `wires serve`, ask again | the spare answers (`wires call --verbose` names it) |
 | 6 | admin | `wires remove agent` | stderr `state version N: pushed to 1 of 1 host(s)` (2 of 2 with a spare) |
-| 6 | agent | ask Claude Code the question again | exit 77, nothing on stdout: `wires: denied by host: not a member of this network`; no `✗` in the watch (a non-member's knock is traced by the host, not logged) |
+| 6 | agent | ask Claude Code the question again | exit 77, nothing on stdout: `wires: denied by host: not a member of this network`; no `✗` in the watch (a banned node's knock is traced by the host, not logged) |
 
 ### Rebuttals, one line each
 
@@ -58,7 +58,7 @@ On camera, in order:
 
 | Terminal | Machine | `WIRES_HOME` | Role |
 |---|---|---|---|
-| **admin** | laptop | `~/.wires-admin` | holds the root key; signs roles, services and members |
+| **admin** | laptop | `~/.wires-admin` | holds the root key; mints badges; signs roles, services and bans |
 | **workbench** | workbench (x86_64 Linux, no firewall port opened) | `~/.wires-demo` | `wires serve host.json`: implements `orders-db` |
 | **spare** (optional) | a second host | `~/.wires-spare` | implements `orders-db` too, for the failover beat |
 | **agent** | laptop | `~/.wires-agent` | Claude Code, calling `wires call orders-db` from Bash |
@@ -328,7 +328,7 @@ exit code.
 - "Encrypted", "channel", "everyone can watch". Records are read from each
   host by the readers the registry names, in full; everyone else sees only
   their own person's.
-- "Nothing about other people reaches the agent." Every member holds the
-  whole signed list (cards 35–37 fix that).
+- "Nothing about other people reaches the agent." Every machine holds the
+  whole signed list: every role and service (cards 36–37 fix that).
 - "Join by domain." It isn't built (card 18).
 

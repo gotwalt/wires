@@ -1,20 +1,24 @@
 //! Moving the signed state between nodes, by key.
 //!
-//! Two directions on one ALPN, [`STATE_ALPN`]:
+//! Every exchange opens with the dialer's [`StateFrame::Hello`]: its badge
+//! (its root-signed [`Membership`]), which the responder checks, with the
+//! bans in its own copy, before anything else
+//! ([`check_admitted`](crate::check_admitted)). Then two directions on one
+//! ALPN, [`STATE_ALPN`]:
 //!
 //! - **Push:** after every admin edit (and `wires state push`), the admin
 //!   dials every host (only a running `serve` answers) and sends
 //!   [`StateFrame::Offer`]; the receiver verifies it under its root, adopts
 //!   it if [newer](crate::SignedState::is_newer_than), and answers
 //!   [`StateFrame::Have`] with the version it now holds.
-//! - **Pull:** a member whose copy has gone stale (last checked too long
+//! - **Pull:** a node whose copy has gone stale (last checked too long
 //!   ago) dials the hosts in its copy (then the admin) and sends
 //!   [`StateFrame::Have`]; the peer answers
 //!   [`StateFrame::Offer`] when it holds a newer copy, else `Have`.
 //!
 //! A node never adopts an older or unverifiable state, so a peer that lies
 //! can only fail to help. The caller is always the iroh-authenticated key;
-//! non-members are answered [`StateFrame::Denied`].
+//! a dialer that isn't admitted is answered [`StateFrame::Denied`].
 //!
 //! Frames are a 4-byte big-endian length then canonical JSON tagged by
 //! `type`, at most [`MAX_STATE_FRAME`] bytes.
@@ -30,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec::{canonical_bytes, length_prefixed, prefix_len, split_frame};
 use crate::error::{Error, Result};
+use crate::membership::Membership;
 use crate::state::{SignedState, StateVersion};
 
 /// The ALPN the state push/pull protocol speaks.
@@ -40,7 +45,8 @@ pub const STATE_ALPN: &[u8] = b"wires/state/1";
 pub const MAX_STATE_FRAME: usize = 4 * 1024 * 1024;
 
 /// The largest frame that is not an [`StateFrame::Offer`]. A `Have` is
-/// about 50 bytes and a `Denied` carries a short reason, so a reader that
+/// about 50 bytes, a `Hello` (one badge) under 500, and a `Denied` carries a
+/// short reason, so a reader that
 /// hasn't yet seen an offer's opening bytes ([`OFFER_BODY_PREFIX`]) needs no
 /// more than this.
 pub const MAX_SMALL_STATE_FRAME: usize = 4 * 1024;
@@ -62,6 +68,12 @@ pub const OFFER_BODY_PREFIX: &[u8] = br#"{"state":"#;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StateFrame {
+    /// The dialer's first frame: "this is my badge". The responder answers
+    /// nothing else until it has checked it.
+    Hello {
+        /// The dialer's root-signed membership.
+        membership: Membership,
+    },
     /// "Here is my copy": a push, or the answer to a pull from a peer that
     /// holds a newer one.
     Offer {
@@ -73,7 +85,8 @@ pub enum StateFrame {
         /// The sender's current version (0: none yet).
         version: StateVersion,
     },
-    /// Terminal refusal (the dialer is not a member).
+    /// Terminal refusal (the dialer is not admitted, or its frame made no
+    /// sense).
     Denied {
         /// Why, in words.
         reason: String,
@@ -125,7 +138,9 @@ mod tests {
     fn frames_round_trip() {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let state = State::new(root.node_id()).sign(&root).unwrap();
+        let membership = Membership::mint(&root, root.node_id(), 0, i64::MAX).unwrap();
         for f in [
+            StateFrame::Hello { membership },
             StateFrame::Offer { state },
             StateFrame::Have {
                 version: StateVersion(7),
@@ -147,8 +162,9 @@ mod tests {
     fn only_offers_are_large_and_they_announce_themselves() {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let mut s = State::new(root.node_id());
-        s.members
-            .extend((0..200u8).map(|i| NodeIdentity::from_seed([i; 32]).node_id()));
+        for i in 0..200u8 {
+            s.ban(NodeIdentity::from_seed([i; 32]).node_id(), i64::MAX);
+        }
         let offer = StateFrame::Offer {
             state: s.sign(&root).unwrap(),
         }
@@ -156,7 +172,9 @@ mod tests {
         .unwrap();
         assert!(offer.len() > MAX_SMALL_STATE_FRAME, "{}", offer.len());
         assert!(offer[4..].starts_with(OFFER_BODY_PREFIX));
+        let membership = Membership::mint(&root, root.node_id(), i64::MIN, i64::MIN).unwrap();
         for small in [
+            StateFrame::Hello { membership },
             StateFrame::Have {
                 version: StateVersion(u64::MAX),
             },
