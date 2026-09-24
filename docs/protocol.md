@@ -370,8 +370,9 @@ its own directory signs (its replica loop keeps its copy in step with the others
 policy newly lists as a directory runs the directory mode only after a restart (it traces so).
 
 **Freshness at the host.** The host keeps the newest `Fresh` that vouches for its held head (by
-version, then `until`) in memory and in `fresh.json` (0600), read back at start if it still
-vouches for the head on disk. Before each call's registry check the gate asks whether a **current**
+version, then a current one over one that isn't current, then `until`: one from a directory
+whose clock runs ahead never displaces a current one) in memory and in `fresh.json` (0600), read
+back at start if it still vouches for the head on disk. Before each call's registry check the gate asks whether a **current**
 `Fresh` (`Fresh::is_current(now)`) names the exact head it decides under, and
 `settings.freshness` decides when none does:
 

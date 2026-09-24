@@ -298,7 +298,7 @@ impl Follower {
                     .verify(&policy.head)
                     .context("the freshness doesn't vouch for the policy's head")?;
                 self.adopt(&policy, "whole", now)?;
-                self.vouch(&fresh)
+                self.vouch(&fresh, now)
             }
             SubFrame::PolicyUpdate { update, fresh } => {
                 let held = store::read(&self.ks, self.root)?
@@ -311,9 +311,9 @@ impl Follower {
                     .verify(&next.head)
                     .context("the freshness doesn't vouch for the update's head")?;
                 self.adopt(&next, "update", now)?;
-                self.vouch(&fresh)
+                self.vouch(&fresh, now)
             }
-            SubFrame::Fresh { fresh } => self.vouch(&fresh),
+            SubFrame::Fresh { fresh } => self.vouch(&fresh, now),
             SubFrame::Denied { reason } => bail!("refused: {reason}"),
             SubFrame::View { .. } | SubFrame::ViewUpdate { .. } => {
                 bail!("a view frame on a policy subscription")
@@ -341,7 +341,7 @@ impl Follower {
 
     /// Keep `fresh` if it vouches for the head held now. One for another
     /// head (a directory behind this host, say) is skipped, not an error.
-    fn vouch(&self, fresh: &Fresh) -> Result<()> {
+    fn vouch(&self, fresh: &Fresh, now: i64) -> Result<()> {
         let Some(held) = store::read(&self.ks, self.root)? else {
             return Ok(());
         };
@@ -353,7 +353,7 @@ impl Follower {
             );
             return Ok(());
         }
-        self.freshness.offer(fresh, &held.signed.head)?;
+        self.freshness.offer(fresh, &held.signed.head, now)?;
         Ok(())
     }
 }
@@ -382,7 +382,7 @@ pub(crate) async fn vouch_from_local(
         if let Some(fresh) = fresh
             && let Ok(Some(held)) = store::read(&ks, root)
             && held.version() == fresh.version
-            && let Err(e) = freshness.offer(&fresh, &held.signed.head)
+            && let Err(e) = freshness.offer(&fresh, &held.signed.head, now_unix())
         {
             tracing::debug!("this directory's own freshness: {e:#}");
         }

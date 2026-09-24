@@ -548,7 +548,9 @@ mod tests {
         assert_eq!(refused.to_string(), freshness::STALE);
         assert!(!refused.needs_identity());
         let fresh = library::Fresh::sign(&dir, &strict.signed.head, 100, 200).unwrap();
-        host.freshness.offer(&fresh, &strict.signed.head).unwrap();
+        host.freshness
+            .offer(&fresh, &strict.signed.head, 100)
+            .unwrap();
         assert!(host.check_vouched(&strict, 150).is_ok());
         assert!(host.check_vouched(&strict, 201).is_err());
         assert!(host.check_vouched(&lenient, 201).is_ok());
