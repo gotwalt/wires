@@ -1,17 +1,23 @@
 //! The whole policy: every item, as the admin edits it ([`Policy`]) and as
 //! it is signed and published ([`SignedPolicy`]: the root-signed head and the
-//! items it commits to). Card 36's replacement for the one-blob
-//! [`State`](crate::State).
+//! items it commits to). Card 36's replacement for the one-blob state.
 //!
-//! The admin and the directories hold all of it; everyone else holds a
-//! subset with proofs: a host its [`Slice`], a caller its [`View`], each cut
-//! here as a pure function of the policy.
+//! **The root signs the policy, and each service entry, like a badge.** The
+//! head signs an [`ItemsHash`] over every item, so a node holding the whole
+//! policy (the admin, a directory, a host) checks it all with one signature,
+//! and a directory can't forge, drop or mix items. Each service item is also
+//! a [`SignedEntry`] with its own root signature, so a caller can hold just
+//! the services it may use (its [`View`], cut here by
+//! [`view_for`](SignedPolicy::view_for)) and check each one alone. Hosts
+//! follow the policy by [`PolicyUpdate`](crate::PolicyUpdate)s
+//! ([`SignedPolicy::apply`]).
 //!
 //! [`Policy`] is typed maps, like the state, so an edit can't produce two
 //! items with one key or a second settings item; [`Policy::items`] flattens
-//! them into leaf order. [`Policy::validate`] carries over the state's rules
-//! (every role a service names is defined, every matcher names a trusted
-//! issuer, each host listed once) and adds the new kinds'.
+//! them into key order, signing each service entry. [`Policy::validate`]
+//! carries over the state's rules (every role a service names is defined,
+//! every matcher names a trusted issuer, each host listed once) and adds the
+//! new kinds'.
 //!
 //! ```
 //! use library::{
@@ -38,24 +44,23 @@
 //! });
 //! let signed = policy.sign(&root).unwrap();
 //! signed.verify(root.node_id()).unwrap();
-//! assert_eq!(signed.head.head.item_count, 4); // role, service, issuer, settings
+//! assert_eq!(signed.items.len(), 4); // role, service, issuer, settings
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::entry::SignedEntry;
 use crate::error::{Error, Result};
 use crate::head::StateVersion;
-use crate::head::{POLICY_V3, PolicyHead, SignedPolicyHead};
+use crate::head::{ItemsHash, POLICY_V3, PolicyHead, SignedPolicyHead};
 use crate::identity::{NodeId, NodeIdentity};
 use crate::idp::{Issuer, Principal};
 use crate::item::{Ban, IssuerConfig, Item, Settings};
-use crate::merkle::MultiProof;
-use crate::merkle::{ItemHash, ItemTree};
-use crate::parts::{Slice, SliceUpdate, View, ViewEntry, ViewUpdate};
 use crate::registry::{Service, ServiceName};
 use crate::role::{Matcher, RoleName};
+use crate::view::{View, ViewEntry};
 
 /// The policy as the admin edits it: head fields plus every item, by kind.
 /// See the module docs.
@@ -85,7 +90,8 @@ pub struct Policy {
 }
 
 /// A signed policy: the root-signed head and every item it commits to, in
-/// leaf order. What the admin publishes and a directory stores.
+/// key order. What the admin publishes, and what a directory and every host
+/// hold.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedPolicy {
@@ -185,47 +191,55 @@ impl Policy {
         Ok(())
     }
 
-    /// Every item, in leaf ([`ItemKey`](crate::ItemKey)) order.
-    pub fn items(&self) -> Vec<Item> {
+    /// Every item, in key ([`ItemKey`](crate::ItemKey)) order. Each service
+    /// is signed by `root` at this policy's version, unless `previous` holds
+    /// the same entry (same fabric, name and body), which is kept with its
+    /// signature and version. [`Error::FabricMismatch`] if `root` is not
+    /// `fabric`.
+    pub fn items(&self, root: &NodeIdentity, previous: Option<&SignedPolicy>) -> Result<Vec<Item>> {
+        if root.node_id() != self.fabric {
+            return Err(Error::FabricMismatch);
+        }
+        let kept: BTreeMap<&ServiceName, &SignedEntry> = previous
+            .map(|p| p.entries().map(|e| (&e.name, e)).collect())
+            .unwrap_or_default();
         // Each map iterates in its key's order, and the kinds follow in
         // `ItemKey`'s order, so the concatenation is sorted.
         let roles = self.roles.iter().map(|(k, v)| Item::Role {
             key: k.clone(),
             body: v.clone(),
         });
-        let services = self.services.iter().map(|(k, v)| Item::Service {
+        let mut items: Vec<Item> = roles.collect();
+        for (name, svc) in &self.services {
+            let entry = match kept.get(name) {
+                Some(e) if e.is_for(self.fabric, name, svc) && e.version <= self.version => {
+                    (*e).clone()
+                }
+                _ => SignedEntry::sign(root, self.version, name.clone(), svc.clone())?,
+            };
+            items.push(Item::Service(entry));
+        }
+        items.extend(
+            self.bans
+                .iter()
+                .map(|(k, v)| Item::Ban { key: *k, body: *v }),
+        );
+        items.extend(self.issuers.iter().map(|(k, v)| Item::Issuer {
             key: k.clone(),
             body: v.clone(),
-        });
-        let bans = self
-            .bans
-            .iter()
-            .map(|(k, v)| Item::Ban { key: *k, body: *v });
-        let issuers = self.issuers.iter().map(|(k, v)| Item::Issuer {
-            key: k.clone(),
-            body: v.clone(),
-        });
-        let settings = Item::Settings {
+        }));
+        items.push(Item::Settings {
             body: self.settings,
-        };
-        roles
-            .chain(services)
-            .chain(bans)
-            .chain(issuers)
-            .chain([settings])
-            .collect()
+        });
+        Ok(items)
     }
 
     /// Rebuild a policy from a head's fields and its items (the inverse of
-    /// [`items`](Self::items)). [`Error::InvalidPolicy`] if the items are not
-    /// strictly in key order or hold no settings item.
+    /// [`items`](Self::items); entries lose their signatures).
+    /// [`Error::InvalidPolicy`] if the items are not strictly in key order or
+    /// hold no settings item.
     pub fn from_items(head: &PolicyHead, items: &[Item]) -> Result<Policy> {
-        if let Some(pair) = items.windows(2).find(|w| w[0].key() >= w[1].key()) {
-            return Err(Error::InvalidPolicy(format!(
-                "items out of order at {}",
-                pair[1].key()
-            )));
-        }
+        check_order(items)?;
         let mut policy = Policy::new(head.fabric);
         policy.version = head.version;
         policy.issued = head.issued;
@@ -237,8 +251,10 @@ impl Policy {
                 Item::Role { key, body } => {
                     policy.roles.insert(key.clone(), body.clone());
                 }
-                Item::Service { key, body } => {
-                    policy.services.insert(key.clone(), body.clone());
+                Item::Service(entry) => {
+                    policy
+                        .services
+                        .insert(entry.name.clone(), entry.service.clone());
                 }
                 Item::Ban { key, body } => {
                     policy.bans.insert(*key, *body);
@@ -255,16 +271,52 @@ impl Policy {
     }
 
     /// Validate, then sign as-is with the root key (the caller sets
-    /// `version`, `issued` and `not_after`): the items' Merkle root and count
-    /// go into the head. [`Error::FabricMismatch`] if `root` is not
-    /// `fabric`.
+    /// `version`, `issued` and `not_after`): every service entry at this
+    /// version, and the head over the items' hash.
+    /// [`Error::FabricMismatch`] if `root` is not `fabric`. An edit uses
+    /// [`sign_after`](Self::sign_after) instead, so unchanged entries keep
+    /// their version.
     pub fn sign(&self, root: &NodeIdentity) -> Result<SignedPolicy> {
+        self.sign_with(root, None)
+    }
+
+    /// [`sign`](Self::sign), keeping from `previous` (the policy this one
+    /// edits) every service entry the edit didn't change, with its signature
+    /// and version: the admin re-signs only what changed, and a caller
+    /// holding an unchanged entry needs nothing new.
+    ///
+    /// ```
+    /// use library::{Item, NodeIdentity, Policy, Service, ServiceName, StateVersion};
+    /// let root = NodeIdentity::from_seed([1u8; 32]);
+    /// let mut p = Policy::new(root.node_id());
+    /// p.version = StateVersion(1);
+    /// p.not_after = i64::MAX;
+    /// for name in ["a", "b"] {
+    ///     p.services.insert(ServiceName::new(name).unwrap(), Service {
+    ///         description: String::new(), allow: vec![], hosts: vec![], readers: vec![],
+    ///     });
+    /// }
+    /// let v1 = p.sign(&root).unwrap();
+    /// p.version = StateVersion(2);
+    /// p.services.get_mut(&ServiceName::new("b").unwrap()).unwrap().description = "new".into();
+    /// let v2 = p.sign_after(&root, &v1).unwrap();
+    /// let versions: Vec<u64> = v2.entries().map(|e| e.version.0).collect();
+    /// assert_eq!(versions, [1, 2], "only b was re-signed");
+    /// ```
+    pub fn sign_after(&self, root: &NodeIdentity, previous: &SignedPolicy) -> Result<SignedPolicy> {
+        self.sign_with(root, Some(previous))
+    }
+
+    fn sign_with(
+        &self,
+        root: &NodeIdentity,
+        previous: Option<&SignedPolicy>,
+    ) -> Result<SignedPolicy> {
         if root.node_id() != self.fabric {
             return Err(Error::FabricMismatch);
         }
         self.validate()?;
-        let items = self.items();
-        let tree = tree_of(&items)?;
+        let items = self.items(root, previous)?;
         let head = PolicyHead {
             format: POLICY_V3,
             fabric: self.fabric,
@@ -272,8 +324,7 @@ impl Policy {
             issued: self.issued,
             not_after: self.not_after,
             directories: self.directories.clone(),
-            items_root: tree.root(),
-            item_count: tree.len(),
+            items_hash: ItemsHash::of(&items)?,
         }
         .sign(root)?;
         Ok(SignedPolicy { head, items })
@@ -384,19 +435,33 @@ impl SignedPolicy {
         self.head.is_newer_than(&other.head)
     }
 
-    /// Verify the head under `root` ([`SignedPolicyHead::verify`]), that the
-    /// items are strictly in key order and are exactly the tree the head
-    /// commits to (count and root), then [`Policy::validate`]. Does not check
-    /// freshness.
+    /// The one check for a whole signed policy: the head verifies under
+    /// `root` ([`SignedPolicyHead::verify`]); the items are strictly in key
+    /// order and hash to the head's `items_hash`
+    /// ([`Error::ItemsMismatch`]); every service entry verifies on its own
+    /// under `root`, at a version no higher than the head's; then
+    /// [`Policy::validate`]. Does not check freshness.
     pub fn verify(&self, root: NodeId) -> Result<()> {
+        self.check_items(root, self.entries())
+    }
+
+    /// [`verify`](Self::verify), checking the signatures of only `entries`
+    /// (those not already verified in a policy this one was built from).
+    pub(crate) fn check_items<'a>(
+        &self,
+        root: NodeId,
+        entries: impl IntoIterator<Item = &'a SignedEntry>,
+    ) -> Result<()> {
         self.head.verify(root)?;
         let policy = self.to_policy()?;
-        let tree = tree_of(&self.items)?;
-        let head = &self.head.head;
-        if tree.len() != head.item_count || tree.root() != head.items_root {
-            return Err(Error::InvalidPolicy(
-                "the items are not the ones the head commits to".into(),
-            ));
+        if ItemsHash::of(&self.items)? != self.head.head.items_hash {
+            return Err(Error::ItemsMismatch);
+        }
+        for entry in self.entries() {
+            check_entry_version(entry, &self.head)?;
+        }
+        for entry in entries {
+            entry.verify(root)?;
         }
         policy.validate()
     }
@@ -406,84 +471,20 @@ impl SignedPolicy {
         Policy::from_items(&self.head.head, &self.items)
     }
 
-    /// The Merkle tree over the items (one `O(n)` build; prove from it).
-    pub fn tree(&self) -> Result<ItemTree> {
-        tree_of(&self.items)
-    }
-
-    /// `host`'s slice: the head and, with proofs, every service item naming
-    /// `host`, every role those services' `allow` and `readers` name plus
-    /// `extra_roles` (the roles its `host.json` names; undefined ones are
-    /// skipped), every ban, every issuer, and the settings. Nothing else.
-    ///
-    /// ```
-    /// use library::{
-    ///     Audience, Issuer, IssuerConfig, ItemKey, Matcher, NodeIdentity, Policy, RoleName,
-    ///     Service, ServiceName, StateVersion,
-    /// };
-    /// let root = NodeIdentity::from_seed([1u8; 32]);
-    /// let (a, b) = (NodeIdentity::from_seed([2u8; 32]).node_id(), NodeIdentity::from_seed([3u8; 32]).node_id());
-    /// let mut p = Policy::new(root.node_id());
-    /// p.version = StateVersion(1);
-    /// p.not_after = i64::MAX;
-    /// p.issuers.insert(Issuer::new("https://idp"), IssuerConfig {
-    ///     client_id: Audience::new("cli"), audiences: vec![Audience::new("cli")],
-    /// });
-    /// for (role, service, host) in [("dba", "orders-db", a), ("sre", "deploy", b)] {
-    ///     let role = RoleName::new(role).unwrap();
-    ///     p.roles.insert(role.clone(), vec![Matcher::new("https://idp")]);
-    ///     p.services.insert(ServiceName::new(service).unwrap(), Service {
-    ///         description: String::new(), allow: vec![role], hosts: vec![host], readers: vec![],
-    ///     });
-    /// }
-    /// let slice = p.sign(&root).unwrap().slice_for_host(a, &[]).unwrap();
-    /// slice.verify(root.node_id()).unwrap();
-    /// // Host a sees its own service and role, never b's.
-    /// assert!(slice.service(&ServiceName::new("orders-db").unwrap()).is_some());
-    /// assert!(slice.service(&ServiceName::new("deploy").unwrap()).is_none());
-    /// assert!(!slice.keys().contains(&ItemKey::Role(RoleName::new("sre").unwrap())));
-    /// ```
-    pub fn slice_for_host(&self, host: NodeId, extra_roles: &[RoleName]) -> Result<Slice> {
-        let mut roles: BTreeSet<&RoleName> = extra_roles.iter().collect();
-        for item in &self.items {
-            if let Item::Service { body, .. } = item
-                && body.hosts.contains(&host)
-            {
-                roles.extend(body.allow.iter().chain(&body.readers));
-            }
-        }
-        let wanted = |item: &Item| match item {
-            Item::Service { body, .. } => body.hosts.contains(&host),
-            Item::Role { key, .. } => roles.contains(key),
-            Item::Ban { .. } | Item::Issuer { .. } | Item::Settings { .. } => true,
-        };
-        let (picked, proof) = self.prove_where(|item| wanted(item).then_some(()))?;
-        Ok(Slice {
-            head: self.head.clone(),
-            items: picked.into_iter().map(|(item, ())| item).collect(),
-            proof,
+    /// Every service entry, in name order.
+    pub fn entries(&self) -> impl Iterator<Item = &SignedEntry> {
+        self.items.iter().filter_map(|item| match item {
+            Item::Service(entry) => Some(entry),
+            _ => None,
         })
     }
 
-    /// The update that moves `from` (this host's slice under an older head)
-    /// to its slice under this policy: [`slice_for_host`](Self::slice_for_host)
-    /// then [`Slice::update_to`]. The directory recomputes `from` from the
-    /// older policy the subscriber's `have` names.
-    pub fn slice_update(
-        &self,
-        from: &Slice,
-        host: NodeId,
-        extra_roles: &[RoleName],
-    ) -> Result<SliceUpdate> {
-        Ok(from.update_to(&self.slice_for_host(host, extra_roles)?))
-    }
-
-    /// The view of a caller presenting `principal`: the head and, with
-    /// proofs, each service item whose `allow` (marked `call`) or `readers`
-    /// (marked `read`) admits it. No role, ban, issuer or settings, and no
-    /// other service; with no principal, no entries (no role admits). With a
-    /// `query`, only the entries whose name or description contain it
-    /// (ignoring ASCII case), proved as a set of their own.
+    /// The view of a caller presenting `principal`: the head and each
+    /// service entry whose `allow` (marked `call`) or `readers` (marked
+    /// `read`) admits it, each with its own root signature. No role, ban,
+    /// issuer or settings, and no other service; with no principal, no
+    /// entries (no role admits). With a `query`, only the entries whose name
+    /// or description contain it (ignoring ASCII case).
     ///
     /// ```
     /// use library::{
@@ -510,15 +511,17 @@ impl SignedPolicy {
     ///     issuer: "https://idp".into(), subject: "1".into(),
     ///     email: Some("alice@example.com".into()), org: None, groups: vec![], not_after: 0,
     /// };
-    /// let view = signed.view_for(Some(&who), None).unwrap();
+    /// let view = signed.view_for(Some(&who), None);
     /// view.verify(root.node_id()).unwrap();
     /// assert!(view.entries[0].call);
+    /// // Each entry verifies on its own, too.
+    /// view.entries[0].entry.verify(root.node_id()).unwrap();
     /// // Bob doesn't learn the service exists; nor does a caller with no identity.
     /// who.email = Some("bob@example.com".into());
-    /// assert!(signed.view_for(Some(&who), None).unwrap().entries.is_empty());
-    /// assert!(signed.view_for(None, None).unwrap().entries.is_empty());
+    /// assert!(signed.view_for(Some(&who), None).entries.is_empty());
+    /// assert!(signed.view_for(None, None).entries.is_empty());
     /// ```
-    pub fn view_for(&self, principal: Option<&Principal>, query: Option<&str>) -> Result<View> {
+    pub fn view_for(&self, principal: Option<&Principal>, query: Option<&str>) -> View {
         let roles: BTreeMap<&RoleName, &[Matcher]> = self
             .items
             .iter()
@@ -533,58 +536,54 @@ impl SignedPolicy {
                 .any(|r| admits(roles.get(r).copied(), principal))
         };
         let query = query.map(str::to_ascii_lowercase);
-        let marks = |item: &Item| match item {
-            Item::Service { key, body }
-                if query
+        let entries = self
+            .entries()
+            .filter(|e| {
+                query
                     .as_deref()
-                    .is_none_or(|q| service_matches(key, body, q)) =>
-            {
-                let (call, read) = (admitted(&body.allow), admitted(&body.readers));
-                (call || read).then_some((call, read))
-            }
-            _ => None,
-        };
-        let (picked, proof) = self.prove_where(marks)?;
-        Ok(View {
+                    .is_none_or(|q| service_matches(&e.name, &e.service, q))
+            })
+            .filter_map(|e| {
+                let (call, read) = (admitted(&e.service.allow), admitted(&e.service.readers));
+                (call || read).then(|| ViewEntry {
+                    entry: e.clone(),
+                    call,
+                    read,
+                })
+            })
+            .collect();
+        View {
             head: self.head.clone(),
-            entries: picked
-                .into_iter()
-                .map(|(item, (call, read))| ViewEntry { item, call, read })
-                .collect(),
-            proof,
-        })
-    }
-
-    /// The update that moves `from` (this caller's view under an older head,
-    /// or with older marks) to its view under this policy.
-    pub fn view_update(&self, from: &View, principal: Option<&Principal>) -> Result<ViewUpdate> {
-        Ok(from.update_to(&self.view_for(principal, None)?))
-    }
-
-    /// Every item `pick` returns something for, with what it said, in leaf
-    /// order, and one multiproof over them all.
-    fn prove_where<T>(
-        &self,
-        pick: impl Fn(&Item) -> Option<T>,
-    ) -> Result<(Vec<(Item, T)>, MultiProof)> {
-        let mut picked = Vec::new();
-        let mut indices = Vec::new();
-        for (index, item) in (0u64..).zip(&self.items) {
-            if let Some(mark) = pick(item) {
-                picked.push((item.clone(), mark));
-                indices.push(index);
-            }
+            entries,
         }
-        let proof = self.tree()?.prove_many(&indices).ok_or(Error::BadProof)?;
-        Ok((picked, proof))
     }
 }
 
-/// The Merkle tree over `items`, in the order given.
-fn tree_of(items: &[Item]) -> Result<ItemTree> {
-    Ok(ItemTree::new(
-        items.iter().map(ItemHash::of).collect::<Result<_>>()?,
-    ))
+/// [`Error::InvalidPolicy`] unless `items` are strictly in key order (so no
+/// key is repeated).
+pub(crate) fn check_order(items: &[Item]) -> Result<()> {
+    match items.windows(2).find(|w| w[0].key() >= w[1].key()) {
+        Some(pair) => Err(Error::InvalidPolicy(format!(
+            "items out of order at {}",
+            pair[1].key()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// [`Error::InvalidPolicy`] unless `entry` belongs to `head`'s fabric and
+/// was last changed no later than `head`'s version.
+pub(crate) fn check_entry_version(entry: &SignedEntry, head: &SignedPolicyHead) -> Result<()> {
+    if entry.fabric != head.head.fabric {
+        return Err(Error::InvalidSignature);
+    }
+    if entry.version > head.head.version {
+        return Err(Error::InvalidPolicy(format!(
+            "service {} is at version {}, after its head's {}",
+            entry.name, entry.version.0, head.head.version.0
+        )));
+    }
+    Ok(())
 }
 
 /// Whether service `name`'s name or description contains `query` (already
@@ -787,6 +786,11 @@ mod tests {
         items.iter().map(Item::key).collect()
     }
 
+    /// The service entry `n` of `signed`.
+    fn entry<'a>(signed: &'a SignedPolicy, n: &str) -> &'a SignedEntry {
+        signed.entries().find(|e| e.name == name(n)).unwrap()
+    }
+
     #[test]
     fn sign_verify_round_trip() {
         let signed = sample().sign(&root()).unwrap();
@@ -798,13 +802,21 @@ mod tests {
         back.verify(root().node_id()).unwrap();
         assert_eq!(signed.head.head.format, POLICY_V3);
         assert_eq!(signed.head.head.directories, vec![node(30)]);
-        assert_eq!(signed.head.head.item_count, 4 + 4 + 1 + 1 + 1);
-        assert_eq!(signed.head.head.items_root, signed.tree().unwrap().root());
+        assert_eq!(signed.items.len(), 4 + 4 + 1 + 1 + 1);
+        assert_eq!(
+            signed.head.head.items_hash,
+            ItemsHash::of(&signed.items).unwrap()
+        );
+        // Every entry is signed at the policy's version, and verifies alone.
+        for e in signed.entries() {
+            assert_eq!(e.version, StateVersion(3));
+            e.verify(root().node_id()).unwrap();
+        }
     }
 
     #[test]
     fn items_come_out_in_key_order() {
-        let items = sample().items();
+        let items = sample().items(&root(), None).unwrap();
         let k = keys(&items);
         assert!(k.windows(2).all(|w| w[0] < w[1]), "{k:?}");
         assert_eq!(
@@ -823,6 +835,10 @@ mod tests {
                 ItemKey::Settings,
             ]
         );
+        assert!(matches!(
+            sample().items(&NodeIdentity::from_seed([9u8; 32]), None),
+            Err(Error::FabricMismatch)
+        ));
     }
 
     #[test]
@@ -831,7 +847,7 @@ mod tests {
         assert_eq!(p.version, StateVersion(0));
         assert_eq!(p.not_after, 0);
         assert_eq!(p.settings, Settings::default());
-        assert_eq!(p.items().len(), 1);
+        assert_eq!(p.items(&root(), None).unwrap().len(), 1);
         p.validate().unwrap();
     }
 
@@ -921,9 +937,10 @@ mod tests {
         t.items.swap(0, 1);
         assert!(matches!(verify(&t), Err(Error::InvalidPolicy(_))));
 
+        // Missing, extra and tampered items no longer hash to the head's.
         let mut t = signed.clone();
         t.items.remove(0);
-        assert!(verify(&t).is_err());
+        assert!(matches!(verify(&t), Err(Error::ItemsMismatch)));
 
         let mut t = signed.clone();
         t.items.insert(
@@ -933,7 +950,8 @@ mod tests {
                 body: Ban { until: 1 },
             },
         );
-        assert!(verify(&t).is_err());
+        t.items.sort_by_key(Item::key);
+        assert!(matches!(verify(&t), Err(Error::ItemsMismatch)));
 
         let mut t = signed.clone();
         let Some(Item::Ban { body, .. }) =
@@ -942,10 +960,10 @@ mod tests {
             unreachable!()
         };
         body.until += 1;
-        assert!(verify(&t).is_err());
+        assert!(matches!(verify(&t), Err(Error::ItemsMismatch)));
 
         // A second settings item, even correctly signed, is refused.
-        let mut items = sample().items();
+        let mut items = sample().items(&root(), None).unwrap();
         items.push(Item::Settings {
             body: Settings::default(),
         });
@@ -958,6 +976,100 @@ mod tests {
         let mut t = signed;
         t.head = p.sign(&root()).unwrap().head;
         assert!(verify(&t).is_err());
+    }
+
+    /// The head's hash covers every entry, but each entry must also verify on
+    /// its own: a policy whose head the root signed over an entry it didn't
+    /// is refused, as is one carrying an entry from after its head.
+    #[test]
+    fn every_entry_verifies_on_its_own() {
+        let resign = |mut items: Vec<Item>, edit: &dyn Fn(&mut SignedEntry)| {
+            for item in &mut items {
+                if let Item::Service(e) = item
+                    && e.name == name("status")
+                {
+                    edit(e);
+                }
+            }
+            let mut head = sample().sign(&root()).unwrap().head.head;
+            head.items_hash = ItemsHash::of(&items).unwrap();
+            SignedPolicy {
+                head: head.sign(&root()).unwrap(),
+                items,
+            }
+        };
+        let items = sample().items(&root(), None).unwrap();
+        resign(items.clone(), &|_| {})
+            .verify(root().node_id())
+            .unwrap();
+
+        let forged = resign(items.clone(), &|e| e.service.hosts.push(node(12)));
+        assert!(matches!(
+            forged.verify(root().node_id()),
+            Err(Error::InvalidSignature)
+        ));
+        let other = NodeIdentity::from_seed([9u8; 32]);
+        let foreign = resign(items.clone(), &|e| {
+            *e = SignedEntry::sign(&other, e.version, e.name.clone(), e.service.clone()).unwrap();
+        });
+        assert!(matches!(
+            foreign.verify(root().node_id()),
+            Err(Error::InvalidSignature)
+        ));
+        let future = resign(items, &|e| {
+            *e = SignedEntry::sign(&root(), StateVersion(4), e.name.clone(), e.service.clone())
+                .unwrap();
+        });
+        assert!(matches!(
+            future.verify(root().node_id()),
+            Err(Error::InvalidPolicy(_))
+        ));
+    }
+
+    #[test]
+    fn an_edit_re_signs_only_the_entries_it_changes() {
+        let v3 = sample().sign(&root()).unwrap();
+        let mut p = sample();
+        p.version = StateVersion(4);
+        p.services.get_mut(&name("status")).unwrap().description = "SLOs".into();
+        p.services.remove(&name("deploy"));
+        p.services
+            .insert(name("new"), service(&["staff"], &[], &[10]));
+        p.bans.insert(node(21), Ban { until: 900 });
+        let v4 = p.sign_after(&root(), &v3).unwrap();
+        v4.verify(root().node_id()).unwrap();
+        let versions: Vec<(String, u64)> = v4
+            .entries()
+            .map(|e| (e.name.to_string(), e.version.0))
+            .collect();
+        assert_eq!(
+            versions,
+            [
+                ("locked".into(), 3),
+                ("new".into(), 4),
+                ("orders-db".into(), 3),
+                ("status".into(), 4),
+            ]
+        );
+        assert_eq!(entry(&v4, "orders-db"), entry(&v3, "orders-db"));
+        // A plain sign re-signs every entry.
+        assert!(
+            p.sign(&root())
+                .unwrap()
+                .entries()
+                .all(|e| e.version == StateVersion(4))
+        );
+        // Another fabric's policy lends nothing: every entry is its own.
+        let other = NodeIdentity::from_seed([9u8; 32]);
+        let mut q = p.clone();
+        q.fabric = other.node_id();
+        let theirs = q.sign_after(&other, &v3).unwrap();
+        theirs.verify(other.node_id()).unwrap();
+        assert!(
+            theirs
+                .entries()
+                .all(|e| e.version == StateVersion(4) && e.fabric == other.node_id())
+        );
     }
 
     #[test]
@@ -1015,64 +1127,14 @@ mod tests {
     }
 
     #[test]
-    fn a_host_slice_holds_only_what_the_host_needs() {
-        let signed = sample().sign(&root()).unwrap();
-        let slice = signed.slice_for_host(node(10), &[]).unwrap();
-        slice.verify(root().node_id()).unwrap();
-        assert_eq!(
-            slice.keys(),
-            vec![
-                ItemKey::Role(role("analyst")),
-                ItemKey::Role(role("auditor")),
-                ItemKey::Role(role("staff")),
-                ItemKey::Service(name("orders-db")),
-                ItemKey::Service(name("status")),
-                ItemKey::Ban(node(20)),
-                ItemKey::Issuer(Issuer::new(ISS)),
-                ItemKey::Settings,
-            ]
-        );
-        // host.json's roles come along; an undefined one is skipped.
-        let slice = signed
-            .slice_for_host(node(11), &[role("analyst"), role("ghost")])
-            .unwrap();
-        slice.verify(root().node_id()).unwrap();
-        assert_eq!(
-            slice.keys(),
-            vec![
-                ItemKey::Role(role("analyst")),
-                ItemKey::Role(role("auditor")),
-                ItemKey::Role(role("oncall")),
-                ItemKey::Role(role("staff")),
-                ItemKey::Service(name("deploy")),
-                ItemKey::Service(name("locked")),
-                ItemKey::Service(name("status")),
-                ItemKey::Ban(node(20)),
-                ItemKey::Issuer(Issuer::new(ISS)),
-                ItemKey::Settings,
-            ]
-        );
-        // A node that hosts nothing still gets bans, issuers and settings.
-        let slice = signed.slice_for_host(node(99), &[]).unwrap();
-        assert_eq!(
-            slice.keys(),
-            vec![
-                ItemKey::Ban(node(20)),
-                ItemKey::Issuer(Issuer::new(ISS)),
-                ItemKey::Settings,
-            ]
-        );
-    }
-
-    #[test]
     fn a_view_holds_only_what_its_caller_may_use() {
         let signed = sample().sign(&root()).unwrap();
         let marks = |p: Option<&Principal>| -> Vec<(String, bool, bool)> {
-            let view = signed.view_for(p, None).unwrap();
+            let view = signed.view_for(p, None);
             view.verify(root().node_id()).unwrap();
             view.entries
                 .iter()
-                .map(|e| (e.service().unwrap().0.to_string(), e.call, e.read))
+                .map(|e| (e.entry.name.to_string(), e.call, e.read))
                 .collect()
         };
         assert_eq!(
@@ -1113,11 +1175,11 @@ mod tests {
         let signed = p.sign(&root()).unwrap();
         let alice = who("alice@example.com");
         let names = |q| -> Vec<String> {
-            let view = signed.view_for(Some(&alice), q).unwrap();
+            let view = signed.view_for(Some(&alice), q);
             view.verify(root().node_id()).unwrap();
             view.entries
                 .iter()
-                .map(|e| e.service().unwrap().0.to_string())
+                .map(|e| e.entry.name.to_string())
                 .collect()
         };
         assert_eq!(names(Some("orders")), vec!["orders-db", "status"]);
@@ -1127,26 +1189,12 @@ mod tests {
     }
 
     #[test]
-    fn a_part_cut_from_one_head_fails_under_another() {
-        let v3 = sample().sign(&root()).unwrap();
-        let mut p = sample();
-        p.version = StateVersion(4);
-        p.bans.insert(node(21), Ban { until: 900 });
-        let v4 = p.sign(&root()).unwrap();
-
-        let mut slice = v3.slice_for_host(node(10), &[]).unwrap();
-        slice.head = v4.head.clone();
-        assert!(matches!(
-            slice.verify(root().node_id()),
-            Err(Error::BadProof)
-        ));
-
-        let mut view = v3.view_for(Some(&who("alice@example.com")), None).unwrap();
-        view.head = v4.head;
-        assert!(matches!(
-            view.verify(root().node_id()),
-            Err(Error::BadProof)
-        ));
+    fn view_entries_are_the_policy_s_own_signed_entries() {
+        let signed = sample().sign(&root()).unwrap();
+        let view = signed.view_for(Some(&who("alice@example.com")), None);
+        for e in &view.entries {
+            assert_eq!(&e.entry, entry(&signed, e.entry.name.as_str()));
+        }
     }
 
     proptest! {
@@ -1157,50 +1205,20 @@ mod tests {
             prop_assert_eq!(signed.to_policy().unwrap(), p);
         }
 
+        /// Signing after any older policy keeps exactly the entries it
+        /// shares, and the result verifies and reads back as the new policy.
         #[test]
-        fn slices_hold_exactly_what_their_host_needs(
-            p in arb_policy(),
-            host in 10u8..15,
-            extra in proptest::collection::vec(0usize..7, 0..3),
-        ) {
-            let signed = p.sign(&root()).unwrap();
-            let extra: Vec<RoleName> = extra.iter().map(|r| role(&format!("r{r}"))).collect();
-            let slice = signed.slice_for_host(node(host), &extra).unwrap();
-            prop_assert!(slice.verify(root().node_id()).is_ok());
-
-            let mine: BTreeSet<&ServiceName> = p
-                .services
-                .iter()
-                .filter(|(_, s)| s.hosts.contains(&node(host)))
-                .map(|(n, _)| n)
-                .collect();
-            let needed: BTreeSet<&RoleName> = mine
-                .iter()
-                .flat_map(|n| p.services[*n].allow.iter().chain(&p.services[*n].readers))
-                .chain(extra.iter())
-                .filter(|r| p.roles.contains_key(*r))
-                .collect();
-            let mut services = BTreeSet::new();
-            let mut roles = BTreeSet::new();
-            let mut bans = 0;
-            for item in &slice.items {
-                match item {
-                    Item::Service { key, body } => {
-                        prop_assert!(body.hosts.contains(&node(host)), "{key} doesn't name the host");
-                        services.insert(key);
-                    }
-                    Item::Role { key, .. } => {
-                        prop_assert!(needed.contains(key), "role {key} isn't needed");
-                        roles.insert(key);
-                    }
-                    Item::Ban { .. } => bans += 1,
-                    Item::Issuer { .. } | Item::Settings { .. } => {}
-                }
+        fn sign_after_keeps_exactly_the_unchanged_entries(a in arb_policy(), b in arb_policy()) {
+            let old = a.sign(&root()).unwrap();
+            let mut b = b;
+            b.version = StateVersion(a.version.0 + 1);
+            let new = b.sign_after(&root(), &old).unwrap();
+            prop_assert!(new.verify(root().node_id()).is_ok());
+            prop_assert_eq!(new.to_policy().unwrap(), b.clone());
+            for e in new.entries() {
+                let same = a.services.get(&e.name) == Some(&e.service);
+                prop_assert_eq!(e.version, if same { a.version } else { b.version });
             }
-            prop_assert_eq!(services, mine);
-            prop_assert_eq!(roles, needed);
-            prop_assert_eq!(bans, p.bans.len());
-            prop_assert_eq!(slice.settings(), Some(&p.settings));
         }
 
         #[test]
@@ -1209,7 +1227,7 @@ mod tests {
             principal in arb_principal(),
         ) {
             let signed = p.sign(&root()).unwrap();
-            let view = signed.view_for(principal.as_ref(), None).unwrap();
+            let view = signed.view_for(principal.as_ref(), None);
             prop_assert!(view.verify(root().node_id()).is_ok());
             // The rule, spelled out independently of `admits`.
             let admits = |r: &RoleName| match (&principal, p.roles.get(r)) {
@@ -1225,7 +1243,7 @@ mod tests {
             let got: Vec<(ServiceName, bool, bool)> = view
                 .entries
                 .iter()
-                .map(|e| (e.service().unwrap().0.clone(), e.call, e.read))
+                .map(|e| (e.entry.name.clone(), e.call, e.read))
                 .collect();
             prop_assert_eq!(got, want);
             if principal.is_none() {

@@ -219,7 +219,9 @@ impl ServiceEdit {
 /// `until` has passed dropped ([`Policy::prune_bans`]: the badge each one
 /// cancelled has expired), version + 1, valid until `ttl` from now or the
 /// stored one's expiry, whichever is later (an edit never shortens the
-/// policy's lifetime). Validation failures name the broken rule.
+/// policy's lifetime). Only the service entries the edit changed are
+/// re-signed ([`Policy::sign_after`]); the rest keep their signature and
+/// version. Validation failures name the broken rule.
 pub(crate) fn edit_policy(
     ks: &Keystore,
     ttl: Ttl,
@@ -241,7 +243,11 @@ pub(crate) fn edit_policy(
     next.not_after = ttl
         .not_after(now)
         .max(held.as_ref().map_or(i64::MIN, |h| h.policy.not_after));
-    let signed = next.sign(&root).context("the new policy is not valid")?;
+    let signed = match &held {
+        Some(h) => next.sign_after(&root, &h.signed),
+        None => next.sign(&root),
+    }
+    .context("the new policy is not valid")?;
     if !store::adopt_if_newer(ks, &signed, root.node_id(), now)? {
         bail!("another admin command changed the policy meanwhile; run this one again");
     }
@@ -694,6 +700,47 @@ mod tests {
         role_rm(&ks, role("analyst"), ttl()).unwrap();
         let stored = store::read(&ks, root).unwrap().unwrap();
         assert_eq!(stored.version(), StateVersion(v0.0 + 5));
+    }
+
+    /// An edit re-signs only the service entries it changes; the rest keep
+    /// their root signature and the version they last changed at, so a
+    /// caller holding them needs nothing new (card 36d).
+    #[test]
+    fn an_edit_re_signs_only_the_entries_it_changes() {
+        let ks = admin_with(&[]);
+        let matcher = vec![parse_matcher("*@x.com", GOOGLE_ISSUER).unwrap()];
+        role_set(&ks, role("analyst"), matcher, ttl()).unwrap();
+        let edit = |d: &str| ServiceEdit {
+            description: Some(d.into()),
+            allow: Some(vec![role("analyst")]),
+            ..Default::default()
+        };
+        add(&ks, svc("a"), edit("a"), ttl()).unwrap();
+        let at_b = add(&ks, svc("b"), edit("b"), ttl()).unwrap();
+        let s = set(&ks, svc("b"), edit("b, changed"), ttl()).unwrap();
+        let versions = |h: &Held| -> Vec<(String, u64)> {
+            h.signed
+                .entries()
+                .map(|e| (e.name.to_string(), e.version.0))
+                .collect()
+        };
+        let now = s.version().0;
+        assert_eq!(
+            versions(&s),
+            [("a".into(), now - 2), ("b".into(), now)],
+            "a kept its version"
+        );
+        let a = |h: &Held| h.signed.entries().next().unwrap().clone();
+        assert_eq!(a(&s), a(&at_b), "and its signature");
+        // A role edit changes no entry.
+        let s = role_set(
+            &ks,
+            role("analyst"),
+            vec![parse_matcher("*@y.com", GOOGLE_ISSUER).unwrap()],
+            ttl(),
+        )
+        .unwrap();
+        assert_eq!(versions(&s), [("a".into(), now - 2), ("b".into(), now)]);
     }
 
     #[test]

@@ -116,11 +116,12 @@ pub enum Error {
     #[error("invalid policy: {0}")]
     InvalidPolicy(String),
 
-    /// An [`InclusionProof`](crate::InclusionProof) does not prove its item
-    /// under the head it was checked against (a tampered item or proof, or
-    /// one issued under another head).
-    #[error("inclusion proof does not match the policy head")]
-    BadProof,
+    /// A signed policy's items don't hash to its head's
+    /// [`ItemsHash`](crate::ItemsHash): an item was tampered with, dropped or
+    /// added, or the items belong to another head. A holder applying a
+    /// [`PolicyUpdate`](crate::PolicyUpdate) then asks for the whole policy.
+    #[error("the items are not the ones the policy head commits to")]
+    ItemsMismatch,
 
     /// A [`Fresh`](crate::Fresh) was signed by a key the policy head does not
     /// list in `directories`.

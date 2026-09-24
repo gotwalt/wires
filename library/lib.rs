@@ -10,8 +10,8 @@
 //! - `calls/` — remote CLI calls: the session frames, invocations, audit
 //!   records and the host's call log, pushes, and IdP identity.
 //! - `services/` — the admin-signed policy (card 36): roles, the service
-//!   registry, policy evaluation; the items, their Merkle tree, the signed
-//!   head, slices and views, and freshness.
+//!   registry, policy evaluation; the items, the signed head and signed
+//!   service entries, updates, views, and freshness.
 //! - `directory/` — the directory's request and subscription frames.
 //!
 //! The folders are a filing system, not a namespace: every module is still
@@ -42,14 +42,14 @@
 //! - [`access`] — [`authorize`] and [`allowed_services`] over the policy.
 //! - [`item`] — the policy's leaves: [`Item`] (role, service, ban, issuer,
 //!   settings) and its [`ItemKey`].
-//! - [`merkle`] — the [`ItemTree`] over items: [`ItemsRoot`],
-//!   [`InclusionProof`] and [`MultiProof`].
-//! - [`head`] — the root-signed [`PolicyHead`] / [`SignedPolicyHead`], and
-//!   the [`StateVersion`] that orders them.
+//! - [`entry`] — a service's [`SignedEntry`], signed by the root on its own.
+//! - [`head`] — the root-signed [`PolicyHead`] / [`SignedPolicyHead`] over
+//!   an [`ItemsHash`], and the [`StateVersion`] that orders them.
 //! - [`signed_policy`] — the whole [`Policy`] and [`SignedPolicy`], and the
-//!   parts cut from it.
-//! - [`parts`] — a host's [`Slice`], a caller's [`View`], and the
-//!   [`SliceUpdate`] / [`ViewUpdate`] that move them to a newer head.
+//!   views cut from it.
+//! - [`policy_update`] — the [`PolicyUpdate`] that moves a whole policy to a
+//!   newer head.
+//! - [`view`] — a caller's [`View`] and the [`ViewUpdate`] that moves it.
 //! - [`fresh`] — a directory's signed [`Fresh`] timestamp.
 //! - [`directory`] — the [`DirectoryRequest`] / [`SubRequest`] frames on
 //!   [`DIRECTORY_ALPN`] and [`DIRECTORY_SUB_ALPN`].
@@ -145,7 +145,7 @@ pub mod push;
 pub mod session;
 
 // services/ — the admin-signed policy: the registry, roles, evaluation, and
-// the head, items, proofs and freshness a directory serves (card 36).
+// the head, items, signed entries and freshness a directory serves (card 36).
 #[path = "services/access.rs"]
 pub mod access;
 #[path = "services/registry.rs"]
@@ -153,18 +153,20 @@ pub mod registry;
 #[path = "services/role.rs"]
 pub mod role;
 
+#[path = "services/entry.rs"]
+pub mod entry;
 #[path = "services/fresh.rs"]
 pub mod fresh;
 #[path = "services/head.rs"]
 pub mod head;
 #[path = "services/item.rs"]
 pub mod item;
-#[path = "services/merkle.rs"]
-pub mod merkle;
-#[path = "services/parts.rs"]
-pub mod parts;
+#[path = "services/policy_update.rs"]
+pub mod policy_update;
 #[path = "services/signed_policy.rs"]
 pub mod signed_policy;
+#[path = "services/view.rs"]
+pub mod view;
 
 // directory/ — the directory's protocols.
 #[path = "directory/frames.rs"]
@@ -186,10 +188,12 @@ pub use directory::{
     DIRECTORY_ALPN, DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, MAX_DIRECTORY_FRAME,
     MAX_SMALL_DIRECTORY_FRAME, PUBLISH_BODY_PREFIX, SubFrame, SubRequest, SubscriptionKind,
 };
+pub use entry::{ENTRY_CONTEXT, ENTRY_V1, SignedEntry};
 pub use error::{Error, IdTokenError, Result};
 pub use fresh::{FRESH_CONTEXT, FRESH_V1, Fresh};
 pub use head::{
-    HeadHash, POLICY_HEAD_CONTEXT, POLICY_V3, PolicyHead, SignedPolicyHead, StateVersion,
+    HeadHash, ITEMS_CONTEXT, ItemsHash, POLICY_HEAD_CONTEXT, POLICY_V3, PolicyHead,
+    SignedPolicyHead, StateVersion,
 };
 pub use identity::{AlgorithmId, NodeId, NodeIdentity, Signature};
 pub use idp::{
@@ -203,12 +207,8 @@ pub use item::{
     Settings,
 };
 pub use membership::{MEMBERSHIP_V1, Membership};
-pub use merkle::{
-    InclusionProof, ItemHash, ItemTree, ItemsRoot, LeafRange, MAX_PROOF_DEPTH, MultiProof,
-    ProofHashes, ProofPath,
-};
-pub use parts::{Slice, SliceUpdate, View, ViewEntry, ViewUpdate};
 pub use policy::{check_admitted, check_inclusion};
+pub use policy_update::PolicyUpdate;
 pub use push::{
     INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_FRAME, MAX_INBOX_HELLO, MAX_PUSH_BODY,
     MAX_SUBJECT, PushBody, PushId, PushMessage, Subject,
@@ -217,3 +217,4 @@ pub use registry::{MAX_SERVICE_NAME, Service, ServiceName};
 pub use role::{EmailPattern, MAX_ROLE_NAME, Matcher, RoleName};
 pub use session::{Chunk, Frame, Hello, HelloAck};
 pub use signed_policy::{Policy, SignedPolicy};
+pub use view::{View, ViewEntry, ViewUpdate};

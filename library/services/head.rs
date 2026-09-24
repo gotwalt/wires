@@ -1,10 +1,12 @@
 //! The policy head: the root-signed summary every node holds (card 36).
 //!
 //! A [`PolicyHead`] names the fabric, a monotonic version, its lifetime, the
-//! directory nodes, and the Merkle root and count of the policy's items
-//! ([`crate::merkle`]). The root signs it ([`SignedPolicyHead`]); every item
-//! a node holds is proved against it, so a directory can hand out any subset
-//! of the policy without being able to forge or mix one.
+//! directory nodes, and an [`ItemsHash`] over every item of the policy. The
+//! root signs it ([`SignedPolicyHead`]); a node holding the whole policy
+//! checks its items against the hash, so a directory can't forge an item,
+//! drop one, or mix items from two versions. (A caller, which holds only
+//! some services, checks each one's own root signature instead:
+//! [`SignedEntry`](crate::SignedEntry).)
 //!
 //! - **Signed bytes:** [`POLICY_HEAD_CONTEXT`] followed by the canonical JSON
 //!   of `{alg, head}`. The context separates it from the state, memberships,
@@ -15,7 +17,9 @@
 //!   adopts a head only if it verifies, is fresh and
 //!   [is newer](SignedPolicyHead::is_newer_than).
 //! - **`directories`** sits in the head, not in an item: every node needs it,
-//!   and needs it before it can check any proof.
+//!   including a caller that holds no other item.
+//! - **Items hash:** blake3 over [`ITEMS_CONTEXT`] ‖ the canonical JSON array
+//!   of the items, strictly in [`ItemKey`](crate::ItemKey) order.
 //!
 //! ```
 //! use library::{NodeIdentity, Policy, StateVersion};
@@ -25,7 +29,8 @@
 //! policy.not_after = i64::MAX;
 //! let signed = policy.sign(&root).unwrap();
 //! signed.head.verify(root.node_id()).unwrap();
-//! assert_eq!(signed.head.head.item_count, 1, "just the settings item");
+//! assert_eq!(signed.items.len(), 1, "just the settings item");
+//! assert_eq!(signed.head.head.items_hash, library::ItemsHash::of(&signed.items).unwrap());
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -33,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::codec::{canonical_bytes, hex_id};
 use crate::error::{Error, Result};
 use crate::identity::{AlgorithmId, NodeId, NodeIdentity, Signature};
-use crate::merkle::ItemsRoot;
+use crate::item::Item;
 
 /// A monotonic policy version: every admin edit bumps it by one, and a node
 /// never replaces its copy with a lower one. (The name is kept from the
@@ -49,11 +54,39 @@ pub const POLICY_V3: u8 = 3;
 /// Domain-separation prefix of a head's signed bytes.
 pub const POLICY_HEAD_CONTEXT: &[u8] = b"wires/policy-head/v1\0";
 
+/// Domain-separation prefix of the bytes an [`ItemsHash`] hashes.
+pub const ITEMS_CONTEXT: &[u8] = b"wires/policy-items/v1\0";
+
 hex_id! {
     /// The blake3 hash of a [`SignedPolicyHead`]'s canonical JSON (signature
     /// included): names one exact head, for [`Fresh`](crate::Fresh) to vouch
     /// for.
     pub struct HeadHash([u8; 32]);
+}
+
+hex_id! {
+    /// The blake3 hash of a policy's whole item set: [`ITEMS_CONTEXT`] ‖ the
+    /// canonical JSON array of the items, in key order. The head signs it.
+    pub struct ItemsHash([u8; 32]);
+}
+
+impl ItemsHash {
+    /// The hash of `items`, in the order given (a policy's are strictly in
+    /// [`ItemKey`](crate::ItemKey) order, which
+    /// [`SignedPolicy::verify`](crate::SignedPolicy::verify) checks).
+    ///
+    /// ```
+    /// use library::{Item, ItemsHash, Settings};
+    /// let items = [Item::Settings { body: Settings::default() }];
+    /// assert_eq!(ItemsHash::of(&items).unwrap(), ItemsHash::of(&items).unwrap());
+    /// assert_ne!(ItemsHash::of(&items).unwrap(), ItemsHash::of(&[]).unwrap());
+    /// ```
+    pub fn of(items: &[Item]) -> Result<ItemsHash> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(ITEMS_CONTEXT);
+        hasher.update(&canonical_bytes(&items)?);
+        Ok(ItemsHash(*hasher.finalize().as_bytes()))
+    }
 }
 
 /// The content of a policy head. See the module docs.
@@ -75,10 +108,8 @@ pub struct PolicyHead {
     /// The directory nodes, in the admin's preference order, each once. Their
     /// keys sign [`Fresh`](crate::Fresh).
     pub directories: Vec<NodeId>,
-    /// The Merkle root over every item.
-    pub items_root: ItemsRoot,
-    /// How many items the tree holds (fixes its shape).
-    pub item_count: u64,
+    /// The hash of every item, in key order.
+    pub items_hash: ItemsHash,
 }
 
 /// A [`PolicyHead`] with the root's signature over it.
@@ -98,7 +129,8 @@ impl PolicyHead {
     /// Sign as-is with the root key. [`Error::FabricMismatch`] if `root` is
     /// not this head's `fabric`; [`Error::InvalidPolicy`] if a directory is
     /// listed twice. (Heads are normally signed by
-    /// [`Policy::sign`](crate::Policy::sign), which also computes the root.)
+    /// [`Policy::sign`](crate::Policy::sign), which also computes the items
+    /// hash.)
     pub fn sign(&self, root: &NodeIdentity) -> Result<SignedPolicyHead> {
         if root.node_id() != self.fabric {
             return Err(Error::FabricMismatch);
@@ -217,8 +249,7 @@ mod tests {
             issued: 10,
             not_after: 1_000,
             directories: vec![node(2), node(3)],
-            items_root: ItemsRoot::from_hex(&"ab".repeat(32)).unwrap(),
-            item_count: 7,
+            items_hash: ItemsHash::from_hex(&"ab".repeat(32)).unwrap(),
         }
     }
 
@@ -254,12 +285,12 @@ mod tests {
             Err(Error::FabricMismatch)
         ));
         let tampers: [fn(&mut PolicyHead); 4] = [
-            |h| h.item_count += 1,
+            |h| h.issued += 1,
             |h| {
                 h.directories.pop();
             },
             |h| h.not_after += 1,
-            |h| h.items_root = ItemsRoot::from_hex(&"cd".repeat(32)).unwrap(),
+            |h| h.items_hash = ItemsHash::from_hex(&"cd".repeat(32)).unwrap(),
         ];
         for tamper in tampers {
             let mut t = signed.clone();
@@ -326,7 +357,7 @@ mod tests {
         let a = sample().sign(&root()).unwrap();
         assert_eq!(a.hash().unwrap(), a.clone().hash().unwrap());
         let mut h = sample();
-        h.item_count += 1;
+        h.items_hash = ItemsHash::from_hex(&"cd".repeat(32)).unwrap();
         let b = h.sign(&root()).unwrap();
         assert_ne!(a.hash().unwrap(), b.hash().unwrap());
         assert_eq!(
@@ -334,6 +365,43 @@ mod tests {
             blake3::hash(&canonical_bytes(&a).unwrap())
                 .to_hex()
                 .as_str()
+        );
+    }
+
+    #[test]
+    fn the_items_hash_is_domain_separated_and_ordered() {
+        use crate::item::{Ban, Settings};
+        let items = vec![
+            Item::Ban {
+                key: node(2),
+                body: Ban { until: 5 },
+            },
+            Item::Settings {
+                body: Settings::default(),
+            },
+        ];
+        let mut want = ITEMS_CONTEXT.to_vec();
+        want.extend(canonical_bytes(&items).unwrap());
+        assert_eq!(
+            ItemsHash::of(&items).unwrap().hex(),
+            blake3::hash(&want).to_hex().as_str()
+        );
+        // Plain blake3 of the same JSON is another hash.
+        assert_ne!(
+            ItemsHash::of(&items).unwrap().hex(),
+            blake3::hash(&canonical_bytes(&items).unwrap())
+                .to_hex()
+                .as_str()
+        );
+        let mut swapped = items.clone();
+        swapped.swap(0, 1);
+        assert_ne!(
+            ItemsHash::of(&items).unwrap(),
+            ItemsHash::of(&swapped).unwrap()
+        );
+        assert_ne!(
+            ItemsHash::of(&items).unwrap(),
+            ItemsHash::of(&items[..1]).unwrap()
         );
     }
 

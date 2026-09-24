@@ -7,9 +7,9 @@
 //! the lock a removed member presenting a genuine older policy could roll a
 //! node back.
 //!
-//! In card 36b every node still holds the whole policy (hosts narrow to
-//! slices in card 36c, callers to views in card 37). A directory keeps its
-//! own copy in `directory.redb` ([`crate::directory`]).
+//! Hosts and directories hold the whole policy; callers do too until card
+//! 37 gives each its view. A directory keeps its own copy in
+//! `directory.redb` ([`crate::directory`]).
 
 use std::fs::OpenOptions;
 

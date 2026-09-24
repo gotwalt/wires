@@ -8,7 +8,8 @@
 //! - [`SubscriptionProtocol`] (`wires/directory-sub/1`): a `replica`
 //!   subscription from another directory the head lists: the whole policy
 //!   whenever it moves past what the subscriber holds, and a `fresh` beat
-//!   otherwise. `slice` and `view` are cards 36c and 37.
+//!   otherwise. A host's `policy` subscription (with `policy_update`
+//!   deltas) is card 36c's, a caller's `view` card 37's.
 //! - [`beat_loop`]: a new `Fresh` every `settings.beat_secs`.
 //! - [`replicate`]: follow every other directory the head lists as a
 //!   `replica`, and take any newer head it has, so a directory that missed
@@ -154,7 +155,7 @@ async fn subscription(dir: &Directory, conn: &Connection, caller: NodeId) -> Res
     if kind != SubscriptionKind::Replica {
         return deny(
             &mut send,
-            "this directory does not serve slice or view subscriptions yet (cards 36c, 37)".into(),
+            "this directory does not serve policy or view subscriptions yet (cards 36c, 37)".into(),
         )
         .await;
     }
@@ -192,7 +193,7 @@ async fn subscription(dir: &Directory, conn: &Connection, caller: NodeId) -> Res
         {
             let frame = if c.held.version() > sent {
                 sent = c.held.version();
-                SubFrame::Replica {
+                SubFrame::Policy {
                     policy: c.held.signed.clone(),
                     fresh,
                 }
@@ -298,14 +299,13 @@ async fn follow_once(
     let subscribe = SubRequest::Subscribe {
         kind: SubscriptionKind::Replica,
         have: dir.version(),
-        roles: Vec::new(),
     };
     wire::write(&mut send, &hello.encode()?).await?;
     wire::write(&mut send, &subscribe.encode()?).await?;
     let result = async {
         while let Some(frame) = wire::read_sub_frame(&mut recv).await? {
             match frame {
-                SubFrame::Replica { policy, fresh } => {
+                SubFrame::Policy { policy, fresh } => {
                     policy.head.verify(dir.root())?;
                     fresh
                         .verify(&policy.head)

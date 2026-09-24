@@ -16,9 +16,9 @@
 //!
 //! Nothing is ever adopted except through [`store::adopt_if_newer`]
 //! (verified under the root, fresh, strictly newer), so a lying directory
-//! can only fail to help. **Temporary (card 36b):** hosts and callers still
-//! fetch the whole policy (`policy {have}`); card 36c moves hosts to a slice
-//! subscription and card 37 callers to views.
+//! can only fail to help. Hosts hold the whole policy; card 36c moves them
+//! from this timer to a `policy` subscription with `policy_update` deltas,
+//! and card 37 moves callers from the whole policy to their views.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -404,7 +404,7 @@ pub(crate) async fn check_once(endpoint: &Endpoint, ks: &Keystore) -> Result<Opt
 /// A running host's (or gateway's) check, until `stop` resolves or its
 /// sender is dropped, or the endpoint closes: at once, then every `every`
 /// (the held policy's `settings.beat_secs` when `None`), [`check_once`].
-/// Card 36c replaces this with a slice subscription.
+/// Card 36c replaces this with a `policy` subscription.
 pub(crate) async fn refresh_loop(
     endpoint: Endpoint,
     ks: Arc<Keystore>,
