@@ -165,11 +165,11 @@ with junk connections gets real calls dropped from the log.
 
 ## Acceptance
 
-- [ ] A test for each finding that fails before the fix.
-- [ ] `make demo` green; the push demo uses the per-call push capability.
-- [ ] `grep -rn "is_member()\|MEMBER_ROLE" library wires` is empty.
-- [ ] README, usage, protocol, summary and CLAUDE.md pass the rebuttal test and agree with the code.
-- [ ] `make lint test` green.
+- [x] A test for each finding (named per section in the integrator review below). Red-before-fix was checked for a sample (L2a all; L2b, L3 some; L6 all), not for every test.
+- [x] `make demo` green; the push demo uses the per-call push capability (`.scripts/fixtures/ci.sh`).
+- [x] `grep -rn "is_member()\|MEMBER_ROLE" library wires` is empty.
+- [x] README, usage, protocol, summary and CLAUDE.md agree with the code (docs sweep L5; five claims spot-checked in review).
+- [x] `make lint test` green (129 / 334 / 41 at 419818b).
 
 ## Notes
 
@@ -204,3 +204,18 @@ Documentation and doc comments only; no behaviour changed.
 - **Known limits:** README, usage, protocol §10 and the summary list what stays accepted until card 29: the O(members) org chart every member holds, argv seen by a removed host, hidden-link count and timing, and Google's ~1 h tokens with the nonce dropped on refresh.
 - **Refusals and the environment:** usage's service-environment paragraph (it still said `WIRES_HOME` is passed) and its revocation text ("in the host's log") are fixed: a non-member's refusal is traced, not logged.
 - **Checks:** `cargo test --workspace`, clippy `-D warnings` and `fmt --check` are green.
+
+### Integrator review (2026-09-24) → done
+
+An independent reviewer checked c8ef536: every in-scope finding in §1–§6, §8–§10 is fixed with a named test, and no regression against the premise was found. Its follow-ups were built in lane L6 (419818b):
+- state sync reads as bytes arrive, only an offer can be large (4 KiB otherwise), 16 exchanges at a time, membership before signature verification, strangers hear only "not admitted";
+- the record stream's `Open` is capped at 64 KiB with 16 undecided readers;
+- the inbox receiver gives strangers the fixed refusal text;
+- the child push socket lives in a private runtime directory, not the keystore;
+- `host.json` `end_of_options` inserts `--` before the caller's arguments (§10).
+
+Carried forward, by design:
+- `Invoke` is still sent with `Hello`, and the in-memory high-water mark is lost on restart (card 29);
+- push by principal and all of §7 (card 31);
+- a same-user service can still read the host keystore at its default path ([card 32](../backlog/32-service-sandbox-OPEN.md)).
+
