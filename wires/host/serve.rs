@@ -415,14 +415,14 @@ mod tests {
         let idp = crate::caller::mock_idp::MockIdp::start("alice@example.com").await;
         let home = crate::testutil::temp_dir();
         let now = crate::clock::now_unix();
-        jwks::KeyFetcher::new(Some(home.join("jwks")))
+        jwks::KeyFetcher::new(Some(home.join(crate::caller::jwks::JWKS_DIR)))
             .unwrap()
             .keys(&idp.issuer, None, now)
             .await
             .unwrap();
         assert_eq!(idp.jwks_fetches(), 1);
         assert!(
-            std::fs::read_dir(home.join("jwks"))
+            std::fs::read_dir(home.join(crate::caller::jwks::JWKS_DIR))
                 .unwrap()
                 .next()
                 .is_some()

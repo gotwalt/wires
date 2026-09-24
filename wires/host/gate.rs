@@ -59,7 +59,7 @@ pub(crate) const IDP_UNREACHABLE: &str =
 /// What a peer hears when this host can't decide at all (no readable signed
 /// state, or one older than it already decided under): the operator's
 /// problem, not the peer's. The cause goes only to the host's trace.
-pub(crate) const HOST_MISCONFIGURED: &str = "responder configuration error";
+pub(crate) const HOST_MISCONFIGURED: &str = "host configuration error";
 
 /// Why [`ServicesHost::decide_push`] refused a recipient. `Display` is the
 /// reason recorded and reported.

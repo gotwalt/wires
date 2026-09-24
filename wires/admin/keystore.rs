@@ -306,7 +306,7 @@ fn write_secret(path: &Path, contents: &str) -> Result<()> {
 /// connection while `wires/state` adopts a newer copy from another task or
 /// process. A plain `std::fs::write` is `O_TRUNC` followed by a write, so a
 /// reader landing in that window sees an empty or half-written file and the
-/// host fails closed ("responder configuration error") over a scheduling
+/// host fails closed ("host configuration error") over a scheduling
 /// accident.
 ///
 /// `rename(2)` within a directory is atomic, so a reader sees either the
@@ -372,7 +372,7 @@ fn set_mode(path: &Path, mode: u32) {
 /// *this* keystore's node.
 ///
 /// Catches a membership copied to the wrong machine without a network
-/// round-trip, so it never masquerades as a refusal by the responder.
+/// round-trip, so it never masquerades as a refusal by the host.
 pub(crate) fn preflight(node: NodeId, membership: &Membership) -> Result<()> {
     if membership.member != node {
         bail!(

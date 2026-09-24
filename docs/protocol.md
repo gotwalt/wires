@@ -178,7 +178,7 @@ removal applies on the next dial without a restart. Before it knows who is askin
 sessions open (one more is closed unanswered), and it sizes no buffer from a length prefix. The first
 failure below is sent as `Denied` (`wires/host/gate.rs`):
 
-1. The host holds a readable state (else `responder configuration error`).
+1. The host holds a readable state (else `host configuration error`).
 2. **Membership, before anything else:** `check_inclusion(hello.membership, trust_root, caller,
    now)` and the state lists `caller`. Anyone else — no credential, someone else's, another network's,
    expired, removed — hears only `not a member of this network`: no reason, no state version. Their
@@ -219,7 +219,7 @@ reach whatever that user can, the host's keystore and operator socket included. 
 switch users itself; the operator does
 ([deployment.md](deployment.md#run-services-as-a-separate-unix-user)). Independently of that, the host fails closed on the parts of its
 keystore a child could tamper with: it keeps the highest state version it has decided under in
-memory and refuses to decide under an older `state.json` (`responder configuration error`, logged
+memory and refuses to decide under an older `state.json` (`host configuration error`, logged
 as a rollback), and it trusts only issuer keys it fetched itself (§6).
 
 **Native services** (card 33: `wires/host/native.rs`, `wires/host/embed.rs`). An app can embed

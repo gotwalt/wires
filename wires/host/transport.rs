@@ -969,7 +969,7 @@ pub(crate) fn child_env(
 /// local or transport failure, so `wires call` can exit with a dedicated
 /// code and print the host's own words.
 #[derive(Debug, thiserror::Error)]
-#[error("denied by responder: {reason}")]
+#[error("denied by host: {reason}")]
 pub struct Denied {
     /// The host's stated reason.
     reason: String,

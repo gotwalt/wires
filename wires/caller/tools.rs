@@ -241,7 +241,7 @@ pub fn run_tools_cmd(a: ToolsArgs) -> Result<String> {
         ToolsCmd::Rm { name } => {
             let name = ServiceName::new(name)?;
             if config.remove(&name).is_none() {
-                bail!("no tool named `{name}` in {}", path.display());
+                bail!("no alias named `{name}` in {}", path.display());
             }
             config.save(&path)?;
             Ok(format!("removed {name}"))

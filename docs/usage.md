@@ -134,7 +134,7 @@ agent$ wires join eyJhZG1pbiI6…
 agent$ wires services
 wires services: no service allows this node without a login (state v9)
 agent$ wires call orders-db -- "select count(*) from orders"
-wires: denied by responder: no ID token presented; run `wires login`; orders-db needs a verified identity in role analyst
+wires: denied by host: no ID token presented; run `wires login`; orders-db needs a verified identity in role analyst
 agent$ echo $?
 77
 agent$ wires login --client-id <client id> --client-secret <secret>
@@ -154,7 +154,7 @@ anyway is refused with the reason:
 observer$ wires services
 wires services: no service allows sec@audit.example (state v10)
 observer$ wires call orders-db -- "select 1"
-wires: denied by responder: sec@audit.example is in no role allowed to call orders-db (analyst)
+wires: denied by host: sec@audit.example is in no role allowed to call orders-db (analyst)
 ```
 
 `--jq`, `--head` and `--max-bytes` are applied inside `wires call`; the host
@@ -195,7 +195,7 @@ admin$ wires remove agent
 wires: state version 11: pushed to 2 of 2 host(s)
 removed dd7e7237… (agent) (state version 11, 4 members)
 agent$ wires call orders-db -- "select count(*) from orders"
-wires: denied by responder: not a member of this network
+wires: denied by host: not a member of this network
 agent$ echo $?
 77
 ```
@@ -485,7 +485,7 @@ a container can mount its node key from a secret with `--node-seed-file`.
 
 `serve` re-reads its signed state once per connection, so a removal takes
 effect at each host on the next call after that host has the new state, with
-no restart. A refused call prints `wires: denied by responder: <reason>` on
+no restart. A refused call prints `wires: denied by host: <reason>` on
 stderr, writes nothing to stdout and exits `77`. A member's refusal is in the
 host's log; a removed member hears only `not a member of this network`, and
 the host traces that instead of logging it. There is no shared key, so there

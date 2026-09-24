@@ -24,8 +24,8 @@ What's covered:
   localhost, no relay or discovery), and `e2e/`: the whole stack over
   hermetic loopback (the registry deciding each call, `also_require`,
   removal with no restart, unassigned services, push by the state and by a
-  call's push capability, what a service child can and can't reach, nothing
-  sent to a bystander, the record stream keyed by person, and the web
+  call's push capability, what a service child can and can't reach, the
+  record stream keyed by person, and the web
   gateway's OAuth and MCP paths).
 
 ## Lint and format

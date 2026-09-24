@@ -317,5 +317,5 @@ async fn a_rolled_back_state_is_refused() {
     let old = w.state(1).encode().unwrap();
     std::fs::write(ks.path(crate::state::store::STATE_FILE), format!("{old}\n")).unwrap();
     let refused = call_env(&w, &w.alice, &host).await.unwrap_err();
-    assert_eq!(refused, "responder configuration error");
+    assert_eq!(refused, "host configuration error");
 }

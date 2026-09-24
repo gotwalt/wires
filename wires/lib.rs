@@ -408,7 +408,7 @@ fn print_report(result: anyhow::Result<admin::Report>) {
 /// admission" still lands here.
 fn exit_with(e: anyhow::Error) -> ! {
     if let Some(d) = e.downcast_ref::<host::transport::Denied>() {
-        eprintln!("wires: denied by responder: {}", d.reason());
+        eprintln!("wires: denied by host: {}", d.reason());
         std::process::exit(EXIT_DENIED);
     }
     eprintln!("wires: {e:#}");

@@ -103,8 +103,8 @@ struct Running {
 }
 
 const REDIRECT: &str = "http://127.0.0.1:9/callback";
-const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+const VERIFIER: &str = crate::caller::login::RFC7636_VERIFIER;
+const CHALLENGE: &str = crate::caller::login::RFC7636_CHALLENGE;
 
 impl Running {
     async fn start(idp: &MockIdp) -> Self {
