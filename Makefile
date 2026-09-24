@@ -24,9 +24,9 @@ python: ## Build the Python bindings into target/python (card 33)
 	.scripts/build-python.sh
 node: ## Build the Node/TypeScript package into target/node/wires (card 33)
 	.scripts/build-node.sh
-demo-python: ## Serve a Python-native service on a loopback fabric and call it
+demo-python: ## Serve a Python-native service on a loopback network and call it
 	.scripts/demo-native-service.sh --lang python
-demo-node: ## Serve a TypeScript-native service on a loopback fabric and call it
+demo-node: ## Serve a TypeScript-native service on a loopback network and call it
 	.scripts/demo-native-service.sh --lang node
 image: ## Build the distroless image natively (wires:dev)
 	docker build -t wires:dev .

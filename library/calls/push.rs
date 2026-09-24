@@ -69,7 +69,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::canonical_bytes;
+use crate::codec::{canonical_bytes, hex_id, length_prefixed, prefix_len, split_frame};
 use crate::error::{Error, Result};
 use crate::identity::NodeId;
 use crate::idp::IdToken;
@@ -102,24 +102,9 @@ pub const MAX_INBOX_FRAME: usize = 4 * 1024 * 1024;
 /// [`MAX_INBOX_FRAME`] a delivery may need.
 pub const MAX_INBOX_HELLO: usize = 64 * 1024;
 
-/// A push message's id: 16 random bytes, hex on the wire. What a receiver
-/// de-duplicates by.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct PushId([u8; 16]);
-
-impl PushId {
-    /// A fresh random id.
-    pub fn generate() -> Self {
-        Self(rand::random())
-    }
-
-    /// Lowercase hex (32 characters).
-    pub fn hex(&self) -> String {
-        hex::encode(self.0)
-    }
-
-    /// Parse 32 hex characters.
+hex_id! {
+    /// A push message's id: 16 random bytes, hex on the wire. What a receiver
+    /// de-duplicates by.
     ///
     /// ```
     /// use library::PushId;
@@ -127,28 +112,14 @@ impl PushId {
     /// assert_eq!(PushId::from_hex(&id.hex()).unwrap(), id);
     /// assert!(PushId::from_hex("abc").is_err());
     /// ```
-    pub fn from_hex(s: &str) -> Result<Self> {
-        let bytes = hex::decode(s)?;
-        Ok(Self(bytes.try_into().map_err(|_| Error::BadKeyLength)?))
-    }
+    #[derive(PartialOrd, Ord)]
+    pub struct PushId([u8; 16]);
 }
 
-impl TryFrom<String> for PushId {
-    type Error = Error;
-    fn try_from(s: String) -> Result<Self> {
-        Self::from_hex(&s)
-    }
-}
-
-impl From<PushId> for String {
-    fn from(id: PushId) -> String {
-        id.hex()
-    }
-}
-
-impl std::fmt::Display for PushId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.hex())
+impl PushId {
+    /// A fresh random id.
+    pub fn generate() -> Self {
+        Self(rand::random())
     }
 }
 
@@ -327,11 +298,7 @@ impl InboxFrame {
         if body.len() > MAX_INBOX_FRAME {
             return Err(Error::InvalidPush("the frame is larger than 4 MiB"));
         }
-        let len = u32::try_from(body.len()).map_err(|_| Error::BadFrame)?;
-        let mut out = Vec::with_capacity(4 + body.len());
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(&body);
-        Ok(out)
+        length_prefixed(&body)
     }
 
     /// Decode the first frame in `buf`: `Ok(None)` until a whole frame has
@@ -339,14 +306,11 @@ impl InboxFrame {
     /// over [`MAX_INBOX_FRAME`] is refused before the body is looked at, and
     /// so is a `Deliver` of more than [`MAX_BATCH`] messages. Never panics.
     pub fn decode(buf: &[u8]) -> Result<Option<(Self, usize)>> {
-        let Some(len) = Self::length(buf)? else {
+        Self::length(buf)?;
+        let Some((body, end)) = split_frame(buf) else {
             return Ok(None);
         };
-        let end = 4 + len;
-        if buf.len() < end {
-            return Ok(None);
-        }
-        let frame: Self = serde_json::from_slice(&buf[4..end]).map_err(Error::Decode)?;
+        let frame: Self = serde_json::from_slice(body).map_err(Error::Decode)?;
         frame.check()?;
         Ok(Some((frame, end)))
     }
@@ -355,10 +319,9 @@ impl InboxFrame {
     /// the four prefix bytes are there; an error when it is over
     /// [`MAX_INBOX_FRAME`] (a reader allocates nothing for it).
     pub fn length(buf: &[u8]) -> Result<Option<usize>> {
-        let Some(prefix) = buf.get(..4) else {
+        let Some(len) = prefix_len(buf) else {
             return Ok(None);
         };
-        let len = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
         if len > MAX_INBOX_FRAME {
             return Err(Error::InvalidPush("the frame is larger than 4 MiB"));
         }

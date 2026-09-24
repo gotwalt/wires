@@ -347,17 +347,16 @@ impl Labels {
                 .map(|(_, s)| s.clone())
         };
         match record {
-            AuditRecord::Started { call, tool, .. } => {
-                let service = ServiceName::from(tool.clone());
+            AuditRecord::Started { call, service, .. } => {
                 self.0.push_back((*call, service.clone()));
                 while self.0.len() > LABELS_KEPT {
                     self.0.pop_front();
                 }
-                Some(service)
+                Some(service.clone())
             }
             AuditRecord::Finished { call, .. } => of(self, call),
             AuditRecord::Push { call, .. } => call.as_ref().and_then(|c| of(self, c)),
-            AuditRecord::Denied { tool, .. } => tool.clone().map(ServiceName::from),
+            AuditRecord::Denied { service, .. } => service.clone(),
         }
     }
 }
@@ -578,13 +577,7 @@ pub(crate) async fn watch_with(
     opts: &WatchOpts,
     out: &mut (dyn FnMut(Output) + Send),
 ) -> Result<Report> {
-    let membership = ks
-        .read_membership()?
-        .context("this node has no membership: run `wires join <token>` first")?;
-    let state = store::read(ks, membership.fabric)?.context(
-        "this node holds no signed state yet: `wires join` delivers it (or ask the admin to \
-         push it)",
-    )?;
+    let (membership, state) = store::require(ks)?;
     let state = &state.state;
     let services: Vec<ServiceName> = if opts.services.is_empty() {
         state.services.keys().cloned().collect()
@@ -677,7 +670,7 @@ pub(crate) async fn watch_with(
     };
     while let Some(event) = rx.recv().await {
         let host = event.host();
-        let short = pick::short(&host);
+        let short = host.short();
         match event {
             Event::Item {
                 progress: p, shown, ..
@@ -837,19 +830,16 @@ pub(crate) fn audit_line(record: &AuditRecord) -> String {
             call,
             caller,
             principal,
-            tool,
+            service,
             argv,
             role,
             ..
         } => {
-            let role = role
-                .as_deref()
-                .map(|r| format!(" [{}]", escape(r)))
-                .unwrap_or_default();
             let mut line = format!(
-                "▶ {} {}{role} {tool}",
+                "▶ {} {} [{}] {service}",
                 short_hex(&call.hex()),
-                caller_label(*caller, principal.as_ref())
+                caller_label(*caller, principal.as_ref()),
+                escape(role.as_str())
             );
             for arg in argv.as_slice() {
                 line.push(' ');
@@ -910,12 +900,12 @@ pub(crate) fn audit_line(record: &AuditRecord) -> String {
         }
         AuditRecord::Denied {
             caller,
-            tool,
+            service,
             reason,
             ..
-        } => match tool {
-            Some(tool) => format!(
-                "✗ {} {tool} denied: {}",
+        } => match service {
+            Some(service) => format!(
+                "✗ {} {service} denied: {}",
                 short_node(*caller),
                 escape(reason)
             ),
@@ -1000,7 +990,7 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library::{Argv, CallId, NodeIdentity, ToolName};
+    use library::{Argv, CallId, NodeIdentity, ServiceName};
 
     fn host() -> NodeIdentity {
         NodeIdentity::from_seed([9; 32])
@@ -1014,7 +1004,7 @@ mod tests {
             let r = AuditRecord::Denied {
                 caller: h.node_id(),
                 principal: None,
-                tool: None,
+                service: None,
                 reason: format!("r{i}"),
                 at_ms: 0,
             };
@@ -1223,10 +1213,10 @@ mod tests {
             call,
             caller,
             principal: None,
-            tool: ToolName::new("orders-db").unwrap(),
+            service: ServiceName::new("orders-db").unwrap(),
             argv: Argv::new(vec![]).unwrap(),
-            roster_version: None,
-            role: None,
+            state_version: library::StateVersion(1),
+            role: library::RoleName::new("analyst").unwrap(),
             at_ms: 0,
         };
         let finished = |call| AuditRecord::Finished {
@@ -1273,10 +1263,10 @@ mod tests {
             call: CallId::from_hex(&"3fa2".repeat(8)).unwrap(),
             caller,
             principal: None,
-            tool: ToolName::new("orders-db").unwrap(),
+            service: ServiceName::new("orders-db").unwrap(),
             argv: Argv::new(vec!["select 1".into(), "x".into()]).unwrap(),
-            roster_version: None,
-            role: Some("analyst".into()),
+            state_version: library::StateVersion(1),
+            role: library::RoleName::new("analyst").unwrap(),
             at_ms: 0,
         };
         assert_eq!(
@@ -1289,7 +1279,7 @@ mod tests {
         let denied = AuditRecord::Denied {
             caller,
             principal: None,
-            tool: None,
+            service: None,
             reason: "no\nforged".into(),
             at_ms: 0,
         };

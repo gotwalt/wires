@@ -42,8 +42,10 @@ extern crate self as wires;
 
 mod admin;
 mod caller;
+mod clock;
 mod gateway;
 mod host;
+mod net;
 mod state;
 
 pub use host::embed::{Host, HostBuilder};
@@ -218,15 +220,6 @@ async fn dev_mock_idp_cmd(a: DevMockIdpArgs) -> anyhow::Result<()> {
 /// `wires call` can tell "you are not allowed" apart from "the network is
 /// down" without parsing text.
 const EXIT_DENIED: i32 = 77;
-
-/// Current unix time in seconds.
-pub(crate) fn now_unix() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
 
 /// Build a multi-threaded tokio runtime for the network subcommands.
 fn runtime() -> tokio::runtime::Runtime {

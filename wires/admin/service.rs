@@ -30,7 +30,7 @@ use super::invite::{Report, resolve_member};
 use super::keystore::Keystore;
 use super::propagate;
 use super::ttl::Ttl;
-use crate::now_unix;
+use crate::clock::now_unix;
 use crate::state::{store, sync};
 
 /// `service` arguments.
@@ -285,10 +285,7 @@ pub(crate) fn role_rm(ks: &Keystore, name: RoleName, ttl: Ttl) -> Result<SignedS
 fn check_hosts(s: &State, hosts: Option<&[NodeId]>) -> Result<()> {
     for h in hosts.unwrap_or_default() {
         if !s.is_member(*h) {
-            bail!(
-                "{} is not a member; `wires invite` it first",
-                &h.hex()[..16]
-            );
+            bail!("{} is not a member; `wires invite` it first", h.short());
         }
     }
     Ok(())

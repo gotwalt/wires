@@ -33,7 +33,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use clap::Args;
-use library::{Audience, IdToken, IdentityClaim, Issuer, NodeId, OidcNonce, Principal};
+use library::{Audience, B64, IdToken, IdentityClaim, Issuer, NodeId, OidcNonce, Principal};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -71,8 +71,6 @@ pub(crate) const CALLBACK_LINGER: Duration = Duration::from_secs(3);
 /// it was just sent. So the rest of the request is read and thrown away, until
 /// the browser hangs up or this runs out.
 const DRAIN_WAIT: Duration = Duration::from_secs(2);
-
-const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// `login` arguments.
 #[derive(Args, Debug, Default)]
@@ -412,7 +410,7 @@ async fn finish(
             &claim,
             std::slice::from_ref(&client.issuer),
             &[client.audience()],
-            crate::now_unix(),
+            crate::clock::now_unix(),
         )
         .await
         .map_err(|e| anyhow!("the IdP's ID token does not verify as a claim for this node: {e}"))?;
@@ -748,11 +746,7 @@ pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
     eprintln!(
         "wires login: node {} is {} (token stored in {}, valid until unix {})",
         node.hex(),
-        login
-            .principal
-            .email
-            .as_deref()
-            .unwrap_or(&login.principal.subject),
+        login.principal.name(),
         token_path.display(),
         login.principal.not_after
     );
@@ -1073,7 +1067,7 @@ mod tests {
         let idp = MockIdp::start("alice@example.com").await;
         let dir = crate::testutil::ScratchDir::new("jwk");
         let cache = Some(dir.path().to_path_buf());
-        let now = crate::now_unix();
+        let now = crate::clock::now_unix();
         let aud = [Audience::new(idp.client_id.clone())];
         let iss = [idp.issuer.clone()];
 
@@ -1117,7 +1111,7 @@ mod tests {
     async fn an_expired_claim_still_names_its_principal() {
         let idp = MockIdp::start("alice@example.com").await;
         let fetcher = KeyFetcher::new(None).unwrap();
-        let now = crate::now_unix();
+        let now = crate::clock::now_unix();
         let stale = IdentityClaim {
             node: node(),
             id_token: idp.mint(&OidcNonce::for_node(&node()), now - 3600),
@@ -1145,14 +1139,17 @@ mod tests {
         let fetcher = KeyFetcher::new(None).unwrap();
         let claim = IdentityClaim {
             node: node(),
-            id_token: idp.mint(&OidcNonce::for_node(&node()), crate::now_unix() + 600),
+            id_token: idp.mint(
+                &OidcNonce::for_node(&node()),
+                crate::clock::now_unix() + 600,
+            ),
         };
         let err = fetcher
             .verify(
                 &claim,
                 &[Issuer::new("https://accounts.google.com")],
                 &[Audience::new(idp.client_id.clone())],
-                crate::now_unix(),
+                crate::clock::now_unix(),
             )
             .await
             .unwrap_err();

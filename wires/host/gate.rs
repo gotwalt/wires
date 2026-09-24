@@ -11,7 +11,7 @@
 //! 3. the service is registered, and assigned to **this** host
 //!    ([`State::assigns`](library::State::assigns));
 //! 4. the registry allows the caller's role ([`library::authorize`]);
-//! 5. the host's own `also_require` roles (`host.json` v2), which can only
+//! 5. the host's own `also_require` roles (`host.json`), which can only
 //!    narrow: the caller must be in **every** one of them.
 //!
 //! A member's refusal is also written to the call log. The caller's
@@ -20,9 +20,9 @@
 //! caller, under the host's `identity.issuers`: [`ServicesHost::principal`]),
 //! so [`admit`] is pure and clock-free except for `now`.
 //!
-//! [`ServicesHost`] is everything a v2 host decides with: its own
+//! [`ServicesHost`] is everything a host decides with: its own
 //! credentials, where its signed state lives (re-read per connection), its
-//! `host.json` v2, the identity verifier and the call-log sink. The session
+//! `host.json`, the identity verifier and the call-log sink. The session
 //! transport ([`ServicesProtocol`](crate::host::transport::ServicesProtocol))
 //! and the push service ([`push`](crate::host::push)) both ask it.
 
@@ -37,15 +37,15 @@ use library::{
 
 use crate::admin::keystore::Keystore;
 use crate::caller::jwks::VerifyError;
-use crate::host::config_v2::HostConfigV2;
-use crate::host::identity::{Identities, principal_name};
+use crate::host::config::HostConfig;
+use crate::host::identity::Identities;
 use crate::host::transport::AuditSink;
 
 /// The one refusal a peer that is not a member of this host's signed state
 /// hears, whatever the reason (no credential, someone else's, expired,
 /// removed, never invited). It says nothing about the state, its version or
 /// who is in it; the exact reason goes only to the host's trace.
-pub(crate) const NOT_ADMITTED: &str = "not admitted to this fabric";
+pub(crate) const NOT_ADMITTED: &str = "not a member of this network";
 
 /// What a member hears when the ID token it presented did not verify
 /// (untrusted issuer, bad signature, wrong audience or nonce). The exact
@@ -167,7 +167,7 @@ impl fmt::Display for GateRefusal {
 /// Run the checks in the module docs. `me` is this host.
 pub(crate) fn admit(
     state: &SignedState,
-    config: &HostConfigV2,
+    config: &HostConfig,
     me: NodeId,
     caller: NodeId,
     principal: Option<&Principal>,
@@ -205,7 +205,7 @@ pub(crate) fn admit(
         return Err(GateRefusal::AlsoRequire {
             service: service.clone(),
             roles: also.to_vec(),
-            principal: principal.map(principal_name),
+            principal: principal.map(Principal::name),
         });
     }
     Ok(Admitted {
@@ -218,12 +218,12 @@ pub(crate) fn admit(
 /// in-process handler (card 33).
 pub(crate) enum Implementation<'a> {
     /// A CLI child, from `host.json`.
-    Command(&'a crate::host::config_v2::ServiceImpl),
+    Command(&'a crate::host::config::ServiceImpl),
     /// A native service.
     Native(Arc<dyn crate::host::native::DynService>),
 }
 
-/// Everything a v2 host (`wires serve` with a `host.json` v2) decides with.
+/// Everything a host (`wires serve` with a `host.json`) decides with.
 /// Built once per `serve`, shared by every session and the push service.
 pub(crate) struct ServicesHost {
     /// This host.
@@ -235,8 +235,8 @@ pub(crate) struct ServicesHost {
     /// Where the signed state is read from, per connection (so a newer
     /// state adopted by `wires/state` takes effect on the next dial).
     pub(crate) keystore: Arc<Keystore>,
-    /// `host.json` v2.
-    pub(crate) config: HostConfigV2,
+    /// `host.json`.
+    pub(crate) config: HostConfig,
     /// The services an app implements in-process (card 33), beside
     /// `config`'s CLI services. Empty for `wires serve`.
     pub(crate) native: crate::host::native::NativeServices,
@@ -310,7 +310,7 @@ impl ServicesHost {
         })?;
         self.config.check_against(&state.state, self.me)?;
         let version = state.state.version.0;
-        let me8 = &self.me.hex()[..8];
+        let me8 = self.me.short();
         for name in self.native.keys() {
             if self.config.services.contains_key(name) {
                 bail!("service {name} is both in host.json and a native service; pick one");
@@ -390,7 +390,7 @@ impl ServicesHost {
                 None,
                 Some(format!(
                     "the ID token for {} expired; run `wires login`",
-                    principal_name(&p)
+                    p.name()
                 )),
             ),
             Err(VerifyError::Unavailable(_)) => (None, Some(IDP_UNREACHABLE.to_string())),
@@ -465,7 +465,7 @@ impl ServicesHost {
             return Err((
                 format!(
                     "{} is not a member of the current signed state (version {})",
-                    &node.hex()[..8],
+                    node.short(),
                     state.state.version.0
                 ),
                 true,
@@ -499,7 +499,7 @@ impl ServicesHost {
             match &principal {
                 Some(p) => format!(
                     "{} is in no role allowed to receive pushes ({roles})",
-                    principal_name(p)
+                    p.name()
                 ),
                 None => format!(
                     "receiving pushes needs a verified identity in role {roles} (call this host \
@@ -566,7 +566,7 @@ mod tests {
 
     /// Root 1; members 2 (caller) and 3 (this host); `status` (staff:
     /// anyone [`ISS`] verified) on 3.
-    fn setup() -> (SignedState, HostConfigV2) {
+    fn setup() -> (SignedState, HostConfig) {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let mut s = State::new(root.node_id());
         s.version = StateVersion(5);
@@ -583,15 +583,14 @@ mod tests {
                 readers: vec![],
             },
         );
-        let cfg =
-            HostConfigV2::parse(r#"{"version":2,"services":{"status":{"command":["true"]}}}"#)
-                .unwrap();
+        let cfg = HostConfig::parse(r#"{"version":2,"services":{"status":{"command":["true"]}}}"#)
+            .unwrap();
         (s.sign(&root).unwrap(), cfg)
     }
 
     /// [`setup`] plus roles `analyst` (alice) and `sre` (alice, carol),
     /// `orders-db` allowing analyst on 3, and host.json requiring sre too.
-    fn strict() -> (SignedState, HostConfigV2) {
+    fn strict() -> (SignedState, HostConfig) {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let (signed, _) = setup();
         let mut s = signed.state;
@@ -613,7 +612,7 @@ mod tests {
                 readers: vec![],
             },
         );
-        let cfg = HostConfigV2::parse(
+        let cfg = HostConfig::parse(
             r#"{"version":2,"services":{"orders-db":{"command":["true"],"also_require":["sre"]}}}"#,
         )
         .unwrap();
@@ -719,7 +718,7 @@ mod tests {
         ) {
             let (s, _) = strict();
             let also: Vec<String> = also.iter().map(|r| format!("{r:?}")).collect();
-            let cfg = HostConfigV2::parse(&format!(
+            let cfg = HostConfig::parse(&format!(
                 r#"{{"version":2,"services":{{"orders-db":{{"command":["true"],"also_require":[{}]}}}}}}"#,
                 also.join(",")
             )).unwrap();

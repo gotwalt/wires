@@ -58,6 +58,7 @@ use crate::admin::keystore::{self, Keystore};
 use crate::admin::ttl::Ttl;
 use crate::caller::call::CredArgs;
 use crate::caller::lock::{EXIT_LOCKED, Lock};
+use crate::clock::now_ms;
 use crate::host::transport::{self, Denied};
 
 /// The mailbox directory under `$WIRES_HOME`.
@@ -358,11 +359,6 @@ fn private(dir: &Path) {
     let _ = dir;
 }
 
-/// Unix milliseconds now.
-fn now_ms() -> i64 {
-    crate::host::audit::now_ms()
-}
-
 /// Keep only messages a peer may hand this node: from `peer` (the key the
 /// connection authenticated), to `me`, and not expired at `now_ms`.
 pub(crate) fn acceptable(
@@ -387,7 +383,7 @@ pub(crate) fn line(m: &PushMessage) -> String {
     format!(
         "{}  from host {} (verified)  {}  {}",
         utc(m.at_ms),
-        &m.from.hex()[..8],
+        m.from.short(),
         one_line(m.subject.as_str()),
         one_line(m.body.as_str())
     )
@@ -539,7 +535,7 @@ impl InboxReceiver {
                     bail!("a peer spoke out of turn");
                 }
             };
-        if let Err(detail) = self.admit(peer, &membership, crate::now_unix()) {
+        if let Err(detail) = self.admit(peer, &membership, crate::clock::now_unix()) {
             STRANGERS.refused("inbox delivery", peer, &detail);
             deny(&mut send, crate::host::gate::NOT_ADMITTED).await;
             return Ok(());
@@ -820,7 +816,7 @@ async fn read_loop(
             {
                 match fetched {
                     Fetched::Refused(reason) => {
-                        eprintln!("wires inbox: host {} refused: {reason}", &host.hex()[..8]);
+                        eprintln!("wires inbox: host {} refused: {reason}", host.short());
                         refusals.push(reason);
                     }
                     Fetched::Messages(n) => {
@@ -871,9 +867,6 @@ async fn cold_fetcher(
     membership: &Membership,
     relay_url: Option<&str>,
 ) -> Result<Fetcher> {
-    if crate::state::store::read(ks, membership.fabric)?.is_none() {
-        bail!("this node holds no signed state yet: run `wires join <token>` first");
-    }
     let allowed = crate::caller::services::allowed(ks).await?;
     let hosts: Vec<NodeId> = crate::caller::pick::hosts_of(
         &allowed.state.state,
@@ -987,7 +980,7 @@ mod tests {
             l,
             format!(
                 "2026-09-23 08:04:05Z  from host {} (verified)  build-41  failed: test_orders_total\\nline 2\\u{{1b}}[31m",
-                &node(1).hex()[..8]
+                node(1).short()
             )
         );
         assert!(!l.contains('\n'));

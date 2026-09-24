@@ -234,7 +234,7 @@ impl Store {
 
 /// SHA-256 of an access token, base64url: how the store keys it.
 fn token_hash(token: &str) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ring::digest::digest(
+    library::B64.encode(ring::digest::digest(
         &ring::digest::SHA256,
         token.as_bytes(),
     ))

@@ -37,9 +37,13 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use library::{Argv, AuditRecord, CallId, NodeId, OutputHasher, Principal, StdinCapture, ToolName};
+use library::{
+    Argv, AuditRecord, CallId, NodeId, OutputHasher, Principal, RoleName, ServiceName,
+    StateVersion, StdinCapture,
+};
 use tokio::io::{AsyncRead, ReadBuf};
 
+use crate::clock::now_ms;
 use crate::host::transport::{self, AuditSink, LogUnavailable};
 
 /// How many records may wait for the log's writer. A session beyond that
@@ -47,17 +51,8 @@ use crate::host::transport::{self, AuditSink, LogUnavailable};
 /// dropped.
 pub const AUDIT_QUEUE: usize = 256;
 
-/// Unix milliseconds now (the `at_ms` of a record).
-pub fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// Log a refusal of `caller` — a member; see the module docs — (asking for
-/// `tool`, if it named one) with the reason it was sent. A no-op when the
+/// `service`, if it named one) with the reason it was sent. A no-op when the
 /// responder has no audit sink. A log that can't take it is traced at
 /// `error`: the refusal stands either way.
 ///
@@ -71,14 +66,14 @@ pub async fn denied(
     sink: Option<&AuditSink>,
     caller: NodeId,
     principal: Option<Principal>,
-    tool: Option<ToolName>,
+    service: Option<ServiceName>,
     reason: &str,
 ) {
     let Some(sink) = sink else { return };
     let record = AuditRecord::Denied {
         caller,
         principal,
-        tool,
+        service,
         reason: transport::truncate_reason(reason.to_string()),
         at_ms: now_ms(),
     };
@@ -109,7 +104,7 @@ pub struct CallAudit {
 
 impl CallAudit {
     /// Log [`Started`](AuditRecord::Started) for a call `caller` was
-    /// admitted to (under `roster_version`, the state version) and return
+    /// admitted to (under `state_version`) and return
     /// the handle that will log its `Finished`. `Ok(None)` — and nothing
     /// logged — when the responder has no audit sink.
     ///
@@ -127,10 +122,10 @@ impl CallAudit {
         sink: Option<&AuditSink>,
         caller: NodeId,
         principal: Option<Principal>,
-        tool: ToolName,
+        service: ServiceName,
         args: &[String],
-        roster_version: Option<u64>,
-        role: Option<String>,
+        state_version: StateVersion,
+        role: RoleName,
     ) -> Result<Option<Self>, LogUnavailable> {
         let Some(sink) = sink.cloned() else {
             return Ok(None);
@@ -144,9 +139,9 @@ impl CallAudit {
             call,
             caller,
             principal,
-            tool,
+            service,
             argv,
-            roster_version,
+            state_version,
             role,
             at_ms: now_ms(),
         })
@@ -290,14 +285,28 @@ mod tests {
         }
     }
 
-    /// The tool the sample calls invoke.
-    fn db_query() -> ToolName {
-        ToolName::new("db_query").unwrap()
+    /// The service the sample calls invoke.
+    fn db_query() -> ServiceName {
+        ServiceName::new("db_query").unwrap()
+    }
+
+    /// The role that admits the sample calls.
+    fn analyst() -> RoleName {
+        RoleName::new("analyst").unwrap()
     }
 
     #[tokio::test]
     async fn no_sink_means_no_records_and_no_handle() {
-        let started = CallAudit::start(None, caller(), None, db_query(), &[], None, None).await;
+        let started = CallAudit::start(
+            None,
+            caller(),
+            None,
+            db_query(),
+            &[],
+            StateVersion(1),
+            analyst(),
+        )
+        .await;
         assert!(started.unwrap().is_none());
         denied(None, caller(), None, None, "whatever").await; // must not panic
     }
@@ -326,8 +335,8 @@ mod tests {
             Some(alice()),
             db_query(),
             &["a b".to_string()],
-            Some(7),
-            Some("analyst".into()),
+            StateVersion(7),
+            analyst(),
         )
         .await
         .unwrap()
@@ -346,21 +355,21 @@ mod tests {
             call: started,
             caller: c,
             principal,
-            tool,
+            service,
             argv,
-            roster_version,
+            state_version,
             role,
             ..
         }) = rx.try_recv()
         else {
             panic!("expected Started first");
         };
-        assert_eq!(role.as_deref(), Some("analyst"));
+        assert_eq!(role, analyst());
         assert_eq!(c, caller());
         assert_eq!(principal, Some(alice()), "the record names the person");
-        assert_eq!(tool.as_str(), "db_query");
+        assert_eq!(service, db_query());
         assert_eq!(argv.as_slice(), ["a b"]);
-        assert_eq!(roster_version, Some(7));
+        assert_eq!(state_version, StateVersion(7));
         let Ok(AuditRecord::Finished {
             call,
             exit,
@@ -399,9 +408,17 @@ mod tests {
                 p.answer(Err("disk full".into()));
             }
         });
-        let e = CallAudit::start(Some(&sink), caller(), None, db_query(), &[], None, None)
-            .await
-            .unwrap_err();
+        let e = CallAudit::start(
+            Some(&sink),
+            caller(),
+            None,
+            db_query(),
+            &[],
+            StateVersion(1),
+            analyst(),
+        )
+        .await
+        .unwrap_err();
         assert!(e.to_string().contains("disk full"), "{e}");
     }
 
@@ -410,9 +427,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_log_that_never_answers_times_out() {
         let (sink, _queue) = AuditSink::log_queue(4);
-        let e = CallAudit::start(Some(&sink), caller(), None, db_query(), &[], None, None)
-            .await
-            .unwrap_err();
+        let e = CallAudit::start(
+            Some(&sink),
+            caller(),
+            None,
+            db_query(),
+            &[],
+            StateVersion(1),
+            analyst(),
+        )
+        .await
+        .unwrap_err();
         assert!(e.to_string().contains("no answer"), "{e}");
     }
 

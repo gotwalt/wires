@@ -1,4 +1,4 @@
-//! `host.json` version 2: how this host implements the services the signed
+//! `host.json`: how this host implements the services the signed
 //! state assigns to it (card 27).
 //!
 //! Who may call a service is no longer the host's to say: the admin-signed
@@ -48,9 +48,8 @@
 //!
 //! What this parser checks is the file on its own. Checks against the signed
 //! state (every service here is assigned to this host; every role named is
-//! defined) are [`HostConfigV2::check_against`], which `serve` runs before
-//! it binds. Version 1 (tools and roles decided by the host, card 13) is
-//! refused with a pointer to the signed state.
+//! defined) are [`HostConfig::check_against`], which `serve` runs before
+//! it binds.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -62,13 +61,13 @@ use serde::{Deserialize, Serialize};
 use crate::host::identity::IdpTrust;
 
 /// The `host.json` version this module reads.
-pub(crate) const HOST_CONFIG_V2: u32 = 2;
+pub(crate) const HOST_CONFIG: u32 = 2;
 
-/// A parsed, validated v2 `host.json`. See the module docs.
+/// A parsed, validated `host.json`. See the module docs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct HostConfigV2 {
-    /// The format version; must be [`HOST_CONFIG_V2`].
+pub(crate) struct HostConfig {
+    /// The format version; must be [`HOST_CONFIG`].
     pub(crate) version: u32,
     /// Which IdPs the host trusts.
     #[serde(default)]
@@ -77,7 +76,7 @@ pub(crate) struct HostConfigV2 {
     pub(crate) services: BTreeMap<ServiceName, ServiceImpl>,
     /// Who may receive pushes from this host. Absent: nobody.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) push: Option<PushV2>,
+    pub(crate) push: Option<Push>,
     /// Where the host's call log is exported. Absent: nowhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) audit: Option<AuditConfig>,
@@ -126,10 +125,10 @@ impl ServiceImpl {
     }
 }
 
-/// `push` in v2: registry roles that may receive pushes.
+/// `push`: registry roles that may receive pushes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PushV2 {
+pub(crate) struct Push {
     /// The roles whose members may receive pushes, tried in order. Empty:
     /// nobody.
     #[serde(default)]
@@ -188,7 +187,7 @@ pub(crate) struct TrustedIssuer {
     pub(crate) audiences: Vec<String>,
 }
 
-impl HostConfigV2 {
+impl HostConfig {
     /// Read and validate `host.json` at `path`.
     pub(crate) fn load(path: &Path) -> Result<Self> {
         let text =
@@ -210,7 +209,7 @@ impl HostConfigV2 {
         Ok(config)
     }
 
-    /// Parse and validate v2 text: the schema, then
+    /// Parse and validate `host.json` text: the schema, then
     /// [`validate`](Self::validate).
     pub(crate) fn parse(text: &str) -> Result<Self> {
         let config = Self::parse_schema(text)?;
@@ -225,13 +224,10 @@ impl HostConfigV2 {
             version: Option<u32>,
         }
         match serde_json::from_str::<Peek>(text)?.version {
-            Some(HOST_CONFIG_V2) => {}
-            Some(1) => bail!(
-                "version 1 (tools and roles decided by the host) is no longer served: services \
-                 and roles live in the admin-signed state (`wires service add`, `wires role \
-                 set`), and host.json version 2 says how this host implements them"
-            ),
-            Some(v) => bail!("version {v} is not supported (this host reads version 2)"),
+            Some(HOST_CONFIG) => {}
+            Some(v) => {
+                bail!("version {v} is not supported (this host reads version {HOST_CONFIG})")
+            }
             None => bail!("missing `version`"),
         }
         Ok(serde_json::from_str(text)?)
@@ -239,7 +235,7 @@ impl HostConfigV2 {
 
     /// The rules the schema can't say, on the file alone:
     ///
-    /// - `version` is [`HOST_CONFIG_V2`]; at least one service; no empty
+    /// - `version` is [`HOST_CONFIG`]; at least one service; no empty
     ///   command; no empty `cwd`;
     /// - `env` names are non-empty, contain no `=` or NUL, and don't start
     ///   with `WIRES_` (the server-derived variables are not settable);
@@ -256,9 +252,9 @@ impl HostConfigV2 {
     /// an embedding app's config must pass, since its native services count
     /// too.
     pub(crate) fn validate_fields(&self) -> Result<()> {
-        if self.version != HOST_CONFIG_V2 {
+        if self.version != HOST_CONFIG {
             bail!(
-                "version {} is not supported here (expected {HOST_CONFIG_V2})",
+                "version {} is not supported here (expected {HOST_CONFIG})",
                 self.version
             );
         }
@@ -306,7 +302,7 @@ impl HostConfigV2 {
     /// defined in `state`. The error names the first offender.
     pub(crate) fn check_against(&self, state: &State, me: NodeId) -> Result<()> {
         let version = state.version.0;
-        let me8 = &me.hex()[..8];
+        let me8 = me.short();
         for name in self.services.keys() {
             if state.service(name).is_none() {
                 bail!(
@@ -344,7 +340,7 @@ impl HostConfigV2 {
         Ok(())
     }
 
-    /// What `wires serve --check` prints for a v2 file: the services it
+    /// What `wires serve --check` prints for a `host.json`: the services it
     /// implements, their commands and `also_require`, trusted issuers, and
     /// push. Who may call is the signed state's, so it is not shown here.
     pub(crate) fn summary(&self) -> String {
@@ -413,7 +409,7 @@ mod tests {
 
     #[test]
     fn parses_the_example() {
-        let c = HostConfigV2::parse(EXAMPLE).unwrap();
+        let c = HostConfig::parse(EXAMPLE).unwrap();
         let svc = &c.services[&ServiceName::new("orders-db").unwrap()];
         assert_eq!(svc.cwd.as_deref(), Some(Path::new("/srv/orders")));
         assert_eq!(svc.also_require, vec![RoleName::new("sre").unwrap()]);
@@ -424,7 +420,7 @@ mod tests {
     /// the caller's arguments; off (the default), they follow directly.
     #[test]
     fn end_of_options_inserts_a_double_dash() {
-        let c = HostConfigV2::parse(
+        let c = HostConfig::parse(
             r#"{"version":2,"services":{
                 "plain":{"command":["gh","api"]},
                 "dashed":{"command":["gh","api"],"end_of_options":true},
@@ -450,20 +446,13 @@ mod tests {
     }
 
     #[test]
-    fn v1_is_refused_with_the_way_forward() {
-        let v1 = r#"{"version":1,"tools":{"echo":{"command":["echo"],"allow":["member"]}}}"#;
-        let e = format!("{:#}", HostConfigV2::parse(v1).unwrap_err());
-        assert!(e.contains("wires service add"), "{e}");
-    }
-
-    #[test]
     fn unknown_keys_are_errors_at_every_level() {
         for bad in [
             r#"{"version":2,"services":{"a":{"command":["x"]}},"tools":{}}"#,
             r#"{"version":2,"services":{"a":{"command":["x"],"allow":["member"]}}}"#,
             r#"{"version":2,"services":{"a":{"command":["x"]}},"push":{"alow":[]}}"#,
         ] {
-            assert!(HostConfigV2::parse(bad).is_err(), "{bad}");
+            assert!(HostConfig::parse(bad).is_err(), "{bad}");
         }
     }
 
@@ -474,12 +463,12 @@ mod tests {
             r#"{"version":2,"services":{"a":{"command":[]}}}"#,
             r#"{"version":2,"services":{"a":{"command":["x"],"cwd":""}}}"#,
             r#"{"version":2,"services":{"a":{"command":["x"],"env":{"A=B":"1"}}}}"#,
-            r#"{"version":2,"services":{"a":{"command":["x"],"env":{"WIRES_TOOL":"1"}}}}"#,
+            r#"{"version":2,"services":{"a":{"command":["x"],"env":{"WIRES_SERVICE":"1"}}}}"#,
             r#"{"version":2,"services":{"Bad Name":{"command":["x"]}}}"#,
             r#"{"version":2,"services":{"a":{"command":["x"]}},"audit":{"otlp":"ftp://x"}}"#,
             r#"{"version":3,"services":{"a":{"command":["x"]}}}"#,
         ] {
-            assert!(HostConfigV2::parse(bad).is_err(), "{bad}");
+            assert!(HostConfig::parse(bad).is_err(), "{bad}");
         }
     }
 
@@ -505,7 +494,7 @@ mod tests {
             },
         );
         let text = r#"{"version":2,"services":{"orders-db":{"command":["x"]}}}"#;
-        let c = HostConfigV2::parse(text).unwrap();
+        let c = HostConfig::parse(text).unwrap();
         let e = c.check_against(&state, me).unwrap_err().to_string();
         assert!(
             e.contains("orders-db") && e.contains("does not assign"),
@@ -513,7 +502,7 @@ mod tests {
         );
         assert!(c.check_against(&state, other).is_ok());
         let check = |text: &str| {
-            HostConfigV2::parse(text)
+            HostConfig::parse(text)
                 .unwrap()
                 .check_against(&state, other)
                 .map_err(|e| e.to_string())

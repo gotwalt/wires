@@ -263,7 +263,7 @@ impl KeyFetcher {
     /// The on-disk cache file for `issuer`.
     fn disk_path(&self, issuer: &Issuer) -> Option<PathBuf> {
         let digest = ring::digest::digest(&ring::digest::SHA256, issuer.as_str().as_bytes());
-        let name = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.as_ref());
+        let name = library::B64.encode(digest.as_ref());
         Some(self.cache_dir.as_ref()?.join(format!("{name}.json")))
     }
 
@@ -347,21 +347,11 @@ pub(crate) fn discovery_url(issuer: &Issuer) -> Result<Url> {
 pub(crate) fn require_secure(url: &Url) -> Result<()> {
     match url.scheme() {
         "https" => Ok(()),
-        "http" if is_loopback(url) => Ok(()),
+        "http" if crate::net::is_loopback(url) => Ok(()),
         other => Err(anyhow!(
             "refusing {other}:// URL {url}: OIDC endpoints must be https (http is allowed only to \
              a loopback host)"
         )),
-    }
-}
-
-/// Whether `url`'s host is the local machine.
-pub(crate) fn is_loopback(url: &Url) -> bool {
-    match url.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-        None => false,
     }
 }
 

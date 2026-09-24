@@ -3,7 +3,7 @@
 # Acceptance for card 33 phase 2: a wires-native service written in PYTHON
 # (bindings/python/examples/kv.py, through wires-ffi / UniFFI) or in
 # TYPESCRIPT (bindings/node/examples/kv.mts, through wires-node / napi-rs)
-# is served on a real, loopback fabric and called with the shipped `wires`
+# is served on a real, loopback network and called with the shipped `wires`
 # binary. To a caller it is a CLI like any other.
 #
 # Four keystores on one machine:
@@ -135,7 +135,7 @@ else
 fi
 
 # --------------------------------------------------------------------------
-# The fabric: the admin, the $LANG_NAME host, two callers, one IdP.
+# The network: the admin, the $LANG_NAME host, two callers, one IdP.
 # --------------------------------------------------------------------------
 root="$D/root"
 host="$D/host"

@@ -28,13 +28,11 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+use crate::codec::B64;
 use crate::codec::canonical_bytes;
 use crate::error::{Error, Result};
 use crate::identity::AlgorithmId;
 use crate::identity::{NodeId, NodeIdentity, Signature};
-
-/// The base64 alphabet for membership tokens: URL-safe, no padding.
-const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// The current (and only) membership format version.
 pub const MEMBERSHIP_V1: u8 = 1;

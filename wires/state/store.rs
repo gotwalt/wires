@@ -9,7 +9,7 @@
 use std::fs::OpenOptions;
 
 use anyhow::{Context, Result, bail};
-use library::{NodeId, SignedState};
+use library::{Membership, NodeId, SignedState};
 
 use crate::admin::keystore::{Keystore, write_text_mode};
 
@@ -18,6 +18,23 @@ pub(crate) const STATE_FILE: &str = "state.json";
 
 /// The lock file guarding [`STATE_FILE`] rewrites.
 const LOCK_FILE: &str = "state.json.lock";
+
+/// This node's membership and its signed state (verified under the
+/// membership's root), both required: what a command that acts as a member
+/// needs first. Either missing is an error that says to run `wires join`.
+pub(crate) fn require(ks: &Keystore) -> Result<(Membership, SignedState)> {
+    let membership = ks
+        .read_membership()?
+        .context("this node has no membership: run `wires join <token>` first")?;
+    let state = require_state(ks, membership.fabric)?;
+    Ok((membership, state))
+}
+
+/// [`read`], required to exist (for a membership resolved elsewhere, such as
+/// a `--membership` flag).
+pub(crate) fn require_state(ks: &Keystore, root: NodeId) -> Result<SignedState> {
+    read(ks, root)?.context("this node holds no signed state yet: run `wires join <token>` first")
+}
 
 /// The stored state, verified under `root`; `None` if this node has none yet.
 /// A present but invalid file is an error (fail closed).
@@ -32,7 +49,7 @@ pub(crate) fn read(ks: &Keystore, root: NodeId) -> Result<Option<SignedState>> {
         SignedState::decode(text.trim()).with_context(|| format!("parsing {}", path.display()))?;
     state
         .verify(root)
-        .with_context(|| format!("{} does not verify under the fabric root", path.display()))?;
+        .with_context(|| format!("{} does not verify under the network root", path.display()))?;
     Ok(Some(state))
 }
 
@@ -46,7 +63,7 @@ pub(crate) fn adopt_if_newer(
 ) -> Result<bool> {
     candidate
         .verify(root)
-        .context("the offered state does not verify under the fabric root")?;
+        .context("the offered state does not verify under the network root")?;
     candidate
         .check_fresh(now)
         .context("the offered state is not fresh")?;

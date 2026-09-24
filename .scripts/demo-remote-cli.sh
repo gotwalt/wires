@@ -186,9 +186,9 @@ agent="$D/agent"
 obs="$D/observer"
 mkdir -p "$root" "$wb" "$sp" "$agent" "$obs"
 
-# The admin starts the fabric (and is a member itself); every other machine
+# The admin starts the network (and is a member itself); every other machine
 # makes its key and hands the admin its id. One invite token back each.
-ROOT_ID="$(WIRES_HOME="$root" "$WIRES" init | awk '/^fabric /{print $2}')"
+ROOT_ID="$(WIRES_HOME="$root" "$WIRES" init | awk '/^network /{print $2}')"
 WB_ID="$(WIRES_HOME="$wb" "$WIRES" id 2>/dev/null)"
 SP_ID="$(WIRES_HOME="$sp" "$WIRES" id 2>/dev/null)"
 AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
@@ -632,7 +632,7 @@ set -e
 	bad "9: the removed agent's call exited $rc, expected $EXIT_DENIED"
 }
 [ "$(wc -c <"$D/c5.out" | tr -d ' ')" -eq 0 ] || bad "9: the refused call wrote $(wc -c <"$D/c5.out") bytes to stdout"
-grep -qF "not admitted to this fabric" "$D/c5.err" || {
+grep -qF "not a member of this network" "$D/c5.err" || {
 	cat "$D/c5.err" >&2
 	bad "9: refused, but not for the removal"
 }

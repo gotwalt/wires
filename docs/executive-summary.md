@@ -32,7 +32,7 @@ There are four roles, each with a few commands:
 
 A laptop and a Linux workstation, reached by key through public relays:
 
-- The host had **no TCP listener and no opened firewall port**. A key outside the fabric was refused at its first message, before anything ran.
+- The host had **no TCP listener and no opened firewall port**. A key outside the network was refused at its first message, before anything ran.
 - Before signing in, the agent saw no tools, and calling one by name was refused with the reason. After a real Google sign-in, the tool appeared.
 - A Claude Code session in locked mode, whose PATH held `wires` plus the system basics and which was only allowed to run `wires call` and the tool listing, found the tool, queried a remote database and answered correctly. Each query was logged under the person's email and role.
 - `wires remove` cut the agent off at its next call, with no restart and no manual key rotation anywhere.

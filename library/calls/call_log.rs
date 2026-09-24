@@ -35,7 +35,7 @@
 //! let denied = |at_ms| AuditRecord::Denied {
 //!     caller: NodeIdentity::from_seed([8u8; 32]).node_id(),
 //!     principal: None,
-//!     tool: None,
+//!     service: None,
 //!     reason: "not a member".into(),
 //!     at_ms,
 //! };
@@ -60,7 +60,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditRecord;
-use crate::codec::canonical_bytes;
+use crate::codec::{canonical_bytes, hex_id};
 use crate::error::{Error, Result};
 use crate::identity::{NodeId, NodeIdentity, Signature};
 
@@ -98,18 +98,18 @@ impl fmt::Display for LogSeq {
     }
 }
 
-/// BLAKE3 over an entry's signed bytes and its signature: what the next entry
-/// links back to. Lowercase hex on the wire.
-///
-/// ```
-/// use library::EntryHash;
-/// let h = EntryHash::from_hex(&"ab".repeat(32)).unwrap();
-/// assert_eq!(EntryHash::from_hex(&h.hex()).unwrap(), h);
-/// assert!(EntryHash::ZERO.is_zero());
-/// ```
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct EntryHash([u8; 32]);
+hex_id! {
+    /// BLAKE3 over an entry's signed bytes and its signature: what the next
+    /// entry links back to. Lowercase hex on the wire.
+    ///
+    /// ```
+    /// use library::EntryHash;
+    /// let h = EntryHash::from_hex(&"ab".repeat(32)).unwrap();
+    /// assert_eq!(EntryHash::from_hex(&h.hex()).unwrap(), h);
+    /// assert!(EntryHash::ZERO.is_zero());
+    /// ```
+    pub struct EntryHash([u8; 32]);
+}
 
 impl EntryHash {
     /// The `prev` of the genesis entry, and only of it.
@@ -118,35 +118,6 @@ impl EntryHash {
     /// Whether this is [`EntryHash::ZERO`].
     pub fn is_zero(&self) -> bool {
         *self == Self::ZERO
-    }
-
-    /// Borrow the raw digest bytes.
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    /// Lowercase hex.
-    pub fn hex(&self) -> String {
-        hex::encode(self.0)
-    }
-
-    /// Parse 64 hex characters.
-    pub fn from_hex(s: &str) -> Result<Self> {
-        let bytes = hex::decode(s)?;
-        Ok(Self(bytes.try_into().map_err(|_| Error::BadKeyLength)?))
-    }
-}
-
-impl TryFrom<String> for EntryHash {
-    type Error = Error;
-    fn try_from(s: String) -> Result<Self> {
-        Self::from_hex(&s)
-    }
-}
-
-impl From<EntryHash> for String {
-    fn from(h: EntryHash) -> String {
-        h.hex()
     }
 }
 
@@ -378,7 +349,7 @@ pub enum ChainBreak {
 ///
 /// let host = NodeIdentity::from_seed([1u8; 32]);
 /// let rec = |r: &str| AuditRecord::Denied {
-///     caller: host.node_id(), principal: None, tool: None, reason: r.into(), at_ms: 0,
+///     caller: host.node_id(), principal: None, service: None, reason: r.into(), at_ms: 0,
 /// };
 /// let a = LogEntry::next(&host, None, 0, rec("a")).unwrap();
 /// let b = LogEntry::next(&host, Some(a.point().unwrap()), 0, rec("b")).unwrap();
@@ -495,7 +466,10 @@ impl Default for Retention {
 mod tests {
     use super::*;
     use crate::audit::{CallId, OutputHasher};
-    use crate::invoke::{Argv, ToolName};
+    use crate::invoke::Argv;
+    use crate::registry::ServiceName;
+    use crate::role::RoleName;
+    use crate::state::StateVersion;
     use proptest::prelude::*;
 
     fn host() -> NodeIdentity {
@@ -512,10 +486,10 @@ mod tests {
                 call: CallId::from_hex(&format!("{i:032x}")).unwrap(),
                 caller: caller(),
                 principal: None,
-                tool: ToolName::new("db_query").unwrap(),
+                service: ServiceName::new("db_query").unwrap(),
                 argv: Argv::new(vec![format!("arg{i}")]).unwrap(),
-                roster_version: None,
-                role: Some("analyst".into()),
+                state_version: StateVersion(1),
+                role: RoleName::new("analyst").unwrap(),
                 at_ms: i as i64,
             },
             1 => AuditRecord::Finished {
@@ -532,7 +506,7 @@ mod tests {
             _ => AuditRecord::Denied {
                 caller: caller(),
                 principal: None,
-                tool: None,
+                service: None,
                 reason: format!("no {i}"),
                 at_ms: i as i64,
             },
@@ -561,7 +535,7 @@ mod tests {
             AuditRecord::Denied {
                 caller: caller(),
                 principal: None,
-                tool: None,
+                service: None,
                 reason: "r".into(),
                 at_ms: 1,
             },

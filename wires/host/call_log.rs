@@ -50,7 +50,8 @@ use library::{AuditRecord, ChainPoint, LogEntry, NodeIdentity, Retention, verify
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::host::audit::{AUDIT_QUEUE, now_ms};
+use crate::clock::now_ms;
+use crate::host::audit::AUDIT_QUEUE;
 use crate::host::otlp::Exporter;
 use crate::host::transport::{AuditSink, Pending};
 
@@ -374,7 +375,7 @@ mod tests {
         AuditRecord::Denied {
             caller: NodeIdentity::from_seed([7u8; 32]).node_id(),
             principal: None,
-            tool: None,
+            service: None,
             reason: format!("no {n}"),
             at_ms: n,
         }

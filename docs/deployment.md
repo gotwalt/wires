@@ -112,7 +112,7 @@ n0.
   to the hosts, with no import and no restart. `serve` re-reads its state
   once per connection, so from the moment a host has the new state, the
   removed member's next call there is refused: exit `77`, `wires: denied by
-  responder: not admitted to this fabric` on its stderr. The host traces the
+  responder: not a member of this network` on its stderr. The host traces the
   refusal rather than logging it (a key outside the state can't write to the
   log). A host the push missed enforces the removal once it pulls (every 10
   minutes) or after `wires state push`. There is no shared key to rotate.

@@ -21,7 +21,7 @@ use super::keystore::{self, Keystore};
 use super::propagate;
 use super::service::edit_state;
 use super::ttl::Ttl;
-use crate::now_unix;
+use crate::clock::now_unix;
 
 /// `invite` arguments.
 #[derive(Args)]

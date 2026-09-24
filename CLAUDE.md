@@ -148,7 +148,7 @@ host exposing CLIs needs an image that also has those CLIs.
     a folder with a `mod.rs` — `admin/` (keystore, `init`/`invite`/`remove`,
     `service`/`role` edits of the signed state, `state push`, `--ttl` /
     `--state-ttl`), `host/` (`serve`,
-    `host.json` v2, the gate over the signed state, the session transport,
+    `host.json`, the gate over the signed state, the session transport,
     native services and the embedded `Host`,
     verified identities, the call log and OTLP export, the record stream, push,
     its control sockets and the per-call push capability), `caller/` (`join`, `login`, `services`, `call`

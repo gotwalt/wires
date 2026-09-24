@@ -337,7 +337,7 @@ impl HostBuilder {
         self.with(|b| b.push_allow(roles))
     }
 
-    /// Also read `path` as `host.json` v2 (CLI services beside the foreign
+    /// Also read `path` as `host.json` (CLI services beside the foreign
     /// ones, trusted IdPs, push, audit export).
     pub fn host_json(self: Arc<Self>, path: String) -> Arc<Self> {
         self.with(|b| b.host_json(path))

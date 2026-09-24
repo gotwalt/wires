@@ -7,7 +7,7 @@
 //! logged by the host itself in its own signed call log.
 //!
 //! - [`serve`] — `wires serve host.json` / `--check`: preflight, bind, serve.
-//! - [`config_v2`] — `host.json` v2 (services it implements, local trust,
+//! - [`config`] — `host.json` (services it implements, local trust,
 //!   `also_require`).
 //! - [`gate`] — the call gate over the signed state, and the
 //!   [`ServicesHost`](gate::ServicesHost) a host decides with.
@@ -32,7 +32,7 @@
 pub mod audit;
 pub mod call_log;
 pub mod capability;
-pub mod config_v2;
+pub mod config;
 pub mod control;
 pub mod embed;
 pub mod gate;

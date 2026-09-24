@@ -28,7 +28,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::canonical_bytes;
+use crate::codec::{canonical_bytes, length_prefixed, prefix_len, split_frame};
 use crate::error::{Error, Result};
 use crate::state::{SignedState, StateVersion};
 
@@ -87,24 +87,17 @@ impl StateFrame {
         if body.len() > MAX_STATE_FRAME {
             return Err(Error::BadFrame);
         }
-        let len = u32::try_from(body.len()).map_err(|_| Error::BadFrame)?;
-        let mut out = Vec::with_capacity(4 + body.len());
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(&body);
-        Ok(out)
+        length_prefixed(&body)
     }
 
     /// Decode the first frame in `buf`: `Ok(None)` until a whole frame has
     /// arrived; an error for an oversized prefix or a malformed body.
     pub fn decode(buf: &[u8]) -> Result<Option<(StateFrame, usize)>> {
-        let Some(len) = Self::length(buf)? else {
+        Self::length(buf)?;
+        let Some((body, end)) = split_frame(buf) else {
             return Ok(None);
         };
-        let end = 4 + len;
-        if buf.len() < end {
-            return Ok(None);
-        }
-        let frame = serde_json::from_slice(&buf[4..end]).map_err(Error::Decode)?;
+        let frame = serde_json::from_slice(body).map_err(Error::Decode)?;
         Ok(Some((frame, end)))
     }
 
@@ -112,10 +105,9 @@ impl StateFrame {
     /// its four bytes are there; [`Error::BadFrame`] when it is over
     /// [`MAX_STATE_FRAME`] (so a reader allocates nothing for it).
     pub fn length(buf: &[u8]) -> Result<Option<usize>> {
-        let Some(prefix) = buf.get(..4) else {
+        let Some(len) = prefix_len(buf) else {
             return Ok(None);
         };
-        let len = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
         if len > MAX_STATE_FRAME {
             return Err(Error::BadFrame);
         }

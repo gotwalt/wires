@@ -74,6 +74,7 @@ use super::gate::ServicesHost;
 use super::transport::{self, AuditSink};
 use crate::admin::ttl::Ttl;
 use crate::caller::inbox::{deny, read_frame, read_frame_within, write_frame};
+use crate::clock::now_ms;
 
 /// How long a push waits for its recipient when `--ttl` isn't given.
 pub(crate) const DEFAULT_TTL: Duration = Duration::from_secs(24 * 3600);
@@ -158,8 +159,8 @@ impl PushReport {
             .iter()
             .map(|r| {
                 let who = match &r.who {
-                    Some(w) => format!("{w} ({})", &r.to.hex()[..8]),
-                    None => r.to.hex()[..8].to_string(),
+                    Some(w) => format!("{w} ({})", r.to.short()),
+                    None => r.to.short(),
                 };
                 let mut line = format!("{:<9}  {who}  {}", r.outcome.as_str(), r.id);
                 if let Some(reason) = &r.reason {
@@ -492,7 +493,7 @@ impl PushHost {
         if ttl.is_zero() || ttl > MAX_TTL {
             bail!("--ttl must be between 1s and 7d");
         }
-        let now = crate::now_unix();
+        let now = crate::clock::now_unix();
         let at_ms = now_ms();
         let mut report = PushReport::default();
         for to in self.recipients(&spec.to, now)? {
@@ -590,7 +591,7 @@ impl PushHost {
     /// authorization first: a recipient the signed state no longer holds
     /// loses its queue (recorded `denied`).
     pub(crate) async fn deliver_direct(&self, to: NodeId) -> Result<Vec<PushId>> {
-        let now = crate::now_unix();
+        let now = crate::clock::now_unix();
         if let Err((reason, roster)) = self.authorize(to, now) {
             if roster {
                 for e in self.with_queue(|q| q.purge(to)) {
@@ -616,7 +617,7 @@ impl PushHost {
         let conn = endpoint
             .connect(addr, INBOX_ALPN)
             .await
-            .map_err(|e| anyhow!("dialing {}: {e}", &to.hex()[..8]))?;
+            .map_err(|e| anyhow!("dialing {}: {e}", to.short()))?;
         let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
         write_frame(&mut send, &self.hello()).await?;
         write_frame(&mut send, &InboxFrame::Deliver { messages: batch }).await?;
@@ -717,7 +718,7 @@ impl PushHost {
                 return Ok(());
             }
         };
-        let now = crate::now_unix();
+        let now = crate::clock::now_unix();
         let state = match self.host.state() {
             Ok(state) => state,
             Err(e) => {
@@ -886,11 +887,6 @@ impl iroh::protocol::ProtocolHandler for PushFetch {
             iroh::protocol::AcceptError::from_boxed(e.into())
         })
     }
-}
-
-/// Unix milliseconds now.
-fn now_ms() -> i64 {
-    crate::host::audit::now_ms()
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,14 +1081,14 @@ mod tests {
         let ks = Keystore::at(&home);
         let mut s = State::new(root.node_id());
         s.version = StateVersion(1);
-        s.issued = crate::now_unix();
+        s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
         s.members.extend([node(4), node(2)]);
         s.hosts.insert(node(4));
         let signed = s.sign(&root).unwrap();
-        crate::state::store::adopt_if_newer(&ks, &signed, root.node_id(), crate::now_unix())
+        crate::state::store::adopt_if_newer(&ks, &signed, root.node_id(), crate::clock::now_unix())
             .unwrap();
-        let config = crate::host::config_v2::HostConfigV2::parse(
+        let config = crate::host::config::HostConfig::parse(
             r#"{"version":2,"services":{"t":{"command":["true"]}},"push":{"allow":["analyst"]}}"#,
         )
         .unwrap();
@@ -1257,14 +1253,11 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            format!(
-                "delivered  alice@example.com ({})  {id}",
-                &node(2).hex()[..8]
-            )
+            format!("delivered  alice@example.com ({})  {id}", node(2).short())
         );
         assert_eq!(
             lines[1],
-            format!("denied     {}  {id}  no role", &node(3).hex()[..8])
+            format!("denied     {}  {id}  no role", node(3).short())
         );
         assert!(report.any_accepted());
     }

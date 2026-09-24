@@ -6,7 +6,7 @@
 The goal is CLI-style efficiency with a permission surface as narrow as MCP's.
 The agent runs one thing, `wires call <tool> …`. What each tool does is defined
 on the host (`host.json`), checked against the caller's IdP identity, and
-recorded by the host as a structured `(tool, argv)`. Output filtering that
+recorded by the host as a structured `(service, argv)`. Output filtering that
 would normally need a shell (`| jq`, `| head`) happens inside `wires call`:
 
 ```bash

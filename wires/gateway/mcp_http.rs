@@ -35,16 +35,10 @@ use serde_json::json;
 use super::oauth::challenge;
 use super::{Backend, Gateway};
 use crate::caller::mcp::{
-    HEADER_MISMATCH, META_PROTOCOL_VERSION, McpServer, RpcError, SUPPORTED_PROTOCOL_VERSIONS,
-    UNSUPPORTED_PROTOCOL_VERSION, error_response, is_modern,
+    HEADER_MISMATCH, INVALID_REQUEST, META_PROTOCOL_VERSION, METHOD_NOT_FOUND, McpServer,
+    PARSE_ERROR, RpcError, SUPPORTED_PROTOCOL_VERSIONS, UNSUPPORTED_PROTOCOL_VERSION,
+    error_response, is_modern,
 };
-
-/// JSON-RPC: the body was not JSON.
-const PARSE_ERROR: i64 = -32700;
-/// JSON-RPC: not a single request object.
-const INVALID_REQUEST: i64 = -32600;
-/// JSON-RPC: no such method.
-const METHOD_NOT_FOUND: i64 = -32601;
 
 /// The version a legacy request with no `MCP-Protocol-Version` speaks.
 pub(crate) const HEADERLESS_VERSION: &str = "2025-03-26";
@@ -204,7 +198,7 @@ pub(crate) async fn post<B: Backend>(
             );
         }
     }
-    let now = crate::now_unix();
+    let now = crate::clock::now_unix();
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -437,7 +431,10 @@ mod tests {
             status_for(&err(UNSUPPORTED_PROTOCOL_VERSION), true),
             StatusCode::BAD_REQUEST
         );
-        assert_eq!(status_for(&err(-32602), true), StatusCode::OK);
+        assert_eq!(
+            status_for(&err(crate::caller::mcp::INVALID_PARAMS), true),
+            StatusCode::OK
+        );
         assert_eq!(status_for(&json!({"result":{}}), true), StatusCode::OK);
     }
 

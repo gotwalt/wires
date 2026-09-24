@@ -17,7 +17,7 @@ pub enum Error {
     /// A token (an invite, a membership, a signed state) was not valid
     /// base64.
     #[error("token decode: {0}")]
-    TicketDecode(#[from] base64::DecodeError),
+    TokenDecode(#[from] base64::DecodeError),
 
     /// A signature did not verify against the expected public key.
     #[error("invalid signature")]
@@ -51,9 +51,10 @@ pub enum Error {
     #[error("credential subject does not match caller")]
     SubjectMismatch,
 
-    /// A byte slice had the wrong length for the key or signature it decodes to.
-    #[error("bad key or signature length")]
-    BadKeyLength,
+    /// A byte slice had the wrong length for the key, signature, id or
+    /// digest it decodes to.
+    #[error("bad length for a key, signature, id or digest")]
+    BadLength,
 
     /// A hex string was not valid hex for the value it decodes to.
     #[error("bad hex: {0}")]
@@ -66,12 +67,8 @@ pub enum Error {
     /// [`State::sign`](crate::State::sign) was handed a signing key whose
     /// node id is not the state's `fabric` — a usage error (the fabric root
     /// must sign its own state).
-    #[error("signing key is not the fabric root")]
+    #[error("signing key is not the network root")]
     FabricMismatch,
-
-    /// A tool name broke the [`ToolName`](crate::ToolName) rules.
-    #[error("invalid tool name")]
-    InvalidToolName,
 
     /// A service name broke the [`ServiceName`](crate::ServiceName) rules.
     #[error("invalid service name")]

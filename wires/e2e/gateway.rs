@@ -114,7 +114,7 @@ impl Running {
             node: node(2),
             upstream: idp.client(),
             fetcher: KeyFetcher::new(None).unwrap(),
-            store: Store::open(None, crate::now_unix()).unwrap(),
+            store: Store::open(None, crate::clock::now_unix()).unwrap(),
             client_key: ClientKey::new(&[3; 32]),
             metadata: MetadataFetcher::new().unwrap(),
             origins: vec![base.clone(), "https://claude.ai".into()],
@@ -435,7 +435,7 @@ async fn a_web_client_signs_in_and_calls_as_its_user() {
             },
             std::slice::from_ref(&idp.issuer),
             &[library::Audience::new(idp.client_id.clone())],
-            crate::now_unix(),
+            crate::clock::now_unix(),
         )
         .await
         .unwrap();
@@ -451,7 +451,7 @@ async fn a_web_client_signs_in_and_calls_as_its_user() {
         )
         .await;
     let v: Value = r.json().await.unwrap();
-    assert_eq!(v["error"]["code"], -32602);
+    assert_eq!(v["error"]["code"], crate::caller::mcp::INVALID_PARAMS);
 
     // Legacy, same token: initialize, then the agreed version in the header.
     let r = gw
@@ -544,7 +544,10 @@ async fn the_endpoint_enforces_the_transport_rules() {
 
     let r = gw.modern(&token, "resources/list", None, json!({})).await;
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
-    assert_eq!(r.json::<Value>().await.unwrap()["error"]["code"], -32601);
+    assert_eq!(
+        r.json::<Value>().await.unwrap()["error"]["code"],
+        crate::caller::mcp::METHOD_NOT_FOUND
+    );
 
     let r = gw.modern(&token, "server/discover", None, json!({})).await;
     assert_eq!(r.status(), StatusCode::OK);
@@ -604,7 +607,7 @@ async fn concurrent_users_each_call_with_their_own_token() {
                 },
                 std::slice::from_ref(&idp.issuer),
                 &[library::Audience::new(idp.client_id.clone())],
-                crate::now_unix(),
+                crate::clock::now_unix(),
             )
             .await
             .unwrap();

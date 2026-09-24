@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use library::{
-    Argv, IdToken, Invocation, Membership, NodeId, NodeIdentity, ServiceName, SignedState, ToolName,
+    Argv, IdToken, Invocation, Membership, NodeId, NodeIdentity, ServiceName, SignedState,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -89,13 +89,13 @@ pub struct Dial {
     pub addrs: Vec<SocketAddr>,
     /// The relay to dial through, if any.
     pub relay_url: Option<String>,
-    /// The remote tool name plus the per-call argv.
+    /// The service to ask for plus the per-call argv.
     pub invocation: Invocation,
 }
 
 impl Dial {
-    /// Resolve `tool` into a dial plan carrying `argv`. The remote tool name
-    /// is the entry's explicit `remote_tool`, else the local name.
+    /// Resolve `tool` into a dial plan carrying `argv`. The service asked
+    /// for is the entry's explicit `remote_tool`, else the local name.
     pub fn resolve(tool: &RemoteTool, argv: Argv) -> Result<Self> {
         let ToolTarget::Node {
             node,
@@ -116,7 +116,10 @@ impl Dial {
             target: *node,
             addrs: addrs.clone(),
             relay_url: relay_url.clone(),
-            invocation: Invocation { tool: remote, argv },
+            invocation: Invocation {
+                service: remote,
+                argv,
+            },
         })
     }
 }
@@ -181,7 +184,7 @@ where
     let ks = Keystore::resolve()?;
     let state = fresh_state(&ks, creds)?;
     check_alias(&state, &plan)?;
-    let service = ServiceName::from(plan.invocation.tool.clone());
+    let service = plan.invocation.service.clone();
     let relay = creds.relay_override.clone().or(plan.relay_url);
     let target = transport::endpoint_addr(&plan.target, &plan.addrs, relay.as_deref())?;
     let mut hello = crate::caller::hello::with_membership(&ks, creds.membership.clone())?;
@@ -230,7 +233,7 @@ impl Caller for WiresCaller {
                     &self.creds,
                     &ks,
                     &state,
-                    &ServiceName::from(tool.name.clone()),
+                    &tool.name,
                     argv,
                     std::io::Cursor::new(stdin),
                     &mut stdout,
@@ -286,10 +289,8 @@ pub(crate) fn stored_state(ks: &Keystore, creds: &Credentials) -> Result<Option<
 /// dials from an expired state (it would present an old version, and name
 /// hosts the admin may have since removed).
 pub(crate) fn fresh_state(ks: &Keystore, creds: &Credentials) -> Result<SignedState> {
-    let state = stored_state(ks, creds)?.ok_or_else(|| {
-        anyhow!("this node holds no signed state yet: run `wires join <token>` first")
-    })?;
-    check_fresh(&state, crate::now_unix())?;
+    let state = store::require_state(ks, creds.membership.fabric)?;
+    check_fresh(&state, crate::clock::now_unix())?;
     Ok(state)
 }
 
@@ -309,12 +310,12 @@ fn check_fresh(state: &SignedState, now: i64) -> Result<()> {
 /// An alias may only pin a host that the current `state` assigns the alias's
 /// service (its `remote_tool`, else its name).
 fn check_alias(state: &SignedState, plan: &Dial) -> Result<()> {
-    let service = ServiceName::from(plan.invocation.tool.clone());
+    let service = plan.invocation.service.clone();
     if !state.state.assigns(&service, plan.target) {
         bail!(
             "the alias's host {} is not assigned `{service}` in signed state version {}; \
              nothing was dialed",
-            pick::short(&plan.target),
+            plan.target.short(),
             state.state.version.0
         );
     }
@@ -335,7 +336,7 @@ fn accept_ack(
     let Some(newer) = newer else {
         return Ok(());
     };
-    if store::adopt_if_newer(ks, newer, fabric, crate::now_unix())
+    if store::adopt_if_newer(ks, newer, fabric, crate::clock::now_unix())
         .context("the host handed back a signed state that does not verify; no input was sent")?
     {
         tracing::info!(
@@ -349,7 +350,7 @@ fn accept_ack(
             "signed state version {} no longer assigns `{service}` to host {}, so the call was \
              stopped before any input was sent (see `wires services`)",
             held.state.version.0,
-            pick::short(&host)
+            host.short()
         );
     }
     Ok(())
@@ -441,7 +442,7 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    check_fresh(state, crate::now_unix())?;
+    check_fresh(state, crate::clock::now_unix())?;
     let last_good = LastGood::path(ks);
     let hosts = pick::candidates(
         &state.state,
@@ -463,7 +464,7 @@ where
         dial.timeout,
         hello,
         Invocation {
-            tool: service.clone().into(),
+            service: service.clone(),
             argv,
         },
         |host, newer| accept_ack(ks, fabric, service, host, newer),
@@ -474,10 +475,7 @@ where
     .await
     .with_context(|| format!("calling {service}"))?;
     if verbose {
-        eprintln!(
-            "wires: {service} answered by host {}",
-            pick::short(&done.host)
-        );
+        eprintln!("wires: {service} answered by host {}", done.host.short());
     }
     LastGood::record(&last_good, service, done.host);
     Ok(done.dialed.exit)
@@ -527,7 +525,7 @@ pub struct CallArgs {
     pub verbose: bool,
     /// The service's name (`wires services`).
     #[arg(value_name = "SERVICE")]
-    pub tool: String,
+    pub service: String,
     /// Extra arguments appended to the remote command. Use `--` before any
     /// that start with `-`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -536,7 +534,7 @@ pub struct CallArgs {
 
 /// Look `name` up in `config`, with an error that lists what *is* there.
 pub fn lookup<'a>(config: &'a ToolsConfig, name: &str) -> Result<&'a RemoteTool> {
-    let found = ToolName::new(name).ok().and_then(|n| config.get(&n));
+    let found = ServiceName::new(name).ok().and_then(|n| config.get(&n));
     found.ok_or_else(|| {
         let known: Vec<&str> = config.tools.iter().map(|t| t.name.as_str()).collect();
         if known.is_empty() {
@@ -555,7 +553,7 @@ pub fn lookup<'a>(config: &'a ToolsConfig, name: &str) -> Result<&'a RemoteTool>
 /// anything is dialed.
 ///
 /// The shaping flags are local: they are not part of the [`Invocation`], so
-/// the host never sees them and its call record holds only `(tool, argv)`.
+/// the host never sees them and its call record holds only `(service, argv)`.
 ///
 /// In locked mode ([`Lock`]), an override flag, or data on stdin the operator
 /// didn't allow, fails with [`EXIT_LOCKED`] before anything is dialed.
@@ -586,10 +584,10 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
     )?)?;
     let argv = Argv::new(a.args).context("arguments")?;
     let creds = Credentials::resolve(&a.creds)?;
-    let route = route(&config, &a.tool, &creds)?;
+    let route = route(&config, &a.service, &creds)?;
     let plan = match &route {
         Route::Service { .. } => None,
-        Route::Alias => Some(Dial::resolve(lookup(&config, &a.tool)?, argv.clone())?),
+        Route::Alias => Some(Dial::resolve(lookup(&config, &a.service)?, argv.clone())?),
     };
     let run = async |stdout: &mut (dyn AsyncWrite + Unpin + Send)| match (&route, plan) {
         (Route::Service { ks, state, service }, _) => {
@@ -652,9 +650,7 @@ enum Route {
 /// that points at `wires services`.
 fn route(config: &ToolsConfig, name: &str, creds: &Credentials) -> Result<Route> {
     let ks = Keystore::resolve()?;
-    let Some(state) = stored_state(&ks, creds)? else {
-        bail!("this node holds no signed state yet: run `wires join <token>` first");
-    };
+    let state = store::require_state(&ks, creds.membership.fabric)?;
     route_in(config, name, ks, state)
 }
 
@@ -705,10 +701,10 @@ mod tests {
 
     fn tool(target: ToolTarget, remote: Option<&str>) -> RemoteTool {
         RemoteTool {
-            name: ToolName::new("local").unwrap(),
+            name: ServiceName::new("local").unwrap(),
             description: String::new(),
             target,
-            remote_tool: remote.map(|r| ToolName::new(r).unwrap()),
+            remote_tool: remote.map(|r| ServiceName::new(r).unwrap()),
         }
     }
 
@@ -731,7 +727,7 @@ mod tests {
         assert_eq!(d.target, node());
         assert_eq!(d.addrs, vec![addr]);
         assert_eq!(d.relay_url.as_deref(), Some("https://relay.example"));
-        assert_eq!(d.invocation.tool.as_str(), "local");
+        assert_eq!(d.invocation.service.as_str(), "local");
         assert_eq!(d.invocation.argv.as_slice(), ["x"]);
     }
 
@@ -746,7 +742,7 @@ mod tests {
             Some("psql"),
         );
         let d = Dial::resolve(&t, Argv::default()).unwrap();
-        assert_eq!(d.invocation.tool.as_str(), "psql");
+        assert_eq!(d.invocation.service.as_str(), "psql");
     }
 
     #[test]
@@ -824,7 +820,7 @@ mod tests {
         // permission rule scoped to one tool (`Bash(wires call gh:*)`) still
         // matches a shaped call.
         let a = parse(&["gh", "--jq", ".[].name", "--head", "3", "--", "api", "x"]);
-        assert_eq!(a.tool, "gh");
+        assert_eq!(a.service, "gh");
         assert_eq!(a.shape.jq.as_deref(), Some(".[].name"));
         assert_eq!(a.shape.head, Some(3));
         assert_eq!(a.args, ["api", "x"]);
@@ -887,7 +883,7 @@ mod tests {
     /// after it arrives, and the remote exit code passes through.
     #[tokio::test]
     async fn shaping_over_a_loopback_host() {
-        use crate::host::config_v2::HostConfigV2;
+        use crate::host::config::HostConfig;
         use crate::host::transport::{ALPN, endpoint_addr, secret_key};
         use library::{Hello, Membership, Service, State, StateVersion};
 
@@ -917,7 +913,7 @@ mod tests {
         let ks = Keystore::at(&home);
         crate::state::store::adopt_if_newer(&ks, &s.sign(&root).unwrap(), root.node_id(), 10)
             .unwrap();
-        let config = HostConfigV2::parse(&format!(
+        let config = HostConfig::parse(&format!(
             r#"{{"version":2,"identity":{},"services":{{
                 "json":{{"command":["sh","-c","printf '{{\"items\":[{{\"name\":\"é-one\"}},{{\"name\":\"two\"}},{{\"name\":\"three\"}}]}}'"]}},
                 "fail":{{"command":["sh","-c","echo 'HTTP 404'; exit 3"]}}}}}}"#,
@@ -962,7 +958,7 @@ mod tests {
                     id_token: Some(crate::testutil::test_id_token(&client.node_id())),
                 },
                 Invocation {
-                    tool: ToolName::new(name).unwrap(),
+                    service: ServiceName::new(name).unwrap(),
                     argv: Argv::default(),
                 },
                 |_, _| Ok(()),
@@ -1002,7 +998,7 @@ mod tests {
     fn args_pass_through_with_or_without_a_separator() {
         let a = parse(&["rg", "foo", "bar"]);
         assert_eq!(
-            (a.tool.as_str(), a.args),
+            (a.service.as_str(), a.args),
             ("rg", vec!["foo".into(), "bar".into()])
         );
         let a = parse(&["rg", "--", "-n", "--x", "foo"]);
@@ -1290,7 +1286,7 @@ mod tests {
         let (r, _) = run_service(&f, &state, Hints::from_pairs([(a, vec![dead])])).await;
         let err = format!("{:#}", r.unwrap_err());
         assert!(err.contains("no host answered"), "{err}");
-        assert!(err.contains(&a.hex()[..8]), "{err}");
+        assert!(err.contains(&a.short()), "{err}");
     }
     /// Card 28 §8: an expired state is never dialed from.
     #[tokio::test]
@@ -1376,14 +1372,14 @@ mod tests {
         let stranger = NodeIdentity::from_seed([91; 32]).node_id();
         let state = signed_state(&f.root, 1, me, &[host]);
         let alias = |name: &str, node: NodeId| RemoteTool {
-            name: ToolName::new(name).unwrap(),
+            name: ServiceName::new(name).unwrap(),
             description: String::new(),
             target: ToolTarget::Node {
                 node,
                 relay_url: None,
                 addrs: vec![],
             },
-            remote_tool: Some(ToolName::new("orders-db").unwrap()),
+            remote_tool: Some(ServiceName::new("orders-db").unwrap()),
         };
         let config = ToolsConfig {
             tools: vec![alias("orders-db", stranger), alias("orders", stranger)],

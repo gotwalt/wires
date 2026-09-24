@@ -2,25 +2,17 @@
 //! this node holds: its membership, the version of its signed state, and its
 //! stored ID token from `wires login` (the token travels in the handshake).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use library::{Hello, IdToken, Membership, StateVersion};
 
 use crate::admin::keystore::Keystore;
 use crate::caller::login::ID_TOKEN_FILE;
 use crate::state::store;
 
-/// Build this node's [`Hello`]. A missing ID token is not an error (the host
-/// decides whether the service needs one); a missing membership is.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn build(ks: &Keystore) -> Result<Hello> {
-    let membership = ks
-        .read_membership()?
-        .context("this node has no membership: run `wires join <token>` first")?;
-    with_membership(ks, membership)
-}
-
-/// [`build`] with a membership resolved elsewhere (a `--membership` flag):
-/// the state version and ID token still come from `ks`. A stored state that
+/// Build this node's [`Hello`] around `membership` (from the keystore or a
+/// `--membership` flag); the state version and ID token come from `ks`. A
+/// missing ID token is not an error (the host decides whether the service
+/// needs one). A stored state that
 /// fails to verify counts as none (version 0): the host then hands back its
 /// own.
 pub(crate) fn with_membership(ks: &Keystore, membership: Membership) -> Result<Hello> {
@@ -56,12 +48,6 @@ mod tests {
     }
 
     #[test]
-    fn no_membership_is_an_error() {
-        let err = build(&keystore()).unwrap_err().to_string();
-        assert!(err.contains("wires join"), "{err}");
-    }
-
-    #[test]
     fn carries_membership_state_version_and_token() {
         let root = NodeIdentity::from_seed([1; 32]);
         let me = NodeIdentity::from_seed([2; 32]);
@@ -69,7 +55,7 @@ mod tests {
         let m = Membership::mint(&root, me.node_id(), 0, i64::MAX).unwrap();
         ks.save_membership(&m).unwrap();
 
-        let h = build(&ks).unwrap();
+        let h = with_membership(&ks, m.clone()).unwrap();
         assert_eq!(h.membership, m);
         assert_eq!(h.state_version, StateVersion(0));
         assert_eq!(h.id_token, None);
@@ -82,7 +68,7 @@ mod tests {
         store::adopt_if_newer(&ks, &signed, root.node_id(), 10).unwrap();
         std::fs::write(ks.path(ID_TOKEN_FILE), "a.b.c\n").unwrap();
 
-        let h = build(&ks).unwrap();
+        let h = with_membership(&ks, m.clone()).unwrap();
         assert_eq!(h.state_version, StateVersion(4));
         assert_eq!(h.id_token, Some(IdToken::new("a.b.c")));
     }

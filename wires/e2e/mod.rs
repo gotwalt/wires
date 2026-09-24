@@ -7,7 +7,7 @@
 //! no relay, nothing that leaves the machine. Peers find each other through
 //! address hints over loopback ([`localhost_socks`]).
 //!
-//! - [`services_host`] — card 27's acceptance: a `host.json` v2 host decides
+//! - [`services_host`] — card 27's acceptance: a host decides
 //!   every call by the admin-signed state (the registry's roles,
 //!   `also_require`, removal with no restart, refusing unassigned services,
 //!   push by the state), and nothing is broadcast to a bystander.
@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use iroh::Endpoint;
 
-/// Card 27's host side: a `host.json` v2 host decides by the signed state.
+/// Card 27's host side: a host decides by the signed state.
 mod services_host;
 
 /// Card 26b: call records streamed from the host's log to authorized readers.

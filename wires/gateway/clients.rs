@@ -24,11 +24,10 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
+use library::B64;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
-
-const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// The prefix of a DCR-issued `client_id`.
 pub(crate) const DCR_PREFIX: &str = "wires-dcr.";
@@ -65,7 +64,7 @@ impl Client {
         self.redirect_uris.iter().any(|r| {
             r == uri
                 || (r.scheme() == "http"
-                    && is_loopback_host(r)
+                    && crate::net::is_loopback(r)
                     && r.scheme() == uri.scheme()
                     && r.host_str() == uri.host_str()
                     && r.path() == uri.path()
@@ -93,16 +92,7 @@ fn refuse<T>(why: impl Into<String>) -> Result<T, ClientError> {
 pub(crate) fn valid_redirect_uri(uri: &Url) -> bool {
     uri.fragment().is_none()
         && uri.has_host()
-        && (uri.scheme() == "https" || (uri.scheme() == "http" && is_loopback_host(uri)))
-}
-
-fn is_loopback_host(uri: &Url) -> bool {
-    match uri.host() {
-        Some(url::Host::Domain(d)) => d == "localhost",
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    }
+        && (uri.scheme() == "https" || (uri.scheme() == "http" && crate::net::is_loopback(uri)))
 }
 
 /// An RFC 7591 registration request (only the fields the gateway reads).

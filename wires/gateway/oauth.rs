@@ -47,7 +47,7 @@ const CALLBACK_COOKIE: &str = "__Host-wires_cb";
 /// cookie alone never names a pending authorization.
 fn callback_binding(id: &str) -> String {
     use base64::Engine as _;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ring::digest::digest(
+    library::B64.encode(ring::digest::digest(
         &ring::digest::SHA256,
         format!("wires gateway callback v1:{id}").as_bytes(),
     ))
@@ -162,7 +162,7 @@ pub(crate) async fn register<B: Backend>(State(gw): Gw<B>, body: axum::body::Byt
             );
         }
     };
-    let now = crate::now_unix();
+    let now = crate::clock::now_unix();
     match gw.client_key.register(&req, now) {
         Ok(c) => (
             StatusCode::CREATED,
@@ -262,7 +262,7 @@ pub(crate) async fn authorize<B: Backend>(
         resource: gw.urls.resource(),
         upstream_verifier: verifier,
         login_hint: q.get("login_hint").map(|h| h.chars().take(256).collect()),
-        created: crate::now_unix(),
+        created: crate::clock::now_unix(),
     };
     let id = match gw.store.begin(authorization) {
         Ok(id) => id,
@@ -343,7 +343,7 @@ pub(crate) async fn confirm<B: Backend>(
             "This sign-in did not start in this browser. Start again from your MCP client.",
         );
     }
-    let Some(a) = gw.store.pending(id, crate::now_unix()) else {
+    let Some(a) = gw.store.pending(id, crate::clock::now_unix()) else {
         return error_page(
             StatusCode::BAD_REQUEST,
             "This sign-in has expired. Start again from your MCP client.",
@@ -400,7 +400,7 @@ pub(crate) async fn callback<B: Backend>(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let now = crate::now_unix();
+    let now = crate::clock::now_unix();
     let state = q.get("state").map(String::as_str).unwrap_or_default();
     if state.is_empty() || cookie(&headers, CALLBACK_COOKIE) != Some(&callback_binding(state)) {
         return error_page(
@@ -444,7 +444,7 @@ pub(crate) async fn callback<B: Backend>(
             return back("access_denied", "the sign-in did not verify");
         }
     };
-    let who = crate::host::identity::principal_name(&login.principal);
+    let who = login.principal.name();
     match gw.tools_for(&login.principal) {
         Ok((grants, _)) if grants.is_empty() => {
             tracing::info!("gateway: {who} may call nothing here; refused");
@@ -497,7 +497,7 @@ pub(crate) async fn token<B: Backend>(
             "only authorization_code is supported",
         );
     }
-    let now = crate::now_unix();
+    let now = crate::clock::now_unix();
     let Some(grant) = f.get("code").and_then(|c| gw.store.redeem_code(c, now)) else {
         return bad("invalid_grant", "the code is unknown, used or expired");
     };
@@ -627,7 +627,7 @@ fn esc(s: &str) -> String {
 #[cfg(test)]
 pub(crate) fn b64(bytes: &[u8]) -> String {
     use base64::Engine as _;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    library::B64.encode(bytes)
 }
 
 #[cfg(test)]

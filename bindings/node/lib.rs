@@ -292,7 +292,7 @@ impl HostBuilder {
         this
     }
 
-    /// Also read `path` as `host.json` v2 (CLI services beside the
+    /// Also read `path` as `host.json` (CLI services beside the
     /// JavaScript ones, trusted IdPs, push, audit export).
     #[napi]
     pub fn host_json<'a>(&mut self, this: This<'a>, path: String) -> This<'a> {

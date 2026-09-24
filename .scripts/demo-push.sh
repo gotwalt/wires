@@ -130,7 +130,7 @@ wb="$D/wb"
 agent="$D/agent"
 mkdir -p "$root" "$wb" "$agent"
 
-ROOT_ID="$(admin init | awk '/^fabric /{print $2}')"
+ROOT_ID="$(admin init | awk '/^network /{print $2}')"
 WB_ID="$(WIRES_HOME="$wb" "$WIRES" id 2>/dev/null)"
 AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
 [ -n "$ROOT_ID" ] && [ -n "$WB_ID" ] && [ -n "$AG_ID" ] || bad "setup: could not read the key ids"

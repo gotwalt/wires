@@ -24,7 +24,7 @@ Every role joins the same way: `wires id`, then `wires join <token>` with the ad
 | **Who may call what** | The state's registry: each service's `allow` roles, and the role definitions (matchers on the IdP identity, each naming its issuer). Every role needs a verified identity. | The host, on every call. `wires services` evaluates the same table locally, for listing only. |
 | **Stricter local rules** | `host.json`'s `also_require` roles per service. They can only narrow. | The host, after the registry. |
 | **Who is calling** | Your IdP's ID token, bound to the caller's node key at `wires login` (the OIDC `nonce` is a hash of the key), presented in the session `Hello`. | The host, against the issuer's JWKS, under the issuers `host.json` trusts. No wires identity service. |
-| **Reach** | The host's node key. Callers dial a key (iroh; n0 discovery, or an optional local `$WIRES_HOME/hints` file); the host binds UDP for QUIC and has no TCP listener. | iroh's handshake authenticates the key (any key may connect); the host then checks the membership and the state at the first message, and a key the state doesn't list hears only `not admitted to this fabric`. |
+| **Reach** | The host's node key. Callers dial a key (iroh; n0 discovery, or an optional local `$WIRES_HOME/hints` file); the host binds UDP for QUIC and has no TCP listener. | iroh's handshake authenticates the key (any key may connect); the host then checks the membership and the state at the first message, and a key the state doesn't list hears only `not a member of this network`. |
 | **Which host** | The registry's `hosts` for the service. Only the admin binds a name to a host, so no host can squat a name. | The caller (it dials only those hosts) and the host (it refuses to start, or to serve, a name not assigned to it). |
 | **Records** | Each host's own call log: every call, member's refusal and push (a non-member's knock is traced, not logged), signed by the host and hash-linked. | Readers, with `wires watch`: the service's `readers` roles see all of it; everyone else sees only the records of their own verified identity (issuer and subject, from any of their nodes) and a hash link for every other entry. Every entry and the chain are verified. |
 | **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. A service pushes only through its call's capability, to that call's caller. | The host, at send, delivery and fetch: a member of the state, in a `push.allow` role. |
@@ -47,7 +47,7 @@ step. Node ids are shortened.
 
 ```console
 admin$ wires init
-fabric 57b09428…
+network 57b09428…
 node 23028cae…
 state version 1 (1 member: this node)
 next: on each joining machine run `wires id`, then here `wires invite <node-id> --name <label>`
@@ -195,7 +195,7 @@ admin$ wires remove agent
 wires: state version 11: pushed to 2 of 2 host(s)
 removed dd7e7237… (agent) (state version 11, 4 members)
 agent$ wires call orders-db -- "select count(*) from orders"
-wires: denied by responder: not admitted to this fabric
+wires: denied by responder: not a member of this network
 agent$ echo $?
 77
 ```
@@ -442,13 +442,13 @@ For a stdio MCP client, the whole config is:
 Who may call a service is not in this file: it is the registry's `allow`. A
 member's refusal names the rule that failed (`… is in no role allowed to call
 orders-db (analyst)`, `service orders-db is not assigned to this host …`); a
-key the state doesn't list hears only `not admitted to this fabric`.
+key the state doesn't list hears only `not a member of this network`.
 
 A service's environment starts empty: only `PATH`, `LANG` and `LC_*` are
 inherited from `serve`, then the service's `env`, then what the host sets
 from the verified call: `WIRES_CALLER_NODE`, `WIRES_CALLER_EMAIL` (when
 verified), `WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_AFTER`,
-`WIRES_STATE_VERSION`, `WIRES_SERVICE`, `WIRES_TOOL`, `WIRES_ROLE`, and, with
+`WIRES_STATE_VERSION`, `WIRES_SERVICE`, `WIRES_ROLE`, and, with
 a `push` section, the call's push capability (`WIRES_PUSH_SOCKET`,
 `WIRES_PUSH_TOKEN`). None of it is taken from the caller. The child gets no
 `WIRES_HOME`, `HOME`, agent sockets or cloud credentials.
@@ -497,7 +497,7 @@ a container can mount its node key from a secret with `--node-seed-file`.
 effect at each host on the next call after that host has the new state, with
 no restart. A refused call prints `wires: denied by responder: <reason>` on
 stderr, writes nothing to stdout and exits `77`. A member's refusal is in the
-host's log; a removed member hears only `not admitted to this fabric`, and
+host's log; a removed member hears only `not a member of this network`, and
 the host traces that instead of logging it. There is no shared key, so there
 is nothing to rotate. The protocol as built: [docs/protocol.md](protocol.md).
 

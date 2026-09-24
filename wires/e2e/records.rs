@@ -3,7 +3,7 @@
 //! card 28's §5: "mine" is the person, a following reader is re-decided,
 //! and marks are kept per host.
 //!
-//! One v2 host serves `orders-db` (analyst; readers: security) and `status`
+//! One host serves `orders-db` (analyst; readers: security) and `status`
 //! (staff: anyone the three IdPs verified; readers: security), writing its
 //! real call log. alice (analyst) calls, from two nodes; sam (security)
 //! reads; bob (staff, no reader role) and a stranger try to. The readers run
@@ -27,7 +27,7 @@ use iroh::{Endpoint, EndpointAddr};
 use library::{
     AuditRecord, ChainBreak, Frame, Hello, Invocation, LogEntry, LogSeq, Matcher, Membership,
     NodeId, NodeIdentity, OidcNonce, RoleName, Service, ServiceName, SignedState, State,
-    StateVersion, ToolName,
+    StateVersion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
@@ -40,7 +40,7 @@ use crate::caller::mock_idp::{MOCK_CLIENT_ID, MockIdp};
 use crate::caller::pick::Hints;
 use crate::caller::watch_records::{Output, Report, WatchOpts, text_line, watch_with};
 use crate::host::call_log::{self, CallLog};
-use crate::host::config_v2::HostConfigV2;
+use crate::host::config::HostConfig;
 use crate::host::record_stream::NOT_ADMITTED;
 use crate::host::serve::{services_host, services_router};
 use crate::host::transport::{ALPN, endpoint_addr, secret_key};
@@ -90,7 +90,7 @@ impl World {
     fn state_v(&self, version: u64, edit: impl FnOnce(&mut State)) -> SignedState {
         let mut s = State::new(self.root.node_id());
         s.version = StateVersion(version);
-        s.issued = crate::now_unix();
+        s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
         for n in [&self.host, &self.alice, &self.alice2, &self.bob, &self.sam] {
             s.members.insert(n.node_id());
@@ -149,7 +149,7 @@ impl World {
             state_version: StateVersion(1),
             id_token: Some(self.idp(who).mint(
                 &OidcNonce::for_node(&who.node_id()),
-                crate::now_unix() + 3600,
+                crate::clock::now_unix() + 3600,
             )),
         }
     }
@@ -163,7 +163,7 @@ impl World {
             &ks,
             &self.state(),
             self.root.node_id(),
-            crate::now_unix(),
+            crate::clock::now_unix(),
         )
         .unwrap();
         let token = self.hello(who).id_token.unwrap();
@@ -194,7 +194,7 @@ impl Host {
             &keystore,
             &w.state(),
             w.root.node_id(),
-            crate::now_unix(),
+            crate::clock::now_unix(),
         )
         .unwrap();
         let issuers: Vec<String> = [&w.idp_alice, &w.idp_bob, &w.idp_sam]
@@ -206,7 +206,7 @@ impl Host {
                 )
             })
             .collect();
-        let config = HostConfigV2::parse(&format!(
+        let config = HostConfig::parse(&format!(
             r#"{{"version":2,"identity":{{"issuers":[{}]}},"services":{SERVICES}}}"#,
             issuers.join(",")
         ))
@@ -218,7 +218,7 @@ impl Host {
             config,
         )
         .unwrap();
-        host.preflight(crate::now_unix()).unwrap();
+        host.preflight(crate::clock::now_unix()).unwrap();
         // The call log exactly as `serve` opens it.
         let log = keystore.path(call_log::LOG_FILE);
         let opened =
@@ -247,7 +247,7 @@ impl Host {
             &self.keystore,
             state,
             w.root.node_id(),
-            crate::now_unix(),
+            crate::clock::now_unix(),
         )
         .unwrap();
     }
@@ -297,7 +297,7 @@ async fn call(w: &World, who: &NodeIdentity, host: &Host, name: &str, args: &[&s
         let conn = endpoint.connect(host.addr.clone(), ALPN).await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
         let invoke = Frame::Invoke(Invocation {
-            tool: ToolName::new(name).unwrap(),
+            service: ServiceName::new(name).unwrap(),
             argv: library::Argv::new(args.iter().map(|a| a.to_string()).collect()).unwrap(),
         });
         for frame in [Frame::Hello(w.hello(who)), invoke] {

@@ -77,8 +77,8 @@ SignedState { state, alg, sig }
   strictly newer (`is_newer_than`: same fabric, higher version). The re-read, check and write happen
   under one exclusive file lock (`state.json.lock`), so a removed member presenting a genuine older
   state can't roll a node back.
-- **Names.** `ServiceName` is `[a-z][a-z0-9_-]*`, at most 64 bytes (the same rules as the session's
-  `ToolName`). `RoleName` is 1–64 of `[A-Za-z0-9_.-]`.
+- **Names.** `ServiceName` is `[a-z][a-z0-9_-]*`, at most 64 bytes; the session's `Invocation`
+  names one. `RoleName` is 1–64 of `[A-Za-z0-9_.-]`.
 - **Roles.** A role is an OR of matchers; a matcher is an AND of its keys over the caller's verified
   IdP principal: `issuer` (exact, **required**), `email` (exact, or `*@domain`), `org` (Google's
   `hd`), `group`. Because every matcher names its issuer, a token another trusted issuer minted
@@ -149,7 +149,7 @@ Frames are length-prefixed canonical JSON tagged by `type`, at most 4 MiB
   most 16 exchanges at once (one more is closed unanswered) and sizes no buffer from a length
   prefix: a frame over 4 KiB must open as an `offer` (`{"state":`, checked before the rest is
   read), and nothing is over 4 MiB. A held copy that has expired vouches for nobody, and a dialer
-  it doesn't list hears only `not admitted to this fabric` (no version, not whether the copy
+  it doesn't list hears only `not a member of this network` (no version, not whether the copy
   expired; the detail is traced, throttled). To an `offer` from a member of the fresh held copy it
   runs `adopt_if_newer`. Adopted: it marks its copy checked and answers `have`. Not adopted
   (older or equal): it answers `have` and does **not** mark its copy checked, so a removed member
@@ -173,7 +173,7 @@ A session is one bidirectional QUIC stream on ALPN `wires/session/3`. Codec:
 | Tag | Frame | Body | Direction |
 |---|---|---|---|
 | 8 | `Hello` | canonical JSON `{membership, state_version, id_token?}` | caller → host |
-| 7 | `Invoke` | canonical JSON `Invocation {tool, argv}` | caller → host, right after `Hello`, without waiting |
+| 7 | `Invoke` | canonical JSON `Invocation {service, argv}` | caller → host, right after `Hello`, without waiting |
 | 9 | `HelloAck` | canonical JSON `{membership, state_version, newer_state?}` (the host's own) | host → caller |
 | 6 | `Denied` | UTF-8 reason (at most 512 bytes) | host → caller, terminal |
 | 1/2/3 | `Stdin`/`Stdout`/`Stderr` | raw chunk (at most 64 KiB when pumped) | stdin: caller → host; stdout/stderr: host → caller |
@@ -190,7 +190,7 @@ failure below is sent as `Denied` (`wires/host/gate.rs`):
 1. The host holds a readable state (else `responder configuration error`).
 2. **Membership, before anything else:** `check_inclusion(hello.membership, trust_root, caller,
    now)` and the state lists `caller`. Anyone else — no credential, someone else's, another fabric's,
-   expired, removed — hears only `not admitted to this fabric`: no reason, no state version. Their
+   expired, removed — hears only `not a member of this network`: no reason, no state version. Their
    token is never verified (no JWKS fetch, no identity-index entry), and the refusal is traced
    (throttled), **not** written to the call log, so strangers can't fill it.
 3. **Identity.** The `id_token`, if any, is verified by the host itself (§6); the principal, or why
@@ -216,7 +216,7 @@ caller's arguments as an option; it doesn't help a CLI that ignores `--`), in it
 child's environment is built from nothing (`env_clear`): only `PATH`, `LANG` and `LC_*` are
 inherited from `serve`; then `host.json`'s `env`; then the server-derived `WIRES_CALLER_NODE`,
 `WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_AFTER`, `WIRES_STATE_VERSION`, `WIRES_SERVICE`,
-`WIRES_TOOL`, `WIRES_ROLE`, and, when verified, `WIRES_CALLER_EMAIL`. With `push` on, also
+`WIRES_ROLE`, and, when verified, `WIRES_CALLER_EMAIL`. With `push` on, also
 `WIRES_PUSH_SOCKET` and `WIRES_PUSH_TOKEN`, the call's push capability (§7), already bound to the
 call's id before the child starts. The child never gets `WIRES_HOME`, `HOME`, agent sockets or
 cloud credentials. If the connection closes, the host kills the child.
@@ -318,7 +318,7 @@ so it may be at most 64 KiB. Two ways a message is delivered:
 
 - **Direct:** the host dials the recipient (3 s budget). A running `wires inbox --wait` serves the
   inbox ALPN and accepts `deliver` only from a member its signed state names as a **host**; any
-  other dialer hears only `not admitted to this fabric` (the reason is traced, throttled).
+  other dialer hears only `not a member of this network` (the reason is traced, throttled).
 - **Fetch:** `wires inbox` dials the hosts of every service it may call (`hello` with its stored ID
   token, `fetch` held open for up to 25 s, `deliver`, then `ack`).
 
@@ -328,7 +328,7 @@ admits it (default: nobody). **The identity rule:** every role needs the recipie
 principal, which the host learns only when the recipient presents its token to it: on a call, or in
 an inbox fetch. `--to <role>` names the members whose known principal the role admits; a member
 with no verified identity here is in no role. A fetch is checked like a call: at most 64 undecided
-at once, membership first, and a non-member hears only `not admitted to this fabric`, has its token
+at once, membership first, and a non-member hears only `not a member of this network`, has its token
 left unverified, and is traced, not logged; a removed member's queue is dropped (each message logged
 `denied`) and its fetch refused. A member holds at most 2 long polls open per host; a member's
 policy refusal is answered, not logged (`wires inbox` asks every host of its services).
@@ -365,9 +365,8 @@ capability only, the operator's `push` narrows to `--to <node-id>`, role address
 ## 8. Records
 
 **The call log** (`library/calls/call_log.rs`, `wires/host/call_log.rs`). Every `AuditRecord` a host
-produces (`started {call, caller, principal?, tool, argv, roster_version?, role?}` — `roster_version`
-carries the state version — `finished {call, exit, duration_ms, stdout/stderr bytes, stdout_digest,
-stdin_bytes, stdin_digest, stdin_head ≤4 KiB}`, `denied {caller, principal?, tool?, reason}`, `push {id, to,
+produces (`started {call, caller, principal?, service, argv, state_version, role}` —
+`finished {call, exit, duration_ms, stdout/stderr bytes, stdout_digest, stdin_bytes, stdin_digest, stdin_head ≤4 KiB}`, `denied {caller, principal?, service?, reason}`, `push {id, to,
 principal?, role?, subject, outcome, reason?, body?, call?}`; a `principal` is the verified
 `{issuer, subject, email?, …}`) becomes a `LogEntry { v: 1, host, seq, prev, at_ms, record,
 sig }`: dense 0-based `seq`, `prev` the hash of the previous entry (zero at seq 0), signed by the
@@ -405,8 +404,8 @@ Each entry is sent either **in full** (signed, as stored) or inside a `hidden` r
 full when its service was requested and granted `all`, or when its service was requested and its
 subject is the reader's **person**: the same verified principal (issuer and `sub`) the host verifies
 for the reader now, whichever node either used. A reader with no verified principal sees nothing in
-full. Subjects and services: `started` — its tool, its `principal`; `finished` — its `started`'s (if
-that was pruned, the entry is only a hidden link); `denied` — its tool, its `principal` (no tool:
+full. Subjects and services: `started` — its service, its `principal`; `finished` — its `started`'s (if
+that was pruned, the entry is only a hidden link); `denied` — its service, its `principal` (no service:
 shown only to its subject); `push` — the service of the call whose capability sent it (`call` → that
 call's `started`), and the principal it was admitted for. An operator push (no `call`), or one whose
 call's `started` was pruned, is shown only to its recipient.

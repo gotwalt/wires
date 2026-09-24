@@ -53,7 +53,7 @@ honest line from someone who runs remote MCP servers behind Tailscale today.
 | Role | Decides | Commands |
 |---|---|---|
 | **admin** | who's in, the roles, which services run where, who may call and read each (root key; one signed state) | `init`, `invite`, `remove`, `role`, `service`, `state push` |
-| **host** | how it implements its assigned services; trusted IdPs; stricter local rules (`host.json` v2) | `serve host.json`, `push` |
+| **host** | how it implements its assigned services; trusted IdPs; stricter local rules (`host.json`) | `serve host.json`, `push` |
 | **caller** | — runs services by name; MCP (stdio, or the remote gateway) so wires works in the clients people already use | `join`, `login`, `services`, `call`, `mcp`, `inbox`, `gateway` |
 | **reader** | — any member: a service's `readers` role reads all its records, in full; everyone else their own person's (same issuer and subject, from any node) | `watch` |
 
@@ -64,7 +64,7 @@ The IdP is *bound* at the caller (`login`) and *verified* at the host, against t
 1. **workbench** (no inbound ports): `wires serve host.json`, implementing `orders-db`, which the admin registered for role `analyst` (`wires service add orders-db --allow analyst --reader security --host workbench`).
 2. **laptop**: Claude Code calling `wires call orders-db -- "…"` from Bash (and/or `wires mcp` in its MCP config).
 3. **reader** (third terminal/machine, role `security`): `wires watch orders-db` — each call appears as `▶ … alice@corp (…) [analyst] orders-db "select …"`, then `■ … exit 0 · 41 ms · 3.1 KiB out`.
-4. **Revoke**: one `wires remove agent` → the new state is pushed to the workbench, which refuses the agent's next call (exit 77, `not admitted to this fabric`); the host traces that rather than logging it, since a key outside the state can't write to the log.
+4. **Revoke**: one `wires remove agent` → the new state is pushed to the workbench, which refuses the agent's next call (exit 77, `not a member of this network`); the host traces that rather than logging it, since a key outside the state can't write to the log.
 
 ## Lanes
 

@@ -44,16 +44,13 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+use crate::codec::B64;
 use crate::codec::canonical_bytes;
 use crate::error::{Error, Result};
 use crate::identity::{NodeId, NodeIdentity};
 use crate::membership::Membership;
 use crate::policy::check_inclusion;
 use crate::state::SignedState;
-
-/// The base64 alphabet for the token: URL-safe, no padding (as every other
-/// wires token).
-const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// The invite token's format discriminant. `2`: membership + signed state
 /// (card 27); the channel-era `1` (roster head, sealed fabric key, bootstrap

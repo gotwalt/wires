@@ -12,19 +12,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::identity::NodeId;
-use crate::invoke::ToolName;
 use crate::role::RoleName;
 
-/// A service's name: the same rules as [`ToolName`] (ASCII lowercase letter,
-/// then lowercase letters, digits, `_` or `-`, at most [`MAX_TOOL_NAME`](crate::MAX_TOOL_NAME)
-/// bytes), so it is safe verbatim as an MCP tool name, a CLI word and a log
-/// field.
+/// Longest accepted [`ServiceName`], in bytes.
+pub const MAX_SERVICE_NAME: usize = 64;
+
+/// A service's name: an ASCII lowercase letter, then lowercase letters,
+/// digits, `_` or `-`, at most [`MAX_SERVICE_NAME`] bytes, so it is safe
+/// verbatim as an MCP tool name, a CLI word and a log field.
 ///
 /// ```
-/// use library::{ServiceName, ToolName};
+/// use library::ServiceName;
 /// let s = ServiceName::new("orders-db").unwrap();
-/// assert_eq!(ToolName::from(s.clone()).as_str(), "orders-db");
+/// assert_eq!(s.as_str(), "orders-db");
 /// assert!(ServiceName::new("Orders DB").is_err());
+/// assert!(ServiceName::new("").is_err());
 /// ```
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -34,8 +36,16 @@ impl ServiceName {
     /// Validate and wrap a service name; [`Error::InvalidServiceName`] if it
     /// breaks the rules in the type docs.
     pub fn new(name: impl Into<String>) -> Result<Self> {
-        let tool = ToolName::new(name).map_err(|_| Error::InvalidServiceName)?;
-        Ok(Self(tool.as_str().to_string()))
+        let name = name.into();
+        let mut chars = name.chars();
+        let first_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
+        let rest_ok =
+            chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+        if first_ok && rest_ok && name.len() <= MAX_SERVICE_NAME {
+            Ok(Self(name))
+        } else {
+            Err(Error::InvalidServiceName)
+        }
     }
 
     /// The name as a string slice.
@@ -55,21 +65,6 @@ impl TryFrom<String> for ServiceName {
 impl From<ServiceName> for String {
     fn from(s: ServiceName) -> String {
         s.0
-    }
-}
-
-/// The session's [`Invocation`](crate::Invocation) still names a
-/// [`ToolName`]; a service name always is one (same rules).
-impl From<ServiceName> for ToolName {
-    fn from(s: ServiceName) -> ToolName {
-        ToolName::new(s.0).expect("a ServiceName is a valid ToolName")
-    }
-}
-
-/// And back: a tool name always is a valid service name.
-impl From<ToolName> for ServiceName {
-    fn from(t: ToolName) -> ServiceName {
-        ServiceName(t.as_str().to_string())
     }
 }
 
@@ -103,14 +98,31 @@ pub struct Service {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::invoke::MAX_TOOL_NAME;
-    use proptest::prelude::*;
 
     #[test]
-    fn rejects_bad_names() {
-        assert!(ServiceName::new("").is_err());
-        assert!(ServiceName::new("9lives").is_err());
-        assert!(ServiceName::new("a".repeat(MAX_TOOL_NAME + 1)).is_err());
+    fn name_rules() {
+        for ok in [
+            "a",
+            "db_query",
+            "rg",
+            "psql-ro",
+            "x9",
+            &"a".repeat(MAX_SERVICE_NAME),
+        ] {
+            assert!(ServiceName::new(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "9lives",
+            "_x",
+            "A",
+            "db query",
+            "db.query",
+            &"a".repeat(MAX_SERVICE_NAME + 1),
+        ] {
+            assert!(ServiceName::new(bad).is_err(), "{bad}");
+        }
+        assert!(serde_json::from_str::<ServiceName>("\"ok\"").is_ok());
         assert!(serde_json::from_str::<ServiceName>("\"UP\"").is_err());
     }
 
@@ -118,15 +130,5 @@ mod tests {
     fn service_rejects_unknown_fields() {
         let json = r#"{"description":"","allow":[],"hosts":[],"readers":[],"x":1}"#;
         assert!(serde_json::from_str::<Service>(json).is_err());
-    }
-
-    proptest! {
-        #[test]
-        fn service_and_tool_names_agree(s in "[a-z][a-z0-9_-]{0,63}") {
-            let svc = ServiceName::new(s.clone()).unwrap();
-            let tool = ToolName::from(svc.clone());
-            prop_assert_eq!(tool.as_str(), s.as_str());
-            prop_assert_eq!(ServiceName::from(ToolName::from(svc.clone())), svc);
-        }
     }
 }

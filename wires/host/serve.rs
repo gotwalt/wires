@@ -3,7 +3,7 @@
 //! What the host implements — each service's command, working directory and
 //! environment, the IdPs it trusts, stricter local rules, push, and where its
 //! call log is exported — comes from `host.json` (version 2, see
-//! [`config_v2`](super::config_v2)). Who may call is the admin-signed state's
+//! [`config`](super::config)). Who may call is the admin-signed state's
 //! to say. The flags left are where the host's own credentials live and
 //! `--relay-url`.
 //!
@@ -17,7 +17,7 @@ use anyhow::Context;
 use clap::Args;
 use library::NodeId;
 
-use super::config_v2::HostConfigV2;
+use super::config::HostConfig;
 use super::native::NativeServices;
 use super::{call_log, capability, control, gate, identity, otlp, push, transport};
 use crate::admin::keystore;
@@ -63,7 +63,7 @@ pub(crate) struct ServeArgs {
 /// the inbox ALPN plus a local control socket for `wires push`, deciding
 /// every call by the signed state as it stands at that connection.
 pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
-    let config = HostConfigV2::load(&a.config)?;
+    let config = HostConfig::load(&a.config)?;
     if a.check {
         print!("{}", config.summary());
         return Ok(());
@@ -98,7 +98,7 @@ pub(crate) struct Serving {
     pub(crate) keystore: Arc<keystore::Keystore>,
     /// How it implements its CLI services, which IdPs it trusts, push, and
     /// audit export.
-    pub(crate) config: HostConfigV2,
+    pub(crate) config: HostConfig,
     /// The services it implements in-process (card 33).
     pub(crate) native: NativeServices,
     /// How it gets its endpoint.
@@ -142,11 +142,11 @@ pub(crate) async fn serve_until(
     let mut host = services_host(node.node_id(), membership, Arc::clone(&ks), config)?;
     host.native = native;
     // A host assigned a service while it was offline: pull, then try again.
-    let state = match (host.preflight(crate::now_unix()), &binding) {
+    let state = match (host.preflight(crate::clock::now_unix()), &binding) {
         (Ok(state), _) => state,
         (Err(e), Binding::N0 { relay_url, .. }) => {
             match crate::state::sync::pull_now(&ks, &node, relay_url.as_deref()).await {
-                Ok(Some(_)) => host.preflight(crate::now_unix())?,
+                Ok(Some(_)) => host.preflight(crate::clock::now_unix())?,
                 _ => return Err(e),
             }
         }
@@ -234,12 +234,12 @@ pub(crate) fn services_host(
     me: NodeId,
     membership: library::Membership,
     keystore: Arc<keystore::Keystore>,
-    config: HostConfigV2,
+    config: HostConfig,
 ) -> anyhow::Result<gate::ServicesHost> {
     if keystore.path(ROOT_SEED).exists() {
         anyhow::bail!(
             "{} holds the admin key ({ROOT_SEED}); a host runs services and must not share a \
-             keystore with the fabric's root. Run `wires serve` from the host's own keystore \
+             keystore with the network's root (the admin). Run `wires serve` from the host's own keystore \
              (WIRES_HOME=<another dir> wires id, invite that node, join it there)",
             keystore.path("").display()
         );
@@ -365,7 +365,7 @@ mod tests {
                 crate::caller::mock_idp::MOCK_CLIENT_ID
             )
         });
-        let config = HostConfigV2::parse(&format!(
+        let config = HostConfig::parse(&format!(
             r#"{{"version":2,{identity}"services":{{"status":{{"command":["true"]}}}}}}"#
         ))
         .unwrap();
@@ -402,7 +402,7 @@ mod tests {
         let host = host_at(&home, None).unwrap();
         let ks = keystore::Keystore::at(&home);
         let root = library::NodeIdentity::from_seed([1u8; 32]).node_id();
-        let now = crate::now_unix();
+        let now = crate::clock::now_unix();
         crate::state::store::adopt_if_newer(&ks, &signed(1), root, now).unwrap();
         assert_eq!(host.state().unwrap().state.version.0, 1);
         crate::state::store::adopt_if_newer(&ks, &signed(2), root, now).unwrap();
@@ -426,7 +426,7 @@ mod tests {
     async fn a_host_trusts_only_the_keys_it_fetched_itself() {
         let idp = crate::caller::mock_idp::MockIdp::start("alice@example.com").await;
         let home = crate::testutil::temp_dir();
-        let now = crate::now_unix();
+        let now = crate::clock::now_unix();
         jwks::KeyFetcher::new(Some(home.join("jwks")))
             .unwrap()
             .keys(&idp.issuer, None, now)
@@ -483,13 +483,5 @@ mod tests {
         let e = format!("{:#}", serve_cmd(args(&bad)).await.unwrap_err());
         assert!(e.contains("is not a valid host.json"), "{e}");
         assert!(e.contains("unknown field `extra`"), "{e}");
-        let v1 = dir.join("v1.json");
-        std::fs::write(
-            &v1,
-            r#"{"version":1,"tools":{"gh":{"command":["gh"],"allow":["member"]}}}"#,
-        )
-        .unwrap();
-        let e = format!("{:#}", serve_cmd(args(&v1)).await.unwrap_err());
-        assert!(e.contains("version 1"), "{e}");
     }
 }

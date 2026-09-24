@@ -37,7 +37,8 @@ use iroh::endpoint::presets::N0;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 
 use library::{
-    Chunk, Frame, Hello, Invocation, NodeId, NodeIdentity, SignedState, ToolName, check_inclusion,
+    Chunk, Frame, Hello, Invocation, NodeId, NodeIdentity, ServiceName, SignedState,
+    check_inclusion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
@@ -233,7 +234,7 @@ impl Throttle {
     /// is why (never sent to the peer).
     pub(crate) fn refused(&self, what: &str, peer: NodeId, detail: &str) {
         tracing::debug!(peer = %peer.hex(), "{what} refused: {detail}");
-        if let Some(n) = self.tick(crate::host::audit::now_ms()) {
+        if let Some(n) = self.tick(crate::clock::now_ms()) {
             tracing::info!(
                 refused = n,
                 last_peer = %peer.hex(),
@@ -644,10 +645,10 @@ async fn refuse_member<W: AsyncWrite + Unpin>(
     audit: Option<&AuditSink>,
     caller: NodeId,
     principal: Option<library::Principal>,
-    tool: Option<ToolName>,
+    service: Option<ServiceName>,
     reason: String,
 ) -> anyhow::Error {
-    crate::host::audit::denied(audit, caller, principal, tool, &reason).await; // audit: denied
+    crate::host::audit::denied(audit, caller, principal, service, &reason).await; // audit: denied
     deny(send, reason.clone()).await;
     Refused(reason).into()
 }
@@ -666,7 +667,7 @@ async fn refuse_stranger<W: AsyncWrite + Unpin>(
     Refused(reason.to_string()).into()
 }
 
-/// The v2 responder over an authenticated bi-stream (see
+/// The host side of a session, over an authenticated bi-stream (see
 /// [`serve_session_permitted`], here with no pre-auth permit to return).
 #[cfg(test)]
 pub(crate) async fn serve_services_session<S, R>(
@@ -683,7 +684,7 @@ where
     serve_session_permitted(send, recv, caller, host, None, shutdown).await
 }
 
-/// The v2 responder over an authenticated bi-stream: read the
+/// The host side of a session, over an authenticated bi-stream: read the
 /// [`Frame::Hello`] (at most [`MAX_HELLO_FRAME`]) and the [`Frame::Invoke`]
 /// (at most [`MAX_INVOKE_FRAME`]), then decide by **this host's** signed
 /// state (re-read now, so a removal applies on the next dial):
@@ -751,9 +752,8 @@ where
             return Err(refuse_stranger(&mut send, caller, DENY_INVOKE_REQUIRED, &detail).await);
         }
     };
-    let tool = invocation.tool.clone();
-    let service = library::ServiceName::from(tool.clone());
-    let now = crate::now_unix();
+    let service = invocation.service.clone();
+    let now = crate::clock::now_unix();
 
     let state = match host.state() {
         Ok(state) => state,
@@ -784,14 +784,14 @@ where
         Ok(admitted) => admitted,
         Err(reason) => {
             let who = principal.clone();
-            return Err(refuse_member(&mut send, audit, caller, who, Some(tool), reason).await);
+            return Err(refuse_member(&mut send, audit, caller, who, Some(service), reason).await);
         }
     };
     // Only an admitted caller learns whether this host implements it.
     let Some(implementation) = host.implementation(&service) else {
         let reason = format!("service {service} is not implemented on this host");
         let who = principal.clone();
-        return Err(refuse_member(&mut send, audit, caller, who, Some(tool), reason).await);
+        return Err(refuse_member(&mut send, audit, caller, who, Some(service), reason).await);
     };
     drop(preauth);
     let version = admitted.state_version;
@@ -818,10 +818,10 @@ where
         audit,
         caller,
         principal.clone(),
-        tool.clone(),
+        service.clone(),
         invocation.argv.as_slice(),
-        Some(version.0),
-        Some(admitted.role.as_str().to_string()),
+        version,
+        admitted.role.clone(),
     )
     .await
     {
@@ -914,7 +914,6 @@ where
         ),
         ("WIRES_STATE_VERSION", version.0.to_string().into()),
         ("WIRES_SERVICE", service.as_str().into()),
-        ("WIRES_TOOL", tool.as_str().into()),
         ("WIRES_ROLE", admitted.role.as_str().into()),
     ];
     if let Some(email) = principal.as_ref().and_then(|p| p.email.as_deref()) {
@@ -1062,14 +1061,14 @@ where
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
                 tracing::debug!(host = %host.hex(), "dial failed: {e}");
-                failures.push(format!("{}: {e}", &host.hex()[..8]));
+                failures.push(format!("{}: {e}", host.short()));
                 continue;
             }
             Err(_) => {
                 tracing::debug!(host = %host.hex(), "dial timed out");
                 failures.push(format!(
                     "{}: no answer within {}s",
-                    &host.hex()[..8],
+                    host.short(),
                     dial_timeout.as_secs_f32()
                 ));
                 continue;
@@ -1190,8 +1189,13 @@ where
     // Credential-only (root-vouched + TTL); whether the host is still assigned
     // the service is `on_ack`'s to check.
     if let Some(target_id) = verify_target {
-        check_inclusion(&ack_membership, fabric_root, target_id, crate::now_unix())
-            .map_err(|e| anyhow!("responder membership rejected (no stdin sent): {e}"))?;
+        check_inclusion(
+            &ack_membership,
+            fabric_root,
+            target_id,
+            crate::clock::now_unix(),
+        )
+        .map_err(|e| anyhow!("responder membership rejected (no stdin sent): {e}"))?;
     }
     on_ack(newer_state.as_ref())?;
 
@@ -1292,9 +1296,9 @@ mod tests {
         assert_eq!(got, want);
     }
     use crate::admin::keystore::Keystore;
-    use crate::host::config_v2::HostConfigV2;
+    use crate::host::config::HostConfig;
     use crate::host::gate::ServicesHost;
-    use library::{Argv, Membership, Service, ServiceName, State, StateVersion};
+    use library::{Argv, Membership, Service, State, StateVersion};
 
     /// A shutdown signal that never fires: the dialer stays present for the
     /// whole session.
@@ -1334,7 +1338,7 @@ mod tests {
         let ks = Keystore::at(&home);
         let mut s = State::new(root.node_id());
         s.version = StateVersion(1);
-        s.issued = crate::now_unix();
+        s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
         s.members.extend([host.node_id(), caller.node_id()]);
         s.hosts.insert(host.node_id());
@@ -1350,9 +1354,9 @@ mod tests {
             },
         );
         let signed = s.sign(&root).unwrap();
-        crate::state::store::adopt_if_newer(&ks, &signed, root.node_id(), crate::now_unix())
+        crate::state::store::adopt_if_newer(&ks, &signed, root.node_id(), crate::clock::now_unix())
             .unwrap();
-        let config = HostConfigV2::parse(&format!(
+        let config = HostConfig::parse(&format!(
             r#"{{"version":2,"identity":{},"services":{{"t":{{"command":{}}}}}}}"#,
             crate::testutil::test_identity_json(),
             serde_json::to_string(command).unwrap()
@@ -1380,7 +1384,7 @@ mod tests {
     /// An invocation of `t` with `args`.
     fn invoke(args: &[&str]) -> Invocation {
         Invocation {
-            tool: ToolName::new("t").unwrap(),
+            service: ServiceName::new("t").unwrap(),
             argv: Argv::new(args.iter().map(|a| a.to_string()).collect()).unwrap(),
         }
     }
@@ -1634,10 +1638,10 @@ mod tests {
             Some(&sink),
             caller_id().node_id(),
             None,
-            ToolName::new("t").unwrap(),
+            ServiceName::new("t").unwrap(),
             &[],
-            Some(1),
-            Some("staff".into()),
+            StateVersion(1),
+            library::RoleName::new("staff").unwrap(),
         )
         .await
         .unwrap();
@@ -1853,7 +1857,7 @@ mod tests {
             "a stranger's refusal reached the call log"
         );
         let unknown = Invocation {
-            tool: ToolName::new("nope").unwrap(),
+            service: ServiceName::new("nope").unwrap(),
             argv: Argv::default(),
         };
         let r = refusal_by(

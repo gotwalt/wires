@@ -222,11 +222,6 @@ pub(crate) fn write_own_hint(ks: &Keystore, endpoint: &iroh::Endpoint) -> anyhow
     crate::admin::keystore::write_text_mode(&path, &format!("{}\n", hint_line(me, &addrs)), None)
 }
 
-/// The short form of a host key that `--verbose` prints.
-pub(crate) fn short(node: &NodeId) -> String {
-    node.hex()[..8].to_string()
-}
-
 /// Every host of the services in `names`, once each, in first-seen order
 /// (for `wires inbox`: fetch from the hosts of the services you use).
 pub(crate) fn hosts_of<'a>(

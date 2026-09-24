@@ -48,10 +48,21 @@ impl NodeId {
         hex::encode(self.0)
     }
 
+    /// The first 8 hex characters: how a node is named in a message or a
+    /// list, where the full 64 would drown the line.
+    ///
+    /// ```
+    /// let id = library::NodeIdentity::from_seed([5u8; 32]).node_id();
+    /// assert_eq!(id.short(), id.hex()[..8]);
+    /// ```
+    pub fn short(&self) -> String {
+        hex::encode(&self.0[..4])
+    }
+
     /// Parse a `NodeId` from its lowercase-hex rendering (the inverse of
     /// [`hex`](Self::hex)). Used to accept node ids as CLI input.
     ///
-    /// Returns [`Error::BadHex`] for non-hex text and [`Error::BadKeyLength`]
+    /// Returns [`Error::BadHex`] for non-hex text and [`Error::BadLength`]
     /// when the decoded byte count is not 32.
     ///
     /// ```
@@ -61,7 +72,7 @@ impl NodeId {
     /// ```
     pub fn from_hex(s: &str) -> Result<NodeId> {
         let bytes = hex::decode(s)?;
-        let arr: [u8; 32] = bytes.try_into().map_err(|_| Error::BadKeyLength)?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| Error::BadLength)?;
         Ok(NodeId(arr))
     }
 
@@ -179,7 +190,7 @@ impl NodeIdentity {
     /// `node.seed` / `root.seed` and to accept key seeds as CLI input. The
     /// decoded seed is scrubbed; the text `s` is the caller's to scrub.
     ///
-    /// Returns [`Error::BadHex`] for non-hex text and [`Error::BadKeyLength`]
+    /// Returns [`Error::BadHex`] for non-hex text and [`Error::BadLength`]
     /// when the decoded byte count is not 32.
     ///
     /// ```
@@ -191,7 +202,7 @@ impl NodeIdentity {
         if s.len() != 64 {
             // Bad hex is reported before bad length, as a full decode would.
             let _decoded = Zeroizing::new(hex::decode(s)?);
-            return Err(Error::BadKeyLength);
+            return Err(Error::BadLength);
         }
         let mut seed = Zeroizing::new([0u8; 32]);
         hex::decode_to_slice(s, &mut *seed)?;
@@ -376,17 +387,17 @@ mod tests {
         ));
         assert!(matches!(
             NodeIdentity::from_seed_hex("00"),
-            Err(Error::BadKeyLength)
+            Err(Error::BadLength)
         ));
         assert!(matches!(
             NodeIdentity::from_seed_hex(&"0".repeat(66)),
-            Err(Error::BadKeyLength)
+            Err(Error::BadLength)
         ));
     }
 
     #[test]
     fn from_hex_rejects_wrong_length() {
-        assert!(matches!(NodeId::from_hex("00"), Err(Error::BadKeyLength)));
+        assert!(matches!(NodeId::from_hex("00"), Err(Error::BadLength)));
     }
 
     #[test]

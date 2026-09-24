@@ -22,7 +22,7 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr};
 use library::{
     AuditRecord, CallId, Frame, Hello, Invocation, Matcher, Membership, NodeIdentity, OidcNonce,
-    PushBody, RoleName, Service, ServiceName, SignedState, State, StateVersion, Subject, ToolName,
+    PushBody, RoleName, Service, ServiceName, SignedState, State, StateVersion, Subject,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
@@ -31,7 +31,7 @@ use tokio::time::timeout;
 use super::{PATIENCE, localhost_socks};
 use crate::admin::keystore::Keystore;
 use crate::caller::mock_idp::{MOCK_CLIENT_ID, MockIdp};
-use crate::host::config_v2::HostConfigV2;
+use crate::host::config::HostConfig;
 use crate::host::control::ControlClient;
 use crate::host::push::{PushHost, PushSpec, host_socket};
 use crate::host::serve::{push_sockets, services_host, services_router};
@@ -62,7 +62,7 @@ impl World {
     fn state(&self, version: u64) -> SignedState {
         let mut s = State::new(self.root.node_id());
         s.version = StateVersion(version);
-        s.issued = crate::now_unix();
+        s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
         s.members.extend([
             self.alice.node_id(),
@@ -90,8 +90,8 @@ impl World {
     }
 
     /// `env` prints its environment; push to analysts.
-    fn host_json(&self) -> HostConfigV2 {
-        HostConfigV2::parse(&format!(
+    fn host_json(&self) -> HostConfig {
+        HostConfig::parse(&format!(
             r#"{{"version":2,
                 "identity":{{"issuers":[{{"issuer":"{}","audiences":["{MOCK_CLIENT_ID}"]}}]}},
                 "services":{{"env":{{"command":["env"],"env":{{"FROM_HOST_JSON":"yes"}}}}}},
@@ -107,7 +107,7 @@ impl World {
             state_version: StateVersion(1),
             id_token: Some(self.idp.mint(
                 &OidcNonce::for_node(&who.node_id()),
-                crate::now_unix() + 3600,
+                crate::clock::now_unix() + 3600,
             )),
         }
     }
@@ -131,7 +131,7 @@ impl Host {
             &keystore,
             &w.state(1),
             w.root.node_id(),
-            crate::now_unix(),
+            crate::clock::now_unix(),
         )
         .unwrap();
         let mut host = services_host(
@@ -141,7 +141,7 @@ impl Host {
             w.host_json(),
         )
         .unwrap();
-        host.preflight(crate::now_unix()).unwrap();
+        host.preflight(crate::clock::now_unix()).unwrap();
         let (sink, records) = AuditSink::channel(64);
         host.audit = Some(sink);
         let host = Arc::new(host);
@@ -197,7 +197,7 @@ async fn call_env(
         let conn = endpoint.connect(host.addr.clone(), ALPN).await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
         let invoke = Frame::Invoke(Invocation {
-            tool: ToolName::new("env").unwrap(),
+            service: ServiceName::new("env").unwrap(),
             argv: library::Argv::new(vec![]).unwrap(),
         });
         for frame in [Frame::Hello(w.hello(who)), invoke] {
@@ -382,8 +382,13 @@ async fn a_rolled_back_state_is_refused() {
     let w = World::new().await;
     let host = Host::start(&w).await;
     let ks = Keystore::at(&host.home);
-    crate::state::store::adopt_if_newer(&ks, &w.state(2), w.root.node_id(), crate::now_unix())
-        .unwrap();
+    crate::state::store::adopt_if_newer(
+        &ks,
+        &w.state(2),
+        w.root.node_id(),
+        crate::clock::now_unix(),
+    )
+    .unwrap();
     call_env(&w, &w.alice, &host).await.unwrap();
     // Version 1 copied back over version 2: it verifies, and is refused.
     let old = w.state(1).encode().unwrap();

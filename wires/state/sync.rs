@@ -38,9 +38,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::store;
 use crate::admin::keystore::{self, Keystore};
+use crate::clock::now_unix;
 use crate::host::gate::NOT_ADMITTED;
 use crate::host::transport::{self, Throttle};
-use crate::now_unix;
 
 /// How old a local copy may be before a cold command pulls.
 pub(crate) const STALE_AFTER_SECS: i64 = 10 * 60;
@@ -95,7 +95,7 @@ impl PushReport {
                 "; not reached: {} (`wires state push` re-sends it)",
                 self.missed
                     .iter()
-                    .map(|n| format!("{}…", &n.hex()[..8]))
+                    .map(|n| format!("{}…", n.short()))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -172,7 +172,7 @@ async fn exchange(endpoint: &Endpoint, peer: NodeId, frame: &StateFrame) -> Resu
     let conn = tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, STATE_ALPN))
         .await
         .map_err(|_| anyhow!("no answer within {DIAL_TIMEOUT:?}"))?
-        .map_err(|e| anyhow!("dialing {}…: {e}", &peer.hex()[..8]))?;
+        .map_err(|e| anyhow!("dialing {}…: {e}", peer.short()))?;
     let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
     write_frame(&mut send, frame).await?;
     send.finish().ok();
@@ -291,7 +291,7 @@ pub(crate) fn held_hosts(ks: &Keystore) -> Result<BTreeSet<NodeId>> {
 
 /// The state `ks` holds, or an error saying there is none.
 fn stored(ks: &Keystore) -> Result<SignedState> {
-    let root = store::fabric(ks)?.ok_or_else(|| anyhow!("this keystore is in no fabric"))?;
+    let root = store::fabric(ks)?.ok_or_else(|| anyhow!("this keystore is in no network"))?;
     store::read(ks, root)?.ok_or_else(|| anyhow!("no signed state here"))
 }
 
@@ -314,7 +314,7 @@ pub(crate) async fn pull(
     peers: &[NodeId],
     have: StateVersion,
 ) -> Result<Option<SignedState>> {
-    let root = store::fabric(ks)?.ok_or_else(|| anyhow!("this keystore is in no fabric"))?;
+    let root = store::fabric(ks)?.ok_or_else(|| anyhow!("this keystore is in no network"))?;
     let held = store::read(ks, root)?;
     let admin = store::read_admin(ks).ok().flatten();
     let vouched = |p: NodeId| admin == Some(p) || held.as_ref().is_some_and(|s| s.state.is_host(p));
@@ -540,14 +540,14 @@ pub(crate) fn answer(
     let unreadable = |e: anyhow::Error| Refusal::Stranger(format!("{e:#}"));
     let root = store::fabric(ks)
         .map_err(unreadable)?
-        .ok_or_else(|| Refusal::Stranger("this node is in no fabric".into()))?;
+        .ok_or_else(|| Refusal::Stranger("this node is in no network".into()))?;
     let held = store::read(ks, root).map_err(unreadable)?;
     // Membership counts only in a copy that is still fresh.
     let is_member = |s: &Option<SignedState>| {
         s.as_ref()
             .is_some_and(|s| s.check_fresh(now).is_ok() && s.state.is_member(caller))
     };
-    let not_listed = || format!("{}… is not a member of the held copy", &caller.hex()[..8]);
+    let not_listed = || format!("{}… is not a member of the held copy", caller.short());
     let version = |s: &Option<SignedState>| s.as_ref().map_or(StateVersion(0), |s| s.state.version);
     match frame {
         StateFrame::Offer { state } if !is_member(&held) => {
@@ -950,7 +950,7 @@ mod tests {
         assert!(missed.reached_no_host());
         let line = missed.line(StateVersion(3));
         assert!(line.contains("pushed to 0 of 1 host(s)"), "{line}");
-        assert!(line.contains(&a.hex()[..8]) && line.contains("wires state push"));
+        assert!(line.contains(&a.short()) && line.contains("wires state push"));
         let some = PushReport {
             delivered: vec![b],
             missed: vec![a],

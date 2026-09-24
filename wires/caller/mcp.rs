@@ -81,13 +81,13 @@ pub const FILTER_HINT: &str = "Filter output with the command's own flags (e.g. 
 pub const SERVER_NAME: &str = "wires";
 
 /// JSON-RPC: the line was not valid JSON.
-const PARSE_ERROR: i64 = -32700;
+pub(crate) const PARSE_ERROR: i64 = -32700;
 /// JSON-RPC: valid JSON, but not a request object.
-const INVALID_REQUEST: i64 = -32600;
+pub(crate) const INVALID_REQUEST: i64 = -32600;
 /// JSON-RPC: no such method.
-const METHOD_NOT_FOUND: i64 = -32601;
+pub(crate) const METHOD_NOT_FOUND: i64 = -32601;
 /// JSON-RPC: bad params (including MCP's "unknown tool").
-const INVALID_PARAMS: i64 = -32602;
+pub(crate) const INVALID_PARAMS: i64 = -32602;
 /// MCP `HeaderMismatch` (2026-07-28): HTTP headers disagree with the body.
 pub(crate) const HEADER_MISMATCH: i64 = -32020;
 /// MCP `UnsupportedProtocolVersion` (2026-07-28).
@@ -602,7 +602,7 @@ pub(crate) fn with_services(
         !registered
     });
     for g in grants {
-        let name = library::ToolName::from(g.service.clone());
+        let name = g.service.clone();
         config.tools.push(RemoteTool {
             name,
             description: state
@@ -653,7 +653,7 @@ pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library::{NodeIdentity, ToolName};
+    use library::{NodeIdentity, ServiceName};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -701,7 +701,7 @@ mod tests {
 
     fn entry(name: &str, description: &str) -> RemoteTool {
         RemoteTool {
-            name: ToolName::new(name).unwrap(),
+            name: ServiceName::new(name).unwrap(),
             description: description.into(),
             target: ToolTarget::Node {
                 node: NodeIdentity::from_seed([5; 32]).node_id(),

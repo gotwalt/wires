@@ -64,15 +64,6 @@ impl IdpTrust {
     }
 }
 
-/// The human name for a principal: the verified email, else `sub` at the
-/// issuer.
-pub(crate) fn principal_name(p: &Principal) -> String {
-    match &p.email {
-        Some(email) => email.clone(),
-        None => format!("{} at {}", p.subject, p.issuer),
-    }
-}
-
 /// What the index holds for one node.
 #[derive(Clone, Debug, Default)]
 struct Known {
@@ -169,7 +160,7 @@ impl Identities {
                     .as_ref()
                     .is_none_or(|held| p.not_after >= held.not_after)
                 {
-                    tracing::info!(node = %node.hex(), who = %principal_name(p), "identity verified");
+                    tracing::info!(node = %node.hex(), who = %p.name(), "identity verified");
                     entry.principal = Some(p.clone());
                 }
             }
@@ -299,13 +290,5 @@ mod tests {
             id_token: library::IdToken::new("x.y.z"),
         };
         assert!(t.audiences_for_claim(&garbage).is_empty());
-    }
-
-    #[test]
-    fn a_principal_is_named_by_email_else_subject_at_issuer() {
-        assert_eq!(principal_name(&who("a@example.com", 0)), "a@example.com");
-        let mut anon = who("a@example.com", 0);
-        anon.email = None;
-        assert_eq!(principal_name(&anon), format!("sub-a@example.com at {ISS}"));
     }
 }

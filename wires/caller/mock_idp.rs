@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use library::{IdToken, Issuer, OidcNonce};
+use library::{B64, IdToken, Issuer, OidcNonce};
 use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
 use serde_json::json;
@@ -28,8 +28,6 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 use crate::caller::login::{OidcClient, Pkce, read_request, write_response};
-
-const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// The client id the mock accepts.
 pub(crate) const MOCK_CLIENT_ID: &str = "wires-test-client";
@@ -323,7 +321,7 @@ fn handle(state: &Mutex<State>, method: &str, target: &str, body: &[u8]) -> Repl
             if get("client_id") != MOCK_CLIENT_ID {
                 return oauth_error("invalid_client");
             }
-            let exp = crate::now_unix() + 3600;
+            let exp = crate::clock::now_unix() + 3600;
             match get("grant_type").as_str() {
                 "authorization_code" => {
                     let Some(p) = st.pending.remove(&get("code")) else {

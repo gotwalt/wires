@@ -21,7 +21,7 @@
 //! | `wires.caller.node` | started, denied (the iroh-authenticated key) |
 //! | `wires.principal.email`, `wires.principal.iss`, `wires.principal.sub` | started, push (when verified) |
 //! | `wires.role` | started, push |
-//! | `wires.tool` | started, denied (when named) |
+//! | `wires.service` | started, denied (when named) |
 //! | `wires.argv` (string array) | started |
 //! | `wires.exit`, `wires.duration_ms`, `wires.stdout.digest`, `wires.stdout.bytes` | finished |
 //! | `wires.denied.reason` | denied |
@@ -64,7 +64,7 @@ pub fn logs_url(endpoint: &str) -> Result<Url> {
     let mut url = Url::parse(endpoint).with_context(|| format!("{endpoint:?} is not a URL"))?;
     match url.scheme() {
         "https" => {}
-        "http" if is_loopback(&url) => {}
+        "http" if crate::net::is_loopback(&url) => {}
         "http" => bail!(
             "{endpoint:?}: plain http:// is allowed only to a collector on this machine \
              (localhost, 127.0.0.1, [::1]); use https://"
@@ -76,16 +76,6 @@ pub fn logs_url(endpoint: &str) -> Result<Url> {
         url.set_path(&path);
     }
     Ok(url)
-}
-
-/// Whether `url`'s host is this machine.
-fn is_loopback(url: &Url) -> bool {
-    match url.host() {
-        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    }
 }
 
 /// The sending side of the exporter: cheap to hold, never blocks.
@@ -206,7 +196,7 @@ pub fn log_record(entry: &LogEntry) -> Value {
             call,
             caller,
             principal,
-            tool,
+            service,
             argv,
             role,
             ..
@@ -214,16 +204,14 @@ pub fn log_record(entry: &LogEntry) -> Value {
             attrs.push(kv("wires.call.id", string(call.hex())));
             attrs.push(kv("wires.caller.node", string(caller.hex())));
             principal_attrs(&mut attrs, principal.as_ref());
-            if let Some(role) = role {
-                attrs.push(kv("wires.role", string(role)));
-            }
-            attrs.push(kv("wires.tool", string(tool.as_str())));
+            attrs.push(kv("wires.role", string(role.as_str())));
+            attrs.push(kv("wires.service", string(service.as_str())));
             let args: Vec<Value> = argv.as_slice().iter().map(string).collect();
             attrs.push(kv(
                 "wires.argv",
                 json!({ "arrayValue": { "values": args } }),
             ));
-            ("started", format!("call started: {}", tool.as_str()), false)
+            ("started", format!("call started: {service}"), false)
         }
         AuditRecord::Finished {
             call,
@@ -246,13 +234,13 @@ pub fn log_record(entry: &LogEntry) -> Value {
         }
         AuditRecord::Denied {
             caller,
-            tool,
+            service,
             reason,
             ..
         } => {
             attrs.push(kv("wires.caller.node", string(caller.hex())));
-            if let Some(tool) = tool {
-                attrs.push(kv("wires.tool", string(tool.as_str())));
+            if let Some(service) = service {
+                attrs.push(kv("wires.service", string(service.as_str())));
             }
             attrs.push(kv("wires.denied.reason", string(reason)));
             ("denied", format!("call denied: {reason}"), true)
@@ -322,7 +310,7 @@ fn int(n: i64) -> Value {
 mod tests {
     use super::*;
     use crate::caller::login::{read_request, write_response};
-    use library::{Argv, CallId, NodeIdentity, OutputHasher, ToolName};
+    use library::{Argv, CallId, NodeIdentity, OutputHasher, ServiceName};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -353,10 +341,10 @@ mod tests {
                 not_after: 0,
                 claims: Default::default(),
             }),
-            tool: ToolName::new("db_query").unwrap(),
+            service: ServiceName::new("db_query").unwrap(),
             argv: Argv::new(vec!["select 1".into(), "-n".into()]).unwrap(),
-            roster_version: None,
-            role: Some("analyst".into()),
+            state_version: library::StateVersion(1),
+            role: library::RoleName::new("analyst").unwrap(),
             at_ms: 5,
         }
     }
@@ -441,7 +429,7 @@ mod tests {
         assert_eq!(s("wires.principal.iss"), "https://idp.example");
         assert_eq!(s("wires.principal.sub"), "sub-1");
         assert_eq!(s("wires.role"), "analyst");
-        assert_eq!(s("wires.tool"), "db_query");
+        assert_eq!(s("wires.service"), "db_query");
         assert_eq!(
             a["wires.argv"],
             json!({"arrayValue": {"values": [
@@ -481,7 +469,7 @@ mod tests {
             AuditRecord::Denied {
                 caller: caller(),
                 principal: None,
-                tool: Some(ToolName::new("db_query").unwrap()),
+                service: Some(ServiceName::new("db_query").unwrap()),
                 reason: "no role allows db_query".into(),
                 at_ms: 1,
             },
@@ -494,7 +482,7 @@ mod tests {
             a["wires.denied.reason"]["stringValue"],
             "no role allows db_query"
         );
-        assert_eq!(a["wires.tool"]["stringValue"], "db_query");
+        assert_eq!(a["wires.service"]["stringValue"], "db_query");
         assert!(!a.contains_key("wires.principal.email"));
     }
 

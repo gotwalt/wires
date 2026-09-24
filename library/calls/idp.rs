@@ -49,6 +49,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::codec::B64;
 use crate::error::{Error, IdTokenError, Result};
 use crate::identity::NodeId;
 
@@ -62,8 +63,6 @@ pub const CLOCK_SKEW_SECS: i64 = 60;
 /// claim becomes [`Principal::org`], and the issuer `wires role set` names
 /// when none is given.
 pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
-
-const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// A raw OIDC ID token: a compact JWS (`header.payload.signature`), exactly as
 /// the IdP issued it. Opaque until verified.
@@ -270,6 +269,33 @@ pub struct Principal {
     /// a [`Principal`] read back from a call record has it empty.
     #[serde(skip)]
     pub claims: Map<String, Value>,
+}
+
+impl Principal {
+    /// The human name for this principal: the verified email, else `sub`
+    /// at the issuer.
+    ///
+    /// ```
+    /// use library::Principal;
+    /// let mut p = Principal {
+    ///     issuer: "https://idp.example".into(),
+    ///     subject: "u-1".into(),
+    ///     email: Some("a@example.com".into()),
+    ///     org: None,
+    ///     groups: vec![],
+    ///     not_after: 0,
+    ///     claims: Default::default(),
+    /// };
+    /// assert_eq!(p.name(), "a@example.com");
+    /// p.email = None;
+    /// assert_eq!(p.name(), "u-1 at https://idp.example");
+    /// ```
+    pub fn name(&self) -> String {
+        match &self.email {
+            Some(email) => email.clone(),
+            None => format!("{} at {}", self.subject, self.issuer),
+        }
+    }
 }
 
 /// "Node *K* is held by the person this ID token names": the ID token a

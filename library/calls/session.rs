@@ -44,7 +44,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::canonical_bytes;
+use crate::codec::{canonical_bytes, length_prefixed, split_frame};
 use crate::error::{Error, Result};
 use crate::idp::IdToken;
 use crate::invoke::Invocation;
@@ -211,11 +211,7 @@ impl Frame {
                 payload.extend_from_slice(&canonical_bytes(ack)?);
             }
         }
-        let len: u32 = payload.len().try_into().map_err(|_| Error::BadFrame)?;
-        let mut out = Vec::with_capacity(4 + payload.len());
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(&payload);
-        Ok(out)
+        length_prefixed(&payload)
     }
 
     /// Decode the first frame in `buf`.
@@ -226,15 +222,9 @@ impl Frame {
     /// occupied — and [`Error::BadFrame`] / [`Error::Decode`] on a malformed
     /// frame. Never panics.
     pub fn decode(buf: &[u8]) -> Result<Option<(Frame, usize)>> {
-        if buf.len() < 4 {
+        let Some((payload, end)) = split_frame(buf) else {
             return Ok(None);
-        }
-        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        let end = 4 + len;
-        if buf.len() < end {
-            return Ok(None);
-        }
-        let payload = &buf[4..end];
+        };
         let (&tag, body) = payload.split_first().ok_or(Error::BadFrame)?;
         let frame = match tag {
             TAG_STDIN => Frame::Stdin(Chunk::from_bytes(body.to_vec())),
@@ -282,8 +272,8 @@ mod tests {
                 "[a-z][a-z0-9_-]{0,20}",
                 proptest::collection::vec("[^\u{0}]{0,16}", 0..6)
             )
-                .prop_map(|(tool, args)| Frame::Invoke(crate::invoke::Invocation {
-                    tool: crate::invoke::ToolName::new(tool).unwrap(),
+                .prop_map(|(service, args)| Frame::Invoke(crate::invoke::Invocation {
+                    service: crate::registry::ServiceName::new(service).unwrap(),
                     argv: crate::invoke::Argv::new(args).unwrap(),
                 })),
             (

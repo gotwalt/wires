@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use iroh::{Endpoint, EndpointAddr};
 use library::{
     AuditRecord, Hello, Invocation, Matcher, Membership, NodeIdentity, OidcNonce, OutputHasher,
-    RoleName, Service as Registered, ServiceName, SignedState, State, StateVersion, ToolName,
+    RoleName, Service as Registered, ServiceName, SignedState, State, StateVersion,
 };
 use tokio::sync::oneshot;
 
@@ -66,7 +66,7 @@ impl World {
     fn state(&self, services: &[&str]) -> SignedState {
         let mut s = State::new(self.root.node_id());
         s.version = StateVersion(1);
-        s.issued = crate::now_unix();
+        s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
         s.members.extend([
             self.host.node_id(),
@@ -102,8 +102,13 @@ impl World {
         let ks = Keystore::at(&home);
         ks.save_node(&self.host, false).unwrap();
         ks.save_membership(&self.membership(&self.host)).unwrap();
-        crate::state::store::adopt_if_newer(&ks, state, self.root.node_id(), crate::now_unix())
-            .unwrap();
+        crate::state::store::adopt_if_newer(
+            &ks,
+            state,
+            self.root.node_id(),
+            crate::clock::now_unix(),
+        )
+        .unwrap();
         home
     }
 
@@ -130,7 +135,7 @@ impl World {
             state_version: StateVersion(1),
             id_token: Some(idp.mint(
                 &OidcNonce::for_node(&who.node_id()),
-                crate::now_unix() + 3600,
+                crate::clock::now_unix() + 3600,
             )),
         }
     }
@@ -212,7 +217,7 @@ async fn call(
                 std::time::Duration::from_secs(2),
                 w.hello(who),
                 Invocation {
-                    tool: ToolName::new(name).unwrap(),
+                    service: ServiceName::new(name).unwrap(),
                     argv: library::Argv::new(args.iter().map(|a| a.to_string()).collect()).unwrap(),
                 },
                 |_, _| Ok(()),
@@ -355,7 +360,7 @@ async fn a_native_call_is_logged_like_a_cli_call() {
         call,
         caller,
         principal,
-        tool,
+        service,
         argv,
         role,
         ..
@@ -369,12 +374,8 @@ async fn a_native_call_is_logged_like_a_cli_call() {
         Some("alice@example.com")
     );
     assert_eq!(
-        (tool.as_str(), argv.as_slice(), role.as_deref()),
-        (
-            "kv",
-            &["set".to_string(), "k".to_string()][..],
-            Some("analyst")
-        )
+        (service.as_str(), argv.as_slice(), role.as_str()),
+        ("kv", &["set".to_string(), "k".to_string()][..], "analyst")
     );
     let AuditRecord::Finished {
         call: done,

@@ -38,7 +38,7 @@ On camera, in order:
 | 5b (opt.) | agent | [push beat](#5b-the-workbench-calls-back-push): `wires call deploy -- build 41`, `wires inbox --wait --timeout 10m` | `… from host <wb8> (verified)  build-41  failed: …` |
 | 5c (with a spare) | workbench | stop `wires serve`, ask again | the spare answers (`wires call --verbose` names it) |
 | 6 | admin | `wires remove agent` | stderr `state version N: pushed to 1 of 1 host(s)` (2 of 2 with a spare) |
-| 6 | agent | ask Claude Code the question again | exit 77, nothing on stdout: `wires: denied by responder: not admitted to this fabric`; no `✗` in the watch (a non-member's knock is traced by the host, not logged) |
+| 6 | agent | ask Claude Code the question again | exit 77, nothing on stdout: `wires: denied by responder: not a member of this network`; no `✗` in the watch (a non-member's knock is traced by the host, not logged) |
 
 ### Rebuttals, one line each
 
@@ -306,7 +306,7 @@ Then ask Claude Code the question again.
 > restart and no key to rotate. The agent's next call exits 77 with nothing on
 > stdout."
 
-Point at `wires: denied by responder: not admitted to this fabric` and the
+Point at `wires: denied by responder: not a member of this network` and the
 exit code.
 
 ### Closing line

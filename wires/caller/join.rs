@@ -17,7 +17,7 @@ use clap::Args;
 use library::{Invite, NodeId, NodeIdentity};
 
 use crate::admin::keystore::{self, Keystore};
-use crate::now_unix;
+use crate::clock::now_unix;
 
 /// `join` arguments.
 #[derive(Args)]
@@ -95,10 +95,10 @@ pub(crate) fn join_in(ks: &Keystore, token: &str, now: i64) -> anyhow::Result<St
         && held.fabric != fabric
     {
         bail!(
-            "this keystore is already in fabric {}…; the invite is for fabric {}… — use another \
-             $WIRES_HOME to join a second fabric",
-            &held.fabric.hex()[..8],
-            &fabric.hex()[..8]
+            "this keystore is already in network {}…; the invite is for network {}… — use another \
+             $WIRES_HOME to join a second network",
+            held.fabric.short(),
+            fabric.short()
         );
     }
 
@@ -110,10 +110,10 @@ pub(crate) fn join_in(ks: &Keystore, token: &str, now: i64) -> anyhow::Result<St
     let held = crate::state::store::read(ks, fabric)?
         .map_or(invite.state.state.version, |s| s.state.version);
     Ok(format!(
-        "joined fabric {}… as {}… (state version {})\nnext: `wires login` to sign in, then \
+        "joined network {}… as {}… (state version {})\nnext: `wires login` to sign in, then \
          `wires services`",
-        &fabric.hex()[..8],
-        &me.node_id().hex()[..8],
+        fabric.short(),
+        me.node_id().short(),
         held.0,
     ))
 }

@@ -27,7 +27,6 @@ use serde_json::Value;
 use crate::admin::keystore::{self, Keystore};
 use crate::caller::hello::stored_token;
 use crate::caller::jwks::KeyFetcher;
-use crate::caller::pick::short;
 use crate::state::store;
 
 /// `wires services [--json] [--verbose]`.
@@ -58,13 +57,7 @@ pub(crate) struct Allowed {
 /// listing (which is then empty: every role needs a verified identity).
 pub(crate) async fn allowed(ks: &Keystore) -> Result<Allowed> {
     let me = keystore::node_identity_in(ks)?.node_id();
-    let membership = ks
-        .read_membership()?
-        .context("this node has no membership: run `wires join <token>` first")?;
-    let state = store::read(ks, membership.fabric)?.context(
-        "this node holds no signed state yet: `wires join` delivers it (or ask the admin to \
-         push it)",
-    )?;
+    let (_, state) = store::require(ks)?;
     let principal = match my_principal(ks, me).await {
         Ok(p) => p,
         Err(e) => {
@@ -93,7 +86,7 @@ pub(crate) async fn my_principal(ks: &Keystore, me: NodeId) -> Result<Option<Pri
     let claim = IdentityClaim { node: me, id_token };
     let fetcher = KeyFetcher::new(Some(ks.path("jwks")))?;
     let principal = fetcher
-        .verify(&claim, &[issuer], &audiences, crate::now_unix())
+        .verify(&claim, &[issuer], &audiences, crate::clock::now_unix())
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(Some(principal))
@@ -102,7 +95,7 @@ pub(crate) async fn my_principal(ks: &Keystore, me: NodeId) -> Result<Option<Pri
 /// The `aud` claim of an unverified JWS (a string or an array of strings).
 fn unverified_audiences(jws: &str) -> Result<Vec<Audience>> {
     let payload = jws.split('.').nth(1).context("the ID token is not a JWS")?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+    let bytes = library::B64
         .decode(payload.trim_end_matches('='))
         .context("the ID token's payload is not base64url")?;
     let json: Value = serde_json::from_slice(&bytes).context("the ID token's payload")?;
@@ -122,10 +115,7 @@ pub(crate) async fn run(a: &ServicesArgs) -> Result<String> {
     let ks = Keystore::resolve()?;
     let allowed = allowed(&ks).await?;
     if allowed.grants.is_empty() {
-        let who = allowed
-            .principal
-            .as_ref()
-            .map(|p| p.email.clone().unwrap_or_else(|| p.subject.clone()));
+        let who = allowed.principal.as_ref().map(Principal::name);
         eprintln!(
             "wires services: no service allows {} (state v{})",
             who.as_deref().unwrap_or("this node without a login"),
@@ -202,7 +192,7 @@ fn render_json(state: &State, grants: &[Grant], verbose: bool) -> Result<String>
 fn hosts(state: &State, g: &Grant) -> Vec<String> {
     state
         .service(&g.service)
-        .map(|s| s.hosts.iter().map(short).collect())
+        .map(|s| s.hosts.iter().map(NodeId::short).collect())
         .unwrap_or_default()
 }
 
@@ -265,7 +255,7 @@ mod tests {
             "orders-db  Read-only SQL against the orders database  (analyst)\n\
              status     Build and deploy status                    (staff)"
         );
-        assert!(!out.contains(&short(&node(4))));
+        assert!(!out.contains(&node(4).short()));
         assert_eq!(render(&state(), &[], false), "");
     }
 
@@ -274,7 +264,7 @@ mod tests {
         let out = render(&state(), &grants(), true);
         for line in out.lines() {
             assert!(
-                line.ends_with(&format!("hosts: {}", short(&node(4)))),
+                line.ends_with(&format!("hosts: {}", node(4).short())),
                 "{line}"
             );
         }
@@ -297,7 +287,7 @@ mod tests {
 
     #[test]
     fn audiences_come_from_the_token() {
-        let b64 = |v: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+        let b64 = |v: &str| library::B64.encode(v);
         let one = format!("h.{}.s", b64(r#"{"aud":"client-1"}"#));
         assert_eq!(
             unverified_audiences(&one).unwrap(),

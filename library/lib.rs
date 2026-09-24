@@ -153,6 +153,7 @@ pub use call_log::{
     CALL_LOG_CONTEXT, CALL_LOG_V1, ChainBreak, ChainPoint, EntryHash, LogEntry, LogSeq, Retention,
     verify_chain,
 };
+pub use codec::B64;
 pub use error::{Error, IdTokenError, Result};
 pub use identity::{AlgorithmId, NodeId, NodeIdentity, Signature};
 pub use idp::{
@@ -160,14 +161,14 @@ pub use idp::{
     OIDC_NONCE_CONTEXT, OidcNonce, Principal, verify_claim,
 };
 pub use invite::{INVITE_V2, Invite};
-pub use invoke::{Argv, Invocation, MAX_ARGS, MAX_ARGV_BYTES, MAX_TOOL_NAME, ToolName};
+pub use invoke::{Argv, Invocation, MAX_ARGS, MAX_ARGV_BYTES};
 pub use membership::{MEMBERSHIP_V1, Membership};
 pub use policy::check_inclusion;
 pub use push::{
     INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_FRAME, MAX_INBOX_HELLO, MAX_PUSH_BODY,
     MAX_SUBJECT, PushBody, PushId, PushMessage, Subject,
 };
-pub use registry::{Service, ServiceName};
+pub use registry::{MAX_SERVICE_NAME, Service, ServiceName};
 pub use role::{EmailPattern, MAX_ROLE_NAME, Matcher, RoleName};
 pub use session::{Chunk, Frame, Hello, HelloAck};
 pub use state::{STATE_CONTEXT, STATE_V1, SignedState, State, StateVersion};

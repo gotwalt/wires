@@ -1,4 +1,4 @@
-//! Card 27c's acceptance tests: **a `host.json` v2 host decides every call
+//! Card 27c's acceptance tests: **a host decides every call
 //! by the admin-signed state it holds**, re-read per connection.
 //!
 //! The state is signed in the test by the fabric root and adopted into the
@@ -36,7 +36,6 @@ use iroh::{Endpoint, EndpointAddr};
 use library::{
     AuditRecord, Frame, Hello, HelloAck, Invocation, Matcher, Membership, NodeId, NodeIdentity,
     OidcNonce, PushBody, RoleName, Service, ServiceName, SignedState, State, StateVersion, Subject,
-    ToolName,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
@@ -46,7 +45,7 @@ use super::{PATIENCE, localhost_socks};
 use crate::admin::keystore::Keystore;
 use crate::caller::inbox::{Fetched, InboxReceiver, Mailbox, fetch_from};
 use crate::caller::mock_idp::{MOCK_CLIENT_ID, MockIdp};
-use crate::host::config_v2::HostConfigV2;
+use crate::host::config::HostConfig;
 use crate::host::push::{PushHost, PushSpec};
 use crate::host::serve::{services_host, services_router};
 use crate::host::transport::{ALPN, AuditSink, endpoint_addr, secret_key};
@@ -91,7 +90,7 @@ impl World {
     fn state(&self, version: u64, members: &[NodeId]) -> SignedState {
         let mut s = State::new(self.root.node_id());
         s.version = StateVersion(version);
-        s.issued = crate::now_unix();
+        s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
         s.members.extend(members.iter().copied());
         s.members.insert(self.host.node_id());
@@ -139,8 +138,8 @@ impl World {
         ]
     }
 
-    /// A `host.json` v2 trusting all four IdPs, with `services` spliced in.
-    fn host_json(&self, services: &str, push: bool) -> HostConfigV2 {
+    /// A `host.json` trusting all four IdPs, with `services` spliced in.
+    fn host_json(&self, services: &str, push: bool) -> HostConfig {
         let issuers: Vec<String> = [
             &self.idp_alice,
             &self.idp_bob,
@@ -160,7 +159,7 @@ impl World {
         } else {
             ""
         };
-        HostConfigV2::parse(&format!(
+        HostConfig::parse(&format!(
             r#"{{"version":2,"identity":{{"issuers":[{}]}},"services":{services}{push}}}"#,
             issuers.join(",")
         ))
@@ -187,7 +186,7 @@ impl World {
             id_token: logged_in.then(|| {
                 idp.mint(
                     &OidcNonce::for_node(&who.node_id()),
-                    crate::now_unix() + 3600,
+                    crate::clock::now_unix() + 3600,
                 )
             }),
         }
@@ -202,7 +201,7 @@ fn service(s: &str) -> ServiceName {
     ServiceName::new(s).unwrap()
 }
 
-/// A running v2 host: its router, where to dial it, its keystore, its call
+/// A running host: its router, where to dial it, its keystore, its call
 /// log's records, and its push service (if any).
 struct Host {
     _router: Router,
@@ -217,17 +216,22 @@ struct Host {
 impl Host {
     /// Start `config` on `w.host`, holding `state`. Fails as `serve` would
     /// when the preflight refuses.
-    async fn start(w: &World, config: HostConfigV2, state: &SignedState) -> anyhow::Result<Host> {
+    async fn start(w: &World, config: HostConfig, state: &SignedState) -> anyhow::Result<Host> {
         let home = crate::testutil::temp_dir();
         let keystore = Arc::new(Keystore::at(home.clone()));
-        crate::state::store::adopt_if_newer(&keystore, state, w.root.node_id(), crate::now_unix())?;
+        crate::state::store::adopt_if_newer(
+            &keystore,
+            state,
+            w.root.node_id(),
+            crate::clock::now_unix(),
+        )?;
         let mut host = services_host(
             w.host.node_id(),
             w.membership(&w.host),
             Arc::clone(&keystore),
             config,
         )?;
-        host.preflight(crate::now_unix())?;
+        host.preflight(crate::clock::now_unix())?;
         let (sink, records) = AuditSink::channel(64);
         host.audit = Some(sink);
         let host = Arc::new(host);
@@ -262,7 +266,7 @@ impl Host {
                 &self.keystore,
                 state,
                 w.root.node_id(),
-                crate::now_unix()
+                crate::clock::now_unix()
             )
             .unwrap()
         );
@@ -329,7 +333,7 @@ async fn call(who: &NodeIdentity, host: &Host, hello: Hello, name: &str, args: &
         let conn = endpoint.connect(host.addr.clone(), ALPN).await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
         let invoke = Frame::Invoke(Invocation {
-            tool: ToolName::new(name).unwrap(),
+            service: ServiceName::new(name).unwrap(),
             argv: library::Argv::new(args.iter().map(|a| a.to_string()).collect()).unwrap(),
         });
         for frame in [Frame::Hello(hello), invoke] {
@@ -401,7 +405,7 @@ async fn the_registry_decides_who_runs_what() {
                 principal.unwrap().email.as_deref(),
                 Some("alice@example.com")
             );
-            assert_eq!(role.as_deref(), Some("analyst"));
+            assert_eq!(role.as_str(), "analyst");
         }
         other => panic!("expected started, got {other:?}"),
     }
@@ -474,7 +478,7 @@ async fn a_trusted_issuer_cannot_vouch_for_another_issuers_people() {
     let partner_hello = Hello {
         id_token: Some(w.idp_partner.mint(
             &OidcNonce::for_node(&w.alice.node_id()),
-            crate::now_unix() + 3600,
+            crate::clock::now_unix() + 3600,
         )),
         ..w.hello(&w.alice, 1, false)
     };
@@ -565,7 +569,10 @@ async fn an_unassigned_service_refuses_to_start() {
         w.host_json(SERVICES, false),
     )
     .unwrap();
-    let e = format!("{:#}", host.preflight(crate::now_unix()).unwrap_err());
+    let e = format!(
+        "{:#}",
+        host.preflight(crate::clock::now_unix()).unwrap_err()
+    );
     assert!(e.contains("no signed state"), "{e}");
 }
 
@@ -771,7 +778,8 @@ async fn a_fetch_with_a_token_makes_a_caller_reachable_by_role() {
     // And while `wires inbox --wait` runs, a push is delivered directly.
     let home = crate::testutil::temp_dir();
     let ks = Arc::new(Keystore::at(&home));
-    crate::state::store::adopt_if_newer(&ks, &state, w.root.node_id(), crate::now_unix()).unwrap();
+    crate::state::store::adopt_if_newer(&ks, &state, w.root.node_id(), crate::clock::now_unix())
+        .unwrap();
     let mailbox = Mailbox::open(&home).unwrap();
     let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(secret_key(&w.carol))

@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
-use library::{NodeId, ToolName};
+use library::{NodeId, ServiceName};
 use serde::{Deserialize, Serialize};
 
 /// The file name under `$WIRES_HOME`.
@@ -62,29 +62,24 @@ pub enum ToolTarget {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct RemoteTool {
     /// The local name (`wires call <name>`, and the MCP tool name).
-    pub name: ToolName,
+    pub name: ServiceName,
     /// One line for humans and for the MCP `description`.
     pub description: String,
     /// Where the responder lives.
     pub target: ToolTarget,
     /// The name the responder exposes it under, when different from `name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_tool: Option<ToolName>,
+    pub remote_tool: Option<ServiceName>,
 }
 
 impl RemoteTool {
     /// One short line saying where this tool lives, for `wires tools list`.
     pub fn target_summary(&self) -> String {
         match &self.target {
-            ToolTarget::Node { node, .. } => format!("node → {}", short(&node.hex())),
+            ToolTarget::Node { node, .. } => format!("node → {}", node.short()),
             ToolTarget::Service => "service".to_string(),
         }
     }
-}
-
-/// The first 16 hex chars of a node id: enough to tell nodes apart in a list.
-fn short(hex: &str) -> &str {
-    &hex[..hex.len().min(16)]
 }
 
 /// The whole `tools.json`.
@@ -125,7 +120,7 @@ impl ToolsConfig {
     }
 
     /// Check the invariants [`load`](Self::load) enforces: every name unique.
-    /// (Names and remote names are already valid [`ToolName`]s by type.)
+    /// (Names and remote names are already valid [`ServiceName`]s by type.)
     pub fn validate(&self) -> Result<()> {
         let mut seen = BTreeSet::new();
         for tool in &self.tools {
@@ -166,13 +161,13 @@ impl ToolsConfig {
     }
 
     /// Remove and return the entry named `name`, if any.
-    pub fn remove(&mut self, name: &ToolName) -> Option<RemoteTool> {
+    pub fn remove(&mut self, name: &ServiceName) -> Option<RemoteTool> {
         let at = self.tools.iter().position(|t| &t.name == name)?;
         Some(self.tools.remove(at))
     }
 
     /// The entry named `name`, if any.
-    pub fn get(&self, name: &ToolName) -> Option<&RemoteTool> {
+    pub fn get(&self, name: &ServiceName) -> Option<&RemoteTool> {
         self.tools.iter().find(|t| &t.name == name)
     }
 }
@@ -263,7 +258,7 @@ pub fn run_tools_cmd(a: ToolsArgs) -> Result<String> {
     match cmd {
         ToolsCmd::List => Ok(render_list(&config)),
         ToolsCmd::Rm { name } => {
-            let name = ToolName::new(name)?;
+            let name = ServiceName::new(name)?;
             if config.remove(&name).is_none() {
                 bail!("no tool named `{name}` in {}", path.display());
             }
@@ -281,10 +276,10 @@ pub fn run_tools_cmd(a: ToolsArgs) -> Result<String> {
 }
 
 /// Build (and validate) the entry `wires tools add` describes: the node id
-/// must be valid hex, the names valid [`ToolName`]s.
+/// must be valid hex, the names valid [`ServiceName`]s.
 fn remote_tool_from_args(a: ToolsAddArgs) -> Result<RemoteTool> {
     Ok(RemoteTool {
-        name: ToolName::new(a.name).context("tool name")?,
+        name: ServiceName::new(a.name).context("tool name")?,
         description: a.description,
         target: ToolTarget::Node {
             node: NodeId::from_hex(&a.node).context("--node")?,
@@ -293,7 +288,7 @@ fn remote_tool_from_args(a: ToolsAddArgs) -> Result<RemoteTool> {
         },
         remote_tool: a
             .remote_tool
-            .map(ToolName::new)
+            .map(ServiceName::new)
             .transpose()
             .context("--remote-tool")?,
     })
@@ -339,7 +334,7 @@ pub(crate) mod tests {
 
     fn node_tool(name: &str) -> RemoteTool {
         RemoteTool {
-            name: ToolName::new(name).unwrap(),
+            name: ServiceName::new(name).unwrap(),
             description: format!("{name} does things"),
             target: ToolTarget::Node {
                 node: NodeIdentity::from_seed([4; 32]).node_id(),
@@ -354,7 +349,7 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!(
             "wires-tools-{tag}-{}-{}",
             std::process::id(),
-            crate::now_unix()
+            crate::clock::now_unix()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join(TOOLS_FILE)
@@ -422,7 +417,7 @@ pub(crate) mod tests {
         let mut c = ToolsConfig::default();
         c.add(node_tool("rg")).unwrap();
         assert!(c.add(node_tool("rg")).is_err());
-        let rg = ToolName::new("rg").unwrap();
+        let rg = ServiceName::new("rg").unwrap();
         assert_eq!(c.remove(&rg).unwrap().name, rg);
         assert!(c.remove(&rg).is_none());
     }
@@ -434,7 +429,7 @@ pub(crate) mod tests {
             tools: vec![
                 node_tool("rg"),
                 RemoteTool {
-                    remote_tool: Some(ToolName::new("psql").unwrap()),
+                    remote_tool: Some(ServiceName::new("psql").unwrap()),
                     ..node_tool("db_query")
                 },
             ],
@@ -494,14 +489,14 @@ pub(crate) mod tests {
             proptest::option::of("https://[a-z]{1,8}\\.example"),
         )
             .prop_map(|(name, description, remote, seed, relay_url)| RemoteTool {
-                name: ToolName::new(name).unwrap(),
+                name: ServiceName::new(name).unwrap(),
                 description,
                 target: ToolTarget::Node {
                     node: NodeIdentity::from_seed(seed).node_id(),
                     relay_url,
                     addrs: vec![],
                 },
-                remote_tool: remote.map(|r| ToolName::new(r).unwrap()),
+                remote_tool: remote.map(|r| ServiceName::new(r).unwrap()),
             })
     }
 

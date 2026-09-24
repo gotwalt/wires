@@ -111,7 +111,7 @@ impl PublicUrls {
     /// and nothing but an origin.
     pub(crate) fn parse(raw: &str) -> Result<Self> {
         let url = Url::parse(raw).with_context(|| format!("--public-url {raw}"))?;
-        let loopback = crate::caller::jwks::is_loopback(&url);
+        let loopback = crate::net::is_loopback(&url);
         if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
             bail!("--public-url must be https (got {raw})");
         }
@@ -219,7 +219,7 @@ impl crate::caller::call::Caller for PresentingCaller {
             &creds,
             &ks,
             &state,
-            &library::ServiceName::from(tool.name.clone()),
+            &tool.name,
             &dial,
             argv,
             std::io::Cursor::new(stdin),
@@ -464,7 +464,7 @@ fn secret(file: Option<&std::path::Path>, env: &str) -> Result<Option<String>> {
 /// The DCR MAC key: from the keystore, created on first run.
 fn client_key(ks: &Keystore) -> Result<ClientKey> {
     use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let b64 = library::B64;
     let path = ks.path(CLIENT_KEY_FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -548,7 +548,7 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
         node,
         upstream,
         fetcher: KeyFetcher::new(Some(ks.path("jwks")))?,
-        store: Store::open(Some(ks.path(SESSIONS_FILE)), crate::now_unix())?,
+        store: Store::open(Some(ks.path(SESSIONS_FILE)), crate::clock::now_unix())?,
         client_key: client_key(&ks)?,
         metadata: MetadataFetcher::new()?,
         origins,

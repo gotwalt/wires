@@ -91,7 +91,7 @@ pub(crate) fn test_idp() -> &'static crate::caller::mock_idp::MockIdp {
 pub(crate) fn test_id_token(node: &library::NodeId) -> library::IdToken {
     test_idp().mint(
         &library::OidcNonce::for_node(node),
-        crate::now_unix() + 3600,
+        crate::clock::now_unix() + 3600,
     )
 }
 

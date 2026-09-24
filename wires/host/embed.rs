@@ -43,7 +43,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use library::{NodeId, RoleName, ServiceName};
 
 use crate::admin::keystore::Keystore;
-use crate::host::config_v2::{HOST_CONFIG_V2, HostConfigV2, IdentityConfig, TrustedIssuer};
+use crate::host::config::{HOST_CONFIG, HostConfig, IdentityConfig, TrustedIssuer};
 use crate::host::native::{NativeServices, Service};
 use crate::host::serve::{Binding, Serving, serve_until};
 
@@ -115,7 +115,7 @@ impl Host {
 }
 
 impl HostBuilder {
-    /// Also read `path` as `host.json` v2: its CLI services (served beside
+    /// Also read `path` as `host.json`: its CLI services (served beside
     /// the native ones), trusted IdPs, `push` and `audit`. Its `services`
     /// may be empty.
     pub fn host_json(mut self, path: impl Into<PathBuf>) -> Self {
@@ -182,9 +182,9 @@ impl HostBuilder {
             }
         }
         let mut config = match &self.host_json {
-            Some(path) => HostConfigV2::load_embedded(path)?,
-            None => HostConfigV2 {
-                version: HOST_CONFIG_V2,
+            Some(path) => HostConfig::load_embedded(path)?,
+            None => HostConfig {
+                version: HOST_CONFIG,
                 identity: IdentityConfig::default(),
                 services: Default::default(),
                 push: None,

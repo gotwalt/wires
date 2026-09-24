@@ -13,56 +13,35 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::codec::hex_id;
 use crate::identity::NodeId;
 use crate::idp::Principal;
-use crate::invoke::{Argv, ToolName};
+use crate::invoke::Argv;
 use crate::push::{PushBody, PushId, Subject};
+use crate::registry::ServiceName;
+use crate::role::RoleName;
+use crate::state::StateVersion;
 
-/// Correlates a call's [`Started`](AuditRecord::Started) and
-/// [`Finished`](AuditRecord::Finished) records. 16 random bytes, hex on the
-/// wire.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct CallId([u8; 16]);
+hex_id! {
+    /// Correlates a call's [`Started`](AuditRecord::Started) and
+    /// [`Finished`](AuditRecord::Finished) records. 16 random bytes, hex on
+    /// the wire.
+    pub struct CallId([u8; 16]);
+}
 
 impl CallId {
     /// A fresh random call id.
     pub fn generate() -> Self {
         Self(rand::random())
     }
-
-    /// Lowercase hex.
-    pub fn hex(&self) -> String {
-        hex::encode(self.0)
-    }
-
-    /// Parse 32 hex characters.
-    pub fn from_hex(s: &str) -> Result<Self> {
-        let bytes = hex::decode(s)?;
-        Ok(Self(bytes.try_into().map_err(|_| Error::BadKeyLength)?))
-    }
 }
 
-impl TryFrom<String> for CallId {
-    type Error = Error;
-    fn try_from(s: String) -> Result<Self> {
-        Self::from_hex(&s)
-    }
+hex_id! {
+    /// BLAKE3 digest of a call's complete stdout (or stdin), hex on the wire.
+    /// Lets an observer check a result someone later presents without the
+    /// log carrying the output itself.
+    pub struct OutputDigest([u8; 32]);
 }
-
-impl From<CallId> for String {
-    fn from(c: CallId) -> String {
-        c.hex()
-    }
-}
-
-/// BLAKE3 digest of a call's complete stdout, hex on the wire. Lets an
-/// observer check a result someone later presents without the log carrying
-/// the output itself.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct OutputDigest([u8; 32]);
 
 impl OutputDigest {
     /// Wrap a finished BLAKE3 hash.
@@ -70,8 +49,7 @@ impl OutputDigest {
         Self(*hash.as_bytes())
     }
 
-    /// The digest of zero bytes: what an empty stream hashes to, and what a
-    /// record written before a digest field existed is read as.
+    /// The digest of zero bytes.
     ///
     /// ```
     /// use library::{OutputDigest, OutputHasher};
@@ -79,25 +57,6 @@ impl OutputDigest {
     /// ```
     pub fn empty() -> Self {
         Self::from_hash(blake3::hash(b""))
-    }
-
-    /// Lowercase hex.
-    pub fn hex(&self) -> String {
-        hex::encode(self.0)
-    }
-}
-
-impl TryFrom<String> for OutputDigest {
-    type Error = Error;
-    fn try_from(s: String) -> Result<Self> {
-        let bytes = hex::decode(s)?;
-        Ok(Self(bytes.try_into().map_err(|_| Error::BadKeyLength)?))
-    }
-}
-
-impl From<OutputDigest> for String {
-    fn from(d: OutputDigest) -> String {
-        d.hex()
     }
 }
 
@@ -261,18 +220,14 @@ pub enum AuditRecord {
         /// reader's "mine" matches (the node is not the boundary).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<Principal>,
-        /// The exposed tool that ran.
-        tool: ToolName,
+        /// The service that ran.
+        service: ServiceName,
         /// The caller-supplied arguments.
         argv: Argv,
-        /// The signed-state version the caller was admitted under (the
-        /// field keeps its channel-era name so older logs still parse).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        roster_version: Option<u64>,
-        /// The role in the signed state that admitted the caller. `None` in
-        /// records written before roles existed.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        role: Option<String>,
+        /// The signed-state version the caller was admitted under.
+        state_version: StateVersion,
+        /// The role in the signed state that admitted the caller.
+        role: RoleName,
         /// Unix milliseconds at authorization.
         at_ms: i64,
     },
@@ -290,13 +245,10 @@ pub enum AuditRecord {
         stderr_bytes: u64,
         /// BLAKE3 of the complete stdout.
         stdout_digest: OutputDigest,
-        /// Bytes the caller sent on stdin. `0` in records written before
-        /// stdin was recorded.
-        #[serde(default)]
+        /// Bytes the caller sent on stdin.
         stdin_bytes: u64,
         /// BLAKE3 of the complete stdin (the empty digest when there was
-        /// none, or in records written before stdin was recorded).
-        #[serde(default = "OutputDigest::empty")]
+        /// none).
         stdin_digest: OutputDigest,
         /// The first [`STDIN_HEAD_MAX`] bytes of stdin as text (see
         /// [`stdin_head`]); `None` when stdin was empty.
@@ -346,9 +298,9 @@ pub enum AuditRecord {
         /// matches. `None` for a refusal before any identity was checked.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<Principal>,
-        /// The tool it asked for, if it got as far as naming one.
+        /// The service it asked for, if it got as far as naming one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        tool: Option<ToolName>,
+        service: Option<ServiceName>,
         /// The same reason the caller was sent.
         reason: String,
         /// Unix milliseconds at refusal.
@@ -459,7 +411,7 @@ mod tests {
         let denied = |principal| AuditRecord::Denied {
             caller: node,
             principal,
-            tool: None,
+            service: None,
             reason: "no".into(),
             at_ms: 1,
         };
@@ -512,45 +464,30 @@ mod tests {
         );
     }
 
-    /// A record from a responder that predates stdin recording still parses,
-    /// and reads as "no stdin".
+    /// `Started` names the service, the state version and the role that
+    /// admitted the caller.
     #[test]
-    fn an_old_finished_record_still_parses() {
-        let old = format!(
-            r#"{{"kind":"finished","call":"0123456789abcdef0123456789abcdef","exit":0,"duration_ms":8,"stdout_bytes":2,"stderr_bytes":0,"stdout_digest":"{}"}}"#,
-            OutputDigest::from_hash(blake3::hash(b"1\n")).hex()
-        );
-        let parsed: AuditRecord = serde_json::from_str(&old).unwrap();
-        assert_eq!(parsed, finished(None));
-    }
-
-    /// `role` is written when set and omitted when not; a `Started` from a
-    /// host that predates roles still parses, as "no role".
-    #[test]
-    fn started_role_is_optional_on_the_wire() {
+    fn started_records_the_service_version_and_role() {
         let node = crate::NodeIdentity::from_seed([1u8; 32]).node_id();
-        let started = |role: Option<&str>| AuditRecord::Started {
+        let started = AuditRecord::Started {
             call: CallId::from_hex("0123456789abcdef0123456789abcdef").unwrap(),
             caller: node,
             principal: None,
-            tool: ToolName::new("db_query").unwrap(),
+            service: ServiceName::new("db_query").unwrap(),
             argv: Argv::default(),
-            roster_version: None,
-            role: role.map(str::to_string),
+            state_version: StateVersion(7),
+            role: RoleName::new("analyst").unwrap(),
             at_ms: 1,
         };
-        let with = serde_json::to_string(&started(Some("analyst"))).unwrap();
-        assert!(with.contains(r#""role":"analyst""#), "{with}");
-        assert_eq!(
-            serde_json::from_str::<AuditRecord>(&with).unwrap(),
-            started(Some("analyst"))
-        );
-        let without = serde_json::to_string(&started(None)).unwrap();
-        assert!(!without.contains("role"), "{without}");
-        assert_eq!(
-            serde_json::from_str::<AuditRecord>(&without).unwrap(),
-            started(None)
-        );
+        let json = serde_json::to_string(&started).unwrap();
+        for field in [
+            r#""service":"db_query""#,
+            r#""state_version":7"#,
+            r#""role":"analyst""#,
+        ] {
+            assert!(json.contains(field), "{field} in {json}");
+        }
+        assert_eq!(serde_json::from_str::<AuditRecord>(&json).unwrap(), started);
     }
 
     #[test]

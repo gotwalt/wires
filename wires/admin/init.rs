@@ -11,7 +11,7 @@ use library::{Membership, NodeIdentity};
 
 use super::keystore::Keystore;
 use super::ttl::Ttl;
-use crate::now_unix;
+use crate::clock::now_unix;
 
 /// `init` arguments.
 #[derive(Args)]
@@ -44,9 +44,9 @@ pub(crate) fn init_cmd(a: InitArgs) -> anyhow::Result<String> {
 pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
     if let Some(fabric) = crate::state::store::fabric(ks)? {
         bail!(
-            "this keystore is already in fabric {}…; `wires init` starts a new fabric — use \
+            "this keystore is already in network {}…; `wires init` starts a new network — use \
              another $WIRES_HOME for that",
-            &fabric.hex()[..8]
+            fabric.short()
         );
     }
     let root = match ks.read_root_identity()? {
@@ -81,7 +81,7 @@ pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
     crate::state::store::save_admin(ks, me.node_id())?;
 
     Ok(format!(
-        "fabric {}\nnode {}\nstate version {} (1 member: this node)\n\
+        "network {}\nnode {}\nstate version {} (1 member: this node)\n\
          next: on each joining machine run `wires id`, then here `wires invite <node-id> --name <label>`",
         root.node_id().hex(),
         me.node_id().hex(),
@@ -133,6 +133,6 @@ mod tests {
             node.node_id()
         );
         let err = init_in(&ks, args()).unwrap_err();
-        assert!(format!("{err:#}").contains("already in fabric"), "{err:#}");
+        assert!(format!("{err:#}").contains("already in network"), "{err:#}");
     }
 }

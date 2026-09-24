@@ -338,22 +338,16 @@ pub(crate) fn about(
 ) -> (Option<ServiceName>, Option<Person>) {
     match record {
         AuditRecord::Started {
-            tool, principal, ..
-        } => (
-            Some(ServiceName::from(tool.clone())),
-            principal.as_ref().map(Person::of),
-        ),
+            service, principal, ..
+        } => (Some(service.clone()), principal.as_ref().map(Person::of)),
         AuditRecord::Finished { call, .. } => match calls.get(call) {
             Some((s, who)) => (Some(s.clone()), who.clone()),
             // Its start was pruned: nobody can tell whose it was.
             None => (None, None),
         },
         AuditRecord::Denied {
-            tool, principal, ..
-        } => (
-            tool.clone().map(ServiceName::from),
-            principal.as_ref().map(Person::of),
-        ),
+            service, principal, ..
+        } => (service.clone(), principal.as_ref().map(Person::of)),
         AuditRecord::Push {
             call, principal, ..
         } => (
@@ -504,7 +498,7 @@ pub(crate) async fn authorize(
     })
 }
 
-/// The record-stream ALPN on a v2 host. At most [`MAX_PREAUTH_READERS`]
+/// The record-stream ALPN on a host. At most [`MAX_PREAUTH_READERS`]
 /// readers wait for a decision at once.
 #[derive(Clone, Debug)]
 pub(crate) struct RecordStream {
@@ -642,7 +636,7 @@ where
         return Ok(());
     };
     let decide = |now| authorize(host, caller, &hello, &services, mine, now);
-    let decided = decide(crate::now_unix()).await;
+    let decided = decide(crate::clock::now_unix()).await;
     drop(preauth);
     let mut view = match decided {
         Ok(view) => view,
@@ -669,7 +663,7 @@ where
         }
         // Decide again before sending anything new: a reader removed (or
         // dropped from `readers`) gets nothing logged after that.
-        let now = crate::now_unix();
+        let now = crate::clock::now_unix();
         let version = host.state().ok().map(|s| s.state.version);
         let regrant = if view.due(version, now) {
             let next = match decide(now).await {
@@ -735,7 +729,7 @@ async fn send_items<S: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library::{Argv, NodeIdentity, OutputDigest, PushId, PushOutcome, Subject, ToolName};
+    use library::{Argv, NodeIdentity, OutputDigest, PushId, PushOutcome, ServiceName, Subject};
 
     fn node(b: u8) -> NodeId {
         NodeIdentity::from_seed([b; 32]).node_id()
@@ -770,15 +764,15 @@ mod tests {
         CallId::from_hex(&format!("{b:02x}").repeat(16)).unwrap()
     }
 
-    fn started(c: u8, caller: NodeId, principal: Option<Principal>, tool: &str) -> AuditRecord {
+    fn started(c: u8, caller: NodeId, principal: Option<Principal>, service: &str) -> AuditRecord {
         AuditRecord::Started {
             call: call(c),
             caller,
             principal,
-            tool: ToolName::new(tool).unwrap(),
+            service: ServiceName::new(service).unwrap(),
             argv: Argv::new(vec![]).unwrap(),
-            roster_version: None,
-            role: None,
+            state_version: library::StateVersion(1),
+            role: library::RoleName::new("analyst").unwrap(),
             at_ms: 0,
         }
     }
@@ -797,11 +791,11 @@ mod tests {
         }
     }
 
-    fn denied(caller: NodeId, principal: Option<Principal>, tool: Option<&str>) -> AuditRecord {
+    fn denied(caller: NodeId, principal: Option<Principal>, service: Option<&str>) -> AuditRecord {
         AuditRecord::Denied {
             caller,
             principal,
-            tool: tool.map(|t| ToolName::new(t).unwrap()),
+            service: service.map(|s| ServiceName::new(s).unwrap()),
             reason: "no".into(),
             at_ms: 0,
         }
