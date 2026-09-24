@@ -1,10 +1,43 @@
 # 31 — Inbox: callbacks to the caller that asked, in every client (CLI and MCP)
 
-**Lane:** P3 · **Depends on:** 28 (steps 1–2), 30 · **Status:** design, to agree
-with the human before any push code moves · **Files:** `wires/host/push.rs`,
+**Lane:** P3 · **Depends on:** 28 (steps 1–2), 30 · **Status:** **parked
+2026-09-24**: three open questions below (§ Parked), the last with no good
+answer yet. No push code has moved · **Files:** `wires/host/push.rs`,
 `wires/host/gate.rs` (push decisions), `wires/host/control.rs`,
 `wires/caller/inbox.rs`, `wires/caller/mcp.rs`, `wires/gateway/`,
 `library/calls/push.rs`, protocol.md §7, usage, README
+
+## Parked (2026-09-24)
+
+Planning the build against the code turned up three places where D1–D6 and
+the code don't meet. The human parked the card on the third: "this last
+question means we should probably park card 31 until we have a better
+answer."
+
+1. **Stranding of operator pushes (D1b/D3).** "Refuse at send unless the
+   recipient may call a service here" needs the recipient's principal. A host
+   knows only the *last* principal a node presented, and the gateway presents
+   many from one node. Candidate: `wires inbox` (and the gateway) fetch from
+   **every host in the signed state**, so an operator push needs only "a
+   current member" and nothing can strand. That also removes D3's
+   "service moved hosts" caveat. Cost: more fan-out, and any admin-named host
+   can leave a note in any member's mailbox.
+2. **Direct dial vs D1 (D6).** A direct delivery that honors D1 needs the
+   receiver to present its ID token back to the host (the gateway: one token
+   per live user). Candidate: drop the dial and the caller's inbox receiver.
+   "Listening" becomes an open long poll, which the host already answers the
+   moment a push is queued. That leaves one delivery path (a fetch, with the
+   caller's token), and the caller exposes no inbound ALPN.
+3. **Who sees the MCP `inbox` tool (open, the blocker).** The card says the tool
+   appears "only for callers with a service that calls back (`"push": true`)".
+   But `push: true` lives in the host's `host.json`, which a caller never sees,
+   so a caller can't know which of its services call back. The options on the
+   table were "always list it" (every MCP user pays for a tool that may never
+   return anything) and "a `callbacks` flag on the registry's Service" (the
+   admin declares it, and the signed-state format changes). Neither is
+   convincing. The deeper question is whether "this service calls back" is a
+   property of the service (the registry's) or of an implementation (the
+   host's), and what a caller should be told before it calls.
 
 ## Why (the human, 2026-09-24)
 

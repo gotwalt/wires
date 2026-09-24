@@ -99,14 +99,14 @@ Each summary describes the surface at the time the card was done. Cards 25–27 
 | [28](done/28-audit-fixes.md) | A | 27, 26 | **Audit fixes (2026-09-23):** drop `member`, issuer-scoped matchers, service child can't reach host secrets (per-call push capability), fail-closed log, pre-auth caps, person-keyed records and re-decided `watch` streams, state-sync and caller fixes, docs sweep. Push delivery moved to 31 |
 | [29](backlog/29-identity-and-scale.md) | I2 | 28 | **Identity and scale (design agreed):** machine badges + banned list, `login --for` + day-pass, per-caller views served by hosts, transparency-log checkpoints |
 | [30](done/30-web-gateway.md) | W | 27, 26 | `wires gateway`: remote MCP (Streamable HTTP 2026-07-28 + OAuth 2.1) for Claude.ai; each call presents the web user's own gateway-bound Google token |
-| [31](backlog/31-inbox-delivery.md) | P3 | 28, 30 | **Design agreed 2026-09-24, not built:** callbacks go to the caller that asked (node + principal), through the call's push capability only; operator push `--to <node-id>` only; at least once to its mailbox; fetch set complete by construction; an `inbox` MCP tool in `wires mcp` and the gateway. Replaces card 28 §4 (push half) and §7 |
+| [31](backlog/31-inbox-delivery.md) | P3 | 28, 30 | **Parked 2026-09-24** (open questions on the card; the blocker is how a caller learns which services call back). Design as agreed 2026-09-24, not built: callbacks go to the caller that asked (node + principal), through the call's push capability only; operator push `--to <node-id>` only; at least once to its mailbox; fetch set complete by construction; an `inbox` MCP tool in `wires mcp` and the gateway. Replaces card 28 §4 (push half) and §7 |
 | [22](done/22-gossip-role-OPEN.md) | — | decided | **Decided 2026-09-23: drop the channel** → cards 27 and 26 |
 | [32](backlog/32-service-sandbox-OPEN.md) | — | parked | **Open question, don't build:** run each service call in a rootless microVM (Firecracker or equivalent) so a service can't reach the host's keys |
 | [18](backlog/18-front-door-OPEN.md) | — | parked | **Open question, don't build:** apex key, invites, `wires join <domain>` |
 | [16](done/16-token-benchmark.md) | bench | 01–03 | MCP (GitHub server, many tools; ± tool search) vs `gh` via `wires call` vs bare `gh`: 5 tasks × 5 runs |
 | [09](backlog/09-witness.md) | stretch | 26 | Witness: a reader that follows hosts' call logs and exports signed checkpoints, so a truncation or rewrite contradicts a copy the host doesn't control |
 
-**Order (agreed 2026-09-23):** 24 → 25 (Cargo + strip) → 27 (services, not hosts; drop the channel) → 26 (host-held records) → recording (08, in progress: workbench on HEAD, dry run, record; see its Steps). **Then (2026-09-23 audit; order decided 2026-09-24):** 28 → 31 (inbox) → 29 (identity and scale). 32 (service sandbox) is open, not scheduled.
+**Order (agreed 2026-09-23):** 24 → 25 (Cargo + strip) → 27 (services, not hosts; drop the channel) → 26 (host-held records) → recording (08, in progress: workbench on HEAD, dry run, record; see its Steps). **Then (2026-09-23 audit; order decided 2026-09-24):** 28 → 29 (identity and scale). 31 (inbox) is parked (2026-09-24) and 32 (service sandbox) is open; neither is scheduled.
 
 ## Rules for workers
 
