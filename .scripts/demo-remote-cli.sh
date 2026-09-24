@@ -11,8 +11,11 @@
 #                Two hosts implement it: a caller never names either. Both
 #                are also the network's directories (`wires directory add`):
 #                `serve` runs the directory too, which holds the signed
-#                policy the admin publishes, and which hosts and callers
-#                fetch it from.
+#                policy the admin publishes; each host follows the other's
+#                (a subscription: every edit arrives within a second), and
+#                callers fetch from them. Two, because step 8 stops the
+#                workbench and step 9's `wires remove` must still reach a
+#                directory.
 #   agent     -- alice@example.com (role analyst): `wires login`, `wires
 #                services`, `wires call orders-db …`, `wires mcp`, `wires inbox`.
 #   observer  -- sec@audit.example (role security): allowed to call nothing,

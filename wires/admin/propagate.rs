@@ -10,7 +10,8 @@
 //! state push` re-publishes it once a directory is up.
 //!
 //! ```text
-//! wires state push     # re-publish the stored policy to every directory
+//! wires state push                          # re-publish the stored policy to every directory
+//! wires state settings --freshness strict    # the signed freshness rule (card 36c)
 //! ```
 
 use std::collections::BTreeSet;
@@ -36,6 +37,10 @@ pub(crate) enum StateCmd {
     /// Re-publish the stored signed policy to every directory (after an
     /// edit that reached none, or a directory that was down).
     Push,
+    /// Print the network's settings, or change them and publish: the
+    /// freshness rule (`--freshness lenient|strict`) and how often
+    /// directories vouch for the policy.
+    Settings(super::settings::SettingsArgs),
 }
 
 /// How a publish went, for an admin command's [`Report`].
@@ -93,9 +98,23 @@ pub(crate) fn fold(mut report: Report, pushed: Propagation) -> Report {
     report
 }
 
-/// `wires state push`: re-publish the stored policy to every directory.
+/// `wires state push` (re-publish the stored policy to every directory) and
+/// `wires state settings`.
 pub(crate) async fn state_cmd(a: StateArgs) -> Result<Report> {
     match a.cmd {
+        StateCmd::Settings(s) if !s.is_edit() => Ok(Report {
+            stdout: super::settings::settings_in(&Keystore::resolve()?, &s)?,
+            ..Report::default()
+        }),
+        StateCmd::Settings(s) => {
+            run_edit(|ks| {
+                Ok(Report {
+                    stdout: super::settings::settings_in(ks, &s)?,
+                    ..Report::default()
+                })
+            })
+            .await
+        }
         StateCmd::Push => {
             run_edit(|ks| {
                 if ks.read_root_identity()?.is_none() {

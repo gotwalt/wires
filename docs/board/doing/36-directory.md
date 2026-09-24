@@ -384,3 +384,64 @@ proofs, multiproofs, slices and their sizes in the notes above, and the "host sl
   (a ban) to 1.7 KB (a service) at any size; a 25-entry view 16.8 KB. The model's apex rows use
   them: a host receives 140–280 KB a day after its first sync.
 
+
+**36c (2026-09-24, branch `worker/36c-host-subscription`): hosts subscribe; the freshness rule.**
+
+- **Directory side** (`wires/directory/sub_policy.rs`; `serve.rs` gained one `match kind` arm,
+  `node.rs` the `Policy {have}` arm, `policy_at` and a `policy_frames` field). `since(dir, current,
+  have)` → `Current | Update(update_from(kept head at have)) | Whole` answers both `policy {have}`
+  and `subscribe {policy, have}`. A subscription sends that first (a `fresh` beat when current),
+  then one `policy_update` per adopted head from the version last sent, a `fresh` every beat, and
+  `denied` when the head stops listing the directory. Subscribers at one version share one encoded
+  frame (`FrameCache`, keyed `(have, head, fresh.at)`, 8 kept), so a publish to 1,000 hosts is one
+  redb read and one diff, not 1,000. `policy` subscriptions are open to any admitted node, like
+  `policy {have}` today: card 37 narrows both to hosts and directories. Cap: the existing
+  `--max-subscribers` semaphore, shared with replicas.
+- **Host side** (`wires/host/follow.rs`, `wires/host/freshness.rs`). `serve_until` spawns a
+  `Follower` instead of `refresh_loop`: `subscribe {policy, have}` to the first listed directory
+  that answers (never itself; last-followed first, then the head's order, re-read from
+  `policy.json` on every reconnect, so a newly added directory is followed without a restart).
+  `take`: whole `policy` (head verifies, `Fresh` vouches, `adopt_if_newer`), `policy_update`
+  (`apply` on the held copy, `Fresh` vouches for the result, adopt), `fresh` (kept if it vouches
+  for the held head; another version's is skipped, not an error). Any error → resubscribe at once
+  with `have: 0`; a second failure in a row → next directory. Reconnect backoff 1 s → min(beat,
+  30 s); a stream silent for 2 beats + 10 s is taken for dead. A host that is also a directory
+  also keeps its own directory's `Fresh` (`vouch_from_local`).
+- **Deviation: one subscription at a time, cold failover.** The card says the rest "stay as warm
+  failover"; I kept one stream per host so a directory's subscriber count is the host count, not
+  hosts × directories. Failover costs one dial (≤ 5 s) per dead directory. Easy to change if warm
+  standby is wanted.
+- **Freshness.** `Freshness` keeps the newest `Fresh` that vouches for the held head (by
+  `(version, until)`), in memory and `fresh.json` (0600, reloaded at start only if it vouches for
+  the head on disk). `ServicesHost::check_vouched` runs first in `decide` (after badge, bans and
+  the ID token): `strict` + no current `Fresh` for the exact head → `GateRefusal::Unvouched`, text
+  `this host's policy is stale: no directory has vouched for it recently; try again later` (exit
+  77); `lenient` → decide, and warn at most every 10 s (silent when the head lists no directory).
+  **Decided: strict refusals are logged** like any admitted caller's refusal: one record per
+  refused call is not noise, and the log then shows which calls a host refused while it couldn't
+  vouch for its policy. Push and the record stream ignore freshness (not in scope). Lenient
+  staleness shows in the trace only, not yet in `wires watch` (the card's Decisions mention it).
+- **Admin CLI: `wires state settings [--freshness lenient|strict] [--beat-secs N] [--fresh-secs
+  N]`** (`wires/admin/settings.rs`; `StateCmd::Settings` in `propagate.rs`, one help line in
+  `lib.rs`). Under `state` because it edits the policy itself, not a registry noun; no flag
+  prints the settings and edits nothing. Card 38 can polish the help.
+- **Kept, deliberately:** `fetch::fetch_now` (a host whose preflight fails at start does one
+  `policy {have}` fetch, as before; `fetch` now also applies a `policy_update` answer), and
+  `refresh_loop` / `check_once` / `newer_head` (the gateway still uses them; card 37 moves it).
+  36b's `directory/tests.rs` still drives `check_once` from a "host" endpoint: it now tests the
+  gateway's path.
+- **Not built:** a host newly listed in `directories` runs the directory mode only after a restart
+  (the router's ALPNs are fixed at spawn and the host would need a second policy writer); the
+  follower traces "restart `wires serve` to run it" once.
+- **Demo:** still two directories. Step 8 stops the workbench, so step 9's `wires remove` needs a
+  live directory to publish to; with only the workbench listed it would exit 1. Comment updated.
+- **Acceptance** (`wires/e2e/follow.rs`, plus unit tests in `sub_policy.rs`, `freshness.rs`,
+  `serve.rs`, `settings.rs`): an edit reaches both subscribed hosts in ~40 ms as one
+  `policy_update` (well under 2 s); a host that missed two edits catches up with one update; a
+  host whose copy the delta doesn't apply to resyncs and takes the whole policy (`resyncs 1,
+  wholes 1`); beat 1 s / fresh 3 s: with the directory stopped, `lenient` keeps serving and
+  `strict` refuses with the stale text, then serves again once the directory restarts from
+  `directory.redb`; a host restarted from disk with no directory up serves at once.
+- **Measured:** one ban edit costs each host **1,191 B in one frame** (test fixture: one role, one service and
+  21 bans; the whole policy is 4,473 B), matching 36d's 1.2 KB; a `fresh` beat is ~475 B
+  (36a).

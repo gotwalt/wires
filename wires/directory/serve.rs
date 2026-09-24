@@ -8,8 +8,9 @@
 //! - [`SubscriptionProtocol`] (`wires/directory-sub/1`): a `replica`
 //!   subscription from another directory the head lists: the whole policy
 //!   whenever it moves past what the subscriber holds, and a `fresh` beat
-//!   otherwise. A host's `policy` subscription (with `policy_update`
-//!   deltas) is card 36c's, a caller's `view` card 37's.
+//!   otherwise; a host's `policy` subscription, the whole policy once and
+//!   then `policy_update` deltas ([`sub_policy`](super::sub_policy)); a
+//!   caller's `view` is card 37's.
 //! - [`beat_loop`]: a new `Fresh` every `settings.beat_secs`.
 //! - [`replicate`]: follow every other directory the head lists as a
 //!   `replica`, and take any newer head it has, so a directory that missed
@@ -152,12 +153,18 @@ async fn subscription(dir: &Directory, conn: &Connection, caller: NodeId) -> Res
         SubRequest::Hello { .. } => return deny(&mut send, "a second hello".into()).await,
     };
     drop(undecided);
-    if kind != SubscriptionKind::Replica {
-        return deny(
-            &mut send,
-            "this directory does not serve policy or view subscriptions yet (cards 36c, 37)".into(),
-        )
-        .await;
+    match kind {
+        SubscriptionKind::Replica => {}
+        SubscriptionKind::Policy => {
+            return super::sub_policy::serve(dir, conn, &mut send, caller, have).await;
+        }
+        SubscriptionKind::View => {
+            return deny(
+                &mut send,
+                "this directory does not serve view subscriptions yet (card 37)".into(),
+            )
+            .await;
+        }
     }
     let listed = |dir: &Directory| {
         dir.snapshot()

@@ -207,7 +207,7 @@ view (card 36, "Not gossip").
 | `wires/records/1` | hosts | the record stream |
 | `wires/inbox/2` | hosts; callers in `inbox --wait` | push delivery and fetch |
 | `wires/directory/1` | directories | `publish`, `head`, `policy {have}` (the whole policy, for hosts and directories; answered with `policy`, `policy_update` or `current`), `view`, `resolve` (a caller's signed entries; refused until card 37). |
-| `wires/directory-sub/1` | directories | subscriptions: `policy` (hosts: `policy_update` deltas, 36c), `view` (long-running callers: `view_update`, 37), `replica` (other directories; built in 36b) |
+| `wires/directory-sub/1` | directories | subscriptions: `policy` (hosts: the whole policy once, then `policy_update` deltas and `fresh` beats; 36c), `view` (long-running callers: `view_update`, 37), `replica` (other directories; 36b) |
 | ~~`wires/state/1`~~ | — | retired by card 36 |
 
 ## 8. What it costs
@@ -230,16 +230,16 @@ Sizes are measured from the library (card 36d).
 
 ## 9. Before, now, and this design
 
-Card 35 is built, and cards 36b (the directory mode) and 36d (the head signs a hash of every
-item, and the root signs each service entry on its own) are built on `aaron/directory`; card 36c (host
-subscriptions with `policy_update` deltas, freshness modes) and card 37 (caller views) are next.
+Card 35 is built, and cards 36b (the directory mode), 36d (the head signs a hash of every item,
+and the root signs each service entry on its own) and 36c (host subscriptions with `policy_update`
+deltas, freshness modes) are built on `aaron/directory`; card 37 (caller views) is next.
 
 | Before cards 35–36 | Now (after 36d; protocol.md) | This design | Card |
 |---|---|---|---|
 | The state lists every member; `invite` is an edit | Badges; `remove` is a ban; `invite` edits nothing | same | 35 ✓ |
 | One signed blob, pushed whole to every host | A root-signed head over a hash of the items, and root-signed service entries, published to the directories (`directory.redb`, replicas); the admin dials no host | same; hosts hold the whole policy | 36b ✓, 36d ✓ |
-| Hosts re-check every 10 min and search peers | Hosts fetch at start and check a directory's `head` every beat (5 min), then fetch the **whole** policy (`policy {have}`) | one `policy` subscription to a directory, carrying `policy_update` deltas; lenient / strict freshness | 36b ✓, 36c |
-| The state expires in 30 days | Heads last 90 days; directories sign a `Fresh` every beat (nothing enforces it yet) | freshness decides, per `settings.freshness` | 36b ✓, 36c |
+| Hosts re-check every 10 min and search peers | One `policy` subscription to the first directory that answers (the others are failover), carrying `policy_update` deltas and a `Fresh` every beat; an edit arrives in well under a second | same | 36b ✓, 36c ✓ |
+| The state expires in 30 days | Heads last 90 days; a host keeps the newest `Fresh` for its head (`fresh.json`); when it lapses, `settings.freshness` decides: `lenient` keeps deciding and traces it, `strict` refuses calls | same; `lenient` staleness also shown in `wires watch` | 36b ✓, 36c ✓ |
 | Issuers configured per host in `host.json` | Signed `issuer` items; `host.json` can only narrow them | same | 36b ✓ |
 | Every caller holds the whole state and pulls it before commands | Every caller holds the whole policy and fetches it from a directory when its copy is 10 min old, or gets it in `HelloAck` | each caller holds its view; learns of changes in `HelloAck` or by subscription | 37 |
 | The invite carries the whole state | The invite carries the whole signed policy (its head lists the directories) | badge, root key and directory ids | 37 |

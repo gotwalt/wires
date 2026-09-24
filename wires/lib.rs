@@ -95,7 +95,7 @@ Admin — admits nodes and signs what runs where (holds the root key):
   role      Define roles from IdP identity: set / rm
   issuer    Trust an IdP: set / rm (its client id, accepted audiences)
   directory Name directories: add / rm; `directory serve` runs one
-  state     Re-publish the signed policy to every directory (push)
+  state     The signed policy: push (re-publish), settings (freshness rule)
 
 Host — implements the services assigned to it:
   serve     Run host.json's services; check every caller; log every call
@@ -151,7 +151,8 @@ enum Command {
     /// `serve` runs this node's directory alone.
     Directory(directory::DirectoryArgs),
     /// The signed policy itself: `push` re-publishes it to every directory
-    /// (after an edit that reached none).
+    /// (after an edit that reached none); `settings` prints or changes the
+    /// freshness rule and the directories' beat.
     State(admin::propagate::StateArgs),
 
     // --- host ---

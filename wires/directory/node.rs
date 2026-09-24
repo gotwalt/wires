@@ -20,6 +20,7 @@ use library::{
 };
 
 use super::db::{DB_FILE, DirectoryDb};
+use super::sub_policy::Since;
 use crate::admin::keystore::Keystore;
 use crate::policy::store::{self, Held};
 
@@ -60,6 +61,8 @@ pub(crate) struct Directory {
     pub(crate) undecided: Arc<tokio::sync::Semaphore>,
     /// For tests: count every accept.
     accepts: RwLock<u64>,
+    /// The encoded frames its `policy` subscribers share (card 36c).
+    pub(crate) policy_frames: super::sub_policy::FrameCache,
 }
 
 /// How many streams, on both ALPNs together, may be open before their
@@ -122,6 +125,7 @@ impl Directory {
             subscribers: Arc::new(tokio::sync::Semaphore::new(max_subscribers)),
             undecided: Arc::new(tokio::sync::Semaphore::new(MAX_UNDECIDED)),
             accepts: RwLock::new(0),
+            policy_frames: Default::default(),
         });
         dir.beat(now)?;
         Ok(dir)
@@ -146,6 +150,12 @@ impl Directory {
     pub(crate) fn version(&self) -> StateVersion {
         self.snapshot()
             .map_or(StateVersion(0), |c| c.held.version())
+    }
+
+    /// The signed policy at `version`, if it is one of the kept heads (what
+    /// a delta is computed from).
+    pub(crate) fn policy_at(&self, version: StateVersion) -> Result<Option<SignedPolicy>> {
+        self.db.policy_at(version)
     }
 
     /// Follow every change of head or freshness.
@@ -263,12 +273,15 @@ impl Directory {
                 Err(reason) => denied(reason),
             },
             // The whole policy, for hosts and directories (and, until card
-            // 37, callers).
+            // 37, callers), or the delta from a kept `have` (card 36c).
             DirectoryRequest::Policy { have } => match self.current_with_fresh() {
-                Ok((c, fresh)) if have >= c.held.version() => DirectoryAnswer::Current { fresh },
-                Ok((c, fresh)) => DirectoryAnswer::Policy {
-                    policy: c.held.signed.clone(),
-                    fresh,
+                Ok((c, fresh)) => match super::sub_policy::since(self, &c, have) {
+                    Since::Current => DirectoryAnswer::Current { fresh },
+                    Since::Update(update) => DirectoryAnswer::PolicyUpdate { update, fresh },
+                    Since::Whole => DirectoryAnswer::Policy {
+                        policy: c.held.signed.clone(),
+                        fresh,
+                    },
                 },
                 Err(reason) => denied(reason),
             },

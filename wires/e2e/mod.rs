@@ -17,6 +17,9 @@
 //!   environment and a per-call push capability, not the host's keystore.
 //! - [`gateway`] — `wires gateway`: a web MCP client signs in (OAuth, a mock
 //!   Google) and calls as its user, over real HTTP.
+//! - [`follow`] — card 36c: hosts follow a directory's `policy`
+//!   subscription (deltas, resync, failover), and the signed freshness rule
+//!   (`lenient` / `strict`) with every directory down.
 //! - [`native`] — card 33: an embedded [`Host`](crate::Host) serves a native
 //!   service (the `kv` example), called and logged like a CLI service.
 
@@ -43,6 +46,8 @@ mod services_host;
 /// Card 26b: call records streamed from the host's log to authorized readers.
 mod records;
 
+/// Card 36c: hosts follow the directory by subscription; the freshness rule.
+mod follow;
 /// `wires gateway`: OAuth sign-in and MCP over HTTP, end to end.
 mod gateway;
 /// Card 33: an app serves wires calls in-process through an embedded host.

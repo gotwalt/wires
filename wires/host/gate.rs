@@ -7,7 +7,10 @@
 //!    connection). Anyone else hears only [`NOT_ADMITTED`], and — checked
 //!    first by [`ServicesHost::check_member`], before its ID token is even
 //!    looked at — is traced, not written to the call log;
-//! 2. the policy is fresh (its head's `not_after`);
+//! 2. the policy is fresh (its head's `not_after`) and, under the signed
+//!    `settings.freshness: strict`, vouched for by a current `Fresh` from a
+//!    directory ([`freshness`](super::freshness); `lenient`, the default,
+//!    only traces a lapse);
 //! 3. the service is registered, and assigned to **this** host
 //!    ([`Policy::assigns`](library::Policy::assigns));
 //! 4. the registry allows the caller's role ([`library::authorize`]);
@@ -32,15 +35,17 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use library::{
-    IdToken, Membership, NodeId, Principal, Refusal, RoleName, ServiceName, StateVersion,
-    authorize, role_admits,
+    FreshnessMode, IdToken, Membership, NodeId, Principal, Refusal, RoleName, ServiceName,
+    StateVersion, authorize, role_admits,
 };
 
 use crate::admin::keystore::Keystore;
 use crate::caller::jwks::VerifyError;
 use crate::host::config::HostConfig;
+use crate::host::freshness::{Freshness, STALE, Vouched};
 use crate::host::identity::Identities;
 use crate::host::transport::AuditSink;
+use crate::host::transport::Throttle;
 use crate::policy::store::Held;
 
 /// The one refusal a peer that is not admitted hears, whatever the reason
@@ -64,6 +69,10 @@ pub(crate) const IDP_UNREACHABLE: &str =
 /// policy, or one older than it already decided under): the operator's
 /// problem, not the peer's. The cause goes only to the host's trace.
 pub(crate) const HOST_MISCONFIGURED: &str = "host configuration error";
+
+/// Calls decided while the host's policy was not vouched for (traced, not
+/// once per call).
+static LAPSES: Throttle = Throttle::new();
 
 /// Why [`ServicesHost::decide_push`] refused a recipient. `Display` is the
 /// reason recorded and reported.
@@ -102,6 +111,12 @@ pub(crate) enum GateRefusal {
         version: StateVersion,
         /// Why it is not fresh.
         why: String,
+    },
+    /// `settings.freshness` is `strict` and no current `Fresh` vouches for
+    /// the host's policy ([`STALE`]).
+    Unvouched {
+        /// The policy's version.
+        version: StateVersion,
     },
     /// The registry refused ([`library::authorize`]).
     Registry {
@@ -158,6 +173,7 @@ impl fmt::Display for GateRefusal {
                  a newer one",
                 version.0
             ),
+            GateRefusal::Unvouched { .. } => f.write_str(STALE),
             GateRefusal::Registry {
                 refusal: Refusal::Banned,
                 ..
@@ -279,6 +295,10 @@ pub(crate) struct ServicesHost {
     /// The push service, when it runs: where a native service's
     /// [`push_to_caller`](crate::Call::push_to_caller) goes.
     pub(crate) push_commands: Option<tokio::sync::mpsc::Sender<crate::host::push::PushCommand>>,
+    /// The newest `Fresh` a directory signed for the held head, and so
+    /// whether `settings.freshness` lets this host decide
+    /// ([`freshness`](crate::host::freshness)).
+    pub(crate) freshness: Arc<Freshness>,
     /// The highest policy version this host has decided under, in memory:
     /// [`policy`](Self::policy) refuses anything older read back from disk.
     pub(crate) high_water: std::sync::atomic::AtomicU64,
@@ -428,8 +448,51 @@ impl ServicesHost {
         }
     }
 
+    /// Whether this host may decide under `state` at `now` by the signed
+    /// freshness rule: always under `lenient` (a lapse is traced,
+    /// throttled), and under `strict` only while a current `Fresh` vouches
+    /// for its head.
+    pub(crate) fn check_vouched(&self, state: &Held, now: i64) -> Result<(), GateRefusal> {
+        let since = match self.freshness.vouched(&state.signed.head, now) {
+            Vouched::Current => return Ok(()),
+            Vouched::Lapsed { since } => since,
+        };
+        let version = state.version();
+        match state.policy.settings.freshness {
+            FreshnessMode::Strict => {
+                if let Some(n) = LAPSES.tick(now.saturating_mul(1000)) {
+                    tracing::warn!(
+                        policy_version = version.0,
+                        lapsed_at = ?since,
+                        refused = n,
+                        "strict: refusing calls, no directory has vouched for this host's policy \
+                         recently"
+                    );
+                }
+                Err(GateRefusal::Unvouched { version })
+            }
+            FreshnessMode::Lenient => {
+                // A network with no directory has nothing to vouch: no news.
+                if state.directories().is_empty() {
+                    return Ok(());
+                }
+                if let Some(n) = LAPSES.tick(now.saturating_mul(1000)) {
+                    tracing::warn!(
+                        policy_version = version.0,
+                        lapsed_at = ?since,
+                        calls = n,
+                        "lenient: still deciding under this host's policy, which no directory has \
+                         vouched for recently (until its not_after)"
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// [`admit`] under `state`, as the text the caller is sent: a refusal
     /// that a verified identity could change leads with why there is none.
+    /// First the freshness rule ([`check_vouched`](Self::check_vouched)).
     pub(crate) fn decide(
         &self,
         state: &Held,
@@ -439,6 +502,7 @@ impl ServicesHost {
         service: &ServiceName,
         now: i64,
     ) -> std::result::Result<Admitted, String> {
+        self.check_vouched(state, now).map_err(|r| r.to_string())?;
         admit(
             state,
             &self.config,
