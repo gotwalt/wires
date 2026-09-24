@@ -9,6 +9,12 @@
 #   docker compose run --rm wires-gateway join <token>
 #   docker compose up -d
 #
+# The gateway asks a directory for each user's view, so its network needs one
+# (named with `wires directory add` before the gateway is invited). If no
+# host runs it, run it here as its own node: the optional `wires-directory`
+# service (`--profile directory`), with its own keystore; see
+# docs/deployment.md § "Running a directory".
+#
 # The tunnel's ingress (in positivesum/infra) routes the public host to
 # http://wires-gateway:8080 on this project's network; nothing is published
 # on the Docker host.
@@ -28,9 +34,26 @@ services:
       WIRES_GATEWAY_CLIENT_SECRET: ${WIRES_GATEWAY_CLIENT_SECRET}
       RUST_LOG: ${RUST_LOG:-warn,wires=info}
     volumes:
-      # The gateway's keystore: node key, membership, signed state, DCR key,
-      # sessions. Must persist (the node key is the gateway's identity).
+      # The gateway's keystore: node key, badge, the invite's directory ids and
+      # login settings, DCR key, sessions. Must persist (the node key is the
+      # gateway's identity).
       - keystore:/data
+    restart: unless-stopped
+
+  # Optional: a directory on this machine, as a node of its own (the gateway
+  # never uses its own node as its directory). Start with --profile directory.
+  wires-directory:
+    profiles: [directory]
+    build:
+      context: ../..
+    image: wires:gateway
+    command: ["directory", "serve"]
+    environment:
+      WIRES_HOME: /data
+      RUST_LOG: ${RUST_LOG:-warn,wires=info}
+    volumes:
+      # Node key, badge, the signed policy and directory.redb. Must persist.
+      - directory-keystore:/data
     restart: unless-stopped
 
   cloudflared:
@@ -43,3 +66,4 @@ services:
 
 volumes:
   keystore:
+  directory-keystore:
