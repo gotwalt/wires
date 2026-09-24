@@ -269,8 +269,8 @@ impl crate::caller::call::Caller for PresentingCaller {
         stdin: Vec<u8>,
     ) -> Result<crate::caller::call::CallOutcome> {
         use crate::caller::call::{SERVICE_DIAL_TIMEOUT, ServiceDial, call_entry, outcome};
-        let Some(entry) = self.view.entry(&tool.name).filter(|e| e.call) else {
-            bail!("`{}` is not a service this user may call", tool.name);
+        let Some(entry) = self.view.entry(&tool.name) else {
+            bail!("`{}` is not in this user's view", tool.name);
         };
         let dial = ServiceDial {
             endpoint: &self.endpoint,

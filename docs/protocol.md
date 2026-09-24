@@ -557,8 +557,7 @@ refuses to dial from an expired one (it refreshes first; failing that, exit 1: a
 `wires policy push` or a fresh invite). It takes the service's hosts from the service's root-signed
 entry, the last host that answered (`last-good.json`) first, then the admin's order. A name the
 view doesn't hold is asked of a directory (`resolve`); a name no directory resolves for this
-caller, or whose entry is marked `read` only, ends the call before any dial (exit 1, with `run
-wires login` when it isn't signed in). It
+caller ends the call before any dial (exit 1, with `run wires login` when it isn't signed in). It
 fails over to the next host **only when a dial fails** (10 s each); a host that answered has
 decided. It sends `Hello` and `Invoke` together, then, before it forwards a byte of stdin,
 **always** verifies the `HelloAck` membership with `check_inclusion(ack, own fabric,
