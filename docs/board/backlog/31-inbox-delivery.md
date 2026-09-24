@@ -130,3 +130,7 @@ One tool, the same everywhere: **`inbox`**, `{ wait_seconds?: 0–25, limit?: 1�
 - [ ] `make demo` (push demo) green, using the call capability only.
 
 ## Notes
+
+- 2026-09-24, the human: "no need for role or broadcast messages". D1 is
+  agreed. D2–D6 and the MCP shape stand as recommended unless amended; the
+  per-service capability grace (D2) is still open.
