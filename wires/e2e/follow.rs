@@ -497,7 +497,10 @@ async fn a_directory_serving_an_unadoptable_policy_is_passed_over() {
     h.until(StateVersion(2)).await;
     assert_eq!(store::read(&h.ks, h.root).unwrap().unwrap().signed, good);
     let (_, _, _, resyncs) = h.frames();
-    assert_eq!(resyncs, 2, "the update, then the whole policy, from the first");
+    assert_eq!(
+        resyncs, 2,
+        "the update, then the whole policy, from the first"
+    );
     h.task.abort();
     first.stop().await;
     second.stop().await;

@@ -317,6 +317,31 @@ mod tests {
         assert!(format!("{err:#}").contains("alice"), "{err:#}");
     }
 
+    /// Under strict freshness, removing the last directory would leave
+    /// nothing to vouch for the policy: refused, naming the way out, and
+    /// nothing changes.
+    #[test]
+    fn removing_the_last_directory_under_strict_is_refused() {
+        let ks = admin();
+        let dir = NodeIdentity::from_seed([4u8; 32]).node_id();
+        invite(&ks, dir, Some("dir"));
+        crate::admin::service::directory_add(&ks, dir, Ttl::default()).unwrap();
+        crate::admin::settings::settings_in(
+            &ks,
+            &crate::admin::settings::SettingsArgs {
+                freshness: Some(crate::admin::settings::Freshness::Strict),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let before = stored(&ks).version();
+        let err = format!("{:#}", remove(&ks, "dir").unwrap_err());
+        assert!(err.contains("freshness is strict"), "{err}");
+        assert!(err.contains("--freshness lenient"), "{err}");
+        assert_eq!(stored(&ks).version(), before);
+        assert_eq!(stored(&ks).directories(), &[dir]);
+    }
+
     #[test]
     fn names_are_one_word_and_not_ids() {
         assert!(check_name("workbench").is_ok());

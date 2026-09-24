@@ -118,6 +118,9 @@ SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kin
   no directory has vouched for its policy recently, §4 *Freshness at the host*), `beat_secs`
   (default 300: how often a directory signs a `Fresh` and beats its subscriptions) and `fresh_secs`
   (default 900: how long a `Fresh` is good for). The admin sets them with `wires policy settings`.
+  `strict` needs at least one directory listed (nothing else could vouch, and every host would
+  refuse every call), so validation refuses `strict` with no directory, whichever edit would
+  make it so: `policy settings`, or `directory rm` or `remove` of the last directory.
 - **Versioning.** Every admin edit (`init`, `remove`, `service`, `role`, `issuer`, `directory
   add|rm`, and the rare `invite` below) is the stored policy changed, expired bans dropped,
   `version + 1`, `issued = now`, `not_after = max(now + --policy-ttl, the stored policy's

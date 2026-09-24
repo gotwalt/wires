@@ -150,9 +150,20 @@ mod tests {
         assert_eq!(before, after);
     }
 
+    /// An admin whose policy lists one directory (strict needs one).
+    fn admin_with_a_directory() -> Keystore {
+        let ks = admin();
+        let dir = library::NodeIdentity::generate().node_id();
+        let mut ledger = crate::admin::ledger::Ledger::load(&ks).unwrap();
+        ledger.record(dir, None, i64::MAX);
+        ledger.save(&ks).unwrap();
+        crate::admin::service::directory_add(&ks, dir, Ttl::default()).unwrap();
+        ks
+    }
+
     #[test]
     fn an_edit_signs_the_next_policy() {
-        let ks = admin();
+        let ks = admin_with_a_directory();
         let a = SettingsArgs {
             freshness: Some(Freshness::Strict),
             beat_secs: Some(60),
@@ -186,5 +197,13 @@ mod tests {
         ] {
             assert!(settings_in(&ks, &a).is_err(), "{a:?}");
         }
+        // Strict with no directory: nothing could vouch for the policy.
+        let strict = SettingsArgs {
+            freshness: Some(Freshness::Strict),
+            ..SettingsArgs::default()
+        };
+        let err = format!("{:#}", settings_in(&ks, &strict).unwrap_err());
+        assert!(err.contains("wires directory add"), "{err}");
+        assert!(settings_in(&admin_with_a_directory(), &strict).is_ok());
     }
 }

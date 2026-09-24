@@ -867,6 +867,28 @@ mod tests {
         assert!(directory_rm(&ks, dir, ttl()).is_err(), "not listed");
     }
 
+    /// Under strict freshness the last directory can't go: nothing would
+    /// vouch for the policy, and every host would refuse every call.
+    #[test]
+    fn the_last_directory_stays_under_strict_freshness() {
+        let (a, b) = (
+            NodeIdentity::generate().node_id(),
+            NodeIdentity::generate().node_id(),
+        );
+        let ks = admin_with(&[a, b]);
+        directory_add(&ks, a, ttl()).unwrap();
+        directory_add(&ks, b, ttl()).unwrap();
+        edit_policy(&ks, ttl(), |p| {
+            p.settings.freshness = library::FreshnessMode::Strict;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(directory_rm(&ks, a, ttl()).unwrap().directories(), &[b]);
+        let err = format!("{:#}", directory_rm(&ks, b, ttl()).unwrap_err());
+        assert!(err.contains("freshness is strict"), "{err}");
+        assert!(err.contains("wires directory add"), "{err}");
+    }
+
     #[test]
     fn matchers_parse_like_card_13() {
         let m = parse_matcher("*@example.com", GOOGLE_ISSUER).unwrap();
