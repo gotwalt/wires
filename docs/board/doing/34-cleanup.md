@@ -850,3 +850,105 @@ Left: `e2e/records.rs` keeps `call_log::start(opened, None, false)` (lane
 HOST's §B2 changes that signature; the integrator reconciles it). The RFC 7636
 vector inlined in `e2e/gateway.rs` stays (§A12 lists it with the caller's
 PKCE tests). The sync tests' internal `Fabric` fixture name stays (internal).
+### Lane HOST
+
+`wires/host/**` (not `native.rs`, `embed.rs`, `service.rs`, `serve_until`,
+or the `TaskProcess`/`in_process` helpers). Every rewritten test was seen
+red against a deliberately broken implementation (listed per test below),
+then green.
+
+Deleted tests:
+
+- `audit.rs` `an_untallied_stdin_tap_records_nothing`: asserted nothing; a
+  `StdinTap` with no audit holds no state to check.
+- `serve.rs`, the loop over `--expose`, `--audit-topic`, `--peer`,
+  `--roster-head`, `--inclusion-proof` and `-- cat` (§A3): clap rejects
+  unknown flags anyway. The test is now `serve_takes_host_json_and_its_flags`.
+- `call_log.rs` `the_tee_logs_exports_and_forwards` and
+  `the_log_is_kept_without_a_channel_or_exporter`: they tested the channel
+  forwarding (§B2), which is gone; replaced by `the_tee_logs_and_exports`
+  (red with the export dropped) and `the_log_is_kept_without_an_exporter`.
+
+Rewritten tests (and the break that turned each red):
+
+- §A7 `capability.rs` `only_the_exact_caller_id_is_admitted`: known answers
+  (the id in either case admitted, a random string not) instead of the
+  implementation's formula. Red with `to != grant.caller.hex()`.
+- §A8 `gate.rs` `the_gate_never_widens_the_registry`: asserts that an
+  admitted caller is in every `also_require` role (and `status`, which any
+  staff may call, now carries the same `also_require`, so the rule has
+  something to narrow). Red with `all` → `any`.
+- §A9 `transport.rs` `child_is_killed_when_the_dialer_vanishes`: the child
+  writes its pid; the test waits for it, checks it is alive, drops the
+  dialer, and checks `kill(pid, 0)` fails after the session returns. Red
+  with the bridge returning at shutdown without killing.
+- §A9 `config.rs` `validation_rules`: every case asserts its own error text
+  (plus the missing-version, empty/duplicate-issuer and no-audience rules).
+  Red with the duplicate-issuer check off.
+- §A9 `push.rs` `the_queue_survives_a_round_trip_through_its_file`: through
+  `persisted_queue` and `save` (and the file's `0600`). Red with `save`
+  skipping an existing file.
+- §A13 `otlp.rs` `one_record_per_entry_in_order` (was `one_record_per_entry`
+  over up to three hosts): one host's chain, one resource naming it, records
+  in order. Red with the records reversed.
+- `identity.rs` `each_state_of_a_node` (it read `Lookup::Unverified`): now
+  checks that a failing token marks the node as seen with no principal. Red
+  with failures not recorded.
+
+Done:
+
+- §B2: `call_log::start(log, exporter)` → `(AuditSink, JoinHandle)`; no
+  `channel` flag, receiver, forwarding branch or per-record clone.
+- §B5: `record_stream::authorize` uses `ServicesHost::check_member`; its
+  `NOT_ADMITTED` alias is gone (callers use `gate::NOT_ADMITTED`);
+  `serve`'s `preauth` is a plain permit; `last_seq` lost its `.max(1)`.
+  **(bug)** `View::items` returns `Result` and a hidden entry that can't be
+  hashed fails the stream instead of leaving a silent gap. One
+  `gate::HOST_MISCONFIGURED` ("responder configuration error"; the text is
+  unchanged, protocol.md and an e2e test quote it). `dial_opened(_with)`
+  take `target: NodeId`; the mid-stream `Denied` arm is gone.
+  `validate_fields` lost its second version check. `otlp::request` builds one
+  resource (an exporter carries one host's log); the per-record summary is
+  gone. `identity.rs`: `Known.failure`, `Lookup` and `IdpTrust.issuers`
+  (now `issuers()`, from `by_issuer`) are gone. `gate.rs`: the no-op
+  `dedup`. `capability.rs`: `Grant.service` (and `mint`'s `service`
+  argument); the redundant `len() == 64` check. `push.rs`: the duplicate-id
+  check, `PushHost.me`; `authorize` is private and returns
+  `gate::PushRefusal { NotAMember, Refused }` (so `decide_push` does too),
+  and the `roster` bindings are gone. Private now: `control.rs` `RUN_DIR`,
+  `SUN_PATH_BYTES`, `ControlSocket::serve`, `effective_uid`; `push.rs`
+  `authorize`, `deliver_direct`, `sweep`; `config.rs` `validate`.
+  `serde(default)` dropped from `Option` fields in `config.rs`, `push.rs`
+  and `record_stream.rs`.
+- §C3: `transport::ALPN` is `wires/session/1` (nothing but protocol.md §5
+  named `/3`; updated), with no channel-era note.
+- §C4: `Denied` derives `thiserror::Error`; "a self-hosted iroh relay".
+- §C5/C6/C7: "The call gate"; "two `serve`s on one keystore" for the
+  sequence allocators; the "membership rejected: revoked" examples, "fabric
+  member", "root-vouched" and "fabric" in host prose and `serve --help` are
+  gone; "responder" → "host" in host prose and in two dialer errors (the
+  user-facing "denied by responder" stays: `lib.rs`, `mcp.rs` and the docs
+  are other lanes'). `call_log.rs`'s "chosen over redb (card 25)" history is
+  gone. `member` as a sample role (§A4) is replaced in `capability.rs`,
+  `control.rs` and `config.rs`.
+- §D1 (`record_stream` in the `host/mod.rs` index), §D2 (the banners in
+  `control.rs`, `push.rs`, `transport.rs`; the mid-module `use` in
+  `transport.rs`'s tests), §D3 (no `cargo doc --document-private-items`
+  warning left in `wires/host`).
+
+Follow-through outside `wires/host`: `wires/Cargo.toml` gains
+`thiserror = { workspace = true }` (and `Cargo.lock` the edge);
+`wires/e2e/records.rs` calls `call_log::start(opened, None)` and imports
+`gate::NOT_ADMITTED`; `docs/protocol.md` §5 names `wires/session/1`;
+`serve_until` gets the one-line `call_log::start` change.
+
+Left:
+
+- `serve.rs` `Binding::Endpoint` keeps its `cfg_attr(not(test),
+  allow(dead_code))`: making it `#[cfg(test)]` needs `#[cfg(test)]` on two
+  match arms in `serve_until` (the card-33 lane's).
+- The optional `PushGrants` → `PushCapabilities` rename: it touches
+  `serve_until` too.
+- The append in `call_log::tee` still clones the record once: `Pending`'s
+  answer channel is private to `transport.rs`, so splitting it would add a
+  type for one clone per `fsync`.

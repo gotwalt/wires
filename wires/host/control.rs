@@ -61,7 +61,7 @@ use crate::host::push::{PushCommand, PushReport, PushSpec};
 use crate::host::transport::truncate_reason;
 
 /// The directory under the wires home that holds control sockets.
-pub const RUN_DIR: &str = "run";
+const RUN_DIR: &str = "run";
 
 /// The most bytes one NDJSON request line may occupy (a line is read into
 /// memory before it can be parsed, so an unbounded reader is a local memory
@@ -82,7 +82,7 @@ pub fn run_dir(home: &Path) -> PathBuf {
 
 /// The size of `sockaddr_un::sun_path`, NUL terminator included: 104 bytes on
 /// macOS (and the BSDs), 108 on Linux.
-pub const SUN_PATH_BYTES: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
+const SUN_PATH_BYTES: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
 
 /// Whether `path` can be bound as a unix socket (it leaves room for the NUL).
 pub fn fits_sockaddr(path: &Path) -> bool {
@@ -108,10 +108,6 @@ pub fn short_socket_path(full: &Path, uid: u32, bases: &[PathBuf]) -> Option<Pat
         .map(|base| base.join(format!("wires-{uid}")).join(&name))
         .find(|path| fits_sockaddr(path))
 }
-
-// ---------------------------------------------------------------------------
-// The wire protocol
-// ---------------------------------------------------------------------------
 
 /// One request from `wires push` to the running `serve`: externally tagged,
 /// `{"push":{…}}`, which leaves room for later operations.
@@ -158,10 +154,6 @@ pub enum Response {
     Err(String),
 }
 
-// ---------------------------------------------------------------------------
-// Server side (owned by `wires serve`)
-// ---------------------------------------------------------------------------
-
 /// A bound control socket, unlinked when dropped.
 #[derive(Debug)]
 pub struct ControlSocket {
@@ -205,7 +197,7 @@ impl ControlSocket {
     /// Accept connections forever, handing every push `authority` allows to
     /// `push`. One task per connection, so a client that says nothing cannot
     /// wedge the others.
-    pub async fn serve(self, push: mpsc::Sender<PushCommand>, authority: Authority) {
+    async fn serve(self, push: mpsc::Sender<PushCommand>, authority: Authority) {
         loop {
             match self.listener.accept().await {
                 Ok((stream, _)) => {
@@ -363,10 +355,6 @@ async fn read_capped_line<R: AsyncBufRead + Unpin>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Client side (owned by `wires push`)
-// ---------------------------------------------------------------------------
-
 /// A connection to a running `serve`'s control socket.
 #[derive(Debug)]
 pub struct ControlClient {
@@ -482,16 +470,13 @@ impl ControlClient {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Small unix helpers
-// ---------------------------------------------------------------------------
-
 /// Is something listening on the socket at `path`?
 ///
 /// The stale-socket probe. A successful connect means yes; `ECONNREFUSED` (and
 /// `ENOENT`, racing with a removal) means no. Any other error is treated as
 /// "yes" — refusing to start is the safe answer when the answer is unknown,
-/// because the failure mode of guessing wrong is two sequence allocators.
+/// because guessing wrong puts two `serve`s on one keystore, both appending
+/// to its call log and push queue.
 async fn is_live(path: &Path) -> bool {
     match UnixStream::connect(path).await {
         Ok(_) => true,
@@ -531,7 +516,7 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
 
 /// This process's effective uid (`geteuid()`); `0` off unix, where no
 /// directory has an owner to check.
-pub(crate) fn effective_uid() -> u32 {
+fn effective_uid() -> u32 {
     #[cfg(unix)]
     {
         // SAFETY: geteuid(2) has no preconditions and cannot fail.
@@ -599,8 +584,8 @@ mod tests {
         let err = serde_json::to_string(&Response::Err("no".into())).unwrap();
         assert_eq!(err, r#"{"err":"no"}"#);
         let req: Request =
-            serde_json::from_str(r#"{"push":{"to":"member","subject":"s","body":"b"}}"#).unwrap();
-        assert!(matches!(req, Request::Push(spec) if spec.to == "member"));
+            serde_json::from_str(r#"{"push":{"to":"analyst","subject":"s","body":"b"}}"#).unwrap();
+        assert!(matches!(req, Request::Push(spec) if spec.to == "analyst"));
     }
 
     #[tokio::test]
@@ -679,11 +664,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_child_socket_takes_only_a_live_token_to_its_caller() {
-        use library::{NodeIdentity, ServiceName};
+        use library::NodeIdentity;
         let caps = std::sync::Arc::new(Capabilities::default());
         let alice = NodeIdentity::from_seed([2; 32]).node_id();
         let bob = NodeIdentity::from_seed([3; 32]).node_id();
-        let cap = caps.mint(alice, ServiceName::new("deploy").unwrap());
+        let cap = caps.mint(alice);
         let call = library::CallId::generate();
         cap.bind_call(call);
         let token = cap.token().hex();

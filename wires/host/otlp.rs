@@ -9,7 +9,7 @@
 //! Each record's **body** is the signed [`LogEntry`] itself, as JSON, so the
 //! record stays verifiable in the SIEM by anyone holding the host's public
 //! key. Its **attributes** make it queryable (each only when the record
-//! carries it: a `finished` record has no caller or tool, and pairs with its
+//! carries it: a `finished` record has no caller or service, and pairs with its
 //! `started` by `wires.call.id`):
 //!
 //! | attribute | from |
@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
-use library::{AuditRecord, LogEntry, NodeId, Principal};
+use library::{AuditRecord, LogEntry, Principal};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -124,7 +124,7 @@ impl Exporter {
     }
 
     /// How many entries have been dropped so far (the warning logs it too).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -151,33 +151,22 @@ pub async fn run(mut rx: mpsc::Receiver<LogEntry>, url: Url, http: reqwest::Clie
     }
 }
 
-/// An OTLP `ExportLogsServiceRequest` (JSON encoding) for `entries`, grouped
-/// under one resource per host.
+/// An OTLP `ExportLogsServiceRequest` (JSON encoding) for `entries`, in
+/// order, under one resource: an exporter carries one host's log, so the
+/// host is the first entry's.
 pub fn request(entries: &[LogEntry]) -> Value {
-    let mut hosts: Vec<NodeId> = entries.iter().map(|e| e.host).collect();
-    hosts.sort();
-    hosts.dedup();
-    let resource_logs: Vec<Value> = hosts
-        .into_iter()
-        .map(|host| {
-            let records: Vec<Value> = entries
-                .iter()
-                .filter(|e| e.host == host)
-                .map(log_record)
-                .collect();
-            json!({
-                "resource": { "attributes": [
-                    kv("service.name", string("wires-host")),
-                    kv("wires.host.node", string(host.hex())),
-                ]},
-                "scopeLogs": [{
-                    "scope": { "name": SCOPE, "version": env!("CARGO_PKG_VERSION") },
-                    "logRecords": records,
-                }],
-            })
-        })
-        .collect();
-    json!({ "resourceLogs": resource_logs })
+    let mut resource = vec![kv("service.name", string("wires-host"))];
+    if let Some(first) = entries.first() {
+        resource.push(kv("wires.host.node", string(first.host.hex())));
+    }
+    let records: Vec<Value> = entries.iter().map(log_record).collect();
+    json!({ "resourceLogs": [{
+        "resource": { "attributes": resource },
+        "scopeLogs": [{
+            "scope": { "name": SCOPE, "version": env!("CARGO_PKG_VERSION") },
+            "logRecords": records,
+        }],
+    }]})
 }
 
 /// One entry as an OTLP `LogRecord`. See the module docs for the attributes.
@@ -191,7 +180,7 @@ pub fn log_record(entry: &LogEntry) -> Value {
     if let Ok(hash) = entry.hash() {
         attrs.push(kv("wires.record.hash", string(hash.hex())));
     }
-    let (kind, summary, warn) = match &entry.record {
+    let (kind, warn) = match &entry.record {
         AuditRecord::Started {
             call,
             caller,
@@ -211,7 +200,7 @@ pub fn log_record(entry: &LogEntry) -> Value {
                 "wires.argv",
                 json!({ "arrayValue": { "values": args } }),
             ));
-            ("started", format!("call started: {service}"), false)
+            ("started", false)
         }
         AuditRecord::Finished {
             call,
@@ -226,11 +215,7 @@ pub fn log_record(entry: &LogEntry) -> Value {
             attrs.push(kv("wires.duration_ms", int(*duration_ms as i64)));
             attrs.push(kv("wires.stdout.digest", string(stdout_digest.hex())));
             attrs.push(kv("wires.stdout.bytes", int(*stdout_bytes as i64)));
-            (
-                "finished",
-                format!("call finished: exit {exit}"),
-                *exit != 0,
-            )
+            ("finished", *exit != 0)
         }
         AuditRecord::Denied {
             caller,
@@ -243,7 +228,7 @@ pub fn log_record(entry: &LogEntry) -> Value {
                 attrs.push(kv("wires.service", string(service.as_str())));
             }
             attrs.push(kv("wires.denied.reason", string(reason)));
-            ("denied", format!("call denied: {reason}"), true)
+            ("denied", true)
         }
         AuditRecord::Push {
             to,
@@ -261,7 +246,7 @@ pub fn log_record(entry: &LogEntry) -> Value {
             attrs.push(kv("wires.push.subject", string(subject.as_str())));
             attrs.push(kv("wires.push.outcome", string(outcome.as_str())));
             let warn = matches!(outcome, library::PushOutcome::Denied);
-            ("push", format!("push {}", outcome.as_str()), warn)
+            ("push", warn)
         }
     };
     attrs.insert(0, kv("wires.record.kind", string(kind)));
@@ -269,7 +254,8 @@ pub fn log_record(entry: &LogEntry) -> Value {
         .saturating_mul(1_000_000)
         .to_string();
     let (severity, severity_text) = if warn { (13, "WARN") } else { (9, "INFO") };
-    let body = serde_json::to_string(entry).unwrap_or(summary);
+    // A `LogEntry` is plain JSON (string keys only): it always serializes.
+    let body = serde_json::to_string(entry).unwrap_or_default();
     json!({
         "timeUnixNano": nanos,
         "observedTimeUnixNano": nanos,
@@ -310,7 +296,7 @@ fn int(n: i64) -> Value {
 mod tests {
     use super::*;
     use crate::caller::login::{read_request, write_response};
-    use library::{Argv, CallId, NodeIdentity, OutputHasher, ServiceName};
+    use library::{Argv, CallId, NodeId, NodeIdentity, OutputHasher, ServiceName};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -577,37 +563,31 @@ mod tests {
     }
 
     proptest! {
-        /// Every entry becomes exactly one log record, under its host's
-        /// resource, whatever the mix of hosts.
+        /// Every entry of a host's log becomes exactly one log record, in
+        /// order, under the one resource that names the host.
         #[test]
-        fn one_record_per_entry(hosts in proptest::collection::vec(0u8..3, 0..12)) {
-            let mut tips = [None; 3];
-            let entries: Vec<LogEntry> = hosts
-                .iter()
-                .map(|h| {
-                    let id = NodeIdentity::from_seed([*h + 20; 32]);
-                    let e = LogEntry::next(&id, tips[*h as usize], 1, finished()).unwrap();
-                    tips[*h as usize] = Some(e.point().unwrap());
-                    e
-                })
-                .collect();
+        fn one_record_per_entry_in_order(n in 1usize..12) {
+            let h = host();
+            let mut entries: Vec<LogEntry> = Vec::new();
+            for i in 0..n {
+                let tip = entries.last().map(|e| e.point().unwrap());
+                entries.push(LogEntry::next(&h, tip, i as i64, finished()).unwrap());
+            }
             let req = request(&entries);
             let resources = req["resourceLogs"].as_array().unwrap();
-            let mut distinct = hosts.clone();
-            distinct.sort();
-            distinct.dedup();
-            prop_assert_eq!(resources.len(), distinct.len());
-            let total: usize = resources
+            prop_assert_eq!(resources.len(), 1);
+            prop_assert_eq!(
+                &attributes(&resources[0]["resource"])["wires.host.node"]["stringValue"],
+                &json!(h.node_id().hex())
+            );
+            let seqs: Vec<Value> = resources[0]["scopeLogs"][0]["logRecords"]
+                .as_array()
+                .unwrap()
                 .iter()
-                .map(|r| r["scopeLogs"][0]["logRecords"].as_array().unwrap().len())
-                .sum();
-            prop_assert_eq!(total, entries.len());
-            for r in resources {
-                let host = attributes(&r["resource"])["wires.host.node"]["stringValue"].clone();
-                for rec in r["scopeLogs"][0]["logRecords"].as_array().unwrap() {
-                    prop_assert_eq!(&attributes(rec)["wires.host.node"]["stringValue"], &host);
-                }
-            }
+                .map(|r| attributes(r)["wires.record.seq"]["intValue"].clone())
+                .collect();
+            let want: Vec<Value> = (0..n).map(|i| json!(i.to_string())).collect();
+            prop_assert_eq!(seqs, want);
         }
     }
 }

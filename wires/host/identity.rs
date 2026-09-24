@@ -5,11 +5,11 @@
 //! Principal`. It is fed every ID token a caller presents in person: in the
 //! session [`Hello`](library::Hello) of a call, and in the inbox
 //! [`Hello`](library::InboxFrame::Hello) of a fetch. Each one is verified
-//! here with card 04's [`KeyFetcher`](crate::caller::jwks::KeyFetcher) under
+//! here with card 04's [`KeyFetcher`] under
 //! the host's own trusted issuers ([`IdpTrust`], from `host.json`). The iroh
 //! connection authenticated the presenting key, and the token's OIDC nonce
 //! binds it to that key, so a token for someone else's key never verifies.
-//! A token that fails is logged and never displaces a principal that
+//! A token that fails is traced and never displaces a principal that
 //! verified.
 //!
 //! Nothing is broadcast: a host knows the identities of the callers that
@@ -30,20 +30,21 @@ pub(crate) type Verdict = Result<Principal, VerifyError>;
 /// audiences (`host.json` `identity.issuers`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IdpTrust {
-    /// Issuers whose keys this host will fetch and trust.
-    pub issuers: Vec<Issuer>,
-    /// Accepted `aud` values per issuer. An audience accepted from one issuer
-    /// is not accepted from another.
-    pub by_issuer: Vec<(Issuer, Vec<Audience>)>,
+    /// The issuers whose keys this host will fetch and trust, each with the
+    /// `aud` values it accepts from that issuer. An audience accepted from
+    /// one issuer is not accepted from another.
+    by_issuer: Vec<(Issuer, Vec<Audience>)>,
 }
 
 impl IdpTrust {
     /// Exactly these issuers, each with its own accepted audiences.
     pub(crate) fn per_issuer(issuers: Vec<(Issuer, Vec<Audience>)>) -> Self {
-        Self {
-            issuers: issuers.iter().map(|(iss, _)| iss.clone()).collect(),
-            by_issuer: issuers,
-        }
+        Self { by_issuer: issuers }
+    }
+
+    /// The trusted issuers, in the order `host.json` lists them.
+    pub(crate) fn issuers(&self) -> Vec<Issuer> {
+        self.by_issuer.iter().map(|(iss, _)| iss.clone()).collect()
     }
 
     /// The audiences accepted from `issuer` (none from an untrusted one).
@@ -64,26 +65,6 @@ impl IdpTrust {
     }
 }
 
-/// What the index holds for one node.
-#[derive(Clone, Debug, Default)]
-struct Known {
-    /// The verified principal with the latest `exp` (possibly stale by now).
-    principal: Option<Principal>,
-    /// Why the most recent failing token failed.
-    failure: Option<String>,
-}
-
-/// What the index says about a node.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Lookup {
-    /// No token from it has been seen.
-    Unknown,
-    /// Tokens were seen, none verified; the latest failure's reason.
-    Unverified(String),
-    /// A verified principal (check [`is_fresh`] before trusting it now).
-    Known(Principal),
-}
-
 /// Whether `p` is still within its token's lifetime at `now` (with the same
 /// skew allowance [`library::verify_claim`] uses).
 pub(crate) fn is_fresh(p: &Principal, now: i64) -> bool {
@@ -96,8 +77,9 @@ pub(crate) struct Identities {
     fetcher: KeyFetcher,
     /// Which issuers and audiences this host accepts.
     trust: IdpTrust,
-    /// What is known per node.
-    known: Mutex<HashMap<NodeId, Known>>,
+    /// Every node a token has been seen from, with the verified principal
+    /// of the latest `exp` (possibly stale by now), if any verified.
+    known: Mutex<HashMap<NodeId, Option<Principal>>>,
 }
 
 impl std::fmt::Debug for Identities {
@@ -135,7 +117,7 @@ impl Identities {
             .fetcher
             .verify(
                 &claim,
-                &self.trust.issuers,
+                &self.trust.issuers(),
                 self.trust.audiences_for_claim(&claim),
                 now,
             )
@@ -148,26 +130,19 @@ impl Identities {
     ///
     /// A verified principal (fresh or expired) replaces the held one when its
     /// `exp` is at least as late — re-logins win, and replaying an old token
-    /// cannot roll a node back to an older identity. A failure is remembered
-    /// only as the reason to give while nothing has verified.
+    /// cannot roll a node back to an older identity. A failure is traced,
+    /// and only notes that the node presented a token.
     pub(crate) fn record(&self, node: NodeId, verdict: &Verdict) {
         let mut known = self.known.lock().expect("identity index poisoned");
-        let entry = known.entry(node).or_default();
+        let held = known.entry(node).or_default();
         match verdict {
             Ok(p) | Err(VerifyError::Expired(p)) => {
-                if entry
-                    .principal
-                    .as_ref()
-                    .is_none_or(|held| p.not_after >= held.not_after)
-                {
+                if held.as_ref().is_none_or(|h| p.not_after >= h.not_after) {
                     tracing::info!(node = %node.hex(), who = %p.name(), "identity verified");
-                    entry.principal = Some(p.clone());
+                    *held = Some(p.clone());
                 }
             }
-            Err(e) => {
-                tracing::warn!(node = %node.hex(), "ID token did not verify: {e}");
-                entry.failure = Some(e.to_string());
-            }
+            Err(e) => tracing::warn!(node = %node.hex(), "ID token did not verify: {e}"),
         }
     }
 
@@ -177,27 +152,15 @@ impl Identities {
         known.keys().copied().collect()
     }
 
-    /// What is known about `node`.
-    pub(crate) fn lookup(&self, node: NodeId) -> Lookup {
+    /// The principal `node` last verified as, fresh or not.
+    fn latest(&self, node: NodeId) -> Option<Principal> {
         let known = self.known.lock().expect("identity index poisoned");
-        match known.get(&node) {
-            None => Lookup::Unknown,
-            Some(Known {
-                principal: Some(p), ..
-            }) => Lookup::Known(p.clone()),
-            Some(Known {
-                failure: Some(why), ..
-            }) => Lookup::Unverified(why.clone()),
-            Some(_) => Lookup::Unknown,
-        }
+        known.get(&node).cloned().flatten()
     }
 
     /// `node`'s principal if one verified and is still fresh at `now`.
     pub(crate) fn current(&self, node: NodeId, now: i64) -> Option<Principal> {
-        match self.lookup(node) {
-            Lookup::Known(p) if is_fresh(&p, now) => Some(p),
-            _ => None,
-        }
+        self.latest(node).filter(|p| is_fresh(p, now))
     }
 }
 
@@ -236,14 +199,17 @@ mod tests {
     fn each_state_of_a_node() {
         let ids = index();
         let n = node(1);
-        assert_eq!(ids.lookup(n), Lookup::Unknown);
+        assert_eq!(ids.latest(n), None);
+        assert!(ids.nodes().is_empty());
         ids.record(
             n,
             &Err(VerifyError::Rejected(IdTokenError::WrongNonce {
                 node: n.hex(),
             })),
         );
-        assert!(matches!(ids.lookup(n), Lookup::Unverified(why) if why.contains("nonce")));
+        // Seen, but nobody verified.
+        assert_eq!(ids.latest(n), None);
+        assert_eq!(ids.nodes(), vec![n]);
         ids.record(n, &Ok(who("alice@example.com", 1_000)));
         assert_eq!(ids.current(n, 100), Some(who("alice@example.com", 1_000)));
         assert_eq!(ids.current(n, 1_000 + CLOCK_SKEW_SECS + 1), None);
@@ -257,11 +223,11 @@ mod tests {
         ids.record(n, &Ok(who("new@example.com", 200)));
         ids.record(n, &Ok(who("old@example.com", 100)));
         ids.record(n, &Err(VerifyError::Unavailable("down".into())));
-        assert_eq!(ids.lookup(n), Lookup::Known(who("new@example.com", 200)));
+        assert_eq!(ids.latest(n), Some(who("new@example.com", 200)));
         // An expired verdict still names who the node was.
         ids.record(n, &Err(VerifyError::Expired(who("later@example.com", 300))));
-        assert_eq!(ids.lookup(n), Lookup::Known(who("later@example.com", 300)));
-        assert_eq!(ids.lookup(node(6)), Lookup::Unknown);
+        assert_eq!(ids.latest(n), Some(who("later@example.com", 300)));
+        assert_eq!(ids.latest(node(6)), None);
     }
 
     #[test]
@@ -271,7 +237,7 @@ mod tests {
             (Issuer::new("https://b"), vec![Audience::new("y")]),
         ]);
         assert_eq!(
-            t.issuers,
+            t.issuers(),
             ["https://a", "https://b"].map(Issuer::new).to_vec()
         );
         assert_eq!(

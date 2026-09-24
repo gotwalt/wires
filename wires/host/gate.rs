@@ -1,5 +1,4 @@
-//! The services-era call gate (card 27, lane **27c**): what a host checks on
-//! every [`Hello`](library::Hello) + [`Invoke`](library::Frame::Invoke),
+//! The call gate: what a host checks on every [`Hello`](library::Hello) + [`Invoke`](library::Frame::Invoke),
 //! in order, the first failure being the refusal the caller hears:
 //!
 //! 1. the caller is a member of the host's signed state (removal is
@@ -56,6 +55,29 @@ pub(crate) const TOKEN_UNVERIFIED: &str = "your ID token could not be verified; 
 /// The exact failure goes only to the host's trace.
 pub(crate) const IDP_UNREACHABLE: &str =
     "the identity provider is unreachable from this host; try again later";
+
+/// What a peer hears when this host can't decide at all (no readable signed
+/// state, or one older than it already decided under): the operator's
+/// problem, not the peer's. The cause goes only to the host's trace.
+pub(crate) const HOST_MISCONFIGURED: &str = "responder configuration error";
+
+/// Why [`ServicesHost::decide_push`] refused a recipient. `Display` is the
+/// reason recorded and reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PushRefusal {
+    /// Not a member of the current signed state: what is queued for it goes.
+    NotAMember(String),
+    /// A member the push rule refuses, or a host that can't decide now.
+    Refused(String),
+}
+
+impl fmt::Display for PushRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PushRefusal::NotAMember(why) | PushRefusal::Refused(why) => f.write_str(why),
+        }
+    }
+}
 
 /// A call the gate admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,7 +250,7 @@ pub(crate) enum Implementation<'a> {
 pub(crate) struct ServicesHost {
     /// This host.
     pub(crate) me: NodeId,
-    /// The fabric root whose signed state and memberships are honored.
+    /// The network root whose signed state and memberships are honored.
     pub(crate) trust_root: NodeId,
     /// The host's own membership, presented in the `HelloAck`.
     pub(crate) membership: Membership,
@@ -344,7 +366,7 @@ impl ServicesHost {
     }
 
     /// Whether `caller`, presenting `membership`, is a member of `state`:
-    /// the credential is the fabric root's for this very key and current at
+    /// the credential is the network root's for this very key and current at
     /// `now`, and the state lists the key. Checked before anything that
     /// costs this host (a token verification, a JWKS fetch, a call-log
     /// entry). `Err` is the exact reason, for this host's trace only; the
@@ -441,35 +463,28 @@ impl ServicesHost {
 
     /// Whether `node` may receive pushes from this host at `now`: a member of
     /// the current signed state, in the first `push.allow` role that admits
-    /// it (with the principal it last verified as here). `Err` is the reason
-    /// and whether it is membership (not the push rule) that refused.
+    /// it (with the principal it last verified as here).
     pub(crate) fn decide_push(
         &self,
         node: NodeId,
         now: i64,
-    ) -> std::result::Result<(Option<Principal>, RoleName), (String, bool)> {
+    ) -> std::result::Result<(Option<Principal>, RoleName), PushRefusal> {
         let state = self.state().map_err(|e| {
             tracing::warn!("signed state unusable: {e:#}");
-            ("responder configuration error".to_string(), false)
+            PushRefusal::Refused(HOST_MISCONFIGURED.to_string())
         })?;
         if let Err(e) = state.check_fresh(now) {
-            return Err((
-                format!(
-                    "this host's signed state (version {}) is not fresh ({e})",
-                    state.state.version.0
-                ),
-                false,
-            ));
+            return Err(PushRefusal::Refused(format!(
+                "this host's signed state (version {}) is not fresh ({e})",
+                state.state.version.0
+            )));
         }
         if !state.state.is_member(node) {
-            return Err((
-                format!(
-                    "{} is not a member of the current signed state (version {})",
-                    node.short(),
-                    state.state.version.0
-                ),
-                true,
-            ));
+            return Err(PushRefusal::NotAMember(format!(
+                "{} is not a member of the current signed state (version {})",
+                node.short(),
+                state.state.version.0
+            )));
         }
         let allow = self
             .config
@@ -478,9 +493,8 @@ impl ServicesHost {
             .map(|p| p.allow.as_slice())
             .unwrap_or_default();
         if allow.is_empty() {
-            return Err((
+            return Err(PushRefusal::Refused(
                 "this host's host.json `push.allow` is empty: it pushes to no one".to_string(),
-                false,
             ));
         }
         let principal = self.identities.current(node, now);
@@ -495,19 +509,16 @@ impl ServicesHost {
             .map(RoleName::as_str)
             .collect::<Vec<_>>()
             .join(", ");
-        Err((
-            match &principal {
-                Some(p) => format!(
-                    "{} is in no role allowed to receive pushes ({roles})",
-                    p.name()
-                ),
-                None => format!(
-                    "receiving pushes needs a verified identity in role {roles} (call this host \
-                     after `wires login`)"
-                ),
-            },
-            false,
-        ))
+        Err(PushRefusal::Refused(match &principal {
+            Some(p) => format!(
+                "{} is in no role allowed to receive pushes ({roles})",
+                p.name()
+            ),
+            None => format!(
+                "receiving pushes needs a verified identity in role {roles} (call this host after \
+                 `wires login`)"
+            ),
+        }))
     }
 
     /// The members `role` names at `now` (never this host): every member
@@ -527,7 +538,6 @@ impl ServicesHost {
             .collect();
         nodes.retain(|n| *n != self.me);
         nodes.sort();
-        nodes.dedup();
         nodes
     }
 }
@@ -703,8 +713,9 @@ mod tests {
 
     proptest! {
         /// The host never admits more than the registry: whatever
-        /// `also_require` says, an admission implies `authorize` admitted
-        /// with the same role.
+        /// `also_require` says, an admitted caller is one `authorize`
+        /// admits, is in **every** `also_require` role, and was decided
+        /// under a fresh state.
         #[test]
         fn the_gate_never_widens_the_registry(
             caller in 1u8..6,
@@ -717,17 +728,22 @@ mod tests {
         ) {
             let (s, _) = strict();
             let also: Vec<String> = also.iter().map(|r| format!("{r:?}")).collect();
+            // The same `also_require` on both services: `status` admits any
+            // verified staff, so it is where the host's rule has to narrow.
+            let also = also.join(",");
             let cfg = HostConfig::parse(&format!(
-                r#"{{"version":2,"services":{{"orders-db":{{"command":["true"],"also_require":[{}]}}}}}}"#,
-                also.join(",")
+                r#"{{"version":2,"services":{{
+                    "orders-db":{{"command":["true"],"also_require":[{also}]}},
+                    "status":{{"command":["true"],"also_require":[{also}]}}}}}}"#
             )).unwrap();
             let p = email.map(who);
             let svc = name(service);
-            if let Ok(ok) = admit(&s, &cfg, node(3), node(caller), p.as_ref(), &svc, now) {
-                prop_assert_eq!(
-                    authorize(&s.state, node(caller), p.as_ref(), &svc),
-                    Ok(ok.role)
-                );
+            if admit(&s, &cfg, node(3), node(caller), p.as_ref(), &svc, now).is_ok() {
+                prop_assert!(authorize(&s.state, node(caller), p.as_ref(), &svc).is_ok());
+                let required = cfg.services.get(&svc).map(|i| i.also_require.clone());
+                for r in required.unwrap_or_default() {
+                    prop_assert!(role_admits(&s.state, &r, p.as_ref()), "not in {}", r);
+                }
                 prop_assert!(s.check_fresh(now).is_ok());
             }
         }

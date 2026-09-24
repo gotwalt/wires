@@ -9,14 +9,11 @@
 //! only then may a call's child be spawned (see
 //! [`audit`](crate::host::audit)). A failed append is cut back off the file
 //! (to the last logged entry) before the next append, so a half-written line
-//! never ends up in the middle of the chain. A plain file fits because:
+//! never ends up in the middle of the chain.
 //!
-//! - the data *is* an append-only sequence read front to back (a subscriber
-//!   asks for "everything after seq N"), which a file does natively;
-//! - the entries are self-verifying, so the store needs no transactional
-//!   integrity of its own: [`CallLog::open`] re-verifies the whole chain, and
-//!   a flipped byte anywhere is caught there (and by any reader);
-//! - it is inspectable with `jq`, and needs no database dependency.
+//! The entries are self-verifying, so the file needs no transactional
+//! integrity of its own: [`CallLog::open`] re-verifies the whole chain, and a
+//! flipped byte anywhere is caught there (and by any reader).
 //!
 //! A torn final line (a crash mid-append) is truncated on open with a warning:
 //! it was never fsync'd, so it was never logged. Anything else that doesn't
@@ -34,11 +31,9 @@
 //!
 //! [`start`] hands `serve` the [`AuditSink`] every session and push writes
 //! to, and runs a [`tee`] that appends each record to this log, answers the
-//! waiting session, offers the signed entry to the OTLP [`Exporter`] (when
-//! `host.json` has `audit.otlp`), and optionally passes the record on to one
-//! more receiver (`serve` passes none). Only the append is waited on; the
-//! exporter and the extra receiver are offered what was logged and never
-//! stall it.
+//! waiting session, and offers the signed entry to the OTLP [`Exporter`]
+//! (when `host.json` has `audit.otlp`). Only the append is waited on; the
+//! exporter is offered what was logged and never stalls it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
@@ -285,53 +280,31 @@ fn read_repairing(path: &Path) -> Result<Vec<LogEntry>> {
     Ok(entries)
 }
 
-/// Build the host's audit path: a sink for sessions and pushes, a [`tee`]
-/// running on a blocking thread, and — when `channel` is set — a receiver
-/// that gets every logged record too.
-pub fn start(
-    log: CallLog,
-    exporter: Option<Exporter>,
-    channel: bool,
-) -> (
-    AuditSink,
-    Option<mpsc::Receiver<AuditRecord>>,
-    JoinHandle<()>,
-) {
+/// Build the host's audit path: a sink for sessions and pushes, and a
+/// [`tee`] running on a blocking thread.
+pub fn start(log: CallLog, exporter: Option<Exporter>) -> (AuditSink, JoinHandle<()>) {
     tracing::info!(
         path = %log.path().display(),
         next = log.tip().map_or(0, |t| t.seq.0 + 1),
         "call log open"
     );
     let (sink, records) = AuditSink::log_queue(AUDIT_QUEUE);
-    let (to_channel, from_tee) = if channel {
-        let (tx, rx) = mpsc::channel(AUDIT_QUEUE);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-    let tee = tokio::task::spawn_blocking(move || tee(records, log, exporter, to_channel));
-    (sink, from_tee, tee)
+    let tee = tokio::task::spawn_blocking(move || tee(records, log, exporter));
+    (sink, tee)
 }
 
 /// Drain `records`: append each to `log`, tell its sender whether it was
-/// logged, then offer the signed entry to `exporter` and pass the record on
-/// to `channel`. Returns when every sink is gone.
+/// logged, then offer the signed entry to `exporter`. Returns when every
+/// sink is gone.
 ///
 /// Blocking (it `fsync`s): run it on a blocking thread. The sender is
 /// answered only after the `fsync`; a failed append is answered with the
 /// error (the sender decides what that means — see
-/// [`audit`](crate::host::audit)) and is not exported or forwarded. Never
-/// waits on the exporter or the channel — both are offered with `try_send`
-/// and a full queue skips with a warning; the entry is in the log either
-/// way.
-pub fn tee(
-    mut records: mpsc::Receiver<Pending>,
-    mut log: CallLog,
-    exporter: Option<Exporter>,
-    mut channel: Option<mpsc::Sender<AuditRecord>>,
-) {
+/// [`audit`](crate::host::audit)) and is not exported. Never waits on the
+/// exporter: it is offered the entry with `try_send`, and a full queue skips
+/// with a warning; the entry is in the log either way.
+pub fn tee(mut records: mpsc::Receiver<Pending>, mut log: CallLog, exporter: Option<Exporter>) {
     while let Some(pending) = records.blocking_recv() {
-        let record = pending.record.clone();
         let entry = match log.append(pending.record.clone()) {
             Ok(entry) => entry,
             Err(e) => {
@@ -343,18 +316,6 @@ pub fn tee(
         pending.answer(Ok(()));
         if let Some(x) = &exporter {
             x.export(entry);
-        }
-        if let Some(tx) = &channel {
-            match tx.try_send(record) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!("audit record not forwarded: the channel queue is full")
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    tracing::warn!("the record receiver is gone; records stay in the call log");
-                    channel = None;
-                }
-            }
         }
     }
 }
@@ -508,40 +469,37 @@ mod tests {
         assert_eq!(verify(&path).unwrap(), log.tip());
     }
 
-    /// The tee logs every record, offers each entry to the exporter, and
-    /// passes every record to the channel in order.
+    /// The tee logs every record, in order, and offers each logged entry
+    /// to the exporter.
     #[tokio::test]
-    async fn the_tee_logs_exports_and_forwards() {
+    async fn the_tee_logs_and_exports() {
         let dir = crate::testutil::temp_dir();
         let path = dir.join(LOG_FILE);
         let (exporter, mut exported) = Exporter::channel(16);
-        let (sink, channel, tee) = start(open(&path), Some(exporter), true);
-        let mut channel = channel.unwrap();
+        let (sink, tee) = start(open(&path), Some(exporter));
         for n in 0..3 {
             sink.append(denied(n)).await.unwrap();
         }
         drop(sink);
         tee.await.unwrap();
-        let mut forwarded = Vec::new();
-        while let Some(r) = channel.recv().await {
-            forwarded.push(r);
-        }
-        assert_eq!(forwarded, [denied(0), denied(1), denied(2)]);
         let logged = read(&path).unwrap();
-        assert_eq!(logged.len(), 3);
+        assert_eq!(
+            logged.iter().map(|e| e.record.clone()).collect::<Vec<_>>(),
+            [denied(0), denied(1), denied(2)]
+        );
         for e in &logged {
             assert_eq!(exported.recv().await.as_ref(), Some(e));
         }
+        assert_eq!(exported.recv().await, None, "exported more than was logged");
         assert_eq!(verify(&path).unwrap().unwrap().seq, LogSeq(2));
     }
 
-    /// Without a channel the tee still logs; nothing is forwarded.
+    /// Without an exporter the tee still logs.
     #[tokio::test]
-    async fn the_log_is_kept_without_a_channel_or_exporter() {
+    async fn the_log_is_kept_without_an_exporter() {
         let dir = crate::testutil::temp_dir();
         let path = dir.join(LOG_FILE);
-        let (sink, channel, tee) = start(open(&path), None, false);
-        assert!(channel.is_none());
+        let (sink, tee) = start(open(&path), None);
         sink.append(denied(1)).await.unwrap();
         drop(sink);
         tee.await.unwrap();
@@ -570,8 +528,7 @@ mod tests {
     }
 
     /// Through the tee: a record the log can't take is answered with the
-    /// error (so a call's `Started` refuses the call), and is neither
-    /// exported nor forwarded.
+    /// error (so a call's `Started` refuses the call), and is not exported.
     #[tokio::test]
     async fn the_tee_answers_a_failed_append_with_the_error() {
         let dir = crate::testutil::temp_dir();
@@ -579,20 +536,18 @@ mod tests {
         let mut log = open(&path);
         log.break_for_test();
         let (exporter, mut exported) = Exporter::channel(16);
-        let (sink, channel, tee) = start(log, Some(exporter), true);
-        let mut channel = channel.unwrap();
+        let (sink, tee) = start(log, Some(exporter));
         let e = sink.append(denied(1)).await.unwrap_err();
         assert!(e.to_string().contains("appending to"), "{e}");
-        // Writable again: the next record is logged, exported and forwarded.
+        // Writable again: the next record is logged and exported.
         sink.append(denied(2)).await.unwrap();
         drop(sink);
         tee.await.unwrap();
-        assert_eq!(channel.recv().await, Some(denied(2)));
-        assert_eq!(channel.recv().await, None);
         let logged = read(&path).unwrap();
         assert_eq!(logged.len(), 1);
         assert_eq!(logged[0].record, denied(2));
         assert_eq!(exported.recv().await.as_ref(), Some(&logged[0]));
+        assert_eq!(exported.recv().await, None, "a failed append was exported");
     }
 
     proptest! {

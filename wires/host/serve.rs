@@ -46,7 +46,7 @@ pub(crate) struct ServeArgs {
     /// Use a self-hosted relay at this URL instead of the n0 default.
     #[arg(long)]
     pub(crate) relay_url: Option<String>,
-    /// The host's own membership token: it names the fabric (the trust root)
+    /// The host's own membership token: it names the network (its root key)
     /// whose signed state decides every call, and is presented in the
     /// `HelloAck`. Falls back to `$WIRES_MEMBERSHIP`, then
     /// `--membership-file`, then the keystore (`membership.json`).
@@ -92,7 +92,7 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
 pub(crate) struct Serving {
     /// This host's node key.
     pub(crate) node: library::NodeIdentity,
-    /// Its membership, which names the fabric whose signed state decides.
+    /// Its membership, which names the network whose signed state decides.
     pub(crate) membership: library::Membership,
     /// Its keystore: the signed state, the call log, the push queue.
     pub(crate) keystore: Arc<keystore::Keystore>,
@@ -167,7 +167,7 @@ pub(crate) async fn serve_until(
         node.duplicate(),
         library::Retention::default(),
     )?;
-    let (sink, _, _tee) = call_log::start(log, exporter, false);
+    let (sink, _tee) = call_log::start(log, exporter);
     host.audit = Some(sink);
     // The push service's queue, made before the host is shared so native
     // services can reach it.
@@ -229,7 +229,7 @@ const ROOT_SEED: &str = "root.seed";
 /// ([`capability::ChildDir`]).
 ///
 /// Refuses an admin keystore (one holding `root.seed`): a host runs service
-/// children, and the fabric's root key must not sit beside them.
+/// children, and the network's root key must not sit beside them.
 pub(crate) fn services_host(
     me: NodeId,
     membership: library::Membership,
@@ -327,7 +327,7 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn serve_takes_host_json_and_nothing_else_decides() {
+    fn serve_takes_host_json_and_its_flags() {
         let parse = |args: &[&str]| Cli::try_parse_from(["wires", "serve"].iter().chain(args));
         let Command::Serve(a) = parse(&["host.json", "--check"]).unwrap().command else {
             panic!("expected serve");
@@ -336,18 +336,6 @@ mod tests {
         assert!(a.check);
         assert!(parse(&[]).is_err(), "host.json is required");
         assert!(parse(&["h.json", "--relay-url", "https://r.example"]).is_ok());
-        // The flag-based and channel-era forms are gone: host.json and the
-        // signed state are the only ones.
-        for gone in [
-            &["h.json", "--expose", "a=cat"][..],
-            &["h.json", "--audit-topic", "ops"],
-            &["h.json", "--peer", "t1"],
-            &["h.json", "--roster-head", "x"],
-            &["h.json", "--inclusion-proof", "x"],
-            &["h.json", "--", "cat"],
-        ] {
-            assert!(parse(gone).is_err(), "{gone:?}");
-        }
     }
 
     /// A host's parts for the tests below: root 1, host 10, a keystore at
