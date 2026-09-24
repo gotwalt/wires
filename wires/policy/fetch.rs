@@ -7,18 +7,22 @@
 //!   edit drops learns it). It dials no host. A directory it can't reach is
 //!   reported, not queued; the command fails when it reached none
 //!   ([`PublishReport::reached_none`]).
-//! - [`fetch`]: a host at start and on a timer ([`refresh_loop`]: `head`
-//!   first, then the policy only when the head moved), and a caller's cold
-//!   command whose copy was last checked more than [`STALE_AFTER_SECS`] ago
-//!   ([`refresh_cold`]), ask the directories their held head lists for a
-//!   newer policy, stopping at the first adopted one or the first "you are
-//!   current" vouched for by a `Fresh` from a listed directory.
+//! - [`fetch`]: one `policy {have}` to each directory the held head lists
+//!   in turn, stopping at the first adopted policy (whole, or the held one
+//!   with a `policy_update` applied) or the first "you are current" vouched
+//!   for by a `Fresh` from a listed directory. A host uses it once, at a
+//!   start whose preflight fails ([`fetch_now`]: a service assigned while it
+//!   was down); a caller's cold command when its copy was last checked more
+//!   than [`STALE_AFTER_SECS`] ago ([`refresh_cold`]); the gateway on a
+//!   timer ([`refresh_loop`], `head` first) until card 37 gives callers and
+//!   the gateway their views.
+//!
+//! A running host follows its directories by subscription instead
+//! ([`crate::host::follow`], card 36c).
 //!
 //! Nothing is ever adopted except through [`store::adopt_if_newer`]
 //! (verified under the root, fresh, strictly newer), so a lying directory
-//! can only fail to help. Hosts hold the whole policy; card 36c moves them
-//! from this timer to a `policy` subscription with `policy_update` deltas,
-//! and card 37 moves callers from the whole policy to their views.
+//! can only fail to help.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -221,7 +225,8 @@ fn stored(ks: &Keystore) -> Result<Held> {
 /// stopping at the first answer that settles it:
 ///
 /// - a `policy` whose `Fresh` vouches for its head, and which verifies, is
-///   fresh and is newer, is adopted and returned;
+///   fresh and is newer, is adopted and returned; so is the held policy with
+///   a `policy_update` applied ([`SignedPolicy::apply`]);
 /// - `current`, with a `Fresh` for the held head from a directory that head
 ///   lists, current at `now`: this node is up to date (`Ok(None)`).
 ///
@@ -257,6 +262,36 @@ pub(crate) async fn fetch(
                     Ok(false) => {}
                     Err(e) => {
                         tracing::warn!(directory = %dir.hex(), "refused a fetched policy: {e:#}")
+                    }
+                }
+            }
+            // The delta from the version held (card 36c): applied to the
+            // held copy, which must then verify as a whole.
+            Ok(DirectoryAnswer::PolicyUpdate { update, fresh }) => {
+                let Some(held) = held else { continue };
+                let applied = held
+                    .signed
+                    .apply(&update, root)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|next| {
+                        fresh.verify(&next.head)?;
+                        Ok(next)
+                    });
+                let next = match applied {
+                    Ok(next) => next,
+                    Err(e) => {
+                        tracing::warn!(directory = %dir.hex(), "refused a policy update: {e:#}");
+                        continue;
+                    }
+                };
+                match store::adopt_if_newer(ks, &next, root, now_unix()) {
+                    Ok(true) => {
+                        store::mark_checked(ks, now_unix())?;
+                        return Ok(Some(next));
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(directory = %dir.hex(), "refused a policy update: {e:#}")
                     }
                 }
             }
@@ -401,10 +436,11 @@ pub(crate) async fn check_once(endpoint: &Endpoint, ks: &Keystore) -> Result<Opt
     }
 }
 
-/// A running host's (or gateway's) check, until `stop` resolves or its
-/// sender is dropped, or the endpoint closes: at once, then every `every`
-/// (the held policy's `settings.beat_secs` when `None`), [`check_once`].
-/// Card 36c replaces this with a `policy` subscription.
+/// The gateway's check, until `stop` resolves or its sender is dropped, or
+/// the endpoint closes: at once, then every `every` (the held policy's
+/// `settings.beat_secs` when `None`), [`check_once`]. A host follows a
+/// subscription instead ([`crate::host::follow`]); card 37 moves the
+/// gateway to views.
 pub(crate) async fn refresh_loop(
     endpoint: Endpoint,
     ks: Arc<Keystore>,
