@@ -480,6 +480,7 @@ mod tests {
             1,
             AuditRecord::Denied {
                 caller: caller(),
+                principal: None,
                 tool: Some(ToolName::new("db_query").unwrap()),
                 reason: "no role allows db_query".into(),
                 at_ms: 1,

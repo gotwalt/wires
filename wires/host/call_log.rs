@@ -373,6 +373,7 @@ mod tests {
     fn denied(n: i64) -> AuditRecord {
         AuditRecord::Denied {
             caller: NodeIdentity::from_seed([7u8; 32]).node_id(),
+            principal: None,
             tool: None,
             reason: format!("no {n}"),
             at_ms: n,

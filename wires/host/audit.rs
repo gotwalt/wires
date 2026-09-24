@@ -63,15 +63,21 @@ pub fn now_ms() -> i64 {
 ///
 /// The reason is cut exactly as [`transport`] cuts the one it sends, so the
 /// record and the caller's `Denied` frame say the same thing.
+///
+/// `principal` is the caller's verified identity, when the host had one when
+/// it refused. The record then carries its issuer and subject, so the refusal
+/// is that person's "mine".
 pub async fn denied(
     sink: Option<&AuditSink>,
     caller: NodeId,
+    principal: Option<Principal>,
     tool: Option<ToolName>,
     reason: &str,
 ) {
     let Some(sink) = sink else { return };
     let record = AuditRecord::Denied {
         caller,
+        principal,
         tool,
         reason: transport::truncate_reason(reason.to_string()),
         at_ms: now_ms(),
@@ -293,14 +299,14 @@ mod tests {
     async fn no_sink_means_no_records_and_no_handle() {
         let started = CallAudit::start(None, caller(), None, db_query(), &[], None, None).await;
         assert!(started.unwrap().is_none());
-        denied(None, caller(), None, "whatever").await; // must not panic
+        denied(None, caller(), None, None, "whatever").await; // must not panic
     }
 
     #[tokio::test]
     async fn denied_records_the_reason_the_caller_gets() {
         let (sink, mut rx) = AuditSink::channel(4);
         let long = "x".repeat(10_000);
-        denied(Some(&sink), caller(), None, &long).await;
+        denied(Some(&sink), caller(), None, None, &long).await;
         let Ok(AuditRecord::Denied {
             reason, caller: c, ..
         }) = rx.try_recv()
@@ -417,7 +423,7 @@ mod tests {
         let (sink, mut rx) = AuditSink::channel(2);
         let burst = tokio::spawn(async move {
             for n in 0..50 {
-                denied(Some(&sink), caller(), None, &format!("no {n}")).await;
+                denied(Some(&sink), caller(), None, None, &format!("no {n}")).await;
             }
         });
         let mut reasons = Vec::new();

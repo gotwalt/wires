@@ -633,10 +633,11 @@ async fn refuse_member<W: AsyncWrite + Unpin>(
     send: &mut W,
     audit: Option<&AuditSink>,
     caller: NodeId,
+    principal: Option<library::Principal>,
     tool: Option<ToolName>,
     reason: String,
 ) -> anyhow::Error {
-    crate::host::audit::denied(audit, caller, tool, &reason).await; // audit: denied
+    crate::host::audit::denied(audit, caller, principal, tool, &reason).await; // audit: denied
     deny(send, reason.clone()).await;
     Refused(reason).into()
 }
@@ -772,13 +773,15 @@ where
     ) {
         Ok(admitted) => admitted,
         Err(reason) => {
-            return Err(refuse_member(&mut send, audit, caller, Some(tool), reason).await);
+            let who = principal.clone();
+            return Err(refuse_member(&mut send, audit, caller, who, Some(tool), reason).await);
         }
     };
     // Only an admitted caller learns whether this host implements it.
     let Some(svc) = host.config.services.get(&service) else {
         let reason = format!("service {service} is not implemented on this host");
-        return Err(refuse_member(&mut send, audit, caller, Some(tool), reason).await);
+        let who = principal.clone();
+        return Err(refuse_member(&mut send, audit, caller, who, Some(tool), reason).await);
     };
     drop(preauth);
     let version = admitted.state_version;

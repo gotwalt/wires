@@ -15,10 +15,26 @@
 //! stream with a loud alarm on stderr (exit 1), and the reader's mark for it
 //! is left at the last good entry.
 //!
+//! The reader keeps, in [`MARKS_FILE`], **one chain anchor per host** (the
+//! furthest entry of that host's log it has verified, under any view) and a
+//! **resume point per view** (the services asked of that host, `--mine`).
+//! A view resumes from its own point, and wherever its stream passes the
+//! anchor the entry must be the one verified before, so `watch x` after
+//! `watch` (or after a service moves) still catches a rewrite. Each host
+//! also says where its log stands ([`RecordFrame::Granted`]): a tip below
+//! the anchor is a rollback (an alarm, exit 1); a first held entry past the
+//! anchor is retention, reported as a notice, and checking starts over from
+//! what the host still holds.
+//!
+//! The service a line names is derived here, from signed records: a
+//! `Started`'s tool, and for a `Finished` or a service's push the tool of the
+//! `Started` with the same call id ([`Labels`]). An operator push, or a line
+//! whose call this reader never saw start, shows `-`.
+//!
 //! The backlog from every host is merged by time and printed first; then,
-//! unless `--once`, new records as they are logged. The verified tip per
-//! host (and per view: the services asked for and `--mine`) is kept in
-//! [`MARKS_FILE`] in the keystore, so a restart resumes where it stopped.
+//! unless `--once`, new records as they are logged. A host that re-decides a
+//! following reader's access (a new signed state, an expired token) may end
+//! the stream with a refusal, which is printed like any other.
 //!
 //! ```text
 //! 14:02:07 orders-db ▶ 3fa2 alice@example.com (a1b2…) [analyst] orders-db "select 1"
@@ -27,14 +43,14 @@
 //! 14:03:00 -         ⇢ 9c1e → alice@example.com (a1b2…) [analyst] "build-41" delivered
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use iroh::{Endpoint, EndpointAddr};
 use library::{
-    AuditRecord, ChainBreak, ChainPoint, LogEntry, LogSeq, NodeId, Principal, ServiceName,
+    AuditRecord, CallId, ChainBreak, ChainPoint, LogEntry, LogSeq, NodeId, Principal, ServiceName,
     verify_chain,
 };
 use serde::Serialize;
@@ -46,7 +62,8 @@ use crate::host::record_stream::{self, Link, RecordFrame, StreamItem};
 use crate::host::transport;
 use crate::state::store;
 
-/// The keystore file holding the reader's verified tip per host and view.
+/// The keystore file holding the reader's marks: per host, its chain anchor,
+/// a resume point per view, and recent calls' labels ([`Marks`]).
 pub(crate) const MARKS_FILE: &str = "record-marks.json";
 
 /// How long a host gets to answer the dial.
@@ -62,7 +79,8 @@ pub(crate) struct WatchArgs {
     #[arg(long)]
     pub(crate) mine: bool,
     /// One JSON object per record: `{service, host, seq, entry}` (the entry
-    /// is the host-signed log entry, verifiable on its own).
+    /// is the host-signed log entry, verifiable on its own; `service` is
+    /// derived by this reader from signed records, not supplied by the host).
     #[arg(long)]
     pub(crate) json: bool,
     /// Print what is there (after your last mark) and exit, instead of
@@ -88,7 +106,8 @@ pub(crate) struct WatchOpts {
 /// One verified record, ready to show.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct Shown {
-    /// The service it is about (`None`: none, e.g. a push).
+    /// The service it is about, as this reader derived it from signed
+    /// records ([`Labels`]; `None`: none known, e.g. an operator push).
     pub(crate) service: Option<ServiceName>,
     /// The host that logged it.
     pub(crate) host: NodeId,
@@ -106,6 +125,9 @@ pub(crate) enum Output {
     /// Something the reader must be told on stderr (a refusal, an
     /// unreachable host, a log that does not verify).
     Alarm(String),
+    /// Something the reader should know that is not a fault (a host pruned
+    /// entries past its retention).
+    Notice(String),
 }
 
 /// How a watch ended (`--once`, or every host gone).
@@ -119,6 +141,9 @@ pub(crate) struct Report {
     pub(crate) refused: Vec<(NodeId, String)>,
     /// Hosts that could not be read (dial or stream failure).
     pub(crate) failed: Vec<(NodeId, String)>,
+    /// Hosts that pruned entries past the reader's anchor (retention), and
+    /// the first seq each still holds.
+    pub(crate) pruned: Vec<(NodeId, LogSeq)>,
     /// Hosts asked.
     pub(crate) hosts: usize,
 }
@@ -128,38 +153,118 @@ pub(crate) struct Report {
 // ---------------------------------------------------------------------------
 
 /// A reader's running check of one host's log.
+///
+/// It continues from the view's resume point (`tip`), and also holds the
+/// host's **anchor**: the furthest point of this host's chain the reader has
+/// verified under any view. Wherever the stream passes the anchor, the entry
+/// there must be the one verified before (and the next must link to it), so
+/// a rewrite is caught even when this view has never seen that stretch.
 #[derive(Clone, Debug)]
 pub(crate) struct Chain {
     /// The host whose log it is.
     host: NodeId,
-    /// The last verified point (`None`: nothing yet).
+    /// The last verified point of this stream (`None`: nothing yet).
     tip: Option<ChainPoint>,
+    /// The host's anchor (`None`: none, or dropped by retention).
+    anchor: Option<ChainPoint>,
+}
+
+/// What a host's [`RecordFrame::Granted`] told the reader, once checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// The log reaches everything the reader verified.
+    Continuous,
+    /// The host pruned entries before this seq (retention): what the reader
+    /// verified before it can no longer be checked, and checking starts
+    /// over from there. Not tampering.
+    Pruned(LogSeq),
+}
+
+/// The later of two points (by seq).
+fn later(a: Option<ChainPoint>, b: Option<ChainPoint>) -> Option<ChainPoint> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if y.seq > x.seq { y } else { x }),
+        (x, y) => x.or(y),
+    }
 }
 
 impl Chain {
-    /// Continue checking `host`'s log from `tip` (the reader's mark).
-    pub(crate) fn new(host: NodeId, tip: Option<ChainPoint>) -> Self {
-        Self { host, tip }
+    /// Continue checking `host`'s log from `tip` (the view's resume point),
+    /// holding it to `anchor` (the host's).
+    pub(crate) fn new(host: NodeId, tip: Option<ChainPoint>, anchor: Option<ChainPoint>) -> Self {
+        Self { host, tip, anchor }
     }
 
-    /// The last verified point.
+    /// The last verified point of this stream.
     pub(crate) fn tip(&self) -> Option<ChainPoint> {
         self.tip
     }
 
+    /// The host's anchor after this stream: the furthest verified point.
+    pub(crate) fn anchor(&self) -> Option<ChainPoint> {
+        later(self.anchor, self.tip)
+    }
+
+    /// Check the host's tip and first held seq (from a
+    /// [`RecordFrame::Granted`]) against what the reader verified.
+    ///
+    /// A tip below the furthest verified point is a rollback, and a
+    /// different entry at that point a fork: both are [`ChainBreak`]s. A
+    /// first held seq past the point after the anchor (or the resume point)
+    /// is retention: that point is dropped, and [`Standing::Pruned`] says
+    /// so.
+    pub(crate) fn granted(
+        &mut self,
+        tip: Option<ChainPoint>,
+        first: Option<LogSeq>,
+    ) -> std::result::Result<Standing, ChainBreak> {
+        if let Some(known) = self.anchor() {
+            match tip {
+                None => return Err(ChainBreak::RolledBack { seq: known.seq }),
+                Some(t) if t.seq < known.seq => {
+                    return Err(ChainBreak::RolledBack { seq: known.seq });
+                }
+                Some(t) if t.seq == known.seq && t.hash != known.hash => {
+                    return Err(ChainBreak::Fork { seq: t.seq });
+                }
+                Some(_) => {}
+            }
+        }
+        let Some(first) = first else {
+            return Ok(Standing::Continuous);
+        };
+        let gone = |p: Option<ChainPoint>| p.is_some_and(|p| p.seq.next() < first);
+        let mut standing = Standing::Continuous;
+        if gone(self.anchor) {
+            self.anchor = None;
+            standing = Standing::Pruned(first);
+        }
+        if gone(self.tip) {
+            self.tip = None;
+            standing = Standing::Pruned(first);
+        }
+        Ok(standing)
+    }
+
     /// Check the next streamed item. A shown entry must be signed by the host
     /// and link to the point before it; a hidden run must start right after
-    /// it and link to it. Returns the entry when it is new and shown.
+    /// it and link to it; and either must agree with the anchor where they
+    /// meet it. Returns the entry when it is new and shown.
     pub(crate) fn accept(
         &mut self,
         item: StreamItem,
-    ) -> std::result::Result<Option<(Option<ServiceName>, LogEntry)>, ChainBreak> {
+    ) -> std::result::Result<Option<LogEntry>, ChainBreak> {
         match item {
-            StreamItem::Entry { service, entry } => {
+            StreamItem::Entry { entry } => {
                 let before = self.tip.map(|t| t.seq);
-                self.tip = verify_chain(self.host, self.tip, std::slice::from_ref(&entry))?;
+                let tip = verify_chain(self.host, self.tip, std::slice::from_ref(&entry))?;
+                let hash = entry
+                    .hash()
+                    .map_err(|_| ChainBreak::Malformed { seq: entry.seq })?;
+                self.against_anchor(entry.seq, entry.prev, hash)?;
+                self.tip = tip;
                 // An exact repeat of the tip verifies but is not news.
-                Ok((before < Some(entry.seq)).then_some((service, entry)))
+                Ok((before < Some(entry.seq)).then_some(entry))
             }
             StreamItem::Hidden { from, links } => {
                 let mut seq = from;
@@ -172,8 +277,24 @@ impl Chain {
         }
     }
 
+    /// The entry at `seq` (linking to `prev`, hashing to `hash`) against the
+    /// anchor: at the anchor's seq it must be the anchored entry, and right
+    /// after it, it must link to it.
+    fn against_anchor(
+        &self,
+        seq: LogSeq,
+        prev: library::EntryHash,
+        hash: library::EntryHash,
+    ) -> std::result::Result<(), ChainBreak> {
+        match self.anchor {
+            Some(a) if seq == a.seq && hash != a.hash => Err(ChainBreak::Fork { seq }),
+            Some(a) if seq == a.seq.next() && prev != a.hash => Err(ChainBreak::BrokenLink { seq }),
+            _ => Ok(()),
+        }
+    }
+
     /// Check one hidden entry at `seq`: it must follow the tip and link to
-    /// it (a repeat of the tip must be the tip).
+    /// it (a repeat of the tip must be the tip), and agree with the anchor.
     fn link(&mut self, seq: LogSeq, link: Link) -> std::result::Result<(), ChainBreak> {
         match self.tip {
             Some(t) if seq == t.seq && link.hash != t.hash => {
@@ -190,6 +311,7 @@ impl Chain {
             }
             _ => {}
         }
+        self.against_anchor(seq, link.prev, link.hash)?;
         self.tip = Some(ChainPoint {
             seq,
             hash: link.hash,
@@ -199,23 +321,81 @@ impl Chain {
 }
 
 // ---------------------------------------------------------------------------
+// Labels
+// ---------------------------------------------------------------------------
+
+/// How many recent calls per host [`Labels`] remembers.
+const LABELS_KEPT: usize = 1024;
+
+/// The service each record is about, derived by the reader from signed
+/// records (never from anything the host adds): a `Started`'s tool, and for
+/// a `Finished` or a service's `Push` the tool of the `Started` with the
+/// same call id this reader saw. Kept per host across runs (in
+/// [`MARKS_FILE`]), for the most recent [`LABELS_KEPT`] calls.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
+pub(crate) struct Labels(VecDeque<(CallId, ServiceName)>);
+
+impl Labels {
+    /// The label for `record`, learning from it when it starts a call.
+    pub(crate) fn label(&mut self, record: &AuditRecord) -> Option<ServiceName> {
+        let of = |labels: &Self, call: &CallId| {
+            labels
+                .0
+                .iter()
+                .rev()
+                .find(|(c, _)| c == call)
+                .map(|(_, s)| s.clone())
+        };
+        match record {
+            AuditRecord::Started { call, tool, .. } => {
+                let service = ServiceName::from(tool.clone());
+                self.0.push_back((*call, service.clone()));
+                while self.0.len() > LABELS_KEPT {
+                    self.0.pop_front();
+                }
+                Some(service)
+            }
+            AuditRecord::Finished { call, .. } => of(self, call),
+            AuditRecord::Push { call, .. } => call.as_ref().and_then(|c| of(self, c)),
+            AuditRecord::Denied { tool, .. } => tool.clone().map(ServiceName::from),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Marks
 // ---------------------------------------------------------------------------
 
-/// The reader's verified tip per host and view, in [`MARKS_FILE`].
+/// What the reader keeps about one host, in [`MARKS_FILE`].
 #[derive(Clone, Debug, Default, serde::Deserialize, Serialize)]
-pub(crate) struct Marks(BTreeMap<String, ChainPoint>);
+pub(crate) struct HostMarks {
+    /// The furthest point of this host's chain the reader verified, under
+    /// any view: every later stream is held to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) anchor: Option<ChainPoint>,
+    /// Where each view (the services asked of this host, `--mine`) resumes.
+    #[serde(default)]
+    pub(crate) views: BTreeMap<String, ChainPoint>,
+    /// The recent calls' services, for labels.
+    #[serde(default)]
+    pub(crate) labels: Labels,
+}
+
+/// The reader's marks per host (keyed by the host's hex id), in
+/// [`MARKS_FILE`]: one chain anchor per host, and a resume point per view.
+#[derive(Clone, Debug, Default, serde::Deserialize, Serialize)]
+pub(crate) struct Marks(BTreeMap<String, HostMarks>);
 
 impl Marks {
-    /// The key for `host` under a view (the services asked of it, `mine`).
-    fn key(host: NodeId, services: &[ServiceName], mine: bool) -> String {
+    /// The view key for the services asked of a host and `mine`.
+    fn view(services: &[ServiceName], mine: bool) -> String {
         let names: Vec<&str> = services.iter().map(ServiceName::as_str).collect();
-        format!(
-            "{} {}{}",
-            host.hex(),
-            names.join(","),
-            if mine { " mine" } else { "" }
-        )
+        format!("{}{}", names.join(","), if mine { " mine" } else { "" })
+    }
+
+    /// The marks for `host` (default when none).
+    pub(crate) fn host(&self, host: NodeId) -> HostMarks {
+        self.0.get(&host.hex()).cloned().unwrap_or_default()
     }
 
     /// Load the marks (none when the file is missing or unreadable).
@@ -243,16 +423,26 @@ impl Marks {
 // Streaming
 // ---------------------------------------------------------------------------
 
+/// Where one host's check stands: the stream's tip (the view's resume
+/// point) and the host's anchor.
+#[derive(Clone, Copy, Debug, Default)]
+struct Progress {
+    tip: Option<ChainPoint>,
+    anchor: Option<ChainPoint>,
+}
+
 /// What one host's stream reports to the watch.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // transient, one per streamed item
 enum Event {
-    /// A verified item; the new tip, and the entry when it is shown.
+    /// A verified item: where the check stands, and the entry when shown.
     Item {
         host: NodeId,
-        tip: Option<ChainPoint>,
-        shown: Option<(Option<ServiceName>, LogEntry)>,
+        progress: Progress,
+        shown: Option<LogEntry>,
     },
+    /// The host pruned entries before this seq (retention).
+    Pruned(NodeId, LogSeq, Progress),
     /// The backlog is in.
     CaughtUp(NodeId),
     /// The log did not verify; the stream was dropped.
@@ -269,11 +459,28 @@ impl Event {
     fn host(&self) -> NodeId {
         match self {
             Event::Item { host, .. }
+            | Event::Pruned(host, ..)
             | Event::CaughtUp(host)
             | Event::Broken(host, _)
             | Event::Refused(host, _)
             | Event::Failed(host, _)
             | Event::Ended(host) => *host,
+        }
+    }
+}
+
+impl Chain {
+    /// Whether this stream has yet to reach the host's anchor.
+    fn short_of_anchor(&self) -> bool {
+        self.anchor
+            .is_some_and(|a| self.tip.is_none_or(|t| t.seq < a.seq))
+    }
+
+    /// Where this check stands.
+    fn progress(&self) -> Progress {
+        Progress {
+            tip: self.tip(),
+            anchor: self.anchor(),
         }
     }
 }
@@ -295,6 +502,10 @@ async fn stream_host(
                 .context("dialing the host")?;
         let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
         record_stream::write_frame(&mut send, &open).await?;
+        // Entries before the anchor wait until the stream reaches it: they
+        // are not known good until the anchor confirms the chain they're on
+        // (a stream that breaks, or ends, first never shows them).
+        let mut held: Vec<Event> = Vec::new();
         loop {
             match record_stream::read_frame(&mut recv).await? {
                 None => break,
@@ -302,18 +513,34 @@ async fn stream_host(
                     let _ = tx.send(Event::Refused(host, reason));
                     break;
                 }
-                Some(RecordFrame::Granted { scopes }) => {
-                    tracing::debug!(host = %host.hex(), ?scopes, "record stream granted");
+                Some(RecordFrame::Granted { scopes, tip, first }) => {
+                    tracing::debug!(host = %host.hex(), ?scopes, ?tip, ?first, "record stream granted");
+                    match chain.granted(tip, first) {
+                        Ok(Standing::Continuous) => {}
+                        Ok(Standing::Pruned(first)) => {
+                            let _ = tx.send(Event::Pruned(host, first, chain.progress()));
+                        }
+                        Err(why) => {
+                            let _ = tx.send(Event::Broken(host, why));
+                            conn.close(1u32.into(), b"log does not verify");
+                            return Ok(());
+                        }
+                    }
                 }
                 Some(RecordFrame::Batch { items }) => {
                     for item in items {
                         match chain.accept(item) {
                             Ok(shown) => {
-                                let _ = tx.send(Event::Item {
+                                held.push(Event::Item {
                                     host,
-                                    tip: chain.tip(),
+                                    progress: chain.progress(),
                                     shown,
                                 });
+                                if !chain.short_of_anchor() {
+                                    for event in held.drain(..) {
+                                        let _ = tx.send(event);
+                                    }
+                                }
                             }
                             Err(why) => {
                                 let _ = tx.send(Event::Broken(host, why));
@@ -340,9 +567,9 @@ async fn stream_host(
 }
 
 /// Watch as the node in `ks`: dial the hosts of the services asked for
-/// through `endpoint` (addresses from `hints`), verify, and hand each record
-/// and alarm to `out` — the merged backlog first, then (with `follow`) live
-/// records. Returns when every host's stream has ended.
+/// through `endpoint` (addresses from `hints`), verify, and hand each record,
+/// notice and alarm to `out` — the merged backlog first, then (with
+/// `follow`) live records. Returns when every host's stream has ended.
 pub(crate) async fn watch_with(
     ks: &Keystore,
     endpoint: &Endpoint,
@@ -377,20 +604,24 @@ pub(crate) async fn watch_with(
         hosts: hosts.len(),
         ..Report::default()
     };
-    let mut keys: BTreeMap<NodeId, String> = BTreeMap::new();
+    // Per host: its view key, and the reader-side labels.
+    let mut views: BTreeMap<NodeId, String> = BTreeMap::new();
+    let mut labels: BTreeMap<NodeId, Labels> = BTreeMap::new();
     for host in &hosts {
         let here: Vec<ServiceName> = services
             .iter()
             .filter(|s| state.assigns(s, *host))
             .cloned()
             .collect();
-        let key = Marks::key(*host, &here, opts.mine);
-        let mark = marks.0.get(&key).copied();
-        keys.insert(*host, key);
+        let view = Marks::view(&here, opts.mine);
+        let held = marks.host(*host);
+        let resume = held.views.get(&view).copied();
+        views.insert(*host, view);
+        labels.insert(*host, held.labels.clone());
         let open = RecordFrame::Open {
             hello: hello.clone(),
             services: here,
-            since: mark.map(|m| m.seq),
+            since: resume.map(|m| m.seq),
             mine: opts.mine,
             follow: opts.follow,
         };
@@ -404,7 +635,7 @@ pub(crate) async fn watch_with(
             endpoint.clone(),
             target,
             open,
-            Chain::new(*host, mark),
+            Chain::new(*host, resume, held.anchor),
             tx.clone(),
         ));
     }
@@ -418,9 +649,10 @@ pub(crate) async fn watch_with(
     }
     let mut live: BTreeSet<NodeId> = pending.clone();
     let mut backlog: Vec<Shown> = Vec::new();
-    let mut tips: BTreeMap<NodeId, ChainPoint> = BTreeMap::new();
+    let mut progress: BTreeMap<NodeId, Progress> = BTreeMap::new();
     let flush = |backlog: &mut Vec<Shown>,
-                 tips: &mut BTreeMap<NodeId, ChainPoint>,
+                 progress: &mut BTreeMap<NodeId, Progress>,
+                 labels: &BTreeMap<NodeId, Labels>,
                  marks: &mut Marks,
                  report: &mut Report,
                  out: &mut (dyn FnMut(Output) + Send)| {
@@ -429,9 +661,15 @@ pub(crate) async fn watch_with(
             report.shown += 1;
             out(Output::Record(Box::new(s)));
         }
-        let changed = !tips.is_empty();
-        for (h, tip) in std::mem::take(tips) {
-            marks.0.insert(keys[&h].clone(), tip);
+        let changed = !progress.is_empty();
+        for (h, p) in std::mem::take(progress) {
+            let held = marks.0.entry(h.hex()).or_default();
+            held.anchor = p.anchor;
+            match p.tip {
+                Some(tip) => held.views.insert(views[&h].clone(), tip),
+                None => held.views.remove(&views[&h]),
+            };
+            held.labels = labels[&h].clone();
         }
         if changed {
             marks.save(ks);
@@ -441,11 +679,12 @@ pub(crate) async fn watch_with(
         let host = event.host();
         let short = pick::short(&host);
         match event {
-            Event::Item { tip, shown, .. } => {
-                if let Some(tip) = tip {
-                    tips.insert(host, tip);
-                }
-                if let Some((service, entry)) = shown {
+            Event::Item {
+                progress: p, shown, ..
+            } => {
+                progress.insert(host, p);
+                if let Some(entry) = shown {
+                    let service = labels.get_mut(&host).and_then(|l| l.label(&entry.record));
                     backlog.push(Shown {
                         service,
                         host,
@@ -453,6 +692,14 @@ pub(crate) async fn watch_with(
                         entry,
                     });
                 }
+            }
+            Event::Pruned(_, first, p) => {
+                progress.insert(host, p);
+                out(Output::Notice(format!(
+                    "host {short} pruned entries before seq {first} (retention); what this reader \
+                     verified before that can no longer be checked, so checking starts over there"
+                )));
+                report.pruned.push((host, first));
             }
             Event::CaughtUp(_) => {
                 pending.remove(&host);
@@ -480,13 +727,27 @@ pub(crate) async fn watch_with(
             }
         }
         if pending.is_empty() {
-            flush(&mut backlog, &mut tips, &mut marks, &mut report, out);
+            flush(
+                &mut backlog,
+                &mut progress,
+                &labels,
+                &mut marks,
+                &mut report,
+                out,
+            );
         }
         if live.is_empty() {
             break;
         }
     }
-    flush(&mut backlog, &mut tips, &mut marks, &mut report, out);
+    flush(
+        &mut backlog,
+        &mut progress,
+        &labels,
+        &mut marks,
+        &mut report,
+        out,
+    );
     Ok(report)
 }
 
@@ -511,6 +772,7 @@ pub(crate) async fn watch_cmd(a: WatchArgs) -> Result<i32> {
     let mut out = |o: Output| match o {
         Output::Record(s) => println!("{}", if json { json_line(&s) } else { text_line(&s) }),
         Output::Alarm(msg) => eprintln!("wires: {msg}"),
+        Output::Notice(msg) => eprintln!("wires: note: {msg}"),
     };
     let report = tokio::select! {
         r = watch_with(&ks, &endpoint, &hints, a.relay_url.as_deref(), &opts, &mut out) => r?,
@@ -751,6 +1013,7 @@ mod tests {
             let tip = out.last().map(|e| e.point().unwrap());
             let r = AuditRecord::Denied {
                 caller: h.node_id(),
+                principal: None,
                 tool: None,
                 reason: format!("r{i}"),
                 at_ms: 0,
@@ -774,16 +1037,13 @@ mod tests {
     }
 
     fn shown(e: &LogEntry) -> StreamItem {
-        StreamItem::Entry {
-            service: None,
-            entry: e.clone(),
-        }
+        StreamItem::Entry { entry: e.clone() }
     }
 
     #[test]
     fn a_chain_links_across_hidden_runs() {
         let es = entries(5);
-        let mut c = Chain::new(host().node_id(), None);
+        let mut c = Chain::new(host().node_id(), None, None);
         assert!(c.accept(shown(&es[0])).unwrap().is_some());
         assert!(c.accept(hidden(&es[1..4])).unwrap().is_none());
         assert!(c.accept(shown(&es[4])).unwrap().is_some());
@@ -801,13 +1061,13 @@ mod tests {
         if let AuditRecord::Denied { reason, .. } = &mut bad.record {
             *reason = "rX".into();
         }
-        let mut c = Chain::new(id, Some(es[0].point().unwrap()));
+        let mut c = Chain::new(id, Some(es[0].point().unwrap()), None);
         assert_eq!(
             c.accept(shown(&bad)),
             Err(ChainBreak::BadSignature { seq: LogSeq(1) })
         );
         // A missing entry.
-        let mut c = Chain::new(id, Some(es[0].point().unwrap()));
+        let mut c = Chain::new(id, Some(es[0].point().unwrap()), None);
         assert_eq!(
             c.accept(shown(&es[2])),
             Err(ChainBreak::Gap {
@@ -817,7 +1077,7 @@ mod tests {
         );
         // A hidden run whose hash doesn't match what the next entry links to
         // (a tampered entry the reader can't see).
-        let mut c = Chain::new(id, Some(es[0].point().unwrap()));
+        let mut c = Chain::new(id, Some(es[0].point().unwrap()), None);
         let mut run = hidden(&es[1..3]);
         if let StreamItem::Hidden { links, .. } = &mut run {
             links[0].hash = bad.hash().unwrap();
@@ -827,7 +1087,7 @@ mod tests {
             Err(ChainBreak::BrokenLink { seq: LogSeq(2) })
         );
         // A hidden run that doesn't link to the tip.
-        let mut c = Chain::new(id, Some(es[1].point().unwrap()));
+        let mut c = Chain::new(id, Some(es[1].point().unwrap()), None);
         let mut run = hidden(&es[2..3]);
         if let StreamItem::Hidden { links, .. } = &mut run {
             links[0].prev = es[0].hash().unwrap();
@@ -836,6 +1096,174 @@ mod tests {
             c.accept(run),
             Err(ChainBreak::BrokenLink { seq: LogSeq(2) })
         );
+    }
+
+    /// `entries(n)`, but entry `at` (and so every later one) rewritten and
+    /// re-signed by the host key: a consistent chain of its own.
+    fn rewritten(n: usize, at: usize) -> Vec<LogEntry> {
+        let h = host();
+        let mut out: Vec<LogEntry> = Vec::new();
+        for (i, e) in entries(n).into_iter().enumerate() {
+            let tip = out.last().map(|e| e.point().unwrap());
+            let mut r = e.record;
+            if i == at
+                && let AuditRecord::Denied { reason, .. } = &mut r
+            {
+                *reason = "rewritten".into();
+            }
+            out.push(LogEntry::next(&h, tip, 0, r).unwrap());
+        }
+        out
+    }
+
+    /// A view with no resume point of its own is still held to the host's
+    /// anchor: a rewritten log that is consistent in itself is a fork where
+    /// it passes the anchor, whether it passes it shown or hidden.
+    #[test]
+    fn a_new_view_is_held_to_the_hosts_anchor() {
+        let es = entries(5);
+        let anchor = Some(es[3].point().unwrap());
+        let forged = rewritten(5, 2);
+        let mut c = Chain::new(host().node_id(), None, anchor);
+        for e in &forged[..3] {
+            c.accept(shown(e)).unwrap();
+        }
+        assert_eq!(
+            c.accept(shown(&forged[3])),
+            Err(ChainBreak::Fork { seq: LogSeq(3) })
+        );
+        let mut c = Chain::new(host().node_id(), None, anchor);
+        assert_eq!(
+            c.accept(hidden(&forged[..5])),
+            Err(ChainBreak::Fork { seq: LogSeq(3) })
+        );
+        // The honest log passes, and the anchor moves on with it.
+        let mut c = Chain::new(host().node_id(), None, anchor);
+        c.accept(hidden(&es[..4])).unwrap();
+        c.accept(shown(&es[4])).unwrap();
+        assert_eq!(c.anchor(), Some(es[4].point().unwrap()));
+        // Starting right after the anchor (it was pruned), the first entry
+        // must still link to it.
+        let mut c = Chain::new(host().node_id(), None, anchor);
+        assert_eq!(
+            c.accept(shown(&forged[4])),
+            Err(ChainBreak::BrokenLink { seq: LogSeq(4) })
+        );
+    }
+
+    /// A host whose tip is below the anchor rolled its log back; one with a
+    /// different entry at the anchor forked it.
+    #[test]
+    fn a_tip_below_the_anchor_is_a_rollback() {
+        let es = entries(5);
+        let id = host().node_id();
+        let anchor = Some(es[3].point().unwrap());
+        let mut c = Chain::new(id, Some(es[1].point().unwrap()), anchor);
+        assert_eq!(
+            c.granted(Some(es[2].point().unwrap()), Some(LogSeq(0))),
+            Err(ChainBreak::RolledBack { seq: LogSeq(3) })
+        );
+        assert_eq!(
+            Chain::new(id, None, anchor).granted(None, None),
+            Err(ChainBreak::RolledBack { seq: LogSeq(3) })
+        );
+        let forged = rewritten(4, 2);
+        assert_eq!(
+            Chain::new(id, None, anchor).granted(Some(forged[3].point().unwrap()), Some(LogSeq(0))),
+            Err(ChainBreak::Fork { seq: LogSeq(3) })
+        );
+        let mut c = Chain::new(id, None, anchor);
+        assert_eq!(
+            c.granted(Some(es[4].point().unwrap()), Some(LogSeq(0))),
+            Ok(Standing::Continuous)
+        );
+    }
+
+    /// Entries pruned from the front past the anchor are retention, not
+    /// tampering: the anchor (and a resume point the host can't continue)
+    /// is dropped, and the stream from the first held entry verifies.
+    #[test]
+    fn pruning_past_the_anchor_is_retention() {
+        let es = entries(8);
+        let id = host().node_id();
+        let mut c = Chain::new(
+            id,
+            Some(es[1].point().unwrap()),
+            Some(es[2].point().unwrap()),
+        );
+        assert_eq!(
+            c.granted(Some(es[7].point().unwrap()), Some(LogSeq(5))),
+            Ok(Standing::Pruned(LogSeq(5)))
+        );
+        assert_eq!((c.tip(), c.anchor()), (None, None));
+        c.accept(shown(&es[5])).unwrap();
+        c.accept(hidden(&es[6..8])).unwrap();
+        assert_eq!(c.anchor(), Some(es[7].point().unwrap()));
+        // Pruned up to right after the anchor: it can still be checked.
+        let mut c = Chain::new(
+            id,
+            Some(es[2].point().unwrap()),
+            Some(es[2].point().unwrap()),
+        );
+        assert_eq!(
+            c.granted(Some(es[7].point().unwrap()), Some(LogSeq(3))),
+            Ok(Standing::Continuous)
+        );
+    }
+
+    /// The label is derived from signed records by the reader: a Started's
+    /// tool, and the same call's Finished and pushes; an operator push and
+    /// a call never seen start have none.
+    #[test]
+    fn labels_come_from_the_signed_started() {
+        let caller = NodeIdentity::from_seed([2; 32]).node_id();
+        let call = CallId::from_hex(&"3fa2".repeat(8)).unwrap();
+        let other = CallId::from_hex(&"9999".repeat(8)).unwrap();
+        let started = AuditRecord::Started {
+            call,
+            caller,
+            principal: None,
+            tool: ToolName::new("orders-db").unwrap(),
+            argv: Argv::new(vec![]).unwrap(),
+            roster_version: None,
+            role: None,
+            at_ms: 0,
+        };
+        let finished = |call| AuditRecord::Finished {
+            call,
+            exit: 0,
+            duration_ms: 1,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            stdout_digest: library::OutputDigest::empty(),
+            stdin_bytes: 0,
+            stdin_digest: library::OutputDigest::empty(),
+            stdin_head: None,
+        };
+        let push = |call| AuditRecord::Push {
+            id: library::PushId::from_hex(&"ab".repeat(16)).unwrap(),
+            to: caller,
+            principal: None,
+            role: None,
+            subject: library::Subject::new("s").unwrap(),
+            outcome: library::PushOutcome::Queued,
+            reason: None,
+            body: None,
+            call,
+            at_ms: 0,
+        };
+        let orders = Some(ServiceName::new("orders-db").unwrap());
+        let mut labels = Labels::default();
+        assert_eq!(labels.label(&finished(call)), None);
+        assert_eq!(labels.label(&started), orders);
+        assert_eq!(labels.label(&push(Some(call))), orders);
+        assert_eq!(labels.label(&finished(call)), orders);
+        assert_eq!(labels.label(&push(None)), None);
+        assert_eq!(labels.label(&push(Some(other))), None);
+        // Kept across runs in the marks file.
+        let json = serde_json::to_string(&labels).unwrap();
+        let mut back: Labels = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.label(&finished(call)), orders);
     }
 
     #[test]
@@ -860,6 +1288,7 @@ mod tests {
         );
         let denied = AuditRecord::Denied {
             caller,
+            principal: None,
             tool: None,
             reason: "no\nforged".into(),
             at_ms: 0,

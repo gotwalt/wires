@@ -568,10 +568,17 @@ wait "$WAIT_PID" || {
 	bad "7: inbox --wait did not exit 0 on the push"
 }
 grep -qF "build-42  passed" "$D/i3.out" || bad "7: inbox --wait did not print build-42"
-WIRES_HOME="$obs" "$WIRES" watch orders-db --once >"$D/w3.out" 2>/dev/null || true
+# The operator's push belongs to no service: its record goes to its recipient
+# only, not to the service's readers.
+WIRES_HOME="$agent" "$WIRES" watch --once >"$D/w3.out" 2>/dev/null || true
 PQ="$(the_line "$D/w3.out" "⇢" "→ $EMAIL" "\"build-41\"")" || {
 	cat "$D/w3.out" >&2
-	bad "7: the push is not in the workbench's records"
+	bad "7: the push is not in the agent's own records"
+}
+WIRES_HOME="$obs" "$WIRES" watch orders-db --once >"$D/w4.out" 2>/dev/null || true
+grep -qF "build-41" "$D/w4.out" && {
+	cat "$D/w4.out" >&2
+	bad "7: the reader of orders-db sees the operator's push to the agent"
 }
 ok "7: pushed by key, fetched with no open port; --wait woke on the next one"
 line "$(cat "$D/i1.out")"
