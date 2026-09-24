@@ -183,3 +183,23 @@ Lanes merged into `aaron/audit-fixes`: L1 (§2, §3), L2a (§1, §10 socket dir)
 - Admin edits that reach no host exit 1 (the state is still stored); scripts that edit before any host is up must tolerate it.
 - Open: §5 records (lane L3), §11 docs sweep.
 
+
+### Docs sweep (§11, lane L5)
+
+Documentation and doc comments only; no behaviour changed.
+- **Precedence:** protocol.md's intro, the board's non-negotiable and CLAUDE.md now say the premise outranks the docs and the docs outrank the code. The premise is stated in the board README, protocol.md and CLAUDE.md.
+- **§11 items:**
+  - "refused at the handshake" is now "any key can connect; one the state doesn't list is refused at its first message";
+  - "pushed to every member/machine" is now "pushed to the hosts; others pull";
+  - "cuts off at next call" is now "at each host that has the new state";
+  - "nothing is broadcast" is qualified by the whole state every member holds (card 29), and for records by hash links;
+  - "no TCP listener on either side" is now "on the host", naming `wires login`'s loopback port and the gateway;
+  - "never learns an address" is now "never names or configures one";
+  - usage's "can't start `serve`" now agrees with protocol §4 (a host pulls from other hosts when its preflight fails);
+  - stale references fixed: `idp.rs`/`IdentityClaim`, `invoke.rs` (`--expose`), `keystore.rs` file names, `config_v2.rs` `check_against`, `sync.rs` "before its preflight", roster-head and channel leftovers, board card 09's "without decrypting";
+  - demo.md's `remove` output now matches the code.
+- **`member`:** it no longer appears as a role anywhere, except protocol §3's "an ordinary role name", which is kept on purpose. Bench reports carry a one-line "setup has changed" note.
+- **Push:** the docs describe push as built (per-call capability, operator socket, role push) and link card 31 as next.
+- **Known limits:** README, usage, protocol §10 and the summary list what stays accepted until card 29: the O(members) org chart every member holds, argv seen by a removed host, hidden-link count and timing, and Google's ~1 h tokens with the nonce dropped on refresh.
+- **Refusals and the environment:** usage's service-environment paragraph (it still said `WIRES_HOME` is passed) and its revocation text ("in the host's log") are fixed: a non-member's refusal is traced, not logged.
+- **Checks:** `cargo test --workspace`, clippy `-D warnings` and `fmt --check` are green.

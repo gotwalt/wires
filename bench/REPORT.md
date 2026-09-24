@@ -5,6 +5,11 @@ sessions, all 100 scored correct. Total spend $4.18 (smoke tests: about $1.70 mo
 Arm 5 (card 19, [below](#arm-5-wires-is-the-only-thing-the-agent-can-run)) added
 50 more sessions the same day: $0.83, all correct.*
 
+*Note (card 28): the setup has changed since these runs. There is no built-in
+`member` role any more, so `bench/wires-up.sh` now registers `gh` for a role
+`bench` matched on the benchmark's IdP identity. The results below are from
+the runs as they were.*
+
 ## Headline
 
 The CLI arms used **about half to a third of the input tokens** and cost
@@ -232,8 +237,9 @@ python3 bench/report.py bench/results/<utc-date>-arm5.jsonl
 python3 bench/permission-probe.py --out /tmp/probe.jsonl   # docs/agent-sandbox.md evidence (~$0.20)
 ```
 
-`bench/wires-up.sh` serves `gh` from a member-only `host.json` (card 13's
-`wires serve host.json`; no channel, so no audit or IdP). Card 16's four
+At the time of these runs, `bench/wires-up.sh` served `gh` from a
+member-only `host.json` (card 13's `wires serve host.json`; no channel, so no
+audit or IdP); it now registers `gh` for role `bench` (see the note above). Card 16's four
 arms ran the binary of that time, which had `serve --expose 'gh=gh'`.
 
 Needs `claude` logged in, `gh` logged in, docker, and python3. The token is

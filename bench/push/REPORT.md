@@ -4,6 +4,12 @@
 `--model opus` → claude-opus-5-5, Claude Code 2.1.280), all correct. Spend
 $1.71 in results, plus about $0.35 of smoke tests and probes.*
 
+*Note (card 28): the setup has changed since these runs. There is no built-in
+`member` role any more (`bench/push/up.sh` now uses a role `bench` matched on
+the benchmark's IdP identity), and a service pushes through a per-call
+capability instead of the host's keystore. The results below are from the
+runs as they were.*
+
 **Task:** start build *n* on a remote mock CI (`wires call deploy -- build n`),
 wait for it to finish, read its log (`wires call logs -- build n --tail 50`),
 and report the failing test and the `left:` value of its assertion. The value
@@ -97,6 +103,6 @@ cargo build --release -p wires && ./bench/push/run.sh                 # 3 arms x
 python3 bench/push/report.py bench/push/results/2026-09-23.jsonl
 ```
 
-`bench/push/up.sh` provisions a loopback workbench (the mock CI plus
-`"push": {"allow": ["member"]}`) and one agent keystore per arm under
+`bench/push/up.sh` provisions a loopback workbench (the mock CI plus, at the
+time of these runs, `"push": {"allow": ["member"]}`; now role `bench`) and one agent keystore per arm under
 `/tmp/wb24`. The raw stream-json transcripts are not committed.
