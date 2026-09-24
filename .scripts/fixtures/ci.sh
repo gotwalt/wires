@@ -13,10 +13,12 @@
 #
 #   wires push --to "$WIRES_CALLER_NODE" --subject build-<n> -- "failed: …"
 #
-# which reaches the running `wires serve` over its control socket: serve sets
-# $WIRES_HOME to the host's keystore for every service it runs.
+# which reaches the running `wires serve` through this call's push capability:
+# serve gives every service it runs $WIRES_PUSH_SOCKET and a per-call
+# $WIRES_PUSH_TOKEN (never the host's keystore), good for pushing to this
+# call's caller until 10 minutes after the call ends.
 #
-# Environment (set on `wires serve`, inherited):
+# Environment (host.json `env`; a service inherits only PATH and the locale):
 #   CI_JOBS      state directory (default ./ci-jobs, relative to serve's cwd)
 #   CI_JOB_SECS  how long a build runs (default 5); $CI_JOBS/job-secs, if
 #                present, overrides it at deploy time (the benchmark sets it)

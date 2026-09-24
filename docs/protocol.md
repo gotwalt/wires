@@ -166,11 +166,22 @@ sent as `Denied` and logged as an `AuditRecord::Denied` (`wires/host/gate.rs`):
 
 The host then sends `HelloAck` (with `newer_state` when the caller's `state_version` is older) and
 execs the service's fixed argv **with the caller's argv appended element by element, never through
-a shell**, in its `cwd`, with its `env`. It scrubs every inherited `WIRES_*`, then sets the
-server-derived `WIRES_CALLER_NODE`, `WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_AFTER`,
-`WIRES_STATE_VERSION`, `WIRES_SERVICE`, `WIRES_TOOL`, `WIRES_ROLE`, `WIRES_HOME` (the host's own, so
-a service can `wires push`) and, when verified, `WIRES_CALLER_EMAIL`. If the connection closes, the
+a shell**, in its `cwd`. The child's environment is built from nothing (`env_clear`): only `PATH`,
+`LANG` and `LC_*` are inherited from `serve`; then `host.json`'s `env`; then the server-derived
+`WIRES_CALLER_NODE`, `WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_AFTER`, `WIRES_STATE_VERSION`,
+`WIRES_SERVICE`, `WIRES_TOOL`, `WIRES_ROLE`, and, when verified, `WIRES_CALLER_EMAIL`. With `push`
+on, also `WIRES_PUSH_SOCKET` and `WIRES_PUSH_TOKEN`, the call's push capability (§7). The child
+never gets `WIRES_HOME`, `HOME`, agent sockets or cloud credentials. If the connection closes, the
 host kills the child.
+
+The child still runs as `serve`'s own Unix user, so a service a caller can steer into reading or
+writing files can reach whatever that user can, the host's keystore included. **Run services as a
+separate Unix user** (for example, a `command` of `["sudo", "-u", "svc", "--", "tool"]`). `wires`
+does not switch users itself, and a service running as another user can't reach the child socket
+(§7, a 0700 directory) until the operator opens that directory to it. Independently of that, the host fails closed on the parts of its
+keystore a child could tamper with: it keeps the highest state version it has decided under in
+memory and refuses to decide under an older `state.json` (`responder configuration error`, logged
+as a rollback), and it trusts only issuer keys it fetched itself (§6).
 
 **The caller** (`wires call`, `wires mcp`) takes the service's hosts from its state, the last host
 that answered (`last-good.json`) first, then the admin's order. It fails over to the next host **only
@@ -197,7 +208,9 @@ value is accepted; `exp` and `iat` are within the 60 s clock skew; `nonce == for
 `email` is used only when `email_verified` is true; `hd` becomes `org` only when `iss` is exactly
 `https://accounts.google.com`; `groups` is kept. A host
 remembers the latest verified principal per node (`wires/host/identity.rs`) and never lets a failure
-or an older token displace it. It knows only the callers that presented a token **to it**.
+or an older token displace it. It knows only the callers that presented a token **to it**. A host
+keeps issuer key sets **in memory only** and never reads the `jwks/` disk cache, which anything
+running as its user could write; callers keep that cache, and trust a disk entry for at most 24 h.
 
 ## 7. Push: `wires/inbox/2`
 
@@ -222,8 +235,22 @@ with no verified identity here is in no role. A removed member's queue is droppe
 A receiver refuses a message whose `from` is not the authenticated peer or whose `to` is not itself.
 Delivery is at least once; the receiver removes duplicates by `PushId`. The host queues up to 64
 messages per recipient (oldest dropped), in `push-queue.json`. The TTL defaults to 24 h and is at
-most 7 d. `wires push` hands the message to the running `serve` over its control socket
-(`run/serve.sock`, mode 0600 in a 0700 directory). Each milestone is an `AuditRecord::Push`.
+most 7 d. Each milestone is an `AuditRecord::Push`.
+
+`wires push` hands the message to the running `serve` over one of two local sockets (NDJSON,
+`wires/host/control.rs`), each mode 0600 in a 0700 directory that the server and the operator's
+client both check is owned by `geteuid()`:
+
+- **The operator socket**, `run/serve.sock`: `{"push":{to, subject, body, ttl_secs?}}` to any node
+  or role. A service child is not told where it is.
+- **The child socket**, `child/push.sock`: a service pushing back to **its own caller**. For every
+  call, `serve` mints a random 32-byte token (64 hex) and gives the child `WIRES_PUSH_SOCKET` and
+  `WIRES_PUSH_TOKEN`; `wires push` sees the token and sends `{"caller_push":{token, push}}` (no
+  keystore needed). The socket accepts it only for a live token and only with `to` equal to that
+  call's caller node id (never a role or another node); the operator's `push` form is refused
+  there. A token is live for the call and 10 minutes after it ends (`CAPABILITY_GRACE`), so a job
+  the call started can still report; tokens are memory-only, so a restart kills them. The push
+  still passes `push.allow`, and its records carry `call`, the call whose capability sent it.
 
 ## 8. Records
 
@@ -231,7 +258,7 @@ most 7 d. `wires push` hands the message to the running `serve` over its control
 produces (`started {call, caller, principal?, tool, argv, roster_version?, role?}` — `roster_version`
 carries the state version — `finished {call, exit, duration_ms, stdout/stderr bytes, stdout_digest,
 stdin_bytes, stdin_digest, stdin_head ≤4 KiB}`, `denied {caller, tool?, reason}`, `push {id, to,
-subject, outcome, reason?, body?}`) becomes a `LogEntry { v: 1, host, seq, prev, at_ms, record,
+subject, outcome, reason?, body?, call?}`) becomes a `LogEntry { v: 1, host, seq, prev, at_ms, record,
 sig }`: dense 0-based `seq`, `prev` the hash of the previous entry (zero at seq 0), signed by the
 host over `"wires/call-log/v1\0"` ‖ canonical JSON of the other fields. `verify_chain` reports a bad
 signature, a gap, a broken link or a fork. The log is `call-log.jsonl` (fsync per entry), re-verified
@@ -267,8 +294,13 @@ Nothing is broadcast: a record leaves a host only when a reader asks for it and 
 | `tools.json` | — | caller | locked mode; optional aliases |
 | `inbox/` | 0700 | caller | `new/` (≤256 unread), `read/` (last 1024), `notes/` |
 | `record-marks.json` | — | reader | `wires watch` tips |
-| `call-log.jsonl`, `push-queue.json`, `jwks/` | — | host | §8, §7, cached issuer keys |
-| `run/serve.sock`, `run/hint` | 0600 | host | the push control socket; this host's own hint line |
+| `call-log.jsonl`, `push-queue.json` | — | host | §8, §7 |
+| `jwks/` | — | caller | cached issuer keys (a host never reads it, §6) |
+| `run/serve.sock`, `run/hint` | 0600 | host | the operator's push socket; this host's own hint line |
+| `child/push.sock` | 0600 | host | the child socket for a call's push capability (§7) |
+
+A host's keystore must not hold `root.seed`: `wires serve` refuses to start from the admin's
+keystore. Run the host from its own (`WIRES_HOME=<dir> wires id`, invite that node, join there).
 
 **Hints** (`wires/caller/pick.rs`). `$WIRES_HOME/hints` is local and unsigned: one line per node,
 `<node id hex> <ip:port>…`, `#` comments, bad lines skipped. Every endpoint `wires` binds registers

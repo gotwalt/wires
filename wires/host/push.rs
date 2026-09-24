@@ -4,11 +4,16 @@
 //! # Sending
 //!
 //! `wires push` is host-local: it hands a [`PushSpec`] to the running `wires
-//! serve` over its control socket ([`host_socket`],
-//! [`control`](crate::host::control)), and prints the [`PushReport`]. A
-//! service can address its own caller: the host puts the verified caller's id
-//! in each service's environment as `WIRES_CALLER_NODE`, so a service that
-//! starts background work can later run `wires push --to "$WIRES_CALLER_NODE" …`.
+//! serve` over a control socket ([`control`](crate::host::control)), and
+//! prints the [`PushReport`]. Two sockets, two authorities:
+//!
+//! - the **operator** socket ([`host_socket`], `run/serve.sock`): any node
+//!   or role, for whoever runs `serve`;
+//! - the **child** socket ([`capability`](crate::host::capability)): a
+//!   service pushes back to *its own caller* only, with the per-call token
+//!   `serve` put in its environment (`WIRES_PUSH_TOKEN`), so a service that
+//!   starts background work can later run `wires push --to
+//!   "$WIRES_CALLER_NODE" …`. Those records name the call (`call`).
 //!
 //! # Who may receive
 //!
@@ -58,7 +63,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use iroh::Endpoint;
 use library::{
-    AuditRecord, INBOX_ALPN, InboxFrame, MAX_BATCH, NodeId, Principal, PushBody, PushId,
+    AuditRecord, CallId, INBOX_ALPN, InboxFrame, MAX_BATCH, NodeId, Principal, PushBody, PushId,
     PushMessage, PushOutcome, Subject,
 };
 use serde::{Deserialize, Serialize};
@@ -173,6 +178,9 @@ impl PushReport {
 pub(crate) struct PushCommand {
     /// The request.
     pub(crate) spec: PushSpec,
+    /// The call whose push capability sent it (`None`: the operator, or a
+    /// capability push racing its call's `Started` record).
+    pub(crate) call: Option<CallId>,
     /// The report, or why the request itself was refused.
     pub(crate) reply: oneshot::Sender<std::result::Result<PushReport, String>>,
 }
@@ -192,6 +200,9 @@ pub(crate) struct Entry {
     /// The `push.allow` role that admitted it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) role: Option<String>,
+    /// The call whose push capability sent it (`None`: the operator).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) call: Option<CallId>,
 }
 
 /// Per-recipient FIFO queues, bounded by `cap` each. See the module docs.
@@ -368,6 +379,7 @@ impl PushHost {
                 outcome,
                 reason: reason.map(transport::truncate_reason),
                 body: self.log_body.then(|| entry.message.body.clone()),
+                call: entry.call,
                 at_ms: now_ms(),
             });
         }
@@ -436,9 +448,21 @@ impl PushHost {
         Ok(nodes)
     }
 
-    /// Send `spec`: authorize each recipient, queue, try a direct delivery,
-    /// record every outcome.
+    /// Send `spec` as the operator: [`send_from`](Self::send_from) with no
+    /// call.
+    #[cfg(test)]
     pub(crate) async fn send(&self, spec: PushSpec) -> Result<PushReport> {
+        self.send_from(spec, None).await
+    }
+
+    /// Send `spec`: authorize each recipient, queue, try a direct delivery,
+    /// record every outcome, naming `call` (the call whose push capability
+    /// sent it) in each record.
+    pub(crate) async fn send_from(
+        &self,
+        spec: PushSpec,
+        call: Option<CallId>,
+    ) -> Result<PushReport> {
         let ttl = spec
             .ttl_secs
             .map(Duration::from_secs)
@@ -466,6 +490,7 @@ impl PushHost {
                         message,
                         principal: None,
                         role: None,
+                        call,
                     };
                     self.record(&entry, PushOutcome::Denied, Some(reason.clone()));
                     report.results.push(PushResult {
@@ -482,6 +507,7 @@ impl PushHost {
                 message,
                 principal,
                 role,
+                call,
             };
             let id = entry.message.id;
             let who = entry.principal.as_ref().and_then(|p| p.email.clone());
@@ -709,10 +735,11 @@ impl PushHost {
         loop {
             tokio::select! {
                 command = commands.recv() => {
-                    let Some(PushCommand { spec, reply }) = command else { return };
+                    let Some(PushCommand { spec, call, reply }) = command else { return };
                     let me = Arc::clone(&self);
                     tokio::spawn(async move {
-                        let _ = reply.send(me.send(spec).await.map_err(|e| format!("{e:#}")));
+                        let sent = me.send_from(spec, call).await;
+                        let _ = reply.send(sent.map_err(|e| format!("{e:#}")));
                     });
                 }
                 _ = tick.tick() => self.sweep(now_ms()),
@@ -775,9 +802,45 @@ pub(crate) struct PushArgs {
     pub(crate) body: Vec<String>,
 }
 
+/// Where `wires push` sends its request, read from the environment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PushRoute {
+    /// Inside a service `serve` spawned: the child socket and the call's
+    /// token (`WIRES_PUSH_SOCKET`, `WIRES_PUSH_TOKEN`). No keystore needed.
+    Capability {
+        /// The child-facing control socket.
+        socket: PathBuf,
+        /// The call's push token, as the child was given it.
+        token: String,
+    },
+    /// The operator on the host: `run/serve.sock` under the wires home.
+    Operator,
+}
+
+impl PushRoute {
+    /// The route `var` (an environment lookup) implies: the capability when
+    /// `WIRES_PUSH_TOKEN` is set (which then needs `WIRES_PUSH_SOCKET` too),
+    /// else the operator's.
+    pub(crate) fn from_env(var: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        use crate::host::capability::{ENV_SOCKET, ENV_TOKEN};
+        let Some(token) = var(ENV_TOKEN).filter(|t| !t.is_empty()) else {
+            return Ok(PushRoute::Operator);
+        };
+        let socket = var(ENV_SOCKET).filter(|s| !s.is_empty()).ok_or_else(|| {
+            anyhow!("{ENV_TOKEN} is set but {ENV_SOCKET} is not (both come from `wires serve`)")
+        })?;
+        Ok(PushRoute::Capability {
+            socket: PathBuf::from(socket),
+            token,
+        })
+    }
+}
+
 /// `wires push`: hand the push to this machine's running `wires serve` and
-/// print what happened per recipient. Exit 0 when anyone got (or will get)
-/// it, 77 when every recipient was refused.
+/// print what happened per recipient. Inside a service (`WIRES_PUSH_TOKEN`
+/// set) it uses that call's push capability, which reaches only the call's
+/// caller; otherwise the operator's socket. Exit 0 when anyone got (or will
+/// get) it, 77 when every recipient was refused.
 pub(crate) async fn push_cmd(a: PushArgs) -> Result<i32> {
     let subject = Subject::new(a.subject).context("--subject")?;
     let body = if a.body.is_empty() && !std::io::stdin().is_terminal() {
@@ -796,15 +859,31 @@ pub(crate) async fn push_cmd(a: PushArgs) -> Result<i32> {
         body,
         ttl_secs: a.ttl.map(|t| t.duration().as_secs()),
     };
-    let socket = host_socket(&crate::admin::keystore::home()?);
-    let Some(mut client) = crate::host::control::ControlClient::connect(&socket).await? else {
-        bail!(
-            "no `wires serve` is running on this machine (`wires push` hands the message to it; \
-             looked for {})",
-            socket.display()
-        );
-    };
-    report(client.push(spec).await?)
+    use crate::host::control::ControlClient;
+    match PushRoute::from_env(|k| std::env::var(k).ok())? {
+        PushRoute::Capability { socket, token } => {
+            // The path came from the `serve` that spawned this process, not
+            // from a lookup, so there is no owner to second-guess here.
+            let Some(mut client) = ControlClient::connect_child(&socket).await? else {
+                bail!(
+                    "the `wires serve` that ran this service is gone (no control socket at {})",
+                    socket.display()
+                );
+            };
+            report(client.caller_push(token, spec).await?)
+        }
+        PushRoute::Operator => {
+            let socket = host_socket(&crate::admin::keystore::home()?);
+            let Some(mut client) = ControlClient::connect(&socket).await? else {
+                bail!(
+                    "no `wires serve` is running on this machine (`wires push` hands the message \
+                     to it; looked for {})",
+                    socket.display()
+                );
+            };
+            report(client.push(spec).await?)
+        }
+    }
 }
 
 /// Print `report`; exit 0 when anyone got (or will get) it, else 77.
@@ -817,26 +896,38 @@ fn report(report: PushReport) -> Result<i32> {
     })
 }
 
-/// The control socket a host's `serve` answers `wires push` on:
+/// The operator's control socket a host's `serve` answers `wires push` on:
 /// `$WIRES_HOME/run/serve.sock`, or a short stand-in when that path is too
 /// long to bind.
 pub(crate) fn host_socket(home: &std::path::Path) -> PathBuf {
-    use crate::host::control::{fits_sockaddr, run_dir, short_socket_path};
-    let full = run_dir(home).join("serve.sock");
-    if fits_sockaddr(&full) {
-        return full;
+    socket_path(
+        &crate::host::control::run_dir(home).join("serve.sock"),
+        home,
+    )
+}
+
+/// `full`, or its short stand-in ([`short_socket_path`]) when it is too long
+/// to bind; the stand-in is keyed by the uid owning `home`.
+///
+/// [`short_socket_path`]: crate::host::control::short_socket_path
+pub(crate) fn socket_path(full: &std::path::Path, home: &std::path::Path) -> PathBuf {
+    use crate::host::control::{fits_sockaddr, short_socket_path};
+    if fits_sockaddr(full) {
+        return full.to_path_buf();
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if let Ok(meta) = std::fs::metadata(home) {
             let bases = [std::env::temp_dir(), PathBuf::from("/tmp")];
-            if let Some(short) = short_socket_path(&full, meta.uid(), &bases) {
+            if let Some(short) = short_socket_path(full, meta.uid(), &bases) {
                 return short;
             }
         }
     }
-    full
+    #[cfg(not(unix))]
+    let _ = home;
+    full.to_path_buf()
 }
 
 #[cfg(test)]
@@ -862,6 +953,7 @@ mod tests {
             },
             principal: None,
             role: None,
+            call: None,
         }
     }
 
@@ -949,6 +1041,36 @@ mod tests {
             format!("denied     {}  {id}  no role", &node(3).hex()[..8])
         );
         assert!(report.any_accepted());
+    }
+
+    #[test]
+    fn push_takes_the_capability_route_only_when_a_token_is_set() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(PushRoute::from_env(env(&[])).unwrap(), PushRoute::Operator);
+        assert_eq!(
+            PushRoute::from_env(env(&[("WIRES_PUSH_SOCKET", "/s")])).unwrap(),
+            PushRoute::Operator
+        );
+        assert_eq!(
+            PushRoute::from_env(env(&[
+                ("WIRES_PUSH_SOCKET", "/s"),
+                ("WIRES_PUSH_TOKEN", "ab")
+            ]))
+            .unwrap(),
+            PushRoute::Capability {
+                socket: PathBuf::from("/s"),
+                token: "ab".into()
+            }
+        );
+        let e = PushRoute::from_env(env(&[("WIRES_PUSH_TOKEN", "ab")])).unwrap_err();
+        assert!(format!("{e}").contains("WIRES_PUSH_SOCKET"), "{e}");
     }
 
     proptest! {

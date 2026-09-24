@@ -18,7 +18,7 @@ use clap::Args;
 use library::NodeId;
 
 use super::config_v2::HostConfigV2;
-use super::{call_log, control, gate, identity, otlp, push, transport};
+use super::{call_log, capability, control, gate, identity, otlp, push, transport};
 use crate::admin::keystore;
 use crate::caller::jwks;
 use crate::init_logging;
@@ -106,9 +106,8 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(crate::state::sync::refresh_loop(endpoint, Arc::clone(&ks)));
     match push {
         Some(push) => {
-            let socket = control::ControlSocket::bind(&push::host_socket(&home)).await?;
             let (commands_tx, commands) = tokio::sync::mpsc::channel(16);
-            let _control = socket.spawn(commands_tx);
+            let _sockets = push_sockets(&home, &host, commands_tx).await?;
             tokio::select! {
                 () = push.run(commands) => Ok(()),
                 r = tokio::signal::ctrl_c() => r.context("waiting for ctrl-c"),
@@ -118,8 +117,17 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     }
 }
 
+/// The file whose presence marks an admin keystore.
+const ROOT_SEED: &str = "root.seed";
+
 /// A host for `me` (before its call log is attached): its identity verifier
-/// trusts exactly `config`'s issuers, caching JWKS under `home`.
+/// trusts exactly `config`'s issuers and keeps their keys **in memory only**
+/// (a key set on disk could have been planted by anything running as this
+/// user, a service child included). With `push` on, calls get a per-call
+/// push capability on the child socket under `home`.
+///
+/// Refuses an admin keystore (one holding `root.seed`): a host runs service
+/// children, and the fabric's root key must not sit beside them.
 pub(crate) fn services_host(
     me: NodeId,
     membership: library::Membership,
@@ -127,8 +135,20 @@ pub(crate) fn services_host(
     home: &Path,
     config: HostConfigV2,
 ) -> anyhow::Result<gate::ServicesHost> {
-    let fetcher = jwks::KeyFetcher::new(Some(home.join("jwks")))?;
+    if keystore.path(ROOT_SEED).exists() {
+        anyhow::bail!(
+            "{} holds the admin key ({ROOT_SEED}); a host runs services and must not share a \
+             keystore with the fabric's root. Run `wires serve` from the host's own keystore \
+             (WIRES_HOME=<another dir> wires id, invite that node, join it there)",
+            keystore.path("").display()
+        );
+    }
+    let fetcher = jwks::KeyFetcher::new(None)?;
     let identities = Arc::new(identity::Identities::new(fetcher, config.identity.trust()));
+    let push_grants = config.push.is_some().then(|| capability::PushGrants {
+        caps: Arc::default(),
+        socket: capability::child_socket(home),
+    });
     Ok(gate::ServicesHost {
         me,
         trust_root: membership.fabric,
@@ -137,7 +157,30 @@ pub(crate) fn services_host(
         config,
         identities,
         audit: None,
+        push_grants,
+        high_water: Default::default(),
     })
+}
+
+/// Bind the push control sockets and serve them into `commands`: the
+/// operator's (`run/serve.sock`, any push) and, when `host` hands out push
+/// capabilities, the child socket (a call's push to its own caller). Keep
+/// the handles: aborting one unbinds its socket.
+pub(crate) async fn push_sockets(
+    home: &Path,
+    host: &gate::ServicesHost,
+    commands: tokio::sync::mpsc::Sender<push::PushCommand>,
+) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+    let operator = control::ControlSocket::bind(&push::host_socket(home)).await?;
+    let mut handles = vec![operator.spawn(commands.clone(), control::Authority::Operator)];
+    if let Some(grants) = &host.push_grants {
+        let child = control::ControlSocket::bind(&grants.socket).await?;
+        handles.push(child.spawn(
+            commands,
+            control::Authority::Calls(Arc::clone(&grants.caps)),
+        ));
+    }
+    Ok(handles)
 }
 
 /// Serve a host on `endpoint`: the session ALPN, the state ALPN (so members
@@ -199,6 +242,113 @@ mod tests {
         ] {
             assert!(parse(gone).is_err(), "{gone:?}");
         }
+    }
+
+    /// A host's parts for the tests below: root 1, host 10, a keystore at
+    /// `home`, and a host.json trusting `issuer` (none: no identity).
+    fn host_at(
+        home: &Path,
+        issuer: Option<&library::Issuer>,
+    ) -> anyhow::Result<gate::ServicesHost> {
+        let root = library::NodeIdentity::from_seed([1u8; 32]);
+        let me = library::NodeIdentity::from_seed([10u8; 32]).node_id();
+        let identity = issuer.map_or(String::new(), |iss| {
+            format!(
+                r#""identity":{{"issuers":[{{"issuer":"{}","audiences":["{}"]}}]}},"#,
+                iss.as_str(),
+                crate::caller::mock_idp::MOCK_CLIENT_ID
+            )
+        });
+        let config = HostConfigV2::parse(&format!(
+            r#"{{"version":2,{identity}"services":{{"status":{{"command":["true"]}}}}}}"#
+        ))
+        .unwrap();
+        services_host(
+            me,
+            library::Membership::mint(&root, me, 0, i64::MAX).unwrap(),
+            Arc::new(keystore::Keystore::at(home)),
+            home,
+            config,
+        )
+    }
+
+    fn signed(version: u64) -> library::SignedState {
+        let root = library::NodeIdentity::from_seed([1u8; 32]);
+        let mut s = library::State::new(root.node_id());
+        s.version = library::StateVersion(version);
+        s.not_after = i64::MAX;
+        s.sign(&root).unwrap()
+    }
+
+    #[test]
+    fn serve_refuses_an_admin_keystore() {
+        let home = crate::testutil::temp_dir();
+        host_at(&home, None).unwrap();
+        keystore::Keystore::at(&home)
+            .save_root(&library::NodeIdentity::from_seed([1u8; 32]), false)
+            .unwrap();
+        let e = format!("{:#}", host_at(&home, None).unwrap_err());
+        assert!(e.contains("root.seed") && e.contains("own keystore"), "{e}");
+    }
+
+    #[test]
+    fn a_host_refuses_to_decide_under_a_rolled_back_state() {
+        let home = crate::testutil::temp_dir();
+        let host = host_at(&home, None).unwrap();
+        let ks = keystore::Keystore::at(&home);
+        let root = library::NodeIdentity::from_seed([1u8; 32]).node_id();
+        let now = crate::now_unix();
+        crate::state::store::adopt_if_newer(&ks, &signed(1), root, now).unwrap();
+        assert_eq!(host.state().unwrap().state.version.0, 1);
+        crate::state::store::adopt_if_newer(&ks, &signed(2), root, now).unwrap();
+        assert_eq!(host.state().unwrap().state.version.0, 2);
+        // Someone with write access puts version 1 back: it still verifies.
+        let old = signed(1).encode().unwrap();
+        std::fs::write(ks.path(crate::state::store::STATE_FILE), format!("{old}\n")).unwrap();
+        let e = format!("{:#}", host.state().unwrap_err());
+        assert!(e.contains("version 1") && e.contains("version 2"), "{e}");
+        // The push rule reads the same state, and refuses too.
+        assert!(host.decide_push(host.me, now).is_err());
+        // A state at least as new as the mark is decided under again.
+        crate::state::store::adopt_if_newer(&ks, &signed(3), root, now).unwrap();
+        assert_eq!(host.state().unwrap().state.version.0, 3);
+    }
+
+    /// A key set on disk in the host's home (a caller's cache, or one planted
+    /// by anything running as this user) is never what the host verifies
+    /// with: it fetches the issuer's keys itself.
+    #[tokio::test]
+    async fn a_host_trusts_only_the_keys_it_fetched_itself() {
+        let idp = crate::caller::mock_idp::MockIdp::start("alice@example.com").await;
+        let home = crate::testutil::temp_dir();
+        let now = crate::now_unix();
+        jwks::KeyFetcher::new(Some(home.join("jwks")))
+            .unwrap()
+            .keys(&idp.issuer, None, now)
+            .await
+            .unwrap();
+        assert_eq!(idp.jwks_fetches(), 1);
+        assert!(
+            std::fs::read_dir(home.join("jwks"))
+                .unwrap()
+                .next()
+                .is_some()
+        );
+
+        let host = host_at(&home, Some(&idp.issuer)).unwrap();
+        let alice = library::NodeIdentity::from_seed([2u8; 32]).node_id();
+        let token = idp.mint(&library::OidcNonce::for_node(&alice), now + 3600);
+        let who = host
+            .identities
+            .verify_token(alice, &token, now)
+            .await
+            .unwrap();
+        assert_eq!(who.email.as_deref(), Some("alice@example.com"));
+        assert_eq!(
+            idp.jwks_fetches(),
+            2,
+            "the host must fetch, not read the disk"
+        );
     }
 
     /// `serve --check` validates and summarizes without a keystore; a bad

@@ -20,10 +20,13 @@
 //! - [`otlp`] — optional OTLP/HTTP export of that log (`audit.otlp`).
 //! - [`push`] — `wires push`: messages to callers by key, queued, delivered
 //!   or fetched, gated by the signed state and `push.allow` (card 23).
-//! - [`control`] — the local socket `wires push` hands a push to `serve` on.
+//! - [`control`] — the local sockets `wires push` hands a push to `serve` on.
+//! - [`capability`] — the per-call push token a service child gets instead of
+//!   the host's keystore: it pushes only to that call's caller.
 
 pub mod audit;
 pub mod call_log;
+pub mod capability;
 pub mod config_v2;
 pub mod control;
 pub mod gate;
