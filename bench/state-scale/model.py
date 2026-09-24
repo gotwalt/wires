@@ -9,16 +9,17 @@ Three designs:
   badges  card 35 (built): members and the host list leave the state (a node
           is admitted by its root-signed badge; removal is a ban until the
           badge expires), so an invite is no edit. Distribution is unchanged.
-  apex    badges, plus a persistent directory (apex): hosts hold a long poll
-          to it and get only their own services' entries, bans and a
-          freshness timestamp; callers fetch their own view from it. Nothing
-          is syndicated to every node.
+  apex    badges, plus a persistent directory (apex, card 36): the admin
+          publishes to it; each host holds the whole root-signed policy and
+          follows it by subscription (a delta per edit and a freshness beat);
+          each caller holds only its view, the root-signed service entries
+          it may use (card 37). Nothing is syndicated to every caller.
 
 Byte sizes were measured from real signed states by the `state_sizes`
 example, which card 36b deleted with the one-blob state (it is in git
 history, at 055ac46): they are frozen, as the *today* and *badges* rows
 describe a design that no longer runs. The *apex* sizes come from
-`cargo run -q --release -p library --example policy_sizes` (card 36a).
+`cargo run -q --release -p library --example policy_sizes` (card 36d).
 Rates are assumptions, all in ASSUMPTIONS below.
 
   python3 bench/state-scale/model.py                 # group roles
@@ -55,9 +56,15 @@ ASSUMPTIONS = {
     "host_refresh_windows": 144,  # a host checks every 10 min
     "dial": 3_000,  # bytes of handshake per new iroh connection (not measured)
     "small_frame": 100,  # a `have` exchange, a "not modified"
-    # apex, measured by `cargo run -q --release -p library --example policy_sizes` (card 36a):
-    "entry_sig": 5,  # per-item share of one multiproof over a whole slice or view
-    "update": 2_800,  # a subscription update: new head (558 B), Fresh, multiproof
+    # apex, measured by `cargo run -q --release -p library --example policy_sizes` (card 36d):
+    "policy_base": 770,  # the root-signed head (540 B), the issuer and settings items
+    "service_entry": 610,  # a service item: its root-signed entry (the model's `service`, signed)
+    "policy_role": 101,  # a role item with one group matcher
+    "policy_ban": 115,  # a ban item
+    "update_service": 1_669,  # policy_update frame: new head, Fresh, one changed service
+    "update_ban": 1_183,  # policy_update frame: new head, Fresh, one new ban
+    "view_base": 986,  # a view's head (540 B) and Fresh (446 B)
+    "view_entry": 630,  # a view entry: the signed entry and its call/read marks
     "timestamp": 475,  # the freshness beat frame
     "heartbeats": 288,  # apex: one every 5 min
     "view_checks": 8,  # apex: a caller revalidates its view hourly while active
@@ -135,23 +142,31 @@ def model(tier, s, a, email_roles):
     )
     badges["invite"] = (s["membership"] + badges["held_caller"]) * 4 / 3
 
-    entry = s["service"] + a["entry_sig"]
-    per_host = services * a["replicas"] / hosts
+    # The whole root-signed policy: what the apex and every host hold.
+    policy_role_bytes = role_bytes - roles * (s["role"] - a["policy_role"])
+    policy = (
+        a["policy_base"]
+        + services * a["service_entry"]
+        + policy_role_bytes
+        + removals * a["badge_days"] * a["policy_ban"]
+    )
     visible = min(services, a["visible_services"])
+    # Every edit reaches every host as one delta: the new head, its Fresh and
+    # the changed item.
     host_in = (
         a["heartbeats"] * a["timestamp"]
-        + max(1.0, removals + service_edits) * a["update"]  # every edit moves the head
-        + service_edits * a["replicas"] / hosts * entry
-        + removals * (s["ban"] + small)
+        + max(1.0, service_edits) * a["update_service"]
+        + removals * a["update_ban"]
     )
     view_changes = service_edits * visible / services
-    caller_in = min(view_changes, a["view_checks"]) * (a["update"] + visible * entry) + a[
-        "view_checks"
-    ] * (small + dial)
+    caller_in = min(view_changes, a["view_checks"]) * a["update_service"] + a["view_checks"] * (
+        small + dial
+    )
     apex = {
-        "held_center": s["base"] + services * entry + role_bytes + bans,
-        "held_host": a["update"] + per_host * entry + min(roles, 3 * per_host) * role_bytes / roles + bans,
-        "held_caller": a["update"] + visible * entry,
+        "held_center": policy,
+        "held_host": policy,
+        "first_sync": policy + a["timestamp"],  # the whole policy in one frame
+        "held_caller": a["view_base"] + visible * a["view_entry"],
         "edits": max(1.0, removals + service_edits),
         "host_in": host_in,
         "caller_in": caller_in,
@@ -172,13 +187,14 @@ def table(results, email_roles) -> str:
     for design, title in [
         ("today", "**Today**"),
         ("badges", "**Badges only** (members leave the state)"),
-        ("apex", "**Apex** (directory; slices; views)"),
+        ("apex", "**Apex** (directory; hosts hold the policy; callers views)"),
     ]:
         rows.append(Row(title, [""] * len(TIERS)))
         d = [r[design] for r in results]
         if design == "apex":
             rows.append(Row("apex holds", [fmt(x["held_center"]) for x in d]))
             rows.append(Row("each host holds", [fmt(x["held_host"]) for x in d]))
+            rows.append(Row("a host's first sync", [fmt(x["first_sync"]) for x in d]))
             rows.append(Row("each caller holds", [fmt(x["held_caller"]) for x in d]))
         else:
             cap = [" (over frame cap)" if x["held_caller"] > FRAME_CAP else "" for x in d]

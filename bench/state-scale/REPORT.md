@@ -1,7 +1,9 @@
 # State scale: how much metadata each node moves
 
 *Modeled 2026-09-24 at 655a96c; the *badges* and *apex* rows re-modeled after
-card 35 built badges (the state's measured ban entry, and no host list). `python3 bench/state-scale/model.py`
+card 35 built badges (the state's measured ban entry, and no host list), and
+the *apex* rows again after card 36d (hosts hold the whole policy; no Merkle
+proofs). `python3 bench/state-scale/model.py`
 (`--email-roles`). Byte sizes were measured from real signed states by the
 `state_sizes` example (deleted with the one-blob state by card 36b; in git
 history at 055ac46), and the *apex* ones by `policy_sizes`; rates are
@@ -15,14 +17,21 @@ receive, per day, as the org grows, and what would a persistent directory
 **Measured sizes** (serialized signed JSON): a member 67 B, a host 134 B (both
 format 1, before card 35), a ban 78 B (format 2), a service entry 318 B (80-character description, 2 hosts, 2 allow roles,
 1 reader role), a role with one group matcher 73 B, each further email matcher
-75 B, a membership 361 B.
+75 B, a membership 361 B. In the signed policy (card 36d, `policy_sizes`): the
+root-signed head 540 B, a `Fresh` 446 B, a service item 610 B (the same entry,
+now root-signed on its own), a role item 101 B, a ban item 115 B; the whole
+policy is 67 KB at 100 services, 667 KB at 1k and 3.3 MB at 5k (with 30, 300
+and 1,500 open bans), which the model reproduces within 1%.
 
 **Main assumptions:** 2 nodes per user; 0.1% of nodes join or leave per day;
 1% of services edited per day; a caller is active 8 h/day; 3 KB per iroh
 handshake (not measured); a caller may use 30 services; in the apex design,
-**measured** by `policy_sizes` (card 36a): a 475 B freshness beat every 5 min, a
-2.8 KB subscription update per edit (every edit moves the head, so every host
-gets one), about 5 B of multiproof per held item; views revalidated hourly.
+**measured** by `policy_sizes` (card 36d): a 475 B freshness beat every 5 min;
+a `policy_update` per edit of 1.7 KB (one changed service) or 1.2 KB (one new
+ban), the new head, its `Fresh` and the changed item, which every host
+receives, since every host holds the whole policy; a caller's view entry 630 B
+(its signed entry and marks); views revalidated hourly, and a changed view
+entry costs one 1.7 KB update.
 
 ## Results (group roles)
 
@@ -48,20 +57,21 @@ gets one), about 5 B of multiproof per held item; views revalidated hourly.
 | each host sends callers /day | 3.1 MB | 8.8 MB | 242.0 MB | 7.5 GB |
 | admin sends /day | 35.5 KB | 4.0 MB | 3.6 GB | 179.4 GB |
 | whole network /day | 17.6 MB | 471.3 MB | 128.5 GB | 7.9 TB |
-| **Apex** (directory; slices; views) |  |  |  |  |
-| apex holds | 4.1 KB | 36.7 KB | 362.2 KB | 1.8 MB |
-| each host holds | 4.4 KB | 7.4 KB | 29.0 KB | 126.4 KB |
-| each caller holds | 6.0 KB | 12.5 KB | 12.5 KB | 12.5 KB |
+| **Apex** (directory; hosts hold the policy; callers views) |  |  |  |  |
+| apex holds | 7.4 KB | 67.3 KB | 666.3 KB | 3.3 MB |
+| each host holds | 7.4 KB | 67.3 KB | 666.3 KB | 3.3 MB |
+| a host's first sync | 7.8 KB | 67.8 KB | 666.8 KB | 3.3 MB |
+| each caller holds | 7.3 KB | 19.9 KB | 19.9 KB | 19.9 KB |
 | invite token | 785 B | 785 B | 785 B | 785 B |
-| each caller receives /day | 25.4 KB | 28.5 KB | 28.5 KB | 28.5 KB |
-| each host receives /day | 139.6 KB | 142.7 KB | 195.3 KB | 427.2 KB |
-| apex sends /day | 3.2 MB | 64.2 MB | 668.6 MB | 3.3 GB |
-| whole network /day | 3.2 MB | 64.2 MB | 668.6 MB | 3.3 GB |
+| each caller receives /day | 25.0 KB | 25.3 KB | 25.3 KB | 25.3 KB |
+| each host receives /day | 138.5 KB | 139.7 KB | 165.6 KB | 280.0 KB |
+| apex sends /day | 3.2 MB | 57.6 MB | 588.8 MB | 2.8 GB |
+| whole network /day | 3.2 MB | 57.6 MB | 588.8 MB | 2.8 GB |
 
 With email-list roles (Google has no groups claim; 30 people per role), today's
 state is about 1.3× larger (10.7 MB at *large*). In the apex design the extra
-bytes stay on the apex (4.7 MB) and in host slices (189 KB at *large*); caller
-views don't change.
+bytes stay in the policy the apex and each host hold (5.5 MB at *large*, a
+host's one-time first sync); host updates and caller views don't change.
 
 ## Findings
 
@@ -78,12 +88,14 @@ views don't change.
    where sync fails outright.
 5. **Badges alone cut per-node traffic about 5–6×,** but it still grows with
    the org (75 MB per caller per day at *large*). Card 35 built this.
-6. **The apex makes per-node cost nearly flat:** about 29 KB per caller per
-   day at every size; a host receives 140 KB (team) to 430 KB (*large*) a day.
-   A host's traffic is the 5-minute freshness beat (137 KB/day) plus one
-   2.8 KB update per edit anywhere in the fabric, since every edit moves the
-   head; so it grows with the edit rate, not with the number of nodes. The
-   whole network costs what one apex sends.
+6. **The apex makes per-node cost nearly flat:** about 25 KB per caller per
+   day at every size; a host receives 140 KB (team) to 280 KB (*large*) a day.
+   Each host holds the whole root-signed policy (67 KB at *company*, 3.3 MB at
+   *large*), fetched once; after that its traffic is the 5-minute freshness
+   beat (137 KB/day) plus one 1.2–1.7 KB `policy_update` per edit anywhere in
+   the fabric (the new head and the changed item, checked against the head's
+   one signature). So it grows with the edit rate, not with the number of
+   nodes. The whole network costs what one apex sends.
 7. **Today is fine at the demo size.** At *team* scale every number is small;
    the design only breaks past about 1k users.
 
@@ -102,19 +114,19 @@ directory, each row reads something smaller, or asks.
 
 | Reader | Uses the full copy for | With a directory |
 |---|---|---|
-| host gate (`host/gate.rs`) | caller is a member; service assigned here; `authorize` | badge + the ban list; its **slice** (own entries, the roles they name) |
-| host record stream | readers roles; membership | slice |
-| host push (`decide_push`) | recipient is a member; `push.allow` roles | badge + bans; the roles `host.json` names, in the slice |
-| host `StateResponder`, `refresh_loop` | serving and fetching state | **gone**: one long poll to the directory |
+| host gate (`host/gate.rs`) | caller is a member; service assigned here; `authorize` | badge + the ban list; its own copy of the **whole policy**, kept by `policy_update` deltas |
+| host record stream | readers roles; membership | the same copy |
+| host push (`decide_push`) | recipient is a member; `push.allow` roles | badge + bans; the roles `host.json` names, in the same copy |
+| host `StateResponder`, `refresh_loop` | serving and fetching state | **gone**: one `policy` subscription to the directory |
 | `wires call`, `mcp`, gateway | service → hosts, failover order | the caller's **view** (root-signed entries it may use), cached |
 | caller checks `HelloAck` | the state still assigns the service to that host | the host presents its own root-signed entry in `HelloAck`; no directory needed |
 | `wires services`, `tools/list` | `allowed_services` over the whole state | the view; search at the directory for large catalogs |
 | `wires inbox` | hosts to fetch from; who may deliver (`is_host`) | hosts in the view; a deliverer presents its signed entry |
 | `wires watch` | hosts of the services it reads | the view (read grants included) |
 | caller cold pull | freshness | **gone**: `HelloAck` carries the directory's version; revalidate only when it moved |
-| admin push to every host | distribution | one publish to the directory; hosts learn it by long poll |
+| admin push to every host | distribution | one publish to the directory; hosts learn it by subscription |
 | `invite` / `join` | the whole state in the token | badge + root key + directory keys (≈ 800 B) |
 
 Nothing in the table needs the directory to *decide* a call: hosts decide from
-their slice, callers dial from their cached view. The directory is on the
+their own copy of the policy, callers dial from their cached view. The directory is on the
 path for joining, for learning about changes, and for search.
