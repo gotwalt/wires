@@ -73,7 +73,14 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     let home = keystore::home()?;
     let ks = Arc::new(keystore::Keystore::resolve()?);
     let mut host = services_host(node.node_id(), membership, Arc::clone(&ks), &home, config)?;
-    let state = host.preflight(crate::now_unix())?;
+    // A host assigned a service while it was offline: pull, then try again.
+    let state = match host.preflight(crate::now_unix()) {
+        Ok(state) => state,
+        Err(e) => match crate::state::sync::pull_now(&ks, &node, a.relay_url.as_deref()).await {
+            Ok(Some(_)) => host.preflight(crate::now_unix())?,
+            _ => return Err(e),
+        },
+    };
     tracing::info!(
         state_version = state.state.version.0,
         services = host.config.services.len(),

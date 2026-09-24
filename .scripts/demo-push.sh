@@ -144,15 +144,18 @@ ISSUER="$(awk '/^issuer /{print $2}' "$D/idp.out")"
 CLIENT_ID="$(awk '/^client_id /{print $2}' "$D/idp.out")"
 admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1
 admin invite "$WB_ID" --name workbench >/dev/null 2>&1
+# The workbench isn't up yet, so each edit reaches no host and exits 1 (the
+# state is stored; the workbench's token carries it).
 for svc in deploy status logs; do
 	admin service add "$svc" --allow analyst --host workbench \
-		--description "$svc a CI build: \`$svc -- build <n>\`" >/dev/null 2>"$D/svc.err" || {
+		--description "$svc a CI build: \`$svc -- build <n>\`" >/dev/null 2>"$D/svc.err" ||
+		grep -qF "reached none of its 1 host(s)" "$D/svc.err" || {
 		cat "$D/svc.err" >&2
 		bad "setup: wires service add $svc failed"
 	}
 done
-# The workbench was offline for those pushes: its token carries the state.
-WIRES_HOME="$wb" "$WIRES" join "$(admin invite "$WB_ID" --name workbench 2>/dev/null)" >/dev/null
+WB_TOKEN="$(admin invite "$WB_ID" --name workbench 2>/dev/null)" || true
+WIRES_HOME="$wb" "$WIRES" join "$WB_TOKEN" >/dev/null
 
 HOST_JSON="$D/host.json"
 JOBS="$D/jobs"

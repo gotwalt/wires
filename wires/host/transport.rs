@@ -966,6 +966,10 @@ pub(crate) struct ServiceDialed {
 /// preferred order) until one connects within `dial_timeout`, then open with
 /// `hello`, send `invocation` and bridge stdio on that one.
 ///
+/// `on_ack` runs once the host's `HelloAck` has verified and **before** any
+/// stdin is forwarded, with the host's id and the newer state it handed back
+/// (if any): the caller adopts that state there and may abort the call.
+///
 /// Fails over **only on a dial failure**: once a host has answered, its
 /// refusal ([`Denied`]) or a mid-session error is final (it decided, and
 /// stdin may already be spent). Errors if no target connects, naming each
@@ -977,6 +981,7 @@ pub(crate) async fn call_service_on<R, W, E>(
     dial_timeout: std::time::Duration,
     hello: Hello,
     invocation: Invocation,
+    on_ack: impl FnOnce(NodeId, Option<&SignedState>) -> Result<()>,
     stdin: R,
     stdout: W,
     stderr: E,
@@ -1010,12 +1015,13 @@ where
         };
         let host = to_node_id(&conn.remote_id());
         let (send, recv) = conn.open_bi().await.context("opening bi-stream")?;
-        let dialed = dial_opened(
+        let dialed = dial_opened_with(
             send,
             recv,
             hello,
             invocation,
             Some(host),
+            |newer| on_ack(host, newer),
             stdin,
             stdout,
             stderr,
@@ -1030,21 +1036,55 @@ where
     bail!("no host answered ({})", failures.join("; "))
 }
 
-/// What a finished dial came to: the remote exit code and, when the host's
-/// `HelloAck` carried one, the newer signed state it handed back.
+/// What a finished dial came to: the remote exit code.
 #[derive(Debug)]
 pub(crate) struct Dialed {
     /// The remote child's exit code.
     pub(crate) exit: i32,
-    /// The host's newer state (card 27), for the caller to adopt.
-    pub(crate) newer_state: Option<SignedState>,
+}
+
+/// [`dial_opened_with`] with nothing to do at the ack (a newer state the
+/// host hands back is ignored): the session tests' form.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dial_opened<S, R, I, W, E>(
+    send: S,
+    recv: R,
+    hello: Hello,
+    invocation: Invocation,
+    verify_target: Option<NodeId>,
+    stdin: I,
+    stdout: W,
+    stderr: E,
+) -> Result<Dialed>
+where
+    S: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin,
+    I: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    dial_opened_with(
+        send,
+        recv,
+        hello,
+        invocation,
+        verify_target,
+        |_| Ok(()),
+        stdin,
+        stdout,
+        stderr,
+    )
+    .await
 }
 
 /// The dialer half of a session over an established bi-stream. Presents the
 /// `hello`, then reads the host's [`HelloAck`](library::HelloAck); when
-/// `verify_target` is `Some` (always, from [`call_service_on`]), verifies the responder's membership against the dialer's own
-/// fabric root and the authenticated target id **before** any stdin is
-/// forwarded. On failure, aborts with no stdin sent.
+/// `verify_target` is `Some` (always, from [`call_service_on`]), verifies the
+/// responder's membership against the dialer's own fabric root and the
+/// authenticated target id, then runs `on_ack` with the ack's newer state,
+/// all **before** any stdin is forwarded. On any failure, aborts with no
+/// stdin sent.
 ///
 /// The [`Frame::Invoke`] carrying `invocation` follows the opening
 /// immediately, without waiting for the ack.
@@ -1052,12 +1092,13 @@ pub(crate) struct Dialed {
 /// Errors if the session ends **without** an [`Frame::Exit`] — a responder that
 /// closes mid-session is a failure, not a silent success.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn dial_opened<S, R, I, W, E>(
+pub(crate) async fn dial_opened_with<S, R, I, W, E>(
     mut send: S,
     mut recv: R,
     hello: Hello,
     invocation: Invocation,
     verify_target: Option<NodeId>,
+    on_ack: impl FnOnce(Option<&SignedState>) -> Result<()>,
     stdin: I,
     mut stdout: W,
     mut stderr: E,
@@ -1084,11 +1125,13 @@ where
         None => bail!("the host closed before sending a hello ack"),
     };
     // Verify the service is a fabric member before streaming stdin.
-    // Credential-only (root-vouched + TTL); reverse roster-freshness is deferred.
+    // Credential-only (root-vouched + TTL); whether the host is still assigned
+    // the service is `on_ack`'s to check.
     if let Some(target_id) = verify_target {
         check_inclusion(&ack_membership, fabric_root, target_id, crate::now_unix())
             .map_err(|e| anyhow!("responder membership rejected (no stdin sent): {e}"))?;
     }
+    on_ack(newer_state.as_ref())?;
 
     // Local stdin -> Stdin frames, then shut down the send direction (EOF).
     let stdin_task = tokio::spawn(async move {
@@ -1138,10 +1181,7 @@ where
     if !saw_exit {
         bail!("session ended without an exit code (responder closed early?)");
     }
-    Ok(Dialed {
-        exit: code,
-        newer_state,
-    })
+    Ok(Dialed { exit: code })
 }
 
 #[cfg(test)]

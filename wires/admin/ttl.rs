@@ -9,9 +9,9 @@ use std::str::FromStr;
 pub(crate) struct Ttl(i64);
 
 impl Ttl {
-    /// The default for heads and memberships minted by `init` / `invite` /
-    /// `remove`: long, because nothing renews them yet (card 14 notes the
-    /// renewal story as a follow-up).
+    /// The default for memberships (`init` / `invite --ttl`) and for the
+    /// signed state (every edit's `--state-ttl`): long, because nothing
+    /// renews them yet (card 14 notes the renewal story as a follow-up).
     pub(crate) const DEFAULT: &'static str = "30d";
 
     /// The expiry `now_unix + self`, saturating.

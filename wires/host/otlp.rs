@@ -1,6 +1,7 @@
 //! Optional OTLP/HTTP (JSON) export of the host's call log (card 26a).
 //!
-//! With `"audit": {"otlp": "http://collector:4318"}` in `host.json`, every
+//! With `"audit": {"otlp": "https://collector.example:4318"}` in `host.json`
+//! (plain `http://` only to a collector on this machine), every
 //! entry the host appends to its [call log](crate::host::call_log) is also
 //! POSTed to `<endpoint>/v1/logs` as an OTLP `LogRecord`, so an org with a
 //! SIEM gets identity-stamped call records where its other logs live.
@@ -54,18 +55,37 @@ const LOGS_PATH: &str = "v1/logs";
 /// The instrumentation scope every record is filed under.
 const SCOPE: &str = "wires.call_log";
 
-/// The OTLP logs URL for a configured collector `endpoint`: `http`/`https`
-/// only, with `/v1/logs` appended unless the path already ends with it.
+/// The OTLP logs URL for a configured collector `endpoint`: `https`, or
+/// plain `http` only to a loopback host (`localhost`, `127.0.0.0/8`, `::1`):
+/// the records carry callers' identities and arguments, so they don't cross
+/// a network in the clear. `/v1/logs` is appended unless the path already
+/// ends with it.
 pub fn logs_url(endpoint: &str) -> Result<Url> {
     let mut url = Url::parse(endpoint).with_context(|| format!("{endpoint:?} is not a URL"))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        bail!("{endpoint:?}: an OTLP/HTTP endpoint is http:// or https://");
+    match url.scheme() {
+        "https" => {}
+        "http" if is_loopback(&url) => {}
+        "http" => bail!(
+            "{endpoint:?}: plain http:// is allowed only to a collector on this machine \
+             (localhost, 127.0.0.1, [::1]); use https://"
+        ),
+        _ => bail!("{endpoint:?}: an OTLP/HTTP endpoint is https:// (or http:// to localhost)"),
     }
     if !url.path().trim_end_matches('/').ends_with(LOGS_PATH) {
         let path = format!("{}/{LOGS_PATH}", url.path().trim_end_matches('/'));
         url.set_path(&path);
     }
     Ok(url)
+}
+
+/// Whether `url`'s host is this machine.
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 /// The sending side of the exporter: cheap to hold, never blocks.
@@ -378,8 +398,9 @@ mod tests {
     #[test]
     fn logs_url_appends_the_logs_path_once() {
         let u = |s| logs_url(s).unwrap().to_string();
-        assert_eq!(u("http://collector:4318"), "http://collector:4318/v1/logs");
-        assert_eq!(u("http://collector:4318/"), "http://collector:4318/v1/logs");
+        assert_eq!(u("http://127.0.0.1:4318"), "http://127.0.0.1:4318/v1/logs");
+        assert_eq!(u("http://localhost:4318/"), "http://localhost:4318/v1/logs");
+        assert_eq!(u("http://[::1]:4318"), "http://[::1]:4318/v1/logs");
         assert_eq!(
             u("https://c.example/otel/v1/logs"),
             "https://c.example/otel/v1/logs"
@@ -390,6 +411,22 @@ mod tests {
         );
         assert!(logs_url("collector:4318/x").is_err());
         assert!(logs_url("not a url").is_err());
+    }
+
+    /// Card 28 §10: records don't cross a network in the clear.
+    #[test]
+    fn plain_http_is_only_for_a_loopback_collector() {
+        for bad in [
+            "http://collector:4318",
+            "http://10.0.0.5:4318",
+            "http://[2001:db8::1]:4318",
+            "http://localhost.evil.example:4318",
+        ] {
+            let e = format!("{:#}", logs_url(bad).unwrap_err());
+            assert!(e.contains("https://"), "{bad}: {e}");
+        }
+        assert!(logs_url("https://collector:4318").is_ok());
+        assert!(logs_url("ftp://localhost").is_err());
     }
 
     /// Known answer: a `started` and its `finished`, attribute by attribute.

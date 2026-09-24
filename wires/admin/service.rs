@@ -17,6 +17,8 @@
 //! makes a node a host, and dropping its last service makes it a plain
 //! member again.
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use library::{
@@ -26,6 +28,7 @@ use library::{
 
 use super::invite::{Report, resolve_member};
 use super::keystore::Keystore;
+use super::propagate;
 use super::ttl::Ttl;
 use crate::now_unix;
 use crate::state::{store, sync};
@@ -67,8 +70,9 @@ pub(crate) struct ServiceEditArgs {
     /// A role that may read its call records. Repeatable.
     #[arg(long = "reader")]
     pub(crate) reader: Vec<String>,
-    /// Lifetime of the new state (`30d`, `12h`, … or seconds).
-    #[arg(long, default_value = Ttl::DEFAULT)]
+    /// Lifetime of the new state, from now (`30d`, `12h`, … or seconds);
+    /// never shortens the current one.
+    #[arg(long = "state-ttl", default_value = Ttl::DEFAULT)]
     pub(crate) ttl: Ttl,
 }
 
@@ -77,8 +81,8 @@ pub(crate) struct ServiceEditArgs {
 pub(crate) struct ServiceRmArgs {
     /// The service to drop.
     pub(crate) name: String,
-    /// Lifetime of the new state.
-    #[arg(long, default_value = Ttl::DEFAULT)]
+    /// Lifetime of the new state, from now; never shortens the current one.
+    #[arg(long = "state-ttl", default_value = Ttl::DEFAULT)]
     pub(crate) ttl: Ttl,
 }
 
@@ -111,8 +115,8 @@ pub(crate) struct RoleSetArgs {
     /// The IdP a matcher trusts when it names none: its exact `iss`.
     #[arg(long, default_value = GOOGLE_ISSUER)]
     pub(crate) issuer: String,
-    /// Lifetime of the new state.
-    #[arg(long, default_value = Ttl::DEFAULT)]
+    /// Lifetime of the new state, from now; never shortens the current one.
+    #[arg(long = "state-ttl", default_value = Ttl::DEFAULT)]
     pub(crate) ttl: Ttl,
 }
 
@@ -121,8 +125,8 @@ pub(crate) struct RoleSetArgs {
 pub(crate) struct RoleRmArgs {
     /// The role to drop.
     pub(crate) name: String,
-    /// Lifetime of the new state.
-    #[arg(long, default_value = Ttl::DEFAULT)]
+    /// Lifetime of the new state, from now; never shortens the current one.
+    #[arg(long = "state-ttl", default_value = Ttl::DEFAULT)]
     pub(crate) ttl: Ttl,
 }
 
@@ -163,8 +167,10 @@ impl ServiceEdit {
 // ---------------------------------------------------------------------------
 
 /// Sign and store the next version of this keystore's state: the stored one
-/// (or, for `wires init`, an empty one) changed by `change`, hosts re-derived, version + 1, valid until
-/// `ttl` from now. Validation failures name the broken rule.
+/// (or, for `wires init`, an empty one) changed by `change`, hosts
+/// re-derived, version + 1, valid until `ttl` from now or the stored one's
+/// expiry, whichever is later (an edit never shortens the state's
+/// lifetime). Validation failures name the broken rule.
 pub(crate) fn edit_state(
     ks: &Keystore,
     ttl: Ttl,
@@ -187,7 +193,9 @@ pub(crate) fn edit_state(
     let now = now_unix();
     next.version = StateVersion(next.version.0 + 1);
     next.issued = now;
-    next.not_after = ttl.not_after(now);
+    next.not_after = ttl
+        .not_after(now)
+        .max(held.as_ref().map_or(i64::MIN, |s| s.state.not_after));
     let signed = next.sign(&root).context("the new state is not valid")?;
     if !store::adopt_if_newer(ks, &signed, root.node_id(), now)? {
         bail!("another admin command changed the state meanwhile; run this one again");
@@ -443,30 +451,34 @@ pub(crate) fn role_in(ks: &Keystore, a: RoleArgs) -> Result<(String, SignedState
     ))
 }
 
-/// Push the stored state and fold the outcome into a [`Report`].
-async fn pushed(ks: &Keystore, stdout: String) -> Result<Report> {
-    let note = match sync::push_current(ks).await {
-        Ok(line) => line,
-        Err(e) => format!("the new state is stored but was not pushed: {e:#}"),
-    };
-    Ok(Report {
+/// Push the stored state to the hosts (and `earlier`, the hosts before the
+/// edit) and fold the outcome into a [`Report`].
+async fn pushed(ks: &Keystore, stdout: String, earlier: &BTreeSet<NodeId>) -> Result<Report> {
+    let report = Report {
         stdout,
-        notes: vec![note],
-    })
+        notes: Vec::new(),
+        failure: None,
+    };
+    Ok(propagate::fold(
+        report,
+        propagate::propagate(ks, earlier).await,
+    ))
 }
 
 /// `wires service …` against the resolved keystore, then push.
 pub(crate) async fn service_cmd(a: ServiceArgs) -> Result<Report> {
     let ks = Keystore::resolve()?;
+    let earlier = sync::held_hosts(&ks)?;
     let (stdout, _) = service_in(&ks, a)?;
-    pushed(&ks, stdout).await
+    pushed(&ks, stdout, &earlier).await
 }
 
 /// `wires role …` against the resolved keystore, then push.
 pub(crate) async fn role_cmd(a: RoleArgs) -> Result<Report> {
     let ks = Keystore::resolve()?;
+    let earlier = sync::held_hosts(&ks)?;
     let (stdout, _) = role_in(&ks, a)?;
-    pushed(&ks, stdout).await
+    pushed(&ks, stdout, &earlier).await
 }
 
 #[cfg(test)]
@@ -480,13 +492,7 @@ mod tests {
     /// An initialized admin keystore with `extra` more members in its state.
     pub(crate) fn admin_with(extra: &[NodeId]) -> Keystore {
         let ks = Keystore::at(temp_dir());
-        init_in(
-            &ks,
-            InitArgs {
-                ttl: Ttl::DEFAULT.parse().unwrap(),
-            },
-        )
-        .unwrap();
+        init_in(&ks, InitArgs::default()).unwrap();
         let extra = extra.to_vec();
         edit_state(&ks, ttl(), |s| {
             s.members.extend(extra);

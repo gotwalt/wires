@@ -474,17 +474,26 @@ pub struct McpArgs {
 }
 
 /// `config`'s aliases, then one [`ToolTarget::Service`] tool per grant (its
-/// registry description), skipping a name an alias already takes.
+/// registry description). A registered service wins: an alias with the name
+/// of any service in `state` is dropped (with a warning), granted or not.
 pub(crate) fn with_services(
     mut config: ToolsConfig,
     state: &library::State,
     grants: &[library::Grant],
 ) -> ToolsConfig {
+    config.tools.retain(|t| {
+        let registered =
+            library::ServiceName::new(t.name.as_str()).is_ok_and(|n| state.service(&n).is_some());
+        if registered {
+            tracing::warn!(
+                "tools.json alias `{}` is shadowed by the registered service of that name",
+                t.name
+            );
+        }
+        !registered
+    });
     for g in grants {
         let name = library::ToolName::from(g.service.clone());
-        if config.get(&name).is_some() {
-            continue;
-        }
         config.tools.push(RemoteTool {
             name,
             description: state
@@ -952,8 +961,9 @@ mod tests {
         );
     }
 
+    /// Card 28 §8: a registered service beats an alias of the same name.
     #[test]
-    fn services_become_tools_after_the_aliases() {
+    fn services_become_tools_after_the_aliases_and_shadow_them() {
         use library::{Grant, RoleName, Service, ServiceName, State};
         let node = |b: u8| NodeIdentity::from_seed([b; 32]).node_id();
         let mut state = State::new(node(1));
@@ -978,15 +988,22 @@ mod tests {
             })
             .collect();
         let aliases = ToolsConfig {
-            tools: vec![entry("db_query", "an alias")],
+            tools: vec![entry("db_query", "an alias"), entry("mine", "kept")],
             ..ToolsConfig::default()
         };
         let config = with_services(aliases, &state, &grants);
         let names: Vec<_> = config.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["db_query", "orders-db"]);
-        assert_eq!(config.tools[0].description, "an alias");
+        assert_eq!(names, ["mine", "db_query", "orders-db"]);
+        assert_eq!(config.tools[0].description, "kept");
         assert_eq!(config.tools[1].target, ToolTarget::Service);
-        assert_eq!(config.tools[1].description, "Read-only SQL");
+        assert_eq!(config.tools[1].description, "shadowed");
+        assert_eq!(config.tools[2].description, "Read-only SQL");
+        // Registered but not granted: the alias still goes.
+        let aliases = ToolsConfig {
+            tools: vec![entry("db_query", "an alias")],
+            ..ToolsConfig::default()
+        };
+        assert!(with_services(aliases, &state, &[]).tools.is_empty());
     }
 
     proptest! {

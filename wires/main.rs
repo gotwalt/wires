@@ -65,6 +65,7 @@ Admin — signs who's in and what runs where (holds the root key):
   remove    Drop a node; hosts refuse its next call
   service   Register services: add / set / rm (name, allowed roles, hosts)
   role      Define roles from IdP identity: set / rm
+  state     Re-send the signed state to every host (push)
 
 Host — implements the services assigned to it:
   serve     Run host.json's services; check every caller; log every call
@@ -103,15 +104,19 @@ enum Command {
     /// sign the first state (this node its one member).
     Init(admin::init::InitArgs),
     /// Add a node to the signed state and print its join token (stdout); the
-    /// new state is pushed to every member.
+    /// new state is pushed to every host.
     Invite(admin::invite::InviteArgs),
     /// Remove a node (by `--name` label or id) from the signed state; it is
-    /// pushed to hosts first, and every host refuses the node's next call.
+    /// pushed to the hosts, and every host that has it refuses the node's
+    /// next call.
     Remove(admin::invite::RemoveArgs),
     /// Edit the service registry in the signed state, and push it.
     Service(admin::service::ServiceArgs),
     /// Edit the role definitions in the signed state, and push them.
     Role(admin::service::RoleArgs),
+    /// The signed state itself: `push` re-sends it to every host (after an
+    /// edit that reached none).
+    State(admin::propagate::StateArgs),
 
     // --- host ---
     /// Implement the services host.json names (and the signed state assigns
@@ -277,6 +282,13 @@ fn main() {
                 Err(e) => exit_with(e),
             }
         }
+        Command::State(a) => {
+            init_quiet_logging();
+            match runtime().block_on(admin::propagate::state_cmd(a)) {
+                Ok(report) => print_report(report),
+                Err(e) => exit_with(e),
+            }
+        }
         Command::Id => print_or_exit(caller::join::id_cmd()),
         Command::Join(a) => print_or_exit(caller::join::join_cmd(a)),
         Command::Serve(a) => {
@@ -370,12 +382,20 @@ fn print_or_exit(result: anyhow::Result<String>) {
 }
 
 /// Print an admin command's notes on stderr and its result on stdout (the
-/// token, for `invite` — so `$(wires invite …)` is the token alone).
+/// token, for `invite` — so `$(wires invite …)` is the token alone). A
+/// failure (the new state reached no host) is printed last and exits 1: the
+/// work is done and stored, but not in force.
 fn print_report(report: admin::invite::Report) {
     for note in &report.notes {
         eprintln!("wires: {note}");
     }
-    println!("{}", report.stdout);
+    if !report.stdout.is_empty() {
+        println!("{}", report.stdout);
+    }
+    if let Some(failure) = report.failure {
+        eprintln!("wires: {failure}");
+        std::process::exit(1);
+    }
 }
 
 /// Report a network-command failure and exit.
@@ -444,6 +464,18 @@ mod tests {
         assert!(Cli::try_parse_from(["wires", "invite", &id, "--name", "alice"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "invite"]).is_err());
         assert!(Cli::try_parse_from(["wires", "remove", "alice"]).is_ok());
+        // Card 28: `--ttl` is a membership's lifetime, `--state-ttl` the
+        // signed state's.
+        assert!(
+            Cli::try_parse_from(["wires", "invite", &id, "--ttl", "1h", "--state-ttl", "30d"])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["wires", "init", "--state-ttl", "7d"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "remove", "alice", "--state-ttl", "7d"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "remove", "alice", "--ttl", "7d"]).is_err());
+        assert!(Cli::try_parse_from(["wires", "service", "rm", "db", "--state-ttl", "7d"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "service", "rm", "db", "--ttl", "7d"]).is_err());
+        assert!(Cli::try_parse_from(["wires", "state", "push"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "id"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "join"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "join", "tok"]).is_ok());

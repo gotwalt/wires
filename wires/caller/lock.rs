@@ -13,8 +13,15 @@
 //!   read for this, never a `--tools-file`.
 //!
 //! Once on, every [`CredArgs`] flag is refused with an error naming it
-//! ([`OVERRIDE_FLAGS`]); the shaping flags (`--jq`, `--head`, `--max-bytes`),
+//! ([`OVERRIDE_FLAGS`]), and so are the environment variables that override
+//! the same credentials ([`OVERRIDE_ENV`]: `WIRES_NODE_SEED`,
+//! `WIRES_MEMBERSHIP`); the shaping flags (`--jq`, `--head`, `--max-bytes`),
 //! the tool name and its arguments are untouched.
+//!
+//! **What it assumes.** Locked mode is only as strong as the agent's inability
+//! to set its own environment: `WIRES_LOCKED` itself, and `WIRES_HOME` (which
+//! picks the keystore and `tools.json`), are read from it. Run the agent where
+//! the operator, not the agent, sets them (`docs/agent-sandbox.md`).
 //!
 //! **stdin.** `wires call`'s stdin can carry working-directory files to the
 //! host (`wires call t -- x < secrets.txt` passes Claude Code's permission
@@ -56,6 +63,10 @@ pub const OVERRIDE_FLAGS: &[&str] = &[
     "--relay-url",
 ];
 
+/// Every environment variable locked mode refuses: the ones that override
+/// this node's credentials, like `--node-seed` and `--membership` do.
+pub const OVERRIDE_ENV: &[&str] = &["WIRES_NODE_SEED", "WIRES_MEMBERSHIP"];
+
 /// How long a locked `wires call` waits for the first byte of a non-terminal
 /// stdin before treating it as empty (a harness may hold stdin open without
 /// ever writing). Nothing read later is forwarded either way.
@@ -88,6 +99,8 @@ pub enum Lock {
 pub enum Refused {
     /// An override flag was passed.
     Flag(&'static str),
+    /// A credential-override environment variable is set.
+    Env(&'static str),
     /// `wires call`'s stdin held data and the operator didn't allow it.
     Stdin,
 }
@@ -100,6 +113,12 @@ impl std::fmt::Display for Refused {
                 "{flag} is not allowed in locked mode (set by the operator: {LOCKED_ENV}=1 or \
                  \"locked\" in tools.json); only --jq, --head, --max-bytes, the tool name and \
                  its arguments are"
+            ),
+            Self::Env(var) => write!(
+                f,
+                "${var} is not allowed in locked mode (set by the operator: {LOCKED_ENV}=1 or \
+                 \"locked\" in tools.json): it overrides this node's credentials; the keystore's \
+                 are used"
             ),
             Self::Stdin => write!(
                 f,
@@ -150,14 +169,30 @@ impl Lock {
         ))
     }
 
-    /// Refuse the first override flag set in `creds`, if locked.
+    /// Refuse the first override flag set in `creds`, then the first
+    /// [`OVERRIDE_ENV`] variable set in this process, if locked.
     pub fn check(&self, creds: &CredArgs) -> std::result::Result<(), Refused> {
+        self.check_with_env(creds, |k| std::env::var_os(k).is_some())
+    }
+
+    /// [`check`](Self::check) with the environment given as `is_set` (a
+    /// variable set to anything, even empty, counts).
+    pub fn check_with_env(
+        &self,
+        creds: &CredArgs,
+        is_set: impl Fn(&str) -> bool,
+    ) -> std::result::Result<(), Refused> {
         match self {
             Self::Open => Ok(()),
-            Self::Locked { .. } => match overrides(creds).first() {
-                Some(flag) => Err(Refused::Flag(flag)),
-                None => Ok(()),
-            },
+            Self::Locked { .. } => {
+                if let Some(flag) = overrides(creds).first() {
+                    return Err(Refused::Flag(flag));
+                }
+                match OVERRIDE_ENV.iter().find(|v| is_set(v)) {
+                    Some(var) => Err(Refused::Env(var)),
+                    None => Ok(()),
+                }
+            }
         }
     }
 
@@ -297,6 +332,24 @@ mod tests {
         }
     }
 
+    /// Card 28 §10: locked mode refuses the credential environment
+    /// overrides as it refuses the flags; open mode reads them.
+    #[test]
+    fn locked_mode_refuses_the_credential_env_overrides() {
+        let a = call(&["gh", "--", "pr", "list"]);
+        for var in OVERRIDE_ENV {
+            let set = |k: &str| k == *var;
+            let err = LOCKED.check_with_env(&a.creds, set).unwrap_err();
+            assert_eq!(err, Refused::Env(var));
+            assert!(err.to_string().contains(var), "{err}");
+            assert_eq!(Lock::Open.check_with_env(&a.creds, set), Ok(()));
+        }
+        assert_eq!(LOCKED.check_with_env(&a.creds, |_| false), Ok(()));
+        // WIRES_HOME and WIRES_LOCKED are the operator's; not refused here.
+        let home = |k: &str| k == "WIRES_HOME" || k == LOCKED_ENV;
+        assert_eq!(LOCKED.check_with_env(&a.creds, home), Ok(()));
+    }
+
     #[test]
     fn shaping_flags_tool_and_args_are_accepted_when_locked() {
         let a = call(&[
@@ -315,13 +368,14 @@ mod tests {
             "--tools-file",
             "y",
         ]);
-        assert_eq!(LOCKED.check(&a.creds), Ok(()));
+        let unset = |_: &str| false;
+        assert_eq!(LOCKED.check_with_env(&a.creds, unset), Ok(()));
         assert_eq!(a.args[2], "--relay-url", "remote argv, not ours");
         assert_eq!(
-            LOCKED.check(&call(&["eacc34e0/db_query", "select 1"]).creds),
+            LOCKED.check_with_env(&call(&["eacc34e0/db_query", "select 1"]).creds, unset),
             Ok(())
         );
-        assert_eq!(LOCKED.check(&mcp(&[]).creds), Ok(()));
+        assert_eq!(LOCKED.check_with_env(&mcp(&[]).creds, unset), Ok(()));
     }
 
     #[test]

@@ -316,10 +316,13 @@ fn write_secret(path: &Path, contents: &str, force: bool) -> Result<()> {
 /// accident.
 ///
 /// `rename(2)` within a directory is atomic, so a reader sees either the
-/// previous contents or the new ones and never a splice of the two. The mode is
-/// set on the temporary file *before* the rename, so the target is never
-/// momentarily world-readable either.
+/// previous contents or the new ones and never a splice of the two. The
+/// temporary file is created with `O_EXCL` (never following a planted file or
+/// symlink) and mode `0600` **from the start**, so no one else can open it
+/// while it is written; it is widened to `mode` (e.g. `0644` for a public
+/// membership) only after the write. With no `mode` it stays `0600`.
 pub(crate) fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) -> Result<()> {
+    use std::io::Write;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
@@ -333,7 +336,19 @@ pub(crate) fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) ->
     let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
 
     let result = (|| -> Result<()> {
-        std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(contents.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        drop(f);
         if let Some(mode) = mode {
             set_mode(&tmp, mode);
         }
@@ -464,6 +479,37 @@ mod tests {
             .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Card 28 §10: a file written through `write_text_mode` is never
+    /// world-readable unless asked (its temporary file is created `0600`),
+    /// and an explicit mode still applies.
+    #[cfg(unix)]
+    #[test]
+    fn text_files_are_private_unless_widened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let private = dir.join("state-checked.txt");
+        write_text_mode(&private, "1\n", None).unwrap();
+        assert_eq!(mode(&private), 0o600);
+        let public = dir.join("membership.json");
+        write_text_mode(&public, "m\n", Some(0o644)).unwrap();
+        assert_eq!(mode(&public), 0o644);
+        // Overwriting keeps it atomic and leaves no temporary behind.
+        write_text_mode(&private, "2\n", None).unwrap();
+        assert_eq!(std::fs::read_to_string(&private).unwrap(), "2\n");
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     fn fixture_membership() -> Membership {
