@@ -1,6 +1,6 @@
 # 33 — Wires-native services: the host runtime as a library
 
-**Lane:** N · **Depends on:** 28 · **Status:** Phases 0–2 done (Rust, Python, TypeScript); packaging open (2026-09-23)
+**Lane:** N · **Depends on:** 28 · **Status:** in review (2026-09-23): Phases 0–2 done (Rust, Python, TypeScript) and merged to main; packaging (wheel, npm) is the open follow-up
 · **Files:** `library/membership/identity.rs` (key hygiene), `wires/admin/keystore.rs`
 (seed read/write only), `wires/host/transport.rs` (the bridge), `wires/host/service.rs`
 (new), `wires/host/serve.rs`, protocol.md §9; Phase 1: `wires/lib.rs` (was
