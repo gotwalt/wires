@@ -36,6 +36,28 @@ use crate::caller::login::{Pkce, authorization_url, exchange_code, random_token}
 
 /// The cookie binding a consent page to the browser that loaded it.
 const CONSENT_COOKIE: &str = "wires_authz";
+/// The cookie binding the IdP's redirect back to the browser that consented:
+/// without it, a copied IdP link would skip the consent page entirely.
+const CALLBACK_COOKIE: &str = "wires_cb";
+
+/// What [`CALLBACK_COOKIE`] holds for authorization `id`: a hash, so the
+/// cookie alone never names a pending authorization.
+fn callback_binding(id: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ring::digest::digest(
+        &ring::digest::SHA256,
+        format!("wires gateway callback v1:{id}").as_bytes(),
+    ))
+}
+
+/// `; Secure` on an https gateway (a loopback test gateway is plain http).
+fn secure_attr(urls: &PublicUrls) -> &'static str {
+    if urls.issuer.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    }
+}
 
 type Gw<B> = State<Arc<Gateway<B>>>;
 
@@ -247,11 +269,7 @@ pub(crate) async fn authorize<B: Backend>(
 
 /// The consent page: who is asking, where the grant goes, one button.
 fn consent(urls: &PublicUrls, client: &Client, redirect: &Url, id: &str) -> Response {
-    let secure = if urls.issuer.starts_with("https://") {
-        "; Secure"
-    } else {
-        ""
-    };
+    let secure = secure_attr(urls);
     let cookie = format!(
         "{CONSENT_COOKIE}={id}; Path=/authorize; HttpOnly; SameSite=Strict; Max-Age={PENDING_TTL_SECS}{secure}"
     );
@@ -337,17 +355,43 @@ pub(crate) async fn confirm<B: Backend>(
     );
     url.query_pairs_mut()
         .append_pair("prompt", "select_account");
-    Redirect::to(url.as_str()).into_response()
+    // `Lax`, not `Strict`: the IdP's redirect back is a cross-site
+    // top-level navigation, which `Lax` still carries.
+    let bind = format!(
+        "{CALLBACK_COOKIE}={}; Path=/oauth/callback; HttpOnly; SameSite=Lax; Max-Age={PENDING_TTL_SECS}{}",
+        callback_binding(id),
+        secure_attr(&gw.urls)
+    );
+    let mut resp = Redirect::to(url.as_str()).into_response();
+    resp.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&bind).expect("ascii"),
+    );
+    resp
 }
 
 /// `GET /oauth/callback`: the IdP's answer. Verify, admit, hand the client
 /// a code.
+///
+/// Only in the browser that pressed continue on the consent page: the
+/// [`CALLBACK_COOKIE`] set there must match `state`. Otherwise an IdP link
+/// copied out of someone else's authorization (theirs, with their redirect
+/// URI) would sign the victim in to it with no consent page. A mismatch
+/// leaves the authorization pending: it isn't the victim's to spend.
 pub(crate) async fn callback<B: Backend>(
     State(gw): Gw<B>,
+    headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let now = crate::now_unix();
-    let Some(a) = q.get("state").and_then(|id| gw.store.finish(id, now)) else {
+    let state = q.get("state").map(String::as_str).unwrap_or_default();
+    if state.is_empty() || cookie(&headers, CALLBACK_COOKIE) != Some(&callback_binding(state)) {
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "This sign-in did not start in this browser. Start again from your MCP client.",
+        );
+    }
+    let Some(a) = gw.store.finish(state, now) else {
         return error_page(
             StatusCode::BAD_REQUEST,
             "This sign-in has expired or was already used. Start again from your MCP client.",
@@ -389,7 +433,7 @@ pub(crate) async fn callback<B: Backend>(
             tracing::info!("gateway: {who} may call nothing here; refused");
             return back(
                 "access_denied",
-                &format!("{who} may call no services through this gateway"),
+                "this account may call no services through this gateway",
             );
         }
         Ok((grants, _)) => tracing::info!("gateway: {who} signed in ({} services)", grants.len()),

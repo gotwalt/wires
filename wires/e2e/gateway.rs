@@ -217,9 +217,36 @@ impl Running {
         assert_eq!(idp_q["nonce"], OidcNonce::for_node(&node(2)).as_str());
         assert_eq!(idp_q["redirect_uri"], self.url("/oauth/callback"));
 
+        let bind = to_idp.headers()["set-cookie"].to_str().unwrap().to_owned();
+        assert!(
+            bind.contains("Path=/oauth/callback") && bind.contains("SameSite=Lax"),
+            "{bind}"
+        );
+        let bind = bind.split(';').next().unwrap().to_owned();
         let back = self.http.get(&idp_url).send().await.unwrap();
         let callback = back.headers()["location"].to_str().unwrap().to_owned();
-        let to_client = self.http.get(&callback).send().await.unwrap();
+
+        // The IdP link forwarded to another browser (no consent cookie):
+        // refused, and the authorization stays pending for its owner.
+        let forwarded = self.http.get(&callback).send().await.unwrap();
+        assert_eq!(forwarded.status(), StatusCode::FORBIDDEN);
+        assert!(forwarded.headers().get("location").is_none());
+        let wrong = self
+            .http
+            .get(&callback)
+            .header("cookie", "wires_cb=not-the-binding")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+
+        let to_client = self
+            .http
+            .get(&callback)
+            .header("cookie", &bind)
+            .send()
+            .await
+            .unwrap();
         assert!(to_client.status().is_redirection());
         let loc = Url::parse(to_client.headers()["location"].to_str().unwrap()).unwrap();
         assert!(loc.as_str().starts_with(REDIRECT), "{loc}");
@@ -519,8 +546,8 @@ async fn a_user_the_state_admits_to_nothing_is_refused_at_sign_in() {
     let q = gw.authorize(&client).await;
     assert_eq!(q["error"], "access_denied");
     assert!(
-        q["error_description"].contains("mallory@example.com"),
-        "{q:?}"
+        !q["error_description"].contains("mallory"),
+        "no email leaked: {q:?}"
     );
     assert_eq!(q["iss"], gw.base);
     assert!(!q.contains_key("code"));
