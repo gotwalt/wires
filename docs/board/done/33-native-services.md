@@ -254,3 +254,12 @@ proves good enough when evaluated.
   path (`run_foreign`, which `Foreign` uses): a raise is exit 1 plus
   stderr; stdio is closed after the handler returns though the foreign
   side kept it. The builds-once test stays (binding-specific).
+
+### Integrator review (2026-09-24) → done
+
+The review blocked on B1 (a stopped host left its endpoint and state refresh
+running), B2 (dropping a handler's wait detached it; the tests found the
+session could hang) and B3 (missing acceptance tests). All three are fixed
+and tested; the M and L items too (see "Integrator review fixes" above).
+Merged with card 34's lanes; the checks passed on main (lint, 523 tests,
+`make demo`, `make demo-python`, `make demo-node`).

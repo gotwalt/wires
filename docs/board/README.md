@@ -69,16 +69,14 @@ Open cards only; finished cards are in [done/](done/).
 
 | Card | Lane | Depends on | Status | Summary |
 |---|---|---|---|---|
-| [34](doing/34-cleanup.md) | C | 33 | doing | **Cleanup:** hollow tests, dead and duplicate paths, compat shims, leftovers from earlier designs, drifted duplicate docs |
 | [08](doing/08-demo-two-machine.md) | E | — | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent, recording |
-| [33](review/33-native-services.md) | N | 28 | review | **Wires-native services:** the host runtime as a library, so an app serves wires calls in-process; Rust API plus Python (UniFFI) and TypeScript (napi-rs) bindings on top of it |
 | [29](backlog/29-identity-and-scale.md) | I2 | 28 | backlog (next) | **Identity and scale (design agreed):** machine badges + banned list, `login --for` + day-pass, per-caller views served by hosts, transparency-log checkpoints |
 | [31](backlog/31-inbox-delivery.md) | P3 | 28, 30 | designed, parked | **Inbox delivery:** callbacks go to the caller that asked, through the call's push capability only; open questions on the card |
 | [32](backlog/32-service-sandbox-OPEN.md) | — | — | open question | **Don't build:** run each service call in a rootless microVM so a service can't reach the host's keys |
 | [18](backlog/18-front-door-OPEN.md) | — | — | open question | **Don't build:** apex key, invites, `wires join <domain>` |
 | [09](backlog/09-witness.md) | stretch | — | backlog | Witness: a reader that follows hosts' call logs and exports signed checkpoints, so a truncation or rewrite contradicts a copy the host doesn't control |
 
-**Order:** 34 (cleanup) → 08 (recording) → 29 (identity and scale). 31 and
+**Order:** 08 (recording; re-record the README demo) → 29 (identity and scale). 31 and
 32 are not scheduled.
 
 ## Rules for workers

@@ -1,6 +1,6 @@
 # 34 — Cleanup: dead paths, hollow tests, leftovers from earlier designs
 
-**Lane:** C · **Depends on:** 33 (merged at `cee6b0f`) · **Status:** backlog · **Files:** repo-wide (`library/`, `wires/`, `docs/`, `.scripts/`, `bench/`, root config)
+**Lane:** C · **Depends on:** 33 (merged at `cee6b0f`) · **Status:** done 2026-09-24 · **Files:** repo-wide (`library/`, `wires/`, `docs/`, `.scripts/`, `bench/`, root config)
 
 ## Why (the human, 2026-09-24)
 
@@ -1042,3 +1042,28 @@ For other lanes:
 Left: the `// ----- … -----` section banners in inbox.rs and
 watch_records.rs (they divide 1,100-line files; §D2 names only the host
 ones).
+
+### Integration (2026-09-24) → done
+
+Phase 1 then six lanes (LIB, HOST, CALLER, ADMIN, DOCS, and NATIVE for card
+33's review fixes), merged one at a time into `main`. The conflicts were
+the Notes section here, `call_log.rs`'s module doc, one import in
+`e2e/records.rs`, `transport.rs`'s `bind_with_alpn` doc, the board table, and
+usage.md's layout. Two breaks only showed up after merging: the gateway's
+`refresh_loop` call needed NATIVE's new stop channel, and `native.rs` still
+set LIB's deleted `Principal::claims`. One integration commit made the
+wording the same everywhere: "denied by host" in the CLI and docs (the MCP
+path already said it), "host configuration error", "no alias named", the
+shared `JWKS_DIR` and RFC 7636 constants in e2e.
+
+The old `child_is_killed_when_the_dialer_vanishes` failed once under the
+load of four parallel lane builds (it had a 5 s timeout and asserted nothing
+about the child). HOST's rewrite (pid file + `kill -0`) replaced it.
+
+Final check on `a12960d`+: `make lint`, `cargo test --workspace` (523
+passed, 0 failed), `cargo doc --workspace --no-deps` with no warnings,
+`make demo`, `.scripts/demo-push.sh`, `make demo-python`, `make demo-node`.
+The acceptance grep over `library/`, `wires/`, `bindings/` and `.scripts/`
+has no hits, and no `cfg_attr(not(test), allow(dead_code))` remains. Left
+for card 08: re-recording the README GIF/MP4, which still show the pre-28
+refusal text.
