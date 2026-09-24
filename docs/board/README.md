@@ -11,9 +11,12 @@ watch` lets the people the registry names as readers observe calls, in full,
 for logging and compliance.
 
 **Non-negotiables** (carried over from the restart): E2EE with a blind relay
-(no host or relay holds a key it doesn't need; a service child gets none of
-the host's keystore, card 28); offline-verifiable membership (no auth-server
-round-trip; removal by omission, until card 29's ban list); **the premise
+(no host or relay holds a key it doesn't need; a service child is handed none
+of the host's keystore, card 28, though it still runs as the host's user until
+[card 32](backlog/32-service-sandbox-OPEN.md)); offline-verifiable membership
+(no auth-server round-trip; removal is a root-signed ban that takes effect at
+each host's next dial, decided 2026-09-24, built by card 29; until then,
+removal by omission); **the premise
 outranks the docs, and the docs outrank the code** (README and docs first,
 code second: a disagreement is a code bug unless the doc breaks the
 premise). **Kill criteria:** if no one wants
@@ -98,11 +101,12 @@ Each summary describes the surface at the time the card was done. Cards 25–27 
 | [30](done/30-web-gateway.md) | W | 27, 26 | `wires gateway`: remote MCP (Streamable HTTP 2026-07-28 + OAuth 2.1) for Claude.ai; each call presents the web user's own gateway-bound Google token |
 | [31](backlog/31-inbox-delivery.md) | P3 | 28, 30 | **Design agreed 2026-09-24, not built:** callbacks go to the caller that asked (node + principal), through the call's push capability only; operator push `--to <node-id>` only; at least once to its mailbox; fetch set complete by construction; an `inbox` MCP tool in `wires mcp` and the gateway. Replaces card 28 §4 (push half) and §7 |
 | [22](done/22-gossip-role-OPEN.md) | — | decided | **Decided 2026-09-23: drop the channel** → cards 27 and 26 |
+| [32](backlog/32-service-sandbox-OPEN.md) | — | parked | **Open question, don't build:** run each service call in a rootless microVM (Firecracker or equivalent) so a service can't reach the host's keys |
 | [18](backlog/18-front-door-OPEN.md) | — | parked | **Open question, don't build:** apex key, invites, `wires join <domain>` |
 | [16](done/16-token-benchmark.md) | bench | 01–03 | MCP (GitHub server, many tools; ± tool search) vs `gh` via `wires call` vs bare `gh`: 5 tasks × 5 runs |
 | [09](backlog/09-witness.md) | stretch | 26 | Witness: a reader that follows hosts' call logs and exports signed checkpoints, so a truncation or rewrite contradicts a copy the host doesn't control |
 
-**Order (agreed 2026-09-23):** 24 → 25 (Cargo + strip) → 27 (services, not hosts; drop the channel) → 26 (host-held records) → recording (08, in progress: workbench on HEAD, dry run, record; see its Steps). **Then (2026-09-23 audit):** 28 → 29 and 31 (both need 28; 31 also needs 30, done).
+**Order (agreed 2026-09-23):** 24 → 25 (Cargo + strip) → 27 (services, not hosts; drop the channel) → 26 (host-held records) → recording (08, in progress: workbench on HEAD, dry run, record; see its Steps). **Then (2026-09-23 audit; order decided 2026-09-24):** 28 → 31 (inbox) → 29 (identity and scale). 32 (service sandbox) is open, not scheduled.
 
 ## Rules for workers
 

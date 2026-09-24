@@ -181,7 +181,8 @@ Lanes merged into `aaron/audit-fixes`: L1 (§2, §3), L2a (§1, §10 socket dir)
 - §6: refusals of non-members (including a removed member) are traced, not logged, so a removed member's later attempts no longer appear in `watch`.
 - §8: pull order is last-good hosts, then other hosts, then the admin (computing "services I may call" needs a JWKS fetch).
 - Admin edits that reach no host exit 1 (the state is still stored); scripts that edit before any host is up must tolerate it.
-- Open: §5 records (lane L3), §11 docs sweep.
+- §5 records (lane L3, 93312df) and §11 docs sweep (L5, c8ef536) merged. Review follow-ups (state-sync and record-stream pre-auth caps, receiver text, child socket placement, `end_of_options`) in lane L6.
+- Decided 2026-09-24: service isolation beyond card 28 §1 is [card 32](../backlog/32-service-sandbox-OPEN.md) (a future rootless microVM); next card is 31, then 29.
 
 
 ### Docs sweep (§11, lane L5)
