@@ -42,11 +42,12 @@ WIRES_HOME="$D/root" "$WIRES" init >/dev/null
 WB_ID="$(WIRES_HOME="$D/wb" "$WIRES" id 2>/dev/null)"
 WIRES_HOME="$D/root" "$WIRES" invite "$WB_ID" --name workbench >/dev/null 2>&1
 add() { WIRES_HOME="$D/root" "$WIRES" service add "$1" --allow member --host workbench --description "$2" >/dev/null 2>&1; }
-add deploy "Start a CI build in the background: deploy -- build <n>. Returns at once; the result is pushed to your wires inbox when the build finishes."
-add status "A build's state: status -- build <n> (running / failed)."
-add logs "A build's log: logs -- build <n> [--tail N] (default: last 50 lines)."
-# The workbench was offline for those pushes: its token carries the state.
-tok="$(WIRES_HOME="$D/root" "$WIRES" invite "$WB_ID" --name workbench 2>/dev/null)"
+# The workbench isn't up yet: each edit reaches no host and exits 1 (the state
+# is stored; the workbench's token carries it).
+add deploy "Start a CI build in the background: deploy -- build <n>. Returns at once; the result is pushed to your wires inbox when the build finishes." || true
+add status "A build's state: status -- build <n> (running / failed)." || true
+add logs "A build's log: logs -- build <n> [--tail N] (default: last 50 lines)." || true
+tok="$(WIRES_HOME="$D/root" "$WIRES" invite "$WB_ID" --name workbench 2>/dev/null)" || true
 WIRES_HOME="$D/wb" "$WIRES" join "$tok" >/dev/null
 
 cat >"$D/host.json" <<JSON

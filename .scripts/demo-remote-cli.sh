@@ -226,19 +226,21 @@ beat 5
 step "1  the admin registers ONE service, and who may call and read it"
 # ==========================================================================
 run "wires service add orders-db --description … --allow analyst --reader security --host workbench --host spare"
+# The hosts aren't up yet, so the edit reaches neither and exits 1 (the new
+# state is stored; a fresh token carries it to them below).
 admin service add orders-db \
 	--description "Read-only SQL (sqlite3) over the orders database; pass the SQL statement as the argument." \
-	--allow analyst --reader security --host workbench --host spare >"$D/svc.out" 2>"$D/svc.err" || {
+	--allow analyst --reader security --host workbench --host spare >"$D/svc.out" 2>"$D/svc.err" ||
+	grep -qF "reached none of its 2 host(s)" "$D/svc.err" || {
 	cat "$D/svc.err" >&2
 	bad "1: wires service add failed"
 }
 show "$D/svc.out"
-# The hosts were offline for that push: a fresh token catches them up (re-join
-# never rolls a state back).
+# A fresh token catches the hosts up (re-join never rolls a state back).
 for pair in "$wb:$WB_ID:workbench" "$sp:$SP_ID:spare"; do
 	h="${pair%%:*}"
 	rest="${pair#*:}"
-	tok="$(admin invite "${rest%%:*}" --name "${rest#*:}" 2>/dev/null)"
+	tok="$(admin invite "${rest%%:*}" --name "${rest#*:}" 2>/dev/null)" || true
 	WIRES_HOME="$h" "$WIRES" join "$tok" >/dev/null
 done
 HOST_JSON="$D/host.json"
@@ -268,7 +270,7 @@ OB_TOKEN="$(admin invite "$OB_ID" --name observer 2>>"$D/invite.err")" || {
 	cat "$D/invite.err" >&2
 	bad "setup: inviting the observer failed"
 }
-grep -qF "pushed to 2 member(s)" "$D/invite.err" || {
+grep -qF "pushed to 2 of 2 host(s)" "$D/invite.err" || {
 	cat "$D/invite.err" >&2
 	bad "setup: the invites' state never reached the two hosts"
 }
@@ -608,7 +610,7 @@ admin remove agent >"$D/remove.out" 2>"$D/remove.err" || {
 	cat "$D/remove.err" >&2
 	bad "9: wires remove failed"
 }
-grep -qF "pushed to 2 member(s)" "$D/remove.err" || {
+grep -qF "pushed to 2 of 2 host(s)" "$D/remove.err" || {
 	cat "$D/remove.err" >&2
 	bad "9: the new state never reached both hosts"
 }
