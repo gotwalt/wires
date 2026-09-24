@@ -165,6 +165,13 @@ pub(crate) async fn serve_until(
     )?;
     let (sink, _, _tee) = call_log::start(log, exporter, false);
     host.audit = Some(sink);
+    // The push service's queue, made before the host is shared so native
+    // services can reach it.
+    let push_queue = host.config.push.is_some().then(|| {
+        let (commands_tx, commands) = tokio::sync::mpsc::channel(16);
+        host.push_commands = Some(commands_tx.clone());
+        (commands_tx, commands)
+    });
     let host = Arc::new(host);
     let push = host.config.push.is_some().then(|| {
         Arc::new(
@@ -182,9 +189,8 @@ pub(crate) async fn serve_until(
     let _router = services_router(endpoint.clone(), Arc::clone(&host), push.clone());
     // A push missed while down is pulled on a timer.
     tokio::spawn(crate::state::sync::refresh_loop(endpoint, Arc::clone(&ks)));
-    match push {
-        Some(push) => {
-            let (commands_tx, commands) = tokio::sync::mpsc::channel(16);
+    match push.zip(push_queue) {
+        Some((push, (commands_tx, commands))) => {
             let sockets = push_sockets(&ks.path(""), &host, commands_tx).await?;
             let ended = tokio::select! {
                 () = push.run(commands) => Ok(()),
@@ -247,6 +253,7 @@ pub(crate) fn services_host(
         identities,
         audit: None,
         push_grants,
+        push_commands: None,
         high_water: Default::default(),
     })
 }

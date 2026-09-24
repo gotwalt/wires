@@ -240,7 +240,11 @@ a native service is invoked by `Invoke`, reads the caller's stdin, writes stdout
 its exit code is the call's. Callers can't tell it from a CLI. The handler runs as a tokio task
 only after `Started` is fsynced and `HelloAck` is sent. It gets the verified caller as a type
 (`Call`: node, principal, role, state version, service, argv, call id) in place of the `WIRES_*`
-variables, and no push capability yet. If the connection closes, the host aborts the task; if the
+variables. With push configured (`host.json` `push`, or the builder's `push_allow`), the host mints
+the call's push capability as it does for a child and hands it over in-process:
+`Call::push_to_caller(subject, body)` is checked against the same live-token registry (only this
+call's caller, until the grace period after the call ends, §7), goes through `push.allow`, and is
+logged naming the call. If the connection closes, the host aborts the task; if the
 handler panics, the call exits -1. Its stdio is recorded like a child's (§8). An embedded host
 starts like `serve`: the signed state must assign every service to it, CLI and native, and a name
 can't be both. Its keystore is the directory the app names (it reads neither `$WIRES_HOME` nor

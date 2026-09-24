@@ -248,6 +248,9 @@ pub(crate) struct ServicesHost {
     /// The per-call push capability (when `host.json` enables push): the
     /// live tokens and the child socket a service is told about.
     pub(crate) push_grants: Option<crate::host::capability::PushGrants>,
+    /// The push service, when it runs: where a native service's
+    /// [`push_to_caller`](crate::Call::push_to_caller) goes.
+    pub(crate) push_commands: Option<tokio::sync::mpsc::Sender<crate::host::push::PushCommand>>,
     /// The highest state version this host has decided under, in memory:
     /// [`state`](Self::state) refuses anything older read back from disk.
     pub(crate) high_water: std::sync::atomic::AtomicU64,

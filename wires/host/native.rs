@@ -15,15 +15,26 @@
 //! A handler runs as a tokio task. When the caller disconnects, the task is
 //! aborted at its next `.await` (clean up in `Drop`). If it panics, the call
 //! exits -1 and still gets its `Finished` record.
+//!
+//! With `push` configured, a handler can message its caller
+//! ([`Call::push_to_caller`]) under the same per-call capability a CLI child
+//! gets as `WIRES_PUSH_TOKEN` (card 28 §1): only to this call's caller, only
+//! until shortly after the call ends, and only if `push.allow` admits them.
 
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use anyhow::Result;
-use library::{Argv, CallId, NodeId, Principal, RoleName, ServiceName, StateVersion};
+use anyhow::{Result, anyhow, bail};
+use library::{
+    Argv, CallId, NodeId, Principal, PushBody, PushOutcome, RoleName, ServiceName, StateVersion,
+    Subject,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, oneshot};
 
+use crate::host::capability::{Capabilities, PushToken};
+use crate::host::push::{PushCommand, PushSpec};
 use crate::host::service::{BoxFuture, Process, Running};
 
 /// A wires service implemented in-process: the handler for every call the
@@ -76,6 +87,28 @@ pub struct Call {
     pub(crate) args: Argv,
     /// This call's id in the host's call log, when the host keeps one.
     pub(crate) id: Option<CallId>,
+    /// Its way back to the caller, when the host pushes.
+    pub(crate) push: Option<CallerPush>,
+}
+
+/// A call's push capability, held in-process: the token the host minted for
+/// this call, the registry that decides whether it is still live, and the
+/// host's push service.
+#[derive(Clone)]
+pub(crate) struct CallerPush {
+    /// The live tokens (the same registry the child socket checks).
+    pub(crate) caps: Arc<Capabilities>,
+    /// This call's token.
+    pub(crate) token: PushToken,
+    /// The host's push service.
+    pub(crate) commands: mpsc::Sender<PushCommand>,
+}
+
+impl std::fmt::Debug for CallerPush {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The token is a bearer credential: never printed.
+        f.write_str("CallerPush { .. }")
+    }
 }
 
 impl Call {
@@ -114,6 +147,59 @@ impl Call {
     /// This call's id in the host's call log (the id `wires watch` shows).
     pub fn id(&self) -> Option<CallId> {
         self.id
+    }
+
+    /// Send the caller a message (their `wires inbox`), as a CLI service
+    /// does with `wires push` and its `WIRES_PUSH_TOKEN`. It reaches only
+    /// this call's caller, only while the call runs and for a short grace
+    /// period after (so a job the call started can still report), and only
+    /// if the host's `push.allow` admits them. The push is in the host's
+    /// call log, naming this call. Returns whether it was delivered or
+    /// queued; errors if the host doesn't push, the capability has expired,
+    /// the subject or body is invalid, or `push.allow` refused the caller.
+    pub async fn push_to_caller(
+        &self,
+        subject: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Result<PushOutcome> {
+        let push = self
+            .push
+            .as_ref()
+            .ok_or_else(|| anyhow!("this host doesn't push (it has no `push` configured)"))?;
+        let to = self.caller.hex();
+        let grant = push
+            .caps
+            .check(&push.token, &to, std::time::Instant::now())
+            .map_err(|refusal| anyhow!("{refusal}"))?;
+        let spec = PushSpec {
+            to,
+            subject: Subject::new(subject)?,
+            body: PushBody::new(body)?,
+            ttl_secs: None,
+        };
+        let (reply, answer) = oneshot::channel();
+        push.commands
+            .send(PushCommand {
+                spec,
+                call: grant.call,
+                reply,
+            })
+            .await
+            .map_err(|_| anyhow!("the host is shutting down"))?;
+        let report = answer
+            .await
+            .map_err(|_| anyhow!("the host dropped the push without answering"))?
+            .map_err(anyhow::Error::msg)?;
+        let Some(result) = report.results.into_iter().next() else {
+            bail!("the host reported no recipient");
+        };
+        if result.outcome == PushOutcome::Denied {
+            bail!(
+                "push refused: {}",
+                result.reason.as_deref().unwrap_or("denied")
+            );
+        }
+        Ok(result.outcome)
     }
 }
 
@@ -213,6 +299,7 @@ mod tests {
             service: ServiceName::new("t").unwrap(),
             args: Argv::new(vec!["a".into(), "b".into()]).unwrap(),
             id: None,
+            push: None,
         }
     }
 

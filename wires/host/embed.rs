@@ -40,7 +40,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use library::{NodeId, ServiceName};
+use library::{NodeId, RoleName, ServiceName};
 
 use crate::admin::keystore::Keystore;
 use crate::host::config_v2::{HOST_CONFIG_V2, HostConfigV2, IdentityConfig, TrustedIssuer};
@@ -59,6 +59,7 @@ pub struct HostBuilder {
     host_json: Option<PathBuf>,
     issuers: Vec<TrustedIssuer>,
     native: Vec<(String, Arc<dyn crate::host::native::DynService>)>,
+    push_allow: Option<Vec<String>>,
     relay_url: Option<String>,
 }
 
@@ -72,6 +73,7 @@ impl Host {
             host_json: None,
             issuers: Vec::new(),
             native: Vec::new(),
+            push_allow: None,
             relay_url: None,
         }
     }
@@ -141,6 +143,14 @@ impl HostBuilder {
         self
     }
 
+    /// Let the host push to the members of `roles` (from the signed state),
+    /// tried in order, as `host.json`'s `push.allow` does: what a native
+    /// service's [`Call::push_to_caller`](crate::Call::push_to_caller) needs.
+    pub fn push_allow<R: Into<String>>(mut self, roles: impl IntoIterator<Item = R>) -> Self {
+        self.push_allow = Some(roles.into_iter().map(Into::into).collect());
+        self
+    }
+
     /// Use a self-hosted relay at `url` instead of n0's.
     pub fn relay_url(mut self, url: impl Into<String>) -> Self {
         self.relay_url = Some(url.into());
@@ -171,6 +181,14 @@ impl HostBuilder {
             },
         };
         config.identity.issuers.extend(self.issuers);
+        if let Some(roles) = self.push_allow {
+            let allow = roles
+                .iter()
+                .map(|r| RoleName::new(r).with_context(|| format!("push role {r:?}")))
+                .collect::<Result<Vec<_>>>()?;
+            let push = config.push.get_or_insert_with(Default::default);
+            push.allow.extend(allow);
+        }
         config.validate_fields()?;
         if config.services.is_empty() && native.is_empty() {
             bail!("nothing is implemented: register a service, or give a host.json that has some");

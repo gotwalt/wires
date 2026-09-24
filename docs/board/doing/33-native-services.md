@@ -1,6 +1,6 @@
 # 33 — Wires-native services: the host runtime as a library
 
-**Lane:** N · **Depends on:** 28 · **Status:** Phases 0 and 1 done except push to the caller (2026-09-23)
+**Lane:** N · **Depends on:** 28 · **Status:** Phases 0 and 1 done; Phase 2 next (2026-09-23)
 · **Files:** `library/membership/identity.rs` (key hygiene), `wires/admin/keystore.rs`
 (seed read/write only), `wires/host/transport.rs` (the bridge), `wires/host/service.rs`
 (new), `wires/host/serve.rs`, protocol.md §9; Phase 1: `wires/lib.rs` (was
@@ -71,7 +71,9 @@ assign every registered service to this node. The embedding API takes a
 keystore path, never a seed string.
 - [x] Example: `examples/kv.rs`, a key-value daemon keyed by the verified
       principal (state kept across calls, typed identity).
-- [ ] `Call::push_to_caller`: the per-call push capability as a method.
+- [x] `Call::push_to_caller`: the per-call push capability as a method
+      (`HostBuilder::push_allow` or `host.json` `push`); e2e
+      `a_native_service_pushes_to_its_caller`.
 - [x] e2e (`wires/e2e/native.rs`, hermetic loopback, the example's own `Kv`):
       called through the dial `wires call` uses; a refused caller never
       reaches the handler; the host's signed log holds `Started` / `Finished`
@@ -118,3 +120,10 @@ proves good enough when evaluated.
   host's signed log file directly, not through the `wires watch` stream.
 - Known limit: `transport::bind_with_alpn` still reads the local hints file
   from `$WIRES_HOME`, not from an embedded host's keystore (protocol.md §5).
+- 2026-09-23, push: the transport mints a native call's capability exactly as
+  for a child (same `Capabilities` registry, bound to the call id, dropped
+  after the bridge to start the grace period). The handler gets a
+  `CallerPush` (registry + token + the push service's sender, never printed)
+  instead of `WIRES_PUSH_TOKEN`; `push_to_caller` runs the child socket's
+  check, then sends the same `PushCommand`. `serve_until` now makes the push
+  queue before the host is shared (`ServicesHost::push_commands`).

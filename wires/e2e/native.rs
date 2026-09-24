@@ -14,6 +14,9 @@
 //!   hash-linked log (what `wires watch` streams) holds `Started` and
 //!   `Finished` with the caller's identity, role, and stdio digests.
 //! - [`an_unassigned_native_service_refuses_to_start`]
+//! - [`a_native_service_pushes_to_its_caller`]: `push_to_caller` goes through
+//!   the call's push capability and `push.allow`, and is logged naming the
+//!   call; a host without push says so.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -411,4 +414,92 @@ async fn an_unassigned_native_service_refuses_to_start() {
         e.contains("native service other, but the signed state (version 1) has no such service"),
         "{e}"
     );
+}
+
+/// Pushes `subject` to its caller and prints the outcome (or the error, and
+/// exits 1).
+struct Notify;
+
+impl Service for Notify {
+    async fn call(&self, call: Call, mut io: CallIo) -> i32 {
+        use tokio::io::AsyncWriteExt;
+        let subject = call.args().first().cloned().unwrap_or_default();
+        match call.push_to_caller(subject, "body").await {
+            Ok(outcome) => {
+                let _ = io.stdout.write_all(outcome.as_str().as_bytes()).await;
+                0
+            }
+            Err(e) => {
+                let _ = io.stderr.write_all(format!("{e:#}").as_bytes()).await;
+                1
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_native_service_pushes_to_its_caller() {
+    let w = World::new().await;
+    let state = w.state(&["notify"]);
+
+    // With push allowed to analysts: alice's push is taken (no receiver is
+    // listening, so it is queued for her `wires inbox`).
+    let home = w.keystore(&state);
+    let host = w
+        .builder(&home)
+        .push_allow(["analyst"])
+        .service("notify", Notify)
+        .build()
+        .unwrap();
+    let host = Running::start(&w, host, home).await;
+    assert_eq!(
+        call(&w, &host, &w.alice, "notify", &["deployed"], "").await,
+        ran(0, "queued")
+    );
+    let home = host.home.clone();
+    host.stop().await.unwrap();
+    let entries = crate::host::call_log::read(&home.join(crate::host::call_log::LOG_FILE)).unwrap();
+    let started = entries
+        .iter()
+        .find_map(|e| match &e.record {
+            AuditRecord::Started { call, .. } => Some(*call),
+            _ => None,
+        })
+        .expect("the call was logged");
+    let pushed = entries
+        .iter()
+        .find_map(|e| match &e.record {
+            AuditRecord::Push {
+                to,
+                call,
+                subject,
+                outcome,
+                ..
+            } => Some((*to, *call, subject.as_str().to_string(), *outcome)),
+            _ => None,
+        })
+        .expect("the push was logged");
+    assert_eq!(
+        pushed,
+        (
+            w.alice.node_id(),
+            Some(started),
+            "deployed".to_string(),
+            library::PushOutcome::Queued
+        )
+    );
+
+    // A host with no push configured says so to the handler.
+    let home = w.keystore(&state);
+    let host = w.builder(&home).service("notify", Notify).build().unwrap();
+    let host = Running::start(&w, host, home).await;
+    assert_eq!(
+        call(&w, &host, &w.alice, "notify", &["deployed"], "").await,
+        Outcome::Ran {
+            code: 1,
+            stdout: String::new(),
+            stderr: "this host doesn't push (it has no `push` configured)".into()
+        }
+    );
+    host.stop().await.unwrap();
 }

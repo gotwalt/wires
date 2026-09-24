@@ -829,6 +829,23 @@ where
         // and bridge as a child, with the verified caller as a type rather
         // than `WIRES_*` variables.
         Implementation::Native(native) => {
+            // The call's push capability, as a CLI child gets it (card 28
+            // §1), held in-process rather than in the environment.
+            let capability = match (&host.push_grants, &host.push_commands) {
+                (Some(grants), Some(commands)) => {
+                    let cap = grants.caps.mint(caller, service.clone());
+                    if let Some(call_audit) = &call_audit {
+                        cap.bind_call(call_audit.call());
+                    }
+                    let push = crate::host::native::CallerPush {
+                        caps: Arc::clone(&grants.caps),
+                        token: cap.token().clone(),
+                        commands: commands.clone(),
+                    };
+                    Some((cap, push))
+                }
+                _ => None,
+            };
             let call = crate::host::native::Call {
                 caller,
                 principal: principal.clone(),
@@ -837,9 +854,13 @@ where
                 service: service.clone(),
                 args: invocation.argv.clone(),
                 id: call_audit.as_ref().map(|a| a.call()),
+                push: capability.as_ref().map(|(_, push)| push.clone()),
             };
             let running = crate::host::native::start(native, call);
-            return bridge(send, recv, running, shutdown, call_audit).await;
+            let result = bridge(send, recv, running, shutdown, call_audit).await;
+            // Dropping the capability starts its grace period.
+            drop(capability);
+            return result;
         }
     };
     let Some((program, args)) = svc.argv(invocation.argv.as_slice()) else {
