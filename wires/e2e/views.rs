@@ -489,7 +489,7 @@ async fn a_refresh_from_a_kept_head_is_an_update() {
         badge: &w.badge(),
         id_token: crate::caller::hello::stored_token(&ks),
     };
-    view::refresh(&ks, &asker, false).await.unwrap();
+    let held_v3 = view::refresh(&ks, &asker, false).await.unwrap().view;
     // As the admin signs an edit: unchanged entries keep their signature.
     let mut p = v3.to_policy().unwrap();
     p.version = StateVersion(4);
@@ -505,6 +505,7 @@ async fn a_refresh_from_a_kept_head_is_an_update() {
         &DirectoryRequest::View {
             have: StateVersion(3),
             query: None,
+            held: Some(library::ViewDigest::of(&held_v3).unwrap()),
         },
     )
     .await
@@ -520,6 +521,73 @@ async fn a_refresh_from_a_kept_head_is_an_update() {
     let whole = w.caller_keystore(true);
     let fetched = view::refresh(&whole, &asker, true).await.unwrap();
     assert_eq!(held.view, fetched.view);
+    endpoint.close().await;
+}
+
+/// A caller whose token no longer verifies can't keep entries it held:
+/// the directory can't cut an update from a view it can't name, so it sends
+/// the (empty) whole view, not an empty update over the old one.
+#[tokio::test]
+async fn without_a_verified_identity_a_held_view_is_emptied_not_kept() {
+    let w = World::new();
+    let v3 = w.policy(3, |_| {});
+    let serving = w.directory(&v3).await;
+    let ks = w.caller_keystore(true);
+    let endpoint = w.caller_endpoint().await;
+    let signed_in = Asker {
+        endpoint: &endpoint,
+        badge: &w.badge(),
+        id_token: crate::caller::hello::stored_token(&ks),
+    };
+    let held = view::refresh(&ks, &signed_in, false).await.unwrap();
+    assert_eq!(held.view.entries.len(), 2);
+    // `status` is revoked at v4; the caller's token has since lapsed.
+    let mut p = v3.to_policy().unwrap();
+    p.version = StateVersion(4);
+    p.services.remove(&service("status"));
+    let v4 = p.sign_after(&w.root, &v3).unwrap();
+    assert!(serving.dir.accept(&v4, now_unix()).unwrap());
+    let lapsed = Asker {
+        endpoint: &endpoint,
+        badge: &w.badge(),
+        id_token: None,
+    };
+    let held = view::refresh(&ks, &lapsed, false).await.unwrap();
+    assert_eq!(held.version(), StateVersion(4));
+    let names: Vec<&str> = held
+        .view
+        .entries
+        .iter()
+        .map(|e| e.entry.name.as_str())
+        .collect();
+    assert!(names.is_empty(), "kept {names:?} with no verified identity");
+    endpoint.close().await;
+}
+
+/// A caller holding the empty view `wires join` stores, at the newest
+/// version, gets its entries once it presents a token that verifies: the
+/// directory answers `current` only for the view it would send.
+#[tokio::test]
+async fn an_empty_view_at_the_newest_version_is_filled_once_signed_in() {
+    let w = World::new();
+    let v3 = w.policy(3, |_| {});
+    let _serving = w.directory(&v3).await;
+    let ks = w.caller_keystore(true);
+    let root = w.root.node_id();
+    let joined = library::View {
+        head: v3.head.clone(),
+        entries: vec![],
+    };
+    view::write(&ks, root, &HeldView::fetched(joined, None, now_unix())).unwrap();
+    let endpoint = w.caller_endpoint().await;
+    let asker = Asker {
+        endpoint: &endpoint,
+        badge: &w.badge(),
+        id_token: crate::caller::hello::stored_token(&ks),
+    };
+    let held = view::refresh(&ks, &asker, false).await.unwrap();
+    let names: Vec<&str> = held.callable().map(|e| e.entry.name.as_str()).collect();
+    assert_eq!(names, ["orders-db", "status"]);
     endpoint.close().await;
 }
 

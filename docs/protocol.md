@@ -242,14 +242,20 @@ fresh, strictly newer than the held head. Then it is stored, adopted into the di
 signed for it, and subscribers are woken. An older or equal one changes nothing.
 
 **`wires/directory/1`.** Frames are a 4-byte length then canonical JSON tagged by `type`
-(`library/directory/frames.rs`), at most 16 MiB; a request over 16 KiB must open as a `publish`
-(`{"head":`, checked before the rest is read). One request per connection: the dialer sends
-`hello {badge, id_token?}` then one request, and gets one answer (5 s to dial, 10 s per frame).
+(`library/directory/frames.rs`), at most 16 MiB; the `hello` is at most 16 KiB whatever it opens
+with, and a request after it over 16 KiB must open as a `publish` (`{"head":`, checked before the
+rest is read), so only an admitted node can make a directory read a large body. One request per
+connection: the dialer sends `hello {badge, id_token?}` then one request, and gets one answer (5 s
+to dial, 10 s per frame).
 
 - **Admission first.** `check_admitted` (§2) under the held policy (`check_inclusion` when it holds
   none yet). Anyone not admitted hears only `not a member of this network`; the detail is traced,
-  throttled, and logged nowhere. At most 16 streams, on both ALPNs together, are open before their
-  `hello` is decided; one more is closed unanswered.
+  throttled, and logged nowhere. At most 16 connections, on both ALPNs together, are undecided at
+  once (one more is closed unanswered): from the connection until its `hello` is decided, and the
+  stream must open and the `hello` arrive within 10 s. An admitted peer gives up its undecided slot
+  at once and takes one of 64 slots for admitted work (reading and answering its request, which for
+  a view may wait on the IdP's keys, or reading its `subscribe`); one more hears `denied` (`this
+  directory is busy; try again or ask another`).
 - `publish {head, items}`: from any admitted node. Accepted as above, it answers
   `published {version}` with the version it now holds (the published one, or a newer one it
   already had); refused, `denied {reason}`. The admin publishes this way.
@@ -271,10 +277,16 @@ principal. With no token, or one that doesn't verify, no role admits and the vie
 head alone). Nothing per user is stored, and a request is **traced, not logged**: a view grants
 nothing, and the host logs every call.
 
-- `view {have, query: none}`: `current {fresh}` when `have` is the newest; a `view_update
-  {update, fresh}` (`ViewUpdate {head, changed: [ViewEntry], removed: [ServiceName]}`, the view at
-  the kept head `have` diffed against the view now) when `have` is one of the kept heads; else the
-  whole `view {view, fresh}`.
+- `view {have, query: none, held?}`: `held` is the `ViewDigest` of the view the caller holds
+  (blake3 over `"wires/view-digest/v1\0"` ‖ the view's canonical JSON). With a verified principal
+  and a `held` that names exactly the view the directory would diff from: `current {fresh}` when
+  `have` is the newest and `held` is the view now; a `view_update {update, fresh}` (`ViewUpdate
+  {head, changed: [ViewEntry], removed: [ServiceName]}`, the principal's view at the kept head
+  `have` diffed against the view now) when `have` is one of the kept heads and `held` is the view
+  at it. Anything else gets the whole `view {view, fresh}`: no `held`, one that doesn't match (a
+  view cut for another identity, or the empty one `wires join` stores), and any request without a
+  verified principal (the empty view, whole, so a caller whose token has lapsed can't keep
+  entries it held).
 - `view {have, query: q}`: the entries whose name or description contains `q` (ignoring ASCII
   case), always a whole `view`.
 - `resolve {service}`: a `view` holding that one service, or no entry (it doesn't exist, or the
@@ -300,7 +312,10 @@ more is refused with `denied`.
   beat every `settings.beat_secs` in between. A subscriber ahead of the directory gets nothing
   until the directory catches up. Subscribers at one version share one encoded frame, so a publish
   costs the directory one diff per version its subscribers hold, not one per subscriber. The
-  stream ends with `denied` when the head stops listing this node (it can no longer vouch).
+  stream ends with `denied` when the head stops listing this node (it can no longer vouch), and
+  when a head no longer admits the subscriber (its badge is checked again, and the head's bans:
+  `not a member of this network`) or no longer names it as a host or a directory (the refusal
+  above).
 - **`replica`**, only from a node the held head lists as a directory: `policy {policy, fresh}`
   when the held version is newer than `have`, else `fresh {fresh}`; then the same on every
   change. It ends with `denied` if the subscriber stops being listed.
@@ -309,8 +324,9 @@ more is refused with `denied`.
   whatever `have` says (the directory keeps nothing per subscriber, so it can't know which view a
   `have` refers to); then, for every head it adopts, a `view_update {update, fresh}` against the
   view it sent last, and a `fresh` beat in between. A subscriber that can't apply an update
-  subscribes again and takes the whole view. `wires mcp`, each live gateway session and `wires
-  inbox --wait` hold one.
+  subscribes again and takes the whole view. The stream ends with `denied` when a head no longer
+  admits the subscriber (badge and bans, as above) or stops listing this node. `wires mcp`, each
+  live gateway session and `wires inbox --wait` hold one.
 
 **Replicas.** Each directory subscribes to every other directory its head lists, as `replica`,
 reconnecting after a failure with a pause growing from 1 s to 30 s. A `policy` frame is taken when
@@ -399,7 +415,8 @@ host's, a directory's) cuts its own view from it instead of asking.
 - **One-shot commands make no background traffic.** `wires call` dials from the view as it is,
   and learns of a newer policy only in the call's handshake: `HelloAck` carries the host's head
   version, and when it is newer than the view's, the head and the called service's entry (§5).
-  The caller then refreshes its view after the call (`view {have}`: an update from a kept head).
+  The caller then refreshes its view after the call (`view {have, held}`: an update from a kept
+  head).
   A name the view doesn't hold is asked of a directory with `resolve` before the call fails; a
   view that is missing or expired is refreshed first. So on an unchanged fabric a call is the only
   connection.

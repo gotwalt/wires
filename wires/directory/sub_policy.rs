@@ -15,7 +15,10 @@
 //!
 //! A subscriber that can't apply an update subscribes anew with `have: 0`.
 //! The stream ends with `denied` when this node stops being a directory
-//! (it can no longer vouch), and the host fails over to another.
+//! (it can no longer vouch), and the host fails over to another. Every
+//! head is checked as the subscription's opening was: one that no longer
+//! admits the subscriber (its badge again, and the head's bans) or no longer
+//! names it as a host or a directory ends the stream with `denied` too.
 //!
 //! Subscribers following the same head get the same bytes: each frame is
 //! encoded once per `(have, head, Fresh)` and shared ([`FrameCache`]), so a
@@ -29,10 +32,11 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use iroh::endpoint::{Connection, SendStream};
-use library::{Fresh, NodeId, PolicyUpdate, StateVersion, SubFrame};
+use library::{Fresh, Membership, NodeId, PolicyUpdate, StateVersion, SubFrame};
 
-use super::node::{Current, Directory};
+use super::node::{Current, Directory, NOT_ADMITTED, VIEW_NOT_POLICY};
 use super::wire;
+use crate::clock::now_unix;
 
 /// What brings a holder of `have` to a directory's newest head.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,15 +156,19 @@ impl FrameCache {
     }
 }
 
-/// Serve one host's `policy` subscription on `send` (the `hello` and the
-/// `subscribe {kind: policy, have}` already read and admitted) until the
-/// host goes away or this node stops being a directory. Takes one of the
-/// directory's subscriber slots, or refuses when the cap is reached.
+/// Serve one host's `policy` subscription on `send` (the `hello`, with
+/// `badge`, and the `subscribe {kind: policy, have}` already read and
+/// admitted) until the host goes away, this node stops being a directory,
+/// or a new head no longer admits the host (`badge` is checked again, and
+/// its bans) or no longer names it as a host or directory: each ends the
+/// stream with `denied`. Takes one of the directory's subscriber slots, or
+/// refuses when the cap is reached.
 pub(crate) async fn serve(
     dir: &Directory,
     conn: &Connection,
     send: &mut SendStream,
     caller: NodeId,
+    badge: &Membership,
     have: StateVersion,
 ) -> Result<()> {
     let Ok(_slot) = Arc::clone(&dir.subscribers).try_acquire_owned() else {
@@ -183,6 +191,13 @@ pub(crate) async fn serve(
                 // The head no longer lists this node: it vouches for nothing.
                 return deny(send, "no longer a directory of this network".into()).await;
             };
+            if let Err(detail) = dir.admit(caller, badge, now_unix()) {
+                tracing::info!(peer = %caller.hex(), "policy subscription ended: {detail}");
+                return deny(send, NOT_ADMITTED.into()).await;
+            }
+            if !dir.holds_whole(caller) {
+                return deny(send, VIEW_NOT_POLICY.into()).await;
+            }
             if let Some((bytes, to)) = dir.policy_frames.frame(dir, &c, &fresh, sent)? {
                 wire::write(send, &bytes).await?;
                 sent = to;

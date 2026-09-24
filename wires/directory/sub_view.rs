@@ -15,26 +15,34 @@
 //! subscriber names: the directory stores nothing per subscriber, so it
 //! can't know which view a `have` refers to. A subscriber that can't apply
 //! an update subscribes again.
+//!
+//! Every head is checked as the `hello` was: a head that bans the
+//! subscriber (or a badge that has lapsed) ends the stream with `denied`
+//! (`not a member of this network`), and so does a head that stops listing
+//! this directory (it can no longer vouch), so the caller fails over.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use iroh::endpoint::{Connection, SendStream};
-use library::{IdToken, NodeId, Principal, SubFrame, View};
+use library::{IdToken, Membership, NodeId, Principal, SubFrame, View};
 
-use super::node::Directory;
+use super::node::{Directory, NOT_ADMITTED};
 use super::wire;
 use crate::clock::now_unix;
 use crate::host::transport;
 
 /// Serve one `view` subscription for the admitted `caller` (which presented
-/// `id_token` in its `hello`) on `send`, until the caller goes, the
-/// directory stops, or the subscriber cap is reached (a terminal `denied`).
+/// `badge` and `id_token` in its `hello`) on `send`, until the caller goes
+/// or the directory stops; or with a terminal `denied` when the subscriber
+/// cap is reached, a new head no longer admits the caller (`badge` checked
+/// again, and its bans), or the head stops listing this directory.
 pub(crate) async fn serve(
     dir: &Directory,
     conn: &Connection,
     send: &mut SendStream,
     caller: NodeId,
+    badge: &Membership,
     id_token: Option<&IdToken>,
 ) -> Result<()> {
     let Ok(_slot) = Arc::clone(&dir.subscribers).try_acquire_owned() else {
@@ -63,9 +71,15 @@ pub(crate) async fn serve(
     let mut changes = dir.watch();
     loop {
         let snapshot = changes.borrow_and_update().clone();
-        if let Some(c) = snapshot
-            && let Some(fresh) = c.fresh.clone()
-        {
+        if let Some(c) = snapshot {
+            let Some(fresh) = c.fresh.clone() else {
+                // The head no longer lists this node: it vouches for nothing.
+                return deny(send, "no longer a directory of this network".into()).await;
+            };
+            if let Err(detail) = dir.admit(caller, badge, now_unix()) {
+                tracing::info!(peer = %caller.hex(), "view subscription ended: {detail}");
+                return deny(send, NOT_ADMITTED.into()).await;
+            }
             let frame = match &sent {
                 Some(view) if view.head.head.version >= c.held.version() => {
                     SubFrame::Fresh { fresh }

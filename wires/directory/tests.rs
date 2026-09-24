@@ -130,8 +130,19 @@ impl Fabric {
     /// Node `i`'s directory, open from `ks`, serving on its own endpoint
     /// (and following its peers when `replicate`).
     async fn directory(&self, i: usize, ks: &Arc<Keystore>, replicate: bool) -> Serving {
+        self.directory_with(i, ks, replicate, None).await
+    }
+
+    /// [`directory`](Self::directory), with a shorter `stream_deadline`.
+    async fn directory_with(
+        &self,
+        i: usize,
+        ks: &Arc<Keystore>,
+        replicate: bool,
+        stream_deadline: Option<Duration>,
+    ) -> Serving {
         let node = &self.nodes[i];
-        let dir = Directory::open(
+        let mut dir = Directory::open(
             node.duplicate(),
             self.root.node_id(),
             Arc::clone(ks),
@@ -139,6 +150,11 @@ impl Fabric {
             now_unix(),
         )
         .unwrap();
+        if let Some(deadline) = stream_deadline {
+            Arc::get_mut(&mut dir)
+                .expect("no other handle yet")
+                .stream_deadline = deadline;
+        }
         let endpoint = bind(node, &self.book).await;
         let router = Running::mount(Router::builder(endpoint.clone()), &dir).spawn();
         let running =
@@ -632,4 +648,305 @@ fn directory_edits_are_head_edits() {
     )
     .unwrap();
     assert!(f.policy().directories().is_empty());
+}
+
+/// A beat never rolls back a publish accepted while it signs: what it
+/// announces and vouches for is the newest head held.
+#[test]
+fn a_beat_never_rolls_back_a_concurrent_accept() {
+    let f = Fabric::new(1);
+    f.list_directory(0);
+    let ks = f.join(0);
+    let now = now_unix();
+    let dir = Directory::open(f.nodes[0].duplicate(), f.root.node_id(), ks, 8, now).unwrap();
+    let newer = f.assign("status", 0);
+    // While the beat is between signing and announcing, a publish arrives
+    // on another thread, given a moment to land if nothing holds it off.
+    let (took_tx, took_rx) = std::sync::mpsc::channel();
+    let accepter = Arc::clone(&dir);
+    let candidate = newer.signed.clone();
+    *dir.beat_hook.lock().unwrap() = Some(Box::new(move || {
+        std::thread::spawn(move || {
+            took_tx
+                .send(accepter.accept(&candidate, now).unwrap())
+                .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(300));
+    }));
+    dir.beat(now + 1).unwrap();
+    assert!(
+        took_rx.recv_timeout(PATIENCE).unwrap(),
+        "the publish was taken"
+    );
+    assert_eq!(dir.version(), newer.version(), "the beat rolled it back");
+    let c = dir.snapshot().unwrap();
+    assert_eq!(c.held.signed, newer.signed);
+    c.fresh.clone().unwrap().verify(&newer.signed.head).unwrap();
+}
+
+/// A raw connection from `ep` to directory `to` on `alpn`.
+async fn dial(ep: &Endpoint, to: library::NodeId, alpn: &[u8]) -> Connection {
+    let addr = transport::endpoint_addr(&to, &[], None).unwrap();
+    tokio::time::timeout(PATIENCE, ep.connect(addr, alpn))
+        .await
+        .expect("dialing took too long")
+        .unwrap()
+}
+
+/// Subscribe to directory `to` as `kind`, from `ep` presenting `badge`: the
+/// stream the frames arrive on.
+async fn subscribe(
+    ep: &Endpoint,
+    to: library::NodeId,
+    badge: &Membership,
+    kind: library::SubscriptionKind,
+) -> (Connection, iroh::endpoint::RecvStream) {
+    let conn = dial(ep, to, library::DIRECTORY_SUB_ALPN).await;
+    let (mut send, recv) = conn.open_bi().await.unwrap();
+    let hello = library::SubRequest::Hello {
+        badge: badge.clone(),
+        id_token: None,
+    };
+    let sub = library::SubRequest::Subscribe {
+        kind,
+        have: StateVersion(0),
+    };
+    wire::write(&mut send, &hello.encode().unwrap())
+        .await
+        .unwrap();
+    wire::write(&mut send, &sub.encode().unwrap())
+        .await
+        .unwrap();
+    (conn, recv)
+}
+
+/// Read frames until the first `denied` (its reason), or `None` when the
+/// stream ends without one; a few seconds at most.
+async fn until_denied(recv: &mut iroh::endpoint::RecvStream) -> Option<String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(frame) = wire::read_sub_frame(recv).await.unwrap() {
+            if let library::SubFrame::Denied { reason } = frame {
+                // Nothing follows a denied: the stream ends.
+                assert!(wire::read_sub_frame(recv).await.unwrap().is_none());
+                return Some(reason);
+            }
+        }
+        None
+    })
+    .await
+    .expect("the subscription went on")
+}
+
+/// The first frame of a subscription, which must not be `denied`.
+async fn first_frame(recv: &mut iroh::endpoint::RecvStream) -> library::SubFrame {
+    let frame = tokio::time::timeout(PATIENCE, wire::read_sub_frame(recv))
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a first frame");
+    assert!(
+        !matches!(frame, library::SubFrame::Denied { .. }),
+        "{frame:?}"
+    );
+    frame
+}
+
+/// `policy` (0: directory, 1: the admin's) with `edit` applied, at the next
+/// version, root-signed.
+fn next_policy(
+    f: &Fabric,
+    dir: &Directory,
+    edit: impl FnOnce(&mut library::Policy),
+) -> SignedPolicy {
+    let mut p = dir.snapshot().unwrap().held.policy.clone();
+    p.version = StateVersion(p.version.0 + 1);
+    edit(&mut p);
+    crate::testutil::signed_policy(&f.root, p)
+}
+
+/// A host's `policy` subscription ends with `denied` once a new head bans
+/// it, or no longer names it as a host.
+#[tokio::test]
+async fn a_policy_subscription_ends_when_the_host_is_banned_or_unlisted() {
+    use library::SubscriptionKind::Policy;
+    let f = Fabric::new(2); // 0: directory, 1: host
+    f.list_directory(0);
+    f.assign("status", 1);
+    let ks = f.join(0);
+    let d = f.directory(0, &ks, false).await;
+    let host = f.nodes[1].node_id();
+    let ep = bind(&f.nodes[1], &f.book).await;
+    let badge = f.badge(&f.nodes[1]);
+
+    let services = d.dir.snapshot().unwrap().held.policy.services.clone();
+
+    // No longer a host: it holds its view, not the policy.
+    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), &badge, Policy).await;
+    first_frame(&mut recv).await;
+    let unlisted = next_policy(&f, &d.dir, |p| p.services.clear());
+    assert!(d.dir.accept(&unlisted, now_unix()).unwrap());
+    let reason = until_denied(&mut recv).await.unwrap();
+    assert!(reason.contains("view"), "{reason}");
+
+    // A host again, then banned (which takes it off its services too).
+    let relisted = next_policy(&f, &d.dir, |p| p.services = services);
+    assert!(d.dir.accept(&relisted, now_unix()).unwrap());
+    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), &badge, Policy).await;
+    first_frame(&mut recv).await;
+    let banned = next_policy(&f, &d.dir, |p| {
+        p.services.clear();
+        p.bans.insert(host, Ban { until: i64::MAX });
+    });
+    assert!(d.dir.accept(&banned, now_unix()).unwrap());
+    assert_eq!(
+        until_denied(&mut recv).await.as_deref(),
+        Some(crate::host::gate::NOT_ADMITTED)
+    );
+}
+
+/// A caller's `view` subscription ends with `denied` once a new head bans
+/// it, or stops listing this directory (it can no longer vouch).
+#[tokio::test]
+async fn a_view_subscription_ends_when_the_caller_is_banned_or_the_directory_unlisted() {
+    use library::SubscriptionKind::View;
+    let f = Fabric::new(2); // 0: directory, 1: caller
+    f.list_directory(0);
+    let ks = f.join(0);
+    let d = f.directory(0, &ks, false).await;
+    let caller = f.nodes[1].node_id();
+    let ep = bind(&f.nodes[1], &f.book).await;
+    let badge = f.badge(&f.nodes[1]);
+
+    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), &badge, View).await;
+    first_frame(&mut recv).await;
+    let banned = next_policy(&f, &d.dir, |p| {
+        p.bans.insert(caller, Ban { until: i64::MAX });
+    });
+    assert!(d.dir.accept(&banned, now_unix()).unwrap());
+    assert_eq!(
+        until_denied(&mut recv).await.as_deref(),
+        Some(crate::host::gate::NOT_ADMITTED)
+    );
+
+    let unbanned = next_policy(&f, &d.dir, |p| {
+        p.bans.remove(&caller);
+    });
+    assert!(d.dir.accept(&unbanned, now_unix()).unwrap());
+    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), &badge, View).await;
+    first_frame(&mut recv).await;
+    let me = f.nodes[0].node_id();
+    let unlisted = next_policy(&f, &d.dir, |p| {
+        p.directories.retain(|d| *d != me);
+    });
+    assert!(d.dir.accept(&unlisted, now_unix()).unwrap());
+    let reason = until_denied(&mut recv).await.unwrap();
+    assert!(reason.contains("no longer a directory"), "{reason}");
+}
+
+/// A `hello` is small: one that announces a publish-sized body is refused
+/// from its prefix, before the directory reads (or waits for) the body.
+#[tokio::test]
+async fn a_large_hello_is_refused_before_its_body_is_read() {
+    let f = Fabric::new(1);
+    f.list_directory(0);
+    let ks = f.join(0);
+    let _d = f.directory(0, &ks, false).await;
+    let stranger = NodeIdentity::generate();
+    let ep = bind(&stranger, &f.book).await;
+    for alpn in [DIRECTORY_ALPN, library::DIRECTORY_SUB_ALPN] {
+        let conn = dial(&ep, f.nodes[0].node_id(), alpn).await;
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        // A 1 MiB frame that opens like a publish, and nothing more.
+        let mut bytes = ((1usize << 20) as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(library::PUBLISH_BODY_PREFIX);
+        wire::write(&mut send, &bytes).await.unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(3), async {
+            if alpn == DIRECTORY_ALPN {
+                wire::read_answer(&mut recv).await.unwrap()
+                    == DirectoryAnswer::Denied {
+                        reason: crate::host::gate::NOT_ADMITTED.into(),
+                    }
+            } else {
+                matches!(
+                    wire::read_sub_frame(&mut recv).await.unwrap(),
+                    Some(library::SubFrame::Denied { .. })
+                )
+            }
+        })
+        .await
+        .expect("the directory waited for a 1 MiB hello");
+        assert!(refused);
+    }
+}
+
+/// Peers that connect and never open a stream give up their undecided
+/// slots at the stream deadline, so they can't lock members out.
+#[tokio::test]
+async fn idle_connections_do_not_hold_the_undecided_slots() {
+    let f = Fabric::new(2);
+    f.list_directory(0);
+    let ks = f.join(0);
+    let deadline = Duration::from_millis(500);
+    let _d = f.directory_with(0, &ks, false, Some(deadline)).await;
+    let stranger = NodeIdentity::generate();
+    let stranger_ep = bind(&stranger, &f.book).await;
+    let mut idle = Vec::new();
+    for _ in 0..super::node::MAX_UNDECIDED {
+        idle.push(dial(&stranger_ep, f.nodes[0].node_id(), DIRECTORY_ALPN).await);
+    }
+    tokio::time::sleep(deadline * 3).await;
+    let member_ep = bind(&f.nodes[1], &f.book).await;
+    let answer = wire::ask(
+        &member_ep,
+        f.nodes[0].node_id(),
+        &f.badge(&f.nodes[1]),
+        None,
+        &DirectoryRequest::Head {},
+    )
+    .await
+    .unwrap();
+    assert!(matches!(answer, DirectoryAnswer::Head { .. }), "{answer:?}");
+    drop(idle);
+}
+
+/// Once a peer is admitted it no longer holds an undecided slot: admitted
+/// peers that stall their request can't lock out new connections.
+#[tokio::test]
+async fn admitted_peers_do_not_hold_the_undecided_slots() {
+    let f = Fabric::new(2);
+    f.list_directory(0);
+    let ks = f.join(0);
+    let _d = f.directory(0, &ks, false).await;
+    let member_ep = bind(&f.nodes[1], &f.book).await;
+    let badge = f.badge(&f.nodes[1]);
+    let hello = DirectoryRequest::Hello {
+        badge: badge.clone(),
+        id_token: None,
+    }
+    .encode()
+    .unwrap();
+    let mut stalled = Vec::new();
+    for _ in 0..super::node::MAX_UNDECIDED {
+        let conn = dial(&member_ep, f.nodes[0].node_id(), DIRECTORY_ALPN).await;
+        let (mut send, recv) = conn.open_bi().await.unwrap();
+        // The hello, then no request.
+        wire::write(&mut send, &hello).await.unwrap();
+        stalled.push((conn, send, recv));
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let answer = tokio::time::timeout(
+        Duration::from_secs(3),
+        wire::ask(
+            &member_ep,
+            f.nodes[0].node_id(),
+            &badge,
+            None,
+            &DirectoryRequest::Head {},
+        ),
+    )
+    .await
+    .expect("no answer in time")
+    .unwrap();
+    assert!(matches!(answer, DirectoryAnswer::Head { .. }), "{answer:?}");
+    drop(stalled);
 }
