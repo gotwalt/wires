@@ -13,6 +13,7 @@
 //! - [`with_every_directory_down_lenient_keeps_serving`]
 //! - [`with_every_directory_down_strict_refuses_until_one_is_back`]
 //! - [`a_host_restarted_from_disk_serves_before_any_directory_answers`]
+//! - [`a_directory_serving_an_unadoptable_policy_is_passed_over`]
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -79,10 +80,21 @@ impl World {
     /// both directories listed, `settings`, and `bans` banned nodes; signed
     /// after the previous one, so unchanged entries keep their signature.
     fn policy(&self, version: u64, settings: Settings, bans: u8) -> SignedPolicy {
+        self.policy_until(version, settings, bans, i64::MAX)
+    }
+
+    /// [`policy`](Self::policy), good until `not_after`.
+    fn policy_until(
+        &self,
+        version: u64,
+        settings: Settings,
+        bans: u8,
+        not_after: i64,
+    ) -> SignedPolicy {
         let mut p = Policy::new(self.root.node_id());
         p.version = StateVersion(version);
         p.issued = now_unix();
-        p.not_after = i64::MAX;
+        p.not_after = not_after;
         p.directories = self.dirs.iter().map(|d| d.node_id()).collect();
         p.settings = settings;
         p.roles.insert(
@@ -458,6 +470,37 @@ async fn with_every_directory_down_strict_refuses_until_one_is_back() {
     let out = eventually("a call after", || async { w.call(&addr).await.ok() }).await;
     assert_eq!(out, "hi\n");
     d.stop().await;
+}
+
+/// A directory that serves a policy the host can't adopt (here, one that
+/// expired after the directory took it) is passed over: the host asks it
+/// for the whole policy once, then fails over to the next directory, which
+/// serves a good one, instead of asking the first again forever.
+#[tokio::test]
+async fn a_directory_serving_an_unadoptable_policy_is_passed_over() {
+    let w = World::new().await;
+    let v1 = w.policy(1, Settings::default(), 0);
+    let first_ks = w.keystore(&w.dirs[0], &v1);
+    let second_ks = w.keystore(&w.dirs[1], &v1);
+    // Two version 2s, so neither directory takes the other's (not newer).
+    // The first directory's expires a moment after it takes it.
+    let expiring = w.policy_until(2, Settings::default(), 1, now_unix() + 1);
+    let good = w.policy(2, Settings::default(), 2);
+    let first = w.directory(0, &first_ks).await;
+    assert!(first.dir.accept(&expiring, now_unix()).unwrap());
+    let second = w.directory(1, &second_ks).await;
+    assert!(second.dir.accept(&good, now_unix()).unwrap());
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+    // The host's policy lists the first directory first.
+    let h = w.follower(0, &w.keystore(&w.hosts[0], &v1)).await;
+    h.until(StateVersion(2)).await;
+    assert_eq!(store::read(&h.ks, h.root).unwrap().unwrap().signed, good);
+    let (_, _, _, resyncs) = h.frames();
+    assert_eq!(resyncs, 2, "the update, then the whole policy, from the first");
+    h.task.abort();
+    first.stop().await;
+    second.stop().await;
 }
 
 /// A host restarted with its policy on disk serves at once, with no
