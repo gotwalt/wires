@@ -1100,7 +1100,6 @@ mod tests {
             node(4),
             Membership::mint(&root, node(4), 0, i64::MAX).unwrap(),
             Arc::new(ks),
-            &home,
             config,
         )
         .unwrap();

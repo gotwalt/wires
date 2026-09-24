@@ -1303,7 +1303,6 @@ mod tests {
             host.node_id(),
             Membership::mint(&root, host.node_id(), 0, i64::MAX).unwrap(),
             Arc::new(ks),
-            &home,
             config,
         )
         .unwrap()

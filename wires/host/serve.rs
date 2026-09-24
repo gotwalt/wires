@@ -72,7 +72,7 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     let membership = keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?;
     let home = keystore::home()?;
     let ks = Arc::new(keystore::Keystore::resolve()?);
-    let mut host = services_host(node.node_id(), membership, Arc::clone(&ks), &home, config)?;
+    let mut host = services_host(node.node_id(), membership, Arc::clone(&ks), config)?;
     // A host assigned a service while it was offline: pull, then try again.
     let state = match host.preflight(crate::now_unix()) {
         Ok(state) => state,
@@ -114,11 +114,18 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     match push {
         Some(push) => {
             let (commands_tx, commands) = tokio::sync::mpsc::channel(16);
-            let _sockets = push_sockets(&home, &host, commands_tx).await?;
-            tokio::select! {
+            let sockets = push_sockets(&home, &host, commands_tx).await?;
+            let ended = tokio::select! {
                 () = push.run(commands) => Ok(()),
                 r = tokio::signal::ctrl_c() => r.context("waiting for ctrl-c"),
+            };
+            for socket in sockets {
+                socket.abort();
             }
+            if let Some(grants) = &host.push_grants {
+                grants.dir.remove();
+            }
+            ended
         }
         None => tokio::signal::ctrl_c().await.context("waiting for ctrl-c"),
     }
@@ -131,7 +138,8 @@ const ROOT_SEED: &str = "root.seed";
 /// trusts exactly `config`'s issuers and keeps their keys **in memory only**
 /// (a key set on disk could have been planted by anything running as this
 /// user, a service child included). With `push` on, calls get a per-call
-/// push capability on the child socket under `home`.
+/// push capability on a child socket in a private directory of its own
+/// ([`capability::ChildDir`]).
 ///
 /// Refuses an admin keystore (one holding `root.seed`): a host runs service
 /// children, and the fabric's root key must not sit beside them.
@@ -139,7 +147,6 @@ pub(crate) fn services_host(
     me: NodeId,
     membership: library::Membership,
     keystore: Arc<keystore::Keystore>,
-    home: &Path,
     config: HostConfigV2,
 ) -> anyhow::Result<gate::ServicesHost> {
     if keystore.path(ROOT_SEED).exists() {
@@ -152,10 +159,13 @@ pub(crate) fn services_host(
     }
     let fetcher = jwks::KeyFetcher::new(None)?;
     let identities = Arc::new(identity::Identities::new(fetcher, config.identity.trust()));
-    let push_grants = config.push.is_some().then(|| capability::PushGrants {
-        caps: Arc::default(),
-        socket: capability::child_socket(home),
-    });
+    let push_grants = match config.push {
+        Some(_) => Some(
+            capability::PushGrants::new()
+                .context("creating the private directory for the child push socket")?,
+        ),
+        None => None,
+    };
     Ok(gate::ServicesHost {
         me,
         trust_root: membership.fabric,
@@ -274,7 +284,6 @@ mod tests {
             me,
             library::Membership::mint(&root, me, 0, i64::MAX).unwrap(),
             Arc::new(keystore::Keystore::at(home)),
-            home,
             config,
         )
     }

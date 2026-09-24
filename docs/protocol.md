@@ -219,11 +219,14 @@ inherited from `serve`; then `host.json`'s `env`; then the server-derived `WIRES
 call's id before the child starts. The child never gets `WIRES_HOME`, `HOME`, agent sockets or
 cloud credentials. If the connection closes, the host kills the child.
 
-The child still runs as `serve`'s own Unix user, so a service a caller can steer into reading or
-writing files can reach whatever that user can, the host's keystore included. **Run services as a
-separate Unix user** (for example, a `command` of `["sudo", "-u", "svc", "--", "tool"]`). `wires`
-does not switch users itself, and a service running as another user can't reach the child socket
-(§7, a 0700 directory) until the operator opens that directory to it. Independently of that, the host fails closed on the parts of its
+The child still runs as `serve`'s own Unix user. It is told neither `WIRES_HOME` nor where the
+operator socket is (its push socket lives outside the keystore, §7), but it can still find the
+keystore at its default path, so a service a caller can steer into reading or writing files can
+reach whatever that user can, the host's keystore and operator socket included. That is accepted
+for now: isolating services is left open (a rootless microVM is the likely answer). Until then,
+**run services as a separate Unix user** (for example, a `command` of `["sudo", "-u", "svc", "--",
+"tool"]`). `wires` does not switch users itself, and a service running as another user can't reach
+the child socket (§7, a 0700 directory) until the operator opens that directory to it. Independently of that, the host fails closed on the parts of its
 keystore a child could tamper with: it keeps the highest state version it has decided under in
 memory and refuses to decide under an older `state.json` (`responder configuration error`, logged
 as a rollback), and it trusts only issuer keys it fetched itself (§6).
@@ -311,9 +314,13 @@ most 7 d. Each milestone is an `AuditRecord::Push`.
 `wires/host/control.rs`), each mode 0600 in a 0700 directory that the server and the operator's
 client both check is owned by `geteuid()`:
 
-- **The operator socket**, `run/serve.sock`: `{"push":{to, subject, body, ttl_secs?}}` to any node
-  or role. A service child is not told where it is.
-- **The child socket**, `child/push.sock`: a service pushing back to **its own caller**. With a
+- **The operator socket**, `run/serve.sock` in the keystore: `{"push":{to, subject, body,
+  ttl_secs?}}` to any node or role. A service child is not told where it is (though one running as
+  the host's user can find it at the keystore's default path, §5).
+- **The child socket**, `push.sock` in a private `wires-<16 random hex>` directory (0700) that
+  `serve` makes at start, outside the keystore, under `$XDG_RUNTIME_DIR` (else the temp dir, else
+  `/tmp`), and removes at exit; so `WIRES_PUSH_SOCKET` names neither `WIRES_HOME` nor the operator
+  socket. It carries a service pushing back to **its own caller**. With a
   `push` section in `host.json`, for every call `serve` mints a random 32-byte token (64 hex) and gives the child `WIRES_PUSH_SOCKET` and
   `WIRES_PUSH_TOKEN`; `wires push` sees the token and sends `{"caller_push":{token, push}}` (no
   keystore needed). The socket accepts it only for a live token and only with `to` equal to that
@@ -413,7 +420,9 @@ Nothing is broadcast: a record's content leaves a host only when a reader asks f
 | `call-log.jsonl`, `push-queue.json` | — | host | §8, §7 |
 | `jwks/` | — | caller | cached issuer keys (a host never reads it, §6) |
 | `run/serve.sock`, `run/hint` | 0600 | host | the operator's push socket; this host's own hint line |
-| `child/push.sock` | 0600 | host | the child socket for a call's push capability (§7) |
+
+The child socket for a call's push capability is not in the keystore: it lives in a private
+directory `serve` makes per run (§7).
 
 A host's keystore must not hold `root.seed`: `wires serve` refuses to start from the admin's
 keystore. Run the host from its own (`WIRES_HOME=<dir> wires id`, invite that node, join there).

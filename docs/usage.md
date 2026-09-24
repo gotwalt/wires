@@ -453,10 +453,13 @@ a `push` section, the call's push capability (`WIRES_PUSH_SOCKET`,
 `WIRES_PUSH_TOKEN`). None of it is taken from the caller. The child gets no
 `WIRES_HOME`, `HOME`, agent sockets or cloud credentials.
 
-The child still runs as `serve`'s Unix user, so a service a caller can steer
-into reading or writing files reaches whatever that user can, the host's
-keystore included. **Run services as a separate Unix user** (e.g. a
-`command` of `["sudo", "-u", "svc", "--", "tool"]`). A service's fixed
+The child still runs as `serve`'s Unix user. It isn't told where the
+keystore is (its push socket is outside it), but it can find it at the
+default path, so a service a caller can steer into reading or writing files
+reaches whatever that user can, the host's keystore included. Isolating
+services is left open for now (a rootless microVM is the likely answer);
+until then, **run services as a separate Unix user** (e.g. a `command` of
+`["sudo", "-u", "svc", "--", "tool"]`). A service's fixed
 command must also be safe against any trailing arguments, including ones
 spelled like options (`gh api -X DELETE …`).
 
@@ -480,7 +483,7 @@ since a host's control socket lives under it and socket paths are limited to
 | `tools.json` | `tools add`, the operator | Locked mode; optional aliases. |
 | `inbox/` | `inbox` | Pushed messages: `new/` unread (at most 256, oldest evicted with a note), `read/` the last 1024 (0700). |
 | `record-marks.json` | `watch` | Per host: the furthest verified entry (the anchor every view is checked against), where each view (services, `--mine`) resumes, and recent calls' services for labels. Delete it to start over after an alarm you have resolved. |
-| `call-log.jsonl`, `push-queue.json`, `run/`, `child/` | `serve` | A host's call log, undelivered pushes, the operator's control socket and own hint line, and the socket for services' per-call push capabilities. |
+| `call-log.jsonl`, `push-queue.json`, `run/` | `serve` | A host's call log, undelivered pushes, the operator's control socket and own hint line. (The socket for services' per-call push capabilities is outside the keystore, in a private directory `serve` makes per run.) |
 | `gateway-client-key`, `gateway-sessions.json` | `gateway` | The key DCR client ids are MAC'd with, and live web sessions keyed by token hash (0600). |
 
 Secrets resolve **flag → environment variable → `--…-file` → keystore**, so

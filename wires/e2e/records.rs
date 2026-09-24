@@ -215,7 +215,6 @@ impl Host {
             w.host.node_id(),
             w.membership(&w.host),
             Arc::clone(&keystore),
-            &home,
             config,
         )
         .unwrap();

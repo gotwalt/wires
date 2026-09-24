@@ -928,7 +928,6 @@ mod tests {
             server.node_id(),
             Membership::mint(&root, server.node_id(), 0, i64::MAX).unwrap(),
             std::sync::Arc::new(ks),
-            &home,
             config,
         )
         .unwrap();

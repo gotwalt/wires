@@ -5,9 +5,11 @@
 //! When `host.json` enables `push`, `serve` mints a fresh random
 //! [`PushToken`] for every call it spawns and hands the child two variables:
 //!
-//! - `WIRES_PUSH_SOCKET`: the **child-facing** control socket
-//!   ([`child_socket`], `$WIRES_HOME/child/push.sock`), separate from the
-//!   operator's `run/serve.sock`;
+//! - `WIRES_PUSH_SOCKET`: the **child-facing** control socket, in a private
+//!   directory made for this `serve` outside the keystore ([`ChildDir`]:
+//!   `$XDG_RUNTIME_DIR/wires-<random>/push.sock`, else the same under the
+//!   temp dir), so the path names neither `WIRES_HOME` nor the operator's
+//!   `run/serve.sock`;
 //! - `WIRES_PUSH_TOKEN`: the token, 64 hex characters.
 //!
 //! `wires push` in the child sees `WIRES_PUSH_TOKEN` and sends
@@ -24,13 +26,15 @@
 //! its call-log records name the call whose capability sent it.
 //!
 //! The operator socket keeps full `wires push --to <node|role>` power. The
-//! child is not told where it is, but a child running as the host's own Unix
-//! user can still find and open anything that user can: real isolation needs
-//! the service to run as a different user (`docs/protocol.md` §5).
+//! child is told neither where it is nor where the keystore is, but a child
+//! running as the host's own Unix user can still find the keystore at its
+//! default path (and the operator socket in it) and open anything that user
+//! can. That is accepted for now: isolating services (a separate user, or a
+//! rootless microVM later) is left open (`docs/protocol.md` §5).
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,9 +46,8 @@ use library::{CallId, NodeId, ServiceName};
 /// kills them all.
 pub(crate) const CAPABILITY_GRACE: Duration = Duration::from_secs(10 * 60);
 
-/// The directory under the wires home that holds the child-facing socket
-/// (kept apart from `run/`, so the two can be given different access).
-pub(crate) const CHILD_DIR: &str = "child";
+/// The child-facing socket's file name inside its [`ChildDir`].
+pub(crate) const CHILD_SOCKET: &str = "push.sock";
 
 /// The variable naming the child-facing control socket.
 pub(crate) const ENV_SOCKET: &str = "WIRES_PUSH_SOCKET";
@@ -252,15 +255,95 @@ impl Drop for CallCapability {
 pub(crate) struct PushGrants {
     /// The live tokens.
     pub(crate) caps: Arc<Capabilities>,
+    /// The private directory holding the child socket; removed when the last
+    /// holder drops it (and explicitly when `serve` exits).
+    pub(crate) dir: Arc<ChildDir>,
     /// The child-facing control socket (`WIRES_PUSH_SOCKET`).
     pub(crate) socket: PathBuf,
 }
 
-/// The child-facing control socket under the wires home `home`:
-/// `$WIRES_HOME/child/push.sock`, or a short stand-in when that path is too
-/// long to bind.
-pub(crate) fn child_socket(home: &Path) -> PathBuf {
-    crate::host::push::socket_path(&home.join(CHILD_DIR).join("push.sock"), home)
+impl PushGrants {
+    /// Fresh grants, with a new [`ChildDir`] for the socket.
+    pub(crate) fn new() -> std::io::Result<Self> {
+        let dir = Arc::new(ChildDir::create()?);
+        Ok(Self {
+            caps: Arc::default(),
+            socket: dir.socket(),
+            dir,
+        })
+    }
+}
+
+/// One `serve`'s private directory for the child socket: `wires-<16 random
+/// hex>`, mode `0700`, under `$XDG_RUNTIME_DIR` when set, else the temp dir,
+/// else `/tmp` (the first whose socket path fits a `sockaddr_un`). It is
+/// outside the keystore, so the path a child is given reveals neither
+/// `WIRES_HOME` nor the operator socket; random, so it names nothing else
+/// either. Created at `serve` start, removed when dropped.
+#[derive(Debug)]
+pub(crate) struct ChildDir {
+    /// The directory.
+    path: PathBuf,
+}
+
+impl ChildDir {
+    /// Make a fresh one (see the type docs).
+    pub(crate) fn create() -> std::io::Result<Self> {
+        let mut bases = Vec::new();
+        if let Some(run) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+            && run.is_absolute()
+            && run.is_dir()
+        {
+            bases.push(run);
+        }
+        bases.push(std::env::temp_dir());
+        bases.push(PathBuf::from("/tmp"));
+        let mut last = std::io::Error::other("no base directory for the child socket");
+        for base in bases {
+            let path = base.join(format!("wires-{}", &PushToken::generate().hex()[..16]));
+            if !crate::host::control::fits_sockaddr(&path.join(CHILD_SOCKET)) {
+                continue;
+            }
+            match make_private_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    /// The directory.
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// The child socket's path in it.
+    pub(crate) fn socket(&self) -> PathBuf {
+        self.path.join(CHILD_SOCKET)
+    }
+
+    /// Remove the directory and what is in it (idempotent).
+    pub(crate) fn remove(&self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+impl Drop for ChildDir {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
+
+/// Create `path` (not its parents) with mode `0700`; fails if it exists.
+fn make_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 #[cfg(test)]
@@ -351,6 +434,31 @@ mod tests {
         // And it is gone for good, not just refused.
         assert_eq!(caps.len(), 0);
         assert!(caps.check(&token, &to, ended).is_err());
+    }
+
+    /// Card 28 §1/§9: the child socket's directory is private, outside
+    /// any keystore, fits a unix socket path, is fresh per `serve`, and is
+    /// gone when dropped.
+    #[test]
+    fn the_child_dir_is_private_fresh_and_removed() {
+        let a = ChildDir::create().unwrap();
+        let b = ChildDir::create().unwrap();
+        assert_ne!(a.path(), b.path());
+        assert!(crate::host::control::fits_sockaddr(&a.socket()));
+        assert_eq!(a.socket().parent(), Some(a.path()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(a.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        let name = a.path().file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.starts_with("wires-") && name.len() == 6 + 16, "{name}");
+        let path = a.path().to_path_buf();
+        drop(a);
+        assert!(!path.exists());
+        b.remove();
+        b.remove();
     }
 
     proptest! {

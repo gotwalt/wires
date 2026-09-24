@@ -64,8 +64,10 @@ ones. Don't run `serve` from the admin's keystore: it refuses one holding
 **The keystore must be writable and must persist.** `$WIRES_HOME` holds the
 host's node key and membership, and the host rewrites its signed state at
 runtime: every admin change is pushed to it (`state.json`). It also holds the
-call log (`call-log.jsonl`), the push queue and the control sockets (`run/`,
-`child/`).
+call log (`call-log.jsonl`), the push queue and the operator's control socket
+(`run/`). The services' push socket is not in it: `serve` makes a private
+directory for that under `$XDG_RUNTIME_DIR` (else the temp dir) at start and
+removes it at exit, so the runtime or temp dir must be writable too.
 A read-only or throwaway keystore loses those on restart.
 
 **Secrets.** Every secret input resolves **flag → environment variable →
