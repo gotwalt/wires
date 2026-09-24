@@ -218,10 +218,11 @@ async fn subscription(dir: &Directory, conn: &Connection, caller: NodeId) -> Res
             if !dir.holds_whole(caller) {
                 return deny(&mut send, super::node::VIEW_NOT_POLICY.into()).await;
             }
-            return super::sub_policy::serve(dir, conn, &mut send, caller, have).await;
+            return super::sub_policy::serve(dir, conn, &mut send, caller, &badge, have).await;
         }
         SubscriptionKind::View => {
-            return super::sub_view::serve(dir, conn, &mut send, caller, id_token.as_ref()).await;
+            return super::sub_view::serve(dir, conn, &mut send, caller, &badge, id_token.as_ref())
+                .await;
         }
     }
     let listed = |dir: &Directory| {

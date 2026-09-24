@@ -306,7 +306,10 @@ more is refused with `denied`.
   beat every `settings.beat_secs` in between. A subscriber ahead of the directory gets nothing
   until the directory catches up. Subscribers at one version share one encoded frame, so a publish
   costs the directory one diff per version its subscribers hold, not one per subscriber. The
-  stream ends with `denied` when the head stops listing this node (it can no longer vouch).
+  stream ends with `denied` when the head stops listing this node (it can no longer vouch), and
+  when a head no longer admits the subscriber (its badge is checked again, and the head's bans:
+  `not a member of this network`) or no longer names it as a host or a directory (the refusal
+  above).
 - **`replica`**, only from a node the held head lists as a directory: `policy {policy, fresh}`
   when the held version is newer than `have`, else `fresh {fresh}`; then the same on every
   change. It ends with `denied` if the subscriber stops being listed.
@@ -315,8 +318,9 @@ more is refused with `denied`.
   whatever `have` says (the directory keeps nothing per subscriber, so it can't know which view a
   `have` refers to); then, for every head it adopts, a `view_update {update, fresh}` against the
   view it sent last, and a `fresh` beat in between. A subscriber that can't apply an update
-  subscribes again and takes the whole view. `wires mcp`, each live gateway session and `wires
-  inbox --wait` hold one.
+  subscribes again and takes the whole view. The stream ends with `denied` when a head no longer
+  admits the subscriber (badge and bans, as above) or stops listing this node. `wires mcp`, each
+  live gateway session and `wires inbox --wait` hold one.
 
 **Replicas.** Each directory subscribes to every other directory its head lists, as `replica`,
 reconnecting after a failure with a pause growing from 1 s to 30 s. A `policy` frame is taken when
