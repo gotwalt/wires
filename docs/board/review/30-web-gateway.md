@@ -42,6 +42,10 @@ already uses — and without weakening "the host verifies the IdP itself".
       workbench host's `identity.issuers` audiences
 - [x] gateway invited (`gateway`, b7b1289e…, state v9) + joined on workbench
 - [x] gateway `.env` on workbench; `docker compose up -d`
+- [x] docs: deployment.md § A web gateway; protocol.md §6 + limits; usage
+      (roles, reference, keystore, trade-offs); README, executive summary and
+      demo.md present MCP clients (stdio + gateway) as first-class, with the
+      gateway's costs stated
 - [x] Claude.ai connector added; `orders-db` called as gotwalt@gmail.com,
       the call in the host's log
 
@@ -50,3 +54,30 @@ already uses — and without weakening "the host verifies the IdP itself".
 - 2026-09-24: live end to end. Claude.ai signed in as gotwalt@gmail.com and ran
   `orders-db` 4 times (exit 0). Each call is in the workbench host's signed
   log as caller = the gateway node, principal = the Google account.
+- Files outside `wires/gateway/`: `caller/mcp.rs` (2026-07-28 core:
+  `server/discover`, −32022, `ttlMs`/`cacheScope`, legacy-only
+  `ping`/`initialize`, `with_negotiated`), `caller/call.rs`
+  (`Credentials::presenting` + the `hello.id_token` override in `dial` and
+  `call_service_with`), `caller/login.rs` (`exchange_code`; `token_request`
+  builds its body before awaiting, for `Send`), `main.rs`, `Dockerfile`
+  (nonroot-owned `/data` so a fresh volume is writable), `deploy/gateway/`.
+- Integration with audit card 28: when `member` is deleted, drop the
+  `!r.is_member()` filter in `web_grants` (the audit does this at merge) and
+  re-run `cargo test -p wires gateway` and `e2e::gateway`. The live fabric
+  then needs a fresh `wires init` + re-invites (state format change).
+- Seam for audit card 29 (fetched per-caller views, day-passes): only
+  `Gateway::tools_for` / `web_grants` compute what a user may call.
+- Deploy facts: tunnel `wires-alpha` (infra PR #17, applied locally
+  break-glass 2026-09-23 because CI is blocked on GitHub billing: merge it
+  when CI runs). Workbench: `~/src/wires-gateway/deploy/gateway`, volume
+  `wires_keystore`, gateway node `b7b1289e…` invited as `gateway` (state v9).
+  The workbench host's `host.json` lists the web client id as an audience.
+- Open: `deploy/gateway/.env` on workbench was created `664` (an earlier
+  `touch`): `chmod 600` it. The audit's §1 (a service child can read the
+  host's `node.seed` / plant JWKS) is reachable by any user the gateway
+  admits, if a service can be made to read or write files; `orders-db` runs
+  `sqlite3 -safe -readonly`. Audit lane L2a closes it.
+- Not done: CORS headers (browser-based MCP clients like the Inspector would
+  need them; Claude.ai calls from its servers); SSE responses (nothing
+  streams); `subscriptions/listen` (no list-change notifications; clients
+  re-list per `ttlMs`).
