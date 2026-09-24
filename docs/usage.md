@@ -11,7 +11,7 @@ choices, the limits, and the command reference. The wire-level spec is
 |---|---|---|
 | **admin** | who's in, which roles exist, which services run where, who may call and read each (root key) | `init`, `invite`, `remove`, `role set\|rm`, `service add\|set\|rm` |
 | **host** | how it implements its assigned services; which IdPs it trusts; stricter local rules; push | `serve host.json`, `push` |
-| **caller** | — runs services by name; MCP (stdio, or a remote gateway for web clients) for clients that only speak MCP | `id`, `join`, `login`, `services`, `call`, `mcp`, `inbox`, `gateway` |
+| **caller** | — runs services by name; MCP (stdio, or the remote gateway) so wires works in the clients people already use | `id`, `join`, `login`, `services`, `call`, `mcp`, `inbox`, `gateway` |
 | **reader** | — any member; reads the records a service's `readers` role allows, or its own | `watch` |
 
 Every role joins the same way: `wires id`, then `wires join <token>` with the admin's invite.
@@ -193,7 +193,7 @@ The script also covers SQL on stdin, the same service through `wires mcp`,
 
 ## Why it's built this way
 
-**The CLI first; MCP wherever a client needs it.** Models already know
+**The CLI where it's most efficient; MCP wherever people already work.** Models already know
 CLIs, and a CLI lets the agent pick the fields it wants before anything
 reaches context: `gh … --json tagName --jq …`, or `wires call`'s own
 `--jq/--head/--max-bytes` for commands without a filter. That filtering, not
@@ -213,13 +213,17 @@ Arm 5 shows the efficiency holds when `wires call` is the only thing the agent
 is allowed to run. Caveats: n = 5 per cell, one model (Opus 5.5), one MCP
 server (GitHub's, whose payloads are unusually large), and stripped-down
 sessions, so the percentages overstate what a full session would see. An MCP
-server with field selection would close much of this gap. `wires mcp` serves
-the same services, with the same `jq`/`head`/`max_bytes` fields, to clients
-that can only speak MCP, and `wires gateway` does the same as a remote MCP
-server for web clients such as Claude.ai. Neither weakens a guarantee above:
-the gateway presents each web user's own ID token, so the host verifies the
-IdP, applies the registry, and records the person. What it adds is one
-listener and a party holding live sessions
+server with field selection would close much of this gap.
+
+MCP compatibility is a goal of its own: people should be able to use wires
+in the clients where they already use remote tool calling. `wires mcp`
+serves the same services, with the same `jq`/`head`/`max_bytes` fields, over
+stdio (Claude Desktop, IDEs), and `wires gateway` serves them as a remote
+MCP server (Claude.ai's connectors). The gateway presents each web user's
+own ID token, so the host still verifies the IdP and applies the registry
+(only roles that match the user's identity admit them), and its record names
+the verified person as well as the gateway node that dialed. What it adds is
+one listener and a party holding live sessions
 ([deployment.md § A web gateway](deployment.md#a-web-gateway)).
 
 **Services, not hosts.** A caller cares what it is calling, not where it
@@ -350,7 +354,7 @@ To make `wires` the boundary, use a structural setup:
 | | `wires login` | Sign in with your IdP (Google by default; `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*`) and store the key-bound ID token. |
 | | `wires services [--verbose] [--json]` | List the services you may call and the role that admits you, evaluated locally. `--verbose` adds their hosts. |
 | | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name (or a `tools.json` alias). Stdio passes through and its exit code becomes `call`'s. A refusal exits `77`. |
-| | `wires mcp` | Serve the same services as MCP tools over stdio, for clients that can't run a CLI. |
+| | `wires mcp` | Serve the same services as MCP tools over stdio (Claude Desktop, IDEs). |
 | | `wires gateway --public-url https://… [--listen addr] [--client-id …]` | Serve them as a remote MCP server (Streamable HTTP + OAuth 2.1) for web clients such as Claude.ai. Each user signs in with Google through the gateway and calls with their own token ([deployment](deployment.md#a-web-gateway)). |
 | | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`. |
 | **reader** | `wires watch [service…] [--mine] [--once] [--json]` | Stream call records from your services' hosts, verified: all records of services whose `readers` role you're in, otherwise your own. |

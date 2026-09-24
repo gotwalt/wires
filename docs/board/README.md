@@ -27,7 +27,7 @@ Why each clause earns its place (the rebuttals it has to survive):
 |---|---|
 | **Reached by key, not network path** | Tailscale/VPN gives the agent's machine a route to the *host*; you then trust every port on it. Wires gives a route to *the services a signed list lets you call* and nothing else — there is no network path to widen. |
 | **By service name** | The caller asks for `orders-db`, not a machine; the admin binds names to hosts (failover, moves, no squatting), and the caller never learns an address. |
-| **CLIs, not MCP servers** | CLIs are the idiom models already know, one generic verb, and output is filtered *before* it hits context — meaningfully more efficient than MCP tool schemas + JSON results, even post-2026-07-28. `wires call` is the native path; `wires mcp` (stdio) and `wires gateway` (remote, for Claude.ai) are the on-ramps for clients that only speak MCP, with the same identity, registry and record. |
+| **CLIs, not MCP servers** | CLIs are the idiom models already know, one generic verb, and output is filtered *before* it hits context — meaningfully more efficient than MCP tool schemas + JSON results, even post-2026-07-28. `wires call` is the native, efficient path; `wires mcp` (stdio) and `wires gateway` (remote, for Claude.ai) serve the same services as MCP so wires works in the clients people already use, with the same identity, registry and record. |
 | **IdP-authenticated caller, one signed list** | The ID token is bound to the node key (OIDC `nonce` = hash of the key) and presented in each call's handshake; the host verifies the IdP's signature itself (no wires attestor) and checks it against the admin-signed registry — one list of who may call what, not one per server. |
 | **Recorded at the infra layer** | The *host* writes a signed, hash-chained record of every call, refusal, and exit — stamped with the caller identity it verified. The agent can't forge it, no gateway owns it, and a reader the registry names holds neither end's credentials. A CLI has no such story; an MCP gateway's log belongs to whoever runs the gateway. |
 
@@ -41,7 +41,7 @@ honest line from someone who runs remote MCP servers behind Tailscale today.
 |---|---|---|
 | **admin** | who's in, the roles, which services run where, who may call and read each (root key; one signed state) | `init`, `invite`, `remove`, `role`, `service` |
 | **host** | how it implements its assigned services; trusted IdPs; stricter local rules (`host.json` v2) | `serve host.json`, `push` |
-| **caller** | — runs services by name; MCP only for backward compatibility | `join`, `login`, `services`, `call`, `mcp`, `inbox` |
+| **caller** | — runs services by name; MCP (stdio, or the remote gateway) so wires works in the clients people already use | `join`, `login`, `services`, `call`, `mcp`, `inbox`, `gateway` |
 | **reader** | — any member: a service's `readers` role reads all its records, everyone else their own | `watch` |
 
 The IdP is *bound* at the caller (`login`) and *verified* at the host, against the admin-signed state it holds. The admin's invite is the only thing handed out of band; every later state is pushed by key (or pulled from a host). Nothing is broadcast.

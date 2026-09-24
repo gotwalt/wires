@@ -19,17 +19,20 @@ provider vouches for, and neither machine opens a firewall port.
   output (`--jq`, `--head`) before it reaches their context. On GitHub tasks
   that halved input tokens against GitHub's MCP server, and cost went from
   $1.87 to $0.39 over 25 runs ([bench](bench/REPORT.md)).
-- **Your MCP clients still work.** The same services reach clients that
-  only speak MCP: `wires mcp` over stdio (Claude Desktop, IDEs), and
+- **Works in the MCP clients you already use.** The same services are MCP
+  tools too: `wires mcp` over stdio (Claude Desktop, IDEs), and
   `wires gateway` as a remote MCP server that Claude.ai adds as a custom
   connector (MCP 2026-07-28, and the older `initialize` clients). A web user
-  signs in with Google through the gateway, and the host still checks
-  Google's signature for that person, admits them by the same registry, and
-  records them, not the gateway, as the caller.
+  signs in with Google through the gateway; the host checks Google's
+  signature for that person itself, admits them only through registry roles
+  that match their identity, and records them as the verified principal of
+  a call the gateway's node dialed. `wires call` stays the efficient path:
+  the token savings above come from it.
 - **Your IdP says who's calling.** `wires login` signs in with your OIDC
   provider and ties that sign-in to the agent's key. Every host checks the
-  IdP's signature itself: there's no wires account and no auth server, and
-  the CLI being run has no auth code.
+  IdP's signature itself: a CLI caller has no wires account and no auth
+  server in the way (the web gateway runs one, for MCP clients), and the CLI
+  being run has no auth code.
 - **Discovery by who you are.** An admin signs one registry: the services,
   the machines that run each, and the roles (matched on IdP identity, e.g.
   `*@acme.com`) that may call each. `wires services` shows an agent only what

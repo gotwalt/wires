@@ -105,9 +105,9 @@ n0.
 ## A web gateway
 
 `wires gateway` serves the services each signed-in user may call as a remote
-MCP server (Streamable HTTP, OAuth 2.1), for clients that can't run a CLI
-or a stdio server: Claude.ai's custom connectors, the MCP Inspector. It is
-one member node that calls **as** each web user:
+MCP server (Streamable HTTP, OAuth 2.1), for the web clients people already
+use for remote tool calling: Claude.ai's custom connectors, the MCP
+Inspector. It is one member node that calls **as** each web user:
 
 1. The user adds `https://<gateway>/mcp` as a connector. The client finds
    the gateway's OAuth metadata, registers (Client ID Metadata Document, or
@@ -117,7 +117,8 @@ one member node that calls **as** each web user:
 3. On every call, the gateway presents that user's ID token in the session
    `Hello`. The host verifies Google's signature and the nonce against the
    dialing node (the gateway) under its own `identity.issuers`, checks the
-   registry, runs the call and records the user as the caller.
+   registry, runs the call and records it with the user as the verified
+   principal (the dialing node is the gateway's).
 
 What this changes, honestly:
 

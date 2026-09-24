@@ -16,9 +16,10 @@ every call from its copy. The caller is authenticated by their IdP, via an ID
 token bound to the node key and presented in the session handshake. Every
 call is recorded by the host in its own signed, hash-linked log, which the
 readers the registry names stream with `wires watch`. Nothing is broadcast
-(there is no channel). `wires call` is the CLI-native path; `wires mcp` is
-the stdio MCP on-ramp for clients that only speak MCP; `wires gateway` is the
-remote-MCP on-ramp for web clients (Claude.ai). The goal is a sharp
+(there is no channel). `wires call` is the CLI-native (and most efficient)
+path; `wires mcp` (stdio) and `wires gateway` (remote, e.g. Claude.ai) serve
+the same services as MCP, so wires works in the clients people already use
+for remote tool calling, with the same identity, registry and record. The goal is a sharp
 demo for the MCP team.
 
 **Read `docs/board/README.md` before planning any work.** It holds the pitch,

@@ -81,3 +81,13 @@ already uses — and without weakening "the host verifies the IdP itself".
   need them; Claude.ai calls from its servers); SSE responses (nothing
   streams); `subscriptions/listen` (no list-change notifications; clients
   re-list per `ttlMs`).
+- 2026-09-24 review (integrator = the audit session): H1 consent bypass
+  (the IdP callback wasn't bound to the consenting browser) fixed and
+  deployed in 5c4a5e7; M1 (bounded memory + a per-address limit), M2
+  (pinned, non-echoing metadata fetch), M3 (one shared endpoint, two-user
+  concurrent e2e) and the lows in 8e79223, deployed. Docs now carry the
+  user's MCP stance: MCP compatibility is a goal of its own (use wires where
+  you already use remote tool calling), with `wires call` as the efficient
+  path; the record's wording is "the person as the verified principal, the
+  gateway node as the dialer". The live shared-endpoint path is exercised by
+  the next real Claude.ai call (the e2e scripts the dial).
