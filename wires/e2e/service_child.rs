@@ -74,7 +74,7 @@ impl World {
             RoleName::new("analyst").unwrap(),
             vec![Matcher {
                 email: Some("alice@example.com".parse().unwrap()),
-                ..Default::default()
+                ..Matcher::new(self.idp.issuer.as_str())
             }],
         );
         s.services.insert(
