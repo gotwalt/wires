@@ -53,7 +53,7 @@ honest line from someone who runs remote MCP servers behind Tailscale today.
 | **host** | how it implements its assigned services; trusted IdPs; stricter local rules (`host.json`) | `serve host.json`, `push` |
 | **caller** | — runs services by name; MCP (stdio, or the remote gateway) so wires works in the clients people already use | `id`, `join`, `login`, `services`, `call`, `mcp`, `gateway`, `inbox` |
 | **reader** | — any member: a service's `readers` role reads all its records, in full; everyone else their own person's (same issuer and subject, from any node) | `watch` |
-| **directory** (cards 35–37) | nothing: it holds the newest root-signed policy, signs its freshness, and gives each host its slice and each caller its view; it never decides a call | `serve` (when the policy lists it), `directory` |
+| **directory** (cards 35–37) | nothing: it holds the newest root-signed policy, signs its freshness, and gives each host its slice and each caller its view; it never decides a call | `serve` (when the policy lists it), `directory serve`; the admin names directories with `directory add\|rm` |
 
 The IdP is *bound* at the caller (`login`) and *verified* at the host, against the admin-signed state it holds. Every role needs a verified identity (there is no built-in `member` role), and every matcher names its issuer. The admin's invite is the only thing handed out of band; every later state is pushed by key to the hosts, and other members pull it from a host (or get it in a call's handshake). Nothing is broadcast, but every member still holds the whole state until cards 35–37 move the policy to a directory ([fabric.md](../fabric.md) is the target architecture: how the fabric is hosted, persisted and kept in sync).
 

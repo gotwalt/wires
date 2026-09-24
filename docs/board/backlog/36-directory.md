@@ -41,7 +41,10 @@ person. It doesn't fit the directory:
 - **Shape.** A subscription that streams updates, and typed signed items, don't fit stdin/stdout.
 
 So the directory is a mode, like state sync and the record stream: `serve` runs it when the policy
-lists its node in `directories`, and `wires directory` runs it alone on a node that hosts nothing.
+lists its node in `directories`, and **`wires directory serve` runs it alone** on a node that hosts
+nothing (the human, 2026-09-24: ship both in this card). `wires directory serve` takes no `host.json`;
+it needs only a keystore that joined the fabric and is listed in `directories`, and it refuses the
+admin's keystore, as `serve` does.
 Its gate is the badge (and bans); what it returns is filtered by the requester's role in the fabric
 (directory, host, admin-delivered head) and, for views (card 37), by the verified IdP principal.
 
@@ -136,9 +139,19 @@ those items' `allow` and `readers` name, the roles `host.json` names (`also_requ
 service and no other role. It stores the slice in its keystore (`policy/`) and decides from it on
 restart before any directory answers.
 
+### The root key stays a file
+
+The human, 2026-09-24: no key ceremony in the alpha. `root.seed` stays a 0600 file in the
+admin's keystore, as today: no backup root, no rotation, no delegation chain for the root itself.
+This is a known trade-off ([fabric.md §4.4](../../fabric.md#44-the-root-key)), not a gap to fill
+in this card. The only root-adjacent key this card adds is each directory's own node key, which
+signs `Fresh`, and it is trusted only because the root-signed head lists it.
+
 ### Naming directories, and a fabric's first one
 
-- `wires directory add|rm <node>` edits the head's `directories`, like `service` edits services.
+- `wires directory add|rm <node>` (admin) edits the head's `directories`, like `service` edits
+  services; `wires directory serve` (on the directory node) runs the mode. Both sit under one noun
+  so neither shadows the other.
   At least one is required once any other node has joined.
 - A new fabric: `wires init`, `wires invite <node>` and `wires directory add <node>`; the node
   joins and starts `serve`, and the admin's publish gives it the policy. In the demo, workbench is
@@ -171,6 +184,8 @@ and the admin's push to every host. Callers keep their full state and cold pull 
 - [ ] A tampered item, an item proved under an older head, an older head and a `Fresh` from a key
       not in `directories` are each refused.
 - [ ] A directory that missed a publish catches up from a replica.
+- [ ] `wires directory serve` serves a fabric on a node with no `host.json`, and refuses to start from
+      the admin's keystore or on a node the head doesn't list.
 - [ ] `bench/state-scale/model.py`'s *apex* host rows describe the result.
 - [ ] protocol.md rewritten for the head, items, freshness and both ALPNs; `wires/state/1` removed.
 
@@ -180,8 +195,5 @@ and the admin's push to every host. Callers keep their full state and cold pull 
   `wires renew` periodically against the directory's list of expiring badges, or the root
   delegates a narrow renewal key to the directories (card 18's front desk). Until decided, badges
   are re-issued by invite.
-- **Root key custody.** `root.seed` is one file. TUF lets a root sign its own successor; decide
-  whether heads name a backup root key.
-- Should `wires directory` (standalone) ship in this card, or only the `serve`-embedded mode?
 
 ## Notes

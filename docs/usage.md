@@ -446,6 +446,10 @@ To make `wires` the boundary, use a structural setup:
     service's reader (not content, caller or service).
   - **Google ID tokens last about an hour**, and Google drops the `nonce`
     (the key binding) on refresh, so people sign in again about hourly.
+- **The root key is a file** (`root.seed` in the admin's keystore): no backup
+  root, no rotation. Losing or leaking it means starting a new network and
+  re-inviting everyone; it needs more attention before wires holds anything
+  valuable ([fabric.md §4.4](fabric.md#44-the-root-key)).
 - **Memberships and the state don't renew yet.** A membership expires after
   its `--ttl`, the state after its `--state-ttl` (both default 30 days); an
   expired state admits nobody, and no caller dials from one. Any admin edit

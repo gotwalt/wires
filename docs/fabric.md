@@ -32,7 +32,7 @@ authenticated by key. The jobs:
 | Node | Job | Runs | Must be up? |
 |---|---|---|---|
 | **Admin** | Holds the root key; signs badges and policy; publishes each edit to the directories. | One-shot commands (`init`, `invite`, `remove`, `role`, `service`, `state push`). | Only to change something. |
-| **Directory** | Holds the newest policy; signs a freshness timestamp every 5 min; gives each host its slice and each caller its view; streams changes to subscribers. **Never decides a call.** | `wires serve` on a node the policy lists in `directories`, or `wires directory` alone. ALPNs `wires/directory/1`, `wires/directory-sub/1`. | For joining, changes, discovery and freshness. Not for calls. |
+| **Directory** | Holds the newest policy; signs a freshness timestamp every 5 min; gives each host its slice and each caller its view; streams changes to subscribers. **Never decides a call.** | `wires serve` on a node the policy lists in `directories`, or `wires directory serve` alone (no `host.json`). ALPNs `wires/directory/1`, `wires/directory-sub/1`. | For joining, changes, discovery and freshness. Not for calls. |
 | **Host** | Runs services; decides every call from its own slice; signs every call into its own log; serves the record stream and push. | `wires serve host.json`, or an app embedding `wires::Host`. ALPNs `wires/session/1`, `wires/records/1`, `wires/inbox/2`. | For its services' calls. |
 | **Caller** | Calls services by name, as a person verified by their IdP. | `wires call` (one-shot), `wires mcp`, `wires gateway` (long-running), `wires inbox`. | Only while calling. |
 | **Reader** | A caller the policy names in a service's `readers`; reads its records in full. | `wires watch`. | Only while reading. |
@@ -51,8 +51,8 @@ check ID tokens) and on iroh's discovery and relays (n0's public ones, or your o
 | **keep bans current everywhere** | a directory reachable by every host (hosts subscribe; a ban arrives in seconds). |
 | **keep the fabric alive** | the admin signs a new head before the current one expires (default 90 days), and new badges before old ones expire (default 30 days; renewal is card 36's open question). |
 
-**Recommended:** two directories on different machines (either can also be a host), and a backup of
-`root.seed` kept offline.
+**Recommended:** two directories on different machines (either can also be a host, or run
+`wires directory serve` alone).
 
 ### When something is down
 
@@ -71,7 +71,7 @@ check ID tokens) and on iroh's discovery and relays (n0's public ones, or your o
 
 | Node | What it keeps | If lost |
 |---|---|---|
-| **Admin** | `root.seed`: **the fabric's whole authority**. The full policy (every item, the newest head). `issued.json`: each badge it minted, with its label and expiry. | `root.seed` lost: the fabric can't be changed and dies when its head and badges expire. There's no rotation yet (card 36). Policy lost: pull it back from any directory. |
+| **Admin** | `root.seed`: **the fabric's whole authority**. The full policy (every item, the newest head). `issued.json`: each badge it minted, with its label and expiry. | `root.seed` lost: the fabric can't be changed and dies when its head and badges expire. See §4.4. Policy lost: pull it back from any directory. |
 | **Directory** | `directory.redb`: recent heads, the items they name, the newest `Fresh`. Its own badge and `node.seed`. | Rebuild from a replica (it catches up by itself) or by `wires state push` from the admin. Nothing is unique to it. |
 | **Host** | `policy/`: its slice (the head, `Fresh`, its own items with proofs). `call-log.jsonl`: every call, signed and hash-linked, kept 30 days. `push-queue.json`, `host.json`, badge, `node.seed`. | Slice: fetched again from a directory. **Call log: unique to this host**; export it over OTLP, or wait for card 09, which gives checkpoints to a witness. |
 | **Caller** | Badge, `node.seed`, `view.json` (its own services), `idp-token.jwt`, `last-good.json`, `record-marks.json`, `inbox/`. | View: fetched again. Badge or seed: a new invite. |
@@ -100,6 +100,25 @@ address records.
 A fabric survives any length of downtime, **except expiry**. If the head (90 days) or the badges
 (30 days) expired meanwhile, nodes refuse to use them until the admin signs new ones. The clock is
 the one thing a restart can't fix.
+
+### 4.4 The root key
+
+For the alpha, **the root key is a file**: `root.seed`, mode 0600, in the admin's keystore. There's
+no key ceremony, no backup root and no rotation, so a fabric can be started with one command and
+understood in one sentence. This is a deliberate trade-off that needs more attention before wires
+holds anything valuable:
+
+- **If it's lost**, nothing breaks at once: hosts and directories keep working under the policy
+  they hold. But nobody can change the policy or issue badges, and the fabric stops when its head
+  (90 days) or its badges (30 days) expire. Recovery is a new fabric: `wires init`, then re-invite
+  every node (an invite is about 800 B, card 37) and re-add the services.
+- **If it leaks**, whoever holds it can admit any node and rewrite the policy. Recovery is the same:
+  a new fabric.
+- **What guards it today:** it never leaves the admin's machine; `wires serve` and
+  `wires directory serve` refuse to run from a keystore that holds it; a host or directory never needs
+  it. Copying the file somewhere safe is the whole backup story.
+- **Later** (not scheduled): a hardware-backed or passkey root, a root that names its own
+  successor (as TUF allows), and narrow delegations so the root signs less often (cards 18, 29).
 
 ## 5. How metadata moves
 
