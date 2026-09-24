@@ -203,7 +203,7 @@ pub(crate) fn services_router(
     let mut builder = iroh::protocol::Router::builder(endpoint.clone())
         .accept(
             library::STATE_ALPN,
-            crate::state::sync::StateResponder(Arc::clone(&host.keystore)),
+            crate::state::sync::StateResponder::new(Arc::clone(&host.keystore)),
         )
         .accept(
             transport::ALPN,

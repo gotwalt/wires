@@ -145,15 +145,21 @@ Frames are length-prefixed canonical JSON tagged by `type`, at most 4 MiB
   local copy only.
 - **Handshake.** A host whose state is newer than the version in a caller's `Hello` hands it back in
   `HelloAck.newer_state` (§5); the caller adopts it before sending stdin.
-- **The responder** (`StateResponder`, on every `serve`). A held copy that has expired vouches for
-  nobody. To an `offer`, it requires the dialer to be a member of the fresh held copy or of the
-  (verified) offered one, then runs `adopt_if_newer`. Adopted: it marks its copy checked and
-  answers `have`. Not adopted (older, equal, or refused): it answers `have` only if the dialer is a
-  member of its fresh held copy, else `denied`, and does **not** mark its copy checked, so a removed
-  member replaying its old, still-fresh state can't stop the host pulling the newer one. To a
-  `have`, it requires a fresh held copy (else `denied`: an expired state is never served) with the
-  dialer a member, and answers `offer` when it holds a newer one, else `have`. Anything else is
-  `denied`.
+- **The responder** (`StateResponder`, on every `serve`). Any key can dial it, so it serves at
+  most 16 exchanges at once (one more is closed unanswered) and sizes no buffer from a length
+  prefix: a frame over 4 KiB must open as an `offer` (`{"state":`, checked before the rest is
+  read), and nothing is over 4 MiB. A held copy that has expired vouches for nobody, and a dialer
+  it doesn't list hears only `not admitted to this fabric` (no version, not whether the copy
+  expired; the detail is traced, throttled). To an `offer` from a member of the fresh held copy it
+  runs `adopt_if_newer`. Adopted: it marks its copy checked and answers `have`. Not adopted
+  (older or equal): it answers `have` and does **not** mark its copy checked, so a removed member
+  the copy still lists, replaying its old, still-fresh state, can't stop the host pulling the
+  newer one. An `offer` from anyone else is taken only if it vouches for the dialer (a host whose
+  copy expired or predates the dialer, catching up): the free checks first (this fabric, strictly
+  newer than the held copy, fresh, listing the dialer), and only then the signature, once, by
+  `adopt_if_newer`. To a `have`, the dialer must be a member of the held copy; then an expired copy
+  is refused as expired (never served), and otherwise it answers `offer` when it holds a newer one,
+  else `have`.
 
 A node never adopts an older or unverifiable state, so a lying peer can only fail to help. A host
 that was offline when a service was assigned to it catches up at `serve` start from another host,

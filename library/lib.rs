@@ -171,7 +171,7 @@ pub use registry::{Service, ServiceName};
 pub use role::{EmailPattern, MAX_ROLE_NAME, Matcher, RoleName};
 pub use session::{Chunk, Frame, Hello, HelloAck};
 pub use state::{STATE_CONTEXT, STATE_V1, SignedState, State, StateVersion};
-pub use sync::{MAX_STATE_FRAME, STATE_ALPN, StateFrame};
+pub use sync::{MAX_SMALL_STATE_FRAME, MAX_STATE_FRAME, OFFER_BODY_PREFIX, STATE_ALPN, StateFrame};
 
 /// Crate version, surfaced so the binaries have something concrete to call
 /// while the real surface is still being built out.

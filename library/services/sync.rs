@@ -39,6 +39,24 @@ pub const STATE_ALPN: &[u8] = b"wires/state/1";
 /// allocating).
 pub const MAX_STATE_FRAME: usize = 4 * 1024 * 1024;
 
+/// The largest frame that is not an [`StateFrame::Offer`]. A `Have` is
+/// about 50 bytes and a `Denied` carries a short reason, so a reader that
+/// hasn't yet seen an offer's opening bytes ([`OFFER_BODY_PREFIX`]) needs no
+/// more than this.
+pub const MAX_SMALL_STATE_FRAME: usize = 4 * 1024;
+
+/// How the body of every encoded [`StateFrame::Offer`] begins: canonical
+/// JSON sorts `state` before `type`. A reader checks these bytes before it
+/// accepts a frame over [`MAX_SMALL_STATE_FRAME`], so only an offer can make
+/// it read up to [`MAX_STATE_FRAME`].
+///
+/// ```
+/// use library::{OFFER_BODY_PREFIX, StateFrame, StateVersion};
+/// let have = StateFrame::Have { version: StateVersion(1) }.encode().unwrap();
+/// assert!(!have[4..].starts_with(OFFER_BODY_PREFIX));
+/// ```
+pub const OFFER_BODY_PREFIX: &[u8] = br#"{"state":"#;
+
 /// One frame of the state protocol. See the module docs.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +145,36 @@ mod tests {
             let bytes = f.encode().unwrap();
             assert_eq!(StateFrame::decode(&bytes).unwrap(), Some((f, bytes.len())));
             assert_eq!(StateFrame::decode(&bytes[..bytes.len() - 1]).unwrap(), None);
+        }
+    }
+
+    /// An offer's body always opens with [`OFFER_BODY_PREFIX`]; the other
+    /// frames never do, and fit in [`MAX_SMALL_STATE_FRAME`] even with a
+    /// worst-case (all control characters) 512-byte reason.
+    #[test]
+    fn only_offers_are_large_and_they_announce_themselves() {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let mut s = State::new(root.node_id());
+        s.members
+            .extend((0..200u8).map(|i| NodeIdentity::from_seed([i; 32]).node_id()));
+        let offer = StateFrame::Offer {
+            state: s.sign(&root).unwrap(),
+        }
+        .encode()
+        .unwrap();
+        assert!(offer.len() > MAX_SMALL_STATE_FRAME, "{}", offer.len());
+        assert!(offer[4..].starts_with(OFFER_BODY_PREFIX));
+        for small in [
+            StateFrame::Have {
+                version: StateVersion(u64::MAX),
+            },
+            StateFrame::Denied {
+                reason: "\u{1}".repeat(512),
+            },
+        ] {
+            let bytes = small.encode().unwrap();
+            assert!(bytes.len() <= MAX_SMALL_STATE_FRAME, "{}", bytes.len());
+            assert!(!bytes[4..].starts_with(OFFER_BODY_PREFIX));
         }
     }
 
