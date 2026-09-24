@@ -244,8 +244,7 @@ impl HostConfigV2 {
     /// again whenever the state advances: every service here must be assigned
     /// to `me` ("refuses to serve a name the registry doesn't assign to
     /// it"), and every role in `also_require` and `push.allow` must be
-    /// defined in `state` (or be `member`). The error names the first
-    /// offender.
+    /// defined in `state`. The error names the first offender.
     pub(crate) fn check_against(&self, state: &State, me: NodeId) -> Result<()> {
         let version = state.version.0;
         let me8 = &me.hex()[..8];
@@ -263,7 +262,7 @@ impl HostConfigV2 {
                 );
             }
         }
-        let defined = |r: &RoleName| r.is_member() || state.roles.contains_key(r);
+        let defined = |r: &RoleName| state.roles.contains_key(r);
         for (name, svc) in &self.services {
             if let Some(r) = svc.also_require.iter().find(|r| !defined(r)) {
                 bail!(
@@ -295,7 +294,10 @@ impl HostConfigV2 {
         let _ = writeln!(out, "host.json ok (version {})", self.version);
         let _ = writeln!(out, "trusted issuers:");
         if self.identity.issuers.is_empty() {
-            let _ = writeln!(out, "  (none: only `member` services can be called here)");
+            let _ = writeln!(
+                out,
+                "  (none: no caller can be verified, so no service can be called here)"
+            );
         }
         for t in &self.identity.issuers {
             let _ = writeln!(out, "  {}  audiences: {}", t.issuer, t.audiences.join(", "));
@@ -406,7 +408,7 @@ mod tests {
             ServiceName::new("orders-db").unwrap(),
             Service {
                 description: String::new(),
-                allow: vec![RoleName::member()],
+                allow: vec![RoleName::new("staff").unwrap()],
                 hosts: vec![other],
                 readers: vec![],
             },

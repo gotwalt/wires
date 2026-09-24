@@ -2,9 +2,9 @@
 //! holds them, by readers it authorizes, and verified on receipt**.
 //!
 //! One v2 host serves `orders-db` (analyst; readers: security) and `status`
-//! (member; readers: security), writing its real call log. alice (analyst)
-//! calls; sam (security) reads; bob (a member, no reader role) and a stranger
-//! try to. The readers run the production `wires watch` core
+//! (staff: anyone the three IdPs verified; readers: security), writing its
+//! real call log. alice (analyst) calls; sam (security) reads; bob (staff, no
+//! reader role) and a stranger try to. The readers run the production `wires watch` core
 //! ([`watch_with`]) over loopback.
 //!
 //! - [`readers_see_all_callers_see_their_own_members_see_nothing`]: `--mine`,
@@ -80,14 +80,25 @@ impl World {
             s.members.insert(n.node_id());
         }
         s.hosts.insert(self.host.node_id());
-        let email = |e: &str| Matcher {
+        let email = |idp: &MockIdp, e: &str| Matcher {
             email: Some(e.parse().unwrap()),
-            ..Default::default()
+            ..Matcher::new(idp.issuer.as_str())
         };
-        s.roles
-            .insert(role("analyst"), vec![email("alice@example.com")]);
-        s.roles
-            .insert(role("security"), vec![email("sam@example.com")]);
+        s.roles.insert(
+            role("analyst"),
+            vec![email(&self.idp_alice, "alice@example.com")],
+        );
+        s.roles.insert(
+            role("security"),
+            vec![email(&self.idp_sam, "sam@example.com")],
+        );
+        s.roles.insert(
+            role("staff"),
+            [&self.idp_alice, &self.idp_bob, &self.idp_sam]
+                .iter()
+                .map(|idp| Matcher::new(idp.issuer.as_str()))
+                .collect(),
+        );
         let on_host = |allow: Vec<RoleName>| Service {
             description: String::new(),
             allow,
@@ -97,7 +108,7 @@ impl World {
         s.services
             .insert(service("orders-db"), on_host(vec![role("analyst")]));
         s.services
-            .insert(service("status"), on_host(vec![RoleName::member()]));
+            .insert(service("status"), on_host(vec![role("staff")]));
         s.sign(&self.root).unwrap()
     }
 

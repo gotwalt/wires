@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! wires role set analyst '*@example.com' 'issuer=https://idp,group=dba'
+//! wires role set staff --issuer https://acme.okta.com 'issuer=https://acme.okta.com'
 //! wires service add orders-db --description "Read-only SQL" --allow analyst --host workbench
 //! wires service set orders-db --host workbench --host spare     # failover
 //! wires service rm  orders-db
@@ -19,7 +20,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use library::{
-    EmailPattern, Matcher, NodeId, RoleName, Service, ServiceName, SignedState, State, StateVersion,
+    EmailPattern, GOOGLE_ISSUER, Matcher, NodeId, RoleName, Service, ServiceName, SignedState,
+    State, StateVersion,
 };
 
 use super::invite::{Report, resolve_member};
@@ -54,8 +56,8 @@ pub(crate) struct ServiceEditArgs {
     /// What it does, shown in `wires services`.
     #[arg(long)]
     pub(crate) description: Option<String>,
-    /// A role allowed to call it (`member`, or one defined with `wires role
-    /// set`). Repeatable.
+    /// A role allowed to call it (one defined with `wires role set`).
+    /// Repeatable.
     #[arg(long = "allow")]
     pub(crate) allow: Vec<String>,
     /// A member that implements it: an `invite --name` label or a node id.
@@ -103,8 +105,12 @@ pub(crate) struct RoleSetArgs {
     pub(crate) name: String,
     /// One matcher each: `*@example.com`, `alice@example.com`, or
     /// comma-separated keys `issuer=…,email=…,org=…,group=…` (all must hold).
+    /// A matcher without `issuer=` takes `--issuer`.
     #[arg(required = true)]
     pub(crate) matchers: Vec<String>,
+    /// The IdP a matcher trusts when it names none: its exact `iss`.
+    #[arg(long, default_value = GOOGLE_ISSUER)]
+    pub(crate) issuer: String,
     /// Lifetime of the new state.
     #[arg(long, default_value = Ttl::DEFAULT)]
     pub(crate) ttl: Ttl,
@@ -282,19 +288,26 @@ fn check_hosts(s: &State, hosts: Option<&[NodeId]>) -> Result<()> {
 
 /// Parse one matcher: a bare email pattern (`*@example.com`,
 /// `alice@example.com`), or comma-separated `key=value` pairs over `issuer`
-/// (or `iss`), `email`, `org`, `group`.
-pub(crate) fn parse_matcher(text: &str) -> Result<Matcher> {
+/// (or `iss`), `email`, `org`, `group`. A matcher that names no issuer
+/// trusts `default_issuer` (`role set --issuer`, Google by default): every
+/// matcher names one.
+pub(crate) fn parse_matcher(text: &str, default_issuer: &str) -> Result<Matcher> {
     let text = text.trim();
+    let default_issuer = default_issuer.trim();
+    if default_issuer.is_empty() {
+        bail!("--issuer is empty");
+    }
     if !text.contains('=') {
         let email: EmailPattern = text
             .parse()
             .map_err(|_| anyhow!("{text:?} is not an email or *@domain (or key=value pairs)"))?;
         return Ok(Matcher {
             email: Some(email),
-            ..Default::default()
+            ..Matcher::new(default_issuer)
         });
     }
-    let mut m = Matcher::default();
+    let mut issuer: Option<String> = None;
+    let mut m = Matcher::new(default_issuer);
     for part in text.split(',') {
         let (key, value) = part
             .split_once('=')
@@ -304,7 +317,7 @@ pub(crate) fn parse_matcher(text: &str) -> Result<Matcher> {
             bail!("{part:?}: the value is empty");
         }
         let slot = match key.trim() {
-            "issuer" | "iss" => &mut m.issuer,
+            "issuer" | "iss" => &mut issuer,
             "org" => &mut m.org,
             "group" => &mut m.group,
             "email" => {
@@ -323,6 +336,9 @@ pub(crate) fn parse_matcher(text: &str) -> Result<Matcher> {
         if slot.replace(value.to_string()).is_some() {
             bail!("{text:?}: {key} given twice");
         }
+    }
+    if let Some(issuer) = issuer {
+        m.issuer = issuer;
     }
     Ok(m)
 }
@@ -406,13 +422,10 @@ pub(crate) fn role_in(ks: &Keystore, a: RoleArgs) -> Result<(String, SignedState
     let (verb, name, signed) = match a.cmd {
         RoleCmd::Set(r) => {
             let name = role(&r.name)?;
-            if name.is_member() {
-                bail!("`member` is built in (any member) and can't be redefined");
-            }
             let matchers = r
                 .matchers
                 .iter()
-                .map(|m| parse_matcher(m))
+                .map(|m| parse_matcher(m, &r.issuer))
                 .collect::<Result<Vec<_>>>()?;
             ("set", name.clone(), role_set(ks, name, matchers, r.ttl)?)
         }
@@ -505,7 +518,7 @@ mod tests {
         let s = role_set(
             &ks,
             role("analyst"),
-            vec![parse_matcher("*@x.com").unwrap()],
+            vec![parse_matcher("*@x.com", GOOGLE_ISSUER).unwrap()],
             ttl(),
         )
         .unwrap();
@@ -565,18 +578,25 @@ mod tests {
 
     #[test]
     fn matchers_parse_like_card_13() {
-        let m = parse_matcher("*@example.com").unwrap();
+        let m = parse_matcher("*@example.com", GOOGLE_ISSUER).unwrap();
         assert_eq!(m.email, Some("*@example.com".parse().unwrap()));
-        let m = parse_matcher("iss=https://idp,group=dba,org=example.com").unwrap();
-        assert_eq!(m.issuer.as_deref(), Some("https://idp"));
+        assert_eq!(m.issuer, GOOGLE_ISSUER, "shorthand takes the default");
+        let m = parse_matcher("iss=https://idp,group=dba,org=example.com", GOOGLE_ISSUER).unwrap();
+        assert_eq!(m.issuer, "https://idp", "an explicit issuer wins");
         assert_eq!(m.group.as_deref(), Some("dba"));
         assert_eq!(m.org.as_deref(), Some("example.com"));
-        let m = parse_matcher("email=bob@x.com,issuer=https://i").unwrap();
+        let m = parse_matcher("group=dba", "https://okta.example").unwrap();
         assert_eq!(
-            parse_matcher(&m.to_string()).unwrap(),
+            m.issuer, "https://okta.example",
+            "long form takes the default too"
+        );
+        let m = parse_matcher("email=bob@x.com,issuer=https://i", GOOGLE_ISSUER).unwrap();
+        assert_eq!(
+            parse_matcher(&m.to_string(), "https://unused").unwrap(),
             m,
             "Display round-trips"
         );
+        assert!(parse_matcher("*@x.com", " ").is_err(), "an empty --issuer");
         for bad in [
             "",
             "nope",
@@ -584,9 +604,63 @@ mod tests {
             "group=",
             "group=a,group=b",
             "email=*@*",
+            "issuer=a,iss=b",
+            "issuer=",
         ] {
-            assert!(parse_matcher(bad).is_err(), "{bad:?}");
+            assert!(parse_matcher(bad, GOOGLE_ISSUER).is_err(), "{bad:?}");
         }
+    }
+
+    /// Run `wires role …` (the parsed command line) against `ks`.
+    fn role_cli(ks: &Keystore, args: &[&str]) -> Result<SignedState> {
+        use crate::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["wires", "role"].iter().chain(args))?;
+        let Command::Role(a) = cli.command else {
+            panic!("expected role");
+        };
+        role_in(ks, a).map(|(_, s)| s)
+    }
+
+    #[test]
+    fn role_set_names_google_unless_told_otherwise() {
+        let ks = admin_with(&[]);
+        let s = role_cli(&ks, &["set", "analyst", "*@acme.com", "alice@x.com"]).unwrap();
+        let ms = &s.state.roles[&role("analyst")];
+        assert!(ms.iter().all(|m| m.issuer == GOOGLE_ISSUER), "{ms:?}");
+
+        let s = role_cli(
+            &ks,
+            &[
+                "set",
+                "analyst",
+                "--issuer",
+                "https://acme.okta.com",
+                "*@acme.com",
+                "issuer=https://other,group=dba",
+            ],
+        )
+        .unwrap();
+        let ms = &s.state.roles[&role("analyst")];
+        assert_eq!(ms[0].issuer, "https://acme.okta.com");
+        assert_eq!(ms[1].issuer, "https://other");
+    }
+
+    #[test]
+    fn member_is_an_ordinary_role_name() {
+        let ks = admin_with(&[]);
+        let s = role_cli(&ks, &["set", "member", "issuer=https://idp"]).unwrap();
+        assert_eq!(
+            s.state.roles[&role("member")],
+            vec![Matcher::new("https://idp")]
+        );
+        role_cli(&ks, &["rm", "member"]).unwrap();
+        // Undefined, `member` is an unknown role like any other.
+        let edit = ServiceEdit {
+            allow: Some(vec![role("member")]),
+            ..Default::default()
+        };
+        assert!(add(&ks, svc("x"), edit, ttl()).is_err());
     }
 
     #[test]

@@ -964,7 +964,7 @@ mod tests {
                 ServiceName::new(name).unwrap(),
                 Service {
                     description: desc.into(),
-                    allow: vec![RoleName::member()],
+                    allow: vec![RoleName::new("staff").unwrap()],
                     hosts: vec![node(4)],
                     readers: vec![],
                 },
@@ -974,7 +974,7 @@ mod tests {
             .into_iter()
             .map(|n| Grant {
                 service: ServiceName::new(n).unwrap(),
-                role: RoleName::member(),
+                role: RoleName::new("staff").unwrap(),
             })
             .collect();
         let aliases = ToolsConfig {

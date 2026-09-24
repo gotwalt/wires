@@ -799,7 +799,7 @@ mod tests {
     use crate::admin::keystore::Keystore;
     use crate::host::config_v2::HostConfigV2;
     use crate::host::gate::ServicesHost;
-    use library::{Argv, Membership, RoleName, Service, ServiceName, State, StateVersion};
+    use library::{Argv, Membership, Service, ServiceName, State, StateVersion};
 
     /// A shutdown signal that never fires: the dialer stays present for the
     /// whole session.
@@ -818,8 +818,9 @@ mod tests {
         NodeIdentity::from_seed([2u8; 32])
     }
 
-    /// A host implementing service `t` as `command`, allowed to every
-    /// `member`; the caller and the host are the members of its signed state.
+    /// A host implementing service `t` as `command`, allowed to role `staff`
+    /// (anyone the shared test IdP verified); the caller and the host are the
+    /// members of its signed state.
     fn host_running(command: &[&str]) -> Arc<ServicesHost> {
         let (root, host, caller) = (root(), host_id(), caller_id());
         let home = crate::testutil::temp_dir();
@@ -830,11 +831,13 @@ mod tests {
         s.not_after = i64::MAX;
         s.members.extend([host.node_id(), caller.node_id()]);
         s.hosts.insert(host.node_id());
+        let (staff, matchers) = crate::testutil::staff_role();
+        s.roles.insert(staff.clone(), matchers);
         s.services.insert(
             ServiceName::new("t").unwrap(),
             Service {
                 description: String::new(),
-                allow: vec![RoleName::member()],
+                allow: vec![staff],
                 hosts: vec![host.node_id()],
                 readers: vec![],
             },
@@ -843,7 +846,8 @@ mod tests {
         crate::state::store::adopt_if_newer(&ks, &signed, root.node_id(), crate::now_unix())
             .unwrap();
         let config = HostConfigV2::parse(&format!(
-            r#"{{"version":2,"services":{{"t":{{"command":{}}}}}}}"#,
+            r#"{{"version":2,"identity":{},"services":{{"t":{{"command":{}}}}}}}"#,
+            crate::testutil::test_identity_json(),
             serde_json::to_string(command).unwrap()
         ))
         .unwrap();
@@ -859,13 +863,13 @@ mod tests {
         )
     }
 
-    /// The caller's `Hello` (membership under the root, state version 1, no
-    /// ID token: service `t` is open to every member).
+    /// The caller's `Hello` (membership under the root, state version 1, and
+    /// an ID token from the shared test IdP: service `t` needs `staff`).
     fn hello() -> Hello {
         Hello {
             membership: Membership::mint(&root(), caller_id().node_id(), 0, i64::MAX).unwrap(),
             state_version: StateVersion(1),
-            id_token: None,
+            id_token: Some(crate::testutil::test_id_token(&caller_id().node_id())),
         }
     }
 

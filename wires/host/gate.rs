@@ -387,23 +387,20 @@ impl ServicesHost {
     }
 
     /// The members `role` names at `now` (never this host): every member
-    /// for `member`, else every member whose last verified principal here is
-    /// in the role.
+    /// whose last verified principal here is in the role. A member with no
+    /// verified identity here is in no role.
     pub(crate) fn push_recipients(&self, role: &RoleName, now: i64) -> Vec<NodeId> {
         let Ok(state) = self.state() else {
             return Vec::new();
         };
         let s = &state.state;
-        let mut nodes: Vec<NodeId> = if role.is_member() {
-            s.members.iter().copied().collect()
-        } else {
-            self.identities
-                .nodes()
-                .into_iter()
-                .filter(|n| s.is_member(*n))
-                .filter(|n| role_admits(s, role, self.identities.current(*n, now).as_ref()))
-                .collect()
-        };
+        let mut nodes: Vec<NodeId> = self
+            .identities
+            .nodes()
+            .into_iter()
+            .filter(|n| s.is_member(*n))
+            .filter(|n| role_admits(s, role, self.identities.current(*n, now).as_ref()))
+            .collect();
         nodes.retain(|n| *n != self.me);
         nodes.sort();
         nodes.dedup();
@@ -421,9 +418,11 @@ mod tests {
         NodeIdentity::from_seed([b; 32]).node_id()
     }
 
+    const ISS: &str = "https://idp.example";
+
     fn who(email: &str) -> Principal {
         Principal {
-            issuer: "https://idp.example".into(),
+            issuer: ISS.into(),
             subject: email.into(),
             email: Some(email.into()),
             org: None,
@@ -441,7 +440,8 @@ mod tests {
         RoleName::new(s).unwrap()
     }
 
-    /// Root 1; members 2 (caller) and 3 (this host); `status` (member) on 3.
+    /// Root 1; members 2 (caller) and 3 (this host); `status` (staff:
+    /// anyone [`ISS`] verified) on 3.
     fn setup() -> (SignedState, HostConfigV2) {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let mut s = State::new(root.node_id());
@@ -449,11 +449,12 @@ mod tests {
         s.not_after = 100;
         s.members.extend([node(2), node(3)]);
         s.hosts.insert(node(3));
+        s.roles.insert(role("staff"), vec![Matcher::new(ISS)]);
         s.services.insert(
             name("status"),
             Service {
                 description: String::new(),
-                allow: vec![RoleName::member()],
+                allow: vec![role("staff")],
                 hosts: vec![node(3)],
                 readers: vec![],
             },
@@ -472,7 +473,7 @@ mod tests {
         let mut s = signed.state;
         let email = |e: &str| Matcher {
             email: Some(e.parse().unwrap()),
-            ..Default::default()
+            ..Matcher::new(ISS)
         };
         s.roles.insert(role("analyst"), vec![email("alice@x.com")]);
         s.roles.insert(
@@ -496,11 +497,15 @@ mod tests {
     }
 
     #[test]
-    fn member_role_admits_a_member() {
+    fn every_role_needs_a_verified_identity() {
         let (s, cfg) = setup();
         let status = name("status");
-        let ok = admit(&s, &cfg, node(3), node(2), None, &status, 0);
-        assert_eq!(ok.unwrap().state_version, StateVersion(5));
+        let e = admit(&s, &cfg, node(3), node(2), None, &status, 0).unwrap_err();
+        assert!(e.needs_identity(), "{e}");
+        let bob = who("bob@x.com");
+        let ok = admit(&s, &cfg, node(3), node(2), Some(&bob), &status, 0).unwrap();
+        assert_eq!(ok.state_version, StateVersion(5));
+        assert_eq!(ok.role, role("staff"));
     }
 
     #[test]
@@ -549,7 +554,7 @@ mod tests {
             role("sre"),
             vec![Matcher {
                 email: Some("carol@x.com".parse().unwrap()),
-                ..Default::default()
+                ..Matcher::new(ISS)
             }],
         );
         let s2 = state.sign(&NodeIdentity::from_seed([1u8; 32])).unwrap();
@@ -578,7 +583,7 @@ mod tests {
             email in prop::option::of(prop::sample::select(vec![
                 "alice@x.com", "carol@x.com", "eve@y.com",
             ])),
-            also in prop::sample::subsequence(vec!["analyst", "sre", "member"], 0..=3),
+            also in prop::sample::subsequence(vec!["analyst", "sre", "staff"], 0..=3),
             service in prop::sample::select(vec!["status", "orders-db", "nope"]),
             now in 0i64..200,
         ) {

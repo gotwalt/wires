@@ -502,7 +502,7 @@ mod tests {
         use crate::admin::ttl::Ttl;
         use iroh::address_lookup::memory::MemoryLookup;
         use iroh::protocol::Router;
-        use library::{RoleName, ServiceName};
+        use library::ServiceName;
 
         fn ttl() -> Ttl {
             Ttl::DEFAULT.parse().unwrap()
@@ -591,7 +591,7 @@ mod tests {
                 ServiceName::new("orders-db").unwrap(),
                 ServiceEdit {
                     description: Some("orders".into()),
-                    allow: Some(vec![RoleName::member()]),
+                    allow: None,
                     hosts: Some(vec![f.host.0.node_id()]),
                     readers: None,
                 },

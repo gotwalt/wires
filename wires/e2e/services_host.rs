@@ -10,7 +10,10 @@
 //!
 //! - [`the_registry_decides_who_runs_what`]: an allowed role runs; a
 //!   disallowed one, and a caller with no token, are refused with the reason
-//!   (and the refusal is in the call log).
+//!   (and the refusal is in the call log). Every role needs a verified
+//!   identity, even "anyone signed in".
+//! - [`a_trusted_issuer_cannot_vouch_for_another_issuers_people`]: a matcher
+//!   admits only its own issuer's principals.
 //! - [`also_require_only_tightens`]
 //! - [`an_unassigned_service_refuses_to_start`]
 //! - [`a_removed_member_is_refused_on_the_next_call`]: the state bump
@@ -49,6 +52,8 @@ use crate::host::serve::{services_host, services_router};
 use crate::host::transport::{ALPN, AuditSink, endpoint_addr, secret_key};
 
 /// The fabric: root 1, host 10, alice 2, bob 3, carol 4.
+///
+/// The host trusts all four IdPs; the roles name only the first three.
 struct World {
     root: NodeIdentity,
     host: NodeIdentity,
@@ -59,6 +64,9 @@ struct World {
     idp_alice: MockIdp,
     idp_bob: MockIdp,
     idp_carol: MockIdp,
+    /// A partner IdP the host also trusts, which vouches for
+    /// `alice@example.com` too; no role names it.
+    idp_partner: MockIdp,
 }
 
 impl World {
@@ -72,12 +80,14 @@ impl World {
             idp_alice: MockIdp::start("alice@example.com").await,
             idp_bob: MockIdp::start("bob@example.com").await,
             idp_carol: MockIdp::start("carol@example.com").await,
+            idp_partner: MockIdp::start("alice@example.com").await,
         }
     }
 
     /// The signed state at `version`: `members` plus the host; roles
-    /// `analyst` (alice, carol) and `sre` (carol); `orders-db` (analyst) and
-    /// `status` (member), both on the host.
+    /// `analyst` (alice, carol) and `sre` (carol), each email at its own
+    /// IdP, and `staff` (anyone the three people's IdPs verified);
+    /// `orders-db` (analyst) and `status` (staff), both on the host.
     fn state(&self, version: u64, members: &[NodeId]) -> SignedState {
         let mut s = State::new(self.root.node_id());
         s.version = StateVersion(version);
@@ -86,16 +96,28 @@ impl World {
         s.members.extend(members.iter().copied());
         s.members.insert(self.host.node_id());
         s.hosts.insert(self.host.node_id());
-        let email = |e: &str| Matcher {
+        let email = |idp: &MockIdp, e: &str| Matcher {
             email: Some(e.parse().unwrap()),
-            ..Default::default()
+            ..Matcher::new(idp.issuer.as_str())
         };
         s.roles.insert(
             role("analyst"),
-            vec![email("alice@example.com"), email("carol@example.com")],
+            vec![
+                email(&self.idp_alice, "alice@example.com"),
+                email(&self.idp_carol, "carol@example.com"),
+            ],
         );
-        s.roles
-            .insert(role("sre"), vec![email("carol@example.com")]);
+        s.roles.insert(
+            role("sre"),
+            vec![email(&self.idp_carol, "carol@example.com")],
+        );
+        s.roles.insert(
+            role("staff"),
+            [&self.idp_alice, &self.idp_bob, &self.idp_carol]
+                .iter()
+                .map(|idp| Matcher::new(idp.issuer.as_str()))
+                .collect(),
+        );
         let on_host = |allow: Vec<RoleName>| Service {
             description: String::new(),
             allow,
@@ -105,7 +127,7 @@ impl World {
         s.services
             .insert(service("orders-db"), on_host(vec![role("analyst")]));
         s.services
-            .insert(service("status"), on_host(vec![RoleName::member()]));
+            .insert(service("status"), on_host(vec![role("staff")]));
         s.sign(&self.root).unwrap()
     }
 
@@ -117,17 +139,22 @@ impl World {
         ]
     }
 
-    /// A `host.json` v2 trusting all three IdPs, with `services` spliced in.
+    /// A `host.json` v2 trusting all four IdPs, with `services` spliced in.
     fn host_json(&self, services: &str, push: bool) -> HostConfigV2 {
-        let issuers: Vec<String> = [&self.idp_alice, &self.idp_bob, &self.idp_carol]
-            .iter()
-            .map(|idp| {
-                format!(
-                    r#"{{"issuer":"{}","audiences":["{MOCK_CLIENT_ID}"]}}"#,
-                    idp.issuer.as_str()
-                )
-            })
-            .collect();
+        let issuers: Vec<String> = [
+            &self.idp_alice,
+            &self.idp_bob,
+            &self.idp_carol,
+            &self.idp_partner,
+        ]
+        .iter()
+        .map(|idp| {
+            format!(
+                r#"{{"issuer":"{}","audiences":["{MOCK_CLIENT_ID}"]}}"#,
+                idp.issuer.as_str()
+            )
+        })
+        .collect();
         let push = if push {
             r#","push":{"allow":["analyst"]}"#
         } else {
@@ -410,9 +437,17 @@ async fn the_registry_decides_who_runs_what() {
         out.denied()
     );
 
-    // `member` needs no identity; the role reaches the service's env.
+    // No role admits a member without a verified identity, not even
+    // "anyone signed in"; with one, the role reaches the service's env.
     let out = call(&w.bob, &host, w.hello(&w.bob, 1, false), "status", &[]).await;
-    assert_eq!(out.stdout(), "up as member");
+    assert!(
+        out.denied()
+            .starts_with("no ID token presented; run `wires login`"),
+        "{}",
+        out.denied()
+    );
+    let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "status", &[]).await;
+    assert_eq!(out.stdout(), "up as staff");
 
     // A name the registry doesn't know, and a stranger.
     let out = call(&w.alice, &host, w.hello(&w.alice, 1, true), "nope", &[]).await;
@@ -430,6 +465,43 @@ async fn the_registry_decides_who_runs_what() {
         out.denied(),
         "not a member of the current signed state (version 1)"
     );
+}
+
+#[tokio::test]
+async fn a_trusted_issuer_cannot_vouch_for_another_issuers_people() {
+    let w = World::new().await;
+    let host = Host::start(&w, w.host_json(SERVICES, false), &w.state(1, &w.everyone()))
+        .await
+        .unwrap();
+    // The partner IdP verifies alice@example.com, and the host trusts it,
+    // but every role names alice's own IdP (or others): nothing admits her.
+    let partner_hello = Hello {
+        id_token: Some(w.idp_partner.mint(
+            &OidcNonce::for_node(&w.alice.node_id()),
+            crate::now_unix() + 3600,
+        )),
+        ..w.hello(&w.alice, 1, false)
+    };
+    for svc in ["orders-db", "status"] {
+        let out = call(&w.alice, &host, partner_hello.clone(), svc, &[]).await;
+        assert!(
+            out.denied().starts_with(&format!(
+                "alice@example.com is in no role allowed to call {svc}"
+            )),
+            "{}",
+            out.denied()
+        );
+    }
+    // Her own IdP's token is admitted.
+    let out = call(
+        &w.alice,
+        &host,
+        w.hello(&w.alice, 1, true),
+        "orders-db",
+        &["1"],
+    )
+    .await;
+    assert_eq!(out.stdout(), "rows: 1\n");
 }
 
 #[tokio::test]
@@ -535,7 +607,7 @@ async fn a_removed_member_is_refused_on_the_next_call() {
         "not a member of the current signed state (version 2)"
     );
     // bob, still holding version 1, is served and handed version 2.
-    let out = call(&w.bob, &host, w.hello(&w.bob, 1, false), "status", &[]).await;
+    let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "status", &[]).await;
     let Outcome::Ran { ack, .. } = &out else {
         panic!("{out:?}")
     };
@@ -569,10 +641,10 @@ async fn push_follows_the_signed_state() {
 
     // alice's identity is known here once she has called with her token.
     let out = call(&w.alice, &host, w.hello(&w.alice, 1, true), "status", &[]).await;
-    assert_eq!(out.stdout(), "up as member");
+    assert_eq!(out.stdout(), "up as staff");
     let report = push.send(spec(&w.alice)).await.unwrap();
     assert!(report.any_accepted(), "{}", report.render());
-    // bob, unknown here, is told to log in; once known (a member, not an
+    // bob, unknown here, is told to log in; once known (staff, not an
     // analyst) he is refused at send and at fetch.
     let report = push.send(spec(&w.bob)).await.unwrap();
     assert!(
@@ -690,6 +762,15 @@ async fn a_fetch_with_a_token_makes_a_caller_reachable_by_role() {
     // carol (an analyst) has never called this host: nobody is reachable.
     let e = format!("{:#}", push.send(to_analysts()).await.unwrap_err());
     assert!(e.contains("wires inbox"), "{e}");
+    // Nor does any role reach members by membership alone: `member` is no
+    // longer built in, and `staff` needs verified identities too.
+    for to in ["member", "staff"] {
+        let spec = PushSpec {
+            to: to.into(),
+            ..to_analysts()
+        };
+        assert!(push.send(spec).await.is_err(), "--to {to}");
+    }
 
     // Her `wires inbox` presents her token: now the host knows who she is.
     let token = w.hello(&w.carol, 1, true).id_token;

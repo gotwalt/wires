@@ -5,7 +5,7 @@
 //! ```text
 //! $ wires services
 //! orders-db  Read-only SQL against the orders database  (analyst)
-//! status     Build and deploy status                    (member)
+//! status     Build and deploy status                    (staff)
 //! ```
 //!
 //! Hosts are not shown: a caller addresses a service, never a machine.
@@ -55,7 +55,7 @@ pub(crate) struct Allowed {
 
 /// Evaluate the stored state for this node (`ks`), with its stored identity.
 /// Notes on why the identity is missing go to stderr; they don't fail the
-/// listing (services open to any member still show).
+/// listing (which is then empty: every role needs a verified identity).
 pub(crate) async fn allowed(ks: &Keystore) -> Result<Allowed> {
     let me = keystore::node_identity_in(ks)?.node_id();
     let membership = ks
@@ -231,7 +231,7 @@ mod tests {
         s.hosts.insert(node(4));
         let svc = |description: &str| Service {
             description: description.into(),
-            allow: vec![RoleName::member()],
+            allow: vec![RoleName::new("staff").unwrap()],
             hosts: vec![node(4)],
             readers: vec![],
         };
@@ -252,7 +252,7 @@ mod tests {
             },
             Grant {
                 service: name("status"),
-                role: RoleName::member(),
+                role: RoleName::new("staff").unwrap(),
             },
         ]
     }
@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(
             out,
             "orders-db  Read-only SQL against the orders database  (analyst)\n\
-             status     Build and deploy status                    (member)"
+             status     Build and deploy status                    (staff)"
         );
         assert!(!out.contains(&short(&node(4))));
         assert_eq!(render(&state(), &[], false), "");

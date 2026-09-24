@@ -755,7 +755,7 @@ mod tests {
     async fn shaping_over_a_loopback_host() {
         use crate::host::config_v2::HostConfigV2;
         use crate::host::transport::{ALPN, endpoint_addr, secret_key};
-        use library::{Hello, Membership, RoleName, Service, State, StateVersion};
+        use library::{Hello, Membership, Service, State, StateVersion};
 
         let root = NodeIdentity::from_seed([70; 32]);
         let server = NodeIdentity::from_seed([71; 32]);
@@ -766,12 +766,14 @@ mod tests {
         s.not_after = i64::MAX;
         s.members.extend([server.node_id(), client.node_id()]);
         s.hosts.insert(server.node_id());
+        let (staff, matchers) = crate::testutil::staff_role();
+        s.roles.insert(staff.clone(), matchers);
         for name in ["json", "fail"] {
             s.services.insert(
                 ServiceName::new(name).unwrap(),
                 Service {
                     description: String::new(),
-                    allow: vec![RoleName::member()],
+                    allow: vec![staff.clone()],
                     hosts: vec![server.node_id()],
                     readers: vec![],
                 },
@@ -781,11 +783,12 @@ mod tests {
         let ks = Keystore::at(&home);
         crate::state::store::adopt_if_newer(&ks, &s.sign(&root).unwrap(), root.node_id(), 10)
             .unwrap();
-        let config = HostConfigV2::parse(
-            r#"{"version":2,"services":{
-                "json":{"command":["sh","-c","printf '{\"items\":[{\"name\":\"é-one\"},{\"name\":\"two\"},{\"name\":\"three\"}]}'"]},
-                "fail":{"command":["sh","-c","echo 'HTTP 404'; exit 3"]}}}"#,
-        )
+        let config = HostConfigV2::parse(&format!(
+            r#"{{"version":2,"identity":{},"services":{{
+                "json":{{"command":["sh","-c","printf '{{\"items\":[{{\"name\":\"é-one\"}},{{\"name\":\"two\"}},{{\"name\":\"three\"}}]}}'"]}},
+                "fail":{{"command":["sh","-c","echo 'HTTP 404'; exit 3"]}}}}}}"#,
+            crate::testutil::test_identity_json()
+        ))
         .unwrap();
         let host = crate::host::serve::services_host(
             server.node_id(),
@@ -823,7 +826,7 @@ mod tests {
                 Hello {
                     membership: Membership::mint(&root, client.node_id(), 0, i64::MAX).unwrap(),
                     state_version: StateVersion(1),
-                    id_token: None,
+                    id_token: Some(crate::testutil::test_id_token(&client.node_id())),
                 },
                 Invocation {
                     tool: ToolName::new(name).unwrap(),
@@ -971,7 +974,7 @@ mod tests {
         caller: NodeId,
         hosts: &[NodeId],
     ) -> SignedState {
-        use library::{RoleName, Service, State, StateVersion};
+        use library::{Matcher, RoleName, Service, State, StateVersion};
         let mut s = State::new(root.node_id());
         s.version = StateVersion(version);
         s.issued = 1;
@@ -979,11 +982,14 @@ mod tests {
         s.members.insert(caller);
         s.members.extend(hosts.iter().copied());
         s.hosts.extend(hosts.iter().copied());
+        let staff = RoleName::new("staff").unwrap();
+        s.roles
+            .insert(staff.clone(), vec![Matcher::new("https://idp.example")]);
         s.services.insert(
             ServiceName::new("orders-db").unwrap(),
             Service {
                 description: "Read-only SQL".into(),
-                allow: vec![RoleName::member()],
+                allow: vec![staff],
                 hosts: hosts.to_vec(),
                 readers: vec![],
             },

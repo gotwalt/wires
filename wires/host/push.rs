@@ -18,8 +18,8 @@
 //! names (default: nobody). A removed member gets nothing: its queue is
 //! dropped (logged `denied`), and its fetch is refused.
 //!
-//! **The identity rule.** `push.allow: ["member"]` needs no identity. Any
-//! other role needs the recipient's verified principal, and a host only knows
+//! **The identity rule.** Every role needs the recipient's verified
+//! principal (there is no role that admits without one), and a host only knows
 //! the principals that were presented *to it*: the ID token in a call's
 //! `Hello`, or in an inbox fetch's `Hello` (`wires inbox` always sends the
 //! token `wires login` stored). So a caller who has logged in is reachable
@@ -103,7 +103,7 @@ pub(crate) const QUEUE_FILE: &str = "push-queue.json";
 /// What `wires push` asks the running host to send.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PushSpec {
-    /// A node id (64 hex) or a role name (from the signed state, or `member`).
+    /// A node id (64 hex) or a role name from the signed state.
     pub(crate) to: String,
     /// One line.
     pub(crate) subject: Subject,
@@ -415,9 +415,9 @@ impl PushHost {
             .map(|(p, role)| (p, Some(role.as_str().to_string())))
     }
 
-    /// The recipients `to` names at `now`: a node id, or every member in that
-    /// role (`member`: every member; any other role: the members whose
-    /// verified identity this host holds and the role admits).
+    /// The recipients `to` names at `now`: a node id, or the members in that
+    /// role (those whose verified identity this host holds and the role
+    /// admits).
     fn recipients(&self, to: &str, now: i64) -> Result<Vec<NodeId>> {
         if to.len() == 64
             && let Ok(node) = NodeId::from_hex(to)
@@ -758,8 +758,7 @@ fn now_ms() -> i64 {
 pub(crate) struct PushArgs {
     /// Who receives it: a node id (a service's `$WIRES_CALLER_NODE` is its
     /// caller's), or a role from the signed state (every member whose
-    /// verified identity this host holds and the role admits; `member` for
-    /// every member).
+    /// verified identity this host holds and the role admits).
     #[arg(long)]
     pub(crate) to: String,
     /// One line, recorded in the host's call log (the body is not, unless

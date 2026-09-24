@@ -258,7 +258,7 @@ mod tests {
         s.hosts.extend([node(2), node(3)]);
         let svc = |hosts: Vec<NodeId>| Service {
             description: String::new(),
-            allow: vec![RoleName::member()],
+            allow: vec![RoleName::new("staff").unwrap()],
             hosts,
             readers: vec![],
         };

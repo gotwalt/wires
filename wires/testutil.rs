@@ -1,5 +1,5 @@
 //! Fixtures shared by the unit tests of more than one role module: scratch
-//! directories.
+//! directories, and a shared mock IdP for fixtures that need a signed-in caller.
 
 use std::path::{Path, PathBuf};
 
@@ -63,4 +63,51 @@ impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// One mock OIDC issuer for the whole test binary, on its own runtime
+/// thread, so a synchronous fixture can sign a caller in (every role needs a
+/// verified identity). It signs in `caller@example.com` and never stops.
+pub(crate) fn test_idp() -> &'static crate::caller::mock_idp::MockIdp {
+    use crate::caller::mock_idp::MockIdp;
+    static IDP: std::sync::OnceLock<MockIdp> = std::sync::OnceLock::new();
+    IDP.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            tx.send(rt.block_on(MockIdp::start("caller@example.com")))
+                .unwrap();
+            rt.block_on(std::future::pending::<()>());
+        });
+        rx.recv().unwrap()
+    })
+}
+
+/// A [`test_idp`] ID token bound to `node`, valid for an hour.
+pub(crate) fn test_id_token(node: &library::NodeId) -> library::IdToken {
+    test_idp().mint(
+        &library::OidcNonce::for_node(node),
+        crate::now_unix() + 3600,
+    )
+}
+
+/// The role `staff`: anyone [`test_idp`] verified.
+pub(crate) fn staff_role() -> (library::RoleName, Vec<library::Matcher>) {
+    (
+        library::RoleName::new("staff").unwrap(),
+        vec![library::Matcher::new(test_idp().issuer.as_str())],
+    )
+}
+
+/// A `host.json` `"identity"` value that trusts [`test_idp`].
+pub(crate) fn test_identity_json() -> String {
+    format!(
+        r#"{{"issuers":[{{"issuer":"{}","audiences":["{}"]}}]}}"#,
+        test_idp().issuer.as_str(),
+        crate::caller::mock_idp::MOCK_CLIENT_ID
+    )
 }
