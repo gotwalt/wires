@@ -1,5 +1,4 @@
-//! What a service is while one call runs, as the session bridge sees it
-//! (card 33).
+//! What a service is while one call runs, as the session bridge sees it.
 //!
 //! The bridge ([`transport`](crate::host::transport)) doesn't care what
 //! implements a service. It needs the call's stdin to write to, its stdout

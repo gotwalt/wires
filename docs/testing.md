@@ -43,6 +43,12 @@ processes: two hosts implementing one service from
 `dev-mock-idp`) and runs `wires services` / `wires call` / `wires mcp` /
 `wires inbox`, a reader on `wires watch`, failover and removal, all on
 loopback in a fresh `mktemp -d`, every step asserted.
-`.scripts/demo-push.sh --quiet` does the same for push. Both build what they
-need with Cargo; `--keep` leaves the state behind to poke at. Keep state paths short: macOS
+`.scripts/demo-push.sh --quiet` does the same for push, and
+`.scripts/demo-native-service.sh --lang python|node` (`make demo-python`,
+`make demo-node`) for a native service written in Python or TypeScript:
+the kv example as the host, called with the shipped `wires`, down to a
+clean `stop()` (Python needs `uv`, TypeScript Node >= 22.18; the node demo
+also typechecks the example against the generated `index.d.ts`). All three
+build what they need with Cargo; `--keep` leaves the state behind to poke
+at. Keep state paths short: macOS
 limits unix-socket paths to 104 bytes.

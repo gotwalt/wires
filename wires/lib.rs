@@ -22,7 +22,9 @@
 //!
 //! **Embedding** (card 33): an app serves wires calls in-process by
 //! implementing [`Service`] and serving a [`Host`] built from its keystore.
-//! To callers, a native service is a CLI like any other.
+//! To callers, a native service is a CLI like any other. The Python and
+//! TypeScript bindings (`bindings/`) are built on the same API, sharing a
+//! call's stdio through [`SharedIo`].
 //!
 //! Secrets resolve through flag → env → `--…-file` → on-disk
 //! keystore (`admin/keystore.rs`), so once the admin's credentials are
@@ -37,7 +39,7 @@
 //! transport failure.
 
 // The crate calls itself `wires` too, so code written against the public API
-// (`examples/kv.rs`, which the e2e tests include) compiles inside it.
+// (`examples/kv/store.rs`, which the e2e tests include) compiles inside it.
 extern crate self as wires;
 
 mod admin;
@@ -49,7 +51,7 @@ mod net;
 mod state;
 
 pub use host::embed::{Host, HostBuilder};
-pub use host::native::{Call, CallIo, Service};
+pub use host::native::{Call, CallIo, Service, SharedIo};
 /// The types a [`Call`] is described in.
 pub use library::{CallId, NodeId, Principal, RoleName, ServiceName, StateVersion};
 

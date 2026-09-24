@@ -178,3 +178,79 @@ proves good enough when evaluated.
   napi's tokio runtime (`tokio_rt`), the host included. The crate has
   `test = false`: an addon has no test harness to link, so its acceptance
   is `make demo-node`. The demo script is now one, with `--lang`.
+
+### Integrator review fixes (2026-09-24)
+
+- **B1.** `serve_until` now stops everything it started once `shutdown`
+  resolves (or push ends, or the push sockets fail to bind): the refresh
+  loop (a `oneshot` whose sender is dropped; `refresh_loop` selects on it),
+  `router.shutdown()` (which aborts in-flight sessions, so native handlers
+  are aborted too), `endpoint.close()`, and the child push directory. The
+  embedded host's endpoint also takes its address hints from its own
+  keystore (`transport::bind_with(.., hints_from)`; `pull_now` likewise), so
+  it now reads nothing from `$WIRES_HOME` (L4: code fixed, not the doc).
+  e2e `a_stopped_host_closes_its_endpoint`; the demo sends SIGTERM, the
+  example calls `stop()`, and the Python / Node process must exit 0 on its
+  own within 10 s, having printed `kv: stopped`.
+- **B2.** `Task` keeps its `JoinHandle` (and the exit code once reaped)
+  instead of moving it into `wait()`, and aborts it on `Drop`. This fixed a
+  real bug the new tests found: the bridge races `wait()` against the
+  caller leaving, so the dropped `wait` future took the handle with it and
+  the following `kill()` reached nothing; the handler ran on detached and
+  the session hung on its stdout. (The old `TaskProcess` test missed it
+  because its closure dropped its stdout at once.) Tests:
+  `dropping_the_running_service_aborts_its_handler`,
+  `a_kill_after_a_dropped_wait_still_stops_the_handler`.
+- **B3.** e2e: `native_and_cli_services_share_one_host` (a `host.json` CLI
+  service beside `Kv`: one gate, one log), `push_allow_refuses_a_caller_in_none_of_its_roles`
+  (exit 1, `push refused: …`, a `Denied` push record),
+  `each_verified_person_gets_their_own_kv` (alice and bob both admitted,
+  separate namespaces). embed.rs: a native/`host.json` name collision is now
+  refused at `build` (`service t is both registered here and in host.json;
+  pick one`) rather than silently resolved by the gate; `load_embedded` and
+  `HostBuilder::host_json` (empty services beside native ones; CLI services
+  alone; v1 and a missing file refused with the path). transport: the bridge
+  tests drive `native::start` (TaskProcess / `in_process` deleted);
+  `a_native_service_is_stopped_and_finished_when_the_dialer_vanishes`
+  checks `Finished` exit -1.
+- **M1.** The bindings' `serve` no longer takes Ctrl-C unless asked:
+  Python `serve(handle_ctrl_c=False)` (UniFFI default), Node
+  `serve(handleCtrlC?: boolean)`. The stop signal is made at `build`, so
+  `stop()` before `serve()` makes it return at once. The examples stop on
+  SIGTERM/SIGINT themselves (Python serves on a thread so the main thread
+  can take signals). `Host::serve` (Rust) keeps Ctrl-C, documented.
+- **M2.** protocol.md §5: a Rust handler is aborted; a Python/JS handler's
+  next read or write fails. Also documents `also_require`, the name
+  collision, the keystore-only hints, what `serve_until` stops, Ctrl-C.
+- **M3.** usage.md "Host: native services" (keystore setup, Rust, Python,
+  TypeScript, the demo; layout lists `bindings/`); testing.md lists the
+  native demo. README: no line added. The candidate ("write a service in
+  Rust, Python or TypeScript") dies to "any MCP SDK already lets me write a
+  server in Python"; what's distinctive (same gate, log and identity as a
+  CLI service) is the existing pitch, not a new line.
+- **M4.** Board row 33: "bindings that depend on `wires` directly".
+- **L1.** `Call` is no longer `Clone` (nothing needed it; documented: share
+  it in an `Arc`). `Call::principal()` is `&Principal` and `Call::id()` is
+  `CallId` (no role admits without a principal; a host without a call log,
+  tests only, names the call with a fresh id). The bindings follow.
+- **L2.** Documented on `HostBuilder::service` and in protocol.md:
+  `also_require` is CLI-only; a handler checks `Call::role` /
+  `Call::principal` itself. No `HostBuilder::also_require` (it needs the
+  gate to read native rules; not worth it until someone asks).
+- **L3.** kv.py / kv.mts: a failed push after `set` is logged to the host's
+  stderr and the call still exits 0.
+- **Sweep.** One `wires::SharedIo` (in `native.rs`) replaces both bindings'
+  stdio plumbing (locks, close, write, `READ_ALL_MAX`, read-all); the
+  `Principal` mapping is a `From` impl per binding (each needs its own
+  derive, so the struct can't be shared). `WiresError::failed(&anyhow::Error)`
+  (+ `msg`), node's `failed_by`. `Binding::Endpoint` is `#[cfg(test)]`.
+  `HostConfig::read` is the shared helper of `load` / `load_embedded`.
+  `examples/kv.rs` → `examples/kv/{main,store}.rs`, the e2e tests include
+  `store.rs` (no `allow(dead_code)`). Demo: `nativehost`, header rewritten,
+  trap is a `cleanup` function (no stray `p=""`), `tsc --typeRoots` instead
+  of a `sed` of tsconfig, and a `throw` verb (kv.py, kv.mts) asserted as
+  exit 1 with its message. "(card 33)" gone from the package descriptions,
+  build scripts and examples. The bindings' Rust tests drive the foreign
+  path (`run_foreign`, which `Foreign` uses): a raise is exit 1 plus
+  stderr; stdio is closed after the handler returns though the foreign
+  side kept it. The builds-once test stays (binding-specific).

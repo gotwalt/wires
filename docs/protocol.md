@@ -222,7 +222,7 @@ keystore a child could tamper with: it keeps the highest state version it has de
 memory and refuses to decide under an older `state.json` (`host configuration error`, logged
 as a rollback), and it trusts only issuer keys it fetched itself (§6).
 
-**Native services** (card 33: `wires/host/native.rs`, `wires/host/embed.rs`). An app can embed
+**Native services** (`wires/host/native.rs`, `wires/host/embed.rs`). An app can embed
 the host (`wires::Host::builder(<keystore dir>)`, `.service(name, impl wires::Service)`, `.serve()`)
 and implement services in-process. The wire, the gate, the log and the bridge are the ones above:
 a native service is invoked by `Invoke`, reads the caller's stdin, writes stdout and stderr, and
@@ -233,11 +233,19 @@ variables. With push configured (`host.json` `push`, or the builder's `push_allo
 the call's push capability as it does for a child and hands it over in-process:
 `Call::push_to_caller(subject, body)` is checked against the same live-token registry (only this
 call's caller, until the grace period after the call ends, §7), goes through `push.allow`, and is
-logged naming the call. If the connection closes, the host aborts the task; if the
-handler panics, the call exits -1. Its stdio is recorded like a child's (§8). An embedded host
-starts like `serve`: the signed state must assign every service to it, CLI and native, and a name
-can't be both. Its keystore is the directory the app names (it reads neither `$WIRES_HOME` nor
-`$WIRES_NODE_SEED`), except that the local hints file is still read from `$WIRES_HOME`. The node
+logged naming the call. If the connection closes (or the host stops), a Rust handler's task is
+aborted at its next `.await` and the call exits -1; a Python or JavaScript handler can't be
+aborted, so its next read or write fails instead. If a handler panics, the call exits -1. Either
+way the call gets its `Finished`, and its stdio is recorded like a child's (§8). `host.json`'s
+`also_require` applies to CLI services only: a native service is gated by the signed state alone,
+and a handler wanting a stricter local rule checks `Call::role` or `Call::principal` itself. An
+embedded host starts like `serve`: the signed state must assign every service to it, CLI and
+native, and a name can't be both (`build` refuses it). Its keystore, hints file included, is the
+directory the app names; it reads neither `$WIRES_HOME` nor `$WIRES_NODE_SEED`. `serve_until`
+returns once its shutdown future resolves and everything it started has stopped: the state
+refresh, the protocol router with its sessions, and the endpoint (closed). `Host::serve` is
+`serve_until` Ctrl-C, which claims SIGINT process-wide; the bindings' `serve` doesn't listen for
+it unless asked (`serve(handle_ctrl_c=True)`, `serve(true)`). The node
 key lives in the app's memory (§9): a native service is the operator's own code, as trusted as
 `serve`, so nothing isolates it from the key the way a child is kept away from it.
 `bind_loopback()` binds the host's direct (IP) transport only on `127.0.0.1` and `::1`, with no

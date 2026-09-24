@@ -1,4 +1,4 @@
-//! The host an app embeds (card 33): build it from a keystore, register
+//! The host an app embeds: build it from a keystore, register
 //! native [`Service`]s, and serve.
 //!
 //! An embedded host is `wires serve` running inside the app. It starts the
@@ -66,8 +66,9 @@ pub struct HostBuilder {
 
 impl Host {
     /// Start building a host whose keystore is `home` (what `$WIRES_HOME` is
-    /// for `wires`): its `node.seed`, `membership.json` and signed state.
-    /// The host reads nothing from `$WIRES_HOME` or `$WIRES_NODE_SEED`.
+    /// for `wires`): its `node.seed`, `membership.json`, signed state, call
+    /// log and address hints. The host reads nothing from `$WIRES_HOME`,
+    /// `$WIRES_NODE_SEED` or `$WIRES_MEMBERSHIP`.
     pub fn builder(home: impl Into<PathBuf>) -> HostBuilder {
         HostBuilder {
             home: home.into(),
@@ -86,7 +87,9 @@ impl Host {
         self.serving.node.node_id()
     }
 
-    /// Serve until Ctrl-C.
+    /// Serve until Ctrl-C (SIGINT). This listens for the signal
+    /// process-wide, which suits an app that is the host and nothing else;
+    /// an app with its own shutdown uses [`serve_until`](Self::serve_until).
     pub async fn serve(self) -> Result<()> {
         self.serve_until(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -94,9 +97,11 @@ impl Host {
         .await
     }
 
-    /// Serve until `shutdown` resolves. Errors before serving if the signed
-    /// state doesn't assign every service to this host (after trying to
-    /// pull a newer one), or the call log can't be opened.
+    /// Serve until `shutdown` resolves, then stop: calls in progress are
+    /// ended and the endpoint is closed, so nothing of the host outlives
+    /// the returned future. Errors before serving if the signed state
+    /// doesn't assign every service to this host (after trying to pull a
+    /// newer one), or the call log can't be opened. Listens for no signal.
     pub async fn serve_until(self, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
         serve_until(self.serving, async {
             shutdown.await;
@@ -140,6 +145,12 @@ impl HostBuilder {
     }
 
     /// Implement service `name` with `service`, in-process.
+    ///
+    /// `host.json`'s `also_require` (a stricter local rule on top of the
+    /// signed state) applies to its CLI services only; a native service is
+    /// gated by the signed state alone. A handler that wants a stricter
+    /// rule checks [`Call::role`](crate::Call::role) or
+    /// [`Call::principal`](crate::Call::principal) itself.
     pub fn service(mut self, name: impl Into<String>, service: impl Service) -> Self {
         self.native.push((name.into(), Arc::new(service)));
         self
@@ -169,9 +180,9 @@ impl HostBuilder {
     }
 
     /// Check the configuration and load the keystore: the node key, the
-    /// membership. Errors on a bad service name, a name registered twice,
-    /// no services at all, an invalid `host.json`, or a keystore that isn't
-    /// a joined node's. Whether the signed state assigns the services here
+    /// membership. Errors on a bad service name, a name registered twice
+    /// (natively, or natively and in `host.json`), no services at all, an
+    /// invalid `host.json`, or a keystore that isn't a joined node's. Whether the signed state assigns the services here
     /// is checked when the host starts to serve.
     pub fn build(self) -> Result<Host> {
         let mut native = NativeServices::new();
@@ -191,6 +202,9 @@ impl HostBuilder {
                 audit: None,
             },
         };
+        if let Some(name) = native.keys().find(|n| config.services.contains_key(*n)) {
+            bail!("service {name} is both registered here and in host.json; pick one");
+        }
         config.identity.issuers.extend(self.issuers);
         if let Some(roles) = self.push_allow {
             let allow = roles
@@ -294,6 +308,55 @@ mod tests {
             .save_node(&library::NodeIdentity::generate())
             .unwrap();
         assert!(err(Host::builder(&empty).service("t", Nop)).contains("wires join"));
+    }
+
+    /// `host.json` at a fresh path holding `text`.
+    fn host_json(text: &str) -> PathBuf {
+        let path = crate::testutil::temp_dir().join("host.json");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_host_json_may_list_no_services_beside_native_ones() {
+        let empty = host_json(r#"{"version":2,"services":{}}"#);
+        let host = Host::builder(joined())
+            .host_json(&empty)
+            .service("t", Nop)
+            .build()
+            .unwrap();
+        assert!(host.serving.config.services.is_empty());
+        assert!(
+            err(Host::builder(joined()).host_json(&empty)).starts_with("nothing is implemented")
+        );
+        // Its CLI services alone are enough, and are kept.
+        let cli = host_json(r#"{"version":2,"services":{"gh":{"command":["gh"]}}}"#);
+        let host = Host::builder(joined()).host_json(&cli).build().unwrap();
+        assert_eq!(host.serving.config.services.len(), 1);
+    }
+
+    #[test]
+    fn a_bad_host_json_is_refused_with_its_path() {
+        let v1 = host_json(r#"{"version":1,"services":{}}"#);
+        let e = err(Host::builder(joined()).host_json(&v1).service("t", Nop));
+        assert!(e.contains("is not a valid host.json"), "{e}");
+        assert!(e.contains("version 1 is not supported"), "{e}");
+        let missing = crate::testutil::temp_dir().join("absent.json");
+        let e = err(Host::builder(joined())
+            .host_json(&missing)
+            .service("t", Nop));
+        assert!(e.starts_with("reading "), "{e}");
+    }
+
+    /// A name in both places would leave the gate to pick one silently.
+    #[test]
+    fn a_native_service_may_not_share_a_name_with_host_json() {
+        let cli = host_json(r#"{"version":2,"services":{"t":{"command":["true"]}}}"#);
+        let e = err(Host::builder(joined()).host_json(&cli).service("t", Nop));
+        assert_eq!(
+            e,
+            "service t is both registered here and in host.json; pick one"
+        );
     }
 
     #[test]

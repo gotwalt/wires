@@ -5038,6 +5038,7 @@ dependencies = [
 name = "wires-ffi"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -5049,6 +5050,7 @@ dependencies = [
 name = "wires-node"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "napi",
  "napi-build",
  "napi-derive",

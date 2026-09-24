@@ -300,13 +300,15 @@ pub async fn bind(identity: &NodeIdentity, relay_url: Option<&str>) -> Result<En
 
 /// Bind an iroh endpoint for `identity` advertising `alpn`, using the n0 preset
 /// for discovery + relays. If `relay_url` is given, that relay is used instead
-/// of the n0 default (for a self-hosted iroh relay).
+/// of the n0 default (for a self-hosted iroh relay). Address hints come from
+/// $WIRES_HOME's hints file.
 pub async fn bind_with_alpn(
     identity: &NodeIdentity,
     relay_url: Option<&str>,
     alpn: &[u8],
 ) -> Result<Endpoint> {
-    bind_with(identity, relay_url, alpn, false).await
+    let ks = crate::admin::keystore::Keystore::resolve().ok();
+    bind_with(identity, relay_url, alpn, false, ks.as_ref()).await
 }
 
 /// [`bind_with_alpn`], with direct (IP) connections only on loopback
@@ -314,18 +316,21 @@ pub async fn bind_with_alpn(
 /// connect directly, others through the relay. A host bound so opens no
 /// socket on the network and does no gateway (UPnP/PCP/NAT-PMP) probing,
 /// so the macOS firewall doesn't ask to approve it (useful for an
-/// interpreter running a local demo, which can't be signed).
+/// interpreter running a local demo, which can't be signed). Address hints
+/// come from `hints_from`'s hints file (an embedded host passes its own keystore,
+/// never `$WIRES_HOME`).
 pub async fn bind_with(
     identity: &NodeIdentity,
     relay_url: Option<&str>,
     alpn: &[u8],
     loopback_only: bool,
+    hints_from: Option<&crate::admin::keystore::Keystore>,
 ) -> Result<Endpoint> {
-    // The local, unsigned hints file (`$WIRES_HOME/hints`, usually absent):
-    // extra places to try a key, beside n0 discovery.
+    // The local, unsigned hints file (usually absent): extra places to try
+    // a key, beside n0 discovery.
     let hints = iroh::address_lookup::memory::MemoryLookup::new();
-    if let Ok(ks) = crate::admin::keystore::Keystore::resolve() {
-        for addr in crate::caller::pick::Hints::load(&ks).endpoint_addrs() {
+    if let Some(ks) = hints_from {
+        for addr in crate::caller::pick::Hints::load(ks).endpoint_addrs() {
             hints.add_endpoint_info(addr);
         }
     }
@@ -857,14 +862,25 @@ where
                 }
                 _ => None,
             };
+            // No role admits a caller without a verified principal.
+            let Some(principal) = principal else {
+                if let Some(call_audit) = call_audit {
+                    call_audit.finish(-1).await;
+                }
+                return Err(anyhow!("admitted without a verified principal"));
+            };
             let call = crate::host::native::Call {
                 caller,
-                principal: principal.clone(),
+                principal,
                 role: admitted.role.clone(),
                 state_version: version,
                 service: service.clone(),
                 args: invocation.argv.clone(),
-                id: call_audit.as_ref().map(|a| a.call()),
+                // A host with no call log (unit tests only) still names
+                // the call.
+                id: call_audit
+                    .as_ref()
+                    .map_or_else(library::CallId::generate, |a| a.call()),
                 push: capability.as_ref().map(|(_, push)| push.clone()),
             };
             let running = crate::host::native::start(native, call);
@@ -1559,44 +1575,51 @@ mod tests {
         assert!(!alive(pid), "the child {pid} outlived its dialer");
     }
 
-    /// A service that is a task in this process, not a child (card 33): the
-    /// bridge needs only stdio and a [`Process`](crate::host::service::Process).
-    struct TaskProcess(Option<tokio::task::JoinHandle<i32>>);
+    /// Upper-cases its stdin to stdout, writes `note` to stderr, exits 3.
+    struct Upper;
 
-    impl crate::host::service::Process for TaskProcess {
-        fn wait(&mut self) -> crate::host::service::BoxFuture<'_, Result<i32>> {
-            Box::pin(async move {
-                match self.0.take() {
-                    Some(task) => Ok(task.await.unwrap_or(-1)),
-                    None => Ok(-1),
-                }
-            })
-        }
-
-        fn kill(&mut self) {
-            if let Some(task) = &self.0 {
-                task.abort();
-            }
+    impl crate::host::native::Service for Upper {
+        async fn call(&self, _call: crate::Call, mut io: crate::CallIo) -> i32 {
+            let mut input = Vec::new();
+            io.stdin.read_to_end(&mut input).await.unwrap();
+            io.stdout
+                .write_all(&input.to_ascii_uppercase())
+                .await
+                .unwrap();
+            io.stderr.write_all(b"note").await.unwrap();
+            3
         }
     }
 
-    /// `service`, run as an in-process task over in-memory stdio: it gets
-    /// the call's stdin, stdout and stderr and returns the exit code.
-    fn in_process<F, Fut>(service: F) -> crate::host::service::Running
-    where
-        F: FnOnce(tokio::io::DuplexStream, tokio::io::DuplexStream, tokio::io::DuplexStream) -> Fut,
-        Fut: std::future::Future<Output = i32> + Send + 'static,
-    {
-        let (stdin_w, stdin_r) = tokio::io::duplex(64 * 1024);
-        let (stdout_w, stdout_r) = tokio::io::duplex(64 * 1024);
-        let (stderr_w, stderr_r) = tokio::io::duplex(64 * 1024);
-        let task = tokio::spawn(service(stdin_r, stdout_w, stderr_w));
-        crate::host::service::Running {
-            stdin: Box::new(stdin_w),
-            stdout: Box::new(stdout_r),
-            stderr: Box::new(stderr_r),
-            process: Box::new(TaskProcess(Some(task))),
+    /// Never returns.
+    struct Forever;
+
+    impl crate::host::native::Service for Forever {
+        async fn call(&self, _call: crate::Call, _io: crate::CallIo) -> i32 {
+            std::future::pending::<()>().await;
+            0
         }
+    }
+
+    /// `service` started on a test call, as the session starts a native
+    /// service.
+    fn native(service: impl crate::host::native::Service) -> crate::host::service::Running {
+        crate::host::native::start(Arc::new(service), crate::host::native::test_call())
+    }
+
+    /// A logged call's start, on `sink`.
+    async fn started(sink: &AuditSink) -> Option<crate::host::audit::CallAudit> {
+        crate::host::audit::CallAudit::start(
+            Some(sink),
+            caller_id().node_id(),
+            None,
+            ServiceName::new("t").unwrap(),
+            &[],
+            StateVersion(1),
+            library::RoleName::new("staff").unwrap(),
+        )
+        .await
+        .unwrap()
     }
 
     /// Every frame the bridge sent, in order, through the last.
@@ -1609,32 +1632,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_in_process_service_is_bridged_and_recorded_like_a_child() {
-        let running = in_process(|mut stdin, mut stdout, mut stderr| async move {
-            let mut input = Vec::new();
-            stdin.read_to_end(&mut input).await.unwrap();
-            stdout.write_all(&input.to_ascii_uppercase()).await.unwrap();
-            stderr.write_all(b"note").await.unwrap();
-            3
-        });
+    async fn a_native_service_is_bridged_and_recorded_like_a_child() {
         let (sink, mut records) = AuditSink::channel(8);
-        let audit = crate::host::audit::CallAudit::start(
-            Some(&sink),
-            caller_id().node_id(),
-            None,
-            ServiceName::new("t").unwrap(),
-            &[],
-            StateVersion(1),
-            library::RoleName::new("staff").unwrap(),
-        )
-        .await
-        .unwrap();
+        let audit = started(&sink).await;
         let recv = std::io::Cursor::new(encoded(&[
             Frame::Stdin(Chunk::from_bytes(b"abc".to_vec())),
             Frame::Stdin(Chunk::from_bytes(b"def".to_vec())),
         ]));
         let (send, answer) = tokio::io::duplex(64 * 1024);
-        bridge(send, recv, running, never(), audit).await.unwrap();
+        bridge(send, recv, native(Upper), never(), audit)
+            .await
+            .unwrap();
 
         let (mut out, mut err, mut exit) = (Vec::new(), Vec::new(), None);
         for frame in frames_from(answer).await {
@@ -1673,23 +1681,23 @@ mod tests {
         assert_eq!((stdin_bytes, stdin_head.as_deref()), (6, Some("abcdef")));
     }
 
+    /// The caller disconnects mid-call: the handler is stopped, the caller
+    /// is sent exit -1, and the call still gets its `Finished` (exit -1).
     #[tokio::test]
-    async fn an_in_process_service_is_stopped_when_the_dialer_vanishes() {
-        let running = in_process(|_stdin, _stdout, _stderr| async move {
-            std::future::pending::<()>().await;
-            0
-        });
+    async fn a_native_service_is_stopped_and_finished_when_the_dialer_vanishes() {
+        let (sink, mut records) = AuditSink::channel(8);
+        let audit = started(&sink).await;
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let (send, answer) = tokio::io::duplex(64 * 1024);
         let (_hold_stdin_open, recv) = tokio::io::duplex(64);
         let bridged = tokio::spawn(bridge(
             send,
             recv,
-            running,
+            native(Forever),
             async move {
                 let _ = rx.await;
             },
-            None,
+            audit,
         ));
         tx.send(()).ok();
         let done = tokio::time::timeout(std::time::Duration::from_secs(5), bridged).await;
@@ -1700,6 +1708,16 @@ mod tests {
             frames_from(answer).await.last(),
             Some(Frame::Exit(-1))
         ));
+        let Some(library::AuditRecord::Started { call, .. }) = records.recv().await else {
+            panic!("expected Started first");
+        };
+        let Some(library::AuditRecord::Finished {
+            call: done, exit, ..
+        }) = records.recv().await
+        else {
+            panic!("expected Finished second");
+        };
+        assert_eq!((done, exit), (call, -1));
     }
 
     /// What `host` answers to the raw `bytes` from `caller`: the denial

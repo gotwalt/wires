@@ -3,7 +3,7 @@ name = "wires-ffi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Language bindings for wires-native services (card 33): serve wires calls from Python and other languages"
+description = "Language bindings for wires-native services: serve wires calls from Python and other languages"
 
 [lib]
 name = "wires_ffi"
@@ -19,6 +19,7 @@ path = "uniffi-bindgen.rs"
 
 [dependencies]
 wires = { workspace = true }
+anyhow = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

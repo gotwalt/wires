@@ -71,7 +71,7 @@ Open cards only; finished cards are in [done/](done/).
 |---|---|---|---|---|
 | [34](doing/34-cleanup.md) | C | 33 | doing | **Cleanup:** hollow tests, dead and duplicate paths, compat shims, leftovers from earlier designs, drifted duplicate docs |
 | [08](doing/08-demo-two-machine.md) | E | — | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent, recording |
-| [33](review/33-native-services.md) | N | 28 | review | **Wires-native services:** the host runtime as a library, so an app serves wires calls in-process; Rust, then generated Python/TypeScript bindings |
+| [33](review/33-native-services.md) | N | 28 | review | **Wires-native services:** the host runtime as a library, so an app serves wires calls in-process; Rust API plus Python (UniFFI) and TypeScript (napi-rs) bindings on top of it |
 | [29](backlog/29-identity-and-scale.md) | I2 | 28 | backlog (next) | **Identity and scale (design agreed):** machine badges + banned list, `login --for` + day-pass, per-caller views served by hosts, transparency-log checkpoints |
 | [31](backlog/31-inbox-delivery.md) | P3 | 28, 30 | designed, parked | **Inbox delivery:** callbacks go to the caller that asked, through the call's push capability only; open questions on the card |
 | [32](backlog/32-service-sandbox-OPEN.md) | — | — | open question | **Don't build:** run each service call in a rootless microVM so a service can't reach the host's keys |

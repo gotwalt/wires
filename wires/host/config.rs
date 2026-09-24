@@ -190,23 +190,26 @@ pub(crate) struct TrustedIssuer {
 impl HostConfig {
     /// Read and validate `host.json` at `path`.
     pub(crate) fn load(path: &Path) -> Result<Self> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("{} is not a valid host.json", path.display()))
+        Self::read(path, Self::parse)
     }
 
-    /// Read `host.json` at `path` for an app embedding the host (card 33):
-    /// validated like [`load`](Self::load), except `services` may be empty,
-    /// since the app's native services count too.
+    /// Read `host.json` at `path` for an app embedding the host: validated
+    /// like [`load`](Self::load), except `services` may be empty, since the
+    /// app's native services count too.
     pub(crate) fn load_embedded(path: &Path) -> Result<Self> {
+        Self::read(path, |text| {
+            let config = Self::parse_schema(text)?;
+            config.validate_fields()?;
+            Ok(config)
+        })
+    }
+
+    /// Read `path` and make a config of it with `parse`, naming the file in
+    /// either failure.
+    fn read(path: &Path, parse: impl FnOnce(&str) -> Result<Self>) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let config = Self::parse_schema(&text)
-            .with_context(|| format!("{} is not a valid host.json", path.display()))?;
-        config
-            .validate_fields()
-            .with_context(|| format!("{} is not a valid host.json", path.display()))?;
-        Ok(config)
+        parse(&text).with_context(|| format!("{} is not a valid host.json", path.display()))
     }
 
     /// Parse and validate `host.json` text: the schema (and its version),

@@ -212,6 +212,108 @@ The script also covers SQL on stdin, the same service through `wires mcp`,
 ./.scripts/demo-push.sh                  # a host calls the agent back (card 24)
 ```
 
+## Host: native services
+
+A host can also be an app: it embeds the `wires` library, implements services
+in its own process, and serves them. To a caller, a native service is a CLI
+like any other (`wires call`, `wires mcp`, the gateway and `wires watch`
+work unchanged): the same gate, the same call log, the same push. What the
+handler gets beyond a CLI is a warm process (state kept across calls) and
+the verified caller as a value (`call.principal()`, `call.role()`,
+`call.id()`) rather than `WIRES_*` variables. Details and limits are in
+[protocol.md §5](protocol.md).
+
+**Keystore.** An embedded host is a node like any other, with a keystore
+directory of its own that the app names (it reads nothing from
+`$WIRES_HOME`):
+
+```console
+host$ WIRES_HOME=/var/lib/kv/wires wires id                     # its node id
+admin$ wires invite <node id> --name kvhost
+host$ WIRES_HOME=/var/lib/kv/wires wires join <token>
+admin$ wires service add kv --allow analyst --host kvhost
+```
+
+The host refuses to start unless the signed state assigns each of its
+services to it. The node key is loaded into the app's memory: a native
+service is the operator's own code, trusted as much as `wires serve`.
+
+**Rust** (`wires/examples/kv/`, a key-value store with one namespace per
+verified person):
+
+```rust
+struct Hello;
+
+impl wires::Service for Hello {
+    async fn call(&self, call: wires::Call, mut io: wires::CallIo) -> i32 {
+        let line = format!("hello, {}\n", call.principal().name());
+        io.stdout.write_all(line.as_bytes()).await.map_or(1, |()| 0)
+    }
+}
+
+wires::Host::builder("/var/lib/kv/wires")
+    .trust_issuer("https://accounts.google.com", ["….apps.googleusercontent.com"])
+    .service("hello", Hello)
+    .build()?
+    .serve_until(shutdown) // or .serve(): until Ctrl-C
+    .await
+```
+
+`.host_json(path)` also serves `host.json`'s CLI services from the same
+host, and `.push_allow([roles])` enables `call.push_to_caller(subject,
+body)`. When the caller disconnects, the handler's task is aborted.
+
+**Python** (`bindings/python/examples/kv.py`; `make python` builds the
+module into `target/python`). A handler is synchronous and runs on a
+thread of its own:
+
+```python
+import wires
+
+class Hello(wires.Service):
+    def call(self, call):
+        call.write_stdout(f"hello, {call.principal().email}\n".encode())
+        return 0
+
+host = (wires.HostBuilder("/var/lib/kv/wires")
+        .trust_issuer("https://accounts.google.com", ["….apps.googleusercontent.com"])
+        .service("hello", Hello())
+        .build())
+host.serve()   # until host.stop(); serve(handle_ctrl_c=True) also stops on Ctrl-C
+```
+
+**TypeScript** (`bindings/node/examples/kv.mts`; `make node` builds the npm
+package `wires` into `target/node/wires`; Node >= 22.18). A handler is a
+function on Node's event loop, and the stdio methods return Promises:
+
+```ts
+import { HostBuilder } from "wires";
+
+const host = new HostBuilder("/var/lib/kv/wires")
+  .trustIssuer("https://accounts.google.com", ["….apps.googleusercontent.com"])
+  .service("hello", async (call) => {
+    await call.writeStdout(Buffer.from(`hello, ${call.principal().email}\n`));
+    return 0;
+  })
+  .build();
+process.on("SIGTERM", () => host.stop());
+await host.serve();   // until stop(); serve(true) also stops on Ctrl-C
+```
+
+In Python and TypeScript, an exception ends the call with exit 1 and its
+message on the caller's stderr, like an uncaught exception in a CLI. A
+handler there can't be aborted: when the caller disconnects, its next read
+or write fails instead. The bindings' `serve` doesn't take Ctrl-C unless
+asked, since that would claim the signal for the whole process; the
+examples stop the host on SIGTERM or Ctrl-C themselves.
+
+**The demo.** `make demo-python` and `make demo-node`
+(`.scripts/demo-native-service.sh --lang python|node`) serve the kv example
+on a loopback network and call it with the shipped `wires`: state kept
+across calls, the handler's exit code, stderr and exceptions, a refused
+caller, a push to `wires inbox`, the host's log through `wires watch`, and a
+clean `stop()`.
+
 ## Why it's built this way
 
 **The CLI where it's most efficient; MCP wherever people already work.** Models already know
@@ -516,7 +618,7 @@ One Cargo workspace ([CLAUDE.md](../CLAUDE.md)):
   loopback integration tests.
 - **`bindings/`**: `wires-ffi` (Python, via UniFFI) and `bindings/node/`
   `wires-node` (TypeScript, via napi-rs), the embedding API in other
-  languages.
+  languages; see [Host: native services](#host-native-services).
 
 ```bash
 cargo build --workspace

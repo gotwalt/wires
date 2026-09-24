@@ -539,9 +539,12 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
     });
     // A long-running caller: keep its state fresh without waiting for a
     // call to hand back a newer one (it would otherwise expire unnoticed).
+    // The loop stops when `_stop_refresh` drops, when `run` returns.
+    let (_stop_refresh, stop) = tokio::sync::oneshot::channel();
     tokio::spawn(crate::state::sync::refresh_loop(
         gw.backend.endpoint.clone(),
         ks,
+        stop,
     ));
     let listener = tokio::net::TcpListener::bind(a.listen)
         .await

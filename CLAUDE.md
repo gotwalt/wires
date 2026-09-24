@@ -145,7 +145,7 @@ runs from it. A host serving CLIs needs an image that also has those CLIs.
   by role:
   - `wires/`: `lib.rs` is argument parsing and dispatch, plus the public
     embedding API (`Host`, `Service`, `Call`, `CallIo`: card 33, an app
-    serving wires calls in-process); `examples/kv.rs` is a native service;
+    serving wires calls in-process); `examples/kv/` is a native service;
     each role owns
     a folder with a `mod.rs` — `admin/` (keystore, `init`/`invite`/`remove`,
     `service`/`role` edits of the signed state, `state push`, `--ttl` /

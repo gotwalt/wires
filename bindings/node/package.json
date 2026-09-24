@@ -2,7 +2,7 @@
   "name": "wires",
   "version": "0.1.0",
   "private": true,
-  "description": "wires-native services in Node.js and TypeScript (card 33): serve wires calls from your own process",
+  "description": "wires-native services in Node.js and TypeScript: serve wires calls from your own process",
   "license": "MIT",
   "main": "index.js",
   "types": "index.d.ts",
