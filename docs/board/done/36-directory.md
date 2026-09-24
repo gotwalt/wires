@@ -187,20 +187,20 @@ and the admin's push to every host. Callers keep their full state and cold pull 
 
 ## Acceptance
 
-- [ ] An admin edit reaches every subscribed host within 2 s as one `policy_update`: the new head,
+- [x] An admin edit reaches every subscribed host within 2 s as one `policy_update`: the new head,
       its `Fresh` and only the changed items (test with a counting responder).
-- [ ] A host applies each update to its full copy and verifies it with one root signature; a
+- [x] A host applies each update to its full copy and verifies it with one root signature; a
       tampered, missing or extra item makes it fetch the whole policy (36d: library tests).
-- [ ] With every directory stopped, calls keep working under `lenient`; under `strict` they are
+- [x] With every directory stopped, calls keep working under `lenient`; under `strict` they are
       refused once `Fresh` lapses, and served again once a directory is back.
-- [ ] A directory restarted from `directory.redb` serves the same head and a new `Fresh`.
-- [ ] A tampered item, items from another head, an older head and a `Fresh` from a key not in
+- [x] A directory restarted from `directory.redb` serves the same head and a new `Fresh`.
+- [x] A tampered item, items from another head, an older head and a `Fresh` from a key not in
       `directories` are each refused.
-- [ ] A directory that missed a publish catches up from a replica.
-- [ ] `wires directory serve` serves a fabric on a node with no `host.json`, and refuses to start from
+- [x] A directory that missed a publish catches up from a replica.
+- [x] `wires directory serve` serves a fabric on a node with no `host.json`, and refuses to start from
       the admin's keystore or on a node the head doesn't list.
-- [ ] `bench/state-scale/model.py`'s *apex* host rows describe the result.
-- [ ] protocol.md rewritten for the head, items, freshness and both ALPNs; `wires/state/1` removed.
+- [x] `bench/state-scale/model.py`'s *apex* host rows describe the result.
+- [x] protocol.md rewritten for the head, items, freshness and both ALPNs; `wires/state/1` removed.
 
 ## Open questions
 
@@ -445,3 +445,12 @@ proofs, multiproofs, slices and their sizes in the notes above, and the "host sl
 - **Measured:** one ban edit costs each host **1,191 B in one frame** (test fixture: one role, one service and
   21 bans; the whole policy is 4,473 B), matching 36d's 1.2 KB; a `fresh` beat is ~475 B
   (36a).
+
+Integrator (2026-09-24): closed after 36b, 36d and 36c merged into `aaron/directory`; every
+acceptance item is covered by their tests (`wires/directory/tests.rs`, `wires/e2e/follow.rs`,
+the library's `policy_update`/`signed_policy` proptests). Known follow-ups, not blocking:
+a host keeps one subscription at a time (failover costs a dial per dead directory); a node newly
+listed in `directories` runs the directory mode only after a restart; `lenient` staleness shows in
+the host's log, not in `wires watch`; push and the record stream ignore freshness; the demo keeps
+two directories because it stops the workbench before the revoke step. Badge renewal (above) is
+still open.

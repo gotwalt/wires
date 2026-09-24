@@ -1,6 +1,6 @@
 # 37 — Caller views: each caller holds only what it may use
 
-**Lane:** D3 · **Depends on:** [36](../doing/36-directory.md) · **Status:** backlog, designed 2026-09-24 · **Files:** `wires/directory/` (views, search, resolve), `library/calls/session.rs` (`HelloAck`), `wires/caller/{join,services,call,mcp,inbox,watch,pick}.rs`, `wires/gateway/`, `wires/admin/invite.rs`, `library/membership/invite.rs`, protocol.md §3–5, usage.md, [fabric.md](../../fabric.md)
+**Lane:** D3 · **Depends on:** [36](../done/36-directory.md) · **Status:** backlog, designed 2026-09-24 · **Files:** `wires/directory/` (views, search, resolve), `library/calls/session.rs` (`HelloAck`), `wires/caller/{join,services,call,mcp,inbox,watch,pick}.rs`, `wires/gateway/`, `wires/admin/invite.rs`, `library/membership/invite.rs`, protocol.md §3–5, usage.md, [fabric.md](../../fabric.md)
 
 ## Why
 

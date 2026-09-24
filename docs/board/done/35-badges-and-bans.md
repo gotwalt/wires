@@ -2,7 +2,7 @@
 
 **Lane:** D1 · **Depends on:** 28 · **Status:** review (2026-09-24, `worker/35-badges`), designed 2026-09-24 · **Files:** `library/services/{state,access}.rs`, `library/membership/`, `wires/admin/{init,invite,remove,keystore}.rs`, `wires/host/{gate,push,record_stream}.rs`, `wires/state/`, `wires/caller/{join,call,inbox}.rs`, `wires/gateway/mod.rs`, protocol.md §2–4, [fabric.md](../../fabric.md)
 
-The first of three cards (35 → [36](../backlog/36-directory.md) → [37](../backlog/37-caller-views.md)) that replace
+The first of three cards (35 → [36](../done/36-directory.md) → [37](../backlog/37-caller-views.md)) that replace
 "every node holds the whole signed state" with a directory. Together they supersede the
 distribution half of [card 29](../backlog/29-person-identity.md). The architecture they build toward is
 [docs/fabric.md](../../fabric.md).
@@ -39,7 +39,7 @@ revocation list, not a guest list.
   `bans` before sending `Hello`/`Invoke`, which closes "a removed host still sees argv" for any
   caller holding the ban.
 - Badge lifetime stays 30 days by default. Renewal is still missing; it is an open question on
-  [card 36](../backlog/36-directory.md), because the directory is where renewal would live.
+  [card 36](../done/36-directory.md), because the directory is where renewal would live.
 
 ## Acceptance
 
@@ -124,7 +124,7 @@ bans to keep admitting correctly. `StateFrame::Hello` is the one wire change to 
 (retire it with the rest).
 
 **Touched outside this lane (links only):** `docs/fabric.md` line 3, `docs/board/backlog/29-person-identity.md`
-and `docs/board/backlog/36-directory.md` link to this card, which moved to `review/`; nothing else
+and `docs/board/done/36-directory.md` link to this card, which moved to `review/`; nothing else
 in fabric.md changed.
 
 **Results at the end:** `cargo test --workspace` green (library 123 + 44 doctests, wires 366),

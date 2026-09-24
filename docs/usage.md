@@ -447,7 +447,7 @@ To make `wires` the boundary, use a structural setup:
 
 ## Known trade-offs
 
-- **Known and accepted until cards [36](board/doing/36-directory.md)–[37](board/backlog/37-caller-views.md)** (the directory; [fabric.md](fabric.md)), [09](board/backlog/09-witness.md) and [29](board/backlog/29-person-identity.md):
+- **Known and accepted until cards [36](board/done/36-directory.md)–[37](board/backlog/37-caller-views.md)** (the directory; [fabric.md](fabric.md)), [09](board/backlog/09-witness.md) and [29](board/backlog/29-person-identity.md):
   - **Every node holds the whole policy**: host and banned node ids, role
     matchers (often people's emails), service names and descriptions,
     trusted IdPs, directories. It is signed, not secret. It lists no members

@@ -19,7 +19,7 @@ it know it's the *real* lobby? The target UX floated: `wires join acmecorp.com`.
 
 ## Input from cards 36–37 (the directory, 2026-09-24)
 
-The "lobby" now has a concrete home: the directory ([card 36](../doing/36-directory.md)). After card 37 an
+The "lobby" now has a concrete home: the directory ([card 36](../done/36-directory.md)). After card 37 an
 invite is only the badge, the root key and the directory ids, so a `_wires.<domain>` record would
 publish the root key and the directory ids, and a front desk would be a directory holding a limited,
 root-signed enrollment delegation. The same delegation could renew badges (card 36's open
