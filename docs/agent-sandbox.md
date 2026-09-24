@@ -96,8 +96,8 @@ In order of how much it relies on Claude Code's command parser:
      `export` under this rule);
    - `$WIRES_HOME/tools.json` owned by the operator and read-only to the
      agent's user, optionally with `"locked": true` in it so the lock holds
-     even if the environment is lost. `wires` still writes its own state
-     (`policy.json`, `last-good.json`, `inbox/`) under `$WIRES_HOME`, so
+     even if the environment is lost. `wires` still writes its own files
+     (`view.json`, `last-good.json`, `inbox/`) under `$WIRES_HOME`, so
      only the config and credential files need to be read-only.
 
    There, `cat` and friends don't exist: a probe showed Claude Code refuses
