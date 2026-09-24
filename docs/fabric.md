@@ -1,6 +1,6 @@
 # The fabric: how it is hosted, persisted and kept in sync
 
-*Target architecture, agreed 2026-09-24; built by cards [35](board/review/35-badges-and-bans.md),
+*Target architecture, agreed 2026-09-24; built by cards [35](board/done/35-badges-and-bans.md),
 [36](board/backlog/36-directory.md) and [37](board/backlog/37-caller-views.md). The protocol as
 built today is [protocol.md](protocol.md); §9 below lists what changes. The numbers come from
 [`bench/state-scale/`](../bench/state-scale/REPORT.md). User-facing copy says "network";

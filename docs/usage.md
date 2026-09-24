@@ -30,7 +30,7 @@ Every role joins the same way: `wires id`, then `wires join <token>` with the ad
 | **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. A service pushes only through its call's capability, to that call's caller. | The host, at send, delivery and fetch: not banned by the state, in a `push.allow` role. |
 | **Removal** | A new state, pushed to the hosts. No shared key exists, so there is nothing to rotate. | Each host that has the new state, on the removed member's next call or fetch there. |
 
-Nothing is broadcast: a member that takes part in no call receives no traffic about other members' calls. What every member does learn is the whole signed state: every role matcher, service, host id and ban, though no list of members (card [35](board/review/35-badges-and-bans.md)); cards [36](board/backlog/36-directory.md)–[37](board/backlog/37-caller-views.md) replace it with a directory and per-caller views ([fabric.md](fabric.md)).
+Nothing is broadcast: a member that takes part in no call receives no traffic about other members' calls. What every member does learn is the whole signed state: every role matcher, service, host id and ban, though no list of members (card [35](board/done/35-badges-and-bans.md)); cards [36](board/backlog/36-directory.md)–[37](board/backlog/37-caller-views.md) replace it with a directory and per-caller views ([fabric.md](fabric.md)).
 
 ## Walkthrough
 
