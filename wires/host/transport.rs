@@ -30,7 +30,6 @@
 //! - **No call runs unlogged.** An admitted call's `Started` is in the call
 //!   log, `fsync`ed, before its child is spawned ([`AuditSink`]).
 
-use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -42,6 +41,8 @@ use library::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
+
+use crate::host::service::Running;
 use tokio::sync::mpsc;
 
 /// The custom ALPN identifying a wires session.
@@ -449,17 +450,14 @@ async fn read_invocation<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Invocatio
     }
 }
 
-/// Spawn `cmd` (`program` names it in errors) with piped stdio and bridge
-/// the child's stdio over the session until it exits (or kill it when
-/// `shutdown` says the dialer is gone), then log the call's `Finished` via
-/// `audit` and send its [`Frame::Exit`]. The call's `Started` is already
-/// logged and the ack already written; a child that fails to spawn is
-/// logged as finished with exit -1.
-async fn bridge_child<S, R>(
+/// Bridge a running service's stdio over the session until it exits (or
+/// stop it when `shutdown` says the dialer is gone), then log the call's
+/// `Finished` via `audit` and send its [`Frame::Exit`]. The call's `Started`
+/// is already logged and the ack already written.
+async fn bridge<S, R>(
     send: S,
     mut recv: R,
-    mut cmd: Command,
-    program: &str,
+    running: Running,
     shutdown: impl std::future::Future<Output = ()> + Send,
     audit: Option<crate::host::audit::CallAudit>,
 ) -> Result<()>
@@ -467,30 +465,15 @@ where
     S: AsyncWrite + Unpin + Send + 'static,
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let spawned = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let mut child = match spawned {
-        Ok(child) => child,
-        Err(e) => {
-            if let Some(audit) = audit {
-                audit.finish(-1).await; // audit: finished (never ran)
-            }
-            return Err(e).with_context(|| format!("spawning {program}"));
-        }
-    };
-    let mut child_stdin = child.stdin.take().context("child stdin")?;
+    let Running {
+        stdin: mut child_stdin,
+        stdout,
+        stderr,
+        mut process,
+    } = running;
     let stdin_tap = crate::host::audit::tap_stdin(audit.as_ref());
-    let child_stdout = crate::host::audit::tap_stdout(
-        audit.as_ref(),
-        child.stdout.take().context("child stdout")?,
-    );
-    let child_stderr = crate::host::audit::tap_stderr(
-        audit.as_ref(),
-        child.stderr.take().context("child stderr")?,
-    );
+    let child_stdout = crate::host::audit::tap_stdout(audit.as_ref(), stdout);
+    let child_stderr = crate::host::audit::tap_stderr(audit.as_ref(), stderr);
 
     // A single writer task serializes all server->client frames.
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
@@ -522,15 +505,16 @@ where
     let out_task = tokio::spawn(pump_reader(child_stdout, Frame::Stdout, tx.clone()));
     let err_task = tokio::spawn(pump_reader(child_stderr, Frame::Stderr, tx.clone()));
 
-    // Wait for the child, unless the dialer vanishes first — in which case kill
-    // it and reap, rather than leaving an orphan behind. (The `child.wait()`
-    // future is dropped when the select ends, releasing its borrow of `child`.)
-    let status = tokio::select! {
-        status = child.wait() => status.context("waiting for child")?,
+    // Wait for the service, unless the dialer vanishes first — in which case
+    // stop it and reap, rather than leaving an orphan behind. (The `wait()`
+    // future is dropped when the select ends, releasing its borrow of
+    // `process`.)
+    let code = tokio::select! {
+        code = process.wait() => code?,
         _ = shutdown => {
-            tracing::warn!("dialer disconnected; killing child");
-            child.start_kill().ok();
-            child.wait().await.context("reaping killed child")?
+            tracing::warn!("dialer disconnected; stopping the service");
+            process.kill();
+            process.wait().await.context("reaping the stopped service")?
         }
     };
     out_task.await.context("stdout pump")??;
@@ -542,8 +526,7 @@ where
     stdin_task.abort();
     let _ = stdin_task.await;
 
-    let code = status.code().unwrap_or(-1);
-    tracing::info!(code, "child exited; closing session");
+    tracing::info!(code, "service exited; closing session");
     if let Some(audit) = audit {
         audit.finish(code).await; // audit: finished, before the caller hears the exit
     }
@@ -887,7 +870,16 @@ where
     }
     cmd.env_clear()
         .envs(child_env(std::env::vars_os(), &svc.env, server));
-    let result = bridge_child(send, recv, cmd, program, shutdown, call_audit).await;
+    let running = match Running::spawn(cmd) {
+        Ok(running) => running,
+        Err(e) => {
+            if let Some(call_audit) = call_audit {
+                call_audit.finish(-1).await; // audit: finished (never ran)
+            }
+            return Err(e).with_context(|| format!("spawning {program}"));
+        }
+    };
+    let result = bridge(send, recv, running, shutdown, call_audit).await;
     // Dropping the capability starts its grace period.
     drop(capability);
     result
@@ -1510,6 +1502,149 @@ mod tests {
             finished.is_ok(),
             "the session must return once the dialer is gone, not outlive the child"
         );
+    }
+
+    /// A service that is a task in this process, not a child (card 33): the
+    /// bridge needs only stdio and a [`Process`](crate::host::service::Process).
+    struct TaskProcess(Option<tokio::task::JoinHandle<i32>>);
+
+    impl crate::host::service::Process for TaskProcess {
+        fn wait(&mut self) -> crate::host::service::BoxFuture<'_, Result<i32>> {
+            Box::pin(async move {
+                match self.0.take() {
+                    Some(task) => Ok(task.await.unwrap_or(-1)),
+                    None => Ok(-1),
+                }
+            })
+        }
+
+        fn kill(&mut self) {
+            if let Some(task) = &self.0 {
+                task.abort();
+            }
+        }
+    }
+
+    /// `service`, run as an in-process task over in-memory stdio: it gets
+    /// the call's stdin, stdout and stderr and returns the exit code.
+    fn in_process<F, Fut>(service: F) -> crate::host::service::Running
+    where
+        F: FnOnce(tokio::io::DuplexStream, tokio::io::DuplexStream, tokio::io::DuplexStream) -> Fut,
+        Fut: std::future::Future<Output = i32> + Send + 'static,
+    {
+        let (stdin_w, stdin_r) = tokio::io::duplex(64 * 1024);
+        let (stdout_w, stdout_r) = tokio::io::duplex(64 * 1024);
+        let (stderr_w, stderr_r) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(service(stdin_r, stdout_w, stderr_w));
+        crate::host::service::Running {
+            stdin: Box::new(stdin_w),
+            stdout: Box::new(stdout_r),
+            stderr: Box::new(stderr_r),
+            process: Box::new(TaskProcess(Some(task))),
+        }
+    }
+
+    /// Every frame the bridge sent, in order, through the last.
+    async fn frames_from(mut answer: tokio::io::DuplexStream) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while let Some(frame) = read_frame(&mut answer).await.unwrap() {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn an_in_process_service_is_bridged_and_recorded_like_a_child() {
+        let running = in_process(|mut stdin, mut stdout, mut stderr| async move {
+            let mut input = Vec::new();
+            stdin.read_to_end(&mut input).await.unwrap();
+            stdout.write_all(&input.to_ascii_uppercase()).await.unwrap();
+            stderr.write_all(b"note").await.unwrap();
+            3
+        });
+        let (sink, mut records) = AuditSink::channel(8);
+        let audit = crate::host::audit::CallAudit::start(
+            Some(&sink),
+            caller_id().node_id(),
+            None,
+            ToolName::new("t").unwrap(),
+            &[],
+            Some(1),
+            Some("staff".into()),
+        )
+        .await
+        .unwrap();
+        let recv = std::io::Cursor::new(encoded(&[
+            Frame::Stdin(Chunk::from_bytes(b"abc".to_vec())),
+            Frame::Stdin(Chunk::from_bytes(b"def".to_vec())),
+        ]));
+        let (send, answer) = tokio::io::duplex(64 * 1024);
+        bridge(send, recv, running, never(), audit).await.unwrap();
+
+        let (mut out, mut err, mut exit) = (Vec::new(), Vec::new(), None);
+        for frame in frames_from(answer).await {
+            match frame {
+                Frame::Stdout(c) => out.extend_from_slice(c.as_bytes()),
+                Frame::Stderr(c) => err.extend_from_slice(c.as_bytes()),
+                Frame::Exit(code) => exit = Some(code),
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        assert_eq!(
+            (out.as_slice(), err.as_slice(), exit),
+            (&b"ABCDEF"[..], &b"note"[..], Some(3))
+        );
+
+        let Some(library::AuditRecord::Started { call, .. }) = records.recv().await else {
+            panic!("expected Started first");
+        };
+        let Some(library::AuditRecord::Finished {
+            call: done,
+            exit,
+            stdout_bytes,
+            stderr_bytes,
+            stdout_digest,
+            stdin_bytes,
+            stdin_head,
+            ..
+        }) = records.recv().await
+        else {
+            panic!("expected Finished second");
+        };
+        assert_eq!((done, exit, stdout_bytes, stderr_bytes), (call, 3, 6, 4));
+        let mut expect = library::OutputHasher::new();
+        expect.update(b"ABCDEF");
+        assert_eq!(stdout_digest, expect.finish());
+        assert_eq!((stdin_bytes, stdin_head.as_deref()), (6, Some("abcdef")));
+    }
+
+    #[tokio::test]
+    async fn an_in_process_service_is_stopped_when_the_dialer_vanishes() {
+        let running = in_process(|_stdin, _stdout, _stderr| async move {
+            std::future::pending::<()>().await;
+            0
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (send, answer) = tokio::io::duplex(64 * 1024);
+        let (_hold_stdin_open, recv) = tokio::io::duplex(64);
+        let bridged = tokio::spawn(bridge(
+            send,
+            recv,
+            running,
+            async move {
+                let _ = rx.await;
+            },
+            None,
+        ));
+        tx.send(()).ok();
+        let done = tokio::time::timeout(std::time::Duration::from_secs(5), bridged).await;
+        done.expect("the bridge must stop the service once the dialer is gone")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            frames_from(answer).await.last(),
+            Some(Frame::Exit(-1))
+        ));
     }
 
     /// What `host` answers to the raw `bytes` from `caller`: the denial
