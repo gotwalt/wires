@@ -3,10 +3,20 @@
 *Opened 2026-09-22. Supersedes the 2026-08-13 restart plan (deleted by card
 25; it is in the git log).*
 
+**The premise** (the human, 2026-09-23), which defines "correct": remote CLIs
+are distributed securely over iroh; IdP authentication and authorization keep
+out anyone who isn't allowed; agents can't observe each other's work (the
+isolation boundary is the verified person, the IdP principal); and `wires
+watch` lets the people the registry names as readers observe calls, in full,
+for logging and compliance.
+
 **Non-negotiables** (carried over from the restart): E2EE with a blind relay
-(no host or relay holds a key it doesn't need); offline-verifiable membership
-(no auth-server round-trip; removal by omission); the spec is the contract
-(README and docs first, code second). **Kill criteria:** if no one wants
+(no host or relay holds a key it doesn't need; a service child gets none of
+the host's keystore, card 28); offline-verifiable membership (no auth-server
+round-trip; removal by omission, until card 29's ban list); **the premise
+outranks the docs, and the docs outrank the code** (README and docs first,
+code second: a disagreement is a code bug unless the doc breaks the
+premise). **Kill criteria:** if no one wants
 remote CLIs by key after the recorded demo, write it up and stop; if wires is
 something we demo but never use ourselves, mothball it with a postmortem; if
 MCP or A2A ships portable user identity plus infra-level call records, narrow
@@ -26,10 +36,10 @@ Why each clause earns its place (the rebuttals it has to survive):
 | Claim | Why it isn't "just use X" |
 |---|---|
 | **Reached by key, not network path** | Tailscale/VPN gives the agent's machine a route to the *host*; you then trust every port on it. Wires gives a route to *the services a signed list lets you call* and nothing else — there is no network path to widen. |
-| **By service name** | The caller asks for `orders-db`, not a machine; the admin binds names to hosts (failover, moves, no squatting), and the caller never learns an address. |
+| **By service name** | The caller asks for `orders-db`, not a machine; the admin binds names to hosts (failover, moves, no squatting), and the caller never names or configures an address (iroh may still find a direct path, and a host's `run/hint` holds one). |
 | **CLIs first; MCP too** | CLIs are the idiom models already know, one generic verb, and output is filtered *before* it hits context — measurably cheaper than MCP tool schemas + JSON results, even post-2026-07-28; `wires call` is that path. `wires mcp` (stdio) and `wires gateway` (a remote MCP server, for Claude.ai) serve the same services as MCP, so wires works in the clients people already use. What differs from any other MCP server: the host, not the server in front of it, verifies the caller's IdP token and checks the one signed registry, and the host keeps the signed record. |
 | **IdP-authenticated caller, one signed list** | The ID token is bound to the node key (OIDC `nonce` = hash of the key) and presented in each call's handshake; the host verifies the IdP's signature itself (no wires attestor) and checks it against the admin-signed registry — one list of who may call what, not one per server. |
-| **Recorded at the infra layer** | The *host* writes a signed, hash-chained record of every call, refusal, and exit — stamped with the caller identity it verified. The agent can't forge it, no gateway owns it, and a reader the registry names holds neither end's credentials. A CLI has no such story; an MCP gateway's log belongs to whoever runs the gateway. |
+| **Recorded at the infra layer** | The *host* writes a signed, hash-chained record of every call, member's refusal, and exit — stamped with the caller identity it verified. The agent can't forge it, no gateway owns it, and a reader the registry names holds neither end's credentials. A CLI has no such story; an MCP gateway's log belongs to whoever runs the gateway. |
 
 **Pitch rule:** every sentence in README / demo narration must survive one
 honest line from someone who runs remote MCP servers behind Tailscale today.
@@ -39,19 +49,19 @@ honest line from someone who runs remote MCP servers behind Tailscale today.
 
 | Role | Decides | Commands |
 |---|---|---|
-| **admin** | who's in, the roles, which services run where, who may call and read each (root key; one signed state) | `init`, `invite`, `remove`, `role`, `service` |
+| **admin** | who's in, the roles, which services run where, who may call and read each (root key; one signed state) | `init`, `invite`, `remove`, `role`, `service`, `state push` |
 | **host** | how it implements its assigned services; trusted IdPs; stricter local rules (`host.json` v2) | `serve host.json`, `push` |
 | **caller** | — runs services by name; MCP (stdio, or the remote gateway) so wires works in the clients people already use | `join`, `login`, `services`, `call`, `mcp`, `inbox`, `gateway` |
-| **reader** | — any member: a service's `readers` role reads all its records, everyone else their own | `watch` |
+| **reader** | — any member: a service's `readers` role reads all its records, in full; everyone else their own person's (same issuer and subject, from any node) | `watch` |
 
-The IdP is *bound* at the caller (`login`) and *verified* at the host, against the admin-signed state it holds. The admin's invite is the only thing handed out of band; every later state is pushed by key (or pulled from a host). Nothing is broadcast.
+The IdP is *bound* at the caller (`login`) and *verified* at the host, against the admin-signed state it holds. Every role needs a verified identity (there is no built-in `member` role), and every matcher names its issuer. The admin's invite is the only thing handed out of band; every later state is pushed by key to the hosts, and other members pull it from a host (or get it in a call's handshake). There is no channel, but every member still holds the whole state: card 29.
 
 ## The demo we're building toward
 
 1. **workbench** (no inbound ports): `wires serve host.json`, implementing `orders-db`, which the admin registered for role `analyst` (`wires service add orders-db --allow analyst --reader security --host workbench`).
 2. **laptop**: Claude Code calling `wires call orders-db -- "…"` from Bash (and/or `wires mcp` in its MCP config).
 3. **reader** (third terminal/machine, role `security`): `wires watch orders-db` — each call appears as `▶ … alice@corp (…) [analyst] orders-db "select …"`, then `■ … exit 0 · 41 ms · 3.1 KiB out`.
-4. **Revoke**: one `wires remove agent` → the agent's next call is refused (exit 77), and the refusal is in the host's log.
+4. **Revoke**: one `wires remove agent` → the new state is pushed to the workbench, which refuses the agent's next call (exit 77, `not admitted to this fabric`); the host traces that rather than logging it, since a key outside the state can't write to the log.
 
 ## Lanes
 
@@ -83,16 +93,16 @@ Each summary describes the surface at the time the card was done. Cards 25–27 
 | [25](done/25-cargo-and-strip.md) | X | 23, 24 | Down to essentials: Bazel → plain Cargo + Dockerfile; remove grants/tickets/CRL/relay/manual targets and outdated docs (git history is the archive) |
 | [27](done/27-services-not-hosts.md) | S3 | 25 | **Services, not hosts; drop the channel.** Admin-signed members + service registry; local `wires services`; identity in the handshake; delete gossip/fabric keys/re-keys/announcements (~20k LOC) |
 | [26](done/26-host-held-records.md) | H2 | 27 | Call records: host-held signed log, `watch <service>` for authorized readers + own calls, optional OTel export |
-| [28](doing/28-audit-fixes.md) | A | 27, 26 | **Audit fixes (2026-09-23):** drop `member`, issuer-scoped matchers, service child can't reach host secrets, fail-closed log, person-keyed records/push, state-sync and caller fixes, docs sweep |
+| [28](doing/28-audit-fixes.md) | A | 27, 26 | **Audit fixes (2026-09-23):** drop `member`, issuer-scoped matchers, service child can't reach host secrets (per-call push capability), fail-closed log, pre-auth caps, person-keyed records and re-decided `watch` streams, state-sync and caller fixes, docs sweep. Push delivery moved to 31 |
 | [29](backlog/29-identity-and-scale.md) | I2 | 28 | **Identity and scale (design agreed):** machine badges + banned list, `login --for` + day-pass, per-caller views served by hosts, transparency-log checkpoints |
 | [30](done/30-web-gateway.md) | W | 27, 26 | `wires gateway`: remote MCP (Streamable HTTP 2026-07-28 + OAuth 2.1) for Claude.ai; each call presents the web user's own gateway-bound Google token |
-| [31](backlog/31-inbox-delivery.md) | P3 | 28, 30 | **Design, to agree:** callbacks go to the caller that asked (node + principal), through the call's push capability only; at least once to its mailbox; fetch set complete by construction; an `inbox` MCP tool in `wires mcp` and the gateway. Replaces card 28 §4 (push half) and §7 |
+| [31](backlog/31-inbox-delivery.md) | P3 | 28, 30 | **Design agreed 2026-09-24, not built:** callbacks go to the caller that asked (node + principal), through the call's push capability only; operator push `--to <node-id>` only; at least once to its mailbox; fetch set complete by construction; an `inbox` MCP tool in `wires mcp` and the gateway. Replaces card 28 §4 (push half) and §7 |
 | [22](done/22-gossip-role-OPEN.md) | — | decided | **Decided 2026-09-23: drop the channel** → cards 27 and 26 |
 | [18](backlog/18-front-door-OPEN.md) | — | parked | **Open question, don't build:** apex key, invites, `wires join <domain>` |
 | [16](done/16-token-benchmark.md) | bench | 01–03 | MCP (GitHub server, many tools; ± tool search) vs `gh` via `wires call` vs bare `gh`: 5 tasks × 5 runs |
-| [09](backlog/09-witness.md) | stretch | 02 | Key-less witness: stores and verifies call records without decrypting them |
+| [09](backlog/09-witness.md) | stretch | 26 | Witness: a reader that follows hosts' call logs and exports signed checkpoints, so a truncation or rewrite contradicts a copy the host doesn't control |
 
-**Order (agreed 2026-09-23):** 24 → 25 (Cargo + strip) → 27 (services, not hosts; drop the channel) → 26 (host-held records) → recording (08, in progress: workbench on HEAD, dry run, record; see its Steps). **Then (2026-09-23 audit):** 28 → 29.
+**Order (agreed 2026-09-23):** 24 → 25 (Cargo + strip) → 27 (services, not hosts; drop the channel) → 26 (host-held records) → recording (08, in progress: workbench on HEAD, dry run, record; see its Steps). **Then (2026-09-23 audit):** 28 → 29 and 31 (both need 28; 31 also needs 30, done).
 
 ## Rules for workers
 

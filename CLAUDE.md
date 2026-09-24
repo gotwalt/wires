@@ -11,16 +11,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 CLIs on other machines, by **service name**. The machine is reached by public
 key, never by network path. One admin-signed, versioned state says who's in,
 which roles exist, which services exist, which hosts run each, and who may
-call and read each; it is pushed to members by key, and every host decides
-every call from its copy. The caller is authenticated by their IdP, via an ID
-token bound to the node key and presented in the session handshake. Every
-call is recorded by the host in its own signed, hash-linked log, which the
-readers the registry names stream with `wires watch`. Nothing is broadcast
-(there is no channel). `wires call` is the CLI-native (and most efficient)
-path; `wires mcp` (stdio) and `wires gateway` (remote, e.g. Claude.ai) serve
+call and read each; the admin pushes it to the hosts by key, other members
+pull it, and every host decides every call from its copy. The caller is
+authenticated by their IdP, via an ID token bound to the node key and
+presented in the session handshake; every role needs that verified identity
+(there is no built-in `member` role), and every role matcher names its
+issuer. Every call is recorded by the host in its own signed, hash-linked
+log. Agents can't observe each other's work: the isolation boundary is the
+verified person (IdP principal), so a caller sees its own person's records,
+and the readers the registry names see a service's records in full with
+`wires watch`, for logging and compliance. There is no channel; what every
+member still learns about the others (the whole signed state) is card 29's
+to fix. `wires call` is the CLI-native path and the source of the token
+savings; `wires mcp` (stdio) and `wires gateway` (remote, e.g. Claude.ai) serve
 the same services as MCP, so wires works in the clients people already use
-for remote tool calling, with the same identity, registry and record. The goal is a sharp
-demo for the MCP team.
+for remote tool calling, with the same identity, registry and record (MCP
+compatibility is a goal, not a fallback). The goal is a sharp demo for the
+MCP team.
+
+**What outranks what:** the premise outranks the docs, and the docs outrank
+the code. When the code disagrees with `docs/protocol.md`, the code is the
+bug, unless the doc breaks the premise.
 
 **Read `docs/board/README.md` before planning any work.** It holds the pitch,
 the rebuttals it must survive, the demo target, the lanes, and the worker
@@ -121,10 +132,11 @@ host exposing CLIs needs an image that also has those CLIs.
   subdir; the sources are filed by role:
   - `wires/`: `main.rs` is argument parsing and dispatch only; each role owns
     a folder with a `mod.rs` — `admin/` (keystore, `init`/`invite`/`remove`,
-    `service`/`role` edits of the signed state, `--ttl`), `host/` (`serve`,
+    `service`/`role` edits of the signed state, `state push`, `--ttl` /
+    `--state-ttl`), `host/` (`serve`,
     `host.json` v2, the gate over the signed state, the session transport,
-    verified identities, the call log and OTLP export, the record stream, push
-    and its control socket), `caller/` (`join`, `login`, `services`, `call`
+    verified identities, the call log and OTLP export, the record stream, push,
+    its control sockets and the per-call push capability), `caller/` (`join`, `login`, `services`, `call`
     with service → host failover and the local hints file, `mcp`, `inbox`,
     `watch`), `gateway/` (`wires gateway`: remote MCP over HTTP + OAuth
     for web clients, calling with each user's own ID token), `state/` (the

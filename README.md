@@ -40,18 +40,24 @@ provider vouches for, and neither machine opens a firewall port.
   two hosts keeps answering when one is down.
 - **Both directions.** The agent calls the host, and the host can message
   the agent later ("build 41 failed"), addressed by the agent's key, even
-  when the agent isn't connected. `wires inbox --wait` sleeps until it
-  lands: 4 turns and about 2 s to react, against 9–13 turns of polling
-  ([bench](bench/push/REPORT.md)).
-- **No open ports on either side.** wires is built on
+  when the agent isn't connected. A service does it with a push capability
+  `serve` gives each call, which reaches only that call's caller. `wires
+  inbox --wait` sleeps until it lands: 4 turns and about 2 s to react,
+  against 9–13 turns of polling ([bench](bench/push/REPORT.md)).
+- **No firewall port to open on either side.** wires is built on
   [iroh](https://iroh.computer): machines dial each other by public key over
   QUIC, directly or through a relay. The host has no TCP listener and needs
-  no inbound firewall rule, and a peer that isn't in the signed list is refused at
-  the handshake.
+  no inbound firewall rule. Any key can open a connection, but one the
+  signed list doesn't name is refused at its first message, before anything
+  runs.
 
 Since every call runs on a host that has checked who is calling, the host
-also keeps a signed record of each call and refusal. The people the registry
-names as readers stream it with `wires watch`.
+also keeps a signed record of each call. Agents can't see each other's
+work: a caller sees only the records of its own person (its verified
+identity, from any of that person's machines). The people the registry names
+as a service's readers see all of its records, in full (arguments, the
+first 4 KiB of stdin, exit codes), with `wires watch`, for logging and
+compliance.
 
 ![The loopback demo, narrated](docs/media/demo-remote-cli.gif)
 
@@ -62,7 +68,7 @@ machine over loopback, signing in through a mock IdP, not the two-machine run
 ## A quick tour
 
 ```console
-# admin: one signed registry, pushed to every machine by key
+# admin: one signed registry, pushed to the hosts by key
 admin$ wires init
 admin$ wires role set analyst '*@acme.com'
 admin$ wires invite <node-id> --name workbench     # and one per machine
@@ -83,7 +89,8 @@ count(*)
 --------
        7
 
-# later, the host messages the agent back by its key (here from a CI job the agent started)
+# later, a CI job that call started messages the agent back by its key
+# (serve gave the job a push capability that reaches only this caller)
 workbench$ wires push --to "$WIRES_CALLER_NODE" --subject build-41 -- "failed: test_orders_total"
 agent$ wires inbox --wait
 2026-09-23 21:13:20Z  from host 3ef72b11 (verified)  build-41  failed: test_orders_total
@@ -92,8 +99,10 @@ agent$ wires inbox --wait
 The same services work from MCP clients: `wires mcp` in a stdio MCP config,
 or `https://<gateway>/mcp` as a Claude.ai connector
 ([docs/deployment.md § A web gateway](docs/deployment.md#a-web-gateway)).
-`wires remove <name>` cuts a member off at its next call,
-with nothing to restart and no shared key to rotate.
+`wires remove <name>` pushes a new list to the hosts, and each host that
+has it refuses the member's next call, with nothing to restart and no shared
+key to rotate. An edit that reaches no host fails loudly, and `wires state
+push` re-sends it.
 
 ## wires and a remote MCP server
 
@@ -107,8 +116,8 @@ wires covers only MCP's tools; it has no prompts or resources.
 | **Who's calling** | Optional OAuth 2.1: each server is a resource server and validates its own tokens. Enterprise IdP policy is an opt-in extension ([Enterprise-Managed Authorization](https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization)). | The caller's OIDC ID token, bound to its key and checked by every host against the IdP's published keys. One admin-signed registry says which roles may call which service. |
 | **Finding tools** | A configured URL or command per server; `tools/list` may vary with the caller's authorization. The public [MCP Registry](https://modelcontextprotocol.io/registry/about) (preview) lists public servers, not per user. | `wires services`: every service, across all hosts, that the signed registry lets this identity call. |
 | **Server → agent** | Over a stream the client opened and holds: a request's response, or `subscriptions/listen` (task status arrives there as `notifications/tasks`; polling `tasks/get` is the default). Reaching a client that isn't connected is [working-group](https://modelcontextprotocol.io/community/triggers-events/charter) work, not in the spec. | The host dials the agent's key, or keeps the message (24 h by default) for its next `wires inbox`, so it works after the call has ended. `wires inbox --wait` blocks until one lands. |
-| **Network** | stdio (a local subprocess) or Streamable HTTP (the server listens at a URL the client can reach). | Both sides dial out, by key, over QUIC (iroh), directly or through a relay. No TCP listener and no inbound firewall rule on either side. |
-| **Record of calls** | No audit format; clients SHOULD log tool usage, and trace context can be propagated to OpenTelemetry. | The host signs a hash-linked record of every call and refusal; the registry's readers stream it with `wires watch`. |
+| **Network** | stdio (a local subprocess) or Streamable HTTP (the server listens at a URL the client can reach). | Both sides dial out, by key, over QUIC (iroh), directly or through a relay. No inbound firewall rule on either side, and no TCP listener on the host (`wires login` binds a loopback port for the browser redirect; the optional web gateway listens over HTTPS). |
+| **Record of calls** | No audit format; clients SHOULD log tool usage, and trace context can be propagated to OpenTelemetry. | The host signs a hash-linked record of every call and every member's refusal; the registry's readers stream it with `wires watch`, and each caller sees its own person's records. |
 
 ## Measured
 
@@ -144,6 +153,22 @@ Waiting on a mock CI build, 5 runs per setup ([bench/push/REPORT.md](bench/push/
   renew on their own yet.
 - A host can withhold or truncate its own log; tampering and gaps are
   detectable only against a copy a reader already holds.
+- Known and accepted until
+  [card 29](docs/board/backlog/29-identity-and-scale.md), which redesigns
+  identity and scale:
+  - every member holds the whole signed list (every member's key, every
+    role's matchers, every service), and its size grows with the number of
+    members;
+  - a removed host whose membership hasn't expired still sees the arguments
+    of a call sent to it (the caller stops before stdin once it learns the
+    newer list);
+  - a caller who isn't a service's reader still learns, from the hash links
+    it checks, how many records a host logged and when;
+  - Google ID tokens last about an hour and Google drops the key binding on
+    refresh, so people sign in again about hourly.
+- Push delivery is being reworked so every callback goes only to the caller
+  that asked, in every client
+  ([card 31](docs/board/backlog/31-inbox-delivery.md)).
 
 More in [docs/usage.md § Known trade-offs](docs/usage.md#known-trade-offs).
 
