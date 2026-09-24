@@ -62,7 +62,7 @@ The human (2026-09-24): "Agree, keep operator push."
 
 - The operator socket keeps `wires push --to <node-id>`: a node id only, no roles, no broadcast. It is a separate path from call callbacks, for a person running the host who wants to tell a particular machine something.
 - It goes to that **node's** mailbox and is not tied to a principal, because the operator is addressing a machine. It still passes the recipient-is-a-current-member check, and it names no call or service (the reader shows `operator push` instead).
-- **The gateway drops operator pushes addressed to its node** (logged `denied` at the host: "the gateway's node has no single reader"). Its mailboxes are per principal (D4), and a push to the gateway's machine belongs to none of its users.
+- **The gateway is an ordinary node here; no special case.** An operator push to its node id lands in the gateway node's own mailbox, and whoever runs the gateway reads it with `wires inbox` against the gateway's keystore. Web users never see it: they read only the callbacks addressed to their (gateway node, principal), through the MCP `inbox` tool (D4).
 - For D3: an operator push can only come from a host of a service the recipient may call. A push from any other host is refused at send, so it can't strand.
 - This removes (b), and (c) entirely: a host never enumerates who is in a role, because it only answers a caller it has already verified. **Recommend.**
 
@@ -133,7 +133,7 @@ One tool, the same everywhere: **`inbox`**, `{ wait_seconds?: 0–25, limit?: 1�
   - through the gateway, users A and B each get only their own calls' callbacks;
   - a message names the call and service it answers;
   - a service can push only through a live call capability; the operator can push only `--to <node-id>`, and never to a role;
-  - an operator push to the gateway's node is refused;
+  - an operator push to the gateway's node reaches the gateway's own `wires inbox`, and no web user;
   - a crash between print and mark re-shows the message rather than losing it;
   - `dropped: n` surfaces;
   - a removed member's queue is purged on state advance.
@@ -145,6 +145,8 @@ One tool, the same everywhere: **`inbox`**, `{ wait_seconds?: 0–25, limit?: 1�
 
 - 2026-09-24, the human: "no need for role or broadcast messages". D1 is
   agreed. Then (relayed by the audit session): "Agree, keep operator push".
-  That's D1b: `--to <node-id>` only, per node, refused for the gateway's
-  node. D1–D6 and the MCP inbox are agreed. D2–D6 and the MCP shape stand as recommended unless amended; the
+  That's D1b: `--to <node-id>` only, per node. Then "the MCP gateway should
+  just function as an addressable node; the default wiring should work": no
+  gateway special case. Operator pushes to its node are the gateway
+  operator's to read. D1–D6 and the MCP inbox are agreed. D2–D6 and the MCP shape stand as recommended unless amended; the
   per-service capability grace (D2) is still open.
