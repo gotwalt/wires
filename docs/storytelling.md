@@ -1,8 +1,7 @@
 # Storytelling: the rebuttal test
 
-*2026-08-14, trimmed 2026-09-23 (card 25) to what the board still uses: the
-test every README and narration sentence must pass, and the conventions the
-self-asserting demo scripts follow.*
+*The test every README and narration sentence must pass, and the
+conventions the self-asserting demo scripts follow.*
 
 ## 1. The rebuttal test
 

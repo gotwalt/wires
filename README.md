@@ -11,7 +11,8 @@ its own: as CLIs.**
 wires does the job of a remote MCP server: it lets an agent harness (Claude
 Code, or anything that can run a command) use tools that live somewhere else.
 The tool is a command-line program, the caller is a person your identity
-provider vouches for, and neither machine opens a firewall port.
+provider vouches for, and the machine is reached by its public key, never by
+a network path.
 
 - **CLIs, not a new protocol.** `wires call orders-db -- "select …"` runs a
   command on the machine that has the database; stdin, stdout and the exit
@@ -44,12 +45,12 @@ provider vouches for, and neither machine opens a firewall port.
   `serve` gives each call, which reaches only that call's caller. `wires
   inbox --wait` sleeps until it lands: 4 turns and about 2 s to react,
   against 9–13 turns of polling ([bench](bench/push/REPORT.md)).
-- **No firewall port to open on either side.** wires is built on
-  [iroh](https://iroh.computer): machines dial each other by public key over
-  QUIC, directly or through a relay. The host has no TCP listener and needs
-  no inbound firewall rule. Any key can open a connection, but one the
-  signed list doesn't name is refused at its first message, before anything
-  runs.
+- **Reached by key, and only the services you may call.** wires is built
+  on [iroh](https://iroh.computer): machines dial each other by public key
+  over QUIC, directly or through a relay. The caller gets a path to the
+  services the signed registry lets its person call, and to nothing else on
+  that machine. Any key can open a connection, but one the registry doesn't
+  name is refused at its first message, before anything runs.
 
 Since every call runs on a host that has checked who is calling, the host
 also keeps a signed record of each call. Agents can't see each other's
@@ -142,35 +143,21 @@ Waiting on a mock CI build, 5 runs per setup ([bench/push/REPORT.md](bench/push/
 
 ## Limits
 
-- Reaching a host through NAT can use a public relay (n0's by default, or
-  your own); traffic through it is end-to-end encrypted.
-- Identity is OIDC ID tokens. Only Google has been tested.
-- The web gateway is the one piece that listens (HTTPS, behind a tunnel or
-  proxy), and it holds each signed-in user's Google token until it expires,
-  about an hour; then the client reconnects. It offers tools only, not push
-  or `watch`.
-- Memberships and the signed state expire (30 days by default) and don't
-  renew on their own yet.
+It's a prototype (see the note at the top). The main limits:
+
+- Every member holds the whole signed registry (every member's key, every
+  role's matchers, every service), and it grows with the number of members.
+  The redesign is [card 29](docs/board/backlog/29-identity-and-scale.md).
+- Memberships and the registry expire (30 days by default) and don't renew
+  on their own yet.
 - A host can withhold or truncate its own log; tampering and gaps are
   detectable only against a copy a reader already holds.
-- Known and accepted until
-  [card 29](docs/board/backlog/29-identity-and-scale.md), which redesigns
-  identity and scale:
-  - every member holds the whole signed list (every member's key, every
-    role's matchers, every service), and its size grows with the number of
-    members;
-  - a removed host whose membership hasn't expired still sees the arguments
-    of a call sent to it (the caller stops before stdin once it learns the
-    newer list);
-  - a caller who isn't a service's reader still learns, from the hash links
-    it checks, how many records a host logged and when;
-  - Google ID tokens last about an hour and Google drops the key binding on
-    refresh, so people sign in again about hourly.
-- Push delivery is being reworked so every callback goes only to the caller
-  that asked, in every client
-  ([card 31](docs/board/backlog/31-inbox-delivery.md)).
+- Only Google has been tested as the IdP. The web gateway is the one piece
+  that listens, and it holds each signed-in user's token until it expires.
+- Callbacks go to a caller by key, not yet only to the caller that asked:
+  designed, parked ([card 31](docs/board/backlog/31-inbox-delivery.md)).
 
-More in [docs/usage.md § Known trade-offs](docs/usage.md#known-trade-offs).
+The full list: [docs/usage.md § Known trade-offs](docs/usage.md#known-trade-offs).
 
 ## More
 

@@ -5,10 +5,10 @@ sessions, all 100 scored correct. Total spend $4.18 (smoke tests: about $1.70 mo
 Arm 5 (card 19, [below](#arm-5-wires-is-the-only-thing-the-agent-can-run)) added
 50 more sessions the same day: $0.83, all correct.*
 
-*Note (card 28): the setup has changed since these runs. There is no built-in
-`member` role any more, so `bench/wires-up.sh` now registers `gh` for a role
-`bench` matched on the benchmark's IdP identity. The results below are from
-the runs as they were.*
+*Note: the setup has changed since these runs. `bench/wires-up.sh` now
+registers `gh` in the admin-signed registry for a role `bench` matched on the
+benchmark's IdP identity, and the agent signs in with `wires login`. The
+results and the setup table below are from the runs as they were.*
 
 ## Headline
 
@@ -39,7 +39,7 @@ nearly the same ($0.011 MCP vs $0.009 CLI).
 | Claude Code | 2.1.280, `--model opus` → `claude-opus-5-5` (the human's configured default) |
 | MCP server | `ghcr.io/github/github-mcp-server` v1.12.2 (commit 85598ba, digest `sha256:508a0857…cac6`), `docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN … stdio --read-only`, default toolsets (context, copilot, issues, pull_requests, repos, users) |
 | gh | 2.101.0 |
-| wires | this branch's `wires` binary; loopback `wires serve --expose 'gh=gh'`, agent `tools.json` → `gh` by node id + 127.0.0.1 address (`bench/wires-up.sh`) |
+| wires | the `wires` binary of the day, a loopback responder serving the local `gh` (card 16's four arms: a `--expose 'gh=gh'` flag; arm 5: a member-only `host.json`); the agent reached it by node id + 127.0.0.1 address (`bench/wires-up.sh`) |
 | Session | `claude -p --output-format stream-json --verbose --no-session-persistence --strict-mcp-config --setting-sources project --disable-slash-commands --tools=<arm> --allowedTools=<arm>`, fresh session per run, empty cwd, minimal env (HOME/USER/PATH/…) plus `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` |
 | Built-in tools | MCP arms: `--tools=ToolSearch` (+ the MCP server). CLI arms: `--tools=Bash,ToolSearch` |
 | Permissions | MCP: `mcp__github`. wires: `Bash(wires call gh:*)`, gh: `Bash(gh:*)`, and both get `Bash(jq/head/tail/grep/wc/sort:*)`. Arm 5 (wires-only): `Bash(wires call gh:*)` and nothing else |
@@ -236,11 +236,6 @@ BENCH_OUT=bench/results/<utc-date>-arm5.jsonl ./bench/run.sh --reps 5 --arms wir
 python3 bench/report.py bench/results/<utc-date>-arm5.jsonl
 python3 bench/permission-probe.py --out /tmp/probe.jsonl   # docs/agent-sandbox.md evidence (~$0.20)
 ```
-
-At the time of these runs, `bench/wires-up.sh` served `gh` from a
-member-only `host.json` (card 13's `wires serve host.json`; no channel, so no
-audit or IdP); it now registers `gh` for role `bench` (see the note above). Card 16's four
-arms ran the binary of that time, which had `serve --expose 'gh=gh'`.
 
 Needs `claude` logged in, `gh` logged in, docker, and python3. The token is
 read at runtime with `gh auth token`, passed to the container through the

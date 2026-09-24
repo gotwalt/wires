@@ -8,14 +8,14 @@ bench/results/<date>.jsonl. Ground truth is fetched live from the GitHub API
 correct if its ANSWER line matches either snapshot (the volatile tasks --
 open-issue counts, recently merged PRs -- can move while a repetition runs).
 
-Arms (see REPORT.md for why these four):
+Arms (see REPORT.md for why these five):
   mcp       GitHub MCP server (docker, stdio, --read-only, default toolsets);
             Claude Code's default tool loading (ENABLE_TOOL_SEARCH unset,
             which in 2.1.280 resolves to tool search = on).
   mcp-eager Same server, ENABLE_TOOL_SEARCH=false: every tool schema is sent
             up front (the pre-tool-search behavior).
   wires     `wires call gh -- ...` from Bash, via a loopback `wires serve
-            --expose gh=gh` (bench/wires-up.sh).
+            host.json` that implements the service `gh` (bench/wires-up.sh).
   gh        bare `gh` from Bash.
   wires-only  (card 19) `wires call gh` is the ONLY thing the agent may run:
             `--allowedTools=Bash(wires call gh:*)`, no jq/head/grep helpers.

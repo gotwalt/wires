@@ -171,8 +171,9 @@ binary with an empty scratch `WIRES_HOME`, so nothing was dialed).** Raw rows:
 | `-- api x <<'EOF' …` | forwarded | **refused** by wires (by design, above) |
 | `WIRES_LOCKED=0 wires call …` · `WIRES_HOME=. wires call …` · `env -u WIRES_LOCKED wires call …` · `unset WIRES_LOCKED; …` · `export WIRES_LOCKED=0; …` | — | **refused** by Claude Code ("requires approval") |
 
-Claude Code allowed all 22 flag and stdin commands under
-`Bash(wires call:*)`; those refusals came from `wires` itself. The five
+Claude Code allowed all 18 flag and stdin commands in the table (each
+unlocked and locked) under `Bash(wires call:*)`; those refusals came from
+`wires` itself. (The raw rows also probe a flag `wires` has since dropped.) The five
 attempts to switch the lock off from the command line never reached `wires`. Under `Bash(wires call gh:*)`
 (locked), `--node-seed-file`, shaping and `< canary.txt` behaved the same;
 `wires call --relay-url … gh` was refused by Claude Code already, since a

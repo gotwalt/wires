@@ -116,7 +116,7 @@ PROBES: dict[str, tuple[str, tuple]] = {
 # (`--real-wires`, optionally `--locked`). "Ran" means wires honored the
 # flag or the stdin, i.e. its output does not carry the locked-mode refusal.
 # WIRES_HOME is an empty scratch dir, so an honored call then fails on "no
-# channel" and never dials anything.
+# membership" and never dials anything.
 SEED = "00" * 32
 WIRES_PROBES: dict[str, tuple[str, tuple]] = {
     "flag-tools-file": ("wires call gh --tools-file canary.txt -- --version", ("honored",)),
@@ -124,8 +124,6 @@ WIRES_PROBES: dict[str, tuple[str, tuple]] = {
     "flag-node-seed-file": ("wires call gh --node-seed-file canary.txt -- --version", ("honored",)),
     "flag-membership": ("wires call gh --membership AAAA -- --version", ("honored",)),
     "flag-membership-file": ("wires call gh --membership-file canary.txt -- --version", ("honored",)),
-    "flag-inclusion-proof": ("wires call gh --inclusion-proof AAAA -- --version", ("honored",)),
-    "flag-inclusion-proof-file": ("wires call gh --inclusion-proof-file canary.txt -- --version", ("honored",)),
     "flag-relay-url": ("wires call --relay-url https://relay.invalid gh -- --version", ("honored",)),
     "flag-shaping": ("wires call gh --jq . --head 1 --max-bytes 64 -- --version", ("honored",)),
     "stdin-redirect": ("wires call gh -- api x < canary.txt", ("honored",)),

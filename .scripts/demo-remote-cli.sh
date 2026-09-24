@@ -73,8 +73,6 @@ done
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
-# One crate, two builds: `wires-mock-idp` adds only the hidden `dev-mock-idp`
-# subcommand. Everything the demo proves runs on the shipped `wires`.
 WIRES="${WIRES_BIN:-$repo/target/release/wires}"
 WIRES_DEV="${WIRES_DEV_BIN:-$repo/target/release/wires-mock-idp}"
 EMAIL="alice@example.com"
@@ -83,42 +81,14 @@ EXIT_DENIED=77
 START=$SECONDS
 
 D="$(mktemp -d)"
-IDP_PID=""
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$repo/.scripts/lib.sh"
 WB_PID=""
 SP_PID=""
 MCP_PID=""
 p=""
 trap 'exec 3>&- 2>/dev/null || true; for p in $MCP_PID $SP_PID $WB_PID $IDP_PID; do kill "$p" 2>/dev/null || true; done; [ -n "$KEEP" ] || rm -rf "$D"' EXIT INT TERM
 
-say() { [ -n "$QUIET" ] || printf '\033[36m[demo]\033[0m %s\n' "$*" >&2; }
-run() { [ -n "$QUIET" ] || printf '\033[2m     $ %s\033[0m\n' "$*" >&2; }
-ok() { printf '\033[32m[ok]\033[0m   %s\n' "$*" >&2; }
-bad() {
-	printf '\033[31m[FAIL]\033[0m %s\n' "$*" >&2
-	exit 1
-}
-step() {
-	[ -n "$QUIET" ] || {
-		printf '\n\033[1;36m[demo] %s\033[0m\n' "$*" >&2
-		sleep 1.5
-	}
-}
-beat() { [ -n "$QUIET" ] || sleep "$1"; }
-line() { [ -n "$QUIET" ] || printf '\033[1m     %s\033[0m\n' "$*" >&2; }
-show() { [ -n "$QUIET" ] || sed 's/^/     /' "$1" >&2; }
-# Print a file's tail on failure.
-dump() { [ -z "${1:-}" ] || sed 's/^/  '"$(basename "$1")"'| /' "$1" | tail -20 >&2; }
-
-# Poll a file for a fixed string. $3 is the budget in tenths of a second.
-wait_for() {
-	local file="$1" s="$2" n="${3:-300}"
-	for _ in $(seq 1 "$n"); do
-		if [ -e "$file" ] && grep -qF -- "$s" "$file"; then return 0; fi
-		sleep 0.1
-	done
-	return 1
-}
-alive() { kill -0 "$1" 2>/dev/null; }
 # The one line of $1 holding every remaining fixed string (or fail).
 the_line() {
 	local file="$1" hits
@@ -146,33 +116,7 @@ start_host() {
 		bad "$2 never came up"
 	}
 }
-# Sign $1's keystore in as $2 (the stand-in IdP honours login_hint).
-login_as() {
-	WIRES_HOME="$1" "$WIRES" login \
-		--issuer "$ISSUER" --client-id "$CLIENT_ID" --client-secret not-so-secret \
-		--no-browser >"$D/login.out" 2>"$D/login.err" &
-	local pid=$!
-	wait_for "$D/login.err" "sign in at" 100 || bad "login printed no sign-in URL"
-	local url
-	url="$(grep -m1 -E '^  https?://' "$D/login.err" | sed 's/^  //')"
-	curl -fsSL -o /dev/null "$url&login_hint=$2" || bad "the sign-in round trip failed"
-	wait "$pid" || {
-		sed 's/^/  login| /' "$D/login.err" >&2
-		bad "wires login failed"
-	}
-	grep -qF "is $2" "$D/login.err" || bad "login did not bind $2"
-}
-
-if [ -z "${WIRES_BIN:-}" ]; then
-	say "cargo build --release (the mock-IdP build first, then the shipped one) ..."
-	# Same target dir, so the second build only recompiles the wires crate; the
-	# feature build is copied aside before the shipped build replaces it.
-	cargo build -q --release -p wires --features dev-mock-idp
-	rm -f "$WIRES_DEV" && cp target/release/wires "$WIRES_DEV"
-	cargo build -q --release -p wires
-	# A stable signature keeps the macOS firewall from asking again each build.
-	.scripts/macos-sign.sh "$WIRES" "$WIRES_DEV"
-fi
+build_wires
 command -v sqlite3 >/dev/null || bad "sqlite3 is not on PATH"
 command -v curl >/dev/null || bad "curl is not on PATH"
 
@@ -198,11 +142,7 @@ OB_ID="$(WIRES_HOME="$obs" "$WIRES" id 2>/dev/null)"
 AG8="${AG_ID:0:8}"
 admin() { WIRES_HOME="$root" "$WIRES" "$@"; }
 # The IdP comes first: every role names the issuer it trusts.
-"$WIRES_DEV" dev-mock-idp --email "$EMAIL" >"$D/idp.out" 2>"$D/idp.err" &
-IDP_PID=$!
-wait_for "$D/idp.out" "client_id " 100 || bad "setup: the mock IdP did not start; see $D/idp.err"
-ISSUER="$(awk '/^issuer /{print $2}' "$D/idp.out")"
-CLIENT_ID="$(awk '/^client_id /{print $2}' "$D/idp.out")"
+start_mock_idp "$EMAIL"
 # Roles are who, by IdP identity. Then the hosts join; they are not running
 # yet, so the admin's pushes miss them -- their tokens carry the state.
 admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1

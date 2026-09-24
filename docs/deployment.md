@@ -26,7 +26,8 @@ Build natively on the machine that runs it: `cargo build --release -p wires`
 image. The `Dockerfile` builds on whatever architecture the Docker host is
 (arm64 on a Mac, x86_64 on Linux); nothing cross-compiles.
 
-The image holds only `wires`. A **host** image must also contain the binaries
+The image holds only `wires`: enough for a caller, a reader, or the web
+gateway (`deploy/gateway/` runs it as `wires gateway`). A **host** image must also contain the binaries
 its `host.json` execs (`sqlite3`, `gh`, …): build your own image from the
 `Dockerfile`'s `build` stage output (`/usr/local/bin/wires`) plus those binaries.
 
@@ -52,15 +53,32 @@ it starts; with none of them up, a fresh `wires invite` token for it carries
 it (re-joining never rolls back). An admin edit that reaches no host exits 1;
 `wires state push` re-sends the stored state once a host is up.
 
-**Run services as a separate Unix user.** A service's child gets a minimal
-environment and no `WIRES_HOME`, but it runs as `serve`'s own user, so a
-service a caller can steer into reading or writing files can reach the
-host's keystore (its node key signs the call log). Put `sudo -u svc --` (or
-similar) in the service's `command`. A service's fixed command must also be
-safe against any trailing arguments the caller adds, including option-like
-ones; `"end_of_options": true` puts `--` before them, for CLIs that honour
-it. Don't run `serve` from the admin's keystore: it refuses one holding
-`root.seed`.
+### Run services as a separate Unix user
+
+A service's child gets a minimal environment and is told neither
+`WIRES_HOME` nor where the operator's socket is, but it runs as `serve`'s
+own user and can find the keystore at its default path. So a service a
+caller can steer into reading or writing files can reach whatever that user
+can: the host's node key (which signs the call log) and the operator's push
+socket included. `wires` doesn't switch users itself; put it in the
+service's `command`:
+
+```json
+"orders-db": { "command": ["sudo", "-u", "svc", "--", "sqlite3", "-safe", "-readonly", "orders.db"] }
+```
+
+A service running as another user can't reach the per-call push socket (a
+0700 directory owned by `serve`'s user) until you open that directory to
+it. Isolating each call properly is an open question (a rootless microVM,
+[card 32](board/backlog/32-service-sandbox-OPEN.md)).
+
+A service's fixed command must also be safe against any trailing arguments
+the caller adds, including option-like ones; `"end_of_options": true` puts
+`--` before them, for CLIs that honour it. Don't run `serve` from the
+admin's keystore: it refuses one holding `root.seed`.
+
+### Keystore and secrets
+
 
 **The keystore must be writable and must persist.** `$WIRES_HOME` holds the
 host's node key and membership, and the host rewrites its signed state at
@@ -103,7 +121,7 @@ Three layers, most self-contained first:
 For a private or air-gapped network, run your own relay so nothing depends on
 n0.
 
-## Provisioning and revocation
+## Provisioning and removal
 
 - **Add a member:** the joiner runs `wires id`; the admin runs
   `wires invite <id> --name <label>` and hands back the token; the joiner runs
@@ -155,8 +173,8 @@ What this changes, honestly:
   verified identity, so the gateway's node alone is in no role: the gateway
   offers a service only if a role matches the web user's own verified
   identity. A user the state lets call nothing is refused at sign-in.
-- Push, inbox and `watch` aren't offered through the gateway yet (an `inbox`
-  MCP tool is [card 31](board/backlog/31-inbox-delivery.md)).
+- Push, inbox and `watch` aren't offered through the gateway (an `inbox`
+  MCP tool is designed, parked: [card 31](board/backlog/31-inbox-delivery.md)).
 
 To run one:
 

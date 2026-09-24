@@ -11,7 +11,6 @@ members = [
 version = "0.1.0"
 license = "MIT"
 edition = "2024"
-rust-version = "1.91"
 
 [workspace.dependencies]
 library = { path = "library" }

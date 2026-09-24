@@ -1,6 +1,6 @@
 # Wires — Executive Summary
 
-*2026-09-23. Replaces the 2026-08-15 summary, which pitched Wires as a group chat for people and their AI assistants. This version describes the pared-back product that the work since then produced and measured. Details: [README](../README.md) · board: [docs/board](board/README.md).*
+*2026-09-23. Details: [README](../README.md) · board: [docs/board](board/README.md).*
 
 ## The problem
 
@@ -21,9 +21,9 @@ Three things organizations are now asking for sit in that gap:
 
 There are four roles, each with a few commands:
 
-- **Admin** (`init`, `invite`, `remove`, `role`, `service`): signs one versioned document that says who's in, which roles exist (matched on IdP identity), which services exist, which hosts run each one, and who may call and read each. It is pushed to the hosts by key; other machines pull it from a host.
+- **Admin** (`init`, `invite`, `remove`, `role`, `service`, `state push`): signs one versioned document that says who's in, which roles exist (matched on IdP identity), which services exist, which hosts run each one, and who may call and read each. It is pushed to the hosts by key; other machines pull it from a host.
 - **Host** (`wires serve host.json`): implements the services assigned to it. One file says how each runs, which identity providers it trusts, and any stricter local rule; it checks every call against the signed list.
-- **Caller** (`join`, `login`, `services`, `call`, `inbox`, `mcp`, `gateway`): the agent, or the MCP client it runs in. `wires login` binds the person's IdP sign-in (Google in the demo; any OIDC issuer via `--issuer`) to the agent's key once. `wires services` shows only the services that person may call; the caller never names a machine, and a service can have several hosts.
+- **Caller** (`id`, `join`, `login`, `services`, `call`, `mcp`, `gateway`, `inbox`): the agent, or the MCP client it runs in. `wires login` binds the person's IdP sign-in (Google in the demo; any OIDC issuer via `--issuer`) to the agent's key once. `wires services` shows only the services that person may call; the caller never names a machine, and a service can have several hosts.
 - **Reader** (`watch`): a member the admin allows to read a service's records sees every call and every member's refusal from the hosts' own logs, in full (arguments, the first 4 KiB of stdin, exit codes), for logging and compliance, holding neither end's credentials. Everyone else sees only the calls made as them: their verified identity, from any of their machines. Agents working for different people can't see each other's work.
 
 **Two ways in, both first-class.** `wires call` is the CLI path and the efficient one (the measured savings below come from it). MCP is the other, so people can use wires in the clients where they already use remote tool calling: `wires mcp` over stdio, and `wires gateway` as a remote MCP server that Claude.ai connects to (MCP 2026-07-28 plus older clients). Each web user signs in with Google through the gateway, and every call carries that person's own token, so the host still verifies the IdP itself, admits them only through roles that match their identity, and records them as the verified principal of the call. Users keep their clients; the operator stands the gateway up once (an OAuth client, TLS in front, and that client's id trusted on each host).
@@ -37,7 +37,7 @@ A laptop and a Linux workstation, reached by key through public relays:
 - A Claude Code session in locked mode, whose PATH held `wires` plus the system basics and which was only allowed to run `wires call` and the tool listing, found the tool, queried a remote database and answered correctly. Each query was logged under the person's email and role.
 - `wires remove` cut the agent off at its next call, with no restart and no manual key rotation anywhere.
 
-That run used the earlier design, where hosts published records to a shared encrypted channel. The current one (services in an admin-signed registry, records kept by each host) passes the same self-checking demo on one machine, plus: a service with two hosts that keeps answering when one is down, a reader who sees every call while the agent sees only its own person's, and a host **pushing** a message back to the agent that called it ("build 41 failed") with no endpoint on the agent's side, read with `wires inbox`. The two-machine run of this version, and its recording, is in progress ([card 08](board/doing/08-demo-two-machine.md)).
+That run used an earlier design. The current one (services in an admin-signed registry, records kept by each host) passes the same self-checking demo on one machine, plus: a service with two hosts that keeps answering when one is down, a reader who sees every call while the agent sees only its own person's, and a host **pushing** a message back to the agent that called it ("build 41 failed") with no endpoint on the agent's side, read with `wires inbox`. The two-machine run of this version, and its recording, is in progress ([card 08](board/doing/08-demo-two-machine.md)).
 
 ## What's been measured
 
@@ -70,10 +70,11 @@ Checking an inbox on a loop costs exactly what polling costs; the saving comes o
 ## Honest limits
 
 - **Joining an organization is still a hand-issued invite.** Joining by domain ("`wires join acmecorp.com`") is an open question, not yet designed.
-- **Every member holds the whole signed list** (member keys, role matchers, service names): the org chart, growing with the number of members. It is signed, not secret. Memberships and the list expire after 30 days and don't renew yet. The redesign (machine badges, per-caller views, day-passes for headless agents) is agreed and next: [card 29](board/backlog/29-identity-and-scale.md).
-- **Also accepted until then:** a removed host whose membership hasn't expired still sees a call's arguments; a caller who isn't a reader learns how many records a host logged, and when (not what or by whom); Google sign-ins last about an hour.
-- **Push reaches callers by key today, and by role from the host's operator.** Next ([card 31](board/backlog/31-inbox-delivery.md), agreed): every callback goes only to the agent and person that made the call, and MCP clients get an `inbox` tool.
-- **A host can withhold or truncate its own log.** Tampering and gaps are detectable only against a copy a reader holds (an OTel export, or a witness: [card 09](board/backlog/09-witness.md)).
+- **Every member holds the whole signed list** (member keys, role matchers, service names): the org chart, growing with the number of members. The redesign (machine badges, per-caller views, day-passes for headless agents) is agreed and next: [card 29](board/backlog/29-identity-and-scale.md).
+- **Callbacks only to the agent and person that made the call**, and an `inbox` tool for MCP clients: designed, parked ([card 31](board/backlog/31-inbox-delivery.md)).
+- **A host can withhold or truncate its own log.** Tampering and gaps are detectable only against a copy a reader holds.
+
+The full list: [usage.md § Known trade-offs](usage.md#known-trade-offs).
 
 ## The next step
 
