@@ -132,6 +132,7 @@ pub struct McpServer<C> {
     config: ToolsConfig,
     caller: C,
     negotiated: Option<String>,
+    redact_failures: bool,
 }
 
 impl<C: Caller> McpServer<C> {
@@ -141,7 +142,16 @@ impl<C: Caller> McpServer<C> {
             config,
             caller,
             negotiated: None,
+            redact_failures: false,
         }
+    }
+
+    /// Report a failed dial as `call failed` without its details (host ids,
+    /// addresses, relay errors), which go to the log instead: for callers
+    /// who are not the operator (`wires gateway`'s web users).
+    pub fn with_redacted_failures(mut self) -> Self {
+        self.redact_failures = true;
+        self
     }
 
     /// Serve as if `initialize` had agreed `version` (a legacy HTTP client
@@ -310,7 +320,14 @@ impl<C: Caller> McpServer<C> {
             Ok(outcome) => render_outcome(&shaped(&shape, outcome)),
             Err(e) => {
                 tracing::warn!("wires mcp: call to `{name}` failed: {e:#}");
-                (format!("wires: call failed: {e:#}"), true)
+                if self.redact_failures {
+                    (
+                        "wires: call failed: no host of this service could be reached; try again, or ask the operator".to_owned(),
+                        true,
+                    )
+                } else {
+                    (format!("wires: call failed: {e:#}"), true)
+                }
             }
         };
         Ok(json!({
@@ -929,6 +946,21 @@ mod tests {
                 "data":{"supported":SUPPORTED_PROTOCOL_VERSIONS,"requested":"2099-01-01"}}})
         );
         assert!(s.caller.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn redacted_failures_hide_the_details() {
+        let mut s = server().with_redacted_failures();
+        let out = transcript(&mut s, &[call(1, "offline", json!({}))]);
+        let text = out[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("wires: call failed"), "{text}");
+        assert!(!text.contains("10s"), "{text}");
+        let out = transcript(&mut s, &[call(2, "locked", json!({}))]);
+        assert_eq!(
+            out[0],
+            text_result(2, "denied by responder: membership rejected: revoked", true),
+            "a refusal is an answer, still shown"
+        );
     }
 
     #[test]

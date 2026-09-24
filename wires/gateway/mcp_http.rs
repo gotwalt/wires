@@ -283,7 +283,8 @@ pub(crate) async fn post<B: Backend>(
         Era::Legacy(v) => (false, v),
     };
     let mut server = McpServer::new(tools, gw.backend.caller(session.id_token.clone()))
-        .with_negotiated(negotiated);
+        .with_negotiated(negotiated)
+        .with_redacted_failures();
     let Some(reply) = server.handle(msg).await else {
         return StatusCode::ACCEPTED.into_response();
     };

@@ -42,8 +42,8 @@ fn form(pairs: &[(&str, &str)]) -> String {
         .finish()
 }
 
-/// Calls the scripted dialer saw: tool name and the token presented.
-type Seen = Arc<Mutex<Vec<(String, IdToken)>>>;
+/// Calls the scripted dialer saw: tool name, argv, and the token presented.
+type Seen = Arc<Mutex<Vec<(String, Vec<String>, IdToken)>>>;
 
 struct Scripted {
     state: State,
@@ -62,11 +62,14 @@ impl Caller for Recording {
         argv: library::Argv,
         _stdin: Vec<u8>,
     ) -> anyhow::Result<CallOutcome> {
-        self.seen
-            .lock()
-            .unwrap()
-            .push((tool.name.as_str().to_owned(), self.token.clone()));
         let argv: Vec<String> = argv.into();
+        // Overlap concurrent calls, so a token mix-up would show.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        self.seen.lock().unwrap().push((
+            tool.name.as_str().to_owned(),
+            argv.clone(),
+            self.token.clone(),
+        ));
         Ok(CallOutcome::Exited {
             exit: 0,
             stdout: format!("ran {}\n", argv.join(" ")).into_bytes(),
@@ -115,6 +118,7 @@ impl Running {
             client_key: ClientKey::new(&[3; 32]),
             metadata: MetadataFetcher::new().unwrap(),
             origins: vec![base.clone(), "https://claude.ai".into()],
+            limiter: crate::gateway::RateLimit::new(10_000),
             backend: Scripted {
                 state: state(),
                 seen: Arc::clone(&seen),
@@ -160,7 +164,15 @@ impl Running {
     /// Walk `/authorize` → consent → IdP → callback; the final redirect to
     /// the client, parsed.
     async fn authorize(&self, client_id: &str) -> HashMap<String, String> {
+        self.authorize_as(client_id, None).await
+    }
+
+    /// [`Self::authorize`], asking the IdP for `hint`'s account.
+    async fn authorize_as(&self, client_id: &str, hint: Option<&str>) -> HashMap<String, String> {
         let mut auth = Url::parse(&self.url("/authorize")).unwrap();
+        if let Some(h) = hint {
+            auth.query_pairs_mut().append_pair("login_hint", h);
+        }
         auth.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", client_id)
@@ -272,8 +284,13 @@ impl Running {
 
     /// Sign in fully; the access token.
     async fn sign_in(&self) -> String {
+        self.sign_in_as(None).await
+    }
+
+    /// [`Self::sign_in`] as `hint`'s account.
+    async fn sign_in_as(&self, hint: Option<&str>) -> String {
         let client = self.register().await;
-        let q = self.authorize(&client).await;
+        let q = self.authorize_as(&client, hint).await;
         let r = self.token(&client, &q["code"], VERIFIER).await;
         assert_eq!(r.status(), StatusCode::OK);
         let body: Value = r.json().await.unwrap();
@@ -399,7 +416,7 @@ async fn a_web_client_signs_in_and_calls_as_its_user() {
 
     // The dialer was handed alice's own token, bound to the gateway's node:
     // exactly what a host verifies.
-    let (tool, presented) = gw.seen.lock().unwrap()[0].clone();
+    let (tool, _, presented) = gw.seen.lock().unwrap()[0].clone();
     assert_eq!(tool, "orders-db");
     let fetcher = KeyFetcher::new(None).unwrap();
     let who = fetcher
@@ -536,6 +553,86 @@ async fn the_endpoint_enforces_the_transport_rules() {
             .unwrap()
             .contains("error=\"invalid_token\"")
     );
+}
+
+/// Two web users calling at once through the one gateway node: every dial
+/// carries the token of the user who made that call, never the other's.
+#[tokio::test]
+async fn concurrent_users_each_call_with_their_own_token() {
+    let idp = MockIdp::start("alice@example.com").await;
+    let gw = Running::start(&idp).await;
+    let alice = gw.sign_in_as(Some("alice@example.com")).await;
+    let bob = gw.sign_in_as(Some("bob@example.com")).await;
+    let calls = (0..16).map(|i| {
+        let (who, token) = if i % 2 == 0 {
+            ("alice", &alice)
+        } else {
+            ("bob", &bob)
+        };
+        let tag = format!("{who}-{i}");
+        let gw = &gw;
+        async move {
+            let r = gw
+                .modern(
+                    token,
+                    "tools/call",
+                    Some("orders-db"),
+                    json!({"name":"orders-db","arguments":{"args":[tag]}}),
+                )
+                .await;
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+    });
+    futures_join_all(calls).await;
+    let fetcher = KeyFetcher::new(None).unwrap();
+    let seen = gw.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 16);
+    for (_, argv, token) in seen {
+        let who = fetcher
+            .verify(
+                &IdentityClaim {
+                    node: node(2),
+                    id_token: token,
+                },
+                std::slice::from_ref(&idp.issuer),
+                &[library::Audience::new(idp.client_id.clone())],
+                crate::now_unix(),
+            )
+            .await
+            .unwrap();
+        let caller = argv[0].split('-').next().unwrap();
+        assert_eq!(
+            who.email.as_deref(),
+            Some(format!("{caller}@example.com").as_str())
+        );
+    }
+}
+
+/// Run `futs` concurrently to completion (no `futures` crate here).
+async fn futures_join_all<F: std::future::Future<Output = ()>>(futs: impl Iterator<Item = F>) {
+    let mut set = Vec::new();
+    for f in futs {
+        set.push(Box::pin(f));
+    }
+    let mut pending: Vec<_> = set.into_iter().map(Some).collect();
+    std::future::poll_fn(|cx| {
+        let mut done = true;
+        for slot in pending.iter_mut() {
+            if let Some(f) = slot {
+                if f.as_mut().poll(cx).is_ready() {
+                    *slot = None;
+                } else {
+                    done = false;
+                }
+            }
+        }
+        if done {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
 }
 
 #[tokio::test]

@@ -247,7 +247,11 @@ impl Caller for WiresCaller {
 /// Fold a dial result and its buffered output into a [`CallOutcome`]: a
 /// [`transport::Denied`] anywhere in the error chain is an answer, not a
 /// failure.
-fn outcome(result: Result<i32>, stdout: Vec<u8>, stderr: Vec<u8>) -> Result<CallOutcome> {
+pub(crate) fn outcome(
+    result: Result<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) -> Result<CallOutcome> {
     match result {
         Ok(exit) => Ok(CallOutcome::Exited {
             exit,

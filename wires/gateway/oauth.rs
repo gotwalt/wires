@@ -258,6 +258,7 @@ pub(crate) async fn authorize<B: Backend>(
         code_challenge: challenge.clone(),
         resource: gw.urls.resource(),
         upstream_verifier: verifier,
+        login_hint: q.get("login_hint").map(|h| h.chars().take(256).collect()),
         created: crate::now_unix(),
     };
     let id = match gw.store.begin(authorization) {
@@ -274,7 +275,7 @@ fn consent(urls: &PublicUrls, client: &Client, redirect: &Url, id: &str) -> Resp
         "{CONSENT_COOKIE}={id}; Path=/authorize; HttpOnly; SameSite=Strict; Max-Age={PENDING_TTL_SECS}{secure}"
     );
     let body = format!(
-        "<p><strong>{}</strong> wants to run wires services as you.</p>\
+        "<p><strong>{}</strong>{} wants to run wires services as you.</p>\
          <p>You'll sign in with Google. Each call then runs on the machine that hosts the \
          service, which checks your identity against the admin-signed list of who may call \
          what, and records the call. Access ends when your sign-in expires (about an hour).</p>\
@@ -283,6 +284,16 @@ fn consent(urls: &PublicUrls, client: &Client, redirect: &Url, id: &str) -> Resp
          <input type=\"hidden\" name=\"id\" value=\"{}\">\
          <button type=\"submit\">Continue with Google</button></form>",
         esc(&client.name),
+        // A metadata-document client proves its URL's host; show it, since
+        // the name is self-declared.
+        if is_metadata_url(&client.id) {
+            Url::parse(&client.id)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| format!(" ({})", esc(h))))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
         esc(redirect.host_str().unwrap_or("")),
         esc(id),
     );
@@ -355,6 +366,9 @@ pub(crate) async fn confirm<B: Backend>(
     );
     url.query_pairs_mut()
         .append_pair("prompt", "select_account");
+    if let Some(hint) = &a.login_hint {
+        url.query_pairs_mut().append_pair("login_hint", hint);
+    }
     // `Lax`, not `Strict`: the IdP's redirect back is a cross-site
     // top-level navigation, which `Lax` still carries.
     let bind = format!(

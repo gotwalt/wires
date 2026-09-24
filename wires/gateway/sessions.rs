@@ -10,9 +10,13 @@
 //! node. The client signs in again instead.
 //!
 //! Sessions are kept in memory and written through to a `0600` file keyed by
-//! the SHA-256 of the token (the file never holds a bearer token), so a
-//! restart doesn't sign everyone out. Authorizations and codes are memory
-//! only: they live for minutes.
+//! the SHA-256 of the access token, so a restart doesn't sign everyone out.
+//! The file holds no access token, but it does hold each session's live ID
+//! token: with the gateway's `node.seed` (in the same keystore) those are
+//! usable until they expire, so the keystore is as sensitive as the node key.
+//! Authorizations and codes are memory only: they live for minutes, and each
+//! map is capped ([`MAX_PENDING`], [`MAX_CODES`]), oldest evicted first, so
+//! unauthenticated traffic can't grow memory without bound.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,6 +35,10 @@ use crate::caller::login::{random_token, save_secret};
 pub(crate) const PENDING_TTL_SECS: i64 = 600;
 /// How long an authorization code is redeemable (OAuth 2.1 recommends short).
 pub(crate) const CODE_TTL_SECS: i64 = 60;
+/// Most authorizations in flight at once; the oldest is evicted past this.
+pub(crate) const MAX_PENDING: usize = 1024;
+/// Most unredeemed codes at once; the oldest is evicted past this.
+pub(crate) const MAX_CODES: usize = 1024;
 
 /// Who a token speaks for, and the proof the hosts will check.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -70,6 +78,8 @@ pub(crate) struct Authorization {
     pub(crate) resource: String,
     /// The PKCE verifier for the upstream (Google) leg.
     pub(crate) upstream_verifier: String,
+    /// The client's OIDC `login_hint`, passed on to the IdP.
+    pub(crate) login_hint: Option<String>,
     /// When `/authorize` saw it, Unix seconds.
     pub(crate) created: i64,
 }
@@ -135,6 +145,15 @@ impl Store {
         inner
             .pending
             .retain(|_, p| p.created + PENDING_TTL_SECS > now);
+        while inner.pending.len() >= MAX_PENDING {
+            let oldest = inner
+                .pending
+                .iter()
+                .min_by_key(|(_, p)| p.created)
+                .map(|(k, _)| k.clone())
+                .expect("non-empty");
+            inner.pending.remove(&oldest);
+        }
         inner.pending.insert(id.clone(), a);
         Ok(id)
     }
@@ -163,6 +182,15 @@ impl Store {
         let mut inner = self.lock();
         let now = grant.expires - CODE_TTL_SECS;
         inner.codes.retain(|_, c| c.expires > now);
+        while inner.codes.len() >= MAX_CODES {
+            let oldest = inner
+                .codes
+                .iter()
+                .min_by_key(|(_, c)| c.expires)
+                .map(|(k, _)| k.clone())
+                .expect("non-empty");
+            inner.codes.remove(&oldest);
+        }
         inner.codes.insert(code.clone(), grant);
         Ok(code)
     }
@@ -245,6 +273,7 @@ mod tests {
             code_challenge: "x".into(),
             resource: "https://wires.example/mcp".into(),
             upstream_verifier: "v".into(),
+            login_hint: None,
             created,
         }
     }
@@ -271,6 +300,19 @@ mod tests {
         assert_eq!(store.finish(&id, NOW + 10), Some(authorization(NOW)));
         assert!(store.finish(&id, NOW + 10).is_none(), "single use");
         assert!(store.pending("nope", NOW).is_none());
+    }
+
+    #[test]
+    fn pending_authorizations_are_capped_oldest_first() {
+        let store = Store::open(None, NOW).unwrap();
+        let first = store.begin(authorization(NOW)).unwrap();
+        let mut last = String::new();
+        for i in 1..=MAX_PENDING as i64 {
+            last = store.begin(authorization(NOW + i.min(10))).unwrap();
+        }
+        assert!(store.pending(&first, NOW + 10).is_none(), "oldest evicted");
+        assert!(store.pending(&last, NOW + 10).is_some());
+        assert_eq!(store.lock().pending.len(), MAX_PENDING);
     }
 
     #[test]

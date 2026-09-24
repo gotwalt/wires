@@ -38,6 +38,14 @@ pub(crate) const MAX_METADATA_BYTES: usize = 64 * 1024;
 pub(crate) const METADATA_TTL: Duration = Duration::from_secs(300);
 /// How long a metadata fetch may take.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest client name kept (characters).
+pub(crate) const MAX_CLIENT_NAME: usize = 100;
+/// Most redirect URIs a client may register or declare.
+pub(crate) const MAX_REDIRECT_URIS: usize = 8;
+/// Longest redirect URI accepted (bytes).
+pub(crate) const MAX_REDIRECT_URI_LEN: usize = 1024;
+/// Most metadata documents cached; the oldest is evicted past this.
+pub(crate) const MAX_CACHED_METADATA: usize = 256;
 
 /// A client the gateway will run an authorization for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +145,18 @@ impl ClientKey {
         if req.redirect_uris.is_empty() {
             return refuse("redirect_uris is required");
         }
+        if req.redirect_uris.len() > MAX_REDIRECT_URIS {
+            return refuse(format!("at most {MAX_REDIRECT_URIS} redirect_uris"));
+        }
+        if req
+            .redirect_uris
+            .iter()
+            .any(|u| u.len() > MAX_REDIRECT_URI_LEN)
+        {
+            return refuse(format!(
+                "a redirect URI is longer than {MAX_REDIRECT_URI_LEN} bytes"
+            ));
+        }
         let mut uris = Vec::new();
         for raw in &req.redirect_uris {
             let uri =
@@ -148,10 +168,11 @@ impl ClientKey {
             }
             uris.push(uri);
         }
-        let name = req
+        let name: String = req
             .client_name
             .clone()
             .filter(|n| !n.trim().is_empty())
+            .map(|n| n.chars().take(MAX_CLIENT_NAME).collect())
             .unwrap_or_else(|| "an MCP client".into());
         let body = Registered {
             n: name.clone(),
@@ -229,6 +250,11 @@ pub(crate) fn validate_metadata(url: &Url, body: &[u8]) -> Result<Client, Client
         .and_then(Value::as_array)
         .filter(|a| !a.is_empty())
         .ok_or_else(|| ClientError("the client metadata document has no redirect_uris".into()))?;
+    if uris.len() > MAX_REDIRECT_URIS {
+        return refuse(format!(
+            "the client metadata document lists more than {MAX_REDIRECT_URIS} redirect_uris"
+        ));
+    }
     let mut redirect_uris = Vec::new();
     for u in uris {
         let uri = u
@@ -240,7 +266,7 @@ pub(crate) fn validate_metadata(url: &Url, body: &[u8]) -> Result<Client, Client
     }
     Ok(Client {
         id: url.as_str().to_owned(),
-        name: name.to_owned(),
+        name: name.chars().take(MAX_CLIENT_NAME).collect(),
         redirect_uris,
     })
 }
@@ -293,27 +319,22 @@ pub(crate) fn is_public_ip(ip: IpAddr) -> bool {
 
 /// Fetches and caches client metadata documents.
 pub(crate) struct MetadataFetcher {
-    http: reqwest::Client,
     cache: Mutex<HashMap<String, (Client, std::time::Instant)>>,
 }
 
 impl MetadataFetcher {
-    /// A fetcher with its own HTTP client: no redirects followed, short
-    /// timeout.
+    /// An empty fetcher.
     pub(crate) fn new() -> Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("wires/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(FETCH_TIMEOUT)
-            .build()?;
         Ok(Self {
-            http,
             cache: Mutex::new(HashMap::new()),
         })
     }
 
     /// The client whose metadata document is at `client_id`.
+    ///
+    /// A failed fetch says only that it failed: the details (which could
+    /// map the gateway's view of the network) go to the log.
     pub(crate) async fn client(&self, client_id: &str) -> Result<Client, ClientError> {
         if let Some((client, at)) = self.lock().get(client_id)
             && at.elapsed() < METADATA_TTL
@@ -321,18 +342,31 @@ impl MetadataFetcher {
             return Ok(client.clone());
         }
         let url = fetchable_metadata_url(client_id)?;
-        let body = self
-            .fetch(&url)
-            .await
-            .map_err(|e| ClientError(format!("fetching the client metadata document: {e:#}")))?;
+        let body = self.fetch(&url).await.map_err(|e| {
+            tracing::info!("gateway: client metadata {url}: {e:#}");
+            ClientError("the client metadata document could not be fetched".into())
+        })?;
         let client = validate_metadata(&url, &body)?;
-        self.lock().insert(
+        let mut cache = self.lock();
+        cache.retain(|_, (_, at)| at.elapsed() < METADATA_TTL);
+        while cache.len() >= MAX_CACHED_METADATA {
+            let oldest = cache
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| k.clone())
+                .expect("non-empty");
+            cache.remove(&oldest);
+        }
+        cache.insert(
             client_id.to_owned(),
             (client.clone(), std::time::Instant::now()),
         );
         Ok(client)
     }
 
+    /// GET `url`, connecting only to the public addresses its host resolved
+    /// to when checked: the client is pinned to them, so a second DNS answer
+    /// (rebinding) can't send the request somewhere private.
     async fn fetch(&self, url: &Url) -> Result<Vec<u8>> {
         let host = url.host_str().ok_or_else(|| anyhow!("no host"))?;
         let port = url.port_or_known_default().unwrap_or(443);
@@ -340,8 +374,13 @@ impl MetadataFetcher {
         if addrs.is_empty() || !addrs.iter().all(|a| is_public_ip(a.ip())) {
             anyhow::bail!("{host} does not resolve to public addresses only");
         }
-        let mut resp = self
-            .http
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("wires/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(FETCH_TIMEOUT)
+            .resolve_to_addrs(host, &addrs)
+            .build()?;
+        let mut resp = http
             .get(url.clone())
             .header(reqwest::header::ACCEPT, "application/json")
             .send()
@@ -407,6 +446,20 @@ mod tests {
         for junk in ["", "abc", DCR_PREFIX, "wires-dcr.x.y"] {
             assert!(key().registered(junk).is_err(), "{junk}");
         }
+    }
+
+    #[test]
+    fn registrations_are_bounded() {
+        let many: Vec<String> = (0..=MAX_REDIRECT_URIS)
+            .map(|i| format!("https://c.example/{i}"))
+            .collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(key().register(&req(&many, None), 1).is_err());
+        let long = format!("https://c.example/{}", "a".repeat(MAX_REDIRECT_URI_LEN));
+        assert!(key().register(&req(&[&long], None), 1).is_err());
+        let name = "n".repeat(10 * MAX_CLIENT_NAME);
+        let c = key().register(&req(&[CLAUDE], Some(&name)), 1).unwrap();
+        assert_eq!(c.name.chars().count(), MAX_CLIENT_NAME);
     }
 
     #[test]

@@ -43,7 +43,7 @@ use library::{Grant, IdToken, NodeId, Principal, State, role_admits};
 use url::Url;
 
 use crate::admin::keystore::{self, Keystore};
-use crate::caller::call::{CredArgs, Credentials, WiresCaller};
+use crate::caller::call::{CredArgs, Credentials};
 use crate::caller::jwks::KeyFetcher;
 use crate::caller::login::{DEFAULT_ISSUER, OidcClient, random_token, save_secret};
 use crate::caller::mcp::with_services;
@@ -148,10 +148,13 @@ pub(crate) trait Backend: Send + Sync + 'static {
     fn caller(&self, token: IdToken) -> Self::Caller;
 }
 
-/// The production [`Backend`]: this node's keystore.
+/// The production [`Backend`]: this node's keystore, and one long-lived
+/// endpoint every web user's calls dial from (one node key, one endpoint:
+/// not one per call contending for the same relay slot).
 pub(crate) struct Keystored {
     ks: Keystore,
     fabric: NodeId,
+    endpoint: iroh::Endpoint,
 }
 
 impl Backend for Keystored {
@@ -164,14 +167,18 @@ impl Backend for Keystored {
     }
 
     fn caller(&self, token: IdToken) -> PresentingCaller {
-        PresentingCaller { token }
+        PresentingCaller {
+            token,
+            endpoint: self.endpoint.clone(),
+        }
     }
 }
 
-/// A [`WiresCaller`] with this node's credentials, presenting a web user's
-/// ID token instead of a stored one.
+/// Calls a service with this node's credentials over the gateway's shared
+/// endpoint, presenting a web user's ID token instead of a stored one.
 pub(crate) struct PresentingCaller {
     token: IdToken,
+    endpoint: iroh::Endpoint,
 }
 
 impl crate::caller::call::Caller for PresentingCaller {
@@ -181,8 +188,107 @@ impl crate::caller::call::Caller for PresentingCaller {
         argv: library::Argv,
         stdin: Vec<u8>,
     ) -> Result<crate::caller::call::CallOutcome> {
+        use crate::caller::call::{
+            SERVICE_DIAL_TIMEOUT, ServiceDial, call_service_with, outcome, stored_state,
+        };
+        let ks = Keystore::resolve()?;
         let creds = Credentials::resolve(&CredArgs::default())?.presenting(self.token.clone());
-        WiresCaller::new(creds).call(tool, argv, stdin).await
+        let state = stored_state(&ks, &creds)?.context("the gateway holds no signed state")?;
+        let dial = ServiceDial {
+            endpoint: &self.endpoint,
+            hints: crate::caller::pick::Hints::load(&ks),
+            timeout: SERVICE_DIAL_TIMEOUT,
+        };
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let result = call_service_with(
+            &creds,
+            &ks,
+            &state,
+            &library::ServiceName::from(tool.name.clone()),
+            &dial,
+            argv,
+            std::io::Cursor::new(stdin),
+            &mut stdout,
+            &mut stderr,
+            false,
+        )
+        .await;
+        outcome(result, stdout, stderr)
+    }
+}
+
+/// How often the gateway checks for a newer signed state (the pull itself
+/// runs only when the stored one is stale).
+const STATE_REFRESH: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Requests per minute each client address may make to the unauthenticated
+/// OAuth endpoints (`/register`, `/authorize…`, `/oauth/callback`, `/token`).
+pub(crate) const OAUTH_PER_MINUTE: u32 = 60;
+/// Most client addresses tracked; the table is cleared past this.
+const MAX_TRACKED_ADDRS: usize = 10_000;
+
+/// A fixed-window request counter per client address.
+pub(crate) struct RateLimit {
+    per_minute: u32,
+    seen: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u32)>>,
+}
+
+impl RateLimit {
+    /// A limit of `per_minute` requests per address.
+    pub(crate) fn new(per_minute: u32) -> Self {
+        Self {
+            per_minute,
+            seen: Default::default(),
+        }
+    }
+
+    /// Count one request from `addr`; `false` if it is over the limit.
+    pub(crate) fn allow(&self, addr: &str) -> bool {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() >= MAX_TRACKED_ADDRS {
+            seen.clear();
+        }
+        let now = std::time::Instant::now();
+        let entry = seen.entry(addr.to_owned()).or_insert((now, 0));
+        if now.duration_since(entry.0) >= std::time::Duration::from_secs(60) {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+        entry.1 <= self.per_minute
+    }
+}
+
+/// The client's address as the tunnel reports it (`CF-Connecting-IP`), else
+/// the first `X-Forwarded-For` hop, else one shared bucket.
+pub(crate) fn client_addr(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(',').next())
+        })
+        .map(|v| v.trim().to_owned())
+        .unwrap_or_else(|| "direct".to_owned())
+}
+
+async fn limit_oauth<B: Backend>(
+    axum::extract::State(gw): axum::extract::State<Arc<Gateway<B>>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    if gw.limiter.allow(&client_addr(req.headers())) {
+        next.run(req).await
+    } else {
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, "60")],
+            "too many requests",
+        )
+            .into_response()
     }
 }
 
@@ -204,6 +310,8 @@ pub(crate) struct Gateway<B> {
     pub(crate) metadata: MetadataFetcher,
     /// Browser origins accepted on `/mcp`.
     pub(crate) origins: Vec<String>,
+    /// The per-address limit on the OAuth endpoints.
+    pub(crate) limiter: RateLimit,
     /// State and dialing.
     pub(crate) backend: B,
 }
@@ -241,9 +349,21 @@ pub(crate) fn web_grants(state: &State, gateway: NodeId, principal: &Principal) 
         .collect()
 }
 
-/// The HTTP routes.
+/// The HTTP routes. The unauthenticated OAuth endpoints are rate-limited
+/// per client address.
 pub(crate) fn router<B: Backend>(gw: Arc<Gateway<B>>) -> Router {
+    let oauth = Router::new()
+        .route("/register", post(oauth::register::<B>))
+        .route("/authorize", get(oauth::authorize::<B>))
+        .route("/authorize/confirm", post(oauth::confirm::<B>))
+        .route("/oauth/callback", get(oauth::callback::<B>))
+        .route("/token", post(oauth::token::<B>))
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&gw),
+            limit_oauth::<B>,
+        ));
     Router::new()
+        .merge(oauth)
         .route("/", get(oauth::home::<B>))
         .route("/healthz", get(|| async { "ok" }))
         .route(
@@ -258,11 +378,6 @@ pub(crate) fn router<B: Backend>(gw: Arc<Gateway<B>>) -> Router {
             "/.well-known/oauth-authorization-server",
             get(oauth::server_metadata::<B>),
         )
-        .route("/register", post(oauth::register::<B>))
-        .route("/authorize", get(oauth::authorize::<B>))
-        .route("/authorize/confirm", post(oauth::confirm::<B>))
-        .route("/oauth/callback", get(oauth::callback::<B>))
-        .route("/token", post(oauth::token::<B>))
         .route(
             "/mcp",
             post(mcp_http::post::<B>)
@@ -345,6 +460,7 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
     let backend = Keystored {
         ks: Keystore::resolve()?,
         fabric: membership.fabric,
+        endpoint: crate::host::transport::bind(&keystore::node_identity_in(&ks)?, None).await?,
     };
     let state = backend.state()?;
     if !state.is_member(node) {
@@ -367,8 +483,17 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
         client_key: client_key(&ks)?,
         metadata: MetadataFetcher::new()?,
         origins,
+        limiter: RateLimit::new(OAUTH_PER_MINUTE),
         backend,
         urls,
+    });
+    // A long-running caller: keep its state fresh without waiting for a
+    // call to hand back a newer one (it would otherwise expire unnoticed).
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(STATE_REFRESH).await;
+            crate::state::sync::refresh_cold().await;
+        }
     });
     let listener = tokio::net::TcpListener::bind(a.listen)
         .await
@@ -404,7 +529,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Gateway 2, host 3. `orders-db` for `analyst` (alice); `status` for
+    /// Gateway 2, host 3. `orders-db` for `analyst` (alice, bob); `status` for
     /// `member`; `mixed` for `member` then `analyst`.
     pub(crate) fn state() -> State {
         let mut s = State::new(node(1));
@@ -414,10 +539,13 @@ pub(crate) mod tests {
         s.hosts.insert(node(3));
         s.roles.insert(
             RoleName::new("analyst").unwrap(),
-            vec![Matcher {
-                email: Some("alice@example.com".parse().unwrap()),
-                ..Default::default()
-            }],
+            ["alice@example.com", "bob@example.com"]
+                .into_iter()
+                .map(|e| Matcher {
+                    email: Some(e.parse().unwrap()),
+                    ..Default::default()
+                })
+                .collect(),
         );
         let svc = |allow: Vec<RoleName>| Service {
             description: "d".into(),
@@ -464,6 +592,20 @@ pub(crate) mod tests {
             web_grants(&state(), node(9), &principal("alice@example.com")).is_empty(),
             "a gateway that isn't a member offers nothing"
         );
+    }
+
+    #[test]
+    fn the_rate_limit_counts_per_address() {
+        let l = RateLimit::new(3);
+        assert!((0..3).all(|_| l.allow("a")));
+        assert!(!l.allow("a"));
+        assert!(l.allow("b"));
+        let mut h = axum::http::HeaderMap::new();
+        assert_eq!(client_addr(&h), "direct");
+        h.insert("x-forwarded-for", "10.0.0.1, 10.0.0.2".parse().unwrap());
+        assert_eq!(client_addr(&h), "10.0.0.1");
+        h.insert("cf-connecting-ip", "203.0.113.9".parse().unwrap());
+        assert_eq!(client_addr(&h), "203.0.113.9");
     }
 
     #[test]
