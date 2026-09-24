@@ -84,6 +84,7 @@ Each summary describes the surface at the time the card was done. Cards 25–27 
 | [27](done/27-services-not-hosts.md) | S3 | 25 | **Services, not hosts; drop the channel.** Admin-signed members + service registry; local `wires services`; identity in the handshake; delete gossip/fabric keys/re-keys/announcements (~20k LOC) |
 | [26](done/26-host-held-records.md) | H2 | 27 | Call records: host-held signed log, `watch <service>` for authorized readers + own calls, optional OTel export |
 | [30](review/30-web-gateway.md) | W | 27, 26 | `wires gateway`: remote MCP (Streamable HTTP 2026-07-28 + OAuth 2.1) for Claude.ai; each call presents the web user's own gateway-bound Google token |
+| [31](backlog/31-inbox-delivery.md) | P3 | 28, 30 | **Design, to agree:** callbacks go to the caller that asked (node + principal), through the call's push capability only; at least once to its mailbox; fetch set complete by construction; an `inbox` MCP tool in `wires mcp` and the gateway. Replaces card 28 §4 (push half) and §7 |
 | [22](done/22-gossip-role-OPEN.md) | — | decided | **Decided 2026-09-23: drop the channel** → cards 27 and 26 |
 | [18](backlog/18-front-door-OPEN.md) | — | parked | **Open question, don't build:** apex key, invites, `wires join <domain>` |
 | [16](done/16-token-benchmark.md) | bench | 01–03 | MCP (GitHub server, many tools; ± tool search) vs `gh` via `wires call` vs bare `gh`: 5 tasks × 5 runs |
