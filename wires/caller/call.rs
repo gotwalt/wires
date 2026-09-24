@@ -3,17 +3,23 @@
 //! The name is a **service** (card 27): its hosts come from this node's
 //! admin-signed state, tried last-good first with failover on a dial failure
 //! ([`crate::caller::pick`]), and the session opens with the card-27
-//! [`Hello`](library::Hello) (membership, state version, ID token). A newer
-//! state a host hands back is adopted. An alias in `tools.json` wins over a
-//! service: it pins a name to one host (and address hints), and that host
-//! still decides by its signed state.
+//! [`Hello`](library::Hello) (membership, state version, ID token). Nothing
+//! is dialed from an expired state. A newer state a host hands back in its
+//! `HelloAck` is adopted **before** any stdin is sent, and the call stops
+//! there if that state no longer assigns the service to that host. A
+//! registered service wins over a `tools.json` alias of the same name; an
+//! alias pins a name to one host (and address hints), which the current
+//! state must assign the alias's service, and that host still decides by
+//! its signed state.
 //! Locked mode ([`crate::caller::lock`]) refuses the override flags a
 //! sandboxed agent could steer this with.
 //!
 //! The CLI-native front door. An agent runs `wires call <tool> [-- args…]`
 //! from its shell: stdin, stdout and stderr pass straight through, the remote
 //! exit code becomes ours, and a refusal by the responder exits
-//! [`EXIT_DENIED`](crate::EXIT_DENIED) (77) with the reason on stderr.
+//! [`EXIT_DENIED`](crate::EXIT_DENIED) (77) with the reason on stderr. A
+//! remote command that itself exits 77 is reported as 1, with a note
+//! ([`own_exit`]), so 77 always means "refused".
 //!
 //! The same dialing sits behind the [`Caller`] trait, which buffers a call's
 //! output into a [`CallOutcome`] for `wires mcp` — and lets the MCP server be
@@ -143,7 +149,8 @@ impl Credentials {
 /// by its signed state. A refusal surfaces as a [`transport::Denied`] error.
 ///
 /// Runs a local preflight first, so a membership issued to another node
-/// fails here, not at the host.
+/// fails here, not at the host; and refuses, before dialing, an expired
+/// state or a pinned host the state doesn't assign the alias's service.
 pub async fn dial<R, W, E>(
     creds: &Credentials,
     plan: Dial,
@@ -158,17 +165,22 @@ where
 {
     crate::admin::keystore::preflight(creds.node.node_id(), &creds.membership)
         .map_err(anyhow::Error::msg)?;
+    let ks = Keystore::resolve()?;
+    let state = fresh_state(&ks, creds)?;
+    check_alias(&state, &plan)?;
+    let service = ServiceName::from(plan.invocation.tool.clone());
     let relay = creds.relay_override.clone().or(plan.relay_url);
     let target = transport::endpoint_addr(&plan.target, &plan.addrs, relay.as_deref())?;
-    let ks = Keystore::resolve()?;
     let hello = crate::caller::hello::with_membership(&ks, creds.membership.clone())?;
     let endpoint = transport::bind(&creds.node, relay.as_deref()).await?;
+    let fabric = creds.membership.fabric;
     let done = transport::call_service_on(
         &endpoint,
         &[target],
         SERVICE_DIAL_TIMEOUT,
         hello,
         plan.invocation,
+        |host, newer| accept_ack(&ks, fabric, &service, host, newer),
         stdin,
         stdout,
         stderr,
@@ -197,8 +209,7 @@ impl Caller for WiresCaller {
         if tool.target == ToolTarget::Service {
             let result = async {
                 let ks = Keystore::resolve()?;
-                let state = stored_state(&ks, &self.creds)?
-                    .ok_or_else(|| anyhow!("this node holds no signed state"))?;
+                let state = fresh_state(&ks, &self.creds)?;
                 call_service(
                     &self.creds,
                     &ks,
@@ -251,11 +262,102 @@ pub(crate) fn stored_state(ks: &Keystore, creds: &Credentials) -> Result<Option<
     store::read(ks, creds.membership.fabric)
 }
 
-/// Call `service` (card 27): its hosts from `state`, last-good first, failing
-/// over on a dial failure; open with the [`Hello`](library::Hello), bridge
-/// stdio, adopt any newer state the host hands back, remember the host that
-/// answered. `verbose` names that host on stderr. A refusal is a
-/// [`transport::Denied`] error, as in [`dial`].
+/// [`stored_state`], required to exist and to be fresh: a caller never
+/// dials from an expired state (it would present an old version, and name
+/// hosts the admin may have since removed).
+pub(crate) fn fresh_state(ks: &Keystore, creds: &Credentials) -> Result<SignedState> {
+    let state = stored_state(ks, creds)?.ok_or_else(|| {
+        anyhow!("this node holds no signed state yet: run `wires join <token>` first")
+    })?;
+    check_fresh(&state, crate::now_unix())?;
+    Ok(state)
+}
+
+/// Refuse an expired `state`, saying what to do about it.
+fn check_fresh(state: &SignedState, now: i64) -> Result<()> {
+    if state.check_fresh(now).is_err() {
+        bail!(
+            "this node's signed state (version {}) has expired and no newer one could be pulled, \
+             so nothing was dialed; ask the admin to run `wires state push` (or for a fresh \
+             invite)",
+            state.state.version.0
+        );
+    }
+    Ok(())
+}
+
+/// An alias may only pin a host that the current `state` assigns the alias's
+/// service (its `remote_tool`, else its name).
+fn check_alias(state: &SignedState, plan: &Dial) -> Result<()> {
+    let service = ServiceName::from(plan.invocation.tool.clone());
+    if !state.state.assigns(&service, plan.target) {
+        bail!(
+            "the alias's host {} is not assigned `{service}` in signed state version {}; \
+             nothing was dialed",
+            pick::short(&plan.target),
+            state.state.version.0
+        );
+    }
+    Ok(())
+}
+
+/// What the caller does at a host's `HelloAck`, before any stdin: adopt the
+/// newer state it handed back (if any), then require the state now held to
+/// still assign `service` to `host`. An error aborts the call (exit 1): the
+/// host keeps the `Invoke` it already has, but gets no stdin.
+fn accept_ack(
+    ks: &Keystore,
+    fabric: NodeId,
+    service: &ServiceName,
+    host: NodeId,
+    newer: Option<&SignedState>,
+) -> Result<()> {
+    let Some(newer) = newer else {
+        return Ok(());
+    };
+    if store::adopt_if_newer(ks, newer, fabric, crate::now_unix())
+        .context("the host handed back a signed state that does not verify; no input was sent")?
+    {
+        tracing::info!(
+            version = newer.state.version.0,
+            "adopted the host's newer signed state"
+        );
+    }
+    let held = store::read(ks, fabric)?.context("no signed state after adopting one")?;
+    if !held.state.assigns(service, host) {
+        bail!(
+            "signed state version {} no longer assigns `{service}` to host {}, so the call was \
+             stopped before any input was sent (see `wires services`)",
+            held.state.version.0,
+            pick::short(&host)
+        );
+    }
+    Ok(())
+}
+
+/// The exit code `wires call` reports for a remote exit code, and a note for
+/// stderr when it differs: 77 is reserved for a refusal by the host, so a
+/// remote command's own 77 becomes 1.
+pub(crate) fn own_exit(remote: i32) -> (i32, Option<String>) {
+    if remote == crate::EXIT_DENIED {
+        return (
+            1,
+            Some(format!(
+                "wires: the remote command exited {remote}; reported as 1 (exit {remote} means \
+                 the host refused the call)"
+            )),
+        );
+    }
+    (remote, None)
+}
+
+/// Call `service` (card 27): its hosts from `state` (which must be fresh),
+/// last-good first, failing over on a dial failure; open with the
+/// [`Hello`](library::Hello); at the host's ack, adopt any newer state it
+/// hands back and stop unless that state still assigns `service` to it; then
+/// bridge stdio and remember the host that answered. `verbose` names that
+/// host on stderr. A refusal is a [`transport::Denied`] error, as in
+/// [`dial`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_service<R, W, E>(
     creds: &Credentials,
@@ -319,6 +421,7 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
+    check_fresh(state, crate::now_unix())?;
     let last_good = LastGood::path(ks);
     let hosts = pick::candidates(
         &state.state,
@@ -330,6 +433,7 @@ where
     }
     let hello = crate::caller::hello::with_membership(ks, creds.membership.clone())?;
     let targets = dial.hints.targets(&hosts, creds.relay_override.as_deref());
+    let fabric = creds.membership.fabric;
     let done = transport::call_service_on(
         dial.endpoint,
         &targets,
@@ -339,6 +443,7 @@ where
             tool: service.clone().into(),
             argv,
         },
+        |host, newer| accept_ack(ks, fabric, service, host, newer),
         stdin,
         stdout,
         stderr,
@@ -352,16 +457,6 @@ where
         );
     }
     LastGood::record(&last_good, service, done.host);
-    if let Some(newer) = &done.dialed.newer_state {
-        match store::adopt_if_newer(ks, newer, creds.membership.fabric, crate::now_unix()) {
-            Ok(true) => tracing::info!(
-                version = newer.state.version.0,
-                "adopted the host's newer signed state"
-            ),
-            Ok(false) => {}
-            Err(e) => tracing::warn!("the host's newer state was not adopted: {e:#}"),
-        }
-    }
     Ok(done.dialed.exit)
 }
 
@@ -491,11 +586,18 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
         (Route::Alias, Some(plan)) => dial(&creds, plan, stdin, stdout, tokio::io::stderr()).await,
         (Route::Alias, None) => unreachable!("an alias route always has a plan"),
     };
+    let report = |remote: i32| {
+        let (code, note) = own_exit(remote);
+        if let Some(note) = note {
+            eprintln!("{note}");
+        }
+        code
+    };
     if shape.is_identity() {
-        return run(&mut tokio::io::stdout()).await;
+        return Ok(report(run(&mut tokio::io::stdout()).await?));
     }
     let mut stdout = Vec::new();
-    let remote = run(&mut stdout).await?;
+    let remote = report(run(&mut stdout).await?);
     write_shaped(
         &shape,
         remote,
@@ -522,21 +624,30 @@ enum Route {
     Alias,
 }
 
-/// An alias wins; else a service registered in the stored state. A name the
-/// state doesn't register is an error that points at `wires services`.
+/// A service registered in the stored state wins; else an alias (whose host
+/// [`dial`] checks against the state). A name that is neither is an error
+/// that points at `wires services`.
 fn route(config: &ToolsConfig, name: &str, creds: &Credentials) -> Result<Route> {
-    if lookup(config, name).is_ok() {
-        return Ok(Route::Alias);
-    }
     let ks = Keystore::resolve()?;
     let Some(state) = stored_state(&ks, creds)? else {
         bail!("this node holds no signed state yet: run `wires join <token>` first");
     };
-    let service = ServiceName::new(name).map_err(|e| anyhow!("`{name}`: {e}"))?;
-    if state.state.service(&service).is_none() {
-        bail!("no service named `{name}` (see `wires services`)");
+    route_in(config, name, ks, state)
+}
+
+/// [`route`] against a given keystore and state.
+fn route_in(config: &ToolsConfig, name: &str, ks: Keystore, state: SignedState) -> Result<Route> {
+    let service = ServiceName::new(name).ok();
+    if let Some(service) = service
+        && state.state.service(&service).is_some()
+    {
+        return Ok(Route::Service { ks, state, service });
     }
-    Ok(Route::Service { ks, state, service })
+    if lookup(config, name).is_ok() {
+        return Ok(Route::Alias);
+    }
+    ServiceName::new(name).map_err(|e| anyhow!("`{name}`: {e}"))?;
+    bail!("no service named `{name}` (see `wires services`)")
 }
 
 /// Shape a finished call's `stdout`, write it to `out` and any notes to
@@ -829,6 +940,7 @@ mod tests {
                     tool: ToolName::new(name).unwrap(),
                     argv: Argv::default(),
                 },
+                |_, _| Ok(()),
                 std::io::Cursor::new(Vec::new()),
                 &mut stdout,
                 &mut stderr,
@@ -889,6 +1001,12 @@ mod tests {
         },
         /// `Denied`.
         Deny(&'static str),
+        /// `HelloAck` (with `newer`), then every `Stdin` byte into `got`
+        /// until EOF, then exit 0.
+        Echo {
+            newer: Option<SignedState>,
+            got: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        },
     }
 
     type Seen = std::sync::Arc<std::sync::Mutex<Vec<library::Hello>>>;
@@ -936,6 +1054,20 @@ mod tests {
                         let _ = transport::write_frame(&mut send, &ack).await;
                         let chunk = Chunk::from_bytes(out.as_bytes().to_vec());
                         let _ = transport::write_frame(&mut send, &Frame::Stdout(chunk)).await;
+                        let _ = transport::write_frame(&mut send, &Frame::Exit(0)).await;
+                    }
+                    Answer::Echo { newer, got } => {
+                        let ack = Frame::HelloAck(HelloAck {
+                            membership: membership.clone(),
+                            state_version: caller_version,
+                            newer_state: newer.clone(),
+                        });
+                        let _ = transport::write_frame(&mut send, &ack).await;
+                        while let Ok(Some(Frame::Stdin(chunk))) =
+                            transport::read_frame(&mut recv).await
+                        {
+                            got.lock().unwrap().extend_from_slice(chunk.as_bytes());
+                        }
                         let _ = transport::write_frame(&mut send, &Frame::Exit(0)).await;
                     }
                 }
@@ -1015,6 +1147,15 @@ mod tests {
     }
 
     async fn run_service(f: &Fixture, state: &SignedState, hints: Hints) -> (Result<i32>, String) {
+        run_service_with_stdin(f, state, hints, Vec::new()).await
+    }
+
+    async fn run_service_with_stdin(
+        f: &Fixture,
+        state: &SignedState,
+        hints: Hints,
+        stdin: Vec<u8>,
+    ) -> (Result<i32>, String) {
         let endpoint = test_endpoint(&f.creds.node).await;
         let dial = ServiceDial {
             endpoint: &endpoint,
@@ -1029,7 +1170,7 @@ mod tests {
             &ServiceName::new("orders-db").unwrap(),
             &dial,
             Argv::default(),
-            std::io::Cursor::new(Vec::new()),
+            std::io::Cursor::new(stdin),
             &mut stdout,
             Vec::new(),
             false,
@@ -1121,5 +1262,126 @@ mod tests {
         let err = format!("{:#}", r.unwrap_err());
         assert!(err.contains("no host answered"), "{err}");
         assert!(err.contains(&a.hex()[..8]), "{err}");
+    }
+    /// Card 28 §8: an expired state is never dialed from.
+    #[tokio::test]
+    async fn an_expired_state_refuses_to_dial() {
+        let f = fixture();
+        let h = NodeIdentity::from_seed([87; 32]);
+        let me = f.creds.node.node_id();
+        let answer = Answer::Run {
+            out: "",
+            newer: None,
+        };
+        let (h_id, h_addr, seen) = fake_host(&f.root, &h, answer).await;
+        let mut expired = signed_state(&f.root, 1, me, &[h_id]).state;
+        expired.not_after = 1;
+        let expired = expired.sign(&f.root).unwrap();
+        let (r, _) = run_service(&f, &expired, Hints::from_pairs([(h_id, vec![h_addr])])).await;
+        let err = format!("{:#}", r.unwrap_err());
+        assert!(
+            err.contains("expired") && err.contains("wires state push"),
+            "{err}"
+        );
+        assert!(seen.lock().unwrap().is_empty(), "nothing was dialed");
+    }
+
+    /// Card 28 §8: the host's newer state is adopted at the ack, and when it
+    /// no longer assigns the service to that host the call stops there,
+    /// before any stdin, as a failure (not a refusal).
+    #[tokio::test]
+    async fn a_newer_state_dropping_the_host_aborts_before_stdin() {
+        let f = fixture();
+        let h = NodeIdentity::from_seed([88; 32]);
+        let other = NodeIdentity::from_seed([89; 32]).node_id();
+        let me = f.creds.node.node_id();
+        let v1 = signed_state(&f.root, 1, me, &[h.node_id()]);
+        let mut v2 = signed_state(&f.root, 2, me, &[other]).state;
+        v2.members.insert(h.node_id());
+        let v2 = v2.sign(&f.root).unwrap();
+        store::adopt_if_newer(&f.ks, &v1, f.root.node_id(), 10).unwrap();
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let answer = Answer::Echo {
+            newer: Some(v2.clone()),
+            got: got.clone(),
+        };
+        let (h_id, h_addr, _) = fake_host(&f.root, &h, answer).await;
+        let hints = Hints::from_pairs([(h_id, vec![h_addr])]);
+        let (r, out) = run_service_with_stdin(&f, &v1, hints, b"secret".to_vec()).await;
+        let err = r.unwrap_err();
+        assert!(
+            err.downcast_ref::<transport::Denied>().is_none(),
+            "exit 1, not 77"
+        );
+        let err = format!("{err:#}");
+        assert!(err.contains("no longer assigns"), "{err}");
+        assert_eq!(out, "");
+        assert_eq!(store::read(&f.ks, f.root.node_id()).unwrap().unwrap(), v2);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(got.lock().unwrap().is_empty(), "no stdin reached the host");
+
+        // Control: a newer state that still assigns the host lets stdin through.
+        let f = fixture();
+        let v2 = signed_state(&f.root, 2, me, &[h.node_id()]);
+        store::adopt_if_newer(&f.ks, &v1, f.root.node_id(), 10).unwrap();
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let answer = Answer::Echo {
+            newer: Some(v2),
+            got: got.clone(),
+        };
+        let h2 = NodeIdentity::from_seed([88; 32]);
+        let (h_id, h_addr, _) = fake_host(&f.root, &h2, answer).await;
+        let hints = Hints::from_pairs([(h_id, vec![h_addr])]);
+        let (r, _) = run_service_with_stdin(&f, &v1, hints, b"secret".to_vec()).await;
+        assert_eq!(r.unwrap(), 0);
+        assert_eq!(got.lock().unwrap().as_slice(), b"secret");
+    }
+
+    /// Card 28 §8: a registered service beats an alias of the same name, and
+    /// an alias may only pin a host the state assigns its service.
+    #[test]
+    fn a_service_beats_an_alias_and_an_alias_needs_an_assigned_host() {
+        let f = fixture();
+        let me = f.creds.node.node_id();
+        let host = NodeIdentity::from_seed([90; 32]).node_id();
+        let stranger = NodeIdentity::from_seed([91; 32]).node_id();
+        let state = signed_state(&f.root, 1, me, &[host]);
+        let alias = |name: &str, node: NodeId| RemoteTool {
+            name: ToolName::new(name).unwrap(),
+            description: String::new(),
+            target: ToolTarget::Node {
+                node,
+                relay_url: None,
+                addrs: vec![],
+            },
+            remote_tool: Some(ToolName::new("orders-db").unwrap()),
+        };
+        let config = ToolsConfig {
+            tools: vec![alias("orders-db", stranger), alias("orders", stranger)],
+            locked: false,
+        };
+        let ks = || Keystore::at(crate::testutil::temp_dir());
+        let routed = route_in(&config, "orders-db", ks(), state.clone()).unwrap();
+        assert!(matches!(routed, Route::Service { .. }), "the service wins");
+        let routed = route_in(&config, "orders", ks(), state.clone()).unwrap();
+        assert!(matches!(routed, Route::Alias));
+        assert!(route_in(&config, "nope", ks(), state.clone()).is_err());
+
+        let plan = |node| Dial::resolve(&alias("orders", node), Argv::default()).unwrap();
+        let err = check_alias(&state, &plan(stranger))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not assigned `orders-db`"), "{err}");
+        check_alias(&state, &plan(host)).unwrap();
+    }
+
+    /// Card 28 §10: a remote exit 77 is not a refusal.
+    #[test]
+    fn a_remote_77_is_reported_as_1() {
+        assert_eq!(own_exit(0), (0, None));
+        assert_eq!(own_exit(3), (3, None));
+        let (code, note) = own_exit(crate::EXIT_DENIED);
+        assert_eq!(code, 1);
+        assert!(note.unwrap().contains("exited 77"));
     }
 }
