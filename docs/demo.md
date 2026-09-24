@@ -34,7 +34,7 @@ On camera, in order:
 | 3 | agent | `wires services` | `orders-db  Read-only SQL (sqlite3) over …  (analyst)` |
 | 4 | agent | `claude --allowedTools 'Bash(wires call orders-db:*)'`, then [the prompt](#4-the-agent-works) | Claude Code runs `wires call orders-db -- "…"`; the answer is umbrella, $999.00 of $1,629.84 (61.3%) |
 | 5 | reader | `wires watch orders-db` | `▶ … <you>@gmail.com (…) [analyst] orders-db "select …"`, `■ … exit 0 · … ms · … B out` |
-| 5 (opt.) | reader (second tab) | `wires call orders-db -- "select 1"` | exit 77: `wires: denied by host: <reader> is in no role allowed to call orders-db (analyst); don't retry: ask your admin for access`; a `✗` in the watch |
+| 5 (opt.) | reader (second tab) | `wires call orders-db -- "select 1"; echo $?` | ``wires: no service named `orders-db` that you may call; see `wires services` ``, then `1`: the reader's view marks it read-only, so nothing is dialed and the watch gains no line |
 | 5b (opt.) | agent | [push beat](#5b-the-workbench-calls-back-push): `wires call deploy -- build 41`, `wires inbox --wait --timeout 10m` | `… from host <wb8> (verified)  build-41  failed: …` |
 | 5c (with a spare) | workbench | stop `wires serve`, ask again | the spare answers (`wires call --verbose` names it) |
 | 6 | admin | `wires remove agent` | stderr `policy version N: published to 1 of 1 directory(ies)` (2 of 2 with a spare that is also a directory) |
@@ -79,8 +79,10 @@ agent's and reader's `wires login` need no flags.
 because the ssh config forces a remote command. Make `orders.db` in the
 directory `wires serve` runs from (`sqlite3 orders.db < .scripts/fixtures/orders.sql`),
 and put this `host.json` beside it (the loopback demo's
-`.scripts/fixtures/host.json`; the trusted IdP is the signed policy's, which
-`init` sets, so an `identity` section is optional and could only narrow it):
+`.scripts/fixtures/host.json` without its `also_require`, which the loopback
+run uses to show a host refusing an analyst the policy admits; the trusted IdP
+is the signed policy's, which `init` sets, so an `identity` section is
+optional and could only narrow it):
 
 ```json
 {
@@ -218,8 +220,10 @@ reader$ WIRES_HOME=~/.wires-reader wires watch orders-db
 > every signature and every link."
 
 Point at the `▶ … <you>@gmail.com (…) [analyst] orders-db "select …"` and
-`■ … exit 0 · … ms · … B out` pairs, and at the `✗` line for the refusal in
-beat 2. The agent's own `wires watch` shows only its own person's calls: the
+`■ … exit 0 · … ms · … B out` pairs. If you run the optional beat, the
+reader's own `wires call` stops on the reader's machine (exit 1): it may read
+`orders-db`, not call it, so no host is dialed and nothing is logged. The
+agent's own `wires watch` shows only its own person's calls: the
 isolation boundary is the verified person, so another person's agent sees
 none of these (only hash links, which reveal how many entries and when).
 
