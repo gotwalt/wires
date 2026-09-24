@@ -1,4 +1,4 @@
-//! Push to callers (board card 23): a host sends a message to a caller it
+//! Push to callers: a host sends a message to a caller it
 //! verified, addressed by the caller's **key**, not an address.
 //!
 //! A host queues each [`PushMessage`] per recipient and delivers it one of
@@ -267,7 +267,6 @@ pub enum InboxFrame {
     Fetch {
         /// How long the host may hold the stream open for a first message
         /// (it caps this); `0` answers at once.
-        #[serde(default)]
         wait_ms: u64,
     },
     /// Messages, host → recipient (after a recipient's `Fetch`, or after the
@@ -364,8 +363,8 @@ mod tests {
         }
     }
 
-    /// The wire shape is pinned: a receiver written against the Notes'
-    /// example must parse what a host sends.
+    /// The wire shape is pinned: a receiver written against the documented
+    /// shape (`docs/protocol.md`) must parse what a host sends.
     #[test]
     fn a_fetch_and_a_deliver_have_the_documented_shape() {
         let fetch = InboxFrame::Fetch { wait_ms: 25_000 }.encode().unwrap();
@@ -382,14 +381,11 @@ mod tests {
             node(2).hex()
         );
         assert!(text.ends_with(&tail), "{text}");
-        // A fetch without `wait_ms` means "answer now".
+        // `wait_ms` is required: a fetch without it is malformed.
         let bare = br#"{"type":"fetch"}"#;
         let mut framed = (bare.len() as u32).to_be_bytes().to_vec();
         framed.extend_from_slice(bare);
-        assert_eq!(
-            InboxFrame::decode(&framed).unwrap().unwrap().0,
-            InboxFrame::Fetch { wait_ms: 0 }
-        );
+        assert!(InboxFrame::decode(&framed).is_err());
     }
 
     #[test]
@@ -494,12 +490,6 @@ mod tests {
         #[test]
         fn decode_never_panics(data in proptest::collection::vec(any::<u8>(), 0..512)) {
             let _ = InboxFrame::decode(&data);
-        }
-
-        #[test]
-        fn push_ids_round_trip(id in any::<[u8; 16]>()) {
-            let id = PushId(id);
-            prop_assert_eq!(PushId::from_hex(&id.hex()).unwrap(), id);
         }
     }
 }

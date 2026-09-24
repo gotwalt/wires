@@ -339,7 +339,6 @@ mod tests {
                 org: None,
                 groups: vec![],
                 not_after: 0,
-                claims: Default::default(),
             }),
             service: ServiceName::new("db_query").unwrap(),
             argv: Argv::new(vec!["select 1".into(), "-n".into()]).unwrap(),

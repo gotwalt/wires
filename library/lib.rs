@@ -94,7 +94,6 @@
 //!     org: None,
 //!     groups: vec![],
 //!     not_after: i64::MAX,
-//!     claims: Default::default(),
 //! };
 //! assert_eq!(authorize(&signed.state, alice.node_id(), Some(&who), &orders), Ok(analyst));
 //! // Without a verified identity, the registry refuses (and says why).
@@ -145,10 +144,7 @@ mod codec;
 mod idp_vectors;
 
 pub use access::{Grant, Refusal, allowed_services, authorize, role_admits};
-pub use audit::{
-    AuditRecord, CallId, OutputDigest, OutputHasher, PushOutcome, STDIN_HEAD_MAX, StdinCapture,
-    stdin_head,
-};
+pub use audit::{AuditRecord, CallId, OutputDigest, OutputHasher, PushOutcome, StdinCapture};
 pub use call_log::{
     CALL_LOG_CONTEXT, CALL_LOG_V1, ChainBreak, ChainPoint, EntryHash, LogEntry, LogSeq, Retention,
     verify_chain,
@@ -173,9 +169,3 @@ pub use role::{EmailPattern, MAX_ROLE_NAME, Matcher, RoleName};
 pub use session::{Chunk, Frame, Hello, HelloAck};
 pub use state::{STATE_CONTEXT, STATE_V1, SignedState, State, StateVersion};
 pub use sync::{MAX_SMALL_STATE_FRAME, MAX_STATE_FRAME, OFFER_BODY_PREFIX, STATE_ALPN, StateFrame};
-
-/// Crate version, surfaced so the binaries have something concrete to call
-/// while the real surface is still being built out.
-pub fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
-}

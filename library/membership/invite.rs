@@ -52,9 +52,8 @@ use crate::membership::Membership;
 use crate::policy::check_inclusion;
 use crate::state::SignedState;
 
-/// The invite token's format discriminant. `2`: membership + signed state
-/// (card 27); the channel-era `1` (roster head, sealed fabric key, bootstrap
-/// peers) is refused.
+/// The invite token's format discriminant (membership + signed state). An
+/// invite of any other format is refused.
 pub const INVITE_V2: u8 = 2;
 
 /// One node's invitation to a fabric. See the module docs.
@@ -140,10 +139,8 @@ mod tests {
         }
         let signed = state_with(&root, &members).sign(&root).unwrap();
         let membership = Membership::mint(&root, joiner.node_id(), 0, i64::MAX).unwrap();
-        (
-            NodeIdentity::from_seed([1u8; 32]),
-            Invite::new(membership, signed, root.node_id()),
-        )
+        let invite = Invite::new(membership, signed, root.node_id());
+        (root, invite)
     }
 
     #[test]
@@ -194,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn garbage_and_old_tokens_are_refused() {
+    fn garbage_and_unknown_formats_are_refused() {
         assert!(Invite::decode("not a token!").is_err());
         assert!(Invite::decode("e30").is_err()); // "{}"
         let joiner = NodeIdentity::from_seed([2u8; 32]);

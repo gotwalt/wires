@@ -1,5 +1,5 @@
 //! Role definitions: named OR-of-matchers over a caller's verified IdP
-//! [`Principal`] (card 27; the shape moved here from card 13's `host.json`).
+//! [`Principal`].
 //!
 //! A **role** is an OR of [`Matcher`]s; a matcher is an AND of its keys
 //! (`issuer`, `email`, `org`, `group`). Every matcher names its issuer, so a
@@ -27,8 +27,6 @@ pub const MAX_ROLE_NAME: usize = 64;
 /// use library::RoleName;
 /// assert!(RoleName::new("analyst").is_ok());
 /// assert!(RoleName::new("has space").is_err());
-/// // `member` is an ordinary name: nothing is built in.
-/// assert!(RoleName::new("member").is_ok());
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -227,7 +225,7 @@ impl Matcher {
     /// let mut p = Principal {
     ///     issuer: "https://idp".into(), subject: "1".into(),
     ///     email: Some("alice@example.com".into()), org: None, groups: vec![],
-    ///     not_after: 0, claims: Default::default(),
+    ///     not_after: 0,
     /// };
     /// assert!(m.matches(&p));
     /// p.issuer = "https://other-idp".into();
@@ -284,7 +282,6 @@ mod tests {
             org: None,
             groups: vec!["sre".into()],
             not_after: 0,
-            claims: Default::default(),
         }
     }
 
@@ -369,7 +366,6 @@ mod tests {
                 org: Some("acme.com".into()),
                 groups: vec!["sre".into()],
                 not_after: 0,
-                claims: Default::default(),
             };
             prop_assert_eq!(m.matches(&p), matcher_iss == token_iss);
         }

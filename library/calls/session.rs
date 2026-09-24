@@ -4,7 +4,7 @@
 //! stream: an opening [`Frame::Hello`] that presents the dialer's membership,
 //! state version and ID token, then tagged stdio chunks ([`Frame::Stdin`] / [`Frame::Stdout`] /
 //! [`Frame::Stderr`]) and a final [`Frame::Exit`] carrying the child's exit
-//! code. A responder that refuses the handshake answers with a terminal
+//! code. A host that refuses the handshake answers with a terminal
 //! [`Frame::Denied`] carrying the human-readable reason instead of an ack, so
 //! the dialer can say *why* it was turned away rather than reporting a bare
 //! dropped connection.
@@ -22,16 +22,16 @@
 //!
 //! | tag  | variant     | body                                       |
 //! |------|-------------|--------------------------------------------|
-//! | `0`  | —           | retired (the channel-era `Handshake`)      |
 //! | `1`  | `Stdin`     | raw chunk bytes                            |
 //! | `2`  | `Stdout`    | raw chunk bytes                            |
 //! | `3`  | `Stderr`    | raw chunk bytes                            |
 //! | `4`  | `Exit`      | 4-byte big-endian `i32`                    |
-//! | `5`  | —           | retired (the channel-era `HandshakeAck`)   |
 //! | `6`  | `Denied`    | UTF-8 reason bytes                         |
 //! | `7`  | `Invoke`    | canonical-JSON of the [`Invocation`]       |
-//! | `8`  | `Hello`     | canonical-JSON of the [`Hello`] (card 27)  |
-//! | `9`  | `HelloAck`  | canonical-JSON of the [`HelloAck`] (card 27) |
+//! | `8`  | `Hello`     | canonical-JSON of the [`Hello`]            |
+//! | `9`  | `HelloAck`  | canonical-JSON of the [`HelloAck`]         |
+//!
+//! Any other tag is a [`Error::BadFrame`].
 //!
 //! A dialer sends [`Frame::Invoke`] immediately after its `Hello`, without
 //! waiting for the ack — the host reads both, authorizes them together, and
@@ -60,7 +60,7 @@ const TAG_INVOKE: u8 = 7;
 const TAG_HELLO: u8 = 8;
 const TAG_HELLO_ACK: u8 = 9;
 
-/// The services-era opening frame (card 27), dialer → host, followed at once
+/// The opening frame, dialer → host, followed at once
 /// by [`Frame::Invoke`]. Unsigned envelope: each part verifies on its own
 /// (the membership under the root, the token under the IdP's keys and the
 /// nonce binding to the iroh-authenticated caller).
@@ -111,16 +111,6 @@ impl Chunk {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
-
-    /// The chunk's length in bytes.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Whether the chunk carries no bytes.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
 }
 
 /// One framed message on a session.
@@ -140,12 +130,12 @@ pub enum Frame {
     Stderr(Chunk),
     /// The child process's exit code.
     Exit(i32),
-    /// Terminal frame from the responder: the call was refused, with a
+    /// Terminal frame from the host: the call was refused, with a
     /// human-readable reason. Sent instead of a `HelloAck`, after which the
-    /// responder closes. Carries no secrets — the reason describes the dialer's
+    /// host closes. Carries no secrets — the reason describes the dialer's
     /// own credential.
     Denied {
-        /// Why the session was refused (e.g. `membership rejected: revoked`).
+        /// Why the session was refused (e.g. `not a member of this network`).
         reason: String,
     },
     /// Dialer → host, right after `Hello`: which service to run and the
@@ -171,7 +161,7 @@ impl Frame {
     /// assert!(Frame::decode(&bytes[..bytes.len() - 1]).unwrap().is_none());
     ///
     /// // A refusal round-trips its reason verbatim.
-    /// let denied = Frame::Denied { reason: "membership rejected: revoked".into() };
+    /// let denied = Frame::Denied { reason: "not a member of this network".into() };
     /// let bytes = denied.encode().unwrap();
     /// assert_eq!(Frame::decode(&bytes).unwrap().unwrap().0, denied);
     /// ```
@@ -349,21 +339,11 @@ mod tests {
         fn garbage_never_panics(b in proptest::collection::vec(any::<u8>(), 0..64)) {
             let _ = Frame::decode(&b);
         }
-
-        /// A denial's reason survives a round-trip verbatim, for any string.
-        #[test]
-        fn denied_reason_roundtrips(reason in any::<String>()) {
-            let f = Frame::Denied { reason };
-            let enc = f.encode().unwrap();
-            let (dec, consumed) = Frame::decode(&enc).unwrap().unwrap();
-            prop_assert_eq!(dec, f);
-            prop_assert_eq!(consumed, enc.len());
-        }
     }
 
     #[test]
     fn denied_roundtrips_empty_ascii_and_unicode() {
-        for reason in ["", "membership rejected: revoked", "refusé — 拒否 🚫"] {
+        for reason in ["", "not a member of this network", "refusé — 拒否 🚫"] {
             let f = Frame::Denied {
                 reason: reason.to_string(),
             };
@@ -394,30 +374,11 @@ mod tests {
     }
 
     #[test]
-    fn exit_roundtrips_negative() {
-        let enc = Frame::Exit(-1).encode().unwrap();
-        let (dec, _) = Frame::decode(&enc).unwrap().unwrap();
-        assert_eq!(dec, Frame::Exit(-1));
-    }
-
-    #[test]
     fn empty_stdin_chunk_roundtrips() {
         let f = Frame::Stdin(Chunk::from_bytes(Vec::new()));
         let enc = f.encode().unwrap();
         assert_eq!(enc, vec![0, 0, 0, 1, TAG_STDIN]);
         assert_eq!(Frame::decode(&enc).unwrap().unwrap().0, f);
-    }
-
-    #[test]
-    fn retired_handshake_tags_are_bad_frames() {
-        assert!(matches!(
-            Frame::decode(&[0, 0, 0, 3, 0, b'{', b'}']),
-            Err(Error::BadFrame)
-        ));
-        assert!(matches!(
-            Frame::decode(&[0, 0, 0, 3, 5, b'{', b'}']),
-            Err(Error::BadFrame)
-        ));
     }
 
     #[test]

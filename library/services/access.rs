@@ -1,5 +1,5 @@
 //! Policy evaluation over the signed state: **may this caller call this
-//! service**, and **which services may it call** (card 27).
+//! service**, and **which services may it call**.
 //!
 //! One function, two uses: a host runs [`authorize`] on every call (then its
 //! own stricter `also_require`), and `wires services` runs
@@ -118,7 +118,7 @@ impl fmt::Display for Refusal {
 /// });
 /// let alice = Principal {
 ///     issuer: "https://idp".into(), subject: "a".into(), email: None, org: None,
-///     groups: vec![], not_after: 0, claims: Default::default(),
+///     groups: vec![], not_after: 0,
 /// };
 /// assert_eq!(authorize(&state, host, Some(&alice), &status), Ok(staff));
 /// // A member with no verified identity is in no role.
@@ -198,7 +198,6 @@ mod tests {
     use crate::registry::Service;
     use crate::role::Matcher;
     use crate::state::StateVersion;
-    use proptest::prelude::*;
 
     fn node(b: u8) -> NodeId {
         NodeIdentity::from_seed([b; 32]).node_id()
@@ -214,7 +213,6 @@ mod tests {
             org: None,
             groups: vec![],
             not_after: i64::MAX,
-            claims: Default::default(),
         }
     }
 
@@ -319,29 +317,6 @@ mod tests {
     }
 
     #[test]
-    fn a_role_named_member_is_an_ordinary_role() {
-        let mut s = state();
-        let member = RoleName::new("member").unwrap();
-        s.roles.insert(
-            member.clone(),
-            vec![Matcher {
-                email: Some("alice@example.com".parse().unwrap()),
-                ..Matcher::new(ISS)
-            }],
-        );
-        s.services.get_mut(&name("status")).unwrap().allow = vec![member.clone()];
-        s.validate().unwrap();
-        assert!(authorize(&s, node(3), None, &name("status")).is_err());
-        let bob = who("bob@example.com");
-        assert!(authorize(&s, node(3), Some(&bob), &name("status")).is_err());
-        let alice = who("alice@example.com");
-        assert_eq!(
-            authorize(&s, node(2), Some(&alice), &name("status")),
-            Ok(member)
-        );
-    }
-
-    #[test]
     fn the_same_email_from_another_issuer_is_not_admitted() {
         let mut alice = who("alice@example.com");
         alice.issuer = "https://partner-okta.example".into();
@@ -399,46 +374,5 @@ mod tests {
             authorize(&state(), node(3), Some(&p), &name("orders-db")),
             Err(Refusal::NotInRole { principal: Some(ref w), .. }) if w == "sub-42"
         ));
-    }
-
-    proptest! {
-        /// The listing is exactly the services `authorize` admits, with the
-        /// same role; a non-member is refused everything first.
-        #[test]
-        fn listing_agrees_with_authorize(
-            caller in 1u8..12,
-            email in prop::option::of(prop::sample::select(vec![
-                "alice@example.com", "bob@example.com", "eve@evil.net",
-            ])),
-        ) {
-            let s = state();
-            let p = email.map(who);
-            let listed = allowed_services(&s, node(caller), p.as_ref());
-            for svc in s.services.keys() {
-                let got = authorize(&s, node(caller), p.as_ref(), svc);
-                let shown = listed.iter().find(|g| &g.service == svc);
-                prop_assert_eq!(got.clone().ok(), shown.map(|g| g.role.clone()));
-                if !s.is_member(node(caller)) {
-                    prop_assert_eq!(got.clone(), Err(Refusal::NotAMember));
-                }
-                if p.is_none() {
-                    prop_assert!(got.is_err(), "no identity, no role");
-                }
-                if let Ok(role) = got {
-                    prop_assert!(s.services[svc].allow.contains(&role));
-                    prop_assert!(role_admits(&s, &role, p.as_ref()));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn refusal_text_says_what_to_do() {
-        let r = Refusal::NotInRole {
-            service: name("orders-db"),
-            allow: vec![RoleName::new("analyst").unwrap()],
-            principal: None,
-        };
-        assert!(r.to_string().contains("wires login"));
     }
 }

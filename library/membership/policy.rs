@@ -3,13 +3,13 @@
 //! [`check_inclusion`] is the gate a host runs on a caller's [`Membership`]
 //! credential. Whether the member is *still* in is the admin-signed
 //! [`State`](crate::State)'s member set: removal is a new state that leaves
-//! the member out (`wires remove`), so there is no separate revocation list.
+//! the member out (`wires remove`).
 
 use crate::error::{Error, Result};
 use crate::identity::NodeId;
 use crate::membership::Membership;
 
-/// Decide whether a responder should accept `membership` from `caller` right now.
+/// Decide whether a host should accept `membership` from `caller` right now.
 ///
 /// Accepts iff the membership verifies under `fabric_root` (signature, version,
 /// algorithm, and the `fabric == fabric_root` pin), its `member` equals

@@ -748,7 +748,6 @@ mod tests {
             org: None,
             groups: vec![],
             not_after: 1_000,
-            claims: Default::default(),
         }
     }
 

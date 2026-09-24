@@ -46,8 +46,9 @@ pub enum Error {
         not_after: i64,
     },
 
-    /// The credential's subject (a membership's member, a proof's member) does
-    /// not match the authenticated caller.
+    /// The credential's subject does not match the node checking it: a
+    /// membership's member is not the authenticated caller, or an invite's
+    /// state does not name the invitee.
     #[error("credential subject does not match caller")]
     SubjectMismatch,
 

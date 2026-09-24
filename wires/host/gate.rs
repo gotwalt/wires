@@ -552,7 +552,6 @@ mod tests {
             org: None,
             groups: vec![],
             not_after: i64::MAX,
-            claims: Default::default(),
         }
     }
 

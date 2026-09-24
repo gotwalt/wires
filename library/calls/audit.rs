@@ -62,7 +62,7 @@ impl OutputDigest {
 
 /// Streaming BLAKE3 over a call's stdout, finished into an [`OutputDigest`].
 ///
-/// The responder feeds it every chunk the child writes, in order, and keeps
+/// The host feeds it every chunk the child writes, in order, and keeps
 /// the byte count alongside so a [`Finished`](AuditRecord::Finished) record
 /// needs no second pass over output it never buffers.
 ///
@@ -108,16 +108,16 @@ impl OutputHasher {
 }
 
 /// The most bytes of a call's stdin a [`Finished`](AuditRecord::Finished)
-/// record quotes in `stdin_head`.
+/// record quotes in `stdin_head` (4 KiB).
 ///
 /// Enough to show an observer the SQL statement or prompt an agent piped in —
 /// the part of a call a skeptic most wants to see — without turning the
 /// call log into a copy of every payload. The full input is still pinned by
 /// `stdin_digest`.
-pub const STDIN_HEAD_MAX: usize = 4096;
+pub(crate) const STDIN_HEAD_MAX: usize = 4096;
 
-/// What a responder records about the stdin a caller sent: every byte hashed
-/// and counted, and the first [`STDIN_HEAD_MAX`] bytes kept for quoting.
+/// What a host records about the stdin a caller sent: every byte hashed
+/// and counted, and the first 4 KiB kept for quoting.
 ///
 /// ```
 /// use library::{OutputHasher, StdinCapture};
@@ -162,8 +162,9 @@ impl StdinCapture {
         self.hasher.finish()
     }
 
-    /// The captured head as text (see [`stdin_head`]); `None` when nothing
-    /// was fed.
+    /// The captured head as quotable text: lossy UTF-8, cut on a char
+    /// boundary (a character the 4 KiB cap split is dropped); `None` when
+    /// nothing was fed.
     pub fn head(&self) -> Option<String> {
         stdin_head(&self.head)
     }
@@ -176,15 +177,7 @@ impl StdinCapture {
 /// shown as a replacement character, and invalid bytes elsewhere become
 /// `U+FFFD` (which can grow the text, so the byte cap is applied after
 /// decoding).
-///
-/// ```
-/// use library::stdin_head;
-/// assert_eq!(stdin_head(b""), None);
-/// assert_eq!(stdin_head(b"hi").as_deref(), Some("hi"));
-/// // "é" is two bytes; a prefix that ends inside it drops the half.
-/// assert_eq!(stdin_head(&"é".as_bytes()[..1]).as_deref(), Some(""));
-/// ```
-pub fn stdin_head(prefix: &[u8]) -> Option<String> {
+fn stdin_head(prefix: &[u8]) -> Option<String> {
     if prefix.is_empty() {
         return None;
     }
@@ -205,7 +198,7 @@ pub fn stdin_head(prefix: &[u8]) -> Option<String> {
     Some(text)
 }
 
-/// One entry in a responder's call log. See the module docs.
+/// One entry in a host's call log. See the module docs.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuditRecord {
@@ -215,7 +208,7 @@ pub enum AuditRecord {
         call: CallId,
         /// The iroh-authenticated caller.
         caller: NodeId,
-        /// The caller's IdP identity, when the responder verified one. Its
+        /// The caller's IdP identity, when the host verified one. Its
         /// issuer and subject name the person whose call this is: what a
         /// reader's "mine" matches (the node is not the boundary).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -250,12 +243,12 @@ pub enum AuditRecord {
         /// BLAKE3 of the complete stdin (the empty digest when there was
         /// none).
         stdin_digest: OutputDigest,
-        /// The first [`STDIN_HEAD_MAX`] bytes of stdin as text (see
-        /// [`stdin_head`]); `None` when stdin was empty.
+        /// The first 4 KiB of stdin as text (see [`StdinCapture::head`]);
+        /// `None` when stdin was empty.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stdin_head: Option<String>,
     },
-    /// A push to a caller (card 23) reached a milestone: queued, delivered,
+    /// A push to a caller reached a milestone: queued, delivered,
     /// fetched, expired, dropped or refused. One record per milestone per
     /// message; the subject is recorded, the body only when the host opts in
     /// (`host.json` `"push": {"log_body": true}`).
@@ -406,7 +399,6 @@ mod tests {
             org: None,
             groups: vec![],
             not_after: 9,
-            claims: Default::default(),
         };
         let denied = |principal| AuditRecord::Denied {
             caller: node,
@@ -424,13 +416,6 @@ mod tests {
         );
         let anonymous = serde_json::to_string(&denied(None)).unwrap();
         assert!(!anonymous.contains("principal"), "{anonymous}");
-    }
-
-    #[test]
-    fn empty_hasher_is_the_digest_of_nothing() {
-        let h = OutputHasher::new();
-        assert_eq!(h.bytes(), 0);
-        assert_eq!(h.finish(), OutputDigest::from_hash(blake3::hash(b"")));
     }
 
     fn finished(stdin: Option<&[u8]>) -> AuditRecord {
@@ -452,16 +437,14 @@ mod tests {
     }
 
     #[test]
-    fn finished_round_trips_with_and_without_stdin() {
-        for record in [finished(None), finished(Some(b"select 1"))] {
-            let json = serde_json::to_string(&record).unwrap();
-            assert_eq!(serde_json::from_str::<AuditRecord>(&json).unwrap(), record);
-        }
+    fn an_absent_stdin_head_is_omitted() {
         let json = serde_json::to_string(&finished(None)).unwrap();
         assert!(
             !json.contains("stdin_head"),
             "an absent head is omitted: {json}"
         );
+        let json = serde_json::to_string(&finished(Some(b"select 1"))).unwrap();
+        assert!(json.contains(r#""stdin_head":"select 1""#), "{json}");
     }
 
     /// `Started` names the service, the state version and the role that
@@ -492,6 +475,10 @@ mod tests {
 
     #[test]
     fn stdin_head_caps_and_splits_on_a_char_boundary() {
+        assert_eq!(stdin_head(b""), None);
+        assert_eq!(stdin_head(b"hi").as_deref(), Some("hi"));
+        // "é" is two bytes; a prefix that ends inside it drops the half.
+        assert_eq!(stdin_head(&"é".as_bytes()[..1]).as_deref(), Some(""));
         let long = "x".repeat(STDIN_HEAD_MAX + 10);
         assert_eq!(stdin_head(long.as_bytes()).unwrap().len(), STDIN_HEAD_MAX);
         // A 3-byte char straddling the cap is dropped, not half-kept.

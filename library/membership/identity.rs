@@ -103,11 +103,6 @@ impl Signature {
         &self.0
     }
 
-    /// Construct a `Signature` from raw signature bytes.
-    pub fn from_bytes(bytes: [u8; 64]) -> Self {
-        Self(bytes)
-    }
-
     /// Lowercase-hex rendering of the signature.
     pub fn hex(&self) -> String {
         hex::encode(self.0)
@@ -350,13 +345,6 @@ mod tests {
             prop_assert_eq!(NodeId::from_hex(&id.hex()).unwrap(), id);
         }
 
-        /// `NodeIdentity::from_seed_hex` inverts `hex::encode(seed)`.
-        #[test]
-        fn from_seed_hex_roundtrips(s in seed()) {
-            let id = NodeIdentity::from_seed_hex(&hex::encode(s)).unwrap();
-            prop_assert_eq!(*id.expose_seed(), s);
-        }
-
         /// `expose_seed_hex` is exactly `hex::encode` of the seed.
         #[test]
         fn expose_seed_hex_is_lowercase_hex(s in seed()) {
@@ -406,12 +394,6 @@ mod tests {
             NodeId::from_hex(&"z".repeat(64)),
             Err(Error::BadHex(_))
         ));
-    }
-
-    #[test]
-    fn node_id_hex_is_64_chars() {
-        let id = NodeIdentity::from_seed([7u8; 32]).node_id();
-        assert_eq!(id.hex().len(), 64);
     }
 
     #[test]

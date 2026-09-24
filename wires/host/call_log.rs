@@ -9,15 +9,14 @@
 //! only then may a call's child be spawned (see
 //! [`audit`](crate::host::audit)). A failed append is cut back off the file
 //! (to the last logged entry) before the next append, so a half-written line
-//! never ends up in the middle of the chain. Chosen over redb because:
+//! never ends up in the middle of the chain. A plain file fits because:
 //!
 //! - the data *is* an append-only sequence read front to back (a subscriber
 //!   asks for "everything after seq N"), which a file does natively;
 //! - the entries are self-verifying, so the store needs no transactional
 //!   integrity of its own: [`CallLog::open`] re-verifies the whole chain, and
 //!   a flipped byte anywhere is caught there (and by any reader);
-//! - it is inspectable with `jq`, and adds no dependency to a crate whose
-//!   dependency list is being cut down (card 25).
+//! - it is inspectable with `jq`, and needs no database dependency.
 //!
 //! A torn final line (a crash mid-append) is truncated on open with a warning:
 //! it was never fsync'd, so it was never logged. Anything else that doesn't

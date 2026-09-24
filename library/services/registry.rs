@@ -1,5 +1,5 @@
 //! The service registry: what callers address by name, who may call it, and
-//! which hosts implement it (card 27).
+//! which hosts implement it.
 //!
 //! A [`Service`] is an entry in the admin-signed [`State`](crate::State):
 //! only the admin binds a [`ServiceName`] to a host, which is what closes
@@ -90,7 +90,7 @@ pub struct Service {
     /// but not served anywhere yet.
     pub hosts: Vec<NodeId>,
     /// Roles whose members may read this service's call records besides the
-    /// caller's own (card 26b). Empty: only the host operator and each
+    /// caller's own. Empty: only the host operator and each
     /// caller for their own calls.
     pub readers: Vec<RoleName>,
 }

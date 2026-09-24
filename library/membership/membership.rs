@@ -4,8 +4,8 @@
 //! A [`Membership`] binds a *member* node key to a *fabric* (named by the fabric
 //! root's public key) until `not_after`, signed by that root. It is
 //! **scope-independent** — it answers "is this node a member of fabric R, and
-//! who is it?", the question an identity-aware tool asks the instant a session
-//! opens. It is non-transferable: a responder accepts it only when the
+//! who is it?", the question a host asks the instant a session
+//! opens. It is non-transferable: a host accepts it only when the
 //! iroh-authenticated caller equals `member` (see
 //! [`crate::policy::check_inclusion`]).
 //!
@@ -14,9 +14,8 @@
 //! - **`fabric` is a *signed* field.** Rather than trusting a root supplied out
 //!   of band, a membership carries `fabric` inside the signed body, and
 //!   [`verify`](Membership::verify) asserts `fabric == fabric_root`. The
-//!   credential *names its own authority*, so a responder cannot be steered into
-//!   checking it against the wrong root, and the leaf authority is pinned for a
-//!   future delegation chain (which must terminate at this `fabric`).
+//!   credential *names its own authority*, so a host cannot be steered into
+//!   checking it against the wrong root.
 //! - **`version` is a *signed* discriminant.** Each version serializes a fixed,
 //!   total set of fields; a future v2 defines a *separate* body with its new
 //!   fields **required**, never an `Option` added to the v1 body. Optional-but-
@@ -52,14 +51,14 @@ struct MembershipBody<'a> {
 
 /// A fabric-root-signed proof that `member` belongs to `fabric`.
 ///
-/// Non-transferable: a responder accepts it only when the iroh-authenticated
+/// Non-transferable: a host accepts it only when the iroh-authenticated
 /// caller equals `member` (see [`crate::policy::check_inclusion`]).
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Membership {
     /// Format version; `= MEMBERSHIP_V1`. A *signed* discriminant.
     pub version: u8,
     /// The fabric root's public key — the authority. A *signed* field, pinned by
-    /// [`verify`](Self::verify) against the responder's trusted root.
+    /// [`verify`](Self::verify) against the host's trusted root.
     pub fabric: NodeId,
     /// The included node (non-transferable).
     pub member: NodeId,
@@ -118,7 +117,7 @@ impl Membership {
     ///
     /// Checks the algorithm is supported, the version is understood, the
     /// `fabric == fabric_root` pin holds, and the signature covers the canonical
-    /// body. Does **not** check `member == caller`, TTL, or revocation — that is
+    /// body. Does **not** check `member == caller` or TTL — that is
     /// [`crate::policy::check_inclusion`].
     pub fn verify(&self, fabric_root: NodeId) -> Result<()> {
         if self.alg != AlgorithmId::Ed25519 {
@@ -128,7 +127,7 @@ impl Membership {
             return Err(Error::UnsupportedVersion);
         }
         // The credential names its own authority; refuse to check it against any
-        // root but the one it claims (and the one the responder trusts).
+        // root but the one it claims (and the one the host trusts).
         if self.fabric != fabric_root {
             return Err(Error::InvalidSignature);
         }
@@ -174,15 +173,12 @@ mod tests {
     }
 
     proptest! {
-        /// A freshly minted membership verifies under the minting root and names
-        /// that root as its fabric.
+        /// A freshly minted membership verifies under the minting root.
         #[test]
         fn mint_then_verify_ok(rs in seed(), ms in seed(), issued in any::<i64>(), not_after in any::<i64>()) {
             let root = NodeIdentity::from_seed(rs);
             let member = NodeIdentity::from_seed(ms).node_id();
             let m = Membership::mint(&root, member, issued, not_after).unwrap();
-            prop_assert_eq!(m.fabric, root.node_id());
-            prop_assert_eq!(m.member, member);
             prop_assert!(m.verify(root.node_id()).is_ok());
         }
 

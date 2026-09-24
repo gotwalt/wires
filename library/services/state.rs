@@ -1,6 +1,6 @@
 //! The admin-signed state: one versioned, root-signed document that says who
 //! is in, which members are hosts, what the roles are, and which services
-//! exist (card 27).
+//! exist.
 //!
 //! [`State`] is the content; [`SignedState`] is that content plus the root's
 //! signature. It is the thing every node holds: `wires join` installs it,
@@ -223,15 +223,13 @@ impl State {
 }
 
 impl SignedState {
-    /// Verify it was signed by `root` for that fabric: algorithm, format, the
-    /// `fabric == root` pin, the signature, then [`State::validate`]. Does not
-    /// check freshness ([`check_fresh`](Self::check_fresh)).
+    /// Verify it was signed by `root` for that fabric: algorithm, the
+    /// `fabric == root` pin, the signature, then [`State::validate`] (which
+    /// checks the format). Does not check freshness
+    /// ([`check_fresh`](Self::check_fresh)).
     pub fn verify(&self, root: NodeId) -> Result<()> {
         if self.alg != AlgorithmId::Ed25519 {
             return Err(Error::UnsupportedAlgorithm);
-        }
-        if self.state.format != STATE_V1 {
-            return Err(Error::UnsupportedVersion);
         }
         if self.state.fabric != root {
             return Err(Error::InvalidSignature);
@@ -363,51 +361,66 @@ mod tests {
         ));
     }
 
+    /// The rule `validate` says `s` breaks.
+    fn broken_rule(s: &State) -> String {
+        match s.validate() {
+            Err(Error::InvalidState(why)) => why,
+            other => panic!("expected InvalidState, got {other:?}"),
+        }
+    }
+
     #[test]
     fn validation_rules() {
+        sample().validate().unwrap();
+
         let mut s = sample();
         s.hosts.insert(node(8));
         assert!(matches!(s.sign(&root()), Err(Error::InvalidState(_))));
+        assert!(broken_rule(&s).ends_with("is not a member"));
 
         let mut s = sample();
         s.roles.insert(RoleName::new("x").unwrap(), vec![]);
-        assert!(s.validate().is_err(), "a role with no matchers");
+        assert_eq!(broken_rule(&s), "role x has no matchers");
 
         let mut s = sample();
         s.roles
             .insert(RoleName::new("x").unwrap(), vec![Matcher::new(" ")]);
-        assert!(s.validate().is_err(), "a matcher with no issuer");
-
-        // `member` is not built in: undefined, it is an unknown role ...
-        let member = RoleName::new("member").unwrap();
-        let mut s = sample();
-        s.services
-            .values_mut()
-            .for_each(|svc| svc.allow = vec![member.clone()]);
-        assert!(s.validate().is_err(), "`member` is not built in");
-        // ... and defined, an ordinary one.
-        s.roles
-            .insert(member, vec![Matcher::new("https://idp.example")]);
-        s.validate().unwrap();
+        assert_eq!(broken_rule(&s), "role x has a matcher with no issuer");
 
         let mut s = sample();
         s.services.values_mut().for_each(|svc| {
             svc.allow = vec![RoleName::new("ghost").unwrap()];
         });
-        assert!(s.validate().is_err());
+        assert_eq!(
+            broken_rule(&s),
+            "service orders-db names undefined role ghost"
+        );
+
+        let mut s = sample();
+        s.services.values_mut().for_each(|svc| {
+            svc.readers = vec![RoleName::new("ghost").unwrap()];
+        });
+        assert_eq!(
+            broken_rule(&s),
+            "service orders-db names undefined role ghost"
+        );
 
         let mut s = sample();
         s.services
             .values_mut()
             .for_each(|svc| svc.hosts = vec![node(2)]); // a member, not a host
-        assert!(s.validate().is_err());
+        assert!(broken_rule(&s).ends_with("is not a host"));
 
         let mut s = sample();
         s.services.values_mut().for_each(|svc| {
             let h = svc.hosts[0];
             svc.hosts.push(h);
         });
-        assert!(s.validate().is_err());
+        assert!(broken_rule(&s).contains("twice"));
+
+        let mut s = sample();
+        s.format = STATE_V1 + 1;
+        assert!(matches!(s.validate(), Err(Error::UnsupportedVersion)));
     }
 
     #[test]

@@ -22,8 +22,9 @@ pub const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose:
 
 /// Serialize `value` to canonical JSON bytes (sorted keys, compact).
 ///
-/// This is the exact byte string that gets signed (memberships, heads) or
-/// base64-encoded (tokens); both producer and verifier must agree on it byte-for-byte.
+/// This is the exact byte string that gets signed (memberships, signed states)
+/// or base64-encoded (tokens); both producer and verifier must agree on it
+/// byte-for-byte.
 ///
 /// Routing through `serde_json::Value` is what canonicalizes: `serde_json`'s
 /// object map is a `BTreeMap` (no `preserve_order` feature), so keys come out
@@ -111,11 +112,34 @@ pub(crate) use hex_id;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+
+    /// Fields declared out of key order, so a serializer that kept
+    /// declaration order would emit `b` before `a` (and `y` before `x`).
+    #[derive(Serialize)]
+    struct Outer {
+        b: u8,
+        a: u8,
+        nested: Inner,
+    }
+
+    #[derive(Serialize)]
+    struct Inner {
+        y: u8,
+        x: u8,
+    }
 
     #[test]
     fn sorts_keys_and_is_compact() {
-        let v = json!({"b": 1, "a": 2, "nested": {"y": 1, "x": 2}});
+        let v = Outer {
+            b: 1,
+            a: 2,
+            nested: Inner { y: 1, x: 2 },
+        };
+        // Plain serde keeps declaration order; canonicalizing must not.
+        assert_eq!(
+            serde_json::to_vec(&v).unwrap(),
+            br#"{"b":1,"a":2,"nested":{"y":1,"x":2}}"#.to_vec()
+        );
         assert_eq!(
             canonical_bytes(&v).unwrap(),
             br#"{"a":2,"b":1,"nested":{"x":2,"y":1}}"#.to_vec()
@@ -135,9 +159,16 @@ mod tests {
     }
 
     #[test]
-    fn invariant_to_input_key_order() {
-        let a = json!({"x": 1, "y": 2});
-        let b = json!({"y": 2, "x": 1});
-        assert_eq!(canonical_bytes(&a).unwrap(), canonical_bytes(&b).unwrap());
+    fn invariant_to_input_map_order() {
+        // A HashMap iterates in an arbitrary order; a map built in the
+        // reverse order must still encode to the same bytes.
+        let forward: std::collections::HashMap<String, u32> =
+            (0..64).map(|i| (format!("k{i}"), i)).collect();
+        let reverse: std::collections::HashMap<String, u32> =
+            (0..64).rev().map(|i| (format!("k{i}"), i)).collect();
+        let bytes = canonical_bytes(&forward).unwrap();
+        assert_eq!(bytes, canonical_bytes(&reverse).unwrap());
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with(r#"{"k0":0,"k1":1,"k10":10,"#), "{text}");
     }
 }

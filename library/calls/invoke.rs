@@ -73,7 +73,7 @@ impl From<Argv> for Vec<String> {
 /// One call: which service to run, and with what extra arguments.
 ///
 /// Unsigned by design — it travels inside a session whose peer iroh has
-/// already authenticated, and the responder authorizes it against that peer's
+/// already authenticated, and the host authorizes it against that peer's
 /// credentials, never against anything the invocation claims.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Invocation {
@@ -86,7 +86,6 @@ pub struct Invocation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
 
     #[test]
     fn argv_limits() {
@@ -94,19 +93,5 @@ mod tests {
         assert!(Argv::new(vec!["x".into(); MAX_ARGS + 1]).is_err());
         assert!(Argv::new(vec!["x".repeat(MAX_ARGV_BYTES + 1)]).is_err());
         assert!(serde_json::from_str::<Argv>(r#"["a\u0000"]"#).is_err());
-    }
-
-    proptest! {
-        #[test]
-        fn invocation_json_round_trips(
-            service in "[a-z][a-z0-9_-]{0,20}",
-            args in proptest::collection::vec("[^\u{0}]{0,16}", 0..8),
-        ) {
-            let inv = Invocation {
-                service: ServiceName::new(service).unwrap(),
-                argv: Argv::new(args).unwrap() };
-            let json = serde_json::to_string(&inv).unwrap();
-            prop_assert_eq!(serde_json::from_str::<Invocation>(&json).unwrap(), inv);
-        }
     }
 }

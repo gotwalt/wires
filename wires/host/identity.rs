@@ -222,7 +222,6 @@ mod tests {
             org: None,
             groups: vec![],
             not_after,
-            claims: Default::default(),
         }
     }
 

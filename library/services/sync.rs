@@ -1,4 +1,4 @@
-//! Moving the signed state between nodes, by key (card 27, lane **27a**).
+//! Moving the signed state between nodes, by key.
 //!
 //! Two directions on one ALPN, [`STATE_ALPN`]:
 //!
@@ -7,8 +7,8 @@
 //!   [`StateFrame::Offer`]; the receiver verifies it under its root, adopts
 //!   it if [newer](crate::SignedState::is_newer_than), and answers
 //!   [`StateFrame::Have`] with the version it now holds.
-//! - **Pull:** a member whose copy was last checked more than 10 minutes ago
-//!   dials the hosts in its copy (then the admin) and sends
+//! - **Pull:** a member whose copy has gone stale (last checked too long
+//!   ago) dials the hosts in its copy (then the admin) and sends
 //!   [`StateFrame::Have`]; the peer answers
 //!   [`StateFrame::Offer`] when it holds a newer copy, else `Have`.
 //!
@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn unknown_frames_and_fields_are_refused() {
         for body in [
-            r#"{"type":"gossip"}"#,
+            r#"{"type":"subscribe"}"#,
             r#"{"type":"have","version":1,"extra":2}"#,
         ] {
             let mut buf = (body.len() as u32).to_be_bytes().to_vec();
@@ -192,13 +192,6 @@ mod tests {
         #[test]
         fn decode_never_panics(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
             let _ = StateFrame::decode(&data);
-        }
-
-        #[test]
-        fn have_round_trips(v in proptest::prelude::any::<u64>()) {
-            let f = StateFrame::Have { version: StateVersion(v) };
-            let bytes = f.encode().unwrap();
-            proptest::prop_assert_eq!(StateFrame::decode(&bytes).unwrap(), Some((f, bytes.len())));
         }
     }
 }

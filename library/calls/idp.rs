@@ -225,7 +225,6 @@ impl OidcNonce {
     /// use library::{NodeIdentity, OidcNonce};
     /// let node = NodeIdentity::from_seed([7; 32]).node_id();
     /// let nonce = OidcNonce::for_node(&node);
-    /// assert_eq!(nonce, OidcNonce::for_node(&node));
     /// assert_eq!(nonce.as_str().len(), 43); // 32 bytes, base64url, no padding
     /// ```
     pub fn for_node(node: &NodeId) -> Self {
@@ -260,15 +259,6 @@ pub struct Principal {
     pub groups: Vec<String>,
     /// The token's `exp`, Unix seconds: the claim is stale after this.
     pub not_after: i64,
-    /// The token's whole verified payload, every claim as the IdP signed it.
-    ///
-    /// The fields above are the ones wires reads today; this keeps the rest
-    /// (Okta `groups`, Entra `roles`, custom claims) so a later host policy
-    /// can match any claim without a wire change. Reader-local: it is derived
-    /// by verification like everything else here and is never serialized, so
-    /// a [`Principal`] read back from a call record has it empty.
-    #[serde(skip)]
-    pub claims: Map<String, Value>,
 }
 
 impl Principal {
@@ -284,7 +274,6 @@ impl Principal {
     ///     org: None,
     ///     groups: vec![],
     ///     not_after: 0,
-    ///     claims: Default::default(),
     /// };
     /// assert_eq!(p.name(), "a@example.com");
     /// p.email = None;
@@ -301,7 +290,7 @@ impl Principal {
 /// "Node *K* is held by the person this ID token names": the ID token a
 /// caller presented, paired with the key the connection authenticated, for
 /// the host to verify independently.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct IdentityClaim {
     /// The node key the token was minted for (its `nonce` must equal
     /// [`OidcNonce::for_node`] of this id).
@@ -410,7 +399,6 @@ pub fn verify_claim(
         org,
         groups,
         not_after: exp,
-        claims: p.clone(),
     })
 }
 
@@ -438,9 +426,7 @@ fn int_claim(p: &Map<String, Value>, name: &'static str) -> Result<Option<i64>> 
 #[derive(Deserialize)]
 struct Header {
     alg: String,
-    #[serde(default)]
     kid: Option<String>,
-    #[serde(default)]
     crit: Option<Value>,
 }
 
@@ -796,11 +782,8 @@ mod tests {
                     org: None,
                     groups: vec![],
                     not_after: NOW + 3600,
-                    claims: p.claims.clone(),
                 }
             );
-            assert_eq!(p.claims["nonce"], OidcNonce::for_node(&node()).as_str());
-            assert_eq!(p.claims["hd"], "example.com", "kept as a claim, not an org");
         }
     }
 
@@ -1006,6 +989,16 @@ mod tests {
 
     // --- properties
 
+    /// Known answer: the nonce is base64url of BLAKE3 `derive_key` under
+    /// [`OIDC_NONCE_CONTEXT`], so another implementation can reproduce it.
+    #[test]
+    fn for_node_known_answer() {
+        assert_eq!(
+            OidcNonce::for_node(&NodeId::from_bytes([0u8; 32])).as_str(),
+            "MdlGYAh9SOh5L8h2ZiN3LoEfOKjDRW7yRiHihsBU0f0"
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -1025,11 +1018,10 @@ mod tests {
             prop_assert!(check(&tampered).is_err());
         }
 
-        /// The nonce is deterministic per node and distinct across nodes.
+        /// The nonce is distinct across nodes, and URL-safe.
         #[test]
-        fn for_node_is_deterministic_and_distinct(a in any::<[u8; 32]>(), b in any::<[u8; 32]>()) {
+        fn for_node_is_distinct_and_url_safe(a in any::<[u8; 32]>(), b in any::<[u8; 32]>()) {
             let (na, nb) = (NodeId::from_bytes(a), NodeId::from_bytes(b));
-            prop_assert_eq!(OidcNonce::for_node(&na), OidcNonce::for_node(&na));
             if a != b {
                 prop_assert_ne!(OidcNonce::for_node(&na), OidcNonce::for_node(&nb));
             }

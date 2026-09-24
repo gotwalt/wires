@@ -1,5 +1,5 @@
 //! The host's own call log: every [`AuditRecord`] a host writes, signed by the
-//! host's node key and hash-linked to the one before it (card 26a).
+//! host's node key and hash-linked to the one before it.
 //!
 //! A host appends each record it produces to a local, append-only log. Each
 //! [`LogEntry`] carries:
@@ -17,7 +17,7 @@
 //! two different entries for one slot ([`ChainBreak::Fork`]).
 //!
 //! **What this does not prove.** A host can still withhold or truncate its own
-//! history (records are not replicated at write time; see card 22). Rewrites
+//! history (records are not replicated at write time). Rewrites
 //! are detectable only against a copy someone already holds — a subscriber's
 //! [`ChainPoint`] or an OTel export — which is why [`verify_chain`] takes the
 //! reader's last known point.
@@ -188,10 +188,8 @@ fn signing_bytes(
 
 impl LogEntry {
     /// Sign `record` as entry `seq` of `host`'s log, linked to `prev`.
-    ///
-    /// Prefer [`LogEntry::next`], which derives `seq` and `prev` from the
-    /// log's tip.
-    pub fn sign(
+    /// [`LogEntry::next`] derives `seq` and `prev` from the log's tip.
+    fn sign(
         host: &NodeIdentity,
         seq: LogSeq,
         prev: EntryHash,
@@ -374,15 +372,10 @@ pub fn verify_chain(
         if entry.host != host {
             return Err(ChainBreak::WrongHost { seq });
         }
-        if entry.v != CALL_LOG_V1 {
-            return Err(ChainBreak::BadSignature { seq });
-        }
-        let bytes = entry
-            .signing_bytes()
-            .map_err(|_| ChainBreak::Malformed { seq })?;
-        if host.verify(&bytes, &entry.sig).is_err() {
-            return Err(ChainBreak::BadSignature { seq });
-        }
+        entry.verify().map_err(|e| match e {
+            Error::UnsupportedVersion | Error::InvalidSignature => ChainBreak::BadSignature { seq },
+            _ => ChainBreak::Malformed { seq },
+        })?;
         let hash = entry.hash().map_err(|_| ChainBreak::Malformed { seq })?;
         match tip {
             None => {
@@ -424,10 +417,8 @@ pub fn verify_chain(
 /// How long a host keeps log entries. Default: 30 days.
 ///
 /// ```
-/// use std::time::Duration;
 /// use library::Retention;
 /// let r = Retention::default();
-/// assert_eq!(r.max_age(), Duration::from_secs(30 * 24 * 3600));
 /// let day_ms = 24 * 3600 * 1000;
 /// assert!(r.keeps(40 * day_ms, 40 * day_ms - 29 * day_ms));
 /// assert!(!r.keeps(40 * day_ms, 40 * day_ms - 31 * day_ms));
@@ -437,16 +428,11 @@ pub struct Retention(Duration);
 
 impl Retention {
     /// The default retention, in days.
-    pub const DEFAULT_DAYS: u64 = 30;
+    const DEFAULT_DAYS: u64 = 30;
 
     /// Keep entries for `max_age`.
     pub fn new(max_age: Duration) -> Self {
         Self(max_age)
-    }
-
-    /// How long entries are kept.
-    pub fn max_age(&self) -> Duration {
-        self.0
     }
 
     /// Whether an entry logged at `at_ms` is still kept at `now_ms`.
