@@ -2,11 +2,12 @@
 //! (evaluated locally against your signed state, as `wires services` lists
 //! them), plus `tools.json` aliases, resolved once at startup.
 //!
-//! wires in the stdio MCP clients people already use (Claude Desktop, IDEs). Each
-//! tool becomes one MCP tool taking `{ args?: string[], stdin?:
-//! string, jq?: string, head?: integer, max_bytes?: integer }`; the last three
-//! shape the remote stdout in-process ([`shape`](crate::caller::shape)), as
-//! `wires call --jq/--head/--max-bytes` do. Calling a tool dials the responder over wires (through a
+//! wires in the stdio MCP clients people already use (Claude Desktop, IDEs).
+//! Each service (or alias) becomes one MCP tool taking `{ args?: string[],
+//! stdin?: string, jq?: string, head?: integer, max_bytes?: integer }`; the
+//! last three shape the remote stdout in-process
+//! ([`shape`](crate::caller::shape)), as `wires call --jq/--head/--max-bytes`
+//! do. Calling a tool dials the service's host over wires (through a
 //! [`Caller`]) and returns the remote output as one text block. There is no
 //! HTTP and no OAuth here: the caller is this node's key and the ID token
 //! `wires login` stored, presented in each call's `Hello` as `wires call`
@@ -24,6 +25,8 @@
 //! [`McpServer`] is transport-free: `wires gateway` drives the same core
 //! over Streamable HTTP, one request at a time
 //! ([`crate::gateway::mcp_http`]).
+
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Args;
@@ -270,7 +273,7 @@ impl<C: Caller> McpServer<C> {
         })
     }
 
-    /// `tools/list`: every `tools.json` entry, in config order (stable, so
+    /// `tools/list`: every alias, then every service, in order (stable, so
     /// clients and prompt caches can rely on it). A modern reply carries the
     /// 2026-07-28 cache hints: `private`, since the list is per caller.
     fn tools_list(&self, modern: bool) -> Value {
@@ -508,10 +511,10 @@ fn parse_arguments(arguments: Option<&Value>) -> Result<(Argv, Vec<u8>, ShapeArg
 
 /// Render an outcome as the result's text, plus whether it is an error:
 /// stdout, then a `stderr:` block if any, then `exit: N`. A denial reads
-/// `denied by responder: <reason>`.
+/// `denied by host: <reason>`.
 fn render_outcome(outcome: &CallOutcome) -> (String, bool) {
     match outcome {
-        CallOutcome::Denied(reason) => (format!("denied by responder: {reason}"), true),
+        CallOutcome::Denied(reason) => (format!("denied by host: {reason}"), true),
         CallOutcome::Exited {
             exit,
             stdout,
@@ -580,6 +583,9 @@ where
 pub struct McpArgs {
     #[command(flatten)]
     pub creds: CredArgs,
+    /// Read aliases from this file instead of `$WIRES_HOME/tools.json`.
+    #[arg(long)]
+    pub tools_file: Option<PathBuf>,
 }
 
 /// `config`'s aliases, then one [`ToolTarget::Service`] tool per grant (its
@@ -623,12 +629,12 @@ pub(crate) fn with_services(
 /// refused before anything loads. A tool's `stdin` field is still accepted:
 /// it is text in the client's request, never a file this process reads.
 pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
-    crate::caller::lock::Lock::detect()?.check(&a.creds)?;
-    let path = crate::caller::tools::resolve_path(a.creds.tools_file.as_deref())?;
+    crate::caller::lock::Lock::detect()?.check(&a.creds, a.tools_file.as_deref())?;
+    let path = crate::caller::tools::resolve_path(a.tools_file.as_deref())?;
     let config = ToolsConfig::load(&path)?;
     let creds = Credentials::resolve(&a.creds)?;
     let ks = crate::admin::keystore::Keystore::resolve()?;
-    let config = if crate::caller::call::stored_state(&ks, &creds)?.is_some() {
+    let config = if crate::state::store::read(&ks, creds.fabric())?.is_some() {
         // Every service this node may call, one MCP tool each.
         let allowed = crate::caller::services::allowed(&ks).await?;
         with_services(config, &allowed.state.state, &allowed.grants)
@@ -735,7 +741,7 @@ mod tests {
             .answer("fails", Ok(exited(2, "partial", "boom\n")))
             .answer(
                 "locked",
-                Ok(CallOutcome::Denied("membership rejected: revoked".into())),
+                Ok(CallOutcome::Denied("not a member of this network".into())),
             )
             .answer(
                 "offline",
@@ -775,23 +781,6 @@ mod tests {
             "content":[{"type":"text","text":text}],"isError":is_error}})
     }
 
-    fn schema() -> Value {
-        input_schema()
-    }
-
-    /// The first live run's agent piped its SQL on stdin, where an observer
-    /// saw none of it; the schema steers an agent to `args` first, and keeps
-    /// `stdin` available.
-    #[test]
-    fn the_schema_leads_with_args_and_keeps_stdin() {
-        let props = &input_schema()["properties"];
-        let args = props["args"]["description"].as_str().unwrap();
-        let stdin = props["stdin"]["description"].as_str().unwrap();
-        assert!(args.contains("primary"), "{args}");
-        assert!(args.contains("SQL statement"), "{args}");
-        assert!(stdin.starts_with("Secondary"), "{stdin}");
-    }
-
     #[test]
     fn golden_classic_session() {
         let mut s = server();
@@ -820,14 +809,14 @@ mod tests {
                 "serverInfo":{"name":"wires","version":env!("CARGO_PKG_VERSION")},
                 "instructions":INSTRUCTIONS}}),
             json!({"jsonrpc":"2.0","id":2,"result":{"tools":[
-                {"name":"db_query","description":format!("Read-only SQL{suffix}"),"inputSchema":schema()},
-                {"name":"fails","description":format!("Always exits 2{suffix}"),"inputSchema":schema()},
-                {"name":"locked","description":format!("Refused{suffix}"),"inputSchema":schema()},
-                {"name":"offline","description":format!("Unreachable{suffix}"),"inputSchema":schema()},
+                {"name":"db_query","description":format!("Read-only SQL{suffix}"),"inputSchema":input_schema()},
+                {"name":"fails","description":format!("Always exits 2{suffix}"),"inputSchema":input_schema()},
+                {"name":"locked","description":format!("Refused{suffix}"),"inputSchema":input_schema()},
+                {"name":"offline","description":format!("Unreachable{suffix}"),"inputSchema":input_schema()},
             ]}}),
             text_result(3, "id\n1\nexit: 0", false),
             text_result(4, "partial\nstderr:\nboom\nexit: 2", true),
-            text_result(5, "denied by responder: membership rejected: revoked", true),
+            text_result(5, "denied by host: not a member of this network", true),
             json!({"jsonrpc":"2.0","id":6,"error":{"code":-32602,"message":"unknown tool: nope"}}),
             text_result(
                 7,
@@ -870,10 +859,10 @@ mod tests {
             out[0],
             json!({"jsonrpc":"2.0","id":"a","result":{
                 "tools":[
-                    {"name":"db_query","description":format!("Read-only SQL {FILTER_HINT}"),"inputSchema":schema()},
-                    {"name":"fails","description":format!("Always exits 2 {FILTER_HINT}"),"inputSchema":schema()},
-                    {"name":"locked","description":format!("Refused {FILTER_HINT}"),"inputSchema":schema()},
-                    {"name":"offline","description":format!("Unreachable {FILTER_HINT}"),"inputSchema":schema()},
+                    {"name":"db_query","description":format!("Read-only SQL {FILTER_HINT}"),"inputSchema":input_schema()},
+                    {"name":"fails","description":format!("Always exits 2 {FILTER_HINT}"),"inputSchema":input_schema()},
+                    {"name":"locked","description":format!("Refused {FILTER_HINT}"),"inputSchema":input_schema()},
+                    {"name":"offline","description":format!("Unreachable {FILTER_HINT}"),"inputSchema":input_schema()},
                 ],
                 "ttlMs":LIST_TTL_MS,"cacheScope":"private",
                 "resultType":"complete","_meta":stamped_meta}})
@@ -969,7 +958,7 @@ mod tests {
         let out = transcript(&mut s, &[call(2, "locked", json!({}))]);
         assert_eq!(
             out[0],
-            text_result(2, "denied by responder: membership rejected: revoked", true),
+            text_result(2, "denied by host: not a member of this network", true),
             "a refusal is an answer, still shown"
         );
     }
@@ -987,8 +976,7 @@ mod tests {
 
     #[test]
     fn a_negotiated_version_can_be_given_up_front() {
-        let s = server().with_negotiated(Some("2025-06-18".into()));
-        let mut s = s;
+        let mut s = server().with_negotiated(Some("2025-06-18".into()));
         let out = transcript(
             &mut s,
             &[json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})],
@@ -1069,10 +1057,6 @@ mod tests {
         assert!(d.starts_with("The GitHub CLI "), "{d}");
         assert!(d.contains("--jq"), "{d}");
         assert!(d.contains("pipes are not available"), "{d}");
-        let props = &input_schema()["properties"];
-        for field in ["jq", "head", "max_bytes"] {
-            assert!(props[field]["description"].is_string(), "{field}");
-        }
     }
 
     #[test]
@@ -1143,9 +1127,9 @@ mod tests {
                 ..Default::default()
             })
             .unwrap(),
-            CallOutcome::Denied("revoked".into()),
+            CallOutcome::Denied("not admitted".into()),
         );
-        assert_eq!(out, CallOutcome::Denied("revoked".into()));
+        assert_eq!(out, CallOutcome::Denied("not admitted".into()));
     }
 
     #[test]

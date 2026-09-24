@@ -24,7 +24,7 @@
 //! [`MIN_TTL`]..=[`MAX_TTL`] ([`DEFAULT_TTL`] when absent). A token whose
 //! `kid` is not in the cached set triggers **one** refetch (keys rotate), at
 //! most once per [`MIN_TTL`] per issuer so a stream of bogus `kid`s cannot turn
-//! an observer into a request amplifier.
+//! the verifier into a request amplifier.
 //!
 //! **HTTPS only**, with one exception: plain `http` to a loopback host
 //! (`127.0.0.1`, `::1`, `localhost`) — which is how the hermetic mock issuer
@@ -41,6 +41,8 @@ use library::{Audience, IdTokenError, IdentityClaim, Issuer, Jwks, Principal, ve
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+/// The key-cache directory under `$WIRES_HOME`.
+pub(crate) const JWKS_DIR: &str = "jwks";
 /// TTL used when the JWKS response carries no `max-age`.
 pub(crate) const DEFAULT_TTL: i64 = 3600;
 /// Shortest cache lifetime honored (and the minimum gap between forced
@@ -387,7 +389,13 @@ pub(crate) fn http_client() -> Result<reqwest::Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::caller::mock_idp::MockIdp;
+    use library::{NodeId, NodeIdentity, OidcNonce};
     use proptest::prelude::*;
+
+    fn node() -> NodeId {
+        NodeIdentity::from_seed([4; 32]).node_id()
+    }
 
     #[test]
     fn only_https_or_loopback_http_is_allowed() {
@@ -484,5 +492,103 @@ mod tests {
         });
         let b = KeyFetcher::new(Some(dir.path().to_path_buf())).unwrap();
         assert_eq!(b.cached(&issuer, 1_000), None);
+    }
+
+    /// Keys rotate: a token signed under a `kid` the cache has never seen
+    /// triggers exactly one refetch, and the on-disk cache serves a restarted
+    /// reader without any fetch.
+    #[tokio::test]
+    async fn an_unknown_kid_refetches_and_the_disk_cache_serves_restarts() {
+        let idp = MockIdp::start("alice@example.com").await;
+        let dir = crate::testutil::ScratchDir::new("jwk");
+        let cache = Some(dir.path().to_path_buf());
+        let now = crate::clock::now_unix();
+        let aud = [Audience::new(idp.client_id.clone())];
+        let iss = [idp.issuer.clone()];
+
+        let fetcher = KeyFetcher::new(cache.clone()).unwrap();
+        let claim = IdentityClaim {
+            node: node(),
+            id_token: idp.mint(&OidcNonce::for_node(&node()), now + 600),
+        };
+        fetcher.verify(&claim, &iss, &aud, now).await.unwrap();
+        assert_eq!(idp.jwks_fetches(), 1);
+
+        // A restarted reader: served from disk.
+        let restarted = KeyFetcher::new(cache.clone()).unwrap();
+        restarted.verify(&claim, &iss, &aud, now).await.unwrap();
+        assert_eq!(idp.jwks_fetches(), 1);
+
+        // Rotation: a new kid forces one refetch, then verifies.
+        idp.rotate_key();
+        let rotated = IdentityClaim {
+            node: node(),
+            id_token: idp.mint(&OidcNonce::for_node(&node()), now + 600),
+        };
+        restarted.verify(&rotated, &iss, &aud, now).await.unwrap();
+        assert_eq!(idp.jwks_fetches(), 2);
+
+        // A bogus kid right after is not an amplifier: no further fetch.
+        idp.rotate_key();
+        let bogus = IdentityClaim {
+            node: node(),
+            id_token: idp.mint(&OidcNonce::for_node(&node()), now + 600),
+        };
+        let err = restarted.verify(&bogus, &iss, &aud, now).await.unwrap_err();
+        assert!(matches!(
+            err,
+            VerifyError::Rejected(IdTokenError::UnknownKey { .. })
+        ));
+        assert_eq!(idp.jwks_fetches(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_expired_claim_still_names_its_principal() {
+        let idp = MockIdp::start("alice@example.com").await;
+        let fetcher = KeyFetcher::new(None).unwrap();
+        let now = crate::clock::now_unix();
+        let stale = IdentityClaim {
+            node: node(),
+            id_token: idp.mint(&OidcNonce::for_node(&node()), now - 3600),
+        };
+        let err = fetcher
+            .verify(
+                &stale,
+                std::slice::from_ref(&idp.issuer),
+                &[Audience::new(idp.client_id.clone())],
+                now,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            VerifyError::Expired(p) => {
+                assert_eq!(p.email.as_deref(), Some("alice@example.com"))
+            }
+            other => panic!("expected Expired, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_issuer_is_never_fetched() {
+        let idp = MockIdp::start("alice@example.com").await;
+        let fetcher = KeyFetcher::new(None).unwrap();
+        let claim = IdentityClaim {
+            node: node(),
+            id_token: idp.mint(
+                &OidcNonce::for_node(&node()),
+                crate::clock::now_unix() + 600,
+            ),
+        };
+        let err = fetcher
+            .verify(
+                &claim,
+                &[Issuer::new("https://accounts.google.com")],
+                &[Audience::new(idp.client_id.clone())],
+                crate::clock::now_unix(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VerifyError::Untrusted(_)));
+        assert_eq!(idp.jwks_fetches(), 0);
     }
 }

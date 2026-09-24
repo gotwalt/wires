@@ -357,7 +357,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn tokens_and_codes_are_distinct_and_unguessable(n in 2usize..20) {
+        fn issued_tokens_are_long_and_never_repeat(n in 2usize..20) {
             let store = Store::open(None, NOW).unwrap();
             let mut seen = std::collections::HashSet::new();
             for _ in 0..n {

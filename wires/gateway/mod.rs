@@ -41,7 +41,7 @@ use clap::Args;
 use library::{Grant, IdToken, NodeId, Principal, State, role_admits};
 use url::Url;
 
-use crate::admin::keystore::{self, Keystore};
+use crate::admin::keystore::Keystore;
 use crate::caller::call::{CredArgs, Credentials};
 use crate::caller::jwks::KeyFetcher;
 use crate::caller::login::{DEFAULT_ISSUER, OidcClient, random_token, save_secret};
@@ -156,30 +156,27 @@ pub(crate) trait Backend: Send + Sync + 'static {
     fn caller(&self, token: IdToken) -> Self::Caller;
 }
 
-/// The production [`Backend`]: this node's keystore, and one long-lived
-/// endpoint every web user's calls dial from (one node key, one endpoint:
-/// not one per call contending for the same relay slot).
+/// The production [`Backend`]: this node's keystore and credentials, and
+/// one long-lived endpoint every web user's calls dial from (one node key,
+/// one endpoint: not one per call contending for the same relay slot).
 pub(crate) struct Keystored {
-    ks: Keystore,
-    fabric: NodeId,
+    ks: Arc<Keystore>,
+    creds: Credentials,
     endpoint: iroh::Endpoint,
-    relay_url: Option<String>,
 }
 
 impl Backend for Keystored {
     type Caller = PresentingCaller;
 
     fn state(&self) -> Result<State> {
-        Ok(store::read(&self.ks, self.fabric)?
-            .context("the gateway holds no signed state: `wires join` it first")?
-            .state)
+        Ok(store::require_state(&self.ks, self.creds.fabric())?.state)
     }
 
     fn caller(&self, token: IdToken) -> PresentingCaller {
         PresentingCaller {
-            token,
+            ks: Arc::clone(&self.ks),
+            creds: self.creds.clone().presenting(token),
             endpoint: self.endpoint.clone(),
-            relay_url: self.relay_url.clone(),
         }
     }
 }
@@ -187,9 +184,9 @@ impl Backend for Keystored {
 /// Calls a service with this node's credentials over the gateway's shared
 /// endpoint, presenting a web user's ID token instead of a stored one.
 pub(crate) struct PresentingCaller {
-    token: IdToken,
+    ks: Arc<Keystore>,
+    creds: Credentials,
     endpoint: iroh::Endpoint,
-    relay_url: Option<String>,
 }
 
 impl crate::caller::call::Caller for PresentingCaller {
@@ -199,25 +196,17 @@ impl crate::caller::call::Caller for PresentingCaller {
         argv: library::Argv,
         stdin: Vec<u8>,
     ) -> Result<crate::caller::call::CallOutcome> {
-        use crate::caller::call::{
-            SERVICE_DIAL_TIMEOUT, ServiceDial, call_service_with, outcome, stored_state,
-        };
-        let ks = Keystore::resolve()?;
-        let creds = Credentials::resolve(&CredArgs {
-            relay_url: self.relay_url.clone(),
-            ..CredArgs::default()
-        })?
-        .presenting(self.token.clone());
-        let state = stored_state(&ks, &creds)?.context("the gateway holds no signed state")?;
+        use crate::caller::call::{SERVICE_DIAL_TIMEOUT, ServiceDial, call_service_with, outcome};
+        let state = store::require_state(&self.ks, self.creds.fabric())?;
         let dial = ServiceDial {
             endpoint: &self.endpoint,
-            hints: crate::caller::pick::Hints::load(&ks),
+            hints: crate::caller::pick::Hints::load(&self.ks),
             timeout: SERVICE_DIAL_TIMEOUT,
         };
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let result = call_service_with(
-            &creds,
-            &ks,
+            &self.creds,
+            &self.ks,
             &state,
             &tool.name,
             &dial,
@@ -231,10 +220,6 @@ impl crate::caller::call::Caller for PresentingCaller {
         outcome(result, stdout, stderr)
     }
 }
-
-/// How often the gateway checks for a newer signed state (the pull itself
-/// runs only when the stored one is stale).
-const STATE_REFRESH: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Requests per minute each client address may make to the unauthenticated
 /// OAuth endpoints (`/register`, `/authorize…`, `/oauth/callback`, `/token`).
@@ -464,7 +449,6 @@ fn secret(file: Option<&std::path::Path>, env: &str) -> Result<Option<String>> {
 /// The DCR MAC key: from the keystore, created on first run.
 fn client_key(ks: &Keystore) -> Result<ClientKey> {
     use base64::Engine as _;
-    let b64 = library::B64;
     let path = ks.path(CLIENT_KEY_FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -475,7 +459,7 @@ fn client_key(ks: &Keystore) -> Result<ClientKey> {
         }
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let bytes: [u8; 32] = b64
+    let bytes: [u8; 32] = library::B64
         .decode(text.trim())
         .ok()
         .and_then(|b| b.try_into().ok())
@@ -516,20 +500,16 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
             "WIRES_GATEWAY_CLIENT_SECRET",
         )?,
     };
-    let ks = Keystore::resolve()?;
-    let node = keystore::node_identity_in(&ks)?.node_id();
-    let membership = ks
-        .read_membership()?
-        .context("the gateway has no membership: `wires join <token>` it first")?;
-    let backend = Keystored {
-        ks: Keystore::resolve()?,
-        fabric: membership.fabric,
-        endpoint: crate::host::transport::bind(
-            &keystore::node_identity_in(&ks)?,
-            a.relay_url.as_deref(),
-        )
-        .await?,
+    let ks = Arc::new(Keystore::resolve()?);
+    let creds = Credentials::resolve(&CredArgs {
         relay_url: a.relay_url.clone(),
+        ..CredArgs::default()
+    })?;
+    let node = creds.node_id();
+    let backend = Keystored {
+        ks: Arc::clone(&ks),
+        endpoint: creds.bind().await?,
+        creds,
     };
     let state = backend.state()?;
     if !state.is_member(node) {
@@ -547,7 +527,7 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
     let gw = Arc::new(Gateway {
         node,
         upstream,
-        fetcher: KeyFetcher::new(Some(ks.path("jwks")))?,
+        fetcher: KeyFetcher::new(Some(ks.path(crate::caller::jwks::JWKS_DIR)))?,
         store: Store::open(Some(ks.path(SESSIONS_FILE)), crate::clock::now_unix())?,
         client_key: client_key(&ks)?,
         metadata: MetadataFetcher::new()?,
@@ -559,12 +539,10 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
     });
     // A long-running caller: keep its state fresh without waiting for a
     // call to hand back a newer one (it would otherwise expire unnoticed).
-    tokio::spawn(async {
-        loop {
-            tokio::time::sleep(STATE_REFRESH).await;
-            crate::state::sync::refresh_cold().await;
-        }
-    });
+    tokio::spawn(crate::state::sync::refresh_loop(
+        gw.backend.endpoint.clone(),
+        ks,
+    ));
     let listener = tokio::net::TcpListener::bind(a.listen)
         .await
         .with_context(|| format!("binding {}", a.listen))?;
@@ -709,15 +687,26 @@ pub(crate) mod tests {
         assert_eq!(a, "2001:db8:1:2::/64");
     }
 
+    /// Past the cap the oldest windows go, one at a time: an address over
+    /// its limit in a recent window is still refused.
     #[test]
     fn a_full_table_evicts_rather_than_resets() {
         let l = RateLimit::new(1);
+        let fill = |range: std::ops::Range<usize>| {
+            for i in range {
+                l.allow(&format!("fill-{i}"));
+            }
+        };
+        fill(0..MAX_TRACKED_ADDRS / 2);
         assert!(l.allow("hog"));
         assert!(!l.allow("hog"));
-        for i in 0..MAX_TRACKED_ADDRS {
-            l.allow(&format!("fill-{i}"));
-        }
-        assert!(l.seen.lock().unwrap().len() <= MAX_TRACKED_ADDRS);
+        fill(MAX_TRACKED_ADDRS / 2..MAX_TRACKED_ADDRS + 10);
+        assert!(
+            !l.allow("hog"),
+            "a recent over-limit address is still refused"
+        );
+        assert_eq!(l.seen.lock().unwrap().len(), MAX_TRACKED_ADDRS);
+        assert!(l.allow("fill-0"), "the oldest window went");
     }
 
     #[test]

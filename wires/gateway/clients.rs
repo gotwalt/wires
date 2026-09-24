@@ -102,7 +102,6 @@ pub(crate) struct RegistrationRequest {
     #[serde(default)]
     pub(crate) redirect_uris: Vec<String>,
     /// Optional display name.
-    #[serde(default)]
     pub(crate) client_name: Option<String>,
 }
 

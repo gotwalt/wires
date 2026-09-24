@@ -36,18 +36,18 @@ use serde::{Deserialize, Serialize};
 /// The file name under `$WIRES_HOME`.
 pub const TOOLS_FILE: &str = "tools.json";
 
-/// Where a remote tool's responder is reached.
+/// Where a [`RemoteTool`]'s host is reached.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolTarget {
-    /// The responder's node id, with optional relay and address hints.
+    /// One host, pinned by node id, with optional relay and address hints.
     Node {
-        /// The responder's node id.
+        /// The host's node id.
         node: NodeId,
         /// A self-hosted relay to dial through instead of the n0 default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         relay_url: Option<String>,
-        /// Direct socket addresses where the responder is reachable, so the
+        /// Direct socket addresses where the host is reachable, so the
         /// dialer needs no discovery.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         addrs: Vec<SocketAddr>,
@@ -58,22 +58,23 @@ pub enum ToolTarget {
     Service,
 }
 
-/// One remote CLI the caller can invoke.
+/// One name the caller can call: a `tools.json` alias, or (built by `wires
+/// mcp`) a service from the signed state.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct RemoteTool {
     /// The local name (`wires call <name>`, and the MCP tool name).
     pub name: ServiceName,
     /// One line for humans and for the MCP `description`.
     pub description: String,
-    /// Where the responder lives.
+    /// Where the host is.
     pub target: ToolTarget,
-    /// The name the responder exposes it under, when different from `name`.
+    /// The service to ask the host for, when different from `name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_tool: Option<ServiceName>,
 }
 
 impl RemoteTool {
-    /// One short line saying where this tool lives, for `wires tools list`.
+    /// One short line saying where this entry goes, for `wires tools list`.
     pub fn target_summary(&self) -> String {
         match &self.target {
             ToolTarget::Node { node, .. } => format!("node → {}", node.short()),
@@ -85,7 +86,7 @@ impl RemoteTool {
 /// The whole `tools.json`.
 #[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub struct ToolsConfig {
-    /// The tools, in display order.
+    /// The aliases, in display order.
     #[serde(default)]
     pub tools: Vec<RemoteTool>,
     /// Locked caller mode (card 20): when `true` in `$WIRES_HOME/tools.json`,
@@ -125,7 +126,7 @@ impl ToolsConfig {
         let mut seen = BTreeSet::new();
         for tool in &self.tools {
             if !seen.insert(&tool.name) {
-                bail!("duplicate tool name `{}`", tool.name);
+                bail!("duplicate alias `{}`", tool.name);
             }
         }
         Ok(())
@@ -151,7 +152,7 @@ impl ToolsConfig {
     pub fn add(&mut self, tool: RemoteTool) -> Result<()> {
         if self.get(&tool.name).is_some() {
             bail!(
-                "a tool named `{}` already exists (remove it first with `wires tools rm {}`)",
+                "an alias named `{}` already exists (remove it first with `wires tools rm {}`)",
                 tool.name,
                 tool.name
             );
@@ -196,36 +197,36 @@ pub struct ToolsArgs {
 /// are the directory; an alias pins a name to one host by hand).
 #[derive(Subcommand)]
 pub enum ToolsCmd {
-    /// Add an alias: a remote tool reached by its responder's node id.
+    /// Add an alias: a service pinned to one host by its node id.
     Add(ToolsAddArgs),
     /// List the aliases in `tools.json`, one per line, then a `#` line on
     /// how to call and filter them.
     List,
-    /// Remove a tool by name.
+    /// Remove an alias by name.
     Rm {
-        /// The local tool name to remove.
+        /// The alias to remove.
         name: String,
     },
 }
 
-/// `wires tools add`: a name, a description, and where the responder lives.
+/// `wires tools add`: a name, a description, and the host it pins.
 #[derive(Args)]
 pub struct ToolsAddArgs {
-    /// The local tool name (`wires call <name>`, and the MCP tool name).
+    /// The alias (`wires call <name>`, and the MCP tool name).
     pub name: String,
-    /// The responder's hex node id.
+    /// The host's hex node id.
     #[arg(long)]
     pub node: String,
-    /// Relay to reach the responder through.
+    /// Relay to reach the host through.
     #[arg(long)]
     pub relay_url: Option<String>,
-    /// Direct socket address of the responder. Repeatable.
+    /// Direct socket address of the host. Repeatable.
     #[arg(long = "addr")]
     pub addr: Vec<SocketAddr>,
-    /// One line saying what the tool does (shown to agents).
+    /// One line saying what it does (shown to agents).
     #[arg(long)]
     pub description: String,
-    /// The name the responder exposes it under, when different from `name`.
+    /// The service to ask the host for, when different from `name`.
     #[arg(long)]
     pub remote_tool: Option<String>,
 }
@@ -259,7 +260,7 @@ pub fn run_tools_cmd(a: ToolsArgs) -> Result<String> {
 /// must be valid hex, the names valid [`ServiceName`]s.
 fn remote_tool_from_args(a: ToolsAddArgs) -> Result<RemoteTool> {
     Ok(RemoteTool {
-        name: ServiceName::new(a.name).context("tool name")?,
+        name: ServiceName::new(a.name).context("alias name")?,
         description: a.description,
         target: ToolTarget::Node {
             node: NodeId::from_hex(&a.node).context("--node")?,
@@ -290,7 +291,7 @@ fn render_list(config: &ToolsConfig) -> String {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use library::NodeIdentity;
     use proptest::prelude::*;
@@ -308,19 +309,14 @@ pub(crate) mod tests {
         }
     }
 
-    fn tmp(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "wires-tools-{tag}-{}-{}",
-            std::process::id(),
-            crate::clock::now_unix()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir.join(TOOLS_FILE)
+    /// A `tools.json` path in a fresh empty directory.
+    fn tmp() -> PathBuf {
+        crate::testutil::temp_dir().join(TOOLS_FILE)
     }
 
     #[test]
     fn missing_file_is_empty() {
-        let path = tmp("missing");
+        let path = tmp();
         assert_eq!(ToolsConfig::load(&path).unwrap(), ToolsConfig::default());
     }
 
@@ -347,8 +343,7 @@ pub(crate) mod tests {
 
     #[test]
     fn duplicate_names_are_rejected_on_load() {
-        let path = tmp("dup");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let path = tmp();
         let c = ToolsConfig {
             tools: vec![node_tool("rg"), node_tool("rg")],
             locked: false,
@@ -356,15 +351,14 @@ pub(crate) mod tests {
         std::fs::write(&path, serde_json::to_string(&c).unwrap()).unwrap();
         let err = ToolsConfig::load(&path).unwrap_err();
         assert!(
-            format!("{err:#}").contains("duplicate tool name `rg`"),
+            format!("{err:#}").contains("duplicate alias `rg`"),
             "{err:#}"
         );
     }
 
     #[test]
     fn invalid_names_are_rejected_on_load() {
-        let path = tmp("badname");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let path = tmp();
         let mut v = serde_json::to_value(ToolsConfig {
             tools: vec![node_tool("rg")],
             locked: false,
@@ -387,7 +381,7 @@ pub(crate) mod tests {
 
     #[test]
     fn save_then_load_round_trips() {
-        let path = tmp("save");
+        let path = tmp();
         let c = ToolsConfig {
             tools: vec![
                 node_tool("rg"),
@@ -404,7 +398,7 @@ pub(crate) mod tests {
 
     #[test]
     fn cli_add_list_rm() {
-        let path = tmp("cli");
+        let path = tmp();
         let run = |cmd: ToolsCmd| {
             run_tools_cmd(ToolsArgs {
                 tools_file: Some(path.clone()),

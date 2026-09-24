@@ -3,7 +3,7 @@
 //! The name is a **service** (card 27): its hosts come from this node's
 //! admin-signed state, tried last-good first with failover on a dial failure
 //! ([`crate::caller::pick`]), and the session opens with the card-27
-//! [`Hello`](library::Hello) (membership, state version, ID token). Nothing
+//! [`Hello`] (membership, state version, ID token). Nothing
 //! is dialed from an expired state. A newer state a host hands back in its
 //! `HelloAck` is adopted **before** any stdin is sent, and the call stops
 //! there if that state no longer assigns the service to that host. A
@@ -14,9 +14,9 @@
 //! Locked mode ([`crate::caller::lock`]) refuses the override flags a
 //! sandboxed agent could steer this with.
 //!
-//! The CLI-native front door. An agent runs `wires call <tool> [-- args…]`
+//! The CLI-native front door. An agent runs `wires call <service> [-- args…]`
 //! from its shell: stdin, stdout and stderr pass straight through, the remote
-//! exit code becomes ours, and a refusal by the responder exits
+//! exit code becomes ours, and a refusal by the host exits
 //! [`EXIT_DENIED`](crate::EXIT_DENIED) (77) with the reason on stderr. A
 //! remote command that itself exits 77 is reported as 1, with a note
 //! ([`own_exit`]), so 77 always means "refused".
@@ -29,11 +29,12 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use library::{
-    Argv, IdToken, Invocation, Membership, NodeId, NodeIdentity, ServiceName, SignedState,
+    Argv, Hello, IdToken, Invocation, Membership, NodeId, NodeIdentity, ServiceName, SignedState,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -61,17 +62,18 @@ pub enum CallOutcome {
         /// Everything it wrote to stderr.
         stderr: Vec<u8>,
     },
-    /// The responder refused the call; its stated reason, verbatim.
+    /// The host refused the call; its stated reason, verbatim.
     Denied(String),
 }
 
 /// Something that can run a [`RemoteTool`] and hand back its [`CallOutcome`].
 ///
 /// `Err` is reserved for local or transport failures (no keystore, dial
-/// timeout, session dropped); a refusal by the responder is an `Ok`
+/// timeout, session dropped); a refusal by the host is an `Ok`
 /// [`CallOutcome::Denied`], because to the caller it is an answer.
 pub trait Caller {
-    /// Run `tool` with the extra `argv`, feeding it `stdin` (then EOF).
+    /// Call `tool` (a service, or an alias) with the extra `argv`, feeding
+    /// it `stdin` (then EOF).
     fn call(
         &self,
         tool: &RemoteTool,
@@ -83,9 +85,9 @@ pub trait Caller {
 /// Everything needed to dial one call, resolved from a [`RemoteTool`] entry.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Dial {
-    /// The responder's node id.
+    /// The pinned host's node id.
     pub target: NodeId,
-    /// Direct address hints for the responder.
+    /// Direct address hints for the host.
     pub addrs: Vec<SocketAddr>,
     /// The relay to dial through, if any.
     pub relay_url: Option<String>,
@@ -94,8 +96,8 @@ pub struct Dial {
 }
 
 impl Dial {
-    /// Resolve `tool` into a dial plan carrying `argv`. The service asked
-    /// for is the entry's explicit `remote_tool`, else the local name.
+    /// Resolve the alias `tool` into a dial plan carrying `argv`. The service
+    /// asked for is the entry's explicit `remote_tool`, else the local name.
     pub fn resolve(tool: &RemoteTool, argv: Argv) -> Result<Self> {
         let ToolTarget::Node {
             node,
@@ -126,8 +128,9 @@ impl Dial {
 
 /// This node's credentials for dialing: the node key and its membership,
 /// plus the ID token to present when it isn't the one `wires login` stored.
+#[derive(Clone)]
 pub struct Credentials {
-    node: NodeIdentity,
+    node: Arc<NodeIdentity>,
     membership: Membership,
     relay_override: Option<String>,
     id_token: Option<IdToken>,
@@ -138,7 +141,10 @@ impl Credentials {
     /// keystore).
     pub fn resolve(a: &CredArgs) -> Result<Self> {
         Ok(Self {
-            node: keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?,
+            node: Arc::new(keystore::node_identity(
+                a.node_seed.as_deref(),
+                a.node_seed_file.as_deref(),
+            )?),
             membership: keystore::membership(
                 a.membership.as_deref(),
                 a.membership_file.as_deref(),
@@ -157,11 +163,40 @@ impl Credentials {
         self.id_token = Some(token);
         self
     }
+
+    /// This node's id.
+    pub(crate) fn node_id(&self) -> NodeId {
+        self.node.node_id()
+    }
+
+    /// The network root this node's membership names.
+    pub(crate) fn fabric(&self) -> NodeId {
+        self.membership.fabric
+    }
+
+    /// Bind this node's endpoint (through the `--relay-url` override, if
+    /// any), for dialing services.
+    pub(crate) async fn bind(&self) -> Result<iroh::Endpoint> {
+        transport::bind(&self.node, self.relay_override.as_deref()).await
+    }
+
+    /// The session [`Hello`] to open with, after a local preflight (so a
+    /// membership issued to another node fails here, not at the host): the
+    /// membership, the version of the state in `ks`, and the ID token
+    /// ([`presenting`](Self::presenting)'s, else the stored one).
+    fn hello(&self, ks: &Keystore) -> Result<Hello> {
+        keystore::preflight(self.node.node_id(), &self.membership).map_err(anyhow::Error::msg)?;
+        let mut hello = crate::caller::hello::with_membership(ks, self.membership.clone());
+        if let Some(token) = &self.id_token {
+            hello.id_token = Some(token.clone());
+        }
+        Ok(hello)
+    }
 }
 
 /// Dial `plan` (an alias: one pinned host) with `creds` and bridge the given
 /// stdio; returns the remote exit code. The session opens with the same
-/// [`Hello`](library::Hello) a service call does, so the host still decides
+/// [`Hello`] a service call does, so the host still decides
 /// by its signed state. A refusal surfaces as a [`transport::Denied`] error.
 ///
 /// Runs a local preflight first, so a membership issued to another node
@@ -179,18 +214,13 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    crate::admin::keystore::preflight(creds.node.node_id(), &creds.membership)
-        .map_err(anyhow::Error::msg)?;
     let ks = Keystore::resolve()?;
+    let hello = creds.hello(&ks)?;
     let state = fresh_state(&ks, creds)?;
     check_alias(&state, &plan)?;
     let service = plan.invocation.service.clone();
     let relay = creds.relay_override.clone().or(plan.relay_url);
     let target = transport::endpoint_addr(&plan.target, &plan.addrs, relay.as_deref())?;
-    let mut hello = crate::caller::hello::with_membership(&ks, creds.membership.clone())?;
-    if let Some(token) = &creds.id_token {
-        hello.id_token = Some(token.clone());
-    }
     let endpoint = transport::bind(&creds.node, relay.as_deref()).await?;
     let fabric = creds.membership.fabric;
     let done = transport::call_service_on(
@@ -279,15 +309,10 @@ pub(crate) fn outcome(
     }
 }
 
-/// This node's verified signed state, under the fabric root its membership
-/// names; `None` if it holds none yet.
-pub(crate) fn stored_state(ks: &Keystore, creds: &Credentials) -> Result<Option<SignedState>> {
-    store::read(ks, creds.membership.fabric)
-}
-
-/// [`stored_state`], required to exist and to be fresh: a caller never
-/// dials from an expired state (it would present an old version, and name
-/// hosts the admin may have since removed).
+/// This node's verified signed state, under the network root its membership
+/// names, required to exist and to be fresh: a caller never dials from an
+/// expired state (it would present an old version, and name hosts the admin
+/// may have since removed).
 pub(crate) fn fresh_state(ks: &Keystore, creds: &Credentials) -> Result<SignedState> {
     let state = store::require_state(ks, creds.membership.fabric)?;
     check_fresh(&state, crate::clock::now_unix())?;
@@ -374,7 +399,7 @@ pub(crate) fn own_exit(remote: i32) -> (i32, Option<String>) {
 
 /// Call `service` (card 27): its hosts from `state` (which must be fresh),
 /// last-good first, failing over on a dial failure; open with the
-/// [`Hello`](library::Hello); at the host's ack, adopt any newer state it
+/// [`Hello`]; at the host's ack, adopt any newer state it
 /// hands back and stop unless that state still assigns `service` to it; then
 /// bridge stdio and remember the host that answered. `verbose` names that
 /// host on stderr. A refusal is a [`transport::Denied`] error, as in
@@ -396,10 +421,7 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    crate::admin::keystore::preflight(creds.node.node_id(), &creds.membership)
-        .map_err(anyhow::Error::msg)?;
-    let relay = creds.relay_override.as_deref();
-    let endpoint = transport::bind(&creds.node, relay).await?;
+    let endpoint = creds.bind().await?;
     let dial = ServiceDial {
         endpoint: &endpoint,
         hints: Hints::load(ks),
@@ -442,6 +464,7 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
+    let hello = creds.hello(ks)?;
     check_fresh(state, crate::clock::now_unix())?;
     let last_good = LastGood::path(ks);
     let hosts = pick::candidates(
@@ -451,10 +474,6 @@ where
     );
     if hosts.is_empty() {
         bail!("no service named `{service}` with a host (see `wires services`)");
-    }
-    let mut hello = crate::caller::hello::with_membership(ks, creds.membership.clone())?;
-    if let Some(token) = &creds.id_token {
-        hello.id_token = Some(token.clone());
     }
     let targets = dial.hints.targets(&hosts, creds.relay_override.as_deref());
     let fabric = creds.membership.fabric;
@@ -481,16 +500,13 @@ where
     Ok(done.dialed.exit)
 }
 
-/// Credential and config flags shared by `wires call` and `wires mcp`.
+/// Credential flags shared by `wires call`, `wires mcp` and `wires inbox`.
 ///
 /// Every one of them is refused in locked mode (`WIRES_LOCKED=1`, see
-/// [`crate::caller::lock`]): they are how a caller is steered off the
-/// operator's configuration.
+/// [`crate::caller::lock`]), as is `--tools-file`: they are how a caller is
+/// steered off the operator's configuration.
 #[derive(Args, Clone, Debug, Default)]
 pub struct CredArgs {
-    /// Read aliases from this file instead of `$WIRES_HOME/tools.json`.
-    #[arg(long)]
-    pub tools_file: Option<PathBuf>,
     /// Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`,
     /// then `--node-seed-file`, then the keystore (`node.seed`).
     #[arg(long)]
@@ -505,18 +521,21 @@ pub struct CredArgs {
     /// Read the membership token from this file instead of the keystore.
     #[arg(long)]
     pub membership_file: Option<PathBuf>,
-    /// Dial through this relay, overriding the tool entry's own.
+    /// Dial through this relay, overriding an alias's own.
     #[arg(long)]
     pub relay_url: Option<String>,
 }
 
-/// `wires call <tool> [--jq F] [--head N] [--max-bytes N] [-- args…]`.
+/// `wires call <service> [--jq F] [--head N] [--max-bytes N] [-- args…]`.
 #[derive(Args)]
 pub struct CallArgs {
     #[command(flatten)]
     pub creds: CredArgs,
+    /// Read aliases from this file instead of `$WIRES_HOME/tools.json`.
+    #[arg(long)]
+    pub tools_file: Option<PathBuf>,
     /// Local output shaping (no shell needed). Goes before `--`, after the
-    /// tool name (so a permission rule scoped to the tool, e.g.
+    /// service name (so a permission rule scoped to the service, e.g.
     /// `Bash(wires call gh:*)`, still matches) or before it.
     #[command(flatten)]
     pub shape: ShapeArgs,
@@ -532,20 +551,22 @@ pub struct CallArgs {
     pub args: Vec<String>,
 }
 
-/// Look `name` up in `config`, with an error that lists what *is* there.
+/// Look the alias `name` up in `config`, with an error that lists what *is*
+/// there.
 pub fn lookup<'a>(config: &'a ToolsConfig, name: &str) -> Result<&'a RemoteTool> {
     let found = ServiceName::new(name).ok().and_then(|n| config.get(&n));
     found.ok_or_else(|| {
         let known: Vec<&str> = config.tools.iter().map(|t| t.name.as_str()).collect();
         if known.is_empty() {
-            anyhow!("no tool named `{name}`: tools.json is empty (add one with `wires tools add`)")
+            anyhow!("no alias named `{name}`: tools.json is empty (add one with `wires tools add`)")
         } else {
-            anyhow!("no tool named `{name}` (known: {})", known.join(", "))
+            anyhow!("no alias named `{name}` (known: {})", known.join(", "))
         }
     })
 }
 
-/// `wires call`: stream local stdio to the remote tool; returns its exit code.
+/// `wires call`: stream local stdio to the remote service; returns its exit
+/// code.
 ///
 /// With a shaping flag (`--jq`/`--head`/`--max-bytes`), the remote stdout is
 /// buffered and shaped in-process before it is written; stderr still
@@ -559,7 +580,7 @@ pub fn lookup<'a>(config: &'a ToolsConfig, name: &str) -> Result<&'a RemoteTool>
 /// didn't allow, fails with [`EXIT_LOCKED`] before anything is dialed.
 pub async fn call_cmd(a: CallArgs) -> Result<i32> {
     let lock = Lock::detect()?;
-    if let Err(e) = lock.check(&a.creds) {
+    if let Err(e) = lock.check(&a.creds, a.tools_file.as_deref()) {
         eprintln!("wires: {e}");
         return Ok(EXIT_LOCKED);
     }
@@ -580,22 +601,23 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
         Box::new(tokio::io::stdin())
     };
     let config = ToolsConfig::load(&crate::caller::tools::resolve_path(
-        a.creds.tools_file.as_deref(),
+        a.tools_file.as_deref(),
     )?)?;
     let argv = Argv::new(a.args).context("arguments")?;
     let creds = Credentials::resolve(&a.creds)?;
-    let route = route(&config, &a.service, &creds)?;
-    let plan = match &route {
-        Route::Service { .. } => None,
-        Route::Alias => Some(Dial::resolve(lookup(&config, &a.service)?, argv.clone())?),
-    };
-    let run = async |stdout: &mut (dyn AsyncWrite + Unpin + Send)| match (&route, plan) {
-        (Route::Service { ks, state, service }, _) => {
+    let route = route(&config, &a.service, argv, &creds)?;
+    let run = async |stdout: &mut (dyn AsyncWrite + Unpin + Send)| match route {
+        Route::Service {
+            ks,
+            state,
+            service,
+            argv,
+        } => {
             call_service(
                 &creds,
-                ks,
-                state,
-                service,
+                &ks,
+                &state,
+                &service,
                 argv,
                 stdin,
                 stdout,
@@ -604,8 +626,7 @@ pub async fn call_cmd(a: CallArgs) -> Result<i32> {
             )
             .await
         }
-        (Route::Alias, Some(plan)) => dial(&creds, plan, stdin, stdout, tokio::io::stderr()).await,
-        (Route::Alias, None) => unreachable!("an alias route always has a plan"),
+        Route::Alias(plan) => dial(&creds, plan, stdin, stdout, tokio::io::stderr()).await,
     };
     let report = |remote: i32| {
         let (code, note) = own_exit(remote);
@@ -640,30 +661,43 @@ enum Route {
         state: SignedState,
         /// The service.
         service: ServiceName,
+        /// The per-call arguments.
+        argv: Argv,
     },
-    /// An alias in `tools.json`.
-    Alias,
+    /// An alias in `tools.json`, resolved to its pinned host.
+    Alias(Dial),
 }
 
 /// A service registered in the stored state wins; else an alias (whose host
 /// [`dial`] checks against the state). A name that is neither is an error
 /// that points at `wires services`.
-fn route(config: &ToolsConfig, name: &str, creds: &Credentials) -> Result<Route> {
+fn route(config: &ToolsConfig, name: &str, argv: Argv, creds: &Credentials) -> Result<Route> {
     let ks = Keystore::resolve()?;
     let state = store::require_state(&ks, creds.membership.fabric)?;
-    route_in(config, name, ks, state)
+    route_in(config, name, argv, ks, state)
 }
 
 /// [`route`] against a given keystore and state.
-fn route_in(config: &ToolsConfig, name: &str, ks: Keystore, state: SignedState) -> Result<Route> {
+fn route_in(
+    config: &ToolsConfig,
+    name: &str,
+    argv: Argv,
+    ks: Keystore,
+    state: SignedState,
+) -> Result<Route> {
     let service = ServiceName::new(name).ok();
     if let Some(service) = service
         && state.state.service(&service).is_some()
     {
-        return Ok(Route::Service { ks, state, service });
+        return Ok(Route::Service {
+            ks,
+            state,
+            service,
+            argv,
+        });
     }
-    if lookup(config, name).is_ok() {
-        return Ok(Route::Alias);
+    if let Ok(alias) = lookup(config, name) {
+        return Ok(Route::Alias(Dial::resolve(alias, argv)?));
     }
     ServiceName::new(name).map_err(|e| anyhow!("`{name}`: {e}"))?;
     bail!("no service named `{name}` (see `wires services`)")
@@ -748,10 +782,10 @@ mod tests {
     #[test]
     fn denied_is_an_outcome_and_other_errors_stay_errors() {
         let denied =
-            anyhow::Error::new(transport::Denied::new("revoked".into())).context("dialing");
+            anyhow::Error::new(transport::Denied::new("not admitted".into())).context("dialing");
         assert_eq!(
             outcome(Err(denied), vec![], vec![]).unwrap(),
-            CallOutcome::Denied("revoked".into())
+            CallOutcome::Denied("not admitted".into())
         );
         assert!(outcome(Err(anyhow!("timeout")), vec![], vec![]).is_err());
         assert_eq!(
@@ -765,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_lists_known_tools_on_a_miss() {
+    fn lookup_lists_known_aliases_on_a_miss() {
         let config = ToolsConfig {
             tools: vec![tool(
                 ToolTarget::Node {
@@ -800,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn shaping_flags_go_before_the_tool_and_after_it_belong_to_the_tool() {
+    fn shaping_flags_go_before_the_service_and_after_it_belong_to_it() {
         let a = parse(&[
             "--jq",
             ".[].name",
@@ -816,15 +850,15 @@ mod tests {
         assert_eq!(a.shape.jq.as_deref(), Some(".[].name"));
         assert_eq!((a.shape.head, a.shape.max_bytes), (Some(3), Some(100)));
         assert_eq!(a.args, ["api", "x"]);
-        // Right after the tool name, before `--`, they are still ours — so a
-        // permission rule scoped to one tool (`Bash(wires call gh:*)`) still
+        // Right after the service name, before `--`, they are still ours — so
+        // a permission rule scoped to one service (`Bash(wires call gh:*)`) still
         // matches a shaped call.
         let a = parse(&["gh", "--jq", ".[].name", "--head", "3", "--", "api", "x"]);
         assert_eq!(a.service, "gh");
         assert_eq!(a.shape.jq.as_deref(), Some(".[].name"));
         assert_eq!(a.shape.head, Some(3));
         assert_eq!(a.args, ["api", "x"]);
-        // After `--`, or once the tool's own arguments have begun, `--jq` is
+        // After `--`, or once the service's own arguments have begun, `--jq` is
         // the remote command's flag (gh's).
         let a = parse(&["gh", "--", "api", "x", "--jq", ".name"]);
         assert_eq!(a.shape, ShapeArgs::default());
@@ -884,7 +918,7 @@ mod tests {
     #[tokio::test]
     async fn shaping_over_a_loopback_host() {
         use crate::host::config::HostConfig;
-        use crate::host::transport::{ALPN, endpoint_addr, secret_key};
+        use crate::host::transport::endpoint_addr;
         use library::{Hello, Membership, Service, State, StateVersion};
 
         let root = NodeIdentity::from_seed([70; 32]);
@@ -927,23 +961,11 @@ mod tests {
             config,
         )
         .unwrap();
-        let endpoint = |id: &NodeIdentity| {
-            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-                .secret_key(secret_key(id))
-                .alpns(vec![ALPN.to_vec()])
-                .bind()
-        };
-        let server_ep = endpoint(&server).await.unwrap();
-        let addrs: Vec<SocketAddr> = server_ep
-            .bound_sockets()
-            .into_iter()
-            .filter(SocketAddr::is_ipv4)
-            .map(|s| SocketAddr::from(([127, 0, 0, 1], s.port())))
-            .collect();
-        let target = endpoint_addr(&server.node_id(), &addrs, None).unwrap();
+        let server_ep = test_endpoint(&server).await;
+        let target = endpoint_addr(&server.node_id(), &[loopback(&server_ep)], None).unwrap();
         let _router =
             crate::host::serve::services_router(server_ep, std::sync::Arc::new(host), None);
-        let client_ep = endpoint(&client).await.unwrap();
+        let client_ep = test_endpoint(&client).await;
 
         let run = async |name: &str, shape: Shape| {
             let mut stdout = Vec::new();
@@ -1004,7 +1026,7 @@ mod tests {
         let a = parse(&["rg", "--", "-n", "--x", "foo"]);
         assert_eq!(a.args, ["-n", "--x", "foo"]);
         let a = parse(&["--tools-file", "/t.json", "rg", "-n"]);
-        assert_eq!(a.creds.tools_file, Some(PathBuf::from("/t.json")));
+        assert_eq!(a.tools_file, Some(PathBuf::from("/t.json")));
         assert_eq!(a.args, ["-n"]);
         assert!(parse(&["rg"]).args.is_empty());
     }
@@ -1161,7 +1183,7 @@ mod tests {
         let membership = Membership::mint(&root, me.node_id(), 0, i64::MAX).unwrap();
         Fixture {
             creds: Credentials {
-                node: me,
+                node: Arc::new(me),
                 membership,
                 relay_override: None,
                 id_token: None,
@@ -1354,8 +1376,7 @@ mod tests {
             newer: Some(v2),
             got: got.clone(),
         };
-        let h2 = NodeIdentity::from_seed([88; 32]);
-        let (h_id, h_addr, _) = fake_host(&f.root, &h2, answer).await;
+        let (h_id, h_addr, _) = fake_host(&f.root, &h, answer).await;
         let hints = Hints::from_pairs([(h_id, vec![h_addr])]);
         let (r, _) = run_service_with_stdin(&f, &v1, hints, b"secret".to_vec()).await;
         assert_eq!(r.unwrap(), 0);
@@ -1386,11 +1407,14 @@ mod tests {
             locked: false,
         };
         let ks = || Keystore::at(crate::testutil::temp_dir());
-        let routed = route_in(&config, "orders-db", ks(), state.clone()).unwrap();
+        let route = |name| route_in(&config, name, Argv::default(), ks(), state.clone());
+        let routed = route("orders-db").unwrap();
         assert!(matches!(routed, Route::Service { .. }), "the service wins");
-        let routed = route_in(&config, "orders", ks(), state.clone()).unwrap();
-        assert!(matches!(routed, Route::Alias));
-        assert!(route_in(&config, "nope", ks(), state.clone()).is_err());
+        let Route::Alias(plan) = route("orders").unwrap() else {
+            panic!("an alias")
+        };
+        assert_eq!(plan.target, stranger);
+        assert!(route("nope").is_err());
 
         let plan = |node| Dial::resolve(&alias("orders", node), Argv::default()).unwrap();
         let err = check_alias(&state, &plan(stranger))

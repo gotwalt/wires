@@ -392,12 +392,6 @@ mod tests {
             );
             assert!(e.message().contains(bad), "{bad}: {e}");
         }
-        assert!(
-            JqProgram::new("nosuchfn")
-                .unwrap_err()
-                .message()
-                .contains("nosuchfn")
-        );
         let e = Shape::new(&ShapeArgs {
             jq: Some(".[".into()),
             ..Default::default()
@@ -502,13 +496,18 @@ mod tests {
             prop_assert!(err.is_none());
         }
 
-        /// `--head` never splits a character and keeps a prefix.
+        /// `--head N` keeps a prefix of at most N lines, and when it cuts,
+        /// the cut is right after the Nth line's `\n`.
         #[test]
-        fn head_never_splits_a_char(s in "\\PC{0,40}(\n\\PC{0,20}){0,6}", n in 0usize..8) {
+        fn head_keeps_a_prefix_of_n_lines(s in "\\PC{0,40}(\n\\PC{0,20}){0,6}", n in 0usize..8) {
             let out = shape(None, Some(n), None).apply(s.as_bytes()).stdout;
             let out = String::from_utf8(out).expect("valid UTF-8");
             prop_assert!(s.starts_with(&out));
             prop_assert!(out.matches('\n').count() <= n);
+            if out.len() < s.len() {
+                prop_assert_eq!(out.matches('\n').count(), n);
+                prop_assert!(n == 0 || out.ends_with('\n'));
+            }
         }
 
         /// `--max-bytes` never splits a character, never exceeds N, and

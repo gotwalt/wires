@@ -16,7 +16,7 @@
 //! streams, and there are no server-initiated messages). A notification is
 //! `202`. `GET` and `DELETE` are `405`. An `Origin` that isn't allowed is
 //! `403` (DNS-rebinding protection). No valid bearer token is `401` with the
-//! [`challenge`](super::oauth::challenge).
+//! [`challenge`].
 //!
 //! The tool list is computed per request from the signed state the gateway
 //! holds and the caller's verified principal, so an admin's change applies
