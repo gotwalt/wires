@@ -20,7 +20,7 @@
 //!     }
 //!   },
 //!   "push": { "allow": ["analyst"], "log_body": false },
-//!   "audit": { "otlp": "http://collector:4318" }
+//!   "audit": { "otlp": "https://collector.example:4318" }
 //! }
 //! ```
 //!
@@ -193,7 +193,7 @@ impl HostConfigV2 {
     /// - `env` names are non-empty, contain no `=` or NUL, and don't start
     ///   with `WIRES_` (the server-derived variables are not settable);
     /// - each issuer is listed once, non-empty, with at least one audience;
-    /// - `audit.otlp` is an http(s) URL.
+    /// - `audit.otlp` is an https URL (or http to a loopback collector).
     pub(crate) fn validate(&self) -> Result<()> {
         if self.version != HOST_CONFIG_V2 {
             bail!(
@@ -344,7 +344,7 @@ mod tests {
         }
       },
       "push": { "allow": ["analyst"] },
-      "audit": { "otlp": "http://collector:4318" }
+      "audit": { "otlp": "https://collector.example:4318" }
     }"#;
 
     #[test]

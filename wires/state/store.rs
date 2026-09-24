@@ -53,7 +53,7 @@ pub(crate) fn adopt_if_newer(
 
     let lock_path = ks.path(LOCK_FILE);
     if let Some(dir) = lock_path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        create_private_dir(dir)?;
     }
     let lock = OpenOptions::new()
         .create(true)
@@ -78,6 +78,21 @@ pub(crate) fn adopt_if_newer(
     write_text_mode(&ks.path(STATE_FILE), &format!("{text}\n"), Some(0o600))?;
     Ok(true)
     // `lock` drops here, releasing the file lock.
+}
+
+/// Create `dir` (and its parents) if missing, the new directories mode
+/// `0700`: the keystore holds seeds and the state.
+fn create_private_dir(dir: &std::path::Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))
 }
 
 /// The admin's node id (`state-admin.txt`): where a member pulls newer
@@ -181,6 +196,21 @@ mod tests {
         forged.state.version = StateVersion(9);
         std::fs::write(&path, format!("{}\n", forged.encode().unwrap())).unwrap();
         assert!(read(&ks, root.node_id()).is_err());
+    }
+
+    /// Card 28 §10: a keystore directory the store creates is `0700`, and
+    /// the state file `0600`.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_keystore_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = NodeIdentity::generate();
+        let dir = crate::testutil::temp_dir().join("fresh-home");
+        let ks = Keystore::at(&dir);
+        assert!(adopt_if_newer(&ks, &signed(&root, 1), root.node_id(), 10).unwrap());
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&ks.path(STATE_FILE)), 0o600);
     }
 
     #[test]
