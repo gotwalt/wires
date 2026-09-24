@@ -4,10 +4,14 @@
 //! parsing and dispatch ([`run`], which `main.rs` calls), plus the public
 //! surface an app embeds to serve wires calls in-process (card 33):
 //!
-//! - **admin** (`admin/`) — holds the root key and signs the state: who is
-//!   in, which roles exist, which services run where and who may call them.
+//! - **admin** (`admin/`) — holds the root key, mints badges and signs the
+//!   policy: which IdPs are trusted, which roles exist, which services run
+//!   where and who may call them, who is banned, which nodes are directories.
+//! - **directory** (`directory/`) — holds the newest policy and vouches for
+//!   its freshness; hosts and callers fetch from it. It never decides a
+//!   call (card 36).
 //! - **host** (`host/`) — `wires serve`: implements the services the signed
-//!   state assigns to it, checks every caller against that state, and keeps
+//!   policy assigns to it, checks every caller against that policy, and keeps
 //!   its own log of every call.
 //! - **caller** (`caller/`) — `wires login | services | call | mcp | inbox`:
 //!   runs remote CLIs by service name (`mcp` serves them as MCP over stdio,
@@ -18,7 +22,7 @@
 //! - **observer** — `wires watch`: streams call records from the hosts' own
 //!   logs, to readers the registry names (card 26b, `caller/watch_records.rs`).
 //!
-//! `state/` is where the signed state lives on every node and how it moves.
+//! `policy/` is where the signed policy lives on every node and how it moves.
 //!
 //! **Embedding** (card 33): an app serves wires calls in-process by
 //! implementing [`Service`] and serving a [`Host`] built from its keystore.
@@ -45,10 +49,11 @@ extern crate self as wires;
 mod admin;
 mod caller;
 mod clock;
+mod directory;
 mod gateway;
 mod host;
 mod net;
-mod state;
+mod policy;
 
 pub use host::embed::{Host, HostBuilder};
 pub use host::native::{Call, CallIo, Service, SharedIo};
@@ -83,12 +88,14 @@ const HELP_TEMPLATE: &str = "\
 {usage-heading} {usage}
 
 Admin — admits nodes and signs what runs where (holds the root key):
-  init      Create the root key, this node, and the first signed state
+  init      Create the root key, this node, and the first signed policy
   invite    Admit a node: mint its badge, print its one join token
   remove    Ban a node; hosts refuse its next call
   service   Register services: add / set / rm (name, allowed roles, hosts)
   role      Define roles from IdP identity: set / rm
-  state     Re-send the signed state to every host (push)
+  issuer    Trust an IdP: set / rm (its client id, accepted audiences)
+  directory Name directories: add / rm; `directory serve` runs one
+  state     Re-publish the signed policy to every directory (push)
 
 Host — implements the services assigned to it:
   serve     Run host.json's services; check every caller; log every call
@@ -96,7 +103,7 @@ Host — implements the services assigned to it:
 
 Caller — runs remote CLIs by service name (every role joins the same way):
   id        Print this node's id: what you send the admin
-  join      Install the admin's invite token: membership and signed state
+  join      Install the admin's invite token: membership and signed policy
   login     Sign in with your IdP, binding this node's key to your identity
   services  List the services you may call, and the role that lets you
   call      Run a service by name: stdio passes through, its exit code is ours
@@ -125,27 +132,32 @@ struct Cli {
 enum Command {
     // --- admin ---
     /// Create the root key and this machine's node key, mint this node's
-    /// badge, and sign the first state.
+    /// badge, and sign the first policy (trusting one IdP).
     Init(admin::init::InitArgs),
-    /// Mint a node's badge and print its join token (stdout). No state edit:
-    /// nothing is pushed (unless it lifts the node's ban).
+    /// Mint a node's badge and print its join token (stdout). No policy
+    /// edit: nothing is published (unless it lifts the node's ban).
     Invite(admin::invite::InviteArgs),
-    /// Remove a node (by `--name` label or id): a ban in the signed state
-    /// until its badge expires. It is pushed to the hosts, and every host
-    /// that has it refuses the node's next call.
+    /// Remove a node (by `--name` label or id): a ban in the signed policy
+    /// until its badge expires. It is published to the directories, and
+    /// every host that fetches it refuses the node's next call.
     Remove(admin::invite::RemoveArgs),
-    /// Edit the service registry in the signed state, and push it.
+    /// Edit the service registry in the signed policy, and publish it.
     Service(admin::service::ServiceArgs),
-    /// Edit the role definitions in the signed state, and push them.
+    /// Edit the role definitions in the signed policy, and publish them.
     Role(admin::service::RoleArgs),
-    /// The signed state itself: `push` re-sends it to every host (after an
-    /// edit that reached none).
+    /// Edit the trusted IdPs in the signed policy, and publish them.
+    Issuer(admin::service::IssuerArgs),
+    /// The directories: `add` / `rm` (admin) edit the policy's list;
+    /// `serve` runs this node's directory alone.
+    Directory(directory::DirectoryArgs),
+    /// The signed policy itself: `push` re-publishes it to every directory
+    /// (after an edit that reached none).
     State(admin::propagate::StateArgs),
 
     // --- host ---
-    /// Implement the services host.json names (and the signed state assigns
+    /// Implement the services host.json names (and the signed policy assigns
     /// here): check every caller, exec the service, bridge its stdio, log
-    /// every call.
+    /// every call. Runs the directory too when the policy lists this node.
     Serve(host::serve::ServeArgs),
     /// Send a caller a message, addressed by its key (a service's
     /// `$WIRES_CALLER_NODE`) or a role: through this machine's running
@@ -157,13 +169,13 @@ enum Command {
     /// sends the admin.
     Id,
     /// Install an invite token from `wires invite`: membership and the
-    /// signed state. Without a token, print this node's id.
+    /// signed policy. Without a token, print this node's id.
     Join(caller::join::JoinArgs),
     /// Sign in with your IdP (OIDC), binding this node's key to your identity;
     /// the token is stored locally and presented when you call.
     Login(caller::login::LoginArgs),
     /// List the services you may call (evaluated locally against the signed
-    /// state), with what each does and the role that admits you.
+    /// policy), with what each does and the role that admits you.
     Services(caller::services::ServicesArgs),
     /// Run a service by name: stdio passes through,
     /// its exit code becomes ours, a refusal exits 77.
@@ -290,6 +302,22 @@ pub fn run() {
             init_quiet_logging();
             print_report(runtime().block_on(admin::service::role_cmd(a)))
         }
+        Command::Issuer(a) => {
+            init_quiet_logging();
+            print_report(runtime().block_on(admin::service::issuer_cmd(a)))
+        }
+        Command::Directory(a) if directory::is_edit(&a) => {
+            init_quiet_logging();
+            print_report(runtime().block_on(directory::edit_cmd(a)))
+        }
+        Command::Directory(a) => {
+            let directory::DirectoryCmd::Serve(serve) = a.cmd else {
+                unreachable!("an edit is dispatched above");
+            };
+            if let Err(e) = runtime().block_on(directory::serve::serve_cmd(serve)) {
+                exit_with(e);
+            }
+        }
         Command::State(a) => {
             init_quiet_logging();
             print_report(runtime().block_on(admin::propagate::state_cmd(a)))
@@ -308,7 +336,7 @@ pub fn run() {
         Command::Inbox(a) => {
             init_quiet_logging();
             exit_with_code(runtime().block_on(async {
-                state::sync::refresh_cold().await;
+                policy::fetch::refresh_cold().await;
                 caller::inbox::inbox_cmd(a).await
             }))
         }
@@ -320,7 +348,7 @@ pub fn run() {
         Command::Call(a) => {
             init_quiet_logging();
             exit_with_code(runtime().block_on(async {
-                state::sync::refresh_cold().await;
+                policy::fetch::refresh_cold().await;
                 caller::call::call_cmd(a).await
             }))
         }
@@ -332,7 +360,7 @@ pub fn run() {
         Command::Mcp(a) => {
             init_quiet_logging();
             let served = runtime().block_on(async {
-                state::sync::refresh_cold().await;
+                policy::fetch::refresh_cold().await;
                 caller::mcp::mcp_cmd(a).await
             });
             if let Err(e) = served {
@@ -342,7 +370,7 @@ pub fn run() {
         Command::Gateway(a) => {
             init_logging();
             let served = runtime().block_on(async {
-                state::sync::refresh_cold().await;
+                policy::fetch::refresh_cold().await;
                 gateway::gateway_cmd(a).await
             });
             if let Err(e) = served {
@@ -383,8 +411,9 @@ fn exit_with_code(result: anyhow::Result<i32>) -> ! {
 
 /// Print an admin command's notes on stderr and its result on stdout (the
 /// token, for `invite` — so `$(wires invite …)` is the token alone). A
-/// failure (the new state reached no host) is printed last and exits 1: the
-/// work is done and stored, but not in force. An error is [`exit_with`].
+/// failure (the new policy reached no directory) is printed last and exits
+/// 1: the work is done and stored, but not in force. An error is
+/// [`exit_with`].
 fn print_report(result: anyhow::Result<admin::Report>) {
     let report = match result {
         Ok(report) => report,
@@ -454,7 +483,7 @@ mod tests {
             assert!(help.contains(&format!("{role} — ")), "{help}");
         }
         let lines = help.lines().count();
-        assert!(lines <= 32, "{lines} lines:\n{help}");
+        assert!(lines <= 34, "{lines} lines:\n{help}");
     }
 
     /// Card 14's onboarding commands parse as documented.
@@ -468,7 +497,7 @@ mod tests {
         assert!(Cli::try_parse_from(["wires", "invite"]).is_err());
         assert!(Cli::try_parse_from(["wires", "remove", "alice"]).is_ok());
         // Card 28: `--ttl` is a membership's lifetime, `--state-ttl` the
-        // signed state's.
+        // signed policy's.
         assert!(
             Cli::try_parse_from(["wires", "invite", &id, "--ttl", "1h", "--state-ttl", "30d"])
                 .is_ok()
@@ -479,6 +508,17 @@ mod tests {
         assert!(Cli::try_parse_from(["wires", "service", "rm", "db", "--state-ttl", "7d"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "service", "rm", "db", "--ttl", "7d"]).is_err());
         assert!(Cli::try_parse_from(["wires", "state", "push"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["wires", "init", "--issuer", "https://i", "--client-id", "c"])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["wires", "directory", "add", "workbench"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "directory", "rm", "workbench"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "directory", "serve"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["wires", "directory", "serve", "--max-subscribers", "8"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["wires", "directory"]).is_err());
         assert!(Cli::try_parse_from(["wires", "id"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "join"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "join", "tok"]).is_ok());

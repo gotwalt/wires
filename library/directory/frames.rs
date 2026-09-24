@@ -12,7 +12,12 @@
 //! | `slice {have, roles}` | `slice_update {update, fresh}` from `have`; `slice {slice, fresh}` when `have` is 0 or no longer kept; `current {fresh}` when `have` is the newest |
 //! | `view {have, query?}` | `view_update`, `view` or `current` the same way (a `query` always gets a whole `view`) |
 //! | `resolve {service}` | `view {view, fresh}` holding that service, or none |
+//! | `policy {have}` | **temporary** (card 36b): `policy {policy, fresh}`, the whole signed policy, or `current {fresh}` when `have` is the newest |
 //! | anything refused | `denied {reason}` |
+//!
+//! `policy {have}` exists only while hosts and callers still hold the whole
+//! policy: card 36c moves hosts to slices, card 37 callers to views, and
+//! then it goes.
 //!
 //! **`wires/directory-sub/1`**: the dialer sends `hello` then
 //! [`SubRequest::Subscribe`], and the directory streams [`SubFrame`]s: the
@@ -48,6 +53,7 @@ use crate::codec::{canonical_bytes, length_prefixed, prefix_len, split_frame};
 use crate::error::{Error, Result};
 use crate::fresh::Fresh;
 use crate::head::SignedPolicyHead;
+use crate::head::StateVersion;
 use crate::idp::IdToken;
 use crate::item::Item;
 use crate::membership::Membership;
@@ -55,7 +61,6 @@ use crate::parts::{Slice, SliceUpdate, View, ViewUpdate};
 use crate::registry::ServiceName;
 use crate::role::RoleName;
 use crate::signed_policy::SignedPolicy;
-use crate::state::StateVersion;
 
 /// The ALPN of the directory's request protocol.
 pub const DIRECTORY_ALPN: &[u8] = b"wires/directory/1";
@@ -120,6 +125,13 @@ pub enum DirectoryRequest {
         /// The service.
         service: ServiceName,
     },
+    /// **Temporary** (card 36b; removed once hosts hold slices, card 36c,
+    /// and callers views, card 37): the whole signed policy, for a node
+    /// that still holds all of it.
+    Policy {
+        /// The version the dialer holds (0: none).
+        have: StateVersion,
+    },
 }
 
 /// The directory's answer on [`DIRECTORY_ALPN`]. See the module docs.
@@ -170,6 +182,14 @@ pub enum DirectoryAnswer {
     ViewUpdate {
         /// The update.
         update: ViewUpdate,
+        /// The directory's `Fresh` for its head.
+        fresh: Fresh,
+    },
+    /// **Temporary** (card 36b): the whole signed policy, answering
+    /// [`DirectoryRequest::Policy`].
+    Policy {
+        /// The newest signed policy.
+        policy: SignedPolicy,
         /// The directory's `Fresh` for its head.
         fresh: Fresh,
     },
@@ -436,6 +456,9 @@ mod tests {
             DirectoryRequest::Resolve {
                 service: name("status"),
             },
+            DirectoryRequest::Policy {
+                have: StateVersion(2),
+            },
         ]
     }
 
@@ -494,6 +517,10 @@ mod tests {
             },
             DirectoryAnswer::ViewUpdate {
                 update: view_update.clone(),
+                fresh: fresh.clone(),
+            },
+            DirectoryAnswer::Policy {
+                policy: signed.clone(),
                 fresh: fresh.clone(),
             },
             DirectoryAnswer::Denied {
@@ -566,7 +593,7 @@ mod tests {
     #[test]
     fn only_publishes_are_large_and_they_announce_themselves() {
         let mut p = sample();
-        for b in 0..200u8 {
+        for b in 100..=255u8 {
             p.bans
                 .insert(NodeIdentity::from_seed([b; 32]).node_id(), Ban { until: 1 });
         }

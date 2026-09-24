@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use iroh::{Endpoint, EndpointAddr};
 use library::{
     AuditRecord, Hello, Invocation, Matcher, Membership, NodeIdentity, OidcNonce, OutputHasher,
-    RoleName, Service as Registered, ServiceName, SignedState, State, StateVersion,
+    Policy, RoleName, Service as Registered, ServiceName, SignedPolicy, StateVersion,
 };
 use tokio::sync::oneshot;
 
@@ -69,13 +69,13 @@ impl World {
     /// The signed state: alice and bob are members; role `analyst` is
     /// alice's email at her IdP and `ops` bob's at his; each of `services`
     /// is on the host, for `analyst`.
-    fn state(&self, services: &[&str]) -> SignedState {
+    fn state(&self, services: &[&str]) -> SignedPolicy {
         self.state_allowing(services, &["analyst"])
     }
 
     /// [`state`](Self::state), with each service allowed to `allow`.
-    fn state_allowing(&self, services: &[&str], allow: &[&str]) -> SignedState {
-        let mut s = State::new(self.root.node_id());
+    fn state_allowing(&self, services: &[&str], allow: &[&str]) -> SignedPolicy {
+        let mut s = Policy::new(self.root.node_id());
         s.version = StateVersion(1);
         s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
@@ -104,17 +104,17 @@ impl World {
                 },
             );
         }
-        s.sign(&self.root).unwrap()
+        crate::testutil::signed_policy(&self.root, s)
     }
 
     /// The host's keystore, as `wires id` + `wires join` leave it: its node
     /// key, its membership, and `state`.
-    fn keystore(&self, state: &SignedState) -> std::path::PathBuf {
+    fn keystore(&self, state: &SignedPolicy) -> std::path::PathBuf {
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);
         ks.save_node(&self.host).unwrap();
         ks.save_membership(&self.membership(&self.host)).unwrap();
-        crate::state::store::adopt_if_newer(
+        crate::policy::store::adopt_if_newer(
             &ks,
             state,
             self.root.node_id(),
@@ -427,7 +427,7 @@ async fn an_unassigned_native_service_refuses_to_start() {
     let served = Running::start(&w, host, home).await;
     let e = format!("{:#}", served.stop().await.unwrap_err());
     assert!(
-        e.contains("native service other, but the signed state (version 1) has no such service"),
+        e.contains("native service other, but the signed policy (version 1) has no such service"),
         "{e}"
     );
 }

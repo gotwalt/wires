@@ -33,7 +33,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use iroh::EndpointAddr;
-use library::{NodeId, ServiceName, State};
+use library::{NodeId, Policy, ServiceName};
 use serde::{Deserialize, Serialize};
 
 use crate::admin::keystore::Keystore;
@@ -53,7 +53,7 @@ pub(crate) const OWN_HINT_FILE: &str = "run/hint";
 /// (card 35: a caller never sends `Hello` or `Invoke` to a removed host).
 /// Empty if the service is unknown or has no such hosts.
 pub(crate) fn candidates(
-    state: &State,
+    state: &Policy,
     service: &ServiceName,
     last_good: Option<NodeId>,
 ) -> Vec<NodeId> {
@@ -64,7 +64,7 @@ pub(crate) fn candidates(
         .hosts
         .iter()
         .copied()
-        .filter(|h| !state.is_banned(*h))
+        .filter(|h| !state.bans_node(*h))
         .collect();
     if let Some(good) = last_good
         && let Some(at) = hosts.iter().position(|h| *h == good)
@@ -96,12 +96,6 @@ impl LastGood {
     /// The host that last answered `service`.
     pub(crate) fn get(&self, service: &ServiceName) -> Option<NodeId> {
         self.0.get(service).copied()
-    }
-
-    /// Every host remembered here (the hosts this node has called), in
-    /// service order.
-    pub(crate) fn hosts(&self) -> impl Iterator<Item = NodeId> + '_ {
-        self.0.values().copied()
     }
 
     /// Remember that `host` answered `service`, and save (best effort).
@@ -218,7 +212,7 @@ pub(crate) fn write_own_hint(ks: &Keystore, endpoint: &iroh::Endpoint) -> anyhow
 /// Every host of the services in `names`, once each, in first-seen order
 /// (for `wires inbox`: fetch from the hosts of the services you use).
 pub(crate) fn hosts_of<'a>(
-    state: &State,
+    state: &Policy,
     names: impl IntoIterator<Item = &'a ServiceName>,
 ) -> Vec<NodeId> {
     let mut out: Vec<NodeId> = Vec::new();
@@ -245,8 +239,8 @@ mod tests {
         NodeIdentity::from_seed([b; 32]).node_id()
     }
 
-    fn state() -> State {
-        let mut s = State::new(node(1));
+    fn state() -> Policy {
+        let mut s = Policy::new(node(1));
         s.version = StateVersion(1);
         let svc = |hosts: Vec<NodeId>| Service {
             description: String::new(),
@@ -280,11 +274,11 @@ mod tests {
     #[test]
     fn a_banned_host_is_never_a_candidate() {
         let mut s = state();
-        s.bans.insert(node(2), i64::MAX);
+        s.ban(node(2), i64::MAX);
         let name = ServiceName::new("orders-db").unwrap();
         assert_eq!(candidates(&s, &name, None), vec![node(3)]);
         assert_eq!(candidates(&s, &name, Some(node(2))), vec![node(3)]);
-        s.bans.insert(node(3), i64::MAX);
+        s.ban(node(3), i64::MAX);
         assert!(candidates(&s, &name, None).is_empty());
     }
 

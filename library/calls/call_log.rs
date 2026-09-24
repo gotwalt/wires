@@ -452,10 +452,10 @@ impl Default for Retention {
 mod tests {
     use super::*;
     use crate::audit::{CallId, OutputHasher};
+    use crate::head::StateVersion;
     use crate::invoke::Argv;
     use crate::registry::ServiceName;
     use crate::role::RoleName;
-    use crate::state::StateVersion;
     use proptest::prelude::*;
 
     fn host() -> NodeIdentity {

@@ -1,15 +1,16 @@
 //! `host.json`: how this host implements the services the signed
-//! state assigns to it (card 27).
+//! policy assigns to it (card 27).
 //!
-//! Who may call a service is no longer the host's to say: the admin-signed
-//! registry names each service's roles and hosts. The host file shrinks to
-//! the implementation plus local trust, and may only be **stricter**:
+//! Who may call a service is not the host's to say: the admin-signed
+//! registry names each service's roles and hosts, and (card 36) the IdPs
+//! the network trusts. The host file is the implementation, and may only be
+//! **stricter**:
 //!
 //! ```json
 //! {
 //!   "version": 2,
 //!   "identity": { "issuers": [
-//!     { "issuer": "https://accounts.google.com", "audiences": ["476….apps.googleusercontent.com"] }
+//!     { "issuer": "https://accounts.google.com" }
 //!   ] },
 //!   "services": {
 //!     "orders-db": {
@@ -26,15 +27,16 @@
 //! ```
 //!
 //! - `version` (required, `2`). **Unknown keys are errors** at every level.
-//! - `identity.issuers`: the IdPs whose ID tokens this host verifies, each
-//!   with the OAuth client ids it accepts as `aud`. Local trust: the registry's roles match principals,
-//!   but which IdPs to believe is the host's call.
+//! - `identity.issuers` (optional): narrows the IdPs the signed policy
+//!   trusts to those listed, and, where an entry lists `audiences`, the
+//!   `aud` values accepted from it to those. It can't add an IdP or an
+//!   audience the policy doesn't trust. Absent: the policy's, as signed.
 //! - `services`: name → `command` (argv, never a shell; each call's
 //!   arguments are appended), optional `cwd`, optional `env` (set on top of
 //!   a minimal environment: only `PATH`, `LANG` and `LC_*` are inherited
 //!   from `serve`; the server-derived `WIRES_*` values are set last), and
 //!   `also_require`: roles (defined in the
-//!   signed state) the caller must **also** be in, on top of the registry's
+//!   signed policy) the caller must **also** be in, on top of the registry's
 //!   `allow`. It can only narrow. `end_of_options: true` (default false)
 //!   puts `--` between the fixed command and the caller's arguments, so a
 //!   CLI that honours `--` takes none of them as an option (`-X DELETE`
@@ -47,7 +49,7 @@
 //!   (card 26a).
 //!
 //! What this parser checks is the file on its own. Checks against the signed
-//! state (every service here is assigned to this host; every role named is
+//! policy (every service here is assigned to this host; every role named is
 //! defined) are [`HostConfig::check_against`], which `serve` runs before
 //! it binds.
 
@@ -55,7 +57,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use library::{Audience, Issuer, NodeId, RoleName, ServiceName, State};
+use library::{Audience, NodeId, Policy, RoleName, ServiceName};
 use serde::{Deserialize, Serialize};
 
 use crate::host::identity::IdpTrust;
@@ -69,9 +71,9 @@ pub(crate) const HOST_CONFIG: u32 = 2;
 pub(crate) struct HostConfig {
     /// The format version; must be [`HOST_CONFIG`].
     pub(crate) version: u32,
-    /// Which IdPs the host trusts.
-    #[serde(default)]
-    pub(crate) identity: IdentityConfig,
+    /// Narrows the IdPs the signed policy trusts. Absent: the policy's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) identity: Option<IdentityConfig>,
     /// How each assigned service runs here, by name.
     pub(crate) services: BTreeMap<ServiceName, ServiceImpl>,
     /// Who may receive pushes from this host. Absent: nobody.
@@ -97,7 +99,7 @@ pub(crate) struct ServiceImpl {
     /// here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) env: BTreeMap<String, String>,
-    /// Roles (from the signed state) the caller must also be in. Empty: the
+    /// Roles (from the signed policy) the caller must also be in. Empty: the
     /// registry's `allow` alone decides.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) also_require: Vec<RoleName>,
@@ -147,43 +149,25 @@ pub(crate) struct AuditConfig {
     pub(crate) otlp: Option<String>,
 }
 
-/// `identity`: the IdPs the host verifies ID tokens from.
+/// `identity`: narrows the IdPs the signed policy trusts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct IdentityConfig {
-    /// The trusted issuers.
+    /// The only issuers this host verifies tokens from (each must also be
+    /// trusted by the policy).
     #[serde(default)]
     pub(crate) issuers: Vec<TrustedIssuer>,
 }
 
-impl IdentityConfig {
-    /// The IdPs and per-issuer audiences to verify ID tokens under.
-    pub(crate) fn trust(&self) -> IdpTrust {
-        IdpTrust::per_issuer(
-            self.issuers
-                .iter()
-                .map(|t| {
-                    (
-                        Issuer::new(t.issuer.clone()),
-                        t.audiences
-                            .iter()
-                            .filter(|a| !a.trim().is_empty())
-                            .map(|a| Audience::new(a.clone()))
-                            .collect(),
-                    )
-                })
-                .collect(),
-        )
-    }
-}
-
-/// One trusted IdP.
+/// One IdP this host keeps trusting.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TrustedIssuer {
     /// The token `iss`, exactly (e.g. `https://accounts.google.com`).
     pub(crate) issuer: String,
-    /// The OAuth client ids accepted as `aud` from this issuer.
+    /// The only `aud` values accepted from this issuer (each must also be
+    /// one the policy accepts). Empty: the policy's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) audiences: Vec<String>,
 }
 
@@ -241,7 +225,7 @@ impl HostConfig {
     /// - at least one service; no empty command; no empty `cwd`;
     /// - `env` names are non-empty, contain no `=` or NUL, and don't start
     ///   with `WIRES_` (the server-derived variables are not settable);
-    /// - each issuer is listed once, non-empty, with at least one audience;
+    /// - each `identity` issuer is listed once and non-empty;
     /// - `audit.otlp` is an https URL (or http to a loopback collector).
     fn validate(&self) -> Result<()> {
         if self.services.is_empty() {
@@ -255,7 +239,7 @@ impl HostConfig {
     /// too.
     pub(crate) fn validate_fields(&self) -> Result<()> {
         let mut issuers: Vec<&str> = Vec::new();
-        for trusted in &self.identity.issuers {
+        for trusted in self.identity.iter().flat_map(|i| &i.issuers) {
             let iss = trusted.issuer.as_str();
             if iss.trim().is_empty() {
                 bail!("identity.issuers: an issuer is empty");
@@ -263,8 +247,8 @@ impl HostConfig {
             if issuers.contains(&iss) {
                 bail!("identity.issuers: {iss} is listed twice");
             }
-            if trusted.audiences.iter().all(|a| a.trim().is_empty()) {
-                bail!("identity.issuers: {iss} has no audiences");
+            if trusted.audiences.iter().any(|a| a.trim().is_empty()) {
+                bail!("identity.issuers: {iss} lists an empty audience");
             }
             issuers.push(iss);
         }
@@ -290,25 +274,56 @@ impl HostConfig {
         Ok(())
     }
 
-    /// Check this file against the signed state, when `serve` starts (only
-    /// then: a later state that unassigns a service is enforced per call by
+    /// The IdPs (and per-issuer audiences) this host verifies ID tokens
+    /// under: `policy`'s `issuer` items, narrowed by `identity` when it is
+    /// present (an issuer it doesn't list is dropped; an entry's
+    /// `audiences`, when given, keep only those of the policy's). Never
+    /// wider than the policy.
+    pub(crate) fn trust(&self, policy: &Policy) -> IdpTrust {
+        let signed = policy
+            .issuers
+            .iter()
+            .map(|(iss, config)| (iss.clone(), config.audiences.clone()));
+        let Some(identity) = &self.identity else {
+            return IdpTrust::per_issuer(signed.collect());
+        };
+        IdpTrust::per_issuer(
+            signed
+                .filter_map(|(iss, audiences)| {
+                    let local = identity.issuers.iter().find(|t| t.issuer == iss.as_str())?;
+                    let audiences: Vec<Audience> = if local.audiences.is_empty() {
+                        audiences
+                    } else {
+                        audiences
+                            .into_iter()
+                            .filter(|a| local.audiences.iter().any(|l| l == a.as_str()))
+                            .collect()
+                    };
+                    Some((iss, audiences))
+                })
+                .collect(),
+        )
+    }
+
+    /// Check this file against the signed policy, when `serve` starts (only
+    /// then: a later policy that unassigns a service is enforced per call by
     /// the gate, which refuses it): every service here must be assigned
     /// to `me` ("refuses to serve a name the registry doesn't assign to
     /// it"), and every role in `also_require` and `push.allow` must be
     /// defined in `state`. The error names the first offender.
-    pub(crate) fn check_against(&self, state: &State, me: NodeId) -> Result<()> {
+    pub(crate) fn check_against(&self, state: &Policy, me: NodeId) -> Result<()> {
         let version = state.version.0;
         let me8 = me.short();
         for name in self.services.keys() {
             if state.service(name).is_none() {
                 bail!(
-                    "host.json implements service {name}, but the signed state (version \
+                    "host.json implements service {name}, but the signed policy (version \
                      {version}) has no such service"
                 );
             }
             if !state.assigns(name, me) {
                 bail!(
-                    "host.json implements service {name}, but the signed state (version \
+                    "host.json implements service {name}, but the signed policy (version \
                      {version}) does not assign it to this host ({me8}); refusing to serve it"
                 );
             }
@@ -317,7 +332,7 @@ impl HostConfig {
         for (name, svc) in &self.services {
             if let Some(r) = svc.also_require.iter().find(|r| !defined(r)) {
                 bail!(
-                    "service {name}: also_require names role {r}, which the signed state \
+                    "service {name}: also_require names role {r}, which the signed policy \
                      (version {version}) does not define"
                 );
             }
@@ -329,7 +344,7 @@ impl HostConfig {
             .find(|r| !defined(r))
         {
             bail!(
-                "push.allow names role {r}, which the signed state (version {version}) does not \
+                "push.allow names role {r}, which the signed policy (version {version}) does not \
                  define"
             );
         }
@@ -338,24 +353,36 @@ impl HostConfig {
 
     /// What `wires serve --check` prints for a `host.json`: the services it
     /// implements, their commands and `also_require`, trusted issuers, and
-    /// push. Who may call is the signed state's, so it is not shown here.
+    /// push. Who may call is the signed policy's, so it is not shown here.
     pub(crate) fn summary(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
         let _ = writeln!(out, "host.json ok (version {})", self.version);
-        let _ = writeln!(out, "trusted issuers:");
-        if self.identity.issuers.is_empty() {
-            let _ = writeln!(
-                out,
-                "  (none: no caller can be verified, so no service can be called here)"
-            );
-        }
-        for t in &self.identity.issuers {
-            let _ = writeln!(out, "  {}  audiences: {}", t.issuer, t.audiences.join(", "));
+        match &self.identity {
+            None => {
+                let _ = writeln!(out, "trusted issuers: the signed policy's");
+            }
+            Some(identity) => {
+                let _ = writeln!(out, "trusted issuers: the signed policy's, narrowed to");
+                if identity.issuers.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "  (none: no caller can be verified, so no service can be called here)"
+                    );
+                }
+                for t in &identity.issuers {
+                    let audiences = if t.audiences.is_empty() {
+                        "the policy's".to_string()
+                    } else {
+                        t.audiences.join(", ")
+                    };
+                    let _ = writeln!(out, "  {}  audiences: {audiences}", t.issuer);
+                }
+            }
         }
         let _ = writeln!(
             out,
-            "services (who may call each is in the admin-signed state):"
+            "services (who may call each is in the admin-signed policy):"
         );
         for (name, svc) in &self.services {
             let _ = writeln!(out, "  {name}");
@@ -495,7 +522,7 @@ mod tests {
             ),
             (
                 r#"{"version":2,"identity":{"issuers":[{"issuer":"https://i","audiences":[" "]}]},"services":{"a":{"command":["x"]}}}"#,
-                "https://i has no audiences",
+                "https://i lists an empty audience",
             ),
             (
                 r#"{"version":2,"services":{"a":{"command":["x"]}},"audit":{"otlp":"ftp://x"}}"#,
@@ -507,6 +534,51 @@ mod tests {
         }
     }
 
+    /// Card 36: the policy's `issuer` items are what a host trusts;
+    /// `identity` only narrows them.
+    #[test]
+    fn host_json_narrows_the_policys_issuers_and_never_widens_them() {
+        use library::{Issuer, IssuerConfig, NodeIdentity};
+        let mut policy = Policy::new(NodeIdentity::from_seed([1u8; 32]).node_id());
+        for (iss, auds) in [("https://a", &["x", "y"][..]), ("https://b", &["z"][..])] {
+            policy.issuers.insert(
+                Issuer::new(iss),
+                IssuerConfig {
+                    client_id: Audience::new(auds[0]),
+                    audiences: auds.iter().map(|a| Audience::new(*a)).collect(),
+                },
+            );
+        }
+        let trust = |json: &str| {
+            HostConfig::parse(&format!(
+                r#"{{"version":2,{json}"services":{{"a":{{"command":["x"]}}}}}}"#
+            ))
+            .unwrap()
+            .trust(&policy)
+        };
+        let all = trust("");
+        assert_eq!(
+            all.issuers(),
+            [Issuer::new("https://a"), Issuer::new("https://b")]
+        );
+        assert_eq!(all.audiences_for(&Issuer::new("https://a")).len(), 2);
+        let narrowed = trust(
+            r#""identity":{"issuers":[{"issuer":"https://a","audiences":["y","w"]},{"issuer":"https://c"}]},"#,
+        );
+        assert_eq!(
+            narrowed.issuers(),
+            [Issuer::new("https://a")],
+            "c is not the policy's"
+        );
+        assert_eq!(
+            narrowed.audiences_for(&Issuer::new("https://a")),
+            [Audience::new("y")],
+            "w is not the policy's"
+        );
+        let none = trust(r#""identity":{"issuers":[]},"#);
+        assert!(none.issuers().is_empty());
+    }
+
     #[test]
     fn refuses_services_not_assigned_here() {
         use library::{NodeIdentity, Service, StateVersion};
@@ -515,7 +587,7 @@ mod tests {
             NodeIdentity::from_seed([2u8; 32]).node_id(),
             NodeIdentity::from_seed([3u8; 32]).node_id(),
         );
-        let mut state = State::new(root.node_id());
+        let mut state = Policy::new(root.node_id());
         state.version = StateVersion(1);
         state.services.insert(
             ServiceName::new("orders-db").unwrap(),

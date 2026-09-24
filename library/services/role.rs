@@ -7,7 +7,7 @@
 //! there is no built-in role, and no role admits a caller without an
 //! identity. "Anyone signed in with this IdP" is a matcher with only
 //! `issuer`. Role definitions live in the admin-signed
-//! [`State`](crate::State), so every host and every caller evaluates the same
+//! [`Policy`](crate::Policy), so every host and every caller evaluates the same
 //! table.
 
 use std::fmt;
@@ -170,11 +170,11 @@ impl fmt::Display for EmailPattern {
 /// `alice@acme.com`. A matcher with only `issuer` admits anyone that IdP
 /// verified. A matcher never matches a caller without a verified principal,
 /// and a matcher whose `issuer` is empty is refused by
-/// [`State::validate`](crate::State::validate).
+/// [`Policy::validate`](crate::Policy::validate).
 ///
-/// Inside the signed state, absent optional keys are omitted from the
+/// Inside the signed policy, absent optional keys are omitted from the
 /// canonical JSON; that is sound because the matcher is signed as part of the
-/// whole state body, and "absent" vs "present" can't be confused (there is no
+/// whole signed body, and "absent" vs "present" can't be confused (there is no
 /// default value that means "any").
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

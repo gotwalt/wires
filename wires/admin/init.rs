@@ -2,13 +2,15 @@
 //!
 //! Creates the root key and this machine's node key in one keystore, mints
 //! this node's badge (its membership: the admin's node is admitted like any
-//! other, which is what lets it push every later state to the hosts by key),
-//! records it in the ledger, and signs the first admin-signed state: no
-//! roles, no services, no bans.
+//! other, which is what lets it publish every later policy to the
+//! directories by key), records it in the ledger, and signs the first
+//! policy: one trusted IdP (its `issuer` item, Google unless `--issuer`
+//! says otherwise: every role's matchers must name a trusted issuer), no
+//! roles, no services, no bans, no directories yet.
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use clap::Args;
-use library::{Membership, NodeIdentity};
+use library::{GOOGLE_ISSUER, Issuer, Membership, NodeIdentity};
 
 use super::keystore::Keystore;
 use super::ledger::Ledger;
@@ -22,17 +24,33 @@ pub(crate) struct InitArgs {
     /// 30 days).
     #[arg(long, default_value = Ttl::DEFAULT)]
     pub(crate) ttl: Ttl,
-    /// Lifetime of the first signed state.
-    #[arg(long, default_value = Ttl::DEFAULT)]
+    /// Lifetime of the first signed policy.
+    #[arg(long, default_value = Ttl::POLICY_DEFAULT)]
     pub(crate) state_ttl: Ttl,
+    /// The IdP the network trusts first: its exact `iss` (more with
+    /// `wires issuer set`).
+    #[arg(long, default_value = GOOGLE_ISSUER)]
+    pub(crate) issuer: String,
+    /// The OAuth client id `wires login` signs in under at that IdP. Falls
+    /// back to `$WIRES_OIDC_CLIENT_ID`.
+    #[arg(long)]
+    pub(crate) client_id: Option<String>,
+    /// An `aud` value hosts accept from that IdP. Repeatable; default: the
+    /// client id.
+    #[arg(long = "audience")]
+    pub(crate) audience: Vec<String>,
 }
 
+#[cfg(test)]
 impl Default for InitArgs {
-    /// Both lifetimes at [`Ttl::DEFAULT`].
+    /// The default lifetimes, Google, and a test client id.
     fn default() -> Self {
         Self {
             ttl: Ttl::default(),
-            state_ttl: Ttl::default(),
+            state_ttl: Ttl::policy_default(),
+            issuer: GOOGLE_ISSUER.to_string(),
+            client_id: Some("wires-test-client".into()),
+            audience: Vec::new(),
         }
     }
 }
@@ -44,13 +62,27 @@ pub(crate) fn init_cmd(a: InitArgs) -> anyhow::Result<String> {
 
 /// [`init_cmd`] against an explicit keystore (the testable form).
 pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
-    if let Some(fabric) = crate::state::store::fabric(ks)? {
+    if let Some(fabric) = crate::policy::store::fabric(ks)? {
         bail!(
             "this keystore is already in network {}…; `wires init` starts a new network — use \
              another $WIRES_HOME for that",
             fabric.short()
         );
     }
+    let client_id = a
+        .client_id
+        .clone()
+        .or_else(|| std::env::var("WIRES_OIDC_CLIENT_ID").ok())
+        .filter(|c| !c.trim().is_empty())
+        .with_context(|| {
+            format!(
+                "no OAuth client id for {}: pass --client-id (or set $WIRES_OIDC_CLIENT_ID); \
+                 every role names a trusted IdP, and `wires login` signs in under this client id",
+                a.issuer
+            )
+        })?;
+    let issuer = Issuer::new(a.issuer.trim());
+    let config = super::service::issuer_config(&client_id, &a.audience)?;
     let root = match ks.read_root_identity()? {
         Some(root) => root,
         None => {
@@ -74,15 +106,18 @@ pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
     let mut ledger = Ledger::load(ks)?;
     ledger.record(me.node_id(), None, badge.not_after);
     ledger.save(ks)?;
-    let state = super::service::edit_state(ks, a.state_ttl, |_| Ok(()))?;
-    crate::state::store::save_admin(ks, me.node_id())?;
+    let held = super::service::edit_policy(ks, a.state_ttl, |p| {
+        p.issuers.insert(issuer.clone(), config);
+        Ok(())
+    })?;
 
     Ok(format!(
-        "network {}\nnode {}\nstate version {}\n\
-         next: on each joining machine run `wires id`, then here `wires invite <node-id> --name <label>`",
+        "network {}\nnode {}\npolicy version {} (trusts {issuer})\n\
+         next: on each joining machine run `wires id`, then here `wires invite <node-id> --name \
+         <label>`; name a directory with `wires directory add <label>`",
         root.node_id().hex(),
         me.node_id().hex(),
-        state.state.version.0,
+        held.version().0,
     ))
 }
 
@@ -92,7 +127,7 @@ mod tests {
     use crate::testutil::temp_dir;
 
     #[test]
-    fn init_badges_this_node_and_signs_an_empty_state() {
+    fn init_badges_this_node_and_signs_a_policy_trusting_one_idp() {
         let ks = Keystore::at(temp_dir());
         let out = init_in(&ks, InitArgs::default()).unwrap();
         let root = ks.read_root_identity().unwrap().unwrap();
@@ -103,21 +138,54 @@ mod tests {
         let membership = ks.read_membership().unwrap().unwrap();
         assert_eq!(membership.member, me.node_id());
         assert_eq!(membership.fabric, root.node_id());
-        let state = crate::state::store::read(&ks, root.node_id())
+        let held = crate::policy::store::read(&ks, root.node_id())
             .unwrap()
             .unwrap();
-        assert_eq!(state.state.version, library::StateVersion(1));
-        assert!(state.state.services.is_empty());
-        assert!(state.state.bans.is_empty());
+        assert_eq!(held.version(), library::StateVersion(1));
+        assert!(held.policy.services.is_empty());
+        assert!(held.policy.bans.is_empty());
+        assert!(held.directories().is_empty());
+        let google = &held.policy.issuers[&Issuer::new(GOOGLE_ISSUER)];
+        assert_eq!(google.client_id.as_str(), "wires-test-client");
+        assert_eq!(google.audiences, vec![google.client_id.clone()]);
+        // 90 days by default: freshness, not expiry, keeps copies current.
+        assert!(held.policy.not_after >= now_unix() + 89 * 86_400);
         let ledger = Ledger::load(&ks).unwrap();
         assert_eq!(
             ledger.get(me.node_id()).map(|i| i.not_after),
             Some(membership.not_after)
         );
-        assert_eq!(
-            crate::state::store::read_admin(&ks).unwrap(),
-            Some(me.node_id())
+    }
+
+    #[test]
+    fn init_names_another_idp_and_needs_a_client_id() {
+        let ks = Keystore::at(temp_dir());
+        let a = InitArgs {
+            issuer: "https://idp.example".into(),
+            client_id: Some("cli".into()),
+            audience: vec!["api://a".into(), "api://b".into()],
+            ..InitArgs::default()
+        };
+        init_in(&ks, a).unwrap();
+        let root = ks.read_root_identity().unwrap().unwrap().node_id();
+        let held = crate::policy::store::read(&ks, root).unwrap().unwrap();
+        let idp = &held.policy.issuers[&Issuer::new("https://idp.example")];
+        assert_eq!(idp.audiences.len(), 2);
+        assert!(
+            !held
+                .policy
+                .issuers
+                .contains_key(&Issuer::new(GOOGLE_ISSUER))
         );
+
+        let ks = Keystore::at(temp_dir());
+        let a = InitArgs {
+            client_id: Some("  ".into()),
+            ..InitArgs::default()
+        };
+        let e = init_in(&ks, a).unwrap_err();
+        assert!(format!("{e:#}").contains("--client-id"), "{e:#}");
+        assert!(ks.read_root_identity().unwrap().is_none(), "nothing made");
     }
 
     #[test]

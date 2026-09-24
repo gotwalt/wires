@@ -26,8 +26,8 @@ use std::time::Duration;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, EndpointAddr};
 use library::{
-    Frame, Hello, HelloAck, Invocation, Matcher, Membership, NodeIdentity, OidcNonce, RoleName,
-    ServiceName, SignedState, State, StateVersion,
+    Frame, Hello, HelloAck, Invocation, Matcher, Membership, NodeIdentity, OidcNonce, Policy,
+    RoleName, ServiceName, SignedPolicy, StateVersion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::timeout;
@@ -102,13 +102,13 @@ fn email_at(idp: &MockIdp, email: &str) -> Matcher {
 
 /// The state `root` signs at `version` (issued now, never expiring), after
 /// `edit` fills it in.
-fn signed_state(root: &NodeIdentity, version: u64, edit: impl FnOnce(&mut State)) -> SignedState {
-    let mut s = State::new(root.node_id());
+fn signed_state(root: &NodeIdentity, version: u64, edit: impl FnOnce(&mut Policy)) -> SignedPolicy {
+    let mut s = Policy::new(root.node_id());
     s.version = StateVersion(version);
     s.issued = crate::clock::now_unix();
     s.not_after = i64::MAX;
     edit(&mut s);
-    s.sign(root).unwrap()
+    crate::testutil::signed_policy(root, s)
 }
 
 /// `who`'s membership under `root`, never expiring.
@@ -132,8 +132,8 @@ fn hello(root: &NodeIdentity, who: &NodeIdentity, version: u64, idp: Option<&Moc
 }
 
 /// Store `state` in `ks` as `wires/state` does; whether it was adopted.
-fn adopt(ks: &Keystore, root: &NodeIdentity, state: &SignedState) -> bool {
-    crate::state::store::adopt_if_newer(ks, state, root.node_id(), crate::clock::now_unix())
+fn adopt(ks: &Keystore, root: &NodeIdentity, state: &SignedPolicy) -> bool {
+    crate::policy::store::adopt_if_newer(ks, state, root.node_id(), crate::clock::now_unix())
         .unwrap()
 }
 

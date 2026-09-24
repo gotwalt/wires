@@ -35,10 +35,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec::canonical_bytes;
 use crate::error::{Error, Result};
+use crate::head::StateVersion;
 use crate::head::{HeadHash, SignedPolicyHead};
 use crate::identity::{AlgorithmId, NodeId, NodeIdentity, Signature};
 use crate::idp::CLOCK_SKEW_SECS;
-use crate::state::StateVersion;
 
 /// The current (and only) `Fresh` format.
 pub const FRESH_V1: u8 = 1;

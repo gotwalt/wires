@@ -61,7 +61,7 @@ use crate::caller::one_line;
 use crate::caller::pick::{self, Hints};
 use crate::host::record_stream::{self, Link, RecordFrame, StreamItem};
 use crate::host::transport;
-use crate::state::store;
+use crate::policy::store;
 
 /// The keystore file holding the reader's marks: per host, its chain anchor,
 /// a resume point per view, and recent calls' labels ([`Marks`]).
@@ -577,7 +577,7 @@ pub(crate) async fn watch_with(
     out: &mut (dyn FnMut(Output) + Send),
 ) -> Result<Report> {
     let (membership, state) = store::require(ks)?;
-    let state = &state.state;
+    let state = &state.policy;
     let services: Vec<ServiceName> = if opts.services.is_empty() {
         state.services.keys().cloned().collect()
     } else {

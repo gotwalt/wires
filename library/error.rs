@@ -14,7 +14,7 @@ pub enum Error {
     #[error("decode: {0}")]
     Decode(serde_json::Error),
 
-    /// A token (an invite, a membership, a signed state) was not valid
+    /// A token (an invite, a membership) was not valid
     /// base64.
     #[error("token decode: {0}")]
     TokenDecode(#[from] base64::DecodeError),
@@ -37,7 +37,7 @@ pub enum Error {
 
     /// A credential's `not_after` is in the past relative to the checked time.
     ///
-    /// Shared by memberships and signed states — the caller prefixes which
+    /// Shared by memberships and policy heads — the caller prefixes which
     /// credential it was checking (`membership rejected: …`), so the display
     /// deliberately does *not* name one.
     #[error("expired at {not_after}")]
@@ -51,8 +51,8 @@ pub enum Error {
     #[error("credential subject does not match caller")]
     SubjectMismatch,
 
-    /// The node's badge verifies, but the signed state bans it (the admin
-    /// removed it; [`State::bans`](crate::State::bans)).
+    /// The node's badge verifies, but the signed policy bans it (the admin
+    /// removed it; [`Policy::bans`](crate::Policy::bans)).
     #[error("banned until {until}")]
     Banned {
         /// The ban's `until`, unix seconds.
@@ -72,9 +72,9 @@ pub enum Error {
     #[error("bad frame")]
     BadFrame,
 
-    /// [`State::sign`](crate::State::sign) was handed a signing key whose
-    /// node id is not the state's `fabric` — a usage error (the fabric root
-    /// must sign its own state).
+    /// [`Policy::sign`](crate::Policy::sign) was handed a signing key whose
+    /// node id is not the policy's `fabric` — a usage error (the fabric root
+    /// must sign its own policy).
     #[error("signing key is not the network root")]
     FabricMismatch,
 
@@ -90,11 +90,6 @@ pub enum Error {
     /// [`EmailPattern`](crate::EmailPattern)).
     #[error("invalid email pattern (an address, or `*@domain`)")]
     InvalidEmailPattern,
-
-    /// A [`State`](crate::State) broke a structural rule of
-    /// [`State::validate`](crate::State::validate); the string names which.
-    #[error("invalid signed state: {0}")]
-    InvalidState(String),
 
     /// An argument list broke the [`Argv`](crate::Argv) limits.
     #[error("invalid argv")]

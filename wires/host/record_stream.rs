@@ -448,11 +448,11 @@ pub(crate) async fn authorize(
     mine: bool,
     now: i64,
 ) -> std::result::Result<View, String> {
-    let state = host.state().map_err(|e| {
+    let state = host.policy().map_err(|e| {
         tracing::warn!("signed state unusable: {e:#}");
         HOST_MISCONFIGURED.to_string()
     })?;
-    let s = &state.state;
+    let s = &state.policy;
     if let Err(detail) = host.check_member(&state, &hello.membership, caller, now) {
         STRANGERS.refused("record stream", caller, &detail);
         return Err(NOT_ADMITTED.to_string());
@@ -658,7 +658,7 @@ where
         // Decide again before sending anything new: a reader removed (or
         // dropped from `readers`) gets nothing logged after that.
         let now = crate::clock::now_unix();
-        let version = host.state().ok().map(|s| s.state.version);
+        let version = host.policy().ok().map(|s| s.version());
         let regrant = if view.due(version, now) {
             let next = match decide(now).await {
                 Ok(next) => next,

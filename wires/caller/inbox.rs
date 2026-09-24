@@ -484,7 +484,7 @@ impl std::fmt::Debug for InboxReceiver {
 
 impl InboxReceiver {
     /// Whether `peer` may deliver here: its badge verifies, and it is a host
-    /// in this node's signed state, not banned ([`library::State::is_host`]). `Err` is why not, for this node's trace only: the peer
+    /// in this node's signed state, not banned ([`library::Policy::is_host`]). `Err` is why not, for this node's trace only: the peer
     /// hears just [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED).
     pub(crate) fn admit(
         &self,
@@ -494,14 +494,14 @@ impl InboxReceiver {
     ) -> std::result::Result<(), String> {
         library::check_inclusion(membership, self.fabric, peer, now)
             .map_err(|e| format!("membership rejected: {e}"))?;
-        let state = crate::state::store::read(&self.keystore, self.fabric)
+        let state = crate::policy::store::read(&self.keystore, self.fabric)
             .map_err(|e| format!("{e:#}"))?
             .ok_or("this node holds no signed state")?;
-        if !state.state.is_host(peer) {
+        if !state.policy.is_host(peer) {
             return Err(format!(
                 "not a host in the signed state (version {}); this inbox takes pushes from \
                  hosts only",
-                state.state.version.0
+                state.version().0
             ));
         }
         Ok(())
@@ -827,7 +827,7 @@ async fn cold_fetcher(
 ) -> Result<Fetcher> {
     let allowed = crate::caller::services::allowed(ks).await?;
     let hosts: Vec<NodeId> = crate::caller::pick::hosts_of(
-        &allowed.state.state,
+        &allowed.state.policy,
         allowed.grants.iter().map(|g| &g.service),
     )
     .into_iter()
@@ -879,12 +879,12 @@ mod tests {
         let banned = node(6);
         let home = crate::testutil::temp_dir();
         let ks = Arc::new(Keystore::at(&home));
-        let mut s = library::State::new(root.node_id());
+        let mut s = library::Policy::new(root.node_id());
         s.version = library::StateVersion(9);
         s.not_after = i64::MAX;
         s.ban(banned, i64::MAX);
-        let signed = s.sign(&root).unwrap();
-        crate::state::store::adopt_if_newer(&ks, &signed, root.node_id(), 10).unwrap();
+        let signed = crate::testutil::signed_policy(&root, s);
+        crate::policy::store::adopt_if_newer(&ks, &signed, root.node_id(), 10).unwrap();
         let receiver = InboxReceiver {
             me,
             fabric: root.node_id(),

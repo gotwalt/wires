@@ -34,7 +34,14 @@ use crate::codec::{canonical_bytes, hex_id};
 use crate::error::{Error, Result};
 use crate::identity::{AlgorithmId, NodeId, NodeIdentity, Signature};
 use crate::merkle::ItemsRoot;
-use crate::state::StateVersion;
+
+/// A monotonic policy version: every admin edit bumps it by one, and a node
+/// never replaces its copy with a lower one. (The name is kept from the
+/// signed state the policy replaced: it is the `state_version` a call's
+/// `Hello` carries.)
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StateVersion(pub u64);
 
 /// The policy head format: the third signed-state format.
 pub const POLICY_V3: u8 = 3;
@@ -233,7 +240,7 @@ mod tests {
         let bytes = signed_bytes(&signed.head, &signed.alg).unwrap();
         assert!(bytes.starts_with(b"wires/policy-head/v1\0{\"alg\":\"ed25519\",\"head\":{"));
         // The same body under the state's context doesn't verify.
-        let mut other = crate::state::STATE_CONTEXT.to_vec();
+        let mut other = crate::fresh::FRESH_CONTEXT.to_vec();
         other.extend_from_slice(&bytes[POLICY_HEAD_CONTEXT.len()..]);
         assert!(root().node_id().verify(&other, &signed.sig).is_err());
     }

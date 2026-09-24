@@ -1,15 +1,16 @@
-//! Policy evaluation over the signed state: **may this caller call this
+//! Policy evaluation over the signed policy: **may this caller call this
 //! service**, and **which services may it call**.
 //!
 //! One function, two uses: a host runs [`authorize`] on every call (then its
 //! own stricter `also_require`), and `wires services` runs
 //! [`allowed_services`] locally to list what the caller may use. Both read
-//! only the signed [`State`] and the caller's verified [`Principal`]; there
+//! only the [`Policy`] (a verified [`SignedPolicy`](crate::SignedPolicy)'s
+//! items) and the caller's verified [`Principal`]; there
 //! is no network and no clock (the principal handed in is already fresh).
 //!
 //! Neither checks the caller's badge: that is the gate's, before this
 //! ([`check_admitted`](crate::check_admitted)). Both do refuse a node the
-//! state bans, so a registry decision never admits a removed node.
+//! policy bans, so a registry decision never admits a removed node.
 //!
 //! The host is the ground truth: [`allowed_services`] is defined in terms of
 //! [`authorize`], so the listing never shows a service the host would refuse
@@ -21,7 +22,7 @@ use crate::identity::NodeId;
 use crate::idp::Principal;
 use crate::registry::ServiceName;
 use crate::role::RoleName;
-use crate::state::State;
+use crate::signed_policy::Policy;
 
 /// A service the caller may call, and the role that admits it (what `wires
 /// services` shows as "why").
@@ -37,7 +38,7 @@ pub struct Grant {
 /// and what the call log records, so each case is precise.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// The state bans the caller: the admin removed it.
+    /// The policy bans the caller: the admin removed it.
     Banned,
     /// No service by that name is registered.
     UnknownService(ServiceName),
@@ -98,17 +99,17 @@ impl fmt::Display for Refusal {
 /// [`Refusal`].
 ///
 /// Does **not** check that the service is assigned to any particular host
-/// ([`State::assigns`]) or the host's own `also_require`: those are the
+/// ([`Policy::assigns`]) or the host's own `also_require`: those are the
 /// host's, on top of this.
 ///
 /// ```
 /// use library::{
-///     authorize, Matcher, NodeIdentity, Principal, Refusal, RoleName, Service, ServiceName,
-///     State,
+///     authorize, Matcher, NodeIdentity, Policy, Principal, Refusal, RoleName, Service,
+///     ServiceName,
 /// };
 ///
 /// let host = NodeIdentity::from_seed([2u8; 32]).node_id();
-/// let mut state = State::new(NodeIdentity::from_seed([1u8; 32]).node_id());
+/// let mut state = Policy::new(NodeIdentity::from_seed([1u8; 32]).node_id());
 /// let staff = RoleName::new("staff").unwrap();
 /// state.roles.insert(staff.clone(), vec![Matcher::new("https://idp")]);
 /// let status = ServiceName::new("status").unwrap();
@@ -133,12 +134,12 @@ impl fmt::Display for Refusal {
 /// assert_eq!(authorize(&state, removed, Some(&alice), &status), Err(Refusal::Banned));
 /// ```
 pub fn authorize(
-    state: &State,
+    state: &Policy,
     caller: NodeId,
     principal: Option<&Principal>,
     service: &ServiceName,
 ) -> Result<RoleName, Refusal> {
-    if state.is_banned(caller) {
+    if state.bans_node(caller) {
         return Err(Refusal::Banned);
     }
     let Some(svc) = state.services.get(service) else {
@@ -164,19 +165,16 @@ pub fn authorize(
 /// Whether `role` admits a node presenting `principal`: a defined role
 /// when one of its matchers matches the verified principal. With no
 /// principal, no role admits; an undefined role never admits (a validated
-/// state has none, but a failure here must deny).
-pub fn role_admits(state: &State, role: &RoleName, principal: Option<&Principal>) -> bool {
-    let (Some(p), Some(matchers)) = (principal, state.roles.get(role)) else {
-        return false;
-    };
-    matchers.iter().any(|m| m.matches(p))
+/// policy has none, but a failure here must deny).
+pub fn role_admits(state: &Policy, role: &RoleName, principal: Option<&Principal>) -> bool {
+    state.role_admits(role, principal)
 }
 
 /// Every service [`authorize`] would admit `caller` to, with the admitting
 /// role, in name order. Services it can't call are left out, not listed as
 /// refused. A banned node gets nothing.
 pub fn allowed_services(
-    state: &State,
+    state: &Policy,
     caller: NodeId,
     principal: Option<&Principal>,
 ) -> Vec<Grant> {
@@ -197,10 +195,10 @@ pub fn allowed_services(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::head::StateVersion;
     use crate::identity::NodeIdentity;
     use crate::registry::Service;
     use crate::role::Matcher;
-    use crate::state::StateVersion;
 
     fn node(b: u8) -> NodeId {
         NodeIdentity::from_seed([b; 32]).node_id()
@@ -230,8 +228,8 @@ mod tests {
     /// alice (2), bob (3) call; host (4) serves `orders-db` (analyst:
     /// alice at [`ISS`]) and `status` (staff: anyone [`ISS`] verified);
     /// `locked` allows nobody; 9 is banned.
-    fn state() -> State {
-        let mut s = State::new(node(1));
+    fn state() -> Policy {
+        let mut s = Policy::new(node(1));
         s.version = StateVersion(1);
         s.not_after = i64::MAX;
         s.ban(node(9), i64::MAX);
@@ -346,7 +344,7 @@ mod tests {
         assert_eq!(listed, vec![name("status")]);
         assert!(allowed_services(&s, node(3), None).is_empty());
         assert!(allowed_services(&s, node(9), Some(&alice)).is_empty());
-        // A node the state never heard of is no different from alice.
+        // A node the policy never heard of is no different from alice.
         assert_eq!(allowed_services(&s, node(8), Some(&alice)).len(), 2);
     }
 

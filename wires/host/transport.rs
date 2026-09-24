@@ -37,7 +37,7 @@ use iroh::endpoint::presets::N0;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 
 use library::{
-    Chunk, Frame, Hello, Invocation, NodeId, NodeIdentity, ServiceName, SignedState,
+    Chunk, Frame, Hello, Invocation, NodeId, NodeIdentity, ServiceName, SignedPolicy,
     check_inclusion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -747,7 +747,7 @@ where
     let service = invocation.service.clone();
     let now = crate::clock::now_unix();
 
-    let state = match host.state() {
+    let state = match host.policy() {
         Ok(state) => state,
         Err(e) => {
             // The host's own fault, not the caller's: an operator error.
@@ -831,7 +831,7 @@ where
     let ack = Frame::HelloAck(library::HelloAck {
         membership: host.membership.clone(),
         state_version: version,
-        newer_state: (hello.state_version < version).then(|| state.clone()),
+        newer_policy: (hello.state_version < version).then(|| state.signed.clone()),
     });
     if let Err(e) = write_frame(&mut send, &ack).await {
         // The caller is gone before anything ran: close the logged call.
@@ -1034,7 +1034,7 @@ pub(crate) async fn call_service_on<R, W, E>(
     dial_timeout: std::time::Duration,
     hello: Hello,
     invocation: Invocation,
-    on_ack: impl FnOnce(NodeId, Option<&SignedState>) -> Result<()>,
+    on_ack: impl FnOnce(NodeId, Option<&SignedPolicy>) -> Result<()>,
     stdin: R,
     stdout: W,
     stderr: E,
@@ -1150,7 +1150,7 @@ pub(crate) async fn dial_opened_with<S, R, I, W, E>(
     hello: Hello,
     invocation: Invocation,
     target: NodeId,
-    on_ack: impl FnOnce(Option<&SignedState>) -> Result<()>,
+    on_ack: impl FnOnce(Option<&SignedPolicy>) -> Result<()>,
     stdin: I,
     mut stdout: W,
     mut stderr: E,
@@ -1168,8 +1168,8 @@ where
     write_frame(&mut send, &Frame::Invoke(invocation)).await?;
 
     // Read the host's ack first (it is always the host's first frame).
-    let (ack_membership, newer_state) = match read_frame(&mut recv).await? {
-        Some(Frame::HelloAck(ack)) => (ack.membership, ack.newer_state),
+    let (ack_membership, newer_policy) = match read_frame(&mut recv).await? {
+        Some(Frame::HelloAck(ack)) => (ack.membership, ack.newer_policy),
         // Refused: surface the host's reason. No stdin task has been
         // spawned yet, so nothing was forwarded and nothing hit local stdout.
         Some(Frame::Denied { reason }) => return Err(Denied::new(reason).into()),
@@ -1181,7 +1181,7 @@ where
     // service is `on_ack`'s to check, against the signed state.
     check_inclusion(&ack_membership, root, target, crate::clock::now_unix())
         .map_err(|e| anyhow!("the host's membership was rejected (no stdin sent): {e}"))?;
-    on_ack(newer_state.as_ref())?;
+    on_ack(newer_policy.as_ref())?;
 
     // Local stdin -> Stdin frames, then shut down the send direction (EOF).
     let stdin_task = tokio::spawn(async move {
@@ -1234,7 +1234,7 @@ mod tests {
     use crate::admin::keystore::Keystore;
     use crate::host::config::HostConfig;
     use crate::host::gate::ServicesHost;
-    use library::{Argv, Membership, Service, State, StateVersion};
+    use library::{Argv, Membership, Policy, Service, StateVersion};
 
     #[test]
     fn a_service_child_gets_a_minimal_environment() {
@@ -1314,7 +1314,7 @@ mod tests {
         let (root, host) = (root(), host_id());
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);
-        let mut s = State::new(root.node_id());
+        let mut s = Policy::new(root.node_id());
         s.version = StateVersion(1);
         s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
@@ -1330,9 +1330,14 @@ mod tests {
                 readers: vec![],
             },
         );
-        let signed = s.sign(&root).unwrap();
-        crate::state::store::adopt_if_newer(&ks, &signed, root.node_id(), crate::clock::now_unix())
-            .unwrap();
+        let signed = crate::testutil::signed_policy(&root, s);
+        crate::policy::store::adopt_if_newer(
+            &ks,
+            &signed,
+            root.node_id(),
+            crate::clock::now_unix(),
+        )
+        .unwrap();
         let config = HostConfig::parse(&format!(
             r#"{{"version":2,"identity":{},"services":{{"t":{{"command":{}}}}}}}"#,
             crate::testutil::test_identity_json(),

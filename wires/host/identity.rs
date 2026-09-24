@@ -6,7 +6,9 @@
 //! session [`Hello`](library::Hello) of a call, and in the inbox
 //! [`Hello`](library::InboxFrame::Hello) of a fetch. Each one is verified
 //! here with card 04's [`KeyFetcher`] under
-//! the host's own trusted issuers ([`IdpTrust`], from `host.json`). The iroh
+//! the host's trusted issuers ([`IdpTrust`]: the signed policy's `issuer`
+//! items, narrowed by `host.json`; card 36), which follow the policy the
+//! host decides under ([`Identities::set_trust`]). The iroh
 //! connection authenticated the presenting key, and the token's OIDC nonce
 //! binds it to that key, so a token for someone else's key never verifies.
 //! A token that fails is traced and never displaces a principal that
@@ -27,7 +29,8 @@ use crate::caller::jwks::{KeyFetcher, VerifyError};
 pub(crate) type Verdict = Result<Principal, VerifyError>;
 
 /// Which issuers a host accepts ID tokens from, each with its own accepted
-/// audiences (`host.json` `identity.issuers`).
+/// audiences (the policy's `issuer` items, narrowed by `host.json`'s
+/// `identity.issuers`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IdpTrust {
     /// The issuers whose keys this host will fetch and trust, each with the
@@ -42,7 +45,7 @@ impl IdpTrust {
         Self { by_issuer: issuers }
     }
 
-    /// The trusted issuers, in the order `host.json` lists them.
+    /// The trusted issuers, in order.
     pub(crate) fn issuers(&self) -> Vec<Issuer> {
         self.by_issuer.iter().map(|(iss, _)| iss.clone()).collect()
     }
@@ -75,8 +78,8 @@ pub(crate) fn is_fresh(p: &Principal, now: i64) -> bool {
 pub(crate) struct Identities {
     /// Fetches and caches issuers' keys.
     fetcher: KeyFetcher,
-    /// Which issuers and audiences this host accepts.
-    trust: IdpTrust,
+    /// Which issuers and audiences this host accepts now.
+    trust: std::sync::RwLock<IdpTrust>,
     /// Every node a token has been seen from, with the verified principal
     /// of the latest `exp` (possibly stale by now), if any verified.
     known: Mutex<HashMap<NodeId, Option<Principal>>>,
@@ -95,9 +98,24 @@ impl Identities {
     pub(crate) fn new(fetcher: KeyFetcher, trust: IdpTrust) -> Self {
         Self {
             fetcher,
-            trust,
+            trust: std::sync::RwLock::new(trust),
             known: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Verify under `trust` from now on (the host adopted a policy whose
+    /// `issuer` items changed). Principals already verified stay.
+    pub(crate) fn set_trust(&self, trust: IdpTrust) {
+        let mut held = self.trust.write().expect("identity trust poisoned");
+        if *held != trust {
+            tracing::info!(issuers = ?trust.issuers(), "trusted issuers changed");
+            *held = trust;
+        }
+    }
+
+    /// The trust tokens are verified under now.
+    pub(crate) fn trust(&self) -> IdpTrust {
+        self.trust.read().expect("identity trust poisoned").clone()
     }
 
     /// Verify the ID token `node` presented (in a session or inbox `Hello`)
@@ -113,12 +131,13 @@ impl Identities {
             node,
             id_token: id_token.clone(),
         };
+        let trust = self.trust();
         let verdict = self
             .fetcher
             .verify(
                 &claim,
-                &self.trust.issuers(),
-                self.trust.audiences_for_claim(&claim),
+                &trust.issuers(),
+                trust.audiences_for_claim(&claim),
                 now,
             )
             .await;

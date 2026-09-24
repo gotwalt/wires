@@ -700,7 +700,7 @@ impl PushHost {
             }
         };
         let now = crate::clock::now_unix();
-        let state = match self.host.state() {
+        let state = match self.host.policy() {
             Ok(state) => state,
             Err(e) => {
                 tracing::warn!("signed state unusable: {e:#}");
@@ -1055,20 +1055,25 @@ mod tests {
     /// tests stop at admission, and `serve` isn't preflighted.)
     fn push_host() -> (Arc<PushHost>, mpsc::Receiver<AuditRecord>) {
         use crate::admin::keystore::Keystore;
-        use library::{Membership, State, StateVersion};
+        use library::{Membership, Policy, StateVersion};
         let root = NodeIdentity::from_seed([1u8; 32]);
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);
-        let mut s = State::new(root.node_id());
+        let mut s = Policy::new(root.node_id());
         s.version = StateVersion(1);
         s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
         for seed in 50..55u8 {
             s.ban(node(seed), i64::MAX);
         }
-        let signed = s.sign(&root).unwrap();
-        crate::state::store::adopt_if_newer(&ks, &signed, root.node_id(), crate::clock::now_unix())
-            .unwrap();
+        let signed = crate::testutil::signed_policy(&root, s);
+        crate::policy::store::adopt_if_newer(
+            &ks,
+            &signed,
+            root.node_id(),
+            crate::clock::now_unix(),
+        )
+        .unwrap();
         let config = crate::host::config::HostConfig::parse(
             r#"{"version":2,"services":{"t":{"command":["true"]}},"push":{"allow":["analyst"]}}"#,
         )

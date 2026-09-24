@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use library::{IdToken, IdentityClaim, OidcNonce, State};
+use library::{IdToken, IdentityClaim, OidcNonce, Policy};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use url::Url;
@@ -48,7 +48,7 @@ fn form(pairs: &[(&str, &str)]) -> String {
 type Seen = Arc<Mutex<Vec<(String, Vec<String>, IdToken)>>>;
 
 struct Scripted {
-    state: State,
+    state: Policy,
     seen: Seen,
 }
 
@@ -82,7 +82,7 @@ impl Caller for Recording {
 
 impl Backend for Scripted {
     type Caller = Recording;
-    fn state(&self) -> anyhow::Result<State> {
+    fn state(&self) -> anyhow::Result<Policy> {
         Ok(self.state.clone())
     }
     fn caller(&self, token: IdToken) -> Recording {

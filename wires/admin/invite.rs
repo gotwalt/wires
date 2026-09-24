@@ -3,19 +3,19 @@
 //!
 //! **`invite` is not an edit** (card 35). It mints the node's root-signed
 //! badge (its membership), records it in the admin's ledger
-//! ([`super::ledger`]), and bundles it with the current signed state into
-//! one [`Invite`] token. The state's version doesn't move and nothing is
-//! pushed: every host admits any badge the root signed. Two cases do edit,
-//! and then push: re-inviting a node the state bans lifts the ban, and a
-//! state that has expired is re-signed (a joiner can't install an expired
-//! one).
+//! ([`super::ledger`]), and bundles it with the current signed policy (whose
+//! head names the directories) into one [`Invite`] token. The policy's
+//! version doesn't move and nothing is published: every host admits any
+//! badge the root signed. Two cases do edit, and then publish: re-inviting a
+//! node the policy bans lifts the ban, and a policy that has expired is
+//! re-signed (a joiner can't install an expired one).
 //!
-//! **`remove` is a ban**: an edit that adds the node to the state's `bans`
+//! **`remove` is a ban**: an edit that adds the node to the policy's bans
 //! until its badge would expire anyway (the ledger's `not_after`, or the
 //! longest badge lifetime for a node the ledger doesn't know), drops it from
-//! every service it hosted, and is pushed to the hosts. Every host refuses
-//! its next connection (the host re-reads its state per connection, so no
-//! restart).
+//! every service it hosted and from the directories, and is published to
+//! the directories. Every host refuses its next connection once it holds
+//! the new policy (it re-reads its policy per connection, so no restart).
 //!
 //! Names (`--name alice`) are the admin's local labels in the ledger, for
 //! `wires remove alice`. They are not identity: nothing on the wire carries
@@ -27,7 +27,7 @@ use library::{Invite, Membership, NodeId};
 
 use super::keystore::{self, Keystore};
 use super::ledger::Ledger;
-use super::service::edit_state;
+use super::service::edit_policy;
 use super::ttl::Ttl;
 use super::{Report, run_edit, run_if_edited};
 use crate::clock::now_unix;
@@ -46,10 +46,10 @@ pub(crate) struct InviteArgs {
     /// 30 days).
     #[arg(long, default_value = Ttl::DEFAULT)]
     pub(crate) ttl: Ttl,
-    /// Lifetime of the signed state, from now, if this invite has to edit
-    /// it (lifting a ban, or re-signing an expired state). Never shortens
-    /// the current state's expiry.
-    #[arg(long, default_value = Ttl::DEFAULT)]
+    /// Lifetime of the signed policy, from now, if this invite has to edit
+    /// it (lifting a ban, or re-signing an expired policy). Never shortens
+    /// the current policy's expiry.
+    #[arg(long, default_value = Ttl::POLICY_DEFAULT)]
     pub(crate) state_ttl: Ttl,
 }
 
@@ -59,20 +59,21 @@ pub(crate) struct RemoveArgs {
     /// The node to remove: a name given to `wires invite --name`, or a hex
     /// node id.
     pub(crate) member: String,
-    /// Lifetime of the new signed state, from now (`30d`, `12h`, … or
-    /// seconds). Never shortens the current state's expiry.
-    #[arg(long, default_value = Ttl::DEFAULT)]
+    /// Lifetime of the new signed policy, from now (`90d`, `12h`, … or
+    /// seconds). Never shortens the current policy's expiry.
+    #[arg(long, default_value = Ttl::POLICY_DEFAULT)]
     pub(crate) state_ttl: Ttl,
 }
 
-/// `invite` against the resolved keystore. Pushes only when it edited the
-/// state (see the module docs); the token is printed even when that push
-/// reached no host (the invitee can still join), but the command fails.
+/// `invite` against the resolved keystore. Publishes only when it edited
+/// the policy (see the module docs); the token is printed even when that
+/// publish reached no directory (the invitee can still join), but the
+/// command fails.
 pub(crate) async fn invite_cmd(a: InviteArgs) -> anyhow::Result<Report> {
     run_if_edited(|ks| invite_in(ks, a)).await
 }
 
-/// [`invite_cmd`] against an explicit keystore, without any push (the
+/// [`invite_cmd`] against an explicit keystore, without any publish (the
 /// testable form).
 pub(crate) fn invite_in(ks: &Keystore, a: InviteArgs) -> anyhow::Result<Report> {
     let invitee = NodeId::from_hex(a.node_id.trim())
@@ -93,14 +94,14 @@ pub(crate) fn invite_in(ks: &Keystore, a: InviteArgs) -> anyhow::Result<Report> 
             );
         }
     }
-    let held = crate::state::store::require_state(ks, root.node_id())?;
+    let held = crate::policy::store::require_policy(ks, root.node_id())?;
     let now = now_unix();
     let badge = Membership::mint(&root, invitee, now, ttl.not_after(now))?;
     let rejoin = ledger.contains(invitee);
-    let ban = held.state.bans.get(&invitee).copied();
+    let ban = held.policy.bans.get(&invitee).map(|b| b.until);
     let stale = held.check_fresh(now).is_err();
     let state = if ban.is_some() || stale {
-        edit_state(ks, a.state_ttl, |s| {
+        edit_policy(ks, a.state_ttl, |s| {
             s.bans.remove(&invitee);
             Ok(())
         })?
@@ -115,19 +116,14 @@ pub(crate) fn invite_in(ks: &Keystore, a: InviteArgs) -> anyhow::Result<Report> 
         badge.not_after.max(ban.unwrap_or(i64::MIN)),
     );
     ledger.save(ks)?;
-    let token = Invite::new(
-        badge.clone(),
-        state.clone(),
-        keystore::node_identity_in(ks)?.node_id(),
-    )
-    .encode()?;
+    let token = Invite::new(badge.clone(), state.signed.clone()).encode()?;
     let edit = match (ban, stale) {
-        (Some(_), _) => format!("lifted its ban: state version {}", state.state.version.0),
+        (Some(_), _) => format!("lifted its ban: policy version {}", state.version().0),
         (None, true) => format!(
-            "re-signed the expired state: version {}",
-            state.state.version.0
+            "re-signed the expired policy: version {}",
+            state.version().0
         ),
-        (None, false) => format!("state version {} unchanged", state.state.version.0),
+        (None, false) => format!("policy version {} unchanged", state.version().0),
     };
     let note = format!(
         "{} {}{} (badge until {}; {edit})",
@@ -147,13 +143,13 @@ pub(crate) fn invite_in(ks: &Keystore, a: InviteArgs) -> anyhow::Result<Report> 
     })
 }
 
-/// `remove` against the resolved keystore: a ban in the signed state, then
-/// pushed to the hosts (including the removed node, if it hosted).
+/// `remove` against the resolved keystore: a ban in the signed policy, then
+/// published to the directories.
 pub(crate) async fn remove_cmd(a: RemoveArgs) -> anyhow::Result<Report> {
     run_edit(|ks| remove_in(ks, a)).await
 }
 
-/// [`remove_cmd`] against an explicit keystore, without the push (the
+/// [`remove_cmd`] against an explicit keystore, without the publish (the
 /// testable form).
 pub(crate) fn remove_in(ks: &Keystore, a: RemoveArgs) -> anyhow::Result<Report> {
     let mut ledger = Ledger::load(ks)?;
@@ -161,22 +157,27 @@ pub(crate) fn remove_in(ks: &Keystore, a: RemoveArgs) -> anyhow::Result<Report> 
     let root = ks
         .read_root_identity()?
         .ok_or_else(|| anyhow::anyhow!("no root key here: `wires remove` runs on the admin"))?;
-    let held = crate::state::store::require_state(ks, root.node_id())?;
-    if let Some(until) = held.state.bans.get(&member) {
-        bail!("{} is already removed (banned until {until})", member.hex());
+    let held = crate::policy::store::require_policy(ks, root.node_id())?;
+    if let Some(ban) = held.policy.bans.get(&member) {
+        bail!(
+            "{} is already removed (banned until {})",
+            member.hex(),
+            ban.until
+        );
     }
     let now = now_unix();
     let until = ledger.ban_until(member, now);
-    let state = edit_state(ks, a.state_ttl, |s| {
+    let state = edit_policy(ks, a.state_ttl, |s| {
         s.ban(member, until);
         for svc in s.services.values_mut() {
             svc.hosts.retain(|h| *h != member);
         }
+        s.directories.retain(|d| *d != member);
         Ok(())
     })?;
     ledger.forget(member);
     ledger.save(ks)?;
-    let banned = if state.state.is_banned(member) {
+    let banned = if state.policy.bans_node(member) {
         format!("banned until {until}")
     } else {
         // Its badge had already expired: the edit's pruning dropped the ban.
@@ -184,11 +185,11 @@ pub(crate) fn remove_in(ks: &Keystore, a: RemoveArgs) -> anyhow::Result<Report> 
     };
     Ok(Report {
         stdout: format!(
-            "removed {}{} ({banned}; state version {}, {} ban(s))",
+            "removed {}{} ({banned}; policy version {}, {} ban(s))",
             member.hex(),
             label.map(|n| format!(" ({n})")).unwrap_or_default(),
-            state.state.version.0,
-            state.state.bans.len()
+            state.version().0,
+            state.policy.bans.len()
         ),
         ..Report::default()
     })
@@ -203,8 +204,8 @@ fn resolve_removal(
     let (member, label) = resolve_member(ledger, text)?;
     if member == keystore::node_identity_in(ks)?.node_id() {
         bail!(
-            "{} is this machine's own node: removing it would leave nobody to sign and push the \
-             next state from",
+            "{} is this machine's own node: removing it would leave nobody to sign and publish \
+             the next policy from",
             member.hex()
         );
     }
@@ -285,9 +286,9 @@ mod tests {
         )
     }
 
-    fn stored(ks: &Keystore) -> library::SignedState {
+    fn stored(ks: &Keystore) -> crate::policy::store::Held {
         let root = ks.read_root_identity().unwrap().unwrap().node_id();
-        crate::state::store::read(ks, root).unwrap().unwrap()
+        crate::policy::store::read(ks, root).unwrap().unwrap()
     }
 
     #[test]
@@ -322,12 +323,12 @@ mod tests {
     #[test]
     fn invite_mints_a_badge_and_remove_bans_it() {
         let ks = admin();
-        let v1 = stored(&ks).state.version;
+        let v1 = stored(&ks).version();
         let alice = NodeIdentity::from_seed([2u8; 32]);
         let invite = invite(&ks, alice.node_id(), Some("alice"));
         invite.verify(&alice, now_unix()).unwrap();
-        assert_eq!(invite.state.state.version, v1, "no edit");
-        assert_eq!(invite.state, stored(&ks));
+        assert_eq!(invite.policy.version(), v1, "no edit");
+        assert_eq!(invite.policy, stored(&ks).signed);
         let issued = Ledger::load(&ks).unwrap();
         assert_eq!(
             issued.get(alice.node_id()).unwrap().not_after,
@@ -338,14 +339,14 @@ mod tests {
         assert!(
             removed
                 .stdout
-                .contains(&format!("state version {}", v1.0 + 1)),
+                .contains(&format!("policy version {}", v1.0 + 1)),
             "{}",
             removed.stdout
         );
         let state = stored(&ks);
         assert_eq!(
-            state.state.bans.get(&alice.node_id()),
-            Some(&invite.membership.not_after),
+            state.policy.bans.get(&alice.node_id()).map(|b| b.until),
+            Some(invite.membership.not_after),
             "banned until the badge would expire"
         );
         assert_eq!(Ledger::load(&ks).unwrap().by_label("alice"), None);
@@ -365,7 +366,7 @@ mod tests {
         let stranger = NodeIdentity::from_seed([7u8; 32]).node_id();
         let before = now_unix();
         remove(&ks, &stranger.hex()).unwrap();
-        let until = stored(&ks).state.bans[&stranger];
+        let until = stored(&ks).policy.bans[&stranger].until;
         assert!(until >= Ttl::max_badge().not_after(before), "{until}");
         assert!(until <= Ttl::max_badge().not_after(now_unix()), "{until}");
     }
@@ -378,11 +379,11 @@ mod tests {
         let alice = NodeIdentity::from_seed([2u8; 32]);
         let first = invite(&ks, alice.node_id(), None);
         remove(&ks, &alice.node_id().hex()).unwrap();
-        let banned = stored(&ks).state.version;
+        let banned = stored(&ks).version();
         let back = invite(&ks, alice.node_id(), None);
         back.verify(&alice, now_unix()).unwrap();
-        assert_eq!(back.state.state.version, StateVersion(banned.0 + 1));
-        assert!(!back.state.state.is_banned(alice.node_id()));
+        assert_eq!(back.policy.version(), StateVersion(banned.0 + 1));
+        assert!(!back.policy.to_policy().unwrap().bans_node(alice.node_id()));
         assert!(
             Ledger::load(&ks)
                 .unwrap()
@@ -393,14 +394,15 @@ mod tests {
         );
     }
 
-    /// Card 35's first acceptance: onboarding 1,000 nodes changes no state
-    /// version and sends nothing to hosts, and the state's size doesn't
-    /// depend on how many badges were issued.
+    /// Card 35's first acceptance: onboarding 1,000 nodes changes no policy
+    /// version and publishes nothing, and the policy's size doesn't depend
+    /// on how many badges were issued.
     #[tokio::test]
     async fn onboarding_a_thousand_nodes_edits_nothing_and_pushes_nothing() {
         let ks = admin();
         let before = stored(&ks);
-        let bytes = before.encode().unwrap().len();
+        let size = |p: &library::SignedPolicy| serde_json::to_vec(p).unwrap().len();
+        let bytes = size(&before.signed);
         let pushes = std::cell::Cell::new(0usize);
         for i in 0..1_000u32 {
             let mut seed = [9u8; 32];
@@ -430,12 +432,12 @@ mod tests {
             .await
             .unwrap();
             let invite = Invite::decode(&report.stdout).unwrap();
-            assert_eq!(invite.state.encode().unwrap().len(), bytes);
+            assert_eq!(size(&invite.policy), bytes);
         }
         assert_eq!(pushes.get(), 0, "nothing was pushed");
         let after = stored(&ks);
         assert_eq!(after, before, "no edit");
-        assert_eq!(after.encode().unwrap().len(), bytes);
+        assert_eq!(size(&after.signed), bytes);
         // A removal is an edit, so it does push.
         let victim = NodeIdentity::from_seed([9u8; 32]).node_id();
         super::super::run_if_edited_in(
@@ -455,12 +457,12 @@ mod tests {
     }
 
     /// Card 28 §8: `invite --ttl` is the badge's lifetime only, capped at
-    /// 30 days; the state's comes from `--state-ttl`, and never moves
+    /// 30 days; the policy's comes from `--state-ttl`, and never moves
     /// earlier.
     #[test]
-    fn invite_ttl_is_the_badge_and_never_shortens_the_state() {
+    fn invite_ttl_is_the_badge_and_never_shortens_the_policy() {
         let ks = admin();
-        let before = stored(&ks).state.not_after;
+        let before = stored(&ks).policy.not_after;
         let alice = NodeIdentity::from_seed([2u8; 32]);
         let report = invite_in(
             &ks,
@@ -475,7 +477,7 @@ mod tests {
         let invite = Invite::decode(&report.stdout).unwrap();
         let now = now_unix();
         assert!(invite.membership.not_after <= now + 3600);
-        assert_eq!(invite.state.state.not_after, before);
+        assert_eq!(invite.policy.head.head.not_after, before);
         let long = invite_in(
             &ks,
             InviteArgs {

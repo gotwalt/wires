@@ -9,10 +9,23 @@ use std::str::FromStr;
 pub(crate) struct Ttl(i64);
 
 impl Ttl {
-    /// The default for memberships (`init` / `invite --ttl`) and for the
-    /// signed state (every edit's `--state-ttl`): long, because nothing
-    /// renews them yet (card 14 notes the renewal story as a follow-up).
+    /// The default for memberships (`init` / `invite --ttl`): long, because
+    /// nothing renews them yet (card 14 notes the renewal story as a
+    /// follow-up).
     pub(crate) const DEFAULT: &'static str = "30d";
+
+    /// The default lifetime of a signed policy head (every edit's
+    /// `--state-ttl`, card 36): the directories' freshness timestamps, not
+    /// the head's expiry, keep copies current.
+    pub(crate) const POLICY_DEFAULT: &'static str = "90d";
+
+    /// [`Ttl::POLICY_DEFAULT`], parsed.
+    #[cfg(test)]
+    pub(crate) fn policy_default() -> Ttl {
+        Ttl::POLICY_DEFAULT
+            .parse()
+            .expect("the policy default parses")
+    }
 
     /// The longest badge (membership) lifetime `init` and `invite` mint. A
     /// ban on a node the admin's ledger doesn't know lasts this long, so it
@@ -105,6 +118,7 @@ mod tests {
             assert!(bad.parse::<Ttl>().is_err(), "{bad:?} parsed");
         }
         assert_eq!(Ttl::default().not_after(100), 100 + 30 * 86_400);
+        assert_eq!(Ttl::policy_default().not_after(0), 90 * 86_400);
     }
 
     #[test]

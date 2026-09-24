@@ -27,8 +27,8 @@ use std::time::Duration;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr};
 use library::{
-    AuditRecord, ChainBreak, Hello, LogEntry, LogSeq, Membership, NodeId, NodeIdentity, RoleName,
-    Service, SignedState, State,
+    AuditRecord, ChainBreak, Hello, LogEntry, LogSeq, Membership, NodeId, NodeIdentity, Policy,
+    RoleName, Service, SignedPolicy,
 };
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -76,13 +76,13 @@ impl World {
         }
     }
 
-    fn state(&self) -> SignedState {
+    fn state(&self) -> SignedPolicy {
         self.state_v(1, |_| {})
     }
 
     /// The state at `version`, changed by `edit` before it is signed. It
     /// bans [`banned`].
-    fn state_v(&self, version: u64, edit: impl FnOnce(&mut State)) -> SignedState {
+    fn state_v(&self, version: u64, edit: impl FnOnce(&mut Policy)) -> SignedPolicy {
         signed_state(&self.root, version, |s| {
             s.ban(banned().node_id(), i64::MAX);
             s.roles.insert(
@@ -179,7 +179,7 @@ impl Host {
         host.audit = Some(sink);
         let endpoint = bind(&w.host).await;
         let addr = endpoint_addr(&w.host.node_id(), &localhost_socks(&endpoint), None).unwrap();
-        let router = services_router(endpoint.clone(), Arc::new(host), None);
+        let router = services_router(endpoint.clone(), Arc::new(host), None, None);
         Host {
             _router: router,
             keystore,
@@ -190,7 +190,7 @@ impl Host {
     }
 
     /// Adopt `state` (as `wires/state` would): the next decision uses it.
-    fn adopt(&self, w: &World, state: &SignedState) {
+    fn adopt(&self, w: &World, state: &SignedPolicy) {
         adopt(&self.keystore, &w.root, state);
     }
 

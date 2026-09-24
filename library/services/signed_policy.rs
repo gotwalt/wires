@@ -46,6 +46,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::head::StateVersion;
 use crate::head::{POLICY_V3, PolicyHead, SignedPolicyHead};
 use crate::identity::{NodeId, NodeIdentity};
 use crate::idp::{Issuer, Principal};
@@ -55,7 +56,6 @@ use crate::merkle::{ItemHash, ItemTree};
 use crate::parts::{Slice, SliceUpdate, View, ViewEntry, ViewUpdate};
 use crate::registry::{Service, ServiceName};
 use crate::role::{Matcher, RoleName};
-use crate::state::StateVersion;
 
 /// The policy as the admin edits it: head fields plus every item, by kind.
 /// See the module docs.
@@ -121,7 +121,7 @@ impl Policy {
     /// - every role has matchers, and every matcher names a trusted issuer
     ///   (one with an `issuer` item);
     /// - every service's `allow` and `readers` name a defined role, and it
-    ///   lists each host once;
+    ///   lists each host once, none of them banned;
     /// - every issuer is non-blank and accepts at least one non-blank
     ///   audience;
     /// - `settings.beat_secs > 0` and `settings.fresh_secs >= beat_secs`.
@@ -171,6 +171,9 @@ impl Policy {
             let mut seen = BTreeSet::new();
             if let Some(h) = svc.hosts.iter().find(|h| !seen.insert(**h)) {
                 return bad(format!("service {name} lists host {} twice", h.hex()));
+            }
+            if let Some(h) = svc.hosts.iter().find(|h| self.bans.contains_key(h)) {
+                return bad(format!("service {name}: host {} is banned", h.hex()));
             }
         }
         if self.settings.beat_secs == 0 {
@@ -283,15 +286,65 @@ impl Policy {
         admits(self.roles.get(role).map(Vec::as_slice), principal)
     }
 
+    /// Whether the policy holds a ban for `node`, whatever its `until`: the
+    /// rule every gate applies (a ban holds until an edit prunes it, and by
+    /// then the badge it cancels has expired). [`is_banned`](Self::is_banned)
+    /// also lets it lapse at `until`; both agree while that badge is valid.
+    pub fn bans_node(&self, node: NodeId) -> bool {
+        self.bans.contains_key(&node)
+    }
+
+    /// Every host: each node that some service's `hosts` names. Derived, so
+    /// assigning a service is what makes a node a host.
+    pub fn hosts(&self) -> BTreeSet<NodeId> {
+        self.services
+            .values()
+            .flat_map(|s| s.hosts.iter().copied())
+            .collect()
+    }
+
+    /// Whether `node` is a host: some service names it, and it is not banned.
+    pub fn is_host(&self, node: NodeId) -> bool {
+        !self.bans_node(node) && self.services.values().any(|s| s.hosts.contains(&node))
+    }
+
+    /// The registry entry for `name`, if any.
+    pub fn service(&self, name: &ServiceName) -> Option<&Service> {
+        self.services.get(name)
+    }
+
+    /// Whether the registry assigns `service` to `host`, which is not
+    /// banned: what a host checks before serving a name, and what a caller
+    /// checks before dialing.
+    ///
+    /// ```
+    /// use library::{NodeIdentity, Policy, Service, ServiceName};
+    /// let mut p = Policy::new(NodeIdentity::from_seed([1u8; 32]).node_id());
+    /// let host = NodeIdentity::from_seed([2u8; 32]).node_id();
+    /// let status = ServiceName::new("status").unwrap();
+    /// p.services.insert(status.clone(), Service {
+    ///     description: String::new(), allow: vec![], hosts: vec![host], readers: vec![],
+    /// });
+    /// assert!(p.assigns(&status, host) && p.is_host(host));
+    /// p.ban(host, i64::MAX);
+    /// assert!(!p.assigns(&status, host) && !p.is_host(host));
+    /// ```
+    pub fn assigns(&self, service: &ServiceName, host: NodeId) -> bool {
+        !self.bans_node(host)
+            && self
+                .service(service)
+                .is_some_and(|s| s.hosts.contains(&host))
+    }
+
     /// Whether `node` is banned at `now` (`now <= until`). Same verdict as
-    /// [`State::is_banned`](crate::State::is_banned) on a pruned state: a ban
+    /// [`bans_node`](Self::bans_node) on a pruned policy: a ban
     /// past its `until` cancels a badge that has expired anyway.
     pub fn is_banned(&self, node: NodeId, now: i64) -> bool {
         self.bans.get(&node).is_some_and(|b| b.holds(now))
     }
 
     /// Ban `node` until `until` (unix seconds); a node already banned keeps
-    /// the later of its two `until`s, as [`State::ban`](crate::State::ban).
+    /// the later of its two `until`s.
     ///
     /// ```
     /// use library::{NodeIdentity, Policy};
@@ -308,9 +361,8 @@ impl Policy {
         ban.until = ban.until.max(until);
     }
 
-    /// Drop every ban whose `until` is before `now` (as
-    /// [`State::prune_bans`](crate::State::prune_bans): every admin edit
-    /// runs it, so the policy tracks recent removals, not every node ever
+    /// Drop every ban whose `until` is before `now` (every admin edit runs
+    /// it, so the policy tracks recent removals, not every node ever
     /// removed). Returns how many were dropped.
     pub fn prune_bans(&mut self, now: i64) -> usize {
         let before = self.bans.len();
@@ -320,6 +372,18 @@ impl Policy {
 }
 
 impl SignedPolicy {
+    /// This policy's version (its head's).
+    pub fn version(&self) -> StateVersion {
+        self.head.head.version
+    }
+
+    /// Whether this policy should replace `other`: same fabric and a strictly
+    /// higher version ([`SignedPolicyHead::is_newer_than`]). Says nothing
+    /// about signatures; verify first.
+    pub fn is_newer_than(&self, other: &SignedPolicy) -> bool {
+        self.head.is_newer_than(&other.head)
+    }
+
     /// Verify the head under `root` ([`SignedPolicyHead::verify`]), that the
     /// items are strictly in key order and are exactly the tree the head
     /// commits to (count and root), then [`Policy::validate`]. Does not check
@@ -931,19 +995,18 @@ mod tests {
         assert!(p.is_banned(node(20), 700));
         assert!(!p.bans.contains_key(&node(21)));
 
-        // The same verdicts as card 35's state.
-        let mut s = crate::State::new(root().node_id());
+        // After an edit's prune, the gates' rule (a ban held, whatever its
+        // until) and the clocked one agree.
         let mut q = Policy::new(root().node_id());
         for (n, until) in [(1, 10), (2, 20), (1, 30), (3, 5)] {
-            s.ban(node(n), until);
             q.ban(node(n), until);
         }
         for now in [0, 5, 6, 20, 21, 30, 31] {
-            let (mut s, mut q) = (s.clone(), q.clone());
-            assert_eq!(s.prune_bans(now), q.prune_bans(now), "at {now}");
+            let mut q = q.clone();
+            q.prune_bans(now);
             for n in 1..=3 {
                 assert_eq!(
-                    s.is_banned(node(n)),
+                    q.bans_node(node(n)),
                     q.is_banned(node(n), now),
                     "{n} at {now}"
                 );
