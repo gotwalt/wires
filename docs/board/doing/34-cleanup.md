@@ -585,3 +585,94 @@ Deliberately left:
 - `gateway/mod.rs` keeps its own "the gateway holds no signed state" lookups
   (different wording, and §B6's gateway items are that lane's).
 - `cargo doc` warnings (§D3) are unchanged by this phase; none are new.
+
+### Lane CALLER
+
+`wires/caller/**` and `wires/gateway/**`. `make lint`, `cargo test
+--workspace` and `make demo` pass. D1's `tools.rs` change (required
+subcommand, no listing, `render_aliases`/unreachable `bail!` gone, lib.rs
+dispatch) is lane ADMIN's, per the integrator; this lane left those lines
+alone.
+
+- **§B6 call.rs.** `Credentials::hello(ks)` runs the preflight and builds the
+  `Hello` (with the `presenting` token) once, for `dial` and
+  `call_service_with`; `Credentials::{node_id, fabric, bind}` for the
+  gateway; `Credentials` is `Clone` (the node key behind an `Arc`).
+  `Route::Alias(Dial)` (argv moves into the route; no `Option`, no
+  `unreachable!`). `stored_state` is gone (`mcp` reads `store::read`). The
+  loopback shaping test uses `test_endpoint`/`loopback`.
+- **§B6 inbox.rs.** `InboxArgs` flattens `CredArgs`. `--tools-file` moved
+  out of `CredArgs` onto `CallArgs`/`McpArgs`, so inbox doesn't grow a flag
+  it ignores; `Lock::check(creds, tools_file)` still refuses it by name.
+  `evictions(unread, cap)` (the always-0 `incoming` is gone).
+- **One escaper**, `caller::one_line`, for inbox and watch lines (with a
+  known-answer test). `Hints` holds addresses only (the relay slot was
+  always `None`). `jwks::JWKS_DIR` for the three caller/gateway uses.
+  `hello::with_membership` returns `Hello` (it could not fail).
+- **Gateway.** One `Keystore` (an `Arc`) and one `Credentials`, resolved at
+  start, instead of re-reading both on every call; `node_identity_in` and
+  `resolve()` once. The state lookups are `store::require_state`. The
+  refresh is `sync::refresh_loop` on the gateway's shared endpoint (first
+  tick at start, then every `STALE_AFTER_SECS`); `STATE_REFRESH` is gone.
+  `library::B64` used directly; the test-only `oauth::b64` is gone.
+- **mock_idp**: the inspection hooks and their `state` field are
+  `#[cfg(test)]`, so the `#[cfg_attr(not(test), allow(dead_code))]` on the
+  module is gone.
+- **Wording.** `wires mcp` says `denied by host: <reason>`; "tool" /
+  "responder" → service / host / alias in call.rs, mcp.rs, tools.rs,
+  watch_records.rs; locked mode's refusal lists `--verbose` and "the service
+  name"; `jwks.rs` "an observer", login.rs "the publish", the Bazel notes in
+  `caller/mod.rs` and `lock.rs`, the `wires watch` "channel-era" header.
+  `caller/mod.rs` indexes `watch_records`. The `cargo doc` warnings in
+  `watch_records.rs` and `gateway/mcp_http.rs` are fixed (and the three
+  that this lane's new `Hello` import caused in call.rs).
+- **serde(default)**: dropped on `Option` fields (`TokenReply`,
+  `RegistrationRequest.client_name`) and on the watch marks' `views`/`labels`
+  (always written; an older marks file now loads as empty).
+
+Tests rewritten, each seen failing against a broken implementation:
+`inbox::evictions_take_the_oldest_past_the_cap` (new known answer) and
+`evictions_make_room_oldest_first` (invariants, not the formula; broke the
+count and the sort); `lock::unknown_values_fail_closed` (generates only
+non-off values; broke the off list and the stdin policy);
+`gateway::a_full_table_evicts_rather_than_resets` (hog is over its limit in
+a recent window and stays refused; broke eviction into a reset);
+`shape::head_keeps_a_prefix_of_n_lines` (was `head_never_splits_a_char`;
+adds "a cut lands right after the Nth `\n`"; broke `head_len` by one);
+`oauth::pkce_needs_a_well_formed_verifier_and_its_challenge` and
+`a_challenge_admits_no_other_verifier` (broke `pkce_ok`'s length and match
+checks); `call::a_service_beats_an_alias…` now checks the alias's pinned
+host (broke `Dial::resolve`'s target). Renamed only:
+`sessions::issued_tokens_are_long_and_never_repeat` (it never touched
+codes), `watch_records::record_line_formats`,
+`call::lookup_lists_known_aliases_on_a_miss`. Moved: the JWKS cache,
+rotation, expiry and untrusted-issuer tests, login.rs → jwks.rs. The RFC
+7636 vector is tested once (`login::pkce_matches_the_rfc_7636_appendix_b_vector`),
+from shared `#[cfg(test)]` constants `login::RFC7636_{VERIFIER,CHALLENGE}`.
+
+Deleted:
+
+- `mcp::the_schema_leads_with_args_and_keeps_stdin`: asserted words of the
+  literal a few lines above it (§A10); the same for the schema-field loop
+  in `descriptions_say_how_to_filter_without_a_shell`.
+- `oauth::any_generated_verifier_matches_its_own_challenge`: `pkce_ok`
+  calls `Pkce::from_verifier`, so it compared the formula with itself.
+- `oauth::pkce_matches_the_rfc_7636_vector`: a second copy of the vector
+  (its well-formedness cases live on in the rewritten test).
+- Dead statements: `shape.rs`'s repeated `nosuchfn` assertion, inbox's
+  `m.from = node(1)` re-set, call.rs's `h2` (same identity as `h`).
+
+For other lanes:
+
+- "denied by responder" is still printed by `lib.rs:434` (ADMIN) and
+  `transport::Denied`'s `Display` (HOST), and quoted in usage.md and
+  demo.md (docs); `wires mcp` now says "denied by host".
+- `e2e/gateway.rs:104-105` can use `login::RFC7636_{VERIFIER,CHALLENGE}`.
+- `host/serve.rs` still spells `"jwks"` twice; `caller::jwks::JWKS_DIR`
+  exists.
+- `run_tools_cmd`'s "no tool named" (inside ADMIN's D1 edit) could say
+  "no alias named", as `add`/`validate`/`wires call` now do.
+
+Left: the `// ----- … -----` section banners in inbox.rs and
+watch_records.rs (they divide 1,100-line files; §D2 names only the host
+ones).
