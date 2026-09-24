@@ -22,7 +22,9 @@ use library::NodeId;
 
 use super::config::HostConfig;
 use super::native::NativeServices;
-use super::{call_log, capability, control, gate, identity, otlp, push, transport};
+use super::{
+    call_log, capability, control, follow, freshness, gate, identity, otlp, push, transport,
+};
 use crate::admin::keystore;
 use crate::caller::jwks;
 use crate::init_logging;
@@ -131,8 +133,9 @@ pub(crate) enum Binding {
 /// (fetching one from a directory first if it doesn't), open the call log,
 /// then serve the session and record-stream ALPNs (the directory's when the
 /// policy lists this node, and push when configured), deciding every call
-/// by the signed policy as it stands at that connection, and checking a
-/// directory for a newer policy every `settings.beat_secs`.
+/// by the signed policy as it stands at that connection (and its signed
+/// freshness rule), and following a directory's `policy` subscription for
+/// every edit and `Fresh` ([`follow`]).
 pub(crate) async fn serve_until(
     serving: Serving,
     shutdown: impl std::future::Future<Output = anyhow::Result<()>>,
@@ -230,19 +233,34 @@ pub(crate) async fn serve_until(
         push.clone(),
         directory.as_ref(),
     );
+    // The policy's edits, and its freshness, from a directory's `policy`
+    // subscription (card 36c), until serving ends. It never holds up
+    // serving: until a directory answers, calls are decided from the
+    // policy on disk.
+    let mut following = tokio::task::JoinSet::new();
+    following.spawn(
+        follow::Follower {
+            endpoint: endpoint.clone(),
+            ks: Arc::clone(&ks),
+            root: host.trust_root,
+            badge: host.membership.clone(),
+            freshness: Arc::clone(&host.freshness),
+            runs_directory: directory.is_some(),
+            stats: Default::default(),
+        }
+        .run(),
+    );
+    if let Some(dir) = &directory {
+        following.spawn(follow::vouch_from_local(
+            Arc::clone(dir),
+            Arc::clone(&ks),
+            host.trust_root,
+            Arc::clone(&host.freshness),
+        ));
+    }
     let running = directory.map(|dir| {
         crate::directory::serve::Running::start(dir, endpoint.clone(), host.membership.clone())
     });
-    // An edit made while this host was down, or since, is fetched from a
-    // directory on a timer, until serving ends (dropping `stop_refresh`
-    // stops it). Card 36c replaces it with a `policy` subscription.
-    let (stop_refresh, refresh_stopped) = tokio::sync::oneshot::channel::<()>();
-    let refresh = tokio::spawn(crate::policy::fetch::refresh_loop(
-        endpoint.clone(),
-        Arc::clone(&ks),
-        None,
-        refresh_stopped,
-    ));
     let ended = match push.zip(push_queue) {
         Some((push, (commands_tx, commands))) => {
             match push_sockets(&ks.path(""), &host, commands_tx).await {
@@ -262,11 +280,10 @@ pub(crate) async fn serve_until(
         None => shutdown.await,
     };
     // Stop everything this host started, so an app that embeds it can go
-    // on without it: the refresh, the directory's loops, the router (its
-    // protocols and sessions), and the endpoint (the socket and the relay
-    // connection).
-    drop(stop_refresh);
-    let _ = refresh.await;
+    // on without it: the subscription, the directory's loops, the router
+    // (its protocols and sessions), and the endpoint (the socket and the
+    // relay connection).
+    following.shutdown().await;
     if let Some(running) = running {
         running.stop().await;
     }
@@ -319,6 +336,16 @@ pub(crate) fn services_host(
         fetcher,
         identity::IdpTrust::per_issuer(Vec::new()),
     ));
+    // The freshness it last held, if it still vouches for the policy on
+    // disk: a restarted host knows how recently its copy was vouched for.
+    let head = crate::policy::store::read(&keystore, membership.fabric)
+        .ok()
+        .flatten()
+        .map(|h| h.signed.head);
+    let freshness = Arc::new(freshness::Freshness::load(
+        Arc::clone(&keystore),
+        head.as_ref(),
+    ));
     let push_grants = match config.push {
         Some(_) => Some(
             capability::PushGrants::new()
@@ -337,6 +364,7 @@ pub(crate) fn services_host(
         audit: None,
         push_grants,
         push_commands: None,
+        freshness,
         high_water: Default::default(),
     })
 }
@@ -493,6 +521,38 @@ mod tests {
         // A state at least as new as the mark is decided under again.
         crate::policy::store::adopt_if_newer(&ks, &signed(3), root, now).unwrap();
         assert_eq!(host.policy().unwrap().version().0, 3);
+    }
+
+    /// The signed freshness rule: `lenient` decides whatever the host's
+    /// freshness; `strict` only while a current `Fresh` vouches for the
+    /// head it decides under.
+    #[test]
+    fn strict_decides_only_while_a_directory_vouches() {
+        let home = crate::testutil::temp_dir();
+        let host = host_at(&home, None).unwrap();
+        let root = library::NodeIdentity::from_seed([1u8; 32]);
+        let dir = library::NodeIdentity::from_seed([30u8; 32]);
+        let held = |mode| {
+            let mut p = library::Policy::new(root.node_id());
+            p.version = library::StateVersion(2);
+            p.not_after = i64::MAX;
+            p.directories = vec![dir.node_id()];
+            p.settings.freshness = mode;
+            crate::testutil::held(&root, p)
+        };
+        let (lenient, strict) = (
+            held(library::FreshnessMode::Lenient),
+            held(library::FreshnessMode::Strict),
+        );
+        assert!(host.check_vouched(&lenient, 100).is_ok());
+        let refused = host.check_vouched(&strict, 100).unwrap_err();
+        assert_eq!(refused.to_string(), freshness::STALE);
+        assert!(!refused.needs_identity());
+        let fresh = library::Fresh::sign(&dir, &strict.signed.head, 100, 200).unwrap();
+        host.freshness.offer(&fresh, &strict.signed.head).unwrap();
+        assert!(host.check_vouched(&strict, 150).is_ok());
+        assert!(host.check_vouched(&strict, 201).is_err());
+        assert!(host.check_vouched(&lenient, 201).is_ok());
     }
 
     /// A key set on disk in the host's home (a caller's cache, or one planted

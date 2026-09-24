@@ -18,6 +18,11 @@
 //! - [`native`] — services an app implements in-process (card 33): the
 //!   public [`Service`](native::Service) trait and what a handler gets.
 //! - [`embed`] — the public [`Host`](embed::Host) an app builds and serves.
+//! - [`follow`] — the host's `policy` subscription to a directory: the whole
+//!   policy once, then each edit as a delta, and a `Fresh` every beat
+//!   (card 36c).
+//! - [`freshness`] — the newest `Fresh` for the held head (`fresh.json`),
+//!   and the signed rule (`lenient` / `strict`) for when it lapses.
 //! - [`identity`] — the ID tokens callers presented, verified and indexed.
 //! - [`audit`] — the call records the host keeps.
 //! - [`call_log`] — the host's own signed, hash-linked log of those records,
@@ -37,6 +42,8 @@ pub mod capability;
 pub mod config;
 pub mod control;
 pub mod embed;
+pub mod follow;
+pub mod freshness;
 pub mod gate;
 pub mod identity;
 pub mod native;
