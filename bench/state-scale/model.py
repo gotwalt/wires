@@ -3,13 +3,14 @@
 
 Three designs:
 
-  today   every node holds the whole signed state (members, hosts, roles,
-          services); the admin pushes it to every host after each edit, and a
-          caller pulls it whenever its copy is 10 min stale and has changed.
+  today   (labelled *Before*) the design until card 35: every node held the
+          whole signed state (members, hosts, roles, services); the admin
+          pushed it to every host after each edit, and a caller pulled it
+          whenever its copy was 10 min stale and had changed.
   badges  card 35 (built): members and the host list leave the state (a node
           is admitted by its root-signed badge; removal is a ban until the
           badge expires), so an invite is no edit. Distribution is unchanged.
-  apex    badges, plus a persistent directory (apex, card 36): the admin
+  apex    as built (cards 35-37): badges, plus a persistent directory (apex, card 36): the admin
           publishes to it; each host holds the whole root-signed policy and
           follows it by subscription (a delta per edit and a freshness beat);
           each caller holds only its view, the root-signed service entries
@@ -211,9 +212,9 @@ def table(results, email_roles) -> str:
         Row("nodes", [f"{r['nodes']:,}" for r in results]),
     ]
     for design, title in [
-        ("today", "**Today**"),
+        ("today", "**Before** (the one-blob state, until card 35)"),
         ("badges", "**Badges only** (members leave the state)"),
-        ("apex", "**Apex** (directory; hosts hold the policy; callers views)"),
+        ("apex", "**Apex**, as built (directory; hosts hold the policy; callers views)"),
     ]:
         rows.append(Row(title, [""] * len(TIERS)))
         d = [r[design] for r in results]

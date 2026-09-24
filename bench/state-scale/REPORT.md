@@ -10,10 +10,11 @@ proofs), and the *apex* caller rows after card 37 (views, as built).
 history at 055ac46), and the *apex* ones by `policy_sizes`; rates are
 assumptions, listed in `model.py`'s `ASSUMPTIONS`.*
 
-**The question.** Today every node holds the whole admin-signed state and
-re-fetches it after every edit (protocol.md §3–4). How much does each node
-receive, per day, as the org grows, and what would a persistent directory
-(apex) save?
+**The question** (asked at 655a96c, before cards 35–37). Every node then held
+the whole admin-signed state and re-fetched it after every edit. How much did
+each node receive, per day, as the org grew, and what would a persistent
+directory (apex) save? The *apex* rows are that directory as cards 35–37 built
+it; the *before* and *badges* rows describe designs that no longer run.
 
 **Measured sizes** (serialized signed JSON): a member 67 B, a host 134 B (both
 format 1, before card 35), a ban 78 B (format 2), a service entry 318 B (80-character description, 2 hosts, 2 allow roles,
@@ -46,7 +47,7 @@ mcp` (up 8 h/day) holds a subscription: its whole view once, a beat every
 |---|---|---|---|---|
 | users / services / hosts | 50 / 10 / 5 | 1,000 / 100 / 50 | 10,000 / 1,000 / 500 | 50,000 / 5,000 / 1,000 |
 | nodes | 105 | 2,050 | 20,500 | 101,000 |
-| **Today** |  |  |  |  |
+| **Before** (the one-blob state, until card 35) |  |  |  |  |
 | every node holds | 11.3 KB | 174.5 KB | 1.7 MB | 8.5 MB (over frame cap) |
 | edits/day | 1 | 3 | 30 | 151 |
 | invite token | 15.6 KB | 233.2 KB | 2.3 MB | 11.3 MB |
@@ -64,7 +65,7 @@ mcp` (up 8 h/day) holds a subscription: its whole view once, a beat every
 | each host sends callers /day | 3.1 MB | 8.8 MB | 242.0 MB | 7.5 GB |
 | admin sends /day | 35.5 KB | 4.0 MB | 3.6 GB | 179.4 GB |
 | whole network /day | 17.6 MB | 471.3 MB | 128.5 GB | 7.9 TB |
-| **Apex** (directory; hosts hold the policy; callers views) |  |  |  |  |
+| **Apex**, as built (directory; hosts hold the policy; callers views) |  |  |  |  |
 | apex holds | 7.4 KB | 67.3 KB | 666.3 KB | 3.3 MB |
 | each host holds | 7.4 KB | 67.3 KB | 666.3 KB | 3.3 MB |
 | a host's first sync | 7.8 KB | 67.8 KB | 666.8 KB | 3.3 MB |
@@ -76,24 +77,24 @@ mcp` (up 8 h/day) holds a subscription: its whole view once, a beat every
 | apex sends /day | 1.3 MB | 30.2 MB | 2.4 GB | 27.4 GB |
 | whole network /day | 1.3 MB | 30.2 MB | 2.4 GB | 27.4 GB |
 
-With email-list roles (Google has no groups claim; 30 people per role), today's
-state is about 1.3× larger (10.7 MB at *large*). In the apex design the extra
+With email-list roles (Google has no groups claim; 30 people per role), the old
+state was about 1.3× larger (10.7 MB at *large*). In the apex design the extra
 bytes stay in the policy the apex and each host hold (5.5 MB at *large*, a
 host's one-time first sync); host updates and caller views don't change.
 
 ## Findings
 
-1. **The surge is membership, not services.** About 80% of today's state is
-   the member list, and two thirds of edits are membership changes. When one
-   laptop joins, every node downloads the whole org's node list again. Per-node
-   cost grows with the org's size times its edit rate.
-2. **Callers are the bulk of the traffic.** A host sends callers about 30×
-   what it receives from the admin: every caller re-downloads the whole
+1. **The surge was membership, not services.** About 80% of the old state
+   was the member list, and two thirds of edits were membership changes. When
+   one laptop joined, every node downloaded the whole org's node list again.
+   Per-node cost grew with the org's size times its edit rate.
+2. **Callers were the bulk of the traffic.** A host sent callers about 30×
+   what it received from the admin: every caller re-downloaded the whole
    state once per active 10-minute window that saw an edit.
-3. **The invite token breaks first.** It embeds the whole state: 233 KB at
+3. **The invite token broke first.** It embedded the whole state: 233 KB at
    1k users, too big to paste into Slack.
-4. **The 4 MiB frame cap is crossed at about 60k nodes** (the *large* tier),
-   where sync fails outright.
+4. **The 4 MiB frame cap was crossed at about 60k nodes** (the *large* tier),
+   where sync failed outright.
 5. **Badges alone cut per-node traffic about 5–6×,** but it still grows with
    the org (75 MB per caller per day at *large*). Card 35 built this.
 6. **The apex makes per-node cost nearly flat:** a one-shot caller receives
@@ -107,23 +108,23 @@ host's one-time first sync); host updates and caller views don't change.
    the fabric (the new head and the changed item, checked against the head's
    one signature). So it grows with the edit rate, not with the number of
    nodes. The whole network costs what one apex sends.
-7. **Today is fine at the demo size.** At *team* scale every number is small;
-   the design only breaks past about 1k users.
+7. **The old design was fine at the demo size.** At *team* scale every number
+   is small; it only broke past about 1k users.
 
-Churn scales the *today* and *badges* rows roughly linearly; it doesn't change
+Churn scales the *before* and *badges* rows roughly linearly; it doesn't change
 the shape, the invite size or the frame cap.
 
-This replaces card 29's estimate (1.4 TB to onboard 10k people onto 200
-hosts) and its claim that host refreshes cost H² dials: a pull stops at the
-first host that confirms the copy is current (`a_pull_stops_at_the_first_current_answer`),
-so a quiet fabric costs about one dial per host per 10 minutes.
+This replaced card 29's estimate (1.4 TB to onboard 10k people onto 200
+hosts) and its claim that host refreshes cost H² dials: the old pull stopped at
+the first host that confirmed the copy was current, so a quiet fabric cost
+about one dial per host per 10 minutes.
 
-## Where the syndicated state is read today, and what replaces it
+## Where the syndicated state was read, and what replaced it
 
-Every row is a place a node reads its own full copy of the state. With a
-directory, each row reads something smaller, or asks.
+Every row is a place a node read its own full copy of the state before card
+35. With the directory (built), each row reads something smaller, or asks.
 
-| Reader | Uses the full copy for | With a directory |
+| Reader | Used the full copy for | Now |
 |---|---|---|
 | host gate (`host/gate.rs`) | caller is a member; service assigned here; `authorize` | badge + the ban list; its own copy of the **whole policy**, kept by `policy_update` deltas |
 | host record stream | readers roles; membership | the same copy |
