@@ -113,6 +113,24 @@ pub(crate) async fn read_request<R: AsyncRead + Unpin>(r: &mut R) -> Result<Dire
     .map_err(|_| anyhow!("no directory request within {FRAME_TIMEOUT:?}"))?
 }
 
+/// Read the frame that opens a `wires/directory/1` stream, before its
+/// sender is admitted, within `deadline`: at most
+/// [`MAX_SMALL_DIRECTORY_FRAME`], whatever it opens with, so a stranger
+/// can't make the directory read a publish-sized body. The caller checks it
+/// is a `hello`.
+pub(crate) async fn read_hello<R: AsyncRead + Unpin>(
+    r: &mut R,
+    deadline: Duration,
+) -> Result<DirectoryRequest> {
+    tokio::time::timeout(
+        deadline,
+        read_capped(r, MAX_SMALL_DIRECTORY_FRAME, DirectoryRequest::decode),
+    )
+    .await
+    .map_err(|_| anyhow!("no hello within {deadline:?}"))??
+    .ok_or_else(|| anyhow!("the stream ended before a hello"))
+}
+
 /// Read one [`DirectoryAnswer`] within [`FRAME_TIMEOUT`].
 pub(crate) async fn read_answer<R: AsyncRead + Unpin>(r: &mut R) -> Result<DirectoryAnswer> {
     tokio::time::timeout(

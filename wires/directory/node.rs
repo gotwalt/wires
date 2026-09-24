@@ -26,7 +26,8 @@ use std::sync::{Arc, RwLock};
 use anyhow::{Context, Result, anyhow};
 use library::{
     DirectoryAnswer, DirectoryRequest, Fresh, IdToken, IdentityClaim, Membership, NodeId,
-    NodeIdentity, Policy, Principal, SignedPolicy, StateVersion, check_admitted, check_inclusion,
+    NodeIdentity, Policy, Principal, SignedPolicy, StateVersion, View, ViewDigest, ViewUpdate,
+    check_admitted, check_inclusion,
 };
 
 use super::db::{DB_FILE, DirectoryDb};
@@ -46,6 +47,16 @@ pub(crate) struct Current {
     pub(crate) fresh: Option<Fresh>,
 }
 
+/// Less than a whole view, for a caller holding exactly the view the
+/// directory would diff from ([`Directory::view_since`]).
+#[allow(clippy::large_enum_variant)] // one per request, moved once
+enum ViewSince {
+    /// It holds the view at the newest head.
+    Current,
+    /// What moves it from a kept head to the newest.
+    Update(ViewUpdate),
+}
+
 /// What [`Directory::watch`] carries: the current state, or nothing yet.
 pub(crate) type Snapshot = Option<Arc<Current>>;
 
@@ -63,25 +74,50 @@ pub(crate) struct Directory {
     db: DirectoryDb,
     /// The newest policy and `Fresh`, and the channel subscribers follow.
     current: tokio::sync::watch::Sender<Snapshot>,
-    /// Serializes accepts (the store has one writer).
+    /// Serializes accepts and beats (the store has one writer, and the
+    /// head announced is always the newest held).
     write: std::sync::Mutex<()>,
     /// The subscriber cap (local config).
     pub(crate) max_subscribers: usize,
     /// The subscribers following now.
     pub(crate) subscribers: Arc<tokio::sync::Semaphore>,
-    /// Streams not yet admitted (bounded: any key can dial).
+    /// Connections not yet admitted (bounded: any key can dial). A permit
+    /// is held from the connection until its `hello` is decided, never
+    /// longer.
     pub(crate) undecided: Arc<tokio::sync::Semaphore>,
+    /// Admitted work not yet answered or subscribed: a one-shot request
+    /// being read and answered (a view may wait on an IdP's keys), or a
+    /// `subscribe` being read.
+    pub(crate) admitted: Arc<tokio::sync::Semaphore>,
+    /// How long a new connection may take to open its stream, and a `hello`
+    /// to arrive ([`wire::FRAME_TIMEOUT`](super::wire::FRAME_TIMEOUT);
+    /// shorter in tests).
+    pub(crate) stream_deadline: std::time::Duration,
     /// For tests: count every accept.
     accepts: RwLock<u64>,
     /// The encoded frames its `policy` subscribers share (card 36c).
     pub(crate) policy_frames: super::sub_policy::FrameCache,
     /// Verifies callers' ID tokens (the IdPs' keys, in memory only).
     fetcher: KeyFetcher,
+    /// For tests: run once by the next [`beat`](Directory::beat), after it
+    /// signs and before it announces.
+    #[cfg(test)]
+    pub(crate) beat_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
-/// How many streams, on both ALPNs together, may be open before their
-/// `hello` is checked. One more is closed unanswered.
+/// How many connections, on both ALPNs together, may be undecided (from the
+/// connection until its `hello` is decided, at most
+/// [`stream_deadline`](Directory::stream_deadline) to open a stream and as
+/// long again for the `hello`). One more is closed unanswered.
 pub(crate) const MAX_UNDECIDED: usize = 16;
+
+/// How many admitted requests (and `subscribe`s being read) a directory
+/// works on at once, apart from the undecided ones. One more hears
+/// [`BUSY`].
+pub(crate) const MAX_ADMITTED: usize = 64;
+
+/// What an admitted node hears when [`MAX_ADMITTED`] are in hand.
+pub(crate) const BUSY: &str = "this directory is busy; try again or ask another";
 
 /// The default subscriber cap.
 pub(crate) const DEFAULT_MAX_SUBSCRIBERS: usize = 4096;
@@ -139,9 +175,13 @@ impl Directory {
             max_subscribers,
             subscribers: Arc::new(tokio::sync::Semaphore::new(max_subscribers)),
             undecided: Arc::new(tokio::sync::Semaphore::new(MAX_UNDECIDED)),
+            admitted: Arc::new(tokio::sync::Semaphore::new(MAX_ADMITTED)),
+            stream_deadline: super::wire::FRAME_TIMEOUT,
             accepts: RwLock::new(0),
             policy_frames: Default::default(),
             fetcher: KeyFetcher::new(None)?,
+            #[cfg(test)]
+            beat_hook: std::sync::Mutex::new(None),
         });
         dir.beat(now)?;
         Ok(dir)
@@ -188,14 +228,21 @@ impl Directory {
     /// Sign a new `Fresh` for the held head, valid for the head's
     /// `settings.fresh_secs` from `now`, store it and announce it. A head
     /// that doesn't list this node gets none (traced): it holds the policy
-    /// but vouches for nothing.
+    /// but vouches for nothing. It holds the writer lock [`accept`](Self::accept)
+    /// holds, and reads the head under it, so it never announces (or stores
+    /// a `Fresh` for) a head older than one accepted meanwhile.
     pub(crate) fn beat(&self, now: i64) -> Result<()> {
+        let _one_writer = self.write.lock().map_err(|_| anyhow!("a poisoned lock"))?;
         let Some(current) = self.snapshot() else {
             return Ok(());
         };
         let fresh = self.sign_fresh(&current.held, now);
         if let Some(f) = &fresh {
             self.db.set_fresh(f)?;
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.beat_hook.lock().unwrap().take() {
+            hook();
         }
         self.current.send_replace(Some(Arc::new(Current {
             held: current.held.clone(),
@@ -324,10 +371,13 @@ impl Directory {
     /// [`answer`](Self::answer)'s), from an admitted `caller` that presented
     /// `id_token` in its `hello`:
     ///
-    /// - `view {have, query: None}`: `current {fresh}` when `have` is the
-    ///   held version; a `view_update` from a `have` this directory still
-    ///   keeps (the caller applies it with [`library::View::apply`]); else
-    ///   the whole view;
+    /// - `view {have, query: None, held}`: for a verified principal whose
+    ///   `held` digest names exactly the view this directory would diff
+    ///   from ([`view_since`](Self::view_since)), `current {fresh}` at the
+    ///   held version or a `view_update` from a kept `have` (the caller
+    ///   applies it with [`library::View::apply`]); else the whole view (so
+    ///   without a verified principal, the empty view, whole: a caller
+    ///   can't keep entries it isn't entitled to);
     /// - `view {have, query: Some(q)}`: the entries matching `q`, always a
     ///   whole (searched) view;
     /// - `resolve {service}`: a view holding just that service, or no entry.
@@ -350,21 +400,19 @@ impl Directory {
         let principal = self.principal(caller, id_token, &c.held.policy, now).await;
         let who = principal.as_ref().map(Principal::name);
         let answer = match request {
-            DirectoryRequest::View { have, query: None } if have >= c.held.version() => {
-                DirectoryAnswer::Current { fresh }
-            }
-            DirectoryRequest::View { have, query } => {
+            DirectoryRequest::View { have, query, held } => {
                 let after = c.held.signed.view_for(principal.as_ref(), query.as_deref());
-                // From a head this directory still keeps: just what changed.
-                let kept = match (&query, have) {
-                    (None, have) if have > StateVersion(0) => self.policy_at(have).ok().flatten(),
+                // Less than the whole view only for a verified principal
+                // asking for all of it, holding exactly what we'd diff from.
+                let since = match (&principal, &query, held) {
+                    (Some(p), None, Some(held)) => self.view_since(&c, p, have, held, &after),
                     _ => None,
                 };
-                match kept {
-                    Some(old) => DirectoryAnswer::ViewUpdate {
-                        update: old.view_for(principal.as_ref(), None).update_to(&after),
-                        fresh,
-                    },
+                match since {
+                    Some(ViewSince::Current) => DirectoryAnswer::Current { fresh },
+                    Some(ViewSince::Update(update)) => {
+                        DirectoryAnswer::ViewUpdate { update, fresh }
+                    }
                     None => DirectoryAnswer::View { view: after, fresh },
                 }
             }
@@ -387,6 +435,35 @@ impl Directory {
             "directory: answered a view"
         );
         answer
+    }
+
+    /// What brings a caller holding the view `held` names (at `have`) to
+    /// `after`, `principal`'s view under `c`'s head: `current` when `have`
+    /// is the head and `held` is `after`; an update when `have` is a kept
+    /// head and `held` is `principal`'s view under it; else `None` (the
+    /// whole view): what the caller holds isn't what this directory would
+    /// diff from (cut for another identity, or none, or not at all).
+    fn view_since(
+        &self,
+        c: &Current,
+        principal: &Principal,
+        have: StateVersion,
+        held: ViewDigest,
+        after: &View,
+    ) -> Option<ViewSince> {
+        let matches = |view: &View| ViewDigest::of(view).is_ok_and(|d| d == held);
+        if have == c.held.version() {
+            return matches(after).then_some(ViewSince::Current);
+        }
+        if have.0 == 0 || have > c.held.version() {
+            return None;
+        }
+        let before = self
+            .policy_at(have)
+            .ok()
+            .flatten()?
+            .view_for(Some(principal), None);
+        matches(&before).then(|| ViewSince::Update(before.update_to(after)))
     }
 
     /// Who `caller` is: its `id_token` verified under `policy`'s trusted
