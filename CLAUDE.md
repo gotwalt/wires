@@ -25,9 +25,9 @@ log. Agents can't observe each other's work: the isolation boundary is the
 verified person (IdP principal), so a caller sees its own person's records,
 and the readers the registry names see a service's records in full with
 `wires watch`, for logging and compliance. Nothing is broadcast; what every
-member still learns about the others (the whole signed policy) is cards
-36c–37's to fix, by giving each host its slice and each caller its view
-(`docs/fabric.md`). `wires call` is the CLI-native path and the source of the token
+member still learns about the others (the whole signed policy) is card
+37's to fix, by giving each caller its view of root-signed service entries
+(hosts keep the whole policy; `docs/fabric.md`). `wires call` is the CLI-native path and the source of the token
 savings; `wires mcp` (stdio) and `wires gateway` (remote, e.g. Claude.ai) serve
 the same services as MCP, so wires works in the clients people already use
 for remote tool calling, with the same identity, registry and record (MCP

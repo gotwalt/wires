@@ -31,7 +31,7 @@ Every role joins the same way: `wires id`, then `wires join <token>` with the ad
 | **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. A service pushes only through its call's capability, to that call's caller. | The host, at send, delivery and fetch: not banned by the policy, in a `push.allow` role. |
 | **Removal** | A new policy, published to the directories; hosts fetch it from one. No shared key exists, so there is nothing to rotate. | Each host that has the new policy, on the removed member's next call or fetch there. |
 
-Nothing is broadcast: a member that takes part in no call receives no traffic about other members' calls. What every member does learn is the whole signed policy: every role matcher, service, host id, ban and directory, though no list of members (card [35](board/done/35-badges-and-bans.md)). The policy now lives on directories (card 36); cards 36c and [37](board/backlog/37-caller-views.md) narrow what each host and caller holds to its own slice or view ([fabric.md](fabric.md)).
+Nothing is broadcast: a member that takes part in no call receives no traffic about other members' calls. What every member does learn is the whole signed policy: every role matcher, service, host id, ban and directory, though no list of members (card [35](board/done/35-badges-and-bans.md)). The policy now lives on directories (card 36); card [37](board/backlog/37-caller-views.md) narrows what each caller holds to its own view, the root-signed entries of the services it may use, while hosts keep the whole policy ([fabric.md](fabric.md)).
 
 ## Walkthrough
 
@@ -453,7 +453,7 @@ To make `wires` the boundary, use a structural setup:
     matchers (often people's emails), service names and descriptions,
     trusted IdPs, directories. It is signed, not secret. It lists no members
     (card 35), but every agent's machine still holds every service and role
-    until card 37 (views) and every host until card 36c (slices).
+    until card 37 (views). Hosts hold all of it by design.
   - **A host learns an edit at its next check** of a directory (every 5
     minutes), unless it is itself a directory; card 36c subscribes hosts so
     an edit arrives in seconds.
@@ -510,9 +510,9 @@ To make `wires` the boundary, use a structural setup:
 - **The recorded two-machine demo** with real Google sign-in and Claude Code
   as the agent ([card 08](board/doing/08-demo-two-machine.md);
   script in [docs/demo.md](demo.md)).
-- **Slices and views** (cards [36](board/doing/36-directory.md) (36c),
+- **Subscriptions and views** (cards [36](board/doing/36-directory.md) (36c),
   [37](board/backlog/37-caller-views.md); the architecture is
-  [fabric.md](fabric.md)): directories give each host only its slice, by
+  [fabric.md](fabric.md)): directories send each host the policy's changes, by
   subscription, and each caller only its view, with search; `wires mcp`
   noticing a new policy without a restart; the `strict` freshness setting.
 - `login --for` and day-passes for headless agents
