@@ -17,7 +17,8 @@
 //!       "cwd": "/srv/orders",
 //!       "env": { "LC_ALL": "C" },
 //!       "also_require": ["sre"]
-//!     }
+//!     },
+//!     "deploy": { "command": ["deployctl", "run"], "end_of_options": true }
 //!   },
 //!   "push": { "allow": ["analyst"], "log_body": false },
 //!   "audit": { "otlp": "https://collector.example:4318" }
@@ -34,7 +35,12 @@
 //!   from `serve`; the server-derived `WIRES_*` values are set last), and
 //!   `also_require`: roles (defined in the
 //!   signed state) the caller must **also** be in, on top of the registry's
-//!   `allow`. It can only narrow.
+//!   `allow`. It can only narrow. `end_of_options: true` (default false)
+//!   puts `--` between the fixed command and the caller's arguments, so a
+//!   CLI that honours `--` takes none of them as an option (`-X DELETE`
+//!   stays an operand). It only helps such CLIs: one that ignores `--`, or
+//!   reads it as an operand, is no safer, and its fixed command must still
+//!   be safe against any trailing arguments.
 //! - `push`: which registry roles may receive pushes from this host, and
 //!   whether the call log keeps push bodies (card 23).
 //! - `audit.otlp`: an OTLP/HTTP collector the call log is also exported to
@@ -96,6 +102,28 @@ pub(crate) struct ServiceImpl {
     /// registry's `allow` alone decides.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) also_require: Vec<RoleName>,
+    /// Put `--` between `command` and the caller's arguments, so a CLI
+    /// that honours `--` can't take them as options. Default false. It
+    /// helps only CLIs that honour `--`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) end_of_options: bool,
+}
+
+impl ServiceImpl {
+    /// What the child is run as for a call with the caller's arguments
+    /// `caller`: the program, then its arguments (the fixed ones, `--` when
+    /// [`end_of_options`](Self::end_of_options), then the caller's, element
+    /// by element). `None` for an empty `command`.
+    pub(crate) fn argv<'a>(&'a self, caller: &'a [String]) -> Option<(&'a str, Vec<&'a str>)> {
+        let (program, fixed) = self.command.split_first()?;
+        let args = fixed
+            .iter()
+            .map(String::as_str)
+            .chain(self.end_of_options.then_some("--"))
+            .chain(caller.iter().map(String::as_str))
+            .collect();
+        Some((program.as_str(), args))
+    }
 }
 
 /// `push` in v2: registry roles that may receive pushes.
@@ -317,6 +345,9 @@ impl HostConfigV2 {
             if let Some(cwd) = &svc.cwd {
                 let _ = writeln!(out, "    cwd: {}", cwd.display());
             }
+            if svc.end_of_options {
+                let _ = writeln!(out, "    `--` before the caller's arguments");
+            }
             if !svc.also_require.is_empty() {
                 let roles: Vec<&str> = svc.also_require.iter().map(RoleName::as_str).collect();
                 let _ = writeln!(out, "    also requires: {}", roles.join(", "));
@@ -361,6 +392,35 @@ mod tests {
         assert_eq!(svc.cwd.as_deref(), Some(Path::new("/srv/orders")));
         assert_eq!(svc.also_require, vec![RoleName::new("sre").unwrap()]);
         assert_eq!(c.push.unwrap().allow.len(), 1);
+    }
+
+    /// Card 28 §10: `end_of_options` puts `--` between the fixed command and
+    /// the caller's arguments; off (the default), they follow directly.
+    #[test]
+    fn end_of_options_inserts_a_double_dash() {
+        let c = HostConfigV2::parse(
+            r#"{"version":2,"services":{
+                "plain":{"command":["gh","api"]},
+                "dashed":{"command":["gh","api"],"end_of_options":true},
+                "bare":{"command":["tool"],"end_of_options":true}}}"#,
+        )
+        .unwrap();
+        let svc = |n: &str| &c.services[&ServiceName::new(n).unwrap()];
+        let caller: Vec<String> = ["-X", "DELETE", "repos/x"].map(String::from).to_vec();
+        assert!(!svc("plain").end_of_options);
+        assert_eq!(
+            svc("plain").argv(&caller),
+            Some(("gh", vec!["api", "-X", "DELETE", "repos/x"]))
+        );
+        assert_eq!(
+            svc("dashed").argv(&caller),
+            Some(("gh", vec!["api", "--", "-X", "DELETE", "repos/x"]))
+        );
+        assert_eq!(svc("bare").argv(&[]), Some(("tool", vec!["--"])));
+        assert!(c.summary().contains("`--` before the caller's arguments"));
+        // The default isn't written back out.
+        let plain = serde_json::to_string(svc("plain")).unwrap();
+        assert!(!plain.contains("end_of_options"), "{plain}");
     }
 
     #[test]

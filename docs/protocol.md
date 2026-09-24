@@ -210,7 +210,9 @@ Every refusal from step 3 on (the caller is a member) is logged as an `AuditReco
 The host then appends the call's `Started` to its call log and `fsync`s it (§8) — if it can't, the
 call is refused (`this host can't record calls right now…`) and nothing runs — sends `HelloAck`
 (with `newer_state` when the caller's `state_version` is older) and execs the service's fixed argv
-**with the caller's argv appended element by element, never through a shell**, in its `cwd`. The
+**with the caller's argv appended element by element, never through a shell** (after a `--` when
+the service sets `end_of_options` in `host.json`, so a CLI that honours `--` takes none of the
+caller's arguments as an option; it doesn't help a CLI that ignores `--`), in its `cwd`. The
 child's environment is built from nothing (`env_clear`): only `PATH`, `LANG` and `LC_*` are
 inherited from `serve`; then `host.json`'s `env`; then the server-derived `WIRES_CALLER_NODE`,
 `WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_AFTER`, `WIRES_STATE_VERSION`, `WIRES_SERVICE`,

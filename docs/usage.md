@@ -435,7 +435,7 @@ For a stdio MCP client, the whole config is:
 |---|---|
 | `version` | Required, `2`. Unknown keys anywhere are an **error**. Version 1 (tools and roles decided by the host) is refused. |
 | `identity.issuers` | The IdPs whose ID tokens the host verifies, each with the OAuth client ids (`audiences`) it accepts **from that issuer**. |
-| `services` | Name → `command` (argv, no shell; each call's arguments are appended), optional `cwd`, optional `env` (no `WIRES_*` names), and `also_require`: roles from the state the caller must **also** be in (only narrows). Every name must be assigned to this host by the state. |
+| `services` | Name → `command` (argv, no shell; each call's arguments are appended), optional `cwd`, optional `env` (no `WIRES_*` names), `also_require`: roles from the state the caller must **also** be in (only narrows), and `end_of_options` (default `false`): put `--` between the command and the caller's arguments, so they can't be read as options by a CLI that honours `--` (it does nothing for one that doesn't). Every name must be assigned to this host by the state. |
 | `push` | Optional. `allow`: the roles (from the state) whose members may receive `wires push` from this host (none by default). `log_body`: also log each push's body (default `false`: subject only). |
 | `audit.otlp` | Optional. An OTLP/HTTP collector the call log is also exported to: `https://…`, or plain `http://` only to `localhost` / `127.0.0.1` / `[::1]`. |
 
@@ -461,7 +461,9 @@ services is left open for now (a rootless microVM is the likely answer);
 until then, **run services as a separate Unix user** (e.g. a `command` of
 `["sudo", "-u", "svc", "--", "tool"]`). A service's fixed
 command must also be safe against any trailing arguments, including ones
-spelled like options (`gh api -X DELETE …`).
+spelled like options (`gh api -X DELETE …`). `"end_of_options": true` in
+`host.json` puts `--` before them, which settles it for CLIs that honour
+`--` and for no others.
 
 ### The keystore
 

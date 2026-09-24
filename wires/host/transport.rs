@@ -839,7 +839,7 @@ where
         return Err(e);
     }
 
-    let Some((program, fixed)) = svc.command.split_first() else {
+    let Some((program, args)) = svc.argv(invocation.argv.as_slice()) else {
         // Nothing can run: close the logged call.
         if let Some(call_audit) = call_audit {
             call_audit.finish(-1).await;
@@ -847,7 +847,7 @@ where
         return Err(anyhow!("empty service command"));
     };
     let mut cmd = Command::new(program);
-    cmd.args(fixed).args(invocation.argv.as_slice());
+    cmd.args(args);
     if let Some(cwd) = &svc.cwd {
         cmd.current_dir(cwd);
     }
@@ -1333,7 +1333,15 @@ mod tests {
         args: &[&str],
         input: &[u8],
     ) -> (Result<i32>, Vec<u8>, Vec<u8>) {
-        let host = host_running(command);
+        run_session_on(host_running(command), args, input).await
+    }
+
+    /// [`run_session`] against `host`.
+    async fn run_session_on(
+        host: Arc<ServicesHost>,
+        args: &[&str],
+        input: &[u8],
+    ) -> (Result<i32>, Vec<u8>, Vec<u8>) {
         let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
         let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
         let caller = caller_id().node_id();
@@ -1402,6 +1410,26 @@ mod tests {
         let cut = truncate_reason(long);
         assert!(cut.len() <= MAX_REASON);
         assert!(cut.len() > MAX_REASON - 4);
+    }
+
+    /// Card 28 §10: with `end_of_options`, the child sees `--` between its
+    /// fixed arguments and the caller's; without, the caller's follow
+    /// directly.
+    #[tokio::test]
+    async fn end_of_options_puts_a_double_dash_before_the_callers_args() {
+        let script = ["sh", "-c", r#"printf '%s|' "$@""#, "sh", "fixed"];
+        let (code, out, _) = run_session(&script, &["-X", "DELETE"], b"").await;
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(String::from_utf8(out).unwrap(), "fixed|-X|DELETE|");
+        let mut host = host_unshared(&script);
+        host.config
+            .services
+            .get_mut(&ServiceName::new("t").unwrap())
+            .unwrap()
+            .end_of_options = true;
+        let (code, out, _) = run_session_on(Arc::new(host), &["-X", "DELETE"], b"").await;
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(String::from_utf8(out).unwrap(), "fixed|--|-X|DELETE|");
     }
 
     #[tokio::test]

@@ -58,7 +58,8 @@ service a caller can steer into reading or writing files can reach the
 host's keystore (its node key signs the call log). Put `sudo -u svc --` (or
 similar) in the service's `command`. A service's fixed command must also be
 safe against any trailing arguments the caller adds, including option-like
-ones. Don't run `serve` from the admin's keystore: it refuses one holding
+ones; `"end_of_options": true` puts `--` before them, for CLIs that honour
+it. Don't run `serve` from the admin's keystore: it refuses one holding
 `root.seed`.
 
 **The keystore must be writable and must persist.** `$WIRES_HOME` holds the
