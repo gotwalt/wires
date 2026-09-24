@@ -277,10 +277,16 @@ principal. With no token, or one that doesn't verify, no role admits and the vie
 head alone). Nothing per user is stored, and a request is **traced, not logged**: a view grants
 nothing, and the host logs every call.
 
-- `view {have, query: none}`: `current {fresh}` when `have` is the newest; a `view_update
-  {update, fresh}` (`ViewUpdate {head, changed: [ViewEntry], removed: [ServiceName]}`, the view at
-  the kept head `have` diffed against the view now) when `have` is one of the kept heads; else the
-  whole `view {view, fresh}`.
+- `view {have, query: none, held?}`: `held` is the `ViewDigest` of the view the caller holds
+  (blake3 over `"wires/view-digest/v1\0"` ‖ the view's canonical JSON). With a verified principal
+  and a `held` that names exactly the view the directory would diff from: `current {fresh}` when
+  `have` is the newest and `held` is the view now; a `view_update {update, fresh}` (`ViewUpdate
+  {head, changed: [ViewEntry], removed: [ServiceName]}`, the principal's view at the kept head
+  `have` diffed against the view now) when `have` is one of the kept heads and `held` is the view
+  at it. Anything else gets the whole `view {view, fresh}`: no `held`, one that doesn't match (a
+  view cut for another identity, or the empty one `wires join` stores), and any request without a
+  verified principal (the empty view, whole, so a caller whose token has lapsed can't keep
+  entries it held).
 - `view {have, query: q}`: the entries whose name or description contains `q` (ignoring ASCII
   case), always a whole `view`.
 - `resolve {service}`: a `view` holding that one service, or no entry (it doesn't exist, or the
@@ -409,7 +415,8 @@ host's, a directory's) cuts its own view from it instead of asking.
 - **One-shot commands make no background traffic.** `wires call` dials from the view as it is,
   and learns of a newer policy only in the call's handshake: `HelloAck` carries the host's head
   version, and when it is newer than the view's, the head and the called service's entry (§5).
-  The caller then refreshes its view after the call (`view {have}`: an update from a kept head).
+  The caller then refreshes its view after the call (`view {have, held}`: an update from a kept
+  head).
   A name the view doesn't hold is asked of a directory with `resolve` before the call fails; a
   view that is missing or expired is refreshed first. So on an unchanged fabric a call is the only
   connection.

@@ -15,7 +15,7 @@
 //! | `publish {head, items}` | `published {version}`: the version it now holds |
 //! | `head {}` | `head {head, fresh}` |
 //! | `policy {have}` | the whole policy for a host or directory: `policy {policy, fresh}`; `policy_update {update, fresh}` from a `have` the directory still keeps; `current {fresh}` when `have` is the newest |
-//! | `view {have, query?}` | the caller's view: `view {view, fresh}`, `view_update {update, fresh}` or `current {fresh}` the same way (a `query` always gets a whole `view`) |
+//! | `view {have, query?, held?}` | the caller's view: `view {view, fresh}`, or `view_update {update, fresh}` / `current {fresh}` the same way, only when `held` ([`ViewDigest`]) names exactly the view the directory would diff from, for a verified principal (a `query` always gets a whole `view`) |
 //! | `resolve {service}` | `view {view, fresh}` holding just that service, or no entry |
 //! | anything refused | `denied {reason}` |
 //!
@@ -49,7 +49,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{canonical_bytes, length_prefixed, prefix_len, split_frame};
+use crate::codec::{canonical_bytes, hex_id, length_prefixed, prefix_len, split_frame};
 use crate::error::{Error, Result};
 use crate::fresh::Fresh;
 use crate::head::SignedPolicyHead;
@@ -81,6 +81,38 @@ pub const MAX_SMALL_DIRECTORY_FRAME: usize = 16 * 1024;
 /// (canonical JSON sorts `head` first); no other request's does. A directory
 /// checks it before reading a request over [`MAX_SMALL_DIRECTORY_FRAME`].
 pub const PUBLISH_BODY_PREFIX: &[u8] = br#"{"head":"#;
+
+/// Domain-separation prefix of the bytes a [`ViewDigest`] hashes.
+pub const VIEW_DIGEST_CONTEXT: &[u8] = b"wires/view-digest/v1\0";
+
+hex_id! {
+    /// Names one exact [`View`]: blake3 over [`VIEW_DIGEST_CONTEXT`] ‖ the
+    /// view's canonical JSON (its head and every entry with its marks). A
+    /// caller sends it with `view {have, held}` so the directory answers
+    /// `current` or a `view_update` only for the view the caller holds; a
+    /// view cut for someone else, or for no one, doesn't match.
+    pub struct ViewDigest([u8; 32]);
+}
+
+impl ViewDigest {
+    /// The digest of `view`.
+    ///
+    /// ```
+    /// use library::{NodeIdentity, Policy, StateVersion, ViewDigest};
+    /// let root = NodeIdentity::from_seed([1u8; 32]);
+    /// let mut policy = Policy::new(root.node_id());
+    /// policy.version = StateVersion(1);
+    /// policy.not_after = i64::MAX;
+    /// let empty = policy.sign(&root).unwrap().view_for(None, None);
+    /// assert_eq!(ViewDigest::of(&empty).unwrap(), ViewDigest::of(&empty.clone()).unwrap());
+    /// ```
+    pub fn of(view: &View) -> Result<ViewDigest> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(VIEW_DIGEST_CONTEXT);
+        hasher.update(&canonical_bytes(view)?);
+        Ok(ViewDigest(*hasher.finalize().as_bytes()))
+    }
+}
 
 /// A dialer's frame on [`DIRECTORY_ALPN`]. See the module docs.
 #[allow(clippy::large_enum_variant)]
@@ -120,6 +152,13 @@ pub enum DirectoryRequest {
         /// Only entries whose name or description match this.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query: Option<String>,
+        /// The digest of the view the dialer holds at `have`
+        /// ([`ViewDigest::of`]). The directory answers `current` or a
+        /// `view_update` only when it matches the view it would diff from
+        /// (the caller's view at `have`, for the principal it presents
+        /// now); without it, or when it doesn't match, the whole view.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        held: Option<ViewDigest>,
     },
     /// One service, only if it is in the dialer's view (card 37).
     Resolve {
@@ -424,10 +463,19 @@ mod tests {
             DirectoryRequest::View {
                 have: StateVersion(0),
                 query: Some("orders".into()),
+                held: None,
             },
             DirectoryRequest::View {
                 have: StateVersion(0),
                 query: None,
+                held: None,
+            },
+            DirectoryRequest::View {
+                have: StateVersion(3),
+                query: None,
+                held: Some(
+                    ViewDigest::of(&sample().sign(&root()).unwrap().view_for(None, None)).unwrap(),
+                ),
             },
             DirectoryRequest::Resolve {
                 service: name("status"),
@@ -667,7 +715,7 @@ mod tests {
 
         #[test]
         fn view_requests_round_trip(have in any::<u64>(), query in proptest::option::of("[a-z ]{0,16}")) {
-            let r = DirectoryRequest::View { have: StateVersion(have), query };
+            let r = DirectoryRequest::View { have: StateVersion(have), query, held: None };
             let bytes = r.encode().unwrap();
             prop_assert_eq!(DirectoryRequest::decode(&bytes).unwrap(), Some((r, bytes.len())));
         }

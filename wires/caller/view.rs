@@ -38,7 +38,7 @@ use iroh::Endpoint;
 use library::{
     DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, Fresh, IdToken, Membership, NodeId,
     ServiceName, SignedPolicyHead, StateVersion, SubFrame, SubRequest, SubscriptionKind, View,
-    ViewEntry,
+    ViewDigest, ViewEntry,
 };
 use serde::{Deserialize, Serialize};
 
@@ -219,11 +219,18 @@ pub(crate) async fn ask_view(
     query: Option<String>,
     now: i64,
 ) -> Result<Fetched> {
-    let have = match (&query, held) {
-        (None, Some(view)) => view.head.head.version,
-        _ => StateVersion(0),
+    // What is held, named exactly: the directory answers `current` or an
+    // update only for this view (one cut for another identity, or for none,
+    // gets the whole view).
+    let (have, held_digest) = match (&query, held) {
+        (None, Some(view)) => (view.head.head.version, Some(ViewDigest::of(view)?)),
+        _ => (StateVersion(0), None),
     };
-    let request = DirectoryRequest::View { have, query };
+    let request = DirectoryRequest::View {
+        have,
+        query,
+        held: held_digest,
+    };
     match ask(endpoint, dir, badge, id_token, &request).await? {
         DirectoryAnswer::View { view, fresh } => {
             view.verify(root)

@@ -187,6 +187,7 @@ pub use codec::B64;
 pub use directory::{
     DIRECTORY_ALPN, DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, MAX_DIRECTORY_FRAME,
     MAX_SMALL_DIRECTORY_FRAME, PUBLISH_BODY_PREFIX, SubFrame, SubRequest, SubscriptionKind,
+    VIEW_DIGEST_CONTEXT, ViewDigest,
 };
 pub use entry::{ENTRY_CONTEXT, ENTRY_V1, SignedEntry};
 pub use error::{Error, IdTokenError, Result};
