@@ -1,7 +1,7 @@
 //! Card 27c's acceptance tests: **a host decides every call
 //! by the admin-signed policy it holds**, re-read per connection.
 //!
-//! The state is signed in the test by the network root and adopted into the
+//! The policy is signed in the test by the network root and adopted into the
 //! host's keystore exactly as a fetch from a directory does
 //! ([`adopt_if_newer`](crate::policy::store::adopt_if_newer)). Callers dial
 //! the real session ALPN over loopback with a hand-rolled `Hello` + `Invoke`
@@ -17,11 +17,13 @@
 //! - [`also_require_only_tightens`]
 //! - [`an_unassigned_service_refuses_to_start`]
 //! - [`a_removed_member_is_refused_on_the_next_call`]: the ban applies with
-//!   no restart; an older caller copy gets the newer state back.
+//!   no restart; a caller holding an older version gets the new head and
+//!   the called service's signed entry back in its `HelloAck`.
 //! - [`push_follows_the_signed_state`]: card 23's push and inbox fetch,
-//!   authorized by the registry roles in `push.allow`.
+//!   decided by the signed policy: the bans, and the registry roles in
+//!   `push.allow`.
 //! - [`a_fetch_with_a_token_makes_a_caller_reachable_by_role`]: a logged-in
-//!   member who never called is reachable by role once its `wires inbox`
+//!   node who never called is reachable by role once its `wires inbox`
 //!   fetch presented its token, and a direct push lands in a waiting inbox.
 
 use std::sync::Arc;
@@ -156,7 +158,7 @@ impl World {
         super::membership(&self.root, who)
     }
 
-    /// `who`'s `Hello`: its membership, the state version it holds, and a
+    /// `who`'s `Hello`: its badge, the policy version it holds, and a
     /// fresh token from its own IdP when `logged_in`.
     fn hello(&self, who: &NodeIdentity, version: u64, logged_in: bool) -> Hello {
         let idp = if who.node_id() == self.alice.node_id() {
@@ -175,7 +177,7 @@ impl World {
 struct Host {
     _router: Router,
     addr: EndpointAddr,
-    /// The host endpoint's address book: where it can dial members (push).
+    /// The host endpoint's address book: where it can dial callers (push).
     book: MemoryLookup,
     keystore: Arc<Keystore>,
     records: mpsc::Receiver<AuditRecord>,
@@ -217,7 +219,7 @@ impl Host {
         })
     }
 
-    /// The admin's newer state reaches this host (as a fetch from a directory would).
+    /// The admin's newer policy reaches this host (as a fetch from a directory would).
     fn adopt(&self, w: &World, state: &SignedPolicy) {
         assert!(adopt(&self.keystore, &w.root, state));
     }
@@ -534,7 +536,7 @@ async fn push_follows_the_signed_state() {
     };
     assert!(why.contains("no role allowed to receive pushes"), "{why}");
 
-    // Banned by the state: her queue is dropped and her fetch refused.
+    // Banned by the policy: her queue is dropped and her fetch refused.
     push.send(spec(&w.alice)).await.unwrap();
     host.adopt(&w, &w.state(2, &[w.alice.node_id()]));
     let Fetched::Refused(why) = fetch(&w, &w.alice, &host, None).await else {

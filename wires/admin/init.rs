@@ -25,7 +25,7 @@ pub(crate) struct InitArgs {
     pub(crate) ttl: Ttl,
     /// Lifetime of the first signed policy.
     #[arg(long, default_value = Ttl::POLICY_DEFAULT, hide = true)]
-    pub(crate) state_ttl: Ttl,
+    pub(crate) policy_ttl: Ttl,
     /// The IdP the network trusts first: its exact `iss` (more: `wires issuer set`).
     #[arg(long, default_value = GOOGLE_ISSUER)]
     pub(crate) issuer: String,
@@ -48,7 +48,7 @@ impl Default for InitArgs {
     fn default() -> Self {
         Self {
             ttl: Ttl::default(),
-            state_ttl: Ttl::policy_default(),
+            policy_ttl: Ttl::policy_default(),
             issuer: GOOGLE_ISSUER.to_string(),
             client_id: Some("wires-test-client".into()),
             audience: Vec::new(),
@@ -108,7 +108,7 @@ pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
     let mut ledger = Ledger::load(ks)?;
     ledger.record(me.node_id(), None, badge.not_after);
     ledger.save(ks)?;
-    let held = super::service::edit_policy(ks, a.state_ttl, |p| {
+    let held = super::service::edit_policy(ks, a.policy_ttl, |p| {
         p.issuers.insert(issuer.clone(), config);
         Ok(())
     })?;

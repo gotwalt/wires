@@ -22,7 +22,7 @@
 //!   host, at the cost of the directories becoming a dependency for calls.
 //!
 //! ```text
-//! wires state settings --freshness strict   # admin: the rule, signed into the policy
+//! wires policy settings --freshness strict   # admin: the rule, signed into the policy
 //! ```
 
 use std::sync::{Arc, RwLock};

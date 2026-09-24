@@ -1,6 +1,6 @@
 //! The whole policy: every item, as the admin edits it ([`Policy`]) and as
 //! it is signed and published ([`SignedPolicy`]: the root-signed head and the
-//! items it commits to). Card 36's replacement for the one-blob state.
+//! items it commits to).
 //!
 //! **The root signs the policy, and each service entry, like a badge.** The
 //! head signs an [`ItemsHash`] over every item, so a node holding the whole
@@ -12,12 +12,11 @@
 //! follow the policy by [`PolicyUpdate`](crate::PolicyUpdate)s
 //! ([`SignedPolicy::apply`]).
 //!
-//! [`Policy`] is typed maps, like the state, so an edit can't produce two
+//! [`Policy`] is typed maps, so an edit can't produce two
 //! items with one key or a second settings item; [`Policy::items`] flattens
 //! them into key order, signing each service entry. [`Policy::validate`]
-//! carries over the state's rules (every role a service names is defined,
-//! every matcher names a trusted issuer, each host listed once) and adds the
-//! new kinds'.
+//! checks that every role a service names is defined, every matcher names a
+//! trusted issuer, each host is listed once and no host is banned.
 //!
 //! ```
 //! use library::{

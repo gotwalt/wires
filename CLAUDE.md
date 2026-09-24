@@ -15,8 +15,8 @@ key, never by network path. Each node is admitted by its root-signed badge;
 one admin-signed, versioned policy says which IdPs are trusted, which roles
 exist, which services exist, which hosts run each, who may call and read
 each, who is banned, and which nodes are directories; the admin publishes it
-by key to the directories, hosts and callers fetch it from one, and every
-host decides every call from its copy. The caller is
+by key to the directories, hosts hold all of it and follow its changes from
+one by subscription, and every host decides every call from its copy. The caller is
 authenticated by their IdP, via an ID token bound to the node key and
 presented in the session handshake; every role needs that verified identity
 (there is no built-in `member` role), and every role matcher names its
@@ -24,10 +24,10 @@ issuer. Every call is recorded by the host in its own signed, hash-linked
 log. Agents can't observe each other's work: the isolation boundary is the
 verified person (IdP principal), so a caller sees its own person's records,
 and the readers the registry names see a service's records in full with
-`wires watch`, for logging and compliance. Nothing is broadcast; what every
-member still learns about the others (the whole signed policy) is card
-37's to fix, by giving each caller its view of root-signed service entries
-(hosts keep the whole policy; `docs/fabric.md`). `wires call` is the CLI-native path and the source of the token
+`wires watch`, for logging and compliance. Nothing is broadcast: each caller
+holds only its view (the root-signed entries of the services its person may
+use), and only hosts and directories hold the whole policy
+(`docs/fabric.md`). `wires call` is the CLI-native path and the source of the token
 savings; `wires mcp` (stdio) and `wires gateway` (remote, e.g. Claude.ai) serve
 the same services as MCP, so wires works in the clients people already use
 for remote tool calling, with the same identity, registry and record (MCP
@@ -47,9 +47,9 @@ rebuttal test in `docs/storytelling.md` §1.
 The pitch lives in `README.md`; usage (roles, walkthrough, reference) in `docs/usage.md`. Deployment and testing patterns live in
 `docs/deployment.md` and `docs/testing.md`. The spec for the code that runs
 (membership, the signed policy and the directory, the session handshake and gate,
-push, the call log and record stream, hints) is `docs/protocol.md`; the target
-architecture (how the fabric is hosted, persisted and synced, via a directory)
-is `docs/fabric.md`. The
+push, the call log and record stream, hints) is `docs/protocol.md`; the
+architecture (who runs what, what each node keeps, how the policy moves
+through the directories) is `docs/fabric.md`. The
 non-negotiables and kill criteria are at the top of `docs/board/README.md`.
 **Git history is the archive:** outdated docs are deleted, not moved aside.
 The product summary is `docs/executive-summary.md`. The pre-restart prototype is tagged `archive/poc-2026-05`: reference
@@ -154,14 +154,14 @@ runs from it. A host serving CLIs needs an image that also has those CLIs.
     each role owns
     a folder with a `mod.rs` — `admin/` (keystore, `init`/`invite`/`remove`,
     `service`/`role`/`issuer`/`directory add|rm` edits of the signed policy,
-    `state push`, `--ttl` /
-    `--state-ttl`), `host/` (`serve`,
+    `policy push`, `--ttl` /
+    `--policy-ttl`), `host/` (`serve`,
     `host.json`, the gate over the signed policy, the session transport,
     native services and the embedded `Host`,
     verified identities, the call log and OTLP export, the record stream, push,
-    its control sockets and the per-call push capability), `caller/` (`join`, `login`, `services`, `call`
-    with service → host failover and the local hints file, `mcp`, `inbox`,
-    `watch`), `gateway/` (`wires gateway`: remote MCP over HTTP + OAuth
+    its control sockets and the per-call push capability), `caller/` (`join`, `login`, the caller's view
+    (`view.json`), `services`, `call` with service → host failover and the
+    local hints file, `mcp`, `inbox`, `watch`), `gateway/` (`wires gateway`: remote MCP over HTTP + OAuth
     for web clients, calling with each user's own ID token), `directory/` (the
     directory mode: `directory.redb`, `wires/directory/1` and
     `wires/directory-sub/1`, the freshness beat and replicas, `directory

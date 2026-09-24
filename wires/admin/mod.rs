@@ -7,8 +7,8 @@
 //! directories. It lists no members (card 35): a node is admitted by the
 //! root-signed badge the admin mints for it, so inviting one is no edit.
 //! Every other command here edits the policy, signs the next version, and
-//! publishes it to the directories (never to a host: hosts and callers
-//! fetch it from a directory).
+//! publishes it to the directories (never to a host: hosts follow it from a
+//! directory, and callers ask one for their views).
 //!
 //! - [`init`] — `wires init`: root key, node key, the admin's own badge, the
 //!   first signed policy.
@@ -22,12 +22,12 @@
 //!   `wires issuer set | rm`, and the edits behind `wires directory add |
 //!   rm`.
 //! - [`propagate`] — publishing each edit to the directories (an edit that
-//!   reaches none fails), and `wires state push`.
-//! - [`settings`] — `wires state settings`: the freshness rule and the
+//!   reaches none fails), and `wires policy push`.
+//! - [`settings`] — `wires policy settings`: the freshness rule and the
 //!   directories' beat, in the signed policy.
 //! - [`keystore`] — the on-disk home: keys, the membership, and the
 //!   flag → env → file → keystore resolution every command uses.
-//! - [`ttl`] — the `--ttl` / `--state-ttl` / `--timeout` lifetimes.
+//! - [`ttl`] — the `--ttl` / `--policy-ttl` / `--timeout` lifetimes.
 
 pub mod init;
 pub mod invite;

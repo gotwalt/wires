@@ -1,5 +1,5 @@
 //! [`Ttl`]: a lifetime typed the way people say it, shared by every command
-//! that takes one (`--ttl`, `--state-ttl`, `--timeout`).
+//! that takes one (`--ttl`, `--policy-ttl`, `--timeout`).
 
 use std::str::FromStr;
 
@@ -15,7 +15,7 @@ impl Ttl {
     pub(crate) const DEFAULT: &'static str = "30d";
 
     /// The default lifetime of a signed policy head (every edit's
-    /// `--state-ttl`, card 36): the directories' freshness timestamps, not
+    /// `--policy-ttl`, card 36): the directories' freshness timestamps, not
     /// the head's expiry, keep copies current.
     pub(crate) const POLICY_DEFAULT: &'static str = "90d";
 

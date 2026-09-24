@@ -13,7 +13,7 @@ Patterns for running wires beyond one machine. For the command reference see
 | **Web gateway** (for Claude.ai and other remote-MCP clients) | `wires gateway` | HTTP, behind TLS you provide (a tunnel or proxy) |
 | **Reader** | `wires watch` | No |
 | **Directory** (holds the signed policy for everyone else) | `wires serve host.json` on a host the policy lists, or `wires directory serve` | No TCP listener; binds UDP for QUIC |
-| **Admin** | `wires init` / `invite` / `remove` / `issuer` / `role` / `service` / `directory` / `state push` / `state settings`, one-shot | No |
+| **Admin** | `wires init` / `invite` / `remove` / `issuer` / `role` / `service` / `directory` / `policy push` / `policy settings`, one-shot | No |
 
 A host dials out (to peers directly, or through a relay). Any key can
 complete the QUIC handshake; one without a valid badge, or banned by the signed policy, is refused at
@@ -34,7 +34,7 @@ its `host.json` execs (`sqlite3`, `gh`, …): build your own image from the
 
 ## Running a host
 
-A host is a member like any other. It joins once, then runs `serve`:
+A host is a node like any other. It joins once, then runs `serve`:
 
 ```bash
 wires id                       # send this to the admin
@@ -51,9 +51,11 @@ The admin assigns services to the host (`wires service add … --host
 <name>`) before it starts. If the host's copy of the policy predates that,
 `serve` fetches the newer policy from a directory when it starts; with no
 directory up, a fresh `wires invite` token for it carries it (re-joining
-never rolls back). While it runs, it checks a directory for a newer policy
-every 5 minutes. An admin edit that reaches no directory exits 1; `wires
-state push` re-publishes the stored policy once one is up.
+never rolls back). While it runs, it follows one directory's subscription
+(the next listed one if that directory goes away): each admin edit arrives
+within a second as one small update, and a signed freshness timestamp every
+5 minutes. An admin edit that reaches no directory exits 1; `wires policy
+push` re-publishes the stored policy once one is up.
 
 ### Run services as a separate Unix user
 
@@ -79,23 +81,15 @@ the caller adds, including option-like ones; `"end_of_options": true` puts
 `--` before them, for CLIs that honour it. Don't run `serve` from the
 admin's keystore: it refuses one holding `root.seed`.
 
-**Directories.** Hosts and callers fetch the signed policy from a directory,
-and the admin publishes every edit to them (`wires directory add <node>`). A
-host the policy lists runs the directory itself inside `serve`; a node that
-hosts nothing runs one with `wires directory serve` (its own keystore, joined
-like any node, no `host.json`). Calls don't need a directory; joining,
-edits and bans spreading do, so run two on different machines.
-
 ### Keystore and secrets
 
-
 **The keystore must be writable and must persist.** `$WIRES_HOME` holds the
-host's node key and membership, and the host rewrites its signed policy at
-runtime: it fetches every admin change from a directory (`policy.json`; a
-host that is also a directory keeps `directory.redb` too). It also holds the
-call log (`call-log.jsonl`), the push queue and the operator's control socket
-(`run/`). The services' push socket is not in it: `serve` makes a private
-directory for that under `$XDG_RUNTIME_DIR` (else the temp dir) at start and
+host's node key and badge, and the host rewrites its signed policy at
+runtime: every admin change arrives from a directory (`policy.json`, and the
+newest freshness timestamp in `fresh.json`; a host that is also a directory
+keeps `directory.redb` too). It also holds the call log (`call-log.jsonl`),
+the push queue and the operator's control socket (`run/`). The services'
+push socket is not in it: `serve` makes a private directory for that under `$XDG_RUNTIME_DIR` (else the temp dir) at start and
 removes it at exit, so the runtime or temp dir must be writable too.
 A read-only or throwaway keystore loses those on restart.
 
@@ -111,6 +105,58 @@ a StatefulSet volume), `replicas: 1` (the node key is the host's address, so
 replicas sharing a key are not a load balancer), and no `Service` or
 `Ingress`.
 
+## Running a directory
+
+A network needs a **directory**: hosts, callers and the gateway get the
+policy from one. It holds the newest signed policy (`directory.redb`), signs
+a freshness timestamp for it every 5 minutes, takes each admin edit, hands
+each host the whole policy and then every change by subscription, and hands each caller
+its view (the services that caller may use). It never decides a call: hosts
+decide from their own copy, so calls keep working with every directory down.
+Joining, listing services, and edits and bans spreading need one.
+
+Where to run it:
+
+- **On a host.** When the policy lists a host's node (`wires directory add
+  <label>`), its `wires serve` runs the directory on the same endpoint. The
+  simplest small network: one always-on host that is also the directory. A
+  host listed while it runs starts the directory at its next restart.
+- **Alone**, with `wires directory serve` on a node that hosts nothing (no
+  `host.json`), for example on the gateway machine, with its own keystore
+  (the gateway never uses its own node as its directory;
+  `deploy/gateway/compose.yml` has an optional `wires-directory` service
+  for this). It refuses the admin's keystore and a node the policy doesn't
+  list.
+
+Either way, a directory's first policy comes in its invite: the admin
+invites the node, lists it, then sends a fresh invite, which carries the
+whole policy because the node is now listed:
+
+```bash
+wires id                                   # on the directory node
+wires invite <id> --name dir1              # admin
+wires directory add dir1                   # admin
+wires invite <id> --name dir1              # admin: this token carries the policy
+wires join <token>                         # on the directory node
+wires directory serve                      # or `wires serve host.json` on a host
+```
+
+Run two, on different machines: each follows the other as a replica, so one
+that missed an edit catches up, and hosts and callers fail over between
+them. The admin publishes every edit to all of them (an edit that reaches
+none exits 1). `--max-subscribers` (default 4096) caps the subscriptions one
+directory serves at once (hosts, other directories, and long-running callers
+such as `wires mcp` and gateway sessions). Its keystore must persist:
+losing `directory.redb` loses nothing (the admin's `wires policy push`, or a
+replica, restores it), but the node key and badge are what the policy lists.
+
+**When no directory answers**, hosts keep deciding from the policy they hold
+under the default `lenient` freshness, and say so in their trace. Under
+`wires policy settings --freshness strict` a host refuses every call once
+the last freshness timestamp it holds lapses (15 minutes by default,
+`--fresh-secs`), so a ban is honoured everywhere within that time or nothing
+is served.
+
 ## Reachability and discovery
 
 Three layers, most self-contained first:
@@ -122,7 +168,7 @@ Three layers, most self-contained first:
   authenticates the peer's key, so a wrong address can only fail to connect.
 - **Self-hosted relay**: run upstream
   [`iroh-relay`](https://docs.rs/iroh-relay) and pass `--relay-url` to
-  `serve`, `call`, `mcp`, `gateway`, `inbox` and `watch`, for NAT traversal between egress-only
+  `serve`, `directory serve`, `call`, `mcp`, `gateway`, `inbox` and `watch`, for NAT traversal between egress-only
   peers that can both reach it. Keep it one logical endpoint: two peers only
   rendezvous on the *same* relay.
 - **n0 DNS discovery and relays** (the default): resolves a node id to
@@ -133,21 +179,23 @@ n0.
 
 ## Provisioning and removal
 
-- **Add a member:** the joiner runs `wires id`; the admin runs
+- **Add a node:** the joiner runs `wires id`; the admin runs
   `wires invite <id> --name <label>` and hands back the token; the joiner runs
   `wires join <token>`. The token's badge (its root-signed membership) is
   what admits the node: the invite edits no policy and publishes nothing. The
   root key never leaves the admin's machine.
-- **Remove a member:** `wires remove <label>`. The node is banned in a new
+- **Remove a node:** `wires remove <label>`. The node is banned in a new
   signed policy until its badge would expire, and the policy is published to
   the directories, with no import and no restart. `serve` re-reads its policy
   once per connection, so from the moment a host has the new policy, the removed
   node's next call there is refused: exit `77`, `wires: denied by host: not
-  a member of this network` on its stderr. The host traces the refusal
-  rather than logging it (a banned key can't write to the log). A host that is a directory has the new policy at once; any other host
-  follows a directory's subscription and has it within a second. There is no shared key to rotate.
+  a member of this network; don't retry: ask your admin for access` on its
+  stderr. The host traces the refusal rather than logging it (a banned key
+  can't write to the log). A host that is a directory has the new policy at
+  once; any other host follows a directory's subscription and has it within
+  a second. There is no shared key to rotate.
 - **Expiry:** a badge (membership) expires after its `--ttl` (default and
-  most `30d`), the signed policy after its `--state-ttl` (default `90d`), and
+  most `30d`), the signed policy after its `--policy-ttl` (default `90d`), and
   nothing renews them yet. Any admin edit signs a fresh policy (never
   shortening its life), and so does an invite when the stored policy has
   expired; re-issue badges with `wires invite <id>`.
@@ -159,7 +207,7 @@ n0.
 `wires gateway` serves the services each signed-in user may call as a remote
 MCP server (Streamable HTTP, OAuth 2.1), for the web clients people already
 use for remote tool calling: Claude.ai's custom connectors, the MCP
-Inspector. It is one member node that calls **as** each web user:
+Inspector. It is one node that calls **as** each web user:
 
 1. The user adds `https://<gateway>/mcp` as a connector. The client finds
    the gateway's OAuth metadata, registers (Client ID Metadata Document, or
@@ -199,8 +247,12 @@ To run one:
    --client-id <the CLI's client id> --audience <the CLI's client id>
    --audience <the gateway's client id>`). A host whose `host.json` narrows
    `identity.issuers[].audiences` must list it there too.
-3. **The gateway joins** like any member (`wires id`, `wires invite`,
-   `wires join`). The registry's roles decide what each user sees.
+3. **The gateway joins** like any node (`wires id`, `wires invite`,
+   `wires join`), after the admin has named a directory: the gateway asks a
+   directory for each signed-in user's view (and follows it for as long as
+   the session lives), so it refuses to start when its invite lists none,
+   and it never uses its own node. The registry's roles decide what each
+   user sees.
 4. **TLS in front.** The gateway speaks plain HTTP. `deploy/gateway/` runs
    it next to `cloudflared` on a Cloudflare Tunnel whose ingress routes the
    public host to `http://wires-gateway:8080`. Turn Cloudflare's Browser
@@ -216,6 +268,17 @@ docker compose up -d
 curl https://<gateway>/.well-known/oauth-protected-resource/mcp
 ```
 
-The keystore volume holds the node key, membership and signed policy, the
-key that signs DCR client ids (`gateway-client-key`), and the live sessions
+The keystore volume holds the node key, its badge, the directory ids and
+login settings from its invite, the key that signs DCR client ids (`gateway-client-key`), and the live sessions
 (`gateway-sessions.json`, keyed by token hash, so a restart signs no one out).
+Users' views are held in memory and fetched again after a restart.
+
+To run the directory on the same machine, as its own node, start the
+optional service with its own keystore volume, then invite, list and join it
+as in [Running a directory](#running-a-directory):
+
+```bash
+docker compose --profile directory run --rm wires-directory id
+docker compose --profile directory run --rm wires-directory join <token>
+docker compose --profile directory up -d
+```

@@ -447,7 +447,7 @@ mod tests {
         assert!(json.contains(r#""stdin_head":"select 1""#), "{json}");
     }
 
-    /// `Started` names the service, the state version and the role that
+    /// `Started` names the service, the policy version and the role that
     /// admitted the caller.
     #[test]
     fn started_records_the_service_version_and_role() {

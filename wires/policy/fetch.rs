@@ -1,7 +1,7 @@
 //! Moving the signed policy by key, through the directories
 //! (`wires/directory/1`; the frames are [`library::directory`]'s).
 //!
-//! - [`publish_all`]: after every admin edit (and `wires state push`), the
+//! - [`publish_all`]: after every admin edit (and `wires policy push`), the
 //!   admin publishes the whole new policy to every directory the new head
 //!   lists, plus those the head before the edit listed (so a directory the
 //!   edit drops learns it). It dials no host. A directory it can't reach is
@@ -40,7 +40,7 @@ use crate::clock::now_unix;
 use crate::directory::wire::ask;
 use crate::host::transport;
 
-/// How long a cold command spends fetching, all directories together.
+/// How long a host's start-up fetch ([`fetch_now`]) spends, all directories together.
 const COLD_FETCH_BUDGET: Duration = Duration::from_secs(8);
 
 /// Which directories took a published policy and which didn't.
@@ -70,7 +70,7 @@ impl PublishReport {
         );
         if !self.missed.is_empty() {
             out.push_str(&format!(
-                "; not reached: {} (`wires state push` re-publishes it)",
+                "; not reached: {} (`wires policy push` re-publishes it)",
                 self.missed
                     .iter()
                     .map(|n| format!("{}…", n.short()))
@@ -343,7 +343,7 @@ pub(crate) async fn catch_up(endpoint: &Endpoint, ks: &Keystore) -> Result<Optio
 }
 
 /// `wires serve`'s fetch at start (a host assigned a service while it was
-/// offline): bind as `node` briefly and [`catch_up`], within the cold-fetch
+/// offline): bind as `node` briefly and [`catch_up`], within the start-up fetch
 /// budget.
 pub(crate) async fn fetch_now(
     ks: &Keystore,

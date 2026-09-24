@@ -4,7 +4,7 @@
 //! exclusive lock (`policy.json.lock`, an OS file lock, so it also holds
 //! across processes): re-read the stored copy, verify the candidate under the
 //! root, require it to be fresh and strictly newer, write atomically. Without
-//! the lock a removed member presenting a genuine older policy could roll a
+//! the lock a removed node presenting a genuine older policy could roll a
 //! node back.
 //!
 //! Hosts, directories and the admin hold the whole policy; a caller holds

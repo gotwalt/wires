@@ -1,10 +1,12 @@
 # The fabric: how it is hosted, persisted and kept in sync
 
-*Target architecture, agreed 2026-09-24; built by cards [35](board/done/35-badges-and-bans.md),
-[36](board/done/36-directory.md) and [37](board/done/37-caller-views.md). The protocol as
-built today is [protocol.md](protocol.md); §9 below lists what is built and what changes. The numbers come from
-[`bench/state-scale/`](../bench/state-scale/REPORT.md). User-facing copy says "network";
-"fabric" is the internal word, and the name of the signed field.*
+*The architecture as built (cards [35](board/done/35-badges-and-bans.md),
+[36](board/done/36-directory.md), [36d](board/done/36d-no-merkle-policy.md) and
+[37](board/done/37-caller-views.md)): who runs what, what each node keeps, and how each kind of
+metadata moves. The wire-level spec is [protocol.md](protocol.md); §9 lists what changed from the
+earlier design. The numbers come from [`bench/state-scale/`](../bench/state-scale/REPORT.md).
+User-facing copy says "network"; "fabric" is the internal word, and the name of the signed
+field.*
 
 ## 1. What a fabric is
 
@@ -20,7 +22,7 @@ The root signs three kinds of thing:
   edit is version N+1. **The root signs the policy, and each service entry, like a badge:** one
   signature on the head covers a hash of every item, and each service entry also carries its own,
   so a caller can hold and check just the services it may use.
-- **Delegations** it chooses to make (later): day-passes (card 29), enrollment (card 18).
+- **Delegations** it may make later (not built): day-passes (card 29), enrollment (card 18).
 
 Everything else is signed by the node that produced it: a host signs its call records, and a
 directory signs freshness timestamps. The IdP signs ID tokens.
@@ -33,8 +35,8 @@ authenticated by key. The jobs:
 
 | Node | Job | Runs | Must be up? |
 |---|---|---|---|
-| **Admin** | Holds the root key; signs badges and policy; publishes each edit to the directories. | One-shot commands (`init`, `invite`, `remove`, `issuer`, `role`, `service`, `directory add\|rm`, `state push`). | Only to change something. |
-| **Directory** | Holds the newest policy; signs a freshness timestamp every 5 min; gives each host the whole policy and each caller its view; streams changes to subscribers. **Never decides a call.** | `wires serve` on a node the policy lists in `directories`, or `wires directory serve` alone (no `host.json`). ALPNs `wires/directory/1`, `wires/directory-sub/1`. | For joining, changes, discovery and freshness. Not for calls. |
+| **Admin** | Holds the root key; signs badges and policy; publishes each edit to the directories. | One-shot commands (`init`, `invite`, `remove`, `issuer`, `role`, `service`, `directory add\|rm`, `policy push`). | Only to change something. |
+| **Directory** | Holds the newest policy; signs a freshness timestamp every 5 min (the policy's `beat_secs`); gives each host the whole policy and each caller its view; streams changes to subscribers (at most 4,096, `--max-subscribers`). **Never decides a call.** | `wires serve` on a node the policy lists in `directories` (decided when it starts), or `wires directory serve` alone (no `host.json`). Both refuse a keystore that holds `root.seed`. ALPNs `wires/directory/1`, `wires/directory-sub/1`. | For joining, changes, discovery and freshness. Not for calls. |
 | **Host** | Runs services; decides every call from its own copy of the whole policy; signs every call into its own log; serves the record stream and push. | `wires serve host.json`, or an app embedding `wires::Host`. ALPNs `wires/session/1`, `wires/records/1`, `wires/inbox/2`. | For its services' calls. |
 | **Caller** | Calls services by name, as a person verified by their IdP. | `wires call` (one-shot), `wires mcp`, `wires gateway` (long-running), `wires inbox`. | Only while calling. |
 | **Reader** | A caller the policy names in a service's `readers`; reads its records in full. | `wires watch`. | Only while reading. |
@@ -53,7 +55,7 @@ check ID tokens) and on iroh's discovery and relays (n0's public ones, or your o
 | **call a service** | one reachable host of that service. Nothing else: the host decides from its policy on disk, and the caller dials from its cached view. |
 | **join, change policy, revoke, list or search services** | one reachable directory. |
 | **keep bans current everywhere** | a directory reachable by every host (hosts subscribe; a ban arrives in seconds). |
-| **keep the fabric alive** | the admin signs a new head before the current one expires (default 90 days), and new badges before old ones expire (default 30 days; renewal is card 36's open question). |
+| **keep the fabric alive** | the admin signs a new head before the current one expires (default 90 days), and new badges before old ones expire (default 30 days; there is no renewal yet: a node gets a new badge by a new invite). |
 
 **Recommended:** two directories on different machines (either can also be a host, or run
 `wires directory serve` alone).
@@ -75,10 +77,10 @@ check ID tokens) and on iroh's discovery and relays (n0's public ones, or your o
 
 | Node | What it keeps | If lost |
 |---|---|---|
-| **Admin** | `root.seed`: **the fabric's whole authority**. The full policy (every item, the newest head). `issued.json`: each badge it minted, with its label and expiry. | `root.seed` lost: the fabric can't be changed and dies when its head and badges expire. See §4.4. Policy lost: pull it back from any directory. |
-| **Directory** | `directory.redb`: recent heads, the items they name, the newest `Fresh`. Its own badge and `node.seed`. | Rebuild from a replica (it catches up by itself) or by `wires state push` from the admin. Nothing is unique to it. |
-| **Host** | `policy.json`: the whole signed policy (the head and every item; the head's one signature covers them all), and its latest `Fresh`. `call-log.jsonl`: every call, signed and hash-linked, kept 30 days. `push-queue.json`, `host.json`, badge, `node.seed`. | Policy: fetched again from a directory. **Call log: unique to this host**; export it over OTLP, or wait for card 09, which gives checkpoints to a witness. |
-| **Caller** | Badge, `node.seed`, `view.json` (its own services: root-signed entries, each checked alone), `directories.json` and `login.json` (from its invite), `idp-token.jwt`, `last-good.json`, `record-marks.json`, `inbox/`. No `policy.json`. | View: fetched again. Badge or seed: a new invite. |
+| **Admin** | `root.seed`: **the fabric's whole authority**. `policy.json`: the whole signed policy, which every edit starts from. `issued.json`: each badge it minted, with its label and expiry. `login-client.json`: the login settings invites carry. Its own badge (`membership.json`) and `node.seed`. | `root.seed` lost: the fabric can't be changed and dies when its head and badges expire. See §4.4. `policy.json` lost: copy it back from any host or directory (it is root-signed, so any copy verifies); there is no command that fetches it. |
+| **Directory** | `directory.redb`: the last 16 heads (for deltas), the items they name, the newest `Fresh`; a copy of the newest policy in `policy.json`. Its own badge (`membership.json`) and `node.seed`. | Rebuild from a replica (it catches up by itself) or by `wires policy push` from the admin. Nothing is unique to it. |
+| **Host** | `policy.json`: the whole signed policy (the head and every item; the head's one signature covers them all), and `fresh.json`, the newest `Fresh` that vouches for it. `call-log.jsonl`: every call, signed and hash-linked, kept 30 days. `push-queue.json`, `host.json`, its badge (`membership.json`), `node.seed`. | Policy: fetched again from a directory. **Call log: unique to this host**; export it over OTLP, or wait for card 09, which gives checkpoints to a witness. |
+| **Caller** | Its badge (`membership.json`), `node.seed`, `view.json` (its own services: root-signed entries, each checked alone), `directories.json` and `login.json` (from its invite), `idp-token.jwt`, `last-good.json`, `record-marks.json`, `inbox/`. No `policy.json`. | View: fetched again. Badge or seed: a new invite. |
 
 Nothing about the fabric is stored "in the network". n0 DNS and the relays hold only short-lived
 address records.
@@ -99,8 +101,8 @@ address records.
    subscribe to a directory and receive anything published while they were off (one
    `policy_update`, or the whole policy if the directory no longer keeps their version).
 3. **Callers** use `view.json`. The first call's `HelloAck` tells them whether the policy moved.
-4. **If the admin edited while directories were off**, the edit's `wires state push` failed
-   (exit 1) and the change is only on the admin. It spreads when the admin re-runs `state push`.
+4. **If the admin edited while directories were off**, the edit's publish failed (exit 1) and the
+   change is only on the admin. It spreads when the admin runs `wires policy push`.
 
 A fabric survives any length of downtime, **except expiry**. If the head (90 days) or the badges
 (30 days) expired meanwhile, nodes refuse to use them until the admin signs new ones. The clock is
@@ -175,29 +177,36 @@ view (card 36, "Not gossip").
 
 ## 6. The flows
 
-- **Start a fabric.** `wires init` makes the root key and signs version 1. The admin names a
-  directory (`wires directory add <node>`), invites that node, and it starts `serve`.
-- **Join.** The admin runs `wires invite <node id>`: a badge plus the root key and directory ids,
-  about 800 B. The policy doesn't change. The new node runs `wires join`, then `wires login`, then
-  fetches its view.
+- **Start a fabric.** `wires init` makes the root key and signs version 1, trusting one IdP. The
+  admin names a directory (`wires directory add <node id>`), then invites that node: since the
+  policy already lists it, its token also carries the whole policy. The node joins and runs
+  `wires directory serve` (or `wires serve host.json`, if it is also a host).
+- **Join.** The admin runs `wires invite <node id>`: a badge (which names the root key), up to two
+  directory ids and the login settings, under 1 KB (979 B with Google-sized settings). The policy
+  doesn't change. The new node runs `wires join`, then a bare `wires login` (the invite named the
+  IdP), which fetches its view.
 - **Change policy.** An admin edit signs head N+1, re-signing only the service entries it changed,
   and publishes it to every directory. Directories send every subscribed host a `policy_update`:
   the new head, its `Fresh` and the changed items. The host applies it to its copy and checks the
   result against the head's one signature; any mismatch, and it fetches the whole policy.
   Subscribed callers (`mcp`, gateway) get their changed view entries. One-shot callers learn at
   their next call.
-- **Revoke.** `wires remove <node>` adds a ban (until the node's badge would expire). Every
-  subscribed host has it within seconds and refuses the node's next connection.
+- **Revoke.** `wires remove <node>` adds a ban (until the node's badge would expire) and drops the
+  node from every service's hosts and from the directories. Every subscribed host has it within
+  seconds and refuses the node's next connection; so does every directory.
 - **Call.** The caller picks a host from its view and dials it with `Hello` (badge, ID token) and
   `Invoke`. The host checks the badge and bans, verifies the token, and checks the service is
   assigned to it and allowed for the caller. It logs `Started`, runs the service, and logs
-  `Finished`. `HelloAck` carries the host's head version, so a caller whose view is behind refreshes
-  it afterwards.
+  `Finished`. `HelloAck` carries the host's head version; when it is newer than the caller's view,
+  it also carries the service's signed entry, which the caller checks before sending stdin, and the
+  caller refreshes its view afterwards. A name missing from the view is `resolve`d at a directory
+  first.
 - **Discover.** `wires services [query]` reads the view, refreshing it from a directory when it's
-  behind or a day old. In MCP, `tools/list` (or `search_services` for large views) serves the same
-  view.
-- **Watch.** A reader streams records from the hosts of the services its view marks `read`, and
-  checks each host's chain (later: checkpoints against the witness, card 09).
+  behind, expired or a day old. In MCP, `tools/list` serves the same view; past 40 services it
+  offers `search_services` and `call_service` instead.
+- **Watch.** A reader streams records from the hosts of the services its view marks `read` (and,
+  for its own person's records, `call`), and checks each host's chain against its marks
+  (`record-marks.json`). Checkpoints against a witness are card 09.
 
 ## 7. ALPNs
 
@@ -206,16 +215,15 @@ view (card 36, "Not gossip").
 | `wires/session/1` | hosts | calls |
 | `wires/records/1` | hosts | the record stream |
 | `wires/inbox/2` | hosts; callers in `inbox --wait` | push delivery and fetch |
-| `wires/directory/1` | directories | `publish`, `head`, `policy {have}` (the whole policy, for hosts and directories; answered with `policy`, `policy_update` or `current`), `view`, `resolve` (a caller's signed entries, cut for its verified ID token; 37). |
-| `wires/directory-sub/1` | directories | subscriptions: `policy` (hosts: the whole policy once, then `policy_update` deltas and `fresh` beats; 36c), `view` (long-running callers: `view_update`, 37), `replica` (other directories; 36b) |
-| ~~`wires/state/1`~~ | — | retired by card 36 |
+| `wires/directory/1` | directories | `publish` (from the admin), `head`, `policy {have}` (the whole policy, only for a node the policy names as a host or directory; answered with `policy`, `policy_update` or `current`), `view` and `resolve` (a caller's signed entries, cut for its verified ID token) |
+| `wires/directory-sub/1` | directories | subscriptions: `policy` (hosts: the whole policy or a delta first, then a `policy_update` per new head and `fresh` beats), `view` (long-running callers: the whole view, then `view_update`s), `replica` (other directories the policy lists) |
 
 ## 8. What it costs
 
 Metadata received per node per day, at 10k users, 1k services and 500 hosts
 ([`bench/state-scale/`](../bench/state-scale/REPORT.md)):
 
-| | Today | This design |
+| | Before (every node held the whole signed state) | Now |
 |---|---|---|
 | each caller | 39 MB | 115 KB one-shot (a dial and a `HelloAck` per new head it notices), 75 KB with `wires mcp` subscribed |
 | each host | 54 MB (plus 1.6 GB sent to callers) | 166 KB, after a first sync of the whole policy (667 KB) |
@@ -230,19 +238,24 @@ day) plus one 1.2–1.7 KB `policy_update` per edit (the new head, its `Fresh` a
 so it grows with the edit rate, not the number of nodes: 140 KB a day at 50 users, 280 KB at 50k.
 Sizes are measured from the library (card 36d).
 
-## 9. Before, now, and this design
+## 9. What changed from the earlier design
 
-Card 35 is built, and cards 36b (the directory mode), 36d (the head signs a hash of every item,
-and the root signs each service entry on its own) and 36c (host subscriptions with `policy_update`
-deltas, freshness modes) and 37 (caller views) are built on `aaron/directory`.
+Until card 34, one root-signed *state* listed every member, role and service; the admin pushed it
+whole to every host after each edit, hosts re-checked it every 10 minutes and searched their peers
+for newer copies (`wires/state/1`), and every caller held and re-downloaded all of it. Cards 35–37
+replaced that:
 
-| Before cards 35–36 | Now (after 36d; protocol.md) | This design | Card |
-|---|---|---|---|
-| The state lists every member; `invite` is an edit | Badges; `remove` is a ban; `invite` edits nothing | same | 35 ✓ |
-| One signed blob, pushed whole to every host | A root-signed head over a hash of the items, and root-signed service entries, published to the directories (`directory.redb`, replicas); the admin dials no host | same; hosts hold the whole policy | 36b ✓, 36d ✓ |
-| Hosts re-check every 10 min and search peers | One `policy` subscription to the first directory that answers (the others are failover), carrying `policy_update` deltas and a `Fresh` every beat; an edit arrives in well under a second | same | 36b ✓, 36c ✓ |
-| The state expires in 30 days | Heads last 90 days; a host keeps the newest `Fresh` for its head (`fresh.json`); when it lapses, `settings.freshness` decides: `lenient` keeps deciding and traces it, `strict` refuses calls | same; `lenient` staleness also shown in `wires watch` | 36b ✓, 36c ✓ |
-| Issuers configured per host in `host.json` | Signed `issuer` items; `host.json` can only narrow them | same | 36b ✓ |
-| Every caller holds the whole state and pulls it before commands | Each caller holds its view (`view.json`); a one-shot learns of a new head in `HelloAck` (with the service's entry, checked before stdin) and then asks for what changed; `wires mcp`, gateway sessions and `inbox --wait` subscribe; `wires services <query>` and MCP `search_services` search it | same | 37 ✓ |
-| The invite carries the whole state | A caller's invite: its badge (the root key is its `fabric`), up to two directory ids and the login settings, under 1 KB; a host's or directory's also carries the policy | same | 37 ✓ |
-| Hash-chained logs, checked against a reader's marks | same | Merkle logs with checkpoints, witnessed by the directory | 09 |
+| Before | Now | Card |
+|---|---|---|
+| The state lists every member; `invite` is an edit | A node is in by its badge; `remove` is a ban; `invite` edits nothing | 35 |
+| One signed blob, pushed whole to every host | A root-signed head over a hash of the items, and root-signed service entries, published to the directories (`directory.redb`, replicas); the admin dials no host | 36, 36d |
+| Hosts re-check every 10 min and search peers | One `policy` subscription to the first directory that answers (the others are failover), carrying `policy_update` deltas and a `Fresh` every beat; an edit arrives in well under a second | 36 |
+| The state expires in 30 days | Heads last 90 days; a host keeps the newest `Fresh` for its head (`fresh.json`); when it lapses, `settings.freshness` decides (`lenient` keeps deciding and traces it, `strict` refuses calls) | 36 |
+| Issuers configured per host in `host.json` | Signed `issuer` items; `host.json` can only narrow them | 36 |
+| Every caller holds the whole state and pulls it before commands | Each caller holds its view (`view.json`) and learns of a new head in `HelloAck`; `wires mcp`, gateway sessions and `inbox --wait` subscribe; `wires services <query>` and MCP `search_services` search it | 37 |
+| The invite carries the whole state | A caller's invite is its badge, up to two directory ids and the login settings, under 1 KB; a host's or directory's also carries the policy | 37 |
+
+Not built yet: `lenient` staleness shows in the host's trace, not in `wires watch`; a host keeps
+one subscription at a time, so failover costs a dial per dead directory; a node newly listed in
+`directories` runs the directory mode only after `wires serve` restarts; badges can't be renewed
+(re-invite); call logs are hash chains, not Merkle logs with witnessed checkpoints (card 09).

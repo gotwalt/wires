@@ -301,7 +301,7 @@ pub(crate) fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) ->
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "tmp".to_string());
     // Unique per process *and* per call: two threads in one process rewriting
-    // the same file (a pulled state and a pushed one, say) must not share a
+    // the same file (a fetched policy and a published one, say) must not share a
     // temporary path, or one would rename the other's half-written file.
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -438,7 +438,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        let private = dir.join("state-checked.txt");
+        let private = dir.join("last-good.json");
         write_text_mode(&private, "1\n", None).unwrap();
         assert_eq!(mode(&private), 0o600);
         let public = dir.join("membership.json");

@@ -14,7 +14,7 @@ Options:
           The client's public secret, which invites carry to `wires login`
       --login
           Make this the IdP invites tell `wires login` to use (default: init's)
-      --state-ttl <TTL>
+      --policy-ttl <TTL>
           Lifetime of the new policy, from now; never shortens the current one [default: 90d]
   -h, --help
           Print help

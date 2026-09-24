@@ -26,8 +26,8 @@
 //! - `mock_idp` — a hermetic OIDC issuer (tests and the dev build only).
 //! - [`view`] — `view.json`: the services this caller may use, each a
 //!   root-signed entry (card 37), and how it is fetched and followed.
-//! - [`services`] — `wires services`: what this caller may call, evaluated
-//!   locally.
+//! - [`services`] — `wires services`: what this caller may call, read from
+//!   its view.
 //! - [`pick`] — service name → host, with failover; the local dial hints.
 //! - [`hello`] — the caller's session `Hello`.
 //! - [`join`] — `wires id` and `wires join <token>` (card 14; every node

@@ -1,6 +1,6 @@
 Print the network's settings, or change them and publish
 
-Usage: wires state settings [OPTIONS]
+Usage: wires policy settings [OPTIONS]
 
 Options:
       --freshness <FRESHNESS>
@@ -23,5 +23,5 @@ Options:
           Also list the operator and credential flags
 
 Examples:
-  wires state settings
-  wires state settings --freshness strict --beat-secs 60
+  wires policy settings
+  wires policy settings --freshness strict --beat-secs 60

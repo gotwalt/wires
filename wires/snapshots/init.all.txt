@@ -5,7 +5,7 @@ Usage: wires init [OPTIONS]
 Options:
       --ttl <TTL>
           Lifetime of this node's badge (`30d`, `12h`, … or seconds; at most 30d) [default: 30d]
-      --state-ttl <STATE_TTL>
+      --policy-ttl <POLICY_TTL>
           Lifetime of the first signed policy [default: 90d]
       --issuer <ISSUER>
           The IdP the network trusts first: its exact `iss` (more: `wires issuer set`) [default: https://accounts.google.com]

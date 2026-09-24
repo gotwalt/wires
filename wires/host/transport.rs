@@ -59,7 +59,7 @@ const PUMP_BUF: usize = 64 * 1024;
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// Largest [`Frame::Hello`] a host reads, before it knows who is asking: a
-/// membership, a state version and an ID token fit in a few KiB.
+/// badge, a policy version and an ID token fit in a few KiB.
 pub(crate) const MAX_HELLO_FRAME: usize = 64 * 1024;
 
 /// Largest [`Frame::Invoke`] a host reads before admitting the caller. An
@@ -583,7 +583,7 @@ impl ServicesProtocol {
     }
 }
 
-/// Refusals of peers not known to be members (see [`Throttle`]).
+/// Refusals of peers not known to be admitted (see [`Throttle`]).
 static STRANGERS: Throttle = Throttle::new();
 
 impl iroh::protocol::ProtocolHandler for ServicesProtocol {
@@ -676,9 +676,9 @@ where
 /// The host side of a session, over an authenticated bi-stream: read the
 /// [`Frame::Hello`] (at most [`MAX_HELLO_FRAME`]) and the [`Frame::Invoke`]
 /// (at most [`MAX_INVOKE_FRAME`]), then decide by **this host's** signed
-/// state (re-read now, so a removal applies on the next dial):
+/// policy (re-read now, so a removal applies on the next dial):
 ///
-/// 1. the caller's badge (membership credential), and that the state
+/// 1. the caller's badge (membership credential), and that the policy
 ///    doesn't ban it
 ///    ([`ServicesHost::check_member`](crate::host::gate::ServicesHost::check_member)).
 ///    Anyone else hears only [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED),
@@ -695,8 +695,9 @@ where
 /// Admitted: the call's `Started` is appended to the call log and `fsync`ed
 /// **before** anything else — if it can't be, the call is refused with
 /// [`DENY_LOG_UNAVAILABLE`] and nothing runs. Then a [`Frame::HelloAck`]
-/// carrying this host's membership and state version, plus the state itself
-/// when the caller's copy is older (the cheapest pull), then the service's
+/// carrying this host's badge and policy version, plus the policy head and
+/// the called service's signed entry when the caller's view is older (so it
+/// checks this host is still assigned before stdin, then refreshes), then the service's
 /// command with the caller's argv appended (never a shell), in its `cwd`
 /// with its `env`, and the server-derived `WIRES_*` variables.
 pub(crate) async fn serve_session_permitted<S, R>(
@@ -787,8 +788,8 @@ where
     drop(preauth);
     let version = admitted.state_version;
     if hello.state_version > version {
-        // The caller saw a newer state than ours; we still decide by ours
-        // (its state pull catches this host up).
+        // The caller saw a newer policy than ours; we still decide by ours
+        // (our directory subscription catches this host up).
         tracing::info!(
             caller = %caller.hex(),
             theirs = hello.state_version.0,
@@ -1016,7 +1017,7 @@ impl Denied {
 pub(crate) struct ServiceDialed {
     /// The host that ran the call.
     pub(crate) host: NodeId,
-    /// The remote exit code and any newer state.
+    /// The remote exit code.
     pub(crate) dialed: Dialed,
 }
 
@@ -1362,7 +1363,7 @@ mod tests {
         .unwrap()
     }
 
-    /// The caller's `Hello` (membership under the root, state version 1, and
+    /// The caller's `Hello` (badge under the root, policy version 1, and
     /// an ID token from the shared test IdP: service `t` needs `staff`).
     fn hello() -> Hello {
         Hello {
@@ -1758,7 +1759,7 @@ mod tests {
         refusal_by(&host_running(&["cat"]), encoded(frames), caller).await
     }
 
-    /// A key the state bans, with a badge the root really minted for it (so
+    /// A key the policy bans, with a badge the root really minted for it (so
     /// only the ban keeps it out).
     fn stranger(seed: u8) -> (NodeId, Hello) {
         let id = NodeIdentity::from_seed([seed; 32]).node_id();
@@ -1780,8 +1781,8 @@ mod tests {
     }
 
     /// Whatever keeps a peer out — someone else's badge, a badge from another
-    /// network, or a genuine one the state bans — it hears the one fixed
-    /// sentence: no reason, no state version.
+    /// network, or a genuine one the policy bans — it hears the one fixed
+    /// sentence: no reason, no policy version.
     #[tokio::test]
     async fn a_non_member_hears_only_the_fixed_refusal() {
         let open = [Frame::Hello(hello()), Frame::Invoke(invoke(&[]))];

@@ -66,7 +66,7 @@ impl World {
         }
     }
 
-    /// The signed policy: alice and bob are members; role `analyst` is
+    /// The signed policy: alice and bob hold badges; role `analyst` is
     /// alice's email at her IdP and `ops` bob's at his; each of `services`
     /// is on the host, for `analyst`.
     fn state(&self, services: &[&str]) -> SignedPolicy {
@@ -108,7 +108,7 @@ impl World {
     }
 
     /// The host's keystore, as `wires id` + `wires join` leave it: its node
-    /// key, its membership, and `state`.
+    /// key, its badge, and the policy `state`.
     fn keystore(&self, state: &SignedPolicy) -> std::path::PathBuf {
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);

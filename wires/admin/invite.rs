@@ -4,8 +4,8 @@
 //! **`invite` is not an edit** (card 35). It mints the node's root-signed
 //! badge (its membership), records it in the admin's ledger
 //! ([`super::ledger`]), and bundles it into one [`Invite`] token with the
-//! directory ids and the login settings ([`super::login_client`]): about
-//! 800 bytes, at any fabric size (card 37). A node the policy already names
+//! directory ids and the login settings ([`super::login_client`]):
+//! under 1 KB at any network size (card 37). A node the policy already names
 //! as a host or directory also gets the whole policy (it holds it anyway).
 //! The policy's version doesn't move and nothing is published: every host
 //! admits any badge the root signed. Two cases do edit, and then publish:
@@ -49,7 +49,7 @@ pub(crate) struct InviteArgs {
     /// it (lifting a ban, or re-signing an expired policy). Never shortens
     /// the current policy's expiry.
     #[arg(long, default_value = Ttl::POLICY_DEFAULT, hide = true)]
-    pub(crate) state_ttl: Ttl,
+    pub(crate) policy_ttl: Ttl,
 }
 
 /// `remove` arguments.
@@ -60,7 +60,7 @@ pub(crate) struct RemoveArgs {
     /// Lifetime of the new signed policy, from now (`90d`, `12h`, … or
     /// seconds). Never shortens the current policy's expiry.
     #[arg(long, default_value = Ttl::POLICY_DEFAULT, hide = true)]
-    pub(crate) state_ttl: Ttl,
+    pub(crate) policy_ttl: Ttl,
 }
 
 /// `invite` against the resolved keystore. Publishes only when it edited
@@ -99,7 +99,7 @@ pub(crate) fn invite_in(ks: &Keystore, a: InviteArgs) -> anyhow::Result<Report> 
     let ban = held.policy.bans.get(&invitee).map(|b| b.until);
     let stale = held.check_fresh(now).is_err();
     let state = if ban.is_some() || stale {
-        edit_policy(ks, a.state_ttl, |s| {
+        edit_policy(ks, a.policy_ttl, |s| {
             s.bans.remove(&invitee);
             Ok(())
         })?
@@ -174,7 +174,7 @@ pub(crate) fn remove_in(ks: &Keystore, a: RemoveArgs) -> anyhow::Result<Report> 
     }
     let now = now_unix();
     let until = ledger.ban_until(member, now);
-    let state = edit_policy(ks, a.state_ttl, |s| {
+    let state = edit_policy(ks, a.policy_ttl, |s| {
         s.ban(member, until);
         for svc in s.services.values_mut() {
             svc.hosts.retain(|h| *h != member);
@@ -276,7 +276,7 @@ mod tests {
                 node_id: node.hex(),
                 name: name.map(str::to_string),
                 ttl: Ttl::default(),
-                state_ttl: Ttl::default(),
+                policy_ttl: Ttl::default(),
             },
         )
         .unwrap();
@@ -288,7 +288,7 @@ mod tests {
             ks,
             RemoveArgs {
                 member: who.into(),
-                state_ttl: Ttl::default(),
+                policy_ttl: Ttl::default(),
             },
         )
     }
@@ -425,7 +425,7 @@ mod tests {
                             node_id: node.hex(),
                             name: None,
                             ttl: Ttl::default(),
-                            state_ttl: Ttl::default(),
+                            policy_ttl: Ttl::default(),
                         },
                     )
                 },
@@ -528,7 +528,7 @@ mod tests {
                     node_id: alice.node_id().hex(),
                     name: None,
                     ttl: Ttl::default(),
-                    state_ttl: Ttl::default(),
+                    policy_ttl: Ttl::default(),
                 },
             )
             .unwrap();
@@ -558,7 +558,7 @@ mod tests {
     }
 
     /// Card 28 §8: `invite --ttl` is the badge's lifetime only, capped at
-    /// 30 days; the policy's comes from `--state-ttl`, and never moves
+    /// 30 days; the policy's comes from `--policy-ttl`, and never moves
     /// earlier.
     #[test]
     fn invite_ttl_is_the_badge_and_never_shortens_the_policy() {
@@ -571,7 +571,7 @@ mod tests {
                 node_id: alice.node_id().hex(),
                 name: None,
                 ttl: "1h".parse().unwrap(),
-                state_ttl: Ttl::default(),
+                policy_ttl: Ttl::default(),
             },
         )
         .unwrap();
@@ -585,7 +585,7 @@ mod tests {
                 node_id: alice.node_id().hex(),
                 name: None,
                 ttl: "90d".parse().unwrap(),
-                state_ttl: Ttl::default(),
+                policy_ttl: Ttl::default(),
             },
         );
         assert!(format!("{:#}", long.unwrap_err()).contains("at most"));

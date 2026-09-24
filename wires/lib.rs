@@ -125,8 +125,8 @@ enum Command {
     #[command(after_help = help::DIRECTORY_AFTER)]
     Directory(directory::DirectoryArgs),
     /// Re-publish the signed policy (push), or print or change its settings
-    #[command(after_help = help::STATE_AFTER)]
-    State(admin::propagate::StateArgs),
+    #[command(after_help = help::POLICY_AFTER)]
+    Policy(admin::propagate::PolicyArgs),
 
     // --- host ---
     /// Run host.json's services: check every caller, run the call, log it
@@ -303,9 +303,9 @@ pub fn run() {
                 exit_with(e);
             }
         }
-        Command::State(a) => {
+        Command::Policy(a) => {
             init_quiet_logging();
-            print_report(runtime().block_on(admin::propagate::state_cmd(a)))
+            print_report(runtime().block_on(admin::propagate::policy_cmd(a)))
         }
         Command::Id => print_or_exit(caller::join::id_cmd()),
         Command::Join(a) => {
@@ -451,18 +451,20 @@ mod tests {
         assert!(Cli::try_parse_from(["wires", "invite", &id, "--name", "alice"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "invite"]).is_err());
         assert!(Cli::try_parse_from(["wires", "remove", "alice"]).is_ok());
-        // Card 28: `--ttl` is a membership's lifetime, `--state-ttl` the
+        // Card 28: `--ttl` is a membership's lifetime, `--policy-ttl` the
         // signed policy's.
         assert!(
-            Cli::try_parse_from(["wires", "invite", &id, "--ttl", "1h", "--state-ttl", "30d"])
+            Cli::try_parse_from(["wires", "invite", &id, "--ttl", "1h", "--policy-ttl", "30d"])
                 .is_ok()
         );
-        assert!(Cli::try_parse_from(["wires", "init", "--state-ttl", "7d"]).is_ok());
-        assert!(Cli::try_parse_from(["wires", "remove", "alice", "--state-ttl", "7d"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "init", "--policy-ttl", "7d"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "remove", "alice", "--policy-ttl", "7d"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "remove", "alice", "--ttl", "7d"]).is_err());
-        assert!(Cli::try_parse_from(["wires", "service", "rm", "db", "--state-ttl", "7d"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["wires", "service", "rm", "db", "--policy-ttl", "7d"]).is_ok()
+        );
         assert!(Cli::try_parse_from(["wires", "service", "rm", "db", "--ttl", "7d"]).is_err());
-        assert!(Cli::try_parse_from(["wires", "state", "push"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "policy", "push"]).is_ok());
         assert!(
             Cli::try_parse_from(["wires", "init", "--issuer", "https://i", "--client-id", "c"])
                 .is_ok()

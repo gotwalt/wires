@@ -9,6 +9,13 @@ answer yet. No push code has moved · **Files:** `wires/host/push.rs`,
 
 ## Parked (2026-09-24)
 
+*Since parking (cards 35–37):* a node is in by its badge (there is no member
+list), and a caller holds only its view, not the policy, so it no longer knows
+every host: candidate 1 below would now need a directory to name the hosts, or
+a new view field. `wires inbox` and `inbox --wait` already fetch from and
+accept deliveries only from the hosts of the services in the caller's view
+(card 37), which is D3's receiver rule.
+
 Planning the build against the code turned up three places where D1–D6 and
 the code don't meet. The human parked the card on the third: "this last
 question means we should probably park card 31 until we have a better
@@ -18,10 +25,10 @@ answer."
    recipient may call a service here" needs the recipient's principal. A host
    knows only the *last* principal a node presented, and the gateway presents
    many from one node. Candidate: `wires inbox` (and the gateway) fetch from
-   **every host in the signed state**, so an operator push needs only "a
-   current member" and nothing can strand. That also removes D3's
+   **every host in the signed policy**, so an operator push needs only "an
+   admitted node" and nothing can strand. That also removes D3's
    "service moved hosts" caveat. Cost: more fan-out, and any admin-named host
-   can leave a note in any member's mailbox.
+   can leave a note in any node's mailbox.
 2. **Direct dial vs D1 (D6).** A direct delivery that honors D1 needs the
    receiver to present its ID token back to the host (the gateway: one token
    per live user). Candidate: drop the dial and the caller's inbox receiver.
@@ -34,7 +41,7 @@ answer."
    so a caller can't know which of its services call back. The options on the
    table were "always list it" (every MCP user pays for a tool that may never
    return anything) and "a `callbacks` flag on the registry's Service" (the
-   admin declares it, and the signed-state format changes). Neither is
+   admin declares it, and the signed policy's format changes). Neither is
    convincing. The deeper question is whether "this service calls back" is a
    property of the service (the registry's) or of an implementation (the
    host's), and what a caller should be told before it calls.
@@ -113,7 +120,7 @@ The human (2026-09-24): "Agree, keep operator push."
   - One edge case: a caller removed from the service after the call. Its pending pushes are dropped, logged as `denied`.
   - **Caveat: a service that moves hosts strands the callbacks queued on its old host.** The caller stops fetching from a host that no longer serves anything it may call. Accepted for now. The admin moving a service should let the old host run until its queues drain or expire.
 - `push.allow` in `host.json` becomes a per-service switch (`"push": true` on the services that call back). Who receives is decided by D1: the caller, already admitted to that service.
-- This also covers card 28 §7's receiver rule: accept `deliver` only from hosts of services this node may call, with a fresh state.
+- This also covers card 28 §7's receiver rule: accept `deliver` only from hosts of services this node may call, with a fresh view (built by card 37).
 
 ### D4. The mailbox belongs to the caller: one reader, read once, crash-safe
 
@@ -125,7 +132,7 @@ The human (2026-09-24): "Agree, keep operator push."
 
 - **Order:** FIFO per (host, caller); nothing across hosts. Each message carries its host, service, call and `at_ms`.
 - **Caps:** per caller *per call* at the host (a chatty job can't crowd out other calls' callbacks), oldest dropped. Per-sender caps in the mailbox; evict by local receive time. These are card 28 §7's fixes, moved here.
-- **Loss is visible:** `deliver` carries `dropped: n` since the last ack, and the reader prints it. When the state advances, a removed member's queue is purged (card 28 §7).
+- **Loss is visible:** `deliver` carries `dropped: n` since the last ack, and the reader prints it. When the policy advances, a banned node's queue is purged (built, card 35).
 
 ### D6. Listening vs not listening stays as it is
 
@@ -152,10 +159,10 @@ One tool, the same everywhere: **`inbox`**, `{ wait_seconds?: 0–25, limit?: 1�
   - "Queue entries carry the admitted principal and are delivered only to a presenter whose token verifies to it" → D1 (the caller is node + principal).
   - (§4's "mine by principal" for `watch` stays in card 28.)
 - **§7, all of it:**
-  - receiver accepts `deliver` only from hosts of services it may call, plus a fresh state → D3;
+  - receiver accepts `deliver` only from hosts of services it may call, plus a fresh view → D3;
   - `--to` limited to allowed roles, with counts not names → **moot**: D1 removes role addressing, and D1b keeps only `--to <node-id>`;
   - per-sender mailbox caps, evict by receive time, dedup by `(from, id)`, host cap per originating service → D5 (the host cap becomes per call);
-  - purge a removed member's queue when the state advances → D5.
+  - purge a banned node's queue when the policy advances → D5.
 - **Kept from card 28 as built:** the per-call push capability (L2a), the only way a *service* pushes, addressed by D1 to the call's node + principal. The operator socket's `push` form stays, narrowed to `--to <node-id>` (D1b).
 
 ## Acceptance
@@ -169,7 +176,7 @@ One tool, the same everywhere: **`inbox`**, `{ wait_seconds?: 0–25, limit?: 1�
   - an operator push to the gateway's node reaches the gateway's own `wires inbox`, and no web user;
   - a crash between print and mark re-shows the message rather than losing it;
   - `dropped: n` surfaces;
-  - a removed member's queue is purged on state advance.
+  - a banned node's queue is purged when the policy advances.
 - [ ] `inbox` MCP tool in `wires mcp` and `wires gateway`; e2e for both (gateway: two users, long poll).
 - [ ] protocol.md §7 rewritten to D1–D6. README's "both directions" bullet reworded to callbacks: the host answers the agent that asked, even after the call has ended.
 - [ ] `make demo` (push demo) green, using the call capability only.

@@ -2,9 +2,9 @@
 //!
 //! A host is `wires serve host.json`: `host.json` (version 2) says how each
 //! service runs here; the admin-signed policy says who may call it. Every
-//! call is decided by the state as it stands at that connection — membership,
-//! the registry's role for the service, then any stricter local rule — and
-//! logged by the host itself in its own signed call log.
+//! call is decided by the policy as it stands at that connection — the
+//! badge and bans, the registry's role for the service, then any stricter
+//! local rule — and logged by the host itself in its own signed call log.
 //!
 //! - [`serve`] — `wires serve host.json` / `--check`: preflight, bind, serve.
 //! - [`config`] — `host.json` (services it implements, local trust,
@@ -28,7 +28,7 @@
 //! - [`call_log`] — the host's own signed, hash-linked log of those records,
 //!   on disk with retention (card 26a).
 //! - [`record_stream`] — that log served, by key, to the readers the signed
-//!   state names (`wires watch`, card 26b).
+//!   policy names (`wires watch`, card 26b).
 //! - [`otlp`] — optional OTLP/HTTP export of that log (`audit.otlp`).
 //! - [`push`] — `wires push`: messages to callers by key, queued, delivered
 //!   or fetched, gated by the signed policy and `push.allow` (card 23).

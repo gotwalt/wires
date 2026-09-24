@@ -10,7 +10,7 @@ Options:
       --allow <ALLOW>              A role allowed to call it (one defined with `wires role set`). Repeatable
       --host <HOST>                A node that implements it: an `invite --name` label or a node id. Repeatable (failover)
       --reader <READER>            A role that may read its call records. Repeatable
-      --state-ttl <TTL>            Lifetime of the new policy, from now (`90d`, `12h`, … or seconds); never shortens the current one [default: 90d]
+      --policy-ttl <TTL>           Lifetime of the new policy, from now (`90d`, `12h`, … or seconds); never shortens the current one [default: 90d]
   -h, --help                       Print help
       --help-all                   Also list the operator and credential flags
 

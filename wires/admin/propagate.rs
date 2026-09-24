@@ -1,4 +1,4 @@
-//! Getting an admin edit to the directories, and `wires state push`.
+//! Getting an admin edit to the directories, and `wires policy push`.
 //!
 //! Every admin edit (`remove`, `service`, `role`, `issuer`, `directory add |
 //! rm`, and the rare `invite` that edits) is signed and stored here first,
@@ -7,11 +7,11 @@
 //! dials no host: hosts and callers fetch from a directory. If the policy
 //! names directories and **none** took it, the command fails: the policy is
 //! in force nowhere but here. The new one stays stored here, and `wires
-//! state push` re-publishes it once a directory is up.
+//! policy push` re-publishes it once a directory is up.
 //!
 //! ```text
-//! wires state push                          # re-publish the stored policy to every directory
-//! wires state settings --freshness strict    # the signed freshness rule (card 36c)
+//! wires policy push                          # re-publish the stored policy to every directory
+//! wires policy settings --freshness strict    # the signed freshness rule (card 36c)
 //! ```
 
 use std::collections::BTreeSet;
@@ -24,25 +24,25 @@ use super::keystore::Keystore;
 use super::{Report, run_edit};
 use crate::policy::fetch;
 
-/// `state` arguments.
+/// `policy` arguments.
 #[derive(Args)]
-pub(crate) struct StateArgs {
+pub(crate) struct PolicyArgs {
     #[command(subcommand)]
-    pub(crate) cmd: StateCmd,
+    pub(crate) cmd: PolicyCmd,
 }
 
-/// The `state` subcommands.
+/// The `policy` subcommands.
 #[derive(Subcommand)]
-pub(crate) enum StateCmd {
+pub(crate) enum PolicyCmd {
     /// Re-publish the stored signed policy to every directory
     // After an edit that reached none, or a directory that was down.
-    #[command(after_help = "Example:\n  wires state push")]
+    #[command(after_help = "Example:\n  wires policy push")]
     Push,
     /// Print the network's settings, or change them and publish
     // The freshness rule (`--freshness lenient|strict`) and how often
     // directories vouch for the policy.
     #[command(
-        after_help = "Examples:\n  wires state settings\n  wires state settings --freshness strict --beat-secs 60"
+        after_help = "Examples:\n  wires policy settings\n  wires policy settings --freshness strict --beat-secs 60"
     )]
     Settings(super::settings::SettingsArgs),
 }
@@ -71,7 +71,7 @@ impl Propagation {
                     format!(
                         "policy version {} is signed and stored here, but reached none of its \
                          {} directory(ies), so no host or caller can fetch it yet; run `wires \
-                         state push` once a directory is up",
+                         policy push` once a directory is up",
                         version.0,
                         report.missed.len()
                     )
@@ -80,7 +80,7 @@ impl Propagation {
             Err(e) => Propagation {
                 note: format!("the new policy is stored here but was not published: {e:#}"),
                 failure: Some(
-                    "no directory has the new policy yet; run `wires state push` to re-publish it"
+                    "no directory has the new policy yet; run `wires policy push` to re-publish it"
                         .into(),
                 ),
             },
@@ -102,15 +102,15 @@ pub(crate) fn fold(mut report: Report, pushed: Propagation) -> Report {
     report
 }
 
-/// `wires state push` (re-publish the stored policy to every directory) and
-/// `wires state settings`.
-pub(crate) async fn state_cmd(a: StateArgs) -> Result<Report> {
+/// `wires policy push` (re-publish the stored policy to every directory) and
+/// `wires policy settings`.
+pub(crate) async fn policy_cmd(a: PolicyArgs) -> Result<Report> {
     match a.cmd {
-        StateCmd::Settings(s) if !s.is_edit() => Ok(Report {
+        PolicyCmd::Settings(s) if !s.is_edit() => Ok(Report {
             stdout: super::settings::settings_in(&Keystore::resolve()?, &s)?,
             ..Report::default()
         }),
-        StateCmd::Settings(s) => {
+        PolicyCmd::Settings(s) => {
             run_edit(|ks| {
                 Ok(Report {
                     stdout: super::settings::settings_in(ks, &s)?,
@@ -119,10 +119,10 @@ pub(crate) async fn state_cmd(a: StateArgs) -> Result<Report> {
             })
             .await
         }
-        StateCmd::Push => {
+        PolicyCmd::Push => {
             run_edit(|ks| {
                 if ks.read_root_identity()?.is_none() {
-                    anyhow::bail!("no root key here: `wires state push` runs on the admin");
+                    anyhow::bail!("no root key here: `wires policy push` runs on the admin");
                 }
                 Ok(Report::default())
             })
@@ -149,7 +149,7 @@ mod tests {
         )));
         let failure = missed.failure.expect("fails");
         assert!(failure.contains("stored here"), "{failure}");
-        assert!(failure.contains("wires state push"), "{failure}");
+        assert!(failure.contains("wires policy push"), "{failure}");
         // No directories at all: nothing to reach, nothing failed.
         let none = Propagation::from_publish(Ok((StateVersion(7), PublishReport::default())));
         assert_eq!(none.failure, None);

@@ -11,8 +11,8 @@ names as readers observe calls, in full, for logging and compliance. If the code
 this document, the code is the bug, unless this document breaks the premise, in which case both
 are fixed. What the premise needs and the code doesn't do yet is listed in §10.
 
-The target architecture (how the fabric is hosted, persisted and kept in sync, once hosts follow
-the policy by subscription and callers hold views) is [fabric.md](fabric.md). Usage, roles and the demo are in [usage.md](usage.md), [the board](board/README.md) and
+The architecture around it (who runs what, what each node keeps, and how each kind of metadata
+moves) is [fabric.md](fabric.md). Usage, roles and the demo are in [usage.md](usage.md), [the board](board/README.md) and
 [demo.md](demo.md). Deployment and testing are in [deployment.md](deployment.md) and
 [testing.md](testing.md).
 
@@ -117,10 +117,10 @@ SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kin
 - **Settings.** One item: `freshness` (`lenient`, the default, or `strict`: what a host does when
   no directory has vouched for its policy recently, §4 *Freshness at the host*), `beat_secs`
   (default 300: how often a directory signs a `Fresh` and beats its subscriptions) and `fresh_secs`
-  (default 900: how long a `Fresh` is good for). The admin sets them with `wires state settings`.
+  (default 900: how long a `Fresh` is good for). The admin sets them with `wires policy settings`.
 - **Versioning.** Every admin edit (`init`, `remove`, `service`, `role`, `issuer`, `directory
   add|rm`, and the rare `invite` below) is the stored policy changed, expired bans dropped,
-  `version + 1`, `issued = now`, `not_after = max(now + --state-ttl, the stored policy's
+  `version + 1`, `issued = now`, `not_after = max(now + --policy-ttl, the stored policy's
   not_after)` (default `90d`: an edit never shortens the policy's life; a directory's `Fresh`, not
   the head's expiry, is what says a copy is current), re-signed. `--ttl` on `init` and `invite` is
   the minted **badge's** lifetime only.
@@ -180,10 +180,10 @@ The admin commands and their flags are in [usage.md § Commands by role](usage.m
   `directories`, and from the ledger. Removing a node already banned is refused.
 - **`role`** and **`service`** edit the roles and the registry; a `--host` must be a node in the
   ledger, and not banned.
-- **`state settings [--freshness lenient|strict] [--beat-secs N] [--fresh-secs N]`** edits the
+- **`policy settings [--freshness lenient|strict] [--beat-secs N] [--fresh-secs N]`** edits the
   settings item; with no flag it prints the settings and edits nothing.
 
-Every edit takes `--state-ttl` and ends with the publish in §4. `wires state push` changes nothing:
+Every edit takes `--policy-ttl` and ends with the publish in §4. `wires policy push` changes nothing:
 it re-publishes the stored policy to every directory.
 
 `Invite { format: 4, membership, directories: [NodeId], login?: LoginSettings { issuer,
@@ -318,13 +318,13 @@ its head verifies under the root, its `Fresh` vouches for that head, and it is n
 accepted as above. So a directory that missed a publish catches up from another. There is no
 consensus: one author, and "newer" is a version number.
 
-**Publish (admin).** After every admin edit, and on `wires state push`, the admin dials,
+**Publish (admin).** After every admin edit, and on `wires policy push`, the admin dials,
 concurrently, every directory the new head lists plus every directory the head before the edit
 listed (so a directory the edit drops learns it), never itself, and sends `publish`. It dials no
 host. A directory counts as delivered when it answers `published` with at least the offered
 version. Stderr says `policy version N: published to K of D directory(ies)`, naming any not
 reached. **When D > 0 and K = 0 the command exits 1** (after printing its result, e.g. the invite
-token): the new policy is stored on the admin and nowhere else. `wires state push` re-publishes
+token): the new policy is stored on the admin and nowhere else. `wires policy push` re-publishes
 it. With no directory at all, the line says so and nothing fails; a new node gets the policy in its
 invite token.
 
@@ -443,7 +443,8 @@ failure below is sent as `Denied` (`wires/host/gate.rs`):
    there is none, is kept for the next steps. A token that fails is `your ID token could not be
    verified` or `the identity provider is unreachable from this host`; the detail is only in the
    host's trace.
-4. **The gate** (`admit`): the policy is fresh → the service is registered → it is assigned to
+4. **The gate** (`admit`): under `strict`, a current `Fresh` vouches for the held head (§4
+   *Freshness at the host*) → the head hasn't expired → the service is registered → it is assigned to
    **this** host → `authorize` (the registry's `allow`) → every role in `host.json`'s `also_require`
    for it admits the caller too (it can only narrow; the refusal doesn't name those host-local roles).
    A refusal that a verified identity could change leads with why there is none (`no ID token
@@ -514,7 +515,7 @@ Node's event loop. In both, a handler that raises ends the call with exit 1 and 
 
 **The caller** (`wires call`, `wires mcp`, the gateway) dials from its view (§4 *Views*), and
 refuses to dial from an expired one (it refreshes first; failing that, exit 1: ask the admin for
-`wires state push` or a fresh invite). It takes the service's hosts from the service's root-signed
+`wires policy push` or a fresh invite). It takes the service's hosts from the service's root-signed
 entry, the last host that answered (`last-good.json`) first, then the admin's order. A name the
 view doesn't hold is asked of a directory (`resolve`); a name no directory resolves for this
 caller ends the call before any dial (exit 1, with `run wires login` when it isn't signed in). It
@@ -683,8 +684,8 @@ call's `started` was pruned, is shown only to its recipient.
 
 What hidden links reveal: a reader in no `readers` role still learns how many entries each host it
 reads logged, and under `follow`, when each was written (a run arrives as the entries are appended).
-Not what, by whom, or for which service. (Card 29 replaces this with checkpoints and inclusion proofs,
-and drops hidden links for non-readers.)
+Not what, by whom, or for which service. ([Card 09](board/backlog/09-witness.md) would replace this with
+checkpoints and inclusion proofs, and drop hidden links for non-readers.)
 
 `wires watch` asks the hosts of the services in its view (card 37: those it may read in full, and those it may call, for its own records; with no service named, all of them) and merges their backlogs by time. It keeps, in `record-marks.json`, **one chain anchor
 per host** (the furthest entry it verified there, under any view) and a **resume point per view** (the
@@ -708,7 +709,7 @@ Nothing is broadcast: a record's content leaves a host only when a reader asks f
 | `issued.json` | 0600 | admin | the ledger of badges it minted: node → label (for `remove` and `service --host`), latest `not_after` (how long a ban must last); never sent |
 | `membership.json` | 0644 | every node | its badge (membership token) |
 | `policy.json` (+ `.lock`) | 0600 | admin, host, directory | the newest verified signed policy (§3); **a caller holds none** |
-| `policy-checked.txt` | 0600 | host | when a directory last vouched for the copy (§4) |
+| `policy-checked.txt` | 0600 | host, directory | when a directory last vouched for the copy (§4), or the invite brought it; written, not read |
 | `view.json` | 0600 | caller (any node that calls) | its view: the head, the root-signed entries it may call or read, the newest `Fresh`, when a directory last vouched, the newest head a host reported (§4 *Views*) |
 | `directories.json` | 0600 | every joined node | the invite's directory ids: where to ask before a head names them |
 | `login.json` | 0600 | every joined node | the invite's login settings: issuer, client id, public client secret (`wires login`'s defaults) |

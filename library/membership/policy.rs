@@ -75,15 +75,15 @@ pub fn check_inclusion(
 /// let root = NodeIdentity::from_seed([1u8; 32]);
 /// let alice = NodeIdentity::from_seed([2u8; 32]).node_id();
 /// let badge = Membership::mint(&root, alice, 0, 100).unwrap();
-/// let mut state = Policy::new(root.node_id());
+/// let mut policy = Policy::new(root.node_id());
 ///
 /// // Any badge the root signed admits: the policy needn't list anyone.
-/// assert!(check_admitted(&badge, root.node_id(), &state, alice, 0).is_ok());
+/// assert!(check_admitted(&badge, root.node_id(), &policy, alice, 0).is_ok());
 ///
 /// // Removed: banned until the badge would have expired.
-/// state.ban(alice, badge.not_after);
+/// policy.ban(alice, badge.not_after);
 /// assert!(matches!(
-///     check_admitted(&badge, root.node_id(), &state, alice, 0),
+///     check_admitted(&badge, root.node_id(), &policy, alice, 0),
 ///     Err(Error::Banned { until: 100 })
 /// ));
 /// ```
@@ -147,18 +147,18 @@ mod tests {
             let root = NodeIdentity::from_seed([1u8; 32]);
             let member = NodeIdentity::from_seed(ms).node_id();
             let m = Membership::mint(&root, member, 0, not_after).unwrap();
-            let mut state = Policy::new(root.node_id());
+            let mut policy = Policy::new(root.node_id());
             for o in &others {
                 let other = NodeIdentity::from_seed(*o).node_id();
                 if other != member {
-                    state.ban(other, 7);
+                    policy.ban(other, 7);
                 }
             }
             if banned {
-                state.ban(member, not_after);
+                policy.ban(member, not_after);
             }
             let included = check_inclusion(&m, root.node_id(), member, now).is_ok();
-            let admitted = check_admitted(&m, root.node_id(), &state, member, now);
+            let admitted = check_admitted(&m, root.node_id(), &policy, member, now);
             prop_assert_eq!(admitted.is_ok(), included && !banned);
             if included && banned {
                 prop_assert!(matches!(admitted, Err(Error::Banned { .. })), "{:?}", admitted);

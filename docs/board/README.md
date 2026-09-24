@@ -12,7 +12,7 @@ for logging and compliance.
 of the host's keystore, card 28, though it still runs as the host's user until
 [card 32](backlog/32-service-sandbox-OPEN.md)); offline-verifiable membership
 (no auth-server round-trip; removal is a root-signed ban that takes effect at
-each host's next dial, decided 2026-09-24, built by card 35); **the premise
+each host's next dial, card 35); **the premise
 outranks the docs, and the docs outrank the code** (README and docs first,
 code second: a disagreement is a code bug unless the doc breaks the
 premise). **Kill criteria:** if no one wants
@@ -48,20 +48,20 @@ honest line from someone who runs remote MCP servers behind Tailscale today.
 
 | Role | Decides | Commands |
 |---|---|---|
-| **admin** | who's in, the trusted IdPs, the roles, which services run where, who may call and read each, which nodes are directories (root key; one signed policy) | `init`, `invite`, `remove`, `issuer`, `role`, `service`, `directory add\|rm`, `state push`, `state settings` |
+| **admin** | who's in, the trusted IdPs, the roles, which services run where, who may call and read each, which nodes are directories (root key; one signed policy) | `init`, `invite`, `remove`, `issuer`, `role`, `service`, `directory add\|rm`, `policy push`, `policy settings` |
 | **host** | how it implements its assigned services; stricter local rules (`host.json`: narrower IdPs, `also_require`) | `serve host.json`, `push` |
 | **caller** | — runs services by name; MCP (stdio, or the remote gateway) so wires works in the clients people already use | `id`, `join`, `login`, `services`, `call`, `mcp`, `gateway`, `inbox` |
 | **reader** | — any member: a service's `readers` role reads all its records, in full; everyone else their own person's (same issuer and subject, from any node) | `watch` |
-| **directory** (card 36) | nothing: it holds the newest root-signed policy, signs its freshness, and hands the policy to hosts (whole once, then deltas by subscription) and callers (their view, card 37: the services each may use, cut for its verified ID token); it never decides a call | `serve` (when the policy lists it), `directory serve`; the admin names directories with `directory add\|rm` |
+| **directory** (card 36) | nothing: it holds the newest root-signed policy, signs its freshness, and hands the policy to hosts (whole once, then deltas by subscription) and callers (their view: the services each may use, cut for its verified ID token); it never decides a call | `serve` (when the policy lists it), `directory serve`; the admin names directories with `directory add\|rm` |
 
-The IdP is *bound* at the caller (`login`) and *verified* at the host, against the admin-signed policy it holds. Every role needs a verified identity (there is no built-in `member` role), and every matcher names an issuer the policy trusts. The admin's invite is the only thing handed out of band (a caller's is its badge, directory ids and the IdP to sign in with, under 1 KB); every later policy is published by key to the directories, hosts follow it from one, and each caller holds only its view (card 37), refreshed when a call's handshake shows a newer head or followed by subscription (`wires mcp`, the gateway). Nothing is broadcast; hosts and directories hold the whole policy ([fabric.md](../fabric.md) is the target architecture: how the fabric is hosted, persisted and kept in sync).
+The IdP is *bound* at the caller (`login`) and *verified* at the host, against the admin-signed policy it holds. Every role needs a verified identity (there is no built-in `member` role), and every matcher names an issuer the policy trusts. The admin's invite is the only thing handed out of band (a caller's is its badge, directory ids and the IdP to sign in with, under 1 KB); every later policy is published by key to the directories, hosts follow it from one, and each caller holds only its view, refreshed when a call's handshake shows a newer head or followed by subscription (`wires mcp`, the gateway, `inbox --wait`). Nothing is broadcast; hosts and directories hold the whole policy ([fabric.md](../fabric.md): how the network is hosted, persisted and kept in sync).
 
 ## The demo we're building toward
 
 1. **workbench** (no inbound ports): `wires serve host.json`, implementing `orders-db`, which the admin registered for role `analyst` (`wires service add orders-db --allow analyst --reader security --host workbench`).
 2. **laptop**: Claude Code calling `wires call orders-db -- "…"` from Bash (and/or `wires mcp` in its MCP config).
 3. **reader** (third terminal/machine, role `security`): `wires watch orders-db` — each call appears as `▶ … alice@corp (…) [analyst] orders-db "select …"`, then `■ … exit 0 · 41 ms · 3.1 KiB out`.
-4. **Revoke**: one `wires remove agent` → the new policy is published to the directory the workbench also runs, and the workbench refuses the agent's next call (exit 77, `not a member of this network`); the host traces that rather than logging it, since a banned key can't write to the log.
+4. **Revoke**: one `wires remove agent` → the new policy is published to the directory the workbench also runs, and the workbench refuses the agent's next call (exit 77, `denied by host: not a member of this network`); the host traces that rather than logging it, since a banned key can't write to the log.
 
 ## Lanes
 
@@ -70,28 +70,15 @@ Open cards only; finished cards are in [done/](done/).
 | Card | Lane | Depends on | Status | Summary |
 |---|---|---|---|---|
 | [08](doing/08-demo-two-machine.md) | E | — | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent, recording |
-| [35](done/35-badges-and-bans.md) | D1 | 28 | done (on `aaron/directory`) | **Badges and bans:** members leave the signed state; a node is admitted by its root-signed badge, removal is a ban, `invite` is no edit |
-| [36](done/36-directory.md) | D2 | 35 | done (on `aaron/directory`) | **The directory:** a mode on its own ALPNs, backed by redb; the root signs the policy, and each service entry; freshness timestamps; hosts subscribe to the policy's changes; retires state sync |
-| [36d](done/36d-no-merkle-policy.md) | D2 | 36b | done (on `aaron/directory`) | **No Merkle tree:** the root signs the policy (a hash of every item), and each service entry; hosts hold the whole policy and follow it by deltas |
-| [37](done/37-caller-views.md) | D3 | 36 | done (on `aaron/directory`) | **Caller views:** each caller holds only the services it may use; search; `HelloAck` carries the head version; `mcp`/gateway subscribe; invites under 1 KB carry the login settings |
-| [38](done/38-llm-help-text.md) | H | 37 | done (on `aaron/directory`) | **Help text for LLMs:** the premise (a network for authenticated remote CLI calls) told once, in help and MCP instructions; terse, predictable `--help`, examples, next-step errors, `--help-all` for operator flags, snapshot tests, a small eval |
 | [29](backlog/29-person-identity.md) | I2 | 36 | backlog | **Person identity for headless agents:** `login --for`, day-passes issued by a directory |
 | [31](backlog/31-inbox-delivery.md) | P3 | 28, 30 | designed, parked | **Inbox delivery:** callbacks go to the caller that asked, through the call's push capability only; open questions on the card |
 | [32](backlog/32-service-sandbox-OPEN.md) | — | — | open question | **Don't build:** run each service call in a rootless microVM so a service can't reach the host's keys |
 | [18](backlog/18-front-door-OPEN.md) | — | — | open question | **Don't build:** front door, `wires join <domain>` (now pointing at the directory) |
 | [09](backlog/09-witness.md) | R | 36 | backlog | **Transparency-log records:** Merkle call logs with checkpoints the directory witnesses; no hidden links for non-readers |
 
-**Order:** 08 (recording; re-record the README demo) → 35 → 36 → 37 (the directory; the
-why is [`bench/state-scale/REPORT.md`](../../bench/state-scale/REPORT.md)) → 29 → 09. 31 and
-32 are not scheduled.
-
-**Build plan for 35–37 (2026-09-24):** workers branch from `aaron/directory`; the integrator
-merges each into it, and the whole update lands on `main` as one PR. Stages: **35 ∥ 36a**
-(36a = card 36's pure `library` types: head, items, `Fresh`, directory frames) →
-**36b** (the mode, redb, publish, retiring state sync) → **36d** (no Merkle tree: a signed hash of
-the items and signed service entries) → **36c** ∥ **37** →
-**[38](done/38-llm-help-text.md)** (help text an LLM can act on) → a docs and comments sweep
-across the repo.
+**Order:** 08 (recording; re-record the README demo) → 29 → 09. 31 and 32 are not scheduled.
+The directory update (cards 35–38: badges and bans, the directory, caller views, help text for
+LLMs; the why is [`bench/state-scale/REPORT.md`](../../bench/state-scale/REPORT.md)) is done.
 
 ## Rules for workers
 

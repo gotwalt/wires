@@ -10,7 +10,7 @@
 //! - [`services_host`] — card 27's acceptance: a host decides
 //!   every call by the admin-signed policy (the registry's roles,
 //!   `also_require`, removal with no restart, refusing unassigned services,
-//!   push by the state).
+//!   push by the policy).
 //! - [`records`] — card 26b: call records streamed from the host's own log
 //!   to authorized readers (`wires watch`).
 //! - [`service_child`] — card 28 §1: a service child gets a minimal
@@ -110,7 +110,7 @@ fn email_at(idp: &MockIdp, email: &str) -> Matcher {
     }
 }
 
-/// The state `root` signs at `version` (issued now, never expiring), after
+/// The policy `root` signs at `version` (issued now, never expiring), after
 /// `edit` fills it in.
 fn signed_state(root: &NodeIdentity, version: u64, edit: impl FnOnce(&mut Policy)) -> SignedPolicy {
     let mut s = Policy::new(root.node_id());
@@ -121,12 +121,12 @@ fn signed_state(root: &NodeIdentity, version: u64, edit: impl FnOnce(&mut Policy
     crate::testutil::signed_policy(root, s)
 }
 
-/// `who`'s membership under `root`, never expiring.
+/// `who`'s badge under `root`, never expiring.
 fn membership(root: &NodeIdentity, who: &NodeIdentity) -> Membership {
     Membership::mint(root, who.node_id(), 0, i64::MAX).unwrap()
 }
 
-/// `who`'s `Hello` under `root`: the state version it holds, and a fresh ID
+/// `who`'s `Hello` under `root`: the policy version it holds, and a fresh ID
 /// token from `idp` when it is signed in there.
 fn hello(root: &NodeIdentity, who: &NodeIdentity, version: u64, idp: Option<&MockIdp>) -> Hello {
     Hello {

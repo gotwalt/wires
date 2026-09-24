@@ -5,7 +5,7 @@
 //! the typed copy in memory), signs a [`Fresh`] for its head
 //! ([`Directory::beat`]), takes a newer policy from anyone admitted
 //! ([`Directory::accept`]: verified under the root, fresh, strictly newer,
-//! items hashing to the head's root) and answers `wires/directory/1`
+//! items matching the head's `items_hash`) and answers `wires/directory/1`
 //! requests ([`Directory::answer`]). **It never decides a call.**
 //!
 //! A caller asks for its **view** (card 37): the services its verified IdP

@@ -2,7 +2,7 @@
 //! remote MCP server, for clients that can only reach one over HTTPS
 //! (Claude.ai's custom connectors, the MCP Inspector).
 //!
-//! It is a caller that acts for web users. The gateway is one member node;
+//! It is a caller that acts for web users. The gateway is one admitted node;
 //! each web user signs in with Google *through* it, and the gateway asks
 //! Google for an ID token whose `nonce` is bound to the gateway's node key
 //! (the same binding `wires login` makes for a caller's own node). Every call

@@ -5,7 +5,7 @@
 //! directory ids (where the node asks for the policy's head and, after
 //! `wires login`, its view) and the fabric's [`LoginSettings`] (which IdP and
 //! OAuth client `wires login` signs in with, so a joiner types no flags).
-//! That is all a caller gets: about 800 bytes, at any fabric size (card 37).
+//! That is all a caller gets: under 1 KB, at any fabric size (card 37).
 //! It holds no role, no ban and no service.
 //!
 //! A node the policy already names as a host or a directory also gets the
