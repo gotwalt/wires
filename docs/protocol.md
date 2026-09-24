@@ -333,7 +333,10 @@ more is refused with `denied`.
   view it sent last, and a `fresh` beat in between. A subscriber that can't apply an update
   subscribes again and takes the whole view. The stream ends with `denied` when a head no longer
   admits the subscriber (badge and bans, as above) or stops listing this node. `wires mcp`, each
-  live gateway session and `wires inbox --wait` hold one.
+  live gateway session and `wires inbox --wait` hold one (`wires/caller/view.rs`): the first
+  frame within 10 s, then each within the held `Fresh`'s lifetime plus that again (at most 10 s)
+  of slack, or the stream is taken for dead; a `denied`, at once or ending the stream, moves it to
+  the next directory at once, and a round no directory served pauses from 1 s up to 30 s.
 
 **Replicas.** Each directory subscribes to every other directory its head lists, as `replica`,
 reconnecting after a failure with a pause growing from 1 s to 30 s. A `policy` frame is taken when
@@ -375,9 +378,11 @@ reconnect, so a directory the admin adds is followed without a restart. It takes
 
 Any frame it can't take (an update that doesn't apply, a policy that doesn't verify) makes it
 subscribe again at once with `have: 0` and take the whole policy; a second failure in a row moves
-it to the next directory. When the stream ends (the directory stopped, was unlisted, or sent
-nothing for two beats plus 10 s) it reconnects, pausing from 1 s up to the beat (at most 30 s)
-while none answers. The subscription never holds up serving: a host restarted with `policy.json`
+it to the next directory, where the next round starts too. So does a `denied`, at once or ending
+the stream (not admitted, no longer a host, the directory no longer one, or busy): the next
+directory is tried at once. When the stream ends (the directory stopped, or sent nothing for two
+beats plus 10 s) it reconnects, pausing from 1 s up to the beat (at most 30 s) while none answers,
+so a host every directory refuses asks each at most once per pause. The subscription never holds up serving: a host restarted with `policy.json`
 decides from it before any directory answers. A host that is itself a directory keeps the `Fresh`
 its own directory signs (its replica loop keeps its copy in step with the others). A host that the
 policy newly lists as a directory runs the directory mode only after a restart (it traces so).

@@ -512,7 +512,12 @@ pub(crate) struct Follow {
 /// goes (with a growing pause, at most [`MAX_BACKOFF`]). Every change (a new
 /// view, an update applied with [`View::apply`], a new `Fresh`) is sent on
 /// the returned channel; an update that doesn't apply ends that
-/// subscription, and the next asks for the whole view again.
+/// subscription, and the next asks for the whole view again. A stream
+/// silent past [`silence`] is taken for dead. A directory that answers
+/// `denied` (this node is not admitted, or the directory is no longer one,
+/// or busy), at once or ending the stream, is passed over for the next one
+/// at once; a round that no directory served waits the growing pause, so
+/// no directory is asked again in a tight loop.
 pub(crate) fn follow(f: Follow) -> (ViewWatch, tokio::task::JoinHandle<()>) {
     let (tx, rx) = tokio::sync::watch::channel(f.initial.clone().map(Arc::new));
     let task = tokio::spawn(async move {
@@ -531,7 +536,11 @@ pub(crate) fn follow(f: Follow) -> (ViewWatch, tokio::task::JoinHandle<()>) {
                 .collect();
             for dir in dirs {
                 match follow_once(&f, dir, root, &mut held, &tx).await {
-                    Ok(()) => backoff = Duration::from_secs(1),
+                    Ok(Ended::Closed) => backoff = Duration::from_secs(1),
+                    Ok(Ended::Denied(reason)) => tracing::info!(
+                        directory = %dir.hex(),
+                        "view subscription refused: {reason}; trying the next directory"
+                    ),
                     Err(e) => tracing::debug!(directory = %dir.hex(), "view subscription: {e:#}"),
                 }
                 if tx.is_closed() {
@@ -545,15 +554,44 @@ pub(crate) fn follow(f: Follow) -> (ViewWatch, tokio::task::JoinHandle<()>) {
     (rx, task)
 }
 
+/// How one view subscription ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    /// After at least one frame, the stream closed, broke, or went silent
+    /// past [`silence`] (or nobody listens to the view any more).
+    Closed,
+    /// The directory answered `denied`, at once or ending the stream.
+    Denied(String),
+}
+
+/// How long a view subscription may stay silent once it has answered: the
+/// held `Fresh`'s lifetime (a live directory beats well within it, since
+/// `fresh_secs >= beat_secs`) plus that again, at most 10 s, of slack; with
+/// none held, two default beats and 10 s. (A caller's view carries no
+/// settings, so the `Fresh` is what says how often to expect one.)
+fn silence(held: Option<&HeldView>) -> Duration {
+    match held.and_then(|h| h.fresh.as_ref()) {
+        Some(f) => {
+            let span = u64::try_from(f.until.saturating_sub(f.at))
+                .unwrap_or(0)
+                .max(1);
+            Duration::from_secs(span + span.min(10))
+        }
+        None => Duration::from_secs(2 * u64::from(library::DEFAULT_BEAT_SECS) + 10),
+    }
+}
+
 /// One subscription to `dir`, until it ends: apply every frame to `held`
-/// and announce the result.
+/// and announce the result. The first frame must come within
+/// [`wire::FRAME_TIMEOUT`], each later one within [`silence`]. `Err`: it
+/// never answered, or sent a frame that can't be taken.
 async fn follow_once(
     f: &Follow,
     dir: NodeId,
     root: NodeId,
     held: &mut Option<HeldView>,
     tx: &tokio::sync::watch::Sender<Option<Arc<HeldView>>>,
-) -> Result<()> {
+) -> Result<Ended> {
     let addr = transport::endpoint_addr(&dir, &[], None)?;
     let conn = tokio::time::timeout(
         wire::DIAL_TIMEOUT,
@@ -574,7 +612,31 @@ async fn follow_once(
     wire::write(&mut send, &hello.encode()?).await?;
     wire::write(&mut send, &subscribe.encode()?).await?;
     let result = async {
-        while let Some(frame) = wire::read_sub_frame(&mut recv).await? {
+        let mut answered = false;
+        loop {
+            let wait = if answered {
+                silence(held.as_ref())
+            } else {
+                wire::FRAME_TIMEOUT
+            };
+            let frame = match tokio::time::timeout(wait, wire::read_sub_frame(&mut recv)).await {
+                Ok(Ok(Some(frame))) => frame,
+                Ok(Ok(None)) if !answered => bail!("the directory closed without answering"),
+                Ok(Err(e)) if !answered => return Err(e),
+                Err(_) if !answered => bail!("no answer within {wait:?}"),
+                Ok(Ok(None)) => return Ok(Ended::Closed),
+                Ok(Err(e)) => {
+                    tracing::debug!(directory = %dir.hex(), "view subscription broke: {e:#}");
+                    return Ok(Ended::Closed);
+                }
+                Err(_) => {
+                    tracing::info!(
+                        directory = %dir.hex(),
+                        "view subscription silent for {wait:?}; following again"
+                    );
+                    return Ok(Ended::Closed);
+                }
+            };
             let now = now_unix();
             let next = match frame {
                 SubFrame::View { view, fresh } => {
@@ -611,9 +673,10 @@ async fn follow_once(
                         ..base.clone()
                     }
                 }
-                SubFrame::Denied { reason } => bail!("refused: {reason}"),
+                SubFrame::Denied { reason } => return Ok(Ended::Denied(reason)),
                 other => bail!("an unexpected frame for a view: {other:?}"),
             };
+            answered = true;
             if let Some(ks) = &f.persist
                 && let Err(e) = write(ks, root, &next)
             {
@@ -621,10 +684,9 @@ async fn follow_once(
             }
             *held = Some(next.clone());
             if tx.send(Some(Arc::new(next))).is_err() {
-                return Ok(());
+                return Ok(Ended::Closed);
             }
         }
-        Ok(())
     }
     .await;
     conn.close(0u32.into(), b"done");
@@ -723,5 +785,210 @@ mod tests {
         let view = crate::testutil::signed_policy(&root(), p).view_for(None, None);
         write(&ks, r, &HeldView::fetched(view, None, 0)).unwrap();
         assert_eq!(directories(&ks, r, me), vec![listed]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Following: a silent or refusing directory (a fake one, on loopback)
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use iroh::address_lookup::memory::MemoryLookup;
+
+    /// What a fake directory does on each view subscription.
+    #[derive(Clone, Copy)]
+    enum Script {
+        /// The view once, then nothing, the stream held open.
+        ViewThenSilence,
+        /// The view, then `denied`.
+        ViewThenDenied,
+        /// `denied` at once.
+        Denied,
+    }
+
+    /// Nodes 53 and 54: the fake directories.
+    fn dir(i: u8) -> NodeIdentity {
+        NodeIdentity::from_seed([53 + i; 32])
+    }
+
+    /// [`signed`] at version 1, listing both fake directories.
+    fn listing() -> SignedPolicy {
+        let mut p = signed(1).to_policy().unwrap();
+        p.directories = vec![dir(0).node_id(), dir(1).node_id()];
+        crate::testutil::signed_policy(&root(), p)
+    }
+
+    /// A loopback endpoint for `who`, found through `book`, speaking `alpns`.
+    async fn endpoint(who: &NodeIdentity, book: &MemoryLookup, alpns: Vec<Vec<u8>>) -> Endpoint {
+        let ep = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(transport::secret_key(who))
+            .address_lookup(book.clone())
+            .alpns(alpns)
+            .bind()
+            .await
+            .unwrap();
+        let socks: Vec<_> = ep
+            .bound_sockets()
+            .into_iter()
+            .map(crate::net::dialable)
+            .collect();
+        book.add_endpoint_info(transport::endpoint_addr(&who.node_id(), &socks, None).unwrap());
+        ep
+    }
+
+    /// Fake directory `i` playing `script` to every subscriber, its `Fresh`
+    /// good for `span` seconds; the count of subscriptions it took.
+    async fn fake_directory(
+        i: u8,
+        book: &MemoryLookup,
+        script: Script,
+        span: i64,
+    ) -> Arc<AtomicUsize> {
+        let ep = endpoint(&dir(i), book, vec![DIRECTORY_SUB_ALPN.to_vec()]).await;
+        let policy = listing();
+        let now = now_unix();
+        let fresh = Fresh::sign(&dir(i), &policy.head, now, now + span).unwrap();
+        let view = SubFrame::View {
+            view: policy.view_for(Some(&anyone()), None),
+            fresh,
+        };
+        let denied = SubFrame::Denied {
+            reason: "no longer a directory of this network".into(),
+        };
+        let taken = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&taken);
+        tokio::spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                let Ok(conn) = incoming.await else { continue };
+                count.fetch_add(1, Ordering::SeqCst);
+                let frames = match script {
+                    Script::ViewThenSilence => vec![view.clone()],
+                    Script::ViewThenDenied => vec![view.clone(), denied.clone()],
+                    Script::Denied => vec![denied.clone()],
+                };
+                tokio::spawn(async move {
+                    let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+                        return;
+                    };
+                    let _hello = wire::read_sub_request(&mut recv).await;
+                    let _subscribe = wire::read_sub_request(&mut recv).await;
+                    for frame in frames {
+                        let _ = wire::write(&mut send, &frame.encode().unwrap()).await;
+                    }
+                    if matches!(script, Script::ViewThenSilence) {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                    }
+                    let _ = send.finish();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+                });
+            }
+        });
+        taken
+    }
+
+    /// A follower for node 55 over `book`, starting from no view and the
+    /// fake directories.
+    async fn follower(book: &MemoryLookup) -> Follow {
+        let me = NodeIdentity::from_seed([55; 32]);
+        Follow {
+            endpoint: endpoint(&me, book, vec![]).await,
+            badge: Membership::mint(&root(), me.node_id(), 0, i64::MAX).unwrap(),
+            id_token: Arc::new(|| None),
+            initial: None,
+            fallback: vec![dir(0).node_id(), dir(1).node_id()],
+            persist: None,
+        }
+    }
+
+    /// The silence bound: the held `Fresh`'s lifetime plus that again, at
+    /// most 10 s; two default beats and 10 s with none.
+    #[test]
+    fn silence_follows_the_freshness_lifetime() {
+        let policy = listing();
+        let held = |span: i64| {
+            let fresh = Fresh::sign(&dir(0), &policy.head, 100, 100 + span).unwrap();
+            HeldView::fetched(policy.view_for(None, None), Some(fresh), 100)
+        };
+        assert_eq!(silence(Some(&held(1))), Duration::from_secs(2));
+        assert_eq!(silence(Some(&held(900))), Duration::from_secs(910));
+        assert_eq!(silence(None), Duration::from_secs(610));
+    }
+
+    /// A directory that answers and then goes silent (no beat within the
+    /// silence bound) ends the subscription, so the follower moves on,
+    /// rather than waiting on it forever.
+    #[tokio::test]
+    async fn a_silent_view_subscription_is_taken_for_dead() {
+        let book = MemoryLookup::new();
+        let _taken = fake_directory(0, &book, Script::ViewThenSilence, 1).await;
+        let f = follower(&book).await;
+        let (tx, _rx) = tokio::sync::watch::channel(None);
+        let mut held = None;
+        let ended = tokio::time::timeout(
+            Duration::from_secs(10),
+            follow_once(&f, dir(0).node_id(), root().node_id(), &mut held, &tx),
+        )
+        .await
+        .expect("ends within the silence bound")
+        .unwrap();
+        assert_eq!(ended, Ended::Closed);
+        assert_eq!(held.unwrap().version(), StateVersion(1));
+        f.endpoint.close().await;
+    }
+
+    /// A directory that ends the subscription with `denied` is passed over
+    /// at once for the next one, and not asked again meanwhile.
+    #[tokio::test]
+    async fn a_denied_view_subscription_moves_to_the_next_directory() {
+        let book = MemoryLookup::new();
+        let first = fake_directory(0, &book, Script::ViewThenDenied, 3600).await;
+        let second = fake_directory(1, &book, Script::ViewThenSilence, 3600).await;
+        let f = follower(&book).await;
+        let (tx, _rx) = tokio::sync::watch::channel(None);
+        let mut held = None;
+        let ended = follow_once(&f, dir(0).node_id(), root().node_id(), &mut held, &tx)
+            .await
+            .unwrap();
+        assert!(matches!(ended, Ended::Denied(r) if r.contains("no longer a directory")));
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+
+        let endpoint = f.endpoint.clone();
+        let (_watch, task) = follow(f);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while second.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the second directory is followed");
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(
+            first.load(Ordering::SeqCst),
+            2,
+            "once more, then passed over"
+        );
+        assert_eq!(second.load(Ordering::SeqCst), 1, "followed, and still");
+        task.abort();
+        endpoint.close().await;
+    }
+
+    /// When every directory refuses, the follower pauses between rounds (1
+    /// s, 2 s, …): a handful of attempts over seconds, never a tight loop.
+    #[tokio::test]
+    async fn a_follower_every_directory_refuses_backs_off() {
+        let book = MemoryLookup::new();
+        let first = fake_directory(0, &book, Script::Denied, 3600).await;
+        let second = fake_directory(1, &book, Script::Denied, 3600).await;
+        let f = follower(&book).await;
+        let endpoint = f.endpoint.clone();
+        let (_watch, task) = follow(f);
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
+        task.abort();
+        // Rounds at about 0, 1 and 3 s.
+        for taken in [first, second] {
+            let n = taken.load(Ordering::SeqCst);
+            assert!((1..=4).contains(&n), "{n} subscriptions in 3.5 s");
+        }
+        endpoint.close().await;
     }
 }
