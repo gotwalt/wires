@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use library::{CallId, NodeId, ServiceName};
+use library::{CallId, NodeId};
 
 /// How long a call's push token stays live after the call ends: long enough
 /// for a build or job the call started to report back, short enough that a
@@ -101,8 +101,6 @@ impl fmt::Debug for PushToken {
 pub(crate) struct Grant {
     /// The call's caller: the only node the token can push to.
     pub(crate) caller: NodeId,
-    /// The service the call ran.
-    pub(crate) service: ServiceName,
     /// The call's id in the call log, once its `Started` record exists.
     pub(crate) call: Option<CallId>,
     /// When the token dies; `None` while the call is still running.
@@ -148,9 +146,9 @@ pub(crate) struct Capabilities {
 }
 
 impl Capabilities {
-    /// Mint a token for a call by `caller` to `service`, live until the
-    /// returned handle is dropped plus [`CAPABILITY_GRACE`].
-    pub(crate) fn mint(self: &Arc<Self>, caller: NodeId, service: ServiceName) -> CallCapability {
+    /// Mint a token for a call by `caller`, live until the returned handle
+    /// is dropped plus [`CAPABILITY_GRACE`].
+    pub(crate) fn mint(self: &Arc<Self>, caller: NodeId) -> CallCapability {
         let token = PushToken::generate();
         let mut grants = self.lock();
         prune(&mut grants, Instant::now());
@@ -158,7 +156,6 @@ impl Capabilities {
             token.clone(),
             Grant {
                 caller,
-                service,
                 call: None,
                 expires: None,
             },
@@ -195,8 +192,7 @@ impl Capabilities {
         let mut grants = self.lock();
         prune(&mut grants, now);
         let grant = grants.get(token).ok_or(CapabilityRefusal::Unknown)?;
-        let exact = to.len() == 64 && NodeId::from_hex(to).is_ok_and(|n| n == grant.caller);
-        if !exact {
+        if !NodeId::from_hex(to).is_ok_and(|n| n == grant.caller) {
             return Err(CapabilityRefusal::NotTheCaller {
                 caller: grant.caller,
             });
@@ -356,10 +352,6 @@ mod tests {
         NodeIdentity::from_seed([b; 32]).node_id()
     }
 
-    fn svc() -> ServiceName {
-        ServiceName::new("deploy").unwrap()
-    }
-
     #[test]
     fn a_token_is_64_hex_and_round_trips() {
         let t = PushToken::generate();
@@ -378,7 +370,7 @@ mod tests {
     #[test]
     fn a_live_token_pushes_only_to_its_caller() {
         let caps = Arc::new(Capabilities::default());
-        let cap = caps.mint(node(2), svc());
+        let cap = caps.mint(node(2));
         let now = Instant::now();
         let grant = caps.check(cap.token(), &node(2).hex(), now).unwrap();
         assert_eq!(grant.caller, node(2));
@@ -392,7 +384,8 @@ mod tests {
         for to in [
             node(3).hex(),
             "analyst".into(),
-            "member".into(),
+            format!("{}0", node(2).hex()),
+            node(2).hex()[..63].to_string(),
             String::new(),
         ] {
             assert_eq!(
@@ -411,7 +404,7 @@ mod tests {
     #[test]
     fn a_token_dies_a_grace_period_after_its_call_ends() {
         let caps = Arc::new(Capabilities::default());
-        let cap = caps.mint(node(2), svc());
+        let cap = caps.mint(node(2));
         let token = cap.token().clone();
         let to = node(2).hex();
         // While the call runs, no clock kills it.
@@ -463,19 +456,19 @@ mod tests {
 
     proptest! {
         /// Whatever `--to` says, a capability admits exactly its caller's
-        /// 64-hex id and nothing else.
+        /// 64-hex id (in either case) and nothing else.
         #[test]
         fn only_the_exact_caller_id_is_admitted(to in "[0-9a-zA-Z]{0,70}", pick in 0u8..3) {
             let caps = Arc::new(Capabilities::default());
-            let cap = caps.mint(node(2), svc());
-            let to = match pick {
-                0 => node(2).hex(),
-                1 => node(2).hex().to_uppercase(),
-                _ => to,
+            let cap = caps.mint(node(2));
+            let (to, want) = match pick {
+                0 => (node(2).hex(), true),
+                1 => (node(2).hex().to_uppercase(), true),
+                // A random string is the caller's id only by a 2^-256 fluke.
+                _ => (to, false),
             };
             let ok = caps.check(cap.token(), &to, Instant::now()).is_ok();
-            let want = NodeId::from_hex(&to).is_ok_and(|n| n == node(2)) && to.len() == 64;
-            prop_assert_eq!(ok, want);
+            prop_assert_eq!(ok, want, "{}", to);
         }
     }
 }

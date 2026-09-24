@@ -1,5 +1,5 @@
 //! The record stream (card 26b): a host serves its own signed call log
-//! ([`call_log`](super::call_log)) to authorized readers, by key, on
+//! ([`call_log`]) to authorized readers, by key, on
 //! [`ALPN`]. Nothing is broadcast: a record's content leaves the host only
 //! when a reader asks for it and may see it (any other member asking gets
 //! its hash link).
@@ -50,11 +50,11 @@
 //!   person's. A reader with no verified principal sees nothing in full.
 //!
 //! What a record is about ([`about`]):
-//! - `Started`: its tool; its `principal`.
+//! - `Started`: its service; its `principal`.
 //! - `Finished`: its `Started`'s service and subject. When that `Started`
 //!   was pruned, neither is known, and the entry is only a hidden link.
-//! - `Denied`: its tool, if it named one; its `principal`. With no tool,
-//!   it is shown only to its subject.
+//! - `Denied`: its service, if it named one; its `principal`. With no
+//!   service, it is shown only to its subject.
 //! - `Push`: the service of the call that sent it (`call` → that call's
 //!   `Started`); its subject is the principal it was admitted for (none
 //!   recorded: shown to nobody but that service's readers). An operator
@@ -69,21 +69,17 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use library::{
     AuditRecord, CLOCK_SKEW_SECS, CallId, ChainPoint, EntryHash, Hello, LogEntry, LogSeq, NodeId,
-    Principal, ServiceName, StateVersion, check_inclusion, role_admits,
+    Principal, ServiceName, StateVersion, role_admits,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::call_log;
-use super::gate::ServicesHost;
+use super::gate::{HOST_MISCONFIGURED, NOT_ADMITTED, ServicesHost};
 use super::transport;
 
 /// The record-stream ALPN.
 pub(crate) const ALPN: &[u8] = b"wires/records/1";
-
-/// The fixed refusal a reader that isn't a current member gets: nothing
-/// about why (the detail goes only to the host's trace). The session's.
-pub(crate) const NOT_ADMITTED: &str = super::gate::NOT_ADMITTED;
 
 /// The refusal a following reader gets when its ID token expires.
 pub(crate) const TOKEN_EXPIRED: &str =
@@ -184,7 +180,8 @@ impl StreamItem {
     pub(crate) fn last_seq(&self) -> LogSeq {
         match self {
             StreamItem::Entry { entry } => entry.seq,
-            StreamItem::Hidden { from, links } => LogSeq(from.0 + links.len().max(1) as u64 - 1),
+            // A run is never empty: it starts with the entry that opened it.
+            StreamItem::Hidden { from, links } => LogSeq(from.0 + links.len() as u64 - 1),
         }
     }
 }
@@ -201,7 +198,7 @@ pub(crate) enum RecordFrame {
         /// The services it wants records of.
         services: Vec<ServiceName>,
         /// Only entries after this seq (its resume point for this view).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         since: Option<LogSeq>,
         /// Only its own records, even where it may read all.
         mine: bool,
@@ -216,12 +213,12 @@ pub(crate) enum RecordFrame {
         scopes: BTreeMap<ServiceName, Scope>,
         /// The log's newest entry (`None`: the log is empty). Below the
         /// reader's anchor means the log was rolled back.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         tip: Option<ChainPoint>,
         /// The oldest entry the host still holds (`None`: empty). Above the
         /// reader's anchor means entries were pruned (retention), not
         /// tampered with.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         first: Option<LogSeq>,
     },
     /// Host → reader: the next items, in log order.
@@ -388,8 +385,13 @@ impl View {
     /// sent of the entries after `since`: shown entries in full, the rest in
     /// [`StreamItem::Hidden`] runs. The whole log is walked so a `Finished`
     /// (or a service's `Push`) finds its `Started` even when that came
-    /// before `since`.
-    pub(crate) fn items(&self, entries: &[LogEntry], since: Option<LogSeq>) -> Vec<StreamItem> {
+    /// before `since`. Fails when a hidden entry can't be hashed: skipping
+    /// it would leave a gap the reader can't explain.
+    pub(crate) fn items(
+        &self,
+        entries: &[LogEntry],
+        since: Option<LogSeq>,
+    ) -> Result<Vec<StreamItem>> {
         let mut calls: HashMap<CallId, (ServiceName, Option<Person>)> = HashMap::new();
         let mut out: Vec<StreamItem> = Vec::new();
         for entry in entries {
@@ -410,7 +412,9 @@ impl View {
             }
             // Hash what is stored: a tampered entry breaks the reader's chain
             // even when the reader can't see it.
-            let Ok(hash) = entry.hash() else { continue };
+            let hash = entry
+                .hash()
+                .with_context(|| format!("hashing call-log entry {}", entry.seq.0))?;
             let link = Link {
                 prev: entry.prev,
                 hash,
@@ -427,7 +431,7 @@ impl View {
                 }),
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -444,23 +448,11 @@ pub(crate) async fn authorize(
 ) -> std::result::Result<View, String> {
     let state = host.state().map_err(|e| {
         tracing::warn!("signed state unusable: {e:#}");
-        "responder configuration error".to_string()
+        HOST_MISCONFIGURED.to_string()
     })?;
     let s = &state.state;
-    if let Err(e) = check_inclusion(&hello.membership, host.trust_root, caller, now) {
-        STRANGERS.refused(
-            "record stream",
-            caller,
-            &format!("membership rejected: {e}"),
-        );
-        return Err(NOT_ADMITTED.to_string());
-    }
-    if !s.is_member(caller) {
-        STRANGERS.refused(
-            "record stream",
-            caller,
-            &format!("not a member of the signed state (version {})", s.version.0),
-        );
+    if let Err(detail) = host.check_member(&state, &hello.membership, caller, now) {
+        STRANGERS.refused("record stream", caller, &detail);
         return Err(NOT_ADMITTED.to_string());
     }
     if let Err(e) = state.check_fresh(now) {
@@ -546,7 +538,7 @@ impl iroh::protocol::ProtocolHandler for RecordStream {
                 caller,
                 &self.host,
                 &self.log,
-                Some(permit),
+                permit,
                 async move {
                     closed.closed().await;
                 },
@@ -595,7 +587,7 @@ pub(crate) async fn serve<S, R>(
     caller: NodeId,
     host: &ServicesHost,
     log: &Path,
-    preauth: Option<tokio::sync::OwnedSemaphorePermit>,
+    preauth: tokio::sync::OwnedSemaphorePermit,
     gone: impl std::future::Future<Output = ()>,
 ) -> Result<()>
 where
@@ -712,7 +704,7 @@ async fn send_items<S: AsyncWrite + Unpin>(
     entries: &[LogEntry],
     sent: Option<LogSeq>,
 ) -> Result<Option<LogSeq>> {
-    let items = view.items(entries, sent);
+    let items = view.items(entries, sent)?;
     let mark = items.last().map(StreamItem::last_seq).or(sent);
     for chunk in items.chunks(BATCH) {
         write_frame(
@@ -860,7 +852,9 @@ mod tests {
 
     #[test]
     fn a_reader_sees_all_of_its_service_and_nothing_else() {
-        let items = view(None, &[("orders-db", Scope::All)]).items(&log(), None);
+        let items = view(None, &[("orders-db", Scope::All)])
+            .items(&log(), None)
+            .unwrap();
         assert_eq!(shown(&items), vec![0, 1, 2]);
         let l = log();
         assert_eq!(
@@ -885,11 +879,14 @@ mod tests {
             Some(bob()),
             &[("orders-db", Scope::Mine), ("status", Scope::Mine)],
         );
-        assert_eq!(shown(&bob_view.items(&log(), None)), vec![2, 3, 4]);
+        assert_eq!(shown(&bob_view.items(&log(), None).unwrap()), vec![2, 3, 4]);
         let alice_view = view(Some(alice()), &[("orders-db", Scope::Mine)]);
-        assert_eq!(shown(&alice_view.items(&log(), None)), vec![0, 1]);
+        assert_eq!(shown(&alice_view.items(&log(), None).unwrap()), vec![0, 1]);
         // `since` skips, but a Finished still finds its earlier Started.
-        assert_eq!(shown(&alice_view.items(&log(), Some(LogSeq(0)))), vec![1]);
+        assert_eq!(
+            shown(&alice_view.items(&log(), Some(LogSeq(0))).unwrap()),
+            vec![1]
+        );
     }
 
     /// The boundary is the person: alice's second node sees her first
@@ -905,13 +902,16 @@ mod tests {
         ]);
         let mine = [("orders-db", Scope::Mine)];
         assert_eq!(
-            shown(&view(Some(alice()), &mine).items(&records, None)),
+            shown(&view(Some(alice()), &mine).items(&records, None).unwrap()),
             [0, 1]
         );
-        assert_eq!(shown(&view(Some(bob()), &mine).items(&records, None)), [2]);
+        assert_eq!(
+            shown(&view(Some(bob()), &mine).items(&records, None).unwrap()),
+            [2]
+        );
         // Same subject at another issuer: another person.
         let impostor = who("https://other.example", "alice");
-        assert!(shown(&view(Some(impostor), &mine).items(&records, None)).is_empty());
+        assert!(shown(&view(Some(impostor), &mine).items(&records, None).unwrap()).is_empty());
     }
 
     /// A reader with no verified principal sees nothing in full, not even
@@ -923,7 +923,9 @@ mod tests {
             denied(node(2), None, Some("orders-db")),
             started(1, node(2), Some(alice()), "orders-db"),
         ]);
-        let items = view(None, &[("orders-db", Scope::Mine)]).items(&records, None);
+        let items = view(None, &[("orders-db", Scope::Mine)])
+            .items(&records, None)
+            .unwrap();
         assert!(shown(&items).is_empty(), "{items:?}");
     }
 
@@ -944,20 +946,23 @@ mod tests {
             push(node(3), None, None),
         ]);
         let orders_reader = view(None, &[("orders-db", Scope::All)]);
-        assert_eq!(shown(&orders_reader.items(&records, None)), [0, 1, 2]);
+        assert_eq!(
+            shown(&orders_reader.items(&records, None).unwrap()),
+            [0, 1, 2]
+        );
         let status_reader = view(None, &[("status", Scope::All), ("orders-db", Scope::Mine)]);
-        assert!(shown(&status_reader.items(&records, None)).is_empty());
+        assert!(shown(&status_reader.items(&records, None).unwrap()).is_empty());
         let alice_view = view(Some(alice()), &[("orders-db", Scope::Mine)]);
-        assert_eq!(shown(&alice_view.items(&records, None)), [0, 1, 2]);
+        assert_eq!(shown(&alice_view.items(&records, None).unwrap()), [0, 1, 2]);
         // bob, reading nothing: only the pushes admitted for him.
         let bob_view = view(Some(bob()), &[("orders-db", Scope::Mine)]);
-        assert_eq!(shown(&bob_view.items(&records, None)), [3, 4]);
+        assert_eq!(shown(&bob_view.items(&records, None).unwrap()), [3, 4]);
         // An all-reader of every service here still doesn't see bob's.
         let everything = view(
             Some(alice()),
             &[("orders-db", Scope::All), ("status", Scope::All)],
         );
-        assert_eq!(shown(&everything.items(&records, None)), [0, 1, 2]);
+        assert_eq!(shown(&everything.items(&records, None).unwrap()), [0, 1, 2]);
     }
 
     /// A Finished whose Started was pruned is a hidden link to everyone; a
@@ -966,15 +971,17 @@ mod tests {
     fn serviceless_records_are_shown_to_their_subject_only() {
         let records = signed(vec![finished(1), denied(node(3), Some(bob()), None)]);
         let all = view(Some(alice()), &[("orders-db", Scope::All)]);
-        assert!(shown(&all.items(&records, None)).is_empty());
+        assert!(shown(&all.items(&records, None).unwrap()).is_empty());
         let bob_view = view(Some(bob()), &[("orders-db", Scope::Mine)]);
-        assert_eq!(shown(&bob_view.items(&records, None)), [1]);
+        assert_eq!(shown(&bob_view.items(&records, None).unwrap()), [1]);
     }
 
     #[test]
     fn a_stranger_view_gets_only_hidden_runs() {
         let stranger = who("https://idp.example", "carol");
-        let items = view(Some(stranger), &[("orders-db", Scope::Mine)]).items(&log(), None);
+        let items = view(Some(stranger), &[("orders-db", Scope::Mine)])
+            .items(&log(), None)
+            .unwrap();
         assert_eq!(items.len(), 1);
         assert!(matches!(
             items[0],

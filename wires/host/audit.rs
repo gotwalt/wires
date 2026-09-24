@@ -53,7 +53,7 @@ pub const AUDIT_QUEUE: usize = 256;
 
 /// Log a refusal of `caller` — a member; see the module docs — (asking for
 /// `service`, if it named one) with the reason it was sent. A no-op when the
-/// responder has no audit sink. A log that can't take it is traced at
+/// host has no audit sink. A log that can't take it is traced at
 /// `error`: the refusal stands either way.
 ///
 /// The reason is cut exactly as [`transport`] cuts the one it sends, so the
@@ -106,7 +106,7 @@ impl CallAudit {
     /// Log [`Started`](AuditRecord::Started) for a call `caller` was
     /// admitted to (under `state_version`) and return
     /// the handle that will log its `Finished`. `Ok(None)` — and nothing
-    /// logged — when the responder has no audit sink.
+    /// logged — when the host has no audit sink.
     ///
     /// Waits until the entry is durably written. `Err` means it wasn't, and
     /// the call must not run (see the module docs).
@@ -461,11 +461,6 @@ mod tests {
         burst.await.unwrap();
         let want: Vec<String> = (0..50).map(|n| format!("no {n}")).collect();
         assert_eq!(reasons, want);
-    }
-
-    #[test]
-    fn an_untallied_stdin_tap_records_nothing() {
-        tap_stdin(None).feed(b"ignored"); // must not panic
     }
 
     #[tokio::test]

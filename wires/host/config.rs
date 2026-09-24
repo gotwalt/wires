@@ -75,10 +75,10 @@ pub(crate) struct HostConfig {
     /// How each assigned service runs here, by name.
     pub(crate) services: BTreeMap<ServiceName, ServiceImpl>,
     /// Who may receive pushes from this host. Absent: nobody.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) push: Option<Push>,
     /// Where the host's call log is exported. Absent: nowhere.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) audit: Option<AuditConfig>,
 }
 
@@ -89,7 +89,7 @@ pub(crate) struct ServiceImpl {
     /// The fixed argv; each call's arguments are appended. Never a shell.
     pub(crate) command: Vec<String>,
     /// The working directory. Absent: `serve`'s own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cwd: Option<PathBuf>,
     /// Extra environment, set on top of a minimal one (only `PATH`, `LANG`
     /// and `LC_*` are inherited from `serve`) and before the `WIRES_*`
@@ -143,7 +143,7 @@ pub(crate) struct Push {
 #[serde(deny_unknown_fields)]
 pub(crate) struct AuditConfig {
     /// An OTLP/HTTP collector base URL (`/v1/logs` is appended).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) otlp: Option<String>,
 }
 
@@ -209,8 +209,8 @@ impl HostConfig {
         Ok(config)
     }
 
-    /// Parse and validate `host.json` text: the schema, then
-    /// [`validate`](Self::validate).
+    /// Parse and validate `host.json` text: the schema (and its version),
+    /// then [`validate`](Self::validate).
     pub(crate) fn parse(text: &str) -> Result<Self> {
         let config = Self::parse_schema(text)?;
         config.validate()?;
@@ -235,13 +235,12 @@ impl HostConfig {
 
     /// The rules the schema can't say, on the file alone:
     ///
-    /// - `version` is [`HOST_CONFIG`]; at least one service; no empty
-    ///   command; no empty `cwd`;
+    /// - at least one service; no empty command; no empty `cwd`;
     /// - `env` names are non-empty, contain no `=` or NUL, and don't start
     ///   with `WIRES_` (the server-derived variables are not settable);
     /// - each issuer is listed once, non-empty, with at least one audience;
     /// - `audit.otlp` is an https URL (or http to a loopback collector).
-    pub(crate) fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         if self.services.is_empty() {
             bail!("nothing is implemented: `services` is empty");
         }
@@ -252,12 +251,6 @@ impl HostConfig {
     /// an embedding app's config must pass, since its native services count
     /// too.
     pub(crate) fn validate_fields(&self) -> Result<()> {
-        if self.version != HOST_CONFIG {
-            bail!(
-                "version {} is not supported here (expected {HOST_CONFIG})",
-                self.version
-            );
-        }
         let mut issuers: Vec<&str> = Vec::new();
         for trusted in &self.identity.issuers {
             let iss = trusted.issuer.as_str();
@@ -449,26 +442,65 @@ mod tests {
     fn unknown_keys_are_errors_at_every_level() {
         for bad in [
             r#"{"version":2,"services":{"a":{"command":["x"]}},"tools":{}}"#,
-            r#"{"version":2,"services":{"a":{"command":["x"],"allow":["member"]}}}"#,
+            r#"{"version":2,"services":{"a":{"command":["x"],"allow":["sre"]}}}"#,
             r#"{"version":2,"services":{"a":{"command":["x"]}},"push":{"alow":[]}}"#,
         ] {
             assert!(HostConfig::parse(bad).is_err(), "{bad}");
         }
     }
 
+    /// Each rule refuses its case, and says which rule it was.
     #[test]
     fn validation_rules() {
-        for bad in [
-            r#"{"version":2,"services":{}}"#,
-            r#"{"version":2,"services":{"a":{"command":[]}}}"#,
-            r#"{"version":2,"services":{"a":{"command":["x"],"cwd":""}}}"#,
-            r#"{"version":2,"services":{"a":{"command":["x"],"env":{"A=B":"1"}}}}"#,
-            r#"{"version":2,"services":{"a":{"command":["x"],"env":{"WIRES_SERVICE":"1"}}}}"#,
-            r#"{"version":2,"services":{"Bad Name":{"command":["x"]}}}"#,
-            r#"{"version":2,"services":{"a":{"command":["x"]}},"audit":{"otlp":"ftp://x"}}"#,
-            r#"{"version":3,"services":{"a":{"command":["x"]}}}"#,
+        for (bad, why) in [
+            (
+                r#"{"services":{"a":{"command":["x"]}}}"#,
+                "missing `version`",
+            ),
+            (
+                r#"{"version":3,"services":{"a":{"command":["x"]}}}"#,
+                "version 3 is not supported",
+            ),
+            (r#"{"version":2,"services":{}}"#, "`services` is empty"),
+            (
+                r#"{"version":2,"services":{"a":{"command":[]}}}"#,
+                "service a: empty command",
+            ),
+            (
+                r#"{"version":2,"services":{"a":{"command":["x"],"cwd":""}}}"#,
+                "service a: empty cwd",
+            ),
+            (
+                r#"{"version":2,"services":{"a":{"command":["x"],"env":{"A=B":"1"}}}}"#,
+                "is not a variable name",
+            ),
+            (
+                r#"{"version":2,"services":{"a":{"command":["x"],"env":{"WIRES_SERVICE":"1"}}}}"#,
+                "env WIRES_SERVICE is set by wires itself",
+            ),
+            (
+                r#"{"version":2,"services":{"Bad Name":{"command":["x"]}}}"#,
+                "invalid service name",
+            ),
+            (
+                r#"{"version":2,"identity":{"issuers":[{"issuer":" ","audiences":["a"]}]},"services":{"a":{"command":["x"]}}}"#,
+                "an issuer is empty",
+            ),
+            (
+                r#"{"version":2,"identity":{"issuers":[{"issuer":"https://i","audiences":["a"]},{"issuer":"https://i","audiences":["b"]}]},"services":{"a":{"command":["x"]}}}"#,
+                "https://i is listed twice",
+            ),
+            (
+                r#"{"version":2,"identity":{"issuers":[{"issuer":"https://i","audiences":[" "]}]},"services":{"a":{"command":["x"]}}}"#,
+                "https://i has no audiences",
+            ),
+            (
+                r#"{"version":2,"services":{"a":{"command":["x"]}},"audit":{"otlp":"ftp://x"}}"#,
+                "audit.otlp",
+            ),
         ] {
-            assert!(HostConfig::parse(bad).is_err(), "{bad}");
+            let e = format!("{:#}", HostConfig::parse(bad).unwrap_err());
+            assert!(e.contains(why), "{bad}: {e}");
         }
     }
 

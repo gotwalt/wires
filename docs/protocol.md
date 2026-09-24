@@ -165,9 +165,9 @@ A node never adopts an older or unverifiable state, so a lying peer can only fai
 that was offline when a service was assigned to it catches up at `serve` start from another host,
 or by joining with a fresh invite (re-joining never rolls back).
 
-## 5. Sessions: `wires/session/3`
+## 5. Sessions: `wires/session/1`
 
-A session is one bidirectional QUIC stream on ALPN `wires/session/3`. Codec:
+A session is one bidirectional QUIC stream on ALPN `wires/session/1`. Codec:
 `library/calls/session.rs`. Transport: `wires/host/transport.rs`.
 
 | Tag | Frame | Body | Direction |

@@ -41,7 +41,7 @@ use crate::caller::pick::Hints;
 use crate::caller::watch_records::{Output, Report, WatchOpts, text_line, watch_with};
 use crate::host::call_log::{self, CallLog};
 use crate::host::config::HostConfig;
-use crate::host::record_stream::NOT_ADMITTED;
+use crate::host::gate::NOT_ADMITTED;
 use crate::host::serve::{services_host, services_router};
 use crate::host::transport::{ALPN, endpoint_addr, secret_key};
 
@@ -223,7 +223,7 @@ impl Host {
         let log = keystore.path(call_log::LOG_FILE);
         let opened =
             CallLog::open(&log, w.host.duplicate(), library::Retention::default()).unwrap();
-        let (sink, _, _tee) = call_log::start(opened, None, false);
+        let (sink, _tee) = call_log::start(opened, None);
         host.audit = Some(sink);
         let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key(&w.host))

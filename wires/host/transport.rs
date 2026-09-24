@@ -3,7 +3,7 @@
 //! `library` stays pure (no iroh/tokio); this module is where the
 //! key-addressed session meets the iroh QUIC endpoint. The session ALPN is
 //! [`ALPN`]. A caller opens a bi-stream and sends a
-//! [`Frame::Hello`](library::Frame::Hello) — its root-signed membership, the
+//! [`Frame::Hello`] — its root-signed membership, the
 //! signed-state version it holds, and its IdP ID token — followed at once by
 //! a [`Frame::Invoke`] naming a service plus per-call arguments. The host
 //! ([`serve_session_permitted`]) decides by the signed state it holds, re-read
@@ -47,12 +47,9 @@ use crate::host::gate::Implementation;
 use crate::host::service::Running;
 use tokio::sync::mpsc;
 
-/// The custom ALPN identifying a wires session.
-///
-/// `/3`: the session opens with a [`Hello`] (card 27); a peer still speaking
-/// the channel-era `/2` handshake fails cleanly at connect time rather than
-/// mid-handshake.
-pub const ALPN: &[u8] = b"wires/session/3";
+/// The custom ALPN identifying a wires session, which opens with a
+/// [`Hello`].
+pub const ALPN: &[u8] = b"wires/session/1";
 
 /// Read buffer size for pumping child / local stdio into frames.
 const PUMP_BUF: usize = 64 * 1024;
@@ -79,7 +76,7 @@ pub(crate) const MAX_INVOKE_FRAME: usize = 8 * library::MAX_ARGV_BYTES;
 /// count: the permit is returned as soon as the gate decides.
 pub(crate) const MAX_PREAUTH_SESSIONS: usize = 64;
 
-/// How long a responder waits for the opening handshake before giving up, so a
+/// How long a host waits for the opening handshake before giving up, so a
 /// peer that connects but never speaks can't hold a session task open.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -88,7 +85,7 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// unavailable. See [`AuditSink::append`].
 pub(crate) const LOG_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Denial reason: the responder got something other than an
+/// Denial reason: the host got something other than an
 /// [`Frame::Invoke`] after the handshake.
 pub const DENY_INVOKE_REQUIRED: &str = "invoke required";
 
@@ -258,10 +255,6 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-// ---------------------------------------------------------------------------
-// Key bridge: our `library` identities <-> iroh's
-// ---------------------------------------------------------------------------
-
 /// Map a `library` node identity to the iroh `SecretKey` of the same Ed25519
 /// key, so the iroh node id equals our [`NodeId`].
 pub fn secret_key(identity: &NodeIdentity) -> SecretKey {
@@ -307,7 +300,7 @@ pub async fn bind(identity: &NodeIdentity, relay_url: Option<&str>) -> Result<En
 
 /// Bind an iroh endpoint for `identity` advertising `alpn`, using the n0 preset
 /// for discovery + relays. If `relay_url` is given, that relay is used instead
-/// of the n0 default (for a self-hosted `//relay`).
+/// of the n0 default (for a self-hosted iroh relay).
 pub async fn bind_with_alpn(
     identity: &NodeIdentity,
     relay_url: Option<&str>,
@@ -361,10 +354,6 @@ pub async fn bind_with(
         .await
         .map_err(|e| anyhow!("binding iroh endpoint: {e}"))
 }
-
-// ---------------------------------------------------------------------------
-// Frame I/O over an iroh bi-stream (length-prefixed via `library::Frame`)
-// ---------------------------------------------------------------------------
 
 /// Write one length-prefixed frame.
 pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> Result<()> {
@@ -564,10 +553,6 @@ where
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Responder (`wires serve`)
-// ---------------------------------------------------------------------------
-
 /// The session ALPN for a host, as a router protocol (see
 /// [`serve_session_permitted`]). At most [`MAX_PREAUTH_SESSIONS`] sessions
 /// wait for a decision at once; one more is closed unanswered and traced.
@@ -760,7 +745,7 @@ where
         Err(e) => {
             // The host's own fault, not the caller's: an operator error.
             tracing::warn!("signed state unusable: {e:#}");
-            let reason = "responder configuration error";
+            let reason = crate::host::gate::HOST_MISCONFIGURED;
             deny(&mut send, reason.to_string()).await;
             return Err(Refused(reason.to_string()).into());
         }
@@ -859,7 +844,7 @@ where
             // §1), held in-process rather than in the environment.
             let capability = match (&host.push_grants, &host.push_commands) {
                 (Some(grants), Some(commands)) => {
-                    let cap = grants.caps.mint(caller, service.clone());
+                    let cap = grants.caps.mint(caller);
                     if let Some(call_audit) = &call_audit {
                         cap.bind_call(call_audit.call());
                     }
@@ -924,7 +909,7 @@ where
     let capability = host
         .push_grants
         .as_ref()
-        .map(|g| (g.caps.mint(caller, service.clone()), g.socket.clone()));
+        .map(|g| (g.caps.mint(caller), g.socket.clone()));
     if let Some((cap, socket)) = &capability {
         use crate::host::capability::{ENV_SOCKET, ENV_TOKEN};
         server.push((ENV_SOCKET, socket.clone().into_os_string()));
@@ -977,42 +962,31 @@ pub(crate) fn child_env(
     env
 }
 
-// ---------------------------------------------------------------------------
-// Dialer (`wires call`, `wires mcp`)
-// ---------------------------------------------------------------------------
-
-/// The responder refused the handshake and said why.
+/// The host refused the call and said why.
 ///
 /// Distinguishes an *authorization* failure (the credential this dialer
 /// presented was not acceptable — removed, expired, not in a role) from every
 /// local or transport failure, so `wires call` can exit with a dedicated
-/// code and print the responder's own words. Hand-rolled rather than derived:
-/// `//wires` deliberately carries no `thiserror` dependency.
-#[derive(Debug)]
+/// code and print the host's own words.
+#[derive(Debug, thiserror::Error)]
+#[error("denied by responder: {reason}")]
 pub struct Denied {
+    /// The host's stated reason.
     reason: String,
 }
 
 impl Denied {
-    /// Wrap the responder's stated reason.
+    /// Wrap the host's stated reason.
     pub(crate) fn new(reason: String) -> Self {
         Self { reason }
     }
 
-    /// The responder's stated reason, verbatim (e.g. `membership rejected:
-    /// revoked`).
+    /// The host's stated reason, verbatim (e.g. `not a member of this
+    /// network`).
     pub fn reason(&self) -> &str {
         &self.reason
     }
 }
-
-impl std::fmt::Display for Denied {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "denied by responder: {}", self.reason)
-    }
-}
-
-impl std::error::Error for Denied {}
 
 /// What a service call came to: [`Dialed`] plus the host that answered.
 #[derive(Debug)]
@@ -1081,7 +1055,7 @@ where
             recv,
             hello,
             invocation,
-            Some(host),
+            host,
             |newer| on_ack(host, newer),
             stdin,
             stdout,
@@ -1113,7 +1087,7 @@ pub(crate) async fn dial_opened<S, R, I, W, E>(
     recv: R,
     hello: Hello,
     invocation: Invocation,
-    verify_target: Option<NodeId>,
+    target: NodeId,
     stdin: I,
     stdout: W,
     stderr: E,
@@ -1130,7 +1104,7 @@ where
         recv,
         hello,
         invocation,
-        verify_target,
+        target,
         |_| Ok(()),
         stdin,
         stdout,
@@ -1139,18 +1113,17 @@ where
     .await
 }
 
-/// The dialer half of a session over an established bi-stream. Presents the
-/// `hello`, then reads the host's [`HelloAck`](library::HelloAck); when
-/// `verify_target` is `Some` (always, from [`call_service_on`]), verifies the
-/// responder's membership against the dialer's own fabric root and the
-/// authenticated target id, then runs `on_ack` with the ack's newer state,
-/// all **before** any stdin is forwarded. On any failure, aborts with no
-/// stdin sent.
+/// The dialer half of a session over an established bi-stream to `target`
+/// (the iroh-authenticated host). Presents the `hello`, then reads the
+/// host's [`HelloAck`](library::HelloAck), verifies the membership in it
+/// against the dialer's own network root and `target`, then runs `on_ack`
+/// with the ack's newer state, all **before** any stdin is forwarded. On any
+/// failure, aborts with no stdin sent.
 ///
 /// The [`Frame::Invoke`] carrying `invocation` follows the opening
 /// immediately, without waiting for the ack.
 ///
-/// Errors if the session ends **without** an [`Frame::Exit`] — a responder that
+/// Errors if the session ends **without** an [`Frame::Exit`] — a host that
 /// closes mid-session is a failure, not a silent success.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dial_opened_with<S, R, I, W, E>(
@@ -1158,7 +1131,7 @@ pub(crate) async fn dial_opened_with<S, R, I, W, E>(
     mut recv: R,
     hello: Hello,
     invocation: Invocation,
-    verify_target: Option<NodeId>,
+    target: NodeId,
     on_ack: impl FnOnce(Option<&SignedState>) -> Result<()>,
     stdin: I,
     mut stdout: W,
@@ -1171,32 +1144,25 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    // The dialer's own fabric root is the authority for verifying the responder.
-    let fabric_root = hello.membership.fabric;
+    // The dialer's own network root is the authority for verifying the host.
+    let root = hello.membership.fabric;
     write_frame(&mut send, &Frame::Hello(hello)).await?;
     write_frame(&mut send, &Frame::Invoke(invocation)).await?;
 
-    // Read the responder's ack first (it is always the responder's first frame).
+    // Read the host's ack first (it is always the host's first frame).
     let (ack_membership, newer_state) = match read_frame(&mut recv).await? {
         Some(Frame::HelloAck(ack)) => (ack.membership, ack.newer_state),
-        // Refused: surface the responder's reason. No stdin task has been
+        // Refused: surface the host's reason. No stdin task has been
         // spawned yet, so nothing was forwarded and nothing hit local stdout.
         Some(Frame::Denied { reason }) => return Err(Denied::new(reason).into()),
         Some(_) => bail!("the host's first frame was not a hello ack"),
         None => bail!("the host closed before sending a hello ack"),
     };
-    // Verify the service is a fabric member before streaming stdin.
-    // Credential-only (root-vouched + TTL); whether the host is still assigned
-    // the service is `on_ack`'s to check.
-    if let Some(target_id) = verify_target {
-        check_inclusion(
-            &ack_membership,
-            fabric_root,
-            target_id,
-            crate::clock::now_unix(),
-        )
-        .map_err(|e| anyhow!("responder membership rejected (no stdin sent): {e}"))?;
-    }
+    // Before any stdin: the host's membership must be one our root signed
+    // for this very key, and current. Whether the host is still assigned the
+    // service is `on_ack`'s to check, against the signed state.
+    check_inclusion(&ack_membership, root, target, crate::clock::now_unix())
+        .map_err(|e| anyhow!("the host's membership was rejected (no stdin sent): {e}"))?;
     on_ack(newer_state.as_ref())?;
 
     // Local stdin -> Stdin frames, then shut down the send direction (EOF).
@@ -1231,13 +1197,7 @@ where
                 tracing::info!(code, "remote child exited");
                 break;
             }
-            // A responder may also refuse mid-stream (e.g. a future re-check);
-            // treat it exactly like a refusal at the ack.
-            Some(Frame::Denied { reason }) => {
-                stdin_task.abort();
-                return Err(Denied::new(reason).into());
-            }
-            Some(_) => {} // ignore unexpected frames from the responder
+            Some(_) => {} // ignore unexpected frames from the host
             None => break,
         }
     }
@@ -1245,7 +1205,7 @@ where
     stderr.flush().await.ok();
     stdin_task.abort();
     if !saw_exit {
-        bail!("session ended without an exit code (responder closed early?)");
+        bail!("session ended without an exit code (the host closed early?)");
     }
     Ok(Dialed { exit: code })
 }
@@ -1253,6 +1213,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::keystore::Keystore;
+    use crate::host::config::HostConfig;
+    use crate::host::gate::ServicesHost;
+    use library::{Argv, Membership, Service, State, StateVersion};
 
     #[test]
     fn a_service_child_gets_a_minimal_environment() {
@@ -1295,10 +1259,6 @@ mod tests {
         .collect();
         assert_eq!(got, want);
     }
-    use crate::admin::keystore::Keystore;
-    use crate::host::config::HostConfig;
-    use crate::host::gate::ServicesHost;
-    use library::{Argv, Membership, Service, State, StateVersion};
 
     /// A shutdown signal that never fires: the dialer stays present for the
     /// whole session.
@@ -1306,7 +1266,7 @@ mod tests {
         std::future::pending::<()>()
     }
 
-    /// The fabric root, the host and the caller every session test uses.
+    /// The network root, the host and the caller every session test uses.
     fn root() -> NodeIdentity {
         NodeIdentity::from_seed([1u8; 32])
     }
@@ -1418,7 +1378,7 @@ mod tests {
             s2c_r,
             hello(),
             invoke(args),
-            Some(host_id().node_id()),
+            host_id().node_id(),
             std::io::Cursor::new(input.to_vec()),
             &mut out,
             &mut err,
@@ -1467,7 +1427,7 @@ mod tests {
 
     #[test]
     fn truncate_reason_cuts_on_a_char_boundary() {
-        let short = "membership rejected: revoked".to_string();
+        let short = crate::host::gate::NOT_ADMITTED.to_string();
         assert_eq!(truncate_reason(short.clone()), short);
         let long = "é拒".repeat(400);
         let cut = truncate_reason(long);
@@ -1534,7 +1494,7 @@ mod tests {
                 s2c_r,
                 hello(),
                 invoke(&[]),
-                None,
+                host_id().node_id(),
                 stdin,
                 &mut out,
                 &mut err,
@@ -1551,10 +1511,13 @@ mod tests {
             .unwrap();
     }
 
-    /// A dialer that vanishes mid-session takes the remote child with it.
+    /// A dialer that vanishes mid-session takes the remote child with it:
+    /// the child was running, and once the session returns it is gone.
     #[tokio::test]
     async fn child_is_killed_when_the_dialer_vanishes() {
-        let host = host_running(&["sh", "-c", "sleep 30"]);
+        let pid_file = crate::testutil::temp_dir().join("pid");
+        let script = format!("echo $$ > {}; exec sleep 30", pid_file.display());
+        let host = host_running(&["sh", "-c", &script]);
         let mut opening = Frame::Hello(hello()).encode().unwrap();
         opening.extend(Frame::Invoke(invoke(&[])).encode().unwrap());
         let recv = std::io::Cursor::new(opening);
@@ -1567,12 +1530,33 @@ mod tests {
             })
             .await
         });
+        // The child is spawned (and has written its pid) before the dialer
+        // goes.
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+                {
+                    return pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the child never started");
+        let alive = |pid: i32| {
+            // SAFETY: kill(2) with signal 0 only checks that `pid` exists.
+            unsafe { libc::kill(pid, 0) == 0 }
+        };
+        assert!(alive(pid));
         tx.send(()).ok();
-        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), srv).await;
-        assert!(
-            finished.is_ok(),
-            "the session must return once the dialer is gone, not outlive the child"
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), srv)
+            .await
+            .expect("the session must return once the dialer is gone")
+            .unwrap()
+            .unwrap();
+        assert!(!alive(pid), "the child {pid} outlived its dialer");
     }
 
     /// A service that is a task in this process, not a child (card 33): the
@@ -1763,7 +1747,7 @@ mod tests {
     }
 
     /// Whatever keeps a peer out — someone else's credential, a credential
-    /// from another fabric, or a genuine one the state doesn't list — it
+    /// from another network, or a genuine one the state doesn't list — it
     /// hears the one fixed sentence: no reason, no state version.
     #[tokio::test]
     async fn a_non_member_hears_only_the_fixed_refusal() {
@@ -1918,7 +1902,7 @@ mod tests {
             s2c_r,
             hello(),
             invoke(&[]),
-            None,
+            host_id().node_id(),
             std::io::Cursor::new(Vec::new()),
             &mut out,
             &mut Vec::new(),

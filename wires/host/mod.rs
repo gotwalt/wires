@@ -22,6 +22,8 @@
 //! - [`audit`] — the call records the host keeps.
 //! - [`call_log`] — the host's own signed, hash-linked log of those records,
 //!   on disk with retention (card 26a).
+//! - [`record_stream`] — that log served, by key, to the readers the signed
+//!   state names (`wires watch`, card 26b).
 //! - [`otlp`] — optional OTLP/HTTP export of that log (`audit.otlp`).
 //! - [`push`] — `wires push`: messages to callers by key, queued, delivered
 //!   or fetched, gated by the signed state and `push.allow` (card 23).

@@ -70,7 +70,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
-use super::gate::ServicesHost;
+use super::gate::{HOST_MISCONFIGURED, PushRefusal, ServicesHost};
 use super::transport::{self, AuditSink};
 use crate::admin::ttl::Ttl;
 use crate::caller::inbox::{deny, read_frame, read_frame_within, write_frame};
@@ -109,10 +109,6 @@ pub(crate) const MAX_FETCHES_PER_NODE: usize = 2;
 /// The queue file under `$WIRES_HOME`.
 pub(crate) const QUEUE_FILE: &str = "push-queue.json";
 
-// ---------------------------------------------------------------------------
-// The request and its answer (the control socket's `push` operation)
-// ---------------------------------------------------------------------------
-
 /// What `wires push` asks the running host to send.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PushSpec {
@@ -123,7 +119,7 @@ pub(crate) struct PushSpec {
     /// The text.
     pub(crate) body: PushBody,
     /// Time to live in seconds; `None` is [`DEFAULT_TTL`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ttl_secs: Option<u64>,
 }
 
@@ -133,14 +129,14 @@ pub(crate) struct PushResult {
     /// The recipient.
     pub(crate) to: NodeId,
     /// Its verified identity (email), when the host knows one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) who: Option<String>,
     /// The message id (also on a refusal: it names the `denied` record).
     pub(crate) id: PushId,
     /// `delivered`, `queued` or `denied`.
     pub(crate) outcome: PushOutcome,
     /// Why, when denied.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<String>,
 }
 
@@ -193,23 +189,19 @@ pub(crate) struct PushCommand {
     pub(crate) reply: oneshot::Sender<std::result::Result<PushReport, String>>,
 }
 
-// ---------------------------------------------------------------------------
-// The queue (pure)
-// ---------------------------------------------------------------------------
-
 /// One queued message, with who it was admitted as (for later records).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Entry {
     /// The message.
     pub(crate) message: PushMessage,
     /// The recipient's verified identity at send time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) principal: Option<Principal>,
     /// The `push.allow` role that admitted it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) role: Option<String>,
     /// The call whose push capability sent it (`None`: the operator).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) call: Option<CallId>,
 }
 
@@ -222,15 +214,11 @@ pub(crate) struct Queue {
 
 impl Queue {
     /// Add `entry` behind its recipient's queue; returns the entry dropped to
-    /// keep it within `cap` (the oldest), if any. An id already queued is
-    /// not added twice.
+    /// keep it within `cap` (the oldest), if any.
     pub(crate) fn insert(&mut self, entry: Entry, cap: usize) -> Option<Entry> {
         let q = self.by_recipient.entry(entry.message.to).or_default();
-        if q.iter().any(|e| e.message.id == entry.message.id) {
-            return None;
-        }
         q.push_back(entry);
-        (q.len() > cap.max(1)).then(|| q.pop_front()).flatten()
+        (q.len() > cap).then(|| q.pop_front()).flatten()
     }
 
     /// Up to `max` messages for `to` not expired at `now_ms`, oldest first.
@@ -300,16 +288,10 @@ impl Queue {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The service
-// ---------------------------------------------------------------------------
-
 /// A host's push service: the queue, the checks, direct delivery, and the
 /// fetch side of the inbox ALPN. Shared (`Arc`) by the control socket's
 /// commands, the fetch handler and the expiry sweep.
 pub(crate) struct PushHost {
-    /// This host.
-    me: NodeId,
     /// Who decides who may receive: the host's signed state.
     host: Arc<ServicesHost>,
     /// `push.log_body`.
@@ -331,7 +313,7 @@ pub(crate) struct PushHost {
 impl std::fmt::Debug for PushHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PushHost")
-            .field("me", &self.me.hex())
+            .field("me", &self.host.me.hex())
             .field("log_body", &self.log_body)
             .finish_non_exhaustive()
     }
@@ -343,7 +325,6 @@ impl PushHost {
     pub(crate) fn from_state(host: Arc<ServicesHost>) -> Self {
         let log_body = host.config.push.as_ref().is_some_and(|p| p.log_body);
         Self {
-            me: host.me,
             host,
             log_body,
             queue: Mutex::new(Queue::default()),
@@ -436,15 +417,14 @@ impl PushHost {
         out
     }
 
-    /// Whether `node` may receive from this host at `now`: a member of the
-    /// current signed state, admitted by `push.allow` with its identity as
-    /// it stands. `Ok` names the principal and role; `Err` the reason, and
-    /// whether it is membership (not the push rule) that refused.
-    pub(crate) fn authorize(
+    /// Whether `node` may receive from this host at `now`
+    /// ([`ServicesHost::decide_push`]): `Ok` names the principal and the
+    /// role that admitted it, as an [`Entry`] records them.
+    fn authorize(
         &self,
         node: NodeId,
         now: i64,
-    ) -> std::result::Result<(Option<Principal>, Option<String>), (String, bool)> {
+    ) -> std::result::Result<(Option<Principal>, Option<String>), PushRefusal> {
         self.host
             .decide_push(node, now)
             .map(|(p, role)| (p, Some(role.as_str().to_string())))
@@ -499,7 +479,7 @@ impl PushHost {
         for to in self.recipients(&spec.to, now)? {
             let message = PushMessage {
                 id: PushId::generate(),
-                from: self.me,
+                from: self.host.me,
                 to,
                 subject: spec.subject.clone(),
                 body: spec.body.clone(),
@@ -508,7 +488,8 @@ impl PushHost {
             };
             let (principal, role) = match self.authorize(to, now) {
                 Ok(admitted) => admitted,
-                Err((reason, _)) => {
+                Err(refusal) => {
+                    let reason = refusal.to_string();
                     let entry = Entry {
                         message,
                         principal: None,
@@ -590,16 +571,13 @@ impl PushHost {
     /// which leave the queue and are recorded `delivered`. Re-checks
     /// authorization first: a recipient the signed state no longer holds
     /// loses its queue (recorded `denied`).
-    pub(crate) async fn deliver_direct(&self, to: NodeId) -> Result<Vec<PushId>> {
+    async fn deliver_direct(&self, to: NodeId) -> Result<Vec<PushId>> {
         let now = crate::clock::now_unix();
-        if let Err((reason, roster)) = self.authorize(to, now) {
-            if roster {
-                for e in self.with_queue(|q| q.purge(to)) {
-                    self.record(&e, PushOutcome::Denied, Some(reason.clone()))
-                        .await;
-                }
+        if let Err(refusal) = self.authorize(to, now) {
+            if let PushRefusal::NotAMember(reason) = &refusal {
+                self.drop_queue(to, reason).await;
             }
-            bail!("not delivering: {reason}");
+            bail!("not delivering: {refusal}");
         }
         let batch = self
             .queue
@@ -723,7 +701,7 @@ impl PushHost {
             Ok(state) => state,
             Err(e) => {
                 tracing::warn!("signed state unusable: {e:#}");
-                deny(&mut send, "responder configuration error").await;
+                deny(&mut send, HOST_MISCONFIGURED).await;
                 return Ok(());
             }
         };
@@ -741,16 +719,19 @@ impl PushHost {
         if let Some(token) = &id_token {
             let _ = self.host.identities.verify_token(caller, token, now).await;
         }
-        if let Err((reason, roster)) = self.authorize(caller, now) {
-            if roster {
+        match self.authorize(caller, now) {
+            Ok(_) => {}
+            Err(PushRefusal::NotAMember(reason)) => {
                 // Removed between the two reads of the state.
                 FETCH_STRANGERS.refused("inbox fetch", caller, &reason);
                 self.drop_queue(caller, &reason).await;
                 deny(&mut send, crate::host::gate::NOT_ADMITTED).await;
-            } else {
-                deny(&mut send, &format!("inbox fetch refused: {reason}")).await;
+                return Ok(());
             }
-            return Ok(());
+            Err(PushRefusal::Refused(reason)) => {
+                deny(&mut send, &format!("inbox fetch refused: {reason}")).await;
+                return Ok(());
+            }
         }
         drop(preauth);
         let Some(_slot) = self.fetch_slot(caller) else {
@@ -808,7 +789,7 @@ impl PushHost {
     }
 
     /// Record and drop what expired at `now_ms`.
-    pub(crate) async fn sweep(&self, now_ms: i64) {
+    async fn sweep(&self, now_ms: i64) {
         let expired = {
             let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
             let gone = q.expire(now_ms);
@@ -888,10 +869,6 @@ impl iroh::protocol::ProtocolHandler for PushFetch {
         })
     }
 }
-
-// ---------------------------------------------------------------------------
-// `wires push`
-// ---------------------------------------------------------------------------
 
 /// `wires push --to <node|role> --subject S [--ttl D] [-- body…]`.
 #[derive(Args, Clone, Debug)]
@@ -1070,7 +1047,7 @@ mod tests {
         }
     }
 
-    /// A push host (4) of the fabric rooted at 1, whose state lists 2 as a
+    /// A push host (4) of the network rooted at 1, whose state lists 2 as a
     /// member, logging to an in-memory sink. (No service or role is needed:
     /// these tests stop at membership, and `serve` isn't preflighted.)
     fn push_host() -> (Arc<PushHost>, mpsc::Receiver<AuditRecord>) {
@@ -1220,12 +1197,27 @@ mod tests {
         assert_eq!(q, Queue::default());
     }
 
-    #[test]
-    fn the_queue_survives_a_round_trip_through_its_file() {
-        let mut q = Queue::default();
-        q.insert(entry(node(2), 1, 100), 8);
-        let back: Queue = serde_json::from_str(&serde_json::to_string(&q).unwrap()).unwrap();
-        assert_eq!(back, q);
+    /// What a host queued is in its queue file (`0600`), and a host started
+    /// on that file (a restart) holds it again.
+    #[tokio::test]
+    async fn the_queue_survives_a_round_trip_through_its_file() {
+        let (push, _records) = push_host();
+        let path = crate::testutil::temp_dir().join(QUEUE_FILE);
+        let host = || PushHost::from_state(Arc::clone(&push.host)).persisted_queue(path.clone());
+        let before = host();
+        let (a, b) = (entry(node(2), 1, 100), entry(node(3), 2, 100));
+        before.with_queue(|q| q.insert(a.clone(), 8));
+        before.with_queue(|q| q.insert(b.clone(), 8));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let after = host().queue.into_inner().unwrap();
+        assert_eq!(after.pending(node(2), 0, 8), [a.message]);
+        assert_eq!(after.pending(node(3), 0, 8), [b.message]);
+        assert_eq!(after, before.queue.into_inner().unwrap());
     }
 
     #[test]
