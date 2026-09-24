@@ -9,16 +9,19 @@
 //! |---|---|
 //! | `publish {head, items}` | `published {version}`: the version it now holds |
 //! | `head {}` | `head {head, fresh}` |
-//! | `slice {have, roles}` | `slice {slice, fresh}`, or `current {fresh}` when `have` is the newest |
-//! | `view {have, query?}` | `view {view, fresh}`, or `current {fresh}` |
+//! | `slice {have, roles}` | `slice_update {update, fresh}` from `have`; `slice {slice, fresh}` when `have` is 0 or no longer kept; `current {fresh}` when `have` is the newest |
+//! | `view {have, query?}` | `view_update`, `view` or `current` the same way (a `query` always gets a whole `view`) |
 //! | `resolve {service}` | `view {view, fresh}` holding that service, or none |
 //! | anything refused | `denied {reason}` |
 //!
 //! **`wires/directory-sub/1`**: the dialer sends `hello` then
 //! [`SubRequest::Subscribe`], and the directory streams [`SubFrame`]s: the
-//! subscriber's whole part (`slice`, `view`, or for another directory the
-//! whole `replica`) whenever its part changes under a new head, a `fresh`
-//! every beat, or a terminal `denied`.
+//! subscriber's whole part first (`slice`, `view`, or for another directory
+//! the whole `replica`), then a `slice_update` / `view_update` (or a new
+//! `replica`) for every new head, a `fresh` every beat, or a terminal
+//! `denied`. A subscriber that can't apply an update (see
+//! [`Slice::apply`](crate::Slice::apply)) subscribes anew with `have: 0` and
+//! gets its whole part.
 //!
 //! As with [`crate::sync`], the caller is always the iroh-authenticated key,
 //! never a field. Frames are a 4-byte big-endian length then canonical JSON
@@ -48,7 +51,7 @@ use crate::head::SignedPolicyHead;
 use crate::idp::IdToken;
 use crate::item::Item;
 use crate::membership::Membership;
-use crate::parts::{Slice, View};
+use crate::parts::{Slice, SliceUpdate, View, ViewUpdate};
 use crate::registry::ServiceName;
 use crate::role::RoleName;
 use crate::signed_policy::SignedPolicy;
@@ -149,10 +152,24 @@ pub enum DirectoryAnswer {
         /// The directory's `Fresh` for its head.
         fresh: Fresh,
     },
+    /// What moves the dialer's slice (at its `have`) to the newest head.
+    SliceUpdate {
+        /// The update.
+        update: SliceUpdate,
+        /// The directory's `Fresh` for its head.
+        fresh: Fresh,
+    },
     /// A caller's view (or, for `resolve`, the one-entry or empty view).
     View {
         /// The view.
         view: View,
+        /// The directory's `Fresh` for its head.
+        fresh: Fresh,
+    },
+    /// What moves the dialer's view (at its `have`) to the newest head.
+    ViewUpdate {
+        /// The update.
+        update: ViewUpdate,
         /// The directory's `Fresh` for its head.
         fresh: Fresh,
     },
@@ -205,17 +222,33 @@ pub enum SubRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SubFrame {
-    /// The subscriber's slice under a new head.
+    /// The subscriber's whole slice: the first sync, or after an update it
+    /// couldn't apply.
     Slice {
         /// The whole slice.
         slice: Slice,
         /// The `Fresh` for its head.
         fresh: Fresh,
     },
-    /// The subscriber's view under a new head.
+    /// A new head for a subscriber holding a slice: the changes and one
+    /// proof over its whole resulting slice.
+    SliceUpdate {
+        /// The update.
+        update: SliceUpdate,
+        /// The `Fresh` for its head.
+        fresh: Fresh,
+    },
+    /// The subscriber's whole view (first sync, or after a failed update).
     View {
         /// The whole view.
         view: View,
+        /// The `Fresh` for its head.
+        fresh: Fresh,
+    },
+    /// A new head (or new marks) for a subscriber holding a view.
+    ViewUpdate {
+        /// The update.
+        update: ViewUpdate,
         /// The `Fresh` for its head.
         fresh: Fresh,
     },

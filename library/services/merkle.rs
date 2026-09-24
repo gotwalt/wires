@@ -166,6 +166,95 @@ impl InclusionProof {
     }
 }
 
+/// Sibling hashes of a [`MultiProof`], in the order its check consumes them
+/// (level by level from the leaves, left to right). Travels as one base64url
+/// string like [`ProofPath`], without its depth cap: the frame limit bounds
+/// it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ProofHashes(Vec<ItemsRoot>);
+
+impl ProofHashes {
+    /// The hashes, in the order they are consumed.
+    pub fn hashes(&self) -> &[ItemsRoot] {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ProofHashes {
+    type Error = Error;
+    /// Decode the base64url string; [`Error::BadLength`] unless it is whole
+    /// hashes.
+    fn try_from(s: String) -> Result<Self> {
+        todo!("ProofHashes::try_from {s}")
+    }
+}
+
+impl From<ProofHashes> for String {
+    fn from(p: ProofHashes) -> String {
+        todo!("ProofHashes into String {p:?}")
+    }
+}
+
+/// A run of consecutive leaves: `start`, `start + 1`, … `start + len - 1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeafRange {
+    /// The first leaf's index.
+    pub start: u64,
+    /// How many leaves (at least one).
+    pub len: u64,
+}
+
+/// One proof for a set of leaves under one root: which leaves (as ascending,
+/// non-touching [`LeafRange`]s, so a contiguous run like a fabric's bans
+/// costs one entry) and the sibling hashes the set doesn't determine itself,
+/// each sent once. A contiguous run of `k` leaves costs about `2·log n`
+/// hashes; `k` scattered leaves about `k·(log n − log k)`.
+///
+/// Like an [`InclusionProof`], it is bound to positions in one tree: the
+/// sides come from the indices and the head's `item_count`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MultiProof {
+    /// The proved leaves' indices.
+    pub leaves: Vec<LeafRange>,
+    /// The sibling hashes.
+    pub hashes: ProofHashes,
+}
+
+impl MultiProof {
+    /// The proved indices, ascending. [`Error::BadProof`] if the ranges are
+    /// empty, out of order, touching or overlapping, or name more than
+    /// `count` leaves (checked before anything is expanded).
+    pub fn indices(&self, count: u64) -> Result<Vec<u64>> {
+        todo!("MultiProof::indices {count}")
+    }
+
+    /// Check that `leaves` (one hash per proved index, in index order) are
+    /// exactly those leaves of the tree with `root` and `count` leaves.
+    /// [`Error::BadProof`] otherwise: a changed leaf, a changed, missing or
+    /// extra hash, another root or count, or a leaf count that doesn't match
+    /// the ranges. No leaves and no hashes proves nothing and passes.
+    pub fn verify(&self, leaves: &[ItemHash], root: ItemsRoot, count: u64) -> Result<()> {
+        todo!("MultiProof::verify {} {root} {count}", leaves.len())
+    }
+
+    /// [`verify`](Self::verify) over the items' leaf hashes.
+    pub fn verify_items<'a>(
+        &self,
+        items: impl IntoIterator<Item = &'a Item>,
+        root: ItemsRoot,
+        count: u64,
+    ) -> Result<()> {
+        let leaves = items
+            .into_iter()
+            .map(ItemHash::of)
+            .collect::<Result<Vec<_>>>()?;
+        self.verify(&leaves, root, count)
+    }
+}
+
 /// A built tree: every level, so proofs are cheap after one `O(n)` build.
 #[derive(Clone, Debug)]
 pub struct ItemTree {
@@ -214,6 +303,13 @@ impl ItemTree {
             Some(root) => *root,
             None => ItemsRoot(*blake3::hash(b"").as_bytes()),
         }
+    }
+
+    /// One [`MultiProof`] for the leaves at `indices`, which must be strictly
+    /// ascending and in range (else `None`). Each sibling hash is sent once,
+    /// and none that the proved leaves themselves determine.
+    pub fn prove_many(&self, indices: &[u64]) -> Option<MultiProof> {
+        todo!("ItemTree::prove_many {indices:?}")
     }
 
     /// The proof for leaf `index`, or `None` past the last leaf.
