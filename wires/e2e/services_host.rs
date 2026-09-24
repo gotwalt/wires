@@ -225,7 +225,6 @@ impl Host {
             w.host.node_id(),
             w.membership(&w.host),
             Arc::clone(&keystore),
-            &home,
             config,
         )?;
         host.preflight(crate::now_unix())?;
@@ -563,7 +562,6 @@ async fn an_unassigned_service_refuses_to_start() {
         w.host.node_id(),
         w.membership(&w.host),
         Arc::new(Keystore::at(home.clone())),
-        &home,
         w.host_json(SERVICES, false),
     )
     .unwrap();

@@ -145,15 +145,21 @@ Frames are length-prefixed canonical JSON tagged by `type`, at most 4 MiB
   local copy only.
 - **Handshake.** A host whose state is newer than the version in a caller's `Hello` hands it back in
   `HelloAck.newer_state` (§5); the caller adopts it before sending stdin.
-- **The responder** (`StateResponder`, on every `serve`). A held copy that has expired vouches for
-  nobody. To an `offer`, it requires the dialer to be a member of the fresh held copy or of the
-  (verified) offered one, then runs `adopt_if_newer`. Adopted: it marks its copy checked and
-  answers `have`. Not adopted (older, equal, or refused): it answers `have` only if the dialer is a
-  member of its fresh held copy, else `denied`, and does **not** mark its copy checked, so a removed
-  member replaying its old, still-fresh state can't stop the host pulling the newer one. To a
-  `have`, it requires a fresh held copy (else `denied`: an expired state is never served) with the
-  dialer a member, and answers `offer` when it holds a newer one, else `have`. Anything else is
-  `denied`.
+- **The responder** (`StateResponder`, on every `serve`). Any key can dial it, so it serves at
+  most 16 exchanges at once (one more is closed unanswered) and sizes no buffer from a length
+  prefix: a frame over 4 KiB must open as an `offer` (`{"state":`, checked before the rest is
+  read), and nothing is over 4 MiB. A held copy that has expired vouches for nobody, and a dialer
+  it doesn't list hears only `not admitted to this fabric` (no version, not whether the copy
+  expired; the detail is traced, throttled). To an `offer` from a member of the fresh held copy it
+  runs `adopt_if_newer`. Adopted: it marks its copy checked and answers `have`. Not adopted
+  (older or equal): it answers `have` and does **not** mark its copy checked, so a removed member
+  the copy still lists, replaying its old, still-fresh state, can't stop the host pulling the
+  newer one. An `offer` from anyone else is taken only if it vouches for the dialer (a host whose
+  copy expired or predates the dialer, catching up): the free checks first (this fabric, strictly
+  newer than the held copy, fresh, listing the dialer), and only then the signature, once, by
+  `adopt_if_newer`. To a `have`, the dialer must be a member of the held copy; then an expired copy
+  is refused as expired (never served), and otherwise it answers `offer` when it holds a newer one,
+  else `have`.
 
 A node never adopts an older or unverifiable state, so a lying peer can only fail to help. A host
 that was offline when a service was assigned to it catches up at `serve` start from another host,
@@ -204,7 +210,9 @@ Every refusal from step 3 on (the caller is a member) is logged as an `AuditReco
 The host then appends the call's `Started` to its call log and `fsync`s it (§8) — if it can't, the
 call is refused (`this host can't record calls right now…`) and nothing runs — sends `HelloAck`
 (with `newer_state` when the caller's `state_version` is older) and execs the service's fixed argv
-**with the caller's argv appended element by element, never through a shell**, in its `cwd`. The
+**with the caller's argv appended element by element, never through a shell** (after a `--` when
+the service sets `end_of_options` in `host.json`, so a CLI that honours `--` takes none of the
+caller's arguments as an option; it doesn't help a CLI that ignores `--`), in its `cwd`. The
 child's environment is built from nothing (`env_clear`): only `PATH`, `LANG` and `LC_*` are
 inherited from `serve`; then `host.json`'s `env`; then the server-derived `WIRES_CALLER_NODE`,
 `WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_AFTER`, `WIRES_STATE_VERSION`, `WIRES_SERVICE`,
@@ -213,11 +221,14 @@ inherited from `serve`; then `host.json`'s `env`; then the server-derived `WIRES
 call's id before the child starts. The child never gets `WIRES_HOME`, `HOME`, agent sockets or
 cloud credentials. If the connection closes, the host kills the child.
 
-The child still runs as `serve`'s own Unix user, so a service a caller can steer into reading or
-writing files can reach whatever that user can, the host's keystore included. **Run services as a
-separate Unix user** (for example, a `command` of `["sudo", "-u", "svc", "--", "tool"]`). `wires`
-does not switch users itself, and a service running as another user can't reach the child socket
-(§7, a 0700 directory) until the operator opens that directory to it. Independently of that, the host fails closed on the parts of its
+The child still runs as `serve`'s own Unix user. It is told neither `WIRES_HOME` nor where the
+operator socket is (its push socket lives outside the keystore, §7), but it can still find the
+keystore at its default path, so a service a caller can steer into reading or writing files can
+reach whatever that user can, the host's keystore and operator socket included. That is accepted
+for now: isolating services is left open (a rootless microVM is the likely answer). Until then,
+**run services as a separate Unix user** (for example, a `command` of `["sudo", "-u", "svc", "--",
+"tool"]`). `wires` does not switch users itself, and a service running as another user can't reach
+the child socket (§7, a 0700 directory) until the operator opens that directory to it. Independently of that, the host fails closed on the parts of its
 keystore a child could tamper with: it keeps the highest state version it has decided under in
 memory and refuses to decide under an older `state.json` (`responder configuration error`, logged
 as a rollback), and it trusts only issuer keys it fetched itself (§6).
@@ -280,7 +291,8 @@ to a caller, addressed **by key**. Frames are length-prefixed canonical JSON tag
 so it may be at most 64 KiB. Two ways a message is delivered:
 
 - **Direct:** the host dials the recipient (3 s budget). A running `wires inbox --wait` serves the
-  inbox ALPN and accepts `deliver` only from a member its signed state names as a **host**.
+  inbox ALPN and accepts `deliver` only from a member its signed state names as a **host**; any
+  other dialer hears only `not admitted to this fabric` (the reason is traced, throttled).
 - **Fetch:** `wires inbox` dials the hosts of every service it may call (`hello` with its stored ID
   token, `fetch` held open for up to 25 s, `deliver`, then `ack`).
 
@@ -304,9 +316,13 @@ most 7 d. Each milestone is an `AuditRecord::Push`.
 `wires/host/control.rs`), each mode 0600 in a 0700 directory that the server and the operator's
 client both check is owned by `geteuid()`:
 
-- **The operator socket**, `run/serve.sock`: `{"push":{to, subject, body, ttl_secs?}}` to any node
-  or role. A service child is not told where it is.
-- **The child socket**, `child/push.sock`: a service pushing back to **its own caller**. With a
+- **The operator socket**, `run/serve.sock` in the keystore: `{"push":{to, subject, body,
+  ttl_secs?}}` to any node or role. A service child is not told where it is (though one running as
+  the host's user can find it at the keystore's default path, §5).
+- **The child socket**, `push.sock` in a private `wires-<16 random hex>` directory (0700) that
+  `serve` makes at start, outside the keystore, under `$XDG_RUNTIME_DIR` (else the temp dir, else
+  `/tmp`), and removes at exit; so `WIRES_PUSH_SOCKET` names neither `WIRES_HOME` nor the operator
+  socket. It carries a service pushing back to **its own caller**. With a
   `push` section in `host.json`, for every call `serve` mints a random 32-byte token (64 hex) and gives the child `WIRES_PUSH_SOCKET` and
   `WIRES_PUSH_TOKEN`; `wires push` sees the token and sends `{"caller_push":{token, push}}` (no
   keystore needed). The socket accepts it only for a live token and only with `to` equal to that
@@ -347,7 +363,9 @@ members of the state are traced, not logged (§5), so no one outside the fabric 
 **The record stream** (`wires/records/1`, `wires/host/record_stream.rs`): length-prefixed JSON
 frames. The reader sends `open {hello, services, since?, mine, follow}`. The host checks membership
 first: a reader that isn't a current member gets `denied` with the fixed text `not admitted to this
-fabric` and nothing else. Otherwise it answers `granted {scopes, tip?, first?}`: per requested service
+fabric` and nothing else (the detail is traced, throttled). Before it has decided, it reads an
+`open` of at most 64 KiB, sizes no buffer from a length prefix, and holds at most 16 undecided
+readers (one more is closed unanswered). Otherwise it answers `granted {scopes, tip?, first?}`: per requested service
 assigned here, `all` when the reader's verified principal is in one of the service's `readers` roles
 and it didn't ask for `mine`, else `mine`; `tip` is the log's newest `{seq, hash}` and `first` the
 oldest seq it still holds. Then `batch`es of items after `since`, `caught_up`, and with `follow` more
@@ -404,7 +422,9 @@ Nothing is broadcast: a record's content leaves a host only when a reader asks f
 | `call-log.jsonl`, `push-queue.json` | — | host | §8, §7 |
 | `jwks/` | — | caller | cached issuer keys (a host never reads it, §6) |
 | `run/serve.sock`, `run/hint` | 0600 | host | the operator's push socket; this host's own hint line |
-| `child/push.sock` | 0600 | host | the child socket for a call's push capability (§7) |
+
+The child socket for a call's push capability is not in the keystore: it lives in a private
+directory `serve` makes per run (§7).
 
 A host's keystore must not hold `root.seed`: `wires serve` refuses to start from the admin's
 keystore. Run the host from its own (`WIRES_HOME=<dir> wires id`, invite that node, join there).

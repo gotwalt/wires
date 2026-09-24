@@ -472,6 +472,9 @@ fn civil(days: i64) -> (i64, i64, i64) {
 // The receiver (inside `wires inbox --wait`)
 // ---------------------------------------------------------------------------
 
+/// Refusals of peers that may not deliver here (see [`transport::Throttle`]).
+static STRANGERS: transport::Throttle = transport::Throttle::new();
+
 /// The inbox ALPN on a waiting caller: accepts deliveries from hosts.
 ///
 /// A delivery is accepted only from a peer that proves fabric membership
@@ -499,7 +502,8 @@ impl std::fmt::Debug for InboxReceiver {
 
 impl InboxReceiver {
     /// Whether `peer` may deliver here: a member, and a host in this node's
-    /// signed state. `Err` is the reason it is told.
+    /// signed state. `Err` is why not, for this node's trace only: the peer
+    /// hears just [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED).
     pub(crate) fn admit(
         &self,
         peer: NodeId,
@@ -513,9 +517,8 @@ impl InboxReceiver {
             .ok_or("this node holds no signed state")?;
         if !state.state.is_host(peer) {
             return Err(format!(
-                "{} is not a host in the signed state (version {}); this inbox takes pushes \
-                 from hosts only",
-                &peer.hex()[..8],
+                "not a host in the signed state (version {}); this inbox takes pushes from \
+                 hosts only",
                 state.state.version.0
             ));
         }
@@ -536,9 +539,9 @@ impl InboxReceiver {
                     bail!("a peer spoke out of turn");
                 }
             };
-        if let Err(reason) = self.admit(peer, &membership, crate::now_unix()) {
-            tracing::warn!(peer = %peer.hex(), "refusing a push: {reason}");
-            deny(&mut send, &reason).await;
+        if let Err(detail) = self.admit(peer, &membership, crate::now_unix()) {
+            STRANGERS.refused("inbox delivery", peer, &detail);
+            deny(&mut send, crate::host::gate::NOT_ADMITTED).await;
             return Ok(());
         }
         let messages = match read_frame(&mut recv, FRAME_TIMEOUT).await? {
@@ -913,6 +916,62 @@ mod tests {
 
     fn mailbox() -> Mailbox {
         Mailbox::open(&crate::testutil::temp_dir()).unwrap()
+    }
+
+    /// Card 28 §9: a dialer that may not deliver here (a member that isn't
+    /// a host, or no member at all) hears only the fixed "not admitted", no
+    /// reason and no state version.
+    #[tokio::test]
+    async fn a_refused_deliverer_hears_only_not_admitted() {
+        let root = NodeIdentity::from_seed([1; 32]);
+        let (me, member, stranger) = (node(2), NodeIdentity::from_seed([3; 32]), node(4));
+        let home = crate::testutil::temp_dir();
+        let ks = Arc::new(Keystore::at(&home));
+        let mut s = library::State::new(root.node_id());
+        s.version = library::StateVersion(9);
+        s.not_after = i64::MAX;
+        s.members.extend([me, member.node_id()]);
+        let signed = s.sign(&root).unwrap();
+        crate::state::store::adopt_if_newer(&ks, &signed, root.node_id(), 10).unwrap();
+        let receiver = InboxReceiver {
+            me,
+            fabric: root.node_id(),
+            keystore: ks,
+            mailbox: Mailbox::open(&home).unwrap(),
+        };
+        let other_root = NodeIdentity::from_seed([5; 32]);
+        for (peer, membership) in [
+            (
+                member.node_id(),
+                Membership::mint(&root, member.node_id(), 0, i64::MAX).unwrap(),
+            ),
+            (
+                stranger,
+                Membership::mint(&other_root, stranger, 0, i64::MAX).unwrap(),
+            ),
+        ] {
+            let (mut dialer, host_side) = tokio::io::duplex(64 * 1024);
+            let (recv, send) = tokio::io::split(host_side);
+            write_frame(
+                &mut dialer,
+                &InboxFrame::Hello {
+                    membership,
+                    id_token: None,
+                },
+            )
+            .await
+            .unwrap();
+            receiver.serve(send, recv, peer).await.unwrap();
+            match read_frame(&mut dialer, Duration::from_secs(1))
+                .await
+                .unwrap()
+            {
+                Some(InboxFrame::Denied { reason }) => {
+                    assert_eq!(reason, crate::host::gate::NOT_ADMITTED)
+                }
+                other => panic!("expected a denial, got {other:?}"),
+            }
+        }
     }
 
     #[test]

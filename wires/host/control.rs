@@ -8,13 +8,14 @@
 //! - the **operator** socket, `$WIRES_HOME/run/serve.sock`
 //!   ([`host_socket`](crate::host::push::host_socket)): `{"push":…}` to any
 //!   node or role;
-//! - the **child** socket, `$WIRES_HOME/child/push.sock`
-//!   ([`child_socket`](crate::host::capability::child_socket)): only
+//! - the **child** socket, `push.sock` in a private directory made for each
+//!   `serve` outside the keystore
+//!   ([`ChildDir`](crate::host::capability::ChildDir)): only
 //!   `{"caller_push":{"token":…,"push":…}}`, which reaches only the caller of
 //!   the call that token was minted for
 //!   ([`capability`](crate::host::capability)).
 //!
-//! A home too deep for a unix socket path falls back to
+//! A home too deep for a unix socket path puts the operator socket at
 //! `$TMPDIR/wires-<uid>/<hash>.sock`, or the same under `/tmp`.
 //!
 //! ```text
@@ -34,8 +35,9 @@
 //! local user would be a push-as-this-host capability. The directory mode is
 //! the load-bearing half (it is set before the socket exists); the socket's
 //! own mode is set immediately after `bind`. A service child running as the
-//! same user could still open the operator socket if it went looking; only
-//! running services as another Unix user closes that.
+//! same user isn't told where the operator socket is, but could still find it
+//! (under the keystore's default path) and open it; only running services as
+//! another Unix user (or, later, in a microVM) closes that.
 //!
 //! # Stale sockets
 //!

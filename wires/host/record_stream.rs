@@ -66,7 +66,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use library::{
     AuditRecord, CLOCK_SKEW_SECS, CallId, ChainPoint, EntryHash, Hello, LogEntry, LogSeq, NodeId,
     Principal, ServiceName, StateVersion, check_inclusion, role_admits,
@@ -82,8 +82,8 @@ use super::transport;
 pub(crate) const ALPN: &[u8] = b"wires/records/1";
 
 /// The fixed refusal a reader that isn't a current member gets: nothing
-/// about why (the detail goes only to the host's own log).
-pub(crate) const NOT_ADMITTED: &str = "not admitted to this fabric";
+/// about why (the detail goes only to the host's trace). The session's.
+pub(crate) const NOT_ADMITTED: &str = super::gate::NOT_ADMITTED;
 
 /// The refusal a following reader gets when its ID token expires.
 pub(crate) const TOKEN_EXPIRED: &str =
@@ -91,6 +91,19 @@ pub(crate) const TOKEN_EXPIRED: &str =
 
 /// The largest frame either side accepts.
 const MAX_FRAME: usize = 16 * 1024 * 1024;
+
+/// The largest [`RecordFrame::Open`] the host reads, before it knows who is
+/// asking: a [`Hello`] (a membership and an ID token, a few KiB) plus the
+/// names of the services wanted here (at most 64 bytes each).
+pub(crate) const MAX_OPEN_FRAME: usize = 64 * 1024;
+
+/// How many readers may be undecided at once (connected, `Open` not yet
+/// read and authorized). Any key can connect; one more is closed
+/// unanswered. A decided stream no longer counts.
+pub(crate) const MAX_PREAUTH_READERS: usize = 16;
+
+/// Refusals of readers not known to be members (see [`transport::Throttle`]).
+static STRANGERS: transport::Throttle = transport::Throttle::new();
 
 /// How long the host waits for the reader's [`RecordFrame::Open`].
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -240,9 +253,19 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &RecordFram
     Ok(())
 }
 
-/// Read one frame; `None` at a clean end of stream. The length is checked
-/// before the body is allocated.
+/// Read one frame of at most [`MAX_FRAME`]; `None` at a clean end of
+/// stream. See [`read_frame_within`].
 pub(crate) async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<RecordFrame>> {
+    read_frame_within(r, MAX_FRAME).await
+}
+
+/// [`read_frame`], refusing a frame whose length prefix is over `max`. The
+/// prefix is the peer's claim, so nothing is sized from it: the buffer grows
+/// only as bytes arrive.
+pub(crate) async fn read_frame_within<R: AsyncRead + Unpin>(
+    r: &mut R,
+    max: usize,
+) -> Result<Option<RecordFrame>> {
     let mut len = [0u8; 4];
     match r.read_exact(&mut len).await {
         Ok(_) => {}
@@ -250,13 +273,18 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option
         Err(e) => return Err(e).context("reading a record frame"),
     }
     let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_FRAME {
-        bail!("record frame too large: {len} bytes (max {MAX_FRAME})");
+    if len > max {
+        bail!("record frame too large: {len} bytes (max {max})");
     }
-    let mut body = vec![0u8; len];
-    r.read_exact(&mut body)
+    let mut body = Vec::with_capacity(len.min(MAX_OPEN_FRAME));
+    (&mut *r)
+        .take(len as u64)
+        .read_to_end(&mut body)
         .await
         .context("reading a record frame body")?;
+    if body.len() != len {
+        bail!("truncated record frame");
+    }
     Ok(Some(
         serde_json::from_slice(&body).context("decoding a record frame")?,
     ))
@@ -426,14 +454,18 @@ pub(crate) async fn authorize(
     })?;
     let s = &state.state;
     if let Err(e) = check_inclusion(&hello.membership, host.trust_root, caller, now) {
-        tracing::info!(reader = %caller.hex(), "record stream: membership rejected: {e}");
+        STRANGERS.refused(
+            "record stream",
+            caller,
+            &format!("membership rejected: {e}"),
+        );
         return Err(NOT_ADMITTED.to_string());
     }
     if !s.is_member(caller) {
-        tracing::info!(
-            reader = %caller.hex(),
-            version = s.version.0,
-            "record stream: not a member of the current signed state"
+        STRANGERS.refused(
+            "record stream",
+            caller,
+            &format!("not a member of the signed state (version {})", s.version.0),
         );
         return Err(NOT_ADMITTED.to_string());
     }
@@ -472,20 +504,27 @@ pub(crate) async fn authorize(
     })
 }
 
-/// The record-stream ALPN on a v2 host.
+/// The record-stream ALPN on a v2 host. At most [`MAX_PREAUTH_READERS`]
+/// readers wait for a decision at once.
 #[derive(Clone, Debug)]
 pub(crate) struct RecordStream {
     /// The host (its signed state, identity verifier, trust root).
     host: Arc<ServicesHost>,
     /// The call log file.
     log: PathBuf,
+    /// Permits for readers not yet decided.
+    preauth: Arc<tokio::sync::Semaphore>,
 }
 
 impl RecordStream {
     /// Serve `host`'s call log (`$WIRES_HOME/call-log.jsonl`).
     pub(crate) fn new(host: Arc<ServicesHost>) -> Self {
         let log = host.keystore.path(call_log::LOG_FILE);
-        Self { host, log }
+        Self {
+            host,
+            log,
+            preauth: Arc::new(tokio::sync::Semaphore::new(MAX_PREAUTH_READERS)),
+        }
     }
 }
 
@@ -495,12 +534,29 @@ impl iroh::protocol::ProtocolHandler for RecordStream {
         conn: iroh::endpoint::Connection,
     ) -> std::result::Result<(), iroh::protocol::AcceptError> {
         let caller = transport::to_node_id(&conn.remote_id());
+        let Ok(permit) = Arc::clone(&self.preauth).try_acquire_owned() else {
+            STRANGERS.refused(
+                "record stream",
+                caller,
+                &format!("{MAX_PREAUTH_READERS} readers already await a decision"),
+            );
+            conn.close(1u32.into(), b"busy");
+            return Ok(());
+        };
         let result = async {
             let (send, recv) = conn.accept_bi().await.context("accepting a stream")?;
             let closed = conn.clone();
-            serve(send, recv, caller, &self.host, &self.log, async move {
-                closed.closed().await;
-            })
+            serve(
+                send,
+                recv,
+                caller,
+                &self.host,
+                &self.log,
+                Some(permit),
+                async move {
+                    closed.closed().await;
+                },
+            )
             .await
         }
         .await;
@@ -512,10 +568,14 @@ impl iroh::protocol::ProtocolHandler for RecordStream {
     }
 }
 
-/// Send `reason` as a [`RecordFrame::Denied`] and end the stream.
+/// Send `reason` as a [`RecordFrame::Denied`] and end the stream. A
+/// member's refusal is traced here; a stranger's ([`NOT_ADMITTED`]) was
+/// already traced, throttled, by [`authorize`].
 async fn deny<S: AsyncWrite + Unpin>(send: &mut S, caller: NodeId, reason: &str) {
     let reason = transport::truncate_reason(reason.to_string());
-    tracing::info!(reader = %caller.hex(), "record stream refused: {reason}");
+    if reason != NOT_ADMITTED {
+        tracing::info!(reader = %caller.hex(), "record stream refused: {reason}");
+    }
     let _ = write_frame(send, &RecordFrame::Denied { reason }).await;
     let _ = send.shutdown().await;
 }
@@ -529,24 +589,45 @@ fn granted(view: &View, entries: &[LogEntry]) -> RecordFrame {
     }
 }
 
-/// Serve one reader over a bi-stream: read its `Open`, authorize it, send the
-/// backlog after `since`, then (with `follow`) new entries until `gone`
-/// resolves or a write fails, re-authorizing it as the module docs say.
+/// Serve one reader over a bi-stream: read its `Open` (at most
+/// [`MAX_OPEN_FRAME`]), authorize it, send the backlog after `since`, then
+/// (with `follow`) new entries until `gone` resolves or a write fails,
+/// re-authorizing it as the module docs say. `preauth` (the reader's place
+/// among the undecided) is released once it is decided. A reader that
+/// fails before that is traced as a stranger, throttled.
 pub(crate) async fn serve<S, R>(
     mut send: S,
     mut recv: R,
     caller: NodeId,
     host: &ServicesHost,
     log: &Path,
+    preauth: Option<tokio::sync::OwnedSemaphorePermit>,
     gone: impl std::future::Future<Output = ()>,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let open = tokio::time::timeout(OPEN_TIMEOUT, read_frame(&mut recv))
-        .await
-        .map_err(|_| anyhow!("no open within {OPEN_TIMEOUT:?}"))??;
+    let open = match tokio::time::timeout(
+        OPEN_TIMEOUT,
+        read_frame_within(&mut recv, MAX_OPEN_FRAME),
+    )
+    .await
+    {
+        Ok(Ok(open)) => open,
+        Ok(Err(e)) => {
+            STRANGERS.refused("record stream", caller, &format!("{e:#}"));
+            return Ok(());
+        }
+        Err(_) => {
+            STRANGERS.refused(
+                "record stream",
+                caller,
+                &format!("no open within {OPEN_TIMEOUT:?}"),
+            );
+            return Ok(());
+        }
+    };
     let Some(RecordFrame::Open {
         hello,
         services,
@@ -555,12 +636,15 @@ where
         follow,
     }) = open
     else {
+        STRANGERS.refused("record stream", caller, "its first frame wasn't an open");
         let reason = "expected open".to_string();
         let _ = write_frame(&mut send, &RecordFrame::Denied { reason }).await;
-        bail!("a reader spoke out of turn");
+        return Ok(());
     };
     let decide = |now| authorize(host, caller, &hello, &services, mine, now);
-    let mut view = match decide(crate::now_unix()).await {
+    let decided = decide(crate::now_unix()).await;
+    drop(preauth);
+    let mut view = match decided {
         Ok(view) => view,
         Err(reason) => {
             deny(&mut send, caller, &reason).await;

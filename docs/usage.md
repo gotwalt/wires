@@ -435,7 +435,7 @@ For a stdio MCP client, the whole config is:
 |---|---|
 | `version` | Required, `2`. Unknown keys anywhere are an **error**. Version 1 (tools and roles decided by the host) is refused. |
 | `identity.issuers` | The IdPs whose ID tokens the host verifies, each with the OAuth client ids (`audiences`) it accepts **from that issuer**. |
-| `services` | Name → `command` (argv, no shell; each call's arguments are appended), optional `cwd`, optional `env` (no `WIRES_*` names), and `also_require`: roles from the state the caller must **also** be in (only narrows). Every name must be assigned to this host by the state. |
+| `services` | Name → `command` (argv, no shell; each call's arguments are appended), optional `cwd`, optional `env` (no `WIRES_*` names), `also_require`: roles from the state the caller must **also** be in (only narrows), and `end_of_options` (default `false`): put `--` between the command and the caller's arguments, so they can't be read as options by a CLI that honours `--` (it does nothing for one that doesn't). Every name must be assigned to this host by the state. |
 | `push` | Optional. `allow`: the roles (from the state) whose members may receive `wires push` from this host (none by default). `log_body`: also log each push's body (default `false`: subject only). |
 | `audit.otlp` | Optional. An OTLP/HTTP collector the call log is also exported to: `https://…`, or plain `http://` only to `localhost` / `127.0.0.1` / `[::1]`. |
 
@@ -453,12 +453,17 @@ a `push` section, the call's push capability (`WIRES_PUSH_SOCKET`,
 `WIRES_PUSH_TOKEN`). None of it is taken from the caller. The child gets no
 `WIRES_HOME`, `HOME`, agent sockets or cloud credentials.
 
-The child still runs as `serve`'s Unix user, so a service a caller can steer
-into reading or writing files reaches whatever that user can, the host's
-keystore included. **Run services as a separate Unix user** (e.g. a
-`command` of `["sudo", "-u", "svc", "--", "tool"]`). A service's fixed
+The child still runs as `serve`'s Unix user. It isn't told where the
+keystore is (its push socket is outside it), but it can find it at the
+default path, so a service a caller can steer into reading or writing files
+reaches whatever that user can, the host's keystore included. Isolating
+services is left open for now (a rootless microVM is the likely answer);
+until then, **run services as a separate Unix user** (e.g. a `command` of
+`["sudo", "-u", "svc", "--", "tool"]`). A service's fixed
 command must also be safe against any trailing arguments, including ones
-spelled like options (`gh api -X DELETE …`).
+spelled like options (`gh api -X DELETE …`). `"end_of_options": true` in
+`host.json` puts `--` before them, which settles it for CLIs that honour
+`--` and for no others.
 
 ### The keystore
 
@@ -480,7 +485,7 @@ since a host's control socket lives under it and socket paths are limited to
 | `tools.json` | `tools add`, the operator | Locked mode; optional aliases. |
 | `inbox/` | `inbox` | Pushed messages: `new/` unread (at most 256, oldest evicted with a note), `read/` the last 1024 (0700). |
 | `record-marks.json` | `watch` | Per host: the furthest verified entry (the anchor every view is checked against), where each view (services, `--mine`) resumes, and recent calls' services for labels. Delete it to start over after an alarm you have resolved. |
-| `call-log.jsonl`, `push-queue.json`, `run/`, `child/` | `serve` | A host's call log, undelivered pushes, the operator's control socket and own hint line, and the socket for services' per-call push capabilities. |
+| `call-log.jsonl`, `push-queue.json`, `run/` | `serve` | A host's call log, undelivered pushes, the operator's control socket and own hint line. (The socket for services' per-call push capabilities is outside the keystore, in a private directory `serve` makes per run.) |
 | `gateway-client-key`, `gateway-sessions.json` | `gateway` | The key DCR client ids are MAC'd with, and live web sessions keyed by token hash (0600). |
 
 Secrets resolve **flag → environment variable → `--…-file` → keystore**, so

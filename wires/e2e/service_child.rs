@@ -138,7 +138,6 @@ impl Host {
             w.host.node_id(),
             Membership::mint(&w.root, w.host.node_id(), 0, i64::MAX).unwrap(),
             Arc::clone(&keystore),
-            &home,
             w.host_json(),
         )
         .unwrap();
@@ -281,6 +280,28 @@ async fn a_child_gets_a_minimal_environment_and_a_push_capability() {
     let socket = PathBuf::from(&env["WIRES_PUSH_SOCKET"]);
     assert_ne!(socket, host_socket(&host.home), "not the operator's socket");
     assert!(socket.exists());
+    // Its path gives away neither the keystore nor the operator socket.
+    let home = host.home.canonicalize().unwrap();
+    let dir = socket.parent().unwrap().canonicalize().unwrap();
+    assert!(
+        !dir.starts_with(&home),
+        "{} is inside the keystore {}",
+        dir.display(),
+        home.display()
+    );
+    assert_ne!(
+        Some(dir.as_path()),
+        host_socket(&host.home)
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .as_deref()
+    );
+    for (key, value) in &env {
+        assert!(
+            !value.contains(home.to_str().unwrap()) && !value.contains(host.home.to_str().unwrap()),
+            "{key} names the keystore: {value}"
+        );
+    }
 }
 
 #[tokio::test]

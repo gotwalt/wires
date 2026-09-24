@@ -14,7 +14,7 @@
 //!   current"; a running `wires serve` does the same on a timer
 //!   ([`refresh_loop`]), and once at start when its preflight fails
 //!   ([`pull_now`]).
-//! - [`respond`] / [`StateResponder`]: the side a running host serves on the
+//! - [`StateResponder`] / [`answer`]: the side a running host serves on the
 //!   ALPN: answer a pull, adopt an offer.
 //!
 //! One bi-stream per exchange, one frame each way. Nothing is ever adopted
@@ -30,12 +30,16 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
-use library::{NodeId, NodeIdentity, STATE_ALPN, SignedState, StateFrame, StateVersion};
+use library::{
+    MAX_SMALL_STATE_FRAME, NodeId, NodeIdentity, OFFER_BODY_PREFIX, STATE_ALPN, SignedState,
+    StateFrame, StateVersion,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::store;
 use crate::admin::keystore::{self, Keystore};
-use crate::host::transport;
+use crate::host::gate::NOT_ADMITTED;
+use crate::host::transport::{self, Throttle};
 use crate::now_unix;
 
 /// How old a local copy may be before a cold command pulls.
@@ -49,6 +53,17 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a cold command spends pulling, all peers together.
 const COLD_PULL_BUDGET: Duration = Duration::from_secs(8);
+
+/// How many state exchanges a host serves at once. Any key can dial the
+/// state ALPN, and until its frame is read and answered nothing says it is
+/// a member, so this bounds what strangers can hold open: at most this many
+/// frames (each at most [`library::MAX_STATE_FRAME`], and only if the peer
+/// actually sends that much) and verifications. One more is closed
+/// unanswered.
+pub(crate) const MAX_STATE_EXCHANGES: usize = 16;
+
+/// Refusals of state-sync peers not known to be members.
+static STRANGERS: Throttle = Throttle::new();
 
 /// Which hosts took an offered state and which didn't.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -104,28 +119,51 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &StateFrame) -> Re
     w.write_all(&bytes).await.context("writing a state frame")
 }
 
-/// Read one frame within [`FRAME_TIMEOUT`]; the length prefix is checked
-/// before the body is allocated.
+/// Read one frame within [`FRAME_TIMEOUT`].
+///
+/// The length prefix is the peer's claim, so nothing is sized from it: the
+/// buffer grows only as bytes arrive. A frame over
+/// [`MAX_SMALL_STATE_FRAME`] must open with [`OFFER_BODY_PREFIX`] (only an
+/// offer carries a state), checked before the rest is read; over
+/// [`MAX_STATE_FRAME`] is refused from the prefix alone.
 async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<StateFrame> {
-    let read = async {
-        let mut prefix = [0u8; 4];
-        r.read_exact(&mut prefix)
-            .await
-            .context("reading a state frame")?;
-        let len = StateFrame::length(&prefix)?.unwrap_or(0);
-        let mut buf = prefix.to_vec();
-        buf.resize(4 + len, 0);
-        r.read_exact(&mut buf[4..])
-            .await
-            .context("reading a state frame body")?;
-        match StateFrame::decode(&buf)? {
-            Some((frame, _)) => Ok(frame),
-            None => bail!("truncated state frame"),
-        }
-    };
-    tokio::time::timeout(FRAME_TIMEOUT, read)
+    tokio::time::timeout(FRAME_TIMEOUT, read_frame_untimed(r))
         .await
         .map_err(|_| anyhow!("no state frame within {FRAME_TIMEOUT:?}"))?
+}
+
+/// [`read_frame`] without its deadline.
+async fn read_frame_untimed<R: AsyncRead + Unpin>(r: &mut R) -> Result<StateFrame> {
+    let mut prefix = [0u8; 4];
+    r.read_exact(&mut prefix)
+        .await
+        .context("reading a state frame")?;
+    let len = StateFrame::length(&prefix)?.unwrap_or(0);
+    let mut buf = Vec::with_capacity(4 + len.min(MAX_SMALL_STATE_FRAME));
+    buf.extend_from_slice(&prefix);
+    if len > MAX_SMALL_STATE_FRAME {
+        let mut head = [0u8; OFFER_BODY_PREFIX.len()];
+        r.read_exact(&mut head)
+            .await
+            .context("reading a state frame body")?;
+        if head != OFFER_BODY_PREFIX {
+            bail!(
+                "a {len}-byte state frame that isn't an offer (at most \
+                 {MAX_SMALL_STATE_FRAME} bytes)"
+            );
+        }
+        buf.extend_from_slice(&head);
+    }
+    let rest = (4 + len - buf.len()) as u64;
+    (&mut *r)
+        .take(rest)
+        .read_to_end(&mut buf)
+        .await
+        .context("reading a state frame body")?;
+    match StateFrame::decode(&buf)? {
+        Some((frame, _)) => Ok(frame),
+        None => bail!("truncated state frame"),
+    }
 }
 
 /// Dial `peer` by key, send `frame`, return its one answer.
@@ -414,86 +452,155 @@ pub(crate) async fn refresh_loop(endpoint: Endpoint, ks: Arc<Keystore>) {
 // The responder
 // ---------------------------------------------------------------------------
 
-/// Serve one incoming state-protocol connection: read one frame, answer it.
-///
-/// An expired held copy vouches for nobody. So:
-///
-/// - `Offer`: the dialer must be a member of the fresh held copy or of the
-///   (verified) offered one. The offer is run through `adopt_if_newer`
-///   (verified, fresh, strictly newer). Adopted: answered `Have` with the new
-///   version, and the copy is marked checked. Not adopted: answered `Have`
-///   only if the dialer is a member of the fresh held copy, else `Denied`,
-///   and the copy is **not** marked checked (a removed member re-offering
-///   its old state must not stop this node pulling the newer one).
-/// - `Have`: the held copy must exist and be fresh, and the dialer must be a
-///   member of it; answered with the held copy if it is newer, else `Have`.
-pub(crate) async fn respond(conn: Connection, ks: &Keystore) -> Result<()> {
-    let caller = transport::to_node_id(&conn.remote_id());
+/// Why [`answer`] refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// The dialer isn't known to be a member: it hears only
+    /// [`NOT_ADMITTED`] (no version, nothing about the held copy). The
+    /// detail is for this host's trace.
+    Stranger(String),
+    /// A member of the held copy: told why.
+    Member(String),
+}
+
+impl Refusal {
+    /// What the dialer is told.
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Refusal::Stranger(_) => NOT_ADMITTED.to_string(),
+            Refusal::Member(reason) => transport::truncate_reason(reason.clone()),
+        }
+    }
+}
+
+/// Serve one incoming state-protocol connection: read one frame, answer it
+/// (see [`answer`]). Strangers' refusals and failed reads are traced,
+/// throttled.
+async fn exchange_one(conn: &Connection, caller: NodeId, ks: &Keystore) -> Result<()> {
     let (mut send, mut recv) = conn.accept_bi().await.context("accepting a stream")?;
-    let frame = read_frame(&mut recv).await?;
+    let frame = match read_frame(&mut recv).await {
+        Ok(frame) => frame,
+        Err(e) => {
+            // Before anything says who this is: trace it like a stranger.
+            STRANGERS.refused("state sync", caller, &format!("{e:#}"));
+            return Ok(());
+        }
+    };
     let answer = answer(ks, caller, frame, now_unix());
     let result = match answer {
         Ok(reply) => write_frame(&mut send, &reply).await,
-        Err(reason) => {
-            let reason = transport::truncate_reason(reason);
+        Err(refusal) => {
+            match &refusal {
+                Refusal::Stranger(detail) => STRANGERS.refused("state sync", caller, detail),
+                Refusal::Member(reason) => {
+                    tracing::info!(peer = %caller.hex(), "state exchange refused: {reason}")
+                }
+            }
+            let reason = refusal.reason();
             write_frame(&mut send, &StateFrame::Denied { reason }).await
         }
     };
     send.finish().ok();
-    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
     result
 }
 
-/// The decision behind [`respond`], without the network: the reply, or the
-/// refusal reason.
+/// The decision behind [`exchange_one`], without the network: the reply, or the
+/// refusal.
+///
+/// Membership is checked first, and cheapest first: an expired held copy
+/// vouches for nobody, and anyone not known to be a member hears only
+/// [`NOT_ADMITTED`] (no version, no word on whether the copy expired).
+///
+/// - `Offer`, from a member of the fresh held copy: run through
+///   `adopt_if_newer` (verified, fresh, strictly newer). Adopted: answered
+///   `Have` with the new version, and the copy is marked checked. Not
+///   adopted: answered `Have`, and **not** marked checked (a removed member
+///   the held copy still lists, re-offering its old state, must not stop
+///   this node pulling the newer one). Refused: told why.
+/// - `Offer`, from anyone else: accepted only if the offer itself vouches
+///   for the dialer (a host whose copy expired, or missed the dialer's
+///   admission, catching up). The offer's own claims are checked first,
+///   for free: this fabric, strictly newer than the held copy, fresh, and
+///   listing the dialer. Only then is its signature verified (by
+///   `adopt_if_newer`, once): verifying means re-encoding a state of up to
+///   [`library::MAX_STATE_FRAME`] and an ed25519 check, so a stranger
+///   can't make this host do it with an offer that couldn't be adopted
+///   anyway. Adopted: `Have` and marked checked; anything else:
+///   [`NOT_ADMITTED`].
+/// - `Have`: the dialer must be a member of the held copy (else
+///   [`NOT_ADMITTED`]), and only then is it told when that copy has
+///   expired (an expired state is never served); answered with the held
+///   copy if it is newer, else `Have`.
 pub(crate) fn answer(
     ks: &Keystore,
     caller: NodeId,
     frame: StateFrame,
     now: i64,
-) -> std::result::Result<StateFrame, String> {
-    let fail = |e: anyhow::Error| format!("{e:#}");
+) -> std::result::Result<StateFrame, Refusal> {
+    let unreadable = |e: anyhow::Error| Refusal::Stranger(format!("{e:#}"));
     let root = store::fabric(ks)
-        .map_err(fail)?
-        .ok_or("this node is in no fabric")?;
-    let held = store::read(ks, root).map_err(fail)?;
+        .map_err(unreadable)?
+        .ok_or_else(|| Refusal::Stranger("this node is in no fabric".into()))?;
+    let held = store::read(ks, root).map_err(unreadable)?;
     // Membership counts only in a copy that is still fresh.
     let is_member = |s: &Option<SignedState>| {
         s.as_ref()
             .is_some_and(|s| s.check_fresh(now).is_ok() && s.state.is_member(caller))
     };
-    let not_a_member = || format!("{}… is not a member", &caller.hex()[..8]);
+    let not_listed = || format!("{}… is not a member of the held copy", &caller.hex()[..8]);
     let version = |s: &Option<SignedState>| s.as_ref().map_or(StateVersion(0), |s| s.state.version);
     match frame {
-        StateFrame::Offer { state } => {
-            let vouched = state.verify(root).is_ok() && state.state.is_member(caller);
-            if !is_member(&held) && !vouched {
-                return Err(not_a_member());
+        StateFrame::Offer { state } if !is_member(&held) => {
+            let offered = state.state.version;
+            let plausible = state.state.fabric == root
+                && offered > version(&held)
+                && state.check_fresh(now).is_ok()
+                && state.state.is_member(caller);
+            if !plausible {
+                return Err(Refusal::Stranger(format!(
+                    "{}, and its offer (version {}) can't vouch for it",
+                    not_listed(),
+                    offered.0
+                )));
             }
+            match store::adopt_if_newer(ks, &state, root, now) {
+                Ok(true) => {
+                    store::mark_checked(ks, now).map_err(unreadable)?;
+                    Ok(StateFrame::Have { version: offered })
+                }
+                Ok(false) => Err(Refusal::Stranger(format!(
+                    "{}, and its offer wasn't adopted",
+                    not_listed()
+                ))),
+                Err(e) => Err(Refusal::Stranger(format!(
+                    "{}, and its offer was refused: {e:#}",
+                    not_listed()
+                ))),
+            }
+        }
+        StateFrame::Offer { state } => {
             let adopted = store::adopt_if_newer(ks, &state, root, now)
-                .map_err(|e| format!("the offered state was refused: {e:#}"))?;
-            let held = store::read(ks, root).map_err(fail)?;
+                .map_err(|e| Refusal::Member(format!("the offered state was refused: {e:#}")))?;
+            let held = store::read(ks, root).map_err(unreadable)?;
             if adopted {
-                store::mark_checked(ks, now).map_err(fail)?;
+                store::mark_checked(ks, now).map_err(unreadable)?;
             } else if !is_member(&held) {
-                return Err(not_a_member());
+                // Another exchange replaced the copy meanwhile.
+                return Err(Refusal::Stranger(not_listed()));
             }
             Ok(StateFrame::Have {
                 version: version(&held),
             })
         }
         StateFrame::Have { version: theirs } => {
-            let Some(state) = held else {
-                return Err("this node holds no signed state".into());
+            let Some(state) = held.filter(|s| s.state.is_member(caller)) else {
+                return Err(Refusal::Stranger(not_listed()));
             };
             if state.check_fresh(now).is_err() {
-                return Err(format!(
+                return Err(Refusal::Member(format!(
                     "this node's signed state (version {}) has expired",
                     state.state.version.0
-                ));
-            }
-            if !state.state.is_member(caller) {
-                return Err(not_a_member());
+                )));
             }
             if state.state.version > theirs {
                 Ok(StateFrame::Offer { state })
@@ -503,14 +610,34 @@ pub(crate) fn answer(
                 })
             }
         }
-        StateFrame::Denied { .. } => Err("expected an offer or a have".into()),
+        StateFrame::Denied { .. } => Err(if is_member(&held) {
+            Refusal::Member("expected an offer or a have".into())
+        } else {
+            Refusal::Stranger(format!("{} (it sent a denied)", not_listed()))
+        }),
     }
 }
 
-/// [`respond`] as a router protocol on [`STATE_ALPN`], for a running
-/// host (`wires serve` mounts it; nothing else listens).
+/// [`exchange_one`] as a router protocol on [`STATE_ALPN`], for a running
+/// host (`wires serve` mounts it; nothing else listens). At most
+/// [`MAX_STATE_EXCHANGES`] run at once.
 #[derive(Clone)]
-pub(crate) struct StateResponder(pub(crate) Arc<Keystore>);
+pub(crate) struct StateResponder {
+    /// This host's keystore (its signed state).
+    ks: Arc<Keystore>,
+    /// Permits for exchanges in progress.
+    exchanges: Arc<tokio::sync::Semaphore>,
+}
+
+impl StateResponder {
+    /// Answer from the state in `ks`.
+    pub(crate) fn new(ks: Arc<Keystore>) -> Self {
+        Self {
+            ks,
+            exchanges: Arc::new(tokio::sync::Semaphore::new(MAX_STATE_EXCHANGES)),
+        }
+    }
+}
 
 impl std::fmt::Debug for StateResponder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -523,8 +650,21 @@ impl iroh::protocol::ProtocolHandler for StateResponder {
         &self,
         conn: Connection,
     ) -> std::result::Result<(), iroh::protocol::AcceptError> {
-        respond(conn, &self.0).await.map_err(|e| {
-            tracing::warn!("state exchange failed: {e:#}");
+        let caller = transport::to_node_id(&conn.remote_id());
+        let Ok(permit) = Arc::clone(&self.exchanges).try_acquire_owned() else {
+            STRANGERS.refused(
+                "state sync",
+                caller,
+                &format!("{MAX_STATE_EXCHANGES} state exchanges already in progress"),
+            );
+            conn.close(1u32.into(), b"busy");
+            return Ok(());
+        };
+        let result = exchange_one(&conn, caller, &self.ks).await;
+        drop(permit);
+        let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+        result.map_err(|e| {
+            tracing::warn!(peer = %caller.hex(), "state exchange failed: {e:#}");
             iroh::protocol::AcceptError::from_boxed(e.into())
         })
     }
@@ -616,7 +756,7 @@ mod tests {
         // The host already holds v2: the old offer is refused outright.
         let ks = member_ks(&root, &me, Some(&v2));
         let err = answer(&ks, removed, offer(&v1), 10).unwrap_err();
-        assert!(err.contains("not a member"), "{err}");
+        assert_eq!(err.reason(), NOT_ADMITTED, "{err:?}");
         assert!(store::is_stale(&ks, 10, STALE_AFTER_SECS));
 
         // The host missed v2: the removed member is still in its copy, so
@@ -660,12 +800,107 @@ mod tests {
         let offer = |s: &SignedState| StateFrame::Offer { state: s.clone() };
         assert_eq!(answer(&ks, peer, have(0), 50), Ok(offer(&v1)), "fresh");
         let err = answer(&ks, peer, have(0), 200).unwrap_err();
-        assert!(err.contains("expired"), "{err}");
+        assert!(err.reason().contains("expired"), "{err:?}");
         // An offer that isn't adopted is refused: nothing here vouches.
         assert!(answer(&ks, peer, offer(&v1), 200).is_err());
         // A fresh, newer state from a member of it is adopted.
         let v2 = signed(&root, 2, &[me.node_id(), peer]);
         assert_eq!(answer(&ks, peer, offer(&v2), 200), Ok(have(2)));
+    }
+
+    /// Card 28 §9: whoever isn't a member of the held copy hears only
+    /// "not admitted": no version, not whether the copy expired; a member of
+    /// an expired copy is told it expired.
+    #[test]
+    fn a_stranger_hears_only_not_admitted() {
+        let root = NodeIdentity::generate();
+        let (me, peer, outsider) = (
+            NodeIdentity::generate(),
+            NodeIdentity::generate().node_id(),
+            NodeIdentity::generate().node_id(),
+        );
+        let mut s = State::new(root.node_id());
+        s.version = StateVersion(7);
+        s.not_after = 100;
+        s.members.extend([me.node_id(), peer]);
+        let v7 = s.sign(&root).unwrap();
+        let ks = member_ks(&root, &me, Some(&v7));
+        let have = |v| StateFrame::Have {
+            version: StateVersion(v),
+        };
+        let offer = |s: &SignedState| StateFrame::Offer { state: s.clone() };
+        for now in [50, 200] {
+            for frame in [have(0), have(9), offer(&v7)] {
+                let err = answer(&ks, outsider, frame.clone(), now).unwrap_err();
+                assert!(
+                    matches!(err, Refusal::Stranger(_)),
+                    "{frame:?} at {now}: {err:?}"
+                );
+                assert_eq!(err.reason(), NOT_ADMITTED);
+            }
+        }
+        // A member of the (now expired) copy learns it expired.
+        let err = answer(&ks, peer, have(0), 200).unwrap_err();
+        assert_eq!(
+            err,
+            Refusal::Member("this node's signed state (version 7) has expired".into())
+        );
+        // A newer offer that doesn't list the stranger, or is stale, or is
+        // for another fabric, is refused before its signature matters.
+        let rogue = NodeIdentity::generate();
+        let mut other = State::new(rogue.node_id());
+        other.version = StateVersion(9);
+        other.not_after = i64::MAX;
+        other.members.insert(outsider);
+        let mut unlisted = State::new(root.node_id());
+        unlisted.version = StateVersion(9);
+        unlisted.not_after = i64::MAX;
+        for state in [other.sign(&rogue).unwrap(), unlisted.sign(&root).unwrap()] {
+            let err = answer(&ks, outsider, offer(&state), 50).unwrap_err();
+            assert_eq!(err.reason(), NOT_ADMITTED, "{err:?}");
+        }
+        assert_eq!(
+            store::read(&ks, root.node_id())
+                .unwrap()
+                .unwrap()
+                .state
+                .version,
+            StateVersion(7)
+        );
+    }
+
+    /// A frame over the small cap must say it's an offer in its first
+    /// bytes: a stranger announcing 4 MiB and then trickling (or sending
+    /// anything else) is refused at once, not held until the timeout.
+    #[tokio::test]
+    async fn a_large_frame_must_open_as_an_offer() {
+        let (mut w, mut r) = tokio::io::duplex(1024);
+        w.write_all(&(library::MAX_STATE_FRAME as u32).to_be_bytes())
+            .await
+            .unwrap();
+        w.write_all(br#"{"type":"have","#).await.unwrap();
+        // The writer stays open: the old reader would wait for 4 MiB.
+        let e = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut r))
+            .await
+            .expect("refused from the first bytes, not at the timeout")
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("isn't an offer"), "{e:#}");
+        drop(w);
+
+        // A real, large offer still reads, streamed in.
+        let root = NodeIdentity::generate();
+        let many: Vec<NodeId> = (0..200)
+            .map(|_| NodeIdentity::generate().node_id())
+            .collect();
+        let big = StateFrame::Offer {
+            state: signed(&root, 1, &many),
+        };
+        let bytes = big.encode().unwrap();
+        assert!(bytes.len() > MAX_SMALL_STATE_FRAME);
+        let (mut w, mut r) = tokio::io::duplex(512);
+        let writer = tokio::spawn(async move { w.write_all(&bytes).await });
+        assert_eq!(read_frame(&mut r).await.unwrap(), big);
+        writer.await.unwrap().unwrap();
     }
 
     /// The admin pushes to the hosts (and the hosts before the edit), never
@@ -777,7 +1012,7 @@ mod tests {
             );
             let router = serve.then(|| {
                 Router::builder(endpoint.clone())
-                    .accept(STATE_ALPN, StateResponder(Arc::clone(ks)))
+                    .accept(STATE_ALPN, StateResponder::new(Arc::clone(ks)))
                     .spawn()
             });
             (endpoint, router)
@@ -860,7 +1095,7 @@ mod tests {
             let router = Router::builder(endpoint.clone())
                 .accept(
                     STATE_ALPN,
-                    Counted(StateResponder(Arc::clone(ks)), Arc::clone(&count)),
+                    Counted(StateResponder::new(Arc::clone(ks)), Arc::clone(&count)),
                 )
                 .spawn();
             (endpoint, router, count)
@@ -948,6 +1183,37 @@ mod tests {
                 .unwrap();
             assert!(report.reached_no_host(), "{report:?}");
             assert_eq!(report.missed, vec![f.host.0.node_id()]);
+            admin_ep.close().await;
+        }
+
+        /// Card 28 §9: a host already serving [`MAX_STATE_EXCHANGES`]
+        /// exchanges closes one more unanswered; a freed permit serves again.
+        #[tokio::test]
+        async fn exchanges_beyond_the_cap_are_closed_unanswered() {
+            let f = fabric();
+            let book = MemoryLookup::new();
+            let admin_node = f.admin.read_node_identity().unwrap().unwrap();
+            let (admin_ep, _) = bind(&admin_node, &f.admin, &book, false).await;
+            let (host_ep, _) = bind(&f.host.0, &f.host.1, &book, false).await;
+            let responder = StateResponder::new(Arc::clone(&f.host.1));
+            let busy = Arc::clone(&responder.exchanges)
+                .acquire_many_owned(MAX_STATE_EXCHANGES as u32)
+                .await
+                .unwrap();
+            let _router = Router::builder(host_ep)
+                .accept(STATE_ALPN, responder)
+                .spawn();
+            let new = assign(&f);
+            let report = push_all(&admin_ep, &new, &[f.host.0.node_id()])
+                .await
+                .unwrap();
+            assert_eq!(report.missed, vec![f.host.0.node_id()], "{report:?}");
+            assert!(version(&f.host.1, f.root) < new.state.version);
+            drop(busy);
+            let report = push_all(&admin_ep, &new, &[f.host.0.node_id()])
+                .await
+                .unwrap();
+            assert_eq!(report.delivered, vec![f.host.0.node_id()], "{report:?}");
             admin_ep.close().await;
         }
 
