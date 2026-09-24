@@ -283,9 +283,39 @@ impl Policy {
         admits(self.roles.get(role).map(Vec::as_slice), principal)
     }
 
-    /// Whether `node` is banned at `now`.
+    /// Whether `node` is banned at `now` (`now <= until`). Same verdict as
+    /// [`State::is_banned`](crate::State::is_banned) on a pruned state: a ban
+    /// past its `until` cancels a badge that has expired anyway.
     pub fn is_banned(&self, node: NodeId, now: i64) -> bool {
         self.bans.get(&node).is_some_and(|b| b.holds(now))
+    }
+
+    /// Ban `node` until `until` (unix seconds); a node already banned keeps
+    /// the later of its two `until`s, as [`State::ban`](crate::State::ban).
+    ///
+    /// ```
+    /// use library::{NodeIdentity, Policy};
+    /// let mut p = Policy::new(NodeIdentity::from_seed([1u8; 32]).node_id());
+    /// let node = NodeIdentity::from_seed([2u8; 32]).node_id();
+    /// p.ban(node, 200);
+    /// p.ban(node, 100);
+    /// assert!(p.is_banned(node, 200));
+    /// assert_eq!(p.prune_bans(201), 1);
+    /// assert!(p.bans.is_empty());
+    /// ```
+    pub fn ban(&mut self, node: NodeId, until: i64) {
+        let ban = self.bans.entry(node).or_insert(Ban { until });
+        ban.until = ban.until.max(until);
+    }
+
+    /// Drop every ban whose `until` is before `now` (as
+    /// [`State::prune_bans`](crate::State::prune_bans): every admin edit
+    /// runs it, so the policy tracks recent removals, not every node ever
+    /// removed). Returns how many were dropped.
+    pub fn prune_bans(&mut self, now: i64) -> usize {
+        let before = self.bans.len();
+        self.bans.retain(|_, ban| ban.holds(now));
+        before - self.bans.len()
     }
 }
 
@@ -886,6 +916,39 @@ mod tests {
         assert!(p.is_banned(node(20), 500));
         assert!(!p.is_banned(node(20), 501));
         assert!(!p.is_banned(node(21), 0));
+    }
+
+    #[test]
+    fn bans_follow_the_state_rules() {
+        let mut p = sample();
+        p.ban(node(20), 400); // earlier: the later until (500) stays
+        assert_eq!(p.bans[&node(20)].until, 500);
+        p.ban(node(20), 700);
+        assert_eq!(p.bans[&node(20)].until, 700);
+        p.ban(node(21), 600);
+        assert_eq!(p.prune_bans(600), 0, "until is inclusive");
+        assert_eq!(p.prune_bans(601), 1);
+        assert!(p.is_banned(node(20), 700));
+        assert!(!p.bans.contains_key(&node(21)));
+
+        // The same verdicts as card 35's state.
+        let mut s = crate::State::new(root().node_id());
+        let mut q = Policy::new(root().node_id());
+        for (n, until) in [(1, 10), (2, 20), (1, 30), (3, 5)] {
+            s.ban(node(n), until);
+            q.ban(node(n), until);
+        }
+        for now in [0, 5, 6, 20, 21, 30, 31] {
+            let (mut s, mut q) = (s.clone(), q.clone());
+            assert_eq!(s.prune_bans(now), q.prune_bans(now), "at {now}");
+            for n in 1..=3 {
+                assert_eq!(
+                    s.is_banned(node(n)),
+                    q.is_banned(node(n), now),
+                    "{n} at {now}"
+                );
+            }
+        }
     }
 
     #[test]
