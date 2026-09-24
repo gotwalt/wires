@@ -585,3 +585,86 @@ Deliberately left:
 - `gateway/mod.rs` keeps its own "the gateway holds no signed state" lookups
   (different wording, and §B6's gateway items are that lane's).
 - `cargo doc` warnings (§D3) are unchanged by this phase; none are new.
+
+### Lane LIB
+
+`library/` items: §A1, A3, A4 (library half), A8 (library half), A10
+(library half), B8, C3 (session, invite), C5/C6/C7 (library wording), D2
+noise, and the optional `wait_ms`. `make lint` and `cargo test --workspace`
+pass; `cargo doc -p library` has no warnings.
+
+- **§A1.** `codec` tests run over a `#[derive(Serialize)]` struct declared
+  out of key order (and first assert that plain serde keeps declaration
+  order, so the fixture can't go vacuous); `invariant_to_input_key_order` is
+  now `invariant_to_input_map_order`, over two `HashMap`s built in opposite
+  orders. The `(memberships, heads)` wording is `(memberships, signed
+  states)`.
+- **§A8.** `OidcNonce::for_node` has a known-answer test (node `[0; 32]`);
+  the `for_node(na) == for_node(na)` line is gone from the proptest (now
+  `for_node_is_distinct_and_url_safe`) and the doctest. `mint_then_verify_ok`
+  no longer asserts the fields `mint` just set.
+- **§B8.** `verify_chain` calls `LogEntry::verify` (mapping its errors to
+  `BadSignature`/`Malformed`); `SignedState::verify` leaves the format check
+  to `validate`. Deleted: `library::version`, `Signature::from_bytes`,
+  `Chunk::len`/`is_empty`, `Principal::claims`, the serde derives on
+  `IdentityClaim`, `Retention::max_age`. Narrowed: `LogEntry::sign` (private),
+  `Retention::DEFAULT_DAYS` (private), `stdin_head` (private) and
+  `STDIN_HEAD_MAX` (`pub(crate)`); `stdin_head`'s doctest cases moved into
+  `stdin_head_caps_and_splits_on_a_char_boundary`. The test `invite_for`
+  returns its `root` instead of rebuilding it.
+- **§C3.** `session.rs`: the retired tag rows and "services-era (card 27)"
+  are gone ("any other tag is a `BadFrame`"). `invite.rs`: the channel-era
+  history is gone from `INVITE_V2`'s doc;
+  `garbage_and_old_tokens_are_refused` → `garbage_and_unknown_formats_are_refused`.
+- **§C5/C6/C7.** `SubjectMismatch`'s doc names its two real subjects
+  (membership member, invite state). Gone: "future delegation chain",
+  "or revocation", "no separate revocation list", "the Notes' example",
+  `{"type":"gossip"}` (now `subscribe`), role.rs's card history, and every
+  done-card reference in `library/` module docs (23, 26a, 26b, 27, 22, 13);
+  card 29 (open) and card 18 (open) stay. The example refusal reason is
+  "not a member of this network". "responder" is "host" throughout
+  `library/` docs. ("exposed tool" was already gone after phase 1.)
+- **§D2 noise.** No `serde(default)` on `idp.rs`'s private `Header`
+  `Option`s. **`wait_ms` is required** (protocol.md already shows
+  `fetch {wait_ms}`); a fetch without it is refused, which the shape test now
+  asserts.
+- **Also (sweep).** `state::validation_rules` asserted only `is_err()`; it now
+  checks each broken rule by its `InvalidState` text, and covers an undefined
+  `readers` role and an unknown `format`.
+
+Follow-through outside `library/` (kept small):
+
+- `claims: Default::default(),` removed where a `Principal` is built:
+  `wires/host/{otlp,audit,gate,identity,record_stream}.rs`,
+  `wires/gateway/{mod,sessions}.rs` (one line each).
+- `wires/host/call_log.rs` module doc: "Chosen over redb … (card 25)" is
+  now "A plain file fits because: … needs no database dependency" (§C6,
+  assigned to this lane).
+
+Deleted tests:
+
+- `session::retired_handshake_tags_are_bad_frames`: `unknown_tag_is_bad_frame` covers it (§A3).
+- `session::denied_reason_roundtrips` (proptest): the `roundtrips` proptest already generates every `Denied` reason.
+- `session::exit_roundtrips_negative`: the `roundtrips` proptest covers any `i32`.
+- `access::a_role_named_member_is_an_ordinary_role`: keeps the retired `member` role alive (§A4); undefined-role refusal is covered.
+- `access::listing_agrees_with_authorize` (proptest): restates `allowed_services`'s implementation.
+- `access::refusal_text_says_what_to_do`: repeats the "wires login" assert in `no_identity_no_role`.
+- `state::validation_rules`, the `member` block: same reason as above (§A4); the `ghost` role case covers it.
+- `role.rs` doctest lines for `member` (§A4).
+- `identity::from_seed_hex_roundtrips`: the `expose_seed_hex` proptest plus doctest cover the inverse.
+- `identity::node_id_hex_is_64_chars`: `node_id_serializes_as_hex_string` and the `generate` doctest pin the width.
+- `invoke::invocation_json_round_trips` (proptest): derive-only; the session `roundtrips` proptest carries every `Invoke`.
+- `audit::empty_hasher_is_the_digest_of_nothing`: the `OutputDigest::empty` doctest and the chunking proptest cover it.
+- `audit::finished_round_trips_with_and_without_stdin`: its round trip is the proptest's; its omission check lives on as `an_absent_stdin_head_is_omitted`.
+- `push::push_ids_round_trip` (proptest): derive-only (`hex_id!`).
+- `sync::have_round_trips` (proptest): `frames_round_trip` covers `Have`.
+- `idp`: the `p.claims[...]` asserts in the principal test went with the field.
+
+Seen red against a broken implementation, then restored: `sorts_keys_and_is_compact`
+and `invariant_to_input_map_order` (canonicalization skipped),
+`for_node_known_answer` (context changed), `mint_then_verify_ok` (wrong
+field signed), `validation_rules` (readers not checked; format not checked),
+`an_absent_stdin_head_is_omitted` (`skip_serializing_if` dropped),
+`a_fetch_and_a_deliver_have_the_documented_shape` (`wait_ms` defaulted),
+`stdin_head_caps_and_splits_on_a_char_boundary` (split char kept), and
+`an_unknown_version_does_not_verify` (`verify_chain`'s version mapping).
