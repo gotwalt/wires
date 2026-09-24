@@ -8,13 +8,13 @@
 //!   policy: which IdPs are trusted, which roles exist, which services run
 //!   where and who may call them, who is banned, which nodes are directories.
 //! - **directory** (`directory/`) — holds the newest policy and vouches for
-//!   its freshness; hosts and callers fetch from it. It never decides a
-//!   call (card 36).
+//!   its freshness; hosts fetch it whole, and each caller its view (the
+//!   services it may use, card 37). It never decides a call (card 36).
 //! - **host** (`host/`) — `wires serve`: implements the services the signed
 //!   policy assigns to it, checks every caller against that policy, and keeps
 //!   its own log of every call.
 //! - **caller** (`caller/`) — `wires login | services | call | mcp | inbox`:
-//!   runs remote CLIs by service name (`mcp` serves them as MCP over stdio,
+//!   holds only its view, and runs remote CLIs by service name (`mcp` serves them as MCP over stdio,
 //!   for the MCP clients people already use).
 //! - **gateway** (`gateway/`) — `wires gateway`: those services as a
 //!   remote MCP server with OAuth, for web clients (Claude.ai), each call
@@ -103,9 +103,9 @@ Host — implements the services assigned to it:
 
 Caller — runs remote CLIs by service name (every role joins the same way):
   id        Print this node's id: what you send the admin
-  join      Install the admin's invite token: membership and signed policy
-  login     Sign in with your IdP, binding this node's key to your identity
-  services  List the services you may call, and the role that lets you
+  join      Install the admin's invite token: badge, directories, IdP
+  login     Sign in with your IdP (as the invite says); fetch your view
+  services  List (or search) the services you may call: your view
   call      Run a service by name: stdio passes through, its exit code is ours
   mcp       Serve those services as MCP tools over stdio (Claude Desktop, IDEs)
   gateway   Serve them as a remote MCP server (HTTP + OAuth) for web users
@@ -169,14 +169,16 @@ enum Command {
     /// Print this node's id (creating its key on first use): what a joiner
     /// sends the admin.
     Id,
-    /// Install an invite token from `wires invite`: membership and the
-    /// signed policy. Without a token, print this node's id.
+    /// Install an invite token from `wires invite`: this node's badge, the
+    /// directory ids and the IdP to sign in with (a host's token also
+    /// carries the signed policy). Without a token, print this node's id.
     Join(caller::join::JoinArgs),
     /// Sign in with your IdP (OIDC), binding this node's key to your identity;
     /// the token is stored locally and presented when you call.
     Login(caller::login::LoginArgs),
-    /// List the services you may call (evaluated locally against the signed
-    /// policy), with what each does and the role that admits you.
+    /// List the services you may call (your view: the root-signed entries a
+    /// directory cut for your identity), with what each does and the roles
+    /// it allows; a query searches names and descriptions.
     Services(caller::services::ServicesArgs),
     /// Run a service by name: stdio passes through,
     /// its exit code becomes ours, a refusal exits 77.
@@ -324,7 +326,10 @@ pub fn run() {
             print_report(runtime().block_on(admin::propagate::state_cmd(a)))
         }
         Command::Id => print_or_exit(caller::join::id_cmd()),
-        Command::Join(a) => print_or_exit(caller::join::join_cmd(a)),
+        Command::Join(a) => {
+            init_quiet_logging();
+            print_or_exit(runtime().block_on(caller::join::join_cmd(a)))
+        }
         Command::Serve(a) => {
             if let Err(e) = runtime().block_on(host::serve::serve_cmd(a)) {
                 exit_with(e);
@@ -336,10 +341,7 @@ pub fn run() {
         }
         Command::Inbox(a) => {
             init_quiet_logging();
-            exit_with_code(runtime().block_on(async {
-                policy::fetch::refresh_cold().await;
-                caller::inbox::inbox_cmd(a).await
-            }))
+            exit_with_code(runtime().block_on(caller::inbox::inbox_cmd(a)))
         }
         Command::Login(a) => {
             if let Err(e) = runtime().block_on(caller::login::login_cmd(a)) {
@@ -348,10 +350,7 @@ pub fn run() {
         }
         Command::Call(a) => {
             init_quiet_logging();
-            exit_with_code(runtime().block_on(async {
-                policy::fetch::refresh_cold().await;
-                caller::call::call_cmd(a).await
-            }))
+            exit_with_code(runtime().block_on(caller::call::call_cmd(a)))
         }
         Command::Services(a) => {
             init_quiet_logging();
@@ -360,20 +359,14 @@ pub fn run() {
         Command::Tools(a) => print_or_exit(caller::tools::run_tools_cmd(a)),
         Command::Mcp(a) => {
             init_quiet_logging();
-            let served = runtime().block_on(async {
-                policy::fetch::refresh_cold().await;
-                caller::mcp::mcp_cmd(a).await
-            });
+            let served = runtime().block_on(caller::mcp::mcp_cmd(a));
             if let Err(e) = served {
                 exit_with(e);
             }
         }
         Command::Gateway(a) => {
             init_logging();
-            let served = runtime().block_on(async {
-                policy::fetch::refresh_cold().await;
-                gateway::gateway_cmd(a).await
-            });
+            let served = runtime().block_on(gateway::gateway_cmd(a));
             if let Err(e) = served {
                 exit_with(e);
             }

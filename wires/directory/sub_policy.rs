@@ -255,7 +255,9 @@ mod tests {
     }
 
     fn ask(dir: &Directory, have: u64) -> DirectoryAnswer {
-        let caller = NodeIdentity::from_seed([50u8; 32]).node_id();
+        // A directory the policy lists (card 37: only hosts and
+        // directories get the whole policy).
+        let caller = me().node_id();
         dir.answer(
             caller,
             DirectoryRequest::Policy {

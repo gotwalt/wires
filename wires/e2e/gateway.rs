@@ -15,7 +15,8 @@
 //! - [`a_user_the_state_admits_to_nothing_is_refused_at_sign_in`]
 //! - [`a_code_is_single_use_and_bound_to_its_client`]
 //!
-//! The backend is scripted: the signed policy is fixed in the test, and
+//! The backend is scripted: the signed policy is fixed in the test (each
+//! user's view is cut from it, as a directory would), and
 //! "dialing" records the tool and token. That the host admits exactly such
 //! a token is `services_host`'s job (a token nonce-bound to the dialing
 //! node, verified against the host's trusted issuer).
@@ -23,7 +24,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use library::{IdToken, IdentityClaim, OidcNonce, Policy};
+use library::{IdToken, IdentityClaim, OidcNonce, SignedPolicy, View};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use url::Url;
@@ -33,8 +34,9 @@ use crate::caller::jwks::KeyFetcher;
 use crate::caller::mock_idp::MockIdp;
 use crate::caller::tools::RemoteTool;
 use crate::gateway::clients::{ClientKey, MetadataFetcher};
+use crate::gateway::sessions::Session;
 use crate::gateway::sessions::Store;
-use crate::gateway::tests::{node, state_for};
+use crate::gateway::tests::{node, signed_for};
 use crate::gateway::{Backend, Gateway, PublicUrls, router};
 
 /// A form body (this reqwest is built without its `form` feature).
@@ -48,7 +50,7 @@ fn form(pairs: &[(&str, &str)]) -> String {
 type Seen = Arc<Mutex<Vec<(String, Vec<String>, IdToken)>>>;
 
 struct Scripted {
-    state: Policy,
+    state: SignedPolicy,
     seen: Seen,
 }
 
@@ -82,10 +84,13 @@ impl Caller for Recording {
 
 impl Backend for Scripted {
     type Caller = Recording;
-    fn state(&self) -> anyhow::Result<Policy> {
-        Ok(self.state.clone())
+    /// The view a directory would cut for the session's (verified) user.
+    async fn view(&self, session: &Session) -> anyhow::Result<Arc<View>> {
+        Ok(Arc::new(
+            self.state.view_for(Some(&session.principal), None),
+        ))
     }
-    fn caller(&self, token: IdToken) -> Recording {
+    fn caller(&self, token: IdToken, _view: Arc<View>) -> Recording {
         Recording {
             token,
             seen: Arc::clone(&self.seen),
@@ -123,7 +128,7 @@ impl Running {
             limiter: crate::gateway::RateLimit::new(10_000),
             trust_proxy: false,
             backend: Scripted {
-                state: state_for(idp.issuer.as_str()),
+                state: signed_for(idp.issuer.as_str()),
                 seen: Arc::clone(&seen),
             },
         });

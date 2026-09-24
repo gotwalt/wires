@@ -200,7 +200,7 @@ pub use idp::{
     Audience, CLOCK_SKEW_SECS, GOOGLE_ISSUER, IdToken, IdentityClaim, Issuer, Jwk, Jwks,
     OIDC_NONCE_CONTEXT, OidcNonce, Principal, verify_claim,
 };
-pub use invite::{INVITE_V3, Invite};
+pub use invite::{INVITE_MAX_DIRECTORIES, INVITE_V4, Invite, LoginSettings, PublicClientSecret};
 pub use invoke::{Argv, Invocation, MAX_ARGS, MAX_ARGV_BYTES};
 pub use item::{
     Ban, DEFAULT_BEAT_SECS, DEFAULT_FRESH_SECS, FreshnessMode, IssuerConfig, Item, ItemKey,

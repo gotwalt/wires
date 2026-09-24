@@ -36,9 +36,10 @@ a network path.
   being run has no auth code.
 - **Discovery by who you are.** An admin signs one registry: the services,
   the machines that run each, and the roles (matched on IdP identity, e.g.
-  `*@acme.com`) that may call each. `wires services` shows an agent only what
-  its person may call. The agent never names a machine, and a service with
-  two hosts keeps answering when one is down.
+  `*@acme.com`) that may call each. An agent's machine holds only its view,
+  the services its person may use, and `wires services` lists them. The
+  agent never names a machine, and a service with two hosts keeps answering
+  when one is down.
 - **Both directions.** The agent calls the host, and the host can message
   the agent later ("build 41 failed"), addressed by the agent's key, even
   when the agent isn't connected. A service does it with a push capability
@@ -83,7 +84,7 @@ workbench$ wires serve host.json
 
 # agent: sign in once, then call by name
 agent$ wires join <token>
-agent$ wires login                  # browser sign-in; client id from $WIRES_OIDC_CLIENT_ID
+agent$ wires login                  # browser sign-in; the invite named the IdP
 agent$ wires services
 orders-db  Read-only SQL over orders  (analyst)
 agent$ wires call orders-db -- "select count(*) from orders"
@@ -146,11 +147,11 @@ Waiting on a mock CI build, 5 runs per setup ([bench/push/REPORT.md](bench/push/
 
 It's a prototype (see the note at the top). The main limits:
 
-- Every machine holds the whole signed registry (every role's matchers, every
-  service and its hosts, every ban). It no longer lists members: a machine is
-  admitted by its root-signed badge. The redesign moves the registry to
-  directory nodes, so each machine holds only what it uses
-  ([docs/fabric.md](docs/fabric.md), cards 36–37).
+- An agent's machine holds only its view: the services its person may use,
+  each signed by the admin. But the hosts and directories hold the whole
+  signed registry (every role's matchers, every service and its hosts, every
+  ban; no member list), and a directory sees who asks for which view
+  ([docs/fabric.md](docs/fabric.md)).
 - Memberships and the registry expire (30 days by default) and don't renew
   on their own yet.
 - A host can withhold or truncate its own log; tampering and gaps are

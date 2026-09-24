@@ -20,6 +20,7 @@
 //!   `wires directory serve`.
 //! - [`sub_policy`] — a host's `policy` subscription: the whole policy
 //!   once, then a delta per new head, and a `fresh` beat (card 36c).
+//! - [`sub_view`] — a caller's `view` subscription (card 37).
 //! - [`wire`] — frame I/O, and [`ask`](wire::ask): one request to a
 //!   directory, for every other role.
 //!
@@ -33,6 +34,7 @@ pub mod db;
 pub mod node;
 pub mod serve;
 pub mod sub_policy;
+pub mod sub_view;
 pub mod wire;
 
 use anyhow::Result;

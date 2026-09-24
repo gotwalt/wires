@@ -5,13 +5,15 @@
 //! (`$WIRES_HOME/inbox/`, `0700`) one of two ways:
 //!
 //! - **fetched** by `wires inbox`: a bounded catch-up from every host of the
-//!   services this node may call (from its signed policy), after which the
-//!   host forgets what was acknowledged. The fetch presents this node's ID
-//!   token (`wires login`), which is how a host learns who it is for pushes
-//!   addressed to a role;
+//!   services in this node's view (card 37), after which the host forgets
+//!   what was acknowledged. The fetch presents this node's ID token (`wires
+//!   login`), which is how a host learns who it is for pushes addressed to a
+//!   role;
 //! - **pushed** while `wires inbox --wait` runs: it serves the inbox ALPN
-//!   ([`INBOX_ALPN`]) and accepts deliveries ([`InboxReceiver`]) from members
-//!   the signed policy names as hosts, besides long-polling each host.
+//!   ([`INBOX_ALPN`]) and accepts deliveries ([`InboxReceiver`]) only from
+//!   the hosts its view names, besides long-polling each host. It follows
+//!   its view meanwhile (a `view` subscription), so the hosts it asks and
+//!   admits follow grants and revocations.
 //!
 //! `wires inbox` then prints what is unread — one line per message, or
 //! `--json` — and marks it read. `--wait` blocks until a message arrives
@@ -48,9 +50,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use iroh::{Endpoint, EndpointAddr};
-use library::{
-    INBOX_ALPN, InboxFrame, MAX_BATCH, Membership, NodeId, NodeIdentity, PushId, PushMessage,
-};
+use library::{INBOX_ALPN, InboxFrame, MAX_BATCH, Membership, NodeId, PushId, PushMessage};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -459,16 +459,17 @@ static STRANGERS: transport::Throttle = transport::Throttle::new();
 /// The inbox ALPN on a waiting caller: accepts deliveries from hosts.
 ///
 /// A delivery is accepted only from a peer whose badge proves it is in this
-/// network and that this node's **signed policy names as a host**, which it
-/// doesn't ban (re-read per delivery). Each message must be from that peer
-/// and to this node.
+/// network and that **this node's view names as a host** of one of its
+/// services (card 37; re-read per delivery, and kept current by the
+/// `--wait` subscription). Each message must be from that peer and to this
+/// node.
 #[derive(Clone)]
 pub(crate) struct InboxReceiver {
     /// This node.
     pub(crate) me: NodeId,
-    /// The fabric root memberships and the state must chain to.
+    /// The fabric root memberships and the view must chain to.
     pub(crate) fabric: NodeId,
-    /// Where this node's signed policy is.
+    /// Where this node's view is.
     pub(crate) keystore: Arc<Keystore>,
     /// Where messages go.
     pub(crate) mailbox: Mailbox,
@@ -483,9 +484,10 @@ impl std::fmt::Debug for InboxReceiver {
 }
 
 impl InboxReceiver {
-    /// Whether `peer` may deliver here: its badge verifies, and it is a host
-    /// in this node's signed policy, not banned ([`library::Policy::is_host`]). `Err` is why not, for this node's trace only: the peer
-    /// hears just [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED).
+    /// Whether `peer` may deliver here: its badge verifies, and it hosts a
+    /// service in this node's view. `Err` is why not, for this node's trace
+    /// only: the peer hears just
+    /// [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED).
     pub(crate) fn admit(
         &self,
         peer: NodeId,
@@ -494,14 +496,19 @@ impl InboxReceiver {
     ) -> std::result::Result<(), String> {
         library::check_inclusion(membership, self.fabric, peer, now)
             .map_err(|e| format!("membership rejected: {e}"))?;
-        let state = crate::policy::store::read(&self.keystore, self.fabric)
+        let held = crate::caller::view::read(&self.keystore, self.fabric)
             .map_err(|e| format!("{e:#}"))?
-            .ok_or("this node holds no signed policy")?;
-        if !state.policy.is_host(peer) {
+            .ok_or("this node holds no view")?;
+        let hosts_one = held
+            .view
+            .entries
+            .iter()
+            .any(|e| e.entry.service.hosts.contains(&peer));
+        if !hosts_one {
             return Err(format!(
-                "not a host in the signed policy (version {}); this inbox takes pushes from \
-                 hosts only",
-                state.version().0
+                "not a host of any service in this node's view (policy version {}); this inbox \
+                 takes pushes from those hosts only",
+                held.version().0
             ));
         }
         Ok(())
@@ -722,10 +729,32 @@ pub(crate) async fn inbox_cmd(a: InboxArgs) -> Result<i32> {
     let deadline = a
         .timeout
         .map(|t| tokio::time::Instant::now() + t.duration());
-    let fetcher = cold_fetcher(&ks, &node, &membership, c.relay_url.as_deref()).await?;
-    // While waiting, a host's direct delivery lands here too.
+    let fetcher = Fetcher {
+        endpoint: transport::bind(&node, c.relay_url.as_deref()).await?,
+        hello: hello(&ks, &membership),
+        ks: Arc::clone(&ks),
+        me: node.node_id(),
+        fabric: membership.fabric,
+        relay: c.relay_url.clone(),
+    };
+    // Card 37: while waiting, follow the view (so the hosts asked and the
+    // hosts admitted follow grants and revocations), and take a host's
+    // direct delivery.
+    let follower = a.wait.then(|| {
+        let token_ks = Arc::clone(&ks);
+        crate::caller::view::follow(crate::caller::view::Follow {
+            endpoint: fetcher.endpoint.clone(),
+            badge: membership.clone(),
+            id_token: Arc::new(move || crate::caller::hello::stored_token(&token_ks)),
+            initial: crate::caller::view::read(&ks, membership.fabric)
+                .ok()
+                .flatten(),
+            fallback: crate::caller::view::joined_directories(&ks),
+            persist: Some(Arc::clone(&ks)),
+        })
+    });
     let _receiver = a.wait.then(|| {
-        iroh::protocol::Router::builder(fetcher.0.clone())
+        iroh::protocol::Router::builder(fetcher.endpoint.clone())
             .accept(
                 INBOX_ALPN,
                 InboxReceiver {
@@ -738,13 +767,56 @@ pub(crate) async fn inbox_cmd(a: InboxArgs) -> Result<i32> {
             .spawn()
     });
     let code = read_loop(&a, &mailbox, &fetcher, deadline).await;
-    fetcher.0.close().await;
+    if let Some((_, task)) = follower {
+        task.abort();
+    }
+    fetcher.endpoint.close().await;
     code
 }
 
-/// `wires inbox`'s way to the hosts: its endpoint, their dial targets, and
-/// the `Hello` it presents.
-type Fetcher = (Endpoint, Vec<(NodeId, EndpointAddr)>, InboxFrame);
+/// `wires inbox`'s way to the hosts: its endpoint, the `Hello` it presents,
+/// and where the view that names the hosts is.
+struct Fetcher {
+    /// This node's endpoint.
+    endpoint: Endpoint,
+    /// The `Hello` every fetch opens with.
+    hello: InboxFrame,
+    /// The keystore holding the view.
+    ks: Arc<Keystore>,
+    /// This node.
+    me: NodeId,
+    /// The fabric root the view verifies under.
+    fabric: NodeId,
+    /// The relay to dial through, if any.
+    relay: Option<String>,
+}
+
+impl Fetcher {
+    /// The hosts of every service in the view (read now: a `--wait`
+    /// subscription keeps it current), never this node, as dial targets.
+    fn targets(&self) -> Vec<(NodeId, EndpointAddr)> {
+        let held = match crate::caller::view::read(&self.ks, self.fabric) {
+            Ok(Some(held)) => held,
+            Ok(None) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!("the stored view is unusable: {e:#}");
+                return Vec::new();
+            }
+        };
+        let names: Vec<&library::ServiceName> =
+            held.view.entries.iter().map(|e| &e.entry.name).collect();
+        let hosts: Vec<NodeId> = crate::caller::pick::hosts_of(&held.view, names)
+            .into_iter()
+            .filter(|h| *h != self.me)
+            .collect();
+        let hints = crate::caller::pick::Hints::load(&self.ks);
+        hosts
+            .iter()
+            .copied()
+            .zip(hints.targets(&hosts, self.relay.as_deref()))
+            .collect()
+    }
+}
 
 /// Fetch, print what is unread, and — with `--wait` — repeat until
 /// something is printed or `deadline` passes.
@@ -760,7 +832,8 @@ async fn read_loop(
         // Every host refused this node: an answer, not "nothing yet" (77).
         let mut refused_by_all: Option<String> = None;
         {
-            let (endpoint, targets, hello) = fetcher;
+            let targets = fetcher.targets();
+            let (endpoint, targets, hello) = (&fetcher.endpoint, &targets, &fetcher.hello);
             let wait = if a.wait && !mailbox.has_unread() {
                 deadline
                     .map_or(LONG_POLL, |d| d.saturating_duration_since(round))
@@ -817,32 +890,6 @@ async fn read_loop(
     }
 }
 
-/// A fetcher: this node's endpoint, the hosts of every service it may call
-/// (from its signed policy; no network read), and its `Hello`.
-async fn cold_fetcher(
-    ks: &Keystore,
-    node: &NodeIdentity,
-    membership: &Membership,
-    relay_url: Option<&str>,
-) -> Result<Fetcher> {
-    let allowed = crate::caller::services::allowed(ks).await?;
-    let hosts: Vec<NodeId> = crate::caller::pick::hosts_of(
-        &allowed.state.policy,
-        allowed.grants.iter().map(|g| &g.service),
-    )
-    .into_iter()
-    .filter(|h| *h != node.node_id())
-    .collect();
-    let hints = crate::caller::pick::Hints::load(ks);
-    let targets = hosts
-        .iter()
-        .copied()
-        .zip(hints.targets(&hosts, relay_url))
-        .collect();
-    let endpoint = transport::bind(node, relay_url).await?;
-    Ok((endpoint, targets, hello(ks, membership)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -869,11 +916,13 @@ mod tests {
         Mailbox::open(&crate::testutil::temp_dir()).unwrap()
     }
 
-    /// Card 28 §9: a dialer that may not deliver here (an admitted node
-    /// that isn't a host, a banned host, or another network's node) hears
+    /// Card 28 §9, card 37: a dialer that may not deliver here (an admitted
+    /// node that hosts none of this caller's services, however many it
+    /// hosts that the caller may not use, or another network's node) hears
     /// only the fixed "not admitted", no reason and no state version.
     #[tokio::test]
     async fn a_refused_deliverer_hears_only_not_admitted() {
+        use library::{RoleName, Service, ServiceName};
         let root = NodeIdentity::from_seed([1; 32]);
         let (me, member, stranger) = (node(2), NodeIdentity::from_seed([3; 32]), node(4));
         let banned = node(6);
@@ -882,9 +931,28 @@ mod tests {
         let mut s = library::Policy::new(root.node_id());
         s.version = library::StateVersion(9);
         s.not_after = i64::MAX;
-        s.ban(banned, i64::MAX);
+        // Node 6 hosts a service this caller may not use: it is not in the
+        // view, so it may not deliver here either.
+        let nobody = RoleName::new("nobody").unwrap();
+        s.roles.insert(
+            nobody.clone(),
+            vec![library::Matcher {
+                email: Some("nobody@example.com".parse().unwrap()),
+                ..library::Matcher::new("https://idp.example")
+            }],
+        );
+        s.services.insert(
+            ServiceName::new("payroll").unwrap(),
+            Service {
+                description: String::new(),
+                allow: vec![nobody],
+                hosts: vec![banned],
+                readers: vec![],
+            },
+        );
         let signed = crate::testutil::signed_policy(&root, s);
-        crate::policy::store::adopt_if_newer(&ks, &signed, root.node_id(), 10).unwrap();
+        let held = crate::caller::view::HeldView::fetched(signed.view_for(None, None), None, 10);
+        crate::caller::view::write(&ks, root.node_id(), &held).unwrap();
         let receiver = InboxReceiver {
             me,
             fabric: root.node_id(),

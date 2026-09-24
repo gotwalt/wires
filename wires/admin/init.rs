@@ -39,6 +39,11 @@ pub(crate) struct InitArgs {
     /// client id.
     #[arg(long = "audience")]
     pub(crate) audience: Vec<String>,
+    /// That client's **public** secret (a Google "Desktop app" client's,
+    /// which its token endpoint requires and which is not confidential).
+    /// Invites carry it to `wires login`; never pass a confidential secret.
+    #[arg(long)]
+    pub(crate) public_client_secret: Option<String>,
 }
 
 #[cfg(test)]
@@ -51,6 +56,7 @@ impl Default for InitArgs {
             issuer: GOOGLE_ISSUER.to_string(),
             client_id: Some("wires-test-client".into()),
             audience: Vec::new(),
+            public_client_secret: None,
         }
     }
 }
@@ -110,6 +116,8 @@ pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
         p.issuers.insert(issuer.clone(), config);
         Ok(())
     })?;
+    // Card 37: invites tell `wires login` to sign in here.
+    super::login_client::LoginClient::record(ks, &issuer, a.public_client_secret.as_deref(), true)?;
 
     Ok(format!(
         "network {}\nnode {}\npolicy version {} (trusts {issuer})\n\

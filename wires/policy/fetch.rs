@@ -12,10 +12,9 @@
 //!   with a `policy_update` applied) or the first "you are current" vouched
 //!   for by a `Fresh` from a listed directory. A host uses it once, at a
 //!   start whose preflight fails ([`fetch_now`]: a service assigned while it
-//!   was down); a caller's cold command when its copy was last checked more
-//!   than [`STALE_AFTER_SECS`] ago ([`refresh_cold`]); the gateway on a
-//!   timer ([`refresh_loop`], `head` first) until card 37 gives callers and
-//!   the gateway their views.
+//!   was down). Only hosts and directories may fetch the whole policy
+//!   (card 37): a caller, the gateway included, holds its view
+//!   ([`crate::caller::view`]).
 //!
 //! A running host follows its directories by subscription instead
 //! ([`crate::host::follow`], card 36c).
@@ -40,9 +39,6 @@ use crate::admin::keystore::{self, Keystore};
 use crate::clock::now_unix;
 use crate::directory::wire::ask;
 use crate::host::transport;
-
-/// How old a caller's copy may be before a cold command fetches.
-pub(crate) const STALE_AFTER_SECS: i64 = 10 * 60;
 
 /// How long a cold command spends fetching, all directories together.
 const COLD_FETCH_BUDGET: Duration = Duration::from_secs(8);
@@ -320,37 +316,6 @@ pub(crate) async fn fetch(
     Ok(None)
 }
 
-/// Whether some directory has a newer head than `ks` holds: `head {}` to
-/// each in turn, the first verified answer settles it (its head verifies
-/// under the root and its `Fresh` vouches for that head). `None`: no
-/// directory answered so.
-pub(crate) async fn newer_head(
-    endpoint: &Endpoint,
-    ks: &Keystore,
-    directories: &[NodeId],
-) -> Result<Option<bool>> {
-    let root = store::fabric(ks)?.ok_or_else(|| anyhow!("this keystore is in no network"))?;
-    let have = store::read(ks, root)?.map_or(StateVersion(0), |h| h.version());
-    let badge = badge(ks)?;
-    for dir in directories {
-        match ask(endpoint, *dir, &badge, None, &DirectoryRequest::Head {}).await {
-            Ok(DirectoryAnswer::Head { head, fresh }) => {
-                let checked = head
-                    .verify(root)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|()| Ok(fresh.verify(&head)?));
-                match checked {
-                    Ok(()) => return Ok(Some(head.head.version > have)),
-                    Err(e) => tracing::warn!(directory = %dir.hex(), "refused a head: {e:#}"),
-                }
-            }
-            Ok(other) => tracing::debug!(directory = %dir.hex(), "head: {other:?}"),
-            Err(e) => tracing::debug!(directory = %dir.hex(), "head failed: {e:#}"),
-        }
-    }
-    Ok(None)
-}
-
 /// The directories this node asks, never itself: those its held policy
 /// lists, in the admin's order.
 pub(crate) fn directories_of(ks: &Keystore, me: NodeId) -> Result<Vec<NodeId>> {
@@ -391,98 +356,6 @@ pub(crate) async fn fetch_now(
         .unwrap_or(Ok(None));
     endpoint.close().await;
     fetched
-}
-
-/// A cold command's best-effort refresh: if this keystore is in a network and
-/// its copy is stale, bind briefly and fetch. Never fails the command.
-pub(crate) async fn refresh_cold() {
-    let run = async {
-        let ks = Keystore::resolve()?;
-        if store::fabric(&ks)?.is_none() || !store::is_stale(&ks, now_unix()) {
-            return Ok(None);
-        }
-        let node = keystore::node_identity_in(&ks)?;
-        if directories_of(&ks, node.node_id())?.is_empty() {
-            return Ok(None);
-        }
-        let endpoint = transport::bind_with_alpn(&node, None, DIRECTORY_ALPN).await?;
-        let fetched = tokio::time::timeout(COLD_FETCH_BUDGET, catch_up(&endpoint, &ks))
-            .await
-            .unwrap_or(Ok(None));
-        endpoint.close().await;
-        fetched
-    };
-    match run.await {
-        Ok(Some(policy)) => tracing::info!(version = policy.version().0, "fetched a newer policy"),
-        Ok(None) => {}
-        Err(e) => tracing::debug!("policy refresh skipped: {e:#}"),
-    }
-}
-
-/// One periodic check: ask the directories for their `head`, and fetch the
-/// policy only when one is newer. Returns the newly adopted policy, if any.
-pub(crate) async fn check_once(endpoint: &Endpoint, ks: &Keystore) -> Result<Option<SignedPolicy>> {
-    let me = transport::to_node_id(&endpoint.id());
-    let dirs = directories_of(ks, me)?;
-    if dirs.is_empty() {
-        return Ok(None);
-    }
-    match newer_head(endpoint, ks, &dirs).await? {
-        Some(false) => {
-            store::mark_checked(ks, now_unix())?;
-            Ok(None)
-        }
-        Some(true) | None => fetch(endpoint, ks, &dirs).await,
-    }
-}
-
-/// The gateway's check, until `stop` resolves or its sender is dropped, or
-/// the endpoint closes: at once, then every `every` (the held policy's
-/// `settings.beat_secs` when `None`), [`check_once`]. A host follows a
-/// subscription instead ([`crate::host::follow`]); card 37 moves the
-/// gateway to views.
-pub(crate) async fn refresh_loop(
-    endpoint: Endpoint,
-    ks: Arc<Keystore>,
-    every: Option<Duration>,
-    mut stop: tokio::sync::oneshot::Receiver<()>,
-) {
-    let mut first = true;
-    loop {
-        let period = if first {
-            Duration::ZERO
-        } else {
-            every.unwrap_or_else(|| beat_of(&ks))
-        };
-        first = false;
-        tokio::select! {
-            _ = &mut stop => return,
-            _ = tokio::time::sleep(period) => {}
-        }
-        if endpoint.is_closed() {
-            return;
-        }
-        tokio::select! {
-            _ = &mut stop => return,
-            checked = check_once(&endpoint, &ks) => {
-                match checked {
-                    Ok(Some(p)) => tracing::info!(version = p.version().0, "fetched a newer policy"),
-                    Ok(None) => {}
-                    Err(e) => tracing::debug!("policy check failed: {e:#}"),
-                }
-            }
-        }
-    }
-}
-
-/// The held policy's beat (or the default).
-fn beat_of(ks: &Keystore) -> Duration {
-    let secs = store::fabric(ks)
-        .ok()
-        .flatten()
-        .and_then(|root| store::read(ks, root).ok().flatten())
-        .map_or(library::DEFAULT_BEAT_SECS, |h| h.policy.settings.beat_secs);
-    Duration::from_secs(u64::from(secs.max(1)))
 }
 
 #[cfg(test)]

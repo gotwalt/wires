@@ -264,7 +264,10 @@ async fn the_registry_decides_who_runs_what() {
         unreachable!()
     };
     assert_eq!(ack.state_version, StateVersion(1));
-    assert!(ack.newer_policy.is_none(), "her copy is current");
+    assert!(
+        ack.head.is_none() && ack.entry.is_none(),
+        "her view is current"
+    );
     match host.record().await {
         AuditRecord::Started {
             principal, role, ..
@@ -474,7 +477,11 @@ async fn a_removed_member_is_refused_on_the_next_call() {
         panic!("{out:?}")
     };
     assert_eq!(ack.state_version, StateVersion(2));
-    assert_eq!(ack.newer_policy.as_ref(), Some(&v2));
+    // Card 37: the head and the called service's entry, not the policy.
+    assert_eq!(ack.head.as_ref(), Some(&v2.head));
+    let status = ack.entry.as_ref().expect("the called service's entry");
+    assert_eq!(status.name.as_str(), "status");
+    assert!(v2.entries().any(|e| e == status));
     // Claiming a newer version than the host's changes nothing.
     let out = call(
         &w.alice,
@@ -601,7 +608,9 @@ async fn a_fetch_with_a_token_makes_a_caller_reachable_by_role() {
     // And while `wires inbox --wait` runs, a push is delivered directly.
     let home = crate::testutil::temp_dir();
     let ks = Arc::new(Keystore::at(&home));
-    adopt(&ks, &w.root, &state);
+    // Card 37: carol holds her view; the host is in it.
+    let carol = super::person(&w.idp_carol, "carol@example.com");
+    super::hold_view(&ks, &w.root, &state, Some(&carol));
     let mailbox = Mailbox::open(&home).unwrap();
     let endpoint = bind(&w.carol).await;
     host.book.add_endpoint_info(

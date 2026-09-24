@@ -18,8 +18,8 @@
 //! `403` (DNS-rebinding protection). No valid bearer token is `401` with the
 //! [`challenge`].
 //!
-//! The tool list is computed per request from the signed policy the gateway
-//! holds and the caller's verified principal, so an admin's change applies
+//! The tool list is computed per request from the user's view (card 37), which
+//! the gateway follows by subscription, so an admin's change applies
 //! to the next request.
 
 use std::sync::Arc;
@@ -261,13 +261,16 @@ pub(crate) async fn post<B: Backend>(
     if id.is_none() {
         return StatusCode::ACCEPTED.into_response();
     }
-    let tools = match gw.tools_for(&session.principal) {
-        Ok((_, tools)) => tools,
+    let (view, tools) = match gw.tools_for(&session).await {
+        Ok(found) => found,
         Err(e) => {
-            tracing::warn!("gateway: no usable signed policy: {e:#}");
+            tracing::warn!("gateway: no view for this user: {e:#}");
             let reply = error_response(
                 id.unwrap_or(Value::Null),
-                RpcError::new(-32000, "the gateway holds no usable signed policy"),
+                RpcError::new(
+                    -32000,
+                    "the gateway could not get your services from a directory; try again",
+                ),
             );
             return json_reply(StatusCode::SERVICE_UNAVAILABLE, &reply);
         }
@@ -276,7 +279,7 @@ pub(crate) async fn post<B: Backend>(
         Era::Modern => (true, None),
         Era::Legacy(v) => (false, v),
     };
-    let mut server = McpServer::new(tools, gw.backend.caller(session.id_token.clone()))
+    let mut server = McpServer::new(tools, gw.backend.caller(session.id_token.clone(), view))
         .with_negotiated(negotiated)
         .with_redacted_failures();
     let Some(reply) = server.handle(msg).await else {

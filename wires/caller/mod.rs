@@ -1,7 +1,8 @@
 //! The **caller** role: an agent or a person running remote CLIs.
 //!
-//! The caller binds its node key to an IdP identity (`wires login`), lists
-//! the services the signed policy lets it call (`wires services`), and runs
+//! The caller binds its node key to an IdP identity (`wires login`), holds
+//! only its view of the policy (the services it may use, card 37), lists
+//! them (`wires services`), and runs
 //! them by name (`wires call`, the CLI-native path and the source of the
 //! token savings; `wires mcp`, the same services as MCP tools over stdio, so
 //! wires works in the MCP clients people already use).
@@ -23,6 +24,8 @@
 //! - [`login`] — OIDC sign-in, nonce-bound to this node's key.
 //! - [`jwks`] — issuer discovery and key fetching for ID-token verification.
 //! - `mock_idp` — a hermetic OIDC issuer (tests and the dev build only).
+//! - [`view`] — `view.json`: the services this caller may use, each a
+//!   root-signed entry (card 37), and how it is fetched and followed.
 //! - [`services`] — `wires services`: what this caller may call, evaluated
 //!   locally.
 //! - [`pick`] — service name → host, with failover; the local dial hints.
@@ -47,6 +50,7 @@ pub mod pick;
 pub mod services;
 pub mod shape;
 pub mod tools;
+pub mod view;
 pub mod watch_records;
 
 /// `s` on one line: newlines and every other control character escaped, so

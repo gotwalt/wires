@@ -3,12 +3,14 @@
 //!
 //! **`invite` is not an edit** (card 35). It mints the node's root-signed
 //! badge (its membership), records it in the admin's ledger
-//! ([`super::ledger`]), and bundles it with the current signed policy (whose
-//! head names the directories) into one [`Invite`] token. The policy's
-//! version doesn't move and nothing is published: every host admits any
-//! badge the root signed. Two cases do edit, and then publish: re-inviting a
-//! node the policy bans lifts the ban, and a policy that has expired is
-//! re-signed (a joiner can't install an expired one).
+//! ([`super::ledger`]), and bundles it into one [`Invite`] token with the
+//! directory ids and the login settings ([`super::login_client`]): about
+//! 800 bytes, at any fabric size (card 37). A node the policy already names
+//! as a host or directory also gets the whole policy (it holds it anyway).
+//! The policy's version doesn't move and nothing is published: every host
+//! admits any badge the root signed. Two cases do edit, and then publish:
+//! re-inviting a node the policy bans lifts the ban, and a policy that has
+//! expired is re-signed.
 //!
 //! **`remove` is a ban**: an edit that adds the node to the policy's bans
 //! until its badge would expire anyway (the ledger's `not_after`, or the
@@ -116,7 +118,16 @@ pub(crate) fn invite_in(ks: &Keystore, a: InviteArgs) -> anyhow::Result<Report> 
         badge.not_after.max(ban.unwrap_or(i64::MIN)),
     );
     ledger.save(ks)?;
-    let token = Invite::new(badge.clone(), state.signed.clone()).encode()?;
+    // Card 37: a caller's token is its badge, the directory ids and the
+    // login settings (under 1 KB at any fabric size); a node the policy
+    // names as a host or directory, which holds the whole policy anyway,
+    // gets that too.
+    let login = super::login_client::LoginClient::load(ks)?.settings(&state.policy);
+    let mut invite = Invite::new(badge.clone(), state.directories().to_vec(), login);
+    if state.policy.is_host(invitee) || state.directories().contains(&invitee) {
+        invite = invite.with_policy(state.signed.clone());
+    }
+    let token = invite.encode()?;
     let edit = match (ban, stale) {
         (Some(_), _) => format!("lifted its ban: policy version {}", state.version().0),
         (None, true) => format!(
@@ -327,8 +338,9 @@ mod tests {
         let alice = NodeIdentity::from_seed([2u8; 32]);
         let invite = invite(&ks, alice.node_id(), Some("alice"));
         invite.verify(&alice, now_unix()).unwrap();
-        assert_eq!(invite.policy.version(), v1, "no edit");
-        assert_eq!(invite.policy, stored(&ks).signed);
+        assert_eq!(stored(&ks).version(), v1, "no edit");
+        assert_eq!(invite.policy, None, "a caller gets no policy");
+        assert_eq!(invite.directories, stored(&ks).directories());
         let issued = Ledger::load(&ks).unwrap();
         assert_eq!(
             issued.get(alice.node_id()).unwrap().not_after,
@@ -382,8 +394,8 @@ mod tests {
         let banned = stored(&ks).version();
         let back = invite(&ks, alice.node_id(), None);
         back.verify(&alice, now_unix()).unwrap();
-        assert_eq!(back.policy.version(), StateVersion(banned.0 + 1));
-        assert!(!back.policy.to_policy().unwrap().bans_node(alice.node_id()));
+        assert_eq!(stored(&ks).version(), StateVersion(banned.0 + 1));
+        assert!(!stored(&ks).policy.bans_node(alice.node_id()));
         assert!(
             Ledger::load(&ks)
                 .unwrap()
@@ -432,7 +444,7 @@ mod tests {
             .await
             .unwrap();
             let invite = Invite::decode(&report.stdout).unwrap();
-            assert_eq!(size(&invite.policy), bytes);
+            assert!(invite.policy.is_none());
         }
         assert_eq!(pushes.get(), 0, "nothing was pushed");
         let after = stored(&ks);
@@ -456,6 +468,99 @@ mod tests {
         assert_eq!(pushes.get(), 1);
     }
 
+    /// Card 37: a caller's token is its badge, the directory ids and the
+    /// login settings, under 1 KB however large the fabric grows (here with
+    /// a Google-sized client id and public secret, three directories (it
+    /// carries the first two), and a
+    /// thousand services); a host's carries the whole policy too.
+    #[test]
+    fn a_callers_invite_is_under_1_kb_at_any_fabric_size() {
+        use library::{Audience, Issuer, RoleName, Service, ServiceName};
+        let ks = admin();
+        let google = Issuer::new(library::GOOGLE_ISSUER);
+        let client = concat!(
+            "123456789012-",
+            "abcdefghijklmnopqrstuvwxyz012345",
+            ".apps.googleusercontent.com"
+        );
+        super::super::service::issuer_set(
+            &ks,
+            google.clone(),
+            super::super::service::issuer_config(client, &[]).unwrap(),
+            Ttl::default(),
+        )
+        .unwrap();
+        super::super::login_client::LoginClient::record(
+            &ks,
+            &google,
+            Some(concat!("GOCSPX", "-abcdefghijklmnopqrstuvwxyz01")),
+            true,
+        )
+        .unwrap();
+        let (d1, d2, host) = (
+            NodeIdentity::from_seed([31u8; 32]).node_id(),
+            NodeIdentity::from_seed([32u8; 32]).node_id(),
+            NodeIdentity::from_seed([33u8; 32]).node_id(),
+        );
+        let alice = NodeIdentity::from_seed([2u8; 32]);
+        let mut sizes = Vec::new();
+        for services in [0usize, 100, 1000] {
+            edit_policy(&ks, Ttl::default(), |p| {
+                p.directories = vec![d1, d2, NodeIdentity::from_seed([34u8; 32]).node_id()];
+                let staff = RoleName::new("staff").unwrap();
+                p.roles.insert(
+                    staff.clone(),
+                    vec![library::Matcher::new(library::GOOGLE_ISSUER)],
+                );
+                for i in p.services.len()..services {
+                    p.services.insert(
+                        ServiceName::new(format!("svc-{i}")).unwrap(),
+                        Service {
+                            description: "a service with an ordinary description".into(),
+                            allow: vec![staff.clone()],
+                            hosts: vec![host],
+                            readers: vec![],
+                        },
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+            let report = invite_in(
+                &ks,
+                InviteArgs {
+                    node_id: alice.node_id().hex(),
+                    name: None,
+                    ttl: Ttl::default(),
+                    state_ttl: Ttl::default(),
+                },
+            )
+            .unwrap();
+            let token = report.stdout;
+            assert!(
+                token.len() < 1024,
+                "{services} services: {} bytes",
+                token.len()
+            );
+            sizes.push(token.len());
+            let invite = Invite::decode(&token).unwrap();
+            invite.verify(&alice, now_unix()).unwrap();
+            assert_eq!(invite.directories, vec![d1, d2]);
+            let login = invite.login.unwrap();
+            assert_eq!(login.issuer, google);
+            assert_eq!(login.client_id, Audience::new(client));
+            assert!(login.public_client_secret.is_some());
+            assert!(invite.policy.is_none());
+        }
+        assert!(sizes.windows(2).all(|w| w[0] == w[1]), "{sizes:?}");
+        // A host the policy names gets the whole policy.
+        let host_invite = invite(&ks, host, None);
+        assert_eq!(host_invite.policy, Some(stored(&ks).signed));
+        // The secret is not in the signed policy.
+        let text = serde_json::to_string(&stored(&ks).signed).unwrap();
+        assert!(!text.contains("GOCSPX"));
+    }
+
     /// Card 28 §8: `invite --ttl` is the badge's lifetime only, capped at
     /// 30 days; the policy's comes from `--state-ttl`, and never moves
     /// earlier.
@@ -477,7 +582,7 @@ mod tests {
         let invite = Invite::decode(&report.stdout).unwrap();
         let now = now_unix();
         assert!(invite.membership.not_after <= now + 3600);
-        assert_eq!(invite.policy.head.head.not_after, before);
+        assert_eq!(stored(&ks).policy.not_after, before);
         let long = invite_in(
             &ks,
             InviteArgs {

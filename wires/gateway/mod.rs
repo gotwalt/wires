@@ -11,10 +11,13 @@
 //! as the caller. The gateway holds nothing a host has to trust beyond its
 //! membership: it can't name a user Google didn't sign in.
 //!
-//! What a web user sees is decided by the signed policy, as for any caller:
-//! the services a role **matching the user's IdP identity** admits
-//! ([`web_grants`]). Every role needs a verified identity, so the gateway's
-//! node alone admits nobody.
+//! What a web user sees is their **view** (card 37), as for any caller: the
+//! services a role **matching the user's IdP identity** admits, each a
+//! root-signed entry, cut by a directory for that user's own ID token
+//! (nonce-bound to the gateway's node). The gateway holds no policy: it
+//! keeps one view subscription per live session ([`Keystored`]), so a
+//! grant or a revocation applies to the user's next request. Every role
+//! needs a verified identity, so the gateway's node alone admits nobody.
 //!
 //! - [`oauth`] — the OAuth 2.1 authorization server Claude.ai signs in to
 //!   (metadata, `/authorize` → Google → `/token`), RFC 9728 / 8414 / 8707 /
@@ -34,11 +37,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use std::collections::HashMap;
+use std::future::Future;
+
 use anyhow::{Context, Result, anyhow, bail};
 use axum::Router;
 use axum::routing::{get, post};
 use clap::Args;
-use library::{Grant, IdToken, NodeId, Policy, Principal, role_admits};
+use library::{IdToken, NodeId, View};
 use url::Url;
 
 use crate::admin::keystore::Keystore;
@@ -47,10 +53,10 @@ use crate::caller::jwks::KeyFetcher;
 use crate::caller::login::{DEFAULT_ISSUER, OidcClient, random_token, save_secret};
 use crate::caller::mcp::with_services;
 use crate::caller::tools::ToolsConfig;
-use crate::policy::store;
+use crate::caller::view::{self, HeldView, ViewWatch};
 
 use self::clients::{ClientKey, MetadataFetcher};
-use self::sessions::Store;
+use self::sessions::{Session, Store};
 
 /// The gateway's MAC key for DCR client ids, in the keystore (`0600`).
 pub(crate) const CLIENT_KEY_FILE: &str = "gateway-client-key";
@@ -149,44 +155,111 @@ impl PublicUrls {
 pub(crate) trait Backend: Send + Sync + 'static {
     /// The caller used for one web user's calls.
     type Caller: crate::caller::call::Caller + Send + Sync;
-    /// The signed policy this gateway holds now (read per request, so a
-    /// newer policy applies at once).
-    fn state(&self) -> Result<Policy>;
-    /// A caller presenting `token` in every call's handshake.
-    fn caller(&self, token: IdToken) -> Self::Caller;
+    /// The view of the web user `session` speaks for (current: a newer
+    /// policy applies to their next request).
+    fn view(&self, session: &Session) -> impl Future<Output = Result<Arc<View>>> + Send;
+    /// A caller presenting `token` in every call's handshake, dialing the
+    /// hosts `view` names.
+    fn caller(&self, token: IdToken, view: Arc<View>) -> Self::Caller;
 }
 
-/// The production [`Backend`]: this node's keystore and credentials, and
-/// one long-lived endpoint every web user's calls dial from (one node key,
-/// one endpoint: not one per call contending for the same relay slot).
+/// How long a web user's first request waits for their view.
+const VIEW_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One web user's live view: the subscription following it, until their
+/// ID token expires.
+struct UserView {
+    /// The view as it changes.
+    rx: ViewWatch,
+    /// The subscription (aborted when the session is over).
+    task: tokio::task::JoinHandle<()>,
+    /// The ID token's `exp`: the session is over after it.
+    not_after: i64,
+}
+
+/// The production [`Backend`]: this node's keystore and credentials, one
+/// long-lived endpoint every web user's calls dial from (one node key, one
+/// endpoint: not one per call contending for the same relay slot), and one
+/// view subscription per live session, keyed by its ID token.
 pub(crate) struct Keystored {
     ks: Arc<Keystore>,
     creds: Credentials,
     endpoint: iroh::Endpoint,
+    /// The directories to ask (the gateway's own view's, else its join's).
+    directories: Vec<NodeId>,
+    /// Live views, by ID token.
+    views: std::sync::Mutex<HashMap<String, UserView>>,
+}
+
+impl Keystored {
+    /// The live view for `session`, subscribing on first use; sessions
+    /// whose tokens have expired are dropped (their subscriptions end).
+    fn watch(&self, session: &Session, now: i64) -> ViewWatch {
+        let mut views = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        views.retain(|_, v| {
+            let live = v.not_after >= now && !v.task.is_finished();
+            if !live {
+                v.task.abort();
+            }
+            live
+        });
+        let key = session.id_token.as_str().to_owned();
+        if let Some(v) = views.get(&key) {
+            return v.rx.clone();
+        }
+        let token = session.id_token.clone();
+        let (rx, task) = view::follow(view::Follow {
+            endpoint: self.endpoint.clone(),
+            badge: self.creds.membership().clone(),
+            id_token: Arc::new(move || Some(token.clone())),
+            initial: None,
+            fallback: self.directories.clone(),
+            persist: None,
+        });
+        views.insert(
+            key,
+            UserView {
+                rx: rx.clone(),
+                task,
+                not_after: session.not_after(),
+            },
+        );
+        rx
+    }
 }
 
 impl Backend for Keystored {
     type Caller = PresentingCaller;
 
-    fn state(&self) -> Result<Policy> {
-        Ok(store::require_policy(&self.ks, self.creds.fabric())?.policy)
+    async fn view(&self, session: &Session) -> Result<Arc<View>> {
+        let mut rx = self.watch(session, crate::clock::now_unix());
+        let held: Arc<HeldView> = tokio::time::timeout(VIEW_WAIT, rx.wait_for(Option::is_some))
+            .await
+            .map_err(|_| anyhow!("no directory gave this user's view within {VIEW_WAIT:?}"))?
+            .map_err(|_| anyhow!("the view subscription ended"))?
+            .clone()
+            .expect("waited for a view");
+        Ok(Arc::new(held.view.clone()))
     }
 
-    fn caller(&self, token: IdToken) -> PresentingCaller {
+    fn caller(&self, token: IdToken, view: Arc<View>) -> PresentingCaller {
         PresentingCaller {
             ks: Arc::clone(&self.ks),
             creds: self.creds.clone().presenting(token),
             endpoint: self.endpoint.clone(),
+            view,
         }
     }
 }
 
 /// Calls a service with this node's credentials over the gateway's shared
-/// endpoint, presenting a web user's ID token instead of a stored one.
+/// endpoint, presenting a web user's ID token instead of a stored one, on
+/// the hosts that user's view names.
 pub(crate) struct PresentingCaller {
     ks: Arc<Keystore>,
     creds: Credentials,
     endpoint: iroh::Endpoint,
+    view: Arc<View>,
 }
 
 impl crate::caller::call::Caller for PresentingCaller {
@@ -196,19 +269,21 @@ impl crate::caller::call::Caller for PresentingCaller {
         argv: library::Argv,
         stdin: Vec<u8>,
     ) -> Result<crate::caller::call::CallOutcome> {
-        use crate::caller::call::{SERVICE_DIAL_TIMEOUT, ServiceDial, call_service_with, outcome};
-        let state = store::require_policy(&self.ks, self.creds.fabric())?;
+        use crate::caller::call::{SERVICE_DIAL_TIMEOUT, ServiceDial, call_entry, outcome};
+        let Some(entry) = self.view.entry(&tool.name) else {
+            bail!("`{}` is not in this user's view", tool.name);
+        };
         let dial = ServiceDial {
             endpoint: &self.endpoint,
             hints: crate::caller::pick::Hints::load(&self.ks),
             timeout: SERVICE_DIAL_TIMEOUT,
         };
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        let result = call_service_with(
+        let result = call_entry(
             &self.creds,
             &self.ks,
-            &state,
-            &tool.name,
+            self.view.head.head.version,
+            &entry.entry,
             &dial,
             argv,
             std::io::Cursor::new(stdin),
@@ -216,7 +291,8 @@ impl crate::caller::call::Caller for PresentingCaller {
             &mut stderr,
             false,
         )
-        .await;
+        .await
+        .map(|called| called.exit);
         outcome(result, stdout, stderr)
     }
 }
@@ -366,36 +442,13 @@ pub(crate) struct Gateway<B> {
 }
 
 impl<B: Backend> Gateway<B> {
-    /// The services `principal` may call through this gateway, with the
-    /// MCP tools they become, per the current signed policy.
-    pub(crate) fn tools_for(&self, principal: &Principal) -> Result<(Vec<Grant>, ToolsConfig)> {
-        let state = self.backend.state()?;
-        let grants = web_grants(&state, self.node, principal);
-        let tools = with_services(ToolsConfig::default(), &state, &grants);
-        Ok((grants, tools))
+    /// The web user `session` speaks for: their view, and the MCP tools
+    /// the services they may call become.
+    pub(crate) async fn tools_for(&self, session: &Session) -> Result<(Arc<View>, ToolsConfig)> {
+        let view = self.backend.view(session).await?;
+        let tools = with_services(ToolsConfig::default(), &view);
+        Ok((view, tools))
     }
-}
-
-/// The services a web user may call through the gateway node `gateway`:
-/// those whose `allow` has a role whose matchers admit `principal`.
-/// Nothing if the state bans the gateway itself.
-pub(crate) fn web_grants(state: &Policy, gateway: NodeId, principal: &Principal) -> Vec<Grant> {
-    if state.bans_node(gateway) {
-        return Vec::new();
-    }
-    state
-        .services
-        .iter()
-        .filter_map(|(service, svc)| {
-            svc.allow
-                .iter()
-                .find(|r| role_admits(state, r, Some(principal)))
-                .map(|role| Grant {
-                    service: service.clone(),
-                    role: role.clone(),
-                })
-        })
-        .collect()
 }
 
 /// The HTTP routes. The unauthenticated OAuth endpoints are rate-limited
@@ -506,19 +559,32 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
         ..CredArgs::default()
     })?;
     let node = creds.node_id();
+    // Where web users' views come from: the directories this node knows
+    // (its own view's head, else its invite's, else its whole policy's).
+    let mut directories = view::directories(&ks, creds.fabric(), node);
+    if directories.is_empty()
+        && let Some(held) = crate::policy::store::read(&ks, creds.fabric())?
+    {
+        directories = held
+            .directories()
+            .iter()
+            .copied()
+            .filter(|d| *d != node)
+            .collect();
+    }
+    if directories.is_empty() {
+        bail!(
+            "this node knows no directory to ask for its users' views: join with an invite from \
+             an admin whose policy names one (`wires directory add`)"
+        );
+    }
     let backend = Keystored {
         ks: Arc::clone(&ks),
         endpoint: creds.bind().await?,
         creds,
+        directories,
+        views: std::sync::Mutex::new(HashMap::new()),
     };
-    let state = backend.state()?;
-    if state.bans_node(node) {
-        bail!(
-            "this node ({}) is banned by its signed policy (version {}): the admin removed it",
-            node.hex(),
-            state.version.0
-        );
-    }
     let mut origins = vec![
         urls.issuer.clone(),
         "https://claude.ai".to_owned(),
@@ -538,17 +604,6 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
         backend,
         urls,
     });
-    // A long-running caller: keep its policy fresh without waiting for a
-    // call to hand back a newer one (it would otherwise expire unnoticed):
-    // a directory's head, every beat. The loop stops when `_stop_refresh`
-    // drops, when `run` returns. (Card 37: a view subscription.)
-    let (_stop_refresh, stop) = tokio::sync::oneshot::channel();
-    tokio::spawn(crate::policy::fetch::refresh_loop(
-        gw.backend.endpoint.clone(),
-        ks,
-        None,
-        stop,
-    ));
     let listener = tokio::net::TcpListener::bind(a.listen)
         .await
         .with_context(|| format!("binding {}", a.listen))?;
@@ -569,7 +624,9 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use library::{Matcher, NodeIdentity, RoleName, Service, ServiceName, StateVersion};
+    use library::{
+        Matcher, NodeIdentity, Policy, Principal, RoleName, Service, ServiceName, StateVersion,
+    };
 
     pub(crate) fn node(b: u8) -> NodeId {
         NodeIdentity::from_seed([b; 32]).node_id()
@@ -586,13 +643,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Gateway 2, host 3, 9 banned. `orders-db` for `analyst` (alice, bob); `status` for
-    /// `ops` (carol); `mixed` for `ops` then `analyst`. Matchers trust Google.
-    pub(crate) fn state() -> Policy {
-        state_for(library::GOOGLE_ISSUER)
-    }
-
-    /// [`state`] with its roles' matchers trusting `issuer`.
+    /// Gateway 2, host 3, 9 banned. `orders-db` for `analyst` (alice, bob);
+    /// `status` for `ops` (carol); `mixed` for `ops` then `analyst`. Matchers
+    /// trust `issuer`.
     pub(crate) fn state_for(issuer: &str) -> Policy {
         let mut s = Policy::new(node(1));
         s.version = StateVersion(1);
@@ -637,29 +690,25 @@ pub(crate) mod tests {
         s
     }
 
+    /// [`state_for`], signed by its root (node 1's key), its issuer trusted.
+    pub(crate) fn signed_for(issuer: &str) -> library::SignedPolicy {
+        crate::testutil::signed_policy(&NodeIdentity::from_seed([1; 32]), state_for(issuer))
+    }
+
+    /// A web user's tools are the services their view lets them call.
     #[test]
     fn a_web_user_gets_the_services_whose_roles_match_them() {
-        let names = |g: Vec<Grant>| -> Vec<(String, String)> {
-            g.into_iter()
-                .map(|g| (g.service.to_string(), g.role.as_str().to_owned()))
+        let names = |email: &str| -> Vec<String> {
+            let view = signed_for(library::GOOGLE_ISSUER).view_for(Some(&principal(email)), None);
+            with_services(ToolsConfig::default(), &view)
+                .tools
+                .iter()
+                .map(|t| t.name.to_string())
                 .collect()
         };
-        assert_eq!(
-            names(web_grants(
-                &state(),
-                node(2),
-                &principal("alice@example.com")
-            )),
-            [
-                ("mixed".to_owned(), "analyst".to_owned()),
-                ("orders-db".to_owned(), "analyst".to_owned())
-            ]
-        );
-        assert!(web_grants(&state(), node(2), &principal("mallory@example.com")).is_empty());
-        assert!(
-            web_grants(&state(), node(9), &principal("alice@example.com")).is_empty(),
-            "a banned gateway offers nothing"
-        );
+        assert_eq!(names("alice@example.com"), ["mixed", "orders-db"]);
+        assert_eq!(names("carol@example.com"), ["mixed", "status"]);
+        assert!(names("mallory@example.com").is_empty());
     }
 
     #[test]

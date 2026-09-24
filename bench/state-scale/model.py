@@ -13,7 +13,10 @@ Three designs:
           publishes to it; each host holds the whole root-signed policy and
           follows it by subscription (a delta per edit and a freshness beat);
           each caller holds only its view, the root-signed service entries
-          it may use (card 37). Nothing is syndicated to every caller.
+          it may use (card 37): a one-shot caller learns of a new head in a
+          call's handshake and then asks for what changed; `wires mcp` and a
+          gateway session follow a view subscription. Nothing is syndicated
+          to every caller.
 
 Byte sizes were measured from real signed states by the `state_sizes`
 example, which card 36b deleted with the one-blob state (it is in git
@@ -67,7 +70,10 @@ ASSUMPTIONS = {
     "view_entry": 630,  # a view entry: the signed entry and its call/read marks
     "timestamp": 475,  # the freshness beat frame
     "heartbeats": 288,  # apex: one every 5 min
-    "view_checks": 8,  # apex: a caller revalidates its view hourly while active
+    "caller_invite": 979,  # a caller's token: badge, 2 directory ids, Google-sized login (card 37)
+    "hello_ack_news": 1_549,  # a HelloAck carrying a newer head and one service entry
+    "view_update_head": 1_000,  # a view_update that changes no entry: head and Fresh
+    "active_beats": 96,  # a subscribed caller (`wires mcp`) is up 8 h/day: one beat / 5 min
     "visible_services": 30,  # services one caller may use
     "badge_days": 30,  # a ban lasts until the badge would expire
 }
@@ -159,8 +165,27 @@ def model(tier, s, a, email_roles):
         + removals * a["update_ban"]
     )
     view_changes = service_edits * visible / services
-    caller_in = min(view_changes, a["view_checks"]) * a["update_service"] + a["view_checks"] * (
-        small + dial
+    heads = max(1.0, removals + service_edits)
+    view_frame = a["view_base"] + visible * a["view_entry"]
+    # A one-shot caller (card 37, as built): no background traffic. A call
+    # whose host reports a newer head carries that head and the service's
+    # entry, and the caller then asks for its view from the head it holds:
+    # the directory answers with what changed (a view_update). It notices at
+    # most one new head per active window.
+    refreshes = min(heads, a["active_windows"])
+    caller_in = refreshes * (a["hello_ack_news"] + dial + small + a["view_update_head"]) + (
+        view_changes * a["view_entry"]
+    )
+    # A subscribed caller (`wires mcp`, a gateway session), up 8 h a day:
+    # its whole view at subscribe, a beat every 5 min, and a view_update per
+    # new head while it is up (a changed entry only when one of its own).
+    up = a["active_beats"] / a["heartbeats"]
+    caller_sub_in = (
+        dial
+        + view_frame
+        + a["active_beats"] * a["timestamp"]
+        + up * heads * a["view_update_head"]
+        + up * view_changes * a["view_entry"]
     )
     apex = {
         "held_center": policy,
@@ -170,10 +195,11 @@ def model(tier, s, a, email_roles):
         "edits": max(1.0, removals + service_edits),
         "host_in": host_in,
         "caller_in": caller_in,
+        "caller_sub_in": caller_sub_in,
         "host_out": 0.0,
         "center_out": hosts * host_in + callers * caller_in,
         "total": hosts * host_in + callers * caller_in,
-        "invite": (s["membership"] + 2 * 64 + 100) * 4 / 3,  # badge + root + apex keys
+        "invite": a["caller_invite"],  # measured: badge, 2 directory ids, login settings
     }
     return {"nodes": nodes, "today": today, "badges": badges, "apex": apex}
 
@@ -201,7 +227,10 @@ def table(results, email_roles) -> str:
             rows.append(Row("every node holds", [fmt(x["held_caller"]) + c for x, c in zip(d, cap)]))
             rows.append(Row("edits/day", [f"{x['edits']:,.0f}" for x in d]))
         rows.append(Row("invite token", [fmt(x["invite"]) for x in d]))
-        rows.append(Row("each caller receives /day", [fmt(x["caller_in"]) for x in d]))
+        label = "each one-shot caller receives /day" if design == "apex" else "each caller receives /day"
+        rows.append(Row(label, [fmt(x["caller_in"]) for x in d]))
+        if design == "apex":
+            rows.append(Row("each subscribed caller (MCP) receives /day", [fmt(x["caller_sub_in"]) for x in d]))
         rows.append(Row("each host receives /day", [fmt(x["host_in"]) for x in d]))
         if design != "apex":
             rows.append(Row("each host sends callers /day", [fmt(x["host_out"]) for x in d]))

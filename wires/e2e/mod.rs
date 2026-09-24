@@ -20,6 +20,8 @@
 //! - [`follow`] — card 36c: hosts follow a directory's `policy`
 //!   subscription (deltas, resync, failover), and the signed freshness rule
 //!   (`lenient` / `strict`) with every directory down.
+//! - [`views`] — card 37: each caller holds only its view, and a running
+//!   `wires mcp` hears of a grant or a revocation within 2 s.
 //! - [`native`] — card 33: an embedded [`Host`](crate::Host) serves a native
 //!   service (the `kv` example), called and logged like a CLI service.
 
@@ -54,6 +56,9 @@ mod gateway;
 mod native;
 /// Card 28 §1: the service child is not the host.
 mod service_child;
+/// Card 37: each caller holds only its view; grants and revocations reach
+/// a running `wires mcp`.
+mod views;
 
 /// The outer bound on any single wait here: generous, and never reached in
 /// the passing case (every wait is on an event, not a clock).
@@ -134,6 +139,34 @@ fn hello(root: &NodeIdentity, who: &NodeIdentity, version: u64, idp: Option<&Moc
             )
         }),
     }
+}
+
+/// `email` as `idp` verified it (the subject is the email).
+fn person(idp: &MockIdp, email: &str) -> library::Principal {
+    library::Principal {
+        issuer: idp.issuer.as_str().into(),
+        subject: email.into(),
+        email: Some(email.into()),
+        org: None,
+        groups: vec![],
+        not_after: i64::MAX,
+    }
+}
+
+/// Store in a caller's `ks` the view a directory would cut from `state`
+/// for `who` (card 37: a caller holds its view, not the policy).
+fn hold_view(
+    ks: &Keystore,
+    root: &NodeIdentity,
+    state: &SignedPolicy,
+    who: Option<&library::Principal>,
+) {
+    let held = crate::caller::view::HeldView::fetched(
+        state.view_for(who, None),
+        None,
+        crate::clock::now_unix(),
+    );
+    crate::caller::view::write(ks, root.node_id(), &held).unwrap();
 }
 
 /// Store `state` in `ks` as a fetch from a directory does; whether it was adopted.

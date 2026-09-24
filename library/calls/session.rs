@@ -39,18 +39,30 @@
 //!
 //! [`Hello`] and [`HelloAck`] are unsigned envelopes: each part verifies on
 //! its own (the membership under the root, the ID token under the IdP's keys
-//! and its nonce binding to the iroh-authenticated caller, the policy under
-//! the root), so omitting an absent part via `skip_serializing_if` is safe.
+//! and its nonce binding to the iroh-authenticated caller, the head and the
+//! service entry under the root), so omitting an absent part via
+//! `skip_serializing_if` is safe.
+//!
+//! **The handshake carries the news** (card 37). A caller holds a view, not
+//! the policy: its `Hello` names the head version of that view, and the
+//! host's `HelloAck` names its own. When the host's is newer, the ack also
+//! carries the host's root-signed head and the called service's root-signed
+//! entry, so the caller checks the host is still assigned the service
+//! ([`HelloAck::assigns`]) before it sends any stdin, then refreshes its
+//! view after the call.
 
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{canonical_bytes, length_prefixed, split_frame};
+use crate::entry::SignedEntry;
 use crate::error::{Error, Result};
-use crate::head::StateVersion;
+use crate::head::{SignedPolicyHead, StateVersion};
+use crate::identity::NodeId;
 use crate::idp::IdToken;
 use crate::invoke::Invocation;
 use crate::membership::Membership;
-use crate::signed_policy::SignedPolicy;
+use crate::registry::ServiceName;
+use crate::signed_policy::check_entry_version;
 
 const TAG_STDIN: u8 = 1;
 const TAG_STDOUT: u8 = 2;
@@ -70,9 +82,9 @@ const TAG_HELLO_ACK: u8 = 9;
 pub struct Hello {
     /// The dialer's root-signed membership.
     pub membership: Membership,
-    /// The policy version the dialer holds (0: none). A host holding a
-    /// newer one answers with it in [`HelloAck::newer_policy`] (card 37
-    /// replaces this with the head version alone).
+    /// The head version of the dialer's view (0: none). A host holding a
+    /// newer policy answers with its head and the called service's entry
+    /// ([`HelloAck::head`], [`HelloAck::entry`]).
     pub state_version: StateVersion,
     /// The dialer's IdP ID token (nonce-bound to its node key), when it has
     /// logged in.
@@ -81,18 +93,96 @@ pub struct Hello {
 }
 
 /// The host's answer to an admitted [`Hello`]: its own membership (the
-/// dialer verifies it before sending stdin), its policy version, and, when the
-/// dialer's copy is older, the newer signed policy so the dialer can adopt it.
+/// dialer verifies it before sending stdin), the head version it decided
+/// under, and, when that is newer than the dialer's view, its head and the
+/// called service's entry (see the module docs).
+///
+/// ```
+/// use library::{HelloAck, Membership, NodeIdentity, Policy, Service, ServiceName, StateVersion};
+/// let root = NodeIdentity::from_seed([1u8; 32]);
+/// let host = NodeIdentity::from_seed([2u8; 32]).node_id();
+/// let name = ServiceName::new("orders-db").unwrap();
+/// let mut policy = Policy::new(root.node_id());
+/// policy.version = StateVersion(5);
+/// policy.not_after = i64::MAX;
+/// policy.services.insert(name.clone(), Service {
+///     description: String::new(), allow: vec![], hosts: vec![host], readers: vec![],
+/// });
+/// let signed = policy.sign(&root).unwrap();
+/// let ack = HelloAck {
+///     membership: Membership::mint(&root, host, 0, i64::MAX).unwrap(),
+///     state_version: StateVersion(5),
+///     head: Some(signed.head.clone()),
+///     entry: signed.entries().next().cloned(),
+/// };
+/// // The caller's view is at version 3: the host is still assigned orders-db.
+/// assert!(ack.assigns(root.node_id(), StateVersion(3), &name, host).unwrap());
+/// // Another host is not.
+/// let other = NodeIdentity::from_seed([3u8; 32]).node_id();
+/// assert!(!ack.assigns(root.node_id(), StateVersion(3), &name, other).unwrap());
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HelloAck {
     /// The host's root-signed membership.
     pub membership: Membership,
-    /// The policy version the host decided under.
+    /// The head version of the policy the host decided under.
     pub state_version: StateVersion,
-    /// The host's newer signed policy, when the dialer's was older.
+    /// The host's root-signed head, when it is newer than the dialer's view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub newer_policy: Option<SignedPolicy>,
+    pub head: Option<SignedPolicyHead>,
+    /// With `head`: the called service's root-signed entry under it (none
+    /// if the policy no longer has the service).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<SignedEntry>,
+}
+
+impl HelloAck {
+    /// Whether this ack lets a dialer whose view is at `held` go on with a
+    /// call of `service` on `host` (the iroh-authenticated peer), under the
+    /// fabric `root`. `Ok(true)` when the host's version is not newer than
+    /// `held` (nothing new), or when its head and `service`'s entry verify
+    /// under `root` and the entry still lists `host`; `Ok(false)` when the
+    /// newer policy no longer assigns `service` to `host` (or no longer has
+    /// it). `Err` when the ack reports a newer version without a head that
+    /// verifies at that version, or carries an entry that doesn't verify,
+    /// is for another service, or is newer than its head.
+    pub fn assigns(
+        &self,
+        root: NodeId,
+        held: StateVersion,
+        service: &ServiceName,
+        host: NodeId,
+    ) -> Result<bool> {
+        if self.state_version <= held {
+            return Ok(true);
+        }
+        let head = self.head.as_ref().ok_or_else(|| {
+            Error::InvalidPolicy(format!(
+                "the host reports policy version {} without its head",
+                self.state_version.0
+            ))
+        })?;
+        head.verify(root)?;
+        if head.head.version != self.state_version {
+            return Err(Error::InvalidPolicy(format!(
+                "the host's head is version {}, not the {} it reports",
+                head.head.version.0, self.state_version.0
+            )));
+        }
+        let Some(entry) = &self.entry else {
+            return Ok(false);
+        };
+        if entry.name != *service {
+            return Err(Error::InvalidPolicy(format!(
+                "the host sent the entry of {}, not {service}",
+                entry.name
+            )));
+        }
+        check_entry_version(entry, head)?;
+        entry.verify(root)?;
+        Ok(entry.service.hosts.contains(&host))
+    }
 }
 
 /// A chunk of stdio bytes carried in a [`Frame`].
@@ -251,6 +341,87 @@ mod tests {
         proptest::collection::vec(any::<u8>(), 0..256)
     }
 
+    fn orders() -> ServiceName {
+        ServiceName::new("orders-db").unwrap()
+    }
+
+    /// A policy at `version` in which `hosts` implement `orders-db`.
+    fn signed_with(
+        root: &NodeIdentity,
+        version: u64,
+        hosts: &[NodeId],
+    ) -> crate::signed_policy::SignedPolicy {
+        let mut p = crate::signed_policy::Policy::new(root.node_id());
+        p.version = StateVersion(version);
+        p.not_after = i64::MAX;
+        p.services.insert(
+            orders(),
+            crate::registry::Service {
+                description: String::new(),
+                allow: vec![],
+                hosts: hosts.to_vec(),
+                readers: vec![],
+            },
+        );
+        p.sign(root).unwrap()
+    }
+
+    /// An ack from `host` at `signed`'s version, with its news.
+    fn ack(
+        root: &NodeIdentity,
+        host: NodeId,
+        signed: &crate::signed_policy::SignedPolicy,
+    ) -> HelloAck {
+        HelloAck {
+            membership: Membership::mint(root, host, 0, i64::MAX).unwrap(),
+            state_version: signed.version(),
+            head: Some(signed.head.clone()),
+            entry: signed.entries().next().cloned(),
+        }
+    }
+
+    #[test]
+    fn an_ack_says_whether_the_host_is_still_assigned() {
+        let root = NodeIdentity::from_seed([1; 32]);
+        let host = NodeIdentity::from_seed([2; 32]).node_id();
+        let other = NodeIdentity::from_seed([3; 32]).node_id();
+        let r = root.node_id();
+        let v5 = signed_with(&root, 5, &[host]);
+        let ack5 = ack(&root, host, &v5);
+        assert!(ack5.assigns(r, StateVersion(4), &orders(), host).unwrap());
+        assert!(!ack5.assigns(r, StateVersion(4), &orders(), other).unwrap());
+        // Nothing new: nothing to check, even with no head.
+        let mut bare = ack5.clone();
+        bare.head = None;
+        bare.entry = None;
+        assert!(bare.assigns(r, StateVersion(5), &orders(), other).unwrap());
+        // Newer without a head: refused.
+        assert!(bare.assigns(r, StateVersion(4), &orders(), host).is_err());
+        // The service is gone: not assigned.
+        let mut gone = ack5.clone();
+        gone.entry = None;
+        assert!(!gone.assigns(r, StateVersion(4), &orders(), host).unwrap());
+        // A forged entry, another service's entry, another root, a head at
+        // another version: refused.
+        let mut forged = ack5.clone();
+        forged.entry.as_mut().unwrap().service.hosts.push(other);
+        assert!(
+            forged
+                .assigns(r, StateVersion(4), &orders(), other)
+                .is_err()
+        );
+        let status = ServiceName::new("status").unwrap();
+        assert!(ack5.assigns(r, StateVersion(4), &status, host).is_err());
+        let rogue = NodeIdentity::from_seed([9; 32]).node_id();
+        assert!(
+            ack5.assigns(rogue, StateVersion(4), &orders(), host)
+                .is_err()
+        );
+        let mut skewed = ack5;
+        skewed.state_version = StateVersion(6);
+        assert!(skewed.assigns(r, StateVersion(4), &orders(), host).is_err());
+    }
+
     /// An arbitrary frame of any variant.
     fn frame() -> impl Strategy<Value = Frame> {
         prop_oneof![
@@ -282,17 +453,19 @@ mod tests {
                         id_token: token.map(IdToken::new),
                     })
                 }),
-            (seed(), any::<u64>(), any::<bool>()).prop_map(|(rs, v, with_policy)| {
+            (seed(), any::<u64>(), any::<bool>()).prop_map(|(rs, v, with_news)| {
                 let root = NodeIdentity::from_seed(rs);
-                let newer_policy = with_policy.then(|| {
-                    let mut p = crate::signed_policy::Policy::new(root.node_id());
-                    p.version = StateVersion(v);
-                    p.sign(&root).unwrap()
-                });
+                let (head, entry) = if with_news {
+                    let signed = signed_with(&root, v, &[root.node_id()]);
+                    (Some(signed.head.clone()), signed.entries().next().cloned())
+                } else {
+                    (None, None)
+                };
                 Frame::HelloAck(HelloAck {
                     membership: Membership::mint(&root, root.node_id(), 0, 1).unwrap(),
                     state_version: StateVersion(v),
-                    newer_policy,
+                    head,
+                    entry,
                 })
             }),
         ]

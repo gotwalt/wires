@@ -445,20 +445,29 @@ pub(crate) async fn callback<B: Backend>(
         }
     };
     let who = login.principal.name();
-    match gw.tools_for(&login.principal) {
-        Ok((grants, _)) if grants.is_empty() => {
+    let session = Session {
+        principal: login.principal,
+        id_token: login.claim.id_token,
+        client_id: a.client_id.clone(),
+        resource: a.resource.clone(),
+    };
+    // Card 37: the user's view, cut by a directory for their own token.
+    match gw.tools_for(&session).await {
+        Ok((_, tools)) if tools.tools.is_empty() => {
             tracing::info!("gateway: {who} may call nothing here; refused");
             return back(
                 "access_denied",
                 "this account may call no services through this gateway",
             );
         }
-        Ok((grants, _)) => tracing::info!("gateway: {who} signed in ({} services)", grants.len()),
+        Ok((_, tools)) => {
+            tracing::info!("gateway: {who} signed in ({} services)", tools.tools.len())
+        }
         Err(e) => {
-            tracing::warn!("gateway: no usable signed policy: {e:#}");
+            tracing::warn!("gateway: no view for {who}: {e:#}");
             return back(
                 "temporarily_unavailable",
-                "the gateway holds no usable signed policy",
+                "the gateway could not get your services from a directory; try again",
             );
         }
     }
@@ -466,12 +475,7 @@ pub(crate) async fn callback<B: Backend>(
         client_id: a.client_id.clone(),
         redirect_uri: a.redirect_uri.clone(),
         code_challenge: a.code_challenge.clone(),
-        session: Session {
-            principal: login.principal,
-            id_token: login.claim.id_token,
-            client_id: a.client_id.clone(),
-            resource: a.resource.clone(),
-        },
+        session,
         expires: now + CODE_TTL_SECS,
     };
     match gw.store.issue_code(grant) {

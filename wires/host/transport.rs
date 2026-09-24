@@ -37,8 +37,7 @@ use iroh::endpoint::presets::N0;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 
 use library::{
-    Chunk, Frame, Hello, Invocation, NodeId, NodeIdentity, ServiceName, SignedPolicy,
-    check_inclusion,
+    Chunk, Frame, Hello, HelloAck, Invocation, NodeId, NodeIdentity, ServiceName, check_inclusion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
@@ -828,10 +827,16 @@ where
             return Err(Refused(DENY_LOG_UNAVAILABLE.to_string()).into());
         }
     };
-    let ack = Frame::HelloAck(library::HelloAck {
+    // Card 37: a caller whose view is older gets this host's head and the
+    // service's entry, to check the host is still assigned before stdin.
+    let news = hello.state_version < version;
+    let ack = Frame::HelloAck(HelloAck {
         membership: host.membership.clone(),
         state_version: version,
-        newer_policy: (hello.state_version < version).then(|| state.signed.clone()),
+        head: news.then(|| state.signed.head.clone()),
+        entry: news
+            .then(|| state.signed.entries().find(|e| e.name == service).cloned())
+            .flatten(),
     });
     if let Err(e) = write_frame(&mut send, &ack).await {
         // The caller is gone before anything ran: close the logged call.
@@ -1020,8 +1025,9 @@ pub(crate) struct ServiceDialed {
 /// `hello`, send `invocation` and bridge stdio on that one.
 ///
 /// `on_ack` runs once the host's `HelloAck` has verified and **before** any
-/// stdin is forwarded, with the host's id and the newer state it handed back
-/// (if any): the caller adopts that state there and may abort the call.
+/// stdin is forwarded, with the host's id and the ack (its head version,
+/// and the head and service entry when newer than the caller's view): the
+/// caller checks the host is still assigned there and may abort the call.
 ///
 /// Fails over **only on a dial failure**: once a host has answered, its
 /// refusal ([`Denied`]) or a mid-session error is final (it decided, and
@@ -1034,7 +1040,7 @@ pub(crate) async fn call_service_on<R, W, E>(
     dial_timeout: std::time::Duration,
     hello: Hello,
     invocation: Invocation,
-    on_ack: impl FnOnce(NodeId, Option<&SignedPolicy>) -> Result<()>,
+    on_ack: impl FnOnce(NodeId, &HelloAck) -> Result<()>,
     stdin: R,
     stdout: W,
     stderr: E,
@@ -1074,7 +1080,7 @@ where
             hello,
             invocation,
             host,
-            |newer| on_ack(host, newer),
+            |ack| on_ack(host, ack),
             stdin,
             stdout,
             stderr,
@@ -1096,7 +1102,7 @@ pub(crate) struct Dialed {
     pub(crate) exit: i32,
 }
 
-/// [`dial_opened_with`] with nothing to do at the ack (a newer state the
+/// [`dial_opened_with`] with nothing to do at the ack (a newer head the
 /// host hands back is ignored): the session tests' form.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
@@ -1135,8 +1141,8 @@ where
 /// (the iroh-authenticated host). Presents the `hello`, then reads the
 /// host's [`HelloAck`](library::HelloAck), verifies the membership in it
 /// against the dialer's own network root and `target`, then runs `on_ack`
-/// with the ack's newer state, all **before** any stdin is forwarded. On any
-/// failure, aborts with no stdin sent.
+/// with the ack, all **before** any stdin is forwarded. On any failure,
+/// aborts with no stdin sent.
 ///
 /// The [`Frame::Invoke`] carrying `invocation` follows the opening
 /// immediately, without waiting for the ack.
@@ -1150,7 +1156,7 @@ pub(crate) async fn dial_opened_with<S, R, I, W, E>(
     hello: Hello,
     invocation: Invocation,
     target: NodeId,
-    on_ack: impl FnOnce(Option<&SignedPolicy>) -> Result<()>,
+    on_ack: impl FnOnce(&HelloAck) -> Result<()>,
     stdin: I,
     mut stdout: W,
     mut stderr: E,
@@ -1168,8 +1174,8 @@ where
     write_frame(&mut send, &Frame::Invoke(invocation)).await?;
 
     // Read the host's ack first (it is always the host's first frame).
-    let (ack_membership, newer_policy) = match read_frame(&mut recv).await? {
-        Some(Frame::HelloAck(ack)) => (ack.membership, ack.newer_policy),
+    let ack = match read_frame(&mut recv).await? {
+        Some(Frame::HelloAck(ack)) => ack,
         // Refused: surface the host's reason. No stdin task has been
         // spawned yet, so nothing was forwarded and nothing hit local stdout.
         Some(Frame::Denied { reason }) => return Err(Denied::new(reason).into()),
@@ -1178,10 +1184,10 @@ where
     };
     // Before any stdin: the host's membership must be one our root signed
     // for this very key, and current. Whether the host is still assigned the
-    // service is `on_ack`'s to check, against the signed policy.
-    check_inclusion(&ack_membership, root, target, crate::clock::now_unix())
+    // service is `on_ack`'s to check, against the ack's head and entry.
+    check_inclusion(&ack.membership, root, target, crate::clock::now_unix())
         .map_err(|e| anyhow!("the host's membership was rejected (no stdin sent): {e}"))?;
-    on_ack(newer_policy.as_ref())?;
+    on_ack(&ack)?;
 
     // Local stdin -> Stdin frames, then shut down the send direction (EOF).
     let stdin_task = tokio::spawn(async move {

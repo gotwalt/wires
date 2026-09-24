@@ -220,34 +220,54 @@ async fn an_edit_reaches_the_directory_and_hosts_fetch_it_nobody_dials_them() {
     assert_eq!(mirrored.version(), edit.version());
     assert_eq!(dials.0.load(Ordering::SeqCst), 0, "the admin dialed a host");
 
-    // The host: `head` shows a newer version, so it fetches the policy.
-    let fetched = fetch::check_once(&host_ep, &host_ks).await.unwrap();
+    // The host fetches the newer policy (`policy {have}`).
+    let fetched = fetch::catch_up(&host_ep, &host_ks).await.unwrap();
     assert_eq!(fetched.map(|p| p.version()), Some(edit.version()));
     let held = store::read(&host_ks, f.root.node_id()).unwrap().unwrap();
     assert!(held.policy.assigns(
         &ServiceName::new("orders-db").unwrap(),
         f.nodes[1].node_id()
     ));
-    // Current now: `head` says so, and nothing more is fetched.
-    assert!(
-        fetch::check_once(&host_ep, &host_ks)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    // Current now: the directory says so, and nothing more is fetched.
+    assert!(fetch::catch_up(&host_ep, &host_ks).await.unwrap().is_none());
 
-    // A caller's cold fetch.
+    // Card 37: a caller (neither a host nor a directory) is refused the
+    // whole policy: it asks for its view instead.
     let caller_ep = bind(&f.nodes[2], &f.book).await;
-    let fetched = fetch::catch_up(&caller_ep, &caller_ks).await.unwrap();
-    assert_eq!(fetched.map(|p| p.version()), Some(edit.version()));
-    // Asked again, the directory vouches that it is current.
+    let before = store::read(&caller_ks, f.root.node_id())
+        .unwrap()
+        .unwrap()
+        .version();
     assert!(
         fetch::catch_up(&caller_ep, &caller_ks)
             .await
             .unwrap()
             .is_none()
     );
-    assert!(!store::is_stale(&caller_ks, now_unix()));
+    assert_eq!(
+        store::read(&caller_ks, f.root.node_id())
+            .unwrap()
+            .unwrap()
+            .version(),
+        before,
+        "the caller got no newer policy"
+    );
+    let badge = f.badge(&f.nodes[2]);
+    let answer = wire::ask(
+        &caller_ep,
+        f.nodes[0].node_id(),
+        &badge,
+        None,
+        &DirectoryRequest::Policy {
+            have: StateVersion(0),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&answer, DirectoryAnswer::Denied { reason } if reason.contains("view")),
+        "{answer:?}"
+    );
     assert_eq!(dials.0.load(Ordering::SeqCst), 0);
     admin_ep.close().await;
     let _ = dir.endpoint;

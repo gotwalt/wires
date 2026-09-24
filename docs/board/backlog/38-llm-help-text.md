@@ -1,6 +1,6 @@
 # 38 — Help text an LLM can act on: predictable, useful, terse
 
-**Lane:** H · **Depends on:** [37](37-caller-views.md) (the CLI surface settles there) · **Status:** backlog, 2026-09-24 · **Files:** `wires/lib.rs` (clap definitions), every command's error text, `wires/caller/mcp.rs` and `wires/gateway/` (tool names, descriptions, schemas), `wires/e2e/` or a new `wires/help_snapshots` test, usage.md § Reference
+**Lane:** H · **Depends on:** [37](../done/37-caller-views.md) (the CLI surface settles there) · **Status:** backlog, 2026-09-24 · **Files:** `wires/lib.rs` (clap definitions), every command's error text, `wires/caller/mcp.rs` and `wires/gateway/` (tool names, descriptions, schemas), `wires/e2e/` or a new `wires/help_snapshots` test, usage.md § Reference
 
 ## Why (the human, 2026-09-24)
 

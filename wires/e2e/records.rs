@@ -137,7 +137,16 @@ impl World {
         let ks = Keystore::at(crate::testutil::temp_dir());
         ks.save_node(who).unwrap();
         ks.save_membership(&self.membership(who)).unwrap();
-        adopt(&ks, &self.root, &self.state());
+        // Card 37: a reader holds its view (what it may read, or call).
+        let email = if self.idp(who).issuer == self.idp_alice.issuer {
+            "alice@example.com"
+        } else if who.node_id() == self.bob.node_id() {
+            "bob@example.com"
+        } else {
+            "sam@example.com"
+        };
+        let who_is = super::person(self.idp(who), email);
+        super::hold_view(&ks, &self.root, &self.state(), Some(&who_is));
         let token = self.hello(who).id_token.unwrap();
         std::fs::write(ks.path(ID_TOKEN_FILE), token.as_str()).unwrap();
         ks
@@ -310,14 +319,13 @@ async fn readers_see_all_callers_see_their_own_members_see_nothing() {
     assert_eq!(recs.len(), 4, "{lines:#?}");
     assert!(recs.iter().all(|l| !l.contains("✗")));
 
-    // bob, a member in no reader role: only his own refusal (it names his
-    // verified identity).
+    // bob, a member in no reader role: orders-db is not in his view (card
+    // 37: he may neither call nor read it), so his refusal there, though
+    // recorded, is not his to read; status is, and he never called it.
     let bob = w.reader(&w.bob);
     let (report, lines) = watch_once(&w, &w.bob, &bob, &host, &[], false).await;
     assert!(report.refused.is_empty());
-    let recs = records(&lines);
-    assert_eq!(recs.len(), 1, "{lines:#?}");
-    assert!(recs[0].contains("✗"));
+    assert!(records(&lines).is_empty(), "{lines:#?}");
     // …and nothing at all of status, where he never called.
     let bob2 = w.reader(&w.bob);
     let (_, lines) = watch_once(&w, &w.bob, &bob2, &host, &["status"], false).await;
@@ -569,9 +577,17 @@ async fn mine_is_the_person_not_the_node() {
     assert_eq!(recs.len(), 2, "{lines:#?}");
     assert!(recs[0].contains("from-node-2") && recs[0].contains("alice@example.com"));
 
+    // bob sees his own status call, none of alice's: orders-db is not even
+    // in his view (card 37).
     let bob = w.reader(&w.bob);
-    let (_, lines) = watch_once(&w, &w.bob, &bob, &host, &["orders-db"], false).await;
-    assert!(records(&lines).is_empty(), "{lines:#?}");
+    let (_, lines) = watch_once(&w, &w.bob, &bob, &host, &["status"], false).await;
+    let recs = records(&lines);
+    assert_eq!(recs.len(), 2, "{lines:#?}");
+    assert!(
+        recs.iter()
+            .all(|l| l.contains("bob@example.com") || l.contains("exit 0"))
+    );
+    assert!(recs.iter().all(|l| !l.contains("from-node-2")));
 }
 
 /// A reader with no verified principal sees nothing in full, not even what

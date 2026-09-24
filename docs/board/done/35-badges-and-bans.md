@@ -2,7 +2,7 @@
 
 **Lane:** D1 · **Depends on:** 28 · **Status:** review (2026-09-24, `worker/35-badges`), designed 2026-09-24 · **Files:** `library/services/{state,access}.rs`, `library/membership/`, `wires/admin/{init,invite,remove,keystore}.rs`, `wires/host/{gate,push,record_stream}.rs`, `wires/state/`, `wires/caller/{join,call,inbox}.rs`, `wires/gateway/mod.rs`, protocol.md §2–4, [fabric.md](../../fabric.md)
 
-The first of three cards (35 → [36](../done/36-directory.md) → [37](../backlog/37-caller-views.md)) that replace
+The first of three cards (35 → [36](../done/36-directory.md) → [37](../done/37-caller-views.md)) that replace
 "every node holds the whole signed state" with a directory. Together they supersede the
 distribution half of [card 29](../backlog/29-person-identity.md). The architecture they build toward is
 [docs/fabric.md](../../fabric.md).

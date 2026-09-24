@@ -10,7 +10,8 @@
 //!   whenever it moves past what the subscriber holds, and a `fresh` beat
 //!   otherwise; a host's `policy` subscription, the whole policy once and
 //!   then `policy_update` deltas ([`sub_policy`](super::sub_policy)); a
-//!   caller's `view` is card 37's.
+//!   caller's `view` subscription, the whole view once and then
+//!   `view_update` deltas ([`sub_view`](super::sub_view)).
 //! - [`beat_loop`]: a new `Fresh` every `settings.beat_secs`.
 //! - [`replicate`]: follow every other directory the head lists as a
 //!   `replica`, and take any newer head it has, so a directory that missed
@@ -78,11 +79,19 @@ async fn one_request(dir: &Directory, conn: &Connection, caller: NodeId) -> Resu
         }
     };
     let answer = match wire::read_request(&mut recv).await {
-        Ok(DirectoryRequest::Hello { badge, .. }) => {
+        Ok(DirectoryRequest::Hello { badge, id_token }) => {
             match dir.admit(caller, &badge, now_unix()) {
                 Err(detail) => refuse(detail),
                 // Admitted: only now is a (possibly large) request read.
                 Ok(()) => match wire::read_request(&mut recv).await {
+                    // A caller's view (card 37), cut for its ID token.
+                    Ok(
+                        request
+                        @ (DirectoryRequest::View { .. } | DirectoryRequest::Resolve { .. }),
+                    ) => {
+                        dir.answer_caller(caller, id_token.as_ref(), request, now_unix())
+                            .await
+                    }
                     Ok(request) => dir.answer(caller, request, now_unix()),
                     Err(e) => {
                         tracing::info!(peer = %caller.hex(), "unreadable directory request: {e:#}");
@@ -133,8 +142,8 @@ async fn subscription(dir: &Directory, conn: &Connection, caller: NodeId) -> Res
         send.finish().ok();
         Ok(())
     };
-    let badge = match wire::read_sub_request(&mut recv).await {
-        Ok(SubRequest::Hello { badge, .. }) => badge,
+    let (badge, id_token) = match wire::read_sub_request(&mut recv).await {
+        Ok(SubRequest::Hello { badge, id_token }) => (badge, id_token),
         other => {
             let detail = match other {
                 Err(e) => format!("{e:#}"),
@@ -156,14 +165,15 @@ async fn subscription(dir: &Directory, conn: &Connection, caller: NodeId) -> Res
     match kind {
         SubscriptionKind::Replica => {}
         SubscriptionKind::Policy => {
+            // Card 37: the whole policy is for hosts and directories; a
+            // caller follows its view.
+            if !dir.holds_whole(caller) {
+                return deny(&mut send, super::node::VIEW_NOT_POLICY.into()).await;
+            }
             return super::sub_policy::serve(dir, conn, &mut send, caller, have).await;
         }
         SubscriptionKind::View => {
-            return deny(
-                &mut send,
-                "this directory does not serve view subscriptions yet (card 37)".into(),
-            )
-            .await;
+            return super::sub_view::serve(dir, conn, &mut send, caller, id_token.as_ref()).await;
         }
     }
     let listed = |dir: &Directory| {

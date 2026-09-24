@@ -7,14 +7,14 @@
 //! the lock a removed member presenting a genuine older policy could roll a
 //! node back.
 //!
-//! Hosts and directories hold the whole policy; callers do too until card
-//! 37 gives each its view. A directory keeps its own copy in
+//! Hosts, directories and the admin hold the whole policy; a caller holds
+//! only its view (`view.json`, [`crate::caller::view`], card 37). A directory keeps its own copy in
 //! `directory.redb` ([`crate::directory`]).
 
 use std::fs::OpenOptions;
 
 use anyhow::{Context, Result, bail};
-use library::{Membership, NodeId, Policy, SignedPolicy, StateVersion};
+use library::{NodeId, Policy, SignedPolicy, StateVersion};
 
 use crate::admin::keystore::{Keystore, create_private_dir, write_text_mode};
 
@@ -25,7 +25,7 @@ pub(crate) const POLICY_FILE: &str = "policy.json";
 const LOCK_FILE: &str = "policy.json.lock";
 
 /// When this node last checked its copy with a directory
-/// (`policy-checked.txt`, unix seconds): what [`is_stale`] measures against.
+/// (`policy-checked.txt`, unix seconds).
 const CHECKED_FILE: &str = "policy-checked.txt";
 
 /// A signed policy this node verified under its root, and the typed
@@ -63,17 +63,6 @@ impl Held {
     pub(crate) fn directories(&self) -> &[NodeId] {
         &self.signed.head.head.directories
     }
-}
-
-/// This node's membership and its policy (verified under the membership's
-/// root), both required: what a command that acts as a member needs first.
-/// Either missing is an error that says to run `wires join`.
-pub(crate) fn require(ks: &Keystore) -> Result<(Membership, Held)> {
-    let membership = ks
-        .read_membership()?
-        .context("this node has no membership: run `wires join <token>` first")?;
-    let held = require_policy(ks, membership.fabric)?;
-    Ok((membership, held))
 }
 
 /// [`read`], required to exist (for a membership resolved elsewhere, such as
@@ -149,16 +138,6 @@ pub(crate) fn fabric(ks: &Keystore) -> Result<Option<NodeId>> {
 /// Record that this node's copy was checked against a directory at `now`.
 pub(crate) fn mark_checked(ks: &Keystore, now: i64) -> Result<()> {
     write_text_mode(&ks.path(CHECKED_FILE), &format!("{now}\n"), None)
-}
-
-/// Whether this node's copy was last checked more than
-/// [`STALE_AFTER_SECS`](super::fetch::STALE_AFTER_SECS) before `now` (or
-/// never).
-pub(crate) fn is_stale(ks: &Keystore, now: i64) -> bool {
-    std::fs::read_to_string(ks.path(CHECKED_FILE))
-        .ok()
-        .and_then(|t| t.trim().parse::<i64>().ok())
-        .is_none_or(|at| now.saturating_sub(at) > super::fetch::STALE_AFTER_SECS)
 }
 
 #[cfg(test)]
@@ -238,15 +217,5 @@ mod tests {
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&ks.path(POLICY_FILE)), 0o600);
-    }
-
-    #[test]
-    fn staleness() {
-        let ks = keystore();
-        let max = super::super::fetch::STALE_AFTER_SECS;
-        assert!(is_stale(&ks, 1_000), "never checked is stale");
-        mark_checked(&ks, 1_000).unwrap();
-        assert!(!is_stale(&ks, 1_000 + max));
-        assert!(is_stale(&ks, 1_001 + max));
     }
 }

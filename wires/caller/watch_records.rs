@@ -1,13 +1,14 @@
 //! `wires watch [<service>…] [--mine] [--json]` (card 26b): stream call
 //! records from the hosts that hold them.
 //!
-//! The service's hosts come from the signed policy; the reader never names a
+//! The service's hosts come from its entry in the reader's view (card 37: the
+//! services it may read, or call for its own records); it never names a
 //! host. Each host is dialed by key on the record-stream ALPN
 //! ([`record_stream`]) with the same credentials
 //! a call presents, and answers with what this reader may see: every record
 //! of a service whose `readers` roles it is in, otherwise only its own calls
 //! (`--mine` asks for only those everywhere). With no service named, every
-//! service in the signed policy is asked for.
+//! service in the view is asked for.
 //!
 //! Every entry is checked as it arrives ([`Chain`]): the host's signature,
 //! and the hash link to the entry before it, across the runs of entries the
@@ -61,7 +62,6 @@ use crate::caller::one_line;
 use crate::caller::pick::{self, Hints};
 use crate::host::record_stream::{self, Link, RecordFrame, StreamItem};
 use crate::host::transport;
-use crate::policy::store;
 
 /// The keystore file holding the reader's marks: per host, its chain anchor,
 /// a resume point per view, and recent calls' labels ([`Marks`]).
@@ -73,7 +73,7 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// `wires watch [<service>…] [--mine] [--json] [--once]`.
 #[derive(Args, Clone, Debug, Default)]
 pub(crate) struct WatchArgs {
-    /// The services to watch (default: every service in the signed policy).
+    /// The services to watch (default: every service in the view).
     #[arg(value_name = "SERVICE")]
     pub(crate) services: Vec<String>,
     /// Only your own calls, even for services whose records you may read.
@@ -96,7 +96,7 @@ pub(crate) struct WatchArgs {
 /// What a watch asks for.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WatchOpts {
-    /// The services (empty: every service in the signed policy).
+    /// The services (empty: every service in the view).
     pub(crate) services: Vec<ServiceName>,
     /// Only the reader's own calls.
     pub(crate) mine: bool,
@@ -576,14 +576,19 @@ pub(crate) async fn watch_with(
     opts: &WatchOpts,
     out: &mut (dyn FnMut(Output) + Send),
 ) -> Result<Report> {
-    let (membership, state) = store::require(ks)?;
-    let state = &state.policy;
+    // Card 37: the services come from this node's view: those it may read
+    // (every record) or call (its own records).
+    let membership = ks
+        .read_membership()?
+        .context("this node has no membership: run `wires join <token>` first")?;
+    let held = crate::caller::services::current_view(ks).await?;
+    let view = &held.view;
     let services: Vec<ServiceName> = if opts.services.is_empty() {
-        state.services.keys().cloned().collect()
+        view.entries.iter().map(|e| e.entry.name.clone()).collect()
     } else {
         for s in &opts.services {
-            if state.service(s).is_none() {
-                bail!("no service named `{s}` (see `wires services`)");
+            if view.entry(s).is_none() {
+                bail!("no service named `{s}` in your view (see `wires services`)");
             }
         }
         opts.services.clone()
@@ -591,7 +596,7 @@ pub(crate) async fn watch_with(
     let hello = crate::caller::hello::with_membership(ks, membership);
     let mut marks = Marks::load(ks);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let hosts = pick::hosts_of(state, services.iter());
+    let hosts = pick::hosts_of(view, services.iter());
     let mut report = Report {
         hosts: hosts.len(),
         ..Report::default()
@@ -602,7 +607,10 @@ pub(crate) async fn watch_with(
     for host in &hosts {
         let here: Vec<ServiceName> = services
             .iter()
-            .filter(|s| state.assigns(s, *host))
+            .filter(|s| {
+                view.entry(s)
+                    .is_some_and(|e| e.entry.service.hosts.contains(host))
+            })
             .cloned()
             .collect();
         let view = Marks::view(&here, opts.mine);

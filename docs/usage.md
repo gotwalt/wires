@@ -10,7 +10,7 @@ choices, the limits, and the command reference. The wire-level spec is
 | Role | Decides | Commands |
 |---|---|---|
 | **admin** | who's in (it mints each node's badge, and bans), which IdPs are trusted, which roles exist, which services run where, who may call and read each, which nodes are directories (root key) | `init`, `invite`, `remove`, `issuer set\|rm`, `role set\|rm`, `service add\|set\|rm`, `directory add\|rm`, `state push`, `state settings` |
-| **directory** | nothing: it holds the newest signed policy, vouches for its freshness, and hands it to hosts and callers; it never decides a call | `serve` (when the policy lists it), `directory serve` |
+| **directory** | nothing: it holds the newest signed policy, vouches for its freshness, hands it whole to hosts, and hands each caller its view (the services that caller may use, cut for its verified identity); it never decides a call | `serve` (when the policy lists it), `directory serve` |
 | **host** | how it implements its assigned services; stricter local rules (narrower IdPs, `also_require`); push | `serve host.json`, `push` |
 | **caller** | — runs services by name; MCP (stdio, or the remote gateway) so wires works in the clients people already use | `id`, `join`, `login`, `services`, `call`, `mcp`, `inbox`, `gateway` |
 | **reader** | — any member; reads the records a service's `readers` role allows, or its own (by verified identity) | `watch` |
@@ -22,16 +22,16 @@ Every role joins the same way: `wires id`, then `wires join <token>` with the ad
 | Guarantee | Lives in | Checked by |
 |---|---|---|
 | **Who's in** | Each node's badge: its root-signed membership, minted by `wires invite` (at most 30 days). Removal is a ban in the admin-signed policy until that badge would expire; the policy lists no members. | The host, per connection: the badge, and the bans in its copy of the policy (re-read every dial). |
-| **Who may call what** | The policy's registry: each service's `allow` roles, and the role definitions (matchers on the IdP identity, each naming its issuer). Every role needs a verified identity. | The host, on every call. `wires services` evaluates the same table locally, for listing only. |
+| **Who may call what** | The policy's registry: each service's `allow` roles, and the role definitions (matchers on the IdP identity, each naming its issuer). Every role needs a verified identity. | The host, on every call. A directory cuts each caller's view from the same table, for listing and dialing only. |
 | **Stricter local rules** | `host.json`'s `also_require` roles per service. They can only narrow. | The host, after the registry. |
 | **Who is calling** | Your IdP's ID token, bound to the caller's node key at `wires login` (the OIDC `nonce` is a hash of the key), presented in the session `Hello`. | The host, against the issuer's JWKS, under the issuers the policy trusts (`host.json` may narrow them). No wires identity service. |
 | **Reach** | The host's node key. Callers dial a key (iroh; n0 discovery, or an optional local `$WIRES_HOME/hints` file); the host binds UDP for QUIC and has no TCP listener. | iroh's handshake authenticates the key (any key may connect); the host then checks the badge and the bans at the first message, and a key without a valid badge, or banned, hears only `not a member of this network`. |
-| **Which host** | The registry's `hosts` for the service. Only the admin binds a name to a host, so no host can squat a name. | The caller (it dials only those hosts) and the host (it refuses to start, or to serve, a name not assigned to it). |
+| **Which host** | The registry's `hosts` for the service. Only the admin binds a name to a host, so no host can squat a name. | The caller (it dials only the hosts its view's root-signed entry lists) and the host (it refuses to start, or to serve, a name not assigned to it). |
 | **Records** | Each host's own call log: every call, admitted caller's refusal and push (a knock from a node that isn't admitted is traced, not logged), signed by the host and hash-linked. | Readers, with `wires watch`: the service's `readers` roles see all of it; everyone else sees only the records of their own verified identity (issuer and subject, from any of their nodes) and a hash link for every other entry. Every entry and the chain are verified. |
 | **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. A service pushes only through its call's capability, to that call's caller. | The host, at send, delivery and fetch: not banned by the policy, in a `push.allow` role. |
 | **Removal** | A new policy, published to the directories; hosts fetch it from one. No shared key exists, so there is nothing to rotate. | Each host that has the new policy, on the removed member's next call or fetch there. |
 
-Nothing is broadcast: a member that takes part in no call receives no traffic about other members' calls. What every member does learn is the whole signed policy: every role matcher, service, host id, ban and directory, though no list of members (card [35](board/done/35-badges-and-bans.md)). The policy now lives on directories (card 36); card [37](board/backlog/37-caller-views.md) narrows what each caller holds to its own view, the root-signed entries of the services it may use, while hosts keep the whole policy ([fabric.md](fabric.md)).
+Nothing is broadcast: a member that takes part in no call receives no traffic about other members' calls. The policy lives on directories (card 36). **A caller holds only its view** (card 37): the root-signed entries of the services its verified person may call or read, which a directory cuts for its ID token. It holds no role, no ban, no other service, and no node id but its services' hosts and the directories. Hosts, directories and the admin hold the whole policy (every role matcher, service, host id, ban and directory, though no list of members, card [35](board/done/35-badges-and-bans.md)); see [fabric.md](fabric.md).
 
 ## Walkthrough
 
@@ -46,10 +46,13 @@ step. Node ids are shortened.
 
 **1. admin: start, define roles.** The first policy trusts one IdP: Google
 unless `--issuer` names another, with the OAuth client id `wires login` signs in
-under (`--client-id`, or `$WIRES_OIDC_CLIENT_ID`). More with `wires issuer set`.
+under (`--client-id`, or `$WIRES_OIDC_CLIENT_ID`) and, for a Google "Desktop
+app" client, its public secret (`--public-client-secret`: not confidential;
+never pass a confidential one). Every invite carries these, so a joiner's
+`wires login` needs no flags. More IdPs with `wires issuer set`.
 
 ```console
-admin$ wires init --client-id <client id>.apps.googleusercontent.com
+admin$ wires init --client-id <client id>.apps.googleusercontent.com --public-client-secret <desktop secret>
 network 57b09428…
 node 23028cae…
 policy version 1 (trusts https://accounts.google.com)
@@ -63,8 +66,9 @@ role security set (policy version 3)
 **2. Hosts join, become the directories, and the admin registers the
 service.** Each machine sends its `wires id`; the admin sends back one token.
 A **directory** holds the signed policy for everyone else: the admin publishes
-each edit to it, and hosts and callers fetch from it. Any node can be one; in
-this small network the two hosts are also the directories.
+each edit to it, hosts fetch it whole, and each caller asks it for its view.
+Any node can be one; in this small network the two hosts are also the
+directories.
 
 ```console
 workbench$ wires id
@@ -88,11 +92,11 @@ exits 1: the new policy is stored on the admin and nowhere else. Once a
 directory is up, `wires state push` re-publishes it. A host that starts on a
 policy that doesn't assign it the service fetches a newer one from a directory
 before giving up; here none is up yet, so the hosts join with a fresh `wires
-invite` token, which carries the current policy (re-joining never rolls a
-policy back). An invite edits nothing: it mints the node's badge (its
-membership, which is what admits it) and carries the admin's current signed
-policy. The token isn't a secret: the badge is bound to the invitee's key, and
-the policy names no other member.
+invite` token: a node the policy names as a host or a directory gets the
+whole current policy in its token (re-joining never rolls a policy back). An
+invite edits nothing: it mints the node's badge (its membership, which is what
+admits it). The token isn't a secret: the badge is bound to the invitee's key,
+and nothing in it names another member.
 
 **3. The hosts serve.** `host.json` says only how each service runs here. A
 command is an argv, exec'd directly and never through a shell, with the
@@ -130,26 +134,35 @@ directory on the same endpoint too. A node that hosts nothing runs one with
 
 **4. The agent and the observer join.** An invite mints a badge and edits
 nothing, so the hosts need no new policy: they admit any badge the root
-signed.
+signed. A caller's token is its badge, the ids of up to two directories and
+the IdP to sign in with: under 1 KB, at any fabric size. It holds no policy.
 
 ```console
 admin$ wires invite dd7e7237… --name agent
 wires: invited dd7e7237… as "agent" (badge until 1792703101; policy version 6 unchanged)
 agent$ wires join eyJhZG1pbiI6…
+joined network 57b09428… as dd7e7237… (policy version 6)
+next: `wires login` to sign in, then `wires services`
 ```
 
-**5. agent: before sign-in, nothing; after, one service.**
+**5. agent: before sign-in, nothing; after, one service.** The agent holds a
+**view**: the services its verified identity may use, each an entry the root
+signed, cut by a directory for its ID token. Before it signs in, the view is
+empty: no role admits a node with no identity, so it knows no host to dial.
 
 ```console
 agent$ wires services
-wires services: no service allows this node without a login (policy v6)
+wires services: no service to list: this node is not signed in (`wires login`) (policy v6)
 agent$ wires call orders-db -- "select count(*) from orders"
-wires: denied by host: no ID token presented; run `wires login`; orders-db needs a verified identity in role analyst
+wires: no service named `orders-db` that you may use: this node is not signed in (run `wires login`), and every service needs a verified identity
 agent$ echo $?
-77
-agent$ wires login --client-id <client id> --client-secret <secret>
+1
+agent$ wires login
 wires login: node dd7e7237… is alice@example.com (token stored in …/idp-token.jwt, valid until unix …)
+wires login: 1 service(s) you may call (policy version 6); see `wires services`
 agent$ wires services
+orders-db  Read-only SQL (sqlite3) over the orders database; pass the SQL statement as the argument.  (analyst)
+agent$ wires services orders          # search names and descriptions
 orders-db  Read-only SQL (sqlite3) over the orders database; pass the SQL statement as the argument.  (analyst)
 agent$ wires call orders-db -- "select count(*) from orders"
 count(*)
@@ -157,12 +170,14 @@ count(*)
        7
 ```
 
-A signed-in node in no allowed role sees nothing, and naming the service
-anyway is refused with the reason:
+`wires login` needed no flags: the invite named the IdP and its client. A
+signed-in node in no allowed role sees nothing it may call. The observer may
+read orders-db's records, so the service is in its view (marked `read`), and
+naming it in a call reaches the host, which refuses it with the reason:
 
 ```console
 observer$ wires services
-wires services: no service allows sec@audit.example (policy v6)
+wires services: no service to list: no service allows you (policy v6)
 observer$ wires call orders-db -- "select 1"
 wires: denied by host: sec@audit.example is in no role allowed to call orders-db (analyst)
 ```
@@ -176,7 +191,6 @@ own logs, with no key to either end:
 
 ```console
 observer$ wires watch orders-db --once
-21:13:08 orders-db ✗ dd7e… orders-db denied: no ID token presented; run `wires login`; …
 21:13:09 orders-db ✗ f6d6… orders-db denied: sec@audit.example is in no role allowed to call orders-db (analyst)
 21:13:09 orders-db ▶ 8bd5 alice@example.com (dd7e…) [analyst] orders-db "select count(*) from orders"
 21:13:09 orders-db ■ 8bd5 exit 0 · 3 ms · 27 B out · blake3 8b4c…
@@ -447,17 +461,24 @@ To make `wires` the boundary, use a structural setup:
 
 ## Known trade-offs
 
-- **Known and accepted until cards [36](board/done/36-directory.md)–[37](board/backlog/37-caller-views.md)** (the directory; [fabric.md](fabric.md)), [09](board/backlog/09-witness.md) and [29](board/backlog/29-person-identity.md):
-  - **Every node holds the whole policy**: host and banned node ids, role
-    matchers (often people's emails), service names and descriptions,
-    trusted IdPs, directories. It is signed, not secret. It lists no members
-    (card 35), but every agent's machine still holds every service and role
-    until card 37 (views). Hosts hold all of it by design.
+- **Known and accepted until cards [09](board/backlog/09-witness.md) and [29](board/backlog/29-person-identity.md)**, and by design ([fabric.md](fabric.md)):
+  - **Hosts and directories hold the whole policy**: host and banned node
+    ids, role matchers (often people's emails), service names and
+    descriptions, trusted IdPs, directories. It is signed, not secret, and
+    lists no members (card 35). A caller holds only its view (card 37).
+  - **A directory sees who asks for what.** It verifies each caller's ID
+    token to cut its view, so it learns which person asks for which view
+    (traced, not logged). It can withhold an entry or serve a stale view
+    (a signed freshness timestamp bounds how stale), which makes a caller
+    miss a service, never reach one it may not use: the host decides every
+    call from its whole policy.
   - **A removed host still sees argv** while its badge is valid, from a
-    caller whose copy of the policy predates the ban: the caller sends the
-    arguments with its `Hello` and stops before stdin only once the host
-    hands back a policy that no longer assigns it the service. A caller that
-    holds the ban never dials it.
+    caller whose view predates the removal: the caller sends the arguments
+    with its `Hello` and stops before stdin only once the host's handshake
+    shows a newer head whose entry no longer lists it.
+  - **A revoked grant takes your old records with it.** `wires watch` reads
+    the services in your view, so once a service leaves it, your own
+    records there are no longer yours to read (its readers still see them).
   - **Hidden record links reveal count and timing** to a caller who isn't a
     service's reader (not content, caller or service).
   - **Google ID tokens last about an hour**, and Google drops the `nonce`
@@ -473,10 +494,12 @@ To make `wires` the boundary, use a structural setup:
   one it replaces); re-issue memberships with `wires invite <id>`.
 - **The admin is a one-shot command.** It publishes each edit to the
   directories only. An edit that reaches none exits 1; `wires state push`
-  re-publishes it. Callers fetch from a directory on their next command
-  (after 10 minutes), or get it at their next call's handshake; hosts follow
-  a directory's subscription and have each edit within a second. With no
-  directory up, a node needs a fresh invite.
+  re-publishes it. Hosts follow a directory's subscription and have each
+  edit within a second; so do `wires mcp` and gateway sessions, for their
+  views. A one-shot `wires call` learns of an edit in its next call's
+  handshake and refreshes its view then; `wires services` refreshes a view
+  older than a day. With no directory up, callers use the view they hold,
+  and a host needs a fresh invite.
 - **With every directory down, hosts keep deciding** from their copy under
   the default `lenient` freshness, and say so in their trace (not yet in
   `wires watch`); edits and bans don't spread until a directory is back.
@@ -512,9 +535,6 @@ To make `wires` the boundary, use a structural setup:
 - **The recorded two-machine demo** with real Google sign-in and Claude Code
   as the agent ([card 08](board/doing/08-demo-two-machine.md);
   script in [docs/demo.md](demo.md)).
-- **Caller views** ([card 37](board/backlog/37-caller-views.md); the
-  architecture is [fabric.md](fabric.md)): each caller holds only its view,
-  with search, and `wires mcp` notices a new policy without a restart.
 - `login --for` and day-passes for headless agents
   ([card 29](board/backlog/29-person-identity.md)); transparency-log
   checkpoints witnessed by the directory ([card 09](board/backlog/09-witness.md));
@@ -531,10 +551,10 @@ To make `wires` the boundary, use a structural setup:
 
 | Role | Command | What it does |
 |---|---|---|
-| **admin** | `wires init [--issuer URL] [--client-id ID] [--audience A]… [--ttl 30d] [--state-ttl 90d]` | Create the root key and this node, mint this node's badge, and sign policy version 1, trusting one IdP: `--issuer` (default `https://accounts.google.com`), whose OAuth client id `--client-id` (else `$WIRES_OIDC_CLIENT_ID`; required) `wires login` signs in under, and whose `--audience` values hosts accept (default: the client id). `--ttl` is this node's badge lifetime (at most 30 days), `--state-ttl` the policy's. |
-| | `wires invite <node-id> [--name l] [--ttl 30d] [--state-ttl 90d]` | Mint the node's badge (valid for `--ttl`, at most 30 days), record it in the admin's ledger (`issued.json`), print its join token (stdout): the badge and the signed policy. Not a policy edit: nothing is published. Re-inviting a banned node lifts its ban (an edit, published; `--state-ttl` applies). |
+| **admin** | `wires init [--issuer URL] [--client-id ID] [--audience A]… [--public-client-secret S] [--ttl 30d] [--state-ttl 90d]` | Create the root key and this node, mint this node's badge, and sign policy version 1, trusting one IdP: `--issuer` (default `https://accounts.google.com`), whose OAuth client id `--client-id` (else `$WIRES_OIDC_CLIENT_ID`; required) `wires login` signs in under, and whose `--audience` values hosts accept (default: the client id). Invites tell `wires login` to use this IdP; `--public-client-secret` is its client's public (Desktop-app) secret, which invites carry and the signed policy doesn't. `--ttl` is this node's badge lifetime (at most 30 days), `--state-ttl` the policy's. |
+| | `wires invite <node-id> [--name l] [--ttl 30d] [--state-ttl 90d]` | Mint the node's badge (valid for `--ttl`, at most 30 days), record it in the admin's ledger (`issued.json`), print its join token (stdout): the badge, up to two directory ids and the login settings (under 1 KB; a host or directory also gets the signed policy). Not a policy edit: nothing is published. Re-inviting a banned node lifts its ban (an edit, published; `--state-ttl` applies). |
 | | `wires remove <name\|node-id> [--state-ttl 90d]` | Ban a node until its badge would expire (30 days for a node the ledger doesn't know), and drop it from every service's hosts and from the directories; publish. Its next call to a host that has the new policy is refused. |
-| | `wires issuer set <iss> --client-id ID [--audience A]…` · `issuer rm <iss>` | Trust an IdP (or change its client id and accepted audiences; default audience: the client id), or stop trusting one no role names. Every role's matchers must name a trusted issuer. |
+| | `wires issuer set <iss> --client-id ID [--audience A]… [--public-client-secret S] [--login]` · `issuer rm <iss>` | Trust an IdP (or change its client id and accepted audiences; default audience: the client id), or stop trusting one no role names. `--login` makes it the IdP invites name; `--public-client-secret` as for `init`. Every role's matchers must name a trusted issuer. |
 | | `wires directory add\|rm <name\|node-id>` | List a node (invited, not banned) as one of the network's directories, or stop listing it. |
 | | `wires role set <name> [--issuer URL] [--state-ttl] <matcher>…` · `role rm <name>` | Define a role as an OR of matchers: `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…` (all must hold). Every matcher names its issuer, compared exactly: one without `issuer=` takes `--issuer` (default `https://accounts.google.com`). `issuer=…` alone admits anyone that IdP verified. `org` is Google's `hd`, read only from Google. The issuer must be one the policy trusts (`wires issuer set`). There is no built-in role: a node with no verified identity is in no role. |
 | | `wires service add\|set <name> [--description D] [--allow role]… [--host node]… [--reader role]…` · `service rm <name>` | Edit the registry. `--host` is an `invite --name` label or a node id, of a node this admin invited and didn't ban; `set` replaces each list given. |
@@ -544,12 +564,12 @@ To make `wires` the boundary, use a structural setup:
 | **host** | `wires serve host.json` | Refuse to start unless the policy assigns every service in the file here (fetching a newer one from a directory first if needed); then check every caller against the policy, exec the service per call, and log every call, admitted caller's refusal and push. It follows a directory's subscription for every edit (and, under `strict` freshness, refuses calls while no directory vouches for its policy), and runs the directory too when the policy lists this node. `--check` validates and prints what the file implements. |
 | | `wires push --to <node-id\|role> --subject S [--ttl D] -- <body>` | Hand a message for a caller to this machine's running `serve` (body from stdin if none is given). From the operator's shell: to any node or role. From a service (it has `WIRES_PUSH_TOKEN`): only to that call's caller. Prints `delivered`, `queued` or `denied` per recipient; exits `77` if every recipient was refused. |
 | **caller** | `wires id` | Print this node's id (creating its key on first use). |
-| | `wires join <token>` | Install an invite: the badge (membership) and the signed policy. |
-| | `wires login` | Sign in with your IdP (Google by default; `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*`) and store the key-bound ID token. |
-| | `wires services [--verbose] [--json]` | List the services you may call and the role that admits you, evaluated locally. `--verbose` adds their hosts. |
-| | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name (or a `tools.json` alias; a registered service of the same name wins). Stdio passes through and its exit code becomes `call`'s, except that a remote exit `77` is reported as `1` (with a note on stderr). A refusal by the host exits `77`; a local or transport failure, an expired policy, or a newer policy (handed back at the handshake) that no longer assigns the service to that host exits `1`, before any stdin is sent. |
-| | `wires mcp` | Serve the same services as MCP tools over stdio (Claude Desktop, IDEs). |
-| | `wires gateway --public-url https://… [--listen addr] [--client-id …]` | Serve them as a remote MCP server (Streamable HTTP + OAuth 2.1) for web clients such as Claude.ai. Each user signs in with Google through the gateway and calls with their own token ([deployment](deployment.md#a-web-gateway)). |
+| | `wires join <token>` | Install an invite: the badge (membership), the directory ids and the login settings (and, for a host, the signed policy); a caller then asks a directory for the head. |
+| | `wires login` | Sign in with the IdP your invite named (flags `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*` override it), store the key-bound ID token, and fetch your view: the services you may use. |
+| | `wires services [query] [--verbose] [--json]` | List the services in your view you may call, with the roles each allows; a `query` keeps those whose name or description contains it. Refreshes the view first when it is over a day old or a call saw a newer policy. `--verbose` adds their hosts. |
+| | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name, from your view (a name it lacks is asked of a directory; or a `tools.json` alias, which a service in your view of the same name beats). Stdio passes through and its exit code becomes `call`'s, except that a remote exit `77` is reported as `1` (with a note on stderr). A refusal by the host exits `77`; a service you may not use, a local or transport failure, an expired view, or a newer policy head (in the host's handshake) whose entry no longer lists that host exits `1`, before any stdin is sent. On an unchanged fabric the call is its only connection. |
+| | `wires mcp` | Serve the same services as MCP tools over stdio (Claude Desktop, IDEs), following your view: a grant or revocation reaches the client as `tools/list_changed` within seconds. Past 40 services it offers `search_services` and `call_service` instead of one tool each. |
+| | `wires gateway --public-url https://… [--listen addr] [--client-id …]` | Serve them as a remote MCP server (Streamable HTTP + OAuth 2.1) for web clients such as Claude.ai. Each user signs in with Google through the gateway and calls with their own token, from their own view (one subscription per live session) ([deployment](deployment.md#a-web-gateway)). |
 | | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`. |
 | **reader** | `wires watch [service…] [--mine] [--once] [--json]` | Stream call records from your services' hosts, verified: all records of services whose `readers` role you're in, otherwise your own (your verified identity's, from any node). A following stream is re-decided when the signed policy changes or your ID token expires, and ends with the refusal when access is gone (exit `77` when every host refused). A log rolled back below what you verified, or rewritten, is an alarm (exit 1); entries pruned past it (retention, 30 days) are a notice. Marks are kept per host, so any view catches a rewrite another view verified. The service each line names is derived from the signed records, not supplied by the host. |
 

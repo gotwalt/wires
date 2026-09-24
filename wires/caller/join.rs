@@ -2,21 +2,29 @@
 //!
 //! A host and a caller join the same way: send the admin this node's id
 //! (`wires id`), paste back the token `wires invite` printed (`wires join
-//! <token>`). Join checks the token is for this node, signed by one root
-//! throughout, and not banned by its state, then installs the membership
-//! (this node's badge: what admits it) and the admin-signed policy where
-//! every other command looks for them. The policy's head names the
-//! directories newer policies are fetched from.
+//! <token>`). Join checks the token is for this node and signed by one root
+//! throughout, then installs what it carries where every other command
+//! looks for it (card 37):
 //!
-//! After this, newer policies are fetched from a directory (by a host at
-//! start and every beat; by a caller on a cold command) or handed back in a
-//! call's `HelloAck`; nothing needs importing by hand again.
+//! - the membership (this node's badge: what admits it);
+//! - the directory ids (`directories.json`): where the head, the view and
+//!   (for a host) the policy are asked for;
+//! - the login settings (`login.json`): which IdP and OAuth client `wires
+//!   login` signs in with, so it needs no flags;
+//! - for a node the policy names as a host or directory, the whole signed
+//!   policy.
+//!
+//! A caller then asks a directory for the head, so it knows the fabric's
+//! version and directories at once (its view, empty until it signs in; the
+//! services come with `wires login`). Nothing needs importing by hand again:
+//! a host follows the policy from a directory, a caller its view.
 
 use anyhow::{Context, bail};
 use clap::Args;
-use library::{Invite, NodeId, NodeIdentity};
+use library::{Invite, NodeId, NodeIdentity, View};
 
 use crate::admin::keystore::{self, Keystore};
+use crate::caller::view::{self, HeldView};
 use crate::clock::now_unix;
 
 /// `join` arguments.
@@ -47,31 +55,53 @@ pub(crate) fn id_in(ks: &Keystore) -> anyhow::Result<(NodeId, bool)> {
     Ok((node.node_id(), true))
 }
 
-/// `join`: install the token, or print this node's id when there is none.
-pub(crate) fn join_cmd(a: JoinArgs) -> anyhow::Result<String> {
+/// `join`: install the token (and, for a caller, ask a directory for the
+/// head), or print this node's id when there is none.
+pub(crate) async fn join_cmd(a: JoinArgs) -> anyhow::Result<String> {
     let ks = Keystore::resolve()?;
-    match a.token {
-        Some(token) => join_in(&ks, &token, now_unix()),
-        None => {
-            let (id, _) = id_in(&ks)?;
-            Ok(format!(
-                "{}\nsend this node id to your admin; they run `wires invite {}` and send back \
-                 the token for `wires join <token>`",
-                id.hex(),
-                id.hex()
-            ))
+    let Some(token) = a.token else {
+        let (id, _) = id_in(&ks)?;
+        return Ok(format!(
+            "{}\nsend this node id to your admin; they run `wires invite {}` and send back the \
+             token for `wires join <token>`",
+            id.hex(),
+            id.hex()
+        ));
+    };
+    let joined = join_in(&ks, &token, now_unix())?;
+    let mut out = joined.summary;
+    if joined.caller {
+        match fetch_head(&ks).await {
+            Ok(held) => out.push_str(&format!(" (policy version {})", held.version().0)),
+            Err(e) => {
+                tracing::debug!("asking a directory for the head: {e:#}");
+                out.push_str(
+                    " (no directory answered yet; `wires login` asks again for your services)",
+                )
+            }
         }
     }
+    out.push_str("\nnext: `wires login` to sign in, then `wires services`");
+    Ok(out)
 }
 
-/// [`join_cmd`] with a token, against an explicit keystore (the testable
-/// form). Returns the summary for stdout.
+/// What [`join_in`] installed.
+#[derive(Debug)]
+pub(crate) struct Joined {
+    /// The first line for stdout.
+    pub(crate) summary: String,
+    /// The invite carried no policy (a caller): ask a directory for the head.
+    pub(crate) caller: bool,
+}
+
+/// [`join_cmd`] with a token, against an explicit keystore, without the
+/// network (the testable form).
 ///
 /// Nothing is written until the whole token has verified. A keystore already
 /// in a *different* fabric is refused (one keystore, one fabric — use another
-/// `$WIRES_HOME`); re-joining the same fabric never moves the stored policy
+/// `$WIRES_HOME`); re-joining the same fabric never moves a stored policy
 /// backwards.
-pub(crate) fn join_in(ks: &Keystore, token: &str, now: i64) -> anyhow::Result<String> {
+pub(crate) fn join_in(ks: &Keystore, token: &str, now: i64) -> anyhow::Result<Joined> {
     let invite = Invite::decode(token).context("the invite token (is the paste complete?)")?;
     let me = keystore::node_identity_in(ks).map_err(|_| {
         anyhow::anyhow!(
@@ -103,39 +133,106 @@ pub(crate) fn join_in(ks: &Keystore, token: &str, now: i64) -> anyhow::Result<St
     }
 
     ks.save_membership(&invite.membership)?;
-    crate::policy::store::adopt_if_newer(ks, &invite.policy, fabric, now)?;
-    crate::policy::store::mark_checked(ks, now)?;
-    let held =
-        crate::policy::store::read(ks, fabric)?.map_or(invite.policy.version(), |s| s.version());
-    Ok(format!(
-        "joined network {}… as {}… (policy version {})\nnext: `wires login` to sign in, then \
-         `wires services`",
+    view::save_joined_directories(ks, &invite.directories)?;
+    if let Some(login) = &invite.login {
+        crate::caller::login::save_settings(ks, login)?;
+    }
+    let mut summary = format!(
+        "joined network {}… as {}…",
         fabric.short(),
-        me.node_id().short(),
-        held.0,
-    ))
+        me.node_id().short()
+    );
+    if let Some(policy) = &invite.policy {
+        crate::policy::store::adopt_if_newer(ks, policy, fabric, now)?;
+        crate::policy::store::mark_checked(ks, now)?;
+        let held =
+            crate::policy::store::read(ks, fabric)?.map_or(policy.version(), |s| s.version());
+        summary.push_str(&format!(
+            " as a host or directory (policy version {})",
+            held.0
+        ));
+    }
+    Ok(Joined {
+        summary,
+        caller: invite.policy.is_none(),
+    })
+}
+
+/// A new caller's first question: the head, from a directory the invite
+/// named, stored as an empty view (no entry before `wires login`). Keeps a
+/// view already held at a newer head.
+async fn fetch_head(ks: &Keystore) -> anyhow::Result<HeldView> {
+    let node = keystore::node_identity_in(ks)?;
+    let badge = ks
+        .read_membership()?
+        .context("no membership after joining")?;
+    let root = badge.fabric;
+    if let Some(held) = view::read(ks, root)? {
+        return Ok(held);
+    }
+    let endpoint =
+        crate::host::transport::bind_with(&node, None, library::DIRECTORY_ALPN, false, Some(ks))
+            .await?;
+    let asked = async {
+        let mut failures = Vec::new();
+        for dir in view::directories(ks, root, node.node_id()) {
+            match view::ask_head(&endpoint, dir, &badge, root).await {
+                Ok((head, fresh)) => {
+                    let empty = View {
+                        head,
+                        entries: Vec::new(),
+                    };
+                    let held = HeldView::fetched(empty, Some(fresh), now_unix());
+                    view::write(ks, root, &held)?;
+                    return Ok(held);
+                }
+                Err(e) => failures.push(format!("{}: {e:#}", dir.short())),
+            }
+        }
+        bail!("no directory answered ({})", failures.join("; "))
+    };
+    let result = tokio::time::timeout(view::REFRESH_BUDGET, asked)
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("no directory answered in time")));
+    endpoint.close().await;
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::temp_dir;
-    use library::{Membership, Policy, SignedPolicy, StateVersion};
+    use library::{
+        Audience, Issuer, LoginSettings, Membership, Policy, SignedPolicy, StateVersion,
+    };
 
     /// A policy at `version`, signed by `root`.
     fn signed(root: &NodeIdentity, version: u64) -> SignedPolicy {
         let mut s = Policy::new(root.node_id());
         s.version = StateVersion(version);
         s.not_after = i64::MAX;
-        s.directories = vec![NodeIdentity::from_seed([4u8; 32]).node_id()];
+        s.directories = vec![dir()];
         crate::testutil::signed_policy(root, s)
     }
 
-    /// An invite for `joiner` in the fabric of `root`, at policy `version`.
-    fn invite_for(root: &NodeIdentity, joiner: NodeId, version: u64) -> Invite {
+    fn dir() -> NodeId {
+        NodeIdentity::from_seed([4u8; 32]).node_id()
+    }
+
+    fn login() -> LoginSettings {
+        LoginSettings {
+            issuer: Issuer::new("https://idp.example"),
+            client_id: Audience::new("desktop-client"),
+            public_client_secret: None,
+        }
+    }
+
+    /// A caller's invite for `joiner` in the fabric of `root`.
+    fn invite_for(root: &NodeIdentity, joiner: NodeId) -> Invite {
         Invite::new(
             Membership::mint(root, joiner, 0, i64::MAX).unwrap(),
-            signed(root, version),
+            vec![dir()],
+            Some(login()),
         )
     }
 
@@ -147,27 +244,46 @@ mod tests {
         assert_eq!(id_in(&ks).unwrap(), (first, false));
     }
 
+    /// Card 37: a caller's join installs the badge, the directory ids and
+    /// the login settings, and no policy.
     #[test]
-    fn join_installs_the_membership_and_the_policy() {
+    fn a_callers_join_installs_the_badge_directories_and_login_and_no_policy() {
         let ks = Keystore::at(temp_dir());
         let (me, _) = id_in(&ks).unwrap();
         let root = NodeIdentity::from_seed([1u8; 32]);
-        let invite = invite_for(&root, me, 3);
-        let out = join_in(&ks, &invite.encode().unwrap(), 0).unwrap();
-        assert!(out.contains("policy version 3"), "{out}");
+        let invite = invite_for(&root, me);
+        let joined = join_in(&ks, &invite.encode().unwrap(), 0).unwrap();
+        assert!(joined.caller);
         assert_eq!(
             ks.read_membership().unwrap(),
             Some(invite.membership.clone())
         );
+        assert_eq!(view::joined_directories(&ks), vec![dir()]);
+        assert_eq!(crate::caller::login::read_settings(&ks), Some(login()));
+        assert!(
+            crate::policy::store::read(&ks, root.node_id())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!ks.path(crate::policy::store::POLICY_FILE).exists());
+    }
+
+    #[test]
+    fn a_hosts_join_installs_the_policy_and_never_rolls_it_back() {
+        let ks = Keystore::at(temp_dir());
+        let (me, _) = id_in(&ks).unwrap();
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let v3 = invite_for(&root, me).with_policy(signed(&root, 3));
+        let joined = join_in(&ks, &v3.encode().unwrap(), 0).unwrap();
+        assert!(!joined.caller);
+        assert!(joined.summary.contains("policy version 3"), "{joined:?}");
         let held = crate::policy::store::read(&ks, root.node_id())
             .unwrap()
             .unwrap();
         assert_eq!(held.version(), StateVersion(3));
-        // Where it fetches newer policies from: the head's directories.
-        assert_eq!(held.directories(), invite.directories());
-
         // Re-joining with an older token keeps the newer policy.
-        join_in(&ks, &invite_for(&root, me, 2).encode().unwrap(), 0).unwrap();
+        let v2 = invite_for(&root, me).with_policy(signed(&root, 2));
+        join_in(&ks, &v2.encode().unwrap(), 0).unwrap();
         let held = crate::policy::store::read(&ks, root.node_id())
             .unwrap()
             .unwrap();
@@ -180,10 +296,11 @@ mod tests {
         id_in(&ks).unwrap();
         let root = NodeIdentity::from_seed([1u8; 32]);
         let other = NodeIdentity::from_seed([7u8; 32]).node_id();
-        let invite = invite_for(&root, other, 1);
+        let invite = invite_for(&root, other);
         let err = join_in(&ks, &invite.encode().unwrap(), 0).unwrap_err();
         assert!(format!("{err:#}").contains(&other.hex()), "{err:#}");
         assert!(ks.read_membership().unwrap().is_none());
+        assert!(view::joined_directories(&ks).is_empty());
 
         // No node key at all is its own, named failure.
         let bare = Keystore::at(temp_dir());
@@ -197,11 +314,11 @@ mod tests {
         let ks = Keystore::at(temp_dir());
         let (me, _) = id_in(&ks).unwrap();
         let root = NodeIdentity::from_seed([1u8; 32]);
-        let invite = invite_for(&root, me, 1);
+        let invite = invite_for(&root, me);
         join_in(&ks, &invite.encode().unwrap(), 0).unwrap();
 
         let rogue = NodeIdentity::from_seed([66u8; 32]);
-        let other = invite_for(&rogue, me, 1);
+        let other = invite_for(&rogue, me);
         let err = join_in(&ks, &other.encode().unwrap(), 0).unwrap_err();
         assert!(
             format!("{err:#}").contains("another $WIRES_HOME"),

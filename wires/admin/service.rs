@@ -162,6 +162,15 @@ pub(crate) struct IssuerSetArgs {
     /// client id.
     #[arg(long = "audience")]
     pub(crate) audience: Vec<String>,
+    /// The client's **public** secret (a Google "Desktop app" client's),
+    /// which invites carry to `wires login`; kept in this keystore, not in
+    /// the signed policy. Never pass a confidential secret.
+    #[arg(long)]
+    pub(crate) public_client_secret: Option<String>,
+    /// Make this the IdP invites tell `wires login` to use (by default, the
+    /// one `wires init` trusted).
+    #[arg(long)]
+    pub(crate) login: bool,
     /// Lifetime of the new policy, from now; never shortens the current one.
     #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
     pub(crate) ttl: Ttl,
@@ -571,7 +580,15 @@ pub(crate) fn issuer_in(ks: &Keystore, a: IssuerArgs) -> Result<String> {
         IssuerCmd::Set(i) => {
             let iss = Issuer::new(i.issuer.trim());
             let config = issuer_config(&i.client_id, &i.audience)?;
-            ("trusted", iss.clone(), issuer_set(ks, iss, config, i.ttl)?)
+            let signed = issuer_set(ks, iss.clone(), config, i.ttl)?;
+            // Card 37: what invites tell `wires login` (not signed).
+            super::login_client::LoginClient::record(
+                ks,
+                &iss,
+                i.public_client_secret.as_deref(),
+                i.login,
+            )?;
+            ("trusted", iss, signed)
         }
         IssuerCmd::Rm(i) => {
             let iss = Issuer::new(i.issuer.trim());

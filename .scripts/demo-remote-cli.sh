@@ -33,8 +33,9 @@
 # host's `serve` writes its own line to run/hint and the script copies those
 # into the other keystores' local, unsigned `hints` file.
 #
-# Asserted: before login the agent sees no service and its call is refused
-# (77) with the reason; after login `wires services` lists orders-db (analyst)
+# Asserted: before login the agent's view is empty, so it lists no service
+# and its call finds no host (exit 1, "not signed in"); after a bare `wires
+# login` (the invite named the IdP) `wires services` lists orders-db (analyst)
 # and the signed-in non-analyst sees nothing and is refused by name; the
 # agent's SQL runs (args, stdin, MCP); `.shell id` is refused by sqlite3
 # -safe; the security reader's `wires watch` shows every call and refusal with
@@ -144,7 +145,7 @@ start_mock_idp "$EMAIL"
 # The admin starts the network (its own node holds a badge too); every other
 # machine makes its key and hands the admin its id. One invite token back
 # each: a badge, which is what admits the node.
-ROOT_ID="$(WIRES_HOME="$root" "$WIRES" init --issuer "$ISSUER" --client-id "$CLIENT_ID" |
+ROOT_ID="$(WIRES_HOME="$root" "$WIRES" init --issuer "$ISSUER" --client-id "$CLIENT_ID" --public-client-secret not-so-secret |
 	awk '/^network /{print $2}')"
 WB_ID="$(WIRES_HOME="$wb" "$WIRES" id 2>/dev/null)"
 SP_ID="$(WIRES_HOME="$sp" "$WIRES" id 2>/dev/null)"
@@ -238,7 +239,7 @@ WIRES_HOME="$obs" "$WIRES" join "$OB_TOKEN" >/dev/null
 beat 2
 
 # ==========================================================================
-step "2  the agent, before signing in: no service listed, and a call is refused"
+step "2  the agent, before signing in: no service in its view, and no host to call"
 # ==========================================================================
 run "wires services"
 WIRES_HOME="$agent" "$WIRES" services >"$D/s0.out" 2>"$D/s0.err" || {
@@ -255,23 +256,25 @@ set +e
 WIRES_HOME="$agent" "$WIRES" call orders-db -- "select count(*) from orders" >"$D/c0.out" 2>"$D/c0.err"
 rc=$?
 set -e
-[ "$rc" -eq "$EXIT_DENIED" ] || {
+# Card 37: the view is empty without a verified identity, so the agent
+# holds no host to dial; the directory it asks (`resolve`) says the same.
+[ "$rc" -eq 1 ] || {
 	dump "$D/c0.err"
-	bad "2: an unverified call exited $rc, expected $EXIT_DENIED"
+	bad "2: an unverified call exited $rc, expected 1 (nothing to dial)"
 }
-grep -qF "no ID token presented" "$D/c0.err" || {
+grep -qF "not signed in" "$D/c0.err" || {
 	dump "$D/c0.err"
-	bad "2: refused, but not for the missing identity"
+	bad "2: stopped, but not for the missing identity"
 }
-[ ! -s "$D/c0.out" ] || bad "2: the refused call wrote to stdout"
+[ ! -s "$D/c0.out" ] || bad "2: the stopped call wrote to stdout"
 show "$D/c0.err"
-ok "2: exit $EXIT_DENIED -- no verified identity, no sqlite3"
+ok "2: exit 1 -- no verified identity, no service in its view, nothing dialed"
 beat 3
 
 # ==========================================================================
 step "3  the agent signs in with its IdP -- the token is bound to its node key"
 # ==========================================================================
-run "wires login --issuer $ISSUER --client-id $CLIENT_ID --no-browser"
+run "wires login --no-browser   # the invite named the IdP and its client"
 login_as "$agent" "$EMAIL"
 run "wires services"
 WIRES_HOME="$agent" "$WIRES" services >"$D/s1.out" 2>"$D/s1.err" || {
@@ -283,7 +286,7 @@ grep -qE "^orders-db +Read-only SQL.*\(analyst\)$" "$D/s1.out" || {
 	bad "3: the signed-in analyst does not see orders-db"
 }
 show "$D/s1.out"
-ok "3: evaluated locally against the signed policy: orders-db, because analyst -- no host named"
+ok "3: its view, cut by the directory for its token: orders-db, because analyst -- no host named"
 beat 3
 
 # ==========================================================================
@@ -449,10 +452,6 @@ F4="$(the_line "$D/w1.out" "■" "exit $SHELL_RC")" || {
 	cat "$D/w1.out" >&2
 	bad "6: no ■ exit $SHELL_RC for .shell id"
 }
-D0="$(the_line "$D/w1.out" "✗ ${AG_ID:0:4}…" "no ID token presented")" || {
-	cat "$D/w1.out" >&2
-	bad "6: the agent's pre-login refusal is not in the records"
-}
 D9="$(the_line "$D/w1.out" "✗ ${OB_ID:0:4}…" "is in no role allowed to call orders-db")" || {
 	cat "$D/w1.out" >&2
 	bad "6: $READER's refusal is not in the records"
@@ -461,7 +460,6 @@ line "$S1"
 line "$F1"
 line "$F2"
 line "$F4"
-line "$D0"
 line "$D9"
 ok "6a: the reader sees who ran what -- and every refusal -- holding neither end's keys"
 run "wires watch --once   # on the agent: not a reader, so only its own calls"
@@ -623,7 +621,7 @@ beat 2
 step "SUMMARY"
 # ==========================================================================
 printf '     name      : orders-db, a service; its hosts were never named by the caller\n' >&2
-printf '     identity  : unverified caller refused (77); %s allowed as analyst, %s refused by name\n' "$EMAIL" "$READER" >&2
+printf '     identity  : no identity, no view: nothing to call; %s allowed as analyst, %s refused by name\n' "$EMAIL" "$READER" >&2
 printf '     records   : the security reader saw every call and refusal; the agent only its own\n' >&2
 printf '     contained : .shell id refused by sqlite3 -safe, exit %s\n' "$SHELL_RC" >&2
 # shellcheck disable=SC2016 # literal backticks in the summary

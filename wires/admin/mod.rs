@@ -14,6 +14,8 @@
 //!   first signed policy.
 //! - [`invite`] — `wires invite` (one token per joiner: a badge, no edit)
 //!   and `wires remove` (a ban).
+//! - [`login_client`] — `login-client.json`: which trusted IdP invites tell
+//!   `wires login` to use, and its public client secret (card 37).
 //! - [`ledger`] — `issued.json`: the badges this admin minted, with their
 //!   labels and expiries (how long a ban must last).
 //! - [`service`] — `wires service add | set | rm`, `wires role set | rm`,
@@ -31,6 +33,7 @@ pub mod init;
 pub mod invite;
 pub mod keystore;
 pub mod ledger;
+pub mod login_client;
 pub mod propagate;
 pub mod service;
 pub mod settings;

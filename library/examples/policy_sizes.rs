@@ -7,15 +7,17 @@
 //! signed service entry, the whole policy (as published and as the frame a
 //! host first receives), the `policy_update` frame for one changed service
 //! and for one new ban, and a caller's view of about 25 services (entry
-//! count and frame).
+//! count, frame and `view.json`), a `HelloAck` carrying news (card 37: the
+//! head and one service entry), and a caller's invite token.
 //!
 //! ```text
 //! cargo run -q --release -p library --example policy_sizes
 //! ```
 
 use library::{
-    Audience, Ban, Fresh, Issuer, IssuerConfig, Item, Matcher, NodeId, NodeIdentity, Policy,
-    Principal, RoleName, Service, ServiceName, SignedPolicy, StateVersion, SubFrame,
+    Audience, Ban, Fresh, HelloAck, Invite, Issuer, IssuerConfig, Item, LoginSettings, Matcher,
+    Membership, NodeId, NodeIdentity, Policy, Principal, PublicClientSecret, RoleName, Service,
+    ServiceName, SignedPolicy, StateVersion, SubFrame,
 };
 
 const ISSUED: i64 = 1_790_000_000;
@@ -193,8 +195,41 @@ fn measure(root: &NodeIdentity, t: &Tier) -> serde_json::Value {
         "update_new_ban": banned.0,
         "update_new_ban_items": banned.1,
         "view_entries": view.entries.len(),
-        "view_frame": SubFrame::View { view, fresh }.encode().expect("a frame").len(),
+        "view_json": len(&serde_json::json!({
+            "view": &view, "fresh": &fresh, "checked": ISSUED, "seen": 0,
+        })),
+        "view_frame": SubFrame::View { view, fresh: fresh.clone() }.encode().expect("a frame").len(),
+        "hello_ack_news": len(&HelloAck {
+            membership: Membership::mint(root, node(0), ISSUED, ISSUED + 30 * 86_400)
+                .expect("a badge"),
+            state_version: signed.version(),
+            head: Some(signed.head.clone()),
+            entry: signed.entries().next().cloned(),
+        }),
+        "caller_invite_token": caller_invite(root, &signed).len(),
     })
+}
+
+/// A caller's invite token (card 37): its badge, the policy's directory ids
+/// and Google-sized login settings with a public client secret.
+fn caller_invite(root: &NodeIdentity, signed: &SignedPolicy) -> String {
+    let badge =
+        Membership::mint(root, node(4_000_000), ISSUED, ISSUED + 30 * 86_400).expect("a badge");
+    let login = LoginSettings {
+        issuer: Issuer::new(library::GOOGLE_ISSUER),
+        client_id: Audience::new(concat!(
+            "123456789012-",
+            "abcdefghijklmnopqrstuvwxyz012345",
+            ".apps.googleusercontent.com"
+        )),
+        public_client_secret: Some(PublicClientSecret::new(concat!(
+            "GOCSPX",
+            "-abcdefghijklmnopqrstuvwxyz01"
+        ))),
+    };
+    Invite::new(badge, signed.head.head.directories.clone(), Some(login))
+        .encode()
+        .expect("a token")
 }
 
 fn main() {

@@ -8,6 +8,16 @@
 //! items hashing to the head's root) and answers `wires/directory/1`
 //! requests ([`Directory::answer`]). **It never decides a call.**
 //!
+//! A caller asks for its **view** (card 37): the services its verified IdP
+//! principal may call or read, each a root-signed entry
+//! ([`Directory::answer_caller`]). The directory verifies the ID token the
+//! caller presented in its `hello` itself, as a host does (the policy's
+//! signed `issuer` items, the IdP's keys held in memory, the nonce bound to
+//! the iroh-authenticated key), and cuts the view from the policy it holds
+//! ([`SignedPolicy::view_for`]). Nothing per user is stored, and a request
+//! is traced, not logged: a view grants nothing (the host decides every
+//! call), and without a verified principal the view is empty.
+//!
 //! Every change of head or freshness is published on a watch channel
 //! ([`Directory::watch`]), which the subscriptions follow.
 
@@ -15,13 +25,15 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, anyhow};
 use library::{
-    DirectoryAnswer, DirectoryRequest, Fresh, Membership, NodeId, NodeIdentity, SignedPolicy,
-    StateVersion, check_admitted, check_inclusion,
+    DirectoryAnswer, DirectoryRequest, Fresh, IdToken, IdentityClaim, Membership, NodeId,
+    NodeIdentity, Policy, Principal, SignedPolicy, StateVersion, check_admitted, check_inclusion,
 };
 
 use super::db::{DB_FILE, DirectoryDb};
 use super::sub_policy::Since;
 use crate::admin::keystore::Keystore;
+use crate::caller::jwks::KeyFetcher;
+use crate::host::identity::IdpTrust;
 use crate::policy::store::{self, Held};
 
 /// What a directory holds now: the newest verified policy and its `Fresh`
@@ -63,6 +75,8 @@ pub(crate) struct Directory {
     accepts: RwLock<u64>,
     /// The encoded frames its `policy` subscribers share (card 36c).
     pub(crate) policy_frames: super::sub_policy::FrameCache,
+    /// Verifies callers' ID tokens (the IdPs' keys, in memory only).
+    fetcher: KeyFetcher,
 }
 
 /// How many streams, on both ALPNs together, may be open before their
@@ -75,9 +89,10 @@ pub(crate) const DEFAULT_MAX_SUBSCRIBERS: usize = 4096;
 /// What a node not admitted hears on either ALPN, whatever the reason.
 pub(crate) use crate::host::gate::NOT_ADMITTED;
 
-/// What a request this directory doesn't serve yet hears.
-const NOT_YET: &str = "this directory does not serve views or resolve yet (card 37); \
-                       ask for `policy`";
+/// What a node that is neither a host nor a directory hears when it asks
+/// for (or subscribes to) the whole policy (card 37).
+pub(crate) const VIEW_NOT_POLICY: &str = "the whole policy is for the network's hosts and \
+                                          directories; a caller asks for its view";
 
 impl std::fmt::Debug for Directory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -126,6 +141,7 @@ impl Directory {
             undecided: Arc::new(tokio::sync::Semaphore::new(MAX_UNDECIDED)),
             accepts: RwLock::new(0),
             policy_frames: Default::default(),
+            fetcher: KeyFetcher::new(None)?,
         });
         dir.beat(now)?;
         Ok(dir)
@@ -272,8 +288,12 @@ impl Directory {
                 },
                 Err(reason) => denied(reason),
             },
-            // The whole policy, for hosts and directories (and, until card
-            // 37, callers), or the delta from a kept `have` (card 36c).
+            // The whole policy, for hosts and directories only (card 37: a
+            // caller holds its view), or the delta from a kept `have`
+            // (card 36c).
+            DirectoryRequest::Policy { .. } if !self.holds_whole(caller) => {
+                denied(VIEW_NOT_POLICY.into())
+            }
             DirectoryRequest::Policy { have } => match self.current_with_fresh() {
                 Ok((c, fresh)) => match super::sub_policy::since(self, &c, have) {
                     Since::Current => DirectoryAnswer::Current { fresh },
@@ -286,9 +306,126 @@ impl Directory {
                 Err(reason) => denied(reason),
             },
             DirectoryRequest::View { .. } | DirectoryRequest::Resolve { .. } => {
-                denied(NOT_YET.into())
+                denied("a view needs the caller's ID token: ask through `answer_caller`".into())
             }
             DirectoryRequest::Hello { .. } => denied("a second hello".into()),
+        }
+    }
+
+    /// Whether `node` may hold the whole policy (card 37): a host of one of
+    /// its services, or one of its directories, in the policy held now. A
+    /// caller holds its view instead.
+    pub(crate) fn holds_whole(&self, node: NodeId) -> bool {
+        self.snapshot()
+            .is_some_and(|c| c.held.policy.is_host(node) || c.held.directories().contains(&node))
+    }
+
+    /// The answer to a caller's `view` or `resolve` (anything else is
+    /// [`answer`](Self::answer)'s), from an admitted `caller` that presented
+    /// `id_token` in its `hello`:
+    ///
+    /// - `view {have, query: None}`: `current {fresh}` when `have` is the
+    ///   held version; a `view_update` from a `have` this directory still
+    ///   keeps (the caller applies it with [`library::View::apply`]); else
+    ///   the whole view;
+    /// - `view {have, query: Some(q)}`: the entries matching `q`, always a
+    ///   whole (searched) view;
+    /// - `resolve {service}`: a view holding just that service, or no entry.
+    ///
+    /// Traced, not logged (see the module docs).
+    pub(crate) async fn answer_caller(
+        &self,
+        caller: NodeId,
+        id_token: Option<&IdToken>,
+        request: DirectoryRequest,
+        now: i64,
+    ) -> DirectoryAnswer {
+        let denied = |reason: String| DirectoryAnswer::Denied {
+            reason: crate::host::transport::truncate_reason(reason),
+        };
+        let (c, fresh) = match self.current_with_fresh() {
+            Ok(held) => held,
+            Err(reason) => return denied(reason),
+        };
+        let principal = self.principal(caller, id_token, &c.held.policy, now).await;
+        let who = principal.as_ref().map(Principal::name);
+        let answer = match request {
+            DirectoryRequest::View { have, query: None } if have >= c.held.version() => {
+                DirectoryAnswer::Current { fresh }
+            }
+            DirectoryRequest::View { have, query } => {
+                let after = c.held.signed.view_for(principal.as_ref(), query.as_deref());
+                // From a head this directory still keeps: just what changed.
+                let kept = match (&query, have) {
+                    (None, have) if have > StateVersion(0) => self.policy_at(have).ok().flatten(),
+                    _ => None,
+                };
+                match kept {
+                    Some(old) => DirectoryAnswer::ViewUpdate {
+                        update: old.view_for(principal.as_ref(), None).update_to(&after),
+                        fresh,
+                    },
+                    None => DirectoryAnswer::View { view: after, fresh },
+                }
+            }
+            DirectoryRequest::Resolve { service } => {
+                let mut view = c.held.signed.view_for(principal.as_ref(), None);
+                view.entries.retain(|e| e.entry.name == service);
+                DirectoryAnswer::View { view, fresh }
+            }
+            other => return self.answer(caller, other, now),
+        };
+        let entries = match &answer {
+            DirectoryAnswer::View { view, .. } => view.entries.len(),
+            _ => 0,
+        };
+        tracing::debug!(
+            peer = %caller.hex(),
+            who = who.as_deref().unwrap_or("-"),
+            entries,
+            version = c.held.version().0,
+            "directory: answered a view"
+        );
+        answer
+    }
+
+    /// Who `caller` is: its `id_token` verified under `policy`'s trusted
+    /// issuers (each with its accepted audiences) and bound to `caller`'s
+    /// key, or `None` (no token, or one that doesn't verify, traced).
+    pub(crate) async fn principal(
+        &self,
+        caller: NodeId,
+        id_token: Option<&IdToken>,
+        policy: &Policy,
+        now: i64,
+    ) -> Option<Principal> {
+        let id_token = id_token?;
+        let trust = IdpTrust::per_issuer(
+            policy
+                .issuers
+                .iter()
+                .map(|(iss, config)| (iss.clone(), config.audiences.clone()))
+                .collect(),
+        );
+        let claim = IdentityClaim {
+            node: caller,
+            id_token: id_token.clone(),
+        };
+        match self
+            .fetcher
+            .verify(
+                &claim,
+                &trust.issuers(),
+                trust.audiences_for_claim(&claim),
+                now,
+            )
+            .await
+        {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::debug!(peer = %caller.hex(), "directory: an ID token did not verify: {e}");
+                None
+            }
         }
     }
 
