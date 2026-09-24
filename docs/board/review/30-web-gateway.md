@@ -38,11 +38,15 @@ already uses — and without weakening "the host verifies the IdP itself".
 - [x] e2e: DCR → consent → mock Google → code (+`state`, `iss`) → token →
       modern and legacy MCP; dialer receives the user's gateway-bound token
 - [x] infra applied (break-glass local apply 2026-09-23: 5 added, 1 changed; merge PR #17 once CI billing is fixed)
-- [ ] Google *Web application* client with `…/oauth/callback`; its id in the
+- [x] Google *Web application* client with `…/oauth/callback`; its id in the
       workbench host's `identity.issuers` audiences
 - [x] gateway invited (`gateway`, b7b1289e…, state v9) + joined on workbench
-- [ ] gateway `.env` on workbench; `docker compose up -d`
-- [ ] Claude.ai connector added; `orders-db` called as gotwalt@gmail.com,
+- [x] gateway `.env` on workbench; `docker compose up -d`
+- [x] Claude.ai connector added; `orders-db` called as gotwalt@gmail.com,
       the call in the host's log
 
 ## Notes
+
+- 2026-09-24: live end to end. Claude.ai signed in as gotwalt@gmail.com and ran
+  `orders-db` 4 times (exit 0). Each call is in the workbench host's signed
+  log as caller = the gateway node, principal = the Google account.

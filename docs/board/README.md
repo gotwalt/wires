@@ -83,7 +83,7 @@ Each summary describes the surface at the time the card was done. Cards 25–27 
 | [25](done/25-cargo-and-strip.md) | X | 23, 24 | Down to essentials: Bazel → plain Cargo + Dockerfile; remove grants/tickets/CRL/relay/manual targets and outdated docs (git history is the archive) |
 | [27](done/27-services-not-hosts.md) | S3 | 25 | **Services, not hosts; drop the channel.** Admin-signed members + service registry; local `wires services`; identity in the handshake; delete gossip/fabric keys/re-keys/announcements (~20k LOC) |
 | [26](done/26-host-held-records.md) | H2 | 27 | Call records: host-held signed log, `watch <service>` for authorized readers + own calls, optional OTel export |
-| [30](doing/30-web-gateway.md) | W | 27, 26 | `wires gateway`: remote MCP (Streamable HTTP 2026-07-28 + OAuth 2.1) for Claude.ai; each call presents the web user's own gateway-bound Google token |
+| [30](review/30-web-gateway.md) | W | 27, 26 | `wires gateway`: remote MCP (Streamable HTTP 2026-07-28 + OAuth 2.1) for Claude.ai; each call presents the web user's own gateway-bound Google token |
 | [22](done/22-gossip-role-OPEN.md) | — | decided | **Decided 2026-09-23: drop the channel** → cards 27 and 26 |
 | [18](backlog/18-front-door-OPEN.md) | — | parked | **Open question, don't build:** apex key, invites, `wires join <domain>` |
 | [16](done/16-token-benchmark.md) | bench | 01–03 | MCP (GitHub server, many tools; ± tool search) vs `gh` via `wires call` vs bare `gh`: 5 tasks × 5 runs |
