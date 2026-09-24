@@ -48,20 +48,20 @@ honest line from someone who runs remote MCP servers behind Tailscale today.
 
 | Role | Decides | Commands |
 |---|---|---|
-| **admin** | who's in, the roles, which services run where, who may call and read each (root key; one signed state) | `init`, `invite`, `remove`, `role`, `service`, `state push` |
-| **host** | how it implements its assigned services; trusted IdPs; stricter local rules (`host.json`) | `serve host.json`, `push` |
+| **admin** | who's in, the trusted IdPs, the roles, which services run where, who may call and read each, which nodes are directories (root key; one signed policy) | `init`, `invite`, `remove`, `issuer`, `role`, `service`, `directory add\|rm`, `state push` |
+| **host** | how it implements its assigned services; stricter local rules (`host.json`: narrower IdPs, `also_require`) | `serve host.json`, `push` |
 | **caller** | — runs services by name; MCP (stdio, or the remote gateway) so wires works in the clients people already use | `id`, `join`, `login`, `services`, `call`, `mcp`, `gateway`, `inbox` |
 | **reader** | — any member: a service's `readers` role reads all its records, in full; everyone else their own person's (same issuer and subject, from any node) | `watch` |
-| **directory** (cards 35–37) | nothing: it holds the newest root-signed policy, signs its freshness, and gives each host its slice and each caller its view; it never decides a call | `serve` (when the policy lists it), `directory serve`; the admin names directories with `directory add\|rm` |
+| **directory** (card 36) | nothing: it holds the newest root-signed policy, signs its freshness, and hands the policy to hosts and callers (their slice and view from cards 36c, 37); it never decides a call | `serve` (when the policy lists it), `directory serve`; the admin names directories with `directory add\|rm` |
 
-The IdP is *bound* at the caller (`login`) and *verified* at the host, against the admin-signed state it holds. Every role needs a verified identity (there is no built-in `member` role), and every matcher names its issuer. The admin's invite is the only thing handed out of band; every later state is pushed by key to the hosts, and other members pull it from a host (or get it in a call's handshake). Nothing is broadcast, but every member still holds the whole state until cards 35–37 move the policy to a directory ([fabric.md](../fabric.md) is the target architecture: how the fabric is hosted, persisted and kept in sync).
+The IdP is *bound* at the caller (`login`) and *verified* at the host, against the admin-signed policy it holds. Every role needs a verified identity (there is no built-in `member` role), and every matcher names an issuer the policy trusts. The admin's invite is the only thing handed out of band; every later policy is published by key to the directories, and hosts and callers fetch it from one (or get it in a call's handshake). Nothing is broadcast, but every member still holds the whole policy until cards 36c and 37 narrow it to slices and views ([fabric.md](../fabric.md) is the target architecture: how the fabric is hosted, persisted and kept in sync).
 
 ## The demo we're building toward
 
 1. **workbench** (no inbound ports): `wires serve host.json`, implementing `orders-db`, which the admin registered for role `analyst` (`wires service add orders-db --allow analyst --reader security --host workbench`).
 2. **laptop**: Claude Code calling `wires call orders-db -- "…"` from Bash (and/or `wires mcp` in its MCP config).
 3. **reader** (third terminal/machine, role `security`): `wires watch orders-db` — each call appears as `▶ … alice@corp (…) [analyst] orders-db "select …"`, then `■ … exit 0 · 41 ms · 3.1 KiB out`.
-4. **Revoke**: one `wires remove agent` → the new state is pushed to the workbench, which refuses the agent's next call (exit 77, `not a member of this network`); the host traces that rather than logging it, since a key outside the state can't write to the log.
+4. **Revoke**: one `wires remove agent` → the new policy is published to the directory the workbench also runs, and the workbench refuses the agent's next call (exit 77, `not a member of this network`); the host traces that rather than logging it, since a banned key can't write to the log.
 
 ## Lanes
 
@@ -71,7 +71,7 @@ Open cards only; finished cards are in [done/](done/).
 |---|---|---|---|---|
 | [08](doing/08-demo-two-machine.md) | E | — | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent, recording |
 | [35](done/35-badges-and-bans.md) | D1 | 28 | done (on `aaron/directory`) | **Badges and bans:** members leave the signed state; a node is admitted by its root-signed badge, removal is a ban, `invite` is no edit |
-| [36](backlog/36-directory.md) | D2 | 35 | backlog | **The directory:** a mode on its own ALPNs, backed by redb; root-signed head over proved items; freshness timestamps; hosts subscribe to their slice; retires state sync |
+| [36](doing/36-directory.md) | D2 | 35 | doing (36b on a worker branch) | **The directory:** a mode on its own ALPNs, backed by redb; root-signed head over proved items; freshness timestamps; hosts subscribe to their slice; retires state sync |
 | [37](backlog/37-caller-views.md) | D3 | 36 | backlog | **Caller views:** each caller holds only the services it may use; search; `HelloAck` carries the head version; `mcp`/gateway subscribe; ~800 B invites |
 | [38](backlog/38-llm-help-text.md) | H | 37 | backlog | **Help text for LLMs:** the premise (a network for authenticated remote CLI calls) told once, in help and MCP instructions; terse, predictable `--help`, examples, next-step errors, `--help-all` for operator flags, snapshot tests, a small eval |
 | [29](backlog/29-person-identity.md) | I2 | 36 | backlog | **Person identity for headless agents:** `login --for`, day-passes issued by a directory |

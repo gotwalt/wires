@@ -15,18 +15,23 @@ cargo test -p wires -- --nocapture
 What's covered:
 
 - **`library`** — property tests (`proptest`), example unit tests and runnable
-  doctests for identity, memberships, invites, the signed state, roles,
-  the registry and `authorize`, state-sync and session frames, invocations,
+  doctests for identity, memberships, invites, the signed policy (head,
+  items, proofs, `Fresh`), roles, the registry and `authorize`, directory
+  and session frames, invocations,
   call records and the call log, IdP claims and push frames.
 - **`wires`** — each role's command functions, the keystore (round-trips,
   file modes, flag → env → file → keystore precedence), the session transport
   over in-memory pipes and over **real loopback QUIC** (two iroh endpoints on
   localhost, no relay or discovery), and `e2e/`: the whole stack over
   hermetic loopback (the registry deciding each call, `also_require`,
-  removal with no restart, unassigned services, push by the state and by a
+  removal with no restart, unassigned services, push by the policy and by a
   call's push capability, what a service child can and can't reach, the
   record stream keyed by person, and the web
-  gateway's OAuth and MCP paths).
+  gateway's OAuth and MCP paths), and `directory/tests.rs`: the directory
+  over loopback (the admin publishing to it and dialing no host, hosts and
+  callers fetching from it, a restart from `directory.redb`, refusing
+  tampered, mixed and older policies and a stranger's `Fresh`, catching up
+  from a replica).
 
 ## Lint and format
 

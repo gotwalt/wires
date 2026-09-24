@@ -4,14 +4,13 @@
 //! (`wires id`), paste back the token `wires invite` printed (`wires join
 //! <token>`). Join checks the token is for this node, signed by one root
 //! throughout, and not banned by its state, then installs the membership
-//! (this node's badge: what admits it) and the admin-signed state where
-//! every other command looks for them, and records the admin's node id to
-//! pull newer states from.
+//! (this node's badge: what admits it) and the admin-signed policy where
+//! every other command looks for them. The policy's head names the
+//! directories newer policies are fetched from.
 //!
-//! After this, newer states arrive by push from the admin (hosts only: a
-//! running `serve` is what listens), or are pulled from a host on a cold
-//! command or handed back in a call's `HelloAck`; nothing needs importing by
-//! hand again.
+//! After this, newer policies are fetched from a directory (by a host at
+//! start and every beat; by a caller on a cold command) or handed back in a
+//! call's `HelloAck`; nothing needs importing by hand again.
 
 use anyhow::{Context, bail};
 use clap::Args;
@@ -70,7 +69,7 @@ pub(crate) fn join_cmd(a: JoinArgs) -> anyhow::Result<String> {
 ///
 /// Nothing is written until the whole token has verified. A keystore already
 /// in a *different* fabric is refused (one keystore, one fabric — use another
-/// `$WIRES_HOME`); re-joining the same fabric never moves the stored state
+/// `$WIRES_HOME`); re-joining the same fabric never moves the stored policy
 /// backwards.
 pub(crate) fn join_in(ks: &Keystore, token: &str, now: i64) -> anyhow::Result<String> {
     let invite = Invite::decode(token).context("the invite token (is the paste complete?)")?;
@@ -104,13 +103,12 @@ pub(crate) fn join_in(ks: &Keystore, token: &str, now: i64) -> anyhow::Result<St
     }
 
     ks.save_membership(&invite.membership)?;
-    crate::state::store::adopt_if_newer(ks, &invite.state, fabric, now)?;
-    crate::state::store::mark_checked(ks, now)?;
-    crate::state::store::save_admin(ks, invite.admin)?;
-    let held = crate::state::store::read(ks, fabric)?
-        .map_or(invite.state.state.version, |s| s.state.version);
+    crate::policy::store::adopt_if_newer(ks, &invite.policy, fabric, now)?;
+    crate::policy::store::mark_checked(ks, now)?;
+    let held =
+        crate::policy::store::read(ks, fabric)?.map_or(invite.policy.version(), |s| s.version());
     Ok(format!(
-        "joined network {}… as {}… (state version {})\nnext: `wires login` to sign in, then \
+        "joined network {}… as {}… (policy version {})\nnext: `wires login` to sign in, then \
          `wires services`",
         fabric.short(),
         me.node_id().short(),
@@ -122,23 +120,22 @@ pub(crate) fn join_in(ks: &Keystore, token: &str, now: i64) -> anyhow::Result<St
 mod tests {
     use super::*;
     use crate::testutil::temp_dir;
-    use library::{Membership, SignedState, State, StateVersion};
+    use library::{Membership, Policy, SignedPolicy, StateVersion};
 
-    /// A state at `version`, signed by `root`.
-    fn signed(root: &NodeIdentity, version: u64) -> SignedState {
-        let mut s = State::new(root.node_id());
+    /// A policy at `version`, signed by `root`.
+    fn signed(root: &NodeIdentity, version: u64) -> SignedPolicy {
+        let mut s = Policy::new(root.node_id());
         s.version = StateVersion(version);
         s.not_after = i64::MAX;
-        s.sign(root).unwrap()
+        s.directories = vec![NodeIdentity::from_seed([4u8; 32]).node_id()];
+        crate::testutil::signed_policy(root, s)
     }
 
-    /// An invite for `joiner` in the fabric of `root`, at state `version`.
+    /// An invite for `joiner` in the fabric of `root`, at policy `version`.
     fn invite_for(root: &NodeIdentity, joiner: NodeId, version: u64) -> Invite {
-        let admin = NodeIdentity::from_seed([4u8; 32]).node_id();
         Invite::new(
             Membership::mint(root, joiner, 0, i64::MAX).unwrap(),
             signed(root, version),
-            admin,
         )
     }
 
@@ -151,32 +148,30 @@ mod tests {
     }
 
     #[test]
-    fn join_installs_the_membership_state_and_admin() {
+    fn join_installs_the_membership_and_the_policy() {
         let ks = Keystore::at(temp_dir());
         let (me, _) = id_in(&ks).unwrap();
         let root = NodeIdentity::from_seed([1u8; 32]);
         let invite = invite_for(&root, me, 3);
         let out = join_in(&ks, &invite.encode().unwrap(), 0).unwrap();
-        assert!(out.contains("state version 3"), "{out}");
+        assert!(out.contains("policy version 3"), "{out}");
         assert_eq!(
             ks.read_membership().unwrap(),
             Some(invite.membership.clone())
         );
-        let held = crate::state::store::read(&ks, root.node_id())
+        let held = crate::policy::store::read(&ks, root.node_id())
             .unwrap()
             .unwrap();
-        assert_eq!(held.state.version, StateVersion(3));
-        assert_eq!(
-            crate::state::store::read_admin(&ks).unwrap(),
-            Some(invite.admin)
-        );
+        assert_eq!(held.version(), StateVersion(3));
+        // Where it fetches newer policies from: the head's directories.
+        assert_eq!(held.directories(), invite.directories());
 
-        // Re-joining with an older token keeps the newer state.
+        // Re-joining with an older token keeps the newer policy.
         join_in(&ks, &invite_for(&root, me, 2).encode().unwrap(), 0).unwrap();
-        let held = crate::state::store::read(&ks, root.node_id())
+        let held = crate::policy::store::read(&ks, root.node_id())
             .unwrap()
             .unwrap();
-        assert_eq!(held.state.version, StateVersion(3));
+        assert_eq!(held.version(), StateVersion(3));
     }
 
     #[test]

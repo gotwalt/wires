@@ -24,7 +24,7 @@
 //!    [`RecordFrame::CaughtUp`]; with `follow`, further batches as the log
 //!    grows, until the reader hangs up.
 //!
-//! A following stream is **re-authorized** whenever the host's signed state
+//! A following stream is **re-authorized** whenever the host's signed policy
 //! changes and when the reader's ID token, the state or the membership
 //! expires: the same checks as at open. Access gone → [`RecordFrame::Denied`]
 //! and the stream ends; access changed (e.g. dropped from `readers`) → a new
@@ -297,7 +297,7 @@ pub(crate) struct View {
     pub(crate) reader: Option<Person>,
     /// What it was granted, per service.
     pub(crate) scopes: BTreeMap<ServiceName, Scope>,
-    /// The signed-state version it was decided under: a newer one means
+    /// The policy version it was decided under: a newer one means
     /// deciding again.
     pub(crate) version: StateVersion,
     /// Unix seconds from which it must be decided again: the earliest expiry
@@ -448,11 +448,11 @@ pub(crate) async fn authorize(
     mine: bool,
     now: i64,
 ) -> std::result::Result<View, String> {
-    let state = host.state().map_err(|e| {
-        tracing::warn!("signed state unusable: {e:#}");
+    let state = host.policy().map_err(|e| {
+        tracing::warn!("signed policy unusable: {e:#}");
         HOST_MISCONFIGURED.to_string()
     })?;
-    let s = &state.state;
+    let s = &state.policy;
     if let Err(detail) = host.check_member(&state, &hello.membership, caller, now) {
         STRANGERS.refused("record stream", caller, &detail);
         return Err(NOT_ADMITTED.to_string());
@@ -460,9 +460,9 @@ pub(crate) async fn authorize(
     if let Err(e) = state.check_fresh(now) {
         tracing::warn!(
             version = s.version.0,
-            "record stream: signed state not fresh: {e}"
+            "record stream: signed policy not fresh: {e}"
         );
-        return Err("this host's signed state is not fresh; try again later".to_string());
+        return Err("this host's signed policy is not fresh; try again later".to_string());
     }
     let (principal, _) = host.principal(caller, hello.id_token.as_ref(), now).await;
     let mut scopes = BTreeMap::new();
@@ -496,7 +496,7 @@ pub(crate) async fn authorize(
 /// readers wait for a decision at once.
 #[derive(Clone, Debug)]
 pub(crate) struct RecordStream {
-    /// The host (its signed state, identity verifier, trust root).
+    /// The host (its signed policy, identity verifier, trust root).
     host: Arc<ServicesHost>,
     /// The call log file.
     log: PathBuf,
@@ -658,7 +658,7 @@ where
         // Decide again before sending anything new: a reader removed (or
         // dropped from `readers`) gets nothing logged after that.
         let now = crate::clock::now_unix();
-        let version = host.state().ok().map(|s| s.state.version);
+        let version = host.policy().ok().map(|s| s.version());
         let regrant = if view.due(version, now) {
             let next = match decide(now).await {
                 Ok(next) => next,

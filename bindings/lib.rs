@@ -134,7 +134,7 @@ impl Call {
         self.call.role().as_str().to_string()
     }
 
-    /// The signed-state version the call was decided under.
+    /// The policy version the call was decided under.
     pub fn state_version(&self) -> u64 {
         self.call.state_version().0
     }
@@ -361,7 +361,7 @@ impl Host {
     /// thread, or a signal handler), then close the host's endpoint and
     /// return. With `handle_ctrl_c`, Ctrl-C (SIGINT) stops it too; that
     /// claims the signal for the whole process, so it is off unless asked.
-    /// Errors before serving if the signed state doesn't assign every
+    /// Errors before serving if the signed policy doesn't assign every
     /// service to this host. A host serves once.
     #[uniffi::method(default(handle_ctrl_c = false))]
     pub fn serve(&self, handle_ctrl_c: bool) -> Result<(), WiresError> {

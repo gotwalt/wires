@@ -1,18 +1,21 @@
-//! `wires service add | set | rm` and `wires role set | rm` (card 27): the
-//! admin edits the admin-signed state, signs the next version,
-//! and pushes it to the hosts ([`super::propagate`]).
+//! `wires service add | set | rm`, `wires role set | rm`, `wires issuer set |
+//! rm` and `wires directory add | rm` (cards 27, 36): the admin edits the
+//! admin-signed policy, signs the next version, and publishes it to the
+//! directories ([`super::propagate`]).
 //!
 //! ```text
 //! wires role set analyst '*@example.com' 'issuer=https://idp,group=dba'
+//! wires issuer set https://acme.okta.com --client-id 0oa…   # trust an IdP
 //! wires role set staff --issuer https://acme.okta.com 'issuer=https://acme.okta.com'
 //! wires service add orders-db --description "Read-only SQL" --allow analyst --host workbench
 //! wires service set orders-db --host workbench --host spare     # failover
 //! wires service rm  orders-db
 //! ```
 //!
-//! Every edit goes through [`edit_state`]: the stored state, changed, its
+//! Every edit goes through [`edit_policy`]: the stored policy, changed, its
 //! expired bans dropped, the version bumped by one, re-signed (which
-//! validates it) and stored through the compare-and-swap. **The host set is
+//! validates it: every matcher's issuer must be trusted by an `issuer` item)
+//! and stored through the compare-and-swap. **The host set is
 //! derived:** a node is a host exactly when some service names it, so
 //! assigning a service is what makes a node a host, and dropping its last
 //! service makes it a plain node again. A `--host` must be a node this
@@ -21,8 +24,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use library::{
-    EmailPattern, GOOGLE_ISSUER, Matcher, NodeId, RoleName, Service, ServiceName, SignedState,
-    State, StateVersion,
+    Audience, EmailPattern, GOOGLE_ISSUER, Issuer, IssuerConfig, Matcher, NodeId, Policy, RoleName,
+    Service, ServiceName, StateVersion,
 };
 
 use super::invite::resolve_member;
@@ -31,7 +34,7 @@ use super::ledger::Ledger;
 use super::ttl::Ttl;
 use super::{Report, run_edit};
 use crate::clock::now_unix;
-use crate::state::store;
+use crate::policy::store::{self, Held};
 
 /// `service` arguments.
 #[derive(Args)]
@@ -43,11 +46,11 @@ pub(crate) struct ServiceArgs {
 /// The `service` subcommands.
 #[derive(Subcommand)]
 pub(crate) enum ServiceCmd {
-    /// Register a new service and push the new state.
+    /// Register a new service and publish the new policy.
     Add(ServiceEditArgs),
     /// Change an existing service (each flag given replaces that list).
     Set(ServiceEditArgs),
-    /// Drop a service and push the new state.
+    /// Drop a service and publish the new policy.
     Rm(ServiceRmArgs),
 }
 
@@ -70,9 +73,9 @@ pub(crate) struct ServiceEditArgs {
     /// A role that may read its call records. Repeatable.
     #[arg(long = "reader")]
     pub(crate) reader: Vec<String>,
-    /// Lifetime of the new state, from now (`30d`, `12h`, … or seconds);
+    /// Lifetime of the new policy, from now (`90d`, `12h`, … or seconds);
     /// never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::DEFAULT)]
+    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
     pub(crate) ttl: Ttl,
 }
 
@@ -81,8 +84,8 @@ pub(crate) struct ServiceEditArgs {
 pub(crate) struct ServiceRmArgs {
     /// The service to drop.
     pub(crate) name: String,
-    /// Lifetime of the new state, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::DEFAULT)]
+    /// Lifetime of the new policy, from now; never shortens the current one.
+    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
     pub(crate) ttl: Ttl,
 }
 
@@ -96,9 +99,9 @@ pub(crate) struct RoleArgs {
 /// The `role` subcommands.
 #[derive(Subcommand)]
 pub(crate) enum RoleCmd {
-    /// Define (or replace) a role as an OR of matchers, and push.
+    /// Define (or replace) a role as an OR of matchers, and publish.
     Set(RoleSetArgs),
-    /// Drop a role no service names any more, and push.
+    /// Drop a role no service names any more, and publish.
     Rm(RoleRmArgs),
 }
 
@@ -115,8 +118,8 @@ pub(crate) struct RoleSetArgs {
     /// The IdP a matcher trusts when it names none: its exact `iss`.
     #[arg(long, default_value = GOOGLE_ISSUER)]
     pub(crate) issuer: String,
-    /// Lifetime of the new state, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::DEFAULT)]
+    /// Lifetime of the new policy, from now; never shortens the current one.
+    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
     pub(crate) ttl: Ttl,
 }
 
@@ -125,8 +128,52 @@ pub(crate) struct RoleSetArgs {
 pub(crate) struct RoleRmArgs {
     /// The role to drop.
     pub(crate) name: String,
-    /// Lifetime of the new state, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::DEFAULT)]
+    /// Lifetime of the new policy, from now; never shortens the current one.
+    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
+    pub(crate) ttl: Ttl,
+}
+
+/// `issuer` arguments.
+#[derive(Args)]
+pub(crate) struct IssuerArgs {
+    #[command(subcommand)]
+    pub(crate) cmd: IssuerCmd,
+}
+
+/// The `issuer` subcommands: the IdPs the network trusts (signed `issuer`
+/// items; a host's `host.json` can narrow them, never widen them).
+#[derive(Subcommand)]
+pub(crate) enum IssuerCmd {
+    /// Trust an IdP (or change one), and publish.
+    Set(IssuerSetArgs),
+    /// Stop trusting an IdP no role names any more, and publish.
+    Rm(IssuerRmArgs),
+}
+
+/// `issuer set` arguments.
+#[derive(Args)]
+pub(crate) struct IssuerSetArgs {
+    /// The IdP's exact `iss` (e.g. `https://accounts.google.com`).
+    pub(crate) issuer: String,
+    /// The OAuth client id `wires login` signs in under.
+    #[arg(long)]
+    pub(crate) client_id: String,
+    /// An `aud` value hosts accept from this IdP. Repeatable; default: the
+    /// client id.
+    #[arg(long = "audience")]
+    pub(crate) audience: Vec<String>,
+    /// Lifetime of the new policy, from now; never shortens the current one.
+    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
+    pub(crate) ttl: Ttl,
+}
+
+/// `issuer rm` arguments.
+#[derive(Args)]
+pub(crate) struct IssuerRmArgs {
+    /// The IdP's exact `iss`.
+    pub(crate) issuer: String,
+    /// Lifetime of the new policy, from now; never shortens the current one.
+    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
     pub(crate) ttl: Ttl,
 }
 
@@ -167,24 +214,24 @@ impl ServiceEdit {
 // The one edit path
 // ---------------------------------------------------------------------------
 
-/// Sign and store the next version of this keystore's state: the stored one
-/// (or, for `wires init`, an empty one) changed by `change`, bans whose
-/// `until` has passed dropped ([`State::prune_bans`]: the badge each one
+/// Sign and store the next version of this keystore's policy: the stored
+/// one (or, for `wires init`, an empty one) changed by `change`, bans whose
+/// `until` has passed dropped ([`Policy::prune_bans`]: the badge each one
 /// cancelled has expired), version + 1, valid until `ttl` from now or the
 /// stored one's expiry, whichever is later (an edit never shortens the
-/// state's lifetime). Validation failures name the broken rule.
-pub(crate) fn edit_state(
+/// policy's lifetime). Validation failures name the broken rule.
+pub(crate) fn edit_policy(
     ks: &Keystore,
     ttl: Ttl,
-    change: impl FnOnce(&mut State) -> Result<()>,
-) -> Result<SignedState> {
+    change: impl FnOnce(&mut Policy) -> Result<()>,
+) -> Result<Held> {
     let root = ks
         .read_root_identity()?
         .ok_or_else(|| anyhow!("no root key here; run `wires init` first (on the admin)"))?;
     let held = store::read(ks, root.node_id())?;
     let mut next = match &held {
-        Some(s) => s.state.clone(),
-        None => State::new(root.node_id()),
+        Some(h) => h.policy.clone(),
+        None => Policy::new(root.node_id()),
     };
     change(&mut next)?;
     let now = now_unix();
@@ -193,23 +240,18 @@ pub(crate) fn edit_state(
     next.issued = now;
     next.not_after = ttl
         .not_after(now)
-        .max(held.as_ref().map_or(i64::MIN, |s| s.state.not_after));
-    let signed = next.sign(&root).context("the new state is not valid")?;
+        .max(held.as_ref().map_or(i64::MIN, |h| h.policy.not_after));
+    let signed = next.sign(&root).context("the new policy is not valid")?;
     if !store::adopt_if_newer(ks, &signed, root.node_id(), now)? {
-        bail!("another admin command changed the state meanwhile; run this one again");
+        bail!("another admin command changed the policy meanwhile; run this one again");
     }
-    Ok(signed)
+    Held::verify(signed, root.node_id())
 }
 
 /// `wires service add <name>`: register a new service.
-pub(crate) fn add(
-    ks: &Keystore,
-    name: ServiceName,
-    edit: ServiceEdit,
-    ttl: Ttl,
-) -> Result<SignedState> {
+pub(crate) fn add(ks: &Keystore, name: ServiceName, edit: ServiceEdit, ttl: Ttl) -> Result<Held> {
     let ledger = Ledger::load(ks)?;
-    edit_state(ks, ttl, |s| {
+    edit_policy(ks, ttl, |s| {
         if s.services.contains_key(&name) {
             bail!("service {name} already exists; change it with `wires service set`");
         }
@@ -227,14 +269,9 @@ pub(crate) fn add(
 }
 
 /// `wires service set <name>`: change an existing service.
-pub(crate) fn set(
-    ks: &Keystore,
-    name: ServiceName,
-    edit: ServiceEdit,
-    ttl: Ttl,
-) -> Result<SignedState> {
+pub(crate) fn set(ks: &Keystore, name: ServiceName, edit: ServiceEdit, ttl: Ttl) -> Result<Held> {
     let ledger = Ledger::load(ks)?;
-    edit_state(ks, ttl, |s| {
+    edit_policy(ks, ttl, |s| {
         check_hosts(s, &ledger, edit.hosts.as_deref())?;
         let svc = s
             .services
@@ -246,8 +283,8 @@ pub(crate) fn set(
 }
 
 /// `wires service rm <name>`: drop a service.
-pub(crate) fn rm(ks: &Keystore, name: ServiceName, ttl: Ttl) -> Result<SignedState> {
-    edit_state(ks, ttl, |s| {
+pub(crate) fn rm(ks: &Keystore, name: ServiceName, ttl: Ttl) -> Result<Held> {
+    edit_policy(ks, ttl, |s| {
         s.services
             .remove(&name)
             .map(|_| ())
@@ -261,19 +298,19 @@ pub(crate) fn role_set(
     name: RoleName,
     matchers: Vec<Matcher>,
     ttl: Ttl,
-) -> Result<SignedState> {
+) -> Result<Held> {
     if matchers.is_empty() {
         bail!("a role needs at least one matcher");
     }
-    edit_state(ks, ttl, |s| {
+    edit_policy(ks, ttl, |s| {
         s.roles.insert(name, matchers);
         Ok(())
     })
 }
 
 /// `wires role rm <name>`: drop a role (refused while a service names it).
-pub(crate) fn role_rm(ks: &Keystore, name: RoleName, ttl: Ttl) -> Result<SignedState> {
-    edit_state(ks, ttl, |s| {
+pub(crate) fn role_rm(ks: &Keystore, name: RoleName, ttl: Ttl) -> Result<Held> {
+    edit_policy(ks, ttl, |s| {
         if s.roles.remove(&name).is_none() {
             bail!("no role {name}");
         }
@@ -281,14 +318,84 @@ pub(crate) fn role_rm(ks: &Keystore, name: RoleName, ttl: Ttl) -> Result<SignedS
     })
 }
 
-/// Each proposed host must be a node this admin invited (in its ledger),
-/// and not banned.
-fn check_hosts(s: &State, ledger: &Ledger, hosts: Option<&[NodeId]>) -> Result<()> {
+/// `wires issuer set <iss>`: trust an IdP, or change its client id and
+/// audiences.
+pub(crate) fn issuer_set(
+    ks: &Keystore,
+    issuer: Issuer,
+    config: IssuerConfig,
+    ttl: Ttl,
+) -> Result<Held> {
+    edit_policy(ks, ttl, |p| {
+        p.issuers.insert(issuer, config);
+        Ok(())
+    })
+}
+
+/// `wires issuer rm <iss>`: stop trusting an IdP (refused while a role's
+/// matcher names it).
+pub(crate) fn issuer_rm(ks: &Keystore, issuer: &Issuer, ttl: Ttl) -> Result<Held> {
+    edit_policy(ks, ttl, |p| {
+        if p.issuers.remove(issuer).is_none() {
+            bail!("no trusted issuer {issuer}");
+        }
+        Ok(())
+    })
+}
+
+/// The `issuer` item `init` and `issuer set` sign: `client_id`, and the
+/// audiences hosts accept (the client id when none are given).
+pub(crate) fn issuer_config(client_id: &str, audiences: &[String]) -> Result<IssuerConfig> {
+    let client_id = client_id.trim();
+    if client_id.is_empty() {
+        bail!("the OAuth client id is empty");
+    }
+    let audiences: Vec<Audience> = if audiences.is_empty() {
+        vec![Audience::new(client_id)]
+    } else {
+        audiences.iter().map(|a| Audience::new(a.trim())).collect()
+    };
+    Ok(IssuerConfig {
+        client_id: Audience::new(client_id),
+        audiences,
+    })
+}
+
+/// `wires directory add <node>`: list a node as one of the network's
+/// directories (a node this admin invited, not banned, listed once).
+pub(crate) fn directory_add(ks: &Keystore, node: NodeId, ttl: Ttl) -> Result<Held> {
+    let ledger = Ledger::load(ks)?;
+    edit_policy(ks, ttl, |p| {
+        check_hosts(p, &ledger, Some(&[node]))?;
+        if p.directories.contains(&node) {
+            bail!("{} is already a directory", node.short());
+        }
+        p.directories.push(node);
+        Ok(())
+    })
+}
+
+/// `wires directory rm <node>`: stop listing a node as a directory.
+pub(crate) fn directory_rm(ks: &Keystore, node: NodeId, ttl: Ttl) -> Result<Held> {
+    edit_policy(ks, ttl, |p| {
+        let before = p.directories.len();
+        p.directories.retain(|d| *d != node);
+        if p.directories.len() == before {
+            bail!("{} is not a directory", node.short());
+        }
+        Ok(())
+    })
+}
+
+/// Each proposed host (or directory) must be a node this admin invited (in
+/// its ledger), and not banned.
+pub(crate) fn check_hosts(s: &Policy, ledger: &Ledger, hosts: Option<&[NodeId]>) -> Result<()> {
     for h in hosts.unwrap_or_default() {
-        if let Some(until) = s.bans.get(h) {
+        if let Some(ban) = s.bans.get(h) {
             bail!(
-                "{} was removed (banned until {until}); `wires invite` it again first",
-                h.short()
+                "{} was removed (banned until {}); `wires invite` it again first",
+                h.short(),
+                ban.until
             );
         }
         if !ledger.contains(*h) {
@@ -404,7 +511,7 @@ pub(crate) fn edit_from(ks: &Keystore, a: &ServiceEditArgs) -> Result<ServiceEdi
     })
 }
 
-/// Run a `service` subcommand against `ks` (no push): what changed.
+/// Run a `service` subcommand against `ks` (no publish): what changed.
 pub(crate) fn service_in(ks: &Keystore, a: ServiceArgs) -> Result<String> {
     let (verb, name, signed) = match a.cmd {
         ServiceCmd::Add(e) => {
@@ -423,12 +530,12 @@ pub(crate) fn service_in(ks: &Keystore, a: ServiceArgs) -> Result<String> {
         }
     };
     Ok(format!(
-        "service {name} {verb} (state version {})",
-        signed.state.version.0
+        "service {name} {verb} (policy version {})",
+        signed.version().0
     ))
 }
 
-/// Run a `role` subcommand against `ks` (no push): what changed.
+/// Run a `role` subcommand against `ks` (no publish): what changed.
 pub(crate) fn role_in(ks: &Keystore, a: RoleArgs) -> Result<String> {
     let role = |t: &str| RoleName::new(t.trim()).map_err(|_| anyhow!("{t:?} is not a role name"));
     let (verb, name, signed) = match a.cmd {
@@ -447,12 +554,46 @@ pub(crate) fn role_in(ks: &Keystore, a: RoleArgs) -> Result<String> {
         }
     };
     Ok(format!(
-        "role {name} {verb} (state version {})",
-        signed.state.version.0
+        "role {name} {verb} (policy version {})",
+        signed.version().0
     ))
 }
 
-/// `wires service …` against the resolved keystore, then push.
+/// Run an `issuer` subcommand against `ks` (no publish): what changed.
+pub(crate) fn issuer_in(ks: &Keystore, a: IssuerArgs) -> Result<String> {
+    let (verb, iss, signed) = match a.cmd {
+        IssuerCmd::Set(i) => {
+            let iss = Issuer::new(i.issuer.trim());
+            let config = issuer_config(&i.client_id, &i.audience)?;
+            ("trusted", iss.clone(), issuer_set(ks, iss, config, i.ttl)?)
+        }
+        IssuerCmd::Rm(i) => {
+            let iss = Issuer::new(i.issuer.trim());
+            (
+                "no longer trusted",
+                iss.clone(),
+                issuer_rm(ks, &iss, i.ttl)?,
+            )
+        }
+    };
+    Ok(format!(
+        "issuer {iss} {verb} (policy version {})",
+        signed.version().0
+    ))
+}
+
+/// `wires issuer …` against the resolved keystore, then publish.
+pub(crate) async fn issuer_cmd(a: IssuerArgs) -> Result<Report> {
+    run_edit(|ks| {
+        Ok(Report {
+            stdout: issuer_in(ks, a)?,
+            ..Report::default()
+        })
+    })
+    .await
+}
+
+/// `wires service …` against the resolved keystore, then publish.
 pub(crate) async fn service_cmd(a: ServiceArgs) -> Result<Report> {
     run_edit(|ks| {
         Ok(Report {
@@ -463,7 +604,7 @@ pub(crate) async fn service_cmd(a: ServiceArgs) -> Result<Report> {
     .await
 }
 
-/// `wires role …` against the resolved keystore, then push.
+/// `wires role …` against the resolved keystore, then publish.
 pub(crate) async fn role_cmd(a: RoleArgs) -> Result<Report> {
     run_edit(|ks| {
         Ok(Report {
@@ -511,7 +652,7 @@ mod tests {
         let host = NodeIdentity::generate().node_id();
         let ks = admin_with(&[host]);
         let root = ks.read_root_identity().unwrap().unwrap().node_id();
-        let v0 = store::read(&ks, root).unwrap().unwrap().state.version;
+        let v0 = store::read(&ks, root).unwrap().unwrap().version();
 
         let s = role_set(
             &ks,
@@ -520,7 +661,7 @@ mod tests {
             ttl(),
         )
         .unwrap();
-        assert_eq!(s.state.version, StateVersion(v0.0 + 1));
+        assert_eq!(s.version(), StateVersion(v0.0 + 1));
         let edit = ServiceEdit {
             description: Some("orders".into()),
             allow: Some(vec![role("analyst")]),
@@ -528,8 +669,8 @@ mod tests {
             readers: None,
         };
         let s = add(&ks, svc("orders-db"), edit.clone(), ttl()).unwrap();
-        assert!(s.state.assigns(&svc("orders-db"), host));
-        assert!(s.state.is_host(host));
+        assert!(s.policy.assigns(&svc("orders-db"), host));
+        assert!(s.policy.is_host(host));
         assert!(add(&ks, svc("orders-db"), edit, ttl()).is_err(), "twice");
 
         let s = set(
@@ -542,17 +683,17 @@ mod tests {
             ttl(),
         )
         .unwrap();
-        assert_eq!(s.state.services[&svc("orders-db")].description, "new");
-        assert_eq!(s.state.services[&svc("orders-db")].hosts, vec![host]);
+        assert_eq!(s.policy.services[&svc("orders-db")].description, "new");
+        assert_eq!(s.policy.services[&svc("orders-db")].hosts, vec![host]);
         assert!(set(&ks, svc("nope"), ServiceEdit::default(), ttl()).is_err());
 
         // A role still in use can't go; after the service goes, it can.
         assert!(role_rm(&ks, role("analyst"), ttl()).is_err());
         let s = rm(&ks, svc("orders-db"), ttl()).unwrap();
-        assert!(!s.state.is_host(host), "no service left, no longer a host");
+        assert!(!s.policy.is_host(host), "no service left, no longer a host");
         role_rm(&ks, role("analyst"), ttl()).unwrap();
         let stored = store::read(&ks, root).unwrap().unwrap();
-        assert_eq!(stored.state.version, StateVersion(v0.0 + 5));
+        assert_eq!(stored.version(), StateVersion(v0.0 + 5));
     }
 
     #[test]
@@ -587,13 +728,13 @@ mod tests {
         let now = now_unix();
         // A state someone signed a while ago, holding a ban that has since
         // lapsed (as if its `until` passed after that edit).
-        let mut s = store::read(&ks, root.node_id()).unwrap().unwrap().state;
+        let mut s = store::read(&ks, root.node_id()).unwrap().unwrap().policy;
         s.version = StateVersion(s.version.0 + 1);
         s.ban(lapsed, now - 10);
         s.ban(live, now + 3_600);
-        let signed = s.sign(&root).unwrap();
+        let signed = crate::testutil::signed_policy(&root, s.clone());
         assert!(store::adopt_if_newer(&ks, &signed, root.node_id(), now).unwrap());
-        assert!(signed.state.is_banned(lapsed), "held until an edit");
+        assert!(s.bans_node(lapsed), "held until an edit");
 
         let edit = ServiceEdit {
             hosts: Some(vec![live]),
@@ -609,8 +750,46 @@ mod tests {
             ttl(),
         )
         .unwrap();
-        assert!(!next.state.is_banned(lapsed), "dropped at the first edit");
-        assert!(next.state.is_banned(live), "still in force");
+        assert!(!next.policy.bans_node(lapsed), "dropped at the first edit");
+        assert!(next.policy.bans_node(live), "still in force");
+    }
+
+    /// Card 36: every matcher names a trusted issuer; `init` trusts one, and
+    /// `issuer set | rm` edit the rest.
+    #[test]
+    fn a_role_needs_a_trusted_issuer() {
+        let ks = admin_with(&[]);
+        let okta = "https://acme.okta.com";
+        let matcher = || vec![parse_matcher("*@acme.com", okta).unwrap()];
+        let e = role_set(&ks, role("staff"), matcher(), ttl()).unwrap_err();
+        assert!(format!("{e:#}").contains("not trusted"), "{e:#}");
+        let config = issuer_config("0oa1", &["api://x".into()]).unwrap();
+        assert_eq!(config.audiences, vec![Audience::new("api://x")]);
+        issuer_set(&ks, Issuer::new(okta), config, ttl()).unwrap();
+        role_set(&ks, role("staff"), matcher(), ttl()).unwrap();
+        // Still named by a role: can't go.
+        assert!(issuer_rm(&ks, &Issuer::new(okta), ttl()).is_err());
+        role_rm(&ks, role("staff"), ttl()).unwrap();
+        let held = issuer_rm(&ks, &Issuer::new(okta), ttl()).unwrap();
+        assert!(!held.policy.issuers.contains_key(&Issuer::new(okta)));
+        assert!(issuer_config(" ", &[]).is_err());
+    }
+
+    #[test]
+    fn directories_are_invited_nodes_listed_once() {
+        let dir = NodeIdentity::generate().node_id();
+        let ks = admin_with(&[dir]);
+        let held = directory_add(&ks, dir, ttl()).unwrap();
+        assert_eq!(held.directories(), &[dir]);
+        assert!(directory_add(&ks, dir, ttl()).is_err(), "twice");
+        let stranger = NodeIdentity::generate().node_id();
+        assert!(
+            directory_add(&ks, stranger, ttl()).is_err(),
+            "never invited"
+        );
+        let held = directory_rm(&ks, dir, ttl()).unwrap();
+        assert!(held.directories().is_empty());
+        assert!(directory_rm(&ks, dir, ttl()).is_err(), "not listed");
     }
 
     #[test]
@@ -650,7 +829,7 @@ mod tests {
 
     /// Run `wires role …` (the parsed command line) against `ks`: the
     /// state it stored.
-    fn role_cli(ks: &Keystore, args: &[&str]) -> Result<SignedState> {
+    fn role_cli(ks: &Keystore, args: &[&str]) -> Result<Held> {
         use crate::{Cli, Command};
         use clap::Parser;
         let cli = Cli::try_parse_from(["wires", "role"].iter().chain(args))?;
@@ -665,8 +844,17 @@ mod tests {
     #[test]
     fn role_set_names_google_unless_told_otherwise() {
         let ks = admin_with(&[]);
+        for iss in ["https://acme.okta.com", "https://other"] {
+            issuer_set(
+                &ks,
+                Issuer::new(iss),
+                issuer_config("cli", &[]).unwrap(),
+                ttl(),
+            )
+            .unwrap();
+        }
         let s = role_cli(&ks, &["set", "analyst", "*@acme.com", "alice@x.com"]).unwrap();
-        let ms = &s.state.roles[&role("analyst")];
+        let ms = &s.policy.roles[&role("analyst")];
         assert!(ms.iter().all(|m| m.issuer == GOOGLE_ISSUER), "{ms:?}");
 
         let s = role_cli(
@@ -681,7 +869,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let ms = &s.state.roles[&role("analyst")];
+        let ms = &s.policy.roles[&role("analyst")];
         assert_eq!(ms[0].issuer, "https://acme.okta.com");
         assert_eq!(ms[1].issuer, "https://other");
     }
@@ -699,6 +887,12 @@ mod tests {
         assert!(ok(&["role", "set", "analyst", "*@x.com", "group=dba"]));
         assert!(!ok(&["role", "set", "analyst"]), "a matcher is required");
         assert!(ok(&["role", "rm", "analyst"]));
+        assert!(ok(&["issuer", "set", "https://i", "--client-id", "c"]));
+        assert!(
+            !ok(&["issuer", "set", "https://i"]),
+            "a client id is required"
+        );
+        assert!(ok(&["issuer", "rm", "https://i"]));
         let Command::Service(a) = Cli::try_parse_from(["wires", "service", "rm", "db"])
             .unwrap()
             .command
@@ -718,11 +912,10 @@ mod tests {
             let root = ks.read_root_identity().unwrap().unwrap().node_id();
             add(&ks, svc("s"), ServiceEdit::default(), ttl()).unwrap();
             for d in descs {
-                let before = store::read(&ks, root).unwrap().unwrap().state.version;
+                let before = store::read(&ks, root).unwrap().unwrap().version();
                 let after = set(&ks, svc("s"), ServiceEdit { description: Some(d), ..Default::default() }, ttl())
                     .unwrap()
-                    .state
-                    .version;
+                    .version();
                 prop_assert_eq!(after, StateVersion(before.0 + 1));
             }
         }

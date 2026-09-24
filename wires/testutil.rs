@@ -95,6 +95,47 @@ pub(crate) fn staff_role() -> (library::RoleName, Vec<library::Matcher>) {
     )
 }
 
+/// Trust every issuer a role in `policy` names that it doesn't trust yet,
+/// accepting the mock IdP's client id: what a test policy needs to pass
+/// validation (card 36: every matcher names a trusted issuer).
+pub(crate) fn trust_role_issuers(policy: &mut library::Policy) {
+    let named: Vec<String> = policy
+        .roles
+        .values()
+        .flatten()
+        .map(|m| m.issuer.clone())
+        .collect();
+    for iss in named {
+        policy
+            .issuers
+            .entry(library::Issuer::new(iss.as_str()))
+            .or_insert_with(|| library::IssuerConfig {
+                client_id: library::Audience::new(crate::caller::mock_idp::MOCK_CLIENT_ID),
+                audiences: vec![library::Audience::new(
+                    crate::caller::mock_idp::MOCK_CLIENT_ID,
+                )],
+            });
+    }
+}
+
+/// `policy`, its roles' issuers trusted ([`trust_role_issuers`]), signed by
+/// `root`.
+pub(crate) fn signed_policy(
+    root: &library::NodeIdentity,
+    mut policy: library::Policy,
+) -> library::SignedPolicy {
+    trust_role_issuers(&mut policy);
+    policy.sign(root).unwrap()
+}
+
+/// [`signed_policy`], verified and typed as a node holds it.
+pub(crate) fn held(
+    root: &library::NodeIdentity,
+    policy: library::Policy,
+) -> crate::policy::store::Held {
+    crate::policy::store::Held::verify(signed_policy(root, policy), root.node_id()).unwrap()
+}
+
 /// A `host.json` `"identity"` value that trusts [`test_idp`].
 pub(crate) fn test_identity_json() -> String {
     format!(

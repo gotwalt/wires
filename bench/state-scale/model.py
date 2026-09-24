@@ -14,23 +14,21 @@ Three designs:
           freshness timestamp; callers fetch their own view from it. Nothing
           is syndicated to every node.
 
-Byte sizes are measured from real signed states
-(`cargo run -q --release -p library --example state_sizes`; pass --measure
-to re-measure). `member` and `host` are format-1 sizes, frozen: the state has
-had neither since card 35, so --measure keeps them for the *today* rows.
+Byte sizes were measured from real signed states by the `state_sizes`
+example, which card 36b deleted with the one-blob state (it is in git
+history, at 055ac46): they are frozen, as the *today* and *badges* rows
+describe a design that no longer runs. The *apex* sizes come from
+`cargo run -q --release -p library --example policy_sizes` (card 36a).
 Rates are assumptions, all in ASSUMPTIONS below.
 
   python3 bench/state-scale/model.py                 # group roles
   python3 bench/state-scale/model.py --email-roles   # Google: roles are email lists
-  python3 bench/state-scale/model.py --measure       # re-measure the sizes first
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import math
-import subprocess
 from dataclasses import dataclass
 
 # Measured by the state_sizes example (bytes of serialized JSON): `member` and
@@ -201,24 +199,11 @@ def table(results, email_roles) -> str:
     return head + "\n".join(out)
 
 
-def measure() -> dict:
-    out = subprocess.run(
-        ["cargo", "run", "-q", "--release", "-p", "library", "--example", "state_sizes"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    measured = {k: round(v) for k, v in json.loads(out).items()}
-    return {**SIZES, **measured}
-
-
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--email-roles", action="store_true", help="roles are lists of emails")
-    p.add_argument("--measure", action="store_true", help="re-measure sizes with the library")
     args = p.parse_args()
-    sizes = measure() if args.measure else SIZES
-    results = [model(t, sizes, ASSUMPTIONS, args.email_roles) for t in TIERS]
+    results = [model(t, SIZES, ASSUMPTIONS, args.email_roles) for t in TIERS]
     print(table(results, args.email_roles))
 
 

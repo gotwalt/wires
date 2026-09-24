@@ -393,10 +393,10 @@ fn check_not_older(held: &SignedPolicyHead, newer: &SignedPolicyHead) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::head::StateVersion;
     use crate::item::Ban;
     use crate::signed_policy::fixtures::*;
     use crate::signed_policy::{Policy, SignedPolicy};
-    use crate::state::StateVersion;
     use proptest::prelude::*;
 
     fn signed() -> SignedPolicy {

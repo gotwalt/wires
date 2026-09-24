@@ -1,5 +1,5 @@
 //! `wires services` (card 27, lane **27b**): the services this caller may
-//! call, evaluated **locally** against its signed state and its own verified
+//! call, evaluated **locally** against its signed policy and its own verified
 //! identity; no network, no broadcast. Services it can't call are not shown.
 //!
 //! ```text
@@ -20,14 +20,14 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use clap::Args;
 use library::{
-    Audience, Grant, IdentityClaim, Issuer, NodeId, Principal, SignedState, State, allowed_services,
+    Audience, Grant, IdentityClaim, Issuer, NodeId, Policy, Principal, allowed_services,
 };
 use serde_json::Value;
 
 use crate::admin::keystore::{self, Keystore};
 use crate::caller::hello::stored_token;
 use crate::caller::jwks::KeyFetcher;
-use crate::state::store;
+use crate::policy::store::{self, Held};
 
 /// `wires services [--json] [--verbose]`.
 #[derive(Args, Clone, Debug, Default)]
@@ -41,18 +41,18 @@ pub(crate) struct ServicesArgs {
     pub(crate) verbose: bool,
 }
 
-/// What this node may call: its verified principal (if any), the signed state,
-/// and the grants that state gives it.
+/// What this node may call: its verified principal (if any), the signed
+/// policy, and the grants that policy gives it.
 pub(crate) struct Allowed {
-    /// The verified stored state.
-    pub(crate) state: SignedState,
+    /// The verified stored policy.
+    pub(crate) state: Held,
     /// Who this node verified as; `None`: no usable token.
     pub(crate) principal: Option<Principal>,
     /// The services it may call, in name order.
     pub(crate) grants: Vec<Grant>,
 }
 
-/// Evaluate the stored state for this node (`ks`), with its stored identity.
+/// Evaluate the stored policy for this node (`ks`), with its stored identity.
 /// Notes on why the identity is missing go to stderr; they don't fail the
 /// listing (which is then empty: every role needs a verified identity).
 pub(crate) async fn allowed(ks: &Keystore) -> Result<Allowed> {
@@ -65,7 +65,7 @@ pub(crate) async fn allowed(ks: &Keystore) -> Result<Allowed> {
             None
         }
     };
-    let grants = allowed_services(&state.state, me, principal.as_ref());
+    let grants = allowed_services(&state.policy, me, principal.as_ref());
     Ok(Allowed {
         state,
         principal,
@@ -117,20 +117,20 @@ pub(crate) async fn run(a: &ServicesArgs) -> Result<String> {
     if allowed.grants.is_empty() {
         let who = allowed.principal.as_ref().map(Principal::name);
         eprintln!(
-            "wires services: no service allows {} (state v{})",
+            "wires services: no service allows {} (policy v{})",
             who.as_deref().unwrap_or("this node without a login"),
-            allowed.state.state.version.0
+            allowed.state.version().0
         );
     }
     if a.json {
-        return render_json(&allowed.state.state, &allowed.grants, a.verbose);
+        return render_json(&allowed.state.policy, &allowed.grants, a.verbose);
     }
-    Ok(render(&allowed.state.state, &allowed.grants, a.verbose))
+    Ok(render(&allowed.state.policy, &allowed.grants, a.verbose))
 }
 
 /// The listing: one line per grant, `name  description  (role)`, columns
 /// aligned, in name order; `verbose` appends `hosts: …`.
-pub(crate) fn render(state: &State, grants: &[Grant], verbose: bool) -> String {
+pub(crate) fn render(state: &Policy, grants: &[Grant], verbose: bool) -> String {
     let desc = |g: &Grant| {
         state
             .service(&g.service)
@@ -168,7 +168,7 @@ pub(crate) fn render(state: &State, grants: &[Grant], verbose: bool) -> String {
 }
 
 /// `--json`: one object per line.
-fn render_json(state: &State, grants: &[Grant], verbose: bool) -> Result<String> {
+fn render_json(state: &Policy, grants: &[Grant], verbose: bool) -> Result<String> {
     let mut lines = Vec::new();
     for g in grants {
         let mut obj = serde_json::json!({
@@ -189,7 +189,7 @@ fn render_json(state: &State, grants: &[Grant], verbose: bool) -> Result<String>
     Ok(lines.join("\n"))
 }
 
-fn hosts(state: &State, g: &Grant) -> Vec<String> {
+fn hosts(state: &Policy, g: &Grant) -> Vec<String> {
     state
         .service(&g.service)
         .map(|s| s.hosts.iter().map(NodeId::short).collect())
@@ -214,8 +214,8 @@ mod tests {
         ServiceName::new(s).unwrap()
     }
 
-    fn state() -> State {
-        let mut s = State::new(node(1));
+    fn state() -> Policy {
+        let mut s = Policy::new(node(1));
         s.version = StateVersion(1);
         let svc = |description: &str| Service {
             description: description.into(),

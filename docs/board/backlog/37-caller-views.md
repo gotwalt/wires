@@ -1,6 +1,6 @@
 # 37 — Caller views: each caller holds only what it may use
 
-**Lane:** D3 · **Depends on:** [36](36-directory.md) · **Status:** backlog, designed 2026-09-24 · **Files:** `wires/directory/` (views, search, resolve), `library/calls/session.rs` (`HelloAck`), `wires/caller/{join,services,call,mcp,inbox,watch,pick}.rs`, `wires/gateway/`, `wires/admin/invite.rs`, `library/membership/invite.rs`, protocol.md §3–5, usage.md, [fabric.md](../../fabric.md)
+**Lane:** D3 · **Depends on:** [36](../doing/36-directory.md) · **Status:** backlog, designed 2026-09-24 · **Files:** `wires/directory/` (views, search, resolve), `library/calls/session.rs` (`HelloAck`), `wires/caller/{join,services,call,mcp,inbox,watch,pick}.rs`, `wires/gateway/`, `wires/admin/invite.rs`, `library/membership/invite.rs`, protocol.md §3–5, usage.md, [fabric.md](../../fabric.md)
 
 ## Why
 
@@ -21,7 +21,7 @@ even a filtered catalog outgrows a model's context.
 - **`wires/directory/1` gains** `view {have, query?}` (the whole view, or the entries matching
   `query` by name and description) and `resolve {service}` (one entry, only if it is in the view).
   A request is traced, not logged.
-- **Callers stop holding the state.** `state.json` and the cold pull go; the caller keeps
+- **Callers stop holding the state.** `policy.json` and the cold fetch go; the caller keeps
   `view.json`. `wires services [query]` reads it, refreshing first if it is older than a day or
   its head is behind (next point).
 - **The call handshake carries the news.** `HelloAck` gains the host's head version. When it is

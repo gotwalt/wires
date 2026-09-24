@@ -8,14 +8,19 @@
 #
 #   workbench -- `wires serve host.json` (.scripts/fixtures/host.json:
 #   spare        implements one service, orders-db, as sqlite3 over orders.db).
-#                Two hosts implement it: a caller never names either.
+#                Two hosts implement it: a caller never names either. Both
+#                are also the network's directories (`wires directory add`):
+#                `serve` runs the directory too, which holds the signed
+#                policy the admin publishes, and which hosts and callers
+#                fetch it from.
 #   agent     -- alice@example.com (role analyst): `wires login`, `wires
 #                services`, `wires call orders-db …`, `wires mcp`, `wires inbox`.
 #   observer  -- sec@audit.example (role security): allowed to call nothing,
 #                allowed to READ orders-db's call records (`wires watch`).
-#   root      -- the admin: `wires init`, `role set`, `service add`, one
-#                `wires invite` per machine, and later `wires remove agent`.
-#                Every change is one signed state, pushed to the hosts by key.
+#   root      -- the admin: `wires init`, `role set`, `directory add`,
+#                `service add`, one `wires invite` per machine, and later
+#                `wires remove agent`. Every change is one signed policy,
+#                published to the directories by key.
 #
 # The IdP is a hermetic loopback OIDC issuer (`wires dev-mock-idp`, compiled
 # only with `--features dev-mock-idp` -- never the shipped binary). `wires login
@@ -121,7 +126,7 @@ command -v sqlite3 >/dev/null || bad "sqlite3 is not on PATH"
 command -v curl >/dev/null || bad "curl is not on PATH"
 
 # ==========================================================================
-# Setup (off camera): five keystores, one signed state, one database, one IdP.
+# Setup (off camera): five keystores, one signed policy, one database, one IdP.
 # ==========================================================================
 root="$D/root"
 wb="$D/workbench"
@@ -130,10 +135,14 @@ agent="$D/agent"
 obs="$D/observer"
 mkdir -p "$root" "$wb" "$sp" "$agent" "$obs"
 
+# The IdP comes first: the network's first policy trusts it, and every role
+# names the issuer it trusts.
+start_mock_idp "$EMAIL"
 # The admin starts the network (its own node holds a badge too); every other
 # machine makes its key and hands the admin its id. One invite token back
 # each: a badge, which is what admits the node.
-ROOT_ID="$(WIRES_HOME="$root" "$WIRES" init | awk '/^network /{print $2}')"
+ROOT_ID="$(WIRES_HOME="$root" "$WIRES" init --issuer "$ISSUER" --client-id "$CLIENT_ID" |
+	awk '/^network /{print $2}')"
 WB_ID="$(WIRES_HOME="$wb" "$WIRES" id 2>/dev/null)"
 SP_ID="$(WIRES_HOME="$sp" "$WIRES" id 2>/dev/null)"
 AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
@@ -142,14 +151,20 @@ OB_ID="$(WIRES_HOME="$obs" "$WIRES" id 2>/dev/null)"
 	bad "setup: could not read the key ids"
 AG8="${AG_ID:0:8}"
 admin() { WIRES_HOME="$root" "$WIRES" "$@"; }
-# The IdP comes first: every role names the issuer it trusts.
-start_mock_idp "$EMAIL"
-# Roles are who, by IdP identity. Then the hosts join; they are not running
-# yet, so the admin's pushes miss them -- their tokens carry the state.
+# Roles are who, by IdP identity. Then the hosts are invited and named the
+# network's directories; they are not running yet, so the admin's publishes
+# miss them -- their tokens carry the policy.
 admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1
 admin role set security --issuer "$ISSUER" "$READER" >/dev/null 2>&1
 admin invite "$WB_ID" --name workbench >/dev/null 2>&1
 admin invite "$SP_ID" --name spare >/dev/null 2>&1
+for h in workbench spare; do
+	admin directory add "$h" >/dev/null 2>"$D/dir.err" ||
+		grep -qF "reached none of its" "$D/dir.err" || {
+		cat "$D/dir.err" >&2
+		bad "setup: wires directory add $h failed"
+	}
+done
 
 DB="$D/orders.db"
 sqlite3 "$DB" <"$repo/.scripts/fixtures/orders.sql"
@@ -167,17 +182,17 @@ beat 5
 step "1  the admin registers ONE service, and who may call and read it"
 # ==========================================================================
 run "wires service add orders-db --description … --allow analyst --reader security --host workbench --host spare"
-# The hosts aren't up yet, so the edit reaches neither and exits 1 (the new
-# state is stored; a fresh token carries it to them below).
+# The directories aren't up yet, so the edit reaches neither and exits 1
+# (the new policy is stored; a fresh token carries it to them below).
 admin service add orders-db \
 	--description "Read-only SQL (sqlite3) over the orders database; pass the SQL statement as the argument." \
 	--allow analyst --reader security --host workbench --host spare >"$D/svc.out" 2>"$D/svc.err" ||
-	grep -qF "reached none of its 2 host(s)" "$D/svc.err" || {
+	grep -qF "reached none of its 2 directory(ies)" "$D/svc.err" || {
 	cat "$D/svc.err" >&2
 	bad "1: wires service add failed"
 }
 show "$D/svc.out"
-# A fresh token catches the hosts up (re-join never rolls a state back).
+# A fresh token catches the hosts up (re-join never rolls a policy back).
 for pair in "$wb:$WB_ID:workbench" "$sp:$SP_ID:spare"; do
 	h="${pair%%:*}"
 	rest="${pair#*:}"
@@ -187,14 +202,14 @@ done
 HOST_JSON="$D/host.json"
 sed -e "s|__ISSUER__|$ISSUER|" -e "s|__CLIENT_ID__|$CLIENT_ID|" \
 	"$repo/.scripts/fixtures/host.json" >"$HOST_JSON"
-run "wires serve --check host.json   # how this host implements it; who may call is the state's"
+run "wires serve --check host.json   # how this host implements it; who may call is the policy's"
 "$WIRES" serve --check "$HOST_JSON" >"$D/check.out" 2>&1 || {
 	dump "$D/check.out"
 	bad "1: serve --check rejected host.json"
 }
 grep -qF "orders-db" "$D/check.out" || bad "1: serve --check does not list orders-db"
 show "$D/check.out"
-run "wires serve host.json   # on the workbench, and on the spare"
+run "wires serve host.json   # on the workbench, and on the spare (each also a directory)"
 start_host "$wb" workbench
 WB_PID=$LAST_PID
 start_host "$sp" spare
@@ -202,7 +217,7 @@ SP_PID=$LAST_PID
 share_hints
 ok "1: workbench (pid $WB_PID) and spare (pid $SP_PID) serve orders-db, reached by key"
 # The agent and the observer are invited now. An invite mints a badge and
-# edits nothing: the state's version doesn't move, and nothing is pushed.
+# edits nothing: the policy's version doesn't move, and nothing is published.
 AG_TOKEN="$(admin invite "$AG_ID" --name agent 2>"$D/invite.err")" || {
 	cat "$D/invite.err" >&2
 	bad "setup: inviting the agent failed"
@@ -211,9 +226,9 @@ OB_TOKEN="$(admin invite "$OB_ID" --name observer 2>>"$D/invite.err")" || {
 	cat "$D/invite.err" >&2
 	bad "setup: inviting the observer failed"
 }
-if [ "$(grep -cF "unchanged" "$D/invite.err")" -ne 2 ] || grep -qF "pushed to" "$D/invite.err"; then
+if [ "$(grep -cF "unchanged" "$D/invite.err")" -ne 2 ] || grep -qF "published to" "$D/invite.err"; then
 	cat "$D/invite.err" >&2
-	bad "setup: an invite edited the state or pushed it"
+	bad "setup: an invite edited the policy or published it"
 fi
 WIRES_HOME="$agent" "$WIRES" join "$AG_TOKEN" >/dev/null
 WIRES_HOME="$obs" "$WIRES" join "$OB_TOKEN" >/dev/null
@@ -265,7 +280,7 @@ grep -qE "^orders-db +Read-only SQL.*\(analyst\)$" "$D/s1.out" || {
 	bad "3: the signed-in analyst does not see orders-db"
 }
 show "$D/s1.out"
-ok "3: evaluated locally against the signed state: orders-db, because analyst -- no host named"
+ok "3: evaluated locally against the signed policy: orders-db, because analyst -- no host named"
 beat 3
 
 # ==========================================================================
@@ -558,9 +573,9 @@ admin remove agent >"$D/remove.out" 2>"$D/remove.err" || {
 	cat "$D/remove.err" >&2
 	bad "9: wires remove failed"
 }
-grep -qF "pushed to 2 of 2 host(s)" "$D/remove.err" || {
+grep -qF "published to 2 of 2 directory(ies)" "$D/remove.err" || {
 	cat "$D/remove.err" >&2
-	bad "9: the new state never reached both hosts"
+	bad "9: the new policy never reached both directories"
 }
 show "$D/remove.out"
 run "wires call orders-db -- 'select count(*) from orders'"

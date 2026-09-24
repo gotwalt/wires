@@ -1,6 +1,6 @@
 # 36 — The directory: where the fabric's policy lives
 
-**Lane:** D2 · **Depends on:** [35](../done/35-badges-and-bans.md) · **Status:** backlog, designed 2026-09-24 · **Files:** `library/services/` (policy head, items, Merkle proofs, freshness), `library/directory/` (new: frames), `wires/directory/` (new: the mode, its redb store, subscriptions), `wires/host/{serve,gate}.rs`, `wires/state/` (retired), `wires/admin/`, protocol.md §3–4, [fabric.md](../../fabric.md)
+**Lane:** D2 · **Depends on:** [35](../done/35-badges-and-bans.md) · **Status:** doing (36a, 36b done; 36c next), designed 2026-09-24 · **Files:** `library/services/` (policy head, items, Merkle proofs, freshness), `library/directory/` (new: frames), `wires/directory/` (new: the mode, its redb store, subscriptions), `wires/host/{serve,gate}.rs`, `wires/state/` (retired), `wires/admin/`, protocol.md §3–4, [fabric.md](../../fabric.md)
 
 ## Why (the human, 2026-09-24)
 
@@ -295,3 +295,58 @@ updates and the 184 KB / 1.06 MB slice figures above.
   bans are most of the 182 KB, and that is a first-sync cost. At 1k services and about 20 edits a
   day, the updates come to about 60 KB a day plus 288 beats × 475 B ≈ 137 KB of `Fresh`. The
   beat, not the policy, now dominates a host's daily traffic, against the model's 288 × 300 B.
+
+**36b (2026-09-24, branch `worker/36b-directory`): the mode, and the policy everywhere.**
+Every node still holds the **whole** signed policy; hosts narrow to slices in 36c, callers to
+views in 37.
+
+- **State → Policy.** `State`, `SignedState`, `StateFrame`, `wires/state/1` and the
+  `state_sizes` example are gone. `StateVersion` moved to `head.rs` (kept: it is the
+  `state_version` of `Hello`). Nodes store `policy.json` (+ `.lock`, `adopt_if_newer`: verify,
+  fresh head, strictly newer) and decide from a `Held {signed, policy}`. `check_admitted`,
+  `authorize`, `allowed_services`, `role_admits` take a `Policy`; the refusal wording is
+  unchanged. Gates use `Policy::bans_node` (a ban holds until pruned, as the state's did);
+  `Policy::validate` gained the state's "no banned host" rule; `Policy` gained `hosts`,
+  `is_host`, `assigns`, `service`. `HelloAck.newer_state` → `newer_policy`. `Invite` is format
+  3: `{membership, policy}`; the directory ids are the head's (no `admin` hint,
+  no `state-admin.txt`).
+- **Issuers are signed.** `init` signs an `issuer` item (`--issuer`, default Google;
+  `--client-id` or `$WIRES_OIDC_CLIENT_ID`, **required**; `--audience`, default the client id).
+  `wires issuer set|rm` edit the rest (`rm` is refused while a role names it). `host.json`'s
+  `identity` is optional and only narrows (an entry's `audiences` optional = the policy's);
+  the host's `Identities` trust follows the policy it decides under (`ServicesHost::policy`
+  sets it). Head `not_after` defaults to 90 days (`Ttl::POLICY_DEFAULT`).
+- **The directory** (`wires/directory/`): `db.rs` (`directory.redb`: heads keep the signed head
+  plus each item's storage key, a blake3 of its JSON, not the Merkle leaf hash, so 36d's tree
+  removal doesn't touch it; last 16 heads; items GC'd; `current`; `meta` version + fresh),
+  `node.rs` (`Directory`: `accept` = `SignedPolicy::verify` + fresh + newer, mirrored into the
+  node's own `policy.json`; `Fresh` signed at open, on each accept and every `beat_secs`, only
+  when the head lists the node; `answer`), `serve.rs` (both ALPNs, 16 undecided streams across
+  both, subscriber cap `--max-subscribers` default 4096, `replica` subscriptions only from
+  listed directories, the beat and replica loops with 1 s → 30 s backoff, `directory serve`),
+  `wire.rs` (frame I/O and `ask`). `slice`/`view`/`resolve` and `slice`/`view` subscriptions
+  answer `denied`.
+- **Temporary, for 36c/37 to remove:** `DirectoryRequest::Policy {have}` →
+  `DirectoryAnswer::Policy {policy, fresh}` (or `current {fresh}`), the whole policy. Its users:
+  `policy::fetch::fetch` (host `fetch_now` at start, `check_once` → `refresh_loop` every
+  `beat_secs` after a `head {}`; the gateway's loop; callers' `refresh_cold` when
+  `policy-checked.txt` is >10 min old). 36c replaces the host side with the slice
+  subscription (and freshness lenient/strict, which 36b does not enforce: hosts store no
+  `Fresh`); 37 replaces the caller side, `newer_policy`, and the whole policy in the invite.
+- **Distribution.** Admin edits publish to the new head's directories plus the previous head's,
+  never to a host; exit 1 when D > 0 and none took it; D = 0 is a note. `remove` also drops
+  the node from `directories`. `wires serve` runs the directory when the head lists its node
+  (decided at start; listing a running host takes effect at its restart).
+- **Deviation: the demo has two directories.** Hosts check `head` only every beat (5 min) until
+  36c, so with only the workbench listed the spare would keep serving a removed agent for up to
+  5 min, and the demo's removal step (the agent's last good host is the spare after the
+  failover step) would fail. Both hosts are listed, as fabric.md recommends; `remove` then
+  reaches both at once.
+- **Acceptance** (`wires/directory/tests.rs`, `db.rs`): publish reaches the directory within
+  2 s and a counting responder on the host sees no dial; host (`check_once`) and caller
+  (`catch_up`) fetch it; restart from `directory.redb` serves the same head and a new `Fresh`
+  (with `policy.json` removed); tampered item, another head's items, an unsigned version bump
+  and an older head refused; a `Fresh` from an unlisted key refused by the fetcher; a replica
+  catches up; strangers and banned nodes hear only `not a member of this network`;
+  `directory serve` refuses `root.seed` and an unlisted node. Not built (36c): the "within 2 s
+  to every subscribed host" and slice-content criteria, lenient/strict, model.py apex rows.

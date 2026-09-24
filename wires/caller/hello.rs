@@ -1,12 +1,12 @@
 //! The caller's half of the session handshake: build the [`Hello`] from what
-//! this node holds: its membership, the version of its signed state, and its
+//! this node holds: its membership, the version of its signed policy, and its
 //! stored ID token from `wires login` (the token travels in the handshake).
 
 use library::{Hello, IdToken, Membership, StateVersion};
 
 use crate::admin::keystore::Keystore;
 use crate::caller::login::ID_TOKEN_FILE;
-use crate::state::store;
+use crate::policy::store;
 
 /// Build this node's [`Hello`] around `membership` (from the keystore or a
 /// `--membership` flag); the state version and ID token come from `ks`. A
@@ -15,10 +15,10 @@ use crate::state::store;
 /// 0): the host then hands back its own.
 pub(crate) fn with_membership(ks: &Keystore, membership: Membership) -> Hello {
     let state_version = match store::read(ks, membership.fabric) {
-        Ok(Some(s)) => s.state.version,
+        Ok(Some(s)) => s.version(),
         Ok(None) => StateVersion(0),
         Err(e) => {
-            tracing::warn!("the stored signed state is unusable: {e:#}");
+            tracing::warn!("the stored signed policy is unusable: {e:#}");
             StateVersion(0)
         }
     };
@@ -39,7 +39,7 @@ pub(crate) fn stored_token(ks: &Keystore) -> Option<IdToken> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library::{NodeIdentity, State};
+    use library::{NodeIdentity, Policy};
 
     fn keystore() -> Keystore {
         Keystore::at(crate::testutil::temp_dir())
@@ -58,11 +58,11 @@ mod tests {
         assert_eq!(h.state_version, StateVersion(0));
         assert_eq!(h.id_token, None);
 
-        let mut s = State::new(root.node_id());
+        let mut s = Policy::new(root.node_id());
         s.version = StateVersion(4);
         s.issued = 1;
         s.not_after = i64::MAX;
-        let signed = s.sign(&root).unwrap();
+        let signed = crate::testutil::signed_policy(&root, s);
         store::adopt_if_newer(&ks, &signed, root.node_id(), 10).unwrap();
         std::fs::write(ks.path(ID_TOKEN_FILE), "a.b.c\n").unwrap();
 

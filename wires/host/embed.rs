@@ -3,9 +3,9 @@
 //!
 //! An embedded host is `wires serve` running inside the app. It starts the
 //! same way, keeps the same call log, and decides every call by the same
-//! admin-signed state. It must be a joined node (`WIRES_HOME=<dir> wires
+//! admin-signed policy. It must be a joined node (`WIRES_HOME=<dir> wires
 //! id`, the admin invites it, `WIRES_HOME=<dir> wires join <token>`), and
-//! the signed state must assign each of its services to it
+//! the signed policy must assign each of its services to it
 //! (`wires service add <name> --host <it>`), or [`Host::serve`] refuses to
 //! start, naming the first that isn't.
 //!
@@ -66,7 +66,7 @@ pub struct HostBuilder {
 
 impl Host {
     /// Start building a host whose keystore is `home` (what `$WIRES_HOME` is
-    /// for `wires`): its `node.seed`, `membership.json`, signed state, call
+    /// for `wires`): its `node.seed`, `membership.json`, signed policy, call
     /// log and address hints. The host reads nothing from `$WIRES_HOME`,
     /// `$WIRES_NODE_SEED` or `$WIRES_MEMBERSHIP`.
     pub fn builder(home: impl Into<PathBuf>) -> HostBuilder {
@@ -99,7 +99,7 @@ impl Host {
 
     /// Serve until `shutdown` resolves, then stop: calls in progress are
     /// ended and the endpoint is closed, so nothing of the host outlives
-    /// the returned future. Errors before serving if the signed state
+    /// the returned future. Errors before serving if the signed policy
     /// doesn't assign every service to this host (after trying to pull a
     /// newer one), or the call log can't be opened. Listens for no signal.
     pub async fn serve_until(self, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
@@ -128,10 +128,11 @@ impl HostBuilder {
         self
     }
 
-    /// Trust ID tokens from `issuer` (its `iss`, exactly) for the OAuth
-    /// client ids in `audiences`, as `host.json`'s `identity.issuers` does.
-    /// Every registry role names an issuer, so a host that trusts none
-    /// admits nobody.
+    /// Keep trusting ID tokens from `issuer` (its `iss`, exactly), and only
+    /// for the OAuth client ids in `audiences` (none: every one the policy
+    /// accepts), as `host.json`'s `identity.issuers` does. The IdPs a
+    /// network trusts are its signed policy's `issuer` items (card 36);
+    /// naming any here narrows them to those named, and never adds one.
     pub fn trust_issuer<A: Into<String>>(
         mut self,
         issuer: impl Into<String>,
@@ -147,8 +148,8 @@ impl HostBuilder {
     /// Implement service `name` with `service`, in-process.
     ///
     /// `host.json`'s `also_require` (a stricter local rule on top of the
-    /// signed state) applies to its CLI services only; a native service is
-    /// gated by the signed state alone. A handler that wants a stricter
+    /// signed policy) applies to its CLI services only; a native service is
+    /// gated by the signed policy alone. A handler that wants a stricter
     /// rule checks [`Call::role`](crate::Call::role) or
     /// [`Call::principal`](crate::Call::principal) itself.
     pub fn service(mut self, name: impl Into<String>, service: impl Service) -> Self {
@@ -156,7 +157,7 @@ impl HostBuilder {
         self
     }
 
-    /// Let the host push to the members of `roles` (from the signed state),
+    /// Let the host push to the members of `roles` (from the signed policy),
     /// tried in order, as `host.json`'s `push.allow` does: what a native
     /// service's [`Call::push_to_caller`](crate::Call::push_to_caller) needs.
     pub fn push_allow<R: Into<String>>(mut self, roles: impl IntoIterator<Item = R>) -> Self {
@@ -182,7 +183,7 @@ impl HostBuilder {
     /// Check the configuration and load the keystore: the node key, the
     /// membership. Errors on a bad service name, a name registered twice
     /// (natively, or natively and in `host.json`), no services at all, an
-    /// invalid `host.json`, or a keystore that isn't a joined node's. Whether the signed state assigns the services here
+    /// invalid `host.json`, or a keystore that isn't a joined node's. Whether the signed policy assigns the services here
     /// is checked when the host starts to serve.
     pub fn build(self) -> Result<Host> {
         let mut native = NativeServices::new();
@@ -196,7 +197,7 @@ impl HostBuilder {
             Some(path) => HostConfig::load_embedded(path)?,
             None => HostConfig {
                 version: HOST_CONFIG,
-                identity: IdentityConfig::default(),
+                identity: None,
                 services: Default::default(),
                 push: None,
                 audit: None,
@@ -205,7 +206,13 @@ impl HostBuilder {
         if let Some(name) = native.keys().find(|n| config.services.contains_key(*n)) {
             bail!("service {name} is both registered here and in host.json; pick one");
         }
-        config.identity.issuers.extend(self.issuers);
+        if !self.issuers.is_empty() {
+            config
+                .identity
+                .get_or_insert_with(IdentityConfig::default)
+                .issuers
+                .extend(self.issuers);
+        }
         if let Some(roles) = self.push_allow {
             let allow = roles
                 .iter()
@@ -366,9 +373,14 @@ mod tests {
             .trust_issuer("https://idp.example", ["a"])
             .trust_issuer("https://idp.example", ["b"]);
         assert!(err(b).contains("listed twice"));
-        let no_aud = Host::builder(joined())
+        let empty_aud = Host::builder(joined())
+            .service("t", Nop)
+            .trust_issuer("https://idp.example", [" "]);
+        assert!(err(empty_aud).contains("an empty audience"));
+        // No audiences: every one the policy accepts from that issuer.
+        let policys = Host::builder(joined())
             .service("t", Nop)
             .trust_issuer("https://idp.example", Vec::<String>::new());
-        assert!(err(no_aud).contains("no audiences"));
+        assert!(policys.build().is_ok());
     }
 }

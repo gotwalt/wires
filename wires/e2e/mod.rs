@@ -1,4 +1,4 @@
-//! The integration tests: the whole stack — signed state, the `Hello`
+//! The integration tests: the whole stack — signed policy, the `Hello`
 //! handshake, the registry gate, exec and the stdio bridge, push — driven
 //! over hermetic loopback QUIC.
 //!
@@ -8,7 +8,7 @@
 //! address hints over loopback ([`localhost_socks`]).
 //!
 //! - [`services_host`] — card 27's acceptance: a host decides
-//!   every call by the admin-signed state (the registry's roles,
+//!   every call by the admin-signed policy (the registry's roles,
 //!   `also_require`, removal with no restart, refusing unassigned services,
 //!   push by the state).
 //! - [`records`] — card 26b: call records streamed from the host's own log
@@ -26,8 +26,8 @@ use std::time::Duration;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, EndpointAddr};
 use library::{
-    Frame, Hello, HelloAck, Invocation, Matcher, Membership, NodeIdentity, OidcNonce, RoleName,
-    ServiceName, SignedState, State, StateVersion,
+    Frame, Hello, HelloAck, Invocation, Matcher, Membership, NodeIdentity, OidcNonce, Policy,
+    RoleName, ServiceName, SignedPolicy, StateVersion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::timeout;
@@ -37,7 +37,7 @@ use crate::caller::mock_idp::{MOCK_CLIENT_ID, MockIdp};
 use crate::host::config::HostConfig;
 use crate::host::transport::{ALPN, secret_key};
 
-/// Card 27's host side: a host decides by the signed state.
+/// Card 27's host side: a host decides by the signed policy.
 mod services_host;
 
 /// Card 26b: call records streamed from the host's log to authorized readers.
@@ -102,13 +102,13 @@ fn email_at(idp: &MockIdp, email: &str) -> Matcher {
 
 /// The state `root` signs at `version` (issued now, never expiring), after
 /// `edit` fills it in.
-fn signed_state(root: &NodeIdentity, version: u64, edit: impl FnOnce(&mut State)) -> SignedState {
-    let mut s = State::new(root.node_id());
+fn signed_state(root: &NodeIdentity, version: u64, edit: impl FnOnce(&mut Policy)) -> SignedPolicy {
+    let mut s = Policy::new(root.node_id());
     s.version = StateVersion(version);
     s.issued = crate::clock::now_unix();
     s.not_after = i64::MAX;
     edit(&mut s);
-    s.sign(root).unwrap()
+    crate::testutil::signed_policy(root, s)
 }
 
 /// `who`'s membership under `root`, never expiring.
@@ -131,9 +131,9 @@ fn hello(root: &NodeIdentity, who: &NodeIdentity, version: u64, idp: Option<&Moc
     }
 }
 
-/// Store `state` in `ks` as `wires/state` does; whether it was adopted.
-fn adopt(ks: &Keystore, root: &NodeIdentity, state: &SignedState) -> bool {
-    crate::state::store::adopt_if_newer(ks, state, root.node_id(), crate::clock::now_unix())
+/// Store `state` in `ks` as a fetch from a directory does; whether it was adopted.
+fn adopt(ks: &Keystore, root: &NodeIdentity, state: &SignedPolicy) -> bool {
+    crate::policy::store::adopt_if_newer(ks, state, root.node_id(), crate::clock::now_unix())
         .unwrap()
 }
 

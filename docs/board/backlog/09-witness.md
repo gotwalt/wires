@@ -1,6 +1,6 @@
 # 09 — Transparency-log records and a witness
 
-**Lane:** R · **Depends on:** 26, [36](36-directory.md) · **Status:** backlog; reshaped 2026-09-24 to take in the records half of the old card 29
+**Lane:** R · **Depends on:** 26, [36](../doing/36-directory.md) · **Status:** backlog; reshaped 2026-09-24 to take in the records half of the old card 29
 
 ## Goal
 

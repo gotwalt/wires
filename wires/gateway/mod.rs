@@ -11,7 +11,7 @@
 //! as the caller. The gateway holds nothing a host has to trust beyond its
 //! membership: it can't name a user Google didn't sign in.
 //!
-//! What a web user sees is decided by the signed state, as for any caller:
+//! What a web user sees is decided by the signed policy, as for any caller:
 //! the services a role **matching the user's IdP identity** admits
 //! ([`web_grants`]). Every role needs a verified identity, so the gateway's
 //! node alone admits nobody.
@@ -38,7 +38,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use axum::Router;
 use axum::routing::{get, post};
 use clap::Args;
-use library::{Grant, IdToken, NodeId, Principal, State, role_admits};
+use library::{Grant, IdToken, NodeId, Policy, Principal, role_admits};
 use url::Url;
 
 use crate::admin::keystore::Keystore;
@@ -47,7 +47,7 @@ use crate::caller::jwks::KeyFetcher;
 use crate::caller::login::{DEFAULT_ISSUER, OidcClient, random_token, save_secret};
 use crate::caller::mcp::with_services;
 use crate::caller::tools::ToolsConfig;
-use crate::state::store;
+use crate::policy::store;
 
 use self::clients::{ClientKey, MetadataFetcher};
 use self::sessions::Store;
@@ -149,9 +149,9 @@ impl PublicUrls {
 pub(crate) trait Backend: Send + Sync + 'static {
     /// The caller used for one web user's calls.
     type Caller: crate::caller::call::Caller + Send + Sync;
-    /// The signed state this gateway holds now (read per request, so a
-    /// newer state applies at once).
-    fn state(&self) -> Result<State>;
+    /// The signed policy this gateway holds now (read per request, so a
+    /// newer policy applies at once).
+    fn state(&self) -> Result<Policy>;
     /// A caller presenting `token` in every call's handshake.
     fn caller(&self, token: IdToken) -> Self::Caller;
 }
@@ -168,8 +168,8 @@ pub(crate) struct Keystored {
 impl Backend for Keystored {
     type Caller = PresentingCaller;
 
-    fn state(&self) -> Result<State> {
-        Ok(store::require_state(&self.ks, self.creds.fabric())?.state)
+    fn state(&self) -> Result<Policy> {
+        Ok(store::require_policy(&self.ks, self.creds.fabric())?.policy)
     }
 
     fn caller(&self, token: IdToken) -> PresentingCaller {
@@ -197,7 +197,7 @@ impl crate::caller::call::Caller for PresentingCaller {
         stdin: Vec<u8>,
     ) -> Result<crate::caller::call::CallOutcome> {
         use crate::caller::call::{SERVICE_DIAL_TIMEOUT, ServiceDial, call_service_with, outcome};
-        let state = store::require_state(&self.ks, self.creds.fabric())?;
+        let state = store::require_policy(&self.ks, self.creds.fabric())?;
         let dial = ServiceDial {
             endpoint: &self.endpoint,
             hints: crate::caller::pick::Hints::load(&self.ks),
@@ -367,7 +367,7 @@ pub(crate) struct Gateway<B> {
 
 impl<B: Backend> Gateway<B> {
     /// The services `principal` may call through this gateway, with the
-    /// MCP tools they become, per the current signed state.
+    /// MCP tools they become, per the current signed policy.
     pub(crate) fn tools_for(&self, principal: &Principal) -> Result<(Vec<Grant>, ToolsConfig)> {
         let state = self.backend.state()?;
         let grants = web_grants(&state, self.node, principal);
@@ -379,8 +379,8 @@ impl<B: Backend> Gateway<B> {
 /// The services a web user may call through the gateway node `gateway`:
 /// those whose `allow` has a role whose matchers admit `principal`.
 /// Nothing if the state bans the gateway itself.
-pub(crate) fn web_grants(state: &State, gateway: NodeId, principal: &Principal) -> Vec<Grant> {
-    if state.is_banned(gateway) {
+pub(crate) fn web_grants(state: &Policy, gateway: NodeId, principal: &Principal) -> Vec<Grant> {
+    if state.bans_node(gateway) {
         return Vec::new();
     }
     state
@@ -512,9 +512,9 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
         creds,
     };
     let state = backend.state()?;
-    if state.is_banned(node) {
+    if state.bans_node(node) {
         bail!(
-            "this node ({}) is banned by its signed state (version {}): the admin removed it",
+            "this node ({}) is banned by its signed policy (version {}): the admin removed it",
             node.hex(),
             state.version.0
         );
@@ -538,13 +538,15 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
         backend,
         urls,
     });
-    // A long-running caller: keep its state fresh without waiting for a
-    // call to hand back a newer one (it would otherwise expire unnoticed).
-    // The loop stops when `_stop_refresh` drops, when `run` returns.
+    // A long-running caller: keep its policy fresh without waiting for a
+    // call to hand back a newer one (it would otherwise expire unnoticed):
+    // a directory's head, every beat. The loop stops when `_stop_refresh`
+    // drops, when `run` returns. (Card 37: a view subscription.)
     let (_stop_refresh, stop) = tokio::sync::oneshot::channel();
-    tokio::spawn(crate::state::sync::refresh_loop(
+    tokio::spawn(crate::policy::fetch::refresh_loop(
         gw.backend.endpoint.clone(),
         ks,
+        None,
         stop,
     ));
     let listener = tokio::net::TcpListener::bind(a.listen)
@@ -586,13 +588,13 @@ pub(crate) mod tests {
 
     /// Gateway 2, host 3, 9 banned. `orders-db` for `analyst` (alice, bob); `status` for
     /// `ops` (carol); `mixed` for `ops` then `analyst`. Matchers trust Google.
-    pub(crate) fn state() -> State {
+    pub(crate) fn state() -> Policy {
         state_for(library::GOOGLE_ISSUER)
     }
 
     /// [`state`] with its roles' matchers trusting `issuer`.
-    pub(crate) fn state_for(issuer: &str) -> State {
-        let mut s = State::new(node(1));
+    pub(crate) fn state_for(issuer: &str) -> Policy {
+        let mut s = Policy::new(node(1));
         s.version = StateVersion(1);
         s.not_after = i64::MAX;
         s.ban(node(9), i64::MAX);

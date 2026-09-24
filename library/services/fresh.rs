@@ -35,10 +35,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec::canonical_bytes;
 use crate::error::{Error, Result};
+use crate::head::StateVersion;
 use crate::head::{HeadHash, SignedPolicyHead};
 use crate::identity::{AlgorithmId, NodeId, NodeIdentity, Signature};
 use crate::idp::CLOCK_SKEW_SECS;
-use crate::state::StateVersion;
 
 /// The current (and only) `Fresh` format.
 pub const FRESH_V1: u8 = 1;
@@ -46,7 +46,7 @@ pub const FRESH_V1: u8 = 1;
 /// Domain-separation prefix of a `Fresh`'s signed bytes.
 pub const FRESH_CONTEXT: &[u8] = b"wires/fresh/v1\0";
 
-/// A directory's signed statement that `head` (version `version`) is the
+/// A directory's signed policyment that `head` (version `version`) is the
 /// newest policy it holds, from `at` until `until`. See the module docs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

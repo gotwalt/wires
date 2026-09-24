@@ -69,10 +69,11 @@ machine over loopback, signing in through a mock IdP, not the two-machine run
 ## A quick tour
 
 ```console
-# admin: one signed registry, pushed to the hosts by key
-admin$ wires init
+# admin: one signed registry, published by key to a directory
+admin$ wires init --client-id <your Google OAuth client id>
 admin$ wires role set analyst '*@acme.com'
 admin$ wires invite <node-id> --name workbench     # and one per machine
+admin$ wires directory add workbench               # it also holds the registry for the others
 admin$ wires service add orders-db --description "Read-only SQL over orders" \
          --allow analyst --host workbench
 

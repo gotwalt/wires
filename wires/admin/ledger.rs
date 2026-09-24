@@ -1,6 +1,6 @@
 //! `issued.json`: the admin's private ledger of the badges it minted.
 //!
-//! The signed state lists no members (card 35): a node is admitted by its
+//! The signed policy lists no members (card 35): a node is admitted by its
 //! root-signed badge. So the admin keeps its own record of what it issued,
 //! for two things:
 //!

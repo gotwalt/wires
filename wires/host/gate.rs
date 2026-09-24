@@ -2,14 +2,14 @@
 //! in order, the first failure being the refusal the caller hears:
 //!
 //! 1. the caller is admitted: its badge (root-signed membership) verifies
-//!    and names it, and the host's signed state doesn't ban it (removal is
-//!    a ban; no restart needed, because the state is re-read per
+//!    and names it, and the host's signed policy doesn't ban it (removal is
+//!    a ban; no restart needed, because the policy is re-read per
 //!    connection). Anyone else hears only [`NOT_ADMITTED`], and — checked
 //!    first by [`ServicesHost::check_member`], before its ID token is even
 //!    looked at — is traced, not written to the call log;
-//! 2. the state is fresh ([`SignedState::check_fresh`]);
+//! 2. the policy is fresh (its head's `not_after`);
 //! 3. the service is registered, and assigned to **this** host
-//!    ([`State::assigns`](library::State::assigns));
+//!    ([`Policy::assigns`](library::Policy::assigns));
 //! 4. the registry allows the caller's role ([`library::authorize`]);
 //! 5. the host's own `also_require` roles (`host.json`), which can only
 //!    narrow: the caller must be in **every** one of them.
@@ -17,11 +17,12 @@
 //! An admitted caller's refusal is also written to the call log. The
 //! caller's principal is verified after the badge check and before [`admit`]
 //! runs (the ID token from the `Hello`, nonce-bound to the iroh-authenticated
-//! caller, under the host's `identity.issuers`: [`ServicesHost::principal`]),
+//! caller, under the policy's `issuer` items as `host.json` narrows them:
+//! [`ServicesHost::principal`]),
 //! so [`admit`] is pure and clock-free except for `now`.
 //!
 //! [`ServicesHost`] is everything a host decides with: its own
-//! credentials, where its signed state lives (re-read per connection), its
+//! credentials, where its signed policy lives (re-read per connection), its
 //! `host.json`, the identity verifier and the call-log sink. The session
 //! transport ([`ServicesProtocol`](crate::host::transport::ServicesProtocol))
 //! and the push service ([`push`](crate::host::push)) both ask it.
@@ -31,8 +32,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use library::{
-    IdToken, Membership, NodeId, Principal, Refusal, RoleName, ServiceName, SignedState,
-    StateVersion, authorize, role_admits,
+    IdToken, Membership, NodeId, Principal, Refusal, RoleName, ServiceName, StateVersion,
+    authorize, role_admits,
 };
 
 use crate::admin::keystore::Keystore;
@@ -40,10 +41,11 @@ use crate::caller::jwks::VerifyError;
 use crate::host::config::HostConfig;
 use crate::host::identity::Identities;
 use crate::host::transport::AuditSink;
+use crate::policy::store::Held;
 
 /// The one refusal a peer that is not admitted hears, whatever the reason
 /// (no badge, someone else's, another network's, expired, banned). It says
-/// nothing about the state, its version or who is in it; the exact reason
+/// nothing about the policy, its version or who is in it; the exact reason
 /// goes only to the host's trace.
 pub(crate) const NOT_ADMITTED: &str = "not a member of this network";
 
@@ -59,7 +61,7 @@ pub(crate) const IDP_UNREACHABLE: &str =
     "the identity provider is unreachable from this host; try again later";
 
 /// What a peer hears when this host can't decide at all (no readable signed
-/// state, or one older than it already decided under): the operator's
+/// policy, or one older than it already decided under): the operator's
 /// problem, not the peer's. The cause goes only to the host's trace.
 pub(crate) const HOST_MISCONFIGURED: &str = "host configuration error";
 
@@ -67,7 +69,7 @@ pub(crate) const HOST_MISCONFIGURED: &str = "host configuration error";
 /// reason recorded and reported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PushRefusal {
-    /// Banned by the current signed state: what is queued for it goes.
+    /// Banned by the current signed policy: what is queued for it goes.
     NotAdmitted(String),
     /// A node the push rule refuses, or a host that can't decide now.
     Refused(String),
@@ -86,17 +88,17 @@ impl fmt::Display for PushRefusal {
 pub(crate) struct Admitted {
     /// The registry role that admitted the caller (recorded in the log).
     pub(crate) role: RoleName,
-    /// The state version the decision was made under.
+    /// The policy version the decision was made under.
     pub(crate) state_version: StateVersion,
 }
 
 /// Why [`admit`] refused. `Display` is the text the caller is sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum GateRefusal {
-    /// The host's own state has expired: it admits nobody until the admin
+    /// The host's own policy has expired: it admits nobody until the admin
     /// signs a newer one.
     Stale {
-        /// The expired state's version.
+        /// The expired policy's version.
         version: StateVersion,
         /// Why it is not fresh.
         why: String,
@@ -105,14 +107,14 @@ pub(crate) enum GateRefusal {
     Registry {
         /// The registry's reason.
         refusal: Refusal,
-        /// The state version it decided under.
+        /// The policy version it decided under.
         version: StateVersion,
     },
     /// The service exists, but the registry doesn't assign it to this host.
     NotAssigned {
         /// The service.
         service: ServiceName,
-        /// The state version it decided under.
+        /// The policy version it decided under.
         version: StateVersion,
     },
     /// The registry admitted the caller, but this host's `also_require`
@@ -152,7 +154,7 @@ impl fmt::Display for GateRefusal {
         match self {
             GateRefusal::Stale { version, why } => write!(
                 f,
-                "this host's signed state (version {}) is not fresh ({why}); the admin must sign \
+                "this host's signed policy (version {}) is not fresh ({why}); the admin must sign \
                  a newer one",
                 version.0
             ),
@@ -163,7 +165,7 @@ impl fmt::Display for GateRefusal {
             GateRefusal::Registry { refusal, .. } => write!(f, "{refusal}"),
             GateRefusal::NotAssigned { service, version } => write!(
                 f,
-                "service {service} is not assigned to this host (signed state version {})",
+                "service {service} is not assigned to this host (signed policy version {})",
                 version.0
             ),
             // The roles are this host's own (`host.json`); they stay in its
@@ -190,7 +192,7 @@ impl fmt::Display for GateRefusal {
 
 /// Run the checks in the module docs. `me` is this host.
 pub(crate) fn admit(
-    state: &SignedState,
+    state: &Held,
     config: &HostConfig,
     me: NodeId,
     caller: NodeId,
@@ -198,13 +200,13 @@ pub(crate) fn admit(
     service: &ServiceName,
     now: i64,
 ) -> Result<Admitted, GateRefusal> {
-    let version = state.state.version;
-    let s = &state.state;
+    let version = state.version();
+    let s = &state.policy;
     let registry = |refusal| GateRefusal::Registry { refusal, version };
-    // The ban before anything a banned node could learn from (the state's
+    // The ban before anything a banned node could learn from (the policy's
     // freshness and version). Its badge was checked before this
     // ([`ServicesHost::check_member`]).
-    if s.is_banned(caller) {
+    if s.bans_node(caller) {
         return Err(registry(Refusal::Banned));
     }
     state.check_fresh(now).map_err(|e| GateRefusal::Stale {
@@ -253,13 +255,13 @@ pub(crate) enum Implementation<'a> {
 pub(crate) struct ServicesHost {
     /// This host.
     pub(crate) me: NodeId,
-    /// The network root whose signed state and memberships are honored.
+    /// The network root whose signed policy and memberships are honored.
     pub(crate) trust_root: NodeId,
     /// The host's own membership, presented in the `HelloAck`.
     pub(crate) membership: Membership,
-    /// Where the signed state is read from, per connection (so a newer
-    /// state adopted by `wires/state`, say one with a new ban, takes effect
-    /// on the next dial).
+    /// Where the signed policy is read from, per connection (so a newer
+    /// policy fetched from a directory, say one with a new ban, takes
+    /// effect on the next dial).
     pub(crate) keystore: Arc<Keystore>,
     /// `host.json`.
     pub(crate) config: HostConfig,
@@ -277,8 +279,8 @@ pub(crate) struct ServicesHost {
     /// The push service, when it runs: where a native service's
     /// [`push_to_caller`](crate::Call::push_to_caller) goes.
     pub(crate) push_commands: Option<tokio::sync::mpsc::Sender<crate::host::push::PushCommand>>,
-    /// The highest state version this host has decided under, in memory:
-    /// [`state`](Self::state) refuses anything older read back from disk.
+    /// The highest policy version this host has decided under, in memory:
+    /// [`policy`](Self::policy) refuses anything older read back from disk.
     pub(crate) high_water: std::sync::atomic::AtomicU64,
 }
 
@@ -291,65 +293,68 @@ impl fmt::Debug for ServicesHost {
 }
 
 impl ServicesHost {
-    /// This host's signed state, verified under the trust root. A host with
-    /// none (or an unreadable one) serves nobody: fail closed.
+    /// This host's signed policy, verified under the trust root. A host
+    /// with none (or an unreadable one) serves nobody: fail closed. The ID
+    /// tokens it verifies from here on are checked under this policy's
+    /// `issuer` items, narrowed by `host.json` ([`HostConfig::trust`]).
     ///
     /// Also fail closed on a **rollback**: the file is re-read on every
-    /// decision, and anyone who can write it could put back an older state
+    /// decision, and anyone who can write it could put back an older policy
     /// that still verifies (one from before a ban). So the
     /// host keeps the highest version it has used in memory
     /// ([`high_water`](Self::high_water)) and refuses to decide under a
-    /// lower one until a state at least that new is back on disk.
-    pub(crate) fn state(&self) -> Result<SignedState> {
+    /// lower one until a policy at least that new is back on disk.
+    pub(crate) fn policy(&self) -> Result<Held> {
         use std::sync::atomic::Ordering;
-        let state = crate::state::store::read(&self.keystore, self.trust_root)?
-            .ok_or_else(|| anyhow!("this host holds no signed state (run `wires join`)"))?;
-        let version = state.state.version.0;
+        let state = crate::policy::store::read(&self.keystore, self.trust_root)?
+            .ok_or_else(|| anyhow!("this host holds no signed policy (run `wires join`)"))?;
+        let version = state.version().0;
         let seen = self.high_water.fetch_max(version, Ordering::SeqCst);
         if version < seen {
             tracing::error!(
                 on_disk = version,
                 seen,
-                "refusing to decide: the signed state on disk is older than one this host already \
-                 used (rolled back?)"
+                "refusing to decide: the signed policy on disk is older than one this host \
+                 already used (rolled back?)"
             );
             anyhow::bail!(
-                "the signed state on disk (version {version}) is older than version {seen}, which \
-                 this host already decided under; refusing to decide until a state at least that \
-                 new is back"
+                "the signed policy on disk (version {version}) is older than version {seen}, \
+                 which this host already decided under; refusing to decide until a policy at \
+                 least that new is back"
             );
         }
+        self.identities.set_trust(self.config.trust(&state.policy));
         Ok(state)
     }
 
-    /// What `serve` checks before it binds: a fresh signed state that
+    /// What `serve` checks before it binds: a fresh signed policy that
     /// assigns every service in `host.json`, and every native service, to
     /// this host (the error names the first that isn't). A name can't be
     /// both a `host.json` service and a native one.
-    pub(crate) fn preflight(&self, now: i64) -> Result<SignedState> {
-        let state = self.state()?;
+    pub(crate) fn preflight(&self, now: i64) -> Result<Held> {
+        let state = self.policy()?;
         state.check_fresh(now).with_context(|| {
             format!(
-                "this host's signed state (version {}) has expired",
-                state.state.version.0
+                "this host's signed policy (version {}) has expired",
+                state.version().0
             )
         })?;
-        self.config.check_against(&state.state, self.me)?;
-        let version = state.state.version.0;
+        self.config.check_against(&state.policy, self.me)?;
+        let version = state.version().0;
         let me8 = self.me.short();
         for name in self.native.keys() {
             if self.config.services.contains_key(name) {
                 bail!("service {name} is both in host.json and a native service; pick one");
             }
-            if state.state.service(name).is_none() {
+            if state.policy.service(name).is_none() {
                 bail!(
-                    "this host implements native service {name}, but the signed state (version \
+                    "this host implements native service {name}, but the signed policy (version \
                      {version}) has no such service"
                 );
             }
-            if !state.state.assigns(name, self.me) {
+            if !state.policy.assigns(name, self.me) {
                 bail!(
-                    "this host implements native service {name}, but the signed state (version \
+                    "this host implements native service {name}, but the signed policy (version \
                      {version}) does not assign it to this host ({me8}); refusing to serve it"
                 );
             }
@@ -371,23 +376,22 @@ impl ServicesHost {
 
     /// Whether `caller`, presenting badge `membership`, is admitted under
     /// `state` ([`library::check_admitted`]): the badge is the network
-    /// root's for this very key and current at `now`, and the state doesn't
+    /// root's for this very key and current at `now`, and the policy doesn't
     /// ban the key. Checked before anything that costs this host (a token
     /// verification, a JWKS fetch, a call-log entry). `Err` is the exact
     /// reason, for this host's trace only; the peer hears [`NOT_ADMITTED`].
     pub(crate) fn check_member(
         &self,
-        state: &SignedState,
+        state: &Held,
         membership: &Membership,
         caller: NodeId,
         now: i64,
     ) -> std::result::Result<(), String> {
-        library::check_admitted(membership, self.trust_root, &state.state, caller, now).map_err(
+        library::check_admitted(membership, self.trust_root, &state.policy, caller, now).map_err(
             |e| match e {
-                library::Error::Banned { .. } => format!(
-                    "{e} by the signed state (version {})",
-                    state.state.version.0
-                ),
+                library::Error::Banned { .. } => {
+                    format!("{e} by the signed policy (version {})", state.version().0)
+                }
                 e => format!("membership rejected: {e}"),
             },
         )
@@ -428,7 +432,7 @@ impl ServicesHost {
     /// that a verified identity could change leads with why there is none.
     pub(crate) fn decide(
         &self,
-        state: &SignedState,
+        state: &Held,
         caller: NodeId,
         principal: Option<&Principal>,
         missing: Option<&str>,
@@ -466,7 +470,7 @@ impl ServicesHost {
     }
 
     /// Whether `node` may receive pushes from this host at `now`: not banned
-    /// by the current signed state, and in the first `push.allow` role that
+    /// by the current signed policy, and in the first `push.allow` role that
     /// admits it (with the principal it last verified as here). A node only
     /// has a principal here after it passed the gate (badge and bans) with
     /// an ID token, so a node that never presented a badge is in no role.
@@ -475,21 +479,22 @@ impl ServicesHost {
         node: NodeId,
         now: i64,
     ) -> std::result::Result<(Option<Principal>, RoleName), PushRefusal> {
-        let state = self.state().map_err(|e| {
-            tracing::warn!("signed state unusable: {e:#}");
+        let state = self.policy().map_err(|e| {
+            tracing::warn!("signed policy unusable: {e:#}");
             PushRefusal::Refused(HOST_MISCONFIGURED.to_string())
         })?;
         if let Err(e) = state.check_fresh(now) {
             return Err(PushRefusal::Refused(format!(
-                "this host's signed state (version {}) is not fresh ({e})",
-                state.state.version.0
+                "this host's signed policy (version {}) is not fresh ({e})",
+                state.version().0
             )));
         }
-        if let Some(until) = state.state.bans.get(&node) {
+        if let Some(ban) = state.policy.bans.get(&node) {
             return Err(PushRefusal::NotAdmitted(format!(
-                "{} is banned until {until} by the current signed state (version {})",
+                "{} is banned until {} by the current signed policy (version {})",
                 node.short(),
-                state.state.version.0
+                ban.until,
+                state.version().0
             )));
         }
         let allow = self
@@ -506,7 +511,7 @@ impl ServicesHost {
         let principal = self.identities.current(node, now);
         if let Some(role) = allow
             .iter()
-            .find(|r| role_admits(&state.state, r, principal.as_ref()))
+            .find(|r| role_admits(&state.policy, r, principal.as_ref()))
         {
             return Ok((principal, role.clone()));
         }
@@ -528,18 +533,18 @@ impl ServicesHost {
     }
 
     /// The nodes `role` names at `now` (never this host): every node the
-    /// state doesn't ban whose last verified principal here is in the role.
+    /// policy doesn't ban whose last verified principal here is in the role.
     /// A node with no verified identity here is in no role.
     pub(crate) fn push_recipients(&self, role: &RoleName, now: i64) -> Vec<NodeId> {
-        let Ok(state) = self.state() else {
+        let Ok(state) = self.policy() else {
             return Vec::new();
         };
-        let s = &state.state;
+        let s = &state.policy;
         let mut nodes: Vec<NodeId> = self
             .identities
             .nodes()
             .into_iter()
-            .filter(|n| !s.is_banned(*n))
+            .filter(|n| !s.bans_node(*n))
             .filter(|n| role_admits(s, role, self.identities.current(*n, now).as_ref()))
             .collect();
         nodes.retain(|n| *n != self.me);
@@ -551,7 +556,7 @@ impl ServicesHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library::{Matcher, NodeIdentity, Service, State};
+    use library::{Matcher, NodeIdentity, Policy, Service};
     use proptest::prelude::*;
 
     fn node(b: u8) -> NodeId {
@@ -581,9 +586,9 @@ mod tests {
 
     /// Root 1; 2 calls and 3 is this host; 9 is banned; `status` (staff:
     /// anyone [`ISS`] verified) on 3.
-    fn setup() -> (SignedState, HostConfig) {
+    fn setup() -> (Held, HostConfig) {
         let root = NodeIdentity::from_seed([1u8; 32]);
-        let mut s = State::new(root.node_id());
+        let mut s = Policy::new(root.node_id());
         s.version = StateVersion(5);
         s.not_after = 100;
         s.ban(node(9), 100);
@@ -599,15 +604,15 @@ mod tests {
         );
         let cfg = HostConfig::parse(r#"{"version":2,"services":{"status":{"command":["true"]}}}"#)
             .unwrap();
-        (s.sign(&root).unwrap(), cfg)
+        (crate::testutil::held(&root, s), cfg)
     }
 
     /// [`setup`] plus roles `analyst` (alice) and `sre` (alice, carol),
     /// `orders-db` allowing analyst on 3, and host.json requiring sre too.
-    fn strict() -> (SignedState, HostConfig) {
+    fn strict() -> (Held, HostConfig) {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let (signed, _) = setup();
-        let mut s = signed.state;
+        let mut s = signed.policy;
         let email = |e: &str| Matcher {
             email: Some(e.parse().unwrap()),
             ..Matcher::new(ISS)
@@ -630,7 +635,7 @@ mod tests {
             r#"{"version":2,"services":{"orders-db":{"command":["true"],"also_require":["sre"]}}}"#,
         )
         .unwrap();
-        (s.sign(&root).unwrap(), cfg)
+        (crate::testutil::held(&root, s), cfg)
     }
 
     #[test]
@@ -654,7 +659,7 @@ mod tests {
             Err(GateRefusal::Stale { .. })
         ));
         // A banned node hears the fixed sentence, even under an expired
-        // state: the ban is checked before freshness.
+        // policy: the ban is checked before freshness.
         for now in [0, 101] {
             let e = admit(&s, &cfg, node(3), node(9), None, &status, now).unwrap_err();
             assert_eq!(e.to_string(), NOT_ADMITTED);
@@ -687,7 +692,7 @@ mod tests {
             Err(GateRefusal::Registry { .. })
         ));
         // alice without sre on the host side: refused by also_require.
-        let mut state = s.state.clone();
+        let mut state = s.policy.clone();
         state.roles.insert(
             role("sre"),
             vec![Matcher {
@@ -695,7 +700,7 @@ mod tests {
                 ..Matcher::new(ISS)
             }],
         );
-        let s2 = state.sign(&NodeIdentity::from_seed([1u8; 32])).unwrap();
+        let s2 = crate::testutil::held(&NodeIdentity::from_seed([1u8; 32]), state);
         let e = admit(&s2, &cfg, node(3), node(2), Some(&alice), &db, 0).unwrap_err();
         assert!(matches!(e, GateRefusal::AlsoRequire { .. }));
         // The host's own role names stay out of what the caller hears.
@@ -720,7 +725,7 @@ mod tests {
         /// The host never admits more than the registry: whatever
         /// `also_require` says, an admitted caller is one `authorize`
         /// admits, is in **every** `also_require` role, and was decided
-        /// under a fresh state.
+        /// under a fresh policy.
         #[test]
         fn the_gate_never_widens_the_registry(
             caller in 1u8..6,
@@ -744,10 +749,10 @@ mod tests {
             let p = email.map(who);
             let svc = name(service);
             if admit(&s, &cfg, node(3), node(caller), p.as_ref(), &svc, now).is_ok() {
-                prop_assert!(authorize(&s.state, node(caller), p.as_ref(), &svc).is_ok());
+                prop_assert!(authorize(&s.policy, node(caller), p.as_ref(), &svc).is_ok());
                 let required = cfg.services.get(&svc).map(|i| i.also_require.clone());
                 for r in required.unwrap_or_default() {
-                    prop_assert!(role_admits(&s.state, &r, p.as_ref()), "not in {}", r);
+                    prop_assert!(role_admits(&s.policy, &r, p.as_ref()), "not in {}", r);
                 }
                 prop_assert!(s.check_fresh(now).is_ok());
             }

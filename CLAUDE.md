@@ -12,9 +12,11 @@ the `wires` binary.
 **The current assignment (2026-09-22, reshaped by card 27):** agents run
 CLIs on other machines, by **service name**. The machine is reached by public
 key, never by network path. Each node is admitted by its root-signed badge;
-one admin-signed, versioned state says which roles exist, which services
-exist, which hosts run each, who may call and read each, and who is banned; the admin pushes it to the hosts by key, other members
-pull it, and every host decides every call from its copy. The caller is
+one admin-signed, versioned policy says which IdPs are trusted, which roles
+exist, which services exist, which hosts run each, who may call and read
+each, who is banned, and which nodes are directories; the admin publishes it
+by key to the directories, hosts and callers fetch it from one, and every
+host decides every call from its copy. The caller is
 authenticated by their IdP, via an ID token bound to the node key and
 presented in the session handshake; every role needs that verified identity
 (there is no built-in `member` role), and every role matcher names its
@@ -23,8 +25,9 @@ log. Agents can't observe each other's work: the isolation boundary is the
 verified person (IdP principal), so a caller sees its own person's records,
 and the readers the registry names see a service's records in full with
 `wires watch`, for logging and compliance. Nothing is broadcast; what every
-member still learns about the others (the whole signed state) is cards
-35–37's to fix, by moving the policy to directory nodes (`docs/fabric.md`). `wires call` is the CLI-native path and the source of the token
+member still learns about the others (the whole signed policy) is cards
+36c–37's to fix, by giving each host its slice and each caller its view
+(`docs/fabric.md`). `wires call` is the CLI-native path and the source of the token
 savings; `wires mcp` (stdio) and `wires gateway` (remote, e.g. Claude.ai) serve
 the same services as MCP, so wires works in the clients people already use
 for remote tool calling, with the same identity, registry and record (MCP
@@ -43,7 +46,7 @@ rebuttal test in `docs/storytelling.md` §1.
 
 The pitch lives in `README.md`; usage (roles, walkthrough, reference) in `docs/usage.md`. Deployment and testing patterns live in
 `docs/deployment.md` and `docs/testing.md`. The spec for the code that runs
-(membership, the signed state and its sync, the session handshake and gate,
+(membership, the signed policy and the directory, the session handshake and gate,
 push, the call log and record stream, hints) is `docs/protocol.md`; the target
 architecture (how the fabric is hosted, persisted and synced, via a directory)
 is `docs/fabric.md`. The
@@ -150,20 +153,24 @@ runs from it. A host serving CLIs needs an image that also has those CLIs.
     serving wires calls in-process); `examples/kv/` is a native service;
     each role owns
     a folder with a `mod.rs` — `admin/` (keystore, `init`/`invite`/`remove`,
-    `service`/`role` edits of the signed state, `state push`, `--ttl` /
+    `service`/`role`/`issuer`/`directory add|rm` edits of the signed policy,
+    `state push`, `--ttl` /
     `--state-ttl`), `host/` (`serve`,
-    `host.json`, the gate over the signed state, the session transport,
+    `host.json`, the gate over the signed policy, the session transport,
     native services and the embedded `Host`,
     verified identities, the call log and OTLP export, the record stream, push,
     its control sockets and the per-call push capability), `caller/` (`join`, `login`, `services`, `call`
     with service → host failover and the local hints file, `mcp`, `inbox`,
     `watch`), `gateway/` (`wires gateway`: remote MCP over HTTP + OAuth
-    for web clients, calling with each user's own ID token), `state/` (the
-    signed state on this node: the store, and push / pull by key); `e2e/` holds the loopback integration tests and
+    for web clients, calling with each user's own ID token), `directory/` (the
+    directory mode: `directory.redb`, `wires/directory/1` and
+    `wires/directory-sub/1`, the freshness beat and replicas, `directory
+    serve`), `policy/` (the signed policy on this node: `policy.json`,
+    publishing to and fetching from the directories); `e2e/` holds the loopback integration tests and
     `testutil.rs` the shared test fixtures. See `docs/board/README.md` § Roles.
-  - `library/`: `membership/`, `calls/`, `services/` are folders only — every
+  - `library/`: `membership/`, `calls/`, `services/`, `directory/` are folders only — every
     module is declared at the crate root with `#[path]`, so public paths
-    (`library::state`, …) and the `lib.rs` re-exports don't depend on them.
+    (`library::signed_policy`, …) and the `lib.rs` re-exports don't depend on them.
 - `.scripts/` — the self-asserting demos, their shared helpers (`lib.sh`)
   and fixtures, the bindings builds, and `macos-sign.sh`, which
   `.cargo/config.toml` sets as the macOS `runner` so test and `cargo run`

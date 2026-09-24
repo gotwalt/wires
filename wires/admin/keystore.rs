@@ -9,9 +9,9 @@
 //!   *public* signed credential, not a secret).
 //! - `issued.json`: the admin's ledger of the badges it minted, with their
 //!   labels (mode `0600`; [`super::ledger`]).
-//! - `state.json`, `state-admin.txt`, `state-checked.txt`: the admin-signed
-//!   state, where to pull it from, and when it was last checked
-//!   ([`crate::state::store`]).
+//! - `policy.json`, `policy-checked.txt`: the admin-signed policy, and when
+//!   it was last checked with a directory ([`crate::policy::store`]);
+//!   `directory.redb` on a directory node ([`crate::directory::db`]).
 //!
 //! The resolver helpers ([`node_identity`], [`membership`])
 //! encode the precedence the CLI uses: an inline flag wins, then the matching
@@ -279,8 +279,8 @@ fn write_secret(path: &Path, contents: &str) -> Result<()> {
 /// directory, then a `rename` over the target.
 ///
 /// Every file this module writes is also read, concurrently, by something that
-/// takes no lock — `state.json` most of all, which a host re-reads on every
-/// connection while `wires/state` adopts a newer copy from another task or
+/// takes no lock — `policy.json` most of all, which a host re-reads on every
+/// connection while a fetch adopts a newer copy from another task or
 /// process. A plain `std::fs::write` is `O_TRUNC` followed by a write, so a
 /// reader landing in that window sees an empty or half-written file and the
 /// host fails closed ("host configuration error") over a scheduling

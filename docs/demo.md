@@ -28,7 +28,7 @@ On camera, in order:
 | Beat | Terminal | Command | What appears |
 |---|---|---|---|
 | 1 | workbench | `ss -ltnp` then `ss -lunp \| grep wires` | no TCP listener from wires; UDP sockets (QUIC) only |
-| 2 | agent | `wires services` | nothing on stdout; stderr `wires services: no service allows this node without a login (state vN)` |
+| 2 | agent | `wires services` | nothing on stdout; stderr `wires services: no service allows this node without a login (policy vN)` |
 | 2 | agent | `wires call orders-db -- "select count(*) from orders"; echo $?` | ``wires: denied by host: no ID token presented; run `wires login` ``, then `77` |
 | 3 | agent | `wires login` | browser: Google, then the "signed in" page |
 | 3 | agent | `wires services` | `orders-db  Read-only SQL (sqlite3) over …  (analyst)` |
@@ -37,7 +37,7 @@ On camera, in order:
 | 5 (opt.) | reader (second tab) | `wires call orders-db -- "select 1"` | exit 77: `… is in no role allowed to call orders-db (analyst)`; a `✗` in the watch |
 | 5b (opt.) | agent | [push beat](#5b-the-workbench-calls-back-push): `wires call deploy -- build 41`, `wires inbox --wait --timeout 10m` | `… from host <wb8> (verified)  build-41  failed: …` |
 | 5c (with a spare) | workbench | stop `wires serve`, ask again | the spare answers (`wires call --verbose` names it) |
-| 6 | admin | `wires remove agent` | stderr `state version N: pushed to 1 of 1 host(s)` (2 of 2 with a spare) |
+| 6 | admin | `wires remove agent` | stderr `policy version N: published to 1 of 1 directory(ies)` (2 of 2 with a spare that is also a directory) |
 | 6 | agent | ask Claude Code the question again | exit 77, nothing on stdout: `wires: denied by host: not a member of this network`; no `✗` in the watch (a banned node's knock is traced by the host, not logged) |
 
 ### Rebuttals, one line each
@@ -58,8 +58,8 @@ On camera, in order:
 
 | Terminal | Machine | `WIRES_HOME` | Role |
 |---|---|---|---|
-| **admin** | laptop | `~/.wires-admin` | holds the root key; mints badges; signs roles, services and bans |
-| **workbench** | workbench (x86_64 Linux, no firewall port opened) | `~/.wires-demo` | `wires serve host.json`: implements `orders-db` |
+| **admin** | laptop | `~/.wires-admin` | holds the root key; mints badges; signs the trusted IdP, roles, services, bans and directories |
+| **workbench** | workbench (x86_64 Linux, no firewall port opened) | `~/.wires-demo` | `wires serve host.json`: implements `orders-db`, and is the network's directory |
 | **spare** (optional) | a second host | `~/.wires-spare` | implements `orders-db` too, for the failover beat |
 | **agent** | laptop | `~/.wires-agent` | Claude Code, calling `wires call orders-db` from Bash |
 | **reader** | laptop (or a second laptop) | `~/.wires-reader` | a member in role `security`: `wires watch orders-db` |
@@ -73,7 +73,7 @@ limits socket paths to 104 bytes.
 secret isn't confidential for that client type. On the laptop:
 
 ```bash
-export WIRES_OIDC_CLIENT_ID=<id>.apps.googleusercontent.com   # login reads these
+export WIRES_OIDC_CLIENT_ID=<id>.apps.googleusercontent.com   # init and login read these
 export WIRES_OIDC_CLIENT_SECRET=<secret>
 ```
 
@@ -82,14 +82,12 @@ export WIRES_OIDC_CLIENT_SECRET=<secret>
 because the ssh config forces a remote command. Make `orders.db` in the
 directory `wires serve` runs from (`sqlite3 orders.db < .scripts/fixtures/orders.sql`),
 and put this `host.json` beside it (the loopback demo's
-`.scripts/fixtures/host.json`, with the Google issuer and your client id):
+`.scripts/fixtures/host.json`; the trusted IdP is the signed policy's, which
+`init` sets, so an `identity` section is optional and could only narrow it):
 
 ```json
 {
   "version": 2,
-  "identity": { "issuers": [
-    { "issuer": "https://accounts.google.com", "audiences": ["<id>.apps.googleusercontent.com"] }
-  ] },
   "services": {
     "orders-db": { "command": ["sqlite3", "-safe", "-readonly", "-header", "-column", "orders.db"] }
   },
@@ -100,11 +98,12 @@ and put this `host.json` beside it (the loopback demo's
 **Provision** (this can be on camera, but it's slow viewing):
 
 ```bash
-admin$     WIRES_HOME=~/.wires-admin wires init
+admin$     WIRES_HOME=~/.wires-admin wires init             # trusts Google, with $WIRES_OIDC_CLIENT_ID
 admin$     WIRES_HOME=~/.wires-admin wires role set analyst '<your address>@gmail.com'
 admin$     WIRES_HOME=~/.wires-admin wires role set security '<the reader's address>'
 workbench$ WIRES_HOME=~/.wires-demo  wires id        # → send to admin
 admin$     WIRES_HOME=~/.wires-admin wires invite <workbench id> --name workbench
+admin$     WIRES_HOME=~/.wires-admin wires directory add workbench   # it holds the policy for the others
 admin$     WIRES_HOME=~/.wires-admin wires service add orders-db \
              --description "Read-only SQL (sqlite3) over the orders database; pass the SQL statement as the argument." \
              --allow analyst --reader security --host workbench     # (--host spare too, if you have one)
@@ -114,17 +113,18 @@ workbench$ WIRES_HOME=~/.wires-demo  wires serve --check host.json
 workbench$ WIRES_HOME=~/.wires-demo  wires serve host.json    # under a supervisor (card 08 used systemd-run --user)
 agent$     WIRES_HOME=~/.wires-agent  wires id
 reader$    WIRES_HOME=~/.wires-reader wires id
-admin$     WIRES_HOME=~/.wires-admin wires invite <agent id> --name agent      # pushed to the running workbench
+admin$     WIRES_HOME=~/.wires-admin wires invite <agent id> --name agent      # no edit: nothing is published
 admin$     WIRES_HOME=~/.wires-admin wires invite <reader id> --name reader
 agent$     WIRES_HOME=~/.wires-agent  wires join <token>
 reader$    WIRES_HOME=~/.wires-reader wires join <token>
 reader$    WIRES_HOME=~/.wires-reader wires login     # as the reader's address
 ```
 
-The workbench is invited twice because it was offline when the service was
-assigned to it: the second token carries the newer state (re-joining never
-rolls one back). Every later admin change reaches the running workbench by
-push. Machines find each other by key through n0 discovery; on a network
+The workbench is invited twice because it was offline when it was named the
+directory and assigned the service (those edits exit 1: no directory was
+up): the second token carries the newer policy (re-joining never rolls one
+back). Every later admin change is published to the running workbench, which
+is the directory, and the agent and reader fetch it from there. Machines find each other by key through n0 discovery; on a network
 without it, copy the workbench's `run/hint` line into the others'
 `$WIRES_HOME/hints`.
 

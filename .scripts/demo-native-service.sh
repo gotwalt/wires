@@ -148,21 +148,23 @@ host="$D/host"
 agent="$D/agent"
 other="$D/other"
 mkdir -p "$root" "$host" "$agent" "$other"
-WIRES_HOME="$root" "$WIRES" init >/dev/null
-HOST_ID="$(WIRES_HOME="$host" "$WIRES" id 2>/dev/null)"
-AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
-OT_ID="$(WIRES_HOME="$other" "$WIRES" id 2>/dev/null)"
-admin() { WIRES_HOME="$root" "$WIRES" "$@"; }
-
 "$WIRES_DEV" dev-mock-idp --email "$EMAIL" >"$D/idp.out" 2>"$D/idp.err" &
 IDP_PID=$!
 wait_for "$D/idp.out" "client_id " 100 || bad "the mock IdP did not start"
 ISSUER="$(awk '/^issuer /{print $2}' "$D/idp.out")"
 CLIENT_ID="$(awk '/^client_id /{print $2}' "$D/idp.out")"
 
+# The network's first policy trusts the IdP.
+WIRES_HOME="$root" "$WIRES" init --issuer "$ISSUER" --client-id "$CLIENT_ID" >/dev/null
+HOST_ID="$(WIRES_HOME="$host" "$WIRES" id 2>/dev/null)"
+AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
+OT_ID="$(WIRES_HOME="$other" "$WIRES" id 2>/dev/null)"
+admin() { WIRES_HOME="$root" "$WIRES" "$@"; }
+
 admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1
 admin invite "$HOST_ID" --name nativehost >/dev/null 2>&1
-# The host isn't up yet: the edit is stored, and a fresh token carries it.
+# The network names no directory: the edit is stored here, and a fresh token
+# carries it to the host.
 admin service add kv --description "A key-value store, one namespace per person ($LANG_NAME)." \
 	--allow analyst --host nativehost >"$D/svc.out" 2>"$D/svc.err" ||
 	grep -qF "reached none of its 1 host(s)" "$D/svc.err" || {
@@ -192,18 +194,18 @@ for h in "$root" "$agent" "$other"; do cp "$host/run/hint" "$h/hints"; done
 ok "the $LANG_NAME host serves kv as ${HOST_ID:0:8}... (pid $HOST_PID)"
 
 # The callers join. An invite mints a badge and edits nothing, so nothing is
-# pushed to the $LANG_NAME host.
+# published.
 AG_TOKEN="$(admin invite "$AG_ID" --name agent 2>"$D/invite.err")"
 OT_TOKEN="$(admin invite "$OT_ID" --name other 2>>"$D/invite.err")"
-! grep -qF "pushed to" "$D/invite.err" || {
+! grep -qF "published to" "$D/invite.err" || {
 	dump "$D/invite.err"
-	bad "an invite pushed a state to the $LANG_NAME host"
+	bad "an invite published a policy"
 }
 WIRES_HOME="$agent" "$WIRES" join "$AG_TOKEN" >/dev/null
 WIRES_HOME="$other" "$WIRES" join "$OT_TOKEN" >/dev/null
 login_as "$agent" "$EMAIL"
 login_as "$other" "$OTHER"
-ok "the $LANG_NAME host took the admin's pushed state; alice and bob signed in"
+ok "the $LANG_NAME host serves the admin's signed policy; alice and bob signed in"
 
 # --------------------------------------------------------------------------
 # Calls.

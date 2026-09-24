@@ -15,7 +15,7 @@
 //! - [`a_user_the_state_admits_to_nothing_is_refused_at_sign_in`]
 //! - [`a_code_is_single_use_and_bound_to_its_client`]
 //!
-//! The backend is scripted: the signed state is fixed in the test, and
+//! The backend is scripted: the signed policy is fixed in the test, and
 //! "dialing" records the tool and token. That the host admits exactly such
 //! a token is `services_host`'s job (a token nonce-bound to the dialing
 //! node, verified against the host's trusted issuer).
@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use library::{IdToken, IdentityClaim, OidcNonce, State};
+use library::{IdToken, IdentityClaim, OidcNonce, Policy};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use url::Url;
@@ -48,7 +48,7 @@ fn form(pairs: &[(&str, &str)]) -> String {
 type Seen = Arc<Mutex<Vec<(String, Vec<String>, IdToken)>>>;
 
 struct Scripted {
-    state: State,
+    state: Policy,
     seen: Seen,
 }
 
@@ -82,7 +82,7 @@ impl Caller for Recording {
 
 impl Backend for Scripted {
     type Caller = Recording;
-    fn state(&self) -> anyhow::Result<State> {
+    fn state(&self) -> anyhow::Result<Policy> {
         Ok(self.state.clone())
     }
     fn caller(&self, token: IdToken) -> Recording {

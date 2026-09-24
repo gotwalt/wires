@@ -40,6 +40,10 @@ jaq-json = { workspace = true }
 # `wires gateway` (card 30): the HTTP server for remote MCP + OAuth. Rides
 # the hyper/tower already in the graph via reqwest; only axum itself is new.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "form", "query"] }
+# `directory.redb` (card 36): a directory's heads, items and freshness.
+# Pure Rust, one file, ACID; the one new crate the directory brings.
+redb = "4"
+blake3 = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

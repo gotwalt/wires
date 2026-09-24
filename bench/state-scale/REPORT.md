@@ -2,9 +2,10 @@
 
 *Modeled 2026-09-24 at 655a96c; the *badges* and *apex* rows re-modeled after
 card 35 built badges (the state's measured ban entry, and no host list). `python3 bench/state-scale/model.py`
-(`--email-roles`, `--measure`). Byte sizes are measured from real signed
-states by `cargo run -q --release -p library --example state_sizes`; rates
-are assumptions, listed in `model.py`'s `ASSUMPTIONS`.*
+(`--email-roles`). Byte sizes were measured from real signed states by the
+`state_sizes` example (deleted with the one-blob state by card 36b; in git
+history at 055ac46), and the *apex* ones by `policy_sizes`; rates are
+assumptions, listed in `model.py`'s `ASSUMPTIONS`.*
 
 **The question.** Today every node holds the whole admin-signed state and
 re-fetches it after every edit (protocol.md §3–4). How much does each node

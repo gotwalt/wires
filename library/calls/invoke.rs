@@ -1,6 +1,6 @@
 //! What a caller asks a host to run.
 //!
-//! A host implements the services its signed state assigns to it
+//! A host implements the services its signed policy assigns to it
 //! (`host.json`). The caller names one of them with a
 //! [`ServiceName`] and supplies the per-call arguments as
 //! an [`Argv`]; together they form the [`Invocation`] carried in a

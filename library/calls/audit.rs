@@ -14,13 +14,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::codec::hex_id;
+use crate::head::StateVersion;
 use crate::identity::NodeId;
 use crate::idp::Principal;
 use crate::invoke::Argv;
 use crate::push::{PushBody, PushId, Subject};
 use crate::registry::ServiceName;
 use crate::role::RoleName;
-use crate::state::StateVersion;
 
 hex_id! {
     /// Correlates a call's [`Started`](AuditRecord::Started) and
@@ -217,9 +217,9 @@ pub enum AuditRecord {
         service: ServiceName,
         /// The caller-supplied arguments.
         argv: Argv,
-        /// The signed-state version the caller was admitted under.
+        /// The policy version the caller was admitted under.
         state_version: StateVersion,
-        /// The role in the signed state that admitted the caller.
+        /// The role in the signed policy that admitted the caller.
         role: RoleName,
         /// Unix milliseconds at authorization.
         at_ms: i64,
@@ -315,7 +315,7 @@ pub enum PushOutcome {
     Expired,
     /// Pushed out of a full queue by a newer message.
     Dropped,
-    /// Refused: the current signed state bans the recipient, or it holds no
+    /// Refused: the current signed policy bans the recipient, or it holds no
     /// role in `push.allow` (at send, delivery or fetch time).
     Denied,
 }

@@ -1,5 +1,5 @@
 //! `wires mcp`: a stdio MCP server whose tools are the services you may call
-//! (evaluated locally against your signed state, as `wires services` lists
+//! (evaluated locally against your signed policy, as `wires services` lists
 //! them), plus `tools.json` aliases, resolved once at startup.
 //!
 //! wires in the stdio MCP clients people already use (Claude Desktop, IDEs).
@@ -593,7 +593,7 @@ pub struct McpArgs {
 /// of any service in `state` is dropped (with a warning), granted or not.
 pub(crate) fn with_services(
     mut config: ToolsConfig,
-    state: &library::State,
+    state: &library::Policy,
     grants: &[library::Grant],
 ) -> ToolsConfig {
     config.tools.retain(|t| {
@@ -634,12 +634,12 @@ pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
     let config = ToolsConfig::load(&path)?;
     let creds = Credentials::resolve(&a.creds)?;
     let ks = crate::admin::keystore::Keystore::resolve()?;
-    let config = if crate::state::store::read(&ks, creds.fabric())?.is_some() {
+    let config = if crate::policy::store::read(&ks, creds.fabric())?.is_some() {
         // Every service this node may call, one MCP tool each.
         let allowed = crate::caller::services::allowed(&ks).await?;
-        with_services(config, &allowed.state.state, &allowed.grants)
+        with_services(config, &allowed.state.policy, &allowed.grants)
     } else {
-        tracing::warn!("this node holds no signed state yet (`wires join`): aliases only");
+        tracing::warn!("this node holds no signed policy yet (`wires join`): aliases only");
         config
     };
     tracing::info!(
@@ -1151,9 +1151,9 @@ mod tests {
     /// Card 28 §8: a registered service beats an alias of the same name.
     #[test]
     fn services_become_tools_after_the_aliases_and_shadow_them() {
-        use library::{Grant, RoleName, Service, ServiceName, State};
+        use library::{Grant, Policy, RoleName, Service, ServiceName};
         let node = |b: u8| NodeIdentity::from_seed([b; 32]).node_id();
-        let mut state = State::new(node(1));
+        let mut state = Policy::new(node(1));
         for (name, desc) in [("orders-db", "Read-only SQL"), ("db_query", "shadowed")] {
             state.services.insert(
                 ServiceName::new(name).unwrap(),

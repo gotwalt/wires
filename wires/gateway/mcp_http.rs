@@ -18,7 +18,7 @@
 //! `403` (DNS-rebinding protection). No valid bearer token is `401` with the
 //! [`challenge`].
 //!
-//! The tool list is computed per request from the signed state the gateway
+//! The tool list is computed per request from the signed policy the gateway
 //! holds and the caller's verified principal, so an admin's change applies
 //! to the next request.
 
@@ -264,10 +264,10 @@ pub(crate) async fn post<B: Backend>(
     let tools = match gw.tools_for(&session.principal) {
         Ok((_, tools)) => tools,
         Err(e) => {
-            tracing::warn!("gateway: no usable signed state: {e:#}");
+            tracing::warn!("gateway: no usable signed policy: {e:#}");
             let reply = error_response(
                 id.unwrap_or(Value::Null),
-                RpcError::new(-32000, "the gateway holds no usable signed state"),
+                RpcError::new(-32000, "the gateway holds no usable signed policy"),
             );
             return json_reply(StatusCode::SERVICE_UNAVAILABLE, &reply);
         }

@@ -2,7 +2,7 @@
 //!
 //! A session carries a small set of [`Frame`]s over a single bidirectional
 //! stream: an opening [`Frame::Hello`] that presents the dialer's membership,
-//! state version and ID token, then tagged stdio chunks ([`Frame::Stdin`] / [`Frame::Stdout`] /
+//! policy version and ID token, then tagged stdio chunks ([`Frame::Stdin`] / [`Frame::Stdout`] /
 //! [`Frame::Stderr`]) and a final [`Frame::Exit`] carrying the child's exit
 //! code. A host that refuses the handshake answers with a terminal
 //! [`Frame::Denied`] carrying the human-readable reason instead of an ack, so
@@ -39,17 +39,18 @@
 //!
 //! [`Hello`] and [`HelloAck`] are unsigned envelopes: each part verifies on
 //! its own (the membership under the root, the ID token under the IdP's keys
-//! and its nonce binding to the iroh-authenticated caller, the state under
+//! and its nonce binding to the iroh-authenticated caller, the policy under
 //! the root), so omitting an absent part via `skip_serializing_if` is safe.
 
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{canonical_bytes, length_prefixed, split_frame};
 use crate::error::{Error, Result};
+use crate::head::StateVersion;
 use crate::idp::IdToken;
 use crate::invoke::Invocation;
 use crate::membership::Membership;
-use crate::state::{SignedState, StateVersion};
+use crate::signed_policy::SignedPolicy;
 
 const TAG_STDIN: u8 = 1;
 const TAG_STDOUT: u8 = 2;
@@ -69,9 +70,9 @@ const TAG_HELLO_ACK: u8 = 9;
 pub struct Hello {
     /// The dialer's root-signed membership.
     pub membership: Membership,
-    /// The signed-state version the dialer holds (0: none). A host holding a
-    /// newer one answers with it in [`HelloAck::newer_state`] or refuses a
-    /// node it bans; a host holding an older one pulls it.
+    /// The policy version the dialer holds (0: none). A host holding a
+    /// newer one answers with it in [`HelloAck::newer_policy`] (card 37
+    /// replaces this with the head version alone).
     pub state_version: StateVersion,
     /// The dialer's IdP ID token (nonce-bound to its node key), when it has
     /// logged in.
@@ -80,18 +81,18 @@ pub struct Hello {
 }
 
 /// The host's answer to an admitted [`Hello`]: its own membership (the
-/// dialer verifies it before sending stdin), its state version, and, when the
-/// dialer's copy is older, the newer state so the dialer can adopt it.
+/// dialer verifies it before sending stdin), its policy version, and, when the
+/// dialer's copy is older, the newer signed policy so the dialer can adopt it.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HelloAck {
     /// The host's root-signed membership.
     pub membership: Membership,
-    /// The signed-state version the host decided under.
+    /// The policy version the host decided under.
     pub state_version: StateVersion,
-    /// The host's newer state, when the dialer's was older.
+    /// The host's newer signed policy, when the dialer's was older.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub newer_state: Option<SignedState>,
+    pub newer_policy: Option<SignedPolicy>,
 }
 
 /// A chunk of stdio bytes carried in a [`Frame`].
@@ -141,7 +142,7 @@ pub enum Frame {
     /// Dialer → host, right after `Hello`: which service to run and the
     /// per-call arguments.
     Invoke(Invocation),
-    /// The opening frame: membership, state version, ID token.
+    /// The opening frame: membership, policy version, ID token.
     Hello(Hello),
     /// The host's ack to an admitted [`Hello`].
     HelloAck(HelloAck),
@@ -281,17 +282,17 @@ mod tests {
                         id_token: token.map(IdToken::new),
                     })
                 }),
-            (seed(), any::<u64>(), any::<bool>()).prop_map(|(rs, v, with_state)| {
+            (seed(), any::<u64>(), any::<bool>()).prop_map(|(rs, v, with_policy)| {
                 let root = NodeIdentity::from_seed(rs);
-                let newer_state = with_state.then(|| {
-                    let mut s = crate::state::State::new(root.node_id());
-                    s.version = StateVersion(v);
-                    s.sign(&root).unwrap()
+                let newer_policy = with_policy.then(|| {
+                    let mut p = crate::signed_policy::Policy::new(root.node_id());
+                    p.version = StateVersion(v);
+                    p.sign(&root).unwrap()
                 });
                 Frame::HelloAck(HelloAck {
                     membership: Membership::mint(&root, root.node_id(), 0, 1).unwrap(),
                     state_version: StateVersion(v),
-                    newer_state,
+                    newer_policy,
                 })
             }),
         ]
