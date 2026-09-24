@@ -58,7 +58,13 @@ pub enum ItemKey {
 impl fmt::Display for ItemKey {
     /// `kind:key` (`settings` alone), for messages and traces.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("ItemKey::fmt {f:p}")
+        match self {
+            ItemKey::Role(r) => write!(f, "role:{r}"),
+            ItemKey::Service(s) => write!(f, "service:{s}"),
+            ItemKey::Ban(n) => write!(f, "ban:{}", n.hex()),
+            ItemKey::Issuer(i) => write!(f, "issuer:{i}"),
+            ItemKey::Settings => f.write_str("settings"),
+        }
     }
 }
 
@@ -75,7 +81,7 @@ pub struct Ban {
 impl Ban {
     /// Whether the ban still holds at `now` (`now <= until`).
     pub fn holds(&self, now: i64) -> bool {
-        todo!("Ban::holds {now}")
+        now <= self.until
     }
 }
 
@@ -125,7 +131,11 @@ pub struct Settings {
 impl Default for Settings {
     /// `lenient`, a 5-minute beat, 15-minute freshness.
     fn default() -> Self {
-        todo!("Settings::default")
+        Settings {
+            freshness: FreshnessMode::Lenient,
+            beat_secs: DEFAULT_BEAT_SECS,
+            fresh_secs: DEFAULT_FRESH_SECS,
+        }
     }
 }
 
@@ -173,7 +183,13 @@ pub enum Item {
 impl Item {
     /// This item's [`ItemKey`]: its kind and key, its place in the tree.
     pub fn key(&self) -> ItemKey {
-        todo!("Item::key")
+        match self {
+            Item::Role { key, .. } => ItemKey::Role(key.clone()),
+            Item::Service { key, .. } => ItemKey::Service(key.clone()),
+            Item::Ban { key, .. } => ItemKey::Ban(*key),
+            Item::Issuer { key, .. } => ItemKey::Issuer(key.clone()),
+            Item::Settings { .. } => ItemKey::Settings,
+        }
     }
 }
 

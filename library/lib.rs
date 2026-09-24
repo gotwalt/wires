@@ -49,7 +49,7 @@
 //! - [`head`] — the root-signed [`PolicyHead`] / [`SignedPolicyHead`].
 //! - [`signed_policy`] — the whole [`Policy`] and [`SignedPolicy`], and the
 //!   parts cut from it.
-//! - [`slice`] — those parts: a host's [`Slice`], a caller's [`View`].
+//! - [`parts`] — a host's [`Slice`], a caller's [`View`].
 //! - [`fresh`] — a directory's signed [`Fresh`] timestamp.
 //! - [`directory`] — the [`DirectoryRequest`] / [`SubRequest`] frames on
 //!   [`DIRECTORY_ALPN`] and [`DIRECTORY_SUB_ALPN`].
@@ -161,10 +161,10 @@ pub mod head;
 pub mod item;
 #[path = "services/merkle.rs"]
 pub mod merkle;
+#[path = "services/parts.rs"]
+pub mod parts;
 #[path = "services/signed_policy.rs"]
 pub mod signed_policy;
-#[path = "services/slice.rs"]
-pub mod slice;
 
 // directory/ — the directory's protocols.
 #[path = "directory/frames.rs"]
@@ -202,6 +202,7 @@ pub use item::{
 };
 pub use membership::{MEMBERSHIP_V1, Membership};
 pub use merkle::{InclusionProof, ItemHash, ItemTree, ItemsRoot, MAX_PROOF_DEPTH, ProofPath};
+pub use parts::{ProvedItem, Slice, View, ViewEntry};
 pub use policy::check_inclusion;
 pub use push::{
     INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_FRAME, MAX_INBOX_HELLO, MAX_PUSH_BODY,
@@ -211,6 +212,5 @@ pub use registry::{MAX_SERVICE_NAME, Service, ServiceName};
 pub use role::{EmailPattern, MAX_ROLE_NAME, Matcher, RoleName};
 pub use session::{Chunk, Frame, Hello, HelloAck};
 pub use signed_policy::{Policy, SignedPolicy};
-pub use slice::{ProvedItem, Slice, View, ViewEntry};
 pub use state::{STATE_CONTEXT, STATE_V1, SignedState, State, StateVersion};
 pub use sync::{MAX_SMALL_STATE_FRAME, MAX_STATE_FRAME, OFFER_BODY_PREFIX, STATE_ALPN, StateFrame};

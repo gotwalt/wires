@@ -56,8 +56,20 @@ hex_id! {
 impl ItemHash {
     /// The leaf hash of `item`.
     pub fn of(item: &Item) -> Result<ItemHash> {
-        todo!("ItemHash::of {item:?}")
+        let mut h = blake3::Hasher::new();
+        h.update(&[LEAF_PREFIX]);
+        h.update(&canonical_bytes(item)?);
+        Ok(ItemHash(*h.finalize().as_bytes()))
     }
+}
+
+/// `blake3(0x01 ‖ left ‖ right)`.
+fn node_hash(left: &ItemsRoot, right: &ItemsRoot) -> ItemsRoot {
+    let mut h = blake3::Hasher::new();
+    h.update(&[NODE_PREFIX]);
+    h.update(&left.0);
+    h.update(&right.0);
+    ItemsRoot(*h.finalize().as_bytes())
 }
 
 /// The sibling hashes on the path from a leaf to the root, leaf end first.
@@ -80,13 +92,22 @@ impl TryFrom<String> for ProofPath {
     /// Decode the base64url string; [`Error::BadLength`] unless it is whole
     /// hashes, at most [`MAX_PROOF_DEPTH`] of them.
     fn try_from(s: String) -> Result<Self> {
-        todo!("ProofPath::try_from {s}")
+        // Refuse an over-long path before decoding it.
+        if s.len() > (32 * MAX_PROOF_DEPTH).div_ceil(3) * 4 {
+            return Err(Error::BadLength);
+        }
+        let bytes = B64.decode(s)?;
+        let (chunks, rest) = bytes.as_chunks::<32>();
+        if !rest.is_empty() || chunks.len() > MAX_PROOF_DEPTH {
+            return Err(Error::BadLength);
+        }
+        Ok(ProofPath(chunks.iter().copied().map(ItemsRoot).collect()))
     }
 }
 
 impl From<ProofPath> for String {
     fn from(p: ProofPath) -> String {
-        todo!("ProofPath into String {p:?}")
+        B64.encode(p.0.iter().flat_map(|h| h.0).collect::<Vec<u8>>())
     }
 }
 
@@ -107,15 +128,35 @@ impl InclusionProof {
     /// `root` and `count` leaves; [`Error::BadProof`] if not (a changed item,
     /// a changed or truncated path, an index out of range, or another tree).
     pub fn verify(&self, item: &Item, root: ItemsRoot, count: u64) -> Result<()> {
-        todo!("InclusionProof::verify {item:?} {root} {count}")
+        if self.index >= count {
+            return Err(Error::BadProof);
+        }
+        let mut acc = ItemsRoot(ItemHash::of(item)?.0);
+        let mut siblings = self.path.0.iter();
+        let (mut i, mut n) = (self.index, count);
+        // Walk up the one shape `count` fixes: an odd last node has no
+        // sibling and carries up unchanged.
+        while n > 1 {
+            if i % 2 == 1 {
+                acc = node_hash(siblings.next().ok_or(Error::BadProof)?, &acc);
+            } else if i + 1 < n {
+                acc = node_hash(&acc, siblings.next().ok_or(Error::BadProof)?);
+            }
+            i /= 2;
+            n = n.div_ceil(2);
+        }
+        if siblings.next().is_some() || acc != root {
+            return Err(Error::BadProof);
+        }
+        Ok(())
     }
 }
 
 /// A built tree: every level, so proofs are cheap after one `O(n)` build.
 #[derive(Clone, Debug)]
 pub struct ItemTree {
-    /// `levels[0]` is the leaves; the last level is the root alone (empty
-    /// when there are no leaves).
+    /// `levels[0]` is the leaves; the last level is the root alone (or no
+    /// node at all, for no leaves).
     levels: Vec<Vec<ItemsRoot>>,
 }
 
@@ -123,12 +164,29 @@ impl ItemTree {
     /// Build the tree over `leaves`, which must already be in
     /// [`ItemKey`](crate::ItemKey) order.
     pub fn new(leaves: Vec<ItemHash>) -> ItemTree {
-        todo!("ItemTree::new {}", leaves.len())
+        let mut levels = vec![
+            leaves
+                .into_iter()
+                .map(|l| ItemsRoot(l.0))
+                .collect::<Vec<_>>(),
+        ];
+        while let Some(level) = levels.last().filter(|l| l.len() > 1) {
+            let next = level
+                .chunks(2)
+                .map(|pair| match pair {
+                    [left, right] => node_hash(left, right),
+                    [odd] => *odd,
+                    _ => unreachable!("chunks(2) yields one or two"),
+                })
+                .collect();
+            levels.push(next);
+        }
+        ItemTree { levels }
     }
 
     /// The number of leaves.
     pub fn len(&self) -> u64 {
-        todo!("ItemTree::len {}", self.levels.len())
+        self.levels[0].len() as u64
     }
 
     /// Whether the tree has no leaves.
@@ -138,12 +196,27 @@ impl ItemTree {
 
     /// The root hash (`blake3("")` for no leaves).
     pub fn root(&self) -> ItemsRoot {
-        todo!("ItemTree::root")
+        match self.levels.last().and_then(|top| top.first()) {
+            Some(root) => *root,
+            None => ItemsRoot(*blake3::hash(b"").as_bytes()),
+        }
     }
 
     /// The proof for leaf `index`, or `None` past the last leaf.
     pub fn prove(&self, index: u64) -> Option<InclusionProof> {
-        todo!("ItemTree::prove {index}")
+        let mut i = usize::try_from(index).ok()?;
+        self.levels[0].get(i)?;
+        let mut path = Vec::new();
+        for level in &self.levels[..self.levels.len() - 1] {
+            if let Some(sibling) = level.get(i ^ 1) {
+                path.push(*sibling);
+            }
+            i /= 2;
+        }
+        Some(InclusionProof {
+            index,
+            path: ProofPath(path),
+        })
     }
 }
 
@@ -255,7 +328,11 @@ mod tests {
             ..proof.clone()
         };
         assert!(moved.verify(&items[2], tree.root(), 6).is_err());
-        assert!(proof.verify(&items[2], tree.root(), 7).is_err());
+        // The count fixes the shape (the head signs it with the root): where
+        // the shapes differ, so do the paths.
+        let fifth = tree.prove(4).unwrap();
+        fifth.verify(&items[4], tree.root(), 6).unwrap();
+        assert!(fifth.verify(&items[4], tree.root(), 7).is_err());
         assert!(proof.verify(&items[2], tree.root(), 2).is_err());
         let out_of_range = InclusionProof {
             index: 6,

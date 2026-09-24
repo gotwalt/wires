@@ -48,10 +48,10 @@ use crate::head::SignedPolicyHead;
 use crate::idp::IdToken;
 use crate::item::Item;
 use crate::membership::Membership;
+use crate::parts::{Slice, View};
 use crate::registry::ServiceName;
 use crate::role::RoleName;
 use crate::signed_policy::SignedPolicy;
-use crate::slice::{Slice, View};
 use crate::state::StateVersion;
 
 /// The ALPN of the directory's request protocol.
@@ -96,7 +96,7 @@ pub enum DirectoryRequest {
         items: Vec<Item>,
     },
     /// The newest head and its `Fresh`.
-    Head,
+    Head {},
     /// The dialer's host slice.
     Slice {
         /// The version the dialer holds (0: none).
@@ -248,15 +248,34 @@ impl DirectoryRequest {
     /// arrived; an error for an oversized prefix (see
     /// [`length`](Self::length)) or a malformed body.
     pub fn decode(buf: &[u8]) -> Result<Option<(DirectoryRequest, usize)>> {
-        todo!("DirectoryRequest::decode {}", buf.len())
+        if Self::length(buf)?.is_none() {
+            return Ok(None);
+        }
+        decode_frame(buf, MAX_DIRECTORY_FRAME)
     }
 
-    /// The body length the prefix at the start of `buf` announces, once its
-    /// four bytes are there. [`Error::BadFrame`] when it is over
-    /// [`MAX_DIRECTORY_FRAME`], or over [`MAX_SMALL_DIRECTORY_FRAME`] and the
-    /// body's first bytes (once there) aren't [`PUBLISH_BODY_PREFIX`].
+    /// The body length the prefix at the start of `buf` announces, once it
+    /// is safe to read: at once for a body up to
+    /// [`MAX_SMALL_DIRECTORY_FRAME`], and for a larger one once its first
+    /// bytes show it is a publish ([`PUBLISH_BODY_PREFIX`]); `Ok(None)`
+    /// until then. [`Error::BadFrame`] when it is over
+    /// [`MAX_DIRECTORY_FRAME`], or large and not a publish (refused from the
+    /// first byte that differs, before the rest is read).
     pub fn length(buf: &[u8]) -> Result<Option<usize>> {
-        todo!("DirectoryRequest::length {}", buf.len())
+        let Some(len) = prefix_len(buf) else {
+            return Ok(None);
+        };
+        if len > MAX_DIRECTORY_FRAME {
+            return Err(Error::BadFrame);
+        }
+        if len <= MAX_SMALL_DIRECTORY_FRAME {
+            return Ok(Some(len));
+        }
+        let opening = &buf[4..buf.len().min(4 + PUBLISH_BODY_PREFIX.len())];
+        if !PUBLISH_BODY_PREFIX.starts_with(opening) {
+            return Err(Error::BadFrame);
+        }
+        Ok((opening.len() == PUBLISH_BODY_PREFIX.len()).then_some(len))
     }
 }
 
@@ -300,13 +319,24 @@ impl SubFrame {
 /// Length-prefixed canonical JSON, refusing a body over
 /// [`MAX_DIRECTORY_FRAME`].
 fn encode_frame<T: Serialize>(frame: &T) -> Result<Vec<u8>> {
-    todo!("encode_frame {}", std::any::type_name_of_val(frame))
+    let body = canonical_bytes(frame)?;
+    if body.len() > MAX_DIRECTORY_FRAME {
+        return Err(Error::BadFrame);
+    }
+    length_prefixed(&body)
 }
 
 /// The first whole frame in `buf`, refusing a prefix over `max` before
 /// reading the body.
 fn decode_frame<T: DeserializeOwned>(buf: &[u8], max: usize) -> Result<Option<(T, usize)>> {
-    todo!("decode_frame {} {max}", buf.len())
+    if prefix_len(buf).is_some_and(|len| len > max) {
+        return Err(Error::BadFrame);
+    }
+    let Some((body, end)) = split_frame(buf) else {
+        return Ok(None);
+    };
+    let frame = serde_json::from_slice(body).map_err(Error::Decode)?;
+    Ok(Some((frame, end)))
 }
 
 #[cfg(test)]
@@ -347,7 +377,7 @@ mod tests {
                 head: signed.head.clone(),
                 items: signed.items,
             },
-            DirectoryRequest::Head,
+            DirectoryRequest::Head {},
             DirectoryRequest::Slice {
                 have: StateVersion(2),
                 roles: vec![role("oncall")],
@@ -381,7 +411,7 @@ mod tests {
             assert_eq!(DirectoryRequest::decode(&bytes[..3]).unwrap(), None);
         }
         assert_eq!(
-            DirectoryRequest::Head.encode().unwrap()[4..],
+            DirectoryRequest::Head {}.encode().unwrap()[4..],
             br#"{"type":"head"}"#[..]
         );
     }
@@ -513,7 +543,7 @@ mod tests {
         assert!(DirectoryRequest::length(&buf[..4 + PUBLISH_BODY_PREFIX.len()]).is_err());
         assert!(DirectoryRequest::decode(&buf).is_err());
         // A small one's length is known from the prefix alone.
-        let small = DirectoryRequest::Head.encode().unwrap();
+        let small = DirectoryRequest::Head {}.encode().unwrap();
         assert_eq!(
             DirectoryRequest::length(&small[..4]).unwrap(),
             Some(small.len() - 4)

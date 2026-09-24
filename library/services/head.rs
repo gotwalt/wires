@@ -28,7 +28,6 @@
 //! assert_eq!(signed.head.head.item_count, 1, "just the settings item");
 //! ```
 
-use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{canonical_bytes, hex_id};
@@ -94,12 +93,34 @@ impl PolicyHead {
     /// listed twice. (Heads are normally signed by
     /// [`Policy::sign`](crate::Policy::sign), which also computes the root.)
     pub fn sign(&self, root: &NodeIdentity) -> Result<SignedPolicyHead> {
-        todo!("PolicyHead::sign {}", root.node_id().hex())
+        if root.node_id() != self.fabric {
+            return Err(Error::FabricMismatch);
+        }
+        self.check_directories()?;
+        let alg = AlgorithmId::Ed25519;
+        let sig = root.sign(&signed_bytes(self, &alg)?);
+        Ok(SignedPolicyHead {
+            head: self.clone(),
+            alg,
+            sig,
+        })
+    }
+
+    /// [`Error::InvalidPolicy`] if a directory is listed twice.
+    fn check_directories(&self) -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        match self.directories.iter().find(|d| !seen.insert(**d)) {
+            Some(d) => Err(Error::InvalidPolicy(format!(
+                "directory {} is listed twice",
+                d.hex()
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Whether `node` is one of the head's directories.
     pub fn is_directory(&self, node: NodeId) -> bool {
-        todo!("PolicyHead::is_directory {}", node.hex())
+        self.directories.contains(&node)
     }
 }
 
@@ -108,23 +129,38 @@ impl SignedPolicyHead {
     /// `fabric == root` pin, the signature, then that no directory is listed
     /// twice. Does not check freshness ([`check_fresh`](Self::check_fresh)).
     pub fn verify(&self, root: NodeId) -> Result<()> {
-        todo!("SignedPolicyHead::verify {}", root.hex())
+        if self.alg != AlgorithmId::Ed25519 {
+            return Err(Error::UnsupportedAlgorithm);
+        }
+        if self.head.format != POLICY_V3 {
+            return Err(Error::UnsupportedVersion);
+        }
+        if self.head.fabric != root {
+            return Err(Error::InvalidSignature);
+        }
+        root.verify(&signed_bytes(&self.head, &self.alg)?, &self.sig)?;
+        self.head.check_directories()
     }
 
     /// [`Error::Expired`] when `now > not_after`.
     pub fn check_fresh(&self, now: i64) -> Result<()> {
-        todo!("SignedPolicyHead::check_fresh {now}")
+        if now > self.head.not_after {
+            return Err(Error::Expired {
+                not_after: self.head.not_after,
+            });
+        }
+        Ok(())
     }
 
     /// Whether this head should replace `other`: same fabric and a strictly
     /// higher version. Says nothing about signatures; verify first.
     pub fn is_newer_than(&self, other: &SignedPolicyHead) -> bool {
-        todo!("SignedPolicyHead::is_newer_than {other:?}")
+        self.head.fabric == other.head.fabric && self.head.version > other.head.version
     }
 
     /// The [`HeadHash`] naming this exact signed head.
     pub fn hash(&self) -> Result<HeadHash> {
-        todo!("SignedPolicyHead::hash")
+        Ok(HeadHash(*blake3::hash(&canonical_bytes(self)?).as_bytes()))
     }
 }
 

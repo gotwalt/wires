@@ -49,11 +49,11 @@ use crate::error::{Error, Result};
 use crate::head::{POLICY_V3, PolicyHead, SignedPolicyHead};
 use crate::identity::{NodeId, NodeIdentity};
 use crate::idp::{Issuer, Principal};
-use crate::item::{Ban, IssuerConfig, Item, ItemKey, Settings};
+use crate::item::{Ban, IssuerConfig, Item, Settings};
 use crate::merkle::{ItemHash, ItemTree};
+use crate::parts::{ProvedItem, Slice, View, ViewEntry};
 use crate::registry::{Service, ServiceName};
 use crate::role::{Matcher, RoleName};
-use crate::slice::{ProvedItem, Slice, View, ViewEntry};
 use crate::state::StateVersion;
 
 /// The policy as the admin edits it: head fields plus every item, by kind.
@@ -90,7 +90,7 @@ pub struct Policy {
 pub struct SignedPolicy {
     /// The signed head.
     pub head: SignedPolicyHead,
-    /// Every item, sorted by [`ItemKey`], each key once.
+    /// Every item, sorted by [`ItemKey`](crate::ItemKey), each key once.
     pub items: Vec<Item>,
 }
 
@@ -99,7 +99,18 @@ impl Policy {
     /// 0), with default [`Settings`]: the starting point `wires init` fills
     /// in.
     pub fn new(fabric: NodeId) -> Policy {
-        todo!("Policy::new {}", fabric.hex())
+        Policy {
+            fabric,
+            version: StateVersion(0),
+            issued: 0,
+            not_after: 0,
+            directories: Vec::new(),
+            roles: BTreeMap::new(),
+            services: BTreeMap::new(),
+            bans: BTreeMap::new(),
+            issuers: BTreeMap::new(),
+            settings: Settings::default(),
+        }
     }
 
     /// The structural rules the types can't say ([`Error::InvalidPolicy`]
@@ -114,19 +125,129 @@ impl Policy {
     ///   audience;
     /// - `settings.beat_secs > 0` and `settings.fresh_secs >= beat_secs`.
     pub fn validate(&self) -> Result<()> {
-        todo!("Policy::validate")
+        let bad = |why: String| Err(Error::InvalidPolicy(why));
+        let mut seen = BTreeSet::new();
+        if let Some(d) = self.directories.iter().find(|d| !seen.insert(**d)) {
+            return bad(format!("directory {} is listed twice", d.hex()));
+        }
+        for (iss, config) in &self.issuers {
+            if iss.as_str().trim().is_empty() {
+                return bad("an issuer is blank".into());
+            }
+            if config
+                .audiences
+                .iter()
+                .all(|a| a.as_str().trim().is_empty())
+            {
+                return bad(format!("issuer {iss} accepts no audience"));
+            }
+        }
+        for (role, matchers) in &self.roles {
+            if matchers.is_empty() {
+                return bad(format!("role {role} has no matchers"));
+            }
+            for m in matchers {
+                if m.issuer.trim().is_empty() {
+                    return bad(format!("role {role} has a matcher with no issuer"));
+                }
+                if !self.issuers.contains_key(&Issuer::new(m.issuer.as_str())) {
+                    return bad(format!(
+                        "role {role} names issuer {}, which is not trusted",
+                        m.issuer
+                    ));
+                }
+            }
+        }
+        for (name, svc) in &self.services {
+            if let Some(role) = svc
+                .allow
+                .iter()
+                .chain(&svc.readers)
+                .find(|r| !self.roles.contains_key(*r))
+            {
+                return bad(format!("service {name} names undefined role {role}"));
+            }
+            let mut seen = BTreeSet::new();
+            if let Some(h) = svc.hosts.iter().find(|h| !seen.insert(**h)) {
+                return bad(format!("service {name} lists host {} twice", h.hex()));
+            }
+        }
+        if self.settings.beat_secs == 0 {
+            return bad("settings: beat_secs is 0".into());
+        }
+        if self.settings.fresh_secs < self.settings.beat_secs {
+            return bad("settings: fresh_secs is shorter than beat_secs".into());
+        }
+        Ok(())
     }
 
-    /// Every item, in leaf ([`ItemKey`]) order.
+    /// Every item, in leaf ([`ItemKey`](crate::ItemKey)) order.
     pub fn items(&self) -> Vec<Item> {
-        todo!("Policy::items")
+        // Each map iterates in its key's order, and the kinds follow in
+        // `ItemKey`'s order, so the concatenation is sorted.
+        let roles = self.roles.iter().map(|(k, v)| Item::Role {
+            key: k.clone(),
+            body: v.clone(),
+        });
+        let services = self.services.iter().map(|(k, v)| Item::Service {
+            key: k.clone(),
+            body: v.clone(),
+        });
+        let bans = self
+            .bans
+            .iter()
+            .map(|(k, v)| Item::Ban { key: *k, body: *v });
+        let issuers = self.issuers.iter().map(|(k, v)| Item::Issuer {
+            key: k.clone(),
+            body: v.clone(),
+        });
+        let settings = Item::Settings {
+            body: self.settings,
+        };
+        roles
+            .chain(services)
+            .chain(bans)
+            .chain(issuers)
+            .chain([settings])
+            .collect()
     }
 
     /// Rebuild a policy from a head's fields and its items (the inverse of
     /// [`items`](Self::items)). [`Error::InvalidPolicy`] if the items are not
     /// strictly in key order or hold no settings item.
     pub fn from_items(head: &PolicyHead, items: &[Item]) -> Result<Policy> {
-        todo!("Policy::from_items {head:?} {}", items.len())
+        if let Some(pair) = items.windows(2).find(|w| w[0].key() >= w[1].key()) {
+            return Err(Error::InvalidPolicy(format!(
+                "items out of order at {}",
+                pair[1].key()
+            )));
+        }
+        let mut policy = Policy::new(head.fabric);
+        policy.version = head.version;
+        policy.issued = head.issued;
+        policy.not_after = head.not_after;
+        policy.directories = head.directories.clone();
+        let mut settings = None;
+        for item in items {
+            match item {
+                Item::Role { key, body } => {
+                    policy.roles.insert(key.clone(), body.clone());
+                }
+                Item::Service { key, body } => {
+                    policy.services.insert(key.clone(), body.clone());
+                }
+                Item::Ban { key, body } => {
+                    policy.bans.insert(*key, *body);
+                }
+                Item::Issuer { key, body } => {
+                    policy.issuers.insert(key.clone(), body.clone());
+                }
+                Item::Settings { body } => settings = Some(*body),
+            }
+        }
+        policy.settings =
+            settings.ok_or_else(|| Error::InvalidPolicy("no settings item".into()))?;
+        Ok(policy)
     }
 
     /// Validate, then sign as-is with the root key (the caller sets
@@ -134,19 +255,36 @@ impl Policy {
     /// go into the head. [`Error::FabricMismatch`] if `root` is not
     /// `fabric`.
     pub fn sign(&self, root: &NodeIdentity) -> Result<SignedPolicy> {
-        todo!("Policy::sign {}", root.node_id().hex())
+        if root.node_id() != self.fabric {
+            return Err(Error::FabricMismatch);
+        }
+        self.validate()?;
+        let items = self.items();
+        let tree = tree_of(&items)?;
+        let head = PolicyHead {
+            format: POLICY_V3,
+            fabric: self.fabric,
+            version: self.version,
+            issued: self.issued,
+            not_after: self.not_after,
+            directories: self.directories.clone(),
+            items_root: tree.root(),
+            item_count: tree.len(),
+        }
+        .sign(root)?;
+        Ok(SignedPolicy { head, items })
     }
 
     /// Whether `role` admits a caller presenting `principal`: a defined role
     /// one of whose matchers matches it. With no principal, or an undefined
     /// role, nothing admits (exactly [`role_admits`](crate::role_admits)).
     pub fn role_admits(&self, role: &RoleName, principal: Option<&Principal>) -> bool {
-        todo!("Policy::role_admits {role} {principal:?}")
+        admits(self.roles.get(role).map(Vec::as_slice), principal)
     }
 
     /// Whether `node` is banned at `now`.
     pub fn is_banned(&self, node: NodeId, now: i64) -> bool {
-        todo!("Policy::is_banned {} {now}", node.hex())
+        self.bans.get(&node).is_some_and(|b| b.holds(now))
     }
 }
 
@@ -156,7 +294,16 @@ impl SignedPolicy {
     /// commits to (count and root), then [`Policy::validate`]. Does not check
     /// freshness.
     pub fn verify(&self, root: NodeId) -> Result<()> {
-        todo!("SignedPolicy::verify {}", root.hex())
+        self.head.verify(root)?;
+        let policy = self.to_policy()?;
+        let tree = tree_of(&self.items)?;
+        let head = &self.head.head;
+        if tree.len() != head.item_count || tree.root() != head.items_root {
+            return Err(Error::InvalidPolicy(
+                "the items are not the ones the head commits to".into(),
+            ));
+        }
+        policy.validate()
     }
 
     /// The editable [`Policy`] this was signed from.
@@ -166,7 +313,7 @@ impl SignedPolicy {
 
     /// The Merkle tree over the items (one `O(n)` build; prove from it).
     pub fn tree(&self) -> Result<ItemTree> {
-        todo!("SignedPolicy::tree")
+        tree_of(&self.items)
     }
 
     /// `host`'s slice: the head and, with proofs, every service item naming
@@ -174,10 +321,28 @@ impl SignedPolicy {
     /// `extra_roles` (the roles its `host.json` names; undefined ones are
     /// skipped), every ban, every issuer, and the settings. Nothing else.
     pub fn slice_for_host(&self, host: NodeId, extra_roles: &[RoleName]) -> Result<Slice> {
-        todo!(
-            "SignedPolicy::slice_for_host {} {extra_roles:?}",
-            host.hex()
-        )
+        let mut roles: BTreeSet<&RoleName> = extra_roles.iter().collect();
+        for item in &self.items {
+            if let Item::Service { body, .. } = item
+                && body.hosts.contains(&host)
+            {
+                roles.extend(body.allow.iter().chain(&body.readers));
+            }
+        }
+        let wanted = |item: &Item| match item {
+            Item::Service { body, .. } => body.hosts.contains(&host),
+            Item::Role { key, .. } => roles.contains(key),
+            Item::Ban { .. } | Item::Issuer { .. } | Item::Settings { .. } => true,
+        };
+        let items = self
+            .prove_where(|item| wanted(item).then_some(()))?
+            .into_iter()
+            .map(|(proved, ())| proved)
+            .collect();
+        Ok(Slice {
+            head: self.head.clone(),
+            items,
+        })
     }
 
     /// The view of a caller presenting `principal`: the head and, with
@@ -185,14 +350,72 @@ impl SignedPolicy {
     /// (marked `read`) admits it. No role, ban, issuer or settings, and no
     /// other service; with no principal, no entries (no role admits).
     pub fn view_for(&self, principal: Option<&Principal>) -> Result<View> {
-        todo!("SignedPolicy::view_for {principal:?}")
+        let roles: BTreeMap<&RoleName, &[Matcher]> = self
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Role { key, body } => Some((key, body.as_slice())),
+                _ => None,
+            })
+            .collect();
+        let admitted = |allowed: &[RoleName]| {
+            allowed
+                .iter()
+                .any(|r| admits(roles.get(r).copied(), principal))
+        };
+        let marks = |item: &Item| match item {
+            Item::Service { body, .. } => {
+                let (call, read) = (admitted(&body.allow), admitted(&body.readers));
+                (call || read).then_some((call, read))
+            }
+            _ => None,
+        };
+        let entries = self
+            .prove_where(marks)?
+            .into_iter()
+            .map(|(item, (call, read))| ViewEntry { item, call, read })
+            .collect();
+        Ok(View {
+            head: self.head.clone(),
+            entries,
+        })
     }
+
+    /// Every item `pick` returns something for, with its proof and what
+    /// `pick` said, in leaf order.
+    fn prove_where<T>(&self, pick: impl Fn(&Item) -> Option<T>) -> Result<Vec<(ProvedItem, T)>> {
+        let tree = self.tree()?;
+        let mut out = Vec::new();
+        for (index, item) in (0u64..).zip(&self.items) {
+            if let Some(mark) = pick(item) {
+                let proof = tree.prove(index).ok_or(Error::BadProof)?;
+                out.push((
+                    ProvedItem {
+                        item: item.clone(),
+                        proof,
+                    },
+                    mark,
+                ));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The Merkle tree over `items`, in the order given.
+fn tree_of(items: &[Item]) -> Result<ItemTree> {
+    Ok(ItemTree::new(
+        items.iter().map(ItemHash::of).collect::<Result<_>>()?,
+    ))
 }
 
 /// Whether `matchers` (a role's definition, if it has one) admit `principal`.
 /// The one rule every admission check shares.
 pub(crate) fn admits(matchers: Option<&[Matcher]>, principal: Option<&Principal>) -> bool {
-    todo!("admits {matchers:?} {principal:?}")
+    let (Some(matchers), Some(p)) = (matchers, principal) else {
+        return false;
+    };
+    matchers.iter().any(|m| m.matches(p))
 }
 
 /// Shared test fixtures: a small, valid policy.
@@ -301,6 +524,7 @@ mod tests {
     use super::fixtures::*;
     use super::*;
     use crate::idp::Audience;
+    use crate::item::ItemKey;
     use proptest::prelude::*;
 
     /// The rule `validate` says `p` breaks.

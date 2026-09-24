@@ -35,6 +35,7 @@ use crate::item::{IssuerConfig, Item, ItemKey, Settings};
 use crate::merkle::InclusionProof;
 use crate::registry::{Service, ServiceName};
 use crate::role::{Matcher, RoleName};
+use crate::signed_policy::admits;
 
 /// One item with its proof of inclusion under a head.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,7 +51,8 @@ impl ProvedItem {
     /// Check the proof against `head`'s `items_root` and `item_count`
     /// ([`Error::BadProof`]).
     pub fn verify(&self, head: &PolicyHead) -> Result<()> {
-        todo!("ProvedItem::verify {head:?}")
+        self.proof
+            .verify(&self.item, head.items_root, head.item_count)
     }
 }
 
@@ -70,44 +72,64 @@ impl Slice {
     /// appears twice, and that the settings item is there. Does not check
     /// freshness.
     pub fn verify(&self, root: NodeId) -> Result<()> {
-        todo!("Slice::verify {}", root.hex())
+        self.head.verify(root)?;
+        let keys = verify_items(&self.head.head, &self.items)?;
+        if !keys.contains(&ItemKey::Settings) {
+            return Err(Error::InvalidPolicy("the slice has no settings".into()));
+        }
+        Ok(())
     }
 
     /// The fabric's settings (present in every verified slice).
     pub fn settings(&self) -> Option<&Settings> {
-        todo!("Slice::settings")
+        self.items.iter().find_map(|p| match &p.item {
+            Item::Settings { body } => Some(body),
+            _ => None,
+        })
     }
 
     /// The service `name`, if this slice holds it.
     pub fn service(&self, name: &ServiceName) -> Option<&Service> {
-        todo!("Slice::service {name}")
+        self.items.iter().find_map(|p| match &p.item {
+            Item::Service { key, body } if key == name => Some(body),
+            _ => None,
+        })
     }
 
     /// The matchers of role `name`, if this slice holds it.
     pub fn role(&self, name: &RoleName) -> Option<&[Matcher]> {
-        todo!("Slice::role {name}")
+        self.items.iter().find_map(|p| match &p.item {
+            Item::Role { key, body } if key == name => Some(body.as_slice()),
+            _ => None,
+        })
     }
 
     /// The trusted issuer `iss`, if the policy names it.
     pub fn issuer(&self, iss: &Issuer) -> Option<&IssuerConfig> {
-        todo!("Slice::issuer {iss}")
+        self.items.iter().find_map(|p| match &p.item {
+            Item::Issuer { key, body } if key == iss => Some(body),
+            _ => None,
+        })
     }
 
     /// Whether `role` admits `principal`, by the roles this slice holds
     /// (same rule as [`role_admits`](crate::role_admits): no principal or
     /// an unheld role admits nothing).
     pub fn role_admits(&self, role: &RoleName, principal: Option<&Principal>) -> bool {
-        todo!("Slice::role_admits {role} {principal:?}")
+        admits(self.role(role), principal)
     }
 
     /// Whether `node` is banned at `now`.
     pub fn is_banned(&self, node: NodeId, now: i64) -> bool {
-        todo!("Slice::is_banned {} {now}", node.hex())
+        self.items.iter().any(|p| match &p.item {
+            Item::Ban { key, body } => *key == node && body.holds(now),
+            _ => false,
+        })
     }
 
     /// Every item's key, in order.
     pub fn keys(&self) -> Vec<ItemKey> {
-        todo!("Slice::keys")
+        self.items.iter().map(|p| p.item.key()).collect()
     }
 }
 
@@ -127,7 +149,10 @@ impl ViewEntry {
     /// The service's name and entry (`None` if the item is not a service,
     /// which [`View::verify`] refuses).
     pub fn service(&self) -> Option<(&ServiceName, &Service)> {
-        todo!("ViewEntry::service")
+        match &self.item.item {
+            Item::Service { key, body } => Some((key, body)),
+            _ => None,
+        }
     }
 }
 
@@ -148,19 +173,40 @@ impl View {
     /// Does not check freshness. (The marks are the directory's reading of
     /// roles the view doesn't carry; the host decides every call.)
     pub fn verify(&self, root: NodeId) -> Result<()> {
-        todo!("View::verify {}", root.hex())
+        self.head.verify(root)?;
+        verify_items(&self.head.head, self.entries.iter().map(|e| &e.item))?;
+        for entry in &self.entries {
+            let key = entry.item.item.key();
+            if entry.service().is_none() {
+                return Err(Error::InvalidPolicy(format!("a view holds {key}")));
+            }
+            if !entry.call && !entry.read {
+                return Err(Error::InvalidPolicy(format!(
+                    "{key} is in the view but marked neither call nor read"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The entry for service `name`, if the view holds it.
     pub fn entry(&self, name: &ServiceName) -> Option<&ViewEntry> {
-        todo!("View::entry {name}")
+        self.entries
+            .iter()
+            .find(|e| e.service().is_some_and(|(key, _)| key == name))
     }
 
     /// Keep only the entries whose name or description contains `query`,
     /// ignoring ASCII case (`wires services <query>`, card 37). Proofs stay
     /// valid: each is under the same head.
     pub fn retain_matching(&mut self, query: &str) {
-        todo!("View::retain_matching {query}")
+        let query = query.to_ascii_lowercase();
+        self.entries.retain(|e| {
+            e.service().is_some_and(|(name, svc)| {
+                name.as_str().contains(&query)
+                    || svc.description.to_ascii_lowercase().contains(&query)
+            })
+        });
     }
 }
 

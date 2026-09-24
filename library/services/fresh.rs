@@ -81,10 +81,36 @@ impl Fresh {
         at: i64,
         until: i64,
     ) -> Result<Fresh> {
-        todo!(
-            "Fresh::sign {} {head:?} {at} {until}",
-            directory.node_id().hex()
-        )
+        if !head.head.is_directory(directory.node_id()) {
+            return Err(Error::NotADirectory);
+        }
+        if until < at {
+            return Err(Error::InvalidPolicy(
+                "freshness ends before it starts".into(),
+            ));
+        }
+        let body = SignedBody {
+            format: FRESH_V1,
+            fabric: head.head.fabric,
+            directory: directory.node_id(),
+            version: head.head.version,
+            head: head.hash()?,
+            at,
+            until,
+            alg: AlgorithmId::Ed25519,
+        };
+        let sig = directory.sign(&body.signed_bytes()?);
+        Ok(Fresh {
+            format: body.format,
+            fabric: body.fabric,
+            directory: body.directory,
+            version: body.version,
+            head: body.head,
+            at,
+            until,
+            alg: body.alg,
+            sig,
+        })
     }
 
     /// Check it vouches for exactly `head` (a head the caller has already
@@ -94,43 +120,72 @@ impl Fresh {
     /// the signature. Does not check the time
     /// ([`is_current`](Self::is_current)).
     pub fn verify(&self, head: &SignedPolicyHead) -> Result<()> {
-        todo!("Fresh::verify {head:?}")
+        if self.format != FRESH_V1 {
+            return Err(Error::UnsupportedVersion);
+        }
+        if self.alg != AlgorithmId::Ed25519 {
+            return Err(Error::UnsupportedAlgorithm);
+        }
+        if self.fabric != head.head.fabric
+            || self.version != head.head.version
+            || self.head != head.hash()?
+        {
+            return Err(Error::FreshMismatch);
+        }
+        if !head.head.is_directory(self.directory) {
+            return Err(Error::NotADirectory);
+        }
+        if self.until < self.at {
+            return Err(Error::InvalidPolicy(
+                "freshness ends before it starts".into(),
+            ));
+        }
+        self.directory.verify(&self.signed_bytes()?, &self.sig)
     }
 
     /// Whether it is current at `now`: `now <= until`, and `at` is no further
     /// in the future than [`CLOCK_SKEW_SECS`].
     pub fn is_current(&self, now: i64) -> bool {
-        todo!("Fresh::is_current {now} {CLOCK_SKEW_SECS}")
+        now >= self.at.saturating_sub(CLOCK_SKEW_SECS) && now <= self.until
     }
 }
 
 /// The signed portion of a [`Fresh`]: every field but `sig`.
 #[derive(Serialize)]
-struct SignedBody<'a> {
+struct SignedBody {
     format: u8,
-    fabric: &'a NodeId,
-    directory: &'a NodeId,
+    fabric: NodeId,
+    directory: NodeId,
     version: StateVersion,
-    head: &'a HeadHash,
+    head: HeadHash,
     at: i64,
     until: i64,
-    alg: &'a AlgorithmId,
+    alg: AlgorithmId,
+}
+
+impl SignedBody {
+    /// [`FRESH_CONTEXT`] ‖ the canonical body: what the directory signs.
+    fn signed_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = FRESH_CONTEXT.to_vec();
+        bytes.extend(canonical_bytes(self)?);
+        Ok(bytes)
+    }
 }
 
 impl Fresh {
+    /// The bytes [`sig`](Self::sig) covers.
     fn signed_bytes(&self) -> Result<Vec<u8>> {
-        let mut bytes = FRESH_CONTEXT.to_vec();
-        bytes.extend(canonical_bytes(&SignedBody {
+        SignedBody {
             format: self.format,
-            fabric: &self.fabric,
-            directory: &self.directory,
+            fabric: self.fabric,
+            directory: self.directory,
             version: self.version,
-            head: &self.head,
+            head: self.head,
             at: self.at,
             until: self.until,
-            alg: &self.alg,
-        })?);
-        Ok(bytes)
+            alg: self.alg,
+        }
+        .signed_bytes()
     }
 }
 
