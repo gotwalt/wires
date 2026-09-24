@@ -15,7 +15,7 @@
 //! - `directory/` — the directory's request and subscription frames.
 //!
 //! The folders are a filing system, not a namespace: every module is still
-//! declared here at the crate root (`library::state`, `library::session`, …),
+//! declared here at the crate root (`library::signed_policy`, `library::session`, …),
 //! and the re-exports below are the public surface.
 //!
 //! - [`identity`] — the Ed25519 [`NodeIdentity`], the [`NodeId`] / [`Signature`]
@@ -70,8 +70,8 @@
 //! let alice = NodeIdentity::from_seed([3u8; 32]);
 //!
 //! // The admin signs the trusted IdPs, the roles, the service registry
-//! // (which hosts run each) and the bans: one versioned policy. It lists no
-//! // members: a node is admitted by its badge.
+//! // (which hosts run each) and the bans: one versioned policy. No node
+//! // list: a node is admitted by its root-signed badge.
 //! let analyst = RoleName::new("analyst").unwrap();
 //! let orders = ServiceName::new("orders-db").unwrap();
 //! let mut s = Policy::new(root.node_id());

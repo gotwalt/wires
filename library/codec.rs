@@ -36,7 +36,7 @@ pub(crate) fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 }
 
 /// Prefix `body` with its length as four big-endian bytes: the framing
-/// every wires stream protocol (session, state sync, inbox) uses.
+/// every wires stream protocol (session, directory, inbox) uses.
 /// [`Error::BadFrame`] if the body is longer than a `u32` can say.
 pub(crate) fn length_prefixed(body: &[u8]) -> Result<Vec<u8>> {
     let len = u32::try_from(body.len()).map_err(|_| Error::BadFrame)?;

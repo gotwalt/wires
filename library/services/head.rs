@@ -9,12 +9,13 @@
 //! [`SignedEntry`](crate::SignedEntry).)
 //!
 //! - **Signed bytes:** [`POLICY_HEAD_CONTEXT`] followed by the canonical JSON
-//!   of `{alg, head}`. The context separates it from the state, memberships,
-//!   call-log entries and [`Fresh`](crate::Fresh).
-//! - **Format:** [`POLICY_V3`], a signed discriminant (the state was 1, and 2
-//!   after card 35). Unknown fields are refused at decode.
-//! - **Versioning:** as the state's: [`StateVersion`] only goes up, and a node
-//!   adopts a head only if it verifies, is fresh and
+//!   of `{alg, head}`. The context separates it from service entries,
+//!   memberships, call-log entries and [`Fresh`](crate::Fresh).
+//! - **Format:** [`POLICY_V3`], a signed discriminant (formats 1 and 2 were
+//!   the signed state the policy replaced, card 36). Unknown fields are
+//!   refused at decode.
+//! - **Versioning:** [`StateVersion`] only goes up, and a node adopts a head
+//!   only if it verifies, is fresh and
 //!   [is newer](SignedPolicyHead::is_newer_than).
 //! - **`directories`** sits in the head, not in an item: every node needs it,
 //!   including a caller that holds no other item.
@@ -42,13 +43,13 @@ use crate::item::Item;
 
 /// A monotonic policy version: every admin edit bumps it by one, and a node
 /// never replaces its copy with a lower one. (The name is kept from the
-/// signed policy the policy replaced: it is the `state_version` a call's
-/// `Hello` carries.)
+/// signed state the policy replaced: it is the `state_version` a call's
+/// `Hello` and `HelloAck` carry.)
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StateVersion(pub u64);
 
-/// The policy head format: the third signed-state format.
+/// The policy head format: 3 (formats 1 and 2 were the retired signed state).
 pub const POLICY_V3: u8 = 3;
 
 /// Domain-separation prefix of a head's signed bytes.
@@ -270,7 +271,7 @@ mod tests {
         let signed = sample().sign(&root()).unwrap();
         let bytes = signed_bytes(&signed.head, &signed.alg).unwrap();
         assert!(bytes.starts_with(b"wires/policy-head/v1\0{\"alg\":\"ed25519\",\"head\":{"));
-        // The same body under the state's context doesn't verify.
+        // The same body under the freshness context doesn't verify.
         let mut other = crate::fresh::FRESH_CONTEXT.to_vec();
         other.extend_from_slice(&bytes[POLICY_HEAD_CONTEXT.len()..]);
         assert!(root().node_id().verify(&other, &signed.sig).is_err());
