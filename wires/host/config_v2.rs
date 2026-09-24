@@ -196,9 +196,30 @@ impl HostConfigV2 {
         Self::parse(&text).with_context(|| format!("{} is not a valid host.json", path.display()))
     }
 
+    /// Read `host.json` at `path` for an app embedding the host (card 33):
+    /// validated like [`load`](Self::load), except `services` may be empty,
+    /// since the app's native services count too.
+    pub(crate) fn load_embedded(path: &Path) -> Result<Self> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let config = Self::parse_schema(&text)
+            .with_context(|| format!("{} is not a valid host.json", path.display()))?;
+        config
+            .validate_fields()
+            .with_context(|| format!("{} is not a valid host.json", path.display()))?;
+        Ok(config)
+    }
+
     /// Parse and validate v2 text: the schema, then
     /// [`validate`](Self::validate).
     pub(crate) fn parse(text: &str) -> Result<Self> {
+        let config = Self::parse_schema(text)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// The schema alone: the version, then the fields.
+    fn parse_schema(text: &str) -> Result<Self> {
         #[derive(Deserialize)]
         struct Peek {
             version: Option<u32>,
@@ -213,9 +234,7 @@ impl HostConfigV2 {
             Some(v) => bail!("version {v} is not supported (this host reads version 2)"),
             None => bail!("missing `version`"),
         }
-        let config: Self = serde_json::from_str(text)?;
-        config.validate()?;
-        Ok(config)
+        Ok(serde_json::from_str(text)?)
     }
 
     /// The rules the schema can't say, on the file alone:
@@ -227,6 +246,16 @@ impl HostConfigV2 {
     /// - each issuer is listed once, non-empty, with at least one audience;
     /// - `audit.otlp` is an https URL (or http to a loopback collector).
     pub(crate) fn validate(&self) -> Result<()> {
+        if self.services.is_empty() {
+            bail!("nothing is implemented: `services` is empty");
+        }
+        self.validate_fields()
+    }
+
+    /// [`validate`](Self::validate) without "at least one service": what
+    /// an embedding app's config must pass, since its native services count
+    /// too.
+    pub(crate) fn validate_fields(&self) -> Result<()> {
         if self.version != HOST_CONFIG_V2 {
             bail!(
                 "version {} is not supported here (expected {HOST_CONFIG_V2})",
@@ -246,9 +275,6 @@ impl HostConfigV2 {
                 bail!("identity.issuers: {iss} has no audiences");
             }
             issuers.push(iss);
-        }
-        if self.services.is_empty() {
-            bail!("nothing is implemented: `services` is empty");
         }
         for (name, svc) in &self.services {
             if svc.command.is_empty() {

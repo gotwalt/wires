@@ -29,7 +29,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use library::{
     IdToken, Membership, NodeId, Principal, Refusal, RoleName, ServiceName, SignedState,
     StateVersion, authorize, role_admits,
@@ -214,6 +214,15 @@ pub(crate) fn admit(
     })
 }
 
+/// How a host implements one service: a `host.json` command, or an app's
+/// in-process handler (card 33).
+pub(crate) enum Implementation<'a> {
+    /// A CLI child, from `host.json`.
+    Command(&'a crate::host::config_v2::ServiceImpl),
+    /// A native service.
+    Native(Arc<dyn crate::host::native::DynService>),
+}
+
 /// Everything a v2 host (`wires serve` with a `host.json` v2) decides with.
 /// Built once per `serve`, shared by every session and the push service.
 pub(crate) struct ServicesHost {
@@ -228,6 +237,9 @@ pub(crate) struct ServicesHost {
     pub(crate) keystore: Arc<Keystore>,
     /// `host.json` v2.
     pub(crate) config: HostConfigV2,
+    /// The services an app implements in-process (card 33), beside
+    /// `config`'s CLI services. Empty for `wires serve`.
+    pub(crate) native: crate::host::native::NativeServices,
     /// Verifies the ID tokens callers present, and remembers the verified
     /// principals (what push authorization reads).
     pub(crate) identities: Arc<Identities>,
@@ -282,8 +294,9 @@ impl ServicesHost {
     }
 
     /// What `serve` checks before it binds: a fresh signed state that
-    /// assigns every service in `host.json` to this host (the error names
-    /// the first that isn't).
+    /// assigns every service in `host.json`, and every native service, to
+    /// this host (the error names the first that isn't). A name can't be
+    /// both a `host.json` service and a native one.
     pub(crate) fn preflight(&self, now: i64) -> Result<SignedState> {
         let state = self.state()?;
         state.check_fresh(now).with_context(|| {
@@ -293,7 +306,38 @@ impl ServicesHost {
             )
         })?;
         self.config.check_against(&state.state, self.me)?;
+        let version = state.state.version.0;
+        let me8 = &self.me.hex()[..8];
+        for name in self.native.keys() {
+            if self.config.services.contains_key(name) {
+                bail!("service {name} is both in host.json and a native service; pick one");
+            }
+            if state.state.service(name).is_none() {
+                bail!(
+                    "this host implements native service {name}, but the signed state (version \
+                     {version}) has no such service"
+                );
+            }
+            if !state.state.assigns(name, self.me) {
+                bail!(
+                    "this host implements native service {name}, but the signed state (version \
+                     {version}) does not assign it to this host ({me8}); refusing to serve it"
+                );
+            }
+        }
         Ok(state)
+    }
+
+    /// How this host implements `service`, if it does.
+    pub(crate) fn implementation(&self, service: &ServiceName) -> Option<Implementation<'_>> {
+        match self.native.get(service) {
+            Some(native) => Some(Implementation::Native(Arc::clone(native))),
+            None => self
+                .config
+                .services
+                .get(service)
+                .map(Implementation::Command),
+        }
     }
 
     /// Whether `caller`, presenting `membership`, is a member of `state`:

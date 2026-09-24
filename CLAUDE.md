@@ -128,13 +128,18 @@ host exposing CLIs needs an image that also has those CLIs.
 
 - `Cargo.toml` / `Cargo.lock` — the workspace. Members are flat top-level
   packages: `library/` (the `library` crate, `[lib] path = "lib.rs"`) and
-  `wires/` (the `wires` binary, `[[bin]] path = "main.rs"`). No `src/`
-  subdir; the sources are filed by role:
-  - `wires/`: `main.rs` is argument parsing and dispatch only; each role owns
+  `wires/` (the `wires` library, `lib.rs`, and the `wires` binary,
+  `main.rs`, which only calls `wires::run`). No `src/` subdir; the sources
+  are filed by role:
+  - `wires/`: `lib.rs` is argument parsing and dispatch, plus the public
+    embedding API (`Host`, `Service`, `Call`, `CallIo`: card 33, an app
+    serving wires calls in-process); `examples/kv.rs` is a native service;
+    each role owns
     a folder with a `mod.rs` — `admin/` (keystore, `init`/`invite`/`remove`,
     `service`/`role` edits of the signed state, `state push`, `--ttl` /
     `--state-ttl`), `host/` (`serve`,
     `host.json` v2, the gate over the signed state, the session transport,
+    native services and the embedded `Host`,
     verified identities, the call log and OTLP export, the record stream, push,
     its control sockets and the per-call push capability), `caller/` (`join`, `login`, `services`, `call`
     with service → host failover and the local hints file, `mcp`, `inbox`,

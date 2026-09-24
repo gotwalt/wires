@@ -1,10 +1,11 @@
 # 33 — Wires-native services: the host runtime as a library
 
-**Lane:** N · **Depends on:** 28 · **Status:** Phase 0 done; Phase 1 next (2026-09-23)
+**Lane:** N · **Depends on:** 28 · **Status:** Phases 0 and 1 done except push to the caller (2026-09-23)
 · **Files:** `library/membership/identity.rs` (key hygiene), `wires/admin/keystore.rs`
 (seed read/write only), `wires/host/transport.rs` (the bridge), `wires/host/service.rs`
-(new), `wires/host/serve.rs`, protocol.md §9; Phase 1 adds a `[lib]` target to
-`wires/` and an example
+(new), `wires/host/serve.rs`, protocol.md §9; Phase 1: `wires/lib.rs` (was
+`main.rs`), `wires/main.rs`, `wires/host/{native,embed,gate,config_v2}.rs`,
+`wires/examples/kv.rs`, `wires/e2e/native.rs`, protocol.md §5, CLAUDE.md
 
 ## Why (the human, 2026-09-23)
 
@@ -42,7 +43,7 @@ fork/exec per call, the verified caller given as a type rather than
 
 ## Phases
 
-**Key hygiene (done: `db925a7`).** `NodeIdentity`: no `Clone`, `Debug` or
+**Key hygiene (done: `95f9091`).** `NodeIdentity`: no `Clone`, `Debug` or
 `Serialize` (compile-fail doctests); `expose_seed()` / `expose_seed_hex()`
 return `Zeroizing`; `duplicate()` is the explicit second owner; the keystore
 reads and writes seeds through scrubbed buffers.
@@ -58,21 +59,24 @@ disconnect stay in the bridge, so every kind of service gets them.
       through a session: frames, exit code, taps.
 
 **Phase 1: Rust proof of concept.** A `[lib]` target on `wires` exposing
-`Host::builder().home(..).identity(..).service(name, impl Service).build()?.serve()`.
-`Service::call(&self, Call, CallIo) -> i32`. `Call` carries the verified
-caller node, `Principal`, role, state version and `Argv`, plus
-`push_to_caller` (the per-call capability as a method) and a cancellation
-token. `CallIo` is a `tokio::io::duplex` pair per stream. If the caller
+`Host::builder(home).trust_issuer(..).host_json(..).service(name, impl Service).build()?.serve()`
+(or `.serve_until(shutdown)`). `Service::call(&self, Call, CallIo) -> impl
+Future<Output = i32>`. `Call` carries the verified caller node, `Principal`,
+role, state version, service, args and call id. `CallIo` is boxed
+`AsyncRead`/`AsyncWrite` over `tokio::io::duplex` pipes. If the caller
 disconnects, the handler's task is aborted; if the handler panics, the call
 exits -1 and still gets a `Finished` record. Native and `Command` services
 can mix in one host. The same preflight applies: the signed state must
 assign every registered service to this node. The embedding API takes a
 keystore path, never a seed string.
-- [ ] Example: a `kv` daemon keyed by the verified principal (state kept
-      across calls, typed identity, push to the caller).
-- [ ] e2e on the loopback fixtures: works through `wires call` and `wires
-      mcp`; `wires watch` shows the same record shape as a CLI service; a
-      refused caller never reaches the handler; stdin/stdout digests match.
+- [x] Example: `examples/kv.rs`, a key-value daemon keyed by the verified
+      principal (state kept across calls, typed identity).
+- [ ] `Call::push_to_caller`: the per-call push capability as a method.
+- [x] e2e (`wires/e2e/native.rs`, hermetic loopback, the example's own `Kv`):
+      called through the dial `wires call` uses; a refused caller never
+      reaches the handler; the host's signed log holds `Started` / `Finished`
+      / `Denied` with principal, role, argv and stdin digest and head; an
+      unassigned native service refuses to start.
 
 **Phase 2: move it into its own crate, then generate bindings.** Split the
 host runtime into a third crate (`service/`, package `wires-service`) once
@@ -99,3 +103,18 @@ proves good enough when evaluated.
   `an_in_process_service_is_bridged_and_recorded_like_a_child` (frames, exit,
   stdout/stderr/stdin taps) and
   `an_in_process_service_is_stopped_when_the_dialer_vanishes`.
+- 2026-09-23, Phase 1: `wires` is now a library plus a one-line `main.rs`
+  (`wires::run`). The old `main.rs` became `lib.rs` unchanged apart from
+  `fn main` → `pub fn run` and the re-exports, so every `crate::` path still
+  works. `extern crate self as wires` lets `examples/kv.rs` (written against
+  the public API) be included in the e2e tests as is. `serve_cmd` is now a
+  thin `Serving` + `serve_until(serving, shutdown)`, which the embedded `Host`
+  shares, so both start, log and serve the same way; `Binding::Endpoint` is
+  the hermetic-test seam. `host.json` loaded by an embedding app may list no
+  services (`load_embedded` / `validate_fields`). Dropped from the plan: the
+  cancellation token (aborting the task is enough; clean up in `Drop`).
+  Not tested separately: `wires mcp` and the gateway reach a native service
+  through the same dial (`call_service_on`) the tests use; the tests read the
+  host's signed log file directly, not through the `wires watch` stream.
+- Known limit: `transport::bind_with_alpn` still reads the local hints file
+  from `$WIRES_HOME`, not from an embedded host's keystore (protocol.md §5).

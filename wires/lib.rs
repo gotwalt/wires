@@ -1,0 +1,531 @@
+//! `wires` — run a CLI on another machine from your agent.
+//!
+//! The crate is organized by role, one folder each. This file is argument
+//! parsing and dispatch ([`run`], which `main.rs` calls), plus the public
+//! surface an app embeds to serve wires calls in-process (card 33):
+//!
+//! - **admin** ([`admin`]) — holds the root key and signs the state: who is
+//!   in, which roles exist, which services run where and who may call them.
+//! - **host** ([`host`]) — `wires serve`: implements the services the signed
+//!   state assigns to it, checks every caller against that state, and keeps
+//!   its own log of every call.
+//! - **caller** ([`caller`]) — `wires login | services | call | mcp | inbox`:
+//!   runs remote CLIs by service name (`mcp` serves them as MCP over stdio,
+//!   for the MCP clients people already use).
+//! - **gateway** ([`gateway`]) — `wires gateway`: those services as a
+//!   remote MCP server with OAuth, for web clients (Claude.ai), each call
+//!   made with the signed-in user's own ID token.
+//! - **observer** — `wires watch`: streams call records from the hosts' own
+//!   logs, to readers the registry names (card 26b, [`caller::watch_records`]).
+//!
+//! [`state`] is where the signed state lives on every node and how it moves.
+//!
+//! **Embedding** (card 33): an app serves wires calls in-process by
+//! implementing [`Service`] and serving a [`Host`] built from its keystore.
+//! To callers, a native service is a CLI like any other.
+//!
+//! Secrets resolve through flag → env → `--…-file` → on-disk
+//! keystore ([`admin::keystore`]), so once the admin's credentials are
+//! installed, `wires call <service>` and `wires mcp` need no other flags — which
+//! is what lets `wires mcp` drop straight into an MCP client's config as
+//! `"command": "wires"`.
+//!
+//! `call` keeps stdout **byte-pure** (only the remote CLI's bytes): every
+//! diagnostic goes to stderr, and the exit code carries the outcome — the
+//! child's own code on success (a remote `77` is reported as `1`), and
+//! [`EXIT_DENIED`] only when the host refused the call, `1` for any local or
+//! transport failure.
+
+// The crate calls itself `wires` too, so code written against the public API
+// (`examples/kv.rs`, which the e2e tests include) compiles inside it.
+extern crate self as wires;
+
+mod admin;
+mod caller;
+mod gateway;
+mod host;
+mod state;
+
+pub use host::embed::{Host, HostBuilder};
+pub use host::native::{Call, CallIo, Service};
+/// The types a [`Call`] is described in.
+pub use library::{CallId, NodeId, Principal, RoleName, ServiceName, StateVersion};
+
+/// The integration tests — the whole stack over hermetic loopback, in one
+/// place because none of them belongs to a single module's seam.
+///
+/// Declared `#[cfg(test)]` so it is out of the shipped binary entirely.
+#[cfg(test)]
+mod e2e;
+
+/// Fixtures shared by more than one role's unit tests.
+#[cfg(test)]
+mod testutil;
+
+#[cfg(feature = "dev-mock-idp")]
+use std::io::Write as _;
+
+#[cfg(feature = "dev-mock-idp")]
+use clap::Args;
+use clap::{Parser, Subcommand};
+
+/// The top-level help, grouped by role.
+///
+/// Hand-written because clap cannot put subcommands under more than one
+/// heading; `tests::help_lists_every_visible_command` keeps it in step with
+/// [`Command`].
+const HELP_TEMPLATE: &str = "\
+{about-with-newline}
+{usage-heading} {usage}
+
+Admin — signs who's in and what runs where (holds the root key):
+  init      Create the root key, this node, and the first signed state
+  invite    Add a node and print its one join token
+  remove    Drop a node; hosts refuse its next call
+  service   Register services: add / set / rm (name, allowed roles, hosts)
+  role      Define roles from IdP identity: set / rm
+  state     Re-send the signed state to every host (push)
+
+Host — implements the services assigned to it:
+  serve     Run host.json's services; check every caller; log every call
+  push      Send a caller a message by key (to its inbox); logged
+
+Caller — runs remote CLIs by service name (every role joins the same way):
+  id        Print this node's id: what you send the admin
+  join      Install the admin's invite token: membership and signed state
+  login     Sign in with your IdP, binding this node's key to your identity
+  services  List the services you may call, and the role that lets you
+  call      Run a service by name: stdio passes through, its exit code is ours
+  mcp       Serve those services as MCP tools over stdio (Claude Desktop, IDEs)
+  gateway   Serve them as a remote MCP server (HTTP + OAuth) for web users
+  inbox     Read what hosts pushed to you; --wait blocks until something arrives
+
+Reader — reads the hosts' call records:
+  watch     Stream call records from your services' hosts, verified (--mine)
+
+Options:
+{options}";
+
+/// wires: run a CLI on another machine by service name, reached by key, with
+/// every caller checked against an admin-signed list.
+#[derive(Parser)]
+#[command(name = "wires", version, about, help_template = HELP_TEMPLATE)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+/// Every top-level command. The doc comments are each command's own `--help`
+/// summary; the top-level listing is [`HELP_TEMPLATE`].
+#[derive(Subcommand)]
+enum Command {
+    // --- admin ---
+    /// Create the root key and this machine's node key, and
+    /// sign the first state (this node its one member).
+    Init(admin::init::InitArgs),
+    /// Add a node to the signed state and print its join token (stdout); the
+    /// new state is pushed to the hosts.
+    Invite(admin::invite::InviteArgs),
+    /// Remove a node (by `--name` label or id) from the signed state; it is
+    /// pushed to the hosts, and every host that has it refuses the node's
+    /// next call.
+    Remove(admin::invite::RemoveArgs),
+    /// Edit the service registry in the signed state, and push it.
+    Service(admin::service::ServiceArgs),
+    /// Edit the role definitions in the signed state, and push them.
+    Role(admin::service::RoleArgs),
+    /// The signed state itself: `push` re-sends it to every host (after an
+    /// edit that reached none).
+    State(admin::propagate::StateArgs),
+
+    // --- host ---
+    /// Implement the services host.json names (and the signed state assigns
+    /// here): check every caller, exec the service, bridge its stdio, log
+    /// every call.
+    Serve(host::serve::ServeArgs),
+    /// Send a caller a message, addressed by its key (a service's
+    /// `$WIRES_CALLER_NODE`) or a role: through this machine's running
+    /// `wires serve`, to the caller's inbox; logged.
+    Push(host::push::PushArgs),
+
+    // --- caller (and every joiner) ---
+    /// Print this node's id (creating its key on first use): what a joiner
+    /// sends the admin.
+    Id,
+    /// Install an invite token from `wires invite`: membership and the
+    /// signed state. Without a token, print this node's id.
+    Join(caller::join::JoinArgs),
+    /// Sign in with your IdP (OIDC), binding this node's key to your identity;
+    /// the token is stored locally and presented when you call.
+    Login(caller::login::LoginArgs),
+    /// List the services you may call (evaluated locally against the signed
+    /// state), with what each does and the role that admits you.
+    Services(caller::services::ServicesArgs),
+    /// Run a service by name: stdio passes through,
+    /// its exit code becomes ours, a refusal exits 77.
+    Call(caller::call::CallArgs),
+    /// The old name of `wires services`; `add` / `list` / `rm` edit the local
+    /// aliases in `tools.json`.
+    #[command(hide = true)]
+    Tools(caller::tools::ToolsArgs),
+    /// Serve the services you may call (plus aliases) as MCP tools over stdio
+    /// (Claude Desktop, IDEs, any stdio MCP client).
+    Mcp(caller::mcp::McpArgs),
+    /// Print what hosts pushed to you (verified sender first), and mark it
+    /// read; `--wait` blocks until something arrives (exit 124 on
+    /// `--timeout`).
+    Inbox(caller::inbox::InboxArgs),
+
+    /// Serve the services each signed-in user may call as a remote MCP
+    /// server (Streamable HTTP + OAuth 2.1), for web clients like Claude.ai.
+    Gateway(gateway::GatewayArgs),
+
+    // --- reader ---
+    /// Stream call records from the hosts of your services: every record of
+    /// a service you are a reader of, otherwise your own.
+    Watch(caller::watch_records::WatchArgs),
+
+    /// Dev build only: run the hermetic mock OIDC issuer on a loopback port
+    /// until killed. Prints `issuer <url>` and `client_id <id>` on stdout.
+    #[cfg(feature = "dev-mock-idp")]
+    #[command(hide = true)]
+    DevMockIdp(DevMockIdpArgs),
+}
+
+/// `dev-mock-idp` arguments (dev build only).
+#[cfg(feature = "dev-mock-idp")]
+#[derive(Args)]
+struct DevMockIdpArgs {
+    /// The email every sign-in resolves to.
+    #[arg(long)]
+    email: String,
+}
+
+/// `dev-mock-idp`: serve [`caller::mock_idp::MockIdp`] until the process is
+/// killed.
+#[cfg(feature = "dev-mock-idp")]
+async fn dev_mock_idp_cmd(a: DevMockIdpArgs) -> anyhow::Result<()> {
+    let idp = caller::mock_idp::MockIdp::start(&a.email).await;
+    println!("issuer {}", idp.issuer.as_str());
+    println!("client_id {}", idp.client_id);
+    std::io::stdout().flush()?;
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+/// Exit code for an authorization refusal by the responder (sysexits
+/// `EX_NOPERM`), distinct from 1 = local/transport failure. An agent running
+/// `wires call` can tell "you are not allowed" apart from "the network is
+/// down" without parsing text.
+const EXIT_DENIED: i32 = 77;
+
+/// Current unix time in seconds.
+pub(crate) fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Build a multi-threaded tokio runtime for the network subcommands.
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Runtime::new().expect("building tokio runtime")
+}
+
+/// Initialize tracing for the network subcommands, writing to **stderr** so it
+/// never corrupts a command's piped stdout.
+///
+/// The default filter is [`LOG_FILTER`]: wires' own startup / accept /
+/// reject lines print, while iroh's relay and discovery chatter stays out of an
+/// MCP client's server-log pane. `$RUST_LOG` overrides it entirely (e.g.
+/// `RUST_LOG=iroh=debug`).
+fn init_logging() {
+    init_logging_with(LOG_FILTER);
+}
+
+/// [`init_logging`] for the dialing commands (`call`, `services`, `mcp`),
+/// whose stderr belongs to the remote CLI, and the admin's one-shot commands:
+/// [`QUIET_LOG_FILTER`] by default, so a successful run leaves nothing of
+/// wires' own on stderr but its notes.
+fn init_quiet_logging() {
+    init_logging_with(QUIET_LOG_FILTER);
+}
+
+/// The default log filter of the long-running commands.
+const LOG_FILTER: &str = "warn,wires=info";
+
+/// The default log filter of the dialing commands: only warnings from wires
+/// itself, and iroh (plus `iroh_*`, which the target prefix also matches)
+/// entirely off — its endpoint teardown logs `ERROR … relay_recv_channel
+/// closed` at the end of every perfectly normal call.
+const QUIET_LOG_FILTER: &str = "warn,iroh=off";
+
+/// Install the stderr subscriber with `default` unless `$RUST_LOG` is set.
+fn init_logging_with(default: &str) {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default)),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+/// The `wires` command line: parse the arguments, run the command, exit.
+pub fn run() {
+    match Cli::parse().command {
+        Command::Init(a) => {
+            init_quiet_logging();
+            print_or_exit(admin::init::init_cmd(a))
+        }
+        Command::Invite(a) => {
+            init_quiet_logging();
+            match runtime().block_on(admin::invite::invite_cmd(a)) {
+                Ok(report) => print_report(report),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::Remove(a) => {
+            init_quiet_logging();
+            match runtime().block_on(admin::invite::remove_cmd(a)) {
+                Ok(report) => print_report(report),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::Service(a) => {
+            init_quiet_logging();
+            match runtime().block_on(admin::service::service_cmd(a)) {
+                Ok(report) => print_report(report),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::Role(a) => {
+            init_quiet_logging();
+            match runtime().block_on(admin::service::role_cmd(a)) {
+                Ok(report) => print_report(report),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::State(a) => {
+            init_quiet_logging();
+            match runtime().block_on(admin::propagate::state_cmd(a)) {
+                Ok(report) => print_report(report),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::Id => print_or_exit(caller::join::id_cmd()),
+        Command::Join(a) => print_or_exit(caller::join::join_cmd(a)),
+        Command::Serve(a) => {
+            if let Err(e) = runtime().block_on(host::serve::serve_cmd(a)) {
+                eprintln!("wires: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        Command::Push(a) => {
+            init_quiet_logging();
+            match runtime().block_on(host::push::push_cmd(a)) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::Inbox(a) => {
+            init_quiet_logging();
+            runtime().block_on(state::sync::refresh_cold());
+            match runtime().block_on(caller::inbox::inbox_cmd(a)) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::Login(a) => {
+            if let Err(e) = runtime().block_on(caller::login::login_cmd(a)) {
+                exit_with(e);
+            }
+        }
+        Command::Call(a) => {
+            init_quiet_logging();
+            runtime().block_on(state::sync::refresh_cold());
+            match runtime().block_on(caller::call::call_cmd(a)) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::Services(a) => {
+            init_quiet_logging();
+            match runtime().block_on(caller::services::run(&a)) {
+                Ok(out) if out.is_empty() => {}
+                Ok(out) => println!("{out}"),
+                Err(e) => exit_with(e),
+            }
+        }
+        Command::Tools(a) => {
+            init_quiet_logging();
+            runtime().block_on(state::sync::refresh_cold());
+            match runtime().block_on(caller::tools::tools_cmd(a)) {
+                Ok(out) if out.is_empty() => {}
+                Ok(out) => println!("{out}"),
+                Err(e) => {
+                    eprintln!("wires: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Mcp(a) => {
+            init_quiet_logging();
+            runtime().block_on(state::sync::refresh_cold());
+            if let Err(e) = runtime().block_on(caller::mcp::mcp_cmd(a)) {
+                eprintln!("wires: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        Command::Gateway(a) => {
+            init_logging();
+            runtime().block_on(state::sync::refresh_cold());
+            if let Err(e) = runtime().block_on(gateway::gateway_cmd(a)) {
+                exit_with(e);
+            }
+        }
+        // Exit 77 when every host refused the stream.
+        Command::Watch(a) => {
+            init_quiet_logging();
+            match runtime().block_on(caller::watch_records::watch_cmd(a)) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => exit_with(e),
+            }
+        }
+        #[cfg(feature = "dev-mock-idp")]
+        Command::DevMockIdp(a) => {
+            if let Err(e) = runtime().block_on(dev_mock_idp_cmd(a)) {
+                exit_with(e);
+            }
+        }
+    }
+}
+
+/// Print an offline command's result on stdout, or its error and exit 1.
+fn print_or_exit(result: anyhow::Result<String>) {
+    match result {
+        Ok(out) => println!("{out}"),
+        Err(e) => {
+            eprintln!("wires: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Print an admin command's notes on stderr and its result on stdout (the
+/// token, for `invite` — so `$(wires invite …)` is the token alone). A
+/// failure (the new state reached no host) is printed last and exits 1: the
+/// work is done and stored, but not in force.
+fn print_report(report: admin::invite::Report) {
+    for note in &report.notes {
+        eprintln!("wires: {note}");
+    }
+    if !report.stdout.is_empty() {
+        println!("{}", report.stdout);
+    }
+    if let Some(failure) = report.failure {
+        eprintln!("wires: {failure}");
+        std::process::exit(1);
+    }
+}
+
+/// Report a network-command failure and exit.
+///
+/// An authorization refusal is its own outcome: print the responder's own
+/// words and exit [`EXIT_DENIED`], not the generic 1. The downcast walks
+/// anyhow's context chain, so a `Denied` wrapped in "peer X refused this node's
+/// admission" still lands here.
+fn exit_with(e: anyhow::Error) -> ! {
+    if let Some(d) = e.downcast_ref::<host::transport::Denied>() {
+        eprintln!("wires: denied by responder: {}", d.reason());
+        std::process::exit(EXIT_DENIED);
+    }
+    eprintln!("wires: {e:#}");
+    std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+    use clap::error::ErrorKind;
+
+    use super::*;
+
+    /// Every command a user can see is listed, under a role, in the
+    /// hand-written top-level help — and nothing else is.
+    #[test]
+    fn help_lists_every_visible_command() {
+        let cli = Cli::command();
+        let mut visible: Vec<&str> = cli
+            .get_subcommands()
+            .filter(|c| !c.is_hide_set())
+            .map(|c| c.get_name())
+            .collect();
+        let mut listed: Vec<&str> = HELP_TEMPLATE
+            .lines()
+            .filter_map(|l| l.strip_prefix("  "))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        visible.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(
+            visible, listed,
+            "HELP_TEMPLATE is out of step with `Command`"
+        );
+    }
+
+    /// The top-level help names the roles and fits on one screen.
+    #[test]
+    fn help_shows_the_roles_on_one_screen() {
+        let help = Cli::command().render_help().to_string();
+        for role in ["Admin", "Host", "Caller", "Reader"] {
+            assert!(help.contains(&format!("{role} — ")), "{help}");
+        }
+        let lines = help.lines().count();
+        assert!(lines <= 32, "{lines} lines:\n{help}");
+    }
+
+    /// Card 14's onboarding commands parse as documented.
+    #[test]
+    fn onboarding_commands_parse() {
+        let id = "ab".repeat(32);
+        assert!(Cli::try_parse_from(["wires", "init"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "init", "--ttl", "7d"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "init", "--ttl", "soon"]).is_err());
+        assert!(Cli::try_parse_from(["wires", "invite", &id, "--name", "alice"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "invite"]).is_err());
+        assert!(Cli::try_parse_from(["wires", "remove", "alice"]).is_ok());
+        // Card 28: `--ttl` is a membership's lifetime, `--state-ttl` the
+        // signed state's.
+        assert!(
+            Cli::try_parse_from(["wires", "invite", &id, "--ttl", "1h", "--state-ttl", "30d"])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["wires", "init", "--state-ttl", "7d"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "remove", "alice", "--state-ttl", "7d"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "remove", "alice", "--ttl", "7d"]).is_err());
+        assert!(Cli::try_parse_from(["wires", "service", "rm", "db", "--state-ttl", "7d"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "service", "rm", "db", "--ttl", "7d"]).is_err());
+        assert!(Cli::try_parse_from(["wires", "state", "push"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "id"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "join"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "join", "tok"]).is_ok());
+    }
+
+    /// Card 27: the channel and its plumbing are gone.
+    #[test]
+    fn the_channel_commands_are_gone() {
+        for gone in [
+            &["wires", "advanced", "--help"][..],
+            &["wires", "connect", "--target", "00"],
+            &["wires", "tail", "ops"],
+            &["wires", "init", "--channel", "ops"],
+        ] {
+            assert!(
+                Cli::try_parse_from(gone.iter()).is_err_and(|e| e.kind() != ErrorKind::DisplayHelp),
+                "{gone:?} still parses"
+            );
+        }
+    }
+}

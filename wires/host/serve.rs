@@ -18,6 +18,7 @@ use clap::Args;
 use library::NodeId;
 
 use super::config_v2::HostConfigV2;
+use super::native::NativeServices;
 use super::{call_log, capability, control, gate, identity, otlp, push, transport};
 use crate::admin::keystore;
 use crate::caller::jwks;
@@ -68,30 +69,97 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     init_logging();
-    let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
-    let membership = keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?;
-    let home = keystore::home()?;
-    let ks = Arc::new(keystore::Keystore::resolve()?);
-    let mut host = services_host(node.node_id(), membership, Arc::clone(&ks), config)?;
-    // A host assigned a service while it was offline: pull, then try again.
-    let state = match host.preflight(crate::now_unix()) {
-        Ok(state) => state,
-        Err(e) => match crate::state::sync::pull_now(&ks, &node, a.relay_url.as_deref()).await {
-            Ok(Some(_)) => host.preflight(crate::now_unix())?,
-            _ => return Err(e),
+    let serving = Serving {
+        node: keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?,
+        membership: keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?,
+        keystore: Arc::new(keystore::Keystore::resolve()?),
+        config,
+        native: NativeServices::new(),
+        binding: Binding::N0 {
+            relay_url: a.relay_url,
         },
+    };
+    serve_until(serving, async {
+        tokio::signal::ctrl_c().await.context("waiting for ctrl-c")
+    })
+    .await
+}
+
+/// Everything a host runs with, however it was started: `wires serve` (its
+/// flags and `host.json`) or an app embedding the host
+/// ([`Host`](crate::Host)).
+pub(crate) struct Serving {
+    /// This host's node key.
+    pub(crate) node: library::NodeIdentity,
+    /// Its membership, which names the fabric whose signed state decides.
+    pub(crate) membership: library::Membership,
+    /// Its keystore: the signed state, the call log, the push queue.
+    pub(crate) keystore: Arc<keystore::Keystore>,
+    /// How it implements its CLI services, which IdPs it trusts, push, and
+    /// audit export.
+    pub(crate) config: HostConfigV2,
+    /// The services it implements in-process (card 33).
+    pub(crate) native: NativeServices,
+    /// How it gets its endpoint.
+    pub(crate) binding: Binding,
+}
+
+/// How a host gets its iroh endpoint.
+pub(crate) enum Binding {
+    /// Bind one with n0 discovery and relays (or `relay_url`'s relay).
+    N0 {
+        /// A self-hosted relay instead of n0's.
+        relay_url: Option<String>,
+    },
+    /// Serve on an endpoint already bound for this host's key. Tests use
+    /// this for hermetic loopback. A host that has to pull a state before
+    /// it can start fails instead (it has no relay to pull through).
+    #[cfg_attr(not(test), allow(dead_code))]
+    Endpoint(iroh::Endpoint),
+}
+
+/// Serve `serving` until `shutdown` resolves: refuse to start unless the
+/// node holds a fresh signed state that assigns every service to it (pulling
+/// one first if it doesn't), open the call log, then serve the session,
+/// state and record-stream ALPNs (and push, when configured), deciding every
+/// call by the signed state as it stands at that connection.
+pub(crate) async fn serve_until(
+    serving: Serving,
+    shutdown: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    let Serving {
+        node,
+        membership,
+        keystore: ks,
+        config,
+        native,
+        binding,
+    } = serving;
+    let mut host = services_host(node.node_id(), membership, Arc::clone(&ks), config)?;
+    host.native = native;
+    // A host assigned a service while it was offline: pull, then try again.
+    let state = match (host.preflight(crate::now_unix()), &binding) {
+        (Ok(state), _) => state,
+        (Err(e), Binding::N0 { relay_url }) => {
+            match crate::state::sync::pull_now(&ks, &node, relay_url.as_deref()).await {
+                Ok(Some(_)) => host.preflight(crate::now_unix())?,
+                _ => return Err(e),
+            }
+        }
+        (Err(e), Binding::Endpoint(_)) => return Err(e),
     };
     tracing::info!(
         state_version = state.state.version.0,
         services = host.config.services.len(),
-        "signed state assigns every host.json service to this host"
+        native = host.native.len(),
+        "signed state assigns every service to this host"
     );
     let exporter = match host.config.audit.as_ref().and_then(|a| a.otlp.as_deref()) {
         Some(url) => Some(otlp::Exporter::spawn(url)?.0),
         None => None,
     };
     let log = call_log::CallLog::open(
-        &home.join(call_log::LOG_FILE),
+        &ks.path(call_log::LOG_FILE),
         node.duplicate(),
         library::Retention::default(),
     )?;
@@ -101,10 +169,13 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     let push = host.config.push.is_some().then(|| {
         Arc::new(
             push::PushHost::from_state(Arc::clone(&host))
-                .persisted_queue(home.join(push::QUEUE_FILE)),
+                .persisted_queue(ks.path(push::QUEUE_FILE)),
         )
     });
-    let endpoint = transport::bind(&node, a.relay_url.as_deref()).await?;
+    let endpoint = match binding {
+        Binding::N0 { relay_url } => transport::bind(&node, relay_url.as_deref()).await?,
+        Binding::Endpoint(endpoint) => endpoint,
+    };
     if let Err(e) = crate::caller::pick::write_own_hint(&ks, &endpoint) {
         tracing::warn!("could not write this host's hint line: {e:#}");
     }
@@ -114,10 +185,10 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     match push {
         Some(push) => {
             let (commands_tx, commands) = tokio::sync::mpsc::channel(16);
-            let sockets = push_sockets(&home, &host, commands_tx).await?;
+            let sockets = push_sockets(&ks.path(""), &host, commands_tx).await?;
             let ended = tokio::select! {
                 () = push.run(commands) => Ok(()),
-                r = tokio::signal::ctrl_c() => r.context("waiting for ctrl-c"),
+                r = shutdown => r,
             };
             for socket in sockets {
                 socket.abort();
@@ -127,7 +198,7 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
             }
             ended
         }
-        None => tokio::signal::ctrl_c().await.context("waiting for ctrl-c"),
+        None => shutdown.await,
     }
 }
 
@@ -172,6 +243,7 @@ pub(crate) fn services_host(
         membership,
         keystore,
         config,
+        native: Default::default(),
         identities,
         audit: None,
         push_grants,

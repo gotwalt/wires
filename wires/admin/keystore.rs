@@ -47,8 +47,9 @@ impl Keystore {
         Ok(Self { dir: home()? })
     }
 
-    /// A keystore rooted at an explicit directory (used in tests).
-    #[cfg(test)]
+    /// A keystore rooted at an explicit directory (tests, and an app
+    /// embedding a host, which names its keystore rather than reading
+    /// `$WIRES_HOME`).
     pub fn at(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
     }

@@ -13,8 +13,11 @@
 //!   [`ServicesHost`](gate::ServicesHost) a host decides with.
 //! - [`transport`] — the session protocol: bind/dial, the `Hello`, exec and
 //!   the stdio bridge.
-//! - [`service`] — what the bridge runs for one call: a spawned CLI child
-//!   today, anything with stdio and an exit code (card 33).
+//! - [`service`] — what the bridge runs for one call: anything with stdio
+//!   and an exit code.
+//! - [`native`] — services an app implements in-process (card 33): the
+//!   public [`Service`](native::Service) trait and what a handler gets.
+//! - [`embed`] — the public [`Host`](embed::Host) an app builds and serves.
 //! - [`identity`] — the ID tokens callers presented, verified and indexed.
 //! - [`audit`] — the call records the host keeps.
 //! - [`call_log`] — the host's own signed, hash-linked log of those records,
@@ -31,8 +34,10 @@ pub mod call_log;
 pub mod capability;
 pub mod config_v2;
 pub mod control;
+pub mod embed;
 pub mod gate;
 pub mod identity;
+pub mod native;
 pub mod otlp;
 pub mod push;
 pub mod record_stream;

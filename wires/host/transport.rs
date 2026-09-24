@@ -42,6 +42,7 @@ use library::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 
+use crate::host::gate::Implementation;
 use crate::host::service::Running;
 use tokio::sync::mpsc;
 
@@ -761,7 +762,7 @@ where
         }
     };
     // Only an admitted caller learns whether this host implements it.
-    let Some(svc) = host.config.services.get(&service) else {
+    let Some(implementation) = host.implementation(&service) else {
         let reason = format!("service {service} is not implemented on this host");
         let who = principal.clone();
         return Err(refuse_member(&mut send, audit, caller, who, Some(tool), reason).await);
@@ -822,6 +823,25 @@ where
         return Err(e);
     }
 
+    let svc = match implementation {
+        Implementation::Command(svc) => svc,
+        // An app's in-process handler (card 33): the same gate, log, ack
+        // and bridge as a child, with the verified caller as a type rather
+        // than `WIRES_*` variables.
+        Implementation::Native(native) => {
+            let call = crate::host::native::Call {
+                caller,
+                principal: principal.clone(),
+                role: admitted.role.clone(),
+                state_version: version,
+                service: service.clone(),
+                args: invocation.argv.clone(),
+                id: call_audit.as_ref().map(|a| a.call()),
+            };
+            let running = crate::host::native::start(native, call);
+            return bridge(send, recv, running, shutdown, call_audit).await;
+        }
+    };
     let Some((program, args)) = svc.argv(invocation.argv.as_slice()) else {
         // Nothing can run: close the logged call.
         if let Some(call_audit) = call_audit {

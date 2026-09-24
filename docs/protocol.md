@@ -202,8 +202,8 @@ failure below is sent as `Denied` (`wires/host/gate.rs`):
    for it admits the caller too (it can only narrow; the refusal doesn't name those host-local roles).
    A refusal that a verified identity could change leads with why there is none (`no ID token
    presented; run \`wires login\``).
-5. **Implementation.** Only an admitted caller learns whether `host.json` implements the service
-   (`service … is not implemented on this host`).
+5. **Implementation.** Only an admitted caller learns whether this host implements the service,
+   in `host.json` or natively (`service … is not implemented on this host`).
 
 Every refusal from step 3 on (the caller is a member) is logged as an `AuditRecord::Denied`.
 
@@ -232,6 +232,21 @@ the child socket (§7, a 0700 directory) until the operator opens that directory
 keystore a child could tamper with: it keeps the highest state version it has decided under in
 memory and refuses to decide under an older `state.json` (`responder configuration error`, logged
 as a rollback), and it trusts only issuer keys it fetched itself (§6).
+
+**Native services** (card 33: `wires/host/native.rs`, `wires/host/embed.rs`). An app can embed
+the host (`wires::Host::builder(<keystore dir>)`, `.service(name, impl wires::Service)`, `.serve()`)
+and implement services in-process. The wire, the gate, the log and the bridge are the ones above:
+a native service is invoked by `Invoke`, reads the caller's stdin, writes stdout and stderr, and
+its exit code is the call's. Callers can't tell it from a CLI. The handler runs as a tokio task
+only after `Started` is fsynced and `HelloAck` is sent. It gets the verified caller as a type
+(`Call`: node, principal, role, state version, service, argv, call id) in place of the `WIRES_*`
+variables, and no push capability yet. If the connection closes, the host aborts the task; if the
+handler panics, the call exits -1. Its stdio is recorded like a child's (§8). An embedded host
+starts like `serve`: the signed state must assign every service to it, CLI and native, and a name
+can't be both. Its keystore is the directory the app names (it reads neither `$WIRES_HOME` nor
+`$WIRES_NODE_SEED`), except that the local hints file is still read from `$WIRES_HOME`. The node
+key lives in the app's memory (§9): a native service is the operator's own code, as trusted as
+`serve`, so nothing isolates it from the key the way a child is kept away from it.
 
 **The caller** (`wires call`, `wires mcp`) refuses to dial from an expired state (exit 1: ask the
 admin for `wires state push` or a fresh invite). It takes the service's hosts from its state, the
