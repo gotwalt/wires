@@ -1,21 +1,24 @@
 //! The services-era call gate (card 27, lane **27c**): what a host checks on
 //! every [`Hello`](library::Hello) + [`Invoke`](library::Frame::Invoke),
-//! in order, the first failure being the refusal the caller hears and the
-//! call log records:
+//! in order, the first failure being the refusal the caller hears:
 //!
-//! 1. the host's signed state is fresh ([`SignedState::check_fresh`]);
-//! 2. the caller is a member of it (removal is omission; no restart needed,
-//!    because the state is re-read per connection);
+//! 1. the caller is a member of the host's signed state (removal is
+//!    omission; no restart needed, because the state is re-read per
+//!    connection). Anyone else hears only [`NOT_ADMITTED`], and — checked
+//!    first by [`ServicesHost::check_member`], before its ID token is even
+//!    looked at — is traced, not written to the call log;
+//! 2. the state is fresh ([`SignedState::check_fresh`]);
 //! 3. the service is registered, and assigned to **this** host
 //!    ([`State::assigns`](library::State::assigns));
 //! 4. the registry allows the caller's role ([`library::authorize`]);
 //! 5. the host's own `also_require` roles (`host.json` v2), which can only
 //!    narrow: the caller must be in **every** one of them.
 //!
-//! The caller's principal is verified before [`admit`] runs (the ID token
-//! from the `Hello`, nonce-bound to the iroh-authenticated caller, under the
-//! host's `identity.issuers`: [`ServicesHost::principal`]), so [`admit`] is
-//! pure and clock-free except for `now`.
+//! A member's refusal is also written to the call log. The caller's
+//! principal is verified after the membership check and before [`admit`]
+//! runs (the ID token from the `Hello`, nonce-bound to the iroh-authenticated
+//! caller, under the host's `identity.issuers`: [`ServicesHost::principal`]),
+//! so [`admit`] is pure and clock-free except for `now`.
 //!
 //! [`ServicesHost`] is everything a v2 host decides with: its own
 //! credentials, where its signed state lives (re-read per connection), its
@@ -37,6 +40,22 @@ use crate::caller::jwks::VerifyError;
 use crate::host::config_v2::HostConfigV2;
 use crate::host::identity::{Identities, principal_name};
 use crate::host::transport::AuditSink;
+
+/// The one refusal a peer that is not a member of this host's signed state
+/// hears, whatever the reason (no credential, someone else's, expired,
+/// removed, never invited). It says nothing about the state, its version or
+/// who is in it; the exact reason goes only to the host's trace.
+pub(crate) const NOT_ADMITTED: &str = "not admitted to this fabric";
+
+/// What a member hears when the ID token it presented did not verify
+/// (untrusted issuer, bad signature, wrong audience or nonce). The exact
+/// reason goes only to the host's trace.
+pub(crate) const TOKEN_UNVERIFIED: &str = "your ID token could not be verified; run `wires login`";
+
+/// What a member hears when this host could not fetch its issuer's keys.
+/// The exact failure goes only to the host's trace.
+pub(crate) const IDP_UNREACHABLE: &str =
+    "the identity provider is unreachable from this host; try again later";
 
 /// A call the gate admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,12 +125,6 @@ impl GateRefusal {
 
 impl fmt::Display for GateRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let roles = |rs: &[RoleName]| {
-            rs.iter()
-                .map(RoleName::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
         match self {
             GateRefusal::Stale { version, why } => write!(
                 f,
@@ -121,32 +134,31 @@ impl fmt::Display for GateRefusal {
             ),
             GateRefusal::Registry {
                 refusal: Refusal::NotAMember,
-                version,
-            } => write!(f, "{} (version {})", Refusal::NotAMember, version.0),
+                ..
+            } => f.write_str(NOT_ADMITTED),
             GateRefusal::Registry { refusal, .. } => write!(f, "{refusal}"),
             GateRefusal::NotAssigned { service, version } => write!(
                 f,
                 "service {service} is not assigned to this host (signed state version {})",
                 version.0
             ),
+            // The roles are this host's own (`host.json`); they stay in its
+            // trace, not in what the caller hears.
             GateRefusal::AlsoRequire {
                 service,
-                roles: rs,
                 principal: Some(who),
+                ..
             } => write!(
                 f,
-                "{who} is not in every role this host also requires for {service} ({})",
-                roles(rs)
+                "{who} is not admitted to {service} by this host's own rules"
             ),
             GateRefusal::AlsoRequire {
                 service,
-                roles: rs,
                 principal: None,
+                ..
             } => write!(
                 f,
-                "{service} on this host also needs a verified identity in role {}; run `wires \
-                 login`",
-                roles(rs)
+                "{service} on this host also needs a verified identity; run `wires login`"
             ),
         }
     }
@@ -163,15 +175,17 @@ pub(crate) fn admit(
     now: i64,
 ) -> Result<Admitted, GateRefusal> {
     let version = state.state.version;
+    let s = &state.state;
+    let registry = |refusal| GateRefusal::Registry { refusal, version };
+    // Membership before anything a non-member could learn from (the state's
+    // freshness and version).
+    if !s.is_member(caller) {
+        return Err(registry(Refusal::NotAMember));
+    }
     state.check_fresh(now).map_err(|e| GateRefusal::Stale {
         version,
         why: e.to_string(),
     })?;
-    let s = &state.state;
-    let registry = |refusal| GateRefusal::Registry { refusal, version };
-    if !s.is_member(caller) {
-        return Err(registry(Refusal::NotAMember));
-    }
     if s.service(service).is_none() {
         return Err(registry(Refusal::UnknownService(service.clone())));
     }
@@ -252,8 +266,35 @@ impl ServicesHost {
         Ok(state)
     }
 
+    /// Whether `caller`, presenting `membership`, is a member of `state`:
+    /// the credential is the fabric root's for this very key and current at
+    /// `now`, and the state lists the key. Checked before anything that
+    /// costs this host (a token verification, a JWKS fetch, a call-log
+    /// entry). `Err` is the exact reason, for this host's trace only; the
+    /// peer hears [`NOT_ADMITTED`].
+    pub(crate) fn check_member(
+        &self,
+        state: &SignedState,
+        membership: &Membership,
+        caller: NodeId,
+        now: i64,
+    ) -> std::result::Result<(), String> {
+        library::check_inclusion(membership, self.trust_root, caller, now)
+            .map_err(|e| format!("membership rejected: {e}"))?;
+        if !state.state.is_member(caller) {
+            return Err(format!(
+                "not a member of the signed state (version {})",
+                state.state.version.0
+            ));
+        }
+        Ok(())
+    }
+
     /// Verify the ID token `caller` presented (if any): its principal, or
-    /// `None` and why there is none (with the `wires login` remedy).
+    /// `None` and why there is none (with the `wires login` remedy). Only
+    /// for a caller [`check_member`](Self::check_member) passed. Why a token
+    /// failed is traced (by [`Identities`]); the caller hears
+    /// [`TOKEN_UNVERIFIED`] or [`IDP_UNREACHABLE`].
     pub(crate) async fn principal(
         &self,
         caller: NodeId,
@@ -275,12 +316,8 @@ impl ServicesHost {
                     principal_name(&p)
                 )),
             ),
-            Err(e) => (
-                None,
-                Some(format!(
-                    "the ID token did not verify ({e}); run `wires login`"
-                )),
-            ),
+            Err(VerifyError::Unavailable(_)) => (None, Some(IDP_UNREACHABLE.to_string())),
+            Err(_) => (None, Some(TOKEN_UNVERIFIED.to_string())),
         }
     }
 
@@ -304,6 +341,16 @@ impl ServicesHost {
             service,
             now,
         )
+        .inspect_err(|r| {
+            if let GateRefusal::AlsoRequire { roles, .. } = r {
+                tracing::info!(
+                    caller = %caller.hex(),
+                    service = %service,
+                    also_require = ?roles.iter().map(RoleName::as_str).collect::<Vec<_>>(),
+                    "refused by this host's also_require"
+                );
+            }
+        })
         .map_err(|r| match missing {
             Some(why) if r.needs_identity() => {
                 // Both say "run `wires login`"; say it once.
@@ -511,11 +558,12 @@ mod tests {
             admit(&s, &cfg, node(3), node(2), None, &status, 101),
             Err(GateRefusal::Stale { .. })
         ));
-        let e = admit(&s, &cfg, node(3), node(9), None, &status, 0).unwrap_err();
-        assert_eq!(
-            e.to_string(),
-            "not a member of the current signed state (version 5)"
-        );
+        // A non-member hears the fixed sentence, even under an expired
+        // state: membership is checked before freshness.
+        for now in [0, 101] {
+            let e = admit(&s, &cfg, node(3), node(9), None, &status, now).unwrap_err();
+            assert_eq!(e.to_string(), NOT_ADMITTED);
+        }
         assert!(matches!(
             admit(&s, &cfg, node(2), node(2), None, &status, 0),
             Err(GateRefusal::NotAssigned { .. })
@@ -555,7 +603,12 @@ mod tests {
         let s2 = state.sign(&NodeIdentity::from_seed([1u8; 32])).unwrap();
         let e = admit(&s2, &cfg, node(3), node(2), Some(&alice), &db, 0).unwrap_err();
         assert!(matches!(e, GateRefusal::AlsoRequire { .. }));
-        assert!(e.to_string().contains("also requires"), "{e}");
+        // The host's own role names stay out of what the caller hears.
+        assert_eq!(
+            e.to_string(),
+            "alice@x.com is not admitted to orders-db by this host's own rules"
+        );
+        assert!(!e.to_string().contains("sre"), "{e}");
     }
 
     #[test]

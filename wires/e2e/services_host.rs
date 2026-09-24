@@ -426,10 +426,7 @@ async fn the_registry_decides_who_runs_what() {
         &[],
     )
     .await;
-    assert_eq!(
-        out.denied(),
-        "not a member of the current signed state (version 1)"
-    );
+    assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
 }
 
 #[tokio::test]
@@ -462,7 +459,7 @@ async fn also_require_only_tightens() {
     .await;
     assert_eq!(
         out.denied(),
-        "alice@example.com is not in every role this host also requires for orders-db (sre)"
+        "alice@example.com is not admitted to orders-db by this host's own rules"
     );
     // bob is in neither: the registry refuses first (the host can't widen).
     let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "orders-db", &[]).await;
@@ -530,10 +527,7 @@ async fn a_removed_member_is_refused_on_the_next_call() {
         &["2"],
     )
     .await;
-    assert_eq!(
-        out.denied(),
-        "not a member of the current signed state (version 2)"
-    );
+    assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
     // bob, still holding version 1, is served and handed version 2.
     let out = call(&w.bob, &host, w.hello(&w.bob, 1, false), "status", &[]).await;
     let Outcome::Ran { ack, .. } = &out else {
@@ -550,7 +544,7 @@ async fn a_removed_member_is_refused_on_the_next_call() {
         &[],
     )
     .await;
-    assert!(out.denied().starts_with("not a member"));
+    assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
 }
 
 #[tokio::test]
@@ -599,10 +593,7 @@ async fn push_follows_the_signed_state() {
     let Fetched::Refused(why) = fetch(&w, &w.alice, &host, None).await else {
         panic!("a removed member may not fetch");
     };
-    assert!(
-        why.contains("is not a member of the current signed state (version 2)"),
-        "{why}"
-    );
+    assert!(why.contains(crate::host::gate::NOT_ADMITTED), "{why}");
 }
 
 /// `wires inbox`'s fetch from `host`, as `who`, presenting `id_token`.

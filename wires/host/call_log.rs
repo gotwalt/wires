@@ -5,7 +5,11 @@
 //!
 //! `$WIRES_HOME/call-log.jsonl` holds one entry per line, oldest first.
 //! Appending writes the line and `fsync`s (`sync_data`) before the entry
-//! counts as logged. Chosen over redb because:
+//! counts as logged: only then is the session waiting on it told so, and
+//! only then may a call's child be spawned (see
+//! [`audit`](crate::host::audit)). A failed append is cut back off the file
+//! (to the last logged entry) before the next append, so a half-written line
+//! never ends up in the middle of the chain. Chosen over redb because:
 //!
 //! - the data *is* an append-only sequence read front to back (a subscriber
 //!   asks for "everything after seq N"), which a file does natively;
@@ -30,10 +34,12 @@
 //! # Where records come from
 //!
 //! [`start`] hands `serve` the [`AuditSink`] every session and push writes
-//! to, and runs a [`tee`] that appends each record to this log (always),
-//! offers the signed entry to the OTLP [`Exporter`] (when `host.json` has
-//! `audit.otlp`), and optionally passes the record on to one more receiver
-//! (`serve` passes none).
+//! to, and runs a [`tee`] that appends each record to this log, answers the
+//! waiting session, offers the signed entry to the OTLP [`Exporter`] (when
+//! `host.json` has `audit.otlp`), and optionally passes the record on to one
+//! more receiver (`serve` passes none). Only the append is waited on; the
+//! exporter and the extra receiver are offered what was logged and never
+//! stall it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
@@ -46,7 +52,7 @@ use tokio::task::JoinHandle;
 
 use crate::host::audit::{AUDIT_QUEUE, now_ms};
 use crate::host::otlp::Exporter;
-use crate::host::transport::AuditSink;
+use crate::host::transport::{AuditSink, Pending};
 
 /// The log's file name under the wires home.
 pub const LOG_FILE: &str = "call-log.jsonl";
@@ -65,6 +71,11 @@ pub struct CallLog {
     tip: Option<ChainPoint>,
     /// `at_ms` of the oldest entry held, if any.
     oldest_ms: Option<i64>,
+    /// The file's length up to the end of the last logged entry.
+    logged_len: u64,
+    /// An append failed, so the file may hold part of a line past
+    /// `logged_len`: cut it off before appending again.
+    needs_repair: bool,
 }
 
 impl std::fmt::Debug for CallLog {
@@ -98,6 +109,7 @@ impl CallLog {
             .append(true)
             .open(path)
             .with_context(|| format!("opening {}", path.display()))?;
+        let logged_len = file.metadata()?.len();
         let mut log = Self {
             path: path.to_path_buf(),
             file,
@@ -105,6 +117,8 @@ impl CallLog {
             retention,
             tip,
             oldest_ms: entries.first().map(|e| e.at_ms),
+            logged_len,
+            needs_repair: false,
         };
         log.prune(now_ms())?;
         Ok(log)
@@ -127,7 +141,14 @@ impl CallLog {
 
     /// [`append`](Self::append) with an explicit log time (tests, and
     /// retention runs against the same clock).
+    ///
+    /// `Ok` only once the line is written and `fsync`ed. On `Err` nothing
+    /// was logged: the tip is unchanged, and whatever part of the line
+    /// reached the file is cut off before the next append.
     pub fn append_at(&mut self, at_ms: i64, record: AuditRecord) -> Result<LogEntry> {
+        if self.needs_repair {
+            self.repair()?;
+        }
         if self
             .oldest_ms
             .is_some_and(|t| !self.retention.keeps(at_ms, t))
@@ -137,13 +158,41 @@ impl CallLog {
         let entry = LogEntry::next(&self.host, self.tip, at_ms, record)?;
         let mut line = serde_json::to_vec(&entry)?;
         line.push(b'\n');
-        self.file
+        if let Err(e) = self
+            .file
             .write_all(&line)
             .and_then(|()| self.file.sync_data())
-            .with_context(|| format!("appending to {}", self.path.display()))?;
+        {
+            self.needs_repair = true;
+            return Err(e).with_context(|| format!("appending to {}", self.path.display()));
+        }
+        self.logged_len += line.len() as u64;
         self.tip = Some(entry.point()?);
         self.oldest_ms.get_or_insert(at_ms);
         Ok(entry)
+    }
+
+    /// After a failed append: reopen the file and cut it back to the last
+    /// logged entry, so the next line follows it directly.
+    fn repair(&mut self) -> Result<()> {
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("reopening {}", self.path.display()))?;
+        file.set_len(self.logged_len)
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("cutting a failed append off {}", self.path.display()))?;
+        self.file = file;
+        self.needs_repair = false;
+        tracing::warn!(path = %self.path.display(), "call log: writable again");
+        Ok(())
+    }
+
+    /// Make the next append fail, as a full or failing disk would (tests):
+    /// the file handle is swapped for a read-only one.
+    #[cfg(test)]
+    pub(crate) fn break_for_test(&mut self) {
+        self.file = File::open(&self.path).expect("reopen read-only");
     }
 
     /// Drop the entries `retention` no longer keeps at `now_ms` from the
@@ -186,6 +235,7 @@ impl CallLog {
             let _ = d.sync_all();
         }
         self.file = OpenOptions::new().append(true).open(&self.path)?;
+        self.logged_len = self.file.metadata()?.len();
         self.oldest_ms = entries.get(cut).map(|e| e.at_ms);
         tracing::info!(dropped = cut, "call log: pruned entries past retention");
         Ok(cut)
@@ -237,7 +287,7 @@ fn read_repairing(path: &Path) -> Result<Vec<LogEntry>> {
 
 /// Build the host's audit path: a sink for sessions and pushes, a [`tee`]
 /// running on a blocking thread, and — when `channel` is set — a receiver
-/// that gets every record too.
+/// that gets every logged record too.
 pub fn start(
     log: CallLog,
     exporter: Option<Exporter>,
@@ -252,7 +302,7 @@ pub fn start(
         next = log.tip().map_or(0, |t| t.seq.0 + 1),
         "call log open"
     );
-    let (sink, records) = AuditSink::channel(AUDIT_QUEUE);
+    let (sink, records) = AuditSink::log_queue(AUDIT_QUEUE);
     let (to_channel, from_tee) = if channel {
         let (tx, rx) = mpsc::channel(AUDIT_QUEUE);
         (Some(tx), Some(rx))
@@ -263,37 +313,45 @@ pub fn start(
     (sink, from_tee, tee)
 }
 
-/// Drain `records`: append each to `log`, offer the signed entry to
-/// `exporter`, and pass the record on to `channel`. Returns when `records`
-/// closes.
+/// Drain `records`: append each to `log`, tell its sender whether it was
+/// logged, then offer the signed entry to `exporter` and pass the record on
+/// to `channel`. Returns when every sink is gone.
 ///
-/// Blocking (it `fsync`s): run it on a blocking thread. Never waits on the
-/// exporter or the channel — both are offered with `try_send` and a full
-/// queue drops with a warning — so a slow collector or a stuck channel can't
-/// stall the log. A failed append is logged and the record still flows on.
+/// Blocking (it `fsync`s): run it on a blocking thread. The sender is
+/// answered only after the `fsync`; a failed append is answered with the
+/// error (the sender decides what that means — see
+/// [`audit`](crate::host::audit)) and is not exported or forwarded. Never
+/// waits on the exporter or the channel — both are offered with `try_send`
+/// and a full queue skips with a warning; the entry is in the log either
+/// way.
 pub fn tee(
-    mut records: mpsc::Receiver<AuditRecord>,
+    mut records: mpsc::Receiver<Pending>,
     mut log: CallLog,
     exporter: Option<Exporter>,
     mut channel: Option<mpsc::Sender<AuditRecord>>,
 ) {
-    while let Some(record) = records.blocking_recv() {
-        match log.append(record.clone()) {
-            Ok(entry) => {
-                if let Some(x) = &exporter {
-                    x.export(entry);
-                }
+    while let Some(pending) = records.blocking_recv() {
+        let record = pending.record.clone();
+        let entry = match log.append(pending.record.clone()) {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::error!("call log: append failed: {e:#}");
+                pending.answer(Err(format!("{e:#}")));
+                continue;
             }
-            Err(e) => tracing::warn!("call log: record not logged: {e:#}"),
+        };
+        pending.answer(Ok(()));
+        if let Some(x) = &exporter {
+            x.export(entry);
         }
         if let Some(tx) = &channel {
             match tx.try_send(record) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!("audit record not published: the channel queue is full")
+                    tracing::warn!("audit record not forwarded: the channel queue is full")
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    tracing::warn!("the channel publisher is gone; records stay in the call log");
+                    tracing::warn!("the record receiver is gone; records stay in the call log");
                     channel = None;
                 }
             }
@@ -459,7 +517,7 @@ mod tests {
         let (sink, channel, tee) = start(open(&path), Some(exporter), true);
         let mut channel = channel.unwrap();
         for n in 0..3 {
-            sink.record(denied(n));
+            sink.append(denied(n)).await.unwrap();
         }
         drop(sink);
         tee.await.unwrap();
@@ -483,10 +541,57 @@ mod tests {
         let path = dir.join(LOG_FILE);
         let (sink, channel, tee) = start(open(&path), None, false);
         assert!(channel.is_none());
-        sink.record(denied(1));
+        sink.append(denied(1)).await.unwrap();
         drop(sink);
         tee.await.unwrap();
         assert_eq!(read(&path).unwrap().len(), 1);
+    }
+
+    /// An append that can't reach the disk logs nothing: the tip stays,
+    /// and the next append (the disk writable again) continues the chain
+    /// with nothing torn in between.
+    #[test]
+    fn a_failed_append_logs_nothing_and_the_log_recovers() {
+        let dir = crate::testutil::temp_dir();
+        let path = dir.join(LOG_FILE);
+        let mut log = open(&path);
+        log.append_at(now_ms(), denied(0)).unwrap();
+        let tip = log.tip();
+        log.break_for_test();
+        assert!(log.append_at(now_ms(), denied(1)).is_err());
+        assert_eq!(log.tip(), tip);
+        assert_eq!(read(&path).unwrap().len(), 1);
+        let next = log.append_at(now_ms(), denied(2)).unwrap();
+        assert_eq!(next.seq, LogSeq(1));
+        assert_eq!(verify(&path).unwrap(), log.tip());
+        drop(log);
+        assert_eq!(open(&path).tip(), next.point().ok());
+    }
+
+    /// Through the tee: a record the log can't take is answered with the
+    /// error (so a call's `Started` refuses the call), and is neither
+    /// exported nor forwarded.
+    #[tokio::test]
+    async fn the_tee_answers_a_failed_append_with_the_error() {
+        let dir = crate::testutil::temp_dir();
+        let path = dir.join(LOG_FILE);
+        let mut log = open(&path);
+        log.break_for_test();
+        let (exporter, mut exported) = Exporter::channel(16);
+        let (sink, channel, tee) = start(log, Some(exporter), true);
+        let mut channel = channel.unwrap();
+        let e = sink.append(denied(1)).await.unwrap_err();
+        assert!(e.to_string().contains("appending to"), "{e}");
+        // Writable again: the next record is logged, exported and forwarded.
+        sink.append(denied(2)).await.unwrap();
+        drop(sink);
+        tee.await.unwrap();
+        assert_eq!(channel.recv().await, Some(denied(2)));
+        assert_eq!(channel.recv().await, None);
+        let logged = read(&path).unwrap();
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].record, denied(2));
+        assert_eq!(exported.recv().await.as_ref(), Some(&logged[0]));
     }
 
     proptest! {
