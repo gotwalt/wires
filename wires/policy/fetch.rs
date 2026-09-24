@@ -226,8 +226,8 @@ fn stored(ks: &Keystore) -> Result<Held> {
 /// - `current`, with a `Fresh` for the held head from a directory that head
 ///   lists, current at `now`: this node is up to date (`Ok(None)`).
 ///
-/// Only those two mark the copy checked; a refusal, a lapsed or foreign
-/// `Fresh`, or an older policy does not (so the next check asks again).
+/// A refusal, a lapsed or foreign `Fresh`, or an older policy settles
+/// nothing: the next directory is asked.
 pub(crate) async fn fetch(
     endpoint: &Endpoint,
     ks: &Keystore,
@@ -252,7 +252,6 @@ pub(crate) async fn fetch(
                 }
                 match store::adopt_if_newer(ks, &policy, root, now_unix()) {
                     Ok(true) => {
-                        store::mark_checked(ks, now_unix())?;
                         return Ok(Some(policy));
                     }
                     Ok(false) => {}
@@ -282,7 +281,6 @@ pub(crate) async fn fetch(
                 };
                 match store::adopt_if_newer(ks, &next, root, now_unix()) {
                     Ok(true) => {
-                        store::mark_checked(ks, now_unix())?;
                         return Ok(Some(next));
                     }
                     Ok(false) => {}
@@ -295,7 +293,6 @@ pub(crate) async fn fetch(
                 let Some(held) = held else { continue };
                 match fresh.verify(&held.signed.head) {
                     Ok(()) if fresh.is_current(now_unix()) => {
-                        store::mark_checked(ks, now_unix())?;
                         return Ok(None);
                     }
                     Ok(()) => tracing::debug!(directory = %dir.hex(), "a lapsed freshness"),

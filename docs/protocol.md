@@ -398,8 +398,8 @@ itself, for `policy {have}`, and stops at the first answer that settles it:
 - `current {fresh}` counts only when the `Fresh` verifies against the **held** head and is current
   (`at` at most 60 s ahead, `now <= until`): this node is up to date.
 
-Only those two mark the copy checked (`policy-checked.txt`). A refusal, a `Fresh` from a key the
-head doesn't list, a lapsed one, or an older policy doesn't. So a lying directory can only fail to
+Only those two settle it. A refusal, a `Fresh` from a key the head doesn't list, a lapsed one, or
+an older policy doesn't, and the next directory is asked. So a lying directory can only fail to
 help.
 
 A `serve` whose preflight fails (a host assigned a service while it was offline) fetches from a
@@ -731,7 +731,6 @@ Nothing is broadcast: a record's content leaves a host only when a reader asks f
 | `issued.json` | 0600 | admin | the ledger of badges it minted: node → label (for `remove` and `service --host`), latest `not_after` (how long a ban must last); never sent |
 | `membership.json` | 0644 | every node | its badge (membership token) |
 | `policy.json` (+ `.lock`) | 0600 | admin, host, directory | the newest verified signed policy (§3); **a caller holds none** |
-| `policy-checked.txt` | 0600 | host, directory | when a directory last vouched for the copy (§4), or the invite brought it; written, not read |
 | `view.json` | 0600 | caller (any node that calls) | its view: the head, the root-signed entries it may call or read, the newest `Fresh`, when a directory last vouched, the newest head a host reported (§4 *Views*) |
 | `directories.json` | 0600 | every joined node | the invite's directory ids: where to ask before a head names them |
 | `login.json` | 0600 | every joined node | the invite's login settings: issuer, client id, public client secret (`wires login`'s defaults) |
