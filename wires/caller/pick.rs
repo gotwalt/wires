@@ -92,6 +92,12 @@ impl LastGood {
         self.0.get(service).copied()
     }
 
+    /// Every host remembered here (the hosts this node has called), in
+    /// service order.
+    pub(crate) fn hosts(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.0.values().copied()
+    }
+
     /// Remember that `host` answered `service`, and save (best effort).
     pub(crate) fn record(path: &Path, service: &ServiceName, host: NodeId) {
         let mut me = Self::load(path);

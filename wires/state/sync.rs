@@ -1,28 +1,35 @@
 //! Moving the signed state by key over [`STATE_ALPN`](library::STATE_ALPN).
 //! The frames are [`library::StateFrame`].
 //!
-//! - [`push_all`]: after `invite` / `remove` / `service` / `role`, the admin
-//!   offers the new state to every member, **hosts first** (they enforce it),
-//!   then everyone else. A member it can't reach is reported, not queued:
-//!   it catches up by [`pull`] (below), or from a host's `HelloAck`.
+//! - [`push_all`]: after `invite` / `remove` / `service` / `role` (and
+//!   `wires state push`), the admin offers the new state to every **host**
+//!   (they enforce it, and they are the members that listen: only `serve`
+//!   runs the responder), plus any node that hosted under the state before
+//!   the edit. A host it can't reach is reported, not queued; the admin
+//!   command fails when it reached none ([`PushReport::reached_no_host`]).
 //! - [`pull`]: a cold command whose copy was last checked more than
-//!   [`STALE_AFTER_SECS`] ago asks the admin or any host for a newer one
-//!   ([`refresh_cold`]); a running `wires serve` does the same on a timer
-//!   ([`refresh_loop`]).
+//!   [`STALE_AFTER_SECS`] ago asks the hosts (the ones this node called
+//!   before first) and then the admin for a newer one ([`refresh_cold`]),
+//!   stopping at the first adopted state or the first vouched "you are
+//!   current"; a running `wires serve` does the same on a timer
+//!   ([`refresh_loop`]), and once before its preflight ([`pull_now`]).
 //! - [`respond`] / [`StateResponder`]: the side a running host serves on the
 //!   ALPN: answer a pull, adopt an offer.
 //!
 //! One bi-stream per exchange, one frame each way. Nothing is ever adopted
 //! except through [`store::adopt_if_newer`] (verified under the root, fresh,
-//! strictly newer), so a lying peer can only fail to help.
+//! strictly newer), so a lying peer can only fail to help. An expired copy
+//! vouches for nobody: its holder neither serves it nor hears a dialer on
+//! its strength.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
-use library::{NodeId, STATE_ALPN, SignedState, StateFrame, StateVersion};
+use library::{NodeId, NodeIdentity, STATE_ALPN, SignedState, StateFrame, StateVersion};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::store;
@@ -42,27 +49,34 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a cold command spends pulling, all peers together.
 const COLD_PULL_BUDGET: Duration = Duration::from_secs(8);
 
-/// Who took an offered state and who didn't.
+/// Which hosts took an offered state and which didn't.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PushReport {
-    /// Members now holding at least the offered version.
+    /// Hosts now holding at least the offered version.
     pub(crate) delivered: Vec<NodeId>,
-    /// Members that couldn't be reached or refused (they catch up by pull).
+    /// Hosts that couldn't be reached or refused it.
     pub(crate) missed: Vec<NodeId>,
 }
 
 impl PushReport {
     /// One human line for the admin's stderr.
     pub(crate) fn line(&self, version: StateVersion) -> String {
+        let total = self.delivered.len() + self.missed.len();
+        if total == 0 {
+            return format!(
+                "state version {}: no host to push to yet (a new member gets it in its invite \
+                 token)",
+                version.0
+            );
+        }
         let mut out = format!(
-            "state version {}: pushed to {} member(s)",
+            "state version {}: pushed to {} of {total} host(s)",
             version.0,
             self.delivered.len()
         );
         if !self.missed.is_empty() {
             out.push_str(&format!(
-                "; {} not reachable now ({}) — they pull it on their next command",
-                self.missed.len(),
+                "; not reached: {} (`wires state push` re-sends it)",
                 self.missed
                     .iter()
                     .map(|n| format!("{}…", &n.hex()[..8]))
@@ -71,6 +85,12 @@ impl PushReport {
             ));
         }
         out
+    }
+
+    /// Whether there were hosts to reach and not one took the state: the
+    /// fabric is still enforcing the older one.
+    pub(crate) fn reached_no_host(&self) -> bool {
+        self.delivered.is_empty() && !self.missed.is_empty()
     }
 }
 
@@ -126,92 +146,129 @@ async fn exchange(endpoint: &Endpoint, peer: NodeId, frame: &StateFrame) -> Resu
 // Push (admin)
 // ---------------------------------------------------------------------------
 
-/// Offer `state` to each of `members`: first every one that `state` names a
-/// host (concurrently), then the rest (concurrently). A member counts as
+/// Offer `state` to each of `targets`, concurrently. A target counts as
 /// delivered once it answers holding at least `state`'s version.
 pub(crate) async fn push_all(
     endpoint: &Endpoint,
     state: &SignedState,
-    members: &[NodeId],
+    targets: &[NodeId],
 ) -> Result<PushReport> {
-    let (hosts, others): (Vec<NodeId>, Vec<NodeId>) = members
-        .iter()
-        .copied()
-        .partition(|m| state.state.is_host(*m));
     let mut report = PushReport::default();
-    for wave in [hosts, others] {
-        let mut set = tokio::task::JoinSet::new();
-        for member in wave {
-            let endpoint = endpoint.clone();
-            let offer = StateFrame::Offer {
-                state: state.clone(),
+    let mut set = tokio::task::JoinSet::new();
+    for &target in targets {
+        let endpoint = endpoint.clone();
+        let offer = StateFrame::Offer {
+            state: state.clone(),
+        };
+        let want = state.state.version;
+        set.spawn(async move {
+            let ok = match exchange(&endpoint, target, &offer).await {
+                Ok(StateFrame::Have { version }) => version >= want,
+                Ok(StateFrame::Denied { reason }) => {
+                    tracing::warn!(host = %target.hex(), "state push refused: {reason}");
+                    false
+                }
+                Ok(_) => false,
+                Err(e) => {
+                    tracing::debug!(host = %target.hex(), "state push failed: {e:#}");
+                    false
+                }
             };
-            let want = state.state.version;
-            set.spawn(async move {
-                let ok = match exchange(&endpoint, member, &offer).await {
-                    Ok(StateFrame::Have { version }) => version >= want,
-                    Ok(StateFrame::Denied { reason }) => {
-                        tracing::warn!(member = %member.hex(), "state push refused: {reason}");
-                        false
-                    }
-                    Ok(_) => false,
-                    Err(e) => {
-                        tracing::debug!(member = %member.hex(), "state push failed: {e:#}");
-                        false
-                    }
-                };
-                (member, ok)
-            });
-        }
-        while let Some(joined) = set.join_next().await {
-            let (member, ok) = joined.context("a push task panicked")?;
-            if ok {
-                report.delivered.push(member);
-            } else {
-                report.missed.push(member);
-            }
+            (target, ok)
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        let (target, ok) = joined.context("a push task panicked")?;
+        if ok {
+            report.delivered.push(target);
+        } else {
+            report.missed.push(target);
         }
     }
+    report.delivered.sort();
+    report.missed.sort();
     Ok(report)
 }
 
-/// The admin's push of the stored state from `ks` over `endpoint`: every
-/// member but this node, hosts first.
-pub(crate) async fn push_current_on(endpoint: &Endpoint, ks: &Keystore) -> Result<PushReport> {
-    let root = store::fabric(ks)?.ok_or_else(|| anyhow!("this keystore is in no fabric"))?;
-    let state = store::read(ks, root)?.ok_or_else(|| anyhow!("no signed state here"))?;
-    let me = transport::to_node_id(&endpoint.id());
-    let members: Vec<NodeId> = state
+/// Who the admin pushes `state` to: its hosts, plus `earlier` (the hosts of
+/// the state before this edit, so a node that stops hosting learns it), never
+/// `me`. Plain members aren't dialed: nothing listens there.
+pub(crate) fn push_targets(
+    state: &SignedState,
+    earlier: &BTreeSet<NodeId>,
+    me: NodeId,
+) -> Vec<NodeId> {
+    state
         .state
-        .members
+        .hosts
         .iter()
+        .chain(earlier)
         .copied()
-        .filter(|m| *m != me)
-        .collect();
-    push_all(endpoint, &state, &members).await
+        .filter(|h| *h != me)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The admin's push of the stored state from `ks` over `endpoint`, to
+/// [`push_targets`].
+pub(crate) async fn push_current_on(
+    endpoint: &Endpoint,
+    ks: &Keystore,
+    earlier: &BTreeSet<NodeId>,
+) -> Result<PushReport> {
+    let state = stored(ks)?;
+    let me = transport::to_node_id(&endpoint.id());
+    push_all(endpoint, &state, &push_targets(&state, earlier, me)).await
 }
 
 /// [`push_current_on`] over a freshly bound endpoint for this keystore's
-/// node (the admin CLI's form). Returns the line for stderr.
-pub(crate) async fn push_current(ks: &Keystore) -> Result<String> {
-    let root = store::fabric(ks)?.ok_or_else(|| anyhow!("this keystore is in no fabric"))?;
-    let version = store::read(ks, root)?
-        .map(|s| s.state.version)
-        .ok_or_else(|| anyhow!("no signed state here"))?;
+/// node (the admin CLI's form): the version pushed and the report. Binds
+/// nothing when there is no host to push to.
+pub(crate) async fn push_current(
+    ks: &Keystore,
+    earlier: &BTreeSet<NodeId>,
+) -> Result<(StateVersion, PushReport)> {
+    let state = stored(ks)?;
     let node = keystore::node_identity_in(ks)?;
+    let version = state.state.version;
+    if push_targets(&state, earlier, node.node_id()).is_empty() {
+        return Ok((version, PushReport::default()));
+    }
     let endpoint = transport::bind_with_alpn(&node, None, STATE_ALPN).await?;
-    let report = push_current_on(&endpoint, ks).await;
+    let report = push_current_on(&endpoint, ks, earlier).await;
     endpoint.close().await;
-    Ok(report?.line(version))
+    Ok((version, report?))
+}
+
+/// The hosts of the state `ks` holds now (empty when it holds none): what an
+/// admin command records before its edit, for [`push_targets`].
+pub(crate) fn held_hosts(ks: &Keystore) -> Result<BTreeSet<NodeId>> {
+    let Some(root) = store::fabric(ks)? else {
+        return Ok(BTreeSet::new());
+    };
+    Ok(store::read(ks, root)?.map_or_else(BTreeSet::new, |s| s.state.hosts))
+}
+
+/// The state `ks` holds, or an error saying there is none.
+fn stored(ks: &Keystore) -> Result<SignedState> {
+    let root = store::fabric(ks)?.ok_or_else(|| anyhow!("this keystore is in no fabric"))?;
+    store::read(ks, root)?.ok_or_else(|| anyhow!("no signed state here"))
 }
 
 // ---------------------------------------------------------------------------
 // Pull (members)
 // ---------------------------------------------------------------------------
 
-/// Ask `peers` in turn for a state newer than `have`; the first verified,
-/// newer one is adopted and returned. Marks the copy checked once any peer
-/// answered.
+/// Ask `peers` in turn for a state newer than `have`, stopping at the
+/// first one that settles it:
+///
+/// - a verified, fresh, newer `offer` is adopted and returned;
+/// - a `have` at least `have` from a **vouched** peer (a host in the held
+///   copy, or the recorded admin) says this node is current: `Ok(None)`.
+///
+/// Only those two outcomes mark the copy checked; a refusal, a peer that is
+/// behind, or an unvouched answer does not (so the next command asks again).
 pub(crate) async fn pull(
     endpoint: &Endpoint,
     ks: &Keystore,
@@ -219,11 +276,12 @@ pub(crate) async fn pull(
     have: StateVersion,
 ) -> Result<Option<SignedState>> {
     let root = store::fabric(ks)?.ok_or_else(|| anyhow!("this keystore is in no fabric"))?;
-    let mut answered = false;
+    let held = store::read(ks, root)?;
+    let admin = store::read_admin(ks).ok().flatten();
+    let vouched = |p: NodeId| admin == Some(p) || held.as_ref().is_some_and(|s| s.state.is_host(p));
     for peer in peers {
         match exchange(endpoint, *peer, &StateFrame::Have { version: have }).await {
             Ok(StateFrame::Offer { state }) => {
-                answered = true;
                 match store::adopt_if_newer(ks, &state, root, now_unix()) {
                     Ok(true) => {
                         store::mark_checked(ks, now_unix())?;
@@ -233,24 +291,32 @@ pub(crate) async fn pull(
                     Err(e) => tracing::warn!(peer = %peer.hex(), "refused a pulled state: {e:#}"),
                 }
             }
-            Ok(StateFrame::Have { .. }) => answered = true,
+            Ok(StateFrame::Have { version }) if version >= have && vouched(*peer) => {
+                store::mark_checked(ks, now_unix())?;
+                return Ok(None);
+            }
+            Ok(StateFrame::Have { version }) => {
+                tracing::debug!(peer = %peer.hex(), version = version.0, "not a current answer")
+            }
             Ok(StateFrame::Denied { reason }) => {
                 tracing::debug!(peer = %peer.hex(), "state pull refused: {reason}")
             }
             Err(e) => tracing::debug!(peer = %peer.hex(), "state pull failed: {e:#}"),
         }
     }
-    if answered {
-        store::mark_checked(ks, now_unix())?;
-    }
     Ok(None)
 }
 
-/// Where this node pulls from: every host in its copy (they are up, serving),
-/// then the admin if known (often a one-shot CLI), never itself.
+/// Where this node pulls from, never itself: first the hosts this node
+/// called before (`last-good.json`: the hosts of the services it actually
+/// uses, which it has already reached), then every other host in its copy
+/// (they are up, serving), then the admin if known (often a one-shot CLI,
+/// so last).
 pub(crate) fn pull_peers(ks: &Keystore, state: Option<&SignedState>, me: NodeId) -> Vec<NodeId> {
     let mut peers = Vec::new();
     if let Some(state) = state {
+        let used = crate::caller::pick::LastGood::load(&crate::caller::pick::LastGood::path(ks));
+        peers.extend(used.hosts().filter(|h| state.state.is_host(*h)));
         peers.extend(state.state.hosts.iter().copied());
     }
     if let Ok(Some(admin)) = store::read_admin(ks) {
@@ -261,16 +327,9 @@ pub(crate) fn pull_peers(ks: &Keystore, state: Option<&SignedState>, me: NodeId)
     peers
 }
 
-/// Pull over `endpoint` if the stored copy was last checked more than
-/// [`STALE_AFTER_SECS`] ago. Returns the newly adopted state, if any.
-pub(crate) async fn refresh_if_stale(
-    endpoint: &Endpoint,
-    ks: &Keystore,
-) -> Result<Option<SignedState>> {
-    let now = now_unix();
-    if !store::is_stale(ks, now, STALE_AFTER_SECS) {
-        return Ok(None);
-    }
+/// Pull over `endpoint` from [`pull_peers`], whether or not the copy is
+/// stale. Returns the newly adopted state, if any.
+pub(crate) async fn catch_up(endpoint: &Endpoint, ks: &Keystore) -> Result<Option<SignedState>> {
     let Some(root) = store::fabric(ks)? else {
         return Ok(None);
     };
@@ -282,6 +341,34 @@ pub(crate) async fn refresh_if_stale(
         return Ok(None);
     }
     pull(endpoint, ks, &peers, have).await
+}
+
+/// `wires serve`'s catch-up when its preflight fails (a host assigned a
+/// service while it was offline): bind as `node` briefly and [`catch_up`],
+/// within the cold-pull budget.
+pub(crate) async fn pull_now(
+    ks: &Keystore,
+    node: &NodeIdentity,
+    relay_url: Option<&str>,
+) -> Result<Option<SignedState>> {
+    let endpoint = transport::bind_with_alpn(node, relay_url, STATE_ALPN).await?;
+    let pulled = tokio::time::timeout(COLD_PULL_BUDGET, catch_up(&endpoint, ks))
+        .await
+        .unwrap_or(Ok(None));
+    endpoint.close().await;
+    pulled
+}
+
+/// Pull over `endpoint` if the stored copy was last checked more than
+/// [`STALE_AFTER_SECS`] ago. Returns the newly adopted state, if any.
+pub(crate) async fn refresh_if_stale(
+    endpoint: &Endpoint,
+    ks: &Keystore,
+) -> Result<Option<SignedState>> {
+    if !store::is_stale(ks, now_unix(), STALE_AFTER_SECS) {
+        return Ok(None);
+    }
+    catch_up(endpoint, ks).await
 }
 
 /// A cold command's best-effort refresh: if this keystore is in a fabric and
@@ -328,11 +415,17 @@ pub(crate) async fn refresh_loop(endpoint: Endpoint, ks: Arc<Keystore>) {
 
 /// Serve one incoming state-protocol connection: read one frame, answer it.
 ///
-/// - `Offer`: adopted if it verifies under this node's root, is fresh and
-///   strictly newer; answered `Have` with the version now held. The dialer
-///   must be a member of the held copy or of the (verified) offered one.
-/// - `Have`: the dialer must be a member of the held copy; answered with the
-///   held copy if it is newer, else `Have`.
+/// An expired held copy vouches for nobody. So:
+///
+/// - `Offer`: the dialer must be a member of the fresh held copy or of the
+///   (verified) offered one. The offer is run through `adopt_if_newer`
+///   (verified, fresh, strictly newer). Adopted: answered `Have` with the new
+///   version, and the copy is marked checked. Not adopted: answered `Have`
+///   only if the dialer is a member of the fresh held copy, else `Denied`,
+///   and the copy is **not** marked checked (a removed member re-offering
+///   its old state must not stop this node pulling the newer one).
+/// - `Have`: the held copy must exist and be fresh, and the dialer must be a
+///   member of it; answered with the held copy if it is newer, else `Have`.
 pub(crate) async fn respond(conn: Connection, ks: &Keystore) -> Result<()> {
     let caller = transport::to_node_id(&conn.remote_id());
     let (mut send, mut recv) = conn.accept_bi().await.context("accepting a stream")?;
@@ -363,32 +456,50 @@ pub(crate) fn answer(
         .map_err(fail)?
         .ok_or("this node is in no fabric")?;
     let held = store::read(ks, root).map_err(fail)?;
-    let is_member = |s: &Option<SignedState>| s.as_ref().is_some_and(|s| s.state.is_member(caller));
+    // Membership counts only in a copy that is still fresh.
+    let is_member = |s: &Option<SignedState>| {
+        s.as_ref()
+            .is_some_and(|s| s.check_fresh(now).is_ok() && s.state.is_member(caller))
+    };
+    let not_a_member = || format!("{}… is not a member", &caller.hex()[..8]);
     let version = |s: &Option<SignedState>| s.as_ref().map_or(StateVersion(0), |s| s.state.version);
     match frame {
         StateFrame::Offer { state } => {
             let vouched = state.verify(root).is_ok() && state.state.is_member(caller);
             if !is_member(&held) && !vouched {
-                return Err(format!("{}… is not a member", &caller.hex()[..8]));
+                return Err(not_a_member());
             }
-            if let Err(e) = store::adopt_if_newer(ks, &state, root, now) {
-                return Err(format!("the offered state was refused: {e:#}"));
-            }
-            store::mark_checked(ks, now).map_err(fail)?;
+            let adopted = store::adopt_if_newer(ks, &state, root, now)
+                .map_err(|e| format!("the offered state was refused: {e:#}"))?;
             let held = store::read(ks, root).map_err(fail)?;
+            if adopted {
+                store::mark_checked(ks, now).map_err(fail)?;
+            } else if !is_member(&held) {
+                return Err(not_a_member());
+            }
             Ok(StateFrame::Have {
                 version: version(&held),
             })
         }
         StateFrame::Have { version: theirs } => {
-            if !is_member(&held) {
-                return Err(format!("{}… is not a member", &caller.hex()[..8]));
+            let Some(state) = held else {
+                return Err("this node holds no signed state".into());
+            };
+            if state.check_fresh(now).is_err() {
+                return Err(format!(
+                    "this node's signed state (version {}) has expired",
+                    state.state.version.0
+                ));
             }
-            match held {
-                Some(state) if state.state.version > theirs => Ok(StateFrame::Offer { state }),
-                held => Ok(StateFrame::Have {
-                    version: version(&held),
-                }),
+            if !state.state.is_member(caller) {
+                return Err(not_a_member());
+            }
+            if state.state.version > theirs {
+                Ok(StateFrame::Offer { state })
+            } else {
+                Ok(StateFrame::Have {
+                    version: state.state.version,
+                })
             }
         }
         StateFrame::Denied { .. } => Err("expected an offer or a have".into()),
@@ -490,6 +601,131 @@ mod tests {
         );
     }
 
+    /// Card 28 §8: a removed member re-offering its old, still-fresh state
+    /// is refused by a host that holds the newer one, and never marks a
+    /// host's copy checked (so the host keeps pulling).
+    #[test]
+    fn a_removed_members_old_offer_is_denied_and_marks_nothing_checked() {
+        let root = NodeIdentity::generate();
+        let (me, removed) = (NodeIdentity::generate(), NodeIdentity::generate().node_id());
+        let v1 = signed(&root, 1, &[me.node_id(), removed]);
+        let v2 = signed(&root, 2, &[me.node_id()]);
+        let offer = |s: &SignedState| StateFrame::Offer { state: s.clone() };
+
+        // The host already holds v2: the old offer is refused outright.
+        let ks = member_ks(&root, &me, Some(&v2));
+        let err = answer(&ks, removed, offer(&v1), 10).unwrap_err();
+        assert!(err.contains("not a member"), "{err}");
+        assert!(store::is_stale(&ks, 10, STALE_AFTER_SECS));
+
+        // The host missed v2: the removed member is still in its copy, so
+        // it is told what is held, but the copy is not marked checked.
+        let ks = member_ks(&root, &me, Some(&v1));
+        let have1 = StateFrame::Have {
+            version: StateVersion(1),
+        };
+        assert_eq!(answer(&ks, removed, offer(&v1), 10), Ok(have1));
+        assert!(
+            store::is_stale(&ks, 10, STALE_AFTER_SECS),
+            "a non-adopting offer must not stop this node pulling"
+        );
+        // A real adopt does mark it.
+        let v3 = signed(&root, 3, &[me.node_id()]);
+        let answered = answer(&ks, me.node_id(), offer(&v3), 10);
+        assert_eq!(
+            answered,
+            Ok(StateFrame::Have {
+                version: StateVersion(3)
+            })
+        );
+        assert!(!store::is_stale(&ks, 10, STALE_AFTER_SECS));
+    }
+
+    /// Card 28 §8: an expired held copy is not served, and vouches for no
+    /// dialer; a fresh newer offer still repairs it.
+    #[test]
+    fn an_expired_copy_is_not_served_and_vouches_for_nobody() {
+        let root = NodeIdentity::generate();
+        let (me, peer) = (NodeIdentity::generate(), NodeIdentity::generate().node_id());
+        let mut s = State::new(root.node_id());
+        s.version = StateVersion(1);
+        s.not_after = 100;
+        s.members.extend([me.node_id(), peer]);
+        let v1 = s.sign(&root).unwrap();
+        let ks = member_ks(&root, &me, Some(&v1));
+        let have = |v| StateFrame::Have {
+            version: StateVersion(v),
+        };
+        let offer = |s: &SignedState| StateFrame::Offer { state: s.clone() };
+        assert_eq!(answer(&ks, peer, have(0), 50), Ok(offer(&v1)), "fresh");
+        let err = answer(&ks, peer, have(0), 200).unwrap_err();
+        assert!(err.contains("expired"), "{err}");
+        // An offer that isn't adopted is refused: nothing here vouches.
+        assert!(answer(&ks, peer, offer(&v1), 200).is_err());
+        // A fresh, newer state from a member of it is adopted.
+        let v2 = signed(&root, 2, &[me.node_id(), peer]);
+        assert_eq!(answer(&ks, peer, offer(&v2), 200), Ok(have(2)));
+    }
+
+    /// The admin pushes to the hosts (and the hosts before the edit), never
+    /// to plain members or itself.
+    #[test]
+    fn push_targets_are_hosts_old_and_new() {
+        let root = NodeIdentity::generate();
+        let [admin, h1, h2, member] = [0; 4].map(|_| NodeIdentity::generate().node_id());
+        let mut s = State::new(root.node_id());
+        s.version = StateVersion(1);
+        s.not_after = i64::MAX;
+        s.members.extend([admin, h1, member]);
+        s.hosts.insert(h1);
+        s.services.insert(
+            library::ServiceName::new("svc").unwrap(),
+            library::Service {
+                description: String::new(),
+                allow: vec![],
+                hosts: vec![h1],
+                readers: vec![],
+            },
+        );
+        let state = s.sign(&root).unwrap();
+        let mut want = vec![h1, h2];
+        want.sort();
+        assert_eq!(
+            push_targets(&state, &BTreeSet::from([h2, admin]), admin),
+            want
+        );
+        assert_eq!(
+            push_targets(&state, &BTreeSet::new(), h1),
+            Vec::<NodeId>::new()
+        );
+    }
+
+    #[test]
+    fn the_push_line_says_which_hosts_it_missed() {
+        let a = NodeIdentity::from_seed([1; 32]).node_id();
+        let b = NodeIdentity::from_seed([2; 32]).node_id();
+        let none = PushReport::default();
+        assert!(!none.reached_no_host());
+        assert!(none.line(StateVersion(3)).contains("no host to push to"));
+        let missed = PushReport {
+            delivered: vec![],
+            missed: vec![a],
+        };
+        assert!(missed.reached_no_host());
+        let line = missed.line(StateVersion(3));
+        assert!(line.contains("pushed to 0 of 1 host(s)"), "{line}");
+        assert!(line.contains(&a.hex()[..8]) && line.contains("wires state push"));
+        let some = PushReport {
+            delivered: vec![b],
+            missed: vec![a],
+        };
+        assert!(!some.reached_no_host());
+        assert!(
+            some.line(StateVersion(3))
+                .contains("pushed to 1 of 2 host(s)")
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Loopback e2e: the admin pushes, a host and a member adopt; pull covers
     // a missed push.
@@ -557,7 +793,7 @@ mod tests {
 
         fn fabric() -> Fabric {
             let admin = Arc::new(Keystore::at(temp_dir()));
-            init_in(&admin, InitArgs { ttl: ttl() }).unwrap();
+            init_in(&admin, InitArgs::default()).unwrap();
             let root_id = admin.read_root_identity().unwrap().unwrap();
             let me = admin.read_node_identity().unwrap().unwrap().node_id();
             let (host, member) = (NodeIdentity::generate(), NodeIdentity::generate());
@@ -600,43 +836,80 @@ mod tests {
             .unwrap()
         }
 
+        /// Like `bind` with `serve`, but every state connection accepted is
+        /// counted.
+        async fn bind_counted(
+            node: &NodeIdentity,
+            ks: &Arc<Keystore>,
+            book: &MemoryLookup,
+        ) -> (Endpoint, Router, Arc<std::sync::atomic::AtomicUsize>) {
+            #[derive(Debug, Clone)]
+            struct Counted(StateResponder, Arc<std::sync::atomic::AtomicUsize>);
+            impl iroh::protocol::ProtocolHandler for Counted {
+                async fn accept(
+                    &self,
+                    conn: Connection,
+                ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+                    self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    self.0.accept(conn).await
+                }
+            }
+            let (endpoint, _) = bind(node, ks, book, false).await;
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let router = Router::builder(endpoint.clone())
+                .accept(
+                    STATE_ALPN,
+                    Counted(StateResponder(Arc::clone(ks)), Arc::clone(&count)),
+                )
+                .spawn();
+            (endpoint, router, count)
+        }
+
         #[tokio::test]
-        async fn an_admin_change_reaches_a_host_and_a_member_within_two_seconds() {
+        async fn an_admin_change_reaches_the_host_within_two_seconds_and_skips_members() {
             let f = fabric();
             let book = MemoryLookup::new();
             let admin_node = f.admin.read_node_identity().unwrap().unwrap();
             let (admin_ep, _) = bind(&admin_node, &f.admin, &book, false).await;
             let (_h, _hr) = bind(&f.host.0, &f.host.1, &book, true).await;
-            let (_m, _mr) = bind(&f.member.0, &f.member.1, &book, true).await;
+            let (_m, _mr, member_dials) = bind_counted(&f.member.0, &f.member.1, &book).await;
+            let before = version(&f.member.1, f.root);
 
+            let earlier = held_hosts(&f.admin).unwrap();
             let new = assign(&f);
             let started = std::time::Instant::now();
-            let report =
-                tokio::time::timeout(Duration::from_secs(2), push_current_on(&admin_ep, &f.admin))
-                    .await
-                    .expect("the push took over 2 s")
-                    .unwrap();
+            let report = tokio::time::timeout(
+                Duration::from_secs(2),
+                push_current_on(&admin_ep, &f.admin, &earlier),
+            )
+            .await
+            .expect("the push took over 2 s")
+            .unwrap();
             assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(report.delivered, vec![f.host.0.node_id()]);
             assert!(report.missed.is_empty(), "{report:?}");
-            assert_eq!(report.delivered.len(), 2);
-            for ks in [&f.host.1, &f.member.1] {
-                assert_eq!(version(ks, f.root), new.state.version);
-                assert!(
-                    store::read(ks, f.root)
-                        .unwrap()
-                        .unwrap()
-                        .state
-                        .is_host(f.host.0.node_id())
-                );
-            }
+            assert_eq!(version(&f.host.1, f.root), new.state.version);
+            assert!(
+                store::read(&f.host.1, f.root)
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    .is_host(f.host.0.node_id())
+            );
+            // A plain member is not dialed (nothing listens there).
+            assert_eq!(member_dials.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(version(&f.member.1, f.root), before);
 
             // `remove`: the member is dropped, and the host holds that at once.
+            let earlier = held_hosts(&f.admin).unwrap();
             let removed = service::edit_state(&f.admin, ttl(), |s| {
                 s.members.remove(&f.member.0.node_id());
                 Ok(())
             })
             .unwrap();
-            let report = push_current_on(&admin_ep, &f.admin).await.unwrap();
+            let report = push_current_on(&admin_ep, &f.admin, &earlier)
+                .await
+                .unwrap();
             assert_eq!(report.delivered, vec![f.host.0.node_id()]);
             let held = store::read(&f.host.1, f.root).unwrap().unwrap();
             assert_eq!(held, removed);
@@ -651,11 +924,29 @@ mod tests {
             )
             .await;
             std::fs::remove_file(f.member.1.path("state-checked.txt")).ok();
-            let pulled = pull(&m2, &f.member.1, &[f.host.0.node_id()], new.state.version)
+            let pulled = pull(&m2, &f.member.1, &[f.host.0.node_id()], before)
                 .await
                 .unwrap();
             assert!(pulled.is_none());
-            assert_eq!(version(&f.member.1, f.root), new.state.version);
+            assert_eq!(version(&f.member.1, f.root), before);
+            admin_ep.close().await;
+        }
+
+        /// A push that reaches none of the state's hosts says so.
+        #[tokio::test]
+        async fn a_push_that_reaches_no_host_is_reported() {
+            let f = fabric();
+            let book = MemoryLookup::new();
+            let admin_node = f.admin.read_node_identity().unwrap().unwrap();
+            let (admin_ep, _) = bind(&admin_node, &f.admin, &book, false).await;
+            // The host is known but not listening.
+            let (_h, _) = bind(&f.host.0, &f.host.1, &book, false).await;
+            assign(&f);
+            let report = push_current_on(&admin_ep, &f.admin, &BTreeSet::new())
+                .await
+                .unwrap();
+            assert!(report.reached_no_host(), "{report:?}");
+            assert_eq!(report.missed, vec![f.host.0.node_id()]);
             admin_ep.close().await;
         }
 
@@ -669,11 +960,13 @@ mod tests {
 
             let old = store::read(&f.admin, f.root).unwrap().unwrap();
             let new = assign(&f);
-            push_current_on(&admin_ep, &f.admin).await.unwrap();
+            push_current_on(&admin_ep, &f.admin, &BTreeSet::new())
+                .await
+                .unwrap();
             assert_eq!(version(&f.host.1, f.root), new.state.version);
 
-            // Anyone replaying the genuine older state gets told what's held.
-            // (The host answers with the newer version it holds.)
+            // The admin (still a member) replaying the genuine older state is
+            // told what's held.
             let report = push_all(&admin_ep, &old, &[f.host.0.node_id()])
                 .await
                 .unwrap();
@@ -689,13 +982,12 @@ mod tests {
             let admin_node = f.admin.read_node_identity().unwrap().unwrap();
             let (admin_ep, _) = bind(&admin_node, &f.admin, &book, false).await;
             let (_h, _hr) = bind(&f.host.0, &f.host.1, &book, true).await;
-            // The member is up but not listening: the push misses it.
             let (member_ep, _) = bind(&f.member.0, &f.member.1, &book, false).await;
 
-            // The member already knows the host (an earlier push it got)…
+            // The member already knows the host (an earlier state it got)…
             let assigned = assign(&f);
             store::adopt_if_newer(&f.member.1, &assigned, f.root, now_unix()).unwrap();
-            // …but misses this one.
+            // …but members aren't pushed to, so it misses this one.
             let new = service::set(
                 &f.admin,
                 ServiceName::new("orders-db").unwrap(),
@@ -706,9 +998,10 @@ mod tests {
                 ttl(),
             )
             .unwrap();
-            let report = push_current_on(&admin_ep, &f.admin).await.unwrap();
+            let report = push_current_on(&admin_ep, &f.admin, &BTreeSet::new())
+                .await
+                .unwrap();
             assert_eq!(report.delivered, vec![f.host.0.node_id()]);
-            assert_eq!(report.missed, vec![f.member.0.node_id()]);
             assert!(version(&f.member.1, f.root) < new.state.version);
 
             // Fresh copy: no pull. Stale: pulls from the host.
@@ -732,6 +1025,180 @@ mod tests {
             assert!(!store::is_stale(&f.member.1, now_unix(), STALE_AFTER_SECS));
             admin_ep.close().await;
             member_ep.close().await;
+        }
+
+        /// Three hosts, a member whose copy is current: the pull stops at
+        /// the first host's "current" answer, and marks the copy checked.
+        #[tokio::test]
+        async fn a_pull_stops_at_the_first_current_answer() {
+            let f = fabric();
+            let book = MemoryLookup::new();
+            let (h2, h3) = (NodeIdentity::generate(), NodeIdentity::generate());
+            service::edit_state(&f.admin, ttl(), |s| {
+                s.members.extend([h2.node_id(), h3.node_id()]);
+                Ok(())
+            })
+            .unwrap();
+            let hosts = vec![f.host.0.node_id(), h2.node_id(), h3.node_id()];
+            let state = service::add(
+                &f.admin,
+                ServiceName::new("orders-db").unwrap(),
+                ServiceEdit {
+                    hosts: Some(hosts.clone()),
+                    ..Default::default()
+                },
+                ttl(),
+            )
+            .unwrap();
+            let join = |node: &NodeIdentity| {
+                let root = f.admin.read_root_identity().unwrap().unwrap();
+                let ks = Arc::new(member_ks(&root, node, None));
+                store::adopt_if_newer(&ks, &state, f.root, now_unix()).unwrap();
+                ks
+            };
+            let (h2_ks, h3_ks) = (join(&h2), join(&h3));
+            for ks in [&f.host.1, &f.member.1] {
+                store::adopt_if_newer(ks, &state, f.root, now_unix()).unwrap();
+            }
+            let mut counts = Vec::new();
+            let mut keep = Vec::new();
+            for (node, ks) in [(&f.host.0, &f.host.1), (&h2, &h2_ks), (&h3, &h3_ks)] {
+                let (ep, router, count) = bind_counted(node, ks, &book).await;
+                counts.push(count);
+                keep.push((ep, router));
+            }
+            let (member_ep, _) = bind(&f.member.0, &f.member.1, &book, false).await;
+            assert!(store::is_stale(&f.member.1, now_unix(), STALE_AFTER_SECS));
+            let pulled = pull(&member_ep, &f.member.1, &hosts, state.state.version)
+                .await
+                .unwrap();
+            assert!(pulled.is_none());
+            let dials: usize = counts
+                .iter()
+                .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+                .sum();
+            assert_eq!(dials, 1, "one current answer settles it");
+            assert!(!store::is_stale(&f.member.1, now_unix(), STALE_AFTER_SECS));
+
+            // The hosts this node has called go first.
+            crate::caller::pick::LastGood::record(
+                &crate::caller::pick::LastGood::path(&f.member.1),
+                &ServiceName::new("orders-db").unwrap(),
+                h3.node_id(),
+            );
+            let peers = pull_peers(&f.member.1, Some(&state), f.member.0.node_id());
+            assert_eq!(peers[0], h3.node_id());
+            assert_eq!(peers.len(), 4, "three hosts and the admin: {peers:?}");
+            member_ep.close().await;
+        }
+
+        /// A removed member re-offers its old state to a host that missed
+        /// the removal: the host is not marked checked, so it still pulls
+        /// the newer state from another host. A host that holds the newer
+        /// state refuses the offer.
+        #[tokio::test]
+        async fn a_removed_member_cannot_stop_a_host_pulling() {
+            let f = fabric();
+            let book = MemoryLookup::new();
+            let h2 = NodeIdentity::generate();
+            service::edit_state(&f.admin, ttl(), |s| {
+                s.members.insert(h2.node_id());
+                Ok(())
+            })
+            .unwrap();
+            let old = service::add(
+                &f.admin,
+                ServiceName::new("orders-db").unwrap(),
+                ServiceEdit {
+                    hosts: Some(vec![f.host.0.node_id(), h2.node_id()]),
+                    ..Default::default()
+                },
+                ttl(),
+            )
+            .unwrap();
+            let root = f.admin.read_root_identity().unwrap().unwrap();
+            let h2_ks = Arc::new(member_ks(&root, &h2, None));
+            for ks in [&f.host.1, &h2_ks, &f.member.1] {
+                store::adopt_if_newer(ks, &old, f.root, now_unix()).unwrap();
+            }
+            let removed = service::edit_state(&f.admin, ttl(), |s| {
+                s.members.remove(&f.member.0.node_id());
+                Ok(())
+            })
+            .unwrap();
+            let admin_node = f.admin.read_node_identity().unwrap().unwrap();
+            let (admin_ep, _) = bind(&admin_node, &f.admin, &book, false).await;
+            let (_h1, _h1r) = bind(&f.host.0, &f.host.1, &book, true).await;
+            let (h2_ep, _h2r) = bind(&h2, &h2_ks, &book, true).await;
+            // Only host 1 gets the removal.
+            let report = push_all(&admin_ep, &removed, &[f.host.0.node_id()])
+                .await
+                .unwrap();
+            assert_eq!(report.delivered, vec![f.host.0.node_id()]);
+
+            let (m_ep, _) = bind(&f.member.0, &f.member.1, &book, false).await;
+            // Host 1 refuses the replay outright.
+            let r1 = push_all(&m_ep, &old, &[f.host.0.node_id()]).await.unwrap();
+            assert_eq!(r1.missed, vec![f.host.0.node_id()]);
+            // Host 2 hears it (the member is in its copy) but isn't marked
+            // checked by it…
+            push_all(&m_ep, &old, &[h2.node_id()]).await.unwrap();
+            assert!(store::is_stale(&h2_ks, now_unix(), STALE_AFTER_SECS));
+            // …so its next refresh pulls the removal from host 1.
+            let pulled = refresh_if_stale(&h2_ep, &h2_ks).await.unwrap();
+            assert_eq!(pulled.as_ref(), Some(&removed));
+            admin_ep.close().await;
+            m_ep.close().await;
+        }
+
+        /// A host assigned a service while it was offline catches up from
+        /// another host before its preflight (what `serve` runs).
+        #[tokio::test]
+        async fn a_host_assigned_while_offline_catches_up() {
+            let f = fabric();
+            let book = MemoryLookup::new();
+            let late = NodeIdentity::generate();
+            service::edit_state(&f.admin, ttl(), |s| {
+                s.members.insert(late.node_id());
+                Ok(())
+            })
+            .unwrap();
+            let first = assign(&f);
+            let root = f.admin.read_root_identity().unwrap().unwrap();
+            let late_ks = Arc::new(member_ks(&root, &late, None));
+            store::adopt_if_newer(&late_ks, &first, f.root, now_unix()).unwrap();
+            store::adopt_if_newer(&f.host.1, &first, f.root, now_unix()).unwrap();
+            // The admin adds `late` as a second host; only host 1 is up.
+            let second = service::set(
+                &f.admin,
+                ServiceName::new("orders-db").unwrap(),
+                ServiceEdit {
+                    hosts: Some(vec![f.host.0.node_id(), late.node_id()]),
+                    ..Default::default()
+                },
+                ttl(),
+            )
+            .unwrap();
+            let admin_node = f.admin.read_node_identity().unwrap().unwrap();
+            let (admin_ep, _) = bind(&admin_node, &f.admin, &book, false).await;
+            let (_h, _hr) = bind(&f.host.0, &f.host.1, &book, true).await;
+            push_current_on(&admin_ep, &f.admin, &BTreeSet::new())
+                .await
+                .unwrap();
+            // `late` comes up: fresh check or not, it catches up.
+            store::mark_checked(&late_ks, now_unix()).unwrap();
+            let (late_ep, _) = bind(&late, &late_ks, &book, false).await;
+            let pulled = catch_up(&late_ep, &late_ks).await.unwrap();
+            assert_eq!(pulled.as_ref(), Some(&second));
+            assert!(
+                store::read(&late_ks, f.root)
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    .assigns(&ServiceName::new("orders-db").unwrap(), late.node_id())
+            );
+            admin_ep.close().await;
+            late_ep.close().await;
         }
     }
 }

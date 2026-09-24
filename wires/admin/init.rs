@@ -16,10 +16,23 @@ use crate::now_unix;
 /// `init` arguments.
 #[derive(Args)]
 pub(crate) struct InitArgs {
-    /// Lifetime of this node's membership and of the first signed state
-    /// (`30d`, `12h`, … or seconds).
+    /// Lifetime of this node's membership (`30d`, `12h`, … or seconds).
     #[arg(long, default_value = Ttl::DEFAULT)]
     pub(crate) ttl: Ttl,
+    /// Lifetime of the first signed state.
+    #[arg(long, default_value = Ttl::DEFAULT)]
+    pub(crate) state_ttl: Ttl,
+}
+
+impl Default for InitArgs {
+    /// Both lifetimes at [`Ttl::DEFAULT`].
+    fn default() -> Self {
+        let ttl: Ttl = Ttl::DEFAULT.parse().expect("the default lifetime parses");
+        Self {
+            ttl,
+            state_ttl: ttl,
+        }
+    }
 }
 
 /// `init` against the resolved keystore.
@@ -61,7 +74,7 @@ pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
         a.ttl.not_after(now),
     )?)?;
     ks.save_names(&Default::default())?;
-    let state = super::service::edit_state(ks, a.ttl, |s| {
+    let state = super::service::edit_state(ks, a.state_ttl, |s| {
         s.members.insert(me.node_id());
         Ok(())
     })?;
@@ -82,9 +95,7 @@ mod tests {
     use crate::testutil::temp_dir;
 
     fn args() -> InitArgs {
-        InitArgs {
-            ttl: Ttl::DEFAULT.parse().unwrap(),
-        }
+        InitArgs::default()
     }
 
     #[test]

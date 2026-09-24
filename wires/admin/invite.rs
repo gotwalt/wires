@@ -2,7 +2,7 @@
 //! command each.
 //!
 //! Both are an edit of the admin-signed state ([`edit_state`]), pushed to
-//! every member by key (hosts first). `invite` also mints the new member's
+//! the hosts by key ([`propagate`](super::propagate)). `invite` also mints the new member's
 //! membership and bundles it with the new state into one [`Invite`] token;
 //! `remove` has nothing to hand out — the removed node is simply not in the
 //! new state, and every host refuses its next call (the host re-reads its
@@ -18,6 +18,7 @@ use clap::Args;
 use library::{Invite, Membership, NodeId, SignedState};
 
 use super::keystore::{self, Keystore};
+use super::propagate;
 use super::service::edit_state;
 use super::ttl::Ttl;
 use crate::now_unix;
@@ -32,10 +33,14 @@ pub(crate) struct InviteArgs {
     /// `wires service add --host <name>`.
     #[arg(long)]
     pub(crate) name: Option<String>,
-    /// Lifetime of the invitee's membership and of the new signed state
-    /// (`30d`, `12h`, … or seconds).
+    /// Lifetime of the invitee's membership (`30d`, `12h`, … or seconds).
+    /// The signed state's own lifetime is `--state-ttl`.
     #[arg(long, default_value = Ttl::DEFAULT)]
     pub(crate) ttl: Ttl,
+    /// Lifetime of the new signed state, from now. Never shortens the
+    /// current state's expiry.
+    #[arg(long, default_value = Ttl::DEFAULT)]
+    pub(crate) state_ttl: Ttl,
 }
 
 /// `remove` arguments.
@@ -44,37 +49,37 @@ pub(crate) struct RemoveArgs {
     /// The member to remove: a name given to `wires invite --name`, or a hex
     /// node id.
     pub(crate) member: String,
-    /// Lifetime of the new signed state (`30d`, `12h`, … or seconds).
+    /// Lifetime of the new signed state, from now (`30d`, `12h`, … or
+    /// seconds). Never shortens the current state's expiry.
     #[arg(long, default_value = Ttl::DEFAULT)]
-    pub(crate) ttl: Ttl,
+    pub(crate) state_ttl: Ttl,
 }
 
 /// What an admin command prints: `stdout` is the result (the token, for
-/// `invite`), `notes` go to stderr.
+/// `invite`), `notes` go to stderr, and a `failure` (the new state reached
+/// no host) goes last on stderr and makes the command exit 1.
 #[derive(Debug)]
 pub(crate) struct Report {
-    /// The command's result, for stdout.
+    /// The command's result, for stdout (nothing when empty).
     pub(crate) stdout: String,
     /// Progress and hints, for stderr.
     pub(crate) notes: Vec<String>,
+    /// Why the command failed after doing its work, if it did.
+    pub(crate) failure: Option<String>,
 }
 
-/// `invite` against the resolved keystore, then push the new state.
+/// `invite` against the resolved keystore, then push the new state. The
+/// token is printed even when the push reached no host (the invitee can
+/// still join), but the command fails.
 pub(crate) async fn invite_cmd(a: InviteArgs) -> anyhow::Result<Report> {
     let ks = Keystore::resolve()?;
+    let earlier = crate::state::sync::held_hosts(&ks)?;
     let mut report = invite_in(&ks, a)?;
-    report
-        .notes
-        .insert(report.notes.len() - 1, push_note(&ks).await);
+    // The "on the joining machine" hint stays last.
+    let hint = report.notes.pop();
+    let mut report = propagate::fold(report, propagate::propagate(&ks, &earlier).await);
+    report.notes.extend(hint);
     Ok(report)
-}
-
-/// Push the stored state to every member (hosts first) and say how it went.
-async fn push_note(ks: &Keystore) -> String {
-    match crate::state::sync::push_current(ks).await {
-        Ok(line) => line,
-        Err(e) => format!("the new state is stored but was not pushed: {e:#}"),
-    }
 }
 
 /// [`invite_cmd`] against an explicit keystore, without the push (the
@@ -101,7 +106,7 @@ pub(crate) fn invite_in(ks: &Keystore, a: InviteArgs) -> anyhow::Result<Report> 
     let membership = Membership::mint(&root, invitee, now, a.ttl.not_after(now))?;
     let rejoin =
         crate::state::store::read(ks, root.node_id())?.is_some_and(|s| s.state.is_member(invitee));
-    let state = edit_state(ks, a.ttl, |s| {
+    let state = edit_state(ks, a.state_ttl, |s| {
         s.members.insert(invitee);
         Ok(())
     })?;
@@ -132,23 +137,27 @@ pub(crate) fn invite_in(ks: &Keystore, a: InviteArgs) -> anyhow::Result<Report> 
     Ok(Report {
         stdout: token,
         notes,
+        failure: None,
     })
 }
 
 /// `remove` against the resolved keystore: out of the signed state, then
-/// pushed (hosts first).
+/// pushed to the hosts (including the removed node, if it hosted).
 pub(crate) async fn remove_cmd(a: RemoveArgs) -> anyhow::Result<Report> {
     let ks = Keystore::resolve()?;
-    let mut report = remove_in(&ks, a)?;
-    report.notes.push(push_note(&ks).await);
-    Ok(report)
+    let earlier = crate::state::sync::held_hosts(&ks)?;
+    let report = remove_in(&ks, a)?;
+    Ok(propagate::fold(
+        report,
+        propagate::propagate(&ks, &earlier).await,
+    ))
 }
 
 /// [`remove_cmd`] against an explicit keystore, without the push (the
 /// testable form).
 pub(crate) fn remove_in(ks: &Keystore, a: RemoveArgs) -> anyhow::Result<Report> {
     let (member, label) = resolve_removal(ks, &a.member)?;
-    let Some(state) = drop_from_state(ks, member, a.ttl)? else {
+    let Some(state) = drop_from_state(ks, member, a.state_ttl)? else {
         bail!("{} is not a member", member.hex());
     };
     let mut names = ks.read_names()?;
@@ -163,6 +172,7 @@ pub(crate) fn remove_in(ks: &Keystore, a: RemoveArgs) -> anyhow::Result<Report> 
             state.state.members.len()
         ),
         notes: Vec::new(),
+        failure: None,
     })
 }
 
@@ -274,13 +284,7 @@ mod tests {
     fn invite_then_remove_edits_the_signed_state() {
         use crate::admin::init::{InitArgs, init_in};
         let ks = Keystore::at(crate::testutil::temp_dir());
-        init_in(
-            &ks,
-            InitArgs {
-                ttl: Ttl::DEFAULT.parse().unwrap(),
-            },
-        )
-        .unwrap();
+        init_in(&ks, InitArgs::default()).unwrap();
         let root = ks.read_root_identity().unwrap().unwrap();
         let alice = NodeIdentity::from_seed([2u8; 32]);
         let report = invite_in(
@@ -289,6 +293,7 @@ mod tests {
                 node_id: alice.node_id().hex(),
                 name: Some("alice".into()),
                 ttl: Ttl::DEFAULT.parse().unwrap(),
+                state_ttl: Ttl::DEFAULT.parse().unwrap(),
             },
         )
         .unwrap();
@@ -299,7 +304,7 @@ mod tests {
             &ks,
             RemoveArgs {
                 member: "alice".into(),
-                ttl: Ttl::DEFAULT.parse().unwrap(),
+                state_ttl: Ttl::DEFAULT.parse().unwrap(),
             },
         )
         .unwrap();
@@ -316,13 +321,61 @@ mod tests {
         // Removing again, or removing this machine's own node, is refused.
         let again = RemoveArgs {
             member: alice.node_id().hex(),
-            ttl: Ttl::DEFAULT.parse().unwrap(),
+            state_ttl: Ttl::DEFAULT.parse().unwrap(),
         };
         assert!(remove_in(&ks, again).is_err());
         let me = RemoveArgs {
             member: keystore::node_identity_in(&ks).unwrap().node_id().hex(),
-            ttl: Ttl::DEFAULT.parse().unwrap(),
+            state_ttl: Ttl::DEFAULT.parse().unwrap(),
         };
         assert!(format!("{:#}", remove_in(&ks, me).unwrap_err()).contains("own node"));
+    }
+
+    /// Card 28 §8: `invite --ttl` is the membership's lifetime only; the
+    /// state's comes from `--state-ttl`, and never moves earlier.
+    #[test]
+    fn invite_ttl_is_the_membership_and_never_shortens_the_state() {
+        use crate::admin::init::{InitArgs, init_in};
+        let ks = Keystore::at(crate::testutil::temp_dir());
+        init_in(&ks, InitArgs::default()).unwrap();
+        let root = ks.read_root_identity().unwrap().unwrap().node_id();
+        let before = crate::state::store::read(&ks, root)
+            .unwrap()
+            .unwrap()
+            .state
+            .not_after;
+        let alice = NodeIdentity::from_seed([2u8; 32]);
+        let report = invite_in(
+            &ks,
+            InviteArgs {
+                node_id: alice.node_id().hex(),
+                name: None,
+                ttl: "1h".parse().unwrap(),
+                state_ttl: Ttl::DEFAULT.parse().unwrap(),
+            },
+        )
+        .unwrap();
+        let invite = Invite::decode(&report.stdout).unwrap();
+        let now = now_unix();
+        assert!(invite.membership.not_after <= now + 3600);
+        assert!(
+            invite.state.state.not_after >= before,
+            "the state kept its lifetime"
+        );
+        assert!(invite.state.state.not_after >= now + 29 * 86_400);
+        // A short --state-ttl doesn't pull the expiry in either.
+        let bob = NodeIdentity::from_seed([3u8; 32]);
+        let report = invite_in(
+            &ks,
+            InviteArgs {
+                node_id: bob.node_id().hex(),
+                name: None,
+                ttl: Ttl::DEFAULT.parse().unwrap(),
+                state_ttl: "1h".parse().unwrap(),
+            },
+        )
+        .unwrap();
+        let invite = Invite::decode(&report.stdout).unwrap();
+        assert!(invite.state.state.not_after >= before);
     }
 }
