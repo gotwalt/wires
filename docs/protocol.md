@@ -257,8 +257,9 @@ client both check is owned by `geteuid()`:
 **The call log** (`library/calls/call_log.rs`, `wires/host/call_log.rs`). Every `AuditRecord` a host
 produces (`started {call, caller, principal?, tool, argv, roster_version?, role?}` — `roster_version`
 carries the state version — `finished {call, exit, duration_ms, stdout/stderr bytes, stdout_digest,
-stdin_bytes, stdin_digest, stdin_head ≤4 KiB}`, `denied {caller, tool?, reason}`, `push {id, to,
-subject, outcome, reason?, body?, call?}`) becomes a `LogEntry { v: 1, host, seq, prev, at_ms, record,
+stdin_bytes, stdin_digest, stdin_head ≤4 KiB}`, `denied {caller, principal?, tool?, reason}`, `push {id, to,
+principal?, role?, subject, outcome, reason?, body?, call?}`; a `principal` is the verified
+`{issuer, subject, email?, …}`) becomes a `LogEntry { v: 1, host, seq, prev, at_ms, record,
 sig }`: dense 0-based `seq`, `prev` the hash of the previous entry (zero at seq 0), signed by the
 host over `"wires/call-log/v1\0"` ‖ canonical JSON of the other fields. `verify_chain` reports a bad
 signature, a gap, a broken link or a fork. The log is `call-log.jsonl` (fsync per entry), re-verified
@@ -267,15 +268,44 @@ on open, pruned from the front after 30 days, and optionally exported over OTLP/
 against a copy someone holds.
 
 **The record stream** (`wires/records/1`, `wires/host/record_stream.rs`): length-prefixed JSON
-frames. The reader sends `open {hello, services, since?, mine, follow}`. The host answers `denied`
-(not a member), or `granted {scopes}`: per requested service assigned here, `all` when the reader is
-in one of the service's `readers` roles and didn't ask for `mine`, else `mine`. Then `batch`es of
-items after `since`, `caught_up`, and with `follow` more batches as the log grows. Each entry is sent
-either **in full** (signed, as stored) or inside a `hidden` run carrying only its `{prev, hash}`
-link, so the reader checks the chain across what it may not see. An entry is shown in full when its
-service was granted `all`, or when the reader is its subject (the caller of a call or refusal, the
-recipient of a push). `wires watch` merges the hosts' backlogs by time and keeps its verified tip per
-host in `record-marks.json`; a broken chain stops that host's stream with an alarm (exit 1).
+frames. The reader sends `open {hello, services, since?, mine, follow}`. The host checks membership
+first: a reader that isn't a current member gets `denied` with the fixed text `not admitted to this
+fabric` and nothing else. Otherwise it answers `granted {scopes, tip?, first?}`: per requested service
+assigned here, `all` when the reader's verified principal is in one of the service's `readers` roles
+and it didn't ask for `mine`, else `mine`; `tip` is the log's newest `{seq, hash}` and `first` the
+oldest seq it still holds. Then `batch`es of items after `since`, `caught_up`, and with `follow` more
+batches as the log grows. A `follow` stream is re-decided (membership, freshness, readers) whenever the
+host's signed state changes and when the reader's ID token, the state or its membership expires:
+`denied` ends it when access is gone (including an ID token that expired: the reader logs in and
+watches again), and a new `granted` precedes entries decided under a changed view.
+
+Each entry is sent either **in full** (signed, as stored) or inside a `hidden` run carrying only its
+`{prev, hash}` link, so the reader checks the chain across what it may not see. An entry is shown in
+full when its service was requested and granted `all`, or when its service was requested and its
+subject is the reader's **person**: the same verified principal (issuer and `sub`) the host verifies
+for the reader now, whichever node either used. A reader with no verified principal sees nothing in
+full. Subjects and services: `started` — its tool, its `principal`; `finished` — its `started`'s (if
+that was pruned, the entry is only a hidden link); `denied` — its tool, its `principal` (no tool:
+shown only to its subject); `push` — the service of the call whose capability sent it (`call` → that
+call's `started`), and the principal it was admitted for. An operator push (no `call`), or one whose
+call's `started` was pruned, is shown only to its recipient.
+
+What hidden links reveal: a reader in no `readers` role still learns how many entries each host it
+reads logged, and under `follow`, when each was written (a run arrives as the entries are appended).
+Not what, by whom, or for which service. (Card 29 replaces this with checkpoints and inclusion proofs,
+and drops hidden links for non-readers.)
+
+`wires watch` merges the hosts' backlogs by time. It keeps, in `record-marks.json`, **one chain anchor
+per host** (the furthest entry it verified there, under any view) and a **resume point per view** (the
+services asked of that host, `mine`). A view resumes from its own point, and wherever its stream passes
+the anchor the entry there must be the one verified before, and the next must link to it; entries
+before the anchor are shown only once the anchor confirms them. So a rewrite is caught even by a view
+that never saw that stretch. Against `granted`: a `tip` below the anchor is a rollback, and a different
+hash at the anchor a fork; both are alarms. A `first` past the entry after the anchor is retention: a
+notice (`host … pruned entries before seq N (retention)`), and the anchor restarts from what the host
+still holds. Any alarm stops that host's stream (exit 1) and leaves its marks at the last good entry.
+The service label a line shows is the reader's own, derived from signed records: a `started`'s tool,
+paired locally with its `finished` and the pushes naming its call; the host sends no label.
 
 Nothing is broadcast: a record leaves a host only when a reader asks for it and may see it.
 
@@ -293,7 +323,7 @@ Nothing is broadcast: a record leaves a host only when a reader asks for it and 
 | `hints` | — | any node | optional local dial hints (below) |
 | `tools.json` | — | caller | locked mode; optional aliases |
 | `inbox/` | 0700 | caller | `new/` (≤256 unread), `read/` (last 1024), `notes/` |
-| `record-marks.json` | — | reader | `wires watch` tips |
+| `record-marks.json` | — | reader | `wires watch`: per host, the chain anchor, a resume point per view, recent call labels |
 | `call-log.jsonl`, `push-queue.json` | — | host | §8, §7 |
 | `jwks/` | — | caller | cached issuer keys (a host never reads it, §6) |
 | `run/serve.sock`, `run/hint` | 0600 | host | the operator's push socket; this host's own hint line |

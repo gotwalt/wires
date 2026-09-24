@@ -12,7 +12,7 @@ choices, the limits, and the command reference. The wire-level spec is
 | **admin** | who's in, which roles exist, which services run where, who may call and read each (root key) | `init`, `invite`, `remove`, `role set\|rm`, `service add\|set\|rm` |
 | **host** | how it implements its assigned services; which IdPs it trusts; stricter local rules; push | `serve host.json`, `push` |
 | **caller** | — runs services by name; MCP only for backward compatibility | `id`, `join`, `login`, `services`, `call`, `mcp`, `inbox` |
-| **reader** | — any member; reads the records a service's `readers` role allows, or its own | `watch` |
+| **reader** | — any member; reads the records a service's `readers` role allows, or its own (by verified identity) | `watch` |
 
 Every role joins the same way: `wires id`, then `wires join <token>` with the admin's invite.
 
@@ -26,7 +26,7 @@ Every role joins the same way: `wires id`, then `wires join <token>` with the ad
 | **Who is calling** | Your IdP's ID token, bound to the caller's node key at `wires login` (the OIDC `nonce` is a hash of the key), presented in the session `Hello`. | The host, against the issuer's JWKS, under the issuers `host.json` trusts. No wires identity service. |
 | **Reach** | The host's node key. Callers dial a key (iroh; n0 discovery, or an optional local `$WIRES_HOME/hints` file); the host binds UDP for QUIC and has no TCP listener. | iroh's handshake authenticates the key; the host then checks the membership and the state. |
 | **Which host** | The registry's `hosts` for the service. Only the admin binds a name to a host, so no host can squat a name. | The caller (it dials only those hosts) and the host (it refuses to start, or to serve, a name not assigned to it). |
-| **Records** | Each host's own call log: every call, refusal and push, signed by the host and hash-linked. | Readers, with `wires watch`: the service's `readers` roles see all of it, everyone else only their own calls; every entry and the chain are verified. |
+| **Records** | Each host's own call log: every call, refusal and push, signed by the host and hash-linked. | Readers, with `wires watch`: the service's `readers` roles see all of it; everyone else sees only the records of their own verified identity (issuer and subject, from any of their nodes) and a hash link for every other entry. Every entry and the chain are verified. |
 | **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. | The host, at send, delivery and fetch: a member of the state, in a `push.allow` role. |
 | **Removal** | A new state, pushed hosts first. No shared key exists, so there is nothing to rotate. | Every host, on the removed member's next call or fetch. |
 
@@ -168,6 +168,10 @@ observer$ wires watch orders-db --once
 ```
 
 The agent's own `wires watch` shows its calls and not the observer's refusal.
+"Its own" means its person's: the records whose verified identity (issuer and
+subject) is the one the agent's ID token proves, from any node. Without a
+verified ID token, a reader sees nothing in full. A push from the host
+operator belongs to no service, so only its recipient sees its record.
 
 **7. Failover and removal.** With the workbench stopped, the same command is
 answered by the spare (`wires call --verbose` says which host answered;
@@ -342,7 +346,7 @@ To make `wires` the boundary, use a structural setup:
 | | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name (or a `tools.json` alias). Stdio passes through and its exit code becomes `call`'s. A refusal exits `77`. |
 | | `wires mcp` | Serve the same services as MCP tools over stdio, for clients that can't run a CLI. |
 | | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`. |
-| **reader** | `wires watch [service…] [--mine] [--once] [--json]` | Stream call records from your services' hosts, verified: all records of services whose `readers` role you're in, otherwise your own. |
+| **reader** | `wires watch [service…] [--mine] [--once] [--json]` | Stream call records from your services' hosts, verified: all records of services whose `readers` role you're in, otherwise your own (your verified identity's, from any node). A following stream is re-decided when the signed state changes or your ID token expires, and ends with the refusal when access is gone. A log rolled back below what you verified is an alarm (exit 1); entries pruned past it (retention) are a notice. The service each line names is derived from the signed records, not supplied by the host. |
 
 For an MCP-only client, the whole config is:
 
@@ -390,7 +394,7 @@ since a host's control socket lives under it and socket paths are limited to
 | `hints` | you | Optional local dial hints (below). |
 | `tools.json` | `tools add`, the operator | Locked mode; optional aliases. |
 | `inbox/` | `inbox` | Pushed messages: `new/` unread (at most 256, oldest evicted with a note), `read/` the last 1024 (0700). |
-| `record-marks.json` | `watch` | The last verified record per host. |
+| `record-marks.json` | `watch` | Per host: the furthest verified entry (the anchor every view is checked against), where each view (services, `--mine`) resumes, and recent calls' services for labels. Delete it to start over after an alarm you have resolved. |
 | `call-log.jsonl`, `push-queue.json`, `run/` | `serve` | A host's call log, undelivered pushes, control socket and own hint line. |
 
 Secrets resolve **flag → environment variable → `--…-file` → keystore**, so
