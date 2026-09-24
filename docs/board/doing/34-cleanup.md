@@ -527,3 +527,61 @@ Delete, or rewrite so the test can fail for the reason in its name.
   demo.md follow. The GIF/MP4 re-record is card 08's (it records anyway).
 - **D3 → yes.** The board table lists open cards; `done/` holds the rest.
 - **D4 → yes.** `config_v2` → `config`, `HostConfigV2` → `HostConfig`, etc.
+
+### Phase 1 (done)
+
+The cross-cutting changes the later lanes build on. `make lint`,
+`cargo test --workspace`, `make demo` and `.scripts/demo-push.sh` pass.
+
+- **§B1.** `ToolName`, `MAX_TOOL_NAME` and `Error::InvalidToolName` are
+  gone; `ServiceName` (with `MAX_SERVICE_NAME`, exported) validates itself.
+  `Invocation.service`, `AuditRecord::{Started,Denied}.service`,
+  `CallArgs.service`; the two `From` impls and `service_and_tool_names_agree`
+  deleted (`tool_name_rules` folded into `registry::name_rules`). The child
+  env loses `WIRES_TOOL` (it always equalled `WIRES_SERVICE`), and the OTLP
+  attribute `wires.tool` is now `wires.service`. The alias file keeps its
+  `remote_tool` key (typed `ServiceName` now); D1's lane decides its shape.
+- **§C1/C2.** `Started` carries a required `state_version: StateVersion` and
+  `role: RoleName`; the `serde(default)`s on `stdin_bytes`/`stdin_digest` and
+  `Invocation.argv` are gone. Deleted `an_old_finished_record_still_parses`
+  and `started_role_is_optional_on_the_wire` (compat shims); replaced by
+  `started_records_the_service_version_and_role`. protocol.md §8 updated.
+  `Push.role` stays optional (a push isn't always role-admitted).
+- **§B3.** `wires/clock.rs`: `now_unix()`, `now_ms()`; the wrappers in
+  `inbox.rs`, `push.rs`, `lib.rs` and `host::audit::now_ms` are gone.
+- **§B4/§C5.** `codec::hex_id!` declares `CallId`, `PushId`, `OutputDigest`,
+  `EntryHash` (all now `Hash` + `Display`; `EntryHash::as_bytes` dropped);
+  `codec::{length_prefixed, prefix_len, split_frame}` frame the session,
+  state-sync and inbox codecs. `BadKeyLength` → `BadLength`,
+  `TicketDecode` → `TokenDecode`.
+- **§B6 helpers.** `Principal::name()` (replaces
+  `host::identity::principal_name`, its test, and the variants in
+  `services.rs`/`login.rs`; `wires login` now prints `sub at issuer` when
+  there is no email). `NodeId::short()` (8 hex) replaces `pick::short`,
+  `tools::short` (was 16) and the inline `&hex()[..8]`/`[..16]` on node ids.
+  `library::B64` is the one URL_SAFE_NO_PAD engine. `store::require(ks)` and
+  `store::require_state(ks, root)` replace the six "run `wires join`"
+  lookups (inbox's duplicate check deleted). One `net::is_loopback` (three
+  copies before, counting otlp.rs). The JSON-RPC codes live in
+  `caller/mcp.rs` only; the gateway and e2e tests use them.
+- **§A6** (it went with `store::require`): `hello::build` and
+  `no_membership_is_an_error` deleted; the other test calls `with_membership`.
+- **D4/§C3.** `host/config.rs`, `HostConfig`, `Push`, `HOST_CONFIG`; the v1
+  refusal is the generic "version N is not supported"; its tests
+  (`v1_is_refused_with_the_way_forward`, the v1 case in `serve.rs`) deleted.
+  "v2 host" / "The v2 responder" prose is "host". The file's `"version": 2`
+  is unchanged.
+- **D2.** "not a member of this network", `init` prints `network <id>`,
+  `join` says `joined network …`, "network root" in errors; the scripts, demo.md,
+  usage.md, protocol.md, deployment.md, executive-summary.md and the board
+  README follow.
+
+Deliberately left:
+
+- `wires watch` lines keep 4-hex ids (`short_hex`/`short_node`): the line is
+  dense, and usage.md and the recorded casts quote that width.
+- `WIRES_FABRIC_ROOT` (a child env name) and the internal `fabric` field and
+  helper names stay, per D2 ("internal identifiers stay").
+- `gateway/mod.rs` keeps its own "the gateway holds no signed state" lookups
+  (different wording, and §B6's gateway items are that lane's).
+- `cargo doc` warnings (§D3) are unchanged by this phase; none are new.
