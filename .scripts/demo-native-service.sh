@@ -191,12 +191,13 @@ grep -qF "kv: serving as $HOST_ID" "$D/host.err" || bad "the $LANG_NAME host is 
 for h in "$root" "$agent" "$other"; do cp "$host/run/hint" "$h/hints"; done
 ok "the $LANG_NAME host serves kv as ${HOST_ID:0:8}... (pid $HOST_PID)"
 
-# The callers join; each invite is a new state, pushed to the $LANG_NAME host.
+# The callers join. An invite mints a badge and edits nothing, so nothing is
+# pushed to the $LANG_NAME host.
 AG_TOKEN="$(admin invite "$AG_ID" --name agent 2>"$D/invite.err")"
 OT_TOKEN="$(admin invite "$OT_ID" --name other 2>>"$D/invite.err")"
-grep -qF "pushed to 1 of 1 host(s)" "$D/invite.err" || {
+! grep -qF "pushed to" "$D/invite.err" || {
 	dump "$D/invite.err"
-	bad "the invites' state never reached the $LANG_NAME host"
+	bad "an invite pushed a state to the $LANG_NAME host"
 }
 WIRES_HOME="$agent" "$WIRES" join "$AG_TOKEN" >/dev/null
 WIRES_HOME="$other" "$WIRES" join "$OT_TOKEN" >/dev/null

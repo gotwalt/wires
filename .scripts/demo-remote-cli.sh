@@ -130,8 +130,9 @@ agent="$D/agent"
 obs="$D/observer"
 mkdir -p "$root" "$wb" "$sp" "$agent" "$obs"
 
-# The admin starts the network (and is a member itself); every other machine
-# makes its key and hands the admin its id. One invite token back each.
+# The admin starts the network (its own node holds a badge too); every other
+# machine makes its key and hands the admin its id. One invite token back
+# each: a badge, which is what admits the node.
 ROOT_ID="$(WIRES_HOME="$root" "$WIRES" init | awk '/^network /{print $2}')"
 WB_ID="$(WIRES_HOME="$wb" "$WIRES" id 2>/dev/null)"
 SP_ID="$(WIRES_HOME="$sp" "$WIRES" id 2>/dev/null)"
@@ -158,7 +159,7 @@ say "five keystores on this machine stand in for five machines:"
 say "  workbench  ${WB_ID:0:8}...  and spare ${SP_ID:0:8}...: both implement orders-db"
 say "  agent      ${AG8}...  your agent's machine ($EMAIL)"
 say "  observer   ${OB_ID:0:8}...  $READER: may read the records, may call nothing"
-say "  root       the human who signs who's in and what runs where"
+say "  root       the human who admits nodes and signs what runs where"
 say "and a stand-in IdP at $ISSUER (card 08 swaps in Google)."
 beat 5
 
@@ -200,8 +201,8 @@ start_host "$sp" spare
 SP_PID=$LAST_PID
 share_hints
 ok "1: workbench (pid $WB_PID) and spare (pid $SP_PID) serve orders-db, reached by key"
-# The agent and the observer are invited now; each invite is a new state,
-# pushed to both hosts.
+# The agent and the observer are invited now. An invite mints a badge and
+# edits nothing: the state's version doesn't move, and nothing is pushed.
 AG_TOKEN="$(admin invite "$AG_ID" --name agent 2>"$D/invite.err")" || {
 	cat "$D/invite.err" >&2
 	bad "setup: inviting the agent failed"
@@ -210,10 +211,10 @@ OB_TOKEN="$(admin invite "$OB_ID" --name observer 2>>"$D/invite.err")" || {
 	cat "$D/invite.err" >&2
 	bad "setup: inviting the observer failed"
 }
-grep -qF "pushed to 2 of 2 host(s)" "$D/invite.err" || {
+if [ "$(grep -cF "unchanged" "$D/invite.err")" -ne 2 ] || grep -qF "pushed to" "$D/invite.err"; then
 	cat "$D/invite.err" >&2
-	bad "setup: the invites' state never reached the two hosts"
-}
+	bad "setup: an invite edited the state or pushed it"
+fi
 WIRES_HOME="$agent" "$WIRES" join "$AG_TOKEN" >/dev/null
 WIRES_HOME="$obs" "$WIRES" join "$OB_TOKEN" >/dev/null
 beat 2
@@ -583,7 +584,7 @@ set +e
 WIRES_HOME="$wb" "$WIRES" push --to "$AG_ID" --subject after-removal -- "x" >"$D/p3.out" 2>"$D/p3.err"
 rc=$?
 set -e
-if ! { [ "$rc" -eq "$EXIT_DENIED" ] && grep -qF "not a member of the current signed state" "$D/p3.out"; }; then
+if ! { [ "$rc" -eq "$EXIT_DENIED" ] && grep -qF "banned until" "$D/p3.out"; }; then
 	cat "$D/p3.out" "$D/p3.err" >&2
 	bad "9: a push to the removed agent exited $rc, expected $EXIT_DENIED"
 fi
