@@ -58,6 +58,11 @@ pub const OIDC_NONCE_CONTEXT: &str = "wires oidc-nonce v1";
 /// How far `exp` / `iat` may be off from the verifier's clock, in seconds.
 pub const CLOCK_SKEW_SECS: i64 = 60;
 
+/// Google's issuer identifier: the one issuer whose `hd` (hosted domain)
+/// claim becomes [`Principal::org`], and the issuer `wires role set` names
+/// when none is given.
+pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
+
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// A raw OIDC ID token: a compact JWS (`header.payload.signature`), exactly as
@@ -247,7 +252,8 @@ pub struct Principal {
     /// The `email` claim, when present and `email_verified` is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
-    /// The Google Workspace hosted domain (`hd`) or equivalent org claim.
+    /// The Google Workspace hosted domain (`hd`), read only when the issuer
+    /// is exactly [`GOOGLE_ISSUER`]; `None` for every other issuer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org: Option<String>,
     /// Group memberships, when the IdP asserts them.
@@ -293,7 +299,8 @@ pub struct IdentityClaim {
 /// 6. `nonce` equals [`OidcNonce::for_node`] of `claim.node`.
 ///
 /// `email` is surfaced only when `email_verified` is true; `hd` becomes
-/// [`Principal::org`]; a string-array `groups` claim becomes
+/// [`Principal::org`] only when the issuer is exactly [`GOOGLE_ISSUER`]
+/// (another IdP's `hd` is just a claim, never an org); a string-array `groups` claim becomes
 /// [`Principal::groups`].
 pub fn verify_claim(
     claim: &IdentityClaim,
@@ -359,7 +366,9 @@ pub fn verify_claim(
     let email = verified
         .then(|| p.get("email").and_then(Value::as_str).map(str::to_string))
         .flatten();
-    let org = p.get("hd").and_then(Value::as_str).map(str::to_string);
+    let org = (iss == GOOGLE_ISSUER)
+        .then(|| p.get("hd").and_then(Value::as_str).map(str::to_string))
+        .flatten();
     let groups = match p.get("groups") {
         Some(Value::Array(items)) => items
             .iter()
@@ -757,15 +766,39 @@ mod tests {
                     issuer: ISS.into(),
                     subject: "1234567890".into(),
                     email: Some("alice@example.com".into()),
-                    org: Some("example.com".into()),
+                    org: None,
                     groups: vec![],
                     not_after: NOW + 3600,
                     claims: p.claims.clone(),
                 }
             );
             assert_eq!(p.claims["nonce"], OidcNonce::for_node(&node()).as_str());
-            assert_eq!(p.claims["hd"], "example.com");
+            assert_eq!(p.claims["hd"], "example.com", "kept as a claim, not an org");
         }
+    }
+
+    #[test]
+    fn hd_is_an_org_only_from_google() {
+        let google = |iss: &str| {
+            let claim = with(node(), Alg::Es256, |c| {
+                c.insert("iss".into(), iss.into());
+            });
+            verify_claim(
+                &claim,
+                &Issuer::new(iss),
+                &jwks(),
+                &[Audience::new(AUD)],
+                NOW,
+            )
+            .unwrap()
+        };
+        assert_eq!(google(GOOGLE_ISSUER).org.as_deref(), Some("example.com"));
+        assert_eq!(
+            google("accounts.google.com").org,
+            None,
+            "not exactly Google"
+        );
+        assert_eq!(google("https://okta.example").org, None);
     }
 
     #[test]

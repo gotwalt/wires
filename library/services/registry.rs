@@ -87,8 +87,8 @@ pub struct Service {
     /// What the service does, for callers and their agents (may be empty).
     pub description: String,
     /// The roles that may call it, tried in order; the first that admits the
-    /// caller is the one recorded. Empty: nobody (default deny). May list
-    /// [`RoleName::member`].
+    /// caller is the one recorded. Empty: nobody (default deny). Each must be
+    /// defined in [`State::roles`](crate::State::roles).
     pub allow: Vec<RoleName>,
     /// The hosts that implement it, in the admin's preference order. Each
     /// must be in [`State::hosts`](crate::State::hosts). Empty: registered

@@ -20,7 +20,7 @@
 //!   a v2 field.
 //!
 //! ```
-//! use library::{NodeIdentity, RoleName, Service, ServiceName, State, StateVersion};
+//! use library::{Matcher, NodeIdentity, RoleName, Service, ServiceName, State, StateVersion};
 //!
 //! let root = NodeIdentity::from_seed([1u8; 32]);
 //! let host = NodeIdentity::from_seed([2u8; 32]).node_id();
@@ -29,11 +29,13 @@
 //! state.not_after = i64::MAX;
 //! state.members.insert(host);
 //! state.hosts.insert(host);
+//! let staff = RoleName::new("staff").unwrap();
+//! state.roles.insert(staff.clone(), vec![Matcher::new("https://accounts.google.com")]);
 //! state.services.insert(
 //!     ServiceName::new("orders-db").unwrap(),
 //!     Service {
 //!         description: "Read-only SQL".into(),
-//!         allow: vec![RoleName::member()],
+//!         allow: vec![staff],
 //!         hosts: vec![host],
 //!         readers: vec![],
 //!     },
@@ -88,8 +90,8 @@ pub struct State {
     pub members: BTreeSet<NodeId>,
     /// The members that may serve services (a subset of `members`).
     pub hosts: BTreeSet<NodeId>,
-    /// Role definitions: name → OR of matchers. Never defines
-    /// [`MEMBER_ROLE`](crate::MEMBER_ROLE), which is built in.
+    /// Role definitions: name → OR of matchers. There is no built-in role:
+    /// a service's `allow` and `readers` name only roles defined here.
     pub roles: BTreeMap<RoleName, Vec<Matcher>>,
     /// The service registry.
     pub services: BTreeMap<ServiceName, Service>,
@@ -142,10 +144,9 @@ impl State {
     ///
     /// - `format` is [`STATE_V1`];
     /// - every host is a member;
-    /// - no role is named `member`, every role has matchers, and no matcher
-    ///   is empty (it would match everyone);
-    /// - every service's `allow` and `readers` name a defined role or
-    ///   `member`, and its `hosts` are hosts, each listed once.
+    /// - every role has matchers, and every matcher names an issuer;
+    /// - every service's `allow` and `readers` name a defined role, and its
+    ///   `hosts` are hosts, each listed once.
     pub fn validate(&self) -> Result<()> {
         let bad = |why: String| Err(Error::InvalidState(why));
         if self.format != STATE_V1 {
@@ -155,19 +156,16 @@ impl State {
             return bad(format!("host {} is not a member", h.hex()));
         }
         for (role, matchers) in &self.roles {
-            if role.is_member() {
-                return bad("role `member` is built in and can't be redefined".into());
-            }
             if matchers.is_empty() {
                 return bad(format!("role {role} has no matchers"));
             }
-            if matchers.iter().any(Matcher::is_empty) {
-                return bad(format!("role {role} has an empty matcher"));
+            if matchers.iter().any(|m| m.issuer.trim().is_empty()) {
+                return bad(format!("role {role} has a matcher with no issuer"));
             }
         }
         for (name, svc) in &self.services {
             for role in svc.allow.iter().chain(&svc.readers) {
-                if !role.is_member() && !self.roles.contains_key(role) {
+                if !self.roles.contains_key(role) {
                     return bad(format!("service {name} names undefined role {role}"));
                 }
             }
@@ -303,7 +301,7 @@ mod tests {
             RoleName::new("analyst").unwrap(),
             vec![Matcher {
                 email: Some("*@example.com".parse().unwrap()),
-                ..Default::default()
+                ..Matcher::new("https://idp.example")
             }],
         );
         s.services.insert(
@@ -312,7 +310,7 @@ mod tests {
                 description: "orders".into(),
                 allow: vec![RoleName::new("analyst").unwrap()],
                 hosts: vec![host],
-                readers: vec![RoleName::member()],
+                readers: vec![RoleName::new("analyst").unwrap()],
             },
         );
         s
@@ -347,10 +345,7 @@ mod tests {
             Err(Error::InvalidSignature)
         ));
         let mut t = signed;
-        t.state
-            .services
-            .values_mut()
-            .for_each(|s| s.allow = vec![RoleName::member()]);
+        t.state.services.values_mut().for_each(|s| s.allow = vec![]);
         assert!(t.verify(root().node_id()).is_err());
     }
 
@@ -377,13 +372,25 @@ mod tests {
         assert!(matches!(s.sign(&root()), Err(Error::InvalidState(_))));
 
         let mut s = sample();
-        s.roles.insert(RoleName::member(), vec![Matcher::default()]);
-        assert!(s.validate().is_err());
+        s.roles.insert(RoleName::new("x").unwrap(), vec![]);
+        assert!(s.validate().is_err(), "a role with no matchers");
 
         let mut s = sample();
         s.roles
-            .insert(RoleName::new("x").unwrap(), vec![Matcher::default()]);
-        assert!(s.validate().is_err());
+            .insert(RoleName::new("x").unwrap(), vec![Matcher::new(" ")]);
+        assert!(s.validate().is_err(), "a matcher with no issuer");
+
+        // `member` is not built in: undefined, it is an unknown role ...
+        let member = RoleName::new("member").unwrap();
+        let mut s = sample();
+        s.services
+            .values_mut()
+            .for_each(|svc| svc.allow = vec![member.clone()]);
+        assert!(s.validate().is_err(), "`member` is not built in");
+        // ... and defined, an ordinary one.
+        s.roles
+            .insert(member, vec![Matcher::new("https://idp.example")]);
+        s.validate().unwrap();
 
         let mut s = sample();
         s.services.values_mut().for_each(|svc| {

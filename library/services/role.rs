@@ -2,15 +2,13 @@
 //! [`Principal`] (card 27; the shape moved here from card 13's `host.json`).
 //!
 //! A **role** is an OR of [`Matcher`]s; a matcher is an AND of its keys
-//! (`issuer`, `email`, `org`, `group`). The built-in role [`MEMBER_ROLE`]
-//! admits any member of the signed state, verified identity or not, and can't
-//! be redefined. Role definitions live in the admin-signed
+//! (`issuer`, `email`, `org`, `group`). Every matcher names its issuer, so a
+//! role only ever admits a caller with a verified principal from that IdP:
+//! there is no built-in role, and no role admits a caller without an
+//! identity. "Anyone signed in with this IdP" is a matcher with only
+//! `issuer`. Role definitions live in the admin-signed
 //! [`State`](crate::State), so every host and every caller evaluates the same
 //! table.
-//!
-//! This is a copy of `wires/host/policy.rs`'s `RoleName` / `EmailPattern` /
-//! `Matcher` with `thiserror` errors; lane 27d deletes the binary's copy once
-//! the v1 `host.json` path is gone.
 
 use std::fmt;
 use std::str::FromStr;
@@ -19,9 +17,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::idp::Principal;
-
-/// The built-in role: any member of the signed state, with no IdP requirement.
-pub const MEMBER_ROLE: &str = "member";
 
 /// The longest role name accepted.
 pub const MAX_ROLE_NAME: usize = 64;
@@ -32,7 +27,8 @@ pub const MAX_ROLE_NAME: usize = 64;
 /// use library::RoleName;
 /// assert!(RoleName::new("analyst").is_ok());
 /// assert!(RoleName::new("has space").is_err());
-/// assert!(RoleName::member().is_member());
+/// // `member` is an ordinary name: nothing is built in.
+/// assert!(RoleName::new("member").is_ok());
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -52,16 +48,6 @@ impl RoleName {
             return Err(Error::InvalidRoleName);
         }
         Ok(Self(name))
-    }
-
-    /// The built-in [`MEMBER_ROLE`].
-    pub fn member() -> Self {
-        Self(MEMBER_ROLE.to_string())
-    }
-
-    /// Whether this is the built-in [`MEMBER_ROLE`].
-    pub fn is_member(&self) -> bool {
-        self.0 == MEMBER_ROLE
     }
 
     /// The name as a string slice.
@@ -172,29 +158,31 @@ impl fmt::Display for EmailPattern {
     }
 }
 
-/// One entry of a role: every key present must hold (AND).
+/// One entry of a role: `issuer` and every other key present must hold (AND).
 ///
 /// | key      | matches                                                   |
 /// |----------|-----------------------------------------------------------|
-/// | `issuer` | [`Principal::issuer`], exactly                            |
+/// | `issuer` | [`Principal::issuer`], exactly; **always required**       |
 /// | `email`  | the verified email: exact, or `*@domain` (the only glob)  |
 /// | `org`    | [`Principal::org`] (Google's `hd`), ASCII case-insensitive|
 /// | `group`  | one of [`Principal::groups`], exactly                     |
 ///
-/// A matcher never matches a caller without a verified principal, and an
-/// empty matcher is refused by [`State::validate`](crate::State::validate)
-/// (it would match everyone).
+/// Every matcher names the IdP it trusts, so `*@acme.com` from one issuer is
+/// never satisfied by a token another trusted issuer minted for
+/// `alice@acme.com`. A matcher with only `issuer` admits anyone that IdP
+/// verified. A matcher never matches a caller without a verified principal,
+/// and a matcher whose `issuer` is empty is refused by
+/// [`State::validate`](crate::State::validate).
 ///
-/// Inside the signed state, absent keys are omitted from the canonical JSON;
-/// that is sound because the matcher is signed as part of the whole state
-/// body, and "absent" vs "present" can't be confused (there is no default
-/// value that means "any").
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Inside the signed state, absent optional keys are omitted from the
+/// canonical JSON; that is sound because the matcher is signed as part of the
+/// whole state body, and "absent" vs "present" can't be confused (there is no
+/// default value that means "any").
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Matcher {
-    /// `issuer`: the IdP, exactly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub issuer: Option<String>,
+    /// `issuer`: the IdP, exactly (e.g. `https://accounts.google.com`).
+    pub issuer: String,
     /// `email`: the verified email.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<EmailPattern>,
@@ -207,25 +195,46 @@ pub struct Matcher {
 }
 
 impl Matcher {
-    /// Whether no key is set.
-    pub fn is_empty(&self) -> bool {
-        self.issuer.is_none() && self.email.is_none() && self.org.is_none() && self.group.is_none()
+    /// A matcher on `issuer` alone (anyone that IdP verified); set the other
+    /// keys with struct-update syntax.
+    ///
+    /// ```
+    /// use library::Matcher;
+    /// let m = Matcher {
+    ///     email: Some("*@example.com".parse().unwrap()),
+    ///     ..Matcher::new("https://accounts.google.com")
+    /// };
+    /// assert_eq!(m.to_string(), "issuer=https://accounts.google.com,email=*@example.com");
+    /// ```
+    pub fn new(issuer: impl Into<String>) -> Self {
+        Self {
+            issuer: issuer.into(),
+            email: None,
+            org: None,
+            group: None,
+        }
     }
 
-    /// Whether `p` satisfies every key.
+    /// Whether `p` satisfies every key: its issuer is exactly `issuer`, and
+    /// each other key present holds.
     ///
     /// ```
     /// use library::{Matcher, Principal};
-    /// let m = Matcher { email: Some("*@example.com".parse().unwrap()), ..Default::default() };
-    /// let p = Principal {
+    /// let m = Matcher {
+    ///     email: Some("*@example.com".parse().unwrap()),
+    ///     ..Matcher::new("https://idp")
+    /// };
+    /// let mut p = Principal {
     ///     issuer: "https://idp".into(), subject: "1".into(),
     ///     email: Some("alice@example.com".into()), org: None, groups: vec![],
     ///     not_after: 0, claims: Default::default(),
     /// };
     /// assert!(m.matches(&p));
+    /// p.issuer = "https://other-idp".into();
+    /// assert!(!m.matches(&p), "same email, different IdP");
     /// ```
     pub fn matches(&self, p: &Principal) -> bool {
-        self.issuer.as_ref().is_none_or(|iss| p.issuer == *iss)
+        p.issuer == self.issuer
             && self
                 .email
                 .as_ref()
@@ -243,12 +252,10 @@ impl Matcher {
 }
 
 impl fmt::Display for Matcher {
-    /// `issuer=…,email=…,org=…,group=…` (the keys present, in that order).
+    /// `issuer=…,email=…,org=…,group=…` (`issuer`, then the keys present, in
+    /// that order).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut parts = Vec::new();
-        if let Some(v) = &self.issuer {
-            parts.push(format!("issuer={v}"));
-        }
+        let mut parts = vec![format!("issuer={}", self.issuer)];
         if let Some(v) = &self.email {
             parts.push(format!("email={v}"));
         }
@@ -265,10 +272,13 @@ impl fmt::Display for Matcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    const ISS: &str = "https://idp.example";
 
     fn principal(email: &str) -> Principal {
         Principal {
-            issuer: "https://idp.example".into(),
+            issuer: ISS.into(),
             subject: "s".into(),
             email: Some(email.into()),
             org: None,
@@ -291,7 +301,7 @@ mod tests {
         let m = Matcher {
             email: Some("*@example.com".parse().unwrap()),
             group: Some("sre".into()),
-            ..Default::default()
+            ..Matcher::new(ISS)
         };
         assert!(m.matches(&principal("a@example.com")));
         assert!(!m.matches(&principal("a@other.com")));
@@ -300,6 +310,15 @@ mod tests {
             ..m
         };
         assert!(!m.matches(&principal("a@example.com")));
+    }
+
+    #[test]
+    fn an_issuer_only_matcher_admits_anyone_that_idp_verified() {
+        let m = Matcher::new(ISS);
+        assert!(m.matches(&principal("anyone@anywhere.net")));
+        let mut p = principal("anyone@anywhere.net");
+        p.issuer = "https://elsewhere".into();
+        assert!(!m.matches(&p));
     }
 
     #[test]
@@ -314,6 +333,45 @@ mod tests {
 
     #[test]
     fn matcher_rejects_unknown_keys() {
-        assert!(serde_json::from_str::<Matcher>(r#"{"emial":"a@b.c"}"#).is_err());
+        assert!(
+            serde_json::from_str::<Matcher>(r#"{"issuer":"https://i","emial":"a@b.c"}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn matcher_requires_an_issuer_on_the_wire() {
+        assert!(serde_json::from_str::<Matcher>(r#"{"email":"a@b.c"}"#).is_err());
+        let m: Matcher = serde_json::from_str(r#"{"issuer":"https://i","email":"a@b.c"}"#).unwrap();
+        assert_eq!(m.issuer, "https://i");
+    }
+
+    proptest! {
+        /// A matcher never matches a principal from another issuer, whatever
+        /// the other keys and claims say.
+        #[test]
+        fn a_matcher_never_crosses_issuers(
+            matcher_iss in "https://[a-c]\\.example",
+            token_iss in "https://[a-c]\\.example",
+            email in prop::option::of(prop::sample::select(vec!["*@acme.com", "alice@acme.com"])),
+            org in prop::option::of(Just("acme.com".to_string())),
+            group in prop::option::of(Just("sre".to_string())),
+        ) {
+            let m = Matcher {
+                email: email.map(|e| e.parse().unwrap()),
+                org,
+                group,
+                ..Matcher::new(matcher_iss.clone())
+            };
+            let p = Principal {
+                issuer: token_iss.clone(),
+                subject: "s".into(),
+                email: Some("alice@acme.com".into()),
+                org: Some("acme.com".into()),
+                groups: vec!["sre".into()],
+                not_after: 0,
+                claims: Default::default(),
+            };
+            prop_assert_eq!(m.matches(&p), matcher_iss == token_iss);
+        }
     }
 }

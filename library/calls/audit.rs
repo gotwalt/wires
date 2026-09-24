@@ -267,9 +267,8 @@ pub enum AuditRecord {
         /// field keeps its channel-era name so older logs still parse).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         roster_version: Option<u64>,
-        /// The host policy role that admitted the caller (`host.json`'s
-        /// `roles`, or the built-in `member`). `None` in records written
-        /// before roles existed.
+        /// The role in the signed state that admitted the caller. `None` in
+        /// records written before roles existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
         /// Unix milliseconds at authorization.

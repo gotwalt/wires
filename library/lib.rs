@@ -66,7 +66,10 @@
 //! s.hosts.insert(host.node_id());
 //! s.roles.insert(
 //!     analyst.clone(),
-//!     vec![Matcher { email: Some("*@example.com".parse().unwrap()), ..Default::default() }],
+//!     vec![Matcher {
+//!         email: Some("*@example.com".parse().unwrap()),
+//!         ..Matcher::new("https://accounts.google.com")
+//!     }],
 //! );
 //! s.services.insert(
 //!     orders.clone(),
@@ -85,7 +88,7 @@
 //! let membership = Membership::mint(&root, alice.node_id(), 0, i64::MAX).unwrap();
 //! check_inclusion(&membership, root.node_id(), alice.node_id(), 0).unwrap();
 //! let who = Principal {
-//!     issuer: "https://idp.example.com".into(),
+//!     issuer: "https://accounts.google.com".into(),
 //!     subject: "alice".into(),
 //!     email: Some("alice@example.com".into()),
 //!     org: None,
@@ -153,8 +156,8 @@ pub use call_log::{
 pub use error::{Error, IdTokenError, Result};
 pub use identity::{AlgorithmId, NodeId, NodeIdentity, Signature};
 pub use idp::{
-    Audience, CLOCK_SKEW_SECS, IdToken, IdentityClaim, Issuer, Jwk, Jwks, OIDC_NONCE_CONTEXT,
-    OidcNonce, Principal, verify_claim,
+    Audience, CLOCK_SKEW_SECS, GOOGLE_ISSUER, IdToken, IdentityClaim, Issuer, Jwk, Jwks,
+    OIDC_NONCE_CONTEXT, OidcNonce, Principal, verify_claim,
 };
 pub use invite::{INVITE_V2, Invite};
 pub use invoke::{Argv, Invocation, MAX_ARGS, MAX_ARGV_BYTES, MAX_TOOL_NAME, ToolName};
@@ -165,7 +168,7 @@ pub use push::{
     PushId, PushMessage, Subject,
 };
 pub use registry::{Service, ServiceName};
-pub use role::{EmailPattern, MAX_ROLE_NAME, MEMBER_ROLE, Matcher, RoleName};
+pub use role::{EmailPattern, MAX_ROLE_NAME, Matcher, RoleName};
 pub use session::{Chunk, Frame, Hello, HelloAck};
 pub use state::{STATE_CONTEXT, STATE_V1, SignedState, State, StateVersion};
 pub use sync::{MAX_STATE_FRAME, STATE_ALPN, StateFrame};
