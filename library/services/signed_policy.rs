@@ -473,7 +473,16 @@ impl SignedPolicy {
         &self,
         pick: impl Fn(&Item) -> Option<T>,
     ) -> Result<(Vec<(Item, T)>, MultiProof)> {
-        todo!("prove_where {}", std::any::type_name_of_val(&pick))
+        let mut picked = Vec::new();
+        let mut indices = Vec::new();
+        for (index, item) in (0u64..).zip(&self.items) {
+            if let Some(mark) = pick(item) {
+                picked.push((item.clone(), mark));
+                indices.push(index);
+            }
+        }
+        let proof = self.tree()?.prove_many(&indices).ok_or(Error::BadProof)?;
+        Ok((picked, proof))
     }
 }
 

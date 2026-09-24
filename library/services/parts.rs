@@ -56,7 +56,7 @@ use crate::item::{IssuerConfig, Item, ItemKey, Settings};
 use crate::merkle::MultiProof;
 use crate::registry::{Service, ServiceName};
 use crate::role::{Matcher, RoleName};
-use crate::signed_policy::admits;
+use crate::signed_policy::{admits, service_matches};
 
 /// A host's part of the policy. See the module docs and
 /// [`SignedPolicy::slice_for_host`](crate::SignedPolicy::slice_for_host).
@@ -90,22 +90,39 @@ impl Slice {
     /// order and hold the settings, and the multiproof over all of them.
     /// Does not check freshness.
     pub fn verify(&self, root: NodeId) -> Result<()> {
-        todo!("Slice::verify {}", root.hex())
+        verify_set(&self.head, &self.items, &self.proof, root)?;
+        if self.settings().is_none() {
+            return Err(Error::InvalidPolicy("the slice has no settings".into()));
+        }
+        Ok(())
     }
 
     /// The update that turns this slice into `newer` (the same host's slice
     /// under a newer head): what the directory sends a subscriber.
     pub fn update_to(&self, newer: &Slice) -> SliceUpdate {
-        todo!("Slice::update_to {newer:?}")
+        let (changed, removed) = diff(&self.items, &newer.items);
+        SliceUpdate {
+            head: newer.head.clone(),
+            changed,
+            removed,
+            proof: newer.proof.clone(),
+        }
     }
 
     /// Apply `update`: its head must verify under `root` and be no older
-    /// than this one; every removed key must be held; the rebuilt set (held
-    /// + changed − removed) must hold the settings and prove under the new
-    /// head. Any failure is an error and this slice is unchanged: ask the
-    /// directory for the whole slice.
+    /// than this one; every removed key must be held; the rebuilt set (the
+    /// held items, plus the changed ones, less the removed ones) must hold
+    /// the settings and prove under the new head. Any failure is an error
+    /// and this slice is unchanged: ask the directory for the whole slice.
     pub fn apply(&self, update: &SliceUpdate, root: NodeId) -> Result<Slice> {
-        todo!("Slice::apply {update:?} {}", root.hex())
+        check_not_older(&self.head, &update.head)?;
+        let slice = Slice {
+            head: update.head.clone(),
+            items: merge(&self.items, &update.changed, &update.removed)?,
+            proof: update.proof.clone(),
+        };
+        slice.verify(root)?;
+        Ok(slice)
     }
 
     /// The fabric's settings (present in every verified slice).
@@ -218,18 +235,43 @@ impl View {
     /// of them. Does not check freshness. (The marks are the directory's
     /// reading of roles the view doesn't carry; the host decides every call.)
     pub fn verify(&self, root: NodeId) -> Result<()> {
-        todo!("View::verify {}", root.hex())
+        verify_set(&self.head, &self.entries, &self.proof, root)?;
+        for entry in &self.entries {
+            let key = entry.item.key();
+            if entry.service().is_none() {
+                return Err(Error::InvalidPolicy(format!("a view holds {key}")));
+            }
+            if !entry.call && !entry.read {
+                return Err(Error::InvalidPolicy(format!(
+                    "{key} is in the view but marked neither call nor read"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The update that turns this view into `newer`.
     pub fn update_to(&self, newer: &View) -> ViewUpdate {
-        todo!("View::update_to {newer:?}")
+        let (changed, removed) = diff(&self.entries, &newer.entries);
+        ViewUpdate {
+            head: newer.head.clone(),
+            changed,
+            removed,
+            proof: newer.proof.clone(),
+        }
     }
 
     /// Apply `update`, as [`Slice::apply`] does; the result must pass
     /// [`verify`](Self::verify)'s rules.
     pub fn apply(&self, update: &ViewUpdate, root: NodeId) -> Result<View> {
-        todo!("View::apply {update:?} {}", root.hex())
+        check_not_older(&self.head, &update.head)?;
+        let view = View {
+            head: update.head.clone(),
+            entries: merge(&self.entries, &update.changed, &update.removed)?,
+            proof: update.proof.clone(),
+        };
+        view.verify(root)?;
+        Ok(view)
     }
 
     /// The entry for service `name`, if the view holds it.
@@ -243,7 +285,14 @@ impl View {
     /// ASCII case (`wires services <query>`, card 37). A reading of the view;
     /// the view itself, and its proof, are unchanged.
     pub fn matching(&self, query: &str) -> Vec<&ViewEntry> {
-        todo!("View::matching {query}")
+        let query = query.to_ascii_lowercase();
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.service()
+                    .is_some_and(|(name, svc)| service_matches(name, svc, &query))
+            })
+            .collect()
     }
 }
 
@@ -268,14 +317,40 @@ impl Entry for ViewEntry {
 /// `(changed, removed)` from `old` to `new`: entries of `new` not equal in
 /// `old`, and keys of `old` missing from `new`.
 fn diff<E: Entry>(old: &[E], new: &[E]) -> (Vec<E>, Vec<ItemKey>) {
-    todo!("diff {} {}", old.len(), new.len())
+    let before: BTreeMap<ItemKey, &E> = old.iter().map(|e| (e.item().key(), e)).collect();
+    let after: BTreeMap<ItemKey, &E> = new.iter().map(|e| (e.item().key(), e)).collect();
+    let changed = new
+        .iter()
+        .filter(|e| before.get(&e.item().key()) != Some(e))
+        .cloned()
+        .collect();
+    let removed = before
+        .into_keys()
+        .filter(|k| !after.contains_key(k))
+        .collect();
+    (changed, removed)
 }
 
 /// `held` + `changed` − `removed`, in key order. [`Error::InvalidPolicy`]
 /// if a removed key isn't held, or a key is both changed and removed, or
 /// changed twice.
 fn merge<E: Entry>(held: &[E], changed: &[E], removed: &[ItemKey]) -> Result<Vec<E>> {
-    todo!("merge {} {} {}", held.len(), changed.len(), removed.len())
+    let bad = |why: String| Err(Error::InvalidPolicy(why));
+    let mut set: BTreeMap<ItemKey, E> = held.iter().map(|e| (e.item().key(), e.clone())).collect();
+    for key in removed {
+        if set.remove(key).is_none() {
+            return bad(format!("the update removes {key}, which isn't held"));
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for e in changed {
+        let key = e.item().key();
+        if removed.contains(&key) || !seen.insert(key.clone()) {
+            return bad(format!("the update names {key} twice"));
+        }
+        set.insert(key, e.clone());
+    }
+    Ok(set.into_values().collect())
 }
 
 /// The shared checks: `head` verifies under `root`, the entries are strictly
@@ -286,23 +361,38 @@ fn verify_set<E: Entry>(
     proof: &MultiProof,
     root: NodeId,
 ) -> Result<()> {
-    todo!(
-        "verify_set {head:?} {} {proof:?} {}",
-        entries.len(),
-        root.hex()
+    head.verify(root)?;
+    if let Some(pair) = entries
+        .windows(2)
+        .find(|w| w[0].item().key() >= w[1].item().key())
+    {
+        return Err(Error::InvalidPolicy(format!(
+            "{} is out of order or repeated",
+            pair[1].item().key()
+        )));
+    }
+    proof.verify_items(
+        entries.iter().map(Entry::item),
+        head.head.items_root,
+        head.head.item_count,
     )
 }
 
 /// [`Error::InvalidPolicy`] unless `newer` is the same fabric's head and no
 /// older than `held`.
 fn check_not_older(held: &SignedPolicyHead, newer: &SignedPolicyHead) -> Result<()> {
-    todo!("check_not_older {held:?} {newer:?}")
+    if newer.head.fabric != held.head.fabric || newer.head.version < held.head.version {
+        return Err(Error::InvalidPolicy(format!(
+            "the update's head (version {}) is older than the held one ({})",
+            newer.head.version.0, held.head.version.0
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::NodeIdentity;
     use crate::item::Ban;
     use crate::signed_policy::fixtures::*;
     use crate::signed_policy::{Policy, SignedPolicy};

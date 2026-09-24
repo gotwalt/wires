@@ -96,19 +96,34 @@ impl TryFrom<String> for ProofPath {
         if s.len() > (32 * MAX_PROOF_DEPTH).div_ceil(3) * 4 {
             return Err(Error::BadLength);
         }
-        let bytes = B64.decode(s)?;
-        let (chunks, rest) = bytes.as_chunks::<32>();
-        if !rest.is_empty() || chunks.len() > MAX_PROOF_DEPTH {
+        let hashes = decode_hashes(s)?;
+        if hashes.len() > MAX_PROOF_DEPTH {
             return Err(Error::BadLength);
         }
-        Ok(ProofPath(chunks.iter().copied().map(ItemsRoot).collect()))
+        Ok(ProofPath(hashes))
     }
 }
 
 impl From<ProofPath> for String {
     fn from(p: ProofPath) -> String {
-        B64.encode(p.0.iter().flat_map(|h| h.0).collect::<Vec<u8>>())
+        encode_hashes(&p.0)
     }
+}
+
+/// base64url of the concatenated hashes.
+fn encode_hashes(hashes: &[ItemsRoot]) -> String {
+    B64.encode(hashes.iter().flat_map(|h| h.0).collect::<Vec<u8>>())
+}
+
+/// The inverse of [`encode_hashes`]; [`Error::BadLength`] unless whole
+/// hashes.
+fn decode_hashes(s: String) -> Result<Vec<ItemsRoot>> {
+    let bytes = B64.decode(s)?;
+    let (chunks, rest) = bytes.as_chunks::<32>();
+    if !rest.is_empty() {
+        return Err(Error::BadLength);
+    }
+    Ok(chunks.iter().copied().map(ItemsRoot).collect())
 }
 
 /// Proof that an item is leaf `index` of the tree a head commits to. Check
@@ -186,13 +201,13 @@ impl TryFrom<String> for ProofHashes {
     /// Decode the base64url string; [`Error::BadLength`] unless it is whole
     /// hashes.
     fn try_from(s: String) -> Result<Self> {
-        todo!("ProofHashes::try_from {s}")
+        Ok(ProofHashes(decode_hashes(s)?))
     }
 }
 
 impl From<ProofHashes> for String {
     fn from(p: ProofHashes) -> String {
-        todo!("ProofHashes into String {p:?}")
+        encode_hashes(&p.0)
     }
 }
 
@@ -228,7 +243,23 @@ impl MultiProof {
     /// empty, out of order, touching or overlapping, or name more than
     /// `count` leaves (checked before anything is expanded).
     pub fn indices(&self, count: u64) -> Result<Vec<u64>> {
-        todo!("MultiProof::indices {count}")
+        let mut next = 0u64; // the lowest start the next range may have
+        let mut total = 0u64;
+        for (k, r) in self.leaves.iter().enumerate() {
+            let end = r.start.checked_add(r.len).ok_or(Error::BadProof)?;
+            if r.len == 0 || end > count || (k > 0 && r.start < next) {
+                return Err(Error::BadProof);
+            }
+            // A gap of at least one leaf, so each set has one encoding.
+            next = end + 1;
+            total += r.len;
+        }
+        // `total <= count`, which the signed head bounds.
+        let mut out = Vec::with_capacity(usize::try_from(total).map_err(|_| Error::BadProof)?);
+        for r in &self.leaves {
+            out.extend(r.start..r.start + r.len);
+        }
+        Ok(out)
     }
 
     /// Check that `leaves` (one hash per proved index, in index order) are
@@ -237,7 +268,31 @@ impl MultiProof {
     /// extra hash, another root or count, or a leaf count that doesn't match
     /// the ranges. No leaves and no hashes proves nothing and passes.
     pub fn verify(&self, leaves: &[ItemHash], root: ItemsRoot, count: u64) -> Result<()> {
-        todo!("MultiProof::verify {} {root} {count}", leaves.len())
+        let total: u64 = self
+            .leaves
+            .iter()
+            .map(|r| r.len)
+            .fold(0, u64::saturating_add);
+        if total != leaves.len() as u64 {
+            return Err(Error::BadProof);
+        }
+        let indices = self.indices(count)?;
+        if indices.is_empty() {
+            return match self.hashes.0.is_empty() {
+                true => Ok(()),
+                false => Err(Error::BadProof),
+            };
+        }
+        let known = indices
+            .into_iter()
+            .zip(leaves.iter().map(|l| ItemsRoot(l.0)))
+            .collect();
+        let mut hashes = self.hashes.0.iter().copied();
+        let got = walk(known, count, |_, _| hashes.next()).ok_or(Error::BadProof)?;
+        if hashes.next().is_some() || got != root {
+            return Err(Error::BadProof);
+        }
+        Ok(())
     }
 
     /// [`verify`](Self::verify) over the items' leaf hashes.
@@ -253,6 +308,42 @@ impl MultiProof {
             .collect::<Result<Vec<_>>>()?;
         self.verify(&leaves, root, count)
     }
+}
+
+/// Compute the root from `known` nodes (ascending leaf indices with their
+/// hashes; not empty) of a tree of `count` leaves, asking `sibling(level,
+/// index)` for each node the known ones don't determine, level by level from
+/// the leaves, left to right: the order a [`MultiProof`] carries them in.
+/// `None` when `sibling` has none to give.
+fn walk(
+    mut known: Vec<(u64, ItemsRoot)>,
+    count: u64,
+    mut sibling: impl FnMut(usize, u64) -> Option<ItemsRoot>,
+) -> Option<ItemsRoot> {
+    let (mut level, mut n) = (0, count);
+    while n > 1 {
+        let mut next = Vec::with_capacity(known.len().div_ceil(2));
+        let mut k = 0;
+        while k < known.len() {
+            let (i, h) = known[k];
+            let parent = if i % 2 == 1 {
+                node_hash(&sibling(level, i - 1)?, &h)
+            } else if i + 1 == n {
+                h // the odd last node carries up
+            } else if known.get(k + 1).is_some_and(|(j, _)| *j == i + 1) {
+                k += 1;
+                node_hash(&h, &known[k].1)
+            } else {
+                node_hash(&h, &sibling(level, i + 1)?)
+            };
+            next.push((i / 2, parent));
+            k += 1;
+        }
+        known = next;
+        n = n.div_ceil(2);
+        level += 1;
+    }
+    known.first().map(|(_, h)| *h)
 }
 
 /// A built tree: every level, so proofs are cheap after one `O(n)` build.
@@ -309,7 +400,32 @@ impl ItemTree {
     /// ascending and in range (else `None`). Each sibling hash is sent once,
     /// and none that the proved leaves themselves determine.
     pub fn prove_many(&self, indices: &[u64]) -> Option<MultiProof> {
-        todo!("ItemTree::prove_many {indices:?}")
+        if indices.windows(2).any(|w| w[0] >= w[1]) {
+            return None;
+        }
+        let known = indices
+            .iter()
+            .map(|i| Some((*i, *self.levels[0].get(usize::try_from(*i).ok()?)?)))
+            .collect::<Option<Vec<_>>>()?;
+        let mut leaves: Vec<LeafRange> = Vec::new();
+        for &i in indices {
+            match leaves.last_mut() {
+                Some(r) if r.start + r.len == i => r.len += 1,
+                _ => leaves.push(LeafRange { start: i, len: 1 }),
+            }
+        }
+        let mut hashes = Vec::new();
+        if !known.is_empty() {
+            walk(known, self.len(), |level, index| {
+                let h = self.levels[level][usize::try_from(index).ok()?];
+                hashes.push(h);
+                Some(h)
+            })?;
+        }
+        Some(MultiProof {
+            leaves,
+            hashes: ProofHashes(hashes),
+        })
     }
 
     /// The proof for leaf `index`, or `None` past the last leaf.
@@ -346,8 +462,20 @@ mod tests {
 
     /// `count` distinct items, their leaves, and the tree over them.
     fn tree_of(count: u8) -> (Vec<Item>, ItemTree) {
-        let items: Vec<Item> = (0..count).map(|b| ban(b, i64::from(b))).collect();
-        let leaves = items.iter().map(|i| ItemHash::of(i).unwrap()).collect();
+        // Built once: key derivation and hashing dominate the proptests.
+        static ALL: std::sync::OnceLock<Vec<(Item, ItemHash)>> = std::sync::OnceLock::new();
+        let all = ALL.get_or_init(|| {
+            (0..=u8::MAX)
+                .map(|b| {
+                    let item = ban(b, i64::from(b));
+                    let hash = ItemHash::of(&item).unwrap();
+                    (item, hash)
+                })
+                .collect()
+        });
+        let some = &all[..usize::from(count)];
+        let items = some.iter().map(|(i, _)| i.clone()).collect();
+        let leaves = some.iter().map(|(_, h)| *h).collect();
         (items, ItemTree::new(leaves))
     }
 
@@ -689,7 +817,9 @@ mod tests {
         assert!(ProofHashes::try_from("AAAA".to_string()).is_err());
         let (items, tree) = tree_of(4);
         let leaves: Vec<ItemHash> = items.iter().map(|i| ItemHash::of(i).unwrap()).collect();
-        let text = serde_json::to_string(&tree.prove_many(&[0, 1, 3]).unwrap()).unwrap();
+        let text =
+            String::from_utf8(canonical_bytes(&tree.prove_many(&[0, 1, 3]).unwrap()).unwrap())
+                .unwrap();
         assert!(text.starts_with(r#"{"hashes":""#), "{text}");
         let back: MultiProof = serde_json::from_str(&text).unwrap();
         back.verify(&[leaves[0], leaves[1], leaves[3]], tree.root(), 4)
