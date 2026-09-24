@@ -1,8 +1,15 @@
 # The wires protocol
 
 This document describes the protocol as the code implements it today: `library/` (pure types and
-codecs) and `wires/` (the iroh transport and CLI). If this document and the code disagree, the
-code is correct and this document should be fixed.
+codecs) and `wires/` (the iroh transport and CLI).
+
+**What outranks what.** The premise outranks this document, and this document outranks the code.
+The premise: remote CLIs are distributed securely over iroh; IdP authentication and authorization
+keep out anyone who isn't allowed; agents can't observe each other's work, and the isolation
+boundary is the verified person (the IdP principal); `wires watch` lets the people the registry
+names as readers observe calls, in full, for logging and compliance. If the code disagrees with
+this document, the code is the bug, unless this document breaks the premise, in which case both
+are fixed. What the premise needs and the code doesn't do yet is listed in §10.
 
 Usage, roles and the demo are in [usage.md](usage.md), [the board](board/README.md) and
 [demo.md](demo.md). Deployment and testing are in [deployment.md](deployment.md) and
@@ -259,8 +266,8 @@ write; callers keep that cache, and trust a disk entry for at most 24 h.
 **A web gateway** (`wires gateway`) is one member node that carries many principals: it asks the IdP
 for each web user's ID token with `nonce = for_node(gateway)` and presents that user's token in the
 `Hello` of each call it makes for them. Nothing on the wire changes; the host sees a member node
-presenting a token bound to it. The gateway offers a user only services that a non-`member` role
-admits by that user's principal. It issues its own OAuth access tokens (opaque, bound to its
+presenting a token bound to it. The gateway offers a user only services that a role admits by
+that user's own verified principal; the gateway's node alone is in no role. It issues its own OAuth access tokens (opaque, bound to its
 `/mcp`, expiring with the ID token) and no refresh tokens. Its MCP endpoint serves the 2026-07-28
 Streamable HTTP binding and the legacy `initialize` era ([deployment.md](deployment.md)).
 
@@ -299,14 +306,19 @@ client both check is owned by `geteuid()`:
 
 - **The operator socket**, `run/serve.sock`: `{"push":{to, subject, body, ttl_secs?}}` to any node
   or role. A service child is not told where it is.
-- **The child socket**, `child/push.sock`: a service pushing back to **its own caller**. For every
-  call, `serve` mints a random 32-byte token (64 hex) and gives the child `WIRES_PUSH_SOCKET` and
+- **The child socket**, `child/push.sock`: a service pushing back to **its own caller**. With a
+  `push` section in `host.json`, for every call `serve` mints a random 32-byte token (64 hex) and gives the child `WIRES_PUSH_SOCKET` and
   `WIRES_PUSH_TOKEN`; `wires push` sees the token and sends `{"caller_push":{token, push}}` (no
   keystore needed). The socket accepts it only for a live token and only with `to` equal to that
   call's caller node id (never a role or another node); the operator's `push` form is refused
   there. A token is live for the call and 10 minutes after it ends (`CAPABILITY_GRACE`), so a job
   the call started can still report; tokens are memory-only, so a restart kills them. The push
   still passes `push.allow`, and its records carry `call`, the call whose capability sent it.
+
+This is push as built. [Card 31](board/backlog/31-inbox-delivery.md) (agreed, not built) is the
+next step: every callback goes to the calling node **and** principal through the call's
+capability only, the operator's `push` narrows to `--to <node-id>`, role addressing goes, and an
+`inbox` MCP tool reaches `wires mcp` and the gateway.
 
 ## 8. Records
 
@@ -372,7 +384,7 @@ still holds. Any alarm stops that host's stream (exit 1) and leaves its marks at
 The service label a line shows is the reader's own, derived from signed records: a `started`'s tool,
 paired locally with its `finished` and the pushes naming its call; the host sends no label.
 
-Nothing is broadcast: a record leaves a host only when a reader asks for it and may see it.
+Nothing is broadcast: a record's content leaves a host only when a reader asks for it and may see it; any other member asking gets its hash link.
 
 ## 9. Keystore (`$WIRES_HOME`, else `$XDG_CONFIG_HOME/wires`, else `~/.config/wires`)
 
@@ -418,10 +430,18 @@ precedence. Locked mode (`WIRES_LOCKED`) refuses the credential flags and the `W
 - The admin is a one-shot CLI and is pushed only to hosts: a plain member gets a new state by its
   next pull (from a host) or at a call's handshake. A host assigned a service while offline pulls
   it at `serve` start from another host in its copy; with none up, it needs a fresh invite.
-- Every member holds the whole state (member ids, roles, registry).
-- A host knows a caller's identity only after the caller presented its token to that host, so push
-  by role reaches only those callers.
-- A web gateway holds each signed-in user's gateway-bound ID token until it expires (~1 h), and
-  hosts index identity per node, so push and `watch --mine` are not offered through it.
-- One fabric per keystore. The caller checks the host's membership and that its own (newest) state
-  assigns the service to that host, but only after the host already holds the `Invoke` (card 29).
+- Known and accepted until [card 29](board/backlog/29-identity-and-scale.md):
+  - Every member holds the whole state: every member id, every role's matchers (often people's
+    emails) and every service. Agents learn the org chart, and the state grows with the number of
+    members, so onboarding N people costs O(N) states of O(N) size to every host.
+  - The caller checks the host's membership and that its own (newest) state assigns the service to
+    that host, but only after the host already holds the `Invoke`: a removed host whose membership
+    hasn't expired sees the argv (not stdin).
+  - Hidden record links (§8) tell a non-reader how many entries a host logged, and when.
+  - Google ID tokens last about an hour, and Google drops the `nonce` on refresh, so a person signs
+    in again roughly hourly (a web gateway session ends with the token).
+- A host knows a caller's identity only after the caller presented its token to that host, and
+  indexes it per node, so push by role reaches only those callers (card 31 removes role push).
+- A web gateway holds each signed-in user's gateway-bound ID token until it expires (~1 h). It
+  offers tools only: push is keyed by node (card 31), and `watch` isn't an MCP tool.
+- One fabric per keystore.

@@ -37,7 +37,7 @@ On camera, in order:
 | 5 (opt.) | reader (second tab) | `wires call orders-db -- "select 1"` | exit 77: `… is in no role allowed to call orders-db (analyst)`; a `✗` in the watch |
 | 5b (opt.) | agent | [push beat](#5b-the-workbench-calls-back-push): `wires call deploy -- build 41`, `wires inbox --wait --timeout 10m` | `… from host <wb8> (verified)  build-41  failed: …` |
 | 5c (with a spare) | workbench | stop `wires serve`, ask again | the spare answers (`wires call --verbose` names it) |
-| 6 | admin | `wires remove agent` | stderr `state version N: pushed to K member(s)` |
+| 6 | admin | `wires remove agent` | stderr `state version N: pushed to 1 of 1 host(s)` (2 of 2 with a spare) |
 | 6 | agent | ask Claude Code the question again | exit 77, nothing on stdout: `wires: denied by responder: not admitted to this fabric`; no `✗` in the watch (a non-member's knock is traced by the host, not logged) |
 
 ### Rebuttals, one line each
@@ -155,8 +155,8 @@ workbench$ ss -lunp | grep wires   # UDP sockets: iroh's QUIC
 
 > "This is the workbench. It implements one service: read-only SQL on an
 > orders database. It has no TCP listener, and no firewall port opened.
-> Unauthenticated peers are refused at the handshake. What it does have is a
-> key."
+> Anyone can knock, but a key outside the list is refused at its first
+> message, before anything runs. What it does have is a key."
 
 Never say "no ports". iroh binds UDP for QUIC, and `ss -lunp` shows it.
 
@@ -218,7 +218,9 @@ reader$ WIRES_HOME=~/.wires-reader wires watch orders-db
 
 Point at the `▶ … <you>@gmail.com (…) [analyst] orders-db "select …"` and
 `■ … exit 0 · … ms · … B out` pairs, and at the `✗` line for the refusal in
-beat 2. The agent's own `wires watch` shows only its own calls.
+beat 2. The agent's own `wires watch` shows only its own person's calls: the
+isolation boundary is the verified person, so another person's agent sees
+none of these (only hash links, which reveal how many entries and when).
 
 ### 5b. The workbench calls back (push)
 
@@ -240,8 +242,11 @@ register them (`wires service add deploy --allow analyst --host workbench
 at once; the result is pushed to your wires inbox."`, likewise `logs`), and
 restart `wires serve` with `CI_JOB_SECS=90 CI_JOBS=~/ci-jobs` in its
 environment. The build's background job runs `wires push --to
-"$WIRES_CALLER_NODE" …`, which reaches the running `serve` over its control
-socket (the host sets `WIRES_HOME` for every service it runs). Let Claude Code
+"$WIRES_CALLER_NODE" …`, which reaches the running `serve` through the call's
+push capability: with `push` in `host.json`, `serve` gives every call's child
+`WIRES_PUSH_SOCKET` and `WIRES_PUSH_TOKEN`, good for pushing to that call's
+caller only, for the call and 10 minutes after it (keep `CI_JOB_SECS` under
+that). The child never gets the host's keystore. Let Claude Code
 run `wires inbox` as well: `--allowedTools 'Bash(wires call:*),Bash(wires inbox:*)'`.
 
 Prompt in Claude Code:
@@ -297,7 +302,7 @@ admin$ WIRES_HOME=~/.wires-admin wires remove agent
 Then ask Claude Code the question again.
 
 > "One command. The admin signed a new list without the agent and pushed it
-> to the workbench first. The workbench reads it on the next call, with no
+> to the workbench. The workbench applies it from the next call, with no
 > restart and no key to rotate. The agent's next call exits 77 with nothing on
 > stdout."
 
@@ -313,12 +318,17 @@ exit code.
 ## Things not to say
 
 - "No ports" or "no attack surface". Say: no TCP listener, no firewall port
-  opened, and unauthenticated peers are refused at the handshake.
+  opened, and a key outside the list is refused at its first message.
+- "Refused at the handshake." Any key completes iroh's handshake; the refusal
+  comes at the first wires message, before anything runs.
 - "MCP schemas bloat context." Tool search already handles that. The measured
   win comes from filtering output before it reaches context (bench/REPORT.md).
 - "The agent can only run wires." That's true of a container that holds only
   `wires`, not of a Bash permission rule.
 - "Encrypted", "channel", "everyone can watch". Records are read from each
-  host by the readers the registry names.
+  host by the readers the registry names, in full; everyone else sees only
+  their own person's.
+- "Nothing about other people reaches the agent." Every member holds the
+  whole signed list (card 29 fixes that).
 - "Join by domain." It isn't built (card 18).
 

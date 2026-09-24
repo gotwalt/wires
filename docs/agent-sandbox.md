@@ -127,8 +127,8 @@ The operator turns the lock on with `WIRES_LOCKED=1` (any value but empty,
 
 | | locked `wires call` | locked `wires mcp` |
 |---|---|---|
-| the eight flags above | **refused**, exit 2, `wires: --relay-url is not allowed in locked mode …`; nothing dialed | refused at startup, exit 1 |
-| `--jq`, `--head`, `--max-bytes`, the tool name (`db_query`, `eacc34e0/db_query`), its args after `--` (including ones spelled like our flags) | accepted | the `jq` / `head` / `max_bytes` / `args` fields: accepted |
+| the six flags above | **refused**, exit 2, `wires: --relay-url is not allowed in locked mode …`; nothing dialed | refused at startup, exit 1 |
+| `--jq`, `--head`, `--max-bytes`, the service name (`db_query`), its args after `--` (including ones spelled like our flags) | accepted | the `jq` / `head` / `max_bytes` / `args` fields: accepted |
 | stdin | **refused if it holds any data** (exit 2), unless the operator also sets `WIRES_LOCKED_STDIN=allow`; a terminal or empty stdin is fine, and the remote gets EOF | the `stdin` field: accepted |
 | `WIRES_NODE_SEED`, `WIRES_MEMBERSHIP` (they override the node key and membership, like the flags) | **refused**, exit 2, `wires: $WIRES_NODE_SEED is not allowed in locked mode …`; nothing dialed | refused at startup, exit 1 |
 | `WIRES_HOME`, `WIRES_LOCKED`, `WIRES_LOCKED_STDIN` | still read: they are how the operator configures the lock | same |

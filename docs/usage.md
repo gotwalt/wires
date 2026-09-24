@@ -24,13 +24,13 @@ Every role joins the same way: `wires id`, then `wires join <token>` with the ad
 | **Who may call what** | The state's registry: each service's `allow` roles, and the role definitions (matchers on the IdP identity, each naming its issuer). Every role needs a verified identity. | The host, on every call. `wires services` evaluates the same table locally, for listing only. |
 | **Stricter local rules** | `host.json`'s `also_require` roles per service. They can only narrow. | The host, after the registry. |
 | **Who is calling** | Your IdP's ID token, bound to the caller's node key at `wires login` (the OIDC `nonce` is a hash of the key), presented in the session `Hello`. | The host, against the issuer's JWKS, under the issuers `host.json` trusts. No wires identity service. |
-| **Reach** | The host's node key. Callers dial a key (iroh; n0 discovery, or an optional local `$WIRES_HOME/hints` file); the host binds UDP for QUIC and has no TCP listener. | iroh's handshake authenticates the key; the host then checks the membership and the state. |
+| **Reach** | The host's node key. Callers dial a key (iroh; n0 discovery, or an optional local `$WIRES_HOME/hints` file); the host binds UDP for QUIC and has no TCP listener. | iroh's handshake authenticates the key (any key may connect); the host then checks the membership and the state at the first message, and a key the state doesn't list hears only `not admitted to this fabric`. |
 | **Which host** | The registry's `hosts` for the service. Only the admin binds a name to a host, so no host can squat a name. | The caller (it dials only those hosts) and the host (it refuses to start, or to serve, a name not assigned to it). |
-| **Records** | Each host's own call log: every call, refusal and push, signed by the host and hash-linked. | Readers, with `wires watch`: the service's `readers` roles see all of it; everyone else sees only the records of their own verified identity (issuer and subject, from any of their nodes) and a hash link for every other entry. Every entry and the chain are verified. |
-| **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. | The host, at send, delivery and fetch: a member of the state, in a `push.allow` role. |
-| **Removal** | A new state, pushed to the hosts. No shared key exists, so there is nothing to rotate. | Every host, on the removed member's next call or fetch. |
+| **Records** | Each host's own call log: every call, member's refusal and push (a non-member's knock is traced, not logged), signed by the host and hash-linked. | Readers, with `wires watch`: the service's `readers` roles see all of it; everyone else sees only the records of their own verified identity (issuer and subject, from any of their nodes) and a hash link for every other entry. Every entry and the chain are verified. |
+| **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. A service pushes only through its call's capability, to that call's caller. | The host, at send, delivery and fetch: a member of the state, in a `push.allow` role. |
+| **Removal** | A new state, pushed to the hosts. No shared key exists, so there is nothing to rotate. | Each host that has the new state, on the removed member's next call or fetch there. |
 
-Nothing is broadcast: a member that takes part in no call receives no traffic about other members' calls, identities or services (the admin's state push aside).
+There is no channel, and a member that takes part in no call receives no traffic about other members' calls. What every member does learn is the whole signed state: every member id, role matcher and service ([card 29](board/backlog/29-identity-and-scale.md) replaces it with per-caller views).
 
 ## Walkthrough
 
@@ -79,10 +79,12 @@ admin$ echo $?
 
 The hosts weren't running, so the push missed them and the command exits 1:
 the new state is stored on the admin but in force nowhere. Once a host is up,
-`wires state push` re-sends it; a host that isn't up yet can't start `serve`
-on a state that doesn't assign it the service, so a fresh `wires invite`
-token catches it up (re-joining never rolls a state back). The token
-isn't a secret: it holds the invitee's membership and the signed state.
+`wires state push` re-sends it. A host that starts on a state that doesn't
+assign it the service pulls a newer one from the other hosts in its copy
+before giving up; here each host's copy names no other host (the state had
+no services yet), so a fresh `wires invite` token catches it up (re-joining
+never rolls a state back). The token isn't a secret: it holds the invitee's
+membership and the signed state.
 
 **3. The hosts serve.** `host.json` says only how each service runs here. A
 command is an argv, exec'd directly and never through a shell, with the
@@ -176,9 +178,13 @@ observer$ wires watch orders-db --once
 
 The agent's own `wires watch` shows its calls and not the observer's refusal.
 "Its own" means its person's: the records whose verified identity (issuer and
-subject) is the one the agent's ID token proves, from any node. Without a
-verified ID token, a reader sees nothing in full. A push from the host
-operator belongs to no service, so only its recipient sees its record.
+subject) is the one the agent's ID token proves, from any node. That is the
+isolation boundary: agents acting for different people can't see each
+other's work, and two agents of one person can. For every other record the
+agent gets only a hash link, so it can check the chain but learns only how
+many entries there are and when they were written. Without a verified ID
+token, a reader sees nothing in full. A push from the host operator belongs
+to no service, so only its recipient sees its record.
 
 **7. Failover and removal.** With the workbench stopped, the same command is
 answered by the spare (`wires call --verbose` says which host answered;
@@ -193,6 +199,10 @@ wires: denied by responder: not admitted to this fabric
 agent$ echo $?
 77
 ```
+
+Each host applies the removal from the moment it holds the new state. The
+refusal is traced by the host, not written to its call log: a key outside
+the state can't write to the log.
 
 The script also covers SQL on stdin, the same service through `wires mcp`,
 `.shell id` refused by `sqlite3 -safe`, and a push:
@@ -248,8 +258,10 @@ network path to the host; its ACLs can narrow that to a port, and the service
 on that port is then guarded by its own auth. Wires gives the caller a
 key-addressed path to the services the state lets it call. On the host there
 is no TCP listener and no firewall port opened; iroh binds UDP for QUIC
-(direct, or through a relay), and unauthenticated peers are refused at the
-handshake. In the two-machine run (card 08), `ss` on the host showed zero TCP
+(direct, or through a relay). Any key can open a connection, but one the
+state doesn't list is refused at its first message, before anything runs,
+and costs the host little (small frames, no token check, nothing logged).
+In the two-machine run (card 08), `ss` on the host showed zero TCP
 listeners and two UDP sockets.
 
 **One signed state, checked locally.** Who's in, the roles and the registry
@@ -273,8 +285,12 @@ the CLI being run.
 public HTTPS endpoint, and an agent on a laptop or in a sandbox has none. A
 caller here is addressed by its key, so a host can push to it with neither
 side exposing anything: `wires push --to "$WIRES_CALLER_NODE" --subject
-build-41 -- "failed: …"` from a service's background job (every service gets
-its verified caller's id in that variable). The host dials the caller by key
+build-41 -- "failed: …"` from a service's background job. Every service
+gets its verified caller's id in that variable and, when `host.json` has a
+`push` section, a per-call push capability (`WIRES_PUSH_SOCKET`,
+`WIRES_PUSH_TOKEN`) that can push only to that caller, for the call and 10
+minutes after it; the child never holds the host's keys. The host operator
+can also push, by node id or role, from the host's own shell. The host dials the caller by key
 (a running `wires inbox --wait` accepts it) and otherwise keeps it (24 h by
 default) for the caller's next `wires inbox`. `host.json`'s `push.allow`
 decides who may receive (default nobody), checked at send and again at
@@ -285,6 +301,11 @@ input to a model**:
 ```
 2026-09-23 21:13:20Z  from host 3ef72b11 (verified)  build-41  failed: test_orders_total
 ```
+
+That is push as built. [Card 31](board/backlog/31-inbox-delivery.md) is
+agreed and next: a callback goes only to the node **and** person that made
+the call, role addressing goes, and an `inbox` MCP tool reaches `wires mcp`
+and the gateway.
 
 ## Giving an agent only `wires`
 
@@ -312,8 +333,18 @@ To make `wires` the boundary, use a structural setup:
 
 ## Known trade-offs
 
-- **Every member holds the whole state**: member and host node ids, role
-  matchers, service names and descriptions. It is signed, not secret.
+- **Known and accepted until [card 29](board/backlog/29-identity-and-scale.md)**:
+  - **Every member holds the whole state**: member and host node ids, role
+    matchers (often people's emails), service names and descriptions. It is
+    signed, not secret: every agent's machine holds the org chart, and the
+    state grows with the number of members.
+  - **A removed host still sees argv** while its membership is valid: the
+    caller sends the arguments with its `Hello` and stops before stdin only
+    once the host hands back a state that no longer assigns it the service.
+  - **Hidden record links reveal count and timing** to a caller who isn't a
+    service's reader (not content, caller or service).
+  - **Google ID tokens last about an hour**, and Google drops the `nonce`
+    (the key binding) on refresh, so people sign in again about hourly.
 - **Memberships and the state don't renew yet.** A membership expires after
   its `--ttl`, the state after its `--state-ttl` (both default 30 days); an
   expired state admits nobody, and no caller dials from one. Any admin edit
@@ -327,7 +358,7 @@ To make `wires` the boundary, use a structural setup:
   copy when `serve` starts; with none of them up, it needs a fresh invite.
 - **A host knows only the identities presented to it.** Push to a role
   reaches members that have called that host, or run `wires inbox`, since it
-  started.
+  started (card 31 removes role push).
 - **A host can withhold or truncate its own log.** Tampering and gaps are
   detectable, but only against a copy a reader already holds.
 - **A web gateway holds its users' live identities.** Each web user's token
@@ -348,6 +379,13 @@ To make `wires` the boundary, use a structural setup:
 - Renewal of memberships and the state; `wires mcp` noticing a new state
   without a restart; a witness that holds copies of hosts' logs
   ([card 09](board/backlog/09-witness.md)).
+- **Identity and scale** ([card 29](board/backlog/29-identity-and-scale.md),
+  design agreed): machine badges plus a ban list instead of a member list,
+  `login --for` and day-passes for headless agents, per-caller views instead
+  of the whole state, and transparency-log checkpoints for the records.
+- **Callbacks to the caller that asked**
+  ([card 31](board/backlog/31-inbox-delivery.md), agreed): a callback goes
+  only to the node and person that made the call, in every client.
 
 ## Reference
 
@@ -364,16 +402,8 @@ To make `wires` the boundary, use a structural setup:
 | | `wires service add\|set <name> [--description D] [--allow role]… [--host member]… [--reader role]…` · `service rm <name>` | Edit the registry. `--host` is an `invite --name` label or a node id; `set` replaces each list given. |
 | | `wires state push` | Re-send the stored state to every host, e.g. after an edit that reached none. Exits 1 if the state names hosts and none took it. |
 
-Every edit above signs a new state valid for `--state-ttl` from now (default
-30 days), or until the current state's expiry if that is later: an edit never
-shortens the state's life. It is pushed to the state's hosts (and to any node
-that hosted before the edit), not to plain members, which don't listen. When
-the state names hosts and **none** took it, the command still prints its
-result (an `invite` still prints the token) but exits 1: the new state is
-stored on the admin and in force nowhere until `wires state push` reaches a
-host.
-| **host** | `wires serve host.json` | Refuse to start unless the state assigns every service in the file here; then check every caller against the state, exec the service per call, and log every call, refusal and push. `--check` validates and prints what the file implements. |
-| | `wires push --to <node-id\|role> --subject S [--ttl D] -- <body>` | Hand a message for a caller to this machine's running `serve` (body from stdin if none is given). Prints `delivered`, `queued` or `denied` per recipient; exits `77` if every recipient was refused. |
+| **host** | `wires serve host.json` | Refuse to start unless the state assigns every service in the file here; then check every caller against the state, exec the service per call, and log every call, member's refusal and push. `--check` validates and prints what the file implements. |
+| | `wires push --to <node-id\|role> --subject S [--ttl D] -- <body>` | Hand a message for a caller to this machine's running `serve` (body from stdin if none is given). From the operator's shell: to any node or role. From a service (it has `WIRES_PUSH_TOKEN`): only to that call's caller. Prints `delivered`, `queued` or `denied` per recipient; exits `77` if every recipient was refused. |
 | **caller** | `wires id` | Print this node's id (creating its key on first use). |
 | | `wires join <token>` | Install an invite: the membership and the signed state. |
 | | `wires login` | Sign in with your IdP (Google by default; `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*`) and store the key-bound ID token. |
@@ -382,9 +412,18 @@ host.
 | | `wires mcp` | Serve the same services as MCP tools over stdio (Claude Desktop, IDEs). |
 | | `wires gateway --public-url https://… [--listen addr] [--client-id …]` | Serve them as a remote MCP server (Streamable HTTP + OAuth 2.1) for web clients such as Claude.ai. Each user signs in with Google through the gateway and calls with their own token ([deployment](deployment.md#a-web-gateway)). |
 | | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`. |
-| **reader** | `wires watch [service…] [--mine] [--once] [--json]` | Stream call records from your services' hosts, verified: all records of services whose `readers` role you're in, otherwise your own (your verified identity's, from any node). A following stream is re-decided when the signed state changes or your ID token expires, and ends with the refusal when access is gone. A log rolled back below what you verified is an alarm (exit 1); entries pruned past it (retention) are a notice. The service each line names is derived from the signed records, not supplied by the host. |
+| **reader** | `wires watch [service…] [--mine] [--once] [--json]` | Stream call records from your services' hosts, verified: all records of services whose `readers` role you're in, otherwise your own (your verified identity's, from any node). A following stream is re-decided when the signed state changes or your ID token expires, and ends with the refusal when access is gone (exit `77` when every host refused). A log rolled back below what you verified, or rewritten, is an alarm (exit 1); entries pruned past it (retention, 30 days) are a notice. Marks are kept per host, so any view catches a rewrite another view verified. The service each line names is derived from the signed records, not supplied by the host. |
 
-For an MCP-only client, the whole config is:
+Every edit above signs a new state valid for `--state-ttl` from now (default
+30 days), or until the current state's expiry if that is later: an edit never
+shortens the state's life. It is pushed to the state's hosts (and to any node
+that hosted before the edit), not to plain members, which don't listen. When
+the state names hosts and **none** took it, the command still prints its
+result (an `invite` still prints the token) but exits 1: the new state is
+stored on the admin and in force nowhere until `wires state push` reaches a
+host.
+
+For a stdio MCP client, the whole config is:
 
 ```json
 { "mcpServers": { "wires": { "command": "wires", "args": ["mcp"] } } }
@@ -405,12 +444,21 @@ member's refusal names the rule that failed (`… is in no role allowed to call
 orders-db (analyst)`, `service orders-db is not assigned to this host …`); a
 key the state doesn't list hears only `not admitted to this fabric`.
 
-A host that admits a call passes the verified caller to the service as
-environment: `WIRES_CALLER_NODE`, `WIRES_CALLER_EMAIL` (when verified),
-`WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_AFTER`, `WIRES_STATE_VERSION`,
-`WIRES_SERVICE`, `WIRES_TOOL`, `WIRES_ROLE`, and `WIRES_HOME` (the host's, so
-a service can `wires push`). These are set by the host, never taken from the
-caller, and any inherited `WIRES_*` is scrubbed first.
+A service's environment starts empty: only `PATH`, `LANG` and `LC_*` are
+inherited from `serve`, then the service's `env`, then what the host sets
+from the verified call: `WIRES_CALLER_NODE`, `WIRES_CALLER_EMAIL` (when
+verified), `WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_AFTER`,
+`WIRES_STATE_VERSION`, `WIRES_SERVICE`, `WIRES_TOOL`, `WIRES_ROLE`, and, with
+a `push` section, the call's push capability (`WIRES_PUSH_SOCKET`,
+`WIRES_PUSH_TOKEN`). None of it is taken from the caller. The child gets no
+`WIRES_HOME`, `HOME`, agent sockets or cloud credentials.
+
+The child still runs as `serve`'s Unix user, so a service a caller can steer
+into reading or writing files reaches whatever that user can, the host's
+keystore included. **Run services as a separate Unix user** (e.g. a
+`command` of `["sudo", "-u", "svc", "--", "tool"]`). A service's fixed
+command must also be safe against any trailing arguments, including ones
+spelled like options (`gh api -X DELETE …`).
 
 ### The keystore
 
@@ -425,13 +473,14 @@ since a host's control socket lives under it and socket paths are limited to
 | `root.seed`, `names.json` | `init`, `invite`, `remove` | The admin's root key and member labels (0600). Admin machine only. |
 | `membership.json` | `init`, `join` | This node's root-signed membership. |
 | `state.json`, `state-admin.txt`, `state-checked.txt` | `join`, pushes, pulls, admin commands | The newest verified signed state, where to pull it from, and when it was last checked. |
-| `idp-token.jwt` | `login` | The caller's ID token (0600). |
+| `idp-token.jwt`, `idp-refresh-token` | `login` | The caller's ID token, and a refresh token when the IdP grants one (0600). |
+| `jwks/` | callers | Cached issuer keys (a host never reads it). |
 | `last-good.json` | `call` | Which host last answered each service. |
 | `hints` | you | Optional local dial hints (below). |
 | `tools.json` | `tools add`, the operator | Locked mode; optional aliases. |
 | `inbox/` | `inbox` | Pushed messages: `new/` unread (at most 256, oldest evicted with a note), `read/` the last 1024 (0700). |
 | `record-marks.json` | `watch` | Per host: the furthest verified entry (the anchor every view is checked against), where each view (services, `--mine`) resumes, and recent calls' services for labels. Delete it to start over after an alarm you have resolved. |
-| `call-log.jsonl`, `push-queue.json`, `run/` | `serve` | A host's call log, undelivered pushes, control socket and own hint line. |
+| `call-log.jsonl`, `push-queue.json`, `run/`, `child/` | `serve` | A host's call log, undelivered pushes, the operator's control socket and own hint line, and the socket for services' per-call push capabilities. |
 | `gateway-client-key`, `gateway-sessions.json` | `gateway` | The key DCR client ids are MAC'd with, and live web sessions keyed by token hash (0600). |
 
 Secrets resolve **flag → environment variable → `--…-file` → keystore**, so
@@ -440,10 +489,12 @@ a container can mount its node key from a secret with `--node-seed-file`.
 ### Revocation
 
 `serve` re-reads its signed state once per connection, so a removal takes
-effect on the next call, with no restart. A refused call prints `wires:
-denied by responder: <reason>` on stderr, writes nothing to stdout, exits
-`77`, and is in the host's log. There is no shared key, so there is nothing
-to rotate. The protocol as built: [docs/protocol.md](protocol.md).
+effect at each host on the next call after that host has the new state, with
+no restart. A refused call prints `wires: denied by responder: <reason>` on
+stderr, writes nothing to stdout and exits `77`. A member's refusal is in the
+host's log; a removed member hears only `not admitted to this fabric`, and
+the host traces that instead of logging it. There is no shared key, so there
+is nothing to rotate. The protocol as built: [docs/protocol.md](protocol.md).
 
 ### Reachability
 

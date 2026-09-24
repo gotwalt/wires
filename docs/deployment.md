@@ -12,10 +12,12 @@ Patterns for running wires beyond one machine. For the command reference see
 | **Caller** (the agent side) | `wires call`, or `wires mcp` for MCP-only clients | No |
 | **Web gateway** (for Claude.ai and other remote-MCP clients) | `wires gateway` | HTTP, behind TLS you provide (a tunnel or proxy) |
 | **Reader** | `wires watch` | No |
-| **Admin** | `wires init` / `invite` / `remove` / `role` / `service`, one-shot | No |
+| **Admin** | `wires init` / `invite` / `remove` / `role` / `service` / `state push`, one-shot | No |
 
-A host dials out (to peers directly, or through a relay), and unauthenticated
-peers are refused at the QUIC handshake.
+A host dials out (to peers directly, or through a relay). Any key can
+complete the QUIC handshake; one the signed state doesn't list is refused at
+its first message, before anything runs, and isn't written to the call log.
+`wires login` binds a loopback TCP port only for the browser redirect.
 
 ## Building
 
@@ -45,13 +47,25 @@ against.
 
 The admin assigns services to the host (`wires service add … --host
 <name>`) before it starts. If the host was offline when that state was
-pushed, it needs the newer state first: a fresh `wires invite` token for it
-carries it (re-joining never rolls back).
+pushed, `serve` pulls the newer state from the other hosts in its copy when
+it starts; with none of them up, a fresh `wires invite` token for it carries
+it (re-joining never rolls back). An admin edit that reaches no host exits 1;
+`wires state push` re-sends the stored state once a host is up.
+
+**Run services as a separate Unix user.** A service's child gets a minimal
+environment and no `WIRES_HOME`, but it runs as `serve`'s own user, so a
+service a caller can steer into reading or writing files can reach the
+host's keystore (its node key signs the call log). Put `sudo -u svc --` (or
+similar) in the service's `command`. A service's fixed command must also be
+safe against any trailing arguments the caller adds, including option-like
+ones. Don't run `serve` from the admin's keystore: it refuses one holding
+`root.seed`.
 
 **The keystore must be writable and must persist.** `$WIRES_HOME` holds the
 host's node key and membership, and the host rewrites its signed state at
 runtime: every admin change is pushed to it (`state.json`). It also holds the
-call log (`call-log.jsonl`), the push queue and the control socket (`run/`).
+call log (`call-log.jsonl`), the push queue and the control sockets (`run/`,
+`child/`).
 A read-only or throwaway keystore loses those on restart.
 
 **Secrets.** Every secret input resolves **flag → environment variable →
@@ -92,13 +106,17 @@ n0.
   `wires invite <id> --name <label>` and hands back the token; the joiner runs
   `wires join <token>`. The root key never leaves the admin's machine.
 - **Remove a member:** `wires remove <label>`. The new signed state is pushed
-  to the hosts first, with no import and no restart. `serve` re-reads its
-  state once per connection, so the removed member's next call is refused:
-  exit `77`, `wires: denied by responder: <reason>` on its stderr, and a `✗`
-  record in the host's log. There is no shared key to rotate.
-- **Expiry:** memberships and the signed state expire after `--ttl` (default
-  `30d`), and nothing renews them yet. Any admin command signs a fresh state;
-  re-issue memberships with `wires invite <id>`.
+  to the hosts, with no import and no restart. `serve` re-reads its state
+  once per connection, so from the moment a host has the new state, the
+  removed member's next call there is refused: exit `77`, `wires: denied by
+  responder: not admitted to this fabric` on its stderr. The host traces the
+  refusal rather than logging it (a key outside the state can't write to the
+  log). A host the push missed enforces the removal once it pulls (every 10
+  minutes) or after `wires state push`. There is no shared key to rotate.
+- **Expiry:** a membership expires after its `--ttl`, the signed state after
+  its `--state-ttl` (both default `30d`), and nothing renews them yet. Any
+  admin command signs a fresh state (never shortening its life); re-issue
+  memberships with `wires invite <id>`.
 - **Rotate a node key:** the node id changes with the key, so remove the old
   id and invite the new one.
 
@@ -130,11 +148,12 @@ What this changes, honestly:
   it refreshes a token, so a refreshed token couldn't be bound to the
   gateway. The gateway issues no refresh tokens; the client reconnects (one
   click with a live Google session).
-- **Only IdP roles admit a web user.** The gateway offers a service only if a
-  role other than `member` matches the user's verified identity. `member`
-  admits the gateway's node, not the person behind it. A user the state lets
-  call nothing is refused at sign-in.
-- Push, inbox and `watch` aren't offered through the gateway.
+- **Only the user's identity admits a web user.** Every role needs a
+  verified identity, so the gateway's node alone is in no role: the gateway
+  offers a service only if a role matches the web user's own verified
+  identity. A user the state lets call nothing is refused at sign-in.
+- Push, inbox and `watch` aren't offered through the gateway yet (an `inbox`
+  MCP tool is [card 31](board/backlog/31-inbox-delivery.md)).
 
 To run one:
 
