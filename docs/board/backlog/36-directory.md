@@ -1,6 +1,6 @@
 # 36 — The directory: where the fabric's policy lives
 
-**Lane:** D2 · **Depends on:** [35](35-badges-and-bans.md) · **Status:** backlog, designed 2026-09-24 · **Files:** `library/services/` (policy head, items, Merkle proofs, freshness), `library/directory/` (new: frames), `wires/directory/` (new: the mode, its redb store, subscriptions), `wires/host/{serve,gate}.rs`, `wires/state/` (retired), `wires/admin/`, protocol.md §3–4, [fabric.md](../../fabric.md)
+**Lane:** D2 · **Depends on:** [35](../review/35-badges-and-bans.md) · **Status:** backlog, designed 2026-09-24 · **Files:** `library/services/` (policy head, items, Merkle proofs, freshness), `library/directory/` (new: frames), `wires/directory/` (new: the mode, its redb store, subscriptions), `wires/host/{serve,gate}.rs`, `wires/state/` (retired), `wires/admin/`, protocol.md §3–4, [fabric.md](../../fabric.md)
 
 ## Why (the human, 2026-09-24)
 

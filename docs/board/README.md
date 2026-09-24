@@ -70,7 +70,7 @@ Open cards only; finished cards are in [done/](done/).
 | Card | Lane | Depends on | Status | Summary |
 |---|---|---|---|---|
 | [08](doing/08-demo-two-machine.md) | E | — | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent, recording |
-| [35](backlog/35-badges-and-bans.md) | D1 | 28 | backlog (next) | **Badges and bans:** members leave the signed state; a node is admitted by its root-signed badge, removal is a ban, `invite` is no edit |
+| [35](review/35-badges-and-bans.md) | D1 | 28 | review | **Badges and bans:** members leave the signed state; a node is admitted by its root-signed badge, removal is a ban, `invite` is no edit |
 | [36](backlog/36-directory.md) | D2 | 35 | backlog | **The directory:** a mode on its own ALPNs, backed by redb; root-signed head over proved items; freshness timestamps; hosts subscribe to their slice; retires state sync |
 | [37](backlog/37-caller-views.md) | D3 | 36 | backlog | **Caller views:** each caller holds only the services it may use; search; `HelloAck` carries the head version; `mcp`/gateway subscribe; ~800 B invites |
 | [29](backlog/29-person-identity.md) | I2 | 36 | backlog | **Person identity for headless agents:** `login --for`, day-passes issued by a directory |
