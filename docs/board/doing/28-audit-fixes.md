@@ -24,7 +24,7 @@ deployed: break formats freely and don't write compatibility shims.
 - A service's push can reach only that call's caller.
 - A call that can't be logged doesn't run.
 - An admin edit that reaches no host fails loudly, and a command re-sends it.
-- Fabric-wide metadata and the quadratic state are real problems, but they're solved by redesign, not here: [card 29](29-identity-and-scale.md).
+- Fabric-wide metadata and the quadratic state are real problems, but they're solved by redesign, not here: [card 29](../backlog/29-identity-and-scale.md).
 
 ## Findings and fixes
 
@@ -78,8 +78,7 @@ token from **any** issuer the host trusts. A partner Okta could vouch for
 
 **Fix:**
 - "Mine" means the same verified principal (issuer + subject) that `Started` recorded.
-- Push and fetch decide on the token presented in that exchange.
-- Queue entries carry the admitted principal and are delivered only to a presenter whose token verifies to it.
+- ~~Push and fetch by principal~~ → moved to [card 31](../backlog/31-inbox-delivery.md) D1 (agreed 2026-09-24).
 
 ### 5. Records and `watch` (H/M)
 
@@ -103,14 +102,7 @@ with junk connections gets real calls dropped from the log.
 
 ### 7. Push (M)
 
-- The receiver's only check is "is a host" (`caller/inbox.rs:498`), against a state it never checks for freshness. **Fix:** accept `deliver` only from hosts of services this node may call, and require a fresh state.
-- `--to <role>` accepts any role, not just `push.allow` roles, and prints recipients' emails and denied principals (`push.rs:427,487`, `gate.rs:376`). **Fix:** only `push.allow` roles; report counts, not names.
-- The mailbox cap is global and evicts by the sender's `at_ms` (`inbox.rs:205`); dedup is by `PushId` alone. **Fix:**
-  - per-sender caps;
-  - evict by local receive time;
-  - dedupe by `(from, id)`;
-  - a host queue cap per originating service.
-- A removed member's queue is purged only on the next push or fetch (`push.rs:546,649`). **Fix:** purge when the state advances.
+**Moved to [card 31](../backlog/31-inbox-delivery.md)** (agreed 2026-09-24): D1 callbacks go only to the calling node + principal, D1b operator push `--to <node>` only, D3 per-service `push`, D5 caps/dedup/purge. Nothing here is built in card 28.
 
 ### 8. State sync and the caller's view of it (M)
 
@@ -180,3 +172,14 @@ with junk connections gets real calls dropped from the log.
 - [ ] `make lint test` green.
 
 ## Notes
+
+### Integration (2026-09-24)
+
+Lanes merged into `aaron/audit-fixes`: L1 (§2, §3), L2a (§1, §10 socket dir), L2b (§6, §9), L4 (§8, §10), then main (cards 30/31). Deviations from the text above:
+- §8: `Invoke` is still sent with `Hello`; the caller adopts `newer_state` and re-checks the assignment before stdin, but a removed host whose membership hasn't expired still sees argv. Closed by card 29's ban list.
+- §9: `MAX_INVOKE_FRAME` is 512 KiB, not 64 KiB (a legal 64 KiB `Argv` JSON-escapes to more).
+- §6: refusals of non-members (including a removed member) are traced, not logged, so a removed member's later attempts no longer appear in `watch`.
+- §8: pull order is last-good hosts, then other hosts, then the admin (computing "services I may call" needs a JWKS fetch).
+- Admin edits that reach no host exit 1 (the state is still stored); scripts that edit before any host is up must tolerate it.
+- Open: §5 records (lane L3), §11 docs sweep.
+
