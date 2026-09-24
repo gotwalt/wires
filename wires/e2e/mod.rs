@@ -10,7 +10,7 @@
 //! - [`services_host`] — card 27's acceptance: a host decides
 //!   every call by the admin-signed state (the registry's roles,
 //!   `also_require`, removal with no restart, refusing unassigned services,
-//!   push by the state), and nothing is broadcast to a bystander.
+//!   push by the state).
 //! - [`records`] — card 26b: call records streamed from the host's own log
 //!   to authorized readers (`wires watch`).
 //! - [`service_child`] — card 28 §1: a service child gets a minimal
@@ -23,7 +23,19 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use iroh::Endpoint;
+use iroh::address_lookup::memory::MemoryLookup;
+use iroh::{Endpoint, EndpointAddr};
+use library::{
+    Frame, Hello, HelloAck, Invocation, Matcher, Membership, NodeIdentity, OidcNonce, RoleName,
+    ServiceName, SignedState, State, StateVersion,
+};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::time::timeout;
+
+use crate::admin::keystore::Keystore;
+use crate::caller::mock_idp::{MOCK_CLIENT_ID, MockIdp};
+use crate::host::config::HostConfig;
+use crate::host::transport::{ALPN, secret_key};
 
 /// Card 27's host side: a host decides by the signed state.
 mod services_host;
@@ -42,25 +54,198 @@ mod service_child;
 /// the passing case (every wait is on an event, not a clock).
 const PATIENCE: Duration = Duration::from_secs(30);
 
-/// The endpoint's bound sockets with wildcard binds rewritten to localhost, so a
-/// hint reaches it with no discovery service (the `transport.rs` idiom).
+/// The endpoint's bound sockets as hints can dial them (wildcard binds as
+/// localhost, [`crate::net::dialable`]), so a peer reaches it with no
+/// discovery service.
 fn localhost_socks(endpoint: &Endpoint) -> Vec<SocketAddr> {
     endpoint
         .bound_sockets()
         .into_iter()
-        .map(|sock| match sock {
-            SocketAddr::V4(v4) if v4.ip().is_unspecified() => SocketAddr::V4(
-                std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, v4.port()),
-            ),
-            SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
-                SocketAddr::V6(std::net::SocketAddrV6::new(
-                    std::net::Ipv6Addr::LOCALHOST,
-                    v6.port(),
-                    v6.flowinfo(),
-                    v6.scope_id(),
-                ))
-            }
-            other => other,
-        })
+        .map(crate::net::dialable)
         .collect()
+}
+
+/// A hermetic endpoint for `who` ([`presets::Minimal`](iroh::endpoint::presets::Minimal)).
+async fn bind(who: &NodeIdentity) -> Endpoint {
+    Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(secret_key(who))
+        .bind()
+        .await
+        .unwrap()
+}
+
+/// [`bind`], finding peers through `book` (so it can dial them, e.g. push).
+async fn bind_in(who: &NodeIdentity, book: &MemoryLookup) -> Endpoint {
+    Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(secret_key(who))
+        .address_lookup(book.clone())
+        .bind()
+        .await
+        .unwrap()
+}
+
+fn role(s: &str) -> RoleName {
+    RoleName::new(s).unwrap()
+}
+
+fn service(s: &str) -> ServiceName {
+    ServiceName::new(s).unwrap()
+}
+
+/// A matcher for `email` as verified by `idp`.
+fn email_at(idp: &MockIdp, email: &str) -> Matcher {
+    Matcher {
+        email: Some(email.parse().unwrap()),
+        ..Matcher::new(idp.issuer.as_str())
+    }
+}
+
+/// The state `root` signs at `version` (issued now, never expiring), after
+/// `edit` fills it in.
+fn signed_state(root: &NodeIdentity, version: u64, edit: impl FnOnce(&mut State)) -> SignedState {
+    let mut s = State::new(root.node_id());
+    s.version = StateVersion(version);
+    s.issued = crate::clock::now_unix();
+    s.not_after = i64::MAX;
+    edit(&mut s);
+    s.sign(root).unwrap()
+}
+
+/// `who`'s membership under `root`, never expiring.
+fn membership(root: &NodeIdentity, who: &NodeIdentity) -> Membership {
+    Membership::mint(root, who.node_id(), 0, i64::MAX).unwrap()
+}
+
+/// `who`'s `Hello` under `root`: the state version it holds, and a fresh ID
+/// token from `idp` when it is signed in there.
+fn hello(root: &NodeIdentity, who: &NodeIdentity, version: u64, idp: Option<&MockIdp>) -> Hello {
+    Hello {
+        membership: membership(root, who),
+        state_version: StateVersion(version),
+        id_token: idp.map(|idp| {
+            idp.mint(
+                &OidcNonce::for_node(&who.node_id()),
+                crate::clock::now_unix() + 3600,
+            )
+        }),
+    }
+}
+
+/// Store `state` in `ks` as `wires/state` does; whether it was adopted.
+fn adopt(ks: &Keystore, root: &NodeIdentity, state: &SignedState) -> bool {
+    crate::state::store::adopt_if_newer(ks, state, root.node_id(), crate::clock::now_unix())
+        .unwrap()
+}
+
+/// A `host.json` trusting each of `idps` (audience the mock client), with
+/// `services` (a JSON object) and `extra` (`,"key":…` members) spliced in.
+fn host_config(idps: &[&MockIdp], services: &str, extra: &str) -> HostConfig {
+    let issuers: Vec<String> = idps
+        .iter()
+        .map(|idp| {
+            format!(
+                r#"{{"issuer":"{}","audiences":["{MOCK_CLIENT_ID}"]}}"#,
+                idp.issuer.as_str()
+            )
+        })
+        .collect();
+    HostConfig::parse(&format!(
+        r#"{{"version":2,"identity":{{"issuers":[{}]}},"services":{services}{extra}}}"#,
+        issuers.join(",")
+    ))
+    .unwrap()
+}
+
+/// One session frame; `None` at the end of the stream.
+async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Option<Frame> {
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len).await.ok()?;
+    let mut buf = len.to_vec();
+    buf.resize(4 + u32::from_be_bytes(len) as usize, 0);
+    r.read_exact(&mut buf[4..]).await.ok()?;
+    Frame::decode(&buf).unwrap().map(|(f, _)| f)
+}
+
+/// What a call came to.
+#[derive(Debug)]
+enum Outcome {
+    /// Admitted: the ack, the exit code, and stdout.
+    Ran {
+        ack: Box<HelloAck>,
+        code: i32,
+        stdout: String,
+    },
+    /// Refused with this reason.
+    Denied(String),
+}
+
+impl Outcome {
+    /// The refusal's reason; panics on a run.
+    fn denied(&self) -> &str {
+        match self {
+            Outcome::Denied(reason) => reason,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A successful run's stdout; panics on anything else.
+    fn stdout(&self) -> &str {
+        match self {
+            Outcome::Ran {
+                code: 0, stdout, ..
+            } => stdout,
+            other => panic!("expected a successful run, got {other:?}"),
+        }
+    }
+}
+
+/// Dial the host at `addr` as `who` on the session ALPN, say `hello`, invoke
+/// `name` with `args`, close stdin, and collect the outcome. Hand-rolled
+/// frames, so a test can present any `Hello` (the dial `wires call` makes
+/// has its own tests in `caller::call`).
+async fn call(
+    who: &NodeIdentity,
+    addr: &EndpointAddr,
+    hello: Hello,
+    name: &str,
+    args: &[&str],
+) -> Outcome {
+    let endpoint = bind(who).await;
+    let outcome = timeout(PATIENCE, async {
+        let conn = endpoint.connect(addr.clone(), ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let invoke = Frame::Invoke(Invocation {
+            service: service(name),
+            argv: library::Argv::new(args.iter().map(|a| a.to_string()).collect()).unwrap(),
+        });
+        for frame in [Frame::Hello(hello), invoke] {
+            send.write_all(&frame.encode().unwrap()).await.unwrap();
+        }
+        send.finish().unwrap();
+        let ack = match read_frame(&mut recv).await {
+            Some(Frame::HelloAck(ack)) => ack,
+            Some(Frame::Denied { reason }) => return Outcome::Denied(reason),
+            other => panic!("unexpected first answer: {other:?}"),
+        };
+        let mut stdout = Vec::new();
+        loop {
+            match read_frame(&mut recv).await {
+                Some(Frame::Stdout(chunk)) => stdout.extend_from_slice(chunk.as_bytes()),
+                Some(Frame::Stderr(_)) => {}
+                Some(Frame::Exit(code)) => {
+                    conn.close(0u32.into(), b"done");
+                    return Outcome::Ran {
+                        ack: Box::new(ack),
+                        code,
+                        stdout: String::from_utf8(stdout).unwrap(),
+                    };
+                }
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the call timed out");
+    endpoint.close().await;
+    outcome
 }

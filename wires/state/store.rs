@@ -11,7 +11,7 @@ use std::fs::OpenOptions;
 use anyhow::{Context, Result, bail};
 use library::{Membership, NodeId, SignedState};
 
-use crate::admin::keystore::{Keystore, write_text_mode};
+use crate::admin::keystore::{Keystore, create_private_dir, write_text_mode};
 
 /// The file name under `$WIRES_HOME`.
 pub(crate) const STATE_FILE: &str = "state.json";
@@ -94,22 +94,6 @@ pub(crate) fn adopt_if_newer(
     }
     write_text_mode(&ks.path(STATE_FILE), &format!("{text}\n"), Some(0o600))?;
     Ok(true)
-    // `lock` drops here, releasing the file lock.
-}
-
-/// Create `dir` (and its parents) if missing, the new directories mode
-/// `0700`: the keystore holds seeds and the state.
-fn create_private_dir(dir: &std::path::Path) -> Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder
-        .create(dir)
-        .with_context(|| format!("creating {}", dir.display()))
 }
 
 /// The admin's node id (`state-admin.txt`): where a member pulls newer
@@ -118,10 +102,10 @@ fn create_private_dir(dir: &std::path::Path) -> Result<()> {
 const ADMIN_FILE: &str = "state-admin.txt";
 
 /// When this node last checked its copy with a peer (`state-checked.txt`,
-/// unix seconds): what "older than 10 minutes" is measured against.
+/// unix seconds): what [`is_stale`] measures against.
 const CHECKED_FILE: &str = "state-checked.txt";
 
-/// The fabric root this keystore belongs to (its membership's `fabric`);
+/// The network root this keystore belongs to (its membership's `fabric`);
 /// `None` before `init` or `join`.
 pub(crate) fn fabric(ks: &Keystore) -> Result<Option<NodeId>> {
     Ok(ks.read_membership()?.map(|m| m.fabric))
@@ -148,13 +132,14 @@ pub(crate) fn mark_checked(ks: &Keystore, now: i64) -> Result<()> {
     write_text_mode(&ks.path(CHECKED_FILE), &format!("{now}\n"), None)
 }
 
-/// Whether this node's copy was last checked more than `max_age` seconds
-/// before `now` (or never).
-pub(crate) fn is_stale(ks: &Keystore, now: i64, max_age: i64) -> bool {
+/// Whether this node's copy was last checked more than
+/// [`STALE_AFTER_SECS`](super::sync::STALE_AFTER_SECS) before `now` (or
+/// never).
+pub(crate) fn is_stale(ks: &Keystore, now: i64) -> bool {
     std::fs::read_to_string(ks.path(CHECKED_FILE))
         .ok()
         .and_then(|t| t.trim().parse::<i64>().ok())
-        .is_none_or(|at| now.saturating_sub(at) > max_age)
+        .is_none_or(|at| now.saturating_sub(at) > super::sync::STALE_AFTER_SECS)
 }
 
 #[cfg(test)]
@@ -233,10 +218,11 @@ mod tests {
     #[test]
     fn staleness_and_the_admin_hint() {
         let ks = keystore();
-        assert!(is_stale(&ks, 1_000, 600), "never checked is stale");
+        let max = super::super::sync::STALE_AFTER_SECS;
+        assert!(is_stale(&ks, 1_000), "never checked is stale");
         mark_checked(&ks, 1_000).unwrap();
-        assert!(!is_stale(&ks, 1_600, 600));
-        assert!(is_stale(&ks, 1_601, 600));
+        assert!(!is_stale(&ks, 1_000 + max));
+        assert!(is_stale(&ks, 1_001 + max));
         assert_eq!(read_admin(&ks).unwrap(), None);
         let admin = NodeIdentity::generate().node_id();
         save_admin(&ks, admin).unwrap();

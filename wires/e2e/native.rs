@@ -100,7 +100,7 @@ impl World {
     fn keystore(&self, state: &SignedState) -> std::path::PathBuf {
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);
-        ks.save_node(&self.host, false).unwrap();
+        ks.save_node(&self.host).unwrap();
         ks.save_membership(&self.membership(&self.host)).unwrap();
         crate::state::store::adopt_if_newer(
             &ks,

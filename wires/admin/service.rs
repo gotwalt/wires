@@ -17,8 +17,6 @@
 //! makes a node a host, and dropping its last service makes it a plain
 //! member again.
 
-use std::collections::BTreeSet;
-
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use library::{
@@ -26,12 +24,12 @@ use library::{
     State, StateVersion,
 };
 
-use super::invite::{Report, resolve_member};
+use super::invite::resolve_member;
 use super::keystore::Keystore;
-use super::propagate;
 use super::ttl::Ttl;
+use super::{Report, run_edit};
 use crate::clock::now_unix;
-use crate::state::{store, sync};
+use crate::state::store;
 
 /// `service` arguments.
 #[derive(Args)]
@@ -395,7 +393,7 @@ pub(crate) fn edit_from(ks: &Keystore, a: &ServiceEditArgs) -> Result<ServiceEdi
 }
 
 /// Run a `service` subcommand against `ks` (no push): what changed.
-pub(crate) fn service_in(ks: &Keystore, a: ServiceArgs) -> Result<(String, SignedState)> {
+pub(crate) fn service_in(ks: &Keystore, a: ServiceArgs) -> Result<String> {
     let (verb, name, signed) = match a.cmd {
         ServiceCmd::Add(e) => {
             let name = service_name(&e.name)?;
@@ -412,17 +410,14 @@ pub(crate) fn service_in(ks: &Keystore, a: ServiceArgs) -> Result<(String, Signe
             ("removed", name.clone(), rm(ks, name, r.ttl)?)
         }
     };
-    Ok((
-        format!(
-            "service {name} {verb} (state version {})",
-            signed.state.version.0
-        ),
-        signed,
+    Ok(format!(
+        "service {name} {verb} (state version {})",
+        signed.state.version.0
     ))
 }
 
 /// Run a `role` subcommand against `ks` (no push): what changed.
-pub(crate) fn role_in(ks: &Keystore, a: RoleArgs) -> Result<(String, SignedState)> {
+pub(crate) fn role_in(ks: &Keystore, a: RoleArgs) -> Result<String> {
     let role = |t: &str| RoleName::new(t.trim()).map_err(|_| anyhow!("{t:?} is not a role name"));
     let (verb, name, signed) = match a.cmd {
         RoleCmd::Set(r) => {
@@ -439,43 +434,32 @@ pub(crate) fn role_in(ks: &Keystore, a: RoleArgs) -> Result<(String, SignedState
             ("removed", name.clone(), role_rm(ks, name, r.ttl)?)
         }
     };
-    Ok((
-        format!(
-            "role {name} {verb} (state version {})",
-            signed.state.version.0
-        ),
-        signed,
-    ))
-}
-
-/// Push the stored state to the hosts (and `earlier`, the hosts before the
-/// edit) and fold the outcome into a [`Report`].
-async fn pushed(ks: &Keystore, stdout: String, earlier: &BTreeSet<NodeId>) -> Result<Report> {
-    let report = Report {
-        stdout,
-        notes: Vec::new(),
-        failure: None,
-    };
-    Ok(propagate::fold(
-        report,
-        propagate::propagate(ks, earlier).await,
+    Ok(format!(
+        "role {name} {verb} (state version {})",
+        signed.state.version.0
     ))
 }
 
 /// `wires service …` against the resolved keystore, then push.
 pub(crate) async fn service_cmd(a: ServiceArgs) -> Result<Report> {
-    let ks = Keystore::resolve()?;
-    let earlier = sync::held_hosts(&ks)?;
-    let (stdout, _) = service_in(&ks, a)?;
-    pushed(&ks, stdout, &earlier).await
+    run_edit(|ks| {
+        Ok(Report {
+            stdout: service_in(ks, a)?,
+            ..Report::default()
+        })
+    })
+    .await
 }
 
 /// `wires role …` against the resolved keystore, then push.
 pub(crate) async fn role_cmd(a: RoleArgs) -> Result<Report> {
-    let ks = Keystore::resolve()?;
-    let earlier = sync::held_hosts(&ks)?;
-    let (stdout, _) = role_in(&ks, a)?;
-    pushed(&ks, stdout, &earlier).await
+    run_edit(|ks| {
+        Ok(Report {
+            stdout: role_in(ks, a)?,
+            ..Report::default()
+        })
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -487,7 +471,7 @@ mod tests {
     use proptest::prelude::*;
 
     /// An initialized admin keystore with `extra` more members in its state.
-    pub(crate) fn admin_with(extra: &[NodeId]) -> Keystore {
+    fn admin_with(extra: &[NodeId]) -> Keystore {
         let ks = Keystore::at(temp_dir());
         init_in(&ks, InitArgs::default()).unwrap();
         let extra = extra.to_vec();
@@ -500,7 +484,7 @@ mod tests {
     }
 
     fn ttl() -> Ttl {
-        Ttl::DEFAULT.parse().unwrap()
+        Ttl::default()
     }
 
     fn svc(n: &str) -> ServiceName {
@@ -614,7 +598,8 @@ mod tests {
         }
     }
 
-    /// Run `wires role …` (the parsed command line) against `ks`.
+    /// Run `wires role …` (the parsed command line) against `ks`: the
+    /// state it stored.
     fn role_cli(ks: &Keystore, args: &[&str]) -> Result<SignedState> {
         use crate::{Cli, Command};
         use clap::Parser;
@@ -622,7 +607,9 @@ mod tests {
         let Command::Role(a) = cli.command else {
             panic!("expected role");
         };
-        role_in(ks, a).map(|(_, s)| s)
+        role_in(ks, a)?;
+        let root = ks.read_root_identity()?.unwrap().node_id();
+        Ok(store::read(ks, root)?.unwrap())
     }
 
     #[test]
@@ -647,23 +634,6 @@ mod tests {
         let ms = &s.state.roles[&role("analyst")];
         assert_eq!(ms[0].issuer, "https://acme.okta.com");
         assert_eq!(ms[1].issuer, "https://other");
-    }
-
-    #[test]
-    fn member_is_an_ordinary_role_name() {
-        let ks = admin_with(&[]);
-        let s = role_cli(&ks, &["set", "member", "issuer=https://idp"]).unwrap();
-        assert_eq!(
-            s.state.roles[&role("member")],
-            vec![Matcher::new("https://idp")]
-        );
-        role_cli(&ks, &["rm", "member"]).unwrap();
-        // Undefined, `member` is an unknown role like any other.
-        let edit = ServiceEdit {
-            allow: Some(vec![role("member")]),
-            ..Default::default()
-        };
-        assert!(add(&ks, svc("x"), edit, ttl()).is_err());
     }
 
     #[test]

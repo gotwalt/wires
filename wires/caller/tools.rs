@@ -181,16 +181,15 @@ pub fn resolve_path(explicit: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
-/// `wires tools` (hidden): `wires services` plus the aliases, or edit the
-/// local aliases in `tools.json`.
+/// `wires tools` (hidden): edit the local aliases in `tools.json`.
 #[derive(Args)]
 pub struct ToolsArgs {
     /// Use this file instead of `$WIRES_HOME/tools.json`.
     #[arg(long, global = true)]
     pub tools_file: Option<PathBuf>,
-    /// None: `wires services`, then your aliases.
+    /// What to do with the aliases.
     #[command(subcommand)]
-    pub cmd: Option<ToolsCmd>,
+    pub cmd: ToolsCmd,
 }
 
 /// The `wires tools` alias operations (optional: the signed state's services
@@ -231,31 +230,12 @@ pub struct ToolsAddArgs {
     pub remote_tool: Option<String>,
 }
 
-/// `wires tools`: with no subcommand, `wires services` then the aliases;
-/// else [`run_tools_cmd`].
-pub async fn tools_cmd(a: ToolsArgs) -> Result<String> {
-    if a.cmd.is_some() {
-        return run_tools_cmd(a);
-    }
-    let listing = crate::caller::services::run(&Default::default()).await?;
-    let config = ToolsConfig::load(&resolve_path(a.tools_file.as_deref())?)?;
-    let aliases = render_aliases(&config);
-    Ok([listing, aliases]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n"))
-}
-
 /// Run a `wires tools` alias subcommand against the tools file; returns what
 /// to print on stdout (possibly empty).
 pub fn run_tools_cmd(a: ToolsArgs) -> Result<String> {
     let path = resolve_path(a.tools_file.as_deref())?;
     let mut config = ToolsConfig::load(&path)?;
-    let Some(cmd) = a.cmd else {
-        bail!("`wires tools` with no subcommand lists services (tools_cmd)");
-    };
-    match cmd {
+    match a.cmd {
         ToolsCmd::List => Ok(render_list(&config)),
         ToolsCmd::Rm { name } => {
             let name = ServiceName::new(name)?;
@@ -292,23 +272,6 @@ fn remote_tool_from_args(a: ToolsAddArgs) -> Result<RemoteTool> {
             .transpose()
             .context("--remote-tool")?,
     })
-}
-
-/// The aliases, for the end of `wires tools`: `name  alias: …  description`.
-pub(crate) fn render_aliases(config: &ToolsConfig) -> String {
-    config
-        .tools
-        .iter()
-        .map(|t| {
-            format!(
-                "{}  alias: {}  {}",
-                t.name,
-                t.target_summary(),
-                t.description
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// `wires tools list` output: `name<TAB>target<TAB>description`, config
@@ -445,7 +408,7 @@ pub(crate) mod tests {
         let run = |cmd: ToolsCmd| {
             run_tools_cmd(ToolsArgs {
                 tools_file: Some(path.clone()),
-                cmd: Some(cmd),
+                cmd,
             })
         };
         let add = |name: &str| ToolsAddArgs {

@@ -10,6 +10,8 @@
 //! - [`the_endpoint_enforces_the_transport_rules`]: `405`, `403` origin,
 //!   `202` notification, `400` header mismatch, `404` unknown method,
 //!   `401` for a bad token.
+//! - [`concurrent_users_each_call_with_their_own_token`]: two users calling
+//!   at once through one gateway node each present their own token.
 //! - [`a_user_the_state_admits_to_nothing_is_refused_at_sign_in`]
 //! - [`a_code_is_single_use_and_bound_to_its_client`]
 //!
@@ -571,30 +573,31 @@ async fn the_endpoint_enforces_the_transport_rules() {
 #[tokio::test]
 async fn concurrent_users_each_call_with_their_own_token() {
     let idp = MockIdp::start("alice@example.com").await;
-    let gw = Running::start(&idp).await;
+    let gw = Arc::new(Running::start(&idp).await);
     let alice = gw.sign_in_as(Some("alice@example.com")).await;
     let bob = gw.sign_in_as(Some("bob@example.com")).await;
-    let calls = (0..16).map(|i| {
+    let mut calls = tokio::task::JoinSet::new();
+    for i in 0..16 {
         let (who, token) = if i % 2 == 0 {
-            ("alice", &alice)
+            ("alice", alice.clone())
         } else {
-            ("bob", &bob)
+            ("bob", bob.clone())
         };
         let tag = format!("{who}-{i}");
-        let gw = &gw;
-        async move {
+        let gw = Arc::clone(&gw);
+        calls.spawn(async move {
             let r = gw
                 .modern(
-                    token,
+                    &token,
                     "tools/call",
                     Some("orders-db"),
                     json!({"name":"orders-db","arguments":{"args":[tag]}}),
                 )
                 .await;
             assert_eq!(r.status(), StatusCode::OK);
-        }
-    });
-    futures_join_all(calls).await;
+        });
+    }
+    calls.join_all().await;
     let fetcher = KeyFetcher::new(None).unwrap();
     let seen = gw.seen.lock().unwrap().clone();
     assert_eq!(seen.len(), 16);
@@ -617,33 +620,6 @@ async fn concurrent_users_each_call_with_their_own_token() {
             Some(format!("{caller}@example.com").as_str())
         );
     }
-}
-
-/// Run `futs` concurrently to completion (no `futures` crate here).
-async fn futures_join_all<F: std::future::Future<Output = ()>>(futs: impl Iterator<Item = F>) {
-    let mut set = Vec::new();
-    for f in futs {
-        set.push(Box::pin(f));
-    }
-    let mut pending: Vec<_> = set.into_iter().map(Some).collect();
-    std::future::poll_fn(|cx| {
-        let mut done = true;
-        for slot in pending.iter_mut() {
-            if let Some(f) = slot {
-                if f.as_mut().poll(cx).is_ready() {
-                    *slot = None;
-                } else {
-                    done = false;
-                }
-            }
-        }
-        if done {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await;
 }
 
 #[tokio::test]

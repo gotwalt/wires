@@ -18,24 +18,23 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use iroh::EndpointAddr;
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr};
-use library::{
-    AuditRecord, CallId, Frame, Hello, Invocation, Matcher, Membership, NodeIdentity, OidcNonce,
-    PushBody, RoleName, Service, ServiceName, SignedState, State, StateVersion, Subject,
-};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use library::{AuditRecord, CallId, Hello, NodeIdentity, PushBody, Service, SignedState, Subject};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use super::{PATIENCE, localhost_socks};
+use super::{
+    Outcome, PATIENCE, adopt, bind, email_at, host_config, localhost_socks, membership, role,
+    service, signed_state,
+};
 use crate::admin::keystore::Keystore;
-use crate::caller::mock_idp::{MOCK_CLIENT_ID, MockIdp};
+use crate::caller::mock_idp::MockIdp;
 use crate::host::config::HostConfig;
 use crate::host::control::ControlClient;
 use crate::host::push::{PushHost, PushSpec, host_socket};
 use crate::host::serve::{push_sockets, services_host, services_router};
-use crate::host::transport::{ALPN, AuditSink, endpoint_addr, secret_key};
+use crate::host::transport::{AuditSink, endpoint_addr};
 
 /// Root 1, host 10, alice 2 (an analyst, signed in), bob 3.
 struct World {
@@ -60,56 +59,40 @@ impl World {
     /// Everyone a member; role `analyst` = alice; service `env` (analyst) on
     /// the host.
     fn state(&self, version: u64) -> SignedState {
-        let mut s = State::new(self.root.node_id());
-        s.version = StateVersion(version);
-        s.issued = crate::clock::now_unix();
-        s.not_after = i64::MAX;
-        s.members.extend([
-            self.alice.node_id(),
-            self.bob.node_id(),
-            self.host.node_id(),
-        ]);
-        s.hosts.insert(self.host.node_id());
-        s.roles.insert(
-            RoleName::new("analyst").unwrap(),
-            vec![Matcher {
-                email: Some("alice@example.com".parse().unwrap()),
-                ..Matcher::new(self.idp.issuer.as_str())
-            }],
-        );
-        s.services.insert(
-            ServiceName::new("env").unwrap(),
-            Service {
-                description: String::new(),
-                allow: vec![RoleName::new("analyst").unwrap()],
-                hosts: vec![self.host.node_id()],
-                readers: vec![],
-            },
-        );
-        s.sign(&self.root).unwrap()
+        signed_state(&self.root, version, |s| {
+            s.members.extend([
+                self.alice.node_id(),
+                self.bob.node_id(),
+                self.host.node_id(),
+            ]);
+            s.hosts.insert(self.host.node_id());
+            s.roles.insert(
+                role("analyst"),
+                vec![email_at(&self.idp, "alice@example.com")],
+            );
+            s.services.insert(
+                service("env"),
+                Service {
+                    description: String::new(),
+                    allow: vec![role("analyst")],
+                    hosts: vec![self.host.node_id()],
+                    readers: vec![],
+                },
+            );
+        })
     }
 
     /// `env` prints its environment; push to analysts.
     fn host_json(&self) -> HostConfig {
-        HostConfig::parse(&format!(
-            r#"{{"version":2,
-                "identity":{{"issuers":[{{"issuer":"{}","audiences":["{MOCK_CLIENT_ID}"]}}]}},
-                "services":{{"env":{{"command":["env"],"env":{{"FROM_HOST_JSON":"yes"}}}}}},
-                "push":{{"allow":["analyst"]}}}}"#,
-            self.idp.issuer.as_str()
-        ))
-        .unwrap()
+        host_config(
+            &[&self.idp],
+            r#"{"env":{"command":["env"],"env":{"FROM_HOST_JSON":"yes"}}}"#,
+            r#","push":{"allow":["analyst"]}"#,
+        )
     }
 
     fn hello(&self, who: &NodeIdentity) -> Hello {
-        Hello {
-            membership: Membership::mint(&self.root, who.node_id(), 0, i64::MAX).unwrap(),
-            state_version: StateVersion(1),
-            id_token: Some(self.idp.mint(
-                &OidcNonce::for_node(&who.node_id()),
-                crate::clock::now_unix() + 3600,
-            )),
-        }
+        super::hello(&self.root, who, 1, Some(&self.idp))
     }
 }
 
@@ -127,16 +110,10 @@ impl Host {
     async fn start(w: &World) -> Host {
         let home = crate::testutil::temp_dir();
         let keystore = Arc::new(Keystore::at(home.clone()));
-        crate::state::store::adopt_if_newer(
-            &keystore,
-            &w.state(1),
-            w.root.node_id(),
-            crate::clock::now_unix(),
-        )
-        .unwrap();
+        adopt(&keystore, &w.root, &w.state(1));
         let mut host = services_host(
             w.host.node_id(),
-            Membership::mint(&w.root, w.host.node_id(), 0, i64::MAX).unwrap(),
+            membership(&w.root, &w.host),
             Arc::clone(&keystore),
             w.host_json(),
         )
@@ -149,11 +126,7 @@ impl Host {
         let (tx, commands) = mpsc::channel(16);
         let sockets = push_sockets(&home, &host, tx).await.unwrap();
         tokio::spawn(Arc::clone(&push).run(commands));
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .secret_key(secret_key(&w.host))
-            .bind()
-            .await
-            .unwrap();
+        let endpoint = bind(&w.host).await;
         let addr = endpoint_addr(&w.host.node_id(), &localhost_socks(&endpoint), None).unwrap();
         let router = services_router(endpoint, host, Some(push));
         Host {
@@ -173,66 +146,22 @@ impl Host {
     }
 }
 
-async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Option<Frame> {
-    let mut len = [0u8; 4];
-    r.read_exact(&mut len).await.ok()?;
-    let mut buf = len.to_vec();
-    buf.resize(4 + u32::from_be_bytes(len) as usize, 0);
-    r.read_exact(&mut buf[4..]).await.ok()?;
-    Frame::decode(&buf).unwrap().map(|(f, _)| f)
-}
-
-/// Call `env` on `host` as `who`: the child's environment, or the refusal.
+/// Call `env` on `host` as `who` ([`super::call`]): the child's environment,
+/// or the refusal.
 async fn call_env(
     w: &World,
     who: &NodeIdentity,
     host: &Host,
 ) -> Result<BTreeMap<String, String>, String> {
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .secret_key(secret_key(who))
-        .bind()
-        .await
-        .unwrap();
-    let out = timeout(PATIENCE, async {
-        let conn = endpoint.connect(host.addr.clone(), ALPN).await.unwrap();
-        let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        let invoke = Frame::Invoke(Invocation {
-            service: ServiceName::new("env").unwrap(),
-            argv: library::Argv::new(vec![]).unwrap(),
-        });
-        for frame in [Frame::Hello(w.hello(who)), invoke] {
-            send.write_all(&frame.encode().unwrap()).await.unwrap();
-        }
-        send.finish().unwrap();
-        match read_frame(&mut recv).await {
-            Some(Frame::HelloAck(_)) => {}
-            Some(Frame::Denied { reason }) => return Err(reason),
-            other => panic!("unexpected first answer: {other:?}"),
-        }
-        let mut stdout = Vec::new();
-        loop {
-            match read_frame(&mut recv).await {
-                Some(Frame::Stdout(chunk)) => stdout.extend_from_slice(chunk.as_bytes()),
-                Some(Frame::Stderr(_)) => {}
-                Some(Frame::Exit(code)) => {
-                    assert_eq!(code, 0);
-                    conn.close(0u32.into(), b"done");
-                    break;
-                }
-                other => panic!("unexpected frame: {other:?}"),
-            }
-        }
-        Ok(String::from_utf8(stdout)
-            .unwrap()
+    match super::call(who, &host.addr, w.hello(who), "env", &[]).await {
+        Outcome::Denied(reason) => Err(reason),
+        ran => Ok(ran
+            .stdout()
             .lines()
             .filter_map(|l| l.split_once('='))
             .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect())
-    })
-    .await
-    .expect("the call timed out");
-    endpoint.close().await;
-    out
+            .collect()),
+    }
 }
 
 fn spec(to: &str) -> PushSpec {
@@ -382,13 +311,7 @@ async fn a_rolled_back_state_is_refused() {
     let w = World::new().await;
     let host = Host::start(&w).await;
     let ks = Keystore::at(&host.home);
-    crate::state::store::adopt_if_newer(
-        &ks,
-        &w.state(2),
-        w.root.node_id(),
-        crate::clock::now_unix(),
-    )
-    .unwrap();
+    assert!(adopt(&ks, &w.root, &w.state(2)));
     call_env(&w, &w.alice, &host).await.unwrap();
     // Version 1 copied back over version 2: it verifies, and is refused.
     let old = w.state(1).encode().unwrap();

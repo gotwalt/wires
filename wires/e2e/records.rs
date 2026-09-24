@@ -12,6 +12,8 @@
 //! - [`readers_see_all_callers_see_their_own_members_see_nothing`]: `--mine`,
 //!   a late reader's backlog, bob's own refusal only, the stranger's fixed
 //!   refusal, and resuming from the mark.
+//! - [`pre_auth_readers_are_capped_in_size_and_number`]: an oversized `Open`
+//!   and one undecided reader too many are refused before anything is read.
 //! - [`mine_is_the_person_not_the_node`], [`a_reader_with_no_token_sees_nothing_in_full`]
 //! - [`a_follower_gets_live_records`], [`a_removed_reader_stops_mid_stream`],
 //!   [`a_reader_dropped_from_readers_goes_down_to_mine`]
@@ -25,25 +27,25 @@ use std::time::Duration;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr};
 use library::{
-    AuditRecord, ChainBreak, Frame, Hello, Invocation, LogEntry, LogSeq, Matcher, Membership,
-    NodeId, NodeIdentity, OidcNonce, RoleName, Service, ServiceName, SignedState, State,
-    StateVersion,
+    AuditRecord, ChainBreak, Hello, LogEntry, LogSeq, Membership, NodeId, NodeIdentity, RoleName,
+    Service, SignedState, State,
 };
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use super::{PATIENCE, localhost_socks};
+use super::{
+    Outcome, PATIENCE, adopt, bind, email_at, host_config, localhost_socks, role, service,
+    signed_state,
+};
 use crate::admin::keystore::Keystore;
 use crate::caller::login::ID_TOKEN_FILE;
-use crate::caller::mock_idp::{MOCK_CLIENT_ID, MockIdp};
+use crate::caller::mock_idp::MockIdp;
 use crate::caller::pick::Hints;
 use crate::caller::watch_records::{Output, Report, WatchOpts, text_line, watch_with};
 use crate::host::call_log::{self, CallLog};
-use crate::host::config::HostConfig;
 use crate::host::record_stream::NOT_ADMITTED;
 use crate::host::serve::{services_host, services_router};
-use crate::host::transport::{ALPN, endpoint_addr, secret_key};
+use crate::host::transport::endpoint_addr;
 
 /// Root 1, host 10, alice 2 and 7 (analyst; one person, two nodes), bob 3,
 /// sam 5 (security).
@@ -57,14 +59,6 @@ struct World {
     idp_alice: MockIdp,
     idp_bob: MockIdp,
     idp_sam: MockIdp,
-}
-
-fn role(s: &str) -> RoleName {
-    RoleName::new(s).unwrap()
-}
-
-fn service(s: &str) -> ServiceName {
-    ServiceName::new(s).unwrap()
 }
 
 impl World {
@@ -88,45 +82,38 @@ impl World {
 
     /// The state at `version`, changed by `edit` before it is signed.
     fn state_v(&self, version: u64, edit: impl FnOnce(&mut State)) -> SignedState {
-        let mut s = State::new(self.root.node_id());
-        s.version = StateVersion(version);
-        s.issued = crate::clock::now_unix();
-        s.not_after = i64::MAX;
-        for n in [&self.host, &self.alice, &self.alice2, &self.bob, &self.sam] {
-            s.members.insert(n.node_id());
-        }
-        s.hosts.insert(self.host.node_id());
-        let email = |idp: &MockIdp, e: &str| Matcher {
-            email: Some(e.parse().unwrap()),
-            ..Matcher::new(idp.issuer.as_str())
-        };
-        s.roles.insert(
-            role("analyst"),
-            vec![email(&self.idp_alice, "alice@example.com")],
-        );
-        s.roles.insert(
-            role("security"),
-            vec![email(&self.idp_sam, "sam@example.com")],
-        );
-        s.roles.insert(
-            role("staff"),
-            [&self.idp_alice, &self.idp_bob, &self.idp_sam]
-                .iter()
-                .map(|idp| Matcher::new(idp.issuer.as_str()))
-                .collect(),
-        );
-        let on_host = |allow: Vec<RoleName>| Service {
-            description: String::new(),
-            allow,
-            hosts: vec![self.host.node_id()],
-            readers: vec![role("security")],
-        };
-        s.services
-            .insert(service("orders-db"), on_host(vec![role("analyst")]));
-        s.services
-            .insert(service("status"), on_host(vec![role("staff")]));
-        edit(&mut s);
-        s.sign(&self.root).unwrap()
+        signed_state(&self.root, version, |s| {
+            for n in [&self.host, &self.alice, &self.alice2, &self.bob, &self.sam] {
+                s.members.insert(n.node_id());
+            }
+            s.hosts.insert(self.host.node_id());
+            s.roles.insert(
+                role("analyst"),
+                vec![email_at(&self.idp_alice, "alice@example.com")],
+            );
+            s.roles.insert(
+                role("security"),
+                vec![email_at(&self.idp_sam, "sam@example.com")],
+            );
+            s.roles.insert(
+                role("staff"),
+                [&self.idp_alice, &self.idp_bob, &self.idp_sam]
+                    .iter()
+                    .map(|idp| library::Matcher::new(idp.issuer.as_str()))
+                    .collect(),
+            );
+            let on_host = |allow: Vec<RoleName>| Service {
+                description: String::new(),
+                allow,
+                hosts: vec![self.host.node_id()],
+                readers: vec![role("security")],
+            };
+            s.services
+                .insert(service("orders-db"), on_host(vec![role("analyst")]));
+            s.services
+                .insert(service("status"), on_host(vec![role("staff")]));
+            edit(s);
+        })
     }
 
     fn idp(&self, who: &NodeIdentity) -> &MockIdp {
@@ -140,32 +127,19 @@ impl World {
     }
 
     fn membership(&self, who: &NodeIdentity) -> Membership {
-        Membership::mint(&self.root, who.node_id(), 0, i64::MAX).unwrap()
+        super::membership(&self.root, who)
     }
 
     fn hello(&self, who: &NodeIdentity) -> Hello {
-        Hello {
-            membership: self.membership(who),
-            state_version: StateVersion(1),
-            id_token: Some(self.idp(who).mint(
-                &OidcNonce::for_node(&who.node_id()),
-                crate::clock::now_unix() + 3600,
-            )),
-        }
+        super::hello(&self.root, who, 1, Some(self.idp(who)))
     }
 
     /// A reader's keystore: key, membership, the signed state, an ID token.
     fn reader(&self, who: &NodeIdentity) -> Keystore {
         let ks = Keystore::at(crate::testutil::temp_dir());
-        ks.save_node(who, true).unwrap();
+        ks.save_node(who).unwrap();
         ks.save_membership(&self.membership(who)).unwrap();
-        crate::state::store::adopt_if_newer(
-            &ks,
-            &self.state(),
-            self.root.node_id(),
-            crate::clock::now_unix(),
-        )
-        .unwrap();
+        adopt(&ks, &self.root, &self.state());
         let token = self.hello(who).id_token.unwrap();
         std::fs::write(ks.path(ID_TOKEN_FILE), token.as_str()).unwrap();
         ks
@@ -188,29 +162,9 @@ const SERVICES: &str = r#"{
 
 impl Host {
     async fn start(w: &World) -> Host {
-        let home = crate::testutil::temp_dir();
-        let keystore = Arc::new(Keystore::at(home.clone()));
-        crate::state::store::adopt_if_newer(
-            &keystore,
-            &w.state(),
-            w.root.node_id(),
-            crate::clock::now_unix(),
-        )
-        .unwrap();
-        let issuers: Vec<String> = [&w.idp_alice, &w.idp_bob, &w.idp_sam]
-            .iter()
-            .map(|idp| {
-                format!(
-                    r#"{{"issuer":"{}","audiences":["{MOCK_CLIENT_ID}"]}}"#,
-                    idp.issuer.as_str()
-                )
-            })
-            .collect();
-        let config = HostConfig::parse(&format!(
-            r#"{{"version":2,"identity":{{"issuers":[{}]}},"services":{SERVICES}}}"#,
-            issuers.join(",")
-        ))
-        .unwrap();
+        let keystore = Arc::new(Keystore::at(crate::testutil::temp_dir()));
+        adopt(&keystore, &w.root, &w.state());
+        let config = host_config(&[&w.idp_alice, &w.idp_bob, &w.idp_sam], SERVICES, "");
         let mut host = services_host(
             w.host.node_id(),
             w.membership(&w.host),
@@ -225,11 +179,7 @@ impl Host {
             CallLog::open(&log, w.host.duplicate(), library::Retention::default()).unwrap();
         let (sink, _, _tee) = call_log::start(opened, None, false);
         host.audit = Some(sink);
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .secret_key(secret_key(&w.host))
-            .bind()
-            .await
-            .unwrap();
+        let endpoint = bind(&w.host).await;
         let addr = endpoint_addr(&w.host.node_id(), &localhost_socks(&endpoint), None).unwrap();
         let router = services_router(endpoint.clone(), Arc::new(host), None);
         Host {
@@ -243,13 +193,7 @@ impl Host {
 
     /// Adopt `state` (as `wires/state` would): the next decision uses it.
     fn adopt(&self, w: &World, state: &SignedState) {
-        crate::state::store::adopt_if_newer(
-            &self.keystore,
-            state,
-            w.root.node_id(),
-            crate::clock::now_unix(),
-        )
-        .unwrap();
+        adopt(&self.keystore, &w.root, state);
     }
 
     /// Replace the stored log with `entries` (a host rewriting its history).
@@ -277,48 +221,12 @@ impl Host {
     }
 }
 
-async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Option<Frame> {
-    let mut len = [0u8; 4];
-    r.read_exact(&mut len).await.ok()?;
-    let mut buf = len.to_vec();
-    buf.resize(4 + u32::from_be_bytes(len) as usize, 0);
-    r.read_exact(&mut buf[4..]).await.ok()?;
-    Frame::decode(&buf).unwrap().map(|(f, _)| f)
-}
-
-/// `who` calls `name args` on the host; returns whether it ran.
+/// `who` calls `name args` on the host ([`super::call`]); whether it ran.
 async fn call(w: &World, who: &NodeIdentity, host: &Host, name: &str, args: &[&str]) -> bool {
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .secret_key(secret_key(who))
-        .bind()
-        .await
-        .unwrap();
-    let ran = timeout(PATIENCE, async {
-        let conn = endpoint.connect(host.addr.clone(), ALPN).await.unwrap();
-        let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        let invoke = Frame::Invoke(Invocation {
-            service: ServiceName::new(name).unwrap(),
-            argv: library::Argv::new(args.iter().map(|a| a.to_string()).collect()).unwrap(),
-        });
-        for frame in [Frame::Hello(w.hello(who)), invoke] {
-            send.write_all(&frame.encode().unwrap()).await.unwrap();
-        }
-        send.finish().unwrap();
-        loop {
-            match read_frame(&mut recv).await {
-                Some(Frame::Denied { .. }) | None => return false,
-                Some(Frame::Exit(_)) => {
-                    conn.close(0u32.into(), b"done");
-                    return true;
-                }
-                Some(_) => {}
-            }
-        }
-    })
-    .await
-    .expect("the call timed out");
-    endpoint.close().await;
-    ran
+    matches!(
+        super::call(who, &host.addr, w.hello(who), name, args).await,
+        Outcome::Ran { .. }
+    )
 }
 
 /// Run one `wires watch --once` as the reader in `ks`: the report and every
@@ -331,11 +239,7 @@ async fn watch_once(
     services: &[&str],
     mine: bool,
 ) -> (Report, Vec<String>) {
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .secret_key(secret_key(who))
-        .bind()
-        .await
-        .unwrap();
+    let endpoint = bind(who).await;
     let opts = WatchOpts {
         services: services.iter().map(|s| service(s)).collect(),
         mine,
@@ -447,11 +351,7 @@ async fn pre_auth_readers_are_capped_in_size_and_number() {
     let w = World::new().await;
     let host = Host::start(&w).await;
     let stranger = NodeIdentity::from_seed([66u8; 32]);
-    let dialer = Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .secret_key(secret_key(&stranger))
-        .bind()
-        .await
-        .unwrap();
+    let dialer = bind(&stranger).await;
 
     // A prefix one byte over the cap, and the stream held open: the host
     // closes it at once rather than wait out the open timeout for the body.
@@ -511,11 +411,7 @@ async fn a_follower_gets_live_records() {
     let w = World::new().await;
     let host = Host::start(&w).await;
     let sam = w.reader(&w.sam);
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .secret_key(secret_key(&w.sam))
-        .bind()
-        .await
-        .unwrap();
+    let endpoint = bind(&w.sam).await;
     let hints = host.hints(&w);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let watcher = tokio::spawn(async move {
@@ -585,7 +481,6 @@ async fn a_tampered_log_is_reported() {
         matches!(report.broken[0].1, ChainBreak::BrokenLink { .. }),
         "{report:?}"
     );
-    let _: NodeId = w.host.node_id();
 }
 
 /// Start `wires watch` (following) as `who` over `services`: its outputs,
@@ -609,11 +504,7 @@ fn follow(
     };
     let (tx, rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .secret_key(secret_key(&who))
-            .bind()
-            .await
-            .unwrap();
+        let endpoint = bind(&who).await;
         let mut out = |o: Output| {
             let _ = tx.send(o);
         };
@@ -698,7 +589,7 @@ async fn a_reader_with_no_token_sees_nothing_in_full() {
     assert!(records(&lines).is_empty(), "{lines:#?}");
 }
 
-/// A following reader removed from the fabric is refused mid-stream and
+/// A following reader removed from the network is refused mid-stream and
 /// gets nothing logged after the removal.
 #[tokio::test]
 async fn a_removed_reader_stops_mid_stream() {
