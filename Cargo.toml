@@ -28,7 +28,7 @@ blake3 = "1"
 # in the graph via ed25519-dalek and iroh, so no new crate is compiled.
 zeroize = "1"
 proptest = "1"
-iroh = "1.0.3"
+iroh = "1.2"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 tracing = "0.1"
