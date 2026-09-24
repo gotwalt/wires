@@ -83,12 +83,14 @@ Each summary describes the surface at the time the card was done. Cards 25–27 
 | [25](done/25-cargo-and-strip.md) | X | 23, 24 | Down to essentials: Bazel → plain Cargo + Dockerfile; remove grants/tickets/CRL/relay/manual targets and outdated docs (git history is the archive) |
 | [27](done/27-services-not-hosts.md) | S3 | 25 | **Services, not hosts; drop the channel.** Admin-signed members + service registry; local `wires services`; identity in the handshake; delete gossip/fabric keys/re-keys/announcements (~20k LOC) |
 | [26](done/26-host-held-records.md) | H2 | 27 | Call records: host-held signed log, `watch <service>` for authorized readers + own calls, optional OTel export |
+| [28](backlog/28-audit-fixes.md) | A | 27, 26 | **Audit fixes (2026-09-23):** drop `member`, issuer-scoped matchers, service child can't reach host secrets, fail-closed log, person-keyed records/push, state-sync and caller fixes, docs sweep |
+| [29](backlog/29-identity-and-scale.md) | I2 | 28 | **Identity and scale (design agreed):** machine badges + banned list, `login --for` + day-pass, per-caller views served by hosts, transparency-log checkpoints |
 | [22](done/22-gossip-role-OPEN.md) | — | decided | **Decided 2026-09-23: drop the channel** → cards 27 and 26 |
 | [18](backlog/18-front-door-OPEN.md) | — | parked | **Open question, don't build:** apex key, invites, `wires join <domain>` |
 | [16](done/16-token-benchmark.md) | bench | 01–03 | MCP (GitHub server, many tools; ± tool search) vs `gh` via `wires call` vs bare `gh`: 5 tasks × 5 runs |
 | [09](backlog/09-witness.md) | stretch | 02 | Key-less witness: stores and verifies call records without decrypting them |
 
-**Order (agreed 2026-09-23):** 24 → 25 (Cargo + strip) → 27 (services, not hosts; drop the channel) → 26 (host-held records) → recording (08, in progress: workbench on HEAD, dry run, record; see its Steps).
+**Order (agreed 2026-09-23):** 24 → 25 (Cargo + strip) → 27 (services, not hosts; drop the channel) → 26 (host-held records) → recording (08, in progress: workbench on HEAD, dry run, record; see its Steps). **Then (2026-09-23 audit):** 28 → 29.
 
 ## Rules for workers
 
