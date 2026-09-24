@@ -84,6 +84,12 @@ Open cards only; finished cards are in [done/](done/).
 why is [`bench/state-scale/REPORT.md`](../../bench/state-scale/REPORT.md)) → 29 → 09. 31 and
 32 are not scheduled.
 
+**Build plan for 35–37 (2026-09-24):** workers branch from `aaron/directory`; the integrator
+merges each into it, and the whole update lands on `main` as one PR. Stages: **35 ∥ 36a**
+(36a = card 36's pure `library` types: head, items, Merkle proofs, `Fresh`, directory frames) →
+**36b** (the mode, redb, publish, host slices, retiring state sync) → **37** → a docs and comments
+sweep across the repo.
+
 ## Rules for workers
 
 - **Move your card**: `git mv docs/board/backlog/NN-*.md docs/board/doing/` when you start, to `review/` when your acceptance list is green. Only the integrator moves cards to `done/`.
