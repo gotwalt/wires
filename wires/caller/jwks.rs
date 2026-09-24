@@ -189,7 +189,7 @@ impl KeyFetcher {
             // stale claim was for, not just that it is stale.
             Err(library::Error::IdToken(IdTokenError::Expired { exp })) => {
                 match verify_claim(claim, &issuer, &jwks, audiences, exp) {
-                    Ok(principal) => Err(VerifyError::Expired(principal)),
+                    Ok(principal) => Err(VerifyError::Expired(Box::new(principal))),
                     Err(e) => Err(e.into()),
                 }
             }
@@ -306,8 +306,9 @@ pub(crate) enum VerifyError {
     /// Verification ran and failed; the variant says which check.
     Rejected(IdTokenError),
     /// Every check passes except freshness: the token was valid for this
-    /// principal until [`Principal::not_after`].
-    Expired(Principal),
+    /// principal until [`Principal::not_after`]. Boxed: a `Principal` is
+    /// large, and this error travels in every verification `Result`.
+    Expired(Box<Principal>),
 }
 
 impl From<library::Error> for VerifyError {

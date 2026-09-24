@@ -154,14 +154,17 @@ impl Identities {
     pub(crate) fn record(&self, node: NodeId, verdict: &Verdict) {
         let mut known = self.known.lock().expect("identity index poisoned");
         let held = known.entry(node).or_default();
-        match verdict {
-            Ok(p) | Err(VerifyError::Expired(p)) => {
-                if held.as_ref().is_none_or(|h| p.not_after >= h.not_after) {
-                    tracing::info!(node = %node.hex(), who = %p.name(), "identity verified");
-                    *held = Some(p.clone());
-                }
+        let p = match verdict {
+            Ok(p) => p,
+            Err(VerifyError::Expired(p)) => &**p,
+            Err(e) => {
+                tracing::warn!(node = %node.hex(), "ID token did not verify: {e}");
+                return;
             }
-            Err(e) => tracing::warn!(node = %node.hex(), "ID token did not verify: {e}"),
+        };
+        if held.as_ref().is_none_or(|h| p.not_after >= h.not_after) {
+            tracing::info!(node = %node.hex(), who = %p.name(), "identity verified");
+            *held = Some(p.clone());
         }
     }
 
@@ -244,7 +247,13 @@ mod tests {
         ids.record(n, &Err(VerifyError::Unavailable("down".into())));
         assert_eq!(ids.latest(n), Some(who("new@example.com", 200)));
         // An expired verdict still names who the node was.
-        ids.record(n, &Err(VerifyError::Expired(who("later@example.com", 300))));
+        ids.record(
+            n,
+            &Err(VerifyError::Expired(Box::new(who(
+                "later@example.com",
+                300,
+            )))),
+        );
         assert_eq!(ids.latest(n), Some(who("later@example.com", 300)));
         assert_eq!(ids.latest(node(6)), None);
     }

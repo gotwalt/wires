@@ -9,7 +9,7 @@
 # host that serves CLIs needs those CLIs too: build FROM this image's build
 # stage, or copy /usr/local/bin/wires into an image that already has them.
 
-FROM rust:1.91.0-bookworm AS build
+FROM rust:1.98.1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY library ./library

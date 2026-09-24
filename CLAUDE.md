@@ -64,7 +64,7 @@ file shows up in `git status` as `Wires/…`, add it by its lowercase path.
 
 Plain Cargo: one workspace, four crates (`library`, `wires`, `wires-ffi`,
 `wires-node`), `Cargo.lock` committed, toolchain
-pinned in `rust-toolchain.toml` (1.91.0). The `Makefile` wraps the dev loop
+pinned in `rust-toolchain.toml` (1.98.1). The `Makefile` wraps the dev loop
 (`make help`).
 
 ```bash
@@ -130,7 +130,7 @@ Each `library` module is a worked example of the above.
 
 ## Containers
 
-One multi-stage `Dockerfile`: build on `rust:1.91.0-bookworm`, copy the
+One multi-stage `Dockerfile`: build on `rust:1.98.1-bookworm`, copy the
 binary into `gcr.io/distroless/cc-debian12:nonroot`. It builds natively on the
 Docker host's architecture (arm64 on a Mac, x86_64 on workbench); there is no
 cross-compile. The image holds only `wires`: enough for the caller side and
@@ -179,7 +179,7 @@ runs from it. A host serving CLIs needs an image that also has those CLIs.
   (card 16) and its results; `bench/push/` the push-vs-poll benchmark
   (card 24). `deploy/gateway/` — the web gateway's Compose deployment.
   `docs/media/` — the README's demo recording.
-- Rust edition 2024, toolchain 1.91.0 (`rust-toolchain.toml`).
+- Rust edition 2024, toolchain 1.98.1 (`rust-toolchain.toml`).
 - Lint: `clippy` + `shellcheck`, both with default settings. Format:
   `rustfmt` (`rustfmt.toml`) + `shfmt` (tabs, per `.editorconfig`).
 - No CI (decided 2026-09-23): run `make lint test` before pushing.
