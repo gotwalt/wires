@@ -984,7 +984,8 @@ mod tests {
     }
 
     /// A push host (4) of the fabric rooted at 1, whose state lists 2 as a
-    /// member, logging to an in-memory sink.
+    /// member, logging to an in-memory sink. (No service or role is needed:
+    /// these tests stop at membership, and `serve` isn't preflighted.)
     fn push_host() -> (Arc<PushHost>, mpsc::Receiver<AuditRecord>) {
         use crate::admin::keystore::Keystore;
         use library::{Membership, State, StateVersion};
@@ -997,23 +998,6 @@ mod tests {
         s.not_after = i64::MAX;
         s.members.extend([node(4), node(2)]);
         s.hosts.insert(node(4));
-        let analyst = library::RoleName::new("analyst").unwrap();
-        s.roles.insert(
-            analyst.clone(),
-            vec![library::Matcher {
-                email: Some("alice@example.com".parse().unwrap()),
-                ..Default::default()
-            }],
-        );
-        s.services.insert(
-            library::ServiceName::new("t").unwrap(),
-            library::Service {
-                description: String::new(),
-                allow: vec![analyst],
-                hosts: vec![node(4)],
-                readers: vec![],
-            },
-        );
         let signed = s.sign(&root).unwrap();
         crate::state::store::adopt_if_newer(&ks, &signed, root.node_id(), crate::now_unix())
             .unwrap();
