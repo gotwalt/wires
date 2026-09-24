@@ -15,3 +15,6 @@
 
 # Local ops notes and deploy script for workbench (not shared)
 /ops/
+
+# npm packages (bindings/node)
+node_modules/

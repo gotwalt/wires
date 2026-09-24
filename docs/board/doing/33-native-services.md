@@ -1,6 +1,6 @@
 # 33 — Wires-native services: the host runtime as a library
 
-**Lane:** N · **Depends on:** 28 · **Status:** Phases 0 and 1 done; Phase 2: Python done, TypeScript next (2026-09-23)
+**Lane:** N · **Depends on:** 28 · **Status:** Phases 0–2 done (Rust, Python, TypeScript); packaging open (2026-09-23)
 · **Files:** `library/membership/identity.rs` (key hygiene), `wires/admin/keystore.rs`
 (seed read/write only), `wires/host/transport.rs` (the bridge), `wires/host/service.rs`
 (new), `wires/host/serve.rs`, protocol.md §9; Phase 1: `wires/lib.rs` (was
@@ -98,12 +98,20 @@ proves good enough when evaluated.
 - [x] Python: `.scripts/build-python.sh` (`make python`) builds the cdylib
       and the generated `wires.py`; `bindings/python/examples/kv.py` is the
       kv example in Python.
-- [x] Acceptance: `.scripts/demo-python-service.sh` (`make demo-python`), a
+- [x] Acceptance: `.scripts/demo-native-service.sh --lang python` (`make demo-python`), a
       real loopback fabric with the Python process as the host, called by
       the shipped `wires`: set/get/keys with state kept; the handler's exit
       code and stderr; bob refused (77) by name; `push_to_caller` reaching
       `wires inbox`; the host's log through alice's `wires watch --mine`.
-- [ ] TypeScript/Node (napi-rs).
+- [x] TypeScript/Node: `bindings/node/` (package `wires-node`, napi-rs 3,
+      npm package `wires`). A service is `(call) => number | Promise<number>`
+      on Node's event loop; `Call`'s stdio methods return Promises;
+      `HostBuilder` chains; `host.serve()` resolves on `stop()` or Ctrl-C.
+      `.scripts/build-node.sh` (`make node`) builds the addon, the napi
+      loader and the `index.d.ts` generated from `lib.rs` into
+      `target/node/wires`; `bindings/node/examples/kv.mts` is the kv example
+      (Node runs it directly). `make demo-node` runs the same acceptance,
+      plus a `tsc` typecheck of the example against the generated types.
 - [ ] Packaging: a wheel (maturin, `bindings = "uniffi"`) and an npm package.
 
 ## Notes
@@ -162,3 +170,11 @@ proves good enough when evaluated.
 - Observed: a `set` that pushes took ~3 s: `push_to_caller` waits while the
   host tries to deliver directly to a caller with no receiver listening,
   then queues. The same as a CLI child's `wires push`; not a bindings issue.
+- 2026-09-23, TypeScript: the JS handler is a `ThreadsafeFunction` called
+  with `call_async_catch` (plain `call_async` turns a thrown error into a
+  fatal exception that kills Node); a sync throw, an async throw and a
+  rejected Promise all end the call with exit 1 and the message on stderr.
+  It returns `number | Promise<number>` (`Either`). Everything runs on
+  napi's tokio runtime (`tokio_rt`), the host included. The crate has
+  `test = false`: an addon has no test harness to link, so its acceptance
+  is `make demo-node`. The demo script is now one, with `--lang`.

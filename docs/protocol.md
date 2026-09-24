@@ -254,8 +254,10 @@ key lives in the app's memory (§9): a native service is the operator's own code
 `bind_loopback()` binds the host's direct (IP) transport only on `127.0.0.1` and `::1`, with no
 port mapping; callers elsewhere reach it through its relay. It exists for local demos: a host bound
 so holds no network socket, so the macOS firewall doesn't prompt for an interpreter that can't be
-signed. Other languages reach the same API through `wires-ffi` (UniFFI; `bindings/`), where a
-handler is a synchronous `call(call) -> int` on a thread of its own.
+signed. Other languages reach the same API through `wires-ffi` (UniFFI, Python; `bindings/`),
+where a handler is a synchronous `call(call) -> int` on a thread of its own, and `wires-node`
+(napi-rs, TypeScript; `bindings/node/`), where it is `(call) => number | Promise<number>` on
+Node's event loop. In both, a handler that raises ends the call with exit 1 and the error on stderr.
 
 **The caller** (`wires call`, `wires mcp`) refuses to dial from an expired state (exit 1: ask the
 admin for `wires state push` or a fresh invite). It takes the service's hosts from its state, the

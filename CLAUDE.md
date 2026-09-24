@@ -5,8 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 "Wires" — a Rust workspace built with plain Cargo (`library`, `wires`, and
-the `wires-ffi` language bindings), plus a `Dockerfile` for a distroless
-image of the `wires` binary.
+the language bindings `wires-ffi` (Python, via UniFFI) and `wires-node`
+(TypeScript, via napi-rs)), plus a `Dockerfile` for a distroless image of
+the `wires` binary.
 
 **The current assignment (2026-09-22, reshaped by card 27):** agents run
 CLIs on other machines, by **service name**. The machine is reached by public
@@ -70,7 +71,9 @@ cargo build --release -p wires               # the shipped binary: target/releas
 cargo build --release -p wires --features dev-mock-idp  # + hidden `wires dev-mock-idp` (demo only)
 .scripts/demo-remote-cli.sh --quiet          # make demo: the self-asserting loopback demo
 .scripts/build-python.sh                     # make python: Python bindings into target/python
-.scripts/demo-python-service.sh              # make demo-python: a Python-native service, end to end (needs uv)
+.scripts/build-node.sh                       # make node: the npm package into target/node/wires
+.scripts/demo-native-service.sh --lang python   # make demo-python: a Python-native service, end to end (needs uv)
+.scripts/demo-native-service.sh --lang node     # make demo-node: the same in TypeScript (Node >= 22.18)
 docker build .                               # make image: distroless image, native arch
 ```
 
@@ -134,7 +137,9 @@ host exposing CLIs needs an image that also has those CLIs.
   `wires/` (the `wires` library, `lib.rs`, and the `wires` binary,
   `main.rs`, which only calls `wires::run`), and `bindings/` (`wires-ffi`:
   UniFFI bindings of the embedding API, foreign module `wires`; Python
-  example in `bindings/python/`). No `src/` subdir; the sources are filed
+  example in `bindings/python/`) with `bindings/node/` (`wires-node`: the
+  napi-rs addon and npm package `wires`; TypeScript example in
+  `bindings/node/examples/`). No `src/` subdir; the sources are filed
   by role:
   - `wires/`: `lib.rs` is argument parsing and dispatch, plus the public
     embedding API (`Host`, `Service`, `Call`, `CallIo`: card 33, an app

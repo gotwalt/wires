@@ -1,0 +1,25 @@
+[package]
+name = "wires-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Node.js / TypeScript bindings for wires-native services (card 33), through napi-rs"
+
+[lib]
+name = "wires_node"
+path = "lib.rs"
+# A Node addon: loaded by Node, which provides the N-API symbols. There is
+# no Rust test harness to link (the acceptance test is the Node demo).
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+wires = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+napi = { version = "3", default-features = false, features = ["napi9", "tokio_rt"] }
+napi-derive = "3"
+
+[build-dependencies]
+napi-build = "2"

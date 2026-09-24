@@ -1,0 +1,24 @@
+{
+  "name": "wires",
+  "version": "0.1.0",
+  "private": true,
+  "description": "wires-native services in Node.js and TypeScript (card 33): serve wires calls from your own process",
+  "license": "MIT",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "*.node"],
+  "napi": {
+    "binaryName": "wires"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "build": "napi build --platform --release"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
