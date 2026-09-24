@@ -13,7 +13,7 @@ Patterns for running wires beyond one machine. For the command reference see
 | **Web gateway** (for Claude.ai and other remote-MCP clients) | `wires gateway` | HTTP, behind TLS you provide (a tunnel or proxy) |
 | **Reader** | `wires watch` | No |
 | **Directory** (holds the signed policy for everyone else) | `wires serve host.json` on a host the policy lists, or `wires directory serve` | No TCP listener; binds UDP for QUIC |
-| **Admin** | `wires init` / `invite` / `remove` / `issuer` / `role` / `service` / `directory` / `state push`, one-shot | No |
+| **Admin** | `wires init` / `invite` / `remove` / `issuer` / `role` / `service` / `directory` / `state push` / `state settings`, one-shot | No |
 
 A host dials out (to peers directly, or through a relay). Any key can
 complete the QUIC handshake; one without a valid badge, or banned by the signed policy, is refused at
@@ -145,8 +145,7 @@ n0.
   node's next call there is refused: exit `77`, `wires: denied by host: not
   a member of this network` on its stderr. The host traces the refusal
   rather than logging it (a banned key can't write to the log). A host that is a directory has the new policy at once; any other host
-  fetches it at its next check (every 5 minutes, until card 36c's
-  subscriptions). There is no shared key to rotate.
+  follows a directory's subscription and has it within a second. There is no shared key to rotate.
 - **Expiry:** a badge (membership) expires after its `--ttl` (default and
   most `30d`), the signed policy after its `--state-ttl` (default `90d`), and
   nothing renews them yet. Any admin edit signs a fresh policy (never

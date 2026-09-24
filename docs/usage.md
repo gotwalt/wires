@@ -9,7 +9,7 @@ choices, the limits, and the command reference. The wire-level spec is
 
 | Role | Decides | Commands |
 |---|---|---|
-| **admin** | who's in (it mints each node's badge, and bans), which IdPs are trusted, which roles exist, which services run where, who may call and read each, which nodes are directories (root key) | `init`, `invite`, `remove`, `issuer set\|rm`, `role set\|rm`, `service add\|set\|rm`, `directory add\|rm`, `state push` |
+| **admin** | who's in (it mints each node's badge, and bans), which IdPs are trusted, which roles exist, which services run where, who may call and read each, which nodes are directories (root key) | `init`, `invite`, `remove`, `issuer set\|rm`, `role set\|rm`, `service add\|set\|rm`, `directory add\|rm`, `state push`, `state settings` |
 | **directory** | nothing: it holds the newest signed policy, vouches for its freshness, and hands it to hosts and callers; it never decides a call | `serve` (when the policy lists it), `directory serve` |
 | **host** | how it implements its assigned services; stricter local rules (narrower IdPs, `also_require`); push | `serve host.json`, `push` |
 | **caller** | — runs services by name; MCP (stdio, or the remote gateway) so wires works in the clients people already use | `id`, `join`, `login`, `services`, `call`, `mcp`, `inbox`, `gateway` |
@@ -211,9 +211,8 @@ agent$ echo $?
 ```
 
 Each host applies the removal from the moment it holds the new policy: at
-once here, since both hosts are directories; a host that isn't one fetches it
-at its next check of a directory (every 5 minutes, until card 36c's
-subscriptions). The refusal is traced by the host, not written to its call
+once here, since both hosts are directories; a host that isn't one follows a
+directory's subscription and has it within a second. The refusal is traced by the host, not written to its call
 log: a banned key can't write to the log.
 
 The script also covers SQL on stdin, the same service through `wires mcp`,
@@ -454,9 +453,6 @@ To make `wires` the boundary, use a structural setup:
     trusted IdPs, directories. It is signed, not secret. It lists no members
     (card 35), but every agent's machine still holds every service and role
     until card 37 (views). Hosts hold all of it by design.
-  - **A host learns an edit at its next check** of a directory (every 5
-    minutes), unless it is itself a directory; card 36c subscribes hosts so
-    an edit arrives in seconds.
   - **A removed host still sees argv** while its badge is valid, from a
     caller whose copy of the policy predates the ban: the caller sends the
     arguments with its `Hello` and stops before stdin only once the host
@@ -478,9 +474,15 @@ To make `wires` the boundary, use a structural setup:
 - **The admin is a one-shot command.** It publishes each edit to the
   directories only. An edit that reaches none exits 1; `wires state push`
   re-publishes it. Callers fetch from a directory on their next command
-  (after 10 minutes), or get it at their next call's handshake; hosts check a
-  directory at start and every 5 minutes. With no directory up, a node needs
-  a fresh invite.
+  (after 10 minutes), or get it at their next call's handshake; hosts follow
+  a directory's subscription and have each edit within a second. With no
+  directory up, a node needs a fresh invite.
+- **With every directory down, hosts keep deciding** from their copy under
+  the default `lenient` freshness, and say so in their trace (not yet in
+  `wires watch`); edits and bans don't spread until a directory is back.
+  Under `wires state settings --freshness strict` they refuse every call
+  once the last directory's timestamp lapses (15 minutes by default), so a
+  ban is honoured everywhere within that time or nothing is served.
 - **A host knows only the identities presented to it.** Push to a role
   reaches members that have called that host, or run `wires inbox`, since it
   started (card 31 removes role push).
@@ -510,11 +512,9 @@ To make `wires` the boundary, use a structural setup:
 - **The recorded two-machine demo** with real Google sign-in and Claude Code
   as the agent ([card 08](board/doing/08-demo-two-machine.md);
   script in [docs/demo.md](demo.md)).
-- **Subscriptions and views** (cards [36](board/doing/36-directory.md) (36c),
-  [37](board/backlog/37-caller-views.md); the architecture is
-  [fabric.md](fabric.md)): directories send each host the policy's changes, by
-  subscription, and each caller only its view, with search; `wires mcp`
-  noticing a new policy without a restart; the `strict` freshness setting.
+- **Caller views** ([card 37](board/backlog/37-caller-views.md); the
+  architecture is [fabric.md](fabric.md)): each caller holds only its view,
+  with search, and `wires mcp` notices a new policy without a restart.
 - `login --for` and day-passes for headless agents
   ([card 29](board/backlog/29-person-identity.md)); transparency-log
   checkpoints witnessed by the directory ([card 09](board/backlog/09-witness.md));
@@ -539,8 +539,9 @@ To make `wires` the boundary, use a structural setup:
 | | `wires role set <name> [--issuer URL] [--state-ttl] <matcher>…` · `role rm <name>` | Define a role as an OR of matchers: `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…` (all must hold). Every matcher names its issuer, compared exactly: one without `issuer=` takes `--issuer` (default `https://accounts.google.com`). `issuer=…` alone admits anyone that IdP verified. `org` is Google's `hd`, read only from Google. The issuer must be one the policy trusts (`wires issuer set`). There is no built-in role: a node with no verified identity is in no role. |
 | | `wires service add\|set <name> [--description D] [--allow role]… [--host node]… [--reader role]…` · `service rm <name>` | Edit the registry. `--host` is an `invite --name` label or a node id, of a node this admin invited and didn't ban; `set` replaces each list given. |
 | | `wires state push` | Re-publish the stored policy to every directory, e.g. after an edit that reached none. Exits 1 if the policy names directories and none took it. |
+| | `wires state settings [--freshness lenient\|strict] [--beat-secs N] [--fresh-secs N] [--state-ttl 90d]` | Print the network's settings, or change them and publish. `--freshness`: what a host does when no directory has vouched for its policy recently (`lenient`, the default, keeps deciding and traces it; `strict` refuses every call until a directory is back). `--beat-secs` (default 300): how often a directory signs a freshness timestamp; `--fresh-secs` (default 900, at least the beat): how long one lasts. |
 | **directory** | `wires directory serve [--relay-url URL] [--max-subscribers 4096]` | Run this node's directory alone (no `host.json`), until Ctrl-C. Refuses the admin's keystore and a node the policy it holds doesn't list. |
-| **host** | `wires serve host.json` | Refuse to start unless the policy assigns every service in the file here (fetching a newer one from a directory first if needed); then check every caller against the policy, exec the service per call, and log every call, admitted caller's refusal and push. It checks a directory for a newer policy every 5 minutes, and runs the directory too when the policy lists this node. `--check` validates and prints what the file implements. |
+| **host** | `wires serve host.json` | Refuse to start unless the policy assigns every service in the file here (fetching a newer one from a directory first if needed); then check every caller against the policy, exec the service per call, and log every call, admitted caller's refusal and push. It follows a directory's subscription for every edit (and, under `strict` freshness, refuses calls while no directory vouches for its policy), and runs the directory too when the policy lists this node. `--check` validates and prints what the file implements. |
 | | `wires push --to <node-id\|role> --subject S [--ttl D] -- <body>` | Hand a message for a caller to this machine's running `serve` (body from stdin if none is given). From the operator's shell: to any node or role. From a service (it has `WIRES_PUSH_TOKEN`): only to that call's caller. Prints `delivered`, `queued` or `denied` per recipient; exits `77` if every recipient was refused. |
 | **caller** | `wires id` | Print this node's id (creating its key on first use). |
 | | `wires join <token>` | Install an invite: the badge (membership) and the signed policy. |

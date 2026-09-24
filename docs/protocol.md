@@ -114,9 +114,10 @@ SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kin
 - **Issuers.** Each `issuer` item is a trusted IdP: its exact `iss`, the OAuth `client_id`
   `wires login` signs in under, and the `aud` values hosts accept from it. A host's `host.json`
   can narrow them, never widen them (§6).
-- **Settings.** One item: `freshness` (`lenient`, the default, or `strict`; not enforced yet, card
-  36c), `beat_secs` (default 300: how often a directory signs a `Fresh`, and how often a host
-  checks for a newer policy) and `fresh_secs` (default 900: how long a `Fresh` is good for).
+- **Settings.** One item: `freshness` (`lenient`, the default, or `strict`: what a host does when
+  no directory has vouched for its policy recently, §4 *Freshness at the host*), `beat_secs`
+  (default 300: how often a directory signs a `Fresh` and beats its subscriptions) and `fresh_secs`
+  (default 900: how long a `Fresh` is good for). The admin sets them with `wires state settings`.
 - **Versioning.** Every admin edit (`init`, `remove`, `service`, `role`, `issuer`, `directory
   add|rm`, and the rare `invite` below) is the stored policy changed, expired bans dropped,
   `version + 1`, `issued = now`, `not_after = max(now + --state-ttl, the stored policy's
@@ -172,6 +173,8 @@ The admin commands and their flags are in [usage.md § Commands by role](usage.m
   `directories`, and from the ledger. Removing a node already banned is refused.
 - **`role`** and **`service`** edit the roles and the registry; a `--host` must be a node in the
   ledger, and not banned.
+- **`state settings [--freshness lenient|strict] [--beat-secs N] [--fresh-secs N]`** edits the
+  settings item; with no flag it prints the settings and edits nothing.
 
 Every edit takes `--state-ttl` and ends with the publish in §4. `wires state push` changes nothing:
 it re-publishes the stored policy to every directory.
@@ -236,23 +239,32 @@ signed for it, and subscribers are woken. An older or equal one changes nothing.
   `published {version}` with the version it now holds (the published one, or a newer one it
   already had); refused, `denied {reason}`. The admin publishes this way.
 - `head {}` → `head {head, fresh}`.
-- `policy {have}`: the whole policy, for hosts and directories (and callers, until card 37).
-  `current {fresh}` when `have` is the newest, else `policy {policy, fresh}`. The frames also
-  define `policy_update {update, fresh}` (a `PolicyUpdate` from a `have` the directory still keeps),
-  which the directory doesn't send yet.
+- `policy {have}`: the whole policy, for hosts and directories (and callers, until card 37):
+  `current {fresh}` when `have` is the newest (or newer than the directory's); `policy_update
+  {update, fresh}`, the `PolicyUpdate` from the head at `have` (`update_from` against the head
+  kept in `directory.redb`), when `have` is one of the 16 kept heads; else the whole `policy
+  {policy, fresh}` (`have` 0, too old, or unknown).
 - `view {have, query?}` → `view {view, fresh}` (or `view_update {update, fresh}`, or `current`),
   and `resolve {service}` → a one-entry or empty `view`: defined, and answered `denied` until
   card 37.
 
 **`wires/directory-sub/1`.** The dialer sends `hello`, then `subscribe {kind, have}`, where `kind`
-is `policy` (a host), `replica` (another directory) or `view` (a long-running caller). Only
-`replica` is served, and only to a node the held head lists as a directory; `policy` and `view`
-are refused until cards 36c and 37, which will send `policy_update` and `view_update` deltas. A
-replica first receives `policy {policy, fresh}` when the held version is newer than `have`, else
-`fresh {fresh}`; then the same on every change: the whole policy for a newer head, a `fresh` beat
-otherwise. The stream ends with `denied` if the subscriber stops
-being listed. A directory serves at most 4,096 subscribers (`wires directory serve
---max-subscribers`); one more is refused.
+is `policy` (a host), `replica` (another directory) or `view` (a long-running caller; refused
+until card 37). A directory serves at most 4,096 subscribers of either kind (`wires directory
+serve --max-subscribers`); one more is refused with `denied`.
+
+- **`policy`**, from any admitted node (card 37 narrows the whole policy to hosts and
+  directories). The first frame comes at once: `fresh {fresh}` when `have` is the newest, else
+  what `policy {have}` would answer (`policy_update {update, fresh}` from a kept head, or the whole
+  `policy {policy, fresh}`). Then, for every head the directory adopts (a publish, or a replica
+  catching up), one `policy_update` from the version the subscriber was last sent, and a `fresh`
+  beat every `settings.beat_secs` in between. A subscriber ahead of the directory gets nothing
+  until the directory catches up. Subscribers at one version share one encoded frame, so a publish
+  costs the directory one diff per version its subscribers hold, not one per subscriber. The
+  stream ends with `denied` when the head stops listing this node (it can no longer vouch).
+- **`replica`**, only from a node the held head lists as a directory: `policy {policy, fresh}`
+  when the held version is newer than `have`, else `fresh {fresh}`; then the same on every
+  change. It ends with `denied` if the subscriber stops being listed.
 
 **Replicas.** Each directory subscribes to every other directory its head lists, as `replica`,
 reconnecting after a failure with a pause growing from 1 s to 30 s. A `policy` frame is taken when
@@ -270,11 +282,53 @@ token): the new policy is stored on the admin and nowhere else. `wires state pus
 it. With no directory at all, the line says so and nothing fails; a new node gets the policy in its
 invite token.
 
-**Fetch (hosts and callers).** `fetch` asks the directories the held head lists, in order, never
-itself, for `policy {have}`, and stops at the first answer that settles it:
+**Following (hosts).** A running host subscribes as `policy` (`wires/host/follow.rs`) to the
+first directory its held head lists that answers, never itself, trying the one it last followed
+first and then the others in the head's order; the list is re-read from the held policy on every
+reconnect, so a directory the admin adds is followed without a restart. It takes each frame:
+
+- `policy {policy, fresh}`: the head verifies under the root, the `Fresh` vouches for it, and
+  `adopt_if_newer` takes it if newer;
+- `policy_update {update, fresh}`: `SignedPolicy::apply(update, root)` on the held copy (the
+  items' hash and the root's one signature on the new head, each changed entry's own signature),
+  the `Fresh` vouches for the new head, then `adopt_if_newer`;
+- `fresh {fresh}`: kept if it vouches for the held head (one for another version, from a directory
+  behind this host, is skipped).
+
+Any frame it can't take (an update that doesn't apply, a policy that doesn't verify) makes it
+subscribe again at once with `have: 0` and take the whole policy; a second failure in a row moves
+it to the next directory. When the stream ends (the directory stopped, was unlisted, or sent
+nothing for two beats plus 10 s) it reconnects, pausing from 1 s up to the beat (at most 30 s)
+while none answers. The subscription never holds up serving: a host restarted with `policy.json`
+decides from it before any directory answers. A host that is itself a directory keeps the `Fresh`
+its own directory signs (its replica loop keeps its copy in step with the others). A host that the
+policy newly lists as a directory runs the directory mode only after a restart (it traces so).
+
+**Freshness at the host.** The host keeps the newest `Fresh` that vouches for its held head (by
+version, then `until`) in memory and in `fresh.json` (0600), read back at start if it still
+vouches for the head on disk. Before each call's registry check the gate asks whether a **current**
+`Fresh` (`Fresh::is_current(now)`) names the exact head it decides under, and
+`settings.freshness` decides when none does:
+
+- **`lenient`** (default): decide under the held head as usual, until its `not_after`, and trace
+  the lapse (a warning at most every 10 s; none when the head lists no directory). Calls never
+  depend on a directory.
+- **`strict`**: refuse the call with `this host's policy is stale: no directory has vouched for it
+  recently; try again later` (exit 77 at the caller), until a current `Fresh` arrives; then serve
+  again. A ban is then honoured on every host within `fresh_secs` of its publish, at the cost of
+  the directories becoming a dependency for calls. The refusal comes after the badge and ban check
+  and the ID token, so it is an admitted caller's refusal and is written to the call log like any
+  other (one record per refused call: the log shows which calls the host refused while it could
+  not vouch for its policy).
+
+Push and the record stream decide under the held policy whatever its freshness.
+
+**Fetch (callers, and a host's start).** `fetch` asks the directories the held head lists, in
+order, never itself, for `policy {have}`, and stops at the first answer that settles it:
 
 - a `policy` whose `Fresh` verifies against **that** policy's head, and which `adopt_if_newer`
-  takes (verified, fresh, newer), is adopted;
+  takes (verified, fresh, newer), is adopted; so is the held policy with a `policy_update`
+  applied, when its `Fresh` vouches for the result;
 - `current {fresh}` counts only when the `Fresh` verifies against the **held** head and is current
   (`at` at most 60 s ahead, `now <= until`): this node is up to date.
 
@@ -283,10 +337,11 @@ head doesn't list, a lapsed one, or an older policy doesn't. So a lying director
 help.
 
 - **Hosts.** A `serve` whose preflight fails (a host assigned a service while it was offline)
-  fetches from a directory for at most 8 s and preflights again. While it serves it checks at once
-  and then every `settings.beat_secs` (`refresh_loop`): `head {}` first, and `policy` only when a
-  verified head (whose `Fresh` vouches for it) is newer. Card 36c replaces this with a `policy`
-  subscription and its `policy_update` deltas. `wires gateway` runs the same loop.
+  fetches from a directory for at most 8 s and preflights again; while it serves it follows the
+  subscription above.
+- **The gateway** checks at once and then every `settings.beat_secs` (`refresh_loop`): `head {}`
+  first, and `policy` only when a verified head (whose `Fresh` vouches for it) is newer, until card
+  37 moves it to views.
 - **Callers.** A cold command (`call`, `mcp`, `inbox`, `gateway`)
   whose copy was last checked more than 10 minutes ago fetches, for at most 8 s. `wires services`
   never fetches: it reads the local copy only.
@@ -587,6 +642,7 @@ Nothing is broadcast: a record's content leaves a host only when a reader asks f
 | `membership.json` | 0644 | every node | its badge (membership token) |
 | `policy.json` (+ `.lock`) | 0600 | every node | the newest verified signed policy (§3) |
 | `policy-checked.txt` | 0600 | every node | when a directory last vouched for the copy (§4) |
+| `fresh.json` | 0600 | host | the newest `Fresh` for the held head (§4 *Freshness at the host*) |
 | `directory.redb` | 0600 | directory | the directory's heads, items and latest `Fresh` (§4) |
 | `idp-token.jwt`, `idp-refresh-token` | 0600 | caller | from `wires login` |
 | `last-good.json` | 0600 | caller | service → the host that last answered |
@@ -637,12 +693,12 @@ ones that bound this spec:
 
 - Nothing renews memberships (30 days) or the policy head (90 days by default); an expired policy
   admits nobody, is served by no directory, and is dialed from by no caller.
-- Until card 36c, a host learns an edit at its next check of a directory's head (every
-  `settings.beat_secs`, 5 minutes by default); a host that is itself a directory learns it at
-  once. `settings.freshness` (`lenient` / `strict`) is not enforced yet.
-- Until cards 36c and [37](board/backlog/37-caller-views.md) ([fabric.md](fabric.md)): every node
-  holds the whole policy (roles, services, host ids, bans, issuers, directories), fetched whole
-  with the temporary `policy {have}` request, and the invite carries it; a removed host whose badge
+- A host follows one directory at a time (the others are failover it dials only when that one
+  is gone), and a host newly listed as a directory runs the directory mode only after a restart.
+  Under `lenient`, a lapse shows only in the host's trace, not yet in `wires watch`.
+- Until card [37](board/backlog/37-caller-views.md) ([fabric.md](fabric.md)): every node holds
+  the whole policy (roles, services, host ids, bans, issuers, directories), callers fetch it with
+  `policy {have}`, and the invite carries it; a removed host whose badge
   hasn't expired still sees the argv of a caller whose copy predates the ban. Until [card 09](board/backlog/09-witness.md): hidden
   record links (§8) tell a non-reader how many entries a host logged, and when.
 - A host knows a caller's identity only once the caller presented its token to that host.
