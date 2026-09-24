@@ -28,21 +28,20 @@ use crate::policy::store;
 /// `state settings` arguments. None given: print the settings.
 #[derive(Args, Debug, Default)]
 pub(crate) struct SettingsArgs {
-    /// What a host does when no directory has vouched for its policy
-    /// recently: `lenient` keeps deciding (and traces it), `strict` refuses
-    /// every call until a directory vouches again.
+    /// When no directory has vouched for a host's policy lately: keep deciding, or refuse
+    // `lenient` keeps deciding (and traces it), `strict` refuses every call
+    // until a directory vouches again.
     #[arg(long, value_enum)]
     pub(crate) freshness: Option<Freshness>,
     /// How often each directory signs a new freshness timestamp, in
     /// seconds.
     #[arg(long)]
     pub(crate) beat_secs: Option<u32>,
-    /// How long each freshness timestamp is good for, in seconds (at least
-    /// the beat).
+    /// How long each freshness timestamp is good for, in seconds (at least the beat).
     #[arg(long)]
     pub(crate) fresh_secs: Option<u32>,
     /// Lifetime of the new policy, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
+    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 

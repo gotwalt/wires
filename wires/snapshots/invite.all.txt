@@ -1,0 +1,16 @@
+Admit a node: mint its badge and print its join token (edits no policy)
+
+Usage: wires invite [OPTIONS] <NODE_ID>
+
+Arguments:
+  <NODE_ID>  The joiner's node id (what `wires id` printed on its machine)
+
+Options:
+      --name <NAME>            A local label for it, for `wires remove` and `wires service add --host`
+      --ttl <TTL>              Lifetime of the invitee's badge (`30d`, `12h`, … or seconds; at most 30d) [default: 30d]
+      --state-ttl <STATE_TTL>  Lifetime of the signed policy, from now, if this invite has to edit it (lifting a ban, or re-signing an expired policy). Never shortens the current policy's expiry [default: 90d]
+  -h, --help                   Print help
+      --help-all               Also list the operator and credential flags
+
+Example:
+  wires invite <node id> --name alice    # prints the token; send it to them

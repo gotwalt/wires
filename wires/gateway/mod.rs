@@ -68,40 +68,39 @@ pub(crate) const SCOPE: &str = "wires";
 /// `wires gateway` arguments. Secrets resolve flag → environment → file.
 #[derive(Args, Debug)]
 pub struct GatewayArgs {
-    /// The public origin clients reach this gateway at, e.g.
-    /// `https://wires.positivesum.ai` (the OAuth issuer; the MCP endpoint is
-    /// `<origin>/mcp`). Falls back to `$WIRES_GATEWAY_URL`.
+    /// The public origin clients reach (the MCP endpoint is `<origin>/mcp`).
+    // The OAuth issuer, e.g. `https://wires.positivesum.ai`. Falls back to
+    // `$WIRES_GATEWAY_URL`.
     #[arg(long)]
     pub public_url: Option<String>,
     /// Where to listen for HTTP (TLS is the tunnel's or proxy's job).
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub listen: SocketAddr,
-    /// The OAuth client id of a **Web application** client at the IdP, with
-    /// `<public-url>/oauth/callback` as a redirect URI. Falls back to
-    /// `$WIRES_GATEWAY_CLIENT_ID`. Hosts must trust it as an audience.
+    /// The IdP's Web application client id (hosts must trust it as an audience).
+    // Its redirect URI is `<public-url>/oauth/callback`. Falls back to
+    // `$WIRES_GATEWAY_CLIENT_ID`.
     #[arg(long)]
     pub client_id: Option<String>,
-    /// Read the client secret from this file. Falls back to
-    /// `$WIRES_GATEWAY_CLIENT_SECRET`.
+    /// Read the client secret from this file (or `$WIRES_GATEWAY_CLIENT_SECRET`).
     #[arg(long)]
     pub client_secret_file: Option<PathBuf>,
-    /// The IdP (default Google). Falls back to `$WIRES_OIDC_ISSUER`.
+    /// The IdP (default Google, or `$WIRES_OIDC_ISSUER`).
     #[arg(long)]
     pub issuer: Option<String>,
     /// Also accept browser requests from this origin (repeatable). The
     /// public origin, `https://claude.ai` and `https://claude.com` are
     /// always accepted; requests with no `Origin` (server-side clients) are
     /// too.
-    #[arg(long = "allow-origin")]
+    #[arg(long = "allow-origin", hide = true)]
     pub allow_origins: Vec<String>,
     /// Rate-limit by the client address a fronting proxy reports
     /// (`CF-Connecting-IP`, else `X-Forwarded-For`) instead of the TCP peer.
     /// Only behind a proxy that sets them: clients can send them too.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub trust_proxy_header: bool,
     /// Dial hosts through this relay instead of n0's (as `wires call
     /// --relay-url`).
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub relay_url: Option<String>,
 }
 

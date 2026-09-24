@@ -20,28 +20,24 @@ use crate::clock::now_unix;
 /// `init` arguments.
 #[derive(Args)]
 pub(crate) struct InitArgs {
-    /// Lifetime of this node's badge (`30d`, `12h`, … or seconds; at most
-    /// 30 days).
+    /// Lifetime of this node's badge (`30d`, `12h`, … or seconds; at most 30d).
     #[arg(long, default_value = Ttl::DEFAULT)]
     pub(crate) ttl: Ttl,
     /// Lifetime of the first signed policy.
-    #[arg(long, default_value = Ttl::POLICY_DEFAULT)]
+    #[arg(long, default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) state_ttl: Ttl,
-    /// The IdP the network trusts first: its exact `iss` (more with
-    /// `wires issuer set`).
+    /// The IdP the network trusts first: its exact `iss` (more: `wires issuer set`).
     #[arg(long, default_value = GOOGLE_ISSUER)]
     pub(crate) issuer: String,
-    /// The OAuth client id `wires login` signs in under at that IdP. Falls
-    /// back to `$WIRES_OIDC_CLIENT_ID`.
+    /// The OAuth client id `wires login` signs in under (or `$WIRES_OIDC_CLIENT_ID`).
     #[arg(long)]
     pub(crate) client_id: Option<String>,
-    /// An `aud` value hosts accept from that IdP. Repeatable; default: the
-    /// client id.
+    /// An `aud` value hosts accept from that IdP (repeatable; default: the client id).
     #[arg(long = "audience")]
     pub(crate) audience: Vec<String>,
-    /// That client's **public** secret (a Google "Desktop app" client's,
-    /// which its token endpoint requires and which is not confidential).
-    /// Invites carry it to `wires login`; never pass a confidential secret.
+    /// That client's public secret, which invites carry to `wires login`.
+    // A Google "Desktop app" client's, which its token endpoint requires and
+    // which is not confidential. Never pass a confidential secret.
     #[arg(long)]
     pub(crate) public_client_secret: Option<String>,
 }

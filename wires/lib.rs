@@ -51,6 +51,7 @@ mod caller;
 mod clock;
 mod directory;
 mod gateway;
+mod help;
 mod host;
 mod net;
 mod policy;
@@ -71,137 +72,110 @@ mod e2e;
 #[cfg(test)]
 mod testutil;
 
+/// Snapshots of the help text, MCP instructions and key errors (card 38).
+#[cfg(test)]
+mod help_snapshots;
+
 #[cfg(feature = "dev-mock-idp")]
 use std::io::Write as _;
 
 #[cfg(feature = "dev-mock-idp")]
 use clap::Args;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
-/// The top-level help, grouped by role.
-///
-/// Hand-written because clap cannot put subcommands under more than one
-/// heading; `tests::help_lists_every_visible_command` keeps it in step with
-/// [`Command`].
-const HELP_TEMPLATE: &str = "\
-{about-with-newline}
-{usage-heading} {usage}
-
-Admin — admits nodes and signs what runs where (holds the root key):
-  init      Create the root key, this node, and the first signed policy
-  invite    Admit a node: mint its badge, print its one join token
-  remove    Ban a node; hosts refuse its next call
-  service   Register services: add / set / rm (name, allowed roles, hosts)
-  role      Define roles from IdP identity: set / rm
-  issuer    Trust an IdP: set / rm (its client id, accepted audiences)
-  directory Name directories: add / rm; `directory serve` runs one
-  state     The signed policy: push (re-publish), settings (freshness rule)
-
-Host — implements the services assigned to it:
-  serve     Run host.json's services; check every caller; log every call
-  push      Send a caller a message by key (to its inbox); logged
-
-Caller — runs remote CLIs by service name (every role joins the same way):
-  id        Print this node's id: what you send the admin
-  join      Install the admin's invite token: badge, directories, IdP
-  login     Sign in with your IdP (as the invite says); fetch your view
-  services  List (or search) the services you may call: your view
-  call      Run a service by name: stdio passes through, its exit code is ours
-  mcp       Serve those services as MCP tools over stdio (Claude Desktop, IDEs)
-  gateway   Serve them as a remote MCP server (HTTP + OAuth) for web users
-  inbox     Read what hosts pushed to you; --wait blocks until something arrives
-
-Reader — reads the hosts' call records:
-  watch     Stream call records from your services' hosts, verified (--mine)
-
-Options:
-{options}";
-
-/// wires: run a CLI on another machine by service name, reached by key, with
-/// every caller checked against an admin-signed list.
+/// The `wires` command line. Its help text is [`help`]'s: the premise, the
+/// commands a caller runs, and `--help-all` for the rest.
 #[derive(Parser)]
-#[command(name = "wires", version, about, help_template = HELP_TEMPLATE)]
+#[command(
+    name = "wires",
+    version,
+    about = "Run a command-line program on another machine, by service name",
+    help_template = help::HELP_TEMPLATE
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
-/// Every top-level command. The doc comments are each command's own `--help`
-/// summary; the top-level listing is [`HELP_TEMPLATE`].
+/// Every top-level command. Each doc comment is that command's first help
+/// line (verb first, under 80 characters); the top-level listings are
+/// [`help::HELP_TEMPLATE`] and [`help::HELP_ALL_TEMPLATE`].
 #[derive(Subcommand)]
 enum Command {
     // --- admin ---
-    /// Create the root key and this machine's node key, mint this node's
-    /// badge, and sign the first policy (trusting one IdP).
+    /// Create the network: the root key, this node's key and badge, the first policy
+    #[command(after_help = help::INIT_AFTER)]
     Init(admin::init::InitArgs),
-    /// Mint a node's badge and print its join token (stdout). No policy
-    /// edit: nothing is published (unless it lifts the node's ban).
+    /// Admit a node: mint its badge and print its join token (edits no policy)
+    #[command(after_help = help::INVITE_AFTER)]
     Invite(admin::invite::InviteArgs),
-    /// Remove a node (by `--name` label or id): a ban in the signed policy
-    /// until its badge expires. It is published to the directories, and
-    /// every host that fetches it refuses the node's next call.
+    /// Ban a node until its badge expires; hosts refuse its next call
+    #[command(after_help = help::REMOVE_AFTER)]
     Remove(admin::invite::RemoveArgs),
-    /// Edit the service registry in the signed policy, and publish it.
+    /// Register services: add, set, rm (who may call and read, which hosts)
+    #[command(after_help = help::SERVICE_AFTER)]
     Service(admin::service::ServiceArgs),
-    /// Edit the role definitions in the signed policy, and publish them.
+    /// Define roles from IdP identities: set, rm
+    #[command(after_help = help::ROLE_AFTER)]
     Role(admin::service::RoleArgs),
-    /// Edit the trusted IdPs in the signed policy, and publish them.
+    /// Trust an IdP: set, rm
+    #[command(after_help = help::ISSUER_AFTER)]
     Issuer(admin::service::IssuerArgs),
-    /// The directories: `add` / `rm` (admin) edit the policy's list;
-    /// `serve` runs this node's directory alone.
+    /// Name the network's directories (add, rm), or run this node's (serve)
+    #[command(after_help = help::DIRECTORY_AFTER)]
     Directory(directory::DirectoryArgs),
-    /// The signed policy itself: `push` re-publishes it to every directory
-    /// (after an edit that reached none); `settings` prints or changes the
-    /// freshness rule and the directories' beat.
+    /// Re-publish the signed policy (push), or print or change its settings
+    #[command(after_help = help::STATE_AFTER)]
     State(admin::propagate::StateArgs),
 
     // --- host ---
-    /// Implement the services host.json names (and the signed policy assigns
-    /// here): check every caller, exec the service, bridge its stdio, log
-    /// every call. Runs the directory too when the policy lists this node.
+    /// Run host.json's services: check every caller, run the call, log it
+    #[command(after_help = help::SERVE_AFTER)]
     Serve(host::serve::ServeArgs),
-    /// Send a caller a message, addressed by its key (a service's
-    /// `$WIRES_CALLER_NODE`) or a role: through this machine's running
-    /// `wires serve`, to the caller's inbox; logged.
+    /// Send a caller a message by node id or role, to its inbox (logged)
+    #[command(after_help = help::PUSH_AFTER)]
     Push(host::push::PushArgs),
 
     // --- caller (and every joiner) ---
-    /// Print this node's id (creating its key on first use): what a joiner
-    /// sends the admin.
+    /// Print this node's id (making its key on first use), for your admin
+    #[command(after_help = help::ID_AFTER)]
     Id,
-    /// Install an invite token from `wires invite`: this node's badge, the
-    /// directory ids and the IdP to sign in with (a host's token also
-    /// carries the signed policy). Without a token, print this node's id.
+    /// Install the invite token your admin sent (without one, print this node's id)
+    #[command(after_help = help::JOIN_AFTER)]
     Join(caller::join::JoinArgs),
-    /// Sign in with your IdP (OIDC), binding this node's key to your identity;
-    /// the token is stored locally and presented when you call.
+    /// Sign in with your IdP, binding your identity to this node's key
+    #[command(after_help = help::LOGIN_AFTER)]
     Login(caller::login::LoginArgs),
-    /// List the services you may call (your view: the root-signed entries a
-    /// directory cut for your identity), with what each does and the roles
-    /// it allows; a query searches names and descriptions.
+    /// List the services you may call, one per line (a query searches them)
+    #[command(after_help = help::SERVICES_AFTER)]
     Services(caller::services::ServicesArgs),
-    /// Run a service by name: stdio passes through,
-    /// its exit code becomes ours, a refusal exits 77.
+    /// Run a service by name: its stdin, stdout, stderr and exit code are yours
+    #[command(
+        after_help = help::CALL_AFTER,
+        override_usage = "wires call [OPTIONS] <SERVICE> [-- <ARGS>...]"
+    )]
     Call(caller::call::CallArgs),
-    /// Edit the local aliases in `tools.json` (`add` / `list` / `rm`): a
-    /// name pinned to one host by node id.
-    #[command(hide = true, subcommand_required = true)]
+    /// Edit the local aliases in `tools.json`: add, list, rm
+    #[command(
+        hide = true,
+        subcommand_required = true,
+        after_help = "Example:\n  wires tools list"
+    )]
     Tools(caller::tools::ToolsArgs),
-    /// Serve the services you may call (plus aliases) as MCP tools over stdio
-    /// (Claude Desktop, IDEs, any stdio MCP client).
+    /// Serve the services you may call as MCP tools over stdio
+    #[command(after_help = help::MCP_AFTER)]
     Mcp(caller::mcp::McpArgs),
-    /// Print what hosts pushed to you (verified sender first), and mark it
-    /// read; `--wait` blocks until something arrives (exit 124 on
-    /// `--timeout`).
+    /// Print the messages hosts pushed to you, and mark them read
+    #[command(after_help = help::INBOX_AFTER)]
     Inbox(caller::inbox::InboxArgs),
 
-    /// Serve the services each signed-in user may call as a remote MCP
-    /// server (Streamable HTTP + OAuth 2.1), for web clients like Claude.ai.
+    /// Serve each signed-in user's services as a remote MCP server (HTTP + OAuth)
+    #[command(after_help = help::GATEWAY_AFTER)]
     Gateway(gateway::GatewayArgs),
 
     // --- reader ---
-    /// Stream call records from the hosts of your services: every record of
-    /// a service you are a reader of, otherwise your own.
+    /// Stream the call records you may read, verified, from the services' hosts
+    #[command(after_help = help::WATCH_AFTER)]
     Watch(caller::watch_records::WatchArgs),
 
     /// Dev build only: run the hermetic mock OIDC issuer on a loopback port
@@ -284,7 +258,15 @@ fn init_logging_with(default: &str) {
 
 /// The `wires` command line: parse the arguments, run the command, exit.
 pub fn run() {
-    match Cli::parse().command {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let cmd = help::with_help_all(Cli::command());
+    if let Some(text) = help::help_all(cmd.clone(), &args) {
+        print!("{text}");
+        std::process::exit(0);
+    }
+    let matches = cmd.get_matches_from(args);
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    match cli.command {
         Command::Init(a) => {
             init_quiet_logging();
             print_or_exit(admin::init::init_cmd(a))
@@ -350,10 +332,12 @@ pub fn run() {
         }
         Command::Call(a) => {
             init_quiet_logging();
+            set_verbose(a.verbose);
             exit_with_code(runtime().block_on(caller::call::call_cmd(a)))
         }
         Command::Services(a) => {
             init_quiet_logging();
+            set_verbose(a.verbose);
             print_or_exit(runtime().block_on(caller::services::run(&a)))
         }
         Command::Tools(a) => print_or_exit(caller::tools::run_tools_cmd(a)),
@@ -433,52 +417,29 @@ fn print_report(result: anyhow::Result<admin::Report>) {
 /// admission" still lands here.
 fn exit_with(e: anyhow::Error) -> ! {
     if let Some(d) = e.downcast_ref::<host::transport::Denied>() {
-        eprintln!("wires: denied by host: {}", d.reason());
+        eprintln!("wires: {}", help::refusal(d.reason()));
         std::process::exit(EXIT_DENIED);
     }
-    eprintln!("wires: {e:#}");
+    if VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("wires: {e:#}");
+    } else {
+        eprintln!("wires: {}", help::brief(&e));
+    }
     std::process::exit(1);
+}
+
+/// Set by a command's `--verbose`: [`exit_with`] prints an error's every
+/// cause, not just [`help::brief`].
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record a command's `--verbose` for [`exit_with`].
+fn set_verbose(on: bool) {
+    VERBOSE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
-
     use super::*;
-
-    /// Every command a user can see is listed, under a role, in the
-    /// hand-written top-level help — and nothing else is.
-    #[test]
-    fn help_lists_every_visible_command() {
-        let cli = Cli::command();
-        let mut visible: Vec<&str> = cli
-            .get_subcommands()
-            .filter(|c| !c.is_hide_set())
-            .map(|c| c.get_name())
-            .collect();
-        let mut listed: Vec<&str> = HELP_TEMPLATE
-            .lines()
-            .filter_map(|l| l.strip_prefix("  "))
-            .filter_map(|l| l.split_whitespace().next())
-            .collect();
-        visible.sort_unstable();
-        listed.sort_unstable();
-        assert_eq!(
-            visible, listed,
-            "HELP_TEMPLATE is out of step with `Command`"
-        );
-    }
-
-    /// The top-level help names the roles and fits on one screen.
-    #[test]
-    fn help_shows_the_roles_on_one_screen() {
-        let help = Cli::command().render_help().to_string();
-        for role in ["Admin", "Host", "Caller", "Reader"] {
-            assert!(help.contains(&format!("{role} — ")), "{help}");
-        }
-        let lines = help.lines().count();
-        assert!(lines <= 34, "{lines} lines:\n{help}");
-    }
 
     /// Card 14's onboarding commands parse as documented.
     #[test]

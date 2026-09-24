@@ -1,0 +1,15 @@
+Send a caller a message by node id or role, to its inbox (logged)
+
+Usage: wires push [OPTIONS] --to <TO> --subject <SUBJECT> [BODY]...
+
+Arguments:
+  [BODY]...  The body; read from stdin when none is given (and stdin isn't a terminal)
+
+Options:
+      --to <TO>            A node id (a service's `$WIRES_CALLER_NODE`), or a role in the policy
+      --subject <SUBJECT>  One line, recorded in the host's call log (the body only if host.json says)
+      --ttl <TTL>          How long to keep it for a recipient not listening (`90m`, `2d`; max 7d)
+  -h, --help               Print help
+
+Example:
+  wires push --to "$WIRES_CALLER_NODE" --subject "build 42 done" "all green"

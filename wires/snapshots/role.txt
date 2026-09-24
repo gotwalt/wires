@@ -1,0 +1,14 @@
+Define roles from IdP identities: set, rm
+
+Usage: wires role <COMMAND>
+
+Commands:
+  set   Define (or replace) a role as an OR of matchers, and publish
+  rm    Drop a role no service names any more, and publish
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+Example:
+  wires role set analyst --issuer https://accounts.google.com '*@example.com'

@@ -1,0 +1,16 @@
+Print the messages hosts pushed to you, and mark them read
+
+Usage: wires inbox [OPTIONS]
+
+Options:
+      --wait               Block until a message arrives, print it, and exit
+      --timeout <TIMEOUT>  With --wait: give up after this long (`90s`, `10m`) and exit 124
+      --json               One JSON object per message instead of a line
+  -h, --help               Print help
+      --help-all           Also list the operator and credential flags
+
+Examples:
+  wires inbox
+  wires inbox --wait --timeout 10m
+
+Exit: 0 with messages printed (or none, without --wait); 124: --timeout ran out.

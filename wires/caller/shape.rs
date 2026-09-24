@@ -42,17 +42,15 @@ const SNIPPET_BYTES: usize = 160;
 /// `wires call`'s shaping flags, all optional and all local.
 #[derive(Args, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShapeArgs {
-    /// Filter the remote stdout with this jq program, in-process (no local
-    /// `jq` or shell). Strings print raw, other values as compact JSON, one
-    /// per line — as with `gh --jq`. A filter that doesn't compile exits 2
-    /// before the call is made.
+    /// Filter stdout as JSON with this jq program, in-process (as `gh --jq`).
+    // Strings print raw, other values as compact JSON, one per line. A
+    // filter that doesn't compile exits 2 before the call is made.
     #[arg(long, value_name = "FILTER")]
     pub jq: Option<String>,
-    /// Keep only the first N lines of the (filtered) stdout.
+    /// Keep only the first N lines of stdout (after --jq).
     #[arg(long, value_name = "N")]
     pub head: Option<usize>,
-    /// Keep at most N bytes of the (filtered) stdout, cut on a character
-    /// boundary; a note on stderr says how much was dropped.
+    /// Keep at most N bytes of stdout; stderr says how much was dropped.
     #[arg(long, value_name = "N")]
     pub max_bytes: Option<usize>,
 }

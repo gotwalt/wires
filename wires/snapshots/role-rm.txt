@@ -1,0 +1,13 @@
+Drop a role no service names any more, and publish
+
+Usage: wires role rm [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  The role to drop
+
+Options:
+  -h, --help      Print help
+      --help-all  Also list the operator and credential flags
+
+Example:
+  wires role rm analyst

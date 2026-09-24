@@ -1,0 +1,18 @@
+Add an alias: a service pinned to one host by its node id
+
+Usage: wires tools add [OPTIONS] --node <NODE> --description <DESCRIPTION> <NAME>
+
+Arguments:
+  <NAME>  The alias (`wires call <name>`, and the MCP tool name)
+
+Options:
+      --node <NODE>                The host's hex node id
+      --tools-file <TOOLS_FILE>    Use this file instead of `$WIRES_HOME/tools.json`
+      --relay-url <RELAY_URL>      Relay to reach the host through
+      --addr <ADDR>                Direct socket address of the host. Repeatable
+      --description <DESCRIPTION>  One line saying what it does (shown to agents)
+      --remote-tool <REMOTE_TOOL>  The service to ask the host for, when different from `name`
+  -h, --help                       Print help
+
+Example:
+  wires tools add db-pinned --node <host node id> --description "Orders, on one host" --remote-tool orders-db

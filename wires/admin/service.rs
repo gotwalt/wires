@@ -46,11 +46,16 @@ pub(crate) struct ServiceArgs {
 /// The `service` subcommands.
 #[derive(Subcommand)]
 pub(crate) enum ServiceCmd {
-    /// Register a new service and publish the new policy.
+    /// Register a new service and publish the new policy
+    #[command(
+        after_help = "Example:\n  wires service add orders-db --description \"Read-only SQL over the orders database\" \\\n    --allow analyst --reader security --host workbench --host spare"
+    )]
     Add(ServiceEditArgs),
-    /// Change an existing service (each flag given replaces that list).
+    /// Change an existing service (each flag given replaces that list)
+    #[command(after_help = "Example:\n  wires service set orders-db --allow analyst --allow sre")]
     Set(ServiceEditArgs),
-    /// Drop a service and publish the new policy.
+    /// Drop a service and publish the new policy
+    #[command(after_help = "Example:\n  wires service rm orders-db")]
     Rm(ServiceRmArgs),
 }
 
@@ -75,7 +80,7 @@ pub(crate) struct ServiceEditArgs {
     pub(crate) reader: Vec<String>,
     /// Lifetime of the new policy, from now (`90d`, `12h`, … or seconds);
     /// never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
+    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 
@@ -85,7 +90,7 @@ pub(crate) struct ServiceRmArgs {
     /// The service to drop.
     pub(crate) name: String,
     /// Lifetime of the new policy, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
+    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 
@@ -99,9 +104,13 @@ pub(crate) struct RoleArgs {
 /// The `role` subcommands.
 #[derive(Subcommand)]
 pub(crate) enum RoleCmd {
-    /// Define (or replace) a role as an OR of matchers, and publish.
+    /// Define (or replace) a role as an OR of matchers, and publish
+    #[command(
+        after_help = "Examples:\n  wires role set analyst --issuer https://accounts.google.com '*@example.com'\n  wires role set sre 'issuer=https://idp.example.com,group=sre'"
+    )]
     Set(RoleSetArgs),
-    /// Drop a role no service names any more, and publish.
+    /// Drop a role no service names any more, and publish
+    #[command(after_help = "Example:\n  wires role rm analyst")]
     Rm(RoleRmArgs),
 }
 
@@ -110,16 +119,16 @@ pub(crate) enum RoleCmd {
 pub(crate) struct RoleSetArgs {
     /// The role's name.
     pub(crate) name: String,
-    /// One matcher each: `*@example.com`, `alice@example.com`, or
-    /// comma-separated keys `issuer=…,email=…,org=…,group=…` (all must hold).
-    /// A matcher without `issuer=` takes `--issuer`.
+    /// `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…`
+    // Comma-separated keys must all hold. A matcher without `issuer=` takes
+    // `--issuer`.
     #[arg(required = true)]
     pub(crate) matchers: Vec<String>,
     /// The IdP a matcher trusts when it names none: its exact `iss`.
     #[arg(long, default_value = GOOGLE_ISSUER)]
     pub(crate) issuer: String,
     /// Lifetime of the new policy, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
+    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 
@@ -129,7 +138,7 @@ pub(crate) struct RoleRmArgs {
     /// The role to drop.
     pub(crate) name: String,
     /// Lifetime of the new policy, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
+    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 
@@ -144,9 +153,13 @@ pub(crate) struct IssuerArgs {
 /// items; a host's `host.json` can narrow them, never widen them).
 #[derive(Subcommand)]
 pub(crate) enum IssuerCmd {
-    /// Trust an IdP (or change one), and publish.
+    /// Trust an IdP (or change one), and publish
+    #[command(
+        after_help = "Example:\n  wires issuer set https://idp.example.com --client-id <client id>"
+    )]
     Set(IssuerSetArgs),
-    /// Stop trusting an IdP no role names any more, and publish.
+    /// Stop trusting an IdP no role names any more, and publish
+    #[command(after_help = "Example:\n  wires issuer rm https://idp.example.com")]
     Rm(IssuerRmArgs),
 }
 
@@ -158,21 +171,19 @@ pub(crate) struct IssuerSetArgs {
     /// The OAuth client id `wires login` signs in under.
     #[arg(long)]
     pub(crate) client_id: String,
-    /// An `aud` value hosts accept from this IdP. Repeatable; default: the
-    /// client id.
+    /// An `aud` value hosts accept from this IdP (repeatable; default: the client id).
     #[arg(long = "audience")]
     pub(crate) audience: Vec<String>,
-    /// The client's **public** secret (a Google "Desktop app" client's),
-    /// which invites carry to `wires login`; kept in this keystore, not in
-    /// the signed policy. Never pass a confidential secret.
+    /// The client's public secret, which invites carry to `wires login`.
+    // A Google "Desktop app" client's; kept in this keystore, not in the
+    // signed policy. Never pass a confidential secret.
     #[arg(long)]
     pub(crate) public_client_secret: Option<String>,
-    /// Make this the IdP invites tell `wires login` to use (by default, the
-    /// one `wires init` trusted).
+    /// Make this the IdP invites tell `wires login` to use (default: init's).
     #[arg(long)]
     pub(crate) login: bool,
     /// Lifetime of the new policy, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
+    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 
@@ -182,7 +193,7 @@ pub(crate) struct IssuerRmArgs {
     /// The IdP's exact `iss`.
     pub(crate) issuer: String,
     /// Lifetime of the new policy, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
+    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 

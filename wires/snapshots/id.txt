@@ -1,0 +1,9 @@
+Print this node's id (making its key on first use), for your admin
+
+Usage: wires id
+
+Options:
+  -h, --help  Print help
+
+Example:
+  wires id                    # send this to your admin: `wires invite <id>`

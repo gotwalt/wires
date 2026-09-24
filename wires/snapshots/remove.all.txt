@@ -1,0 +1,14 @@
+Ban a node until its badge expires; hosts refuse its next call
+
+Usage: wires remove [OPTIONS] <MEMBER>
+
+Arguments:
+  <MEMBER>  The node to remove: its `wires invite --name` label, or its node id
+
+Options:
+      --state-ttl <STATE_TTL>  Lifetime of the new signed policy, from now (`90d`, `12h`, … or seconds). Never shortens the current policy's expiry [default: 90d]
+  -h, --help                   Print help
+      --help-all               Also list the operator and credential flags
+
+Example:
+  wires remove alice

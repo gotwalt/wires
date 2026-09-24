@@ -1,0 +1,21 @@
+Stream the call records you may read, verified, from the services' hosts
+
+Usage: wires watch [OPTIONS] [SERVICE]...
+
+Arguments:
+  [SERVICE]...  The services to watch (default: every service you may call or read)
+
+Options:
+      --mine                   Only your own calls, even where you may read everyone's
+      --json                   One JSON object per record: `{service, host, seq, entry}`
+      --once                   Print what is there (after your last mark) and exit; don't follow
+      --relay-url <RELAY_URL>  Dial through this relay instead of the n0 default
+  -h, --help                   Print help
+      --help-all               Also list the operator and credential flags
+
+Examples:
+  wires watch orders-db
+  wires watch --mine --once
+
+Readers the policy names see a service's calls in full; everyone else sees
+their own. Exit 77: every host refused the stream.

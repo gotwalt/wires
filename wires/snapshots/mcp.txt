@@ -1,0 +1,10 @@
+Serve the services you may call as MCP tools over stdio
+
+Usage: wires mcp [OPTIONS]
+
+Options:
+  -h, --help      Print help
+      --help-all  Also list the operator and credential flags
+
+Example, as an MCP client's server entry:
+  {"command": "wires", "args": ["mcp"]}

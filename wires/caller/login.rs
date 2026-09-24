@@ -85,37 +85,37 @@ const DRAIN_WAIT: Duration = Duration::from_secs(2);
 pub(crate) struct LoginArgs {
     /// Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`,
     /// then `--node-seed-file`, then the keystore (`node.seed`).
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub node_seed: Option<String>,
     /// Read the node key seed (hex) from this file.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub node_seed_file: Option<std::path::PathBuf>,
     /// OIDC issuer. Falls back to `$WIRES_OIDC_ISSUER`, then the invite's,
     /// then Google.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub issuer: Option<String>,
     /// OAuth client id. Falls back to `$WIRES_OIDC_CLIENT_ID`, then the
     /// invite's.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub client_id: Option<String>,
     /// OAuth client secret (non-confidential for Desktop-app clients). Falls
     /// back to `$WIRES_OIDC_CLIENT_SECRET`, then the invite's.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub client_secret: Option<String>,
-    /// Use the stored refresh token instead of the browser when possible;
-    /// falls back to the browser flow if the refreshed token is not bound to
-    /// this node (Google omits `nonce` on refresh).
+    /// Renew with the stored refresh token; the browser only if that fails.
+    // Falls back to the browser flow if the refreshed token is not bound to
+    // this node (Google omits `nonce` on refresh).
     #[arg(long, conflicts_with = "reuse")]
     pub refresh: bool,
-    /// Re-verify the stored ID token without signing in.
+    /// Re-check the stored ID token; don't sign in.
     #[arg(long)]
     pub reuse: bool,
-    /// Print the sign-in URL but do not try to open a browser.
+    /// Print the sign-in URL; don't open a browser.
     #[arg(long)]
     pub no_browser: bool,
-    /// Fixed loopback port for the redirect (default: any free port) — for
-    /// `ssh -L <port>:127.0.0.1:<port>` when the browser is on another machine.
-    #[arg(long, default_value_t = 0)]
+    /// Fixed loopback port for the redirect (for `ssh -L` to a remote browser).
+    // Default: any free port.
+    #[arg(long, default_value_t = 0, hide_default_value = true)]
     pub callback_port: u16,
 }
 

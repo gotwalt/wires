@@ -34,12 +34,16 @@ pub(crate) struct StateArgs {
 /// The `state` subcommands.
 #[derive(Subcommand)]
 pub(crate) enum StateCmd {
-    /// Re-publish the stored signed policy to every directory (after an
-    /// edit that reached none, or a directory that was down).
+    /// Re-publish the stored signed policy to every directory
+    // After an edit that reached none, or a directory that was down.
+    #[command(after_help = "Example:\n  wires state push")]
     Push,
-    /// Print the network's settings, or change them and publish: the
-    /// freshness rule (`--freshness lenient|strict`) and how often
-    /// directories vouch for the policy.
+    /// Print the network's settings, or change them and publish
+    // The freshness rule (`--freshness lenient|strict`) and how often
+    // directories vouch for the policy.
+    #[command(
+        after_help = "Examples:\n  wires state settings\n  wires state settings --freshness strict --beat-secs 60"
+    )]
     Settings(super::settings::SettingsArgs),
 }
 

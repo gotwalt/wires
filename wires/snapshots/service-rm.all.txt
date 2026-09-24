@@ -1,0 +1,14 @@
+Drop a service and publish the new policy
+
+Usage: wires service rm [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  The service to drop
+
+Options:
+      --state-ttl <TTL>  Lifetime of the new policy, from now; never shortens the current one [default: 90d]
+  -h, --help             Print help
+      --help-all         Also list the operator and credential flags
+
+Example:
+  wires service rm orders-db

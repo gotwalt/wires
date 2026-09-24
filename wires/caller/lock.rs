@@ -112,20 +112,20 @@ impl std::fmt::Display for Refused {
             Self::Flag(flag) => write!(
                 f,
                 "{flag} is not allowed in locked mode (set by the operator: {LOCKED_ENV}=1 or \
-                 \"locked\" in tools.json); only --jq, --head, --max-bytes, --verbose, the \
-                 service name and its arguments are"
+                 \"locked\" in tools.json); drop it: only --jq, --head, --max-bytes, --verbose, \
+                 the service name and its arguments are allowed"
             ),
             Self::Env(var) => write!(
                 f,
                 "${var} is not allowed in locked mode (set by the operator: {LOCKED_ENV}=1 or \
-                 \"locked\" in tools.json): it overrides this node's credentials; the keystore's \
-                 are used"
+                 \"locked\" in tools.json): it overrides this node's credentials; ask your \
+                 operator to unset it"
             ),
             Self::Stdin => write!(
                 f,
-                "stdin is not forwarded in locked mode (it can carry local files to the host); \
-                 pass the input as arguments instead (the operator can set \
-                 {LOCKED_STDIN_ENV}=allow)"
+                "stdin is not forwarded in locked mode (it can carry local files to the host; \
+                 the operator can set {LOCKED_STDIN_ENV}=allow); pass the input as arguments \
+                 instead"
             ),
         }
     }

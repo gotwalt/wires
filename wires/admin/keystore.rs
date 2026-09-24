@@ -131,8 +131,8 @@ pub fn node_identity(inline: Option<&str>, file: Option<&Path>) -> Result<NodeId
     let ks = Keystore::resolve()?;
     ks.read_node_identity()?.ok_or_else(|| {
         anyhow!(
-            "no node key: pass --node-seed, set $WIRES_NODE_SEED, use --node-seed-file, or run \
-             `wires id` (looked for {})",
+            "no node key at {}: run `wires id`, send the id to your admin, then `wires join \
+             <token>` with the token they send",
             ks.path("node.seed").display()
         )
     })
@@ -151,7 +151,8 @@ pub fn node_identity_in(ks: &Keystore) -> Result<NodeIdentity> {
     }
     ks.read_node_identity()?.ok_or_else(|| {
         anyhow!(
-            "no node key: set $WIRES_NODE_SEED or run `wires id` (looked for {})",
+            "no node key at {}: run `wires id`, send the id to your admin, then `wires join \
+             <token>` with the token they send",
             ks.path("node.seed").display()
         )
     })
@@ -181,8 +182,8 @@ pub fn membership(inline: Option<&str>, file: Option<&Path>) -> Result<Membershi
         return Ok(m);
     }
     bail!(
-        "no membership: pass --membership <token>, set $WIRES_MEMBERSHIP, use \
-         --membership-file, or `wires join <token>` (looked for {})",
+        "this node has not joined a network (no {}): run `wires join <token>` with the token \
+         your admin sent",
         ks.path("membership.json").display()
     );
 }
