@@ -80,7 +80,7 @@ impl World {
         self.state_v(1, |_| {})
     }
 
-    /// The state at `version`, changed by `edit` before it is signed. It
+    /// The policy at `version`, changed by `edit` before it is signed. It
     /// bans [`banned`].
     fn state_v(&self, version: u64, edit: impl FnOnce(&mut Policy)) -> SignedPolicy {
         signed_state(&self.root, version, |s| {
@@ -229,7 +229,7 @@ impl Host {
 }
 
 /// `who` calls `name args` on the host ([`super::call`]); whether it ran.
-/// A node every [`World`] state bans (its badge is genuine).
+/// A node every [`World`] policy bans (its badge is genuine).
 fn banned() -> NodeIdentity {
     NodeIdentity::from_seed([66u8; 32])
 }

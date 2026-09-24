@@ -515,9 +515,9 @@ mod tests {
         .unwrap();
         let e = format!("{:#}", host.policy().unwrap_err());
         assert!(e.contains("version 1") && e.contains("version 2"), "{e}");
-        // The push rule reads the same state, and refuses too.
+        // The push rule reads the same policy, and refuses too.
         assert!(host.decide_push(host.me, now).is_err());
-        // A state at least as new as the mark is decided under again.
+        // A policy at least as new as the mark is decided under again.
         crate::policy::store::adopt_if_newer(&ks, &signed(3), root, now).unwrap();
         assert_eq!(host.policy().unwrap().version().0, 3);
     }

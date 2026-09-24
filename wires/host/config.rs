@@ -310,7 +310,7 @@ impl HostConfig {
     /// the gate, which refuses it): every service here must be assigned
     /// to `me` ("refuses to serve a name the registry doesn't assign to
     /// it"), and every role in `also_require` and `push.allow` must be
-    /// defined in `state`. The error names the first offender.
+    /// defined in `state` (the policy). The error names the first offender.
     pub(crate) fn check_against(&self, state: &Policy, me: NodeId) -> Result<()> {
         let version = state.version.0;
         let me8 = me.short();

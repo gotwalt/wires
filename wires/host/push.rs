@@ -19,7 +19,7 @@
 //!
 //! The host's **signed policy** decides, asked **at send, at delivery and at
 //! fetch** ([`ServicesHost::decide_push`]): the recipient must not be banned
-//! by the current state, and must be in a registry role that `host.json`'s
+//! by the current policy, and must be in a registry role that `host.json`'s
 //! `push.allow` names (default: nobody). A removed (banned) node gets
 //! nothing: its queue is dropped (logged `denied`), and its fetch is
 //! refused. A fetch also presents the fetcher's badge, checked first.
@@ -643,7 +643,7 @@ impl PushHost {
     /// Before the caller is known to be admitted, at most
     /// [`MAX_PREAUTH_FETCHES`] fetches are read at once and each opening
     /// frame is at most [`MAX_INBOX_HELLO`]. Membership is checked before
-    /// the ID token is verified (its badge, and the state's bans); a peer
+    /// the ID token is verified (its badge, and the policy's bans); a peer
     /// that is not admitted hears only
     /// [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED) and is traced, not
     /// logged (its queue, if it had one before it was banned, is dropped and
@@ -725,7 +725,7 @@ impl PushHost {
         match self.authorize(caller, now) {
             Ok(_) => {}
             Err(PushRefusal::NotAdmitted(reason)) => {
-                // Removed between the two reads of the state.
+                // Removed between the two reads of the policy.
                 FETCH_STRANGERS.refused("inbox fetch", caller, &reason);
                 self.drop_queue(caller, &reason).await;
                 deny(&mut send, crate::host::gate::NOT_ADMITTED).await;
@@ -1049,7 +1049,7 @@ mod tests {
         }
     }
 
-    /// A push host (4) of the network rooted at 1, whose state bans 50–54,
+    /// A push host (4) of the network rooted at 1, whose policy bans 50–54,
     /// logging to an in-memory sink. (No service or role is needed: these
     /// tests stop at admission, and `serve` isn't preflighted.)
     fn push_host() -> (Arc<PushHost>, mpsc::Receiver<AuditRecord>) {

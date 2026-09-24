@@ -1,14 +1,14 @@
 //! The record stream (card 26b): a host serves its own signed call log
 //! ([`call_log`]) to authorized readers, by key, on
 //! [`ALPN`]. Nothing is broadcast: a record's content leaves the host only
-//! when a reader asks for it and may see it (any other member asking gets
-//! its hash link).
+//! when a reader asks for it and may see it (any other admitted reader asking
+//! gets its hash link).
 //!
 //! # Protocol
 //!
 //! One bi-stream of length-prefixed JSON [`RecordFrame`]s:
 //!
-//! 1. reader → [`RecordFrame::Open`]: its [`Hello`] (membership, state
+//! 1. reader → [`RecordFrame::Open`]: its [`Hello`] (badge, policy
 //!    version, ID token: the same credentials a call presents), the services
 //!    it wants, `since` (its resume point for this view on this host),
 //!    `mine`, `follow`;
@@ -25,7 +25,7 @@
 //!    grows, until the reader hangs up.
 //!
 //! A following stream is **re-authorized** whenever the host's signed policy
-//! changes and when the reader's ID token, the state or the membership
+//! changes and when the reader's ID token, the policy or its badge
 //! expires: the same checks as at open. Access gone → [`RecordFrame::Denied`]
 //! and the stream ends; access changed (e.g. dropped from `readers`) → a new
 //! [`RecordFrame::Granted`], and the entries after it are decided by the new
@@ -99,7 +99,7 @@ pub(crate) const MAX_OPEN_FRAME: usize = 64 * 1024;
 /// unanswered. A decided stream no longer counts.
 pub(crate) const MAX_PREAUTH_READERS: usize = 16;
 
-/// Refusals of readers not known to be members (see [`transport::Throttle`]).
+/// Refusals of readers not known to be admitted (see [`transport::Throttle`]).
 static STRANGERS: transport::Throttle = transport::Throttle::new();
 
 /// How long the host waits for the reader's [`RecordFrame::Open`].
@@ -108,7 +108,7 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Most items per [`RecordFrame::Batch`].
 const BATCH: usize = 256;
 
-/// How often a following stream looks for new entries (and a new state).
+/// How often a following stream looks for new entries (and a new policy).
 const POLL: Duration = Duration::from_millis(200);
 
 /// What a reader may see of one service's records on a host.
@@ -301,14 +301,14 @@ pub(crate) struct View {
     /// deciding again.
     pub(crate) version: StateVersion,
     /// Unix seconds from which it must be decided again: the earliest expiry
-    /// of the reader's ID token, the state and the membership (see
+    /// of the reader's ID token, the policy and its badge (see
     /// [`deadline`]).
     pub(crate) until: i64,
 }
 
 /// When a view decided at the given expiries must be decided again: the
-/// first second at which the state (`state_not_after`, inclusive), the
-/// membership (`membership_not_after`, inclusive) or the reader's verified
+/// first second at which the signed policy (`state_not_after`, inclusive),
+/// the badge (`membership_not_after`, inclusive) or the reader's verified
 /// ID token (its `exp` plus the host's [`CLOCK_SKEW_SECS`]) no longer holds.
 pub(crate) fn deadline(
     state_not_after: i64,
@@ -370,7 +370,7 @@ impl View {
         }
     }
 
-    /// Whether this view must be decided again: the host's state is now
+    /// Whether this view must be decided again: the host's policy is now
     /// `version` (`None`: unreadable), and it is `now`.
     pub(crate) fn due(&self, version: Option<StateVersion>, now: i64) -> bool {
         version != Some(self.version) || now >= self.until
@@ -990,8 +990,8 @@ mod tests {
         ));
     }
 
-    /// A view is decided again on a new state, an unreadable one, and at the
-    /// earliest of the token's, the state's and the membership's expiry.
+    /// A view is decided again on a new policy, an unreadable one, and at the
+    /// earliest of the token's, the policy's and the badge's expiry.
     #[test]
     fn a_view_is_due_on_a_new_state_and_at_its_deadline() {
         let token = alice(); // exp 1_000

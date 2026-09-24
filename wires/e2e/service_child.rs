@@ -11,7 +11,7 @@
 //!   caller and is logged under the call; another node, a role and the
 //!   operator's request form are refused; the operator's own socket still
 //!   pushes to a role.
-//! - [`a_rolled_back_state_is_refused`]: a state older than one the host
+//! - [`a_rolled_back_state_is_refused`]: a policy older than one the host
 //!   already decided under, copied back onto disk, decides nothing.
 
 use std::collections::BTreeMap;
