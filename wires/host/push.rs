@@ -52,7 +52,7 @@
 //! `queued`, `delivered`, `fetched`, `expired`, `dropped`, `denied` — with
 //! the subject, and the body only under `"push": {"log_body": true}`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -63,17 +63,17 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use iroh::Endpoint;
 use library::{
-    AuditRecord, CallId, INBOX_ALPN, InboxFrame, MAX_BATCH, NodeId, Principal, PushBody, PushId,
-    PushMessage, PushOutcome, Subject,
+    AuditRecord, CallId, INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_HELLO, NodeId, Principal,
+    PushBody, PushId, PushMessage, PushOutcome, Subject,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use super::gate::ServicesHost;
 use super::transport::{self, AuditSink};
 use crate::admin::ttl::Ttl;
-use crate::caller::inbox::{deny, read_frame, write_frame};
+use crate::caller::inbox::{deny, read_frame, read_frame_within, write_frame};
 
 /// How long a push waits for its recipient when `--ttl` isn't given.
 pub(crate) const DEFAULT_TTL: Duration = Duration::from_secs(24 * 3600);
@@ -97,6 +97,13 @@ const SWEEP: Duration = Duration::from_secs(1);
 
 /// How long to wait for a peer's next frame.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many inbox fetches a host reads at once before deciding who they
+/// are; one more is answered "busy" and closed.
+pub(crate) const MAX_PREAUTH_FETCHES: usize = 64;
+
+/// How many long polls one member may hold open on a host at once.
+pub(crate) const MAX_FETCHES_PER_NODE: usize = 2;
 
 /// The queue file under `$WIRES_HOME`.
 pub(crate) const QUEUE_FILE: &str = "push-queue.json";
@@ -314,6 +321,10 @@ pub(crate) struct PushHost {
     arrived: Notify,
     /// The host node's endpoint, set once it is bound.
     endpoint: OnceLock<Endpoint>,
+    /// Permits for fetches not yet decided ([`MAX_PREAUTH_FETCHES`]).
+    preauth: Arc<Semaphore>,
+    /// Open long polls per node ([`MAX_FETCHES_PER_NODE`]).
+    fetching: Mutex<HashMap<NodeId, usize>>,
 }
 
 impl std::fmt::Debug for PushHost {
@@ -338,6 +349,8 @@ impl PushHost {
             path: None,
             arrived: Notify::new(),
             endpoint: OnceLock::new(),
+            preauth: Arc::new(Semaphore::new(MAX_PREAUTH_FETCHES)),
+            fetching: Mutex::new(HashMap::new()),
         }
     }
 
@@ -367,10 +380,12 @@ impl PushHost {
         self.host.audit.as_ref()
     }
 
-    /// Record one milestone of `entry` in the call log.
-    fn record(&self, entry: &Entry, outcome: PushOutcome, reason: Option<String>) {
+    /// Log one milestone of `entry` in the call log, waiting until it is
+    /// written. The milestone has already happened, so a log that can't take
+    /// it is traced at `error` (see [`audit`](crate::host::audit)).
+    async fn record(&self, entry: &Entry, outcome: PushOutcome, reason: Option<String>) {
         if let Some(sink) = self.audit() {
-            sink.record(AuditRecord::Push {
+            let record = AuditRecord::Push {
                 id: entry.message.id,
                 to: entry.message.to,
                 principal: entry.principal.clone(),
@@ -381,7 +396,14 @@ impl PushHost {
                 body: self.log_body.then(|| entry.message.body.clone()),
                 call: entry.call,
                 at_ms: now_ms(),
-            });
+            };
+            if let Err(e) = sink.append(record).await {
+                tracing::error!(
+                    id = %entry.message.id,
+                    outcome = outcome.as_str(),
+                    "a push milestone was not logged: {e}"
+                );
+            }
         }
     }
 
@@ -492,7 +514,8 @@ impl PushHost {
                         role: None,
                         call,
                     };
-                    self.record(&entry, PushOutcome::Denied, Some(reason.clone()));
+                    self.record(&entry, PushOutcome::Denied, Some(reason.clone()))
+                        .await;
                     report.results.push(PushResult {
                         to,
                         who: None,
@@ -519,7 +542,8 @@ impl PushHost {
                     Some(format!(
                         "the queue for this recipient holds at most {QUEUE_PER_RECIPIENT}"
                     )),
-                );
+                )
+                .await;
             }
             self.arrived.notify_waiters();
             let delivered = match tokio::time::timeout(DIRECT_BUDGET, self.deliver_direct(to)).await
@@ -545,7 +569,7 @@ impl PushHost {
                     .unwrap_or_else(|e| e.into_inner())
                     .holds(to, id)
                 {
-                    self.record(&entry, PushOutcome::Queued, None);
+                    self.record(&entry, PushOutcome::Queued, None).await;
                 }
                 PushOutcome::Queued
             };
@@ -570,7 +594,8 @@ impl PushHost {
         if let Err((reason, roster)) = self.authorize(to, now) {
             if roster {
                 for e in self.with_queue(|q| q.purge(to)) {
-                    self.record(&e, PushOutcome::Denied, Some(reason.clone()));
+                    self.record(&e, PushOutcome::Denied, Some(reason.clone()))
+                        .await;
                 }
             }
             bail!("not delivering: {reason}");
@@ -607,7 +632,7 @@ impl PushHost {
         conn.close(0u32.into(), b"done");
         let gone = self.with_queue(|q| q.remove(to, &acked));
         for e in &gone {
-            self.record(e, PushOutcome::Delivered, None);
+            self.record(e, PushOutcome::Delivered, None).await;
         }
         Ok(gone.into_iter().map(|e| e.message.id).collect())
     }
@@ -620,8 +645,31 @@ impl PushHost {
         }
     }
 
+    /// A slot for one more long poll from `node`, if it has fewer than
+    /// [`MAX_FETCHES_PER_NODE`] open. Freed on drop.
+    pub(crate) fn fetch_slot(&self, node: NodeId) -> Option<FetchSlot<'_>> {
+        let mut open = self.fetching.lock().unwrap_or_else(|e| e.into_inner());
+        let n = open.entry(node).or_default();
+        if *n >= MAX_FETCHES_PER_NODE {
+            return None;
+        }
+        *n += 1;
+        Some(FetchSlot { host: self, node })
+    }
+
     /// Serve one fetch from `caller` over an accepted stream. See the module
-    /// docs; refusals are sent and recorded.
+    /// docs.
+    ///
+    /// Before the caller is known to be a member, at most
+    /// [`MAX_PREAUTH_FETCHES`] fetches are read at once and each opening
+    /// frame is at most [`MAX_INBOX_HELLO`]. Membership is checked before
+    /// the ID token is verified; a peer that is not a member hears only
+    /// [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED) and is traced, not
+    /// logged (its queue, if it had one as a member, is dropped and each
+    /// message's fate logged). A member's policy refusal is only answered:
+    /// `wires inbox` asks every host of the member's services, and a host it
+    /// may not hear from would otherwise log it on every poll. A member holds
+    /// at most [`MAX_FETCHES_PER_NODE`] long polls open.
     pub(crate) async fn serve_fetch<S, R>(
         &self,
         mut send: S,
@@ -632,53 +680,89 @@ impl PushHost {
         S: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
     {
-        let (membership, id_token) = match read_frame(&mut recv, FRAME_TIMEOUT).await? {
-            Some(InboxFrame::Hello {
-                membership,
-                id_token,
-            }) => (membership, id_token),
-            _ => {
-                deny(&mut send, "expected hello").await;
-                bail!("a fetcher spoke out of turn");
-            }
+        let Ok(preauth) = Arc::clone(&self.preauth).try_acquire_owned() else {
+            FETCH_STRANGERS.refused(
+                "inbox fetch",
+                caller,
+                &format!("{MAX_PREAUTH_FETCHES} fetches already await a decision"),
+            );
+            deny(&mut send, "this host is busy; try again").await;
+            return Ok(());
         };
-        let wait_ms = match read_frame(&mut recv, FRAME_TIMEOUT).await? {
-            Some(InboxFrame::Fetch { wait_ms }) => wait_ms,
-            _ => {
+        let (membership, id_token) =
+            match read_frame_within(&mut recv, FRAME_TIMEOUT, MAX_INBOX_HELLO).await {
+                Ok(Some(InboxFrame::Hello {
+                    membership,
+                    id_token,
+                })) => (membership, id_token),
+                other => {
+                    let detail = match other {
+                        Err(e) => format!("unreadable hello: {e:#}"),
+                        _ => "expected hello".to_string(),
+                    };
+                    FETCH_STRANGERS.refused("inbox fetch", caller, &detail);
+                    deny(&mut send, "expected hello").await;
+                    return Ok(());
+                }
+            };
+        let wait_ms = match read_frame_within(&mut recv, FRAME_TIMEOUT, MAX_INBOX_HELLO).await {
+            Ok(Some(InboxFrame::Fetch { wait_ms })) => wait_ms,
+            other => {
+                let detail = match other {
+                    Err(e) => format!("unreadable fetch: {e:#}"),
+                    _ => "expected fetch".to_string(),
+                };
+                FETCH_STRANGERS.refused("inbox fetch", caller, &detail);
                 deny(&mut send, "expected fetch").await;
-                bail!("a fetcher spoke out of turn");
+                return Ok(());
             }
         };
         let now = crate::now_unix();
-        let credential = library::check_inclusion(&membership, self.host.trust_root, caller, now)
-            .map_err(|e| anyhow!("membership rejected: {e}"));
+        let state = match self.host.state() {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::warn!("signed state unusable: {e:#}");
+                deny(&mut send, "responder configuration error").await;
+                return Ok(());
+            }
+        };
+        // Membership first: a stranger costs no token verification and no
+        // call-log entry.
+        if let Err(detail) = self.host.check_member(&state, &membership, caller, now) {
+            FETCH_STRANGERS.refused("inbox fetch", caller, &detail);
+            self.drop_queue(caller, &detail).await;
+            deny(&mut send, crate::host::gate::NOT_ADMITTED).await;
+            return Ok(());
+        }
         // The fetcher's ID token (from `wires login`) is how this host learns
         // who it is, and so its roles: verified and indexed before the push
         // rule is asked.
-        if credential.is_ok()
-            && let Some(token) = &id_token
-        {
+        if let Some(token) = &id_token {
             let _ = self.host.identities.verify_token(caller, token, now).await;
         }
-        let refusal = match credential {
-            Err(e) => Some((format!("{e:#}"), true)),
-            Ok(()) => self.authorize(caller, now).err(),
-        };
-        if let Some((reason, roster)) = refusal {
-            let reason = format!("inbox fetch refused: {reason}");
-            // A credential refusal (not a member, removed) is recorded like a
-            // refused call. A policy one is only answered: `wires inbox` asks
-            // every host of the member's services, and a host it may not hear
-            // from would otherwise log it every time.
+        if let Err((reason, roster)) = self.authorize(caller, now) {
             if roster {
-                crate::host::audit::denied(self.audit(), caller, None, &reason);
-                for e in self.with_queue(|q| q.purge(caller)) {
-                    self.record(&e, PushOutcome::Denied, Some(reason.clone()));
-                }
+                // Removed between the two reads of the state.
+                FETCH_STRANGERS.refused("inbox fetch", caller, &reason);
+                self.drop_queue(caller, &reason).await;
+                deny(&mut send, crate::host::gate::NOT_ADMITTED).await;
+            } else {
+                deny(&mut send, &format!("inbox fetch refused: {reason}")).await;
             }
-            deny(&mut send, &reason).await;
             return Ok(());
         }
+        drop(preauth);
+        let Some(_slot) = self.fetch_slot(caller) else {
+            deny(
+                &mut send,
+                &format!(
+                    "inbox fetch refused: this node already has {MAX_FETCHES_PER_NODE} fetches \
+                     open here"
+                ),
+            )
+            .await;
+            return Ok(());
+        };
         // Long poll: until something is queued for the caller, or the wait
         // (capped) runs out. The notification is armed before each look, so
         // a message queued in between is never missed.
@@ -707,14 +791,23 @@ impl PushHost {
         };
         let gone = self.with_queue(|q| q.remove(caller, &acked));
         for e in &gone {
-            self.record(e, PushOutcome::Fetched, None);
+            self.record(e, PushOutcome::Fetched, None).await;
         }
         send.shutdown().await.ok();
         Ok(())
     }
 
+    /// Drop everything queued for `node`, which the signed state no longer
+    /// admits, logging each message's fate.
+    async fn drop_queue(&self, node: NodeId, reason: &str) {
+        for e in self.with_queue(|q| q.purge(node)) {
+            self.record(&e, PushOutcome::Denied, Some(reason.to_string()))
+                .await;
+        }
+    }
+
     /// Record and drop what expired at `now_ms`.
-    pub(crate) fn sweep(&self, now_ms: i64) {
+    pub(crate) async fn sweep(&self, now_ms: i64) {
         let expired = {
             let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
             let gone = q.expire(now_ms);
@@ -724,7 +817,7 @@ impl PushHost {
             gone
         };
         for e in &expired {
-            self.record(e, PushOutcome::Expired, None);
+            self.record(e, PushOutcome::Expired, None).await;
         }
     }
 
@@ -742,11 +835,35 @@ impl PushHost {
                         let _ = reply.send(sent.map_err(|e| format!("{e:#}")));
                     });
                 }
-                _ = tick.tick() => self.sweep(now_ms()),
+                _ = tick.tick() => self.sweep(now_ms()).await,
             }
         }
     }
 }
+
+/// One open long poll of a node (see [`PushHost::fetch_slot`]).
+pub(crate) struct FetchSlot<'a> {
+    /// Whose count to give back.
+    host: &'a PushHost,
+    /// The fetching node.
+    node: NodeId,
+}
+
+impl Drop for FetchSlot<'_> {
+    fn drop(&mut self) {
+        let mut open = self.host.fetching.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = open.get_mut(&self.node) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                open.remove(&self.node);
+            }
+        }
+    }
+}
+
+/// Refusals of fetchers not known to be members (see
+/// [`Throttle`](transport::Throttle)).
+static FETCH_STRANGERS: transport::Throttle = transport::Throttle::new();
 
 /// The inbox ALPN on a host: serves fetches ([`PushHost::serve_fetch`]).
 #[derive(Clone, Debug)]
@@ -955,6 +1072,116 @@ mod tests {
             role: None,
             call: None,
         }
+    }
+
+    /// A push host (4) of the fabric rooted at 1, whose state lists 2 as a
+    /// member, logging to an in-memory sink. (No service or role is needed:
+    /// these tests stop at membership, and `serve` isn't preflighted.)
+    fn push_host() -> (Arc<PushHost>, mpsc::Receiver<AuditRecord>) {
+        use crate::admin::keystore::Keystore;
+        use library::{Membership, State, StateVersion};
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        let home = crate::testutil::temp_dir();
+        let ks = Keystore::at(&home);
+        let mut s = State::new(root.node_id());
+        s.version = StateVersion(1);
+        s.issued = crate::now_unix();
+        s.not_after = i64::MAX;
+        s.members.extend([node(4), node(2)]);
+        s.hosts.insert(node(4));
+        let signed = s.sign(&root).unwrap();
+        crate::state::store::adopt_if_newer(&ks, &signed, root.node_id(), crate::now_unix())
+            .unwrap();
+        let config = crate::host::config_v2::HostConfigV2::parse(
+            r#"{"version":2,"services":{"t":{"command":["true"]}},"push":{"allow":["analyst"]}}"#,
+        )
+        .unwrap();
+        let mut host = crate::host::serve::services_host(
+            node(4),
+            Membership::mint(&root, node(4), 0, i64::MAX).unwrap(),
+            Arc::new(ks),
+            &home,
+            config,
+        )
+        .unwrap();
+        let (sink, records) = AuditSink::channel(64);
+        host.audit = Some(sink);
+        (Arc::new(PushHost::from_state(Arc::new(host))), records)
+    }
+
+    /// `frames` from `caller` to `push`'s fetch endpoint: the refusal.
+    async fn fetch_refusal(push: &PushHost, bytes: Vec<u8>, caller: NodeId) -> String {
+        let (send, mut answer) = tokio::io::duplex(64 * 1024);
+        push.serve_fetch(send, std::io::Cursor::new(bytes), caller)
+            .await
+            .unwrap();
+        match read_frame(&mut answer, FRAME_TIMEOUT).await.unwrap() {
+            Some(InboxFrame::Denied { reason }) => reason,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A fetch from a key the state doesn't list hears the fixed sentence,
+    /// has its token left unverified, and leaves nothing in the call log.
+    #[tokio::test]
+    async fn a_non_member_fetch_is_refused_unlogged_and_unverified() {
+        let (push, mut records) = push_host();
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        for seed in 50..60u8 {
+            let who = node(seed);
+            let mut bytes = InboxFrame::Hello {
+                membership: library::Membership::mint(&root, who, 0, i64::MAX).unwrap(),
+                id_token: Some(library::IdToken::new(
+                    "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIn0.",
+                )),
+            }
+            .encode()
+            .unwrap();
+            bytes.extend(InboxFrame::Fetch { wait_ms: 0 }.encode().unwrap());
+            let r = fetch_refusal(&push, bytes, who).await;
+            assert_eq!(r, crate::host::gate::NOT_ADMITTED);
+        }
+        assert!(push.host.identities.nodes().is_empty());
+        assert!(records.try_recv().is_err(), "a stranger's fetch was logged");
+    }
+
+    /// An inbox `hello` whose prefix claims more than `MAX_INBOX_HELLO` is
+    /// refused at the prefix, before any body arrives.
+    #[tokio::test]
+    async fn an_oversized_inbox_hello_is_refused_at_the_prefix() {
+        let (push, _records) = push_host();
+        let (mut to_host, from_peer) = tokio::io::duplex(1024);
+        let (send, mut answer) = tokio::io::duplex(1024);
+        to_host
+            .write_all(&((MAX_INBOX_HELLO + 1) as u32).to_be_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            push.serve_fetch(send, from_peer, node(2)),
+        )
+        .await
+        .expect("the host waited for an oversized hello")
+        .unwrap();
+        let Some(InboxFrame::Denied { .. }) = read_frame(&mut answer, FRAME_TIMEOUT).await.unwrap()
+        else {
+            panic!("expected a refusal");
+        };
+        drop(to_host);
+    }
+
+    /// A member holds at most `MAX_FETCHES_PER_NODE` long polls; another
+    /// node is unaffected, and a finished one frees its slot.
+    #[tokio::test]
+    async fn long_polls_per_node_are_capped() {
+        let (push, _records) = push_host();
+        let held: Vec<_> = (0..MAX_FETCHES_PER_NODE)
+            .map(|_| push.fetch_slot(node(2)).expect("room"))
+            .collect();
+        assert!(push.fetch_slot(node(2)).is_none());
+        assert!(push.fetch_slot(node(3)).is_some());
+        drop(held);
+        assert!(push.fetch_slot(node(2)).is_some());
     }
 
     #[test]

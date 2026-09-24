@@ -6,7 +6,7 @@
 //! [`Frame::Hello`](library::Frame::Hello) — its root-signed membership, the
 //! signed-state version it holds, and its IdP ID token — followed at once by
 //! a [`Frame::Invoke`] naming a service plus per-call arguments. The host
-//! ([`serve_services_session`]) decides by the signed state it holds, re-read
+//! ([`serve_session_permitted`]) decides by the signed state it holds, re-read
 //! per connection (see [`gate`](crate::host::gate)), then execs the
 //! service's fixed argv with the caller's arguments appended — never through
 //! a shell — with the verified caller identity injected into its
@@ -21,6 +21,14 @@
 //! - **Refusals are current.** The signed state is re-read on every
 //!   connection, so a `wires remove` takes effect on the next dial rather
 //!   than the next restart.
+//! - **Strangers are cheap.** Anyone can open a connection, so until the
+//!   host knows the peer is a member it reads small frames only
+//!   ([`MAX_HELLO_FRAME`], [`MAX_INVOKE_FRAME`]), holds at most
+//!   [`MAX_PREAUTH_SESSIONS`] such sessions, verifies no token, says only
+//!   [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED), and writes nothing to
+//!   the call log.
+//! - **No call runs unlogged.** An admitted call's `Started` is in the call
+//!   log, `fsync`ed, before its child is spawned ([`AuditSink`]).
 
 use std::process::Stdio;
 use std::sync::Arc;
@@ -46,42 +54,206 @@ pub const ALPN: &[u8] = b"wires/session/3";
 /// Read buffer size for pumping child / local stdio into frames.
 const PUMP_BUF: usize = 64 * 1024;
 
-/// Largest frame body accepted off the wire. Bounds the allocation a peer can
-/// induce from the (untrusted) length prefix; generous versus the 64 KiB stdio
-/// chunk size, but far below "exhaust memory".
+/// Largest frame body accepted off the wire once a session is admitted.
+/// Bounds what a member can make the host buffer; generous versus the 64 KiB
+/// stdio chunk size, but far below "exhaust memory".
 const MAX_FRAME: usize = 16 * 1024 * 1024;
+
+/// Largest [`Frame::Hello`] a host reads, before it knows who is asking: a
+/// membership, a state version and an ID token fit in a few KiB.
+pub(crate) const MAX_HELLO_FRAME: usize = 64 * 1024;
+
+/// Largest [`Frame::Invoke`] a host reads before admitting the caller. An
+/// [`Argv`](library::Argv) holds at most [`MAX_ARGV_BYTES`](library::MAX_ARGV_BYTES),
+/// but canonical JSON may escape a control character as six bytes (`\u001f`)
+/// and adds quotes and commas per argument, so the cap is eight times that
+/// (512 KiB) — the most a valid invocation can take, and no more.
+pub(crate) const MAX_INVOKE_FRAME: usize = 8 * library::MAX_ARGV_BYTES;
+
+/// How many sessions a host holds open at once *before* deciding who they are
+/// (reading `Hello`/`Invoke`, checking membership, verifying the ID token).
+/// One more is closed at once, without a reply. Admitted sessions don't
+/// count: the permit is returned as soon as the gate decides.
+pub(crate) const MAX_PREAUTH_SESSIONS: usize = 64;
 
 /// How long a responder waits for the opening handshake before giving up, so a
 /// peer that connects but never speaks can't hold a session task open.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a session waits for the call log to take one record — its turn
+/// in the queue plus the append and `fsync` — before treating the log as
+/// unavailable. See [`AuditSink::append`].
+pub(crate) const LOG_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Denial reason: the responder got something other than an
 /// [`Frame::Invoke`] after the handshake.
 pub const DENY_INVOKE_REQUIRED: &str = "invoke required";
 
-/// The responder's handle for publishing [`AuditRecord`](library::AuditRecord)s.
+/// Denial reason: the host could not record the call's `Started` entry, so
+/// the call did not run. The cause is in the host's own trace.
+pub const DENY_LOG_UNAVAILABLE: &str = "this host can't record calls right now, so it runs none; \
+                                        try again later";
+
+/// The call log could not take a record (see [`AuditSink::append`]). The
+/// text is for the host's trace, never for a caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogUnavailable(String);
+
+impl std::fmt::Display for LogUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the call log did not take the record: {}", self.0)
+    }
+}
+
+impl std::error::Error for LogUnavailable {}
+
+/// One record on its way to the call log, with where to say whether it was
+/// logged. Built by [`AuditSink::append`]; drained by the log's writer
+/// ([`call_log::tee`](crate::host::call_log::tee)).
+#[derive(Debug)]
+pub struct Pending {
+    /// The record to append.
+    pub record: library::AuditRecord,
+    /// Answered once the record is durably logged (or failed to be).
+    done: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+}
+
+impl Pending {
+    /// Tell the waiting session how the append went: `Ok` only once the
+    /// entry is written and `fsync`ed.
+    pub fn answer(self, outcome: std::result::Result<(), String>) {
+        let _ = self.done.send(outcome);
+    }
+}
+
+/// The host's handle on its call log: where sessions and pushes send
+/// [`AuditRecord`](library::AuditRecord)s.
 ///
-/// Cloneable and non-blocking: a session never waits on the audit channel. A
-/// full or closed sink is logged and the record dropped — the call itself is
-/// not failed. (Whether a *missing* audit path should fail closed is the
-/// audit lane's decision; see `docs/board`.)
+/// **Fail closed.** [`append`](Self::append) waits (at most [`LOG_WAIT`])
+/// until the record is written and `fsync`ed, and says whether it was. A
+/// full queue is waited on, never skipped, so no record is silently dropped.
+/// A call's `Started` must be logged before its child is spawned, or the call
+/// is refused; what a failure of any later record means is decided by the
+/// caller of `append` (see [`audit`](crate::host::audit)).
 #[derive(Clone, Debug)]
-pub struct AuditSink(tokio::sync::mpsc::Sender<library::AuditRecord>);
+pub struct AuditSink(tokio::sync::mpsc::Sender<Pending>);
 
 impl AuditSink {
-    /// A sink and the receiver the audit publisher drains.
-    pub fn channel(cap: usize) -> (Self, tokio::sync::mpsc::Receiver<library::AuditRecord>) {
+    /// A sink and the queue the log's writer drains (at most `cap` records
+    /// waiting; a session beyond that waits its turn).
+    pub fn log_queue(cap: usize) -> (Self, tokio::sync::mpsc::Receiver<Pending>) {
         let (tx, rx) = tokio::sync::mpsc::channel(cap);
         (Self(tx), rx)
     }
 
-    /// Queue `record` for publishing without waiting.
-    pub fn record(&self, record: library::AuditRecord) {
-        if let Err(e) = self.0.try_send(record) {
-            tracing::warn!("audit record dropped: {e}");
+    /// An in-memory sink (tests): every record is answered as logged once it
+    /// is in the returned receiver, which holds at most `cap`. Must be called
+    /// inside a Tokio runtime.
+    #[cfg(test)]
+    pub fn channel(cap: usize) -> (Self, tokio::sync::mpsc::Receiver<library::AuditRecord>) {
+        let (sink, mut queue) = Self::log_queue(cap);
+        let (tx, rx) = tokio::sync::mpsc::channel(cap);
+        tokio::spawn(async move {
+            while let Some(pending) = queue.recv().await {
+                let kept = tx.send(pending.record.clone()).await;
+                pending.answer(kept.map_err(|_| "the receiver is gone".to_string()));
+            }
+        });
+        (sink, rx)
+    }
+
+    /// Append `record` to the call log, waiting until it is durably written.
+    /// `Err` when the log refused it, is gone, or took longer than
+    /// [`LOG_WAIT`] (the record may still be written later).
+    pub async fn append(&self, record: library::AuditRecord) -> Result<(), LogUnavailable> {
+        let (done, answer) = tokio::sync::oneshot::channel();
+        let wait = async {
+            self.0
+                .send(Pending { record, done })
+                .await
+                .map_err(|_| LogUnavailable("the log writer is gone".into()))?;
+            answer
+                .await
+                .map_err(|_| LogUnavailable("the log writer is gone".into()))?
+                .map_err(LogUnavailable)
+        };
+        tokio::time::timeout(LOG_WAIT, wait)
+            .await
+            .map_err(|_| LogUnavailable(format!("no answer within {LOG_WAIT:?}")))?
+    }
+}
+
+/// Keeps a trace of refusals a stranger can cause from becoming a flood:
+/// each one is traced at `debug`, and at most one `info` line per
+/// [`Throttle::EVERY_MS`] says how many there were. Anyone can open a
+/// connection, so the rate is the stranger's to choose; `info` stays
+/// readable and `debug` has the detail when an operator wants it.
+#[derive(Debug)]
+pub(crate) struct Throttle {
+    /// When the last `info` line was written (unix ms).
+    last_ms: std::sync::atomic::AtomicI64,
+    /// Refusals since then.
+    since: std::sync::atomic::AtomicU64,
+}
+
+impl Throttle {
+    /// The least time between two `info` lines.
+    pub(crate) const EVERY_MS: i64 = 10_000;
+
+    /// A throttle that lets its first event through.
+    pub(crate) const fn new() -> Self {
+        Self {
+            last_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
+            since: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Count one event at `now_ms`: `Some(n)` — the events since the last
+    /// `info` line, this one included — when it is time for another.
+    pub(crate) fn tick(&self, now_ms: i64) -> Option<u64> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.since.fetch_add(1, SeqCst);
+        let last = self.last_ms.load(SeqCst);
+        if now_ms.saturating_sub(last) < Self::EVERY_MS {
+            return None;
+        }
+        if self
+            .last_ms
+            .compare_exchange(last, now_ms, SeqCst, SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        Some(self.since.swap(0, SeqCst))
+    }
+
+    /// Trace one refusal of a stranger: `what` names the protocol, `detail`
+    /// is why (never sent to the peer).
+    pub(crate) fn refused(&self, what: &str, peer: NodeId, detail: &str) {
+        tracing::debug!(peer = %peer.hex(), "{what} refused: {detail}");
+        if let Some(n) = self.tick(crate::host::audit::now_ms()) {
+            tracing::info!(
+                refused = n,
+                last_peer = %peer.hex(),
+                "{what}: refused {n} unadmitted peer(s) since the last report (latest: {detail}); \
+                 not written to the call log"
+            );
         }
     }
 }
+
+/// The refusal a session sends and returns: already traced (and, for a
+/// member, logged), so the accept loop need not warn about it again.
+#[derive(Debug)]
+pub(crate) struct Refused(pub(crate) String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 // ---------------------------------------------------------------------------
 // Key bridge: our `library` identities <-> iroh's
@@ -172,8 +344,21 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame)
     Ok(())
 }
 
-/// Read one length-prefixed frame, or `None` at a clean end of stream.
+/// Read one length-prefixed frame (at most [`MAX_FRAME`]), or `None` at a
+/// clean end of stream.
 pub(crate) async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<Frame>> {
+    read_frame_within(r, MAX_FRAME).await
+}
+
+/// [`read_frame`], refusing a frame whose length prefix is over `max`.
+///
+/// The prefix is the peer's claim, so nothing is sized from it: the body
+/// buffer grows only as bytes actually arrive, and a prefix over `max` is
+/// refused before a byte of body is read.
+pub(crate) async fn read_frame_within<R: AsyncRead + Unpin>(
+    r: &mut R,
+    max: usize,
+) -> Result<Option<Frame>> {
     let mut len_buf = [0u8; 4];
     match r.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -181,17 +366,19 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option
         Err(e) => return Err(e).context("reading frame length"),
     }
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME {
-        // Refuse before allocating: the length prefix is attacker-controlled
-        // (this runs even for the pre-auth handshake frame).
-        bail!("frame too large: {len} bytes (max {MAX_FRAME})");
+    if len > max {
+        bail!("frame too large: {len} bytes (max {max})");
     }
-    let mut full = Vec::with_capacity(4 + len);
+    let mut full = Vec::with_capacity(4 + len.min(PUMP_BUF));
     full.extend_from_slice(&len_buf);
-    full.resize(4 + len, 0);
-    r.read_exact(&mut full[4..])
+    (&mut *r)
+        .take(len as u64)
+        .read_to_end(&mut full)
         .await
         .context("reading frame body")?;
+    if full.len() != 4 + len {
+        bail!("truncated frame");
+    }
     match Frame::decode(&full)? {
         Some((frame, _)) => Ok(Some(frame)),
         None => bail!("truncated frame"),
@@ -252,7 +439,7 @@ async fn pump_reader<R: AsyncRead + Unpin>(
 /// Read the [`Frame::Invoke`] a dialer sends right after its
 /// handshake (bounded by [`HANDSHAKE_TIMEOUT`]).
 async fn read_invocation<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Invocation> {
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(recv))
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame_within(recv, MAX_INVOKE_FRAME))
         .await
         .context("timed out waiting for invoke")??
     {
@@ -262,30 +449,38 @@ async fn read_invocation<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Invocatio
     }
 }
 
-/// Spawn `cmd` (`program` names it in errors) with piped stdio, emit the
-/// call's `Started` record via `start_audit`, and bridge the child's stdio
-/// over the session until it exits (or kill it when `shutdown` says the
-/// dialer is gone), then send its [`Frame::Exit`]. The ack has already been
-/// written.
+/// Spawn `cmd` (`program` names it in errors) with piped stdio and bridge
+/// the child's stdio over the session until it exits (or kill it when
+/// `shutdown` says the dialer is gone), then log the call's `Finished` via
+/// `audit` and send its [`Frame::Exit`]. The call's `Started` is already
+/// logged and the ack already written; a child that fails to spawn is
+/// logged as finished with exit -1.
 async fn bridge_child<S, R>(
     send: S,
     mut recv: R,
     mut cmd: Command,
     program: &str,
     shutdown: impl std::future::Future<Output = ()> + Send,
-    start_audit: impl FnOnce() -> Option<crate::host::audit::CallAudit>,
+    audit: Option<crate::host::audit::CallAudit>,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin + Send + 'static,
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let mut child = cmd
+    let spawned = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawning {program}"))?;
-    let audit = start_audit();
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            if let Some(audit) = audit {
+                audit.finish(-1).await; // audit: finished (never ran)
+            }
+            return Err(e).with_context(|| format!("spawning {program}"));
+        }
+    };
     let mut child_stdin = child.stdin.take().context("child stdin")?;
     let stdin_tap = crate::host::audit::tap_stdin(audit.as_ref());
     let child_stdout = crate::host::audit::tap_stdout(
@@ -350,7 +545,7 @@ where
     let code = status.code().unwrap_or(-1);
     tracing::info!(code, "child exited; closing session");
     if let Some(audit) = audit {
-        audit.finish(code); // audit: finished
+        audit.finish(code).await; // audit: finished, before the caller hears the exit
     }
     tx.send(Frame::Exit(code)).await.ok();
     drop(tx);
@@ -363,9 +558,33 @@ where
 // ---------------------------------------------------------------------------
 
 /// The session ALPN for a host, as a router protocol (see
-/// [`serve_services_session`]).
+/// [`serve_session_permitted`]). At most [`MAX_PREAUTH_SESSIONS`] sessions
+/// wait for a decision at once; one more is closed unanswered and traced.
 #[derive(Clone, Debug)]
-pub(crate) struct ServicesProtocol(pub(crate) Arc<crate::host::gate::ServicesHost>);
+pub(crate) struct ServicesProtocol {
+    /// Who decides.
+    host: Arc<crate::host::gate::ServicesHost>,
+    /// Permits for sessions not yet decided.
+    preauth: Arc<tokio::sync::Semaphore>,
+}
+
+impl ServicesProtocol {
+    /// Serve sessions for `host`.
+    pub(crate) fn new(host: Arc<crate::host::gate::ServicesHost>) -> Self {
+        Self {
+            host,
+            preauth: Arc::new(tokio::sync::Semaphore::new(MAX_PREAUTH_SESSIONS)),
+        }
+    }
+
+    /// A permit for one more undecided session, if there is room.
+    fn enter(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.preauth).try_acquire_owned().ok()
+    }
+}
+
+/// Refusals of peers not known to be members (see [`Throttle`]).
+static STRANGERS: Throttle = Throttle::new();
 
 impl iroh::protocol::ProtocolHandler for ServicesProtocol {
     async fn accept(
@@ -373,13 +592,22 @@ impl iroh::protocol::ProtocolHandler for ServicesProtocol {
         conn: iroh::endpoint::Connection,
     ) -> std::result::Result<(), iroh::protocol::AcceptError> {
         let caller = to_node_id(&conn.remote_id());
-        tracing::info!(caller = %caller.hex(), "connection accepted (iroh-authenticated)");
+        let Some(permit) = self.enter() else {
+            STRANGERS.refused(
+                "session",
+                caller,
+                &format!("{MAX_PREAUTH_SESSIONS} sessions already await a decision"),
+            );
+            conn.close(1u32.into(), b"busy");
+            return Ok(());
+        };
+        tracing::debug!(caller = %caller.hex(), "connection accepted (iroh-authenticated)");
         let result = async {
             let (send, recv) = conn.accept_bi().await.context("accepting bi-stream")?;
             // The transport's own liveness signal: when the dialer goes away,
             // the child dies with it instead of being stranded on this host.
             let closed = conn.clone();
-            serve_services_session(send, recv, caller, &self.0, async move {
+            serve_session_permitted(send, recv, caller, &self.host, Some(permit), async move {
                 closed.closed().await;
             })
             .await
@@ -389,43 +617,50 @@ impl iroh::protocol::ProtocolHandler for ServicesProtocol {
         // connection is torn down; bounded so a vanished dialer can't pin us.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
         result.map_err(|e| {
-            tracing::warn!("connection rejected or failed: {e:#}");
+            if e.downcast_ref::<Refused>().is_some() {
+                tracing::debug!(caller = %caller.hex(), "{e:#}");
+            } else {
+                tracing::warn!(caller = %caller.hex(), "session failed: {e:#}");
+            }
             iroh::protocol::AcceptError::from_boxed(e.into())
         })
     }
 }
 
-/// Refuse `caller`: record it in the call log and send the reason.
-async fn refuse<W: AsyncWrite + Unpin>(
+/// Refuse a **member**: log the refusal in the call log (awaited; a log that
+/// can't take it is traced as an error) and send the reason.
+async fn refuse_member<W: AsyncWrite + Unpin>(
     send: &mut W,
     audit: Option<&AuditSink>,
     caller: NodeId,
     tool: Option<ToolName>,
     reason: String,
 ) -> anyhow::Error {
-    crate::host::audit::denied(audit, caller, tool, &reason); // audit: denied
+    crate::host::audit::denied(audit, caller, tool, &reason).await; // audit: denied
     deny(send, reason.clone()).await;
-    anyhow!(reason)
+    Refused(reason).into()
 }
 
-/// The v2 responder over an authenticated bi-stream: read the
-/// [`Frame::Hello`] and the [`Frame::Invoke`], then decide by **this host's**
-/// signed state (re-read now, so a removal applies on the next dial): the
-/// caller's membership credential, its ID token (verified under
-/// `identity.issuers`, bound to `caller`), then
-/// [`gate::admit`](crate::host::gate::admit) — member → registered and
-/// assigned here → registry role → `also_require`. Only then is the service
-/// looked up in `host.json`. A refusal is a [`Frame::Denied`] plus a call-log
-/// record.
-///
-/// Admitted: a [`Frame::HelloAck`] carrying this host's membership and state
-/// version, plus the state itself when the caller's copy is older (the
-/// cheapest pull), then the service's command with the caller's argv
-/// appended (never a shell), in its `cwd` with its `env`, and the
-/// server-derived `WIRES_*` variables.
+/// Refuse a peer not known to be a member: send `reason`, trace `detail`
+/// (throttled), and write nothing to the call log — anyone can connect, so a
+/// stranger must not be able to fill the log or crowd out real calls.
+async fn refuse_stranger<W: AsyncWrite + Unpin>(
+    send: &mut W,
+    caller: NodeId,
+    reason: &str,
+    detail: &str,
+) -> anyhow::Error {
+    STRANGERS.refused("session", caller, detail);
+    deny(send, reason.to_string()).await;
+    Refused(reason.to_string()).into()
+}
+
+/// The v2 responder over an authenticated bi-stream (see
+/// [`serve_session_permitted`], here with no pre-auth permit to return).
+#[cfg(test)]
 pub(crate) async fn serve_services_session<S, R>(
-    mut send: S,
-    mut recv: R,
+    send: S,
+    recv: R,
     caller: NodeId,
     host: &crate::host::gate::ServicesHost,
     shutdown: impl std::future::Future<Output = ()> + Send,
@@ -434,26 +669,75 @@ where
     S: AsyncWrite + Unpin + Send + 'static,
     R: AsyncRead + Unpin + Send + 'static,
 {
+    serve_session_permitted(send, recv, caller, host, None, shutdown).await
+}
+
+/// The v2 responder over an authenticated bi-stream: read the
+/// [`Frame::Hello`] (at most [`MAX_HELLO_FRAME`]) and the [`Frame::Invoke`]
+/// (at most [`MAX_INVOKE_FRAME`]), then decide by **this host's** signed
+/// state (re-read now, so a removal applies on the next dial):
+///
+/// 1. the caller's membership credential, and that the state lists it
+///    ([`ServicesHost::check_member`](crate::host::gate::ServicesHost::check_member)).
+///    Anyone else hears only [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED),
+///    costs no token verification, and is traced, not logged;
+/// 2. its ID token (verified under `identity.issuers`, bound to `caller`);
+/// 3. [`gate::admit`](crate::host::gate::admit): fresh → registered and
+///    assigned here → registry role → `also_require`;
+/// 4. whether `host.json` implements the service.
+///
+/// A member's refusal is a [`Frame::Denied`] plus a call-log record.
+/// `preauth` is returned once this is decided.
+///
+/// Admitted: the call's `Started` is appended to the call log and `fsync`ed
+/// **before** anything else — if it can't be, the call is refused with
+/// [`DENY_LOG_UNAVAILABLE`] and nothing runs. Then a [`Frame::HelloAck`]
+/// carrying this host's membership and state version, plus the state itself
+/// when the caller's copy is older (the cheapest pull), then the service's
+/// command with the caller's argv appended (never a shell), in its `cwd`
+/// with its `env`, and the server-derived `WIRES_*` variables.
+pub(crate) async fn serve_session_permitted<S, R>(
+    mut send: S,
+    mut recv: R,
+    caller: NodeId,
+    host: &crate::host::gate::ServicesHost,
+    preauth: Option<tokio::sync::OwnedSemaphorePermit>,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+{
     let audit = host.audit.as_ref();
-    let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut recv))
-        .await
-        .context("timed out waiting for hello")??;
+    let first = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        read_frame_within(&mut recv, MAX_HELLO_FRAME),
+    )
+    .await;
     let hello = match first {
-        Some(Frame::Hello(hello)) => hello,
-        Some(_) => {
-            let reason = "first frame was not a hello".to_string();
-            return Err(refuse(&mut send, audit, caller, None, reason).await);
+        Ok(Ok(Some(Frame::Hello(hello)))) => hello,
+        Ok(Ok(Some(_))) => {
+            let reason = "first frame was not a hello";
+            return Err(refuse_stranger(&mut send, caller, reason, reason).await);
         }
-        None => {
-            let reason = "connection closed before hello".to_string();
-            return Err(refuse(&mut send, audit, caller, None, reason).await);
+        Ok(Ok(None)) => {
+            let reason = "connection closed before hello";
+            return Err(refuse_stranger(&mut send, caller, reason, reason).await);
+        }
+        Ok(Err(e)) => {
+            let detail = format!("unreadable hello: {e:#}");
+            return Err(refuse_stranger(&mut send, caller, "unreadable hello", &detail).await);
+        }
+        Err(_) => {
+            let reason = "timed out waiting for hello";
+            return Err(refuse_stranger(&mut send, caller, reason, reason).await);
         }
     };
     let invocation = match read_invocation(&mut recv).await {
         Ok(invocation) => invocation,
         Err(e) => {
-            let _ = refuse(&mut send, audit, caller, None, DENY_INVOKE_REQUIRED.into()).await;
-            return Err(e.context(DENY_INVOKE_REQUIRED));
+            let detail = format!("{e:#}");
+            return Err(refuse_stranger(&mut send, caller, DENY_INVOKE_REQUIRED, &detail).await);
         }
     };
     let tool = invocation.tool.clone();
@@ -463,15 +747,20 @@ where
     let state = match host.state() {
         Ok(state) => state,
         Err(e) => {
+            // The host's own fault, not the caller's: an operator error.
             tracing::warn!("signed state unusable: {e:#}");
-            let reason = "responder configuration error".to_string();
-            return Err(refuse(&mut send, audit, caller, Some(tool), reason).await);
+            let reason = "responder configuration error";
+            deny(&mut send, reason.to_string()).await;
+            return Err(Refused(reason.to_string()).into());
         }
     };
-    if let Err(e) = check_inclusion(&hello.membership, host.trust_root, caller, now) {
-        let reason = format!("membership rejected: {e}");
-        return Err(refuse(&mut send, audit, caller, Some(tool), reason).await);
+    // Membership first: a stranger costs no token verification (no JWKS
+    // fetch, no identity-index entry) and no call-log entry.
+    if let Err(detail) = host.check_member(&state, &hello.membership, caller, now) {
+        let reason = crate::host::gate::NOT_ADMITTED;
+        return Err(refuse_stranger(&mut send, caller, reason, &detail).await);
     }
+    // A member from here on: every refusal is logged.
     let (principal, missing) = host.principal(caller, hello.id_token.as_ref(), now).await;
     let admitted = match host.decide(
         &state,
@@ -482,13 +771,16 @@ where
         now,
     ) {
         Ok(admitted) => admitted,
-        Err(reason) => return Err(refuse(&mut send, audit, caller, Some(tool), reason).await),
+        Err(reason) => {
+            return Err(refuse_member(&mut send, audit, caller, Some(tool), reason).await);
+        }
     };
     // Only an admitted caller learns whether this host implements it.
     let Some(svc) = host.config.services.get(&service) else {
         let reason = format!("service {service} is not implemented on this host");
-        return Err(refuse(&mut send, audit, caller, Some(tool), reason).await);
+        return Err(refuse_member(&mut send, audit, caller, Some(tool), reason).await);
     };
+    drop(preauth);
     let version = admitted.state_version;
     if hello.state_version > version {
         // The caller saw a newer state than ours; we still decide by ours
@@ -507,20 +799,50 @@ where
         state_version = version.0,
         "session accepted"
     );
-    write_frame(
-        &mut send,
-        &Frame::HelloAck(library::HelloAck {
-            membership: host.membership.clone(),
-            state_version: version,
-            newer_state: (hello.state_version < version).then(|| state.clone()),
-        }),
+    // The call is logged before it can run; a call the log can't take
+    // doesn't run.
+    let call_audit = match crate::host::audit::CallAudit::start(
+        audit,
+        caller,
+        principal.clone(),
+        tool.clone(),
+        invocation.argv.as_slice(),
+        Some(version.0),
+        Some(admitted.role.as_str().to_string()),
     )
-    .await?;
+    .await
+    {
+        Ok(call_audit) => call_audit,
+        Err(e) => {
+            tracing::error!(
+                caller = %caller.hex(),
+                service = %service,
+                "call refused: its start could not be logged: {e}"
+            );
+            deny(&mut send, DENY_LOG_UNAVAILABLE.to_string()).await;
+            return Err(Refused(DENY_LOG_UNAVAILABLE.to_string()).into());
+        }
+    };
+    let ack = Frame::HelloAck(library::HelloAck {
+        membership: host.membership.clone(),
+        state_version: version,
+        newer_state: (hello.state_version < version).then(|| state.clone()),
+    });
+    if let Err(e) = write_frame(&mut send, &ack).await {
+        // The caller is gone before anything ran: close the logged call.
+        if let Some(call_audit) = call_audit {
+            call_audit.finish(-1).await;
+        }
+        return Err(e);
+    }
 
-    let (program, fixed) = svc
-        .command
-        .split_first()
-        .ok_or_else(|| anyhow!("empty service command"))?;
+    let Some((program, fixed)) = svc.command.split_first() else {
+        // Nothing can run: close the logged call.
+        if let Some(call_audit) = call_audit {
+            call_audit.finish(-1).await;
+        }
+        return Err(anyhow!("empty service command"));
+    };
     let mut cmd = Command::new(program);
     cmd.args(fixed).args(invocation.argv.as_slice());
     if let Some(cwd) = &svc.cwd {
@@ -556,25 +878,13 @@ where
         server.push((ENV_SOCKET, socket.clone().into_os_string()));
         server.push((ENV_TOKEN, cap.token().hex().into()));
     }
+    if let (Some((cap, _)), Some(call_audit)) = (&capability, &call_audit) {
+        // Bound before spawn: the child's first push already names its call.
+        cap.bind_call(call_audit.call());
+    }
     cmd.env_clear()
         .envs(child_env(std::env::vars_os(), &svc.env, server));
-    let role = admitted.role;
-    let result = bridge_child(send, recv, cmd, program, shutdown, || {
-        let audit = crate::host::audit::CallAudit::start(
-            audit,
-            caller,
-            principal,
-            tool,
-            invocation.argv.as_slice(),
-            Some(version.0),
-            Some(role.as_str().to_string()),
-        );
-        if let (Some((cap, _)), Some(audit)) = (&capability, &audit) {
-            cap.bind_call(audit.call());
-        }
-        audit
-    })
-    .await;
+    let result = bridge_child(send, recv, cmd, program, shutdown, call_audit).await;
     // Dropping the capability starts its grace period.
     drop(capability);
     result
@@ -905,6 +1215,18 @@ mod tests {
     /// (anyone the shared test IdP verified); the caller and the host are the
     /// members of its signed state.
     fn host_running(command: &[&str]) -> Arc<ServicesHost> {
+        Arc::new(host_unshared(command))
+    }
+
+    /// [`host_running`], logging to `audit`.
+    fn host_logging(command: &[&str], audit: AuditSink) -> Arc<ServicesHost> {
+        let mut host = host_unshared(command);
+        host.audit = Some(audit);
+        Arc::new(host)
+    }
+
+    /// [`host_running`], before it is shared.
+    fn host_unshared(command: &[&str]) -> ServicesHost {
         let (root, host, caller) = (root(), host_id(), caller_id());
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);
@@ -934,16 +1256,14 @@ mod tests {
             serde_json::to_string(command).unwrap()
         ))
         .unwrap();
-        Arc::new(
-            crate::host::serve::services_host(
-                host.node_id(),
-                Membership::mint(&root, host.node_id(), 0, i64::MAX).unwrap(),
-                Arc::new(ks),
-                &home,
-                config,
-            )
-            .unwrap(),
+        crate::host::serve::services_host(
+            host.node_id(),
+            Membership::mint(&root, host.node_id(), 0, i64::MAX).unwrap(),
+            Arc::new(ks),
+            &home,
+            config,
         )
+        .unwrap()
     }
 
     /// The caller's `Hello` (membership under the root, state version 1, and
@@ -1122,16 +1442,12 @@ mod tests {
         );
     }
 
-    /// What the host answers to `frames` from `caller`: the denial reason.
-    async fn refusal(frames: &[Frame], caller: NodeId) -> String {
-        let host = host_running(&["cat"]);
-        let mut bytes = Vec::new();
-        for f in frames {
-            bytes.extend(f.encode().unwrap());
-        }
+    /// What `host` answers to the raw `bytes` from `caller`: the denial
+    /// reason.
+    async fn refusal_by(host: &ServicesHost, bytes: Vec<u8>, caller: NodeId) -> String {
         let (send, mut answer) = tokio::io::duplex(64 * 1024);
         let r =
-            serve_services_session(send, std::io::Cursor::new(bytes), caller, &host, never()).await;
+            serve_services_session(send, std::io::Cursor::new(bytes), caller, host, never()).await;
         assert!(r.is_err());
         match read_frame(&mut answer).await.unwrap() {
             Some(Frame::Denied { reason }) => reason,
@@ -1139,20 +1455,288 @@ mod tests {
         }
     }
 
+    /// `frames`, encoded back to back.
+    fn encoded(frames: &[Frame]) -> Vec<u8> {
+        frames.iter().flat_map(|f| f.encode().unwrap()).collect()
+    }
+
+    /// What the host answers to `frames` from `caller`: the denial reason.
+    async fn refusal(frames: &[Frame], caller: NodeId) -> String {
+        refusal_by(&host_running(&["cat"]), encoded(frames), caller).await
+    }
+
+    /// A key that is not in the state, with a membership the root really
+    /// minted for it (so only the state's member list keeps it out).
+    fn stranger(seed: u8) -> (NodeId, Hello) {
+        let id = NodeIdentity::from_seed([seed; 32]).node_id();
+        let hello = Hello {
+            membership: Membership::mint(&root(), id, 0, i64::MAX).unwrap(),
+            state_version: StateVersion(1),
+            id_token: None,
+        };
+        (id, hello)
+    }
+
     #[tokio::test]
-    async fn the_host_refuses_out_of_turn_frames_and_foreign_credentials() {
+    async fn the_host_refuses_out_of_turn_frames() {
         let caller = caller_id().node_id();
         let r = refusal(&[Frame::Invoke(invoke(&[]))], caller).await;
         assert!(r.contains("not a hello"), "{r}");
         let r = refusal(&[Frame::Hello(hello()), Frame::Exit(0)], caller).await;
         assert_eq!(r, DENY_INVOKE_REQUIRED);
-        // Someone else's membership, presented by this caller.
-        let r = refusal(
-            &[Frame::Hello(hello()), Frame::Invoke(invoke(&[]))],
-            NodeIdentity::from_seed([9u8; 32]).node_id(),
+    }
+
+    /// Whatever keeps a peer out — someone else's credential, a credential
+    /// from another fabric, or a genuine one the state doesn't list — it
+    /// hears the one fixed sentence: no reason, no state version.
+    #[tokio::test]
+    async fn a_non_member_hears_only_the_fixed_refusal() {
+        let open = [Frame::Hello(hello()), Frame::Invoke(invoke(&[]))];
+        let theirs = refusal(&open, NodeIdentity::from_seed([9u8; 32]).node_id()).await;
+        let other_root = NodeIdentity::from_seed([8u8; 32]);
+        let (id, _) = stranger(7);
+        let foreign = Hello {
+            membership: Membership::mint(&other_root, id, 0, i64::MAX).unwrap(),
+            ..hello()
+        };
+        let foreign = refusal(&[Frame::Hello(foreign), Frame::Invoke(invoke(&[]))], id).await;
+        let (id, genuine) = stranger(7);
+        let unlisted = refusal(&[Frame::Hello(genuine), Frame::Invoke(invoke(&[]))], id).await;
+        for r in [theirs, foreign, unlisted] {
+            assert_eq!(r, crate::host::gate::NOT_ADMITTED);
+        }
+    }
+
+    /// A non-member's ID token is never looked at: no verification, so no
+    /// JWKS fetch and no identity-index entry. (A member's is.)
+    #[tokio::test]
+    async fn a_non_member_never_has_its_token_verified() {
+        let host = host_running(&["true"]);
+        let token =
+            library::IdToken::new("eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIn0.");
+        let (id, mut hello_s) = stranger(7);
+        hello_s.id_token = Some(token.clone());
+        let r = refusal_by(
+            &host,
+            encoded(&[Frame::Hello(hello_s), Frame::Invoke(invoke(&[]))]),
+            id,
         )
         .await;
-        assert!(r.contains("membership rejected"), "{r}");
+        assert_eq!(r, crate::host::gate::NOT_ADMITTED);
+        assert!(
+            host.identities.nodes().is_empty(),
+            "a stranger's token was verified"
+        );
+        // The member's token is verified (and fails: its issuer isn't trusted).
+        let member = Hello {
+            id_token: Some(token),
+            ..hello()
+        };
+        let (send, _answer) = tokio::io::duplex(64 * 1024);
+        let bytes = encoded(&[Frame::Hello(member), Frame::Invoke(invoke(&[]))]);
+        let caller = caller_id().node_id();
+        let _ =
+            serve_services_session(send, std::io::Cursor::new(bytes), caller, &host, never()).await;
+        assert_eq!(host.identities.nodes(), [caller]);
+    }
+
+    /// The card's flood: a thousand connections from keys that aren't
+    /// members — junk, silence, out-of-turn frames, someone else's
+    /// credential, a genuine but unlisted one — write nothing to the call
+    /// log. A member's refusal is still logged.
+    #[tokio::test]
+    async fn strangers_leave_nothing_in_the_log_and_members_do() {
+        let (sink, mut records) = AuditSink::channel(2048);
+        let host = host_logging(&["true"], sink);
+        for n in 0..1000u32 {
+            let key = NodeIdentity::from_seed({
+                let mut s = [0x55u8; 32];
+                s[..4].copy_from_slice(&n.to_be_bytes());
+                s
+            });
+            let genuine = Hello {
+                membership: Membership::mint(&root(), key.node_id(), 0, i64::MAX).unwrap(),
+                ..hello()
+            };
+            let bytes = match n % 5 {
+                0 => vec![0xde, 0xad, 0xbe, 0xef, 1, 2, 3],
+                1 => Vec::new(),
+                2 => encoded(&[Frame::Invoke(invoke(&[]))]),
+                3 => encoded(&[Frame::Hello(hello()), Frame::Invoke(invoke(&[]))]),
+                _ => encoded(&[Frame::Hello(genuine), Frame::Invoke(invoke(&[]))]),
+            };
+            let (send, _answer) = tokio::io::duplex(64 * 1024);
+            let r = serve_services_session(
+                send,
+                std::io::Cursor::new(bytes),
+                key.node_id(),
+                &host,
+                never(),
+            )
+            .await;
+            assert!(r.is_err());
+        }
+        assert!(
+            records.try_recv().is_err(),
+            "a stranger's refusal reached the call log"
+        );
+        let unknown = Invocation {
+            tool: ToolName::new("nope").unwrap(),
+            argv: Argv::default(),
+        };
+        let r = refusal_by(
+            &host,
+            encoded(&[Frame::Hello(hello()), Frame::Invoke(unknown)]),
+            caller_id().node_id(),
+        )
+        .await;
+        match records.recv().await {
+            Some(library::AuditRecord::Denied { caller, reason, .. }) => {
+                assert_eq!(caller, caller_id().node_id());
+                assert_eq!(reason, r);
+            }
+            other => panic!("expected the member's refusal, got {other:?}"),
+        }
+    }
+
+    /// The card's acceptance: a call whose `Started` can't be logged is
+    /// refused, and its command never runs.
+    #[tokio::test]
+    async fn a_call_whose_start_cannot_be_logged_never_runs() {
+        let dir = crate::testutil::temp_dir();
+        let marker = dir.join("ran");
+        let (sink, mut queue) = AuditSink::log_queue(4);
+        tokio::spawn(async move {
+            while let Some(p) = queue.recv().await {
+                p.answer(Err("disk full".into()));
+            }
+        });
+        let touch = format!("touch {}", marker.display());
+        let host = host_logging(&["sh", "-c", &touch], sink);
+        let r = refusal_by(
+            &host,
+            encoded(&[Frame::Hello(hello()), Frame::Invoke(invoke(&[]))]),
+            caller_id().node_id(),
+        )
+        .await;
+        assert_eq!(r, DENY_LOG_UNAVAILABLE);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!marker.exists(), "the command ran without a logged start");
+    }
+
+    /// A logged call: `Started` then `Finished`, and the child ran after
+    /// `Started` was in the log.
+    #[tokio::test]
+    async fn a_call_is_logged_started_then_finished() {
+        let (sink, mut records) = AuditSink::channel(8);
+        let host = host_logging(&["printf", "ok"], sink);
+        let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
+        let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
+        let caller = caller_id().node_id();
+        let srv = tokio::spawn(async move {
+            serve_services_session(s2c_w, c2s_r, caller, &host, never()).await
+        });
+        let mut out = Vec::new();
+        let dialed = dial_opened(
+            c2s_w,
+            s2c_r,
+            hello(),
+            invoke(&[]),
+            None,
+            std::io::Cursor::new(Vec::new()),
+            &mut out,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        srv.await.unwrap().unwrap();
+        assert_eq!((dialed.exit, out.as_slice()), (0, &b"ok"[..]));
+        let Some(library::AuditRecord::Started { call, .. }) = records.recv().await else {
+            panic!("expected Started first");
+        };
+        let Some(library::AuditRecord::Finished {
+            call: done, exit, ..
+        }) = records.recv().await
+        else {
+            panic!("expected Finished second");
+        };
+        assert_eq!((done, exit), (call, 0));
+    }
+
+    /// A `Hello` whose prefix claims 16 MiB is refused at the prefix: the
+    /// host neither waits for nor allocates the body. So is an oversized
+    /// `Invoke`.
+    #[tokio::test]
+    async fn oversized_opening_frames_are_refused_at_the_prefix() {
+        for (prefix, before) in [
+            (16u32 * 1024 * 1024, Vec::new()),
+            (
+                (MAX_INVOKE_FRAME + 1) as u32,
+                Frame::Hello(hello()).encode().unwrap(),
+            ),
+        ] {
+            let host = host_running(&["true"]);
+            let (mut to_host, from_caller) = tokio::io::duplex(64 * 1024);
+            let (send, mut answer) = tokio::io::duplex(64 * 1024);
+            to_host.write_all(&before).await.unwrap();
+            to_host.write_all(&prefix.to_be_bytes()).await.unwrap();
+            to_host.write_all(&[8u8; 16]).await.unwrap();
+            // `to_host` stays open: a host that waited for the body would hang.
+            let caller = caller_id().node_id();
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                serve_services_session(send, from_caller, caller, &host, never()),
+            )
+            .await
+            .expect("the host waited for an oversized body");
+            assert!(r.is_err());
+            let Some(Frame::Denied { .. }) = read_frame(&mut answer).await.unwrap() else {
+                panic!("expected a denial");
+            };
+            drop(to_host);
+        }
+        let mut cur = std::io::Cursor::new([0u8, 1, 0, 1].to_vec());
+        let e = read_frame_within(&mut cur, MAX_HELLO_FRAME)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("too large"), "{e}");
+    }
+
+    /// A body shorter than its prefix claims is an error, not a zero-filled
+    /// frame.
+    #[tokio::test]
+    async fn a_short_body_is_truncated() {
+        let mut bytes = Frame::Exit(1).encode().unwrap();
+        bytes.pop();
+        let e = read_frame(&mut std::io::Cursor::new(bytes))
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("truncated"), "{e}");
+    }
+
+    /// At most `MAX_PREAUTH_SESSIONS` sessions wait for a decision; a
+    /// finished one makes room.
+    #[test]
+    fn pre_auth_sessions_are_capped() {
+        let protocol = ServicesProtocol::new(host_running(&["true"]));
+        let held: Vec<_> = (0..MAX_PREAUTH_SESSIONS)
+            .map(|_| protocol.enter().expect("room"))
+            .collect();
+        assert!(protocol.enter().is_none());
+        drop(held);
+        assert!(protocol.enter().is_some());
+    }
+
+    /// The refusal trace: the first event reports, the rest within
+    /// `EVERY_MS` are only counted, and the next report says how many.
+    #[test]
+    fn the_throttle_reports_at_most_once_per_interval() {
+        let t = Throttle::new();
+        assert_eq!(t.tick(1_000), Some(1));
+        for _ in 0..99 {
+            assert_eq!(t.tick(1_001), None);
+        }
+        assert_eq!(t.tick(1_000 + Throttle::EVERY_MS), Some(100));
     }
 
     proptest::proptest! {

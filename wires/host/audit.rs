@@ -5,17 +5,32 @@
 //!
 //! # Where the records come from
 //!
-//! [`CallAudit`] is the per-call handle the session holds: `start` emits
-//! [`Started`](AuditRecord::Started) once the child is spawned, the [`Tap`]s
-//! it hands out count (and, for stdout, BLAKE3-hash) what the child writes,
-//! the [`StdinTap`] hashes, counts and quotes the head of what the caller
-//! sent on stdin, and `finish` emits [`Finished`](AuditRecord::Finished). A
-//! refusal emits a lone [`Denied`](AuditRecord::Denied) via [`denied`]
-//! carrying the exact reason the caller was sent. The caller is always the
-//! iroh-authenticated peer, never a handshake claim.
+//! [`CallAudit`] is the per-call handle the session holds: `start` logs
+//! [`Started`](AuditRecord::Started) **before** the child is spawned, the
+//! [`Tap`]s it hands out count (and, for stdout, BLAKE3-hash) what the child
+//! writes, the [`StdinTap`] hashes, counts and quotes the head of what the
+//! caller sent on stdin, and `finish` logs [`Finished`](AuditRecord::Finished)
+//! before the caller hears the exit code. A member's refusal logs a lone
+//! [`Denied`](AuditRecord::Denied) via [`denied`] carrying the exact reason
+//! the caller was sent. The caller is always the iroh-authenticated peer,
+//! never a handshake claim. A peer that is not a member is traced, never
+//! logged (see [`transport`]).
 //!
-//! Recording is best-effort by design: a full or closed sink is logged at
-//! `warn` and the call proceeds.
+//! # When the log can't take a record
+//!
+//! Every record is awaited until it is written and `fsync`ed
+//! ([`AuditSink::append`]); none is dropped to keep a session moving.
+//!
+//! - **`Started` fails:** the call is refused
+//!   ([`DENY_LOG_UNAVAILABLE`](transport::DENY_LOG_UNAVAILABLE)) and its
+//!   child never runs. A call that can't be logged doesn't run.
+//! - **`Finished`, `Denied` or a push record fails:** what it records has
+//!   already happened, so it is traced at `error` and the session goes on.
+//!   The host does not keep a separate "log is broken" switch: every later
+//!   call must log its own `Started` first, so while the log stays
+//!   unwritable the host runs nothing, and it serves again as soon as the
+//!   log takes an entry. A `Started` with no `Finished` in the log therefore
+//!   means the call's end was not recorded, not that it never ran.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -25,10 +40,11 @@ use std::time::Instant;
 use library::{Argv, AuditRecord, CallId, NodeId, OutputHasher, Principal, StdinCapture, ToolName};
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::host::transport::{self, AuditSink};
+use crate::host::transport::{self, AuditSink, LogUnavailable};
 
-/// How many records may queue between the sessions and the tail loop before
-/// the sink starts dropping (and logging) them.
+/// How many records may wait for the log's writer. A session beyond that
+/// waits its turn (within [`LOG_WAIT`](transport::LOG_WAIT)); nothing is
+/// dropped.
 pub const AUDIT_QUEUE: usize = 256;
 
 /// Unix milliseconds now (the `at_ms` of a record).
@@ -40,19 +56,28 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Record a refusal of `caller` (asking for `tool`, if it named one) with the
-/// reason it was sent. A no-op when the responder has no audit sink.
+/// Log a refusal of `caller` — a member; see the module docs — (asking for
+/// `tool`, if it named one) with the reason it was sent. A no-op when the
+/// responder has no audit sink. A log that can't take it is traced at
+/// `error`: the refusal stands either way.
 ///
 /// The reason is cut exactly as [`transport`] cuts the one it sends, so the
 /// record and the caller's `Denied` frame say the same thing.
-pub fn denied(sink: Option<&AuditSink>, caller: NodeId, tool: Option<ToolName>, reason: &str) {
-    if let Some(sink) = sink {
-        sink.record(AuditRecord::Denied {
-            caller,
-            tool,
-            reason: transport::truncate_reason(reason.to_string()),
-            at_ms: now_ms(),
-        });
+pub async fn denied(
+    sink: Option<&AuditSink>,
+    caller: NodeId,
+    tool: Option<ToolName>,
+    reason: &str,
+) {
+    let Some(sink) = sink else { return };
+    let record = AuditRecord::Denied {
+        caller,
+        tool,
+        reason: transport::truncate_reason(reason.to_string()),
+        at_ms: now_ms(),
+    };
+    if let Err(e) = sink.append(record).await {
+        tracing::error!(caller = %caller.hex(), "a refusal was not logged: {e}");
     }
 }
 
@@ -77,23 +102,22 @@ pub struct CallAudit {
 }
 
 impl CallAudit {
-    /// Emit [`Started`](AuditRecord::Started) for a call `caller` was admitted
-    /// to (under `roster_version`, if a head is enforced) and return the
-    /// handle that will emit its `Finished`. `None` — and nothing emitted —
-    /// when the responder has no audit sink.
+    /// Log [`Started`](AuditRecord::Started) for a call `caller` was
+    /// admitted to (under `roster_version`, the state version) and return
+    /// the handle that will log its `Finished`. `Ok(None)` — and nothing
+    /// logged — when the responder has no audit sink.
     ///
-    /// `principal` is the caller's fresh verified IdP identity, when the
-    /// responder's identity index holds one (see [`crate::host::identity`]) — so
-    /// the record names the person, not only the key.
+    /// Waits until the entry is durably written. `Err` means it wasn't, and
+    /// the call must not run (see the module docs).
     ///
-    /// `role` is the `host.json` role the host's policy admitted the caller
-    /// under (see [`crate::host::policy`]).
+    /// `principal` is the caller's verified IdP identity, when it presented
+    /// one, so the record names the person, not only the key. `role` is the
+    /// registry role that admitted the caller.
     ///
     /// `args` are the call's arguments as the record should show them; an
-    /// argument list too large for an [`Argv`] is logged and recorded empty
-    /// rather than failing a call that is already running.
+    /// argument list too large for an [`Argv`] is logged and recorded empty.
     #[allow(clippy::too_many_arguments)]
-    pub fn start(
+    pub async fn start(
         sink: Option<&AuditSink>,
         caller: NodeId,
         principal: Option<Principal>,
@@ -101,14 +125,16 @@ impl CallAudit {
         args: &[String],
         roster_version: Option<u64>,
         role: Option<String>,
-    ) -> Option<Self> {
-        let sink = sink?.clone();
+    ) -> Result<Option<Self>, LogUnavailable> {
+        let Some(sink) = sink.cloned() else {
+            return Ok(None);
+        };
         let argv = Argv::new(args.to_vec()).unwrap_or_else(|e| {
             tracing::warn!("audit: recording an empty argv ({e})");
             Argv::default()
         });
         let call = CallId::generate();
-        sink.record(AuditRecord::Started {
+        sink.append(AuditRecord::Started {
             call,
             caller,
             principal,
@@ -117,15 +143,16 @@ impl CallAudit {
             roster_version,
             role,
             at_ms: now_ms(),
-        });
-        Some(Self {
+        })
+        .await?;
+        Ok(Some(Self {
             sink,
             call,
             spawned: Instant::now(),
             stdout: Tally::default(),
             stderr: Tally::default(),
             stdin: Arc::default(),
-        })
+        }))
     }
 
     /// The call's id (what its `Started` and `Finished` records carry).
@@ -133,9 +160,11 @@ impl CallAudit {
         self.call
     }
 
-    /// Emit [`Finished`](AuditRecord::Finished) with the child's exit code and
-    /// what the taps counted.
-    pub fn finish(self, exit: i32) {
+    /// Log [`Finished`](AuditRecord::Finished) with the child's exit code
+    /// and what the taps counted, waiting until it is written. The call has
+    /// already run, so a log that can't take it is traced at `error` (see
+    /// the module docs).
+    pub async fn finish(self, exit: i32) {
         let (stdout_bytes, stdout_digest) = {
             let h = self.stdout.lock().expect("stdout tally poisoned");
             (h.bytes(), h.finish())
@@ -145,7 +174,7 @@ impl CallAudit {
             let c = self.stdin.lock().expect("stdin capture poisoned");
             (c.bytes(), c.digest(), c.head())
         };
-        self.sink.record(AuditRecord::Finished {
+        let record = AuditRecord::Finished {
             call: self.call,
             exit,
             duration_ms: self.spawned.elapsed().as_millis() as u64,
@@ -155,7 +184,14 @@ impl CallAudit {
             stdin_bytes,
             stdin_digest,
             stdin_head,
-        });
+        };
+        if let Err(e) = self.sink.append(record).await {
+            tracing::error!(
+                call = %self.call.hex(),
+                exit,
+                "a call ran but its end was not logged: {e}"
+            );
+        }
     }
 }
 
@@ -253,17 +289,18 @@ mod tests {
         ToolName::new("db_query").unwrap()
     }
 
-    #[test]
-    fn no_sink_means_no_records_and_no_handle() {
-        assert!(CallAudit::start(None, caller(), None, db_query(), &[], None, None).is_none());
-        denied(None, caller(), None, "whatever"); // must not panic
+    #[tokio::test]
+    async fn no_sink_means_no_records_and_no_handle() {
+        let started = CallAudit::start(None, caller(), None, db_query(), &[], None, None).await;
+        assert!(started.unwrap().is_none());
+        denied(None, caller(), None, "whatever").await; // must not panic
     }
 
-    #[test]
-    fn denied_records_the_reason_the_caller_gets() {
+    #[tokio::test]
+    async fn denied_records_the_reason_the_caller_gets() {
         let (sink, mut rx) = AuditSink::channel(4);
         let long = "x".repeat(10_000);
-        denied(Some(&sink), caller(), None, &long);
+        denied(Some(&sink), caller(), None, &long).await;
         let Ok(AuditRecord::Denied {
             reason, caller: c, ..
         }) = rx.try_recv()
@@ -286,6 +323,8 @@ mod tests {
             Some(7),
             Some("analyst".into()),
         )
+        .await
+        .unwrap()
         .unwrap();
         let mut out = tap_stdout(Some(&audit), &b"hello world"[..]);
         let mut err = tap_stderr(Some(&audit), &b"warn"[..]);
@@ -295,7 +334,7 @@ mod tests {
         let mut sink_buf = Vec::new();
         out.read_to_end(&mut sink_buf).await.unwrap();
         err.read_to_end(&mut sink_buf).await.unwrap();
-        audit.finish(3);
+        audit.finish(3).await;
 
         let Ok(AuditRecord::Started {
             call: started,
@@ -342,6 +381,55 @@ mod tests {
         let mut expect = OutputHasher::new();
         expect.update(b"hello world");
         assert_eq!(stdout_digest, expect.finish());
+    }
+
+    /// A log that can't take `Started` refuses the call's start: no handle,
+    /// so no child.
+    #[tokio::test]
+    async fn a_start_the_log_refuses_is_an_error() {
+        let (sink, mut queue) = AuditSink::log_queue(4);
+        tokio::spawn(async move {
+            while let Some(p) = queue.recv().await {
+                p.answer(Err("disk full".into()));
+            }
+        });
+        let e = CallAudit::start(Some(&sink), caller(), None, db_query(), &[], None, None)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("disk full"), "{e}");
+    }
+
+    /// A log that never answers is unavailable after `LOG_WAIT`, not a
+    /// session stuck forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_log_that_never_answers_times_out() {
+        let (sink, _queue) = AuditSink::log_queue(4);
+        let e = CallAudit::start(Some(&sink), caller(), None, db_query(), &[], None, None)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("no answer"), "{e}");
+    }
+
+    /// A full queue is waited on, never skipped: every record of a burst far
+    /// larger than the queue arrives.
+    #[tokio::test]
+    async fn a_full_queue_waits_and_drops_nothing() {
+        let (sink, mut rx) = AuditSink::channel(2);
+        let burst = tokio::spawn(async move {
+            for n in 0..50 {
+                denied(Some(&sink), caller(), None, &format!("no {n}")).await;
+            }
+        });
+        let mut reasons = Vec::new();
+        while reasons.len() < 50 {
+            match rx.recv().await {
+                Some(AuditRecord::Denied { reason, .. }) => reasons.push(reason),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        burst.await.unwrap();
+        let want: Vec<String> = (0..50).map(|n| format!("no {n}")).collect();
+        assert_eq!(reasons, want);
     }
 
     #[test]

@@ -110,6 +110,17 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
     r: &mut R,
     within: Duration,
 ) -> Result<Option<InboxFrame>> {
+    read_frame_within(r, within, library::MAX_INBOX_FRAME).await
+}
+
+/// [`read_frame`], refusing a frame whose length prefix is over `max` (use
+/// [`MAX_INBOX_HELLO`](library::MAX_INBOX_HELLO) before the peer is known).
+/// Nothing is sized from the prefix: the buffer grows as bytes arrive.
+pub(crate) async fn read_frame_within<R: AsyncRead + Unpin>(
+    r: &mut R,
+    within: Duration,
+    max: usize,
+) -> Result<Option<InboxFrame>> {
     let read = async {
         let mut prefix = [0u8; 4];
         match r.read_exact(&mut prefix).await {
@@ -118,9 +129,14 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
             Err(e) => return Err(e).context("reading an inbox frame"),
         }
         let len = InboxFrame::length(&prefix)?.unwrap_or(0);
-        let mut buf = prefix.to_vec();
-        buf.resize(4 + len, 0);
-        r.read_exact(&mut buf[4..])
+        if len > max {
+            bail!("inbox frame too large: {len} bytes (max {max})");
+        }
+        let mut buf = Vec::with_capacity(4 + len.min(library::MAX_INBOX_HELLO));
+        buf.extend_from_slice(&prefix);
+        (&mut *r)
+            .take(len as u64)
+            .read_to_end(&mut buf)
             .await
             .context("reading an inbox frame body")?;
         match InboxFrame::decode(&buf)? {
@@ -512,13 +528,14 @@ impl InboxReceiver {
         S: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
     {
-        let membership = match read_frame(&mut recv, FRAME_TIMEOUT).await? {
-            Some(InboxFrame::Hello { membership, .. }) => membership,
-            _ => {
-                deny(&mut send, "expected hello").await;
-                bail!("a peer spoke out of turn");
-            }
-        };
+        let membership =
+            match read_frame_within(&mut recv, FRAME_TIMEOUT, library::MAX_INBOX_HELLO).await? {
+                Some(InboxFrame::Hello { membership, .. }) => membership,
+                _ => {
+                    deny(&mut send, "expected hello").await;
+                    bail!("a peer spoke out of turn");
+                }
+            };
         if let Err(reason) = self.admit(peer, &membership, crate::now_unix()) {
             tracing::warn!(peer = %peer.hex(), "refusing a push: {reason}");
             deny(&mut send, &reason).await;

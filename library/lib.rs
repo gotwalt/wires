@@ -164,8 +164,8 @@ pub use invoke::{Argv, Invocation, MAX_ARGS, MAX_ARGV_BYTES, MAX_TOOL_NAME, Tool
 pub use membership::{MEMBERSHIP_V1, Membership};
 pub use policy::check_inclusion;
 pub use push::{
-    INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_FRAME, MAX_PUSH_BODY, MAX_SUBJECT, PushBody,
-    PushId, PushMessage, Subject,
+    INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_FRAME, MAX_INBOX_HELLO, MAX_PUSH_BODY,
+    MAX_SUBJECT, PushBody, PushId, PushMessage, Subject,
 };
 pub use registry::{Service, ServiceName};
 pub use role::{EmailPattern, MAX_ROLE_NAME, Matcher, RoleName};

@@ -200,7 +200,7 @@ pub(crate) fn services_router(
         )
         .accept(
             transport::ALPN,
-            transport::ServicesProtocol(Arc::clone(&host)),
+            transport::ServicesProtocol::new(Arc::clone(&host)),
         )
         .accept(
             super::record_stream::ALPN,

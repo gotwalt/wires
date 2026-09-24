@@ -96,6 +96,12 @@ pub const MAX_BATCH: usize = 32;
 /// before the peer is authorized.
 pub const MAX_INBOX_FRAME: usize = 4 * 1024 * 1024;
 
+/// Largest [`InboxFrame::Hello`] or [`InboxFrame::Fetch`] a peer reads
+/// before it knows who is asking: a membership and an ID token fit in a few
+/// KiB, so a peer that isn't admitted can't make it buffer the
+/// [`MAX_INBOX_FRAME`] a delivery may need.
+pub const MAX_INBOX_HELLO: usize = 64 * 1024;
+
 /// A push message's id: 16 random bytes, hex on the wire. What a receiver
 /// de-duplicates by.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]

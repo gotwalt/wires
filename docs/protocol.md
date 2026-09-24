@@ -148,31 +148,43 @@ A session is one bidirectional QUIC stream on ALPN `wires/session/3`. Codec:
 
 Tags 0 and 5 (the channel-era `Handshake`/`HandshakeAck`) are retired and decode as `BadFrame`.
 
-**The host** reads `Hello` (10 s timeout) and `Invoke`, then re-reads its signed state **for this
-connection**, so a removal applies on the next dial without a restart. The first failure below is
-sent as `Denied` and logged as an `AuditRecord::Denied` (`wires/host/gate.rs`):
+**The host** reads `Hello` (10 s timeout, at most 64 KiB) and `Invoke` (at most 512 KiB: the
+largest valid `Argv`, JSON-escaped), then re-reads its signed state **for this connection**, so a
+removal applies on the next dial without a restart. Before it knows who is asking it holds at most 64
+sessions open (one more is closed unanswered), and it sizes no buffer from a length prefix. The first
+failure below is sent as `Denied` (`wires/host/gate.rs`):
 
 1. The host holds a readable state (else `responder configuration error`).
-2. `check_inclusion(hello.membership, trust_root, caller, now)`: `membership rejected: …`.
+2. **Membership, before anything else:** `check_inclusion(hello.membership, trust_root, caller,
+   now)` and the state lists `caller`. Anyone else — no credential, someone else's, another fabric's,
+   expired, removed — hears only `not admitted to this fabric`: no reason, no state version. Their
+   token is never verified (no JWKS fetch, no identity-index entry), and the refusal is traced
+   (throttled), **not** written to the call log, so strangers can't fill it.
 3. **Identity.** The `id_token`, if any, is verified by the host itself (§6); the principal, or why
-   there is none, is kept for the next steps.
-4. **The gate** (`admit`): the state is fresh → the caller is a member (`not a member of the
-   current signed state (version N)`) → the service is registered → it is assigned to **this** host
-   → `authorize` (the registry's `allow`) → every role in `host.json`'s `also_require` for it admits
-   the caller too (it can only narrow). A refusal that a verified identity could change leads with
-   why there is none (`no ID token presented; run \`wires login\``).
+   there is none, is kept for the next steps. A token that fails is `your ID token could not be
+   verified` or `the identity provider is unreachable from this host`; the detail is only in the
+   host's trace.
+4. **The gate** (`admit`): the state is fresh → the service is registered → it is assigned to
+   **this** host → `authorize` (the registry's `allow`) → every role in `host.json`'s `also_require`
+   for it admits the caller too (it can only narrow; the refusal doesn't name those host-local roles).
+   A refusal that a verified identity could change leads with why there is none (`no ID token
+   presented; run \`wires login\``).
 5. **Implementation.** Only an admitted caller learns whether `host.json` implements the service
    (`service … is not implemented on this host`).
 
-The host then sends `HelloAck` (with `newer_state` when the caller's `state_version` is older) and
-execs the service's fixed argv **with the caller's argv appended element by element, never through
-a shell**, in its `cwd`. The child's environment is built from nothing (`env_clear`): only `PATH`,
-`LANG` and `LC_*` are inherited from `serve`; then `host.json`'s `env`; then the server-derived
-`WIRES_CALLER_NODE`, `WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_AFTER`, `WIRES_STATE_VERSION`,
-`WIRES_SERVICE`, `WIRES_TOOL`, `WIRES_ROLE`, and, when verified, `WIRES_CALLER_EMAIL`. With `push`
-on, also `WIRES_PUSH_SOCKET` and `WIRES_PUSH_TOKEN`, the call's push capability (§7). The child
-never gets `WIRES_HOME`, `HOME`, agent sockets or cloud credentials. If the connection closes, the
-host kills the child.
+Every refusal from step 3 on (the caller is a member) is logged as an `AuditRecord::Denied`.
+
+The host then appends the call's `Started` to its call log and `fsync`s it (§8) — if it can't, the
+call is refused (`this host can't record calls right now…`) and nothing runs — sends `HelloAck`
+(with `newer_state` when the caller's `state_version` is older) and execs the service's fixed argv
+**with the caller's argv appended element by element, never through a shell**, in its `cwd`. The
+child's environment is built from nothing (`env_clear`): only `PATH`, `LANG` and `LC_*` are
+inherited from `serve`; then `host.json`'s `env`; then the server-derived `WIRES_CALLER_NODE`,
+`WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_AFTER`, `WIRES_STATE_VERSION`, `WIRES_SERVICE`,
+`WIRES_TOOL`, `WIRES_ROLE`, and, when verified, `WIRES_CALLER_EMAIL`. With `push` on, also
+`WIRES_PUSH_SOCKET` and `WIRES_PUSH_TOKEN`, the call's push capability (§7), already bound to the
+call's id before the child starts. The child never gets `WIRES_HOME`, `HOME`, agent sockets or
+cloud credentials. If the connection closes, the host kills the child.
 
 The child still runs as `serve`'s own Unix user, so a service a caller can steer into reading or
 writing files can reach whatever that user can, the host's keystore included. **Run services as a
@@ -189,7 +201,8 @@ when a dial fails** (10 s each); a host that answered has decided. It sends `Hel
 then **always** verifies the `HelloAck` membership with `check_inclusion(ack, own fabric,
 authenticated host id, now)` before it forwards a byte of stdin. `Denied` → exit 77, nothing on
 stdout; local or transport failure → 1; otherwise the remote exit code. A session that ends without
-`Exit` is an error. Limits: 16 MiB largest frame; `Argv` holds at most 256 arguments and 64 KiB.
+`Exit` is an error. Limits: 16 MiB largest frame once admitted (64 KiB `Hello` and 512 KiB `Invoke`
+before); `Argv` holds at most 256 arguments and 64 KiB.
 
 A `tools.json` alias pins a local name to one host (node id, optional addresses and relay) and a
 `remote_tool` service name; it opens the same `Hello`, so the host still decides by its state.
@@ -208,16 +221,18 @@ value is accepted; `exp` and `iat` are within the 60 s clock skew; `nonce == for
 `email` is used only when `email_verified` is true; `hd` becomes `org` only when `iss` is exactly
 `https://accounts.google.com`; `groups` is kept. A host
 remembers the latest verified principal per node (`wires/host/identity.rs`) and never lets a failure
-or an older token displace it. It knows only the callers that presented a token **to it**. A host
-keeps issuer key sets **in memory only** and never reads the `jwks/` disk cache, which anything
-running as its user could write; callers keep that cache, and trust a disk entry for at most 24 h.
+or an older token displace it. It knows only the callers that presented a token **to it**, and it
+verifies a token only from a member of its state (§5 step 2). A host keeps issuer key sets **in
+memory only** and never reads the `jwks/` disk cache, which anything running as its user could
+write; callers keep that cache, and trust a disk entry for at most 24 h.
 
 ## 7. Push: `wires/inbox/2`
 
 A host sends a `PushMessage { id, from, to, subject (≤128 B), body (≤16 KiB), at_ms, expires_ms }`
 to a caller, addressed **by key**. Frames are length-prefixed canonical JSON tagged by `type`:
 `hello {membership, id_token?}`, `fetch {wait_ms}`, `deliver {messages ≤ 32}`, `ack {ids}` and
-`denied {reason}`, at most 4 MiB. Two ways a message is delivered:
+`denied {reason}`, at most 4 MiB; a `hello` (and a host's `fetch`) is read before the peer is known,
+so it may be at most 64 KiB. Two ways a message is delivered:
 
 - **Direct:** the host dials the recipient (3 s budget). A running `wires inbox --wait` serves the
   inbox ALPN and accepts `deliver` only from a member its signed state names as a **host**.
@@ -229,8 +244,11 @@ must be a member of the current state, in the first registry role of `host.json`
 admits it (default: nobody). **The identity rule:** every role needs the recipient's verified
 principal, which the host learns only when the recipient presents its token to it: on a call, or in
 an inbox fetch. `--to <role>` names the members whose known principal the role admits; a member
-with no verified identity here is in no role. A removed member's queue is dropped (logged
-`denied`) and its fetch refused.
+with no verified identity here is in no role. A fetch is checked like a call: at most 64 undecided
+at once, membership first, and a non-member hears only `not admitted to this fabric`, has its token
+left unverified, and is traced, not logged; a removed member's queue is dropped (each message logged
+`denied`) and its fetch refused. A member holds at most 2 long polls open per host; a member's
+policy refusal is answered, not logged (`wires inbox` asks every host of its services).
 
 A receiver refuses a message whose `from` is not the authenticated peer or whose `to` is not itself.
 Delivery is at least once; the receiver removes duplicates by `PushId`. The host queues up to 64
@@ -265,6 +283,15 @@ signature, a gap, a broken link or a fork. The log is `call-log.jsonl` (fsync pe
 on open, pruned from the front after 30 days, and optionally exported over OTLP/HTTP
 (`audit.otlp`). A host can still withhold or truncate its own history; rewrites are detectable only
 against a copy someone holds.
+
+**Fail closed.** Every record is awaited until it is written and fsynced (at most 5 s), never dropped
+to keep a session moving. A call's `started` is logged **before** its child is spawned; if it can't
+be, the call is refused and doesn't run. `finished`, a member's `denied` and push records describe
+something that already happened, so a failure is traced as an error and the session goes on; while
+the log stays unwritable every new call fails its own `started` and is refused, and the host serves
+again once an append succeeds (a failed append is cut off the file first). A `started` without a
+`finished` means the end wasn't recorded, not that the call never ran. Refusals of peers that are not
+members of the state are traced, not logged (§5), so no one outside the fabric can write to it.
 
 **The record stream** (`wires/records/1`, `wires/host/record_stream.rs`): length-prefixed JSON
 frames. The reader sends `open {hello, services, since?, mine, follow}`. The host answers `denied`
