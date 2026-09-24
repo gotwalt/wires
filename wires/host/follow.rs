@@ -21,7 +21,9 @@
 //! (the directory stopped, went silent for two beats, or is no longer
 //! listed) it reconnects, trying the directory it last followed first and
 //! then the others in the head's order, backing off from 1 s to the beat
-//! (at most 30 s) while none answers. The list is re-read from the held
+//! (at most 30 s) while none answers. A directory whose whole policy can't
+//! be taken either (expired, say) is passed over: the next round, after a
+//! pause, starts at the directory after it. The list is re-read from the held
 //! policy each time, so a directory the admin adds is followed without a
 //! restart.
 //!
@@ -149,6 +151,7 @@ impl Follower {
             if let Some(i) = last.and_then(|l| dirs.iter().position(|d| *d == l)) {
                 dirs.rotate_left(i);
             }
+            let order = dirs.clone();
             let mut answered = false;
             for dir in dirs {
                 let have = if whole {
@@ -167,9 +170,15 @@ impl Follower {
                             directory = %dir.hex(),
                             "policy subscription: {e:#}; asking for the whole policy"
                         );
-                        // Twice in a row from the whole policy: try the next
-                        // directory, after a pause.
-                        answered = !whole;
+                        if whole {
+                            // Twice in a row, the second from the whole
+                            // policy: this directory serves one this host
+                            // can't take. Start the next round at the next
+                            // directory, after a pause.
+                            last = next_after(&order, dir);
+                            break;
+                        }
+                        answered = true;
                         whole = true;
                     }
                     Err(e) => {
@@ -347,6 +356,13 @@ impl Follower {
         self.freshness.offer(fresh, &held.signed.head)?;
         Ok(())
     }
+}
+
+/// The directory after `dir` in `order` (wrapping), where the next round
+/// starts once `dir` served a policy this host couldn't take.
+fn next_after(order: &[NodeId], dir: NodeId) -> Option<NodeId> {
+    let i = order.iter().position(|d| *d == dir)?;
+    order.get((i + 1) % order.len()).copied()
 }
 
 /// A host that is also a directory: keep every `Fresh` its own directory
