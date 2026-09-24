@@ -74,7 +74,7 @@ Open cards only; finished cards are in [done/](done/).
 | [36](done/36-directory.md) | D2 | 35 | done (on `aaron/directory`) | **The directory:** a mode on its own ALPNs, backed by redb; the root signs the policy, and each service entry; freshness timestamps; hosts subscribe to the policy's changes; retires state sync |
 | [36d](done/36d-no-merkle-policy.md) | D2 | 36b | done (on `aaron/directory`) | **No Merkle tree:** the root signs the policy (a hash of every item), and each service entry; hosts hold the whole policy and follow it by deltas |
 | [37](done/37-caller-views.md) | D3 | 36 | done (on `aaron/directory`) | **Caller views:** each caller holds only the services it may use; search; `HelloAck` carries the head version; `mcp`/gateway subscribe; invites under 1 KB carry the login settings |
-| [38](review/38-llm-help-text.md) | H | 37 | review | **Help text for LLMs:** the premise (a network for authenticated remote CLI calls) told once, in help and MCP instructions; terse, predictable `--help`, examples, next-step errors, `--help-all` for operator flags, snapshot tests, a small eval |
+| [38](done/38-llm-help-text.md) | H | 37 | done (on `aaron/directory`) | **Help text for LLMs:** the premise (a network for authenticated remote CLI calls) told once, in help and MCP instructions; terse, predictable `--help`, examples, next-step errors, `--help-all` for operator flags, snapshot tests, a small eval |
 | [29](backlog/29-person-identity.md) | I2 | 36 | backlog | **Person identity for headless agents:** `login --for`, day-passes issued by a directory |
 | [31](backlog/31-inbox-delivery.md) | P3 | 28, 30 | designed, parked | **Inbox delivery:** callbacks go to the caller that asked, through the call's push capability only; open questions on the card |
 | [32](backlog/32-service-sandbox-OPEN.md) | — | — | open question | **Don't build:** run each service call in a rootless microVM so a service can't reach the host's keys |
@@ -90,7 +90,7 @@ merges each into it, and the whole update lands on `main` as one PR. Stages: **3
 (36a = card 36's pure `library` types: head, items, `Fresh`, directory frames) →
 **36b** (the mode, redb, publish, retiring state sync) → **36d** (no Merkle tree: a signed hash of
 the items and signed service entries) → **36c** ∥ **37** →
-**[38](review/38-llm-help-text.md)** (help text an LLM can act on) → a docs and comments sweep
+**[38](done/38-llm-help-text.md)** (help text an LLM can act on) → a docs and comments sweep
 across the repo.
 
 ## Rules for workers
