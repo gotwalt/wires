@@ -8,6 +8,7 @@
 
 use ed25519_dalek::{Signer, SigningKey, Verifier};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 
@@ -107,6 +108,38 @@ impl Signature {
 /// Both fabric-root keys and node keys are `NodeIdentity` values — the role is
 /// a matter of how the key is used (signing memberships vs. authenticating a
 /// session), not of the type.
+///
+/// **The secret stays inside.** The key is a private field; it is scrubbed
+/// from memory when the identity drops (ed25519-dalek's `ZeroizeOnDrop`); and
+/// the type has no `Clone`, `Debug`, `Display` or `Serialize`, so no code
+/// copies, logs or encodes it by accident. A second owner is an explicit
+/// [`duplicate`](Self::duplicate), and the raw seed comes out only through the
+/// `expose_*` methods, as a [`Zeroizing`] copy that is scrubbed when dropped.
+/// That holds against safe Rust in this process. It does not hold against
+/// `unsafe` code, a foreign-language runtime in the same process, a debugger
+/// running as the same user, or a core dump: whatever runs in-process can
+/// read the key.
+///
+/// No `Clone`:
+///
+/// ```compile_fail,E0599
+/// let id = library::NodeIdentity::generate();
+/// let _copy = id.clone();
+/// ```
+///
+/// No `Debug` (so no `{:?}` in a log line or a panic message):
+///
+/// ```compile_fail,E0277
+/// let id = library::NodeIdentity::generate();
+/// let _text = format!("{id:?}");
+/// ```
+///
+/// No `Serialize`:
+///
+/// ```compile_fail,E0277
+/// let id = library::NodeIdentity::generate();
+/// let _json = serde_json::to_string(&id);
+/// ```
 pub struct NodeIdentity {
     signing_key: SigningKey,
 }
@@ -120,21 +153,31 @@ impl NodeIdentity {
     /// ```
     pub fn generate() -> Self {
         use rand::RngCore;
-        let mut seed = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut seed);
-        Self::from_seed(seed)
+        let mut seed = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(&mut *seed);
+        Self::from_secret(&seed)
     }
 
     /// Reconstruct an identity from its 32-byte Ed25519 seed.
+    ///
+    /// For fixed seeds (tests, doc examples): the caller's `seed` is a plain
+    /// array that nothing scrubs. A real key comes from
+    /// [`generate`](Self::generate) or [`from_seed_hex`](Self::from_seed_hex).
     pub fn from_seed(seed: [u8; 32]) -> Self {
+        Self::from_secret(&seed)
+    }
+
+    /// The identity for `seed`, which the caller scrubs.
+    fn from_secret(seed: &[u8; 32]) -> Self {
         Self {
-            signing_key: SigningKey::from_bytes(&seed),
+            signing_key: SigningKey::from_bytes(seed),
         }
     }
 
     /// Reconstruct an identity from the lowercase-hex of its 32-byte seed (the
-    /// inverse of `hex::encode(seed_bytes())`). Used to accept key seeds as CLI
-    /// input.
+    /// inverse of [`expose_seed_hex`](Self::expose_seed_hex)). Used to read
+    /// `node.seed` / `root.seed` and to accept key seeds as CLI input. The
+    /// decoded seed is scrubbed; the text `s` is the caller's to scrub.
     ///
     /// Returns [`Error::BadHex`] for non-hex text and [`Error::BadKeyLength`]
     /// when the decoded byte count is not 32.
@@ -142,28 +185,62 @@ impl NodeIdentity {
     /// ```
     /// use library::NodeIdentity;
     /// let id = NodeIdentity::from_seed_hex(&"01".repeat(32)).unwrap();
-    /// assert_eq!(id.seed_bytes(), [1u8; 32]);
+    /// assert_eq!(*id.expose_seed(), [1u8; 32]);
     /// ```
     pub fn from_seed_hex(s: &str) -> Result<NodeIdentity> {
-        let bytes = hex::decode(s)?;
-        let arr: [u8; 32] = bytes.try_into().map_err(|_| Error::BadKeyLength)?;
-        Ok(Self::from_seed(arr))
+        if s.len() != 64 {
+            // Bad hex is reported before bad length, as a full decode would.
+            let _decoded = Zeroizing::new(hex::decode(s)?);
+            return Err(Error::BadKeyLength);
+        }
+        let mut seed = Zeroizing::new([0u8; 32]);
+        hex::decode_to_slice(s, &mut *seed)?;
+        Ok(Self::from_secret(&seed))
     }
 
-    /// The 32-byte Ed25519 seed (for persistence). Round-trips with `from_seed`.
-    pub fn seed_bytes(&self) -> [u8; 32] {
-        self.signing_key.to_bytes()
+    /// A second owner of this key, for a task that must hold its own (the
+    /// call log's signer beside the endpoint's). Each copy is scrubbed when
+    /// it drops. Named rather than `Clone` so every copy is deliberate and
+    /// easy to find.
+    ///
+    /// ```
+    /// let id = library::NodeIdentity::generate();
+    /// assert_eq!(id.duplicate().node_id(), id.node_id());
+    /// ```
+    pub fn duplicate(&self) -> NodeIdentity {
+        Self {
+            signing_key: self.signing_key.clone(),
+        }
     }
 
-    /// Lowercase-hex of the 32-byte seed (the inverse of [`from_seed_hex`](Self::from_seed_hex)).
+    /// The 32-byte Ed25519 seed, for persisting the key or handing it to the
+    /// transport (iroh's `SecretKey`, which scrubs its own copy). The copy
+    /// is scrubbed when dropped; don't move the array out of it.
+    /// Round-trips with [`from_seed`](Self::from_seed).
+    pub fn expose_seed(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.signing_key.to_bytes())
+    }
+
+    /// Lowercase-hex of the 32-byte seed (the inverse of
+    /// [`from_seed_hex`](Self::from_seed_hex)), for writing `node.seed` /
+    /// `root.seed`. Scrubbed when dropped.
     ///
     /// ```
     /// use library::NodeIdentity;
     /// let id = NodeIdentity::from_seed([1u8; 32]);
-    /// assert_eq!(NodeIdentity::from_seed_hex(&id.seed_hex()).unwrap().seed_bytes(), id.seed_bytes());
+    /// let back = NodeIdentity::from_seed_hex(&id.expose_seed_hex()).unwrap();
+    /// assert_eq!(back.node_id(), id.node_id());
     /// ```
-    pub fn seed_hex(&self) -> String {
-        hex::encode(self.seed_bytes())
+    pub fn expose_seed_hex(&self) -> Zeroizing<String> {
+        let mut text = Zeroizing::new(String::with_capacity(64));
+        for byte in self.expose_seed().iter() {
+            // Two hex digits per byte, written into the scrubbed buffer (no
+            // intermediate `String`).
+            const DIGITS: &[u8; 16] = b"0123456789abcdef";
+            text.push(DIGITS[usize::from(byte >> 4)] as char);
+            text.push(DIGITS[usize::from(byte & 0xf)] as char);
+        }
+        text
     }
 
     /// This identity's public `NodeId` (its address).
@@ -227,7 +304,7 @@ mod tests {
         /// A seed round-trips through an identity unchanged.
         #[test]
         fn seed_roundtrips(s in seed()) {
-            prop_assert_eq!(NodeIdentity::from_seed(s).seed_bytes(), s);
+            prop_assert_eq!(*NodeIdentity::from_seed(s).expose_seed(), s);
         }
 
         /// A signature by an identity verifies under that identity's node id.
@@ -262,12 +339,49 @@ mod tests {
             prop_assert_eq!(NodeId::from_hex(&id.hex()).unwrap(), id);
         }
 
-        /// `NodeIdentity::from_seed_hex` inverts `hex::encode(seed_bytes())`.
+        /// `NodeIdentity::from_seed_hex` inverts `hex::encode(seed)`.
         #[test]
         fn from_seed_hex_roundtrips(s in seed()) {
             let id = NodeIdentity::from_seed_hex(&hex::encode(s)).unwrap();
-            prop_assert_eq!(id.seed_bytes(), s);
+            prop_assert_eq!(*id.expose_seed(), s);
         }
+
+        /// `expose_seed_hex` is exactly `hex::encode` of the seed.
+        #[test]
+        fn expose_seed_hex_is_lowercase_hex(s in seed()) {
+            let id = NodeIdentity::from_seed(s);
+            let text = id.expose_seed_hex();
+            prop_assert_eq!(text.as_str(), hex::encode(s));
+        }
+
+        /// A duplicate is the same key: same address, same signatures.
+        #[test]
+        fn duplicate_is_the_same_key(s in seed(), m in message()) {
+            let id = NodeIdentity::from_seed(s);
+            let dup = id.duplicate();
+            prop_assert_eq!(dup.node_id(), id.node_id());
+            prop_assert_eq!(dup.sign(&m), id.sign(&m));
+        }
+    }
+
+    #[test]
+    fn from_seed_hex_rejects_bad_hex_before_bad_length() {
+        assert!(matches!(
+            NodeIdentity::from_seed_hex("zz"),
+            Err(Error::BadHex(_))
+        ));
+        assert!(matches!(
+            NodeIdentity::from_seed_hex(&"z".repeat(64)),
+            Err(Error::BadHex(_))
+        ));
+        assert!(matches!(
+            NodeIdentity::from_seed_hex("00"),
+            Err(Error::BadKeyLength)
+        ));
+        assert!(matches!(
+            NodeIdentity::from_seed_hex(&"0".repeat(66)),
+            Err(Error::BadKeyLength)
+        ));
     }
 
     #[test]

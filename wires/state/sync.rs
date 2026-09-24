@@ -1046,8 +1046,8 @@ mod tests {
             };
             Fabric {
                 root: root_id.node_id(),
-                host: (NodeIdentity::from_seed(host.seed_bytes()), join(&host)),
-                member: (NodeIdentity::from_seed(member.seed_bytes()), join(&member)),
+                host: (host.duplicate(), join(&host)),
+                member: (member.duplicate(), join(&member)),
                 admin,
             }
         }
@@ -1152,13 +1152,7 @@ mod tests {
             assert!(!held.state.is_member(f.member.0.node_id()));
 
             // The removed member can no longer pull from the host.
-            let (m2, _) = bind(
-                &NodeIdentity::from_seed(f.member.0.seed_bytes()),
-                &f.member.1,
-                &book,
-                false,
-            )
-            .await;
+            let (m2, _) = bind(&f.member.0, &f.member.1, &book, false).await;
             std::fs::remove_file(f.member.1.path("state-checked.txt")).ok();
             let pulled = pull(&m2, &f.member.1, &[f.host.0.node_id()], before)
                 .await

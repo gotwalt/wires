@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use library::{Membership, NodeId, NodeIdentity};
+use zeroize::Zeroizing;
 
 /// Resolve the wires home directory (does not create it).
 pub fn home() -> Result<PathBuf> {
@@ -82,7 +83,7 @@ impl Keystore {
     fn save_seed(&self, name: &str, id: &NodeIdentity, force: bool) -> Result<PathBuf> {
         ensure_dir(&self.dir)?;
         let path = self.path(name);
-        write_secret(&path, &id.seed_hex(), force)?;
+        write_secret(&path, &id.expose_seed_hex(), force)?;
         Ok(path)
     }
 
@@ -138,10 +139,10 @@ impl Keystore {
 
 /// Resolve a node identity for `serve` / `call`.
 pub fn node_identity(inline: Option<&str>, file: Option<&Path>) -> Result<NodeIdentity> {
-    let env = std::env::var("WIRES_NODE_SEED").ok();
+    let env = std::env::var("WIRES_NODE_SEED").ok().map(Zeroizing::new);
     resolve_identity(
         inline,
-        env.as_deref(),
+        env.as_ref().map(|s| s.as_str()),
         file,
         "node.seed",
         "node",
@@ -155,6 +156,7 @@ pub fn node_identity(inline: Option<&str>, file: Option<&Path>) -> Result<NodeId
 pub fn node_identity_in(ks: &Keystore) -> Result<NodeIdentity> {
     if let Some(hex) = std::env::var("WIRES_NODE_SEED")
         .ok()
+        .map(Zeroizing::new)
         .filter(|s| !s.is_empty())
     {
         return NodeIdentity::from_seed_hex(&hex).context("$WIRES_NODE_SEED");
@@ -245,13 +247,35 @@ pub fn read_identity_file(path: &Path) -> Result<NodeIdentity> {
 // ---------------------------------------------------------------------------
 
 fn read_identity_opt(path: &Path) -> Result<Option<NodeIdentity>> {
-    match read_to_string_opt(path)? {
+    match read_secret_opt(path)? {
         Some(text) => Ok(Some(
             NodeIdentity::from_seed_hex(text.trim())
                 .with_context(|| format!("parsing seed {}", path.display()))?,
         )),
         None => Ok(None),
     }
+}
+
+/// Read a secret file (a seed) into a scrubbed buffer sized to the file up
+/// front, so a growing buffer leaves no unscrubbed copy behind. `None` if the
+/// file is absent.
+fn read_secret_opt(path: &Path) -> Result<Option<Zeroizing<String>>> {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let len = f
+        .metadata()
+        .with_context(|| format!("reading {}", path.display()))?
+        .len();
+    let mut text = Zeroizing::new(String::with_capacity(
+        usize::try_from(len).unwrap_or(0).saturating_add(1),
+    ));
+    f.read_to_string(&mut text)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(Some(text))
 }
 
 fn read_to_string_opt(path: &Path) -> Result<Option<String>> {
@@ -454,13 +478,13 @@ mod tests {
     fn resolve_prefers_inline_then_file() {
         let inline = NodeIdentity::from_seed([5u8; 32]);
         // Inline hex wins regardless of file.
-        let got = node_identity(Some(&inline.seed_hex()), None).unwrap();
+        let got = node_identity(Some(&inline.expose_seed_hex()), None).unwrap();
         assert_eq!(got.node_id(), inline.node_id());
 
         // With no inline/env, an explicit file is used.
         let file_id = NodeIdentity::from_seed([6u8; 32]);
         let path = temp_dir().join("node.seed");
-        write_secret(&path, &file_id.seed_hex(), true).unwrap();
+        write_secret(&path, &file_id.expose_seed_hex(), true).unwrap();
         let got = node_identity(None, Some(&path)).unwrap();
         assert_eq!(got.node_id(), file_id.node_id());
     }

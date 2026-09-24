@@ -429,6 +429,16 @@ directory `serve` makes per run (§7).
 A host's keystore must not hold `root.seed`: `wires serve` refuses to start from the admin's
 keystore. Run the host from its own (`WIRES_HOME=<dir> wires id`, invite that node, join there).
 
+**The seed in memory** (`library::NodeIdentity`). A loaded seed lives in a private field. It is
+scrubbed when the identity drops, and the type has no `Clone`, `Debug` or `Serialize` (compile-fail
+doctests hold this), so no code copies, logs or encodes it by accident. A second owner is an
+explicit `duplicate()`; the raw seed comes out only through `expose_seed()`/`expose_seed_hex()`, as
+copies scrubbed on drop. Reading `node.seed` and writing it both go through scrubbed buffers. This
+guards against accidents in safe Rust, not against code in the same process: `unsafe` code, a
+foreign-language runtime, a debugger running as the same user, or a core dump can read the key.
+Rust moves can also leave stale stack copies that nothing scrubs. A seed passed by flag or
+environment variable also stays in the process's argv or environment.
+
 **Hints** (`wires/caller/pick.rs`). `$WIRES_HOME/hints` is local and unsigned: one line per node,
 `<node id hex> <ip:port>…`, `#` comments, bad lines skipped. Every endpoint `wires` binds registers
 it beside n0 discovery, so calls, state sync, push and fetches all use it. `serve` writes its own line

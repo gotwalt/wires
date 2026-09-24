@@ -221,12 +221,8 @@ impl Host {
         host.preflight(crate::now_unix()).unwrap();
         // The call log exactly as `serve` opens it.
         let log = keystore.path(call_log::LOG_FILE);
-        let opened = CallLog::open(
-            &log,
-            NodeIdentity::from_seed(w.host.seed_bytes()),
-            library::Retention::default(),
-        )
-        .unwrap();
+        let opened =
+            CallLog::open(&log, w.host.duplicate(), library::Retention::default()).unwrap();
         let (sink, _, _tee) = call_log::start(opened, None, false);
         host.audit = Some(sink);
         let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
@@ -605,7 +601,7 @@ fn follow(
     mpsc::UnboundedReceiver<Output>,
 ) {
     let hints = host.hints(w);
-    let who = NodeIdentity::from_seed(who.seed_bytes());
+    let who = who.duplicate();
     let opts = WatchOpts {
         services: services.iter().map(|s| service(s)).collect(),
         mine: false,

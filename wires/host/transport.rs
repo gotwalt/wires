@@ -262,7 +262,7 @@ impl std::error::Error for Refused {}
 /// Map a `library` node identity to the iroh `SecretKey` of the same Ed25519
 /// key, so the iroh node id equals our [`NodeId`].
 pub fn secret_key(identity: &NodeIdentity) -> SecretKey {
-    SecretKey::from_bytes(&identity.seed_bytes())
+    SecretKey::from_bytes(&identity.expose_seed())
 }
 
 /// Map our [`NodeId`] to the iroh `EndpointId` (public key) it names.

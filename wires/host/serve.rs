@@ -92,7 +92,7 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     };
     let log = call_log::CallLog::open(
         &home.join(call_log::LOG_FILE),
-        library::NodeIdentity::from_seed(node.seed_bytes()),
+        node.duplicate(),
         library::Retention::default(),
     )?;
     let (sink, _, _tee) = call_log::start(log, exporter, false);
