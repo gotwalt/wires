@@ -1,11 +1,21 @@
-//! The host's control socket: how `wires push` reaches the running `wires
+//! The host's control sockets: how `wires push` reaches the running `wires
 //! serve` on the same machine (card 23).
 //!
 //! The push queue, the host's endpoint and its call log belong to the one
-//! `serve` process, so `wires push` is a *request to it*, over a unix socket
-//! at `$WIRES_HOME/run/serve.sock` ([`host_socket`](crate::host::push::host_socket);
-//! a home too deep for a unix socket path falls back to
-//! `$TMPDIR/wires-<uid>/<hash>.sock`, or the same under `/tmp`):
+//! `serve` process, so `wires push` is a *request to it*, over a unix socket.
+//! There are two, each with its own [`Authority`]:
+//!
+//! - the **operator** socket, `$WIRES_HOME/run/serve.sock`
+//!   ([`host_socket`](crate::host::push::host_socket)): `{"push":…}` to any
+//!   node or role;
+//! - the **child** socket, `$WIRES_HOME/child/push.sock`
+//!   ([`child_socket`](crate::host::capability::child_socket)): only
+//!   `{"caller_push":{"token":…,"push":…}}`, which reaches only the caller of
+//!   the call that token was minted for
+//!   ([`capability`](crate::host::capability)).
+//!
+//! A home too deep for a unix socket path falls back to
+//! `$TMPDIR/wires-<uid>/<hash>.sock`, or the same under `/tmp`.
 //!
 //! ```text
 //! push  → {"push":{"to":"…","subject":"build-41","body":"…"}}
@@ -16,12 +26,16 @@
 //!
 //! # Who may connect
 //!
-//! The directory is `0700` and the socket is `0600`: on unix, connecting to a
+//! The directory is `0700` and **owned by this user** (checked against
+//! `geteuid()` by the server before it binds and by the operator's client
+//! before it connects), and the socket is `0600`: on unix, connecting to a
 //! socket requires write permission on the node, so the mode *is* the access
 //! control, and it admits only this user — a socket reachable by another
 //! local user would be a push-as-this-host capability. The directory mode is
 //! the load-bearing half (it is set before the socket exists); the socket's
-//! own mode is set immediately after `bind`.
+//! own mode is set immediately after `bind`. A service child running as the
+//! same user could still open the operator socket if it went looking; only
+//! running services as another Unix user closes that.
 //!
 //! # Stale sockets
 //!
@@ -40,6 +54,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::host::capability::{Capabilities, PushToken};
 use crate::host::push::{PushCommand, PushReport, PushSpec};
 use crate::host::transport::truncate_reason;
 
@@ -101,8 +116,33 @@ pub fn short_socket_path(full: &Path, uid: u32, bases: &[PathBuf]) -> Option<Pat
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Request {
-    /// Push a message to callers (`wires push`, card 23).
+    /// Push a message to callers (`wires push`, card 23). Operator socket
+    /// only.
     Push(PushSpec),
+    /// Push to a call's caller under that call's push capability (`wires
+    /// push` inside a service). Child socket only.
+    CallerPush(CallerPush),
+}
+
+/// A push under a call's capability: the token `serve` gave the child, and
+/// the push (whose `to` must be that call's caller).
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallerPush {
+    /// `WIRES_PUSH_TOKEN`, as given.
+    pub token: String,
+    /// The push.
+    pub push: PushSpec,
+}
+
+/// What a control socket lets its clients do.
+#[derive(Clone, Debug)]
+pub(crate) enum Authority {
+    /// The operator's socket: any push.
+    Operator,
+    /// The child socket: only [`Request::CallerPush`] with a live token, to
+    /// that token's caller.
+    Calls(std::sync::Arc<Capabilities>),
 }
 
 /// One reply: `{"pushed":{…}}` or `{"err":"…"}`.
@@ -160,16 +200,18 @@ impl ControlSocket {
         })
     }
 
-    /// Accept connections forever, handing every push to `push`. One task
-    /// per connection, so a client that says nothing cannot wedge the others.
-    pub async fn serve(self, push: mpsc::Sender<PushCommand>) {
+    /// Accept connections forever, handing every push `authority` allows to
+    /// `push`. One task per connection, so a client that says nothing cannot
+    /// wedge the others.
+    pub async fn serve(self, push: mpsc::Sender<PushCommand>, authority: Authority) {
         loop {
             match self.listener.accept().await {
                 Ok((stream, _)) => {
                     let push = push.clone();
+                    let authority = authority.clone();
                     tokio::spawn(async move {
                         let (recv, send) = stream.into_split();
-                        if let Err(e) = serve_conn(recv, send, push).await {
+                        if let Err(e) = serve_conn(recv, send, push, &authority).await {
                             tracing::warn!("control connection ended: {e:#}");
                         }
                     });
@@ -185,8 +227,8 @@ impl ControlSocket {
 
     /// Spawn [`serve`](Self::serve) as a task (aborting it drops the socket
     /// and unlinks the file).
-    pub fn spawn(self, push: mpsc::Sender<PushCommand>) -> JoinHandle<()> {
-        tokio::spawn(self.serve(push))
+    pub fn spawn(self, push: mpsc::Sender<PushCommand>, authority: Authority) -> JoinHandle<()> {
+        tokio::spawn(self.serve(push, authority))
     }
 }
 
@@ -202,11 +244,13 @@ impl Drop for ControlSocket {
 
 /// The NDJSON server loop over one duplex pair (generic, so it is testable
 /// without a socket). Every line gets exactly one reply line, in order; a
-/// malformed line is answered with `{"err":…}`, not by hanging up.
+/// malformed line, or one `authority` does not allow, is answered with
+/// `{"err":…}`, not by hanging up.
 pub(crate) async fn serve_conn<R, W>(
     recv: R,
     mut send: W,
     push: mpsc::Sender<PushCommand>,
+    authority: &Authority,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -218,19 +262,47 @@ where
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let response = match serde_json::from_slice::<Request>(&line) {
-            Ok(Request::Push(spec)) => dispatch_push(&push, spec).await,
-            Err(e) => Response::Err(truncate_reason(format!("malformed request: {e}"))),
+        let response = match (serde_json::from_slice::<Request>(&line), authority) {
+            (Ok(Request::Push(spec)), Authority::Operator) => {
+                dispatch_push(&push, spec, None).await
+            }
+            (Ok(Request::CallerPush(req)), Authority::Calls(caps)) => {
+                let token = PushToken::from_hex(&req.token);
+                let checked = match &token {
+                    Some(token) => caps.check(token, &req.push.to, std::time::Instant::now()),
+                    None => Err(crate::host::capability::CapabilityRefusal::Unknown),
+                };
+                match checked {
+                    Ok(grant) => dispatch_push(&push, req.push, grant.call).await,
+                    Err(refusal) => {
+                        tracing::warn!(to = %req.push.to, "capability push refused: {refusal}");
+                        Response::Err(truncate_reason(refusal.to_string()))
+                    }
+                }
+            }
+            (Ok(Request::Push(_)), Authority::Calls(_)) => Response::Err(
+                "this socket takes only a call's push (`caller_push` with its WIRES_PUSH_TOKEN)"
+                    .into(),
+            ),
+            (Ok(Request::CallerPush(_)), Authority::Operator) => {
+                Response::Err("a call's push goes to the child socket (WIRES_PUSH_SOCKET)".into())
+            }
+            (Err(e), _) => Response::Err(truncate_reason(format!("malformed request: {e}"))),
         };
         write_response(&mut send, &response).await?;
     }
     Ok(())
 }
 
-/// Hand one push to the host's push service and wait for its report.
-async fn dispatch_push(push: &mpsc::Sender<PushCommand>, spec: PushSpec) -> Response {
+/// Hand one push (sent under `call`'s capability, if any) to the host's push
+/// service and wait for its report.
+async fn dispatch_push(
+    push: &mpsc::Sender<PushCommand>,
+    spec: PushSpec,
+    call: Option<library::CallId>,
+) -> Response {
     let (reply, answer) = oneshot::channel();
-    if push.send(PushCommand { spec, reply }).await.is_err() {
+    if push.send(PushCommand { spec, call, reply }).await.is_err() {
         return Response::Err("the host is shutting down".into());
     }
     match answer.await {
@@ -305,9 +377,24 @@ pub struct ControlClient {
 }
 
 impl ControlClient {
-    /// Connect to the `serve` owning `path`, or `Ok(None)` when none is
-    /// running (no socket, or a leftover one that refuses the connection).
+    /// Connect to the operator socket at `path` of the `serve` owning it, or
+    /// `Ok(None)` when none is running (no socket, or a leftover one that
+    /// refuses the connection). Refuses a socket whose directory this user
+    /// does not own: another user's socket there could be collecting pushes.
     pub async fn connect(path: &Path) -> Result<Option<Self>> {
+        if let Some(dir) = path.parent()
+            && dir.exists()
+        {
+            check_owner(dir, effective_uid())?;
+        }
+        Self::connect_child(path).await
+    }
+
+    /// Connect to the child socket at `path` (`WIRES_PUSH_SOCKET`, handed to
+    /// this process by the `serve` that spawned it, so its directory's owner
+    /// is not second-guessed: a service may run as another user). `Ok(None)`
+    /// as for [`connect`](Self::connect).
+    pub async fn connect_child(path: &Path) -> Result<Option<Self>> {
         match UnixStream::connect(path).await {
             Ok(stream) => {
                 let (recv, writer) = stream.into_split();
@@ -333,7 +420,19 @@ impl ControlClient {
 
     /// Ask the running host to push `spec`; its per-recipient report.
     pub async fn push(&mut self, spec: PushSpec) -> Result<PushReport> {
-        match self.request(&Request::Push(spec), REPLY_TIMEOUT).await? {
+        self.answer(Request::Push(spec)).await
+    }
+
+    /// Ask the running host to push `spec` under the call capability
+    /// `token` (only to that call's caller); its per-recipient report.
+    pub async fn caller_push(&mut self, token: String, spec: PushSpec) -> Result<PushReport> {
+        self.answer(Request::CallerPush(CallerPush { token, push: spec }))
+            .await
+    }
+
+    /// Send `request` and turn the reply into a report or the host's refusal.
+    async fn answer(&mut self, request: Request) -> Result<PushReport> {
+        match self.request(&request, REPLY_TIMEOUT).await? {
             Response::Pushed(report) => Ok(report),
             Response::Err(reason) => Err(anyhow!("the host refused the push: {reason}")),
         }
@@ -401,12 +500,14 @@ async fn is_live(path: &Path) -> bool {
     }
 }
 
-/// Create `dir` (and parents), set it to `0700`, and check that it took.
+/// Create `dir` (and parents), set it to `0700`, and check that it took and
+/// that this user (`geteuid()`) owns it.
 ///
 /// The check matters for the short fallback directory under a shared `/tmp`
 /// ([`short_socket_path`]): another user could have made `wires-<uid>` first.
-/// We cannot chmod a directory we do not own, so one that is a symlink, or
-/// still open to group/other after the chmod, is refused rather than used.
+/// We cannot chmod a directory we do not own, so one that is a symlink,
+/// someone else's, or still open to group/other after the chmod, is refused
+/// rather than used.
 fn ensure_private_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     set_mode(dir, 0o700);
@@ -423,6 +524,39 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
             );
         }
     }
+    check_owner(dir, effective_uid())
+}
+
+/// This process's effective uid (`geteuid()`); `0` off unix, where no
+/// directory has an owner to check.
+pub(crate) fn effective_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid(2) has no preconditions and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    0
+}
+
+/// Refuse `dir` unless it is a real directory (not a symlink) owned by `uid`.
+fn check_owner(dir: &Path, uid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(dir)
+            .with_context(|| format!("inspecting {}", dir.display()))?;
+        if !meta.is_dir() || meta.uid() != uid {
+            bail!(
+                "the control socket directory {} is not a directory owned by this user (uid \
+                 {uid}; it is uid {}); refusing to use it",
+                dir.display(),
+                meta.uid()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (dir, uid);
     Ok(())
 }
 
@@ -477,7 +611,8 @@ mod tests {
         });
         let (client, server) = tokio::io::duplex(4096);
         let (srecv, ssend) = tokio::io::split(server);
-        let loop_task = tokio::spawn(async move { serve_conn(srecv, ssend, tx).await });
+        let loop_task =
+            tokio::spawn(async move { serve_conn(srecv, ssend, tx, &Authority::Operator).await });
         let (crecv, mut csend) = tokio::io::split(client);
         let mut creader = BufReader::new(crecv);
         csend
@@ -512,12 +647,113 @@ mod tests {
         host.abort();
     }
 
+    /// One request line through `serve_conn` under `authority`; the reply,
+    /// and the command the host received (if any).
+    async fn one(
+        authority: Authority,
+        request: &str,
+    ) -> (Response, Option<(PushSpec, Option<library::CallId>)>) {
+        let (tx, mut rx) = mpsc::channel::<PushCommand>(8);
+        let host = tokio::spawn(async move {
+            let cmd = rx.recv().await?;
+            let _ = cmd.reply.send(Ok(PushReport::default()));
+            Some((cmd.spec, cmd.call))
+        });
+        let (client, server) = tokio::io::duplex(4096);
+        let (srecv, ssend) = tokio::io::split(server);
+        let loop_task = tokio::spawn(async move { serve_conn(srecv, ssend, tx, &authority).await });
+        let (crecv, mut csend) = tokio::io::split(client);
+        csend.write_all(request.as_bytes()).await.unwrap();
+        csend.write_all(b"\n").await.unwrap();
+        let mut line = Vec::new();
+        read_capped_line(&mut BufReader::new(crecv), &mut line, MAX_REQUEST_LINE)
+            .await
+            .unwrap();
+        drop(csend);
+        timeout(PATIENCE, loop_task).await.unwrap().unwrap().ok();
+        let got = timeout(PATIENCE, host).await.unwrap().unwrap();
+        (serde_json::from_slice(&line).unwrap(), got)
+    }
+
+    #[tokio::test]
+    async fn the_child_socket_takes_only_a_live_token_to_its_caller() {
+        use library::{NodeIdentity, ServiceName};
+        let caps = std::sync::Arc::new(Capabilities::default());
+        let alice = NodeIdentity::from_seed([2; 32]).node_id();
+        let bob = NodeIdentity::from_seed([3; 32]).node_id();
+        let cap = caps.mint(alice, ServiceName::new("deploy").unwrap());
+        let call = library::CallId::generate();
+        cap.bind_call(call);
+        let token = cap.token().hex();
+        let child = || Authority::Calls(std::sync::Arc::clone(&caps));
+        let req = |token: &str, to: &str| {
+            format!(
+                r#"{{"caller_push":{{"token":"{token}","push":{{"to":"{to}","subject":"s","body":"b"}}}}}}"#
+            )
+        };
+
+        // Its caller: handed to the host, naming the call.
+        let (resp, got) = one(child(), &req(&token, &alice.hex())).await;
+        assert_eq!(resp, Response::Pushed(PushReport::default()));
+        let (spec, via) = got.unwrap();
+        assert_eq!((spec.to.as_str(), via), (alice.hex().as_str(), Some(call)));
+
+        // Anyone else, a role, a forged token, the operator's form: refused
+        // before the host hears of it.
+        for (request, why) in [
+            (req(&token, &bob.hex()), "reaches only its caller"),
+            (req(&token, "analyst"), "reaches only its caller"),
+            (req(&"0".repeat(64), &alice.hex()), "unknown or expired"),
+            (req("nope", &alice.hex()), "unknown or expired"),
+            (
+                format!(
+                    r#"{{"push":{{"to":"{}","subject":"s","body":"b"}}}}"#,
+                    alice.hex()
+                ),
+                "takes only a call's push",
+            ),
+        ] {
+            let (resp, got) = one(child(), &request).await;
+            assert!(
+                matches!(&resp, Response::Err(r) if r.contains(why)),
+                "{request}: {resp:?}"
+            );
+            assert!(got.is_none(), "{request} reached the host");
+        }
+
+        // The operator socket refuses the call form (it has its own).
+        let (resp, got) = one(Authority::Operator, &req(&token, &alice.hex())).await;
+        assert!(
+            matches!(&resp, Response::Err(r) if r.contains("child socket")),
+            "{resp:?}"
+        );
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn a_socket_directory_owned_by_someone_else_is_refused() {
+        let dir = crate::testutil::ScratchDir::new("own");
+        let me = effective_uid();
+        check_owner(dir.path(), me).unwrap();
+        ensure_private_dir(&dir.path().join("run")).unwrap();
+        let e = format!(
+            "{:#}",
+            check_owner(dir.path(), me.wrapping_add(1)).unwrap_err()
+        );
+        assert!(e.contains("not a directory owned by this user"), "{e}");
+        // A symlink to our own directory is not the directory.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path().join("run"), &link).unwrap();
+        assert!(check_owner(&link, me).is_err());
+    }
+
     #[tokio::test]
     async fn an_over_long_line_is_refused_rather_than_buffered() {
         let (tx, _rx) = mpsc::channel::<PushCommand>(1);
         let (client, server) = tokio::io::duplex(4096);
         let (srecv, ssend) = tokio::io::split(server);
-        let loop_task = tokio::spawn(async move { serve_conn(srecv, ssend, tx).await });
+        let loop_task =
+            tokio::spawn(async move { serve_conn(srecv, ssend, tx, &Authority::Operator).await });
         let (_crecv, mut csend) = tokio::io::split(client);
         let chunk = vec![b'x'; 64 * 1024];
         let mut written = 0usize;
@@ -561,7 +797,7 @@ mod tests {
         }
         // Live: a second serve must not steal it.
         let (tx, _rx) = mpsc::channel(1);
-        let server = socket.spawn(tx);
+        let server = socket.spawn(tx, Authority::Operator);
         let msg = format!("{:#}", ControlSocket::bind(&path).await.unwrap_err());
         assert!(msg.contains("already running"), "{msg}");
         server.abort();

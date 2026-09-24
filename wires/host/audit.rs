@@ -128,6 +128,11 @@ impl CallAudit {
         })
     }
 
+    /// The call's id (what its `Started` and `Finished` records carry).
+    pub fn call(&self) -> CallId {
+        self.call
+    }
+
     /// Emit [`Finished`](AuditRecord::Finished) with the child's exit code and
     /// what the taps counted.
     pub fn finish(self, exit: i32) {

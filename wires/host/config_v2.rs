@@ -30,7 +30,9 @@
 //!   but which IdPs to believe is the host's call.
 //! - `services`: name → `command` (argv, never a shell; each call's
 //!   arguments are appended), optional `cwd`, optional `env` (set on top of
-//!   the scrubbed environment), and `also_require`: roles (defined in the
+//!   a minimal environment: only `PATH`, `LANG` and `LC_*` are inherited
+//!   from `serve`; the server-derived `WIRES_*` values are set last), and
+//!   `also_require`: roles (defined in the
 //!   signed state) the caller must **also** be in, on top of the registry's
 //!   `allow`. It can only narrow.
 //! - `push`: which registry roles may receive pushes from this host, and
@@ -84,8 +86,10 @@ pub(crate) struct ServiceImpl {
     /// The working directory. Absent: `serve`'s own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cwd: Option<PathBuf>,
-    /// Extra environment, set after the scrub and before the `WIRES_*`
-    /// variables (which always win).
+    /// Extra environment, set on top of a minimal one (only `PATH`, `LANG`
+    /// and `LC_*` are inherited from `serve`) and before the `WIRES_*`
+    /// variables (which always win). Anything else a service needs goes
+    /// here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) env: BTreeMap<String, String>,
     /// Roles (from the signed state) the caller must also be in. Empty: the

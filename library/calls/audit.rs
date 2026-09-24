@@ -327,6 +327,10 @@ pub enum AuditRecord {
         /// The body, only when the host logs bodies.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         body: Option<PushBody>,
+        /// The call whose per-call push capability sent it (a service
+        /// pushing back to its caller); `None` for the host operator's push.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<CallId>,
         /// Unix milliseconds of the milestone.
         at_ms: i64,
     },
@@ -400,6 +404,7 @@ mod tests {
             outcome: PushOutcome::Queued,
             reason: None,
             body: body.map(|b| PushBody::new(b).unwrap()),
+            call: None,
             at_ms: 1,
         };
         let without = serde_json::to_string(&push(None)).unwrap();
@@ -408,7 +413,22 @@ mod tests {
         assert!(!without.contains("body"), "{without}");
         let with = serde_json::to_string(&push(Some("failed"))).unwrap();
         assert!(with.contains(r#""body":"failed""#), "{with}");
-        for record in [push(None), push(Some("failed"))] {
+        assert!(
+            !without.contains("call"),
+            "an operator push names no call: {without}"
+        );
+        let mut by_call = push(None);
+        let AuditRecord::Push { call, .. } = &mut by_call else {
+            unreachable!()
+        };
+        let id = CallId::generate();
+        *call = Some(id);
+        let json = serde_json::to_string(&by_call).unwrap();
+        assert!(
+            json.contains(&format!(r#""call":"{}""#, id.hex())),
+            "{json}"
+        );
+        for record in [push(None), push(Some("failed")), by_call] {
             let json = serde_json::to_string(&record).unwrap();
             assert_eq!(serde_json::from_str::<AuditRecord>(&json).unwrap(), record);
         }

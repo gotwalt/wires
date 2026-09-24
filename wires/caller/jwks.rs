@@ -7,8 +7,18 @@
 //! caches the key set:
 //!
 //! - **in memory** per [`KeyFetcher`], and
-//! - **on disk** under `$WIRES_HOME/jwks/`, so a short-lived `wires watch` or
-//!   a restarted responder does not refetch on every start.
+//! - for the caller's commands only, **on disk** under `$WIRES_HOME/jwks/`,
+//!   so a short-lived `wires watch` or `wires services` does not refetch on
+//!   every start. A disk entry is trusted for at most [`MAX_TTL`] from the
+//!   moment it is read.
+//!
+//! **A host never reads the disk cache** (`serve` builds its fetcher with
+//! no `cache_dir`): whatever runs as the host's user — a service child
+//! included — could plant an attacker's key there, and a host trusting it
+//! would accept forged identities, readers included. A host only trusts keys
+//! it fetched itself, over HTTPS, in this process. A caller keeps the disk
+//! cache: its keystore is its own, and whoever can write `jwks/` there can
+//! already read its node key and stored ID token.
 //!
 //! The cache TTL is the response's `Cache-Control: max-age`, clamped to
 //! [`MIN_TTL`]..=[`MAX_TTL`] ([`DEFAULT_TTL`] when absent). A token whose
@@ -194,7 +204,9 @@ impl KeyFetcher {
             return Some(c.jwks.clone());
         }
         let c = self.read_disk(issuer)?;
-        if c.issuer != *issuer || c.expires_at <= now {
+        // A file claiming to stay fresh longer than any fetch could have made
+        // it is not one this code wrote.
+        if c.issuer != *issuer || c.expires_at <= now || c.expires_at > now + MAX_TTL {
             return None;
         }
         let jwks = c.jwks.clone();
@@ -467,5 +479,20 @@ mod tests {
         assert_eq!(c.cached(&issuer, 1_000), None);
         // Another issuer's file is not mistaken for this one.
         assert_eq!(c.cached(&Issuer::new("https://other.example"), 0), None);
+    }
+
+    #[test]
+    fn a_disk_entry_fresh_beyond_any_fetch_is_not_trusted() {
+        let dir = crate::testutil::ScratchDir::new("jwks");
+        let issuer = Issuer::new("https://idp.example");
+        let a = KeyFetcher::new(Some(dir.path().to_path_buf())).unwrap();
+        let jwks = Jwks::from_json(r#"{"keys":[{"kty":"EC","kid":"k"}]}"#).unwrap();
+        a.write_disk(&Cached {
+            issuer: issuer.clone(),
+            expires_at: i64::MAX,
+            jwks,
+        });
+        let b = KeyFetcher::new(Some(dir.path().to_path_buf())).unwrap();
+        assert_eq!(b.cached(&issuer, 1_000), None);
     }
 }

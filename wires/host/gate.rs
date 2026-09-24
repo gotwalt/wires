@@ -219,6 +219,12 @@ pub(crate) struct ServicesHost {
     pub(crate) identities: Arc<Identities>,
     /// The call log (card 26a), if any.
     pub(crate) audit: Option<AuditSink>,
+    /// The per-call push capability (when `host.json` enables push): the
+    /// live tokens and the child socket a service is told about.
+    pub(crate) push_grants: Option<crate::host::capability::PushGrants>,
+    /// The highest state version this host has decided under, in memory:
+    /// [`state`](Self::state) refuses anything older read back from disk.
+    pub(crate) high_water: std::sync::atomic::AtomicU64,
 }
 
 impl fmt::Debug for ServicesHost {
@@ -232,9 +238,33 @@ impl fmt::Debug for ServicesHost {
 impl ServicesHost {
     /// This host's signed state, verified under the trust root. A host with
     /// none (or an unreadable one) serves nobody: fail closed.
+    ///
+    /// Also fail closed on a **rollback**: the file is re-read on every
+    /// decision, and anyone who can write it could put back an older state
+    /// that still verifies (one that still lists a removed member). So the
+    /// host keeps the highest version it has used in memory
+    /// ([`high_water`](Self::high_water)) and refuses to decide under a
+    /// lower one until a state at least that new is back on disk.
     pub(crate) fn state(&self) -> Result<SignedState> {
-        crate::state::store::read(&self.keystore, self.trust_root)?
-            .ok_or_else(|| anyhow!("this host holds no signed state (run `wires join`)"))
+        use std::sync::atomic::Ordering;
+        let state = crate::state::store::read(&self.keystore, self.trust_root)?
+            .ok_or_else(|| anyhow!("this host holds no signed state (run `wires join`)"))?;
+        let version = state.state.version.0;
+        let seen = self.high_water.fetch_max(version, Ordering::SeqCst);
+        if version < seen {
+            tracing::error!(
+                on_disk = version,
+                seen,
+                "refusing to decide: the signed state on disk is older than one this host already \
+                 used (rolled back?)"
+            );
+            anyhow::bail!(
+                "the signed state on disk (version {version}) is older than version {seen}, which \
+                 this host already decided under; refusing to decide until a state at least that \
+                 new is back"
+            );
+        }
+        Ok(state)
     }
 
     /// What `serve` checks before it binds: a fresh signed state that

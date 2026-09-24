@@ -13,6 +13,8 @@
 //!   push by the state), and nothing is broadcast to a bystander.
 //! - [`records`] — card 26b: call records streamed from the host's own log
 //!   to authorized readers (`wires watch`).
+//! - [`service_child`] — card 28 §1: a service child gets a minimal
+//!   environment and a per-call push capability, not the host's keystore.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -24,6 +26,9 @@ mod services_host;
 
 /// Card 26b: call records streamed from the host's log to authorized readers.
 mod records;
+
+/// Card 28 §1: the service child is not the host.
+mod service_child;
 
 /// The outer bound on any single wait here: generous, and never reached in
 /// the passing case (every wait is on an event, not a clock).

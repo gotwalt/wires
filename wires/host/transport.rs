@@ -526,33 +526,41 @@ where
     if let Some(cwd) = &svc.cwd {
         cmd.current_dir(cwd);
     }
-    // Scrub every inherited `WIRES_*`, then the service's own env, then the
-    // server-derived values (which always win; `host.json` can't set them).
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("WIRES_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.envs(&svc.env)
-        .env("WIRES_CALLER_NODE", caller.hex())
-        .env("WIRES_FABRIC_ROOT", host.trust_root.hex())
-        .env(
+    // A minimal environment: `PATH` and the locale inherited, then the
+    // service's own `env`, then the server-derived values (which always win;
+    // `host.json` can't set them). Nothing of the host's own: no
+    // `WIRES_HOME`, `HOME`, agent sockets or cloud credentials.
+    let mut server: Vec<(&str, std::ffi::OsString)> = vec![
+        ("WIRES_CALLER_NODE", caller.hex().into()),
+        ("WIRES_FABRIC_ROOT", host.trust_root.hex().into()),
+        (
             "WIRES_MEMBERSHIP_NOT_AFTER",
-            hello.membership.not_after.to_string(),
-        )
-        .env("WIRES_STATE_VERSION", version.0.to_string())
-        .env("WIRES_SERVICE", service.as_str())
-        .env("WIRES_TOOL", tool.as_str())
-        .env("WIRES_ROLE", admitted.role.as_str())
-        // The host's own home, so a service can `wires push` back to its
-        // caller through this `serve` (card 23).
-        .env("WIRES_HOME", host.keystore.path(""));
+            hello.membership.not_after.to_string().into(),
+        ),
+        ("WIRES_STATE_VERSION", version.0.to_string().into()),
+        ("WIRES_SERVICE", service.as_str().into()),
+        ("WIRES_TOOL", tool.as_str().into()),
+        ("WIRES_ROLE", admitted.role.as_str().into()),
+    ];
     if let Some(email) = principal.as_ref().and_then(|p| p.email.as_deref()) {
-        cmd.env("WIRES_CALLER_EMAIL", email);
+        server.push(("WIRES_CALLER_EMAIL", email.into()));
     }
+    // The call's push capability: this child may push to its caller, and
+    // no one else, until shortly after the call ends (card 28 §1).
+    let capability = host
+        .push_grants
+        .as_ref()
+        .map(|g| (g.caps.mint(caller, service.clone()), g.socket.clone()));
+    if let Some((cap, socket)) = &capability {
+        use crate::host::capability::{ENV_SOCKET, ENV_TOKEN};
+        server.push((ENV_SOCKET, socket.clone().into_os_string()));
+        server.push((ENV_TOKEN, cap.token().hex().into()));
+    }
+    cmd.env_clear()
+        .envs(child_env(std::env::vars_os(), &svc.env, server));
     let role = admitted.role;
-    bridge_child(send, recv, cmd, program, shutdown, || {
-        crate::host::audit::CallAudit::start(
+    let result = bridge_child(send, recv, cmd, program, shutdown, || {
+        let audit = crate::host::audit::CallAudit::start(
             audit,
             caller,
             principal,
@@ -560,9 +568,42 @@ where
             invocation.argv.as_slice(),
             Some(version.0),
             Some(role.as_str().to_string()),
-        )
+        );
+        if let (Some((cap, _)), Some(audit)) = (&capability, &audit) {
+            cap.bind_call(audit.call());
+        }
+        audit
     })
-    .await
+    .await;
+    // Dropping the capability starts its grace period.
+    drop(capability);
+    result
+}
+
+/// Inherited variables a service child keeps, besides every `LC_*`: the
+/// search path, and the locale (so tools print the text their operator
+/// expects; locale variables carry no credentials).
+const CHILD_INHERITS: &[&str] = &["PATH", "LANG"];
+
+/// The whole environment of a service child: from `inherited` (the host's
+/// own) only [`CHILD_INHERITS`] and `LC_*`; then `service` (`host.json`
+/// `env`); then `server` (the `WIRES_*` values), each layer overriding the
+/// one before.
+pub(crate) fn child_env(
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    service: &std::collections::BTreeMap<String, String>,
+    server: Vec<(&str, std::ffi::OsString)>,
+) -> std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    let mut env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> = inherited
+        .into_iter()
+        .filter(|(k, _)| {
+            k.to_str()
+                .is_some_and(|k| CHILD_INHERITS.contains(&k) || k.starts_with("LC_"))
+        })
+        .collect();
+    env.extend(service.iter().map(|(k, v)| (k.into(), v.into())));
+    env.extend(server.into_iter().map(|(k, v)| (k.into(), v)));
+    env
 }
 
 // ---------------------------------------------------------------------------
@@ -796,6 +837,48 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_service_child_gets_a_minimal_environment() {
+        let os = |k: &str, v: &str| (std::ffi::OsString::from(k), std::ffi::OsString::from(v));
+        let inherited = vec![
+            os("PATH", "/usr/bin"),
+            os("LANG", "en_US.UTF-8"),
+            os("LC_ALL", "C.UTF-8"),
+            os("HOME", "/home/host"),
+            os("SSH_AUTH_SOCK", "/tmp/agent"),
+            os("AWS_SECRET_ACCESS_KEY", "s3cr3t"),
+            os("GH_TOKEN", "ghp_x"),
+            os("WIRES_HOME", "/home/host/.config/wires"),
+            os("WIRES_NODE_SEED", "00"),
+            os("WIRES_CALLER_NODE", "spoofed"),
+        ];
+        let service: std::collections::BTreeMap<String, String> = [
+            ("LC_ALL".to_string(), "C".to_string()),
+            ("CI_JOBS".to_string(), "/srv/jobs".to_string()),
+        ]
+        .into();
+        let env = child_env(
+            inherited,
+            &service,
+            vec![("WIRES_CALLER_NODE", "abc".into())],
+        );
+        let got: Vec<(String, String)> = env
+            .into_iter()
+            .map(|(k, v)| (k.into_string().unwrap(), v.into_string().unwrap()))
+            .collect();
+        let want: Vec<(String, String)> = [
+            ("CI_JOBS", "/srv/jobs"),
+            ("LANG", "en_US.UTF-8"),
+            ("LC_ALL", "C"),
+            ("PATH", "/usr/bin"),
+            ("WIRES_CALLER_NODE", "abc"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(got, want);
+    }
     use crate::admin::keystore::Keystore;
     use crate::host::config_v2::HostConfigV2;
     use crate::host::gate::ServicesHost;
