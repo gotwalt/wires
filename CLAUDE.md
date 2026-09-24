@@ -22,7 +22,7 @@ issuer. Every call is recorded by the host in its own signed, hash-linked
 log. Agents can't observe each other's work: the isolation boundary is the
 verified person (IdP principal), so a caller sees its own person's records,
 and the readers the registry names see a service's records in full with
-`wires watch`, for logging and compliance. There is no channel; what every
+`wires watch`, for logging and compliance. Nothing is broadcast; what every
 member still learns about the others (the whole signed state) is card 29's
 to fix. `wires call` is the CLI-native path and the source of the token
 savings; `wires mcp` (stdio) and `wires gateway` (remote, e.g. Claude.ai) serve
@@ -57,7 +57,8 @@ file shows up in `git status` as `Wires/…`, add it by its lowercase path.
 
 ## Build System
 
-Plain Cargo: one workspace, two crates, `Cargo.lock` committed, toolchain
+Plain Cargo: one workspace, four crates (`library`, `wires`, `wires-ffi`,
+`wires-node`), `Cargo.lock` committed, toolchain
 pinned in `rust-toolchain.toml` (1.91.0). The `Makefile` wraps the dev loop
 (`make help`).
 
@@ -91,7 +92,7 @@ OIDC issuer for the demo script. It is never in a release or the image.
 ## Adding Dependencies
 
 `cargo add -p <crate> <dep>` (or add it to root `[workspace.dependencies]`
-and reference it with `{ workspace = true }` when both crates share it;
+and reference it with `{ workspace = true }` when crates share it;
 test-only deps go under `[dev-dependencies]`). Commit the `Cargo.lock`
 change. Don't run `cargo update` wholesale as a side effect: it bumps every
 crate.
@@ -127,8 +128,9 @@ Each `library` module is a worked example of the above.
 One multi-stage `Dockerfile`: build on `rust:1.91.0-bookworm`, copy the
 binary into `gcr.io/distroless/cc-debian12:nonroot`. It builds natively on the
 Docker host's architecture (arm64 on a Mac, x86_64 on workbench); there is no
-cross-compile. The image holds only `wires` (enough for the caller side); a
-host exposing CLIs needs an image that also has those CLIs.
+cross-compile. The image holds only `wires`: enough for the caller side and
+for `wires gateway`, which `deploy/gateway/` (Compose + Cloudflare Tunnel)
+runs from it. A host serving CLIs needs an image that also has those CLIs.
 
 ## Architecture
 
@@ -160,9 +162,15 @@ host exposing CLIs needs an image that also has those CLIs.
   - `library/`: `membership/`, `calls/`, `services/` are folders only — every
     module is declared at the crate root with `#[path]`, so public paths
     (`library::state`, …) and the `lib.rs` re-exports don't depend on them.
-- `.scripts/` — the self-asserting demo(s) and their fixtures; `bench/` — the
-  token benchmark (card 16) and its results.
+- `.scripts/` — the self-asserting demos, their shared helpers (`lib.sh`)
+  and fixtures, the bindings builds, and `macos-sign.sh`, which
+  `.cargo/config.toml` sets as the macOS `runner` so test and `cargo run`
+  binaries are signed with a stable identity (firewall approvals survive
+  rebuilds; `WIRES_SIGN_ID=-` skips it). `bench/` — the token benchmark
+  (card 16) and its results; `bench/push/` the push-vs-poll benchmark
+  (card 24). `deploy/gateway/` — the web gateway's Compose deployment.
+  `docs/media/` — the README's demo recording.
 - Rust edition 2024, toolchain 1.91.0 (`rust-toolchain.toml`).
-- Lint: `clippy` (`.clippy.toml`) + `shellcheck` (`.shellcheckrc`). Format:
-  `rustfmt` (`rustfmt.toml`) + `shfmt`.
+- Lint: `clippy` + `shellcheck`, both with default settings. Format:
+  `rustfmt` (`rustfmt.toml`) + `shfmt` (tabs, per `.editorconfig`).
 - No CI (decided 2026-09-23): run `make lint test` before pushing.

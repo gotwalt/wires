@@ -4,14 +4,10 @@
 # Cargo build output
 /target/
 
-# Old Bazel symlinks, if a pre-Cargo checkout left them behind
-/bazel-*
-
 *.venv/
 
-# Claude Code local state (worktrees, scratch keystores with seeds/tokens); only the shared settings are tracked
-.claude/*
-!.claude/settings.json
+# Claude Code local state (worktrees, scratch keystores with seeds/tokens)
+.claude/
 
 # Local ops notes and deploy script for workbench (not shared)
 /ops/
