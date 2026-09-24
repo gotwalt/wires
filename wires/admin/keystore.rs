@@ -7,7 +7,8 @@
 //! - `node.seed` / `root.seed`: hex-encoded 32-byte Ed25519 seeds (mode `0600`).
 //! - `membership.json`: the dialer's membership token (mode `0644` — a
 //!   *public* signed credential, not a secret).
-//! - `names.json`: the admin's local labels for members (mode `0600`).
+//! - `issued.json`: the admin's ledger of the badges it minted, with their
+//!   labels (mode `0600`; [`super::ledger`]).
 //! - `state.json`, `state-admin.txt`, `state-checked.txt`: the admin-signed
 //!   state, where to pull it from, and when it was last checked
 //!   ([`crate::state::store`]).
@@ -16,7 +17,6 @@
 //! encode the precedence the CLI uses: an inline flag wins, then the matching
 //! environment variable, then an explicit `--…-file` path, then the keystore.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -107,29 +107,6 @@ impl Keystore {
         create_private_dir(&self.dir)?;
         let path = self.path("membership.json");
         write_text_mode(&path, &membership.encode()?, Some(0o644))?;
-        Ok(path)
-    }
-
-    /// The admin's local labels for members (`names.json`: name → node id).
-    /// Labels, not identity: nothing but `wires remove <name>` reads them.
-    /// Empty when absent.
-    pub fn read_names(&self) -> Result<BTreeMap<String, NodeId>> {
-        let path = self.path("names.json");
-        match read_to_string_opt(&path)? {
-            Some(text) => {
-                serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
-            }
-            None => Ok(BTreeMap::new()),
-        }
-    }
-
-    /// Persist the admin's member labels (`names.json`, mode `0600` — the
-    /// names say who is in).
-    pub fn save_names(&self, names: &BTreeMap<String, NodeId>) -> Result<PathBuf> {
-        create_private_dir(&self.dir)?;
-        let path = self.path("names.json");
-        let json = serde_json::to_string_pretty(names).context("encoding names.json")?;
-        write_text_mode(&path, &json, Some(0o600))?;
         Ok(path)
     }
 }

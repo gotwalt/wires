@@ -1,8 +1,9 @@
 //! The call gate: what a host checks on every [`Hello`](library::Hello) + [`Invoke`](library::Frame::Invoke),
 //! in order, the first failure being the refusal the caller hears:
 //!
-//! 1. the caller is a member of the host's signed state (removal is
-//!    omission; no restart needed, because the state is re-read per
+//! 1. the caller is admitted: its badge (root-signed membership) verifies
+//!    and names it, and the host's signed state doesn't ban it (removal is
+//!    a ban; no restart needed, because the state is re-read per
 //!    connection). Anyone else hears only [`NOT_ADMITTED`], and — checked
 //!    first by [`ServicesHost::check_member`], before its ID token is even
 //!    looked at — is traced, not written to the call log;
@@ -13,8 +14,8 @@
 //! 5. the host's own `also_require` roles (`host.json`), which can only
 //!    narrow: the caller must be in **every** one of them.
 //!
-//! A member's refusal is also written to the call log. The caller's
-//! principal is verified after the membership check and before [`admit`]
+//! An admitted caller's refusal is also written to the call log. The
+//! caller's principal is verified after the badge check and before [`admit`]
 //! runs (the ID token from the `Hello`, nonce-bound to the iroh-authenticated
 //! caller, under the host's `identity.issuers`: [`ServicesHost::principal`]),
 //! so [`admit`] is pure and clock-free except for `now`.
@@ -40,18 +41,19 @@ use crate::host::config::HostConfig;
 use crate::host::identity::Identities;
 use crate::host::transport::AuditSink;
 
-/// The one refusal a peer that is not a member of this host's signed state
-/// hears, whatever the reason (no credential, someone else's, expired,
-/// removed, never invited). It says nothing about the state, its version or
-/// who is in it; the exact reason goes only to the host's trace.
+/// The one refusal a peer that is not admitted hears, whatever the reason
+/// (no badge, someone else's, another network's, expired, banned). It says
+/// nothing about the state, its version or who is in it; the exact reason
+/// goes only to the host's trace.
 pub(crate) const NOT_ADMITTED: &str = "not a member of this network";
 
-/// What a member hears when the ID token it presented did not verify
+/// What an admitted caller hears when the ID token it presented did not verify
 /// (untrusted issuer, bad signature, wrong audience or nonce). The exact
 /// reason goes only to the host's trace.
 pub(crate) const TOKEN_UNVERIFIED: &str = "your ID token could not be verified; run `wires login`";
 
-/// What a member hears when this host could not fetch its issuer's keys.
+/// What an admitted caller hears when this host could not fetch its
+/// issuer's keys.
 /// The exact failure goes only to the host's trace.
 pub(crate) const IDP_UNREACHABLE: &str =
     "the identity provider is unreachable from this host; try again later";
@@ -65,16 +67,16 @@ pub(crate) const HOST_MISCONFIGURED: &str = "host configuration error";
 /// reason recorded and reported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PushRefusal {
-    /// Not a member of the current signed state: what is queued for it goes.
-    NotAMember(String),
-    /// A member the push rule refuses, or a host that can't decide now.
+    /// Banned by the current signed state: what is queued for it goes.
+    NotAdmitted(String),
+    /// A node the push rule refuses, or a host that can't decide now.
     Refused(String),
 }
 
 impl fmt::Display for PushRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PushRefusal::NotAMember(why) | PushRefusal::Refused(why) => f.write_str(why),
+            PushRefusal::NotAdmitted(why) | PushRefusal::Refused(why) => f.write_str(why),
         }
     }
 }
@@ -155,7 +157,7 @@ impl fmt::Display for GateRefusal {
                 version.0
             ),
             GateRefusal::Registry {
-                refusal: Refusal::NotAMember,
+                refusal: Refusal::Banned,
                 ..
             } => f.write_str(NOT_ADMITTED),
             GateRefusal::Registry { refusal, .. } => write!(f, "{refusal}"),
@@ -199,10 +201,11 @@ pub(crate) fn admit(
     let version = state.state.version;
     let s = &state.state;
     let registry = |refusal| GateRefusal::Registry { refusal, version };
-    // Membership before anything a non-member could learn from (the state's
-    // freshness and version).
-    if !s.is_member(caller) {
-        return Err(registry(Refusal::NotAMember));
+    // The ban before anything a banned node could learn from (the state's
+    // freshness and version). Its badge was checked before this
+    // ([`ServicesHost::check_member`]).
+    if s.is_banned(caller) {
+        return Err(registry(Refusal::Banned));
     }
     state.check_fresh(now).map_err(|e| GateRefusal::Stale {
         version,
@@ -255,7 +258,8 @@ pub(crate) struct ServicesHost {
     /// The host's own membership, presented in the `HelloAck`.
     pub(crate) membership: Membership,
     /// Where the signed state is read from, per connection (so a newer
-    /// state adopted by `wires/state` takes effect on the next dial).
+    /// state adopted by `wires/state`, say one with a new ban, takes effect
+    /// on the next dial).
     pub(crate) keystore: Arc<Keystore>,
     /// `host.json`.
     pub(crate) config: HostConfig,
@@ -292,7 +296,7 @@ impl ServicesHost {
     ///
     /// Also fail closed on a **rollback**: the file is re-read on every
     /// decision, and anyone who can write it could put back an older state
-    /// that still verifies (one that still lists a removed member). So the
+    /// that still verifies (one from before a ban). So the
     /// host keeps the highest version it has used in memory
     /// ([`high_water`](Self::high_water)) and refuses to decide under a
     /// lower one until a state at least that new is back on disk.
@@ -365,12 +369,12 @@ impl ServicesHost {
         }
     }
 
-    /// Whether `caller`, presenting `membership`, is a member of `state`:
-    /// the credential is the network root's for this very key and current at
-    /// `now`, and the state lists the key. Checked before anything that
-    /// costs this host (a token verification, a JWKS fetch, a call-log
-    /// entry). `Err` is the exact reason, for this host's trace only; the
-    /// peer hears [`NOT_ADMITTED`].
+    /// Whether `caller`, presenting badge `membership`, is admitted under
+    /// `state` ([`library::check_admitted`]): the badge is the network
+    /// root's for this very key and current at `now`, and the state doesn't
+    /// ban the key. Checked before anything that costs this host (a token
+    /// verification, a JWKS fetch, a call-log entry). `Err` is the exact
+    /// reason, for this host's trace only; the peer hears [`NOT_ADMITTED`].
     pub(crate) fn check_member(
         &self,
         state: &SignedState,
@@ -378,15 +382,15 @@ impl ServicesHost {
         caller: NodeId,
         now: i64,
     ) -> std::result::Result<(), String> {
-        library::check_inclusion(membership, self.trust_root, caller, now)
-            .map_err(|e| format!("membership rejected: {e}"))?;
-        if !state.state.is_member(caller) {
-            return Err(format!(
-                "not a member of the signed state (version {})",
-                state.state.version.0
-            ));
-        }
-        Ok(())
+        library::check_admitted(membership, self.trust_root, &state.state, caller, now).map_err(
+            |e| match e {
+                library::Error::Banned { .. } => format!(
+                    "{e} by the signed state (version {})",
+                    state.state.version.0
+                ),
+                e => format!("membership rejected: {e}"),
+            },
+        )
     }
 
     /// Verify the ID token `caller` presented (if any): its principal, or
@@ -461,9 +465,11 @@ impl ServicesHost {
         })
     }
 
-    /// Whether `node` may receive pushes from this host at `now`: a member of
-    /// the current signed state, in the first `push.allow` role that admits
-    /// it (with the principal it last verified as here).
+    /// Whether `node` may receive pushes from this host at `now`: not banned
+    /// by the current signed state, and in the first `push.allow` role that
+    /// admits it (with the principal it last verified as here). A node only
+    /// has a principal here after it passed the gate (badge and bans) with
+    /// an ID token, so a node that never presented a badge is in no role.
     pub(crate) fn decide_push(
         &self,
         node: NodeId,
@@ -479,9 +485,9 @@ impl ServicesHost {
                 state.state.version.0
             )));
         }
-        if !state.state.is_member(node) {
-            return Err(PushRefusal::NotAMember(format!(
-                "{} is not a member of the current signed state (version {})",
+        if let Some(until) = state.state.bans.get(&node) {
+            return Err(PushRefusal::NotAdmitted(format!(
+                "{} is banned until {until} by the current signed state (version {})",
                 node.short(),
                 state.state.version.0
             )));
@@ -521,9 +527,9 @@ impl ServicesHost {
         }))
     }
 
-    /// The members `role` names at `now` (never this host): every member
-    /// whose last verified principal here is in the role. A member with no
-    /// verified identity here is in no role.
+    /// The nodes `role` names at `now` (never this host): every node the
+    /// state doesn't ban whose last verified principal here is in the role.
+    /// A node with no verified identity here is in no role.
     pub(crate) fn push_recipients(&self, role: &RoleName, now: i64) -> Vec<NodeId> {
         let Ok(state) = self.state() else {
             return Vec::new();
@@ -533,7 +539,7 @@ impl ServicesHost {
             .identities
             .nodes()
             .into_iter()
-            .filter(|n| s.is_member(*n))
+            .filter(|n| !s.is_banned(*n))
             .filter(|n| role_admits(s, role, self.identities.current(*n, now).as_ref()))
             .collect();
         nodes.retain(|n| *n != self.me);
@@ -573,15 +579,14 @@ mod tests {
         RoleName::new(s).unwrap()
     }
 
-    /// Root 1; members 2 (caller) and 3 (this host); `status` (staff:
+    /// Root 1; 2 calls and 3 is this host; 9 is banned; `status` (staff:
     /// anyone [`ISS`] verified) on 3.
     fn setup() -> (SignedState, HostConfig) {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let mut s = State::new(root.node_id());
         s.version = StateVersion(5);
         s.not_after = 100;
-        s.members.extend([node(2), node(3)]);
-        s.hosts.insert(node(3));
+        s.ban(node(9), 100);
         s.roles.insert(role("staff"), vec![Matcher::new(ISS)]);
         s.services.insert(
             name("status"),
@@ -648,8 +653,8 @@ mod tests {
             admit(&s, &cfg, node(3), node(2), None, &status, 101),
             Err(GateRefusal::Stale { .. })
         ));
-        // A non-member hears the fixed sentence, even under an expired
-        // state: membership is checked before freshness.
+        // A banned node hears the fixed sentence, even under an expired
+        // state: the ban is checked before freshness.
         for now in [0, 101] {
             let e = admit(&s, &cfg, node(3), node(9), None, &status, now).unwrap_err();
             assert_eq!(e.to_string(), NOT_ADMITTED);

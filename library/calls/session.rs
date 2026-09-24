@@ -71,7 +71,7 @@ pub struct Hello {
     pub membership: Membership,
     /// The signed-state version the dialer holds (0: none). A host holding a
     /// newer one answers with it in [`HelloAck::newer_state`] or refuses a
-    /// removed member; a host holding an older one pulls it.
+    /// node it bans; a host holding an older one pulls it.
     pub state_version: StateVersion,
     /// The dialer's IdP ID token (nonce-bound to its node key), when it has
     /// logged in.

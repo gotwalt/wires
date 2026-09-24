@@ -16,8 +16,8 @@
 //!   admits only its own issuer's principals.
 //! - [`also_require_only_tightens`]
 //! - [`an_unassigned_service_refuses_to_start`]
-//! - [`a_removed_member_is_refused_on_the_next_call`]: the state bump
-//!   applies with no restart; an older caller copy gets the newer state back.
+//! - [`a_removed_member_is_refused_on_the_next_call`]: the ban applies with
+//!   no restart; an older caller copy gets the newer state back.
 //! - [`push_follows_the_signed_state`]: card 23's push and inbox fetch,
 //!   authorized by the registry roles in `push.allow`.
 //! - [`a_fetch_with_a_token_makes_a_caller_reachable_by_role`]: a logged-in
@@ -82,15 +82,15 @@ impl World {
         }
     }
 
-    /// The signed state at `version`: `members` plus the host; roles
+    /// The signed state at `version`, banning `banned`; roles
     /// `analyst` (alice, carol) and `sre` (carol), each email at its own
     /// IdP, and `staff` (anyone the three people's IdPs verified);
     /// `orders-db` (analyst) and `status` (staff), both on the host.
-    fn state(&self, version: u64, members: &[NodeId]) -> SignedState {
+    fn state(&self, version: u64, banned: &[NodeId]) -> SignedState {
         signed_state(&self.root, version, |s| {
-            s.members.extend(members.iter().copied());
-            s.members.insert(self.host.node_id());
-            s.hosts.insert(self.host.node_id());
+            for b in banned {
+                s.ban(*b, i64::MAX);
+            }
             s.roles.insert(
                 role("analyst"),
                 vec![
@@ -120,14 +120,6 @@ impl World {
             s.services
                 .insert(service("status"), on_host(vec![role("staff")]));
         })
-    }
-
-    fn everyone(&self) -> Vec<NodeId> {
-        vec![
-            self.alice.node_id(),
-            self.bob.node_id(),
-            self.carol.node_id(),
-        ]
     }
 
     /// A `host.json` trusting all four IdPs, with `services` spliced in.
@@ -242,7 +234,7 @@ const SERVICES: &str = r#"{
 #[tokio::test]
 async fn the_registry_decides_who_runs_what() {
     let w = World::new().await;
-    let state = w.state(1, &w.everyone());
+    let state = w.state(1, &[]);
     let mut host = Host::start(&w, w.host_json(SERVICES, false), &state)
         .await
         .unwrap();
@@ -317,25 +309,21 @@ async fn the_registry_decides_who_runs_what() {
     let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "status", &[]).await;
     assert_eq!(out.stdout(), "up as staff");
 
-    // A name the registry doesn't know, and a stranger.
+    // A name the registry doesn't know, and a stranger (another network's
+    // badge).
     let out = call(&w.alice, &host, w.hello(&w.alice, 1, true), "nope", &[]).await;
     assert_eq!(out.denied(), "unknown service: nope");
     let stranger = NodeIdentity::from_seed([66u8; 32]);
-    let out = call(
-        &stranger,
-        &host,
-        w.hello(&stranger, 1, false),
-        "status",
-        &[],
-    )
-    .await;
+    let mut hello = w.hello(&stranger, 1, false);
+    hello.membership = super::membership(&NodeIdentity::from_seed([67u8; 32]), &stranger);
+    let out = call(&stranger, &host, hello, "status", &[]).await;
     assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
 }
 
 #[tokio::test]
 async fn a_trusted_issuer_cannot_vouch_for_another_issuers_people() {
     let w = World::new().await;
-    let host = Host::start(&w, w.host_json(SERVICES, false), &w.state(1, &w.everyone()))
+    let host = Host::start(&w, w.host_json(SERVICES, false), &w.state(1, &[]))
         .await
         .unwrap();
     // The partner IdP verifies alice@example.com, and the host trusts it,
@@ -372,7 +360,7 @@ async fn a_trusted_issuer_cannot_vouch_for_another_issuers_people() {
 #[tokio::test]
 async fn also_require_only_tightens() {
     let w = World::new().await;
-    let state = w.state(1, &w.everyone());
+    let state = w.state(1, &[]);
     let strict = r#"{ "orders-db": { "command": ["echo", "ok"], "also_require": ["sre"] } }"#;
     let host = Host::start(&w, w.host_json(strict, false), &state)
         .await
@@ -409,11 +397,9 @@ async fn also_require_only_tightens() {
 #[tokio::test]
 async fn an_unassigned_service_refuses_to_start() {
     let w = World::new().await;
-    let mut state = w.state(1, &w.everyone()).state;
+    let mut state = w.state(1, &[]).state;
     // `status` moves to another host.
     let other = NodeIdentity::from_seed([11u8; 32]).node_id();
-    state.members.insert(other);
-    state.hosts.insert(other);
     state.services.get_mut(&service("status")).unwrap().hosts = vec![other];
     let state = state.sign(&w.root).unwrap();
     let Err(e) = Host::start(&w, w.host_json(SERVICES, false), &state).await else {
@@ -444,7 +430,7 @@ async fn an_unassigned_service_refuses_to_start() {
 #[tokio::test]
 async fn a_removed_member_is_refused_on_the_next_call() {
     let w = World::new().await;
-    let host = Host::start(&w, w.host_json(SERVICES, false), &w.state(1, &w.everyone()))
+    let host = Host::start(&w, w.host_json(SERVICES, false), &w.state(1, &[]))
         .await
         .unwrap();
     let out = call(
@@ -457,8 +443,9 @@ async fn a_removed_member_is_refused_on_the_next_call() {
     .await;
     assert_eq!(out.stdout(), "rows: 1\n");
 
-    // `wires remove alice`: version 2 without her reaches the host; no restart.
-    let v2 = w.state(2, &[w.bob.node_id(), w.carol.node_id()]);
+    // `wires remove alice`: version 2, banning her, reaches the host; no
+    // restart. Her badge is still genuine and unexpired.
+    let v2 = w.state(2, &[w.alice.node_id()]);
     host.adopt(&w, &v2);
     // She still presents version 1 (and a valid token): the host's copy decides.
     let out = call(
@@ -492,7 +479,7 @@ async fn a_removed_member_is_refused_on_the_next_call() {
 #[tokio::test]
 async fn push_follows_the_signed_state() {
     let w = World::new().await;
-    let host = Host::start(&w, w.host_json(SERVICES, true), &w.state(1, &w.everyone()))
+    let host = Host::start(&w, w.host_json(SERVICES, true), &w.state(1, &[]))
         .await
         .unwrap();
     let push = host.push.clone().unwrap();
@@ -529,9 +516,9 @@ async fn push_follows_the_signed_state() {
     };
     assert!(why.contains("no role allowed to receive pushes"), "{why}");
 
-    // Removed from the state: her queue is dropped and her fetch refused.
+    // Banned by the state: her queue is dropped and her fetch refused.
     push.send(spec(&w.alice)).await.unwrap();
-    host.adopt(&w, &w.state(2, &[w.bob.node_id(), w.carol.node_id()]));
+    host.adopt(&w, &w.state(2, &[w.alice.node_id()]));
     let Fetched::Refused(why) = fetch(&w, &w.alice, &host, None).await else {
         panic!("a removed member may not fetch");
     };
@@ -571,7 +558,7 @@ async fn fetch(
 #[tokio::test]
 async fn a_fetch_with_a_token_makes_a_caller_reachable_by_role() {
     let w = World::new().await;
-    let state = w.state(1, &w.everyone());
+    let state = w.state(1, &[]);
     let host = Host::start(&w, w.host_json(SERVICES, true), &state)
         .await
         .unwrap();

@@ -49,8 +49,9 @@ pub(crate) const HINTS_FILE: &str = "hints";
 pub(crate) const OWN_HINT_FILE: &str = "run/hint";
 
 /// The hosts to try for `service`, in order: `last_good` first if it still
-/// implements it, then the registry's order. Empty if the service is unknown
-/// or has no hosts.
+/// implements it, then the registry's order. Never a host the state bans
+/// (card 35: a caller never sends `Hello` or `Invoke` to a removed host).
+/// Empty if the service is unknown or has no such hosts.
 pub(crate) fn candidates(
     state: &State,
     service: &ServiceName,
@@ -59,7 +60,12 @@ pub(crate) fn candidates(
     let Some(svc) = state.service(service) else {
         return Vec::new();
     };
-    let mut hosts = svc.hosts.clone();
+    let mut hosts: Vec<NodeId> = svc
+        .hosts
+        .iter()
+        .copied()
+        .filter(|h| !state.is_banned(*h))
+        .collect();
     if let Some(good) = last_good
         && let Some(at) = hosts.iter().position(|h| *h == good)
     {
@@ -242,8 +248,6 @@ mod tests {
     fn state() -> State {
         let mut s = State::new(node(1));
         s.version = StateVersion(1);
-        s.members.extend([node(2), node(3), node(4)]);
-        s.hosts.extend([node(2), node(3)]);
         let svc = |hosts: Vec<NodeId>| Service {
             description: String::new(),
             allow: vec![RoleName::new("staff").unwrap()],
@@ -268,6 +272,20 @@ mod tests {
         assert_eq!(candidates(&s, &name, Some(node(4))), vec![node(2), node(3)]);
         let other = ServiceName::new("nope").unwrap();
         assert!(candidates(&s, &other, None).is_empty());
+    }
+
+    /// Card 35: a host the state bans is never a candidate, even as the
+    /// last one that answered. (A validated state can't list a banned host;
+    /// this is the caller's own guard.)
+    #[test]
+    fn a_banned_host_is_never_a_candidate() {
+        let mut s = state();
+        s.bans.insert(node(2), i64::MAX);
+        let name = ServiceName::new("orders-db").unwrap();
+        assert_eq!(candidates(&s, &name, None), vec![node(3)]);
+        assert_eq!(candidates(&s, &name, Some(node(2))), vec![node(3)]);
+        s.bans.insert(node(3), i64::MAX);
+        assert!(candidates(&s, &name, None).is_empty());
     }
 
     #[test]

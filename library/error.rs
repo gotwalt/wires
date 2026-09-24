@@ -47,10 +47,17 @@ pub enum Error {
     },
 
     /// The credential's subject does not match the node checking it: a
-    /// membership's member is not the authenticated caller, or an invite's
-    /// state does not name the invitee.
+    /// membership's member is not the authenticated caller.
     #[error("credential subject does not match caller")]
     SubjectMismatch,
+
+    /// The node's badge verifies, but the signed state bans it (the admin
+    /// removed it; [`State::bans`](crate::State::bans)).
+    #[error("banned until {until}")]
+    Banned {
+        /// The ban's `until`, unix seconds.
+        until: i64,
+    },
 
     /// A byte slice had the wrong length for the key, signature, id or
     /// digest it decodes to.

@@ -679,7 +679,8 @@ where
 /// (at most [`MAX_INVOKE_FRAME`]), then decide by **this host's** signed
 /// state (re-read now, so a removal applies on the next dial):
 ///
-/// 1. the caller's membership credential, and that the state lists it
+/// 1. the caller's badge (membership credential), and that the state
+///    doesn't ban it
 ///    ([`ServicesHost::check_member`](crate::host::gate::ServicesHost::check_member)).
 ///    Anyone else hears only [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED),
 ///    costs no token verification, and is traced, not logged;
@@ -688,7 +689,8 @@ where
 ///    assigned here → registry role → `also_require`;
 /// 4. whether `host.json` implements the service.
 ///
-/// A member's refusal is a [`Frame::Denied`] plus a call-log record.
+/// An admitted caller's refusal is a [`Frame::Denied`] plus a call-log
+/// record.
 /// `preauth` is returned once this is decided.
 ///
 /// Admitted: the call's `Started` is appended to the call log and `fsync`ed
@@ -755,13 +757,13 @@ where
             return Err(Refused(reason.to_string()).into());
         }
     };
-    // Membership first: a stranger costs no token verification (no JWKS
-    // fetch, no identity-index entry) and no call-log entry.
+    // The badge and the bans first: a stranger costs no token verification
+    // (no JWKS fetch, no identity-index entry) and no call-log entry.
     if let Err(detail) = host.check_member(&state, &hello.membership, caller, now) {
         let reason = crate::host::gate::NOT_ADMITTED;
         return Err(refuse_stranger(&mut send, caller, reason, &detail).await);
     }
-    // A member from here on: every refusal is logged.
+    // Admitted from here on: every refusal is logged.
     let (principal, missing) = host.principal(caller, hello.id_token.as_ref(), now).await;
     let admitted = match host.decide(
         &state,
@@ -1294,8 +1296,8 @@ mod tests {
     }
 
     /// A host implementing service `t` as `command`, allowed to role `staff`
-    /// (anyone the shared test IdP verified); the caller and the host are the
-    /// members of its signed state.
+    /// (anyone the shared test IdP verified); its signed state bans
+    /// [`stranger`]`(7)`.
     fn host_running(command: &[&str]) -> Arc<ServicesHost> {
         Arc::new(host_unshared(command))
     }
@@ -1309,15 +1311,14 @@ mod tests {
 
     /// [`host_running`], before it is shared.
     fn host_unshared(command: &[&str]) -> ServicesHost {
-        let (root, host, caller) = (root(), host_id(), caller_id());
+        let (root, host) = (root(), host_id());
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);
         let mut s = State::new(root.node_id());
         s.version = StateVersion(1);
         s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
-        s.members.extend([host.node_id(), caller.node_id()]);
-        s.hosts.insert(host.node_id());
+        s.ban(stranger(7).0, i64::MAX);
         let (staff, matchers) = crate::testutil::staff_role();
         s.roles.insert(staff.clone(), matchers);
         s.services.insert(
@@ -1743,8 +1744,8 @@ mod tests {
         refusal_by(&host_running(&["cat"]), encoded(frames), caller).await
     }
 
-    /// A key that is not in the state, with a membership the root really
-    /// minted for it (so only the state's member list keeps it out).
+    /// A key the state bans, with a badge the root really minted for it (so
+    /// only the ban keeps it out).
     fn stranger(seed: u8) -> (NodeId, Hello) {
         let id = NodeIdentity::from_seed([seed; 32]).node_id();
         let hello = Hello {
@@ -1764,9 +1765,9 @@ mod tests {
         assert_eq!(r, DENY_INVOKE_REQUIRED);
     }
 
-    /// Whatever keeps a peer out — someone else's credential, a credential
-    /// from another network, or a genuine one the state doesn't list — it
-    /// hears the one fixed sentence: no reason, no state version.
+    /// Whatever keeps a peer out — someone else's badge, a badge from another
+    /// network, or a genuine one the state bans — it hears the one fixed
+    /// sentence: no reason, no state version.
     #[tokio::test]
     async fn a_non_member_hears_only_the_fixed_refusal() {
         let open = [Frame::Hello(hello()), Frame::Invoke(invoke(&[]))];
@@ -1779,14 +1780,14 @@ mod tests {
         };
         let foreign = refusal(&[Frame::Hello(foreign), Frame::Invoke(invoke(&[]))], id).await;
         let (id, genuine) = stranger(7);
-        let unlisted = refusal(&[Frame::Hello(genuine), Frame::Invoke(invoke(&[]))], id).await;
-        for r in [theirs, foreign, unlisted] {
+        let banned = refusal(&[Frame::Hello(genuine), Frame::Invoke(invoke(&[]))], id).await;
+        for r in [theirs, foreign, banned] {
             assert_eq!(r, crate::host::gate::NOT_ADMITTED);
         }
     }
 
-    /// A non-member's ID token is never looked at: no verification, so no
-    /// JWKS fetch and no identity-index entry. (A member's is.)
+    /// A banned node's ID token is never looked at: no verification, so no
+    /// JWKS fetch and no identity-index entry. (An admitted node's is.)
     #[tokio::test]
     async fn a_non_member_never_has_its_token_verified() {
         let host = host_running(&["true"]);
@@ -1819,9 +1820,9 @@ mod tests {
     }
 
     /// The card's flood: a thousand connections from keys that aren't
-    /// members — junk, silence, out-of-turn frames, someone else's
-    /// credential, a genuine but unlisted one — write nothing to the call
-    /// log. A member's refusal is still logged.
+    /// admitted — junk, silence, out-of-turn frames, someone else's badge,
+    /// a genuine but banned one — write nothing to the call log. An
+    /// admitted node's refusal is still logged.
     #[tokio::test]
     async fn strangers_leave_nothing_in_the_log_and_members_do() {
         let (sink, mut records) = AuditSink::channel(2048);
@@ -1832,26 +1833,24 @@ mod tests {
                 s[..4].copy_from_slice(&n.to_be_bytes());
                 s
             });
-            let genuine = Hello {
-                membership: Membership::mint(&root(), key.node_id(), 0, i64::MAX).unwrap(),
-                ..hello()
-            };
-            let bytes = match n % 5 {
-                0 => vec![0xde, 0xad, 0xbe, 0xef, 1, 2, 3],
-                1 => Vec::new(),
-                2 => encoded(&[Frame::Invoke(invoke(&[]))]),
-                3 => encoded(&[Frame::Hello(hello()), Frame::Invoke(invoke(&[]))]),
-                _ => encoded(&[Frame::Hello(genuine), Frame::Invoke(invoke(&[]))]),
+            let (banned, genuine) = stranger(7);
+            let (caller, bytes) = match n % 5 {
+                0 => (key.node_id(), vec![0xde, 0xad, 0xbe, 0xef, 1, 2, 3]),
+                1 => (key.node_id(), Vec::new()),
+                2 => (key.node_id(), encoded(&[Frame::Invoke(invoke(&[]))])),
+                3 => (
+                    key.node_id(),
+                    encoded(&[Frame::Hello(hello()), Frame::Invoke(invoke(&[]))]),
+                ),
+                _ => (
+                    banned,
+                    encoded(&[Frame::Hello(genuine), Frame::Invoke(invoke(&[]))]),
+                ),
             };
             let (send, _answer) = tokio::io::duplex(64 * 1024);
-            let r = serve_services_session(
-                send,
-                std::io::Cursor::new(bytes),
-                key.node_id(),
-                &host,
-                never(),
-            )
-            .await;
+            let r =
+                serve_services_session(send, std::io::Cursor::new(bytes), caller, &host, never())
+                    .await;
             assert!(r.is_err());
         }
         assert!(

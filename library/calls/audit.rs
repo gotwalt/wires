@@ -315,8 +315,8 @@ pub enum PushOutcome {
     Expired,
     /// Pushed out of a full queue by a newer message.
     Dropped,
-    /// Refused: the recipient isn't a current member, or holds no role in
-    /// `push.allow` (at send, delivery or fetch time).
+    /// Refused: the current signed state bans the recipient, or it holds no
+    /// role in `push.allow` (at send, delivery or fetch time).
     Denied,
 }
 

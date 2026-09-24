@@ -458,9 +458,10 @@ static STRANGERS: transport::Throttle = transport::Throttle::new();
 
 /// The inbox ALPN on a waiting caller: accepts deliveries from hosts.
 ///
-/// A delivery is accepted only from a peer that proves fabric membership
-/// and that this node's **signed state names as a host** (re-read per
-/// delivery). Each message must be from that peer and to this node.
+/// A delivery is accepted only from a peer whose badge proves it is in this
+/// network and that this node's **signed state names as a host**, which it
+/// doesn't ban (re-read per delivery). Each message must be from that peer
+/// and to this node.
 #[derive(Clone)]
 pub(crate) struct InboxReceiver {
     /// This node.
@@ -482,8 +483,8 @@ impl std::fmt::Debug for InboxReceiver {
 }
 
 impl InboxReceiver {
-    /// Whether `peer` may deliver here: a member, and a host in this node's
-    /// signed state. `Err` is why not, for this node's trace only: the peer
+    /// Whether `peer` may deliver here: its badge verifies, and it is a host
+    /// in this node's signed state, not banned ([`library::State::is_host`]). `Err` is why not, for this node's trace only: the peer
     /// hears just [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED).
     pub(crate) fn admit(
         &self,
@@ -868,19 +869,20 @@ mod tests {
         Mailbox::open(&crate::testutil::temp_dir()).unwrap()
     }
 
-    /// Card 28 §9: a dialer that may not deliver here (a member that isn't
-    /// a host, or no member at all) hears only the fixed "not admitted", no
-    /// reason and no state version.
+    /// Card 28 §9: a dialer that may not deliver here (an admitted node
+    /// that isn't a host, a banned host, or another network's node) hears
+    /// only the fixed "not admitted", no reason and no state version.
     #[tokio::test]
     async fn a_refused_deliverer_hears_only_not_admitted() {
         let root = NodeIdentity::from_seed([1; 32]);
         let (me, member, stranger) = (node(2), NodeIdentity::from_seed([3; 32]), node(4));
+        let banned = node(6);
         let home = crate::testutil::temp_dir();
         let ks = Arc::new(Keystore::at(&home));
         let mut s = library::State::new(root.node_id());
         s.version = library::StateVersion(9);
         s.not_after = i64::MAX;
-        s.members.extend([me, member.node_id()]);
+        s.ban(banned, i64::MAX);
         let signed = s.sign(&root).unwrap();
         crate::state::store::adopt_if_newer(&ks, &signed, root.node_id(), 10).unwrap();
         let receiver = InboxReceiver {
@@ -898,6 +900,10 @@ mod tests {
             (
                 stranger,
                 Membership::mint(&other_root, stranger, 0, i64::MAX).unwrap(),
+            ),
+            (
+                banned,
+                Membership::mint(&root, banned, 0, i64::MAX).unwrap(),
             ),
         ] {
             let (mut dialer, host_side) = tokio::io::duplex(64 * 1024);
