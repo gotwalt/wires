@@ -442,6 +442,6 @@ proofs, multiproofs, slices and their sizes in the notes above, and the "host sl
   wholes 1`); beat 1 s / fresh 3 s: with the directory stopped, `lenient` keeps serving and
   `strict` refuses with the stale text, then serves again once the directory restarts from
   `directory.redb`; a host restarted from disk with no directory up serves at once.
-- **Measured:** one ban edit costs each host **1,191 B in one frame** (test fixture: 2 roles-ish
-  policy with 21 bans, whole policy 4,473 B), matching 36d's 1.2 KB; a `fresh` beat is ~475 B
+- **Measured:** one ban edit costs each host **1,191 B in one frame** (test fixture: one role, one service and
+  21 bans; the whole policy is 4,473 B), matching 36d's 1.2 KB; a `fresh` beat is ~475 B
   (36a).
