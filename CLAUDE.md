@@ -35,7 +35,7 @@ non-negotiables and kill criteria are at the top of `docs/board/README.md`.
 **Git history is the archive:** outdated docs are deleted, not moved aside.
 The product summary is `docs/executive-summary.md`. The pre-restart prototype is tagged `archive/poc-2026-05`: reference
 it freely, but never merge from it. That includes the old HTTP/OAuth
-`wires-mcp` gateway; `wires gateway` (card 28) is its from-scratch
+`wires-mcp` gateway; `wires gateway` (card 30) is its from-scratch
 replacement on the current identity model.
 
 **Case-insensitive FS gotcha:** the package directory is `wires/`. If a new

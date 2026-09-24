@@ -1,4 +1,4 @@
-# 28 — Web gateway: `wires gateway` for Claude.ai
+# 30 — Web gateway: `wires gateway` for Claude.ai
 
 **Lane:** W · **Depends on:** 27, 26 · **Opened:** 2026-09-23
 
@@ -37,10 +37,11 @@ already uses — and without weakening "the host verifies the IdP itself".
 - [x] `cargo test --workspace`, clippy `-D warnings`, fmt clean
 - [x] e2e: DCR → consent → mock Google → code (+`state`, `iss`) → token →
       modern and legacy MCP; dialer receives the user's gateway-bound token
-- [ ] infra applied (PR #17; CI blocked on GitHub billing)
+- [x] infra applied (break-glass local apply 2026-09-23: 5 added, 1 changed; merge PR #17 once CI billing is fixed)
 - [ ] Google *Web application* client with `…/oauth/callback`; its id in the
       workbench host's `identity.issuers` audiences
-- [ ] gateway invited + joined; running on workbench
+- [x] gateway invited (`gateway`, b7b1289e…, state v9) + joined on workbench
+- [ ] gateway `.env` on workbench; `docker compose up -d`
 - [ ] Claude.ai connector added; `orders-db` called as gotwalt@gmail.com,
       the call in the host's log
 
