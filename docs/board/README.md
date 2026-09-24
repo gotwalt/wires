@@ -12,8 +12,7 @@ for logging and compliance.
 of the host's keystore, card 28, though it still runs as the host's user until
 [card 32](backlog/32-service-sandbox-OPEN.md)); offline-verifiable membership
 (no auth-server round-trip; removal is a root-signed ban that takes effect at
-each host's next dial, decided 2026-09-24, built by card 35; until then,
-removal by omission); **the premise
+each host's next dial, decided 2026-09-24, built by card 35); **the premise
 outranks the docs, and the docs outrank the code** (README and docs first,
 code second: a disagreement is a code bug unless the doc breaks the
 premise). **Kill criteria:** if no one wants
