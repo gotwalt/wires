@@ -341,6 +341,7 @@ To make `wires` the boundary, use a structural setup:
 | | `wires services [--verbose] [--json]` | List the services you may call and the role that admits you, evaluated locally. `--verbose` adds their hosts. |
 | | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name (or a `tools.json` alias). Stdio passes through and its exit code becomes `call`'s. A refusal exits `77`. |
 | | `wires mcp` | Serve the same services as MCP tools over stdio, for clients that can't run a CLI. |
+| | `wires gateway --public-url https://… [--listen addr] [--client-id …]` | Serve them as a remote MCP server (Streamable HTTP + OAuth 2.1) for web clients such as Claude.ai. Each user signs in with Google through the gateway and calls with their own token ([deployment](deployment.md#a-web-gateway)). |
 | | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`. |
 | **reader** | `wires watch [service…] [--mine] [--once] [--json]` | Stream call records from your services' hosts, verified: all records of services whose `readers` role you're in, otherwise your own. |
 
@@ -392,6 +393,7 @@ since a host's control socket lives under it and socket paths are limited to
 | `inbox/` | `inbox` | Pushed messages: `new/` unread (at most 256, oldest evicted with a note), `read/` the last 1024 (0700). |
 | `record-marks.json` | `watch` | The last verified record per host. |
 | `call-log.jsonl`, `push-queue.json`, `run/` | `serve` | A host's call log, undelivered pushes, control socket and own hint line. |
+| `gateway-client-key`, `gateway-sessions.json` | `gateway` | The key DCR client ids are MAC'd with, and live web sessions keyed by token hash (0600). |
 
 Secrets resolve **flag → environment variable → `--…-file` → keystore**, so
 a container can mount its node key from a secret with `--node-seed-file`.

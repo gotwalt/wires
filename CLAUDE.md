@@ -17,7 +17,8 @@ token bound to the node key and presented in the session handshake. Every
 call is recorded by the host in its own signed, hash-linked log, which the
 readers the registry names stream with `wires watch`. Nothing is broadcast
 (there is no channel). `wires call` is the CLI-native path; `wires mcp` is
-the stdio MCP on-ramp for clients that only speak MCP. The goal is a sharp
+the stdio MCP on-ramp for clients that only speak MCP; `wires gateway` is the
+remote-MCP on-ramp for web clients (Claude.ai). The goal is a sharp
 demo for the MCP team.
 
 **Read `docs/board/README.md` before planning any work.** It holds the pitch,
@@ -34,7 +35,8 @@ non-negotiables and kill criteria are at the top of `docs/board/README.md`.
 **Git history is the archive:** outdated docs are deleted, not moved aside.
 The product summary is `docs/executive-summary.md`. The pre-restart prototype is tagged `archive/poc-2026-05`: reference
 it freely, but never merge from it. That includes the old HTTP/OAuth
-`wires-mcp` gateway, which `wires mcp` replaces; don't port it.
+`wires-mcp` gateway; `wires gateway` (card 28) is its from-scratch
+replacement on the current identity model.
 
 **Case-insensitive FS gotcha:** the package directory is `wires/`. If a new
 file shows up in `git status` as `Wires/…`, add it by its lowercase path.
@@ -123,8 +125,9 @@ host exposing CLIs needs an image that also has those CLIs.
     verified identities, the call log and OTLP export, the record stream, push
     and its control socket), `caller/` (`join`, `login`, `services`, `call`
     with service → host failover and the local hints file, `mcp`, `inbox`,
-    `watch`), `state/` (the signed state on this node: the store, and push /
-    pull by key); `e2e/` holds the loopback integration tests and
+    `watch`), `gateway/` (`wires gateway`: remote MCP over HTTP + OAuth
+    for web clients, calling with each user's own ID token), `state/` (the
+    signed state on this node: the store, and push / pull by key); `e2e/` holds the loopback integration tests and
     `testutil.rs` the shared test fixtures. See `docs/board/README.md` § Roles.
   - `library/`: `membership/`, `calls/`, `services/` are folders only — every
     module is declared at the crate root with `#[path]`, so public paths

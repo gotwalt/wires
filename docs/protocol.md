@@ -195,6 +195,14 @@ value is accepted; `exp` and `iat` are within the 60 s clock skew; `nonce == for
 remembers the latest verified principal per node (`wires/host/identity.rs`) and never lets a failure
 or an older token displace it. It knows only the callers that presented a token **to it**.
 
+**A web gateway** (`wires gateway`) is one member node that carries many principals: it asks the IdP
+for each web user's ID token with `nonce = for_node(gateway)` and presents that user's token in the
+`Hello` of each call it makes for them. Nothing on the wire changes; the host sees a member node
+presenting a token bound to it. The gateway offers a user only services that a non-`member` role
+admits by that user's principal. It issues its own OAuth access tokens (opaque, bound to its
+`/mcp`, expiring with the ID token) and no refresh tokens. Its MCP endpoint serves the 2026-07-28
+Streamable HTTP binding and the legacy `initialize` era ([deployment.md](deployment.md)).
+
 ## 7. Push: `wires/inbox/2`
 
 A host sends a `PushMessage { id, from, to, subject (≤128 B), body (≤16 KiB), at_ms, expires_ms }`
@@ -284,5 +292,7 @@ precedence.
 - Every member holds the whole state (member ids, roles, registry).
 - A host knows a caller's identity only after the caller presented its token to that host, so push
   by role reaches only those callers.
+- A web gateway holds each signed-in user's gateway-bound ID token until it expires (~1 h), and
+  hosts index identity per node, so push and `watch --mine` are not offered through it.
 - One fabric per keystore. The caller checks the host's membership, not whether the host is still
   in the state.

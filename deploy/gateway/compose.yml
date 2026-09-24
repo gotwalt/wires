@@ -1,0 +1,44 @@
+# `wires gateway` behind a Cloudflare Tunnel: the services each signed-in
+# user may call, as a remote MCP server at https://$WIRES_GATEWAY_HOST/mcp
+# (add it in Claude as a custom connector). See docs/deployment.md
+# § "A web gateway".
+#
+#   cp .env.example .env            # fill it in (never commit it)
+#   docker compose build
+#   docker compose run --rm wires-gateway id          # send the id to the admin
+#   docker compose run --rm wires-gateway join <token>
+#   docker compose up -d
+#
+# The tunnel's ingress (in positivesum/infra) routes the public host to
+# http://wires-gateway:8080 on this project's network; nothing is published
+# on the Docker host.
+name: wires
+
+services:
+  wires-gateway:
+    build:
+      context: ../..
+    image: wires:gateway
+    command: ["gateway", "--listen", "0.0.0.0:8080"]
+    environment:
+      WIRES_HOME: /data
+      WIRES_GATEWAY_URL: https://${WIRES_GATEWAY_HOST}
+      WIRES_GATEWAY_CLIENT_ID: ${WIRES_GATEWAY_CLIENT_ID}
+      WIRES_GATEWAY_CLIENT_SECRET: ${WIRES_GATEWAY_CLIENT_SECRET}
+      RUST_LOG: ${RUST_LOG:-warn,wires=info}
+    volumes:
+      # The gateway's keystore: node key, membership, signed state, DCR key,
+      # sessions. Must persist (the node key is the gateway's identity).
+      - keystore:/data
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${WIRES_TUNNEL_TOKEN}
+    depends_on: [wires-gateway]
+    restart: unless-stopped
+
+volumes:
+  keystore:

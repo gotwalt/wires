@@ -13,6 +13,8 @@
 //!   push by the state), and nothing is broadcast to a bystander.
 //! - [`records`] — card 26b: call records streamed from the host's own log
 //!   to authorized readers (`wires watch`).
+//! - [`gateway`] — `wires gateway`: a web MCP client signs in (OAuth, a mock
+//!   Google) and calls as its user, over real HTTP.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -24,6 +26,9 @@ mod services_host;
 
 /// Card 26b: call records streamed from the host's log to authorized readers.
 mod records;
+
+/// `wires gateway`: OAuth sign-in and MCP over HTTP, end to end.
+mod gateway;
 
 /// The outer bound on any single wait here: generous, and never reached in
 /// the passing case (every wait is on an event, not a clock).

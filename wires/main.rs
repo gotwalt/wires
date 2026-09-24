@@ -11,6 +11,9 @@
 //! - **caller** ([`caller`]) — `wires login | services | call | mcp | inbox`:
 //!   runs remote CLIs by service name (`mcp` is the adapter for clients that
 //!   only speak MCP).
+//! - **gateway** ([`gateway`]) — `wires gateway`: those services as a
+//!   remote MCP server with OAuth, for web clients (Claude.ai), each call
+//!   made with the signed-in user's own ID token.
 //! - **observer** — `wires watch`: streams call records from the hosts' own
 //!   logs, to readers the registry names (card 26b, [`caller::watch_records`]).
 //!
@@ -29,6 +32,7 @@
 
 mod admin;
 mod caller;
+mod gateway;
 mod host;
 mod state;
 
@@ -77,6 +81,7 @@ Caller — runs remote CLIs by service name (every role joins the same way):
   services  List the services you may call, and the role that lets you
   call      Run a service by name: stdio passes through, its exit code is ours
   mcp       Serve those services as MCP tools over stdio (compatibility)
+  gateway   Serve them as a remote MCP server (HTTP + OAuth) for web users
   inbox     Read what hosts pushed to you; --wait blocks until something arrives
 
 Reader — reads the hosts' call records:
@@ -150,6 +155,10 @@ enum Command {
     /// read; `--wait` blocks until something arrives (exit 124 on
     /// `--timeout`).
     Inbox(caller::inbox::InboxArgs),
+
+    /// Serve the services each signed-in user may call as a remote MCP
+    /// server (Streamable HTTP + OAuth 2.1), for web clients like Claude.ai.
+    Gateway(gateway::GatewayArgs),
 
     // --- reader ---
     /// Stream call records from the hosts of your services: every record of
@@ -339,6 +348,13 @@ fn main() {
             if let Err(e) = runtime().block_on(caller::mcp::mcp_cmd(a)) {
                 eprintln!("wires: {e:#}");
                 std::process::exit(1);
+            }
+        }
+        Command::Gateway(a) => {
+            init_logging();
+            runtime().block_on(state::sync::refresh_cold());
+            if let Err(e) = runtime().block_on(gateway::gateway_cmd(a)) {
+                exit_with(e);
             }
         }
         // Exit 77 when every host refused the stream.
