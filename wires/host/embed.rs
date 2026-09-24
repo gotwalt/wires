@@ -255,7 +255,7 @@ mod tests {
         let ks = Keystore::at(&home);
         let root = library::NodeIdentity::from_seed([1u8; 32]);
         let node = library::NodeIdentity::from_seed([9u8; 32]);
-        ks.save_node(&node, false).unwrap();
+        ks.save_node(&node).unwrap();
         ks.save_membership(&library::Membership::mint(&root, node.node_id(), 0, i64::MAX).unwrap())
             .unwrap();
         home
@@ -291,7 +291,7 @@ mod tests {
         let empty = crate::testutil::temp_dir();
         assert!(err(Host::builder(&empty).service("t", Nop)).contains("wires id"));
         Keystore::at(&empty)
-            .save_node(&library::NodeIdentity::generate(), false)
+            .save_node(&library::NodeIdentity::generate())
             .unwrap();
         assert!(err(Host::builder(&empty).service("t", Nop)).contains("wires join"));
     }

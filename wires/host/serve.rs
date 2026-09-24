@@ -390,7 +390,7 @@ mod tests {
         let home = crate::testutil::temp_dir();
         host_at(&home, None).unwrap();
         keystore::Keystore::at(&home)
-            .save_root(&library::NodeIdentity::from_seed([1u8; 32]), false)
+            .save_root(&library::NodeIdentity::from_seed([1u8; 32]))
             .unwrap();
         let e = format!("{:#}", host_at(&home, None).unwrap_err());
         assert!(e.contains("root.seed") && e.contains("own keystore"), "{e}");

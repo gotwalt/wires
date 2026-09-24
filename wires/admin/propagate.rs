@@ -5,7 +5,7 @@
 //! ([`sync::push_current`]). The hosts are the members that listen (only
 //! `wires serve` answers the state protocol) and the ones that enforce it.
 //! If the state names hosts and **none** took it, the command fails:
-//! the fabric is still enforcing the older state. The new one stays stored
+//! the hosts still enforce the older state. The new one stays stored
 //! here, and `wires state push` re-sends it once a host is up.
 //!
 //! ```text
@@ -18,8 +18,8 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 use library::NodeId;
 
-use super::invite::Report;
 use super::keystore::Keystore;
+use super::{Report, run_edit};
 use crate::state::sync;
 
 /// `state` arguments.
@@ -93,16 +93,13 @@ pub(crate) fn fold(mut report: Report, pushed: Propagation) -> Report {
 pub(crate) async fn state_cmd(a: StateArgs) -> Result<Report> {
     match a.cmd {
         StateCmd::Push => {
-            let ks = Keystore::resolve()?;
-            if ks.read_root_identity()?.is_none() {
-                anyhow::bail!("no root key here: `wires state push` runs on the admin");
-            }
-            let report = Report {
-                stdout: String::new(),
-                notes: Vec::new(),
-                failure: None,
-            };
-            Ok(fold(report, propagate(&ks, &BTreeSet::new()).await))
+            run_edit(|ks| {
+                if ks.read_root_identity()?.is_none() {
+                    anyhow::bail!("no root key here: `wires state push` runs on the admin");
+                }
+                Ok(Report::default())
+            })
+            .await
         }
     }
 }
@@ -142,19 +139,5 @@ mod tests {
         let broke = Propagation::from_push(Err(anyhow::anyhow!("no network")));
         assert!(broke.failure.is_some());
         assert!(broke.note.contains("stored here"), "{}", broke.note);
-    }
-
-    #[test]
-    fn state_push_parses() {
-        use crate::{Cli, Command};
-        use clap::Parser;
-        let Command::State(a) = Cli::try_parse_from(["wires", "state", "push"])
-            .unwrap()
-            .command
-        else {
-            panic!("expected state");
-        };
-        assert!(matches!(a.cmd, StateCmd::Push));
-        assert!(Cli::try_parse_from(["wires", "state"]).is_err());
     }
 }

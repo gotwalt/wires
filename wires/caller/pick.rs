@@ -198,18 +198,9 @@ pub(crate) fn hint_line(node: NodeId, addrs: &[SocketAddr]) -> String {
 /// bound sockets, plus iroh's view of its interface addresses) to
 /// `$WIRES_HOME/run/hint`, for a script to append to a caller's `hints`.
 pub(crate) fn write_own_hint(ks: &Keystore, endpoint: &iroh::Endpoint) -> anyhow::Result<()> {
-    use std::net::{Ipv4Addr, Ipv6Addr};
     let mut addrs: Vec<SocketAddr> = endpoint.addr().ip_addrs().copied().collect();
     for sock in endpoint.bound_sockets() {
-        let dialable = match sock {
-            SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
-                SocketAddr::from((Ipv4Addr::LOCALHOST, v4.port()))
-            }
-            SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
-                SocketAddr::from((Ipv6Addr::LOCALHOST, v6.port()))
-            }
-            other => other,
-        };
+        let dialable = crate::net::dialable(sock);
         if !addrs.contains(&dialable) {
             addrs.push(dialable);
         }

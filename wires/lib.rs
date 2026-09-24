@@ -4,28 +4,28 @@
 //! parsing and dispatch ([`run`], which `main.rs` calls), plus the public
 //! surface an app embeds to serve wires calls in-process (card 33):
 //!
-//! - **admin** ([`admin`]) — holds the root key and signs the state: who is
+//! - **admin** (`admin/`) — holds the root key and signs the state: who is
 //!   in, which roles exist, which services run where and who may call them.
-//! - **host** ([`host`]) — `wires serve`: implements the services the signed
+//! - **host** (`host/`) — `wires serve`: implements the services the signed
 //!   state assigns to it, checks every caller against that state, and keeps
 //!   its own log of every call.
-//! - **caller** ([`caller`]) — `wires login | services | call | mcp | inbox`:
+//! - **caller** (`caller/`) — `wires login | services | call | mcp | inbox`:
 //!   runs remote CLIs by service name (`mcp` serves them as MCP over stdio,
 //!   for the MCP clients people already use).
-//! - **gateway** ([`gateway`]) — `wires gateway`: those services as a
+//! - **gateway** (`gateway/`) — `wires gateway`: those services as a
 //!   remote MCP server with OAuth, for web clients (Claude.ai), each call
 //!   made with the signed-in user's own ID token.
 //! - **observer** — `wires watch`: streams call records from the hosts' own
-//!   logs, to readers the registry names (card 26b, [`caller::watch_records`]).
+//!   logs, to readers the registry names (card 26b, `caller/watch_records.rs`).
 //!
-//! [`state`] is where the signed state lives on every node and how it moves.
+//! `state/` is where the signed state lives on every node and how it moves.
 //!
 //! **Embedding** (card 33): an app serves wires calls in-process by
 //! implementing [`Service`] and serving a [`Host`] built from its keystore.
 //! To callers, a native service is a CLI like any other.
 //!
 //! Secrets resolve through flag → env → `--…-file` → on-disk
-//! keystore ([`admin::keystore`]), so once the admin's credentials are
+//! keystore (`admin/keystore.rs`), so once the admin's credentials are
 //! installed, `wires call <service>` and `wires mcp` need no other flags — which
 //! is what lets `wires mcp` drop straight into an MCP client's config as
 //! `"command": "wires"`.
@@ -33,7 +33,7 @@
 //! `call` keeps stdout **byte-pure** (only the remote CLI's bytes): every
 //! diagnostic goes to stderr, and the exit code carries the outcome — the
 //! child's own code on success (a remote `77` is reported as `1`), and
-//! [`EXIT_DENIED`] only when the host refused the call, `1` for any local or
+//! `77` (`EXIT_DENIED`) only when the host refused the call, `1` for any local or
 //! transport failure.
 
 // The crate calls itself `wires` too, so code written against the public API
@@ -166,9 +166,9 @@ enum Command {
     /// Run a service by name: stdio passes through,
     /// its exit code becomes ours, a refusal exits 77.
     Call(caller::call::CallArgs),
-    /// The old name of `wires services`; `add` / `list` / `rm` edit the local
-    /// aliases in `tools.json`.
-    #[command(hide = true)]
+    /// Edit the local aliases in `tools.json` (`add` / `list` / `rm`): a
+    /// name pinned to one host by node id.
+    #[command(hide = true, subcommand_required = true)]
     Tools(caller::tools::ToolsArgs),
     /// Serve the services you may call (plus aliases) as MCP tools over stdio
     /// (Claude Desktop, IDEs, any stdio MCP client).
@@ -274,61 +274,41 @@ pub fn run() {
         }
         Command::Invite(a) => {
             init_quiet_logging();
-            match runtime().block_on(admin::invite::invite_cmd(a)) {
-                Ok(report) => print_report(report),
-                Err(e) => exit_with(e),
-            }
+            print_report(runtime().block_on(admin::invite::invite_cmd(a)))
         }
         Command::Remove(a) => {
             init_quiet_logging();
-            match runtime().block_on(admin::invite::remove_cmd(a)) {
-                Ok(report) => print_report(report),
-                Err(e) => exit_with(e),
-            }
+            print_report(runtime().block_on(admin::invite::remove_cmd(a)))
         }
         Command::Service(a) => {
             init_quiet_logging();
-            match runtime().block_on(admin::service::service_cmd(a)) {
-                Ok(report) => print_report(report),
-                Err(e) => exit_with(e),
-            }
+            print_report(runtime().block_on(admin::service::service_cmd(a)))
         }
         Command::Role(a) => {
             init_quiet_logging();
-            match runtime().block_on(admin::service::role_cmd(a)) {
-                Ok(report) => print_report(report),
-                Err(e) => exit_with(e),
-            }
+            print_report(runtime().block_on(admin::service::role_cmd(a)))
         }
         Command::State(a) => {
             init_quiet_logging();
-            match runtime().block_on(admin::propagate::state_cmd(a)) {
-                Ok(report) => print_report(report),
-                Err(e) => exit_with(e),
-            }
+            print_report(runtime().block_on(admin::propagate::state_cmd(a)))
         }
         Command::Id => print_or_exit(caller::join::id_cmd()),
         Command::Join(a) => print_or_exit(caller::join::join_cmd(a)),
         Command::Serve(a) => {
             if let Err(e) = runtime().block_on(host::serve::serve_cmd(a)) {
-                eprintln!("wires: {e:#}");
-                std::process::exit(1);
+                exit_with(e);
             }
         }
         Command::Push(a) => {
             init_quiet_logging();
-            match runtime().block_on(host::push::push_cmd(a)) {
-                Ok(code) => std::process::exit(code),
-                Err(e) => exit_with(e),
-            }
+            exit_with_code(runtime().block_on(host::push::push_cmd(a)))
         }
         Command::Inbox(a) => {
             init_quiet_logging();
-            runtime().block_on(state::sync::refresh_cold());
-            match runtime().block_on(caller::inbox::inbox_cmd(a)) {
-                Ok(code) => std::process::exit(code),
-                Err(e) => exit_with(e),
-            }
+            exit_with_code(runtime().block_on(async {
+                state::sync::refresh_cold().await;
+                caller::inbox::inbox_cmd(a).await
+            }))
         }
         Command::Login(a) => {
             if let Err(e) = runtime().block_on(caller::login::login_cmd(a)) {
@@ -337,54 +317,40 @@ pub fn run() {
         }
         Command::Call(a) => {
             init_quiet_logging();
-            runtime().block_on(state::sync::refresh_cold());
-            match runtime().block_on(caller::call::call_cmd(a)) {
-                Ok(code) => std::process::exit(code),
-                Err(e) => exit_with(e),
-            }
+            exit_with_code(runtime().block_on(async {
+                state::sync::refresh_cold().await;
+                caller::call::call_cmd(a).await
+            }))
         }
         Command::Services(a) => {
             init_quiet_logging();
-            match runtime().block_on(caller::services::run(&a)) {
-                Ok(out) if out.is_empty() => {}
-                Ok(out) => println!("{out}"),
-                Err(e) => exit_with(e),
-            }
+            print_or_exit(runtime().block_on(caller::services::run(&a)))
         }
-        Command::Tools(a) => {
-            init_quiet_logging();
-            runtime().block_on(state::sync::refresh_cold());
-            match runtime().block_on(caller::tools::tools_cmd(a)) {
-                Ok(out) if out.is_empty() => {}
-                Ok(out) => println!("{out}"),
-                Err(e) => {
-                    eprintln!("wires: {e:#}");
-                    std::process::exit(1);
-                }
-            }
-        }
+        Command::Tools(a) => print_or_exit(caller::tools::run_tools_cmd(a)),
         Command::Mcp(a) => {
             init_quiet_logging();
-            runtime().block_on(state::sync::refresh_cold());
-            if let Err(e) = runtime().block_on(caller::mcp::mcp_cmd(a)) {
-                eprintln!("wires: {e:#}");
-                std::process::exit(1);
+            let served = runtime().block_on(async {
+                state::sync::refresh_cold().await;
+                caller::mcp::mcp_cmd(a).await
+            });
+            if let Err(e) = served {
+                exit_with(e);
             }
         }
         Command::Gateway(a) => {
             init_logging();
-            runtime().block_on(state::sync::refresh_cold());
-            if let Err(e) = runtime().block_on(gateway::gateway_cmd(a)) {
+            let served = runtime().block_on(async {
+                state::sync::refresh_cold().await;
+                gateway::gateway_cmd(a).await
+            });
+            if let Err(e) = served {
                 exit_with(e);
             }
         }
         // Exit 77 when every host refused the stream.
         Command::Watch(a) => {
             init_quiet_logging();
-            match runtime().block_on(caller::watch_records::watch_cmd(a)) {
-                Ok(code) => std::process::exit(code),
-                Err(e) => exit_with(e),
-            }
+            exit_with_code(runtime().block_on(caller::watch_records::watch_cmd(a)))
         }
         #[cfg(feature = "dev-mock-idp")]
         Command::DevMockIdp(a) => {
@@ -395,23 +361,34 @@ pub fn run() {
     }
 }
 
-/// Print an offline command's result on stdout, or its error and exit 1.
+/// Print a command's result on stdout (nothing when it is empty), or
+/// [`exit_with`] its error.
 fn print_or_exit(result: anyhow::Result<String>) {
     match result {
+        Ok(out) if out.is_empty() => {}
         Ok(out) => println!("{out}"),
-        Err(e) => {
-            eprintln!("wires: {e:#}");
-            std::process::exit(1);
-        }
+        Err(e) => exit_with(e),
+    }
+}
+
+/// Exit with a command's own exit code, or [`exit_with`] its error.
+fn exit_with_code(result: anyhow::Result<i32>) -> ! {
+    match result {
+        Ok(code) => std::process::exit(code),
+        Err(e) => exit_with(e),
     }
 }
 
 /// Print an admin command's notes on stderr and its result on stdout (the
 /// token, for `invite` — so `$(wires invite …)` is the token alone). A
 /// failure (the new state reached no host) is printed last and exits 1: the
-/// work is done and stored, but not in force.
-fn print_report(report: admin::invite::Report) {
-    for note in &report.notes {
+/// work is done and stored, but not in force. An error is [`exit_with`].
+fn print_report(result: anyhow::Result<admin::Report>) {
+    let report = match result {
+        Ok(report) => report,
+        Err(e) => exit_with(e),
+    };
+    for note in report.notes.iter().chain(&report.hint) {
         eprintln!("wires: {note}");
     }
     if !report.stdout.is_empty() {
@@ -441,7 +418,6 @@ fn exit_with(e: anyhow::Error) -> ! {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
-    use clap::error::ErrorKind;
 
     use super::*;
 
@@ -504,21 +480,5 @@ mod tests {
         assert!(Cli::try_parse_from(["wires", "id"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "join"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "join", "tok"]).is_ok());
-    }
-
-    /// Card 27: the channel and its plumbing are gone.
-    #[test]
-    fn the_channel_commands_are_gone() {
-        for gone in [
-            &["wires", "advanced", "--help"][..],
-            &["wires", "connect", "--target", "00"],
-            &["wires", "tail", "ops"],
-            &["wires", "init", "--channel", "ops"],
-        ] {
-            assert!(
-                Cli::try_parse_from(gone.iter()).is_err_and(|e| e.kind() != ErrorKind::DisplayHelp),
-                "{gone:?} still parses"
-            );
-        }
     }
 }

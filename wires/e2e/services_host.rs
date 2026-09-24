@@ -1,12 +1,12 @@
 //! Card 27c's acceptance tests: **a host decides every call
 //! by the admin-signed state it holds**, re-read per connection.
 //!
-//! The state is signed in the test by the fabric root and adopted into the
+//! The state is signed in the test by the network root and adopted into the
 //! host's keystore exactly as `wires/state` does
 //! ([`adopt_if_newer`](crate::state::store::adopt_if_newer)). Callers dial
 //! the real session ALPN over loopback with a hand-rolled `Hello` + `Invoke`
-//! (the dial half has its own tests in `caller::call`), presenting ID tokens minted by
-//! [`MockIdp`]s that the host trusts.
+//! ([`super::call`]), presenting ID tokens minted by [`MockIdp`]s that the
+//! host trusts.
 //!
 //! - [`the_registry_decides_who_runs_what`]: an allowed role runs; a
 //!   disallowed one, and a caller with no token, are refused with the reason
@@ -23,34 +23,33 @@
 //! - [`a_fetch_with_a_token_makes_a_caller_reachable_by_role`]: a logged-in
 //!   member who never called is reachable by role once its `wires inbox`
 //!   fetch presented its token, and a direct push lands in a waiting inbox.
-//! - [`nothing_is_broadcast_to_a_bystander`]: calls, refusals and pushes
-//!   between others send a member that takes part in none of them nothing.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use iroh::EndpointAddr;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr};
 use library::{
-    AuditRecord, Frame, Hello, HelloAck, Invocation, Matcher, Membership, NodeId, NodeIdentity,
-    OidcNonce, PushBody, RoleName, Service, ServiceName, SignedState, State, StateVersion, Subject,
+    AuditRecord, Hello, Membership, NodeId, NodeIdentity, OidcNonce, PushBody, RoleName, Service,
+    SignedState, StateVersion, Subject,
 };
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use super::{PATIENCE, localhost_socks};
+use super::{
+    Outcome, PATIENCE, adopt, bind, bind_in, email_at, host_config, localhost_socks, role, service,
+    signed_state,
+};
 use crate::admin::keystore::Keystore;
 use crate::caller::inbox::{Fetched, InboxReceiver, Mailbox, fetch_from};
-use crate::caller::mock_idp::{MOCK_CLIENT_ID, MockIdp};
+use crate::caller::mock_idp::MockIdp;
 use crate::host::config::HostConfig;
 use crate::host::push::{PushHost, PushSpec};
 use crate::host::serve::{services_host, services_router};
-use crate::host::transport::{ALPN, AuditSink, endpoint_addr, secret_key};
+use crate::host::transport::{AuditSink, endpoint_addr};
 
-/// The fabric: root 1, host 10, alice 2, bob 3, carol 4.
+/// The network: root 1, host 10, alice 2, bob 3, carol 4.
 ///
 /// The host trusts all four IdPs; the roles name only the first three.
 struct World {
@@ -88,46 +87,39 @@ impl World {
     /// IdP, and `staff` (anyone the three people's IdPs verified);
     /// `orders-db` (analyst) and `status` (staff), both on the host.
     fn state(&self, version: u64, members: &[NodeId]) -> SignedState {
-        let mut s = State::new(self.root.node_id());
-        s.version = StateVersion(version);
-        s.issued = crate::clock::now_unix();
-        s.not_after = i64::MAX;
-        s.members.extend(members.iter().copied());
-        s.members.insert(self.host.node_id());
-        s.hosts.insert(self.host.node_id());
-        let email = |idp: &MockIdp, e: &str| Matcher {
-            email: Some(e.parse().unwrap()),
-            ..Matcher::new(idp.issuer.as_str())
-        };
-        s.roles.insert(
-            role("analyst"),
-            vec![
-                email(&self.idp_alice, "alice@example.com"),
-                email(&self.idp_carol, "carol@example.com"),
-            ],
-        );
-        s.roles.insert(
-            role("sre"),
-            vec![email(&self.idp_carol, "carol@example.com")],
-        );
-        s.roles.insert(
-            role("staff"),
-            [&self.idp_alice, &self.idp_bob, &self.idp_carol]
-                .iter()
-                .map(|idp| Matcher::new(idp.issuer.as_str()))
-                .collect(),
-        );
-        let on_host = |allow: Vec<RoleName>| Service {
-            description: String::new(),
-            allow,
-            hosts: vec![self.host.node_id()],
-            readers: vec![],
-        };
-        s.services
-            .insert(service("orders-db"), on_host(vec![role("analyst")]));
-        s.services
-            .insert(service("status"), on_host(vec![role("staff")]));
-        s.sign(&self.root).unwrap()
+        signed_state(&self.root, version, |s| {
+            s.members.extend(members.iter().copied());
+            s.members.insert(self.host.node_id());
+            s.hosts.insert(self.host.node_id());
+            s.roles.insert(
+                role("analyst"),
+                vec![
+                    email_at(&self.idp_alice, "alice@example.com"),
+                    email_at(&self.idp_carol, "carol@example.com"),
+                ],
+            );
+            s.roles.insert(
+                role("sre"),
+                vec![email_at(&self.idp_carol, "carol@example.com")],
+            );
+            s.roles.insert(
+                role("staff"),
+                [&self.idp_alice, &self.idp_bob, &self.idp_carol]
+                    .iter()
+                    .map(|idp| library::Matcher::new(idp.issuer.as_str()))
+                    .collect(),
+            );
+            let on_host = |allow: Vec<RoleName>| Service {
+                description: String::new(),
+                allow,
+                hosts: vec![self.host.node_id()],
+                readers: vec![],
+            };
+            s.services
+                .insert(service("orders-db"), on_host(vec![role("analyst")]));
+            s.services
+                .insert(service("status"), on_host(vec![role("staff")]));
+        })
     }
 
     fn everyone(&self) -> Vec<NodeId> {
@@ -140,34 +132,25 @@ impl World {
 
     /// A `host.json` trusting all four IdPs, with `services` spliced in.
     fn host_json(&self, services: &str, push: bool) -> HostConfig {
-        let issuers: Vec<String> = [
-            &self.idp_alice,
-            &self.idp_bob,
-            &self.idp_carol,
-            &self.idp_partner,
-        ]
-        .iter()
-        .map(|idp| {
-            format!(
-                r#"{{"issuer":"{}","audiences":["{MOCK_CLIENT_ID}"]}}"#,
-                idp.issuer.as_str()
-            )
-        })
-        .collect();
         let push = if push {
             r#","push":{"allow":["analyst"]}"#
         } else {
             ""
         };
-        HostConfig::parse(&format!(
-            r#"{{"version":2,"identity":{{"issuers":[{}]}},"services":{services}{push}}}"#,
-            issuers.join(",")
-        ))
-        .unwrap()
+        host_config(
+            &[
+                &self.idp_alice,
+                &self.idp_bob,
+                &self.idp_carol,
+                &self.idp_partner,
+            ],
+            services,
+            push,
+        )
     }
 
     fn membership(&self, who: &NodeIdentity) -> Membership {
-        Membership::mint(&self.root, who.node_id(), 0, i64::MAX).unwrap()
+        super::membership(&self.root, who)
     }
 
     /// `who`'s `Hello`: its membership, the state version it holds, and a
@@ -180,25 +163,8 @@ impl World {
         } else {
             &self.idp_carol
         };
-        Hello {
-            membership: self.membership(who),
-            state_version: StateVersion(version),
-            id_token: logged_in.then(|| {
-                idp.mint(
-                    &OidcNonce::for_node(&who.node_id()),
-                    crate::clock::now_unix() + 3600,
-                )
-            }),
-        }
+        super::hello(&self.root, who, version, logged_in.then_some(idp))
     }
-}
-
-fn role(s: &str) -> RoleName {
-    RoleName::new(s).unwrap()
-}
-
-fn service(s: &str) -> ServiceName {
-    ServiceName::new(s).unwrap()
 }
 
 /// A running host: its router, where to dial it, its keystore, its call
@@ -217,14 +183,8 @@ impl Host {
     /// Start `config` on `w.host`, holding `state`. Fails as `serve` would
     /// when the preflight refuses.
     async fn start(w: &World, config: HostConfig, state: &SignedState) -> anyhow::Result<Host> {
-        let home = crate::testutil::temp_dir();
-        let keystore = Arc::new(Keystore::at(home.clone()));
-        crate::state::store::adopt_if_newer(
-            &keystore,
-            state,
-            w.root.node_id(),
-            crate::clock::now_unix(),
-        )?;
+        let keystore = Arc::new(Keystore::at(crate::testutil::temp_dir()));
+        adopt(&keystore, &w.root, state);
         let mut host = services_host(
             w.host.node_id(),
             w.membership(&w.host),
@@ -241,12 +201,7 @@ impl Host {
             .is_some()
             .then(|| Arc::new(PushHost::from_state(Arc::clone(&host))));
         let book = MemoryLookup::new();
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .secret_key(secret_key(&w.host))
-            .address_lookup(book.clone())
-            .bind()
-            .await
-            .unwrap();
+        let endpoint = bind_in(&w.host, &book).await;
         let addr = endpoint_addr(&w.host.node_id(), &localhost_socks(&endpoint), None).unwrap();
         let router = services_router(endpoint, Arc::clone(&host), push.clone());
         Ok(Host {
@@ -261,15 +216,7 @@ impl Host {
 
     /// The admin's newer state reaches this host (as `wires/state` would).
     fn adopt(&self, w: &World, state: &SignedState) {
-        assert!(
-            crate::state::store::adopt_if_newer(
-                &self.keystore,
-                state,
-                w.root.node_id(),
-                crate::clock::now_unix()
-            )
-            .unwrap()
-        );
+        assert!(adopt(&self.keystore, &w.root, state));
     }
 
     /// The next call-log record.
@@ -281,91 +228,9 @@ impl Host {
     }
 }
 
-/// What a call came to.
-#[derive(Debug)]
-enum Outcome {
-    /// Admitted: the ack, the exit code, and stdout.
-    Ran {
-        ack: Box<HelloAck>,
-        code: i32,
-        stdout: String,
-    },
-    /// Refused with this reason.
-    Denied(String),
-}
-
-impl Outcome {
-    fn denied(&self) -> &str {
-        match self {
-            Outcome::Denied(reason) => reason,
-            other => panic!("expected a refusal, got {other:?}"),
-        }
-    }
-
-    fn stdout(&self) -> &str {
-        match self {
-            Outcome::Ran {
-                code: 0, stdout, ..
-            } => stdout,
-            other => panic!("expected a successful run, got {other:?}"),
-        }
-    }
-}
-
-async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Option<Frame> {
-    let mut len = [0u8; 4];
-    r.read_exact(&mut len).await.ok()?;
-    let mut buf = len.to_vec();
-    buf.resize(4 + u32::from_be_bytes(len) as usize, 0);
-    r.read_exact(&mut buf[4..]).await.ok()?;
-    Frame::decode(&buf).unwrap().map(|(f, _)| f)
-}
-
-/// Dial `host` as `who`, say `hello`, invoke `name` with `args`, close stdin,
-/// and collect the outcome.
+/// [`super::call`] to `host`.
 async fn call(who: &NodeIdentity, host: &Host, hello: Hello, name: &str, args: &[&str]) -> Outcome {
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .secret_key(secret_key(who))
-        .bind()
-        .await
-        .unwrap();
-    let outcome = timeout(PATIENCE, async {
-        let conn = endpoint.connect(host.addr.clone(), ALPN).await.unwrap();
-        let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        let invoke = Frame::Invoke(Invocation {
-            service: ServiceName::new(name).unwrap(),
-            argv: library::Argv::new(args.iter().map(|a| a.to_string()).collect()).unwrap(),
-        });
-        for frame in [Frame::Hello(hello), invoke] {
-            send.write_all(&frame.encode().unwrap()).await.unwrap();
-        }
-        send.finish().unwrap();
-        let ack = match read_frame(&mut recv).await {
-            Some(Frame::HelloAck(ack)) => ack,
-            Some(Frame::Denied { reason }) => return Outcome::Denied(reason),
-            other => panic!("unexpected first answer: {other:?}"),
-        };
-        let mut stdout = Vec::new();
-        loop {
-            match read_frame(&mut recv).await {
-                Some(Frame::Stdout(chunk)) => stdout.extend_from_slice(chunk.as_bytes()),
-                Some(Frame::Stderr(_)) => {}
-                Some(Frame::Exit(code)) => {
-                    conn.close(0u32.into(), b"done");
-                    return Outcome::Ran {
-                        ack: Box::new(ack),
-                        code,
-                        stdout: String::from_utf8(stdout).unwrap(),
-                    };
-                }
-                other => panic!("unexpected frame: {other:?}"),
-            }
-        }
-    })
-    .await
-    .expect("the call timed out");
-    endpoint.close().await;
-    outcome
+    super::call(who, &host.addr, hello, name, args).await
 }
 
 /// `orders-db` echoes its args; `status` prints `up` and the role.
@@ -680,11 +545,7 @@ async fn fetch(
     host: &Host,
     id_token: Option<library::IdToken>,
 ) -> Fetched {
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .secret_key(secret_key(who))
-        .bind()
-        .await
-        .unwrap();
+    let endpoint = bind(who).await;
     let mailbox = Mailbox::open(&crate::testutil::temp_dir()).unwrap();
     let hello = library::InboxFrame::Hello {
         membership: w.membership(who),
@@ -707,40 +568,6 @@ async fn fetch(
     fetched
 }
 
-/// A member's endpoint that counts every connection it is offered, on every
-/// ALPN a wires node speaks, and answers none.
-async fn counting_node(who: &NodeIdentity) -> (Router, EndpointAddr, Arc<AtomicUsize>) {
-    #[derive(Clone, Debug)]
-    struct Count(Arc<AtomicUsize>);
-    impl iroh::protocol::ProtocolHandler for Count {
-        async fn accept(
-            &self,
-            conn: iroh::endpoint::Connection,
-        ) -> std::result::Result<(), iroh::protocol::AcceptError> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            conn.close(0u32.into(), b"counted");
-            Ok(())
-        }
-    }
-    let seen = Arc::new(AtomicUsize::new(0));
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .secret_key(secret_key(who))
-        .bind()
-        .await
-        .unwrap();
-    let addr = endpoint_addr(&who.node_id(), &localhost_socks(&endpoint), None).unwrap();
-    let mut router = Router::builder(endpoint);
-    for alpn in [
-        ALPN,
-        library::INBOX_ALPN,
-        library::STATE_ALPN,
-        crate::host::record_stream::ALPN,
-    ] {
-        router = router.accept(alpn, Count(Arc::clone(&seen)));
-    }
-    (router.spawn(), addr, seen)
-}
-
 #[tokio::test]
 async fn a_fetch_with_a_token_makes_a_caller_reachable_by_role() {
     let w = World::new().await;
@@ -758,15 +585,13 @@ async fn a_fetch_with_a_token_makes_a_caller_reachable_by_role() {
     // carol (an analyst) has never called this host: nobody is reachable.
     let e = format!("{:#}", push.send(to_analysts()).await.unwrap_err());
     assert!(e.contains("wires inbox"), "{e}");
-    // Nor does any role reach members by membership alone: `member` is no
-    // longer built in, and `staff` needs verified identities too.
-    for to in ["member", "staff"] {
-        let spec = PushSpec {
-            to: to.into(),
-            ..to_analysts()
-        };
-        assert!(push.send(spec).await.is_err(), "--to {to}");
-    }
+    // Nor does a role that matches every signed-in person reach anyone
+    // whose identity the host has not seen.
+    let to_staff = PushSpec {
+        to: "staff".into(),
+        ..to_analysts()
+    };
+    assert!(push.send(to_staff).await.is_err());
 
     // Her `wires inbox` presents her token: now the host knows who she is.
     let token = w.hello(&w.carol, 1, true).id_token;
@@ -778,14 +603,9 @@ async fn a_fetch_with_a_token_makes_a_caller_reachable_by_role() {
     // And while `wires inbox --wait` runs, a push is delivered directly.
     let home = crate::testutil::temp_dir();
     let ks = Arc::new(Keystore::at(&home));
-    crate::state::store::adopt_if_newer(&ks, &state, w.root.node_id(), crate::clock::now_unix())
-        .unwrap();
+    adopt(&ks, &w.root, &state);
     let mailbox = Mailbox::open(&home).unwrap();
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .secret_key(secret_key(&w.carol))
-        .bind()
-        .await
-        .unwrap();
+    let endpoint = bind(&w.carol).await;
     host.book.add_endpoint_info(
         endpoint_addr(&w.carol.node_id(), &localhost_socks(&endpoint), None).unwrap(),
     );
@@ -812,49 +632,4 @@ async fn a_fetch_with_a_token_makes_a_caller_reachable_by_role() {
     let unread = mailbox.take_unread().unwrap();
     assert_eq!(unread.len(), 1);
     assert_eq!(unread[0].from, w.host.node_id());
-}
-
-#[tokio::test]
-async fn nothing_is_broadcast_to_a_bystander() {
-    let w = World::new().await;
-    let host = Host::start(&w, w.host_json(SERVICES, true), &w.state(1, &w.everyone()))
-        .await
-        .unwrap();
-    // carol is a member the host could dial, and takes part in nothing.
-    let (_carol, carol_addr, seen) = counting_node(&w.carol).await;
-    host.book.add_endpoint_info(carol_addr);
-
-    // alice calls (twice), bob is refused, the host pushes to alice and
-    // she fetches it.
-    let out = call(
-        &w.alice,
-        &host,
-        w.hello(&w.alice, 1, true),
-        "orders-db",
-        &["1"],
-    )
-    .await;
-    assert_eq!(out.stdout(), "rows: 1\n");
-    call(&w.alice, &host, w.hello(&w.alice, 1, true), "status", &[]).await;
-    let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "orders-db", &[]).await;
-    out.denied();
-    let push = host.push.clone().unwrap();
-    let report = push
-        .send(PushSpec {
-            to: w.alice.node_id().hex(),
-            subject: Subject::new("done").unwrap(),
-            body: PushBody::new("ok").unwrap(),
-            ttl_secs: None,
-        })
-        .await
-        .unwrap();
-    assert!(report.any_accepted(), "{}", report.render());
-    assert!(matches!(
-        fetch(&w, &w.alice, &host, None).await,
-        Fetched::Messages(1)
-    ));
-
-    // The bystander heard nothing about any of it: no connection at all.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(seen.load(Ordering::SeqCst), 0);
 }

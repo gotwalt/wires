@@ -43,7 +43,7 @@ pub(crate) fn id_in(ks: &Keystore) -> anyhow::Result<(NodeId, bool)> {
         return Ok((node.node_id(), false));
     }
     let node = NodeIdentity::generate();
-    ks.save_node(&node, false)?;
+    ks.save_node(&node)?;
     Ok((node.node_id(), true))
 }
 
@@ -103,7 +103,6 @@ pub(crate) fn join_in(ks: &Keystore, token: &str, now: i64) -> anyhow::Result<St
     }
 
     ks.save_membership(&invite.membership)?;
-    // An older copy never replaces a newer one held here.
     crate::state::store::adopt_if_newer(ks, &invite.state, fabric, now)?;
     crate::state::store::mark_checked(ks, now)?;
     crate::state::store::save_admin(ks, invite.admin)?;

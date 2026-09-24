@@ -2,12 +2,11 @@
 //! command each.
 //!
 //! Both are an edit of the admin-signed state ([`edit_state`]), pushed to
-//! the hosts by key ([`propagate`](super::propagate)). `invite` also mints the new member's
-//! membership and bundles it with the new state into one [`Invite`] token;
-//! `remove` has nothing to hand out — the removed node is simply not in the
-//! new state, and every host refuses its next call (the host re-reads its
-//! state per connection, so no restart). There is no key to rotate: nothing
-//! is encrypted to the member set.
+//! the hosts by key ([`super::propagate`]). `invite` also mints the new
+//! member's membership and bundles it with the new state into one [`Invite`]
+//! token; `remove` has nothing to hand out — the removed node is simply not
+//! in the new state, and every host refuses its next call (the host re-reads
+//! its state per connection, so no restart).
 //!
 //! Names (`--name alice`) are the admin's local labels in `names.json`, for
 //! `wires remove alice`. They are not identity: nothing on the wire carries
@@ -18,9 +17,9 @@ use clap::Args;
 use library::{Invite, Membership, NodeId, SignedState};
 
 use super::keystore::{self, Keystore};
-use super::propagate;
 use super::service::edit_state;
 use super::ttl::Ttl;
+use super::{Report, run_edit};
 use crate::clock::now_unix;
 
 /// `invite` arguments.
@@ -55,31 +54,11 @@ pub(crate) struct RemoveArgs {
     pub(crate) state_ttl: Ttl,
 }
 
-/// What an admin command prints: `stdout` is the result (the token, for
-/// `invite`), `notes` go to stderr, and a `failure` (the new state reached
-/// no host) goes last on stderr and makes the command exit 1.
-#[derive(Debug)]
-pub(crate) struct Report {
-    /// The command's result, for stdout (nothing when empty).
-    pub(crate) stdout: String,
-    /// Progress and hints, for stderr.
-    pub(crate) notes: Vec<String>,
-    /// Why the command failed after doing its work, if it did.
-    pub(crate) failure: Option<String>,
-}
-
 /// `invite` against the resolved keystore, then push the new state. The
 /// token is printed even when the push reached no host (the invitee can
 /// still join), but the command fails.
 pub(crate) async fn invite_cmd(a: InviteArgs) -> anyhow::Result<Report> {
-    let ks = Keystore::resolve()?;
-    let earlier = crate::state::sync::held_hosts(&ks)?;
-    let mut report = invite_in(&ks, a)?;
-    // The "on the joining machine" hint stays last.
-    let hint = report.notes.pop();
-    let mut report = propagate::fold(report, propagate::propagate(&ks, &earlier).await);
-    report.notes.extend(hint);
-    Ok(report)
+    run_edit(|ks| invite_in(ks, a)).await
 }
 
 /// [`invite_cmd`] against an explicit keystore, without the push (the
@@ -120,23 +99,21 @@ pub(crate) fn invite_in(ks: &Keystore, a: InviteArgs) -> anyhow::Result<Report> 
         keystore::node_identity_in(ks)?.node_id(),
     )
     .encode()?;
-    let notes = vec![
-        format!(
-            "{} {}{} (state version {}, {} members)",
-            if rejoin { "re-invited" } else { "invited" },
-            invitee.hex(),
-            a.name
-                .as_deref()
-                .map(|n| format!(" as {n:?}"))
-                .unwrap_or_default(),
-            state.state.version.0,
-            state.state.members.len()
-        ),
-        format!("on the joining machine: wires join {token}"),
-    ];
+    let note = format!(
+        "{} {}{} (state version {}, {} members)",
+        if rejoin { "re-invited" } else { "invited" },
+        invitee.hex(),
+        a.name
+            .as_deref()
+            .map(|n| format!(" as {n:?}"))
+            .unwrap_or_default(),
+        state.state.version.0,
+        state.state.members.len()
+    );
     Ok(Report {
+        hint: Some(format!("on the joining machine: wires join {token}")),
         stdout: token,
-        notes,
+        notes: vec![note],
         failure: None,
     })
 }
@@ -144,13 +121,7 @@ pub(crate) fn invite_in(ks: &Keystore, a: InviteArgs) -> anyhow::Result<Report> 
 /// `remove` against the resolved keystore: out of the signed state, then
 /// pushed to the hosts (including the removed node, if it hosted).
 pub(crate) async fn remove_cmd(a: RemoveArgs) -> anyhow::Result<Report> {
-    let ks = Keystore::resolve()?;
-    let earlier = crate::state::sync::held_hosts(&ks)?;
-    let report = remove_in(&ks, a)?;
-    Ok(propagate::fold(
-        report,
-        propagate::propagate(&ks, &earlier).await,
-    ))
+    run_edit(|ks| remove_in(ks, a)).await
 }
 
 /// [`remove_cmd`] against an explicit keystore, without the push (the
@@ -171,8 +142,7 @@ pub(crate) fn remove_in(ks: &Keystore, a: RemoveArgs) -> anyhow::Result<Report> 
             state.state.version.0,
             state.state.members.len()
         ),
-        notes: Vec::new(),
-        failure: None,
+        ..Report::default()
     })
 }
 
@@ -292,8 +262,8 @@ mod tests {
             InviteArgs {
                 node_id: alice.node_id().hex(),
                 name: Some("alice".into()),
-                ttl: Ttl::DEFAULT.parse().unwrap(),
-                state_ttl: Ttl::DEFAULT.parse().unwrap(),
+                ttl: Ttl::default(),
+                state_ttl: Ttl::default(),
             },
         )
         .unwrap();
@@ -304,7 +274,7 @@ mod tests {
             &ks,
             RemoveArgs {
                 member: "alice".into(),
-                state_ttl: Ttl::DEFAULT.parse().unwrap(),
+                state_ttl: Ttl::default(),
             },
         )
         .unwrap();
@@ -321,12 +291,12 @@ mod tests {
         // Removing again, or removing this machine's own node, is refused.
         let again = RemoveArgs {
             member: alice.node_id().hex(),
-            state_ttl: Ttl::DEFAULT.parse().unwrap(),
+            state_ttl: Ttl::default(),
         };
         assert!(remove_in(&ks, again).is_err());
         let me = RemoveArgs {
             member: keystore::node_identity_in(&ks).unwrap().node_id().hex(),
-            state_ttl: Ttl::DEFAULT.parse().unwrap(),
+            state_ttl: Ttl::default(),
         };
         assert!(format!("{:#}", remove_in(&ks, me).unwrap_err()).contains("own node"));
     }
@@ -351,7 +321,7 @@ mod tests {
                 node_id: alice.node_id().hex(),
                 name: None,
                 ttl: "1h".parse().unwrap(),
-                state_ttl: Ttl::DEFAULT.parse().unwrap(),
+                state_ttl: Ttl::default(),
             },
         )
         .unwrap();
@@ -370,7 +340,7 @@ mod tests {
             InviteArgs {
                 node_id: bob.node_id().hex(),
                 name: None,
-                ttl: Ttl::DEFAULT.parse().unwrap(),
+                ttl: Ttl::default(),
                 state_ttl: "1h".parse().unwrap(),
             },
         )

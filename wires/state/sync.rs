@@ -1,4 +1,4 @@
-//! Moving the signed state by key over [`STATE_ALPN`](library::STATE_ALPN).
+//! Moving the signed state by key over [`STATE_ALPN`].
 //! The frames are [`library::StateFrame`].
 //!
 //! - [`push_all`]: after `invite` / `remove` / `service` / `role` (and
@@ -104,7 +104,7 @@ impl PushReport {
     }
 
     /// Whether there were hosts to reach and not one took the state: the
-    /// fabric is still enforcing the older one.
+    /// hosts still enforce the older one.
     pub(crate) fn reached_no_host(&self) -> bool {
         self.delivered.is_empty() && !self.missed.is_empty()
     }
@@ -125,7 +125,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &StateFrame) -> Re
 /// buffer grows only as bytes arrive. A frame over
 /// [`MAX_SMALL_STATE_FRAME`] must open with [`OFFER_BODY_PREFIX`] (only an
 /// offer carries a state), checked before the rest is read; over
-/// [`MAX_STATE_FRAME`] is refused from the prefix alone.
+/// [`library::MAX_STATE_FRAME`] is refused from the prefix alone.
 async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<StateFrame> {
     tokio::time::timeout(FRAME_TIMEOUT, read_frame_untimed(r))
         .await
@@ -404,23 +404,23 @@ pub(crate) async fn refresh_if_stale(
     endpoint: &Endpoint,
     ks: &Keystore,
 ) -> Result<Option<SignedState>> {
-    if !store::is_stale(ks, now_unix(), STALE_AFTER_SECS) {
+    if !store::is_stale(ks, now_unix()) {
         return Ok(None);
     }
     catch_up(endpoint, ks).await
 }
 
-/// A cold command's best-effort refresh: if this keystore is in a fabric and
+/// A cold command's best-effort refresh: if this keystore is in a network and
 /// its copy is stale, bind briefly and pull. Never fails the command.
 pub(crate) async fn refresh_cold() {
     let run = async {
         let ks = Keystore::resolve()?;
-        if store::fabric(&ks)?.is_none() || !store::is_stale(&ks, now_unix(), STALE_AFTER_SECS) {
+        if store::fabric(&ks)?.is_none() || !store::is_stale(&ks, now_unix()) {
             return Ok(None);
         }
         let node = keystore::node_identity_in(&ks)?;
         let endpoint = transport::bind_with_alpn(&node, None, STATE_ALPN).await?;
-        let pulled = tokio::time::timeout(COLD_PULL_BUDGET, refresh_if_stale(&endpoint, &ks))
+        let pulled = tokio::time::timeout(COLD_PULL_BUDGET, catch_up(&endpoint, &ks))
             .await
             .unwrap_or(Ok(None));
         endpoint.close().await;
@@ -520,7 +520,7 @@ async fn exchange_one(conn: &Connection, caller: NodeId, ks: &Keystore) -> Resul
 /// - `Offer`, from anyone else: accepted only if the offer itself vouches
 ///   for the dialer (a host whose copy expired, or missed the dialer's
 ///   admission, catching up). The offer's own claims are checked first,
-///   for free: this fabric, strictly newer than the held copy, fresh, and
+///   for free: this network, strictly newer than the held copy, fresh, and
 ///   listing the dialer. Only then is its signature verified (by
 ///   `adopt_if_newer`, once): verifying means re-encoding a state of up to
 ///   [`library::MAX_STATE_FRAME`] and an ed25519 check, so a stranger
@@ -676,14 +676,14 @@ mod tests {
     use crate::testutil::temp_dir;
     use library::{Membership, NodeIdentity, State};
 
-    /// A keystore for `node` in `root`'s fabric, holding `state` if given.
+    /// A keystore for `node` in `root`'s network, holding `state` if given.
     fn member_ks(
         root: &NodeIdentity,
         node: &NodeIdentity,
         state: Option<&SignedState>,
     ) -> Keystore {
         let ks = Keystore::at(temp_dir());
-        ks.save_node(node, false).unwrap();
+        ks.save_node(node).unwrap();
         ks.save_membership(&Membership::mint(root, node.node_id(), 0, i64::MAX).unwrap())
             .unwrap();
         if let Some(s) = state {
@@ -729,7 +729,7 @@ mod tests {
         assert!(answer(&ks, outsider, offer(&v2), 10).is_err());
         // A forged offer is refused.
         let rogue = NodeIdentity::generate();
-        let mut forged = signed(&rogue, 9, &[peer]).clone();
+        let mut forged = signed(&rogue, 9, &[peer]);
         forged.state.fabric = root.node_id();
         assert!(answer(&ks, peer, offer(&forged), 10).is_err());
         assert_eq!(
@@ -757,7 +757,7 @@ mod tests {
         let ks = member_ks(&root, &me, Some(&v2));
         let err = answer(&ks, removed, offer(&v1), 10).unwrap_err();
         assert_eq!(err.reason(), NOT_ADMITTED, "{err:?}");
-        assert!(store::is_stale(&ks, 10, STALE_AFTER_SECS));
+        assert!(store::is_stale(&ks, 10));
 
         // The host missed v2: the removed member is still in its copy, so
         // it is told what is held, but the copy is not marked checked.
@@ -767,7 +767,7 @@ mod tests {
         };
         assert_eq!(answer(&ks, removed, offer(&v1), 10), Ok(have1));
         assert!(
-            store::is_stale(&ks, 10, STALE_AFTER_SECS),
+            store::is_stale(&ks, 10),
             "a non-adopting offer must not stop this node pulling"
         );
         // A real adopt does mark it.
@@ -779,7 +779,7 @@ mod tests {
                 version: StateVersion(3)
             })
         );
-        assert!(!store::is_stale(&ks, 10, STALE_AFTER_SECS));
+        assert!(!store::is_stale(&ks, 10));
     }
 
     /// Card 28 §8: an expired held copy is not served, and vouches for no
@@ -846,7 +846,7 @@ mod tests {
             Refusal::Member("this node's signed state (version 7) has expired".into())
         );
         // A newer offer that doesn't list the stranger, or is stale, or is
-        // for another fabric, is refused before its signature matters.
+        // for another network, is refused before its signature matters.
         let rogue = NodeIdentity::generate();
         let mut other = State::new(rogue.node_id());
         other.version = StateVersion(9);
@@ -977,7 +977,7 @@ mod tests {
         use library::ServiceName;
 
         fn ttl() -> Ttl {
-            Ttl::DEFAULT.parse().unwrap()
+            Ttl::default()
         }
 
         /// A hermetic endpoint for `node` in the shared address book; with
@@ -997,15 +997,7 @@ mod tests {
             let socks: Vec<std::net::SocketAddr> = endpoint
                 .bound_sockets()
                 .into_iter()
-                .map(|s| match s {
-                    std::net::SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
-                        (std::net::Ipv4Addr::LOCALHOST, v4.port()).into()
-                    }
-                    std::net::SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
-                        (std::net::Ipv6Addr::LOCALHOST, v6.port()).into()
-                    }
-                    other => other,
-                })
+                .map(crate::net::dialable)
                 .collect();
             book.add_endpoint_info(
                 transport::endpoint_addr(&node.node_id(), &socks, None).unwrap(),
@@ -1018,7 +1010,7 @@ mod tests {
             (endpoint, router)
         }
 
-        /// The fabric: an admin (initialized), a host and a member, both
+        /// The network: an admin (initialized), a host and a member, both
         /// joined (holding the state the admin had when they joined).
         struct Fabric {
             admin: Arc<Keystore>,
@@ -1113,7 +1105,6 @@ mod tests {
 
             let earlier = held_hosts(&f.admin).unwrap();
             let new = assign(&f);
-            let started = std::time::Instant::now();
             let report = tokio::time::timeout(
                 Duration::from_secs(2),
                 push_current_on(&admin_ep, &f.admin, &earlier),
@@ -1121,7 +1112,6 @@ mod tests {
             .await
             .expect("the push took over 2 s")
             .unwrap();
-            assert!(started.elapsed() < Duration::from_secs(2));
             assert_eq!(report.delivered, vec![f.host.0.node_id()]);
             assert!(report.missed.is_empty(), "{report:?}");
             assert_eq!(version(&f.host.1, f.root), new.state.version);
@@ -1153,7 +1143,6 @@ mod tests {
 
             // The removed member can no longer pull from the host.
             let (m2, _) = bind(&f.member.0, &f.member.1, &book, false).await;
-            std::fs::remove_file(f.member.1.path("state-checked.txt")).ok();
             let pulled = pull(&m2, &f.member.1, &[f.host.0.node_id()], before)
                 .await
                 .unwrap();
@@ -1283,7 +1272,7 @@ mod tests {
             .unwrap();
             assert_eq!(pulled.as_ref(), Some(&new));
             assert_eq!(store::read(&f.member.1, f.root).unwrap().unwrap(), new);
-            assert!(!store::is_stale(&f.member.1, now_unix(), STALE_AFTER_SECS));
+            assert!(!store::is_stale(&f.member.1, now_unix()));
             admin_ep.close().await;
             member_ep.close().await;
         }
@@ -1329,7 +1318,7 @@ mod tests {
                 keep.push((ep, router));
             }
             let (member_ep, _) = bind(&f.member.0, &f.member.1, &book, false).await;
-            assert!(store::is_stale(&f.member.1, now_unix(), STALE_AFTER_SECS));
+            assert!(store::is_stale(&f.member.1, now_unix()));
             let pulled = pull(&member_ep, &f.member.1, &hosts, state.state.version)
                 .await
                 .unwrap();
@@ -1339,7 +1328,7 @@ mod tests {
                 .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
                 .sum();
             assert_eq!(dials, 1, "one current answer settles it");
-            assert!(!store::is_stale(&f.member.1, now_unix(), STALE_AFTER_SECS));
+            assert!(!store::is_stale(&f.member.1, now_unix()));
 
             // The hosts this node has called go first.
             crate::caller::pick::LastGood::record(
@@ -1404,7 +1393,7 @@ mod tests {
             // Host 2 hears it (the member is in its copy) but isn't marked
             // checked by it…
             push_all(&m_ep, &old, &[h2.node_id()]).await.unwrap();
-            assert!(store::is_stale(&h2_ks, now_unix(), STALE_AFTER_SECS));
+            assert!(store::is_stale(&h2_ks, now_unix()));
             // …so its next refresh pulls the removal from host 1.
             let pulled = refresh_if_stale(&h2_ep, &h2_ks).await.unwrap();
             assert_eq!(pulled.as_ref(), Some(&removed));

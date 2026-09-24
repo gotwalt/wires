@@ -26,6 +26,13 @@ impl Ttl {
     }
 }
 
+impl Default for Ttl {
+    /// [`Ttl::DEFAULT`].
+    fn default() -> Self {
+        Ttl::DEFAULT.parse().expect("the default lifetime parses")
+    }
+}
+
 impl FromStr for Ttl {
     type Err = String;
 
@@ -75,17 +82,21 @@ mod tests {
         for bad in ["", "d", "0d", "-1h", "3y", "1.5h", "99999999999999999w"] {
             assert!(bad.parse::<Ttl>().is_err(), "{bad:?} parsed");
         }
-        assert_eq!(
-            Ttl::DEFAULT.parse::<Ttl>().unwrap().not_after(100),
-            100 + 30 * 86_400
-        );
+        assert_eq!(Ttl::default().not_after(100), 100 + 30 * 86_400);
     }
 
     proptest! {
+        /// Every unit is a whole number of the next smaller one, so `n` of a
+        /// unit is the same lifetime as `n × k` of the smaller one; and a
+        /// bare number is seconds.
         #[test]
-        fn every_unit_scales(n in 1i64..100_000, unit in prop::sample::select(vec!['s', 'm', 'h', 'd', 'w'])) {
-            let secs = match unit { 's' => 1, 'm' => 60, 'h' => 3600, 'd' => 86_400, _ => 604_800 };
-            prop_assert_eq!(format!("{n}{unit}").parse::<Ttl>(), Ok(Ttl(n * secs)));
+        fn units_agree_with_each_other(n in 1i64..10_000) {
+            let ttl = |s: String| s.parse::<Ttl>().unwrap();
+            prop_assert_eq!(ttl(format!("{n}")), ttl(format!("{n}s")));
+            prop_assert_eq!(ttl(format!("{n}m")), ttl(format!("{}s", n * 60)));
+            prop_assert_eq!(ttl(format!("{n}h")), ttl(format!("{}m", n * 60)));
+            prop_assert_eq!(ttl(format!("{n}d")), ttl(format!("{}h", n * 24)));
+            prop_assert_eq!(ttl(format!("{n}w")), ttl(format!("{}d", n * 7)));
         }
     }
 }

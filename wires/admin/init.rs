@@ -1,4 +1,4 @@
-//! `wires init`: a new fabric in one step.
+//! `wires init`: a new network in one step.
 //!
 //! Creates the root key and this machine's node key in one keystore, mints
 //! this node's membership, and signs the first admin-signed state with this
@@ -27,10 +27,9 @@ pub(crate) struct InitArgs {
 impl Default for InitArgs {
     /// Both lifetimes at [`Ttl::DEFAULT`].
     fn default() -> Self {
-        let ttl: Ttl = Ttl::DEFAULT.parse().expect("the default lifetime parses");
         Self {
-            ttl,
-            state_ttl: ttl,
+            ttl: Ttl::default(),
+            state_ttl: Ttl::default(),
         }
     }
 }
@@ -53,7 +52,7 @@ pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
         Some(root) => root,
         None => {
             let root = NodeIdentity::generate();
-            ks.save_root(&root, false)?;
+            ks.save_root(&root)?;
             root
         }
     };
@@ -61,7 +60,7 @@ pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
         Some(node) => node,
         None => {
             let node = NodeIdentity::generate();
-            ks.save_node(&node, false)?;
+            ks.save_node(&node)?;
             node
         }
     };
@@ -94,14 +93,10 @@ mod tests {
     use super::*;
     use crate::testutil::temp_dir;
 
-    fn args() -> InitArgs {
-        InitArgs::default()
-    }
-
     #[test]
     fn init_makes_this_node_the_first_member() {
         let ks = Keystore::at(temp_dir());
-        let out = init_in(&ks, args()).unwrap();
+        let out = init_in(&ks, InitArgs::default()).unwrap();
         let root = ks.read_root_identity().unwrap().unwrap();
         let me = ks.read_node_identity().unwrap().unwrap();
         assert!(out.contains(&root.node_id().hex()), "{out}");
@@ -126,13 +121,13 @@ mod tests {
     fn init_twice_is_refused_and_an_existing_node_key_is_kept() {
         let ks = Keystore::at(temp_dir());
         let node = NodeIdentity::from_seed([5u8; 32]);
-        ks.save_node(&node, false).unwrap();
-        init_in(&ks, args()).unwrap();
+        ks.save_node(&node).unwrap();
+        init_in(&ks, InitArgs::default()).unwrap();
         assert_eq!(
             ks.read_node_identity().unwrap().unwrap().node_id(),
             node.node_id()
         );
-        let err = init_in(&ks, args()).unwrap_err();
+        let err = init_in(&ks, InitArgs::default()).unwrap_err();
         assert!(format!("{err:#}").contains("already in network"), "{err:#}");
     }
 }

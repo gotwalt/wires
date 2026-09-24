@@ -1,5 +1,5 @@
-//! The admin-signed state on this node (card 27, lane **27a**): where it is
-//! kept, and how it moves between nodes.
+//! The admin-signed state on this node: where it is kept, and how it moves
+//! between nodes.
 //!
 //! Every role reads it: the caller lists and resolves services from it, the
 //! host authorizes calls with it, the admin writes it. Everything else

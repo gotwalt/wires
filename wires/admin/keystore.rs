@@ -5,7 +5,7 @@
 //! `$XDG_CONFIG_HOME/wires`, else `~/.config/wires`:
 //!
 //! - `node.seed` / `root.seed`: hex-encoded 32-byte Ed25519 seeds (mode `0600`).
-//! - `membership.json`: the dialer's fabric membership token (mode `0644` — a
+//! - `membership.json`: the dialer's membership token (mode `0644` — a
 //!   *public* signed credential, not a secret).
 //! - `names.json`: the admin's local labels for members (mode `0600`).
 //! - `state.json`, `state-admin.txt`, `state-checked.txt`: the admin-signed
@@ -69,22 +69,22 @@ impl Keystore {
         read_identity_opt(&self.path("root.seed"))
     }
 
-    /// Persist the node identity to `node.seed` (mode `0600`); refuse to
-    /// overwrite an existing file unless `force`. Returns the written path.
-    pub fn save_node(&self, id: &NodeIdentity, force: bool) -> Result<PathBuf> {
-        self.save_seed("node.seed", id, force)
+    /// Persist the node identity to `node.seed` (mode `0600`); an existing
+    /// key is never overwritten. Returns the written path.
+    pub fn save_node(&self, id: &NodeIdentity) -> Result<PathBuf> {
+        self.save_seed("node.seed", id)
     }
 
-    /// Persist the root identity to `root.seed` (mode `0600`); refuse to
-    /// overwrite an existing file unless `force`. Returns the written path.
-    pub fn save_root(&self, id: &NodeIdentity, force: bool) -> Result<PathBuf> {
-        self.save_seed("root.seed", id, force)
+    /// Persist the root identity to `root.seed` (mode `0600`); an existing
+    /// key is never overwritten. Returns the written path.
+    pub fn save_root(&self, id: &NodeIdentity) -> Result<PathBuf> {
+        self.save_seed("root.seed", id)
     }
 
-    fn save_seed(&self, name: &str, id: &NodeIdentity, force: bool) -> Result<PathBuf> {
-        ensure_dir(&self.dir)?;
+    fn save_seed(&self, name: &str, id: &NodeIdentity) -> Result<PathBuf> {
+        create_private_dir(&self.dir)?;
         let path = self.path(name);
-        write_secret(&path, &id.expose_seed_hex(), force)?;
+        write_secret(&path, &id.expose_seed_hex())?;
         Ok(path)
     }
 
@@ -104,7 +104,7 @@ impl Keystore {
     /// `0644` — a membership is a *public* signed credential, not a secret).
     /// Returns the written path.
     pub fn save_membership(&self, membership: &Membership) -> Result<PathBuf> {
-        ensure_dir(&self.dir)?;
+        create_private_dir(&self.dir)?;
         let path = self.path("membership.json");
         write_text_mode(&path, &membership.encode()?, Some(0o644))?;
         Ok(path)
@@ -126,29 +126,39 @@ impl Keystore {
     /// Persist the admin's member labels (`names.json`, mode `0600` — the
     /// names say who is in).
     pub fn save_names(&self, names: &BTreeMap<String, NodeId>) -> Result<PathBuf> {
-        ensure_dir(&self.dir)?;
+        create_private_dir(&self.dir)?;
         let path = self.path("names.json");
         let json = serde_json::to_string_pretty(names).context("encoding names.json")?;
-        write_secret_overwrite(&path, &json)?;
+        write_text_mode(&path, &json, Some(0o600))?;
         Ok(path)
     }
 }
 
-// ---------------------------------------------------------------------------
-// CLI resolvers (flag > env > file > keystore)
-// ---------------------------------------------------------------------------
-
-/// Resolve a node identity for `serve` / `call`.
+/// Resolve a node identity for `serve` / `call`: an inline `--node-seed`
+/// wins, then `$WIRES_NODE_SEED`, then an explicit `--node-seed-file`, then
+/// the keystore (`node.seed`).
 pub fn node_identity(inline: Option<&str>, file: Option<&Path>) -> Result<NodeIdentity> {
-    let env = std::env::var("WIRES_NODE_SEED").ok().map(Zeroizing::new);
-    resolve_identity(
-        inline,
-        env.as_ref().map(|s| s.as_str()),
-        file,
-        "node.seed",
-        "node",
-        "WIRES_NODE_SEED",
-    )
+    if let Some(hex) = inline {
+        return NodeIdentity::from_seed_hex(hex).context("--node-seed");
+    }
+    if let Some(hex) = std::env::var("WIRES_NODE_SEED")
+        .ok()
+        .map(Zeroizing::new)
+        .filter(|s| !s.is_empty())
+    {
+        return NodeIdentity::from_seed_hex(&hex).context("$WIRES_NODE_SEED");
+    }
+    if let Some(path) = file {
+        return read_identity_file(path);
+    }
+    let ks = Keystore::resolve()?;
+    ks.read_node_identity()?.ok_or_else(|| {
+        anyhow!(
+            "no node key: pass --node-seed, set $WIRES_NODE_SEED, use --node-seed-file, or run \
+             `wires id` (looked for {})",
+            ks.path("node.seed").display()
+        )
+    })
 }
 
 /// Resolve the node identity for a command that already holds a keystore
@@ -200,52 +210,10 @@ pub fn membership(inline: Option<&str>, file: Option<&Path>) -> Result<Membershi
     );
 }
 
-fn resolve_identity(
-    inline: Option<&str>,
-    env: Option<&str>,
-    file: Option<&Path>,
-    ks_name: &str,
-    role: &str,
-    env_name: &str,
-) -> Result<NodeIdentity> {
-    if let Some(hex) = inline {
-        return NodeIdentity::from_seed_hex(hex).with_context(|| format!("--{role}-seed"));
-    }
-    if let Some(hex) = env.filter(|s| !s.is_empty()) {
-        return NodeIdentity::from_seed_hex(hex).with_context(|| format!("${env_name}"));
-    }
-    if let Some(path) = file {
-        return read_identity_file(path);
-    }
-    let ks = Keystore::resolve()?;
-    let found = match ks_name {
-        "node.seed" => ks.read_node_identity()?,
-        "root.seed" => ks.read_root_identity()?,
-        other => bail!("unknown keystore file {other}"),
-    };
-    if let Some(id) = found {
-        return Ok(id);
-    }
-    bail!(
-        "no {role} key: pass --{role}-seed, set ${env_name}, use --{role}-seed-file, \
-         or run `{}` (looked for {})",
-        if role == "root" {
-            "wires init"
-        } else {
-            "wires id"
-        },
-        ks.path(ks_name).display()
-    );
-}
-
 /// Read a seed file into an identity, erroring if absent.
 pub fn read_identity_file(path: &Path) -> Result<NodeIdentity> {
     read_identity_opt(path)?.ok_or_else(|| anyhow!("seed file not found: {}", path.display()))
 }
-
-// ---------------------------------------------------------------------------
-// Low-level file helpers
-// ---------------------------------------------------------------------------
 
 fn read_identity_opt(path: &Path) -> Result<Option<NodeIdentity>> {
     match read_secret_opt(path)? {
@@ -287,30 +255,30 @@ fn read_to_string_opt(path: &Path) -> Result<Option<String>> {
     }
 }
 
-fn ensure_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+/// Create `dir` (and its parents) if missing, the new directories mode
+/// `0700`: the keystore holds seeds and the state.
+pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).ok();
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
     }
-    Ok(())
+    builder
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))
 }
 
-/// Write a secret file with mode `0600`, refusing to clobber unless `force`.
+/// Write a secret file with mode `0600`, refusing to clobber an existing one.
 ///
-/// Uses `O_EXCL` (`create_new`) for the non-`force` path so the
-/// refuse-if-exists check and the create are one atomic syscall — no
-/// time-of-check/time-of-use gap and no following a planted symlink.
-fn write_secret(path: &Path, contents: &str, force: bool) -> Result<()> {
+/// `O_EXCL` (`create_new`) makes the refuse-if-exists check and the create
+/// one atomic syscall: no time-of-check/time-of-use gap, and no following a
+/// planted symlink.
+fn write_secret(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true);
-    if force {
-        opts.create(true).truncate(true);
-    } else {
-        opts.create_new(true);
-    }
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -320,7 +288,7 @@ fn write_secret(path: &Path, contents: &str, force: bool) -> Result<()> {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             bail!(
-                "{} already exists (pass --force to overwrite)",
+                "{} already exists; wires never overwrites a key",
                 path.display()
             );
         }
@@ -355,8 +323,8 @@ pub(crate) fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) ->
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "tmp".to_string());
     // Unique per process *and* per call: two threads in one process rewriting
-    // the same head (the admission CAS and an operator command) must not share
-    // a temporary path, or one would rename the other's half-written file.
+    // the same file (a pulled state and a pushed one, say) must not share a
+    // temporary path, or one would rename the other's half-written file.
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
@@ -387,12 +355,6 @@ pub(crate) fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) ->
     result
 }
 
-/// [`write_text_mode`] without a mode change (the file keeps the default).
-#[cfg(test)]
-fn write_text(path: &Path, contents: &str) -> Result<()> {
-    write_text_mode(path, contents, None)
-}
-
 /// Set a file's unix mode (best-effort; no-op on non-unix).
 fn set_mode(path: &Path, mode: u32) {
     #[cfg(unix)]
@@ -406,24 +368,19 @@ fn set_mode(path: &Path, mode: u32) {
     }
 }
 
-/// Write a secret file at mode `0600`, overwriting any existing file.
-fn write_secret_overwrite(path: &Path, contents: &str) -> Result<()> {
-    write_text_mode(path, contents, Some(0o600))
-}
-
 /// Local consistency check run before dialing: the membership must name
 /// *this* keystore's node.
 ///
 /// Catches a membership copied to the wrong machine without a network
 /// round-trip, so it never masquerades as a refusal by the responder.
-pub(crate) fn preflight(node: NodeId, membership: &Membership) -> Result<(), String> {
+pub(crate) fn preflight(node: NodeId, membership: &Membership) -> Result<()> {
     if membership.member != node {
-        return Err(format!(
+        bail!(
             "this membership was issued to node {}, but this keystore's node is {} — import \
              the invite minted for this node (`wires join <token>`)",
             membership.member.hex(),
             node.hex()
-        ));
+        );
     }
     Ok(())
 }
@@ -431,18 +388,7 @@ pub(crate) fn preflight(node: NodeId, membership: &Membership) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    fn temp_dir() -> PathBuf {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let base = std::env::var_os("TEST_TMPDIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = base.join(format!("wires-ks-{}-{}", std::process::id(), n));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::testutil::temp_dir;
 
     #[test]
     fn node_seed_round_trips_through_the_keystore() {
@@ -450,22 +396,22 @@ mod tests {
         assert!(ks.read_node_identity().unwrap().is_none());
 
         let id = NodeIdentity::from_seed([3u8; 32]);
-        ks.save_node(&id, false).unwrap();
+        ks.save_node(&id).unwrap();
         let read = ks.read_node_identity().unwrap().unwrap();
         assert_eq!(read.node_id(), id.node_id());
     }
 
     #[test]
-    fn save_refuses_to_clobber_without_force() {
+    fn a_saved_key_is_never_overwritten() {
         let ks = Keystore::at(temp_dir());
         let a = NodeIdentity::from_seed([1u8; 32]);
         let b = NodeIdentity::from_seed([2u8; 32]);
-        ks.save_root(&a, false).unwrap();
-        assert!(ks.save_root(&b, false).is_err());
-        ks.save_root(&b, true).unwrap();
+        ks.save_root(&a).unwrap();
+        let e = format!("{:#}", ks.save_root(&b).unwrap_err());
+        assert!(e.contains("never overwrites a key"), "{e}");
         assert_eq!(
             ks.read_root_identity().unwrap().unwrap().node_id(),
-            b.node_id()
+            a.node_id()
         );
     }
 
@@ -485,7 +431,7 @@ mod tests {
         // With no inline/env, an explicit file is used.
         let file_id = NodeIdentity::from_seed([6u8; 32]);
         let path = temp_dir().join("node.seed");
-        write_secret(&path, &file_id.expose_seed_hex(), true).unwrap();
+        write_secret(&path, &file_id.expose_seed_hex()).unwrap();
         let got = node_identity(None, Some(&path)).unwrap();
         assert_eq!(got.node_id(), file_id.node_id());
     }
@@ -500,9 +446,7 @@ mod tests {
     fn secret_files_are_0600() {
         use std::os::unix::fs::PermissionsExt;
         let ks = Keystore::at(temp_dir());
-        let path = ks
-            .save_node(&NodeIdentity::from_seed([9u8; 32]), false)
-            .unwrap();
+        let path = ks.save_node(&NodeIdentity::from_seed([9u8; 32])).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
@@ -570,7 +514,7 @@ mod tests {
         assert_eq!(membership(Some(&m.encode().unwrap()), None).unwrap(), m);
         // Else an explicit file is decoded.
         let path = temp_dir().join("membership.json");
-        write_text(&path, &m.encode().unwrap()).unwrap();
+        write_text_mode(&path, &m.encode().unwrap(), None).unwrap();
         assert_eq!(membership(None, Some(&path)).unwrap(), m);
     }
 
@@ -589,7 +533,7 @@ mod tests {
         );
 
         let id = NodeIdentity::from_seed([11u8; 32]);
-        ks.save_node(&id, false).unwrap();
+        ks.save_node(&id).unwrap();
         assert_eq!(node_identity_in(&ks).unwrap().node_id(), id.node_id());
     }
 
@@ -598,7 +542,7 @@ mod tests {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let me = NodeIdentity::from_seed([2u8; 32]).node_id();
         let membership = Membership::mint(&root, me, 0, i64::MAX).unwrap();
-        assert_eq!(preflight(me, &membership), Ok(()));
+        preflight(me, &membership).unwrap();
     }
 
     #[test]
@@ -607,7 +551,7 @@ mod tests {
         let me = NodeIdentity::from_seed([2u8; 32]).node_id();
         let other = NodeIdentity::from_seed([3u8; 32]).node_id();
         let membership = Membership::mint(&root, other, 0, i64::MAX).unwrap();
-        let msg = preflight(me, &membership).unwrap_err();
+        let msg = preflight(me, &membership).unwrap_err().to_string();
         assert!(
             msg.contains(&other.hex()) && msg.contains(&me.hex()),
             "{msg}"
