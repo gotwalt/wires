@@ -585,3 +585,96 @@ Deliberately left:
 - `gateway/mod.rs` keeps its own "the gateway holds no signed state" lookups
   (different wording, and §B6's gateway items are that lane's).
 - `cargo doc` warnings (§D3) are unchanged by this phase; none are new.
+
+### Lane ADMIN
+
+`wires/admin`, `wires/state`, `wires/e2e` (not `native.rs`), `lib.rs`,
+`testutil.rs`, `net.rs`.
+
+Deleted tests:
+
+- `lib.rs` `the_channel_commands_are_gone` (§A3): clap rejects any unknown
+  command anyway; it only kept the retired names alive.
+- `admin/service.rs` `member_is_an_ordinary_role_name` (§A4): "an undefined
+  role is refused" is already covered by
+  `invalid_edits_are_refused_and_nothing_is_stored`.
+- The `member` case in `e2e/services_host.rs`
+  `a_fetch_with_a_token_makes_a_caller_reachable_by_role` (§A4); the `staff`
+  case stays.
+- `e2e/services_host.rs` `nothing_is_broadcast_to_a_bystander` (§A9), with
+  its `counting_node` fixture: no code path would ever dial carol, so it
+  guarded the deleted gossip design. That a role push reaches nobody the host
+  hasn't seen is already asserted in
+  `a_fetch_with_a_token_makes_a_caller_reachable_by_role`.
+- `admin/propagate.rs` `state_push_parses` (§A12): it repeats
+  `lib.rs` `onboarding_commands_parse`.
+
+Rewritten tests, each seen red against a deliberately broken implementation:
+`admin/ttl.rs` `every_unit_scales` → `units_agree_with_each_other` (checks
+units against each other, not the implementation's table; red with
+`'h' => 3601`); keystore `save_refuses_to_clobber_without_force` →
+`a_saved_key_is_never_overwritten` (red with `create(true).truncate(true)`);
+the two `preflight_*` tests (red with the check disabled);
+`store::staleness_and_the_admin_hint` (red with `>=`); the new
+`net::wildcard_binds_dial_localhost` (red without the v6 rewrite);
+`role_cli`, which now reads the stored state back
+(`role_set_names_google_unless_told_otherwise` red with the wrong default
+issuer); `concurrent_users_each_call_with_their_own_token` on `JoinSet`
+(red when a task's assert fails); the shared e2e `call` (red when it drops an
+argument) and `records.rs`'s `call` on top of it (red when inverted).
+
+Done:
+
+- §A7/A11/A12 above; `state/sync.rs`: the dead elapsed-time assert and file
+  removal, the redundant `.clone()`; `e2e/records.rs`: the dead `let _`.
+- §B7: `resolve_identity` inlined into `node_identity` (the root branches
+  were dead); `force` gone (`save_node`/`save_root` never overwrite; the
+  error no longer names a nonexistent `--force`); `write_text` and
+  `write_secret_overwrite` gone; `preflight` returns `anyhow::Result`;
+  `ensure_dir` merged into `keystore::create_private_dir` (the store's copy,
+  moved; it makes new directories `0700` and no longer re-chmods an existing
+  one, since every file in it is written `0600`/`0644` explicitly); the
+  keystore tests use `testutil::temp_dir`. `Report` (now `Default`, with a
+  `hint` printed after the notes) and `run_edit` live in `admin/mod.rs`;
+  invite, remove, service, role and `state push` all go through it.
+  `impl Default for Ttl`. `service_in`/`role_in` return the line only;
+  `admin_with` is private; `init.rs` `args()` gone.
+- §B6: `refresh_cold` calls `catch_up` (one staleness check); `is_stale`
+  takes no `max_age` (always `STALE_AFTER_SECS`). `net::dialable` is the one
+  wildcard → localhost rewrite (`caller/pick.rs` `write_own_hint`, the e2e
+  `localhost_socks`, the sync tests).
+- `lib.rs`: each command runs on one runtime (`refresh_cold` and the command
+  in one `block_on`); every error goes through `exit_with` (`serve`, `mcp`,
+  `tools`, the offline commands); `print_or_exit` prints nothing for empty
+  output; `exit_with_code` for the commands that return a code. D1: `Tools`
+  is documented as the alias editor and requires a subcommand.
+- §B9: `e2e/mod.rs` holds `bind`/`bind_in`, `read_frame`, `Outcome` and the
+  one hand-rolled `call`, and the fixture pieces (`role`, `service`,
+  `email_at`, `signed_state`, `membership`, `hello`, `adopt`,
+  `host_config`). Each file keeps its own `World` (different casts), built
+  from those. `futures_join_all` → `JoinSet`. `testutil.rs`: no
+  `TEST_TMPDIR`, no Bazel.
+- §C6, §D: "same head (the admission CAS…)", "no key to rotate", "`lock`
+  drops here", "10 minutes", `join.rs`'s restating comment; the e2e doc
+  indexes (records, gateway) name every test; "fabric" in doc prose →
+  "network" in these files; `cargo doc --document-private-items` has no
+  warnings in these files, and `lib.rs`'s crate doc no longer links private
+  items (8 warnings in plain `cargo doc`).
+
+Outside the lane, kept minimal:
+
+- `caller/tools.rs` (D1): `ToolsArgs.cmd` is required; `tools_cmd` (the
+  no-subcommand listing), `render_aliases` and the unreachable `bail!` are
+  gone.
+- `caller/pick.rs`: `write_own_hint` calls `net::dialable`.
+- `save_node`/`save_root` lost their `force` argument at the call sites in
+  `host/serve.rs` (test), `host/embed.rs`, `caller/join.rs` and
+  `e2e/native.rs`.
+- `caller/call.rs` and `caller/inbox.rs` still wrap `preflight`'s error in
+  `.map_err(anyhow::Error::msg)`: that still compiles, and lane CALLER can
+  drop it.
+
+Left: `e2e/records.rs` keeps `call_log::start(opened, None, false)` (lane
+HOST's §B2 changes that signature; the integrator reconciles it). The RFC 7636
+vector inlined in `e2e/gateway.rs` stays (§A12 lists it with the caller's
+PKCE tests). The sync tests' internal `Fabric` fixture name stays (internal).
