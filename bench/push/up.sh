@@ -53,15 +53,15 @@ cat >"$D/host.json" <<JSON
 {
   "version": 2,
   "services": {
-    "deploy": { "command": ["$repo/.scripts/fixtures/ci.sh", "deploy"] },
-    "status": { "command": ["$repo/.scripts/fixtures/ci.sh", "status"] },
-    "logs": { "command": ["$repo/.scripts/fixtures/ci.sh", "logs"] }
+    "deploy": { "command": ["$repo/.scripts/fixtures/ci.sh", "deploy"], "env": { "CI_JOBS": "$D/jobs", "CI_WIRES": "$WIRES" } },
+    "status": { "command": ["$repo/.scripts/fixtures/ci.sh", "status"], "env": { "CI_JOBS": "$D/jobs", "CI_WIRES": "$WIRES" } },
+    "logs": { "command": ["$repo/.scripts/fixtures/ci.sh", "logs"], "env": { "CI_JOBS": "$D/jobs", "CI_WIRES": "$WIRES" } }
   },
   "push": { "allow": ["member"] }
 }
 JSON
 "$WIRES" serve --check "$D/host.json" >/dev/null
-(cd "$D" && WIRES_HOME="$D/wb" CI_JOBS="$D/jobs" CI_WIRES="$WIRES" \
+(cd "$D" && WIRES_HOME="$D/wb" \
 	exec nohup "$WIRES" serve "$D/host.json" >"$D/wb.out" 2>"$D/wb.err" </dev/null) &
 echo $! >"$D/wb.pid"
 for _ in $(seq 1 300); do

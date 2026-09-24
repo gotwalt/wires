@@ -155,17 +155,19 @@ ISSUER="$(awk '/^issuer /{print $2}' "$D/idp.out")"
 CLIENT_ID="$(awk '/^client_id /{print $2}' "$D/idp.out")"
 
 HOST_JSON="$D/host.json"
+JOBS="$D/jobs"
+mkdir -p "$JOBS"
+# A service runs in a minimal environment (PATH, the locale, host.json's
+# `env`, the WIRES_* values): the mock CI's settings go in host.json.
 sed -e "s|__ISSUER__|$ISSUER|" -e "s|__CLIENT_ID__|$CLIENT_ID|" \
 	-e "s|__CI__|$repo/.scripts/fixtures/ci.sh|" \
+	-e "s|__JOBS__|$JOBS|" -e "s|__JOB_SECS__|$JOB_SECS|" -e "s|__WIRES__|$WIRES|" \
 	"$repo/.scripts/fixtures/push-host.json" >"$HOST_JSON"
 "$WIRES" serve --check "$HOST_JSON" >"$D/check.out" 2>&1 || {
 	cat "$D/check.out" >&2
 	bad "setup: serve --check rejected push-host.json"
 }
-JOBS="$D/jobs"
-mkdir -p "$JOBS"
-(cd "$D" && WIRES_HOME="$wb" CI_JOBS="$JOBS" CI_JOB_SECS="$JOB_SECS" CI_WIRES="$WIRES" \
-	exec "$WIRES" serve "$HOST_JSON" >"$D/wb.out" 2>"$D/wb.err") &
+(cd "$D" && WIRES_HOME="$wb" exec "$WIRES" serve "$HOST_JSON" >"$D/wb.out" 2>"$D/wb.err") &
 WB_PID=$!
 wait_for "$wb/run/hint" " " 300 || {
 	sed 's/^/  workbench| /' "$D/wb.err" >&2

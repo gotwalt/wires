@@ -6,9 +6,18 @@
     ]
   },
   "services": {
-    "deploy": { "command": ["__CI__", "deploy"] },
-    "status": { "command": ["__CI__", "status"] },
-    "logs": { "command": ["__CI__", "logs"] }
+    "deploy": {
+      "command": ["__CI__", "deploy"],
+      "env": { "CI_JOBS": "__JOBS__", "CI_JOB_SECS": "__JOB_SECS__", "CI_WIRES": "__WIRES__" }
+    },
+    "status": {
+      "command": ["__CI__", "status"],
+      "env": { "CI_JOBS": "__JOBS__", "CI_JOB_SECS": "__JOB_SECS__", "CI_WIRES": "__WIRES__" }
+    },
+    "logs": {
+      "command": ["__CI__", "logs"],
+      "env": { "CI_JOBS": "__JOBS__", "CI_JOB_SECS": "__JOB_SECS__", "CI_WIRES": "__WIRES__" }
+    }
   },
   "push": { "allow": ["analyst"] }
 }
