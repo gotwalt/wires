@@ -255,7 +255,7 @@ set -e
 	dump "$D/c4.err"
 	bad "bob's call exited $rc, expected 1 (not in his view)"
 }
-grep -qF "no service named \`kv\` that you may use" "$D/c4.err" || {
+grep -qF "no service named \`kv\` that you may call" "$D/c4.err" || {
 	dump "$D/c4.err"
 	bad "bob's call stopped, but not for his view"
 }

@@ -1,0 +1,13 @@
+Install the invite token your admin sent (without one, print this node's id)
+
+Usage: wires join [TOKEN]
+
+Arguments:
+  [TOKEN]  The token your admin sent (`wires invite` printed it)
+
+Options:
+  -h, --help  Print help
+
+Examples:
+  wires id                    # send the id to your admin; they send a token
+  wires join <token>          # then: wires login

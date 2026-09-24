@@ -876,21 +876,20 @@ impl iroh::protocol::ProtocolHandler for PushFetch {
 /// `wires push --to <node|role> --subject S [--ttl D] [-- body…]`.
 #[derive(Args, Clone, Debug)]
 pub(crate) struct PushArgs {
-    /// Who receives it: a node id (a service's `$WIRES_CALLER_NODE` is its
-    /// caller's), or a role from the signed policy (every member whose
-    /// verified identity this host holds and the role admits).
+    /// A node id (a service's `$WIRES_CALLER_NODE`), or a role in the policy.
+    // A role: every member whose verified identity this host holds and the
+    // role admits.
     #[arg(long)]
     pub(crate) to: String,
-    /// One line, recorded in the host's call log (the body is not, unless
-    /// host.json says `"push": {"log_body": true}`).
+    /// One line, recorded in the host's call log (the body only if host.json says).
+    // `"push": {"log_body": true}`.
     #[arg(long)]
     pub(crate) subject: String,
-    /// How long the host keeps it for a recipient that isn't listening
-    /// (e.g. `90m`, `2d`; default 24h, at most 7d).
+    /// How long to keep it for a recipient not listening (`90m`, `2d`; max 7d).
+    // Default 24h.
     #[arg(long)]
     pub(crate) ttl: Option<Ttl>,
-    /// The body. Read from stdin when none is given (and stdin isn't a
-    /// terminal).
+    /// The body; read from stdin when none is given (and stdin isn't a terminal).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub(crate) body: Vec<String>,
 }

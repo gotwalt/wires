@@ -694,16 +694,15 @@ pub(crate) async fn fetch_all(
 /// `wires inbox [--wait [--timeout D]] [--json]`.
 #[derive(Args, Clone, Debug, Default)]
 pub(crate) struct InboxArgs {
-    /// Block until at least one message is here, print it, and exit. For a
-    /// harness that runs commands in the background and wakes the agent when
-    /// one exits.
+    /// Block until a message arrives, print it, and exit.
+    // For a harness that runs commands in the background and wakes the
+    // agent when one exits.
     #[arg(long)]
     pub(crate) wait: bool,
-    /// With `--wait`: give up after this long (e.g. `90s`, `10m`) and exit
-    /// 124.
+    /// With --wait: give up after this long (`90s`, `10m`) and exit 124.
     #[arg(long, requires = "wait")]
     pub(crate) timeout: Option<Ttl>,
-    /// Print one JSON object per message instead of a line.
+    /// One JSON object per message instead of a line.
     #[arg(long)]
     pub(crate) json: bool,
     /// The credential flags `wires call` takes (refused in locked mode).
@@ -847,7 +846,11 @@ async fn read_loop(
             {
                 match fetched {
                     Fetched::Refused(reason) => {
-                        eprintln!("wires inbox: host {} refused: {reason}", host.short());
+                        eprintln!(
+                            "wires inbox: host {} refused: {reason}{}",
+                            host.short(),
+                            crate::help::refusal_step(&reason)
+                        );
                         refusals.push(reason);
                     }
                     Fetched::Messages(n) => {

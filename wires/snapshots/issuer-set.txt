@@ -1,0 +1,23 @@
+Trust an IdP (or change one), and publish
+
+Usage: wires issuer set [OPTIONS] --client-id <CLIENT_ID> <ISSUER>
+
+Arguments:
+  <ISSUER>  The IdP's exact `iss` (e.g. `https://accounts.google.com`)
+
+Options:
+      --client-id <CLIENT_ID>
+          The OAuth client id `wires login` signs in under
+      --audience <AUDIENCE>
+          An `aud` value hosts accept from this IdP (repeatable; default: the client id)
+      --public-client-secret <PUBLIC_CLIENT_SECRET>
+          The client's public secret, which invites carry to `wires login`
+      --login
+          Make this the IdP invites tell `wires login` to use (default: init's)
+  -h, --help
+          Print help
+      --help-all
+          Also list the operator and credential flags
+
+Example:
+  wires issuer set https://idp.example.com --client-id <client id>

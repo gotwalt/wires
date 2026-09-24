@@ -553,16 +553,23 @@ async fn resolve_entry(
         .unwrap_or_else(|_| Err(anyhow!("no directory answered")));
     match found {
         Ok(Some(e)) => Ok(e.entry),
-        Ok(None) if signed_in => {
-            bail!("no service named `{service}` that you may use (see `wires services`)")
-        }
-        Ok(None) => bail!(
-            "no service named `{service}` that you may use: this node is not signed in (run \
-             `wires login`), and every service needs a verified identity"
-        ),
+        Ok(None) => Err(not_callable(service, signed_in)),
         Err(e) => Err(e.context(format!(
             "`{service}` is not in this node's view, and no directory could be asked"
         ))),
+    }
+}
+
+/// Why `wires call <service>` has nothing to dial: no service by that name
+/// that this caller may call (a directory said so), and the next step.
+pub(crate) fn not_callable(service: &ServiceName, signed_in: bool) -> anyhow::Error {
+    if signed_in {
+        anyhow!("no service named `{service}` that you may call; see `wires services`")
+    } else {
+        anyhow!(
+            "no service named `{service}` that you may call: this node is not signed in, and \
+             every service needs a verified identity; run `wires login`"
+        )
     }
 }
 
@@ -612,7 +619,7 @@ where
     let last_good = LastGood::path(ks);
     let hosts = pick::candidates(&entry.service, LastGood::load(&last_good).get(service));
     if hosts.is_empty() {
-        bail!("no service named `{service}` with a host (see `wires services`)");
+        bail!("no service named `{service}` with a host; see `wires services`");
     }
     let targets = dial.hints.targets(&hosts, creds.relay_override.as_deref());
     let fabric = creds.membership.fabric;
@@ -646,7 +653,8 @@ where
     })
 }
 
-/// Credential flags shared by `wires call`, `wires mcp` and `wires inbox`.
+/// Credential flags shared by `wires call`, `wires mcp` and `wires inbox`,
+/// hidden from `--help` (listed by `--help-all`): a caller never needs them.
 ///
 /// Every one of them is refused in locked mode (`WIRES_LOCKED=1`, see
 /// [`crate::caller::lock`]), as is `--tools-file`: they are how a caller is
@@ -655,20 +663,20 @@ where
 pub struct CredArgs {
     /// Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`,
     /// then `--node-seed-file`, then the keystore (`node.seed`).
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub node_seed: Option<String>,
     /// Read the node key seed (hex) from this file instead of the keystore.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub node_seed_file: Option<PathBuf>,
     /// The base64 membership token to present. Falls back to
     /// `$WIRES_MEMBERSHIP`, then `--membership-file`, then the keystore.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub membership: Option<String>,
     /// Read the membership token from this file instead of the keystore.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub membership_file: Option<PathBuf>,
     /// Dial through this relay, overriding an alias's own.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub relay_url: Option<String>,
 }
 
@@ -678,21 +686,20 @@ pub struct CallArgs {
     #[command(flatten)]
     pub creds: CredArgs,
     /// Read aliases from this file instead of `$WIRES_HOME/tools.json`.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub tools_file: Option<PathBuf>,
-    /// Local output shaping (no shell needed). Goes before `--`, after the
-    /// service name (so a permission rule scoped to the service, e.g.
-    /// `Bash(wires call gh:*)`, still matches) or before it.
+    // Local output shaping (no shell needed). Goes before `--`, after the
+    // service name (so a permission rule scoped to the service, e.g.
+    // `Bash(wires call gh:*)`, still matches) or before it.
     #[command(flatten)]
     pub shape: ShapeArgs,
-    /// Say on stderr which host answered (callers don't normally care).
+    /// Name the host that answered, and print every cause of an error.
     #[arg(long)]
     pub verbose: bool,
-    /// The service's name (`wires services`).
+    /// The service's name, as `wires services` lists it.
     #[arg(value_name = "SERVICE")]
     pub service: String,
-    /// Extra arguments appended to the remote command. Use `--` before any
-    /// that start with `-`.
+    /// Its arguments, after `--`; there is no shell (no pipes or globs).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }

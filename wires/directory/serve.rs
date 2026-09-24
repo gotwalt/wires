@@ -379,10 +379,9 @@ impl Running {
 #[derive(Args)]
 pub(crate) struct DirectoryServeArgs {
     /// Use a self-hosted relay at this URL instead of the n0 default.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub(crate) relay_url: Option<String>,
-    /// How many subscribers this directory follows at once (one more is
-    /// refused).
+    /// How many subscribers this directory follows at once (one more is refused).
     #[arg(long, default_value_t = DEFAULT_MAX_SUBSCRIBERS)]
     pub(crate) max_subscribers: usize,
 }
@@ -408,9 +407,7 @@ pub(crate) fn open_standalone(
         );
     }
     let node = keystore::node_identity_in(&ks)?;
-    let membership = ks
-        .read_membership()?
-        .context("this node has no membership: run `wires join <token>` first")?;
+    let membership = ks.read_membership()?.context(crate::help::NOT_JOINED)?;
     keystore::preflight(node.node_id(), &membership)?;
     let dir = Directory::open(
         node.duplicate(),

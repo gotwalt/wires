@@ -197,12 +197,17 @@ pub struct ToolsArgs {
 /// are the directory; an alias pins a name to one host by hand).
 #[derive(Subcommand)]
 pub enum ToolsCmd {
-    /// Add an alias: a service pinned to one host by its node id.
+    /// Add an alias: a service pinned to one host by its node id
+    #[command(
+        after_help = "Example:\n  wires tools add db-pinned --node <host node id> --description \"Orders, on one host\" --remote-tool orders-db"
+    )]
     Add(ToolsAddArgs),
-    /// List the aliases in `tools.json`, one per line, then a `#` line on
-    /// how to call and filter them.
+    /// List the aliases in `tools.json`, one per line
+    // Then a `#` line on how to call and filter them.
+    #[command(after_help = "Example:\n  wires tools list")]
     List,
-    /// Remove an alias by name.
+    /// Remove an alias by name
+    #[command(after_help = "Example:\n  wires tools rm db-pinned")]
     Rm {
         /// The alias to remove.
         name: String,

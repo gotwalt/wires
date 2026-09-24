@@ -1,0 +1,16 @@
+Edit the local aliases in `tools.json`: add, list, rm
+
+Usage: wires tools [OPTIONS] <COMMAND>
+
+Commands:
+  add   Add an alias: a service pinned to one host by its node id
+  list  List the aliases in `tools.json`, one per line
+  rm    Remove an alias by name
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --tools-file <TOOLS_FILE>  Use this file instead of `$WIRES_HOME/tools.json`
+  -h, --help                     Print help
+
+Example:
+  wires tools list

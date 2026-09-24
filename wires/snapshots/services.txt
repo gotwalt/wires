@@ -1,0 +1,19 @@
+List the services you may call, one per line (a query searches them)
+
+Usage: wires services [OPTIONS] [QUERY]
+
+Arguments:
+  [QUERY]  Keep the services whose name or description contains this (any case)
+
+Options:
+      --json     One JSON object per line (the shape is below)
+  -v, --verbose  Also show each service's hosts; you never need them to call
+  -h, --help     Print help
+
+Examples:
+  wires services
+  wires services orders --json
+
+Output: one service per line, `<name>  <description>  (<roles that may call>)`;
+nothing on stdout when none. --json, one object per line:
+  {"service":"orders-db","description":"…","allow":["analyst"],"call":true,"read":false,"hosts":2}

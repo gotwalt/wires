@@ -37,14 +37,12 @@ use crate::caller::view::{self, HeldView};
 /// `wires services [query] [--json] [--verbose]`.
 #[derive(Args, Clone, Debug, Default)]
 pub(crate) struct ServicesArgs {
-    /// Only the services whose name or description contains this
-    /// (ignoring case).
+    /// Keep the services whose name or description contains this (any case).
     pub(crate) query: Option<String>,
-    /// One JSON object per line: `{service, description, allow}` (plus
-    /// `hosts` with `--verbose`).
+    /// One JSON object per line (the shape is below).
     #[arg(long)]
     pub(crate) json: bool,
-    /// Also show each service's hosts (short keys). Callers don't need them.
+    /// Also show each service's hosts; you never need them to call.
     #[arg(long, short)]
     pub(crate) verbose: bool,
 }
@@ -91,9 +89,7 @@ fn unverified_audiences(jws: &str) -> Result<Vec<Audience>> {
 /// no view at all it is an error.
 pub(crate) async fn current_view(ks: &Keystore) -> Result<HeldView> {
     let node = keystore::node_identity_in(ks)?;
-    let badge = ks
-        .read_membership()?
-        .context("this node has no membership: run `wires join <token>` first")?;
+    let badge = ks.read_membership()?.context(crate::help::NOT_JOINED)?;
     let held = view::read(ks, badge.fabric)?;
     if let Some(held) = &held
         && !held.is_stale(crate::clock::now_unix())
@@ -125,20 +121,39 @@ pub(crate) async fn run(a: &ServicesArgs) -> Result<String> {
         None => held.callable().collect(),
     };
     if entries.is_empty() {
-        let why = match (&a.query, stored_token(&ks)) {
-            (_, None) => "this node is not signed in (`wires login`)".to_string(),
-            (Some(q), _) => format!("none matches {q:?}"),
-            (None, _) => "no service allows you".to_string(),
-        };
+        let signed_in = stored_token(&ks).is_some();
         eprintln!(
-            "wires services: no service to list: {why} (policy v{})",
-            held.version().0
+            "{}",
+            empty_note(a.query.as_deref(), signed_in, held.version().0)
         );
     }
     if a.json {
         return render_json(&entries, a.verbose);
     }
     Ok(render(&entries, a.verbose))
+}
+
+/// What `wires services` prints on stderr when it lists nothing (stdout
+/// stays empty): the premise when the whole view is empty (this is where an
+/// agent new to wires lands), then why, ending with the next step.
+pub(crate) fn empty_note(query: Option<&str>, signed_in: bool, version: u64) -> String {
+    let why = match (query, signed_in) {
+        (_, false) => {
+            "wires services: nothing to list: this node is not signed in; run `wires login`"
+                .to_owned()
+        }
+        (Some(q), true) => {
+            return format!(
+                "wires services: no service you may call matches {q:?}; run `wires services` \
+                 for all of them"
+            );
+        }
+        (None, true) => format!(
+            "wires services: no service allows you (policy version {version}); ask your admin \
+             for a role that may call one"
+        ),
+    };
+    format!("{}\n\n{why}", crate::help::PREMISE)
 }
 
 /// The roles `e`'s service allows, comma-separated.
@@ -192,17 +207,39 @@ fn render_json(entries: &[&ViewEntry], verbose: bool) -> Result<String> {
     let mut lines = Vec::new();
     for e in entries {
         let svc = &e.entry.service;
-        let mut obj = serde_json::json!({
-            "service": e.entry.name.as_str(),
-            "description": svc.description,
-            "allow": svc.allow.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
-        });
-        if verbose {
-            obj["hosts"] = serde_json::json!(svc.hosts.iter().map(NodeId::hex).collect::<Vec<_>>());
-        }
-        lines.push(serde_json::to_string(&obj)?);
+        let line = JsonLine {
+            service: e.entry.name.as_str(),
+            description: svc.description.as_str(),
+            allow: svc.allow.iter().map(|r| r.as_str()).collect(),
+            call: e.call,
+            read: e.read,
+            hosts: svc.hosts.len(),
+            host_ids: verbose.then(|| svc.hosts.iter().map(NodeId::hex).collect()),
+        };
+        lines.push(serde_json::to_string(&line)?);
     }
     Ok(lines.join("\n"))
+}
+
+/// One `wires services --json` line (card 38: a stable shape, in this
+/// field order; `wires services --help` shows it).
+#[derive(serde::Serialize)]
+struct JsonLine<'a> {
+    /// The service's name: what `wires call` takes.
+    service: &'a str,
+    /// What it does, from the registry.
+    description: &'a str,
+    /// The roles that may call it.
+    allow: Vec<&'a str>,
+    /// Whether you may call it.
+    call: bool,
+    /// Whether you may read its call records (`wires watch`).
+    read: bool,
+    /// How many hosts run it.
+    hosts: usize,
+    /// With `--verbose`: the hosts' node ids.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_ids: Option<Vec<String>>,
 }
 
 /// A description on one line (newlines and tabs become spaces).
@@ -312,9 +349,19 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["service"], "orders-db");
         assert_eq!(rows[0]["allow"], serde_json::json!(["analyst"]));
-        assert!(rows[0].get("hosts").is_none());
+        assert_eq!(rows[0]["call"], true);
+        assert_eq!(rows[0]["hosts"], 1);
+        // The shape `wires services --help` documents, in its order.
+        let first = out.lines().next().unwrap();
+        let at: Vec<usize> = ["service", "description", "allow", "call", "read", "hosts"]
+            .iter()
+            .map(|k| first.find(&format!("\"{k}\":")).unwrap())
+            .collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{first}");
+        assert!(!first.contains("host_ids"), "{first}");
         let out = render_json(&entries, true).unwrap();
         assert!(out.contains(&node(4).hex()));
+        assert!(out.contains("\"host_ids\""));
     }
 
     #[test]

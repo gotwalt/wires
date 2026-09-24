@@ -73,8 +73,12 @@ pub const FIRST_MODERN_VERSION: &str = "2026-07-28";
 /// state, which a client picks up within this.
 pub const LIST_TTL_MS: u64 = 60_000;
 
-/// The server's `instructions`: how to use these tools well.
-pub const INSTRUCTIONS: &str = "Each tool runs one command-line program on another machine, by service name, as you: the machine checks your identity against an admin-signed list of who may call it, and logs the call. Pass the program's arguments as `args` (one string per argument, no shell quoting). There is no shell: filter output with the program's own flags or the `jq`/`head`/`max_bytes` fields.";
+pub fn instructions() -> String {
+    format!("{} {USAGE}", crate::help::one_line(crate::help::PREMISE))
+}
+
+/// What [`instructions`] adds to the premise: how a tool call is shaped.
+pub const USAGE: &str = "Each tool is one service you may call (past a few dozen, find one with `search_services` and run it with `call_service`). Pass its arguments as `args`, one string per argument, no shell quoting. There is no shell: filter output with the program's own flags or the `jq`/`head`/`max_bytes` fields.";
 
 /// The per-request protocol-version key of the 2026-07-28 revision.
 pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
@@ -85,9 +89,10 @@ pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 /// Most bytes of remote stdout (and, separately, stderr) placed in a result.
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
-/// Appended to every tool's description: how to cut output down without a
-/// shell (board card 19).
-pub const FILTER_HINT: &str = "Filter output with the command's own flags (e.g. `gh … --json f --jq …`) or the `jq`/`head`/`max_bytes` fields; there is no shell, so pipes are not available.";
+/// The refusal behaviour, in the descriptions of [`SEARCH_TOOL`] and
+/// [`CALL_TOOL`] (card 38: MCP says what `wires call`'s exit 77 says).
+pub const REFUSAL_HINT: &str =
+    "A refusal (`denied by host`) is policy, not a fault: don't retry; ask your admin.";
 
 /// The name this server reports in `serverInfo`.
 pub const SERVER_NAME: &str = "wires";
@@ -313,7 +318,7 @@ impl<C: Caller> McpServer<C> {
             "protocolVersion": agreed,
             "capabilities": {"tools": {"listChanged": self.list_changed}},
             "serverInfo": server_info(),
-            "instructions": INSTRUCTIONS,
+            "instructions": instructions(),
         })
     }
 
@@ -494,7 +499,7 @@ fn search_tool(count: usize) -> Value {
         "name": SEARCH_TOOL,
         "description": format!(
             "Find services you may call, among {count}, by a word in their name or description; \
-             then run one with `{CALL_TOOL}`."
+             then run one with `{CALL_TOOL}`. {REFUSAL_HINT}"
         ),
         "inputSchema": {
             "type": "object",
@@ -519,7 +524,7 @@ fn call_tool() -> Value {
     json!({
         "name": CALL_TOOL,
         "description": format!(
-            "Run a service found with `{SEARCH_TOOL}`, by name, as you. {FILTER_HINT}"
+            "Run a service found with `{SEARCH_TOOL}`, by name, as you. {REFUSAL_HINT}"
         ),
         "inputSchema": schema,
     })
@@ -531,7 +536,7 @@ fn discover() -> Value {
     json!({
         "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
         "capabilities": {"tools": {}},
-        "instructions": INSTRUCTIONS,
+        "instructions": instructions(),
         "ttlMs": LIST_TTL_MS,
         "cacheScope": "public",
     })
@@ -600,12 +605,24 @@ fn input_schema() -> Value {
     })
 }
 
-/// The MCP description for `tool`: its own line, then [`FILTER_HINT`].
+/// The MCP description for `tool`: the first sentence of its registry
+/// description (card 38: the rest, and how to filter, are in
+/// [`instructions`]).
 fn describe(tool: &RemoteTool) -> String {
-    if tool.description.is_empty() {
-        FILTER_HINT.to_owned()
-    } else {
-        format!("{} {FILTER_HINT}", tool.description)
+    first_sentence(&tool.description)
+}
+
+/// The first sentence of `text`, on one line: up to and including the first
+/// `.`, `!` or `?` followed by whitespace, or all of it.
+fn first_sentence(text: &str) -> String {
+    let text = crate::help::one_line(text);
+    let end = text
+        .char_indices()
+        .find(|&(i, c)| matches!(c, '.' | '!' | '?') && text[i + c.len_utf8()..].starts_with(' '))
+        .map(|(i, c)| i + c.len_utf8());
+    match end {
+        Some(end) => text[..end].to_owned(),
+        None => text,
     }
 }
 
@@ -697,7 +714,7 @@ fn parse_arguments(arguments: Option<&Value>) -> Result<(Argv, Vec<u8>, ShapeArg
 /// `denied by host: <reason>`.
 fn render_outcome(outcome: &CallOutcome) -> (String, bool) {
     match outcome {
-        CallOutcome::Denied(reason) => (format!("denied by host: {reason}"), true),
+        CallOutcome::Denied(reason) => (crate::help::refusal(reason), true),
         CallOutcome::Exited {
             exit,
             stdout,
@@ -798,7 +815,7 @@ pub struct McpArgs {
     #[command(flatten)]
     pub creds: CredArgs,
     /// Read aliases from this file instead of `$WIRES_HOME/tools.json`.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub tools_file: Option<PathBuf>,
 }
 
@@ -1038,13 +1055,13 @@ mod tests {
                 json!({"jsonrpc":"2.0","id":9,"method":"resources/list"}),
             ],
         );
-        let suffix = format!(" {FILTER_HINT}");
+        let suffix = "";
         let expected = vec![
             json!({"jsonrpc":"2.0","id":1,"result":{
                 "protocolVersion":"2025-06-18",
                 "capabilities":{"tools":{"listChanged":false}},
                 "serverInfo":{"name":"wires","version":env!("CARGO_PKG_VERSION")},
-                "instructions":INSTRUCTIONS}}),
+                "instructions":instructions()}}),
             json!({"jsonrpc":"2.0","id":2,"result":{"tools":[
                 {"name":"db_query","description":format!("Read-only SQL{suffix}"),"inputSchema":input_schema()},
                 {"name":"fails","description":format!("Always exits 2{suffix}"),"inputSchema":input_schema()},
@@ -1053,7 +1070,11 @@ mod tests {
             ]}}),
             text_result(3, "id\n1\nexit: 0", false),
             text_result(4, "partial\nstderr:\nboom\nexit: 2", true),
-            text_result(5, "denied by host: not a member of this network", true),
+            text_result(
+                5,
+                &crate::help::refusal("not a member of this network"),
+                true,
+            ),
             json!({"jsonrpc":"2.0","id":6,"error":{"code":-32602,"message":"unknown tool: nope"}}),
             text_result(
                 7,
@@ -1096,10 +1117,10 @@ mod tests {
             out[0],
             json!({"jsonrpc":"2.0","id":"a","result":{
                 "tools":[
-                    {"name":"db_query","description":format!("Read-only SQL {FILTER_HINT}"),"inputSchema":input_schema()},
-                    {"name":"fails","description":format!("Always exits 2 {FILTER_HINT}"),"inputSchema":input_schema()},
-                    {"name":"locked","description":format!("Refused {FILTER_HINT}"),"inputSchema":input_schema()},
-                    {"name":"offline","description":format!("Unreachable {FILTER_HINT}"),"inputSchema":input_schema()},
+                    {"name":"db_query","description":"Read-only SQL","inputSchema":input_schema()},
+                    {"name":"fails","description":"Always exits 2","inputSchema":input_schema()},
+                    {"name":"locked","description":"Refused","inputSchema":input_schema()},
+                    {"name":"offline","description":"Unreachable","inputSchema":input_schema()},
                 ],
                 "ttlMs":LIST_TTL_MS,"cacheScope":"private",
                 "resultType":"complete","_meta":stamped_meta}})
@@ -1159,7 +1180,7 @@ mod tests {
             assert_eq!(r["resultType"], "complete");
             assert_eq!(r["cacheScope"], "public");
             assert_eq!(r["ttlMs"], json!(LIST_TTL_MS));
-            assert_eq!(r["instructions"], INSTRUCTIONS);
+            assert_eq!(r["instructions"], instructions());
             assert_eq!(r["_meta"][META_SERVER_INFO]["name"], "wires");
         }
     }
@@ -1195,7 +1216,11 @@ mod tests {
         let out = transcript(&mut s, &[call(2, "locked", json!({}))]);
         assert_eq!(
             out[0],
-            text_result(2, "denied by host: not a member of this network", true),
+            text_result(
+                2,
+                &crate::help::refusal("not a member of this network"),
+                true
+            ),
             "a refusal is an answer, still shown"
         );
     }
@@ -1289,11 +1314,21 @@ mod tests {
     }
 
     #[test]
-    fn descriptions_say_how_to_filter_without_a_shell() {
-        let d = describe(&entry("gh", "The GitHub CLI"));
-        assert!(d.starts_with("The GitHub CLI "), "{d}");
-        assert!(d.contains("--jq"), "{d}");
-        assert!(d.contains("pipes are not available"), "{d}");
+    fn descriptions_are_one_sentence_and_the_instructions_say_how_to_filter() {
+        let d = describe(&entry(
+            "gh",
+            "The GitHub CLI, remote.  Pass gh's arguments.",
+        ));
+        assert_eq!(d, "The GitHub CLI, remote.");
+        assert_eq!(describe(&entry("v", "v1.2 of it")), "v1.2 of it");
+        assert_eq!(describe(&entry("e", "")), "");
+        let i = instructions();
+        assert!(
+            i.starts_with("wires is a network for authenticated remote CLI calls."),
+            "{i}"
+        );
+        assert!(i.contains("`jq`/`head`/`max_bytes`"), "{i}");
+        assert!(i.contains("There is no shell"), "{i}");
     }
 
     #[test]

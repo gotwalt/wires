@@ -37,33 +37,29 @@ use crate::clock::now_unix;
 /// `invite` arguments.
 #[derive(Args)]
 pub(crate) struct InviteArgs {
-    /// The joiner's node id, hex (what `wires id` prints on the joining
-    /// machine).
+    /// The joiner's node id (what `wires id` printed on its machine).
     pub(crate) node_id: String,
-    /// A local label for this node, for `wires remove <name>` and
-    /// `wires service add --host <name>`.
+    /// A local label for it, for `wires remove` and `wires service add --host`.
     #[arg(long)]
     pub(crate) name: Option<String>,
-    /// Lifetime of the invitee's badge (`30d`, `12h`, … or seconds; at most
-    /// 30 days).
+    /// Lifetime of the invitee's badge (`30d`, `12h`, … or seconds; at most 30d).
     #[arg(long, default_value = Ttl::DEFAULT)]
     pub(crate) ttl: Ttl,
     /// Lifetime of the signed policy, from now, if this invite has to edit
     /// it (lifting a ban, or re-signing an expired policy). Never shortens
     /// the current policy's expiry.
-    #[arg(long, default_value = Ttl::POLICY_DEFAULT)]
+    #[arg(long, default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) state_ttl: Ttl,
 }
 
 /// `remove` arguments.
 #[derive(Args)]
 pub(crate) struct RemoveArgs {
-    /// The node to remove: a name given to `wires invite --name`, or a hex
-    /// node id.
+    /// The node to remove: its `wires invite --name` label, or its node id.
     pub(crate) member: String,
     /// Lifetime of the new signed policy, from now (`90d`, `12h`, … or
     /// seconds). Never shortens the current policy's expiry.
-    #[arg(long, default_value = Ttl::POLICY_DEFAULT)]
+    #[arg(long, default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) state_ttl: Ttl,
 }
 

@@ -30,8 +30,7 @@ use crate::clock::now_unix;
 /// `join` arguments.
 #[derive(Args)]
 pub(crate) struct JoinArgs {
-    /// The token `wires invite` printed. Omit it to print this node's id — the
-    /// thing to send the admin first.
+    /// The token your admin sent (`wires invite` printed it).
     pub(crate) token: Option<String>,
 }
 
@@ -102,7 +101,9 @@ pub(crate) struct Joined {
 /// `$WIRES_HOME`); re-joining the same fabric never moves a stored policy
 /// backwards.
 pub(crate) fn join_in(ks: &Keystore, token: &str, now: i64) -> anyhow::Result<Joined> {
-    let invite = Invite::decode(token).context("the invite token (is the paste complete?)")?;
+    let invite = Invite::decode(token).context(
+        "the invite token does not decode; paste it whole, or ask your admin to send it again",
+    )?;
     let me = keystore::node_identity_in(ks).map_err(|_| {
         anyhow::anyhow!(
             "this keystore has no node key, so this invite (for node {}) cannot be for it — run \
@@ -119,7 +120,9 @@ pub(crate) fn join_in(ks: &Keystore, token: &str, now: i64) -> anyhow::Result<Jo
             me.node_id().hex()
         );
     }
-    invite.verify(&me, now).context("checking the invite")?;
+    invite
+        .verify(&me, now)
+        .context("the invite does not check out; ask your admin for a fresh one")?;
     let fabric = invite.fabric();
     if let Some(held) = ks.read_membership()?
         && held.fabric != fabric

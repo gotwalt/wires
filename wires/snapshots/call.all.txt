@@ -1,0 +1,41 @@
+Run a service by name: its stdin, stdout, stderr and exit code are yours
+
+Usage: wires call [OPTIONS] <SERVICE> [-- <ARGS>...]
+
+Arguments:
+  <SERVICE>  The service's name, as `wires services` lists it
+  [ARGS]...  Its arguments, after `--`; there is no shell (no pipes or globs)
+
+Options:
+      --node-seed <NODE_SEED>
+          Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`, then `--node-seed-file`, then the keystore (`node.seed`)
+      --node-seed-file <NODE_SEED_FILE>
+          Read the node key seed (hex) from this file instead of the keystore
+      --membership <MEMBERSHIP>
+          The base64 membership token to present. Falls back to `$WIRES_MEMBERSHIP`, then `--membership-file`, then the keystore
+      --membership-file <MEMBERSHIP_FILE>
+          Read the membership token from this file instead of the keystore
+      --relay-url <RELAY_URL>
+          Dial through this relay, overriding an alias's own
+      --tools-file <TOOLS_FILE>
+          Read aliases from this file instead of `$WIRES_HOME/tools.json`
+      --jq <FILTER>
+          Filter stdout as JSON with this jq program, in-process (as `gh --jq`)
+      --head <N>
+          Keep only the first N lines of stdout (after --jq)
+      --max-bytes <N>
+          Keep at most N bytes of stdout; stderr says how much was dropped
+      --verbose
+          Name the host that answered, and print every cause of an error
+  -h, --help
+          Print help
+      --help-all
+          Also list the operator and credential flags
+
+Examples:
+  wires call orders-db -- "select count(*) from orders"
+  wires call gh --jq '.[].title' -- issue list --json title
+
+Exit: the service's own code. 77: refused by policy, nothing on stdout (don't
+retry; ask your admin). 1: a local or transport failure (a service's own 77
+is reported as 1). 2: a usage error (a bad --jq, a flag locked mode refuses).

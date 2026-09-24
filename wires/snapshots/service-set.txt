@@ -1,0 +1,17 @@
+Change an existing service (each flag given replaces that list)
+
+Usage: wires service set [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  The service's name (`[a-z][a-z0-9_-]*`)
+
+Options:
+      --description <DESCRIPTION>  What it does, shown in `wires services`
+      --allow <ALLOW>              A role allowed to call it (one defined with `wires role set`). Repeatable
+      --host <HOST>                A node that implements it: an `invite --name` label or a node id. Repeatable (failover)
+      --reader <READER>            A role that may read its call records. Repeatable
+  -h, --help                       Print help
+      --help-all                   Also list the operator and credential flags
+
+Example:
+  wires service set orders-db --allow analyst --allow sre

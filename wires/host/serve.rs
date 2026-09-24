@@ -33,32 +33,31 @@ use crate::init_logging;
 /// credentials come from.
 #[derive(Args)]
 pub(crate) struct ServeArgs {
-    /// The host's config: the services it implements, trusted IdPs, push
-    /// (see `wires serve --check`).
+    /// The host's config: the services it implements, its IdPs, push.
     #[arg(value_name = "HOST_JSON")]
     pub(crate) config: PathBuf,
-    /// Validate HOST_JSON, print the services it implements and which
-    /// issuers are trusted, and exit.
+    /// Check HOST_JSON, print the services it implements and its IdPs; exit.
     #[arg(long)]
     pub(crate) check: bool,
     /// Hex 32-byte seed of this host's node key. Falls back to
     /// `$WIRES_NODE_SEED`, then `--node-seed-file`, then the keystore (`node.seed`).
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub(crate) node_seed: Option<String>,
     /// Read the node key seed (hex) from this file instead of the keystore.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub(crate) node_seed_file: Option<PathBuf>,
     /// Use a self-hosted relay at this URL instead of the n0 default.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub(crate) relay_url: Option<String>,
-    /// The host's own membership token: it names the network (its root key)
-    /// whose signed policy decides every call, and is presented in the
-    /// `HelloAck`. Falls back to `$WIRES_MEMBERSHIP`, then
-    /// `--membership-file`, then the keystore (`membership.json`).
-    #[arg(long)]
+    /// The host's own membership token (its badge), instead of the keystore's.
+    // It names the network (its root key) whose signed policy decides every
+    // call, and is presented in the `HelloAck`. Falls back to
+    // `$WIRES_MEMBERSHIP`, then `--membership-file`, then the keystore
+    // (`membership.json`).
+    #[arg(long, hide = true)]
     pub(crate) membership: Option<String>,
     /// Read the host's membership token from this file.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub(crate) membership_file: Option<PathBuf>,
 }
 

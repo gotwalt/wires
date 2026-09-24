@@ -1,0 +1,31 @@
+Sign in with your IdP, binding your identity to this node's key
+
+Usage: wires login [OPTIONS]
+
+Options:
+      --node-seed <NODE_SEED>
+          Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`, then `--node-seed-file`, then the keystore (`node.seed`)
+      --node-seed-file <NODE_SEED_FILE>
+          Read the node key seed (hex) from this file
+      --issuer <ISSUER>
+          OIDC issuer. Falls back to `$WIRES_OIDC_ISSUER`, then the invite's, then Google
+      --client-id <CLIENT_ID>
+          OAuth client id. Falls back to `$WIRES_OIDC_CLIENT_ID`, then the invite's
+      --client-secret <CLIENT_SECRET>
+          OAuth client secret (non-confidential for Desktop-app clients). Falls back to `$WIRES_OIDC_CLIENT_SECRET`, then the invite's
+      --refresh
+          Renew with the stored refresh token; the browser only if that fails
+      --reuse
+          Re-check the stored ID token; don't sign in
+      --no-browser
+          Print the sign-in URL; don't open a browser
+      --callback-port <CALLBACK_PORT>
+          Fixed loopback port for the redirect (for `ssh -L` to a remote browser)
+  -h, --help
+          Print help
+      --help-all
+          Also list the operator and credential flags
+
+Examples:
+  wires login
+  wires login --no-browser    # prints the URL to open elsewhere

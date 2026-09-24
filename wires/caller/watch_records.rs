@@ -73,23 +73,23 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// `wires watch [<service>…] [--mine] [--json] [--once]`.
 #[derive(Args, Clone, Debug, Default)]
 pub(crate) struct WatchArgs {
-    /// The services to watch (default: every service in the view).
+    /// The services to watch (default: every service you may call or read).
     #[arg(value_name = "SERVICE")]
     pub(crate) services: Vec<String>,
-    /// Only your own calls, even for services whose records you may read.
+    /// Only your own calls, even where you may read everyone's.
     #[arg(long)]
     pub(crate) mine: bool,
-    /// One JSON object per record: `{service, host, seq, entry}` (the entry
-    /// is the host-signed log entry, verifiable on its own; `service` is
-    /// derived by this reader from signed records, not supplied by the host).
+    /// One JSON object per record: `{service, host, seq, entry}`.
+    // The entry is the host-signed log entry, verifiable on its own;
+    // `service` is derived by this reader from signed records, not supplied
+    // by the host.
     #[arg(long)]
     pub(crate) json: bool,
-    /// Print what is there (after your last mark) and exit, instead of
-    /// following.
+    /// Print what is there (after your last mark) and exit; don't follow.
     #[arg(long)]
     pub(crate) once: bool,
     /// Dial through this relay instead of the n0 default.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub(crate) relay_url: Option<String>,
 }
 
@@ -578,9 +578,7 @@ pub(crate) async fn watch_with(
 ) -> Result<Report> {
     // Card 37: the services come from this node's view: those it may read
     // (every record) or call (its own records).
-    let membership = ks
-        .read_membership()?
-        .context("this node has no membership: run `wires join <token>` first")?;
+    let membership = ks.read_membership()?.context(crate::help::NOT_JOINED)?;
     let held = crate::caller::services::current_view(ks).await?;
     let view = &held.view;
     let services: Vec<ServiceName> = if opts.services.is_empty() {
@@ -712,12 +710,15 @@ pub(crate) async fn watch_with(
                 report.broken.push((host, why));
             }
             Event::Refused(_, reason) => {
-                out(Output::Alarm(format!("host {short}: {reason}")));
+                out(Output::Alarm(format!(
+                    "host {short} refused: {reason}{}",
+                    crate::help::refusal_step(&reason)
+                )));
                 report.refused.push((host, reason));
             }
             Event::Failed(_, e) => {
                 out(Output::Alarm(format!(
-                    "host {short} could not be read: {e}"
+                    "host {short} could not be read: {e}; try again later"
                 )));
                 report.failed.push((host, e));
             }

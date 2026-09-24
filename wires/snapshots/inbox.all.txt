@@ -1,0 +1,31 @@
+Print the messages hosts pushed to you, and mark them read
+
+Usage: wires inbox [OPTIONS]
+
+Options:
+      --wait
+          Block until a message arrives, print it, and exit
+      --timeout <TIMEOUT>
+          With --wait: give up after this long (`90s`, `10m`) and exit 124
+      --json
+          One JSON object per message instead of a line
+      --node-seed <NODE_SEED>
+          Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`, then `--node-seed-file`, then the keystore (`node.seed`)
+      --node-seed-file <NODE_SEED_FILE>
+          Read the node key seed (hex) from this file instead of the keystore
+      --membership <MEMBERSHIP>
+          The base64 membership token to present. Falls back to `$WIRES_MEMBERSHIP`, then `--membership-file`, then the keystore
+      --membership-file <MEMBERSHIP_FILE>
+          Read the membership token from this file instead of the keystore
+      --relay-url <RELAY_URL>
+          Dial through this relay, overriding an alias's own
+  -h, --help
+          Print help
+      --help-all
+          Also list the operator and credential flags
+
+Examples:
+  wires inbox
+  wires inbox --wait --timeout 10m
+
+Exit: 0 with messages printed (or none, without --wait); 124: --timeout ran out.

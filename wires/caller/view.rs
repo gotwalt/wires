@@ -355,7 +355,10 @@ pub(crate) async fn refresh(ks: &Keystore, asker: &Asker<'_>, forget: bool) -> R
     let dirs = directories(ks, root, me);
     if dirs.is_empty() {
         return held.ok_or_else(|| {
-            anyhow!("this node knows no directory to ask for its view: join with a fresh invite")
+            anyhow!(
+                "this node knows no directory to ask for its view: ask your admin for a fresh \
+                 invite and `wires join` it"
+            )
         });
     }
     let mut failures = Vec::new();

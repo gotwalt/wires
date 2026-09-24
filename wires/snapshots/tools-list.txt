@@ -1,0 +1,10 @@
+List the aliases in `tools.json`, one per line
+
+Usage: wires tools list [OPTIONS]
+
+Options:
+      --tools-file <TOOLS_FILE>  Use this file instead of `$WIRES_HOME/tools.json`
+  -h, --help                     Print help
+
+Example:
+  wires tools list

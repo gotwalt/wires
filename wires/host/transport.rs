@@ -1092,7 +1092,10 @@ where
     if failures.is_empty() {
         bail!("no host to dial");
     }
-    bail!("no host answered ({})", failures.join("; "))
+    bail!(
+        "no host answered ({}); try again later, or ask your admin whether its hosts are up",
+        failures.join("; ")
+    )
 }
 
 /// What a finished dial came to: the remote exit code.

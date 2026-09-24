@@ -57,12 +57,15 @@ pub(crate) struct DirectoryArgs {
 /// The `directory` subcommands.
 #[derive(Subcommand)]
 pub(crate) enum DirectoryCmd {
-    /// Run this node's directory alone (no host.json), until Ctrl-C. The
-    /// policy it holds must list this node.
+    /// Run this node's directory alone (no host.json) until Ctrl-C
+    // The policy it holds must list this node.
+    #[command(after_help = "Example:\n  wires directory serve")]
     Serve(serve::DirectoryServeArgs),
-    /// Admin: list a node as one of the network's directories, and publish.
+    /// Admin: list a node as one of the network's directories, and publish
+    #[command(after_help = "Example:\n  wires directory add workbench")]
     Add(DirectoryEditArgs),
-    /// Admin: stop listing a node as a directory, and publish.
+    /// Admin: stop listing a node as a directory, and publish
+    #[command(after_help = "Example:\n  wires directory rm workbench")]
     Rm(DirectoryEditArgs),
 }
 
@@ -72,7 +75,7 @@ pub(crate) struct DirectoryEditArgs {
     /// The node: an `invite --name` label or a hex node id.
     pub(crate) node: String,
     /// Lifetime of the new policy, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT)]
+    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 
