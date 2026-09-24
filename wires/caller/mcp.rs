@@ -2,7 +2,7 @@
 //! (evaluated locally against your signed state, as `wires services` lists
 //! them), plus `tools.json` aliases, resolved once at startup.
 //!
-//! The on-ramp for workflows that only speak MCP (Claude Desktop, IDEs). Each
+//! wires in the stdio MCP clients people already use (Claude Desktop, IDEs). Each
 //! tool becomes one MCP tool taking `{ args?: string[], stdin?:
 //! string, jq?: string, head?: integer, max_bytes?: integer }`; the last three
 //! shape the remote stdout in-process ([`shape`](crate::caller::shape)), as

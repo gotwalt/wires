@@ -35,10 +35,13 @@ use super::{Backend, Gateway, PublicUrls, SCOPE};
 use crate::caller::login::{Pkce, authorization_url, exchange_code, random_token};
 
 /// The cookie binding a consent page to the browser that loaded it.
-const CONSENT_COOKIE: &str = "wires_authz";
+///
+/// `__Host-`: browsers accept it only `Secure`, `Path=/` and without
+/// `Domain`, so a sibling subdomain can't plant or shadow it.
+const CONSENT_COOKIE: &str = "__Host-wires_authz";
 /// The cookie binding the IdP's redirect back to the browser that consented:
 /// without it, a copied IdP link would skip the consent page entirely.
-const CALLBACK_COOKIE: &str = "wires_cb";
+const CALLBACK_COOKIE: &str = "__Host-wires_cb";
 
 /// What [`CALLBACK_COOKIE`] holds for authorization `id`: a hash, so the
 /// cookie alone never names a pending authorization.
@@ -272,7 +275,7 @@ pub(crate) async fn authorize<B: Backend>(
 fn consent(urls: &PublicUrls, client: &Client, redirect: &Url, id: &str) -> Response {
     let secure = secure_attr(urls);
     let cookie = format!(
-        "{CONSENT_COOKIE}={id}; Path=/authorize; HttpOnly; SameSite=Strict; Max-Age={PENDING_TTL_SECS}{secure}"
+        "{CONSENT_COOKIE}={id}; Path=/; HttpOnly; SameSite=Strict; Max-Age={PENDING_TTL_SECS}{secure}"
     );
     let body = format!(
         "<p><strong>{}</strong>{} wants to run wires services as you.</p>\
@@ -372,7 +375,7 @@ pub(crate) async fn confirm<B: Backend>(
     // `Lax`, not `Strict`: the IdP's redirect back is a cross-site
     // top-level navigation, which `Lax` still carries.
     let bind = format!(
-        "{CALLBACK_COOKIE}={}; Path=/oauth/callback; HttpOnly; SameSite=Lax; Max-Age={PENDING_TTL_SECS}{}",
+        "{CALLBACK_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={PENDING_TTL_SECS}{}",
         callback_binding(id),
         secure_attr(&gw.urls)
     );
@@ -707,7 +710,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(
             header::COOKIE,
-            HeaderValue::from_static("a=1; wires_authz=xyz; b=2"),
+            HeaderValue::from_static("a=1; __Host-wires_authz=xyz; b=2"),
         );
         assert_eq!(cookie(&h, CONSENT_COOKIE), Some("xyz"));
         assert_eq!(cookie(&h, "c"), None);

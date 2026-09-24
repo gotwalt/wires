@@ -77,7 +77,7 @@ Three layers, most self-contained first:
   authenticates the peer's key, so a wrong address can only fail to connect.
 - **Self-hosted relay**: run upstream
   [`iroh-relay`](https://docs.rs/iroh-relay) and pass `--relay-url` to
-  `serve`, `call`, `mcp`, `inbox` and `watch`, for NAT traversal between egress-only
+  `serve`, `call`, `mcp`, `gateway`, `inbox` and `watch`, for NAT traversal between egress-only
   peers that can both reach it. Keep it one logical endpoint: two peers only
   rendezvous on the *same* relay.
 - **n0 DNS discovery and relays** (the default): resolves a node id to

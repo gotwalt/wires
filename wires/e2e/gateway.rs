@@ -119,13 +119,19 @@ impl Running {
             metadata: MetadataFetcher::new().unwrap(),
             origins: vec![base.clone(), "https://claude.ai".into()],
             limiter: crate::gateway::RateLimit::new(10_000),
+            trust_proxy: false,
             backend: Scripted {
                 state: state(),
                 seen: Arc::clone(&seen),
             },
         });
         let task = tokio::spawn(async move {
-            axum::serve(listener, router(gw)).await.unwrap();
+            axum::serve(
+                listener,
+                router(gw).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
         Self {
             base,
@@ -231,7 +237,9 @@ impl Running {
 
         let bind = to_idp.headers()["set-cookie"].to_str().unwrap().to_owned();
         assert!(
-            bind.contains("Path=/oauth/callback") && bind.contains("SameSite=Lax"),
+            bind.starts_with("__Host-wires_cb=")
+                && bind.contains("Path=/;")
+                && bind.contains("SameSite=Lax"),
             "{bind}"
         );
         let bind = bind.split(';').next().unwrap().to_owned();
@@ -246,7 +254,7 @@ impl Running {
         let wrong = self
             .http
             .get(&callback)
-            .header("cookie", "wires_cb=not-the-binding")
+            .header("cookie", "__Host-wires_cb=not-the-binding")
             .send()
             .await
             .unwrap();

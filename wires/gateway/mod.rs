@@ -89,6 +89,15 @@ pub struct GatewayArgs {
     /// too.
     #[arg(long = "allow-origin")]
     pub allow_origins: Vec<String>,
+    /// Rate-limit by the client address a fronting proxy reports
+    /// (`CF-Connecting-IP`, else `X-Forwarded-For`) instead of the TCP peer.
+    /// Only behind a proxy that sets them: clients can send them too.
+    #[arg(long)]
+    pub trust_proxy_header: bool,
+    /// Dial hosts through this relay instead of n0's (as `wires call
+    /// --relay-url`).
+    #[arg(long)]
+    pub relay_url: Option<String>,
 }
 
 /// The gateway's public URLs, all derived from its origin.
@@ -155,6 +164,7 @@ pub(crate) struct Keystored {
     ks: Keystore,
     fabric: NodeId,
     endpoint: iroh::Endpoint,
+    relay_url: Option<String>,
 }
 
 impl Backend for Keystored {
@@ -170,6 +180,7 @@ impl Backend for Keystored {
         PresentingCaller {
             token,
             endpoint: self.endpoint.clone(),
+            relay_url: self.relay_url.clone(),
         }
     }
 }
@@ -179,6 +190,7 @@ impl Backend for Keystored {
 pub(crate) struct PresentingCaller {
     token: IdToken,
     endpoint: iroh::Endpoint,
+    relay_url: Option<String>,
 }
 
 impl crate::caller::call::Caller for PresentingCaller {
@@ -192,7 +204,11 @@ impl crate::caller::call::Caller for PresentingCaller {
             SERVICE_DIAL_TIMEOUT, ServiceDial, call_service_with, outcome, stored_state,
         };
         let ks = Keystore::resolve()?;
-        let creds = Credentials::resolve(&CredArgs::default())?.presenting(self.token.clone());
+        let creds = Credentials::resolve(&CredArgs {
+            relay_url: self.relay_url.clone(),
+            ..CredArgs::default()
+        })?
+        .presenting(self.token.clone());
         let state = stored_state(&ks, &creds)?.context("the gateway holds no signed state")?;
         let dial = ServiceDial {
             endpoint: &self.endpoint,
@@ -224,8 +240,11 @@ const STATE_REFRESH: std::time::Duration = std::time::Duration::from_secs(600);
 /// Requests per minute each client address may make to the unauthenticated
 /// OAuth endpoints (`/register`, `/authorize…`, `/oauth/callback`, `/token`).
 pub(crate) const OAUTH_PER_MINUTE: u32 = 60;
-/// Most client addresses tracked; the table is cleared past this.
+/// Most client addresses tracked; past this, idle ones go first, then the
+/// oldest window (never a wholesale reset, which would free every client).
 const MAX_TRACKED_ADDRS: usize = 10_000;
+/// The window [`RateLimit`] counts over.
+const WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A fixed-window request counter per client address.
 pub(crate) struct RateLimit {
@@ -245,12 +264,20 @@ impl RateLimit {
     /// Count one request from `addr`; `false` if it is over the limit.
     pub(crate) fn allow(&self, addr: &str) -> bool {
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.len() >= MAX_TRACKED_ADDRS {
-            seen.clear();
-        }
         let now = std::time::Instant::now();
+        if seen.len() >= MAX_TRACKED_ADDRS && !seen.contains_key(addr) {
+            seen.retain(|_, (start, _)| now.duration_since(*start) < WINDOW);
+            while seen.len() >= MAX_TRACKED_ADDRS {
+                let oldest = seen
+                    .iter()
+                    .min_by_key(|(_, (start, _))| *start)
+                    .map(|(k, _)| k.clone())
+                    .expect("non-empty");
+                seen.remove(&oldest);
+            }
+        }
         let entry = seen.entry(addr.to_owned()).or_insert((now, 0));
-        if now.duration_since(entry.0) >= std::time::Duration::from_secs(60) {
+        if now.duration_since(entry.0) >= WINDOW {
             *entry = (now, 0);
         }
         entry.1 += 1;
@@ -258,20 +285,49 @@ impl RateLimit {
     }
 }
 
-/// The client's address as the tunnel reports it (`CF-Connecting-IP`), else
-/// the first `X-Forwarded-For` hop, else one shared bucket.
-pub(crate) fn client_addr(headers: &axum::http::HeaderMap) -> String {
-    headers
-        .get("cf-connecting-ip")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| {
-            headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.split(',').next())
-        })
-        .map(|v| v.trim().to_owned())
-        .unwrap_or_else(|| "direct".to_owned())
+/// The rate-limit key for `ip`: the address, or its /64 for IPv6 (one
+/// subscriber usually holds a whole /64).
+pub(crate) fn addr_key(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+    }
+}
+
+/// Who a request comes from, for rate limiting: the TCP peer, or with
+/// `trust_proxy` (the gateway sits behind a proxy that sets them, e.g.
+/// cloudflared) `CF-Connecting-IP`, else the first `X-Forwarded-For` hop.
+/// Headers are never trusted otherwise: any client can send them.
+pub(crate) fn client_addr(
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+    trust_proxy: bool,
+) -> String {
+    let from_header = || {
+        headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
+            .or_else(|| {
+                headers
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.split(',').next())
+                    .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
+            })
+    };
+    let ip = if trust_proxy {
+        from_header().or(peer.map(|p| p.ip()))
+    } else {
+        peer.map(|p| p.ip())
+    };
+    ip.map(addr_key).unwrap_or_else(|| "unknown".to_owned())
 }
 
 async fn limit_oauth<B: Backend>(
@@ -280,7 +336,14 @@ async fn limit_oauth<B: Backend>(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
-    if gw.limiter.allow(&client_addr(req.headers())) {
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0);
+    if gw
+        .limiter
+        .allow(&client_addr(req.headers(), peer, gw.trust_proxy))
+    {
         next.run(req).await
     } else {
         (
@@ -312,6 +375,8 @@ pub(crate) struct Gateway<B> {
     pub(crate) origins: Vec<String>,
     /// The per-address limit on the OAuth endpoints.
     pub(crate) limiter: RateLimit,
+    /// Take the client address from the proxy's headers, not the peer.
+    pub(crate) trust_proxy: bool,
     /// State and dialing.
     pub(crate) backend: B,
 }
@@ -460,7 +525,12 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
     let backend = Keystored {
         ks: Keystore::resolve()?,
         fabric: membership.fabric,
-        endpoint: crate::host::transport::bind(&keystore::node_identity_in(&ks)?, None).await?,
+        endpoint: crate::host::transport::bind(
+            &keystore::node_identity_in(&ks)?,
+            a.relay_url.as_deref(),
+        )
+        .await?,
+        relay_url: a.relay_url.clone(),
     };
     let state = backend.state()?;
     if !state.is_member(node) {
@@ -484,6 +554,7 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
         metadata: MetadataFetcher::new()?,
         origins,
         limiter: RateLimit::new(OAUTH_PER_MINUTE),
+        trust_proxy: a.trust_proxy_header,
         backend,
         urls,
     });
@@ -504,7 +575,11 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
         gw.urls.resource(),
         a.listen
     );
-    axum::serve(listener, router(gw)).await?;
+    axum::serve(
+        listener,
+        router(gw).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -600,12 +675,39 @@ pub(crate) mod tests {
         assert!((0..3).all(|_| l.allow("a")));
         assert!(!l.allow("a"));
         assert!(l.allow("b"));
+        let peer: Option<SocketAddr> = Some("198.51.100.7:4000".parse().unwrap());
         let mut h = axum::http::HeaderMap::new();
-        assert_eq!(client_addr(&h), "direct");
         h.insert("x-forwarded-for", "10.0.0.1, 10.0.0.2".parse().unwrap());
-        assert_eq!(client_addr(&h), "10.0.0.1");
+        assert_eq!(
+            client_addr(&h, peer, false),
+            "198.51.100.7",
+            "headers untrusted"
+        );
+        assert_eq!(client_addr(&h, peer, true), "10.0.0.1");
         h.insert("cf-connecting-ip", "203.0.113.9".parse().unwrap());
-        assert_eq!(client_addr(&h), "203.0.113.9");
+        assert_eq!(client_addr(&h, peer, true), "203.0.113.9");
+        h.insert("cf-connecting-ip", "not an ip".parse().unwrap());
+        assert_eq!(client_addr(&h, peer, true), "10.0.0.1");
+        assert_eq!(
+            client_addr(&axum::http::HeaderMap::new(), None, true),
+            "unknown"
+        );
+        // One IPv6 subscriber (a /64) is one bucket.
+        let a = client_addr(&h, Some("[2001:db8:1:2:aaaa::1]:1".parse().unwrap()), false);
+        let b = client_addr(&h, Some("[2001:db8:1:2:bbbb::9]:1".parse().unwrap()), false);
+        assert_eq!(a, b);
+        assert_eq!(a, "2001:db8:1:2::/64");
+    }
+
+    #[test]
+    fn a_full_table_evicts_rather_than_resets() {
+        let l = RateLimit::new(1);
+        assert!(l.allow("hog"));
+        assert!(!l.allow("hog"));
+        for i in 0..MAX_TRACKED_ADDRS {
+            l.allow(&format!("fill-{i}"));
+        }
+        assert!(l.seen.lock().unwrap().len() <= MAX_TRACKED_ADDRS);
     }
 
     #[test]
