@@ -34,6 +34,7 @@
 //! let host = NodeIdentity::from_seed([7u8; 32]);
 //! let denied = |at_ms| AuditRecord::Denied {
 //!     caller: NodeIdentity::from_seed([8u8; 32]).node_id(),
+//!     principal: None,
 //!     tool: None,
 //!     reason: "not a member".into(),
 //!     at_ms,
@@ -350,6 +351,15 @@ pub enum ChainBreak {
         /// The entry's sequence number.
         seq: LogSeq,
     },
+    /// The host's log now ends before `seq`, an entry the reader already
+    /// verified: history was rolled back (a truncated or replaced log).
+    /// Pruning never causes this: it drops entries from the front, and the
+    /// newest entry always stays.
+    #[error("the log ends before entry {seq}, which was already verified (rolled back)")]
+    RolledBack {
+        /// The reader's verified entry the log no longer reaches.
+        seq: LogSeq,
+    },
 }
 
 /// Verify `entries` as a contiguous run of `host`'s log, continuing from
@@ -368,7 +378,7 @@ pub enum ChainBreak {
 ///
 /// let host = NodeIdentity::from_seed([1u8; 32]);
 /// let rec = |r: &str| AuditRecord::Denied {
-///     caller: host.node_id(), tool: None, reason: r.into(), at_ms: 0,
+///     caller: host.node_id(), principal: None, tool: None, reason: r.into(), at_ms: 0,
 /// };
 /// let a = LogEntry::next(&host, None, 0, rec("a")).unwrap();
 /// let b = LogEntry::next(&host, Some(a.point().unwrap()), 0, rec("b")).unwrap();
@@ -521,6 +531,7 @@ mod tests {
             },
             _ => AuditRecord::Denied {
                 caller: caller(),
+                principal: None,
                 tool: None,
                 reason: format!("no {i}"),
                 at_ms: i as i64,
@@ -549,6 +560,7 @@ mod tests {
             5,
             AuditRecord::Denied {
                 caller: caller(),
+                principal: None,
                 tool: None,
                 reason: "r".into(),
                 at_ms: 1,

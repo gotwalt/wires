@@ -46,9 +46,23 @@ pub fn now_ms() -> i64 {
 /// The reason is cut exactly as [`transport`] cuts the one it sends, so the
 /// record and the caller's `Denied` frame say the same thing.
 pub fn denied(sink: Option<&AuditSink>, caller: NodeId, tool: Option<ToolName>, reason: &str) {
+    denied_as(sink, caller, None, tool, reason);
+}
+
+/// [`denied`], naming the person refused: `principal` is the caller's
+/// verified identity, when the host had one when it refused. The record then
+/// carries its issuer and subject, so the refusal is that person's "mine".
+pub fn denied_as(
+    sink: Option<&AuditSink>,
+    caller: NodeId,
+    principal: Option<Principal>,
+    tool: Option<ToolName>,
+    reason: &str,
+) {
     if let Some(sink) = sink {
         sink.record(AuditRecord::Denied {
             caller,
+            principal,
             tool,
             reason: transport::truncate_reason(reason.to_string()),
             at_ms: now_ms(),

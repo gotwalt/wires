@@ -256,7 +256,9 @@ pub enum AuditRecord {
         call: CallId,
         /// The iroh-authenticated caller.
         caller: NodeId,
-        /// The caller's IdP identity, when the responder verified one.
+        /// The caller's IdP identity, when the responder verified one. Its
+        /// issuer and subject name the person whose call this is: what a
+        /// reader's "mine" matches (the node is not the boundary).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<Principal>,
         /// The exposed tool that ran.
@@ -310,7 +312,8 @@ pub enum AuditRecord {
         id: PushId,
         /// The recipient's node.
         to: NodeId,
-        /// The recipient's IdP identity, when the host verified one.
+        /// The recipient's IdP identity the push was admitted for, when the
+        /// host verified one: whose push this is (a reader's "mine").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<Principal>,
         /// The `push.allow` role that admitted the recipient.
@@ -337,6 +340,12 @@ pub enum AuditRecord {
     Denied {
         /// The iroh-authenticated caller.
         caller: NodeId,
+        /// The caller's verified IdP identity (issuer and subject, not only
+        /// the email), when the host had verified one by the time it
+        /// refused: whose refusal this is, which is what a reader's "mine"
+        /// matches. `None` for a refusal before any identity was checked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        principal: Option<Principal>,
         /// The tool it asked for, if it got as far as naming one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool: Option<ToolName>,
@@ -431,6 +440,38 @@ mod tests {
             let json = serde_json::to_string(&record).unwrap();
             assert_eq!(serde_json::from_str::<AuditRecord>(&json).unwrap(), record);
         }
+    }
+
+    /// A refusal names the person (issuer and subject), not only the email,
+    /// so a reader's "mine" can match it; one before any identity names none.
+    #[test]
+    fn a_refusal_records_the_principals_issuer_and_subject() {
+        let node = crate::NodeIdentity::from_seed([1u8; 32]).node_id();
+        let who = Principal {
+            issuer: "https://idp.example".into(),
+            subject: "sub-alice".into(),
+            email: Some("alice@example.com".into()),
+            org: None,
+            groups: vec![],
+            not_after: 9,
+            claims: Default::default(),
+        };
+        let denied = |principal| AuditRecord::Denied {
+            caller: node,
+            principal,
+            tool: None,
+            reason: "no".into(),
+            at_ms: 1,
+        };
+        let json = serde_json::to_string(&denied(Some(who.clone()))).unwrap();
+        assert!(json.contains(r#""issuer":"https://idp.example""#), "{json}");
+        assert!(json.contains(r#""subject":"sub-alice""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<AuditRecord>(&json).unwrap(),
+            denied(Some(who))
+        );
+        let anonymous = serde_json::to_string(&denied(None)).unwrap();
+        assert!(!anonymous.contains("principal"), "{anonymous}");
     }
 
     #[test]

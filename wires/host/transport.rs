@@ -403,7 +403,20 @@ async fn refuse<W: AsyncWrite + Unpin>(
     tool: Option<ToolName>,
     reason: String,
 ) -> anyhow::Error {
-    crate::host::audit::denied(audit, caller, tool, &reason); // audit: denied
+    refuse_as(send, audit, caller, None, tool, reason).await
+}
+
+/// [`refuse`], naming the verified `principal` in the record (whose refusal
+/// it is, for a reader's "mine").
+async fn refuse_as<W: AsyncWrite + Unpin>(
+    send: &mut W,
+    audit: Option<&AuditSink>,
+    caller: NodeId,
+    principal: Option<library::Principal>,
+    tool: Option<ToolName>,
+    reason: String,
+) -> anyhow::Error {
+    crate::host::audit::denied_as(audit, caller, principal, tool, &reason); // audit: denied
     deny(send, reason.clone()).await;
     anyhow!(reason)
 }
@@ -482,12 +495,16 @@ where
         now,
     ) {
         Ok(admitted) => admitted,
-        Err(reason) => return Err(refuse(&mut send, audit, caller, Some(tool), reason).await),
+        Err(reason) => {
+            let who = principal.clone();
+            return Err(refuse_as(&mut send, audit, caller, who, Some(tool), reason).await);
+        }
     };
     // Only an admitted caller learns whether this host implements it.
     let Some(svc) = host.config.services.get(&service) else {
         let reason = format!("service {service} is not implemented on this host");
-        return Err(refuse(&mut send, audit, caller, Some(tool), reason).await);
+        let who = principal.clone();
+        return Err(refuse_as(&mut send, audit, caller, who, Some(tool), reason).await);
     };
     let version = admitted.state_version;
     if hello.state_version > version {
