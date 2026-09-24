@@ -21,6 +21,8 @@
 //!   rm`.
 //! - [`propagate`] — publishing each edit to the directories (an edit that
 //!   reaches none fails), and `wires state push`.
+//! - [`settings`] — `wires state settings`: the freshness rule and the
+//!   directories' beat, in the signed policy.
 //! - [`keystore`] — the on-disk home: keys, the membership, and the
 //!   flag → env → file → keystore resolution every command uses.
 //! - [`ttl`] — the `--ttl` / `--state-ttl` / `--timeout` lifetimes.
@@ -31,6 +33,7 @@ pub mod keystore;
 pub mod ledger;
 pub mod propagate;
 pub mod service;
+pub mod settings;
 pub mod ttl;
 
 use std::collections::BTreeSet;
