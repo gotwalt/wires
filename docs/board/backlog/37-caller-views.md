@@ -13,25 +13,35 @@ even a filtered catalog outgrows a model's context.
 
 ## Decisions
 
-- **A view** is the head, `Fresh`, and with proofs, the service items whose `allow` (call) or
-  `readers` (read) admits the caller's verified principal, each marked `call` and/or `read`. It
-  holds no role, no ban and no other service. The directory computes it on request with
-  `authorize`/`role_admits`, after verifying the ID token itself against the signed `issuer` items;
-  nothing per user is stored. With no verified principal the view is empty (no role admits).
-- **`wires/directory/1` gains** `view {have, query?}` (the whole view, or the entries matching
-  `query` by name and description) and `resolve {service}` (one entry, only if it is in the view).
-  A request is traced, not logged.
+- **A view is a list of signed entries.** The root signs the policy, and each service entry, like
+  a badge (card 36d): a view is the head, `Fresh`, and the root-signed service entries
+  (`SignedEntry`) whose `allow` (call) or `readers` (read) admits the caller's verified principal,
+  each marked `call` and/or `read` (`library::View`, `ViewEntry`). Each entry verifies on its own
+  under the root, as a badge does. It holds no role, no ban and no other service. The directory
+  computes it on request (`SignedPolicy::view_for(principal, query)`), after verifying the ID
+  token itself against the signed `issuer` items; nothing per user is stored. With no verified
+  principal the view is empty (no role admits).
+- **Newest entry wins.** Each entry carries the version at which it last changed. A caller keeps
+  the newest version of each and refuses an older one (`View::apply`). A caller holding a stale
+  entry is safe: the host decides every call from its whole, current policy and refuses one it
+  doesn't serve.
+- **`wires/directory/1` serves** `view {have, query?}` → `view {view, fresh}` (or `view_update`,
+  or `current`), the whole view or the entries matching `query` by name and description, and
+  `resolve {service}` → a one-entry or empty view. The frames exist (card 36d); the directory
+  answers `denied` until this card. A request is traced, not logged.
 - **Callers stop holding the state.** `policy.json` and the cold fetch go; the caller keeps
   `view.json`. `wires services [query]` reads it, refreshing first if it is older than a day or
   its head is behind (next point).
 - **The call handshake carries the news.** `HelloAck` gains the host's head version. When it is
-  newer than the caller's view, it also carries the called service's item and proof under that head,
+  newer than the caller's view, it also carries the called service's signed entry (and the head),
   so the caller checks the host is still assigned before sending stdin (replacing today's
-  `newer_state` check), then refreshes its view after the call. One-shot commands get no other
+  `newer_policy` check), then refreshes its view after the call. One-shot commands get no other
   background traffic.
 - **Long-running clients subscribe.** `wires mcp`, the gateway and `inbox --wait` hold a `view`
-  subscription (card 36's `wires/directory-sub/1`), so a grant or a revocation reaches them in
-  seconds; `wires mcp` sends MCP `notifications/tools/list_changed`.
+  subscription (card 36's `wires/directory-sub/1`: `view` first, then `view_update {head, changed,
+  removed}` per new head, applied with `View::apply`; a failed apply resubscribes with `have: 0`),
+  so a grant or a revocation reaches them in seconds; `wires mcp` sends MCP
+  `notifications/tools/list_changed`.
 - **Search in MCP.** When a view holds more than 40 services, `wires mcp` and the gateway expose a
   `search_services` tool instead of listing every service in `tools/list`.
 - **The gateway** asks for one view per web user, with that user's ID token (nonce bound to the

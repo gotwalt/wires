@@ -52,9 +52,9 @@ honest line from someone who runs remote MCP servers behind Tailscale today.
 | **host** | how it implements its assigned services; stricter local rules (`host.json`: narrower IdPs, `also_require`) | `serve host.json`, `push` |
 | **caller** | — runs services by name; MCP (stdio, or the remote gateway) so wires works in the clients people already use | `id`, `join`, `login`, `services`, `call`, `mcp`, `gateway`, `inbox` |
 | **reader** | — any member: a service's `readers` role reads all its records, in full; everyone else their own person's (same issuer and subject, from any node) | `watch` |
-| **directory** (card 36) | nothing: it holds the newest root-signed policy, signs its freshness, and hands the policy to hosts and callers (their slice and view from cards 36c, 37); it never decides a call | `serve` (when the policy lists it), `directory serve`; the admin names directories with `directory add\|rm` |
+| **directory** (card 36) | nothing: it holds the newest root-signed policy, signs its freshness, and hands the policy to hosts (whole, with deltas from card 36c) and callers (their view, card 37); it never decides a call | `serve` (when the policy lists it), `directory serve`; the admin names directories with `directory add\|rm` |
 
-The IdP is *bound* at the caller (`login`) and *verified* at the host, against the admin-signed policy it holds. Every role needs a verified identity (there is no built-in `member` role), and every matcher names an issuer the policy trusts. The admin's invite is the only thing handed out of band; every later policy is published by key to the directories, and hosts and callers fetch it from one (or get it in a call's handshake). Nothing is broadcast, but every member still holds the whole policy until cards 36c and 37 narrow it to slices and views ([fabric.md](../fabric.md) is the target architecture: how the fabric is hosted, persisted and kept in sync).
+The IdP is *bound* at the caller (`login`) and *verified* at the host, against the admin-signed policy it holds. Every role needs a verified identity (there is no built-in `member` role), and every matcher names an issuer the policy trusts. The admin's invite is the only thing handed out of band; every later policy is published by key to the directories, and hosts and callers fetch it from one (or get it in a call's handshake). Nothing is broadcast, but every member still holds the whole policy until card 37 narrows each caller to its view (hosts keep the whole policy) ([fabric.md](../fabric.md) is the target architecture: how the fabric is hosted, persisted and kept in sync).
 
 ## The demo we're building toward
 
@@ -71,7 +71,8 @@ Open cards only; finished cards are in [done/](done/).
 |---|---|---|---|---|
 | [08](doing/08-demo-two-machine.md) | E | — | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent, recording |
 | [35](done/35-badges-and-bans.md) | D1 | 28 | done (on `aaron/directory`) | **Badges and bans:** members leave the signed state; a node is admitted by its root-signed badge, removal is a ban, `invite` is no edit |
-| [36](doing/36-directory.md) | D2 | 35 | doing (36b on a worker branch) | **The directory:** a mode on its own ALPNs, backed by redb; root-signed head over proved items; freshness timestamps; hosts subscribe to their slice; retires state sync |
+| [36](doing/36-directory.md) | D2 | 35 | doing (36c next) | **The directory:** a mode on its own ALPNs, backed by redb; the root signs the policy, and each service entry; freshness timestamps; hosts subscribe to the policy's changes; retires state sync |
+| [36d](review/36d-no-merkle-policy.md) | D2 | 36b | review | **No Merkle tree:** the root signs the policy (a hash of every item), and each service entry; hosts hold the whole policy and follow it by deltas |
 | [37](backlog/37-caller-views.md) | D3 | 36 | backlog | **Caller views:** each caller holds only the services it may use; search; `HelloAck` carries the head version; `mcp`/gateway subscribe; ~800 B invites |
 | [38](backlog/38-llm-help-text.md) | H | 37 | backlog | **Help text for LLMs:** the premise (a network for authenticated remote CLI calls) told once, in help and MCP instructions; terse, predictable `--help`, examples, next-step errors, `--help-all` for operator flags, snapshot tests, a small eval |
 | [29](backlog/29-person-identity.md) | I2 | 36 | backlog | **Person identity for headless agents:** `login --for`, day-passes issued by a directory |
@@ -86,8 +87,9 @@ why is [`bench/state-scale/REPORT.md`](../../bench/state-scale/REPORT.md)) → 2
 
 **Build plan for 35–37 (2026-09-24):** workers branch from `aaron/directory`; the integrator
 merges each into it, and the whole update lands on `main` as one PR. Stages: **35 ∥ 36a**
-(36a = card 36's pure `library` types: head, items, Merkle proofs, `Fresh`, directory frames) →
-**36b** (the mode, redb, publish, host slices, retiring state sync) → **37** →
+(36a = card 36's pure `library` types: head, items, `Fresh`, directory frames) →
+**36b** (the mode, redb, publish, retiring state sync) → **36d** (no Merkle tree: a signed hash of
+the items and signed service entries) → **36c** ∥ **37** →
 **[38](backlog/38-llm-help-text.md)** (help text an LLM can act on) → a docs and comments sweep
 across the repo.
 

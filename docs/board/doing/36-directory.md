@@ -1,6 +1,6 @@
 # 36 — The directory: where the fabric's policy lives
 
-**Lane:** D2 · **Depends on:** [35](../done/35-badges-and-bans.md) · **Status:** doing (36a, 36b done; 36c next), designed 2026-09-24 · **Files:** `library/services/` (policy head, items, Merkle proofs, freshness), `library/directory/` (new: frames), `wires/directory/` (new: the mode, its redb store, subscriptions), `wires/host/{serve,gate}.rs`, `wires/state/` (retired), `wires/admin/`, protocol.md §3–4, [fabric.md](../../fabric.md)
+**Lane:** D2 · **Depends on:** [35](../done/35-badges-and-bans.md) · **Status:** doing (36a, 36b, 36d done; 36c next), designed 2026-09-24 · **Files:** `library/services/` (policy head, items, signed entries, updates, freshness), `library/directory/` (new: frames), `wires/directory/` (new: the mode, its redb store, subscriptions), `wires/host/{serve,gate}.rs`, `wires/state/` (retired), `wires/admin/`, protocol.md §3–4, [fabric.md](../../fabric.md)
 
 ## Why (the human, 2026-09-24)
 
@@ -11,20 +11,22 @@ be a mode on its own ALPNs", "back it using redb".
 Today every host is an equal mirror of the whole signed state. The admin dials every host after
 every edit, every host re-checks every 10 minutes, and no node knows which peer is current, so a
 node that missed a push searches. [`bench/state-scale/REPORT.md`](../../../bench/state-scale/REPORT.md):
-with a directory, each host holds only its own slice and receives 140–430 KB a day (measured
-sizes, card 36a), against 54 MB (10k users) or 1.3 GB (50k) today. The fabric also gets a lasting home: the
+with a directory, each host holds the whole policy (67 KB at 100 services, 3.3 MB at 5k), fetched
+once, and then receives 140–280 KB a day (measured sizes, card 36d), against 54 MB (10k users) or
+1.3 GB (50k) today. The fabric also gets a lasting home: the
 directory is what survives when every host and caller is off.
 
 ## What the directory is
 
 A node the root-signed policy names in `directories`. It holds the newest policy, signs a
-freshness timestamp every few minutes, and hands each host its slice (and, card 37, each caller
-its view). **It never decides a call.** Hosts decide from their slice, so calls keep working
-with every directory down.
+freshness timestamp every few minutes, and hands each host the whole policy and its changes (and,
+card 37, each caller its view). **It never decides a call.** Hosts decide from their own copy, so
+calls keep working with every directory down.
 
-It is trusted for availability and freshness only. Everything it serves is root-signed and proved
-against a root-signed head, so it can't forge or mix policy. It can withhold (bounded by the
-freshness rule below), and it sees who asks for what (traced, not logged).
+It is trusted for availability and freshness only. Everything it serves is root-signed: a whole
+policy checks against its head's one signature, and each service entry in a view carries its own,
+so it can't forge or mix policy. It can withhold (bounded by the freshness rule below), and it
+sees who asks for what (traced, not logged).
 
 ## Decisions
 
@@ -35,7 +37,7 @@ registry's `allow` roles, with a `Started`/`Finished` in the call log. That fits
 person. It doesn't fit the directory:
 
 - **Hosts aren't people.** Every role needs a verified IdP identity (card 28), and a host asking
-  for its slice has none, nor does a new node before `wires login`. Passing `allow` would need a
+  for the policy has none, nor does a new node before `wires login`. Passing `allow` would need a
   machine role, which card 28 removed on purpose.
 - **Log noise.** 500 hosts' 5-minute beats are about 144k call-log entries a day.
 - **Shape.** A subscription that streams updates, and typed signed items, don't fit stdin/stdout.
@@ -61,27 +63,31 @@ A gossip topic (iroh-gossip) was considered for real-time updates and rejected:
   merging.
 
 Real time comes from **directory-held subscriptions** instead: long-lived QUIC streams that carry
-each subscriber only its own slice or view. An idle subscription costs a keepalive. If a directory
+each subscriber only what it may hold: a host the policy's changes, a caller its view's. An idle subscription costs a keepalive. If a directory
 ever holds more subscribers than it can (far beyond the modeled 1,000 hosts), an opaque
 "version N exists" beacon over gossip could fan out the wake-up, with content still fetched per
 node. Not now.
 
-### Policy: a root-signed head over proved items
+### Policy: the root signs the policy, and each service entry
 
-The state becomes a **head** over **items**, so any subset can be handed out and checked:
+The state becomes a **head** over **items**. The root signs the head, and each service entry on
+its own, like a badge (card 36d):
 
 ```
-PolicyHead { format: 3, fabric, version, issued, not_after,
-             directories: [NodeId], items_root: Hash, item_count }   signed by the root
-Item       { kind: role | service | ban | issuer | settings, key, body }
+PolicyHead  { format: 3, fabric, version, issued, not_after,
+              directories: [NodeId], items_hash }                  signed by the root
+Item        { kind: role | service | ban | issuer | settings, key, body }
+SignedEntry { format, fabric, version, name, service, alg, sig }   signed by the root
 ```
 
-- Items are leaves of a blake3 Merkle tree, sorted by `(kind, key)`. A node given an item and its
-  inclusion proof knows it belongs to that exact head, so a directory can't serve one item from
-  an older version under a newer head. The fabric branch's committed roster (PR #7, in git
-  history) is prior art for the tree.
-- `directories` sits in the head itself: every node needs it, and it must be readable before
-  any proof.
+- `items_hash` is blake3 over the canonical, sorted items (domain-separated), so the head's one
+  signature covers the whole set: a node holding the whole policy checks it all at once, and a
+  directory can't change, drop, add or mix items from two versions.
+- **The service item is a `SignedEntry`**, so a caller can hold just the services it may use and
+  check each alone (card 37). Its `version` is the head version at which it last changed; an edit
+  re-signs only the entries it changes, and the others keep their signature and version.
+- `directories` sits in the head itself: every node needs it, including a caller that holds no
+  other item.
 - `issuer` items carry each trusted IdP (issuer, client id, accepted audiences), moving them from
   `host.json` into signed policy (card 29 asked for this). `host.json` can still narrow them.
 - `settings` holds the freshness rule and its intervals.
@@ -109,35 +115,41 @@ Item       { kind: role | service | ban | issuer | settings, key, body }
 | Table | Key → value |
 |---|---|
 | `heads` | version → signed head (last 16 kept, for deltas) |
-| `items` | leaf hash → item bytes (garbage-collected when no kept head names them) |
-| `current` | `(kind, key)` → leaf hash, for the newest head |
+| `items` | content hash (blake3 of the item's JSON) → item bytes (garbage-collected when no kept head names them) |
+| `current` | `(kind, key)` → content hash, for the newest head |
 | `meta` | `version`, the latest `Fresh` |
 
-One writer (a publish), many readers (slices, views, subscriptions reading snapshots). A restart
+One writer (a publish), many readers (policies, updates, views, subscriptions reading snapshots). A restart
 reloads the newest head, signs a new `Fresh`, and serves. Hosts and callers keep plain files; only
 the directory needs a database.
 
 ### ALPNs
 
 - **`wires/directory/1`**: one request per stream, after `hello {badge, id_token?}`.
-  - `publish {head, items}`: from anyone. Accepted when the head verifies, is newer, and the items
-    hash to `items_root`, as `offer` is today. The admin publishes this way.
+  - `publish {head, items}`: from anyone. Accepted when the policy verifies (the head's signature,
+    `items_hash`, every entry's own signature) and is newer, as `offer` was. The admin publishes
+    this way.
   - `head {}`: the newest head and `Fresh`, to any badge holder.
-  - `slice {have, roles}`: a host's slice (below). `view` and `resolve` are card 37.
+  - `policy {have}`: the whole policy, for a host or directory: `policy {policy, fresh}`,
+    `policy_update {update, fresh}` from a `have` the directory still keeps, or `current {fresh}`.
+  - `view {have, query?}` and `resolve {service}`: card 37.
 - **`wires/directory-sub/1`**: subscriptions.
-  - `subscribe {kind: slice | replica | view, have}` → a stream of `update {head, fresh, items,
-    proofs}` when the subscriber's part changed, and `fresh {…}` beats every 5 minutes.
+  - `subscribe {kind: policy | replica | view, have}` → the whole `policy` (or `view`) when `have`
+    is older, then a `policy_update {head, changed, removed}` (or `view_update`) for every new
+    head, with its `Fresh`, and `fresh {…}` beats every 5 minutes.
   - A capped number of subscribers per directory (default 4,096); one over the cap is refused and
-    falls back to asking `slice` every 5 minutes.
+    falls back to asking `policy` every 5 minutes.
 
-### Host slices
+### Hosts hold the whole policy
 
 A host subscribes to every directory (the first that answers wins; the rest stay as warm
-failover). Its slice is: the head, `Fresh`, and with proofs, the service items naming it, the roles
-those items' `allow` and `readers` name, the roles `host.json` names (`also_require`,
-`push.allow`, sent as `roles`), every ban, every issuer, and settings. A host holds no other
-service and no other role. It stores the slice in its keystore (`policy/`) and decides from it on
-restart before any directory answers.
+failover) and holds the **whole** signed policy: hosts are machines the admin placed, and the
+policy is not secret from them. Each `policy_update` carries the new head, its `Fresh`, the items
+changed and the keys removed. The host applies it to its copy, recomputes `items_hash`, and checks
+the root's one signature on the new head (`SignedPolicy::apply`). Any mismatch or gap (a
+tampered, missing or extra item, a version it doesn't hold) → it fetches the whole policy. A mix of
+versions is impossible, because the one signature covers the whole set. It stores the policy in
+its keystore (`policy.json`) and decides from it on restart before any directory answers.
 
 ### The root key stays a file
 
@@ -175,14 +187,15 @@ and the admin's push to every host. Callers keep their full state and cold pull 
 
 ## Acceptance
 
-- [ ] An admin edit reaches every subscribed host that needs it within 2 s, and a host whose slice
-      didn't change receives only the new head and `Fresh` (test with a counting responder).
-- [ ] A host's keystore holds no service item that doesn't name it and no role it doesn't need.
+- [ ] An admin edit reaches every subscribed host within 2 s as one `policy_update`: the new head,
+      its `Fresh` and only the changed items (test with a counting responder).
+- [ ] A host applies each update to its full copy and verifies it with one root signature; a
+      tampered, missing or extra item makes it fetch the whole policy (36d: library tests).
 - [ ] With every directory stopped, calls keep working under `lenient`; under `strict` they are
       refused once `Fresh` lapses, and served again once a directory is back.
 - [ ] A directory restarted from `directory.redb` serves the same head and a new `Fresh`.
-- [ ] A tampered item, an item proved under an older head, an older head and a `Fresh` from a key
-      not in `directories` are each refused.
+- [ ] A tampered item, items from another head, an older head and a `Fresh` from a key not in
+      `directories` are each refused.
 - [ ] A directory that missed a publish catches up from a replica.
 - [ ] `wires directory serve` serves a fabric on a node with no `host.json`, and refuses to start from
       the admin's keystore or on a node the head doesn't list.
@@ -350,3 +363,24 @@ views in 37.
   catches up; strangers and banned nodes hear only `not a member of this network`;
   `directory serve` refuses `root.seed` and an unlisted node. Not built (36c): the "within 2 s
   to every subscribed host" and slice-content criteria, lenient/strict, model.py apex rows.
+
+**36d (2026-09-24, branch `worker/36d-no-merkle`): no Merkle tree.** The human chose a simpler
+integrity scheme (card [36d](../review/36d-no-merkle-policy.md)); this supersedes the Merkle
+proofs, multiproofs, slices and their sizes in the notes above, and the "host slices" design.
+
+- **The root signs the policy, and each service entry.** `PolicyHead.items_hash` (blake3,
+  domain-separated, over the canonical sorted items) replaces `items_root`/`item_count`. Each
+  service item is a root-signed `SignedEntry` whose `version` is the head version at which it last
+  changed; admin edits re-sign only the entries they change (`Policy::sign_after`).
+- **Hosts and directories hold the whole policy.** A host follows it by `PolicyUpdate {head,
+  changed, removed}` (`SignedPolicy::update_from` / `apply`): apply, recompute the hash, check the
+  one head signature; any mismatch → the whole policy. Callers hold views of signed entries (card
+  37), each verifying alone.
+- **Frames for 36c and 37.** `policy {have}` is now the permanent whole-policy fetch (answers
+  `policy`, `policy_update`, `current`); `view`/`view_update`/`resolve` carry signed entries;
+  subscriptions are `policy | replica | view` with `policy_update` / `view_update` deltas. `slice`
+  and the `replica` frame are gone (replicas get `policy` frames).
+- **Measured:** whole policy 67 KB / 667 KB / 3.3 MB at 100 / 1k / 5k services; an update 1.2 KB
+  (a ban) to 1.7 KB (a service) at any size; a 25-entry view 16.8 KB. The model's apex rows use
+  them: a host receives 140–280 KB a day after its first sync.
+

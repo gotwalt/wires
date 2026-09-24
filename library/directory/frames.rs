@@ -1,6 +1,11 @@
 //! The directory's two protocols (card 36): requests on [`DIRECTORY_ALPN`]
 //! and subscriptions on [`DIRECTORY_SUB_ALPN`].
 //!
+//! Hosts and directories hold the whole signed policy; a caller holds its
+//! [`View`]: the services it may use, each a root-signed entry. Nothing here
+//! carries a proof: a whole policy checks against its head's one signature,
+//! and a view's entries each carry their own.
+//!
 //! **`wires/directory/1`**: one request per stream. The dialer sends
 //! [`DirectoryRequest::Hello`] (its badge, and its ID token when it has one)
 //! then one request, and the directory answers once:
@@ -9,39 +14,32 @@
 //! |---|---|
 //! | `publish {head, items}` | `published {version}`: the version it now holds |
 //! | `head {}` | `head {head, fresh}` |
-//! | `slice {have, roles}` | `slice_update {update, fresh}` from `have`; `slice {slice, fresh}` when `have` is 0 or no longer kept; `current {fresh}` when `have` is the newest |
-//! | `view {have, query?}` | `view_update`, `view` or `current` the same way (a `query` always gets a whole `view`) |
-//! | `resolve {service}` | `view {view, fresh}` holding that service, or none |
-//! | `policy {have}` | **temporary** (card 36b): `policy {policy, fresh}`, the whole signed policy, or `current {fresh}` when `have` is the newest |
+//! | `policy {have}` | the whole policy for a host or directory: `policy {policy, fresh}`; `policy_update {update, fresh}` from a `have` the directory still keeps; `current {fresh}` when `have` is the newest |
+//! | `view {have, query?}` | the caller's view: `view {view, fresh}`, `view_update {update, fresh}` or `current {fresh}` the same way (a `query` always gets a whole `view`) |
+//! | `resolve {service}` | `view {view, fresh}` holding just that service, or no entry |
 //! | anything refused | `denied {reason}` |
 //!
-//! `policy {have}` exists only while hosts and callers still hold the whole
-//! policy: card 36c moves hosts to slices, card 37 callers to views, and
-//! then it goes.
-//!
 //! **`wires/directory-sub/1`**: the dialer sends `hello` then
-//! [`SubRequest::Subscribe`], and the directory streams [`SubFrame`]s: the
-//! subscriber's whole part first (`slice`, `view`, or for another directory
-//! the whole `replica`), then a `slice_update` / `view_update` (or a new
-//! `replica`) for every new head, a `fresh` every beat, or a terminal
-//! `denied`. A subscriber that can't apply an update (see
-//! [`Slice::apply`](crate::Slice::apply)) subscribes anew with `have: 0` and
+//! [`SubRequest::Subscribe`] (`policy` for a host, `replica` for another
+//! directory, `view` for a long-running caller such as `wires mcp` or the
+//! gateway), and the directory streams [`SubFrame`]s: the subscriber's whole
+//! part first when its `have` is older (`policy` or `view`), then a
+//! `policy_update` / `view_update` for every new head, a `fresh` every beat,
+//! or a terminal `denied`. A subscriber that can't apply an update
+//! ([`SignedPolicy::apply`](crate::SignedPolicy::apply),
+//! [`View::apply`](crate::View::apply)) subscribes anew with `have: 0` and
 //! gets its whole part.
 //!
-//! As with [`crate::sync`], the caller is always the iroh-authenticated key,
-//! never a field. Frames are a 4-byte big-endian length then canonical JSON
-//! tagged by `type`. The length is checked before anything is allocated:
-//! at most [`MAX_DIRECTORY_FRAME`], and a request over
-//! [`MAX_SMALL_DIRECTORY_FRAME`] must be a `publish`
-//! ([`PUBLISH_BODY_PREFIX`]), so nobody but a publisher (whose head the
-//! directory then verifies) can make it read a large body.
+//! The caller is always the iroh-authenticated key, never a field. Frames
+//! are a 4-byte big-endian length then canonical JSON tagged by `type`. The
+//! length is checked before anything is allocated: at most
+//! [`MAX_DIRECTORY_FRAME`], and a request over [`MAX_SMALL_DIRECTORY_FRAME`]
+//! must be a `publish` ([`PUBLISH_BODY_PREFIX`]), so nobody but a publisher
+//! (whose head the directory then verifies) can make it read a large body.
 //!
 //! ```
-//! use library::{DirectoryRequest, RoleName, StateVersion};
-//! let req = DirectoryRequest::Slice {
-//!     have: StateVersion(3),
-//!     roles: vec![RoleName::new("oncall").unwrap()],
-//! };
+//! use library::{DirectoryRequest, StateVersion};
+//! let req = DirectoryRequest::Policy { have: StateVersion(3) };
 //! let bytes = req.encode().unwrap();
 //! assert_eq!(DirectoryRequest::decode(&bytes).unwrap(), Some((req, bytes.len())));
 //! ```
@@ -57,10 +55,10 @@ use crate::head::StateVersion;
 use crate::idp::IdToken;
 use crate::item::Item;
 use crate::membership::Membership;
-use crate::parts::{Slice, SliceUpdate, View, ViewUpdate};
+use crate::policy_update::PolicyUpdate;
 use crate::registry::ServiceName;
-use crate::role::RoleName;
 use crate::signed_policy::SignedPolicy;
+use crate::view::{View, ViewUpdate};
 
 /// The ALPN of the directory's request protocol.
 pub const DIRECTORY_ALPN: &[u8] = b"wires/directory/1";
@@ -68,8 +66,9 @@ pub const DIRECTORY_ALPN: &[u8] = b"wires/directory/1";
 /// The ALPN of the directory's subscriptions.
 pub const DIRECTORY_SUB_ALPN: &[u8] = b"wires/directory-sub/1";
 
-/// The largest frame either protocol accepts (a `publish` or a `replica` of
-/// a large fabric), checked from the length prefix before allocating.
+/// The largest frame either protocol accepts (a `publish`, or a whole
+/// `policy` of a large fabric), checked from the length prefix before
+/// allocating.
 pub const MAX_DIRECTORY_FRAME: usize = 16 * 1024 * 1024;
 
 /// The largest request that is not a `publish`: a `hello` (a badge and an ID
@@ -91,7 +90,7 @@ pub enum DirectoryRequest {
         /// The dialer's root-signed badge.
         badge: Membership,
         /// Its IdP ID token, nonce-bound to its node key, when it has one
-        /// (a view needs it; a host's slice doesn't).
+        /// (a view needs it; a host's policy doesn't).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id_token: Option<IdToken>,
     },
@@ -105,14 +104,14 @@ pub enum DirectoryRequest {
     },
     /// The newest head and its `Fresh`.
     Head {},
-    /// The dialer's host slice.
-    Slice {
+    /// The whole signed policy, for a host or a directory (a node that holds
+    /// all of it).
+    Policy {
         /// The version the dialer holds (0: none).
         have: StateVersion,
-        /// Extra roles the host needs (its `host.json` names them).
-        roles: Vec<RoleName>,
     },
-    /// The dialer's caller view (card 37).
+    /// The dialer's caller view (card 37): the services its verified
+    /// identity may call or read.
     View {
         /// The version the dialer holds (0: none).
         have: StateVersion,
@@ -124,13 +123,6 @@ pub enum DirectoryRequest {
     Resolve {
         /// The service.
         service: ServiceName,
-    },
-    /// **Temporary** (card 36b; removed once hosts hold slices, card 36c,
-    /// and callers views, card 37): the whole signed policy, for a node
-    /// that still holds all of it.
-    Policy {
-        /// The version the dialer holds (0: none).
-        have: StateVersion,
     },
 }
 
@@ -157,17 +149,17 @@ pub enum DirectoryAnswer {
         /// The directory's `Fresh` for that head.
         fresh: Fresh,
     },
-    /// A host's slice.
-    Slice {
-        /// The slice.
-        slice: Slice,
+    /// The whole signed policy.
+    Policy {
+        /// The newest signed policy.
+        policy: SignedPolicy,
         /// The directory's `Fresh` for its head.
         fresh: Fresh,
     },
-    /// What moves the dialer's slice (at its `have`) to the newest head.
-    SliceUpdate {
+    /// What moves the dialer's whole policy (at its `have`) to the newest.
+    PolicyUpdate {
         /// The update.
-        update: SliceUpdate,
+        update: PolicyUpdate,
         /// The directory's `Fresh` for its head.
         fresh: Fresh,
     },
@@ -185,14 +177,6 @@ pub enum DirectoryAnswer {
         /// The directory's `Fresh` for its head.
         fresh: Fresh,
     },
-    /// **Temporary** (card 36b): the whole signed policy, answering
-    /// [`DirectoryRequest::Policy`].
-    Policy {
-        /// The newest signed policy.
-        policy: SignedPolicy,
-        /// The directory's `Fresh` for its head.
-        fresh: Fresh,
-    },
     /// Terminal refusal.
     Denied {
         /// Why, in words.
@@ -204,9 +188,10 @@ pub enum DirectoryAnswer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionKind {
-    /// A host's slice.
-    Slice,
-    /// Another directory's full copy.
+    /// A host's whole policy.
+    Policy,
+    /// Another directory's whole policy (only from a directory the head
+    /// lists).
     Replica,
     /// A long-running caller's view (card 37).
     View,
@@ -228,12 +213,9 @@ pub enum SubRequest {
     Subscribe {
         /// Which part.
         kind: SubscriptionKind,
-        /// The version the subscriber holds (0: none): the first update
-        /// comes at once when the directory's is newer.
+        /// The version the subscriber holds (0: none): the first frame comes
+        /// at once when the directory's is newer.
         have: StateVersion,
-        /// For a slice: the extra roles the host needs.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        roles: Vec<RoleName>,
     },
 }
 
@@ -242,19 +224,19 @@ pub enum SubRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SubFrame {
-    /// The subscriber's whole slice: the first sync, or after an update it
-    /// couldn't apply.
-    Slice {
-        /// The whole slice.
-        slice: Slice,
+    /// The whole signed policy, for a `policy` or `replica` subscriber: the
+    /// first sync, or after an update it couldn't apply.
+    Policy {
+        /// The whole policy.
+        policy: SignedPolicy,
         /// The `Fresh` for its head.
         fresh: Fresh,
     },
-    /// A new head for a subscriber holding a slice: the changes and one
-    /// proof over its whole resulting slice.
-    SliceUpdate {
+    /// A new head for a subscriber holding the whole policy: the items
+    /// changed and the keys removed since its version.
+    PolicyUpdate {
         /// The update.
-        update: SliceUpdate,
+        update: PolicyUpdate,
         /// The `Fresh` for its head.
         fresh: Fresh,
     },
@@ -269,13 +251,6 @@ pub enum SubFrame {
     ViewUpdate {
         /// The update.
         update: ViewUpdate,
-        /// The `Fresh` for its head.
-        fresh: Fresh,
-    },
-    /// A new signed policy, for a replica.
-    Replica {
-        /// The whole policy.
-        policy: SignedPolicy,
         /// The `Fresh` for its head.
         fresh: Fresh,
     },
@@ -441,9 +416,8 @@ mod tests {
                 items: signed.items,
             },
             DirectoryRequest::Head {},
-            DirectoryRequest::Slice {
+            DirectoryRequest::Policy {
                 have: StateVersion(2),
-                roles: vec![role("oncall")],
             },
             DirectoryRequest::View {
                 have: StateVersion(0),
@@ -455,9 +429,6 @@ mod tests {
             },
             DirectoryRequest::Resolve {
                 service: name("status"),
-            },
-            DirectoryRequest::Policy {
-                have: StateVersion(2),
             },
         ]
     }
@@ -480,47 +451,53 @@ mod tests {
             DirectoryRequest::Head {}.encode().unwrap()[4..],
             br#"{"type":"head"}"#[..]
         );
+        assert_eq!(
+            DirectoryRequest::Policy {
+                have: StateVersion(7)
+            }
+            .encode()
+            .unwrap()[4..],
+            br#"{"have":7,"type":"policy"}"#[..]
+        );
     }
 
     #[test]
     fn answers_and_subscription_frames_round_trip() {
         let signed = sample().sign(&root()).unwrap();
-        let fresh = fresh(&signed);
-        let slice = signed.slice_for_host(node(10), &[]).unwrap();
-        let view = signed
-            .view_for(Some(&who("alice@example.com")), None)
-            .unwrap();
-        let slice_update = slice.update_to(&slice);
-        let view_update = view.update_to(&view);
+        let mut next = sample();
+        next.version = StateVersion(4);
+        next.bans.insert(node(21), Ban { until: 900 });
+        let next = next.sign_after(&root(), &signed).unwrap();
+        let fresh = fresh(&next);
+        let update = next.update_from(&signed);
+        let alice = who("alice@example.com");
+        let view = next.view_for(Some(&alice), None);
+        let view_update = signed.view_for(Some(&alice), None).update_to(&view);
         for a in [
             DirectoryAnswer::Published {
                 version: StateVersion(3),
             },
             DirectoryAnswer::Head {
-                head: signed.head.clone(),
+                head: next.head.clone(),
                 fresh: fresh.clone(),
             },
             DirectoryAnswer::Current {
                 fresh: fresh.clone(),
             },
-            DirectoryAnswer::Slice {
-                slice: slice.clone(),
+            DirectoryAnswer::Policy {
+                policy: next.clone(),
+                fresh: fresh.clone(),
+            },
+            DirectoryAnswer::PolicyUpdate {
+                update: update.clone(),
                 fresh: fresh.clone(),
             },
             DirectoryAnswer::View {
                 view: view.clone(),
                 fresh: fresh.clone(),
             },
-            DirectoryAnswer::SliceUpdate {
-                update: slice_update.clone(),
-                fresh: fresh.clone(),
-            },
             DirectoryAnswer::ViewUpdate {
                 update: view_update.clone(),
-                fresh: fresh.clone(),
-            },
-            DirectoryAnswer::Policy {
-                policy: signed.clone(),
                 fresh: fresh.clone(),
             },
             DirectoryAnswer::Denied {
@@ -534,24 +511,20 @@ mod tests {
             );
         }
         for f in [
-            SubFrame::Slice {
-                slice,
+            SubFrame::Policy {
+                policy: next.clone(),
+                fresh: fresh.clone(),
+            },
+            SubFrame::PolicyUpdate {
+                update: update.clone(),
                 fresh: fresh.clone(),
             },
             SubFrame::View {
                 view,
                 fresh: fresh.clone(),
             },
-            SubFrame::SliceUpdate {
-                update: slice_update,
-                fresh: fresh.clone(),
-            },
             SubFrame::ViewUpdate {
                 update: view_update,
-                fresh: fresh.clone(),
-            },
-            SubFrame::Replica {
-                policy: signed,
                 fresh: fresh.clone(),
             },
             SubFrame::Fresh { fresh },
@@ -562,30 +535,27 @@ mod tests {
             let bytes = f.encode().unwrap();
             assert_eq!(SubFrame::decode(&bytes).unwrap(), Some((f, bytes.len())));
         }
-        for r in [
-            SubRequest::Hello {
-                badge: badge(),
-                id_token: Some(IdToken::new("a.b.c")),
-            },
-            SubRequest::Subscribe {
-                kind: SubscriptionKind::Slice,
-                have: StateVersion(1),
-                roles: vec![role("oncall")],
-            },
-            SubRequest::Subscribe {
-                kind: SubscriptionKind::Replica,
-                have: StateVersion(0),
-                roles: vec![],
-            },
-            SubRequest::Subscribe {
-                kind: SubscriptionKind::View,
-                have: StateVersion(0),
-                roles: vec![],
-            },
+        for kind in [
+            SubscriptionKind::Policy,
+            SubscriptionKind::Replica,
+            SubscriptionKind::View,
         ] {
-            let bytes = r.encode().unwrap();
-            assert_eq!(SubRequest::decode(&bytes).unwrap(), Some((r, bytes.len())));
+            for r in [
+                SubRequest::Hello {
+                    badge: badge(),
+                    id_token: Some(IdToken::new("a.b.c")),
+                },
+                SubRequest::Subscribe {
+                    kind,
+                    have: StateVersion(1),
+                },
+            ] {
+                let bytes = r.encode().unwrap();
+                assert_eq!(SubRequest::decode(&bytes).unwrap(), Some((r, bytes.len())));
+            }
         }
+        // What a subscriber does with a `policy_update`: apply it to its copy.
+        assert_eq!(signed.apply(&update, root().node_id()).unwrap(), next);
     }
 
     /// Only a publish may be large, and it announces itself; every other
@@ -655,8 +625,9 @@ mod tests {
         for body in [
             r#"{"type":"offer"}"#,
             r#"{"type":"head","extra":1}"#,
-            r#"{"type":"slice","have":1}"#,
-            r#"{"type":"slice","have":1,"roles":[],"x":2}"#,
+            r#"{"type":"slice","have":1,"roles":[]}"#,
+            r#"{"type":"policy"}"#,
+            r#"{"type":"policy","have":1,"x":2}"#,
             r#"{"type":"resolve","service":"Not A Name"}"#,
         ] {
             assert!(
@@ -666,11 +637,15 @@ mod tests {
         }
         for body in [
             r#"{"type":"subscribe","kind":"everything","have":0}"#,
-            r#"{"type":"subscribe","kind":"slice","have":0,"x":1}"#,
+            r#"{"type":"subscribe","kind":"slice","have":0}"#,
+            r#"{"type":"subscribe","kind":"policy","have":0,"roles":[]}"#,
         ] {
             assert!(SubRequest::decode(&raw(body.as_bytes())).is_err(), "{body}");
         }
-        assert!(DirectoryAnswer::decode(&raw(br#"{"type":"published"}"#)).is_err());
+        for body in [r#"{"type":"published"}"#, r#"{"type":"slice"}"#] {
+            assert!(DirectoryAnswer::decode(&raw(body.as_bytes())).is_err());
+        }
+        assert!(SubFrame::decode(&raw(br#"{"type":"replica"}"#)).is_err());
     }
 
     #[test]
@@ -689,13 +664,28 @@ mod tests {
         }
 
         #[test]
-        fn slice_requests_round_trip(have in any::<u64>(), roles in proptest::collection::vec("[a-z]{1,8}", 0..4)) {
-            let r = DirectoryRequest::Slice {
-                have: StateVersion(have),
-                roles: roles.iter().map(|r| role(r)).collect(),
-            };
+        fn view_requests_round_trip(have in any::<u64>(), query in proptest::option::of("[a-z ]{0,16}")) {
+            let r = DirectoryRequest::View { have: StateVersion(have), query };
             let bytes = r.encode().unwrap();
             prop_assert_eq!(DirectoryRequest::decode(&bytes).unwrap(), Some((r, bytes.len())));
+        }
+
+        /// Any update between two random policies survives the frame and
+        /// still applies.
+        #[test]
+        fn policy_updates_survive_the_frame(a in arb_policy(), b in arb_policy()) {
+            let old = a.sign(&root()).unwrap();
+            let mut b = b;
+            b.version = StateVersion(a.version.0 + 1);
+            b.directories = vec![node(30)];
+            let new = b.sign_after(&root(), &old).unwrap();
+            let frame = SubFrame::PolicyUpdate { update: new.update_from(&old), fresh: fresh(&new) };
+            let bytes = frame.encode().unwrap();
+            let Some((SubFrame::PolicyUpdate { update, fresh }, _)) = SubFrame::decode(&bytes).unwrap() else {
+                panic!("not a policy_update");
+            };
+            prop_assert!(fresh.verify(&update.head).is_ok());
+            prop_assert_eq!(old.apply(&update, root().node_id()).unwrap(), new);
         }
     }
 }

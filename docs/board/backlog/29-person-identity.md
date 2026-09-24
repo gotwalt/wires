@@ -38,7 +38,7 @@ wheel": each part below names the system it copies.
 - **Google ID tokens have no groups claim**; `hd` is the Workspace domain. With Google, roles are
   email lists or `*@domain`. Okta can add a `groups` claim. Email-list roles grow the policy with
   the number of people ([`bench/state-scale/REPORT.md`](../../../bench/state-scale/REPORT.md)):
-  after card 36 that growth stays on the directory and in host slices, not on callers.
+  after card 36 that growth stays on the directory and the hosts, not on callers.
 - **Issuers are signed policy** (card 36's `issuer` items), so hosts, directories and callers get
   them without `host.json` or environment variables.
 - **Every matcher names its issuer**, as Kubernetes and Tailscale do. Done in card 28.

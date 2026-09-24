@@ -46,7 +46,7 @@ pub const FRESH_V1: u8 = 1;
 /// Domain-separation prefix of a `Fresh`'s signed bytes.
 pub const FRESH_CONTEXT: &[u8] = b"wires/fresh/v1\0";
 
-/// A directory's signed policyment that `head` (version `version`) is the
+/// A directory's signed statement that `head` (version `version`) is the
 /// newest policy it holds, from `at` until `until`. See the module docs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -192,8 +192,8 @@ impl Fresh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::head::ItemsHash;
     use crate::head::{POLICY_V3, PolicyHead};
-    use crate::merkle::ItemsRoot;
     use proptest::prelude::*;
 
     fn root() -> NodeIdentity {
@@ -204,7 +204,7 @@ mod tests {
         NodeIdentity::from_seed([2u8; 32])
     }
 
-    fn head_with(version: u64, count: u64, directories: Vec<NodeId>) -> SignedPolicyHead {
+    fn head_with(version: u64, items: u8, directories: Vec<NodeId>) -> SignedPolicyHead {
         PolicyHead {
             format: POLICY_V3,
             fabric: root().node_id(),
@@ -212,8 +212,7 @@ mod tests {
             issued: 0,
             not_after: i64::MAX,
             directories,
-            items_root: ItemsRoot::from_hex(&"ab".repeat(32)).unwrap(),
-            item_count: count,
+            items_hash: ItemsHash::from_hex(&format!("{items:02x}").repeat(32)).unwrap(),
         }
         .sign(&root())
         .unwrap()

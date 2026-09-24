@@ -73,7 +73,7 @@ pub(crate) const DEFAULT_MAX_SUBSCRIBERS: usize = 4096;
 pub(crate) use crate::host::gate::NOT_ADMITTED;
 
 /// What a request this directory doesn't serve yet hears.
-const NOT_YET: &str = "this directory does not serve slices, views or resolve yet (cards 36c, 37); \
+const NOT_YET: &str = "this directory does not serve views or resolve yet (card 37); \
                        ask for `policy`";
 
 impl std::fmt::Debug for Directory {
@@ -262,8 +262,8 @@ impl Directory {
                 },
                 Err(reason) => denied(reason),
             },
-            // Temporary (card 36b): the whole policy, for the hosts and
-            // callers that still hold all of it.
+            // The whole policy, for hosts and directories (and, until card
+            // 37, callers).
             DirectoryRequest::Policy { have } => match self.current_with_fresh() {
                 Ok((c, fresh)) if have >= c.held.version() => DirectoryAnswer::Current { fresh },
                 Ok((c, fresh)) => DirectoryAnswer::Policy {
@@ -272,9 +272,9 @@ impl Directory {
                 },
                 Err(reason) => denied(reason),
             },
-            DirectoryRequest::Slice { .. }
-            | DirectoryRequest::View { .. }
-            | DirectoryRequest::Resolve { .. } => denied(NOT_YET.into()),
+            DirectoryRequest::View { .. } | DirectoryRequest::Resolve { .. } => {
+                denied(NOT_YET.into())
+            }
             DirectoryRequest::Hello { .. } => denied("a second hello".into()),
         }
     }

@@ -1,16 +1,14 @@
-//! Policy items: the leaves of the root-signed policy (card 36).
+//! Policy items: what the root-signed policy is made of (card 36).
 //!
 //! The policy is a [head](crate::PolicyHead) over a sorted list of
 //! [`Item`]s, one per role, service, ban, trusted issuer, and one for the
 //! fabric's settings. Each item is addressed by its [`ItemKey`] (kind, then
-//! key), which is also the order the leaves sit in the Merkle tree
-//! ([`crate::merkle`]), so any subset can be handed out with inclusion proofs
-//! and checked against the head alone.
+//! key), which is also the order the items are hashed in.
 //!
-//! Items are signed only through the head's `items_root`: their bytes are the
-//! canonical JSON of [`Item`], hashed into an [`ItemHash`](crate::ItemHash).
-//! Like every signed body they have no optional fields and refuse unknown
-//! ones.
+//! The head signs an [`ItemsHash`](crate::ItemsHash) of the whole list. A
+//! service item is also a [`SignedEntry`], signed by the root on its own, so
+//! a caller can hold and check just the services it may use. Like every
+//! signed body, items have no optional fields and refuse unknown ones.
 //!
 //! ```
 //! use library::{Ban, Item, ItemKey, NodeIdentity};
@@ -24,9 +22,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::entry::SignedEntry;
 use crate::identity::NodeId;
 use crate::idp::{Audience, Issuer};
-use crate::registry::{Service, ServiceName};
+use crate::registry::ServiceName;
 use crate::role::{Matcher, RoleName};
 
 /// Default [`Settings::beat_secs`]: a directory signs a new
@@ -38,8 +37,8 @@ pub const DEFAULT_BEAT_SECS: u32 = 5 * 60;
 pub const DEFAULT_FRESH_SECS: u32 = 15 * 60;
 
 /// Where an item sits in the policy: its kind, then its key. The derived
-/// order (kinds in declaration order, then the key's own order) is the leaf
-/// order of the Merkle tree, and a key names at most one item.
+/// order (kinds in declaration order, then the key's own order) is the order
+/// the items are hashed in, and a key names at most one item.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "key", rename_all = "snake_case")]
 pub enum ItemKey {
@@ -145,8 +144,10 @@ impl Default for Settings {
     }
 }
 
-/// One leaf of the policy: a kind, a key and a body. Serialized (and hashed)
-/// as `{"kind": …, "key": …, "body": …}`; the settings item has no key.
+/// One item of the policy: a kind, a key and a body. Serialized (and hashed)
+/// as `{"kind": …, "key": …, "body": …}`; the settings item has no key, and
+/// a service is its [`SignedEntry`]'s fields beside `"kind": "service"` (its
+/// key is the entry's `name`).
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -158,13 +159,8 @@ pub enum Item {
         /// Its matchers (at least one, each naming a trusted issuer).
         body: Vec<Matcher>,
     },
-    /// A service registry entry.
-    Service {
-        /// The service's name.
-        key: ServiceName,
-        /// Who may call and read it, and which hosts run it.
-        body: Service,
-    },
+    /// A service registry entry, signed by the root on its own.
+    Service(SignedEntry),
     /// A removed node.
     Ban {
         /// The banned node.
@@ -187,11 +183,11 @@ pub enum Item {
 }
 
 impl Item {
-    /// This item's [`ItemKey`]: its kind and key, its place in the tree.
+    /// This item's [`ItemKey`]: its kind and key, its place in the policy.
     pub fn key(&self) -> ItemKey {
         match self {
             Item::Role { key, .. } => ItemKey::Role(key.clone()),
-            Item::Service { key, .. } => ItemKey::Service(key.clone()),
+            Item::Service(entry) => ItemKey::Service(entry.name.clone()),
             Item::Ban { key, .. } => ItemKey::Ban(*key),
             Item::Issuer { key, .. } => ItemKey::Issuer(key.clone()),
             Item::Settings { .. } => ItemKey::Settings,
@@ -285,17 +281,44 @@ mod tests {
         );
     }
 
+    fn service_item() -> Item {
+        let root = NodeIdentity::from_seed([1u8; 32]);
+        Item::Service(
+            SignedEntry::sign(
+                &root,
+                crate::StateVersion(2),
+                ServiceName::new("status").unwrap(),
+                crate::Service {
+                    description: String::new(),
+                    allow: vec![],
+                    hosts: vec![],
+                    readers: vec![],
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_service_item_is_its_signed_entry() {
+        let item = service_item();
+        let text = json(&item);
+        assert!(text.starts_with(r#"{"alg":"ed25519","fabric":""#), "{text}");
+        assert!(
+            text.contains(r#""kind":"service","name":"status","#),
+            "{text}"
+        );
+        let back: Item = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, item);
+        // An unknown field inside the entry is refused.
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<Item>(v).is_err());
+    }
+
     #[test]
     fn items_know_their_keys() {
-        let svc = Item::Service {
-            key: ServiceName::new("status").unwrap(),
-            body: Service {
-                description: String::new(),
-                allow: vec![],
-                hosts: vec![],
-                readers: vec![],
-            },
-        };
+        let svc = service_item();
         assert_eq!(
             svc.key(),
             ItemKey::Service(ServiceName::new("status").unwrap())

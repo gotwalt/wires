@@ -11,8 +11,8 @@ names as readers observe calls, in full, for logging and compliance. If the code
 this document, the code is the bug, unless this document breaks the premise, in which case both
 are fixed. What the premise needs and the code doesn't do yet is listed in §10.
 
-The target architecture (how the fabric is hosted, persisted and kept in sync, once hosts hold
-slices and callers views) is [fabric.md](fabric.md). Usage, roles and the demo are in [usage.md](usage.md), [the board](board/README.md) and
+The target architecture (how the fabric is hosted, persisted and kept in sync, once hosts follow
+the policy by subscription and callers hold views) is [fabric.md](fabric.md). Usage, roles and the demo are in [usage.md](usage.md), [the board](board/README.md) and
 [demo.md](demo.md). Deployment and testing are in [deployment.md](deployment.md) and
 [testing.md](testing.md).
 
@@ -24,8 +24,8 @@ slices and callers views) is [fabric.md](fabric.md). Usage, roles and the demo a
 | **The caller is always `to_node_id(conn.remote_id())`**, the key iroh authenticated. It is never a wire field. Every gate below is sound only because of this. | every responder |
 | A network is named by its root key: the `fabric` field every credential signs is `root.node_id()`. | `Membership::mint`, `Policy::new` |
 | Signed objects sign a domain-separation prefix (where they have one) followed by `canonical_bytes(body)`: canonical JSON with keys sorted by `serde_json`'s default `BTreeMap` ordering. `preserve_order` and `arbitrary_precision` must never be enabled. | `library/codec.rs` |
-| Every signed body carries a signed format discriminant and a fixed, complete set of fields. **An optional signed field is not allowed**, because an absent field and a present default sign different bytes; "none" is an empty value. A new format gets a separate body, and an old verifier rejects it with `UnsupportedVersion`. Signed types refuse unknown fields at decode. | membership, policy head, items, `Fresh`, call-log entry |
-| Every signed credential signs its own authority (`fabric`), and `verify(root)` requires `fabric == root`. | membership, policy head, `Fresh` |
+| Every signed body carries a signed format discriminant and a fixed, complete set of fields. **An optional signed field is not allowed**, because an absent field and a present default sign different bytes; "none" is an empty value. A new format gets a separate body, and an old verifier rejects it with `UnsupportedVersion`. Signed types refuse unknown fields at decode. | membership, policy head, items, service entry, `Fresh`, call-log entry |
+| Every signed credential signs its own authority (`fabric`), and `verify(root)` requires `fabric == root`. | membership, policy head, service entry, `Fresh` |
 | Tokens are base64url-no-pad of canonical JSON. Wire frames are a 4-byte big-endian length followed by a body; the length is checked before the body is allocated. Frame envelopes are unsigned, so `skip_serializing_if` is safe in them. | all codecs |
 | `alg` is always `Ed25519`. `not_after` is inclusive, and a credential is expired when `now > not_after`. Times are unix seconds, except `*_ms` fields. | all |
 
@@ -56,30 +56,50 @@ A badge is public. It holds no secret, so presenting it before the peer is verif
 
 One versioned policy, signed by the root, says everything the network agrees on: the trusted IdPs,
 the roles, the services and which hosts run each, the bans, the settings, and which nodes are
-directories. It lists no members (§2). It is a root-signed **head** over **items**
-(`library/services/{head,item,signed_policy}.rs`):
+directories. It lists no members (§2). **The root signs the policy, and each service entry, like
+a badge**: a root-signed **head** over **items**, where each service item is also signed by the root
+on its own (`library/services/{head,item,entry,signed_policy}.rs`):
 
 ```
 PolicyHead { format: 3, fabric, version: StateVersion(u64), issued, not_after,
-             directories: [NodeId], items_root, item_count }
+             directories: [NodeId], items_hash: ItemsHash }
 SignedPolicyHead { head, alg, sig }
+SignedEntry { format: 1, fabric, version, name: ServiceName,
+              service: Service { description, allow: [RoleName], hosts: [NodeId],
+                                 readers: [RoleName] },
+              alg, sig }
 Item = role     { key: RoleName,    body: [Matcher] }
-     | service  { key: ServiceName, body: Service { description, allow: [RoleName],
-                                                    hosts: [NodeId], readers: [RoleName] } }
+     | service  SignedEntry          // {"kind": "service", ...the entry's fields}
      | ban      { key: NodeId,      body: { until } }
      | issuer   { key: Issuer,      body: { client_id, audiences: [Audience] } }
      | settings {                   body: { freshness, beat_secs, fresh_secs } }
 SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kind, key), each key once
 ```
 
-- **Signed bytes:** `"wires/policy-head/v1\0"` followed by canonical JSON of `{alg, head}`. The
-  head commits to the items through `items_root` and `item_count`: today a blake3 Merkle root over
-  the items in key order (card 36d replaces it with a plain hash of the item set). The prefix
-  separates it from memberships, `Fresh` (§4) and call-log entries.
-- **`SignedPolicy::verify(root)`**: the head's algorithm, format 3, the `fabric == root` pin and
-  signature; the items are strictly in key order and are exactly what the head commits to (count
-  and root); then `Policy::validate`. **`check_fresh(now)`**: `Expired` when `now > not_after`.
-  An expired policy admits nobody until the admin signs a newer one.
+- **Signed bytes:** the head signs `"wires/policy-head/v1\0"` followed by canonical JSON of
+  `{alg, head}`. `items_hash` is blake3 of `"wires/policy-items/v1\0"` ‖ the canonical JSON array
+  of the items, in key order, so one signature covers the whole set: no item can be changed,
+  dropped, added, or taken from another version. A service entry signs `"wires/service-entry/v1\0"`
+  ‖ canonical JSON of every field but `sig`. The prefixes separate them from each other, from
+  memberships, `Fresh` (§4) and call-log entries.
+- **An entry's `version`** is the policy version at which it last changed. An edit re-signs only
+  the entries it changes (`Policy::sign_after` the stored policy); the others keep their signature
+  and version. So a caller holding a subset of entries (its view, card 37) can check each one alone
+  against the root, and keep the newest version of each.
+- **`SignedPolicy::verify(root)`**, the one check for a whole policy: the head's algorithm,
+  format 3, the `fabric == root` pin and signature; the items are strictly in key order and hash to
+  `items_hash` (`ItemsMismatch`); every service entry verifies on its own under the root, at a
+  version no later than the head's; then `Policy::validate`. **`check_fresh(now)`**: `Expired`
+  when `now > not_after`. An expired policy admits nobody until the admin signs a newer one.
+- **Updates** (`library/services/policy_update.rs`). `PolicyUpdate { head, changed: [Item],
+  removed: [ItemKey] }` moves a whole policy to a newer head: `new.update_from(&old)` computes it,
+  `old.apply(&update, root)` rebuilds the item set (held + changed − removed), recomputes the hash
+  and checks the new head's signature and each changed entry. Any mismatch (an item tampered with,
+  withheld or added, an older head) is an error, and the holder asks for the whole policy. A
+  **view** (`library/services/view.rs`) is `{head, entries: [ViewEntry {entry: SignedEntry, call,
+  read}]}`: a caller's services, each verifying alone; `SignedPolicy::view_for(principal, query)`
+  cuts it, and `View::apply(ViewUpdate {head, changed, removed: [ServiceName]}, root)` refuses an
+  entry older than the one held.
 - **`Policy::validate`** (run by `sign` and `verify`): no directory listed twice; every role has
   at least one matcher, and **every matcher names an issuer that has an `issuer` item**; every
   issuer is non-blank and accepts at least one audience; every role a service's `allow` or
@@ -123,9 +143,9 @@ SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kin
   there is no principal). `allowed_services` runs it for every service: that is `wires services`,
   evaluated locally with no network.
 
-The policy is not secret. In card 36b every node still holds all of it: host node ids, banned node
-ids, role matchers, trusted IdPs, service names and descriptions, the directories. It names no
-other member (card 35). Card 36c narrows a host to its slice and card 37 a caller to its view (the
+The policy is not secret. Directories and hosts hold all of it: host node ids, banned node ids,
+role matchers, trusted IdPs, service names and descriptions, the directories. It names no other
+member (card 35). Callers still hold all of it too, until card 37 narrows each to its view (the
 target is [fabric.md](fabric.md)).
 
 ### Admin surface
@@ -216,21 +236,26 @@ signed for it, and subscribers are woken. An older or equal one changes nothing.
   `published {version}` with the version it now holds (the published one, or a newer one it
   already had); refused, `denied {reason}`. The admin publishes this way.
 - `head {}` → `head {head, fresh}`.
-- `policy {have}` → `current {fresh}` when `have` is the newest, else `policy {policy, fresh}`,
-  the whole signed policy. **Temporary:** it exists only while hosts and callers hold the whole
-  policy; card 36c moves hosts to slices and card 37 callers to views, and then it goes.
-- `slice`, `view` and `resolve` are answered `denied` until cards 36c and 37.
+- `policy {have}`: the whole policy, for hosts and directories (and callers, until card 37).
+  `current {fresh}` when `have` is the newest, else `policy {policy, fresh}`. The frames also
+  define `policy_update {update, fresh}` (a `PolicyUpdate` from a `have` the directory still keeps),
+  which the directory doesn't send yet.
+- `view {have, query?}` → `view {view, fresh}` (or `view_update {update, fresh}`, or `current`),
+  and `resolve {service}` → a one-entry or empty `view`: defined, and answered `denied` until
+  card 37.
 
-**`wires/directory-sub/1`.** The dialer sends `hello`, then `subscribe {kind, have, roles?}`. Only
-`replica` is served, and only to a node the held head lists as a directory; `slice` and `view` are
-refused until cards 36c and 37. A replica first receives `replica {policy, fresh}` when the held
-version is newer than `have`, else `fresh {fresh}`; then the same on every change: the whole policy
-for a newer head, a `fresh` beat otherwise. The stream ends with `denied` if the subscriber stops
+**`wires/directory-sub/1`.** The dialer sends `hello`, then `subscribe {kind, have}`, where `kind`
+is `policy` (a host), `replica` (another directory) or `view` (a long-running caller). Only
+`replica` is served, and only to a node the held head lists as a directory; `policy` and `view`
+are refused until cards 36c and 37, which will send `policy_update` and `view_update` deltas. A
+replica first receives `policy {policy, fresh}` when the held version is newer than `have`, else
+`fresh {fresh}`; then the same on every change: the whole policy for a newer head, a `fresh` beat
+otherwise. The stream ends with `denied` if the subscriber stops
 being listed. A directory serves at most 4,096 subscribers (`wires directory serve
 --max-subscribers`); one more is refused.
 
 **Replicas.** Each directory subscribes to every other directory its head lists, as `replica`,
-reconnecting after a failure with a pause growing from 1 s to 30 s. A `replica` frame is taken when
+reconnecting after a failure with a pause growing from 1 s to 30 s. A `policy` frame is taken when
 its head verifies under the root, its `Fresh` vouches for that head, and it is newer; then it is
 accepted as above. So a directory that missed a publish catches up from another. There is no
 consensus: one author, and "newer" is a version number.
@@ -260,8 +285,8 @@ help.
 - **Hosts.** A `serve` whose preflight fails (a host assigned a service while it was offline)
   fetches from a directory for at most 8 s and preflights again. While it serves it checks at once
   and then every `settings.beat_secs` (`refresh_loop`): `head {}` first, and `policy` only when a
-  verified head (whose `Fresh` vouches for it) is newer. Card 36c replaces this with a slice
-  subscription. `wires gateway` runs the same loop.
+  verified head (whose `Fresh` vouches for it) is newer. Card 36c replaces this with a `policy`
+  subscription and its `policy_update` deltas. `wires gateway` runs the same loop.
 - **Callers.** A cold command (`call`, `mcp`, `inbox`, `gateway`)
   whose copy was last checked more than 10 minutes ago fetches, for at most 8 s. `wires services`
   never fetches: it reads the local copy only.

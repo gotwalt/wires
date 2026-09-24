@@ -235,7 +235,7 @@ pub(crate) async fn serve_until(
     });
     // An edit made while this host was down, or since, is fetched from a
     // directory on a timer, until serving ends (dropping `stop_refresh`
-    // stops it). Card 36c replaces it with a slice subscription.
+    // stops it). Card 36c replaces it with a `policy` subscription.
     let (stop_refresh, refresh_stopped) = tokio::sync::oneshot::channel::<()>();
     let refresh = tokio::spawn(crate::policy::fetch::refresh_loop(
         endpoint.clone(),

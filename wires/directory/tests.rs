@@ -349,11 +349,11 @@ async fn tampered_mixed_and_older_policies_are_refused() {
     assert!(dir.accept(&v_new.signed, now).unwrap());
     let held = dir.version();
 
-    // A tampered item: the items no longer hash to the head's root.
+    // A tampered item: the items no longer hash to the head's.
     let mut tampered = v_new.signed.clone();
     for item in &mut tampered.items {
-        if let Item::Service { body, .. } = item {
-            body.hosts.push(f.nodes[0].node_id());
+        if let Item::Service(entry) = item {
+            entry.service.hosts.push(f.nodes[0].node_id());
         }
     }
     let e = dir.accept(&tampered, now).unwrap_err();
