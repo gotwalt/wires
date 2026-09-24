@@ -80,6 +80,12 @@ pub struct Ban {
 
 impl Ban {
     /// Whether the ban still holds at `now` (`now <= until`).
+    ///
+    /// ```
+    /// let ban = library::Ban { until: 100 };
+    /// assert!(ban.holds(100));
+    /// assert!(!ban.holds(101));
+    /// ```
     pub fn holds(&self, now: i64) -> bool {
         now <= self.until
     }

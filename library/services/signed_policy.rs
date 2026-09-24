@@ -320,6 +320,34 @@ impl SignedPolicy {
     /// `host`, every role those services' `allow` and `readers` name plus
     /// `extra_roles` (the roles its `host.json` names; undefined ones are
     /// skipped), every ban, every issuer, and the settings. Nothing else.
+    ///
+    /// ```
+    /// use library::{
+    ///     Audience, Issuer, IssuerConfig, ItemKey, Matcher, NodeIdentity, Policy, RoleName,
+    ///     Service, ServiceName, StateVersion,
+    /// };
+    /// let root = NodeIdentity::from_seed([1u8; 32]);
+    /// let (a, b) = (NodeIdentity::from_seed([2u8; 32]).node_id(), NodeIdentity::from_seed([3u8; 32]).node_id());
+    /// let mut p = Policy::new(root.node_id());
+    /// p.version = StateVersion(1);
+    /// p.not_after = i64::MAX;
+    /// p.issuers.insert(Issuer::new("https://idp"), IssuerConfig {
+    ///     client_id: Audience::new("cli"), audiences: vec![Audience::new("cli")],
+    /// });
+    /// for (role, service, host) in [("dba", "orders-db", a), ("sre", "deploy", b)] {
+    ///     let role = RoleName::new(role).unwrap();
+    ///     p.roles.insert(role.clone(), vec![Matcher::new("https://idp")]);
+    ///     p.services.insert(ServiceName::new(service).unwrap(), Service {
+    ///         description: String::new(), allow: vec![role], hosts: vec![host], readers: vec![],
+    ///     });
+    /// }
+    /// let slice = p.sign(&root).unwrap().slice_for_host(a, &[]).unwrap();
+    /// slice.verify(root.node_id()).unwrap();
+    /// // Host a sees its own service and role, never b's.
+    /// assert!(slice.service(&ServiceName::new("orders-db").unwrap()).is_some());
+    /// assert!(slice.service(&ServiceName::new("deploy").unwrap()).is_none());
+    /// assert!(!slice.keys().contains(&ItemKey::Role(RoleName::new("sre").unwrap())));
+    /// ```
     pub fn slice_for_host(&self, host: NodeId, extra_roles: &[RoleName]) -> Result<Slice> {
         let mut roles: BTreeSet<&RoleName> = extra_roles.iter().collect();
         for item in &self.items {
@@ -349,6 +377,40 @@ impl SignedPolicy {
     /// proofs, each service item whose `allow` (marked `call`) or `readers`
     /// (marked `read`) admits it. No role, ban, issuer or settings, and no
     /// other service; with no principal, no entries (no role admits).
+    ///
+    /// ```
+    /// use library::{
+    ///     Audience, Issuer, IssuerConfig, Matcher, NodeIdentity, Policy, Principal, RoleName,
+    ///     Service, ServiceName, StateVersion,
+    /// };
+    /// let root = NodeIdentity::from_seed([1u8; 32]);
+    /// let mut p = Policy::new(root.node_id());
+    /// p.version = StateVersion(1);
+    /// p.not_after = i64::MAX;
+    /// p.issuers.insert(Issuer::new("https://idp"), IssuerConfig {
+    ///     client_id: Audience::new("cli"), audiences: vec![Audience::new("cli")],
+    /// });
+    /// let alice_only = RoleName::new("alice-only").unwrap();
+    /// p.roles.insert(alice_only.clone(), vec![Matcher {
+    ///     email: Some("alice@example.com".parse().unwrap()),
+    ///     ..Matcher::new("https://idp")
+    /// }]);
+    /// p.services.insert(ServiceName::new("payroll").unwrap(), Service {
+    ///     description: String::new(), allow: vec![alice_only], hosts: vec![], readers: vec![],
+    /// });
+    /// let signed = p.sign(&root).unwrap();
+    /// let mut who = Principal {
+    ///     issuer: "https://idp".into(), subject: "1".into(),
+    ///     email: Some("alice@example.com".into()), org: None, groups: vec![], not_after: 0,
+    /// };
+    /// let view = signed.view_for(Some(&who)).unwrap();
+    /// view.verify(root.node_id()).unwrap();
+    /// assert!(view.entries[0].call);
+    /// // Bob doesn't learn the service exists; nor does a caller with no identity.
+    /// who.email = Some("bob@example.com".into());
+    /// assert!(signed.view_for(Some(&who)).unwrap().entries.is_empty());
+    /// assert!(signed.view_for(None).unwrap().entries.is_empty());
+    /// ```
     pub fn view_for(&self, principal: Option<&Principal>) -> Result<View> {
         let roles: BTreeMap<&RoleName, &[Matcher]> = self
             .items

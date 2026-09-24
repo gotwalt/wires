@@ -127,6 +127,20 @@ impl InclusionProof {
     /// Check that `item` is leaf [`index`](Self::index) of the tree with
     /// `root` and `count` leaves; [`Error::BadProof`] if not (a changed item,
     /// a changed or truncated path, an index out of range, or another tree).
+    ///
+    /// ```
+    /// use library::{Ban, Item, ItemHash, ItemTree, NodeIdentity};
+    /// let ban = |b: u8, until| Item::Ban {
+    ///     key: NodeIdentity::from_seed([b; 32]).node_id(),
+    ///     body: Ban { until },
+    /// };
+    /// let items = [ban(1, 10), ban(2, 20), ban(3, 30)];
+    /// let tree = ItemTree::new(items.iter().map(|i| ItemHash::of(i).unwrap()).collect());
+    /// let proof = tree.prove(1).unwrap();
+    /// assert!(proof.verify(&items[1], tree.root(), 3).is_ok());
+    /// // The same key with another body doesn't prove.
+    /// assert!(proof.verify(&ban(2, 99), tree.root(), 3).is_err());
+    /// ```
     pub fn verify(&self, item: &Item, root: ItemsRoot, count: u64) -> Result<()> {
         if self.index >= count {
             return Err(Error::BadProof);

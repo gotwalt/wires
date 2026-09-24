@@ -261,6 +261,16 @@ impl DirectoryRequest {
     /// until then. [`Error::BadFrame`] when it is over
     /// [`MAX_DIRECTORY_FRAME`], or large and not a publish (refused from the
     /// first byte that differs, before the rest is read).
+    ///
+    /// ```
+    /// use library::{DirectoryRequest, MAX_SMALL_DIRECTORY_FRAME};
+    /// let head = DirectoryRequest::Head {}.encode().unwrap();
+    /// assert_eq!(DirectoryRequest::length(&head).unwrap(), Some(head.len() - 4));
+    /// // A large body that opens like anything but a publish is refused early.
+    /// let mut big = ((MAX_SMALL_DIRECTORY_FRAME + 1) as u32).to_be_bytes().to_vec();
+    /// big.extend_from_slice(br#"{"type""#);
+    /// assert!(DirectoryRequest::length(&big).is_err());
+    /// ```
     pub fn length(buf: &[u8]) -> Result<Option<usize>> {
         let Some(len) = prefix_len(buf) else {
             return Ok(None);

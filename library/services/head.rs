@@ -154,6 +154,18 @@ impl SignedPolicyHead {
 
     /// Whether this head should replace `other`: same fabric and a strictly
     /// higher version. Says nothing about signatures; verify first.
+    ///
+    /// ```
+    /// use library::{NodeIdentity, Policy, StateVersion};
+    /// let root = NodeIdentity::from_seed([1u8; 32]);
+    /// let mut p = Policy::new(root.node_id());
+    /// p.version = StateVersion(1);
+    /// let v1 = p.sign(&root).unwrap().head;
+    /// p.version = StateVersion(2);
+    /// let v2 = p.sign(&root).unwrap().head;
+    /// assert!(v2.is_newer_than(&v1));
+    /// assert!(!v1.is_newer_than(&v2));
+    /// ```
     pub fn is_newer_than(&self, other: &SignedPolicyHead) -> bool {
         self.head.fabric == other.head.fabric && self.head.version > other.head.version
     }
