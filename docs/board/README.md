@@ -74,6 +74,7 @@ Open cards only; finished cards are in [done/](done/).
 | [35](backlog/35-badges-and-bans.md) | D1 | 28 | backlog (next) | **Badges and bans:** members leave the signed state; a node is admitted by its root-signed badge, removal is a ban, `invite` is no edit |
 | [36](backlog/36-directory.md) | D2 | 35 | backlog | **The directory:** a mode on its own ALPNs, backed by redb; root-signed head over proved items; freshness timestamps; hosts subscribe to their slice; retires state sync |
 | [37](backlog/37-caller-views.md) | D3 | 36 | backlog | **Caller views:** each caller holds only the services it may use; search; `HelloAck` carries the head version; `mcp`/gateway subscribe; ~800 B invites |
+| [38](backlog/38-llm-help-text.md) | H | 37 | backlog | **Help text for LLMs:** terse, predictable `--help`, examples, next-step errors, `--help-all` for operator flags, snapshot tests, a small eval |
 | [29](backlog/29-person-identity.md) | I2 | 36 | backlog | **Person identity for headless agents:** `login --for`, day-passes issued by a directory |
 | [31](backlog/31-inbox-delivery.md) | P3 | 28, 30 | designed, parked | **Inbox delivery:** callbacks go to the caller that asked, through the call's push capability only; open questions on the card |
 | [32](backlog/32-service-sandbox-OPEN.md) | — | — | open question | **Don't build:** run each service call in a rootless microVM so a service can't reach the host's keys |
@@ -87,8 +88,9 @@ why is [`bench/state-scale/REPORT.md`](../../bench/state-scale/REPORT.md)) → 2
 **Build plan for 35–37 (2026-09-24):** workers branch from `aaron/directory`; the integrator
 merges each into it, and the whole update lands on `main` as one PR. Stages: **35 ∥ 36a**
 (36a = card 36's pure `library` types: head, items, Merkle proofs, `Fresh`, directory frames) →
-**36b** (the mode, redb, publish, host slices, retiring state sync) → **37** → a docs and comments
-sweep across the repo.
+**36b** (the mode, redb, publish, host slices, retiring state sync) → **37** →
+**[38](backlog/38-llm-help-text.md)** (help text an LLM can act on) → a docs and comments sweep
+across the repo.
 
 ## Rules for workers
 
