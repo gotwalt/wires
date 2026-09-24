@@ -17,7 +17,7 @@ update-apply) and a proof format to keep correct.
 Hosts don't need subsets: they are machines the admin placed, and holding the whole policy was
 already accepted in the original card 29. Callers need subsets, but each entry can carry its own
 root signature, as a badge does. With that, integrity needs no tree. The Merkle tree belongs in
-[card 09](09-witness.md), the call log as a transparency log, where it is the standard answer.
+[card 09](../backlog/09-witness.md), the call log as a transparency log, where it is the standard answer.
 
 ## Decisions
 

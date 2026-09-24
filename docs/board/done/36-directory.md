@@ -183,7 +183,7 @@ signs `Fresh`, and it is trusted only because the root-signed head lists it.
 
 `StateResponder` and `wires/state/1`, the host's 10-minute `refresh_loop` and start-up catch-up,
 and the admin's push to every host. Callers keep their full state and cold pull until
-[card 37](37-caller-views.md).
+[card 37](../backlog/37-caller-views.md).
 
 ## Acceptance
 
