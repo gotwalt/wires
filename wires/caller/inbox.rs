@@ -846,7 +846,11 @@ async fn read_loop(
             {
                 match fetched {
                     Fetched::Refused(reason) => {
-                        eprintln!("wires inbox: host {} refused: {reason}", host.short());
+                        eprintln!(
+                            "wires inbox: host {} refused: {reason}{}",
+                            host.short(),
+                            crate::help::refusal_step(&reason)
+                        );
                         refusals.push(reason);
                     }
                     Fetched::Messages(n) => {

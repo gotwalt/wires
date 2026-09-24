@@ -710,12 +710,15 @@ pub(crate) async fn watch_with(
                 report.broken.push((host, why));
             }
             Event::Refused(_, reason) => {
-                out(Output::Alarm(format!("host {short}: {reason}")));
+                out(Output::Alarm(format!(
+                    "host {short} refused: {reason}{}",
+                    crate::help::refusal_step(&reason)
+                )));
                 report.refused.push((host, reason));
             }
             Event::Failed(_, e) => {
                 out(Output::Alarm(format!(
-                    "host {short} could not be read: {e}"
+                    "host {short} could not be read: {e}; try again later"
                 )));
                 report.failed.push((host, e));
             }

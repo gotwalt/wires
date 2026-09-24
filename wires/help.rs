@@ -312,7 +312,13 @@ pub(crate) fn has_next_step(text: &str) -> bool {
 /// tool result): `denied by host: <reason>`, then the next step when the
 /// reason doesn't carry one. The host's own words are never changed.
 pub fn refusal(reason: &str) -> String {
-    let step = if has_next_step(reason) {
+    format!("denied by host: {reason}{}", refusal_step(reason))
+}
+
+/// The next step [`refusal`] appends to a host's `reason`: empty when the
+/// reason names one already.
+pub(crate) fn refusal_step(reason: &str) -> &'static str {
+    if has_next_step(reason) {
         ""
     } else if reason.starts_with("unknown service") || reason.contains("not assigned to this host")
     {
@@ -321,8 +327,7 @@ pub fn refusal(reason: &str) -> String {
         "; try again later, or tell the host's operator"
     } else {
         "; don't retry: ask your admin for access"
-    };
-    format!("denied by host: {reason}{step}")
+    }
 }
 
 /// An error as `wires` prints it without `--verbose`: its messages up to

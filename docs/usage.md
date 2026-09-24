@@ -152,9 +152,12 @@ empty: no role admits a node with no identity, so it knows no host to dial.
 
 ```console
 agent$ wires services
-wires services: no service to list: this node is not signed in (`wires login`) (policy v6)
+wires is a network for authenticated remote CLI calls. Each service is a
+… (the premise, on stderr; stdout is empty)
+
+wires services: nothing to list: this node is not signed in; run `wires login`
 agent$ wires call orders-db -- "select count(*) from orders"
-wires: no service named `orders-db` that you may use: this node is not signed in (run `wires login`), and every service needs a verified identity
+wires: no service named `orders-db` that you may call: this node is not signed in, and every service needs a verified identity; run `wires login`
 agent$ echo $?
 1
 agent$ wires login
@@ -177,9 +180,11 @@ naming it in a call reaches the host, which refuses it with the reason:
 
 ```console
 observer$ wires services
-wires services: no service to list: no service allows you (policy v6)
+wires is a network for authenticated remote CLI calls. …
+
+wires services: no service allows you (policy version 6); ask your admin for a role that may call one
 observer$ wires call orders-db -- "select 1"
-wires: denied by host: sec@audit.example is in no role allowed to call orders-db (analyst)
+wires: denied by host: sec@audit.example is in no role allowed to call orders-db (analyst); don't retry: ask your admin for access
 ```
 
 `--jq`, `--head` and `--max-bytes` are applied inside `wires call`; the host
@@ -219,7 +224,7 @@ admin$ wires remove agent
 wires: policy version 7: published to 2 of 2 directory(ies)
 removed dd7e7237… (agent) (banned until 1792703101; policy version 7, 1 ban(s))
 agent$ wires call orders-db -- "select count(*) from orders"
-wires: denied by host: not a member of this network
+wires: denied by host: not a member of this network; don't retry: ask your admin for access
 agent$ echo $?
 77
 ```
@@ -547,7 +552,26 @@ To make `wires` the boundary, use a structural setup:
 
 ### Commands by role
 
-`wires --help` lists these:
+`wires --help` opens with the premise, the same paragraph `wires mcp` and
+the gateway send as their MCP `instructions` and an empty `wires services`
+prints:
+
+> wires is a network for authenticated remote CLI calls. Each service is a
+> command-line program on another machine, run by its name, never by host or
+> address. Every call runs as you: your sign-in is checked against an
+> admin-signed list of who may call what, and the machine that runs it
+> records the call. A refusal ("denied by host", exit 77) is that policy, not
+> a fault: don't retry or work around it; ask your admin for access.
+
+Then it lists only the caller's commands (`services`, `call`, `login`,
+`join`, `id`, `watch`, `inbox`, `mcp`). `wires --help-all` lists every
+command below, by role. Each command's `--help` gives its examples, and its
+exit codes or output shape where they matter; `wires <command> --help-all`
+adds the flags `--help` hides: the credential overrides (`--node-seed[-file]`,
+`--membership[-file]`, `--tools-file`, `login`'s `--issuer`, `--client-id` and
+`--client-secret`), `--relay-url`, every `--state-ttl`, and the gateway's
+`--allow-origin` and `--trust-proxy-header`. The help text, the MCP text and
+the key errors are snapshot-tested (`wires/snapshots/`).
 
 | Role | Command | What it does |
 |---|---|---|
@@ -560,18 +584,24 @@ To make `wires` the boundary, use a structural setup:
 | | `wires service add\|set <name> [--description D] [--allow role]… [--host node]… [--reader role]…` · `service rm <name>` | Edit the registry. `--host` is an `invite --name` label or a node id, of a node this admin invited and didn't ban; `set` replaces each list given. |
 | | `wires state push` | Re-publish the stored policy to every directory, e.g. after an edit that reached none. Exits 1 if the policy names directories and none took it. |
 | | `wires state settings [--freshness lenient\|strict] [--beat-secs N] [--fresh-secs N] [--state-ttl 90d]` | Print the network's settings, or change them and publish. `--freshness`: what a host does when no directory has vouched for its policy recently (`lenient`, the default, keeps deciding and traces it; `strict` refuses every call until a directory is back). `--beat-secs` (default 300): how often a directory signs a freshness timestamp; `--fresh-secs` (default 900, at least the beat): how long one lasts. |
-| **directory** | `wires directory serve [--relay-url URL] [--max-subscribers 4096]` | Run this node's directory alone (no `host.json`), until Ctrl-C. Refuses the admin's keystore and a node the policy it holds doesn't list. |
+| **directory** | `wires directory serve [--max-subscribers 4096]` | Run this node's directory alone (no `host.json`), until Ctrl-C. Refuses the admin's keystore and a node the policy it holds doesn't list. |
 | **host** | `wires serve host.json` | Refuse to start unless the policy assigns every service in the file here (fetching a newer one from a directory first if needed); then check every caller against the policy, exec the service per call, and log every call, admitted caller's refusal and push. It follows a directory's subscription for every edit (and, under `strict` freshness, refuses calls while no directory vouches for its policy), and runs the directory too when the policy lists this node. `--check` validates and prints what the file implements. |
 | | `wires push --to <node-id\|role> --subject S [--ttl D] -- <body>` | Hand a message for a caller to this machine's running `serve` (body from stdin if none is given). From the operator's shell: to any node or role. From a service (it has `WIRES_PUSH_TOKEN`): only to that call's caller. Prints `delivered`, `queued` or `denied` per recipient; exits `77` if every recipient was refused. |
 | **caller** | `wires id` | Print this node's id (creating its key on first use). |
 | | `wires join <token>` | Install an invite: the badge (membership), the directory ids and the login settings (and, for a host, the signed policy); a caller then asks a directory for the head. |
-| | `wires login` | Sign in with the IdP your invite named (flags `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*` override it), store the key-bound ID token, and fetch your view: the services you may use. |
-| | `wires services [query] [--verbose] [--json]` | List the services in your view you may call, with the roles each allows; a `query` keeps those whose name or description contains it. Refreshes the view first when it is over a day old or a call saw a newer policy. `--verbose` adds their hosts. |
-| | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name, from your view (a name it lacks is asked of a directory; or a `tools.json` alias, which a service in your view of the same name beats). Stdio passes through and its exit code becomes `call`'s, except that a remote exit `77` is reported as `1` (with a note on stderr). A refusal by the host exits `77`; a service you may not use, a local or transport failure, an expired view, or a newer policy head (in the host's handshake) whose entry no longer lists that host exits `1`, before any stdin is sent. On an unchanged fabric the call is its only connection. |
-| | `wires mcp` | Serve the same services as MCP tools over stdio (Claude Desktop, IDEs), following your view: a grant or revocation reaches the client as `tools/list_changed` within seconds. Past 40 services it offers `search_services` and `call_service` instead of one tool each. |
-| | `wires gateway --public-url https://… [--listen addr] [--client-id …]` | Serve them as a remote MCP server (Streamable HTTP + OAuth 2.1) for web clients such as Claude.ai. Each user signs in with Google through the gateway and calls with their own token, from their own view (one subscription per live session) ([deployment](deployment.md#a-web-gateway)). |
+| | `wires login [--no-browser] [--callback-port N] [--refresh\|--reuse]` | Sign in with the IdP your invite named (the hidden flags `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*` override it), store the key-bound ID token, and fetch your view: the services you may use. |
+| | `wires services [query] [--verbose] [--json]` | List the services in your view you may call, one per line: `<name>  <description>  (<roles that may call>)`; a `query` keeps those whose name or description contains it. Nothing on stdout when there are none: stderr says why and what to do (with the premise, when the view is empty). `--json` prints one object per line, in a stable shape: `{"service","description","allow":[…],"call","read","hosts":<count>}`, plus `host_ids` with `--verbose`. Refreshes the view first when it is over a day old or a call saw a newer policy. `--verbose` adds the hosts. |
+| | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name, from your view (a name it lacks is asked of a directory; or a `tools.json` alias, which a service in your view of the same name beats). Stdio passes through and its exit code becomes `call`'s, except that a remote exit `77` is reported as `1` (with a note on stderr). A refusal by the host exits `77`, with nothing on stdout; a service you may not use, a local or transport failure, an expired view, or a newer policy head (in the host's handshake) whose entry no longer lists that host exits `1`, before any stdin is sent; a usage error (a `--jq` filter that doesn't compile, a flag locked mode refuses) exits `2`. `--verbose` names the host that answered and prints every cause of an error. On an unchanged fabric the call is its only connection. |
+| | `wires mcp` | Serve the same services as MCP tools over stdio (Claude Desktop, IDEs), following your view: a grant or revocation reaches the client as `tools/list_changed` within seconds. Each tool is a service, named as `wires services` lists it, and described by the first sentence of its registry description; the `instructions` are the premise plus how to pass arguments and filter output. Past 40 services it offers `search_services` and `call_service` instead of one tool each, whose descriptions state the refusal rule. A refusal is a tool error reading `denied by host: <reason>` and its next step. |
+| | `wires gateway --public-url https://… [--listen addr] [--client-id …] [--client-secret-file F] [--issuer URL]` | Serve them as a remote MCP server (Streamable HTTP + OAuth 2.1) for web clients such as Claude.ai. Each user signs in with Google through the gateway and calls with their own token, from their own view (one subscription per live session) ([deployment](deployment.md#a-web-gateway)). |
 | | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`. |
 | **reader** | `wires watch [service…] [--mine] [--once] [--json]` | Stream call records from your services' hosts, verified: all records of services whose `readers` role you're in, otherwise your own (your verified identity's, from any node). A following stream is re-decided when the signed policy changes or your ID token expires, and ends with the refusal when access is gone (exit `77` when every host refused). A log rolled back below what you verified, or rewritten, is an alarm (exit 1); entries pruned past it (retention, 30 days) are a notice. Marks are kept per host, so any view catches a rewrite another view verified. The service each line names is derived from the signed records, not supplied by the host. |
+
+Every command's error ends with the next step in one clause (`run \`wires
+login\``, `see \`wires services\``, `ask your admin …`), and without
+`--verbose` prints no stack of causes. A refusal prints the host's reason as
+the host gave it, then a next step when the reason carries none (`… ; don't
+retry: ask your admin for access`).
 
 Every edit above signs a new policy valid for `--state-ttl` from now (default
 90 days), or until the current policy's expiry if that is later: an edit never
@@ -637,8 +667,8 @@ a container can mount its node key from a secret with `--node-seed-file`.
 
 `serve` re-reads its signed policy once per connection, so a removal takes
 effect at each host on the next call after that host has the new policy, with
-no restart. A refused call prints `wires: denied by host: <reason>` on
-stderr, writes nothing to stdout and exits `77`. A member's refusal is in the
+no restart. A refused call prints `wires: denied by host: <reason>` (and the
+next step) on stderr, writes nothing to stdout and exits `77`. A member's refusal is in the
 host's log; a removed member hears only `not a member of this network`, and
 the host traces that instead of logging it. There is no shared key, so there
 is nothing to rotate. The protocol as built: [docs/protocol.md](protocol.md).
