@@ -118,8 +118,8 @@ reader$    WIRES_HOME=~/.wires-reader wires login     # bare: the invite named t
 ```
 
 The workbench is invited twice because it was offline when it was named the
-directory and assigned the service (those edits exit 1: no directory was
-up): the second token carries the whole policy, since the policy now names
+directory and assigned the service (those edits note that no directory is
+running yet): the second token carries the whole policy, since the policy now names
 the workbench as a host and directory (re-joining never rolls one back).
 Every later admin change is published to the running workbench, which is the
 directory, so its host side has it at once. The agent and reader hold no

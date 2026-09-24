@@ -156,15 +156,14 @@ OB_ID="$(WIRES_HOME="$obs" "$WIRES" id 2>/dev/null)"
 AG8="${AG_ID:0:8}"
 admin() { WIRES_HOME="$root" "$WIRES" "$@"; }
 # Roles are who, by IdP identity. Then the hosts are invited and named the
-# network's directories; they are not running yet, so the admin's publishes
-# miss them -- their tokens carry the policy.
+# network's directories; none is running yet, so each edit notes that and
+# succeeds -- their tokens carry the policy.
 admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1
 admin role set security --issuer "$ISSUER" "$READER" >/dev/null 2>&1
 admin invite "$WB_ID" --name workbench >/dev/null 2>&1
 admin invite "$SP_ID" --name spare >/dev/null 2>&1
 for h in workbench spare; do
-	admin directory add "$h" >/dev/null 2>"$D/dir.err" ||
-		grep -qF "reached none of its" "$D/dir.err" || {
+	admin directory add "$h" >/dev/null 2>"$D/dir.err" || {
 		cat "$D/dir.err" >&2
 		bad "setup: wires directory add $h failed"
 	}
@@ -186,14 +185,18 @@ beat 5
 step "1  the admin registers ONE service, and who may call and read it"
 # ==========================================================================
 run "wires service add orders-db --description … --allow analyst --reader security --host workbench --host spare"
-# The directories aren't up yet, so the edit reaches neither and exits 1
-# (the new policy is stored; a fresh token carries it to them below).
+# The directories aren't up yet and none has taken a publish, so the edit
+# notes that and succeeds (the new policy is stored; a fresh token carries it
+# to them below).
 admin service add orders-db \
 	--description "Read-only SQL (sqlite3) over the orders database; pass the SQL statement as the argument." \
-	--allow analyst --reader security --host workbench --host spare >"$D/svc.out" 2>"$D/svc.err" ||
-	grep -qF "reached none of its 2 directory(ies)" "$D/svc.err" || {
+	--allow analyst --reader security --host workbench --host spare >"$D/svc.out" 2>"$D/svc.err" || {
 	cat "$D/svc.err" >&2
 	bad "1: wires service add failed"
+}
+grep -qF "no directory is running yet" "$D/svc.err" || {
+	cat "$D/svc.err" >&2
+	bad "1: wires service add did not say no directory is running yet"
 }
 show "$D/svc.out"
 # A fresh token catches the hosts up (re-join never rolls a policy back).

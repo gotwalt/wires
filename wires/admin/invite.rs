@@ -92,7 +92,7 @@ pub(crate) fn invite_in(ks: &Keystore, a: InviteArgs) -> anyhow::Result<Report> 
             );
         }
     }
-    let held = crate::policy::store::require_policy(ks, root.node_id())?;
+    let held = super::service::admin_policy(ks, root.node_id())?;
     let now = now_unix();
     let badge = Membership::mint(&root, invitee, now, ttl.not_after(now))?;
     let rejoin = ledger.contains(invitee);
@@ -164,7 +164,7 @@ pub(crate) fn remove_in(ks: &Keystore, a: RemoveArgs) -> anyhow::Result<Report> 
     let root = ks
         .read_root_identity()?
         .ok_or_else(|| anyhow::anyhow!("no root key here: `wires remove` runs on the admin"))?;
-    let held = crate::policy::store::require_policy(ks, root.node_id())?;
+    let held = super::service::admin_policy(ks, root.node_id())?;
     if let Some(ban) = held.policy.bans.get(&member) {
         bail!(
             "{} is already removed (banned until {})",

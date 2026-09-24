@@ -14,6 +14,7 @@
 //! - [`with_every_directory_down_strict_refuses_until_one_is_back`]
 //! - [`a_host_restarted_from_disk_serves_before_any_directory_answers`]
 //! - [`a_directory_serving_an_unadoptable_policy_is_passed_over`]
+//! - [`a_publish_from_a_stale_copy_is_not_delivered`]
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -504,6 +505,50 @@ async fn a_directory_serving_an_unadoptable_policy_is_passed_over() {
     h.task.abort();
     first.stop().await;
     second.stop().await;
+}
+
+/// An admin publishing from a stale copy: a directory holding a newer
+/// version, or another policy at the version offered, answers with what it
+/// holds and keeps it. The publish reports it as `newer`, never delivered,
+/// and the admin command fails naming the way back.
+#[tokio::test]
+async fn a_publish_from_a_stale_copy_is_not_delivered() {
+    let w = World::new().await;
+    let v1 = w.policy(1, Settings::default(), 0);
+    let d = w.directory(0, &w.keystore(&w.dirs[0], &v1)).await;
+    let (v2, v3) = (
+        w.policy(2, Settings::default(), 1),
+        w.policy(3, Settings::default(), 2),
+    );
+    let now = now_unix();
+    assert!(d.dir.accept(&v2, now).unwrap());
+    assert!(d.dir.accept(&v3, now).unwrap());
+    let admin = w.bind(&w.admin).await;
+    let badge = w.badge(&w.admin);
+    let only = [w.dirs[0].node_id()];
+
+    // Two versions behind: its version 2 is older than the directory's 3.
+    let report = publish_all(&admin, &badge, &v2, &only).await.unwrap();
+    assert_eq!(report.newer, vec![(only[0], StateVersion(3))], "{report:?}");
+    assert!(report.delivered.is_empty(), "{report:?}");
+    // One behind: another version 3, signed from its copy of version 2.
+    let other_v3 = w.policy(3, Settings::default(), 5);
+    assert_ne!(other_v3.head, v3.head);
+    let report = publish_all(&admin, &badge, &other_v3, &only).await.unwrap();
+    assert_eq!(report.newer, vec![(only[0], StateVersion(3))], "{report:?}");
+    let failure =
+        crate::admin::propagate::Propagation::from_publish(Ok((StateVersion(3), report)), false)
+            .failure
+            .expect("the edit fails");
+    assert!(failure.contains("policy.json is stale"), "{failure}");
+    assert_eq!(d.dir.snapshot().unwrap().held.signed, v3, "kept its own");
+
+    // The directory's own version, re-published (`policy push`): delivered.
+    let report = publish_all(&admin, &badge, &v3, &only).await.unwrap();
+    assert_eq!(report.delivered, only.to_vec(), "{report:?}");
+    assert!(report.newer.is_empty());
+    admin.close().await;
+    d.stop().await;
 }
 
 /// A host restarted with its policy on disk serves at once, with no

@@ -235,21 +235,61 @@ impl ServiceEdit {
 // ---------------------------------------------------------------------------
 
 /// Sign and store the next version of this keystore's policy: the stored
-/// one (or, for `wires init`, an empty one) changed by `change`, bans whose
-/// `until` has passed dropped ([`Policy::prune_bans`]: the badge each one
-/// cancelled has expired), version + 1, valid until `ttl` from now or the
-/// stored one's expiry, whichever is later (an edit never shortens the
-/// policy's lifetime). Only the service entries the edit changed are
-/// re-signed ([`Policy::sign_after`]); the rest keep their signature and
-/// version. Validation failures name the broken rule.
+/// one changed by `change`, bans whose `until` has passed dropped
+/// ([`Policy::prune_bans`]: the badge each one cancelled has expired),
+/// version + 1, valid until `ttl` from now or the stored one's expiry,
+/// whichever is later (an edit never shortens the policy's lifetime). Only
+/// the service entries the edit changed are re-signed
+/// ([`Policy::sign_after`]); the rest keep their signature and version.
+/// Validation failures name the broken rule. With no stored policy it is
+/// refused ([`admin_policy`]): version 1 signed over a lost copy would
+/// change nothing anywhere.
 pub(crate) fn edit_policy(
     ks: &Keystore,
     ttl: Ttl,
     change: impl FnOnce(&mut Policy) -> Result<()>,
 ) -> Result<Held> {
-    let root = ks
-        .read_root_identity()?
-        .ok_or_else(|| anyhow!("no root key here; run `wires init` first (on the admin)"))?;
+    let root = root_key(ks)?;
+    admin_policy(ks, root.node_id())?;
+    sign_next(ks, ttl, change)
+}
+
+/// `wires init`'s edit: [`edit_policy`] from an empty policy when none is
+/// stored.
+pub(crate) fn first_policy(
+    ks: &Keystore,
+    ttl: Ttl,
+    change: impl FnOnce(&mut Policy) -> Result<()>,
+) -> Result<Held> {
+    sign_next(ks, ttl, change)
+}
+
+/// The root key, or an error saying this is not the admin.
+fn root_key(ks: &Keystore) -> Result<library::NodeIdentity> {
+    ks.read_root_identity()?
+        .ok_or_else(|| anyhow!("no root key here; run `wires init` first (on the admin)"))
+}
+
+/// The admin's stored policy, or an error naming the way back when it is
+/// gone (a lost `policy.json`): copy one from any host or directory, which
+/// hold the whole signed policy (it verifies under this root on the way in).
+pub(crate) fn admin_policy(ks: &Keystore, root: NodeId) -> Result<Held> {
+    store::read(ks, root)?.ok_or_else(|| {
+        anyhow!(
+            "this admin holds no signed policy ({} is missing); copy policy.json from any host \
+             or directory of this network there, then run this again",
+            ks.path(store::POLICY_FILE).display()
+        )
+    })
+}
+
+/// [`edit_policy`]'s body, from an empty policy when none is stored.
+fn sign_next(
+    ks: &Keystore,
+    ttl: Ttl,
+    change: impl FnOnce(&mut Policy) -> Result<()>,
+) -> Result<Held> {
+    let root = root_key(ks)?;
     let held = store::read(ks, root.node_id())?;
     let mut next = match &held {
         Some(h) => h.policy.clone(),
@@ -388,11 +428,18 @@ pub(crate) fn issuer_config(client_id: &str, audiences: &[String]) -> Result<Iss
 }
 
 /// `wires directory add <node>`: list a node as one of the network's
-/// directories (a node this admin invited, not banned, listed once).
+/// directories (not banned, listed once). Unlike a service's `--host`, it
+/// may be a node not invited yet: listing it first is what makes its invite
+/// carry the policy it starts from.
 pub(crate) fn directory_add(ks: &Keystore, node: NodeId, ttl: Ttl) -> Result<Held> {
-    let ledger = Ledger::load(ks)?;
     edit_policy(ks, ttl, |p| {
-        check_hosts(p, &ledger, Some(&[node]))?;
+        if let Some(ban) = p.bans.get(&node) {
+            bail!(
+                "{} was removed (banned until {}); `wires invite` it again first",
+                node.short(),
+                ban.until
+            );
+        }
         if p.directories.contains(&node) {
             bail!("{} is already a directory", node.short());
         }
@@ -851,20 +898,35 @@ mod tests {
     }
 
     #[test]
-    fn directories_are_invited_nodes_listed_once() {
+    fn directories_are_listed_once_invited_or_not_yet() {
         let dir = NodeIdentity::generate().node_id();
         let ks = admin_with(&[dir]);
         let held = directory_add(&ks, dir, ttl()).unwrap();
         assert_eq!(held.directories(), &[dir]);
         assert!(directory_add(&ks, dir, ttl()).is_err(), "twice");
+        // Not invited yet: listed first, so its invite carries the policy.
         let stranger = NodeIdentity::generate().node_id();
-        assert!(
-            directory_add(&ks, stranger, ttl()).is_err(),
-            "never invited"
-        );
+        let held = directory_add(&ks, stranger, ttl()).unwrap();
+        assert_eq!(held.directories(), &[dir, stranger]);
+        directory_rm(&ks, stranger, ttl()).unwrap();
         let held = directory_rm(&ks, dir, ttl()).unwrap();
         assert!(held.directories().is_empty());
         assert!(directory_rm(&ks, dir, ttl()).is_err(), "not listed");
+    }
+
+    /// An admin whose `policy.json` is gone doesn't sign a version 1 over
+    /// it (every directory holds a newer one, so the edit would change
+    /// nothing): refused, naming the way back, and nothing is written.
+    #[test]
+    fn an_edit_with_no_stored_policy_is_refused() {
+        let ks = admin_with(&[]);
+        std::fs::remove_file(ks.path(store::POLICY_FILE)).unwrap();
+        let err = format!(
+            "{:#}",
+            role_set(&ks, role("staff"), vec![Matcher::new(GOOGLE_ISSUER)], ttl()).unwrap_err()
+        );
+        assert!(err.contains("copy policy.json from any host"), "{err}");
+        assert!(!ks.path(store::POLICY_FILE).exists());
     }
 
     /// Under strict freshness the last directory can't go: nothing would

@@ -56,7 +56,7 @@ admin$ wires init --client-id <client id>.apps.googleusercontent.com --public-cl
 network 57b09428…
 node 23028cae…
 policy version 1 (trusts https://accounts.google.com)
-next: on each joining machine run `wires id`, then here `wires invite <node-id> --name <label>`; name a directory with `wires directory add <label>`
+next: on each joining machine run `wires id`; list the directory node first with `wires directory add <node-id>`, then `wires invite <node-id> --name <label>` each machine
 admin$ wires role set analyst '*@example.com'          # issuer: Google unless --issuer
 role analyst set (policy version 2)
 admin$ wires role set security sec@audit.example
@@ -77,24 +77,27 @@ admin$ wires invite 3ef72b11… --name workbench        # likewise the spare
 wires: invited 3ef72b11… as "workbench" (badge until 1792702980; policy version 3 unchanged)
 wires: on the joining machine: wires join eyJhZG1pbiI6…
 admin$ wires directory add workbench                  # likewise the spare
+wires: policy version 4: no directory is running yet (none has taken a publish from this admin); start one with `wires directory serve` on its node: an invite minted from now on carries this policy
+wires: next: re-invite it (`wires invite workbench`) and `wires join` that token there: only an invite minted now carries the policy; then `wires directory serve` there
+directory 3ef72b11… (workbench) added (policy version 4; 1 directory(ies))
 admin$ wires service add orders-db --description "Read-only SQL (sqlite3) over the orders database; …" \
          --allow analyst --reader security --host workbench --host spare
-wires: policy version 6: published to 0 of 2 directory(ies); not reached: 3ef72b11…, 511de414… (`wires policy push` re-publishes it)
+wires: policy version 6: no directory is running yet (…)
 service orders-db added (policy version 6)
-wires: policy version 6 is signed and stored here, but reached none of its 2 directory(ies), so no host or caller can fetch it yet; run `wires policy push` once a directory is up
-admin$ echo $?
-1
-workbench$ wires join eyJhZG1pbiI6…                  # a token from a fresh `wires invite`
+admin$ wires invite 3ef72b11… --name workbench        # again: this token carries the policy
+workbench$ wires join eyJhZG1pbiI6…
 ```
 
-The directories weren't running, so the publish missed them and the command
-exits 1: the new policy is stored on the admin and nowhere else. Once a
-directory is up, `wires policy push` re-publishes it. A host that starts on a
-policy that doesn't assign it the service fetches a newer one from a directory
-before giving up; here none is up yet, so the hosts join with a fresh `wires
-invite` token: a node the policy names as a host or a directory gets the
-whole current policy in its token (re-joining never rolls a policy back). An
-invite edits nothing: it mints the node's badge (its membership, which is what
+No directory is running yet and none has ever taken a publish from this
+admin, so each edit says so and succeeds: the new policy is stored on the
+admin, and a directory gets it in its invite. From the first publish a
+directory takes, an edit that reaches none exits 1 (`wires policy push`
+re-publishes it). The hosts were invited before they were listed, so their
+first tokens carry no policy, and `directory add` says to re-invite: a node
+the policy names as a host or a directory gets the whole current policy in
+its token (re-joining never rolls a policy back). A node that is only a
+directory can be listed by id before its first invite (`wires directory add
+<node-id>`), and then one token does. An invite edits nothing: it mints the node's badge (its membership, which is what
 admits it). The token isn't a secret: the badge is bound to the invitee's key,
 and nothing in it names another node.
 
@@ -499,7 +502,8 @@ To make `wires` the boundary, use a structural setup:
   Any admin edit signs a fresh policy (never with an earlier expiry than the
   one it replaces); re-issue badges with `wires invite <id>`.
 - **The admin is a one-shot command.** It publishes each edit to the
-  directories only. An edit that reaches none exits 1; `wires policy push`
+  directories only. An edit that reaches none exits 1 (until a directory
+  has first taken a publish, it is a note); `wires policy push`
   re-publishes it. Hosts follow a directory's subscription and have each
   edit within a second; so do `wires mcp` and gateway sessions, for their
   views. A one-shot `wires call` learns of an edit in its next call's
@@ -580,7 +584,7 @@ the key errors are snapshot-tested (`wires/snapshots/`).
 | | `wires invite <node-id> [--name l] [--ttl 30d] [--policy-ttl 90d]` | Mint the node's badge (valid for `--ttl`, at most 30 days), record it in the admin's ledger (`issued.json`), print its join token (stdout): the badge, up to two directory ids and the login settings (under 1 KB; a host or directory also gets the signed policy). Not a policy edit: nothing is published. Re-inviting a banned node lifts its ban (an edit, published; `--policy-ttl` applies). |
 | | `wires remove <name\|node-id> [--policy-ttl 90d]` | Ban a node until its badge would expire (30 days for a node the ledger doesn't know), and drop it from every service's hosts and from the directories; publish. Its next call to a host that has the new policy is refused. |
 | | `wires issuer set <iss> --client-id ID [--audience A]… [--public-client-secret S] [--login]` · `issuer rm <iss>` | Trust an IdP (or change its client id and accepted audiences; default audience: the client id), or stop trusting one no role names. `--login` makes it the IdP invites name; `--public-client-secret` as for `init`. Every role's matchers must name a trusted issuer. |
-| | `wires directory add\|rm <name\|node-id>` | List a node (invited, not banned) as one of the network's directories, or stop listing it. |
+| | `wires directory add\|rm <name\|node-id>` | List a node (not banned; invited or not yet) as one of the network's directories, and print its next step; or stop listing it. |
 | | `wires role set <name> [--issuer URL] [--policy-ttl] <matcher>…` · `role rm <name>` | Define a role as an OR of matchers: `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…` (all must hold). Every matcher names its issuer, compared exactly: one without `issuer=` takes `--issuer` (default `https://accounts.google.com`). `issuer=…` alone admits anyone that IdP verified. `org` is Google's `hd`, read only from Google. The issuer must be one the policy trusts (`wires issuer set`). There is no built-in role: a node with no verified identity is in no role. |
 | | `wires service add\|set <name> [--description D] [--allow role]… [--host node]… [--reader role]…` · `service rm <name>` | Edit the registry. `--host` is an `invite --name` label or a node id, of a node this admin invited and didn't ban; `set` replaces each list given. |
 | | `wires policy push` | Re-publish the stored policy to every directory, e.g. after an edit that reached none. Exits 1 if the policy names directories and none took it. |
@@ -611,7 +615,12 @@ lists (and to any the policy before the edit listed); the admin dials no
 host. When the policy names directories and **none** took it, the command
 still prints its result (an `invite` still prints the token) but exits 1: the
 new policy is stored on the admin and nowhere else until `wires policy push`
-reaches a directory. With no directory listed yet, nothing fails.
+reaches a directory. With no directory listed yet, nothing fails, and until a
+directory has taken a publish from this admin (none is running yet),
+reaching none is a note. A directory that holds a newer policy than the
+admin's fails the edit whatever the others did: the admin's `policy.json` is
+stale (copy it from any host or directory, then edit again). So does any
+edit on an admin whose `policy.json` is gone.
 
 For a stdio MCP client, the whole config is:
 

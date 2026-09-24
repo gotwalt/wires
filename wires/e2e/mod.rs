@@ -17,6 +17,8 @@
 //!   environment and a per-call push capability, not the host's keystore.
 //! - [`gateway`] — `wires gateway`: a web MCP client signs in (OAuth, a mock
 //!   Google) and calls as its user, over real HTTP.
+//! - [`first_run`] — starting a network: `init`, `directory add`, `invite`,
+//!   `join`, `directory serve`, an edit, with no step failing.
 //! - [`follow`] — card 36c: hosts follow a directory's `policy`
 //!   subscription (deltas, resync, failover), and the signed freshness rule
 //!   (`lenient` / `strict`) with every directory down.
@@ -48,6 +50,8 @@ mod services_host;
 /// Card 26b: call records streamed from the host's log to authorized readers.
 mod records;
 
+/// Starting a network: no step errors, in the order each step names.
+mod first_run;
 /// Card 36c: hosts follow the directory by subscription; the freshness rule.
 mod follow;
 /// `wires gateway`: OAuth sign-in and MCP over HTTP, end to end.

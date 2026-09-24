@@ -169,8 +169,12 @@ The admin commands and their flags are in [usage.md § Commands by role](usage.m
   stops trusting one, refused while a role's matcher names it. Which issuer invites name, and each
   public secret, stay in the admin's keystore (`login-client.json`, §9), not in the signed policy:
   every host holds the policy, and none needs them.
-- **`directory add <node>`** lists an invited, unbanned node in the head's `directories` (once);
-  **`directory rm <node>`** drops it.
+- **`directory add <node>`** lists an unbanned node in the head's `directories` (once), invited or
+  not yet: listed first, its invite then carries the policy it serves from (the command prints the
+  node's next step); **`directory rm <node>`** drops it.
+- An edit on an admin that holds no `policy.json` is refused, naming the way back: it would sign a
+  version 1 that every directory already holds newer. Copy `policy.json` from any host or directory
+  (it verifies under the root on the way in).
 - **`invite <node>` is not an edit.** It mints the node's badge, records it in the admin's
   ledger, `issued.json` (§9: node → label, latest `not_after`), and puts it in the node's token
   (below): the version doesn't move and nothing is published. Two cases do edit, and then
@@ -340,12 +344,21 @@ consensus: one author, and "newer" is a version number.
 **Publish (admin).** After every admin edit, and on `wires policy push`, the admin dials,
 concurrently, every directory the new head lists plus every directory the head before the edit
 listed (so a directory the edit drops learns it), never itself, and sends `publish`. It dials no
-host. A directory counts as delivered when it answers `published` with at least the offered
-version. Stderr says `policy version N: published to K of D directory(ies)`, naming any not
-reached. **When D > 0 and K = 0 the command exits 1** (after printing its result, e.g. the invite
-token): the new policy is stored on the admin and nowhere else. `wires policy push` re-publishes
-it. With no directory at all, the line says so and nothing fails; a new node gets the policy in its
-invite token.
+host. A directory counts as delivered when it answers `published` with the offered version and
+then shows the offered head when asked (`head`). Stderr says `policy version N: published to K of
+D directory(ies)`, naming any not reached. **When D > 0 and K = 0 the command exits 1** (after
+printing its result, e.g. the invite token): the new policy is stored on the admin and nowhere
+else. `wires policy push` re-publishes it. With no directory at all, the line says so and nothing
+fails; a new node gets the policy in its invite token. Two exceptions:
+
+- **The first run.** Until a directory the publish aims at has taken one from this admin
+  (`reached.json`, §9), reaching none is a note that no directory is running yet, and exits 0. So
+  starting a network (`init`, `directory add`, edits, the directory's invite, `directory serve`)
+  errors nowhere; from the first publish a directory takes, reaching none exits 1 as above.
+- **A stale copy.** A directory answering a newer version, or showing another head at the offered
+  one, kept its own: this admin's `policy.json` is behind and the edit changed nothing there. The
+  command exits 1 whatever the other directories did, saying to copy `policy.json` from any host
+  or directory and make the edit again.
 
 **Following (hosts).** A running host subscribes as `policy` (`wires/host/follow.rs`) to the
 first directory its held head lists that answers, never itself, trying the one it last followed
@@ -728,6 +741,7 @@ Nothing is broadcast: a record's content leaves a host only when a reader asks f
 | File | Mode | Holder | Content |
 |---|---|---|---|
 | `root.seed`, `node.seed` | 0600 | admin / every node | hex Ed25519 seed |
+| `reached.json` | 0600 | admin | the directories that have taken a publish from this admin: until one a publish aims at has, reaching none is the first run, not a failure (§4) |
 | `issued.json` | 0600 | admin | the ledger of badges it minted: node → label (for `remove` and `service --host`), latest `not_after` (how long a ban must last); never sent |
 | `membership.json` | 0644 | every node | its badge (membership token) |
 | `policy.json` (+ `.lock`) | 0600 | admin, host, directory | the newest verified signed policy (§3); **a caller holds none** |

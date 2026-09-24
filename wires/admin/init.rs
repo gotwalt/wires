@@ -108,7 +108,7 @@ pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
     let mut ledger = Ledger::load(ks)?;
     ledger.record(me.node_id(), None, badge.not_after);
     ledger.save(ks)?;
-    let held = super::service::edit_policy(ks, a.policy_ttl, |p| {
+    let held = super::service::first_policy(ks, a.policy_ttl, |p| {
         p.issuers.insert(issuer.clone(), config);
         Ok(())
     })?;
@@ -117,8 +117,8 @@ pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
 
     Ok(format!(
         "network {}\nnode {}\npolicy version {} (trusts {issuer})\n\
-         next: on each joining machine run `wires id`, then here `wires invite <node-id> --name \
-         <label>`; name a directory with `wires directory add <label>`",
+         next: on each joining machine run `wires id`; list the directory node first with \
+         `wires directory add <node-id>`, then `wires invite <node-id> --name <label>` each machine",
         root.node_id().hex(),
         me.node_id().hex(),
         held.version().0,
