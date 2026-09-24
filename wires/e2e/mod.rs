@@ -1,4 +1,4 @@
-//! The integration tests: the whole stack — signed state, the `Hello`
+//! The integration tests: the whole stack — signed policy, the `Hello`
 //! handshake, the registry gate, exec and the stdio bridge, push — driven
 //! over hermetic loopback QUIC.
 //!
@@ -8,15 +8,22 @@
 //! address hints over loopback ([`localhost_socks`]).
 //!
 //! - [`services_host`] — card 27's acceptance: a host decides
-//!   every call by the admin-signed state (the registry's roles,
+//!   every call by the admin-signed policy (the registry's roles,
 //!   `also_require`, removal with no restart, refusing unassigned services,
-//!   push by the state).
+//!   push by the policy).
 //! - [`records`] — card 26b: call records streamed from the host's own log
 //!   to authorized readers (`wires watch`).
 //! - [`service_child`] — card 28 §1: a service child gets a minimal
 //!   environment and a per-call push capability, not the host's keystore.
 //! - [`gateway`] — `wires gateway`: a web MCP client signs in (OAuth, a mock
 //!   Google) and calls as its user, over real HTTP.
+//! - [`first_run`] — starting a network: `init`, `directory add`, `invite`,
+//!   `join`, `directory serve`, an edit, with no step failing.
+//! - [`follow`] — card 36c: hosts follow a directory's `policy`
+//!   subscription (deltas, resync, failover), and the signed freshness rule
+//!   (`lenient` / `strict`) with every directory down.
+//! - [`views`] — card 37: each caller holds only its view, and a running
+//!   `wires mcp` hears of a grant or a revocation within 2 s.
 //! - [`native`] — card 33: an embedded [`Host`](crate::Host) serves a native
 //!   service (the `kv` example), called and logged like a CLI service.
 
@@ -26,8 +33,8 @@ use std::time::Duration;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, EndpointAddr};
 use library::{
-    Frame, Hello, HelloAck, Invocation, Matcher, Membership, NodeIdentity, OidcNonce, RoleName,
-    ServiceName, SignedState, State, StateVersion,
+    Frame, Hello, HelloAck, Invocation, Matcher, Membership, NodeIdentity, OidcNonce, Policy,
+    RoleName, ServiceName, SignedPolicy, StateVersion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::timeout;
@@ -37,18 +44,25 @@ use crate::caller::mock_idp::{MOCK_CLIENT_ID, MockIdp};
 use crate::host::config::HostConfig;
 use crate::host::transport::{ALPN, secret_key};
 
-/// Card 27's host side: a host decides by the signed state.
+/// Card 27's host side: a host decides by the signed policy.
 mod services_host;
 
 /// Card 26b: call records streamed from the host's log to authorized readers.
 mod records;
 
+/// Starting a network: no step errors, in the order each step names.
+mod first_run;
+/// Card 36c: hosts follow the directory by subscription; the freshness rule.
+mod follow;
 /// `wires gateway`: OAuth sign-in and MCP over HTTP, end to end.
 mod gateway;
 /// Card 33: an app serves wires calls in-process through an embedded host.
 mod native;
 /// Card 28 §1: the service child is not the host.
 mod service_child;
+/// Card 37: each caller holds only its view; grants and revocations reach
+/// a running `wires mcp`.
+mod views;
 
 /// The outer bound on any single wait here: generous, and never reached in
 /// the passing case (every wait is on an event, not a clock).
@@ -100,23 +114,23 @@ fn email_at(idp: &MockIdp, email: &str) -> Matcher {
     }
 }
 
-/// The state `root` signs at `version` (issued now, never expiring), after
+/// The policy `root` signs at `version` (issued now, never expiring), after
 /// `edit` fills it in.
-fn signed_state(root: &NodeIdentity, version: u64, edit: impl FnOnce(&mut State)) -> SignedState {
-    let mut s = State::new(root.node_id());
+fn signed_state(root: &NodeIdentity, version: u64, edit: impl FnOnce(&mut Policy)) -> SignedPolicy {
+    let mut s = Policy::new(root.node_id());
     s.version = StateVersion(version);
     s.issued = crate::clock::now_unix();
     s.not_after = i64::MAX;
     edit(&mut s);
-    s.sign(root).unwrap()
+    crate::testutil::signed_policy(root, s)
 }
 
-/// `who`'s membership under `root`, never expiring.
+/// `who`'s badge under `root`, never expiring.
 fn membership(root: &NodeIdentity, who: &NodeIdentity) -> Membership {
     Membership::mint(root, who.node_id(), 0, i64::MAX).unwrap()
 }
 
-/// `who`'s `Hello` under `root`: the state version it holds, and a fresh ID
+/// `who`'s `Hello` under `root`: the policy version it holds, and a fresh ID
 /// token from `idp` when it is signed in there.
 fn hello(root: &NodeIdentity, who: &NodeIdentity, version: u64, idp: Option<&MockIdp>) -> Hello {
     Hello {
@@ -131,9 +145,37 @@ fn hello(root: &NodeIdentity, who: &NodeIdentity, version: u64, idp: Option<&Moc
     }
 }
 
-/// Store `state` in `ks` as `wires/state` does; whether it was adopted.
-fn adopt(ks: &Keystore, root: &NodeIdentity, state: &SignedState) -> bool {
-    crate::state::store::adopt_if_newer(ks, state, root.node_id(), crate::clock::now_unix())
+/// `email` as `idp` verified it (the subject is the email).
+fn person(idp: &MockIdp, email: &str) -> library::Principal {
+    library::Principal {
+        issuer: idp.issuer.as_str().into(),
+        subject: email.into(),
+        email: Some(email.into()),
+        org: None,
+        groups: vec![],
+        not_after: i64::MAX,
+    }
+}
+
+/// Store in a caller's `ks` the view a directory would cut from `state`
+/// for `who` (card 37: a caller holds its view, not the policy).
+fn hold_view(
+    ks: &Keystore,
+    root: &NodeIdentity,
+    state: &SignedPolicy,
+    who: Option<&library::Principal>,
+) {
+    let held = crate::caller::view::HeldView::fetched(
+        state.view_for(who, None),
+        None,
+        crate::clock::now_unix(),
+    );
+    crate::caller::view::write(ks, root.node_id(), &held).unwrap();
+}
+
+/// Store `state` in `ks` as a fetch from a directory does; whether it was adopted.
+fn adopt(ks: &Keystore, root: &NodeIdentity, state: &SignedPolicy) -> bool {
+    crate::policy::store::adopt_if_newer(ks, state, root.node_id(), crate::clock::now_unix())
         .unwrap()
 }
 

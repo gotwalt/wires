@@ -17,11 +17,12 @@
 //!
 //! # Who may receive
 //!
-//! The host's **signed state** decides, asked **at send, at delivery and at
-//! fetch** ([`ServicesHost::decide_push`]): the recipient must be a member of
-//! the current state, in a registry role that `host.json`'s `push.allow`
-//! names (default: nobody). A removed member gets nothing: its queue is
-//! dropped (logged `denied`), and its fetch is refused.
+//! The host's **signed policy** decides, asked **at send, at delivery and at
+//! fetch** ([`ServicesHost::decide_push`]): the recipient must not be banned
+//! by the current policy, and must be in a registry role that `host.json`'s
+//! `push.allow` names (default: nobody). A removed (banned) node gets
+//! nothing: its queue is dropped (logged `denied`), and its fetch is
+//! refused. A fetch also presents the fetcher's badge, checked first.
 //!
 //! **The identity rule.** Every role needs the recipient's verified
 //! principal (there is no role that admits without one), and a host only knows
@@ -29,8 +30,8 @@
 //! `Hello`, or in an inbox fetch's `Hello` (`wires inbox` always sends the
 //! token `wires login` stored). So a caller who has logged in is reachable
 //! by role once it has called this host **or** run `wires inbox` since the
-//! host started; `--to <role>` names exactly those members. Nothing about
-//! identities is broadcast, so a host never learns of a member that has not
+//! host started; `--to <role>` names exactly those nodes. Nothing about
+//! identities is broadcast, so a host never learns of a node that has not
 //! spoken to it.
 //!
 //! # Delivery
@@ -103,7 +104,7 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// are; one more is answered "busy" and closed.
 pub(crate) const MAX_PREAUTH_FETCHES: usize = 64;
 
-/// How many long polls one member may hold open on a host at once.
+/// How many long polls one node may hold open on a host at once.
 pub(crate) const MAX_FETCHES_PER_NODE: usize = 2;
 
 /// The queue file under `$WIRES_HOME`.
@@ -112,7 +113,7 @@ pub(crate) const QUEUE_FILE: &str = "push-queue.json";
 /// What `wires push` asks the running host to send.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PushSpec {
-    /// A node id (64 hex) or a role name from the signed state.
+    /// A node id (64 hex) or a role name from the signed policy.
     pub(crate) to: String,
     /// One line.
     pub(crate) subject: Subject,
@@ -292,7 +293,7 @@ impl Queue {
 /// fetch side of the inbox ALPN. Shared (`Arc`) by the control socket's
 /// commands, the fetch handler and the expiry sweep.
 pub(crate) struct PushHost {
-    /// Who decides who may receive: the host's signed state.
+    /// Who decides who may receive: the host's signed policy.
     host: Arc<ServicesHost>,
     /// `push.log_body`.
     log_body: bool,
@@ -320,8 +321,8 @@ impl std::fmt::Debug for PushHost {
 }
 
 impl PushHost {
-    /// A push service for `host`: recipients are members of its signed
-    /// state in a registry role `push.allow` names.
+    /// A push service for `host`: recipients are nodes its signed policy
+    /// doesn't ban, in a registry role `push.allow` names.
     pub(crate) fn from_state(host: Arc<ServicesHost>) -> Self {
         let log_body = host.config.push.as_ref().is_some_and(|p| p.log_body);
         Self {
@@ -430,7 +431,7 @@ impl PushHost {
             .map(|(p, role)| (p, Some(role.as_str().to_string())))
     }
 
-    /// The recipients `to` names at `now`: a node id, or the members in that
+    /// The recipients `to` names at `now`: a node id, or the nodes in that
     /// role (those whose verified identity this host holds and the role
     /// admits).
     fn recipients(&self, to: &str, now: i64) -> Result<Vec<NodeId>> {
@@ -444,7 +445,7 @@ impl PushHost {
         let nodes = self.host.push_recipients(&role, now);
         if nodes.is_empty() {
             bail!(
-                "no member with a verified identity is in role {role} right now (a member's \
+                "no node with a verified identity is in role {role} right now (a node's \
                  identity reaches this host when it calls here or runs `wires inbox`)"
             );
         }
@@ -569,12 +570,12 @@ impl PushHost {
     /// Dial `to`'s receiver (a `wires inbox --wait` in progress) and hand it
     /// what is queued for it (one batch). Returns the ids it acknowledged,
     /// which leave the queue and are recorded `delivered`. Re-checks
-    /// authorization first: a recipient the signed state no longer holds
+    /// authorization first: a recipient the signed policy no longer holds
     /// loses its queue (recorded `denied`).
     async fn deliver_direct(&self, to: NodeId) -> Result<Vec<PushId>> {
         let now = crate::clock::now_unix();
         if let Err(refusal) = self.authorize(to, now) {
-            if let PushRefusal::NotAMember(reason) = &refusal {
+            if let PushRefusal::NotAdmitted(reason) = &refusal {
                 self.drop_queue(to, reason).await;
             }
             bail!("not delivering: {refusal}");
@@ -639,15 +640,17 @@ impl PushHost {
     /// Serve one fetch from `caller` over an accepted stream. See the module
     /// docs.
     ///
-    /// Before the caller is known to be a member, at most
+    /// Before the caller is known to be admitted, at most
     /// [`MAX_PREAUTH_FETCHES`] fetches are read at once and each opening
     /// frame is at most [`MAX_INBOX_HELLO`]. Membership is checked before
-    /// the ID token is verified; a peer that is not a member hears only
+    /// the ID token is verified (its badge, and the policy's bans); a peer
+    /// that is not admitted hears only
     /// [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED) and is traced, not
-    /// logged (its queue, if it had one as a member, is dropped and each
-    /// message's fate logged). A member's policy refusal is only answered:
-    /// `wires inbox` asks every host of the member's services, and a host it
-    /// may not hear from would otherwise log it on every poll. A member holds
+    /// logged (its queue, if it had one before it was banned, is dropped and
+    /// each message's fate logged). An admitted node's policy refusal is only
+    /// answered: `wires inbox` asks every host of the node's services, and a
+    /// host it may not hear from would otherwise log it on every poll. A node
+    /// holds
     /// at most [`MAX_FETCHES_PER_NODE`] long polls open.
     pub(crate) async fn serve_fetch<S, R>(
         &self,
@@ -697,10 +700,10 @@ impl PushHost {
             }
         };
         let now = crate::clock::now_unix();
-        let state = match self.host.state() {
+        let state = match self.host.policy() {
             Ok(state) => state,
             Err(e) => {
-                tracing::warn!("signed state unusable: {e:#}");
+                tracing::warn!("signed policy unusable: {e:#}");
                 deny(&mut send, HOST_MISCONFIGURED).await;
                 return Ok(());
             }
@@ -721,8 +724,8 @@ impl PushHost {
         }
         match self.authorize(caller, now) {
             Ok(_) => {}
-            Err(PushRefusal::NotAMember(reason)) => {
-                // Removed between the two reads of the state.
+            Err(PushRefusal::NotAdmitted(reason)) => {
+                // Removed between the two reads of the policy.
                 FETCH_STRANGERS.refused("inbox fetch", caller, &reason);
                 self.drop_queue(caller, &reason).await;
                 deny(&mut send, crate::host::gate::NOT_ADMITTED).await;
@@ -779,7 +782,7 @@ impl PushHost {
         Ok(())
     }
 
-    /// Drop everything queued for `node`, which the signed state no longer
+    /// Drop everything queued for `node`, which the signed policy no longer
     /// admits, logging each message's fate.
     async fn drop_queue(&self, node: NodeId, reason: &str) {
         for e in self.with_queue(|q| q.purge(node)) {
@@ -843,7 +846,7 @@ impl Drop for FetchSlot<'_> {
     }
 }
 
-/// Refusals of fetchers not known to be members (see
+/// Refusals of fetchers not known to be admitted (see
 /// [`Throttle`](transport::Throttle)).
 static FETCH_STRANGERS: transport::Throttle = transport::Throttle::new();
 
@@ -873,21 +876,20 @@ impl iroh::protocol::ProtocolHandler for PushFetch {
 /// `wires push --to <node|role> --subject S [--ttl D] [-- body…]`.
 #[derive(Args, Clone, Debug)]
 pub(crate) struct PushArgs {
-    /// Who receives it: a node id (a service's `$WIRES_CALLER_NODE` is its
-    /// caller's), or a role from the signed state (every member whose
-    /// verified identity this host holds and the role admits).
+    /// A node id (a service's `$WIRES_CALLER_NODE`), or a role in the policy.
+    // A role: every member whose verified identity this host holds and the
+    // role admits.
     #[arg(long)]
     pub(crate) to: String,
-    /// One line, recorded in the host's call log (the body is not, unless
-    /// host.json says `"push": {"log_body": true}`).
+    /// One line, recorded in the host's call log (the body only if host.json says).
+    // `"push": {"log_body": true}`.
     #[arg(long)]
     pub(crate) subject: String,
-    /// How long the host keeps it for a recipient that isn't listening
-    /// (e.g. `90m`, `2d`; default 24h, at most 7d).
+    /// How long to keep it for a recipient not listening (`90m`, `2d`; max 7d).
+    // Default 24h.
     #[arg(long)]
     pub(crate) ttl: Option<Ttl>,
-    /// The body. Read from stdin when none is given (and stdin isn't a
-    /// terminal).
+    /// The body; read from stdin when none is given (and stdin isn't a terminal).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub(crate) body: Vec<String>,
 }
@@ -1047,24 +1049,30 @@ mod tests {
         }
     }
 
-    /// A push host (4) of the network rooted at 1, whose state lists 2 as a
-    /// member, logging to an in-memory sink. (No service or role is needed:
-    /// these tests stop at membership, and `serve` isn't preflighted.)
+    /// A push host (4) of the network rooted at 1, whose policy bans 50–54,
+    /// logging to an in-memory sink. (No service or role is needed: these
+    /// tests stop at admission, and `serve` isn't preflighted.)
     fn push_host() -> (Arc<PushHost>, mpsc::Receiver<AuditRecord>) {
         use crate::admin::keystore::Keystore;
-        use library::{Membership, State, StateVersion};
+        use library::{Membership, Policy, StateVersion};
         let root = NodeIdentity::from_seed([1u8; 32]);
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);
-        let mut s = State::new(root.node_id());
+        let mut s = Policy::new(root.node_id());
         s.version = StateVersion(1);
         s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
-        s.members.extend([node(4), node(2)]);
-        s.hosts.insert(node(4));
-        let signed = s.sign(&root).unwrap();
-        crate::state::store::adopt_if_newer(&ks, &signed, root.node_id(), crate::clock::now_unix())
-            .unwrap();
+        for seed in 50..55u8 {
+            s.ban(node(seed), i64::MAX);
+        }
+        let signed = crate::testutil::signed_policy(&root, s);
+        crate::policy::store::adopt_if_newer(
+            &ks,
+            &signed,
+            root.node_id(),
+            crate::clock::now_unix(),
+        )
+        .unwrap();
         let config = crate::host::config::HostConfig::parse(
             r#"{"version":2,"services":{"t":{"command":["true"]}},"push":{"allow":["analyst"]}}"#,
         )
@@ -1093,16 +1101,19 @@ mod tests {
         }
     }
 
-    /// A fetch from a key the state doesn't list hears the fixed sentence,
-    /// has its token left unverified, and leaves nothing in the call log.
+    /// A fetch from a banned key (50–54: a genuine badge), or with another
+    /// network's badge (55–59), hears the fixed sentence, has its token left
+    /// unverified, and leaves nothing in the call log.
     #[tokio::test]
-    async fn a_non_member_fetch_is_refused_unlogged_and_unverified() {
+    async fn a_banned_or_badgeless_fetch_is_refused_unlogged_and_unverified() {
         let (push, mut records) = push_host();
         let root = NodeIdentity::from_seed([1u8; 32]);
+        let rogue = NodeIdentity::from_seed([66u8; 32]);
         for seed in 50..60u8 {
             let who = node(seed);
+            let issuer = if seed < 55 { &root } else { &rogue };
             let mut bytes = InboxFrame::Hello {
-                membership: library::Membership::mint(&root, who, 0, i64::MAX).unwrap(),
+                membership: library::Membership::mint(issuer, who, 0, i64::MAX).unwrap(),
                 id_token: Some(library::IdToken::new(
                     "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIn0.",
                 )),
@@ -1115,6 +1126,44 @@ mod tests {
         }
         assert!(push.host.identities.nodes().is_empty());
         assert!(records.try_recv().is_err(), "a stranger's fetch was logged");
+    }
+
+    /// Card 35: a push to a banned node is refused at send (recorded
+    /// `denied`, naming the ban), and nothing is queued for it.
+    #[tokio::test]
+    async fn a_push_to_a_banned_node_is_denied() {
+        let (push, mut records) = push_host();
+        let banned = node(50);
+        let report = push
+            .send(PushSpec {
+                to: banned.hex(),
+                subject: Subject::new("s").unwrap(),
+                body: PushBody::new("b").unwrap(),
+                ttl_secs: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.results.len(), 1);
+        let r = &report.results[0];
+        assert_eq!(r.outcome, PushOutcome::Denied);
+        assert!(
+            r.reason.as_deref().unwrap_or_default().contains("banned"),
+            "{r:?}"
+        );
+        assert!(
+            push.queue
+                .lock()
+                .unwrap()
+                .pending(banned, now_ms(), MAX_BATCH)
+                .is_empty()
+        );
+        assert!(matches!(
+            records.try_recv(),
+            Ok(AuditRecord::Push {
+                outcome: PushOutcome::Denied,
+                ..
+            })
+        ));
     }
 
     /// An inbox `hello` whose prefix claims more than `MAX_INBOX_HELLO` is

@@ -1,0 +1,4 @@
+instructions:
+wires is a network for authenticated remote CLI calls. Each service is a command-line program on another machine, run by its name, never by host or address. Every call runs as you: your sign-in is checked against an admin-signed list of who may call what, and the machine that runs it records the call. A refusal ("denied by host", exit 77) is that policy, not a fault: don't retry or work around it; ask your admin for access. Each tool is one service you may call (past a few dozen, find one with `search_services` and run it with `call_service`). Pass its arguments as `args`, one string per argument, no shell quoting. There is no shell: filter output with the program's own flags or the `jq`/`head`/`max_bytes` fields.
+
+search_services / call_service: A refusal (`denied by host`) is policy, not a fault: don't retry; ask your admin.

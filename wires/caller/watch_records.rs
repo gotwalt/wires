@@ -1,13 +1,14 @@
 //! `wires watch [<service>…] [--mine] [--json]` (card 26b): stream call
 //! records from the hosts that hold them.
 //!
-//! The service's hosts come from the signed state; the reader never names a
+//! The service's hosts come from its entry in the reader's view (card 37: the
+//! services it may read, or call for its own records); it never names a
 //! host. Each host is dialed by key on the record-stream ALPN
 //! ([`record_stream`]) with the same credentials
 //! a call presents, and answers with what this reader may see: every record
 //! of a service whose `readers` roles it is in, otherwise only its own calls
 //! (`--mine` asks for only those everywhere). With no service named, every
-//! service in the signed state is asked for.
+//! service in the view is asked for.
 //!
 //! Every entry is checked as it arrives ([`Chain`]): the host's signature,
 //! and the hash link to the entry before it, across the runs of entries the
@@ -33,7 +34,7 @@
 //!
 //! The backlog from every host is merged by time and printed first; then,
 //! unless `--once`, new records as they are logged. A host that re-decides a
-//! following reader's access (a new signed state, an expired token) may end
+//! following reader's access (a new signed policy, an expired token) may end
 //! the stream with a refusal, which is printed like any other.
 //!
 //! ```text
@@ -61,7 +62,6 @@ use crate::caller::one_line;
 use crate::caller::pick::{self, Hints};
 use crate::host::record_stream::{self, Link, RecordFrame, StreamItem};
 use crate::host::transport;
-use crate::state::store;
 
 /// The keystore file holding the reader's marks: per host, its chain anchor,
 /// a resume point per view, and recent calls' labels ([`Marks`]).
@@ -73,30 +73,30 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// `wires watch [<service>…] [--mine] [--json] [--once]`.
 #[derive(Args, Clone, Debug, Default)]
 pub(crate) struct WatchArgs {
-    /// The services to watch (default: every service in the signed state).
+    /// The services to watch (default: every service you may call or read).
     #[arg(value_name = "SERVICE")]
     pub(crate) services: Vec<String>,
-    /// Only your own calls, even for services whose records you may read.
+    /// Only your own calls, even where you may read everyone's.
     #[arg(long)]
     pub(crate) mine: bool,
-    /// One JSON object per record: `{service, host, seq, entry}` (the entry
-    /// is the host-signed log entry, verifiable on its own; `service` is
-    /// derived by this reader from signed records, not supplied by the host).
+    /// One JSON object per record: `{service, host, seq, entry}`.
+    // The entry is the host-signed log entry, verifiable on its own;
+    // `service` is derived by this reader from signed records, not supplied
+    // by the host.
     #[arg(long)]
     pub(crate) json: bool,
-    /// Print what is there (after your last mark) and exit, instead of
-    /// following.
+    /// Print what is there (after your last mark) and exit; don't follow.
     #[arg(long)]
     pub(crate) once: bool,
     /// Dial through this relay instead of the n0 default.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub(crate) relay_url: Option<String>,
 }
 
 /// What a watch asks for.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WatchOpts {
-    /// The services (empty: every service in the signed state).
+    /// The services (empty: every service in the view).
     pub(crate) services: Vec<ServiceName>,
     /// Only the reader's own calls.
     pub(crate) mine: bool,
@@ -576,14 +576,17 @@ pub(crate) async fn watch_with(
     opts: &WatchOpts,
     out: &mut (dyn FnMut(Output) + Send),
 ) -> Result<Report> {
-    let (membership, state) = store::require(ks)?;
-    let state = &state.state;
+    // Card 37: the services come from this node's view: those it may read
+    // (every record) or call (its own records).
+    let membership = ks.read_membership()?.context(crate::help::NOT_JOINED)?;
+    let held = crate::caller::services::current_view(ks).await?;
+    let view = &held.view;
     let services: Vec<ServiceName> = if opts.services.is_empty() {
-        state.services.keys().cloned().collect()
+        view.entries.iter().map(|e| e.entry.name.clone()).collect()
     } else {
         for s in &opts.services {
-            if state.service(s).is_none() {
-                bail!("no service named `{s}` (see `wires services`)");
+            if view.entry(s).is_none() {
+                bail!("no service named `{s}` in your view (see `wires services`)");
             }
         }
         opts.services.clone()
@@ -591,7 +594,7 @@ pub(crate) async fn watch_with(
     let hello = crate::caller::hello::with_membership(ks, membership);
     let mut marks = Marks::load(ks);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let hosts = pick::hosts_of(state, services.iter());
+    let hosts = pick::hosts_of(view, services.iter());
     let mut report = Report {
         hosts: hosts.len(),
         ..Report::default()
@@ -602,7 +605,10 @@ pub(crate) async fn watch_with(
     for host in &hosts {
         let here: Vec<ServiceName> = services
             .iter()
-            .filter(|s| state.assigns(s, *host))
+            .filter(|s| {
+                view.entry(s)
+                    .is_some_and(|e| e.entry.service.hosts.contains(host))
+            })
             .cloned()
             .collect();
         let view = Marks::view(&here, opts.mine);
@@ -704,12 +710,15 @@ pub(crate) async fn watch_with(
                 report.broken.push((host, why));
             }
             Event::Refused(_, reason) => {
-                out(Output::Alarm(format!("host {short}: {reason}")));
+                out(Output::Alarm(format!(
+                    "host {short} refused: {reason}{}",
+                    crate::help::refusal_step(&reason)
+                )));
                 report.refused.push((host, reason));
             }
             Event::Failed(_, e) => {
                 out(Output::Alarm(format!(
-                    "host {short} could not be read: {e}"
+                    "host {short} could not be read: {e}; try again later"
                 )));
                 report.failed.push((host, e));
             }

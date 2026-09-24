@@ -1,0 +1,9 @@
+Re-publish the stored signed policy to every directory
+
+Usage: wires policy push
+
+Options:
+  -h, --help  Print help
+
+Example:
+  wires policy push

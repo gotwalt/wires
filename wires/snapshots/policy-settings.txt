@@ -1,0 +1,27 @@
+Print the network's settings, or change them and publish
+
+Usage: wires policy settings [OPTIONS]
+
+Options:
+      --freshness <FRESHNESS>
+          When no directory has vouched for a host's policy lately: keep deciding, or refuse
+
+          Possible values:
+          - lenient: Keep deciding under the held policy until it expires
+          - strict:  Refuse calls until a directory vouches again
+
+      --beat-secs <BEAT_SECS>
+          How often each directory signs a new freshness timestamp, in seconds
+
+      --fresh-secs <FRESH_SECS>
+          How long each freshness timestamp is good for, in seconds (at least the beat)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+      --help-all
+          Also list the operator and credential flags
+
+Examples:
+  wires policy settings
+  wires policy settings --freshness strict --beat-secs 60

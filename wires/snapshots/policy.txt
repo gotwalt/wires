@@ -1,0 +1,15 @@
+Re-publish the signed policy (push), or print or change its settings
+
+Usage: wires policy <COMMAND>
+
+Commands:
+  push      Re-publish the stored signed policy to every directory
+  settings  Print the network's settings, or change them and publish
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+Examples:
+  wires policy push
+  wires policy settings --freshness strict

@@ -1,6 +1,6 @@
 # Wires — Executive Summary
 
-*2026-09-23. Details: [README](../README.md) · board: [docs/board](board/README.md).*
+*2026-09-24. Details: [README](../README.md) · board: [docs/board](board/README.md).*
 
 ## The problem
 
@@ -19,14 +19,14 @@ Three things organizations are now asking for sit in that gap:
 
 > **Run a CLI on another machine from your agent, by service name. The machine is reached by public key, never by network path; the caller is authenticated by your IdP and checked against an admin-signed list of who may call what; and the machine that ran each call keeps a signed record of it that the people you name can read, without access to the caller or the machine.**
 
-There are four roles, each with a few commands:
+There are four roles, each with a few commands, plus the directory, a mode a host (or a machine of its own) runs:
 
-- **Admin** (`init`, `invite`, `remove`, `role`, `service`, `state push`): signs one versioned document that says who's in, which roles exist (matched on IdP identity), which services exist, which hosts run each one, and who may call and read each. It is pushed to the hosts by key; other machines pull it from a host.
-- **Host** (`wires serve host.json`): implements the services assigned to it. One file says how each runs, which identity providers it trusts, and any stricter local rule; it checks every call against the signed list.
-- **Caller** (`id`, `join`, `login`, `services`, `call`, `mcp`, `gateway`, `inbox`): the agent, or the MCP client it runs in. `wires login` binds the person's IdP sign-in (Google in the demo; any OIDC issuer via `--issuer`) to the agent's key once. `wires services` shows only the services that person may call; the caller never names a machine, and a service can have several hosts.
-- **Reader** (`watch`): a member the admin allows to read a service's records sees every call and every member's refusal from the hosts' own logs, in full (arguments, the first 4 KiB of stdin, exit codes), for logging and compliance, holding neither end's credentials. Everyone else sees only the calls made as them: their verified identity, from any of their machines. Agents working for different people can't see each other's work.
+- **Admin** (`init`, `invite`, `remove`, `issuer`, `role`, `service`, `directory`, `policy push`): mints each machine's badge (what admits it) and signs one versioned policy that says which identity providers are trusted, which roles exist (matched on IdP identity), which services exist, which hosts run each one, who may call and read each, and which machines are banned. It is published by key to one or more directory machines (often a host doubles as one). Hosts hold all of it and follow its changes from a directory within seconds; each caller gets from a directory only its view, the services its person may use.
+- **Host** (`wires serve host.json`): implements the services assigned to it. One file says how each runs and any stricter local rule (it can narrow the trusted identity providers, never add one); it checks every call against the signed list.
+- **Caller** (`id`, `join`, `login`, `services`, `call`, `mcp`, `gateway`, `inbox`): the agent, or the MCP client it runs in. `wires login` binds the person's IdP sign-in (Google in the demo; any OIDC issuer the admin trusts, and the invite names it) to the agent's key once. `wires services` shows only the services that person may call; the caller never names a machine, and a service can have several hosts.
+- **Reader** (`watch`): a person the admin allows to read a service's records sees every call and every refusal of an admitted caller from the hosts' own logs, in full (arguments, the first 4 KiB of stdin, exit codes), for logging and compliance, holding neither end's credentials. Everyone else sees only the calls made as them: their verified identity, from any of their machines. Agents working for different people can't see each other's work.
 
-**Two ways in, both first-class.** `wires call` is the CLI path and the efficient one (the measured savings below come from it). MCP is the other, so people can use wires in the clients where they already use remote tool calling: `wires mcp` over stdio, and `wires gateway` as a remote MCP server that Claude.ai connects to (MCP 2026-07-28 plus older clients). Each web user signs in with Google through the gateway, and every call carries that person's own token, so the host still verifies the IdP itself, admits them only through roles that match their identity, and records them as the verified principal of the call. Users keep their clients; the operator stands the gateway up once (an OAuth client, TLS in front, and that client's id trusted on each host).
+**Two ways in, both first-class.** `wires call` is the CLI path and the efficient one (the measured savings below come from it). MCP is the other, so people can use wires in the clients where they already use remote tool calling: `wires mcp` over stdio, and `wires gateway` as a remote MCP server that Claude.ai connects to (MCP 2026-07-28 plus older clients). Each web user signs in with Google through the gateway, and every call carries that person's own token, so the host still verifies the IdP itself, admits them only through roles that match their identity, and records them as the verified principal of the call. Users keep their clients; the operator stands the gateway up once (an OAuth client, TLS in front, and that client's id trusted in the signed policy).
 
 ## What's been demonstrated (two machines, 2026-09-23)
 
@@ -63,14 +63,15 @@ Checking an inbox on a loop costs exactly what polling costs; the saving comes o
 
 - **Reached by key.** Tailscale-style networks give the agent's machine a route to the host; Wires gives a route to the services a signed list lets the caller call, and nothing else.
 - **Identity is the IdP's own signature**, tied to the agent's key and checked by the host. No Wires-run identity service exists to trust.
-- **One signed list, checked locally.** Who's in, the roles and the services are one admin-signed document every machine holds. Hosts decide each call from it with no auth server; callers list what they may call from it. Only the admin can bind a service name to a host.
+- **One signed list, checked locally.** The roles, the services and the bans are one admin-signed document the hosts hold; each machine's own root-signed badge says it is in. Hosts decide each call from it with no auth server. An agent's machine holds only its view: the services its person may use, each signed by the admin, so it learns no other service, role or ban. Only the admin can bind a service name to a host.
 - **The host writes the log**, signed and hash-linked, so the agent can't forge it, and a reader the admin names needs nothing from either end. Nothing is broadcast: a record's content leaves a host only when a reader allowed to see it asks (anyone else asking gets hash links).
 - **A sandbox that allows only `wires`** gives CLI efficiency with a permission surface as narrow as MCP's. We tested this: a permission rule alone isn't airtight (the agent can still run `cat`, read files, and pass `wires`' own override flags), so `WIRES_LOCKED=1` makes `wires` refuse those flags itself.
 
 ## Honest limits
 
 - **Joining an organization is still a hand-issued invite.** Joining by domain ("`wires join acmecorp.com`") is an open question, not yet designed.
-- **Every member holds the whole signed list** (member keys, role matchers, service names): the org chart, growing with the number of members. The redesign is agreed and next: machine badges, and directory nodes that give each host and caller only its own part ([fabric.md](fabric.md); cards 35–37), then day-passes for headless agents (card 29).
+- **Hosts and directories hold the whole signed list** (role matchers, service names, host and banned keys; there is no member list). An agent's machine holds only its view, but a directory sees which person asks for which view. Next: day-passes for headless agents (card 29).
+- **A directory must be up to join, change the policy, spread a ban or list services.** Calls don't need one: each host decides from its own copy.
 - **Callbacks only to the agent and person that made the call**, and an `inbox` tool for MCP clients: designed, parked ([card 31](board/backlog/31-inbox-delivery.md)).
 - **A host can withhold or truncate its own log.** Tampering and gaps are detectable only against a copy a reader holds.
 

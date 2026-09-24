@@ -11,7 +11,7 @@
 //!   caller and is logged under the call; another node, a role and the
 //!   operator's request form are refused; the operator's own socket still
 //!   pushes to a role.
-//! - [`a_rolled_back_state_is_refused`]: a state older than one the host
+//! - [`a_rolled_back_state_is_refused`]: a policy older than one the host
 //!   already decided under, copied back onto disk, decides nothing.
 
 use std::collections::BTreeMap;
@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use iroh::EndpointAddr;
 use iroh::protocol::Router;
-use library::{AuditRecord, CallId, Hello, NodeIdentity, PushBody, Service, SignedState, Subject};
+use library::{AuditRecord, CallId, Hello, NodeIdentity, PushBody, Service, SignedPolicy, Subject};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -56,16 +56,9 @@ impl World {
         }
     }
 
-    /// Everyone a member; role `analyst` = alice; service `env` (analyst) on
-    /// the host.
-    fn state(&self, version: u64) -> SignedState {
+    /// Role `analyst` = alice; service `env` (analyst) on the host.
+    fn state(&self, version: u64) -> SignedPolicy {
         signed_state(&self.root, version, |s| {
-            s.members.extend([
-                self.alice.node_id(),
-                self.bob.node_id(),
-                self.host.node_id(),
-            ]);
-            s.hosts.insert(self.host.node_id());
             s.roles.insert(
                 role("analyst"),
                 vec![email_at(&self.idp, "alice@example.com")],
@@ -128,7 +121,7 @@ impl Host {
         tokio::spawn(Arc::clone(&push).run(commands));
         let endpoint = bind(&w.host).await;
         let addr = endpoint_addr(&w.host.node_id(), &localhost_socks(&endpoint), None).unwrap();
-        let router = services_router(endpoint, host, Some(push));
+        let router = services_router(endpoint, host, Some(push), None);
         Host {
             _router: router,
             _sockets: sockets,
@@ -314,8 +307,12 @@ async fn a_rolled_back_state_is_refused() {
     assert!(adopt(&ks, &w.root, &w.state(2)));
     call_env(&w, &w.alice, &host).await.unwrap();
     // Version 1 copied back over version 2: it verifies, and is refused.
-    let old = w.state(1).encode().unwrap();
-    std::fs::write(ks.path(crate::state::store::STATE_FILE), format!("{old}\n")).unwrap();
+    let old = serde_json::to_string(&w.state(1)).unwrap();
+    std::fs::write(
+        ks.path(crate::policy::store::POLICY_FILE),
+        format!("{old}\n"),
+    )
+    .unwrap();
     let refused = call_env(&w, &w.alice, &host).await.unwrap_err();
     assert_eq!(refused, "host configuration error");
 }

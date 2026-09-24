@@ -1,0 +1,14 @@
+Trust an IdP: set, rm
+
+Usage: wires issuer <COMMAND>
+
+Commands:
+  set   Trust an IdP (or change one), and publish
+  rm    Stop trusting an IdP no role names any more, and publish
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+Example:
+  wires issuer set https://accounts.google.com --client-id <client id>

@@ -1,0 +1,15 @@
+Sign in with your IdP, binding your identity to this node's key
+
+Usage: wires login [OPTIONS]
+
+Options:
+      --refresh                        Renew with the stored refresh token; the browser only if that fails
+      --reuse                          Re-check the stored ID token; don't sign in
+      --no-browser                     Print the sign-in URL; don't open a browser
+      --callback-port <CALLBACK_PORT>  Fixed loopback port for the redirect (for `ssh -L` to a remote browser)
+  -h, --help                           Print help
+      --help-all                       Also list the operator and credential flags
+
+Examples:
+  wires login
+  wires login --no-browser    # prints the URL to open elsewhere

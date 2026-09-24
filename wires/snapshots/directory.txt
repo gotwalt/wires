@@ -1,0 +1,16 @@
+Name the network's directories (add, rm), or run this node's (serve)
+
+Usage: wires directory <COMMAND>
+
+Commands:
+  serve  Run this node's directory alone (no host.json) until Ctrl-C
+  add    Admin: list a node as one of the network's directories, and publish
+  rm     Admin: stop listing a node as a directory, and publish
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+Examples:
+  wires directory add workbench
+  wires directory serve

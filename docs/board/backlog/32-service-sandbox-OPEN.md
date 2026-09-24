@@ -9,7 +9,7 @@ Card 28 §1 stopped *handing* a service's child process the host's keystore
 operator socket). But the child still runs as the host's own OS user, so a
 caller who can steer the service's CLI into reading files can still read
 `~/.config/wires/node.seed` (sign the host's call log, impersonate the host),
-`jwks/`, `state.json` and the push queue. Today's answer is advice: run
+`jwks/`, `policy.json` and the push queue. Today's answer is advice: run
 services as a separate Unix user (deployment.md, usage.md, protocol.md §5).
 
 ## The direction

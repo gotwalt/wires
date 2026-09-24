@@ -36,9 +36,10 @@ a network path.
   being run has no auth code.
 - **Discovery by who you are.** An admin signs one registry: the services,
   the machines that run each, and the roles (matched on IdP identity, e.g.
-  `*@acme.com`) that may call each. `wires services` shows an agent only what
-  its person may call. The agent never names a machine, and a service with
-  two hosts keeps answering when one is down.
+  `*@acme.com`) that may call each. An agent's machine holds only its view,
+  the services its person may use, and `wires services` lists them. The
+  agent never names a machine, and a service with two hosts keeps answering
+  when one is down.
 - **Both directions.** The agent calls the host, and the host can message
   the agent later ("build 41 failed"), addressed by the agent's key, even
   when the agent isn't connected. A service does it with a push capability
@@ -69,12 +70,14 @@ machine over loopback, signing in through a mock IdP, not the two-machine run
 ## A quick tour
 
 ```console
-# admin: one signed registry, pushed to the hosts by key
-admin$ wires init
+# admin: one signed registry, published by key to a directory
+admin$ wires init --client-id <your Google OAuth client id>
 admin$ wires role set analyst '*@acme.com'
 admin$ wires invite <node-id> --name workbench     # and one per machine
+admin$ wires directory add workbench               # workbench also serves the registry to the others
 admin$ wires service add orders-db --description "Read-only SQL over orders" \
          --allow analyst --host workbench
+admin$ wires invite <node-id> --name workbench     # a fresh token that carries the registry
 
 # host: how it runs the services the registry gives it
 workbench$ wires join <token>
@@ -82,7 +85,7 @@ workbench$ wires serve host.json
 
 # agent: sign in once, then call by name
 agent$ wires join <token>
-agent$ wires login                  # browser sign-in; client id from $WIRES_OIDC_CLIENT_ID
+agent$ wires login                  # browser sign-in; the invite named the IdP
 agent$ wires services
 orders-db  Read-only SQL over orders  (analyst)
 agent$ wires call orders-db -- "select count(*) from orders"
@@ -100,10 +103,12 @@ agent$ wires inbox --wait
 The same services work from MCP clients: `wires mcp` in a stdio MCP config,
 or `https://<gateway>/mcp` as a Claude.ai connector
 ([docs/deployment.md § A web gateway](docs/deployment.md#a-web-gateway)).
-`wires remove <name>` pushes a new list to the hosts, and each host that
-has it refuses the member's next call, with nothing to restart and no shared
-key to rotate. An edit that reaches no host fails loudly, and `wires state
-push` re-sends it.
+`wires remove <name>` publishes a ban to the directories; every host follows
+one, has the ban within seconds, and refuses that node's next call, with
+nothing to restart and no shared key to rotate. An edit that reaches no
+directory fails loudly, and `wires policy push` re-sends it. (The first two
+edits above report exactly that: workbench isn't running yet, and its second
+token brings them.)
 
 ## wires and a remote MCP server
 
@@ -118,7 +123,7 @@ wires covers only MCP's tools; it has no prompts or resources.
 | **Finding tools** | A configured URL or command per server; `tools/list` may vary with the caller's authorization. The public [MCP Registry](https://modelcontextprotocol.io/registry/about) (preview) lists public servers, not per user. | `wires services`: every service, across all hosts, that the signed registry lets this identity call. |
 | **Server → agent** | Over a stream the client opened and holds: a request's response, or `subscriptions/listen` (task status arrives there as `notifications/tasks`; polling `tasks/get` is the default). Reaching a client that isn't connected is [working-group](https://modelcontextprotocol.io/community/triggers-events/charter) work, not in the spec. | The host dials the agent's key, or keeps the message (24 h by default) for its next `wires inbox`, so it works after the call has ended. `wires inbox --wait` blocks until one lands. |
 | **Network** | stdio (a local subprocess) or Streamable HTTP (the server listens at a URL the client can reach). | Both sides dial out, by key, over QUIC (iroh), directly or through a relay. No inbound firewall rule on either side, and no TCP listener on the host (`wires login` binds a loopback port for the browser redirect; the optional web gateway listens over HTTPS). |
-| **Record of calls** | No audit format; clients SHOULD log tool usage, and trace context can be propagated to OpenTelemetry. | The host signs a hash-linked record of every call and every member's refusal; the registry's readers stream it with `wires watch`, and each caller sees its own person's records. |
+| **Record of calls** | No audit format; clients SHOULD log tool usage, and trace context can be propagated to OpenTelemetry. | The host signs a hash-linked record of every call and every refusal of an admitted caller; the registry's readers stream it with `wires watch`, and each caller sees its own person's records. |
 
 ## Measured
 
@@ -145,12 +150,16 @@ Waiting on a mock CI build, 5 runs per setup ([bench/push/REPORT.md](bench/push/
 
 It's a prototype (see the note at the top). The main limits:
 
-- Every member holds the whole signed registry (every member's key, every
-  role's matchers, every service), and it grows with the number of members.
-  The redesign moves the registry to directory nodes, so each machine holds
-  only what it uses ([docs/fabric.md](docs/fabric.md), cards 35–37).
-- Memberships and the registry expire (30 days by default) and don't renew
-  on their own yet.
+- An agent's machine holds only its view: the services its person may use,
+  each signed by the admin. But the hosts and directories hold the whole
+  signed registry (every role's matchers, every service and its hosts, every
+  ban; no member list), and a directory sees who asks for which view
+  ([docs/fabric.md](docs/fabric.md)).
+- A network needs a directory running (on a host, or on its own) for
+  joining, edits, bans and discovery; calls don't, since each host decides
+  from its own copy.
+- Badges (30 days) and the registry (90 days by default) expire and don't
+  renew on their own yet.
 - A host can withhold or truncate its own log; tampering and gaps are
   detectable only against a copy a reader already holds.
 - Only Google has been tested as the IdP. The web gateway is the one piece

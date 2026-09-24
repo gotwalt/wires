@@ -1,0 +1,13 @@
+Remove an alias by name
+
+Usage: wires tools rm [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  The alias to remove
+
+Options:
+      --tools-file <TOOLS_FILE>  Use this file instead of `$WIRES_HOME/tools.json`
+  -h, --help                     Print help
+
+Example:
+  wires tools rm db-pinned

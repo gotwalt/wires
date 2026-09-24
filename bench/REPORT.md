@@ -240,6 +240,6 @@ python3 bench/permission-probe.py --out /tmp/probe.jsonl   # docs/agent-sandbox.
 Needs `claude` logged in, `gh` logged in, docker, and python3. The token is
 read at runtime with `gh auth token`, passed to the container through the
 environment, and never written anywhere. Raw transcripts go to a temp dir
-outside the repo (`BENCH_RAW` overrides). wires state lives in
+outside the repo (`BENCH_RAW` overrides). The wires keystores live in
 `/tmp/wb16`, which stays short because of macOS's 104-byte socket-path limit
 (`BENCH_WIRES_DIR` overrides).

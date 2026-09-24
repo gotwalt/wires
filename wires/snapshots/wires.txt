@@ -1,0 +1,24 @@
+wires is a network for authenticated remote CLI calls. Each service is a
+command-line program on another machine, run by its name, never by host or
+address. Every call runs as you: your sign-in is checked against an
+admin-signed list of who may call what, and the machine that runs it records
+the call. A refusal ("denied by host", exit 77) is that policy, not a fault:
+don't retry or work around it; ask your admin for access.
+`wires services` lists what you may call; `wires call <service> -- <args>` runs one.
+
+Usage: wires <COMMAND>
+
+  services  List the services you may call (a word searches them; --json)
+  call      Run a service by name; its output and exit code are yours
+  login     Sign in with your IdP; every call needs it
+  join      Install the invite token your admin sent
+  id        Print this node's id, to send your admin for an invite
+  watch     Stream the call records you may read
+  inbox     Print the messages hosts pushed to you
+  mcp       Serve the services you may call as MCP tools over stdio
+
+Examples:
+  wires services orders
+  wires call orders-db -- "select count(*) from orders"
+
+Admin, host and directory commands: wires --help-all

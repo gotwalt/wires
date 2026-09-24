@@ -2,10 +2,10 @@
 //!
 //! It holds the operator's locked-mode switch ([`crate::caller::lock`]) and,
 //! optionally, **aliases**: a local name pinned to one host, by node id plus
-//! optional address hints and relay. Services from the signed state are the
+//! optional address hints and relay. Services from the signed policy are the
 //! usual way to call (`wires services`); an alias is for pinning a service to
 //! one host by hand. Either way the session opens with the same `Hello`, and
-//! the host decides by its signed state (the alias's `remote_tool` is the
+//! the host decides by its signed policy (the alias's `remote_tool` is the
 //! service name it asks for). Shared by `wires call` and `wires mcp`.
 //!
 //! ```json
@@ -52,14 +52,14 @@ pub enum ToolTarget {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         addrs: Vec<SocketAddr>,
     },
-    /// A service in this node's signed state (card 27): the host is picked
+    /// A service in this node's signed policy (card 27): the host is picked
     /// at call time, never pinned. Built by `wires mcp`, not written to
     /// `tools.json` by any command.
     Service,
 }
 
 /// One name the caller can call: a `tools.json` alias, or (built by `wires
-/// mcp`) a service from the signed state.
+/// mcp`) a service from the signed policy.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct RemoteTool {
     /// The local name (`wires call <name>`, and the MCP tool name).
@@ -193,16 +193,21 @@ pub struct ToolsArgs {
     pub cmd: ToolsCmd,
 }
 
-/// The `wires tools` alias operations (optional: the signed state's services
+/// The `wires tools` alias operations (optional: the signed policy's services
 /// are the directory; an alias pins a name to one host by hand).
 #[derive(Subcommand)]
 pub enum ToolsCmd {
-    /// Add an alias: a service pinned to one host by its node id.
+    /// Add an alias: a service pinned to one host by its node id
+    #[command(
+        after_help = "Example:\n  wires tools add db-pinned --node <host node id> --description \"Orders, on one host\" --remote-tool orders-db"
+    )]
     Add(ToolsAddArgs),
-    /// List the aliases in `tools.json`, one per line, then a `#` line on
-    /// how to call and filter them.
+    /// List the aliases in `tools.json`, one per line
+    // Then a `#` line on how to call and filter them.
+    #[command(after_help = "Example:\n  wires tools list")]
     List,
-    /// Remove an alias by name.
+    /// Remove an alias by name
+    #[command(after_help = "Example:\n  wires tools rm db-pinned")]
     Rm {
         /// The alias to remove.
         name: String,

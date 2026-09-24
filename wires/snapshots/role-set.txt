@@ -1,0 +1,16 @@
+Define (or replace) a role as an OR of matchers, and publish
+
+Usage: wires role set [OPTIONS] <NAME> <MATCHERS>...
+
+Arguments:
+  <NAME>         The role's name
+  <MATCHERS>...  `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…`
+
+Options:
+      --issuer <ISSUER>  The IdP a matcher trusts when it names none: its exact `iss` [default: https://accounts.google.com]
+  -h, --help             Print help
+      --help-all         Also list the operator and credential flags
+
+Examples:
+  wires role set analyst --issuer https://accounts.google.com '*@example.com'
+  wires role set sre 'issuer=https://idp.example.com,group=sre'

@@ -7,16 +7,15 @@
 //! - `node.seed` / `root.seed`: hex-encoded 32-byte Ed25519 seeds (mode `0600`).
 //! - `membership.json`: the dialer's membership token (mode `0644` — a
 //!   *public* signed credential, not a secret).
-//! - `names.json`: the admin's local labels for members (mode `0600`).
-//! - `state.json`, `state-admin.txt`, `state-checked.txt`: the admin-signed
-//!   state, where to pull it from, and when it was last checked
-//!   ([`crate::state::store`]).
+//! - `issued.json`: the admin's ledger of the badges it minted, with their
+//!   labels (mode `0600`; [`super::ledger`]).
+//! - `policy.json`: the admin-signed policy ([`crate::policy::store`]);
+//!   `directory.redb` on a directory node ([`crate::directory::db`]).
 //!
 //! The resolver helpers ([`node_identity`], [`membership`])
 //! encode the precedence the CLI uses: an inline flag wins, then the matching
 //! environment variable, then an explicit `--…-file` path, then the keystore.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -109,29 +108,6 @@ impl Keystore {
         write_text_mode(&path, &membership.encode()?, Some(0o644))?;
         Ok(path)
     }
-
-    /// The admin's local labels for members (`names.json`: name → node id).
-    /// Labels, not identity: nothing but `wires remove <name>` reads them.
-    /// Empty when absent.
-    pub fn read_names(&self) -> Result<BTreeMap<String, NodeId>> {
-        let path = self.path("names.json");
-        match read_to_string_opt(&path)? {
-            Some(text) => {
-                serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
-            }
-            None => Ok(BTreeMap::new()),
-        }
-    }
-
-    /// Persist the admin's member labels (`names.json`, mode `0600` — the
-    /// names say who is in).
-    pub fn save_names(&self, names: &BTreeMap<String, NodeId>) -> Result<PathBuf> {
-        create_private_dir(&self.dir)?;
-        let path = self.path("names.json");
-        let json = serde_json::to_string_pretty(names).context("encoding names.json")?;
-        write_text_mode(&path, &json, Some(0o600))?;
-        Ok(path)
-    }
 }
 
 /// Resolve a node identity for `serve` / `call`: an inline `--node-seed`
@@ -154,8 +130,8 @@ pub fn node_identity(inline: Option<&str>, file: Option<&Path>) -> Result<NodeId
     let ks = Keystore::resolve()?;
     ks.read_node_identity()?.ok_or_else(|| {
         anyhow!(
-            "no node key: pass --node-seed, set $WIRES_NODE_SEED, use --node-seed-file, or run \
-             `wires id` (looked for {})",
+            "no node key at {}: run `wires id`, send the id to your admin, then `wires join \
+             <token>` with the token they send",
             ks.path("node.seed").display()
         )
     })
@@ -174,7 +150,8 @@ pub fn node_identity_in(ks: &Keystore) -> Result<NodeIdentity> {
     }
     ks.read_node_identity()?.ok_or_else(|| {
         anyhow!(
-            "no node key: set $WIRES_NODE_SEED or run `wires id` (looked for {})",
+            "no node key at {}: run `wires id`, send the id to your admin, then `wires join \
+             <token>` with the token they send",
             ks.path("node.seed").display()
         )
     })
@@ -204,8 +181,8 @@ pub fn membership(inline: Option<&str>, file: Option<&Path>) -> Result<Membershi
         return Ok(m);
     }
     bail!(
-        "no membership: pass --membership <token>, set $WIRES_MEMBERSHIP, use \
-         --membership-file, or `wires join <token>` (looked for {})",
+        "this node has not joined a network (no {}): run `wires join <token>` with the token \
+         your admin sent",
         ks.path("membership.json").display()
     );
 }
@@ -302,8 +279,8 @@ fn write_secret(path: &Path, contents: &str) -> Result<()> {
 /// directory, then a `rename` over the target.
 ///
 /// Every file this module writes is also read, concurrently, by something that
-/// takes no lock — `state.json` most of all, which a host re-reads on every
-/// connection while `wires/state` adopts a newer copy from another task or
+/// takes no lock — `policy.json` most of all, which a host re-reads on every
+/// connection while a fetch adopts a newer copy from another task or
 /// process. A plain `std::fs::write` is `O_TRUNC` followed by a write, so a
 /// reader landing in that window sees an empty or half-written file and the
 /// host fails closed ("host configuration error") over a scheduling
@@ -323,7 +300,7 @@ pub(crate) fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) ->
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "tmp".to_string());
     // Unique per process *and* per call: two threads in one process rewriting
-    // the same file (a pulled state and a pushed one, say) must not share a
+    // the same file (a fetched policy and a published one, say) must not share a
     // temporary path, or one would rename the other's half-written file.
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -460,7 +437,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        let private = dir.join("state-checked.txt");
+        let private = dir.join("last-good.json");
         write_text_mode(&private, "1\n", None).unwrap();
         assert_eq!(mode(&private), 0o600);
         let public = dir.join("membership.json");

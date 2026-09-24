@@ -1,11 +1,16 @@
-//! Policy evaluation over the signed state: **may this caller call this
+//! Policy evaluation over the signed policy: **may this caller call this
 //! service**, and **which services may it call**.
 //!
 //! One function, two uses: a host runs [`authorize`] on every call (then its
 //! own stricter `also_require`), and `wires services` runs
 //! [`allowed_services`] locally to list what the caller may use. Both read
-//! only the signed [`State`] and the caller's verified [`Principal`]; there
+//! only the [`Policy`] (a verified [`SignedPolicy`](crate::SignedPolicy)'s
+//! items) and the caller's verified [`Principal`]; there
 //! is no network and no clock (the principal handed in is already fresh).
+//!
+//! Neither checks the caller's badge: that is the gate's, before this
+//! ([`check_admitted`](crate::check_admitted)). Both do refuse a node the
+//! policy bans, so a registry decision never admits a removed node.
 //!
 //! The host is the ground truth: [`allowed_services`] is defined in terms of
 //! [`authorize`], so the listing never shows a service the host would refuse
@@ -17,7 +22,7 @@ use crate::identity::NodeId;
 use crate::idp::Principal;
 use crate::registry::ServiceName;
 use crate::role::RoleName;
-use crate::state::State;
+use crate::signed_policy::Policy;
 
 /// A service the caller may call, and the role that admits it (what `wires
 /// services` shows as "why").
@@ -33,8 +38,8 @@ pub struct Grant {
 /// and what the call log records, so each case is precise.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// The caller is not in the state's `members` (never joined, or removed).
-    NotAMember,
+    /// The policy bans the caller: the admin removed it.
+    Banned,
     /// No service by that name is registered.
     UnknownService(ServiceName),
     /// The service's `allow` is empty: nobody may call it.
@@ -62,7 +67,7 @@ impl fmt::Display for Refusal {
                 .join(", ")
         };
         match self {
-            Refusal::NotAMember => f.write_str("not a member of the current signed state"),
+            Refusal::Banned => f.write_str("removed from this network"),
             Refusal::UnknownService(s) => write!(f, "unknown service: {s}"),
             Refusal::NobodyAllowed(s) => write!(f, "service {s} allows no role"),
             Refusal::NotInRole {
@@ -87,30 +92,28 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// Decide one call against the registry, in order: `caller` is a member →
+/// Decide one call against the registry, in order: `caller` is not banned →
 /// `service` exists → the first role in its `allow` that admits the caller
 /// (a defined role whose matchers match its verified `principal`; with no
 /// principal, no role admits) → `Ok(role)`. The first failure is the
 /// [`Refusal`].
 ///
 /// Does **not** check that the service is assigned to any particular host
-/// ([`State::assigns`]) or the host's own `also_require`: those are the
+/// ([`Policy::assigns`]) or the host's own `also_require`: those are the
 /// host's, on top of this.
 ///
 /// ```
 /// use library::{
-///     authorize, Matcher, NodeIdentity, Principal, Refusal, RoleName, Service, ServiceName,
-///     State,
+///     authorize, Matcher, NodeIdentity, Policy, Principal, Refusal, RoleName, Service,
+///     ServiceName,
 /// };
 ///
 /// let host = NodeIdentity::from_seed([2u8; 32]).node_id();
-/// let mut state = State::new(NodeIdentity::from_seed([1u8; 32]).node_id());
-/// state.members.insert(host);
-/// state.hosts.insert(host);
+/// let mut policy = Policy::new(NodeIdentity::from_seed([1u8; 32]).node_id());
 /// let staff = RoleName::new("staff").unwrap();
-/// state.roles.insert(staff.clone(), vec![Matcher::new("https://idp")]);
+/// policy.roles.insert(staff.clone(), vec![Matcher::new("https://idp")]);
 /// let status = ServiceName::new("status").unwrap();
-/// state.services.insert(status.clone(), Service {
+/// policy.services.insert(status.clone(), Service {
 ///     description: String::new(),
 ///     allow: vec![staff.clone()],
 ///     hosts: vec![host],
@@ -120,25 +123,26 @@ impl fmt::Display for Refusal {
 ///     issuer: "https://idp".into(), subject: "a".into(), email: None, org: None,
 ///     groups: vec![], not_after: 0,
 /// };
-/// assert_eq!(authorize(&state, host, Some(&alice), &status), Ok(staff));
-/// // A member with no verified identity is in no role.
+/// assert_eq!(authorize(&policy, host, Some(&alice), &status), Ok(staff));
+/// // A node with no verified identity is in no role.
 /// assert!(matches!(
-///     authorize(&state, host, None, &status),
+///     authorize(&policy, host, None, &status),
 ///     Err(Refusal::NotInRole { principal: None, .. })
 /// ));
-/// let stranger = NodeIdentity::from_seed([9u8; 32]).node_id();
-/// assert_eq!(authorize(&state, stranger, None, &status), Err(Refusal::NotAMember));
+/// let removed = NodeIdentity::from_seed([9u8; 32]).node_id();
+/// policy.ban(removed, i64::MAX);
+/// assert_eq!(authorize(&policy, removed, Some(&alice), &status), Err(Refusal::Banned));
 /// ```
 pub fn authorize(
-    state: &State,
+    policy: &Policy,
     caller: NodeId,
     principal: Option<&Principal>,
     service: &ServiceName,
 ) -> Result<RoleName, Refusal> {
-    if !state.is_member(caller) {
-        return Err(Refusal::NotAMember);
+    if policy.bans_node(caller) {
+        return Err(Refusal::Banned);
     }
-    let Some(svc) = state.services.get(service) else {
+    let Some(svc) = policy.services.get(service) else {
         return Err(Refusal::UnknownService(service.clone()));
     };
     if svc.allow.is_empty() {
@@ -147,7 +151,7 @@ pub fn authorize(
     if let Some(role) = svc
         .allow
         .iter()
-        .find(|role| role_admits(state, role, principal))
+        .find(|role| role_admits(policy, role, principal))
     {
         return Ok(role.clone());
     }
@@ -158,30 +162,27 @@ pub fn authorize(
     })
 }
 
-/// Whether `role` admits a member presenting `principal`: a defined role
+/// Whether `role` admits a node presenting `principal`: a defined role
 /// when one of its matchers matches the verified principal. With no
 /// principal, no role admits; an undefined role never admits (a validated
-/// state has none, but a failure here must deny).
-pub fn role_admits(state: &State, role: &RoleName, principal: Option<&Principal>) -> bool {
-    let (Some(p), Some(matchers)) = (principal, state.roles.get(role)) else {
-        return false;
-    };
-    matchers.iter().any(|m| m.matches(p))
+/// policy has none, but a failure here must deny).
+pub fn role_admits(policy: &Policy, role: &RoleName, principal: Option<&Principal>) -> bool {
+    policy.role_admits(role, principal)
 }
 
 /// Every service [`authorize`] would admit `caller` to, with the admitting
 /// role, in name order. Services it can't call are left out, not listed as
-/// refused. A non-member gets nothing.
+/// refused. A banned node gets nothing.
 pub fn allowed_services(
-    state: &State,
+    policy: &Policy,
     caller: NodeId,
     principal: Option<&Principal>,
 ) -> Vec<Grant> {
-    state
+    policy
         .services
         .keys()
         .filter_map(|service| {
-            authorize(state, caller, principal, service)
+            authorize(policy, caller, principal, service)
                 .ok()
                 .map(|role| Grant {
                     service: service.clone(),
@@ -194,10 +195,10 @@ pub fn allowed_services(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::head::StateVersion;
     use crate::identity::NodeIdentity;
     use crate::registry::Service;
     use crate::role::Matcher;
-    use crate::state::StateVersion;
 
     fn node(b: u8) -> NodeId {
         NodeIdentity::from_seed([b; 32]).node_id()
@@ -224,15 +225,14 @@ mod tests {
         RoleName::new("staff").unwrap()
     }
 
-    /// alice (2), bob (3) are members; host (4) serves `orders-db`
-    /// (analyst: alice at [`ISS`]) and `status` (staff: anyone [`ISS`]
-    /// verified); `locked` allows nobody.
-    fn state() -> State {
-        let mut s = State::new(node(1));
+    /// alice (2), bob (3) call; host (4) serves `orders-db` (analyst:
+    /// alice at [`ISS`]) and `status` (staff: anyone [`ISS`] verified);
+    /// `locked` allows nobody; 9 is banned.
+    fn policy() -> Policy {
+        let mut s = Policy::new(node(1));
         s.version = StateVersion(1);
         s.not_after = i64::MAX;
-        s.members.extend([node(2), node(3), node(4)]);
-        s.hosts.insert(node(4));
+        s.ban(node(9), i64::MAX);
         let analyst = RoleName::new("analyst").unwrap();
         s.roles.insert(
             analyst.clone(),
@@ -258,18 +258,18 @@ mod tests {
     fn analyst_may_call_orders_db() {
         let alice = who("alice@example.com");
         assert_eq!(
-            authorize(&state(), node(2), Some(&alice), &name("orders-db")),
+            authorize(&policy(), node(2), Some(&alice), &name("orders-db")),
             Ok(RoleName::new("analyst").unwrap())
         );
     }
 
     #[test]
     fn refusals_are_precise() {
-        let s = state();
+        let s = policy();
         let bob = who("bob@example.com");
         assert_eq!(
-            authorize(&s, node(9), None, &name("status")),
-            Err(Refusal::NotAMember)
+            authorize(&s, node(9), Some(&bob), &name("status")),
+            Err(Refusal::Banned)
         );
         assert_eq!(
             authorize(&s, node(3), Some(&bob), &name("nope")),
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn no_identity_no_role() {
-        let r = authorize(&state(), node(3), None, &name("status"));
+        let r = authorize(&policy(), node(3), None, &name("status"));
         assert!(
             matches!(
                 r,
@@ -311,7 +311,7 @@ mod tests {
         assert!(r.unwrap_err().to_string().contains("wires login"));
         let bob = who("bob@example.com");
         assert_eq!(
-            authorize(&state(), node(3), Some(&bob), &name("status")),
+            authorize(&policy(), node(3), Some(&bob), &name("status")),
             Ok(staff())
         );
     }
@@ -321,15 +321,15 @@ mod tests {
         let mut alice = who("alice@example.com");
         alice.issuer = "https://partner-okta.example".into();
         assert!(matches!(
-            authorize(&state(), node(2), Some(&alice), &name("orders-db")),
+            authorize(&policy(), node(2), Some(&alice), &name("orders-db")),
             Err(Refusal::NotInRole { .. })
         ));
-        assert!(allowed_services(&state(), node(2), Some(&alice)).is_empty());
+        assert!(allowed_services(&policy(), node(2), Some(&alice)).is_empty());
     }
 
     #[test]
     fn listing_shows_only_what_you_may_call() {
-        let s = state();
+        let s = policy();
         let alice = who("alice@example.com");
         let listed: Vec<_> = allowed_services(&s, node(2), Some(&alice))
             .into_iter()
@@ -344,11 +344,13 @@ mod tests {
         assert_eq!(listed, vec![name("status")]);
         assert!(allowed_services(&s, node(3), None).is_empty());
         assert!(allowed_services(&s, node(9), Some(&alice)).is_empty());
+        // A node the policy never heard of is no different from alice.
+        assert_eq!(allowed_services(&s, node(8), Some(&alice)).len(), 2);
     }
 
     #[test]
     fn first_admitting_role_wins_and_undefined_roles_deny() {
-        let mut s = state();
+        let mut s = policy();
         let analyst = RoleName::new("analyst").unwrap();
         s.services.get_mut(&name("status")).unwrap().allow = vec![analyst.clone(), staff()];
         let alice = who("alice@example.com");
@@ -371,7 +373,7 @@ mod tests {
         p.email = None;
         p.subject = "sub-42".into();
         assert!(matches!(
-            authorize(&state(), node(3), Some(&p), &name("orders-db")),
+            authorize(&policy(), node(3), Some(&p), &name("orders-db")),
             Err(Refusal::NotInRole { principal: Some(ref w), .. }) if w == "sub-42"
         ));
     }

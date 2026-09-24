@@ -14,7 +14,7 @@ pub enum Error {
     #[error("decode: {0}")]
     Decode(serde_json::Error),
 
-    /// A token (an invite, a membership, a signed state) was not valid
+    /// A token (an invite, a membership) was not valid
     /// base64.
     #[error("token decode: {0}")]
     TokenDecode(#[from] base64::DecodeError),
@@ -37,7 +37,7 @@ pub enum Error {
 
     /// A credential's `not_after` is in the past relative to the checked time.
     ///
-    /// Shared by memberships and signed states — the caller prefixes which
+    /// Shared by memberships and policy heads — the caller prefixes which
     /// credential it was checking (`membership rejected: …`), so the display
     /// deliberately does *not* name one.
     #[error("expired at {not_after}")]
@@ -47,10 +47,17 @@ pub enum Error {
     },
 
     /// The credential's subject does not match the node checking it: a
-    /// membership's member is not the authenticated caller, or an invite's
-    /// state does not name the invitee.
+    /// membership's member is not the authenticated caller.
     #[error("credential subject does not match caller")]
     SubjectMismatch,
+
+    /// The node's badge verifies, but the signed policy bans it (the admin
+    /// removed it; [`Policy::bans`](crate::Policy::bans)).
+    #[error("banned until {until}")]
+    Banned {
+        /// The ban's `until`, unix seconds.
+        until: i64,
+    },
 
     /// A byte slice had the wrong length for the key, signature, id or
     /// digest it decodes to.
@@ -65,9 +72,9 @@ pub enum Error {
     #[error("bad frame")]
     BadFrame,
 
-    /// [`State::sign`](crate::State::sign) was handed a signing key whose
-    /// node id is not the state's `fabric` — a usage error (the fabric root
-    /// must sign its own state).
+    /// [`Policy::sign`](crate::Policy::sign) was handed a signing key whose
+    /// node id is not the policy's `fabric` — a usage error (the fabric root
+    /// must sign its own policy).
     #[error("signing key is not the network root")]
     FabricMismatch,
 
@@ -83,11 +90,6 @@ pub enum Error {
     /// [`EmailPattern`](crate::EmailPattern)).
     #[error("invalid email pattern (an address, or `*@domain`)")]
     InvalidEmailPattern,
-
-    /// A [`State`](crate::State) broke a structural rule of
-    /// [`State::validate`](crate::State::validate); the string names which.
-    #[error("invalid signed state: {0}")]
-    InvalidState(String),
 
     /// An argument list broke the [`Argv`](crate::Argv) limits.
     #[error("invalid argv")]
@@ -107,6 +109,30 @@ pub enum Error {
     /// just "unverified".
     #[error("id token rejected: {0}")]
     IdToken(#[from] IdTokenError),
+
+    /// A [`Policy`](crate::Policy) broke a structural rule of
+    /// [`Policy::validate`](crate::Policy::validate), or a signed policy's
+    /// items do not match its head; the string names which.
+    #[error("invalid policy: {0}")]
+    InvalidPolicy(String),
+
+    /// A signed policy's items don't hash to its head's
+    /// [`ItemsHash`](crate::ItemsHash): an item was tampered with, dropped or
+    /// added, or the items belong to another head. A holder applying a
+    /// [`PolicyUpdate`](crate::PolicyUpdate) then asks for the whole policy.
+    #[error("the items are not the ones the policy head commits to")]
+    ItemsMismatch,
+
+    /// A [`Fresh`](crate::Fresh) was signed by a key the policy head does not
+    /// list in `directories`.
+    #[error("freshness signed by a node that is not a directory")]
+    NotADirectory,
+
+    /// A [`Fresh`](crate::Fresh) vouches for another head than the one it
+    /// was checked against (another version, or the same version with other
+    /// content).
+    #[error("freshness is for another policy head")]
+    FreshMismatch,
 }
 
 /// Why an OIDC ID token failed [`verify_claim`](crate::verify_claim).

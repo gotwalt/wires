@@ -1,0 +1,22 @@
+Serve each signed-in user's services as a remote MCP server (HTTP + OAuth)
+
+Usage: wires gateway [OPTIONS]
+
+Options:
+      --public-url <PUBLIC_URL>
+          The public origin clients reach (the MCP endpoint is `<origin>/mcp`)
+      --listen <LISTEN>
+          Where to listen for HTTP (TLS is the tunnel's or proxy's job) [default: 127.0.0.1:8080]
+      --client-id <CLIENT_ID>
+          The IdP's Web application client id (hosts must trust it as an audience)
+      --client-secret-file <CLIENT_SECRET_FILE>
+          Read the client secret from this file (or `$WIRES_GATEWAY_CLIENT_SECRET`)
+      --issuer <ISSUER>
+          The IdP (default Google, or `$WIRES_OIDC_ISSUER`)
+  -h, --help
+          Print help
+      --help-all
+          Also list the operator and credential flags
+
+Example:
+  wires gateway --public-url https://wires.example.com --client-id <web client id>

@@ -22,7 +22,7 @@
 # generated from the Rust; alice's set (value on stdin), get and keys
 # round-trip through the handler, state kept between calls; the handler's
 # exit code and stderr are the caller's, and an exception it raises is exit
-# 1 with its message; bob is refused (77) by name, before the handler runs;
+# 1 with its message; bob, whose view holds no kv, dials nothing (exit 1);
 # push_to_caller reaches alice's `wires inbox` from the host's verified key;
 # the host's signed log, read by alice's own `wires watch`, shows her calls
 # with her verified email; and SIGTERM makes the example call `stop()`, so
@@ -69,7 +69,6 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
 WIRES="${WIRES_BIN:-$repo/target/release/wires}"
 WIRES_DEV="${WIRES_DEV_BIN:-$repo/target/release/wires-mock-idp}"
-EXIT_DENIED=77
 EMAIL="alice@example.com"
 OTHER="bob@other.example"
 
@@ -98,9 +97,7 @@ wait_for() {
 	return 1
 }
 login_as() {
-	WIRES_HOME="$1" "$WIRES" login \
-		--issuer "$ISSUER" --client-id "$CLIENT_ID" --client-secret not-so-secret \
-		--no-browser >"$D/login.out" 2>"$D/login.err" &
+	WIRES_HOME="$1" "$WIRES" login --no-browser >"$D/login.out" 2>"$D/login.err" &
 	local pid=$!
 	wait_for "$D/login.err" "sign in at" 100 || bad "login printed no sign-in URL"
 	local url
@@ -148,24 +145,30 @@ host="$D/host"
 agent="$D/agent"
 other="$D/other"
 mkdir -p "$root" "$host" "$agent" "$other"
-WIRES_HOME="$root" "$WIRES" init >/dev/null
-HOST_ID="$(WIRES_HOME="$host" "$WIRES" id 2>/dev/null)"
-AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
-OT_ID="$(WIRES_HOME="$other" "$WIRES" id 2>/dev/null)"
-admin() { WIRES_HOME="$root" "$WIRES" "$@"; }
-
 "$WIRES_DEV" dev-mock-idp --email "$EMAIL" >"$D/idp.out" 2>"$D/idp.err" &
 IDP_PID=$!
 wait_for "$D/idp.out" "client_id " 100 || bad "the mock IdP did not start"
 ISSUER="$(awk '/^issuer /{print $2}' "$D/idp.out")"
 CLIENT_ID="$(awk '/^client_id /{print $2}' "$D/idp.out")"
 
+# The network's first policy trusts the IdP.
+WIRES_HOME="$root" "$WIRES" init --issuer "$ISSUER" --client-id "$CLIENT_ID" --public-client-secret not-so-secret >/dev/null
+HOST_ID="$(WIRES_HOME="$host" "$WIRES" id 2>/dev/null)"
+AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
+OT_ID="$(WIRES_HOME="$other" "$WIRES" id 2>/dev/null)"
+admin() { WIRES_HOME="$root" "$WIRES" "$@"; }
+
 admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1
 admin invite "$HOST_ID" --name nativehost >/dev/null 2>&1
-# The host isn't up yet: the edit is stored, and a fresh token carries it.
+# The host is also the network's directory (card 37: callers ask one for
+# their view). It isn't up yet, so the edits reach no directory, and a fresh
+# token carries the policy to the host.
+admin directory add nativehost >/dev/null 2>"$D/dir.err" || {
+	dump "$D/dir.err"
+	bad "wires directory add failed"
+}
 admin service add kv --description "A key-value store, one namespace per person ($LANG_NAME)." \
-	--allow analyst --host nativehost >"$D/svc.out" 2>"$D/svc.err" ||
-	grep -qF "reached none of its 1 host(s)" "$D/svc.err" || {
+	--allow analyst --host nativehost >"$D/svc.out" 2>"$D/svc.err" || {
 	dump "$D/svc.err"
 	bad "wires service add failed"
 }
@@ -191,18 +194,19 @@ grep -qF "kv: serving as $HOST_ID" "$D/host.err" || bad "the $LANG_NAME host is 
 for h in "$root" "$agent" "$other"; do cp "$host/run/hint" "$h/hints"; done
 ok "the $LANG_NAME host serves kv as ${HOST_ID:0:8}... (pid $HOST_PID)"
 
-# The callers join; each invite is a new state, pushed to the $LANG_NAME host.
+# The callers join. An invite mints a badge and edits nothing, so nothing is
+# published.
 AG_TOKEN="$(admin invite "$AG_ID" --name agent 2>"$D/invite.err")"
 OT_TOKEN="$(admin invite "$OT_ID" --name other 2>>"$D/invite.err")"
-grep -qF "pushed to 1 of 1 host(s)" "$D/invite.err" || {
+! grep -qF "published to" "$D/invite.err" || {
 	dump "$D/invite.err"
-	bad "the invites' state never reached the $LANG_NAME host"
+	bad "an invite published a policy"
 }
 WIRES_HOME="$agent" "$WIRES" join "$AG_TOKEN" >/dev/null
 WIRES_HOME="$other" "$WIRES" join "$OT_TOKEN" >/dev/null
 login_as "$agent" "$EMAIL"
 login_as "$other" "$OTHER"
-ok "the $LANG_NAME host took the admin's pushed state; alice and bob signed in"
+ok "the $LANG_NAME host serves the admin's signed policy; alice and bob signed in"
 
 # --------------------------------------------------------------------------
 # Calls.
@@ -243,16 +247,18 @@ set +e
 call "$other" keys >"$D/c4.out" 2>"$D/c4.err"
 rc=$?
 set -e
-[ "$rc" -eq "$EXIT_DENIED" ] || {
+# Card 37: kv is not in bob's view (no role of his may use it), so his
+# call finds no host: nothing is dialed, and the handler never runs.
+[ "$rc" -eq 1 ] || {
 	dump "$D/c4.err"
-	bad "bob's call exited $rc, expected $EXIT_DENIED"
+	bad "bob's call exited $rc, expected 1 (not in his view)"
 }
-grep -qF "$OTHER is in no role allowed to call kv (analyst)" "$D/c4.err" || {
+grep -qF "no service named \`kv\` that you may call" "$D/c4.err" || {
 	dump "$D/c4.err"
-	bad "bob was refused, but not by name"
+	bad "bob's call stopped, but not for his view"
 }
-[ ! -s "$D/c4.out" ] || bad "bob's refused call wrote to stdout"
-ok "bob is refused ($EXIT_DENIED) by name, before the handler runs"
+[ ! -s "$D/c4.out" ] || bad "bob's call wrote to stdout"
+ok "bob holds no kv in his view: nothing dialed, the handler never runs"
 
 # --------------------------------------------------------------------------
 # The handler's push, and the host's own record.

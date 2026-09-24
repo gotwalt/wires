@@ -88,29 +88,35 @@ command -v curl >/dev/null || bad "curl is not on PATH"
 command -v perl >/dev/null || bad "perl is not on PATH (the mock CI's clock)"
 
 # ==========================================================================
-# Setup (off camera): three keystores, one signed state, one IdP, one mock CI.
+# Setup (off camera): three keystores, one signed policy, one IdP, one mock CI.
 # ==========================================================================
 root="$D/root"
 wb="$D/wb"
 agent="$D/agent"
 mkdir -p "$root" "$wb" "$agent"
 
-ROOT_ID="$(admin init | awk '/^network /{print $2}')"
+# The IdP comes first: the network's first policy trusts it, and every role
+# names the issuer it trusts.
+start_mock_idp "$EMAIL"
+ROOT_ID="$(admin init --issuer "$ISSUER" --client-id "$CLIENT_ID" --public-client-secret not-so-secret | awk '/^network /{print $2}')"
 WB_ID="$(WIRES_HOME="$wb" "$WIRES" id 2>/dev/null)"
 AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
 [ -n "$ROOT_ID" ] && [ -n "$WB_ID" ] && [ -n "$AG_ID" ] || bad "setup: could not read the key ids"
 AG8="${AG_ID:0:8}"
 WB8="${WB_ID:0:8}"
-# The IdP comes first: every role names the issuer it trusts.
-start_mock_idp "$EMAIL"
 admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1
 admin invite "$WB_ID" --name workbench >/dev/null 2>&1
-# The workbench isn't up yet, so each edit reaches no host and exits 1 (the
-# state is stored; the workbench's token carries it).
+# The workbench is also the network's one directory (card 37: callers ask
+# one for their view). It isn't up yet, so each edit is stored here and
+# notes that no directory is running yet; the workbench's token carries the
+# policy.
+admin directory add workbench >/dev/null 2>"$D/dir.err" || {
+	cat "$D/dir.err" >&2
+	bad "setup: wires directory add workbench failed"
+}
 for svc in deploy status logs; do
 	admin service add "$svc" --allow analyst --host workbench \
-		--description "$svc a CI build: \`$svc -- build <n>\`" >/dev/null 2>"$D/svc.err" ||
-		grep -qF "reached none of its 1 host(s)" "$D/svc.err" || {
+		--description "$svc a CI build: \`$svc -- build <n>\`" >/dev/null 2>"$D/svc.err" || {
 		cat "$D/svc.err" >&2
 		bad "setup: wires service add $svc failed"
 	}

@@ -1,9 +1,9 @@
 //! Card 27c's acceptance tests: **a host decides every call
-//! by the admin-signed state it holds**, re-read per connection.
+//! by the admin-signed policy it holds**, re-read per connection.
 //!
-//! The state is signed in the test by the network root and adopted into the
-//! host's keystore exactly as `wires/state` does
-//! ([`adopt_if_newer`](crate::state::store::adopt_if_newer)). Callers dial
+//! The policy is signed in the test by the network root and adopted into the
+//! host's keystore exactly as a fetch from a directory does
+//! ([`adopt_if_newer`](crate::policy::store::adopt_if_newer)). Callers dial
 //! the real session ALPN over loopback with a hand-rolled `Hello` + `Invoke`
 //! ([`super::call`]), presenting ID tokens minted by [`MockIdp`]s that the
 //! host trusts.
@@ -16,12 +16,14 @@
 //!   admits only its own issuer's principals.
 //! - [`also_require_only_tightens`]
 //! - [`an_unassigned_service_refuses_to_start`]
-//! - [`a_removed_member_is_refused_on_the_next_call`]: the state bump
-//!   applies with no restart; an older caller copy gets the newer state back.
+//! - [`a_removed_member_is_refused_on_the_next_call`]: the ban applies with
+//!   no restart; a caller holding an older version gets the new head and
+//!   the called service's signed entry back in its `HelloAck`.
 //! - [`push_follows_the_signed_state`]: card 23's push and inbox fetch,
-//!   authorized by the registry roles in `push.allow`.
+//!   decided by the signed policy: the bans, and the registry roles in
+//!   `push.allow`.
 //! - [`a_fetch_with_a_token_makes_a_caller_reachable_by_role`]: a logged-in
-//!   member who never called is reachable by role once its `wires inbox`
+//!   node who never called is reachable by role once its `wires inbox`
 //!   fetch presented its token, and a direct push lands in a waiting inbox.
 
 use std::sync::Arc;
@@ -32,7 +34,7 @@ use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::Router;
 use library::{
     AuditRecord, Hello, Membership, NodeId, NodeIdentity, OidcNonce, PushBody, RoleName, Service,
-    SignedState, StateVersion, Subject,
+    SignedPolicy, StateVersion, Subject,
 };
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -82,15 +84,15 @@ impl World {
         }
     }
 
-    /// The signed state at `version`: `members` plus the host; roles
+    /// The signed policy at `version`, banning `banned`; roles
     /// `analyst` (alice, carol) and `sre` (carol), each email at its own
     /// IdP, and `staff` (anyone the three people's IdPs verified);
     /// `orders-db` (analyst) and `status` (staff), both on the host.
-    fn state(&self, version: u64, members: &[NodeId]) -> SignedState {
+    fn state(&self, version: u64, banned: &[NodeId]) -> SignedPolicy {
         signed_state(&self.root, version, |s| {
-            s.members.extend(members.iter().copied());
-            s.members.insert(self.host.node_id());
-            s.hosts.insert(self.host.node_id());
+            for b in banned {
+                s.ban(*b, i64::MAX);
+            }
             s.roles.insert(
                 role("analyst"),
                 vec![
@@ -119,15 +121,18 @@ impl World {
                 .insert(service("orders-db"), on_host(vec![role("analyst")]));
             s.services
                 .insert(service("status"), on_host(vec![role("staff")]));
+            // The partner IdP is trusted too (an `issuer` item), though no
+            // role names it.
+            s.issuers.insert(
+                library::Issuer::new(self.idp_partner.issuer.as_str()),
+                library::IssuerConfig {
+                    client_id: library::Audience::new(crate::caller::mock_idp::MOCK_CLIENT_ID),
+                    audiences: vec![library::Audience::new(
+                        crate::caller::mock_idp::MOCK_CLIENT_ID,
+                    )],
+                },
+            );
         })
-    }
-
-    fn everyone(&self) -> Vec<NodeId> {
-        vec![
-            self.alice.node_id(),
-            self.bob.node_id(),
-            self.carol.node_id(),
-        ]
     }
 
     /// A `host.json` trusting all four IdPs, with `services` spliced in.
@@ -153,7 +158,7 @@ impl World {
         super::membership(&self.root, who)
     }
 
-    /// `who`'s `Hello`: its membership, the state version it holds, and a
+    /// `who`'s `Hello`: its badge, the policy version it holds, and a
     /// fresh token from its own IdP when `logged_in`.
     fn hello(&self, who: &NodeIdentity, version: u64, logged_in: bool) -> Hello {
         let idp = if who.node_id() == self.alice.node_id() {
@@ -172,7 +177,7 @@ impl World {
 struct Host {
     _router: Router,
     addr: EndpointAddr,
-    /// The host endpoint's address book: where it can dial members (push).
+    /// The host endpoint's address book: where it can dial callers (push).
     book: MemoryLookup,
     keystore: Arc<Keystore>,
     records: mpsc::Receiver<AuditRecord>,
@@ -182,7 +187,7 @@ struct Host {
 impl Host {
     /// Start `config` on `w.host`, holding `state`. Fails as `serve` would
     /// when the preflight refuses.
-    async fn start(w: &World, config: HostConfig, state: &SignedState) -> anyhow::Result<Host> {
+    async fn start(w: &World, config: HostConfig, state: &SignedPolicy) -> anyhow::Result<Host> {
         let keystore = Arc::new(Keystore::at(crate::testutil::temp_dir()));
         adopt(&keystore, &w.root, state);
         let mut host = services_host(
@@ -203,7 +208,7 @@ impl Host {
         let book = MemoryLookup::new();
         let endpoint = bind_in(&w.host, &book).await;
         let addr = endpoint_addr(&w.host.node_id(), &localhost_socks(&endpoint), None).unwrap();
-        let router = services_router(endpoint, Arc::clone(&host), push.clone());
+        let router = services_router(endpoint, Arc::clone(&host), push.clone(), None);
         Ok(Host {
             _router: router,
             addr,
@@ -214,8 +219,8 @@ impl Host {
         })
     }
 
-    /// The admin's newer state reaches this host (as `wires/state` would).
-    fn adopt(&self, w: &World, state: &SignedState) {
+    /// The admin's newer policy reaches this host (as a fetch from a directory would).
+    fn adopt(&self, w: &World, state: &SignedPolicy) {
         assert!(adopt(&self.keystore, &w.root, state));
     }
 
@@ -242,7 +247,7 @@ const SERVICES: &str = r#"{
 #[tokio::test]
 async fn the_registry_decides_who_runs_what() {
     let w = World::new().await;
-    let state = w.state(1, &w.everyone());
+    let state = w.state(1, &[]);
     let mut host = Host::start(&w, w.host_json(SERVICES, false), &state)
         .await
         .unwrap();
@@ -261,7 +266,10 @@ async fn the_registry_decides_who_runs_what() {
         unreachable!()
     };
     assert_eq!(ack.state_version, StateVersion(1));
-    assert!(ack.newer_state.is_none(), "her copy is current");
+    assert!(
+        ack.head.is_none() && ack.entry.is_none(),
+        "her view is current"
+    );
     match host.record().await {
         AuditRecord::Started {
             principal, role, ..
@@ -317,25 +325,21 @@ async fn the_registry_decides_who_runs_what() {
     let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "status", &[]).await;
     assert_eq!(out.stdout(), "up as staff");
 
-    // A name the registry doesn't know, and a stranger.
+    // A name the registry doesn't know, and a stranger (another network's
+    // badge).
     let out = call(&w.alice, &host, w.hello(&w.alice, 1, true), "nope", &[]).await;
     assert_eq!(out.denied(), "unknown service: nope");
     let stranger = NodeIdentity::from_seed([66u8; 32]);
-    let out = call(
-        &stranger,
-        &host,
-        w.hello(&stranger, 1, false),
-        "status",
-        &[],
-    )
-    .await;
+    let mut hello = w.hello(&stranger, 1, false);
+    hello.membership = super::membership(&NodeIdentity::from_seed([67u8; 32]), &stranger);
+    let out = call(&stranger, &host, hello, "status", &[]).await;
     assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
 }
 
 #[tokio::test]
 async fn a_trusted_issuer_cannot_vouch_for_another_issuers_people() {
     let w = World::new().await;
-    let host = Host::start(&w, w.host_json(SERVICES, false), &w.state(1, &w.everyone()))
+    let host = Host::start(&w, w.host_json(SERVICES, false), &w.state(1, &[]))
         .await
         .unwrap();
     // The partner IdP verifies alice@example.com, and the host trusts it,
@@ -372,7 +376,7 @@ async fn a_trusted_issuer_cannot_vouch_for_another_issuers_people() {
 #[tokio::test]
 async fn also_require_only_tightens() {
     let w = World::new().await;
-    let state = w.state(1, &w.everyone());
+    let state = w.state(1, &[]);
     let strict = r#"{ "orders-db": { "command": ["echo", "ok"], "also_require": ["sre"] } }"#;
     let host = Host::start(&w, w.host_json(strict, false), &state)
         .await
@@ -409,13 +413,11 @@ async fn also_require_only_tightens() {
 #[tokio::test]
 async fn an_unassigned_service_refuses_to_start() {
     let w = World::new().await;
-    let mut state = w.state(1, &w.everyone()).state;
+    let mut state = w.state(1, &[]).to_policy().unwrap();
     // `status` moves to another host.
     let other = NodeIdentity::from_seed([11u8; 32]).node_id();
-    state.members.insert(other);
-    state.hosts.insert(other);
     state.services.get_mut(&service("status")).unwrap().hosts = vec![other];
-    let state = state.sign(&w.root).unwrap();
+    let state = crate::testutil::signed_policy(&w.root, state);
     let Err(e) = Host::start(&w, w.host_json(SERVICES, false), &state).await else {
         panic!("a host must not serve a name the registry gives someone else");
     };
@@ -425,7 +427,7 @@ async fn an_unassigned_service_refuses_to_start() {
         "{e}"
     );
 
-    // And with no signed state at all, nothing is served.
+    // And with no signed policy at all, nothing is served.
     let home = crate::testutil::temp_dir();
     let host = services_host(
         w.host.node_id(),
@@ -438,13 +440,13 @@ async fn an_unassigned_service_refuses_to_start() {
         "{:#}",
         host.preflight(crate::clock::now_unix()).unwrap_err()
     );
-    assert!(e.contains("no signed state"), "{e}");
+    assert!(e.contains("no signed policy"), "{e}");
 }
 
 #[tokio::test]
 async fn a_removed_member_is_refused_on_the_next_call() {
     let w = World::new().await;
-    let host = Host::start(&w, w.host_json(SERVICES, false), &w.state(1, &w.everyone()))
+    let host = Host::start(&w, w.host_json(SERVICES, false), &w.state(1, &[]))
         .await
         .unwrap();
     let out = call(
@@ -457,8 +459,9 @@ async fn a_removed_member_is_refused_on_the_next_call() {
     .await;
     assert_eq!(out.stdout(), "rows: 1\n");
 
-    // `wires remove alice`: version 2 without her reaches the host; no restart.
-    let v2 = w.state(2, &[w.bob.node_id(), w.carol.node_id()]);
+    // `wires remove alice`: version 2, banning her, reaches the host; no
+    // restart. Her badge is still genuine and unexpired.
+    let v2 = w.state(2, &[w.alice.node_id()]);
     host.adopt(&w, &v2);
     // She still presents version 1 (and a valid token): the host's copy decides.
     let out = call(
@@ -476,7 +479,11 @@ async fn a_removed_member_is_refused_on_the_next_call() {
         panic!("{out:?}")
     };
     assert_eq!(ack.state_version, StateVersion(2));
-    assert_eq!(ack.newer_state.as_ref(), Some(&v2));
+    // Card 37: the head and the called service's entry, not the policy.
+    assert_eq!(ack.head.as_ref(), Some(&v2.head));
+    let status = ack.entry.as_ref().expect("the called service's entry");
+    assert_eq!(status.name.as_str(), "status");
+    assert!(v2.entries().any(|e| e == status));
     // Claiming a newer version than the host's changes nothing.
     let out = call(
         &w.alice,
@@ -492,7 +499,7 @@ async fn a_removed_member_is_refused_on_the_next_call() {
 #[tokio::test]
 async fn push_follows_the_signed_state() {
     let w = World::new().await;
-    let host = Host::start(&w, w.host_json(SERVICES, true), &w.state(1, &w.everyone()))
+    let host = Host::start(&w, w.host_json(SERVICES, true), &w.state(1, &[]))
         .await
         .unwrap();
     let push = host.push.clone().unwrap();
@@ -529,9 +536,9 @@ async fn push_follows_the_signed_state() {
     };
     assert!(why.contains("no role allowed to receive pushes"), "{why}");
 
-    // Removed from the state: her queue is dropped and her fetch refused.
+    // Banned by the policy: her queue is dropped and her fetch refused.
     push.send(spec(&w.alice)).await.unwrap();
-    host.adopt(&w, &w.state(2, &[w.bob.node_id(), w.carol.node_id()]));
+    host.adopt(&w, &w.state(2, &[w.alice.node_id()]));
     let Fetched::Refused(why) = fetch(&w, &w.alice, &host, None).await else {
         panic!("a removed member may not fetch");
     };
@@ -571,7 +578,7 @@ async fn fetch(
 #[tokio::test]
 async fn a_fetch_with_a_token_makes_a_caller_reachable_by_role() {
     let w = World::new().await;
-    let state = w.state(1, &w.everyone());
+    let state = w.state(1, &[]);
     let host = Host::start(&w, w.host_json(SERVICES, true), &state)
         .await
         .unwrap();
@@ -603,7 +610,9 @@ async fn a_fetch_with_a_token_makes_a_caller_reachable_by_role() {
     // And while `wires inbox --wait` runs, a push is delivered directly.
     let home = crate::testutil::temp_dir();
     let ks = Arc::new(Keystore::at(&home));
-    adopt(&ks, &w.root, &state);
+    // Card 37: carol holds her view; the host is in it.
+    let carol = super::person(&w.idp_carol, "carol@example.com");
+    super::hold_view(&ks, &w.root, &state, Some(&carol));
     let mailbox = Mailbox::open(&home).unwrap();
     let endpoint = bind(&w.carol).await;
     host.book.add_endpoint_info(

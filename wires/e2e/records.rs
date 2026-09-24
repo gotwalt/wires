@@ -27,8 +27,8 @@ use std::time::Duration;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr};
 use library::{
-    AuditRecord, ChainBreak, Hello, LogEntry, LogSeq, Membership, NodeId, NodeIdentity, RoleName,
-    Service, SignedState, State,
+    AuditRecord, ChainBreak, Hello, LogEntry, LogSeq, Membership, NodeId, NodeIdentity, Policy,
+    RoleName, Service, SignedPolicy,
 };
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -76,17 +76,15 @@ impl World {
         }
     }
 
-    fn state(&self) -> SignedState {
+    fn state(&self) -> SignedPolicy {
         self.state_v(1, |_| {})
     }
 
-    /// The state at `version`, changed by `edit` before it is signed.
-    fn state_v(&self, version: u64, edit: impl FnOnce(&mut State)) -> SignedState {
+    /// The policy at `version`, changed by `edit` before it is signed. It
+    /// bans [`banned`].
+    fn state_v(&self, version: u64, edit: impl FnOnce(&mut Policy)) -> SignedPolicy {
         signed_state(&self.root, version, |s| {
-            for n in [&self.host, &self.alice, &self.alice2, &self.bob, &self.sam] {
-                s.members.insert(n.node_id());
-            }
-            s.hosts.insert(self.host.node_id());
+            s.ban(banned().node_id(), i64::MAX);
             s.roles.insert(
                 role("analyst"),
                 vec![email_at(&self.idp_alice, "alice@example.com")],
@@ -134,12 +132,21 @@ impl World {
         super::hello(&self.root, who, 1, Some(self.idp(who)))
     }
 
-    /// A reader's keystore: key, membership, the signed state, an ID token.
+    /// A reader's keystore: key, membership, the signed policy, an ID token.
     fn reader(&self, who: &NodeIdentity) -> Keystore {
         let ks = Keystore::at(crate::testutil::temp_dir());
         ks.save_node(who).unwrap();
         ks.save_membership(&self.membership(who)).unwrap();
-        adopt(&ks, &self.root, &self.state());
+        // Card 37: a reader holds its view (what it may read, or call).
+        let email = if self.idp(who).issuer == self.idp_alice.issuer {
+            "alice@example.com"
+        } else if who.node_id() == self.bob.node_id() {
+            "bob@example.com"
+        } else {
+            "sam@example.com"
+        };
+        let who_is = super::person(self.idp(who), email);
+        super::hold_view(&ks, &self.root, &self.state(), Some(&who_is));
         let token = self.hello(who).id_token.unwrap();
         std::fs::write(ks.path(ID_TOKEN_FILE), token.as_str()).unwrap();
         ks
@@ -181,7 +188,7 @@ impl Host {
         host.audit = Some(sink);
         let endpoint = bind(&w.host).await;
         let addr = endpoint_addr(&w.host.node_id(), &localhost_socks(&endpoint), None).unwrap();
-        let router = services_router(endpoint.clone(), Arc::new(host), None);
+        let router = services_router(endpoint.clone(), Arc::new(host), None, None);
         Host {
             _router: router,
             keystore,
@@ -191,8 +198,8 @@ impl Host {
         }
     }
 
-    /// Adopt `state` (as `wires/state` would): the next decision uses it.
-    fn adopt(&self, w: &World, state: &SignedState) {
+    /// Adopt `state` (as a fetch from a directory would): the next decision uses it.
+    fn adopt(&self, w: &World, state: &SignedPolicy) {
         adopt(&self.keystore, &w.root, state);
     }
 
@@ -222,6 +229,11 @@ impl Host {
 }
 
 /// `who` calls `name args` on the host ([`super::call`]); whether it ran.
+/// A node every [`World`] policy bans (its badge is genuine).
+fn banned() -> NodeIdentity {
+    NodeIdentity::from_seed([66u8; 32])
+}
+
 async fn call(w: &World, who: &NodeIdentity, host: &Host, name: &str, args: &[&str]) -> bool {
     matches!(
         super::call(who, &host.addr, w.hello(who), name, args).await,
@@ -307,21 +319,20 @@ async fn readers_see_all_callers_see_their_own_members_see_nothing() {
     assert_eq!(recs.len(), 4, "{lines:#?}");
     assert!(recs.iter().all(|l| !l.contains("✗")));
 
-    // bob, a member in no reader role: only his own refusal (it names his
-    // verified identity).
+    // bob, a member in no reader role: orders-db is not in his view (card
+    // 37: he may neither call nor read it), so his refusal there, though
+    // recorded, is not his to read; status is, and he never called it.
     let bob = w.reader(&w.bob);
     let (report, lines) = watch_once(&w, &w.bob, &bob, &host, &[], false).await;
     assert!(report.refused.is_empty());
-    let recs = records(&lines);
-    assert_eq!(recs.len(), 1, "{lines:#?}");
-    assert!(recs[0].contains("✗"));
+    assert!(records(&lines).is_empty(), "{lines:#?}");
     // …and nothing at all of status, where he never called.
     let bob2 = w.reader(&w.bob);
     let (_, lines) = watch_once(&w, &w.bob, &bob2, &host, &["status"], false).await;
     assert!(records(&lines).is_empty(), "{lines:#?}");
 
-    // A stranger is refused outright.
-    let stranger = NodeIdentity::from_seed([66u8; 32]);
+    // A banned node (its badge is genuine) is refused outright.
+    let stranger = banned();
     let ks = w.reader(&stranger);
     let (report, lines) = watch_once(&w, &stranger, &ks, &host, &[], false).await;
     assert_eq!(report.refused.len(), 1, "{lines:#?}");
@@ -566,9 +577,17 @@ async fn mine_is_the_person_not_the_node() {
     assert_eq!(recs.len(), 2, "{lines:#?}");
     assert!(recs[0].contains("from-node-2") && recs[0].contains("alice@example.com"));
 
+    // bob sees his own status call, none of alice's: orders-db is not even
+    // in his view (card 37).
     let bob = w.reader(&w.bob);
-    let (_, lines) = watch_once(&w, &w.bob, &bob, &host, &["orders-db"], false).await;
-    assert!(records(&lines).is_empty(), "{lines:#?}");
+    let (_, lines) = watch_once(&w, &w.bob, &bob, &host, &["status"], false).await;
+    let recs = records(&lines);
+    assert_eq!(recs.len(), 2, "{lines:#?}");
+    assert!(
+        recs.iter()
+            .all(|l| l.contains("bob@example.com") || l.contains("exit 0"))
+    );
+    assert!(recs.iter().all(|l| !l.contains("from-node-2")));
 }
 
 /// A reader with no verified principal sees nothing in full, not even what
@@ -589,8 +608,8 @@ async fn a_reader_with_no_token_sees_nothing_in_full() {
     assert!(records(&lines).is_empty(), "{lines:#?}");
 }
 
-/// A following reader removed from the network is refused mid-stream and
-/// gets nothing logged after the removal.
+/// A following reader removed from the network (banned) is refused
+/// mid-stream and gets nothing logged after the removal.
 #[tokio::test]
 async fn a_removed_reader_stops_mid_stream() {
     let w = World::new().await;
@@ -603,7 +622,7 @@ async fn a_removed_reader_stops_mid_stream() {
     host.adopt(
         &w,
         &w.state_v(2, |s| {
-            s.members.remove(&sam);
+            s.ban(sam, i64::MAX);
         }),
     );
     assert!(call(&w, &w.alice, &host, "orders-db", &["after"]).await);

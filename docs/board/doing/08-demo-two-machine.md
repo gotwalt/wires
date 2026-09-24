@@ -23,16 +23,18 @@ The run follows [docs/demo.md](../../demo.md) (cheat sheet at its top).
 - [ ] workbench on HEAD: push to `~/src/wires-demo`, `cargo build --release -p wires`,
       replace the old `wires-demo` unit (it predates the services surface), `orders.db` +
       `host.json` (Google issuer, `orders-db`, `push`), fresh keystore.
-- [ ] Provision per `docs/demo.md`: `init`; `role set analyst` / `role set security`;
-      `invite` workbench; `service add orders-db --allow analyst --reader security --host
-      workbench`; re-invite workbench (it was offline for that push); `join`;
-      `serve --check host.json`; `serve host.json` under `systemd-run --user`; `ss -ltnp`
-      shows no TCP listener.
-- [ ] laptop: agent and reader `id` / `join`; reader `wires login`; Claude Code with
+- [ ] Provision per `docs/demo.md`: `init --client-id … --public-client-secret …`;
+      `role set analyst` / `role set security`; `invite` workbench; `directory add
+      workbench`; `service add orders-db --allow analyst --reader security --host
+      workbench` (both edits exit 1: no directory is up yet); re-invite workbench (that
+      token carries the policy); `join`; `serve --check host.json`; `serve host.json` under
+      `systemd-run --user` (it is also the directory); `ss -ltnp` shows no TCP listener.
+- [ ] laptop: agent and reader `id` / `join`; reader `wires login` (bare: the invite names
+      the IdP); Claude Code with
       `WIRES_HOME=~/.wires-agent` and `--allowedTools 'Bash(wires call orders-db:*)'`
       (optionally `wires mcp` in its MCP config, shown only as the compatibility path).
-- [ ] Dry run, every beat of the cheat sheet: `services` empty and `call` exit 77 before
-      login → `wires login` (real Google) → `services` lists `orders-db (analyst)` → Claude
+- [ ] Dry run, every beat of the cheat sheet: `services` says to `wires login` and `call`
+      exits 1 (no service by that name for this node) before login → `wires login` (real Google) → `services` lists `orders-db (analyst)` → Claude
       Code answers → reader's `wires watch orders-db` shows `▶`/`■`/`✗` → optional push beat
       (`deploy`/`inbox --wait`/`logs`) → `wires remove agent` → exit 77, 0 bytes out.
 - [ ] **Recording.** Capture (asciinema + agg, or screen capture) and embed it in the

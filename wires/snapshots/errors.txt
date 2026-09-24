@@ -1,0 +1,57 @@
+wires: denied by host: not a member of this network; don't retry: ask your admin for access [exit 77]
+
+wires: denied by host: sec@audit.example is in no role allowed to call orders-db (analyst); don't retry: ask your admin for access [exit 77]
+
+wires: denied by host: orders-db needs a verified identity in role analyst; run `wires login` [exit 77]
+
+wires: denied by host: unknown service: orders-db; see `wires services` [exit 77]
+
+wires: denied by host: service orders-db allows no role; don't retry: ask your admin for access [exit 77]
+
+wires: denied by host: service orders-db is not assigned to this host (signed policy version 7); see `wires services` [exit 77]
+
+wires: denied by host: alice@example.com is not admitted to orders-db by this host's own rules; don't retry: ask your admin for access [exit 77]
+
+wires: denied by host: this host's policy is stale: no directory has vouched for it recently; try again later [exit 77]
+
+wires: denied by host: your ID token could not be verified; run `wires login` [exit 77]
+
+wires: denied by host: the identity provider is unreachable from this host; try again later [exit 77]
+
+wires: denied by host: host configuration error; try again later, or tell the host's operator [exit 77]
+
+wires: no service named `orders-db` that you may call; see `wires services` [exit 1]
+
+wires: no service named `orders-db` that you may call: this node is not signed in, and every service needs a verified identity; run `wires login` [exit 1]
+
+wires: --node-seed is not allowed in locked mode (set by the operator: WIRES_LOCKED=1 or "locked" in tools.json); drop it: only --jq, --head, --max-bytes, --verbose, the service name and its arguments are allowed [exit 2]
+
+wires: $WIRES_NODE_SEED is not allowed in locked mode (set by the operator: WIRES_LOCKED=1 or "locked" in tools.json): it overrides this node's credentials; ask your operator to unset it [exit 2]
+
+wires: stdin is not forwarded in locked mode (it can carry local files to the host; the operator can set WIRES_LOCKED_STDIN=allow); pass the input as arguments instead [exit 2]
+
+wires: this node has not joined a network: run `wires id`, send the id to your admin, then `wires join <token>` with the token they send [exit 1]
+
+wires: no node key at /home/me/.wires/node.seed: run `wires id`, send the id to your admin, then `wires join <token>` with the token they send [exit 1]
+
+wires: the invite token does not decode; paste it whole, or ask your admin to send it again [exit 1]
+
+wires is a network for authenticated remote CLI calls. Each service is a
+command-line program on another machine, run by its name, never by host or
+address. Every call runs as you: your sign-in is checked against an
+admin-signed list of who may call what, and the machine that runs it records
+the call. A refusal ("denied by host", exit 77) is that policy, not a fault:
+don't retry or work around it; ask your admin for access.
+
+wires services: nothing to list: this node is not signed in; run `wires login`
+
+wires is a network for authenticated remote CLI calls. Each service is a
+command-line program on another machine, run by its name, never by host or
+address. Every call runs as you: your sign-in is checked against an
+admin-signed list of who may call what, and the machine that runs it records
+the call. A refusal ("denied by host", exit 77) is that policy, not a fault:
+don't retry or work around it; ask your admin for access.
+
+wires services: no service allows you (policy version 7); ask your admin for a role that may call one
+
+wires services: no service you may call matches "payroll"; run `wires services` for all of them

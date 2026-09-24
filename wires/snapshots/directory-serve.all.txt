@@ -1,0 +1,16 @@
+Run this node's directory alone (no host.json) until Ctrl-C
+
+Usage: wires directory serve [OPTIONS]
+
+Options:
+      --relay-url <RELAY_URL>
+          Use a self-hosted relay at this URL instead of the n0 default
+      --max-subscribers <MAX_SUBSCRIBERS>
+          How many subscribers this directory follows at once (one more is refused) [default: 4096]
+  -h, --help
+          Print help
+      --help-all
+          Also list the operator and credential flags
+
+Example:
+  wires directory serve

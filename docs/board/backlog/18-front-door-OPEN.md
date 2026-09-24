@@ -15,12 +15,11 @@ it know it's the *real* lobby? The target UX floated: `wires join acmecorp.com`.
 
 ## Related, and separately decided
 
-- Services should be visible **only to callers who can use them** (the human, 2026-09-23). Done by card 27: `wires services` evaluates the admin-signed state locally and lists only what the caller's verified identity may call; the host still enforces on every call.
+- Services should be visible **only to callers who can use them** (the human, 2026-09-23). Done by cards 27 and 37: a caller holds only its view, the root-signed entries of the services its verified identity may call or read, cut by a directory; the host still enforces on every call.
 
 ## Input from cards 36–37 (the directory, 2026-09-24)
 
-The "lobby" now has a concrete home: the directory ([card 36](36-directory.md)). After card 37 an
-invite is only the badge, the root key and the directory ids, so a `_wires.<domain>` record would
-publish the root key and the directory ids, and a front desk would be a directory holding a limited,
-root-signed enrollment delegation. The same delegation could renew badges (card 36's open
-question). Still don't build this until it's discussed.
+The "lobby" now has a concrete home: the directory ([card 36](../done/36-directory.md)). An invite is
+now only the badge (which names the root key), up to two directory ids and the login settings, so a
+`_wires.<domain>` record would publish the root key, the directory ids and the login settings, and a front desk would be a directory holding a limited,
+root-signed enrollment delegation. The same delegation could renew badges (still open on card 36). Still don't build this until it's discussed.

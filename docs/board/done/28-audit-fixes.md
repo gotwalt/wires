@@ -24,7 +24,7 @@ deployed: break formats freely and don't write compatibility shims.
 - A service's push can reach only that call's caller.
 - A call that can't be logged doesn't run.
 - An admin edit that reaches no host fails loudly, and a command re-sends it.
-- Fabric-wide metadata and the quadratic state are real problems, but they're solved by redesign, not here: [card 29](../backlog/29-identity-and-scale.md).
+- Fabric-wide metadata and the quadratic state are real problems, but they're solved by redesign, not here: [card 29](../backlog/29-person-identity.md).
 
 ## Findings and fixes
 

@@ -1,12 +1,13 @@
 //! Service name → host (card 27). The caller never names a
-//! host: it takes the service's `hosts` from the signed state, tries the
-//! last one that worked first, then the rest in the admin's order, moving to
-//! the next on a dial failure (not on a refusal: a host that refused has
-//! decided). `--verbose` says which host answered.
+//! host: it takes the service's `hosts` from the root-signed entry in its
+//! view (card 37), tries the last one that worked first, then the rest in
+//! the admin's order, moving to the next on a dial failure (not on a
+//! refusal: a host that refused has decided). `--verbose` says which host
+//! answered.
 //!
 //! The last host that answered for each service is remembered in
 //! `$WIRES_HOME/last-good.json` ([`LastGood`]); a hint, never an authority —
-//! a host the state no longer assigns is skipped.
+//! a host the entry no longer lists is skipped.
 //!
 //! # Addressing
 //!
@@ -33,7 +34,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use iroh::EndpointAddr;
-use library::{NodeId, ServiceName, State};
+use library::{NodeId, Service, ServiceName, View};
 use serde::{Deserialize, Serialize};
 
 use crate::admin::keystore::Keystore;
@@ -48,18 +49,13 @@ pub(crate) const HINTS_FILE: &str = "hints";
 /// Where `wires serve` writes its own hint line, under `$WIRES_HOME`.
 pub(crate) const OWN_HINT_FILE: &str = "run/hint";
 
-/// The hosts to try for `service`, in order: `last_good` first if it still
-/// implements it, then the registry's order. Empty if the service is unknown
-/// or has no hosts.
-pub(crate) fn candidates(
-    state: &State,
-    service: &ServiceName,
-    last_good: Option<NodeId>,
-) -> Vec<NodeId> {
-    let Some(svc) = state.service(service) else {
-        return Vec::new();
-    };
-    let mut hosts = svc.hosts.clone();
+/// The hosts to try for `service` (its root-signed entry's), in order:
+/// `last_good` first if the entry still lists it, then the registry's
+/// order. A caller holds no ban list: a signed policy never lists a banned
+/// host (the admin's `remove` drops it from every service), and the host
+/// decides every call anyway.
+pub(crate) fn candidates(service: &Service, last_good: Option<NodeId>) -> Vec<NodeId> {
+    let mut hosts: Vec<NodeId> = service.hosts.clone();
     if let Some(good) = last_good
         && let Some(at) = hosts.iter().position(|h| *h == good)
     {
@@ -90,12 +86,6 @@ impl LastGood {
     /// The host that last answered `service`.
     pub(crate) fn get(&self, service: &ServiceName) -> Option<NodeId> {
         self.0.get(service).copied()
-    }
-
-    /// Every host remembered here (the hosts this node has called), in
-    /// service order.
-    pub(crate) fn hosts(&self) -> impl Iterator<Item = NodeId> + '_ {
-        self.0.values().copied()
     }
 
     /// Remember that `host` answered `service`, and save (best effort).
@@ -209,17 +199,18 @@ pub(crate) fn write_own_hint(ks: &Keystore, endpoint: &iroh::Endpoint) -> anyhow
     crate::admin::keystore::write_text_mode(&path, &format!("{}\n", hint_line(me, &addrs)), None)
 }
 
-/// Every host of the services in `names`, once each, in first-seen order
-/// (for `wires inbox`: fetch from the hosts of the services you use).
+/// Every host of the services in `names` that `view` holds, once each, in
+/// first-seen order (for `wires inbox` and `wires watch`: the hosts of the
+/// services you use).
 pub(crate) fn hosts_of<'a>(
-    state: &State,
+    view: &View,
     names: impl IntoIterator<Item = &'a ServiceName>,
 ) -> Vec<NodeId> {
     let mut out: Vec<NodeId> = Vec::new();
     for name in names {
-        for h in state
-            .service(name)
-            .map(|s| s.hosts.clone())
+        for h in view
+            .entry(name)
+            .map(|e| e.entry.service.hosts.clone())
             .unwrap_or_default()
         {
             if !out.contains(&h) {
@@ -233,20 +224,35 @@ pub(crate) fn hosts_of<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library::{NodeIdentity, RoleName, Service, StateVersion};
+    use library::{NodeIdentity, Policy, Principal, StateVersion};
 
     fn node(b: u8) -> NodeId {
         NodeIdentity::from_seed([b; 32]).node_id()
     }
 
-    fn state() -> State {
-        let mut s = State::new(node(1));
+    /// Anyone the mock IdP signed in.
+    fn anyone() -> Principal {
+        Principal {
+            issuer: crate::testutil::test_idp().issuer.as_str().into(),
+            subject: "1".into(),
+            email: None,
+            org: None,
+            groups: vec![],
+            not_after: i64::MAX,
+        }
+    }
+
+    /// A view holding `orders-db` (hosts 2, 3) and `status` (host 3).
+    fn view() -> View {
+        let root = NodeIdentity::from_seed([1; 32]);
+        let mut s = Policy::new(root.node_id());
         s.version = StateVersion(1);
-        s.members.extend([node(2), node(3), node(4)]);
-        s.hosts.extend([node(2), node(3)]);
+        s.not_after = i64::MAX;
+        let (staff, matchers) = crate::testutil::staff_role();
+        s.roles.insert(staff.clone(), matchers);
         let svc = |hosts: Vec<NodeId>| Service {
             description: String::new(),
-            allow: vec![RoleName::new("staff").unwrap()],
+            allow: vec![staff.clone()],
             hosts,
             readers: vec![],
         };
@@ -256,18 +262,17 @@ mod tests {
         );
         s.services
             .insert(ServiceName::new("status").unwrap(), svc(vec![node(3)]));
-        s
+        crate::testutil::signed_policy(&root, s).view_for(Some(&anyone()), None)
     }
 
     #[test]
     fn last_good_first_then_registry_order() {
-        let s = state();
+        let v = view();
         let name = ServiceName::new("orders-db").unwrap();
-        assert_eq!(candidates(&s, &name, None), vec![node(2), node(3)]);
-        assert_eq!(candidates(&s, &name, Some(node(3))), vec![node(3), node(2)]);
-        assert_eq!(candidates(&s, &name, Some(node(4))), vec![node(2), node(3)]);
-        let other = ServiceName::new("nope").unwrap();
-        assert!(candidates(&s, &other, None).is_empty());
+        let svc = &v.entry(&name).unwrap().entry.service;
+        assert_eq!(candidates(svc, None), vec![node(2), node(3)]);
+        assert_eq!(candidates(svc, Some(node(3))), vec![node(3), node(2)]);
+        assert_eq!(candidates(svc, Some(node(4))), vec![node(2), node(3)]);
     }
 
     #[test]
@@ -286,7 +291,7 @@ mod tests {
 
     #[test]
     fn hosts_of_the_services_you_use_once_each() {
-        let s = state();
+        let s = view();
         let names = [
             ServiceName::new("status").unwrap(),
             ServiceName::new("orders-db").unwrap(),

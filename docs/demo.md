@@ -18,27 +18,27 @@ Set these once per terminal, so every command below is bare `wires …`:
 |---|---|
 | **admin** (laptop) | `export WIRES_HOME=~/.wires-admin` |
 | **workbench** (`ssh -o RemoteCommand=none workbench`) | `export WIRES_HOME=~/.wires-demo`; `cd` to the directory with `host.json` and `orders.db` |
-| **agent** (laptop, Claude Code) | `export WIRES_HOME=~/.wires-agent WIRES_OIDC_CLIENT_ID=… WIRES_OIDC_CLIENT_SECRET=…` |
-| **reader** (laptop or second laptop) | `export WIRES_HOME=~/.wires-reader WIRES_OIDC_CLIENT_ID=… WIRES_OIDC_CLIENT_SECRET=…` |
+| **agent** (laptop, Claude Code) | `export WIRES_HOME=~/.wires-agent` (its invite names the IdP, so `wires login` is bare) |
+| **reader** (laptop or second laptop) | `export WIRES_HOME=~/.wires-reader` |
 
 Off camera: `./.scripts/demo-remote-cli.sh --quiet` is green, [provisioning](#before-recording-off-camera)
-is done, `wires serve host.json` is running on the workbench, and the reader is logged in.
+is done, `wires serve host.json` is running on the workbench (it is also the network's directory), and the reader is logged in.
 On camera, in order:
 
 | Beat | Terminal | Command | What appears |
 |---|---|---|---|
 | 1 | workbench | `ss -ltnp` then `ss -lunp \| grep wires` | no TCP listener from wires; UDP sockets (QUIC) only |
-| 2 | agent | `wires services` | nothing on stdout; stderr `wires services: no service allows this node without a login (state vN)` |
-| 2 | agent | `wires call orders-db -- "select count(*) from orders"; echo $?` | ``wires: denied by host: no ID token presented; run `wires login` ``, then `77` |
-| 3 | agent | `wires login` | browser: Google, then the "signed in" page |
+| 2 | agent | `wires services` | nothing on stdout; stderr: the premise, then ``wires services: nothing to list: this node is not signed in; run `wires login` `` |
+| 2 | agent | `wires call orders-db -- "select count(*) from orders"; echo $?` | ``wires: no service named `orders-db` that you may call: this node is not signed in, and every service needs a verified identity; run `wires login` ``, then `1` (nothing was dialed) |
+| 3 | agent | `wires login` | browser: Google, then the "signed in" page; stderr ``wires login: 1 service(s) you may call (policy version N); see `wires services` `` |
 | 3 | agent | `wires services` | `orders-db  Read-only SQL (sqlite3) over …  (analyst)` |
 | 4 | agent | `claude --allowedTools 'Bash(wires call orders-db:*)'`, then [the prompt](#4-the-agent-works) | Claude Code runs `wires call orders-db -- "…"`; the answer is umbrella, $999.00 of $1,629.84 (61.3%) |
-| 5 | reader | `wires watch orders-db` | `▶ … <you>@gmail.com (…) [analyst] orders-db "select …"`, `■ … exit 0 · … ms · … B out`, and a `✗ … no ID token presented` line for beat 2 |
-| 5 (opt.) | reader (second tab) | `wires call orders-db -- "select 1"` | exit 77: `… is in no role allowed to call orders-db (analyst)`; a `✗` in the watch |
+| 5 | reader | `wires watch orders-db` | `▶ … <you>@gmail.com (…) [analyst] orders-db "select …"`, `■ … exit 0 · … ms · … B out` |
+| 5 (opt.) | reader (second tab) | `wires call orders-db -- "select 1"; echo $?` | ``wires: no service named `orders-db` that you may call; see `wires services` ``, then `1`: the reader's view marks it read-only, so nothing is dialed and the watch gains no line |
 | 5b (opt.) | agent | [push beat](#5b-the-workbench-calls-back-push): `wires call deploy -- build 41`, `wires inbox --wait --timeout 10m` | `… from host <wb8> (verified)  build-41  failed: …` |
 | 5c (with a spare) | workbench | stop `wires serve`, ask again | the spare answers (`wires call --verbose` names it) |
-| 6 | admin | `wires remove agent` | stderr `state version N: pushed to 1 of 1 host(s)` (2 of 2 with a spare) |
-| 6 | agent | ask Claude Code the question again | exit 77, nothing on stdout: `wires: denied by host: not a member of this network`; no `✗` in the watch (a non-member's knock is traced by the host, not logged) |
+| 6 | admin | `wires remove agent` | stderr `policy version N: published to 1 of 1 directory(ies)` (2 of 2 with a spare that is also a directory) |
+| 6 | agent | ask Claude Code the question again | exit 77, nothing on stdout: `wires: denied by host: not a member of this network; don't retry: ask your admin for access`; no `✗` in the watch (a banned node's knock is traced by the host, not logged) |
 
 ### Rebuttals, one line each
 
@@ -58,11 +58,11 @@ On camera, in order:
 
 | Terminal | Machine | `WIRES_HOME` | Role |
 |---|---|---|---|
-| **admin** | laptop | `~/.wires-admin` | holds the root key; signs roles, services and members |
-| **workbench** | workbench (x86_64 Linux, no firewall port opened) | `~/.wires-demo` | `wires serve host.json`: implements `orders-db` |
+| **admin** | laptop | `~/.wires-admin` | holds the root key; mints badges; signs the trusted IdP, roles, services, bans and directories |
+| **workbench** | workbench (x86_64 Linux, no firewall port opened) | `~/.wires-demo` | `wires serve host.json`: implements `orders-db`, and is the network's directory |
 | **spare** (optional) | a second host | `~/.wires-spare` | implements `orders-db` too, for the failover beat |
 | **agent** | laptop | `~/.wires-agent` | Claude Code, calling `wires call orders-db` from Bash |
-| **reader** | laptop (or a second laptop) | `~/.wires-reader` | a member in role `security`: `wires watch orders-db` |
+| **reader** | laptop (or a second laptop) | `~/.wires-reader` | a person in role `security`: `wires watch orders-db` |
 
 Keep `WIRES_HOME` short: a host's control socket lives under it, and macOS
 limits socket paths to 104 bytes.
@@ -70,26 +70,23 @@ limits socket paths to 104 bytes.
 ## Before recording (off camera)
 
 **Google OAuth.** Create a "Desktop app" OAuth client in Google Cloud. Its
-secret isn't confidential for that client type. On the laptop:
-
-```bash
-export WIRES_OIDC_CLIENT_ID=<id>.apps.googleusercontent.com   # login reads these
-export WIRES_OIDC_CLIENT_SECRET=<secret>
-```
+secret isn't confidential for that client type. `wires init` signs the client
+id into the policy and records the secret; every invite carries both, so the
+agent's and reader's `wires login` need no flags.
 
 **workbench.** Build natively there (`cargo build --release -p wires`, or
 `docker build .`); nothing cross-compiles. Use `ssh -o RemoteCommand=none`
 because the ssh config forces a remote command. Make `orders.db` in the
 directory `wires serve` runs from (`sqlite3 orders.db < .scripts/fixtures/orders.sql`),
 and put this `host.json` beside it (the loopback demo's
-`.scripts/fixtures/host.json`, with the Google issuer and your client id):
+`.scripts/fixtures/host.json` without its `also_require`, which the loopback
+run uses to show a host refusing an analyst the policy admits; the trusted IdP
+is the signed policy's, which `init` sets, so an `identity` section is
+optional and could only narrow it):
 
 ```json
 {
   "version": 2,
-  "identity": { "issuers": [
-    { "issuer": "https://accounts.google.com", "audiences": ["<id>.apps.googleusercontent.com"] }
-  ] },
   "services": {
     "orders-db": { "command": ["sqlite3", "-safe", "-readonly", "-header", "-column", "orders.db"] }
   },
@@ -100,33 +97,39 @@ and put this `host.json` beside it (the loopback demo's
 **Provision** (this can be on camera, but it's slow viewing):
 
 ```bash
-admin$     WIRES_HOME=~/.wires-admin wires init
+admin$     WIRES_HOME=~/.wires-admin wires init --client-id <id>.apps.googleusercontent.com --public-client-secret <secret>
 admin$     WIRES_HOME=~/.wires-admin wires role set analyst '<your address>@gmail.com'
 admin$     WIRES_HOME=~/.wires-admin wires role set security '<the reader's address>'
 workbench$ WIRES_HOME=~/.wires-demo  wires id        # → send to admin
 admin$     WIRES_HOME=~/.wires-admin wires invite <workbench id> --name workbench
+admin$     WIRES_HOME=~/.wires-admin wires directory add workbench   # the directory: it holds the policy for the others
 admin$     WIRES_HOME=~/.wires-admin wires service add orders-db \
              --description "Read-only SQL (sqlite3) over the orders database; pass the SQL statement as the argument." \
              --allow analyst --reader security --host workbench     # (--host spare too, if you have one)
-admin$     WIRES_HOME=~/.wires-admin wires invite <workbench id> --name workbench   # a token with the service in it
+admin$     WIRES_HOME=~/.wires-admin wires invite <workbench id> --name workbench   # a token with the policy in it
 workbench$ WIRES_HOME=~/.wires-demo  wires join <token>
 workbench$ WIRES_HOME=~/.wires-demo  wires serve --check host.json
 workbench$ WIRES_HOME=~/.wires-demo  wires serve host.json    # under a supervisor (card 08 used systemd-run --user)
 agent$     WIRES_HOME=~/.wires-agent  wires id
 reader$    WIRES_HOME=~/.wires-reader wires id
-admin$     WIRES_HOME=~/.wires-admin wires invite <agent id> --name agent      # pushed to the running workbench
+admin$     WIRES_HOME=~/.wires-admin wires invite <agent id> --name agent      # badge, directory, IdP: no edit, nothing published
 admin$     WIRES_HOME=~/.wires-admin wires invite <reader id> --name reader
 agent$     WIRES_HOME=~/.wires-agent  wires join <token>
 reader$    WIRES_HOME=~/.wires-reader wires join <token>
-reader$    WIRES_HOME=~/.wires-reader wires login     # as the reader's address
+reader$    WIRES_HOME=~/.wires-reader wires login     # bare: the invite named the IdP; as the reader's address
 ```
 
-The workbench is invited twice because it was offline when the service was
-assigned to it: the second token carries the newer state (re-joining never
-rolls one back). Every later admin change reaches the running workbench by
-push. Machines find each other by key through n0 discovery; on a network
-without it, copy the workbench's `run/hint` line into the others'
-`$WIRES_HOME/hints`.
+The workbench is invited twice because it was offline when it was named the
+directory and assigned the service (those edits note that no directory is
+running yet): the second token carries the whole policy, since the policy now names
+the workbench as a host and directory (re-joining never rolls one back).
+Every later admin change is published to the running workbench, which is the
+directory, so its host side has it at once. The agent and reader hold no
+policy: their invites carry a badge, the directory's id and the IdP to sign
+in with (under 1 KB), and after `wires login` each fetches its view from the
+directory, the services its person may use. Machines find each other by key
+through n0 discovery; on a network without it, copy the workbench's
+`run/hint` line into the others' `$WIRES_HOME/hints`.
 
 **Claude Code for the agent.** Run it with `WIRES_HOME=~/.wires-agent` in its
 environment and allow only the one service:
@@ -164,24 +167,24 @@ Never say "no ports". iroh binds UDP for QUIC, and `ss -lunp` shows it.
 
 ```bash
 agent$ WIRES_HOME=~/.wires-agent wires services      # nothing
-agent$ WIRES_HOME=~/.wires-agent wires call orders-db -- "select count(*) from orders"   # exit 77
+agent$ WIRES_HOME=~/.wires-agent wires call orders-db -- "select count(*) from orders"   # exit 1: run `wires login`
 ```
 
-> "My agent's machine joined with one invite from me. The admin-signed list
-> it holds says `orders-db` is for analysts, and it hasn't said who it is yet,
-> so it sees nothing, and asking by name is refused with the reason."
+> "My agent's machine joined with one invite from me. It hasn't said who it
+> is yet, so it may use nothing: it doesn't even know which machine runs
+> `orders-db`. Asking by name gets nothing, and the message says what to do."
 
 ### 3. Sign in once
 
 ```bash
-agent$ WIRES_HOME=~/.wires-agent wires login       # browser: Google
+agent$ WIRES_HOME=~/.wires-agent wires login       # browser: Google; no flags, the invite named the IdP
 agent$ WIRES_HOME=~/.wires-agent wires services    # orders-db  Read-only SQL …  (analyst)
 ```
 
 > "I sign in with Google. The ID token names this machine's key, because the
-> key's hash is the sign-in nonce. `wires services` checks my identity
-> against the list the admin signed, right here, with no network: I'm an
-> analyst, so I see `orders-db`. I never name a machine."
+> key's hash is the sign-in nonce. With it, the directory gives this machine
+> the services the admin's signed list lets me call, each entry signed by the
+> admin: I'm an analyst, so I see `orders-db`. I never name a machine."
 
 ### 4. The agent works
 
@@ -217,8 +220,10 @@ reader$ WIRES_HOME=~/.wires-reader wires watch orders-db
 > every signature and every link."
 
 Point at the `▶ … <you>@gmail.com (…) [analyst] orders-db "select …"` and
-`■ … exit 0 · … ms · … B out` pairs, and at the `✗` line for the refusal in
-beat 2. The agent's own `wires watch` shows only its own person's calls: the
+`■ … exit 0 · … ms · … B out` pairs. If you run the optional beat, the
+reader's own `wires call` stops on the reader's machine (exit 1): it may read
+`orders-db`, not call it, so no host is dialed and nothing is logged. The
+agent's own `wires watch` shows only its own person's calls: the
 isolation boundary is the verified person, so another person's agent sees
 none of these (only hash links, which reveal how many entries and when).
 
@@ -301,13 +306,13 @@ admin$ WIRES_HOME=~/.wires-admin wires remove agent
 
 Then ask Claude Code the question again.
 
-> "One command. The admin signed a new list without the agent and pushed it
-> to the workbench. The workbench applies it from the next call, with no
-> restart and no key to rotate. The agent's next call exits 77 with nothing on
-> stdout."
+> "One command. The admin signed a ban on the agent's key into the list and
+> published it to the directory, which here is the workbench itself. The
+> workbench applies it from the next call, with no restart and no key to
+> rotate. The agent's next call exits 77 with nothing on stdout."
 
-Point at `wires: denied by host: not a member of this network` and the
-exit code.
+Point at `wires: denied by host: not a member of this network; don't retry:
+ask your admin for access` and the exit code.
 
 ### Closing line
 
@@ -328,7 +333,10 @@ exit code.
 - "Encrypted", "channel", "everyone can watch". Records are read from each
   host by the readers the registry names, in full; everyone else sees only
   their own person's.
-- "Nothing about other people reaches the agent." Every member holds the
-  whole signed list (cards 35–37 fix that).
+- "Nothing about other people reaches the agent." Its machine holds only the
+  services it may use (with the roles that may call them and their hosts'
+  keys), and its `wires watch` shows others' records only as hash links, which
+  still reveal how many calls a host logged and when. Hosts and directories
+  hold the whole signed list.
 - "Join by domain." It isn't built (card 18).
 

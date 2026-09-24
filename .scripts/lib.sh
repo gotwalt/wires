@@ -69,11 +69,10 @@ start_mock_idp() {
 }
 
 # Sign keystore $1 in as $2 (the stand-in IdP honours login_hint): `wires
-# login --no-browser` prints the sign-in URL, and curl plays the browser.
+# login --no-browser` prints the sign-in URL, and curl plays the browser. No
+# --issuer or --client-id: the invite carried them (card 37).
 login_as() {
-	WIRES_HOME="$1" "$WIRES" login \
-		--issuer "$ISSUER" --client-id "$CLIENT_ID" --client-secret not-so-secret \
-		--no-browser >"$D/login.out" 2>"$D/login.err" &
+	WIRES_HOME="$1" "$WIRES" login --no-browser >"$D/login.out" 2>"$D/login.err" &
 	local pid=$!
 	wait_for "$D/login.err" "sign in at" 100 || bad "login printed no sign-in URL"
 	local url

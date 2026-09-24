@@ -1,0 +1,14 @@
+Stop trusting an IdP no role names any more, and publish
+
+Usage: wires issuer rm [OPTIONS] <ISSUER>
+
+Arguments:
+  <ISSUER>  The IdP's exact `iss`
+
+Options:
+      --policy-ttl <TTL>  Lifetime of the new policy, from now; never shortens the current one [default: 90d]
+  -h, --help              Print help
+      --help-all          Also list the operator and credential flags
+
+Example:
+  wires issuer rm https://idp.example.com

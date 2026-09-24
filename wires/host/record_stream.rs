@@ -1,18 +1,19 @@
 //! The record stream (card 26b): a host serves its own signed call log
 //! ([`call_log`]) to authorized readers, by key, on
 //! [`ALPN`]. Nothing is broadcast: a record's content leaves the host only
-//! when a reader asks for it and may see it (any other member asking gets
-//! its hash link).
+//! when a reader asks for it and may see it (any other admitted reader asking
+//! gets its hash link).
 //!
 //! # Protocol
 //!
 //! One bi-stream of length-prefixed JSON [`RecordFrame`]s:
 //!
-//! 1. reader → [`RecordFrame::Open`]: its [`Hello`] (membership, state
+//! 1. reader → [`RecordFrame::Open`]: its [`Hello`] (badge, policy
 //!    version, ID token: the same credentials a call presents), the services
 //!    it wants, `since` (its resume point for this view on this host),
 //!    `mine`, `follow`;
-//! 2. host → [`RecordFrame::Denied`] (a non-member gets only
+//! 2. host → [`RecordFrame::Denied`] (a node that isn't admitted: no valid
+//!    badge, or banned, gets only
 //!    [`NOT_ADMITTED`]; nothing else is sent), or [`RecordFrame::Granted`]:
 //!    per requested service assigned to this host, [`Scope::All`] (the
 //!    reader's verified principal is in one of the service's `readers` roles,
@@ -23,8 +24,8 @@
 //!    [`RecordFrame::CaughtUp`]; with `follow`, further batches as the log
 //!    grows, until the reader hangs up.
 //!
-//! A following stream is **re-authorized** whenever the host's signed state
-//! changes and when the reader's ID token, the state or the membership
+//! A following stream is **re-authorized** whenever the host's signed policy
+//! changes and when the reader's ID token, the policy or its badge
 //! expires: the same checks as at open. Access gone → [`RecordFrame::Denied`]
 //! and the stream ends; access changed (e.g. dropped from `readers`) → a new
 //! [`RecordFrame::Granted`], and the entries after it are decided by the new
@@ -98,7 +99,7 @@ pub(crate) const MAX_OPEN_FRAME: usize = 64 * 1024;
 /// unanswered. A decided stream no longer counts.
 pub(crate) const MAX_PREAUTH_READERS: usize = 16;
 
-/// Refusals of readers not known to be members (see [`transport::Throttle`]).
+/// Refusals of readers not known to be admitted (see [`transport::Throttle`]).
 static STRANGERS: transport::Throttle = transport::Throttle::new();
 
 /// How long the host waits for the reader's [`RecordFrame::Open`].
@@ -107,7 +108,7 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Most items per [`RecordFrame::Batch`].
 const BATCH: usize = 256;
 
-/// How often a following stream looks for new entries (and a new state).
+/// How often a following stream looks for new entries (and a new policy).
 const POLL: Duration = Duration::from_millis(200);
 
 /// What a reader may see of one service's records on a host.
@@ -296,18 +297,18 @@ pub(crate) struct View {
     pub(crate) reader: Option<Person>,
     /// What it was granted, per service.
     pub(crate) scopes: BTreeMap<ServiceName, Scope>,
-    /// The signed-state version it was decided under: a newer one means
+    /// The policy version it was decided under: a newer one means
     /// deciding again.
     pub(crate) version: StateVersion,
     /// Unix seconds from which it must be decided again: the earliest expiry
-    /// of the reader's ID token, the state and the membership (see
+    /// of the reader's ID token, the policy and its badge (see
     /// [`deadline`]).
     pub(crate) until: i64,
 }
 
 /// When a view decided at the given expiries must be decided again: the
-/// first second at which the state (`state_not_after`, inclusive), the
-/// membership (`membership_not_after`, inclusive) or the reader's verified
+/// first second at which the signed policy (`state_not_after`, inclusive),
+/// the badge (`membership_not_after`, inclusive) or the reader's verified
 /// ID token (its `exp` plus the host's [`CLOCK_SKEW_SECS`]) no longer holds.
 pub(crate) fn deadline(
     state_not_after: i64,
@@ -369,7 +370,7 @@ impl View {
         }
     }
 
-    /// Whether this view must be decided again: the host's state is now
+    /// Whether this view must be decided again: the host's policy is now
     /// `version` (`None`: unreadable), and it is `now`.
     pub(crate) fn due(&self, version: Option<StateVersion>, now: i64) -> bool {
         version != Some(self.version) || now >= self.until
@@ -436,8 +437,9 @@ impl View {
 }
 
 /// Decide what `caller` (with `hello`) may read of `wanted` on `host` at
-/// `now`: `Err` is the refusal sent to it. A non-member gets only
-/// [`NOT_ADMITTED`]. Membership is checked before anything else.
+/// `now`: `Err` is the refusal sent to it. A node that isn't admitted gets
+/// only [`NOT_ADMITTED`]. Its badge and the bans are checked before anything
+/// else.
 pub(crate) async fn authorize(
     host: &ServicesHost,
     caller: NodeId,
@@ -446,11 +448,11 @@ pub(crate) async fn authorize(
     mine: bool,
     now: i64,
 ) -> std::result::Result<View, String> {
-    let state = host.state().map_err(|e| {
-        tracing::warn!("signed state unusable: {e:#}");
+    let state = host.policy().map_err(|e| {
+        tracing::warn!("signed policy unusable: {e:#}");
         HOST_MISCONFIGURED.to_string()
     })?;
-    let s = &state.state;
+    let s = &state.policy;
     if let Err(detail) = host.check_member(&state, &hello.membership, caller, now) {
         STRANGERS.refused("record stream", caller, &detail);
         return Err(NOT_ADMITTED.to_string());
@@ -458,9 +460,9 @@ pub(crate) async fn authorize(
     if let Err(e) = state.check_fresh(now) {
         tracing::warn!(
             version = s.version.0,
-            "record stream: signed state not fresh: {e}"
+            "record stream: signed policy not fresh: {e}"
         );
-        return Err("this host's signed state is not fresh; try again later".to_string());
+        return Err("this host's signed policy is not fresh; try again later".to_string());
     }
     let (principal, _) = host.principal(caller, hello.id_token.as_ref(), now).await;
     let mut scopes = BTreeMap::new();
@@ -494,7 +496,7 @@ pub(crate) async fn authorize(
 /// readers wait for a decision at once.
 #[derive(Clone, Debug)]
 pub(crate) struct RecordStream {
-    /// The host (its signed state, identity verifier, trust root).
+    /// The host (its signed policy, identity verifier, trust root).
     host: Arc<ServicesHost>,
     /// The call log file.
     log: PathBuf,
@@ -656,7 +658,7 @@ where
         // Decide again before sending anything new: a reader removed (or
         // dropped from `readers`) gets nothing logged after that.
         let now = crate::clock::now_unix();
-        let version = host.state().ok().map(|s| s.state.version);
+        let version = host.policy().ok().map(|s| s.version());
         let regrant = if view.due(version, now) {
             let next = match decide(now).await {
                 Ok(next) => next,
@@ -988,8 +990,8 @@ mod tests {
         ));
     }
 
-    /// A view is decided again on a new state, an unreadable one, and at the
-    /// earliest of the token's, the state's and the membership's expiry.
+    /// A view is decided again on a new policy, an unreadable one, and at the
+    /// earliest of the token's, the policy's and the badge's expiry.
     #[test]
     fn a_view_is_due_on_a_new_state_and_at_its_deadline() {
         let token = alice(); // exp 1_000

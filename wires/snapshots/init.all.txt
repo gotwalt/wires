@@ -1,0 +1,24 @@
+Create the network: the root key, this node's key and badge, the first policy
+
+Usage: wires init [OPTIONS]
+
+Options:
+      --ttl <TTL>
+          Lifetime of this node's badge (`30d`, `12h`, … or seconds; at most 30d) [default: 30d]
+      --policy-ttl <POLICY_TTL>
+          Lifetime of the first signed policy [default: 90d]
+      --issuer <ISSUER>
+          The IdP the network trusts first: its exact `iss` (more: `wires issuer set`) [default: https://accounts.google.com]
+      --client-id <CLIENT_ID>
+          The OAuth client id `wires login` signs in under (or `$WIRES_OIDC_CLIENT_ID`)
+      --audience <AUDIENCE>
+          An `aud` value hosts accept from that IdP (repeatable; default: the client id)
+      --public-client-secret <PUBLIC_CLIENT_SECRET>
+          That client's public secret, which invites carry to `wires login`
+  -h, --help
+          Print help
+      --help-all
+          Also list the operator and credential flags
+
+Example:
+  wires init --client-id <desktop client id> --public-client-secret <its secret>

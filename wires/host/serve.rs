@@ -3,9 +3,12 @@
 //! What the host implements — each service's command, working directory and
 //! environment, the IdPs it trusts, stricter local rules, push, and where its
 //! call log is exported — comes from `host.json` (version 2, see
-//! [`config`](super::config)). Who may call is the admin-signed state's
-//! to say. The flags left are where the host's own credentials live and
-//! `--relay-url`.
+//! [`config`](super::config)). Who may call, and which IdPs are trusted,
+//! is the admin-signed policy's to say (`host.json` can only narrow). The
+//! flags left are where the host's own credentials live and `--relay-url`.
+//!
+//! When the policy lists this node in `directories`, `serve` also runs the
+//! directory ([`crate::directory`]) on the same endpoint.
 //!
 //! `wires serve --check host.json` validates the file and prints what it
 //! means, without touching the keystore or the network.
@@ -19,7 +22,9 @@ use library::NodeId;
 
 use super::config::HostConfig;
 use super::native::NativeServices;
-use super::{call_log, capability, control, gate, identity, otlp, push, transport};
+use super::{
+    call_log, capability, control, follow, freshness, gate, identity, otlp, push, transport,
+};
 use crate::admin::keystore;
 use crate::caller::jwks;
 use crate::init_logging;
@@ -28,40 +33,40 @@ use crate::init_logging;
 /// credentials come from.
 #[derive(Args)]
 pub(crate) struct ServeArgs {
-    /// The host's config: the services it implements, trusted IdPs, push
-    /// (see `wires serve --check`).
+    /// The host's config: the services it implements, its IdPs, push.
     #[arg(value_name = "HOST_JSON")]
     pub(crate) config: PathBuf,
-    /// Validate HOST_JSON, print the services it implements and which
-    /// issuers are trusted, and exit.
+    /// Check HOST_JSON, print the services it implements and its IdPs; exit.
     #[arg(long)]
     pub(crate) check: bool,
     /// Hex 32-byte seed of this host's node key. Falls back to
     /// `$WIRES_NODE_SEED`, then `--node-seed-file`, then the keystore (`node.seed`).
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub(crate) node_seed: Option<String>,
     /// Read the node key seed (hex) from this file instead of the keystore.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub(crate) node_seed_file: Option<PathBuf>,
     /// Use a self-hosted relay at this URL instead of the n0 default.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub(crate) relay_url: Option<String>,
-    /// The host's own membership token: it names the network (its root key)
-    /// whose signed state decides every call, and is presented in the
-    /// `HelloAck`. Falls back to `$WIRES_MEMBERSHIP`, then
-    /// `--membership-file`, then the keystore (`membership.json`).
-    #[arg(long)]
+    /// The host's own membership token (its badge), instead of the keystore's.
+    // It names the network (its root key) whose signed policy decides every
+    // call, and is presented in the `HelloAck`. Falls back to
+    // `$WIRES_MEMBERSHIP`, then `--membership-file`, then the keystore
+    // (`membership.json`).
+    #[arg(long, hide = true)]
     pub(crate) membership: Option<String>,
     /// Read the host's membership token from this file.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub(crate) membership_file: Option<PathBuf>,
 }
 
-/// `serve`: refuse to start unless this node holds a fresh signed state that
-/// assigns every service in `host.json` to it; then serve the session ALPN,
-/// the state ALPN (members pull newer states from hosts), and — with `push` —
-/// the inbox ALPN plus a local control socket for `wires push`, deciding
-/// every call by the signed state as it stands at that connection.
+/// `serve`: refuse to start unless this node holds a fresh signed policy
+/// that assigns every service in `host.json` to it (fetching one from a
+/// directory first if it doesn't); then serve the session and record-stream
+/// ALPNs (the directory's too, when the policy lists this node), and — with
+/// `push` — the inbox ALPN plus a local control socket for `wires push`,
+/// deciding every call by the signed policy as it stands at that connection.
 pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     let config = HostConfig::load(&a.config)?;
     if a.check {
@@ -92,12 +97,12 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
 pub(crate) struct Serving {
     /// This host's node key.
     pub(crate) node: library::NodeIdentity,
-    /// Its membership, which names the network whose signed state decides.
+    /// Its membership, which names the network whose signed policy decides.
     pub(crate) membership: library::Membership,
-    /// Its keystore: the signed state, the call log, the push queue.
+    /// Its keystore: the signed policy, the call log, the push queue.
     pub(crate) keystore: Arc<keystore::Keystore>,
-    /// How it implements its CLI services, which IdPs it trusts, push, and
-    /// audit export.
+    /// How it implements its CLI services, how it narrows the trusted IdPs,
+    /// push, and audit export.
     pub(crate) config: HostConfig,
     /// The services it implements in-process (card 33).
     pub(crate) native: NativeServices,
@@ -116,17 +121,20 @@ pub(crate) enum Binding {
         loopback_only: bool,
     },
     /// Serve on an endpoint already bound for this host's key: hermetic
-    /// loopback, for tests. A host that has to pull a state before it can
-    /// start fails instead (it has no relay to pull through).
+    /// loopback, for tests. A host that has to fetch a policy before it can
+    /// start fails instead (it has no relay to fetch through).
     #[cfg(test)]
     Endpoint(iroh::Endpoint),
 }
 
 /// Serve `serving` until `shutdown` resolves: refuse to start unless the
-/// node holds a fresh signed state that assigns every service to it (pulling
-/// one first if it doesn't), open the call log, then serve the session,
-/// state and record-stream ALPNs (and push, when configured), deciding every
-/// call by the signed state as it stands at that connection.
+/// node holds a fresh signed policy that assigns every service to it
+/// (fetching one from a directory first if it doesn't), open the call log,
+/// then serve the session and record-stream ALPNs (the directory's when the
+/// policy lists this node, and push when configured), deciding every call
+/// by the signed policy as it stands at that connection (and its signed
+/// freshness rule), and following a directory's `policy` subscription for
+/// every edit and `Fresh` ([`follow`]).
 pub(crate) async fn serve_until(
     serving: Serving,
     shutdown: impl std::future::Future<Output = anyhow::Result<()>>,
@@ -141,11 +149,11 @@ pub(crate) async fn serve_until(
     } = serving;
     let mut host = services_host(node.node_id(), membership, Arc::clone(&ks), config)?;
     host.native = native;
-    // A host assigned a service while it was offline: pull, then try again.
+    // A host assigned a service while it was offline: fetch, then try again.
     let state = match (host.preflight(crate::clock::now_unix()), &binding) {
         (Ok(state), _) => state,
         (Err(e), Binding::N0 { relay_url, .. }) => {
-            match crate::state::sync::pull_now(&ks, &node, relay_url.as_deref()).await {
+            match crate::policy::fetch::fetch_now(&ks, &node, relay_url.as_deref()).await {
                 Ok(Some(_)) => host.preflight(crate::clock::now_unix())?,
                 _ => return Err(e),
             }
@@ -154,11 +162,25 @@ pub(crate) async fn serve_until(
         (Err(e), Binding::Endpoint(_)) => return Err(e),
     };
     tracing::info!(
-        state_version = state.state.version.0,
+        policy_version = state.version().0,
         services = host.config.services.len(),
         native = host.native.len(),
-        "signed state assigns every service to this host"
+        "signed policy assigns every service to this host"
     );
+    // The directory, when the policy lists this node (card 36).
+    let directory = if state.directories().contains(&node.node_id()) {
+        let dir = crate::directory::node::Directory::open(
+            node.duplicate(),
+            membership_fabric(&host),
+            Arc::clone(&ks),
+            crate::directory::node::DEFAULT_MAX_SUBSCRIBERS,
+            crate::clock::now_unix(),
+        )?;
+        tracing::info!(version = dir.version().0, "this host is also a directory");
+        Some(dir)
+    } else {
+        None
+    };
     let exporter = match host.config.audit.as_ref().and_then(|a| a.otlp.as_deref()) {
         Some(url) => Some(otlp::Exporter::spawn(url)?.0),
         None => None,
@@ -204,15 +226,40 @@ pub(crate) async fn serve_until(
     if let Err(e) = crate::caller::pick::write_own_hint(&ks, &endpoint) {
         tracing::warn!("could not write this host's hint line: {e:#}");
     }
-    let router = services_router(endpoint.clone(), Arc::clone(&host), push.clone());
-    // A push missed while down is pulled on a timer, until serving ends
-    // (dropping `stop_refresh` stops it).
-    let (stop_refresh, refresh_stopped) = tokio::sync::oneshot::channel::<()>();
-    let refresh = tokio::spawn(crate::state::sync::refresh_loop(
+    let router = services_router(
         endpoint.clone(),
-        Arc::clone(&ks),
-        refresh_stopped,
-    ));
+        Arc::clone(&host),
+        push.clone(),
+        directory.as_ref(),
+    );
+    // The policy's edits, and its freshness, from a directory's `policy`
+    // subscription (card 36c), until serving ends. It never holds up
+    // serving: until a directory answers, calls are decided from the
+    // policy on disk.
+    let mut following = tokio::task::JoinSet::new();
+    following.spawn(
+        follow::Follower {
+            endpoint: endpoint.clone(),
+            ks: Arc::clone(&ks),
+            root: host.trust_root,
+            badge: host.membership.clone(),
+            freshness: Arc::clone(&host.freshness),
+            runs_directory: directory.is_some(),
+            stats: Default::default(),
+        }
+        .run(),
+    );
+    if let Some(dir) = &directory {
+        following.spawn(follow::vouch_from_local(
+            Arc::clone(dir),
+            Arc::clone(&ks),
+            host.trust_root,
+            Arc::clone(&host.freshness),
+        ));
+    }
+    let running = directory.map(|dir| {
+        crate::directory::serve::Running::start(dir, endpoint.clone(), host.membership.clone())
+    });
     let ended = match push.zip(push_queue) {
         Some((push, (commands_tx, commands))) => {
             match push_sockets(&ks.path(""), &host, commands_tx).await {
@@ -232,10 +279,13 @@ pub(crate) async fn serve_until(
         None => shutdown.await,
     };
     // Stop everything this host started, so an app that embeds it can go
-    // on without it: the refresh, the router (its protocols and
-    // sessions), and the endpoint (the socket and the relay connection).
-    drop(stop_refresh);
-    let _ = refresh.await;
+    // on without it: the subscription, the directory's loops, the router
+    // (its protocols and sessions), and the endpoint (the socket and the
+    // relay connection).
+    following.shutdown().await;
+    if let Some(running) = running {
+        running.stop().await;
+    }
     if let Err(e) = router.shutdown().await {
         tracing::warn!("a protocol handler failed while shutting down: {e}");
     }
@@ -249,8 +299,14 @@ pub(crate) async fn serve_until(
 /// The file whose presence marks an admin keystore.
 const ROOT_SEED: &str = "root.seed";
 
+/// The fabric `host` decides for.
+fn membership_fabric(host: &gate::ServicesHost) -> NodeId {
+    host.trust_root
+}
+
 /// A host for `me` (before its call log is attached): its identity verifier
-/// trusts exactly `config`'s issuers and keeps their keys **in memory only**
+/// trusts the signed policy's issuers as `config` narrows them (updated
+/// whenever it reads a newer policy), and keeps their keys **in memory only**
 /// (a key set on disk could have been planted by anything running as this
 /// user, a service child included). With `push` on, calls get a per-call
 /// push capability on a child socket in a private directory of its own
@@ -273,7 +329,22 @@ pub(crate) fn services_host(
         );
     }
     let fetcher = jwks::KeyFetcher::new(None)?;
-    let identities = Arc::new(identity::Identities::new(fetcher, config.identity.trust()));
+    // The trust follows the policy the host decides under
+    // ([`gate::ServicesHost::policy`]); until one is read, none.
+    let identities = Arc::new(identity::Identities::new(
+        fetcher,
+        identity::IdpTrust::per_issuer(Vec::new()),
+    ));
+    // The freshness it last held, if it still vouches for the policy on
+    // disk: a restarted host knows how recently its copy was vouched for.
+    let head = crate::policy::store::read(&keystore, membership.fabric)
+        .ok()
+        .flatten()
+        .map(|h| h.signed.head);
+    let freshness = Arc::new(freshness::Freshness::load(
+        Arc::clone(&keystore),
+        head.as_ref(),
+    ));
     let push_grants = match config.push {
         Some(_) => Some(
             capability::PushGrants::new()
@@ -292,6 +363,7 @@ pub(crate) fn services_host(
         audit: None,
         push_grants,
         push_commands: None,
+        freshness,
         high_water: Default::default(),
     })
 }
@@ -317,21 +389,21 @@ pub(crate) async fn push_sockets(
     Ok(handles)
 }
 
-/// Serve a host on `endpoint`: the session ALPN, the state ALPN (so members
-/// can pull newer signed states from it, and the admin's pushes land), the
-/// record stream (`wires watch`, card 26b), plus the inbox ALPN when it
-/// pushes (and push's direct deliveries dial from
+/// Serve a host on `endpoint`: the session ALPN, the record stream (`wires
+/// watch`, card 26b), the directory's two ALPNs when this node is one, plus
+/// the inbox ALPN when it pushes (and push's direct deliveries dial from
 /// this endpoint). Keep the router alive for as long as the host serves.
 pub(crate) fn services_router(
     endpoint: iroh::Endpoint,
     host: Arc<gate::ServicesHost>,
     push: Option<Arc<push::PushHost>>,
+    directory: Option<&Arc<crate::directory::node::Directory>>,
 ) -> iroh::protocol::Router {
-    let mut builder = iroh::protocol::Router::builder(endpoint.clone())
-        .accept(
-            library::STATE_ALPN,
-            crate::state::sync::StateResponder::new(Arc::clone(&host.keystore)),
-        )
+    let mut builder = iroh::protocol::Router::builder(endpoint.clone());
+    if let Some(dir) = directory {
+        builder = crate::directory::serve::Running::mount(builder, dir);
+    }
+    let mut builder = builder
         .accept(
             transport::ALPN,
             transport::ServicesProtocol::new(Arc::clone(&host)),
@@ -385,20 +457,31 @@ mod tests {
             r#"{{"version":2,{identity}"services":{{"status":{{"command":["true"]}}}}}}"#
         ))
         .unwrap();
-        services_host(
+        let host = services_host(
             me,
             library::Membership::mint(&root, me, 0, i64::MAX).unwrap(),
             Arc::new(keystore::Keystore::at(home)),
             config,
-        )
+        )?;
+        // As if it had read a policy trusting `issuer`.
+        if let Some(iss) = issuer {
+            host.identities
+                .set_trust(identity::IdpTrust::per_issuer(vec![(
+                    iss.clone(),
+                    vec![library::Audience::new(
+                        crate::caller::mock_idp::MOCK_CLIENT_ID,
+                    )],
+                )]));
+        }
+        Ok(host)
     }
 
-    fn signed(version: u64) -> library::SignedState {
+    fn signed(version: u64) -> library::SignedPolicy {
         let root = library::NodeIdentity::from_seed([1u8; 32]);
-        let mut s = library::State::new(root.node_id());
+        let mut s = library::Policy::new(root.node_id());
         s.version = library::StateVersion(version);
         s.not_after = i64::MAX;
-        s.sign(&root).unwrap()
+        crate::testutil::signed_policy(&root, s)
     }
 
     #[test]
@@ -419,20 +502,58 @@ mod tests {
         let ks = keystore::Keystore::at(&home);
         let root = library::NodeIdentity::from_seed([1u8; 32]).node_id();
         let now = crate::clock::now_unix();
-        crate::state::store::adopt_if_newer(&ks, &signed(1), root, now).unwrap();
-        assert_eq!(host.state().unwrap().state.version.0, 1);
-        crate::state::store::adopt_if_newer(&ks, &signed(2), root, now).unwrap();
-        assert_eq!(host.state().unwrap().state.version.0, 2);
+        crate::policy::store::adopt_if_newer(&ks, &signed(1), root, now).unwrap();
+        assert_eq!(host.policy().unwrap().version().0, 1);
+        crate::policy::store::adopt_if_newer(&ks, &signed(2), root, now).unwrap();
+        assert_eq!(host.policy().unwrap().version().0, 2);
         // Someone with write access puts version 1 back: it still verifies.
-        let old = signed(1).encode().unwrap();
-        std::fs::write(ks.path(crate::state::store::STATE_FILE), format!("{old}\n")).unwrap();
-        let e = format!("{:#}", host.state().unwrap_err());
+        let old = serde_json::to_string(&signed(1)).unwrap();
+        std::fs::write(
+            ks.path(crate::policy::store::POLICY_FILE),
+            format!("{old}\n"),
+        )
+        .unwrap();
+        let e = format!("{:#}", host.policy().unwrap_err());
         assert!(e.contains("version 1") && e.contains("version 2"), "{e}");
-        // The push rule reads the same state, and refuses too.
+        // The push rule reads the same policy, and refuses too.
         assert!(host.decide_push(host.me, now).is_err());
-        // A state at least as new as the mark is decided under again.
-        crate::state::store::adopt_if_newer(&ks, &signed(3), root, now).unwrap();
-        assert_eq!(host.state().unwrap().state.version.0, 3);
+        // A policy at least as new as the mark is decided under again.
+        crate::policy::store::adopt_if_newer(&ks, &signed(3), root, now).unwrap();
+        assert_eq!(host.policy().unwrap().version().0, 3);
+    }
+
+    /// The signed freshness rule: `lenient` decides whatever the host's
+    /// freshness; `strict` only while a current `Fresh` vouches for the
+    /// head it decides under.
+    #[test]
+    fn strict_decides_only_while_a_directory_vouches() {
+        let home = crate::testutil::temp_dir();
+        let host = host_at(&home, None).unwrap();
+        let root = library::NodeIdentity::from_seed([1u8; 32]);
+        let dir = library::NodeIdentity::from_seed([30u8; 32]);
+        let held = |mode| {
+            let mut p = library::Policy::new(root.node_id());
+            p.version = library::StateVersion(2);
+            p.not_after = i64::MAX;
+            p.directories = vec![dir.node_id()];
+            p.settings.freshness = mode;
+            crate::testutil::held(&root, p)
+        };
+        let (lenient, strict) = (
+            held(library::FreshnessMode::Lenient),
+            held(library::FreshnessMode::Strict),
+        );
+        assert!(host.check_vouched(&lenient, 100).is_ok());
+        let refused = host.check_vouched(&strict, 100).unwrap_err();
+        assert_eq!(refused.to_string(), freshness::STALE);
+        assert!(!refused.needs_identity());
+        let fresh = library::Fresh::sign(&dir, &strict.signed.head, 100, 200).unwrap();
+        host.freshness
+            .offer(&fresh, &strict.signed.head, 100)
+            .unwrap();
+        assert!(host.check_vouched(&strict, 150).is_ok());
+        assert!(host.check_vouched(&strict, 201).is_err());
+        assert!(host.check_vouched(&lenient, 201).is_ok());
     }
 
     /// A key set on disk in the host's home (a caller's cache, or one planted

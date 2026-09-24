@@ -1,0 +1,28 @@
+Run host.json's services: check every caller, run the call, log it
+
+Usage: wires serve [OPTIONS] <HOST_JSON>
+
+Arguments:
+  <HOST_JSON>  The host's config: the services it implements, its IdPs, push
+
+Options:
+      --check
+          Check HOST_JSON, print the services it implements and its IdPs; exit
+      --node-seed <NODE_SEED>
+          Hex 32-byte seed of this host's node key. Falls back to `$WIRES_NODE_SEED`, then `--node-seed-file`, then the keystore (`node.seed`)
+      --node-seed-file <NODE_SEED_FILE>
+          Read the node key seed (hex) from this file instead of the keystore
+      --relay-url <RELAY_URL>
+          Use a self-hosted relay at this URL instead of the n0 default
+      --membership <MEMBERSHIP>
+          The host's own membership token (its badge), instead of the keystore's
+      --membership-file <MEMBERSHIP_FILE>
+          Read the host's membership token from this file
+  -h, --help
+          Print help
+      --help-all
+          Also list the operator and credential flags
+
+Examples:
+  wires serve --check host.json
+  wires serve host.json

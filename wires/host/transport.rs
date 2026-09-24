@@ -4,9 +4,9 @@
 //! key-addressed session meets the iroh QUIC endpoint. The session ALPN is
 //! [`ALPN`]. A caller opens a bi-stream and sends a
 //! [`Frame::Hello`] — its root-signed membership, the
-//! signed-state version it holds, and its IdP ID token — followed at once by
+//! policy version it holds, and its IdP ID token — followed at once by
 //! a [`Frame::Invoke`] naming a service plus per-call arguments. The host
-//! ([`serve_session_permitted`]) decides by the signed state it holds, re-read
+//! ([`serve_session_permitted`]) decides by the signed policy it holds, re-read
 //! per connection (see [`gate`](crate::host::gate)), then execs the
 //! service's fixed argv with the caller's arguments appended — never through
 //! a shell — with the verified caller identity injected into its
@@ -18,7 +18,7 @@
 //!   [`Frame::Denied`] carrying the reason before closing, which the dialer
 //!   surfaces as a [`Denied`] error (`wires call` exits 77). Nothing the
 //!   dialer sends or receives on a refused session ever reaches its stdout.
-//! - **Refusals are current.** The signed state is re-read on every
+//! - **Refusals are current.** The signed policy is re-read on every
 //!   connection, so a `wires remove` takes effect on the next dial rather
 //!   than the next restart.
 //! - **Strangers are cheap.** Anyone can open a connection, so until the
@@ -37,8 +37,7 @@ use iroh::endpoint::presets::N0;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 
 use library::{
-    Chunk, Frame, Hello, Invocation, NodeId, NodeIdentity, ServiceName, SignedState,
-    check_inclusion,
+    Chunk, Frame, Hello, HelloAck, Invocation, NodeId, NodeIdentity, ServiceName, check_inclusion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
@@ -60,7 +59,7 @@ const PUMP_BUF: usize = 64 * 1024;
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// Largest [`Frame::Hello`] a host reads, before it knows who is asking: a
-/// membership, a state version and an ID token fit in a few KiB.
+/// badge, a policy version and an ID token fit in a few KiB.
 pub(crate) const MAX_HELLO_FRAME: usize = 64 * 1024;
 
 /// Largest [`Frame::Invoke`] a host reads before admitting the caller. An
@@ -584,7 +583,7 @@ impl ServicesProtocol {
     }
 }
 
-/// Refusals of peers not known to be members (see [`Throttle`]).
+/// Refusals of peers not known to be admitted (see [`Throttle`]).
 static STRANGERS: Throttle = Throttle::new();
 
 impl iroh::protocol::ProtocolHandler for ServicesProtocol {
@@ -677,9 +676,10 @@ where
 /// The host side of a session, over an authenticated bi-stream: read the
 /// [`Frame::Hello`] (at most [`MAX_HELLO_FRAME`]) and the [`Frame::Invoke`]
 /// (at most [`MAX_INVOKE_FRAME`]), then decide by **this host's** signed
-/// state (re-read now, so a removal applies on the next dial):
+/// policy (re-read now, so a removal applies on the next dial):
 ///
-/// 1. the caller's membership credential, and that the state lists it
+/// 1. the caller's badge (membership credential), and that the policy
+///    doesn't ban it
 ///    ([`ServicesHost::check_member`](crate::host::gate::ServicesHost::check_member)).
 ///    Anyone else hears only [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED),
 ///    costs no token verification, and is traced, not logged;
@@ -688,14 +688,16 @@ where
 ///    assigned here → registry role → `also_require`;
 /// 4. whether `host.json` implements the service.
 ///
-/// A member's refusal is a [`Frame::Denied`] plus a call-log record.
+/// An admitted caller's refusal is a [`Frame::Denied`] plus a call-log
+/// record.
 /// `preauth` is returned once this is decided.
 ///
 /// Admitted: the call's `Started` is appended to the call log and `fsync`ed
 /// **before** anything else — if it can't be, the call is refused with
 /// [`DENY_LOG_UNAVAILABLE`] and nothing runs. Then a [`Frame::HelloAck`]
-/// carrying this host's membership and state version, plus the state itself
-/// when the caller's copy is older (the cheapest pull), then the service's
+/// carrying this host's badge and policy version, plus the policy head and
+/// the called service's signed entry when the caller's view is older (so it
+/// checks this host is still assigned before stdin, then refreshes), then the service's
 /// command with the caller's argv appended (never a shell), in its `cwd`
 /// with its `env`, and the server-derived `WIRES_*` variables.
 pub(crate) async fn serve_session_permitted<S, R>(
@@ -745,23 +747,23 @@ where
     let service = invocation.service.clone();
     let now = crate::clock::now_unix();
 
-    let state = match host.state() {
+    let state = match host.policy() {
         Ok(state) => state,
         Err(e) => {
             // The host's own fault, not the caller's: an operator error.
-            tracing::warn!("signed state unusable: {e:#}");
+            tracing::warn!("signed policy unusable: {e:#}");
             let reason = crate::host::gate::HOST_MISCONFIGURED;
             deny(&mut send, reason.to_string()).await;
             return Err(Refused(reason.to_string()).into());
         }
     };
-    // Membership first: a stranger costs no token verification (no JWKS
-    // fetch, no identity-index entry) and no call-log entry.
+    // The badge and the bans first: a stranger costs no token verification
+    // (no JWKS fetch, no identity-index entry) and no call-log entry.
     if let Err(detail) = host.check_member(&state, &hello.membership, caller, now) {
         let reason = crate::host::gate::NOT_ADMITTED;
         return Err(refuse_stranger(&mut send, caller, reason, &detail).await);
     }
-    // A member from here on: every refusal is logged.
+    // Admitted from here on: every refusal is logged.
     let (principal, missing) = host.principal(caller, hello.id_token.as_ref(), now).await;
     let admitted = match host.decide(
         &state,
@@ -786,13 +788,13 @@ where
     drop(preauth);
     let version = admitted.state_version;
     if hello.state_version > version {
-        // The caller saw a newer state than ours; we still decide by ours
-        // (its state pull catches this host up).
+        // The caller saw a newer policy than ours; we still decide by ours
+        // (our directory subscription catches this host up).
         tracing::info!(
             caller = %caller.hex(),
             theirs = hello.state_version.0,
             ours = version.0,
-            "caller holds a newer signed state"
+            "caller holds a newer signed policy"
         );
     }
     tracing::info!(
@@ -826,10 +828,16 @@ where
             return Err(Refused(DENY_LOG_UNAVAILABLE.to_string()).into());
         }
     };
-    let ack = Frame::HelloAck(library::HelloAck {
+    // Card 37: a caller whose view is older gets this host's head and the
+    // service's entry, to check the host is still assigned before stdin.
+    let news = hello.state_version < version;
+    let ack = Frame::HelloAck(HelloAck {
         membership: host.membership.clone(),
         state_version: version,
-        newer_state: (hello.state_version < version).then(|| state.clone()),
+        head: news.then(|| state.signed.head.clone()),
+        entry: news
+            .then(|| state.signed.entries().find(|e| e.name == service).cloned())
+            .flatten(),
     });
     if let Err(e) = write_frame(&mut send, &ack).await {
         // The caller is gone before anything ran: close the logged call.
@@ -1009,7 +1017,7 @@ impl Denied {
 pub(crate) struct ServiceDialed {
     /// The host that ran the call.
     pub(crate) host: NodeId,
-    /// The remote exit code and any newer state.
+    /// The remote exit code.
     pub(crate) dialed: Dialed,
 }
 
@@ -1018,8 +1026,9 @@ pub(crate) struct ServiceDialed {
 /// `hello`, send `invocation` and bridge stdio on that one.
 ///
 /// `on_ack` runs once the host's `HelloAck` has verified and **before** any
-/// stdin is forwarded, with the host's id and the newer state it handed back
-/// (if any): the caller adopts that state there and may abort the call.
+/// stdin is forwarded, with the host's id and the ack (its head version,
+/// and the head and service entry when newer than the caller's view): the
+/// caller checks the host is still assigned there and may abort the call.
 ///
 /// Fails over **only on a dial failure**: once a host has answered, its
 /// refusal ([`Denied`]) or a mid-session error is final (it decided, and
@@ -1032,7 +1041,7 @@ pub(crate) async fn call_service_on<R, W, E>(
     dial_timeout: std::time::Duration,
     hello: Hello,
     invocation: Invocation,
-    on_ack: impl FnOnce(NodeId, Option<&SignedState>) -> Result<()>,
+    on_ack: impl FnOnce(NodeId, &HelloAck) -> Result<()>,
     stdin: R,
     stdout: W,
     stderr: E,
@@ -1072,7 +1081,7 @@ where
             hello,
             invocation,
             host,
-            |newer| on_ack(host, newer),
+            |ack| on_ack(host, ack),
             stdin,
             stdout,
             stderr,
@@ -1084,7 +1093,10 @@ where
     if failures.is_empty() {
         bail!("no host to dial");
     }
-    bail!("no host answered ({})", failures.join("; "))
+    bail!(
+        "no host answered ({}); try again later, or ask your admin whether its hosts are up",
+        failures.join("; ")
+    )
 }
 
 /// What a finished dial came to: the remote exit code.
@@ -1094,7 +1106,7 @@ pub(crate) struct Dialed {
     pub(crate) exit: i32,
 }
 
-/// [`dial_opened_with`] with nothing to do at the ack (a newer state the
+/// [`dial_opened_with`] with nothing to do at the ack (a newer head the
 /// host hands back is ignored): the session tests' form.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
@@ -1133,8 +1145,8 @@ where
 /// (the iroh-authenticated host). Presents the `hello`, then reads the
 /// host's [`HelloAck`](library::HelloAck), verifies the membership in it
 /// against the dialer's own network root and `target`, then runs `on_ack`
-/// with the ack's newer state, all **before** any stdin is forwarded. On any
-/// failure, aborts with no stdin sent.
+/// with the ack, all **before** any stdin is forwarded. On any failure,
+/// aborts with no stdin sent.
 ///
 /// The [`Frame::Invoke`] carrying `invocation` follows the opening
 /// immediately, without waiting for the ack.
@@ -1148,7 +1160,7 @@ pub(crate) async fn dial_opened_with<S, R, I, W, E>(
     hello: Hello,
     invocation: Invocation,
     target: NodeId,
-    on_ack: impl FnOnce(Option<&SignedState>) -> Result<()>,
+    on_ack: impl FnOnce(&HelloAck) -> Result<()>,
     stdin: I,
     mut stdout: W,
     mut stderr: E,
@@ -1166,8 +1178,8 @@ where
     write_frame(&mut send, &Frame::Invoke(invocation)).await?;
 
     // Read the host's ack first (it is always the host's first frame).
-    let (ack_membership, newer_state) = match read_frame(&mut recv).await? {
-        Some(Frame::HelloAck(ack)) => (ack.membership, ack.newer_state),
+    let ack = match read_frame(&mut recv).await? {
+        Some(Frame::HelloAck(ack)) => ack,
         // Refused: surface the host's reason. No stdin task has been
         // spawned yet, so nothing was forwarded and nothing hit local stdout.
         Some(Frame::Denied { reason }) => return Err(Denied::new(reason).into()),
@@ -1176,10 +1188,10 @@ where
     };
     // Before any stdin: the host's membership must be one our root signed
     // for this very key, and current. Whether the host is still assigned the
-    // service is `on_ack`'s to check, against the signed state.
-    check_inclusion(&ack_membership, root, target, crate::clock::now_unix())
+    // service is `on_ack`'s to check, against the ack's head and entry.
+    check_inclusion(&ack.membership, root, target, crate::clock::now_unix())
         .map_err(|e| anyhow!("the host's membership was rejected (no stdin sent): {e}"))?;
-    on_ack(newer_state.as_ref())?;
+    on_ack(&ack)?;
 
     // Local stdin -> Stdin frames, then shut down the send direction (EOF).
     let stdin_task = tokio::spawn(async move {
@@ -1232,7 +1244,7 @@ mod tests {
     use crate::admin::keystore::Keystore;
     use crate::host::config::HostConfig;
     use crate::host::gate::ServicesHost;
-    use library::{Argv, Membership, Service, State, StateVersion};
+    use library::{Argv, Membership, Policy, Service, StateVersion};
 
     #[test]
     fn a_service_child_gets_a_minimal_environment() {
@@ -1294,8 +1306,8 @@ mod tests {
     }
 
     /// A host implementing service `t` as `command`, allowed to role `staff`
-    /// (anyone the shared test IdP verified); the caller and the host are the
-    /// members of its signed state.
+    /// (anyone the shared test IdP verified); its signed policy bans
+    /// [`stranger`]`(7)`.
     fn host_running(command: &[&str]) -> Arc<ServicesHost> {
         Arc::new(host_unshared(command))
     }
@@ -1309,15 +1321,14 @@ mod tests {
 
     /// [`host_running`], before it is shared.
     fn host_unshared(command: &[&str]) -> ServicesHost {
-        let (root, host, caller) = (root(), host_id(), caller_id());
+        let (root, host) = (root(), host_id());
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);
-        let mut s = State::new(root.node_id());
+        let mut s = Policy::new(root.node_id());
         s.version = StateVersion(1);
         s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
-        s.members.extend([host.node_id(), caller.node_id()]);
-        s.hosts.insert(host.node_id());
+        s.ban(stranger(7).0, i64::MAX);
         let (staff, matchers) = crate::testutil::staff_role();
         s.roles.insert(staff.clone(), matchers);
         s.services.insert(
@@ -1329,9 +1340,14 @@ mod tests {
                 readers: vec![],
             },
         );
-        let signed = s.sign(&root).unwrap();
-        crate::state::store::adopt_if_newer(&ks, &signed, root.node_id(), crate::clock::now_unix())
-            .unwrap();
+        let signed = crate::testutil::signed_policy(&root, s);
+        crate::policy::store::adopt_if_newer(
+            &ks,
+            &signed,
+            root.node_id(),
+            crate::clock::now_unix(),
+        )
+        .unwrap();
         let config = HostConfig::parse(&format!(
             r#"{{"version":2,"identity":{},"services":{{"t":{{"command":{}}}}}}}"#,
             crate::testutil::test_identity_json(),
@@ -1347,7 +1363,7 @@ mod tests {
         .unwrap()
     }
 
-    /// The caller's `Hello` (membership under the root, state version 1, and
+    /// The caller's `Hello` (badge under the root, policy version 1, and
     /// an ID token from the shared test IdP: service `t` needs `staff`).
     fn hello() -> Hello {
         Hello {
@@ -1743,8 +1759,8 @@ mod tests {
         refusal_by(&host_running(&["cat"]), encoded(frames), caller).await
     }
 
-    /// A key that is not in the state, with a membership the root really
-    /// minted for it (so only the state's member list keeps it out).
+    /// A key the policy bans, with a badge the root really minted for it (so
+    /// only the ban keeps it out).
     fn stranger(seed: u8) -> (NodeId, Hello) {
         let id = NodeIdentity::from_seed([seed; 32]).node_id();
         let hello = Hello {
@@ -1764,9 +1780,9 @@ mod tests {
         assert_eq!(r, DENY_INVOKE_REQUIRED);
     }
 
-    /// Whatever keeps a peer out — someone else's credential, a credential
-    /// from another network, or a genuine one the state doesn't list — it
-    /// hears the one fixed sentence: no reason, no state version.
+    /// Whatever keeps a peer out — someone else's badge, a badge from another
+    /// network, or a genuine one the policy bans — it hears the one fixed
+    /// sentence: no reason, no policy version.
     #[tokio::test]
     async fn a_non_member_hears_only_the_fixed_refusal() {
         let open = [Frame::Hello(hello()), Frame::Invoke(invoke(&[]))];
@@ -1779,14 +1795,14 @@ mod tests {
         };
         let foreign = refusal(&[Frame::Hello(foreign), Frame::Invoke(invoke(&[]))], id).await;
         let (id, genuine) = stranger(7);
-        let unlisted = refusal(&[Frame::Hello(genuine), Frame::Invoke(invoke(&[]))], id).await;
-        for r in [theirs, foreign, unlisted] {
+        let banned = refusal(&[Frame::Hello(genuine), Frame::Invoke(invoke(&[]))], id).await;
+        for r in [theirs, foreign, banned] {
             assert_eq!(r, crate::host::gate::NOT_ADMITTED);
         }
     }
 
-    /// A non-member's ID token is never looked at: no verification, so no
-    /// JWKS fetch and no identity-index entry. (A member's is.)
+    /// A banned node's ID token is never looked at: no verification, so no
+    /// JWKS fetch and no identity-index entry. (An admitted node's is.)
     #[tokio::test]
     async fn a_non_member_never_has_its_token_verified() {
         let host = host_running(&["true"]);
@@ -1819,9 +1835,9 @@ mod tests {
     }
 
     /// The card's flood: a thousand connections from keys that aren't
-    /// members — junk, silence, out-of-turn frames, someone else's
-    /// credential, a genuine but unlisted one — write nothing to the call
-    /// log. A member's refusal is still logged.
+    /// admitted — junk, silence, out-of-turn frames, someone else's badge,
+    /// a genuine but banned one — write nothing to the call log. An
+    /// admitted node's refusal is still logged.
     #[tokio::test]
     async fn strangers_leave_nothing_in_the_log_and_members_do() {
         let (sink, mut records) = AuditSink::channel(2048);
@@ -1832,26 +1848,24 @@ mod tests {
                 s[..4].copy_from_slice(&n.to_be_bytes());
                 s
             });
-            let genuine = Hello {
-                membership: Membership::mint(&root(), key.node_id(), 0, i64::MAX).unwrap(),
-                ..hello()
-            };
-            let bytes = match n % 5 {
-                0 => vec![0xde, 0xad, 0xbe, 0xef, 1, 2, 3],
-                1 => Vec::new(),
-                2 => encoded(&[Frame::Invoke(invoke(&[]))]),
-                3 => encoded(&[Frame::Hello(hello()), Frame::Invoke(invoke(&[]))]),
-                _ => encoded(&[Frame::Hello(genuine), Frame::Invoke(invoke(&[]))]),
+            let (banned, genuine) = stranger(7);
+            let (caller, bytes) = match n % 5 {
+                0 => (key.node_id(), vec![0xde, 0xad, 0xbe, 0xef, 1, 2, 3]),
+                1 => (key.node_id(), Vec::new()),
+                2 => (key.node_id(), encoded(&[Frame::Invoke(invoke(&[]))])),
+                3 => (
+                    key.node_id(),
+                    encoded(&[Frame::Hello(hello()), Frame::Invoke(invoke(&[]))]),
+                ),
+                _ => (
+                    banned,
+                    encoded(&[Frame::Hello(genuine), Frame::Invoke(invoke(&[]))]),
+                ),
             };
             let (send, _answer) = tokio::io::duplex(64 * 1024);
-            let r = serve_services_session(
-                send,
-                std::io::Cursor::new(bytes),
-                key.node_id(),
-                &host,
-                never(),
-            )
-            .await;
+            let r =
+                serve_services_session(send, std::io::Cursor::new(bytes), caller, &host, never())
+                    .await;
             assert!(r.is_err());
         }
         assert!(

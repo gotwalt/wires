@@ -1,7 +1,7 @@
 //! Canonical-JSON codec, length-prefixed framing, and fixed-size hex ids
 //! (all internal).
 //!
-//! Memberships and signed states are signed over — and tokens are
+//! Memberships and signed policies are signed over — and tokens are
 //! base64-encoded from — a *canonical* JSON encoding: object keys sorted recursively, with no
 //! insignificant whitespace. Canonicalization makes the byte string
 //! deterministic across re-serialization, which is what makes signing and
@@ -22,7 +22,7 @@ pub const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose:
 
 /// Serialize `value` to canonical JSON bytes (sorted keys, compact).
 ///
-/// This is the exact byte string that gets signed (memberships, signed states)
+/// This is the exact byte string that gets signed (memberships, signed policies)
 /// or base64-encoded (tokens); both producer and verifier must agree on it
 /// byte-for-byte.
 ///
@@ -36,7 +36,7 @@ pub(crate) fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 }
 
 /// Prefix `body` with its length as four big-endian bytes: the framing
-/// every wires stream protocol (session, state sync, inbox) uses.
+/// every wires stream protocol (session, directory, inbox) uses.
 /// [`Error::BadFrame`] if the body is longer than a `u32` can say.
 pub(crate) fn length_prefixed(body: &[u8]) -> Result<Vec<u8>> {
     let len = u32::try_from(body.len()).map_err(|_| Error::BadFrame)?;

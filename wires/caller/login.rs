@@ -15,13 +15,17 @@
 //!    [`REFRESH_TOKEN_FILE`] when the IdP granted one;
 //! 3. nothing is published: `wires call` presents the stored token in its
 //!    session `Hello` (and `wires inbox` in its fetch), and the host verifies
-//!    it there.
+//!    it there;
+//! 4. the caller asks a directory for its view under the new identity (card
+//!    37): the services it may now use.
 //!
-//! Configuration (flag, else environment): `--client-id` /
-//! `WIRES_OIDC_CLIENT_ID` (required), `--client-secret` /
-//! `WIRES_OIDC_CLIENT_SECRET` (Google "Desktop app" clients have a
-//! non-confidential one), `--issuer` / `WIRES_OIDC_ISSUER` (default
-//! `https://accounts.google.com`).
+//! Configuration (flag, else environment, else the invite's login settings
+//! that `wires join` stored in [`LOGIN_SETTINGS_FILE`], card 37): `--issuer`
+//! / `WIRES_OIDC_ISSUER` (last resort `https://accounts.google.com`),
+//! `--client-id` / `WIRES_OIDC_CLIENT_ID` (required from one of the three),
+//! `--client-secret` / `WIRES_OIDC_CLIENT_SECRET` (Google "Desktop app"
+//! clients have a non-confidential one). After `wires join`, a bare `wires
+//! login` is enough.
 //!
 //! The small HTTP/1.1 reader/writer here ([`read_request`],
 //! [`write_response`]) serves only the loopback redirect (and the test
@@ -33,7 +37,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use clap::Args;
-use library::{Audience, B64, IdToken, IdentityClaim, Issuer, NodeId, OidcNonce, Principal};
+use library::{
+    Audience, B64, IdToken, IdentityClaim, Issuer, LoginSettings, NodeId, OidcNonce, Principal,
+};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -49,6 +55,8 @@ pub(crate) const DEFAULT_ISSUER: &str = "https://accounts.google.com";
 pub(crate) const ID_TOKEN_FILE: &str = "idp-token.jwt";
 /// The IdP refresh token, when one was granted (mode `0600`).
 pub(crate) const REFRESH_TOKEN_FILE: &str = "idp-refresh-token";
+/// The invite's login settings, stored by `wires join` (card 37).
+pub(crate) const LOGIN_SETTINGS_FILE: &str = "login.json";
 /// How long the loopback listener waits for the browser to come back.
 pub(crate) const CALLBACK_WAIT: Duration = Duration::from_secs(300);
 /// The scopes requested: an ID token with the email claim, nothing more.
@@ -77,35 +85,37 @@ const DRAIN_WAIT: Duration = Duration::from_secs(2);
 pub(crate) struct LoginArgs {
     /// Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`,
     /// then `--node-seed-file`, then the keystore (`node.seed`).
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub node_seed: Option<String>,
     /// Read the node key seed (hex) from this file.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub node_seed_file: Option<std::path::PathBuf>,
-    /// OIDC issuer. Falls back to `$WIRES_OIDC_ISSUER`, then Google.
-    #[arg(long)]
+    /// OIDC issuer. Falls back to `$WIRES_OIDC_ISSUER`, then the invite's,
+    /// then Google.
+    #[arg(long, hide = true)]
     pub issuer: Option<String>,
-    /// OAuth client id. Falls back to `$WIRES_OIDC_CLIENT_ID`.
-    #[arg(long)]
+    /// OAuth client id. Falls back to `$WIRES_OIDC_CLIENT_ID`, then the
+    /// invite's.
+    #[arg(long, hide = true)]
     pub client_id: Option<String>,
     /// OAuth client secret (non-confidential for Desktop-app clients). Falls
-    /// back to `$WIRES_OIDC_CLIENT_SECRET`.
-    #[arg(long)]
+    /// back to `$WIRES_OIDC_CLIENT_SECRET`, then the invite's.
+    #[arg(long, hide = true)]
     pub client_secret: Option<String>,
-    /// Use the stored refresh token instead of the browser when possible;
-    /// falls back to the browser flow if the refreshed token is not bound to
-    /// this node (Google omits `nonce` on refresh).
+    /// Renew with the stored refresh token; the browser only if that fails.
+    // Falls back to the browser flow if the refreshed token is not bound to
+    // this node (Google omits `nonce` on refresh).
     #[arg(long, conflicts_with = "reuse")]
     pub refresh: bool,
-    /// Re-verify the stored ID token without signing in.
+    /// Re-check the stored ID token; don't sign in.
     #[arg(long)]
     pub reuse: bool,
-    /// Print the sign-in URL but do not try to open a browser.
+    /// Print the sign-in URL; don't open a browser.
     #[arg(long)]
     pub no_browser: bool,
-    /// Fixed loopback port for the redirect (default: any free port) — for
-    /// `ssh -L <port>:127.0.0.1:<port>` when the browser is on another machine.
-    #[arg(long, default_value_t = 0)]
+    /// Fixed loopback port for the redirect (for `ssh -L` to a remote browser).
+    // Default: any free port.
+    #[arg(long, default_value_t = 0, hide_default_value = true)]
     pub callback_port: u16,
 }
 
@@ -121,31 +131,46 @@ pub(crate) struct OidcClient {
 }
 
 impl OidcClient {
-    /// Resolve from flags, else the `WIRES_OIDC_*` environment.
-    fn resolve(a: &LoginArgs) -> Result<Self> {
+    /// Resolve from flags, else the `WIRES_OIDC_*` environment, else the
+    /// invite's login settings (`joined`, which `wires join` stored). The
+    /// invite's client id and secret are used only for the invite's issuer:
+    /// naming another issuer needs its own client id.
+    fn resolve(a: &LoginArgs, joined: Option<LoginSettings>) -> Result<Self> {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let named_issuer = a.issuer.clone().or_else(|| env("WIRES_OIDC_ISSUER"));
+        let joined = joined.filter(|s| {
+            named_issuer
+                .as_deref()
+                .is_none_or(|i| i == s.issuer.as_str())
+        });
         let client_id = a
             .client_id
             .clone()
             .or_else(|| env("WIRES_OIDC_CLIENT_ID"))
+            .or_else(|| joined.as_ref().map(|s| s.client_id.as_str().to_owned()))
             .ok_or_else(|| {
                 anyhow!(
-                    "no OAuth client id: pass --client-id or set $WIRES_OIDC_CLIENT_ID (for \
-                     Google, create a \"Desktop app\" OAuth client in the Cloud Console)"
+                    "no OAuth client id: join with an invite from an admin whose policy trusts \
+                     an IdP, or pass --client-id (or set $WIRES_OIDC_CLIENT_ID; for Google, \
+                     create a \"Desktop app\" OAuth client in the Cloud Console)"
                 )
             })?;
         Ok(Self {
             issuer: Issuer::new(
-                a.issuer
-                    .clone()
-                    .or_else(|| env("WIRES_OIDC_ISSUER"))
+                named_issuer
+                    .or_else(|| joined.as_ref().map(|s| s.issuer.as_str().to_owned()))
                     .unwrap_or_else(|| DEFAULT_ISSUER.to_string()),
             ),
             client_id,
             client_secret: a
                 .client_secret
                 .clone()
-                .or_else(|| env("WIRES_OIDC_CLIENT_SECRET")),
+                .or_else(|| env("WIRES_OIDC_CLIENT_SECRET"))
+                .or_else(|| {
+                    joined
+                        .and_then(|s| s.public_client_secret)
+                        .map(|s| s.as_str().to_owned())
+                }),
         })
     }
 
@@ -702,7 +727,7 @@ pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
     let home = keystore::home()?;
     let node =
         keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?.node_id();
-    let client = OidcClient::resolve(&a)?;
+    let client = OidcClient::resolve(&a, read_settings(&ks))?;
     let fetcher = KeyFetcher::new(Some(home.join(crate::caller::jwks::JWKS_DIR)))?;
     let token_path = ks.path(ID_TOKEN_FILE);
     let refresh_path = ks.path(REFRESH_TOKEN_FILE);
@@ -753,7 +778,38 @@ pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
         token_path.display(),
         login.principal.not_after
     );
+    // Card 37: the view under the new identity (the old one was someone
+    // else's, or no one's).
+    let identity = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
+    if let Some(badge) = ks.read_membership()? {
+        match crate::caller::view::refresh_now(&ks, &identity, &badge, None, true).await {
+            Ok(held) => eprintln!(
+                "wires login: {} service(s) you may call (policy version {}); see `wires \
+                 services`",
+                held.callable().count(),
+                held.version().0
+            ),
+            Err(e) => eprintln!(
+                "wires login: could not fetch your services yet ({e:#}); `wires services` asks \
+                 again"
+            ),
+        }
+    }
     Ok(())
+}
+
+/// The invite's login settings `wires join` stored, if any (unreadable is
+/// none: flags and the environment still work).
+pub(crate) fn read_settings(ks: &keystore::Keystore) -> Option<LoginSettings> {
+    let text = std::fs::read_to_string(ks.path(LOGIN_SETTINGS_FILE)).ok()?;
+    serde_json::from_str(text.trim()).ok()
+}
+
+/// Store the invite's login settings for [`read_settings`] (`0600`: the
+/// client secret is public, but it is nobody else's business).
+pub(crate) fn save_settings(ks: &keystore::Keystore, settings: &LoginSettings) -> Result<()> {
+    let text = serde_json::to_string(settings)?;
+    save_secret(&ks.path(LOGIN_SETTINGS_FILE), &format!("{text}\n"))
 }
 
 #[cfg(test)]
@@ -780,6 +836,54 @@ mod tests {
         let (a, b) = (Pkce::generate().unwrap(), Pkce::generate().unwrap());
         assert_eq!(a.verifier.len(), 43);
         assert_ne!(a.verifier, b.verifier);
+    }
+
+    /// Card 37: after `wires join <token>`, `wires login` needs no
+    /// `--issuer` / `--client-id` / `--client-secret`: the invite's login
+    /// settings sign in against the mock IdP end to end. A flag still wins,
+    /// and another issuer doesn't borrow the invite's client.
+    #[tokio::test]
+    async fn after_join_a_bare_login_signs_in_with_the_invites_settings() {
+        use library::{Invite, LoginSettings, Membership, NodeIdentity, PublicClientSecret};
+        let idp = MockIdp::start("alice@example.com").await;
+        let ks = keystore::Keystore::at(crate::testutil::temp_dir());
+        let (me, _) = crate::caller::join::id_in(&ks).unwrap();
+        let root = NodeIdentity::from_seed([61; 32]);
+        let invite = Invite::new(
+            Membership::mint(&root, me, 0, i64::MAX).unwrap(),
+            vec![],
+            Some(LoginSettings {
+                issuer: idp.issuer.clone(),
+                client_id: Audience::new(idp.client_id.clone()),
+                public_client_secret: Some(PublicClientSecret::new("not-so-secret")),
+            }),
+        );
+        crate::caller::join::join_in(&ks, &invite.encode().unwrap(), 0).unwrap();
+
+        let bare = LoginArgs::default();
+        let client = OidcClient::resolve(&bare, read_settings(&ks)).unwrap();
+        assert_eq!(client, idp.client());
+        let fetcher = KeyFetcher::new(None).unwrap();
+        let login = run_flow(&fetcher, &client, me, 0, idp.browser(), PATIENCE)
+            .await
+            .unwrap();
+        assert_eq!(login.principal.email.as_deref(), Some("alice@example.com"));
+
+        // A flag wins; another issuer needs its own client id.
+        let flagged = LoginArgs {
+            client_id: Some("other".into()),
+            ..LoginArgs::default()
+        };
+        let client = OidcClient::resolve(&flagged, read_settings(&ks)).unwrap();
+        assert_eq!(client.client_id, "other");
+        assert_eq!(client.issuer, idp.issuer);
+        let elsewhere = LoginArgs {
+            issuer: Some("https://elsewhere.example".into()),
+            ..LoginArgs::default()
+        };
+        assert!(OidcClient::resolve(&elsewhere, read_settings(&ks)).is_err());
+        // Nothing joined, nothing passed: the client id is required.
+        assert!(OidcClient::resolve(&bare, None).is_err());
     }
 
     #[test]

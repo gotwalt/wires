@@ -1,0 +1,23 @@
+Run a service by name: its stdin, stdout, stderr and exit code are yours
+
+Usage: wires call [OPTIONS] <SERVICE> [-- <ARGS>...]
+
+Arguments:
+  <SERVICE>  The service's name, as `wires services` lists it
+  [ARGS]...  Its arguments, after `--`; there is no shell (no pipes or globs)
+
+Options:
+      --jq <FILTER>    Filter stdout as JSON with this jq program, in-process (as `gh --jq`)
+      --head <N>       Keep only the first N lines of stdout (after --jq)
+      --max-bytes <N>  Keep at most N bytes of stdout; stderr says how much was dropped
+      --verbose        Name the host that answered, and print every cause of an error
+  -h, --help           Print help
+      --help-all       Also list the operator and credential flags
+
+Examples:
+  wires call orders-db -- "select count(*) from orders"
+  wires call gh --jq '.[].title' -- issue list --json title
+
+Exit: the service's own code. 77: refused by policy, nothing on stdout (don't
+retry; ask your admin). 1: a local or transport failure (a service's own 77
+is reported as 1). 2: a usage error (a bad --jq, a flag locked mode refuses).
