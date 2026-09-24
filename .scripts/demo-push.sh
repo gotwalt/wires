@@ -136,7 +136,13 @@ AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
 [ -n "$ROOT_ID" ] && [ -n "$WB_ID" ] && [ -n "$AG_ID" ] || bad "setup: could not read the key ids"
 AG8="${AG_ID:0:8}"
 WB8="${WB_ID:0:8}"
-admin role set analyst '*@example.com' >/dev/null 2>&1
+# The IdP comes first: every role names the issuer it trusts.
+"$WIRES_DEV" dev-mock-idp --email "$EMAIL" >"$D/idp.out" 2>"$D/idp.err" &
+IDP_PID=$!
+wait_for "$D/idp.out" "client_id " 100 || bad "setup: the mock IdP did not start; see $D/idp.err"
+ISSUER="$(awk '/^issuer /{print $2}' "$D/idp.out")"
+CLIENT_ID="$(awk '/^client_id /{print $2}' "$D/idp.out")"
+admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1
 admin invite "$WB_ID" --name workbench >/dev/null 2>&1
 for svc in deploy status logs; do
 	admin service add "$svc" --allow analyst --host workbench \
@@ -147,12 +153,6 @@ for svc in deploy status logs; do
 done
 # The workbench was offline for those pushes: its token carries the state.
 WIRES_HOME="$wb" "$WIRES" join "$(admin invite "$WB_ID" --name workbench 2>/dev/null)" >/dev/null
-
-"$WIRES_DEV" dev-mock-idp --email "$EMAIL" >"$D/idp.out" 2>"$D/idp.err" &
-IDP_PID=$!
-wait_for "$D/idp.out" "client_id " 100 || bad "setup: the mock IdP did not start; see $D/idp.err"
-ISSUER="$(awk '/^issuer /{print $2}' "$D/idp.out")"
-CLIENT_ID="$(awk '/^client_id /{print $2}' "$D/idp.out")"
 
 HOST_JSON="$D/host.json"
 sed -e "s|__ISSUER__|$ISSUER|" -e "s|__CLIENT_ID__|$CLIENT_ID|" \

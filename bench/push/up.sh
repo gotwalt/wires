@@ -4,13 +4,18 @@
 # running the mock CI (.scripts/fixtures/ci.sh: deploy / status / logs) and
 # one agent keystore per arm, so parallel lanes never share a mailbox.
 #
-#   root      -- `wires init`, the three CI services on the workbench for the
-#                built-in role `member` (any member; no IdP -- the benchmark
-#                measures waiting, not sign-in), one invite per machine
+#   root      -- `wires init`, the three CI services on the workbench for
+#                role `bench` ($BENCH_EMAIL at $BENCH_OIDC_ISSUER: every role
+#                needs a verified identity), one invite per machine
 #   workbench -- `wires serve host.json`: implements the three services, and
-#                pushes to `member`
-#   agent-<arm> -- joined with its invite; the bench runs Claude Code with
-#                WIRES_HOME=<that keystore> and WIRES_LOCKED=1
+#                pushes to `bench`
+#   agent-<arm> -- joined with its invite and signed in with `wires login`
+#                (a browser opens once per arm); the bench runs Claude Code
+#                with WIRES_HOME=<that keystore> and WIRES_LOCKED=1
+#
+# Needs BENCH_EMAIL (who may call) and BENCH_OIDC_CLIENT_ID (an OAuth client
+# of that IdP; Google "Desktop app"); BENCH_OIDC_CLIENT_SECRET if it has one;
+# BENCH_OIDC_ISSUER defaults to https://accounts.google.com.
 #
 # State lives under $BENCH_PUSH_DIR (default /tmp/wb24): short, because macOS
 # caps unix-socket paths at 104 bytes. Writes $D/env.sh (export lines).
@@ -30,6 +35,9 @@ WIRES="${WIRES_BIN:-$D/bin/wires}"
 	echo "usage: $0 <arm>..." >&2
 	exit 2
 }
+EMAIL="${BENCH_EMAIL:?set BENCH_EMAIL to the address that may call (e.g. you@example.com)}"
+CLIENT_ID="${BENCH_OIDC_CLIENT_ID:?set BENCH_OIDC_CLIENT_ID to the IdP OAuth client id}"
+ISSUER="${BENCH_OIDC_ISSUER:-https://accounts.google.com}"
 
 if [ -f "$D/wb.pid" ] && kill -0 "$(cat "$D/wb.pid")" 2>/dev/null; then
 	kill "$(cat "$D/wb.pid")" || true
@@ -41,7 +49,8 @@ mkdir -p "$D/root" "$D/wb" "$D/jobs"
 WIRES_HOME="$D/root" "$WIRES" init >/dev/null
 WB_ID="$(WIRES_HOME="$D/wb" "$WIRES" id 2>/dev/null)"
 WIRES_HOME="$D/root" "$WIRES" invite "$WB_ID" --name workbench >/dev/null 2>&1
-add() { WIRES_HOME="$D/root" "$WIRES" service add "$1" --allow member --host workbench --description "$2" >/dev/null 2>&1; }
+WIRES_HOME="$D/root" "$WIRES" role set bench --issuer "$ISSUER" "$EMAIL" >/dev/null 2>&1
+add() { WIRES_HOME="$D/root" "$WIRES" service add "$1" --allow bench --host workbench --description "$2" >/dev/null 2>&1; }
 add deploy "Start a CI build in the background: deploy -- build <n>. Returns at once; the result is pushed to your wires inbox when the build finishes."
 add status "A build's state: status -- build <n> (running / failed)."
 add logs "A build's log: logs -- build <n> [--tail N] (default: last 50 lines)."
@@ -52,12 +61,13 @@ WIRES_HOME="$D/wb" "$WIRES" join "$tok" >/dev/null
 cat >"$D/host.json" <<JSON
 {
   "version": 2,
+  "identity": { "issuers": [ { "issuer": "$ISSUER", "audiences": ["$CLIENT_ID"] } ] },
   "services": {
     "deploy": { "command": ["$repo/.scripts/fixtures/ci.sh", "deploy"] },
     "status": { "command": ["$repo/.scripts/fixtures/ci.sh", "status"] },
     "logs": { "command": ["$repo/.scripts/fixtures/ci.sh", "logs"] }
   },
-  "push": { "allow": ["member"] }
+  "push": { "allow": ["bench"] }
 }
 JSON
 "$WIRES" serve --check "$D/host.json" >/dev/null
@@ -84,6 +94,9 @@ for arm in "$@"; do
 	tok="$(WIRES_HOME="$D/root" "$WIRES" invite "$id" --name "agent-$arm" 2>/dev/null)"
 	WIRES_HOME="$h" "$WIRES" join "$tok" >/dev/null
 	cp "$D/wb/run/hint" "$h/hints"
+	# Each arm signs in once: its ID token is bound to its own node key.
+	WIRES_HOME="$h" "$WIRES" login --issuer "$ISSUER" --client-id "$CLIENT_ID" \
+		${BENCH_OIDC_CLIENT_SECRET:+--client-secret "$BENCH_OIDC_CLIENT_SECRET"} >&2
 	WIRES_HOME="$h" "$WIRES" services 2>/dev/null | grep -q '^deploy ' || {
 		echo "up: agent-$arm does not see the CI services" >&2
 		exit 1
