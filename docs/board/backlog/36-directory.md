@@ -243,3 +243,55 @@ changes; `state.rs`, `access.rs` and `membership/` untouched (card 35's lane).
   head (`previous` head hash + changed keys with their new leaf hashes), which lets a host carry
   unchanged items forward with no proof at all. (a) stays inside the Merkle module; (b) changes
   the signed head format.
+
+**36a follow-up (2026-09-24, branch `worker/36a2-multiproof`): multiproofs and part updates.**
+The integrator chose (a). This supersedes the per-item proofs, the whole-part subscription
+updates and the 184 KB / 1.06 MB slice figures above.
+
+- **`MultiProof`** (`merkle`): `{leaves: [LeafRange {start, len}], hashes: ProofHashes}`: the
+  proved indices as ascending ranges with at least a one-leaf gap between them (one encoding per
+  set), plus the sibling hashes the set doesn't determine itself, each sent once, as one
+  base64url string. Prover and verifier share one walk (level by level, left to right), so they
+  agree on hash order by construction. `ItemTree::prove_many`, `MultiProof::verify` /
+  `verify_items` / `indices` (range lengths are checked against `count` before anything is
+  expanded). A single leaf's multiproof is exactly its `InclusionProof` path.
+- **Parts carry one multiproof.** `Slice {head, items, proof}` and
+  `View {head, entries: [ViewEntry {item, call, read}], proof}`. `ProvedItem` is gone.
+  `view_for(principal, query)` takes the search query, so a searched view is proved as a set of
+  its own. `View::matching(query)` only reads a view; it doesn't change it.
+- **Updates.** `SliceUpdate` / `ViewUpdate {head, changed, removed, proof}`. `proof` covers the
+  holder's **whole** resulting set under the new head. `Slice::update_to(newer)` diffs two
+  parts; `SignedPolicy::slice_update(from, host, extra_roles)` / `view_update(from, principal)`
+  are the directory side (it recomputes `from` from the older policy the subscriber's `have`
+  names). `Slice::apply(update, root)` / `View::apply` rebuild held + changed − removed and
+  verify it all. They refuse a head that doesn't verify or is older, the removal of an unheld
+  key, a key named twice, and a result that doesn't prove (a withheld or tampered change fails
+  here). The holder then asks for the whole part. After `apply`, every held item is proved
+  under the new head. A directory can still *withhold*, including by a false `removed`, which
+  is no more than a full part allows; `Fresh` bounds it.
+- **Frames.** `SubFrame` and `DirectoryAnswer` gain `slice_update` and `view_update`. The whole
+  `slice` / `view` stays for first sync and after a failed `apply`: subscribe again with
+  `have: 0`.
+- **Bans, aligned with card 35.** `Policy::ban` (the later `until` wins) and
+  `Policy::prune_bans(now)` (drops `until < now`) mirror `State::ban` / `prune_bans`; a test
+  checks they give the same verdicts. One difference for 36b: `State::is_banned(node)` ignores
+  the clock (a ban holds until pruned), while `Policy::is_banned` / `Slice::is_banned(node,
+  now)` also expire at `until`. Both give the same answer while the badge the ban cancels is
+  still valid (both are inclusive of `until`), so after that the difference can't admit anyone.
+- **Measured** (`cargo run -q --release -p library --example policy_sizes`, frames include
+  the `Fresh`):
+
+  | | 100 services | 1k services, 300 bans | 5k services, 1,500 bans |
+  |---|---|---|---|
+  | whole host slice (items) | 7.5 KB (44) | **39.5 KB** (314) | **182 KB** (1,516) |
+  | its multiproof | 983 B, 20 hashes | 1.7 KB, 37 hashes | 3.5 KB, 78 hashes |
+  | update, host's slice unchanged | 2.1 KB | **2.8 KB** | **4.6 KB** |
+  | update, one of its services changed | 2.4 KB | 3.1 KB | 4.9 KB |
+  | update, one new ban | 2.2 KB | 2.9 KB | 4.7 KB |
+  | view, 25 services | 11.4 KB | 12.4 KB | 13.0 KB |
+
+  Per-item proof overhead in a whole slice falls from 511–597 B to about 5 B at 1k
+  services (1.7 KB over 314 items). What remains is the items themselves: at 5k services, 1,500
+  bans are most of the 182 KB, and that is a first-sync cost. At 1k services and about 20 edits a
+  day, the updates come to about 60 KB a day plus 288 beats × 475 B ≈ 137 KB of `Fresh`. The
+  beat, not the policy, now dominates a host's daily traffic, against the model's 288 × 300 B.

@@ -46,12 +46,13 @@
 //! - [`sync`] — the [`StateFrame`] push/pull protocol on [`STATE_ALPN`].
 //! - [`item`] — the policy's leaves: [`Item`] (role, service, ban, issuer,
 //!   settings) and its [`ItemKey`].
-//! - [`merkle`] — the [`ItemTree`] over items: [`ItemsRoot`] and
-//!   [`InclusionProof`].
+//! - [`merkle`] — the [`ItemTree`] over items: [`ItemsRoot`],
+//!   [`InclusionProof`] and [`MultiProof`].
 //! - [`head`] — the root-signed [`PolicyHead`] / [`SignedPolicyHead`].
 //! - [`signed_policy`] — the whole [`Policy`] and [`SignedPolicy`], and the
 //!   parts cut from it.
-//! - [`parts`] — a host's [`Slice`], a caller's [`View`].
+//! - [`parts`] — a host's [`Slice`], a caller's [`View`], and the
+//!   [`SliceUpdate`] / [`ViewUpdate`] that move them to a newer head.
 //! - [`fresh`] — a directory's signed [`Fresh`] timestamp.
 //! - [`directory`] — the [`DirectoryRequest`] / [`SubRequest`] frames on
 //!   [`DIRECTORY_ALPN`] and [`DIRECTORY_SUB_ALPN`].
@@ -202,8 +203,11 @@ pub use item::{
     Settings,
 };
 pub use membership::{MEMBERSHIP_V1, Membership};
-pub use merkle::{InclusionProof, ItemHash, ItemTree, ItemsRoot, MAX_PROOF_DEPTH, ProofPath};
-pub use parts::{ProvedItem, Slice, View, ViewEntry};
+pub use merkle::{
+    InclusionProof, ItemHash, ItemTree, ItemsRoot, LeafRange, MAX_PROOF_DEPTH, MultiProof,
+    ProofHashes, ProofPath,
+};
+pub use parts::{Slice, SliceUpdate, View, ViewEntry, ViewUpdate};
 pub use policy::{check_admitted, check_inclusion};
 pub use push::{
     INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_FRAME, MAX_INBOX_HELLO, MAX_PUSH_BODY,

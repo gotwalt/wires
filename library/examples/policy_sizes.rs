@@ -3,18 +3,19 @@
 //! per-entry overhead, and `timestamp`, the freshness beat).
 //!
 //! Builds real signed policies with the library at the model's tiers, and
-//! prints one JSON line per tier: the serialized head, `Fresh`, a service
-//! item alone and with its proof, a ban with its proof, a host's whole slice,
-//! a 30-service view, and the frames that carry them.
+//! prints one JSON line per tier: the serialized head and `Fresh`, a service
+//! item, a host's whole slice (its multiproof and the frame carrying it), a
+//! caller's view of about 25 services, and the subscription update a host
+//! receives when an edit leaves its slice unchanged, changes one of its
+//! services, or adds a ban.
 //!
 //! ```text
 //! cargo run -q --release -p library --example policy_sizes
 //! ```
 
 use library::{
-    Audience, Ban, DirectoryAnswer, Fresh, Issuer, IssuerConfig, Item, Matcher, NodeId,
-    NodeIdentity, Policy, Principal, ProvedItem, RoleName, Service, ServiceName, SignedPolicy,
-    StateVersion, SubFrame,
+    Audience, Ban, Fresh, Issuer, IssuerConfig, Item, Matcher, NodeId, NodeIdentity, Policy,
+    Principal, RoleName, Service, ServiceName, SignedPolicy, Slice, StateVersion, SubFrame,
 };
 
 const ISSUED: i64 = 1_790_000_000;
@@ -33,6 +34,10 @@ fn seed(i: u64) -> [u8; 32] {
 
 fn role(i: u64) -> RoleName {
     RoleName::new(format!("role-{i:04}")).expect("a valid role name")
+}
+
+fn service_name(s: u64) -> ServiceName {
+    ServiceName::new(format!("svc-{s:05}-orders-db")).expect("a valid name")
 }
 
 fn len<T: serde::Serialize>(value: &T) -> usize {
@@ -54,7 +59,7 @@ fn directory() -> NodeIdentity {
     NodeIdentity::from_seed(seed(u64::MAX))
 }
 
-fn policy(root: &NodeIdentity, t: &Tier) -> SignedPolicy {
+fn policy(root: &NodeIdentity, t: &Tier) -> Policy {
     let mut p = Policy::new(root.node_id());
     p.version = StateVersion(123_456);
     p.issued = ISSUED;
@@ -98,56 +103,100 @@ fn policy(root: &NodeIdentity, t: &Tier) -> SignedPolicy {
             },
         );
     }
-    p.sign(root).expect("a valid policy")
+    p
+}
+
+/// The bytes of the subscription frame that moves `from` to the host's slice
+/// under `next`, with its `Fresh`; and how many items it changed.
+fn update_frame(from: &Slice, next: &SignedPolicy, host: NodeId) -> (usize, usize) {
+    let update = next.slice_update(from, host, &[]).expect("an update");
+    let fresh = Fresh::sign(&directory(), &next.head, ISSUED, ISSUED + 900).expect("a directory");
+    let changed = update.changed.len() + update.removed.len();
+    let frame = SubFrame::SliceUpdate { update, fresh };
+    (frame.encode().expect("a frame").len(), changed)
 }
 
 fn measure(root: &NodeIdentity, t: &Tier) -> serde_json::Value {
-    let signed = policy(root, t);
+    let base = policy(root, t);
+    let signed = base.sign(root).expect("a valid policy");
     let head = &signed.head;
     let fresh = Fresh::sign(&directory(), head, ISSUED, ISSUED + 900).expect("a directory");
     let host = node(1_000_000);
     let slice = signed.slice_for_host(host, &[]).expect("a slice");
-    let proved = |pick: fn(&Item) -> bool| -> ProvedItem {
-        slice
-            .items
-            .iter()
-            .find(|p| pick(&p.item))
-            .expect("the slice holds one")
-            .clone()
-    };
-    let service = proved(|i| matches!(i, Item::Service { .. }));
-    let ban = proved(|i| matches!(i, Item::Ban { .. }));
+    let service = slice
+        .items
+        .iter()
+        .find(|i| matches!(i, Item::Service { .. }))
+        .expect("the host runs a service");
 
-    // A caller in 15 roles: about 30 services' allow lists admit it.
+    // A caller in 2 roles: each role is in about 10 services' `allow` and 5
+    // services' `readers`, so about 25 services admit it (the model assumes
+    // 30 `visible_services`).
     let caller = Principal {
         issuer: ISS.into(),
         subject: "00u1a2b3c4".into(),
         email: Some("alice@acme-corp.com".into()),
         org: None,
-        groups: (0..15).map(|r| format!("eng-team-{:04}", r * 2)).collect(),
+        groups: (0..2).map(|r| format!("eng-team-{:04}", r * 2)).collect(),
         not_after: i64::MAX,
     };
-    let mut view = signed.view_for(Some(&caller)).expect("a view");
-    view.entries.truncate(30);
+    let view = signed.view_for(Some(&caller), None).expect("a view");
+
+    // Three edits, each version + 1: one to a service this host doesn't
+    // run, one to a service it does, and a new ban.
+    let edit = |f: &dyn Fn(&mut Policy)| {
+        let mut p = base.clone();
+        p.version = StateVersion(p.version.0 + 1);
+        f(&mut p);
+        p.sign(root).expect("a valid policy")
+    };
+    let describe = |s: u64| {
+        move |p: &mut Policy| {
+            p.services
+                .get_mut(&service_name(s))
+                .expect("a service")
+                .description =
+                "Read-only SQL against the orders replica, now with a 30 s timeout.".into();
+        }
+    };
+    let elsewhere = (0..t.services)
+        .find(|s| !base.services[&service_name(*s)].hosts.contains(&host))
+        .expect("a service elsewhere");
+    let unchanged = update_frame(&slice, &edit(&describe(elsewhere)), host);
+    let changed = update_frame(&slice, &edit(&describe(0)), host);
+    let banned = update_frame(
+        &slice,
+        &edit(&|p: &mut Policy| {
+            p.bans.insert(
+                node(3_000_000),
+                Ban {
+                    until: ISSUED + 30 * 86_400,
+                },
+            );
+        }),
+        host,
+    );
 
     serde_json::json!({
         "tier": t.name,
         "items": head.head.item_count,
-        "proof_depth": service.proof.path.hashes().len(),
         "head": len(head),
         "fresh": len(&fresh),
         "fresh_beat_frame": SubFrame::Fresh { fresh: fresh.clone() }.encode().expect("a frame").len(),
-        "service_item": len(&service.item),
-        "service_proved": len(&service),
-        "ban_proved": len(&ban),
-        "proof_overhead": len(&service) - len(&service.item),
+        "service_item": len(service),
         "slice_items": slice.items.len(),
+        "slice_proof": len(&slice.proof),
+        "slice_proof_hashes": slice.proof.hashes.hashes().len(),
         "slice": len(&slice),
+        "slice_frame": SubFrame::Slice { slice, fresh: fresh.clone() }.encode().expect("a frame").len(),
         "view_entries": view.entries.len(),
+        "view_proof": len(&view.proof),
         "view": len(&view),
-        "slice_answer": DirectoryAnswer::Slice { slice, fresh: fresh.clone() }
-            .encode().expect("a frame").len(),
-        "current_answer": DirectoryAnswer::Current { fresh }.encode().expect("a frame").len(),
+        "update_unchanged": unchanged.0,
+        "update_changed_service": changed.0,
+        "update_changed_service_items": changed.1,
+        "update_new_ban": banned.0,
+        "update_new_ban_items": banned.1,
         "publish": len(&signed),
     })
 }

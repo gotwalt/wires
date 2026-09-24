@@ -50,8 +50,9 @@ use crate::head::{POLICY_V3, PolicyHead, SignedPolicyHead};
 use crate::identity::{NodeId, NodeIdentity};
 use crate::idp::{Issuer, Principal};
 use crate::item::{Ban, IssuerConfig, Item, Settings};
+use crate::merkle::MultiProof;
 use crate::merkle::{ItemHash, ItemTree};
-use crate::parts::{ProvedItem, Slice, View, ViewEntry};
+use crate::parts::{Slice, SliceUpdate, View, ViewEntry, ViewUpdate};
 use crate::registry::{Service, ServiceName};
 use crate::role::{Matcher, RoleName};
 use crate::state::StateVersion;
@@ -282,9 +283,39 @@ impl Policy {
         admits(self.roles.get(role).map(Vec::as_slice), principal)
     }
 
-    /// Whether `node` is banned at `now`.
+    /// Whether `node` is banned at `now` (`now <= until`). Same verdict as
+    /// [`State::is_banned`](crate::State::is_banned) on a pruned state: a ban
+    /// past its `until` cancels a badge that has expired anyway.
     pub fn is_banned(&self, node: NodeId, now: i64) -> bool {
         self.bans.get(&node).is_some_and(|b| b.holds(now))
+    }
+
+    /// Ban `node` until `until` (unix seconds); a node already banned keeps
+    /// the later of its two `until`s, as [`State::ban`](crate::State::ban).
+    ///
+    /// ```
+    /// use library::{NodeIdentity, Policy};
+    /// let mut p = Policy::new(NodeIdentity::from_seed([1u8; 32]).node_id());
+    /// let node = NodeIdentity::from_seed([2u8; 32]).node_id();
+    /// p.ban(node, 200);
+    /// p.ban(node, 100);
+    /// assert!(p.is_banned(node, 200));
+    /// assert_eq!(p.prune_bans(201), 1);
+    /// assert!(p.bans.is_empty());
+    /// ```
+    pub fn ban(&mut self, node: NodeId, until: i64) {
+        let ban = self.bans.entry(node).or_insert(Ban { until });
+        ban.until = ban.until.max(until);
+    }
+
+    /// Drop every ban whose `until` is before `now` (as
+    /// [`State::prune_bans`](crate::State::prune_bans): every admin edit
+    /// runs it, so the policy tracks recent removals, not every node ever
+    /// removed). Returns how many were dropped.
+    pub fn prune_bans(&mut self, now: i64) -> usize {
+        let before = self.bans.len();
+        self.bans.retain(|_, ban| ban.holds(now));
+        before - self.bans.len()
     }
 }
 
@@ -362,21 +393,33 @@ impl SignedPolicy {
             Item::Role { key, .. } => roles.contains(key),
             Item::Ban { .. } | Item::Issuer { .. } | Item::Settings { .. } => true,
         };
-        let items = self
-            .prove_where(|item| wanted(item).then_some(()))?
-            .into_iter()
-            .map(|(proved, ())| proved)
-            .collect();
+        let (picked, proof) = self.prove_where(|item| wanted(item).then_some(()))?;
         Ok(Slice {
             head: self.head.clone(),
-            items,
+            items: picked.into_iter().map(|(item, ())| item).collect(),
+            proof,
         })
+    }
+
+    /// The update that moves `from` (this host's slice under an older head)
+    /// to its slice under this policy: [`slice_for_host`](Self::slice_for_host)
+    /// then [`Slice::update_to`]. The directory recomputes `from` from the
+    /// older policy the subscriber's `have` names.
+    pub fn slice_update(
+        &self,
+        from: &Slice,
+        host: NodeId,
+        extra_roles: &[RoleName],
+    ) -> Result<SliceUpdate> {
+        Ok(from.update_to(&self.slice_for_host(host, extra_roles)?))
     }
 
     /// The view of a caller presenting `principal`: the head and, with
     /// proofs, each service item whose `allow` (marked `call`) or `readers`
     /// (marked `read`) admits it. No role, ban, issuer or settings, and no
-    /// other service; with no principal, no entries (no role admits).
+    /// other service; with no principal, no entries (no role admits). With a
+    /// `query`, only the entries whose name or description contain it
+    /// (ignoring ASCII case), proved as a set of their own.
     ///
     /// ```
     /// use library::{
@@ -403,15 +446,15 @@ impl SignedPolicy {
     ///     issuer: "https://idp".into(), subject: "1".into(),
     ///     email: Some("alice@example.com".into()), org: None, groups: vec![], not_after: 0,
     /// };
-    /// let view = signed.view_for(Some(&who)).unwrap();
+    /// let view = signed.view_for(Some(&who), None).unwrap();
     /// view.verify(root.node_id()).unwrap();
     /// assert!(view.entries[0].call);
     /// // Bob doesn't learn the service exists; nor does a caller with no identity.
     /// who.email = Some("bob@example.com".into());
-    /// assert!(signed.view_for(Some(&who)).unwrap().entries.is_empty());
-    /// assert!(signed.view_for(None).unwrap().entries.is_empty());
+    /// assert!(signed.view_for(Some(&who), None).unwrap().entries.is_empty());
+    /// assert!(signed.view_for(None, None).unwrap().entries.is_empty());
     /// ```
-    pub fn view_for(&self, principal: Option<&Principal>) -> Result<View> {
+    pub fn view_for(&self, principal: Option<&Principal>, query: Option<&str>) -> Result<View> {
         let roles: BTreeMap<&RoleName, &[Matcher]> = self
             .items
             .iter()
@@ -425,42 +468,51 @@ impl SignedPolicy {
                 .iter()
                 .any(|r| admits(roles.get(r).copied(), principal))
         };
+        let query = query.map(str::to_ascii_lowercase);
         let marks = |item: &Item| match item {
-            Item::Service { body, .. } => {
+            Item::Service { key, body }
+                if query
+                    .as_deref()
+                    .is_none_or(|q| service_matches(key, body, q)) =>
+            {
                 let (call, read) = (admitted(&body.allow), admitted(&body.readers));
                 (call || read).then_some((call, read))
             }
             _ => None,
         };
-        let entries = self
-            .prove_where(marks)?
-            .into_iter()
-            .map(|(item, (call, read))| ViewEntry { item, call, read })
-            .collect();
+        let (picked, proof) = self.prove_where(marks)?;
         Ok(View {
             head: self.head.clone(),
-            entries,
+            entries: picked
+                .into_iter()
+                .map(|(item, (call, read))| ViewEntry { item, call, read })
+                .collect(),
+            proof,
         })
     }
 
-    /// Every item `pick` returns something for, with its proof and what
-    /// `pick` said, in leaf order.
-    fn prove_where<T>(&self, pick: impl Fn(&Item) -> Option<T>) -> Result<Vec<(ProvedItem, T)>> {
-        let tree = self.tree()?;
-        let mut out = Vec::new();
+    /// The update that moves `from` (this caller's view under an older head,
+    /// or with older marks) to its view under this policy.
+    pub fn view_update(&self, from: &View, principal: Option<&Principal>) -> Result<ViewUpdate> {
+        Ok(from.update_to(&self.view_for(principal, None)?))
+    }
+
+    /// Every item `pick` returns something for, with what it said, in leaf
+    /// order, and one multiproof over them all.
+    fn prove_where<T>(
+        &self,
+        pick: impl Fn(&Item) -> Option<T>,
+    ) -> Result<(Vec<(Item, T)>, MultiProof)> {
+        let mut picked = Vec::new();
+        let mut indices = Vec::new();
         for (index, item) in (0u64..).zip(&self.items) {
             if let Some(mark) = pick(item) {
-                let proof = tree.prove(index).ok_or(Error::BadProof)?;
-                out.push((
-                    ProvedItem {
-                        item: item.clone(),
-                        proof,
-                    },
-                    mark,
-                ));
+                picked.push((item.clone(), mark));
+                indices.push(index);
             }
         }
-        Ok(out)
+        let proof = self.tree()?.prove_many(&indices).ok_or(Error::BadProof)?;
+        Ok((picked, proof))
     }
 }
 
@@ -469,6 +521,12 @@ fn tree_of(items: &[Item]) -> Result<ItemTree> {
     Ok(ItemTree::new(
         items.iter().map(ItemHash::of).collect::<Result<_>>()?,
     ))
+}
+
+/// Whether service `name`'s name or description contains `query` (already
+/// lowercased), ignoring ASCII case.
+pub(crate) fn service_matches(name: &ServiceName, svc: &Service, query: &str) -> bool {
+    name.as_str().contains(query) || svc.description.to_ascii_lowercase().contains(query)
 }
 
 /// Whether `matchers` (a role's definition, if it has one) admit `principal`.
@@ -480,11 +538,12 @@ pub(crate) fn admits(matchers: Option<&[Matcher]>, principal: Option<&Principal>
     matchers.iter().any(|m| m.matches(p))
 }
 
-/// Shared test fixtures: a small, valid policy.
+/// Shared test fixtures: a small, valid policy, and random ones.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
     use crate::idp::Audience;
+    use proptest::prelude::*;
 
     /// The one trusted issuer.
     pub(crate) const ISS: &str = "https://idp.example";
@@ -578,6 +637,69 @@ pub(crate) mod fixtures {
             .insert(name("locked"), service(&[], &["auditor"], &[11]));
         p.bans.insert(node(20), Ban { until: 500 });
         p
+    }
+
+    /// A random policy over roles r0..r4, services s0..s7 and hosts 10..13.
+    pub(crate) fn arb_policy() -> impl Strategy<Value = Policy> {
+        let matcher = prop_oneof![
+            Just(Matcher::new(ISS)),
+            Just(email("alice@example.com")),
+            Just(email("*@corp.example")),
+            Just(Matcher {
+                group: Some("sre".into()),
+                ..Matcher::new(ISS)
+            }),
+        ];
+        let roles = proptest::collection::vec(proptest::collection::vec(matcher, 1..3), 5);
+        let subset = |n: usize| proptest::collection::btree_set(0..n, 0..=n);
+        let services = proptest::collection::vec((subset(5), subset(5), subset(4)), 0..8);
+        let bans = proptest::collection::btree_map(40u8..60, any::<i64>(), 0..5);
+        (roles, services, bans).prop_map(|(roles, services, bans)| {
+            let mut p = sample();
+            p.roles.clear();
+            p.services.clear();
+            p.bans.clear();
+            for (i, matchers) in roles.into_iter().enumerate() {
+                p.roles.insert(role(&format!("r{i}")), matchers);
+            }
+            for (i, (allow, readers, hosts)) in services.into_iter().enumerate() {
+                p.services.insert(
+                    name(&format!("s{i}")),
+                    Service {
+                        description: format!("service {i}"),
+                        allow: allow.into_iter().map(|r| role(&format!("r{r}"))).collect(),
+                        hosts: hosts.into_iter().map(|h| node(10 + h as u8)).collect(),
+                        readers: readers
+                            .into_iter()
+                            .map(|r| role(&format!("r{r}")))
+                            .collect(),
+                    },
+                );
+            }
+            for (b, until) in bans {
+                p.bans.insert(node(b), Ban { until });
+            }
+            p
+        })
+    }
+
+    /// A random principal (or none) from a few emails, two issuers, and the
+    /// `sre` group or not.
+    pub(crate) fn arb_principal() -> impl Strategy<Value = Option<Principal>> {
+        let email = prop_oneof![
+            Just("alice@example.com"),
+            Just("bob@corp.example"),
+            Just("eve@elsewhere.example"),
+        ];
+        let issuer = prop_oneof![Just(ISS), Just("https://partner.example")];
+        proptest::option::of((email, issuer, any::<bool>()).prop_map(|(e, iss, sre)| {
+            let mut p = who(e);
+            p.issuer = iss.into();
+            if sre {
+                p.groups = vec!["sre".into()];
+            }
+            p
+        }))
     }
 }
 
@@ -797,6 +919,39 @@ mod tests {
     }
 
     #[test]
+    fn bans_follow_the_state_rules() {
+        let mut p = sample();
+        p.ban(node(20), 400); // earlier: the later until (500) stays
+        assert_eq!(p.bans[&node(20)].until, 500);
+        p.ban(node(20), 700);
+        assert_eq!(p.bans[&node(20)].until, 700);
+        p.ban(node(21), 600);
+        assert_eq!(p.prune_bans(600), 0, "until is inclusive");
+        assert_eq!(p.prune_bans(601), 1);
+        assert!(p.is_banned(node(20), 700));
+        assert!(!p.bans.contains_key(&node(21)));
+
+        // The same verdicts as card 35's state.
+        let mut s = crate::State::new(root().node_id());
+        let mut q = Policy::new(root().node_id());
+        for (n, until) in [(1, 10), (2, 20), (1, 30), (3, 5)] {
+            s.ban(node(n), until);
+            q.ban(node(n), until);
+        }
+        for now in [0, 5, 6, 20, 21, 30, 31] {
+            let (mut s, mut q) = (s.clone(), q.clone());
+            assert_eq!(s.prune_bans(now), q.prune_bans(now), "at {now}");
+            for n in 1..=3 {
+                assert_eq!(
+                    s.is_banned(node(n)),
+                    q.is_banned(node(n), now),
+                    "{n} at {now}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_host_slice_holds_only_what_the_host_needs() {
         let signed = sample().sign(&root()).unwrap();
         let slice = signed.slice_for_host(node(10), &[]).unwrap();
@@ -850,7 +1005,7 @@ mod tests {
     fn a_view_holds_only_what_its_caller_may_use() {
         let signed = sample().sign(&root()).unwrap();
         let marks = |p: Option<&Principal>| -> Vec<(String, bool, bool)> {
-            let view = signed.view_for(p).unwrap();
+            let view = signed.view_for(p, None).unwrap();
             view.verify(root().node_id()).unwrap();
             view.entries
                 .iter()
@@ -888,6 +1043,27 @@ mod tests {
     }
 
     #[test]
+    fn a_view_query_is_a_view_of_its_own() {
+        let mut p = sample();
+        p.services.get_mut(&name("status")).unwrap().description =
+            "Uptime of the ORDERS stack".into();
+        let signed = p.sign(&root()).unwrap();
+        let alice = who("alice@example.com");
+        let names = |q| -> Vec<String> {
+            let view = signed.view_for(Some(&alice), q).unwrap();
+            view.verify(root().node_id()).unwrap();
+            view.entries
+                .iter()
+                .map(|e| e.service().unwrap().0.to_string())
+                .collect()
+        };
+        assert_eq!(names(Some("orders")), vec!["orders-db", "status"]);
+        assert_eq!(names(Some("DB")), vec!["orders-db"]);
+        assert!(names(Some("deploy")).is_empty(), "not alice's to see");
+        assert!(names(Some("no such thing")).is_empty());
+    }
+
+    #[test]
     fn a_part_cut_from_one_head_fails_under_another() {
         let v3 = sample().sign(&root()).unwrap();
         let mut p = sample();
@@ -902,73 +1078,12 @@ mod tests {
             Err(Error::BadProof)
         ));
 
-        let mut view = v3.view_for(Some(&who("alice@example.com"))).unwrap();
+        let mut view = v3.view_for(Some(&who("alice@example.com")), None).unwrap();
         view.head = v4.head;
         assert!(matches!(
             view.verify(root().node_id()),
             Err(Error::BadProof)
         ));
-    }
-
-    /// A random policy over roles r0..r4, services s0..s7 and hosts 10..13.
-    fn arb_policy() -> impl Strategy<Value = Policy> {
-        let matcher = prop_oneof![
-            Just(Matcher::new(ISS)),
-            Just(email("alice@example.com")),
-            Just(email("*@corp.example")),
-            Just(Matcher {
-                group: Some("sre".into()),
-                ..Matcher::new(ISS)
-            }),
-        ];
-        let roles = proptest::collection::vec(proptest::collection::vec(matcher, 1..3), 5);
-        let subset = |n: usize| proptest::collection::btree_set(0..n, 0..=n);
-        let services = proptest::collection::vec((subset(5), subset(5), subset(4)), 0..8);
-        let bans = proptest::collection::btree_map(40u8..60, any::<i64>(), 0..5);
-        (roles, services, bans).prop_map(|(roles, services, bans)| {
-            let mut p = sample();
-            p.roles.clear();
-            p.services.clear();
-            p.bans.clear();
-            for (i, matchers) in roles.into_iter().enumerate() {
-                p.roles.insert(role(&format!("r{i}")), matchers);
-            }
-            for (i, (allow, readers, hosts)) in services.into_iter().enumerate() {
-                p.services.insert(
-                    name(&format!("s{i}")),
-                    Service {
-                        description: format!("service {i}"),
-                        allow: allow.into_iter().map(|r| role(&format!("r{r}"))).collect(),
-                        hosts: hosts.into_iter().map(|h| node(10 + h as u8)).collect(),
-                        readers: readers
-                            .into_iter()
-                            .map(|r| role(&format!("r{r}")))
-                            .collect(),
-                    },
-                );
-            }
-            for (b, until) in bans {
-                p.bans.insert(node(b), Ban { until });
-            }
-            p
-        })
-    }
-
-    fn arb_principal() -> impl Strategy<Value = Option<Principal>> {
-        let email = prop_oneof![
-            Just("alice@example.com"),
-            Just("bob@corp.example"),
-            Just("eve@elsewhere.example"),
-        ];
-        let issuer = prop_oneof![Just(ISS), Just("https://partner.example")];
-        proptest::option::of((email, issuer, any::<bool>()).prop_map(|(e, iss, sre)| {
-            let mut p = who(e);
-            p.issuer = iss.into();
-            if sre {
-                p.groups = vec!["sre".into()];
-            }
-            p
-        }))
     }
 
     proptest! {
@@ -1005,8 +1120,8 @@ mod tests {
             let mut services = BTreeSet::new();
             let mut roles = BTreeSet::new();
             let mut bans = 0;
-            for proved in &slice.items {
-                match &proved.item {
+            for item in &slice.items {
+                match item {
                     Item::Service { key, body } => {
                         prop_assert!(body.hosts.contains(&node(host)), "{key} doesn't name the host");
                         services.insert(key);
@@ -1031,7 +1146,7 @@ mod tests {
             principal in arb_principal(),
         ) {
             let signed = p.sign(&root()).unwrap();
-            let view = signed.view_for(principal.as_ref()).unwrap();
+            let view = signed.view_for(principal.as_ref(), None).unwrap();
             prop_assert!(view.verify(root().node_id()).is_ok());
             // The rule, spelled out independently of `admits`.
             let admits = |r: &RoleName| match (&principal, p.roles.get(r)) {
