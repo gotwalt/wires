@@ -158,9 +158,11 @@ impl NodeIdentity {
     /// assert_eq!(id.node_id().hex().len(), 64);
     /// ```
     pub fn generate() -> Self {
-        use rand::RngCore;
+        use rand::TryRng as _;
         let mut seed = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(&mut *seed);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut *seed)
+            .expect("the OS entropy source failed");
         Self::from_secret(&seed)
     }
 
