@@ -1,5 +1,5 @@
-//! Native services: an app's own code serving wires calls in-process
-//! (card 33), in place of a CLI child.
+//! Native services: an app's own code serving wires calls in-process, in
+//! place of a CLI child.
 //!
 //! An app implements [`Service`] and registers it on a
 //! [`Host`](crate::Host). To callers it is a CLI like any other: it is invoked
@@ -12,9 +12,10 @@
 //! keeps between calls) and the verified caller as a type ([`Call`]) rather
 //! than `WIRES_*` environment variables.
 //!
-//! A handler runs as a tokio task. When the caller disconnects, the task is
-//! aborted at its next `.await` (clean up in `Drop`). If it panics, the call
-//! exits -1 and still gets its `Finished` record.
+//! A handler runs as a tokio task. When the caller disconnects, or the
+//! session is dropped, the task is aborted at its next `.await` (clean up in
+//! `Drop`). If it panics, the call exits -1 and still gets its `Finished`
+//! record.
 //!
 //! With `push` configured, a handler can message its caller
 //! ([`Call::push_to_caller`]) under the same per-call capability a CLI child
@@ -30,7 +31,7 @@ use library::{
     Argv, CallId, NodeId, Principal, PushBody, PushOutcome, RoleName, ServiceName, StateVersion,
     Subject,
 };
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::host::capability::{Capabilities, PushToken};
@@ -48,7 +49,7 @@ use crate::host::service::{BoxFuture, Process, Running};
 ///
 /// impl wires::Service for Shout {
 ///     async fn call(&self, call: wires::Call, mut io: wires::CallIo) -> i32 {
-///         let who = call.principal().and_then(|p| p.email.clone()).unwrap_or_default();
+///         let who = call.principal().name();
 ///         let mut input = Vec::new();
 ///         if io.stdin.read_to_end(&mut input).await.is_err() {
 ///             return 1;
@@ -71,12 +72,16 @@ pub trait Service: Send + Sync + 'static {
 
 /// One admitted call, as its handler sees it: the caller the host verified,
 /// and what the caller asked for.
-#[derive(Clone, Debug)]
+///
+/// Not `Clone`: it holds the call's push capability, which should have one
+/// owner. Share it behind an `Arc` if more than one task needs it.
+#[derive(Debug)]
 pub struct Call {
     /// The caller's node key.
     pub(crate) caller: NodeId,
-    /// The person the caller's ID token verified as, when it presented one.
-    pub(crate) principal: Option<Principal>,
+    /// The person the caller's ID token verified as (the gate admits no
+    /// one without one).
+    pub(crate) principal: Principal,
     /// The registry role that admitted the caller.
     pub(crate) role: RoleName,
     /// The signed-state version the call was decided under.
@@ -85,8 +90,8 @@ pub struct Call {
     pub(crate) service: ServiceName,
     /// The caller's arguments.
     pub(crate) args: Argv,
-    /// This call's id in the host's call log, when the host keeps one.
-    pub(crate) id: Option<CallId>,
+    /// This call's id in the host's call log.
+    pub(crate) id: CallId,
     /// Its way back to the caller, when the host pushes.
     pub(crate) push: Option<CallerPush>,
 }
@@ -118,10 +123,10 @@ impl Call {
     }
 
     /// The person the caller verified as with their IdP. Every registry
-    /// role names an issuer, so an admitted call has one; `None` only if
-    /// that ever changes.
-    pub fn principal(&self) -> Option<&Principal> {
-        self.principal.as_ref()
+    /// role names an issuer and no role admits a caller without a verified
+    /// ID token, so every admitted call has one.
+    pub fn principal(&self) -> &Principal {
+        &self.principal
     }
 
     /// The registry role that admitted the caller.
@@ -145,7 +150,7 @@ impl Call {
     }
 
     /// This call's id in the host's call log (the id `wires watch` shows).
-    pub fn id(&self) -> Option<CallId> {
+    pub fn id(&self) -> CallId {
         self.id
     }
 
@@ -215,6 +220,94 @@ pub struct CallIo {
     pub stderr: Box<dyn AsyncWrite + Send + Unpin>,
 }
 
+/// One of a call's streams, until the call finishes.
+type Slot<T> = tokio::sync::Mutex<Option<Box<T>>>;
+
+/// A call's stdio behind locks, for a handler that can't hold [`CallIo`] by
+/// value: a foreign-language runtime (the Python and Node bindings) whose
+/// call object is shared between threads or Promises and may outlive the
+/// call. Every method fails with "the call has finished" once
+/// [`close`](Self::close) has run.
+pub struct SharedIo {
+    stdin: Slot<dyn AsyncRead + Send + Unpin>,
+    stdout: Slot<dyn AsyncWrite + Send + Unpin>,
+    stderr: Slot<dyn AsyncWrite + Send + Unpin>,
+}
+
+impl SharedIo {
+    /// The most bytes [`read_to_end`](Self::read_to_end) gathers before it
+    /// fails, so a caller can't make a handler buffer without bound. Stream
+    /// larger input with [`read`](Self::read).
+    pub const READ_ALL_MAX: u64 = 64 * 1024 * 1024;
+
+    /// Share `io`.
+    pub fn new(io: CallIo) -> Self {
+        Self {
+            stdin: tokio::sync::Mutex::new(Some(io.stdin)),
+            stdout: tokio::sync::Mutex::new(Some(io.stdout)),
+            stderr: tokio::sync::Mutex::new(Some(io.stderr)),
+        }
+    }
+
+    /// Read some of the caller's stdin into `buf`: how many bytes, 0 at EOF.
+    /// Waits until some arrive.
+    pub async fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        let mut stdin = self.stdin.lock().await;
+        let stdin = stdin.as_mut().ok_or_else(finished)?;
+        Ok(stdin.read(buf).await?)
+    }
+
+    /// Append the rest of the caller's stdin, to EOF, to `buf`. Fails past
+    /// [`READ_ALL_MAX`](Self::READ_ALL_MAX) bytes.
+    pub async fn read_to_end(&self, buf: &mut Vec<u8>) -> Result<()> {
+        let mut stdin = self.stdin.lock().await;
+        let stdin = stdin.as_mut().ok_or_else(finished)?;
+        let n = (&mut **stdin)
+            .take(Self::READ_ALL_MAX + 1)
+            .read_to_end(buf)
+            .await?;
+        if n as u64 > Self::READ_ALL_MAX {
+            bail!("stdin is over 64 MiB; read it in chunks");
+        }
+        Ok(())
+    }
+
+    /// Write all of `data` to the caller's stdout (waits while the caller
+    /// is behind).
+    pub async fn write_stdout(&self, data: &[u8]) -> Result<()> {
+        write_all(&self.stdout, data).await
+    }
+
+    /// Write all of `data` to the caller's stderr.
+    pub async fn write_stderr(&self, data: &[u8]) -> Result<()> {
+        write_all(&self.stderr, data).await
+    }
+
+    /// The handler is done: close stdout and stderr (EOF to the caller) and
+    /// drop stdin, even while the foreign side still holds the call.
+    pub async fn close(&self) {
+        for out in [&self.stdout, &self.stderr] {
+            if let Some(mut w) = out.lock().await.take() {
+                let _ = w.shutdown().await;
+            }
+        }
+        self.stdin.lock().await.take();
+    }
+}
+
+/// Write and flush all of `data` to `out`, unless the call has finished.
+async fn write_all(out: &Slot<dyn AsyncWrite + Send + Unpin>, data: &[u8]) -> Result<()> {
+    let mut out = out.lock().await;
+    let out = out.as_mut().ok_or_else(finished)?;
+    out.write_all(data).await?;
+    Ok(out.flush().await?)
+}
+
+/// The error for stdio used after the call finished.
+fn finished() -> anyhow::Error {
+    anyhow!("the call has finished")
+}
+
 /// [`Service`] with its future boxed, so a host can hold services of
 /// different types in one map.
 pub(crate) trait DynService: Send + Sync + 'static {
@@ -252,55 +345,85 @@ pub(crate) fn start(service: Arc<dyn DynService>, call: Call) -> Running {
         stdin: Box::new(stdin_w),
         stdout: Box::new(stdout_r),
         stderr: Box::new(stderr_r),
-        process: Box::new(Task(Some(task))),
+        process: Box::new(Task {
+            handle: task,
+            code: None,
+        }),
     }
 }
 
 /// A native service's task as a [`Process`]: stopping it aborts the task;
-/// a task that was aborted or panicked exits -1.
-struct Task(Option<tokio::task::JoinHandle<i32>>);
+/// a task that was aborted or panicked exits -1. The handle stays here while
+/// a [`wait`](Process::wait) is pending, so a `kill` after a dropped `wait`
+/// still reaches the task, and dropping the `Task` aborts it too: a handler
+/// never outlives its session (a dropped `JoinHandle` would detach it).
+struct Task {
+    /// The handler's task.
+    handle: tokio::task::JoinHandle<i32>,
+    /// Its exit code, once it has ended.
+    code: Option<i32>,
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
 
 impl Process for Task {
     fn wait(&mut self) -> BoxFuture<'_, Result<i32>> {
         Box::pin(async move {
-            let Some(task) = self.0.take() else {
-                return Ok(-1);
-            };
-            Ok(match task.await {
+            if let Some(code) = self.code {
+                return Ok(code);
+            }
+            let code = match (&mut self.handle).await {
                 Ok(code) => code,
                 Err(e) if e.is_panic() => {
                     tracing::warn!("a native service's handler panicked; the call exits -1");
                     -1
                 }
                 Err(_) => -1,
-            })
+            };
+            self.code = Some(code);
+            Ok(code)
         })
     }
 
     fn kill(&mut self) {
-        if let Some(task) = &self.0 {
-            task.abort();
-        }
+        self.handle.abort();
+    }
+}
+
+/// A call to service `t` with arguments `a b`, from node 2 verified as
+/// `alice@example.com`, admitted as `staff`: for unit tests.
+#[cfg(test)]
+pub(crate) fn test_call() -> Call {
+    Call {
+        caller: library::NodeIdentity::from_seed([2u8; 32]).node_id(),
+        principal: Principal {
+            issuer: "https://idp.example".into(),
+            subject: "alice".into(),
+            email: Some("alice@example.com".into()),
+            org: None,
+            groups: Vec::new(),
+            not_after: i64::MAX,
+            claims: Default::default(),
+        },
+        role: RoleName::new("staff").unwrap(),
+        state_version: StateVersion(1),
+        service: ServiceName::new("t").unwrap(),
+        args: Argv::new(vec!["a".into(), "b".into()]).unwrap(),
+        id: CallId::generate(),
+        push: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     use super::*;
 
     fn call() -> Call {
-        Call {
-            caller: library::NodeIdentity::from_seed([2u8; 32]).node_id(),
-            principal: None,
-            role: RoleName::new("staff").unwrap(),
-            state_version: StateVersion(1),
-            service: ServiceName::new("t").unwrap(),
-            args: Argv::new(vec!["a".into(), "b".into()]).unwrap(),
-            id: None,
-            push: None,
-        }
+        test_call()
     }
 
     /// Writes its arguments to stdout, its stdin to stderr, exits 7.
@@ -348,6 +471,33 @@ mod tests {
         assert_eq!(running.process.wait().await.unwrap(), -1);
     }
 
+    /// The bridge's shape: a `wait` raced against the caller leaving and
+    /// dropped, then `kill` and `wait` again. The kill must still reach the
+    /// task.
+    #[tokio::test]
+    async fn a_kill_after_a_dropped_wait_still_stops_the_handler() {
+        struct Forever;
+        impl Service for Forever {
+            async fn call(&self, _call: Call, _io: CallIo) -> i32 {
+                std::future::pending::<()>().await;
+                0
+            }
+        }
+        let mut running = start(Arc::new(Forever), call());
+        tokio::select! {
+            _ = running.process.wait() => panic!("Forever doesn't end"),
+            () = tokio::task::yield_now() => {}
+        }
+        running.process.kill();
+        let code = tokio::time::timeout(std::time::Duration::from_secs(5), running.process.wait())
+            .await
+            .expect("the kill should end the handler");
+        assert_eq!(code.unwrap(), -1);
+        // Its stdio closes with it.
+        let mut out = Vec::new();
+        running.stdout.read_to_end(&mut out).await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_stopped_handler_exits_minus_one() {
         struct Forever;
@@ -360,5 +510,65 @@ mod tests {
         let mut running = start(Arc::new(Forever), call());
         running.process.kill();
         assert_eq!(running.process.wait().await.unwrap(), -1);
+    }
+
+    /// Dropping a call's `Running` (its session future was dropped) aborts
+    /// the handler rather than leaving it running detached.
+    #[tokio::test]
+    async fn dropping_the_running_service_aborts_its_handler() {
+        /// Holds `alive` for as long as its task runs; never returns.
+        struct Forever(std::sync::Mutex<Option<oneshot::Sender<()>>>);
+        impl Service for Forever {
+            async fn call(&self, _call: Call, _io: CallIo) -> i32 {
+                let _alive = self.0.lock().unwrap().take();
+                std::future::pending::<()>().await;
+                0
+            }
+        }
+        let (alive, ended) = oneshot::channel();
+        let running = start(
+            Arc::new(Forever(std::sync::Mutex::new(Some(alive)))),
+            call(),
+        );
+        tokio::task::yield_now().await;
+        drop(running);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), ended).await;
+        assert!(
+            ended.expect("the handler should be aborted").is_err(),
+            "the handler's task ended without sending: it was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_io_reads_writes_and_refuses_after_close() {
+        let (mut in_w, in_r) = tokio::io::duplex(64);
+        let (out_w, mut out_r) = tokio::io::duplex(64);
+        let (err_w, mut err_r) = tokio::io::duplex(64);
+        let io = SharedIo::new(CallIo {
+            stdin: Box::new(in_r),
+            stdout: Box::new(out_w),
+            stderr: Box::new(err_w),
+        });
+        in_w.write_all(b"abc").await.unwrap();
+        drop(in_w);
+        let mut all = Vec::new();
+        io.read_to_end(&mut all).await.unwrap();
+        assert_eq!(all, b"abc");
+        io.write_stdout(b"out").await.unwrap();
+        io.write_stderr(b"err").await.unwrap();
+        io.close().await;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        out_r.read_to_end(&mut out).await.unwrap();
+        err_r.read_to_end(&mut err).await.unwrap();
+        assert_eq!((out.as_slice(), err.as_slice()), (&b"out"[..], &b"err"[..]));
+        let late = [
+            io.read(&mut [0u8; 4]).await.unwrap_err(),
+            io.read_to_end(&mut Vec::new()).await.unwrap_err(),
+            io.write_stdout(b"late").await.unwrap_err(),
+            io.write_stderr(b"late").await.unwrap_err(),
+        ];
+        for e in late {
+            assert_eq!(e.to_string(), "the call has finished");
+        }
     }
 }

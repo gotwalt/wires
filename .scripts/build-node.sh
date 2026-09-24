@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build the Node.js / TypeScript bindings for wires-native services (card 33)
+# Build the Node.js / TypeScript bindings for wires-native services
 # into a package directory: the platform addon (wires.<platform>.node), the
 # napi-rs loader (index.js), the types generated from bindings/node/lib.rs
 # (index.d.ts), and package.json. Put it at node_modules/wires, or depend on

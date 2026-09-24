@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build the Python bindings for wires-native services (card 33): the
+# Build the Python bindings for wires-native services: the
 # `wires-ffi` cdylib plus its UniFFI-generated `wires.py`, side by side in
 # one directory that goes on PYTHONPATH.
 #

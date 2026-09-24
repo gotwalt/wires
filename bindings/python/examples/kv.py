@@ -1,4 +1,4 @@
-"""kv: a wires-native service written in Python (card 33).
+"""kv: a wires-native service written in Python.
 
 The same store as the Rust example (wires/examples/kv.rs): a key-value map
 held in this process's memory, one namespace per verified person, so each
@@ -7,6 +7,7 @@ caller sees only their own keys.
     wires call kv -- set greeting <<< 'hello'   # the value is stdin
     wires call kv -- get greeting               # hello
     wires call kv -- keys                       # greeting
+    wires call kv -- throw                      # raises: exit 1, its text on stderr
 
 Run it from a joined node's keystore, trusting one IdP:
 
@@ -18,9 +19,13 @@ With --push-to, a `set` also pushes "kv: <key> set" to the caller's
 `wires inbox` (members of ROLE may receive pushes). With --loopback, the
 host takes direct connections only from this machine (others come through
 its relay), so the macOS firewall doesn't prompt for Python.
+
+It serves until SIGTERM or Ctrl-C, which call `host.stop()`: `serve()`
+returns and the process exits 0.
 """
 
 import argparse
+import signal
 import sys
 import threading
 
@@ -37,9 +42,6 @@ class Kv(wires.Service):
 
     def call(self, call: wires.Call) -> int:
         person = call.principal()
-        if person is None:
-            call.write_stderr(b"kv: no verified identity\n")
-            return 1
         me = (person.issuer, person.subject)
         match call.args():
             case ["set", key]:
@@ -50,7 +52,12 @@ class Kv(wires.Service):
                 with self._lock:
                     self._people.setdefault(me, {})[key] = value
                 if self._push:
-                    call.push_to_caller(f"kv: {key} set", f"{len(value)} bytes")
+                    # The key is set either way; a failed notice is logged,
+                    # not the call's failure.
+                    try:
+                        call.push_to_caller(f"kv: {key} set", f"{len(value)} bytes")
+                    except wires.WiresError as e:
+                        print(f"kv: push failed: {e}", file=sys.stderr, flush=True)
                 return 0
             case ["get", key]:
                 with self._lock:
@@ -65,8 +72,11 @@ class Kv(wires.Service):
                     keys = sorted(self._people.get(me, {}))
                 call.write_stdout("".join(f"{k}\n" for k in keys).encode())
                 return 0
+            case ["throw"]:
+                # An uncaught exception: the call exits 1 with its text.
+                raise RuntimeError("kv: thrown on request")
             case _:
-                call.write_stderr(b"usage: kv set KEY (value on stdin) | get KEY | keys\n")
+                call.write_stderr(b"usage: kv set KEY (value on stdin) | get KEY | keys | throw\n")
                 return 2
 
 
@@ -86,7 +96,26 @@ def main() -> int:
         builder = builder.bind_loopback()
     host = builder.service("kv", Kv(push=push_to is not None)).build()
     print(f"kv: serving as {host.node_id()}", file=sys.stderr, flush=True)
-    host.serve()
+    # serve() blocks in Rust, where Python can't run a signal handler, so it
+    # runs on a thread; the main thread takes the signals and stops it.
+    failed: list[Exception] = []
+
+    def serve() -> None:
+        try:
+            host.serve()
+        except wires.WiresError as e:
+            failed.append(e)
+
+    serving = threading.Thread(target=serve)
+    serving.start()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: host.stop())
+    while serving.is_alive():
+        serving.join(0.2)
+    if failed:
+        print(f"kv: {failed[0]}", file=sys.stderr, flush=True)
+        return 1
+    print("kv: stopped", file=sys.stderr, flush=True)
     return 0
 
 

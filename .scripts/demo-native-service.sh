@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Acceptance for card 33 phase 2: a wires-native service written in PYTHON
-# (bindings/python/examples/kv.py, through wires-ffi / UniFFI) or in
-# TYPESCRIPT (bindings/node/examples/kv.mts, through wires-node / napi-rs)
-# is served on a real, loopback network and called with the shipped `wires`
-# binary. To a caller it is a CLI like any other.
+# A wires-native service written in Python (bindings/python/examples/kv.py,
+# through wires-ffi / UniFFI) or TypeScript (bindings/node/examples/kv.mts,
+# through wires-node / napi-rs), served on a real loopback network and
+# called with the shipped `wires` binary. To a caller it is a CLI like any
+# other. Self-asserting; exits non-zero on the first failed check.
 #
 # Four keystores on one machine:
 #
@@ -18,13 +18,15 @@
 # run/hint as `wires serve` does, and the script copies it into the others'
 # hints files.
 #
-# Asserted (both languages): for TypeScript, the example typechecks against
-# the index.d.ts generated from the Rust; alice's `set` (value on stdin),
-# `get` and `keys` round-trip through the handler, state kept between calls; the handler's exit
-# code and stderr are the caller's; bob is refused (77) by name, before the
-# handler runs; the handler's push_to_caller reaches alice's `wires inbox`,
-# from the host's verified key; and the host's signed log, read by alice's
-# own `wires watch`, shows her calls with her verified email.
+# Asserted: (TypeScript) the example typechecks against the index.d.ts
+# generated from the Rust; alice's set (value on stdin), get and keys
+# round-trip through the handler, state kept between calls; the handler's
+# exit code and stderr are the caller's, and an exception it raises is exit
+# 1 with its message; bob is refused (77) by name, before the handler runs;
+# push_to_caller reaches alice's `wires inbox` from the host's verified key;
+# the host's signed log, read by alice's own `wires watch`, shows her calls
+# with her verified email; and SIGTERM makes the example call `stop()`, so
+# `serve()` returns and the process exits 0 on its own.
 #
 # Python comes from uv (a uv-managed CPython, $WIRES_PYTHON, default 3.13;
 # uv downloads it on first use); TypeScript runs on Node >= 22.18, which
@@ -74,8 +76,12 @@ OTHER="bob@other.example"
 D="$(mktemp -d)"
 IDP_PID=""
 HOST_PID=""
-p=""
-trap 'for p in $HOST_PID $IDP_PID; do kill "$p" 2>/dev/null || true; done; [ -n "$KEEP" ] || rm -rf "$D"' EXIT INT TERM
+cleanup() {
+	local pid
+	for pid in $HOST_PID $IDP_PID; do kill "$pid" 2>/dev/null || true; done
+	[ -n "$KEEP" ] || rm -rf "$D"
+}
+trap cleanup EXIT INT TERM
 
 ok() { printf '\033[32m[ok]\033[0m   %s\n' "$*" >&2; }
 bad() {
@@ -125,8 +131,8 @@ else
 	mkdir -p "$app/node_modules"
 	.scripts/build-node.sh "$app/node_modules/wires" >/dev/null
 	cp "$repo/bindings/node/examples/kv.mts" "$repo/bindings/node/examples/tsconfig.json" "$app/"
-	sed -i.bak "s|\"../node_modules/@types\"|\"$repo/bindings/node/node_modules/@types\"|" "$app/tsconfig.json"
-	(cd "$app" && "$repo/bindings/node/node_modules/.bin/tsc" -p tsconfig.json) >"$D/tsc.out" 2>&1 || {
+	(cd "$app" && "$repo/bindings/node/node_modules/.bin/tsc" -p tsconfig.json \
+		--typeRoots "$repo/bindings/node/node_modules/@types") >"$D/tsc.out" 2>&1 || {
 		dump "$D/tsc.out"
 		bad "kv.mts does not typecheck against the generated index.d.ts"
 	}
@@ -155,18 +161,18 @@ ISSUER="$(awk '/^issuer /{print $2}' "$D/idp.out")"
 CLIENT_ID="$(awk '/^client_id /{print $2}' "$D/idp.out")"
 
 admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1
-admin invite "$HOST_ID" --name pyhost >/dev/null 2>&1
+admin invite "$HOST_ID" --name nativehost >/dev/null 2>&1
 # The host isn't up yet: the edit is stored, and a fresh token carries it.
 admin service add kv --description "A key-value store, one namespace per person ($LANG_NAME)." \
-	--allow analyst --host pyhost >"$D/svc.out" 2>"$D/svc.err" ||
+	--allow analyst --host nativehost >"$D/svc.out" 2>"$D/svc.err" ||
 	grep -qF "reached none of its 1 host(s)" "$D/svc.err" || {
 	dump "$D/svc.err"
 	bad "wires service add failed"
 }
-WIRES_HOME="$host" "$WIRES" join "$(admin invite "$HOST_ID" --name pyhost 2>/dev/null)" >/dev/null
+WIRES_HOME="$host" "$WIRES" join "$(admin invite "$HOST_ID" --name nativehost 2>/dev/null)" >/dev/null
 
 # --------------------------------------------------------------------------
-# The Python host.
+# The $LANG_NAME host.
 # --------------------------------------------------------------------------
 if [ "$LANG_" = python ]; then
 	PYTHONPATH="$PY" uv run -q --no-project --managed-python --python "$PYTHON_VERSION" -- \
@@ -223,6 +229,17 @@ grep -qF "kv: no such key" "$D/c3.err" || bad "the handler's stderr did not reac
 ok "the handler's exit code (1) and stderr are the caller's"
 
 set +e
+call "$agent" throw >"$D/c5.out" 2>"$D/c5.err"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || bad "a raising handler exited $rc, expected 1"
+grep -qF "kv: thrown on request" "$D/c5.err" || {
+	dump "$D/c5.err"
+	bad "the exception's message did not reach the caller's stderr"
+}
+ok "an exception in the $LANG_NAME handler is exit 1 with its message on stderr"
+
+set +e
 call "$other" keys >"$D/c4.out" 2>"$D/c4.err"
 rc=$?
 set -e
@@ -265,5 +282,29 @@ grep -qE "kv +■ [0-9a-f]+ exit 0 .*stdin \"hello\"" "$D/w.out" || {
 }
 ok "the host's signed log shows alice's calls to the $LANG_NAME service, with her verified email"
 
-kill "$HOST_PID" 2>/dev/null || true
+# --------------------------------------------------------------------------
+# Stop: SIGTERM makes the example call host.stop(); serve() returns and the
+# process exits 0 by itself (nothing of the host keeps it alive).
+# --------------------------------------------------------------------------
+kill -TERM "$HOST_PID"
+for _ in $(seq 1 100); do
+	kill -0 "$HOST_PID" 2>/dev/null || break
+	sleep 0.1
+done
+if kill -0 "$HOST_PID" 2>/dev/null; then
+	dump "$D/host.err"
+	bad "the $LANG_NAME host was still running 10s after stop()"
+fi
+set +e
+wait "$HOST_PID"
+rc=$?
+set -e
+HOST_PID=""
+[ "$rc" -eq 0 ] || {
+	dump "$D/host.err"
+	bad "the $LANG_NAME host exited $rc after stop(), expected 0"
+}
+grep -qF "kv: stopped" "$D/host.err" || bad "the $LANG_NAME host did not return from serve()"
+ok "stop() ended serve(), and the $LANG_NAME process exited 0 on its own"
+
 printf '\n\033[1mnative-service demo (%s): all assertions passed\033[0m\n' "$LANG_NAME" >&2

@@ -1,5 +1,5 @@
-//! `wires-node`: wires-native services from Node.js and TypeScript (card 33,
-//! phase 2), through [napi-rs](https://napi.rs). The package is `wires`;
+//! `wires-node`: wires-native services from Node.js and TypeScript, through
+//! [napi-rs](https://napi.rs). The package is `wires`;
 //! its `index.d.ts` is generated from this file.
 //!
 //! The surface is the Rust embedding API ([`wires::Host`],
@@ -17,7 +17,8 @@
 //!     return 0;
 //!   })
 //!   .build();
-//! await host.serve();
+//! process.on("SIGTERM", () => host.stop());
+//! await host.serve(); // until stop(); serve(true) also stops on Ctrl-C
 //! ```
 //!
 //! What a JavaScript handler differs in from a Rust one: when the caller
@@ -33,15 +34,10 @@ use napi::bindgen_prelude::{Buffer, Either, Promise, This};
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi::{Error, Result, Status};
 use napi_derive::napi;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use wires::SharedIo;
 
 /// A JavaScript service: `(call) => exitCode`, or a Promise of one.
 type Handler = ThreadsafeFunction<Call, Either<i32, Promise<i32>>, Call, Status, false>;
-
-/// The most bytes [`Call::read_all_stdin`] gathers before it rejects, so a
-/// caller can't make a handler buffer without bound. Stream larger input
-/// with [`Call::read_stdin`].
-const READ_ALL_MAX: u64 = 64 * 1024 * 1024;
 
 /// How much [`Call::read_stdin`] reads at most when not told.
 const READ_DEFAULT: u32 = 64 * 1024;
@@ -49,11 +45,6 @@ const READ_DEFAULT: u32 = 64 * 1024;
 /// A failure, as a JavaScript `Error` with `message`.
 fn failed(message: impl std::fmt::Display) -> Error {
     Error::new(Status::GenericFailure, message.to_string())
-}
-
-/// The error for stdio used after the call finished.
-fn finished() -> Error {
-    failed("the call has finished")
 }
 
 /// The person a caller verified as with their IdP.
@@ -67,35 +58,19 @@ pub struct Principal {
     pub email: Option<String>,
 }
 
-/// One call's stdio, shared between the handler's `Call` and the host.
-struct Stdio {
-    stdin: tokio::sync::Mutex<Option<Box<dyn AsyncRead + Send + Unpin>>>,
-    stdout: tokio::sync::Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>,
-    stderr: tokio::sync::Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>,
-}
-
-impl Stdio {
-    /// The handler is done: close stdout and stderr (EOF to the caller),
-    /// even if JavaScript still holds the `Call`.
-    async fn close(&self) {
-        for out in [&self.stdout, &self.stderr] {
-            if let Some(mut w) = out.lock().await.take() {
-                let _ = w.shutdown().await;
-            }
+impl From<&wires::Principal> for Principal {
+    fn from(p: &wires::Principal) -> Self {
+        Self {
+            issuer: p.issuer.clone(),
+            subject: p.subject.clone(),
+            email: p.email.clone(),
         }
-        self.stdin.lock().await.take();
     }
 }
 
-/// Write all of `data` to `out`.
-async fn write(
-    out: &tokio::sync::Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>,
-    data: &[u8],
-) -> Result<()> {
-    let mut out = out.lock().await;
-    let out = out.as_mut().ok_or_else(finished)?;
-    out.write_all(data).await.map_err(failed)?;
-    out.flush().await.map_err(failed)
+/// A failure of the embedding API, with its chain of causes.
+fn failed_by(e: &anyhow::Error) -> Error {
+    failed(format!("{e:#}"))
 }
 
 /// One admitted call: who is calling, with what, and its stdio. The stdio
@@ -103,7 +78,7 @@ async fn write(
 #[napi]
 pub struct Call {
     call: wires::Call,
-    io: Arc<Stdio>,
+    io: Arc<SharedIo>,
 }
 
 #[napi]
@@ -114,15 +89,10 @@ impl Call {
         self.call.caller().hex()
     }
 
-    /// The person the caller verified as. Every registry role names an
-    /// issuer, so an admitted call has one.
+    /// The person the caller verified as (every admitted call has one).
     #[napi]
-    pub fn principal(&self) -> Option<Principal> {
-        self.call.principal().map(|p| Principal {
-            issuer: p.issuer.clone(),
-            subject: p.subject.clone(),
-            email: p.email.clone(),
-        })
+    pub fn principal(&self) -> Principal {
+        self.call.principal().into()
     }
 
     /// The registry role that admitted the caller.
@@ -151,18 +121,16 @@ impl Call {
 
     /// This call's id in the host's call log (what `wires watch` shows).
     #[napi]
-    pub fn id(&self) -> Option<String> {
-        self.call.id().map(|id| id.hex())
+    pub fn id(&self) -> String {
+        self.call.id().hex()
     }
 
     /// Up to `max` bytes (default 64 KiB) of the caller's stdin; empty at
     /// EOF.
     #[napi]
     pub async fn read_stdin(&self, max: Option<u32>) -> Result<Buffer> {
-        let mut stdin = self.io.stdin.lock().await;
-        let stdin = stdin.as_mut().ok_or_else(finished)?;
         let mut buf = vec![0u8; max.unwrap_or(READ_DEFAULT).max(1) as usize];
-        let n = stdin.read(&mut buf).await.map_err(failed)?;
+        let n = self.io.read(&mut buf).await.map_err(|e| failed_by(&e))?;
         buf.truncate(n);
         Ok(buf.into())
     }
@@ -171,17 +139,11 @@ impl Call {
     /// with `readStdin`).
     #[napi]
     pub async fn read_all_stdin(&self) -> Result<Buffer> {
-        let mut stdin = self.io.stdin.lock().await;
-        let stdin = stdin.as_mut().ok_or_else(finished)?;
         let mut all = Vec::new();
-        (&mut *stdin)
-            .take(READ_ALL_MAX + 1)
+        self.io
             .read_to_end(&mut all)
             .await
-            .map_err(failed)?;
-        if all.len() as u64 > READ_ALL_MAX {
-            return Err(failed("stdin is over 64 MiB; read it with readStdin"));
-        }
+            .map_err(|e| failed_by(&e))?;
         Ok(all.into())
     }
 
@@ -189,13 +151,13 @@ impl Call {
     /// (waits while the caller is behind).
     #[napi]
     pub async fn write_stdout(&self, data: Buffer) -> Result<()> {
-        write(&self.io.stdout, &data).await
+        self.io.write_stdout(&data).await.map_err(|e| failed_by(&e))
     }
 
     /// Write `data` to the caller's stderr.
     #[napi]
     pub async fn write_stderr(&self, data: Buffer) -> Result<()> {
-        write(&self.io.stderr, &data).await
+        self.io.write_stderr(&data).await.map_err(|e| failed_by(&e))
     }
 
     /// Send the caller a message (their `wires inbox`), under this call's
@@ -208,7 +170,7 @@ impl Call {
             .push_to_caller(subject, body)
             .await
             .map(|outcome| outcome.as_str().to_string())
-            .map_err(|e| failed(format!("{e:#}")))
+            .map_err(|e| failed_by(&e))
     }
 }
 
@@ -217,11 +179,7 @@ struct Node(Arc<Handler>);
 
 impl wires::Service for Node {
     async fn call(&self, call: wires::Call, io: wires::CallIo) -> i32 {
-        let stdio = Arc::new(Stdio {
-            stdin: tokio::sync::Mutex::new(Some(io.stdin)),
-            stdout: tokio::sync::Mutex::new(Some(io.stdout)),
-            stderr: tokio::sync::Mutex::new(Some(io.stderr)),
-        });
+        let stdio = Arc::new(SharedIo::new(io));
         let js = Call {
             call,
             io: Arc::clone(&stdio),
@@ -236,10 +194,9 @@ impl wires::Service for Node {
             Err(e) => {
                 // What an uncaught exception in a CLI does: its message on
                 // stderr, exit 1.
-                let text = format!("{}\n", e.reason);
-                if let Some(err) = stdio.stderr.lock().await.as_mut() {
-                    let _ = err.write_all(text.as_bytes()).await;
-                }
+                let _ = stdio
+                    .write_stderr(format!("{}\n", e.reason).as_bytes())
+                    .await;
                 1
             }
         };
@@ -331,11 +288,12 @@ impl HostBuilder {
             .inner
             .take()
             .ok_or_else(|| failed("this builder was already built"))?;
-        let host = builder.build().map_err(|e| failed(format!("{e:#}")))?;
+        let host = builder.build().map_err(|e| failed_by(&e))?;
+        let (stop, stopped) = tokio::sync::oneshot::channel();
         Ok(Host {
             node_id: host.node_id().hex(),
-            host: Mutex::new(Some(host)),
-            stop: Mutex::new(None),
+            host: Mutex::new(Some((host, stopped))),
+            stop: Mutex::new(Some(stop)),
         })
     }
 }
@@ -344,7 +302,9 @@ impl HostBuilder {
 #[napi]
 pub struct Host {
     node_id: String,
-    host: Mutex<Option<wires::Host>>,
+    /// The host and its stop signal, until it serves.
+    host: Mutex<Option<(wires::Host, tokio::sync::oneshot::Receiver<()>)>>,
+    /// Sends the stop signal, once.
     stop: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -357,31 +317,36 @@ impl Host {
         self.node_id.clone()
     }
 
-    /// Serve until `stop()` or Ctrl-C; resolves then. Rejects before
-    /// serving if the signed state doesn't assign every service to this
-    /// host. A host serves once.
+    /// Serve until `stop()`, then close the host's endpoint and resolve.
+    /// With `handleCtrlC`, Ctrl-C (SIGINT) stops it too; that claims the
+    /// signal for the whole process, so it is off unless asked (an app with
+    /// its own handling calls `stop()` from `process.on("SIGINT", …)`).
+    /// Rejects before serving if the signed state doesn't assign every
+    /// service to this host. A host serves once.
     #[napi]
-    pub async fn serve(&self) -> Result<()> {
-        let host = self
+    pub async fn serve(&self, handle_ctrl_c: Option<bool>) -> Result<()> {
+        let (host, stopped) = self
             .host
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .ok_or_else(|| failed("this host has already served"))?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        *self.stop.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
-        host.serve_until(async {
-            tokio::select! {
-                _ = rx => {}
-                _ = tokio::signal::ctrl_c() => {}
+        host.serve_until(async move {
+            if handle_ctrl_c.unwrap_or(false) {
+                tokio::select! {
+                    _ = stopped => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            } else {
+                let _ = stopped.await;
             }
         })
         .await
-        .map_err(|e| failed(format!("{e:#}")))
+        .map_err(|e| failed_by(&e))
     }
 
-    /// Make a running `serve()` resolve. Does nothing if the host isn't
-    /// serving.
+    /// Make `serve()` resolve (at once, if it hasn't started). Does nothing
+    /// the second time.
     #[napi]
     pub fn stop(&self) {
         if let Some(tx) = self.stop.lock().unwrap_or_else(|e| e.into_inner()).take() {

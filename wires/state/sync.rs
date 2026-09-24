@@ -390,7 +390,7 @@ pub(crate) async fn pull_now(
     node: &NodeIdentity,
     relay_url: Option<&str>,
 ) -> Result<Option<SignedState>> {
-    let endpoint = transport::bind_with_alpn(node, relay_url, STATE_ALPN).await?;
+    let endpoint = transport::bind_with(node, relay_url, STATE_ALPN, false, Some(ks)).await?;
     let pulled = tokio::time::timeout(COLD_PULL_BUDGET, catch_up(&endpoint, ks))
         .await
         .unwrap_or(Ok(None));
@@ -434,16 +434,29 @@ pub(crate) async fn refresh_cold() {
 }
 
 /// A running host's refresh: every [`STALE_AFTER_SECS`], pull if stale (a
-/// push it missed while down). Runs until the endpoint closes.
-pub(crate) async fn refresh_loop(endpoint: Endpoint, ks: Arc<Keystore>) {
+/// push it missed while down). Runs until `stop` resolves or its sender is
+/// dropped (the host stopped serving), or the endpoint closes.
+pub(crate) async fn refresh_loop(
+    endpoint: Endpoint,
+    ks: Arc<Keystore>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) {
     let mut tick = tokio::time::interval(Duration::from_secs(STALE_AFTER_SECS as u64));
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = &mut stop => return,
+            _ = tick.tick() => {}
+        }
         if endpoint.is_closed() {
             return;
         }
-        if let Err(e) = refresh_if_stale(&endpoint, &ks).await {
-            tracing::debug!("state refresh failed: {e:#}");
+        tokio::select! {
+            _ = &mut stop => return,
+            refreshed = refresh_if_stale(&endpoint, &ks) => {
+                if let Err(e) = refreshed {
+                    tracing::debug!("state refresh failed: {e:#}");
+                }
+            }
         }
     }
 }

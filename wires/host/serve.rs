@@ -115,10 +115,10 @@ pub(crate) enum Binding {
         /// (see [`transport::bind_with`]).
         loopback_only: bool,
     },
-    /// Serve on an endpoint already bound for this host's key. Tests use
-    /// this for hermetic loopback. A host that has to pull a state before
-    /// it can start fails instead (it has no relay to pull through).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Serve on an endpoint already bound for this host's key: hermetic
+    /// loopback, for tests. A host that has to pull a state before it can
+    /// start fails instead (it has no relay to pull through).
+    #[cfg(test)]
     Endpoint(iroh::Endpoint),
 }
 
@@ -150,6 +150,7 @@ pub(crate) async fn serve_until(
                 _ => return Err(e),
             }
         }
+        #[cfg(test)]
         (Err(e), Binding::Endpoint(_)) => return Err(e),
     };
     tracing::info!(
@@ -188,34 +189,61 @@ pub(crate) async fn serve_until(
             relay_url,
             loopback_only,
         } => {
-            transport::bind_with(&node, relay_url.as_deref(), transport::ALPN, loopback_only)
-                .await?
+            transport::bind_with(
+                &node,
+                relay_url.as_deref(),
+                transport::ALPN,
+                loopback_only,
+                Some(&ks),
+            )
+            .await?
         }
+        #[cfg(test)]
         Binding::Endpoint(endpoint) => endpoint,
     };
     if let Err(e) = crate::caller::pick::write_own_hint(&ks, &endpoint) {
         tracing::warn!("could not write this host's hint line: {e:#}");
     }
-    let _router = services_router(endpoint.clone(), Arc::clone(&host), push.clone());
-    // A push missed while down is pulled on a timer.
-    tokio::spawn(crate::state::sync::refresh_loop(endpoint, Arc::clone(&ks)));
-    match push.zip(push_queue) {
+    let router = services_router(endpoint.clone(), Arc::clone(&host), push.clone());
+    // A push missed while down is pulled on a timer, until serving ends
+    // (dropping `stop_refresh` stops it).
+    let (stop_refresh, refresh_stopped) = tokio::sync::oneshot::channel::<()>();
+    let refresh = tokio::spawn(crate::state::sync::refresh_loop(
+        endpoint.clone(),
+        Arc::clone(&ks),
+        refresh_stopped,
+    ));
+    let ended = match push.zip(push_queue) {
         Some((push, (commands_tx, commands))) => {
-            let sockets = push_sockets(&ks.path(""), &host, commands_tx).await?;
-            let ended = tokio::select! {
-                () = push.run(commands) => Ok(()),
-                r = shutdown => r,
-            };
-            for socket in sockets {
-                socket.abort();
+            match push_sockets(&ks.path(""), &host, commands_tx).await {
+                Ok(sockets) => {
+                    let ended = tokio::select! {
+                        () = push.run(commands) => Ok(()),
+                        r = shutdown => r,
+                    };
+                    for socket in sockets {
+                        socket.abort();
+                    }
+                    ended
+                }
+                Err(e) => Err(e),
             }
-            if let Some(grants) = &host.push_grants {
-                grants.dir.remove();
-            }
-            ended
         }
         None => shutdown.await,
+    };
+    // Stop everything this host started, so an app that embeds it can go
+    // on without it: the refresh, the router (its protocols and
+    // sessions), and the endpoint (the socket and the relay connection).
+    drop(stop_refresh);
+    let _ = refresh.await;
+    if let Err(e) = router.shutdown().await {
+        tracing::warn!("a protocol handler failed while shutting down: {e}");
     }
+    endpoint.close().await;
+    if let Some(grants) = &host.push_grants {
+        grants.dir.remove();
+    }
+    ended
 }
 
 /// The file whose presence marks an admin keystore.

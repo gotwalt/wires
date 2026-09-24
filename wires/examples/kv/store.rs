@@ -1,23 +1,11 @@
-//! `kv`: a wires-native service (card 33). A key-value store held in the
-//! daemon's memory, with one namespace per verified person, so each caller
-//! sees only their own keys. A CLI wrapper couldn't do this cheaply: the
-//! state lives across calls in one warm process, and the caller's identity
-//! arrives as a type, not an environment variable to parse.
+//! The `kv` example's service: a key-value store held in the daemon's
+//! memory, with one namespace per verified person, so each caller sees only
+//! their own keys. A CLI wrapper couldn't do this cheaply: the state lives
+//! across calls in one warm process, and the caller's identity arrives as a
+//! type, not an environment variable to parse.
 //!
-//! ```text
-//! wires call kv -- set greeting <<< 'hello'   # the value is stdin
-//! wires call kv -- get greeting               # hello
-//! wires call kv -- keys                       # greeting
-//! ```
-//!
-//! Run it from a joined node's keystore, trusting one IdP:
-//!
-//! ```text
-//! cargo run -p wires --example kv -- <WIRES_HOME> <issuer> <audience>
-//! ```
-//!
-//! The admin must have registered `kv` on this node (`wires service add kv
-//! --allow <role> --host <this node>`), or the host refuses to start.
+//! Its own file so the e2e tests (`wires/e2e/native.rs`) serve this very
+//! `Kv`; `main.rs` is the daemon around it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -41,10 +29,7 @@ const MAX_VALUE: u64 = 1024 * 1024;
 
 impl wires::Service for Kv {
     async fn call(&self, call: wires::Call, mut io: wires::CallIo) -> i32 {
-        let Some(person) = call.principal() else {
-            let _ = io.stderr.write_all(b"kv: no verified identity\n").await;
-            return 1;
-        };
+        let person = call.principal();
         let person = (person.issuer.clone(), person.subject.clone());
         let args: Vec<&str> = call.args().iter().map(String::as_str).collect();
         match args.as_slice() {
@@ -103,19 +88,4 @@ impl wires::Service for Kv {
             }
         }
     }
-}
-
-#[allow(dead_code)] // the e2e tests include this file for `Kv` alone
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let [home, issuer, audience] = args.as_slice() else {
-        anyhow::bail!("usage: kv <WIRES_HOME> <issuer> <audience>");
-    };
-    let host = wires::Host::builder(home)
-        .trust_issuer(issuer, [audience])
-        .service("kv", Kv::default())
-        .build()?;
-    eprintln!("kv: serving as {}", host.node_id().hex());
-    host.serve().await
 }

@@ -1,5 +1,5 @@
 /**
- * kv: a wires-native service written in TypeScript (card 33).
+ * kv: a wires-native service written in TypeScript.
  *
  * The same store as the Rust and Python examples (wires/examples/kv.rs,
  * bindings/python/examples/kv.py): a key-value map held in this process's
@@ -9,6 +9,7 @@
  *     wires call kv -- set greeting <<< 'hello'   # the value is stdin
  *     wires call kv -- get greeting               # hello
  *     wires call kv -- keys                       # greeting
+ *     wires call kv -- throw                      # throws: exit 1, its message on stderr
  *
  * Run it (Node >= 22.18 runs TypeScript directly) with the package from
  * `./.scripts/build-node.sh` installed as `wires`:
@@ -19,6 +20,9 @@
  * `wires inbox` (members of ROLE may receive pushes). With --loopback, the
  * host takes direct connections only from this machine (others come through
  * its relay), so the macOS firewall doesn't prompt for Node.
+ *
+ * It serves until SIGTERM or Ctrl-C, which call `host.stop()`: `serve()`
+ * resolves and the process exits 0.
  */
 
 import { parseArgs } from "node:util";
@@ -41,10 +45,6 @@ function keysOf(person: string): Map<string, Buffer> {
 
 async function kv(call: Call, push: boolean): Promise<number> {
   const who = call.principal();
-  if (who === null) {
-    await call.writeStderr(Buffer.from("kv: no verified identity\n"));
-    return 1;
-  }
   const keys = keysOf(`${who.issuer} ${who.subject}`);
   const [verb, key, ...rest] = call.args();
   if (verb === "set" && key !== undefined && rest.length === 0) {
@@ -55,7 +55,13 @@ async function kv(call: Call, push: boolean): Promise<number> {
     }
     keys.set(key, value);
     if (push) {
-      await call.pushToCaller(`kv: ${key} set`, `${value.length} bytes`);
+      // The key is set either way; a failed notice is logged, not the
+      // call's failure.
+      try {
+        await call.pushToCaller(`kv: ${key} set`, `${value.length} bytes`);
+      } catch (e) {
+        console.error(`kv: push failed: ${e instanceof Error ? e.message : e}`);
+      }
     }
     return 0;
   }
@@ -73,7 +79,11 @@ async function kv(call: Call, push: boolean): Promise<number> {
     await call.writeStdout(Buffer.from(listing));
     return 0;
   }
-  await call.writeStderr(Buffer.from("usage: kv set KEY (value on stdin) | get KEY | keys\n"));
+  if (verb === "throw" && key === undefined) {
+    // An uncaught exception: the call exits 1 with its message.
+    throw new Error("kv: thrown on request");
+  }
+  await call.writeStderr(Buffer.from("usage: kv set KEY (value on stdin) | get KEY | keys | throw\n"));
   return 2;
 }
 
@@ -100,4 +110,8 @@ if (values.loopback) {
 }
 const host = builder.service("kv", (call) => kv(call, pushTo !== undefined)).build();
 console.error(`kv: serving as ${host.nodeId()}`);
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => host.stop());
+}
 await host.serve();
+console.error("kv: stopped");
