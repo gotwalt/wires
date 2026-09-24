@@ -3,7 +3,7 @@
 //!
 //! The service's hosts come from the signed state; the reader never names a
 //! host. Each host is dialed by key on the record-stream ALPN
-//! ([`record_stream`](crate::host::record_stream)) with the same credentials
+//! ([`record_stream`]) with the same credentials
 //! a call presents, and answers with what this reader may see: every record
 //! of a service whose `readers` roles it is in, otherwise only its own calls
 //! (`--mine` asks for only those everywhere). With no service named, every
@@ -27,7 +27,7 @@
 //! what the host still holds.
 //!
 //! The service a line names is derived here, from signed records: a
-//! `Started`'s tool, and for a `Finished` or a service's push the tool of the
+//! `Started`'s service, and for a `Finished` or a service's push the service of the
 //! `Started` with the same call id ([`Labels`]). An operator push, or a line
 //! whose call this reader never saw start, shows `-`.
 //!
@@ -57,6 +57,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::admin::keystore::{self, Keystore};
+use crate::caller::one_line;
 use crate::caller::pick::{self, Hints};
 use crate::host::record_stream::{self, Link, RecordFrame, StreamItem};
 use crate::host::transport;
@@ -328,8 +329,8 @@ impl Chain {
 const LABELS_KEPT: usize = 1024;
 
 /// The service each record is about, derived by the reader from signed
-/// records (never from anything the host adds): a `Started`'s tool, and for
-/// a `Finished` or a service's `Push` the tool of the `Started` with the
+/// records (never from anything the host adds): a `Started`'s service, and for
+/// a `Finished` or a service's `Push` the service of the `Started` with the
 /// same call id this reader saw. Kept per host across runs (in
 /// [`MARKS_FILE`]), for the most recent [`LABELS_KEPT`] calls.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
@@ -370,13 +371,11 @@ impl Labels {
 pub(crate) struct HostMarks {
     /// The furthest point of this host's chain the reader verified, under
     /// any view: every later stream is held to it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) anchor: Option<ChainPoint>,
     /// Where each view (the services asked of this host, `--mine`) resumes.
-    #[serde(default)]
     pub(crate) views: BTreeMap<String, ChainPoint>,
     /// The recent calls' services, for labels.
-    #[serde(default)]
     pub(crate) labels: Labels,
 }
 
@@ -589,7 +588,7 @@ pub(crate) async fn watch_with(
         }
         opts.services.clone()
     };
-    let hello = crate::caller::hello::with_membership(ks, membership)?;
+    let hello = crate::caller::hello::with_membership(ks, membership);
     let mut marks = Marks::load(ks);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let hosts = pick::hosts_of(state, services.iter());
@@ -782,7 +781,7 @@ pub(crate) async fn watch_cmd(a: WatchArgs) -> Result<i32> {
 }
 
 // ---------------------------------------------------------------------------
-// Rendering (the channel-era `wires watch` line formats)
+// Rendering
 // ---------------------------------------------------------------------------
 
 /// How many hex characters of a node id or digest a record line shows.
@@ -839,7 +838,7 @@ pub(crate) fn audit_line(record: &AuditRecord) -> String {
                 "▶ {} {} [{}] {service}",
                 short_hex(&call.hex()),
                 caller_label(*caller, principal.as_ref()),
-                escape(role.as_str())
+                one_line(role.as_str())
             );
             for arg in argv.as_slice() {
                 line.push(' ');
@@ -881,7 +880,7 @@ pub(crate) fn audit_line(record: &AuditRecord) -> String {
         } => {
             let role = role
                 .as_deref()
-                .map(|r| format!(" [{}]", escape(r)))
+                .map(|r| format!(" [{}]", one_line(r)))
                 .unwrap_or_default();
             let mut line = format!(
                 "⇢ {} → {}{role} {:?} {}",
@@ -891,7 +890,7 @@ pub(crate) fn audit_line(record: &AuditRecord) -> String {
                 outcome.as_str()
             );
             if let Some(reason) = reason {
-                line.push_str(&format!(": {}", escape(reason)));
+                line.push_str(&format!(": {}", one_line(reason)));
             }
             if let Some(body) = body {
                 line.push_str(&format!(" · body {}", stdin_preview(body.as_str(), 0)));
@@ -907,9 +906,9 @@ pub(crate) fn audit_line(record: &AuditRecord) -> String {
             Some(service) => format!(
                 "✗ {} {service} denied: {}",
                 short_node(*caller),
-                escape(reason)
+                one_line(reason)
             ),
-            None => format!("✗ {} denied: {}", short_node(*caller), escape(reason)),
+            None => format!("✗ {} denied: {}", short_node(*caller), one_line(reason)),
         },
     }
 }
@@ -917,7 +916,7 @@ pub(crate) fn audit_line(record: &AuditRecord) -> String {
 /// `alice@corp (a1b2…)` when the host verified an email, else `a1b2…`.
 fn caller_label(caller: NodeId, principal: Option<&Principal>) -> String {
     match principal.and_then(|p| p.email.as_deref()) {
-        Some(email) => format!("{} ({})", escape(email), short_node(caller)),
+        Some(email) => format!("{} ({})", one_line(email), short_node(caller)),
         None => short_node(caller),
     }
 }
@@ -970,21 +969,6 @@ fn quote_arg(arg: &str) -> String {
     } else {
         format!("{arg:?}")
     }
-}
-
-/// `s` with every control character escaped (a record must not be able to
-/// forge a second line or drive the terminal).
-fn escape(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| {
-            let escaped: Vec<char> = if c.is_control() {
-                c.escape_default().collect()
-            } else {
-                vec![c]
-            };
-            escaped
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1202,7 +1186,7 @@ mod tests {
     }
 
     /// The label is derived from signed records by the reader: a Started's
-    /// tool, and the same call's Finished and pushes; an operator push and
+    /// service, and the same call's Finished and pushes; an operator push and
     /// a call never seen start have none.
     #[test]
     fn labels_come_from_the_signed_started() {
@@ -1257,7 +1241,7 @@ mod tests {
     }
 
     #[test]
-    fn the_record_line_formats_are_the_channel_eras() {
+    fn record_line_formats() {
         let caller = NodeIdentity::from_seed([2; 32]).node_id();
         let started = AuditRecord::Started {
             call: CallId::from_hex(&"3fa2".repeat(8)).unwrap(),

@@ -220,7 +220,7 @@ impl Mailbox {
         }
         if out.fresh > 0 {
             let unread = self.unread_index();
-            let evict = evictions(&unread, 0, MAX_UNREAD);
+            let evict = evictions(&unread, MAX_UNREAD);
             for id in &evict {
                 if std::fs::rename(
                     Self::file(&self.new_dir(), id),
@@ -327,15 +327,14 @@ impl Mailbox {
     }
 }
 
-/// Which unread messages to evict so that `unread` plus `incoming` new ones
-/// fit in `cap`: the oldest (by `(at_ms, id)`), as few as possible.
-pub(crate) fn evictions(unread: &[(i64, PushId)], incoming: usize, cap: usize) -> Vec<PushId> {
-    let over = (unread.len() + incoming).saturating_sub(cap);
+/// Which unread messages to evict so that `unread` fits in `cap`: the
+/// oldest (by `(at_ms, id)`), as few as possible.
+pub(crate) fn evictions(unread: &[(i64, PushId)], cap: usize) -> Vec<PushId> {
     let mut sorted = unread.to_vec();
     sorted.sort();
     sorted
         .into_iter()
-        .take(over.min(unread.len()))
+        .take(unread.len().saturating_sub(cap))
         .map(|(_, id)| id)
         .collect()
 }
@@ -384,8 +383,8 @@ pub(crate) fn line(m: &PushMessage) -> String {
         "{}  from host {} (verified)  {}  {}",
         utc(m.at_ms),
         m.from.short(),
-        one_line(m.subject.as_str()),
-        one_line(m.body.as_str())
+        crate::caller::one_line(m.subject.as_str()),
+        crate::caller::one_line(m.body.as_str())
     )
     .trim_end()
     .to_string()
@@ -419,20 +418,6 @@ impl JsonLine {
             at_ms: m.at_ms,
         }
     }
-}
-
-/// `s` on one line: newlines and other control characters escaped.
-fn one_line(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| {
-            let v: Vec<char> = if c.is_control() {
-                c.escape_default().collect()
-            } else {
-                vec![c]
-            };
-            v
-        })
-        .collect()
 }
 
 /// `2026-09-23 16:04:05Z` for unix milliseconds.
@@ -713,37 +698,9 @@ pub(crate) struct InboxArgs {
     /// Print one JSON object per message instead of a line.
     #[arg(long)]
     pub(crate) json: bool,
-    /// Hex 32-byte seed of this node's key (refused in locked mode). Falls
-    /// back to `$WIRES_NODE_SEED`, then the keystore.
-    #[arg(long)]
-    pub(crate) node_seed: Option<String>,
-    /// Read the node key seed from this file (refused in locked mode).
-    #[arg(long)]
-    pub(crate) node_seed_file: Option<PathBuf>,
-    /// The membership token to present (refused in locked mode).
-    #[arg(long)]
-    pub(crate) membership: Option<String>,
-    /// Read the membership token from this file (refused in locked mode).
-    #[arg(long)]
-    pub(crate) membership_file: Option<PathBuf>,
-    /// Dial hosts through this relay (refused in locked mode).
-    #[arg(long)]
-    pub(crate) relay_url: Option<String>,
-}
-
-impl InboxArgs {
-    /// The credential flags, as `call` / `mcp` take them (what locked mode
-    /// checks).
-    pub(crate) fn creds(&self) -> CredArgs {
-        CredArgs {
-            tools_file: None,
-            node_seed: self.node_seed.clone(),
-            node_seed_file: self.node_seed_file.clone(),
-            membership: self.membership.clone(),
-            membership_file: self.membership_file.clone(),
-            relay_url: self.relay_url.clone(),
-        }
-    }
+    /// The credential flags `wires call` takes (refused in locked mode).
+    #[command(flatten)]
+    pub(crate) creds: CredArgs,
 }
 
 /// `wires inbox`: fetch from the hosts of this node's services (and, with
@@ -751,20 +708,20 @@ impl InboxArgs {
 /// it read; returns the exit code.
 pub(crate) async fn inbox_cmd(a: InboxArgs) -> Result<i32> {
     let lock = Lock::detect()?;
-    let creds = a.creds();
-    if let Err(e) = lock.check(&creds) {
+    if let Err(e) = lock.check(&a.creds, None) {
         eprintln!("wires: {e}");
         return Ok(EXIT_LOCKED);
     }
-    let node = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
-    let membership = keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?;
+    let c = &a.creds;
+    let node = keystore::node_identity(c.node_seed.as_deref(), c.node_seed_file.as_deref())?;
+    let membership = keystore::membership(c.membership.as_deref(), c.membership_file.as_deref())?;
     keystore::preflight(node.node_id(), &membership).map_err(anyhow::Error::msg)?;
     let ks = Arc::new(Keystore::resolve()?);
     let mailbox = Mailbox::open(&keystore::home()?)?;
     let deadline = a
         .timeout
         .map(|t| tokio::time::Instant::now() + t.duration());
-    let fetcher = cold_fetcher(&ks, &node, &membership, a.relay_url.as_deref()).await?;
+    let fetcher = cold_fetcher(&ks, &node, &membership, c.relay_url.as_deref()).await?;
     // While waiting, a host's direct delivery lands here too.
     let _receiver = a.wait.then(|| {
         iroh::protocol::Router::builder(fetcher.0.clone())
@@ -969,12 +926,11 @@ mod tests {
 
     #[test]
     fn a_line_names_the_verified_host_first_and_stays_on_one_line() {
-        let mut m = msg(
+        let m = msg(
             1_790_150_645_000,
             "build-41",
             "failed: test_orders_total\nline 2\u{1b}[31m",
         );
-        m.from = node(1);
         let l = line(&m);
         assert_eq!(
             l,
@@ -1076,29 +1032,44 @@ mod tests {
     fn locked_mode_refuses_inbox_overrides() {
         let lock = Lock::from_sources(Some("1"), None, false);
         let a = InboxArgs {
-            relay_url: Some("https://r".into()),
+            creds: CredArgs {
+                relay_url: Some("https://r".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
-        assert!(lock.check(&a.creds()).is_err());
-        assert!(lock.check(&InboxArgs::default().creds()).is_ok());
+        assert!(lock.check(&a.creds, None).is_err());
+        assert!(lock.check(&InboxArgs::default().creds, None).is_ok());
+    }
+
+    #[test]
+    fn evictions_take_the_oldest_past_the_cap() {
+        let id = |b: u8| PushId::from_hex(&format!("{b:02x}").repeat(16)).unwrap();
+        let unread = [(30, id(1)), (10, id(2)), (20, id(3)), (10, id(4))];
+        assert_eq!(evictions(&unread, 2), [id(2), id(4)]);
+        assert_eq!(evictions(&unread, 3), [id(2)]);
+        assert!(evictions(&unread, 4).is_empty());
+        assert!(evictions(&unread, 9).is_empty());
     }
 
     proptest! {
-        /// Eviction makes exactly enough room, and takes the oldest.
+        /// What is left fits the cap and nothing more went than needed; and
+        /// nothing evicted is newer than anything kept.
         #[test]
         fn evictions_make_room_oldest_first(
-            ats in proptest::collection::vec(any::<i64>(), 0..40),
-            incoming in 0usize..10,
+            ats in proptest::collection::vec(0i64..20, 0..40),
             cap in 1usize..30,
         ) {
             let unread: Vec<(i64, PushId)> = ats.iter().map(|&a| (a, PushId::generate())).collect();
-            let evict = evictions(&unread, incoming, cap);
-            let want = (unread.len() + incoming).saturating_sub(cap).min(unread.len());
-            prop_assert_eq!(evict.len(), want);
-            let mut sorted = unread.clone();
-            sorted.sort();
-            let oldest: Vec<PushId> = sorted.iter().take(want).map(|(_, id)| *id).collect();
-            prop_assert_eq!(evict, oldest);
+            let evict = evictions(&unread, cap);
+            let kept: Vec<&(i64, PushId)> =
+                unread.iter().filter(|(_, id)| !evict.contains(id)).collect();
+            prop_assert!(kept.len() <= cap);
+            prop_assert!(evict.is_empty() || kept.len() == cap);
+            prop_assert_eq!(kept.len() + evict.len(), unread.len());
+            for gone in unread.iter().filter(|(_, id)| evict.contains(id)) {
+                prop_assert!(kept.iter().all(|k| gone <= *k));
+            }
         }
 
         /// However messages arrive and repeat, each is read exactly once.

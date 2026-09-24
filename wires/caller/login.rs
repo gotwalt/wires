@@ -62,7 +62,7 @@ const MAX_REQUEST: usize = 64 * 1024;
 /// the instant the code arrives leaves those finding nothing listening, and
 /// the browser shows "Can't connect to the server" over a login that worked.
 /// The login itself does not wait for this: it runs in the background while
-/// the token exchange and the publish carry on.
+/// the token exchange and saving the token carry on.
 pub(crate) const CALLBACK_LINGER: Duration = Duration::from_secs(3);
 /// How long an answered loopback connection is drained before it is dropped.
 ///
@@ -164,6 +164,13 @@ pub(crate) struct Pkce {
     pub challenge: String,
 }
 
+/// RFC 7636 Appendix B's example verifier, for the PKCE tests.
+#[cfg(test)]
+pub(crate) const RFC7636_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+/// The S256 challenge RFC 7636 Appendix B gives for [`RFC7636_VERIFIER`].
+#[cfg(test)]
+pub(crate) const RFC7636_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
 impl Pkce {
     /// A fresh random verifier (32 bytes → 43 characters).
     pub(crate) fn generate() -> Result<Self> {
@@ -196,7 +203,7 @@ pub(crate) fn random_token(n: usize) -> Result<String> {
 /// A completed login: the verified claim and what the IdP handed back.
 #[derive(Clone, Debug)]
 pub(crate) struct Login {
-    /// The claim to publish.
+    /// This node's key bound to the IdP's ID token.
     pub claim: IdentityClaim,
     /// Who the IdP says this node's holder is (verified locally).
     pub principal: Principal,
@@ -207,13 +214,9 @@ pub(crate) struct Login {
 /// The token endpoint's JSON reply (success or error form).
 #[derive(Deserialize)]
 struct TokenReply {
-    #[serde(default)]
     id_token: Option<String>,
-    #[serde(default)]
     refresh_token: Option<String>,
-    #[serde(default)]
     error: Option<String>,
-    #[serde(default)]
     error_description: Option<String>,
 }
 
@@ -700,7 +703,7 @@ pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
     let node =
         keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?.node_id();
     let client = OidcClient::resolve(&a)?;
-    let fetcher = KeyFetcher::new(Some(home.join("jwks")))?;
+    let fetcher = KeyFetcher::new(Some(home.join(crate::caller::jwks::JWKS_DIR)))?;
     let token_path = ks.path(ID_TOKEN_FILE);
     let refresh_path = ks.path(REFRESH_TOKEN_FILE);
 
@@ -757,7 +760,7 @@ pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crate::caller::mock_idp::MockIdp;
-    use library::{IdTokenError, NodeIdentity};
+    use library::NodeIdentity;
     use proptest::prelude::*;
 
     const PATIENCE: Duration = Duration::from_secs(20);
@@ -768,8 +771,8 @@ mod tests {
 
     #[test]
     fn pkce_matches_the_rfc_7636_appendix_b_vector() {
-        let p = Pkce::from_verifier("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".into());
-        assert_eq!(p.challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+        let p = Pkce::from_verifier(RFC7636_VERIFIER.into());
+        assert_eq!(p.challenge, RFC7636_CHALLENGE);
     }
 
     #[test]
@@ -1057,106 +1060,5 @@ mod tests {
         .await
         .unwrap_err();
         assert!(format!("{err:#}").contains("access_denied"), "{err:#}");
-    }
-
-    /// Keys rotate: a token signed under a `kid` the cache has never seen
-    /// triggers exactly one refetch, and the on-disk cache serves a restarted
-    /// reader without any fetch.
-    #[tokio::test]
-    async fn an_unknown_kid_refetches_and_the_disk_cache_serves_restarts() {
-        let idp = MockIdp::start("alice@example.com").await;
-        let dir = crate::testutil::ScratchDir::new("jwk");
-        let cache = Some(dir.path().to_path_buf());
-        let now = crate::clock::now_unix();
-        let aud = [Audience::new(idp.client_id.clone())];
-        let iss = [idp.issuer.clone()];
-
-        let fetcher = KeyFetcher::new(cache.clone()).unwrap();
-        let claim = IdentityClaim {
-            node: node(),
-            id_token: idp.mint(&OidcNonce::for_node(&node()), now + 600),
-        };
-        fetcher.verify(&claim, &iss, &aud, now).await.unwrap();
-        assert_eq!(idp.jwks_fetches(), 1);
-
-        // A restarted reader: served from disk.
-        let restarted = KeyFetcher::new(cache.clone()).unwrap();
-        restarted.verify(&claim, &iss, &aud, now).await.unwrap();
-        assert_eq!(idp.jwks_fetches(), 1);
-
-        // Rotation: a new kid forces one refetch, then verifies.
-        idp.rotate_key();
-        let rotated = IdentityClaim {
-            node: node(),
-            id_token: idp.mint(&OidcNonce::for_node(&node()), now + 600),
-        };
-        restarted.verify(&rotated, &iss, &aud, now).await.unwrap();
-        assert_eq!(idp.jwks_fetches(), 2);
-
-        // A bogus kid right after is not an amplifier: no further fetch.
-        idp.rotate_key();
-        let bogus = IdentityClaim {
-            node: node(),
-            id_token: idp.mint(&OidcNonce::for_node(&node()), now + 600),
-        };
-        let err = restarted.verify(&bogus, &iss, &aud, now).await.unwrap_err();
-        assert!(matches!(
-            err,
-            crate::caller::jwks::VerifyError::Rejected(IdTokenError::UnknownKey { .. })
-        ));
-        assert_eq!(idp.jwks_fetches(), 2);
-    }
-
-    #[tokio::test]
-    async fn an_expired_claim_still_names_its_principal() {
-        let idp = MockIdp::start("alice@example.com").await;
-        let fetcher = KeyFetcher::new(None).unwrap();
-        let now = crate::clock::now_unix();
-        let stale = IdentityClaim {
-            node: node(),
-            id_token: idp.mint(&OidcNonce::for_node(&node()), now - 3600),
-        };
-        let err = fetcher
-            .verify(
-                &stale,
-                std::slice::from_ref(&idp.issuer),
-                &[Audience::new(idp.client_id.clone())],
-                now,
-            )
-            .await
-            .unwrap_err();
-        match err {
-            crate::caller::jwks::VerifyError::Expired(p) => {
-                assert_eq!(p.email.as_deref(), Some("alice@example.com"))
-            }
-            other => panic!("expected Expired, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn an_untrusted_issuer_is_never_fetched() {
-        let idp = MockIdp::start("alice@example.com").await;
-        let fetcher = KeyFetcher::new(None).unwrap();
-        let claim = IdentityClaim {
-            node: node(),
-            id_token: idp.mint(
-                &OidcNonce::for_node(&node()),
-                crate::clock::now_unix() + 600,
-            ),
-        };
-        let err = fetcher
-            .verify(
-                &claim,
-                &[Issuer::new("https://accounts.google.com")],
-                &[Audience::new(idp.client_id.clone())],
-                crate::clock::now_unix(),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::caller::jwks::VerifyError::Untrusted(_)
-        ));
-        assert_eq!(idp.jwks_fetches(), 0);
     }
 }

@@ -623,13 +623,6 @@ fn esc(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// Base64url of `bytes`, as the PKCE tests need.
-#[cfg(test)]
-pub(crate) fn b64(bytes: &[u8]) -> String {
-    use base64::Engine as _;
-    library::B64.encode(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,19 +656,23 @@ mod tests {
         }
     }
 
+    /// The verifier must be well-formed (RFC 7636 §4.1) as well as match.
     #[test]
-    fn pkce_matches_the_rfc_7636_vector() {
-        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-        assert!(pkce_ok(verifier, challenge));
+    fn pkce_needs_a_well_formed_verifier_and_its_challenge() {
+        use crate::caller::login::{RFC7636_CHALLENGE, RFC7636_VERIFIER};
+        assert!(pkce_ok(RFC7636_VERIFIER, RFC7636_CHALLENGE));
         assert!(!pkce_ok(
-            verifier,
+            RFC7636_VERIFIER,
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cX"
         ));
-        assert!(!pkce_ok(
-            "short",
-            &Pkce::from_verifier("short".into()).challenge
-        ));
+        let own = |v: &str| pkce_ok(v, &Pkce::from_verifier(v.into()).challenge);
+        assert!(!own("short"), "under 43 characters");
+        assert!(!own(&"a".repeat(129)), "over 128 characters");
+        assert!(
+            !own(&format!("{}+", &RFC7636_VERIFIER[1..])),
+            "outside the alphabet"
+        );
+        assert!(own(&"a".repeat(43)) && own(&"~._-".repeat(32)));
     }
 
     #[test]
@@ -722,11 +719,14 @@ mod tests {
     }
 
     proptest! {
+        /// A challenge admits only its own verifier.
         #[test]
-        fn any_generated_verifier_matches_its_own_challenge(seed in any::<[u8; 32]>()) {
-            let verifier = b64(&seed);
-            let challenge = Pkce::from_verifier(verifier.clone()).challenge;
-            prop_assert!(pkce_ok(&verifier, &challenge));
+        fn a_challenge_admits_no_other_verifier(
+            a in "[A-Za-z0-9._~-]{43,64}",
+            b in "[A-Za-z0-9._~-]{43,64}",
+        ) {
+            prop_assume!(a != b);
+            prop_assert!(!pkce_ok(&b, &Pkce::from_verifier(a).challenge));
         }
     }
 }

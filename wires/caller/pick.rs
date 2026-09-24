@@ -119,7 +119,7 @@ impl LastGood {
 /// Local, unsigned dial hints: node → direct addresses (see the module
 /// docs). Empty when there is no hints file, which is the normal case.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Hints(BTreeMap<NodeId, (Vec<SocketAddr>, Option<String>)>);
+pub(crate) struct Hints(BTreeMap<NodeId, Vec<SocketAddr>>);
 
 impl Hints {
     /// `$WIRES_HOME/hints` of `ks`; missing is empty. A line that doesn't
@@ -133,7 +133,7 @@ impl Hints {
 
     /// Parse the hints format: `<node hex> <addr>…` per line, `#` comments.
     pub(crate) fn parse(text: &str) -> Self {
-        let mut out: BTreeMap<NodeId, (Vec<SocketAddr>, Option<String>)> = BTreeMap::new();
+        let mut out: BTreeMap<NodeId, Vec<SocketAddr>> = BTreeMap::new();
         for line in text.lines() {
             let line = line.split('#').next().unwrap_or("").trim();
             let mut words = line.split_whitespace();
@@ -145,7 +145,7 @@ impl Hints {
             let entry = out.entry(node).or_default();
             for word in words {
                 match word.parse::<SocketAddr>() {
-                    Ok(addr) if !entry.0.contains(&addr) => entry.0.push(addr),
+                    Ok(addr) if !entry.contains(&addr) => entry.push(addr),
                     Ok(_) => {}
                     Err(_) => tracing::warn!("hints: skipping {word:?} (not ip:port)"),
                 }
@@ -159,9 +159,7 @@ impl Hints {
     pub(crate) fn endpoint_addrs(&self) -> Vec<EndpointAddr> {
         self.0
             .iter()
-            .filter_map(|(n, (addrs, relay))| {
-                transport::endpoint_addr(n, addrs, relay.as_deref()).ok()
-            })
+            .filter_map(|(n, addrs)| transport::endpoint_addr(n, addrs, None).ok())
             .collect()
     }
 
@@ -170,19 +168,17 @@ impl Hints {
     pub(crate) fn from_pairs(
         pairs: impl IntoIterator<Item = (NodeId, Vec<std::net::SocketAddr>)>,
     ) -> Self {
-        Self(pairs.into_iter().map(|(n, a)| (n, (a, None))).collect())
+        Self(pairs.into_iter().collect())
     }
 
     /// `hosts` as dial targets, in order: each with its hints, and `relay`
-    /// when no hint names one. A key that isn't a valid Ed25519 point is
-    /// skipped.
+    /// if given. A key that isn't a valid Ed25519 point is skipped.
     pub(crate) fn targets(&self, hosts: &[NodeId], relay: Option<&str>) -> Vec<EndpointAddr> {
         hosts
             .iter()
             .filter_map(|h| {
-                let (addrs, hint_relay) = self.0.get(h).cloned().unwrap_or_default();
-                let relay = relay.map(str::to_string).or(hint_relay);
-                transport::endpoint_addr(h, &addrs, relay.as_deref()).ok()
+                let addrs = self.0.get(h).map(Vec::as_slice).unwrap_or_default();
+                transport::endpoint_addr(h, addrs, relay).ok()
             })
             .collect()
     }
@@ -321,10 +317,7 @@ mod tests {
         let hints = Hints::parse(&text);
         assert_eq!(
             hints,
-            Hints(BTreeMap::from([
-                (node(3), (vec![a, b], None)),
-                (node(2), (vec![], None)),
-            ]))
+            Hints(BTreeMap::from([(node(3), vec![a, b]), (node(2), vec![]),]))
         );
         assert_eq!(hints.endpoint_addrs().len(), 2);
         let ks = Keystore::at(crate::testutil::temp_dir());

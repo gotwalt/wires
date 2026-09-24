@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use library::{B64, IdToken, Issuer, OidcNonce};
+use library::{B64, Issuer};
 use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
 use serde_json::json;
@@ -27,7 +27,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use url::Url;
 
-use crate::caller::login::{OidcClient, Pkce, read_request, write_response};
+use crate::caller::login::{Pkce, read_request, write_response};
 
 /// The client id the mock accepts.
 pub(crate) const MOCK_CLIENT_ID: &str = "wires-test-client";
@@ -128,6 +128,8 @@ pub(crate) struct MockIdp {
     pub issuer: Issuer,
     /// The accepted client id ([`MOCK_CLIENT_ID`]).
     pub client_id: String,
+    /// The issuer's state, for the tests' inspection hooks.
+    #[cfg(test)]
     state: Arc<Mutex<State>>,
     task: JoinHandle<()>,
 }
@@ -183,14 +185,19 @@ impl MockIdp {
         Self {
             issuer: Issuer::new(issuer),
             client_id: MOCK_CLIENT_ID.to_string(),
+            #[cfg(test)]
             state,
             task,
         }
     }
+}
 
+/// The hooks the `wires login` tests drive the issuer with.
+#[cfg(test)]
+impl MockIdp {
     /// The OAuth client registered with this issuer.
-    pub(crate) fn client(&self) -> OidcClient {
-        OidcClient {
+    pub(crate) fn client(&self) -> crate::caller::login::OidcClient {
+        crate::caller::login::OidcClient {
             issuer: self.issuer.clone(),
             client_id: self.client_id.clone(),
             client_secret: Some("not-so-secret".into()),
@@ -213,8 +220,8 @@ impl MockIdp {
     }
 
     /// Mint a token directly (bypassing the flow) with the current key.
-    pub(crate) fn mint(&self, nonce: &OidcNonce, exp: i64) -> IdToken {
-        IdToken::new(self.state.lock().unwrap().mint(Some(nonce.as_str()), exp))
+    pub(crate) fn mint(&self, nonce: &library::OidcNonce, exp: i64) -> library::IdToken {
+        library::IdToken::new(self.state.lock().unwrap().mint(Some(nonce.as_str()), exp))
     }
 
     /// Swap in a new signing key under a new `kid`.

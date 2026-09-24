@@ -84,7 +84,7 @@ pub(crate) async fn my_principal(ks: &Keystore, me: NodeId) -> Result<Option<Pri
     let issuer: Issuer = id_token.unverified_issuer()?;
     let audiences = unverified_audiences(id_token.as_str())?;
     let claim = IdentityClaim { node: me, id_token };
-    let fetcher = KeyFetcher::new(Some(ks.path("jwks")))?;
+    let fetcher = KeyFetcher::new(Some(ks.path(crate::caller::jwks::JWKS_DIR)))?;
     let principal = fetcher
         .verify(&claim, &[issuer], &audiences, crate::clock::now_unix())
         .await

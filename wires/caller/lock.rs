@@ -12,11 +12,11 @@
 //! - `"locked": true` in `$WIRES_HOME/tools.json`. Only that default file is
 //!   read for this, never a `--tools-file`.
 //!
-//! Once on, every [`CredArgs`] flag is refused with an error naming it
-//! ([`OVERRIDE_FLAGS`]), and so are the environment variables that override
-//! the same credentials ([`OVERRIDE_ENV`]: `WIRES_NODE_SEED`,
+//! Once on, every [`CredArgs`] flag and `--tools-file` is refused with an
+//! error naming it ([`OVERRIDE_FLAGS`]), and so are the environment variables
+//! that override the same credentials ([`OVERRIDE_ENV`]: `WIRES_NODE_SEED`,
 //! `WIRES_MEMBERSHIP`); the shaping flags (`--jq`, `--head`, `--max-bytes`),
-//! the tool name and its arguments are untouched.
+//! `--verbose`, the service name and its arguments are untouched.
 //!
 //! **What it assumes.** Locked mode is only as strong as the agent's inability
 //! to set its own environment: `WIRES_LOCKED` itself, and `WIRES_HOME` (which
@@ -32,6 +32,7 @@
 //! MCP client's request, which `wires mcp` never reads from a file.
 
 use std::io::IsTerminal;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -51,9 +52,9 @@ pub const LOCKED_STDIN_ENV: &str = "WIRES_LOCKED_STDIN";
 /// bad `--jq` filter): nothing was dialed.
 pub const EXIT_LOCKED: i32 = 2;
 
-/// Every flag locked mode refuses: exactly the long names of [`CredArgs`]
-/// (a unit test keeps the two in step, so a new credential flag is refused
-/// until someone decides otherwise).
+/// Every flag locked mode refuses: `--tools-file` and exactly the long names
+/// of [`CredArgs`] (a unit test keeps the two in step, so a new credential
+/// flag is refused until someone decides otherwise).
 pub const OVERRIDE_FLAGS: &[&str] = &[
     "--tools-file",
     "--node-seed",
@@ -111,8 +112,8 @@ impl std::fmt::Display for Refused {
             Self::Flag(flag) => write!(
                 f,
                 "{flag} is not allowed in locked mode (set by the operator: {LOCKED_ENV}=1 or \
-                 \"locked\" in tools.json); only --jq, --head, --max-bytes, the tool name and \
-                 its arguments are"
+                 \"locked\" in tools.json); only --jq, --head, --max-bytes, --verbose, the \
+                 service name and its arguments are"
             ),
             Self::Env(var) => write!(
                 f,
@@ -137,8 +138,7 @@ impl Lock {
     /// [`LOCKED_STDIN_ENV`] and the default `tools.json`'s `locked` field:
     /// `(None, None, false)` is open; `(Some("1"), None, false)` is locked
     /// and refuses stdin; `(Some("0"), Some("allow"), true)` is locked with
-    /// stdin allowed. (`//wires` is a binary, so no doctest runs here; the
-    /// unit tests pin these.)
+    /// stdin allowed. (The unit tests pin these.)
     pub fn from_sources(env_locked: Option<&str>, env_stdin: Option<&str>, config: bool) -> Self {
         let env_on = env_locked.is_some_and(|v| {
             !matches!(
@@ -169,10 +169,15 @@ impl Lock {
         ))
     }
 
-    /// Refuse the first override flag set in `creds`, then the first
-    /// [`OVERRIDE_ENV`] variable set in this process, if locked.
-    pub fn check(&self, creds: &CredArgs) -> std::result::Result<(), Refused> {
-        self.check_with_env(creds, |k| std::env::var_os(k).is_some())
+    /// Refuse the first override flag set in `creds` (or `tools_file`, if
+    /// given), then the first [`OVERRIDE_ENV`] variable set in this process,
+    /// if locked.
+    pub fn check(
+        &self,
+        creds: &CredArgs,
+        tools_file: Option<&Path>,
+    ) -> std::result::Result<(), Refused> {
+        self.check_with_env(creds, tools_file, |k| std::env::var_os(k).is_some())
     }
 
     /// [`check`](Self::check) with the environment given as `is_set` (a
@@ -180,12 +185,13 @@ impl Lock {
     pub fn check_with_env(
         &self,
         creds: &CredArgs,
+        tools_file: Option<&Path>,
         is_set: impl Fn(&str) -> bool,
     ) -> std::result::Result<(), Refused> {
         match self {
             Self::Open => Ok(()),
             Self::Locked { .. } => {
-                if let Some(flag) = overrides(creds).first() {
+                if let Some(flag) = overrides(creds, tools_file).first() {
                     return Err(Refused::Flag(flag));
                 }
                 match OVERRIDE_ENV.iter().find(|v| is_set(v)) {
@@ -207,10 +213,10 @@ impl Lock {
     }
 }
 
-/// The override flags set in `creds`, in [`OVERRIDE_FLAGS`] order.
-fn overrides(creds: &CredArgs) -> Vec<&'static str> {
+/// The override flags set in `creds` and `tools_file`, in
+/// [`OVERRIDE_FLAGS`] order.
+fn overrides(creds: &CredArgs, tools_file: Option<&Path>) -> Vec<&'static str> {
     let CredArgs {
-        tools_file,
         node_seed,
         node_seed_file,
         membership,
@@ -296,6 +302,7 @@ mod tests {
         let mut declared: Vec<String> = cmd
             .get_arguments()
             .filter_map(|a| a.get_long().map(|l| format!("--{l}")))
+            .chain(["--tools-file".to_string()])
             .collect();
         declared.sort();
         let mut listed: Vec<String> = OVERRIDE_FLAGS.iter().map(|s| s.to_string()).collect();
@@ -316,19 +323,24 @@ mod tests {
     fn every_override_flag_is_refused_by_name_in_call_and_mcp() {
         for flag in OVERRIDE_FLAGS {
             let a = call(&[flag, "v", "gh", "--", "pr", "list"]);
-            let err = LOCKED.check(&a.creds).unwrap_err();
+            let err = LOCKED.check(&a.creds, a.tools_file.as_deref()).unwrap_err();
             assert_eq!(err, Refused::Flag(flag));
             assert!(
                 err.to_string()
                     .starts_with(&format!("{flag} is not allowed"))
             );
-            // After the tool name, too (before its own args begin).
+            // After the service name, too (before its own args begin).
             let a = call(&["gh", flag, "v", "--", "pr"]);
-            assert_eq!(LOCKED.check(&a.creds), Err(Refused::Flag(flag)), "{flag}");
+            let check = |lock: Lock, a: &CallArgs| lock.check(&a.creds, a.tools_file.as_deref());
+            assert_eq!(check(LOCKED, &a), Err(Refused::Flag(flag)), "{flag}");
             let m = mcp(&[flag, "v"]);
-            assert_eq!(LOCKED.check(&m.creds), Err(Refused::Flag(flag)), "{flag}");
+            assert_eq!(
+                LOCKED.check(&m.creds, m.tools_file.as_deref()),
+                Err(Refused::Flag(flag)),
+                "{flag}"
+            );
             // Unlocked, the same flag is fine.
-            assert_eq!(Lock::Open.check(&a.creds), Ok(()));
+            assert_eq!(check(Lock::Open, &a), Ok(()));
         }
     }
 
@@ -339,19 +351,19 @@ mod tests {
         let a = call(&["gh", "--", "pr", "list"]);
         for var in OVERRIDE_ENV {
             let set = |k: &str| k == *var;
-            let err = LOCKED.check_with_env(&a.creds, set).unwrap_err();
+            let err = LOCKED.check_with_env(&a.creds, None, set).unwrap_err();
             assert_eq!(err, Refused::Env(var));
             assert!(err.to_string().contains(var), "{err}");
-            assert_eq!(Lock::Open.check_with_env(&a.creds, set), Ok(()));
+            assert_eq!(Lock::Open.check_with_env(&a.creds, None, set), Ok(()));
         }
-        assert_eq!(LOCKED.check_with_env(&a.creds, |_| false), Ok(()));
+        assert_eq!(LOCKED.check_with_env(&a.creds, None, |_| false), Ok(()));
         // WIRES_HOME and WIRES_LOCKED are the operator's; not refused here.
         let home = |k: &str| k == "WIRES_HOME" || k == LOCKED_ENV;
-        assert_eq!(LOCKED.check_with_env(&a.creds, home), Ok(()));
+        assert_eq!(LOCKED.check_with_env(&a.creds, None, home), Ok(()));
     }
 
     #[test]
-    fn shaping_flags_tool_and_args_are_accepted_when_locked() {
+    fn shaping_flags_service_and_args_are_accepted_when_locked() {
         let a = call(&[
             "--jq",
             ".[].title",
@@ -369,13 +381,15 @@ mod tests {
             "y",
         ]);
         let unset = |_: &str| false;
-        assert_eq!(LOCKED.check_with_env(&a.creds, unset), Ok(()));
+        let check = |a: &CallArgs| LOCKED.check_with_env(&a.creds, a.tools_file.as_deref(), unset);
+        assert_eq!(check(&a), Ok(()));
         assert_eq!(a.args[2], "--relay-url", "remote argv, not ours");
+        assert_eq!(check(&call(&["eacc34e0/db_query", "select 1"])), Ok(()));
+        let m = mcp(&[]);
         assert_eq!(
-            LOCKED.check_with_env(&call(&["eacc34e0/db_query", "select 1"]).creds, unset),
+            LOCKED.check_with_env(&m.creds, m.tools_file.as_deref(), unset),
             Ok(())
         );
-        assert_eq!(LOCKED.check_with_env(&mcp(&[]).creds, unset), Ok(()));
     }
 
     #[test]
@@ -436,16 +450,16 @@ mod tests {
     }
 
     proptest! {
-        /// Any value of `WIRES_LOCKED` outside the "off" words locks; only
-        /// `allow` opens stdin.
+        /// Any value of `WIRES_LOCKED` that isn't an "off" word locks (every
+        /// off word starts with `0`, `f`, `n` or `o`, so none is generated),
+        /// and any `WIRES_LOCKED_STDIN` but `allow` refuses stdin.
         #[test]
-        fn unknown_values_fail_closed(v in "[a-zA-Z0-9]{1,8}", s in "[a-z]{0,8}") {
-            let off = matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off");
+        fn unknown_values_fail_closed(
+            v in "[1-9a-eg-mp-zA-EG-MP-Z][a-zA-Z0-9]{0,7}",
+            s in "[a-z]{0,8}".prop_filter("not allow", |s| s != "allow"),
+        ) {
             let lock = Lock::from_sources(Some(&v), Some(&s), false);
-            prop_assert_eq!(lock == Lock::Open, off);
-            if !off {
-                prop_assert_eq!(lock.refuses_stdin(), s != "allow");
-            }
+            prop_assert_eq!(lock, Lock::Locked { stdin: StdinPolicy::Refuse });
         }
     }
 }
