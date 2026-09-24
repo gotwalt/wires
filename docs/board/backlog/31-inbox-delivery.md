@@ -54,7 +54,16 @@ and not to everyone in a role.
 - Every push is sent through a **call's** push capability (card 28 L2a: `serve` gives each call's child a token that can push only to that call's caller). It is addressed to that caller: the dialing **node** *and* the verified **principal** it presented.
 - A host delivers it only to a presenter that is that node **and** whose token verifies to that principal. For a CLI agent, that is exactly the agent that made the call. Through the gateway (one node, many people), node = the gateway and principal = the web user, so it reaches exactly that user.
 - The message carries the **call id and service** it answers, so the agent can match it to what it started ("deploy #41, called 14:02: done").
-- **No fan-out** to the person's other devices, and **no role or broadcast addressing**. The operator's `wires push --to <node|role>` goes away. If org-wide notices are wanted later, they're a separate feature with their own card and delivery rules.
+- **No fan-out** to the person's other devices, and **no role or broadcast addressing**, for anyone.
+
+### D1b. The host operator can still push to one machine
+
+The human (2026-09-24): "Agree, keep operator push."
+
+- The operator socket keeps `wires push --to <node-id>`: a node id only, no roles, no broadcast. It is a separate path from call callbacks, for a person running the host who wants to tell a particular machine something.
+- It goes to that **node's** mailbox and is not tied to a principal, because the operator is addressing a machine. It still passes the recipient-is-a-current-member check, and it names no call or service (the reader shows `operator push` instead).
+- **The gateway is an ordinary node here; no special case.** An operator push to its node id lands in the gateway node's own mailbox, and whoever runs the gateway reads it with `wires inbox` against the gateway's keystore. Web users never see it: they read only the callbacks addressed to their (gateway node, principal), through the MCP `inbox` tool (D4).
+- For D3: an operator push can only come from a host of a service the recipient may call. A push from any other host is refused at send, so it can't strand.
 - This removes (b), and (c) entirely: a host never enumerates who is in a role, because it only answers a caller it has already verified. **Recommend.**
 
 ### D2. At least once to the caller's mailbox; removed on its ack
@@ -63,11 +72,13 @@ and not to everyone in a role.
 - Then it's gone from the host. There is exactly one recipient, so no per-device tracking is needed.
 - The *capability* lives for the call plus a grace period (10 min today). The *message* lives until TTL (24 h default, ≤ 7 d), so a callback sent an hour into a deploy can still be fetched the next day.
   - Open question: should the grace period be settable per service, for long jobs? **Recommend per-service in `host.json`, default 10 min.**
+- **Caveat: a next-day fetch needs a fresh sign-in, for now.** Delivery requires a token that verifies to the calling principal, and Google tokens last about an hour. So fetching a callback after that needs a new `wires login`, until card 29's day-pass exists. The gateway has the same limit: a web user reconnects, then calls `inbox`.
 
 ### D3. Pushes come only from hosts of services you called, so a fetch finds them all
 
 - A capability belongs to a call of a service the caller was allowed to call. So today's fetch set, "hosts of services I may call", contains every host that can hold a push for me **by construction**: (a) can't happen.
   - One edge case: a caller removed from the service after the call. Its pending pushes are dropped, logged as `denied`.
+  - **Caveat: a service that moves hosts strands the callbacks queued on its old host.** The caller stops fetching from a host that no longer serves anything it may call. Accepted for now. The admin moving a service should let the old host run until its queues drain or expire.
 - `push.allow` in `host.json` becomes a per-service switch (`"push": true` on the services that call back). Who receives is decided by D1: the caller, already admitted to that service.
 - This also covers card 28 §7's receiver rule: accept `deliver` only from hosts of services this node may call, with a fresh state.
 
@@ -109,10 +120,10 @@ One tool, the same everywhere: **`inbox`**, `{ wait_seconds?: 0–25, limit?: 1�
   - (§4's "mine by principal" for `watch` stays in card 28.)
 - **§7, all of it:**
   - receiver accepts `deliver` only from hosts of services it may call, plus a fresh state → D3;
-  - `--to` limited to allowed roles, with counts not names → **moot**: D1 removes role and operator addressing;
+  - `--to` limited to allowed roles, with counts not names → **moot**: D1 removes role addressing, and D1b keeps only `--to <node-id>`;
   - per-sender mailbox caps, evict by receive time, dedup by `(from, id)`, host cap per originating service → D5 (the host cap becomes per call);
   - purge a removed member's queue when the state advances → D5.
-- **Kept from card 28 as built:** the per-call push capability (L2a). It becomes the *only* way to push, addressed by D1 to the call's node + principal. The operator socket's `push` form goes.
+- **Kept from card 28 as built:** the per-call push capability (L2a), the only way a *service* pushes, addressed by D1 to the call's node + principal. The operator socket's `push` form stays, narrowed to `--to <node-id>` (D1b).
 
 ## Acceptance
 
@@ -121,7 +132,8 @@ One tool, the same everywhere: **`inbox`**, `{ wait_seconds?: 0–25, limit?: 1�
   - a callback reaches only the calling node, and only while it presents the calling principal (not the same person on another node, not another person on the same node);
   - through the gateway, users A and B each get only their own calls' callbacks;
   - a message names the call and service it answers;
-  - there is no way to push except through a live call capability;
+  - a service can push only through a live call capability; the operator can push only `--to <node-id>`, and never to a role;
+  - an operator push to the gateway's node reaches the gateway's own `wires inbox`, and no web user;
   - a crash between print and mark re-shows the message rather than losing it;
   - `dropped: n` surfaces;
   - a removed member's queue is purged on state advance.
@@ -132,5 +144,9 @@ One tool, the same everywhere: **`inbox`**, `{ wait_seconds?: 0–25, limit?: 1�
 ## Notes
 
 - 2026-09-24, the human: "no need for role or broadcast messages". D1 is
-  agreed. D2–D6 and the MCP shape stand as recommended unless amended; the
+  agreed. Then (relayed by the audit session): "Agree, keep operator push".
+  That's D1b: `--to <node-id>` only, per node. Then "the MCP gateway should
+  just function as an addressable node; the default wiring should work": no
+  gateway special case. Operator pushes to its node are the gateway
+  operator's to read. D1–D6 and the MCP inbox are agreed. D2–D6 and the MCP shape stand as recommended unless amended; the
   per-service capability grace (D2) is still open.
