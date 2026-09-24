@@ -77,6 +77,7 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         native: NativeServices::new(),
         binding: Binding::N0 {
             relay_url: a.relay_url,
+            loopback_only: false,
         },
     };
     serve_until(serving, async {
@@ -110,6 +111,9 @@ pub(crate) enum Binding {
     N0 {
         /// A self-hosted relay instead of n0's.
         relay_url: Option<String>,
+        /// Direct connections only on loopback; others through the relay
+        /// (see [`transport::bind_with`]).
+        loopback_only: bool,
     },
     /// Serve on an endpoint already bound for this host's key. Tests use
     /// this for hermetic loopback. A host that has to pull a state before
@@ -140,7 +144,7 @@ pub(crate) async fn serve_until(
     // A host assigned a service while it was offline: pull, then try again.
     let state = match (host.preflight(crate::now_unix()), &binding) {
         (Ok(state), _) => state,
-        (Err(e), Binding::N0 { relay_url }) => {
+        (Err(e), Binding::N0 { relay_url, .. }) => {
             match crate::state::sync::pull_now(&ks, &node, relay_url.as_deref()).await {
                 Ok(Some(_)) => host.preflight(crate::now_unix())?,
                 _ => return Err(e),
@@ -180,7 +184,13 @@ pub(crate) async fn serve_until(
         )
     });
     let endpoint = match binding {
-        Binding::N0 { relay_url } => transport::bind(&node, relay_url.as_deref()).await?,
+        Binding::N0 {
+            relay_url,
+            loopback_only,
+        } => {
+            transport::bind_with(&node, relay_url.as_deref(), transport::ALPN, loopback_only)
+                .await?
+        }
         Binding::Endpoint(endpoint) => endpoint,
     };
     if let Err(e) = crate::caller::pick::write_own_hint(&ks, &endpoint) {

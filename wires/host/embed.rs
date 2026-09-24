@@ -61,6 +61,7 @@ pub struct HostBuilder {
     native: Vec<(String, Arc<dyn crate::host::native::DynService>)>,
     push_allow: Option<Vec<String>>,
     relay_url: Option<String>,
+    loopback_only: bool,
 }
 
 impl Host {
@@ -75,6 +76,7 @@ impl Host {
             native: Vec::new(),
             push_allow: None,
             relay_url: None,
+            loopback_only: false,
         }
     }
 
@@ -151,6 +153,15 @@ impl HostBuilder {
         self
     }
 
+    /// Accept direct connections only on this machine's loopback
+    /// (`127.0.0.1`, `::1`); callers elsewhere still reach the host through
+    /// its relay. For local demos and tests: the host opens no socket on the
+    /// network, so the macOS firewall doesn't prompt for it.
+    pub fn bind_loopback(mut self) -> Self {
+        self.loopback_only = true;
+        self
+    }
+
     /// Use a self-hosted relay at `url` instead of n0's.
     pub fn relay_url(mut self, url: impl Into<String>) -> Self {
         self.relay_url = Some(url.into());
@@ -218,6 +229,7 @@ impl HostBuilder {
                 native,
                 binding: Binding::N0 {
                     relay_url: self.relay_url,
+                    loopback_only: self.loopback_only,
                 },
             },
         })

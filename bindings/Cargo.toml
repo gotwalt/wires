@@ -1,0 +1,25 @@
+[package]
+name = "wires-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Language bindings for wires-native services (card 33): serve wires calls from Python and other languages"
+
+[lib]
+name = "wires_ffi"
+path = "lib.rs"
+# `cdylib` is what a foreign runtime loads; `lib` lets the Rust tests use it.
+crate-type = ["cdylib", "lib"]
+
+# Generates the foreign bindings from the built library:
+# `cargo run -p wires-ffi --bin uniffi-bindgen -- generate --library …`.
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+[dependencies]
+wires = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uniffi = { version = "0.32", features = ["cli"] }

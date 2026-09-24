@@ -312,6 +312,21 @@ pub async fn bind_with_alpn(
     relay_url: Option<&str>,
     alpn: &[u8],
 ) -> Result<Endpoint> {
+    bind_with(identity, relay_url, alpn, false).await
+}
+
+/// [`bind_with_alpn`], with direct (IP) connections only on loopback
+/// (`127.0.0.1` and `::1`) when `loopback_only`: peers on this machine
+/// connect directly, others through the relay. A host bound so opens no
+/// socket on the network and does no gateway (UPnP/PCP/NAT-PMP) probing,
+/// so the macOS firewall doesn't ask to approve it (useful for an
+/// interpreter running a local demo, which can't be signed).
+pub async fn bind_with(
+    identity: &NodeIdentity,
+    relay_url: Option<&str>,
+    alpn: &[u8],
+    loopback_only: bool,
+) -> Result<Endpoint> {
     // The local, unsigned hints file (`$WIRES_HOME/hints`, usually absent):
     // extra places to try a key, beside n0 discovery.
     let hints = iroh::address_lookup::memory::MemoryLookup::new();
@@ -328,6 +343,17 @@ pub async fn bind_with_alpn(
         let map = iroh::RelayMap::try_from_iter([url])
             .with_context(|| format!("parsing relay url {url}"))?;
         builder = builder.relay_mode(iroh::endpoint::RelayMode::Custom(map));
+    }
+    if loopback_only {
+        // No gateway probing either: port mapping is pointless without a
+        // network socket, and its multicast discovery is what raises the
+        // macOS firewall dialog (iroh's `PortmapperConfig` docs).
+        builder = builder
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .and_then(|b| b.bind_addr("[::1]:0"))
+            .map_err(|e| anyhow!("binding to loopback: {e}"))?;
     }
     builder
         .bind()

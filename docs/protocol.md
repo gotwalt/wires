@@ -251,6 +251,11 @@ can't be both. Its keystore is the directory the app names (it reads neither `$W
 `$WIRES_NODE_SEED`), except that the local hints file is still read from `$WIRES_HOME`. The node
 key lives in the app's memory (§9): a native service is the operator's own code, as trusted as
 `serve`, so nothing isolates it from the key the way a child is kept away from it.
+`bind_loopback()` binds the host's direct (IP) transport only on `127.0.0.1` and `::1`, with no
+port mapping; callers elsewhere reach it through its relay. It exists for local demos: a host bound
+so holds no network socket, so the macOS firewall doesn't prompt for an interpreter that can't be
+signed. Other languages reach the same API through `wires-ffi` (UniFFI; `bindings/`), where a
+handler is a synchronous `call(call) -> int` on a thread of its own.
 
 **The caller** (`wires call`, `wires mcp`) refuses to dial from an expired state (exit 1: ask the
 admin for `wires state push` or a fresh invite). It takes the service's hosts from its state, the

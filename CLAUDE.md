@@ -4,8 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-"Wires" — a two-crate Rust workspace built with plain Cargo, plus a
-`Dockerfile` for a distroless image of the `wires` binary.
+"Wires" — a Rust workspace built with plain Cargo (`library`, `wires`, and
+the `wires-ffi` language bindings), plus a `Dockerfile` for a distroless
+image of the `wires` binary.
 
 **The current assignment (2026-09-22, reshaped by card 27):** agents run
 CLIs on other machines, by **service name**. The machine is reached by public
@@ -68,6 +69,8 @@ cargo fmt --all                              # make fmt (also shfmt)
 cargo build --release -p wires               # the shipped binary: target/release/wires
 cargo build --release -p wires --features dev-mock-idp  # + hidden `wires dev-mock-idp` (demo only)
 .scripts/demo-remote-cli.sh --quiet          # make demo: the self-asserting loopback demo
+.scripts/build-python.sh                     # make python: Python bindings into target/python
+.scripts/demo-python-service.sh              # make demo-python: a Python-native service, end to end (needs uv)
 docker build .                               # make image: distroless image, native arch
 ```
 
@@ -129,8 +132,10 @@ host exposing CLIs needs an image that also has those CLIs.
 - `Cargo.toml` / `Cargo.lock` — the workspace. Members are flat top-level
   packages: `library/` (the `library` crate, `[lib] path = "lib.rs"`) and
   `wires/` (the `wires` library, `lib.rs`, and the `wires` binary,
-  `main.rs`, which only calls `wires::run`). No `src/` subdir; the sources
-  are filed by role:
+  `main.rs`, which only calls `wires::run`), and `bindings/` (`wires-ffi`:
+  UniFFI bindings of the embedding API, foreign module `wires`; Python
+  example in `bindings/python/`). No `src/` subdir; the sources are filed
+  by role:
   - `wires/`: `lib.rs` is argument parsing and dispatch, plus the public
     embedding API (`Host`, `Service`, `Call`, `CallIo`: card 33, an app
     serving wires calls in-process); `examples/kv.rs` is a native service;

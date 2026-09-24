@@ -1,6 +1,6 @@
 # 33 — Wires-native services: the host runtime as a library
 
-**Lane:** N · **Depends on:** 28 · **Status:** Phases 0 and 1 done; Phase 2 next (2026-09-23)
+**Lane:** N · **Depends on:** 28 · **Status:** Phases 0 and 1 done; Phase 2: Python done, TypeScript next (2026-09-23)
 · **Files:** `library/membership/identity.rs` (key hygiene), `wires/admin/keystore.rs`
 (seed read/write only), `wires/host/transport.rs` (the bridge), `wires/host/service.rs`
 (new), `wires/host/serve.rs`, protocol.md §9; Phase 1: `wires/lib.rs` (was
@@ -80,15 +80,31 @@ keystore path, never a seed string.
       / `Denied` with principal, role, argv and stdin digest and head; an
       unassigned native service refuses to start.
 
-**Phase 2: move it into its own crate, then generate bindings.** Split the
-host runtime into a third crate (`service/`, package `wires-service`) once
-Phase 1's API settles; `wires serve` becomes a thin user of it. The
-language-facing surface is a callback interface made of chunks
+**Phase 2: generated bindings.** (Changed 2026-09-23: Phase 1 made `wires`
+a library, so the bindings depend on it directly; the planned split into a
+separate `wires-service` runtime crate would only trim what the bindings
+compile in, and waits until that matters.) The language-facing surface is a callback interface made of chunks
 (`read_stdin() -> Option<Bytes>`, `write_stdout(Bytes)`, `write_stderr(Bytes)`,
 return the exit code), since generated bindings can't cross generics or
 `AsyncRead`. Python via UniFFI (already used for the iOS companion; also
 gives Swift/Kotlin); TypeScript via napi-rs unless a UniFFI Node backend
 proves good enough when evaluated.
+- [x] `bindings/` (package `wires-ffi`, UniFFI 0.32, foreign module `wires`):
+      `Service` (a foreign class; synchronous `call(call) -> int` on a
+      blocking thread), `Call` (caller, `principal()`, role, args, id;
+      blocking `read_stdin` / `read_all_stdin` / `write_stdout` /
+      `write_stderr`; `push_to_caller`), `HostBuilder` → `Host`
+      (`serve()` blocks until `stop()` or Ctrl-C).
+- [x] Python: `.scripts/build-python.sh` (`make python`) builds the cdylib
+      and the generated `wires.py`; `bindings/python/examples/kv.py` is the
+      kv example in Python.
+- [x] Acceptance: `.scripts/demo-python-service.sh` (`make demo-python`), a
+      real loopback fabric with the Python process as the host, called by
+      the shipped `wires`: set/get/keys with state kept; the handler's exit
+      code and stderr; bob refused (77) by name; `push_to_caller` reaching
+      `wires inbox`; the host's log through alice's `wires watch --mine`.
+- [ ] TypeScript/Node (napi-rs).
+- [ ] Packaging: a wheel (maturin, `bindings = "uniffi"`) and an npm package.
 
 ## Notes
 
@@ -127,3 +143,22 @@ proves good enough when evaluated.
   instead of `WIRES_PUSH_TOKEN`; `push_to_caller` runs the child socket's
   check, then sends the same `PushCommand`. `serve_until` now makes the push
   queue before the host is shared (`ServicesHost::push_commands`).
+- 2026-09-23, Python: a foreign handler runs on `spawn_blocking`, so a
+  caller's disconnect can't abort it (its next read or write fails); an
+  exception ends the call with exit 1 and its text on the caller's stderr,
+  like an uncaught exception in a CLI; stdout/stderr are closed when the
+  handler returns even if Python keeps the `Call`. Stdio is `bytes` on the
+  foreign side (`Vec<u8>`): the one place the no-bare-`Vec<u8>` rule gives
+  way, since a binding has no newtypes to offer. The demo runs Python from
+  uv (`uv run --managed-python`, 3.13; uv 0.7.6 has no managed 3.14 stable).
+- 2026-09-23, macOS firewall: the demo's Python host raised the "accept
+  incoming connections?" dialog (an interpreter can't be signed the way
+  `macos-sign.sh` signs our binaries). `HostBuilder::bind_loopback()`
+  (Python: `bind_loopback()`, kv.py `--loopback`) binds IP only on
+  `127.0.0.1`/`::1` and turns off iroh's port mapper, whose multicast
+  gateway discovery is what prompts (iroh's `PortmapperConfig` docs); other
+  callers still reach the host through its relay. Checked with `lsof`: the
+  host holds only loopback UDP sockets, and no prompt appeared.
+- Observed: a `set` that pushes took ~3 s: `push_to_caller` waits while the
+  host tries to deliver directly to a caller with no receiver listening,
+  then queues. The same as a CLI child's `wires push`; not a bindings issue.
