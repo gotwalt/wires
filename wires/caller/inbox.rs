@@ -899,6 +899,17 @@ mod tests {
     use library::{NodeIdentity, PushBody, Subject};
     use proptest::prelude::*;
 
+    /// `wires inbox --help` names every exit code the command uses: 0,
+    /// 124 (`--timeout`), and 77 when every host refused this node.
+    #[test]
+    fn the_help_names_every_exit_code() {
+        let help = crate::help::INBOX_AFTER;
+        assert!(help.contains("Exit: 0 "), "{help}");
+        for code in [EXIT_TIMEOUT, crate::EXIT_DENIED] {
+            assert!(help.contains(&format!("{code}:")), "{code} missing: {help}");
+        }
+    }
+
     fn node(seed: u8) -> NodeId {
         NodeIdentity::from_seed([seed; 32]).node_id()
     }
