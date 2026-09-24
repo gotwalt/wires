@@ -57,8 +57,10 @@ ASSUMPTIONS = {
     "host_refresh_windows": 144,  # a host checks every 10 min
     "dial": 3_000,  # bytes of handshake per new iroh connection (not measured)
     "small_frame": 100,  # a `have` exchange, a "not modified"
-    "entry_sig": 150,  # apex: a per-entry signature and version
-    "timestamp": 300,  # apex: the freshness heartbeat
+    # apex, measured by `cargo run -q --release -p library --example policy_sizes` (card 36a):
+    "entry_sig": 5,  # per-item share of one multiproof over a whole slice or view
+    "update": 2_800,  # a subscription update: new head (558 B), Fresh, multiproof
+    "timestamp": 475,  # the freshness beat frame
     "heartbeats": 288,  # apex: one every 5 min
     "view_checks": 8,  # apex: a caller revalidates its view hourly while active
     "visible_services": 30,  # services one caller may use
@@ -140,17 +142,18 @@ def model(tier, s, a, email_roles):
     visible = min(services, a["visible_services"])
     host_in = (
         a["heartbeats"] * a["timestamp"]
+        + max(1.0, removals + service_edits) * a["update"]  # every edit moves the head
         + service_edits * a["replicas"] / hosts * entry
         + removals * (s["ban"] + small)
     )
     view_changes = service_edits * visible / services
-    caller_in = min(view_changes, a["view_checks"]) * (s["base"] + visible * entry) + a[
+    caller_in = min(view_changes, a["view_checks"]) * (a["update"] + visible * entry) + a[
         "view_checks"
     ] * (small + dial)
     apex = {
         "held_center": s["base"] + services * entry + role_bytes + bans,
-        "held_host": s["base"] + per_host * entry + min(roles, 3 * per_host) * role_bytes / roles + bans,
-        "held_caller": s["base"] + visible * entry,
+        "held_host": a["update"] + per_host * entry + min(roles, 3 * per_host) * role_bytes / roles + bans,
+        "held_caller": a["update"] + visible * entry,
         "edits": max(1.0, removals + service_edits),
         "host_in": host_in,
         "caller_in": caller_in,

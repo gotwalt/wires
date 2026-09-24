@@ -11,8 +11,8 @@ be a mode on its own ALPNs", "back it using redb".
 Today every host is an equal mirror of the whole signed state. The admin dials every host after
 every edit, every host re-checks every 10 minutes, and no node knows which peer is current, so a
 node that missed a push searches. [`bench/state-scale/REPORT.md`](../../../bench/state-scale/REPORT.md):
-with a directory, each host holds only its own slice and receives about 90 KB a day at any org
-size, against 54 MB (10k users) or 1.3 GB (50k) today. The fabric also gets a lasting home: the
+with a directory, each host holds only its own slice and receives 140–430 KB a day (measured
+sizes, card 36a), against 54 MB (10k users) or 1.3 GB (50k) today. The fabric also gets a lasting home: the
 directory is what survives when every host and caller is off.
 
 ## What the directory is

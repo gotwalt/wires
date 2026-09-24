@@ -18,9 +18,10 @@ format 1, before card 35), a ban 78 B (format 2), a service entry 318 B (80-char
 
 **Main assumptions:** 2 nodes per user; 0.1% of nodes join or leave per day;
 1% of services edited per day; a caller is active 8 h/day; 3 KB per iroh
-handshake (not measured); a caller may use 30 services; in the apex design, a
-150 B signature per entry, a 300 B freshness timestamp every 5 min, views
-revalidated hourly.
+handshake (not measured); a caller may use 30 services; in the apex design,
+**measured** by `policy_sizes` (card 36a): a 475 B freshness beat every 5 min, a
+2.8 KB subscription update per edit (every edit moves the head, so every host
+gets one), about 5 B of multiproof per held item; views revalidated hourly.
 
 ## Results (group roles)
 
@@ -47,14 +48,14 @@ revalidated hourly.
 | admin sends /day | 35.5 KB | 4.0 MB | 3.6 GB | 179.4 GB |
 | whole network /day | 17.6 MB | 471.3 MB | 128.5 GB | 7.9 TB |
 | **Apex** (directory; slices; views) |  |  |  |  |
-| apex holds | 5.6 KB | 51.2 KB | 507.2 KB | 2.5 MB |
-| each host holds | 2.8 KB | 5.7 KB | 27.3 KB | 125.6 KB |
-| each caller holds | 5.3 KB | 14.6 KB | 14.6 KB | 14.6 KB |
+| apex holds | 4.1 KB | 36.7 KB | 362.2 KB | 1.8 MB |
+| each host holds | 4.4 KB | 7.4 KB | 29.0 KB | 126.4 KB |
+| each caller holds | 6.0 KB | 12.5 KB | 12.5 KB | 12.5 KB |
 | invite token | 785 B | 785 B | 785 B | 785 B |
-| each caller receives /day | 25.3 KB | 29.2 KB | 29.2 KB | 29.2 KB |
-| each host receives /day | 86.4 KB | 86.6 KB | 88.2 KB | 95.4 KB |
-| apex sends /day | 3.0 MB | 62.7 MB | 627.8 MB | 3.0 GB |
-| whole network /day | 3.0 MB | 62.7 MB | 627.8 MB | 3.0 GB |
+| each caller receives /day | 25.4 KB | 28.5 KB | 28.5 KB | 28.5 KB |
+| each host receives /day | 139.6 KB | 142.7 KB | 195.3 KB | 427.2 KB |
+| apex sends /day | 3.2 MB | 64.2 MB | 668.6 MB | 3.3 GB |
+| whole network /day | 3.2 MB | 64.2 MB | 668.6 MB | 3.3 GB |
 
 With email-list roles (Google has no groups claim; 30 people per role), today's
 state is about 1.3× larger (10.7 MB at *large*). In the apex design the extra
@@ -76,9 +77,12 @@ views don't change.
    where sync fails outright.
 5. **Badges alone cut per-node traffic about 5–6×,** but it still grows with
    the org (75 MB per caller per day at *large*). Card 35 built this.
-6. **The apex makes per-node cost flat:** about 29 KB per caller and 90 KB per
-   host per day at every size, and most of that is handshakes and
-   heartbeats, not data. The whole network costs what one apex sends.
+6. **The apex makes per-node cost nearly flat:** about 29 KB per caller per
+   day at every size; a host receives 140 KB (team) to 430 KB (*large*) a day.
+   A host's traffic is the 5-minute freshness beat (137 KB/day) plus one
+   2.8 KB update per edit anywhere in the fabric, since every edit moves the
+   head; so it grows with the edit rate, not with the number of nodes. The
+   whole network costs what one apex sends.
 7. **Today is fine at the demo size.** At *team* scale every number is small;
    the design only breaks past about 1k users.
 

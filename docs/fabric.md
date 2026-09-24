@@ -210,12 +210,14 @@ Metadata received per node per day, at 10k users, 1k services and 500 hosts
 | | Today | This design |
 |---|---|---|
 | each caller | 39 MB | 29 KB |
-| each host | 54 MB (plus 1.6 GB sent to callers) | 88 KB |
+| each host | 54 MB (plus 1.6 GB sent to callers) | 195 KB |
 | the admin sends | 27 GB | one publish per directory per edit |
 | invite token | 2.3 MB | about 800 B |
 
-Per-node cost is the same at 50 users and 50k. What's left is mostly handshakes and the 5-minute
-freshness beat.
+A caller's cost is the same at 50 users and 50k. A host's is the 5-minute freshness beat
+(137 KB a day) plus a 2.8 KB update per edit (every edit moves the head), so it grows with the
+edit rate, not the number of nodes: 140 KB a day at 50 users, 430 KB at 50k. Sizes are measured
+from the library (card 36a).
 
 ## 9. Today vs this design
 
