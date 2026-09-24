@@ -823,15 +823,18 @@ where
             return Err(Refused(DENY_LOG_UNAVAILABLE.to_string()).into());
         }
     };
-    write_frame(
-        &mut send,
-        &Frame::HelloAck(library::HelloAck {
-            membership: host.membership.clone(),
-            state_version: version,
-            newer_state: (hello.state_version < version).then(|| state.clone()),
-        }),
-    )
-    .await?;
+    let ack = Frame::HelloAck(library::HelloAck {
+        membership: host.membership.clone(),
+        state_version: version,
+        newer_state: (hello.state_version < version).then(|| state.clone()),
+    });
+    if let Err(e) = write_frame(&mut send, &ack).await {
+        // The caller is gone before anything ran: close the logged call.
+        if let Some(call_audit) = call_audit {
+            call_audit.finish(-1).await;
+        }
+        return Err(e);
+    }
 
     let (program, fixed) = svc
         .command
