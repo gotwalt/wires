@@ -49,28 +49,33 @@ mkdir -p "$D/root" "$D/wb" "$D/jobs"
 WIRES_HOME="$D/root" "$WIRES" init >/dev/null
 WB_ID="$(WIRES_HOME="$D/wb" "$WIRES" id 2>/dev/null)"
 WIRES_HOME="$D/root" "$WIRES" invite "$WB_ID" --name workbench >/dev/null 2>&1
-WIRES_HOME="$D/root" "$WIRES" role set bench --issuer "$ISSUER" "$EMAIL" >/dev/null 2>&1 || true
-add() { WIRES_HOME="$D/root" "$WIRES" service add "$1" --allow bench --host workbench --description "$2" >/dev/null 2>&1; }
+WIRES_HOME="$D/root" "$WIRES" role set bench --issuer "$ISSUER" "$EMAIL" >/dev/null
 # The workbench isn't up yet: each edit reaches no host and exits 1 (the state
-# is stored; the workbench's token carries it).
-add deploy "Start a CI build in the background: deploy -- build <n>. Returns at once; the result is pushed to your wires inbox when the build finishes." || true
-add status "A build's state: status -- build <n> (running / failed)." || true
-add logs "A build's log: logs -- build <n> [--tail N] (default: last 50 lines)." || true
+# is stored; the workbench's token carries it). Any other failure stops here.
+add() {
+	WIRES_HOME="$D/root" "$WIRES" service add "$1" --allow bench --host workbench --description "$2" >/dev/null 2>"$D/svc.err" ||
+		grep -qF "reached none of its 1 host(s)" "$D/svc.err" || {
+		cat "$D/svc.err" >&2
+		exit 1
+	}
+}
+add deploy "Start a CI build in the background: deploy -- build <n>. Returns at once; the result is pushed to your wires inbox when the build finishes."
+add status "A build's state: status -- build <n> (running / failed)."
+add logs "A build's log: logs -- build <n> [--tail N] (default: last 50 lines)."
 tok="$(WIRES_HOME="$D/root" "$WIRES" invite "$WB_ID" --name workbench 2>/dev/null)" || true
 WIRES_HOME="$D/wb" "$WIRES" join "$tok" >/dev/null
 
-cat >"$D/host.json" <<JSON
-{
-  "version": 2,
-  "identity": { "issuers": [ { "issuer": "$ISSUER", "audiences": ["$CLIENT_ID"] } ] },
-  "services": {
-    "deploy": { "command": ["$repo/.scripts/fixtures/ci.sh", "deploy"], "env": { "CI_JOBS": "$D/jobs", "CI_WIRES": "$WIRES" } },
-    "status": { "command": ["$repo/.scripts/fixtures/ci.sh", "status"], "env": { "CI_JOBS": "$D/jobs", "CI_WIRES": "$WIRES" } },
-    "logs": { "command": ["$repo/.scripts/fixtures/ci.sh", "logs"], "env": { "CI_JOBS": "$D/jobs", "CI_WIRES": "$WIRES" } }
-  },
-  "push": { "allow": ["bench"] }
+# The demo's host.json, with the bench's IdP and role. $D/jobs/job-secs (set
+# by bench.py per duration) overrides CI_JOB_SECS.
+sed -e "s|__ISSUER__|$ISSUER|" -e "s|__CLIENT_ID__|$CLIENT_ID|" \
+	-e "s|__CI__|$repo/.scripts/fixtures/ci.sh|" \
+	-e "s|__JOBS__|$D/jobs|" -e "s|__JOB_SECS__|60|" -e "s|__WIRES__|$WIRES|" \
+	-e 's|"allow": \["analyst"\]|"allow": ["bench"]|' \
+	"$repo/.scripts/fixtures/push-host.json" >"$D/host.json"
+grep -qF '"allow": ["bench"]' "$D/host.json" || {
+	echo "up: push-host.json no longer has the push rule this script rewrites" >&2
+	exit 1
 }
-JSON
 "$WIRES" serve --check "$D/host.json" >/dev/null
 (cd "$D" && WIRES_HOME="$D/wb" \
 	exec nohup "$WIRES" serve "$D/host.json" >"$D/wb.out" 2>"$D/wb.err" </dev/null) &

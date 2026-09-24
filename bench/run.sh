@@ -2,7 +2,7 @@
 #
 # MCP vs CLI token benchmark (board card 16). Reproduce with:
 #
-#   ./bench/run.sh                                        # full: 4 arms x 5 tasks x 5 reps
+#   ./bench/run.sh                                        # full: 5 arms x 5 tasks x 5 reps
 #   ./bench/run.sh --reps 1                               # smoke test
 #   ./bench/run.sh --arms mcp,gh --tasks t1-release       # a slice
 #
@@ -21,7 +21,9 @@ D="${BENCH_WIRES_DIR:-/tmp/wb16}" # short: macOS 104-byte unix-socket paths
 mkdir -p "$D/bin"
 if [ -z "${WIRES_BIN:-}" ]; then
 	(cd "$repo" && cargo build -q --release -p wires)
-	cp -f "$repo/target/release/wires" "$D/bin/wires"
+	# rm first: overwriting a signed binary in place gets it SIGKILLed on macOS
+	rm -f "$D/bin/wires"
+	cp "$repo/target/release/wires" "$D/bin/wires"
 	chmod u+w "$D/bin/wires"
 fi
 

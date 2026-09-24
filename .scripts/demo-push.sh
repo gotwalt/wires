@@ -63,62 +63,27 @@ JOB_SECS=3
 START=$SECONDS
 
 D="$(mktemp -d)"
-IDP_PID=""
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$repo/.scripts/lib.sh"
 WB_PID=""
 WAIT_PID=""
 p=""
 trap 'for p in $WAIT_PID $WB_PID $IDP_PID; do kill "$p" 2>/dev/null || true; done; [ -n "$KEEP" ] || rm -rf "$D"' EXIT INT TERM
 
-say() { [ -n "$QUIET" ] || printf '\033[36m[demo]\033[0m %s\n' "$*" >&2; }
-run() { [ -n "$QUIET" ] || printf '\033[2m     $ %s\033[0m\n' "$*" >&2; }
-ok() { printf '\033[32m[ok]\033[0m   %s\n' "$*" >&2; }
-bad() {
-	printf '\033[31m[FAIL]\033[0m %s\n' "$*" >&2
-	exit 1
-}
-step() {
-	[ -n "$QUIET" ] || {
-		printf '\n\033[1;36m[demo] %s\033[0m\n' "$*" >&2
-		sleep 1.5
-	}
-}
-beat() { [ -n "$QUIET" ] || sleep "$1"; }
-line() { [ -n "$QUIET" ] || printf '\033[1m     %s\033[0m\n' "$*" >&2; }
-show() { [ -n "$QUIET" ] || sed 's/^/     /' "$1" >&2; }
-
-# Poll a file for a fixed string. $3 is the budget in tenths of a second.
-wait_for() {
-	local file="$1" s="$2" n="${3:-300}"
-	for _ in $(seq 1 "$n"); do
-		if [ -e "$file" ] && grep -qF -- "$s" "$file"; then return 0; fi
-		sleep 0.1
-	done
-	return 1
-}
 # The last line of $1 holding every remaining fixed string, as
-# `<line number>:<line>` (or fail).
-the_line() {
+# `<line number>:<line>` (or fail), so steps can be checked for order.
+numbered_line() {
 	local file="$1" hits
 	shift
 	hits="$(grep -n '' "$file")"
 	for s in "$@"; do hits="$(printf '%s\n' "$hits" | grep -F -- "$s" || true)"; done
 	[ -n "$hits" ] && printf '%s\n' "$hits" | tail -1
 }
-alive() { kill -0 "$1" 2>/dev/null; }
 admin() { WIRES_HOME="$root" "$WIRES" "$@"; }
 # The agent: locked mode, so it can steer nothing but the service and its args.
 agent_wires() { WIRES_HOME="$agent" WIRES_LOCKED=1 "$WIRES" "$@"; }
 
-if [ -z "${WIRES_BIN:-}" ]; then
-	say "cargo build --release (the mock-IdP build first, then the shipped one) ..."
-	# Both builds write target/release/wires: copy the feature build aside first.
-	# rm before cp: overwriting a signed binary in place gets it killed on macOS.
-	(cd "$repo" && cargo build -q --release -p wires --features dev-mock-idp)
-	rm -f "$WIRES_DEV" && cp "$repo/target/release/wires" "$WIRES_DEV"
-	(cd "$repo" && cargo build -q --release -p wires)
-	# A stable signature keeps the macOS firewall from asking again each build.
-	"$repo/.scripts/macos-sign.sh" "$WIRES" "$WIRES_DEV"
-fi
+build_wires
 command -v curl >/dev/null || bad "curl is not on PATH"
 command -v perl >/dev/null || bad "perl is not on PATH (the mock CI's clock)"
 
@@ -137,11 +102,7 @@ AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
 AG8="${AG_ID:0:8}"
 WB8="${WB_ID:0:8}"
 # The IdP comes first: every role names the issuer it trusts.
-"$WIRES_DEV" dev-mock-idp --email "$EMAIL" >"$D/idp.out" 2>"$D/idp.err" &
-IDP_PID=$!
-wait_for "$D/idp.out" "client_id " 100 || bad "setup: the mock IdP did not start; see $D/idp.err"
-ISSUER="$(awk '/^issuer /{print $2}' "$D/idp.out")"
-CLIENT_ID="$(awk '/^client_id /{print $2}' "$D/idp.out")"
+start_mock_idp "$EMAIL"
 admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1
 admin invite "$WB_ID" --name workbench >/dev/null 2>&1
 # The workbench isn't up yet, so each edit reaches no host and exits 1 (the
@@ -186,17 +147,7 @@ AG_TOKEN="$(admin invite "$AG_ID" --name agent 2>"$D/invite.err")" || {
 }
 WIRES_HOME="$agent" "$WIRES" join "$AG_TOKEN" >/dev/null
 
-WIRES_HOME="$agent" "$WIRES" login \
-	--issuer "$ISSUER" --client-id "$CLIENT_ID" --client-secret not-so-secret \
-	--no-browser >"$D/login.out" 2>"$D/login.err" &
-LOGIN_PID=$!
-wait_for "$D/login.err" "sign in at" 100 || bad "setup: login printed no sign-in URL"
-URL="$(grep -m1 -E '^  https?://' "$D/login.err" | sed 's/^  //')"
-curl -fsSL -o /dev/null "$URL" || bad "setup: the sign-in round trip failed"
-wait "$LOGIN_PID" || {
-	sed 's/^/  login| /' "$D/login.err" >&2
-	bad "setup: wires login failed"
-}
+login_as "$agent" "$EMAIL"
 agent_wires services >"$D/services.out" 2>/dev/null || true
 grep -qE "^deploy .*\(analyst\)$" "$D/services.out" || {
 	cat "$D/services.out" >&2
@@ -303,17 +254,17 @@ agent_wires watch --once >"$D/w1.out" 2>"$D/w1.err" || {
 	cat "$D/w1.err" >&2
 	bad "5: wires watch failed"
 }
-SD="$(the_line "$D/w1.out" "▶" "$EMAIL" "[analyst] deploy build 41")" || {
+SD="$(numbered_line "$D/w1.out" "▶" "$EMAIL" "[analyst] deploy build 41")" || {
 	cat "$D/w1.out" >&2
 	bad "5: no ▶ deploy naming $EMAIL"
 }
 # `delivered` if the host's direct dial reached the waiting inbox, else
 # `fetched` by its long poll.
-SP="$(the_line "$D/w1.out" "⇢" "→ $EMAIL" "[analyst] \"build-41\" ")" || {
+SP="$(numbered_line "$D/w1.out" "⇢" "→ $EMAIL" "[analyst] \"build-41\" ")" || {
 	cat "$D/w1.out" >&2
 	bad "5: no ⇢ build-41 in the records"
 }
-SL="$(the_line "$D/w1.out" "▶" "$EMAIL" "[analyst] logs build 41 --tail 50")" || {
+SL="$(numbered_line "$D/w1.out" "▶" "$EMAIL" "[analyst] logs build 41 --tail 50")" || {
 	cat "$D/w1.out" >&2
 	bad "5: no ▶ logs naming $EMAIL"
 }
@@ -361,7 +312,7 @@ show "$D/i2.out"
 agent_wires inbox >"$D/i3.out" 2>/dev/null
 [ ! -s "$D/i3.out" ] || bad "6: a read message was printed twice"
 agent_wires watch --once >"$D/w2.out" 2>/dev/null || true
-QF="$(the_line "$D/w2.out" "⇢" "→ $EMAIL" "\"build-42\" fetched")" || {
+QF="$(numbered_line "$D/w2.out" "⇢" "→ $EMAIL" "\"build-42\" fetched")" || {
 	cat "$D/w2.out" >&2
 	bad "6: no ⇢ build-42 fetched in the records"
 }

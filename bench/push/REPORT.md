@@ -4,11 +4,11 @@
 `--model opus` → claude-opus-5-5, Claude Code 2.1.280), all correct. Spend
 $1.71 in results, plus about $0.35 of smoke tests and probes.*
 
-*Note (card 28): the setup has changed since these runs. There is no built-in
-`member` role any more (`bench/push/up.sh` now uses a role `bench` matched on
-the benchmark's IdP identity), and a service pushes through a per-call
-capability instead of the host's keystore. The results below are from the
-runs as they were.*
+*Note: the setup has changed since these runs. `bench/push/up.sh` now
+registers the services for a role `bench` matched on the benchmark's IdP
+identity (the runs used a built-in `member` role that no longer exists), and
+a service pushes through a per-call capability instead of the host's
+keystore. The results below are from the runs as they were.*
 
 **Task:** start build *n* on a remote mock CI (`wires call deploy -- build n`),
 wait for it to finish, read its log (`wires call logs -- build n --tail 50`),
@@ -88,7 +88,7 @@ denials) come from `python3 bench/push/report.py bench/push/results/2026-09-23.j
 - The `--wait` arm is a foreground blocking call because `claude -p` can't
   resume on a background command. The token cost of an interactive
   background command should be the same, but it wasn't measured here.
-- 60 s reps 1–3 overlapped a `bazel test //...` run on the same machine. One
+- 60 s reps 1–3 overlapped a full workspace test run on the same machine. One
   `--wait` run in that window reacted in 22.7 s (its `wires push` took 9 s
   instead of 3 s, and a fetch stalled). It is not in the median, but it is in
   the raw data.
@@ -103,6 +103,6 @@ cargo build --release -p wires && ./bench/push/run.sh                 # 3 arms x
 python3 bench/push/report.py bench/push/results/2026-09-23.jsonl
 ```
 
-`bench/push/up.sh` provisions a loopback workbench (the mock CI plus, at the
-time of these runs, `"push": {"allow": ["member"]}`; now role `bench`) and one agent keystore per arm under
+`bench/push/up.sh` provisions a loopback workbench (the mock CI, from
+`.scripts/fixtures/push-host.json`) and one agent keystore per arm under
 `/tmp/wb24`. The raw stream-json transcripts are not committed.
