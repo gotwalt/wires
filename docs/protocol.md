@@ -286,7 +286,8 @@ to a caller, addressed **by key**. Frames are length-prefixed canonical JSON tag
 so it may be at most 64 KiB. Two ways a message is delivered:
 
 - **Direct:** the host dials the recipient (3 s budget). A running `wires inbox --wait` serves the
-  inbox ALPN and accepts `deliver` only from a member its signed state names as a **host**.
+  inbox ALPN and accepts `deliver` only from a member its signed state names as a **host**; any
+  other dialer hears only `not admitted to this fabric` (the reason is traced, throttled).
 - **Fetch:** `wires inbox` dials the hosts of every service it may call (`hello` with its stored ID
   token, `fetch` held open for up to 25 s, `deliver`, then `ack`).
 
