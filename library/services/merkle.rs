@@ -229,6 +229,24 @@ pub struct LeafRange {
 ///
 /// Like an [`InclusionProof`], it is bound to positions in one tree: the
 /// sides come from the indices and the head's `item_count`.
+///
+/// ```
+/// use library::{Ban, Item, ItemHash, ItemTree, LeafRange, NodeIdentity};
+/// let items: Vec<Item> = (0..100u8)
+///     .map(|b| Item::Ban {
+///         key: NodeIdentity::from_seed([b; 32]).node_id(),
+///         body: Ban { until: 0 },
+///     })
+///     .collect();
+/// let tree = ItemTree::new(items.iter().map(|i| ItemHash::of(i).unwrap()).collect());
+/// // Forty consecutive leaves: one range, a handful of hashes.
+/// let proof = tree.prove_many(&(40..80).collect::<Vec<_>>()).unwrap();
+/// assert_eq!(proof.leaves, vec![LeafRange { start: 40, len: 40 }]);
+/// assert!(proof.hashes.hashes().len() <= 2 * 7);
+/// proof.verify_items(&items[40..80], tree.root(), 100).unwrap();
+/// // Another set of items doesn't prove.
+/// assert!(proof.verify_items(&items[41..81], tree.root(), 100).is_err());
+/// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MultiProof {
