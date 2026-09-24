@@ -21,7 +21,7 @@ Every role joins the same way: `wires id`, then `wires join <token>` with the ad
 | Guarantee | Lives in | Checked by |
 |---|---|---|
 | **Who's in** | The admin-signed state's member set (and each node's root-signed membership). Removal is a new state without the member. | The host, per connection, against its copy of the state (re-read every dial). |
-| **Who may call what** | The state's registry: each service's `allow` roles, and the role definitions (matchers on the IdP identity). | The host, on every call. `wires services` evaluates the same table locally, for listing only. |
+| **Who may call what** | The state's registry: each service's `allow` roles, and the role definitions (matchers on the IdP identity, each naming its issuer). Every role needs a verified identity. | The host, on every call. `wires services` evaluates the same table locally, for listing only. |
 | **Stricter local rules** | `host.json`'s `also_require` roles per service. They can only narrow. | The host, after the registry. |
 | **Who is calling** | Your IdP's ID token, bound to the caller's node key at `wires login` (the OIDC `nonce` is a hash of the key), presented in the session `Hello`. | The host, against the issuer's JWKS, under the issuers `host.json` trusts. No wires identity service. |
 | **Reach** | The host's node key. Callers dial a key (iroh; n0 discovery, or an optional local `$WIRES_HOME/hints` file); the host binds UDP for QUIC and has no TCP listener. | iroh's handshake authenticates the key; the host then checks the membership and the state. |
@@ -51,7 +51,7 @@ fabric 57b09428…
 node 23028cae…
 state version 1 (1 member: this node)
 next: on each joining machine run `wires id`, then here `wires invite <node-id> --name <label>`
-admin$ wires role set analyst '*@example.com'
+admin$ wires role set analyst '*@example.com'          # issuer: Google unless --issuer
 role analyst set (state version 2)
 admin$ wires role set security sec@audit.example
 role security set (state version 3)
@@ -331,7 +331,7 @@ To make `wires` the boundary, use a structural setup:
 | **admin** | `wires init [--ttl 30d]` | Create the root key and this node, and sign state version 1 with this node as its one member. |
 | | `wires invite <node-id> [--name l] [--ttl 30d]` | Add a node to the state, mint its membership, print its join token (stdout), push the new state. |
 | | `wires remove <name\|node-id> [--ttl 30d]` | Drop a node (and from every service's hosts); push hosts first. Its next call is refused. |
-| | `wires role set <name> <matcher>…` · `role rm <name>` | Define a role as an OR of matchers: `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…` (all must hold). |
+| | `wires role set <name> [--issuer URL] <matcher>…` · `role rm <name>` | Define a role as an OR of matchers: `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…` (all must hold). Every matcher names its issuer, compared exactly: one without `issuer=` takes `--issuer` (default `https://accounts.google.com`). `issuer=…` alone admits anyone that IdP verified. `org` is Google's `hd`, read only from Google. There is no built-in role: a member with no verified identity is in no role. |
 | | `wires service add\|set <name> [--description D] [--allow role]… [--host member]… [--reader role]…` · `service rm <name>` | Edit the registry. `--host` is an `invite --name` label or a node id; `set` replaces each list given. |
 | **host** | `wires serve host.json` | Refuse to start unless the state assigns every service in the file here; then check every caller against the state, exec the service per call, and log every call, refusal and push. `--check` validates and prints what the file implements. |
 | | `wires push --to <node-id\|role> --subject S [--ttl D] -- <body>` | Hand a message for a caller to this machine's running `serve` (body from stdin if none is given). Prints `delivered`, `queued` or `denied` per recipient; exits `77` if every recipient was refused. |

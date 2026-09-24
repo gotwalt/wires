@@ -53,10 +53,10 @@ SignedState { state, alg, sig }
 
 - **Signed bytes:** `"wires/state/v1\0"` followed by canonical JSON of `{alg, state}`. The prefix
   separates it from memberships and call-log entries.
-- **`State::validate`** (run by `sign` and `verify`): format is 1; `hosts ⊆ members`; `member` is
-  built in and can't be defined; every role has at least one matcher and no empty matcher; every
-  role a service's `allow` or `readers` names is defined (or `member`); every service host is in
-  `hosts`, listed once.
+- **`State::validate`** (run by `sign` and `verify`): format is 1; `hosts ⊆ members`; every role
+  has at least one matcher and every matcher names an issuer; every role a service's `allow` or
+  `readers` names is defined (there is no built-in role); every service host is in `hosts`,
+  listed once.
 - **`SignedState::verify(root)`** checks the algorithm, the `fabric == root` pin, the signature,
   then `validate`. **`check_fresh(now)`**: `Expired` when `now > not_after`. An expired state admits
   nobody until the admin signs a newer one.
@@ -72,12 +72,15 @@ SignedState { state, alg, sig }
 - **Names.** `ServiceName` is `[a-z][a-z0-9_-]*`, at most 64 bytes (the same rules as the session's
   `ToolName`). `RoleName` is 1–64 of `[A-Za-z0-9_.-]`.
 - **Roles.** A role is an OR of matchers; a matcher is an AND of its keys over the caller's verified
-  IdP principal: `issuer` (exact), `email` (exact, or `*@domain`), `org` (Google's `hd`), `group`.
-  The built-in role `member` admits any member, with or without an identity.
+  IdP principal: `issuer` (exact, **required**), `email` (exact, or `*@domain`), `org` (Google's
+  `hd`), `group`. Because every matcher names its issuer, a token another trusted issuer minted
+  for the same email never satisfies it. `issuer=…` alone is "anyone that IdP verified". There is
+  no built-in role: **with no verified principal, no role admits** (`role_admits`). `member` is an
+  ordinary role name.
 - **`authorize(state, caller, principal, service)`** (`library/services/access.rs`), in order: the
   caller is a member (`NotAMember`); the service exists (`UnknownService`); it allows some role
-  (`NobodyAllowed`); the first role in `allow` that admits the caller is returned (`NotInRole`,
-  whose text asks for `wires login` when there is no principal). `allowed_services` runs it for
+  (`NobodyAllowed`); the first role in `allow` that admits the caller's verified principal is
+  returned (`NotInRole`, whose text asks for `wires login` when there is no principal). `allowed_services` runs it for
   every service: that is `wires services`, evaluated locally with no network.
 
 The state is not secret. Every member holds all of it: member and host node ids, role matchers,
@@ -92,7 +95,7 @@ registry locally has to hold the set anyway.
 | `wires init [--ttl]` | New root and node keys, this node's membership, version 1 with this node as its one member. |
 | `wires invite <node-id> [--name] [--ttl]` | Adds the member, mints its membership, prints one `Invite` token, pushes the state. |
 | `wires remove <name\|id> [--ttl]` | Drops the member (and from every service's `hosts`), pushes hosts first. |
-| `wires role set <name> <matcher>…` / `role rm <name>` | Defines or drops a role. A matcher is `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…`. |
+| `wires role set <name> [--issuer URL] <matcher>…` / `role rm <name>` | Defines or drops a role. A matcher is `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…`; one without `issuer=` takes `--issuer` (default `https://accounts.google.com`). |
 | `wires service add\|set <name> [--description] [--allow role]… [--host member]… [--reader role]…` / `service rm <name>` | Edits the registry. `--host` takes an `invite --name` label or a node id, and must be a member. |
 
 `Invite { format: 2, membership, state: SignedState, admin: NodeId }` is everything a new node needs.
@@ -191,7 +194,8 @@ A host verifies it against the issuer's JWKS under **its own** trust: `host.json
 `identity.issuers`, each with the audiences it accepts from that issuer. `verify_claim` checks, in
 order: `alg` is RS256 or ES256 and a JWKS key verifies the signature; `iss` matches exactly; an `aud`
 value is accepted; `exp` and `iat` are within the 60 s clock skew; `nonce == for_node(caller)`.
-`email` is used only when `email_verified` is true; `hd` becomes `org`; `groups` is kept. A host
+`email` is used only when `email_verified` is true; `hd` becomes `org` only when `iss` is exactly
+`https://accounts.google.com`; `groups` is kept. A host
 remembers the latest verified principal per node (`wires/host/identity.rs`) and never lets a failure
 or an older token displace it. It knows only the callers that presented a token **to it**.
 
@@ -209,11 +213,11 @@ to a caller, addressed **by key**. Frames are length-prefixed canonical JSON tag
 
 The host authorizes at send, at delivery and at fetch (`ServicesHost::decide_push`): the recipient
 must be a member of the current state, in the first registry role of `host.json`'s `push.allow` that
-admits it (default: nobody). **The identity rule:** `push.allow: ["member"]` needs no identity; any
-other role needs the recipient's verified principal, which the host learns only when the recipient
-presents its token to it: on a call, or in an inbox fetch. `--to <role>` names the members whose
-known principal the role admits (`member`: every member). A removed member's queue is dropped
-(logged `denied`) and its fetch refused.
+admits it (default: nobody). **The identity rule:** every role needs the recipient's verified
+principal, which the host learns only when the recipient presents its token to it: on a call, or in
+an inbox fetch. `--to <role>` names the members whose known principal the role admits; a member
+with no verified identity here is in no role. A removed member's queue is dropped (logged
+`denied`) and its fetch refused.
 
 A receiver refuses a message whose `from` is not the authenticated peer or whose `to` is not itself.
 Delivery is at least once; the receiver removes duplicates by `PushId`. The host queues up to 64
