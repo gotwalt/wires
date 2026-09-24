@@ -142,4 +142,174 @@ fn signed_bytes(head: &PolicyHead, alg: &AlgorithmId) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn root() -> NodeIdentity {
+        NodeIdentity::from_seed([1u8; 32])
+    }
+
+    fn node(b: u8) -> NodeId {
+        NodeIdentity::from_seed([b; 32]).node_id()
+    }
+
+    fn sample() -> PolicyHead {
+        PolicyHead {
+            format: POLICY_V3,
+            fabric: root().node_id(),
+            version: StateVersion(3),
+            issued: 10,
+            not_after: 1_000,
+            directories: vec![node(2), node(3)],
+            items_root: ItemsRoot::from_hex(&"ab".repeat(32)).unwrap(),
+            item_count: 7,
+        }
+    }
+
+    #[test]
+    fn sign_verify_round_trip() {
+        let signed = sample().sign(&root()).unwrap();
+        signed.verify(root().node_id()).unwrap();
+        let back: SignedPolicyHead =
+            serde_json::from_slice(&canonical_bytes(&signed).unwrap()).unwrap();
+        assert_eq!(back, signed);
+        back.verify(root().node_id()).unwrap();
+        assert!(signed.head.is_directory(node(3)));
+        assert!(!signed.head.is_directory(node(4)));
+    }
+
+    #[test]
+    fn signed_bytes_are_domain_separated() {
+        let signed = sample().sign(&root()).unwrap();
+        let bytes = signed_bytes(&signed.head, &signed.alg).unwrap();
+        assert!(bytes.starts_with(b"wires/policy-head/v1\0{\"alg\":\"ed25519\",\"head\":{"));
+        // The same body under the state's context doesn't verify.
+        let mut other = crate::state::STATE_CONTEXT.to_vec();
+        other.extend_from_slice(&bytes[POLICY_HEAD_CONTEXT.len()..]);
+        assert!(root().node_id().verify(&other, &signed.sig).is_err());
+    }
+
+    #[test]
+    fn wrong_root_and_tampering_are_refused() {
+        let signed = sample().sign(&root()).unwrap();
+        assert!(signed.verify(node(9)).is_err());
+        assert!(matches!(
+            sample().sign(&NodeIdentity::from_seed([9u8; 32])),
+            Err(Error::FabricMismatch)
+        ));
+        let tampers: [fn(&mut PolicyHead); 4] = [
+            |h| h.item_count += 1,
+            |h| {
+                h.directories.pop();
+            },
+            |h| h.not_after += 1,
+            |h| h.items_root = ItemsRoot::from_hex(&"cd".repeat(32)).unwrap(),
+        ];
+        for tamper in tampers {
+            let mut t = signed.clone();
+            tamper(&mut t.head);
+            assert!(
+                matches!(t.verify(root().node_id()), Err(Error::InvalidSignature)),
+                "{t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_and_duplicate_directories_are_refused() {
+        let mut h = sample();
+        h.format = POLICY_V3 + 1;
+        let signed = SignedPolicyHead {
+            sig: root().sign(&signed_bytes(&h, &AlgorithmId::Ed25519).unwrap()),
+            head: h,
+            alg: AlgorithmId::Ed25519,
+        };
+        assert!(matches!(
+            signed.verify(root().node_id()),
+            Err(Error::UnsupportedVersion)
+        ));
+
+        let mut h = sample();
+        h.directories.push(node(2));
+        assert!(matches!(h.sign(&root()), Err(Error::InvalidPolicy(_))));
+        let signed = SignedPolicyHead {
+            sig: root().sign(&signed_bytes(&h, &AlgorithmId::Ed25519).unwrap()),
+            head: h,
+            alg: AlgorithmId::Ed25519,
+        };
+        assert!(matches!(
+            signed.verify(root().node_id()),
+            Err(Error::InvalidPolicy(_))
+        ));
+    }
+
+    #[test]
+    fn freshness_and_ordering() {
+        let a = sample().sign(&root()).unwrap();
+        let mut h = sample();
+        h.version = StateVersion(4);
+        let b = h.sign(&root()).unwrap();
+        assert!(b.is_newer_than(&a));
+        assert!(!a.is_newer_than(&b));
+        assert!(!a.is_newer_than(&a));
+        assert!(a.check_fresh(1_000).is_ok());
+        assert!(matches!(
+            a.check_fresh(1_001),
+            Err(Error::Expired { not_after: 1_000 })
+        ));
+        // Another fabric's head is never newer.
+        let other = NodeIdentity::from_seed([9u8; 32]);
+        let mut h = sample();
+        h.fabric = other.node_id();
+        h.version = StateVersion(99);
+        assert!(!h.sign(&other).unwrap().is_newer_than(&a));
+    }
+
+    #[test]
+    fn the_hash_names_one_exact_head() {
+        let a = sample().sign(&root()).unwrap();
+        assert_eq!(a.hash().unwrap(), a.clone().hash().unwrap());
+        let mut h = sample();
+        h.item_count += 1;
+        let b = h.sign(&root()).unwrap();
+        assert_ne!(a.hash().unwrap(), b.hash().unwrap());
+        assert_eq!(
+            a.hash().unwrap().hex(),
+            blake3::hash(&canonical_bytes(&a).unwrap())
+                .to_hex()
+                .as_str()
+        );
+    }
+
+    #[test]
+    fn unknown_fields_are_refused() {
+        let signed = sample().sign(&root()).unwrap();
+        let mut v = serde_json::to_value(&signed).unwrap();
+        v["head"]["members"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<SignedPolicyHead>(v).is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn a_changed_version_never_verifies(version in any::<u64>(), other in any::<u64>()) {
+            prop_assume!(version != other);
+            let mut h = sample();
+            h.version = StateVersion(version);
+            let mut signed = h.sign(&root()).unwrap();
+            signed.head.version = StateVersion(other);
+            prop_assert!(signed.verify(root().node_id()).is_err());
+        }
+
+        #[test]
+        fn any_directory_list_round_trips(seeds in proptest::collection::btree_set(2u8.., 0..8)) {
+            let mut h = sample();
+            h.directories = seeds.iter().map(|b| node(*b)).collect();
+            let signed = h.sign(&root()).unwrap();
+            let back: SignedPolicyHead =
+                serde_json::from_slice(&canonical_bytes(&signed).unwrap()).unwrap();
+            prop_assert!(back.verify(root().node_id()).is_ok());
+            prop_assert_eq!(back, signed);
+        }
+    }
+}

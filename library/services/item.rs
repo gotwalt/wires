@@ -178,4 +178,165 @@ impl Item {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::codec::canonical_bytes;
+    use crate::identity::NodeIdentity;
+    use proptest::prelude::*;
+
+    fn node(b: u8) -> NodeId {
+        NodeIdentity::from_seed([b; 32]).node_id()
+    }
+
+    fn json(item: &Item) -> String {
+        String::from_utf8(canonical_bytes(item).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn keys_sort_by_kind_then_key() {
+        let keys = [
+            ItemKey::Role(RoleName::new("a").unwrap()),
+            ItemKey::Role(RoleName::new("b").unwrap()),
+            ItemKey::Service(ServiceName::new("a").unwrap()),
+            ItemKey::Ban(node(1)),
+            ItemKey::Issuer(Issuer::new("https://a")),
+            ItemKey::Settings,
+        ];
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "{keys:?}");
+    }
+
+    #[test]
+    fn key_display() {
+        assert_eq!(
+            ItemKey::Role(RoleName::new("oncall").unwrap()).to_string(),
+            "role:oncall"
+        );
+        assert_eq!(
+            ItemKey::Issuer(Issuer::new("https://idp")).to_string(),
+            "issuer:https://idp"
+        );
+        assert_eq!(
+            ItemKey::Ban(node(1)).to_string(),
+            format!("ban:{}", node(1).hex())
+        );
+        assert_eq!(ItemKey::Settings.to_string(), "settings");
+    }
+
+    #[test]
+    fn known_encodings() {
+        let ban = Item::Ban {
+            key: node(1),
+            body: Ban { until: 5 },
+        };
+        assert_eq!(
+            json(&ban),
+            format!(
+                r#"{{"body":{{"until":5}},"key":"{}","kind":"ban"}}"#,
+                node(1).hex()
+            )
+        );
+        let settings = Item::Settings {
+            body: Settings::default(),
+        };
+        assert_eq!(
+            json(&settings),
+            r#"{"body":{"beat_secs":300,"fresh_secs":900,"freshness":"lenient"},"kind":"settings"}"#
+        );
+        let issuer = Item::Issuer {
+            key: Issuer::new("https://idp"),
+            body: IssuerConfig {
+                client_id: Audience::new("cli"),
+                audiences: vec![Audience::new("cli")],
+            },
+        };
+        assert_eq!(
+            json(&issuer),
+            r#"{"body":{"audiences":["cli"],"client_id":"cli"},"key":"https://idp","kind":"issuer"}"#
+        );
+        let role = Item::Role {
+            key: RoleName::new("staff").unwrap(),
+            body: vec![Matcher::new("https://idp")],
+        };
+        assert_eq!(
+            json(&role),
+            r#"{"body":[{"issuer":"https://idp"}],"key":"staff","kind":"role"}"#
+        );
+    }
+
+    #[test]
+    fn items_know_their_keys() {
+        let svc = Item::Service {
+            key: ServiceName::new("status").unwrap(),
+            body: Service {
+                description: String::new(),
+                allow: vec![],
+                hosts: vec![],
+                readers: vec![],
+            },
+        };
+        assert_eq!(
+            svc.key(),
+            ItemKey::Service(ServiceName::new("status").unwrap())
+        );
+        let settings = Item::Settings {
+            body: Settings::default(),
+        };
+        assert_eq!(settings.key(), ItemKey::Settings);
+    }
+
+    #[test]
+    fn unknown_fields_and_kinds_are_refused() {
+        for bad in [
+            r#"{"kind":"ban","key":"00","body":{"until":1}}"#,
+            r#"{"kind":"settings","body":{"beat_secs":1,"fresh_secs":1,"freshness":"lenient","x":1}}"#,
+            r#"{"kind":"settings","key":"k","body":{"beat_secs":1,"fresh_secs":1,"freshness":"lenient"}}"#,
+            r#"{"kind":"member","key":"x","body":{}}"#,
+            r#"{"kind":"settings","body":{"beat_secs":1,"fresh_secs":1,"freshness":"sloppy"}}"#,
+        ] {
+            assert!(serde_json::from_str::<Item>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn defaults() {
+        let s = Settings::default();
+        assert_eq!(s.freshness, FreshnessMode::Lenient);
+        assert_eq!(s.beat_secs, DEFAULT_BEAT_SECS);
+        assert_eq!(s.fresh_secs, DEFAULT_FRESH_SECS);
+    }
+
+    #[test]
+    fn a_ban_holds_through_until() {
+        let b = Ban { until: 100 };
+        assert!(b.holds(99));
+        assert!(b.holds(100));
+        assert!(!b.holds(101));
+    }
+
+    proptest! {
+        #[test]
+        fn items_round_trip(seed in any::<u8>(), until in any::<i64>(), strict in any::<bool>()) {
+            let items = [
+                Item::Ban { key: node(seed), body: Ban { until } },
+                Item::Settings {
+                    body: Settings {
+                        freshness: if strict { FreshnessMode::Strict } else { FreshnessMode::Lenient },
+                        ..Settings::default()
+                    },
+                },
+            ];
+            for item in items {
+                let back: Item = serde_json::from_slice(&canonical_bytes(&item).unwrap()).unwrap();
+                prop_assert_eq!(back, item);
+            }
+        }
+
+        #[test]
+        fn key_round_trips(seed in any::<u8>()) {
+            for key in [ItemKey::Ban(node(seed)), ItemKey::Settings] {
+                let back: ItemKey = serde_json::from_str(&serde_json::to_string(&key).unwrap()).unwrap();
+                prop_assert_eq!(back, key);
+            }
+        }
+    }
+}

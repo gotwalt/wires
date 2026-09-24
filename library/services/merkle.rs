@@ -148,4 +148,175 @@ impl ItemTree {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::identity::NodeIdentity;
+    use crate::item::Ban;
+    use proptest::prelude::*;
+
+    fn ban(b: u8, until: i64) -> Item {
+        Item::Ban {
+            key: NodeIdentity::from_seed([b; 32]).node_id(),
+            body: Ban { until },
+        }
+    }
+
+    /// `count` distinct items, their leaves, and the tree over them.
+    fn tree_of(count: u8) -> (Vec<Item>, ItemTree) {
+        let items: Vec<Item> = (0..count).map(|b| ban(b, i64::from(b))).collect();
+        let leaves = items.iter().map(|i| ItemHash::of(i).unwrap()).collect();
+        (items, ItemTree::new(leaves))
+    }
+
+    fn h(bytes: &[&[u8]]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        for b in bytes {
+            hasher.update(b);
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    #[test]
+    fn leaf_hash_is_domain_separated_canonical_json() {
+        let item = ban(1, 5);
+        let want = h(&[&[0], &canonical_bytes(&item).unwrap()]);
+        assert_eq!(ItemHash::of(&item).unwrap().0, want);
+    }
+
+    #[test]
+    fn known_shapes() {
+        assert_eq!(
+            ItemTree::new(vec![]).root().0,
+            *blake3::hash(b"").as_bytes()
+        );
+        assert!(ItemTree::new(vec![]).is_empty());
+        assert_eq!(ItemTree::new(vec![]).prove(0), None);
+
+        let (items, one) = tree_of(1);
+        assert_eq!(one.root().0, ItemHash::of(&items[0]).unwrap().0);
+        assert_eq!(one.prove(0).unwrap().path.hashes(), &[]);
+
+        // Three leaves: ((0, 1), 2); the odd leaf carries up unchanged.
+        let (items, three) = tree_of(3);
+        let l: Vec<[u8; 32]> = items.iter().map(|i| ItemHash::of(i).unwrap().0).collect();
+        let left = h(&[&[1], &l[0], &l[1]]);
+        assert_eq!(three.root().0, h(&[&[1], &left, &l[2]]));
+        assert_eq!(three.len(), 3);
+        assert_eq!(three.prove(2).unwrap().path.hashes(), &[ItemsRoot(left)]);
+        assert_eq!(
+            three.prove(0).unwrap().path.hashes(),
+            &[ItemsRoot(l[1]), ItemsRoot(l[2])]
+        );
+        assert_eq!(three.prove(3), None);
+    }
+
+    #[test]
+    fn a_leaf_does_not_pass_for_an_inner_node() {
+        // A two-leaf tree's root is not the leaf hash of the concatenated
+        // leaves: the prefixes differ.
+        let (items, two) = tree_of(2);
+        let l0 = ItemHash::of(&items[0]).unwrap().0;
+        let l1 = ItemHash::of(&items[1]).unwrap().0;
+        assert_ne!(two.root().0, h(&[&[0], &l0, &l1]));
+    }
+
+    #[test]
+    fn proof_paths_travel_as_one_base64_string() {
+        let (_, tree) = tree_of(5);
+        let proof = tree.prove(4).unwrap();
+        let text = serde_json::to_string(&proof).unwrap();
+        assert!(!text.contains('['), "{text}");
+        let back: InclusionProof = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, proof);
+        assert!(
+            ProofPath::try_from("AAAA".to_string()).is_err(),
+            "not whole hashes"
+        );
+        assert!(ProofPath::try_from("!".to_string()).is_err(), "not base64");
+        let too_deep = B64.encode(vec![0u8; 32 * (MAX_PROOF_DEPTH + 1)]);
+        assert!(ProofPath::try_from(too_deep).is_err());
+        assert_eq!(
+            ProofPath::try_from(String::new()).unwrap(),
+            ProofPath::default()
+        );
+    }
+
+    #[test]
+    fn a_proof_is_bound_to_its_position_and_tree() {
+        let (items, tree) = tree_of(6);
+        let proof = tree.prove(2).unwrap();
+        proof.verify(&items[2], tree.root(), 6).unwrap();
+        assert!(matches!(
+            proof.verify(&items[3], tree.root(), 6),
+            Err(Error::BadProof)
+        ));
+        let moved = InclusionProof {
+            index: 3,
+            ..proof.clone()
+        };
+        assert!(moved.verify(&items[2], tree.root(), 6).is_err());
+        assert!(proof.verify(&items[2], tree.root(), 7).is_err());
+        assert!(proof.verify(&items[2], tree.root(), 2).is_err());
+        let out_of_range = InclusionProof {
+            index: 6,
+            ..proof.clone()
+        };
+        assert!(out_of_range.verify(&items[2], tree.root(), 6).is_err());
+        let mut longer = proof.clone();
+        longer.path.0.push(tree.root());
+        assert!(longer.verify(&items[2], tree.root(), 6).is_err());
+        let mut shorter = proof;
+        shorter.path.0.pop();
+        assert!(shorter.verify(&items[2], tree.root(), 6).is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn every_item_proves_and_nothing_else_does(
+            count in 1u8..40,
+            pick in any::<proptest::sample::Index>(),
+            byte in 0usize..32,
+            step in any::<proptest::sample::Index>(),
+        ) {
+            let (items, tree) = tree_of(count);
+            let n = tree.len();
+            prop_assert_eq!(n, u64::from(count));
+            for (i, item) in items.iter().enumerate() {
+                let proof = tree.prove(i as u64).unwrap();
+                prop_assert!(proof.verify(item, tree.root(), n).is_ok());
+            }
+            let i = pick.index(items.len());
+            let proof = tree.prove(i as u64).unwrap();
+
+            // A tampered item fails.
+            let Item::Ban { key, body } = &items[i] else { unreachable!() };
+            let tampered = Item::Ban { key: *key, body: Ban { until: body.until + 1 } };
+            prop_assert!(proof.verify(&tampered, tree.root(), n).is_err());
+
+            // A tampered path fails.
+            if !proof.path.0.is_empty() {
+                let mut bad = proof.clone();
+                let s = step.index(bad.path.0.len());
+                bad.path.0[s].0[byte] ^= 1;
+                prop_assert!(bad.verify(&items[i], tree.root(), n).is_err());
+            }
+
+            // The same item under another tree (one more leaf) fails.
+            let (_, bigger) = tree_of(count + 1);
+            prop_assert!(proof.verify(&items[i], bigger.root(), n + 1).is_err());
+            prop_assert!(proof.verify(&items[i], bigger.root(), n).is_err());
+        }
+
+        #[test]
+        fn proof_paths_round_trip(hashes in proptest::collection::vec(any::<[u8; 32]>(), 0..20)) {
+            let path = ProofPath(hashes.into_iter().map(ItemsRoot).collect());
+            let back = ProofPath::try_from(String::from(path.clone())).unwrap();
+            prop_assert_eq!(back, path);
+        }
+
+        #[test]
+        fn decoding_any_string_never_panics(s in ".{0,200}") {
+            let _ = ProofPath::try_from(s);
+        }
+    }
+}

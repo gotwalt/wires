@@ -310,4 +310,272 @@ fn decode_frame<T: DeserializeOwned>(buf: &[u8], max: usize) -> Result<Option<(T
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::identity::NodeIdentity;
+    use crate::item::Ban;
+    use crate::signed_policy::fixtures::*;
+    use proptest::prelude::*;
+
+    fn badge() -> Membership {
+        Membership::mint(&root(), node(10), 0, i64::MAX).unwrap()
+    }
+
+    fn fresh(policy: &SignedPolicy) -> Fresh {
+        Fresh::sign(&NodeIdentity::from_seed([30u8; 32]), &policy.head, 0, 900).unwrap()
+    }
+
+    /// A body of `len` bytes behind its prefix.
+    fn raw(body: &[u8]) -> Vec<u8> {
+        let mut buf = (body.len() as u32).to_be_bytes().to_vec();
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    fn requests() -> Vec<DirectoryRequest> {
+        let signed = sample().sign(&root()).unwrap();
+        vec![
+            DirectoryRequest::Hello {
+                badge: badge(),
+                id_token: None,
+            },
+            DirectoryRequest::Hello {
+                badge: badge(),
+                id_token: Some(IdToken::new("a.b.c")),
+            },
+            DirectoryRequest::Publish {
+                head: signed.head.clone(),
+                items: signed.items,
+            },
+            DirectoryRequest::Head,
+            DirectoryRequest::Slice {
+                have: StateVersion(2),
+                roles: vec![role("oncall")],
+            },
+            DirectoryRequest::View {
+                have: StateVersion(0),
+                query: Some("orders".into()),
+            },
+            DirectoryRequest::View {
+                have: StateVersion(0),
+                query: None,
+            },
+            DirectoryRequest::Resolve {
+                service: name("status"),
+            },
+        ]
+    }
+
+    #[test]
+    fn requests_round_trip() {
+        for r in requests() {
+            let bytes = r.encode().unwrap();
+            assert_eq!(
+                DirectoryRequest::decode(&bytes).unwrap(),
+                Some((r.clone(), bytes.len()))
+            );
+            assert_eq!(
+                DirectoryRequest::decode(&bytes[..bytes.len() - 1]).unwrap(),
+                None
+            );
+            assert_eq!(DirectoryRequest::decode(&bytes[..3]).unwrap(), None);
+        }
+        assert_eq!(
+            DirectoryRequest::Head.encode().unwrap()[4..],
+            br#"{"type":"head"}"#[..]
+        );
+    }
+
+    #[test]
+    fn answers_and_subscription_frames_round_trip() {
+        let signed = sample().sign(&root()).unwrap();
+        let fresh = fresh(&signed);
+        let slice = signed.slice_for_host(node(10), &[]).unwrap();
+        let view = signed.view_for(Some(&who("alice@example.com"))).unwrap();
+        for a in [
+            DirectoryAnswer::Published {
+                version: StateVersion(3),
+            },
+            DirectoryAnswer::Head {
+                head: signed.head.clone(),
+                fresh: fresh.clone(),
+            },
+            DirectoryAnswer::Current {
+                fresh: fresh.clone(),
+            },
+            DirectoryAnswer::Slice {
+                slice: slice.clone(),
+                fresh: fresh.clone(),
+            },
+            DirectoryAnswer::View {
+                view: view.clone(),
+                fresh: fresh.clone(),
+            },
+            DirectoryAnswer::Denied {
+                reason: "banned".into(),
+            },
+        ] {
+            let bytes = a.encode().unwrap();
+            assert_eq!(
+                DirectoryAnswer::decode(&bytes).unwrap(),
+                Some((a, bytes.len()))
+            );
+        }
+        for f in [
+            SubFrame::Slice {
+                slice,
+                fresh: fresh.clone(),
+            },
+            SubFrame::View {
+                view,
+                fresh: fresh.clone(),
+            },
+            SubFrame::Replica {
+                policy: signed,
+                fresh: fresh.clone(),
+            },
+            SubFrame::Fresh { fresh },
+            SubFrame::Denied {
+                reason: "subscriber cap reached".into(),
+            },
+        ] {
+            let bytes = f.encode().unwrap();
+            assert_eq!(SubFrame::decode(&bytes).unwrap(), Some((f, bytes.len())));
+        }
+        for r in [
+            SubRequest::Hello {
+                badge: badge(),
+                id_token: Some(IdToken::new("a.b.c")),
+            },
+            SubRequest::Subscribe {
+                kind: SubscriptionKind::Slice,
+                have: StateVersion(1),
+                roles: vec![role("oncall")],
+            },
+            SubRequest::Subscribe {
+                kind: SubscriptionKind::Replica,
+                have: StateVersion(0),
+                roles: vec![],
+            },
+            SubRequest::Subscribe {
+                kind: SubscriptionKind::View,
+                have: StateVersion(0),
+                roles: vec![],
+            },
+        ] {
+            let bytes = r.encode().unwrap();
+            assert_eq!(SubRequest::decode(&bytes).unwrap(), Some((r, bytes.len())));
+        }
+    }
+
+    /// Only a publish may be large, and it announces itself; every other
+    /// request fits the small limit and never opens like a publish.
+    #[test]
+    fn only_publishes_are_large_and_they_announce_themselves() {
+        let mut p = sample();
+        for b in 0..200u8 {
+            p.bans
+                .insert(NodeIdentity::from_seed([b; 32]).node_id(), Ban { until: 1 });
+        }
+        let signed = p.sign(&root()).unwrap();
+        let publish = DirectoryRequest::Publish {
+            head: signed.head,
+            items: signed.items,
+        }
+        .encode()
+        .unwrap();
+        assert!(
+            publish.len() > MAX_SMALL_DIRECTORY_FRAME,
+            "{}",
+            publish.len()
+        );
+        assert!(publish[4..].starts_with(PUBLISH_BODY_PREFIX));
+        assert!(DirectoryRequest::decode(&publish).unwrap().is_some());
+        for r in requests() {
+            if matches!(r, DirectoryRequest::Publish { .. }) {
+                continue;
+            }
+            let bytes = r.encode().unwrap();
+            assert!(bytes.len() <= MAX_SMALL_DIRECTORY_FRAME, "{r:?}");
+            assert!(!bytes[4..].starts_with(PUBLISH_BODY_PREFIX), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn a_large_request_that_is_not_a_publish_is_refused_before_its_body() {
+        let body = format!(
+            r#"{{"type":"view","have":0,"query":"{}"}}"#,
+            "x".repeat(MAX_SMALL_DIRECTORY_FRAME)
+        );
+        let buf = raw(body.as_bytes());
+        // Refused from the first bytes of the body, not after reading it all.
+        assert!(DirectoryRequest::length(&buf[..4]).unwrap().is_none());
+        assert!(DirectoryRequest::length(&buf[..4 + PUBLISH_BODY_PREFIX.len()]).is_err());
+        assert!(DirectoryRequest::decode(&buf).is_err());
+        // A small one's length is known from the prefix alone.
+        let small = DirectoryRequest::Head.encode().unwrap();
+        assert_eq!(
+            DirectoryRequest::length(&small[..4]).unwrap(),
+            Some(small.len() - 4)
+        );
+    }
+
+    #[test]
+    fn oversized_prefixes_are_refused_early() {
+        let over = ((MAX_DIRECTORY_FRAME + 1) as u32).to_be_bytes();
+        assert!(DirectoryRequest::decode(&over).is_err());
+        assert!(DirectoryAnswer::decode(&over).is_err());
+        assert!(SubFrame::decode(&over).is_err());
+        let over_small = ((MAX_SMALL_DIRECTORY_FRAME + 1) as u32).to_be_bytes();
+        assert!(SubRequest::decode(&over_small).is_err());
+    }
+
+    #[test]
+    fn unknown_frames_and_fields_are_refused() {
+        for body in [
+            r#"{"type":"offer"}"#,
+            r#"{"type":"head","extra":1}"#,
+            r#"{"type":"slice","have":1}"#,
+            r#"{"type":"slice","have":1,"roles":[],"x":2}"#,
+            r#"{"type":"resolve","service":"Not A Name"}"#,
+        ] {
+            assert!(
+                DirectoryRequest::decode(&raw(body.as_bytes())).is_err(),
+                "{body}"
+            );
+        }
+        for body in [
+            r#"{"type":"subscribe","kind":"everything","have":0}"#,
+            r#"{"type":"subscribe","kind":"slice","have":0,"x":1}"#,
+        ] {
+            assert!(SubRequest::decode(&raw(body.as_bytes())).is_err(), "{body}");
+        }
+        assert!(DirectoryAnswer::decode(&raw(br#"{"type":"published"}"#)).is_err());
+    }
+
+    #[test]
+    fn the_alpns() {
+        assert_eq!(DIRECTORY_ALPN, b"wires/directory/1");
+        assert_eq!(DIRECTORY_SUB_ALPN, b"wires/directory-sub/1");
+    }
+
+    proptest! {
+        #[test]
+        fn decode_never_panics(data in proptest::collection::vec(any::<u8>(), 0..256)) {
+            let _ = DirectoryRequest::decode(&data);
+            let _ = DirectoryAnswer::decode(&data);
+            let _ = SubRequest::decode(&data);
+            let _ = SubFrame::decode(&data);
+        }
+
+        #[test]
+        fn slice_requests_round_trip(have in any::<u64>(), roles in proptest::collection::vec("[a-z]{1,8}", 0..4)) {
+            let r = DirectoryRequest::Slice {
+                have: StateVersion(have),
+                roles: roles.iter().map(|r| role(r)).collect(),
+            };
+            let bytes = r.encode().unwrap();
+            prop_assert_eq!(DirectoryRequest::decode(&bytes).unwrap(), Some((r, bytes.len())));
+        }
+    }
+}

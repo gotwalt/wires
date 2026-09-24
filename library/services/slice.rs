@@ -183,4 +183,135 @@ fn verify_items<'a>(
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::item::Ban;
+    use crate::signed_policy::SignedPolicy;
+    use crate::signed_policy::fixtures::*;
+
+    fn signed() -> SignedPolicy {
+        sample().sign(&root()).unwrap()
+    }
+
+    #[test]
+    fn slice_accessors() {
+        let slice = signed()
+            .slice_for_host(node(10), &[role("oncall")])
+            .unwrap();
+        slice.verify(root().node_id()).unwrap();
+        assert!(slice.service(&name("orders-db")).is_some());
+        assert!(slice.service(&name("deploy")).is_none());
+        assert_eq!(slice.role(&role("staff")), Some(&[Matcher::new(ISS)][..]));
+        assert!(slice.role(&role("oncall")).is_some());
+        assert!(slice.issuer(&Issuer::new(ISS)).is_some());
+        assert!(slice.issuer(&Issuer::new("https://other")).is_none());
+        let alice = who("alice@example.com");
+        assert!(slice.role_admits(&role("analyst"), Some(&alice)));
+        assert!(!slice.role_admits(&role("analyst"), None));
+        assert!(!slice.role_admits(&role("ghost"), Some(&alice)));
+        assert!(slice.is_banned(node(20), 500));
+        assert!(!slice.is_banned(node(20), 501));
+        assert!(!slice.is_banned(node(21), 0));
+        assert_eq!(slice.settings(), Some(&Settings::default()));
+    }
+
+    #[test]
+    fn a_tampered_slice_is_refused() {
+        let good = signed().slice_for_host(node(10), &[]).unwrap();
+
+        let mut t = good.clone();
+        let Some(Item::Ban { body, .. }) = t
+            .items
+            .iter_mut()
+            .map(|p| &mut p.item)
+            .find(|i| matches!(i, Item::Ban { .. }))
+        else {
+            unreachable!()
+        };
+        *body = Ban { until: i64::MAX };
+        assert!(matches!(t.verify(root().node_id()), Err(Error::BadProof)));
+
+        let mut t = good.clone();
+        t.items.retain(|p| !matches!(p.item, Item::Settings { .. }));
+        assert!(matches!(
+            t.verify(root().node_id()),
+            Err(Error::InvalidPolicy(_))
+        ));
+
+        let mut t = good.clone();
+        let first = t.items[0].clone();
+        t.items.push(first);
+        assert!(matches!(
+            t.verify(root().node_id()),
+            Err(Error::InvalidPolicy(_))
+        ));
+
+        // A proof moved onto another item.
+        let mut t = good.clone();
+        t.items[0].proof = good.items[1].proof.clone();
+        assert!(t.verify(root().node_id()).is_err());
+
+        assert!(good.verify(node(9)).is_err(), "another root");
+    }
+
+    #[test]
+    fn a_view_carries_only_marked_services() {
+        let s = signed();
+        let good = s.view_for(Some(&who("carol@example.com"))).unwrap();
+        good.verify(root().node_id()).unwrap();
+        assert!(
+            good.entry(&name("locked"))
+                .is_some_and(|e| e.read && !e.call)
+        );
+        assert!(good.entry(&name("deploy")).is_none());
+
+        let mut t = good.clone();
+        t.entries[0].call = false;
+        t.entries[0].read = false;
+        assert!(matches!(
+            t.verify(root().node_id()),
+            Err(Error::InvalidPolicy(_))
+        ));
+
+        // A role item smuggled in as an entry, with a valid proof.
+        let slice = s.slice_for_host(node(10), &[]).unwrap();
+        let mut t = good.clone();
+        t.entries.push(ViewEntry {
+            item: slice.items[0].clone(),
+            call: true,
+            read: false,
+        });
+        assert!(matches!(
+            t.verify(root().node_id()),
+            Err(Error::InvalidPolicy(_))
+        ));
+        assert!(t.entries.last().unwrap().service().is_none());
+
+        let mut t = good.clone();
+        let first = t.entries[0].clone();
+        t.entries.push(first);
+        assert!(t.verify(root().node_id()).is_err());
+    }
+
+    #[test]
+    fn search_narrows_a_view_and_keeps_it_valid() {
+        let mut p = sample();
+        p.services.get_mut(&name("status")).unwrap().description =
+            "Uptime of the ORDERS stack".into();
+        let s = p.sign(&root()).unwrap();
+        let mut view = s.view_for(Some(&who("alice@example.com"))).unwrap();
+        view.retain_matching("orders");
+        let names: Vec<_> = view
+            .entries
+            .iter()
+            .map(|e| e.service().unwrap().0.to_string())
+            .collect();
+        assert_eq!(names, vec!["orders-db", "status"]);
+        view.retain_matching("DB");
+        assert_eq!(view.entries.len(), 1);
+        view.verify(root().node_id()).unwrap();
+        view.retain_matching("nothing matches this");
+        assert!(view.entries.is_empty());
+        view.verify(root().node_id()).unwrap();
+    }
+}
