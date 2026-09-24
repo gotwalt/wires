@@ -23,9 +23,13 @@
 //! then the others in the head's order, backing off from 1 s to the beat
 //! (at most 30 s) while none answers. A directory whose whole policy can't
 //! be taken either (expired, say) is passed over: the next round, after a
-//! pause, starts at the directory after it. The list is re-read from the held
-//! policy each time, so a directory the admin adds is followed without a
-//! restart.
+//! pause, starts at the directory after it. So is one that answers `denied`,
+//! at once or ending the stream (this host is not admitted, or may no
+//! longer hold the whole policy; the directory is no longer one, or busy):
+//! the follower tries the next directory at once, and starts its next round
+//! after the one that refused; a round in which every directory refused
+//! waits the growing pause. The list is re-read from the held policy each
+//! time, so a directory the admin adds is followed without a restart.
 //!
 //! A host that is itself a directory also vouches for its own head
 //! ([`vouch_from_local`]); its directory's replica loop keeps its copy in
@@ -74,6 +78,8 @@ pub(crate) struct FollowStats {
     /// Subscriptions started over with `have: 0` after a frame that
     /// couldn't be taken.
     pub(crate) resyncs: AtomicU64,
+    /// `denied` answers, at once or ending a stream.
+    pub(crate) denials: AtomicU64,
 }
 
 /// A running host's subscription to its directories. See the module docs.
@@ -95,13 +101,17 @@ pub(crate) struct Follower {
     pub(crate) stats: Arc<FollowStats>,
 }
 
-/// How one subscription ended, after the directory answered.
+/// How one subscription ended.
 #[derive(Debug)]
 enum Ended {
-    /// The stream closed or went silent: reconnect.
+    /// The stream closed or went silent, after the directory answered:
+    /// reconnect.
     Closed,
     /// A frame couldn't be taken: subscribe again with `have: 0`.
     Resync(anyhow::Error),
+    /// The directory answered `denied`, at once or ending the stream: pass
+    /// it over.
+    Denied(String),
 }
 
 impl Follower {
@@ -164,6 +174,16 @@ impl Follower {
                         whole = false;
                         answered = true;
                     }
+                    Ok(Ended::Denied(reason)) => {
+                        tracing::info!(
+                            directory = %dir.hex(),
+                            "policy subscription refused: {reason}; trying the next directory"
+                        );
+                        // Not asked first again: the next round starts
+                        // after it, and this one goes on at once.
+                        last = next_after(&order, dir);
+                        continue;
+                    }
                     Ok(Ended::Resync(e)) => {
                         self.stats.resyncs.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
@@ -201,7 +221,7 @@ impl Follower {
     }
 
     /// One subscription to `dir` from `have`, until it ends. `Err`: the
-    /// directory never answered (unreachable, refused, or closed at once).
+    /// directory never answered (unreachable, or closed at once).
     async fn subscribe_once(&self, dir: NodeId, have: StateVersion) -> Result<Ended> {
         let addr = transport::endpoint_addr(&dir, &[], None)?;
         let conn = tokio::time::timeout(
@@ -246,11 +266,7 @@ impl Follower {
             };
             self.count(&frame);
             if let SubFrame::Denied { reason } = frame {
-                if answered {
-                    tracing::info!(directory = %dir.hex(), "policy subscription ended: {reason}");
-                    return Ok(Ended::Closed);
-                }
-                bail!("refused: {reason}");
+                return Ok(Ended::Denied(reason));
             }
             if !answered {
                 tracing::info!(directory = %dir.hex(), have = have.0, "following the policy");
@@ -280,6 +296,7 @@ impl Follower {
             SubFrame::Policy { .. } => s.wholes.fetch_add(1, Ordering::Relaxed),
             SubFrame::PolicyUpdate { .. } => s.updates.fetch_add(1, Ordering::Relaxed),
             SubFrame::Fresh { .. } => s.beats.fetch_add(1, Ordering::Relaxed),
+            SubFrame::Denied { .. } => s.denials.fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
     }

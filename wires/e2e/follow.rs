@@ -15,6 +15,8 @@
 //! - [`a_host_restarted_from_disk_serves_before_any_directory_answers`]
 //! - [`a_directory_serving_an_unadoptable_policy_is_passed_over`]
 //! - [`a_publish_from_a_stale_copy_is_not_delivered`]
+//! - [`a_directory_that_ends_the_subscription_with_denied_is_passed_over`]
+//! - [`a_host_every_directory_refuses_backs_off`]
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -92,6 +94,19 @@ impl World {
         bans: u8,
         not_after: i64,
     ) -> SignedPolicy {
+        self.policy_edited(version, settings, bans, not_after, |_| {})
+    }
+
+    /// [`policy_until`](Self::policy_until), changed by `edit` before it is
+    /// signed.
+    fn policy_edited(
+        &self,
+        version: u64,
+        settings: Settings,
+        bans: u8,
+        not_after: i64,
+        edit: impl FnOnce(&mut Policy),
+    ) -> SignedPolicy {
         let mut p = Policy::new(self.root.node_id());
         p.version = StateVersion(version);
         p.issued = now_unix();
@@ -117,6 +132,7 @@ impl World {
         for b in 0..bans {
             p.ban(NodeIdentity::from_seed([100 + b; 32]).node_id(), i64::MAX);
         }
+        edit(&mut p);
         crate::testutil::trust_role_issuers(&mut p);
         let mut last = self.last.lock().unwrap();
         let signed = match last.as_ref() {
@@ -549,6 +565,67 @@ async fn a_publish_from_a_stale_copy_is_not_delivered() {
     assert!(report.newer.is_empty());
     admin.close().await;
     d.stop().await;
+}
+
+/// A directory that ends the host's subscription with `denied` (here: the
+/// new head no longer lists it) is passed over at once: the host follows
+/// the next directory and takes the new head from it, and doesn't ask the
+/// one that refused again.
+#[tokio::test]
+async fn a_directory_that_ends_the_subscription_with_denied_is_passed_over() {
+    let w = World::new().await;
+    let v1 = w.policy(1, Settings::default(), 0);
+    let first = w.directory(0, &w.keystore(&w.dirs[0], &v1)).await;
+    let second = w.directory(1, &w.keystore(&w.dirs[1], &v1)).await;
+    let h = w.follower(0, &w.keystore(&w.hosts[0], &v1)).await;
+    h.until(StateVersion(1)).await;
+    let beats = |d: &Dir| d.dir.snapshot().unwrap().fresh.is_some();
+    assert!(beats(&first) && beats(&second));
+
+    // Version 2 lists only the second directory; both hold it.
+    let second_only = vec![w.dirs[1].node_id()];
+    let v2 = w.policy_edited(2, Settings::default(), 0, i64::MAX, |p| {
+        p.directories = second_only.clone();
+    });
+    let now = now_unix();
+    assert!(first.dir.accept(&v2, now).unwrap());
+    assert!(second.dir.accept(&v2, now).unwrap());
+    h.until(StateVersion(2)).await;
+    // Past the pause a retry of the first directory would have waited.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(h.stats.denials.load(Ordering::SeqCst), 1, "asked once");
+    h.task.abort();
+    first.stop().await;
+    second.stop().await;
+}
+
+/// A host every directory refuses (here: banned) backs off between rounds
+/// (1 s, 2 s, …): a handful of refusals over seconds, never a tight loop.
+#[tokio::test]
+async fn a_host_every_directory_refuses_backs_off() {
+    let w = World::new().await;
+    let v1 = w.policy(1, Settings::default(), 0);
+    let first = w.directory(0, &w.keystore(&w.dirs[0], &v1)).await;
+    let second = w.directory(1, &w.keystore(&w.dirs[1], &v1)).await;
+    let h = w.follower(0, &w.keystore(&w.hosts[0], &v1)).await;
+    h.until(StateVersion(1)).await;
+    let host = w.hosts[0].node_id();
+    let banned = w.policy_edited(2, Settings::default(), 0, i64::MAX, |p| {
+        for svc in p.services.values_mut() {
+            svc.hosts.retain(|h| *h != host);
+        }
+        p.ban(host, i64::MAX);
+    });
+    let now = now_unix();
+    assert!(first.dir.accept(&banned, now).unwrap());
+    assert!(second.dir.accept(&banned, now).unwrap());
+    tokio::time::sleep(Duration::from_millis(4_500)).await;
+    // Rounds at about 0, 1 and 3 s: two refusals each.
+    let denials = h.stats.denials.load(Ordering::SeqCst);
+    assert!((2..=8).contains(&denials), "{denials} refusals in 4.5 s");
+    h.task.abort();
+    first.stop().await;
+    second.stop().await;
 }
 
 /// A host restarted with its policy on disk serves at once, with no
