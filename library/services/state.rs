@@ -6,7 +6,7 @@
 //! signature. It is the thing every node holds: `wires join` installs it,
 //! the admin pushes each new version to the hosts, and other members pull a
 //! newer copy from a host. Nothing in it is secret: every member holds the
-//! whole document (card 29 replaces that with per-caller views), and it is
+//! whole document (cards 35–37 replace that with a directory; `docs/fabric.md`), and it is
 //! checked offline.
 //!
 //! - **Signed bytes:** [`STATE_CONTEXT`] followed by the canonical JSON of

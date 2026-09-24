@@ -147,7 +147,8 @@ It's a prototype (see the note at the top). The main limits:
 
 - Every member holds the whole signed registry (every member's key, every
   role's matchers, every service), and it grows with the number of members.
-  The redesign is [card 29](docs/board/backlog/29-identity-and-scale.md).
+  The redesign moves the registry to directory nodes, so each machine holds
+  only what it uses ([docs/fabric.md](docs/fabric.md), cards 35–37).
 - Memberships and the registry expire (30 days by default) and don't renew
   on their own yet.
 - A host can withhold or truncate its own log; tampering and gaps are

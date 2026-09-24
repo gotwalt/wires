@@ -70,7 +70,7 @@ Checking an inbox on a loop costs exactly what polling costs; the saving comes o
 ## Honest limits
 
 - **Joining an organization is still a hand-issued invite.** Joining by domain ("`wires join acmecorp.com`") is an open question, not yet designed.
-- **Every member holds the whole signed list** (member keys, role matchers, service names): the org chart, growing with the number of members. The redesign (machine badges, per-caller views, day-passes for headless agents) is agreed and next: [card 29](board/backlog/29-identity-and-scale.md).
+- **Every member holds the whole signed list** (member keys, role matchers, service names): the org chart, growing with the number of members. The redesign is agreed and next: machine badges, and directory nodes that give each host and caller only its own part ([fabric.md](fabric.md); cards 35–37), then day-passes for headless agents (card 29).
 - **Callbacks only to the agent and person that made the call**, and an `inbox` tool for MCP clients: designed, parked ([card 31](board/backlog/31-inbox-delivery.md)).
 - **A host can withhold or truncate its own log.** Tampering and gaps are detectable only against a copy a reader holds.
 

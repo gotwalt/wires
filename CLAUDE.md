@@ -23,8 +23,8 @@ log. Agents can't observe each other's work: the isolation boundary is the
 verified person (IdP principal), so a caller sees its own person's records,
 and the readers the registry names see a service's records in full with
 `wires watch`, for logging and compliance. Nothing is broadcast; what every
-member still learns about the others (the whole signed state) is card 29's
-to fix. `wires call` is the CLI-native path and the source of the token
+member still learns about the others (the whole signed state) is cards
+35–37's to fix, by moving the policy to directory nodes (`docs/fabric.md`). `wires call` is the CLI-native path and the source of the token
 savings; `wires mcp` (stdio) and `wires gateway` (remote, e.g. Claude.ai) serve
 the same services as MCP, so wires works in the clients people already use
 for remote tool calling, with the same identity, registry and record (MCP
@@ -44,7 +44,9 @@ rebuttal test in `docs/storytelling.md` §1.
 The pitch lives in `README.md`; usage (roles, walkthrough, reference) in `docs/usage.md`. Deployment and testing patterns live in
 `docs/deployment.md` and `docs/testing.md`. The spec for the code that runs
 (membership, the signed state and its sync, the session handshake and gate,
-push, the call log and record stream, hints) is `docs/protocol.md`. The
+push, the call log and record stream, hints) is `docs/protocol.md`; the target
+architecture (how the fabric is hosted, persisted and synced, via a directory)
+is `docs/fabric.md`. The
 non-negotiables and kill criteria are at the top of `docs/board/README.md`.
 **Git history is the archive:** outdated docs are deleted, not moved aside.
 The product summary is `docs/executive-summary.md`. The pre-restart prototype is tagged `archive/poc-2026-05`: reference

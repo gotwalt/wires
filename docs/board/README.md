@@ -12,7 +12,7 @@ for logging and compliance.
 of the host's keystore, card 28, though it still runs as the host's user until
 [card 32](backlog/32-service-sandbox-OPEN.md)); offline-verifiable membership
 (no auth-server round-trip; removal is a root-signed ban that takes effect at
-each host's next dial, decided 2026-09-24, built by card 29; until then,
+each host's next dial, decided 2026-09-24, built by card 35; until then,
 removal by omission); **the premise
 outranks the docs, and the docs outrank the code** (README and docs first,
 code second: a disagreement is a code bug unless the doc breaks the
@@ -53,8 +53,9 @@ honest line from someone who runs remote MCP servers behind Tailscale today.
 | **host** | how it implements its assigned services; trusted IdPs; stricter local rules (`host.json`) | `serve host.json`, `push` |
 | **caller** | — runs services by name; MCP (stdio, or the remote gateway) so wires works in the clients people already use | `id`, `join`, `login`, `services`, `call`, `mcp`, `gateway`, `inbox` |
 | **reader** | — any member: a service's `readers` role reads all its records, in full; everyone else their own person's (same issuer and subject, from any node) | `watch` |
+| **directory** (cards 35–37) | nothing: it holds the newest root-signed policy, signs its freshness, and gives each host its slice and each caller its view; it never decides a call | `serve` (when the policy lists it), `directory` |
 
-The IdP is *bound* at the caller (`login`) and *verified* at the host, against the admin-signed state it holds. Every role needs a verified identity (there is no built-in `member` role), and every matcher names its issuer. The admin's invite is the only thing handed out of band; every later state is pushed by key to the hosts, and other members pull it from a host (or get it in a call's handshake). Nothing is broadcast, but every member still holds the whole state: card 29.
+The IdP is *bound* at the caller (`login`) and *verified* at the host, against the admin-signed state it holds. Every role needs a verified identity (there is no built-in `member` role), and every matcher names its issuer. The admin's invite is the only thing handed out of band; every later state is pushed by key to the hosts, and other members pull it from a host (or get it in a call's handshake). Nothing is broadcast, but every member still holds the whole state until cards 35–37 move the policy to a directory ([fabric.md](../fabric.md) is the target architecture: how the fabric is hosted, persisted and kept in sync).
 
 ## The demo we're building toward
 
@@ -70,13 +71,17 @@ Open cards only; finished cards are in [done/](done/).
 | Card | Lane | Depends on | Status | Summary |
 |---|---|---|---|---|
 | [08](doing/08-demo-two-machine.md) | E | — | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent, recording |
-| [29](backlog/29-identity-and-scale.md) | I2 | 28 | backlog (next) | **Identity and scale (design agreed):** machine badges + banned list, `login --for` + day-pass, per-caller views served by hosts, transparency-log checkpoints |
+| [35](backlog/35-badges-and-bans.md) | D1 | 28 | backlog (next) | **Badges and bans:** members leave the signed state; a node is admitted by its root-signed badge, removal is a ban, `invite` is no edit |
+| [36](backlog/36-directory.md) | D2 | 35 | backlog | **The directory:** a mode on its own ALPNs, backed by redb; root-signed head over proved items; freshness timestamps; hosts subscribe to their slice; retires state sync |
+| [37](backlog/37-caller-views.md) | D3 | 36 | backlog | **Caller views:** each caller holds only the services it may use; search; `HelloAck` carries the head version; `mcp`/gateway subscribe; ~800 B invites |
+| [29](backlog/29-person-identity.md) | I2 | 36 | backlog | **Person identity for headless agents:** `login --for`, day-passes issued by a directory |
 | [31](backlog/31-inbox-delivery.md) | P3 | 28, 30 | designed, parked | **Inbox delivery:** callbacks go to the caller that asked, through the call's push capability only; open questions on the card |
 | [32](backlog/32-service-sandbox-OPEN.md) | — | — | open question | **Don't build:** run each service call in a rootless microVM so a service can't reach the host's keys |
-| [18](backlog/18-front-door-OPEN.md) | — | — | open question | **Don't build:** apex key, invites, `wires join <domain>` |
-| [09](backlog/09-witness.md) | stretch | — | backlog | Witness: a reader that follows hosts' call logs and exports signed checkpoints, so a truncation or rewrite contradicts a copy the host doesn't control |
+| [18](backlog/18-front-door-OPEN.md) | — | — | open question | **Don't build:** front door, `wires join <domain>` (now pointing at the directory) |
+| [09](backlog/09-witness.md) | R | 36 | backlog | **Transparency-log records:** Merkle call logs with checkpoints the directory witnesses; no hidden links for non-readers |
 
-**Order:** 08 (recording; re-record the README demo) → 29 (identity and scale). 31 and
+**Order:** 08 (recording; re-record the README demo) → 35 → 36 → 37 (the directory; the
+why is [`bench/state-scale/REPORT.md`](../../bench/state-scale/REPORT.md)) → 29 → 09. 31 and
 32 are not scheduled.
 
 ## Rules for workers

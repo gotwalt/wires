@@ -30,7 +30,7 @@ Every role joins the same way: `wires id`, then `wires join <token>` with the ad
 | **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. A service pushes only through its call's capability, to that call's caller. | The host, at send, delivery and fetch: a member of the state, in a `push.allow` role. |
 | **Removal** | A new state, pushed to the hosts. No shared key exists, so there is nothing to rotate. | Each host that has the new state, on the removed member's next call or fetch there. |
 
-Nothing is broadcast: a member that takes part in no call receives no traffic about other members' calls. What every member does learn is the whole signed state: every member id, role matcher and service ([card 29](board/backlog/29-identity-and-scale.md) replaces it with per-caller views).
+Nothing is broadcast: a member that takes part in no call receives no traffic about other members' calls. What every member does learn is the whole signed state: every member id, role matcher and service (cards [35](board/backlog/35-badges-and-bans.md)–[37](board/backlog/37-caller-views.md) replace it with a directory and per-caller views: [fabric.md](fabric.md)).
 
 ## Walkthrough
 
@@ -434,7 +434,7 @@ To make `wires` the boundary, use a structural setup:
 
 ## Known trade-offs
 
-- **Known and accepted until [card 29](board/backlog/29-identity-and-scale.md)**:
+- **Known and accepted until cards [35](board/backlog/35-badges-and-bans.md)–[37](board/backlog/37-caller-views.md)** (the directory; [fabric.md](fabric.md)), [09](board/backlog/09-witness.md) and [29](board/backlog/29-person-identity.md):
   - **Every member holds the whole state**: member and host node ids, role
     matchers (often people's emails), service names and descriptions. It is
     signed, not secret: every agent's machine holds the org chart, and the
@@ -486,13 +486,16 @@ To make `wires` the boundary, use a structural setup:
 - **The recorded two-machine demo** with real Google sign-in and Claude Code
   as the agent ([card 08](board/doing/08-demo-two-machine.md);
   script in [docs/demo.md](demo.md)).
-- Renewal of memberships and the state; `wires mcp` noticing a new state
-  without a restart; a witness that holds copies of hosts' logs
-  ([card 09](board/backlog/09-witness.md)).
-- **Identity and scale** ([card 29](board/backlog/29-identity-and-scale.md),
-  design agreed): machine badges plus a ban list instead of a member list,
-  `login --for` and day-passes for headless agents, per-caller views instead
-  of the whole state, and transparency-log checkpoints for the records.
+- **A directory** (cards [35](board/backlog/35-badges-and-bans.md),
+  [36](board/backlog/36-directory.md), [37](board/backlog/37-caller-views.md);
+  the architecture is [fabric.md](fabric.md)): machine badges plus a ban list
+  instead of a member list; the policy held by directory nodes, which give each
+  host its slice and each caller its view, with search; `wires mcp` noticing a
+  new policy without a restart.
+- `login --for` and day-passes for headless agents
+  ([card 29](board/backlog/29-person-identity.md)); transparency-log
+  checkpoints witnessed by the directory ([card 09](board/backlog/09-witness.md));
+  renewal of badges (open on card 36).
 - **Callbacks to the caller that asked**: a callback goes only to the node
   and person that made the call, in every client. Designed, parked
   ([card 31](board/backlog/31-inbox-delivery.md)).

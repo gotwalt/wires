@@ -329,6 +329,6 @@ exit code.
   host by the readers the registry names, in full; everyone else sees only
   their own person's.
 - "Nothing about other people reaches the agent." Every member holds the
-  whole signed list (card 29 fixes that).
+  whole signed list (cards 35–37 fix that).
 - "Join by domain." It isn't built (card 18).
 

@@ -11,7 +11,8 @@ names as readers observe calls, in full, for logging and compliance. If the code
 this document, the code is the bug, unless this document breaks the premise, in which case both
 are fixed. What the premise needs and the code doesn't do yet is listed in §10.
 
-Usage, roles and the demo are in [usage.md](usage.md), [the board](board/README.md) and
+The target architecture (how the fabric is hosted, persisted and kept in sync, once a directory
+holds the policy) is [fabric.md](fabric.md). Usage, roles and the demo are in [usage.md](usage.md), [the board](board/README.md) and
 [demo.md](demo.md). Deployment and testing are in [deployment.md](deployment.md) and
 [testing.md](testing.md).
 
@@ -90,7 +91,8 @@ SignedState { state, alg, sig }
   every service: that is `wires services`, evaluated locally with no network.
 
 The state is not secret. Every member holds all of it: member and host node ids, role matchers,
-service names and descriptions (card 29 replaces this with per-caller views).
+service names and descriptions (cards 35–37 replace this with badges, a directory and per-caller
+views; the target is [fabric.md](fabric.md)).
 
 ### Admin surface
 
@@ -265,7 +267,7 @@ membership with `check_inclusion(ack, own fabric, authenticated host id, now)` a
 `newer_state` (`adopt_if_newer`); if that state fails to verify, or the state it now holds no
 longer assigns the service to that host, the call stops there (exit 1, no stdin sent). The host
 already has the `Invoke` (argv) by then: a removed host that still holds a valid membership sees
-the argv; card 29's ban list closes that.
+the argv; card 35's ban list closes that.
 
 Exit codes: `Denied` → **77**, nothing on stdout. Local or transport failure (including the checks
 above) → 1. Otherwise the remote exit code, **except that a remote 77 is reported as 1** with a
@@ -482,9 +484,10 @@ ones that bound this spec:
 
 - Nothing renews memberships or the state (both default 30 days); an expired state admits nobody,
   is served by nobody, and is dialed from by no caller.
-- Until [card 29](board/backlog/29-identity-and-scale.md): every member holds the whole state; a
-  removed host whose membership hasn't expired still sees a call's argv; hidden record links (§8)
-  tell a non-reader how many entries a host logged, and when.
+- Until cards [35](board/backlog/35-badges-and-bans.md)–[37](board/backlog/37-caller-views.md)
+  ([fabric.md](fabric.md)): every member holds the whole state; a removed host whose membership
+  hasn't expired still sees a call's argv. Until [card 09](board/backlog/09-witness.md): hidden
+  record links (§8) tell a non-reader how many entries a host logged, and when.
 - A host knows a caller's identity only once the caller presented its token to that host.
 - A host can withhold or truncate its own log (§8).
 - One network per keystore.
