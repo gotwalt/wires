@@ -17,8 +17,12 @@ COPY wires ./wires
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p wires \
-    && cp target/release/wires /usr/local/bin/wires
+    && cp target/release/wires /usr/local/bin/wires \
+    && mkdir -p /out/data
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /usr/local/bin/wires /usr/local/bin/wires
+# An empty keystore mount point owned by the runtime user: a fresh named
+# volume mounted here (deploy/gateway) starts out writable by it.
+COPY --from=build --chown=nonroot:nonroot /out/data /data
 ENTRYPOINT ["/usr/local/bin/wires"]
