@@ -5,13 +5,13 @@
 //! (`$WIRES_HOME/inbox/`, `0700`) one of two ways:
 //!
 //! - **fetched** by `wires inbox`: a bounded catch-up from every host of the
-//!   services this node may call (from its signed state), after which the
+//!   services this node may call (from its signed policy), after which the
 //!   host forgets what was acknowledged. The fetch presents this node's ID
 //!   token (`wires login`), which is how a host learns who it is for pushes
 //!   addressed to a role;
 //! - **pushed** while `wires inbox --wait` runs: it serves the inbox ALPN
 //!   ([`INBOX_ALPN`]) and accepts deliveries ([`InboxReceiver`]) from members
-//!   the signed state names as hosts, besides long-polling each host.
+//!   the signed policy names as hosts, besides long-polling each host.
 //!
 //! `wires inbox` then prints what is unread — one line per message, or
 //! `--json` — and marks it read. `--wait` blocks until a message arrives
@@ -459,7 +459,7 @@ static STRANGERS: transport::Throttle = transport::Throttle::new();
 /// The inbox ALPN on a waiting caller: accepts deliveries from hosts.
 ///
 /// A delivery is accepted only from a peer whose badge proves it is in this
-/// network and that this node's **signed state names as a host**, which it
+/// network and that this node's **signed policy names as a host**, which it
 /// doesn't ban (re-read per delivery). Each message must be from that peer
 /// and to this node.
 #[derive(Clone)]
@@ -468,7 +468,7 @@ pub(crate) struct InboxReceiver {
     pub(crate) me: NodeId,
     /// The fabric root memberships and the state must chain to.
     pub(crate) fabric: NodeId,
-    /// Where this node's signed state is.
+    /// Where this node's signed policy is.
     pub(crate) keystore: Arc<Keystore>,
     /// Where messages go.
     pub(crate) mailbox: Mailbox,
@@ -484,7 +484,7 @@ impl std::fmt::Debug for InboxReceiver {
 
 impl InboxReceiver {
     /// Whether `peer` may deliver here: its badge verifies, and it is a host
-    /// in this node's signed state, not banned ([`library::Policy::is_host`]). `Err` is why not, for this node's trace only: the peer
+    /// in this node's signed policy, not banned ([`library::Policy::is_host`]). `Err` is why not, for this node's trace only: the peer
     /// hears just [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED).
     pub(crate) fn admit(
         &self,
@@ -496,10 +496,10 @@ impl InboxReceiver {
             .map_err(|e| format!("membership rejected: {e}"))?;
         let state = crate::policy::store::read(&self.keystore, self.fabric)
             .map_err(|e| format!("{e:#}"))?
-            .ok_or("this node holds no signed state")?;
+            .ok_or("this node holds no signed policy")?;
         if !state.policy.is_host(peer) {
             return Err(format!(
-                "not a host in the signed state (version {}); this inbox takes pushes from \
+                "not a host in the signed policy (version {}); this inbox takes pushes from \
                  hosts only",
                 state.version().0
             ));
@@ -818,7 +818,7 @@ async fn read_loop(
 }
 
 /// A fetcher: this node's endpoint, the hosts of every service it may call
-/// (from its signed state; no network read), and its `Hello`.
+/// (from its signed policy; no network read), and its `Hello`.
 async fn cold_fetcher(
     ks: &Keystore,
     node: &NodeIdentity,

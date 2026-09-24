@@ -10,7 +10,7 @@
 //!    consent page naming the client. Continuing sends the browser to the
 //!    IdP (Google) with `nonce` = hash of the gateway's node key.
 //! 4. `/oauth/callback` redeems Google's code, verifies the ID token as a
-//!    claim for the gateway's node, and refuses anyone the signed state
+//!    claim for the gateway's node, and refuses anyone the signed policy
 //!    lets call nothing through the gateway. Otherwise it redirects to the
 //!    client with a one-time code, its `state`, and `iss` (RFC 9207).
 //! 5. `/token` redeems the code (client, redirect URI, PKCE verifier and
@@ -455,10 +455,10 @@ pub(crate) async fn callback<B: Backend>(
         }
         Ok((grants, _)) => tracing::info!("gateway: {who} signed in ({} services)", grants.len()),
         Err(e) => {
-            tracing::warn!("gateway: no usable signed state: {e:#}");
+            tracing::warn!("gateway: no usable signed policy: {e:#}");
             return back(
                 "temporarily_unavailable",
-                "the gateway holds no usable signed state",
+                "the gateway holds no usable signed policy",
             );
         }
     }

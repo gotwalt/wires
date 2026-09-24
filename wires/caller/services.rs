@@ -1,5 +1,5 @@
 //! `wires services` (card 27, lane **27b**): the services this caller may
-//! call, evaluated **locally** against its signed state and its own verified
+//! call, evaluated **locally** against its signed policy and its own verified
 //! identity; no network, no broadcast. Services it can't call are not shown.
 //!
 //! ```text

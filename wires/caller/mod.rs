@@ -1,7 +1,7 @@
 //! The **caller** role: an agent or a person running remote CLIs.
 //!
 //! The caller binds its node key to an IdP identity (`wires login`), lists
-//! the services the signed state lets it call (`wires services`), and runs
+//! the services the signed policy lets it call (`wires services`), and runs
 //! them by name (`wires call`, the CLI-native path and the source of the
 //! token savings; `wires mcp`, the same services as MCP tools over stdio, so
 //! wires works in the MCP clients people already use).

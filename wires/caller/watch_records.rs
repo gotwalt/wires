@@ -1,13 +1,13 @@
 //! `wires watch [<service>…] [--mine] [--json]` (card 26b): stream call
 //! records from the hosts that hold them.
 //!
-//! The service's hosts come from the signed state; the reader never names a
+//! The service's hosts come from the signed policy; the reader never names a
 //! host. Each host is dialed by key on the record-stream ALPN
 //! ([`record_stream`]) with the same credentials
 //! a call presents, and answers with what this reader may see: every record
 //! of a service whose `readers` roles it is in, otherwise only its own calls
 //! (`--mine` asks for only those everywhere). With no service named, every
-//! service in the signed state is asked for.
+//! service in the signed policy is asked for.
 //!
 //! Every entry is checked as it arrives ([`Chain`]): the host's signature,
 //! and the hash link to the entry before it, across the runs of entries the
@@ -33,7 +33,7 @@
 //!
 //! The backlog from every host is merged by time and printed first; then,
 //! unless `--once`, new records as they are logged. A host that re-decides a
-//! following reader's access (a new signed state, an expired token) may end
+//! following reader's access (a new signed policy, an expired token) may end
 //! the stream with a refusal, which is printed like any other.
 //!
 //! ```text
@@ -73,7 +73,7 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// `wires watch [<service>…] [--mine] [--json] [--once]`.
 #[derive(Args, Clone, Debug, Default)]
 pub(crate) struct WatchArgs {
-    /// The services to watch (default: every service in the signed state).
+    /// The services to watch (default: every service in the signed policy).
     #[arg(value_name = "SERVICE")]
     pub(crate) services: Vec<String>,
     /// Only your own calls, even for services whose records you may read.
@@ -96,7 +96,7 @@ pub(crate) struct WatchArgs {
 /// What a watch asks for.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WatchOpts {
-    /// The services (empty: every service in the signed state).
+    /// The services (empty: every service in the signed policy).
     pub(crate) services: Vec<ServiceName>,
     /// Only the reader's own calls.
     pub(crate) mine: bool,

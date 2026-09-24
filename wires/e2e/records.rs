@@ -132,7 +132,7 @@ impl World {
         super::hello(&self.root, who, 1, Some(self.idp(who)))
     }
 
-    /// A reader's keystore: key, membership, the signed state, an ID token.
+    /// A reader's keystore: key, membership, the signed policy, an ID token.
     fn reader(&self, who: &NodeIdentity) -> Keystore {
         let ks = Keystore::at(crate::testutil::temp_dir());
         ks.save_node(who).unwrap();
@@ -189,7 +189,7 @@ impl Host {
         }
     }
 
-    /// Adopt `state` (as `wires/state` would): the next decision uses it.
+    /// Adopt `state` (as a fetch from a directory would): the next decision uses it.
     fn adopt(&self, w: &World, state: &SignedPolicy) {
         adopt(&self.keystore, &w.root, state);
     }

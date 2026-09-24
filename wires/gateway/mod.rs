@@ -11,7 +11,7 @@
 //! as the caller. The gateway holds nothing a host has to trust beyond its
 //! membership: it can't name a user Google didn't sign in.
 //!
-//! What a web user sees is decided by the signed state, as for any caller:
+//! What a web user sees is decided by the signed policy, as for any caller:
 //! the services a role **matching the user's IdP identity** admits
 //! ([`web_grants`]). Every role needs a verified identity, so the gateway's
 //! node alone admits nobody.
@@ -367,7 +367,7 @@ pub(crate) struct Gateway<B> {
 
 impl<B: Backend> Gateway<B> {
     /// The services `principal` may call through this gateway, with the
-    /// MCP tools they become, per the current signed state.
+    /// MCP tools they become, per the current signed policy.
     pub(crate) fn tools_for(&self, principal: &Principal) -> Result<(Vec<Grant>, ToolsConfig)> {
         let state = self.backend.state()?;
         let grants = web_grants(&state, self.node, principal);
@@ -514,7 +514,7 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
     let state = backend.state()?;
     if state.bans_node(node) {
         bail!(
-            "this node ({}) is banned by its signed state (version {}): the admin removed it",
+            "this node ({}) is banned by its signed policy (version {}): the admin removed it",
             node.hex(),
             state.version.0
         );

@@ -4,9 +4,9 @@
 //! key-addressed session meets the iroh QUIC endpoint. The session ALPN is
 //! [`ALPN`]. A caller opens a bi-stream and sends a
 //! [`Frame::Hello`] — its root-signed membership, the
-//! signed-state version it holds, and its IdP ID token — followed at once by
+//! policy version it holds, and its IdP ID token — followed at once by
 //! a [`Frame::Invoke`] naming a service plus per-call arguments. The host
-//! ([`serve_session_permitted`]) decides by the signed state it holds, re-read
+//! ([`serve_session_permitted`]) decides by the signed policy it holds, re-read
 //! per connection (see [`gate`](crate::host::gate)), then execs the
 //! service's fixed argv with the caller's arguments appended — never through
 //! a shell — with the verified caller identity injected into its
@@ -18,7 +18,7 @@
 //!   [`Frame::Denied`] carrying the reason before closing, which the dialer
 //!   surfaces as a [`Denied`] error (`wires call` exits 77). Nothing the
 //!   dialer sends or receives on a refused session ever reaches its stdout.
-//! - **Refusals are current.** The signed state is re-read on every
+//! - **Refusals are current.** The signed policy is re-read on every
 //!   connection, so a `wires remove` takes effect on the next dial rather
 //!   than the next restart.
 //! - **Strangers are cheap.** Anyone can open a connection, so until the
@@ -751,7 +751,7 @@ where
         Ok(state) => state,
         Err(e) => {
             // The host's own fault, not the caller's: an operator error.
-            tracing::warn!("signed state unusable: {e:#}");
+            tracing::warn!("signed policy unusable: {e:#}");
             let reason = crate::host::gate::HOST_MISCONFIGURED;
             deny(&mut send, reason.to_string()).await;
             return Err(Refused(reason.to_string()).into());
@@ -794,7 +794,7 @@ where
             caller = %caller.hex(),
             theirs = hello.state_version.0,
             ours = version.0,
-            "caller holds a newer signed state"
+            "caller holds a newer signed policy"
         );
     }
     tracing::info!(
@@ -1178,7 +1178,7 @@ where
     };
     // Before any stdin: the host's membership must be one our root signed
     // for this very key, and current. Whether the host is still assigned the
-    // service is `on_ack`'s to check, against the signed state.
+    // service is `on_ack`'s to check, against the signed policy.
     check_inclusion(&ack_membership, root, target, crate::clock::now_unix())
         .map_err(|e| anyhow!("the host's membership was rejected (no stdin sent): {e}"))?;
     on_ack(newer_policy.as_ref())?;
@@ -1296,7 +1296,7 @@ mod tests {
     }
 
     /// A host implementing service `t` as `command`, allowed to role `staff`
-    /// (anyone the shared test IdP verified); its signed state bans
+    /// (anyone the shared test IdP verified); its signed policy bans
     /// [`stranger`]`(7)`.
     fn host_running(command: &[&str]) -> Arc<ServicesHost> {
         Arc::new(host_unshared(command))

@@ -1,5 +1,5 @@
 //! `wires mcp`: a stdio MCP server whose tools are the services you may call
-//! (evaluated locally against your signed state, as `wires services` lists
+//! (evaluated locally against your signed policy, as `wires services` lists
 //! them), plus `tools.json` aliases, resolved once at startup.
 //!
 //! wires in the stdio MCP clients people already use (Claude Desktop, IDEs).
@@ -639,7 +639,7 @@ pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
         let allowed = crate::caller::services::allowed(&ks).await?;
         with_services(config, &allowed.state.policy, &allowed.grants)
     } else {
-        tracing::warn!("this node holds no signed state yet (`wires join`): aliases only");
+        tracing::warn!("this node holds no signed policy yet (`wires join`): aliases only");
         config
     };
     tracing::info!(

@@ -15,7 +15,7 @@
 //! - [`a_user_the_state_admits_to_nothing_is_refused_at_sign_in`]
 //! - [`a_code_is_single_use_and_bound_to_its_client`]
 //!
-//! The backend is scripted: the signed state is fixed in the test, and
+//! The backend is scripted: the signed policy is fixed in the test, and
 //! "dialing" records the tool and token. That the host admits exactly such
 //! a token is `services_host`'s job (a token nonce-bound to the dialing
 //! node, verified against the host's trusted issuer).

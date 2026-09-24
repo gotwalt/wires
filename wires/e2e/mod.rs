@@ -1,4 +1,4 @@
-//! The integration tests: the whole stack — signed state, the `Hello`
+//! The integration tests: the whole stack — signed policy, the `Hello`
 //! handshake, the registry gate, exec and the stdio bridge, push — driven
 //! over hermetic loopback QUIC.
 //!
@@ -8,7 +8,7 @@
 //! address hints over loopback ([`localhost_socks`]).
 //!
 //! - [`services_host`] — card 27's acceptance: a host decides
-//!   every call by the admin-signed state (the registry's roles,
+//!   every call by the admin-signed policy (the registry's roles,
 //!   `also_require`, removal with no restart, refusing unassigned services,
 //!   push by the state).
 //! - [`records`] — card 26b: call records streamed from the host's own log
@@ -37,7 +37,7 @@ use crate::caller::mock_idp::{MOCK_CLIENT_ID, MockIdp};
 use crate::host::config::HostConfig;
 use crate::host::transport::{ALPN, secret_key};
 
-/// Card 27's host side: a host decides by the signed state.
+/// Card 27's host side: a host decides by the signed policy.
 mod services_host;
 
 /// Card 26b: call records streamed from the host's log to authorized readers.
@@ -131,7 +131,7 @@ fn hello(root: &NodeIdentity, who: &NodeIdentity, version: u64, idp: Option<&Moc
     }
 }
 
-/// Store `state` in `ks` as `wires/state` does; whether it was adopted.
+/// Store `state` in `ks` as a fetch from a directory does; whether it was adopted.
 fn adopt(ks: &Keystore, root: &NodeIdentity, state: &SignedPolicy) -> bool {
     crate::policy::store::adopt_if_newer(ks, state, root.node_id(), crate::clock::now_unix())
         .unwrap()

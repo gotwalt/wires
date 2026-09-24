@@ -1,8 +1,8 @@
 //! Card 27c's acceptance tests: **a host decides every call
-//! by the admin-signed state it holds**, re-read per connection.
+//! by the admin-signed policy it holds**, re-read per connection.
 //!
 //! The state is signed in the test by the network root and adopted into the
-//! host's keystore exactly as `wires/state` does
+//! host's keystore exactly as a fetch from a directory does
 //! ([`adopt_if_newer`](crate::policy::store::adopt_if_newer)). Callers dial
 //! the real session ALPN over loopback with a hand-rolled `Hello` + `Invoke`
 //! ([`super::call`]), presenting ID tokens minted by [`MockIdp`]s that the
@@ -82,7 +82,7 @@ impl World {
         }
     }
 
-    /// The signed state at `version`, banning `banned`; roles
+    /// The signed policy at `version`, banning `banned`; roles
     /// `analyst` (alice, carol) and `sre` (carol), each email at its own
     /// IdP, and `staff` (anyone the three people's IdPs verified);
     /// `orders-db` (analyst) and `status` (staff), both on the host.
@@ -217,7 +217,7 @@ impl Host {
         })
     }
 
-    /// The admin's newer state reaches this host (as `wires/state` would).
+    /// The admin's newer state reaches this host (as a fetch from a directory would).
     fn adopt(&self, w: &World, state: &SignedPolicy) {
         assert!(adopt(&self.keystore, &w.root, state));
     }

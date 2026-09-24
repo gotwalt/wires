@@ -101,7 +101,7 @@ impl Call {
         self.call.role().as_str().to_string()
     }
 
-    /// The signed-state version the call was decided under.
+    /// The policy version the call was decided under.
     #[napi]
     pub fn state_version(&self) -> i64 {
         i64::try_from(self.call.state_version().0).unwrap_or(i64::MAX)
@@ -321,7 +321,7 @@ impl Host {
     /// With `handleCtrlC`, Ctrl-C (SIGINT) stops it too; that claims the
     /// signal for the whole process, so it is off unless asked (an app with
     /// its own handling calls `stop()` from `process.on("SIGINT", …)`).
-    /// Rejects before serving if the signed state doesn't assign every
+    /// Rejects before serving if the signed policy doesn't assign every
     /// service to this host. A host serves once.
     #[napi]
     pub async fn serve(&self, handle_ctrl_c: Option<bool>) -> Result<()> {

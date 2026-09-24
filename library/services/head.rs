@@ -37,7 +37,7 @@ use crate::merkle::ItemsRoot;
 
 /// A monotonic policy version: every admin edit bumps it by one, and a node
 /// never replaces its copy with a lower one. (The name is kept from the
-/// signed state the policy replaced: it is the `state_version` a call's
+/// signed policy the policy replaced: it is the `state_version` a call's
 /// `Hello` carries.)
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 #[serde(transparent)]

@@ -1,5 +1,5 @@
 //! The caller's half of the session handshake: build the [`Hello`] from what
-//! this node holds: its membership, the version of its signed state, and its
+//! this node holds: its membership, the version of its signed policy, and its
 //! stored ID token from `wires login` (the token travels in the handshake).
 
 use library::{Hello, IdToken, Membership, StateVersion};
@@ -18,7 +18,7 @@ pub(crate) fn with_membership(ks: &Keystore, membership: Membership) -> Hello {
         Ok(Some(s)) => s.version(),
         Ok(None) => StateVersion(0),
         Err(e) => {
-            tracing::warn!("the stored signed state is unusable: {e:#}");
+            tracing::warn!("the stored signed policy is unusable: {e:#}");
             StateVersion(0)
         }
     };

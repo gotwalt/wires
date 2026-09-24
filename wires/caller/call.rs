@@ -1,7 +1,7 @@
 //! `wires call`: run one remote CLI by name, as if it were local.
 //!
 //! The name is a **service** (card 27): its hosts come from this node's
-//! admin-signed state, tried last-good first with failover on a dial failure
+//! admin-signed policy, tried last-good first with failover on a dial failure
 //! ([`crate::caller::pick`]), and the session opens with the card-27
 //! [`Hello`] (membership, state version, ID token). Nothing
 //! is dialed from an expired state. A newer state a host hands back in its
@@ -10,7 +10,7 @@
 //! registered service wins over a `tools.json` alias of the same name; an
 //! alias pins a name to one host (and address hints), which the current
 //! state must assign the alias's service, and that host still decides by
-//! its signed state.
+//! its signed policy.
 //! Locked mode ([`crate::caller::lock`]) refuses the override flags a
 //! sandboxed agent could steer this with.
 //!
@@ -197,7 +197,7 @@ impl Credentials {
 /// Dial `plan` (an alias: one pinned host) with `creds` and bridge the given
 /// stdio; returns the remote exit code. The session opens with the same
 /// [`Hello`] a service call does, so the host still decides
-/// by its signed state. A refusal surfaces as a [`transport::Denied`] error.
+/// by its signed policy. A refusal surfaces as a [`transport::Denied`] error.
 ///
 /// Runs a local preflight first, so a membership issued to another node
 /// fails here, not at the host; and refuses, before dialing, an expired

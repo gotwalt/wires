@@ -1,5 +1,5 @@
 //! Service name → host (card 27). The caller never names a
-//! host: it takes the service's `hosts` from the signed state, tries the
+//! host: it takes the service's `hosts` from the signed policy, tries the
 //! last one that worked first, then the rest in the admin's order, moving to
 //! the next on a dial failure (not on a refusal: a host that refused has
 //! decided). `--verbose` says which host answered.

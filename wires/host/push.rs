@@ -17,7 +17,7 @@
 //!
 //! # Who may receive
 //!
-//! The host's **signed state** decides, asked **at send, at delivery and at
+//! The host's **signed policy** decides, asked **at send, at delivery and at
 //! fetch** ([`ServicesHost::decide_push`]): the recipient must not be banned
 //! by the current state, and must be in a registry role that `host.json`'s
 //! `push.allow` names (default: nobody). A removed (banned) node gets
@@ -113,7 +113,7 @@ pub(crate) const QUEUE_FILE: &str = "push-queue.json";
 /// What `wires push` asks the running host to send.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PushSpec {
-    /// A node id (64 hex) or a role name from the signed state.
+    /// A node id (64 hex) or a role name from the signed policy.
     pub(crate) to: String,
     /// One line.
     pub(crate) subject: Subject,
@@ -293,7 +293,7 @@ impl Queue {
 /// fetch side of the inbox ALPN. Shared (`Arc`) by the control socket's
 /// commands, the fetch handler and the expiry sweep.
 pub(crate) struct PushHost {
-    /// Who decides who may receive: the host's signed state.
+    /// Who decides who may receive: the host's signed policy.
     host: Arc<ServicesHost>,
     /// `push.log_body`.
     log_body: bool,
@@ -321,7 +321,7 @@ impl std::fmt::Debug for PushHost {
 }
 
 impl PushHost {
-    /// A push service for `host`: recipients are nodes its signed state
+    /// A push service for `host`: recipients are nodes its signed policy
     /// doesn't ban, in a registry role `push.allow` names.
     pub(crate) fn from_state(host: Arc<ServicesHost>) -> Self {
         let log_body = host.config.push.as_ref().is_some_and(|p| p.log_body);
@@ -570,7 +570,7 @@ impl PushHost {
     /// Dial `to`'s receiver (a `wires inbox --wait` in progress) and hand it
     /// what is queued for it (one batch). Returns the ids it acknowledged,
     /// which leave the queue and are recorded `delivered`. Re-checks
-    /// authorization first: a recipient the signed state no longer holds
+    /// authorization first: a recipient the signed policy no longer holds
     /// loses its queue (recorded `denied`).
     async fn deliver_direct(&self, to: NodeId) -> Result<Vec<PushId>> {
         let now = crate::clock::now_unix();
@@ -703,7 +703,7 @@ impl PushHost {
         let state = match self.host.policy() {
             Ok(state) => state,
             Err(e) => {
-                tracing::warn!("signed state unusable: {e:#}");
+                tracing::warn!("signed policy unusable: {e:#}");
                 deny(&mut send, HOST_MISCONFIGURED).await;
                 return Ok(());
             }
@@ -782,7 +782,7 @@ impl PushHost {
         Ok(())
     }
 
-    /// Drop everything queued for `node`, which the signed state no longer
+    /// Drop everything queued for `node`, which the signed policy no longer
     /// admits, logging each message's fate.
     async fn drop_queue(&self, node: NodeId, reason: &str) {
         for e in self.with_queue(|q| q.purge(node)) {
@@ -877,7 +877,7 @@ impl iroh::protocol::ProtocolHandler for PushFetch {
 #[derive(Args, Clone, Debug)]
 pub(crate) struct PushArgs {
     /// Who receives it: a node id (a service's `$WIRES_CALLER_NODE` is its
-    /// caller's), or a role from the signed state (every member whose
+    /// caller's), or a role from the signed policy (every member whose
     /// verified identity this host holds and the role admits).
     #[arg(long)]
     pub(crate) to: String,

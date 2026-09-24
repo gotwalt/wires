@@ -5,7 +5,7 @@
 //! [`Host`](crate::Host). To callers it is a CLI like any other: it is invoked
 //! with arguments, reads stdin, writes stdout and stderr, and returns an exit
 //! code. `wires call`, `wires mcp`, the gateway and `wires watch` can't tell
-//! the two apart. The host runs a handler only for a call the signed state
+//! the two apart. The host runs a handler only for a call the signed policy
 //! admitted and whose `Started` record is already in the call log, and
 //! records what it read and wrote the way it records a child's stdio. What a
 //! handler gets beyond a CLI is a warm process (whatever state the app
@@ -84,7 +84,7 @@ pub struct Call {
     pub(crate) principal: Principal,
     /// The registry role that admitted the caller.
     pub(crate) role: RoleName,
-    /// The signed-state version the call was decided under.
+    /// The policy version the call was decided under.
     pub(crate) state_version: StateVersion,
     /// The service called.
     pub(crate) service: ServiceName,
@@ -134,7 +134,7 @@ impl Call {
         &self.role
     }
 
-    /// The signed-state version the call was decided under.
+    /// The policy version the call was decided under.
     pub fn state_version(&self) -> StateVersion {
         self.state_version
     }

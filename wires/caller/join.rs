@@ -4,14 +4,13 @@
 //! (`wires id`), paste back the token `wires invite` printed (`wires join
 //! <token>`). Join checks the token is for this node, signed by one root
 //! throughout, and not banned by its state, then installs the membership
-//! (this node's badge: what admits it) and the admin-signed state where
-//! every other command looks for them, and records the admin's node id to
-//! pull newer states from.
+//! (this node's badge: what admits it) and the admin-signed policy where
+//! every other command looks for them. The policy's head names the
+//! directories newer policies are fetched from.
 //!
-//! After this, newer states arrive by push from the admin (hosts only: a
-//! running `serve` is what listens), or are pulled from a host on a cold
-//! command or handed back in a call's `HelloAck`; nothing needs importing by
-//! hand again.
+//! After this, newer policies are fetched from a directory (by a host at
+//! start and every beat; by a caller on a cold command) or handed back in a
+//! call's `HelloAck`; nothing needs importing by hand again.
 
 use anyhow::{Context, bail};
 use clap::Args;
