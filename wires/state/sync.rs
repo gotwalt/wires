@@ -507,7 +507,7 @@ pub(crate) fn answer(
 }
 
 /// [`respond`] as a router protocol on [`STATE_ALPN`], for a running
-/// node (a host's `serve`, a member's `watch`, the admin's).
+/// host (`wires serve` mounts it; nothing else listens).
 #[derive(Clone)]
 pub(crate) struct StateResponder(pub(crate) Arc<Keystore>);
 

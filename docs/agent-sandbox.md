@@ -130,7 +130,16 @@ The operator turns the lock on with `WIRES_LOCKED=1` (any value but empty,
 | the eight flags above | **refused**, exit 2, `wires: --relay-url is not allowed in locked mode …`; nothing dialed | refused at startup, exit 1 |
 | `--jq`, `--head`, `--max-bytes`, the tool name (`db_query`, `eacc34e0/db_query`), its args after `--` (including ones spelled like our flags) | accepted | the `jq` / `head` / `max_bytes` / `args` fields: accepted |
 | stdin | **refused if it holds any data** (exit 2), unless the operator also sets `WIRES_LOCKED_STDIN=allow`; a terminal or empty stdin is fine, and the remote gets EOF | the `stdin` field: accepted |
-| `WIRES_NODE_SEED`, `WIRES_MEMBERSHIP`, `WIRES_INCLUSION_PROOF`, `WIRES_HOME` | still read: they are the operator's environment, and the agent can't set them | same |
+| `WIRES_NODE_SEED`, `WIRES_MEMBERSHIP` (they override the node key and membership, like the flags) | **refused**, exit 2, `wires: $WIRES_NODE_SEED is not allowed in locked mode …`; nothing dialed | refused at startup, exit 1 |
+| `WIRES_HOME`, `WIRES_LOCKED`, `WIRES_LOCKED_STDIN` | still read: they are how the operator configures the lock | same |
+
+**Locked mode assumes the agent can't set its own environment.** `WIRES_LOCKED`
+turns the lock on, and `WIRES_HOME` chooses the keystore and the `tools.json`
+whose `"locked"` is read, so an agent that can run `WIRES_LOCKED=0 wires call …`
+or `WIRES_HOME=./mine wires call …` is not locked. Set them where the agent
+can't change them (the MCP server's `env`, the sandbox's own environment) and
+keep the agent's permission rules from allowing an environment prefix, `env`,
+`export` or `unset` (the probe below shows Claude Code refusing all of them).
 
 **Why stdin is refused by default for `wires call` but not for `wires mcp`.**
 On the shell path, stdin is the one channel through which a working-directory

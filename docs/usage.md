@@ -9,7 +9,7 @@ choices, the limits, and the command reference. The wire-level spec is
 
 | Role | Decides | Commands |
 |---|---|---|
-| **admin** | who's in, which roles exist, which services run where, who may call and read each (root key) | `init`, `invite`, `remove`, `role set\|rm`, `service add\|set\|rm` |
+| **admin** | who's in, which roles exist, which services run where, who may call and read each (root key) | `init`, `invite`, `remove`, `role set\|rm`, `service add\|set\|rm`, `state push` |
 | **host** | how it implements its assigned services; which IdPs it trusts; stricter local rules; push | `serve host.json`, `push` |
 | **caller** | — runs services by name; MCP only for backward compatibility | `id`, `join`, `login`, `services`, `call`, `mcp`, `inbox` |
 | **reader** | — any member; reads the records a service's `readers` role allows, or its own | `watch` |
@@ -28,7 +28,7 @@ Every role joins the same way: `wires id`, then `wires join <token>` with the ad
 | **Which host** | The registry's `hosts` for the service. Only the admin binds a name to a host, so no host can squat a name. | The caller (it dials only those hosts) and the host (it refuses to start, or to serve, a name not assigned to it). |
 | **Records** | Each host's own call log: every call, refusal and push, signed by the host and hash-linked. | Readers, with `wires watch`: the service's `readers` roles see all of it, everyone else only their own calls; every entry and the chain are verified. |
 | **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. | The host, at send, delivery and fetch: a member of the state, in a `push.allow` role. |
-| **Removal** | A new state, pushed hosts first. No shared key exists, so there is nothing to rotate. | Every host, on the removed member's next call or fetch. |
+| **Removal** | A new state, pushed to the hosts. No shared key exists, so there is nothing to rotate. | Every host, on the removed member's next call or fetch. |
 
 Nothing is broadcast: a member that takes part in no call receives no traffic about other members' calls, identities or services (the admin's state push aside).
 
@@ -65,16 +65,23 @@ workbench$ wires id
 3ef72b11…
 admin$ wires invite 3ef72b11… --name workbench        # likewise the spare
 wires: invited 3ef72b11… as "workbench" (state version 4, 2 members)
+wires: state version 4: no host to push to yet (a new member gets it in its invite token)
 wires: on the joining machine: wires join eyJhZG1pbiI6…
 workbench$ wires join eyJhZG1pbiI6…
 admin$ wires service add orders-db --description "Read-only SQL (sqlite3) over the orders database; …" \
          --allow analyst --reader security --host workbench --host spare
+wires: state version 6: pushed to 0 of 2 host(s); not reached: 3ef72b11…, 511de414… (`wires state push` re-sends it)
 service orders-db added (state version 6)
-wires: state version 6: pushed to 0 member(s); 2 not reachable now (3ef72b11…, 511de414…) — they pull it on their next command
+wires: state version 6 is signed and stored here, but reached none of its 2 host(s), so they still enforce the older state; run `wires state push` once a host is up
+admin$ echo $?
+1
 ```
 
-The hosts weren't running, so the push missed them; a fresh `wires invite`
-token catches a host up (re-joining never rolls a state back). The token
+The hosts weren't running, so the push missed them and the command exits 1:
+the new state is stored on the admin but in force nowhere. Once a host is up,
+`wires state push` re-sends it; a host that isn't up yet can't start `serve`
+on a state that doesn't assign it the service, so a fresh `wires invite`
+token catches it up (re-joining never rolls a state back). The token
 isn't a secret: it holds the invitee's membership and the signed state.
 
 **3. The hosts serve.** `host.json` says only how each service runs here. A
@@ -110,12 +117,12 @@ workbench$ wires serve host.json
 to it.
 
 **4. The agent and the observer join.** Each invite is a new state, pushed to
-both hosts:
+both hosts (only hosts are pushed to; the agent gets it in its token):
 
 ```console
 admin$ wires invite dd7e7237… --name agent
 wires: invited dd7e7237… as "agent" (state version 9, 4 members)
-wires: state version 9: pushed to 2 member(s); 1 not reachable now (dd7e7237…) — they pull it on their next command
+wires: state version 9: pushed to 2 of 2 host(s)
 agent$ wires join eyJhZG1pbiI6…
 ```
 
@@ -175,7 +182,7 @@ callers don't normally care). Then:
 
 ```console
 admin$ wires remove agent
-wires: state version 11: pushed to 2 member(s); 1 not reachable now (f6d6dae7…) — they pull it on their next command
+wires: state version 11: pushed to 2 of 2 host(s)
 removed dd7e7237… (agent) (state version 11, 4 members)
 agent$ wires call orders-db -- "select count(*) from orders"
 wires: denied by responder: not a member of the current signed state (version 11)
@@ -294,13 +301,17 @@ To make `wires` the boundary, use a structural setup:
 
 - **Every member holds the whole state**: member and host node ids, role
   matchers, service names and descriptions. It is signed, not secret.
-- **Memberships and the state don't renew yet.** They expire after `--ttl`
-  (default 30 days); an expired state admits nobody. Any admin command signs
-  a fresh state; re-issue memberships with `wires invite <id>`.
-- **The admin is a one-shot command.** A member offline during a push gets
-  the state by pulling from a host on its next command (after 10 minutes), or
-  from a fresh invite; a host assigned a service while offline needs one of
-  those before `serve` will start.
+- **Memberships and the state don't renew yet.** A membership expires after
+  its `--ttl`, the state after its `--state-ttl` (both default 30 days); an
+  expired state admits nobody, and no caller dials from one. Any admin edit
+  signs a fresh state (never with an earlier expiry than the one it
+  replaces); re-issue memberships with `wires invite <id>`.
+- **The admin is a one-shot command.** Only hosts are pushed to (they are
+  the members that listen). An edit that reaches no host exits 1; `wires
+  state push` re-sends it. Other members pull from a host on their next
+  command (after 10 minutes), or get it at their next call's handshake. A
+  host assigned a service while offline pulls from the other hosts in its
+  copy when `serve` starts; with none of them up, it needs a fresh invite.
 - **A host knows only the identities presented to it.** Push to a role
   reaches members that have called that host, or run `wires inbox`, since it
   started.
@@ -328,18 +339,28 @@ To make `wires` the boundary, use a structural setup:
 
 | Role | Command | What it does |
 |---|---|---|
-| **admin** | `wires init [--ttl 30d]` | Create the root key and this node, and sign state version 1 with this node as its one member. |
-| | `wires invite <node-id> [--name l] [--ttl 30d]` | Add a node to the state, mint its membership, print its join token (stdout), push the new state. |
-| | `wires remove <name\|node-id> [--ttl 30d]` | Drop a node (and from every service's hosts); push hosts first. Its next call is refused. |
+| **admin** | `wires init [--ttl 30d] [--state-ttl 30d]` | Create the root key and this node, and sign state version 1 with this node as its one member. `--ttl` is this node's membership lifetime, `--state-ttl` the state's. |
+| | `wires invite <node-id> [--name l] [--ttl 30d] [--state-ttl 30d]` | Add a node to the state, mint its membership (valid for `--ttl`), print its join token (stdout), push the new state. |
+| | `wires remove <name\|node-id> [--state-ttl 30d]` | Drop a node (and from every service's hosts); push to the hosts. Its next call to a host that has the new state is refused. |
 | | `wires role set <name> <matcher>…` · `role rm <name>` | Define a role as an OR of matchers: `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…` (all must hold). |
 | | `wires service add\|set <name> [--description D] [--allow role]… [--host member]… [--reader role]…` · `service rm <name>` | Edit the registry. `--host` is an `invite --name` label or a node id; `set` replaces each list given. |
+| | `wires state push` | Re-send the stored state to every host, e.g. after an edit that reached none. Exits 1 if the state names hosts and none took it. |
+
+Every edit above signs a new state valid for `--state-ttl` from now (default
+30 days), or until the current state's expiry if that is later: an edit never
+shortens the state's life. It is pushed to the state's hosts (and to any node
+that hosted before the edit), not to plain members, which don't listen. When
+the state names hosts and **none** took it, the command still prints its
+result (an `invite` still prints the token) but exits 1: the new state is
+stored on the admin and in force nowhere until `wires state push` reaches a
+host.
 | **host** | `wires serve host.json` | Refuse to start unless the state assigns every service in the file here; then check every caller against the state, exec the service per call, and log every call, refusal and push. `--check` validates and prints what the file implements. |
 | | `wires push --to <node-id\|role> --subject S [--ttl D] -- <body>` | Hand a message for a caller to this machine's running `serve` (body from stdin if none is given). Prints `delivered`, `queued` or `denied` per recipient; exits `77` if every recipient was refused. |
 | **caller** | `wires id` | Print this node's id (creating its key on first use). |
 | | `wires join <token>` | Install an invite: the membership and the signed state. |
 | | `wires login` | Sign in with your IdP (Google by default; `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*`) and store the key-bound ID token. |
 | | `wires services [--verbose] [--json]` | List the services you may call and the role that admits you, evaluated locally. `--verbose` adds their hosts. |
-| | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name (or a `tools.json` alias). Stdio passes through and its exit code becomes `call`'s. A refusal exits `77`. |
+| | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name (or a `tools.json` alias; a registered service of the same name wins). Stdio passes through and its exit code becomes `call`'s, except that a remote exit `77` is reported as `1` (with a note on stderr). A refusal by the host exits `77`; a local or transport failure, an expired state, or a newer state (handed back at the handshake) that no longer assigns the service to that host exits `1`, before any stdin is sent. |
 | | `wires mcp` | Serve the same services as MCP tools over stdio, for clients that can't run a CLI. |
 | | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`. |
 | **reader** | `wires watch [service…] [--mine] [--once] [--json]` | Stream call records from your services' hosts, verified: all records of services whose `readers` role you're in, otherwise your own. |
@@ -358,7 +379,7 @@ For an MCP-only client, the whole config is:
 | `identity.issuers` | The IdPs whose ID tokens the host verifies, each with the OAuth client ids (`audiences`) it accepts **from that issuer**. |
 | `services` | Name → `command` (argv, no shell; each call's arguments are appended), optional `cwd`, optional `env` (no `WIRES_*` names), and `also_require`: roles from the state the caller must **also** be in (only narrows). Every name must be assigned to this host by the state. |
 | `push` | Optional. `allow`: the roles (from the state) whose members may receive `wires push` from this host (none by default). `log_body`: also log each push's body (default `false`: subject only). |
-| `audit.otlp` | Optional. An OTLP/HTTP collector the call log is also exported to. |
+| `audit.otlp` | Optional. An OTLP/HTTP collector the call log is also exported to: `https://…`, or plain `http://` only to `localhost` / `127.0.0.1` / `[::1]`. |
 
 Who may call a service is not in this file: it is the registry's `allow`. A
 refusal names the rule that failed (`… is in no role allowed to call

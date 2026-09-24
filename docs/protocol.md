@@ -61,9 +61,10 @@ SignedState { state, alg, sig }
   then `validate`. **`check_fresh(now)`**: `Expired` when `now > not_after`. An expired state admits
   nobody until the admin signs a newer one.
 - **Versioning.** Every admin edit (`init`, `invite`, `remove`, `service add|set|rm`, `role
-  set|rm`) is the stored state changed, `version + 1`, `issued = now`, `not_after = now + --ttl`
-  (default `30d`), re-signed. The host set is **derived**: a member is a host exactly when some
-  service names it.
+  set|rm`) is the stored state changed, `version + 1`, `issued = now`, `not_after = max(now +
+  --state-ttl, the stored state's not_after)` (default `30d`: an edit never shortens the state's
+  life), re-signed. `--ttl` on `init` and `invite` is the minted **membership's** lifetime only.
+  The host set is **derived**: a member is a host exactly when some service names it.
 - **Monotonic copies.** Every node keeps its newest verified copy in `state.json`, written only
   through `adopt_if_newer(ks, candidate, root, now)`: the candidate must verify, be fresh, and be
   strictly newer (`is_newer_than`: same fabric, higher version). The re-read, check and write happen
@@ -89,11 +90,14 @@ registry locally has to hold the set anyway.
 
 | Command | Effect on the state |
 |---|---|
-| `wires init [--ttl]` | New root and node keys, this node's membership, version 1 with this node as its one member. |
-| `wires invite <node-id> [--name] [--ttl]` | Adds the member, mints its membership, prints one `Invite` token, pushes the state. |
-| `wires remove <name\|id> [--ttl]` | Drops the member (and from every service's `hosts`), pushes hosts first. |
+| `wires init [--ttl] [--state-ttl]` | New root and node keys, this node's membership, version 1 with this node as its one member. |
+| `wires invite <node-id> [--name] [--ttl] [--state-ttl]` | Adds the member, mints its membership (valid for `--ttl`), prints one `Invite` token, pushes the state. |
+| `wires remove <name\|id> [--state-ttl]` | Drops the member (and from every service's `hosts`), pushes the state. |
 | `wires role set <name> <matcher>…` / `role rm <name>` | Defines or drops a role. A matcher is `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…`. |
 | `wires service add\|set <name> [--description] [--allow role]… [--host member]… [--reader role]…` / `service rm <name>` | Edits the registry. `--host` takes an `invite --name` label or a node id, and must be a member. |
+| `wires state push` | Changes nothing: re-sends the stored state to every host (§4). |
+
+Every edit but `init` takes `--state-ttl` and ends with the push in §4.
 
 `Invite { format: 2, membership, state: SignedState, admin: NodeId }` is everything a new node needs.
 `Invite::verify(me, now)` requires that the membership passes `check_inclusion` under its own
@@ -110,24 +114,40 @@ Frames are length-prefixed canonical JSON tagged by `type`, at most 4 MiB
 (`library/services/sync.rs`, `wires/state/sync.rs`): `offer {state}`, `have {version}`,
 `denied {reason}`. One exchange per connection; 5 s to dial, 10 s for the answer.
 
-- **Push.** After every admin edit, the admin dials every member but itself, **hosts first**
-  (concurrently), then the rest, and sends `offer`. The receiver's answer is `have` with the version
-  it now holds; a member counts as delivered when that is at least the offered version. Stderr says
-  `state version N: pushed to K member(s)`, naming any not reachable.
+- **Push.** After every admin edit, and on `wires state push`, the admin dials, concurrently,
+  every **host** of the new state plus every host of the state before the edit (so a node that
+  stops hosting learns it), never itself, and sends `offer`. Plain members aren't dialed: only
+  `serve` runs the responder, so nothing listens there. The receiver's answer is `have` with the
+  version it now holds; a host counts as delivered when that is at least the offered version.
+  Stderr says `state version N: pushed to K of H host(s)`, naming any not reached. **When H > 0 and
+  K = 0 the command exits 1** (after printing its result, e.g. the invite token): the new state is
+  stored on the admin and in force nowhere. `wires state push` re-sends it. With no hosts at all
+  there is nothing to reach and nothing fails; members get the state in their invite token.
 - **Pull.** A cold command (`call`, `mcp`, `inbox`, and the hidden `tools` alias) whose copy was
-  last checked more than 10 minutes ago (`state-checked.txt`) sends `have` to every host in its copy, then the admin, for at
-  most 8 s; the first newer verified `offer` is adopted. A running `serve` does the same every 10
-  minutes. `wires services` never pulls: it reads the local copy only.
+  last checked more than 10 minutes ago (`state-checked.txt`) sends `have` to, in order, the hosts
+  in `last-good.json` (the hosts it has called), every other host in its copy, then the admin, for
+  at most 8 s. It **stops at the first answer that settles it**: a verified, fresh, newer `offer`
+  (adopted), or a `have` at least its own version from a vouched peer (a host in its copy, or the
+  admin in `state-admin.txt`). Only those two mark the copy checked; a refusal, a peer behind it,
+  or an unvouched answer doesn't. A running `serve` does the same every 10 minutes, and once at
+  start when its preflight fails (a host assigned a service while it was offline pulls it from the
+  other hosts in its copy, then preflights again). `wires services` never pulls: it reads the
+  local copy only.
 - **Handshake.** A host whose state is newer than the version in a caller's `Hello` hands it back in
-  `HelloAck.newer_state` (§5); the caller adopts it.
-- **The responder** (`StateResponder`, on every `serve`): to an `offer`, it requires the dialer to
-  be a member of the held copy or of the (verified) offered one, then runs `adopt_if_newer` and
-  answers `have`. To a `have`, it requires the dialer to be a member of the held copy, and answers
-  `offer` when it holds a newer one, else `have`. Anything else is `denied`.
+  `HelloAck.newer_state` (§5); the caller adopts it before sending stdin.
+- **The responder** (`StateResponder`, on every `serve`). A held copy that has expired vouches for
+  nobody. To an `offer`, it requires the dialer to be a member of the fresh held copy or of the
+  (verified) offered one, then runs `adopt_if_newer`. Adopted: it marks its copy checked and
+  answers `have`. Not adopted (older, equal, or refused): it answers `have` only if the dialer is a
+  member of its fresh held copy, else `denied`, and does **not** mark its copy checked, so a removed
+  member replaying its old, still-fresh state can't stop the host pulling the newer one. To a
+  `have`, it requires a fresh held copy (else `denied`: an expired state is never served) with the
+  dialer a member, and answers `offer` when it holds a newer one, else `have`. Anything else is
+  `denied`.
 
 A node never adopts an older or unverifiable state, so a lying peer can only fail to help. A host
-that was offline when a service was assigned to it catches up by its next pull, or by joining with a
-fresh invite (re-joining never rolls back).
+that was offline when a service was assigned to it catches up at `serve` start from another host,
+or by joining with a fresh invite (re-joining never rolls back).
 
 ## 5. Sessions: `wires/session/3`
 
@@ -169,16 +189,26 @@ server-derived `WIRES_CALLER_NODE`, `WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_A
 a service can `wires push`) and, when verified, `WIRES_CALLER_EMAIL`. If the connection closes, the
 host kills the child.
 
-**The caller** (`wires call`, `wires mcp`) takes the service's hosts from its state, the last host
-that answered (`last-good.json`) first, then the admin's order. It fails over to the next host **only
-when a dial fails** (10 s each); a host that answered has decided. It sends `Hello` and `Invoke`,
-then **always** verifies the `HelloAck` membership with `check_inclusion(ack, own fabric,
-authenticated host id, now)` before it forwards a byte of stdin. `Denied` → exit 77, nothing on
-stdout; local or transport failure → 1; otherwise the remote exit code. A session that ends without
-`Exit` is an error. Limits: 16 MiB largest frame; `Argv` holds at most 256 arguments and 64 KiB.
+**The caller** (`wires call`, `wires mcp`) refuses to dial from an expired state (exit 1: ask the
+admin for `wires state push` or a fresh invite). It takes the service's hosts from its state, the
+last host that answered (`last-good.json`) first, then the admin's order. It fails over to the next
+host **only when a dial fails** (10 s each); a host that answered has decided. It sends `Hello` and
+`Invoke` together, then, before it forwards a byte of stdin, **always** verifies the `HelloAck`
+membership with `check_inclusion(ack, own fabric, authenticated host id, now)` and adopts any
+`newer_state` (`adopt_if_newer`); if that state fails to verify, or the state it now holds no
+longer assigns the service to that host, the call stops there (exit 1, no stdin sent). The host
+already has the `Invoke` (argv) by then: a removed host that still holds a valid membership sees
+the argv; card 29's ban list closes that.
+
+Exit codes: `Denied` → **77**, nothing on stdout. Local or transport failure (including the checks
+above) → 1. Otherwise the remote exit code, **except that a remote 77 is reported as 1** with a
+note on stderr, so 77 always means the host refused. A session that ends without `Exit` is an
+error. Limits: 16 MiB largest frame; `Argv` holds at most 256 arguments and 64 KiB.
 
 A `tools.json` alias pins a local name to one host (node id, optional addresses and relay) and a
-`remote_tool` service name; it opens the same `Hello`, so the host still decides by its state.
+`remote_tool` service name; it opens the same `Hello`, so the host still decides by its state. A
+service registered in the state wins over an alias of the same name, and an alias is refused before
+dialing unless the current state assigns its `remote_tool` service to its host.
 
 ## 6. Identity
 
@@ -232,7 +262,7 @@ sig }`: dense 0-based `seq`, `prev` the hash of the previous entry (zero at seq 
 host over `"wires/call-log/v1\0"` ‖ canonical JSON of the other fields. `verify_chain` reports a bad
 signature, a gap, a broken link or a fork. The log is `call-log.jsonl` (fsync per entry), re-verified
 on open, pruned from the front after 30 days, and optionally exported over OTLP/HTTP
-(`audit.otlp`). A host can still withhold or truncate its own history; rewrites are detectable only
+(`audit.otlp`: https, or plain http only to a loopback collector). A host can still withhold or truncate its own history; rewrites are detectable only
 against a copy someone holds.
 
 **The record stream** (`wires/records/1`, `wires/host/record_stream.rs`): length-prefixed JSON
@@ -256,7 +286,7 @@ Nothing is broadcast: a record leaves a host only when a reader asks for it and 
 | `names.json` | 0600 | admin | local labels for `remove` and `service --host`; never sent |
 | `membership.json` | 0644 | every node | membership token |
 | `state.json` (+ `.lock`) | 0600 | every node | the newest verified signed state (§3) |
-| `state-admin.txt`, `state-checked.txt` | — | every node | where to pull from; when the copy was last checked |
+| `state-admin.txt`, `state-checked.txt` | 0600 | every node | where to pull from; when the copy was last checked |
 | `idp-token.jwt`, `idp-refresh-token` | 0600 | caller | from `wires login` |
 | `last-good.json` | 0600 | caller | service → the host that last answered |
 | `hints` | — | any node | optional local dial hints (below) |
@@ -271,18 +301,24 @@ Nothing is broadcast: a record leaves a host only when a reader asks for it and 
 it beside n0 discovery, so calls, state sync, push and fetches all use it. `serve` writes its own line
 to `run/hint`. A hint only says where to try; iroh still authenticates the key.
 
+Every file above is written atomically: a temporary file created `O_EXCL` with mode 0600, widened
+to the listed mode (only `membership.json`'s 0644) after the write, then renamed over the target. A
+file with no listed mode is 0600. The keystore directory the state store creates is 0700.
+
 Flags, environment variables and `--…-file` paths override the keystore, in that order of
-precedence.
+precedence. Locked mode (`WIRES_LOCKED`) refuses the credential flags and the `WIRES_NODE_SEED` /
+`WIRES_MEMBERSHIP` variables; it assumes the agent can't set its own environment.
 
 ## 10. Known limits
 
-- Nothing renews memberships or the state; both expire after `--ttl` (default 30 days). An expired
-  state admits nobody until the admin signs a newer one.
-- The admin is a one-shot CLI: a member offline during a push gets the state by its next pull
-  (from a host) or a fresh invite. A host that is assigned a service while offline can't start
-  `serve` until it has the new state.
+- Nothing renews memberships or the state; a membership expires after its `--ttl`, the state after
+  its `--state-ttl` (both default 30 days). An expired state admits nobody, is served by nobody, and
+  is dialed from by no caller until the admin signs a newer one.
+- The admin is a one-shot CLI and is pushed only to hosts: a plain member gets a new state by its
+  next pull (from a host) or at a call's handshake. A host assigned a service while offline pulls
+  it at `serve` start from another host in its copy; with none up, it needs a fresh invite.
 - Every member holds the whole state (member ids, roles, registry).
 - A host knows a caller's identity only after the caller presented its token to that host, so push
   by role reaches only those callers.
-- One fabric per keystore. The caller checks the host's membership, not whether the host is still
-  in the state.
+- One fabric per keystore. The caller checks the host's membership and that its own (newest) state
+  assigns the service to that host, but only after the host already holds the `Invoke` (card 29).
