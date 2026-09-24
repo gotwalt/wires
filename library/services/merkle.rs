@@ -503,7 +503,196 @@ mod tests {
 
         #[test]
         fn decoding_any_string_never_panics(s in ".{0,200}") {
-            let _ = ProofPath::try_from(s);
+            let _ = ProofPath::try_from(s.clone());
+            let _ = ProofHashes::try_from(s);
         }
+
+        /// Every subset proves; its verdict on a mix of genuine and
+        /// tampered items equals the individual proofs' verdicts.
+        #[test]
+        fn every_subset_proves_and_agrees_with_single_proofs(
+            count in 1u8..120,
+            chosen in proptest::collection::vec(any::<bool>(), 120),
+            tamper in proptest::collection::vec(any::<bool>(), 120),
+        ) {
+            let (items, tree) = tree_of(count);
+            let n = tree.len();
+            let indices: Vec<u64> = (0..n).filter(|i| chosen[*i as usize]).collect();
+            let proof = tree.prove_many(&indices).unwrap();
+            prop_assert_eq!(proof.indices(n).unwrap(), indices.clone());
+            let genuine: Vec<&Item> = indices.iter().map(|i| &items[*i as usize]).collect();
+            prop_assert!(proof.verify_items(genuine, tree.root(), n).is_ok());
+
+            let candidates: Vec<Item> = indices
+                .iter()
+                .map(|i| {
+                    let item = items[*i as usize].clone();
+                    if tamper[*i as usize] { bumped(&item) } else { item }
+                })
+                .collect();
+            let singles = indices.iter().zip(&candidates).all(|(i, item)| {
+                tree.prove(*i).unwrap().verify(item, tree.root(), n).is_ok()
+            });
+            prop_assert_eq!(proof.verify_items(&candidates, tree.root(), n).is_ok(), singles);
+        }
+
+        #[test]
+        fn a_tampered_multiproof_or_another_tree_fails(
+            count in 2u8..100,
+            chosen in proptest::collection::vec(any::<bool>(), 100),
+            at in any::<proptest::sample::Index>(),
+            byte in 0usize..32,
+        ) {
+            let (items, tree) = tree_of(count);
+            let n = tree.len();
+            let mut indices: Vec<u64> = (0..n).filter(|i| chosen[*i as usize]).collect();
+            if indices.is_empty() {
+                indices.push(0);
+            }
+            let leaves: Vec<ItemHash> =
+                indices.iter().map(|i| ItemHash::of(&items[*i as usize]).unwrap()).collect();
+            let proof = tree.prove_many(&indices).unwrap();
+
+            if !proof.hashes.0.is_empty() {
+                let mut bad = proof.clone();
+                let k = at.index(bad.hashes.0.len());
+                bad.hashes.0[k].0[byte] ^= 1;
+                prop_assert!(bad.verify(&leaves, tree.root(), n).is_err());
+                let mut short = proof.clone();
+                short.hashes.0.pop();
+                prop_assert!(short.verify(&leaves, tree.root(), n).is_err());
+            }
+            let mut long = proof.clone();
+            long.hashes.0.push(tree.root());
+            prop_assert!(long.verify(&leaves, tree.root(), n).is_err());
+
+            // Another tree's root (one more leaf) fails.
+            let (_, bigger) = tree_of(count + 1);
+            prop_assert!(proof.verify(&leaves, bigger.root(), n).is_err());
+            prop_assert!(proof.verify(&leaves, bigger.root(), n + 1).is_err());
+
+            // One leaf too few or too many for the ranges fails.
+            prop_assert!(proof.verify(&leaves[1..], tree.root(), n).is_err());
+            let mut more = leaves.clone();
+            more.push(leaves[0]);
+            prop_assert!(proof.verify(&more, tree.root(), n).is_err());
+        }
+
+        /// A contiguous run costs at most about two paths.
+        #[test]
+        fn a_run_costs_about_two_paths(count in 1u8..=255, a in any::<u8>(), b in any::<u8>()) {
+            let (_, tree) = tree_of(count);
+            let n = tree.len();
+            let (lo, hi) = (u64::from(a.min(b)) % n, u64::from(a.max(b)) % n);
+            let (lo, hi) = (lo.min(hi), lo.max(hi));
+            let proof = tree.prove_many(&(lo..=hi).collect::<Vec<_>>()).unwrap();
+            prop_assert_eq!(proof.leaves.len(), 1);
+            let depth = 64 - (n - 1).leading_zeros() as usize;
+            prop_assert!(proof.hashes.0.len() <= 2 * depth, "{} > 2·{depth}", proof.hashes.0.len());
+        }
+
+        #[test]
+        fn multiproofs_round_trip(count in 1u8..60, chosen in proptest::collection::vec(any::<bool>(), 60)) {
+            let (_, tree) = tree_of(count);
+            let indices: Vec<u64> = (0..tree.len()).filter(|i| chosen[*i as usize]).collect();
+            let proof = tree.prove_many(&indices).unwrap();
+            let back: MultiProof = serde_json::from_str(&serde_json::to_string(&proof).unwrap()).unwrap();
+            prop_assert_eq!(back, proof);
+        }
+    }
+
+    /// The same ban, one second longer.
+    fn bumped(item: &Item) -> Item {
+        let Item::Ban { key, body } = item else {
+            unreachable!()
+        };
+        Item::Ban {
+            key: *key,
+            body: Ban {
+                until: body.until + 1,
+            },
+        }
+    }
+
+    #[test]
+    fn multiproof_known_shapes() {
+        let (items, tree) = tree_of(3);
+        let l: Vec<ItemsRoot> = items
+            .iter()
+            .map(|i| ItemsRoot(ItemHash::of(i).unwrap().0))
+            .collect();
+        // Leaves 0 and 1 determine their parent; only leaf 2 is sent.
+        let proof = tree.prove_many(&[0, 1]).unwrap();
+        assert_eq!(proof.leaves, vec![LeafRange { start: 0, len: 2 }]);
+        assert_eq!(proof.hashes.hashes(), &[l[2]]);
+        // Leaves 0 and 2: leaf 1, then nothing (0-1's parent and 2 are known).
+        let proof = tree.prove_many(&[0, 2]).unwrap();
+        assert_eq!(
+            proof.leaves,
+            vec![
+                LeafRange { start: 0, len: 1 },
+                LeafRange { start: 2, len: 1 }
+            ]
+        );
+        assert_eq!(proof.hashes.hashes(), &[l[1]]);
+        // All leaves: no hashes at all.
+        let all = tree.prove_many(&[0, 1, 2]).unwrap();
+        assert!(all.hashes.hashes().is_empty());
+        all.verify_items(&items, tree.root(), 3).unwrap();
+        // A single leaf is its inclusion proof's path.
+        assert_eq!(
+            tree.prove_many(&[1]).unwrap().hashes.hashes(),
+            tree.prove(1).unwrap().path.hashes()
+        );
+        // Nothing proves nothing, and passes only with no hashes.
+        let none = tree.prove_many(&[]).unwrap();
+        assert_eq!(none, MultiProof::default());
+        none.verify(&[], tree.root(), 3).unwrap();
+        let mut stray = none;
+        stray.hashes.0.push(l[0]);
+        assert!(stray.verify(&[], tree.root(), 3).is_err());
+    }
+
+    #[test]
+    fn prove_many_refuses_bad_index_lists() {
+        let (_, tree) = tree_of(5);
+        assert!(tree.prove_many(&[1, 1]).is_none());
+        assert!(tree.prove_many(&[2, 1]).is_none());
+        assert!(tree.prove_many(&[5]).is_none());
+    }
+
+    #[test]
+    fn leaf_ranges_must_be_canonical_and_in_range() {
+        let range = |start, len| LeafRange { start, len };
+        let proof = |leaves| MultiProof {
+            leaves,
+            hashes: ProofHashes::default(),
+        };
+        assert_eq!(
+            proof(vec![range(0, 2), range(3, 1)]).indices(4).unwrap(),
+            vec![0, 1, 3]
+        );
+        for bad in [
+            vec![range(0, 0)],
+            vec![range(0, 2), range(2, 1)], // touching: should be one range
+            vec![range(0, 2), range(1, 1)], // overlapping
+            vec![range(3, 1), range(0, 1)], // out of order
+            vec![range(3, 2)],              // past the last leaf
+            vec![range(0, u64::MAX)],       // huge: refused before expanding
+            vec![range(u64::MAX, 1)],
+        ] {
+            assert!(
+                matches!(proof(bad.clone()).indices(4), Err(Error::BadProof)),
+                "{bad:?}"
+            );
+        }
+        assert!(ProofHashes::try_from("AAAA".to_string()).is_err());
+        let (items, tree) = tree_of(4);
+        let leaves: Vec<ItemHash> = items.iter().map(|i| ItemHash::of(i).unwrap()).collect();
+        let text = serde_json::to_string(&tree.prove_many(&[0, 1, 3]).unwrap()).unwrap();
+        assert!(text.starts_with(r#"{"hashes":""#), "{text}");
+        let back: MultiProof = serde_json::from_str(&text).unwrap();
+        back.verify(&[leaves[0], leaves[1], leaves[3]], tree.root(), 4)
+            .unwrap();
     }
 }

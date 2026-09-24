@@ -300,4 +300,340 @@ fn check_not_older(held: &SignedPolicyHead, newer: &SignedPolicyHead) -> Result<
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::identity::NodeIdentity;
+    use crate::item::Ban;
+    use crate::signed_policy::fixtures::*;
+    use crate::signed_policy::{Policy, SignedPolicy};
+    use crate::state::StateVersion;
+    use proptest::prelude::*;
+
+    fn signed() -> SignedPolicy {
+        sample().sign(&root()).unwrap()
+    }
+
+    /// `sample()` at version 4 after `edit`.
+    fn v4(edit: impl FnOnce(&mut Policy)) -> SignedPolicy {
+        let mut p = sample();
+        p.version = StateVersion(4);
+        edit(&mut p);
+        p.sign(&root()).unwrap()
+    }
+
+    fn r() -> NodeId {
+        root().node_id()
+    }
+
+    #[test]
+    fn slice_accessors() {
+        let slice = signed()
+            .slice_for_host(node(10), &[role("oncall")])
+            .unwrap();
+        slice.verify(r()).unwrap();
+        assert!(slice.service(&name("orders-db")).is_some());
+        assert!(slice.service(&name("deploy")).is_none());
+        assert_eq!(slice.role(&role("staff")), Some(&[Matcher::new(ISS)][..]));
+        assert!(slice.role(&role("oncall")).is_some());
+        assert!(slice.issuer(&Issuer::new(ISS)).is_some());
+        assert!(slice.issuer(&Issuer::new("https://other")).is_none());
+        let alice = who("alice@example.com");
+        assert!(slice.role_admits(&role("analyst"), Some(&alice)));
+        assert!(!slice.role_admits(&role("analyst"), None));
+        assert!(!slice.role_admits(&role("ghost"), Some(&alice)));
+        assert!(slice.is_banned(node(20), 500));
+        assert!(!slice.is_banned(node(20), 501));
+        assert!(!slice.is_banned(node(21), 0));
+        assert_eq!(slice.settings(), Some(&Settings::default()));
+    }
+
+    #[test]
+    fn a_tampered_slice_is_refused() {
+        let good = signed().slice_for_host(node(10), &[]).unwrap();
+
+        let mut t = good.clone();
+        let Some(Item::Ban { body, .. }) =
+            t.items.iter_mut().find(|i| matches!(i, Item::Ban { .. }))
+        else {
+            unreachable!()
+        };
+        *body = Ban { until: i64::MAX };
+        assert!(matches!(t.verify(r()), Err(Error::BadProof)));
+
+        // An item dropped: the proof no longer matches the set.
+        let mut t = good.clone();
+        t.items.remove(0);
+        assert!(t.verify(r()).is_err());
+
+        let mut t = good.clone();
+        t.items.swap(0, 1);
+        assert!(matches!(t.verify(r()), Err(Error::InvalidPolicy(_))));
+
+        let mut t = good.clone();
+        let first = t.items[0].clone();
+        t.items.insert(0, first);
+        assert!(matches!(t.verify(r()), Err(Error::InvalidPolicy(_))));
+
+        // Another host's proof over these items.
+        let mut t = good.clone();
+        t.proof = signed().slice_for_host(node(11), &[]).unwrap().proof;
+        assert!(t.verify(r()).is_err());
+
+        assert!(good.verify(node(9)).is_err(), "another root");
+    }
+
+    #[test]
+    fn a_slice_without_settings_is_refused() {
+        // Proved correctly, but withholding the settings.
+        let s = signed();
+        let full = s.slice_for_host(node(10), &[]).unwrap();
+        let items: Vec<Item> = full
+            .items
+            .iter()
+            .filter(|i| !matches!(i, Item::Settings { .. }))
+            .cloned()
+            .collect();
+        let tree = s.tree().unwrap();
+        let indices: Vec<u64> = items
+            .iter()
+            .map(|i| s.items.iter().position(|j| j == i).unwrap() as u64)
+            .collect();
+        let t = Slice {
+            head: full.head,
+            items,
+            proof: tree.prove_many(&indices).unwrap(),
+        };
+        assert!(matches!(t.verify(r()), Err(Error::InvalidPolicy(_))));
+    }
+
+    #[test]
+    fn a_view_carries_only_marked_services() {
+        let s = signed();
+        let good = s.view_for(Some(&who("carol@example.com")), None).unwrap();
+        good.verify(r()).unwrap();
+        assert!(
+            good.entry(&name("locked"))
+                .is_some_and(|e| e.read && !e.call)
+        );
+        assert!(good.entry(&name("deploy")).is_none());
+
+        let mut t = good.clone();
+        t.entries[0].call = false;
+        t.entries[0].read = false;
+        assert!(matches!(t.verify(r()), Err(Error::InvalidPolicy(_))));
+
+        // A role item smuggled in as an entry, with a valid proof for it.
+        let role_item = s.items[0].clone();
+        assert!(matches!(role_item, Item::Role { .. }));
+        let mut entries = vec![ViewEntry {
+            item: role_item,
+            call: true,
+            read: false,
+        }];
+        entries.extend(good.entries.iter().cloned());
+        let mut indices = vec![0u64];
+        indices.extend(
+            good.entries
+                .iter()
+                .map(|e| s.items.iter().position(|j| *j == e.item).unwrap() as u64),
+        );
+        let t = View {
+            head: good.head.clone(),
+            proof: s.tree().unwrap().prove_many(&indices).unwrap(),
+            entries,
+        };
+        assert!(matches!(t.verify(r()), Err(Error::InvalidPolicy(_))));
+        assert!(t.entries[0].service().is_none());
+
+        let mut t = good.clone();
+        t.entries.reverse();
+        assert!(t.verify(r()).is_err());
+    }
+
+    #[test]
+    fn matching_reads_the_view_without_changing_it() {
+        let mut p = sample();
+        p.services.get_mut(&name("status")).unwrap().description =
+            "Uptime of the ORDERS stack".into();
+        let s = p.sign(&root()).unwrap();
+        let view = s.view_for(Some(&who("alice@example.com")), None).unwrap();
+        let names = |q| -> Vec<String> {
+            view.matching(q)
+                .iter()
+                .map(|e| e.service().unwrap().0.to_string())
+                .collect()
+        };
+        assert_eq!(names("orders"), vec!["orders-db", "status"]);
+        assert_eq!(names("DB"), vec!["orders-db"]);
+        assert!(names("nothing matches this").is_empty());
+        view.verify(r()).unwrap();
+    }
+
+    #[test]
+    fn an_unchanged_slice_updates_with_just_a_head_and_a_proof() {
+        let old = signed().slice_for_host(node(10), &[]).unwrap();
+        // An edit that touches only host 11.
+        let new = v4(|p| p.services.get_mut(&name("deploy")).unwrap().description = "x".into());
+        let update = new.slice_update(&old, node(10), &[]).unwrap();
+        assert!(update.changed.is_empty());
+        assert!(update.removed.is_empty());
+        let applied = old.apply(&update, r()).unwrap();
+        assert_eq!(applied, new.slice_for_host(node(10), &[]).unwrap());
+        assert_eq!(applied.head, new.head, "every item now proved under v4");
+        // The old proof doesn't carry over: the old slice under the new head
+        // fails.
+        let mut mixed = old.clone();
+        mixed.head = new.head.clone();
+        assert!(mixed.verify(r()).is_err());
+    }
+
+    #[test]
+    fn changes_additions_and_removals_apply() {
+        let old = signed().slice_for_host(node(10), &[]).unwrap();
+
+        // A changed service of this host.
+        let new = v4(|p| {
+            p.services.get_mut(&name("status")).unwrap().description = "now with SLOs".into();
+        });
+        let update = new.slice_update(&old, node(10), &[]).unwrap();
+        assert_eq!(
+            update.changed.iter().map(Item::key).collect::<Vec<_>>(),
+            vec![ItemKey::Service(name("status"))]
+        );
+        assert_eq!(
+            old.apply(&update, r()).unwrap(),
+            new.slice_for_host(node(10), &[]).unwrap()
+        );
+
+        // A new ban.
+        let new = v4(|p| {
+            p.bans.insert(node(21), Ban { until: 900 });
+        });
+        let update = new.slice_update(&old, node(10), &[]).unwrap();
+        assert_eq!(update.changed.len(), 1);
+        let applied = old.apply(&update, r()).unwrap();
+        assert!(applied.is_banned(node(21), 900));
+
+        // The host dropped from a service: the service and the roles only it
+        // needed go.
+        let new = v4(|p| p.services.get_mut(&name("orders-db")).unwrap().hosts = vec![node(11)]);
+        let update = new.slice_update(&old, node(10), &[]).unwrap();
+        assert!(
+            update
+                .removed
+                .contains(&ItemKey::Service(name("orders-db")))
+        );
+        assert!(update.removed.contains(&ItemKey::Role(role("analyst"))));
+        let applied = old.apply(&update, r()).unwrap();
+        assert!(applied.service(&name("orders-db")).is_none());
+        assert_eq!(applied, new.slice_for_host(node(10), &[]).unwrap());
+    }
+
+    #[test]
+    fn a_bad_update_is_refused_and_the_holder_asks_for_the_whole_slice() {
+        let old = signed().slice_for_host(node(10), &[]).unwrap();
+        let new = v4(|p| {
+            p.services.get_mut(&name("status")).unwrap().description = "changed".into();
+        });
+        let good = new.slice_update(&old, node(10), &[]).unwrap();
+
+        // The changed item withheld: the old copy doesn't prove under v4.
+        let mut t = good.clone();
+        t.changed.clear();
+        assert!(matches!(old.apply(&t, r()), Err(Error::BadProof)));
+
+        // Removing a key the holder doesn't hold.
+        let mut t = good.clone();
+        t.removed.push(ItemKey::Ban(node(55)));
+        assert!(matches!(old.apply(&t, r()), Err(Error::InvalidPolicy(_))));
+
+        // A key both changed and removed.
+        let mut t = good.clone();
+        t.removed.push(ItemKey::Service(name("status")));
+        assert!(old.apply(&t, r()).is_err());
+
+        // A tampered change.
+        let mut t = good.clone();
+        let Item::Service { body, .. } = &mut t.changed[0] else {
+            unreachable!()
+        };
+        body.allow.clear();
+        assert!(matches!(old.apply(&t, r()), Err(Error::BadProof)));
+
+        // An older head.
+        let older = old.update_to(&old);
+        let newer = old.apply(&good, r()).unwrap();
+        assert!(newer.apply(&older, r()).is_err());
+
+        // Another root.
+        assert!(old.apply(&good, node(9)).is_err());
+    }
+
+    #[test]
+    fn views_update_on_grants_and_revocations() {
+        let alice = who("alice@example.com");
+        let old = signed().view_for(Some(&alice), None).unwrap();
+
+        // Alice becomes an auditor: `locked` appears, and orders-db gains `read`.
+        let new = v4(|p| {
+            p.roles
+                .get_mut(&role("auditor"))
+                .unwrap()
+                .push(email("alice@example.com"));
+        });
+        let update = new.view_update(&old, Some(&alice)).unwrap();
+        assert_eq!(update.changed.len(), 2, "{:?}", update.changed);
+        let applied = old.apply(&update, r()).unwrap();
+        assert_eq!(applied, new.view_for(Some(&alice), None).unwrap());
+        assert!(applied.entry(&name("locked")).is_some_and(|e| e.read));
+
+        // Staff is revoked: status leaves the view.
+        let new = v4(|p| {
+            p.services.get_mut(&name("status")).unwrap().allow = vec![role("oncall")];
+        });
+        let update = new.view_update(&old, Some(&alice)).unwrap();
+        assert_eq!(update.removed, vec![ItemKey::Service(name("status"))]);
+        let applied = old.apply(&update, r()).unwrap();
+        assert!(applied.entry(&name("status")).is_none());
+
+        // A mark flipped in transit doesn't verify.
+        let new = v4(|_| {});
+        let mut update = new.view_update(&old, Some(&alice)).unwrap();
+        assert!(update.changed.is_empty());
+        let mut flipped = old.entries[0].clone();
+        flipped.call = false;
+        flipped.read = false;
+        update.changed.push(flipped);
+        assert!(old.apply(&update, r()).is_err());
+    }
+
+    proptest! {
+        /// Whatever the two policies, applying the update the directory
+        /// computes yields exactly the new part, all proved under the new
+        /// head.
+        #[test]
+        fn updates_rebuild_exactly_the_new_part(
+            a in arb_policy(),
+            b in arb_policy(),
+            host in 10u8..15,
+            principal in arb_principal(),
+        ) {
+            let old = a.sign(&root()).unwrap();
+            let mut b = b;
+            b.version = StateVersion(a.version.0 + 1);
+            let new = b.sign(&root()).unwrap();
+
+            let from = old.slice_for_host(node(host), &[]).unwrap();
+            let update = new.slice_update(&from, node(host), &[]).unwrap();
+            let applied = from.apply(&update, r()).unwrap();
+            prop_assert!(applied.verify(r()).is_ok());
+            prop_assert_eq!(applied, new.slice_for_host(node(host), &[]).unwrap());
+
+            let from = old.view_for(principal.as_ref(), None).unwrap();
+            let update = new.view_update(&from, principal.as_ref()).unwrap();
+            let applied = from.apply(&update, r()).unwrap();
+            prop_assert!(applied.verify(r()).is_ok());
+            prop_assert_eq!(applied, new.view_for(principal.as_ref(), None).unwrap());
+        }
+    }
+}

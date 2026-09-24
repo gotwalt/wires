@@ -499,11 +499,12 @@ pub(crate) fn admits(matchers: Option<&[Matcher]>, principal: Option<&Principal>
     matchers.iter().any(|m| m.matches(p))
 }
 
-/// Shared test fixtures: a small, valid policy.
+/// Shared test fixtures: a small, valid policy, and random ones.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
     use crate::idp::Audience;
+    use proptest::prelude::*;
 
     /// The one trusted issuer.
     pub(crate) const ISS: &str = "https://idp.example";
@@ -597,6 +598,69 @@ pub(crate) mod fixtures {
             .insert(name("locked"), service(&[], &["auditor"], &[11]));
         p.bans.insert(node(20), Ban { until: 500 });
         p
+    }
+
+    /// A random policy over roles r0..r4, services s0..s7 and hosts 10..13.
+    pub(crate) fn arb_policy() -> impl Strategy<Value = Policy> {
+        let matcher = prop_oneof![
+            Just(Matcher::new(ISS)),
+            Just(email("alice@example.com")),
+            Just(email("*@corp.example")),
+            Just(Matcher {
+                group: Some("sre".into()),
+                ..Matcher::new(ISS)
+            }),
+        ];
+        let roles = proptest::collection::vec(proptest::collection::vec(matcher, 1..3), 5);
+        let subset = |n: usize| proptest::collection::btree_set(0..n, 0..=n);
+        let services = proptest::collection::vec((subset(5), subset(5), subset(4)), 0..8);
+        let bans = proptest::collection::btree_map(40u8..60, any::<i64>(), 0..5);
+        (roles, services, bans).prop_map(|(roles, services, bans)| {
+            let mut p = sample();
+            p.roles.clear();
+            p.services.clear();
+            p.bans.clear();
+            for (i, matchers) in roles.into_iter().enumerate() {
+                p.roles.insert(role(&format!("r{i}")), matchers);
+            }
+            for (i, (allow, readers, hosts)) in services.into_iter().enumerate() {
+                p.services.insert(
+                    name(&format!("s{i}")),
+                    Service {
+                        description: format!("service {i}"),
+                        allow: allow.into_iter().map(|r| role(&format!("r{r}"))).collect(),
+                        hosts: hosts.into_iter().map(|h| node(10 + h as u8)).collect(),
+                        readers: readers
+                            .into_iter()
+                            .map(|r| role(&format!("r{r}")))
+                            .collect(),
+                    },
+                );
+            }
+            for (b, until) in bans {
+                p.bans.insert(node(b), Ban { until });
+            }
+            p
+        })
+    }
+
+    /// A random principal (or none) from a few emails, two issuers, and the
+    /// `sre` group or not.
+    pub(crate) fn arb_principal() -> impl Strategy<Value = Option<Principal>> {
+        let email = prop_oneof![
+            Just("alice@example.com"),
+            Just("bob@corp.example"),
+            Just("eve@elsewhere.example"),
+        ];
+        let issuer = prop_oneof![Just(ISS), Just("https://partner.example")];
+        proptest::option::of((email, issuer, any::<bool>()).prop_map(|(e, iss, sre)| {
+            let mut p = who(e);
+            p.issuer = iss.into();
+            if sre {
+                p.groups = vec!["sre".into()];
+            }
+            p
+        }))
     }
 }
 
@@ -869,7 +933,7 @@ mod tests {
     fn a_view_holds_only_what_its_caller_may_use() {
         let signed = sample().sign(&root()).unwrap();
         let marks = |p: Option<&Principal>| -> Vec<(String, bool, bool)> {
-            let view = signed.view_for(p).unwrap();
+            let view = signed.view_for(p, None).unwrap();
             view.verify(root().node_id()).unwrap();
             view.entries
                 .iter()
@@ -907,6 +971,27 @@ mod tests {
     }
 
     #[test]
+    fn a_view_query_is_a_view_of_its_own() {
+        let mut p = sample();
+        p.services.get_mut(&name("status")).unwrap().description =
+            "Uptime of the ORDERS stack".into();
+        let signed = p.sign(&root()).unwrap();
+        let alice = who("alice@example.com");
+        let names = |q| -> Vec<String> {
+            let view = signed.view_for(Some(&alice), q).unwrap();
+            view.verify(root().node_id()).unwrap();
+            view.entries
+                .iter()
+                .map(|e| e.service().unwrap().0.to_string())
+                .collect()
+        };
+        assert_eq!(names(Some("orders")), vec!["orders-db", "status"]);
+        assert_eq!(names(Some("DB")), vec!["orders-db"]);
+        assert!(names(Some("deploy")).is_empty(), "not alice's to see");
+        assert!(names(Some("no such thing")).is_empty());
+    }
+
+    #[test]
     fn a_part_cut_from_one_head_fails_under_another() {
         let v3 = sample().sign(&root()).unwrap();
         let mut p = sample();
@@ -921,73 +1006,12 @@ mod tests {
             Err(Error::BadProof)
         ));
 
-        let mut view = v3.view_for(Some(&who("alice@example.com"))).unwrap();
+        let mut view = v3.view_for(Some(&who("alice@example.com")), None).unwrap();
         view.head = v4.head;
         assert!(matches!(
             view.verify(root().node_id()),
             Err(Error::BadProof)
         ));
-    }
-
-    /// A random policy over roles r0..r4, services s0..s7 and hosts 10..13.
-    fn arb_policy() -> impl Strategy<Value = Policy> {
-        let matcher = prop_oneof![
-            Just(Matcher::new(ISS)),
-            Just(email("alice@example.com")),
-            Just(email("*@corp.example")),
-            Just(Matcher {
-                group: Some("sre".into()),
-                ..Matcher::new(ISS)
-            }),
-        ];
-        let roles = proptest::collection::vec(proptest::collection::vec(matcher, 1..3), 5);
-        let subset = |n: usize| proptest::collection::btree_set(0..n, 0..=n);
-        let services = proptest::collection::vec((subset(5), subset(5), subset(4)), 0..8);
-        let bans = proptest::collection::btree_map(40u8..60, any::<i64>(), 0..5);
-        (roles, services, bans).prop_map(|(roles, services, bans)| {
-            let mut p = sample();
-            p.roles.clear();
-            p.services.clear();
-            p.bans.clear();
-            for (i, matchers) in roles.into_iter().enumerate() {
-                p.roles.insert(role(&format!("r{i}")), matchers);
-            }
-            for (i, (allow, readers, hosts)) in services.into_iter().enumerate() {
-                p.services.insert(
-                    name(&format!("s{i}")),
-                    Service {
-                        description: format!("service {i}"),
-                        allow: allow.into_iter().map(|r| role(&format!("r{r}"))).collect(),
-                        hosts: hosts.into_iter().map(|h| node(10 + h as u8)).collect(),
-                        readers: readers
-                            .into_iter()
-                            .map(|r| role(&format!("r{r}")))
-                            .collect(),
-                    },
-                );
-            }
-            for (b, until) in bans {
-                p.bans.insert(node(b), Ban { until });
-            }
-            p
-        })
-    }
-
-    fn arb_principal() -> impl Strategy<Value = Option<Principal>> {
-        let email = prop_oneof![
-            Just("alice@example.com"),
-            Just("bob@corp.example"),
-            Just("eve@elsewhere.example"),
-        ];
-        let issuer = prop_oneof![Just(ISS), Just("https://partner.example")];
-        proptest::option::of((email, issuer, any::<bool>()).prop_map(|(e, iss, sre)| {
-            let mut p = who(e);
-            p.issuer = iss.into();
-            if sre {
-                p.groups = vec!["sre".into()];
-            }
-            p
-        }))
     }
 
     proptest! {
@@ -1024,8 +1048,8 @@ mod tests {
             let mut services = BTreeSet::new();
             let mut roles = BTreeSet::new();
             let mut bans = 0;
-            for proved in &slice.items {
-                match &proved.item {
+            for item in &slice.items {
+                match item {
                     Item::Service { key, body } => {
                         prop_assert!(body.hosts.contains(&node(host)), "{key} doesn't name the host");
                         services.insert(key);
@@ -1050,7 +1074,7 @@ mod tests {
             principal in arb_principal(),
         ) {
             let signed = p.sign(&root()).unwrap();
-            let view = signed.view_for(principal.as_ref()).unwrap();
+            let view = signed.view_for(principal.as_ref(), None).unwrap();
             prop_assert!(view.verify(root().node_id()).is_ok());
             // The rule, spelled out independently of `admits`.
             let admits = |r: &RoleName| match (&principal, p.roles.get(r)) {

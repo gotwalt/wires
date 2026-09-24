@@ -464,7 +464,11 @@ mod tests {
         let signed = sample().sign(&root()).unwrap();
         let fresh = fresh(&signed);
         let slice = signed.slice_for_host(node(10), &[]).unwrap();
-        let view = signed.view_for(Some(&who("alice@example.com"))).unwrap();
+        let view = signed
+            .view_for(Some(&who("alice@example.com")), None)
+            .unwrap();
+        let slice_update = slice.update_to(&slice);
+        let view_update = view.update_to(&view);
         for a in [
             DirectoryAnswer::Published {
                 version: StateVersion(3),
@@ -484,6 +488,14 @@ mod tests {
                 view: view.clone(),
                 fresh: fresh.clone(),
             },
+            DirectoryAnswer::SliceUpdate {
+                update: slice_update.clone(),
+                fresh: fresh.clone(),
+            },
+            DirectoryAnswer::ViewUpdate {
+                update: view_update.clone(),
+                fresh: fresh.clone(),
+            },
             DirectoryAnswer::Denied {
                 reason: "banned".into(),
             },
@@ -501,6 +513,14 @@ mod tests {
             },
             SubFrame::View {
                 view,
+                fresh: fresh.clone(),
+            },
+            SubFrame::SliceUpdate {
+                update: slice_update,
+                fresh: fresh.clone(),
+            },
+            SubFrame::ViewUpdate {
+                update: view_update,
                 fresh: fresh.clone(),
             },
             SubFrame::Replica {
