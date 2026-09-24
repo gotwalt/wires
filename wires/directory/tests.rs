@@ -1,8 +1,8 @@
 //! Card 36b's acceptance, over hermetic loopback: the admin publishes to a
-//! directory and never dials a host; hosts and callers fetch from it; a
-//! restarted directory serves the same head with a new `Fresh`; tampered,
-//! mixed and older policies and a stranger's `Fresh` are refused; a
-//! directory that missed a publish catches up from a replica; and
+//! directory and never dials a host; a host fetches from it and a caller is
+//! refused the whole policy; a restarted directory serves the same head with
+//! a new `Fresh`; tampered, mixed and older policies and a stranger's `Fresh`
+//! are refused; a directory that missed a publish catches up from a replica; and
 //! `wires directory serve` refuses the admin's keystore and an unlisted node.
 
 use std::sync::Arc;
@@ -184,8 +184,8 @@ async fn until_version(dir: &Directory, version: StateVersion) {
     .expect("the directory never caught up");
 }
 
-/// An admin edit reaches the directory, a host and a caller fetch it from
-/// there, and nothing dials the host.
+/// An admin edit reaches the directory, a host fetches it from there (a
+/// caller is refused it), and nothing dials the host.
 #[tokio::test]
 async fn an_edit_reaches_the_directory_and_hosts_fetch_it_nobody_dials_them() {
     let f = Fabric::new(3); // 0: directory, 1: host, 2: caller

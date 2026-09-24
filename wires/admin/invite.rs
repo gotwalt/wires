@@ -4,8 +4,8 @@
 //! **`invite` is not an edit** (card 35). It mints the node's root-signed
 //! badge (its membership), records it in the admin's ledger
 //! ([`super::ledger`]), and bundles it into one [`Invite`] token with the
-//! directory ids and the login settings ([`super::login_client`]): about
-//! 800 bytes, at any fabric size (card 37). A node the policy already names
+//! directory ids and the login settings ([`super::login_client`]):
+//! under 1 KB at any network size (card 37). A node the policy already names
 //! as a host or directory also gets the whole policy (it holds it anyway).
 //! The policy's version doesn't move and nothing is published: every host
 //! admits any badge the root signed. Two cases do edit, and then publish:

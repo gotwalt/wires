@@ -801,7 +801,7 @@ mod tests {
         let ks = admin_with(&[lapsed, live]);
         let root = ks.read_root_identity().unwrap().unwrap();
         let now = now_unix();
-        // A state someone signed a while ago, holding a ban that has since
+        // A policy someone signed a while ago, holding a ban that has since
         // lapsed (as if its `until` passed after that edit).
         let mut s = store::read(&ks, root.node_id()).unwrap().unwrap().policy;
         s.version = StateVersion(s.version.0 + 1);
@@ -903,7 +903,7 @@ mod tests {
     }
 
     /// Run `wires role …` (the parsed command line) against `ks`: the
-    /// state it stored.
+    /// policy it stored.
     fn role_cli(ks: &Keystore, args: &[&str]) -> Result<Held> {
         use crate::{Cli, Command};
         use clap::Parser;

@@ -7,8 +7,8 @@
 //! directories. It lists no members (card 35): a node is admitted by the
 //! root-signed badge the admin mints for it, so inviting one is no edit.
 //! Every other command here edits the policy, signs the next version, and
-//! publishes it to the directories (never to a host: hosts and callers
-//! fetch it from a directory).
+//! publishes it to the directories (never to a host: hosts follow it from a
+//! directory, and callers ask one for their views).
 //!
 //! - [`init`] — `wires init`: root key, node key, the admin's own badge, the
 //!   first signed policy.

@@ -922,7 +922,7 @@ mod tests {
     /// Card 28 §9, card 37: a dialer that may not deliver here (an admitted
     /// node that hosts none of this caller's services, however many it
     /// hosts that the caller may not use, or another network's node) hears
-    /// only the fixed "not admitted", no reason and no state version.
+    /// only the fixed "not admitted", no reason and no policy version.
     #[tokio::test]
     async fn a_refused_deliverer_hears_only_not_admitted() {
         use library::{RoleName, Service, ServiceName};

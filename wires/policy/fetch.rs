@@ -40,7 +40,7 @@ use crate::clock::now_unix;
 use crate::directory::wire::ask;
 use crate::host::transport;
 
-/// How long a cold command spends fetching, all directories together.
+/// How long a host's start-up fetch ([`fetch_now`]) spends, all directories together.
 const COLD_FETCH_BUDGET: Duration = Duration::from_secs(8);
 
 /// Which directories took a published policy and which didn't.
@@ -343,7 +343,7 @@ pub(crate) async fn catch_up(endpoint: &Endpoint, ks: &Keystore) -> Result<Optio
 }
 
 /// `wires serve`'s fetch at start (a host assigned a service while it was
-/// offline): bind as `node` briefly and [`catch_up`], within the cold-fetch
+/// offline): bind as `node` briefly and [`catch_up`], within the start-up fetch
 /// budget.
 pub(crate) async fn fetch_now(
     ks: &Keystore,

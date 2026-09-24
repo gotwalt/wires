@@ -5,7 +5,7 @@
 //! for two things:
 //!
 //! - **Bans.** `wires remove` bans a node until its badge would expire
-//!   anyway ([`Ledger::ban_until`]), so the ban can drop out of the state
+//!   anyway ([`Ledger::ban_until`]), so the ban can drop out of the policy
 //!   then. A node missing from the ledger (a lost ledger, an id typed by
 //!   hand) is banned for the longest badge lifetime `invite` allows
 //!   ([`Ttl::MAX_BADGE`]), which outlasts any badge this admin could have
