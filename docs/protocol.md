@@ -242,14 +242,20 @@ fresh, strictly newer than the held head. Then it is stored, adopted into the di
 signed for it, and subscribers are woken. An older or equal one changes nothing.
 
 **`wires/directory/1`.** Frames are a 4-byte length then canonical JSON tagged by `type`
-(`library/directory/frames.rs`), at most 16 MiB; a request over 16 KiB must open as a `publish`
-(`{"head":`, checked before the rest is read). One request per connection: the dialer sends
-`hello {badge, id_token?}` then one request, and gets one answer (5 s to dial, 10 s per frame).
+(`library/directory/frames.rs`), at most 16 MiB; the `hello` is at most 16 KiB whatever it opens
+with, and a request after it over 16 KiB must open as a `publish` (`{"head":`, checked before the
+rest is read), so only an admitted node can make a directory read a large body. One request per
+connection: the dialer sends `hello {badge, id_token?}` then one request, and gets one answer (5 s
+to dial, 10 s per frame).
 
 - **Admission first.** `check_admitted` (§2) under the held policy (`check_inclusion` when it holds
   none yet). Anyone not admitted hears only `not a member of this network`; the detail is traced,
-  throttled, and logged nowhere. At most 16 streams, on both ALPNs together, are open before their
-  `hello` is decided; one more is closed unanswered.
+  throttled, and logged nowhere. At most 16 connections, on both ALPNs together, are undecided at
+  once (one more is closed unanswered): from the connection until its `hello` is decided, and the
+  stream must open and the `hello` arrive within 10 s. An admitted peer gives up its undecided slot
+  at once and takes one of 64 slots for admitted work (reading and answering its request, which for
+  a view may wait on the IdP's keys, or reading its `subscribe`); one more hears `denied` (`this
+  directory is busy; try again or ask another`).
 - `publish {head, items}`: from any admitted node. Accepted as above, it answers
   `published {version}` with the version it now holds (the published one, or a newer one it
   already had); refused, `denied {reason}`. The admin publishes this way.

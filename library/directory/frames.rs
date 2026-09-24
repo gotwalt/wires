@@ -33,9 +33,11 @@
 //! The caller is always the iroh-authenticated key, never a field. Frames
 //! are a 4-byte big-endian length then canonical JSON tagged by `type`. The
 //! length is checked before anything is allocated: at most
-//! [`MAX_DIRECTORY_FRAME`], and a request over [`MAX_SMALL_DIRECTORY_FRAME`]
-//! must be a `publish` ([`PUBLISH_BODY_PREFIX`]), so nobody but a publisher
-//! (whose head the directory then verifies) can make it read a large body.
+//! [`MAX_DIRECTORY_FRAME`]; the `hello` (read before its sender is admitted)
+//! at most [`MAX_SMALL_DIRECTORY_FRAME`], whatever it opens with; and a
+//! request after it over [`MAX_SMALL_DIRECTORY_FRAME`] must be a `publish`
+//! ([`PUBLISH_BODY_PREFIX`]), so nobody but an admitted publisher (whose
+//! head the directory then verifies) can make it read a large body.
 //!
 //! ```
 //! use library::{DirectoryRequest, StateVersion};

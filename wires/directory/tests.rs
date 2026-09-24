@@ -130,8 +130,19 @@ impl Fabric {
     /// Node `i`'s directory, open from `ks`, serving on its own endpoint
     /// (and following its peers when `replicate`).
     async fn directory(&self, i: usize, ks: &Arc<Keystore>, replicate: bool) -> Serving {
+        self.directory_with(i, ks, replicate, None).await
+    }
+
+    /// [`directory`](Self::directory), with a shorter `stream_deadline`.
+    async fn directory_with(
+        &self,
+        i: usize,
+        ks: &Arc<Keystore>,
+        replicate: bool,
+        stream_deadline: Option<Duration>,
+    ) -> Serving {
         let node = &self.nodes[i];
-        let dir = Directory::open(
+        let mut dir = Directory::open(
             node.duplicate(),
             self.root.node_id(),
             Arc::clone(ks),
@@ -139,6 +150,11 @@ impl Fabric {
             now_unix(),
         )
         .unwrap();
+        if let Some(deadline) = stream_deadline {
+            Arc::get_mut(&mut dir)
+                .expect("no other handle yet")
+                .stream_deadline = deadline;
+        }
         let endpoint = bind(node, &self.book).await;
         let router = Running::mount(Router::builder(endpoint.clone()), &dir).spawn();
         let running =
@@ -666,4 +682,121 @@ fn a_beat_never_rolls_back_a_concurrent_accept() {
     let c = dir.snapshot().unwrap();
     assert_eq!(c.held.signed, newer.signed);
     c.fresh.clone().unwrap().verify(&newer.signed.head).unwrap();
+}
+
+/// A raw connection from `ep` to directory `to` on `alpn`.
+async fn dial(ep: &Endpoint, to: library::NodeId, alpn: &[u8]) -> Connection {
+    let addr = transport::endpoint_addr(&to, &[], None).unwrap();
+    tokio::time::timeout(PATIENCE, ep.connect(addr, alpn))
+        .await
+        .expect("dialing took too long")
+        .unwrap()
+}
+
+/// A `hello` is small: one that announces a publish-sized body is refused
+/// from its prefix, before the directory reads (or waits for) the body.
+#[tokio::test]
+async fn a_large_hello_is_refused_before_its_body_is_read() {
+    let f = Fabric::new(1);
+    f.list_directory(0);
+    let ks = f.join(0);
+    let _d = f.directory(0, &ks, false).await;
+    let stranger = NodeIdentity::generate();
+    let ep = bind(&stranger, &f.book).await;
+    for alpn in [DIRECTORY_ALPN, library::DIRECTORY_SUB_ALPN] {
+        let conn = dial(&ep, f.nodes[0].node_id(), alpn).await;
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        // A 1 MiB frame that opens like a publish, and nothing more.
+        let mut bytes = ((1usize << 20) as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(library::PUBLISH_BODY_PREFIX);
+        wire::write(&mut send, &bytes).await.unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(3), async {
+            if alpn == DIRECTORY_ALPN {
+                wire::read_answer(&mut recv).await.unwrap()
+                    == DirectoryAnswer::Denied {
+                        reason: crate::host::gate::NOT_ADMITTED.into(),
+                    }
+            } else {
+                matches!(
+                    wire::read_sub_frame(&mut recv).await.unwrap(),
+                    Some(library::SubFrame::Denied { .. })
+                )
+            }
+        })
+        .await
+        .expect("the directory waited for a 1 MiB hello");
+        assert!(refused);
+    }
+}
+
+/// Peers that connect and never open a stream give up their undecided
+/// slots at the stream deadline, so they can't lock members out.
+#[tokio::test]
+async fn idle_connections_do_not_hold_the_undecided_slots() {
+    let f = Fabric::new(2);
+    f.list_directory(0);
+    let ks = f.join(0);
+    let deadline = Duration::from_millis(500);
+    let _d = f.directory_with(0, &ks, false, Some(deadline)).await;
+    let stranger = NodeIdentity::generate();
+    let stranger_ep = bind(&stranger, &f.book).await;
+    let mut idle = Vec::new();
+    for _ in 0..super::node::MAX_UNDECIDED {
+        idle.push(dial(&stranger_ep, f.nodes[0].node_id(), DIRECTORY_ALPN).await);
+    }
+    tokio::time::sleep(deadline * 3).await;
+    let member_ep = bind(&f.nodes[1], &f.book).await;
+    let answer = wire::ask(
+        &member_ep,
+        f.nodes[0].node_id(),
+        &f.badge(&f.nodes[1]),
+        None,
+        &DirectoryRequest::Head {},
+    )
+    .await
+    .unwrap();
+    assert!(matches!(answer, DirectoryAnswer::Head { .. }), "{answer:?}");
+    drop(idle);
+}
+
+/// Once a peer is admitted it no longer holds an undecided slot: admitted
+/// peers that stall their request can't lock out new connections.
+#[tokio::test]
+async fn admitted_peers_do_not_hold_the_undecided_slots() {
+    let f = Fabric::new(2);
+    f.list_directory(0);
+    let ks = f.join(0);
+    let _d = f.directory(0, &ks, false).await;
+    let member_ep = bind(&f.nodes[1], &f.book).await;
+    let badge = f.badge(&f.nodes[1]);
+    let hello = DirectoryRequest::Hello {
+        badge: badge.clone(),
+        id_token: None,
+    }
+    .encode()
+    .unwrap();
+    let mut stalled = Vec::new();
+    for _ in 0..super::node::MAX_UNDECIDED {
+        let conn = dial(&member_ep, f.nodes[0].node_id(), DIRECTORY_ALPN).await;
+        let (mut send, recv) = conn.open_bi().await.unwrap();
+        // The hello, then no request.
+        wire::write(&mut send, &hello).await.unwrap();
+        stalled.push((conn, send, recv));
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let answer = tokio::time::timeout(
+        Duration::from_secs(3),
+        wire::ask(
+            &member_ep,
+            f.nodes[0].node_id(),
+            &badge,
+            None,
+            &DirectoryRequest::Head {},
+        ),
+    )
+    .await
+    .expect("no answer in time")
+    .unwrap();
+    assert!(matches!(answer, DirectoryAnswer::Head { .. }), "{answer:?}");
+    drop(stalled);
 }

@@ -58,8 +58,7 @@ impl iroh::protocol::ProtocolHandler for DirectoryProtocol {
             conn.close(1u32.into(), b"busy");
             return Ok(());
         };
-        let result = one_request(&self.0, &conn, caller).await;
-        drop(permit);
+        let result = one_request(&self.0, &conn, caller, permit).await;
         let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
         if let Err(e) = result {
             tracing::debug!(peer = %caller.hex(), "directory request failed: {e:#}");
@@ -68,35 +67,62 @@ impl iroh::protocol::ProtocolHandler for DirectoryProtocol {
     }
 }
 
-/// Serve one request on `conn`: the `hello`, admission, the request, the
-/// answer.
-async fn one_request(dir: &Directory, conn: &Connection, caller: NodeId) -> Result<()> {
-    let (mut send, mut recv) = conn.accept_bi().await.context("accepting a stream")?;
+/// Accept `conn`'s one stream within `dir.stream_deadline` (a peer that
+/// never opens one gives up its undecided slot).
+async fn accept_stream(
+    dir: &Directory,
+    conn: &Connection,
+) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
+    tokio::time::timeout(dir.stream_deadline, conn.accept_bi())
+        .await
+        .map_err(|_| anyhow!("no stream within {:?}", dir.stream_deadline))?
+        .context("accepting a stream")
+}
+
+/// Serve one request on `conn`: the `hello` (small, within the stream
+/// deadline), admission, the request, the answer. `undecided` is this
+/// connection's undecided slot, released once the peer is admitted; an
+/// admitted request holds one of [`MAX_ADMITTED`](super::node::MAX_ADMITTED)
+/// slots instead, or hears [`BUSY`](super::node::BUSY).
+async fn one_request(
+    dir: &Directory,
+    conn: &Connection,
+    caller: NodeId,
+    undecided: tokio::sync::OwnedSemaphorePermit,
+) -> Result<()> {
+    let (mut send, mut recv) = accept_stream(dir, conn).await?;
     let refuse = |detail: String| {
         STRANGERS.refused("directory", caller, &detail);
         DirectoryAnswer::Denied {
             reason: NOT_ADMITTED.into(),
         }
     };
-    let answer = match wire::read_request(&mut recv).await {
+    let hello = wire::read_hello(&mut recv, dir.stream_deadline).await;
+    let answer = match hello {
         Ok(DirectoryRequest::Hello { badge, id_token }) => {
             match dir.admit(caller, &badge, now_unix()) {
                 Err(detail) => refuse(detail),
-                // Admitted: only now is a (possibly large) request read.
-                Ok(()) => match wire::read_request(&mut recv).await {
-                    // A caller's view (card 37), cut for its ID token.
-                    Ok(
-                        request
-                        @ (DirectoryRequest::View { .. } | DirectoryRequest::Resolve { .. }),
-                    ) => {
-                        dir.answer_caller(caller, id_token.as_ref(), request, now_unix())
-                            .await
-                    }
-                    Ok(request) => dir.answer(caller, request, now_unix()),
-                    Err(e) => {
-                        tracing::info!(peer = %caller.hex(), "unreadable directory request: {e:#}");
-                        return Ok(());
-                    }
+                // Admitted: only now is a (possibly large) request read,
+                // under the admitted bound.
+                Ok(()) => match admitted(dir, undecided) {
+                    None => DirectoryAnswer::Denied {
+                        reason: super::node::BUSY.into(),
+                    },
+                    Some(_slot) => match wire::read_request(&mut recv).await {
+                        // A caller's view (card 37), cut for its ID token.
+                        Ok(
+                            request @ (DirectoryRequest::View { .. }
+                            | DirectoryRequest::Resolve { .. }),
+                        ) => {
+                            dir.answer_caller(caller, id_token.as_ref(), request, now_unix())
+                                .await
+                        }
+                        Ok(request) => dir.answer(caller, request, now_unix()),
+                        Err(e) => {
+                            tracing::info!(peer = %caller.hex(), "unreadable directory request: {e:#}");
+                            return Ok(());
+                        }
+                    },
                 },
             }
         }
@@ -106,6 +132,17 @@ async fn one_request(dir: &Directory, conn: &Connection, caller: NodeId) -> Resu
     wire::write(&mut send, &answer.encode()?).await?;
     send.finish().ok();
     Ok(())
+}
+
+/// Trade an admitted peer's undecided slot for an admitted one: `None`
+/// (busy) when [`MAX_ADMITTED`](super::node::MAX_ADMITTED) are in hand.
+/// The undecided slot is released either way.
+fn admitted(
+    dir: &Directory,
+    undecided: tokio::sync::OwnedSemaphorePermit,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    drop(undecided);
+    Arc::clone(&dir.admitted).try_acquire_owned().ok()
 }
 
 /// `wires/directory-sub/1` as a router protocol. See the module docs.
@@ -118,6 +155,9 @@ impl iroh::protocol::ProtocolHandler for SubscriptionProtocol {
         if let Err(e) = subscription(&self.0, &conn, caller).await {
             tracing::debug!(peer = %caller.hex(), "subscription ended: {e:#}");
         }
+        // Let a last frame (a `denied`) reach the subscriber before the
+        // connection goes: it closes once it has read the end.
+        let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
         conn.close(0u32.into(), b"done");
         Ok(())
     }
@@ -133,7 +173,7 @@ async fn subscription(dir: &Directory, conn: &Connection, caller: NodeId) -> Res
         );
         return Ok(());
     };
-    let (mut send, mut recv) = conn.accept_bi().await.context("accepting a stream")?;
+    let (mut send, mut recv) = accept_stream(dir, conn).await?;
     let deny = async |send: &mut iroh::endpoint::SendStream, reason: String| -> Result<()> {
         let frame = SubFrame::Denied {
             reason: transport::truncate_reason(reason),
@@ -142,7 +182,10 @@ async fn subscription(dir: &Directory, conn: &Connection, caller: NodeId) -> Res
         send.finish().ok();
         Ok(())
     };
-    let (badge, id_token) = match wire::read_sub_request(&mut recv).await {
+    let hello = tokio::time::timeout(dir.stream_deadline, wire::read_sub_request(&mut recv))
+        .await
+        .unwrap_or_else(|_| Err(anyhow!("no hello within {:?}", dir.stream_deadline)));
+    let (badge, id_token) = match hello {
         Ok(SubRequest::Hello { badge, id_token }) => (badge, id_token),
         other => {
             let detail = match other {
@@ -157,11 +200,16 @@ async fn subscription(dir: &Directory, conn: &Connection, caller: NodeId) -> Res
         STRANGERS.refused("directory subscription", caller, &detail);
         return deny(&mut send, NOT_ADMITTED.into()).await;
     }
+    // Admitted: the `subscribe` is read under the admitted bound; the
+    // subscription itself then holds a subscriber slot.
+    let Some(reading) = admitted(dir, undecided) else {
+        return deny(&mut send, super::node::BUSY.into()).await;
+    };
     let (kind, have) = match wire::read_sub_request(&mut recv).await? {
         SubRequest::Subscribe { kind, have, .. } => (kind, have),
         SubRequest::Hello { .. } => return deny(&mut send, "a second hello".into()).await,
     };
-    drop(undecided);
+    drop(reading);
     match kind {
         SubscriptionKind::Replica => {}
         SubscriptionKind::Policy => {

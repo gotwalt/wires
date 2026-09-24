@@ -70,8 +70,18 @@ pub(crate) struct Directory {
     pub(crate) max_subscribers: usize,
     /// The subscribers following now.
     pub(crate) subscribers: Arc<tokio::sync::Semaphore>,
-    /// Streams not yet admitted (bounded: any key can dial).
+    /// Connections not yet admitted (bounded: any key can dial). A permit
+    /// is held from the connection until its `hello` is decided, never
+    /// longer.
     pub(crate) undecided: Arc<tokio::sync::Semaphore>,
+    /// Admitted work not yet answered or subscribed: a one-shot request
+    /// being read and answered (a view may wait on an IdP's keys), or a
+    /// `subscribe` being read.
+    pub(crate) admitted: Arc<tokio::sync::Semaphore>,
+    /// How long a new connection may take to open its stream, and a `hello`
+    /// to arrive ([`wire::FRAME_TIMEOUT`](super::wire::FRAME_TIMEOUT);
+    /// shorter in tests).
+    pub(crate) stream_deadline: std::time::Duration,
     /// For tests: count every accept.
     accepts: RwLock<u64>,
     /// The encoded frames its `policy` subscribers share (card 36c).
@@ -84,9 +94,19 @@ pub(crate) struct Directory {
     pub(crate) beat_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
-/// How many streams, on both ALPNs together, may be open before their
-/// `hello` is checked. One more is closed unanswered.
+/// How many connections, on both ALPNs together, may be undecided (from the
+/// connection until its `hello` is decided, at most
+/// [`stream_deadline`](Directory::stream_deadline) to open a stream and as
+/// long again for the `hello`). One more is closed unanswered.
 pub(crate) const MAX_UNDECIDED: usize = 16;
+
+/// How many admitted requests (and `subscribe`s being read) a directory
+/// works on at once, apart from the undecided ones. One more hears
+/// [`BUSY`].
+pub(crate) const MAX_ADMITTED: usize = 64;
+
+/// What an admitted node hears when [`MAX_ADMITTED`] are in hand.
+pub(crate) const BUSY: &str = "this directory is busy; try again or ask another";
 
 /// The default subscriber cap.
 pub(crate) const DEFAULT_MAX_SUBSCRIBERS: usize = 4096;
@@ -144,6 +164,8 @@ impl Directory {
             max_subscribers,
             subscribers: Arc::new(tokio::sync::Semaphore::new(max_subscribers)),
             undecided: Arc::new(tokio::sync::Semaphore::new(MAX_UNDECIDED)),
+            admitted: Arc::new(tokio::sync::Semaphore::new(MAX_ADMITTED)),
+            stream_deadline: super::wire::FRAME_TIMEOUT,
             accepts: RwLock::new(0),
             policy_frames: Default::default(),
             fetcher: KeyFetcher::new(None)?,
