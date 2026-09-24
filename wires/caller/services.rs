@@ -117,7 +117,7 @@ pub(crate) async fn run(a: &ServicesArgs) -> Result<String> {
     if allowed.grants.is_empty() {
         let who = allowed.principal.as_ref().map(Principal::name);
         eprintln!(
-            "wires services: no service allows {} (state v{})",
+            "wires services: no service allows {} (policy v{})",
             who.as_deref().unwrap_or("this node without a login"),
             allowed.state.version().0
         );

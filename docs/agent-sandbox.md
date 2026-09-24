@@ -82,7 +82,7 @@ In order of how much it relies on Claude Code's command parser:
    `Bash` tool: `--tools=` (plus `ToolSearch` if tool search is wanted) and
    `--allowedTools=mcp__wires`, with `wires mcp` in the MCP config and
    `WIRES_LOCKED=1` in that server's `env`. The permission surface is then
-   exactly the services the signed state lets you call, as with any MCP
+   exactly the services the signed policy lets you call, as with any MCP
    server. The `jq` / `head` / `max_bytes` fields give it the same
    in-process filtering as `wires call`. The benchmark measured the CLI path
    (arm 5), not this one; see `bench/REPORT.md`.
@@ -97,7 +97,7 @@ In order of how much it relies on Claude Code's command parser:
    - `$WIRES_HOME/tools.json` owned by the operator and read-only to the
      agent's user, optionally with `"locked": true` in it so the lock holds
      even if the environment is lost. `wires` still writes its own state
-     (`state.json`, `last-good.json`, `inbox/`) under `$WIRES_HOME`, so
+     (`policy.json`, `last-good.json`, `inbox/`) under `$WIRES_HOME`, so
      only the config and credential files need to be read-only.
 
    There, `cat` and friends don't exist: a probe showed Claude Code refuses
@@ -185,7 +185,7 @@ argv. The lock guards `call`, `mcp` and `inbox` only: keep the permission
 rules at `wires call` and `wires inbox` (not `Bash(wires:*)`), because `wires
 tools add`, `join` and `login` write under `$WIRES_HOME`. And a locked caller
 is still a caller-side setting: the host authenticates the node key and
-decides every call by its signed state either way.
+decides every call by its signed policy either way.
 
 **`wires inbox` (card 23).** Locked, it refuses the same credential flags
 (`--node-seed*`, `--membership*`, `--relay-url`) with
