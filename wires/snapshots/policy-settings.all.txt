@@ -1,15 +1,15 @@
 Print the network's settings, or change them and publish
 
-Usage: wires state settings [OPTIONS]
+Usage: wires policy settings [OPTIONS]
 
 Options:
       --freshness <FRESHNESS>    When no directory has vouched for a host's policy lately: keep deciding, or refuse [possible values: lenient, strict]
       --beat-secs <BEAT_SECS>    How often each directory signs a new freshness timestamp, in seconds
       --fresh-secs <FRESH_SECS>  How long each freshness timestamp is good for, in seconds (at least the beat)
-      --state-ttl <TTL>          Lifetime of the new policy, from now; never shortens the current one [default: 90d]
+      --policy-ttl <TTL>         Lifetime of the new policy, from now; never shortens the current one [default: 90d]
   -h, --help                     Print help (see more with '--help')
       --help-all                 Also list the operator and credential flags
 
 Examples:
-  wires state settings
-  wires state settings --freshness strict --beat-secs 60
+  wires policy settings
+  wires policy settings --freshness strict --beat-secs 60

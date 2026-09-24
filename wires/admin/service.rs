@@ -80,7 +80,7 @@ pub(crate) struct ServiceEditArgs {
     pub(crate) reader: Vec<String>,
     /// Lifetime of the new policy, from now (`90d`, `12h`, … or seconds);
     /// never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
+    #[arg(long = "policy-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 
@@ -90,7 +90,7 @@ pub(crate) struct ServiceRmArgs {
     /// The service to drop.
     pub(crate) name: String,
     /// Lifetime of the new policy, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
+    #[arg(long = "policy-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 
@@ -128,7 +128,7 @@ pub(crate) struct RoleSetArgs {
     #[arg(long, default_value = GOOGLE_ISSUER)]
     pub(crate) issuer: String,
     /// Lifetime of the new policy, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
+    #[arg(long = "policy-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 
@@ -138,7 +138,7 @@ pub(crate) struct RoleRmArgs {
     /// The role to drop.
     pub(crate) name: String,
     /// Lifetime of the new policy, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
+    #[arg(long = "policy-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 
@@ -183,7 +183,7 @@ pub(crate) struct IssuerSetArgs {
     #[arg(long)]
     pub(crate) login: bool,
     /// Lifetime of the new policy, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
+    #[arg(long = "policy-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 
@@ -193,7 +193,7 @@ pub(crate) struct IssuerRmArgs {
     /// The IdP's exact `iss`.
     pub(crate) issuer: String,
     /// Lifetime of the new policy, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
+    #[arg(long = "policy-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 

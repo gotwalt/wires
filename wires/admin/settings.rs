@@ -1,4 +1,4 @@
-//! `wires state settings`: the fabric-wide settings in the signed policy
+//! `wires policy settings`: the fabric-wide settings in the signed policy
 //! (card 36c): the freshness rule, and how often directories vouch.
 //!
 //! - `--freshness lenient | strict`: what a host does when no directory has
@@ -12,8 +12,8 @@
 //! the next policy and publishes it, like every admin edit.
 //!
 //! ```text
-//! wires state settings                        # print them
-//! wires state settings --freshness strict     # bans honoured within 15 min, or no calls
+//! wires policy settings                        # print them
+//! wires policy settings --freshness strict     # bans honoured within 15 min, or no calls
 //! ```
 
 use anyhow::{Result, anyhow};
@@ -25,7 +25,7 @@ use super::service::edit_policy;
 use super::ttl::Ttl;
 use crate::policy::store;
 
-/// `state settings` arguments. None given: print the settings.
+/// `policy settings` arguments. None given: print the settings.
 #[derive(Args, Debug, Default)]
 pub(crate) struct SettingsArgs {
     /// When no directory has vouched for a host's policy lately: keep deciding, or refuse
@@ -41,7 +41,7 @@ pub(crate) struct SettingsArgs {
     #[arg(long)]
     pub(crate) fresh_secs: Option<u32>,
     /// Lifetime of the new policy, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
+    #[arg(long = "policy-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 
@@ -95,7 +95,7 @@ pub(crate) fn line(settings: &Settings) -> String {
     )
 }
 
-/// Run `state settings` against `ks` (no publish): print the settings, or
+/// Run `policy settings` against `ks` (no publish): print the settings, or
 /// sign the next policy with them changed (refused when invalid: a zero
 /// beat, or freshness shorter than the beat).
 pub(crate) fn settings_in(ks: &Keystore, a: &SettingsArgs) -> Result<String> {

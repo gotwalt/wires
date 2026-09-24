@@ -22,12 +22,12 @@
 //!   `wires issuer set | rm`, and the edits behind `wires directory add |
 //!   rm`.
 //! - [`propagate`] — publishing each edit to the directories (an edit that
-//!   reaches none fails), and `wires state push`.
-//! - [`settings`] — `wires state settings`: the freshness rule and the
+//!   reaches none fails), and `wires policy push`.
+//! - [`settings`] — `wires policy settings`: the freshness rule and the
 //!   directories' beat, in the signed policy.
 //! - [`keystore`] — the on-disk home: keys, the membership, and the
 //!   flag → env → file → keystore resolution every command uses.
-//! - [`ttl`] — the `--ttl` / `--state-ttl` / `--timeout` lifetimes.
+//! - [`ttl`] — the `--ttl` / `--policy-ttl` / `--timeout` lifetimes.
 
 pub mod init;
 pub mod invite;

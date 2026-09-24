@@ -1,6 +1,6 @@
 Re-publish the signed policy (push), or print or change its settings
 
-Usage: wires state <COMMAND>
+Usage: wires policy <COMMAND>
 
 Commands:
   push      Re-publish the stored signed policy to every directory
@@ -11,5 +11,5 @@ Options:
   -h, --help  Print help
 
 Examples:
-  wires state push
-  wires state settings --freshness strict
+  wires policy push
+  wires policy settings --freshness strict

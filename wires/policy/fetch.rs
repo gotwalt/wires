@@ -1,7 +1,7 @@
 //! Moving the signed policy by key, through the directories
 //! (`wires/directory/1`; the frames are [`library::directory`]'s).
 //!
-//! - [`publish_all`]: after every admin edit (and `wires state push`), the
+//! - [`publish_all`]: after every admin edit (and `wires policy push`), the
 //!   admin publishes the whole new policy to every directory the new head
 //!   lists, plus those the head before the edit listed (so a directory the
 //!   edit drops learns it). It dials no host. A directory it can't reach is
@@ -70,7 +70,7 @@ impl PublishReport {
         );
         if !self.missed.is_empty() {
             out.push_str(&format!(
-                "; not reached: {} (`wires state push` re-publishes it)",
+                "; not reached: {} (`wires policy push` re-publishes it)",
                 self.missed
                     .iter()
                     .map(|n| format!("{}…", n.short()))

@@ -627,7 +627,7 @@ fn directory_edits_are_head_edits() {
         &f.admin,
         crate::admin::invite::RemoveArgs {
             member: f.nodes[1].node_id().hex(),
-            state_ttl: Ttl::default(),
+            policy_ttl: Ttl::default(),
         },
     )
     .unwrap();

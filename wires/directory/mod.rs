@@ -75,7 +75,7 @@ pub(crate) struct DirectoryEditArgs {
     /// The node: an `invite --name` label or a hex node id.
     pub(crate) node: String,
     /// Lifetime of the new policy, from now; never shortens the current one.
-    #[arg(long = "state-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
+    #[arg(long = "policy-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
 }
 

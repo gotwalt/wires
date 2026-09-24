@@ -81,7 +81,7 @@ Admin: admits nodes and signs what runs where (holds the root key)
   role      Define roles from IdP identities: set, rm
   issuer    Trust an IdP: set, rm
   directory Name the network's directories: add, rm; or run one: serve
-  state     Re-publish the signed policy (push) or change its settings
+  policy    Re-publish the signed policy (push) or change its settings
 
 Host: implements the services assigned to it
   serve     Run host.json's services; check every caller; log every call
@@ -191,11 +191,11 @@ Examples:
   wires directory add workbench
   wires directory serve";
 
-/// `wires state`: examples.
-pub(crate) const STATE_AFTER: &str = "\
+/// `wires policy`: examples.
+pub(crate) const POLICY_AFTER: &str = "\
 Examples:
-  wires state push
-  wires state settings --freshness strict";
+  wires policy push
+  wires policy settings --freshness strict";
 
 /// `wires serve`: examples.
 pub(crate) const SERVE_AFTER: &str = "\

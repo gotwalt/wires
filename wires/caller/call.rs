@@ -361,7 +361,7 @@ fn check_fresh(held: &HeldView, now: i64) -> Result<()> {
     if held.view.head.check_fresh(now).is_err() {
         bail!(
             "this node's view (policy version {}) has expired and no newer one could be \
-             fetched, so nothing was dialed; ask the admin to run `wires state push` (or for a \
+             fetched, so nothing was dialed; ask the admin to run `wires policy push` (or for a \
              fresh invite)",
             held.version().0
         );
@@ -1508,7 +1508,7 @@ mod tests {
         let held = HeldView::fetched(expired.view_for(Some(&me()), None), None, 0);
         let err = format!("{:#}", check_fresh(&held, 10).unwrap_err());
         assert!(
-            err.contains("expired") && err.contains("wires state push"),
+            err.contains("expired") && err.contains("wires policy push"),
             "{err}"
         );
         assert!(check_fresh(&held, 1).is_ok());
