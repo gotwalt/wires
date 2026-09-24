@@ -20,16 +20,16 @@ The run follows [docs/demo.md](../../demo.md) (cheat sheet at its top).
       arm 5 in card 19) and `bench/push/REPORT.md` (card 24).
 - [ ] Loopback gate green on HEAD: `.scripts/demo-remote-cli.sh --quiet` and
       `.scripts/demo-push.sh --quiet`.
-- [ ] workbench on HEAD: push to `~/src/wires-demo`, `cargo build --release -p wires`,
+- [x] workbench on HEAD: push to `~/src/wires-demo`, `cargo build --release -p wires`,
       replace the old `wires-demo` unit (it predates the services surface), `orders.db` +
       `host.json` (Google issuer, `orders-db`, `push`), fresh keystore.
-- [ ] Provision per `docs/demo.md`: `init --client-id … --public-client-secret …`;
+- [x] Provision per `docs/demo.md`: `init --client-id … --public-client-secret …`;
       `role set analyst` / `role set security`; `invite` workbench; `directory add
       workbench`; `service add orders-db --allow analyst --reader security --host
       workbench` (both edits exit 1: no directory is up yet); re-invite workbench (that
       token carries the policy); `join`; `serve --check host.json`; `serve host.json` under
       `systemd-run --user` (it is also the directory); `ss -ltnp` shows no TCP listener.
-- [ ] laptop: agent and reader `id` / `join`; reader `wires login` (bare: the invite names
+- [x] laptop: agent and reader `id` / `join`; reader `wires login` (bare: the invite names
       the IdP); Claude Code with
       `WIRES_HOME=~/.wires-agent` and `--allowedTools 'Bash(wires call orders-db:*)'`
       (optionally `wires mcp` in its MCP config, shown only as the compatibility path).
@@ -44,6 +44,16 @@ The run follows [docs/demo.md](../../demo.md) (cheat sheet at its top).
       recording and the casts; re-cast both demos from the scripts' narrated mode.
 
 ## Notes
+
+### Workbench on the directory model (2026-09-24)
+
+workbench runs `00b816b` (PR #8) on a new fabric: the host is also the
+directory (`directory add workbench`), the gateway and the laptop's agent and
+reader are re-invited (same node keys), and `wires login` + `wires call
+orders-db` from the laptop, Claude Code and the Claude.ai connector all work.
+`serve` is now a persistent systemd user unit, not `systemd-run`. Still open
+here: the loopback gate on HEAD, the scripted dry run (watch, push, removal →
+77) and both recordings.
 
 ### Lessons from the first two workbench runs (2026-09-23)
 
