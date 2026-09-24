@@ -92,8 +92,8 @@ pub fn fits_sockaddr(path: &Path) -> bool {
 /// of `bases` that yields a path which fits; `None` if none does.
 ///
 /// Hashing the *full* path keeps the property the long path had — one socket
-/// per (home, topic) — and lets every process that can compute the long path
-/// find the short one. The `wires-<uid>` directory is created `0700` by
+/// per home and socket name — and lets every process that can compute the
+/// long path find the short one. The `wires-<uid>` directory is created `0700` by
 /// [`ControlSocket::bind`] (which refuses one it cannot make private), so a
 /// shared `/tmp` does not open the socket to other users.
 pub fn short_socket_path(full: &Path, uid: u32, bases: &[PathBuf]) -> Option<PathBuf> {

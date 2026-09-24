@@ -8,8 +8,8 @@
 //!
 //! - [`store`] — `$WIRES_HOME/state.json`: read, and adopt a newer verified
 //!   copy under a lock (never an older one).
-//! - [`sync`] — push to members after an admin change; pull from the admin
-//!   or any host when the local copy is stale; the responder side.
+//! - [`sync`] — push to the hosts after an admin change; pull from a host
+//!   (then the admin) when the local copy is stale; the responder side.
 
 pub mod store;
 pub mod sync;

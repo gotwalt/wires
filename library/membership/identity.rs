@@ -19,11 +19,11 @@ pub struct NodeId([u8; 32]);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Signature([u8; 64]);
 
-/// Signature scheme a signed object (membership, roster head, envelope) was
-/// signed with. Only [`Ed25519`](Self::Ed25519) is implemented today; the tag
-/// travels on the wire so a verifier can reject an object signed with a scheme
-/// it does not support, and so other schemes can be added later without a
-/// format change.
+/// Signature scheme a signed object (membership, signed state, call-log
+/// entry) was signed with. Only [`Ed25519`](Self::Ed25519) is implemented
+/// today; the tag travels on the wire so a verifier can reject an object
+/// signed with a scheme it does not support, and so other schemes can be
+/// added later without a format change.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlgorithmId {

@@ -8,8 +8,9 @@
 //! - `membership.json`: the dialer's fabric membership token (mode `0644` — a
 //!   *public* signed credential, not a secret).
 //! - `names.json`: the admin's local labels for members (mode `0600`).
-//! - `state.json`, `admin.json`, `state-checked`: the admin-signed state and
-//!   where to pull it from ([`crate::state::store`]).
+//! - `state.json`, `state-admin.txt`, `state-checked.txt`: the admin-signed
+//!   state, where to pull it from, and when it was last checked
+//!   ([`crate::state::store`]).
 //!
 //! The resolver helpers ([`node_identity`], [`membership`])
 //! encode the precedence the CLI uses: an inline flag wins, then the matching

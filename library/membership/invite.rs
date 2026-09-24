@@ -11,8 +11,8 @@
 //! Everything inside is public: the membership and the state are signed, not
 //! sealed. A copy in the wrong hands admits nobody, because every host binds
 //! the membership to the key the transport authenticated. What it does
-//! reveal is the member list and the service registry (node ids, service
-//! names and the roles they allow).
+//! reveal is the member list, the role definitions and the service registry
+//! (node ids, role matchers, service names and the roles they allow).
 //!
 //! # Trust on first use
 //!

@@ -1,4 +1,4 @@
-//! IdP identity bound to a wires node key, carried as metadata on a channel.
+//! IdP identity bound to a wires node key, presented in the handshake.
 //!
 //! A node key says *which machine* is calling; an organization wants to know
 //! *which person*. `wires login` closes that gap without a wires-run identity
@@ -8,14 +8,14 @@
 //! containing that nonce, so the token itself proves "the holder of node key
 //! *K* authenticated as *alice@corp*".
 //!
-//! The node then publishes an [`IdentityClaim`] — its node id plus the raw ID
-//! token — on the channel (see [`ChannelRecord`](crate::ChannelRecord)).
-//! Anyone who reads it (a responder deciding whether to run a tool, an
-//! observer rendering an audit log) verifies the IdP's signature against the
-//! issuer's published keys **themselves** with [`verify_claim`] and derives
-//! the [`Principal`]. No party has to trust a wires attestor, and two
-//! organizations with two IdPs can share one channel — that is the federation
-//! story.
+//! Nothing is published. The caller presents the raw ID token in the session
+//! `Hello` of each call (and of each inbox fetch or record stream it opens);
+//! the host pairs it with the key iroh authenticated to form an
+//! [`IdentityClaim`], verifies the IdP's signature against the issuer's
+//! published keys **itself** with [`verify_claim`], under the issuers its own
+//! `host.json` trusts, and derives the [`Principal`]. No party has to trust a
+//! wires attestor, and hosts can trust several IdPs at once; every role
+//! matcher names the issuer it accepts.
 //!
 //! This module is pure: it verifies against a [`Jwks`] the caller already
 //! holds. Fetching and caching the issuer's keys (OIDC discovery →
@@ -272,8 +272,9 @@ pub struct Principal {
     pub claims: Map<String, Value>,
 }
 
-/// "Node *K* is held by the person this ID token names" — published on a
-/// channel for every reader to verify independently.
+/// "Node *K* is held by the person this ID token names": the ID token a
+/// caller presented, paired with the key the connection authenticated, for
+/// the host to verify independently.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct IdentityClaim {
     /// The node key the token was minted for (its `nonce` must equal

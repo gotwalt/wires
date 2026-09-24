@@ -8,7 +8,9 @@
 //! shape the remote stdout in-process ([`shape`](crate::caller::shape)), as
 //! `wires call --jq/--head/--max-bytes` do. Calling a tool dials the responder over wires (through a
 //! [`Caller`]) and returns the remote output as one text block. There is no
-//! HTTP, no OAuth, and no token: the caller's identity is this node's key.
+//! HTTP and no OAuth here: the caller is this node's key and the ID token
+//! `wires login` stored, presented in each call's `Hello` as `wires call`
+//! does, so the host verifies the same person and keeps the same record.
 //!
 //! Wire format: newline-delimited JSON-RPC 2.0 on stdin/stdout. **stdout is
 //! protocol-only** — every diagnostic goes to stderr. Both eras are served

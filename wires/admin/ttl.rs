@@ -1,5 +1,5 @@
 //! [`Ttl`]: a lifetime typed the way people say it, shared by every command
-//! that takes one (`--ttl`, `--timeout`).
+//! that takes one (`--ttl`, `--state-ttl`, `--timeout`).
 
 use std::str::FromStr;
 

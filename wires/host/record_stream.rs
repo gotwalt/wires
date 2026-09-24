@@ -1,7 +1,8 @@
 //! The record stream (card 26b): a host serves its own signed call log
 //! ([`call_log`](super::call_log)) to authorized readers, by key, on
-//! [`ALPN`]. Nothing is broadcast: a record leaves the host only when a
-//! reader asks for it and may see it.
+//! [`ALPN`]. Nothing is broadcast: a record's content leaves the host only
+//! when a reader asks for it and may see it (any other member asking gets
+//! its hash link).
 //!
 //! # Protocol
 //!

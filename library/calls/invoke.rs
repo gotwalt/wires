@@ -1,14 +1,15 @@
-//! What a dialer asks a multi-tool responder to run.
+//! What a caller asks a host to run.
 //!
-//! A responder started with `wires serve --expose name=cmd …` fronts several
-//! CLIs at once. The dialer names one of them with a [`ToolName`] and supplies
-//! the per-call arguments as an [`Argv`]; together they form the
-//! [`Invocation`] carried in a [`Frame::Invoke`](crate::Frame::Invoke) sent
-//! right after the handshake.
+//! A host implements the services its signed state assigns to it
+//! (`host.json`). The caller names one of them with a [`ToolName`] (the
+//! service name, under the same rules as a
+//! [`ServiceName`](crate::ServiceName)) and supplies the per-call arguments as
+//! an [`Argv`]; together they form the [`Invocation`] carried in a
+//! [`Frame::Invoke`](crate::Frame::Invoke) sent right after the `Hello`.
 //!
-//! The responder never passes the caller's arguments to a shell: the exposed
-//! command's own argv is fixed at serve time and the caller's [`Argv`] is
-//! *appended* to it, element by element. Both newtypes validate on
+//! The host never passes the caller's arguments to a shell: the service's
+//! own argv is fixed in `host.json` and the caller's [`Argv`] is *appended*
+//! to it, element by element. Both newtypes validate on
 //! construction and on deserialization, so a value of either type is always
 //! within the limits below.
 

@@ -2,8 +2,9 @@
 //!
 //! The caller binds its node key to an IdP identity (`wires login`), lists
 //! the services the signed state lets it call (`wires services`), and runs
-//! them by name (`wires call`, the CLI-native path; `wires mcp`, the stdio
-//! MCP adapter kept for clients that only speak MCP).
+//! them by name (`wires call`, the CLI-native path and the source of the
+//! token savings; `wires mcp`, the same services as MCP tools over stdio, so
+//! wires works in the MCP clients people already use).
 //!
 //! - [`call`] — dial a tool and bridge stdio; the exit code is the remote one.
 //! - [`shape`] — `--jq` / `--head` / `--max-bytes`: output shaping, in-process.
@@ -11,7 +12,8 @@
 //!   fetched from the hosts of its services, or received while `--wait`s.
 //! - [`lock`] — locked mode: `WIRES_LOCKED=1` refuses the override flags so a
 //!   sandboxed agent can't steer `call`/`mcp` off the operator's config.
-//! - [`mcp`] — the same calls as MCP tools over stdio (backward compatibility).
+//! - [`mcp`] — the same calls as MCP tools over stdio (the core `wires
+//!   gateway` also serves over HTTP).
 //! - [`tools`] — `tools.json`: locked mode, and local aliases (name → one
 //!   host, with address hints).
 //! - [`login`] — OIDC sign-in, nonce-bound to this node's key.

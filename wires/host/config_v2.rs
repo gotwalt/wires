@@ -244,8 +244,9 @@ impl HostConfigV2 {
         Ok(())
     }
 
-    /// Check this file against the signed state, before `serve` starts and
-    /// again whenever the state advances: every service here must be assigned
+    /// Check this file against the signed state, when `serve` starts (only
+    /// then: a later state that unassigns a service is enforced per call by
+    /// the gate, which refuses it): every service here must be assigned
     /// to `me` ("refuses to serve a name the registry doesn't assign to
     /// it"), and every role in `also_require` and `push.allow` must be
     /// defined in `state`. The error names the first offender.

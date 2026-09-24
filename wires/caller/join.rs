@@ -7,8 +7,10 @@
 //! every other command looks for them, and records the admin's node id to
 //! pull newer states from.
 //!
-//! After this, newer states arrive by push from the admin (or are pulled on
-//! a cold command); nothing needs importing by hand again.
+//! After this, newer states arrive by push from the admin (hosts only: a
+//! running `serve` is what listens), or are pulled from a host on a cold
+//! command or handed back in a call's `HelloAck`; nothing needs importing by
+//! hand again.
 
 use anyhow::{Context, bail};
 use clap::Args;

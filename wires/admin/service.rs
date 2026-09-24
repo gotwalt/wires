@@ -1,6 +1,6 @@
 //! `wires service add | set | rm` and `wires role set | rm` (card 27): the
 //! admin edits the admin-signed state, signs the next version,
-//! and pushes it to every member, hosts first.
+//! and pushes it to the hosts ([`super::propagate`]).
 //!
 //! ```text
 //! wires role set analyst '*@example.com' 'issuer=https://idp,group=dba'

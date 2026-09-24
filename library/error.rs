@@ -113,8 +113,9 @@ pub enum Error {
 
 /// Why an OIDC ID token failed [`verify_claim`](crate::verify_claim).
 ///
-/// One variant per check, so each failure is distinguishable — the card-05
-/// policy gate and the tail renderer both surface these verbatim.
+/// One variant per check, so each failure is distinguishable: `wires login`
+/// reports it, and a host keeps it in its trace (its caller hears only a
+/// generic refusal).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum IdTokenError {
     /// The token is not a well-formed compact JWS with JSON header and

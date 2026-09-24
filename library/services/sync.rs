@@ -2,13 +2,14 @@
 //!
 //! Two directions on one ALPN, [`STATE_ALPN`]:
 //!
-//! - **Push:** after `invite`, `remove` or `wires service add|rm|set`, the
-//!   admin dials every member (hosts first) and sends
+//! - **Push:** after every admin edit (and `wires state push`), the admin
+//!   dials every host (only a running `serve` answers) and sends
 //!   [`StateFrame::Offer`]; the receiver verifies it under its root, adopts
 //!   it if [newer](crate::SignedState::is_newer_than), and answers
 //!   [`StateFrame::Have`] with the version it now holds.
-//! - **Pull:** a member whose copy is older than N minutes dials the admin or
-//!   any host and sends [`StateFrame::Have`]; the peer answers
+//! - **Pull:** a member whose copy was last checked more than 10 minutes ago
+//!   dials the hosts in its copy (then the admin) and sends
+//!   [`StateFrame::Have`]; the peer answers
 //!   [`StateFrame::Offer`] when it holds a newer copy, else `Have`.
 //!
 //! A node never adopts an older or unverifiable state, so a peer that lies

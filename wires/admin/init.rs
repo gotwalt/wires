@@ -3,7 +3,7 @@
 //! Creates the root key and this machine's node key in one keystore, mints
 //! this node's membership, and signs the first admin-signed state with this
 //! node as its one member — the admin is a member too, which is what lets it
-//! push every later state to the others by key.
+//! push every later state to the hosts by key.
 
 use anyhow::bail;
 use clap::Args;

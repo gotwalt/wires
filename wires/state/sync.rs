@@ -12,7 +12,8 @@
 //!   before first) and then the admin for a newer one ([`refresh_cold`]),
 //!   stopping at the first adopted state or the first vouched "you are
 //!   current"; a running `wires serve` does the same on a timer
-//!   ([`refresh_loop`]), and once before its preflight ([`pull_now`]).
+//!   ([`refresh_loop`]), and once at start when its preflight fails
+//!   ([`pull_now`]).
 //! - [`respond`] / [`StateResponder`]: the side a running host serves on the
 //!   ALPN: answer a pull, adopt an offer.
 //!

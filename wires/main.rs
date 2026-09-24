@@ -27,8 +27,9 @@
 //!
 //! `call` keeps stdout **byte-pure** (only the remote CLI's bytes): every
 //! diagnostic goes to stderr, and the exit code carries the outcome — the
-//! child's own code on success, [`EXIT_DENIED`] when the responder refused the
-//! credentials, `1` for any local or transport failure.
+//! child's own code on success (a remote `77` is reported as `1`), and
+//! [`EXIT_DENIED`] only when the host refused the call, `1` for any local or
+//! transport failure.
 
 mod admin;
 mod caller;
@@ -109,7 +110,7 @@ enum Command {
     /// sign the first state (this node its one member).
     Init(admin::init::InitArgs),
     /// Add a node to the signed state and print its join token (stdout); the
-    /// new state is pushed to every host.
+    /// new state is pushed to the hosts.
     Invite(admin::invite::InviteArgs),
     /// Remove a node (by `--name` label or id) from the signed state; it is
     /// pushed to the hosts, and every host that has it refuses the node's

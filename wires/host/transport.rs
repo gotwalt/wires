@@ -12,7 +12,7 @@
 //! a shell — with the verified caller identity injected into its
 //! environment, and bridges its stdio over tagged frames.
 //!
-//! Two properties this module exists to preserve:
+//! The properties this module exists to preserve:
 //!
 //! - **Refusals are legible.** A host that turns a caller away sends a
 //!   [`Frame::Denied`] carrying the reason before closing, which the dialer

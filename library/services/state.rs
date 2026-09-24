@@ -3,15 +3,15 @@
 //! exist (card 27).
 //!
 //! [`State`] is the content; [`SignedState`] is that content plus the root's
-//! signature. It replaces the channel as the thing every node holds: `wires
-//! join` installs it, the admin pushes each new version to every member, and
-//! members pull a newer copy from the admin or from any host. Nothing in it
-//! is secret: every member holds the whole document, and it is checked
-//! offline.
+//! signature. It is the thing every node holds: `wires join` installs it,
+//! the admin pushes each new version to the hosts, and other members pull a
+//! newer copy from a host. Nothing in it is secret: every member holds the
+//! whole document (card 29 replaces that with per-caller views), and it is
+//! checked offline.
 //!
 //! - **Signed bytes:** [`STATE_CONTEXT`] followed by the canonical JSON of
 //!   `{alg, state}`. The context separates it from every other object the
-//!   same root key signs (memberships, roster heads).
+//!   same root key signs (memberships).
 //! - **Versioning:** [`StateVersion`] only goes up. A node keeps the newest
 //!   copy it has verified ([`SignedState::is_newer_than`]) and never accepts
 //!   an older one; that is how a removal sticks.

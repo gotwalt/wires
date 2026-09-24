@@ -153,7 +153,7 @@ impl OutputHasher {
 ///
 /// Enough to show an observer the SQL statement or prompt an agent piped in —
 /// the part of a call a skeptic most wants to see — without turning the
-/// channel into a copy of every payload. The full input is still pinned by
+/// call log into a copy of every payload. The full input is still pinned by
 /// `stdin_digest`.
 pub const STDIN_HEAD_MAX: usize = 4096;
 

@@ -161,8 +161,8 @@ impl KeyFetcher {
     /// Verify `claim` against its issuer's current keys.
     ///
     /// The issuer is read (unverified) from the token only to pick which keys
-    /// to fetch, and must be in `trusted` — an observer never fetches from a
-    /// URL an arbitrary channel member chose.
+    /// to fetch, and must be in `trusted` — a verifier never fetches from a
+    /// URL the presenter chose.
     pub(crate) async fn verify(
         &self,
         claim: &IdentityClaim,
