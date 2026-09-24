@@ -517,3 +517,13 @@ Delete, or rewrite so the test can fail for the reason in its name.
   passages each live in one place.
 
 ## Notes
+
+### Decisions (2026-09-24, integrator's recommendations; the human said "go for it")
+
+- **D1 → (a).** Aliases stay, as `wires tools add|list|rm` only. The hidden
+  "old name of `wires services`" behaviour (no-subcommand listing) goes.
+- **D2 → rename.** User-facing "fabric" becomes "network" (e.g. "not a member
+  of this network"); internal type names (`FabricId`) stay. Demo scripts and
+  demo.md follow. The GIF/MP4 re-record is card 08's (it records anyway).
+- **D3 → yes.** The board table lists open cards; `done/` holds the rest.
+- **D4 → yes.** `config_v2` → `config`, `HostConfigV2` → `HostConfig`, etc.
