@@ -63,7 +63,8 @@ pub(crate) struct Directory {
     db: DirectoryDb,
     /// The newest policy and `Fresh`, and the channel subscribers follow.
     current: tokio::sync::watch::Sender<Snapshot>,
-    /// Serializes accepts (the store has one writer).
+    /// Serializes accepts and beats (the store has one writer, and the
+    /// head announced is always the newest held).
     write: std::sync::Mutex<()>,
     /// The subscriber cap (local config).
     pub(crate) max_subscribers: usize,
@@ -77,6 +78,10 @@ pub(crate) struct Directory {
     pub(crate) policy_frames: super::sub_policy::FrameCache,
     /// Verifies callers' ID tokens (the IdPs' keys, in memory only).
     fetcher: KeyFetcher,
+    /// For tests: run once by the next [`beat`](Directory::beat), after it
+    /// signs and before it announces.
+    #[cfg(test)]
+    pub(crate) beat_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// How many streams, on both ALPNs together, may be open before their
@@ -142,6 +147,8 @@ impl Directory {
             accepts: RwLock::new(0),
             policy_frames: Default::default(),
             fetcher: KeyFetcher::new(None)?,
+            #[cfg(test)]
+            beat_hook: std::sync::Mutex::new(None),
         });
         dir.beat(now)?;
         Ok(dir)
@@ -188,14 +195,21 @@ impl Directory {
     /// Sign a new `Fresh` for the held head, valid for the head's
     /// `settings.fresh_secs` from `now`, store it and announce it. A head
     /// that doesn't list this node gets none (traced): it holds the policy
-    /// but vouches for nothing.
+    /// but vouches for nothing. It holds the writer lock [`accept`](Self::accept)
+    /// holds, and reads the head under it, so it never announces (or stores
+    /// a `Fresh` for) a head older than one accepted meanwhile.
     pub(crate) fn beat(&self, now: i64) -> Result<()> {
+        let _one_writer = self.write.lock().map_err(|_| anyhow!("a poisoned lock"))?;
         let Some(current) = self.snapshot() else {
             return Ok(());
         };
         let fresh = self.sign_fresh(&current.held, now);
         if let Some(f) = &fresh {
             self.db.set_fresh(f)?;
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.beat_hook.lock().unwrap().take() {
+            hook();
         }
         self.current.send_replace(Some(Arc::new(Current {
             held: current.held.clone(),

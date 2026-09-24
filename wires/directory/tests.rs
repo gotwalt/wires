@@ -633,3 +633,37 @@ fn directory_edits_are_head_edits() {
     .unwrap();
     assert!(f.policy().directories().is_empty());
 }
+
+/// A beat never rolls back a publish accepted while it signs: what it
+/// announces and vouches for is the newest head held.
+#[test]
+fn a_beat_never_rolls_back_a_concurrent_accept() {
+    let f = Fabric::new(1);
+    f.list_directory(0);
+    let ks = f.join(0);
+    let now = now_unix();
+    let dir = Directory::open(f.nodes[0].duplicate(), f.root.node_id(), ks, 8, now).unwrap();
+    let newer = f.assign("status", 0);
+    // While the beat is between signing and announcing, a publish arrives
+    // on another thread, given a moment to land if nothing holds it off.
+    let (took_tx, took_rx) = std::sync::mpsc::channel();
+    let accepter = Arc::clone(&dir);
+    let candidate = newer.signed.clone();
+    *dir.beat_hook.lock().unwrap() = Some(Box::new(move || {
+        std::thread::spawn(move || {
+            took_tx
+                .send(accepter.accept(&candidate, now).unwrap())
+                .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(300));
+    }));
+    dir.beat(now + 1).unwrap();
+    assert!(
+        took_rx.recv_timeout(PATIENCE).unwrap(),
+        "the publish was taken"
+    );
+    assert_eq!(dir.version(), newer.version(), "the beat rolled it back");
+    let c = dir.snapshot().unwrap();
+    assert_eq!(c.held.signed, newer.signed);
+    c.fresh.clone().unwrap().verify(&newer.signed.head).unwrap();
+}
