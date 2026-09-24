@@ -197,3 +197,49 @@ and the admin's push to every host. Callers keep their full state and cold pull 
   are re-issued by invite.
 
 ## Notes
+
+**36a (2026-09-24, branch `worker/36a-policy-types`): the pure `library` types.** No `wires/`
+changes; `state.rs`, `access.rs` and `membership/` untouched (card 35's lane).
+
+- **Modules.** `library/services/`: `item` (`Item`, `ItemKey`, `Ban`, `IssuerConfig`,
+  `Settings`, `FreshnessMode`), `merkle` (`ItemTree`, `ItemHash`, `ItemsRoot`, `InclusionProof`,
+  `ProofPath`), `head` (`PolicyHead`, `SignedPolicyHead`, `HeadHash`), `signed_policy`
+  (`Policy`, `SignedPolicy`), `parts` (`Slice`, `View`, `ViewEntry`, `ProvedItem`), `fresh`
+  (`Fresh`). `library/directory/frames.rs` is `library::directory` (`DirectoryRequest`,
+  `DirectoryAnswer`, `SubRequest`, `SubFrame`, both ALPNs). The module isn't called `policy`
+  (taken by `check_inclusion`) or `slice` (shadows the primitive in doc links).
+- **`Policy` mirrors `State`.** Typed maps (`roles`, `services`, `bans`, `issuers`, one
+  `settings`) the admin edits, and `sign` → `SignedPolicy { head, items }`, so an edit can't make
+  two items with one key or a second settings item. `Policy::from_items` is the inverse.
+- **Validation** carries over the state's rules (defined roles, matchers with an issuer, each
+  host once) and tightens one: **every matcher must name an issuer that has an `issuer` item.**
+  36b's `init` must therefore sign an issuer item (Google by default) before any role.
+- **Proofs** are `{index, path}`: the sides come from the index and the head's `item_count`, so
+  a proof is bound to one position in one tree. The path travels as one base64url string
+  (a third smaller than hex strings). An odd node carries up unchanged (CT rule).
+- **`Fresh`** is one type with its `sig` inline (like `Membership`), names its signer
+  (`directory`), and vouches for one head by version **and** `HeadHash` (blake3 of the signed
+  head's canonical JSON). `is_current(now)` allows `CLOCK_SKEW_SECS` before `at`.
+- **Frames.** `publish` is the only request that may exceed 16 KiB (`PUBLISH_BODY_PREFIX`,
+  checked from the body's first bytes); everything is at most 16 MiB. `head {}` is a braced
+  variant because serde ignores unknown fields on unit variants. `resolve` is answered with a
+  one-entry (or empty) `view`. `current {fresh}` answers a `slice`/`view` whose `have` is the
+  newest. Subscriptions send the subscriber's **whole** part under a new head
+  (`slice`/`view`/`replica`) or a `fresh` beat.
+- **Measured** (`cargo run --release -p library --example policy_sizes`): head 558 B;
+  `Fresh` 446 B (475 B as a beat frame; the model's `timestamp` is 300); a service item 349 B,
+  with its proof 860 B at 1k services (depth 11) and 946 B at 5k (depth 13), so a proof costs
+  511–597 B per item against the model's `entry_sig` 150. A 30-service view is 27–30 KB. A host
+  slice is **184 KB** at 1k services / 300 open bans and **1.06 MB** at 5k / 1,500 bans: bans
+  are most of it, since every host holds every ban with its own proof.
+- **For 36b, a gap in "a host whose slice didn't change receives only the new head and
+  `Fresh`":** every edit changes `items_root`, so the proofs a host holds no longer verify under
+  the new head. Keeping old-head proofs under a new head is the version mixing the tree exists to
+  prevent (a directory could keep serving a revoked role with a current `Fresh`). Either every
+  update re-proves the host's whole slice (184 KB × edits a day at 1k services, far over the
+  model's 88 KB/day), or 36b adds one of: (a) a **multiproof** over all a host's items (the bans,
+  issuers and settings are one contiguous leaf range, so they cost about 2·log n hashes; an
+  unchanged slice then costs head + `Fresh` + a few KB), or (b) a root-signed change list in the
+  head (`previous` head hash + changed keys with their new leaf hashes), which lets a host carry
+  unchanged items forward with no proof at all. (a) stays inside the Merkle module; (b) changes
+  the signed head format.

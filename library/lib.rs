@@ -10,7 +10,10 @@
 //! - `calls/` — remote CLI calls: the session frames, invocations, audit
 //!   records and the host's call log, pushes, and IdP identity.
 //! - `services/` — the admin-signed state: roles, the service registry, the
-//!   signed [`State`], policy evaluation, and state sync.
+//!   signed [`State`], policy evaluation, and state sync; and its successor,
+//!   the policy a directory serves (card 36): items, their Merkle tree, the
+//!   signed head, slices and views, and freshness.
+//! - `directory/` — the directory's request and subscription frames.
 //!
 //! The folders are a filing system, not a namespace: every module is still
 //! declared here at the crate root (`library::state`, `library::session`, …),
@@ -39,6 +42,17 @@
 //! - [`state`] — the admin-signed, versioned [`State`] / [`SignedState`].
 //! - [`access`] — [`authorize`] and [`allowed_services`] over that state.
 //! - [`sync`] — the [`StateFrame`] push/pull protocol on [`STATE_ALPN`].
+//! - [`item`] — the policy's leaves: [`Item`] (role, service, ban, issuer,
+//!   settings) and its [`ItemKey`].
+//! - [`merkle`] — the [`ItemTree`] over items: [`ItemsRoot`] and
+//!   [`InclusionProof`].
+//! - [`head`] — the root-signed [`PolicyHead`] / [`SignedPolicyHead`].
+//! - [`signed_policy`] — the whole [`Policy`] and [`SignedPolicy`], and the
+//!   parts cut from it.
+//! - [`parts`] — a host's [`Slice`], a caller's [`View`].
+//! - [`fresh`] — a directory's signed [`Fresh`] timestamp.
+//! - [`directory`] — the [`DirectoryRequest`] / [`SubRequest`] frames on
+//!   [`DIRECTORY_ALPN`] and [`DIRECTORY_SUB_ALPN`].
 //! - [`error`] — the crate [`Error`] and [`Result`].
 //!
 //! # Example: sign a state, check a caller
@@ -138,6 +152,24 @@ pub mod state;
 #[path = "services/sync.rs"]
 pub mod sync;
 
+// services/ — the policy a directory serves (card 36).
+#[path = "services/fresh.rs"]
+pub mod fresh;
+#[path = "services/head.rs"]
+pub mod head;
+#[path = "services/item.rs"]
+pub mod item;
+#[path = "services/merkle.rs"]
+pub mod merkle;
+#[path = "services/parts.rs"]
+pub mod parts;
+#[path = "services/signed_policy.rs"]
+pub mod signed_policy;
+
+// directory/ — the directory's protocols.
+#[path = "directory/frames.rs"]
+pub mod directory;
+
 mod codec;
 #[cfg(test)]
 #[path = "calls/idp_vectors.rs"]
@@ -150,7 +182,13 @@ pub use call_log::{
     verify_chain,
 };
 pub use codec::B64;
+pub use directory::{
+    DIRECTORY_ALPN, DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, MAX_DIRECTORY_FRAME,
+    MAX_SMALL_DIRECTORY_FRAME, PUBLISH_BODY_PREFIX, SubFrame, SubRequest, SubscriptionKind,
+};
 pub use error::{Error, IdTokenError, Result};
+pub use fresh::{FRESH_CONTEXT, FRESH_V1, Fresh};
+pub use head::{HeadHash, POLICY_HEAD_CONTEXT, POLICY_V3, PolicyHead, SignedPolicyHead};
 pub use identity::{AlgorithmId, NodeId, NodeIdentity, Signature};
 pub use idp::{
     Audience, CLOCK_SKEW_SECS, GOOGLE_ISSUER, IdToken, IdentityClaim, Issuer, Jwk, Jwks,
@@ -158,7 +196,13 @@ pub use idp::{
 };
 pub use invite::{INVITE_V2, Invite};
 pub use invoke::{Argv, Invocation, MAX_ARGS, MAX_ARGV_BYTES};
+pub use item::{
+    Ban, DEFAULT_BEAT_SECS, DEFAULT_FRESH_SECS, FreshnessMode, IssuerConfig, Item, ItemKey,
+    Settings,
+};
 pub use membership::{MEMBERSHIP_V1, Membership};
+pub use merkle::{InclusionProof, ItemHash, ItemTree, ItemsRoot, MAX_PROOF_DEPTH, ProofPath};
+pub use parts::{ProvedItem, Slice, View, ViewEntry};
 pub use policy::check_inclusion;
 pub use push::{
     INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_FRAME, MAX_INBOX_HELLO, MAX_PUSH_BODY,
@@ -167,5 +211,6 @@ pub use push::{
 pub use registry::{MAX_SERVICE_NAME, Service, ServiceName};
 pub use role::{EmailPattern, MAX_ROLE_NAME, Matcher, RoleName};
 pub use session::{Chunk, Frame, Hello, HelloAck};
+pub use signed_policy::{Policy, SignedPolicy};
 pub use state::{STATE_CONTEXT, STATE_V1, SignedState, State, StateVersion};
 pub use sync::{MAX_SMALL_STATE_FRAME, MAX_STATE_FRAME, OFFER_BODY_PREFIX, STATE_ALPN, StateFrame};

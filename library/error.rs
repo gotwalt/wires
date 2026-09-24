@@ -107,6 +107,29 @@ pub enum Error {
     /// just "unverified".
     #[error("id token rejected: {0}")]
     IdToken(#[from] IdTokenError),
+
+    /// A [`Policy`](crate::Policy) broke a structural rule of
+    /// [`Policy::validate`](crate::Policy::validate), or a signed policy's
+    /// items do not match its head; the string names which.
+    #[error("invalid policy: {0}")]
+    InvalidPolicy(String),
+
+    /// An [`InclusionProof`](crate::InclusionProof) does not prove its item
+    /// under the head it was checked against (a tampered item or proof, or
+    /// one issued under another head).
+    #[error("inclusion proof does not match the policy head")]
+    BadProof,
+
+    /// A [`Fresh`](crate::Fresh) was signed by a key the policy head does not
+    /// list in `directories`.
+    #[error("freshness signed by a node that is not a directory")]
+    NotADirectory,
+
+    /// A [`Fresh`](crate::Fresh) vouches for another head than the one it
+    /// was checked against (another version, or the same version with other
+    /// content).
+    #[error("freshness is for another policy head")]
+    FreshMismatch,
 }
 
 /// Why an OIDC ID token failed [`verify_claim`](crate::verify_claim).
