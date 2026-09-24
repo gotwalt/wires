@@ -15,6 +15,8 @@
 //!   to authorized readers (`wires watch`).
 //! - [`service_child`] — card 28 §1: a service child gets a minimal
 //!   environment and a per-call push capability, not the host's keystore.
+//! - [`gateway`] — `wires gateway`: a web MCP client signs in (OAuth, a mock
+//!   Google) and calls as its user, over real HTTP.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -27,6 +29,8 @@ mod services_host;
 /// Card 26b: call records streamed from the host's log to authorized readers.
 mod records;
 
+/// `wires gateway`: OAuth sign-in and MCP over HTTP, end to end.
+mod gateway;
 /// Card 28 §1: the service child is not the host.
 mod service_child;
 

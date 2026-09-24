@@ -186,7 +186,7 @@ impl Pkce {
 }
 
 /// `n` random bytes, base64url.
-fn random_token(n: usize) -> Result<String> {
+pub(crate) fn random_token(n: usize) -> Result<String> {
     use ring::rand::SecureRandom as _;
     let mut buf = vec![0u8; n];
     ring::rand::SystemRandom::new()
@@ -274,11 +274,29 @@ pub(crate) async fn run_flow(
     let code = tokio::time::timeout(wait, await_callback(listener, &state, CALLBACK_LINGER))
         .await
         .map_err(|_| anyhow!("no sign-in came back within {}s", wait.as_secs()))??;
+    exchange_code(fetcher, client, node, &code, &redirect, &pkce.verifier).await
+}
+
+/// Redeem an authorization `code` at `client`'s issuer (with the
+/// `redirect` it was sent to and the PKCE `verifier`), then verify the ID
+/// token as a claim for `node`.
+///
+/// `wires login` binds the token to the caller's own node; `wires gateway`
+/// binds each web user's token to the gateway's node, which presents it.
+pub(crate) async fn exchange_code(
+    fetcher: &KeyFetcher,
+    client: &OidcClient,
+    node: NodeId,
+    code: &str,
+    redirect: &Url,
+    verifier: &str,
+) -> Result<Login> {
+    let doc = fetcher.discover(&client.issuer).await?;
     let form = [
         ("grant_type", "authorization_code"),
-        ("code", code.as_str()),
+        ("code", code),
         ("redirect_uri", redirect.as_str()),
-        ("code_verifier", pkce.verifier.as_str()),
+        ("code_verifier", verifier),
     ];
     let reply = token_request(fetcher, &doc, client, &form).await?;
     finish(fetcher, client, node, reply).await
@@ -332,12 +350,17 @@ async fn token_request(
     client: &OidcClient,
     form: &[(&str, &str)],
 ) -> Result<TokenReply> {
-    let mut body = url::form_urlencoded::Serializer::new(String::new());
-    body.extend_pairs(form);
-    body.append_pair("client_id", &client.client_id);
-    if let Some(secret) = &client.client_secret {
-        body.append_pair("client_secret", secret);
-    }
+    // Finished before the first await: the serializer isn't `Send`, and the
+    // gateway runs this on a multi-threaded server.
+    let body = {
+        let mut body = url::form_urlencoded::Serializer::new(String::new());
+        body.extend_pairs(form);
+        body.append_pair("client_id", &client.client_id);
+        if let Some(secret) = &client.client_secret {
+            body.append_pair("client_secret", secret);
+        }
+        body.finish()
+    };
     let resp = fetcher
         .http()
         .post(doc.token_endpoint.clone())
@@ -346,7 +369,7 @@ async fn token_request(
             "application/x-www-form-urlencoded",
         )
         .header(reqwest::header::ACCEPT, "application/json")
-        .body(body.finish())
+        .body(body)
         .send()
         .await
         .with_context(|| format!("POST {}", doc.token_endpoint))?;

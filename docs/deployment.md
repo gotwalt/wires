@@ -10,6 +10,7 @@ Patterns for running wires beyond one machine. For the command reference see
 | ----- | ------- | -------- |
 | **Host** (runs the CLIs) | `wires serve host.json` | No TCP listener, no firewall port opened; binds UDP for QUIC |
 | **Caller** (the agent side) | `wires call`, or `wires mcp` for MCP-only clients | No |
+| **Web gateway** (for Claude.ai and other remote-MCP clients) | `wires gateway` | HTTP, behind TLS you provide (a tunnel or proxy) |
 | **Reader** | `wires watch` | No |
 | **Admin** | `wires init` / `invite` / `remove` / `role` / `service`, one-shot | No |
 
@@ -76,7 +77,7 @@ Three layers, most self-contained first:
   authenticates the peer's key, so a wrong address can only fail to connect.
 - **Self-hosted relay**: run upstream
   [`iroh-relay`](https://docs.rs/iroh-relay) and pass `--relay-url` to
-  `serve`, `call`, `mcp`, `inbox` and `watch`, for NAT traversal between egress-only
+  `serve`, `call`, `mcp`, `gateway`, `inbox` and `watch`, for NAT traversal between egress-only
   peers that can both reach it. Keep it one logical endpoint: two peers only
   rendezvous on the *same* relay.
 - **n0 DNS discovery and relays** (the default): resolves a node id to
@@ -100,3 +101,66 @@ n0.
   re-issue memberships with `wires invite <id>`.
 - **Rotate a node key:** the node id changes with the key, so remove the old
   id and invite the new one.
+
+## A web gateway
+
+`wires gateway` serves the services each signed-in user may call as a remote
+MCP server (Streamable HTTP, OAuth 2.1), for the web clients people already
+use for remote tool calling: Claude.ai's custom connectors, the MCP
+Inspector. It is one member node that calls **as** each web user:
+
+1. The user adds `https://<gateway>/mcp` as a connector. The client finds
+   the gateway's OAuth metadata, registers (Client ID Metadata Document, or
+   DCR), and opens the gateway's consent page.
+2. The gateway sends the user to Google with `nonce` = the hash of **the
+   gateway's** node key (as `wires login` does for a caller's own node).
+3. On every call, the gateway presents that user's ID token in the session
+   `Hello`. The host verifies Google's signature and the nonce against the
+   dialing node (the gateway) under its own `identity.issuers`, checks the
+   registry, runs the call and records it with the user as the verified
+   principal (the dialing node is the gateway's).
+
+What this changes, honestly:
+
+- **The gateway holds every signed-in user's live identity.** A token bound
+  to the gateway's key is only useful to the gateway, but the gateway can
+  use it for anything that user may call until it expires (about an hour).
+  Trust the gateway like any service that holds your users' sessions.
+- **Sessions last as long as the Google ID token.** Google omits `nonce` when
+  it refreshes a token, so a refreshed token couldn't be bound to the
+  gateway. The gateway issues no refresh tokens; the client reconnects (one
+  click with a live Google session).
+- **Only IdP roles admit a web user.** The gateway offers a service only if a
+  role other than `member` matches the user's verified identity. `member`
+  admits the gateway's node, not the person behind it. A user the state lets
+  call nothing is refused at sign-in.
+- Push, inbox and `watch` aren't offered through the gateway.
+
+To run one:
+
+1. **An OAuth client** at the IdP of type *Web application* (Google Cloud
+   Console → Credentials), with the redirect URI
+   `https://<gateway>/oauth/callback`.
+2. **Hosts trust it:** add its client id to each host's `host.json`
+   `identity.issuers[].audiences` for `https://accounts.google.com`, and
+   restart `serve`.
+3. **The gateway joins** like any member (`wires id`, `wires invite`,
+   `wires join`). The registry's roles decide what each user sees.
+4. **TLS in front.** The gateway speaks plain HTTP. `deploy/gateway/` runs
+   it next to `cloudflared` on a Cloudflare Tunnel whose ingress routes the
+   public host to `http://wires-gateway:8080`. Turn Cloudflare's Browser
+   Integrity Check off for that host: MCP clients register and exchange
+   tokens from servers, with non-browser user agents.
+
+```bash
+cd deploy/gateway && cp .env.example .env    # client id/secret, tunnel token
+docker compose build
+docker compose run --rm wires-gateway id       # → the admin: wires invite <id> --name gateway
+docker compose run --rm wires-gateway join <token>
+docker compose up -d
+curl https://<gateway>/.well-known/oauth-protected-resource/mcp
+```
+
+The keystore volume holds the node key, membership and signed state, the
+key that signs DCR client ids (`gateway-client-key`), and the live sessions
+(`gateway-sessions.json`, keyed by token hash, so a restart signs no one out).

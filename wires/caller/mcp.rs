@@ -2,7 +2,7 @@
 //! (evaluated locally against your signed state, as `wires services` lists
 //! them), plus `tools.json` aliases, resolved once at startup.
 //!
-//! The on-ramp for workflows that only speak MCP (Claude Desktop, IDEs). Each
+//! wires in the stdio MCP clients people already use (Claude Desktop, IDEs). Each
 //! tool becomes one MCP tool taking `{ args?: string[], stdin?:
 //! string, jq?: string, head?: integer, max_bytes?: integer }`; the last three
 //! shape the remote stdout in-process ([`shape`](crate::caller::shape)), as
@@ -11,10 +11,17 @@
 //! HTTP, no OAuth, and no token: the caller's identity is this node's key.
 //!
 //! Wire format: newline-delimited JSON-RPC 2.0 on stdin/stdout. **stdout is
-//! protocol-only** — every diagnostic goes to stderr. Both the classic
-//! handshake (`initialize` → `notifications/initialized`, e.g. `2025-06-18`)
-//! and the stateless 2026-07-28 form (no `initialize`; each request names its
-//! version in `_meta["io.modelcontextprotocol/protocolVersion"]`) are served.
+//! protocol-only** — every diagnostic goes to stderr. Both eras are served
+//! ("dual-era" in the 2026-07-28 versioning page): the legacy handshake
+//! (`initialize` → `notifications/initialized`, e.g. `2025-06-18`), and the
+//! modern stateless form (no `initialize`; each request names its version in
+//! `_meta["io.modelcontextprotocol/protocolVersion"]`, `server/discover`
+//! answers up front, an unknown version is an `UnsupportedProtocolVersion`
+//! error listing ours).
+//!
+//! [`McpServer`] is transport-free: `wires gateway` drives the same core
+//! over Streamable HTTP, one request at a time
+//! ([`crate::gateway::mcp_http`]).
 
 use anyhow::Result;
 use clap::Args;
@@ -29,8 +36,8 @@ use crate::caller::tools::{RemoteTool, ToolTarget, ToolsConfig};
 /// The newest MCP revision this server speaks (the stateless one).
 pub const LATEST_PROTOCOL_VERSION: &str = "2026-07-28";
 
-/// Every revision `initialize` will agree to, newest first. The surface used
-/// here (tools, text content, `isError`) is the same in all of them.
+/// Every revision served, newest first. The surface used here (tools, text
+/// content, `isError`) is the same in all of them.
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
     "2026-07-28",
     "2025-11-25",
@@ -38,6 +45,22 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
     "2025-03-26",
     "2024-11-05",
 ];
+
+/// The revisions `initialize` negotiates (the legacy era), newest first.
+pub const LEGACY_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The first modern revision: no `initialize`, the version in every
+/// request's `_meta`, `resultType` on every result.
+pub const FIRST_MODERN_VERSION: &str = "2026-07-28";
+
+/// How long a client may cache `tools/list` and `server/discover` results
+/// (the 2026-07-28 `ttlMs`). The tool list only changes with the signed
+/// state, which a client picks up within this.
+pub const LIST_TTL_MS: u64 = 60_000;
+
+/// The server's `instructions`: how to use these tools well.
+pub const INSTRUCTIONS: &str = "Each tool runs one command-line program on another machine, by service name, as you: the machine checks your identity against an admin-signed list of who may call it, and logs the call. Pass the program's arguments as `args` (one string per argument, no shell quoting). There is no shell: filter output with the program's own flags or the `jq`/`head`/`max_bytes` fields.";
 
 /// The per-request protocol-version key of the 2026-07-28 revision.
 pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
@@ -63,21 +86,44 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 /// JSON-RPC: bad params (including MCP's "unknown tool").
 const INVALID_PARAMS: i64 = -32602;
+/// MCP `HeaderMismatch` (2026-07-28): HTTP headers disagree with the body.
+pub(crate) const HEADER_MISMATCH: i64 = -32020;
+/// MCP `UnsupportedProtocolVersion` (2026-07-28).
+pub(crate) const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 
-/// A JSON-RPC error: code and message.
-#[derive(Debug, PartialEq, Eq)]
-struct RpcError {
-    code: i64,
-    message: String,
+/// A JSON-RPC error: code, message, and optional `data`.
+#[derive(Debug, PartialEq)]
+pub(crate) struct RpcError {
+    pub(crate) code: i64,
+    pub(crate) message: String,
+    pub(crate) data: Option<Value>,
 }
 
 impl RpcError {
-    fn new(code: i64, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: i64, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
+            data: None,
         }
     }
+
+    /// `UnsupportedProtocolVersion` for `requested`, listing what is served.
+    pub(crate) fn unsupported_version(requested: &str) -> Self {
+        Self {
+            code: UNSUPPORTED_PROTOCOL_VERSION,
+            message: "Unsupported protocol version".into(),
+            data: Some(json!({
+                "supported": SUPPORTED_PROTOCOL_VERSIONS,
+                "requested": requested,
+            })),
+        }
+    }
+}
+
+/// Whether `version` is of the modern (stateless) era.
+pub(crate) fn is_modern(version: &str) -> bool {
+    version >= FIRST_MODERN_VERSION
 }
 
 /// The MCP server state: the tool map, the caller that runs tools, and the
@@ -86,6 +132,7 @@ pub struct McpServer<C> {
     config: ToolsConfig,
     caller: C,
     negotiated: Option<String>,
+    redact_failures: bool,
 }
 
 impl<C: Caller> McpServer<C> {
@@ -95,7 +142,24 @@ impl<C: Caller> McpServer<C> {
             config,
             caller,
             negotiated: None,
+            redact_failures: false,
         }
+    }
+
+    /// Report a failed dial as `call failed` without its details (host ids,
+    /// addresses, relay errors), which go to the log instead: for callers
+    /// who are not the operator (`wires gateway`'s web users).
+    pub fn with_redacted_failures(mut self) -> Self {
+        self.redact_failures = true;
+        self
+    }
+
+    /// Serve as if `initialize` had agreed `version` (a legacy HTTP client
+    /// names it in its `MCP-Protocol-Version` header on every request after
+    /// the handshake; there is no session to remember it in).
+    pub fn with_negotiated(mut self, version: Option<String>) -> Self {
+        self.negotiated = version;
+        self
     }
 
     /// Handle one line of input; returns the response line to write, or
@@ -138,10 +202,19 @@ impl<C: Caller> McpServer<C> {
         };
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
         let version = self.version_for(&params);
+        if let Some(v) = version.as_deref()
+            && !SUPPORTED_PROTOCOL_VERSIONS.contains(&v)
+            && method != "initialize"
+        {
+            return Some(error_response(id, RpcError::unsupported_version(v)));
+        }
+        let modern = version.as_deref().is_some_and(is_modern);
         let result = match method {
+            "server/discover" => Ok(discover()),
             "initialize" => Ok(self.initialize(&params)),
-            "ping" => Ok(json!({})),
-            "tools/list" => Ok(self.tools_list()),
+            // Removed in 2026-07-28; still part of every legacy revision.
+            "ping" if !modern => Ok(json!({})),
+            "tools/list" => Ok(self.tools_list(modern)),
             "tools/call" => self.tools_call(&params).await,
             other => Err(RpcError::new(
                 METHOD_NOT_FOUND,
@@ -150,12 +223,15 @@ impl<C: Caller> McpServer<C> {
         };
         Some(match result {
             Ok(result) => {
-                // `initialize` fixes the version for the session; stamp its
-                // own reply with what it agreed.
-                let version = if method == "initialize" {
-                    self.negotiated.clone()
-                } else {
-                    version
+                let version = match method {
+                    // `initialize` fixes the version for the session.
+                    "initialize" => self.negotiated.clone(),
+                    // A discover probe without `_meta` still gets a modern
+                    // reply: it is a modern method.
+                    "server/discover" => {
+                        version.or_else(|| Some(LATEST_PROTOCOL_VERSION.to_owned()))
+                    }
+                    _ => version,
                 };
                 json!({"jsonrpc": "2.0", "id": id, "result": stamp(result, version.as_deref())})
             }
@@ -174,24 +250,28 @@ impl<C: Caller> McpServer<C> {
             .or_else(|| self.negotiated.clone())
     }
 
-    /// `initialize`: agree the client's version if supported, else offer the
-    /// newest we speak.
+    /// `initialize` (legacy era only): agree the client's version if it is a
+    /// legacy one we speak, else offer the newest legacy one. A modern
+    /// version can't be agreed here: modern clients don't handshake.
     fn initialize(&mut self, params: &Value) -> Value {
         let requested = params.get("protocolVersion").and_then(Value::as_str);
         let agreed = match requested {
-            Some(v) if SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => v,
-            _ => LATEST_PROTOCOL_VERSION,
+            Some(v) if LEGACY_PROTOCOL_VERSIONS.contains(&v) => v,
+            _ => LEGACY_PROTOCOL_VERSIONS[0],
         };
         self.negotiated = Some(agreed.to_owned());
         json!({
             "protocolVersion": agreed,
             "capabilities": {"tools": {"listChanged": false}},
             "serverInfo": server_info(),
+            "instructions": INSTRUCTIONS,
         })
     }
 
-    /// `tools/list`: every `tools.json` entry, in config order.
-    fn tools_list(&self) -> Value {
+    /// `tools/list`: every `tools.json` entry, in config order (stable, so
+    /// clients and prompt caches can rely on it). A modern reply carries the
+    /// 2026-07-28 cache hints: `private`, since the list is per caller.
+    fn tools_list(&self, modern: bool) -> Value {
         let tools: Vec<Value> = self
             .config
             .tools
@@ -204,7 +284,11 @@ impl<C: Caller> McpServer<C> {
                 })
             })
             .collect();
-        json!({ "tools": tools })
+        if modern {
+            json!({ "tools": tools, "ttlMs": LIST_TTL_MS, "cacheScope": "private" })
+        } else {
+            json!({ "tools": tools })
+        }
     }
 
     /// `tools/call`: look the tool up, validate its arguments, run it.
@@ -236,7 +320,14 @@ impl<C: Caller> McpServer<C> {
             Ok(outcome) => render_outcome(&shaped(&shape, outcome)),
             Err(e) => {
                 tracing::warn!("wires mcp: call to `{name}` failed: {e:#}");
-                (format!("wires: call failed: {e:#}"), true)
+                if self.redact_failures {
+                    (
+                        "wires: call failed: no host of this service could be reached; try again, or ask the operator".to_owned(),
+                        true,
+                    )
+                } else {
+                    (format!("wires: call failed: {e:#}"), true)
+                }
             }
         };
         Ok(json!({
@@ -246,15 +337,27 @@ impl<C: Caller> McpServer<C> {
     }
 }
 
+/// `server/discover`: every version served, the capabilities, and how to
+/// use the tools. The same for every caller, so `public` to caches.
+fn discover() -> Value {
+    json!({
+        "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+        "capabilities": {"tools": {}},
+        "instructions": INSTRUCTIONS,
+        "ttlMs": LIST_TTL_MS,
+        "cacheScope": "public",
+    })
+}
+
 /// `serverInfo`: this binary's name and version.
 fn server_info() -> Value {
     json!({"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")})
 }
 
-/// For a 2026-07-28 (or later) request, stamp `resultType` and the reserved
-/// `_meta` keys on the result; older revisions get the result untouched.
+/// For a modern request, stamp `resultType` and the reserved `_meta` keys on
+/// the result; legacy revisions get the result untouched.
 fn stamp(mut result: Value, version: Option<&str>) -> Value {
-    let Some(version) = version.filter(|v| *v >= LATEST_PROTOCOL_VERSION) else {
+    let Some(version) = version.filter(|v| is_modern(v)) else {
         return result;
     };
     if let Value::Object(map) = &mut result {
@@ -267,9 +370,13 @@ fn stamp(mut result: Value, version: Option<&str>) -> Value {
     result
 }
 
-/// A JSON-RPC error response.
-fn error_response(id: Value, e: RpcError) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "error": {"code": e.code, "message": e.message}})
+/// A JSON-RPC error response (`id` is `null` when the request's is unknown).
+pub(crate) fn error_response(id: Value, e: RpcError) -> Value {
+    let mut error = json!({"code": e.code, "message": e.message});
+    if let Some(data) = e.data {
+        error["data"] = data;
+    }
+    json!({"jsonrpc": "2.0", "id": id, "error": error})
 }
 
 /// The one input schema every tool shares.
@@ -708,7 +815,8 @@ mod tests {
             json!({"jsonrpc":"2.0","id":1,"result":{
                 "protocolVersion":"2025-06-18",
                 "capabilities":{"tools":{"listChanged":false}},
-                "serverInfo":{"name":"wires","version":env!("CARGO_PKG_VERSION")}}}),
+                "serverInfo":{"name":"wires","version":env!("CARGO_PKG_VERSION")},
+                "instructions":INSTRUCTIONS}}),
             json!({"jsonrpc":"2.0","id":2,"result":{"tools":[
                 {"name":"db_query","description":format!("Read-only SQL{suffix}"),"inputSchema":schema()},
                 {"name":"fails","description":format!("Always exits 2{suffix}"),"inputSchema":schema()},
@@ -765,6 +873,7 @@ mod tests {
                     {"name":"locked","description":format!("Refused {FILTER_HINT}"),"inputSchema":schema()},
                     {"name":"offline","description":format!("Unreachable {FILTER_HINT}"),"inputSchema":schema()},
                 ],
+                "ttlMs":LIST_TTL_MS,"cacheScope":"private",
                 "resultType":"complete","_meta":stamped_meta}})
         );
         assert_eq!(
@@ -776,22 +885,114 @@ mod tests {
     }
 
     #[test]
-    fn initialize_offers_the_latest_for_an_unknown_version_and_stamps_it() {
+    fn initialize_offers_the_newest_legacy_version_for_an_unknown_or_modern_one() {
+        for asked in ["1999-01-01", "2026-07-28"] {
+            let mut s = server();
+            let out = transcript(
+                &mut s,
+                &[
+                    json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                           "params":{"protocolVersion":asked}}),
+                    json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+                ],
+            );
+            assert_eq!(
+                out[0]["result"]["protocolVersion"], LEGACY_PROTOCOL_VERSIONS[0],
+                "{asked}"
+            );
+            assert_eq!(
+                out[0]["result"].get("resultType"),
+                None,
+                "legacy: unstamped"
+            );
+            assert_eq!(
+                out[1],
+                json!({"jsonrpc":"2.0","id":2,"result":{}}),
+                "ping is legacy"
+            );
+        }
+    }
+
+    #[test]
+    fn discover_answers_with_or_without_meta() {
         let mut s = server();
+        let meta = json!({META_PROTOCOL_VERSION: "2026-07-28"});
         let out = transcript(
             &mut s,
             &[
-                json!({"jsonrpc":"2.0","id":1,"method":"initialize",
-                       "params":{"protocolVersion":"1999-01-01"}}),
-                json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+                json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":meta}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"server/discover"}),
             ],
         );
-        assert_eq!(out[0]["result"]["protocolVersion"], LATEST_PROTOCOL_VERSION);
-        assert_eq!(out[0]["result"]["resultType"], "complete");
-        assert_eq!(
-            out[1]["result"]["resultType"], "complete",
-            "session version sticks"
+        for reply in &out {
+            let r = &reply["result"];
+            assert_eq!(r["supportedVersions"], json!(SUPPORTED_PROTOCOL_VERSIONS));
+            assert_eq!(r["capabilities"], json!({"tools":{}}));
+            assert_eq!(r["resultType"], "complete");
+            assert_eq!(r["cacheScope"], "public");
+            assert_eq!(r["ttlMs"], json!(LIST_TTL_MS));
+            assert_eq!(r["instructions"], INSTRUCTIONS);
+            assert_eq!(r["_meta"][META_SERVER_INFO]["name"], "wires");
+        }
+    }
+
+    #[test]
+    fn an_unsupported_version_lists_what_is_served_and_dials_nothing() {
+        let mut s = server();
+        let meta = json!({META_PROTOCOL_VERSION: "2099-01-01"});
+        let out = transcript(
+            &mut s,
+            &[
+                json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{
+                "_meta":meta,"name":"db_query","arguments":{}}}),
+            ],
         );
+        assert_eq!(
+            out[0],
+            json!({"jsonrpc":"2.0","id":7,"error":{
+                "code":UNSUPPORTED_PROTOCOL_VERSION,
+                "message":"Unsupported protocol version",
+                "data":{"supported":SUPPORTED_PROTOCOL_VERSIONS,"requested":"2099-01-01"}}})
+        );
+        assert!(s.caller.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn redacted_failures_hide_the_details() {
+        let mut s = server().with_redacted_failures();
+        let out = transcript(&mut s, &[call(1, "offline", json!({}))]);
+        let text = out[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("wires: call failed"), "{text}");
+        assert!(!text.contains("10s"), "{text}");
+        let out = transcript(&mut s, &[call(2, "locked", json!({}))]);
+        assert_eq!(
+            out[0],
+            text_result(2, "denied by responder: membership rejected: revoked", true),
+            "a refusal is an answer, still shown"
+        );
+    }
+
+    #[test]
+    fn ping_is_gone_in_the_modern_era() {
+        let mut s = server();
+        let meta = json!({META_PROTOCOL_VERSION: "2026-07-28"});
+        let out = transcript(
+            &mut s,
+            &[json!({"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":meta}})],
+        );
+        assert_eq!(out[0]["error"]["code"], METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn a_negotiated_version_can_be_given_up_front() {
+        let s = server().with_negotiated(Some("2025-06-18".into()));
+        let mut s = s;
+        let out = transcript(
+            &mut s,
+            &[json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})],
+        );
+        assert_eq!(out[0]["result"].get("resultType"), None);
+        assert_eq!(out[0]["result"].get("ttlMs"), None);
     }
 
     #[test]

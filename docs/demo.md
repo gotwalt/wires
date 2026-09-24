@@ -195,9 +195,13 @@ Prompt in Claude Code:
 > workbench checks my token and the signed list on every call, runs sqlite3,
 > and writes each call into its own signed log."
 
-If someone asks about MCP, show that the same service works through `wires
-mcp` for clients that can't run a CLI, and say it exists only for backward
-compatibility.
+If someone asks about MCP, open Claude.ai with the `wires` connector
+(`https://wires.positivesum.ai/mcp`) and ask the same question there. The
+call lands in the same host log with your Google identity as the verified
+principal (the dialing node is the gateway's). The line: "wires works in the
+MCP clients you already use. The web gateway passes your own sign-in
+through, so the machine that runs the call still checks who you are itself."
+(`wires mcp` does the same over stdio for desktop clients.)
 
 ### 5. The reader reads the records
 

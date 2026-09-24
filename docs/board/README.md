@@ -27,7 +27,7 @@ Why each clause earns its place (the rebuttals it has to survive):
 |---|---|
 | **Reached by key, not network path** | Tailscale/VPN gives the agent's machine a route to the *host*; you then trust every port on it. Wires gives a route to *the services a signed list lets you call* and nothing else — there is no network path to widen. |
 | **By service name** | The caller asks for `orders-db`, not a machine; the admin binds names to hosts (failover, moves, no squatting), and the caller never learns an address. |
-| **CLIs, not MCP servers** | CLIs are the idiom models already know, one generic verb, and output is filtered *before* it hits context — meaningfully more efficient than MCP tool schemas + JSON results, even post-2026-07-28. `wires call` is the native path; `wires mcp` is the on-ramp for workflows that only speak MCP. |
+| **CLIs first; MCP too** | CLIs are the idiom models already know, one generic verb, and output is filtered *before* it hits context — measurably cheaper than MCP tool schemas + JSON results, even post-2026-07-28; `wires call` is that path. `wires mcp` (stdio) and `wires gateway` (a remote MCP server, for Claude.ai) serve the same services as MCP, so wires works in the clients people already use. What differs from any other MCP server: the host, not the server in front of it, verifies the caller's IdP token and checks the one signed registry, and the host keeps the signed record. |
 | **IdP-authenticated caller, one signed list** | The ID token is bound to the node key (OIDC `nonce` = hash of the key) and presented in each call's handshake; the host verifies the IdP's signature itself (no wires attestor) and checks it against the admin-signed registry — one list of who may call what, not one per server. |
 | **Recorded at the infra layer** | The *host* writes a signed, hash-chained record of every call, refusal, and exit — stamped with the caller identity it verified. The agent can't forge it, no gateway owns it, and a reader the registry names holds neither end's credentials. A CLI has no such story; an MCP gateway's log belongs to whoever runs the gateway. |
 
@@ -41,7 +41,7 @@ honest line from someone who runs remote MCP servers behind Tailscale today.
 |---|---|---|
 | **admin** | who's in, the roles, which services run where, who may call and read each (root key; one signed state) | `init`, `invite`, `remove`, `role`, `service` |
 | **host** | how it implements its assigned services; trusted IdPs; stricter local rules (`host.json` v2) | `serve host.json`, `push` |
-| **caller** | — runs services by name; MCP only for backward compatibility | `join`, `login`, `services`, `call`, `mcp`, `inbox` |
+| **caller** | — runs services by name; MCP (stdio, or the remote gateway) so wires works in the clients people already use | `join`, `login`, `services`, `call`, `mcp`, `inbox`, `gateway` |
 | **reader** | — any member: a service's `readers` role reads all its records, everyone else their own | `watch` |
 
 The IdP is *bound* at the caller (`login`) and *verified* at the host, against the admin-signed state it holds. The admin's invite is the only thing handed out of band; every later state is pushed by key (or pulled from a host). Nothing is broadcast.
@@ -85,6 +85,8 @@ Each summary describes the surface at the time the card was done. Cards 25–27 
 | [26](done/26-host-held-records.md) | H2 | 27 | Call records: host-held signed log, `watch <service>` for authorized readers + own calls, optional OTel export |
 | [28](backlog/28-audit-fixes.md) | A | 27, 26 | **Audit fixes (2026-09-23):** drop `member`, issuer-scoped matchers, service child can't reach host secrets, fail-closed log, person-keyed records/push, state-sync and caller fixes, docs sweep |
 | [29](backlog/29-identity-and-scale.md) | I2 | 28 | **Identity and scale (design agreed):** machine badges + banned list, `login --for` + day-pass, per-caller views served by hosts, transparency-log checkpoints |
+| [30](done/30-web-gateway.md) | W | 27, 26 | `wires gateway`: remote MCP (Streamable HTTP 2026-07-28 + OAuth 2.1) for Claude.ai; each call presents the web user's own gateway-bound Google token |
+| [31](backlog/31-inbox-delivery.md) | P3 | 28, 30 | **Design, to agree:** callbacks go to the caller that asked (node + principal), through the call's push capability only; at least once to its mailbox; fetch set complete by construction; an `inbox` MCP tool in `wires mcp` and the gateway. Replaces card 28 §4 (push half) and §7 |
 | [22](done/22-gossip-role-OPEN.md) | — | decided | **Decided 2026-09-23: drop the channel** → cards 27 and 26 |
 | [18](backlog/18-front-door-OPEN.md) | — | parked | **Open question, don't build:** apex key, invites, `wires join <domain>` |
 | [16](done/16-token-benchmark.md) | bench | 01–03 | MCP (GitHub server, many tools; ± tool search) vs `gh` via `wires call` vs bare `gh`: 5 tasks × 5 runs |

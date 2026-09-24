@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use library::{
-    Argv, Invocation, Membership, NodeId, NodeIdentity, ServiceName, SignedState, ToolName,
+    Argv, IdToken, Invocation, Membership, NodeId, NodeIdentity, ServiceName, SignedState, ToolName,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -121,11 +121,13 @@ impl Dial {
     }
 }
 
-/// This node's credentials for dialing: the node key and its membership.
+/// This node's credentials for dialing: the node key and its membership,
+/// plus the ID token to present when it isn't the one `wires login` stored.
 pub struct Credentials {
     node: NodeIdentity,
     membership: Membership,
     relay_override: Option<String>,
+    id_token: Option<IdToken>,
 }
 
 impl Credentials {
@@ -139,7 +141,18 @@ impl Credentials {
                 a.membership_file.as_deref(),
             )?,
             relay_override: a.relay_url.clone(),
+            id_token: None,
         })
+    }
+
+    /// Present `token` in the session `Hello` instead of the stored one.
+    ///
+    /// `wires gateway` dials for many web users from one node: each call
+    /// carries the caller's own ID token, nonce-bound to this node's key, so
+    /// the host verifies the IdP's signature for that user itself.
+    pub fn presenting(mut self, token: IdToken) -> Self {
+        self.id_token = Some(token);
+        self
     }
 }
 
@@ -171,7 +184,10 @@ where
     let service = ServiceName::from(plan.invocation.tool.clone());
     let relay = creds.relay_override.clone().or(plan.relay_url);
     let target = transport::endpoint_addr(&plan.target, &plan.addrs, relay.as_deref())?;
-    let hello = crate::caller::hello::with_membership(&ks, creds.membership.clone())?;
+    let mut hello = crate::caller::hello::with_membership(&ks, creds.membership.clone())?;
+    if let Some(token) = &creds.id_token {
+        hello.id_token = Some(token.clone());
+    }
     let endpoint = transport::bind(&creds.node, relay.as_deref()).await?;
     let fabric = creds.membership.fabric;
     let done = transport::call_service_on(
@@ -242,7 +258,11 @@ impl Caller for WiresCaller {
 /// Fold a dial result and its buffered output into a [`CallOutcome`]: a
 /// [`transport::Denied`] anywhere in the error chain is an answer, not a
 /// failure.
-fn outcome(result: Result<i32>, stdout: Vec<u8>, stderr: Vec<u8>) -> Result<CallOutcome> {
+pub(crate) fn outcome(
+    result: Result<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) -> Result<CallOutcome> {
     match result {
         Ok(exit) => Ok(CallOutcome::Exited {
             exit,
@@ -431,7 +451,10 @@ where
     if hosts.is_empty() {
         bail!("no service named `{service}` with a host (see `wires services`)");
     }
-    let hello = crate::caller::hello::with_membership(ks, creds.membership.clone())?;
+    let mut hello = crate::caller::hello::with_membership(ks, creds.membership.clone())?;
+    if let Some(token) = &creds.id_token {
+        hello.id_token = Some(token.clone());
+    }
     let targets = dial.hints.targets(&hosts, creds.relay_override.as_deref());
     let fabric = creds.membership.fabric;
     let done = transport::call_service_on(
@@ -1146,6 +1169,7 @@ mod tests {
                 node: me,
                 membership,
                 relay_override: None,
+                id_token: None,
             },
             root,
             ks,

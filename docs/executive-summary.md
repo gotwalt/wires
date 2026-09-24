@@ -23,10 +23,10 @@ There are four roles, each with a few commands:
 
 - **Admin** (`init`, `invite`, `remove`, `role`, `service`): signs one versioned document that says who's in, which roles exist (matched on IdP identity), which services exist, which hosts run each one, and who may call and read each. It is pushed to the machines by key.
 - **Host** (`wires serve host.json`): implements the services assigned to it. One file says how each runs, which identity providers it trusts, and any stricter local rule; it checks every call against the signed list.
-- **Caller** (`join`, `login`, `services`, `call`, `inbox`): the agent. `wires login` binds the person's IdP sign-in (Google in the demo; any OIDC issuer via `--issuer`) to the agent's key once. `wires services` shows only the services that person may call; the caller never names a machine, and a service can have several hosts.
+- **Caller** (`join`, `login`, `services`, `call`, `inbox`, `mcp`, `gateway`): the agent, or the MCP client it runs in. `wires login` binds the person's IdP sign-in (Google in the demo; any OIDC issuer via `--issuer`) to the agent's key once. `wires services` shows only the services that person may call; the caller never names a machine, and a service can have several hosts.
 - **Reader** (`watch`): a member the admin allows to read a service's records sees every call and refusal from the hosts' own logs, holding neither end's credentials. Everyone else sees only their own calls.
 
-`wires mcp` exists only so clients that can't run a command can still use the same services. **The product is the CLI.**
+**Two ways in, both first-class.** `wires call` is the CLI path and the efficient one (the measured savings below come from it). MCP is the other, so people can use wires in the clients where they already use remote tool calling: `wires mcp` over stdio, and `wires gateway` as a remote MCP server that Claude.ai connects to (MCP 2026-07-28 plus older clients). Each web user signs in with Google through the gateway, and every call carries that person's own token, so the host still verifies the IdP itself, admits them only through roles that match their identity, and records them as the verified principal of the call. Users keep their clients; the operator stands the gateway up once (an OAuth client, TLS in front, and that client's id trusted on each host).
 
 ## What's been demonstrated (two machines, 2026-09-23)
 

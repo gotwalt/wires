@@ -31,6 +31,9 @@ url = { workspace = true }
 jaq-core = { workspace = true }
 jaq-std = { workspace = true }
 jaq-json = { workspace = true }
+# `wires gateway` (card 30): the HTTP server for remote MCP + OAuth. Rides
+# the hyper/tower already in the graph via reqwest; only axum itself is new.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "form", "query"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
