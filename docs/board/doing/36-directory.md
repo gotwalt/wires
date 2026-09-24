@@ -365,7 +365,7 @@ views in 37.
   to every subscribed host" and slice-content criteria, lenient/strict, model.py apex rows.
 
 **36d (2026-09-24, branch `worker/36d-no-merkle`): no Merkle tree.** The human chose a simpler
-integrity scheme (card [36d](../review/36d-no-merkle-policy.md)); this supersedes the Merkle
+integrity scheme (card [36d](../done/36d-no-merkle-policy.md)); this supersedes the Merkle
 proofs, multiproofs, slices and their sizes in the notes above, and the "host slices" design.
 
 - **The root signs the policy, and each service entry.** `PolicyHead.items_hash` (blake3,
