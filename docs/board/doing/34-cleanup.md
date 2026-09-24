@@ -585,3 +585,93 @@ Deliberately left:
 - `gateway/mod.rs` keeps its own "the gateway holds no signed state" lookups
   (different wording, and §B6's gateway items are that lane's).
 - `cargo doc` warnings (§D3) are unchanged by this phase; none are new.
+
+### Lane DOCS
+
+§E, plus stale narration found on the way. Non-Rust files only.
+
+- **E1.** `rust-toolchain.toml` comment says why 1.91; `.gitignore` drops the
+  Bazel lines and ignores all of `.claude/` (`settings.json` isn't tracked);
+  `.editorconfig` is now Rust/shell/Markdown (shell = tabs, which is what
+  shfmt already produced: `shfmt -d` is clean); the dead `rust-version`
+  workspace key is gone; `.clippy.toml` and `.shellcheckrc` (comments only,
+  nothing referenced them) deleted, CLAUDE.md says "default settings".
+- **E2 / D3.** Board: history lines and the finished order history gone; the
+  Lanes table lists open cards only (34, 08, 33, 29, 31, 32, 18, 09) with a
+  Status column and a link to `done/`; the disclaimer paragraph is gone;
+  "relay package / iOS" rule → "don't merge from `archive/poc-2026-05`";
+  caller command list adds `id`. backlog/09 history line gone; backlog/29
+  "update the board" (already done), the drifted `login.rs:97` (now named by
+  item) and the deleted branch name fixed, "fabric" → "network". doing/08:
+  Steps current, Notes cut to the lessons that still hold, plus a Step to
+  re-record the README GIF/MP4 (they show pre-28/pre-D2 refusal text).
+- **E3.** protocol.md: the Merkle-roster rationale, the retired-tag line
+  ("Any other tag decodes as `BadFrame`"), "no revocation list" and
+  "`member` is an ordinary role name" gone. Prose "fabric" → "network"
+  (field names like `fabric` stay, per D2). **Doc bug:** §8 said the record
+  stream refuses with `not admitted to this fabric`; the code sends
+  `gate::NOT_ADMITTED` ("not a member of this network"). Fixed.
+- **E4.** Card 31 reads "designed, parked" in README, usage (×2),
+  protocol, deployment, executive-summary and the board.
+- **E5.** One home each: keystore table in protocol.md §9 (gained the
+  gateway files row; usage links it and keeps the location/precedence
+  notes); limits canonical in usage § Known trade-offs (gained gateway
+  listens/tools-only, only-Google-tested, relay, one network per keystore);
+  README, exec-summary and protocol §10 are short lists linking there; admin
+  command reference only in usage § Commands by role (protocol §3 is a
+  paragraph + link); the separate-Unix-user passage is a `###` in
+  deployment.md (with the sudo example and the child-socket caveat), linked
+  from usage and protocol §5. Role lists aligned (board, exec-summary). usage
+  layout adds `gateway/` and `bindings/`. CLAUDE.md: four crates, `lib.sh`,
+  `macos-sign.sh` + the `.cargo/config.toml` runner, `bench/push/`,
+  `deploy/gateway/`, `docs/media/`; image description includes `wires
+  gateway` (also Dockerfile, deployment.md).
+- **Dockerfile bug (found):** it copied only `library/` and `wires/`, but
+  the workspace now lists `bindings` and `bindings/node`, so cargo couldn't
+  load the workspace. It copies `bindings/` too; `.dockerignore` skips
+  `node_modules` and `.venv`.
+- **E6.** usage.md blank line in the Commands-by-role table removed.
+  `docs/media/demo-push.*` and both `.cast` files deleted (unlinked, and they
+  show pre-28 text; card 08 re-records). README leads with "reached by key,
+  only the services you may call" (no "no firewall port" lead). History
+  headers in executive-summary.md and storytelling.md gone; "There is no
+  channel" → "Nothing is broadcast" (CLAUDE.md, board, usage); usage
+  "Revocation" → "Removal", deployment "Provisioning and removal"; host.json
+  `version` row no longer mentions v1.
+- **E7.** bench.py/run.sh: five arms, `host.json` not `--expose`;
+  REPORT.md: one top note + a setup row that says which runs used which
+  responder (card 16: `--expose`; arm 5: member-only `host.json`), the
+  contradicting tail note deleted; push/REPORT.md: the repeated setup note
+  and a `bazel test` mention reworded. permission-probe.py: "no membership",
+  the two `--inclusion-proof*` probes deleted; agent-sandbox.md count is 18
+  (9 flag/stdin probes × unlocked/locked). push/up.sh: `role set` fails
+  loudly, and each `service add` tolerates only "reached none of its 1
+  host(s)". run.sh: `rm -f` before `cp`.
+- **E8.** `.scripts/lib.sh`: narration helpers, `wait_for`, `alive`,
+  `dump`, `build_wires` (the two-build block), `start_mock_idp`, `login_as`;
+  both demos source it (≈120 lines gone). demo-push's `the_line` is now
+  `numbered_line`. push/up.sh generates `host.json` from
+  `.scripts/fixtures/push-host.json` with sed (analyst → bench).
+  `demo-native-service.sh` (card 33's lane) still has its own copies; it can
+  source `lib.sh` too.
+
+Skipped, with reasons:
+
+- **Shared bench provisioning** (`wires-up.sh` / `push/up.sh`): both end in a
+  real browser `wires login`, so a refactor can't be exercised here; the
+  shared part is ~20 lines. Left as is.
+- `testing.md` still lists "nothing sent to a bystander" among the e2e
+  cases; drop it if §A9 deletes that test.
+- `protocol.md` still mentions the hidden `tools` alias in the pull list and
+  "denied by responder" appears in usage/demo output: D1 and §C7 are the code
+  lanes'; the docs follow whatever they print.
+- Remaining acceptance-grep hits in my files are justified: `channel` in
+  `rust-toolchain.toml` (TOML key), demo.md's banned-words list,
+  agent-sandbox.md's plain-English "channel"; "ticket" in storytelling.md's
+  killed-story log; `fabric` as a field/identifier name in protocol.md and
+  storytelling.md's register test.
+
+Checks: `make lint`, `make fmt-check`, `cargo test --workspace`, `make demo`
+and `.scripts/demo-push.sh --quiet` green; `docker build .` green (it failed
+to load the workspace before the `bindings/` copy); `bench/push/up.sh` run
+end to end against the mock IdP (an `open` shim played the browser).

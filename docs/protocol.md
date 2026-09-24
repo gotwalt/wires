@@ -21,7 +21,7 @@ Usage, roles and the demo are in [usage.md](usage.md), [the board](board/README.
 |---|---|
 | A node is an Ed25519 key, and `NodeId` is its 32-byte public key. The iroh `SecretKey` is the same seed, so the iroh endpoint id **is** the `NodeId`. | `library/membership/identity.rs`, `transport::secret_key` |
 | **The caller is always `to_node_id(conn.remote_id())`**, the key iroh authenticated. It is never a wire field. Every gate below is sound only because of this. | every responder |
-| The fabric is named by its root key: `fabric = root.node_id()`. | `Membership::mint`, `State::new` |
+| A network is named by its root key: the `fabric` field every credential signs is `root.node_id()`. | `Membership::mint`, `State::new` |
 | Signed objects sign a domain-separation prefix (where they have one) followed by `canonical_bytes(body)`: canonical JSON with keys sorted by `serde_json`'s default `BTreeMap` ordering. `preserve_order` and `arbitrary_precision` must never be enabled. | `library/codec.rs` |
 | Every signed body carries a signed format discriminant and a fixed, complete set of fields. **An optional signed field is not allowed**, because an absent field and a present default sign different bytes; "none" is an empty value. A new format gets a separate body, and an old verifier rejects it with `UnsupportedVersion`. Signed types refuse unknown fields at decode. | membership, state, call-log entry |
 | Every signed credential signs its own authority (`fabric`), and `verify(root)` requires `fabric == root`. | membership, state |
@@ -34,7 +34,7 @@ Every node binds one iroh endpoint (`presets::N0`: n0 DNS/pkarr discovery and re
 ## 2. Membership
 
 `Membership { version: 1, fabric, member, issued, not_after, alg, sig }` is signed by the root. It
-answers two questions: which fabric the node belongs to, and which node it is.
+answers two questions: which network the node belongs to, and which node it is.
 
 `check_inclusion(m, fabric_root, caller, now)` checks, in order: `m.verify(fabric_root)` (algorithm,
 version, the `fabric` pin, signature); `m.member == caller` (`SubjectMismatch`, so a membership is
@@ -42,11 +42,10 @@ not transferable); `now <= not_after` (`Expired`).
 
 A membership is public. It holds no secret, so presenting it before the peer is verified is safe.
 It says the node *was* admitted; whether it is *still* in is the signed state's member set (§3).
-There is no revocation list.
 
 ## 3. The admin-signed state
 
-One versioned document, signed by the root, says everything the fabric agrees on
+One versioned document, signed by the root, says everything the network agrees on
 (`library/services/state.rs`):
 
 ```
@@ -74,7 +73,7 @@ SignedState { state, alg, sig }
   The host set is **derived**: a member is a host exactly when some service names it.
 - **Monotonic copies.** Every node keeps its newest verified copy in `state.json`, written only
   through `adopt_if_newer(ks, candidate, root, now)`: the candidate must verify, be fresh, and be
-  strictly newer (`is_newer_than`: same fabric, higher version). The re-read, check and write happen
+  strictly newer (`is_newer_than`: same network, higher version). The re-read, check and write happen
   under one exclusive file lock (`state.json.lock`), so a removed member presenting a genuine older
   state can't roll a node back.
 - **Names.** `ServiceName` is `[a-z][a-z0-9_-]*`, at most 64 bytes; the session's `Invocation`
@@ -83,8 +82,7 @@ SignedState { state, alg, sig }
   IdP principal: `issuer` (exact, **required**), `email` (exact, or `*@domain`), `org` (Google's
   `hd`), `group`. Because every matcher names its issuer, a token another trusted issuer minted
   for the same email never satisfies it. `issuer=…` alone is "anyone that IdP verified". There is
-  no built-in role: **with no verified principal, no role admits** (`role_admits`). `member` is an
-  ordinary role name.
+  no built-in role: **with no verified principal, no role admits** (`role_admits`).
 - **`authorize(state, caller, principal, service)`** (`library/services/access.rs`), in order: the
   caller is a member (`NotAMember`); the service exists (`UnknownService`); it allows some role
   (`NobodyAllowed`); the first role in `allow` that admits the caller's verified principal is
@@ -92,22 +90,15 @@ SignedState { state, alg, sig }
   every service: that is `wires services`, evaluated locally with no network.
 
 The state is not secret. Every member holds all of it: member and host node ids, role matchers,
-service names and descriptions. That is also why there is no Merkle-committed roster any more: it
-existed to prove inclusion without showing the member set, and a member that must evaluate the
-registry locally has to hold the set anyway.
+service names and descriptions (card 29 replaces this with per-caller views).
 
 ### Admin surface
 
-| Command | Effect on the state |
-|---|---|
-| `wires init [--ttl] [--state-ttl]` | New root and node keys, this node's membership, version 1 with this node as its one member. |
-| `wires invite <node-id> [--name] [--ttl] [--state-ttl]` | Adds the member, mints its membership (valid for `--ttl`), prints one `Invite` token, pushes the state. |
-| `wires remove <name\|id> [--state-ttl]` | Drops the member (and from every service's `hosts`), pushes the state. |
-| `wires role set <name> [--issuer URL] [--state-ttl] <matcher>…` / `role rm <name>` | Defines or drops a role. A matcher is `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…`; one without `issuer=` takes `--issuer` (default `https://accounts.google.com`). |
-| `wires service add\|set <name> [--description] [--allow role]… [--host member]… [--reader role]…` / `service rm <name>` | Edits the registry. `--host` takes an `invite --name` label or a node id, and must be a member. |
-| `wires state push` | Changes nothing: re-sends the stored state to every host (§4). |
-
-Every edit but `init` takes `--state-ttl` and ends with the push in §4.
+The admin commands and their flags are in [usage.md § Commands by role](usage.md#commands-by-role).
+`init` signs version 1 with the admin's own node as its one member; `invite` adds a member and
+mints its membership; `remove` drops a member, and drops it from every service's `hosts`; `role`
+and `service` edit the roles and the registry. Every edit but `init` takes `--state-ttl` and ends
+with the push in §4. `wires state push` changes nothing: it re-sends the stored state to every host.
 
 `Invite { format: 2, membership, state: SignedState, admin: NodeId }` is everything a new node needs.
 `Invite::verify(me, now)` requires that the membership passes `check_inclusion` under its own
@@ -155,7 +146,7 @@ Frames are length-prefixed canonical JSON tagged by `type`, at most 4 MiB
   (older or equal): it answers `have` and does **not** mark its copy checked, so a removed member
   the copy still lists, replaying its old, still-fresh state, can't stop the host pulling the
   newer one. An `offer` from anyone else is taken only if it vouches for the dialer (a host whose
-  copy expired or predates the dialer, catching up): the free checks first (this fabric, strictly
+  copy expired or predates the dialer, catching up): the free checks first (this network, strictly
   newer than the held copy, fresh, listing the dialer), and only then the signature, once, by
   `adopt_if_newer`. To a `have`, the dialer must be a member of the held copy; then an expired copy
   is refused as expired (never served), and otherwise it answers `offer` when it holds a newer one,
@@ -179,7 +170,7 @@ A session is one bidirectional QUIC stream on ALPN `wires/session/3`. Codec:
 | 1/2/3 | `Stdin`/`Stdout`/`Stderr` | raw chunk (at most 64 KiB when pumped) | stdin: caller → host; stdout/stderr: host → caller |
 | 4 | `Exit` | i32, big-endian | host → caller, terminal |
 
-Tags 0 and 5 (the channel-era `Handshake`/`HandshakeAck`) are retired and decode as `BadFrame`.
+Any other tag decodes as `BadFrame`.
 
 **The host** reads `Hello` (10 s timeout, at most 64 KiB) and `Invoke` (at most 512 KiB: the
 largest valid `Argv`, JSON-escaped), then re-reads its signed state **for this connection**, so a
@@ -189,7 +180,7 @@ failure below is sent as `Denied` (`wires/host/gate.rs`):
 
 1. The host holds a readable state (else `responder configuration error`).
 2. **Membership, before anything else:** `check_inclusion(hello.membership, trust_root, caller,
-   now)` and the state lists `caller`. Anyone else — no credential, someone else's, another fabric's,
+   now)` and the state lists `caller`. Anyone else — no credential, someone else's, another network's,
    expired, removed — hears only `not a member of this network`: no reason, no state version. Their
    token is never verified (no JWKS fetch, no identity-index entry), and the refusal is traced
    (throttled), **not** written to the call log, so strangers can't fill it.
@@ -224,11 +215,9 @@ cloud credentials. If the connection closes, the host kills the child.
 The child still runs as `serve`'s own Unix user. It is told neither `WIRES_HOME` nor where the
 operator socket is (its push socket lives outside the keystore, §7), but it can still find the
 keystore at its default path, so a service a caller can steer into reading or writing files can
-reach whatever that user can, the host's keystore and operator socket included. That is accepted
-for now: isolating services is left open (a rootless microVM is the likely answer). Until then,
-**run services as a separate Unix user** (for example, a `command` of `["sudo", "-u", "svc", "--",
-"tool"]`). `wires` does not switch users itself, and a service running as another user can't reach
-the child socket (§7, a 0700 directory) until the operator opens that directory to it. Independently of that, the host fails closed on the parts of its
+reach whatever that user can, the host's keystore and operator socket included. `wires` does not
+switch users itself; the operator does
+([deployment.md](deployment.md#run-services-as-a-separate-unix-user)). Independently of that, the host fails closed on the parts of its
 keystore a child could tamper with: it keeps the highest state version it has decided under in
 memory and refuses to decide under an older `state.json` (`responder configuration error`, logged
 as a rollback), and it trusts only issuer keys it fetched itself (§6).
@@ -357,10 +346,10 @@ client both check is owned by `geteuid()`:
   the call started can still report; tokens are memory-only, so a restart kills them. The push
   still passes `push.allow`, and its records carry `call`, the call whose capability sent it.
 
-This is push as built. [Card 31](board/backlog/31-inbox-delivery.md) (agreed, not built) is the
-next step: every callback goes to the calling node **and** principal through the call's
-capability only, the operator's `push` narrows to `--to <node-id>`, role addressing goes, and an
-`inbox` MCP tool reaches `wires mcp` and the gateway.
+This is push as built. Designed, parked ([card 31](board/backlog/31-inbox-delivery.md)): every
+callback goes to the calling node **and** principal through the call's capability only, the
+operator's `push` narrows to `--to <node-id>`, role addressing goes, and an `inbox` MCP tool
+reaches `wires mcp` and the gateway.
 
 ## 8. Records
 
@@ -383,12 +372,12 @@ something that already happened, so a failure is traced as an error and the sess
 the log stays unwritable every new call fails its own `started` and is refused, and the host serves
 again once an append succeeds (a failed append is cut off the file first). A `started` without a
 `finished` means the end wasn't recorded, not that the call never ran. Refusals of peers that are not
-members of the state are traced, not logged (§5), so no one outside the fabric can write to it.
+members of the state are traced, not logged (§5), so no one outside the network can write to it.
 
 **The record stream** (`wires/records/1`, `wires/host/record_stream.rs`): length-prefixed JSON
 frames. The reader sends `open {hello, services, since?, mine, follow}`. The host checks membership
-first: a reader that isn't a current member gets `denied` with the fixed text `not admitted to this
-fabric` and nothing else (the detail is traced, throttled). Before it has decided, it reads an
+first: a reader that isn't a current member gets `denied` with the fixed text `not a member of this
+network` and nothing else (the detail is traced, throttled). Before it has decided, it reads an
 `open` of at most 64 KiB, sizes no buffer from a length prefix, and holds at most 16 undecided
 readers (one more is closed unanswered). Otherwise it answers `granted {scopes, tip?, first?}`: per requested service
 assigned here, `all` when the reader's verified principal is in one of the service's `readers` roles
@@ -424,7 +413,7 @@ that never saw that stretch. Against `granted`: a `tip` below the anchor is a ro
 hash at the anchor a fork; both are alarms. A `first` past the entry after the anchor is retention: a
 notice (`host … pruned entries before seq N (retention)`), and the anchor restarts from what the host
 still holds. Any alarm stops that host's stream (exit 1) and leaves its marks at the last good entry.
-The service label a line shows is the reader's own, derived from signed records: a `started`'s tool,
+The service label a line shows is the reader's own, derived from signed records: a `started`'s service,
 paired locally with its `finished` and the pushes naming its call; the host sends no label.
 
 Nothing is broadcast: a record's content leaves a host only when a reader asks for it and may see it; any other member asking gets its hash link.
@@ -445,6 +434,7 @@ Nothing is broadcast: a record's content leaves a host only when a reader asks f
 | `inbox/` | 0700 | caller | `new/` (≤256 unread), `read/` (last 1024), `notes/` |
 | `record-marks.json` | — | reader | `wires watch`: per host, the chain anchor, a resume point per view, recent call labels |
 | `call-log.jsonl`, `push-queue.json` | — | host | §8, §7 |
+| `gateway-client-key`, `gateway-sessions.json` | 0600 | web gateway | the key DCR client ids are MAC'd with; live web sessions keyed by token hash |
 | `jwks/` | — | caller | cached issuer keys (a host never reads it, §6) |
 | `run/serve.sock`, `run/hint` | 0600 | host | the operator's push socket; this host's own hint line |
 
@@ -479,24 +469,14 @@ precedence. Locked mode (`WIRES_LOCKED`) refuses the credential flags and the `W
 
 ## 10. Known limits
 
-- Nothing renews memberships or the state; a membership expires after its `--ttl`, the state after
-  its `--state-ttl` (both default 30 days). An expired state admits nobody, is served by nobody, and
-  is dialed from by no caller until the admin signs a newer one.
-- The admin is a one-shot CLI and is pushed only to hosts: a plain member gets a new state by its
-  next pull (from a host) or at a call's handshake. A host assigned a service while offline pulls
-  it at `serve` start from another host in its copy; with none up, it needs a fresh invite.
-- Known and accepted until [card 29](board/backlog/29-identity-and-scale.md):
-  - Every member holds the whole state: every member id, every role's matchers (often people's
-    emails) and every service. Agents learn the org chart, and the state grows with the number of
-    members, so onboarding N people costs O(N) states of O(N) size to every host.
-  - The caller checks the host's membership and that its own (newest) state assigns the service to
-    that host, but only after the host already holds the `Invoke`: a removed host whose membership
-    hasn't expired sees the argv (not stdin).
-  - Hidden record links (§8) tell a non-reader how many entries a host logged, and when.
-  - Google ID tokens last about an hour, and Google drops the `nonce` on refresh, so a person signs
-    in again roughly hourly (a web gateway session ends with the token).
-- A host knows a caller's identity only after the caller presented its token to that host, and
-  indexes it per node, so push by role reaches only those callers (card 31 removes role push).
-- A web gateway holds each signed-in user's gateway-bound ID token until it expires (~1 h). It
-  offers tools only: push is keyed by node (card 31), and `watch` isn't an MCP tool.
-- One fabric per keystore.
+The full list, kept in one place, is [usage.md § Known trade-offs](usage.md#known-trade-offs). The
+ones that bound this spec:
+
+- Nothing renews memberships or the state (both default 30 days); an expired state admits nobody,
+  is served by nobody, and is dialed from by no caller.
+- Until [card 29](board/backlog/29-identity-and-scale.md): every member holds the whole state; a
+  removed host whose membership hasn't expired still sees a call's argv; hidden record links (§8)
+  tell a non-reader how many entries a host logged, and when.
+- A host knows a caller's identity only once the caller presented its token to that host.
+- A host can withhold or truncate its own log (§8).
+- One network per keystore.

@@ -17,7 +17,7 @@ should not reinvent the wheel." Each part below names the system it copies.
 
 Every call carries two things:
 
-1. **A badge for the machine.** The admin signs it: "this key is in our fabric, until <date>". Hosts and agents both have one; it is today's `Membership`.
+1. **A badge for the machine.** The admin signs it: "this key is in our network, until <date>". Hosts and agents both have one; it is today's `Membership`.
 2. **An ID card for the person.** Google or Okta signs it: "this is alice@acme.com". It is stamped with the machine's key, so it's useless on another machine. It is today's nonce-bound ID token, or the day-pass below.
 
 A host admits a call when the badge verifies and isn't banned, the person is
@@ -30,11 +30,11 @@ verified, and the rule book lets that person use that service.
 - Members leave the state. A host admits by the badge's signature; it needs no guest list.
 - Removal is a **banned list** in the state: node ids whose badge hasn't expired yet. An entry drops out when its badge would have expired, so the list stays small.
 - `invite` no longer edits the state, so onboarding costs zero pushes. The state holds roles, services and recent bans: it grows with services, not people.
-- **Replaces the board non-negotiable** "removal by omission; no revocation list". The property it protected is kept: removal still works offline and needs no auth server. Update the board.
+- The board's non-negotiables already say removal is a root-signed ban (decided 2026-09-24). The property the old "removal by omission" protected is kept: removal still works offline and needs no auth server.
 
 ### People: IdP tokens, `login --for`, and later a day-pass (Teleport, Smallstep, `gcloud --no-browser`)
 
-- **Stage 1 (laptops, now):** as today. `wires login` in a browser gives a token lasting about an hour. Google's refresh drops the nonce (`login.rs:97`), so the person signs in again roughly hourly. Disabling someone at the IdP cuts them off within the hour with no wires action.
+- **Stage 1 (laptops, now):** as today. `wires login` in a browser gives a token lasting about an hour. Google's refresh drops the nonce (`LoginArgs::refresh` in `caller/login.rs`), so the person signs in again roughly hourly. Disabling someone at the IdP cuts them off within the hour with no wires action.
 - **Stage 2 (headless agents acting for a person):**
   - `wires login --for <node-id>`: sign in on the laptop, and the token is stamped with the *server's* key. Copy it over. It is safe to copy because it's useless without that key.
   - Then a **day-pass**, so this isn't hourly. A host the admin designates as an **issuer** (the admin signs "this host may issue day-passes") checks a fresh IdP token once and returns: "key K acts for alice@acme.com (issuer, subject, email, groups) until <time>". Every other host checks the day-pass offline, like a badge.
@@ -81,7 +81,7 @@ verified, and the rule book lets that person use that service.
 - How long is a day-pass, and who is allowed to issue them (every host, or ones the admin names)?
 - Does Okta keep the nonce on refresh? If it does, Okta users on laptops don't need a day-pass. Test it.
 - A headless agent's first login: `login --for` plus a copy is enough for stage 2. Is a device-code flow worth it? A device code can't carry our nonce, so the day-pass issuer would have to bind it.
-- Does the gateway (`aaron/web-gateway`) present day-passes or raw tokens? Raw tokens for now; its sessions are about an hour either way.
+- Does the gateway (`wires gateway`) present day-passes or raw tokens? Raw tokens for now; its sessions are about an hour either way.
 
 ## Acceptance (to refine when the card starts)
 

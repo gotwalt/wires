@@ -10,9 +10,6 @@ against a copy someone holds. A witness is a member that holds that copy, so
 an infra team can show "the log is complete and untampered" from something
 other than the host.
 
-*Rewritten 2026-09-23 after card 27 deleted the channel; the original sketch
-(a key-less node on the gossip topic) is in git history.*
-
 ## Sketch
 
 - Entries are already signed by the host and hash-linked (`LogEntry`,

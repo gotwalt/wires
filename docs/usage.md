@@ -30,7 +30,7 @@ Every role joins the same way: `wires id`, then `wires join <token>` with the ad
 | **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. A service pushes only through its call's capability, to that call's caller. | The host, at send, delivery and fetch: a member of the state, in a `push.allow` role. |
 | **Removal** | A new state, pushed to the hosts. No shared key exists, so there is nothing to rotate. | Each host that has the new state, on the removed member's next call or fetch there. |
 
-There is no channel, and a member that takes part in no call receives no traffic about other members' calls. What every member does learn is the whole signed state: every member id, role matcher and service ([card 29](board/backlog/29-identity-and-scale.md) replaces it with per-caller views).
+Nothing is broadcast: a member that takes part in no call receives no traffic about other members' calls. What every member does learn is the whole signed state: every member id, role matcher and service ([card 29](board/backlog/29-identity-and-scale.md) replaces it with per-caller views).
 
 ## Walkthrough
 
@@ -302,10 +302,9 @@ input to a model**:
 2026-09-23 21:13:20Z  from host 3ef72b11 (verified)  build-41  failed: test_orders_total
 ```
 
-That is push as built. [Card 31](board/backlog/31-inbox-delivery.md) is
-agreed and next: a callback goes only to the node **and** person that made
-the call, role addressing goes, and an `inbox` MCP tool reaches `wires mcp`
-and the gateway.
+That is push as built. Callbacks only to the node **and** person that made
+the call, with no role addressing and an `inbox` MCP tool in `wires mcp` and
+the gateway, are designed, parked ([card 31](board/backlog/31-inbox-delivery.md)).
 
 ## Giving an agent only `wires`
 
@@ -365,7 +364,16 @@ To make `wires` the boundary, use a structural setup:
   is bound to the gateway's key, so it's useless elsewhere, but the gateway
   can use it for anything that user may call until it expires (about an
   hour). There is no refresh (Google omits the `nonce` on refresh), so web
-  sessions end with the token.
+  sessions end with the token. It is the one piece that listens (HTTPS,
+  behind a tunnel or proxy), and it offers tools only: push is addressed by
+  node key, and `watch` isn't an MCP tool.
+- **Only Google has been tested** as the IdP, though any OIDC issuer is
+  configured the same way.
+- **A relay may carry the traffic.** Reaching a host behind NAT can go
+  through a public relay (n0's by default, or your own); the relay sees
+  only end-to-end encrypted QUIC.
+- **One network per keystore.** A node in two networks needs two
+  `WIRES_HOME` directories.
 
 ## Not yet
 
@@ -383,9 +391,9 @@ To make `wires` the boundary, use a structural setup:
   design agreed): machine badges plus a ban list instead of a member list,
   `login --for` and day-passes for headless agents, per-caller views instead
   of the whole state, and transparency-log checkpoints for the records.
-- **Callbacks to the caller that asked**
-  ([card 31](board/backlog/31-inbox-delivery.md), agreed): a callback goes
-  only to the node and person that made the call, in every client.
+- **Callbacks to the caller that asked**: a callback goes only to the node
+  and person that made the call, in every client. Designed, parked
+  ([card 31](board/backlog/31-inbox-delivery.md)).
 
 ## Reference
 
@@ -399,9 +407,8 @@ To make `wires` the boundary, use a structural setup:
 | | `wires invite <node-id> [--name l] [--ttl 30d] [--state-ttl 30d]` | Add a node to the state, mint its membership (valid for `--ttl`), print its join token (stdout), push the new state. |
 | | `wires remove <name\|node-id> [--state-ttl 30d]` | Drop a node (and from every service's hosts); push to the hosts. Its next call to a host that has the new state is refused. |
 | | `wires role set <name> [--issuer URL] [--state-ttl] <matcher>…` · `role rm <name>` | Define a role as an OR of matchers: `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…` (all must hold). Every matcher names its issuer, compared exactly: one without `issuer=` takes `--issuer` (default `https://accounts.google.com`). `issuer=…` alone admits anyone that IdP verified. `org` is Google's `hd`, read only from Google. There is no built-in role: a member with no verified identity is in no role. |
-| | `wires service add\|set <name> [--description D] [--allow role]… [--host member]… [--reader role]…` · `service rm <name>` | Edit the registry. `--host` is an `invite --name` label or a node id; `set` replaces each list given. |
+| | `wires service add\|set <name> [--description D] [--allow role]… [--host member]… [--reader role]…` · `service rm <name>` | Edit the registry. `--host` is an `invite --name` label or a node id, and must be a member; `set` replaces each list given. |
 | | `wires state push` | Re-send the stored state to every host, e.g. after an edit that reached none. Exits 1 if the state names hosts and none took it. |
-
 | **host** | `wires serve host.json` | Refuse to start unless the state assigns every service in the file here; then check every caller against the state, exec the service per call, and log every call, member's refusal and push. `--check` validates and prints what the file implements. |
 | | `wires push --to <node-id\|role> --subject S [--ttl D] -- <body>` | Hand a message for a caller to this machine's running `serve` (body from stdin if none is given). From the operator's shell: to any node or role. From a service (it has `WIRES_PUSH_TOKEN`): only to that call's caller. Prints `delivered`, `queued` or `denied` per recipient; exits `77` if every recipient was refused. |
 | **caller** | `wires id` | Print this node's id (creating its key on first use). |
@@ -433,7 +440,7 @@ For a stdio MCP client, the whole config is:
 
 | Key | Meaning |
 |---|---|
-| `version` | Required, `2`. Unknown keys anywhere are an **error**. Version 1 (tools and roles decided by the host) is refused. |
+| `version` | Required, `2`; any other version is refused. Unknown keys anywhere are an **error**. |
 | `identity.issuers` | The IdPs whose ID tokens the host verifies, each with the OAuth client ids (`audiences`) it accepts **from that issuer**. |
 | `services` | Name → `command` (argv, no shell; each call's arguments are appended), optional `cwd`, optional `env` (no `WIRES_*` names), `also_require`: roles from the state the caller must **also** be in (only narrows), and `end_of_options` (default `false`): put `--` between the command and the caller's arguments, so they can't be read as options by a CLI that honours `--` (it does nothing for one that doesn't). Every name must be assigned to this host by the state. |
 | `push` | Optional. `allow`: the roles (from the state) whose members may receive `wires push` from this host (none by default). `log_body`: also log each push's body (default `false`: subject only). |
@@ -453,13 +460,9 @@ a `push` section, the call's push capability (`WIRES_PUSH_SOCKET`,
 `WIRES_PUSH_TOKEN`). None of it is taken from the caller. The child gets no
 `WIRES_HOME`, `HOME`, agent sockets or cloud credentials.
 
-The child still runs as `serve`'s Unix user. It isn't told where the
-keystore is (its push socket is outside it), but it can find it at the
-default path, so a service a caller can steer into reading or writing files
-reaches whatever that user can, the host's keystore included. Isolating
-services is left open for now (a rootless microVM is the likely answer);
-until then, **run services as a separate Unix user** (e.g. a `command` of
-`["sudo", "-u", "svc", "--", "tool"]`). A service's fixed
+The child still runs as `serve`'s Unix user, so it can reach what that
+user can, the host's keystore included: [run services as a separate Unix
+user](deployment.md#run-services-as-a-separate-unix-user). A service's fixed
 command must also be safe against any trailing arguments, including ones
 spelled like options (`gh api -X DELETE …`). `"end_of_options": true` in
 `host.json` puts `--` before them, which settles it for CLIs that honour
@@ -470,28 +473,15 @@ spelled like options (`gh api -X DELETE …`). `"end_of_options": true` in
 Each node's state is a directory: `$WIRES_HOME`, else
 `$XDG_CONFIG_HOME/wires`, else `~/.config/wires`. Keep it short on macOS,
 since a host's control socket lives under it and socket paths are limited to
-104 bytes.
-
-| File | Written by | Holds |
-|---|---|---|
-| `node.seed` | `id`, `init` | This node's secret key (0600). Its public half is the node id. |
-| `root.seed`, `names.json` | `init`, `invite`, `remove` | The admin's root key and member labels (0600). Admin machine only. |
-| `membership.json` | `init`, `join` | This node's root-signed membership. |
-| `state.json`, `state-admin.txt`, `state-checked.txt` | `join`, pushes, pulls, admin commands | The newest verified signed state, where to pull it from, and when it was last checked. |
-| `idp-token.jwt`, `idp-refresh-token` | `login` | The caller's ID token, and a refresh token when the IdP grants one (0600). |
-| `jwks/` | callers | Cached issuer keys (a host never reads it). |
-| `last-good.json` | `call` | Which host last answered each service. |
-| `hints` | you | Optional local dial hints (below). |
-| `tools.json` | `tools add`, the operator | Locked mode; optional aliases. |
-| `inbox/` | `inbox` | Pushed messages: `new/` unread (at most 256, oldest evicted with a note), `read/` the last 1024 (0700). |
-| `record-marks.json` | `watch` | Per host: the furthest verified entry (the anchor every view is checked against), where each view (services, `--mine`) resumes, and recent calls' services for labels. Delete it to start over after an alarm you have resolved. |
-| `call-log.jsonl`, `push-queue.json`, `run/` | `serve` | A host's call log, undelivered pushes, the operator's control socket and own hint line. (The socket for services' per-call push capabilities is outside the keystore, in a private directory `serve` makes per run.) |
-| `gateway-client-key`, `gateway-sessions.json` | `gateway` | The key DCR client ids are MAC'd with, and live web sessions keyed by token hash (0600). |
+104 bytes. Every file in it, with its mode and holder, is listed in
+[protocol.md § 9](protocol.md#9-keystore-wires_home-else-xdg_config_homewires-else-configwires).
+After a `wires watch` alarm you have resolved, delete `record-marks.json` to
+start over.
 
 Secrets resolve **flag → environment variable → `--…-file` → keystore**, so
 a container can mount its node key from a secret with `--node-seed-file`.
 
-### Revocation
+### Removal
 
 `serve` re-reads its signed state once per connection, so a removal takes
 effect at each host on the next call after that host has the new state, with
@@ -514,15 +504,19 @@ address can only fail to connect.
 
 ### Layout, build and test
 
-Two crates in one Cargo workspace ([CLAUDE.md](../CLAUDE.md)):
+One Cargo workspace ([CLAUDE.md](../CLAUDE.md)):
 
 - **`library/`**: the transport-free core. `membership/` (identity,
   membership, the invite), `calls/` (session frames, invocations, call
   records and the call log, IdP identity, pushes), `services/` (roles, the
   registry, the signed state, authorization, state sync).
-- **`wires/`**: the binary, filed by role: `admin/`, `host/`, `caller/`,
-  `state/` (the signed state on this node and how it moves), and `e2e/` for
-  the loopback integration tests.
+- **`wires/`**: the binary (and the embedding API), filed by role:
+  `admin/`, `host/`, `caller/`, `gateway/` (the remote MCP server), `state/`
+  (the signed state on this node and how it moves), and `e2e/` for the
+  loopback integration tests.
+- **`bindings/`**: `wires-ffi` (Python, via UniFFI) and `bindings/node/`
+  `wires-node` (TypeScript, via napi-rs), the embedding API in other
+  languages.
 
 ```bash
 cargo build --workspace
