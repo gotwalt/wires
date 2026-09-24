@@ -38,7 +38,7 @@ On camera, in order:
 | 5b (opt.) | agent | [push beat](#5b-the-workbench-calls-back-push): `wires call deploy -- build 41`, `wires inbox --wait --timeout 10m` | `… from host <wb8> (verified)  build-41  failed: …` |
 | 5c (with a spare) | workbench | stop `wires serve`, ask again | the spare answers (`wires call --verbose` names it) |
 | 6 | admin | `wires remove agent` | stderr `state version N: pushed to K member(s)` |
-| 6 | agent | ask Claude Code the question again | exit 77, nothing on stdout: `wires: denied by responder: <id8> is not a member of the current signed state (version N)`; a `✗` in the watch |
+| 6 | agent | ask Claude Code the question again | exit 77, nothing on stdout: `wires: denied by responder: not admitted to this fabric`; no `✗` in the watch (a non-member's knock is traced by the host, not logged) |
 
 ### Rebuttals, one line each
 
@@ -295,10 +295,10 @@ Then ask Claude Code the question again.
 > "One command. The admin signed a new list without the agent and pushed it
 > to the workbench first. The workbench reads it on the next call, with no
 > restart and no key to rotate. The agent's next call exits 77 with nothing on
-> stdout, and the refusal is in the log the reader sees."
+> stdout."
 
-Point at `wires: denied by responder: not a member of the current signed
-state (version …)` and the reader's `✗` line.
+Point at `wires: denied by responder: not admitted to this fabric` and the
+exit code.
 
 ### Closing line
 

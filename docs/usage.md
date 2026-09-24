@@ -178,7 +178,7 @@ admin$ wires remove agent
 wires: state version 11: pushed to 2 member(s); 1 not reachable now (f6d6dae7…) — they pull it on their next command
 removed dd7e7237… (agent) (state version 11, 4 members)
 agent$ wires call orders-db -- "select count(*) from orders"
-wires: denied by responder: not a member of the current signed state (version 11)
+wires: denied by responder: not admitted to this fabric
 agent$ echo $?
 77
 ```
@@ -361,9 +361,9 @@ For an MCP-only client, the whole config is:
 | `audit.otlp` | Optional. An OTLP/HTTP collector the call log is also exported to. |
 
 Who may call a service is not in this file: it is the registry's `allow`. A
-refusal names the rule that failed (`… is in no role allowed to call
-orders-db (analyst)`, `service orders-db is not assigned to this host …`,
-`not a member of the current signed state (version 11)`).
+member's refusal names the rule that failed (`… is in no role allowed to call
+orders-db (analyst)`, `service orders-db is not assigned to this host …`); a
+key the state doesn't list hears only `not admitted to this fabric`.
 
 A host that admits a call passes the verified caller to the service as
 environment: `WIRES_CALLER_NODE`, `WIRES_CALLER_EMAIL` (when verified),

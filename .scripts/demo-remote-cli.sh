@@ -623,7 +623,7 @@ set -e
 	bad "9: the removed agent's call exited $rc, expected $EXIT_DENIED"
 }
 [ "$(wc -c <"$D/c5.out" | tr -d ' ')" -eq 0 ] || bad "9: the refused call wrote $(wc -c <"$D/c5.out") bytes to stdout"
-grep -qF "not a member of the current signed state" "$D/c5.err" || {
+grep -qF "not admitted to this fabric" "$D/c5.err" || {
 	cat "$D/c5.err" >&2
 	bad "9: refused, but not for the removal"
 }
