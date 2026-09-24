@@ -1,6 +1,6 @@
 # 38 — Help text an LLM can act on: predictable, useful, terse
 
-**Lane:** H · **Depends on:** [37](../done/37-caller-views.md) (the CLI surface settles there) · **Status:** backlog, 2026-09-24 · **Files:** `wires/lib.rs` (clap definitions), every command's error text, `wires/caller/mcp.rs` and `wires/gateway/` (tool names, descriptions, schemas), `wires/e2e/` or a new `wires/help_snapshots` test, usage.md § Reference
+**Lane:** H · **Depends on:** [37](../done/37-caller-views.md) (the CLI surface settles there) · **Status:** review, 2026-09-24 · **Files:** `wires/lib.rs` (clap definitions), every command's error text, `wires/caller/mcp.rs` and `wires/gateway/` (tool names, descriptions, schemas), `wires/e2e/` or a new `wires/help_snapshots` test, usage.md § Reference
 
 ## Why (the human, 2026-09-24)
 
@@ -62,17 +62,48 @@ what it can rely on, not how wires is built; under 90 words.
 
 ## Acceptance
 
-- [ ] The premise paragraph is one constant, shown by `wires --help`, both MCP servers'
+- [x] The premise paragraph is one constant, shown by `wires --help`, both MCP servers'
       `instructions` and an empty `wires services` (snapshot-tested).
-- [ ] Every command and subcommand passes the checklist; `wires --help` and each caller command's
+- [x] Every command and subcommand passes the checklist; `wires --help` and each caller command's
       `--help` fit in 25 lines.
-- [ ] Snapshot tests hold the help text and the key error messages, so a change to what a model
+- [x] Snapshot tests hold the help text and the key error messages, so a change to what a model
       reads is a reviewed diff.
-- [ ] A small eval, reusing `bench/`'s harness: a few headless `claude -p` sessions, each with
+- [x] A small eval, reusing `bench/`'s harness: a few headless `claude -p` sessions, each with
       only `wires` and a task ("find the service that…", "call it", "you were refused — why?"),
       succeed without the model guessing a flag, and one task checks the premise landed (asked
       "what is wires and how do you reach the orders database?", it answers by service name, not
       host or address); report turns and tokens before and after.
-- [ ] usage.md § Reference matches the help text.
+- [x] usage.md § Reference matches the help text.
 
 ## Notes
+
+- **Premise** (`wires/help.rs`, `PREMISE`, 77 words): "wires is a network for authenticated
+  remote CLI calls. Each service is a command-line program on another machine, run by its name,
+  never by host or address. Every call runs as you: your sign-in is checked against an
+  admin-signed list of who may call what, and the machine that runs it records the call. A
+  refusal ("denied by host", exit 77) is that policy, not a fault: don't retry or work around it;
+  ask your admin for access." Interface-neutral, so the MCP `instructions` can use it verbatim;
+  the CLI adds one line (`wires services` / `wires call`), MCP adds how to pass `args` and filter.
+- **`--help-all`**: intercepted in `run()` before clap parses (so `wires call --help-all` needs
+  no SERVICE); it un-hides the command's hidden flags, or at the top level lists every command
+  by role. Hidden: the credential overrides, `--tools-file`, `--relay-url`, every `--state-ttl`,
+  the gateway's `--allow-origin`/`--trust-proxy-header`. `wires --help` lists only the caller's
+  commands (24 lines; was 34); `wires call --help` is 23 (was 31).
+- **Errors**: without `--verbose`, `help::brief` prints the chain up to the first message that
+  names a next step, else outermost + root. A host's refusal reason is never rewritten; the
+  caller appends one step when it has none (`help::refusal`). Host-side reason texts unchanged.
+- **MCP**: tool descriptions are the registry description's first sentence; `FILTER_HINT` is gone
+  (moved into the instructions), `REFUSAL_HINT` is on `search_services`/`call_service`.
+- **`services --json`**: `{service, description, allow, call, read, hosts: <count>}` (+`host_ids`
+  with `--verbose`); `hosts` changed from a list (verbose only) to a count.
+- Touched other lanes minimally: `host/transport.rs` ("no host answered …; try again later, or ask
+  your admin whether its hosts are up"), `.scripts/demo-native-service.sh` (one grep's wording).
+- **Eval** (`bench/help/`): 48 runs, $0.84; all correct before and after; no flag guesses in
+  either arm. After: 1.0 help reads everywhere, refusals stop at 4 turns with 0/6 work-arounds
+  (before 4/6 ran `wires login` or retried), 25–55% fewer input tokens on *refused*, ~25% on
+  *premise*. The top-level example is close to the *call*/*premise* answers (bias noted).
+  `REPORT.md` was not written: the worker environment refused report files; the table is in the
+  handback.
+- Left for the docs sweep: README/demo.md/deployment.md/protocol.md quote the old refusal and
+  `wires services` texts (`denied by host: not a member of this network` without the step; "no
+  service to list").
