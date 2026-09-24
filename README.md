@@ -19,6 +19,13 @@ provider vouches for, and neither machine opens a firewall port.
   output (`--jq`, `--head`) before it reaches their context. On GitHub tasks
   that halved input tokens against GitHub's MCP server, and cost went from
   $1.87 to $0.39 over 25 runs ([bench](bench/REPORT.md)).
+- **Your MCP clients still work.** The same services reach clients that
+  only speak MCP: `wires mcp` over stdio (Claude Desktop, IDEs), and
+  `wires gateway` as a remote MCP server that Claude.ai adds as a custom
+  connector (MCP 2026-07-28, and the older `initialize` clients). A web user
+  signs in with Google through the gateway, and the host still checks
+  Google's signature for that person, admits them by the same registry, and
+  records them, not the gateway, as the caller.
 - **Your IdP says who's calling.** `wires login` signs in with your OIDC
   provider and ties that sign-in to the agent's key. Every host checks the
   IdP's signature itself: there's no wires account and no auth server, and
@@ -79,8 +86,10 @@ agent$ wires inbox --wait
 2026-09-23 21:13:20Z  from host 3ef72b11 (verified)  build-41  failed: test_orders_total
 ```
 
-`wires mcp` serves the same services over stdio MCP, for clients that can
-only speak MCP. `wires remove <name>` cuts a member off at its next call,
+The same services work from MCP clients: `wires mcp` in a stdio MCP config,
+or `https://<gateway>/mcp` as a Claude.ai connector
+([docs/deployment.md § A web gateway](docs/deployment.md#a-web-gateway)).
+`wires remove <name>` cuts a member off at its next call,
 with nothing to restart and no shared key to rotate.
 
 ## wires and a remote MCP server
@@ -124,6 +133,10 @@ Waiting on a mock CI build, 5 runs per setup ([bench/push/REPORT.md](bench/push/
 - Reaching a host through NAT can use a public relay (n0's by default, or
   your own); traffic through it is end-to-end encrypted.
 - Identity is OIDC ID tokens. Only Google has been tested.
+- The web gateway is the one piece that listens (HTTPS, behind a tunnel or
+  proxy), and it holds each signed-in user's Google token until it expires,
+  about an hour; then the client reconnects. It offers tools only, not push
+  or `watch`.
 - Memberships and the signed state expire (30 days by default) and don't
   renew on their own yet.
 - A host can withhold or truncate its own log; tampering and gaps are

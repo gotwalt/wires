@@ -26,7 +26,7 @@ There are four roles, each with a few commands:
 - **Caller** (`join`, `login`, `services`, `call`, `inbox`): the agent. `wires login` binds the person's IdP sign-in (Google in the demo; any OIDC issuer via `--issuer`) to the agent's key once. `wires services` shows only the services that person may call; the caller never names a machine, and a service can have several hosts.
 - **Reader** (`watch`): a member the admin allows to read a service's records sees every call and refusal from the hosts' own logs, holding neither end's credentials. Everyone else sees only their own calls.
 
-`wires mcp` exists only so clients that can't run a command can still use the same services. **The product is the CLI.**
+**The product is the CLI**, and MCP clients aren't left out: `wires mcp` serves the same services over stdio, and `wires gateway` serves them as a remote MCP server that Claude.ai connects to (MCP 2026-07-28 plus older clients). Each web user signs in with Google through the gateway, and every call carries that person's own token, so the host still verifies the IdP itself, admits by the same registry, and records the person as the caller. Adopting wires doesn't mean changing clients.
 
 ## What's been demonstrated (two machines, 2026-09-23)
 

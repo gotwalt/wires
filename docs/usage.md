@@ -11,7 +11,7 @@ choices, the limits, and the command reference. The wire-level spec is
 |---|---|---|
 | **admin** | who's in, which roles exist, which services run where, who may call and read each (root key) | `init`, `invite`, `remove`, `role set\|rm`, `service add\|set\|rm` |
 | **host** | how it implements its assigned services; which IdPs it trusts; stricter local rules; push | `serve host.json`, `push` |
-| **caller** | — runs services by name; MCP only for backward compatibility | `id`, `join`, `login`, `services`, `call`, `mcp`, `inbox` |
+| **caller** | — runs services by name; MCP (stdio, or a remote gateway for web clients) for clients that only speak MCP | `id`, `join`, `login`, `services`, `call`, `mcp`, `inbox`, `gateway` |
 | **reader** | — any member; reads the records a service's `readers` role allows, or its own | `watch` |
 
 Every role joins the same way: `wires id`, then `wires join <token>` with the admin's invite.
@@ -193,7 +193,7 @@ The script also covers SQL on stdin, the same service through `wires mcp`,
 
 ## Why it's built this way
 
-**The CLI first; MCP for backward compatibility only.** Models already know
+**The CLI first; MCP wherever a client needs it.** Models already know
 CLIs, and a CLI lets the agent pick the fields it wants before anything
 reaches context: `gh … --json tagName --jq …`, or `wires call`'s own
 `--jq/--head/--max-bytes` for commands without a filter. That filtering, not
@@ -215,7 +215,12 @@ server (GitHub's, whose payloads are unusually large), and stripped-down
 sessions, so the percentages overstate what a full session would see. An MCP
 server with field selection would close much of this gap. `wires mcp` serves
 the same services, with the same `jq`/`head`/`max_bytes` fields, to clients
-that can only speak MCP.
+that can only speak MCP, and `wires gateway` does the same as a remote MCP
+server for web clients such as Claude.ai. Neither weakens a guarantee above:
+the gateway presents each web user's own ID token, so the host verifies the
+IdP, applies the registry, and records the person. What it adds is one
+listener and a party holding live sessions
+([deployment.md § A web gateway](deployment.md#a-web-gateway)).
 
 **Services, not hosts.** A caller cares what it is calling, not where it
 runs. The admin binds each name to its hosts in the signed state; the caller
@@ -306,6 +311,11 @@ To make `wires` the boundary, use a structural setup:
   started.
 - **A host can withhold or truncate its own log.** Tampering and gaps are
   detectable, but only against a copy a reader already holds.
+- **A web gateway holds its users' live identities.** Each web user's token
+  is bound to the gateway's key, so it's useless elsewhere, but the gateway
+  can use it for anything that user may call until it expires (about an
+  hour). There is no refresh (Google omits the `nonce` on refresh), so web
+  sessions end with the token.
 
 ## Not yet
 
