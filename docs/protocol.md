@@ -353,7 +353,9 @@ members of the state are traced, not logged (§5), so no one outside the fabric 
 **The record stream** (`wires/records/1`, `wires/host/record_stream.rs`): length-prefixed JSON
 frames. The reader sends `open {hello, services, since?, mine, follow}`. The host checks membership
 first: a reader that isn't a current member gets `denied` with the fixed text `not admitted to this
-fabric` and nothing else. Otherwise it answers `granted {scopes, tip?, first?}`: per requested service
+fabric` and nothing else (the detail is traced, throttled). Before it has decided, it reads an
+`open` of at most 64 KiB, sizes no buffer from a length prefix, and holds at most 16 undecided
+readers (one more is closed unanswered). Otherwise it answers `granted {scopes, tip?, first?}`: per requested service
 assigned here, `all` when the reader's verified principal is in one of the service's `readers` roles
 and it didn't ask for `mine`, else `mine`; `tip` is the log's newest `{seq, hash}` and `first` the
 oldest seq it still holds. Then `batch`es of items after `since`, `caught_up`, and with `follow` more

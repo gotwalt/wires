@@ -440,6 +440,77 @@ async fn readers_see_all_callers_see_their_own_members_see_nothing() {
     assert!(recs[0].contains("select-2"));
 }
 
+/// Card 28 §9: before the host knows who is reading, an `Open` over
+/// [`MAX_OPEN_FRAME`] is refused from its length prefix (not waited for),
+/// and at most [`MAX_PREAUTH_READERS`] readers may be undecided at once;
+/// a member decided later is served as usual.
+#[tokio::test]
+async fn pre_auth_readers_are_capped_in_size_and_number() {
+    use crate::host::record_stream::{
+        ALPN as RECORDS_ALPN, MAX_OPEN_FRAME, MAX_PREAUTH_READERS, read_frame as read_record,
+    };
+    let w = World::new().await;
+    let host = Host::start(&w).await;
+    let stranger = NodeIdentity::from_seed([66u8; 32]);
+    let dialer = Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(secret_key(&stranger))
+        .bind()
+        .await
+        .unwrap();
+
+    // A prefix one byte over the cap, and the stream held open: the host
+    // closes it at once rather than wait out the open timeout for the body.
+    let conn = dialer
+        .connect(host.addr.clone(), RECORDS_ALPN)
+        .await
+        .unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(&((MAX_OPEN_FRAME + 1) as u32).to_be_bytes())
+        .await
+        .unwrap();
+    let answered = timeout(Duration::from_secs(3), read_record(&mut recv))
+        .await
+        .expect("refused from the prefix, not after the open timeout");
+    assert!(
+        matches!(answered, Ok(None) | Err(_)),
+        "nothing is granted: {answered:?}"
+    );
+    conn.close(0u32.into(), b"done");
+
+    // MAX_PREAUTH_READERS undecided readers (each sent one byte of a
+    // prefix), then one more: closed unanswered.
+    let mut held = Vec::new();
+    for _ in 0..MAX_PREAUTH_READERS {
+        let conn = dialer
+            .connect(host.addr.clone(), RECORDS_ALPN)
+            .await
+            .unwrap();
+        let (mut send, recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[0]).await.unwrap();
+        held.push((conn, send, recv));
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let conn = dialer
+        .connect(host.addr.clone(), RECORDS_ALPN)
+        .await
+        .unwrap();
+    let closed = timeout(PATIENCE, conn.closed()).await.expect("closed");
+    assert!(format!("{closed:?}").contains("busy"), "{closed:?}");
+
+    // Once they go, a member is served again.
+    for (conn, ..) in held.drain(..) {
+        conn.close(0u32.into(), b"done");
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let sam = w.reader(&w.sam);
+    let (report, _) = watch_once(&w, &w.sam, &sam, &host, &[], false).await;
+    assert!(
+        report.refused.is_empty() && report.failed.is_empty(),
+        "{report:?}"
+    );
+    dialer.close().await;
+}
+
 #[tokio::test]
 async fn a_follower_gets_live_records() {
     let w = World::new().await;
