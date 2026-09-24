@@ -32,26 +32,35 @@ holds the policy) is [fabric.md](fabric.md). Usage, roles and the demo are in [u
 Every node binds one iroh endpoint (`presets::N0`: n0 DNS/pkarr discovery and relays) and is dialed
 **by key**. Addresses are never authority; see §9 for the optional local hints file.
 
-## 2. Membership
+## 2. Membership: badges and bans
 
-`Membership { version: 1, fabric, member, issued, not_after, alg, sig }` is signed by the root. It
-answers two questions: which network the node belongs to, and which node it is.
+`Membership { version: 1, fabric, member, issued, not_after, alg, sig }` is signed by the root: the
+node's **badge**. It answers two questions: which network the node belongs to, and which node it is.
+`init` and `invite` mint it, for at most 30 days (`--ttl`, default `30d`).
 
 `check_inclusion(m, fabric_root, caller, now)` checks, in order: `m.verify(fabric_root)` (algorithm,
-version, the `fabric` pin, signature); `m.member == caller` (`SubjectMismatch`, so a membership is
-not transferable); `now <= not_after` (`Expired`).
+version, the `fabric` pin, signature); `m.member == caller` (`SubjectMismatch`, so a badge is not
+transferable); `now <= not_after` (`Expired`).
 
-A membership is public. It holds no secret, so presenting it before the peer is verified is safe.
-It says the node *was* admitted; whether it is *still* in is the signed state's member set (§3).
+**A node is admitted by its badge and not being banned.** `check_admitted(m, fabric_root, state,
+caller, now)` (`library/membership/policy.rs`) is `check_inclusion`, then `Banned { until }` if the
+signed state's `bans` (§3) names `caller`. Every gate asks this and nothing else about who is in:
+the session gate (§5), the record stream (§8), push and inbox fetch on a host, a caller's inbox
+receiving a delivery (§7), the state responder (§4) and the web gateway. The signed state lists no
+members, so admitting a node is minting its badge, not an edit, and removing one is a ban that lasts
+until its badge would have expired anyway.
+
+A badge is public. It holds no secret, so presenting it before the peer is verified is safe.
 
 ## 3. The admin-signed state
 
 One versioned document, signed by the root, says everything the network agrees on
-(`library/services/state.rs`):
+(`library/services/state.rs`): the roles, the services and which hosts run each, and the bans. It
+lists no members (§2):
 
 ```
-State { format: 1, fabric, version: StateVersion(u64), issued, not_after,
-        members: {NodeId}, hosts: {NodeId},
+State { format: 2, fabric, version: StateVersion(u64), issued, not_after,
+        bans: { NodeId → until },
         roles: { RoleName → [Matcher] },
         services: { ServiceName → Service { description, allow: [RoleName],
                                             hosts: [NodeId], readers: [RoleName] } } }
@@ -60,23 +69,31 @@ SignedState { state, alg, sig }
 
 - **Signed bytes:** `"wires/state/v1\0"` followed by canonical JSON of `{alg, state}`. The prefix
   separates it from memberships and call-log entries.
-- **`State::validate`** (run by `sign` and `verify`): format is 1; `hosts ⊆ members`; every role
+- **`State::validate`** (run by `sign` and `verify`): format is 2 (a format-1 state, which listed
+  `members` and `hosts`, is refused: its fields at decode, its format by `validate`); every role
   has at least one matcher and every matcher names an issuer; every role a service's `allow` or
-  `readers` names is defined (there is no built-in role); every service host is in `hosts`,
-  listed once.
+  `readers` names is defined (there is no built-in role); every service host is listed once and
+  is not banned.
+- **Hosts are derived.** A host is a node some service's `hosts` names (`State::hosts`); there is
+  no host list. `is_host` and `assigns(service, host)` are false for a banned node.
+- **Bans.** `bans` maps a removed node to `until`, unix seconds: the removed badge's `not_after`
+  (§3 Admin surface). A banned node is admitted nowhere this state is held, whatever badge it
+  presents. After `until` its badge has expired anyway, so every edit drops the bans whose `until`
+  has passed (`prune_bans`). The state's size tracks recent removals, not how many badges were ever
+  issued.
 - **`SignedState::verify(root)`** checks the algorithm, the `fabric == root` pin, the signature,
   then `validate`. **`check_fresh(now)`**: `Expired` when `now > not_after`. An expired state admits
   nobody until the admin signs a newer one.
-- **Versioning.** Every admin edit (`init`, `invite`, `remove`, `service add|set|rm`, `role
-  set|rm`) is the stored state changed, `version + 1`, `issued = now`, `not_after = max(now +
-  --state-ttl, the stored state's not_after)` (default `30d`: an edit never shortens the state's
-  life), re-signed. `--ttl` on `init` and `invite` is the minted **membership's** lifetime only.
-  The host set is **derived**: a member is a host exactly when some service names it.
+- **Versioning.** Every admin edit (`init`, `remove`, `service add|set|rm`, `role set|rm`, and the
+  rare `invite` below) is the stored state changed, expired bans dropped, `version + 1`, `issued =
+  now`, `not_after = max(now + --state-ttl, the stored state's not_after)` (default `30d`: an edit
+  never shortens the state's life), re-signed. `--ttl` on `init` and `invite` is the minted
+  **badge's** lifetime only.
 - **Monotonic copies.** Every node keeps its newest verified copy in `state.json`, written only
   through `adopt_if_newer(ks, candidate, root, now)`: the candidate must verify, be fresh, and be
   strictly newer (`is_newer_than`: same network, higher version). The re-read, check and write happen
-  under one exclusive file lock (`state.json.lock`), so a removed member presenting a genuine older
-  state can't roll a node back.
+  under one exclusive file lock (`state.json.lock`), so a removed node presenting a genuine older
+  state (one from before its ban) can't roll a node back.
 - **Names.** `ServiceName` is `[a-z][a-z0-9_-]*`, at most 64 bytes; the session's `Invocation`
   names one. `RoleName` is 1–64 of `[A-Za-z0-9_.-]`.
 - **Roles.** A role is an OR of matchers; a matcher is an AND of its keys over the caller's verified
@@ -85,27 +102,42 @@ SignedState { state, alg, sig }
   for the same email never satisfies it. `issuer=…` alone is "anyone that IdP verified". There is
   no built-in role: **with no verified principal, no role admits** (`role_admits`).
 - **`authorize(state, caller, principal, service)`** (`library/services/access.rs`), in order: the
-  caller is a member (`NotAMember`); the service exists (`UnknownService`); it allows some role
+  caller is not banned (`Banned`; its badge is the gate's, before this); the service exists
+  (`UnknownService`); it allows some role
   (`NobodyAllowed`); the first role in `allow` that admits the caller's verified principal is
   returned (`NotInRole`, whose text asks for `wires login` when there is no principal). `allowed_services` runs it for
   every service: that is `wires services`, evaluated locally with no network.
 
-The state is not secret. Every member holds all of it: member and host node ids, role matchers,
-service names and descriptions (cards 35–37 replace this with badges, a directory and per-caller
-views; the target is [fabric.md](fabric.md)).
+The state is not secret. Every node holds all of it: host node ids, banned node ids, role
+matchers, service names and descriptions. It names no other member (card 35); cards 36–37 replace
+"every node holds the whole state" with a directory and per-caller views (the target is
+[fabric.md](fabric.md)).
 
 ### Admin surface
 
 The admin commands and their flags are in [usage.md § Commands by role](usage.md#commands-by-role).
-`init` signs version 1 with the admin's own node as its one member; `invite` adds a member and
-mints its membership; `remove` drops a member, and drops it from every service's `hosts`; `role`
-and `service` edit the roles and the registry. Every edit but `init` takes `--state-ttl` and ends
-with the push in §4. `wires state push` changes nothing: it re-sends the stored state to every host.
+
+- **`init`** mints the admin's own node's badge and signs version 1: no roles, no services, no bans.
+- **`invite <node>` is not an edit.** It mints the node's badge and records it in the admin's
+  ledger, `issued.json` (§9: node → label, latest `not_after`), and bundles it with the stored
+  state as it is: the version doesn't move and nothing is pushed. Two cases do edit, and then push:
+  re-inviting a node the state bans lifts the ban (the ledger then keeps the later of the old and
+  new badges' expiries), and a stored state that has expired is re-signed (a joiner can't install
+  an expired one).
+- **`remove <node>`** is a ban: `until` is the ledger's `not_after` for the node, or, for a node the
+  ledger doesn't know, now plus the longest badge lifetime (30 days), which outlives any badge the
+  admin could have minted for it. It also drops the node from every service's `hosts`, and from the
+  ledger. Removing a node already banned is refused.
+- **`role`** and **`service`** edit the roles and the registry; a `--host` must be a node in the
+  ledger, and not banned.
+
+Every edit takes `--state-ttl` and ends with the push in §4. `wires state push` changes nothing: it
+re-sends the stored state to every host.
 
 `Invite { format: 2, membership, state: SignedState, admin: NodeId }` is everything a new node needs.
-`Invite::verify(me, now)` requires that the membership passes `check_inclusion` under its own
-`fabric` and names `me`, and that the state verifies under that same root, is fresh, and lists `me`
-as a member. `wires join` stores the membership, adopts the state (never rolling back a newer
+`Invite::verify(me, now)` requires that the state verifies under the membership's own `fabric` and
+is fresh, and that under it `me` is admitted (`check_admitted`: the membership names `me` and is
+unexpired, and the state doesn't ban `me`). `wires join` stores the membership, adopts the state (never rolling back a newer
 one), and records `admin` in `state-admin.txt` as a place to pull from. The token is not secret.
 It works as **trust on first use**, because the token introduces the root; what vouches for the
 admin is whatever carried the token out of band (see
@@ -114,18 +146,20 @@ admin is whatever carried the token out of band (see
 ## 4. Moving the state: `wires/state/1`
 
 Frames are length-prefixed canonical JSON tagged by `type`, at most 4 MiB
-(`library/services/sync.rs`, `wires/state/sync.rs`): `offer {state}`, `have {version}`,
-`denied {reason}`. One exchange per connection; 5 s to dial, 10 s for the answer.
+(`library/services/sync.rs`, `wires/state/sync.rs`): `hello {membership}`, `offer {state}`,
+`have {version}`, `denied {reason}`. One exchange per connection: the dialer sends `hello` (its
+badge) and one `offer` or `have`, and gets one answer; 5 s to dial, 10 s for the answer.
 
 - **Push.** After every admin edit, and on `wires state push`, the admin dials, concurrently,
   every **host** of the new state plus every host of the state before the edit (so a node that
-  stops hosting learns it), never itself, and sends `offer`. Plain members aren't dialed: only
-  `serve` runs the responder, so nothing listens there. The receiver's answer is `have` with the
+  stops hosting, or is banned, learns it), never itself, and sends `offer`. Other nodes aren't
+  dialed: only `serve` runs the responder, so nothing listens there. An `invite` that edits
+  nothing pushes nothing. The receiver's answer is `have` with the
   version it now holds; a host counts as delivered when that is at least the offered version.
   Stderr says `state version N: pushed to K of H host(s)`, naming any not reached. **When H > 0 and
   K = 0 the command exits 1** (after printing its result, e.g. the invite token): the new state is
   stored on the admin and in force nowhere. `wires state push` re-sends it. With no hosts at all
-  there is nothing to reach and nothing fails; members get the state in their invite token.
+  there is nothing to reach and nothing fails; a new node gets the state in its invite token.
 - **Pull.** A cold command (`call`, `mcp`, `inbox`, and the hidden `tools` alias) whose copy was
   last checked more than 10 minutes ago (`state-checked.txt`) sends `have` to, in order, the hosts
   in `last-good.json` (the hosts it has called), every other host in its copy, then the admin, for
@@ -141,18 +175,15 @@ Frames are length-prefixed canonical JSON tagged by `type`, at most 4 MiB
 - **The responder** (`StateResponder`, on every `serve`). Any key can dial it, so it serves at
   most 16 exchanges at once (one more is closed unanswered) and sizes no buffer from a length
   prefix: a frame over 4 KiB must open as an `offer` (`{"state":`, checked before the rest is
-  read), and nothing is over 4 MiB. A held copy that has expired vouches for nobody, and a dialer
-  it doesn't list hears only `not a member of this network` (no version, not whether the copy
-  expired; the detail is traced, throttled). To an `offer` from a member of the fresh held copy it
-  runs `adopt_if_newer`. Adopted: it marks its copy checked and answers `have`. Not adopted
-  (older or equal): it answers `have` and does **not** mark its copy checked, so a removed member
-  the copy still lists, replaying its old, still-fresh state, can't stop the host pulling the
-  newer one. An `offer` from anyone else is taken only if it vouches for the dialer (a host whose
-  copy expired or predates the dialer, catching up): the free checks first (this network, strictly
-  newer than the held copy, fresh, listing the dialer), and only then the signature, once, by
-  `adopt_if_newer`. To a `have`, the dialer must be a member of the held copy; then an expired copy
-  is refused as expired (never served), and otherwise it answers `offer` when it holds a newer one,
-  else `have`.
+  read), and nothing is over 4 MiB. It reads the `hello` first and admits the dialer by its badge
+  and the bans in its held copy, fresh or not (`check_admitted`, §2), before it reads the second
+  frame. Anyone not admitted hears only `not a member of this network` (no version, not whether
+  the copy expired; the detail is traced, throttled). To an `offer` it runs `adopt_if_newer`.
+  Adopted: it marks its copy checked and answers `have`. Not adopted (older or equal): it answers
+  `have` and does **not** mark its copy checked, so a removed node its copy doesn't ban yet,
+  replaying its old, still-fresh state, can't stop the host pulling the newer one. A host whose
+  copy expired catches up the same way. To a `have`, an expired copy is refused as expired (never
+  served); otherwise it answers `offer` when it holds a newer one, else `have`.
 
 A node never adopts an older or unverifiable state, so a lying peer can only fail to help. A host
 that was offline when a service was assigned to it catches up at `serve` start from another host,
@@ -181,9 +212,10 @@ sessions open (one more is closed unanswered), and it sizes no buffer from a len
 failure below is sent as `Denied` (`wires/host/gate.rs`):
 
 1. The host holds a readable state (else `host configuration error`).
-2. **Membership, before anything else:** `check_inclusion(hello.membership, trust_root, caller,
-   now)` and the state lists `caller`. Anyone else — no credential, someone else's, another network's,
-   expired, removed — hears only `not a member of this network`: no reason, no state version. Their
+2. **Admission, before anything else:** `check_admitted(hello.membership, trust_root, state,
+   caller, now)`: the badge and the bans (§2). Anyone else — no badge, someone else's, another
+   network's, expired, banned — hears only `not a member of this network`: no reason, no state
+   version. Their
    token is never verified (no JWKS fetch, no identity-index entry), and the refusal is traced
    (throttled), **not** written to the call log, so strangers can't fill it.
 3. **Identity.** The `id_token`, if any, is verified by the host itself (§6); the principal, or why
@@ -198,7 +230,7 @@ failure below is sent as `Denied` (`wires/host/gate.rs`):
 5. **Implementation.** Only an admitted caller learns whether this host implements the service,
    in `host.json` or natively (`service … is not implemented on this host`).
 
-Every refusal from step 3 on (the caller is a member) is logged as an `AuditRecord::Denied`.
+Every refusal from step 3 on (the caller is admitted) is logged as an `AuditRecord::Denied`.
 
 The host then appends the call's `Started` to its call log and `fsync`s it (§8) — if it can't, the
 call is refused (`this host can't record calls right now…`) and nothing runs — sends `HelloAck`
@@ -260,14 +292,15 @@ Node's event loop. In both, a handler that raises ends the call with exit 1 and 
 
 **The caller** (`wires call`, `wires mcp`) refuses to dial from an expired state (exit 1: ask the
 admin for `wires state push` or a fresh invite). It takes the service's hosts from its state, the
-last host that answered (`last-good.json`) first, then the admin's order. It fails over to the next
+last host that answered (`last-good.json`) first, then the admin's order, and **never a host its
+state bans**: it sends such a host neither `Hello` nor `Invoke`. It fails over to the next
 host **only when a dial fails** (10 s each); a host that answered has decided. It sends `Hello` and
 `Invoke` together, then, before it forwards a byte of stdin, **always** verifies the `HelloAck`
 membership with `check_inclusion(ack, own fabric, authenticated host id, now)` and adopts any
 `newer_state` (`adopt_if_newer`); if that state fails to verify, or the state it now holds no
 longer assigns the service to that host, the call stops there (exit 1, no stdin sent). The host
-already has the `Invoke` (argv) by then: a removed host that still holds a valid membership sees
-the argv; card 35's ban list closes that.
+already has the `Invoke` (argv) by then: a removed host that still holds a valid badge sees the argv
+of a caller whose copy predates the ban (a caller holding the ban never dials it).
 
 Exit codes: `Denied` → **77**, nothing on stdout. Local or transport failure (including the checks
 above) → 1. Otherwise the remote exit code, **except that a remote 77 is reported as 1** with a
@@ -295,14 +328,14 @@ value is accepted; `exp` and `iat` are within the 60 s clock skew; `nonce == for
 `https://accounts.google.com`; `groups` is kept. A host
 remembers the latest verified principal per node (`wires/host/identity.rs`) and never lets a failure
 or an older token displace it. It knows only the callers that presented a token **to it**, and it
-verifies a token only from a member of its state (§5 step 2). A host keeps issuer key sets **in
+verifies a token only from a node it admitted (§5 step 2). A host keeps issuer key sets **in
 memory only** and never reads the `jwks/` disk cache, which anything running as its user could
 write; callers keep that cache, and trust a disk entry for at most 24 h.
 
-**A web gateway** (`wires gateway`) is one member node that carries many principals: it asks the IdP
+**A web gateway** (`wires gateway`) is one node that carries many principals: it asks the IdP
 for each web user's ID token with `nonce = for_node(gateway)` and presents that user's token in the
-`Hello` of each call it makes for them. Nothing on the wire changes; the host sees a member node
-presenting a token bound to it. The gateway offers a user only services that a role admits by
+`Hello` of each call it makes for them. Nothing on the wire changes; the host sees an admitted node
+presenting a token bound to it. A gateway its state bans offers nothing and won't start. The gateway offers a user only services that a role admits by
 that user's own verified principal; the gateway's node alone is in no role. It issues its own OAuth access tokens (opaque, bound to its
 `/mcp`, expiring with the ID token) and no refresh tokens. Its MCP endpoint serves the 2026-07-28
 Streamable HTTP binding and the legacy `initialize` era ([deployment.md](deployment.md)).
@@ -316,21 +349,23 @@ to a caller, addressed **by key**. Frames are length-prefixed canonical JSON tag
 so it may be at most 64 KiB. Two ways a message is delivered:
 
 - **Direct:** the host dials the recipient (3 s budget). A running `wires inbox --wait` serves the
-  inbox ALPN and accepts `deliver` only from a member its signed state names as a **host**; any
-  other dialer hears only `not a member of this network` (the reason is traced, throttled).
+  inbox ALPN and accepts `deliver` only from a node whose badge verifies and that its signed state
+  names as a **host** (never a banned one); any other dialer hears only `not a member of this
+  network` (the reason is traced, throttled).
 - **Fetch:** `wires inbox` dials the hosts of every service it may call (`hello` with its stored ID
   token, `fetch` held open for up to 25 s, `deliver`, then `ack`).
 
 The host authorizes at send, at delivery and at fetch (`ServicesHost::decide_push`): the recipient
-must be a member of the current state, in the first registry role of `host.json`'s `push.allow` that
-admits it (default: nobody). **The identity rule:** every role needs the recipient's verified
+must not be banned by the current state, and must be in the first registry role of `host.json`'s
+`push.allow` that admits it (default: nobody). **The identity rule:** every role needs the recipient's verified
 principal, which the host learns only when the recipient presents its token to it: on a call, or in
-an inbox fetch. `--to <role>` names the members whose known principal the role admits; a member
-with no verified identity here is in no role. A fetch is checked like a call: at most 64 undecided
-at once, membership first, and a non-member hears only `not a member of this network`, has its token
-left unverified, and is traced, not logged; a removed member's queue is dropped (each message logged
-`denied`) and its fetch refused. A member holds at most 2 long polls open per host; a member's
-policy refusal is answered, not logged (`wires inbox` asks every host of its services).
+an inbox fetch, both of which it admitted by badge first. `--to <role>` names the nodes whose known
+principal the role admits; a node with no verified identity here is in no role. A fetch is checked
+like a call: at most 64 undecided at once, the badge and the bans first, and a node not admitted
+hears only `not a member of this network`, has its token left unverified, and is traced, not
+logged; a banned node's queue is dropped (each message logged `denied`), and a push to it or its
+fetch is refused. A node holds at most 2 long polls open per host; an admitted node's policy
+refusal is answered, not logged (`wires inbox` asks every host of its services).
 
 A receiver refuses a message whose `from` is not the authenticated peer or whose `to` is not itself.
 Delivery is at least once; the receiver removes duplicates by `PushId`. The host queues up to 64
@@ -377,23 +412,24 @@ against a copy someone holds.
 
 **Fail closed.** Every record is awaited until it is written and fsynced (at most 5 s), never dropped
 to keep a session moving. A call's `started` is logged **before** its child is spawned; if it can't
-be, the call is refused and doesn't run. `finished`, a member's `denied` and push records describe
+be, the call is refused and doesn't run. `finished`, an admitted caller's `denied` and push records describe
 something that already happened, so a failure is traced as an error and the session goes on; while
 the log stays unwritable every new call fails its own `started` and is refused, and the host serves
 again once an append succeeds (a failed append is cut off the file first). A `started` without a
 `finished` means the end wasn't recorded, not that the call never ran. Refusals of peers that are not
-members of the state are traced, not logged (§5), so no one outside the network can write to it.
+admitted (no valid badge, or banned) are traced, not logged (§5), so no one outside the network can
+write to it.
 
 **The record stream** (`wires/records/1`, `wires/host/record_stream.rs`): length-prefixed JSON
-frames. The reader sends `open {hello, services, since?, mine, follow}`. The host checks membership
-first: a reader that isn't a current member gets `denied` with the fixed text `not a member of this
-network` and nothing else (the detail is traced, throttled). Before it has decided, it reads an
+frames. The reader sends `open {hello, services, since?, mine, follow}`. The host checks admission
+first (the badge in `hello` and the bans, §2): a reader that isn't admitted gets `denied` with the
+fixed text `not a member of this network` and nothing else (the detail is traced, throttled). Before it has decided, it reads an
 `open` of at most 64 KiB, sizes no buffer from a length prefix, and holds at most 16 undecided
 readers (one more is closed unanswered). Otherwise it answers `granted {scopes, tip?, first?}`: per requested service
 assigned here, `all` when the reader's verified principal is in one of the service's `readers` roles
 and it didn't ask for `mine`, else `mine`; `tip` is the log's newest `{seq, hash}` and `first` the
 oldest seq it still holds. Then `batch`es of items after `since`, `caught_up`, and with `follow` more
-batches as the log grows. A `follow` stream is re-decided (membership, freshness, readers) whenever the
+batches as the log grows. A `follow` stream is re-decided (admission, freshness, readers) whenever the
 host's signed state changes and when the reader's ID token, the state or its membership expires:
 `denied` ends it when access is gone (including an ID token that expired: the reader logs in and
 watches again), and a new `granted` precedes entries decided under a changed view.
@@ -426,15 +462,15 @@ still holds. Any alarm stops that host's stream (exit 1) and leaves its marks at
 The service label a line shows is the reader's own, derived from signed records: a `started`'s service,
 paired locally with its `finished` and the pushes naming its call; the host sends no label.
 
-Nothing is broadcast: a record's content leaves a host only when a reader asks for it and may see it; any other member asking gets its hash link.
+Nothing is broadcast: a record's content leaves a host only when a reader asks for it and may see it; any other admitted node asking gets its hash link.
 
 ## 9. Keystore (`$WIRES_HOME`, else `$XDG_CONFIG_HOME/wires`, else `~/.config/wires`)
 
 | File | Mode | Holder | Content |
 |---|---|---|---|
 | `root.seed`, `node.seed` | 0600 | admin / every node | hex Ed25519 seed |
-| `names.json` | 0600 | admin | local labels for `remove` and `service --host`; never sent |
-| `membership.json` | 0644 | every node | membership token |
+| `issued.json` | 0600 | admin | the ledger of badges it minted: node → label (for `remove` and `service --host`), latest `not_after` (how long a ban must last); never sent |
+| `membership.json` | 0644 | every node | its badge (membership token) |
 | `state.json` (+ `.lock`) | 0600 | every node | the newest verified signed state (§3) |
 | `state-admin.txt`, `state-checked.txt` | 0600 | every node | where to pull from; when the copy was last checked |
 | `idp-token.jwt`, `idp-refresh-token` | 0600 | caller | from `wires login` |
@@ -484,9 +520,10 @@ ones that bound this spec:
 
 - Nothing renews memberships or the state (both default 30 days); an expired state admits nobody,
   is served by nobody, and is dialed from by no caller.
-- Until cards [35](board/backlog/35-badges-and-bans.md)–[37](board/backlog/37-caller-views.md)
-  ([fabric.md](fabric.md)): every member holds the whole state; a removed host whose membership
-  hasn't expired still sees a call's argv. Until [card 09](board/backlog/09-witness.md): hidden
+- Until cards [36](board/backlog/36-directory.md)–[37](board/backlog/37-caller-views.md)
+  ([fabric.md](fabric.md)): every node holds the whole state (roles, services, host ids, bans); a
+  removed host whose badge hasn't expired still sees the argv of a caller whose copy predates the
+  ban. Until [card 09](board/backlog/09-witness.md): hidden
   record links (§8) tell a non-reader how many entries a host logged, and when.
 - A host knows a caller's identity only once the caller presented its token to that host.
 - A host can withhold or truncate its own log (§8).

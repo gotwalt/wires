@@ -928,8 +928,6 @@ mod tests {
         s.version = StateVersion(1);
         s.issued = 1;
         s.not_after = i64::MAX;
-        s.members.extend([server.node_id(), client.node_id()]);
-        s.hosts.insert(server.node_id());
         let (staff, matchers) = crate::testutil::staff_role();
         s.roles.insert(staff.clone(), matchers);
         for name in ["json", "fail"] {
@@ -1140,20 +1138,12 @@ mod tests {
     }
 
     /// A signed state at `version` in which `hosts` implement `orders-db`.
-    fn signed_state(
-        root: &NodeIdentity,
-        version: u64,
-        caller: NodeId,
-        hosts: &[NodeId],
-    ) -> SignedState {
+    fn signed_state(root: &NodeIdentity, version: u64, hosts: &[NodeId]) -> SignedState {
         use library::{Matcher, RoleName, Service, State, StateVersion};
         let mut s = State::new(root.node_id());
         s.version = StateVersion(version);
         s.issued = 1;
         s.not_after = i64::MAX;
-        s.members.insert(caller);
-        s.members.extend(hosts.iter().copied());
-        s.hosts.extend(hosts.iter().copied());
         let staff = RoleName::new("staff").unwrap();
         s.roles
             .insert(staff.clone(), vec![Matcher::new("https://idp.example")]);
@@ -1235,9 +1225,8 @@ mod tests {
         let f = fixture();
         let down = NodeIdentity::from_seed([82; 32]).node_id();
         let b = NodeIdentity::from_seed([83; 32]);
-        let me = f.creds.node.node_id();
-        let v1 = signed_state(&f.root, 1, me, &[down, b.node_id()]);
-        let v2 = signed_state(&f.root, 2, me, &[down, b.node_id()]);
+        let v1 = signed_state(&f.root, 1, &[down, b.node_id()]);
+        let v2 = signed_state(&f.root, 2, &[down, b.node_id()]);
         store::adopt_if_newer(&f.ks, &v1, f.root.node_id(), 10).unwrap();
         let answer = Answer::Run {
             out: "42\n",
@@ -1277,8 +1266,7 @@ mod tests {
         let f = fixture();
         let a = NodeIdentity::from_seed([84; 32]);
         let b = NodeIdentity::from_seed([85; 32]);
-        let me = f.creds.node.node_id();
-        let state = signed_state(&f.root, 1, me, &[a.node_id(), b.node_id()]);
+        let state = signed_state(&f.root, 1, &[a.node_id(), b.node_id()]);
         let (a_id, a_addr, _) = fake_host(&f.root, &a, Answer::Deny("not in role analyst")).await;
         let answer = Answer::Run {
             out: "",
@@ -1297,13 +1285,51 @@ mod tests {
         );
     }
 
+    /// Card 35: with its state current, a caller never sends `Hello` (so
+    /// never `Invoke`) to a host that state bans, even one still listed for
+    /// the service (a validated state can't list one; this is the caller's
+    /// own guard) and remembered as the last that answered.
+    #[tokio::test]
+    async fn a_banned_host_is_never_dialed() {
+        let f = fixture();
+        let banned = NodeIdentity::from_seed([92; 32]);
+        let fine = NodeIdentity::from_seed([93; 32]);
+        let mut state = signed_state(&f.root, 1, &[banned.node_id(), fine.node_id()]);
+        // As if the ban were signed in: `call` checks freshness, not the
+        // signature (the store verified it on the way in).
+        state.state.bans.insert(banned.node_id(), i64::MAX);
+        let run = || Answer::Run {
+            out: "ok\n",
+            newer: None,
+        };
+        let (b_id, b_addr, b_seen) = fake_host(&f.root, &banned, run()).await;
+        let (f_id, f_addr, f_seen) = fake_host(&f.root, &fine, run()).await;
+        let name = ServiceName::new("orders-db").unwrap();
+        LastGood::record(&LastGood::path(&f.ks), &name, b_id);
+        let hints = Hints::from_pairs([(b_id, vec![b_addr]), (f_id, vec![f_addr])]);
+        let (r, out) = run_service(&f, &state, hints.clone()).await;
+        assert_eq!(r.unwrap(), 0);
+        assert_eq!(out, "ok\n");
+        assert_eq!(f_seen.lock().unwrap().len(), 1);
+        assert!(
+            b_seen.lock().unwrap().is_empty(),
+            "the banned host was dialed"
+        );
+
+        // Its only host banned: nothing is dialed at all.
+        state.state.bans.insert(fine.node_id(), i64::MAX);
+        let (r, _) = run_service(&f, &state, hints).await;
+        assert!(format!("{:#}", r.unwrap_err()).contains("with a host"));
+        assert!(b_seen.lock().unwrap().is_empty());
+        assert_eq!(f_seen.lock().unwrap().len(), 1);
+    }
+
     /// Every host down: one error naming each.
     #[tokio::test]
     async fn no_host_answering_is_an_error_naming_them() {
         let f = fixture();
         let a = NodeIdentity::from_seed([86; 32]).node_id();
-        let me = f.creds.node.node_id();
-        let state = signed_state(&f.root, 1, me, &[a]);
+        let state = signed_state(&f.root, 1, &[a]);
         let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let (r, _) = run_service(&f, &state, Hints::from_pairs([(a, vec![dead])])).await;
         let err = format!("{:#}", r.unwrap_err());
@@ -1315,13 +1341,12 @@ mod tests {
     async fn an_expired_state_refuses_to_dial() {
         let f = fixture();
         let h = NodeIdentity::from_seed([87; 32]);
-        let me = f.creds.node.node_id();
         let answer = Answer::Run {
             out: "",
             newer: None,
         };
         let (h_id, h_addr, seen) = fake_host(&f.root, &h, answer).await;
-        let mut expired = signed_state(&f.root, 1, me, &[h_id]).state;
+        let mut expired = signed_state(&f.root, 1, &[h_id]).state;
         expired.not_after = 1;
         let expired = expired.sign(&f.root).unwrap();
         let (r, _) = run_service(&f, &expired, Hints::from_pairs([(h_id, vec![h_addr])])).await;
@@ -1341,11 +1366,8 @@ mod tests {
         let f = fixture();
         let h = NodeIdentity::from_seed([88; 32]);
         let other = NodeIdentity::from_seed([89; 32]).node_id();
-        let me = f.creds.node.node_id();
-        let v1 = signed_state(&f.root, 1, me, &[h.node_id()]);
-        let mut v2 = signed_state(&f.root, 2, me, &[other]).state;
-        v2.members.insert(h.node_id());
-        let v2 = v2.sign(&f.root).unwrap();
+        let v1 = signed_state(&f.root, 1, &[h.node_id()]);
+        let v2 = signed_state(&f.root, 2, &[other]);
         store::adopt_if_newer(&f.ks, &v1, f.root.node_id(), 10).unwrap();
         let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let answer = Answer::Echo {
@@ -1369,7 +1391,7 @@ mod tests {
 
         // Control: a newer state that still assigns the host lets stdin through.
         let f = fixture();
-        let v2 = signed_state(&f.root, 2, me, &[h.node_id()]);
+        let v2 = signed_state(&f.root, 2, &[h.node_id()]);
         store::adopt_if_newer(&f.ks, &v1, f.root.node_id(), 10).unwrap();
         let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let answer = Answer::Echo {
@@ -1388,10 +1410,9 @@ mod tests {
     #[test]
     fn a_service_beats_an_alias_and_an_alias_needs_an_assigned_host() {
         let f = fixture();
-        let me = f.creds.node.node_id();
         let host = NodeIdentity::from_seed([90; 32]).node_id();
         let stranger = NodeIdentity::from_seed([91; 32]).node_id();
-        let state = signed_state(&f.root, 1, me, &[host]);
+        let state = signed_state(&f.root, 1, &[host]);
         let alias = |name: &str, node: NodeId| RemoteTool {
             name: ServiceName::new(name).unwrap(),
             description: String::new(),

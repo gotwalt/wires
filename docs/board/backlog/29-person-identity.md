@@ -3,7 +3,7 @@
 **Lane:** I2 · **Depends on:** [36](36-directory.md) · **Status:** backlog; design agreed 2026-09-23, reshaped 2026-09-24 · **Files:** `library/idp/`, `library/membership/` (day-pass), `wires/caller/login.rs`, `wires/directory/` (issuing), `wires/host/{gate,identity}.rs`, protocol.md §6
 
 **Reshaped 2026-09-24.** This card was "identity and scale". Its scale half (badges and bans,
-per-caller views, moving the state) is now cards [35](35-badges-and-bans.md),
+per-caller views, moving the state) is now cards [35](../done/35-badges-and-bans.md),
 [36](36-directory.md) and [37](37-caller-views.md), built around a directory; its records half
 (transparency-log checkpoints) is now [card 09](09-witness.md). What's left is how a *person* is
 proven when no browser is at hand.

@@ -1,13 +1,22 @@
-//! Accept-time policy: signature, member binding, and TTL.
+//! Accept-time policy: is this node admitted to the network right now?
 //!
-//! [`check_inclusion`] is the gate a host runs on a caller's [`Membership`]
-//! credential. Whether the member is *still* in is the admin-signed
-//! [`State`](crate::State)'s member set: removal is a new state that leaves
-//! the member out (`wires remove`).
+//! A node is admitted by its **badge** (its root-signed [`Membership`]) and
+//! not being **banned** by the admin-signed [`State`]:
+//!
+//! - [`check_inclusion`]: the badge verifies under the network root, names
+//!   the authenticated caller, and is unexpired;
+//! - [`check_admitted`]: that, and the state doesn't ban the caller. This is
+//!   the question every gate asks (a host's call gate, push and inbox fetch,
+//!   the record stream, the state responder, a caller's inbox, the gateway).
+//!
+//! The state lists no members: admitting a node is minting its badge, not
+//! an edit. Removal is a ban (`wires remove`), which lasts until the removed
+//! badge would have expired anyway.
 
 use crate::error::{Error, Result};
 use crate::identity::NodeId;
 use crate::membership::Membership;
+use crate::state::State;
 
 /// Decide whether a host should accept `membership` from `caller` right now.
 ///
@@ -52,6 +61,45 @@ pub fn check_inclusion(
     Ok(())
 }
 
+/// Decide whether `caller`, presenting badge `m`, is admitted under
+/// `state`: [`check_inclusion`] against `fabric_root`, then
+/// [`Error::Banned`] if `state` bans `caller`. Returns the first failure.
+///
+/// Doesn't check `state` itself (verify it under `fabric_root`, and check
+/// it is fresh, before deciding under it). As with [`check_inclusion`],
+/// **`caller` must be the cryptographically authenticated peer.**
+///
+/// ```
+/// use library::{check_admitted, Error, Membership, NodeIdentity, State};
+/// let root = NodeIdentity::from_seed([1u8; 32]);
+/// let alice = NodeIdentity::from_seed([2u8; 32]).node_id();
+/// let badge = Membership::mint(&root, alice, 0, 100).unwrap();
+/// let mut state = State::new(root.node_id());
+///
+/// // Any badge the root signed admits: the state needn't list anyone.
+/// assert!(check_admitted(&badge, root.node_id(), &state, alice, 0).is_ok());
+///
+/// // Removed: banned until the badge would have expired.
+/// state.ban(alice, badge.not_after);
+/// assert!(matches!(
+///     check_admitted(&badge, root.node_id(), &state, alice, 0),
+///     Err(Error::Banned { until: 100 })
+/// ));
+/// ```
+pub fn check_admitted(
+    m: &Membership,
+    fabric_root: NodeId,
+    state: &State,
+    caller: NodeId,
+    now_unix: i64,
+) -> Result<()> {
+    check_inclusion(m, fabric_root, caller, now_unix)?;
+    if let Some(until) = state.bans.get(&caller) {
+        return Err(Error::Banned { until: *until });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +130,38 @@ mod tests {
             let m = Membership::mint(&root, member, 0, not_after).unwrap();
             let ok = check_inclusion(&m, fabric_root, caller, now).is_ok();
             prop_assert_eq!(ok, right_root && same_caller && now <= not_after);
+        }
+    }
+
+    proptest! {
+        /// `check_admitted` succeeds iff `check_inclusion` does and the
+        /// state doesn't ban the caller, whatever else it bans.
+        #[test]
+        fn admitted_iff_included_and_not_banned(
+            ms in seed(),
+            not_after in any::<i64>(), now in any::<i64>(),
+            banned in any::<bool>(),
+            others in proptest::collection::vec(seed(), 0..4),
+        ) {
+            let root = NodeIdentity::from_seed([1u8; 32]);
+            let member = NodeIdentity::from_seed(ms).node_id();
+            let m = Membership::mint(&root, member, 0, not_after).unwrap();
+            let mut state = State::new(root.node_id());
+            for o in &others {
+                let other = NodeIdentity::from_seed(*o).node_id();
+                if other != member {
+                    state.ban(other, 7);
+                }
+            }
+            if banned {
+                state.ban(member, not_after);
+            }
+            let included = check_inclusion(&m, root.node_id(), member, now).is_ok();
+            let admitted = check_admitted(&m, root.node_id(), &state, member, now);
+            prop_assert_eq!(admitted.is_ok(), included && !banned);
+            if included && banned {
+                prop_assert!(matches!(admitted, Err(Error::Banned { .. })), "{:?}", admitted);
+            }
         }
     }
 

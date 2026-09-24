@@ -56,16 +56,9 @@ impl World {
         }
     }
 
-    /// Everyone a member; role `analyst` = alice; service `env` (analyst) on
-    /// the host.
+    /// Role `analyst` = alice; service `env` (analyst) on the host.
     fn state(&self, version: u64) -> SignedState {
         signed_state(&self.root, version, |s| {
-            s.members.extend([
-                self.alice.node_id(),
-                self.bob.node_id(),
-                self.host.node_id(),
-            ]);
-            s.hosts.insert(self.host.node_id());
             s.roles.insert(
                 role("analyst"),
                 vec![email_at(&self.idp, "alice@example.com")],

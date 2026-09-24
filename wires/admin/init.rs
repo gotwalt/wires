@@ -1,22 +1,25 @@
 //! `wires init`: a new network in one step.
 //!
 //! Creates the root key and this machine's node key in one keystore, mints
-//! this node's membership, and signs the first admin-signed state with this
-//! node as its one member — the admin is a member too, which is what lets it
-//! push every later state to the hosts by key.
+//! this node's badge (its membership: the admin's node is admitted like any
+//! other, which is what lets it push every later state to the hosts by key),
+//! records it in the ledger, and signs the first admin-signed state: no
+//! roles, no services, no bans.
 
 use anyhow::bail;
 use clap::Args;
 use library::{Membership, NodeIdentity};
 
 use super::keystore::Keystore;
+use super::ledger::Ledger;
 use super::ttl::Ttl;
 use crate::clock::now_unix;
 
 /// `init` arguments.
 #[derive(Args)]
 pub(crate) struct InitArgs {
-    /// Lifetime of this node's membership (`30d`, `12h`, … or seconds).
+    /// Lifetime of this node's badge (`30d`, `12h`, … or seconds; at most
+    /// 30 days).
     #[arg(long, default_value = Ttl::DEFAULT)]
     pub(crate) ttl: Ttl,
     /// Lifetime of the first signed state.
@@ -66,21 +69,16 @@ pub(crate) fn init_in(ks: &Keystore, a: InitArgs) -> anyhow::Result<String> {
     };
 
     let now = now_unix();
-    ks.save_membership(&Membership::mint(
-        &root,
-        me.node_id(),
-        now,
-        a.ttl.not_after(now),
-    )?)?;
-    ks.save_names(&Default::default())?;
-    let state = super::service::edit_state(ks, a.state_ttl, |s| {
-        s.members.insert(me.node_id());
-        Ok(())
-    })?;
+    let badge = Membership::mint(&root, me.node_id(), now, a.ttl.badge()?.not_after(now))?;
+    ks.save_membership(&badge)?;
+    let mut ledger = Ledger::load(ks)?;
+    ledger.record(me.node_id(), None, badge.not_after);
+    ledger.save(ks)?;
+    let state = super::service::edit_state(ks, a.state_ttl, |_| Ok(()))?;
     crate::state::store::save_admin(ks, me.node_id())?;
 
     Ok(format!(
-        "network {}\nnode {}\nstate version {} (1 member: this node)\n\
+        "network {}\nnode {}\nstate version {}\n\
          next: on each joining machine run `wires id`, then here `wires invite <node-id> --name <label>`",
         root.node_id().hex(),
         me.node_id().hex(),
@@ -94,7 +92,7 @@ mod tests {
     use crate::testutil::temp_dir;
 
     #[test]
-    fn init_makes_this_node_the_first_member() {
+    fn init_badges_this_node_and_signs_an_empty_state() {
         let ks = Keystore::at(temp_dir());
         let out = init_in(&ks, InitArgs::default()).unwrap();
         let root = ks.read_root_identity().unwrap().unwrap();
@@ -109,8 +107,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state.state.version, library::StateVersion(1));
-        assert_eq!(state.state.members, [me.node_id()].into());
         assert!(state.state.services.is_empty());
+        assert!(state.state.bans.is_empty());
+        let ledger = Ledger::load(&ks).unwrap();
+        assert_eq!(
+            ledger.get(me.node_id()).map(|i| i.not_after),
+            Some(membership.not_after)
+        );
         assert_eq!(
             crate::state::store::read_admin(&ks).unwrap(),
             Some(me.node_id())

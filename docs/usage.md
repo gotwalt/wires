@@ -9,7 +9,7 @@ choices, the limits, and the command reference. The wire-level spec is
 
 | Role | Decides | Commands |
 |---|---|---|
-| **admin** | who's in, which roles exist, which services run where, who may call and read each (root key) | `init`, `invite`, `remove`, `role set\|rm`, `service add\|set\|rm`, `state push` |
+| **admin** | who's in (it mints each node's badge, and bans), which roles exist, which services run where, who may call and read each (root key) | `init`, `invite`, `remove`, `role set\|rm`, `service add\|set\|rm`, `state push` |
 | **host** | how it implements its assigned services; which IdPs it trusts; stricter local rules; push | `serve host.json`, `push` |
 | **caller** | — runs services by name; MCP (stdio, or the remote gateway) so wires works in the clients people already use | `id`, `join`, `login`, `services`, `call`, `mcp`, `inbox`, `gateway` |
 | **reader** | — any member; reads the records a service's `readers` role allows, or its own (by verified identity) | `watch` |
@@ -20,17 +20,17 @@ Every role joins the same way: `wires id`, then `wires join <token>` with the ad
 
 | Guarantee | Lives in | Checked by |
 |---|---|---|
-| **Who's in** | The admin-signed state's member set (and each node's root-signed membership). Removal is a new state without the member. | The host, per connection, against its copy of the state (re-read every dial). |
+| **Who's in** | Each node's badge: its root-signed membership, minted by `wires invite` (at most 30 days). Removal is a ban in the admin-signed state until that badge would expire; the state lists no members. | The host, per connection: the badge, and the bans in its copy of the state (re-read every dial). |
 | **Who may call what** | The state's registry: each service's `allow` roles, and the role definitions (matchers on the IdP identity, each naming its issuer). Every role needs a verified identity. | The host, on every call. `wires services` evaluates the same table locally, for listing only. |
 | **Stricter local rules** | `host.json`'s `also_require` roles per service. They can only narrow. | The host, after the registry. |
 | **Who is calling** | Your IdP's ID token, bound to the caller's node key at `wires login` (the OIDC `nonce` is a hash of the key), presented in the session `Hello`. | The host, against the issuer's JWKS, under the issuers `host.json` trusts. No wires identity service. |
-| **Reach** | The host's node key. Callers dial a key (iroh; n0 discovery, or an optional local `$WIRES_HOME/hints` file); the host binds UDP for QUIC and has no TCP listener. | iroh's handshake authenticates the key (any key may connect); the host then checks the membership and the state at the first message, and a key the state doesn't list hears only `not a member of this network`. |
+| **Reach** | The host's node key. Callers dial a key (iroh; n0 discovery, or an optional local `$WIRES_HOME/hints` file); the host binds UDP for QUIC and has no TCP listener. | iroh's handshake authenticates the key (any key may connect); the host then checks the badge and the bans at the first message, and a key without a valid badge, or banned, hears only `not a member of this network`. |
 | **Which host** | The registry's `hosts` for the service. Only the admin binds a name to a host, so no host can squat a name. | The caller (it dials only those hosts) and the host (it refuses to start, or to serve, a name not assigned to it). |
-| **Records** | Each host's own call log: every call, member's refusal and push (a non-member's knock is traced, not logged), signed by the host and hash-linked. | Readers, with `wires watch`: the service's `readers` roles see all of it; everyone else sees only the records of their own verified identity (issuer and subject, from any of their nodes) and a hash link for every other entry. Every entry and the chain are verified. |
-| **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. A service pushes only through its call's capability, to that call's caller. | The host, at send, delivery and fetch: a member of the state, in a `push.allow` role. |
+| **Records** | Each host's own call log: every call, admitted caller's refusal and push (a knock from a node that isn't admitted is traced, not logged), signed by the host and hash-linked. | Readers, with `wires watch`: the service's `readers` roles see all of it; everyone else sees only the records of their own verified identity (issuer and subject, from any of their nodes) and a hash link for every other entry. Every entry and the chain are verified. |
+| **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. A service pushes only through its call's capability, to that call's caller. | The host, at send, delivery and fetch: not banned by the state, in a `push.allow` role. |
 | **Removal** | A new state, pushed to the hosts. No shared key exists, so there is nothing to rotate. | Each host that has the new state, on the removed member's next call or fetch there. |
 
-Nothing is broadcast: a member that takes part in no call receives no traffic about other members' calls. What every member does learn is the whole signed state: every member id, role matcher and service (cards [35](board/backlog/35-badges-and-bans.md)–[37](board/backlog/37-caller-views.md) replace it with a directory and per-caller views: [fabric.md](fabric.md)).
+Nothing is broadcast: a member that takes part in no call receives no traffic about other members' calls. What every member does learn is the whole signed state: every role matcher, service, host id and ban, though no list of members (card [35](board/done/35-badges-and-bans.md)); cards [36](board/backlog/36-directory.md)–[37](board/backlog/37-caller-views.md) replace it with a directory and per-caller views ([fabric.md](fabric.md)).
 
 ## Walkthrough
 
@@ -49,7 +49,7 @@ step. Node ids are shortened.
 admin$ wires init
 network 57b09428…
 node 23028cae…
-state version 1 (1 member: this node)
+state version 1
 next: on each joining machine run `wires id`, then here `wires invite <node-id> --name <label>`
 admin$ wires role set analyst '*@example.com'          # issuer: Google unless --issuer
 role analyst set (state version 2)
@@ -64,15 +64,14 @@ its `wires id`; the admin sends back one token.
 workbench$ wires id
 3ef72b11…
 admin$ wires invite 3ef72b11… --name workbench        # likewise the spare
-wires: invited 3ef72b11… as "workbench" (state version 4, 2 members)
-wires: state version 4: no host to push to yet (a new member gets it in its invite token)
+wires: invited 3ef72b11… as "workbench" (badge until 1792702980; state version 3 unchanged)
 wires: on the joining machine: wires join eyJhZG1pbiI6…
 workbench$ wires join eyJhZG1pbiI6…
 admin$ wires service add orders-db --description "Read-only SQL (sqlite3) over the orders database; …" \
          --allow analyst --reader security --host workbench --host spare
-wires: state version 6: pushed to 0 of 2 host(s); not reached: 3ef72b11…, 511de414… (`wires state push` re-sends it)
-service orders-db added (state version 6)
-wires: state version 6 is signed and stored here, but reached none of its 2 host(s), so they still enforce the older state; run `wires state push` once a host is up
+wires: state version 4: pushed to 0 of 2 host(s); not reached: 3ef72b11…, 511de414… (`wires state push` re-sends it)
+service orders-db added (state version 4)
+wires: state version 4 is signed and stored here, but reached none of its 2 host(s), so they still enforce the older state; run `wires state push` once a host is up
 admin$ echo $?
 1
 ```
@@ -83,8 +82,10 @@ the new state is stored on the admin but in force nowhere. Once a host is up,
 assign it the service pulls a newer one from the other hosts in its copy
 before giving up; here each host's copy names no other host (the state had
 no services yet), so a fresh `wires invite` token catches it up (re-joining
-never rolls a state back). The token isn't a secret: it holds the invitee's
-membership and the signed state.
+never rolls a state back). An invite edits nothing: it mints the node's badge
+(its membership, which is what admits it) and carries the admin's current
+signed state. The token isn't a secret: the badge is bound to the invitee's
+key, and the state names no other member.
 
 **3. The hosts serve.** `host.json` says only how each service runs here. A
 command is an argv, exec'd directly and never through a shell, with the
@@ -118,13 +119,13 @@ workbench$ wires serve host.json
 `serve` refuses to start unless its state assigns every service in the file
 to it.
 
-**4. The agent and the observer join.** Each invite is a new state, pushed to
-both hosts (only hosts are pushed to; the agent gets it in its token):
+**4. The agent and the observer join.** An invite mints a badge and edits
+nothing, so the hosts need no new state: they admit any badge the root
+signed.
 
 ```console
 admin$ wires invite dd7e7237… --name agent
-wires: invited dd7e7237… as "agent" (state version 9, 4 members)
-wires: state version 9: pushed to 2 of 2 host(s)
+wires: invited dd7e7237… as "agent" (badge until 1792703101; state version 4 unchanged)
 agent$ wires join eyJhZG1pbiI6…
 ```
 
@@ -132,7 +133,7 @@ agent$ wires join eyJhZG1pbiI6…
 
 ```console
 agent$ wires services
-wires services: no service allows this node without a login (state v9)
+wires services: no service allows this node without a login (state v4)
 agent$ wires call orders-db -- "select count(*) from orders"
 wires: denied by host: no ID token presented; run `wires login`; orders-db needs a verified identity in role analyst
 agent$ echo $?
@@ -147,12 +148,12 @@ count(*)
        7
 ```
 
-A signed-in member in no allowed role sees nothing, and naming the service
+A signed-in node in no allowed role sees nothing, and naming the service
 anyway is refused with the reason:
 
 ```console
 observer$ wires services
-wires services: no service allows sec@audit.example (state v10)
+wires services: no service allows sec@audit.example (state v4)
 observer$ wires call orders-db -- "select 1"
 wires: denied by host: sec@audit.example is in no role allowed to call orders-db (analyst)
 ```
@@ -192,8 +193,8 @@ callers don't normally care). Then:
 
 ```console
 admin$ wires remove agent
-wires: state version 11: pushed to 2 of 2 host(s)
-removed dd7e7237… (agent) (state version 11, 4 members)
+wires: state version 5: pushed to 2 of 2 host(s)
+removed dd7e7237… (agent) (banned until 1792703101; state version 5, 1 ban(s))
 agent$ wires call orders-db -- "select count(*) from orders"
 wires: denied by host: not a member of this network
 agent$ echo $?
@@ -361,16 +362,17 @@ on that port is then guarded by its own auth. Wires gives the caller a
 key-addressed path to the services the state lets it call. On the host there
 is no TCP listener and no firewall port opened; iroh binds UDP for QUIC
 (direct, or through a relay). Any key can open a connection, but one the
-state doesn't list is refused at its first message, before anything runs,
+holds no valid badge, or is banned, is refused at its first message, before anything runs,
 and costs the host little (small frames, no token check, nothing logged).
 In the two-machine run (card 08), `ss` on the host showed zero TCP
 listeners and two UDP sockets.
 
-**One signed state, checked locally.** Who's in, the roles and the registry
-are one root-signed, versioned document that every member holds. Hosts decide
-every call from their copy, re-read per connection, with no round-trip to an
-auth server; callers list what they may call from theirs. A node never
-accepts an older version, so a removal sticks.
+**One signed state, checked locally.** The roles, the registry and the bans
+are one root-signed, versioned document that every node holds; each node's
+root-signed badge says it is in. Hosts decide every call from their copy,
+re-read per connection, with no round-trip to an auth server; callers list
+what they may call from theirs. A node never accepts an older version, so a
+ban sticks.
 
 **The host writes the log.** The record of a call is written by the process
 that ran it, signed by its key and hash-linked, so the caller can't forge it
@@ -434,14 +436,16 @@ To make `wires` the boundary, use a structural setup:
 
 ## Known trade-offs
 
-- **Known and accepted until cards [35](board/backlog/35-badges-and-bans.md)–[37](board/backlog/37-caller-views.md)** (the directory; [fabric.md](fabric.md)), [09](board/backlog/09-witness.md) and [29](board/backlog/29-person-identity.md):
-  - **Every member holds the whole state**: member and host node ids, role
+- **Known and accepted until cards [36](board/backlog/36-directory.md)–[37](board/backlog/37-caller-views.md)** (the directory; [fabric.md](fabric.md)), [09](board/backlog/09-witness.md) and [29](board/backlog/29-person-identity.md):
+  - **Every node holds the whole state**: host and banned node ids, role
     matchers (often people's emails), service names and descriptions. It is
-    signed, not secret: every agent's machine holds the org chart, and the
-    state grows with the number of members.
-  - **A removed host still sees argv** while its membership is valid: the
-    caller sends the arguments with its `Hello` and stops before stdin only
-    once the host hands back a state that no longer assigns it the service.
+    signed, not secret. It lists no members (card 35), but every agent's
+    machine still holds every service and role.
+  - **A removed host still sees argv** while its badge is valid, from a
+    caller whose copy of the state predates the ban: the caller sends the
+    arguments with its `Hello` and stops before stdin only once the host
+    hands back a state that no longer assigns it the service. A caller that
+    holds the ban never dials it.
   - **Hidden record links reveal count and timing** to a caller who isn't a
     service's reader (not content, caller or service).
   - **Google ID tokens last about an hour**, and Google drops the `nonce`
@@ -490,10 +494,9 @@ To make `wires` the boundary, use a structural setup:
 - **The recorded two-machine demo** with real Google sign-in and Claude Code
   as the agent ([card 08](board/doing/08-demo-two-machine.md);
   script in [docs/demo.md](demo.md)).
-- **A directory** (cards [35](board/backlog/35-badges-and-bans.md),
-  [36](board/backlog/36-directory.md), [37](board/backlog/37-caller-views.md);
-  the architecture is [fabric.md](fabric.md)): machine badges plus a ban list
-  instead of a member list; the policy held by directory nodes, which give each
+- **A directory** (cards [36](board/backlog/36-directory.md),
+  [37](board/backlog/37-caller-views.md); the architecture is
+  [fabric.md](fabric.md)): the policy held by directory nodes, which give each
   host its slice and each caller its view, with search; `wires mcp` noticing a
   new policy without a restart.
 - `login --for` and day-passes for headless agents
@@ -512,16 +515,16 @@ To make `wires` the boundary, use a structural setup:
 
 | Role | Command | What it does |
 |---|---|---|
-| **admin** | `wires init [--ttl 30d] [--state-ttl 30d]` | Create the root key and this node, and sign state version 1 with this node as its one member. `--ttl` is this node's membership lifetime, `--state-ttl` the state's. |
-| | `wires invite <node-id> [--name l] [--ttl 30d] [--state-ttl 30d]` | Add a node to the state, mint its membership (valid for `--ttl`), print its join token (stdout), push the new state. |
-| | `wires remove <name\|node-id> [--state-ttl 30d]` | Drop a node (and from every service's hosts); push to the hosts. Its next call to a host that has the new state is refused. |
-| | `wires role set <name> [--issuer URL] [--state-ttl] <matcher>…` · `role rm <name>` | Define a role as an OR of matchers: `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…` (all must hold). Every matcher names its issuer, compared exactly: one without `issuer=` takes `--issuer` (default `https://accounts.google.com`). `issuer=…` alone admits anyone that IdP verified. `org` is Google's `hd`, read only from Google. There is no built-in role: a member with no verified identity is in no role. |
-| | `wires service add\|set <name> [--description D] [--allow role]… [--host member]… [--reader role]…` · `service rm <name>` | Edit the registry. `--host` is an `invite --name` label or a node id, and must be a member; `set` replaces each list given. |
+| **admin** | `wires init [--ttl 30d] [--state-ttl 30d]` | Create the root key and this node, mint this node's badge, and sign state version 1. `--ttl` is this node's badge lifetime (at most 30 days), `--state-ttl` the state's. |
+| | `wires invite <node-id> [--name l] [--ttl 30d] [--state-ttl 30d]` | Mint the node's badge (valid for `--ttl`, at most 30 days), record it in the admin's ledger (`issued.json`), print its join token (stdout). Not a state edit: nothing is pushed. Re-inviting a banned node lifts its ban (an edit, pushed; `--state-ttl` applies). |
+| | `wires remove <name\|node-id> [--state-ttl 30d]` | Ban a node until its badge would expire (30 days for a node the ledger doesn't know), and drop it from every service's hosts; push to the hosts. Its next call to a host that has the new state is refused. |
+| | `wires role set <name> [--issuer URL] [--state-ttl] <matcher>…` · `role rm <name>` | Define a role as an OR of matchers: `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…` (all must hold). Every matcher names its issuer, compared exactly: one without `issuer=` takes `--issuer` (default `https://accounts.google.com`). `issuer=…` alone admits anyone that IdP verified. `org` is Google's `hd`, read only from Google. There is no built-in role: a node with no verified identity is in no role. |
+| | `wires service add\|set <name> [--description D] [--allow role]… [--host node]… [--reader role]…` · `service rm <name>` | Edit the registry. `--host` is an `invite --name` label or a node id, of a node this admin invited and didn't ban; `set` replaces each list given. |
 | | `wires state push` | Re-send the stored state to every host, e.g. after an edit that reached none. Exits 1 if the state names hosts and none took it. |
-| **host** | `wires serve host.json` | Refuse to start unless the state assigns every service in the file here; then check every caller against the state, exec the service per call, and log every call, member's refusal and push. `--check` validates and prints what the file implements. |
+| **host** | `wires serve host.json` | Refuse to start unless the state assigns every service in the file here; then check every caller against the state, exec the service per call, and log every call, admitted caller's refusal and push. `--check` validates and prints what the file implements. |
 | | `wires push --to <node-id\|role> --subject S [--ttl D] -- <body>` | Hand a message for a caller to this machine's running `serve` (body from stdin if none is given). From the operator's shell: to any node or role. From a service (it has `WIRES_PUSH_TOKEN`): only to that call's caller. Prints `delivered`, `queued` or `denied` per recipient; exits `77` if every recipient was refused. |
 | **caller** | `wires id` | Print this node's id (creating its key on first use). |
-| | `wires join <token>` | Install an invite: the membership and the signed state. |
+| | `wires join <token>` | Install an invite: the badge (membership) and the signed state. |
 | | `wires login` | Sign in with your IdP (Google by default; `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*`) and store the key-bound ID token. |
 | | `wires services [--verbose] [--json]` | List the services you may call and the role that admits you, evaluated locally. `--verbose` adds their hosts. |
 | | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name (or a `tools.json` alias; a registered service of the same name wins). Stdio passes through and its exit code becomes `call`'s, except that a remote exit `77` is reported as `1` (with a note on stderr). A refusal by the host exits `77`; a local or transport failure, an expired state, or a newer state (handed back at the handshake) that no longer assigns the service to that host exits `1`, before any stdin is sent. |

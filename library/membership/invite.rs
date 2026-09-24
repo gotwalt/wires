@@ -1,25 +1,27 @@
-//! The invite: everything a new member needs, in one pasteable token.
+//! The invite: everything a new node needs, in one pasteable token.
 //!
-//! `wires invite <node-id>` adds the node to the admin-signed state and
-//! bundles, for that one node: its root-signed [`Membership`], the new
-//! [`SignedState`] (which names it as a member), and the admin's node id to
-//! pull newer copies from. `wires join <token>` checks and installs all of
-//! it.
+//! `wires invite <node-id>` mints the node's root-signed [`Membership`] (its
+//! badge) and bundles it with the admin's current [`SignedState`] and the
+//! admin's node id to pull newer copies from. The state doesn't change: the
+//! badge is what admits the node (card 35), so inviting is no edit. `wires
+//! join <token>` checks and installs all of it.
 //!
 //! # Not a secret
 //!
 //! Everything inside is public: the membership and the state are signed, not
 //! sealed. A copy in the wrong hands admits nobody, because every host binds
 //! the membership to the key the transport authenticated. What it does
-//! reveal is the member list, the role definitions and the service registry
-//! (node ids, role matchers, service names and the roles they allow).
+//! reveal is the state: the role definitions, the service registry (service
+//! names, the roles they allow, their hosts' node ids) and the bans. It
+//! names no other member.
 //!
 //! # Trust on first use
 //!
 //! A joiner has no fabric root to check the token against before it joins:
 //! the token *introduces* the root (`membership.fabric`). [`Invite::verify`]
-//! checks that both parts are signed by that one root and name this node,
-//! which rules out a spliced or mis-addressed token, but not a token from the
+//! checks that both parts are signed by that one root, that the badge names
+//! this node and the state doesn't ban it, which rules out a spliced or
+//! mis-addressed token, but not a token from the
 //! wrong admin. The out-of-band channel the token travels over is what
 //! vouches for the admin (see board card 18 for the open question of an
 //! authenticated front door).
@@ -31,7 +33,6 @@
 //! let mut state = State::new(root.node_id());
 //! state.version = StateVersion(2);
 //! state.not_after = i64::MAX;
-//! state.members.insert(joiner.node_id());
 //! let membership = Membership::mint(&root, joiner.node_id(), 0, i64::MAX).unwrap();
 //! let invite = Invite::new(membership, state.sign(&root).unwrap(), root.node_id());
 //!
@@ -49,7 +50,7 @@ use crate::codec::canonical_bytes;
 use crate::error::{Error, Result};
 use crate::identity::{NodeId, NodeIdentity};
 use crate::membership::Membership;
-use crate::policy::check_inclusion;
+use crate::policy::check_admitted;
 use crate::state::SignedState;
 
 /// The invite token's format discriminant (membership + signed state). An
@@ -64,7 +65,7 @@ pub struct Invite {
     pub format: u8,
     /// The invitee's root-signed membership; its `fabric` is the root.
     pub membership: Membership,
-    /// The current admin-signed state, naming the invitee as a member.
+    /// The admin's current signed state (it doesn't name the invitee).
     pub state: SignedState,
     /// The admin's node id: where the invitee pulls newer states from (an
     /// unsigned hint).
@@ -87,22 +88,25 @@ impl Invite {
         self.membership.fabric
     }
 
-    /// Check the invite is for `me` and internally consistent: the
-    /// membership verifies under its own fabric root, names `me`, and is
-    /// unexpired; the state verifies under that same root, is fresh, and
-    /// lists `me` as a member.
+    /// Check the invite is for `me` and internally consistent: the state
+    /// verifies under the membership's fabric root and is fresh, and under
+    /// it `me` is admitted ([`check_admitted`]: the membership verifies
+    /// under that root, names `me`, is unexpired, and the state doesn't ban
+    /// `me`).
     pub fn verify(&self, me: &NodeIdentity, now_unix: i64) -> Result<()> {
         if self.format != INVITE_V2 {
             return Err(Error::UnsupportedVersion);
         }
         let fabric = self.fabric();
-        check_inclusion(&self.membership, fabric, me.node_id(), now_unix)?;
         self.state.verify(fabric)?;
         self.state.check_fresh(now_unix)?;
-        if !self.state.state.is_member(me.node_id()) {
-            return Err(Error::SubjectMismatch);
-        }
-        Ok(())
+        check_admitted(
+            &self.membership,
+            fabric,
+            &self.state.state,
+            me.node_id(),
+            now_unix,
+        )
     }
 
     /// Encode to the base64url (no-pad) token `wires join` takes.
@@ -123,21 +127,24 @@ mod tests {
     use crate::state::{State, StateVersion};
     use proptest::prelude::*;
 
-    fn state_with(root: &NodeIdentity, members: &[NodeId]) -> State {
+    /// A state that bans `banned`.
+    fn state_with(root: &NodeIdentity, banned: &[NodeId]) -> State {
         let mut state = State::new(root.node_id());
         state.version = StateVersion(1);
         state.not_after = i64::MAX;
-        state.members.extend(members.iter().copied());
+        for b in banned {
+            state.ban(*b, i64::MAX);
+        }
         state
     }
 
+    /// An invite for `joiner` whose state bans `others` other nodes.
     fn invite_for(joiner: &NodeIdentity, others: u8) -> (NodeIdentity, Invite) {
         let root = NodeIdentity::from_seed([1u8; 32]);
-        let mut members = vec![joiner.node_id()];
-        for i in 0..others {
-            members.push(NodeIdentity::from_seed([100 + i; 32]).node_id());
-        }
-        let signed = state_with(&root, &members).sign(&root).unwrap();
+        let banned: Vec<NodeId> = (0..others)
+            .map(|i| NodeIdentity::from_seed([100 + i; 32]).node_id())
+            .collect();
+        let signed = state_with(&root, &banned).sign(&root).unwrap();
         let membership = Membership::mint(&root, joiner.node_id(), 0, i64::MAX).unwrap();
         let invite = Invite::new(membership, signed, root.node_id());
         (root, invite)
@@ -174,16 +181,16 @@ mod tests {
     }
 
     #[test]
-    fn the_state_must_verify_and_name_the_invitee() {
+    fn the_state_must_verify_and_not_ban_the_invitee() {
         let joiner = NodeIdentity::from_seed([2u8; 32]);
         let (root, invite) = invite_for(&joiner, 0);
-        // Not naming the invitee: refused.
+        // Banning the invitee: refused.
         let mut bad = invite.clone();
-        bad.state = state_with(&root, &[]).sign(&root).unwrap();
-        assert!(bad.verify(&joiner, 0).is_err());
+        bad.state = state_with(&root, &[joiner.node_id()]).sign(&root).unwrap();
+        assert!(matches!(bad.verify(&joiner, 0), Err(Error::Banned { .. })));
         // Signed by another root: refused.
         let rogue = NodeIdentity::from_seed([66u8; 32]);
-        let mut forged = state_with(&root, &[joiner.node_id()]);
+        let mut forged = state_with(&root, &[]);
         forged.fabric = rogue.node_id();
         let mut bad = invite;
         bad.state = forged.sign(&rogue).unwrap();
@@ -207,7 +214,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(16))]
 
         /// Encode → decode is the identity, and the decoded token still
-        /// verifies, for any member count.
+        /// verifies, for any number of other nodes banned.
         #[test]
         fn tokens_round_trip(seed in proptest::array::uniform32(any::<u8>()), others in 0u8..6) {
             let joiner = NodeIdentity::from_seed(seed);

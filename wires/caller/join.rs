@@ -2,8 +2,9 @@
 //!
 //! A host and a caller join the same way: send the admin this node's id
 //! (`wires id`), paste back the token `wires invite` printed (`wires join
-//! <token>`). Join checks the token is for this node and signed by one root
-//! throughout, then installs the membership and the admin-signed state where
+//! <token>`). Join checks the token is for this node, signed by one root
+//! throughout, and not banned by its state, then installs the membership
+//! (this node's badge: what admits it) and the admin-signed state where
 //! every other command looks for them, and records the admin's node id to
 //! pull newer states from.
 //!
@@ -123,12 +124,11 @@ mod tests {
     use crate::testutil::temp_dir;
     use library::{Membership, SignedState, State, StateVersion};
 
-    /// A state at `version` naming `members`, signed by `root`.
-    fn signed(root: &NodeIdentity, version: u64, members: &[NodeId]) -> SignedState {
+    /// A state at `version`, signed by `root`.
+    fn signed(root: &NodeIdentity, version: u64) -> SignedState {
         let mut s = State::new(root.node_id());
         s.version = StateVersion(version);
         s.not_after = i64::MAX;
-        s.members.extend(members.iter().copied());
         s.sign(root).unwrap()
     }
 
@@ -137,7 +137,7 @@ mod tests {
         let admin = NodeIdentity::from_seed([4u8; 32]).node_id();
         Invite::new(
             Membership::mint(root, joiner, 0, i64::MAX).unwrap(),
-            signed(root, version, &[joiner]),
+            signed(root, version),
             admin,
         )
     }

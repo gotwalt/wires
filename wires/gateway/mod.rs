@@ -378,9 +378,9 @@ impl<B: Backend> Gateway<B> {
 
 /// The services a web user may call through the gateway node `gateway`:
 /// those whose `allow` has a role whose matchers admit `principal`.
-/// Nothing if the gateway itself isn't a member.
+/// Nothing if the state bans the gateway itself.
 pub(crate) fn web_grants(state: &State, gateway: NodeId, principal: &Principal) -> Vec<Grant> {
-    if !state.is_member(gateway) {
+    if state.is_banned(gateway) {
         return Vec::new();
     }
     state
@@ -512,10 +512,11 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
         creds,
     };
     let state = backend.state()?;
-    if !state.is_member(node) {
+    if state.is_banned(node) {
         bail!(
-            "this node ({}) is not a member of its signed state: the admin must invite it",
-            node.hex()
+            "this node ({}) is banned by its signed state (version {}): the admin removed it",
+            node.hex(),
+            state.version.0
         );
     }
     let mut origins = vec![
@@ -583,7 +584,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Gateway 2, host 3. `orders-db` for `analyst` (alice, bob); `status` for
+    /// Gateway 2, host 3, 9 banned. `orders-db` for `analyst` (alice, bob); `status` for
     /// `ops` (carol); `mixed` for `ops` then `analyst`. Matchers trust Google.
     pub(crate) fn state() -> State {
         state_for(library::GOOGLE_ISSUER)
@@ -594,8 +595,7 @@ pub(crate) mod tests {
         let mut s = State::new(node(1));
         s.version = StateVersion(1);
         s.not_after = i64::MAX;
-        s.members.extend([node(2), node(3)]);
-        s.hosts.insert(node(3));
+        s.ban(node(9), i64::MAX);
         s.roles.insert(
             RoleName::new("analyst").unwrap(),
             ["alice@example.com", "bob@example.com"]
@@ -656,7 +656,7 @@ pub(crate) mod tests {
         assert!(web_grants(&state(), node(2), &principal("mallory@example.com")).is_empty());
         assert!(
             web_grants(&state(), node(9), &principal("alice@example.com")).is_empty(),
-            "a gateway that isn't a member offers nothing"
+            "a banned gateway offers nothing"
         );
     }
 

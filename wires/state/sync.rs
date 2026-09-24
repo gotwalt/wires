@@ -1,11 +1,11 @@
 //! Moving the signed state by key over [`STATE_ALPN`].
 //! The frames are [`library::StateFrame`].
 //!
-//! - [`push_all`]: after `invite` / `remove` / `service` / `role` (and
-//!   `wires state push`), the admin offers the new state to every **host**
-//!   (they enforce it, and they are the members that listen: only `serve`
-//!   runs the responder), plus any node that hosted under the state before
-//!   the edit. A host it can't reach is reported, not queued; the admin
+//! - [`push_all`]: after `remove` / `service` / `role` (and `wires state
+//!   push`, and the rare `invite` that edits), the admin offers the new
+//!   state to every **host** (they enforce it, and they are the nodes that
+//!   listen: only `serve` runs the responder), plus any node that hosted
+//!   under the state before the edit. A host it can't reach is reported, not queued; the admin
 //!   command fails when it reached none ([`PushReport::reached_no_host`]).
 //! - [`pull`]: a cold command whose copy was last checked more than
 //!   [`STALE_AFTER_SECS`] ago asks the hosts (the ones this node called
@@ -17,11 +17,12 @@
 //! - [`StateResponder`] / [`answer`]: the side a running host serves on the
 //!   ALPN: answer a pull, adopt an offer.
 //!
-//! One bi-stream per exchange, one frame each way. Nothing is ever adopted
-//! except through [`store::adopt_if_newer`] (verified under the root, fresh,
-//! strictly newer), so a lying peer can only fail to help. An expired copy
-//! vouches for nobody: its holder neither serves it nor hears a dialer on
-//! its strength.
+//! One bi-stream per exchange: the dialer's `hello` (its badge) and one
+//! frame, then one answer. The responder admits the dialer by its badge and
+//! the bans in its own copy ([`library::check_admitted`]) before anything
+//! else. Nothing is ever adopted except through [`store::adopt_if_newer`]
+//! (verified under the root, fresh, strictly newer), so a lying peer can
+//! only fail to help. An expired copy is never served.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -31,8 +32,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
 use library::{
-    MAX_SMALL_STATE_FRAME, NodeId, NodeIdentity, OFFER_BODY_PREFIX, STATE_ALPN, SignedState,
-    StateFrame, StateVersion,
+    MAX_SMALL_STATE_FRAME, Membership, NodeId, NodeIdentity, OFFER_BODY_PREFIX, STATE_ALPN,
+    SignedState, StateFrame, StateVersion, check_admitted, check_inclusion,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -55,14 +56,14 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const COLD_PULL_BUDGET: Duration = Duration::from_secs(8);
 
 /// How many state exchanges a host serves at once. Any key can dial the
-/// state ALPN, and until its frame is read and answered nothing says it is
-/// a member, so this bounds what strangers can hold open: at most this many
+/// state ALPN, and until its frames are read nothing says it is admitted,
+/// so this bounds what strangers can hold open: at most this many
 /// frames (each at most [`library::MAX_STATE_FRAME`], and only if the peer
 /// actually sends that much) and verifications. One more is closed
 /// unanswered.
 pub(crate) const MAX_STATE_EXCHANGES: usize = 16;
 
-/// Refusals of state-sync peers not known to be members.
+/// Refusals of state-sync peers not known to be admitted.
 static STRANGERS: Throttle = Throttle::new();
 
 /// Which hosts took an offered state and which didn't.
@@ -80,7 +81,7 @@ impl PushReport {
         let total = self.delivered.len() + self.missed.len();
         if total == 0 {
             return format!(
-                "state version {}: no host to push to yet (a new member gets it in its invite \
+                "state version {}: no host to push to yet (a new node gets it in its invite \
                  token)",
                 version.0
             );
@@ -166,14 +167,23 @@ async fn read_frame_untimed<R: AsyncRead + Unpin>(r: &mut R) -> Result<StateFram
     }
 }
 
-/// Dial `peer` by key, send `frame`, return its one answer.
-async fn exchange(endpoint: &Endpoint, peer: NodeId, frame: &StateFrame) -> Result<StateFrame> {
+/// Dial `peer` by key, send our `badge` and `frame`, return its one answer.
+async fn exchange(
+    endpoint: &Endpoint,
+    peer: NodeId,
+    badge: &Membership,
+    frame: &StateFrame,
+) -> Result<StateFrame> {
     let addr = transport::endpoint_addr(&peer, &[], None)?;
     let conn = tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, STATE_ALPN))
         .await
         .map_err(|_| anyhow!("no answer within {DIAL_TIMEOUT:?}"))?
         .map_err(|e| anyhow!("dialing {}…: {e}", peer.short()))?;
     let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
+    let hello = StateFrame::Hello {
+        membership: badge.clone(),
+    };
+    write_frame(&mut send, &hello).await?;
     write_frame(&mut send, frame).await?;
     send.finish().ok();
     let answer = read_frame(&mut recv).await;
@@ -185,10 +195,12 @@ async fn exchange(endpoint: &Endpoint, peer: NodeId, frame: &StateFrame) -> Resu
 // Push (admin)
 // ---------------------------------------------------------------------------
 
-/// Offer `state` to each of `targets`, concurrently. A target counts as
-/// delivered once it answers holding at least `state`'s version.
+/// Offer `state` to each of `targets`, concurrently, presenting `badge`
+/// (the admin's own). A target counts as delivered once it answers holding
+/// at least `state`'s version.
 pub(crate) async fn push_all(
     endpoint: &Endpoint,
+    badge: &Membership,
     state: &SignedState,
     targets: &[NodeId],
 ) -> Result<PushReport> {
@@ -196,12 +208,13 @@ pub(crate) async fn push_all(
     let mut set = tokio::task::JoinSet::new();
     for &target in targets {
         let endpoint = endpoint.clone();
+        let badge = badge.clone();
         let offer = StateFrame::Offer {
             state: state.clone(),
         };
         let want = state.state.version;
         set.spawn(async move {
-            let ok = match exchange(&endpoint, target, &offer).await {
+            let ok = match exchange(&endpoint, target, &badge, &offer).await {
                 Ok(StateFrame::Have { version }) => version >= want,
                 Ok(StateFrame::Denied { reason }) => {
                     tracing::warn!(host = %target.hex(), "state push refused: {reason}");
@@ -230,8 +243,8 @@ pub(crate) async fn push_all(
 }
 
 /// Who the admin pushes `state` to: its hosts, plus `earlier` (the hosts of
-/// the state before this edit, so a node that stops hosting learns it), never
-/// `me`. Plain members aren't dialed: nothing listens there.
+/// the state before this edit, so a node that stops hosting, or is banned,
+/// learns it), never `me`. Other nodes aren't dialed: nothing listens there.
 pub(crate) fn push_targets(
     state: &SignedState,
     earlier: &BTreeSet<NodeId>,
@@ -239,10 +252,9 @@ pub(crate) fn push_targets(
 ) -> Vec<NodeId> {
     state
         .state
-        .hosts
-        .iter()
-        .chain(earlier)
-        .copied()
+        .hosts()
+        .into_iter()
+        .chain(earlier.iter().copied())
         .filter(|h| *h != me)
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -258,7 +270,13 @@ pub(crate) async fn push_current_on(
 ) -> Result<PushReport> {
     let state = stored(ks)?;
     let me = transport::to_node_id(&endpoint.id());
-    push_all(endpoint, &state, &push_targets(&state, earlier, me)).await
+    push_all(
+        endpoint,
+        &badge(ks)?,
+        &state,
+        &push_targets(&state, earlier, me),
+    )
+    .await
 }
 
 /// [`push_current_on`] over a freshly bound endpoint for this keystore's
@@ -286,7 +304,13 @@ pub(crate) fn held_hosts(ks: &Keystore) -> Result<BTreeSet<NodeId>> {
     let Some(root) = store::fabric(ks)? else {
         return Ok(BTreeSet::new());
     };
-    Ok(store::read(ks, root)?.map_or_else(BTreeSet::new, |s| s.state.hosts))
+    Ok(store::read(ks, root)?.map_or_else(BTreeSet::new, |s| s.state.hosts()))
+}
+
+/// This node's own badge, which every exchange opens with.
+fn badge(ks: &Keystore) -> Result<Membership> {
+    ks.read_membership()?
+        .ok_or_else(|| anyhow!("this keystore holds no badge (membership.json)"))
 }
 
 /// The state `ks` holds, or an error saying there is none.
@@ -296,7 +320,7 @@ fn stored(ks: &Keystore) -> Result<SignedState> {
 }
 
 // ---------------------------------------------------------------------------
-// Pull (members)
+// Pull (any node)
 // ---------------------------------------------------------------------------
 
 /// Ask `peers` in turn for a state newer than `have`, stopping at the
@@ -316,10 +340,11 @@ pub(crate) async fn pull(
 ) -> Result<Option<SignedState>> {
     let root = store::fabric(ks)?.ok_or_else(|| anyhow!("this keystore is in no network"))?;
     let held = store::read(ks, root)?;
+    let badge = badge(ks)?;
     let admin = store::read_admin(ks).ok().flatten();
     let vouched = |p: NodeId| admin == Some(p) || held.as_ref().is_some_and(|s| s.state.is_host(p));
     for peer in peers {
-        match exchange(endpoint, *peer, &StateFrame::Have { version: have }).await {
+        match exchange(endpoint, *peer, &badge, &StateFrame::Have { version: have }).await {
             Ok(StateFrame::Offer { state }) => {
                 match store::adopt_if_newer(ks, &state, root, now_unix()) {
                     Ok(true) => {
@@ -340,6 +365,9 @@ pub(crate) async fn pull(
             Ok(StateFrame::Denied { reason }) => {
                 tracing::debug!(peer = %peer.hex(), "state pull refused: {reason}")
             }
+            Ok(StateFrame::Hello { .. }) => {
+                tracing::debug!(peer = %peer.hex(), "state pull answered out of turn")
+            }
             Err(e) => tracing::debug!(peer = %peer.hex(), "state pull failed: {e:#}"),
         }
     }
@@ -356,7 +384,13 @@ pub(crate) fn pull_peers(ks: &Keystore, state: Option<&SignedState>, me: NodeId)
     if let Some(state) = state {
         let used = crate::caller::pick::LastGood::load(&crate::caller::pick::LastGood::path(ks));
         peers.extend(used.hosts().filter(|h| state.state.is_host(*h)));
-        peers.extend(state.state.hosts.iter().copied());
+        peers.extend(
+            state
+                .state
+                .hosts()
+                .into_iter()
+                .filter(|h| state.state.is_host(*h)),
+        );
     }
     if let Ok(Some(admin)) = store::read_admin(ks) {
         peers.push(admin);
@@ -468,11 +502,11 @@ pub(crate) async fn refresh_loop(
 /// Why [`answer`] refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
-    /// The dialer isn't known to be a member: it hears only
-    /// [`NOT_ADMITTED`] (no version, nothing about the held copy). The
-    /// detail is for this host's trace.
+    /// The dialer isn't admitted (its badge, or the held copy's bans): it
+    /// hears only [`NOT_ADMITTED`] (no version, nothing about the held
+    /// copy). The detail is for this host's trace.
     Stranger(String),
-    /// A member of the held copy: told why.
+    /// An admitted dialer: told why.
     Member(String),
 }
 
@@ -486,20 +520,47 @@ impl Refusal {
     }
 }
 
-/// Serve one incoming state-protocol connection: read one frame, answer it
-/// (see [`answer`]). Strangers' refusals and failed reads are traced,
-/// throttled.
+/// Serve one incoming state-protocol connection: read the `hello` and one
+/// frame, answer it (see [`answer`]). Strangers' refusals and failed reads
+/// are traced, throttled.
 async fn exchange_one(conn: &Connection, caller: NodeId, ks: &Keystore) -> Result<()> {
     let (mut send, mut recv) = conn.accept_bi().await.context("accepting a stream")?;
-    let frame = match read_frame(&mut recv).await {
-        Ok(frame) => frame,
-        Err(e) => {
+    let badge = match read_frame(&mut recv).await {
+        Ok(StateFrame::Hello { membership }) => membership,
+        other => {
             // Before anything says who this is: trace it like a stranger.
-            STRANGERS.refused("state sync", caller, &format!("{e:#}"));
+            let detail = match other {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => "expected a hello".to_string(),
+            };
+            STRANGERS.refused("state sync", caller, &detail);
+            let reason = NOT_ADMITTED.to_string();
+            write_frame(&mut send, &StateFrame::Denied { reason })
+                .await
+                .ok();
+            send.finish().ok();
             return Ok(());
         }
     };
-    let answer = answer(ks, caller, frame, now_unix());
+    // Admission before the (possibly large) second frame is read.
+    if let Err(refusal) = admit(ks, caller, &badge, now_unix()) {
+        let (Refusal::Stranger(detail) | Refusal::Member(detail)) = &refusal;
+        STRANGERS.refused("state sync", caller, detail);
+        let reason = refusal.reason();
+        write_frame(&mut send, &StateFrame::Denied { reason })
+            .await
+            .ok();
+        send.finish().ok();
+        return Ok(());
+    }
+    let frame = match read_frame(&mut recv).await {
+        Ok(frame) => frame,
+        Err(e) => {
+            tracing::info!(peer = %caller.hex(), "unreadable state frame: {e:#}");
+            return Ok(());
+        }
+    };
+    let answer = answer(ks, caller, &badge, frame, now_unix());
     let result = match answer {
         Ok(reply) => write_frame(&mut send, &reply).await,
         Err(refusal) => {
@@ -517,97 +578,76 @@ async fn exchange_one(conn: &Connection, caller: NodeId, ks: &Keystore) -> Resul
     result
 }
 
-/// The decision behind [`exchange_one`], without the network: the reply, or the
-/// refusal.
-///
-/// Membership is checked first, and cheapest first: an expired held copy
-/// vouches for nobody, and anyone not known to be a member hears only
-/// [`NOT_ADMITTED`] (no version, no word on whether the copy expired).
-///
-/// - `Offer`, from a member of the fresh held copy: run through
-///   `adopt_if_newer` (verified, fresh, strictly newer). Adopted: answered
-///   `Have` with the new version, and the copy is marked checked. Not
-///   adopted: answered `Have`, and **not** marked checked (a removed member
-///   the held copy still lists, re-offering its old state, must not stop
-///   this node pulling the newer one). Refused: told why.
-/// - `Offer`, from anyone else: accepted only if the offer itself vouches
-///   for the dialer (a host whose copy expired, or missed the dialer's
-///   admission, catching up). The offer's own claims are checked first,
-///   for free: this network, strictly newer than the held copy, fresh, and
-///   listing the dialer. Only then is its signature verified (by
-///   `adopt_if_newer`, once): verifying means re-encoding a state of up to
-///   [`library::MAX_STATE_FRAME`] and an ed25519 check, so a stranger
-///   can't make this host do it with an offer that couldn't be adopted
-///   anyway. Adopted: `Have` and marked checked; anything else:
-///   [`NOT_ADMITTED`].
-/// - `Have`: the dialer must be a member of the held copy (else
-///   [`NOT_ADMITTED`]), and only then is it told when that copy has
-///   expired (an expired state is never served); answered with the held
-///   copy if it is newer, else `Have`.
-pub(crate) fn answer(
+/// Whether `caller`, presenting `badge`, is admitted here: its badge
+/// verifies under this node's network root and names it, and this node's
+/// copy (fresh or not: a ban never admits) doesn't ban it
+/// ([`check_admitted`]). `Err` is a [`Refusal::Stranger`]: the dialer hears
+/// only [`NOT_ADMITTED`].
+pub(crate) fn admit(
     ks: &Keystore,
     caller: NodeId,
-    frame: StateFrame,
+    badge: &Membership,
     now: i64,
-) -> std::result::Result<StateFrame, Refusal> {
+) -> std::result::Result<(), Refusal> {
     let unreadable = |e: anyhow::Error| Refusal::Stranger(format!("{e:#}"));
     let root = store::fabric(ks)
         .map_err(unreadable)?
         .ok_or_else(|| Refusal::Stranger("this node is in no network".into()))?;
     let held = store::read(ks, root).map_err(unreadable)?;
-    // Membership counts only in a copy that is still fresh.
-    let is_member = |s: &Option<SignedState>| {
-        s.as_ref()
-            .is_some_and(|s| s.check_fresh(now).is_ok() && s.state.is_member(caller))
-    };
-    let not_listed = || format!("{}… is not a member of the held copy", caller.short());
+    match &held {
+        Some(s) => check_admitted(badge, root, &s.state, caller, now),
+        None => check_inclusion(badge, root, caller, now),
+    }
+    .map_err(|e| Refusal::Stranger(format!("{}… is not admitted: {e}", caller.short())))
+}
+
+/// The decision behind [`exchange_one`], without the network: the reply, or
+/// the refusal.
+///
+/// Admission first ([`admit`]: the badge, then the bans in the held copy);
+/// anyone not admitted hears only [`NOT_ADMITTED`] (no version, no word on
+/// whether the copy expired). Then:
+///
+/// - `Offer`: run through `adopt_if_newer` (verified, fresh, strictly
+///   newer). Adopted: answered `Have` with the new version, and the copy is
+///   marked checked. Not adopted: answered `Have`, and **not** marked
+///   checked (a removed node the held copy doesn't ban yet, re-offering its
+///   old state, must not stop this node pulling the newer one). Refused:
+///   told why. A host whose copy expired catches up this way too.
+/// - `Have`: an expired held copy is refused as expired (never served);
+///   otherwise answered with the held copy if it is newer, else `Have`.
+/// - Anything else: refused.
+pub(crate) fn answer(
+    ks: &Keystore,
+    caller: NodeId,
+    badge: &Membership,
+    frame: StateFrame,
+    now: i64,
+) -> std::result::Result<StateFrame, Refusal> {
+    admit(ks, caller, badge, now)?;
+    let unreadable = |e: anyhow::Error| Refusal::Stranger(format!("{e:#}"));
+    let root = store::fabric(ks)
+        .map_err(unreadable)?
+        .ok_or_else(|| Refusal::Stranger("this node is in no network".into()))?;
+    let held = store::read(ks, root).map_err(unreadable)?;
     let version = |s: &Option<SignedState>| s.as_ref().map_or(StateVersion(0), |s| s.state.version);
     match frame {
-        StateFrame::Offer { state } if !is_member(&held) => {
-            let offered = state.state.version;
-            let plausible = state.state.fabric == root
-                && offered > version(&held)
-                && state.check_fresh(now).is_ok()
-                && state.state.is_member(caller);
-            if !plausible {
-                return Err(Refusal::Stranger(format!(
-                    "{}, and its offer (version {}) can't vouch for it",
-                    not_listed(),
-                    offered.0
-                )));
-            }
-            match store::adopt_if_newer(ks, &state, root, now) {
-                Ok(true) => {
-                    store::mark_checked(ks, now).map_err(unreadable)?;
-                    Ok(StateFrame::Have { version: offered })
-                }
-                Ok(false) => Err(Refusal::Stranger(format!(
-                    "{}, and its offer wasn't adopted",
-                    not_listed()
-                ))),
-                Err(e) => Err(Refusal::Stranger(format!(
-                    "{}, and its offer was refused: {e:#}",
-                    not_listed()
-                ))),
-            }
-        }
         StateFrame::Offer { state } => {
             let adopted = store::adopt_if_newer(ks, &state, root, now)
                 .map_err(|e| Refusal::Member(format!("the offered state was refused: {e:#}")))?;
-            let held = store::read(ks, root).map_err(unreadable)?;
             if adopted {
                 store::mark_checked(ks, now).map_err(unreadable)?;
-            } else if !is_member(&held) {
-                // Another exchange replaced the copy meanwhile.
-                return Err(Refusal::Stranger(not_listed()));
+                return Ok(StateFrame::Have {
+                    version: state.state.version,
+                });
             }
             Ok(StateFrame::Have {
                 version: version(&held),
             })
         }
         StateFrame::Have { version: theirs } => {
-            let Some(state) = held.filter(|s| s.state.is_member(caller)) else {
-                return Err(Refusal::Stranger(not_listed()));
+            let Some(state) = held else {
+                return Err(Refusal::Member("this node holds no signed state".into()));
             };
             if state.check_fresh(now).is_err() {
                 return Err(Refusal::Member(format!(
@@ -623,11 +663,9 @@ pub(crate) fn answer(
                 })
             }
         }
-        StateFrame::Denied { .. } => Err(if is_member(&held) {
-            Refusal::Member("expected an offer or a have".into())
-        } else {
-            Refusal::Stranger(format!("{} (it sent a denied)", not_listed()))
-        }),
+        StateFrame::Hello { .. } | StateFrame::Denied { .. } => Err(Refusal::Member(
+            "expected an offer or a have after the hello".into(),
+        )),
     }
 }
 
@@ -705,46 +743,68 @@ mod tests {
         ks
     }
 
-    fn signed(root: &NodeIdentity, version: u64, members: &[NodeId]) -> SignedState {
+    /// `node`'s badge in `root`'s network.
+    fn badge(root: &NodeIdentity, node: NodeId) -> Membership {
+        Membership::mint(root, node, 0, i64::MAX).unwrap()
+    }
+
+    /// A state at `version` that bans `banned`, signed by `root`.
+    fn signed(root: &NodeIdentity, version: u64, banned: &[NodeId]) -> SignedState {
         let mut s = State::new(root.node_id());
         s.version = StateVersion(version);
         s.not_after = i64::MAX;
-        s.members.extend(members.iter().copied());
+        for b in banned {
+            s.ban(*b, i64::MAX);
+        }
         s.sign(root).unwrap()
+    }
+
+    fn have(v: u64) -> StateFrame {
+        StateFrame::Have {
+            version: StateVersion(v),
+        }
+    }
+
+    fn offer(s: &SignedState) -> StateFrame {
+        StateFrame::Offer { state: s.clone() }
     }
 
     #[test]
     fn answers_offers_and_pulls() {
         let root = NodeIdentity::generate();
-        let (me, peer, outsider) = (
-            NodeIdentity::generate(),
-            NodeIdentity::generate().node_id(),
-            NodeIdentity::generate().node_id(),
-        );
-        let v1 = signed(&root, 1, &[me.node_id(), peer]);
-        let v2 = signed(&root, 2, &[me.node_id(), peer]);
+        let [me, peer, banned] = [0; 3].map(|_| NodeIdentity::generate());
+        let v1 = signed(&root, 1, &[banned.node_id()]);
+        let v2 = signed(&root, 2, &[banned.node_id()]);
         let ks = member_ks(&root, &me, Some(&v1));
+        let (peer, p) = (peer.node_id(), badge(&root, peer.node_id()));
 
-        // A pull from a member at the same version: Have.
-        let have = |v| StateFrame::Have {
-            version: StateVersion(v),
-        };
-        assert_eq!(answer(&ks, peer, have(1), 10), Ok(have(1)));
+        // Any node with the root's badge is admitted: the state lists no one.
+        // A pull at the same version: Have.
+        assert_eq!(answer(&ks, peer, &p, have(1), 10), Ok(have(1)));
         // An offer of v2: adopted.
-        let offer = |s: &SignedState| StateFrame::Offer { state: s.clone() };
-        assert_eq!(answer(&ks, peer, offer(&v2), 10), Ok(have(2)));
+        assert_eq!(answer(&ks, peer, &p, offer(&v2), 10), Ok(have(2)));
         // An older offer: not adopted, and the answer says what is held.
-        assert_eq!(answer(&ks, peer, offer(&v1), 10), Ok(have(2)));
+        assert_eq!(answer(&ks, peer, &p, offer(&v1), 10), Ok(have(2)));
         // A pull from behind: the held copy.
-        assert_eq!(answer(&ks, peer, have(1), 10), Ok(offer(&v2)));
-        // Non-members are refused either way.
-        assert!(answer(&ks, outsider, have(0), 10).is_err());
-        assert!(answer(&ks, outsider, offer(&v2), 10).is_err());
-        // A forged offer is refused.
+        assert_eq!(answer(&ks, peer, &p, have(1), 10), Ok(offer(&v2)));
+        // Refused either way: a banned node's genuine badge, another
+        // network's badge, someone else's badge.
         let rogue = NodeIdentity::generate();
-        let mut forged = signed(&rogue, 9, &[peer]);
+        let outsider = NodeIdentity::generate().node_id();
+        for (who, b) in [
+            (banned.node_id(), badge(&root, banned.node_id())),
+            (outsider, badge(&rogue, outsider)),
+            (outsider, p.clone()),
+        ] {
+            for frame in [have(0), offer(&v2)] {
+                let err = answer(&ks, who, &b, frame, 10).unwrap_err();
+                assert!(matches!(err, Refusal::Stranger(_)), "{err:?}");
+            }
+        }
+        // A forged offer is refused.
+        let mut forged = signed(&rogue, 9, &[]);
         forged.state.fabric = root.node_id();
-        assert!(answer(&ks, peer, offer(&forged), 10).is_err());
+        assert!(answer(&ks, peer, &p, offer(&forged), 10).is_err());
         assert_eq!(
             store::read(&ks, root.node_id())
                 .unwrap()
@@ -753,125 +813,109 @@ mod tests {
                 .version,
             StateVersion(2)
         );
+        // A second hello is out of turn.
+        let hello = StateFrame::Hello {
+            membership: p.clone(),
+        };
+        assert!(matches!(
+            answer(&ks, peer, &p, hello, 10),
+            Err(Refusal::Member(_))
+        ));
     }
 
-    /// Card 28 §8: a removed member re-offering its old, still-fresh state
-    /// is refused by a host that holds the newer one, and never marks a
-    /// host's copy checked (so the host keeps pulling).
+    /// Card 28 §8: a removed node re-offering its old, still-fresh state is
+    /// refused by a host that holds the ban, and never marks a host's copy
+    /// checked (so the host keeps pulling).
     #[test]
-    fn a_removed_members_old_offer_is_denied_and_marks_nothing_checked() {
+    fn a_removed_nodes_old_offer_is_denied_and_marks_nothing_checked() {
         let root = NodeIdentity::generate();
         let (me, removed) = (NodeIdentity::generate(), NodeIdentity::generate().node_id());
-        let v1 = signed(&root, 1, &[me.node_id(), removed]);
-        let v2 = signed(&root, 2, &[me.node_id()]);
-        let offer = |s: &SignedState| StateFrame::Offer { state: s.clone() };
+        let r = badge(&root, removed);
+        let v1 = signed(&root, 1, &[]);
+        let v2 = signed(&root, 2, &[removed]);
 
         // The host already holds v2: the old offer is refused outright.
         let ks = member_ks(&root, &me, Some(&v2));
-        let err = answer(&ks, removed, offer(&v1), 10).unwrap_err();
+        let err = answer(&ks, removed, &r, offer(&v1), 10).unwrap_err();
         assert_eq!(err.reason(), NOT_ADMITTED, "{err:?}");
         assert!(store::is_stale(&ks, 10));
 
-        // The host missed v2: the removed member is still in its copy, so
+        // The host missed v2: nothing bans the removed node in its copy, so
         // it is told what is held, but the copy is not marked checked.
         let ks = member_ks(&root, &me, Some(&v1));
-        let have1 = StateFrame::Have {
-            version: StateVersion(1),
-        };
-        assert_eq!(answer(&ks, removed, offer(&v1), 10), Ok(have1));
+        assert_eq!(answer(&ks, removed, &r, offer(&v1), 10), Ok(have(1)));
         assert!(
             store::is_stale(&ks, 10),
             "a non-adopting offer must not stop this node pulling"
         );
         // A real adopt does mark it.
-        let v3 = signed(&root, 3, &[me.node_id()]);
-        let answered = answer(&ks, me.node_id(), offer(&v3), 10);
-        assert_eq!(
-            answered,
-            Ok(StateFrame::Have {
-                version: StateVersion(3)
-            })
-        );
+        let v3 = signed(&root, 3, &[removed]);
+        let m = badge(&root, me.node_id());
+        assert_eq!(answer(&ks, me.node_id(), &m, offer(&v3), 10), Ok(have(3)));
         assert!(!store::is_stale(&ks, 10));
     }
 
-    /// Card 28 §8: an expired held copy is not served, and vouches for no
-    /// dialer; a fresh newer offer still repairs it.
+    /// Card 28 §8: an expired held copy is not served; a fresh newer offer
+    /// still repairs it (admission is by badge, so the host needn't trust
+    /// its expired copy to take one).
     #[test]
-    fn an_expired_copy_is_not_served_and_vouches_for_nobody() {
+    fn an_expired_copy_is_not_served_and_a_newer_one_repairs_it() {
         let root = NodeIdentity::generate();
         let (me, peer) = (NodeIdentity::generate(), NodeIdentity::generate().node_id());
+        let p = badge(&root, peer);
         let mut s = State::new(root.node_id());
         s.version = StateVersion(1);
         s.not_after = 100;
-        s.members.extend([me.node_id(), peer]);
         let v1 = s.sign(&root).unwrap();
         let ks = member_ks(&root, &me, Some(&v1));
-        let have = |v| StateFrame::Have {
-            version: StateVersion(v),
-        };
-        let offer = |s: &SignedState| StateFrame::Offer { state: s.clone() };
-        assert_eq!(answer(&ks, peer, have(0), 50), Ok(offer(&v1)), "fresh");
-        let err = answer(&ks, peer, have(0), 200).unwrap_err();
+        assert_eq!(answer(&ks, peer, &p, have(0), 50), Ok(offer(&v1)), "fresh");
+        let err = answer(&ks, peer, &p, have(0), 200).unwrap_err();
         assert!(err.reason().contains("expired"), "{err:?}");
-        // An offer that isn't adopted is refused: nothing here vouches.
-        assert!(answer(&ks, peer, offer(&v1), 200).is_err());
-        // A fresh, newer state from a member of it is adopted.
-        let v2 = signed(&root, 2, &[me.node_id(), peer]);
-        assert_eq!(answer(&ks, peer, offer(&v2), 200), Ok(have(2)));
+        // Re-offering the expired copy adopts nothing.
+        assert!(answer(&ks, peer, &p, offer(&v1), 200).is_err());
+        // A fresh, newer state is adopted.
+        let v2 = signed(&root, 2, &[]);
+        assert_eq!(answer(&ks, peer, &p, offer(&v2), 200), Ok(have(2)));
     }
 
-    /// Card 28 §9: whoever isn't a member of the held copy hears only
-    /// "not admitted": no version, not whether the copy expired; a member of
-    /// an expired copy is told it expired.
+    /// Card 28 §9: whoever isn't admitted hears only "not admitted": no
+    /// version, not whether the copy expired; an admitted node is told it
+    /// expired.
     #[test]
     fn a_stranger_hears_only_not_admitted() {
         let root = NodeIdentity::generate();
-        let (me, peer, outsider) = (
-            NodeIdentity::generate(),
-            NodeIdentity::generate().node_id(),
-            NodeIdentity::generate().node_id(),
-        );
+        let me = NodeIdentity::generate();
+        let [peer, banned] = [0; 2].map(|_| NodeIdentity::generate().node_id());
         let mut s = State::new(root.node_id());
         s.version = StateVersion(7);
         s.not_after = 100;
-        s.members.extend([me.node_id(), peer]);
+        s.ban(banned, i64::MAX);
         let v7 = s.sign(&root).unwrap();
         let ks = member_ks(&root, &me, Some(&v7));
-        let have = |v| StateFrame::Have {
-            version: StateVersion(v),
-        };
-        let offer = |s: &SignedState| StateFrame::Offer { state: s.clone() };
-        for now in [50, 200] {
-            for frame in [have(0), have(9), offer(&v7)] {
-                let err = answer(&ks, outsider, frame.clone(), now).unwrap_err();
-                assert!(
-                    matches!(err, Refusal::Stranger(_)),
-                    "{frame:?} at {now}: {err:?}"
-                );
-                assert_eq!(err.reason(), NOT_ADMITTED);
+        let rogue = NodeIdentity::generate();
+        let outsider = NodeIdentity::generate().node_id();
+        let newer = signed(&root, 9, &[]);
+        for (who, b) in [
+            (outsider, badge(&rogue, outsider)),
+            (banned, badge(&root, banned)),
+        ] {
+            for now in [50, 200] {
+                for frame in [have(0), have(9), offer(&v7), offer(&newer)] {
+                    let err = answer(&ks, who, &b, frame.clone(), now).unwrap_err();
+                    assert!(
+                        matches!(err, Refusal::Stranger(_)),
+                        "{frame:?} at {now}: {err:?}"
+                    );
+                    assert_eq!(err.reason(), NOT_ADMITTED);
+                }
             }
         }
-        // A member of the (now expired) copy learns it expired.
-        let err = answer(&ks, peer, have(0), 200).unwrap_err();
+        // An admitted node learns the (now expired) copy expired.
+        let err = answer(&ks, peer, &badge(&root, peer), have(0), 200).unwrap_err();
         assert_eq!(
             err,
             Refusal::Member("this node's signed state (version 7) has expired".into())
         );
-        // A newer offer that doesn't list the stranger, or is stale, or is
-        // for another network, is refused before its signature matters.
-        let rogue = NodeIdentity::generate();
-        let mut other = State::new(rogue.node_id());
-        other.version = StateVersion(9);
-        other.not_after = i64::MAX;
-        other.members.insert(outsider);
-        let mut unlisted = State::new(root.node_id());
-        unlisted.version = StateVersion(9);
-        unlisted.not_after = i64::MAX;
-        for state in [other.sign(&rogue).unwrap(), unlisted.sign(&root).unwrap()] {
-            let err = answer(&ks, outsider, offer(&state), 50).unwrap_err();
-            assert_eq!(err.reason(), NOT_ADMITTED, "{err:?}");
-        }
         assert_eq!(
             store::read(&ks, root.node_id())
                 .unwrap()
@@ -917,16 +961,14 @@ mod tests {
     }
 
     /// The admin pushes to the hosts (and the hosts before the edit), never
-    /// to plain members or itself.
+    /// to other nodes or itself.
     #[test]
     fn push_targets_are_hosts_old_and_new() {
         let root = NodeIdentity::generate();
-        let [admin, h1, h2, member] = [0; 4].map(|_| NodeIdentity::generate().node_id());
+        let [admin, h1, h2] = [0; 3].map(|_| NodeIdentity::generate().node_id());
         let mut s = State::new(root.node_id());
         s.version = StateVersion(1);
         s.not_after = i64::MAX;
-        s.members.extend([admin, h1, member]);
-        s.hosts.insert(h1);
         s.services.insert(
             library::ServiceName::new("svc").unwrap(),
             library::Service {
@@ -983,6 +1025,8 @@ mod tests {
     mod e2e {
         use super::*;
         use crate::admin::init::{InitArgs, init_in};
+        use crate::admin::invite::{RemoveArgs, remove_in};
+        use crate::admin::ledger::Ledger;
         use crate::admin::service::{self, ServiceEdit};
         use crate::admin::ttl::Ttl;
         use iroh::address_lookup::memory::MemoryLookup;
@@ -1024,7 +1068,8 @@ mod tests {
         }
 
         /// The network: an admin (initialized), a host and a member, both
-        /// joined (holding the state the admin had when they joined).
+        /// invited (in the admin's ledger) and joined (holding the state the
+        /// admin had when they joined).
         struct Fabric {
             admin: Arc<Keystore>,
             root: NodeId,
@@ -1038,11 +1083,8 @@ mod tests {
             let root_id = admin.read_root_identity().unwrap().unwrap();
             let me = admin.read_node_identity().unwrap().unwrap().node_id();
             let (host, member) = (NodeIdentity::generate(), NodeIdentity::generate());
-            let joined = service::edit_state(&admin, ttl(), |s| {
-                s.members.extend([host.node_id(), member.node_id()]);
-                Ok(())
-            })
-            .unwrap();
+            invited(&admin, &[&host, &member]);
+            let joined = store::read(&admin, root_id.node_id()).unwrap().unwrap();
             let join = |node: &NodeIdentity| {
                 let ks = Arc::new(member_ks(&root_id, node, None));
                 store::adopt_if_newer(&ks, &joined, root_id.node_id(), now_unix()).unwrap();
@@ -1055,6 +1097,21 @@ mod tests {
                 member: (member.duplicate(), join(&member)),
                 admin,
             }
+        }
+
+        /// Record `nodes` in the admin's ledger, as `wires invite` does (an
+        /// invite edits no state).
+        fn invited(admin: &Keystore, nodes: &[&NodeIdentity]) {
+            let mut ledger = Ledger::load(admin).unwrap();
+            for n in nodes {
+                ledger.record(n.node_id(), None, i64::MAX);
+            }
+            ledger.save(admin).unwrap();
+        }
+
+        /// `ks`'s own badge.
+        fn own_badge(ks: &Keystore) -> Membership {
+            ks.read_membership().unwrap().unwrap()
         }
 
         fn version(ks: &Keystore, root: NodeId) -> StateVersion {
@@ -1107,7 +1164,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn an_admin_change_reaches_the_host_within_two_seconds_and_skips_members() {
+        async fn an_admin_change_reaches_the_host_within_two_seconds_and_skips_callers() {
             let f = fabric();
             let book = MemoryLookup::new();
             let admin_node = f.admin.read_node_identity().unwrap().unwrap();
@@ -1135,24 +1192,28 @@ mod tests {
                     .state
                     .is_host(f.host.0.node_id())
             );
-            // A plain member is not dialed (nothing listens there).
+            // A node that hosts nothing is not dialed (nothing listens there).
             assert_eq!(member_dials.load(std::sync::atomic::Ordering::SeqCst), 0);
             assert_eq!(version(&f.member.1, f.root), before);
 
-            // `remove`: the member is dropped, and the host holds that at once.
+            // `remove`: the member is banned, and the host holds that at once.
             let earlier = held_hosts(&f.admin).unwrap();
-            let removed = service::edit_state(&f.admin, ttl(), |s| {
-                s.members.remove(&f.member.0.node_id());
-                Ok(())
-            })
+            remove_in(
+                &f.admin,
+                RemoveArgs {
+                    member: f.member.0.node_id().hex(),
+                    state_ttl: ttl(),
+                },
+            )
             .unwrap();
+            let removed = store::read(&f.admin, f.root).unwrap().unwrap();
             let report = push_current_on(&admin_ep, &f.admin, &earlier)
                 .await
                 .unwrap();
             assert_eq!(report.delivered, vec![f.host.0.node_id()]);
             let held = store::read(&f.host.1, f.root).unwrap().unwrap();
             assert_eq!(held, removed);
-            assert!(!held.state.is_member(f.member.0.node_id()));
+            assert!(held.state.is_banned(f.member.0.node_id()));
 
             // The removed member can no longer pull from the host.
             let (m2, _) = bind(&f.member.0, &f.member.1, &book, false).await;
@@ -1200,13 +1261,14 @@ mod tests {
                 .accept(STATE_ALPN, responder)
                 .spawn();
             let new = assign(&f);
-            let report = push_all(&admin_ep, &new, &[f.host.0.node_id()])
+            let badge = own_badge(&f.admin);
+            let report = push_all(&admin_ep, &badge, &new, &[f.host.0.node_id()])
                 .await
                 .unwrap();
             assert_eq!(report.missed, vec![f.host.0.node_id()], "{report:?}");
             assert!(version(&f.host.1, f.root) < new.state.version);
             drop(busy);
-            let report = push_all(&admin_ep, &new, &[f.host.0.node_id()])
+            let report = push_all(&admin_ep, &badge, &new, &[f.host.0.node_id()])
                 .await
                 .unwrap();
             assert_eq!(report.delivered, vec![f.host.0.node_id()], "{report:?}");
@@ -1228,9 +1290,8 @@ mod tests {
                 .unwrap();
             assert_eq!(version(&f.host.1, f.root), new.state.version);
 
-            // The admin (still a member) replaying the genuine older state is
-            // told what's held.
-            let report = push_all(&admin_ep, &old, &[f.host.0.node_id()])
+            // The admin replaying the genuine older state is told what's held.
+            let report = push_all(&admin_ep, &own_badge(&f.admin), &old, &[f.host.0.node_id()])
                 .await
                 .unwrap();
             assert_eq!(report.delivered, vec![f.host.0.node_id()]);
@@ -1250,7 +1311,7 @@ mod tests {
             // The member already knows the host (an earlier state it got)…
             let assigned = assign(&f);
             store::adopt_if_newer(&f.member.1, &assigned, f.root, now_unix()).unwrap();
-            // …but members aren't pushed to, so it misses this one.
+            // …but only hosts are pushed to, so it misses this one.
             let new = service::set(
                 &f.admin,
                 ServiceName::new("orders-db").unwrap(),
@@ -1297,11 +1358,7 @@ mod tests {
             let f = fabric();
             let book = MemoryLookup::new();
             let (h2, h3) = (NodeIdentity::generate(), NodeIdentity::generate());
-            service::edit_state(&f.admin, ttl(), |s| {
-                s.members.extend([h2.node_id(), h3.node_id()]);
-                Ok(())
-            })
-            .unwrap();
+            invited(&f.admin, &[&h2, &h3]);
             let hosts = vec![f.host.0.node_id(), h2.node_id(), h3.node_id()];
             let state = service::add(
                 &f.admin,
@@ -1357,18 +1414,14 @@ mod tests {
 
         /// A removed member re-offers its old state to a host that missed
         /// the removal: the host is not marked checked, so it still pulls
-        /// the newer state from another host. A host that holds the newer
-        /// state refuses the offer.
+        /// the newer state from another host. A host that holds the ban
+        /// refuses the offer.
         #[tokio::test]
         async fn a_removed_member_cannot_stop_a_host_pulling() {
             let f = fabric();
             let book = MemoryLookup::new();
             let h2 = NodeIdentity::generate();
-            service::edit_state(&f.admin, ttl(), |s| {
-                s.members.insert(h2.node_id());
-                Ok(())
-            })
-            .unwrap();
+            invited(&f.admin, &[&h2]);
             let old = service::add(
                 &f.admin,
                 ServiceName::new("orders-db").unwrap(),
@@ -1385,7 +1438,7 @@ mod tests {
                 store::adopt_if_newer(ks, &old, f.root, now_unix()).unwrap();
             }
             let removed = service::edit_state(&f.admin, ttl(), |s| {
-                s.members.remove(&f.member.0.node_id());
+                s.ban(f.member.0.node_id(), i64::MAX);
                 Ok(())
             })
             .unwrap();
@@ -1394,18 +1447,26 @@ mod tests {
             let (_h1, _h1r) = bind(&f.host.0, &f.host.1, &book, true).await;
             let (h2_ep, _h2r) = bind(&h2, &h2_ks, &book, true).await;
             // Only host 1 gets the removal.
-            let report = push_all(&admin_ep, &removed, &[f.host.0.node_id()])
-                .await
-                .unwrap();
+            let report = push_all(
+                &admin_ep,
+                &own_badge(&f.admin),
+                &removed,
+                &[f.host.0.node_id()],
+            )
+            .await
+            .unwrap();
             assert_eq!(report.delivered, vec![f.host.0.node_id()]);
 
             let (m_ep, _) = bind(&f.member.0, &f.member.1, &book, false).await;
             // Host 1 refuses the replay outright.
-            let r1 = push_all(&m_ep, &old, &[f.host.0.node_id()]).await.unwrap();
+            let m = own_badge(&f.member.1);
+            let r1 = push_all(&m_ep, &m, &old, &[f.host.0.node_id()])
+                .await
+                .unwrap();
             assert_eq!(r1.missed, vec![f.host.0.node_id()]);
-            // Host 2 hears it (the member is in its copy) but isn't marked
-            // checked by it…
-            push_all(&m_ep, &old, &[h2.node_id()]).await.unwrap();
+            // Host 2 hears it (its copy bans nobody) but isn't marked checked
+            // by it…
+            push_all(&m_ep, &m, &old, &[h2.node_id()]).await.unwrap();
             assert!(store::is_stale(&h2_ks, now_unix()));
             // …so its next refresh pulls the removal from host 1.
             let pulled = refresh_if_stale(&h2_ep, &h2_ks).await.unwrap();
@@ -1421,11 +1482,7 @@ mod tests {
             let f = fabric();
             let book = MemoryLookup::new();
             let late = NodeIdentity::generate();
-            service::edit_state(&f.admin, ttl(), |s| {
-                s.members.insert(late.node_id());
-                Ok(())
-            })
-            .unwrap();
+            invited(&f.admin, &[&late]);
             let first = assign(&f);
             let root = f.admin.read_root_identity().unwrap().unwrap();
             let late_ks = Arc::new(member_ks(&root, &late, None));
