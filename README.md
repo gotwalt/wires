@@ -180,7 +180,7 @@ The full list: [docs/usage.md § Known trade-offs](docs/usage.md#known-trade-off
 - [docs/demo.md](docs/demo.md): the two-machine demo script.
 
 ```bash
-cargo build --release -p wires           # target/release/wires
+make install                             # wires on your PATH (~/.cargo/bin)
 ./.scripts/demo-remote-cli.sh            # the narrated loopback demo (--quiet: assertions only)
 ```
 

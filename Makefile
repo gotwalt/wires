@@ -1,12 +1,15 @@
 # Dev loop over plain Cargo. `make help` lists the targets.
 SH := $(shell git ls-files '*.sh' .githooks/pre-commit)
 
-.PHONY: help build test lint fmt fmt-check demo python node demo-python demo-node image hooks
+.PHONY: help build install test lint fmt fmt-check demo python node demo-python demo-node image hooks
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
 build: ## Build the workspace (debug)
 	cargo build --workspace
+install: ## Install the release `wires` into ~/.cargo/bin (signed on macOS)
+	cargo install --locked --path wires
+	.scripts/macos-sign.sh "$${CARGO_HOME:-$$HOME/.cargo}/bin/wires"
 test: ## Run every test, doctests included
 	cargo test --workspace
 lint: ## clippy (warnings are errors) + shellcheck
