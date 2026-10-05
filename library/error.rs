@@ -142,6 +142,11 @@ pub enum Error {
     #[error("the freshness has lapsed")]
     FreshLapsed,
 
+    /// A [`Fresh`](crate::Fresh) lasts longer (`until - at`) than its head's
+    /// `fresh_secs` allows.
+    #[error("the freshness lasts longer than the policy allows")]
+    FreshTooLong,
+
     /// A host presented a [`Fresh`](crate::Fresh) it signed itself, as one
     /// of several directories (card 49): a removed host that is also a
     /// directory could vouch for its own old head, so a caller takes a

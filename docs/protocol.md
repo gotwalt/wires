@@ -92,7 +92,7 @@ root-signed **head** over **items**, where each service item is also signed by t
 
 ```
 PolicyHead { format: 5, fabric, version: StateVersion(u64), issued, not_after,   // version: +1 per edit
-             directories: [NodeId], items_hash: ItemsHash }
+             directories: [NodeId], fresh_secs: u32, items_hash: ItemsHash }   // fresh_secs = settings
 SignedPolicyHead { head, alg, sig }
 SignedEntry { format: 2, fabric, version, name: ServiceName,
               service: Service { description, allow: [RoleName], hosts: [NodeId] },
@@ -120,7 +120,8 @@ SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kin
 - **`SignedPolicy::verify(root)`**, the one check for a whole policy: the head's algorithm,
   format 5, the `fabric == root` pin and signature; the items are strictly in key order and hash to
   `items_hash` (`ItemsMismatch`); every service entry verifies on its own under the root, at a
-  version no later than the head's; then `Policy::validate`. **`check_fresh(now)`**: `Expired`
+  version no later than the head's; the head's `fresh_secs` is the settings item's; then
+  `Policy::validate`. **`check_fresh(now)`**: `Expired`
   when `now > not_after`. An expired policy admits nobody until the admin signs a newer one.
 - **Updates** (`library/services/policy_update.rs`). `PolicyUpdate { head, changed: [Item],
   removed: [ItemKey] }` moves a whole policy to a newer head: `new.update_from(&old)` computes it,
@@ -157,7 +158,10 @@ SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kin
   caller tells a host nothing until a current `Fresh` from another directory vouches for the head
   the host holds (§5 *The host's proof*), so a host the admin removed can be told something for at
   most `fresh_secs` after the edit reaches the directories, and with every directory down calls
-  stop within it.
+  stop within it. The head carries it too (`fresh_secs`), so a caller holding only the head bounds
+  every `Fresh` by it. An edit that would leave a network that listed a directory with none
+  (`directory rm`, or `remove` of the last directory's node) is refused: with none, no caller would
+  call any host.
 - **Versioning.** Every admin edit (`init`, `remove`, `restore`, `service`, `role`, `issuer`,
   `directory add|rm`, `policy settings`) is the stored policy changed, `version + 1`, `issued =
   now`, `not_after = max(now + --policy-ttl, the stored policy's not_after)` (default `90d`: an
@@ -271,7 +275,9 @@ at, until, alg, sig }` with its own node key over `"wires/fresh/v1\0"` ‖ canon
 other fields: at open, on every head it accepts, and every `settings.beat_secs`, valid for
 `settings.fresh_secs` (`until = at + fresh_secs`). `HeadHash` is blake3 of the signed head's
 canonical JSON, so a `Fresh` vouches for one exact head. It is valid only because the root-signed
-head lists its signer (`Fresh::verify` refuses any other key, `NotADirectory`). A directory whose
+head lists its signer (`Fresh::verify` refuses any other key, `NotADirectory`), and only for at
+most the head's `fresh_secs` (`until - at`; longer is `FreshTooLong`, so a removed or compromised
+directory can't sign one that lasts for ever). A directory whose
 held head doesn't list it signs none and answers `policy` and views with a refusal. An honest
 directory signs only for the newest head it holds: that is what lets a `Fresh` say a head is
 current, and what a caller relies on before it tells a host anything (§5).
@@ -483,7 +489,7 @@ that still vouch for the head on disk. It shows the current ones to every caller
 session and on an inbox fetch (§5 *The host's proof*, §7). The host's own decisions don't depend
 on them: whether a directory has vouched lately is the caller's check. When none from a directory
 other than this host is current (or, as the head's one directory, none of its own), callers will
-send it nothing, and it traces that (a warning at most every 10 s).
+send it nothing (the host's follower traces the directories it can't reach).
 
 **Fetch (a host's start).** `fetch` asks the directories the held head lists (the network string's
 when it holds none), in order, never itself, for `policy {have}`, and stops at the first answer
@@ -532,9 +538,13 @@ directory's) cuts its own view from it instead of asking.
   that was itself a directory the stale head lists can still answer `current` with a `Fresh` it
   signs for that old head). That is not what keeps a removed host from being told anything: each
   host shows its proof first, and a caller sends nothing until a current `Fresh` from a directory
-  other than that host vouches for the head the host holds (§5 *The host's proof*). So the window
-  in which a host the admin removed can still receive a caller's token is `fresh_secs` (15 minutes
-  by default) after the edit reaches the directories, whatever the view's age.
+  other than that host vouches for the head the host holds, and, when the host shows a newer head,
+  until a refresh has brought the view up to that head (§5 *The host's proof*). So the window in
+  which a host the admin removed can still receive a caller's token on a call or an inbox fetch is
+  `fresh_secs` (15 minutes by default) after the edit reaches the directories, within the limits
+  §9 lists (a one-directory head, a removed directory vouching for others).
+- **The directories asked are the view's head's, then the network string's** not among them, so a
+  view from before a directory was added still reaches it.
 - **`wires services`** reads `view.json`, refreshing first when it is stale (as above). When no
   directory gave it a view and one refused this node (`NOT_ADMITTED`), it lists nothing and says what the
   person can act on (§5 *The caller*).
@@ -578,10 +588,15 @@ else) and sending `Proof` at once: that policy's head and every current `Fresh` 
   it verifies for that head, is current, and is signed by a directory **other than the dialed
   host**, unless the head lists exactly one directory and it is the dialed host). At the view's
   version, the view decides whether this host serves the service (its entry lists the host);
-  at a newer one, the caller first refreshes its view from a directory (8 s) and checks the proof
-  again against it, then the same. **Only then** does it send `Hello` and `Invoke`. Any failure is
-  a **dial failure**: nothing but `Open` was sent, and the next host is tried (below). One flight
-  more than the cached path.
+  at a newer one, the caller first refreshes its view from a directory (8 s): the refreshed view
+  must have **reached** the host's version (a lagging directory, or a removed one answering
+  `current` for the old head it still vouches for, leaves the view behind, and a view behind the
+  host's head never decides), and the proof must then check out at the same version; then the
+  same. A head listing only the dialed host counts as a one-machine network only while the
+  network string names no other directory either. **Only then** does it send `Hello` and
+  `Invoke`. Any failure (a refresh that fails or stays behind, no way to refresh, an unreadable
+  proof) is a **dial failure**: nothing but `Open` was sent, and the next host is tried (below).
+  One flight more than the cached path.
 - **`Hello` and `Invoke` at once** (the cached path): the caller already holds, for its view's
   head, a current `Fresh` from a directory other than this host (one per directory, in
   `view.json`: from its own refresh, its view subscription, or an earlier host's proof; a `Fresh`
@@ -718,7 +733,8 @@ means nothing. A host that failed to answer this caller's dial in the last 60 s 
 (`unanswered.json`, the oldest failure first), so a host that is down costs each caller one dial
 timeout a minute, not one in every few calls. A name the view doesn't hold is asked
 of a directory (`resolve`); a name no directory resolves for this caller ends the call before any
-dial (exit 1). The gateway dials from each user's subscribed view, and neither refreshes it nor
+dial (exit 1), and so does one resolved under a head older than the view (or than one a host has
+shown it), whose `Fresh` would otherwise let the call speak at once. The gateway dials from each user's subscribed view, and neither refreshes it nor
 resolves a name (a host showing a newer head than that view is a dial failure there; the
 subscription catches up); the `Fresh`es hosts' proofs carry it keeps in memory, for all its users.
 It moves to the next host **only when a dial fails** (10 s each), and a proof that doesn't check
@@ -771,8 +787,9 @@ before); `Argv` holds at most 256 arguments and 64 KiB.
 `wires login` runs OIDC (authorization code, PKCE, loopback redirect) with `nonce =
 base64url(blake3::derive_key("wires oidc-nonce v1", node_id))`, verifies the token locally, and
 stores it in `idp-token.jwt`. Nothing is published. The token travels in the session `Hello`, the
-inbox fetch's `hello` (§7) and the directory `hello` (§4), and a host gets it only once its proof
-checked out (§5 *The host's proof*). **It is the only credential a caller
+inbox fetch's `hello` (§7) and the directory `hello` (§4). A host gets it only once its proof
+checked out (§5 *The host's proof*, within the limits of §9); a directory gets it in the `hello`
+before it has proved anything (§9; card 45 closes that). **It is the only credential a caller
 presents**: it is what admits the caller (§2).
 
 A host verifies it against the issuer's JWKS under the trust of the policy it decides under: the
@@ -998,19 +1015,35 @@ ones that bound this spec:
   or node-banned) can still receive the ID token and arguments of a caller whose view predates the
   removal for up to `fresh_secs` after the edit reaches the directories: a `Fresh` an honest
   directory signed for the old head just before is current that long (the caller may hold one
-  already, and speak at once). After that it has nothing to show, and is sent nothing (§5 *The
-  host's proof*).
+  already, and speak at once). After that it can't show a current word for the head it holds, and
+  on a session or an inbox fetch it is sent nothing (§5 *The host's proof*), except as the next
+  three items say. A host's `Proof` is shown to anyone before admission, so it is **replayable
+  material by design**: a removed host can show an honest host's current head and `Fresh`; that
+  only makes the caller refresh its view to that head, which no longer lists it.
 - **A one-machine network trusts its host's own word.** When the head lists exactly one directory
   and it is the host being dialed (the first-run shape: one workbench is both), the caller takes
   that host's own `Fresh`; there is no other directory to ask. Removing that machine is then
-  bounded by the head's `not_after` (90 days by default), not `fresh_secs`. An admin who needs
-  removal to hold runs a second directory.
+  bounded by the head's `not_after` (90 days by default), not `fresh_secs`. Running a second
+  directory makes removal hold for callers that know of it: whose view's head lists it, or whose
+  network string names it (`wires network` prints the new string after `directory add`; a caller
+  that joined with the old one and hasn't refreshed since still trusts the machine's own word, and
+  asks only it).
 - **A removed directory can vouch for others' old heads.** A `Fresh` vouches for a head, not for a
   host, and is valid because the head lists its signer. A directory machine the admin removed keeps
   its key, and every head from before its removal still lists it: it can sign a current `Fresh`
   for such a head, and a host removed at or after that head can show it to a caller whose view is
   that old. The check stops a host vouching for itself, not two removed machines vouching for each
-  other (or one compromised directory for any host); a k-of-n rule would.
+  other (or one compromised directory for any host); a k-of-n rule would. Such a directory, or a
+  lagging honest one, can't move a caller's view backwards (a view is never replaced by an older
+  one, and a refresh that stays behind the host's head decides nothing), but it can keep a stale
+  view in place.
+- **Directories are told the token before they prove anything.** A view refresh or `resolve` sends
+  the caller's ID token in the directory `hello` (§4), so a removed directory still in a stale
+  view's head receives stale callers' tokens. [Card 45](board/backlog/45-trim-policy-sync.md)
+  makes directories prove themselves first, as hosts do.
+- **`wires inbox --wait` takes deliveries without a proof**: a host that delivers directly is
+  admitted because it hosts a service in the receiver's view, so a removed host still in a stale
+  view can push to it (no token goes to the host that way).
 - A host follows one directory, and that directory's `Fresh` is what says its copy is current. A
   directory machine the admin removed can ignore the publish and keep signing a `Fresh` for the old
   head (which still lists it): the hosts following it keep that head, vouched for, until its
@@ -1027,7 +1060,9 @@ ones that bound this spec:
   fix.
 - **The pre-authentication slots can be held by any key.** A directory has 16 undecided
   connections for both its ALPNs, a host 64 undecided sessions and 64 undecided inbox fetches; a
-  slot is held until the opening frames arrive or time out (10 s each), with no per-key cap, so one
+  slot is held until the opening frames arrive or time out (10 s each: up to 20 s for a session or
+  fetch that opens with `Open` and then its `Hello`, 30 s with the `Invoke`), with no per-key cap,
+  so one
   key can keep them full and delay everyone else's admission. Open subscriptions and admitted
   sessions are unaffected.
 - **A publish is open to any key.** Any key can make a directory verify one head signature, and any

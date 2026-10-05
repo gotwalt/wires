@@ -209,10 +209,11 @@ pub(crate) fn test_directory() -> library::NodeIdentity {
     library::NodeIdentity::from_seed([0xd1; 32])
 }
 
-/// A `Fresh` [`test_directory`] signs for `head`, current for the next hour.
+/// A `Fresh` [`test_directory`] signs for `head`, current for the next 14
+/// minutes (a test policy's `fresh_secs` is the default 15).
 pub(crate) fn test_fresh(head: &library::SignedPolicyHead) -> library::Fresh {
     let now = crate::clock::now_unix();
-    library::Fresh::sign(&test_directory(), head, now - 60, now + 3600).unwrap()
+    library::Fresh::sign(&test_directory(), head, now - 60, now + 840).unwrap()
 }
 
 /// Leave [`test_fresh`] for `head` in a host's keystore (`fresh.json`), as

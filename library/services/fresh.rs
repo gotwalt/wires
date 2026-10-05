@@ -83,7 +83,8 @@ pub struct Fresh {
 impl Fresh {
     /// Sign a `Fresh` for `head` with the directory's node key.
     /// [`Error::NotADirectory`] if the head does not list `directory`;
-    /// [`Error::InvalidPolicy`] if `until < at`.
+    /// [`Error::InvalidPolicy`] if `until < at`; [`Error::FreshTooLong`] if
+    /// `until - at` is over the head's `fresh_secs`.
     pub fn sign(
         directory: &NodeIdentity,
         head: &SignedPolicyHead,
@@ -97,6 +98,9 @@ impl Fresh {
             return Err(Error::InvalidPolicy(
                 "freshness ends before it starts".into(),
             ));
+        }
+        if until.saturating_sub(at) > i64::from(head.head.fresh_secs) {
+            return Err(Error::FreshTooLong);
         }
         let body = SignedBody {
             format: FRESH_V1,
@@ -125,8 +129,9 @@ impl Fresh {
     /// Check it vouches for exactly `head` (a head the caller has already
     /// verified under its root): format and algorithm, the same fabric,
     /// version and [`HeadHash`] ([`Error::FreshMismatch`]), a signer the head
-    /// lists in `directories` ([`Error::NotADirectory`]), `at <= until`, and
-    /// the signature. Does not check the time
+    /// lists in `directories` ([`Error::NotADirectory`]), `at <= until`, a
+    /// lifetime no longer than the head's `fresh_secs`
+    /// ([`Error::FreshTooLong`]), and the signature. Does not check the time
     /// ([`is_current`](Self::is_current)).
     pub fn verify(&self, head: &SignedPolicyHead) -> Result<()> {
         if self.format != FRESH_V1 {
@@ -148,6 +153,9 @@ impl Fresh {
             return Err(Error::InvalidPolicy(
                 "freshness ends before it starts".into(),
             ));
+        }
+        if self.until.saturating_sub(self.at) > i64::from(head.head.fresh_secs) {
+            return Err(Error::FreshTooLong);
         }
         self.directory.verify(&self.signed_bytes()?, &self.sig)
     }
@@ -360,6 +368,7 @@ mod tests {
             issued: 0,
             not_after: i64::MAX,
             directories,
+            fresh_secs: 100_000,
             items_hash: ItemsHash::from_hex(&format!("{items:02x}").repeat(32)).unwrap(),
         }
         .sign(&root())
@@ -451,8 +460,8 @@ mod tests {
         assert!(!fresh.is_current(1_901));
         assert!(fresh.is_current(1_000 - CLOCK_SKEW_SECS));
         assert!(!fresh.is_current(1_000 - CLOCK_SKEW_SECS - 1));
-        let extreme = Fresh::sign(&dir(), &head(), i64::MIN, i64::MAX).unwrap();
-        assert!(extreme.is_current(0));
+        let longest = Fresh::sign(&dir(), &head(), -50_000, 50_000).unwrap();
+        assert!(longest.is_current(0));
     }
 
     /// Node 3: a host that is also a directory, in [`two`].
@@ -559,6 +568,28 @@ mod tests {
         forged.0[0].until = 10_000;
         assert!(forged.vouching(&h, host().node_id(), 5_000).is_none());
         assert!(forged.current_for(&h, 5_000).is_empty());
+    }
+
+    /// Card 49 review: a directory's word lasts at most the head's
+    /// `fresh_secs`. One that claims longer (a removed directory signing
+    /// `until = i64::MAX`) is refused at signing and at every check.
+    #[test]
+    fn a_fresh_lasts_no_longer_than_the_head_allows() {
+        let h = head();
+        assert!(Fresh::sign(&dir(), &h, 0, 100_000).is_ok());
+        assert!(matches!(
+            Fresh::sign(&dir(), &h, 0, 100_001),
+            Err(Error::FreshTooLong)
+        ));
+        let mut forever = Fresh::sign(&dir(), &h, 0, 100).unwrap();
+        forever.until = i64::MAX;
+        forever.sig = dir().sign(&forever.signed_bytes().unwrap());
+        assert!(matches!(forever.verify(&h), Err(Error::FreshTooLong)));
+        assert!(forever.vouches(&h, host().node_id(), 1_000).is_err());
+        let mut set = FreshSet::default();
+        set.insert(forever, 1_000);
+        assert!(set.vouching(&h, host().node_id(), 1_000).is_none());
+        assert!(set.current_for(&h, 1_000).is_empty());
     }
 
     proptest! {

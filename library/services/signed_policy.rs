@@ -339,6 +339,7 @@ impl Policy {
             issued: self.issued,
             not_after: self.not_after,
             directories: self.directories.clone(),
+            fresh_secs: self.settings.fresh_secs,
             items_hash: ItemsHash::of(&items)?,
         }
         .sign(root)?;
@@ -472,6 +473,11 @@ impl SignedPolicy {
         let policy = self.to_policy()?;
         if ItemsHash::of(&self.items)? != self.head.head.items_hash {
             return Err(Error::ItemsMismatch);
+        }
+        if policy.settings.fresh_secs != self.head.head.fresh_secs {
+            return Err(Error::InvalidPolicy(
+                "the head's fresh_secs is not the settings' fresh_secs".into(),
+            ));
         }
         for entry in self.entries() {
             check_entry_version(entry, &self.head)?;

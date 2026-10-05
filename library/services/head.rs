@@ -109,6 +109,12 @@ pub struct PolicyHead {
     /// The directory nodes, in the admin's preference order, each once. Their
     /// keys sign [`Fresh`](crate::Fresh).
     pub directories: Vec<NodeId>,
+    /// The longest a [`Fresh`](crate::Fresh) for this head may last
+    /// (`until - at`), seconds: the settings item's `fresh_secs`, carried
+    /// here so a caller holding only the head can bound a directory's word
+    /// (a removed or compromised directory can't sign one that lasts
+    /// forever; card 49 review).
+    pub fresh_secs: u32,
     /// The hash of every item, in key order.
     pub items_hash: ItemsHash,
 }
@@ -250,6 +256,7 @@ mod tests {
             issued: 10,
             not_after: 1_000,
             directories: vec![node(2), node(3)],
+            fresh_secs: 900,
             items_hash: ItemsHash::from_hex(&"ab".repeat(32)).unwrap(),
         }
     }

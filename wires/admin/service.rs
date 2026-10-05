@@ -240,8 +240,20 @@ pub(crate) fn edit_policy(
     change: impl FnOnce(&mut Policy) -> Result<()>,
 ) -> Result<Held> {
     let root = root_key(ks)?;
-    admin_policy(ks, root.node_id())?;
-    sign_next(ks, ttl, change)
+    let listed = !admin_policy(ks, root.node_id())?.directories().is_empty();
+    sign_next(ks, ttl, |p| {
+        change(p)?;
+        // A caller sends a host nothing without a directory's current word
+        // (card 49): dropping the last directory would stop every call.
+        if listed && p.directories.is_empty() {
+            bail!(
+                "this edit would leave the network with no directory, and with none no caller \
+                 would call any host (nothing could vouch for the policy); add another with \
+                 `wires directory add` first"
+            );
+        }
+        Ok(())
+    })
 }
 
 /// `wires init`'s edit: [`edit_policy`] from an empty policy when none is
@@ -894,10 +906,9 @@ mod tests {
         let stranger = NodeIdentity::generate().node_id();
         let held = directory_add(&ks, stranger, ttl()).unwrap();
         assert_eq!(held.directories(), &[dir, stranger]);
-        directory_rm(&ks, stranger, ttl()).unwrap();
-        let held = directory_rm(&ks, dir, ttl()).unwrap();
-        assert!(held.directories().is_empty());
-        assert!(directory_rm(&ks, dir, ttl()).is_err(), "not listed");
+        let held = directory_rm(&ks, stranger, ttl()).unwrap();
+        assert_eq!(held.directories(), &[dir]);
+        assert!(directory_rm(&ks, stranger, ttl()).is_err(), "not listed");
     }
 
     /// An admin whose `policy.json` is gone doesn't sign a version 1 over
@@ -913,6 +924,23 @@ mod tests {
         );
         assert!(err.contains("copy policy.json from any host"), "{err}");
         assert!(!ks.path(store::POLICY_FILE).exists());
+    }
+
+    /// The last directory can't go (card 49): with none, no caller would
+    /// call any host. Refused, naming the way out.
+    #[test]
+    fn the_last_directory_stays() {
+        let (a, b) = (
+            NodeIdentity::generate().node_id(),
+            NodeIdentity::generate().node_id(),
+        );
+        let ks = admin();
+        directory_add(&ks, a, ttl()).unwrap();
+        directory_add(&ks, b, ttl()).unwrap();
+        assert_eq!(directory_rm(&ks, a, ttl()).unwrap().directories(), &[b]);
+        let err = format!("{:#}", directory_rm(&ks, b, ttl()).unwrap_err());
+        assert!(err.contains("no directory"), "{err}");
+        assert!(err.contains("wires directory add"), "{err}");
     }
 
     #[test]

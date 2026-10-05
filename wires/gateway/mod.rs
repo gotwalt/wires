@@ -327,6 +327,7 @@ impl crate::caller::call::Caller for PresentingCaller {
             (*self.view).clone(),
             Scope::Service(service.clone()),
         )
+        .knowing(crate::caller::view::joined_directories(&self.ks))
         .keeping_in(Sink::Shared(Arc::clone(&self.proofs)));
         let dial = ServiceDial {
             endpoint: &self.endpoint,

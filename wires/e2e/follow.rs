@@ -967,7 +967,7 @@ async fn measure_the_extra_flight() {
     let v1 = w.policy(1, Settings::default(), 0);
     let ks = w.keystore(&w.hosts[0], &v1);
     let now = now_unix();
-    let word = library::Fresh::sign(&w.dirs[0], &v1.head, now - 1, now + 3600).unwrap();
+    let word = library::Fresh::sign(&w.dirs[0], &v1.head, now - 1, now + 899).unwrap();
     std::fs::write(
         ks.path(crate::host::freshness::FRESH_FILE),
         serde_json::to_string(&[&word]).unwrap(),

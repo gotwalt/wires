@@ -645,7 +645,7 @@ where
     // it. A caller tells it nothing until that checks out (card 49).
     let proof = host
         .freshness
-        .proof(&state.signed.head, host.me, crate::clock::now_unix());
+        .proof(&state.signed.head, crate::clock::now_unix());
     write_frame(&mut send, &Frame::Proof(proof))
         .await
         .context("sending this host's proof")?;
@@ -978,7 +978,13 @@ where
             }
         };
         let host = to_node_id(&conn.remote_id());
-        let (mut send, mut recv) = conn.open_bi().await.context("opening a bi-stream")?;
+        let (mut send, mut recv) = match conn.open_bi().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                failures.push(format!("{}: opening a stream: {e}", host.short()));
+                continue;
+            }
+        };
         let spoke = speak(&mut send, &mut recv, host, vouch, id_token, &invocation).await;
         if let Err(e) = spoke {
             conn.close(0u32.into(), b"unvouched");
@@ -1058,8 +1064,13 @@ where
     if at_once {
         write_frame(send, &hello(vouch)).await?;
         write_frame(send, &Frame::Invoke(invocation.clone())).await?;
-    } else {
-        write_frame(send, &Frame::Open).await?;
+    } else if let Err(e) = write_frame(send, &Frame::Open).await {
+        return Err(Unvouched {
+            host: host.short(),
+            why: format!("{e:#}"),
+            lapsed: false,
+        }
+        .into());
     }
     let read = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame_within(recv, MAX_HELLO_FRAME));
     let failed = |why: String| -> anyhow::Error {

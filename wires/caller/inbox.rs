@@ -850,6 +850,7 @@ impl Fetcher {
             .zip(hints.targets(&hosts, None))
             .collect();
         let vouch = Vouching::new(self.fabric, held, Scope::AnyService)
+            .knowing(crate::caller::view::joined_directories(&self.ks))
             .refreshing(Refresher {
                 ks: (*self.ks).clone(),
                 endpoint: self.endpoint.clone(),

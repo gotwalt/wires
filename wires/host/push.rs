@@ -631,10 +631,10 @@ impl PushHost {
         // The host speaks first, as on a call (card 49): its head and who
         // vouched for it. A fetcher presents its token only once that checks
         // out.
-        let proof =
-            self.host
-                .freshness
-                .proof(&state.signed.head, self.host.me, crate::clock::now_unix());
+        let proof = self
+            .host
+            .freshness
+            .proof(&state.signed.head, crate::clock::now_unix());
         write_frame(&mut send, &InboxFrame::Proof { proof }).await?;
         let mut first = read_frame_within(&mut recv, FRAME_TIMEOUT, MAX_INBOX_HELLO).await;
         if matches!(first, Ok(Some(InboxFrame::Open {}))) {

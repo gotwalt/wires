@@ -107,6 +107,12 @@ pub(crate) struct Vouching {
     refresher: Option<Refresher>,
     /// Where a `Fresh` learned from a host goes.
     sink: Sink,
+    /// Directories this caller knows of besides its view's head's (the
+    /// network string's): a head listing only the dialed host is taken as
+    /// a one-machine network only when none of these is another node (an
+    /// old one-directory head must not make a later network look like one;
+    /// card 49 review).
+    known: Vec<NodeId>,
 }
 
 impl Vouching {
@@ -118,7 +124,21 @@ impl Vouching {
             scope,
             refresher: None,
             sink: Sink::Nowhere,
+            known: Vec::new(),
         }
+    }
+
+    /// Also know of `directories` (the network string's).
+    pub(crate) fn knowing(mut self, directories: Vec<NodeId>) -> Self {
+        self.known = directories;
+        self
+    }
+
+    /// Whether `fresh`, which vouches by [`Fresh::vouches`]'s rule, may be
+    /// taken: one the host signed itself only while no other directory is
+    /// known (the head's one directory, and the network string's).
+    fn takes(&self, fresh: &Fresh, host: NodeId) -> bool {
+        fresh.directory != host || self.known.iter().all(|d| *d == host)
     }
 
     /// Refresh the view with `refresher` when a host shows a newer head.
@@ -170,7 +190,7 @@ impl Vouching {
                 .held
                 .fresh
                 .vouching(&self.held.view.head, host, now)
-                .is_some()
+                .is_some_and(|f| self.takes(f, host))
     }
 
     /// Check `host`'s `proof` at `now`. `before_speaking`: nothing was sent
@@ -244,11 +264,51 @@ impl Vouching {
                 return Ok(());
             }
             Standing::Newer(v) => {
-                self.refresh_to(v).await?;
-                proof
-                    .check(self.root, &self.held.view.head, host, now)
-                    .map_err(unvouched)?;
+                // Any failure here is a dial failure too: nothing was sent.
+                let dial_failure = |why: String| -> anyhow::Error {
+                    Unvouched {
+                        host: host.short(),
+                        why,
+                        lapsed: false,
+                    }
+                    .into()
+                };
+                self.refresh_to(v)
+                    .await
+                    .map_err(|e| dial_failure(format!("{e:#}")))?;
+                // The refresh must have reached the host's head: a lagging
+                // directory, or a removed one answering `current` for the
+                // old head it still vouches for, leaves the view where it
+                // was, and the old view must not decide (card 49 review).
+                if self.version() < v {
+                    return Err(dial_failure(format!(
+                        "it holds policy version {}, and no directory gave a view that new (got \
+                         {})",
+                        v.0,
+                        self.version().0
+                    )));
+                }
+                match proof.check(self.root, &self.held.view.head, host, now) {
+                    Ok(Standing::Same) => {}
+                    Ok(Standing::Newer(_)) => {
+                        return Err(dial_failure("the refreshed view is still older".into()));
+                    }
+                    Err(e) => return Err(unvouched(e)),
+                }
             }
+        }
+        if before_speaking
+            && let Ok(f) = proof.vouching(host, now)
+            && !self.takes(f, host)
+        {
+            return Err(Unvouched {
+                host: host.short(),
+                why: "it vouched for its own policy, which lists it as the one directory, but \
+                      the network names others"
+                    .into(),
+                lapsed: true,
+            }
+            .into());
         }
         if before_speaking && !self.serves(host) {
             return Err(Unvouched {
@@ -452,7 +512,10 @@ mod tests {
             .check(host().node_id(), &proof(&v4, &dir(), t), t, true)
             .await
             .unwrap_err();
-        assert!(e.downcast_ref::<Unvouched>().is_none(), "{e:#}");
+        assert!(
+            e.downcast_ref::<Unvouched>().is_some(),
+            "a dial failure: {e:#}"
+        );
         assert!(format!("{e:#}").contains("newer than your view"), "{e:#}");
         v.check(host().node_id(), &proof(&v4, &dir(), t), t, false)
             .await
@@ -483,6 +546,28 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Card 49 review, finding 4: a view from the one-machine days (its head
+    /// lists only X) doesn't make X's own word enough once the network
+    /// string names another directory: X is sent nothing.
+    #[tokio::test]
+    async fn an_old_one_directory_head_is_not_a_one_machine_network() {
+        let p = signed(3, &[host().node_id()], &[host().node_id()]);
+        let t = now();
+        let own = proof(&p, &host(), t);
+        let held_own = held(&p, Some(own.fresh[0].clone()));
+        let later = vec![host().node_id(), dir().node_id()];
+        let mut v = Vouching::new(root().node_id(), held_own.clone(), Scope::Service(orders()))
+            .knowing(later.clone());
+        assert!(!v.ready(host().node_id(), t), "not at once");
+        let e = v.check(host().node_id(), &own, t, true).await.unwrap_err();
+        assert!(e.downcast_ref::<Unvouched>().is_some(), "{e:#}");
+        // With no other directory known, it is the one-machine network.
+        let mut v = Vouching::new(root().node_id(), held_own, Scope::Service(orders()))
+            .knowing(vec![host().node_id()]);
+        assert!(v.ready(host().node_id(), t));
+        v.check(host().node_id(), &own, t, true).await.unwrap();
     }
 
     /// An inbox fetch asks any host of a service in the view; a host the

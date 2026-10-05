@@ -248,3 +248,80 @@ this card. `view.json`'s `fresh` is now a list; `fresh.json` is a list.
 - docs/testing.md 37 ("the `lenient` / `strict` …" e2e description).
 - docs/board/README.md: the card 45 row still says "`lenient`/`strict` go" (they are gone).
 - bench/state-scale (dated model) mentions the settings item's shape; not touched.
+
+### After review (worker, 2026-10-05)
+
+The independent security review of efa12ee found the central promise didn't hold yet. The fixes
+below are committed on top of efa12ee. Each one comes with a test that fails without it (except #9;
+see there).
+
+1. **HIGH: a refresh that stays behind decided.** The bug: when a host showed a newer head
+   (`Standing::Newer(v)`), the caller refreshed its view and then decided `serves(host)` on
+   whatever it got back. A removed directory (or an honest one that lags) answering `current` for
+   the old head left the view at the old head, which still listed the removed host. Since a host's
+   `Proof` is replayable, a removed host X could get the token this way, until `not_after`. Now the
+   refreshed view must have reached `v`, and the proof must re-check as `Standing::Same` against it;
+   anything else is an `Unvouched` dial failure. Tests (in `caller::call`, red without the fix: X
+   received the `Hello` and `Invoke`):
+   - `a_removed_directory_vouching_for_its_old_head_in_a_refresh_does_not_decide`
+   - `a_lagging_directory_in_a_refresh_does_not_decide`
+3. **A resolve under an older head.** `resolve_entry` now refuses a one-entry view whose head is
+   older than the view held or than its `seen` (exit 1, no host dialed). Test:
+   `a_resolve_under_an_older_head_than_the_view_is_refused`.
+4. **An old one-directory head.** A host's own word now counts only while the network string
+   (`network.json`) names no other directory either (`Vouching::knowing`; call, inbox and gateway
+   pass `view::joined_directories`). Refreshes now ask the view's head's directories, then the
+   network string's. This does not cover a caller whose network string is also from the
+   one-machine days; protocol §9 now says exactly when a second directory makes removal hold. Test:
+   `vouch::tests::an_old_one_directory_head_is_not_a_one_machine_network` (and the updated
+   `view::tests::directories_come_from_the_head_then_the_network_string`).
+5. **A `Fresh` lasting forever.**
+   - `PolicyHead` gains a signed `fresh_secs` field. `Policy::sign` fills it from settings, and
+     `SignedPolicy::verify` requires it to equal the settings value. The head is still format 5:
+     nothing had shipped at format 5 yet.
+   - `Fresh::sign` and `Fresh::verify` (and so `vouches`, `FreshSet` and the host's `offer`)
+     refuse `until - at > fresh_secs` with the new `Error::FreshTooLong`.
+   - Test: `fresh::tests::a_fresh_lasts_no_longer_than_the_head_allows`. Test signers now use
+     ≤ 900 s windows (`testutil::test_fresh` covers now−60 … now+840).
+6. **Failures before speaking fail over.** Two kinds of failure used to end the call instead of
+   moving to the next host: a refresh error, or no refresher at all (the gateway). Now any failure
+   after `Open` and before speaking is `Unvouched`; that includes a failed `Open` write and a
+   failed `open_bi`, and covers the inbox fetch too. Test:
+   `a_proof_that_cannot_be_settled_fails_over_to_the_next_host` (red without: the call failed with
+   "newer than your view's 1").
+7. **The last directory can't go.** The refusal is back and unconditional. It sits in
+   `edit_policy`: an edit that takes a network that listed a directory down to none is refused,
+   naming `wires directory add`. Tests:
+   - `admin::service::tests::the_last_directory_stays`
+   - `admin::remove::tests::removing_a_node_drops_it_from_hosts_and_directories` and
+     `removing_the_last_directory_is_refused`
+   - `directory/tests.rs` `directory_edits_are_head_edits`: one assertion changed there, in the
+     directory lane, to expect the refusal.
+9. **Pre-auth hold time and `fresh.json`.**
+   - Protocol §9 now gives the real pre-auth hold time: up to 20 s (`Open` then `Hello`), 30 s with
+     the `Invoke`.
+   - `Freshness::offer` now writes `fresh.json` under the lock. The test
+     (`concurrent_offers_persist_the_newest`) did not reproduce the race against the old code in
+     five runs; it is a regression check, not a proof.
+10. **`inbox --wait` deliveries.** A removed host still in a stale view can push to a waiting
+    `inbox --wait`; no token goes to it. Stated in §9, not changed.
+11. **Protocol wording.** §4, §5, §6 and §9 are now exact.
+    - §4 and §5: the bound holds on sessions and fetches within §9's limits; a newer head decides
+      nothing until the view reaches it.
+    - §6: directories get the token before they prove anything (finding 2); card 45 closes that.
+    - §9: a host's `Proof` is replayable material by design; a removed or lagging directory can
+      keep a stale view in place; and when a second directory makes removal hold.
+
+**Finding 2 is not fixed here.** View refresh and `resolve` still send the ID token in the
+directory `hello` before the directory proves anything. `wires/directory/` is untouched; §9 and §6
+say card 45 closes it.
+
+**Also changed: the host's per-connection lapse warning is gone.** It was a throttled `warn!`,
+added in efa12ee, saying "callers will send this host nothing". With it, `cargo test -p wires`
+failed about one run in two in `host::push::tests::a_banned_persons_fetch_drops_the_queue`: that
+test's captured debug line "push denied" was missing, which looks like a tracing callsite-interest
+race between concurrent tests. Without the warning: 0 failures in 8 runs here. Main at 9000e8b:
+0 in 4. With it suppressed only for heads that list no directory, the test still failed 2 of 4.
+The operator now sees a lapse through the follower's trace of directories it can't reach; §4 says
+so. If the warning is wanted back, the flaky test needs a capture that doesn't depend on global
+tracing interest.

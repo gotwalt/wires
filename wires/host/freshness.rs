@@ -18,8 +18,9 @@
 //! **What a lapse costs** (card 49): every session and inbox fetch opens with
 //! [`Freshness::proof`]. With no current `Fresh` from a directory other than
 //! this host (every directory down, or this host cut off from them), callers
-//! send it nothing, so it serves nobody until a directory vouches again. The
-//! host says so in its trace (throttled, [`Freshness::proof`]).
+//! send it nothing, so it serves nobody until a directory vouches again. (The
+//! host doesn't trace it per connection; its follower's trace shows the
+//! directories it can't reach.)
 
 use std::sync::{Arc, RwLock};
 
@@ -50,9 +51,6 @@ impl std::fmt::Debug for Freshness {
     }
 }
 
-/// Lapses a host traces at most this often (one line per window).
-static LAPSES: crate::host::transport::Throttle = crate::host::transport::Throttle::new();
-
 impl Freshness {
     /// The host's freshness from `ks`: its [`FRESH_FILE`], keeping only those
     /// that vouch for `head` (the head on disk; `None`: no policy yet, so
@@ -82,48 +80,32 @@ impl Freshness {
         fresh
             .verify(head)
             .context("the freshness doesn't vouch for the held head")?;
-        let text = {
-            let mut held = self.held.write().unwrap_or_else(|e| e.into_inner());
-            if !held.insert(fresh.clone(), now) {
-                return Ok(false);
-            }
-            let kept: Vec<&Fresh> = held.iter().collect();
-            serde_json::to_string(&kept).context("encoding the freshness")?
-        };
+        // Written under the lock: a concurrent offer can't persist an older
+        // snapshot after this one (card 49 review).
+        let mut held = self.held.write().unwrap_or_else(|e| e.into_inner());
+        if !held.insert(fresh.clone(), now) {
+            return Ok(false);
+        }
+        let kept: Vec<&Fresh> = held.iter().collect();
+        let text = serde_json::to_string(&kept).context("encoding the freshness")?;
         write_private(&self.ks.path(FRESH_FILE), format!("{text}\n"))?;
         Ok(true)
     }
 
     /// What this host shows a caller first, for `head` at `now`: the head and
     /// every current `Fresh` it holds for it. When none of them is from a
-    /// directory other than `me` (or `me` as the head's one directory), no
-    /// caller will go on, and the host traces that (throttled).
-    pub(crate) fn proof(
-        &self,
-        head: &SignedPolicyHead,
-        me: library::NodeId,
-        now: i64,
-    ) -> HostProof {
+    /// directory other than this host (or this host as the head's one
+    /// directory), no caller will go on.
+    pub(crate) fn proof(&self, head: &SignedPolicyHead, now: i64) -> HostProof {
         let fresh = self
             .held
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .current_for(head, now);
-        let proof = HostProof {
+        HostProof {
             head: head.clone(),
             fresh,
-        };
-        if let Err(why) = proof.vouching(me, now)
-            && let Some(n) = LAPSES.tick(crate::clock::now_ms())
-        {
-            tracing::warn!(
-                version = head.head.version.0,
-                sessions = n,
-                "callers will send this host nothing: {why} (is a directory running, and can \
-                 this host reach it?)"
-            );
         }
-        proof
     }
 
     /// Whether some current `Fresh` from a directory other than `me` (or `me`
@@ -185,7 +167,7 @@ mod tests {
         assert!(f.vouched(&h, me(), 200));
         assert!(!f.vouched(&h, me(), 201));
         assert!(
-            f.proof(&h, me(), 201).fresh.is_empty(),
+            f.proof(&h, 201).fresh.is_empty(),
             "a lapsed one isn't shown"
         );
         // It vouches for that head only.
@@ -203,7 +185,7 @@ mod tests {
         assert!(!f.vouched(&h, me(), 150), "its own word isn't enough");
         assert!(f.offer(&fresh(&h, 100, 200), &h, 100).unwrap());
         assert!(f.vouched(&h, me(), 150));
-        let proof = f.proof(&h, me(), 150);
+        let proof = f.proof(&h, 150);
         assert_eq!(proof.fresh.len(), 2);
         assert!(proof.vouching(me(), 150).is_ok());
         // A later beat of its own doesn't displace the other's.
@@ -263,12 +245,48 @@ mod tests {
             .unwrap();
         let back = Freshness::load(Arc::clone(&ks), Some(&h));
         assert!(back.vouched(&h, me(), 150));
-        assert_eq!(back.proof(&h, me(), 150).fresh.len(), 2);
+        assert_eq!(back.proof(&h, 150).fresh.len(), 2);
         // Under another head (or none) the file vouches for nothing.
         let other = Freshness::load(Arc::clone(&ks), Some(&head(3)));
-        assert!(other.proof(&head(3), me(), 150).fresh.is_empty());
+        assert!(other.proof(&head(3), 150).fresh.is_empty());
         let none = Freshness::load(ks, None);
         assert!(!none.vouched(&h, me(), 150));
+    }
+
+    /// Concurrent offers (a beat from the followed directory and one from
+    /// this host's own) leave on disk what is held in memory: the file is
+    /// written under the lock, never from an older snapshot.
+    #[test]
+    fn concurrent_offers_persist_the_newest() {
+        let home = crate::testutil::temp_dir();
+        let ks = Arc::new(Keystore::at(&home));
+        let h = head(2);
+        let f = Arc::new(Freshness::load(Arc::clone(&ks), Some(&h)));
+        let signers = [dir(), me_dir()];
+        std::thread::scope(|scope| {
+            for (t, signer) in signers.iter().enumerate() {
+                for k in 0..4 {
+                    let (f, h) = (Arc::clone(&f), h.clone());
+                    scope.spawn(move || {
+                        for i in 0..60i64 {
+                            let at = 100 + i * 8 + k;
+                            let fresh = Fresh::sign(signer, &h, at, at + 500).unwrap();
+                            let _ = f.offer(&fresh, &h, at);
+                            let _ = t;
+                        }
+                    });
+                }
+            }
+        });
+        let in_memory = f.proof(&h, 600).fresh;
+        let on_disk = Freshness::load(ks, Some(&h)).proof(&h, 600).fresh;
+        let untils = |v: &[Fresh]| {
+            let mut u: Vec<(library::NodeId, i64)> =
+                v.iter().map(|f| (f.directory, f.until)).collect();
+            u.sort();
+            u
+        };
+        assert_eq!(untils(&on_disk), untils(&in_memory));
     }
 
     #[test]

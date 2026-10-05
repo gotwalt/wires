@@ -299,18 +299,20 @@ mod tests {
     fn removing_a_node_drops_it_from_hosts_and_directories() {
         let ks = admin();
         crate::admin::service::directory_add(&ks, node(4), Ttl::default()).unwrap();
+        // Another directory stays (the last one can't go).
+        crate::admin::service::directory_add(&ks, node(5), Ttl::default()).unwrap();
         let out = remove_in(&ks, who(&format!("dir={}", node(4).hex())))
             .unwrap()
             .stdout;
         assert!(out.contains("dir"), "{out}");
         let held = stored(&ks);
         assert!(held.policy.bans_node(node(4)));
-        assert!(held.directories().is_empty());
+        assert_eq!(held.directories(), &[node(5)]);
         // The label stays, for restore.
         let out = restore_in(&ks, who("dir")).unwrap().stdout;
         assert!(out.contains("hosts nothing"), "{out}");
         assert!(!stored(&ks).policy.bans_node(node(4)));
-        assert!(stored(&ks).directories().is_empty(), "not put back");
+        assert_eq!(stored(&ks).directories(), &[node(5)], "not put back");
     }
 
     #[test]
@@ -319,6 +321,22 @@ mod tests {
         let me = keystore::node_identity_in(&ks).unwrap().node_id();
         let e = remove_in(&ks, who(&me.hex())).unwrap_err();
         assert!(format!("{e:#}").contains("own node"), "{e:#}");
+    }
+
+    /// Removing the last directory's node would leave nothing to vouch for
+    /// the policy, and no caller would call any host (card 49): refused,
+    /// naming the way out, and nothing changes.
+    #[test]
+    fn removing_the_last_directory_is_refused() {
+        let ks = admin();
+        let dir = node(4);
+        crate::admin::service::directory_add(&ks, dir, Ttl::default()).unwrap();
+        let before = stored(&ks).version();
+        let err = format!("{:#}", remove_in(&ks, who(&dir.hex())).unwrap_err());
+        assert!(err.contains("no directory"), "{err}");
+        assert!(err.contains("wires directory add"), "{err}");
+        assert_eq!(stored(&ks).version(), before);
+        assert_eq!(stored(&ks).directories(), &[dir]);
     }
 
     #[test]

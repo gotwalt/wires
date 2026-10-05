@@ -235,13 +235,19 @@ pub(crate) fn joined_directories(ks: &Keystore) -> Vec<NodeId> {
         .map_or_else(Vec::new, |n| n.directories)
 }
 
-/// The directories this node asks, never itself: its view's head's (or,
-/// holding none, the network string's).
+/// The directories this node asks, never itself: its view's head's, then
+/// the network string's not among them (so a view from before a directory
+/// was added still reaches it; card 49 review).
 pub(crate) fn directories(ks: &Keystore, root: NodeId, me: NodeId) -> Vec<NodeId> {
-    let dirs = match read(ks, root) {
-        Ok(Some(held)) if !held.directories().is_empty() => held.directories().to_vec(),
-        _ => joined_directories(ks),
+    let mut dirs = match read(ks, root) {
+        Ok(Some(held)) => held.directories().to_vec(),
+        _ => Vec::new(),
     };
+    for d in joined_directories(ks) {
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
     dirs.into_iter().filter(|d| *d != me).collect()
 }
 
@@ -910,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn directories_come_from_the_head_else_from_the_network_string() {
+    fn directories_come_from_the_head_then_the_network_string() {
         let ks = Keystore::at(crate::testutil::temp_dir());
         let r = root().node_id();
         let me = NodeIdentity::from_seed([53; 32]).node_id();
@@ -927,7 +933,7 @@ mod tests {
             None,
         );
         write(&ks, r, &HeldView::fetched(view, None, 0)).unwrap();
-        assert_eq!(directories(&ks, r, me), vec![listed]);
+        assert_eq!(directories(&ks, r, me), vec![listed, d], "the head's first");
     }
 
     // -----------------------------------------------------------------------
@@ -1088,8 +1094,8 @@ mod tests {
     #[tokio::test]
     async fn a_denied_view_subscription_moves_to_the_next_directory() {
         let book = MemoryLookup::new();
-        let first = fake_directory(0, &book, Script::ViewThenDenied, 3600).await;
-        let second = fake_directory(1, &book, Script::ViewThenSilence, 3600).await;
+        let first = fake_directory(0, &book, Script::ViewThenDenied, 900).await;
+        let second = fake_directory(1, &book, Script::ViewThenSilence, 900).await;
         let f = follower(&book).await;
         let (tx, _rx) = tokio::sync::watch::channel(None);
         let mut held = None;
@@ -1124,8 +1130,8 @@ mod tests {
     #[tokio::test]
     async fn a_follower_every_directory_refuses_backs_off() {
         let book = MemoryLookup::new();
-        let first = fake_directory(0, &book, Script::Denied, 3600).await;
-        let second = fake_directory(1, &book, Script::Denied, 3600).await;
+        let first = fake_directory(0, &book, Script::Denied, 900).await;
+        let second = fake_directory(1, &book, Script::Denied, 900).await;
         let f = follower(&book).await;
         let endpoint = f.endpoint.clone();
         let (_watch, task) = follow(f);
