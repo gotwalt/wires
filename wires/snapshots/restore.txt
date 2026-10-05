@@ -1,6 +1,6 @@
-Remove a person (email) or a node (label or id); hosts refuse them
+Lift a removal of a person or a node
 
-Usage: wires remove [OPTIONS] <WHO>
+Usage: wires restore [OPTIONS] <WHO>
 
 Arguments:
   <WHO>  A person's email, or a node's label or id (`label=<node id>` names it)
@@ -10,6 +10,5 @@ Options:
   -h, --help             Print help
       --help-all         Also list the operator and credential flags
 
-Examples:
-  wires remove alice@example.com        # a person, from every machine
-  wires remove workbench                # a node, by label or id
+Example:
+  wires restore alice@example.com

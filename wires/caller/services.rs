@@ -89,14 +89,14 @@ fn unverified_audiences(jws: &str) -> Result<Vec<Audience>> {
 /// no view at all it is an error.
 pub(crate) async fn current_view(ks: &Keystore) -> Result<HeldView> {
     let node = keystore::node_identity_in(ks)?;
-    let badge = ks.read_membership()?.context(crate::help::NOT_JOINED)?;
-    let held = view::read(ks, badge.fabric)?;
+    let root = ks.network_root()?.context(crate::help::NOT_JOINED)?;
+    let held = view::read(ks, root)?;
     if let Some(held) = &held
         && !held.is_stale(crate::clock::now_unix())
     {
         return Ok(held.clone());
     }
-    match view::refresh_now(ks, &node, &badge, None, false).await {
+    match view::refresh_now(ks, &node, root, None, false).await {
         Ok(fresh) => Ok(fresh),
         Err(e) => match held {
             Some(held) => {
@@ -283,7 +283,11 @@ mod tests {
             groups: vec![],
             not_after: i64::MAX,
         };
-        crate::testutil::signed_policy(&root, s).view_for(Some(&principal), None)
+        crate::testutil::signed_policy(&root, s).view_for(
+            crate::testutil::any_node(),
+            Some(&principal),
+            None,
+        )
     }
 
     #[test]

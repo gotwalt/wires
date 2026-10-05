@@ -1,5 +1,5 @@
 //! [`Ttl`]: a lifetime typed the way people say it, shared by every command
-//! that takes one (`--ttl`, `--policy-ttl`, `--timeout`).
+//! that takes one (`--policy-ttl`, `wires push --ttl`, `--timeout`).
 
 use std::str::FromStr;
 
@@ -9,11 +9,6 @@ use std::str::FromStr;
 pub(crate) struct Ttl(i64);
 
 impl Ttl {
-    /// The default for memberships (`init` / `invite --ttl`): long, because
-    /// nothing renews them yet (card 14 notes the renewal story as a
-    /// follow-up).
-    pub(crate) const DEFAULT: &'static str = "30d";
-
     /// The default lifetime of a signed policy head (every edit's
     /// `--policy-ttl`, card 36): the directories' freshness timestamps, not
     /// the head's expiry, keep copies current.
@@ -25,28 +20,6 @@ impl Ttl {
         Ttl::POLICY_DEFAULT
             .parse()
             .expect("the policy default parses")
-    }
-
-    /// The longest badge (membership) lifetime `init` and `invite` mint. A
-    /// ban on a node the admin's ledger doesn't know lasts this long, so it
-    /// outlives any badge the admin could have minted for it (card 35).
-    pub(crate) const MAX_BADGE: &'static str = "30d";
-
-    /// [`Ttl::MAX_BADGE`], parsed.
-    pub(crate) fn max_badge() -> Ttl {
-        Ttl::MAX_BADGE.parse().expect("the badge cap parses")
-    }
-
-    /// `self` as a badge lifetime: refused when longer than
-    /// [`Ttl::MAX_BADGE`].
-    pub(crate) fn badge(self) -> anyhow::Result<Ttl> {
-        if self > Ttl::max_badge() {
-            anyhow::bail!(
-                "--ttl is at most {} for a badge (a removal bans a node until its badge expires)",
-                Ttl::MAX_BADGE
-            );
-        }
-        Ok(self)
     }
 
     /// The expiry `now_unix + self`, saturating.
@@ -62,9 +35,11 @@ impl Ttl {
 }
 
 impl Default for Ttl {
-    /// [`Ttl::DEFAULT`].
+    /// [`Ttl::POLICY_DEFAULT`]: the one lifetime with a default.
     fn default() -> Self {
-        Ttl::DEFAULT.parse().expect("the default lifetime parses")
+        Ttl::POLICY_DEFAULT
+            .parse()
+            .expect("the policy default parses")
     }
 }
 
@@ -117,16 +92,8 @@ mod tests {
         for bad in ["", "d", "0d", "-1h", "3y", "1.5h", "99999999999999999w"] {
             assert!(bad.parse::<Ttl>().is_err(), "{bad:?} parsed");
         }
-        assert_eq!(Ttl::default().not_after(100), 100 + 30 * 86_400);
+        assert_eq!(Ttl::default().not_after(100), 100 + 90 * 86_400);
         assert_eq!(Ttl::policy_default().not_after(0), 90 * 86_400);
-    }
-
-    #[test]
-    fn a_badge_is_at_most_the_cap() {
-        assert!(Ttl::default().badge().is_ok());
-        assert!("1h".parse::<Ttl>().unwrap().badge().is_ok());
-        assert!(Ttl::max_badge().badge().is_ok());
-        assert!("31d".parse::<Ttl>().unwrap().badge().is_err());
     }
 
     proptest! {

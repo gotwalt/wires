@@ -12,5 +12,5 @@ Options:
   -h, --help  Print help
 
 Examples:
-  wires directory add workbench
+  wires directory add workbench=<node id>
   wires directory serve

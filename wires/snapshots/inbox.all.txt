@@ -13,10 +13,6 @@ Options:
           Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`, then `--node-seed-file`, then the keystore (`node.seed`)
       --node-seed-file <NODE_SEED_FILE>
           Read the node key seed (hex) from this file instead of the keystore
-      --membership <MEMBERSHIP>
-          The base64 membership token to present. Falls back to `$WIRES_MEMBERSHIP`, then `--membership-file`, then the keystore
-      --membership-file <MEMBERSHIP_FILE>
-          Read the membership token from this file instead of the keystore
       --relay-url <RELAY_URL>
           Dial through this relay, overriding an alias's own
   -h, --help

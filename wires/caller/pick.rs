@@ -261,7 +261,11 @@ mod tests {
         );
         s.services
             .insert(ServiceName::new("status").unwrap(), svc(vec![node(3)]));
-        crate::testutil::signed_policy(&root, s).view_for(Some(&anyone()), None)
+        crate::testutil::signed_policy(&root, s).view_for(
+            crate::testutil::any_node(),
+            Some(&anyone()),
+            None,
+        )
     }
 
     #[test]

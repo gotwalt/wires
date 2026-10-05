@@ -125,10 +125,10 @@ pub(crate) fn adopt_if_newer(
     Ok(true)
 }
 
-/// The network root this keystore belongs to (its membership's `fabric`);
-/// `None` before `init` or `join`.
+/// The network root this keystore belongs to
+/// ([`Keystore::network_root`]); `None` before `init`, `join` or `login`.
 pub(crate) fn fabric(ks: &Keystore) -> Result<Option<NodeId>> {
-    Ok(ks.read_membership()?.map(|m| m.fabric))
+    ks.network_root()
 }
 
 #[cfg(test)]

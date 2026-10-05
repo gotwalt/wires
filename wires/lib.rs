@@ -4,9 +4,11 @@
 //! parsing and dispatch ([`run`], which `main.rs` calls), plus the public
 //! surface an app embeds to serve wires calls in-process (card 33):
 //!
-//! - **admin** (`admin/`) — holds the root key, mints badges and signs the
-//!   policy: which IdPs are trusted, which roles exist, which services run
-//!   where and who may call them, who is banned, which nodes are directories.
+//! - **admin** (`admin/`) — holds the root key and signs the policy: which
+//!   IdPs are trusted, which roles exist, which services run where and who
+//!   may call them, who is removed, which nodes are directories. It mints
+//!   nothing for any node: a caller is admitted by its IdP sign-in, a host
+//!   or directory by the policy naming its key.
 //! - **directory** (`directory/`) — holds the newest policy and vouches for
 //!   its freshness; hosts fetch it whole, and each caller its view (the
 //!   services it may use, card 37). It never decides a call (card 36).
@@ -14,8 +16,9 @@
 //!   policy assigns to it, checks every caller against that policy, and
 //!   writes one log line per call.
 //! - **caller** (`caller/`) — `wires login | services | call | mcp | inbox`:
-//!   holds only its view, and runs remote CLIs by service name (`mcp` serves them as MCP over stdio,
-//!   for the MCP clients people already use).
+//!   joins and signs in with one `wires login <network>`, holds only its
+//!   view, and runs remote CLIs by service name (`mcp` serves them as MCP
+//!   over stdio, for the MCP clients people already use).
 //! - **gateway** (`gateway/`) — `wires gateway`: those services as a
 //!   remote MCP server with OAuth, for web clients (Claude.ai), each call
 //!   made with the signed-in user's own ID token.
@@ -101,15 +104,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     // --- admin ---
-    /// Create the network: the root key, this node's key and badge, the first policy
+    /// Create the network: the root key, this node's key, the first policy
     #[command(after_help = help::INIT_AFTER)]
     Init(admin::init::InitArgs),
-    /// Admit a node: mint its badge and print its join token (edits no policy)
-    #[command(after_help = help::INVITE_AFTER)]
-    Invite(admin::invite::InviteArgs),
-    /// Ban a node until its badge expires; hosts refuse its next call
+    /// Print the network string every node joins with (not secret)
+    #[command(after_help = help::NETWORK_AFTER)]
+    Network,
+    /// Remove a person (email) or a node (label or id); hosts refuse them
     #[command(after_help = help::REMOVE_AFTER)]
-    Remove(admin::invite::RemoveArgs),
+    Remove(admin::remove::WhoArgs),
+    /// Lift a removal of a person or a node
+    #[command(after_help = help::RESTORE_AFTER)]
+    Restore(admin::remove::WhoArgs),
     /// Register services: add, set, rm (who may call and read, which hosts)
     #[command(after_help = help::SERVICE_AFTER)]
     Service(admin::service::ServiceArgs),
@@ -138,10 +144,10 @@ enum Command {
     /// Print this node's id (making its key on first use), for your admin
     #[command(after_help = help::ID_AFTER)]
     Id,
-    /// Install the invite token your admin sent (without one, print this node's id)
+    /// Join a network with its string, signing nobody in (a host or directory)
     #[command(after_help = help::JOIN_AFTER)]
     Join(caller::join::JoinArgs),
-    /// Sign in with your IdP, binding your identity to this node's key
+    /// Sign in with your IdP (the first time with the network string: login <network>)
     #[command(after_help = help::LOGIN_AFTER)]
     Login(caller::login::LoginArgs),
     /// List the services you may call, one per line (a query searches them)
@@ -264,13 +270,14 @@ pub fn run() {
             init_quiet_logging();
             print_or_exit(admin::init::init_cmd(a))
         }
-        Command::Invite(a) => {
-            init_quiet_logging();
-            print_report(runtime().block_on(admin::invite::invite_cmd(a)))
-        }
+        Command::Network => print_report(admin::network::network_cmd()),
         Command::Remove(a) => {
             init_quiet_logging();
-            print_report(runtime().block_on(admin::invite::remove_cmd(a)))
+            print_report(runtime().block_on(admin::remove::remove_cmd(a)))
+        }
+        Command::Restore(a) => {
+            init_quiet_logging();
+            print_report(runtime().block_on(admin::remove::restore_cmd(a)))
         }
         Command::Service(a) => {
             init_quiet_logging();
@@ -303,7 +310,7 @@ pub fn run() {
         Command::Id => print_or_exit(caller::join::id_cmd()),
         Command::Join(a) => {
             init_quiet_logging();
-            print_or_exit(runtime().block_on(caller::join::join_cmd(a)))
+            print_or_exit(caller::join::join_cmd(a))
         }
         Command::Serve(a) => {
             if let Err(e) = runtime().block_on(host::serve::serve_cmd(a)) {
@@ -376,7 +383,7 @@ fn exit_with_code(result: anyhow::Result<i32>) -> ! {
 }
 
 /// Print an admin command's notes on stderr and its result on stdout (the
-/// token, for `invite` — so `$(wires invite …)` is the token alone). A
+/// string, for `network` — so `$(wires network)` is the string alone). A
 /// failure (the new policy reached no directory) is printed last and exits
 /// 1: the work is done and stored, but not in force. An error is
 /// [`exit_with`].
@@ -434,17 +441,17 @@ mod tests {
     fn onboarding_commands_parse() {
         let id = "ab".repeat(32);
         assert!(Cli::try_parse_from(["wires", "init"]).is_ok());
-        assert!(Cli::try_parse_from(["wires", "init", "--ttl", "7d"]).is_ok());
-        assert!(Cli::try_parse_from(["wires", "init", "--ttl", "soon"]).is_err());
-        assert!(Cli::try_parse_from(["wires", "invite", &id, "--name", "alice"]).is_ok());
-        assert!(Cli::try_parse_from(["wires", "invite"]).is_err());
-        assert!(Cli::try_parse_from(["wires", "remove", "alice"]).is_ok());
-        // Card 28: `--ttl` is a membership's lifetime, `--policy-ttl` the
-        // signed policy's.
+        // No badge, no `--ttl`, no `invite`: card 41.
+        assert!(Cli::try_parse_from(["wires", "init", "--ttl", "7d"]).is_err());
+        assert!(Cli::try_parse_from(["wires", "invite", &id]).is_err());
+        assert!(Cli::try_parse_from(["wires", "network"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "remove", "alice@example.com"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "remove", "workbench"]).is_ok());
         assert!(
-            Cli::try_parse_from(["wires", "invite", &id, "--ttl", "1h", "--policy-ttl", "30d"])
-                .is_ok()
+            Cli::try_parse_from(["wires", "remove", "eve@x.com", "--issuer", "https://i"]).is_ok()
         );
+        assert!(Cli::try_parse_from(["wires", "restore", "alice@example.com"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "remove"]).is_err());
         assert!(Cli::try_parse_from(["wires", "init", "--policy-ttl", "7d"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "remove", "alice", "--policy-ttl", "7d"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "remove", "alice", "--ttl", "7d"]).is_err());
@@ -458,6 +465,9 @@ mod tests {
                 .is_ok()
         );
         assert!(Cli::try_parse_from(["wires", "directory", "add", "workbench"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["wires", "directory", "add", &format!("workbench={id}")]).is_ok()
+        );
         assert!(Cli::try_parse_from(["wires", "directory", "rm", "workbench"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "directory", "serve"]).is_ok());
         assert!(
@@ -465,7 +475,12 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["wires", "directory"]).is_err());
         assert!(Cli::try_parse_from(["wires", "id"]).is_ok());
-        assert!(Cli::try_parse_from(["wires", "join"]).is_ok());
-        assert!(Cli::try_parse_from(["wires", "join", "tok"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["wires", "join"]).is_err(),
+            "the string is required"
+        );
+        assert!(Cli::try_parse_from(["wires", "join", "net"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "login", "net"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "login"]).is_ok());
     }
 }

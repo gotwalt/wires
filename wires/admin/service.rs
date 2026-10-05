@@ -7,30 +7,30 @@
 //! wires role set analyst '*@example.com' 'issuer=https://idp,group=dba'
 //! wires issuer set https://acme.okta.com --client-id 0oa…   # trust an IdP
 //! wires role set staff --issuer https://acme.okta.com 'issuer=https://acme.okta.com'
-//! wires service add orders-db --description "Read-only SQL" --allow analyst --host workbench
+//! wires service add orders-db --description "Read-only SQL" --allow analyst --host workbench=3ef7…
 //! wires service set orders-db --host workbench --host spare     # failover
 //! wires service rm  orders-db
 //! ```
 //!
-//! Every edit goes through [`edit_policy`]: the stored policy, changed, its
-//! expired bans dropped, the version bumped by one, re-signed (which
+//! Every edit goes through [`edit_policy`]: the stored policy, changed, the
+//! version bumped by one, re-signed (which
 //! validates it: every matcher's issuer must be trusted by an `issuer` item)
 //! and stored through the compare-and-swap. **The host set is
 //! derived:** a node is a host exactly when some service names it, so
 //! assigning a service is what makes a node a host, and dropping its last
-//! service makes it a plain node again. A `--host` must be a node this
-//! admin invited (it is in the ledger) and not banned.
+//! service makes it a plain node again. A `--host` is a node id or the
+//! admin's label for one (`label=<node id>` names it the first time,
+//! [`super::labels`]), and not banned.
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use library::{
-    Audience, EmailPattern, GOOGLE_ISSUER, Issuer, IssuerConfig, Matcher, NodeId, Policy, RoleName,
-    Service, ServiceName, StateVersion,
+    Audience, EmailPattern, Issuer, IssuerConfig, Matcher, NodeId, Policy, RoleName, Service,
+    ServiceName, StateVersion,
 };
 
-use super::invite::resolve_member;
 use super::keystore::Keystore;
-use super::ledger::Ledger;
+use super::labels::resolve_all;
 use super::ttl::Ttl;
 use super::{Report, run_edit};
 use crate::clock::now_unix;
@@ -71,8 +71,8 @@ pub(crate) struct ServiceEditArgs {
     /// Repeatable.
     #[arg(long = "allow")]
     pub(crate) allow: Vec<String>,
-    /// A node that implements it: an `invite --name` label or a node id.
-    /// Repeatable (failover).
+    /// A node that implements it: `label=<node id>` the first time, then the
+    /// label (or the id). Repeatable (failover).
     #[arg(long = "host")]
     pub(crate) host: Vec<String>,
     /// Lifetime of the new policy, from now (`90d`, `12h`, … or seconds);
@@ -121,9 +121,10 @@ pub(crate) struct RoleSetArgs {
     // `--issuer`.
     #[arg(required = true)]
     pub(crate) matchers: Vec<String>,
-    /// The IdP a matcher trusts when it names none: its exact `iss`.
-    #[arg(long, default_value = GOOGLE_ISSUER)]
-    pub(crate) issuer: String,
+    /// The IdP a matcher trusts when it names none: its exact `iss` (default:
+    /// the one the network string names).
+    #[arg(long)]
+    pub(crate) issuer: Option<String>,
     /// Lifetime of the new policy, from now; never shortens the current one.
     #[arg(long = "policy-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
     pub(crate) ttl: Ttl,
@@ -171,12 +172,12 @@ pub(crate) struct IssuerSetArgs {
     /// An `aud` value hosts accept from this IdP (repeatable; default: the client id).
     #[arg(long = "audience")]
     pub(crate) audience: Vec<String>,
-    /// The client's public secret, which invites carry to `wires login`.
+    /// The client's public secret, which the network string carries to `wires login`.
     // A Google "Desktop app" client's; kept in this keystore, not in the
     // signed policy. Never pass a confidential secret.
     #[arg(long)]
     pub(crate) public_client_secret: Option<String>,
-    /// Make this the IdP invites tell `wires login` to use (default: init's).
+    /// Make this the IdP the network string tells `wires login` to use (default: init's).
     #[arg(long)]
     pub(crate) login: bool,
     /// Lifetime of the new policy, from now; never shortens the current one.
@@ -202,8 +203,7 @@ pub(crate) struct ServiceEdit {
     pub(crate) description: Option<String>,
     /// Its `allow` roles, replacing the list.
     pub(crate) allow: Option<Vec<RoleName>>,
-    /// Its hosts, replacing the list (each must be a node this admin
-    /// invited, and not banned).
+    /// Its hosts, replacing the list (none of them banned).
     pub(crate) hosts: Option<Vec<NodeId>>,
 }
 
@@ -227,9 +227,7 @@ impl ServiceEdit {
 // ---------------------------------------------------------------------------
 
 /// Sign and store the next version of this keystore's policy: the stored
-/// one changed by `change`, bans whose `until` has passed dropped
-/// ([`Policy::prune_bans`]: the badge each one cancelled has expired),
-/// version + 1, valid until `ttl` from now or the stored one's expiry,
+/// one changed by `change`, version + 1, valid until `ttl` from now or the stored one's expiry,
 /// whichever is later (an edit never shortens the policy's lifetime). Only
 /// the service entries the edit changed are re-signed
 /// ([`Policy::sign_after`]); the rest keep their signature and version.
@@ -289,7 +287,6 @@ fn sign_next(
     };
     change(&mut next)?;
     let now = now_unix();
-    next.prune_bans(now);
     next.version = StateVersion(next.version.0 + 1);
     next.issued = now;
     next.not_after = ttl
@@ -308,12 +305,11 @@ fn sign_next(
 
 /// `wires service add <name>`: register a new service.
 pub(crate) fn add(ks: &Keystore, name: ServiceName, edit: ServiceEdit, ttl: Ttl) -> Result<Held> {
-    let ledger = Ledger::load(ks)?;
     edit_policy(ks, ttl, |s| {
         if s.services.contains_key(&name) {
             bail!("service {name} already exists; change it with `wires service set`");
         }
-        check_hosts(s, &ledger, edit.hosts.as_deref())?;
+        check_hosts(s, edit.hosts.as_deref())?;
         let mut svc = Service {
             description: String::new(),
             allow: Vec::new(),
@@ -327,9 +323,8 @@ pub(crate) fn add(ks: &Keystore, name: ServiceName, edit: ServiceEdit, ttl: Ttl)
 
 /// `wires service set <name>`: change an existing service.
 pub(crate) fn set(ks: &Keystore, name: ServiceName, edit: ServiceEdit, ttl: Ttl) -> Result<Held> {
-    let ledger = Ledger::load(ks)?;
     edit_policy(ks, ttl, |s| {
-        check_hosts(s, &ledger, edit.hosts.as_deref())?;
+        check_hosts(s, edit.hosts.as_deref())?;
         let svc = s
             .services
             .get_mut(&name)
@@ -390,11 +385,19 @@ pub(crate) fn issuer_set(
 }
 
 /// `wires issuer rm <iss>`: stop trusting an IdP (refused while a role's
-/// matcher names it).
+/// matcher names it, or a person ban does: lifting that trust would make
+/// the ban name nobody, and validation would refuse the roles).
 pub(crate) fn issuer_rm(ks: &Keystore, issuer: &Issuer, ttl: Ttl) -> Result<Held> {
     edit_policy(ks, ttl, |p| {
         if p.issuers.remove(issuer).is_none() {
             bail!("no trusted issuer {issuer}");
+        }
+        if let Some(person) = p.person_bans.iter().find(|b| b.issuer == *issuer) {
+            bail!(
+                "{person} is removed under {issuer}; `wires restore {}` first, or keep \
+                 trusting it",
+                person.email()
+            );
         }
         Ok(())
     })
@@ -419,17 +422,13 @@ pub(crate) fn issuer_config(client_id: &str, audiences: &[String]) -> Result<Iss
 }
 
 /// `wires directory add <node>`: list a node as one of the network's
-/// directories (not banned, listed once). Unlike a service's `--host`, it
-/// may be a node not invited yet: listing it first is what makes its invite
-/// carry the policy it starts from.
+/// directories (not banned, listed once). The node needs nothing from the
+/// admin: it joins with the network string and takes the policy from the
+/// next publish.
 pub(crate) fn directory_add(ks: &Keystore, node: NodeId, ttl: Ttl) -> Result<Held> {
     edit_policy(ks, ttl, |p| {
-        if let Some(ban) = p.bans.get(&node) {
-            bail!(
-                "{} was removed (banned until {}); `wires invite` it again first",
-                node.short(),
-                ban.until
-            );
+        if p.bans_node(node) {
+            bail!("{}… was removed; `wires restore` it first", node.short());
         }
         if p.directories.contains(&node) {
             bail!("{} is already a directory", node.short());
@@ -451,22 +450,11 @@ pub(crate) fn directory_rm(ks: &Keystore, node: NodeId, ttl: Ttl) -> Result<Held
     })
 }
 
-/// Each proposed host (or directory) must be a node this admin invited (in
-/// its ledger), and not banned.
-pub(crate) fn check_hosts(s: &Policy, ledger: &Ledger, hosts: Option<&[NodeId]>) -> Result<()> {
+/// No proposed host may be banned.
+pub(crate) fn check_hosts(s: &Policy, hosts: Option<&[NodeId]>) -> Result<()> {
     for h in hosts.unwrap_or_default() {
-        if let Some(ban) = s.bans.get(h) {
-            bail!(
-                "{} was removed (banned until {}); `wires invite` it again first",
-                h.short(),
-                ban.until
-            );
-        }
-        if !ledger.contains(*h) {
-            bail!(
-                "{} was never invited here; `wires invite` it first",
-                h.short()
-            );
+        if s.bans_node(*h) {
+            bail!("{}… was removed; `wires restore` it first", h.short());
         }
     }
     Ok(())
@@ -544,20 +532,18 @@ fn role_names(texts: &[String]) -> Result<Option<Vec<RoleName>>> {
         .map(Some)
 }
 
-/// `--host` labels or ids → node ids, through the admin's ledger.
+/// `--host` labels or ids → node ids, through the admin's labels (binding
+/// any written `label=<node id>`).
 fn host_ids(ks: &Keystore, texts: &[String]) -> Result<Option<Vec<NodeId>>> {
     if texts.is_empty() {
         return Ok(None);
     }
-    let ledger = Ledger::load(ks)?;
-    let mut out = Vec::new();
-    for t in texts {
-        let (id, _) = resolve_member(&ledger, t)?;
-        if !out.contains(&id) {
-            out.push(id);
-        }
-    }
-    Ok(Some(out))
+    Ok(Some(
+        resolve_all(ks, texts)?
+            .into_iter()
+            .map(|n| n.node)
+            .collect(),
+    ))
 }
 
 fn service_name(text: &str) -> Result<ServiceName> {
@@ -604,10 +590,22 @@ pub(crate) fn role_in(ks: &Keystore, a: RoleArgs) -> Result<String> {
     let (verb, name, signed) = match a.cmd {
         RoleCmd::Set(r) => {
             let name = role(&r.name)?;
+            let issuer = match &r.issuer {
+                Some(iss) => iss.clone(),
+                None => {
+                    let root = ks
+                        .read_root_identity()?
+                        .ok_or_else(|| anyhow!("no root key here; run `wires init` first"))?;
+                    let held = admin_policy(ks, root.node_id())?;
+                    super::remove::default_issuer(ks, &held.policy)?
+                        .as_str()
+                        .to_string()
+                }
+            };
             let matchers = r
                 .matchers
                 .iter()
-                .map(|m| parse_matcher(m, &r.issuer))
+                .map(|m| parse_matcher(m, &issuer))
                 .collect::<Result<Vec<_>>>()?;
             ("set", name.clone(), role_set(ks, name, matchers, r.ttl)?)
         }
@@ -629,7 +627,7 @@ pub(crate) fn issuer_in(ks: &Keystore, a: IssuerArgs) -> Result<String> {
             let iss = Issuer::new(i.issuer.trim());
             let config = issuer_config(&i.client_id, &i.audience)?;
             let signed = issuer_set(ks, iss.clone(), config, i.ttl)?;
-            // Card 37: what invites tell `wires login` (not signed).
+            // What the network string tells `wires login` (not signed).
             super::login_client::LoginClient::record(
                 ks,
                 &iss,
@@ -691,18 +689,16 @@ mod tests {
     use super::*;
     use crate::admin::init::{InitArgs, init_in};
     use crate::testutil::temp_dir;
+    use library::GOOGLE_ISSUER;
     use library::NodeIdentity;
     use proptest::prelude::*;
 
-    /// An initialized admin keystore that has invited `extra`.
+    /// An initialized admin keystore (`extra`: nodes it will name; the
+    /// admin needs nothing from them first).
     fn admin_with(extra: &[NodeId]) -> Keystore {
         let ks = Keystore::at(temp_dir());
         init_in(&ks, InitArgs::default()).unwrap();
-        let mut ledger = Ledger::load(&ks).unwrap();
-        for n in extra {
-            ledger.record(*n, None, i64::MAX);
-        }
-        ledger.save(&ks).unwrap();
+        let _ = extra;
         ks
     }
 
@@ -812,12 +808,6 @@ mod tests {
         let ks = admin_with(&[]);
         let root = ks.read_root_identity().unwrap().unwrap().node_id();
         let before = store::read(&ks, root).unwrap().unwrap();
-        let stranger = NodeIdentity::generate().node_id();
-        let edit = ServiceEdit {
-            hosts: Some(vec![stranger]),
-            ..Default::default()
-        };
-        assert!(add(&ks, svc("x"), edit, ttl()).is_err(), "never invited");
         let edit = ServiceEdit {
             allow: Some(vec![role("ghost")]),
             ..Default::default()
@@ -826,34 +816,24 @@ mod tests {
         assert_eq!(store::read(&ks, root).unwrap().unwrap(), before);
     }
 
-    /// Card 35: a ban drops out at the first edit after its `until`, and a
-    /// banned node can't be made a host.
+    /// A ban holds through every later edit until it is lifted, and a
+    /// banned node can't be made a host or a directory.
     #[test]
-    fn a_ban_drops_out_at_the_first_edit_after_its_until() {
-        let (lapsed, live) = (
-            NodeIdentity::generate().node_id(),
-            NodeIdentity::generate().node_id(),
-        );
-        let ks = admin_with(&[lapsed, live]);
-        let root = ks.read_root_identity().unwrap().unwrap();
-        let now = now_unix();
-        // A policy someone signed a while ago, holding a ban that has since
-        // lapsed (as if its `until` passed after that edit).
-        let mut s = store::read(&ks, root.node_id()).unwrap().unwrap().policy;
-        s.version = StateVersion(s.version.0 + 1);
-        s.ban(lapsed, now - 10);
-        s.ban(live, now + 3_600);
-        let signed = crate::testutil::signed_policy(&root, s.clone());
-        assert!(store::adopt_if_newer(&ks, &signed, root.node_id(), now).unwrap());
-        assert!(s.bans_node(lapsed), "held until an edit");
-
+    fn a_ban_holds_through_edits_and_a_banned_node_is_no_host() {
+        let banned = NodeIdentity::generate().node_id();
+        let ks = admin_with(&[banned]);
+        edit_policy(&ks, ttl(), |p| {
+            p.ban(banned);
+            Ok(())
+        })
+        .unwrap();
         let edit = ServiceEdit {
-            hosts: Some(vec![live]),
+            hosts: Some(vec![banned]),
             ..Default::default()
         };
         let err = add(&ks, svc("x"), edit, ttl()).unwrap_err();
-        assert!(format!("{err:#}").contains("banned"), "{err:#}");
-
+        assert!(format!("{err:#}").contains("wires restore"), "{err:#}");
+        assert!(directory_add(&ks, banned, ttl()).is_err());
         let next = role_set(
             &ks,
             role("staff"),
@@ -861,8 +841,27 @@ mod tests {
             ttl(),
         )
         .unwrap();
-        assert!(!next.policy.bans_node(lapsed), "dropped at the first edit");
-        assert!(next.policy.bans_node(live), "still in force");
+        assert!(next.policy.bans_node(banned), "still in force");
+    }
+
+    #[test]
+    fn an_issuer_a_person_ban_names_stays_trusted() {
+        let ks = admin_with(&[]);
+        let okta = Issuer::new("https://acme.okta.com");
+        issuer_set(
+            &ks,
+            okta.clone(),
+            issuer_config("0oa1", &[]).unwrap(),
+            ttl(),
+        )
+        .unwrap();
+        edit_policy(&ks, ttl(), |p| {
+            p.ban_person(library::Person::new(okta.clone(), "eve@acme.com"));
+            Ok(())
+        })
+        .unwrap();
+        let e = issuer_rm(&ks, &okta, ttl()).unwrap_err();
+        assert!(format!("{e:#}").contains("wires restore"), "{e:#}");
     }
 
     /// Card 36: every matcher names a trusted issuer; `init` trusts one, and
@@ -887,13 +886,12 @@ mod tests {
     }
 
     #[test]
-    fn directories_are_listed_once_invited_or_not_yet() {
+    fn directories_are_listed_once() {
         let dir = NodeIdentity::generate().node_id();
         let ks = admin_with(&[dir]);
         let held = directory_add(&ks, dir, ttl()).unwrap();
         assert_eq!(held.directories(), &[dir]);
         assert!(directory_add(&ks, dir, ttl()).is_err(), "twice");
-        // Not invited yet: listed first, so its invite carries the policy.
         let stranger = NodeIdentity::generate().node_id();
         let held = directory_add(&ks, stranger, ttl()).unwrap();
         assert_eq!(held.directories(), &[dir, stranger]);
@@ -990,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn role_set_names_google_unless_told_otherwise() {
+    fn role_set_names_the_login_issuer_unless_told_otherwise() {
         let ks = admin_with(&[]);
         for iss in ["https://acme.okta.com", "https://other"] {
             issuer_set(

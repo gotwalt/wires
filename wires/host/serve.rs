@@ -7,8 +7,11 @@
 //! is the admin-signed policy's to say (`host.json` can only narrow). The
 //! flags left are where the host's own credentials live and `--relay-url`.
 //!
-//! When the policy lists this node in `directories`, `serve` also runs the
-//! directory ([`crate::directory`]) on the same endpoint.
+//! When the policy lists this node in `directories` (or, holding no policy
+//! yet, its network string does), `serve` also runs the directory
+//! ([`crate::directory`]) on the same endpoint. Such a host starts with no
+//! policy at all: its directory takes the admin's first publish, and the
+//! host starts deciding calls once that policy assigns it its services.
 //!
 //! `wires serve --check host.json` validates the file and prints what it
 //! means, without touching the keystore or the network.
@@ -18,7 +21,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Args;
-use library::NodeId;
 
 use super::config::HostConfig;
 use super::native::NativeServices;
@@ -27,8 +29,8 @@ use crate::admin::keystore;
 use crate::caller::jwks;
 use crate::init_logging;
 
-/// `serve` arguments: `host.json`, and where this host's own key and
-/// credentials come from.
+/// `serve` arguments: `host.json`, and where this host's own key comes
+/// from.
 #[derive(Args)]
 pub(crate) struct ServeArgs {
     /// The host's config: the services it implements, its IdPs, push.
@@ -47,24 +49,15 @@ pub(crate) struct ServeArgs {
     /// Use a self-hosted relay at this URL instead of the n0 default.
     #[arg(long, hide = true)]
     pub(crate) relay_url: Option<String>,
-    /// The host's own membership token (its badge), instead of the keystore's.
-    // It names the network (its root key) whose signed policy decides every
-    // call, and is presented in the `HelloAck`. Falls back to
-    // `$WIRES_MEMBERSHIP`, then `--membership-file`, then the keystore
-    // (`membership.json`).
-    #[arg(long, hide = true)]
-    pub(crate) membership: Option<String>,
-    /// Read the host's membership token from this file.
-    #[arg(long, hide = true)]
-    pub(crate) membership_file: Option<PathBuf>,
 }
 
 /// `serve`: refuse to start unless this node holds a fresh signed policy
 /// that assigns every service in `host.json` to it (fetching one from a
-/// directory first if it doesn't); then serve the session ALPN (the
-/// directory's too, when the policy lists this node), and — with
-/// `push` — the inbox ALPN plus a local control socket for `wires push`,
-/// deciding every call by the signed policy as it stands at that connection.
+/// directory first if it doesn't), or runs the directory itself (then it
+/// waits for that policy); then serve the session ALPN (the directory's
+/// too, when it is one), and — with `push` — the inbox ALPN plus a local
+/// control socket for `wires push`, deciding every call by the signed
+/// policy as it stands at that connection.
 pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
     let config = HostConfig::load(&a.config)?;
     if a.check {
@@ -72,10 +65,12 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     init_logging();
+    let ks = keystore::Keystore::resolve()?;
+    let root = ks.read_network()?.context(crate::help::NOT_JOINED)?.root;
     let serving = Serving {
         node: keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?,
-        membership: keystore::membership(a.membership.as_deref(), a.membership_file.as_deref())?,
-        keystore: Arc::new(keystore::Keystore::resolve()?),
+        root,
+        keystore: Arc::new(ks),
         config,
         native: NativeServices::new(),
         binding: Binding::N0 {
@@ -95,8 +90,9 @@ pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
 pub(crate) struct Serving {
     /// This host's node key.
     pub(crate) node: library::NodeIdentity,
-    /// Its membership, which names the network whose signed policy decides.
-    pub(crate) membership: library::Membership,
+    /// The network's root key (from its network string): whose signed
+    /// policy decides.
+    pub(crate) root: library::NodeId,
     /// Its keystore: the signed policy, the push queue.
     pub(crate) keystore: Arc<keystore::Keystore>,
     /// How it implements its CLI services, how it narrows the trusted IdPs,
@@ -120,56 +116,45 @@ pub(crate) enum Binding {
     },
     /// Serve on an endpoint already bound for this host's key: hermetic
     /// loopback, for tests. A host that has to fetch a policy before it can
-    /// start fails instead (it has no relay to fetch through).
+    /// start fails instead (it has no relay to fetch through); one that runs
+    /// the directory waits for a publish as ever.
     #[cfg(test)]
     Endpoint(iroh::Endpoint),
 }
 
-/// Serve `serving` until `shutdown` resolves: refuse to start unless the
-/// node holds a fresh signed policy that assigns every service to it
-/// (fetching one from a directory first if it doesn't), then serve the
-/// session ALPN (the directory's when the
-/// policy lists this node, and push when configured), deciding every call
-/// by the signed policy as it stands at that connection (and its signed
-/// freshness rule), and following a directory's `policy` subscription for
-/// every edit and `Fresh` ([`follow`]).
+/// Serve `serving` until `shutdown` resolves.
+///
+/// A host that runs the directory (its policy, or holding none its network
+/// string, lists it) serves the directory at once, and waits until a policy
+/// arrives that passes the preflight (a fresh one assigning every service
+/// here): that is how the network's first directory starts empty and takes
+/// the admin's first publish. Any other host refuses to start unless it
+/// holds such a policy, fetching one from a directory first if it doesn't.
+/// Then it serves the session ALPN (and push when configured), deciding
+/// every call by the signed policy as it stands at that connection (and
+/// its signed freshness rule), and follows a directory's `policy`
+/// subscription for every edit and `Fresh` ([`follow`]).
 pub(crate) async fn serve_until(
     serving: Serving,
     shutdown: impl std::future::Future<Output = anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     let Serving {
         node,
-        membership,
+        root,
         keystore: ks,
         config,
         native,
         binding,
     } = serving;
-    let mut host = services_host(node.node_id(), membership, Arc::clone(&ks), config)?;
+    let mut host = services_host(node.node_id(), root, Arc::clone(&ks), config)?;
     host.native = native;
-    // A host assigned a service while it was offline: fetch, then try again.
-    let state = match (host.preflight(crate::clock::now_unix()), &binding) {
-        (Ok(state), _) => state,
-        (Err(e), Binding::N0 { relay_url, .. }) => {
-            match crate::policy::fetch::fetch_now(&ks, &node, relay_url.as_deref()).await {
-                Ok(Some(_)) => host.preflight(crate::clock::now_unix())?,
-                _ => return Err(e),
-            }
-        }
-        #[cfg(test)]
-        (Err(e), Binding::Endpoint(_)) => return Err(e),
-    };
-    tracing::info!(
-        policy_version = state.version().0,
-        services = host.config.services.len(),
-        native = host.native.len(),
-        "signed policy assigns every service to this host"
-    );
-    // The directory, when the policy lists this node (card 36).
-    let directory = if state.directories().contains(&node.node_id()) {
+    // The directory, when the policy lists this node, or, holding none, its
+    // network string does (card 36): it starts empty and takes the first
+    // publish.
+    let directory = if crate::directory::serve::listed(&ks, root, node.node_id())? {
         let dir = crate::directory::node::Directory::open(
             node.duplicate(),
-            membership_fabric(&host),
+            root,
             Arc::clone(&ks),
             crate::directory::node::DEFAULT_MAX_SUBSCRIBERS,
             crate::clock::now_unix(),
@@ -177,6 +162,25 @@ pub(crate) async fn serve_until(
         tracing::info!(version = dir.version().0, "this host is also a directory");
         Some(dir)
     } else {
+        // A host assigned a service while it was offline, or one holding no
+        // policy yet: fetch, then try again.
+        let state = match (host.preflight(crate::clock::now_unix()), &binding) {
+            (Ok(state), _) => state,
+            (Err(e), Binding::N0 { relay_url, .. }) => {
+                match crate::policy::fetch::fetch_now(&ks, &node, relay_url.as_deref()).await {
+                    Ok(Some(_)) => host.preflight(crate::clock::now_unix())?,
+                    _ => return Err(no_policy(e)),
+                }
+            }
+            #[cfg(test)]
+            (Err(e), Binding::Endpoint(_)) => return Err(e),
+        };
+        tracing::info!(
+            policy_version = state.version().0,
+            services = host.config.services.len(),
+            native = host.native.len(),
+            "signed policy assigns every service to this host"
+        );
         None
     };
     // The push service's queue, made before the host is shared so native
@@ -229,7 +233,6 @@ pub(crate) async fn serve_until(
             endpoint: endpoint.clone(),
             ks: Arc::clone(&ks),
             root: host.trust_root,
-            badge: host.membership.clone(),
             freshness: Arc::clone(&host.freshness),
             runs_directory: directory.is_some(),
             stats: Default::default(),
@@ -244,9 +247,21 @@ pub(crate) async fn serve_until(
             Arc::clone(&host.freshness),
         ));
     }
-    let running = directory.map(|dir| {
-        crate::directory::serve::Running::start(dir, endpoint.clone(), host.membership.clone())
-    });
+    let running = directory
+        .as_ref()
+        .map(|dir| crate::directory::serve::Running::start(Arc::clone(dir), endpoint.clone()));
+    // A host that is its own directory decides nothing until a policy that
+    // assigns its services arrives (the first publish, on a new network).
+    let shutdown = async {
+        let mut shutdown = std::pin::pin!(shutdown);
+        if let Some(dir) = &directory {
+            tokio::select! {
+                () = await_assigned(&host, dir) => {}
+                r = &mut shutdown => return r,
+            }
+        }
+        shutdown.await
+    };
     let ended = match push.zip(push_queue) {
         Some((push, (commands_tx, commands))) => {
             match push_sockets(&ks.path(""), &host, commands_tx).await {
@@ -286,9 +301,56 @@ pub(crate) async fn serve_until(
 /// The file whose presence marks an admin keystore.
 const ROOT_SEED: &str = "root.seed";
 
-/// The fabric `host` decides for.
-fn membership_fabric(host: &gate::ServicesHost) -> NodeId {
-    host.trust_root
+/// Why a host that runs no directory could not start: its preflight `e`,
+/// after a fetch that brought no usable policy.
+fn no_policy(e: anyhow::Error) -> anyhow::Error {
+    e.context(
+        "no usable signed policy: is a directory running, has the admin published (`wires \
+         policy push`), and does the policy assign this host its services (`wires service add \
+         … --host`)?",
+    )
+}
+
+/// Wait until `host`'s preflight passes: a fresh policy assigning it every
+/// service, which its own directory `dir` takes from a publish. Traces what
+/// it waits for once per version.
+async fn await_assigned(host: &gate::ServicesHost, dir: &crate::directory::node::Directory) {
+    let mut changes = dir.watch();
+    let mut said = None;
+    loop {
+        match host.preflight(crate::clock::now_unix()) {
+            Ok(state) => {
+                tracing::info!(
+                    policy_version = state.version().0,
+                    services = host.config.services.len(),
+                    native = host.native.len(),
+                    "signed policy assigns every service to this host"
+                );
+                return;
+            }
+            Err(e) => {
+                let version = dir.version();
+                if said != Some(version) {
+                    if version.0 == 0 {
+                        tracing::info!(
+                            "waiting for the admin's first publish (`wires policy push`): this \
+                             directory holds no policy yet"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "the policy this directory holds (version {}) doesn't let this host \
+                             serve yet ({e:#}); waiting for a newer one",
+                            version.0
+                        );
+                    }
+                    said = Some(version);
+                }
+            }
+        }
+        if changes.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
 }
 
 /// A host for `me`: its identity verifier
@@ -302,16 +364,16 @@ fn membership_fabric(host: &gate::ServicesHost) -> NodeId {
 /// Refuses an admin keystore (one holding `root.seed`): a host runs service
 /// children, and the network's root key must not sit beside them.
 pub(crate) fn services_host(
-    me: NodeId,
-    membership: library::Membership,
+    me: library::NodeId,
+    root: library::NodeId,
     keystore: Arc<keystore::Keystore>,
     config: HostConfig,
 ) -> anyhow::Result<gate::ServicesHost> {
     if keystore.path(ROOT_SEED).exists() {
         anyhow::bail!(
             "{} holds the admin key ({ROOT_SEED}); a host runs services and must not share a \
-             keystore with the network's root (the admin). Run `wires serve` from the host's own keystore \
-             (WIRES_HOME=<another dir> wires id, invite that node, join it there)",
+             keystore with the network's root (the admin). Run `wires serve` from the host's \
+             own keystore (WIRES_HOME=<another dir> wires join <network>)",
             keystore.path("").display()
         );
     }
@@ -324,7 +386,7 @@ pub(crate) fn services_host(
     ));
     // The freshness it last held, if it still vouches for the policy on
     // disk: a restarted host knows how recently its copy was vouched for.
-    let head = crate::policy::store::read(&keystore, membership.fabric)
+    let head = crate::policy::store::read(&keystore, root)
         .ok()
         .flatten()
         .map(|h| h.signed.head);
@@ -341,8 +403,7 @@ pub(crate) fn services_host(
     };
     Ok(gate::ServicesHost {
         me,
-        trust_root: membership.fabric,
-        membership,
+        trust_root: root,
         keystore,
         config,
         native: Default::default(),
@@ -437,7 +498,7 @@ mod tests {
         .unwrap();
         let host = services_host(
             me,
-            library::Membership::mint(&root, me, 0, i64::MAX).unwrap(),
+            root.node_id(),
             Arc::new(keystore::Keystore::at(home)),
             config,
         )?;
@@ -524,7 +585,6 @@ mod tests {
         assert!(host.check_vouched(&lenient, 100).is_ok());
         let refused = host.check_vouched(&strict, 100).unwrap_err();
         assert_eq!(refused.to_string(), freshness::STALE);
-        assert!(!refused.needs_identity());
         let fresh = library::Fresh::sign(&dir, &strict.signed.head, 100, 200).unwrap();
         host.freshness
             .offer(&fresh, &strict.signed.head, 100)

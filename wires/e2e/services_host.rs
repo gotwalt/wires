@@ -32,7 +32,7 @@ use iroh::EndpointAddr;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::Router;
 use library::{
-    Hello, Membership, NodeId, NodeIdentity, OidcNonce, PushBody, RoleName, Service, SignedPolicy,
+    Hello, NodeId, NodeIdentity, OidcNonce, PushBody, RoleName, Service, SignedPolicy,
     StateVersion, Subject,
 };
 use tokio::time::timeout;
@@ -44,6 +44,7 @@ use super::{
 use crate::admin::keystore::Keystore;
 use crate::caller::inbox::{Fetched, InboxReceiver, Mailbox, fetch_from};
 use crate::caller::mock_idp::MockIdp;
+use crate::help;
 use crate::host::config::HostConfig;
 use crate::host::push::{PushHost, PushSpec};
 use crate::host::serve::{services_host, services_router};
@@ -89,7 +90,7 @@ impl World {
     fn state(&self, version: u64, banned: &[NodeId]) -> SignedPolicy {
         signed_state(&self.root, version, |s| {
             for b in banned {
-                s.ban(*b, i64::MAX);
+                s.ban(*b);
             }
             s.roles.insert(
                 role("analyst"),
@@ -151,12 +152,8 @@ impl World {
         )
     }
 
-    fn membership(&self, who: &NodeIdentity) -> Membership {
-        super::membership(&self.root, who)
-    }
-
-    /// `who`'s `Hello`: its badge, the policy version it holds, and a
-    /// fresh token from its own IdP when `logged_in`.
+    /// `who`'s `Hello`: the policy version it holds, and a fresh token from
+    /// its own IdP when `logged_in` (else one that doesn't verify).
     fn hello(&self, who: &NodeIdentity, version: u64, logged_in: bool) -> Hello {
         let idp = if who.node_id() == self.alice.node_id() {
             &self.idp_alice
@@ -165,7 +162,7 @@ impl World {
         } else {
             &self.idp_carol
         };
-        super::hello(&self.root, who, version, logged_in.then_some(idp))
+        super::hello(who, version, logged_in.then_some(idp))
     }
 }
 
@@ -188,7 +185,7 @@ impl Host {
         adopt(&keystore, &w.root, state);
         let host = services_host(
             w.host.node_id(),
-            w.membership(&w.host),
+            w.root.node_id(),
             Arc::clone(&keystore),
             config,
         )?;
@@ -263,7 +260,7 @@ async fn the_registry_decides_who_runs_what() {
         "bob@example.com is in no role allowed to call orders-db (analyst)"
     );
 
-    // alice without a token: told why she has no identity, and what to do.
+    // alice with no sign-in: not admitted at all, and told to sign in.
     let out = call(
         &w.alice,
         &host,
@@ -272,32 +269,22 @@ async fn the_registry_decides_who_runs_what() {
         &[],
     )
     .await;
-    assert!(
-        out.denied().starts_with("no ID token presented; run `wires login`; orders-db needs a verified identity in role analyst"),
-        "{}",
-        out.denied()
-    );
+    assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
+    assert!(help::has_next_step(out.denied()));
 
-    // No role admits a member without a verified identity, not even
-    // "anyone signed in"; with one, the role reaches the service's env.
+    // No sign-in, no call, not even of a service for "anyone signed in";
+    // with one, the role reaches the service's env.
     let out = call(&w.bob, &host, w.hello(&w.bob, 1, false), "status", &[]).await;
-    assert!(
-        out.denied()
-            .starts_with("no ID token presented; run `wires login`"),
-        "{}",
-        out.denied()
-    );
+    assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
     let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "status", &[]).await;
     assert_eq!(out.stdout(), "up as staff");
 
-    // A name the registry doesn't know, and a stranger (another network's
-    // badge).
+    // A name the registry doesn't know; a stranger presenting bob's token
+    // (bound to bob's key, not its own).
     let out = call(&w.alice, &host, w.hello(&w.alice, 1, true), "nope", &[]).await;
     assert_eq!(out.denied(), "unknown service: nope");
     let stranger = NodeIdentity::from_seed([66u8; 32]);
-    let mut hello = w.hello(&stranger, 1, false);
-    hello.membership = super::membership(&NodeIdentity::from_seed([67u8; 32]), &stranger);
-    let out = call(&stranger, &host, hello, "status", &[]).await;
+    let out = call(&stranger, &host, w.hello(&w.bob, 1, true), "status", &[]).await;
     assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
 }
 
@@ -310,10 +297,10 @@ async fn a_trusted_issuer_cannot_vouch_for_another_issuers_people() {
     // The partner IdP verifies alice@example.com, and the host trusts it,
     // but every role names alice's own IdP (or others): nothing admits her.
     let partner_hello = Hello {
-        id_token: Some(w.idp_partner.mint(
+        id_token: w.idp_partner.mint(
             &OidcNonce::for_node(&w.alice.node_id()),
             crate::clock::now_unix() + 3600,
-        )),
+        ),
         ..w.hello(&w.alice, 1, false)
     };
     for svc in ["orders-db", "status"] {
@@ -396,7 +383,7 @@ async fn an_unassigned_service_refuses_to_start() {
     let home = crate::testutil::temp_dir();
     let host = services_host(
         w.host.node_id(),
-        w.membership(&w.host),
+        w.root.node_id(),
         Arc::new(Keystore::at(home.clone())),
         w.host_json(SERVICES, false),
     )
@@ -424,8 +411,8 @@ async fn a_removed_member_is_refused_on_the_next_call() {
     .await;
     assert_eq!(out.stdout(), "rows: 1\n");
 
-    // `wires remove alice`: version 2, banning her, reaches the host; no
-    // restart. Her badge is still genuine and unexpired.
+    // `wires remove <alice's node>`: version 2, banning it, reaches the
+    // host; no restart. Her token is still genuine and unexpired.
     let v2 = w.state(2, &[w.alice.node_id()]);
     host.adopt(&w, &v2);
     // She still presents version 1 (and a valid token): the host's copy decides.
@@ -461,6 +448,52 @@ async fn a_removed_member_is_refused_on_the_next_call() {
     assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
 }
 
+/// `wires remove alice@example.com`: a person ban refuses her on every
+/// machine she signs in from, leaves everyone else alone, and `wires
+/// restore` lets her back.
+#[tokio::test]
+async fn a_removed_person_is_refused_from_any_machine_until_restored() {
+    let w = World::new().await;
+    let host = Host::start(&w, w.host_json(SERVICES, false), &w.state(1, &[]))
+        .await
+        .unwrap();
+    let laptop = &w.alice;
+    let desktop = NodeIdentity::from_seed([5u8; 32]);
+    let alice_on =
+        |node: &NodeIdentity, version: u64| super::hello(node, version, Some(&w.idp_alice));
+    let ran = call(laptop, &host, alice_on(laptop, 1), "orders-db", &["1"]).await;
+    assert_eq!(ran.stdout(), "rows: 1\n");
+    let ran = call(&desktop, &host, alice_on(&desktop, 1), "orders-db", &["2"]).await;
+    assert_eq!(ran.stdout(), "rows: 2\n");
+
+    let mut v2 = w.state(2, &[]).to_policy().unwrap();
+    v2.ban_person(library::Person::new(
+        library::Issuer::new(w.idp_alice.issuer.as_str()),
+        "alice@example.com",
+    ));
+    let v2 = crate::testutil::signed_policy(&w.root, v2);
+    host.adopt(&w, &v2);
+    for node in [laptop, &desktop] {
+        let out = call(node, &host, alice_on(node, 2), "orders-db", &[]).await;
+        assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
+    }
+    // carol, an analyst too, is unaffected.
+    let out = call(
+        &w.carol,
+        &host,
+        w.hello(&w.carol, 2, true),
+        "orders-db",
+        &["3"],
+    )
+    .await;
+    assert_eq!(out.stdout(), "rows: 3\n");
+
+    // Restored: version 3 holds no ban.
+    host.adopt(&w, &w.state(3, &[]));
+    let out = call(&desktop, &host, alice_on(&desktop, 3), "orders-db", &["4"]).await;
+    assert_eq!(out.stdout(), "rows: 4\n");
+}
+
 #[tokio::test]
 async fn push_follows_the_signed_state() {
     let w = World::new().await;
@@ -492,11 +525,17 @@ async fn push_follows_the_signed_state() {
     let report = push.send(spec(&w.bob)).await.unwrap();
     assert!(!report.any_accepted(), "{}", report.render());
 
+    let token = |who: &NodeIdentity| Some(w.hello(who, 1, true).id_token);
+    // A fetch with no token is not admitted, whoever it is.
+    let Fetched::Refused(why) = fetch(&w, &w.alice, &host, None).await else {
+        panic!("a fetch without a sign-in");
+    };
+    assert!(why.contains(crate::host::gate::NOT_ADMITTED), "{why}");
     assert!(matches!(
-        fetch(&w, &w.alice, &host, None).await,
+        fetch(&w, &w.alice, &host, token(&w.alice)).await,
         Fetched::Messages(1)
     ));
-    let Fetched::Refused(why) = fetch(&w, &w.bob, &host, None).await else {
+    let Fetched::Refused(why) = fetch(&w, &w.bob, &host, token(&w.bob)).await else {
         panic!("bob may not fetch");
     };
     assert!(why.contains("no role allowed to receive pushes"), "{why}");
@@ -504,7 +543,7 @@ async fn push_follows_the_signed_state() {
     // Banned by the policy: her queue is dropped and her fetch refused.
     push.send(spec(&w.alice)).await.unwrap();
     host.adopt(&w, &w.state(2, &[w.alice.node_id()]));
-    let Fetched::Refused(why) = fetch(&w, &w.alice, &host, None).await else {
+    let Fetched::Refused(why) = fetch(&w, &w.alice, &host, token(&w.alice)).await else {
         panic!("a removed member may not fetch");
     };
     assert!(why.contains(crate::host::gate::NOT_ADMITTED), "{why}");
@@ -519,10 +558,8 @@ async fn fetch(
 ) -> Fetched {
     let endpoint = bind(who).await;
     let mailbox = Mailbox::open(&crate::testutil::temp_dir()).unwrap();
-    let hello = library::InboxFrame::Hello {
-        membership: w.membership(who),
-        id_token,
-    };
+    let _ = w;
+    let hello = library::InboxFrame::Hello { id_token };
     let fetched = timeout(
         PATIENCE,
         fetch_from(
@@ -566,7 +603,7 @@ async fn a_fetch_with_a_token_makes_a_caller_reachable_by_role() {
     assert!(push.send(to_staff).await.is_err());
 
     // Her `wires inbox` presents her token: now the host knows who she is.
-    let token = w.hello(&w.carol, 1, true).id_token;
+    let token = Some(w.hello(&w.carol, 1, true).id_token);
     assert!(matches!(
         fetch(&w, &w.carol, &host, token).await,
         Fetched::Messages(0)

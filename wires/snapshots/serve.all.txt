@@ -14,10 +14,6 @@ Options:
           Read the node key seed (hex) from this file instead of the keystore
       --relay-url <RELAY_URL>
           Use a self-hosted relay at this URL instead of the n0 default
-      --membership <MEMBERSHIP>
-          The host's own membership token (its badge), instead of the keystore's
-      --membership-file <MEMBERSHIP_FILE>
-          Read the host's membership token from this file
   -h, --help
           Print help
       --help-all

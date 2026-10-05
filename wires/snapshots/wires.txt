@@ -10,9 +10,7 @@ Usage: wires <COMMAND>
 
   services  List the services you may call (a word searches them; --json)
   call      Run a service by name; its output and exit code are yours
-  login     Sign in with your IdP; every call needs it
-  join      Install the invite token your admin sent
-  id        Print this node's id, to send your admin for an invite
+  login     Sign in with your IdP (the first time: login <network>)
   inbox     Print the messages hosts pushed to you
   mcp       Serve the services you may call as MCP tools over stdio
 

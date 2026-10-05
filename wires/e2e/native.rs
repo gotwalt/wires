@@ -27,8 +27,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use iroh::{Endpoint, EndpointAddr};
 use library::{
-    Hello, Invocation, Matcher, Membership, NodeIdentity, OidcNonce, Policy, RoleName,
-    Service as Registered, ServiceName, SignedPolicy, StateVersion,
+    Hello, Invocation, Matcher, NodeIdentity, OidcNonce, Policy, RoleName, Service as Registered,
+    ServiceName, SignedPolicy, StateVersion,
 };
 use tokio::sync::oneshot;
 
@@ -104,13 +104,13 @@ impl World {
         crate::testutil::signed_policy(&self.root, s)
     }
 
-    /// The host's keystore, as `wires id` + `wires join` leave it: its node
-    /// key, its badge, and the policy `state`.
+    /// The host's keystore, as `wires join` and a first fetch leave it: its
+    /// node key, the network string, and the policy `state`.
     fn keystore(&self, state: &SignedPolicy) -> std::path::PathBuf {
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);
         ks.save_node(&self.host).unwrap();
-        ks.save_membership(&self.membership(&self.host)).unwrap();
+        crate::testutil::join(&ks, &self.root, &[]);
         crate::policy::store::adopt_if_newer(
             &ks,
             state,
@@ -119,10 +119,6 @@ impl World {
         )
         .unwrap();
         home
-    }
-
-    fn membership(&self, who: &NodeIdentity) -> Membership {
-        Membership::mint(&self.root, who.node_id(), 0, i64::MAX).unwrap()
     }
 
     /// A builder for the host on `home`, trusting both IdPs.
@@ -140,12 +136,11 @@ impl World {
             &self.idp_bob
         };
         Hello {
-            membership: self.membership(who),
             state_version: StateVersion(1),
-            id_token: Some(idp.mint(
+            id_token: idp.mint(
                 &OidcNonce::for_node(&who.node_id()),
                 crate::clock::now_unix() + 3600,
-            )),
+            ),
         }
     }
 }
@@ -315,7 +310,7 @@ async fn a_native_service_is_called_like_a_cli() {
     // `call.principal()` what it verified as (`whoami` echoes the token
     // without its signature).
     let hello = w.hello(&w.alice);
-    let token = hello.id_token.clone().unwrap();
+    let token = hello.id_token.clone();
     let (unsigned, _) = token.as_str().rsplit_once('.').unwrap();
     assert_eq!(
         call_with(&host, &w.alice, &hello, "kv", &["whoami"], "").await,

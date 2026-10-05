@@ -7,7 +7,7 @@ Arguments:
   <MATCHERS>...  `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…`
 
 Options:
-      --issuer <ISSUER>  The IdP a matcher trusts when it names none: its exact `iss` [default: https://accounts.google.com]
+      --issuer <ISSUER>  The IdP a matcher trusts when it names none: its exact `iss` (default: the one the network string names)
   -h, --help             Print help
       --help-all         Also list the operator and credential flags
 

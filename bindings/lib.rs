@@ -278,7 +278,7 @@ impl HostBuilder {
 #[uniffi::export]
 impl HostBuilder {
     /// Start building a host whose keystore is `home` (a node joined with
-    /// `WIRES_HOME=<home> wires id` and `wires join`).
+    /// `WIRES_HOME=<home> wires join <network>`).
     #[uniffi::constructor]
     pub fn new(home: String) -> Arc<Self> {
         Arc::new(Self {
@@ -483,7 +483,7 @@ mod tests {
             .err()
             .expect("an empty keystore can't build")
             .to_string();
-        assert!(e.contains("wires id"), "{e}");
+        assert!(e.contains("wires join <network>"), "{e}");
         let again = b.build().err().expect("a builder builds once").to_string();
         assert_eq!(again, "this builder was already built");
     }

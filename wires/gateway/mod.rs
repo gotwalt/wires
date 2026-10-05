@@ -209,7 +209,7 @@ impl Keystored {
         let token = session.id_token.clone();
         let (rx, task) = view::follow(view::Follow {
             endpoint: self.endpoint.clone(),
-            badge: self.creds.membership().clone(),
+            root: self.creds.fabric(),
             id_token: Arc::new(move || Some(token.clone())),
             initial: None,
             fallback: self.directories.clone(),
@@ -559,7 +559,8 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
     })?;
     let node = creds.node_id();
     // Where web users' views come from: the directories this node knows
-    // (its own view's head, else its invite's, else its whole policy's).
+    // (its own view's head, else its network string's, else its whole
+    // policy's).
     let mut directories = view::directories(&ks, creds.fabric(), node);
     if directories.is_empty()
         && let Some(held) = crate::policy::store::read(&ks, creds.fabric())?
@@ -573,8 +574,9 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
     }
     if directories.is_empty() {
         bail!(
-            "this node knows no directory to ask for its users' views: join with an invite from \
-             an admin whose policy names one (`wires directory add`)"
+            "this node knows no directory to ask for its users' views: `wires join <network>` \
+             with a string that names one (the admin's `wires directory add`, then `wires \
+             network`)"
         );
     }
     let backend = Keystored {
@@ -649,7 +651,7 @@ pub(crate) mod tests {
         let mut s = Policy::new(node(1));
         s.version = StateVersion(1);
         s.not_after = i64::MAX;
-        s.ban(node(9), i64::MAX);
+        s.ban(node(9));
         s.roles.insert(
             RoleName::new("analyst").unwrap(),
             ["alice@example.com", "bob@example.com"]
@@ -697,7 +699,11 @@ pub(crate) mod tests {
     #[test]
     fn a_web_user_gets_the_services_whose_roles_match_them() {
         let names = |email: &str| -> Vec<String> {
-            let view = signed_for(library::GOOGLE_ISSUER).view_for(Some(&principal(email)), None);
+            let view = signed_for(library::GOOGLE_ISSUER).view_for(
+                crate::testutil::any_node(),
+                Some(&principal(email)),
+                None,
+            );
             with_services(ToolsConfig::default(), &view)
                 .tools
                 .iter()

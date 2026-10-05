@@ -880,7 +880,7 @@ pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
     let token_ks = Arc::clone(&ks);
     let (mut views, follower) = crate::caller::view::follow(crate::caller::view::Follow {
         endpoint: endpoint.clone(),
-        badge: creds.membership().clone(),
+        root: creds.fabric(),
         id_token: Arc::new(move || crate::caller::hello::stored_token(&token_ks)),
         initial: held,
         fallback: crate::caller::view::joined_directories(&ks),
@@ -1447,7 +1447,11 @@ mod tests {
             groups: vec![],
             not_after: i64::MAX,
         };
-        crate::testutil::signed_policy(&root, state).view_for(Some(&anyone), None)
+        crate::testutil::signed_policy(&root, state).view_for(
+            crate::testutil::any_node(),
+            Some(&anyone),
+            None,
+        )
     }
 
     /// Card 28 §8: a service in the view beats an alias of the same name,

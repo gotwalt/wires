@@ -1,8 +1,6 @@
-wires: denied by host: not a member of this network; don't retry: ask your admin for access [exit 77]
+wires: denied by host: not admitted to this network; sign in with `wires login` [exit 77]
 
 wires: denied by host: carol@partner.example is in no role allowed to call orders-db (analyst); don't retry: ask your admin for access [exit 77]
-
-wires: denied by host: orders-db needs a verified identity in role analyst; run `wires login` [exit 77]
 
 wires: denied by host: unknown service: orders-db; see `wires services` [exit 77]
 
@@ -14,7 +12,7 @@ wires: denied by host: alice@example.com is not admitted to orders-db by this ho
 
 wires: denied by host: this host's policy is stale: no directory has vouched for it recently; try again later [exit 77]
 
-wires: denied by host: your ID token could not be verified; run `wires login` [exit 77]
+wires: denied by host: your sign-in has expired; run `wires login` [exit 77]
 
 wires: denied by host: the identity provider is unreachable from this host; try again later [exit 77]
 
@@ -22,7 +20,7 @@ wires: denied by host: host configuration error; try again later, or tell the ho
 
 wires: no service named `orders-db` that you may call; see `wires services` [exit 1]
 
-wires: no service named `orders-db` that you may call: this node is not signed in, and every service needs a verified identity; run `wires login` [exit 1]
+wires: not signed in: run `wires login` [exit 1]
 
 wires: --node-seed is not allowed in locked mode (set by the operator: WIRES_LOCKED=1 or "locked" in tools.json); drop it: only --jq, --head, --max-bytes, --verbose, the service name and its arguments are allowed [exit 2]
 
@@ -30,11 +28,11 @@ wires: $WIRES_NODE_SEED is not allowed in locked mode (set by the operator: WIRE
 
 wires: stdin is not forwarded in locked mode (it can carry local files to the host; the operator can set WIRES_LOCKED_STDIN=allow); pass the input as arguments instead [exit 2]
 
-wires: this node has not joined a network: run `wires id`, send the id to your admin, then `wires join <token>` with the token they send [exit 1]
+wires: this node has not joined a network: run `wires login <network>` (a caller) or `wires join <network>` (a host or directory) with the string your admin prints with `wires network` [exit 1]
 
-wires: no node key at /home/me/.wires/node.seed: run `wires id`, send the id to your admin, then `wires join <token>` with the token they send [exit 1]
+wires: no node key at /home/me/.wires/node.seed: run `wires id` (it makes one), or `wires join <network>` [exit 1]
 
-wires: the invite token does not decode; paste it whole, or ask your admin to send it again [exit 1]
+wires: the network string does not decode; paste it whole (`wires network` on the admin prints it) [exit 1]
 
 wires is a network for authenticated remote CLI calls. Each service is a
 command-line program on another machine, run by its name, never by host or

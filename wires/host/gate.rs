@@ -1,12 +1,14 @@
 //! The call gate: what a host checks on every [`Hello`](library::Hello) + [`Invoke`](library::Frame::Invoke),
 //! in order, the first failure being the refusal the caller hears:
 //!
-//! 1. the caller is admitted: its badge (root-signed membership) verifies
-//!    and names it, and the host's signed policy doesn't ban it (removal is
-//!    a ban; no restart needed, because the policy is re-read per
-//!    connection). Anyone else hears only [`NOT_ADMITTED`], and — checked
-//!    first by [`ServicesHost::check_member`], before its ID token is even
-//!    looked at — is traced, throttled;
+//! 1. the caller is admitted ([`ServicesHost::admit_caller`]): the ID token
+//!    in its `Hello` verifies under the policy's `issuer` items (as
+//!    `host.json` narrows them), is unexpired and nonce-bound to the
+//!    iroh-authenticated caller, and the host's signed policy bans neither
+//!    the node nor the person (removal is a ban; no restart needed, because
+//!    the policy is re-read per connection). Anyone else hears only
+//!    [`NOT_ADMITTED`] (or [`SIGN_IN_EXPIRED`], [`IDP_UNREACHABLE`]) and is
+//!    traced, throttled;
 //! 2. the policy is fresh (its head's `not_after`) and, under the signed
 //!    `settings.freshness: strict`, vouched for by a current `Fresh` from a
 //!    directory ([`freshness`](super::freshness); `lenient`, the default,
@@ -17,17 +19,15 @@
 //! 5. the host's own `also_require` roles (`host.json`), which can only
 //!    narrow: the caller must be in **every** one of them.
 //!
-//! An identified caller's refusal is also its log line
-//! ([`call_trace`](crate::host::call_trace)). The
-//! caller's principal is verified after the badge check and before [`admit`]
-//! runs (the ID token from the `Hello`, nonce-bound to the iroh-authenticated
-//! caller, under the policy's `issuer` items as `host.json` narrows them:
-//! [`ServicesHost::principal`]),
-//! so [`admit`] is pure and clock-free except for `now`.
+//! An admitted caller's refusal is also its log line
+//! ([`call_trace`](crate::host::call_trace)). The caller's principal is
+//! verified in step 1, before [`admit`] runs, so [`admit`] is pure and
+//! clock-free except for `now`.
 //!
-//! [`ServicesHost`] is everything a host decides with: its own
-//! credentials, where its signed policy lives (re-read per connection), its
-//! `host.json` and the identity verifier. The session
+//! [`ServicesHost`] is everything a host decides with: its node id, where
+//! its signed policy lives (re-read per connection), its `host.json` and the
+//! identity verifier. It holds no credential of its own: a caller trusts it
+//! because the service's root-signed entry names its key. The session
 //! transport ([`ServicesProtocol`](crate::host::transport::ServicesProtocol))
 //! and the push service ([`push`](crate::host::push)) both ask it.
 
@@ -36,8 +36,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use library::{
-    FreshnessMode, IdToken, Membership, NodeId, Principal, Refusal, RoleName, ServiceName,
-    StateVersion, authorize, role_admits,
+    FreshnessMode, IdToken, NodeId, Principal, Refusal, RoleName, ServiceName, StateVersion,
+    authorize, role_admits,
 };
 
 use crate::admin::keystore::Keystore;
@@ -49,18 +49,17 @@ use crate::host::transport::Throttle;
 use crate::policy::store::Held;
 
 /// The one refusal a peer that is not admitted hears, whatever the reason
-/// (no badge, someone else's, another network's, expired, banned). It says
-/// nothing about the policy, its version or who is in it; the exact reason
-/// goes only to the host's trace.
-pub(crate) const NOT_ADMITTED: &str = "not a member of this network";
+/// (no ID token, a malformed one, an untrusted issuer, another audience,
+/// another key's, a banned node or person). It says nothing about the
+/// policy, its version or who is in it; the exact reason goes only to the
+/// host's trace.
+pub(crate) const NOT_ADMITTED: &str = "not admitted to this network; sign in with `wires login`";
 
-/// What an admitted caller hears when the ID token it presented did not verify
-/// (untrusted issuer, bad signature, wrong audience or nonce). The exact
-/// reason goes only to the host's trace.
-pub(crate) const TOKEN_UNVERIFIED: &str = "your ID token could not be verified; run `wires login`";
+/// What a caller hears when its ID token verified but has expired: it is
+/// who it says, and signing in again is the whole remedy.
+pub(crate) const SIGN_IN_EXPIRED: &str = "your sign-in has expired; run `wires login`";
 
-/// What an admitted caller hears when this host could not fetch its
-/// issuer's keys.
+/// What a caller hears when this host could not fetch its issuer's keys.
 /// The exact failure goes only to the host's trace.
 pub(crate) const IDP_UNREACHABLE: &str =
     "the identity provider is unreachable from this host; try again later";
@@ -78,7 +77,8 @@ static LAPSES: Throttle = Throttle::new();
 /// reason traced and reported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PushRefusal {
-    /// Banned by the current signed policy: what is queued for it goes.
+    /// Its node, or the person it verified as here, is banned by the current
+    /// signed policy: what is queued for it goes.
     NotAdmitted(String),
     /// A node the push rule refuses, or a host that can't decide now.
     Refused(String),
@@ -100,8 +100,8 @@ pub(crate) struct Admitted {
     pub(crate) role: RoleName,
     /// The policy version the decision was made under.
     pub(crate) state_version: StateVersion,
-    /// Who the caller verified as, and the token that says so: every role
-    /// needs a verified identity, so every admitted call has one.
+    /// Who the caller verified as, and the token that says so: admission is
+    /// that verification.
     pub(crate) caller: Verified,
 }
 
@@ -143,29 +143,9 @@ pub(crate) enum GateRefusal {
         service: ServiceName,
         /// Every role this host requires on top of the registry.
         roles: Vec<RoleName>,
-        /// Who the caller verified as, if anyone.
-        principal: Option<String>,
+        /// Who the caller verified as.
+        principal: String,
     },
-}
-
-impl GateRefusal {
-    /// Whether presenting a verified identity could change the answer (so a
-    /// refusal of a caller with none should say why it has none).
-    pub(crate) fn needs_identity(&self) -> bool {
-        matches!(
-            self,
-            GateRefusal::Registry {
-                refusal: Refusal::NotInRole {
-                    principal: None,
-                    ..
-                },
-                ..
-            } | GateRefusal::AlsoRequire {
-                principal: None,
-                ..
-            }
-        )
-    }
 }
 
 impl fmt::Display for GateRefusal {
@@ -191,44 +171,34 @@ impl fmt::Display for GateRefusal {
             // The roles are this host's own (`host.json`); they stay in its
             // trace, not in what the caller hears.
             GateRefusal::AlsoRequire {
-                service,
-                principal: Some(who),
-                ..
+                service, principal, ..
             } => write!(
                 f,
-                "{who} is not admitted to {service} by this host's own rules"
-            ),
-            GateRefusal::AlsoRequire {
-                service,
-                principal: None,
-                ..
-            } => write!(
-                f,
-                "{service} on this host also needs a verified identity; run `wires login`"
+                "{principal} is not admitted to {service} by this host's own rules"
             ),
         }
     }
 }
 
-/// Run the checks in the module docs. `me` is this host; `verified` is
-/// the caller's ID token and principal, when its token verified.
+/// Run checks 2–5 in the module docs. `me` is this host; `verified` is the
+/// caller's ID token and the principal admission verified from it.
 pub(crate) fn admit(
     state: &Held,
     config: &HostConfig,
     me: NodeId,
     caller: NodeId,
-    verified: Option<&Verified>,
+    verified: &Verified,
     service: &ServiceName,
     now: i64,
 ) -> Result<Admitted, GateRefusal> {
-    let principal = verified.map(|v| &v.principal);
+    let principal = Some(&verified.principal);
     let version = state.version();
     let s = &state.policy;
     let registry = |refusal| GateRefusal::Registry { refusal, version };
-    // The ban before anything a banned node could learn from (the policy's
-    // freshness and version). Its badge was checked before this
-    // ([`ServicesHost::check_member`]).
-    if s.bans_node(caller) {
+    // The bans again before anything a banned caller could learn from (the
+    // policy's freshness and version); admission checked them first
+    // ([`ServicesHost::admit_caller`]).
+    if library::check_admitted(s, caller, &verified.principal).is_err() {
         return Err(registry(Refusal::Banned));
     }
     state.check_fresh(now).map_err(|e| GateRefusal::Stale {
@@ -245,18 +215,6 @@ pub(crate) fn admit(
         });
     }
     let role = authorize(s, caller, principal, service).map_err(registry)?;
-    // A role matched, and no role matches without a verified principal, so
-    // there is one; the type says so from here on.
-    let Some(verified) = verified else {
-        return Err(registry(Refusal::NotInRole {
-            service: service.clone(),
-            allow: s
-                .service(service)
-                .map(|x| x.allow.clone())
-                .unwrap_or_default(),
-            principal: None,
-        }));
-    };
     let also = config
         .services
         .get(service)
@@ -266,7 +224,7 @@ pub(crate) fn admit(
         return Err(GateRefusal::AlsoRequire {
             service: service.clone(),
             roles: also.to_vec(),
-            principal: principal.map(Principal::name),
+            principal: verified.principal.name(),
         });
     }
     Ok(Admitted {
@@ -290,10 +248,8 @@ pub(crate) enum Implementation<'a> {
 pub(crate) struct ServicesHost {
     /// This host.
     pub(crate) me: NodeId,
-    /// The network root whose signed policy and memberships are honored.
+    /// The network root whose signed policy is honored.
     pub(crate) trust_root: NodeId,
-    /// The host's own membership, presented in the `HelloAck`.
-    pub(crate) membership: Membership,
     /// Where the signed policy is read from, per connection (so a newer
     /// policy fetched from a directory, say one with a new ban, takes
     /// effect on the next dial).
@@ -343,8 +299,13 @@ impl ServicesHost {
     /// lower one until a policy at least that new is back on disk.
     pub(crate) fn policy(&self) -> Result<Held> {
         use std::sync::atomic::Ordering;
-        let state = crate::policy::store::read(&self.keystore, self.trust_root)?
-            .ok_or_else(|| anyhow!("this host holds no signed policy (run `wires join`)"))?;
+        let state =
+            crate::policy::store::read(&self.keystore, self.trust_root)?.ok_or_else(|| {
+                anyhow!(
+                    "this host holds no signed policy yet (the admin's next publish, or a \
+                     directory, gives it one)"
+                )
+            })?;
         let version = state.version().0;
         let seen = self.high_water.fetch_max(version, Ordering::SeqCst);
         if version < seen {
@@ -411,58 +372,48 @@ impl ServicesHost {
         }
     }
 
-    /// Whether `caller`, presenting badge `membership`, is admitted under
-    /// `state` ([`library::check_admitted`]): the badge is the network
-    /// root's for this very key and current at `now`, and the policy doesn't
-    /// ban the key. Checked before anything that costs this host (a token
-    /// verification, a JWKS fetch, a log line). `Err` is the exact
-    /// reason, for this host's trace only; the peer hears [`NOT_ADMITTED`].
-    pub(crate) fn check_member(
+    /// Admit `caller`, presenting `token` in its `Hello`, under `state`: the
+    /// token verifies (trusted issuer and audience under this policy as
+    /// `host.json` narrows it, signature, unexpired, nonce bound to
+    /// `caller`), and the policy bans neither the node nor the person
+    /// ([`library::check_admitted`]). `Err` is what the peer hears
+    /// ([`NOT_ADMITTED`], [`SIGN_IN_EXPIRED`] or [`IDP_UNREACHABLE`]) and the
+    /// exact reason, for this host's trace only.
+    pub(crate) async fn admit_caller(
         &self,
         state: &Held,
-        membership: &Membership,
         caller: NodeId,
+        token: &IdToken,
         now: i64,
-    ) -> std::result::Result<(), String> {
-        library::check_admitted(membership, self.trust_root, &state.policy, caller, now).map_err(
-            |e| match e {
-                library::Error::Banned { .. } => {
-                    format!("{e} by the signed policy (version {})", state.version().0)
-                }
-                e => format!("membership rejected: {e}"),
-            },
-        )
-    }
-
-    /// Verify the ID token `caller` presented (if any): its principal, or
-    /// `None` and why there is none (with the `wires login` remedy). Only
-    /// for a caller [`check_member`](Self::check_member) passed. Why a token
-    /// failed is traced (by [`Identities`]); the caller hears
-    /// [`TOKEN_UNVERIFIED`] or [`IDP_UNREACHABLE`].
-    pub(crate) async fn principal(
-        &self,
-        caller: NodeId,
-        token: Option<&IdToken>,
-        now: i64,
-    ) -> (Option<Principal>, Option<String>) {
-        let Some(token) = token else {
-            return (
-                None,
-                Some("no ID token presented; run `wires login`".to_string()),
-            );
+    ) -> std::result::Result<Verified, (&'static str, String)> {
+        let principal = match self.identities.verify_token(caller, token, now).await {
+            Ok(p) => p,
+            Err(VerifyError::Expired(p)) => {
+                return Err((
+                    SIGN_IN_EXPIRED,
+                    format!("the ID token for {} has expired", p.name()),
+                ));
+            }
+            Err(VerifyError::Unavailable(e)) => {
+                return Err((IDP_UNREACHABLE, format!("the IdP is unreachable: {e}")));
+            }
+            Err(e) => return Err((NOT_ADMITTED, format!("the ID token did not verify: {e}"))),
         };
-        match self.identities.verify_token(caller, token, now).await {
-            Ok(p) => (Some(p), None),
-            Err(VerifyError::Expired(p)) => (
-                None,
-                Some(format!(
-                    "the ID token for {} expired; run `wires login`",
-                    p.name()
-                )),
-            ),
-            Err(VerifyError::Unavailable(_)) => (None, Some(IDP_UNREACHABLE.to_string())),
-            Err(_) => (None, Some(TOKEN_UNVERIFIED.to_string())),
+        if library::check_admitted(&state.policy, caller, &principal).is_err() {
+            return Err((
+                NOT_ADMITTED,
+                format!(
+                    "{} on {}… is removed by the signed policy (version {})",
+                    principal.name(),
+                    caller.short(),
+                    state.version().0
+                ),
+            ));
         }
+        Ok(Verified {
+            token: token.clone(),
+            principal,
+        })
     }
 
     /// Whether this host may decide under `state` at `now` by the signed
@@ -507,15 +458,13 @@ impl ServicesHost {
         }
     }
 
-    /// [`admit`] under `state`, as the text the caller is sent: a refusal
-    /// that a verified identity could change leads with why there is none.
-    /// First the freshness rule ([`check_vouched`](Self::check_vouched)).
+    /// [`admit`] under `state`, as the text the caller is sent. First the
+    /// freshness rule ([`check_vouched`](Self::check_vouched)).
     pub(crate) fn decide(
         &self,
         state: &Held,
         caller: NodeId,
-        verified: Option<&Verified>,
-        missing: Option<&str>,
+        verified: &Verified,
         service: &ServiceName,
         now: i64,
     ) -> std::result::Result<Admitted, String> {
@@ -531,22 +480,15 @@ impl ServicesHost {
                     );
                 }
             })
-            .map_err(|r| match missing {
-                Some(why) if r.needs_identity() => {
-                    // Both say "run `wires login`"; say it once.
-                    let r = r.to_string();
-                    let r = r.strip_suffix("; run `wires login`").unwrap_or(&r);
-                    format!("{why}; {r}")
-                }
-                _ => r.to_string(),
-            })
+            .map_err(|r| r.to_string())
     }
 
-    /// Whether `node` may receive pushes from this host at `now`: not banned
-    /// by the current signed policy, and in the first `push.allow` role that
-    /// admits it (with the principal it last verified as here). A node only
-    /// has a principal here after it passed the gate (badge and bans) with
-    /// an ID token, so a node that never presented a badge is in no role.
+    /// Whether `node` may receive pushes from this host at `now`: neither it
+    /// nor the person it last verified as here is banned by the current
+    /// signed policy, and it is in the first `push.allow` role that admits
+    /// it (with that principal). A node only has a principal here after it
+    /// presented a token that verified (on a call or a fetch), so a node
+    /// that never did is in no role.
     pub(crate) fn decide_push(
         &self,
         node: NodeId,
@@ -562,11 +504,14 @@ impl ServicesHost {
                 state.version().0
             )));
         }
-        if let Some(ban) = state.policy.bans.get(&node) {
+        let principal = self.identities.current(node, now);
+        let person_banned = principal
+            .as_ref()
+            .is_some_and(|p| state.policy.bans_person(p));
+        if state.policy.bans_node(node) || person_banned {
             return Err(PushRefusal::NotAdmitted(format!(
-                "{} is banned until {} by the current signed policy (version {})",
+                "{} is removed by the current signed policy (version {})",
                 node.short(),
-                ban.until,
                 state.version().0
             )));
         }
@@ -581,7 +526,6 @@ impl ServicesHost {
                 "this host's host.json `push.allow` is empty: it pushes to no one".to_string(),
             ));
         }
-        let principal = self.identities.current(node, now);
         if let Some(role) = allow
             .iter()
             .find(|r| role_admits(&state.policy, r, principal.as_ref()))
@@ -605,9 +549,9 @@ impl ServicesHost {
         }))
     }
 
-    /// The nodes `role` names at `now` (never this host): every node the
-    /// policy doesn't ban whose last verified principal here is in the role.
-    /// A node with no verified identity here is in no role.
+    /// The nodes `role` names at `now` (never this host): every node whose
+    /// last verified principal here is in the role, neither the node nor the
+    /// person banned. A node with no verified identity here is in no role.
     pub(crate) fn push_recipients(&self, role: &RoleName, now: i64) -> Vec<NodeId> {
         let Ok(state) = self.policy() else {
             return Vec::new();
@@ -617,8 +561,12 @@ impl ServicesHost {
             .identities
             .nodes()
             .into_iter()
-            .filter(|n| !s.bans_node(*n))
-            .filter(|n| role_admits(s, role, self.identities.current(*n, now).as_ref()))
+            .filter(|n| {
+                let principal = self.identities.current(*n, now);
+                !s.bans_node(*n)
+                    && !principal.as_ref().is_some_and(|p| s.bans_person(p))
+                    && role_admits(s, role, principal.as_ref())
+            })
             .collect();
         nodes.retain(|n| *n != self.me);
         nodes.sort();
@@ -660,14 +608,18 @@ mod tests {
         RoleName::new(s).unwrap()
     }
 
-    /// Root 1; 2 calls and 3 is this host; 9 is banned; `status` (staff:
-    /// anyone [`ISS`] verified) on 3.
+    /// Root 1; 2 calls and 3 is this host; node 9 and mallory are banned;
+    /// `status` (staff: anyone [`ISS`] verified) on 3.
     fn setup() -> (Held, HostConfig) {
         let root = NodeIdentity::from_seed([1u8; 32]);
         let mut s = Policy::new(root.node_id());
         s.version = StateVersion(5);
         s.not_after = 100;
-        s.ban(node(9), 100);
+        s.ban(node(9));
+        s.ban_person(library::Person::new(
+            library::Issuer::new(ISS),
+            "mallory@x.com",
+        ));
         s.roles.insert(role("staff"), vec![Matcher::new(ISS)]);
         s.services.insert(
             name("status"),
@@ -713,13 +665,11 @@ mod tests {
     }
 
     #[test]
-    fn every_role_needs_a_verified_identity() {
+    fn an_admitted_call_carries_its_verified_identity() {
         let (s, cfg) = setup();
         let status = name("status");
-        let e = admit(&s, &cfg, node(3), node(2), None, &status, 0).unwrap_err();
-        assert!(e.needs_identity(), "{e}");
         let bob = who("bob@x.com");
-        let ok = admit(&s, &cfg, node(3), node(2), Some(&bob), &status, 0).unwrap();
+        let ok = admit(&s, &cfg, node(3), node(2), &bob, &status, 0).unwrap();
         assert_eq!(ok.state_version, StateVersion(5));
         assert_eq!(ok.role, role("staff"));
         // The admitted call carries the token and principal it verified.
@@ -730,22 +680,26 @@ mod tests {
     fn refusals_in_order() {
         let (s, cfg) = setup();
         let status = name("status");
+        let bob = who("bob@x.com");
         assert!(matches!(
-            admit(&s, &cfg, node(3), node(2), None, &status, 101),
+            admit(&s, &cfg, node(3), node(2), &bob, &status, 101),
             Err(GateRefusal::Stale { .. })
         ));
-        // A banned node hears the fixed sentence, even under an expired
-        // policy: the ban is checked before freshness.
+        // A banned node or person hears the fixed sentence, even under an
+        // expired policy: the bans are checked before freshness.
+        let mallory = who("mallory@x.com");
         for now in [0, 101] {
-            let e = admit(&s, &cfg, node(3), node(9), None, &status, now).unwrap_err();
+            let e = admit(&s, &cfg, node(3), node(9), &bob, &status, now).unwrap_err();
+            assert_eq!(e.to_string(), NOT_ADMITTED);
+            let e = admit(&s, &cfg, node(3), node(2), &mallory, &status, now).unwrap_err();
             assert_eq!(e.to_string(), NOT_ADMITTED);
         }
         assert!(matches!(
-            admit(&s, &cfg, node(2), node(2), None, &status, 0),
+            admit(&s, &cfg, node(2), node(2), &bob, &status, 0),
             Err(GateRefusal::NotAssigned { .. })
         ));
         assert!(matches!(
-            admit(&s, &cfg, node(3), node(2), None, &name("nope"), 0),
+            admit(&s, &cfg, node(3), node(2), &bob, &name("nope"), 0),
             Err(GateRefusal::Registry {
                 refusal: Refusal::UnknownService(_),
                 ..
@@ -759,12 +713,12 @@ mod tests {
         let db = name("orders-db");
         // alice: analyst (registry) and sre (host) — admitted as analyst.
         let alice = who("alice@x.com");
-        let ok = admit(&s, &cfg, node(3), node(2), Some(&alice), &db, 0).unwrap();
+        let ok = admit(&s, &cfg, node(3), node(2), &alice, &db, 0).unwrap();
         assert_eq!(ok.role, role("analyst"));
         // carol: sre but not analyst — the host's rule can't widen.
         let carol = who("carol@x.com");
         assert!(matches!(
-            admit(&s, &cfg, node(3), node(2), Some(&carol), &db, 0),
+            admit(&s, &cfg, node(3), node(2), &carol, &db, 0),
             Err(GateRefusal::Registry { .. })
         ));
         // alice without sre on the host side: refused by also_require.
@@ -777,7 +731,7 @@ mod tests {
             }],
         );
         let s2 = crate::testutil::held(&NodeIdentity::from_seed([1u8; 32]), state);
-        let e = admit(&s2, &cfg, node(3), node(2), Some(&alice), &db, 0).unwrap_err();
+        let e = admit(&s2, &cfg, node(3), node(2), &alice, &db, 0).unwrap_err();
         assert!(matches!(e, GateRefusal::AlsoRequire { .. }));
         // The host's own role names stay out of what the caller hears.
         assert_eq!(
@@ -785,16 +739,6 @@ mod tests {
             "alice@x.com is not admitted to orders-db by this host's own rules"
         );
         assert!(!e.to_string().contains("sre"), "{e}");
-    }
-
-    #[test]
-    fn only_identity_refusals_ask_for_a_login() {
-        let (s, cfg) = strict();
-        let db = name("orders-db");
-        let e = admit(&s, &cfg, node(3), node(2), None, &db, 0).unwrap_err();
-        assert!(e.needs_identity());
-        let e = admit(&s, &cfg, node(3), node(9), None, &db, 0).unwrap_err();
-        assert!(!e.needs_identity());
     }
 
     proptest! {
@@ -805,9 +749,9 @@ mod tests {
         #[test]
         fn the_gate_never_widens_the_registry(
             caller in 1u8..6,
-            email in prop::option::of(prop::sample::select(vec![
-                "alice@x.com", "carol@x.com", "eve@y.com",
-            ])),
+            email in prop::sample::select(vec![
+                "alice@x.com", "carol@x.com", "eve@y.com", "mallory@x.com",
+            ]),
             also in prop::sample::subsequence(vec!["analyst", "sre", "staff"], 0..=3),
             service in prop::sample::select(vec!["status", "orders-db", "nope"]),
             now in 0i64..200,
@@ -822,10 +766,11 @@ mod tests {
                     "orders-db":{{"command":["true"],"also_require":[{also}]}},
                     "status":{{"command":["true"],"also_require":[{also}]}}}}}}"#
             )).unwrap();
-            let p = email.map(who);
+            let p = who(email);
             let svc = name(service);
-            if let Ok(ok) = admit(&s, &cfg, node(3), node(caller), p.as_ref(), &svc, now) {
-                let principal = p.as_ref().map(|v| &v.principal);
+            if let Ok(ok) = admit(&s, &cfg, node(3), node(caller), &p, &svc, now) {
+                let principal = Some(&p.principal);
+                prop_assert!(library::check_admitted(&s.policy, node(caller), &p.principal).is_ok());
                 prop_assert!(authorize(&s.policy, node(caller), principal, &svc).is_ok());
                 let required = cfg.services.get(&svc).map(|i| i.also_require.clone());
                 for r in required.unwrap_or_default() {
@@ -833,7 +778,7 @@ mod tests {
                 }
                 prop_assert!(s.check_fresh(now).is_ok());
                 // Admitted is verified: the very token and principal given.
-                prop_assert_eq!(Some(&ok.caller), p.as_ref());
+                prop_assert_eq!(&ok.caller, &p);
             }
         }
     }

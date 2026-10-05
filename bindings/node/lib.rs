@@ -220,7 +220,7 @@ impl HostBuilder {
 #[napi]
 impl HostBuilder {
     /// Start building a host whose keystore is `home` (a node joined with
-    /// `WIRES_HOME=<home> wires id` and `wires join`).
+    /// `WIRES_HOME=<home> wires join <network>`).
     #[napi(constructor)]
     pub fn new(home: String) -> Self {
         Self {

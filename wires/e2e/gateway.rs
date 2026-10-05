@@ -86,9 +86,11 @@ impl Backend for Scripted {
     type Caller = Recording;
     /// The view a directory would cut for the session's (verified) user.
     async fn view(&self, session: &Session) -> anyhow::Result<Arc<View>> {
-        Ok(Arc::new(
-            self.state.view_for(Some(&session.principal), None),
-        ))
+        Ok(Arc::new(self.state.view_for(
+            crate::testutil::any_node(),
+            Some(&session.principal),
+            None,
+        )))
     }
     fn caller(&self, token: IdToken, _view: Arc<View>) -> Recording {
         Recording {

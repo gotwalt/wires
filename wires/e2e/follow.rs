@@ -26,8 +26,7 @@ use iroh::Endpoint;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::Router;
 use library::{
-    FreshnessMode, Matcher, Membership, NodeIdentity, Policy, Service, Settings, SignedPolicy,
-    StateVersion,
+    FreshnessMode, Matcher, NodeIdentity, Policy, Service, Settings, SignedPolicy, StateVersion,
 };
 
 use super::{PATIENCE, bind_in, call, hello, host_config, localhost_socks, role, service};
@@ -73,10 +72,6 @@ impl World {
             idp: MockIdp::start("alice@example.com").await,
             last: Default::default(),
         }
-    }
-
-    fn badge(&self, who: &NodeIdentity) -> Membership {
-        Membership::mint(&self.root, who.node_id(), 0, i64::MAX).unwrap()
     }
 
     /// The policy at `version`: `echo` on every host for `analyst` (alice),
@@ -129,7 +124,7 @@ impl World {
             },
         );
         for b in 0..bans {
-            p.ban(NodeIdentity::from_seed([100 + b; 32]).node_id(), i64::MAX);
+            p.ban(NodeIdentity::from_seed([100 + b; 32]).node_id());
         }
         edit(&mut p);
         crate::testutil::trust_role_issuers(&mut p);
@@ -146,7 +141,7 @@ impl World {
     fn keystore(&self, who: &NodeIdentity, policy: &SignedPolicy) -> Arc<Keystore> {
         let ks = Arc::new(Keystore::at(crate::testutil::temp_dir()));
         ks.save_node(who).unwrap();
-        ks.save_membership(&self.badge(who)).unwrap();
+        crate::testutil::join(&ks, &self.root, &[]);
         store::adopt_if_newer(&ks, policy, self.root.node_id(), now_unix()).unwrap();
         ks
     }
@@ -173,7 +168,7 @@ impl World {
         .unwrap();
         let endpoint = self.bind(node).await;
         let router = Running::mount(Router::builder(endpoint.clone()), &dir).spawn();
-        let running = Running::start(Arc::clone(&dir), endpoint.clone(), self.badge(node));
+        let running = Running::start(Arc::clone(&dir), endpoint.clone());
         Dir {
             dir,
             endpoint,
@@ -196,7 +191,6 @@ impl World {
                 endpoint: endpoint.clone(),
                 ks: Arc::clone(ks),
                 root,
-                badge: self.badge(node),
                 freshness: Arc::clone(&freshness),
                 runs_directory: false,
                 stats: Arc::clone(&stats),
@@ -226,7 +220,7 @@ impl World {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let serving = Serving {
             node: node.duplicate(),
-            membership: self.badge(node),
+            root: self.root.node_id(),
             keystore: Arc::clone(ks),
             config: host_config(&[&self.idp], r#"{"echo":{"command":["echo","hi"]}}"#, ""),
             native: NativeServices::new(),
@@ -246,7 +240,7 @@ impl World {
     /// Alice calls `echo` on the host at `addr`: its stdout, or the
     /// refusal.
     async fn call(&self, addr: &iroh::EndpointAddr) -> Result<String, String> {
-        let hello = hello(&self.root, &self.alice, 0, Some(&self.idp));
+        let hello = hello(&self.alice, 0, Some(&self.idp));
         match call(&self.alice, addr, hello, "echo", &[]).await {
             super::Outcome::Ran {
                 code: 0, stdout, ..
@@ -351,7 +345,7 @@ async fn an_edit_reaches_every_subscribed_host_within_2s_as_one_update() {
     let admin = w.bind(&w.admin).await;
     let v2 = w.policy(2, Settings::default(), 21);
     let started = Instant::now();
-    let report = publish_all(&admin, &w.badge(&w.admin), &v2, &[w.dirs[0].node_id()])
+    let report = publish_all(&admin, &v2, &[w.dirs[0].node_id()])
         .await
         .unwrap();
     assert_eq!(report.delivered, vec![w.dirs[0].node_id()]);
@@ -429,7 +423,7 @@ async fn an_update_that_does_not_apply_makes_the_host_take_the_whole_policy() {
     forked.version = StateVersion(1);
     forked.not_after = i64::MAX;
     forked.directories = w.dirs.iter().map(|d| d.node_id()).collect();
-    forked.ban(NodeIdentity::from_seed([7u8; 32]).node_id(), i64::MAX);
+    forked.ban(NodeIdentity::from_seed([7u8; 32]).node_id());
     let forked = crate::testutil::signed_policy(&w.root, forked);
     let h = w.follower(0, &w.keystore(&w.hosts[0], &forked)).await;
     h.until(StateVersion(2)).await;
@@ -539,17 +533,16 @@ async fn a_publish_from_a_stale_copy_is_not_delivered() {
     assert!(d.dir.accept(&v2, now).unwrap());
     assert!(d.dir.accept(&v3, now).unwrap());
     let admin = w.bind(&w.admin).await;
-    let badge = w.badge(&w.admin);
     let only = [w.dirs[0].node_id()];
 
     // Two versions behind: its version 2 is older than the directory's 3.
-    let report = publish_all(&admin, &badge, &v2, &only).await.unwrap();
+    let report = publish_all(&admin, &v2, &only).await.unwrap();
     assert_eq!(report.newer, vec![(only[0], StateVersion(3))], "{report:?}");
     assert!(report.delivered.is_empty(), "{report:?}");
     // One behind: another version 3, signed from its copy of version 2.
     let other_v3 = w.policy(3, Settings::default(), 5);
     assert_ne!(other_v3.head, v3.head);
-    let report = publish_all(&admin, &badge, &other_v3, &only).await.unwrap();
+    let report = publish_all(&admin, &other_v3, &only).await.unwrap();
     assert_eq!(report.newer, vec![(only[0], StateVersion(3))], "{report:?}");
     let failure =
         crate::admin::propagate::Propagation::from_publish(Ok((StateVersion(3), report)), false)
@@ -559,7 +552,7 @@ async fn a_publish_from_a_stale_copy_is_not_delivered() {
     assert_eq!(d.dir.snapshot().unwrap().held.signed, v3, "kept its own");
 
     // The directory's own version, re-published (`policy push`): delivered.
-    let report = publish_all(&admin, &badge, &v3, &only).await.unwrap();
+    let report = publish_all(&admin, &v3, &only).await.unwrap();
     assert_eq!(report.delivered, only.to_vec(), "{report:?}");
     assert!(report.newer.is_empty());
     admin.close().await;
@@ -613,7 +606,7 @@ async fn a_host_every_directory_refuses_backs_off() {
         for svc in p.services.values_mut() {
             svc.hosts.retain(|h| *h != host);
         }
-        p.ban(host, i64::MAX);
+        p.ban(host);
     });
     let now = now_unix();
     assert!(first.dir.accept(&banned, now).unwrap());

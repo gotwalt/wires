@@ -1,11 +1,13 @@
 //! The directory on the network: its two ALPNs, its loops, and
 //! `wires directory serve`.
 //!
-//! - [`DirectoryProtocol`] (`wires/directory/1`): one request per
-//!   connection, after a `hello` whose badge is admitted
-//!   ([`Directory::admit`]); anyone else hears only
+//! - [`DirectoryProtocol`] (`wires/directory/2`): one request per
+//!   connection, after a `hello` ([`Directory::admit`]): a node the policy
+//!   names, or a caller whose ID token verifies, may ask; anyone may
+//!   publish (the head first, checked under the root, and only then its
+//!   items); anyone else asking hears only
 //!   [`NOT_ADMITTED`](super::node::NOT_ADMITTED), traced, not logged.
-//! - [`SubscriptionProtocol`] (`wires/directory-sub/1`): a `replica`
+//! - [`SubscriptionProtocol`] (`wires/directory-sub/2`): a `replica`
 //!   subscription from another directory the head lists: the whole policy
 //!   whenever it moves past what the subscriber holds, and a `fresh` beat
 //!   otherwise; a host's `policy` subscription, the whole policy once and
@@ -17,9 +19,9 @@
 //!   `replica`, and take any newer head it has, so a directory that missed
 //!   a publish catches up.
 //!
-//! `wires serve` runs all of it when the policy lists its node
-//! ([`Running::start`]); `wires directory serve` runs it alone, on a node with
-//! no `host.json` ([`serve_cmd`]).
+//! `wires serve` runs all of it when the policy lists its node, or, holding
+//! none yet, its network string does ([`Running::start`]); `wires directory
+//! serve` runs it alone, on a node with no `host.json` ([`serve_cmd`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,11 +32,11 @@ use clap::Args;
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
 use library::{
-    DIRECTORY_ALPN, DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, Membership, NodeId,
-    NodeIdentity, SubFrame, SubRequest, SubscriptionKind,
+    DIRECTORY_ALPN, DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, NodeId, NodeIdentity,
+    SubFrame, SubRequest, SubscriptionKind,
 };
 
-use super::node::{DEFAULT_MAX_SUBSCRIBERS, Directory, NOT_ADMITTED};
+use super::node::{DEFAULT_MAX_SUBSCRIBERS, Directory, HeadCheck, NOT_ADMITTED};
 use super::wire;
 use crate::admin::keystore::{self, Keystore};
 use crate::clock::now_unix;
@@ -81,9 +83,11 @@ async fn accept_stream(
 
 /// Serve one request on `conn`: the `hello` (small, within the stream
 /// deadline), admission, the request, the answer. `undecided` is this
-/// connection's undecided slot, released once the peer is admitted; an
-/// admitted request holds one of [`MAX_ADMITTED`](super::node::MAX_ADMITTED)
-/// slots instead, or hears [`BUSY`](super::node::BUSY).
+/// connection's undecided slot, released once the peer is admitted (or a
+/// publisher's head checked out); admitted work holds one of
+/// [`MAX_ADMITTED`](super::node::MAX_ADMITTED) slots instead, or hears
+/// [`BUSY`](super::node::BUSY). A publish's items are read only after its
+/// head verified under the root and is newer than the held one.
 async fn one_request(
     dir: &Directory,
     conn: &Connection,
@@ -97,39 +101,82 @@ async fn one_request(
             reason: NOT_ADMITTED.into(),
         }
     };
+    let busy = || DirectoryAnswer::Denied {
+        reason: super::node::BUSY.into(),
+    };
     let hello = wire::read_hello(&mut recv, dir.stream_deadline).await;
     let answer = match hello {
-        Ok(DirectoryRequest::Hello { badge, id_token }) => {
-            match dir.admit(caller, &badge, now_unix()) {
-                Err(detail) => refuse(detail),
-                // Admitted: only now is a (possibly large) request read,
-                // under the admitted bound.
-                Ok(()) => match admitted(dir, undecided) {
-                    None => DirectoryAnswer::Denied {
-                        reason: super::node::BUSY.into(),
-                    },
-                    Some(_slot) => match wire::read_request(&mut recv).await {
-                        // A caller's view (card 37), cut for its ID token.
-                        Ok(
-                            request @ (DirectoryRequest::View { .. }
-                            | DirectoryRequest::Resolve { .. }),
-                        ) => {
-                            dir.answer_caller(caller, id_token.as_ref(), request, now_unix())
-                                .await
+        Ok(DirectoryRequest::Hello { id_token }) => {
+            let peer = dir.admit(caller, id_token.as_ref(), now_unix()).await;
+            let request = if peer.admitted() {
+                // Admitted: the request is read under the admitted bound.
+                match admitted(dir, undecided) {
+                    None => {
+                        write_answer(&mut send, &busy()).await?;
+                        return Ok(());
+                    }
+                    Some(slot) => (wire::read_request(&mut recv).await, Some(slot), None),
+                }
+            } else {
+                // Not admitted: a publish at most, read under the undecided
+                // bound (small, like every request).
+                (wire::read_request(&mut recv).await, None, Some(undecided))
+            };
+            match request {
+                (Ok(DirectoryRequest::Publish { head }), slot, undecided) => {
+                    match dir.check_head(&head, now_unix()) {
+                        HeadCheck::Held { version, head } => {
+                            DirectoryAnswer::Published { version, head }
                         }
-                        Ok(request) => dir.answer(caller, request, now_unix()),
-                        Err(e) => {
-                            tracing::info!(peer = %caller.hex(), "unreadable directory request: {e:#}");
-                            return Ok(());
+                        HeadCheck::Refused(reason) => {
+                            tracing::info!(peer = %caller.hex(), "publish refused: {reason}");
+                            DirectoryAnswer::Denied {
+                                reason: transport::truncate_reason(reason),
+                            }
                         }
-                    },
-                },
+                        // A root-signed, newer head: only now are its
+                        // (possibly large) items read, as admitted work.
+                        HeadCheck::Wanted => {
+                            let slot = match (slot, undecided) {
+                                (Some(slot), _) => Some(slot),
+                                (None, Some(undecided)) => admitted(dir, undecided),
+                                (None, None) => None,
+                            };
+                            match slot {
+                                None => busy(),
+                                Some(_slot) => match wire::read_items(&mut recv).await {
+                                    Ok(items) => dir.publish(caller, head, items, now_unix()),
+                                    Err(e) => {
+                                        tracing::info!(peer = %caller.hex(), "unreadable publish: {e:#}");
+                                        return Ok(());
+                                    }
+                                },
+                            }
+                        }
+                    }
+                }
+                (Ok(_), None, _) => {
+                    refuse("asked for more than a publish without admission".into())
+                }
+                (Ok(request), Some(_slot), _) => dir.answer(&peer, request),
+                (Err(e), ..) => {
+                    tracing::debug!(peer = %caller.hex(), "unreadable directory request: {e:#}");
+                    return Ok(());
+                }
             }
         }
         Ok(_) => refuse("expected a hello".into()),
         Err(e) => refuse(format!("{e:#}")),
     };
-    wire::write(&mut send, &answer.encode()?).await?;
+    write_answer(&mut send, &answer).await
+}
+
+/// Send the one answer and end the stream.
+async fn write_answer(
+    send: &mut iroh::endpoint::SendStream,
+    answer: &DirectoryAnswer,
+) -> Result<()> {
+    wire::write(send, &answer.encode()?).await?;
     send.finish().ok();
     Ok(())
 }
@@ -185,8 +232,8 @@ async fn subscription(dir: &Directory, conn: &Connection, caller: NodeId) -> Res
     let hello = tokio::time::timeout(dir.stream_deadline, wire::read_sub_request(&mut recv))
         .await
         .unwrap_or_else(|_| Err(anyhow!("no hello within {:?}", dir.stream_deadline)));
-    let (badge, id_token) = match hello {
-        Ok(SubRequest::Hello { badge, id_token }) => (badge, id_token),
+    let id_token = match hello {
+        Ok(SubRequest::Hello { id_token }) => id_token,
         other => {
             let detail = match other {
                 Err(e) => format!("{e:#}"),
@@ -196,7 +243,13 @@ async fn subscription(dir: &Directory, conn: &Connection, caller: NodeId) -> Res
             return deny(&mut send, NOT_ADMITTED.into()).await;
         }
     };
-    if let Err(detail) = dir.admit(caller, &badge, now_unix()) {
+    let peer = dir.admit(caller, id_token.as_ref(), now_unix()).await;
+    if !peer.admitted() {
+        let detail = if dir.snapshot().is_none() {
+            "this directory holds no policy yet".to_string()
+        } else {
+            format!("{}… is neither named nor signed in", caller.short())
+        };
         STRANGERS.refused("directory subscription", caller, &detail);
         return deny(&mut send, NOT_ADMITTED.into()).await;
     }
@@ -215,14 +268,20 @@ async fn subscription(dir: &Directory, conn: &Connection, caller: NodeId) -> Res
         SubscriptionKind::Policy => {
             // Card 37: the whole policy is for hosts and directories; a
             // caller follows its view.
-            if !dir.holds_whole(caller) {
+            if !peer.named {
                 return deny(&mut send, super::node::VIEW_NOT_POLICY.into()).await;
             }
-            return super::sub_policy::serve(dir, conn, &mut send, caller, &badge, have).await;
+            return super::sub_policy::serve(dir, conn, &mut send, caller, have).await;
         }
         SubscriptionKind::View => {
-            return super::sub_view::serve(dir, conn, &mut send, caller, &badge, id_token.as_ref())
+            let Some(principal) = peer.principal else {
+                return deny(
+                    &mut send,
+                    "a view subscription needs an ID token that verifies; run `wires login`".into(),
+                )
                 .await;
+            };
+            return super::sub_view::serve(dir, conn, &mut send, caller, principal).await;
         }
     }
     let listed = |dir: &Directory| {
@@ -292,7 +351,7 @@ pub(crate) async fn beat_loop(dir: Arc<Directory>) {
 /// Follow every other directory the held head lists, as a `replica`, until
 /// the task is dropped: one follower per peer, started and stopped as the
 /// head's `directories` change.
-pub(crate) async fn replicate(dir: Arc<Directory>, endpoint: Endpoint, badge: Membership) {
+pub(crate) async fn replicate(dir: Arc<Directory>, endpoint: Endpoint) {
     let mut followers = tokio::task::JoinSet::new();
     let mut by_peer: HashMap<NodeId, tokio::task::AbortHandle> = HashMap::new();
     let mut changes = dir.watch();
@@ -314,12 +373,7 @@ pub(crate) async fn replicate(dir: Arc<Directory>, endpoint: Endpoint, badge: Me
         });
         for peer in peers {
             by_peer.entry(peer).or_insert_with(|| {
-                followers.spawn(follow(
-                    Arc::clone(&dir),
-                    endpoint.clone(),
-                    badge.clone(),
-                    peer,
-                ))
+                followers.spawn(follow(Arc::clone(&dir), endpoint.clone(), peer))
             });
         }
         while followers.try_join_next().is_some() {}
@@ -330,10 +384,10 @@ pub(crate) async fn replicate(dir: Arc<Directory>, endpoint: Endpoint, badge: Me
 }
 
 /// Follow `peer` for good, reconnecting with a growing pause.
-async fn follow(dir: Arc<Directory>, endpoint: Endpoint, badge: Membership, peer: NodeId) {
+async fn follow(dir: Arc<Directory>, endpoint: Endpoint, peer: NodeId) {
     let mut backoff = Duration::from_secs(1);
     loop {
-        match follow_once(&dir, &endpoint, &badge, peer).await {
+        match follow_once(&dir, &endpoint, peer).await {
             Ok(()) => backoff = Duration::from_secs(1),
             Err(e) => tracing::debug!(peer = %peer.hex(), "replica: {e:#}"),
         }
@@ -343,12 +397,7 @@ async fn follow(dir: Arc<Directory>, endpoint: Endpoint, badge: Membership, peer
 }
 
 /// One replica subscription to `peer`: take every newer policy it sends.
-async fn follow_once(
-    dir: &Directory,
-    endpoint: &Endpoint,
-    badge: &Membership,
-    peer: NodeId,
-) -> Result<()> {
+async fn follow_once(dir: &Directory, endpoint: &Endpoint, peer: NodeId) -> Result<()> {
     let addr = transport::endpoint_addr(&peer, &[], None)?;
     let conn = tokio::time::timeout(
         wire::DIAL_TIMEOUT,
@@ -358,10 +407,7 @@ async fn follow_once(
     .map_err(|_| anyhow!("no answer within {:?}", wire::DIAL_TIMEOUT))?
     .map_err(|e| anyhow!("dialing {}…: {e}", peer.short()))?;
     let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
-    let hello = SubRequest::Hello {
-        badge: badge.clone(),
-        id_token: None,
-    };
+    let hello = SubRequest::Hello { id_token: None };
     let subscribe = SubRequest::Subscribe {
         kind: SubscriptionKind::Replica,
         have: dir.version(),
@@ -400,11 +446,11 @@ pub(crate) struct Running {
 }
 
 impl Running {
-    /// Start `dir`'s loops on `endpoint`, presenting `badge` to its peers.
-    pub(crate) fn start(dir: Arc<Directory>, endpoint: Endpoint, badge: Membership) -> Running {
+    /// Start `dir`'s loops on `endpoint`.
+    pub(crate) fn start(dir: Arc<Directory>, endpoint: Endpoint) -> Running {
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(beat_loop(Arc::clone(&dir)));
-        tasks.spawn(replicate(dir, endpoint, badge));
+        tasks.spawn(replicate(dir, endpoint));
         Running { tasks }
     }
 
@@ -438,47 +484,47 @@ pub(crate) struct DirectoryServeArgs {
 /// The file whose presence marks an admin keystore.
 const ROOT_SEED: &str = "root.seed";
 
+/// Whether `me` runs the directory mode from `ks`: the policy it holds
+/// lists it, or, holding none yet, its network string does (the first
+/// directory, which starts empty and takes the admin's first publish).
+pub(crate) fn listed(ks: &Keystore, root: NodeId, me: NodeId) -> Result<bool> {
+    Ok(match crate::policy::store::read(ks, root)? {
+        Some(held) => held.directories().contains(&me),
+        None => ks
+            .read_network()?
+            .is_some_and(|n| n.directories.contains(&me)),
+    })
+}
+
 /// Open the directory a standalone `wires directory serve` runs from `ks`:
 /// refuses the admin's keystore (it holds the root key), a keystore that
-/// joined no network, and a node the newest policy it holds doesn't list in
-/// `directories`.
+/// joined no network, and a node neither the policy it holds nor (holding
+/// none) its network string lists in `directories`.
 pub(crate) fn open_standalone(
     ks: Arc<Keystore>,
     max_subscribers: usize,
     now: i64,
-) -> Result<(Arc<Directory>, NodeIdentity, Membership)> {
+) -> Result<(Arc<Directory>, NodeIdentity)> {
     if ks.path(ROOT_SEED).exists() {
         bail!(
             "{} holds the admin key ({ROOT_SEED}); a directory must not share a keystore with \
              the network's root. Run `wires directory serve` from the directory node's own \
-             keystore (WIRES_HOME=<another dir> wires id, invite that node, join it there)",
+             keystore (WIRES_HOME=<another dir> wires join <network>)",
             ks.path("").display()
         );
     }
     let node = keystore::node_identity_in(&ks)?;
-    let membership = ks.read_membership()?.context(crate::help::NOT_JOINED)?;
-    keystore::preflight(node.node_id(), &membership)?;
-    let dir = Directory::open(
-        node.duplicate(),
-        membership.fabric,
-        ks,
-        max_subscribers,
-        now,
-    )?;
-    let listed = dir
-        .snapshot()
-        .is_some_and(|c| c.held.directories().contains(&node.node_id()));
-    if !listed {
+    let root = ks.read_network()?.context(crate::help::NOT_JOINED)?.root;
+    if !listed(&ks, root, node.node_id())? {
         bail!(
-            "this node ({}…) is not one of the network's directories in the policy it holds \
-             (version {}); on the admin run `wires directory add {}`, then join again with a \
-             fresh invite",
+            "this node ({}…) is not one of the network's directories; on the admin run `wires \
+             directory add <label>={}`, then `wires policy push` once this runs",
             node.node_id().short(),
-            dir.version().0,
             node.node_id().hex()
         );
     }
-    Ok((dir, node, membership))
+    let dir = Directory::open(node.duplicate(), root, ks, max_subscribers, now)?;
+    Ok((dir, node))
 }
 
 /// `wires directory serve`: run the directory alone, on a node that hosts
@@ -486,7 +532,7 @@ pub(crate) fn open_standalone(
 pub(crate) async fn serve_cmd(a: DirectoryServeArgs) -> Result<()> {
     crate::init_logging();
     let ks = Arc::new(Keystore::resolve()?);
-    let (dir, node, membership) = open_standalone(Arc::clone(&ks), a.max_subscribers, now_unix())?;
+    let (dir, node) = open_standalone(Arc::clone(&ks), a.max_subscribers, now_unix())?;
     let endpoint = transport::bind_with(
         &node,
         a.relay_url.as_deref(),
@@ -499,12 +545,15 @@ pub(crate) async fn serve_cmd(a: DirectoryServeArgs) -> Result<()> {
         tracing::warn!("could not write this directory's hint line: {e:#}");
     }
     let router = Running::mount(iroh::protocol::Router::builder(endpoint.clone()), &dir).spawn();
-    let running = Running::start(Arc::clone(&dir), endpoint.clone(), membership);
+    let running = Running::start(Arc::clone(&dir), endpoint.clone());
     tracing::info!(
         version = dir.version().0,
         node = %node.node_id().hex(),
         "serving the directory"
     );
+    if dir.snapshot().is_none() {
+        tracing::info!("{}", super::node::EMPTY);
+    }
     let ended = tokio::signal::ctrl_c().await.context("waiting for ctrl-c");
     running.stop().await;
     if let Err(e) = router.shutdown().await {

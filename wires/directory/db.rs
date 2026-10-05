@@ -260,7 +260,7 @@ pub(crate) fn store_newer(db: &DirectoryDb, policy: &SignedPolicy) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library::{Ban, NodeIdentity, Policy};
+    use library::{NodeIdentity, Policy};
     use proptest::prelude::*;
 
     fn root() -> NodeIdentity {
@@ -273,10 +273,7 @@ mod tests {
         p.version = StateVersion(v);
         p.not_after = i64::MAX;
         for b in bans {
-            p.bans.insert(
-                NodeIdentity::from_seed([*b; 32]).node_id(),
-                Ban { until: 1 },
-            );
+            p.bans.insert(NodeIdentity::from_seed([*b; 32]).node_id());
         }
         p.sign(&root()).unwrap()
     }

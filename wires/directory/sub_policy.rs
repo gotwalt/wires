@@ -16,27 +16,26 @@
 //! A subscriber that can't apply an update subscribes anew with `have: 0`.
 //! The stream ends with `denied` when this node stops being a directory
 //! (it can no longer vouch), and the host fails over to another. Every
-//! head is checked as the subscription's opening was: one that no longer
-//! admits the subscriber (its badge again, and the head's bans) or no longer
-//! names it as a host or a directory ends the stream with `denied` too.
+//! head is checked as the subscription's opening was: one that bans the
+//! subscriber, or no longer names it as a host or a directory, ends the
+//! stream with `denied` too.
 //!
 //! Subscribers following the same head get the same bytes: each frame is
 //! encoded once per `(have, head, Fresh)` and shared ([`FrameCache`]), so a
 //! publish to a directory with a thousand hosts reads the older policy from
 //! the store and diffs it once, not a thousand times.
 //!
-//! `policy {have}` on `wires/directory/1` answers the same way
+//! `policy {have}` on `wires/directory/2` answers the same way
 //! ([`since`]), for a host's one-shot fetch.
 
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use iroh::endpoint::{Connection, SendStream};
-use library::{Fresh, Membership, NodeId, PolicyUpdate, StateVersion, SubFrame};
+use library::{Fresh, NodeId, PolicyUpdate, StateVersion, SubFrame};
 
 use super::node::{Current, Directory, NOT_ADMITTED, VIEW_NOT_POLICY};
 use super::wire;
-use crate::clock::now_unix;
 
 /// What brings a holder of `have` to a directory's newest head.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,19 +155,17 @@ impl FrameCache {
     }
 }
 
-/// Serve one host's `policy` subscription on `send` (the `hello`, with
-/// `badge`, and the `subscribe {kind: policy, have}` already read and
-/// admitted) until the host goes away, this node stops being a directory,
-/// or a new head no longer admits the host (`badge` is checked again, and
-/// its bans) or no longer names it as a host or directory: each ends the
-/// stream with `denied`. Takes one of the directory's subscriber slots, or
+/// Serve one host's `policy` subscription on `send` (the `hello` and the
+/// `subscribe {kind: policy, have}` already read, the host named by the
+/// held policy) until the host goes away, this node stops being a
+/// directory, or a new head bans the host or no longer names it as a host
+/// or directory: each ends the stream with `denied`. Takes one of the directory's subscriber slots, or
 /// refuses when the cap is reached.
 pub(crate) async fn serve(
     dir: &Directory,
     conn: &Connection,
     send: &mut SendStream,
     caller: NodeId,
-    badge: &Membership,
     have: StateVersion,
 ) -> Result<()> {
     let Ok(_slot) = Arc::clone(&dir.subscribers).try_acquire_owned() else {
@@ -191,8 +188,8 @@ pub(crate) async fn serve(
                 // The head no longer lists this node: it vouches for nothing.
                 return deny(send, "no longer a directory of this network".into()).await;
             };
-            if let Err(detail) = dir.admit(caller, badge, now_unix()) {
-                tracing::info!(peer = %caller.hex(), "policy subscription ended: {detail}");
+            if c.held.policy.bans_node(caller) {
+                tracing::info!(peer = %caller.hex(), "policy subscription ended: removed");
                 return deny(send, NOT_ADMITTED.into()).await;
             }
             if !dir.holds_whole(caller) {
@@ -245,10 +242,7 @@ mod tests {
             p.not_after = i64::MAX;
             p.directories = vec![me().node_id()];
             for b in 0..v {
-                p.ban(
-                    NodeIdentity::from_seed([100 + b as u8; 32]).node_id(),
-                    i64::MAX,
-                );
+                p.ban(NodeIdentity::from_seed([100 + b as u8; 32]).node_id());
             }
             let signed = match out.last() {
                 Some(prev) => p.sign_after(&root(), prev).unwrap(),
@@ -272,13 +266,16 @@ mod tests {
     fn ask(dir: &Directory, have: u64) -> DirectoryAnswer {
         // A directory the policy lists (card 37: only hosts and
         // directories get the whole policy).
-        let caller = me().node_id();
+        let peer = super::super::node::Peer {
+            node: me().node_id(),
+            named: true,
+            principal: None,
+        };
         dir.answer(
-            caller,
+            &peer,
             DirectoryRequest::Policy {
                 have: StateVersion(have),
             },
-            0,
         )
     }
 
