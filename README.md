@@ -124,6 +124,12 @@ published; `wires policy push` delivers it once a directory runs.
 `./.scripts/demo-remote-cli.sh` runs the same steps, with two hosts, and
 checks every result.*
 
+![The loopback demo, narrated](docs/media/demo-remote-cli.gif)
+
+*A recording of `./.scripts/demo-remote-cli.sh`: six keystores on one
+machine over loopback, signing in through a stand-in IdP, not the
+two-machine run ([MP4](docs/media/demo-remote-cli.mp4)).*
+
 ## How it works
 
 **The policy.** The admin holds the network's root key and signs one
@@ -185,6 +191,12 @@ wires push --to "$WIRES_CALLER_NODE" --subject build-41 -- "failed: test_orders_
 `wires inbox --wait` sleeps until a message lands. An agent waiting on a
 build this way spends one tool call, not a loop of status checks (numbers
 below).
+
+![The push demo, narrated](docs/media/demo-push.gif)
+
+*A recording of `./.scripts/demo-push.sh` on loopback: a build the agent
+started fails on the host, and `wires inbox --wait` wakes with the push
+([MP4](docs/media/demo-push.mp4)).*
 
 ## MCP: a bridge
 
