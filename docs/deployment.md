@@ -125,19 +125,23 @@ that under `$XDG_RUNTIME_DIR` (else the temp dir) at start and removes it at
 exit, so the runtime or temp dir must be writable too. A read-only or
 throwaway keystore loses those on restart.
 
-**Secrets.** Every secret input resolves **flag → environment variable →
-`--…-file` → keystore**. Don't pass `--node-seed` on the command line or in
-the environment: argv leaks through `ps`, and `serve` execs children. Keep the
-node key as a file, either in the keystore or mounted and read with
-`--node-seed-file`. The root key (`root.seed`) stays on the admin's machine,
-and a host never holds it.
+**Secrets.** `$WIRES_HOME` picks the keystore (else
+`$XDG_CONFIG_HOME/wires`, else `~/.config/wires`), and every command takes
+its node key from there, except that `serve` takes `--node-seed` or
+`--node-seed-file` ahead of it. Don't pass `--node-seed` on the command line:
+argv leaks through `ps`, and `serve` execs children. Keep the node key as a
+file, either in the keystore or mounted and read with `--node-seed-file`.
+The root key (`root.seed`) stays on the admin's machine, and a host never
+holds it.
 
 **Kubernetes** (untested): a persistent, writable `$WIRES_HOME` (a PVC or
 a StatefulSet volume), `replicas: 1` (the node key is the host's address, so
 replicas sharing a key are not a load balancer), and no `Service` or
 `Ingress`. For availability, give the service more hosts, each with its own
-key: callers fail over between them. They don't spread calls, so more hosts
-add no capacity.
+key: calls spread at random across them, and a caller moves to the next
+when one can't be reached. More hosts are more capacity only for a service
+that keeps no state between calls: hosts share nothing but the policy, so a
+service's memory, its disk and its push queue stay on each host.
 
 ## Running a directory
 
@@ -213,14 +217,19 @@ Three layers, most self-contained first:
   the peer's key, so a wrong address can only fail to connect.
 - **Self-hosted relay**: run upstream
   [`iroh-relay`](https://docs.rs/iroh-relay) and pass `--relay-url` to
-  `serve`, `directory serve`, `call`, `mcp`, `gateway` and `inbox`, for NAT
-  traversal between egress-only peers that can both reach it. Keep it one
-  logical endpoint: two peers only rendezvous on the *same* relay.
+  `serve`, `directory serve` and `gateway`, for NAT traversal between
+  egress-only peers that can both reach it. Keep it one logical endpoint: two
+  peers only rendezvous on the *same* relay. A caller's commands take no relay
+  flag: a host publishes its home relay with its address through n0
+  discovery, and the caller dials the relay that address names, so without
+  n0 DNS a caller behind NAT has no way to reach a host on your relay.
 - **n0 DNS discovery and relays** (the default): resolves a node id to
   addresses, but needs outbound internet.
 
-For a private or air-gapped network, run your own relay so nothing depends on
-n0.
+For a private or air-gapped network, run your own relay for hosts, directories
+and the gateway, and give callers a hints line for each host and directory
+they must reach: with no n0 DNS, a caller reaches only addresses its hints
+file names, since it can't be told to use your relay.
 
 ## Provisioning and removal
 

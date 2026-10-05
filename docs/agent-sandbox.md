@@ -96,7 +96,7 @@ In order of how much it relies on Claude Code's command parser:
      `export` under this rule);
    - `node.seed` and `network.json` under `$WIRES_HOME` read-only to the
      agent's user. `wires` still writes its own files (`view.json`,
-     `last-good.json`, `idp-token.jwt`, `inbox/`) there.
+     `unanswered.json`, `idp-token.jwt`, `inbox/`) there.
 
    There, `cat` and friends don't exist: a probe showed Claude Code refuses
    absolute-path binaries like `/bin/cat`, and a bare `cat` would just fail

@@ -52,7 +52,7 @@ clipboard. On camera, in order:
 | **"Just poll."** | Polling (status service or inbox loop) cost 28k→39k tokens as the build went 60→300 s and reacted in 20–180 s; `inbox --wait` cost 15k flat and reacted in ~2 s (bench/push/REPORT.md). |
 | **"A2A has push."** | Through webhooks to a public URL, the same problem. |
 | **"The MCP tasks extension."** | Polling `tasks/get` is its default; status can also arrive as `notifications/tasks` on a `subscriptions/listen` stream the client holds open. Neither reaches an agent that isn't connected; that is working-group work, not in the 2026-07-28 spec. |
-| **"Two hosts, so it scales?"** | No: a second host is failover. Calls go to one host until it stops answering. |
+| **"Two hosts, so it scales?"** | For a service that keeps no state between calls, yes: each call goes to one of its hosts at random. The hosts share nothing but the policy, so what a service keeps (its memory, its disk, its push queue) stays on the host the call landed on. |
 
 ## Cast
 
@@ -60,7 +60,7 @@ clipboard. On camera, in order:
 |---|---|---|---|
 | **admin** | laptop | `~/.wires-admin` | holds the root key; signs the trusted IdP, roles, services, removals and directories |
 | **workbench** | workbench (x86_64 Linux, no firewall port opened) | `~/.wires-demo` | `wires serve host.json`: implements `orders-db`, and is the network's directory |
-| **spare** (optional) | a second host | `~/.wires-spare` | implements `orders-db` too, for the failover beat |
+| **spare** (optional) | a second host | `~/.wires-spare` | implements `orders-db` too, for the beat where the workbench goes down |
 | **agent** | laptop | `~/.wires-agent` | Claude Code, calling `wires call orders-db` from Bash |
 
 ## Before recording (off camera)
@@ -128,7 +128,8 @@ Don't present that Bash rule as a sandbox. Claude Code still auto-allows
 read-only commands like `cat` in the working directory
 ([agent-sandbox.md](agent-sandbox.md)), so start Claude Code from an empty
 directory. If asked, the airtight setups are a container whose `PATH` holds
-only `wires` with `WIRES_LOCKED=1`, or `wires mcp` with no Bash tool at all.
+only `wires` with `WIRES_LOCKED=1` (locked, `wires call` refuses data on
+stdin, so `< file` can't ship a file), or `wires mcp` with no Bash tool at all.
 
 ## The recording
 
@@ -264,9 +265,14 @@ with a reaction time of 20–180 s.
 
 Stop `wires serve` on the workbench and ask the question again.
 
-> "Same command. The admin listed two hosts for `orders-db`; the workbench
-> didn't answer, so the call went to the spare. The agent never named
-> either. That's failover; calls don't spread across them."
+> "Same command. The admin listed two hosts for `orders-db`, and each call
+> goes to one of them at random. The workbench is down, so the spare
+> answered: the caller moves to the next host when one can't be reached.
+> The agent never named either."
+
+Then start `wires serve` on the workbench again before step 6: the removal
+is published to it, and an admin edit keeps trying a directory it can't
+reach for 15 s before it reports the miss.
 
 ### 6. Remove
 
@@ -307,7 +313,9 @@ address>` puts things back.
   `wires`, not of a Bash permission rule.
 - "Every call is recorded", "audit trail". wires keeps no record: each host
   writes one log line per call to its own output.
-- "Scales horizontally" or "load-balanced". A second host is failover.
+- "Load-balanced." Calls spread at random, blind to how busy each host is.
+  Say: calls spread across a service's hosts, which share nothing but the
+  policy.
 - "The admin approves every machine." Anyone a role admits is in from any
   machine they sign in on.
 - "Nothing about other people reaches the agent." Its machine holds only the

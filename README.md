@@ -139,8 +139,9 @@ hosts by key, and sends the caller's ID token in the first message. The ID
 token is bound to the caller's key, so it is useless from any other machine.
 The host verifies the IdP's signature itself, checks its own copy of the
 policy, and runs the command. There is no auth server on the call path. A
-refusal is exit 77 with nothing on stdout. If a service has several hosts
-and one is down, the call goes to the next.
+refusal is exit 77 with nothing on stdout. If a service has several hosts,
+each call goes to one of them at random, and on to the next if that one
+can't be reached.
 
 **The service knows who called.** The command gets the caller's verified
 identity in its environment: `WIRES_CALLER` (the verified claims, as JSON),
@@ -276,8 +277,10 @@ output, and nothing else records calls.
 - **Every service a caller calls gets their ID token**, a bearer credential
   until it expires, and a service's command runs as the host's own Unix user
   unless the operator sets up another.
-- **Several hosts for one service means failover**, not more capacity: a
-  caller tries the next host only when it can't reach one.
+- **Hosts share nothing but the policy.** Calls spread at random across a
+  service's hosts, so a service that keeps state between calls (in memory or
+  on its machine's disk) answers from whichever host the call landed on, and
+  a push waits on the host that sent it.
 - **Hosts and directories hold the whole policy** (roles, services, host
   keys, removals). A caller holds only its view, but a directory sees who
   asks for which view.
