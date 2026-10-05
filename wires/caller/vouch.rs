@@ -179,8 +179,10 @@ impl Vouching {
     /// cached `Fresh`, which still counts beside the host's own (the host's
     /// may have lapsed a moment after the caller's was checked), and a
     /// failure stops the call before stdin: a head older than the view, or
-    /// another head at its version (a newer head is the ack's to check, and
-    /// is noted for a refresh after).
+    /// another head at its version. A newer root-signed head, once spoken,
+    /// needs no directory's word (the host already has what the caller
+    /// sent, and an honest host refuses what its newer policy no longer
+    /// allows): it is the ack's to check, and is noted for a refresh after.
     pub(crate) async fn check(
         &mut self,
         host: NodeId,
@@ -188,6 +190,14 @@ impl Vouching {
         now: i64,
         before_speaking: bool,
     ) -> Result<()> {
+        if !before_speaking && proof.head.head.version > self.version() {
+            proof
+                .head
+                .verify(self.root)
+                .with_context(|| format!("host {}'s newer policy head", host.short()))?;
+            self.note_newer(proof.head.head.version);
+            return Ok(());
+        }
         let unvouched = |e: library::Error| -> anyhow::Error {
             let lapsed = matches!(
                 e,
@@ -447,6 +457,25 @@ mod tests {
         v.check(host().node_id(), &proof(&v4, &dir(), t), t, false)
             .await
             .unwrap();
+        // Once spoken, a newer root-signed head needs no directory's word:
+        // the ack decides (an honest host refuses what it no longer allows).
+        let bare = HostProof {
+            head: v4.head.clone(),
+            fresh: vec![],
+        };
+        v.check(host().node_id(), &bare, t, false).await.unwrap();
+        let rogue = NodeIdentity::from_seed([125; 32]);
+        let mut forged = Policy::new(rogue.node_id());
+        forged.version = StateVersion(9);
+        forged.not_after = i64::MAX;
+        let forged = HostProof {
+            head: forged.sign(&rogue).unwrap().head,
+            fresh: vec![],
+        };
+        assert!(
+            v.check(host().node_id(), &forged, t, false).await.is_err(),
+            "but it must be the root's"
+        );
         // An older head than the view, after speaking: the call stops.
         let mut v = Vouching::new(root().node_id(), held(&v4, None), Scope::Service(orders()));
         assert!(

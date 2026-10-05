@@ -217,8 +217,18 @@ impl World {
         i: usize,
         ks: &Arc<Keystore>,
     ) -> (iroh::EndpointAddr, tokio::sync::oneshot::Sender<()>) {
+        let endpoint = self.bind(&self.hosts[i]).await;
+        self.host_on(i, ks, endpoint).await
+    }
+
+    /// [`host`](Self::host), on `endpoint` (bound for host `i`).
+    async fn host_on(
+        &self,
+        i: usize,
+        ks: &Arc<Keystore>,
+        endpoint: Endpoint,
+    ) -> (iroh::EndpointAddr, tokio::sync::oneshot::Sender<()>) {
         let node = &self.hosts[i];
-        let endpoint = self.bind(node).await;
         let addr = endpoint_addr(&node.node_id(), &localhost_socks(&endpoint), None).unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let serving = Serving {
@@ -934,4 +944,151 @@ async fn a_host_restarted_from_disk_serves_before_any_directory_answers() {
     let ks = w.keystore(&w.hosts[0], &v1);
     let (addr, _stop) = w.host(0, &ks).await;
     assert_eq!(w.call(&addr).await.unwrap(), "hi\n");
+}
+
+/// Card 49's cost, measured: a call whose caller holds no current word for
+/// the host (it sends `Open` and waits for the proof: one flight more) and
+/// one that does (it speaks at once), each on a new connection, to a real
+/// host. On loopback by default; with `WIRES_MEASURE_RELAY=1`, both ends
+/// bind n0's relays and no IP transport, so every packet goes through a
+/// public relay (needs the internet). Not run by `cargo test`:
+///
+/// ```text
+/// cargo test -p wires measure_the_extra_flight -- --ignored --nocapture
+/// WIRES_MEASURE_RELAY=1 cargo test -p wires measure_the_extra_flight -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "a measurement, not a check"]
+async fn measure_the_extra_flight() {
+    use crate::caller::vouch::Scope;
+    let relay = std::env::var_os("WIRES_MEASURE_RELAY").is_some();
+    let rounds = if relay { 30 } else { 200 };
+    let w = World::new().await;
+    let v1 = w.policy(1, Settings::default(), 0);
+    let ks = w.keystore(&w.hosts[0], &v1);
+    let now = now_unix();
+    let word = library::Fresh::sign(&w.dirs[0], &v1.head, now - 1, now + 3600).unwrap();
+    std::fs::write(
+        ks.path(crate::host::freshness::FRESH_FILE),
+        serde_json::to_string(&[&word]).unwrap(),
+    )
+    .unwrap();
+    let relay_only = async |who: &NodeIdentity, alpns: Vec<Vec<u8>>| {
+        Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(crate::host::transport::secret_key(who))
+            .clear_ip_transports()
+            .alpns(alpns)
+            .bind()
+            .await
+            .unwrap()
+    };
+    let (target, _stop) = if relay {
+        let endpoint = relay_only(&w.hosts[0], vec![]).await;
+        tokio::time::timeout(PATIENCE, endpoint.online())
+            .await
+            .expect("no relay within 30 s");
+        let addr = endpoint.addr();
+        let (_, stop) = w.host_on(0, &ks, endpoint).await;
+        (addr, stop)
+    } else {
+        w.host(0, &ks).await
+    };
+    let caller = if relay {
+        relay_only(&w.alice, vec![]).await
+    } else {
+        w.bind(&w.alice).await
+    };
+    let token = w.idp.mint(
+        &library::OidcNonce::for_node(&w.alice.node_id()),
+        now + 3600,
+    );
+    let mut times = [Vec::new(), Vec::new()];
+    for round in 0..rounds + 5 {
+        // Alternate which goes first, so neither pays for the other's close.
+        let order = if round % 2 == 0 { [0, 1] } else { [1, 0] };
+        for cached in order {
+            let out = &mut times[cached];
+            let mut vouch = crate::testutil::vouching(&v1, Scope::Service(service("echo")));
+            if cached == 1 {
+                let fresh = Some(word.clone());
+                let held = crate::caller::view::HeldView::fetched(
+                    library::View {
+                        head: v1.head.clone(),
+                        entries: v1.entries().cloned().collect(),
+                    },
+                    fresh,
+                    now,
+                );
+                vouch = crate::caller::vouch::Vouching::new(
+                    w.root.node_id(),
+                    held,
+                    Scope::Service(service("echo")),
+                );
+            }
+            // The phases `call_service_on` goes through, timed apart.
+            let started = Instant::now();
+            let conn = caller
+                .connect(target.clone(), crate::host::transport::ALPN)
+                .await
+                .unwrap();
+            let connected = started.elapsed();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            let invocation = library::Invocation {
+                service: service("echo"),
+                argv: library::Argv::default(),
+            };
+            let host = w.hosts[0].node_id();
+            crate::host::transport::speak(
+                &mut send,
+                &mut recv,
+                host,
+                &mut vouch,
+                &token,
+                &invocation,
+            )
+            .await
+            .unwrap();
+            let spoke = started.elapsed();
+            let mut stdout = Vec::new();
+            crate::host::transport::converse(
+                send,
+                recv,
+                |_| Ok(()),
+                std::io::Cursor::new(Vec::new()),
+                &mut stdout,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let done = started.elapsed();
+            conn.close(0u32.into(), b"done");
+            assert_eq!(stdout, b"hi\n");
+            // The first few warm the paths up.
+            if round >= 5 {
+                out.push([connected, spoke, done]);
+            }
+        }
+    }
+    // The median of each phase (connected, spoken, done), in ms.
+    let p50 = |v: &[[Duration; 3]]| -> [f64; 3] {
+        std::array::from_fn(|i| {
+            let mut col: Vec<Duration> = v.iter().map(|t| t[i]).collect();
+            col.sort();
+            col[col.len() / 2].as_secs_f64() * 1e3
+        })
+    };
+    let [open, cached] = times;
+    let say = |what: &str, t: [f64; 3]| {
+        eprintln!(
+            "  {what}: connected {:.1} ms, spoken {:.1} ms, exit {:.1} ms",
+            t[0], t[1], t[2]
+        )
+    };
+    eprintln!(
+        "{} x {rounds}, a new connection per call (p50 from the dial):",
+        if relay { "relay only" } else { "loopback" }
+    );
+    say("Open, then the proof", p50(&open));
+    say("speaking at once     ", p50(&cached));
+    caller.close().await;
 }
