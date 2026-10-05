@@ -20,8 +20,10 @@
 //!   `policy push`, `login <network>`, `services`, `call`), with no step
 //!   failing; then removal by person and by node, and `restore`.
 //! - [`follow`] — card 36c: hosts follow a directory's `policy`
-//!   subscription (deltas, resync, failover), and the signed freshness rule
-//!   (`lenient` / `strict`) with every directory down.
+//!   subscription (deltas, resync, failover); and card 49: a caller tells a
+//!   host nothing until another directory vouches for the head it holds, so
+//!   a removed host (one that is also a directory included) gets no token,
+//!   and with every directory down calls fail closed.
 //! - [`views`] — card 37: each caller holds only its view, and a running
 //!   `wires mcp` hears of a grant or a revocation within 2 s.
 //! - [`restart`] — card 48: an admin edit made right after a directory
@@ -52,7 +54,8 @@ mod services_host;
 
 /// Starting a network: no step errors, in the order each step names.
 mod first_run;
-/// Card 36c: hosts follow the directory by subscription; the freshness rule.
+/// Card 36c: hosts follow the directory by subscription; card 49: the
+/// removed-host window.
 mod follow;
 /// `wires gateway`: OAuth sign-in and MCP over HTTP, end to end.
 mod gateway;
@@ -245,7 +248,9 @@ impl Outcome {
 /// Dial the host at `addr` as `who` on the session ALPN, say `hello`, invoke
 /// `name` with `args`, close stdin, and collect the outcome. Hand-rolled
 /// frames, so a test can present any `Hello` (the dial `wires call` makes
-/// has its own tests in `caller::call`).
+/// has its own tests in `caller::call`). It trusts the host blindly: the
+/// host's proof is skipped, not checked (the caller's check, card 49, is
+/// tested where callers are).
 async fn call(
     who: &NodeIdentity,
     addr: &EndpointAddr,
@@ -265,7 +270,11 @@ async fn call(
             send.write_all(&frame.encode().unwrap()).await.unwrap();
         }
         send.finish().unwrap();
-        let ack = match read_frame(&mut recv).await {
+        let mut first = read_frame(&mut recv).await;
+        if matches!(first, Some(Frame::Proof(_))) {
+            first = read_frame(&mut recv).await;
+        }
+        let ack = match first {
             Some(Frame::HelloAck(ack)) => ack,
             Some(Frame::Denied { reason }) => return Outcome::Denied(reason),
             other => panic!("unexpected first answer: {other:?}"),

@@ -195,7 +195,7 @@ Examples:
 pub(crate) const POLICY_AFTER: &str = "\
 Examples:
   wires policy push
-  wires policy settings --freshness strict";
+  wires policy settings --fresh-secs 300";
 
 /// `wires serve`: examples.
 pub(crate) const SERVE_AFTER: &str = "\

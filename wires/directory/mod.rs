@@ -6,9 +6,11 @@
 //! head the root signed (the admin publishes each edit to every directory;
 //! the first directory starts empty and takes the first), follows the
 //! other directories as a replica, and answers hosts and callers. **It never
-//! decides a call:** hosts decide from their own copy, so calls keep working
-//! with every directory down. It is trusted for availability and freshness
-//! only: everything it serves is root-signed.
+//! decides a call:** hosts decide from their own copy. But a caller tells a
+//! host nothing without a directory's current `Fresh` for the head that host
+//! holds (card 49), so with every directory down calls stop within
+//! `fresh_secs`. It is trusted for availability and freshness only:
+//! everything it serves is root-signed.
 //!
 //! It is a mode on its own ALPNs (`wires/directory/2`,
 //! `wires/directory-sub/2`), not a native service: hosts aren't people, and

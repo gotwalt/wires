@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use library::{IdToken, IdentityClaim, OidcNonce, SignedPolicy, View};
+use library::{IdToken, IdentityClaim, OidcNonce, SignedPolicy};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use url::Url;
@@ -32,6 +32,7 @@ use url::Url;
 use crate::caller::call::{CallOutcome, Caller};
 use crate::caller::jwks::KeyFetcher;
 use crate::caller::mock_idp::MockIdp;
+use crate::caller::view::HeldView;
 use crate::gateway::clients::{ClientKey, MetadataFetcher};
 use crate::gateway::sessions::Session;
 use crate::gateway::sessions::Store;
@@ -85,19 +86,20 @@ impl Backend for Scripted {
     type Caller = Recording;
     /// The view a directory would cut for the session's (verified) user,
     /// or its refusal of a user the policy doesn't admit.
-    async fn view(&self, session: &Session) -> anyhow::Result<Arc<View>> {
+    async fn view(&self, session: &Session) -> anyhow::Result<Arc<HeldView>> {
         let node = crate::testutil::any_node();
         if library::check_admitted(&self.state.to_policy()?, node, &session.principal).is_err() {
             return Err(anyhow::anyhow!(crate::host::gate::NOT_ADMITTED)
                 .context(crate::caller::view::NotAdmitted));
         }
-        Ok(Arc::new(self.state.view_for(
-            crate::testutil::any_node(),
-            Some(&session.principal),
+        Ok(Arc::new(HeldView::fetched(
+            self.state
+                .view_for(crate::testutil::any_node(), Some(&session.principal), None),
             None,
+            crate::clock::now_unix(),
         )))
     }
-    fn caller(&self, token: IdToken, _view: Arc<View>) -> Recording {
+    fn caller(&self, token: IdToken, _view: Arc<HeldView>) -> Recording {
         Recording {
             token,
             seen: Arc::clone(&self.seen),

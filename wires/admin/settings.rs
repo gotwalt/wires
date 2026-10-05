@@ -1,24 +1,26 @@
 //! `wires policy settings`: the network-wide settings in the signed policy
-//! (card 36c): the freshness rule, and how often directories vouch.
+//! (cards 36c and 49): how often directories vouch, and for how long.
 //!
-//! - `--freshness lenient | strict`: what a host does when no directory has
-//!   vouched for its policy recently ([`crate::host::freshness`]).
 //! - `--beat-secs N`: how often each directory signs a new `Fresh` (and
 //!   beats its subscriptions).
 //! - `--fresh-secs N`: how long each `Fresh` is good for (at least the
-//!   beat).
+//!   beat). It is the removed-host window: a caller sends a host nothing
+//!   until a current `Fresh` from another directory vouches for the host's
+//!   policy ([`crate::caller::vouch`]), so a host the admin removed can
+//!   still be called for at most this long after the edit reaches the
+//!   directories; and with every directory down, calls stop after it.
 //!
 //! With no flag it prints the settings and edits nothing; with any, it signs
 //! the next policy and publishes it, like every admin edit.
 //!
 //! ```text
-//! wires policy settings                        # print them
-//! wires policy settings --freshness strict     # bans honoured within 15 min, or no calls
+//! wires policy settings                    # print them
+//! wires policy settings --fresh-secs 300   # removal holds within 5 min
 //! ```
 
 use anyhow::{Result, anyhow};
-use clap::{Args, ValueEnum};
-use library::{FreshnessMode, Settings};
+use clap::Args;
+use library::Settings;
 
 use super::keystore::Keystore;
 use super::service::edit_policy;
@@ -28,16 +30,13 @@ use crate::policy::store;
 /// `policy settings` arguments. None given: print the settings.
 #[derive(Args, Debug, Default)]
 pub(crate) struct SettingsArgs {
-    /// When no directory has vouched for a host's policy lately: keep deciding, or refuse
-    // `lenient` keeps deciding (and traces it), `strict` refuses every call
-    // until a directory vouches again.
-    #[arg(long, value_enum)]
-    pub(crate) freshness: Option<Freshness>,
     /// How often each directory signs a new freshness timestamp, in
     /// seconds.
     #[arg(long)]
     pub(crate) beat_secs: Option<u32>,
-    /// How long each freshness timestamp is good for, in seconds (at least the beat).
+    /// How long each freshness timestamp is good for, in seconds (at least the beat)
+    // The removed-host window: a caller sends a host nothing without a
+    // current one from another directory.
     #[arg(long)]
     pub(crate) fresh_secs: Option<u32>,
     /// Lifetime of the new policy, from now; never shortens the current one.
@@ -45,35 +44,14 @@ pub(crate) struct SettingsArgs {
     pub(crate) ttl: Ttl,
 }
 
-/// `--freshness` values.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub(crate) enum Freshness {
-    /// Keep deciding under the held policy until it expires.
-    Lenient,
-    /// Refuse calls until a directory vouches again.
-    Strict,
-}
-
-impl From<Freshness> for FreshnessMode {
-    fn from(f: Freshness) -> FreshnessMode {
-        match f {
-            Freshness::Lenient => FreshnessMode::Lenient,
-            Freshness::Strict => FreshnessMode::Strict,
-        }
-    }
-}
-
 impl SettingsArgs {
     /// Whether any setting is given (an edit), rather than none (print).
     pub(crate) fn is_edit(&self) -> bool {
-        self.freshness.is_some() || self.beat_secs.is_some() || self.fresh_secs.is_some()
+        self.beat_secs.is_some() || self.fresh_secs.is_some()
     }
 
     /// `settings` with the given ones changed.
     fn apply(&self, settings: &mut Settings) {
-        if let Some(f) = self.freshness {
-            settings.freshness = f.into();
-        }
         if let Some(b) = self.beat_secs {
             settings.beat_secs = b;
         }
@@ -85,12 +63,8 @@ impl SettingsArgs {
 
 /// One line for `settings`.
 pub(crate) fn line(settings: &Settings) -> String {
-    let mode = match settings.freshness {
-        FreshnessMode::Lenient => "lenient",
-        FreshnessMode::Strict => "strict",
-    };
     format!(
-        "freshness {mode}; beat {} s; fresh {} s",
+        "beat {} s; fresh {} s",
         settings.beat_secs, settings.fresh_secs
     )
 }
@@ -141,10 +115,7 @@ mod tests {
             .unwrap()
             .version();
         let out = settings_in(&ks, &SettingsArgs::default()).unwrap();
-        assert!(
-            out.starts_with("freshness lenient; beat 300 s; fresh 900 s"),
-            "{out}"
-        );
+        assert!(out.starts_with("beat 300 s; fresh 900 s"), "{out}");
         let after = store::read(&ks, ks.network_root().unwrap().unwrap())
             .unwrap()
             .unwrap()
@@ -152,33 +123,21 @@ mod tests {
         assert_eq!(before, after);
     }
 
-    /// An admin whose policy lists one directory (strict needs one).
-    fn admin_with_a_directory() -> Keystore {
-        let ks = admin();
-        let dir = library::NodeIdentity::generate().node_id();
-        crate::admin::service::directory_add(&ks, dir, Ttl::default()).unwrap();
-        ks
-    }
-
     #[test]
     fn an_edit_signs_the_next_policy() {
-        let ks = admin_with_a_directory();
+        let ks = admin();
         let a = SettingsArgs {
-            freshness: Some(Freshness::Strict),
             beat_secs: Some(60),
             fresh_secs: Some(180),
             ..SettingsArgs::default()
         };
         let out = settings_in(&ks, &a).unwrap();
-        assert!(
-            out.contains("freshness strict; beat 60 s; fresh 180 s"),
-            "{out}"
-        );
+        assert!(out.contains("beat 60 s; fresh 180 s"), "{out}");
         let held = store::read(&ks, ks.network_root().unwrap().unwrap())
             .unwrap()
             .unwrap();
-        assert_eq!(held.policy.settings.freshness, FreshnessMode::Strict);
         assert_eq!(held.policy.settings.beat_secs, 60);
+        assert_eq!(held.policy.settings.fresh_secs, 180);
     }
 
     #[test]
@@ -196,13 +155,5 @@ mod tests {
         ] {
             assert!(settings_in(&ks, &a).is_err(), "{a:?}");
         }
-        // Strict with no directory: nothing could vouch for the policy.
-        let strict = SettingsArgs {
-            freshness: Some(Freshness::Strict),
-            ..SettingsArgs::default()
-        };
-        let err = format!("{:#}", settings_in(&ks, &strict).unwrap_err());
-        assert!(err.contains("wires directory add"), "{err}");
-        assert!(settings_in(&admin_with_a_directory(), &strict).is_ok());
     }
 }

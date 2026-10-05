@@ -201,3 +201,52 @@ pub(crate) fn join(
 pub(crate) fn any_node() -> library::NodeId {
     library::NodeIdentity::from_seed([0xee; 32]).node_id()
 }
+
+/// A directory no test runs, whose word (a `Fresh`) tests hand to hosts so
+/// callers will talk to them (card 49): list it in a policy's
+/// `directories`, then [`vouch_on_disk`] or [`vouch_for`].
+pub(crate) fn test_directory() -> library::NodeIdentity {
+    library::NodeIdentity::from_seed([0xd1; 32])
+}
+
+/// A `Fresh` [`test_directory`] signs for `head`, current for the next hour.
+pub(crate) fn test_fresh(head: &library::SignedPolicyHead) -> library::Fresh {
+    let now = crate::clock::now_unix();
+    library::Fresh::sign(&test_directory(), head, now - 60, now + 3600).unwrap()
+}
+
+/// Leave [`test_fresh`] for `head` in a host's keystore (`fresh.json`), as
+/// a directory's beat would: a host built from it shows callers that word.
+pub(crate) fn vouch_on_disk(
+    ks: &crate::admin::keystore::Keystore,
+    head: &library::SignedPolicyHead,
+) {
+    let text = serde_json::to_string(&[test_fresh(head)]).unwrap();
+    std::fs::create_dir_all(ks.path("")).unwrap();
+    std::fs::write(ks.path(crate::host::freshness::FRESH_FILE), text).unwrap();
+}
+
+/// Hand a running host [`test_fresh`] for the head it holds.
+pub(crate) fn vouch_for(host: &crate::host::gate::ServicesHost) {
+    let head = host.policy().unwrap().signed.head.clone();
+    host.freshness
+        .offer(&test_fresh(&head), &head, crate::clock::now_unix())
+        .unwrap();
+}
+
+/// What a caller checks hosts against when it holds `state`'s every entry
+/// (a view no directory cut: for tests that don't care whose view it is).
+pub(crate) fn vouching(
+    state: &library::SignedPolicy,
+    scope: crate::caller::vouch::Scope,
+) -> crate::caller::vouch::Vouching {
+    let view = library::View {
+        head: state.head.clone(),
+        entries: state.entries().cloned().collect(),
+    };
+    crate::caller::vouch::Vouching::new(
+        state.head.head.fabric,
+        crate::caller::view::HeldView::fetched(view, None, crate::clock::now_unix()),
+        scope,
+    )
+}

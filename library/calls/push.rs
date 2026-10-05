@@ -12,7 +12,13 @@
 //!   [`Deliver`](InboxFrame::Deliver); the receiver stores what it accepts
 //!   and answers [`Ack`](InboxFrame::Ack).
 //! - **fetch**: the recipient dials the host (`wires inbox`, no receiver
-//!   needed), says `Hello` and [`Fetch`](InboxFrame::Fetch) —
+//!   needed). **The host speaks first** (card 49): a
+//!   [`Proof`](InboxFrame::Proof), its head and the current `Fresh`es it
+//!   holds for it ([`HostProof`]), and the recipient presents nothing until
+//!   that checks out. It opens with [`Open`](InboxFrame::Open) and waits for
+//!   the proof, or, holding a current word for this host already, opens
+//!   with its `Hello` at once and still checks the proof before it reads a
+//!   message. Then it says `Hello` and [`Fetch`](InboxFrame::Fetch) —
 //!   optionally holding the stream open up to `wait_ms` for a message to
 //!   arrive — and the host answers `Deliver` (possibly empty); the recipient
 //!   stores and `Ack`s, and only acknowledged messages leave the host's queue.
@@ -76,10 +82,11 @@ use crate::codec::{canonical_bytes, hex_id, length_prefixed, prefix_len, split_f
 use crate::error::{Error, Result};
 use crate::identity::NodeId;
 use crate::idp::IdToken;
+use crate::proof::HostProof;
 
 /// The ALPN of the inbox protocol: a host's fetch endpoint and a waiting
 /// caller's receiver both speak it.
-pub const INBOX_ALPN: &[u8] = b"wires/inbox/3";
+pub const INBOX_ALPN: &[u8] = b"wires/inbox/4";
 
 /// Longest [`Subject`], in bytes.
 pub const MAX_SUBJECT: usize = 128;
@@ -98,8 +105,10 @@ pub const MAX_BATCH: usize = 32;
 /// before the peer is authorized.
 pub const MAX_INBOX_FRAME: usize = 4 * 1024 * 1024;
 
-/// Largest [`InboxFrame::Hello`] or [`InboxFrame::Fetch`] a peer reads
-/// before it knows who is asking: an ID token fits in a few KiB, so a peer that isn't admitted can't make it buffer the
+/// Largest [`InboxFrame::Hello`], [`InboxFrame::Fetch`] or
+/// [`InboxFrame::Proof`] a peer reads before it knows who is asking (or
+/// before the host proved it is current): an ID token, or a head and a few
+/// `Fresh`es, fit in a few KiB, so a peer can't make it buffer the
 /// [`MAX_INBOX_FRAME`] a delivery may need.
 pub const MAX_INBOX_HELLO: usize = 64 * 1024;
 
@@ -252,7 +261,17 @@ impl PushMessage {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboxFrame {
-    /// The dialer's opening frame: from a recipient, its IdP ID token
+    /// A fetcher's opening frame when it waits for the host's
+    /// [`Proof`](Self::Proof) before it presents anything (a QUIC stream
+    /// reaches the host only once its dialer writes).
+    Open {},
+    /// Host to fetcher, always the host's first frame on a fetch: its head and
+    /// the current `Fresh`es it holds for it.
+    Proof {
+        /// The host's proof.
+        proof: HostProof,
+    },
+    /// The dialer's credential: from a recipient, its IdP ID token
     /// (nonce-bound to its node key), which is what admits its fetch; from
     /// a host delivering, none. The dialer's identity is the key iroh
     /// authenticated; the token proves who it signed in as.

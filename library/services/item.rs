@@ -148,40 +148,24 @@ pub struct IssuerConfig {
     pub audiences: Vec<Audience>,
 }
 
-/// What a host does when its [`Fresh`](crate::Fresh) lapses (no directory
-/// reachable).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FreshnessMode {
-    /// Keep deciding under the held head until its `not_after`, and report
-    /// the staleness. Calls never depend on a directory. The default.
-    #[default]
-    Lenient,
-    /// Refuse calls until a current `Fresh` arrives: bans are honoured within
-    /// [`Settings::fresh_secs`] everywhere, and a directory becomes a
-    /// dependency for calls.
-    Strict,
-}
-
 /// The network-wide settings (the body of the one `settings` item).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
-    /// What a host does when its freshness lapses.
-    pub freshness: FreshnessMode,
     /// How often each directory signs a new [`Fresh`](crate::Fresh), in
     /// seconds (also the subscription beat). More than zero.
     pub beat_secs: u32,
     /// How long each `Fresh` is good for, in seconds (`until - at`). At least
-    /// `beat_secs`.
+    /// `beat_secs`. It is the removed-host window (card 49): a caller sends a
+    /// host nothing until a current `Fresh` from a directory other than that
+    /// host vouches for the head the host holds.
     pub fresh_secs: u32,
 }
 
 impl Default for Settings {
-    /// `lenient`, a 5-minute beat, 15-minute freshness.
+    /// A 5-minute beat, 15-minute freshness.
     fn default() -> Self {
         Settings {
-            freshness: FreshnessMode::Lenient,
             beat_secs: DEFAULT_BEAT_SECS,
             fresh_secs: DEFAULT_FRESH_SECS,
         }
@@ -310,7 +294,7 @@ mod tests {
         };
         assert_eq!(
             json(&settings),
-            r#"{"body":{"beat_secs":300,"fresh_secs":900,"freshness":"lenient"},"kind":"settings"}"#
+            r#"{"body":{"beat_secs":300,"fresh_secs":900},"kind":"settings"}"#
         );
         let issuer = Item::Issuer {
             key: Issuer::new("https://idp"),
@@ -389,10 +373,9 @@ mod tests {
         for bad in [
             ban_with_body.as_str(),
             r#"{"kind":"person_ban","key":{"issuer":"https://i","email":"e@x.com","x":1}}"#,
-            r#"{"kind":"settings","body":{"beat_secs":1,"fresh_secs":1,"freshness":"lenient","x":1}}"#,
-            r#"{"kind":"settings","key":"k","body":{"beat_secs":1,"fresh_secs":1,"freshness":"lenient"}}"#,
+            r#"{"kind":"settings","body":{"beat_secs":1,"fresh_secs":1,"x":1}}"#,
+            r#"{"kind":"settings","key":"k","body":{"beat_secs":1,"fresh_secs":1}}"#,
             r#"{"kind":"nonsense","key":"x","body":{}}"#,
-            r#"{"kind":"settings","body":{"beat_secs":1,"fresh_secs":1,"freshness":"sloppy"}}"#,
         ] {
             assert!(serde_json::from_str::<Item>(bad).is_err(), "{bad}");
         }
@@ -401,21 +384,20 @@ mod tests {
     #[test]
     fn defaults() {
         let s = Settings::default();
-        assert_eq!(s.freshness, FreshnessMode::Lenient);
         assert_eq!(s.beat_secs, DEFAULT_BEAT_SECS);
         assert_eq!(s.fresh_secs, DEFAULT_FRESH_SECS);
     }
 
     proptest! {
         #[test]
-        fn items_round_trip(seed in any::<u8>(), email in "[a-z]{1,8}@[a-z]{1,8}[.]com", strict in any::<bool>()) {
+        fn items_round_trip(seed in any::<u8>(), email in "[a-z]{1,8}@[a-z]{1,8}[.]com", beat in 1u32..1_000) {
             let items = [
                 Item::Ban { key: node(seed) },
                 Item::PersonBan { key: Person::new(Issuer::new("https://idp"), &email) },
                 Item::Settings {
                     body: Settings {
-                        freshness: if strict { FreshnessMode::Strict } else { FreshnessMode::Lenient },
-                        ..Settings::default()
+                        beat_secs: beat,
+                        fresh_secs: beat * 3,
                     },
                 },
             ];

@@ -11,7 +11,7 @@
 //! - **Signed bytes:** [`POLICY_HEAD_CONTEXT`] followed by the canonical JSON
 //!   of `{alg, head}`. The context separates it from service entries
 //!   and [`Fresh`](crate::Fresh).
-//! - **Format:** [`POLICY_V4`], a signed discriminant; any other format is
+//! - **Format:** [`POLICY_V5`], a signed discriminant; any other format is
 //!   refused, and unknown fields are refused at decode.
 //! - **Versioning:** [`StateVersion`] only goes up, and a node adopts a head
 //!   only if it verifies, is fresh and
@@ -48,8 +48,9 @@ use crate::item::Item;
 #[serde(transparent)]
 pub struct StateVersion(pub u64);
 
-/// The policy head format: 4, the only one accepted.
-pub const POLICY_V4: u8 = 4;
+/// The policy head format: 5, the only one accepted (4's settings item
+/// carried a freshness rule; card 49 moved that decision to the caller).
+pub const POLICY_V5: u8 = 5;
 
 /// Domain-separation prefix of a head's signed bytes.
 pub const POLICY_HEAD_CONTEXT: &[u8] = b"wires/policy-head/v1\0";
@@ -93,7 +94,7 @@ impl ItemsHash {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyHead {
-    /// Format discriminant; [`POLICY_V4`]. Signed.
+    /// Format discriminant; [`POLICY_V5`]. Signed.
     pub format: u8,
     /// The root's node id: the authority, pinned by
     /// [`SignedPolicyHead::verify`].
@@ -171,7 +172,7 @@ impl SignedPolicyHead {
         if self.alg != AlgorithmId::Ed25519 {
             return Err(Error::UnsupportedAlgorithm);
         }
-        if self.head.format != POLICY_V4 {
+        if self.head.format != POLICY_V5 {
             return Err(Error::UnsupportedVersion);
         }
         if self.head.fabric != root {
@@ -243,7 +244,7 @@ mod tests {
 
     fn sample() -> PolicyHead {
         PolicyHead {
-            format: POLICY_V4,
+            format: POLICY_V5,
             fabric: root().node_id(),
             version: StateVersion(3),
             issued: 10,
@@ -305,7 +306,7 @@ mod tests {
     #[test]
     fn format_and_duplicate_directories_are_refused() {
         let mut h = sample();
-        h.format = POLICY_V4 - 1;
+        h.format = POLICY_V5 - 1;
         let signed = SignedPolicyHead {
             sig: root().sign(&signed_bytes(&h, &AlgorithmId::Ed25519).unwrap()),
             head: h,

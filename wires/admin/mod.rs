@@ -22,8 +22,8 @@
 //!   rm`.
 //! - [`propagate`] — publishing each edit to the directories (an edit that
 //!   reaches none fails, after the first run), and `wires policy push`.
-//! - [`settings`] — `wires policy settings`: the freshness rule and the
-//!   directories' beat, in the signed policy.
+//! - [`settings`] — `wires policy settings`: the directories' beat and how
+//!   long their word lasts (the removed-host window), in the signed policy.
 //! - [`keystore`] — the on-disk home: keys, the network string, and the
 //!   flag → env → file → keystore resolution every command uses.
 //! - [`ttl`] — the `--policy-ttl` / `--timeout` lifetimes.

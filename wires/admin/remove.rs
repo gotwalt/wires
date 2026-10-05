@@ -321,30 +321,6 @@ mod tests {
         assert!(format!("{e:#}").contains("own node"), "{e:#}");
     }
 
-    /// Under strict freshness, removing the last directory would leave
-    /// nothing to vouch for the policy: refused, naming the way out, and
-    /// nothing changes.
-    #[test]
-    fn removing_the_last_directory_under_strict_is_refused() {
-        let ks = admin();
-        let dir = node(4);
-        crate::admin::service::directory_add(&ks, dir, Ttl::default()).unwrap();
-        crate::admin::settings::settings_in(
-            &ks,
-            &crate::admin::settings::SettingsArgs {
-                freshness: Some(crate::admin::settings::Freshness::Strict),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let before = stored(&ks).version();
-        let err = format!("{:#}", remove_in(&ks, who(&dir.hex())).unwrap_err());
-        assert!(err.contains("freshness is strict"), "{err}");
-        assert!(err.contains("--freshness lenient"), "{err}");
-        assert_eq!(stored(&ks).version(), before);
-        assert_eq!(stored(&ks).directories(), &[dir]);
-    }
-
     #[test]
     fn not_an_email_and_not_a_node_is_refused() {
         let ks = admin();

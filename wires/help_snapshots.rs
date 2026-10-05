@@ -198,7 +198,6 @@ fn error_messages_match_their_snapshot() {
             principal: "alice@example.com".into(),
         }
         .to_string(),
-        GateRefusal::Unvouched { version: v }.to_string(),
         SIGN_IN_EXPIRED.to_owned(),
         IDP_UNREACHABLE.to_owned(),
         HOST_MISCONFIGURED.to_owned(),
@@ -224,6 +223,14 @@ fn error_messages_match_their_snapshot() {
     let call = crate::caller::call::not_callable;
     lines.push(format!("wires: {} [exit 1]", call(&svc)));
     lines.push(format!("wires: {} [exit 1]", help::NOT_SIGNED_IN));
+    // Card 49: no host could show a directory's current word, so nothing
+    // was sent anywhere (fail closed).
+    let unvouched = crate::caller::vouch::all_unvouched(
+        "a host of `orders-db`",
+        &["3ef7a1c2: no directory has vouched for this host's policy recently".into()],
+    )
+    .context("calling orders-db");
+    lines.push(format!("wires: {} [exit 1]", help::brief(&unvouched)));
     lines.push(format!("wires: {StdinRefused} [exit 2]"));
     lines.push(format!("wires: {} [exit 1]", help::NOT_JOINED));
     let ks = crate::admin::keystore::Keystore::at("/home/me/.wires");

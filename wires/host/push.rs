@@ -583,7 +583,9 @@ impl PushHost {
     }
 
     /// Serve one fetch from `caller` over an accepted stream. See the module
-    /// docs.
+    /// docs. Like a session, it opens with this host's proof (its head and
+    /// the current `Fresh`es it holds, card 49), then reads the fetcher's
+    /// `open` and `hello`, or its `hello` at once.
     ///
     /// Before the caller is known to be admitted, at most
     /// [`MAX_PREAUTH_FETCHES`] fetches are read at once and each opening
@@ -618,7 +620,27 @@ impl PushHost {
             deny(&mut send, "this host is busy; try again").await;
             return Ok(());
         };
-        let id_token = match read_frame_within(&mut recv, FRAME_TIMEOUT, MAX_INBOX_HELLO).await {
+        let state = match self.host.policy() {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::warn!("signed policy unusable: {e:#}");
+                deny(&mut send, HOST_MISCONFIGURED).await;
+                return Ok(());
+            }
+        };
+        // The host speaks first, as on a call (card 49): its head and who
+        // vouched for it. A fetcher presents its token only once that checks
+        // out.
+        let proof =
+            self.host
+                .freshness
+                .proof(&state.signed.head, self.host.me, crate::clock::now_unix());
+        write_frame(&mut send, &InboxFrame::Proof { proof }).await?;
+        let mut first = read_frame_within(&mut recv, FRAME_TIMEOUT, MAX_INBOX_HELLO).await;
+        if matches!(first, Ok(Some(InboxFrame::Open {}))) {
+            first = read_frame_within(&mut recv, FRAME_TIMEOUT, MAX_INBOX_HELLO).await;
+        }
+        let id_token = match first {
             Ok(Some(InboxFrame::Hello { id_token })) => id_token,
             other => {
                 let detail = match other {
@@ -643,14 +665,6 @@ impl PushHost {
             }
         };
         let now = crate::clock::now_unix();
-        let state = match self.host.policy() {
-            Ok(state) => state,
-            Err(e) => {
-                tracing::warn!("signed policy unusable: {e:#}");
-                deny(&mut send, HOST_MISCONFIGURED).await;
-                return Ok(());
-            }
-        };
         // Admission first, as for a call: the fetcher's ID token (from
         // `wires login`) must verify, which is also how this host learns who
         // it is, and so its roles; then `check_admitted` (bans, email, a role).
@@ -1219,7 +1233,12 @@ mod tests {
         push.serve_fetch(send, std::io::Cursor::new(bytes), caller)
             .await
             .unwrap();
-        match read_frame(&mut answer, FRAME_TIMEOUT).await.unwrap() {
+        // The host's proof always comes first (card 49).
+        let mut first = read_frame(&mut answer, FRAME_TIMEOUT).await.unwrap();
+        if matches!(first, Some(InboxFrame::Proof { .. })) {
+            first = read_frame(&mut answer, FRAME_TIMEOUT).await.unwrap();
+        }
+        match first {
             Some(InboxFrame::Denied { reason }) => reason,
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -1297,7 +1316,7 @@ mod tests {
     async fn an_oversized_inbox_hello_is_refused_at_the_prefix() {
         let push = push_host();
         let (mut to_host, from_peer) = tokio::io::duplex(1024);
-        let (send, mut answer) = tokio::io::duplex(1024);
+        let (send, mut answer) = tokio::io::duplex(64 * 1024);
         to_host
             .write_all(&((MAX_INBOX_HELLO + 1) as u32).to_be_bytes())
             .await
@@ -1309,6 +1328,10 @@ mod tests {
         .await
         .expect("the host waited for an oversized hello")
         .unwrap();
+        let Some(InboxFrame::Proof { .. }) = read_frame(&mut answer, FRAME_TIMEOUT).await.unwrap()
+        else {
+            panic!("expected the host's proof first");
+        };
         let Some(InboxFrame::Denied { .. }) = read_frame(&mut answer, FRAME_TIMEOUT).await.unwrap()
         else {
             panic!("expected a refusal");

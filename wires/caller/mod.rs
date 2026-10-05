@@ -27,6 +27,8 @@
 //! - [`hello`] — the stored ID token the caller presents in each `hello`.
 //! - [`join`] — `wires id` and `wires join <network>` (a host, a directory,
 //!   the gateway); `wires login <network>` joins the same way, then signs in.
+//! - [`vouch`] — the check of a host's proof that it is current, before the
+//!   caller tells it anything (card 49).
 
 pub mod call;
 pub mod hello;
@@ -45,6 +47,7 @@ pub mod pick;
 pub mod services;
 pub mod shape;
 pub mod view;
+pub mod vouch;
 
 /// `s` on one line: newlines and every other control character escaped, so
 /// text from elsewhere (a pushed message) can't forge a

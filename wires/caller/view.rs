@@ -2,8 +2,9 @@
 //! may call, each a root-signed entry, and nothing else.
 //!
 //! A caller never holds the policy. It holds `$WIRES_HOME/view.json`
-//! ([`HeldView`]): the root-signed head, the directory's newest [`Fresh`]
-//! for it, and the signed entries a directory cut for its ID token. No
+//! ([`HeldView`]): the root-signed head, the newest [`Fresh`] each directory
+//! signed for it that this caller has seen (from a directory, or in a host's
+//! proof), and the signed entries a directory cut for its ID token. No
 //! role, no ban, no other service, and no node id but its services' hosts
 //! and the directories. Every entry verifies on its own under the root
 //! ([`View::verify`]), so a directory can't forge one; what it could do is
@@ -19,12 +20,14 @@
 //!   the view is older than a day ([`VIEW_MAX_AGE_SECS`]), its head has
 //!   expired, or a host reported a newer head ([`HeldView::is_stale`]);
 //!   otherwise they dial from the view as it is ([`usable`]). A refresh no
-//!   directory answers leaves the view as it is: calls keep working with
-//!   every directory down, so the hard bound on dialing from an old view is
-//!   its head's `not_after`, not a day. When the host's `HelloAck` reports a newer
-//!   head, the caller records it ([`note_seen`]) and refreshes after the
-//!   call; a name not in the view is asked of a directory with `resolve`
-//!   before the call fails.
+//!   directory answers leaves the view as it is. That is not what bounds a
+//!   call to a host the admin removed: a caller tells a host nothing until a
+//!   current `Fresh` from a directory other than that host vouches for the
+//!   head the host holds (card 49, [`vouch`](crate::caller::vouch)), so the
+//!   bound is `fresh_secs`, and with every directory down calls fail closed.
+//!   When the host's proof or `HelloAck` reports a newer head, the caller
+//!   records it ([`note_seen`]) and refreshes; a name not in the view is
+//!   asked of a directory with `resolve` before the call fails.
 //! - `wires mcp`, the gateway and `inbox --wait` hold a subscription
 //!   ([`follow`]): the whole view, then an update per new head.
 //!
@@ -38,8 +41,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::Endpoint;
 use library::{
-    DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, Fresh, IdToken, NodeId, ServiceName,
-    SignedEntry, StateVersion, SubFrame, SubRequest, SubscriptionKind, View, ViewDigest,
+    DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, Fresh, FreshSet, IdToken, NodeId,
+    ServiceName, SignedEntry, StateVersion, SubFrame, SubRequest, SubscriptionKind, View,
+    ViewDigest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -55,13 +59,11 @@ pub(crate) const VIEW_FILE: &str = "view.json";
 /// How old a view may be before `wires services`, `wires call` or `wires
 /// inbox` refreshes it: a day.
 ///
-/// This is **not** a bound on how long a caller holding a view from before a
-/// host's removal may still dial that host (protocol §5): when no directory
-/// answers the refresh, the caller keeps its view; and a removed machine
-/// that was also a directory the old head lists can answer `current` with
-/// a `Fresh` it signs for that head, resetting the day. The hard bound is
-/// the view's head's `not_after` (90 days by default): an expired view is
-/// never dialed from.
+/// This is **not** what bounds a call to a host the admin removed (protocol
+/// §5): a caller sends a host nothing until a current `Fresh` from another
+/// directory vouches for the host's head ([`vouch`](crate::caller::vouch)),
+/// so that bound is the network's `fresh_secs`. An expired view is never
+/// dialed from.
 pub(crate) const VIEW_MAX_AGE_SECS: i64 = 24 * 60 * 60;
 
 /// How long a refresh spends asking, all directories together.
@@ -70,17 +72,20 @@ pub(crate) const REFRESH_BUDGET: Duration = Duration::from_secs(8);
 /// The longest a subscriber waits between two attempts to follow.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// `view.json`: the view, the newest `Fresh` for its head, when a directory
-/// last vouched for it, and the newest head version a host reported.
+/// `view.json`: the view, the newest `Fresh` per directory seen for it, when
+/// a directory last vouched for it, and the newest head version a host
+/// reported.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HeldView {
     /// The view: the root-signed head and this caller's entries.
     pub(crate) view: View,
-    /// The newest `Fresh` a directory signed for its head (none when the
-    /// view was cut locally from a whole policy).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) fresh: Option<Fresh>,
+    /// The newest `Fresh` each directory signed that this caller has seen,
+    /// from a directory or in a host's proof: what lets it speak to a host
+    /// at once (card 49). Empty when the view was cut locally from a whole
+    /// policy and no host has shown one yet. Every use verifies each again.
+    #[serde(default, skip_serializing_if = "FreshSet::is_empty")]
+    pub(crate) fresh: FreshSet,
     /// When a directory last vouched for the view (unix seconds; 0: never).
     pub(crate) checked: i64,
     /// The newest head version a host reported in a `HelloAck` (0: none
@@ -91,12 +96,25 @@ pub(crate) struct HeldView {
 impl HeldView {
     /// A view just fetched (or cut) at `now`.
     pub(crate) fn fetched(view: View, fresh: Option<Fresh>, now: i64) -> HeldView {
+        let mut set = FreshSet::default();
+        if let Some(f) = fresh {
+            set.insert(f, now);
+        }
         HeldView {
             view,
-            fresh,
+            fresh: set,
             checked: now,
             seen: StateVersion(0),
         }
+    }
+
+    /// Keep, beside its own, what `old` had seen from each directory: a
+    /// refreshed view's head may still be the one they vouch for.
+    pub(crate) fn keeping(mut self, old: Option<&HeldView>, now: i64) -> HeldView {
+        for f in old.into_iter().flat_map(|o| o.fresh.iter()) {
+            self.fresh.insert(f.clone(), now);
+        }
+        self
     }
 
     /// The view's head version.
@@ -167,6 +185,28 @@ pub(crate) fn note_seen(ks: &Keystore, root: NodeId, version: StateVersion) {
     })();
     if let Err(e) = noted {
         tracing::debug!("noting a newer head: {e:#}");
+    }
+}
+
+/// Keep `fresh` (a `Fresh` a host's proof carried, already checked) with the
+/// stored view when it vouches for that view's head: the next call to a
+/// host it vouches for speaks at once (card 49). Best effort; no view, or
+/// a `Fresh` for another head, no note.
+pub(crate) fn note_fresh(ks: &Keystore, root: NodeId, fresh: &Fresh) {
+    let noted = (|| -> Result<()> {
+        let Some(mut held) = read(ks, root)? else {
+            return Ok(());
+        };
+        if fresh.verify(&held.view.head).is_err() {
+            return Ok(());
+        }
+        if held.fresh.insert(fresh.clone(), now_unix()) {
+            write(ks, root, &held)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = noted {
+        tracing::debug!("keeping a host's freshness: {e:#}");
     }
 }
 
@@ -305,14 +345,15 @@ pub(crate) async fn ask_view(
 }
 
 /// Ask directory `dir` for `service` alone (`resolve`): the one-entry view,
-/// or an empty one when this node may not use it (or it doesn't exist).
+/// or an empty one when this node may not use it (or it doesn't exist), and
+/// the `Fresh` that vouches for its head.
 pub(crate) async fn ask_resolve(
     endpoint: &Endpoint,
     dir: NodeId,
     id_token: Option<IdToken>,
     root: NodeId,
     service: &ServiceName,
-) -> Result<View> {
+) -> Result<(View, Fresh)> {
     let request = DirectoryRequest::Resolve {
         service: service.clone(),
     };
@@ -326,7 +367,7 @@ pub(crate) async fn ask_resolve(
             if view.entries.iter().any(|e| e.name != *service) {
                 bail!("the directory resolved {service} to another service");
             }
-            Ok(view)
+            Ok((view, fresh))
         }
         DirectoryAnswer::Denied { reason } => Err(Refused(reason).into()),
         other => bail!("an unexpected answer to `resolve`: {other:?}"),
@@ -415,7 +456,7 @@ pub(crate) async fn refresh(ks: &Keystore, asker: &Asker<'_>, forget: bool) -> R
         }
         match asked {
             Ok(Fetched::View(view, fresh)) => {
-                let fetched = HeldView::fetched(view, Some(fresh), now);
+                let fetched = HeldView::fetched(view, Some(fresh), now).keeping(held.as_ref(), now);
                 if let Some(old) = &held
                     && fetched.version() < old.version()
                 {
@@ -431,7 +472,7 @@ pub(crate) async fn refresh(ks: &Keystore, asker: &Asker<'_>, forget: bool) -> R
             }
             Ok(Fetched::Current(fresh)) => {
                 let mut current = held.clone().expect("current is only taken for a held view");
-                current.fresh = Some(fresh);
+                current.fresh.insert(fresh, now);
                 current.checked = now;
                 write(ks, root, &current)?;
                 return Ok(current);
@@ -470,7 +511,8 @@ pub(crate) fn check_fresh(held: &HeldView, now: i64) -> Result<()> {
 /// ([`HeldView::is_stale`]: older than a day, its head expired, or a host
 /// reported a newer head); then a refresh ([`refresh_now`]). A refresh that
 /// fails leaves a held view whose head hasn't expired, which is dialed from
-/// as it is (so calls keep working with every directory down); with none, it
+/// as it is (each host still has to show a directory's current word before
+/// it is told anything, [`vouch`](crate::caller::vouch)); with none, it
 /// is an error, saying what the person can act on when a directory refused
 /// this node ([`NotAdmitted`]). An expired view is never returned.
 pub(crate) async fn usable(
@@ -545,20 +587,25 @@ pub(crate) async fn refresh_now(
 }
 
 /// Ask the directories for `service` alone (`resolve`), for a name the
-/// held view doesn't have: its entry, if this node may use it.
+/// held view doesn't have: the one-entry view holding its entry (with the
+/// `Fresh` for its head, which a call checks its hosts against), if this
+/// node may use it.
 pub(crate) async fn resolve(
     ks: &Keystore,
     asker: &Asker<'_>,
     service: &ServiceName,
-) -> Result<Option<SignedEntry>> {
+) -> Result<Option<HeldView>> {
     let root = asker.root;
     let me = transport::to_node_id(&asker.endpoint.id());
     let mut failures = Vec::new();
     for dir in directories(ks, root, me) {
         match ask_resolve(asker.endpoint, dir, asker.id_token.clone(), root, service).await {
-            Ok(view) => {
+            Ok((view, fresh)) => {
                 note_seen(ks, root, view.head.head.version);
-                return Ok(view.entries.into_iter().next());
+                if view.entries.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(HeldView::fetched(view, Some(fresh), now_unix())));
             }
             Err(e) => failures.push(format!("{}: {e:#}", dir.short())),
         }
@@ -654,7 +701,8 @@ enum Ended {
 /// none held, two default beats and 10 s. (A caller's view carries no
 /// settings, so the `Fresh` is what says how often to expect one.)
 fn silence(held: Option<&HeldView>) -> Duration {
-    match held.and_then(|h| h.fresh.as_ref()) {
+    let newest = held.and_then(|h| h.fresh.iter().max_by_key(|f| (f.version, f.until)));
+    match newest {
         Some(f) => {
             let span = u64::try_from(f.until.saturating_sub(f.at))
                 .unwrap_or(0)
@@ -725,7 +773,8 @@ async fn follow_once(
                 SubFrame::View { view, fresh } => {
                     view.verify(root)?;
                     fresh.verify(&view.head)?;
-                    let mut next = HeldView::fetched(view, Some(fresh), now);
+                    let mut next =
+                        HeldView::fetched(view, Some(fresh), now).keeping(held.as_ref(), now);
                     next.seen = held.as_ref().map_or(StateVersion(0), |h| h.seen);
                     next
                 }
@@ -738,9 +787,11 @@ async fn follow_once(
                         .apply(&update, root)
                         .context("an update that doesn't apply; subscribing again")?;
                     fresh.verify(&view.head)?;
+                    let mut set = base.fresh.clone();
+                    set.insert(fresh, now);
                     HeldView {
                         view,
-                        fresh: Some(fresh),
+                        fresh: set,
                         checked: now,
                         seen: base.seen,
                     }
@@ -750,11 +801,10 @@ async fn follow_once(
                         bail!("a beat before any view");
                     };
                     fresh.verify(&base.view.head)?;
-                    HeldView {
-                        fresh: Some(fresh),
-                        checked: now,
-                        ..base.clone()
-                    }
+                    let mut next = base.clone();
+                    next.fresh.insert(fresh, now);
+                    next.checked = now;
+                    next
                 }
                 SubFrame::Denied { reason } => return Ok(Ended::Denied(reason)),
                 other => bail!("an unexpected frame for a view: {other:?}"),

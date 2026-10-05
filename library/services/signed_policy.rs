@@ -53,10 +53,10 @@ use serde::{Deserialize, Serialize};
 use crate::entry::SignedEntry;
 use crate::error::{Error, Result};
 use crate::head::StateVersion;
-use crate::head::{ItemsHash, POLICY_V4, PolicyHead, SignedPolicyHead};
+use crate::head::{ItemsHash, POLICY_V5, PolicyHead, SignedPolicyHead};
 use crate::identity::{NodeId, NodeIdentity};
 use crate::idp::{Issuer, Principal};
-use crate::item::{FreshnessMode, IssuerConfig, Item, Person, Settings};
+use crate::item::{IssuerConfig, Item, Person, Settings};
 use crate::registry::{Service, ServiceName};
 use crate::role::{Matcher, RoleName};
 use crate::view::View;
@@ -135,9 +135,7 @@ impl Policy {
     ///   lowercase email;
     /// - every issuer is non-blank and accepts at least one non-blank
     ///   audience;
-    /// - `settings.beat_secs > 0` and `settings.fresh_secs >= beat_secs`;
-    /// - `strict` freshness lists at least one directory (else nothing
-    ///   could vouch, and every host would refuse every call).
+    /// - `settings.beat_secs > 0` and `settings.fresh_secs >= beat_secs`.
     pub fn validate(&self) -> Result<()> {
         let bad = |why: String| Err(Error::InvalidPolicy(why));
         let mut seen = BTreeSet::new();
@@ -200,15 +198,6 @@ impl Policy {
         }
         if self.settings.fresh_secs < self.settings.beat_secs {
             return bad("settings: fresh_secs is shorter than beat_secs".into());
-        }
-        if self.settings.freshness == FreshnessMode::Strict && self.directories.is_empty() {
-            return bad(
-                "settings: freshness is strict but no directory is listed, so nothing \
-                        could vouch for the policy and every host would refuse every call; \
-                        add one with `wires directory add`, or first set \
-                        `wires policy settings --freshness lenient`"
-                    .into(),
-            );
         }
         Ok(())
     }
@@ -344,7 +333,7 @@ impl Policy {
         self.validate()?;
         let items = self.items(root, previous)?;
         let head = PolicyHead {
-            format: POLICY_V4,
+            format: POLICY_V5,
             fabric: self.fabric,
             version: self.version,
             issued: self.issued,
@@ -837,7 +826,7 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&signed).unwrap()).unwrap();
         assert_eq!(back, signed);
         back.verify(root().node_id()).unwrap();
-        assert_eq!(signed.head.head.format, POLICY_V4);
+        assert_eq!(signed.head.head.format, POLICY_V5);
         assert_eq!(signed.head.head.directories, vec![node(30)]);
         assert_eq!(signed.items.len(), 4 + 4 + 1 + 1 + 1 + 1);
         assert_eq!(
@@ -950,19 +939,6 @@ mod tests {
             broken_rule(&p),
             "settings: fresh_secs is shorter than beat_secs"
         );
-
-        // Strict freshness with no directory to vouch: every host would
-        // refuse every call. The rule names the way out.
-        let mut p = sample();
-        p.settings.freshness = crate::FreshnessMode::Strict;
-        assert!(p.validate().is_ok(), "strict, with a directory");
-        p.directories.clear();
-        let why = broken_rule(&p);
-        assert!(why.starts_with("settings: freshness is strict"), "{why}");
-        assert!(why.contains("wires directory add"), "{why}");
-        assert!(why.contains("--freshness lenient"), "{why}");
-        p.settings.freshness = crate::FreshnessMode::Lenient;
-        assert!(p.validate().is_ok(), "lenient, with none");
     }
 
     #[test]

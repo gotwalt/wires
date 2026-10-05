@@ -25,8 +25,10 @@
 //!   neither its node nor its person, and a role matches it.
 //! - [`network`] — the [`Network`] string `wires join` and `wires login`
 //!   install: the root key, directories and [`LoginSettings`].
-//! - [`session`] — the [`Frame`] wire codec, opened by a [`Hello`] (the async
-//!   transport is in `wires`).
+//! - [`session`] — the [`Frame`] wire codec, opened by the host's proof and
+//!   the caller's [`Hello`] (the async transport is in `wires`).
+//! - [`proof`] — a host's [`HostProof`] that it is current, which a caller
+//!   checks before it tells the host anything.
 //! - [`invoke`] — the [`Invocation`] (service + [`Argv`]) a caller asks a host
 //!   to run.
 //! - [`push`] — a host's [`PushMessage`] to a caller, the [`InboxFrame`]
@@ -131,6 +133,8 @@ pub mod network;
 pub mod idp;
 #[path = "calls/invoke.rs"]
 pub mod invoke;
+#[path = "calls/proof.rs"]
+pub mod proof;
 #[path = "calls/push.rs"]
 pub mod push;
 #[path = "calls/session.rs"]
@@ -179,9 +183,9 @@ pub use directory::{
 };
 pub use entry::{ENTRY_CONTEXT, ENTRY_V2, SignedEntry};
 pub use error::{Error, IdTokenError, Result};
-pub use fresh::{FRESH_CONTEXT, FRESH_V1, Fresh};
+pub use fresh::{FRESH_CONTEXT, FRESH_V1, Fresh, FreshSet, MAX_FRESH_SET};
 pub use head::{
-    HeadHash, ITEMS_CONTEXT, ItemsHash, POLICY_HEAD_CONTEXT, POLICY_V4, PolicyHead,
+    HeadHash, ITEMS_CONTEXT, ItemsHash, POLICY_HEAD_CONTEXT, POLICY_V5, PolicyHead,
     SignedPolicyHead, StateVersion,
 };
 pub use identity::{AlgorithmId, NodeId, NodeIdentity, Signature};
@@ -191,13 +195,13 @@ pub use idp::{
 };
 pub use invoke::{Argv, Invocation, MAX_ARGS, MAX_ARGV_BYTES};
 pub use item::{
-    DEFAULT_BEAT_SECS, DEFAULT_FRESH_SECS, FreshnessMode, IssuerConfig, Item, ItemKey, Person,
-    Settings,
+    DEFAULT_BEAT_SECS, DEFAULT_FRESH_SECS, IssuerConfig, Item, ItemKey, Person, Settings,
 };
 pub use network::{
     LoginSettings, NETWORK_MAX_DIRECTORIES, NETWORK_V1, Network, PublicClientSecret,
 };
 pub use policy_update::PolicyUpdate;
+pub use proof::{HostProof, Standing};
 pub use push::{
     INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_FRAME, MAX_INBOX_HELLO, MAX_PUSH_BODY,
     MAX_SUBJECT, PushBody, PushId, PushMessage, PushOutcome, Subject,

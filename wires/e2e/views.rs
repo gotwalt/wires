@@ -184,7 +184,7 @@ async fn a_callers_keystore_holds_only_its_view() {
     let names: Vec<&str> = held.view.entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["orders-db", "status"]);
     assert_eq!(held.version(), StateVersion(3));
-    assert!(held.fresh.is_some(), "the directory vouched for it");
+    assert!(!held.fresh.is_empty(), "the directory vouched for it");
 
     let files = all_files(&ks.path(""));
     assert!(
@@ -258,12 +258,17 @@ async fn without_a_verified_identity_there_is_no_view() {
         id_token: crate::caller::hello::stored_token(&ks),
     };
     let found = view::resolve(&ks, &asker, &orders).await.unwrap().unwrap();
-    assert_eq!(found.name, orders);
-    assert_eq!(
+    assert_eq!(found.entry(&orders).unwrap().name, orders);
+    assert_eq!(found.view.entries.len(), 1, "that one entry");
+    assert!(
+        !found.fresh.is_empty(),
+        "with the directory's word for its head"
+    );
+    assert!(
         view::resolve(&ks, &asker, &service("payroll"))
             .await
-            .unwrap(),
-        None,
+            .unwrap()
+            .is_none(),
         "a service it may not use resolves to nothing"
     );
     // A search by description, as `wires services orders` does locally.
