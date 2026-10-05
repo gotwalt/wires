@@ -121,8 +121,8 @@ impl fmt::Display for Refusal {
 ///     hosts: vec![host],
 /// });
 /// let alice = Principal {
-///     issuer: "https://idp".into(), subject: "a".into(), email: None, org: None,
-///     groups: vec![], not_after: 0,
+///     issuer: "https://idp".into(), subject: "a".into(),
+///     email: Some("alice@example.com".into()), org: None, groups: vec![], not_after: 0,
 /// };
 /// assert_eq!(authorize(&policy, host, Some(&alice), &status), Ok(staff));
 /// // A node with no verified identity is in no role.

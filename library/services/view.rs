@@ -38,7 +38,7 @@
 //! let v1 = policy.sign(&root).unwrap();
 //! let alice = Principal {
 //!     issuer: "https://idp".into(), subject: "1".into(),
-//!     email: None, org: None, groups: vec![], not_after: 0,
+//!     email: Some("alice@example.com".into()), org: None, groups: vec![], not_after: 0,
 //! };
 //! let laptop = NodeIdentity::from_seed([2u8; 32]).node_id();
 //! let view = v1.view_for(laptop, Some(&alice), None);

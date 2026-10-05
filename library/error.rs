@@ -49,6 +49,19 @@ pub enum Error {
     #[error("removed from this network")]
     Banned,
 
+    /// The caller's verified principal carries no verified email, which
+    /// admission requires ([`check_admitted`](crate::check_admitted)): a
+    /// person ban matches a verified email, so a principal without one could
+    /// otherwise sidestep it.
+    #[error("the sign-in carries no verified email")]
+    NoVerifiedEmail,
+
+    /// No role in the signed policy matches the caller's verified principal
+    /// ([`check_admitted`](crate::check_admitted)): the IdP knows them, the
+    /// network doesn't.
+    #[error("no role in the policy matches this person")]
+    NoRole,
+
     /// A byte slice had the wrong length for the key, signature, id or
     /// digest it decodes to.
     #[error("bad length for a key, signature, id or digest")]
