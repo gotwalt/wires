@@ -9,30 +9,29 @@ the language bindings `wires-ffi` (Python, via UniFFI) and `wires-node`
 (TypeScript, via napi-rs)), plus a `Dockerfile` for a distroless image of
 the `wires` binary.
 
-**The current assignment (2026-09-22, reshaped by card 27):** agents run
-CLIs on other machines, by **service name**. The machine is reached by public
-key, never by network path. Each node is admitted by its root-signed badge;
-one admin-signed, versioned policy says which IdPs are trusted, which roles
-exist, which services exist, which hosts run each, who may call and read
-each, who is banned, and which nodes are directories; the admin publishes it
-by key to the directories, hosts hold all of it and follow its changes from
-one by subscription, and every host decides every call from its copy. The caller is
-authenticated by their IdP, via an ID token bound to the node key and
-presented in the session handshake; every role needs that verified identity
-(there is no built-in `member` role), and every role matcher names its
-issuer. Every call is recorded by the host in its own signed, hash-linked
-log. Agents can't observe each other's work: the isolation boundary is the
-verified person (IdP principal), so a caller sees its own person's records,
-and the readers the registry names see a service's records in full with
-`wires watch`, for logging and compliance. Nothing is broadcast: each caller
-holds only its view (the root-signed entries of the services its person may
-use), and only hosts and directories hold the whole policy
-(`docs/fabric.md`). `wires call` is the CLI-native path and the source of the token
-savings; `wires mcp` (stdio) and `wires gateway` (remote, e.g. Claude.ai) serve
-the same services as MCP, so wires works in the clients people already use
-for remote tool calling, with the same identity, registry and record (MCP
-compatibility is a goal, not a fallback). The goal is a sharp demo for the
-MCP team.
+**The current assignment (2026-10-05; cards 39–43 reshape the code to it):**
+agents work best with CLIs, so wires lets an agent run a CLI that lives on
+another machine as if it were local: `wires call <service> -- <args>`. Three
+things stop a CLI from being shared across an organization, and wires is
+those three and little else. **Who is calling:** the caller signs in with the
+org's IdP (`wires login`); the ID token is bound to the node key, presented
+in each call's handshake, and verified by the host itself; signing in is the
+whole of joining (no badges, no invites). **How they find it:** one
+admin-signed, versioned policy says which IdPs are trusted, which roles
+exist, which services exist, which hosts run each, who may call each and who
+is removed; directories hold it, hosts hold all of it and decide every call
+from their copy, and each caller holds only its view, the services its person
+may use (`wires services`). A user never handles a host's key.
+**How they reach it:** by public key over iroh, never by network path, with
+no port opened and no VPN. One thing a local CLI can't do is also in: a
+service can push a message back to its caller (`wires push`, `wires inbox`).
+Every service gets its caller's identity (`WIRES_ID_TOKEN` and the verified
+claims; `call.id_token()` in a native service). `wires mcp` (stdio) and
+`wires gateway` (remote, e.g. Claude on the web) serve the same services to
+MCP clients as a **bridge** from existing MCP workflows, not a goal of their
+own. The signed call log, OTLP export and `wires watch` are cut for now
+(card 40). Until cards 40–42 merge, the code still has them, and badges.
+The goal is a sharp demo for the MCP team.
 
 **What outranks what:** the premise outranks the docs, and the docs outrank
 the code. When the code disagrees with `docs/protocol.md`, the code is the

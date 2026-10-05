@@ -62,3 +62,11 @@ wheel": each part below names the system it copies.
 - [ ] protocol.md §6 describes day-passes; README/usage pass the rebuttal test.
 
 ## Notes
+
+## Input from card 41 (signing in is joining, 2026-10-05)
+
+Badges are gone: the ID token is a caller's only credential, so the hourly Google re-login is felt
+on every caller, not just headless ones. A day-pass is now the *only* wires-signed credential a
+caller would hold, and it must be something `wires login` hands over (the directory signs it on
+seeing a fresh ID token), never a separate step. Read "like a badge" above as "offline, under the
+root-signed head that names the directory".

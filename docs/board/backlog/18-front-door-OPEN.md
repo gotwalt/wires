@@ -23,3 +23,11 @@ The "lobby" now has a concrete home: the directory ([card 36](../done/36-directo
 now only the badge (which names the root key), up to two directory ids and the login settings, so a
 `_wires.<domain>` record would publish the root key, the directory ids and the login settings, and a front desk would be a directory holding a limited,
 root-signed enrollment delegation. The same delegation could renew badges (still open on card 36). Still don't build this until it's discussed.
+
+## Input from card 41 (signing in is joining, 2026-10-05)
+
+There is no invite any more: a caller runs `wires login <network>`, where the network string (the
+root key, up to two directory ids, the sign-in settings) is the same for everyone and not secret.
+So the front door is now only "publish that string under a domain and check it is the real one":
+`wires login acmecorp.com`. No enrollment delegation is needed, since no node is enrolled. The
+fake-lobby question above is unchanged. Still don't build this until it's discussed.

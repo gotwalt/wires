@@ -190,3 +190,13 @@ One tool, the same everywhere: **`inbox`**, `{ wait_seconds?: 0–25, limit?: 1�
   gateway special case. Operator pushes to its node are the gateway
   operator's to read. D1–D6 and the MCP inbox are agreed. D2–D6 and the MCP shape stand as recommended unless amended; the
   per-service capability grace (D2) is still open.
+
+## Input from the 2026-10-05 premise
+
+MCP is now a bridge, not a goal, so push does not need to reach MCP clients: the `inbox` MCP tool
+is dropped from this card, and with it open question 3 (who sees that tool), which is what parked
+it. What remains is questions 1 and 2. Candidate 2 (drop the direct dial; "listening" is an open
+long poll with the caller's token) leaves one delivery path and no inbound ALPN on the caller, and
+is the direction the 2026-10-04 review recommends. Badges are gone (card 41): "an admitted node"
+in candidate 1 now means a caller with a valid sign-in. The per-host push queue is the state that
+keeps a host from being interchangeable ([card 46](46-spread-calls-across-hosts.md)).
