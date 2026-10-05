@@ -92,6 +92,10 @@ pub(crate) struct KeyFetcher {
     discovery: Mutex<HashMap<Issuer, Discovery>>,
     /// When each issuer was last force-refetched for an unknown `kid`.
     forced: Mutex<HashMap<Issuer, i64>>,
+    /// When a fetch of each issuer's keys last failed, and why: not asked
+    /// again within [`MIN_TTL`], so an IdP that doesn't answer doesn't turn
+    /// every presented token into an outbound fetch.
+    failed: Mutex<HashMap<Issuer, (i64, String)>>,
 }
 
 impl KeyFetcher {
@@ -103,6 +107,7 @@ impl KeyFetcher {
             keys: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
             forced: Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashMap::new()),
         })
     }
 
@@ -142,7 +147,8 @@ impl KeyFetcher {
     }
 
     /// The issuer's key set, from cache when fresh. When `kid` is given and
-    /// the cached set lacks it, refetch once (rate-limited per issuer).
+    /// the cached set lacks it, refetch once (rate-limited per issuer). A
+    /// fetch that failed is not retried within [`MIN_TTL`]: its error stands.
     pub(crate) async fn keys(&self, issuer: &Issuer, kid: Option<&str>, now: i64) -> Result<Jwks> {
         let cached = self.cached(issuer, now);
         match (&cached, kid) {
@@ -157,7 +163,18 @@ impl KeyFetcher {
             (Some(jwks), _) => return Ok(jwks.clone()),
             (None, _) => {}
         }
-        self.fetch(issuer, now).await
+        if let Some((at, why)) = self.failed.lock().expect("poisoned").get(issuer)
+            && now - at < MIN_TTL
+        {
+            bail!("{why} (not asked again for {}s)", MIN_TTL - (now - at));
+        }
+        let fetched = self.fetch(issuer, now).await;
+        let mut failed = self.failed.lock().expect("poisoned");
+        match &fetched {
+            Ok(_) => failed.remove(issuer),
+            Err(e) => failed.insert(issuer.clone(), (now, format!("{e:#}"))),
+        };
+        fetched
     }
 
     /// Verify `claim` against its issuer's current keys.
@@ -456,6 +473,40 @@ mod tests {
                 prop_assert_eq!(got, Some(n));
             }
         }
+    }
+
+    /// An IdP that doesn't answer is asked at most once per issuer per
+    /// [`MIN_TTL`]: a stream of tokens is not a stream of outbound fetches.
+    #[tokio::test]
+    async fn a_failed_fetch_is_not_retried_within_the_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = Issuer::new(format!("http://{}", listener.local_addr().unwrap()));
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&asked);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut s, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 503 Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let fetcher = KeyFetcher::new(None).unwrap();
+        let now = 1_000_000;
+        for t in [now, now + 1, now + MIN_TTL - 1] {
+            assert!(fetcher.keys(&issuer, None, t).await.is_err());
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        assert!(fetcher.keys(&issuer, None, now + MIN_TTL).await.is_err());
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "asked again after the window"
+        );
     }
 
     #[test]
