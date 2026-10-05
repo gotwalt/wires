@@ -82,9 +82,6 @@ Open cards only; finished cards are in [done/](done/).
 
 | Card | Stage | Depends on | Status | Summary |
 |---|---|---|---|---|
-| [44](review/44-cut-aliases-and-overrides.md) | 1 | — | review | Cut `tools.json` aliases and the caller's credential-override flags; shrink locked mode |
-| [46](review/46-spread-calls-across-hosts.md) | 1 | — | review | Spread calls across a service's hosts, so more hosts means more capacity |
-| [48](review/48-publish-misses-a-restarted-directory.md) | 1 | — | review | **Find the cause:** an edit right after a directory restarts reached 1 of 2 directories |
 | [49](backlog/49-removed-host-window.md) | 2 | — | backlog, decided | **The removed-host window:** the host proves a current `Fresh` (from another directory) before the caller sends anything; fail closed; 15 min |
 | [45](backlog/45-trim-policy-sync.md) | 3 | 49 | backlog | One way to keep policy copies in step: no deltas, replicas or view subscriptions; `Fresh` and the beat stay for 49, `lenient`/`strict` go |
 | [08](doing/08-demo-two-machine.md) | last | all of the above | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent; re-record |
@@ -93,14 +90,14 @@ Open cards only; finished cards are in [done/](done/).
 | [32](backlog/32-service-sandbox-OPEN.md) | — | — | open question | **Don't build:** run each service call in a rootless microVM |
 | [18](backlog/18-front-door-OPEN.md) | — | — | open question | **Don't build:** `wires login <domain>`, the network string published under a domain |
 
-**Order** (the human, 2026-10-05): 44, 46 and 48 can run side by side; then
+**Order** (the human, 2026-10-05): 44, 46 and 48 are done; then
 49, then 45 (decided together on 2026-10-05: `Fresh` stays, the caller
 fails closed; see card 49's Decision); then `CLAUDE.md` (its goal sentence still says "a
 sharp demo for the MCP team", and MCP is now a bridge: the human's wording);
 then 08, the demo, last. **Skipped for now:** re-running the benchmarks
 (not run on this code; their setup signs in once and a Google sign-in lasts
 an hour). What else the last pass left open is in
-[card 43](done/43-accuracy-sweep.md)'s Notes. 39–43 and 47 are done.
+[card 43](done/43-accuracy-sweep.md)'s Notes. 39–44, 46, 47 and 48 are done.
 
 ## Rules for workers
 
