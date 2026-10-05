@@ -1901,6 +1901,70 @@ mod tests {
         assert!(x_seen.lock().unwrap().is_empty(), "X was sent nothing");
     }
 
+    /// Second review, finding 4: a host that answers `Denied` instead of a
+    /// proof has proved nothing, so its refusal decides nothing: a dial
+    /// failure, and the next host serves the call.
+    #[tokio::test]
+    async fn a_denial_before_any_proof_fails_over_to_the_next_host() {
+        let f = fixture();
+        let (x, y) = (
+            NodeIdentity::from_seed([106; 32]),
+            NodeIdentity::from_seed([107; 32]),
+        );
+        let v1 = signed_at(&f.root, 1, &[x.node_id(), y.node_id()]);
+        // X: `Denied` first, whatever the caller says.
+        let x_ep = test_endpoint(&x).await;
+        let x_addr = loopback(&x_ep);
+        tokio::spawn(async move {
+            while let Some(incoming) = x_ep.accept().await {
+                let Ok(conn) = incoming.await else { continue };
+                let Ok((mut send, _recv)) = conn.accept_bi().await else {
+                    continue;
+                };
+                let denied = library::Frame::Denied {
+                    reason: "host configuration error".into(),
+                };
+                let _ = transport::write_frame(&mut send, &denied).await;
+                let _ = send.finish();
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), conn.closed()).await;
+            }
+        });
+        let y_answer = Answer::Run {
+            out: "from y\n",
+            policy: Some(v1.clone()),
+        };
+        let (_, y_addr, _) = fake_host(&y, y_answer, proof_of(&v1)).await;
+        let endpoint = test_endpoint(&f.creds.node).await;
+        let targets = [
+            transport::endpoint_addr(&x.node_id(), &[x_addr], None).unwrap(),
+            transport::endpoint_addr(&y.node_id(), &[y_addr], None).unwrap(),
+        ];
+        let service = ServiceName::new("orders-db").unwrap();
+        let mut vouch = crate::testutil::vouching(&v1, Scope::Service(service.clone()));
+        let mut stdout = Vec::new();
+        let done = transport::call_service_on(
+            &endpoint,
+            &targets,
+            std::time::Duration::from_secs(2),
+            &mut vouch,
+            &library::IdToken::new("h.p.s"),
+            Invocation {
+                service,
+                argv: Argv::default(),
+            },
+            |_, _, _| Ok(()),
+            std::io::Cursor::new(Vec::new()),
+            &mut stdout,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        endpoint.close().await;
+        assert_eq!(done.host, y.node_id());
+        assert_eq!(stdout, b"from y\n");
+    }
+
     #[tokio::test]
     async fn a_removed_directory_vouching_for_its_old_head_in_a_refresh_does_not_decide() {
         a_refresh_that_stays_behind(true).await;

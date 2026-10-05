@@ -160,6 +160,27 @@ impl Fresh {
         self.directory.verify(&self.signed_bytes()?, &self.sig)
     }
 
+    /// [`verify`](Self::verify) against `head` (which the caller has
+    /// verified under its root), and wrap it as one: the only way into a
+    /// [`FreshSet`].
+    pub fn verified(self, head: &SignedPolicyHead) -> Result<VerifiedFresh> {
+        self.verify(head)?;
+        Ok(VerifiedFresh(self))
+    }
+
+    /// Check only that its signer signed it (format, algorithm, signature),
+    /// with no head to check it against: enough to trust what it says about
+    /// its signer's own version, nothing more.
+    pub fn verify_signature(&self) -> Result<()> {
+        if self.format != FRESH_V1 {
+            return Err(Error::UnsupportedVersion);
+        }
+        if self.alg != AlgorithmId::Ed25519 {
+            return Err(Error::UnsupportedAlgorithm);
+        }
+        self.directory.verify(&self.signed_bytes()?, &self.sig)
+    }
+
     /// Whether it is current at `now`: `now <= until`, and `at` is no further
     /// in the future than [`CLOCK_SKEW_SECS`].
     pub fn is_current(&self, now: i64) -> bool {
@@ -200,6 +221,30 @@ impl Fresh {
     }
 }
 
+/// A [`Fresh`] that verified against a head (second review of cards
+/// 45/49): its signer is listed, its version and head hash are that head's,
+/// its lifetime is within the head's `fresh_secs`, and the signature holds.
+/// Made only by [`Fresh::verified`], so nothing unverified ranks in a
+/// [`FreshSet`] (a forged word for a huge version or `until` could
+/// otherwise take every slot for good).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct VerifiedFresh(Fresh);
+
+impl VerifiedFresh {
+    /// The word.
+    pub fn fresh(&self) -> &Fresh {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for VerifiedFresh {
+    type Target = Fresh;
+    fn deref(&self) -> &Fresh {
+        &self.0
+    }
+}
+
 /// The most directories a [`FreshSet`] keeps a [`Fresh`] from; past it, the
 /// worst-ranked is dropped. A host shows at most this many to a caller.
 pub const MAX_FRESH_SET: usize = 16;
@@ -210,10 +255,12 @@ pub const MAX_FRESH_SET: usize = 16;
 /// host that is also a directory still show another directory's word, and a
 /// caller still find one to dial that directory with.
 ///
-/// It verifies nothing on the way in: every use checks each `Fresh` again
-/// against the head it is asked about ([`vouching`](Self::vouching),
-/// [`current_for`](Self::current_for)), so a set read back from disk can't
-/// vouch for anything a signer didn't sign.
+/// It takes only [`VerifiedFresh`] words, each verified against a
+/// root-verified head on the way in, and a set read back from disk keeps
+/// only those that verify against the head it is read for
+/// ([`from_unverified`](Self::from_unverified)); every use still checks
+/// each `Fresh` against the head it is asked about
+/// ([`vouching`](Self::vouching), [`current_for`](Self::current_for)).
 ///
 /// ```
 /// use library::{Fresh, FreshSet, NodeIdentity, Policy, StateVersion};
@@ -225,16 +272,17 @@ pub const MAX_FRESH_SET: usize = 16;
 /// policy.directories = vec![dir.node_id(), host.node_id()];
 /// let head = policy.sign(&root).unwrap().head;
 /// let mut set = FreshSet::default();
-/// assert!(set.insert(Fresh::sign(&host, &head, 1_000, 1_900).unwrap(), 1_000));
+/// let word = |by| Fresh::sign(by, &head, 1_000, 1_900).unwrap().verified(&head).unwrap();
+/// assert!(set.insert(word(&host), 1_000));
 /// assert!(set.vouching(&head, host.node_id(), 1_500).is_none(), "its own word");
-/// assert!(set.insert(Fresh::sign(&dir, &head, 1_000, 1_900).unwrap(), 1_000));
+/// assert!(set.insert(word(&dir), 1_000));
 /// assert_eq!(set.vouching(&head, host.node_id(), 1_500).unwrap().directory, dir.node_id());
 /// assert_eq!(set.current_for(&head, 1_500).len(), 2);
 /// assert!(set.current_for(&head, 1_901).is_empty());
 /// ```
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
-pub struct FreshSet(Vec<Fresh>);
+pub struct FreshSet(Vec<VerifiedFresh>);
 
 impl FreshSet {
     /// Keep `fresh` if it ranks above the one held from its signer at `now`
@@ -243,7 +291,7 @@ impl FreshSet {
     /// clock runs ahead never displaces a current one). With
     /// [`MAX_FRESH_SET`] signers held already, a new signer displaces the
     /// worst-ranked, if it ranks above it. Whether it was kept.
-    pub fn insert(&mut self, fresh: Fresh, now: i64) -> bool {
+    pub fn insert(&mut self, fresh: VerifiedFresh, now: i64) -> bool {
         let rank = |f: &Fresh| (f.version, f.is_current(now), f.until);
         if let Some(held) = self.0.iter_mut().find(|f| f.directory == fresh.directory) {
             if rank(&fresh) <= rank(held) {
@@ -268,7 +316,10 @@ impl FreshSet {
     /// The first one that [`vouches`](Fresh::vouches) for `head` to a caller
     /// dialing `host` at `now`.
     pub fn vouching(&self, head: &SignedPolicyHead, host: NodeId, now: i64) -> Option<&Fresh> {
-        self.0.iter().find(|f| f.vouches(head, host, now).is_ok())
+        self.0
+            .iter()
+            .map(VerifiedFresh::fresh)
+            .find(|f| f.vouches(head, host, now).is_ok())
     }
 
     /// Every one that verifies for `head` and is current at `now`, at most
@@ -276,6 +327,7 @@ impl FreshSet {
     pub fn current_for(&self, head: &SignedPolicyHead, now: i64) -> Vec<Fresh> {
         self.0
             .iter()
+            .map(VerifiedFresh::fresh)
             .filter(|f| f.verify(head).is_ok() && f.is_current(now))
             .take(MAX_FRESH_SET)
             .cloned()
@@ -284,25 +336,31 @@ impl FreshSet {
 
     /// Every `Fresh` held, one per signer.
     pub fn iter(&self) -> impl Iterator<Item = &Fresh> {
+        self.0.iter().map(VerifiedFresh::fresh)
+    }
+
+    /// Every word held, as verified (to carry into another set).
+    pub fn verified(&self) -> impl Iterator<Item = &VerifiedFresh> {
         self.0.iter()
+    }
+
+    /// The set of `words` (read back from disk, or shown by a peer) that
+    /// verify against `head` (verified under the root by the caller), each
+    /// ranked at its own `at`; the rest are dropped.
+    pub fn from_unverified(words: Vec<Fresh>, head: &SignedPolicyHead) -> FreshSet {
+        let mut set = FreshSet::default();
+        for f in words {
+            let at = f.at;
+            if let Ok(v) = f.verified(head) {
+                set.insert(v, at);
+            }
+        }
+        set
     }
 
     /// Whether it holds none.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
-    }
-}
-
-impl FromIterator<Fresh> for FreshSet {
-    /// Insert each in turn, ranking at their own `at` (what a set read back
-    /// whole needs: the one per signer with the newest head and `until`).
-    fn from_iter<I: IntoIterator<Item = Fresh>>(iter: I) -> Self {
-        let mut set = FreshSet::default();
-        for f in iter {
-            let at = f.at;
-            set.insert(f, at);
-        }
-        set
     }
 }
 
@@ -518,20 +576,71 @@ mod tests {
     fn a_set_keeps_the_best_per_signer() {
         let (h5, h6) = (two(5), two(6));
         let mut set = FreshSet::default();
-        assert!(set.insert(Fresh::sign(&dir(), &h5, 100, 200).unwrap(), 100));
-        assert!(!set.insert(Fresh::sign(&dir(), &h5, 50, 150).unwrap(), 100));
-        assert!(set.insert(Fresh::sign(&dir(), &h5, 150, 300).unwrap(), 150));
-        assert!(set.insert(Fresh::sign(&host(), &h5, 150, 300).unwrap(), 150));
+        assert!(
+            set.insert(
+                Fresh::sign(&dir(), &h5, 100, 200)
+                    .unwrap()
+                    .verified(&h5)
+                    .unwrap(),
+                100
+            )
+        );
+        assert!(
+            !set.insert(
+                Fresh::sign(&dir(), &h5, 50, 150)
+                    .unwrap()
+                    .verified(&h5)
+                    .unwrap(),
+                100
+            )
+        );
+        assert!(
+            set.insert(
+                Fresh::sign(&dir(), &h5, 150, 300)
+                    .unwrap()
+                    .verified(&h5)
+                    .unwrap(),
+                150
+            )
+        );
+        assert!(
+            set.insert(
+                Fresh::sign(&host(), &h5, 150, 300)
+                    .unwrap()
+                    .verified(&h5)
+                    .unwrap(),
+                150
+            )
+        );
         assert_eq!(set.iter().count(), 2, "one per signer");
         // A newer head's replaces the older one's, however short.
-        assert!(set.insert(Fresh::sign(&dir(), &h6, 10, 20).unwrap(), 150));
+        assert!(
+            set.insert(
+                Fresh::sign(&dir(), &h6, 10, 20)
+                    .unwrap()
+                    .verified(&h6)
+                    .unwrap(),
+                150
+            )
+        );
         assert!(set.vouching(&h5, host().node_id(), 160).is_none());
         assert_eq!(set.current_for(&h5, 160).len(), 1, "the host's own");
         // One from the future never displaces a current one.
         let skew = CLOCK_SKEW_SECS;
         let mut set = FreshSet::default();
-        assert!(set.insert(Fresh::sign(&dir(), &h5, 990, 1_100).unwrap(), 1_000));
-        let ahead = Fresh::sign(&dir(), &h5, 1_000 + skew + 60, 2_000).unwrap();
+        assert!(
+            set.insert(
+                Fresh::sign(&dir(), &h5, 990, 1_100)
+                    .unwrap()
+                    .verified(&h5)
+                    .unwrap(),
+                1_000
+            )
+        );
+        let ahead = Fresh::sign(&dir(), &h5, 1_000 + skew + 60, 2_000)
+            .unwrap()
+            .verified(&h5)
+            .unwrap();
         assert!(!set.insert(ahead, 1_000));
     }
 
@@ -543,31 +652,81 @@ mod tests {
         let h = head_with(5, 3, signers.iter().map(|s| s.node_id()).collect());
         let mut set = FreshSet::default();
         for (i, s) in signers.iter().enumerate().take(MAX_FRESH_SET) {
-            assert!(set.insert(Fresh::sign(s, &h, 0, 100 + i as i64).unwrap(), 0));
+            assert!(
+                set.insert(
+                    Fresh::sign(s, &h, 0, 100 + i as i64)
+                        .unwrap()
+                        .verified(&h)
+                        .unwrap(),
+                    0
+                )
+            );
         }
         let last = signers.last().unwrap();
         // Ranked below every one held: not kept.
-        assert!(!set.insert(Fresh::sign(last, &h, 0, 50).unwrap(), 0));
+        assert!(!set.insert(
+            Fresh::sign(last, &h, 0, 50).unwrap().verified(&h).unwrap(),
+            0
+        ));
         // Above the worst: it goes in, the worst goes out.
-        assert!(set.insert(Fresh::sign(last, &h, 0, 1_000).unwrap(), 0));
+        assert!(
+            set.insert(
+                Fresh::sign(last, &h, 0, 1_000)
+                    .unwrap()
+                    .verified(&h)
+                    .unwrap(),
+                0
+            )
+        );
         assert_eq!(set.iter().count(), MAX_FRESH_SET);
         assert!(set.iter().all(|f| f.until != 100), "the worst was dropped");
     }
 
     #[test]
-    fn a_set_round_trips_as_a_plain_list_and_verifies_on_use() {
+    fn a_set_round_trips_as_a_plain_list_and_drops_what_does_not_verify() {
         let h = two(5);
         let mut set = FreshSet::default();
-        set.insert(Fresh::sign(&dir(), &h, 100, 200).unwrap(), 100);
+        set.insert(
+            Fresh::sign(&dir(), &h, 100, 200)
+                .unwrap()
+                .verified(&h)
+                .unwrap(),
+            100,
+        );
         let text = serde_json::to_string(&set).unwrap();
         assert!(text.starts_with('['), "{text}");
-        let back: FreshSet = serde_json::from_str(&text).unwrap();
-        assert_eq!(back, set);
-        // A tampered entry read back vouches for nothing.
-        let mut forged: FreshSet = serde_json::from_str(&text).unwrap();
-        forged.0[0].until = 10_000;
-        assert!(forged.vouching(&h, host().node_id(), 5_000).is_none());
-        assert!(forged.current_for(&h, 5_000).is_empty());
+        let words: Vec<Fresh> = serde_json::from_str(&text).unwrap();
+        assert_eq!(FreshSet::from_unverified(words.clone(), &h), set);
+        // A tampered entry read back is dropped; so is one for another head.
+        let mut forged = words.clone();
+        forged[0].until = 10_000;
+        assert!(FreshSet::from_unverified(forged, &h).is_empty());
+        assert!(FreshSet::from_unverified(words, &two(6)).is_empty());
+    }
+
+    /// Second review of cards 45/49: a forged word (a listed signer's name,
+    /// a huge version and `until`, a junk signature) never enters a set, so
+    /// it can't take a real signer's slot; only [`Fresh::verified`] makes a
+    /// word a set takes.
+    #[test]
+    fn a_forged_word_never_takes_a_slot() {
+        let h = two(5);
+        let mut forged = Fresh::sign(&dir(), &h, 100, 200).unwrap();
+        forged.version = StateVersion(u64::MAX);
+        forged.until = i64::MAX;
+        assert!(forged.clone().verified(&h).is_err());
+        assert!(FreshSet::from_unverified(vec![forged], &h).is_empty());
+        let mut set = FreshSet::default();
+        assert!(
+            set.insert(
+                Fresh::sign(&dir(), &h, 100, 200)
+                    .unwrap()
+                    .verified(&h)
+                    .unwrap(),
+                100
+            )
+        );
+        assert!(set.vouching(&h, host().node_id(), 150).is_some());
     }
 
     /// Card 49 review: a directory's word lasts at most the head's
@@ -586,10 +745,7 @@ mod tests {
         forever.sig = dir().sign(&forever.signed_bytes().unwrap());
         assert!(matches!(forever.verify(&h), Err(Error::FreshTooLong)));
         assert!(forever.vouches(&h, host().node_id(), 1_000).is_err());
-        let mut set = FreshSet::default();
-        set.insert(forever, 1_000);
-        assert!(set.vouching(&h, host().node_id(), 1_000).is_none());
-        assert!(set.current_for(&h, 1_000).is_empty());
+        assert!(forever.verified(&h).is_err(), "never enters a set");
     }
 
     proptest! {
@@ -609,7 +765,7 @@ mod tests {
             let mut set = FreshSet::default();
             for (who, at, len, v) in picks {
                 let h = &heads[(v - 4) as usize];
-                set.insert(Fresh::sign(&signers[who as usize], h, at, at + len).unwrap(), now);
+                set.insert(Fresh::sign(&signers[who as usize], h, at, at + len).unwrap().verified(h).unwrap(), now);
             }
             let mut signed: Vec<NodeId> = set.iter().map(|f| f.directory).collect();
             let n = signed.len();

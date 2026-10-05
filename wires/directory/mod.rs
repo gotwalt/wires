@@ -155,13 +155,22 @@ pub(crate) fn next_step(ks: &Keystore, text: &str) -> Result<String> {
     } else {
         ""
     };
+    // A one-machine network that just gained a second directory: the first
+    // one's own word no longer vouches for it (card 49), so calls fail
+    // closed within `fresh_secs` until the new one runs and has the policy.
+    let urgent = if held.as_ref().is_some_and(|h| h.directories().len() == 2) {
+        " Do it now: until it runs and has taken `wires policy push`, no directory can vouch for \
+         the other, and calls fail closed within `fresh_secs`."
+    } else {
+        ""
+    };
     Ok(if hosts {
-        format!("next: restart `wires serve` on {who} to run the directory{string}")
+        format!("next: restart `wires serve` on {who} to run the directory{string}.{urgent}")
     } else {
         format!(
             "next: on {who}, `wires join <network>`{string}, then `wires serve host.json` or \
              `wires directory serve`; it starts empty and takes this policy from `wires policy \
-             push`"
+             push`.{urgent}"
         )
     })
 }

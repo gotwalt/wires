@@ -208,3 +208,70 @@ clean; shellcheck clean; `.scripts/demo-remote-cli.sh --quiet` (193 s) and `.scr
 - protocol.md: §4 says the token goes only to a proven directory, §5–§6 that hosts and directories
   both prove first, and §9's "directories are told the token before they prove anything" is now
   "directories are held to the hosts' rule".
+
+### After second review (integrate/49-45, on 7758aad)
+
+1. **Forged words took slots for good (MEDIUM-HIGH): fixed by type.** `FreshSet` now holds only
+   `VerifiedFresh`, made only by `Fresh::verified(head)`: the signer is listed by that head, the
+   version and head hash match, `until - at` is within its `fresh_secs`, the signature holds.
+   `FreshSet::insert` takes nothing else; it is no longer `Deserialize` (and lost
+   `FromIterator<Fresh>`): a list read back goes through `FreshSet::from_unverified(words, head)`,
+   which drops what doesn't verify. Every set goes through it:
+   - `view.json`: `HeldView` deserializes via `StoredView` and keeps only words for its view's head.
+     `fetched`, `keeping` and the new `learn_all` verify against the view's head.
+   - The refresh pool: `pool_words` admits a proof's words only when its head verifies under the
+     root, hasn't expired and is no older than the caller's view, and each word verifies for that
+     head (at most 16). `directory_vouched` verifies the proof's head before its words count.
+   - The host's `fresh.json` (`Freshness::load` and `offer`), the gateway's shared set (`learn`
+     verifies against the proof's head), and `Directory::proof`.
+
+   **Not done as asked:** "drop words from directories whose proofs failed" would break mutual
+   vouching. Two directories at one head each hold only their own word, so each one's proof
+   "fails" until the other's word arrives. Words are kept when their directory's head verifies, is
+   current and is not behind the view; words from a head that is forged, expired or behind are
+   dropped. A real word can't hurt: it vouches for a real head.
+
+   Tests: `fresh::tests::a_forged_word_never_takes_a_slot` and
+   `a_set_round_trips_as_a_plain_list_and_drops_what_does_not_verify`;
+   `e2e::views::forged_words_take_no_slot_and_refreshes_go_on`. In that test X shows words forged
+   in Y's and Z's names, `view.json` holds such words too, and the refresh still succeeds from Y
+   vouched by Z. Without the fix the read keeps the forged words and the first assertion fails.
+4. **A `Denied` before a proof is a dial failure (LOW).** `speak` returns `Unvouched` (the next
+   host is tried), and an inbox fetch counts it as unvouched rather than refused. Exit 77 is now
+   only for a `Denied` after the host's proof. Test:
+   `call::tests::a_denial_before_any_proof_fails_over_to_the_next_host`.
+5. **A served view must be under the head its directory proved (LOW).** `ask_proven` hands `take`
+   the proved head; `fetch` and `resolve` refuse any other head. I chose plain equality: a
+   directory that accepts a publish between its proof and its answer fails that round, and the
+   next one or the next poll serves. Test:
+   `e2e::views::a_view_under_another_head_than_the_one_proved_is_not_taken` (X proves v4 with Y's
+   real word, then serves v3).
+6. **`Behind` only from a verified word (LOW).** A `policy` frame's word is verified against its
+   root-verified head before the version is compared. A beat (possibly for a head the host doesn't
+   hold) must pass `Fresh::verify_signature` (new) and be the followed directory's own.
+   `Follower::take` takes the directory. Test:
+   `e2e::follow::a_beat_is_verified_before_it_says_the_directory_is_behind`.
+2. **A lagging directory keeps a removed host reachable: now said exactly.**
+   - protocol §4 (the token bullet): the sentence that a lagging directory "is never told a
+     caller's token once its words have lapsed" was false; it now says its words don't lapse.
+   - §4 *Publish*: what an exit-1 miss costs.
+   - §5: "once an edit has reached **every** directory", plus how the removed host uses the
+     lagging directory's word.
+   - §9 removed-host window: the exception spelled out, including the two-directory refresh case.
+   - The exit-1 failure in `wires/admin/propagate.rs` now says: "until it does, a host this edit
+     removed still receives callers' tokens through that directory's word for the policy before
+     it". The test asserts it. The line is in no snapshot.
+3. **A second directory on a one-machine network: §9** says calls fail closed within
+   `fresh_secs` until Y runs, has had `wires policy push`, and X follows it, so start Y right
+   after `directory add`. `directory add`'s next step adds "Do it now: until it runs and has taken
+   `wires policy push`, no directory can vouch for the other, and calls fail closed within
+   `fresh_secs`" when the head now lists exactly two. Test:
+   `directory::tests::a_second_directory_is_to_be_started_at_once`.
+
+Also in §4: the token bullet says how words are verified and that the view must be under the
+proved head. No narrative docs were touched.
+
+Run: `cargo test --workspace` twice, both green (152 library, 412 wires, 1 ignored, doctests), no
+flakes. `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check` and
+`shellcheck -x .scripts/*.sh` clean. `.scripts/demo-remote-cli.sh --quiet` and
+`.scripts/demo-push.sh --quiet` pass.

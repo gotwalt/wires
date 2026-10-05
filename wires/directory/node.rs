@@ -461,10 +461,14 @@ impl Directory {
         let (c, own) = self.current_with_fresh(now)?;
         let head = &c.held.signed.head;
         let mut set = FreshSet::default();
-        set.insert(own, now);
-        if let Some(host) = self.host_freshness.get() {
-            for f in host.proof(head, now).fresh {
-                set.insert(f, now);
+        let host = self
+            .host_freshness
+            .get()
+            .map(|h| h.proof(head, now).fresh)
+            .unwrap_or_default();
+        for f in std::iter::once(own).chain(host) {
+            if let Ok(v) = f.verified(head) {
+                set.insert(v, now);
             }
         }
         Ok(HostProof {

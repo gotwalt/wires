@@ -481,6 +481,8 @@ async fn a_poll_replaces_a_wrong_view_with_the_whole_one() {
 struct Showing {
     proof: library::HostProof,
     told: Arc<std::sync::atomic::AtomicUsize>,
+    /// What it answers a caller that went on past the proof, if anything.
+    answer: Option<library::DirectoryAnswer>,
 }
 
 impl iroh::protocol::ProtocolHandler for Showing {
@@ -502,6 +504,12 @@ impl iroh::protocol::ProtocolHandler for Showing {
                 tokio::time::timeout(PATIENCE, wire::read_hello(&mut recv, PATIENCE)).await
             {
                 self.told.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(answer) = &self.answer {
+                    let _request = wire::read_request(&mut recv).await;
+                    let _ = wire::write(&mut send, &answer.encode().unwrap()).await;
+                    let _ = send.finish();
+                    let _ = tokio::time::timeout(PATIENCE, conn.closed()).await;
+                }
             }
         }
         Ok(())
@@ -558,6 +566,7 @@ async fn a_removed_or_lagging_directory_is_told_no_token() {
                     Showing {
                         proof,
                         told: Arc::clone(&told),
+                        answer: None,
                     },
                 )
                 .spawn();
@@ -775,6 +784,177 @@ async fn a_signed_in_person_no_role_matches_is_told_so() {
         crate::help::brief(&e)
     );
     endpoint.close().await;
+}
+
+/// Real directories `dirs`, each holding `policy`, serving on loopback.
+async fn real_directories(w: &World, dirs: &[&NodeIdentity], policy: &SignedPolicy) -> Vec<Router> {
+    let now = now_unix();
+    let mut routers = Vec::new();
+    for d in dirs {
+        let ks = Arc::new(Keystore::at(crate::testutil::temp_dir()));
+        let dir = Directory::open(d.duplicate(), w.root.node_id(), ks, 8, now).unwrap();
+        assert!(dir.accept(policy, now).unwrap());
+        let ep = bind_in(d, &w.book).await;
+        w.book
+            .add_endpoint_info(endpoint_addr(&d.node_id(), &localhost_socks(&ep), None).unwrap());
+        routers.push(Running::mount(Router::builder(ep), &dir).spawn());
+    }
+    routers
+}
+
+/// Fake directory `x` showing `proof` and, to a caller that goes on,
+/// answering `answer`; the count of callers that went on.
+async fn showing(
+    w: &World,
+    x: &NodeIdentity,
+    proof: library::HostProof,
+    answer: Option<library::DirectoryAnswer>,
+) -> (Router, Arc<std::sync::atomic::AtomicUsize>) {
+    let told = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ep = bind_in(x, &w.book).await;
+    w.book
+        .add_endpoint_info(endpoint_addr(&x.node_id(), &localhost_socks(&ep), None).unwrap());
+    let router = Router::builder(ep)
+        .accept(
+            library::DIRECTORY_ALPN,
+            Showing {
+                proof,
+                told: Arc::clone(&told),
+                answer,
+            },
+        )
+        .spawn();
+    (router, told)
+}
+
+/// A word that names `by` as its signer for `head`, with a huge version and
+/// `until`, and a signature that covers none of it: what a removed
+/// directory can forge.
+fn forged(by: &NodeIdentity, p: &SignedPolicy) -> library::Fresh {
+    let now = now_unix();
+    let mut f = library::Fresh::sign(by, &p.head, now, now + 60).unwrap();
+    f.version = StateVersion(u64::MAX);
+    f.until = i64::MAX;
+    f
+}
+
+/// Second review, finding 1: a directory X (still listed) shows forged words
+/// in Y's and Z's names, and `view.json` holds such words already. None of
+/// them takes a slot: Y, vouched for by Z (and Z by Y), still gives the
+/// view, and what is stored holds only words that verify.
+#[tokio::test]
+async fn forged_words_take_no_slot_and_refreshes_go_on() {
+    let w = World::new();
+    let (x, y, z) = (
+        NodeIdentity::from_seed([44u8; 32]),
+        NodeIdentity::from_seed([45u8; 32]),
+        NodeIdentity::from_seed([46u8; 32]),
+    );
+    let all = vec![x.node_id(), y.node_id(), z.node_id()];
+    let v4 = w.policy(4, |p| p.directories = all.clone());
+    let routers = real_directories(&w, &[&y, &z], &v4).await;
+    let now = now_unix();
+    let (x_router, _) = showing(
+        &w,
+        &x,
+        library::HostProof {
+            head: v4.head.clone(),
+            fresh: vec![
+                forged(&y, &v4),
+                forged(&z, &v4),
+                library::Fresh::sign(&x, &v4.head, now, now + 900).unwrap(),
+            ],
+        },
+        None,
+    )
+    .await;
+    // `view.json` at version 4, with the forged words written in.
+    let ks = w.caller_keystore(true);
+    let root = w.root.node_id();
+    let held = HeldView::fetched(v4.view_for(w.caller.node_id(), None, None), None, 0);
+    let mut json: Value = serde_json::to_value(&held).unwrap();
+    json["fresh"] = serde_json::to_value(vec![forged(&y, &v4), forged(&z, &v4)]).unwrap();
+    std::fs::write(ks.path(view::VIEW_FILE), json.to_string()).unwrap();
+    assert!(
+        view::read(&ks, root).unwrap().unwrap().fresh.is_empty(),
+        "dropped on read"
+    );
+
+    let endpoint = w.caller_endpoint().await;
+    let asker = Asker {
+        endpoint: &endpoint,
+        root,
+        id_token: crate::caller::hello::stored_token(&ks),
+    };
+    let got = view::refresh(&ks, &asker, false).await.unwrap();
+    assert_eq!(got.version(), StateVersion(4));
+    let stored = view::read(&ks, root).unwrap().unwrap();
+    assert!(!stored.fresh.is_empty());
+    for f in stored.fresh.iter() {
+        f.verify(&v4.head).unwrap();
+        assert!(f.until < i64::MAX && f.version == StateVersion(4));
+    }
+    endpoint.close().await;
+    x_router.shutdown().await.unwrap();
+    for r in routers {
+        r.shutdown().await.unwrap();
+    }
+}
+
+/// Second review, finding 5: a directory that proves one head and serves a
+/// view under another (here an older one, with its own word for it) is not
+/// taken: the view must be under the head it proved.
+#[tokio::test]
+async fn a_view_under_another_head_than_the_one_proved_is_not_taken() {
+    let w = World::new();
+    let (x, y, z) = (
+        NodeIdentity::from_seed([47u8; 32]),
+        NodeIdentity::from_seed([48u8; 32]),
+        NodeIdentity::from_seed([49u8; 32]),
+    );
+    let all = vec![x.node_id(), y.node_id(), z.node_id()];
+    let v2 = w.policy(2, |p| p.directories = all.clone());
+    let v3 = w.policy(3, |p| p.directories = all.clone());
+    let v4 = w.policy(4, |p| p.directories = all.clone());
+    let now = now_unix();
+    let other = library::DirectoryAnswer::View {
+        view: v3.view_for(w.caller.node_id(), None, None),
+        fresh: library::Fresh::sign(&x, &v3.head, now, now + 900).unwrap(),
+    };
+    // Only X runs; it proves version 4 with Y's real word for it.
+    let (x_router, told) = showing(
+        &w,
+        &x,
+        library::HostProof {
+            head: v4.head.clone(),
+            fresh: vec![library::Fresh::sign(&y, &v4.head, now, now + 900).unwrap()],
+        },
+        Some(other),
+    )
+    .await;
+    let ks = w.caller_keystore(true);
+    let root = w.root.node_id();
+    let held = HeldView::fetched(v2.view_for(w.caller.node_id(), None, None), None, 0);
+    view::write(&ks, root, &held).unwrap();
+    let endpoint = w.caller_endpoint().await;
+    let asker = Asker {
+        endpoint: &endpoint,
+        root,
+        id_token: crate::caller::hello::stored_token(&ks),
+    };
+    let e = view::refresh(&ks, &asker, false).await.unwrap_err();
+    assert!(format!("{e:#}").contains("another head"), "{e:#}");
+    assert_eq!(
+        told.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "it was asked"
+    );
+    assert_eq!(
+        view::read(&ks, root).unwrap().unwrap().version(),
+        StateVersion(2)
+    );
+    endpoint.close().await;
+    x_router.shutdown().await.unwrap();
 }
 
 /// A caller holding an empty view at the directory's newest version gets

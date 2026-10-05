@@ -178,7 +178,7 @@ pub use directory::{
 };
 pub use entry::{ENTRY_CONTEXT, ENTRY_V2, SignedEntry};
 pub use error::{Error, IdTokenError, Result};
-pub use fresh::{FRESH_CONTEXT, FRESH_V1, Fresh, FreshSet, MAX_FRESH_SET};
+pub use fresh::{FRESH_CONTEXT, FRESH_V1, Fresh, FreshSet, MAX_FRESH_SET, VerifiedFresh};
 pub use head::{
     HeadHash, ITEMS_CONTEXT, ItemsHash, POLICY_HEAD_CONTEXT, POLICY_V5, PolicyHead,
     SignedPolicyHead, StateVersion,

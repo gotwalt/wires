@@ -84,17 +84,20 @@ pub(crate) const POLL: Duration = Duration::from_secs(60);
 
 /// `view.json`: the view, the newest `Fresh` per directory seen for it, when
 /// a directory last vouched for it, and the newest head version a host
-/// reported.
+/// reported. Its `fresh` holds only words that verify for its view's head:
+/// read back, the rest are dropped (second review: a forged word must
+/// never sit in a slot).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "StoredView")]
 pub(crate) struct HeldView {
     /// The view: the root-signed head and this caller's entries.
     pub(crate) view: View,
     /// The newest `Fresh` each directory signed that this caller has seen,
     /// from a directory or in a host's proof: what lets it speak to a host
     /// at once (card 49). Empty when the view was cut locally from a whole
-    /// policy and no host has shown one yet. Every use verifies each again.
-    #[serde(default, skip_serializing_if = "FreshSet::is_empty")]
+    /// policy and no host has shown one yet. Only words verified for the
+    /// view's head enter it.
+    #[serde(skip_serializing_if = "FreshSet::is_empty")]
     pub(crate) fresh: FreshSet,
     /// When a directory last vouched for the view (unix seconds; 0: never).
     pub(crate) checked: i64,
@@ -103,11 +106,37 @@ pub(crate) struct HeldView {
     pub(crate) seen: StateVersion,
 }
 
+/// `view.json` as read: its words not yet checked against its head.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredView {
+    view: View,
+    #[serde(default)]
+    fresh: Vec<Fresh>,
+    checked: i64,
+    seen: StateVersion,
+}
+
+impl From<StoredView> for HeldView {
+    /// Keep only the words that verify for the view's head (the head itself
+    /// is verified under the root by [`read`]).
+    fn from(s: StoredView) -> HeldView {
+        let fresh = FreshSet::from_unverified(s.fresh, &s.view.head);
+        HeldView {
+            view: s.view,
+            fresh,
+            checked: s.checked,
+            seen: s.seen,
+        }
+    }
+}
+
 impl HeldView {
-    /// A view just fetched (or cut) at `now`.
+    /// A view just fetched (or cut) at `now`, with the word that came with
+    /// it, if it verifies for the view's head.
     pub(crate) fn fetched(view: View, fresh: Option<Fresh>, now: i64) -> HeldView {
         let mut set = FreshSet::default();
-        if let Some(f) = fresh {
+        if let Some(f) = fresh.and_then(|f| f.verified(&view.head).ok()) {
             set.insert(f, now);
         }
         HeldView {
@@ -118,13 +147,20 @@ impl HeldView {
         }
     }
 
-    /// Keep, beside its own, what `old` had seen from each directory: a
-    /// refreshed view's head may still be the one they vouch for.
+    /// Keep, beside its own, what `old` had seen from each directory that
+    /// vouches for this view's head too.
     pub(crate) fn keeping(mut self, old: Option<&HeldView>, now: i64) -> HeldView {
-        for f in old.into_iter().flat_map(|o| o.fresh.iter()) {
-            self.fresh.insert(f.clone(), now);
-        }
+        self.learn_all(old.into_iter().flat_map(|o| o.fresh.iter()), now);
         self
+    }
+
+    /// Keep each of `words` that verifies for the view's head.
+    pub(crate) fn learn_all<'a>(&mut self, words: impl Iterator<Item = &'a Fresh>, now: i64) {
+        for f in words {
+            if let Ok(v) = f.clone().verified(&self.view.head) {
+                self.fresh.insert(v, now);
+            }
+        }
     }
 
     /// The view's head version.
@@ -207,10 +243,10 @@ pub(crate) fn note_fresh(ks: &Keystore, root: NodeId, fresh: &Fresh) {
         let Some(mut held) = read(ks, root)? else {
             return Ok(());
         };
-        if fresh.verify(&held.view.head).is_err() {
+        let Ok(fresh) = fresh.clone().verified(&held.view.head) else {
             return Ok(());
-        }
-        if held.fresh.insert(fresh.clone(), now_unix()) {
+        };
+        if held.fresh.insert(fresh, now_unix()) {
             write(ks, root, &held)?;
         }
         Ok(())
@@ -309,9 +345,14 @@ pub(crate) fn directory_vouched(
             proof.head.head.version.0
         );
     }
+    // Its words count only once its head is the root's, and each verifies
+    // for it (second review).
+    proof.head.verify(root)?;
     let mut set = pool.clone();
-    for f in &proof.fresh {
-        set.insert(f.clone(), now);
+    for f in proof.fresh.iter().take(library::MAX_FRESH_SET) {
+        if let Ok(v) = f.clone().verified(&proof.head) {
+            set.insert(v, now);
+        }
     }
     let combined = HostProof {
         head: proof.head.clone(),
@@ -341,14 +382,43 @@ pub(crate) fn directory_vouched(
     Ok(())
 }
 
+/// The words of `proof` that may join the pool the other directories are
+/// checked against (second review): none unless its head verifies under the
+/// root, hasn't expired, and is no older than the caller's view (`held`);
+/// then each that verifies for that head, at most [`library::MAX_FRESH_SET`].
+/// A forged word, or one shown by a directory whose head is behind, never
+/// takes a slot.
+pub(crate) fn pool_words(
+    proof: &HostProof,
+    root: NodeId,
+    held: Option<&library::SignedPolicyHead>,
+    now: i64,
+) -> Vec<library::VerifiedFresh> {
+    let head = &proof.head;
+    let usable = head.verify(root).is_ok()
+        && head.check_fresh(now).is_ok()
+        && held.is_none_or(|h| head.head.version >= h.head.version);
+    if !usable {
+        return Vec::new();
+    }
+    proof
+        .fresh
+        .iter()
+        .take(library::MAX_FRESH_SET)
+        .filter_map(|f| f.clone().verified(head).ok())
+        .collect()
+}
+
 /// Ask `dirs` for `request`, presenting `id_token` only to a directory whose
 /// proof checks out ([`directory_vouched`]): every directory is asked for
 /// its proof at once (`open`, nothing else); as each proof arrives, the
-/// `Fresh`es it carries join the pool the others are checked against, and
+/// `Fresh`es it carries that verify ([`pool_words`]) join the pool the
+/// others are checked against, and
 /// every directory whose proof now checks out is sent the token and the
 /// request, one at a time, until `take` accepts an answer. A directory
 /// whose proof never checks out was told nothing but `open`. Nothing waits
-/// for the slowest directory once one has answered.
+/// for the slowest directory once one has answered. `take` gets the head
+/// the directory proved, which the answer must be under (second review).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ask_proven<T>(
     endpoint: &Endpoint,
@@ -358,7 +428,7 @@ pub(crate) async fn ask_proven<T>(
     held: Option<&HeldView>,
     id_token: Option<IdToken>,
     request: &DirectoryRequest,
-    mut take: impl FnMut(NodeId, DirectoryAnswer, &FreshSet) -> Result<T>,
+    mut take: impl FnMut(&library::SignedPolicyHead, DirectoryAnswer, &FreshSet) -> Result<T>,
 ) -> std::result::Result<T, Unanswered> {
     let mut asked = tokio::task::JoinSet::new();
     for &dir in dirs {
@@ -373,8 +443,8 @@ pub(crate) async fn ask_proven<T>(
         match opened {
             Ok(o) => {
                 let now = now_unix();
-                for f in &o.proof.fresh {
-                    pool.insert(f.clone(), now);
+                for v in pool_words(&o.proof, root, held.map(|h| &h.view.head), now) {
+                    pool.insert(v, now);
                 }
                 waiting.push((dir, o));
             }
@@ -398,13 +468,14 @@ pub(crate) async fn ask_proven<T>(
                 continue;
             }
             let (dir, o) = waiting.remove(i);
+            let proved = o.proof.head.clone();
             match o.ask(id_token.clone(), request).await {
                 Ok(DirectoryAnswer::Denied { reason }) => {
                     out.not_admitted |= reason == crate::host::gate::NOT_ADMITTED;
                     out.failures
                         .push(format!("{}: refused: {reason}", dir.short()));
                 }
-                Ok(answer) => match take(dir, answer, &pool) {
+                Ok(answer) => match take(&proved, answer, &pool) {
                     Ok(t) => return Ok(t),
                     Err(e) => out.failures.push(format!("{}: {e:#}", dir.short())),
                 },
@@ -430,9 +501,10 @@ pub(crate) async fn ask_proven<T>(
 /// Ask `dirs` (never this node; `known` the network string's, for the
 /// one-directory rule) for this node's whole view, presenting
 /// `id_token` only to a directory that has shown it is current
-/// ([`ask_proven`]): the first view that verifies, whose `Fresh` vouches
-/// for its head, and that is no older than `held`. It keeps what `held` had
-/// seen from each directory, and every `Fresh` the directories showed.
+/// ([`ask_proven`]): the first view that verifies, under exactly the head
+/// that directory proved, whose `Fresh` vouches for its head, and that is no
+/// older than `held`. It keeps what `held` had seen from each directory, and
+/// every `Fresh` the directories showed, that vouches for its head.
 /// Errors when none gave one, with [`NotAdmitted`] as its context when a
 /// directory refused this node's admission.
 pub(crate) async fn fetch(
@@ -453,10 +525,13 @@ pub(crate) async fn fetch(
         held,
         id_token,
         &request,
-        |_, answer, pool| {
+        |proved, answer, pool| {
             let DirectoryAnswer::View { view, fresh } = answer else {
                 bail!("an unexpected answer to `view`: {answer:?}");
             };
+            if view.head != *proved {
+                bail!("a view under another head than the one it proved");
+            }
             view.verify(root)
                 .context("the directory's view does not verify")?;
             fresh
@@ -468,9 +543,7 @@ pub(crate) async fn fetch(
                 bail!("an older view (version {})", view.head.head.version.0);
             }
             let mut fetched = HeldView::fetched(view, Some(fresh), now).keeping(held, now);
-            for f in pool.iter() {
-                fetched.fresh.insert(f.clone(), now);
-            }
+            fetched.learn_all(pool.iter(), now);
             Ok(fetched)
         },
     )
@@ -673,10 +746,13 @@ pub(crate) async fn resolve(
         held.as_ref(),
         asker.id_token.clone(),
         &request,
-        |_, answer, _| {
+        |proved, answer, _| {
             let DirectoryAnswer::View { view, fresh } = answer else {
                 bail!("an unexpected answer to `resolve`: {answer:?}");
             };
+            if view.head != *proved {
+                bail!("a view under another head than the one it proved");
+            }
             view.verify(root)
                 .context("the directory's view does not verify")?;
             fresh
@@ -930,7 +1006,13 @@ mod tests {
         // Another's, in its proof or from the other directory asked.
         assert!(ok(&proof(&v3, &[&a, &b]), &none, None).is_ok());
         let mut pool = FreshSet::default();
-        pool.insert(Fresh::sign(&b, &v3.head, 1_000, 1_900).unwrap(), at);
+        pool.insert(
+            Fresh::sign(&b, &v3.head, 1_000, 1_900)
+                .unwrap()
+                .verified(&v3.head)
+                .unwrap(),
+            at,
+        );
         assert!(ok(&proof(&v3, &[&a]), &pool, Some(&v3)).is_ok());
         // Lapsed: no.
         assert!(

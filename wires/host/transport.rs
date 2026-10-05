@@ -1038,9 +1038,10 @@ pub(crate) struct Dialed {
 /// already ([`Vouching::ready`]), send the `Hello` and `invocation` at once
 /// and then check the host's proof; else send [`Frame::Open`], read and
 /// check the proof (refreshing the view if the host's head is newer), and
-/// only then send the `Hello` and `invocation`. `Err(`[`Unvouched`]`)`:
-/// nothing but `Open` was sent (a dial failure); a [`Denied`]: the host
-/// refused before its proof (its policy is unusable); any other error, after
+/// only then send the `Hello` and `invocation`. `Err(`[`Unvouched`]`)`: a
+/// dial failure, the next host is tried: nothing but `Open` was sent, or the
+/// host answered `Denied` instead of a proof (it proved nothing, so its
+/// refusal decides nothing; second review); any other error, after
 /// speaking, stops the call before stdin.
 pub(crate) async fn speak<S, R>(
     send: &mut S,
@@ -1087,7 +1088,16 @@ where
     };
     let proof = match read.await {
         Ok(Ok(Some(Frame::Proof(proof)))) => proof,
-        Ok(Ok(Some(Frame::Denied { reason }))) => return Err(Denied::new(reason).into()),
+        // Before it has proved anything a host's refusal is no decision (a
+        // removed host could otherwise end the call): the next host.
+        Ok(Ok(Some(Frame::Denied { reason }))) => {
+            return Err(Unvouched {
+                host: host.short(),
+                why: format!("it refused before showing a proof: {reason}"),
+                lapsed: false,
+            }
+            .into());
+        }
         Ok(Ok(Some(_))) => return Err(failed("its first frame was not a proof".into())),
         Ok(Ok(None)) => return Err(failed("it closed before showing a proof".into())),
         Ok(Err(e)) => return Err(failed(format!("an unreadable proof: {e:#}"))),

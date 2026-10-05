@@ -57,13 +57,11 @@ impl Freshness {
     /// nothing is kept). A missing or unreadable file is none, never an
     /// error: freshness only ever arrives from a directory again.
     pub(crate) fn load(ks: Arc<Keystore>, head: Option<&SignedPolicyHead>) -> Freshness {
-        let held: FreshSet = std::fs::read_to_string(ks.path(FRESH_FILE))
+        let words: Vec<Fresh> = std::fs::read_to_string(ks.path(FRESH_FILE))
             .ok()
             .and_then(|text| serde_json::from_str::<Vec<Fresh>>(text.trim()).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|f| head.is_some_and(|h| f.verify(h).is_ok()))
-            .collect();
+            .unwrap_or_default();
+        let held = head.map_or_else(FreshSet::default, |h| FreshSet::from_unverified(words, h));
         Freshness {
             ks,
             held: RwLock::new(held),
@@ -77,13 +75,14 @@ impl Freshness {
     /// `Err`: it doesn't vouch for `head` (another head, a signer the head
     /// doesn't list, a bad signature), and nothing changes.
     pub(crate) fn offer(&self, fresh: &Fresh, head: &SignedPolicyHead, now: i64) -> Result<bool> {
-        fresh
-            .verify(head)
+        let fresh = fresh
+            .clone()
+            .verified(head)
             .context("the freshness doesn't vouch for the held head")?;
         // Written under the lock: a concurrent offer can't persist an older
         // snapshot after this one (card 49 review).
         let mut held = self.held.write().unwrap_or_else(|e| e.into_inner());
-        if !held.insert(fresh.clone(), now) {
+        if !held.insert(fresh, now) {
             return Ok(false);
         }
         let kept: Vec<&Fresh> = held.iter().collect();

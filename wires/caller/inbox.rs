@@ -609,9 +609,15 @@ pub(crate) async fn fetch_from(
         let proof =
             match read_frame_within(&mut recv, FRAME_TIMEOUT, library::MAX_INBOX_HELLO).await {
                 Ok(Some(InboxFrame::Proof { proof })) => proof,
+                // Before a proof a refusal decides nothing (second review):
+                // a dial failure, like no proof at all.
                 Ok(Some(InboxFrame::Denied { reason })) => {
                     conn.close(0u32.into(), b"refused");
-                    return Ok(Fetched::Refused(reason));
+                    return Ok(Fetched::Unvouched(Unvouched {
+                        host: peer.short(),
+                        why: format!("it refused before showing a proof: {reason}"),
+                        lapsed: false,
+                    }));
                 }
                 other => {
                     conn.close(0u32.into(), b"no proof");

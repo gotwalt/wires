@@ -140,8 +140,10 @@ impl Propagation {
                 note: report.line(version),
                 failure: Some(format!(
                     "policy version {} is signed, stored here and in force at {} \
-                     directory(ies), but {} missed it, and nothing else will bring it there: \
-                     run `wires policy push` once {} back",
+                     directory(ies), but {} missed it, and nothing else will bring it there; \
+                     until it does, a host this edit removed still receives callers' tokens \
+                     through that directory's word for the policy before it: run `wires \
+                     policy push` once {} back",
                     version.0,
                     report.delivered.len(),
                     running
@@ -365,6 +367,11 @@ mod tests {
         );
         assert!(failure.contains(&other.short()), "{failure}");
         assert!(failure.contains("wires policy push"), "{failure}");
+        // Second review: what the miss costs, said plainly.
+        assert!(
+            failure.contains("a host this edit removed still receives callers' tokens"),
+            "{failure}"
+        );
         assert!(p.note.contains("published to 1 of 2"), "{}", p.note);
         let not_yet = PublishReport {
             delivered: vec![dir, other],

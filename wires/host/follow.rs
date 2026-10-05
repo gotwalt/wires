@@ -226,7 +226,7 @@ impl Follower {
                 tracing::info!(directory = %dir.hex(), have = have.0, "following the policy");
             }
             answered = true;
-            if let Err(e) = self.take(frame, now_unix()) {
+            if let Err(e) = self.take(dir, frame, now_unix()) {
                 if e.downcast_ref::<Behind>().is_some() {
                     self.stats.behind.fetch_add(1, Ordering::Relaxed);
                 }
@@ -260,12 +260,32 @@ impl Follower {
     /// keep its `Fresh`. `Err`: it can't be taken ([`Behind`] when it is for
     /// a head older than the one held), and the follower passes the
     /// directory over.
-    pub(crate) fn take(&self, frame: SubFrame, now: i64) -> Result<()> {
+    pub(crate) fn take(&self, dir: NodeId, frame: SubFrame, now: i64) -> Result<()> {
         let (fresh, policy) = match frame {
             SubFrame::Policy { policy, fresh } => (fresh, Some(policy)),
             SubFrame::Fresh { fresh } => (fresh, None),
             SubFrame::Denied { reason } => bail!("refused: {reason}"),
         };
+        // Verified before anything is concluded from it (second review): a
+        // whole policy's word against that policy's root-verified head; a
+        // beat's, which may be for a head this host doesn't hold, by its
+        // signature, and only as the word of the directory followed.
+        if let Some(policy) = &policy {
+            policy
+                .head
+                .verify(self.root)
+                .context("the policy's head doesn't verify")?;
+            fresh
+                .verify(&policy.head)
+                .context("the freshness doesn't vouch for the policy's head")?;
+        } else {
+            fresh
+                .verify_signature()
+                .context("the beat's signature doesn't verify")?;
+            if fresh.directory != dir || fresh.fabric != self.root {
+                bail!("a beat that isn't the followed directory's own");
+            }
+        }
         let held = self.held_version();
         if fresh.version < held {
             return Err(Behind {
@@ -275,13 +295,6 @@ impl Follower {
             .into());
         }
         if let Some(policy) = policy {
-            policy
-                .head
-                .verify(self.root)
-                .context("the policy's head doesn't verify")?;
-            fresh
-                .verify(&policy.head)
-                .context("the freshness doesn't vouch for the policy's head")?;
             self.adopt(&policy, now)?;
         }
         self.vouch(&fresh, now)

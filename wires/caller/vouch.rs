@@ -173,9 +173,8 @@ impl Vouching {
     pub(crate) fn keeping_in(mut self, sink: Sink) -> Self {
         if let Sink::Shared(shared) = &sink {
             let now = crate::clock::now_unix();
-            for f in shared.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-                self.held.fresh.insert(f.clone(), now);
-            }
+            let shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+            self.held.learn_all(shared.iter(), now);
         }
         self.sink = sink;
         self
@@ -343,7 +342,7 @@ impl Vouching {
             .into());
         }
         if let Ok(f) = proof.vouching(host, now) {
-            self.learn(f, now);
+            self.learn(f, &proof.head, now);
         }
         Ok(())
     }
@@ -370,18 +369,17 @@ impl Vouching {
         Ok(())
     }
 
-    /// Keep `fresh` (it vouched for a proof that checked out): in memory,
-    /// and in the sink.
-    fn learn(&mut self, fresh: &Fresh, now: i64) {
-        if fresh.verify(&self.held.view.head).is_ok() {
-            self.held.fresh.insert(fresh.clone(), now);
-        }
+    /// Keep `fresh` (it vouched for `head`, the root-verified head of a proof
+    /// that checked out): in memory when it is for the view's head, and in
+    /// the sink. Only a verified word enters a set (second review).
+    fn learn(&mut self, fresh: &Fresh, head: &library::SignedPolicyHead, now: i64) {
+        self.held.learn_all(std::iter::once(fresh), now);
         match &self.sink {
             Sink::Keystore(ks) => view::note_fresh(ks, self.root, fresh),
             Sink::Shared(set) => {
-                set.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(fresh.clone(), now);
+                if let Ok(v) = fresh.clone().verified(head) {
+                    set.lock().unwrap_or_else(|e| e.into_inner()).insert(v, now);
+                }
             }
             Sink::Nowhere => {}
         }

@@ -827,6 +827,22 @@ fn directory_edits_are_head_edits() {
     assert_eq!(f.policy().directories(), &[f.nodes[1].node_id()]);
 }
 
+/// Second review, finding 3: adding a second directory to a one-machine
+/// network says to start it now (calls fail closed until it runs and has
+/// the policy); adding a third doesn't need to.
+#[test]
+fn a_second_directory_is_to_be_started_at_once() {
+    let f = Fabric::new(3);
+    f.list_directory(0);
+    f.list_directory(1);
+    let second = super::next_step(&f.admin, &f.nodes[1].node_id().hex()).unwrap();
+    assert!(second.contains("Do it now"), "{second}");
+    assert!(second.contains("wires policy push"), "{second}");
+    f.list_directory(2);
+    let third = super::next_step(&f.admin, &f.nodes[2].node_id().hex()).unwrap();
+    assert!(!third.contains("Do it now"), "{third}");
+}
+
 /// A beat never rolls back a publish accepted while it signs: what it
 /// announces and vouches for is the newest head held.
 #[test]

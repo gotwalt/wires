@@ -309,13 +309,24 @@ request, and gets one answer (5 s to dial, 10 s per frame).
   and hasn't expired, and some `Fresh` vouches for it): the head is no older than the view's (at
   the same version, the same head), and a current `Fresh` signed by a directory **other than the
   one dialed** vouches for it, unless the head lists exactly that one directory and the network
-  string names no other; and the head lists the directory dialed. The `Fresh`es it counts are the proof's, the ones its view holds, and the ones every other directory showed in
-  the same round, so two directories at one head vouch for each other. As the proofs arrive, it sends
-  its token and request to each directory whose proof checks out, one at a time, until one
-  answers with a view it takes. A directory whose proof doesn't check out is a dial failure: it was
-  sent `open` and nothing else. So a directory the admin removed, or one that missed the edit
-  that removed a host, is never told a caller's token once its words have lapsed. Hosts,
-  directories and the admin present no token, and open with `hello` at once.
+  string names no other; and the head lists the directory dialed. The `Fresh`es it counts are the
+  proof's, the ones its view holds, and the ones every other directory showed in the same round,
+  so two directories at one head vouch for each other; but a word counts, or is kept anywhere, only
+  once it **verifies** (`Fresh::verified`: against a head that verified under the root, whose
+  directories list its signer, at that head's version and hash, within its `fresh_secs`, its
+  signature valid), and a directory's words join the round only when its head verifies, hasn't
+  expired and is no older than the caller's view. So a forged word can't take a real directory's
+  place (each `FreshSet` keeps one word per signer, and admits only verified ones). As the proofs
+  arrive, it sends its token and request to each directory whose proof checks out, one at a time,
+  until one answers with a view it takes: a view (or `resolve`'s one-entry view) **under exactly
+  the head that directory proved**, else the next. A directory whose proof doesn't check out is a
+  dial failure: it was sent `open` and nothing else. So a directory the admin removed is never told
+  a caller's token once its words have lapsed. **A directory that missed the edit is not caught
+  this way:** it is still listed and honest about the head it holds, and its words for that old
+  head don't lapse (it signs one every beat); a caller whose view is that old, or that holds no
+  view, accepts it as current until a publish reaches it (`wires policy push`; the edit itself
+  exits 1 saying so, below). Hosts, directories and the admin present no token, and open with
+  `hello` at once.
 - **Admission first** (`Directory::admit`), under the held policy. The peer is **named** when the
   policy names its key as a host or a directory and doesn't ban it (a key, never a token); it is an
   admitted **caller** when its `id_token` verifies (§6: the held policy's `issuer` items and their
@@ -360,8 +371,9 @@ traced: a view grants nothing, and the host decides every call.
 - `resolve {service}`: a `view` holding that one service, or no entry (it doesn't exist, or the
   caller may not use it: the two are not told apart).
 
-A caller takes a `view` when it verifies (`View::verify`: the head, and each entry on its own
-under the root, at a version no later than the head's) and its `Fresh` vouches for its head. A
+A caller takes a `view` when it is under the head its directory proved, verifies (`View::verify`:
+the head, and each entry on its own under the root, at a version no later than the head's), and
+its `Fresh` verifies for that head. A
 directory can withhold an entry or serve a stale view (a `Fresh` bounds how stale); neither lets
 anyone call anything, since the host decides every call from its whole policy.
 
@@ -410,7 +422,9 @@ missed it, the line adds that hosts following that one decide under the policy b
 takes this one, that nothing else hands it on, and that `wires policy push` re-publishes it.
 **The command exits 1 when a directory the new head lists, and that has taken a publish from this
 admin before, missed it**, whatever the others did: nothing else will bring that directory the
-edit, so the admin must, with `wires policy push` once it is back. The new policy is stored on the
+edit, so the admin must, with `wires policy push` once it is back; until then a host the edit
+removed still receives the tokens of callers whose views predate it, through that directory's
+word for the old head (§5), and the line says so. The new policy is stored on the
 admin and in force at every directory that took it. With no directory listed at all, the line
 says the policy is stored here and that `wires directory add` comes next, and nothing fails. Two
 exceptions:
@@ -439,7 +453,9 @@ without a restart. It takes each frame:
 - `fresh {fresh}`: kept if it vouches for the held head.
 
 A frame for a head **older** than the one it holds means the directory is behind (it missed a
-publish), and can't vouch for this host's head: the host passes it over for the next directory
+publish), and can't vouch for this host's head. That is concluded only from a word that verifies
+(a `policy` frame's against its root-verified head; a beat's by its signature, and only as the
+followed directory's own); anything else is a frame it can't take: the host passes it over for the next directory
 at once. So it does a policy it can't take (one that doesn't verify, or has expired) and a
 `denied`, at once or ending the stream (not named, no longer a host, the directory no longer one,
 or busy); the next round starts after the directory passed over. When the stream ends (the
@@ -454,7 +470,7 @@ signs its own at every beat. A host that the policy newly lists as a directory r
 mode only after a restart (it traces so).
 
 **Freshness at the host.** The host keeps, **per directory**, the newest `Fresh` that vouches
-for its held head (`FreshSet`: by version, then a current one over one that isn't current, then
+for its held head (`FreshSet`, which admits only verified words: by version, then a current one over one that isn't current, then
 `until`: one from a directory whose clock runs ahead never displaces a current one; at most 16
 directories), in memory and in `fresh.json` (0600, a JSON list), read back at start for those
 that still vouch for the head on disk. It shows the current ones to every caller first, on a
@@ -584,8 +600,12 @@ else) and sending `Proof` at once: that policy's head and every current `Fresh` 
 Every `Fresh` a checked proof carries that vouches for the view's head is kept with the view, so
 only the first call in each `fresh_secs` window to a host no held `Fresh` covers pays the extra
 flight. The window is `fresh_secs` (§3 *Settings*): an honest directory signs only for its newest
-head, so once an edit has reached the directories a host it removed has nothing to show within
-`fresh_secs`, and a removed host that is itself a directory can't vouch for its own old head.
+head, so once an edit has reached **every** directory a host it removed has nothing to show within
+`fresh_secs`, and a removed host that is itself a directory can't vouch for its own old head. A
+directory that missed the edit keeps signing for the head before it, and the removed host can show
+that directory's word (a proof is shown to anyone) to callers whose views are that old, until a
+publish reaches it (§4, §9). A host that answers `Denied` instead of its proof has proved nothing:
+that is a dial failure too, and the next host is tried.
 **Fail closed:** with no directory able to vouch (all down, or the host cut off from them), the
 caller sends no host its token, and the call fails (exit 1) saying `no directory has vouched for a
 host of \`<service>\` recently, so nothing was sent (…); the network's directories may be down or out
@@ -753,7 +773,7 @@ admit; the sign-in itself is kept, exit 0) all say it. A refusal by a host also 
 caller's view as behind, so the next `wires services`, `wires call` or `wires inbox` refreshes it
 first.
 
-Exit codes: `Denied` → **77**, nothing on stdout. Local or transport failure (including the checks
+Exit codes: `Denied` (after the host's proof) → **77**, nothing on stdout. Local or transport failure (including the checks
 above, and a call no host could prove itself current for: nothing was sent) → 1. Otherwise the remote exit code, **except that a remote 77 is reported as 1** with a
 note on stderr, so 77 always means the host refused. `wires call` exits 2 before dialing when its `--jq` filter
 doesn't compile or locked mode refuses its stdin, and 2 when the remote exited 0 but shaping its output
@@ -998,7 +1018,12 @@ ones that bound this spec:
   directory signed for the old head just before is current that long (the caller may hold one
   already, and speak at once). After that it can't show a current word for the head it holds, and
   on a session or an inbox fetch it is sent nothing (§5 *The host's proof*), except as the next
-  three items say. A host's `Proof` is shown to anyone before admission, so it is **replayable
+  three items say, and **except while a directory that missed the edit is up**: it keeps signing
+  current words for the old head (it is honest about what it holds, and still listed), the removed
+  host shows one, and callers whose views predate the edit send that host their token until `wires
+  policy push` reaches the directory. The edit exits 1 when a running directory missed it, saying
+  this (§4 *Publish*). In a two-directory network a caller that holds no view, or an old one, may
+  also refresh from the lagging one and stay behind meanwhile. A host's `Proof` is shown to anyone before admission, so it is **replayable
   material by design**: a removed host can show an honest host's current head and `Fresh`; that
   only makes the caller refresh its view to that head, which no longer lists it.
 - **A one-machine network trusts its host's own word.** When the head lists exactly one directory
@@ -1008,7 +1033,10 @@ ones that bound this spec:
   directory makes removal hold for callers that know of it: whose view's head lists it, or whose
   network string names it (`wires network` prints the new string after `directory add`; a caller
   that joined with the old one and hasn't refreshed since still trusts the machine's own word, and
-  asks only it).
+  asks only it). Adding the second directory Y has a cost until it runs: the head now lists two,
+  so X's own word no longer vouches for X, and only Y's can, once Y runs, has taken `wires policy
+  push`, and X follows it. Until then calls fail closed within `fresh_secs`. Start Y right after
+  `directory add`, then `wires policy push` (`directory add` says so).
 - **A removed directory can vouch for others' old heads.** A `Fresh` vouches for a head, not for a
   host, and is valid because the head lists its signer. A directory machine the admin removed keeps
   its key, and every head from before its removal still lists it: it can sign a current `Fresh`

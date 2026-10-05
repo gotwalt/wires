@@ -613,6 +613,7 @@ async fn a_policy_this_host_already_holds_keeps_its_fresh_and_feeds_its_director
     let fresh = library::Fresh::sign(&w.dirs[1], &v2.head, now, now + 300).unwrap();
     follower
         .take(
+            w.dirs[1].node_id(),
             library::SubFrame::Policy {
                 policy: v2.clone(),
                 fresh,
@@ -630,6 +631,7 @@ async fn a_policy_this_host_already_holds_keeps_its_fresh_and_feeds_its_director
     let fresh = library::Fresh::sign(&w.dirs[1], &v3.head, now, now + 300).unwrap();
     follower
         .take(
+            w.dirs[1].node_id(),
             library::SubFrame::Policy {
                 policy: v3.clone(),
                 fresh,
@@ -639,6 +641,58 @@ async fn a_policy_this_host_already_holds_keeps_its_fresh_and_feeds_its_director
         .unwrap();
     assert_eq!(own.version(), StateVersion(3));
     assert_eq!(store::read(&ks, root).unwrap().unwrap().signed, v3);
+    endpoint.close().await;
+}
+
+/// Second review: a beat claiming an older head is taken as "behind" only
+/// once its signature verifies and it is the followed directory's own; a
+/// forged one, or another directory's, is refused as a frame it can't take,
+/// never counted as the directory lagging.
+#[tokio::test]
+async fn a_beat_is_verified_before_it_says_the_directory_is_behind() {
+    let w = World::new().await;
+    let v1 = w.policy(1, Settings::default(), 1);
+    let v2 = w.policy(2, Settings::default(), 2);
+    let ks = w.keystore(&w.hosts[0], &v2);
+    let root = w.root.node_id();
+    let endpoint = w.bind(&w.hosts[0]).await;
+    let follower = Follower {
+        endpoint: endpoint.clone(),
+        ks: Arc::clone(&ks),
+        root,
+        freshness: Arc::new(Freshness::load(Arc::clone(&ks), Some(&v2.head))),
+        directory: None,
+        stats: Arc::new(FollowStats::default()),
+    };
+    let now = now_unix();
+    let followed = w.dirs[0].node_id();
+    let behind = |e: &anyhow::Error| e.downcast_ref::<crate::host::follow::Behind>().is_some();
+    // Genuine, the followed directory's own, for version 1: behind.
+    let old = library::Fresh::sign(&w.dirs[0], &v1.head, now, now + 300).unwrap();
+    let e = follower
+        .take(
+            followed,
+            library::SubFrame::Fresh { fresh: old.clone() },
+            now,
+        )
+        .unwrap_err();
+    assert!(behind(&e), "{e:#}");
+    // Forged (the signature no longer covers it): refused, not "behind".
+    let mut forged = old.clone();
+    forged.until += 1;
+    let e = follower
+        .take(followed, library::SubFrame::Fresh { fresh: forged }, now)
+        .unwrap_err();
+    assert!(!behind(&e), "{e:#}");
+    // Another directory's word, relayed: refused, not "behind".
+    let e = follower
+        .take(
+            w.dirs[1].node_id(),
+            library::SubFrame::Fresh { fresh: old },
+            now,
+        )
+        .unwrap_err();
+    assert!(!behind(&e), "{e:#}");
     endpoint.close().await;
 }
 
