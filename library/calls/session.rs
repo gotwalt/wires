@@ -31,8 +31,8 @@
 //! | `10` | `Hello`     | canonical-JSON of the [`Hello`]            |
 //! | `11` | `HelloAck`  | canonical-JSON of the [`HelloAck`]         |
 //!
-//! Any other tag is a [`Error::BadFrame`], tags `8` and `9` included (the
-//! `Hello` and `HelloAck` that carried badges).
+//! Any other tag is a [`Error::BadFrame`], tags `8` and `9` included (an
+//! older format of `Hello` and `HelloAck`).
 //!
 //! A dialer sends [`Frame::Invoke`] immediately after its `Hello`, without
 //! waiting for the ack — the host reads both, authorizes them together, and
@@ -542,7 +542,7 @@ mod tests {
             Frame::decode(&[0, 0, 0, 1, 12]),
             Err(Error::BadFrame)
         ));
-        // The badge-era hello and ack (tags 8 and 9) are no longer read.
+        // The older hello and ack (tags 8 and 9) are no longer read.
         for tag in [8, 9] {
             assert!(matches!(
                 Frame::decode(&[0, 0, 0, 3, tag, b'{', b'}']),

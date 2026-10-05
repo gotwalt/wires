@@ -30,7 +30,7 @@ wires: stdin is not forwarded in locked mode (it can carry local files to the ho
 
 wires: this node has not joined a network: run `wires login <network>` (a caller) or `wires join <network>` (a host or directory) with the string your admin prints with `wires network` [exit 1]
 
-wires: no node key at /home/me/.wires/node.seed: run `wires id` (it makes one), or `wires join <network>` [exit 1]
+wires: no node key at /home/me/.wires/node.seed: a caller runs `wires login <network>`, a host or directory `wires join <network>`, with the string your admin prints with `wires network` (`wires id` makes the key alone) [exit 1]
 
 wires: the network string does not decode; paste it whole (`wires network` on the admin prints it) [exit 1]
 

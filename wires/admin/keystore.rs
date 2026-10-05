@@ -163,7 +163,9 @@ pub fn node_identity_in(ks: &Keystore) -> Result<NodeIdentity> {
     }
     ks.read_node_identity()?.ok_or_else(|| {
         anyhow!(
-            "no node key at {}: run `wires id` (it makes one), or `wires join <network>`",
+            "no node key at {}: a caller runs `wires login <network>`, a host or directory \
+             `wires join <network>`, with the string your admin prints with `wires network` \
+             (`wires id` makes the key alone)",
             ks.path("node.seed").display()
         )
     })

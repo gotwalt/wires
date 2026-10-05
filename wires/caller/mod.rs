@@ -28,8 +28,8 @@
 //!   its view.
 //! - [`pick`] — service name → host, with failover; the local dial hints.
 //! - [`hello`] — the stored ID token the caller presents in each `hello`.
-//! - [`join`] — `wires id` and `wires join <token>` (card 14; every node
-//!   joins this way, hosts included).
+//! - [`join`] — `wires id` and `wires join <network>` (a host, a directory,
+//!   the gateway); `wires login <network>` joins the same way, then signs in.
 
 pub mod call;
 pub mod hello;

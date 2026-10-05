@@ -1,11 +1,12 @@
-//! The login settings an invite carries (card 37): which IdP and OAuth
-//! client a joiner's `wires login` signs in with, so it needs no flags.
+//! The login settings the network string carries: which IdP and OAuth
+//! client `wires login` signs in with, so it needs no flags.
 //!
 //! The issuer and its client id come from the signed policy's `issuer`
 //! items. Two things don't, and live in the admin's keystore instead
 //! (`login-client.json`, [`LoginClient`]):
 //!
-//! - **which** trusted issuer invites name, when the policy trusts several:
+//! - **which** trusted issuer the network string names, when the policy
+//!   trusts several:
 //!   the one `init` trusted, or the last one `wires issuer set --login`
 //!   marked; when that one is no longer trusted, the first the policy lists
 //!   (in issuer order);
@@ -13,8 +14,8 @@
 //!   (`--public-client-secret`): a Google "Desktop app" client has one its
 //!   token endpoint still requires, and it is not confidential. It stays out
 //!   of the signed policy, which every host holds and no host needs it for.
-//!   A confidential secret must never be given here: an invite is not a
-//!   secret.
+//!   A confidential secret must never be given here: the network string is
+//!   not a secret.
 
 use std::collections::BTreeMap;
 
@@ -31,7 +32,7 @@ pub(crate) const LOGIN_CLIENT_FILE: &str = "login-client.json";
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LoginClient {
-    /// The issuer invites name (when the policy still trusts it).
+    /// The issuer the network string names (when the policy still trusts it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) issuer: Option<Issuer>,
     /// Each issuer's public client secret, where the admin gave one.
@@ -63,7 +64,7 @@ impl LoginClient {
     }
 
     /// Record `issuer`'s public secret (if given) and, with `login`, make
-    /// it the issuer invites name; save.
+    /// it the issuer the network string names; save.
     pub(crate) fn record(
         ks: &Keystore,
         issuer: &Issuer,
@@ -81,7 +82,8 @@ impl LoginClient {
         me.save(ks)
     }
 
-    /// The login settings an invite under `policy` carries: the marked
+    /// The login settings the network string under `policy` carries: the
+    /// marked
     /// issuer if the policy still trusts it, else its first trusted issuer;
     /// that issuer's client id; its public secret, if any. `None` when the
     /// policy trusts no issuer.
@@ -119,7 +121,7 @@ mod tests {
     }
 
     #[test]
-    fn invites_name_the_marked_issuer_else_the_first() {
+    fn the_network_string_names_the_marked_issuer_else_the_first() {
         let ks = Keystore::at(crate::testutil::temp_dir());
         let p = policy(&[
             ("https://b.example", "b-client"),

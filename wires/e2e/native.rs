@@ -64,7 +64,7 @@ impl World {
         }
     }
 
-    /// The signed policy: alice and bob hold badges; role `analyst` is
+    /// The signed policy: role `analyst` is
     /// alice's email at her IdP and `ops` bob's at his; each of `services`
     /// is on the host, for `analyst`.
     fn state(&self, services: &[&str]) -> SignedPolicy {

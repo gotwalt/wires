@@ -8,8 +8,9 @@
 //! (the same binding `wires login` makes for a caller's own node). Every call
 //! then presents **that user's** ID token in the session handshake, so the
 //! host verifies Google's signature for that user itself and decides for
-//! them as the caller. The gateway holds nothing a host has to trust beyond its
-//! membership: it can't name a user Google didn't sign in.
+//! them as the caller. The gateway holds no credential of its own (it joined
+//! with the network string, like any node), and nothing a host has to trust:
+//! it can't name a user Google didn't sign in.
 //!
 //! What a web user sees is their **view** (card 37), as for any caller: the
 //! services a role **matching the user's IdP identity** admits, each a

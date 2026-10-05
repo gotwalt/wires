@@ -282,8 +282,8 @@ fn the_premise_is_short_and_in_the_right_words() {
 #[test]
 fn a_refusal_gets_one_next_step() {
     assert_eq!(
-        help::refusal("not a member of this network"),
-        "denied by host: not a member of this network; don't retry: ask your admin for access"
+        help::refusal("removed from this network"),
+        "denied by host: removed from this network; don't retry: ask your admin for access"
     );
     let login = "your ID token could not be verified; run `wires login`";
     assert_eq!(help::refusal(login), format!("denied by host: {login}"));

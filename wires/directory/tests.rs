@@ -658,8 +658,8 @@ async fn only_a_root_signed_newer_head_makes_a_directory_read_the_items() {
 }
 
 /// The first directory starts empty: it holds no policy, admits nobody (no
-/// issuer is trusted yet) and answers everything but a publish with what it
-/// waits for; the admin's first publish fills it, and it serves from then.
+/// issuer is trusted yet, no node is named) and answers everything but a
+/// publish with what it waits for; the admin's first publish fills it, and it serves from then.
 #[tokio::test]
 async fn the_first_directory_starts_empty_and_takes_the_first_publish() {
     let f = Fabric::new(2); // 0: directory, 1: caller
@@ -682,7 +682,7 @@ async fn the_first_directory_starts_empty_and_takes_the_first_publish() {
     assert_eq!(
         before,
         DirectoryAnswer::Denied {
-            reason: crate::host::gate::NOT_ADMITTED.into()
+            reason: super::node::EMPTY.into()
         }
     );
     let admin_ep = f.admin_endpoint().await;

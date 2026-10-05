@@ -61,10 +61,9 @@ impl Held {
     }
 }
 
-/// [`read`], required to exist (for a membership resolved elsewhere, such as
-/// a `--membership` flag).
+/// [`read`], required to exist (the admin's, which every edit starts from).
 pub(crate) fn require_policy(ks: &Keystore, root: NodeId) -> Result<Held> {
-    read(ks, root)?.context("this node holds no signed policy yet: run `wires join <token>` first")
+    read(ks, root)?.context("this node holds no signed policy yet (`wires init` signs the first)")
 }
 
 /// The stored policy, verified under `root`; `None` if this node has none

@@ -12,8 +12,9 @@
 #                "push": {"allow": ["analyst"]}.
 #   agent     -- signs in (mock IdP) as an analyst, then only `wires call` /
 #                `wires inbox`, in locked mode (WIRES_LOCKED=1).
-#   root      -- the admin: init, the analyst role, the three services on the
-#                workbench, one invite per machine.
+#   root      -- the admin: init, the analyst role, the workbench as the
+#                directory, the three services on it, `wires network`, and
+#                the first `wires policy push` (card 41's first run).
 #
 # Asserted: `deploy` returns within a few seconds while the build keeps
 # running; `wires inbox --wait` (what an agent would run as a background
@@ -89,17 +90,13 @@ mkdir -p "$root" "$wb" "$agent"
 start_mock_idp "$EMAIL"
 ROOT_ID="$(admin init --issuer "$ISSUER" --client-id "$CLIENT_ID" --public-client-secret not-so-secret | awk '/^network /{print $2}')"
 WB_ID="$(WIRES_HOME="$wb" "$WIRES" id 2>/dev/null)"
-AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
-[ -n "$ROOT_ID" ] && [ -n "$WB_ID" ] && [ -n "$AG_ID" ] || bad "setup: could not read the key ids"
-AG8="${AG_ID:0:8}"
+[ -n "$ROOT_ID" ] && [ -n "$WB_ID" ] || bad "setup: could not read the key ids"
 WB8="${WB_ID:0:8}"
-admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1
-admin invite "$WB_ID" --name workbench >/dev/null 2>&1
+admin role set analyst '*@example.com' >/dev/null 2>&1
 # The workbench is also the network's one directory (card 37: callers ask
 # one for their view). It isn't up yet, so each edit is stored here and
-# notes that no directory is running yet; the workbench's token carries the
-# policy.
-admin directory add workbench >/dev/null 2>"$D/dir.err" || {
+# notes that no directory has taken a publish yet.
+admin directory add "workbench=$WB_ID" >/dev/null 2>"$D/dir.err" || {
 	cat "$D/dir.err" >&2
 	bad "setup: wires directory add workbench failed"
 }
@@ -110,8 +107,8 @@ for svc in deploy status logs; do
 		bad "setup: wires service add $svc failed"
 	}
 done
-WB_TOKEN="$(admin invite "$WB_ID" --name workbench 2>/dev/null)" || true
-WIRES_HOME="$wb" "$WIRES" join "$WB_TOKEN" >/dev/null
+NETWORK="$(admin network)"
+WIRES_HOME="$wb" "$WIRES" join "$NETWORK" >/dev/null
 
 HOST_JSON="$D/host.json"
 JOBS="$D/jobs"
@@ -136,13 +133,20 @@ wait_for "$wb/run/hint" " " 300 || {
 # for n0 discovery.
 cp "$wb/run/hint" "$root/hints"
 cp "$wb/run/hint" "$agent/hints"
-AG_TOKEN="$(admin invite "$AG_ID" --name agent 2>"$D/invite.err")" || {
-	cat "$D/invite.err" >&2
-	bad "setup: inviting the agent failed"
+# The workbench's directory started empty: the admin's first publish fills
+# it, and the workbench starts serving.
+admin policy push >/dev/null 2>"$D/push0.err" || {
+	cat "$D/push0.err" >&2
+	bad "setup: wires policy push failed"
 }
-WIRES_HOME="$agent" "$WIRES" join "$AG_TOKEN" >/dev/null
+wait_for "$D/wb.err" "signed policy assigns every service to this host" 100 || {
+	dump "$D/wb.err"
+	bad "setup: the workbench never started serving"
+}
 
-login_as "$agent" "$EMAIL"
+login_as "$agent" "$EMAIL" "$NETWORK"
+AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
+AG8="${AG_ID:0:8}"
 agent_wires services >"$D/services.out" 2>/dev/null || true
 grep -qE "^deploy .*\(analyst\)$" "$D/services.out" || {
 	cat "$D/services.out" >&2

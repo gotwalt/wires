@@ -1,4 +1,4 @@
-//! A service entry the root signs on its own, like a badge (card 36d).
+//! A service entry the root signs on its own (card 36d).
 //!
 //! The policy's head signs a hash of every item ([`ItemsHash`](crate::ItemsHash)),
 //! which is all a host or directory needs: they hold the whole policy. A

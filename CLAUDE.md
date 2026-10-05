@@ -151,23 +151,25 @@ runs from it. A host serving CLIs needs an image that also has those CLIs.
     embedding API (`Host`, `Service`, `Call`, `CallIo`: card 33, an app
     serving wires calls in-process); `examples/kv/` is a native service;
     each role owns
-    a folder with a `mod.rs` — `admin/` (keystore, `init`/`invite`/`remove`,
+    a folder with a `mod.rs` — `admin/` (keystore, `init`, `network` (the
+    network string), `remove`/`restore` (person and node bans), the admin's
+    node labels (`labels.json`),
     `service`/`role`/`issuer`/`directory add|rm` edits of the signed policy,
-    `policy push`, `--ttl` /
-    `--policy-ttl`), `host/` (`serve`,
+    `policy push`, `--policy-ttl`), `host/` (`serve`,
     `host.json`, the gate over the signed policy, the session transport,
     native services and the embedded `Host`,
     verified identities, the per-call log line (`call_trace`), push,
-    its control sockets and the per-call push capability), `caller/` (`join`, `login`, the caller's view
+    its control sockets and the per-call push capability), `caller/` (`id`,
+    `join <network>`, `login [<network>]`, the caller's view
     (`view.json`), `services`, `call` with service → host failover and the
     local hints file, `mcp`, `inbox`), `gateway/` (`wires gateway`: remote MCP over HTTP + OAuth
     for web clients, calling with each user's own ID token), `directory/` (the
-    directory mode: `directory.redb`, `wires/directory/1` and
-    `wires/directory-sub/1`, the freshness beat and replicas, `directory
+    directory mode: `directory.redb`, `wires/directory/2` and
+    `wires/directory-sub/2`, the freshness beat and replicas, `directory
     serve`), `policy/` (the signed policy on this node: `policy.json`,
     publishing to and fetching from the directories); `e2e/` holds the loopback integration tests and
     `testutil.rs` the shared test fixtures. See `docs/board/README.md` § Roles.
-  - `library/`: `membership/`, `calls/`, `services/`, `directory/` are folders only — every
+  - `library/`: `network/`, `calls/`, `services/`, `directory/` are folders only — every
     module is declared at the crate root with `#[path]`, so public paths
     (`library::signed_policy`, …) and the `lib.rs` re-exports don't depend on them.
 - `.scripts/` — the self-asserting demos, their shared helpers (`lib.sh`)

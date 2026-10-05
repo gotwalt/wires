@@ -230,7 +230,7 @@ mod tests {
         assert!(Network::decode(&token).is_err());
         // An unknown field is refused.
         let mut v = serde_json::to_value(Network::new(root(), dirs(1), google())).unwrap();
-        v["membership"] = serde_json::json!("x");
+        v["credential"] = serde_json::json!("x");
         let token = B64.encode(serde_json::to_vec(&v).unwrap());
         assert!(Network::decode(&token).is_err());
     }

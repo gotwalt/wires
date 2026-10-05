@@ -69,8 +69,8 @@ one it stored.
 
 - **`wires join <network>`** stores it (`network.json`) and contacts nobody: what a host or a
   directory runs (they act for no person). It makes the node key first if there is none. Joining a
-  keystore that holds another network's string is refused (one network per keystore); joining the
-  same one again rewrites it.
+  keystore that holds another network's string is refused (one network per keystore), and so is
+  the admin's own (its root key names its network); joining the same one again rewrites it.
 - **`wires login <network>`** joins the same way, then signs in (§6) and asks a directory for the
   view: a caller's whole onboarding. A later sign-in is a bare `wires login`.
 
@@ -242,8 +242,10 @@ alone, on a node with no `host.json`, under the same rule, and refuses the admin
 holding `root.seed`), a keystore that joined no network, and a node neither lists.
 
 **The first publish.** The first directory starts **empty**: it holds no policy, signs no `Fresh`,
-and answers every request but `publish` with `this directory holds no policy yet`. It traces, once,
-that it is waiting for the admin's first publish (`wires policy push`, or the next admin edit). A
+admits nobody (no node is named, no issuer trusted), and answers every request but `publish`, and
+every subscription, with `this directory holds no policy yet: it is waiting for the admin's first
+publish`. It traces, once, that it is waiting for that publish (`wires policy push`, or the next
+admin edit). A
 `wires serve` whose directory is empty serves the directory at once and decides no call (`host
 configuration error`) until a publish arrives that assigns its services; then it starts deciding,
 with no restart. That is the network's one bootstrap step.
@@ -287,7 +289,8 @@ request, and gets one answer (5 s to dial, 10 s per frame).
   is admitted (a named node may present a token too). Anyone else is a **publisher at most**: it may
   send only a `publish`, and any other request hears `not admitted to this network; sign in with
   \`wires login\``, traced, throttled, logged nowhere. With no policy held, nobody is named and no
-  issuer is trusted, so only a publish is answered. At most 16 connections, on both ALPNs together,
+  issuer is trusted, so only a publish is taken (anything else hears that the directory is empty,
+  above). At most 16 connections, on both ALPNs together,
   are undecided at once (one more is closed unanswered): from the connection until its `hello` is
   decided (and, for a publisher, until its head is), and the stream must open and the `hello` arrive
   within 10 s. An admitted peer (or a publisher whose head verified) gives up its undecided slot at

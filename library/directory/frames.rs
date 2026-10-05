@@ -617,7 +617,7 @@ mod tests {
         for body in [
             r#"{"type":"offer"}"#,
             r#"{"type":"head"}"#,
-            r#"{"type":"hello","badge":"x"}"#,
+            r#"{"type":"hello","credential":"x"}"#,
             r#"{"type":"publish","head":{},"items":[]}"#,
             r#"{"type":"slice","have":1,"roles":[]}"#,
             r#"{"type":"policy"}"#,

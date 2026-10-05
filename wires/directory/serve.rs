@@ -155,6 +155,11 @@ async fn one_request(
                         }
                     }
                 }
+                // Holding no policy, it admits nobody; it says what it waits
+                // for (there is nothing to keep from anyone).
+                (Ok(_), None, _) if dir.snapshot().is_none() => DirectoryAnswer::Denied {
+                    reason: super::node::EMPTY.into(),
+                },
                 (Ok(_), None, _) => {
                     refuse("asked for more than a publish without admission".into())
                 }
@@ -245,11 +250,10 @@ async fn subscription(dir: &Directory, conn: &Connection, caller: NodeId) -> Res
     };
     let peer = dir.admit(caller, id_token.as_ref(), now_unix()).await;
     if !peer.admitted() {
-        let detail = if dir.snapshot().is_none() {
-            "this directory holds no policy yet".to_string()
-        } else {
-            format!("{}… is neither named nor signed in", caller.short())
-        };
+        if dir.snapshot().is_none() {
+            return deny(&mut send, super::node::EMPTY.into()).await;
+        }
+        let detail = format!("{}… is neither named nor signed in", caller.short());
         STRANGERS.refused("directory subscription", caller, &detail);
         return deny(&mut send, NOT_ADMITTED.into()).await;
     }

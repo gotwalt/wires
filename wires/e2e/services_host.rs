@@ -494,6 +494,27 @@ async fn a_removed_person_is_refused_from_any_machine_until_restored() {
     assert_eq!(out.stdout(), "rows: 4\n");
 }
 
+/// The web gateway's call, as the host sees it: a node with no credential
+/// of its own (nothing the admin minted, no sign-in of its own) presents a
+/// web user's ID token, nonce-bound to the gateway's key, and is admitted as
+/// that user; the same token from any other node is refused.
+#[tokio::test]
+async fn a_gateway_with_no_credential_of_its_own_calls_as_its_user() {
+    let w = World::new().await;
+    let host = Host::start(&w, w.host_json(SERVICES, false), &w.state(1, &[]))
+        .await
+        .unwrap();
+    let gateway = NodeIdentity::from_seed([90u8; 32]);
+    // Alice signed in at the gateway: her token's nonce is the gateway's.
+    let for_gateway = super::hello(&gateway, 1, Some(&w.idp_alice));
+    let out = call(&gateway, &host, for_gateway.clone(), "orders-db", &["9"]).await;
+    assert_eq!(out.stdout(), "rows: 9\n");
+    // Lifted off the gateway, it admits no one.
+    let thief = NodeIdentity::from_seed([91u8; 32]);
+    let out = call(&thief, &host, for_gateway, "orders-db", &[]).await;
+    assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
+}
+
 #[tokio::test]
 async fn push_follows_the_signed_state() {
     let w = World::new().await;

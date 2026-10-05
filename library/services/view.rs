@@ -5,7 +5,7 @@
 //! A view is the root-signed head (for its version, lifetime and the
 //! directories whose [`Fresh`](crate::Fresh) vouches for it) and the signed
 //! entries of the services a role in whose `allow` admits the caller. Each
-//! entry verifies on its own under the root, as a badge does, so a directory can't
+//! entry verifies on its own under the root, so a directory can't
 //! forge one, move one from another fabric, or hand back an older version
 //! than one the caller holds ([`View::apply`] keeps the newest version of
 //! each entry). What a view leaves out is the point: no role, no ban, and no

@@ -15,8 +15,10 @@
 //!   environment and a per-call push capability, not the host's keystore.
 //! - [`gateway`] — `wires gateway`: a web MCP client signs in (OAuth, a mock
 //!   Google) and calls as its user, over real HTTP.
-//! - [`first_run`] — starting a network: `init`, `directory add`, `invite`,
-//!   `join`, `directory serve`, an edit, with no step failing.
+//! - [`first_run`] — card 41's first run from empty keystores (`init`, `role
+//!   set`, `directory add`, `service add`, `network`, `join`, `serve`,
+//!   `policy push`, `login <network>`, `services`, `call`), with no step
+//!   failing; then removal by person and by node, and `restore`.
 //! - [`follow`] — card 36c: hosts follow a directory's `policy`
 //!   subscription (deltas, resync, failover), and the signed freshness rule
 //!   (`lenient` / `strict`) with every directory down.

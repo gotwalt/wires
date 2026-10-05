@@ -441,7 +441,8 @@ mod tests {
     fn onboarding_commands_parse() {
         let id = "ab".repeat(32);
         assert!(Cli::try_parse_from(["wires", "init"]).is_ok());
-        // No badge, no `--ttl`, no `invite`: card 41.
+        // Card 41: the admin mints nothing for a node, so `init` takes no
+        // lifetime for one, and there is nothing to hand out.
         assert!(Cli::try_parse_from(["wires", "init", "--ttl", "7d"]).is_err());
         assert!(Cli::try_parse_from(["wires", "invite", &id]).is_err());
         assert!(Cli::try_parse_from(["wires", "network"]).is_ok());
