@@ -1,6 +1,6 @@
 # 45 — One way to keep policy copies in step
 
-**Depends on:** [41](../done/41-idp-membership.md) · **Status:** backlog; scheduled (the human, 2026-10-05), **after [card 49](49-removed-host-window.md) is thought through** · **Files:** `library/services/{policy_update,fresh,item,view}.rs`, `library/directory/frames.rs`, `wires/directory/`, `wires/policy/`, `wires/host/{follow,freshness,gate}.rs`, `wires/caller/view.rs`, `wires/admin/settings.rs`
+**Depends on:** [41](../done/41-idp-membership.md) · **Status:** backlog; scheduled (the human, 2026-10-05), **built with [card 49](49-removed-host-window.md)**, which is decided · **Files:** `library/services/{policy_update,fresh,item,view}.rs`, `library/directory/frames.rs`, `wires/directory/`, `wires/policy/`, `wires/host/{follow,freshness,gate}.rs`, `wires/caller/view.rs`, `wires/admin/settings.rs`
 
 ## Why
 
@@ -45,5 +45,17 @@ under the default setting.
 - A host that is also a directory used to resync when its follow loop saw an update it already
   held; fixed in card 43 (`Follower::take` skips it). One fewer reason the delta path misfires.
 - The ALPNs are `wires/directory/2` and `wires/directory-sub/2`.
+
+## Decided with card 49 (the human, 2026-10-05)
+
+Card 49 keeps `Fresh`: a caller now needs one, signed by a directory other
+than the host it dials, before it sends a token. So **item 2 changes**:
+`Fresh` and the directory's beat stay (hosts must hold a current `Fresh` at
+all times); `lenient` / `strict` and the host's gate check on freshness go
+(the caller fails closed instead); the settings item shrinks to `beat_secs`
+and `fresh_secs`, or to `fresh_secs` alone if the beat interval can be
+derived from it. Items 1 and 3 go ahead as written. Build 49 first, then 45,
+or both on one branch: they share `fresh.rs`, `host/freshness.rs` and
+`caller/view.rs`.
 
 ## Notes

@@ -1,6 +1,6 @@
 # 49 — The removed-host window
 
-**Depends on:** decide together with [45](45-trim-policy-sync.md) · **Status:** backlog; a design question to think through first (the human, 2026-10-05: it "seems like a practical problem") · **Files:** `library/calls/session.rs`, `library/services/fresh.rs`, `wires/caller/{call,view,inbox}.rs`, `wires/host/{transport,freshness,follow}.rs`, `docs/protocol.md` §4–5, §9
+**Depends on:** decide together with [45](45-trim-policy-sync.md) · **Status:** backlog; decided (the human, 2026-10-05), build with 45 · **Files:** `library/calls/session.rs`, `library/services/fresh.rs`, `wires/caller/{call,view,inbox}.rs`, `wires/host/{transport,freshness,follow}.rs`, `docs/protocol.md` §4–5, §9
 
 ## The problem
 
@@ -68,7 +68,44 @@ today. Option 2 here is the first thing that would make `Fresh` decide
 something. Think this card through before building 45: either `Fresh` stays
 and earns its place, or 45 goes ahead and this card needs a different answer.
 
-## Questions to settle
+## Decision (the human, 2026-10-05)
+
+Option 2, with these answers to the questions below: "I think 15m is ok. I
+think one machine networks need to work just fine. i think fail close."
+
+- **The host speaks first; the caller sends nothing until it has checked.**
+  Today `Hello` (the ID token) and `Invoke` (the arguments) go out before the
+  host says a word; that order goes. On a new session the host sends its
+  root-signed head and a current `Fresh` for it, and no entries (a stranger
+  learns a version and who vouched, nothing about services). The caller
+  checks: the `Fresh` verifies, is within `until`, is for that head, and is
+  signed by one of that head's directories **other than the dialed host**;
+  the head's version is at least its view's. Same version: its own view says
+  whether this host serves the service. Newer: it refreshes its view from a
+  directory before deciding. Any failure is a dial failure (move to the next
+  host, card 46's rule), not a refusal, and nothing was sent.
+- **The window is `fresh_secs`, 15 minutes by default.** It is the knob.
+- **A cached proof costs no extra flight.** The caller keeps each host's last
+  proof; while it is within `until` and matches its view, it sends `Hello` and
+  `Invoke` at once, as today. The extra round trip is paid only on the first
+  call to a host in each window. Measure both on loopback and over a relay.
+- **Fail closed.** With no directory able to vouch (all down, or the host cut
+  off from them), the caller does not send the token: the call fails with a
+  sentence saying no directory has vouched for this host recently. Calls no
+  longer keep working with every directory down. `lenient` / `strict` goes:
+  this is the only behaviour, decided at the caller, and the host's own
+  `strict` gate check is redundant.
+- **One-machine networks work just fine.** When the head lists exactly one
+  directory and it is the dialed host, the caller accepts that host's own
+  `Fresh`. Fail-closed costs nothing there: if its directory is down, so is
+  the host. The cost is stated in protocol §9: in such a network removal of
+  that machine is bounded by the head's `not_after`, and an admin who needs
+  removal to hold runs a second directory (say so in the walkthrough, since
+  first-run is this shape).
+- **`wires inbox` gets the same check** before it presents a token to a host,
+  and so do `wires mcp` and the gateway, which dial through the same path.
+
+## Questions to settle (answered above)
 
 - Is a 15-minute window acceptable, and is `fresh_secs` the right knob?
 - What should a one-machine network (host and directory together) do?
