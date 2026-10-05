@@ -6,7 +6,7 @@ Arm 5 (card 19, [below](#arm-5-wires-is-the-only-thing-the-agent-can-run)) added
 50 more sessions the same day: $0.83, all correct.*
 
 *Note: the setup has changed since these runs. `bench/wires-up.sh` now
-registers `gh` in the admin-signed registry for a role `bench` matched on the
+registers `gh` in the admin-signed policy for a role `bench` matched on the
 benchmark's IdP identity, and the agent signs in with `wires login`. The
 results and the setup table below are from the runs as they were.*
 

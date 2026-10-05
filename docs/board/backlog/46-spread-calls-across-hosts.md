@@ -21,6 +21,6 @@ every caller's traffic goes to the first until it is down.
   place to settle the first.
 
 Small: tens of lines and a property test. Until it lands, the docs say
-"fails over", not "scales out" ([card 39](39-premise-and-story.md)).
+"fails over", not "scales out" ([card 39](../doing/39-premise-and-story.md)).
 
 ## Notes

@@ -57,7 +57,7 @@ One admin, one host (the `workbench`, holding `orders.db`), one agent.
 
 ```console
 # admin: create the network, say who may call what, and where it runs
-admin$ wires init --client-id <your Google OAuth client id>
+admin$ wires init --client-id <your Google OAuth client id> --public-client-secret <its secret>
 admin$ wires role set analyst '*@acme.com'
 admin$ wires directory add workbench=2161f020032bd52d283a33399ca6364d5b41037a272bafe4b0d72eb69d5e961c
 admin$ wires service add orders-db --description "Read-only SQL over orders" \
@@ -108,7 +108,7 @@ agent$ wires inbox
 
 admin$ wires remove alice@acme.com
 agent$ wires call orders-db -- "select 1"
-wires: denied by host: not admitted to this network; sign in with `wires login`
+wires: denied by host: not admitted to this network: no role in this network matches alice@acme.com, or you were removed: ask your admin
 agent$ echo $?
 77
 ```
@@ -116,8 +116,10 @@ agent$ echo $?
 *The output is from a run on one machine, with `wires dev-mock-idp` (a
 stand-in IdP built only with `--features dev-mock-idp`) in place of Google,
 so that run's `init` also named the stand-in with `--issuer`. The network
-string is cut short here. The `role set`, `directory add` and `service add`
-edits each note on stderr that the new policy is stored but not yet
+string is cut short here, and output the tour doesn't need is left out
+(`join`'s next steps, `serve`'s log, the `push` and `remove` receipts, the
+sign-in URL `login` prints). The `role set`, `directory add` and `service
+add` edits each note on stderr that the new policy is stored but not yet
 published; `wires policy push` delivers it once a directory runs.
 `./.scripts/demo-remote-cli.sh` runs the same steps, with two hosts, and
 checks every result.*
@@ -166,7 +168,8 @@ A webhook needs the receiver to listen, and an agent on a laptop doesn't. A
 wires host sends a message to the caller's key instead, or holds it (24
 hours by default) until the caller's next `wires inbox`. With a `push`
 section in `host.json` whose roles admit the caller, each call's command
-can message the caller that started it, even after the call has ended:
+can message the caller that started it, up to 10 minutes after the call has
+ended:
 
 ```console
 # in a CI job the call started, on the host
@@ -258,15 +261,15 @@ A wires host opens no inbound port: an agent reaches only the services the
 policy lets its person call, checked against their IdP sign-in on every
 call.
 
-**Neither keeps a log of calls for you.** The host writes one ordinary log
+**wires keeps no log of calls for you.** The host writes one ordinary log
 line per call (service, caller, verified email, role, exit code) to its own
-output. wires keeps no other record of calls.
+output, and nothing else records calls.
 
 ## Limits
 
-- **The admin doesn't approve each machine.** Anyone your IdP verifies, and
-  a role admits, is in from any machine. A phished sign-in that binds an
-  attacker's key would be admitted.
+- **The admin doesn't approve each machine.** Anyone your IdP verifies (with
+  a verified email) and a role matches is in from any machine. A phished
+  sign-in that binds an attacker's key would be admitted.
 - **The ID token is the only credential.** Google's last about an hour, so a
   caller runs `wires login` again each hour. Disabling someone at the IdP
   cuts them off within one token's life.
@@ -279,15 +282,16 @@ output. wires keeps no other record of calls.
   keys, removals). A caller holds only its view, but a directory sees who
   asks for which view.
 - **A directory must be running** to change the policy, remove someone or
-  list services. Calls don't need one: each host decides from its own copy.
+  fetch a caller's view (at sign-in, and once the view is a day old). Calls
+  don't need one: each host decides from its own copy.
 - **The policy expires** 90 days after the last edit by default, and nothing
   renews it on its own. Removals don't expire; they stay until `wires
   restore`.
 - **A caller dials from the view it holds.** A host the admin took off a
   service can still be dialed by callers whose view is stale, and receives
-  their ID token and arguments. `wires call` refreshes a view older than a
-  day when a directory answers, but the hard bound is the policy's expiry
-  (90 days by default).
+  their ID token and arguments. `wires call` and `wires inbox` refresh a
+  view older than a day when a directory answers, but the hard bound is the
+  policy's expiry (90 days by default).
 - **Callbacks go to a caller's key**, not yet only to the caller that asked
   ([card 31](docs/board/backlog/31-inbox-delivery.md)).
 - **Only Google has been tested** as the IdP. The web gateway listens over

@@ -118,8 +118,8 @@ Waiting on a mock CI build of 60 s or 300 s, 5 runs per setup
 
 ## Limits
 
-- **The admin doesn't approve each machine.** Anyone the IdP verifies, and a
-  role admits, is in from any machine; a phished sign-in that binds an
+- **The admin doesn't approve each machine.** Anyone the IdP verifies (with
+  a verified email) and a role matches is in from any machine; a phished sign-in that binds an
   attacker's key would be admitted.
 - **The ID token is the only credential.** Google's last about an hour, so
   callers sign in again each hour. Every service a caller calls receives that
@@ -129,8 +129,8 @@ Waiting on a mock CI build of 60 s or 300 s, 5 runs per setup
 - **Several hosts per service give failover**, not more capacity.
 - **Hosts and directories hold the whole policy**; a caller holds only its
   view, but a directory sees who asks for which view.
-- **A directory must be up** to change the policy, remove someone or list
-  services. Calls don't need one.
+- **A directory must be up** to change the policy, remove someone or fetch
+  a caller's view. Calls don't need one.
 - **Only Google has been tested** as the IdP.
 
 The full list: [usage.md § Known trade-offs](usage.md#known-trade-offs).

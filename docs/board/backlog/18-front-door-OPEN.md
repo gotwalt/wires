@@ -1,6 +1,6 @@
 # 18 — OPEN QUESTION: the front door (apex key, invites, `wires join <domain>`)
 
-**Status:** parked by the human on 2026-09-23 ("not crystal clear on the apex / invite; let's not solve that tonight"). **Don't build anything from this card until it's discussed.** The demo uses hand-issued invites (`wires invite` / `wires join`).
+**Status:** parked by the human on 2026-09-23 ("not crystal clear on the apex / invite; let's not solve that tonight"). **Don't build anything from this card until it's discussed.** Invites are gone ([card 41](../done/41-idp-membership.md)): a caller joins with `wires login <network>`, a host or directory with `wires join <network>`.
 
 ## The question
 

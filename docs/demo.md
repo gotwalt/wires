@@ -37,7 +37,7 @@ clipboard. On camera, in order:
 | 5 | agent | [push beat](#5-the-workbench-calls-back-push): `wires call deploy -- build 41`, `wires inbox --wait --timeout 10m` | `… from host <wb8> (verified)  build-41  failed: …` |
 | 5b (with a spare) | workbench | stop `wires serve`, ask again | the spare answers (`wires call --verbose` names it) |
 | 6 | admin | `wires remove <your address>` | stderr `policy version N: published to 1 of 1 directory(ies)` (2 of 2 with a spare that is also a directory) |
-| 6 | agent | ask Claude Code the question again | exit 77, nothing on stdout: ``wires: denied by host: not admitted to this network; sign in with `wires login` `` |
+| 6 | agent | ask Claude Code the question again | exit 77, nothing on stdout: `wires: denied by host: not admitted to this network: no role in this network matches <your address>, or you were removed: ask your admin` |
 
 ### Rebuttals, one line each
 
@@ -280,10 +280,12 @@ Then ask Claude Code the question again.
 > it to the directory, which here is the workbench itself. The workbench
 > applies it from the next call, with no restart and no key to rotate, and
 > it would on any machine I signed in from. The agent's next call exits 77
-> with nothing on stdout. The host doesn't say why, on purpose."
+> with nothing on stdout. The host doesn't tell a removed person apart from
+> anyone else it won't admit, on purpose."
 
-Point at ``wires: denied by host: not admitted to this network; sign in with
-`wires login` `` and the exit code. Afterwards, `wires restore <your
+Point at `wires: denied by host: not admitted to this network: no role in
+this network matches <your address>, or you were removed: ask your admin`
+and the exit code. Afterwards, `wires restore <your
 address>` puts things back.
 
 ### Closing line

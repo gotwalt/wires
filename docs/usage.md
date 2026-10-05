@@ -27,12 +27,12 @@ every role matcher names its issuer.
 
 | What | Lives in | Checked by |
 |---|---|---|
-| **Who is calling** | The caller's ID token from your IdP, bound to the caller's node key at `wires login` (the OIDC `nonce` is a hash of the key), presented in every call's `Hello`. It is the only credential a caller has. | The host, against the issuer's published keys, under the issuers the policy trusts (`host.json` may narrow them). A token that is missing, forged, bound to another key or from an untrusted issuer hears only `not admitted to this network; sign in with \`wires login\``. |
+| **Who is calling** | The caller's ID token from your IdP, bound to the caller's node key at `wires login` (the OIDC `nonce` is a hash of the key), presented in every call's `Hello`. It is the only credential a caller has. | The host, against the issuer's published keys, under the issuers the policy trusts (`host.json` may narrow them). A token that is missing, forged, bound to another key, from an untrusted issuer or without a verified email, a banned person or node, and a person no role matches all hear only `not admitted to this network: sign in with \`wires login\`, or ask your admin for a role` (an expired token hears that the sign-in has expired); the caller's own `wires` turns that into what its person can act on. |
 | **Who may call what** | The policy: each service's `allow` roles, and the roles (matchers on the verified identity, each naming its issuer). | The host, on every call. A directory cuts each caller's view from the same policy, for listing and dialing only. |
 | **Stricter local rules** | `host.json`'s `also_require` roles per service. They can only narrow. | The host, after the policy. |
 | **Which host** | The policy's `hosts` for the service. Only the admin binds a name to a host. | The caller (it dials only the hosts the service's root-signed entry lists) and the host (it refuses to start, or to serve, a name not assigned to it). |
 | **Reach** | The host's node key. Callers dial a key (iroh: n0 discovery, or a local `hints` file); the host binds UDP for QUIC and has no TCP listener. | iroh authenticates the key. Any key may connect; it is refused at its first message unless its token verifies. |
-| **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. A service pushes only through its call's capability, to that call's caller. | The host, at send, delivery and fetch: not removed, and in a `push.allow` role. |
+| **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. A service pushes only through its call's capability, to that call's caller. | The host, at send, delivery and fetch: admitted (not removed, a role matches), and in a `push.allow` role. |
 | **Removal** | A person ban or a node ban in a new policy, published to the directories; hosts follow a directory's subscription. | Each host that has the new policy, on the removed person's or node's next call or fetch there. |
 
 Nothing is broadcast. **A caller holds only its view**: the root-signed
@@ -45,12 +45,14 @@ directories. Hosts, directories and the admin hold the whole policy.
 Six `WIRES_HOME` directories stand in for six machines: **admin**,
 **workbench** and **spare** (hosts, and the network's two directories),
 **agent** (alice@example.com, the caller), **observer**
-(carol@partner.example, signed in but in no role) and **bob**
+(carol@partner.example, whom the IdP verifies but no role matches, so she
+is not in the network) and **bob**
 (bob@example.com, an analyst the hosts' own rule leaves out). This is the
 sequence `.scripts/demo-remote-cli.sh` runs and asserts, on loopback, with a
 stand-in IdP (`wires dev-mock-idp`, only in a build with `--features
-dev-mock-idp`). The output below is copied from a run of it, with Google's
-issuer in place of the stand-in's loopback URL. Node ids are shortened.
+dev-mock-idp`). The output below is copied from a run of those steps, with
+Google's issuer in place of the stand-in's loopback URL. Node ids, the
+network string and the sign-in URL are shortened.
 
 **1. admin: start the network, define roles.** The first policy trusts one
 IdP: Google unless `--issuer` names another, with the OAuth client id
@@ -62,8 +64,8 @@ a confidential one). The network string carries these, so a caller's
 
 ```console
 admin$ wires init --client-id <client id> --public-client-secret <desktop secret>
-network 7c73a216…
-node 877f2682…
+network 735e6b45…
+node 57e74c93…
 policy version 1 (trusts https://accounts.google.com), stored here
 next: run `wires id` on the machine that will be the directory, then `wires directory add <label>=<node id>` here; `wires network` prints the string every node joins with
 admin$ wires role set analyst '*@example.com'
@@ -85,17 +87,18 @@ admin names it once as `label=<node id>` and by the label afterwards.
 
 ```console
 workbench$ wires id
-46a9d98c…
-admin$ wires directory add workbench=46a9d98c…        # likewise spare=0b5afd19…
+wires id: generated this node's key (node.seed)
+63369039…
+admin$ wires directory add workbench=63369039…        # likewise spare=10e4e2c2…
 wires: policy version 4 is stored here; no directory has taken a publish yet. Once one runs (`wires join <network>`, then `wires serve` or `wires directory serve` on its node), run `wires policy push`
 wires: next: on workbench, `wires join <network>` (the network string now names it: `wires network` prints it), then `wires serve host.json` or `wires directory serve`; it starts empty and takes this policy from `wires policy push`
-directory 46a9d98c… (workbench) added (policy version 4; 1 directory(ies))
+directory 63369039… (workbench) added (policy version 4; 1 directory(ies))
 admin$ wires service add orders-db --description "Read-only SQL (sqlite3) over the orders database; pass the SQL statement as the argument." \
          --allow analyst --host workbench --host spare
 wires: policy version 6 is stored here; no directory has taken a publish yet. Once one runs (`wires join <network>`, then `wires serve` or `wires directory serve` on its node), run `wires policy push`
 service orders-db added (policy version 6)
 admin$ wires network
-eyJkaXJlY3RvcmllcyI6WyI0NmE5ZDk4YzFh…
+eyJkaXJlY3RvcmllcyI6WyI2MzM2OTAzOTM4…
 ```
 
 No directory has taken a publish from this admin yet, so each edit says so
@@ -126,8 +129,8 @@ analysts who are also in `oncall`.
 ```
 
 ```console
-workbench$ wires join eyJkaXJlY3RvcmllcyI6WyI0NmE5ZDk4YzFh…
-joined network 7c73a216… as node 46a9d98c…
+workbench$ wires join eyJkaXJlY3RvcmllcyI6WyI2MzM2OTAzOTM4…
+joined network 735e6b45… as node 63369039…
 next: a host runs `wires serve host.json`, a directory `wires directory serve` (the admin names this node by that id); a caller runs `wires login` instead
 workbench$ wires serve --check host.json
 host.json ok (version 2)
@@ -177,9 +180,13 @@ stores the key-bound ID token, and asks a directory for its **view**: the
 services its verified identity may use, each an entry the root signed.
 
 ```console
-agent$ wires login eyJkaXJlY3RvcmllcyI6WyI0NmE5ZDk4YzFh…
-wires login: joined network 7c73a216… (signing in next)
-wires login: node bd95ac1c… is alice@example.com (token stored in …/agent/idp-token.jwt, valid until unix 1791171774)
+agent$ wires login eyJkaXJlY3RvcmllcyI6WyI2MzM2OTAzOTM4…
+wires login: joined network 735e6b45… (signing in next)
+wires login: sign in at
+
+  https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id=…
+
+wires login: node 08cff8c1… is alice@example.com (token stored in …/agent/idp-token.jwt, valid until unix 1791175076)
 wires login: 1 service(s) you may call (policy version 6); see `wires services`
 agent$ wires services
 orders-db  Read-only SQL (sqlite3) over the orders database; pass the SQL statement as the argument.  (analyst)
@@ -205,10 +212,25 @@ through.
 
 **5. Narrower callers.** The observer signs in the same way, and the IdP
 verifies carol@partner.example, but no role in the policy matches her, so
-she is not in the network: she can list nothing and call nothing, and no
-host runs anything for her.
+she is not in the network. `wires login` keeps her sign-in and says so; a
+directory refuses her a view, so she can list nothing, and her call stops on
+her own machine (exit 1, no host dialed). A host would refuse her too.
 
-<!-- sweep: re-capture after card 47 (the observer's `wires services` and `wires call` output) -->
+```console
+observer$ wires login eyJkaXJlY3RvcmllcyI6WyI2MzM2OTAzOTM4…
+wires login: joined network 735e6b45… (signing in next)
+…
+wires login: node baaf7284… is carol@partner.example (token stored in …/observer/idp-token.jwt, valid until unix 1791175080)
+wires login: signed in as carol@partner.example, but not admitted to this network: no role in this network matches carol@partner.example, or you were removed: ask your admin
+observer$ wires services
+wires: not admitted to this network: no role in this network matches carol@partner.example, or you were removed: ask your admin
+observer$ echo $?
+1
+observer$ wires call orders-db -- "select 1"
+wires: not admitted to this network: no role in this network matches carol@partner.example, or you were removed: ask your admin
+observer$ echo $?
+1
+```
 
 Bob is an analyst, so the policy admits him and his view lists orders-db.
 The hosts' own rule also requires `oncall`, which he isn't in, so the host
@@ -227,13 +249,13 @@ no stdin, no token, no file of its own. From the workbench, for alice's
 first call and bob's refusal:
 
 ```
- INFO wires::host::call_trace: call finished service=orders-db caller=bd95ac1c… issuer="https://accounts.google.com" subject="…" email="alice@example.com" role=analyst exit=0 duration_ms=3 bytes_out=27
- INFO wires::host::call_trace: call refused service=orders-db caller=1f86e4f7… issuer="https://accounts.google.com" subject="…" email="bob@example.com" reason="bob@example.com is not admitted to orders-db by this host's own rules"
+ INFO wires::host::call_trace: call finished service=orders-db caller=08cff8c1… issuer="https://accounts.google.com" subject="…" email="alice@example.com" role=analyst exit=0 duration_ms=7 bytes_out=27
+ INFO wires::host::call_trace: call refused service=orders-db caller=ce40632a… issuer="https://accounts.google.com" subject="…" email="bob@example.com" reason="bob@example.com is not admitted to orders-db by this host's own rules"
 ```
 
-A caller the host could not admit (no valid token, or removed) gets no line
-of its own: the host traces those at `debug`, with at most one `info` line
-per 10 seconds counting them. To keep a record, point a log collector at
+A caller the host could not admit (no valid token, removed, or no role
+matches) gets no line of its own: the host traces those at `debug`, with at
+most one `info` line per 10 seconds counting them. To keep a record, point a log collector at
 `serve`'s output.
 
 **7. The host calls back.** The workbench's operator (or a service, through
@@ -242,10 +264,10 @@ its call's push capability) pushes to the agent by key; the agent's
 verified it, because a push is untrusted input to a model:
 
 ```console
-workbench$ wires push --to bd95ac1c… --subject build-41 -- "failed: test_orders_total"
-queued     alice@example.com (bd95ac1c)  d4aafe83bbb1f6c47480773ca482c4ce
+workbench$ wires push --to 08cff8c1… --subject build-41 -- "failed: test_orders_total"
+queued     alice@example.com (08cff8c1)  587cf1b33a9164e93bc28067cd4ae6be
 agent$ wires inbox
-2026-10-05 02:43:03Z  from host 46a9d98c (verified)  build-41  failed: test_orders_total
+2026-10-05 03:38:08Z  from host 63369039 (verified)  build-41  failed: test_orders_total
 ```
 
 `wires inbox --wait` blocks until a message arrives, and accepts the host's
@@ -261,7 +283,7 @@ agent$ wires call --verbose orders-db -- "select count(*) from orders"
 count(*)
 --------
 7
-wires: orders-db answered by host 0b5afd19
+wires: orders-db answered by host 10e4e2c2
 ```
 
 The caller tries the next host only when a dial fails; a host that answered
@@ -272,22 +294,26 @@ admin$ wires remove alice@example.com
 wires: policy version 7: published to 2 of 2 directory(ies)
 removed alice@example.com (https://accounts.google.com) (policy version 7; 0 node and 1 person ban(s); `wires restore` lifts it)
 agent$ wires call orders-db -- "select count(*) from orders"
-wires: denied by host: not admitted to this network; sign in with `wires login`
+wires: denied by host: not admitted to this network: no role in this network matches alice@example.com, or you were removed: ask your admin
 agent$ echo $?
 77
 agent$ wires inbox
-wires inbox: host 46a9d98c refused: not admitted to this network; sign in with `wires login`
-wires inbox: host 0b5afd19 refused: not admitted to this network; sign in with `wires login`
-wires: denied by host: not admitted to this network; sign in with `wires login`
+wires inbox: host 10e4e2c2 refused: not admitted to this network: no role in this network matches alice@example.com, or you were removed: ask your admin
+wires inbox: host 63369039 refused: not admitted to this network: no role in this network matches alice@example.com, or you were removed: ask your admin
+wires: denied by host: not admitted to this network: no role in this network matches alice@example.com, or you were removed: ask your admin
 ```
 
 A person ban holds on every machine that person signs in from. Each host
 applies it from the moment it holds the new policy, with no restart: at once
 here, since both hosts are directories; a host that isn't one follows a
 directory's subscription and has it within a second. A push to her is
-refused at send too. `wires restore alice@example.com` lifts the ban (policy
-version 8), and her next call runs. `wires remove spare` would ban the node
-instead and drop it from every service's hosts and from the directories.
+refused at send too, and what a host had queued for her is dropped at her
+next fetch. A directory now refuses her a view, but the view her machine
+already holds stays until it is refreshed, so her own `wires services` can
+still list orders-db; every host refuses her either way. `wires restore
+alice@example.com` lifts the ban (policy version 8), and her next call
+runs. `wires remove spare` would ban the node instead and drop it from every
+service's hosts and from the directories.
 
 Run it yourself:
 
@@ -308,13 +334,25 @@ Run it yourself:
 | `push` | Optional. `allow`: the roles (from the policy) whose members may receive pushes from this host, tried in order (none by default). |
 
 Who may call a service is not in this file: it is the policy's `allow`. A
-refusal exits 77 at the caller. The host's own rule says so (`… is not
-admitted to orders-db by this host's own rules` for `also_require`), and so
-does a service the caller may call that the policy doesn't assign here
-(`service orders-db is not assigned to this host …`); a caller that isn't
-admitted hears only `not admitted to this network; sign in with \`wires
-login\``.
-<!-- sweep: re-capture after card 47 (the refusal for a service the caller may not call, that doesn't exist, or that allows nobody) -->
+refusal exits 77 at the caller. A host tells an admitted caller nothing
+about a service it may not call: one it isn't allowed, one that doesn't
+exist and one nobody is allowed all get the same sentence, with no role
+names and no policy version (the reason goes to the host's trace), checked
+before the host looks at whether the service is assigned to it:
+
+```console
+bob$ wires call orders-db -- "select 1"      # after the admin allows only oncall
+wires: denied by host: no service named `orders-db` that you may call; see `wires services`
+```
+
+(A name missing from the caller's view gets the same sentence from the
+caller's own `wires`, exit 1, before any host is dialed.) For a service the
+caller may call, the host says why: its own rule (`… is not admitted to
+orders-db by this host's own rules` for `also_require`), or a service the
+policy doesn't assign here (`service orders-db is not assigned to this host
+…`). A caller that isn't admitted hears only `not admitted to this network:
+sign in with \`wires login\`, or ask your admin for a role`, which its own
+`wires` turns into what its person can act on.
 
 ### What a service gets
 
@@ -536,9 +574,9 @@ To make `wires` the boundary, use a structural setup:
 What wires does not do, or does with a cost, as built:
 
 - **The admin does not approve each machine.** Anyone the IdP verifies under
-  a trusted client, whom a role admits, is in from any machine they sign in
-  on. A sign-in phished into binding an attacker's key (the attacker's nonce
-  in the victim's sign-in) would be admitted.
+  a trusted client, with a verified email, whom a role matches, is in from
+  any machine they sign in on. A sign-in phished into binding an attacker's
+  key (the attacker's nonce in the victim's sign-in) would be admitted.
 - **The ID token is the only credential**, so its lifetime is every
   caller's. Google's last about an hour, and Google drops the `nonce` (the
   key binding) on refresh, so people run `wires login` again about hourly.
@@ -569,9 +607,11 @@ What wires does not do, or does with a cost, as built:
   only once the host's handshake shows a newer policy whose entry no longer
   lists that host. A caller dials from the view it holds, so a machine
   removed from a service can still be dialed by callers whose view
-  predates the removal. `wires call` refreshes a view older than a day when
-  a directory answers; the hard bound is the policy's expiry (90 days by
-  default).
+  predates the removal. `wires call` and `wires inbox` refresh a view older
+  than a day when a directory answers; the hard bound is the policy's expiry
+  (90 days by default), because with no directory reachable, or when the
+  removed machine was itself a directory the old policy lists, the caller
+  keeps the view it has.
 - **A stranger costs a token check.** Any key can connect and make a host or
   directory verify one ID token (keys are fetched only for a trusted issuer,
   and refetched at most once per issuer per rate-limit window).
@@ -593,7 +633,10 @@ What wires does not do, or does with a cost, as built:
   Hosts follow a directory's subscription and have each edit within a
   second; so do `wires mcp`, gateway sessions and `wires inbox --wait`, for
   their views. A one-shot `wires call` learns of an edit in its next call's
-  handshake and refreshes its view then.
+  handshake and refreshes its view then, but only after a call the host
+  ran: a refused call leaves the view as it is, so a caller refused a
+  service it may no longer call keeps listing it until the view is a day
+  old.
 - **With every directory down, hosts keep deciding** from their copy under
   the default `lenient` freshness, and say so in their trace; edits and bans
   don't spread until a directory is back. Under `wires policy settings
@@ -601,8 +644,8 @@ What wires does not do, or does with a cost, as built:
   timestamp lapses (15 minutes by default), so a ban is honoured everywhere
   within that time or nothing is served.
 - **A host knows only the identities presented to it.** Push to a role
-  reaches callers that have called that host, or run `wires inbox`, since it
-  started (card 31 removes role push).
+  reaches callers it has admitted (on a call or a `wires inbox` fetch) since
+  it started (card 31 removes role push).
 - **A service runs as `serve`'s Unix user** unless the operator switches
   users in its command ([deployment.md](deployment.md#run-services-as-a-separate-unix-user));
   isolating each call is an open question
@@ -652,7 +695,7 @@ prints:
 > wires is a network for authenticated remote CLI calls. Each service is a
 > command-line program on another machine, run by its name, never by host or
 > address. Every call runs as you: the machine that runs it checks your
-> sign-in against an admin-signed list of who may call what. A refusal
+> sign-in against an admin-signed policy of who may call what. A refusal
 > ("denied by host", exit 77) is that policy, not a fault: don't retry or work
 > around it; ask your admin for access.
 
@@ -671,22 +714,22 @@ snapshot-tested (`wires/snapshots/`).
 | **admin** | `wires init [--issuer URL] [--client-id ID] [--audience A]… [--public-client-secret S] [--policy-ttl 90d]` | Create the root key and this node, and sign policy version 1, trusting one IdP: `--issuer` (default `https://accounts.google.com`), whose OAuth client id `--client-id` (else `$WIRES_OIDC_CLIENT_ID`; required) `wires login` signs in under, and whose `--audience` values hosts accept (default: the client id). The network string names this IdP; `--public-client-secret` is its client's public (Desktop-app) secret, which the network string carries and the signed policy doesn't. Publishes nothing. |
 | | `wires network` | Print the network string (stdout): the root key, the policy's first two directories and the sign-in settings. Not secret. With no directory listed yet it still prints, and warns on stderr. On any other node, the string it joined with. |
 | | `wires issuer set <iss> --client-id ID [--audience A]… [--public-client-secret S] [--login]` · `issuer rm <iss>` | Trust an IdP (or change its client id and accepted audiences; default audience: the client id), or stop trusting one no role and no person ban names. `--login` makes it the IdP the network string names; `--public-client-secret` as for `init`. |
-| | `wires role set <name> [--issuer URL] <matcher>…` · `role rm <name>` | Define a role as an OR of matchers: `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…` (all must hold). Every matcher names its issuer, compared exactly: one without `issuer=` takes `--issuer` (default: the IdP the network string names), which must be trusted. `issuer=…` alone admits anyone that IdP verified. `org` is Google's `hd`, read only from Google. There is no built-in role. |
+| | `wires role set <name> [--issuer URL] <matcher>…` · `role rm <name>` | Define a role as an OR of matchers: `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…` (all must hold). Every matcher names its issuer, compared exactly: one without `issuer=` takes `--issuer` (default: the IdP the network string names), which must be trusted. `issuer=…` alone admits anyone that IdP verified who carries a verified email; no matcher admits a sign-in without one. `org` is Google's `hd`, read only from Google. There is no built-in role, and a person no role matches is not in the network. |
 | | `wires service add\|set <name> [--description D] [--allow role]… [--host node]…` · `service rm <name>` | Edit the services. `--host` is `label=<node id>` the first time, then the label (or the id), of a node not banned; repeat it for failover. `set` replaces each list given. |
 | | `wires directory add\|rm <node>` | List a node (not banned) as one of the network's directories, and print its next steps; or stop listing it. `label=<node id>` the first time. |
-| | `wires remove <email\|node> [--issuer URL]` | An email: a person ban (`--issuer` defaults to the IdP the network string names): every host refuses that person from any machine, and no directory lists them a service. A node id or label: a node ban, and the node is dropped from every service's hosts and from the directories. Neither expires. |
+| | `wires remove <email\|node> [--issuer URL]` | An email: a person ban (`--issuer` defaults to the IdP the network string names): every host refuses that person from any machine, and every directory refuses them a view. A node id or label: a node ban, and the node is dropped from every service's hosts and from the directories. Neither expires. |
 | | `wires restore <email\|node> [--issuer URL]` | Lift a person or node ban. A restored node is not put back into services or directories. |
 | | `wires policy push` | Re-publish the stored policy to every directory: the first publish of a new network, or after an edit that reached none. Exits 1 if a directory has taken a publish before and none took this one. |
 | | `wires policy settings [--freshness lenient\|strict] [--beat-secs N] [--fresh-secs N]` | Print the network's settings, or change them and publish. `--freshness`: what a host does when no directory has vouched for its policy recently (`lenient`, the default, keeps deciding and traces it; `strict` refuses every call until a directory is back). `--beat-secs` (default 300): how often a directory signs a freshness timestamp; `--fresh-secs` (default 900, at least the beat): how long one lasts. `strict` needs a directory: with none listed it is refused, and so is removing the last one under it. |
 | **host** | `wires join <network>` | Store the network string (`network.json`), making the node key if there is none, and print the node id. Contacts nobody. Refuses the admin's keystore and one that joined another network. |
 | | `wires serve host.json` | Serve every service in the file once the policy assigns it here (a host that is also a directory waits for the admin's first publish; one that isn't fetches from a directory for up to 8 s at start, and exits if none answers). Then check every caller against the policy, run the service per call, and write one log line per call. It follows a directory's subscription for every edit (and, under `strict` freshness, refuses calls while no directory vouches for its policy), and runs the directory too when the policy lists this node. `--check` validates and prints what the file implements. |
 | | `wires push --to <node-id\|role> --subject S [--ttl D] [-- <body>]` | Hand a message for a caller to this machine's running `serve` (body from stdin if none is given). From the operator's shell: to any node or role. From a service (it has `WIRES_PUSH_TOKEN`): only to that call's caller. Prints `delivered`, `queued` or `denied` per recipient; exits `77` if every recipient was refused. |
-| **directory** | `wires directory serve [--max-subscribers N]` | Run this node's directory alone (no `host.json`), until Ctrl-C. `--max-subscribers` caps the subscriptions it serves (see `--help-all` for the default<!-- sweep: re-capture after card 47 (subscription limits) -->). Refuses the admin's keystore, a keystore that joined no network, and a node neither the policy nor the network string lists. It starts empty and waits for the admin's first publish. |
+| **directory** | `wires directory serve [--max-subscribers N]` | Run this node's directory alone (no `host.json`), until Ctrl-C. `--max-subscribers` (default 4,096) caps two pools apart: hosts and replicas, and callers' views; one person may hold at most 16 view subscriptions, and each ends when its ID token expires. Refuses the admin's keystore, a keystore that joined no network, and a node neither the policy nor the network string lists. It starts empty and waits for the admin's first publish. |
 | **caller** | `wires id` | Print this node's id (making its key on first use). |
 | | `wires login [<network>] [--no-browser] [--callback-port N] [--refresh\|--reuse]` | The first time, with the network string: join, then sign in. Sign in with the IdP the network string names (the hidden `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*` override it), store the key-bound ID token, and fetch your view. `--refresh` tries the stored refresh token first (with Google the refreshed token has no `nonce`, so it can't be used); `--reuse` re-checks the stored token. |
-| | `wires services [query] [--verbose] [--json]` | List the services in your view, one per line: `<name>  <description>  (<roles that may call>)`; a `query` keeps those whose name or description contains it. Nothing on stdout when there are none: stderr says why and what to do (with the premise, when the view is empty). `--json` prints one object per line, `{"service","description","allow":[…],"hosts":<count>}`, plus `host_ids` with `--verbose`. Refreshes the view first when it is over a day old, expired, or a call saw a newer policy. `--verbose` adds the hosts. |
+| | `wires services [query] [--verbose] [--json]` | List the services in your view, one per line: `<name>  <description>  (<roles that may call>)`; a `query` keeps those whose name or description contains it. Nothing on stdout when there are none: stderr says why and what to do (with the premise, when the view is empty). A person no role matches, or who was removed, exits `1`: `not admitted to this network: no role in this network matches <email>, or you were removed: ask your admin`. `--json` prints one object per line, `{"service","description","allow":[…],"hosts":<count>}`, plus `host_ids` with `--verbose`. Refreshes the view first when it is over a day old, expired, or a call the host ran saw a newer policy. `--verbose` adds the hosts. |
 | | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name, from your view (a name it lacks is asked of a directory; or a `tools.json` alias, which a service in your view of the same name beats). Stdio passes through and its exit code becomes `call`'s, except that a remote exit `77` is reported as `1` (with a note on stderr). A refusal by the host exits `77`, with nothing on stdout. No sign-in, a service you may not call, a local or transport failure, an expired view, or a newer policy (in the host's handshake) whose entry no longer lists that host exits `1`, before any stdin is sent. A usage error (a `--jq` filter that fails, a flag locked mode refuses) exits `2`. `--verbose` names the host that answered and prints every cause of an error. |
-| | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`. |
+| | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`. Refreshes a stale view first, as `call` does, and never dials from an expired one. |
 | | `wires mcp` | Serve the same services as MCP tools over stdio, following your view: a grant or revocation reaches the client as `tools/list_changed` within seconds. Each tool is a service, named as `wires services` lists it, and described by the first sentence of its description; the `instructions` are the premise plus how to pass arguments and filter output. Past 40 services it offers `search_services` and `call_service` instead of one tool each. A refusal is a tool error reading `denied by host: <reason>` and its next step. |
 | | `wires gateway --public-url https://… [--listen addr] [--client-id …] [--client-secret-file F] [--issuer URL]` | Serve them as a remote MCP server (Streamable HTTP + OAuth 2.1) for web clients such as Claude on the web. Each user signs in with the IdP through the gateway and calls with their own token, from their own view (one subscription per live session) ([deployment](deployment.md#a-web-gateway)). |
 | | `wires tools add\|list\|rm` (hidden) | Edit local aliases in `tools.json`: a name pinned to one host by node id. A service in your view of the same name wins, and an alias is refused unless your view's entry for its service lists its host. |
@@ -739,11 +782,13 @@ id>` bans a node and drops it from every service's hosts and from the
 directories. `serve` re-reads its signed policy once per connection, so a
 removal takes effect at each host on the next call after that host has the
 new policy, with no restart. The removed caller's call prints `wires: denied
-by host: not admitted to this network; sign in with \`wires login\``, writes
-nothing to stdout and exits `77`; the host traces it at `debug`, not as a
-call line (a ban is not told apart from no sign-in). Pushes to a removed
-person or node are refused at send, delivery and fetch. There is no shared
-key, so there is nothing to rotate. `wires restore` lifts a ban.
+by host: not admitted to this network: no role in this network matches
+<email>, or you were removed: ask your admin`, writes nothing to stdout and
+exits `77`; the host traces it at `debug`, not as a call line (a ban is not
+told apart from no sign-in). A directory refuses a removed person a view, and
+ends a live view subscription. Pushes to a removed person or node are refused
+at send, delivery and fetch, and a fetch by one drops what was queued for
+it. There is no shared key, so there is nothing to rotate. `wires restore` lifts a ban.
 
 ### Reachability
 

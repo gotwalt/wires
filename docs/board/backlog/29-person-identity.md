@@ -5,7 +5,7 @@
 **Reshaped 2026-09-24.** This card was "identity and scale". Its scale half (badges and bans,
 per-caller views, moving the state) is now cards [35](../done/35-badges-and-bans.md),
 [36](../done/36-directory.md) and [37](../done/37-caller-views.md), built around a directory; its records half
-(transparency-log checkpoints) is now [card 09](09-witness.md). What's left is how a *person* is
+(transparency-log checkpoints) became card 09, since deleted with the call log ([card 40](../done/40-cut-records.md)). What's left is how a *person* is
 proven when no browser is at hand.
 
 ## Why (the human, 2026-09-23)

@@ -20,8 +20,9 @@ directory or gateway `wires join <network>`. The string is the same for
 every node and not secret.
 
 A host dials out (to peers directly, or through a relay). Any key can
-complete the QUIC handshake; one whose ID token doesn't verify, or that the
-signed policy bans, is refused at its first message, before anything runs.
+complete the QUIC handshake; one whose ID token doesn't verify, that the
+signed policy bans, or whose person no role matches, is refused at its first
+message, before anything runs.
 `wires login` binds a loopback TCP port only for the browser redirect.
 
 ## Building
@@ -134,9 +135,9 @@ and a host never holds it.
 **Kubernetes** (untested): a persistent, writable `$WIRES_HOME` (a PVC or
 a StatefulSet volume), `replicas: 1` (the node key is the host's address, so
 replicas sharing a key are not a load balancer), and no `Service` or
-`Ingress`. For more capacity or availability, give the service more hosts,
-each with its own key: callers fail over between them (they don't spread
-calls).
+`Ingress`. For availability, give the service more hosts, each with its own
+key: callers fail over between them. They don't spread calls, so more hosts
+add no capacity.
 
 ## Running a directory
 
@@ -183,10 +184,13 @@ lists it (`directory add` publishes to it) or from a replica.
 Run two, on different machines: each follows the other as a replica, so one
 that missed an edit catches up, and hosts and callers fail over between
 them. The admin publishes every edit to all of them (an edit that reaches
-none exits 1, once one has taken a publish). `--max-subscribers` caps the
-subscriptions one directory serves at once (hosts, other directories, and
-long-running callers such as `wires mcp`, gateway sessions and `wires inbox
---wait`).<!-- sweep: re-capture after card 47 (subscription limits) --> Its
+none exits 1, once one has taken a publish). `--max-subscribers` (default
+4,096) caps each of two pools of subscriptions one directory serves at once:
+hosts and other directories in one, and long-running callers' views
+(`wires mcp`, gateway sessions, `wires inbox --wait`) in the other, so
+callers can't crowd out hosts. One person may hold at most 16 view
+subscriptions, and each ends when its ID token expires (the client
+subscribes again with a fresh one). Its
 keystore must persist: losing `directory.redb` loses nothing (the admin's
 `wires policy push`, or a replica, restores it), but the node key is what
 the policy lists.
@@ -233,10 +237,11 @@ n0.
   new signed policy, published to the directories, with no restart. `serve`
   re-reads its policy once per connection, so from the moment a host has the
   new policy, that person's next call there, from any machine, is refused:
-  exit `77`, `wires: denied by host: not admitted to this network; sign in
-  with \`wires login\`` on their stderr. A host that is a directory has the
-  new policy at once; any other host follows a directory's subscription and
-  has it within a second. Disabling the account at the IdP also cuts them
+  exit `77`, `wires: denied by host: not admitted to this network: no role
+  in this network matches <email>, or you were removed: ask your admin` on
+  their stderr. Directories refuse them a view. A host that is a directory
+  has the new policy at once; any other host follows a directory's
+  subscription and has it within a second. Disabling the account at the IdP also cuts them
   off, within one token lifetime. There is no shared key to rotate.
 - **Remove a machine:** `wires remove <label>` takes a host or directory
   out: a node ban, and the node is dropped from every service's hosts and
@@ -282,8 +287,8 @@ What this changes:
   click with a live Google session).
 - **Only the user's identity admits a web user.** The gateway holds no
   credential of its own and is in no role: it offers a service only if a
-  role matches the web user's own verified identity. A user the policy lets
-  call nothing is refused at sign-in.
+  role matches the web user's own verified identity. A user no role
+  matches, or whom the policy lets call nothing, is refused at sign-in.
 - Push and the inbox aren't offered through the gateway (an `inbox` MCP
   tool is designed, parked: [card 31](board/backlog/31-inbox-delivery.md)).
 

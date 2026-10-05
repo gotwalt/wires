@@ -33,7 +33,7 @@ authenticated by key.
 | Node | Job | Runs | ALPNs it serves | Must be up? |
 |---|---|---|---|---|
 | **Admin** | Holds the root key; signs the policy; publishes each edit to the directories. | One-shot commands: `init`, `network`, `issuer`, `role`, `service`, `directory add\|rm`, `remove`, `restore`, `policy push`, `policy settings`. | none | Only to change something. |
-| **Directory** | Holds the newest policy; signs a `Fresh` every `beat_secs` (default 300 s); gives each host the whole policy and each caller its view; streams changes to subscribers (hosts, other directories, long-running callers), up to a limit<!-- sweep: re-capture after card 47 (subscription limits) -->. **Never decides a call.** | `wires serve` on a node the policy (or, holding none yet, the network string) lists as a directory, or `wires directory serve` alone (no `host.json`). Both refuse a keystore that holds `root.seed`. | `wires/directory/2`, `wires/directory-sub/2` | For sign-in views, edits, removals and freshness. Not for calls. |
+| **Directory** | Holds the newest policy; signs a `Fresh` every `beat_secs` (default 300 s); gives each host the whole policy and each caller its view; streams changes to subscribers in two pools of 4,096 each by default (`--max-subscribers`): hosts and other directories in one, long-running callers' views in the other, at most 16 per person, each ending when its ID token expires. **Never decides a call.** | `wires serve` on a node the policy (or, holding none yet, the network string) lists as a directory, or `wires directory serve` alone (no `host.json`). Both refuse a keystore that holds `root.seed`. | `wires/directory/2`, `wires/directory-sub/2` | For sign-in views, edits, removals and freshness. Not for calls. |
 | **Host** | Runs services; decides every call from its own copy of the whole policy; writes one log line per call to its own output; queues and sends pushes. | `wires serve host.json`, or an app embedding `wires::Host`. | `wires/session/1`, `wires/inbox/3` | For its services' calls. |
 | **Caller** | Calls services by name, as a person their IdP verified. | `wires call` (one-shot), `wires services`, `wires inbox`; `wires mcp` and `wires gateway` (long-running; the gateway calls for each web user). | `wires/inbox/3` while `wires inbox --wait` runs | Only while calling. |
 
@@ -63,7 +63,7 @@ own).
 | Down | Effect |
 |---|---|
 | A host | Its services fail over to their other hosts: the caller tries the next host in the service's list when a dial fails. A service with one host is down with it. |
-| Every directory | Calls keep working. Edits and removals don't spread; views and searches can't refresh (`wires call` falls back to the view it holds); a caller with no view yet can't call. A host that holds no policy can't start. After `fresh_secs` (default 15 min) hosts' freshness lapses: under `lenient` (the default) they keep deciding and trace the lapse; under `strict` they refuse calls until a directory is back. |
+| Every directory | Calls keep working. Edits and removals don't spread; views and searches can't refresh (`wires call` and `wires inbox` fall back to the view they hold); a caller with no view yet can't call. A host that holds no policy can't start. After `fresh_secs` (default 15 min) hosts' freshness lapses: under `lenient` (the default) they keep deciding and trace the lapse; under `strict` they refuse calls until a directory is back. |
 | The admin | Nothing, until something needs changing or the head approaches expiry. |
 | The IdP | ID tokens already issued keep working until they expire (about an hour for Google); nobody can sign in; a host that has not fetched the issuer's keys since it started can't verify anyone. |
 | iroh relays / n0 discovery | Nodes with a direct path or a hints entry still connect; others can't find each other. |
@@ -92,8 +92,8 @@ address records.
   them, and a machine by the policy naming its key.
 - **Per-user views.** A directory computes a view on request from the policy and the caller's
   verified ID token, then forgets it.
-- **Verified identities, outside a host's memory.** A host remembers the principal a node last
-  presented to it, in memory only.
+- **Verified identities, outside a host's memory.** A host remembers the principal a node was last
+  admitted with, in memory only.
 - **A record of calls.** A host writes one ordinary log line per call to `wires serve`'s own
   output, and nothing else: no file, nothing signed, nothing a caller can read back.
 
@@ -104,7 +104,8 @@ address records.
    subscribe to a directory and receive anything published while they were off (one
    `policy_update`, or the whole policy if the directory no longer keeps their version).
 3. **Callers** use `view.json`. The first call's `HelloAck` tells them whether the policy moved; a
-   view older than a day is refreshed before dialing.
+   view older than a day is refreshed before dialing (by `wires call` and `wires inbox`) when a
+   directory answers, and kept when none does, until the policy it came from expires.
 4. **If the admin edited while directories were off**, the edit's publish failed (exit 1) and the
    change is only on the admin. It spreads when the admin runs `wires policy push`.
 
@@ -192,19 +193,22 @@ which carry each subscriber only what it may hold: a host the policy, a caller i
   the new head, its `Fresh` and the changed items. The host applies it to its copy and checks the
   result against the head's one signature; any mismatch, and it fetches the whole policy.
   Subscribed callers (`wires mcp`, gateway sessions, `wires inbox --wait`) get their changed view
-  entries. One-shot callers learn at their next call, or when their view is a day old.
+  entries, and a subscriber no longer admitted gets an emptied view and the subscription ends.
+  One-shot callers learn at their next call, or when their view is a day old.
 - **Remove.** `wires remove alice@example.com` adds a person ban: every host refuses that person
-  from any machine, and no directory lists them a service. `wires remove <node>` takes a host or
+  from any machine, and every directory refuses them a view. `wires remove <node>` takes a host or
   directory machine out: it adds a node ban and drops the node from every service's hosts and
   from the directories. Neither expires;
   `wires restore` lifts one. Every subscribed host has the new policy within a second and refuses
   the next call.
 - **Call.** The caller picks a host from its view (the one that last answered first) and dials it
   with `Hello` (its view's head version and its ID token) and `Invoke` (service and argv). The
-  host verifies the token, checks the bans, checks the service is assigned to it and that a role
-  admits the caller, and runs the service. `HelloAck` carries the host's head version; when it is
-  newer than the caller's view, it also carries the service's signed entry, which the caller checks
-  before sending stdin, and the caller refreshes its view afterwards. A name missing from the view
+  host verifies the token and admits the caller (a verified email, no ban, some role matches),
+  checks that a role in the service's `allow` admits it and only then that the service is
+  assigned to this host, applies `host.json`'s `also_require`, and runs the service. `HelloAck`
+  carries the host's head version; when it is newer than the caller's view, it also carries the
+  service's signed entry, which the caller checks before sending stdin, and the caller refreshes
+  its view afterwards (only after a call the host ran: a refused call leaves the view as it is). A name missing from the view
   is `resolve`d at a directory first.
 - **Discover.** `wires services [query]` reads the view, refreshing it from a directory when it is
   behind, expired or a day old. In MCP, `tools/list` serves the same view; past 40 services it
