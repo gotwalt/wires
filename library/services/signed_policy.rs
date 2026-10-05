@@ -384,15 +384,6 @@ impl Policy {
         self.person_bans.iter().any(|p| p.matches(principal))
     }
 
-    /// Every host: each node that some service's `hosts` names. Derived, so
-    /// assigning a service is what makes a node a host.
-    pub fn hosts(&self) -> BTreeSet<NodeId> {
-        self.services
-            .values()
-            .flat_map(|s| s.hosts.iter().copied())
-            .collect()
-    }
-
     /// Whether `node` is a host: some service names it, and it is not banned.
     pub fn is_host(&self, node: NodeId) -> bool {
         !self.bans_node(node) && self.services.values().any(|s| s.hosts.contains(&node))

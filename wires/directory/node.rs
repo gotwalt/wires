@@ -328,9 +328,6 @@ impl Directory {
             return Ok(());
         };
         let fresh = self.sign_fresh(&current.held, now);
-        if let Some(f) = &fresh {
-            self.db.set_fresh(f)?;
-        }
         #[cfg(test)]
         if let Some(hook) = self.beat_hook.lock().unwrap().take() {
             hook();
@@ -384,9 +381,6 @@ impl Directory {
             tracing::warn!("could not keep policy.json in step with the directory: {e:#}");
         }
         let fresh = self.sign_fresh(&held, now);
-        if let Some(f) = &fresh {
-            self.db.set_fresh(f)?;
-        }
         tracing::info!(version = held.version().0, "directory: took a newer policy");
         self.current
             .send_replace(Some(Arc::new(Current { held, fresh })));

@@ -42,7 +42,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use library::{
     FreshnessMode, IdToken, NodeId, Principal, Refusal, RoleName, ServiceName, StateVersion,
-    authorize, role_admits,
+    authorize,
 };
 
 use crate::admin::keystore::Keystore;
@@ -267,7 +267,7 @@ pub(crate) fn admit(
         .get(service)
         .map(|svc| svc.also_require.as_slice())
         .unwrap_or_default();
-    if !also.iter().all(|r| role_admits(s, r, principal)) {
+    if !also.iter().all(|r| s.role_admits(r, principal)) {
         return Err(GateRefusal::AlsoRequire {
             service: service.clone(),
             roles: also.to_vec(),
@@ -622,7 +622,7 @@ impl ServicesHost {
         }
         if let Some(role) = allow
             .iter()
-            .find(|r| role_admits(&state.policy, r, principal.as_ref()))
+            .find(|r| state.policy.role_admits(r, principal.as_ref()))
         {
             return Ok((principal, role.clone()));
         }
@@ -658,7 +658,7 @@ impl ServicesHost {
             .into_iter()
             .filter(|n| {
                 self.identities.current(*n, now).is_some_and(|p| {
-                    library::check_admitted(s, *n, &p).is_ok() && role_admits(s, role, Some(&p))
+                    library::check_admitted(s, *n, &p).is_ok() && s.role_admits(role, Some(&p))
                 })
             })
             .collect();
@@ -934,7 +934,7 @@ mod tests {
                 prop_assert!(authorize(&s.policy, node(caller), principal, &svc).is_ok());
                 let required = cfg.services.get(&svc).map(|i| i.also_require.clone());
                 for r in required.unwrap_or_default() {
-                    prop_assert!(role_admits(&s.policy, &r, principal), "not in {}", r);
+                    prop_assert!(s.policy.role_admits(&r, principal), "not in {}", r);
                 }
                 prop_assert!(s.check_fresh(now).is_ok());
                 // Admitted is verified: the very token and principal given.

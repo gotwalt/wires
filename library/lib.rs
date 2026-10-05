@@ -169,7 +169,7 @@ mod codec;
 #[path = "calls/idp_vectors.rs"]
 mod idp_vectors;
 
-pub use access::{Grant, Refusal, allowed_services, authorize, role_admits};
+pub use access::{Refusal, authorize};
 pub use admission::check_admitted;
 pub use codec::B64;
 pub use directory::{
