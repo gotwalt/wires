@@ -170,6 +170,23 @@ pub(crate) fn note_seen(ks: &Keystore, root: NodeId, version: StateVersion) {
     }
 }
 
+/// Record that a host refused a call made from the view: it may be behind
+/// the host's policy, so the next `wires services`, `wires call` or `wires
+/// inbox` refreshes first (as if no directory had vouched for it lately).
+/// Best effort; no view, no note.
+pub(crate) fn note_refused(ks: &Keystore, root: NodeId) {
+    let noted = (|| -> Result<()> {
+        let Some(mut held) = read(ks, root)? else {
+            return Ok(());
+        };
+        held.checked = 0;
+        write(ks, root, &held)
+    })();
+    if let Err(e) = noted {
+        tracing::debug!("noting a refusal: {e:#}");
+    }
+}
+
 /// The directories the network string names (empty when none is stored).
 pub(crate) fn joined_directories(ks: &Keystore) -> Vec<NodeId> {
     ks.read_network()

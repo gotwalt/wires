@@ -528,7 +528,15 @@ where
         stderr,
         opts.verbose,
     )
-    .await?;
+    .await;
+    // A refusal can mean the view is behind the host's policy (the person
+    // was removed, or lost the service): have the next command refresh.
+    if let Err(e) = &called
+        && e.downcast_ref::<transport::Denied>().is_some()
+    {
+        view::note_refused(ks, creds.root);
+    }
+    let called = called?;
     if let Some(newer) = called.newer {
         view::note_seen(ks, creds.fabric(), newer);
         if opts.refresh_after {
@@ -1484,6 +1492,10 @@ mod tests {
             b_seen.lock().unwrap().is_empty(),
             "no failover after a refusal"
         );
+        // The view may be behind the host's policy (a removal, a lost
+        // grant): the next `wires services` or `wires call` refreshes it.
+        let after = view::read(&f.ks, f.root.node_id()).unwrap().unwrap();
+        assert!(after.is_stale(crate::clock::now_unix()));
     }
 
     /// Every host down: one error naming each.
