@@ -693,12 +693,11 @@ mod tests {
     use library::NodeIdentity;
     use proptest::prelude::*;
 
-    /// An initialized admin keystore (`extra`: nodes it will name; the
-    /// admin needs nothing from them first).
-    fn admin_with(extra: &[NodeId]) -> Keystore {
+    /// An initialized admin keystore (the admin needs nothing from a node
+    /// before it names one).
+    fn admin() -> Keystore {
         let ks = Keystore::at(temp_dir());
         init_in(&ks, InitArgs::default()).unwrap();
-        let _ = extra;
         ks
     }
 
@@ -717,7 +716,7 @@ mod tests {
     #[test]
     fn service_lifecycle_bumps_the_version_and_derives_hosts() {
         let host = NodeIdentity::generate().node_id();
-        let ks = admin_with(&[host]);
+        let ks = admin();
         let root = ks.read_root_identity().unwrap().unwrap().node_id();
         let v0 = store::read(&ks, root).unwrap().unwrap().version();
 
@@ -767,7 +766,7 @@ mod tests {
     /// caller holding them needs nothing new (card 36d).
     #[test]
     fn an_edit_re_signs_only_the_entries_it_changes() {
-        let ks = admin_with(&[]);
+        let ks = admin();
         let matcher = vec![parse_matcher("*@x.com", GOOGLE_ISSUER).unwrap()];
         role_set(&ks, role("analyst"), matcher, ttl()).unwrap();
         let edit = |d: &str| ServiceEdit {
@@ -805,7 +804,7 @@ mod tests {
 
     #[test]
     fn invalid_edits_are_refused_and_nothing_is_stored() {
-        let ks = admin_with(&[]);
+        let ks = admin();
         let root = ks.read_root_identity().unwrap().unwrap().node_id();
         let before = store::read(&ks, root).unwrap().unwrap();
         let edit = ServiceEdit {
@@ -821,7 +820,7 @@ mod tests {
     #[test]
     fn a_ban_holds_through_edits_and_a_banned_node_is_no_host() {
         let banned = NodeIdentity::generate().node_id();
-        let ks = admin_with(&[banned]);
+        let ks = admin();
         edit_policy(&ks, ttl(), |p| {
             p.ban(banned);
             Ok(())
@@ -846,7 +845,7 @@ mod tests {
 
     #[test]
     fn an_issuer_a_person_ban_names_stays_trusted() {
-        let ks = admin_with(&[]);
+        let ks = admin();
         let okta = Issuer::new("https://acme.okta.com");
         issuer_set(
             &ks,
@@ -868,7 +867,7 @@ mod tests {
     /// `issuer set | rm` edit the rest.
     #[test]
     fn a_role_needs_a_trusted_issuer() {
-        let ks = admin_with(&[]);
+        let ks = admin();
         let okta = "https://acme.okta.com";
         let matcher = || vec![parse_matcher("*@acme.com", okta).unwrap()];
         let e = role_set(&ks, role("staff"), matcher(), ttl()).unwrap_err();
@@ -888,7 +887,7 @@ mod tests {
     #[test]
     fn directories_are_listed_once() {
         let dir = NodeIdentity::generate().node_id();
-        let ks = admin_with(&[dir]);
+        let ks = admin();
         let held = directory_add(&ks, dir, ttl()).unwrap();
         assert_eq!(held.directories(), &[dir]);
         assert!(directory_add(&ks, dir, ttl()).is_err(), "twice");
@@ -906,7 +905,7 @@ mod tests {
     /// nothing): refused, naming the way back, and nothing is written.
     #[test]
     fn an_edit_with_no_stored_policy_is_refused() {
-        let ks = admin_with(&[]);
+        let ks = admin();
         std::fs::remove_file(ks.path(store::POLICY_FILE)).unwrap();
         let err = format!(
             "{:#}",
@@ -924,7 +923,7 @@ mod tests {
             NodeIdentity::generate().node_id(),
             NodeIdentity::generate().node_id(),
         );
-        let ks = admin_with(&[a, b]);
+        let ks = admin();
         directory_add(&ks, a, ttl()).unwrap();
         directory_add(&ks, b, ttl()).unwrap();
         edit_policy(&ks, ttl(), |p| {
@@ -989,7 +988,7 @@ mod tests {
 
     #[test]
     fn role_set_names_the_login_issuer_unless_told_otherwise() {
-        let ks = admin_with(&[]);
+        let ks = admin();
         for iss in ["https://acme.okta.com", "https://other"] {
             issuer_set(
                 &ks,
@@ -1054,7 +1053,7 @@ mod tests {
         /// Any sequence of edits only ever moves the version up by one each.
         #[test]
         fn every_edit_is_one_version_up(descs in proptest::collection::vec("[a-z ]{0,12}", 1..5)) {
-            let ks = admin_with(&[]);
+            let ks = admin();
             let root = ks.read_root_identity().unwrap().unwrap().node_id();
             add(&ks, svc("s"), ServiceEdit::default(), ttl()).unwrap();
             for d in descs {
