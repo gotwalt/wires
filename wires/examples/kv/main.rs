@@ -5,6 +5,7 @@
 //! wires call kv -- set greeting <<< 'hello'   # the value is stdin
 //! wires call kv -- get greeting               # hello
 //! wires call kv -- keys                       # greeting
+//! wires call kv -- whoami                     # alice@example.com, then the ID token unsigned
 //! ```
 //!
 //! Run it from a joined node's keystore, trusting one IdP:

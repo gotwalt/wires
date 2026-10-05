@@ -7,6 +7,10 @@
 //! - [`a_child_gets_a_minimal_environment_and_a_push_capability`]: no
 //!   `WIRES_HOME`, no `HOME`, nothing inherited beyond `PATH` and the
 //!   locale; a `WIRES_PUSH_SOCKET` + `WIRES_PUSH_TOKEN` instead.
+//! - [`a_child_gets_its_callers_id_token_and_verified_claims`]:
+//!   `WIRES_ID_TOKEN` (the token from the call's `Hello`) and `WIRES_CALLER`
+//!   (the verified `Principal`, as JSON), and no `WIRES_*` name beyond the
+//!   ones wires sets.
 //! - [`the_capability_reaches_only_the_caller`]: the child's push reaches its
 //!   caller and is logged under the call; another node, a role and the
 //!   operator's request form are refused; the operator's own socket still
@@ -20,7 +24,10 @@ use std::sync::Arc;
 
 use iroh::EndpointAddr;
 use iroh::protocol::Router;
-use library::{AuditRecord, CallId, Hello, NodeIdentity, PushBody, Service, SignedPolicy, Subject};
+use library::{
+    AuditRecord, CallId, Hello, NodeIdentity, OidcNonce, Principal, PushBody, Service,
+    SignedPolicy, Subject,
+};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -148,13 +155,17 @@ async fn call_env(
 ) -> Result<BTreeMap<String, String>, String> {
     match super::call(who, &host.addr, w.hello(who), "env", &[]).await {
         Outcome::Denied(reason) => Err(reason),
-        ran => Ok(ran
-            .stdout()
-            .lines()
-            .filter_map(|l| l.split_once('='))
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()),
+        ran => Ok(env_of(&ran)),
     }
+}
+
+/// The environment `env` printed in `ran`.
+fn env_of(ran: &Outcome) -> BTreeMap<String, String> {
+    ran.stdout()
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 fn spec(to: &str) -> PushSpec {
@@ -222,6 +233,57 @@ async fn a_child_gets_a_minimal_environment_and_a_push_capability() {
         assert!(
             !value.contains(home.to_str().unwrap()) && !value.contains(host.home.to_str().unwrap()),
             "{key} names the keystore: {value}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_child_gets_its_callers_id_token_and_verified_claims() {
+    let w = World::new().await;
+    let host = Host::start(&w).await;
+    let exp = crate::clock::now_unix() + 3600;
+    let mut hello = w.hello(&w.alice);
+    let token = w.idp.mint(&OidcNonce::for_node(&w.alice.node_id()), exp);
+    hello.id_token = Some(token.clone());
+    let env = match super::call(&w.alice, &host.addr, hello, "env", &[]).await {
+        Outcome::Denied(reason) => panic!("denied: {reason}"),
+        ran => env_of(&ran),
+    };
+    // The token byte for byte as the call's `Hello` carried it.
+    assert_eq!(env["WIRES_ID_TOKEN"], token.as_str());
+    // The claims the host verified from it: the same value as `Principal`.
+    let caller: Principal = serde_json::from_str(&env["WIRES_CALLER"]).unwrap();
+    assert_eq!(
+        caller,
+        Principal {
+            issuer: w.idp.issuer.as_str().into(),
+            subject: "sub-alice@example.com".into(),
+            email: Some("alice@example.com".into()),
+            org: None,
+            groups: vec![],
+            not_after: exp,
+        }
+    );
+    let json: serde_json::Value = serde_json::from_str(&env["WIRES_CALLER"]).unwrap();
+    assert_eq!(json["email"], "alice@example.com");
+    assert_eq!(json["issuer"], w.idp.issuer.as_str());
+    assert_eq!(env["WIRES_CALLER_EMAIL"], "alice@example.com");
+    assert_eq!(env["WIRES_SERVICE"], "env");
+    // The removed variables stay removed: every `WIRES_*` name is one of these.
+    for key in env.keys().filter(|k| k.starts_with("WIRES_")) {
+        assert!(
+            [
+                "WIRES_CALLER_NODE",
+                "WIRES_ID_TOKEN",
+                "WIRES_CALLER",
+                "WIRES_CALLER_EMAIL",
+                "WIRES_SERVICE",
+                "WIRES_ROLE",
+                "WIRES_PUSH_SOCKET",
+                "WIRES_PUSH_TOKEN",
+            ]
+            .contains(&key.as_str()),
+            "{key} is not a variable wires sets: {env:?}"
         );
     }
 }

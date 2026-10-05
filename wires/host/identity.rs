@@ -21,12 +21,34 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use library::{Audience, CLOCK_SKEW_SECS, IdentityClaim, Issuer, NodeId, Principal};
+use library::{Audience, CLOCK_SKEW_SECS, IdToken, IdentityClaim, Issuer, NodeId, Principal};
 
 use crate::caller::jwks::{KeyFetcher, VerifyError};
 
 /// What verifying one token concluded.
 pub(crate) type Verdict = Result<Principal, VerifyError>;
+
+/// A caller's ID token together with the principal this host verified from
+/// it, for one call: what the gate admits ([`Admitted`](crate::host::gate::Admitted))
+/// and what the called service is handed (`WIRES_ID_TOKEN` and
+/// `WIRES_CALLER`, or [`Call::id_token`](crate::Call::id_token) and
+/// [`Call::principal`](crate::Call::principal); protocol §5–6).
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Verified {
+    /// The token, exactly as the caller presented it in its `Hello`.
+    pub(crate) token: IdToken,
+    /// What verifying it concluded.
+    pub(crate) principal: Principal,
+}
+
+impl std::fmt::Debug for Verified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The token is a bearer credential: never printed.
+        f.debug_struct("Verified")
+            .field("principal", &self.principal)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Which issuers a host accepts ID tokens from, each with its own accepted
 /// audiences (the policy's `issuer` items, narrowed by `host.json`'s

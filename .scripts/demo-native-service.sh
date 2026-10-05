@@ -22,7 +22,8 @@
 # generated from the Rust; alice's set (value on stdin), get and keys
 # round-trip through the handler, state kept between calls; the handler's
 # exit code and stderr are the caller's, and an exception it raises is exit
-# 1 with its message; bob, whose view holds no kv, dials nothing (exit 1);
+# 1 with its message; the handler's call.id_token() is the ID token alice
+# presented; bob, whose view holds no kv, dials nothing (exit 1);
 # push_to_caller reaches alice's `wires inbox` from the host's verified key;
 # the host's signed log, read by alice's own `wires watch`, shows her calls
 # with her verified email; and SIGTERM makes the example call `stop()`, so
@@ -231,6 +232,20 @@ set -e
 [ "$rc" -eq 1 ] || bad "a missing key exited $rc, expected the handler's 1"
 grep -qF "kv: no such key" "$D/c3.err" || bad "the handler's stderr did not reach the caller"
 ok "the handler's exit code (1) and stderr are the caller's"
+
+# The handler holds alice's ID token (`call.id_token()`), the one her
+# `wires call` presented; `whoami` echoes it without its signature.
+call "$agent" whoami >"$D/c6.out" 2>"$D/c6.err" || {
+	dump "$D/c6.err"
+	bad "alice's whoami failed"
+}
+TOKEN="$(cat "$agent/idp-token.jwt")"
+[ "$(sed -n 1p "$D/c6.out")" = "$EMAIL" ] || bad "whoami did not name alice"
+[ "$(sed -n 2p "$D/c6.out")" = "${TOKEN%.*}" ] || {
+	dump "$D/c6.out"
+	bad "the handler's call.id_token() is not the token alice presented"
+}
+ok "the $LANG_NAME handler holds alice's ID token (call.id_token()) and her verified email"
 
 set +e
 call "$agent" throw >"$D/c5.out" 2>"$D/c5.err"

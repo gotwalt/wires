@@ -43,7 +43,7 @@ use crate::admin::keystore::Keystore;
 use crate::caller::jwks::VerifyError;
 use crate::host::config::HostConfig;
 use crate::host::freshness::{Freshness, STALE, Vouched};
-use crate::host::identity::Identities;
+use crate::host::identity::{Identities, Verified};
 use crate::host::transport::AuditSink;
 use crate::host::transport::Throttle;
 use crate::policy::store::Held;
@@ -99,6 +99,9 @@ pub(crate) struct Admitted {
     pub(crate) role: RoleName,
     /// The policy version the decision was made under.
     pub(crate) state_version: StateVersion,
+    /// Who the caller verified as, and the token that says so: every role
+    /// needs a verified identity, so every admitted call has one.
+    pub(crate) caller: Verified,
 }
 
 /// Why [`admit`] refused. `Display` is the text the caller is sent.
@@ -206,16 +209,18 @@ impl fmt::Display for GateRefusal {
     }
 }
 
-/// Run the checks in the module docs. `me` is this host.
+/// Run the checks in the module docs. `me` is this host; `verified` is
+/// the caller's ID token and principal, when its token verified.
 pub(crate) fn admit(
     state: &Held,
     config: &HostConfig,
     me: NodeId,
     caller: NodeId,
-    principal: Option<&Principal>,
+    verified: Option<&Verified>,
     service: &ServiceName,
     now: i64,
 ) -> Result<Admitted, GateRefusal> {
+    let principal = verified.map(|v| &v.principal);
     let version = state.version();
     let s = &state.policy;
     let registry = |refusal| GateRefusal::Registry { refusal, version };
@@ -239,6 +244,18 @@ pub(crate) fn admit(
         });
     }
     let role = authorize(s, caller, principal, service).map_err(registry)?;
+    // A role matched, and no role matches without a verified principal, so
+    // there is one; the type says so from here on.
+    let Some(verified) = verified else {
+        return Err(registry(Refusal::NotInRole {
+            service: service.clone(),
+            allow: s
+                .service(service)
+                .map(|x| x.allow.clone())
+                .unwrap_or_default(),
+            principal: None,
+        }));
+    };
     let also = config
         .services
         .get(service)
@@ -254,6 +271,7 @@ pub(crate) fn admit(
     Ok(Admitted {
         role,
         state_version: version,
+        caller: verified.clone(),
     })
 }
 
@@ -497,40 +515,32 @@ impl ServicesHost {
         &self,
         state: &Held,
         caller: NodeId,
-        principal: Option<&Principal>,
+        verified: Option<&Verified>,
         missing: Option<&str>,
         service: &ServiceName,
         now: i64,
     ) -> std::result::Result<Admitted, String> {
         self.check_vouched(state, now).map_err(|r| r.to_string())?;
-        admit(
-            state,
-            &self.config,
-            self.me,
-            caller,
-            principal,
-            service,
-            now,
-        )
-        .inspect_err(|r| {
-            if let GateRefusal::AlsoRequire { roles, .. } = r {
-                tracing::info!(
-                    caller = %caller.hex(),
-                    service = %service,
-                    also_require = ?roles.iter().map(RoleName::as_str).collect::<Vec<_>>(),
-                    "refused by this host's also_require"
-                );
-            }
-        })
-        .map_err(|r| match missing {
-            Some(why) if r.needs_identity() => {
-                // Both say "run `wires login`"; say it once.
-                let r = r.to_string();
-                let r = r.strip_suffix("; run `wires login`").unwrap_or(&r);
-                format!("{why}; {r}")
-            }
-            _ => r.to_string(),
-        })
+        admit(state, &self.config, self.me, caller, verified, service, now)
+            .inspect_err(|r| {
+                if let GateRefusal::AlsoRequire { roles, .. } = r {
+                    tracing::info!(
+                        caller = %caller.hex(),
+                        service = %service,
+                        also_require = ?roles.iter().map(RoleName::as_str).collect::<Vec<_>>(),
+                        "refused by this host's also_require"
+                    );
+                }
+            })
+            .map_err(|r| match missing {
+                Some(why) if r.needs_identity() => {
+                    // Both say "run `wires login`"; say it once.
+                    let r = r.to_string();
+                    let r = r.strip_suffix("; run `wires login`").unwrap_or(&r);
+                    format!("{why}; {r}")
+                }
+                _ => r.to_string(),
+            })
     }
 
     /// Whether `node` may receive pushes from this host at `now`: not banned
@@ -629,14 +639,17 @@ mod tests {
 
     const ISS: &str = "https://idp.example";
 
-    fn who(email: &str) -> Principal {
-        Principal {
-            issuer: ISS.into(),
-            subject: email.into(),
-            email: Some(email.into()),
-            org: None,
-            groups: vec![],
-            not_after: i64::MAX,
+    fn who(email: &str) -> Verified {
+        Verified {
+            token: IdToken::new(format!("token-of-{email}")),
+            principal: Principal {
+                issuer: ISS.into(),
+                subject: email.into(),
+                email: Some(email.into()),
+                org: None,
+                groups: vec![],
+                not_after: i64::MAX,
+            },
         }
     }
 
@@ -712,6 +725,8 @@ mod tests {
         let ok = admit(&s, &cfg, node(3), node(2), Some(&bob), &status, 0).unwrap();
         assert_eq!(ok.state_version, StateVersion(5));
         assert_eq!(ok.role, role("staff"));
+        // The admitted call carries the token and principal it verified.
+        assert_eq!(ok.caller, bob);
     }
 
     #[test]
@@ -812,13 +827,16 @@ mod tests {
             )).unwrap();
             let p = email.map(who);
             let svc = name(service);
-            if admit(&s, &cfg, node(3), node(caller), p.as_ref(), &svc, now).is_ok() {
-                prop_assert!(authorize(&s.policy, node(caller), p.as_ref(), &svc).is_ok());
+            if let Ok(ok) = admit(&s, &cfg, node(3), node(caller), p.as_ref(), &svc, now) {
+                let principal = p.as_ref().map(|v| &v.principal);
+                prop_assert!(authorize(&s.policy, node(caller), principal, &svc).is_ok());
                 let required = cfg.services.get(&svc).map(|i| i.also_require.clone());
                 for r in required.unwrap_or_default() {
-                    prop_assert!(role_admits(&s.policy, &r, p.as_ref()), "not in {}", r);
+                    prop_assert!(role_admits(&s.policy, &r, principal), "not in {}", r);
                 }
                 prop_assert!(s.check_fresh(now).is_ok());
+                // Admitted is verified: the very token and principal given.
+                prop_assert_eq!(Some(&ok.caller), p.as_ref());
             }
         }
     }

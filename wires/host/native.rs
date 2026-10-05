@@ -28,8 +28,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use library::{
-    Argv, CallId, NodeId, Principal, PushBody, PushOutcome, RoleName, ServiceName, StateVersion,
-    Subject,
+    Argv, CallId, IdToken, NodeId, Principal, PushBody, PushOutcome, RoleName, ServiceName, Subject,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -75,17 +74,17 @@ pub trait Service: Send + Sync + 'static {
 ///
 /// Not `Clone`: it holds the call's push capability, which should have one
 /// owner. Share it behind an `Arc` if more than one task needs it.
-#[derive(Debug)]
 pub struct Call {
     /// The caller's node key.
     pub(crate) caller: NodeId,
+    /// The caller's ID token, as presented in the call's `Hello` and
+    /// verified by the host.
+    pub(crate) id_token: IdToken,
     /// The person the caller's ID token verified as (the gate admits no
     /// one without one).
     pub(crate) principal: Principal,
     /// The registry role that admitted the caller.
     pub(crate) role: RoleName,
-    /// The policy version the call was decided under.
-    pub(crate) state_version: StateVersion,
     /// The service called.
     pub(crate) service: ServiceName,
     /// The caller's arguments.
@@ -116,15 +115,61 @@ impl std::fmt::Debug for CallerPush {
     }
 }
 
+impl std::fmt::Debug for Call {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The ID token is a bearer credential: never printed.
+        f.debug_struct("Call")
+            .field("caller", &self.caller)
+            .field("principal", &self.principal)
+            .field("role", &self.role)
+            .field("service", &self.service)
+            .field("args", &self.args)
+            .field("id", &self.id)
+            .field("push", &self.push)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Call {
     /// The caller's node key (the machine that dialed).
     pub fn caller(&self) -> NodeId {
         self.caller
     }
 
-    /// The person the caller verified as with their IdP. Every registry
-    /// role names an issuer and no role admits a caller without a verified
-    /// ID token, so every admitted call has one.
+    /// The caller's raw ID token: the one the host verified for this call
+    /// ([`principal`](Self::principal) is what it verified as), exactly as
+    /// presented. It is the caller's own from `wires call` and `wires mcp`,
+    /// the web user's from the gateway (whose `aud` is the gateway's OAuth
+    /// client). A CLI service gets the same token as `WIRES_ID_TOKEN`.
+    ///
+    /// The handler need not verify it again: the host checked the IdP's
+    /// signature, the audience and the binding to the caller's key. It is
+    /// there to be used, say handed to a token exchange. It is a bearer
+    /// credential until it expires, to any relying party that accepts its
+    /// audience: don't log it.
+    ///
+    /// ```no_run
+    /// /// Hands the caller's token to the backend it fronts, as a bearer.
+    /// struct Fronted;
+    ///
+    /// impl wires::Service for Fronted {
+    ///     async fn call(&self, call: wires::Call, _io: wires::CallIo) -> i32 {
+    ///         let header = format!("Authorization: Bearer {}", call.id_token().as_str());
+    ///         // ... send the request with `header` ...
+    ///         # let _ = header;
+    ///         0
+    ///     }
+    /// }
+    /// ```
+    pub fn id_token(&self) -> &IdToken {
+        &self.id_token
+    }
+
+    /// The person the caller verified as with their IdP: the claims of
+    /// [`id_token`](Self::id_token), as the host verified them (a CLI
+    /// service gets the same value as JSON in `WIRES_CALLER`). Every
+    /// registry role names an issuer and no role admits a caller without a
+    /// verified ID token, so every admitted call has one.
     pub fn principal(&self) -> &Principal {
         &self.principal
     }
@@ -132,11 +177,6 @@ impl Call {
     /// The registry role that admitted the caller.
     pub fn role(&self) -> &RoleName {
         &self.role
-    }
-
-    /// The policy version the call was decided under.
-    pub fn state_version(&self) -> StateVersion {
-        self.state_version
     }
 
     /// The service called (the name this handler was registered under).
@@ -400,6 +440,7 @@ impl Process for Task {
 pub(crate) fn test_call() -> Call {
     Call {
         caller: library::NodeIdentity::from_seed([2u8; 32]).node_id(),
+        id_token: IdToken::new("header.alice.signature"),
         principal: Principal {
             issuer: "https://idp.example".into(),
             subject: "alice".into(),
@@ -409,7 +450,6 @@ pub(crate) fn test_call() -> Call {
             not_after: i64::MAX,
         },
         role: RoleName::new("staff").unwrap(),
-        state_version: StateVersion(1),
         service: ServiceName::new("t").unwrap(),
         args: Argv::new(vec!["a".into(), "b".into()]).unwrap(),
         id: CallId::generate(),
@@ -447,6 +487,15 @@ mod tests {
         async fn call(&self, _call: Call, _io: CallIo) -> i32 {
             panic!("boom")
         }
+    }
+
+    #[test]
+    fn a_call_never_prints_its_id_token() {
+        let call = call();
+        assert_eq!(call.id_token().as_str(), "header.alice.signature");
+        let shown = format!("{call:?}");
+        assert!(shown.contains("alice@example.com"), "{shown}");
+        assert!(!shown.contains("header.alice.signature"), "{shown}");
     }
 
     #[tokio::test]

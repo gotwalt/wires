@@ -765,10 +765,17 @@ where
     }
     // Admitted from here on: every refusal is logged.
     let (principal, missing) = host.principal(caller, hello.id_token.as_ref(), now).await;
+    // The token with what it verified as: what the gate admits, and what
+    // the service is handed.
+    let verified = hello
+        .id_token
+        .clone()
+        .zip(principal.clone())
+        .map(|(token, principal)| crate::host::identity::Verified { token, principal });
     let admitted = match host.decide(
         &state,
         caller,
-        principal.as_ref(),
+        verified.as_ref(),
         missing.as_deref(),
         &service,
         now,
@@ -870,18 +877,11 @@ where
                 }
                 _ => None,
             };
-            // No role admits a caller without a verified principal.
-            let Some(principal) = principal else {
-                if let Some(call_audit) = call_audit {
-                    call_audit.finish(-1).await;
-                }
-                return Err(anyhow!("admitted without a verified principal"));
-            };
             let call = crate::host::native::Call {
                 caller,
-                principal,
+                id_token: admitted.caller.token.clone(),
+                principal: admitted.caller.principal.clone(),
                 role: admitted.role.clone(),
-                state_version: version,
                 service: service.clone(),
                 args: invocation.argv.clone(),
                 // A host with no call log (unit tests only) still names
@@ -914,18 +914,17 @@ where
     // service's own `env`, then the server-derived values (which always win;
     // `host.json` can't set them). Nothing of the host's own: no
     // `WIRES_HOME`, `HOME`, agent sockets or cloud credentials.
+    // The caller's identity is the token it presented and the claims the
+    // host verified from it, as one JSON value (protocol §5–6).
+    let who = &admitted.caller;
     let mut server: Vec<(&str, std::ffi::OsString)> = vec![
         ("WIRES_CALLER_NODE", caller.hex().into()),
-        ("WIRES_FABRIC_ROOT", host.trust_root.hex().into()),
-        (
-            "WIRES_MEMBERSHIP_NOT_AFTER",
-            hello.membership.not_after.to_string().into(),
-        ),
-        ("WIRES_STATE_VERSION", version.0.to_string().into()),
+        ("WIRES_ID_TOKEN", who.token.as_str().into()),
+        ("WIRES_CALLER", caller_json(&who.principal).into()),
         ("WIRES_SERVICE", service.as_str().into()),
         ("WIRES_ROLE", admitted.role.as_str().into()),
     ];
-    if let Some(email) = principal.as_ref().and_then(|p| p.email.as_deref()) {
+    if let Some(email) = who.principal.email.as_deref() {
         server.push(("WIRES_CALLER_EMAIL", email.into()));
     }
     // The call's push capability: this child may push to its caller, and
@@ -958,6 +957,13 @@ where
     // Dropping the capability starts its grace period.
     drop(capability);
     result
+}
+
+/// `WIRES_CALLER`: the verified principal as one JSON object, the fields of
+/// [`Principal`](library::Principal) (`issuer`, `subject`, `not_after`, and
+/// `email`, `org`, `groups` when present), so a script reads `jq -r .email`.
+pub(crate) fn caller_json(principal: &library::Principal) -> String {
+    serde_json::to_string(principal).expect("a principal serializes")
 }
 
 /// Inherited variables a service child keeps, besides every `LC_*`: the
@@ -2053,5 +2059,43 @@ mod tests {
             }
             proptest::prop_assert_eq!(out, expected);
         }
+
+        /// `WIRES_CALLER` is the verified principal itself: it parses back
+        /// to the same value, and every claim is a field a script can read.
+        #[test]
+        fn caller_json_is_the_principal(
+            issuer in "[ -~]{1,24}",
+            subject in "[ -~]{1,24}",
+            email in proptest::option::of("[a-z]{1,8}@[a-z]{1,8}\\.com"),
+            org in proptest::option::of("[a-z.]{1,12}"),
+            groups in proptest::collection::vec("[ -~]{0,12}", 0..4),
+            not_after in proptest::prelude::any::<i64>(),
+        ) {
+            let p = library::Principal { issuer, subject, email, org, groups, not_after };
+            let json = caller_json(&p);
+            let back: library::Principal = serde_json::from_str(&json).unwrap();
+            proptest::prop_assert_eq!(&back, &p);
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            proptest::prop_assert_eq!(v["issuer"].as_str(), Some(p.issuer.as_str()));
+            proptest::prop_assert_eq!(v["subject"].as_str(), Some(p.subject.as_str()));
+            proptest::prop_assert_eq!(v["email"].as_str(), p.email.as_deref());
+            proptest::prop_assert_eq!(v["not_after"].as_i64(), Some(p.not_after));
+        }
+    }
+
+    #[test]
+    fn caller_json_known_answer() {
+        let p = library::Principal {
+            issuer: "https://idp.example".into(),
+            subject: "u-1".into(),
+            email: Some("a@example.com".into()),
+            org: None,
+            groups: vec!["eng".into()],
+            not_after: 1_700_000_000,
+        };
+        assert_eq!(
+            caller_json(&p),
+            r#"{"issuer":"https://idp.example","subject":"u-1","email":"a@example.com","groups":["eng"],"not_after":1700000000}"#
+        );
     }
 }

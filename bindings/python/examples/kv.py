@@ -7,6 +7,7 @@ caller sees only their own keys.
     wires call kv -- set greeting <<< 'hello'   # the value is stdin
     wires call kv -- get greeting               # hello
     wires call kv -- keys                       # greeting
+    wires call kv -- whoami                     # alice@example.com, then the ID token unsigned
     wires call kv -- throw                      # raises: exit 1, its text on stderr
 
 Run it from a joined node's keystore, trusting one IdP:
@@ -72,11 +73,20 @@ class Kv(wires.Service):
                     keys = sorted(self._people.get(me, {}))
                 call.write_stdout("".join(f"{k}\n" for k in keys).encode())
                 return 0
+            case ["whoami"]:
+                # Who the host verified, and the ID token it verified: a
+                # service would hand the token on (say, to a token exchange).
+                # This one echoes it without its signature, which leaves no
+                # credential, only the claims.
+                unsigned = call.id_token().rsplit(".", 1)[0]
+                name = person.email or f"{person.subject} at {person.issuer}"
+                call.write_stdout(f"{name}\n{unsigned}\n".encode())
+                return 0
             case ["throw"]:
                 # An uncaught exception: the call exits 1 with its text.
                 raise RuntimeError("kv: thrown on request")
             case _:
-                call.write_stderr(b"usage: kv set KEY (value on stdin) | get KEY | keys | throw\n")
+                call.write_stderr(b"usage: kv set KEY (value on stdin) | get KEY | keys | whoami | throw\n")
                 return 2
 
 
