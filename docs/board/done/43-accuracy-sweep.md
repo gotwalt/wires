@@ -114,7 +114,7 @@ TypeScript).
 
 **Left for the human.**
 - The removed-host window is the policy head's lifetime (90 days by default). A shorter default
-  narrows it and makes the admin re-sign more often ([card 45](../backlog/45-trim-policy-sync.md)).
+  narrows it and makes the admin re-sign more often ([card 45](45-trim-policy-sync.md)).
 - `Matcher` has optional signed fields, against protocol.md §1 (not exploitable: the items hash
   re-serializes). Smallest fix: plain strings with empty meaning "any", and a new item format.
 - Renames not done because they cross the wire or forty files: `StateVersion` / `state_version`

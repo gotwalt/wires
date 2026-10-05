@@ -168,7 +168,7 @@ closure type plus `Refresher::keystore`; `refresh_to` calls it; no check changed
 `deploy/gateway/compose.yml` (a comment), `.scripts/demo-remote-cli.sh` (header comment),
 `docs/board/README.md` (this card's row). Not touched: `library/calls/proof.rs`, `fresh.rs`,
 `host/freshness.rs`, `transport.rs`, `admin/service.rs`, `remove.rs` (card 49's fixes).
-`docs/board/review/49-removed-host-window.md` still links `../backlog/45-…` (now `review/`).
+`docs/board/done/49-removed-host-window.md` still links `45-…` (now `review/`).
 
 **Narrative statements now false** (not rewritten, per the rules; line numbers on this branch):
 `README.md` 159; `docs/usage.md` 36, 311, 645, 736–745, 800 (subscriptions, replicas, "within

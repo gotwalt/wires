@@ -82,8 +82,6 @@ Open cards only; finished cards are in [done/](done/).
 
 | Card | Stage | Depends on | Status | Summary |
 |---|---|---|---|---|
-| [49](review/49-removed-host-window.md) | 2 | — | review | **The removed-host window:** the host proves a current `Fresh` (from another directory) before the caller sends anything; fail closed; 15 min |
-| [45](review/45-trim-policy-sync.md) | 3 | 49 | review | One way to keep policy copies in step: no deltas, replicas or view subscriptions; `Fresh` and the beat stay for 49; a directory proves itself before a caller's token |
 | [08](doing/08-demo-two-machine.md) | last | all of the above | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent; re-record |
 | [50](backlog/50-example-services.md) | after 08 | 49, 45 | backlog, deferred | **Example services:** aws, gcp, cloudflare, vercel, gh and other CLIs behind today's popular MCP servers; federated (ID token → cloud role) and host-held patterns |
 | [29](backlog/29-person-identity.md) | — | — | backlog, not scheduled | **Person identity for headless agents:** `login --for`, day-passes |
@@ -91,14 +89,15 @@ Open cards only; finished cards are in [done/](done/).
 | [32](backlog/32-service-sandbox-OPEN.md) | — | — | open question | **Don't build:** run each service call in a rootless microVM |
 | [18](backlog/18-front-door-OPEN.md) | — | — | open question | **Don't build:** `wires login <domain>`, the network string published under a domain |
 
-**Order** (the human, 2026-10-05): 44, 46 and 48 are done; then
-49, then 45 (decided together on 2026-10-05: `Fresh` stays, the caller
-fails closed; see card 49's Decision); then `CLAUDE.md` (its goal sentence still says "a
-sharp demo for the MCP team", and MCP is now a bridge: the human's wording);
-then 08, the demo, last. **Skipped for now:** re-running the benchmarks
+**Order** (the human, 2026-10-05): 44, 46, 48, 49 and 45 are done, and
+the narrative docs and `CLAUDE.md` match them (the goal sentence's new
+wording awaits the human's OK); next is 08, the demo, last. **For 08:** with
+the workbench and the spare both host and directory, the spare answers with
+the workbench down only while its last word is current (15 minutes); a
+directory-only node would remove that limit ([demo.md](../demo.md) step 5b). **Skipped for now:** re-running the benchmarks
 (not run on this code; their setup signs in once and a Google sign-in lasts
 an hour). What else the last pass left open is in
-[card 43](done/43-accuracy-sweep.md)'s Notes. 39–44, 46, 47 and 48 are done.
+[card 43](done/43-accuracy-sweep.md)'s Notes. 39–49 are done.
 
 ## Rules for workers
 

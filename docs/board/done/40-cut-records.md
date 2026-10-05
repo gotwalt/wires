@@ -142,7 +142,7 @@ leaves a `started` record behind).
   (`watch` isn't an MCP tool); § Reference: line 593 (quotes the old
   premise "records the call"), 597 (`watch` in the caller commands), 614
   (`[--reader role]…`), 628 (**reader** row), 663–664 (`push.log_body`,
-  `audit.otlp`), 695 (link `protocol.md#9-keystore…`: the keystore is now
+  `audit.otlp`), 695 (link `protocol.md#8-keystore-wires_home-else-xdg_config_homewires-else-configwires…`: the keystore is now
   §8), 696 (`record-marks.json`), 729 (`calls/` holds audit records and the
   call log).
 - `docs/fabric.md` § 1 line 27 (a host signs its call records); § 2 lines

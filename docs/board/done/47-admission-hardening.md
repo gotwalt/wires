@@ -51,7 +51,7 @@ IdP can obtain a token that verifies.
    `not_after` (90 days by default), not a day. protocol.md §5 and §9 and the
    comment on `VIEW_MAX_AGE_SECS` say exactly that. Calls keep working with
    every directory down; that property is not traded away here.
-   ([Card 45](../backlog/45-trim-policy-sync.md) is where freshness gets rethought.)
+   ([Card 45](45-trim-policy-sync.md) is where freshness gets rethought.)
 6. **Small ones:** `IdToken`'s `Debug` never prints the token (and so no
    frame that holds one does); protocol.md §7 says what the code does with a
    banned person's queued pushes; §4's hello timing matches the code (10 s
