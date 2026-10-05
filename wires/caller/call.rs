@@ -251,7 +251,6 @@ where
     E: AsyncWrite + Unpin,
 {
     let ks = Keystore::resolve()?;
-    creds.require_token(&ks)?;
     let held = usable_view(&ks, creds).await?;
     let hello = creds.hello(&ks, held.version())?;
     check_alias(&held, &plan)?;
@@ -377,7 +376,11 @@ pub(crate) fn outcome(
 /// day bounds how long a host the admin removed can still be dialed only
 /// while a directory answers truthfully; the hard bound is the view's
 /// head's `not_after` (protocol §5).
+///
+/// With no ID token it fails at once and asks no directory: nothing is sent
+/// for a call every host would refuse.
 pub(crate) async fn usable_view(ks: &Keystore, creds: &Credentials) -> Result<HeldView> {
+    creds.require_token(ks)?;
     view::usable(ks, &creds.node, creds.root, creds.relay()).await
 }
 
@@ -1362,6 +1365,22 @@ mod tests {
             root,
             ks,
         }
+    }
+
+    /// With no ID token, a call asks no directory for a view (protocol.md
+    /// §5: nothing is sent): it says to sign in first.
+    #[tokio::test]
+    async fn a_call_without_a_sign_in_asks_no_directory() {
+        let root = NodeIdentity::from_seed([82; 32]);
+        let ks = Keystore::at(crate::testutil::temp_dir());
+        let directory = NodeIdentity::from_seed([83; 32]).node_id();
+        crate::testutil::join(&ks, &root, &[directory]);
+        let creds = Credentials::of(NodeIdentity::from_seed([84; 32]), root.node_id());
+        let e = tokio::time::timeout(std::time::Duration::from_secs(2), usable_view(&ks, &creds))
+            .await
+            .expect("it dialed nothing, so it answers at once")
+            .unwrap_err();
+        assert_eq!(e.to_string(), crate::help::NOT_SIGNED_IN);
     }
 
     async fn run_service(f: &Fixture, held: &HeldView, hints: Hints) -> (Result<i32>, String) {
