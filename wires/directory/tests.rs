@@ -1329,3 +1329,22 @@ async fn an_expired_policy_is_served_to_nobody_and_admits_nobody() {
     ));
     assert!(!dir.admit(caller, token.as_ref(), later).await.admitted());
 }
+
+/// A replica peer that goes silent (no policy, no beat) is given up on
+/// after the silence allowance, so the follower reconnects instead of
+/// waiting forever on a half-open stream.
+#[tokio::test]
+async fn a_silent_replica_is_given_up_on() {
+    let f = Fabric::new(1);
+    f.list_directory(0);
+    let ks = f.join(0);
+    let dir = Directory::open(f.nodes[0].duplicate(), f.root.node_id(), ks, 8, now_unix()).unwrap();
+    let (mut ours, _theirs) = tokio::io::duplex(1024);
+    let r = tokio::time::timeout(
+        PATIENCE,
+        super::serve::take_from_replica(&dir, &mut ours, Duration::from_millis(100)),
+    )
+    .await
+    .expect("it gives up on its own");
+    assert!(format!("{:#}", r.unwrap_err()).contains("said nothing"));
+}
