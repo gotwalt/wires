@@ -1175,6 +1175,44 @@ mod tests {
         assert_eq!(lines.matching("push denied").len(), 1, "{}", lines.text());
     }
 
+    /// A banned person's fetch drops the queue even when the token has also
+    /// expired (it still names the person): they hear the sign-in-expired
+    /// sentence, and the messages are gone.
+    #[tokio::test]
+    async fn a_banned_persons_fetch_with_an_expired_token_drops_the_queue() {
+        let push = push_host_with(|p| {
+            let (analyst, matchers) = role_for("analyst", "caller@example.com");
+            p.roles.insert(analyst, matchers);
+            p.ban_person(library::Person::new(
+                crate::testutil::test_idp().issuer.clone(),
+                "caller@example.com",
+            ));
+        });
+        let laptop = node(65);
+        let far = now_ms() + 60_000;
+        push.with_queue(|q| q.insert(entry(laptop, now_ms(), far), QUEUE_PER_RECIPIENT));
+        let expired = crate::testutil::test_idp().mint(
+            &library::OidcNonce::for_node(&laptop),
+            crate::clock::now_unix() - 3600,
+        );
+        let mut bytes = InboxFrame::Hello {
+            id_token: Some(expired),
+        }
+        .encode()
+        .unwrap();
+        bytes.extend(InboxFrame::Fetch { wait_ms: 0 }.encode().unwrap());
+        let r = fetch_refusal(&push, bytes, laptop).await;
+        assert_eq!(r, crate::host::gate::SIGN_IN_EXPIRED);
+        assert!(
+            push.queue
+                .lock()
+                .unwrap()
+                .pending(laptop, now_ms(), MAX_BATCH)
+                .is_empty(),
+            "the banned person's queue is dropped"
+        );
+    }
+
     /// `frames` from `caller` to `push`'s fetch endpoint: the refusal.
     async fn fetch_refusal(push: &PushHost, bytes: Vec<u8>, caller: NodeId) -> String {
         let (send, mut answer) = tokio::io::duplex(64 * 1024);

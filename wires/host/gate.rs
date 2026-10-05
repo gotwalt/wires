@@ -434,18 +434,24 @@ impl ServicesHost {
         token: &IdToken,
         now: i64,
     ) -> std::result::Result<Verified, NotAdmitted> {
+        // A banned node is banned whatever its token says.
         let refused = |said, why| NotAdmitted {
             said,
             why,
-            banned: false,
+            banned: state.policy.bans_node(caller),
         };
         let principal = match self.identities.verify_token(caller, token, now).await {
             Ok(p) => p,
             Err(VerifyError::Expired(p)) => {
-                return Err(refused(
-                    SIGN_IN_EXPIRED,
-                    format!("the ID token for {} has expired", p.name()),
-                ));
+                // Genuine but expired: it still names the person, so a ban
+                // on them still counts.
+                return Err(NotAdmitted {
+                    banned: state.policy.bans_node(caller) || state.policy.bans_person(&p),
+                    ..refused(
+                        SIGN_IN_EXPIRED,
+                        format!("the ID token for {} has expired", p.name()),
+                    )
+                });
             }
             Err(VerifyError::Unavailable(e)) => {
                 return Err(refused(
