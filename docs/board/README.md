@@ -3,7 +3,7 @@
 **The premise** (the human, 2026-10-05), which defines "correct": agents work
 best with CLIs. wires lets an agent run a CLI that lives on another machine
 as if it were local. The caller is a person your IdP verified; they see and
-can call only the services an admin-signed list grants them; the machine is
+can call only the services an admin-signed policy grants them; the machine is
 reached by key, with no port or VPN; and a service can message its caller
 back. MCP clients reach the same services through a bridge.
 
