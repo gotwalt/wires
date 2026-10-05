@@ -317,6 +317,20 @@ impl Follower {
             SubFrame::PolicyUpdate { update, fresh } => {
                 let held = store::read(&self.ks, self.root)?
                     .context("this host holds no policy to apply an update to")?;
+                // Already held: a host that is also a directory mirrors what
+                // its own directory takes, often before the directory it
+                // follows sends the same edit as an update from the version
+                // before. Nothing to apply; keep the `Fresh` if it is for
+                // this head.
+                if held.version() >= update.head.head.version {
+                    if held.signed.head == update.head {
+                        fresh
+                            .verify(&held.signed.head)
+                            .context("the freshness doesn't vouch for the update's head")?;
+                        return self.vouch(&fresh, now);
+                    }
+                    return Ok(());
+                }
                 let next = held
                     .signed
                     .apply(&update, self.root)
