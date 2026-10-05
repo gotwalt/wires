@@ -22,8 +22,8 @@ What's covered:
   `apply`, caller views, `Fresh`), roles, `authorize`, directory and session
   frames, invocations, IdP claims and push frames.
 - **`wires`** — each role's command functions, the keystore (round-trips,
-  file modes, flag → env → file → keystore precedence), the session
-  transport over in-memory pipes and over **real loopback QUIC** (two iroh
+  file modes, `serve`'s `--node-seed` → `--node-seed-file` → keystore
+  precedence), the session transport over in-memory pipes and over **real loopback QUIC** (two iroh
   endpoints on localhost, no relay or discovery), the host's log line for a
   call and for a refusal (`host/call_trace.rs`, `host/transport.rs`), and
   `e2e/`: the whole stack over hermetic loopback. That is the policy
@@ -74,7 +74,7 @@ services` / `wires call` (arguments and stdin) / `wires mcp`, a signed-in
 person no role matches told at sign-in, by `wires services` and by `wires
 call` that she is not in the network (exit 1), an analyst the hosts'
 `also_require` refuses (exit 77), `.shell id` refused by `sqlite3 -safe`, a
-push and `wires inbox` (and `--wait`), failover to the spare, and `wires
+push and `wires inbox` (and `--wait`), the spare answering with the workbench down, and `wires
 remove <email>`: exit 77 with nothing on stdout, and pushes refused at send
 and at fetch. All on loopback in a fresh `mktemp -d`, every step asserted.
 `.scripts/demo-push.sh --quiet` does the same for push (a build service that

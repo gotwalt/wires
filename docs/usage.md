@@ -288,7 +288,8 @@ wires: orders-db answered by host 10e4e2c2
 ```
 
 The caller tries the next host only when a dial fails; a host that answered
-has decided. For the next minute it tries the workbench last. Then the admin
+has decided. When a call had to dial the stopped workbench before the spare
+answered, the caller tries the workbench last for the next minute. Then the admin
 removes alice, by email:
 
 ```console
@@ -400,8 +401,7 @@ the verified caller as a value: `call.principal()` (what a child gets as
 [protocol.md §5](protocol.md#5-sessions-wiressession1).
 
 An embedded host is a node like any other, with a keystore directory of its
-own that the app names (it reads neither `$WIRES_HOME` nor
-`$WIRES_NODE_SEED`):
+own that the app names (it never reads `$WIRES_HOME`):
 
 ```console
 host$  WIRES_HOME=/var/lib/kv/wires wires join <network>      # prints its node id
@@ -554,23 +554,19 @@ A Claude Code rule like `Bash(wires call:*)` is **not airtight** on its own.
 Claude Code does check each part of a compound command, but it also
 auto-allows read-only commands such as `cat` and `echo` inside the working
 directory, and `< file` or a glob can send working-directory files to the
-host as input. The agent can also pass `wires call`'s own override flags
-(`--tools-file`, `--node-seed[-file]`, `--relay-url`). Evidence and method:
+host as input. Evidence and method:
 [agent-sandbox.md](agent-sandbox.md).
 
 To make `wires` the boundary, use a structural setup:
 
 - a container or sandbox whose `PATH` holds only `wires`, in an empty
   working directory with no secrets in the environment, with
-  `WIRES_LOCKED=1` set (or `"locked": true` in a `tools.json` the agent
-  can't write). Locked, `wires call`, `wires mcp` and `wires inbox` refuse
-  every flag that would point them at another key, another tools map or
-  another relay (`--tools-file`, `--node-seed`, `--node-seed-file`,
-  `--relay-url`) and the `WIRES_NODE_SEED` variable; `wires call` accepts
-  only `--jq`, `--head`, `--max-bytes`, `--verbose`, the service name and its
-  arguments. It also refuses data on stdin, so `< file` can't ship a local
-  file to the host; pass input as arguments, or set
-  `WIRES_LOCKED_STDIN=allow` if your services need piped input.
+  `WIRES_LOCKED=1` set. A caller's commands take no key, relay or keystore
+  flag (only the environment, which the operator sets, picks the keystore),
+  so the one thing the lock adds is that `wires call` refuses data on stdin
+  (exit 2, before dialing): `< file` can't ship a local file to the host.
+  Pass input as arguments; an operator whose services need piped input
+  leaves the lock off.
 - or `wires mcp` as the agent's only tool, with no Bash tool at all.
 
 ## Known trade-offs
@@ -692,8 +688,6 @@ What wires does not do, or does with a cost, as built:
 - **Callbacks to the caller that asked**: a callback goes only to the node
   and person that made the call, in every client. Designed, parked
   ([card 31](board/backlog/31-inbox-delivery.md)).
-- **Spreading calls across a service's hosts**
-  ([card 46](board/backlog/46-spread-calls-across-hosts.md)).
 
 ## Reference
 
@@ -714,9 +708,9 @@ Then it lists only the caller's everyday commands (`services`, `call`,
 `login`, `inbox`, `mcp`). `wires --help-all` lists every command, by role.
 Each command's `--help` gives its examples, and its exit codes or output
 shape where they matter; `wires <command> --help-all` adds the flags `--help`
-hides: the credential overrides (`--node-seed[-file]`, `--tools-file`,
-`login`'s `--issuer`, `--client-id` and `--client-secret`), `--relay-url`,
-every `--policy-ttl`, and the gateway's `--allow-origin` and
+hides: `serve`'s `--node-seed[-file]`, `login`'s `--issuer`, `--client-id`
+and `--client-secret`, `--relay-url` (on `serve`, `directory serve` and
+`gateway`), every `--policy-ttl`, and the gateway's `--allow-origin` and
 `--trust-proxy-header`. The help text, the MCP text and the key errors are
 snapshot-tested (`wires/snapshots/`).
 
@@ -739,11 +733,10 @@ snapshot-tested (`wires/snapshots/`).
 | **caller** | `wires id` | Print this node's id (making its key on first use). |
 | | `wires login [<network>] [--no-browser] [--callback-port N] [--refresh\|--reuse]` | The first time, with the network string: join, then sign in. Sign in with the IdP the network string names (the hidden `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*` override it), store the key-bound ID token, and fetch your view. `--refresh` tries the stored refresh token first (with Google the refreshed token has no `nonce`, so it can't be used); `--reuse` re-checks the stored token. |
 | | `wires services [query] [--verbose] [--json]` | List the services in your view, one per line: `<name>  <description>  (<roles that may call>)`; a `query` keeps those whose name or description contains it. Nothing on stdout when there are none: stderr says why and what to do (with the premise, when the view is empty). A person no role matches, or who was removed, exits `1`: `not admitted to this network: no role in this network matches <email>, or you were removed: ask your admin`. `--json` prints one object per line, `{"service","description","allow":[…],"hosts":<count>}`, plus `host_ids` with `--verbose`. Refreshes the view first when it is over a day old, expired, or a call the host ran saw a newer policy. `--verbose` adds the hosts. |
-| | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name, from your view (a name it lacks is asked of a directory; or a `tools.json` alias, which a service in your view of the same name beats). Stdio passes through and its exit code becomes `call`'s, except that a remote exit `77` is reported as `1` (with a note on stderr). A refusal by the host exits `77`, with nothing on stdout. No sign-in, a service you may not call, a local or transport failure, an expired view, or a newer policy (in the host's handshake) whose entry no longer lists that host exits `1`, before any stdin is sent. A usage error (a `--jq` filter that fails, a flag locked mode refuses) exits `2`. `--verbose` names the host that answered and prints every cause of an error. |
+| | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name, from your view (a name it lacks is asked of a directory), on one of the service's hosts at random, moving to the next only when a dial fails. Stdio passes through and its exit code becomes `call`'s, except that a remote exit `77` is reported as `1` (with a note on stderr). A refusal by the host exits `77`, with nothing on stdout. No sign-in, a service you may not call, a local or transport failure, an expired view, or a newer policy (in the host's handshake) whose entry no longer lists that host exits `1`, before any stdin is sent. A usage error (a `--jq` filter that fails, or data on stdin in locked mode) exits `2`. `--verbose` names the host that answered and prints every cause of an error. |
 | | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`; not admitted to the network, with no view held, exits `1`. Refreshes a stale view first, as `call` does, and never dials from an expired one. |
 | | `wires mcp` | Serve the same services as MCP tools over stdio, following your view: a grant or revocation reaches the client as `tools/list_changed` within seconds. Each tool is a service, named as `wires services` lists it, and described by the first sentence of its description; the `instructions` are the premise plus how to pass arguments and filter output. Past 40 services it offers `search_services` and `call_service` instead of one tool each. A refusal is a tool error reading `denied by host: <reason>` and its next step. |
 | | `wires gateway --public-url https://… [--listen addr] [--client-id …] [--client-secret-file F] [--issuer URL]` | Serve them as a remote MCP server (Streamable HTTP + OAuth 2.1) for web clients such as Claude on the web. Each user signs in with the IdP through the gateway and calls with their own token, from their own view (one subscription per live session) ([deployment](deployment.md#a-web-gateway)). |
-| | `wires tools add\|list\|rm` (hidden) | Edit local aliases in `tools.json`: a name pinned to one host by node id. A service in your view of the same name wins, and an alias is refused unless your view's entry for its service lists its host. |
 
 Every command's error ends with the next step in one clause (`run \`wires
 login\``, `see \`wires services\``, `ask your admin …`), and without
@@ -755,7 +748,12 @@ Every admin edit signs a new policy valid for `--policy-ttl` from now
 (default 90 days), or until the current policy's expiry if that is later: an
 edit never shortens the policy's life. It is published to the directories
 the policy lists (and to any the policy before the edit listed); the admin
-dials no host. When a directory has taken a publish from this admin before
+dials no host. A directory that has taken a publish before but can't be
+dialed now (one that just restarted can't be found by its key for a few
+seconds), or that answers that it is busy, is tried again each second for up
+to 15 s, so an edit while such a directory is down takes 15 s before it
+reports the miss (30 s at most); a directory the edit drops is tried once.
+The line names each directory not reached. When a directory has taken a publish from this admin before
 and **none** takes this one, the command still prints its result but exits
 1: the new policy is stored on the admin and nowhere else until `wires policy
 push` reaches a directory. Before that first publish, or with no directory
@@ -783,8 +781,9 @@ directories), `view.json` and `idp-token.jwt` (callers), and the admin's
 `labels.json` (its names for nodes). A host's or directory's keystore must
 not hold `root.seed`: run each from its own.
 
-Secrets resolve **flag → environment variable → `--…-file` → keystore**, so
-a container can mount its node key from a secret with `--node-seed-file`.
+The environment picks the keystore, and every command takes its node key
+from it; `serve` alone takes `--node-seed-file` (or `--node-seed`) ahead of
+it, so a container can mount its node key from a secret.
 
 ### Removal
 
@@ -808,7 +807,9 @@ which needs outbound internet. For a network without discovery, put hint
 lines in `$WIRES_HOME/hints` (`<node id> <ip:port>…`, one per node; a
 running `serve` writes its own to `run/hint`). To avoid n0's relays, run
 upstream [`iroh-relay`](https://docs.rs/iroh-relay) yourself and pass
-`--relay-url <its url>` ([deployment.md](deployment.md#reachability-and-discovery)).
+`--relay-url <its url>` to `serve`, `directory serve` and `gateway`; a
+caller's commands take no relay flag
+([deployment.md](deployment.md#reachability-and-discovery)).
 Addresses are unsigned hints: iroh still authenticates the peer's key, so a
 wrong address can only fail to connect.
 

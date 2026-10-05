@@ -62,7 +62,7 @@ own).
 
 | Down | Effect |
 |---|---|
-| A host | Its services fail over to their other hosts: the caller tries the next host in the service's list when a dial fails. A service with one host is down with it. |
+| A host | Its services keep answering from their other hosts: each call orders a service's hosts at random and tries the next when a dial fails, and a host that failed to answer a caller in the last minute goes last for that caller. A service with one host is down with it. What the host kept between calls (a service's state, its push queue) waits there until it is back. |
 | Every directory | Calls keep working. Edits and removals don't spread; views and searches can't refresh (`wires call` and `wires inbox` fall back to the view they hold); a caller with no view yet can't call. A host that holds no policy can't start. After `fresh_secs` (default 15 min) hosts' freshness lapses: under `lenient` (the default) they keep deciding and trace the lapse; under `strict` they refuse calls until a directory is back. |
 | The admin | Nothing, until something needs changing or the head approaches expiry. |
 | The IdP | ID tokens already issued keep working until they expire (about an hour for Google); nobody can sign in; a host that has not fetched the issuer's keys since it started can't verify anyone. |
@@ -80,7 +80,7 @@ Every keystore file, its mode and holder: [protocol.md §8](protocol.md#8-keysto
 | **Admin** | `root.seed`: **the network's whole authority**. `policy.json`: the whole signed policy, which every edit starts from. `labels.json` (its names for nodes), `login-client.json` (which IdP the network string names, and its public client secret), `reached.json` (the directories that have taken a publish), `node.seed`. | `root.seed` lost: see §4.4. `policy.json` lost: copy it back from any host or directory (it is root-signed, so any copy verifies); no command fetches it. |
 | **Directory** | `directory.redb`: the last 16 heads (for updates) and the items they name; a copy of the newest policy in `policy.json`; `network.json`, `node.seed`. | Rebuilt from a replica (it catches up by itself) or by the admin's `wires policy push`. Nothing is unique to it but its key, which the policy names. |
 | **Host** | `policy.json`: the whole signed policy; `fresh.json`, the newest `Fresh` that vouches for it; `push-queue.json`; `network.json`, `node.seed`; `run/` (the operator's push socket and its hint line). Plus `host.json`, wherever the operator keeps it. | Policy: fetched again from a directory. Queue: pushes not yet delivered are lost. |
-| **Caller** | `node.seed`, `network.json`, `view.json` (its own services: root-signed entries, each checked alone), `idp-token.jwt` (and `idp-refresh-token`), `last-good.json`, `inbox/`, `jwks/`. No `policy.json`. | View: fetched again. Token: `wires login`. Seed: a new node; sign in again with `wires login <network>`. |
+| **Caller** | `node.seed`, `network.json`, `view.json` (its own services: root-signed entries, each checked alone), `idp-token.jwt` (and `idp-refresh-token`), `unanswered.json` (hosts that recently failed to answer it), `inbox/`, `jwks/`. No `policy.json`. | View: fetched again. Token: `wires login`. Seed: a new node; sign in again with `wires login <network>`. |
 | **Web gateway** | As a caller, plus `gateway-client-key` and `gateway-sessions.json`. Its users' views are in memory only. | Sessions: users sign in again. |
 
 Nothing about the network is stored "in the network". n0 DNS and the relays hold only short-lived
@@ -190,9 +190,11 @@ which carry each subscriber only what it may hold: a host the policy, a caller i
   view. A host or directory runs `wires join <network>`, which contacts nobody; the admin names it
   in the policy by its key. The policy doesn't change when a caller joins.
 - **Change policy.** An admin edit signs head N+1, re-signing only the service entries it changed,
-  and publishes it to every directory. One it can't dial is tried again for up to 15 s (a
-  directory that has just restarted can't be found by its key for about 3 s); one that still
-  missed it takes the edit from another directory by its replica subscription (about 40 ms after
+  and publishes it to every directory. One it can't dial, or that answers that it is busy, is
+  tried again for up to 15 s (a directory that has just restarted can't be found by its key for
+  about 3 s), when it has taken a publish from this admin before; a directory the edit drops is
+  tried once. A listed directory that still missed it takes the edit from another directory by
+  its replica subscription (about 40 ms after
   the other took it, in the loopback test `wires/e2e/restart.rs`), and until then the hosts
   following it decide under the policy before it. Directories send every subscribed host a
   `policy_update`: the new head, its `Fresh` and the changed items. The host applies it to its
@@ -207,7 +209,8 @@ which carry each subscriber only what it may hold: a host the policy, a caller i
   from the directories. Neither expires;
   `wires restore` lifts one. Every subscribed host has the new policy within a second and refuses
   the next call.
-- **Call.** The caller picks a host from its view (the one that last answered first) and dials it
+- **Call.** The caller picks one of the service's hosts from its view at random (one that failed
+  to answer it in the last minute goes last; the next is tried only when a dial fails) and dials it
   with `Hello` (its view's head version and its ID token) and `Invoke` (service and argv). The
   host verifies the token and admits the caller (a verified email, no ban, some role matches),
   checks that a role in the service's `allow` admits it and only then that the service is
@@ -243,7 +246,7 @@ What each node receives grows with the rate of edits, not with the number of nod
   call), learns of a new head in a call's `HelloAck`, and then asks a directory for what changed.
   `wires mcp` holds a subscription: the whole view once, then a beat and an update per new head.
 - **The admin** sends one publish per directory per edit (again, for up to 15 s, to one it can't
-  dial that has taken a publish before).
+  dial or that is busy, when it has taken a publish before; at most 30 s in all).
 
 `cargo run -q --release -p library --example policy_sizes` builds real signed policies and
 measures them. At 1,000 services (and 300 bans) it printed: the whole policy 647 KB (65 KB at

@@ -126,7 +126,9 @@ Waiting on a mock CI build of 60 s or 300 s, 5 runs per setup
   token.
 - **No record of calls** beyond one ordinary log line per call in the host's
   output. A signed call record is a possible future design.
-- **Several hosts per service give failover**, not more capacity.
+- **Hosts share nothing but the policy.** Calls spread at random across a
+  service's hosts, so a service that keeps state between calls answers from
+  whichever host the call landed on.
 - **Hosts and directories hold the whole policy**; a caller holds only its
   view, but a directory sees who asks for which view.
 - **A directory must be up** to change the policy, remove someone or fetch
