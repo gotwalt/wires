@@ -1,0 +1,4 @@
+# wires role -> its default namespace (a convenience: RBAC decides). A role
+# with no line is refused.
+analyst analytics
+sre default

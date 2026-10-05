@@ -12,5 +12,9 @@
 # Local ops notes and deploy script for workbench (not shared)
 /ops/
 
+# The example services' credentials and cluster CA (examples/services/*/compose.yml)
+/examples/services/*/secrets/
+/examples/services/k8s/k8s-ca.crt
+
 # npm packages (bindings/node)
 node_modules/

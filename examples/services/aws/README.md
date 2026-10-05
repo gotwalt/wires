@@ -46,19 +46,27 @@ aws iam attach-role-policy --role-name wires-readonly \
 
 ## Once, on the host
 
+The host runs this example as a container: `wires serve` and the AWS CLI v2
+(AWS's own installer, [../Dockerfile](../Dockerfile)) as the unprivileged
+user `wires`, with no port published, since wires dials out. From this
+directory:
+
 ```bash
-sudo cp -R examples/services /opt/wires-examples/          # common.sh + this directory
-sudo install -d -o wires -m 700 /var/lib/wires-examples/aws  # STATE_DIR: per-call token files
-printf 'analyst arn:aws:iam::123456789012:role/wires-readonly\nsre arn:aws:iam::123456789012:role/wires-operator\n' |
-  sudo tee /etc/wires-examples/aws.roles
+(cd ../../.. && make image)        # once per host: the image the examples copy wires from
+$EDITOR aws.roles                  # each wires role's IAM role ARN
+docker compose build
+docker compose run --rm aws join <network>   # the admin's `wires network`; prints the node id
+docker compose run --rm aws serve --check /etc/wires-examples/host.json
+docker compose up -d               # once the admin has added the service (below)
 ```
 
-Merge [host.json](host.json)'s `aws` entry into the host's `host.json`
-(`AWS_DEFAULT_REGION` is yours to set) and restart `wires serve`. The
-`aws` CLI v2 must be on `serve`'s `PATH`. `ALLOW_COMMANDS` overrides the
-wrapper's default subcommands (`sts s3 s3api ec2 logs cloudwatch lambda ecs
-dynamodb cloudformation`; never `configure`, whose `export-credentials`
-prints the session's keys).
+There is no secret to install. [host.json](host.json) (`AWS_DEFAULT_REGION`
+is yours to set) and [aws.roles](aws.roles) are mounted read-only;
+`STATE_DIR`, where each call's token file goes, is a tmpfs, so tokens never
+reach a disk. `ALLOW_COMMANDS` in `host.json` overrides the wrapper's
+default subcommands (`sts s3 s3api ec2 logs cloudwatch lambda ecs dynamodb
+cloudformation`; never `configure`, whose `export-credentials` prints the
+session's keys).
 
 ## Once, as the admin
 

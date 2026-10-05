@@ -39,18 +39,26 @@ cloud checks the person as well as the role.
 
 ## Once, on the host
 
+The host runs this example as a container: `wires serve` and `gcloud`
+(Google's apt repository, [../Dockerfile](../Dockerfile)) as the
+unprivileged user `wires`, with no port published, since wires dials out.
+From this directory:
+
 ```bash
-sudo cp -R examples/services /opt/wires-examples/
-sudo install -d -o wires -m 700 /var/lib/wires-examples/gcp
-printf 'analyst wires-readonly@acme-prod.iam.gserviceaccount.com\nsre wires-operator@acme-prod.iam.gserviceaccount.com\n' |
-  sudo tee /etc/wires-examples/gcp.roles
+(cd ../../.. && make image)        # once per host: the image the examples copy wires from
+$EDITOR gcp.roles host.json        # service accounts; the provider and project
+docker compose build
+docker compose run --rm gcp join <network>   # the admin's `wires network`; prints the node id
+docker compose run --rm gcp serve --check /etc/wires-examples/host.json
+docker compose up -d               # once the admin has added the service (below)
 ```
 
-Merge [host.json](host.json)'s `gcp` entry into the host's `host.json`:
+There is no secret to install. In [host.json](host.json),
 `GCP_WORKLOAD_PROVIDER` is the provider's resource name
-(`projects/<number>/locations/global/workloadIdentityPools/wires/providers/wires-idp`),
-`CLOUDSDK_CORE_PROJECT` the default project. `gcloud` must be on `serve`'s
-`PATH`. The wrapper writes the call's credential configuration (an
+(`projects/<number>/locations/global/workloadIdentityPools/wires/providers/wires-idp`)
+and `CLOUDSDK_CORE_PROJECT` the default project; it and
+[gcp.roles](gcp.roles) are mounted read-only, and `STATE_DIR`, where each
+call's files go, is a tmpfs. The wrapper writes the call's credential configuration (an
 `external_account` file whose `credential_source.file` is the call's token
 file), runs `gcloud auth login --cred-file` into a `CLOUDSDK_CONFIG` of the
 call's own, then the agent's command. Its default subcommands are `compute

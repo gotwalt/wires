@@ -1,0 +1,4 @@
+# wires role -> the service account it impersonates. A role with no line is
+# refused.
+analyst wires-readonly@acme-prod.iam.gserviceaccount.com
+sre wires-operator@acme-prod.iam.gserviceaccount.com

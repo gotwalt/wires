@@ -1,0 +1,3 @@
+# wires role -> the file holding that role's Cloudflare API token (a
+# Compose secret in compose.yml). A role with no line is refused.
+analyst /run/secrets/analyst

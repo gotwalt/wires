@@ -2,7 +2,7 @@
 
 Pattern B ([docs/examples.md](../../../docs/examples.md)): GitHub takes no
 inbound OIDC sign-in for `gh`, so the host holds one narrowly scoped token
-per wires role, in a file only `serve`'s user can read. The signed policy
+per wires role, in a file only its container mounts. The signed policy
 decides who may call `github`; the host's log line names the person;
 removing someone is `wires remove`, with no token to rotate.
 
@@ -21,16 +21,27 @@ this example.
 
 ## Once, on the host
 
+The host runs this example as a container: `wires serve` and `gh`
+(GitHub's apt repository, [../Dockerfile](../Dockerfile)) as the
+unprivileged user `wires`, with no port published, since wires dials out.
+From this directory:
+
 ```bash
-sudo cp -R examples/services /opt/wires-examples/
-sudo install -d -o wires -m 700 /etc/wires-examples/github /var/lib/wires-examples/github
-sudo -u wires sh -c 'umask 077; cat >/etc/wires-examples/github/analyst.token'   # paste, then Ctrl-D
-printf 'analyst /etc/wires-examples/github/analyst.token\n' | sudo tee /etc/wires-examples/github.roles
+(cd ../../.. && make image)        # once per host: the image the examples copy wires from
+install -d -m 700 secrets          # only you can open it
+cat >secrets/analyst.token         # paste the analyst's token, then Ctrl-D
+docker compose build
+docker compose run --rm github join <network>   # the admin's `wires network`; prints the node id
+docker compose run --rm github serve --check /etc/wires-examples/host.json
+docker compose up -d               # once the admin has added the service (below)
 ```
 
-Merge [host.json](host.json)'s `github` entry into the host's `host.json`
-(`HOME` gives `gh` somewhere to keep its config). `gh` must be on `serve`'s
-`PATH`. The wrapper reads the caller's role's file into `GH_TOKEN` and
+The token reaches the container as the Compose secret
+`/run/secrets/analyst`, which [github.roles](github.roles) gives to the
+role `analyst`; another role is a line there and a secret in
+[compose.yml](compose.yml). [host.json](host.json) and `github.roles` are
+mounted read-only, and `HOME`, where `gh` keeps its config, is a tmpfs.
+The wrapper reads the caller's role's file into `GH_TOKEN` and
 execs `gh`. Its default subcommands are `api issue pr repo run search
 release workflow label`; never `auth` (`gh auth token` prints the token),
 `alias`, `extension` or `config`.

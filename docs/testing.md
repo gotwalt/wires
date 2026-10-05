@@ -88,7 +88,8 @@ and at fetch. All on loopback in a fresh `mktemp -d`, every step asserted.
 `.scripts/demo-push.sh --quiet` does the same for push (a build service that
 calls the agent back, a locked caller), `.scripts/demo-example-services.sh
 --quiet` (`make demo-examples`) for the wrappers in `examples/services/`
-against stub CLIs, and
+against stub CLIs (`make demo-examples-docker`, opt-in, builds two of them
+as containers with stub CLIs and checks them there), and
 `.scripts/demo-native-service.sh --lang python|node` (`make demo-python`,
 `make demo-node`) for a native service written in Python or TypeScript: the
 kv example as the host, called with the shipped `wires`, down to a clean

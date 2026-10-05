@@ -1,0 +1,56 @@
+# The `stripe` example as a container: `wires serve` and stripe, as the
+# unprivileged user `wires`. See README.md.
+#
+#   (cd ../../.. && make image)                 # once: the wires image (wires:dev)
+#   install -d -m 700 secrets                   # then write secrets/analyst.token
+#   docker compose build
+#   docker compose run --rm stripe join <network>   # the admin's `wires network`
+#   docker compose run --rm stripe serve --check /etc/wires-examples/host.json
+#   docker compose up -d
+#
+# No port is published: wires dials out.
+name: wires-example-stripe
+
+services:
+  stripe:
+    build:
+      context: ..
+      target: stripe
+      args:
+        WIRES_IMAGE: ${WIRES_IMAGE:-wires:dev}
+    image: wires-example:stripe
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      RUST_LOG: ${RUST_LOG:-warn,wires=info}
+    configs:
+      - source: host-json
+        target: /etc/wires-examples/host.json
+      - source: roles
+        target: /etc/wires-examples/stripe.roles
+    # One credential per wires role, each at /run/secrets/<name>.
+    secrets:
+      - analyst
+    tmpfs:
+      - /tmp
+      # stripe's HOME (host.json): its config, gone with the container.
+      - /var/lib/wires-examples/stripe:uid=10001,gid=10001,mode=0700
+    volumes:
+      # The node key and the signed policy: must persist.
+      - keystore:/data
+    restart: unless-stopped
+
+configs:
+  host-json:
+    file: ./host.json
+  roles:
+    file: ./stripe.roles
+
+secrets:
+  analyst:
+    file: ./secrets/analyst.token
+
+volumes:
+  keystore:

@@ -18,7 +18,7 @@
 #                   spaces; `word` allows a first argument, `word:sub` a first
 #                   and second. Each wrapper has its own default.
 #   STATE_DIR       pattern A only: where each call's token file lives (0700,
-#                   owned by serve's user).
+#                   owned by serve's user; a tmpfs in the example containers).
 #
 # A refusal exits 77 (EX_NOPERM); `wires call` reports a service's 77 as 1
 # with a note on stderr, so a caller can tell it from the host's own refusal.

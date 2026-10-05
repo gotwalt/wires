@@ -138,9 +138,10 @@ done
 NETWORK="$(admin network)"
 WIRES_HOME="$wb" "$WIRES" join "$NETWORK" >/dev/null
 
-# The host's side, as an operator would lay it out (examples/services/*/
-# README.md), under $D: the role maps, the credential files (0600, read by
-# serve's user only), the state dirs, and stub CLIs first on serve's PATH.
+# The host's side, as the wrappers run without a container (docs/examples.md
+# § Installing one), under $D: the role maps, the credential files (0600,
+# read by serve's user only), the state dirs, and stub CLIs first on serve's
+# PATH. The containers are .scripts/demo-example-services-docker.sh's.
 ETC="$D/etc/wires-examples"
 VAR="$D/var/lib/wires-examples"
 STUBS="$D/stub-log"
