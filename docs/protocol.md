@@ -278,11 +278,13 @@ held head doesn't list it signs none and answers `policy` and views with a refus
 |---|---|
 | `heads` | version → the signed head and its items' content-hash keys, in order (the last 16 kept) |
 | `items` | content hash (blake3 of the item's JSON) → the item (dropped when no kept head names it) |
-| `current` | item key (`kind:key`) → content hash, for the newest head |
-| `meta` | `version` (the newest head's), `fresh` (the latest `Fresh`) |
+| `meta` | `version` (the newest head's) |
 
 One writer, many readers. A policy is stored only if it is strictly newer, in one transaction. A
-restart reloads the newest head and signs a new `Fresh`. When the node's own `policy.json` is
+restart reloads the newest head and signs a new `Fresh` (a `Fresh` is kept in memory only; a beat
+writes nothing to disk). A directory whose newest head has expired signs no `Fresh`, admits nobody
+and answers every request with `this directory holds only an expired policy (version N); try
+again later`, until the admin publishes a newer one. When the node's own `policy.json` is
 newer (it fetched one as a host), the store is seeded from it.
 
 **Accepting a policy** (`Directory::accept`): `SignedPolicy::verify` under the root (§3), the head
@@ -559,8 +561,8 @@ a stranger's. Then the first failure below is sent as `Denied` (`wires/host/gate
    try again later`. All three are traced at `debug`, with at most one `info` line per 10 s
    counting them, so strangers can't flood the host's log; none writes a log line of its own.
    Every key can still connect: a stranger costs the host one token check (keys are fetched only
-   for an issuer the policy trusts, and an unknown `kid` refetches at most once per issuer per
-   rate-limit window, §6).
+   for an issuer the policy trusts, an unknown `kid` refetches at most once per issuer per
+   rate-limit window, and a fetch that failed is not retried within it, §6).
 3. **The gate** (`ServicesHost::decide`, then `admit`): under `strict`, a current `Fresh` vouches for the held head (§4
    *Freshness at the host*) → the head hasn't expired → `authorize` (the service is in the policy and
    its `allow` admits the caller) → it is assigned to **this** host → every role in `host.json`'s
@@ -568,7 +570,8 @@ a stranger's. Then the first failure below is sent as `Denied` (`wires/host/gate
    host-local roles). **A host tells an admitted caller nothing about services it may not call:**
    no such service, one nobody is allowed, and one whose `allow` doesn't admit this caller all hear
    the same bytes, `no service named \`<name>\` that you may call`, with no role name and no
-   policy version; which it was goes to the host's trace (`refused by the registry`). Only for a
+   policy version; which it was goes to the host's trace at `debug` (`refused by the signed
+   policy`). Only for a
    service the caller *is* allowed does it hear the specific refusals after it (`service <name> is
    not assigned to this host (signed policy version N)`, the `also_require` sentence).
 4. **Implementation.** Only an admitted caller learns whether this host implements the service,
@@ -680,8 +683,11 @@ matches <email>, or you were removed: ask your admin`; for a token with no verif
 admitted to this network: your sign-in carries no verified email, and this network admits only a
 verified email: ask your admin`; for an expired one, `not admitted to this network: your sign-in
 has expired; run \`wires login\``. `wires call` (exit 77), `wires mcp`'s tool result, `wires
-inbox`, `wires services` (exit 1) and `wires login` (right after a sign-in the network doesn't
-admit; the sign-in itself is kept, exit 0) all say it.
+inbox` (exit 1 when a directory said so and no view is held; 77 when every host refused),
+`wires services` (exit 1) and `wires login` (right after a sign-in the network doesn't
+admit; the sign-in itself is kept, exit 0) all say it. A refusal by a host also marks the
+caller's view as behind, so the next `wires services`, `wires call` or `wires inbox` refreshes it
+first.
 
 Exit codes: `Denied` → **77**, nothing on stdout. Local or transport failure (including the checks
 above) → 1. Otherwise the remote exit code, **except that a remote 77 is reported as 1** with a
@@ -717,7 +723,9 @@ or an older token displace it. It knows only the callers that presented a token 
 node enters that index only once it was **admitted** (§2: its token verified and `check_admitted`
 passed; a token that fails, or a person the policy doesn't admit, leaves no entry, so strangers and
 outsiders can't grow it). A host fetches keys only for an issuer its policy trusts,
-refetches on an unknown `kid` at most once per issuer per rate-limit window (60 s), keeps issuer key sets
+refetches on an unknown `kid` at most once per issuer per rate-limit window (60 s), doesn't retry a
+failed discovery or key fetch within that window (its error stands, so an unreachable IdP costs one
+fetch per issuer per window, not one per token), keeps issuer key sets
 **in memory only** and never reads the `jwks/` disk cache, which anything running as its user could
 write; callers keep that cache, and trust a disk entry for at most 24 h.
 
@@ -746,7 +754,10 @@ presenting a token bound to it. The gateway holds no policy: for each live sessi
 subscribes to that user's **view**, presenting the user's own ID token to a directory, which
 verifies it and cuts the view (§4 *Views*); so it offers a user only services that a role admits
 by that user's own verified principal, and a grant or revocation applies to their next request.
-A node-banned gateway is refused by every host and every directory (`NOT_ADMITTED`). It
+A web user the network doesn't admit is refused at sign-in (`access_denied` at the OAuth
+callback, HTTP 403 at `/mcp`: `not admitted to this network: no role in this network matches this
+account, or it was removed: ask your admin`; the email is left out because the text returns to the
+MCP client). A node-banned gateway is refused by every host and every directory (`NOT_ADMITTED`). It
 issues its own OAuth access tokens (opaque, bound to its
 `/mcp`, expiring with the ID token) and no refresh tokens. Its MCP endpoint serves the 2026-07-28
 Streamable HTTP binding and the legacy `initialize` era ([deployment.md](deployment.md)).
@@ -829,7 +840,7 @@ reaches `wires mcp` and the gateway.
 | `view.json` | 0600 | caller (any node that calls) | its view: the head, the root-signed entries it may call, the newest `Fresh`, when a directory last vouched, the newest head a host reported (§4 *Views*) |
 | `login-client.json` | 0600 | admin | which trusted IdP the network string names, and each client's public secret; never signed, never published |
 | `fresh.json` | 0600 | host | the newest `Fresh` for the held head (§4 *Freshness at the host*) |
-| `directory.redb` | 0600 | directory | the directory's heads, items and latest `Fresh` (§4) |
+| `directory.redb` | 0600 | directory | the directory's heads and items (§4) |
 | `idp-token.jwt`, `idp-refresh-token` | 0600 | caller | from `wires login` |
 | `last-good.json` | 0600 | caller | service → the host that last answered |
 | `hints` | — (the operator's; wires never writes it) | any node | optional local dial hints (below) |

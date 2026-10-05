@@ -78,7 +78,7 @@ Every keystore file, its mode and holder: [protocol.md §8](protocol.md#8-keysto
 | Node | What it keeps | If lost |
 |---|---|---|
 | **Admin** | `root.seed`: **the network's whole authority**. `policy.json`: the whole signed policy, which every edit starts from. `labels.json` (its names for nodes), `login-client.json` (which IdP the network string names, and its public client secret), `reached.json` (the directories that have taken a publish), `node.seed`. | `root.seed` lost: see §4.4. `policy.json` lost: copy it back from any host or directory (it is root-signed, so any copy verifies); no command fetches it. |
-| **Directory** | `directory.redb`: the last 16 heads (for updates), the items they name, the newest `Fresh`; a copy of the newest policy in `policy.json`; `network.json`, `node.seed`. | Rebuilt from a replica (it catches up by itself) or by the admin's `wires policy push`. Nothing is unique to it but its key, which the policy names. |
+| **Directory** | `directory.redb`: the last 16 heads (for updates) and the items they name; a copy of the newest policy in `policy.json`; `network.json`, `node.seed`. | Rebuilt from a replica (it catches up by itself) or by the admin's `wires policy push`. Nothing is unique to it but its key, which the policy names. |
 | **Host** | `policy.json`: the whole signed policy; `fresh.json`, the newest `Fresh` that vouches for it; `push-queue.json`; `network.json`, `node.seed`; `run/` (the operator's push socket and its hint line). Plus `host.json`, wherever the operator keeps it. | Policy: fetched again from a directory. Queue: pushes not yet delivered are lost. |
 | **Caller** | `node.seed`, `network.json`, `view.json` (its own services: root-signed entries, each checked alone), `idp-token.jwt` (and `idp-refresh-token`), `last-good.json`, `inbox/`, `jwks/`. No `policy.json`. | View: fetched again. Token: `wires login`. Seed: a new node; sign in again with `wires login <network>`. |
 | **Web gateway** | As a caller, plus `gateway-client-key` and `gateway-sessions.json`. Its users' views are in memory only. | Sessions: users sign in again. |
@@ -208,7 +208,8 @@ which carry each subscriber only what it may hold: a host the policy, a caller i
   assigned to this host, applies `host.json`'s `also_require`, and runs the service. `HelloAck`
   carries the host's head version; when it is newer than the caller's view, it also carries the
   service's signed entry, which the caller checks before sending stdin, and the caller refreshes
-  its view afterwards (only after a call the host ran: a refused call leaves the view as it is). A name missing from the view
+  its view afterwards. A refusal marks the view as behind, so the caller's next command refreshes
+  it first. A name missing from the view
   is `resolve`d at a directory first.
 - **Discover.** `wires services [query]` reads the view, refreshing it from a directory when it is
   behind, expired or a day old. In MCP, `tools/list` serves the same view; past 40 services it

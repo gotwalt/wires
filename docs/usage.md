@@ -292,7 +292,7 @@ has decided. Then the admin removes alice, by email:
 ```console
 admin$ wires remove alice@example.com
 wires: policy version 7: published to 2 of 2 directory(ies)
-removed alice@example.com (https://accounts.google.com) (policy version 7; 0 node and 1 person ban(s); `wires restore` lifts it)
+removed alice@example.com (https://accounts.google.com) (policy version 7; 1 person ban; `wires restore` lifts it)
 agent$ wires call orders-db -- "select count(*) from orders"
 wires: denied by host: not admitted to this network: no role in this network matches alice@example.com, or you were removed: ask your admin
 agent$ echo $?
@@ -614,7 +614,8 @@ What wires does not do, or does with a cost, as built:
   keeps the view it has.
 - **A stranger costs a token check.** Any key can connect and make a host or
   directory verify one ID token (keys are fetched only for a trusted issuer,
-  and refetched at most once per issuer per rate-limit window).
+  and refetched at most once per issuer per rate-limit window; a failed
+  fetch is not retried within it).
 - **Bans don't expire**, and accumulate in the policy until `wires restore`.
   A person ban matches the ban's issuer and the token's verified email.
   Remove a person by email; `wires remove <node>` is for taking a host or
@@ -633,10 +634,9 @@ What wires does not do, or does with a cost, as built:
   Hosts follow a directory's subscription and have each edit within a
   second; so do `wires mcp`, gateway sessions and `wires inbox --wait`, for
   their views. A one-shot `wires call` learns of an edit in its next call's
-  handshake and refreshes its view then, but only after a call the host
-  ran: a refused call leaves the view as it is, so a caller refused a
-  service it may no longer call keeps listing it until the view is a day
-  old.
+  handshake and refreshes its view then. A refusal by a host also marks
+  the view as behind, so the next `wires services` or `wires call`
+  refreshes it first.
 - **With every directory down, hosts keep deciding** from their copy under
   the default `lenient` freshness, and say so in their trace; edits and bans
   don't spread until a directory is back. Under `wires policy settings
@@ -729,7 +729,7 @@ snapshot-tested (`wires/snapshots/`).
 | | `wires login [<network>] [--no-browser] [--callback-port N] [--refresh\|--reuse]` | The first time, with the network string: join, then sign in. Sign in with the IdP the network string names (the hidden `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*` override it), store the key-bound ID token, and fetch your view. `--refresh` tries the stored refresh token first (with Google the refreshed token has no `nonce`, so it can't be used); `--reuse` re-checks the stored token. |
 | | `wires services [query] [--verbose] [--json]` | List the services in your view, one per line: `<name>  <description>  (<roles that may call>)`; a `query` keeps those whose name or description contains it. Nothing on stdout when there are none: stderr says why and what to do (with the premise, when the view is empty). A person no role matches, or who was removed, exits `1`: `not admitted to this network: no role in this network matches <email>, or you were removed: ask your admin`. `--json` prints one object per line, `{"service","description","allow":[…],"hosts":<count>}`, plus `host_ids` with `--verbose`. Refreshes the view first when it is over a day old, expired, or a call the host ran saw a newer policy. `--verbose` adds the hosts. |
 | | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name, from your view (a name it lacks is asked of a directory; or a `tools.json` alias, which a service in your view of the same name beats). Stdio passes through and its exit code becomes `call`'s, except that a remote exit `77` is reported as `1` (with a note on stderr). A refusal by the host exits `77`, with nothing on stdout. No sign-in, a service you may not call, a local or transport failure, an expired view, or a newer policy (in the host's handshake) whose entry no longer lists that host exits `1`, before any stdin is sent. A usage error (a `--jq` filter that fails, a flag locked mode refuses) exits `2`. `--verbose` names the host that answered and prints every cause of an error. |
-| | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`. Refreshes a stale view first, as `call` does, and never dials from an expired one. |
+| | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`; not admitted to the network, with no view held, exits `1`. Refreshes a stale view first, as `call` does, and never dials from an expired one. |
 | | `wires mcp` | Serve the same services as MCP tools over stdio, following your view: a grant or revocation reaches the client as `tools/list_changed` within seconds. Each tool is a service, named as `wires services` lists it, and described by the first sentence of its description; the `instructions` are the premise plus how to pass arguments and filter output. Past 40 services it offers `search_services` and `call_service` instead of one tool each. A refusal is a tool error reading `denied by host: <reason>` and its next step. |
 | | `wires gateway --public-url https://… [--listen addr] [--client-id …] [--client-secret-file F] [--issuer URL]` | Serve them as a remote MCP server (Streamable HTTP + OAuth 2.1) for web clients such as Claude on the web. Each user signs in with the IdP through the gateway and calls with their own token, from their own view (one subscription per live session) ([deployment](deployment.md#a-web-gateway)). |
 | | `wires tools add\|list\|rm` (hidden) | Edit local aliases in `tools.json`: a name pinned to one host by node id. A service in your view of the same name wins, and an alias is refused unless your view's entry for its service lists its host. |
