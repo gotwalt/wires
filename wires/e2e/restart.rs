@@ -23,6 +23,8 @@
 //! - [`a_stale_address_costs_one_dial_timeout_then_the_next_try_finds_it`]
 //! - [`a_directory_that_missed_an_edit_takes_it_from_another_by_replica`]:
 //!   and how long that takes.
+//! - [`a_busy_directory_is_tried_again`]: busy is no refusal.
+//! - [`a_dead_directory_the_edit_drops_is_tried_once_and_not_waited_for`]
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,17 +39,21 @@ use crate::admin::init::{InitArgs, init_in};
 use crate::admin::keystore::Keystore;
 use crate::admin::propagate::{Propagation, settle};
 use crate::admin::remove::{WhoArgs, remove_in};
-use crate::admin::service::directory_add;
+use crate::admin::service::{directory_add, directory_rm};
 use crate::admin::ttl::Ttl;
 use crate::clock::now_unix;
-use crate::directory::node::Directory;
+use crate::directory::node::{Directory, MAX_ADMITTED};
 use crate::directory::serve::Running;
 use crate::directory::wire::DIAL_TIMEOUT;
 use crate::host::transport::{endpoint_addr, endpoint_id};
 use crate::policy::fetch::{
-    PUBLISH_BUDGET, Retry, held_directories, publish_current_on, publish_retrying,
+    PUBLISH_BUDGET, PublishReport, Retry, held_directories, publish_current_on, publish_retrying,
 };
 use crate::policy::store;
+
+/// Less than the pause before a second try: a publish that tried a
+/// directory once (a dial timeout at most) took less than that plus this.
+const RETRY_SLACK: Duration = Duration::from_millis(900);
 
 /// How long after its restart the admin can find the directory by its key
 /// (n0 discovery: about 3 s on a real network).
@@ -174,25 +180,48 @@ impl Net {
     /// Publish the admin's stored policy as a `wires` command does: a fresh
     /// endpoint, the publish, settled (its note, and `reached.json`).
     async fn publish(&self, retry: Retry) -> Propagation {
+        self.publish_since(&held_directories(&self.admin).unwrap(), retry)
+            .await
+            .0
+    }
+
+    /// [`publish`](Self::publish) after an edit, `earlier` being the
+    /// directories the policy listed before it (as `run_edit` records them);
+    /// and how long the publish took (not counting the endpoint's close).
+    async fn publish_since(
+        &self,
+        earlier: &std::collections::BTreeSet<NodeId>,
+        retry: Retry,
+    ) -> (Propagation, Duration) {
         let endpoint = bind_in(&self.admin_node, &self.admin_book).await;
-        let earlier = held_directories(&self.admin).unwrap();
-        let report = publish_current_on(&endpoint, &self.admin, &earlier, retry).await;
+        let started = Instant::now();
+        let report = publish_current_on(&endpoint, &self.admin, earlier, retry).await;
+        let took = started.elapsed();
         endpoint.close().await;
-        settle(&self.admin, report.map(|r| (self.version(), r)))
+        (
+            settle(&self.admin, report.map(|r| (self.version(), r))),
+            took,
+        )
     }
 
     /// One try at each directory, no second: what every publish did before
     /// card 48.
-    async fn publish_once(&self) -> crate::policy::fetch::PublishReport {
+    async fn publish_once(&self) -> PublishReport {
+        let targets: Vec<NodeId> = self.dirs.iter().map(|d| d.node_id()).collect();
+        self.publish_to(&targets, Duration::ZERO).await
+    }
+
+    /// Publish the admin's stored policy to `targets` only, trying each
+    /// again within `budget`.
+    async fn publish_to(&self, targets: &[NodeId], budget: Duration) -> PublishReport {
         let endpoint = bind_in(&self.admin_node, &self.admin_book).await;
         let held = store::read(&self.admin, self.root).unwrap().unwrap();
-        let targets: Vec<NodeId> = self.dirs.iter().map(|d| d.node_id()).collect();
         let report = publish_retrying(
             &endpoint,
             &held.signed,
-            &targets,
+            targets,
             &targets.iter().copied().collect(),
-            Duration::ZERO,
+            budget,
         )
         .await
         .unwrap();
@@ -337,5 +366,66 @@ async fn a_directory_that_missed_an_edit_takes_it_from_another_by_replica() {
         d1.dir.snapshot().unwrap().held.signed
     );
     d0.stop().await;
+    d1.stop().await;
+}
+
+/// A directory whose slots are all taken answers "busy": no decision, so
+/// the publish tries it again, and it takes the policy once a slot is free.
+#[tokio::test]
+async fn a_busy_directory_is_tried_again() {
+    let net = Net::new();
+    let (d0, d1) = net.running().await;
+    let full = Arc::clone(&d0.dir.admitted)
+        .acquire_many_owned(MAX_ADMITTED as u32)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        tokio::time::sleep(LAG).await;
+        drop(full);
+    });
+    net.remove_alice();
+    // Only to the busy one, so no replica can hand it over meanwhile.
+    let only = [net.dirs[0].node_id()];
+    let report = net.publish_to(&only, PUBLISH_BUDGET).await;
+    assert_eq!(report.delivered, only.to_vec(), "{report:?}");
+    assert!(report.refused.is_empty(), "{report:?}");
+    assert_eq!(d0.dir.version(), net.version());
+    d0.stop().await;
+    d1.stop().await;
+}
+
+/// `wires directory rm` of a directory that is down: it is published to
+/// once (one that is up learns it was dropped), not tried again for the
+/// budget, its miss fails nothing, and the line doesn't say it catches up
+/// (the others no longer let it follow them).
+#[tokio::test]
+async fn a_dead_directory_the_edit_drops_is_tried_once_and_not_waited_for() {
+    let net = Net::new();
+    let (d0, d1) = net.running().await;
+    d0.stop().await;
+    let gone = net.dirs[0].node_id();
+    let earlier = held_directories(&net.admin).unwrap();
+    directory_rm(&net.admin, gone, Ttl::default()).unwrap();
+    let (published, took) = net.publish_since(&earlier, Retry::Reached).await;
+    assert_eq!(published.failure, None, "{}", published.note);
+    assert!(
+        published.note.contains("published to 1 of 2"),
+        "{}",
+        published.note
+    );
+    assert!(
+        published
+            .note
+            .contains(&format!("dropped by this edit: {}…", gone.short())),
+        "{}",
+        published.note
+    );
+    assert!(
+        !published.note.contains("hosts that follow it"),
+        "{}",
+        published.note
+    );
+    assert!(took < DIAL_TIMEOUT + RETRY_SLACK, "tried again: {took:?}");
+    assert_eq!(d1.dir.version(), net.version());
     d1.stop().await;
 }
