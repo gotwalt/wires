@@ -90,6 +90,7 @@ make install                                 # the release `wires` into ~/.cargo
 .scripts/build-node.sh                       # make node: the npm package into target/node/wires
 .scripts/demo-native-service.sh --lang python   # make demo-python: a Python-native service, end to end (needs uv)
 .scripts/demo-native-service.sh --lang node     # make demo-node: the same in TypeScript (Node >= 22.18)
+.scripts/demo-example-services.sh --quiet        # make demo-examples: examples/services/ wrappers against stub CLIs
 docker build .                               # make image: distroless image, native arch
 ```
 
@@ -206,7 +207,8 @@ runs from it. A host serving CLIs needs an image that also has those CLIs.
   (card 16) and its results; `bench/push/` the push-vs-poll benchmark
   (card 24); `bench/help/` the help-text evaluation (card 38);
   `bench/state-scale/` a dated model of policy size. `deploy/gateway/` —
-  the web gateway's Compose deployment. `docs/board/` — the cards;
+  the web gateway's Compose deployment. `examples/services/` — example
+  services wrapping vendor CLIs (`docs/examples.md`). `docs/board/` — the cards;
   `docs/blog/` — the announcement post.
 - Rust edition 2024, toolchain 1.98.1 (`rust-toolchain.toml`).
 - Lint: `clippy` + `shellcheck`, both with default settings. Format:

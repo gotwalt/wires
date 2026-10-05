@@ -83,7 +83,6 @@ Open cards only; finished cards are in [done/](done/).
 | Card | Stage | Depends on | Status | Summary |
 |---|---|---|---|---|
 | [08](doing/08-demo-two-machine.md) | last | all of the above | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent; re-record |
-| [50](review/50-example-services.md) | after 08 | 49, 45 | review | **Example services:** aws, gcp, kubectl (federated: ID token → cloud identity) and gh, wrangler, vercel, supabase, stripe (host-held credential), with `make demo-examples` |
 | [29](backlog/29-person-identity.md) | — | — | backlog, not scheduled | **Person identity for headless agents:** `login --for`, day-passes |
 | [31](backlog/31-inbox-delivery.md) | — | — | designed, parked | **Inbox delivery:** callbacks go to the caller that asked; one delivery path |
 | [32](backlog/32-service-sandbox-OPEN.md) | — | — | open question | **Don't build:** run each service call in a rootless microVM |
@@ -97,7 +96,7 @@ the workbench down only while its last word is current (15 minutes); a
 directory-only node would remove that limit ([demo.md](../demo.md) step 5b). **Skipped for now:** re-running the benchmarks
 (not run on this code; their setup signs in once and a Google sign-in lasts
 an hour). What else the last pass left open is in
-[card 43](done/43-accuracy-sweep.md)'s Notes. 39–49 are done.
+[card 43](done/43-accuracy-sweep.md)'s Notes. 39–50 are done.
 
 ## Rules for workers
 
