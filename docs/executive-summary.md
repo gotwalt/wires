@@ -1,82 +1,143 @@
-# Wires — Executive Summary
+# wires: executive summary
 
-*2026-09-24. Details: [README](../README.md) · board: [docs/board](board/README.md).*
+*2026-10-05. Details: [README](../README.md) · board: [docs/board](board/README.md).*
 
-## The problem
+## What it is
 
-AI agents do their work by running tools. Today there are two ways to give an agent a tool that lives somewhere else, and each is missing something:
+> **Your tools are already CLIs. wires lets any agent in your organization
+> run them where they live: `wires login` says who you are (your IdP),
+> `wires services` lists what you may use, and `wires call` runs one by
+> name, with no port opened and no VPN.**
 
-- **An MCP server.** A remote server listens at a URL the agent's machine can reach. Each server is its own OAuth resource server and validates tokens itself (IdP-centralized policy is an opt-in extension), and the protocol defines no audit record. Since the 2026-07-28 revision MCP is stateless: a server reaches a client only over a stream that client opened and holds, and long-running work is polled (`tasks/get`) or streamed over that listen stream. Reaching a client that isn't connected is working-group work, not in the spec.
-- **A command-line tool.** Models already know CLIs, and CLIs let the agent filter output *before* it reaches context. But a CLI has to be installed next to the agent, together with its credentials, and nothing records who ran what.
+wires is experimental research code: no security review, and no backwards
+compatibility from one version to the next.
 
-Three things organizations are now asking for sit in that gap:
+## Why CLIs
 
-1. **Knowing which person an agent acts for.** Okta shipped "Okta for AI Agents" in April and bought Permiso for about $200M, citing 109 machine identities per human. OWASP's Agentic Top 10 lists per-agent identity, a human owner, least privilege, an immutable audit trail and a kill switch.
-2. **Not exposing services.** OpenClaw, the fastest-growing open-source project in GitHub's history, is an agent people message. It produced 2026's first major agent security crisis: 135k exposed instances and one-click RCE.
-3. **Records of what agents did.** EU AI Act Articles 12 and 26 made logging of AI system actions a legal requirement on 2 August 2026.
+Agents work best with command lines. Models have seen far more shell than
+tool-call JSON; a CLI's output is cut down before it reaches the model's
+context (`--jq`, `--json fields`, `head`); and CLIs compose. Others have
+found the same direction: Anthropic's
+[Code execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp)
+(2025-11-04) names tool definitions and intermediate results as the two
+costs of tool calls; Cloudflare's [Code Mode](https://blog.cloudflare.com/code-mode/)
+(2025-09-26) says "LLMs have seen a lot of code. They have not seen a lot of
+'tool calls'"; Scalekit's [GitHub benchmark](https://www.scalekit.com/blog/mcp-vs-cli-use)
+(2026-03-11) measured 4 to 32 times fewer tokens for the CLI than for
+GitHub's MCP server, and argues MCP is still needed for per-user
+authorization, tenant isolation and audit trails.
 
-## What Wires is
+The catch is that a CLI lives on one machine, with its credentials. Three
+things stop it from being shared across an organization, and wires is
+those three:
 
-> **Run a CLI on another machine from your agent, by service name. The machine is reached by public key, never by network path; the caller is authenticated by your IdP and checked against an admin-signed list of who may call what; and the machine that ran each call keeps a signed record of it that the people you name can read, without access to the caller or the machine.**
+- **Who is calling.** The caller signs in with the organization's IdP
+  (`wires login`). The ID token is bound to the caller's key and sent with
+  every call; the machine that runs the call verifies it itself, with no
+  auth server on the call path. Signing in is the whole of joining: you are
+  in the network if a role in the policy matches you.
+- **How they find it.** One admin-signed policy says which services exist,
+  which hosts run each, and which roles (matched on the verified identity,
+  e.g. `*@acme.com`) may call each. `wires services` lists only what that
+  person may call. Callers name services, never machines or keys.
+- **How they reach it.** Every machine is reached by public key, end-to-end
+  encrypted, directly or through a relay ([iroh](https://iroh.computer)).
+  Both sides dial out: no inbound port, no VPN.
 
-There are four roles, each with a few commands, plus the directory, a mode a host (or a machine of its own) runs:
+Plus one thing a local CLI can't do: **the service can message its caller
+back**. A host sends a message to the caller's key, or holds it until the
+caller's next `wires inbox`; an agent waiting in `wires inbox --wait` wakes
+when it lands, with no endpoint of its own.
 
-- **Admin** (`init`, `invite`, `remove`, `issuer`, `role`, `service`, `directory`, `policy push`): mints each machine's badge (what admits it) and signs one versioned policy that says which identity providers are trusted, which roles exist (matched on IdP identity), which services exist, which hosts run each one, who may call and read each, and which machines are banned. It is published by key to one or more directory machines (often a host doubles as one). Hosts hold all of it and follow its changes from a directory within seconds; each caller gets from a directory only its view, the services its person may use.
-- **Host** (`wires serve host.json`): implements the services assigned to it. One file says how each runs and any stricter local rule (it can narrow the trusted identity providers, never add one); it checks every call against the signed list.
-- **Caller** (`id`, `join`, `login`, `services`, `call`, `mcp`, `gateway`, `inbox`): the agent, or the MCP client it runs in. `wires login` binds the person's IdP sign-in (Google in the demo; any OIDC issuer the admin trusts, and the invite names it) to the agent's key once. `wires services` shows only the services that person may call; the caller never names a machine, and a service can have several hosts.
-- **Reader** (`watch`): a person the admin allows to read a service's records sees every call and every refusal of an admitted caller from the hosts' own logs, in full (arguments, the first 4 KiB of stdin, exit codes), for logging and compliance, holding neither end's credentials. Everyone else sees only the calls made as them: their verified identity, from any of their machines. Agents working for different people can't see each other's work.
+**MCP is a bridge.** `wires mcp` (stdio) and `wires gateway` (a remote MCP
+server for Claude on the web) serve the same services to MCP clients, so a
+team can start from the clients it has. They carry existing workflows over;
+`wires call` is where the savings are, and the bridge should someday be
+unnecessary.
 
-**Two ways in, both first-class.** `wires call` is the CLI path and the efficient one (the measured savings below come from it). MCP is the other, so people can use wires in the clients where they already use remote tool calling: `wires mcp` over stdio, and `wires gateway` as a remote MCP server that Claude.ai connects to (MCP 2026-07-28 plus older clients). Each web user signs in with Google through the gateway, and every call carries that person's own token, so the host still verifies the IdP itself, admits them only through roles that match their identity, and records them as the verified principal of the call. Users keep their clients; the operator stands the gateway up once (an OAuth client, TLS in front, and that client's id trusted in the signed policy).
+## Who does what
 
-## What's been demonstrated (two machines, 2026-09-23)
+- **Admin** (`init`, `role`, `service`, `issuer`, `directory`, `remove`,
+  `restore`, `network`, `policy push`): holds the root key and signs the
+  policy. Every edit is a new version, published by key to the network's
+  directories. `wires network` prints the one string every machine joins
+  with; it is not secret.
+- **Host** (`join`, `serve host.json`, `push`): runs the services the policy
+  assigns it. `host.json` says how each runs (a fixed command; the caller's
+  arguments are appended, with no shell) and can add stricter local rules.
+  It decides every call from its own copy of the policy.
+- **Caller** (`login`, `services`, `call`, `inbox`, `mcp`, `gateway`): the
+  agent, or the MCP client it runs in. It holds only its view: the services
+  its person may call.
+- **Directory** (usually a host doubling as one): holds the newest policy,
+  hands it to hosts, and cuts each caller its view. It never decides a call.
 
-A laptop and a Linux workstation, reached by key through public relays:
+## What's been shown
 
-- The host had **no TCP listener and no opened firewall port**. A key outside the network was refused at its first message, before anything ran.
-- Before signing in, the agent saw no tools, and calling one by name was refused with the reason. After a real Google sign-in, the tool appeared.
-- A Claude Code session in locked mode, whose PATH held `wires` plus the system basics and which was only allowed to run `wires call` and the tool listing, found the tool, queried a remote database and answered correctly. Each query was logged under the person's email and role.
-- `wires remove` cut the agent off at its next call, with no restart and no manual key rotation anywhere.
-
-That run used an earlier design. The current one (services in an admin-signed registry, records kept by each host) passes the same self-checking demo on one machine, plus: a service with two hosts that keeps answering when one is down, a reader who sees every call while the agent sees only its own person's, and a host **pushing** a message back to the agent that called it ("build 41 failed") with no endpoint on the agent's side, read with `wires inbox`. The two-machine run of this version, and its recording, is in progress ([card 08](board/doing/08-demo-two-machine.md)).
+- **Two machines, 2026-09-23, on an earlier design:** a laptop and a Linux
+  workstation reached by key through public relays, the host with no TCP
+  listener and no opened port. After a real Google sign-in, a Claude Code
+  session allowed to run only `wires` found the service, queried a remote
+  database and answered correctly. A removal cut it off at its next call.
+- **The current code, on one machine:** the first run in the README, every
+  step exiting 0 and none repeated; a service with two hosts that keeps
+  answering when one is down; a host pushing "build 41 failed" to the agent
+  that started the build; a removed person refused at their next call (exit
+  77). `.scripts/demo-remote-cli.sh` and `.scripts/demo-push.sh` check all
+  of it on every run.
+- The two-machine run on the current code, and its recording, are next
+  ([card 08](board/doing/08-demo-two-machine.md)).
 
 ## What's been measured
 
-GitHub tasks, 5 tasks × 5 runs each, all answers correct in every setup:
+Runs from 2026-09-23, on an earlier version of wires. GitHub tasks, 5 tasks
+× 5 runs per setup, every answer correct ([bench/REPORT.md](../bench/REPORT.md)):
 
 | How the agent reached GitHub | Median input tokens | Cost, 25 runs |
 |---|---|---|
-| GitHub's MCP server | 21,088 | $1.87 |
-| `wires call gh`, agent limited to `wires` only | 10,713 | $0.39 |
+| GitHub's MCP server (tool search on, the default) | 21,088 | $1.87 |
+| bare `gh` | 6,997 | $0.42 |
+| `wires call gh`, the agent allowed only `wires` | 10,713 | $0.39 |
 
-Most of the saving is **not** tool descriptions (Claude Code's tool search already handles those). It's output size: GitHub's MCP server returned whole API objects (48 KB release notes, 52 KB of comments), while a CLI filters first (`--jq`), so the model sees about 256 bytes. With the agent limited to `wires` alone, there were zero permission refusals. **Caveats:** one model, one MCP server, small n, and stripped-down sessions, so real-session percentages will be smaller while the absolute savings carry over. A leaner MCP server would close part of the gap. Details: [bench/REPORT.md](../bench/REPORT.md).
+The gap is results, not schemas: with tool search on, the schemas cost about
+400 tokens (about 10.2k with it off). The MCP server returned whole API
+objects (a 48 KB release body), the CLI let the model pick fields first.
+Bare `gh` did a little better than `wires call gh`: the saving belongs to the
+CLI, and wires makes the CLI reachable. **Caveats:** one model, one MCP
+server, n = 5, stripped-down sessions; a leaner MCP server would close much
+of the gap; all five tasks read one service, so nothing here measures
+composition.
 
-Waiting on long work (a mock CI build of 60 s or 300 s, 5 runs per setup, all correct):
+Waiting on a mock CI build of 60 s or 300 s, 5 runs per setup
+([bench/push/REPORT.md](../bench/push/REPORT.md)):
 
 | How the agent waited | Turns | Input tokens (median) | Reaction after the build finished |
 |---|---|---|---|
 | Polling a status service, or `wires inbox` on a loop | 9 → 13 | about 28k → 39k | 20–178 s |
-| `wires inbox --wait` (the host pushes to the agent's key) | 4 | 15.4k, flat | about 2 s |
+| `wires inbox --wait` | 4 | 15.4k, flat | about 2 s |
 
-Checking an inbox on a loop costs exactly what polling costs; the saving comes only from waiting on the push. Details: [bench/push/REPORT.md](../bench/push/REPORT.md).
+## Limits
 
-## Why it's built this way
-
-- **Reached by key.** Tailscale-style networks give the agent's machine a route to the host; Wires gives a route to the services a signed list lets the caller call, and nothing else.
-- **Identity is the IdP's own signature**, tied to the agent's key and checked by the host. No Wires-run identity service exists to trust.
-- **One signed list, checked locally.** The roles, the services and the bans are one admin-signed document the hosts hold; each machine's own root-signed badge says it is in. Hosts decide each call from it with no auth server. An agent's machine holds only its view: the services its person may use, each signed by the admin, so it learns no other service, role or ban. Only the admin can bind a service name to a host.
-- **The host writes the log**, signed and hash-linked, so the agent can't forge it, and a reader the admin names needs nothing from either end. Nothing is broadcast: a record's content leaves a host only when a reader allowed to see it asks (anyone else asking gets hash links).
-- **A sandbox that allows only `wires`** gives CLI efficiency with a permission surface as narrow as MCP's. We tested this: a permission rule alone isn't airtight (the agent can still run `cat`, read files, and pass `wires`' own override flags), so `WIRES_LOCKED=1` makes `wires` refuse those flags itself.
-
-## Honest limits
-
-- **Joining an organization is still a hand-issued invite.** Joining by domain ("`wires join acmecorp.com`") is an open question, not yet designed.
-- **Hosts and directories hold the whole signed list** (role matchers, service names, host and banned keys; there is no member list). An agent's machine holds only its view, but a directory sees which person asks for which view. Next: day-passes for headless agents (card 29).
-- **A directory must be up to join, change the policy, spread a ban or list services.** Calls don't need one: each host decides from its own copy.
-- **Callbacks only to the agent and person that made the call**, and an `inbox` tool for MCP clients: designed, parked ([card 31](board/backlog/31-inbox-delivery.md)).
-- **A host can withhold or truncate its own log.** Tampering and gaps are detectable only against a copy a reader holds.
+- **The admin doesn't approve each machine.** Anyone the IdP verifies, and a
+  role admits, is in from any machine; a phished sign-in that binds an
+  attacker's key would be admitted.
+- **The ID token is the only credential.** Google's last about an hour, so
+  callers sign in again each hour. Every service a caller calls receives that
+  token.
+- **No record of calls** beyond one ordinary log line per call in the host's
+  output. A signed call record is a possible future design.
+- **Several hosts per service give failover**, not more capacity.
+- **Hosts and directories hold the whole policy**; a caller holds only its
+  view, but a directory sees who asks for which view.
+- **A directory must be up** to change the policy, remove someone or list
+  services. Calls don't need one.
+- **Only Google has been tested** as the IdP.
 
 The full list: [usage.md § Known trade-offs](usage.md#known-trade-offs).
 
 ## The next step
 
-Show the two-machine demo to someone who builds MCP and note which part lands: **verified identity on every call**, **CLI efficiency without a shell**, **push to agents without an endpoint**, or **a call record the agent can't forge, kept by the machine that ran the call**. That answer decides what gets built next.
+Re-run the two-machine demo on the current code, record it, and show it to
+people who run remote tools for agents today. The kill criteria on the
+[board](board/README.md) decide what follows: if no one wants remote CLIs by
+service name, write it up and stop.
