@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, anyhow, bail};
 use library::NodeId;
 
-use super::keystore::{Keystore, create_private_dir, write_text_mode};
+use super::keystore::{Keystore, create_private_dir, write_private};
 
 /// The labels file in the admin's keystore.
 pub(crate) const LABELS_FILE: &str = "labels.json";
@@ -63,7 +63,7 @@ impl Labels {
     pub(crate) fn save(&self, ks: &Keystore) -> Result<()> {
         create_private_dir(&ks.path(""))?;
         let json = serde_json::to_string_pretty(self).context("encoding the labels")?;
-        write_text_mode(&ks.path(LABELS_FILE), &format!("{json}\n"), None)
+        write_private(&ks.path(LABELS_FILE), &format!("{json}\n"))
     }
 
     /// The node `text` names: `label=<node id>` (binding the label, which

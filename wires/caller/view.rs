@@ -43,7 +43,7 @@ use library::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::admin::keystore::{Keystore, write_text_mode};
+use crate::admin::keystore::{Keystore, write_private};
 use crate::clock::now_unix;
 use crate::directory::wire::{self, ask};
 use crate::host::transport;
@@ -148,11 +148,12 @@ pub(crate) fn write(ks: &Keystore, root: NodeId, held: &HeldView) -> Result<()> 
         .verify(root)
         .context("refusing to store a view that does not verify")?;
     let text = serde_json::to_string(held).context("encoding the view")?;
-    write_text_mode(&ks.path(VIEW_FILE), &format!("{text}\n"), Some(0o600))
+    write_private(&ks.path(VIEW_FILE), &format!("{text}\n"))
 }
 
 /// Record that a host reported head `version` (from a `HelloAck`): the
-/// next `wires services` refreshes first. Best effort; no view, no note.
+/// next `wires services`, `wires call` or `wires inbox` refreshes first.
+/// Best effort; no view, no note.
 pub(crate) fn note_seen(ks: &Keystore, root: NodeId, version: StateVersion) {
     let noted = (|| -> Result<()> {
         let Some(mut held) = read(ks, root)? else {

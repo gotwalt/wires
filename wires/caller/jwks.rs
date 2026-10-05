@@ -7,18 +7,18 @@
 //! caches the key set:
 //!
 //! - **in memory** per [`KeyFetcher`], and
-//! - for the caller's commands only, **on disk** under `$WIRES_HOME/jwks/`,
-//!   so a short-lived `wires call` or `wires services` does not refetch on
-//!   every start. A disk entry is trusted for at most [`MAX_TTL`] from the
-//!   moment it is read.
+//! - for the caller's commands and `wires gateway` only, **on disk** under
+//!   `$WIRES_HOME/jwks/`, so a short-lived `wires call` or `wires services`
+//!   does not refetch on every start. A disk entry is trusted for at most
+//!   [`MAX_TTL`] from the moment it is read.
 //!
-//! **A host never reads the disk cache** (`serve` builds its fetcher with
-//! no `cache_dir`): whatever runs as the host's user — a service child
-//! included — could plant an attacker's key there, and a host trusting it
-//! would accept forged identities. A host only trusts keys
-//! it fetched itself, over HTTPS, in this process. A caller keeps the disk
-//! cache: its keystore is its own, and whoever can write `jwks/` there can
-//! already read its node key and stored ID token.
+//! **A host or directory never reads the disk cache** (`serve` and the
+//! directory build their fetchers with no `cache_dir`): whatever runs as
+//! the host's user — a service child included — could plant an attacker's
+//! key there, and a host trusting it would accept forged identities. A host
+//! only trusts keys it fetched itself, over HTTPS, in this process. A caller
+//! keeps the disk cache: its keystore is its own, and whoever can write
+//! `jwks/` there can already read its node key and stored ID token.
 //!
 //! The cache TTL is the response's `Cache-Control: max-age`, clamped to
 //! [`MIN_TTL`]..=[`MAX_TTL`] ([`DEFAULT_TTL`] when absent). A token whose
@@ -283,12 +283,9 @@ impl KeyFetcher {
         };
         let write = || -> Result<()> {
             if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
+                crate::admin::keystore::create_private_dir(dir)?;
             }
-            let tmp = path.with_extension("tmp");
-            std::fs::write(&tmp, serde_json::to_vec(cached)?)?;
-            std::fs::rename(&tmp, &path)?;
-            Ok(())
+            crate::admin::keystore::write_private(&path, serde_json::to_vec(cached)?)
         };
         if let Err(e) = write() {
             tracing::debug!(path = %path.display(), "jwks cache not written: {e:#}");
@@ -299,7 +296,7 @@ impl KeyFetcher {
 /// Why an identity claim could not be shown as verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum VerifyError {
-    /// The token's issuer is not one this reader trusts.
+    /// The token's issuer is not one this verifier trusts.
     Untrusted(Issuer),
     /// The issuer's keys could not be fetched (network, bad document).
     Unavailable(String),
@@ -327,7 +324,8 @@ impl std::fmt::Display for VerifyError {
         match self {
             VerifyError::Untrusted(iss) => write!(
                 f,
-                "issuer {:?} is not trusted here (add it to host.json identity.issuers)",
+                "issuer {:?} is not trusted here (the signed policy trusts an IdP after `wires \
+                 issuer set`; host.json's identity.issuers can only narrow that)",
                 iss.as_str()
             ),
             VerifyError::Unavailable(e) => write!(f, "issuer keys unavailable: {e}"),

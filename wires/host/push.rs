@@ -18,13 +18,14 @@
 //! # Who may receive
 //!
 //! The host's **signed policy** decides, asked **at send, at delivery and at
-//! fetch** ([`ServicesHost::decide_push`]): neither the recipient's node nor
-//! the person it verified as here may be banned by the current policy, and
-//! it must be in a registry role that `host.json`'s `push.allow` names
-//! (default: nobody). A removed (banned) node or person gets nothing: its
-//! queue is dropped (traced `denied`), and its fetch is refused. A fetch is
-//! admitted like a call, first: its `Hello` carries the fetcher's ID token,
-//! which must verify, and the bans are checked.
+//! fetch** ([`ServicesHost::decide_push`]): the current policy must still
+//! admit the recipient ([`library::check_admitted`]: neither its node nor the
+//! person it verified as here banned, a verified email, a role that matches),
+//! and it must be in a role that `host.json`'s `push.allow` names (default:
+//! nobody). A removed (banned) node or person gets nothing: its queue is
+//! dropped (traced `denied`), and its fetch is refused. A fetch is admitted
+//! like a call, first: its `Hello` carries the fetcher's ID token, which must
+//! verify, and [`library::check_admitted`] must pass.
 //!
 //! **The identity rule.** Every role needs the recipient's verified
 //! principal (there is no role that admits without one), and a host only knows
@@ -314,7 +315,7 @@ impl std::fmt::Debug for PushHost {
 
 impl PushHost {
     /// A push service for `host`: recipients are nodes its signed policy
-    /// doesn't ban, in a registry role `push.allow` names.
+    /// still admits, in a role `push.allow` names.
     pub(crate) fn from_state(host: Arc<ServicesHost>) -> Self {
         Self {
             host,
@@ -366,17 +367,7 @@ impl PushHost {
     /// delivers).
     fn save(&self, q: &Queue) {
         let Some(path) = &self.path else { return };
-        let write = || -> Result<()> {
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, serde_json::to_vec(q)?)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-            }
-            std::fs::rename(&tmp, path)?;
-            Ok(())
-        };
+        let write = || crate::admin::keystore::write_private(path, serde_json::to_vec(q)?);
         if let Err(e) = write() {
             tracing::warn!(path = %path.display(), "saving the push queue: {e:#}");
         }
@@ -662,7 +653,7 @@ impl PushHost {
         };
         // Admission first, as for a call: the fetcher's ID token (from
         // `wires login`) must verify, which is also how this host learns who
-        // it is, and so its roles; then the bans.
+        // it is, and so its roles; then `check_admitted` (bans, email, a role).
         let admitted = match &id_token {
             Some(token) => self.host.admit_caller(&state, caller, token, now).await,
             None => Err(crate::host::gate::NotAdmitted {
@@ -836,8 +827,8 @@ impl iroh::protocol::ProtocolHandler for PushFetch {
 #[derive(Args, Clone, Debug)]
 pub(crate) struct PushArgs {
     /// A node id (a service's `$WIRES_CALLER_NODE`), or a role in the policy.
-    // A role: every member whose verified identity this host holds and the
-    // role admits.
+    // A role: every node whose verified identity this host holds, still
+    // admitted, and in the role.
     #[arg(long)]
     pub(crate) to: String,
     /// One line, shown in the recipient's inbox.
@@ -1198,10 +1189,14 @@ mod tests {
 
     /// A fetch with no ID token (55), a forged one (56–59), or from a
     /// banned key with a genuine token bound to it (50–54) hears the fixed
-    /// sentence, and only a token that verified leaves an identity behind.
+    /// sentence, and leaves no identity behind. The token's person is in a
+    /// role, so only the ban keeps 50–54 out.
     #[tokio::test]
     async fn a_fetch_without_a_valid_sign_in_or_from_a_banned_node_is_refused() {
-        let push = push_host();
+        let push = push_host_with(|p| {
+            let (staff, matchers) = crate::testutil::staff_role();
+            p.roles.insert(staff, matchers);
+        });
         for seed in 50..60u8 {
             let who = node(seed);
             let id_token = match seed {
@@ -1222,7 +1217,7 @@ mod tests {
         );
     }
 
-    /// Card 35: a push to a banned node is refused at send (traced
+    /// A push to a banned node is refused at send (traced
     /// `denied`, naming the ban), and nothing is queued for it.
     #[tokio::test]
     async fn a_push_to_a_banned_node_is_denied() {
@@ -1283,7 +1278,7 @@ mod tests {
         drop(to_host);
     }
 
-    /// A member holds at most `MAX_FETCHES_PER_NODE` long polls; another
+    /// A node holds at most `MAX_FETCHES_PER_NODE` long polls; another
     /// node is unaffected, and a finished one frees its slot.
     #[tokio::test]
     async fn long_polls_per_node_are_capped() {

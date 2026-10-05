@@ -423,7 +423,7 @@ async fn token_request(
     Ok(reply)
 }
 
-/// Verify the reply's ID token as a claim for `node`, like any reader would.
+/// Verify the reply's ID token as a claim for `node`, as any verifier would.
 async fn finish(
     fetcher: &KeyFetcher,
     client: &OidcClient,
@@ -683,7 +683,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// Write `contents` to `path` with mode `0600`, atomically (temp + rename).
 pub(crate) fn save_secret(path: &Path, contents: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::admin::keystore::create_private_dir(dir)?;
     }
     let tmp = path.with_extension("tmp");
     let _ = std::fs::remove_file(&tmp);

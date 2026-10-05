@@ -7,8 +7,9 @@
 //! - **fetched** by `wires inbox`: a bounded catch-up from every host of the
 //!   services in this node's view (card 37), after which the host forgets
 //!   what was acknowledged. The fetch presents this node's ID token (`wires
-//!   login`), which is how a host learns who it is for pushes addressed to a
-//!   role;
+//!   login`): the host admits a fetch only as it admits a call (a role
+//!   must match the person), and learns from it who the pushes addressed
+//!   to a role are for;
 //! - **pushed** while `wires inbox --wait` runs: it serves the inbox ALPN
 //!   ([`INBOX_ALPN`]) and accepts deliveries ([`InboxReceiver`]) only from
 //!   the hosts its view names, besides long-polling each host. It follows
@@ -185,9 +186,8 @@ impl Mailbox {
         let dir = home.join(INBOX_DIR);
         for sub in ["", "new", "read", "notes"] {
             let d = dir.join(sub);
-            std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
+            keystore::create_private_dir(&d)?;
         }
-        private(&dir);
         Ok(Self { dir })
     }
 
@@ -215,7 +215,7 @@ impl Mailbox {
                 continue;
             }
             let path = Self::file(&self.new_dir(), &m.id);
-            write_atomic(&path, &serde_json::to_vec(m)?)?;
+            keystore::write_private(&path, serde_json::to_vec(m)?)?;
             out.fresh += 1;
         }
         if out.fresh > 0 {
@@ -242,7 +242,7 @@ impl Mailbox {
                     now_ms(),
                     PushId::generate().hex()
                 ));
-                write_atomic(&path, note.as_bytes())?;
+                keystore::write_private(&path, note)?;
             }
         }
         Ok(out)
@@ -337,25 +337,6 @@ pub(crate) fn evictions(unread: &[(i64, PushId)], cap: usize) -> Vec<PushId> {
         .take(unread.len().saturating_sub(cap))
         .map(|(_, id)| id)
         .collect()
-}
-
-/// Write `bytes` to `path` via a temp file and a rename.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
-}
-
-/// Best-effort `0700`.
-fn private(dir: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    }
-    #[cfg(not(unix))]
-    let _ = dir;
 }
 
 /// Keep only messages a peer may hand this node: from `peer` (the key the
@@ -780,7 +761,7 @@ struct Fetcher {
     ks: Arc<Keystore>,
     /// This node.
     me: NodeId,
-    /// The fabric root the view verifies under.
+    /// The network root the view verifies under.
     fabric: NodeId,
     /// The relay to dial through, if any.
     relay: Option<String>,
@@ -937,8 +918,8 @@ mod tests {
     async fn a_refused_deliverer_hears_only_not_admitted() {
         use library::{RoleName, Service, ServiceName};
         let root = NodeIdentity::from_seed([1; 32]);
-        let (me, member, stranger) = (node(2), NodeIdentity::from_seed([3; 32]), node(4));
-        let banned = node(6);
+        let (me, signed_in, stranger) = (node(2), NodeIdentity::from_seed([3; 32]), node(4));
+        let unseen_host = node(6);
         let home = crate::testutil::temp_dir();
         let ks = Arc::new(Keystore::at(&home));
         let mut s = library::Policy::new(root.node_id());
@@ -959,7 +940,7 @@ mod tests {
             Service {
                 description: String::new(),
                 allow: vec![nobody],
-                hosts: vec![banned],
+                hosts: vec![unseen_host],
             },
         );
         let signed = crate::testutil::signed_policy(&root, s);
@@ -975,12 +956,12 @@ mod tests {
             keystore: ks,
             mailbox: Mailbox::open(&home).unwrap(),
         };
-        let token = crate::testutil::test_id_token(&member.node_id());
+        let token = crate::testutil::test_id_token(&signed_in.node_id());
         for (peer, id_token) in [
-            (member.node_id(), None),
-            (member.node_id(), Some(token)),
+            (signed_in.node_id(), None),
+            (signed_in.node_id(), Some(token)),
             (stranger, None),
-            (banned, None),
+            (unseen_host, None),
         ] {
             let (mut dialer, host_side) = tokio::io::duplex(64 * 1024);
             let (recv, send) = tokio::io::split(host_side);
@@ -1053,6 +1034,9 @@ mod tests {
             .collect();
         let s = mb.store(&batch).unwrap();
         assert_eq!(s.evicted, 3);
+        // The mailbox, its folders, messages and note are private (§8).
+        #[cfg(unix)]
+        crate::testutil::assert_private(mb.dir.parent().unwrap());
         let notes = mb.take_notes();
         assert_eq!(notes.len(), 1);
         assert!(

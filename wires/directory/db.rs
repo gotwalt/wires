@@ -70,6 +70,8 @@ impl std::fmt::Debug for DirectoryDb {
 impl DirectoryDb {
     /// Open (or create) the store at `path`, with every table present.
     pub(crate) fn open(path: &Path) -> Result<DirectoryDb> {
+        // Made 0600 first: redb would create it with the umask's mode.
+        drop(crate::admin::keystore::open_private(path)?);
         let db = Database::create(path).with_context(|| format!("opening {}", path.display()))?;
         let txn = db.begin_write()?;
         txn.open_table(HEADS)?;

@@ -100,12 +100,12 @@ impl Keystore {
         }
     }
 
-    /// Persist `network` to `network.json` as its token (mode `0600`).
+    /// Persist `network` to `network.json` as its string (mode `0600`).
     /// Returns the written path.
     pub fn save_network(&self, network: &Network) -> Result<PathBuf> {
         create_private_dir(&self.dir)?;
         let path = self.path(NETWORK_FILE);
-        write_text_mode(&path, &format!("{}\n", network.encode()?), None)?;
+        write_private(&path, &format!("{}\n", network.encode()?))?;
         Ok(path)
     }
 
@@ -217,7 +217,7 @@ fn read_to_string_opt(path: &Path) -> Result<Option<String>> {
 }
 
 /// Create `dir` (and its parents) if missing, the new directories mode
-/// `0700`: the keystore holds seeds and the state.
+/// `0700`: the keystore holds seeds and the signed policy.
 pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -274,9 +274,9 @@ fn write_secret(path: &Path, contents: &str) -> Result<()> {
 /// previous contents or the new ones and never a splice of the two. The
 /// temporary file is created with `O_EXCL` (never following a planted file or
 /// symlink) and mode `0600` **from the start**, so no one else can open it
-/// while it is written; it is widened to `mode` only after the write. With
-/// no `mode` it stays `0600`.
-pub(crate) fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) -> Result<()> {
+/// while it is written, and the file keeps that mode (protocol.md §8: every
+/// keystore file is `0600`).
+pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
     use std::io::Write;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
@@ -301,12 +301,9 @@ pub(crate) fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) ->
         let mut f = opts
             .open(&tmp)
             .with_context(|| format!("creating {}", tmp.display()))?;
-        f.write_all(contents.as_bytes())
+        f.write_all(contents.as_ref())
             .with_context(|| format!("writing {}", tmp.display()))?;
         drop(f);
-        if let Some(mode) = mode {
-            set_mode(&tmp, mode);
-        }
         std::fs::rename(&tmp, path)
             .with_context(|| format!("renaming {} onto {}", tmp.display(), path.display()))
     })();
@@ -316,17 +313,19 @@ pub(crate) fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) ->
     result
 }
 
-/// Set a file's unix mode (best-effort; no-op on non-unix).
-fn set_mode(path: &Path, mode: u32) {
+/// Open `path` for writing, creating it mode `0600` if missing and never
+/// truncating it: a lock file, or a store that manages its own contents
+/// (`policy.json.lock`, `directory.redb`).
+pub(crate) fn open_private(path: &Path) -> Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).ok();
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-    }
+    opts.open(path)
+        .with_context(|| format!("opening {}", path.display()))
 }
 
 #[cfg(test)]
@@ -395,23 +394,23 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
-    /// Card 28 §10: a file written through `write_text_mode` is never
-    /// world-readable unless asked (its temporary file is created `0600`),
-    /// and an explicit mode still applies.
+    /// A file written through `write_private` (its temporary file is
+    /// created `0600`) or opened through `open_private` is `0600`, whatever
+    /// the umask.
     #[cfg(unix)]
     #[test]
-    fn text_files_are_private_unless_widened() {
+    fn keystore_files_are_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let private = dir.join("last-good.json");
-        write_text_mode(&private, "1\n", None).unwrap();
+        write_private(&private, "1\n").unwrap();
         assert_eq!(mode(&private), 0o600);
-        let public = dir.join("widened.txt");
-        write_text_mode(&public, "m\n", Some(0o644)).unwrap();
-        assert_eq!(mode(&public), 0o644);
+        let lock = dir.join("policy.json.lock");
+        open_private(&lock).unwrap();
+        assert_eq!(mode(&lock), 0o600);
         // Overwriting keeps it atomic and leaves no temporary behind.
-        write_text_mode(&private, "2\n", None).unwrap();
+        write_private(&private, "2\n").unwrap();
         assert_eq!(std::fs::read_to_string(&private).unwrap(), "2\n");
         let leftovers = std::fs::read_dir(&dir)
             .unwrap()

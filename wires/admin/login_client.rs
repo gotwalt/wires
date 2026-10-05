@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use library::{Issuer, LoginSettings, Policy, PublicClientSecret};
 use serde::{Deserialize, Serialize};
 
-use super::keystore::{Keystore, write_text_mode};
+use super::keystore::{Keystore, write_private};
 
 /// The file under the admin's `$WIRES_HOME`.
 pub(crate) const LOGIN_CLIENT_FILE: &str = "login-client.json";
@@ -56,11 +56,7 @@ impl LoginClient {
     /// Save to `ks` (`0600`).
     pub(crate) fn save(&self, ks: &Keystore) -> Result<()> {
         let text = serde_json::to_string_pretty(self)?;
-        write_text_mode(
-            &ks.path(LOGIN_CLIENT_FILE),
-            &format!("{text}\n"),
-            Some(0o600),
-        )
+        write_private(&ks.path(LOGIN_CLIENT_FILE), format!("{text}\n"))
     }
 
     /// Record `issuer`'s public secret (if given) and, with `login`, make
