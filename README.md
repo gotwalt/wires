@@ -297,7 +297,8 @@ output, and nothing else records calls.
 - **Removing a host takes up to 15 minutes.** A host the admin took off a
   service can still receive the ID token and arguments of a caller whose view
   is older than the edit, until the last word a directory signed for the old
-  policy lapses. In a one-machine network (one workbench is host and
+  policy lapses; a directory that missed the edit keeps vouching for the old
+  policy until `wires policy push` reaches it. In a one-machine network (one workbench is host and
   directory) the machine's own word counts, so removing it holds only at the
   policy's expiry; a second directory makes removal hold for callers that
   know of it.

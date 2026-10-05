@@ -40,7 +40,10 @@ authenticated by key.
 One machine can do several jobs: in a small network one always-on host is also the directory
 (`wires serve` runs the directory too when the policy lists its node). There, callers take that
 machine's own `Fresh`, since there is no other directory to ask, so removing that machine holds
-only at the policy's expiry ([protocol.md §9](protocol.md#9-known-limits)). The loopback demo makes
+only at the policy's expiry ([protocol.md §9](protocol.md#9-known-limits)). To add a second
+directory, start it and run `wires policy push` right after `wires directory add`: until it
+vouches, the first machine can vouch only for itself under a policy that lists two, and calls
+fail closed within `fresh_secs`. The loopback demo makes
 both of its hosts directories, so a removal reaches both at once, and each vouches for the other.
 
 **Outside wires** a network also relies on its IdP (for `wires login`, and for the keys hosts and
@@ -206,7 +209,9 @@ follows, and a caller asks a directory for its view: each receives only what it 
   before still missed it, the edit exits 1, and that directory, and the hosts following it, hold
   the policy before it until `wires policy push` reaches it (a directory that is also a host may
   take it sooner, from the directory its host follows; a host whose directory is behind it moves
-  to another). Directories send every host that follows them the whole new policy and its
+  to another). It also keeps vouching for the old policy, so a host the edit removed can still
+  show its word and be called by callers on the old policy: after a missed publish, run `wires
+  policy push` once the directory is back. Directories send every host that follows them the whole new policy and its
   `Fresh`. `wires mcp` and `wires inbox --wait` ask for their view every 60 s, and the gateway at
   a web user's first request after 60 s, so a grant or revocation reaches them within a minute.
   One-shot callers learn at their next call (from the host's proof or `HelloAck`), or when their
@@ -217,8 +222,10 @@ follows, and a caller asks a directory for its view: each receives only what it 
   from the directories. Neither expires;
   `wires restore` lifts one. Every host following a directory that took the edit has the new
   policy as soon as that directory does, and refuses the next call. Callers tell a removed host
-  nothing once the last `Fresh` for the old head lapses (`fresh_secs`; the limits are in
-  [protocol.md §9](protocol.md#9-known-limits)). Removing the last directory is refused.
+  nothing once the last `Fresh` for the old head lapses (`fresh_secs`), provided every directory
+  took the edit: one that missed it keeps vouching for the old head until `wires policy push`
+  reaches it (the limits are in [protocol.md §9](protocol.md#9-known-limits)). Removing the last
+  directory is refused.
 - **Call.** The caller picks one of the service's hosts from its view at random (one that failed
   to answer it in the last minute goes last; the next is tried only when a dial fails) and dials
   it. The host speaks first: its proof, its root-signed head and the current `Fresh`es it holds.

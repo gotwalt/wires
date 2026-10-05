@@ -171,8 +171,11 @@ Where to run it:
   directory. There, callers take that machine's own timestamp, since no
   other directory exists, so removing that machine holds only at the
   policy's expiry (90 days by default); a second directory makes removal
-  hold within `fresh_secs`. A host listed while it runs starts the directory
-  at its next restart.
+  hold within `fresh_secs`. When you add it, start it and run `wires policy
+  push` promptly: until it vouches, the first machine can vouch only for
+  itself under a policy that lists two directories, and calls fail closed
+  within 15 minutes. A host listed while it runs starts the directory at its
+  next restart.
 - **Alone**, with `wires directory serve` on a node that hosts nothing (no
   `host.json`), for example on the gateway machine, with its own keystore
   (the gateway never uses its own node as its directory;
@@ -205,7 +208,9 @@ can't be dialed for 15 s, and an edit that a directory which has taken a
 publish before still misses exits 1, whatever the others did. That
 directory, and the hosts following it, hold the old policy until `wires
 policy push` reaches it (a host whose directory is behind it moves to
-another). If a host outage mustn't stop calls, don't let your only two
+another), and it keeps vouching for the old policy, so a host that edit
+removed can still be called by callers on the old policy. After a missed
+publish, run `wires policy push` once the directory is back. If a host outage mustn't stop calls, don't let your only two
 directories be your hosts: with one down, the other can show callers only
 its own timestamp, and calls to it stop within `fresh_secs`. Run a third
 directory, or one with `wires directory serve` on a node that hosts nothing.
@@ -275,7 +280,10 @@ file names, since it can't be told to use your relay.
   from the directories (removing the last directory is refused). Callers
   whose view predates the removal tell it nothing once the last timestamp a
   directory signed for the old policy lapses (`fresh_secs`, 15 minutes by
-  default); in a one-machine network, only at the policy's expiry (see
+  default), if every directory took the edit: one that missed it keeps
+  vouching for the old policy, and the removed host can still be called by
+  callers on it, until `wires policy push` reaches that directory (the edit
+  exits 1 to say so). In a one-machine network, only at the policy's expiry (see
   [usage.md § Known trade-offs](usage.md#known-trade-offs)).
 - **Undo:** `wires restore <email|label>`. Bans don't expire otherwise. A
   restored node is not put back into services or directories: add it again.

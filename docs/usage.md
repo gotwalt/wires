@@ -319,10 +319,14 @@ alice@example.com` lifts the ban (policy version 8), and her next call
 runs. `wires remove spare` would ban the node instead and drop it from every
 service's hosts and from the directories; callers would tell it nothing once
 the last word the workbench signed for the old policy lapsed (15 minutes at
-most). That takes a second directory: in a one-machine network, where one
+most), provided every directory took the edit. That takes a second directory: in a one-machine network, where one
 workbench is both host and directory, callers take that machine's own word,
 so removing it holds only at the policy's expiry
-([Known trade-offs](#known-trade-offs)). Two directories that are also the
+([Known trade-offs](#known-trade-offs)). To grow one into two, start the new
+directory and run `wires policy push` right after `wires directory add`:
+until the new one vouches, the first machine can vouch only for itself under
+a policy that lists two directories, and calls fail closed within 15
+minutes. Two directories that are also the
 only hosts, as here, have a cost too: with one down, calls to the other stop
 within 15 minutes, which a third directory avoids.
 
@@ -627,13 +631,20 @@ What wires does not do, or does with a cost, as built:
   directory signs only for the newest policy, so once the edit reaches the
   directories a removed host has nothing to show within that window. Until
   then, a caller holding a word for the old policy can still send it the ID
-  token and arguments.
+  token and arguments. The edit must reach every directory: one that missed
+  it keeps vouching for the old policy, so a removed host can show its word,
+  and callers still on the old policy send it their token until `wires
+  policy push` reaches that directory.
 - **A one-machine network trusts its machine's own word.** When the
   policy lists one directory and it is the host being dialed (the first run:
   one workbench is both), there is no other directory to ask, so removing
   that machine holds only at the policy's expiry (90 days by default). Run a
   second directory (`wires directory add`, then give callers the new
-  `wires network` string) to make removal hold within `fresh_secs`. A
+  `wires network` string) to make removal hold within `fresh_secs`. Start
+  the new directory and run `wires policy push` promptly after `wires
+  directory add`: until it vouches, the first machine can vouch only for
+  itself under a policy that lists two directories, and calls fail closed
+  within 15 minutes. A
   directory machine the admin removed can still sign words for older
   policies that list it, so it can vouch for another removed host to a
   caller whose view is that old ([protocol.md §9](protocol.md#9-known-limits)).
@@ -657,8 +668,10 @@ What wires does not do, or does with a cost, as built:
   directories only, retrying for about 15 seconds. An edit that misses a
   directory that has taken a publish before exits 1, even when another
   directory took it: directories don't replicate, so hosts following the
-  one that missed it decide under the old policy until `wires policy push`
-  re-publishes it (a directory that is also a host may catch up sooner,
+  one that missed it decide under the old policy, and it keeps vouching for
+  that policy (so a removed host can still be called by callers on the old
+  policy), until `wires policy push` re-publishes it. After a missed
+  publish, run `wires policy push` once the directory is back (a directory that is also a host may catch up sooner,
   from the directory its host follows; until any directory has first taken
   a publish, reaching none is a note). Hosts follow a directory and get each
   edit, as the whole policy, as soon as that directory takes it. `wires
