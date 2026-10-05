@@ -786,7 +786,7 @@ pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
             Ok(held) => eprintln!(
                 "wires login: {} service(s) you may call (policy version {}); see `wires \
                  services`",
-                held.callable().count(),
+                held.view.entries.len(),
                 held.version().0
             ),
             Err(e) => eprintln!(

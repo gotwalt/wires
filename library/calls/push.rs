@@ -124,8 +124,8 @@ impl PushId {
 }
 
 /// A push's one-line subject (`build-41`): 1–[`MAX_SUBJECT`] bytes, no
-/// control characters, not only whitespace. It is what the host's call log
-/// records by default, so it must render on one line.
+/// control characters, not only whitespace. `wires inbox` prints it as one
+/// line, so it must render on one.
 ///
 /// ```
 /// use library::Subject;
@@ -230,9 +230,9 @@ pub struct PushMessage {
     pub from: NodeId,
     /// The recipient. A receiver refuses a message addressed to anyone else.
     pub to: NodeId,
-    /// One line, recorded in the host's call log.
+    /// One line.
     pub subject: Subject,
-    /// The text; recorded in the call log only when the host opts in.
+    /// The text.
     pub body: PushBody,
     /// The host's clock when it accepted the push (unix ms).
     pub at_ms: i64,
@@ -337,6 +337,44 @@ impl InboxFrame {
                 Err(Error::InvalidPush("an ack frame carries more than 32 ids"))
             }
             _ => Ok(()),
+        }
+    }
+}
+
+/// What happened to a push for one recipient: what `wires push` reports and
+/// what the host traces at each milestone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PushOutcome {
+    /// Accepted and held for the recipient (its receiver didn't answer).
+    Queued,
+    /// Handed to the recipient's resident receiver, which acknowledged it.
+    Delivered,
+    /// The recipient fetched it (`wires inbox`) and acknowledged it.
+    Fetched,
+    /// Its time-to-live ran out before the recipient took it.
+    Expired,
+    /// Pushed out of a full queue by a newer message.
+    Dropped,
+    /// Refused: the current signed policy bans the recipient, or it holds no
+    /// role in `push.allow` (at send, delivery or fetch time).
+    Denied,
+}
+
+impl PushOutcome {
+    /// The word `wires push` prints (`queued`, `delivered`, …).
+    ///
+    /// ```
+    /// assert_eq!(library::PushOutcome::Fetched.as_str(), "fetched");
+    /// ```
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Delivered => "delivered",
+            Self::Fetched => "fetched",
+            Self::Expired => "expired",
+            Self::Dropped => "dropped",
+            Self::Denied => "denied",
         }
     }
 }

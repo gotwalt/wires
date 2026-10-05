@@ -39,7 +39,6 @@
 //!     description: "uptime".into(),
 //!     allow: vec![staff],
 //!     hosts: vec![host],
-//!     readers: vec![],
 //! });
 //! let signed = policy.sign(&root).unwrap();
 //! signed.verify(root.node_id()).unwrap();
@@ -59,7 +58,7 @@ use crate::idp::{Issuer, Principal};
 use crate::item::{Ban, FreshnessMode, IssuerConfig, Item, Settings};
 use crate::registry::{Service, ServiceName};
 use crate::role::{Matcher, RoleName};
-use crate::view::{View, ViewEntry};
+use crate::view::View;
 
 /// The policy as the admin edits it: head fields plus every item, by kind.
 /// See the module docs.
@@ -125,7 +124,7 @@ impl Policy {
     /// - no directory is listed twice;
     /// - every role has matchers, and every matcher names a trusted issuer
     ///   (one with an `issuer` item);
-    /// - every service's `allow` and `readers` name a defined role, and it
+    /// - every service's `allow` names a defined role, and it
     ///   lists each host once, none of them banned;
     /// - every issuer is non-blank and accepts at least one non-blank
     ///   audience;
@@ -167,12 +166,7 @@ impl Policy {
             }
         }
         for (name, svc) in &self.services {
-            if let Some(role) = svc
-                .allow
-                .iter()
-                .chain(&svc.readers)
-                .find(|r| !self.roles.contains_key(*r))
-            {
+            if let Some(role) = svc.allow.iter().find(|r| !self.roles.contains_key(*r)) {
                 return bad(format!("service {name} names undefined role {role}"));
             }
             let mut seen = BTreeSet::new();
@@ -303,7 +297,7 @@ impl Policy {
     /// p.not_after = i64::MAX;
     /// for name in ["a", "b"] {
     ///     p.services.insert(ServiceName::new(name).unwrap(), Service {
-    ///         description: String::new(), allow: vec![], hosts: vec![], readers: vec![],
+    ///         description: String::new(), allow: vec![], hosts: vec![],
     ///     });
     /// }
     /// let v1 = p.sign(&root).unwrap();
@@ -384,7 +378,7 @@ impl Policy {
     /// let host = NodeIdentity::from_seed([2u8; 32]).node_id();
     /// let status = ServiceName::new("status").unwrap();
     /// p.services.insert(status.clone(), Service {
-    ///     description: String::new(), allow: vec![], hosts: vec![host], readers: vec![],
+    ///     description: String::new(), allow: vec![], hosts: vec![host],
     /// });
     /// assert!(p.assigns(&status, host) && p.is_host(host));
     /// p.ban(host, i64::MAX);
@@ -490,8 +484,8 @@ impl SignedPolicy {
     }
 
     /// The view of a caller presenting `principal`: the head and each
-    /// service entry whose `allow` (marked `call`) or `readers` (marked
-    /// `read`) admits it, each with its own root signature. No role, ban,
+    /// service entry whose `allow` admits it, each with its own root
+    /// signature. No role, ban,
     /// issuer or settings, and no other service; with no principal, no
     /// entries (no role admits). With a `query`, only the entries whose name
     /// or description contain it (ignoring ASCII case).
@@ -514,7 +508,7 @@ impl SignedPolicy {
     ///     ..Matcher::new("https://idp")
     /// }]);
     /// p.services.insert(ServiceName::new("payroll").unwrap(), Service {
-    ///     description: String::new(), allow: vec![alice_only], hosts: vec![], readers: vec![],
+    ///     description: String::new(), allow: vec![alice_only], hosts: vec![],
     /// });
     /// let signed = p.sign(&root).unwrap();
     /// let mut who = Principal {
@@ -523,9 +517,9 @@ impl SignedPolicy {
     /// };
     /// let view = signed.view_for(Some(&who), None);
     /// view.verify(root.node_id()).unwrap();
-    /// assert!(view.entries[0].call);
+    /// assert_eq!(view.entries[0].name.as_str(), "payroll");
     /// // Each entry verifies on its own, too.
-    /// view.entries[0].entry.verify(root.node_id()).unwrap();
+    /// view.entries[0].verify(root.node_id()).unwrap();
     /// // Bob doesn't learn the service exists; nor does a caller with no identity.
     /// who.email = Some("bob@example.com".into());
     /// assert!(signed.view_for(Some(&who), None).entries.is_empty());
@@ -553,14 +547,8 @@ impl SignedPolicy {
                     .as_deref()
                     .is_none_or(|q| service_matches(&e.name, &e.service, q))
             })
-            .filter_map(|e| {
-                let (call, read) = (admitted(&e.service.allow), admitted(&e.service.readers));
-                (call || read).then(|| ViewEntry {
-                    entry: e.clone(),
-                    call,
-                    read,
-                })
-            })
+            .filter(|e| admitted(&e.service.allow))
+            .cloned()
             .collect();
         View {
             head: self.head.clone(),
@@ -649,12 +637,11 @@ pub(crate) mod fixtures {
         }
     }
 
-    pub(crate) fn service(allow: &[&str], readers: &[&str], hosts: &[u8]) -> Service {
+    pub(crate) fn service(allow: &[&str], hosts: &[u8]) -> Service {
         Service {
             description: String::new(),
             allow: allow.iter().map(|r| role(r)).collect(),
             hosts: hosts.iter().map(|h| node(*h)).collect(),
-            readers: readers.iter().map(|r| role(r)).collect(),
         }
     }
 
@@ -667,12 +654,12 @@ pub(crate) mod fixtures {
 
     /// Version 3, one directory (30), hosts 10 and 11, one ban (20):
     ///
-    /// | service | allow | readers | hosts |
-    /// |---|---|---|---|
-    /// | `orders-db` | analyst (alice) | auditor (carol) | 10 |
-    /// | `status` | staff (anyone at ISS) | — | 10, 11 |
-    /// | `deploy` | oncall (group sre) | — | 11 |
-    /// | `locked` | — | auditor | 11 |
+    /// | service | allow | hosts |
+    /// |---|---|---|
+    /// | `orders-db` | analyst (alice) | 10 |
+    /// | `status` | staff (anyone at ISS) | 10, 11 |
+    /// | `deploy` | oncall (group sre) | 11 |
+    /// | `locked` | auditor (carol) | 11 |
     pub(crate) fn sample() -> Policy {
         let mut p = Policy::new(root().node_id());
         p.version = StateVersion(3);
@@ -698,16 +685,14 @@ pub(crate) mod fixtures {
                 ..Matcher::new(ISS)
             }],
         );
-        p.services.insert(
-            name("orders-db"),
-            service(&["analyst"], &["auditor"], &[10]),
-        );
         p.services
-            .insert(name("status"), service(&["staff"], &[], &[10, 11]));
+            .insert(name("orders-db"), service(&["analyst"], &[10]));
         p.services
-            .insert(name("deploy"), service(&["oncall"], &[], &[11]));
+            .insert(name("status"), service(&["staff"], &[10, 11]));
         p.services
-            .insert(name("locked"), service(&[], &["auditor"], &[11]));
+            .insert(name("deploy"), service(&["oncall"], &[11]));
+        p.services
+            .insert(name("locked"), service(&["auditor"], &[11]));
         p.bans.insert(node(20), Ban { until: 500 });
         p
     }
@@ -725,7 +710,7 @@ pub(crate) mod fixtures {
         ];
         let roles = proptest::collection::vec(proptest::collection::vec(matcher, 1..3), 5);
         let subset = |n: usize| proptest::collection::btree_set(0..n, 0..=n);
-        let services = proptest::collection::vec((subset(5), subset(5), subset(4)), 0..8);
+        let services = proptest::collection::vec((subset(5), subset(4)), 0..8);
         let bans = proptest::collection::btree_map(40u8..60, any::<i64>(), 0..5);
         (roles, services, bans).prop_map(|(roles, services, bans)| {
             let mut p = sample();
@@ -735,17 +720,13 @@ pub(crate) mod fixtures {
             for (i, matchers) in roles.into_iter().enumerate() {
                 p.roles.insert(role(&format!("r{i}")), matchers);
             }
-            for (i, (allow, readers, hosts)) in services.into_iter().enumerate() {
+            for (i, (allow, hosts)) in services.into_iter().enumerate() {
                 p.services.insert(
                     name(&format!("s{i}")),
                     Service {
                         description: format!("service {i}"),
                         allow: allow.into_iter().map(|r| role(&format!("r{r}"))).collect(),
                         hosts: hosts.into_iter().map(|h| node(10 + h as u8)).collect(),
-                        readers: readers
-                            .into_iter()
-                            .map(|r| role(&format!("r{r}")))
-                            .collect(),
                     },
                 );
             }
@@ -888,10 +869,6 @@ mod tests {
 
         let mut p = sample();
         p.services.get_mut(&name("status")).unwrap().allow = vec![role("ghost")];
-        assert_eq!(broken_rule(&p), "service status names undefined role ghost");
-
-        let mut p = sample();
-        p.services.get_mut(&name("status")).unwrap().readers = vec![role("ghost")];
         assert_eq!(broken_rule(&p), "service status names undefined role ghost");
 
         let mut p = sample();
@@ -1056,8 +1033,7 @@ mod tests {
         p.version = StateVersion(4);
         p.services.get_mut(&name("status")).unwrap().description = "SLOs".into();
         p.services.remove(&name("deploy"));
-        p.services
-            .insert(name("new"), service(&["staff"], &[], &[10]));
+        p.services.insert(name("new"), service(&["staff"], &[10]));
         p.bans.insert(node(21), Ban { until: 900 });
         let v4 = p.sign_after(&root(), &v3).unwrap();
         v4.verify(root().node_id()).unwrap();
@@ -1152,42 +1128,26 @@ mod tests {
     #[test]
     fn a_view_holds_only_what_its_caller_may_use() {
         let signed = sample().sign(&root()).unwrap();
-        let marks = |p: Option<&Principal>| -> Vec<(String, bool, bool)> {
+        let names = |p: Option<&Principal>| -> Vec<String> {
             let view = signed.view_for(p, None);
             view.verify(root().node_id()).unwrap();
-            view.entries
-                .iter()
-                .map(|e| (e.entry.name.to_string(), e.call, e.read))
-                .collect()
+            view.entries.iter().map(|e| e.name.to_string()).collect()
         };
         assert_eq!(
-            marks(Some(&who("alice@example.com"))),
-            vec![
-                ("orders-db".into(), true, false),
-                ("status".into(), true, false)
-            ]
+            names(Some(&who("alice@example.com"))),
+            vec!["orders-db", "status"]
         );
         assert_eq!(
-            marks(Some(&who("carol@example.com"))),
-            vec![
-                ("locked".into(), false, true),
-                ("orders-db".into(), false, true),
-                ("status".into(), true, false),
-            ]
+            names(Some(&who("carol@example.com"))),
+            vec!["locked", "status"]
         );
         let mut sre = who("dan@example.com");
         sre.groups = vec!["sre".into()];
-        assert_eq!(
-            marks(Some(&sre)),
-            vec![
-                ("deploy".into(), true, false),
-                ("status".into(), true, false)
-            ]
-        );
-        assert!(marks(None).is_empty());
+        assert_eq!(names(Some(&sre)), vec!["deploy", "status"]);
+        assert!(names(None).is_empty());
         let mut elsewhere = who("alice@example.com");
         elsewhere.issuer = "https://partner.example".into();
-        assert!(marks(Some(&elsewhere)).is_empty());
+        assert!(names(Some(&elsewhere)).is_empty());
     }
 
     #[test]
@@ -1200,10 +1160,7 @@ mod tests {
         let names = |q| -> Vec<String> {
             let view = signed.view_for(Some(&alice), q);
             view.verify(root().node_id()).unwrap();
-            view.entries
-                .iter()
-                .map(|e| e.entry.name.to_string())
-                .collect()
+            view.entries.iter().map(|e| e.name.to_string()).collect()
         };
         assert_eq!(names(Some("orders")), vec!["orders-db", "status"]);
         assert_eq!(names(Some("DB")), vec!["orders-db"]);
@@ -1216,7 +1173,7 @@ mod tests {
         let signed = sample().sign(&root()).unwrap();
         let view = signed.view_for(Some(&who("alice@example.com")), None);
         for e in &view.entries {
-            assert_eq!(&e.entry, entry(&signed, e.entry.name.as_str()));
+            assert_eq!(e, entry(&signed, e.name.as_str()));
         }
     }
 
@@ -1257,17 +1214,13 @@ mod tests {
                 (Some(who), Some(ms)) => ms.iter().any(|m| m.matches(who)),
                 _ => false,
             };
-            let want: Vec<(ServiceName, bool, bool)> = p
+            let want: Vec<ServiceName> = p
                 .services
                 .iter()
-                .map(|(n, s)| (n.clone(), s.allow.iter().any(admits), s.readers.iter().any(admits)))
-                .filter(|(_, call, read)| *call || *read)
+                .filter(|(_, s)| s.allow.iter().any(admits))
+                .map(|(n, _)| n.clone())
                 .collect();
-            let got: Vec<(ServiceName, bool, bool)> = view
-                .entries
-                .iter()
-                .map(|e| (e.entry.name.clone(), e.call, e.read))
-                .collect();
+            let got: Vec<ServiceName> = view.entries.iter().map(|e| e.name.clone()).collect();
             prop_assert_eq!(got, want);
             if principal.is_none() {
                 prop_assert!(view.entries.is_empty());

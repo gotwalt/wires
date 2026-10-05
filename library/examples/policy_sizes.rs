@@ -46,8 +46,8 @@ fn len<T: serde::Serialize>(value: &T) -> usize {
     serde_json::to_vec(value).expect("serializable").len()
 }
 
-/// A tier of the model: `services` (2 hosts each, 2 allow roles and 1
-/// reader, an 80-character description), `hosts`, `services / 5` roles
+/// A tier of the model: `services` (2 hosts each, 3 allow roles, an
+/// 80-character description), `hosts`, `services / 5` roles
 /// (one group matcher each), and `bans` open bans.
 struct Tier {
     name: &'static str,
@@ -88,11 +88,14 @@ fn policy(root: &NodeIdentity, t: &Tier) -> Policy {
         let service = Service {
             description:
                 "Read-only SQL against the orders replica; returns CSV. Filter with --where.".into(),
-            allow: vec![role(s % roles), role((s + 1) % roles)],
+            allow: vec![
+                role(s % roles),
+                role((s + 1) % roles),
+                role((s + 2) % roles),
+            ],
             hosts: (0..2)
                 .map(|k| node(1_000_000 + (s + k) % t.hosts))
                 .collect(),
-            readers: vec![role((s + 2) % roles)],
         };
         p.services.insert(service_name(s), service);
     }
@@ -133,9 +136,8 @@ fn measure(root: &NodeIdentity, t: &Tier) -> serde_json::Value {
         .find(|i| matches!(i, Item::Service(_)))
         .expect("a service");
 
-    // A caller in 2 roles: each role is in about 10 services' `allow` and 5
-    // services' `readers`, so about 25 services admit it (the model assumes
-    // 30 `visible_services`).
+    // A caller in 2 roles: each role is in about 15 services' `allow`, so
+    // about 25 services admit it (the model assumes 30 `visible_services`).
     let caller = Principal {
         issuer: ISS.into(),
         subject: "00u1a2b3c4".into(),

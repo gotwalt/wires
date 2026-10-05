@@ -43,7 +43,7 @@ SIZES = {
     "member": 67,  # format 1: one node id in `members`
     "host": 134,  # format 1: a host node, in `members` and in `hosts`
     "ban": 78,  # one entry in `bans`: node id → until
-    "service": 318,  # 80-char description, 2 hosts, 2 allow roles, 1 reader role
+    "service": 318,  # 80-char description, 2 hosts, 3 allow roles
     "role": 73,  # a role with one group matcher
     "email_matcher": 75,  # each further `email=` matcher in a role
     "membership": 361,  # a node's badge

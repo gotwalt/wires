@@ -261,7 +261,6 @@ mod tests {
                     description: "a service with a description of ordinary length".into(),
                     allow: vec![staff.clone()],
                     hosts: dirs(1),
-                    readers: vec![],
                 },
             );
         }

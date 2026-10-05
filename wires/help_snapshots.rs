@@ -25,9 +25,7 @@ use crate::host::gate::{
 };
 
 /// The commands a caller runs: `wires --help` lists exactly these.
-const CALLER: &[&str] = &[
-    "services", "call", "login", "join", "id", "watch", "inbox", "mcp",
-];
+const CALLER: &[&str] = &["services", "call", "login", "join", "id", "inbox", "mcp"];
 
 /// Where the snapshots live.
 fn dir() -> PathBuf {

@@ -1,5 +1,5 @@
 //! The host pushes to callers (board card 23): `wires push --to <node|role>
-//! --subject S -- body`, queued per recipient, delivered by key, logged.
+//! --subject S -- body`, queued per recipient, delivered by key.
 //!
 //! # Sending
 //!
@@ -13,7 +13,7 @@
 //!   service pushes back to *its own caller* only, with the per-call token
 //!   `serve` put in its environment (`WIRES_PUSH_TOKEN`), so a service that
 //!   starts background work can later run `wires push --to
-//!   "$WIRES_CALLER_NODE" …`. Those records name the call (`call`).
+//!   "$WIRES_CALLER_NODE" …`.
 //!
 //! # Who may receive
 //!
@@ -21,7 +21,7 @@
 //! fetch** ([`ServicesHost::decide_push`]): the recipient must not be banned
 //! by the current policy, and must be in a registry role that `host.json`'s
 //! `push.allow` names (default: nobody). A removed (banned) node gets
-//! nothing: its queue is dropped (logged `denied`), and its fetch is
+//! nothing: its queue is dropped (traced `denied`), and its fetch is
 //! refused. A fetch also presents the fetcher's badge, checked first.
 //!
 //! **The identity rule.** Every role needs the recipient's verified
@@ -47,11 +47,10 @@
 //! acknowledged message leaves the queue. The queue is kept in
 //! `$WIRES_HOME/push-queue.json` (`0600`), so a host restart loses nothing.
 //!
-//! # Records
+//! # Tracing
 //!
-//! Every milestone is an [`AuditRecord::Push`] in the host's call log —
-//! `queued`, `delivered`, `fetched`, `expired`, `dropped`, `denied` — with
-//! the subject, and the body only under `"push": {"log_body": true}`.
+//! Every milestone — `queued`, `delivered`, `fetched`, `expired`, `dropped`,
+//! `denied` — is traced at `debug`, with the subject and never the body.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -64,15 +63,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use iroh::Endpoint;
 use library::{
-    AuditRecord, CallId, INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_HELLO, NodeId, Principal,
-    PushBody, PushId, PushMessage, PushOutcome, Subject,
+    INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_HELLO, NodeId, Principal, PushBody, PushId,
+    PushMessage, PushOutcome, Subject,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use super::gate::{HOST_MISCONFIGURED, PushRefusal, ServicesHost};
-use super::transport::{self, AuditSink};
+use super::transport;
 use crate::admin::ttl::Ttl;
 use crate::caller::inbox::{deny, read_frame, read_frame_within, write_frame};
 use crate::clock::now_ms;
@@ -84,7 +83,7 @@ pub(crate) const DEFAULT_TTL: Duration = Duration::from_secs(24 * 3600);
 pub(crate) const MAX_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Most messages queued for one recipient; a newer one drops the oldest
-/// (recorded `dropped`).
+/// (traced `dropped`).
 pub(crate) const QUEUE_PER_RECIPIENT: usize = 64;
 
 /// How long `wires push` spends dialing the recipient before leaving the
@@ -132,7 +131,7 @@ pub(crate) struct PushResult {
     /// Its verified identity (email), when the host knows one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) who: Option<String>,
-    /// The message id (also on a refusal: it names the `denied` record).
+    /// The message id (also on a refusal).
     pub(crate) id: PushId,
     /// `delivered`, `queued` or `denied`.
     pub(crate) outcome: PushOutcome,
@@ -183,14 +182,11 @@ impl PushReport {
 pub(crate) struct PushCommand {
     /// The request.
     pub(crate) spec: PushSpec,
-    /// The call whose push capability sent it (`None`: the operator, or a
-    /// capability push racing its call's `Started` record).
-    pub(crate) call: Option<CallId>,
     /// The report, or why the request itself was refused.
     pub(crate) reply: oneshot::Sender<std::result::Result<PushReport, String>>,
 }
 
-/// One queued message, with who it was admitted as (for later records).
+/// One queued message, with who it was admitted as.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Entry {
     /// The message.
@@ -201,9 +197,6 @@ pub(crate) struct Entry {
     /// The `push.allow` role that admitted it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) role: Option<String>,
-    /// The call whose push capability sent it (`None`: the operator).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) call: Option<CallId>,
 }
 
 /// Per-recipient FIFO queues, bounded by `cap` each. See the module docs.
@@ -295,8 +288,6 @@ impl Queue {
 pub(crate) struct PushHost {
     /// Who decides who may receive: the host's signed policy.
     host: Arc<ServicesHost>,
-    /// `push.log_body`.
-    log_body: bool,
     /// The queues.
     queue: Mutex<Queue>,
     /// Where the queue persists (`None`: memory only, in tests).
@@ -315,7 +306,6 @@ impl std::fmt::Debug for PushHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PushHost")
             .field("me", &self.host.me.hex())
-            .field("log_body", &self.log_body)
             .finish_non_exhaustive()
     }
 }
@@ -324,10 +314,8 @@ impl PushHost {
     /// A push service for `host`: recipients are nodes its signed policy
     /// doesn't ban, in a registry role `push.allow` names.
     pub(crate) fn from_state(host: Arc<ServicesHost>) -> Self {
-        let log_body = host.config.push.as_ref().is_some_and(|p| p.log_body);
         Self {
             host,
-            log_body,
             queue: Mutex::new(Queue::default()),
             path: None,
             arrived: Notify::new(),
@@ -358,36 +346,18 @@ impl PushHost {
         let _ = self.endpoint.set(endpoint);
     }
 
-    /// Where records go.
-    fn audit(&self) -> Option<&AuditSink> {
-        self.host.audit.as_ref()
-    }
-
-    /// Log one milestone of `entry` in the call log, waiting until it is
-    /// written. The milestone has already happened, so a log that can't take
-    /// it is traced at `error` (see [`audit`](crate::host::audit)).
-    async fn record(&self, entry: &Entry, outcome: PushOutcome, reason: Option<String>) {
-        if let Some(sink) = self.audit() {
-            let record = AuditRecord::Push {
-                id: entry.message.id,
-                to: entry.message.to,
-                principal: entry.principal.clone(),
-                role: entry.role.clone(),
-                subject: entry.message.subject.clone(),
-                outcome,
-                reason: reason.map(transport::truncate_reason),
-                body: self.log_body.then(|| entry.message.body.clone()),
-                call: entry.call,
-                at_ms: now_ms(),
-            };
-            if let Err(e) = sink.append(record).await {
-                tracing::error!(
-                    id = %entry.message.id,
-                    outcome = outcome.as_str(),
-                    "a push milestone was not logged: {e}"
-                );
-            }
-        }
+    /// Trace one milestone of `entry` at `debug`: its id, recipient,
+    /// outcome and subject (never the body), and why, for a refusal or a
+    /// drop.
+    fn record(entry: &Entry, outcome: PushOutcome, reason: Option<&str>) {
+        tracing::debug!(
+            id = %entry.message.id,
+            to = %entry.message.to.hex(),
+            subject = %entry.message.subject,
+            reason = reason.unwrap_or(""),
+            "push {}",
+            outcome.as_str()
+        );
     }
 
     /// Save the queue (best effort; a host that can't write it still
@@ -452,21 +422,9 @@ impl PushHost {
         Ok(nodes)
     }
 
-    /// Send `spec` as the operator: [`send_from`](Self::send_from) with no
-    /// call.
-    #[cfg(test)]
-    pub(crate) async fn send(&self, spec: PushSpec) -> Result<PushReport> {
-        self.send_from(spec, None).await
-    }
-
     /// Send `spec`: authorize each recipient, queue, try a direct delivery,
-    /// record every outcome, naming `call` (the call whose push capability
-    /// sent it) in each record.
-    pub(crate) async fn send_from(
-        &self,
-        spec: PushSpec,
-        call: Option<CallId>,
-    ) -> Result<PushReport> {
+    /// and trace every outcome.
+    pub(crate) async fn send(&self, spec: PushSpec) -> Result<PushReport> {
         let ttl = spec
             .ttl_secs
             .map(Duration::from_secs)
@@ -495,10 +453,8 @@ impl PushHost {
                         message,
                         principal: None,
                         role: None,
-                        call,
                     };
-                    self.record(&entry, PushOutcome::Denied, Some(reason.clone()))
-                        .await;
+                    Self::record(&entry, PushOutcome::Denied, Some(&reason));
                     report.results.push(PushResult {
                         to,
                         who: None,
@@ -513,20 +469,18 @@ impl PushHost {
                 message,
                 principal,
                 role,
-                call,
             };
             let id = entry.message.id;
             let who = entry.principal.as_ref().and_then(|p| p.email.clone());
             if let Some(dropped) = self.with_queue(|q| q.insert(entry.clone(), QUEUE_PER_RECIPIENT))
             {
-                self.record(
+                Self::record(
                     &dropped,
                     PushOutcome::Dropped,
-                    Some(format!(
+                    Some(&format!(
                         "the queue for this recipient holds at most {QUEUE_PER_RECIPIENT}"
                     )),
-                )
-                .await;
+                );
             }
             self.arrived.notify_waiters();
             let delivered = match tokio::time::timeout(DIRECT_BUDGET, self.deliver_direct(to)).await
@@ -545,14 +499,14 @@ impl PushHost {
                 PushOutcome::Delivered
             } else {
                 // Still queued unless a fetch took it meanwhile (its own
-                // record says so).
+                // trace says so).
                 if self
                     .queue
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .holds(to, id)
                 {
-                    self.record(&entry, PushOutcome::Queued, None).await;
+                    Self::record(&entry, PushOutcome::Queued, None);
                 }
                 PushOutcome::Queued
             };
@@ -569,14 +523,14 @@ impl PushHost {
 
     /// Dial `to`'s receiver (a `wires inbox --wait` in progress) and hand it
     /// what is queued for it (one batch). Returns the ids it acknowledged,
-    /// which leave the queue and are recorded `delivered`. Re-checks
+    /// which leave the queue and are traced `delivered`. Re-checks
     /// authorization first: a recipient the signed policy no longer holds
-    /// loses its queue (recorded `denied`).
+    /// loses its queue (traced `denied`).
     async fn deliver_direct(&self, to: NodeId) -> Result<Vec<PushId>> {
         let now = crate::clock::now_unix();
         if let Err(refusal) = self.authorize(to, now) {
             if let PushRefusal::NotAdmitted(reason) = &refusal {
-                self.drop_queue(to, reason).await;
+                self.drop_queue(to, reason);
             }
             bail!("not delivering: {refusal}");
         }
@@ -612,7 +566,7 @@ impl PushHost {
         conn.close(0u32.into(), b"done");
         let gone = self.with_queue(|q| q.remove(to, &acked));
         for e in &gone {
-            self.record(e, PushOutcome::Delivered, None).await;
+            Self::record(e, PushOutcome::Delivered, None);
         }
         Ok(gone.into_iter().map(|e| e.message.id).collect())
     }
@@ -645,13 +599,12 @@ impl PushHost {
     /// frame is at most [`MAX_INBOX_HELLO`]. Membership is checked before
     /// the ID token is verified (its badge, and the policy's bans); a peer
     /// that is not admitted hears only
-    /// [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED) and is traced, not
-    /// logged (its queue, if it had one before it was banned, is dropped and
-    /// each message's fate logged). An admitted node's policy refusal is only
-    /// answered: `wires inbox` asks every host of the node's services, and a
-    /// host it may not hear from would otherwise log it on every poll. A node
-    /// holds
-    /// at most [`MAX_FETCHES_PER_NODE`] long polls open.
+    /// [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED) and is traced,
+    /// throttled (its queue, if it had one before it was banned, is dropped
+    /// and each message's fate traced). An admitted node's policy refusal is
+    /// only answered: `wires inbox` asks every host of the node's services,
+    /// and a host it may not hear from would otherwise trace it on every
+    /// poll. A node holds at most [`MAX_FETCHES_PER_NODE`] long polls open.
     pub(crate) async fn serve_fetch<S, R>(
         &self,
         mut send: S,
@@ -708,11 +661,10 @@ impl PushHost {
                 return Ok(());
             }
         };
-        // Membership first: a stranger costs no token verification and no
-        // call-log entry.
+        // Membership first: a stranger costs no token verification.
         if let Err(detail) = self.host.check_member(&state, &membership, caller, now) {
             FETCH_STRANGERS.refused("inbox fetch", caller, &detail);
-            self.drop_queue(caller, &detail).await;
+            self.drop_queue(caller, &detail);
             deny(&mut send, crate::host::gate::NOT_ADMITTED).await;
             return Ok(());
         }
@@ -727,7 +679,7 @@ impl PushHost {
             Err(PushRefusal::NotAdmitted(reason)) => {
                 // Removed between the two reads of the policy.
                 FETCH_STRANGERS.refused("inbox fetch", caller, &reason);
-                self.drop_queue(caller, &reason).await;
+                self.drop_queue(caller, &reason);
                 deny(&mut send, crate::host::gate::NOT_ADMITTED).await;
                 return Ok(());
             }
@@ -776,23 +728,22 @@ impl PushHost {
         };
         let gone = self.with_queue(|q| q.remove(caller, &acked));
         for e in &gone {
-            self.record(e, PushOutcome::Fetched, None).await;
+            Self::record(e, PushOutcome::Fetched, None);
         }
         send.shutdown().await.ok();
         Ok(())
     }
 
     /// Drop everything queued for `node`, which the signed policy no longer
-    /// admits, logging each message's fate.
-    async fn drop_queue(&self, node: NodeId, reason: &str) {
+    /// admits, tracing each message's fate.
+    fn drop_queue(&self, node: NodeId, reason: &str) {
         for e in self.with_queue(|q| q.purge(node)) {
-            self.record(&e, PushOutcome::Denied, Some(reason.to_string()))
-                .await;
+            Self::record(&e, PushOutcome::Denied, Some(reason));
         }
     }
 
-    /// Record and drop what expired at `now_ms`.
-    async fn sweep(&self, now_ms: i64) {
+    /// Trace and drop what expired at `now_ms`.
+    fn sweep(&self, now_ms: i64) {
         let expired = {
             let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
             let gone = q.expire(now_ms);
@@ -802,7 +753,7 @@ impl PushHost {
             gone
         };
         for e in &expired {
-            self.record(e, PushOutcome::Expired, None).await;
+            Self::record(e, PushOutcome::Expired, None);
         }
     }
 
@@ -813,14 +764,14 @@ impl PushHost {
         loop {
             tokio::select! {
                 command = commands.recv() => {
-                    let Some(PushCommand { spec, call, reply }) = command else { return };
+                    let Some(PushCommand { spec, reply }) = command else { return };
                     let me = Arc::clone(&self);
                     tokio::spawn(async move {
-                        let sent = me.send_from(spec, call).await;
+                        let sent = me.send(spec).await;
                         let _ = reply.send(sent.map_err(|e| format!("{e:#}")));
                     });
                 }
-                _ = tick.tick() => self.sweep(now_ms()).await,
+                _ = tick.tick() => self.sweep(now_ms()),
             }
         }
     }
@@ -881,8 +832,7 @@ pub(crate) struct PushArgs {
     // role admits.
     #[arg(long)]
     pub(crate) to: String,
-    /// One line, recorded in the host's call log (the body only if host.json says).
-    // `"push": {"log_body": true}`.
+    /// One line, shown in the recipient's inbox.
     #[arg(long)]
     pub(crate) subject: String,
     /// How long to keep it for a recipient not listening (`90m`, `2d`; max 7d).
@@ -1045,14 +995,13 @@ mod tests {
             },
             principal: None,
             role: None,
-            call: None,
         }
     }
 
-    /// A push host (4) of the network rooted at 1, whose policy bans 50–54,
-    /// logging to an in-memory sink. (No service or role is needed: these
-    /// tests stop at admission, and `serve` isn't preflighted.)
-    fn push_host() -> (Arc<PushHost>, mpsc::Receiver<AuditRecord>) {
+    /// A push host (4) of the network rooted at 1, whose policy bans 50–54.
+    /// (No service or role is needed: these tests stop at admission, and
+    /// `serve` isn't preflighted.)
+    fn push_host() -> Arc<PushHost> {
         use crate::admin::keystore::Keystore;
         use library::{Membership, Policy, StateVersion};
         let root = NodeIdentity::from_seed([1u8; 32]);
@@ -1077,16 +1026,14 @@ mod tests {
             r#"{"version":2,"services":{"t":{"command":["true"]}},"push":{"allow":["analyst"]}}"#,
         )
         .unwrap();
-        let mut host = crate::host::serve::services_host(
+        let host = crate::host::serve::services_host(
             node(4),
             Membership::mint(&root, node(4), 0, i64::MAX).unwrap(),
             Arc::new(ks),
             config,
         )
         .unwrap();
-        let (sink, records) = AuditSink::channel(64);
-        host.audit = Some(sink);
-        (Arc::new(PushHost::from_state(Arc::new(host))), records)
+        Arc::new(PushHost::from_state(Arc::new(host)))
     }
 
     /// `frames` from `caller` to `push`'s fetch endpoint: the refusal.
@@ -1102,11 +1049,11 @@ mod tests {
     }
 
     /// A fetch from a banned key (50–54: a genuine badge), or with another
-    /// network's badge (55–59), hears the fixed sentence, has its token left
-    /// unverified, and leaves nothing in the call log.
+    /// network's badge (55–59), hears the fixed sentence and has its token
+    /// left unverified.
     #[tokio::test]
-    async fn a_banned_or_badgeless_fetch_is_refused_unlogged_and_unverified() {
-        let (push, mut records) = push_host();
+    async fn a_banned_or_badgeless_fetch_is_refused_and_unverified() {
+        let push = push_host();
         let root = NodeIdentity::from_seed([1u8; 32]);
         let rogue = NodeIdentity::from_seed([66u8; 32]);
         for seed in 50..60u8 {
@@ -1125,14 +1072,14 @@ mod tests {
             assert_eq!(r, crate::host::gate::NOT_ADMITTED);
         }
         assert!(push.host.identities.nodes().is_empty());
-        assert!(records.try_recv().is_err(), "a stranger's fetch was logged");
     }
 
-    /// Card 35: a push to a banned node is refused at send (recorded
+    /// Card 35: a push to a banned node is refused at send (traced
     /// `denied`, naming the ban), and nothing is queued for it.
     #[tokio::test]
     async fn a_push_to_a_banned_node_is_denied() {
-        let (push, mut records) = push_host();
+        let (lines, _guard) = crate::host::call_trace::capture::lines();
+        let push = push_host();
         let banned = node(50);
         let report = push
             .send(PushSpec {
@@ -1157,20 +1104,17 @@ mod tests {
                 .pending(banned, now_ms(), MAX_BATCH)
                 .is_empty()
         );
-        assert!(matches!(
-            records.try_recv(),
-            Ok(AuditRecord::Push {
-                outcome: PushOutcome::Denied,
-                ..
-            })
-        ));
+        let traced = lines.matching("push denied");
+        assert_eq!(traced.len(), 1, "{}", lines.text());
+        assert!(traced[0].contains("banned"), "{}", traced[0]);
+        assert!(!traced[0].contains("body"), "{}", traced[0]);
     }
 
     /// An inbox `hello` whose prefix claims more than `MAX_INBOX_HELLO` is
     /// refused at the prefix, before any body arrives.
     #[tokio::test]
     async fn an_oversized_inbox_hello_is_refused_at_the_prefix() {
-        let (push, _records) = push_host();
+        let push = push_host();
         let (mut to_host, from_peer) = tokio::io::duplex(1024);
         let (send, mut answer) = tokio::io::duplex(1024);
         to_host
@@ -1195,7 +1139,7 @@ mod tests {
     /// node is unaffected, and a finished one frees its slot.
     #[tokio::test]
     async fn long_polls_per_node_are_capped() {
-        let (push, _records) = push_host();
+        let push = push_host();
         let held: Vec<_> = (0..MAX_FETCHES_PER_NODE)
             .map(|_| push.fetch_slot(node(2)).expect("room"))
             .collect();
@@ -1250,7 +1194,7 @@ mod tests {
     /// on that file (a restart) holds it again.
     #[tokio::test]
     async fn the_queue_survives_a_round_trip_through_its_file() {
-        let (push, _records) = push_host();
+        let push = push_host();
         let path = crate::testutil::temp_dir().join(QUEUE_FILE);
         let host = || PushHost::from_state(Arc::clone(&push.host)).persisted_queue(path.clone());
         let before = host();

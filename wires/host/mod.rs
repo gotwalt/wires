@@ -4,7 +4,7 @@
 //! service runs here; the admin-signed policy says who may call it. Every
 //! call is decided by the policy as it stands at that connection — the
 //! badge and bans, the registry's role for the service, then any stricter
-//! local rule — and logged by the host itself in its own signed call log.
+//! local rule — and traced by the host as one ordinary log line.
 //!
 //! - [`serve`] — `wires serve host.json` / `--check`: preflight, bind, serve.
 //! - [`config`] — `host.json` (services it implements, local trust,
@@ -24,20 +24,15 @@
 //! - [`freshness`] — the newest `Fresh` for the held head (`fresh.json`),
 //!   and the signed rule (`lenient` / `strict`) for when it lapses.
 //! - [`identity`] — the ID tokens callers presented, verified and indexed.
-//! - [`audit`] — the call records the host keeps.
-//! - [`call_log`] — the host's own signed, hash-linked log of those records,
-//!   on disk with retention (card 26a).
-//! - [`record_stream`] — that log served, by key, to the readers the signed
-//!   policy names (`wires watch`, card 26b).
-//! - [`otlp`] — optional OTLP/HTTP export of that log (`audit.otlp`).
+//! - [`call_trace`] — the one `tracing` line a call (or an identified
+//!   caller's refusal) leaves in `serve`'s output.
 //! - [`push`] — `wires push`: messages to callers by key, queued, delivered
 //!   or fetched, gated by the signed policy and `push.allow` (card 23).
 //! - [`control`] — the local sockets `wires push` hands a push to `serve` on.
 //! - [`capability`] — the per-call push token a service child gets instead of
 //!   the host's keystore: it pushes only to that call's caller.
 
-pub mod audit;
-pub mod call_log;
+pub mod call_trace;
 pub mod capability;
 pub mod config;
 pub mod control;
@@ -47,9 +42,7 @@ pub mod freshness;
 pub mod gate;
 pub mod identity;
 pub mod native;
-pub mod otlp;
 pub mod push;
-pub mod record_stream;
 pub mod serve;
 pub mod service;
 pub mod transport;

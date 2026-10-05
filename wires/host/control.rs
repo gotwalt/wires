@@ -1,7 +1,7 @@
 //! The host's control sockets: how `wires push` reaches the running `wires
 //! serve` on the same machine (card 23).
 //!
-//! The push queue, the host's endpoint and its call log belong to the one
+//! The push queue and the host's endpoint belong to the one
 //! `serve` process, so `wires push` is a *request to it*, over a unix socket.
 //! There are two, each with its own [`Authority`]:
 //!
@@ -99,9 +99,7 @@ pub fn fits_sockaddr(path: &Path) -> bool {
 /// [`ControlSocket::bind`] (which refuses one it cannot make private), so a
 /// shared `/tmp` does not open the socket to other users.
 pub fn short_socket_path(full: &Path, uid: u32, bases: &[PathBuf]) -> Option<PathBuf> {
-    let mut hasher = library::OutputHasher::new();
-    hasher.update(full.as_os_str().as_encoded_bytes());
-    let digest = hasher.finish().hex();
+    let digest = blake3::hash(full.as_os_str().as_encoded_bytes()).to_hex();
     let name = format!("{}.sock", &digest[..SOCKET_NAME_HEX]);
     bases
         .iter()
@@ -257,9 +255,7 @@ where
             continue;
         }
         let response = match (serde_json::from_slice::<Request>(&line), authority) {
-            (Ok(Request::Push(spec)), Authority::Operator) => {
-                dispatch_push(&push, spec, None).await
-            }
+            (Ok(Request::Push(spec)), Authority::Operator) => dispatch_push(&push, spec).await,
             (Ok(Request::CallerPush(req)), Authority::Calls(caps)) => {
                 let token = PushToken::from_hex(&req.token);
                 let checked = match &token {
@@ -267,7 +263,7 @@ where
                     None => Err(crate::host::capability::CapabilityRefusal::Unknown),
                 };
                 match checked {
-                    Ok(grant) => dispatch_push(&push, req.push, grant.call).await,
+                    Ok(_) => dispatch_push(&push, req.push).await,
                     Err(refusal) => {
                         tracing::warn!(to = %req.push.to, "capability push refused: {refusal}");
                         Response::Err(truncate_reason(refusal.to_string()))
@@ -288,15 +284,10 @@ where
     Ok(())
 }
 
-/// Hand one push (sent under `call`'s capability, if any) to the host's push
-/// service and wait for its report.
-async fn dispatch_push(
-    push: &mpsc::Sender<PushCommand>,
-    spec: PushSpec,
-    call: Option<library::CallId>,
-) -> Response {
+/// Hand one push to the host's push service and wait for its report.
+async fn dispatch_push(push: &mpsc::Sender<PushCommand>, spec: PushSpec) -> Response {
     let (reply, answer) = oneshot::channel();
-    if push.send(PushCommand { spec, call, reply }).await.is_err() {
+    if push.send(PushCommand { spec, reply }).await.is_err() {
         return Response::Err("the host is shutting down".into());
     }
     match answer.await {
@@ -476,7 +467,7 @@ impl ControlClient {
 /// `ENOENT`, racing with a removal) means no. Any other error is treated as
 /// "yes" — refusing to start is the safe answer when the answer is unknown,
 /// because guessing wrong puts two `serve`s on one keystore, both appending
-/// to its call log and push queue.
+/// to its push queue.
 async fn is_live(path: &Path) -> bool {
     match UnixStream::connect(path).await {
         Ok(_) => true,
@@ -636,15 +627,12 @@ mod tests {
 
     /// One request line through `serve_conn` under `authority`; the reply,
     /// and the command the host received (if any).
-    async fn one(
-        authority: Authority,
-        request: &str,
-    ) -> (Response, Option<(PushSpec, Option<library::CallId>)>) {
+    async fn one(authority: Authority, request: &str) -> (Response, Option<PushSpec>) {
         let (tx, mut rx) = mpsc::channel::<PushCommand>(8);
         let host = tokio::spawn(async move {
             let cmd = rx.recv().await?;
             let _ = cmd.reply.send(Ok(PushReport::default()));
-            Some((cmd.spec, cmd.call))
+            Some(cmd.spec)
         });
         let (client, server) = tokio::io::duplex(4096);
         let (srecv, ssend) = tokio::io::split(server);
@@ -669,8 +657,6 @@ mod tests {
         let alice = NodeIdentity::from_seed([2; 32]).node_id();
         let bob = NodeIdentity::from_seed([3; 32]).node_id();
         let cap = caps.mint(alice);
-        let call = library::CallId::generate();
-        cap.bind_call(call);
         let token = cap.token().hex();
         let child = || Authority::Calls(std::sync::Arc::clone(&caps));
         let req = |token: &str, to: &str| {
@@ -679,11 +665,10 @@ mod tests {
             )
         };
 
-        // Its caller: handed to the host, naming the call.
+        // Its caller: handed to the host.
         let (resp, got) = one(child(), &req(&token, &alice.hex())).await;
         assert_eq!(resp, Response::Pushed(PushReport::default()));
-        let (spec, via) = got.unwrap();
-        assert_eq!((spec.to.as_str(), via), (alice.hex().as_str(), Some(call)));
+        assert_eq!(got.unwrap().to, alice.hex());
 
         // Anyone else, a role, a forged token, the operator's form: refused
         // before the host hears of it.

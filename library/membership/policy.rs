@@ -7,7 +7,7 @@
 //!   the authenticated caller, and is unexpired;
 //! - [`check_admitted`]: that, and the policy doesn't ban the caller. This
 //!   is the question every gate asks (a host's call gate, push and inbox
-//!   fetch, the record stream, a directory, a caller's inbox, the gateway).
+//!   fetch, a directory, a caller's inbox, the gateway).
 //!
 //! The policy lists no members: admitting a node is minting its badge, not
 //! an edit. Removal is a ban (`wires remove`), which lasts until the removed

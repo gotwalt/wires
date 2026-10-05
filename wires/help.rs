@@ -21,10 +21,10 @@ use clap::{Arg, ArgAction, Command};
 pub const PREMISE: &str = "\
 wires is a network for authenticated remote CLI calls. Each service is a
 command-line program on another machine, run by its name, never by host or
-address. Every call runs as you: your sign-in is checked against an
-admin-signed list of who may call what, and the machine that runs it records
-the call. A refusal (\"denied by host\", exit 77) is that policy, not a fault:
-don't retry or work around it; ask your admin for access.";
+address. Every call runs as you: the machine that runs it checks your
+sign-in against an admin-signed list of who may call what. A refusal
+(\"denied by host\", exit 77) is that policy, not a fault: don't retry or work
+around it; ask your admin for access.";
 
 /// What a command that needs a membership says on a node that has none.
 pub(crate) const NOT_JOINED: &str = "this node has not joined a network: run `wires id`, send the \
@@ -48,7 +48,6 @@ pub(crate) const HELP_TEMPLATE: &str = "\
   login     Sign in with your IdP; every call needs it
   join      Install the invite token your admin sent
   id        Print this node's id, to send your admin for an invite
-  watch     Stream the call records you may read
   inbox     Print the messages hosts pushed to you
   mcp       Serve the services you may call as MCP tools over stdio
 
@@ -68,7 +67,6 @@ Caller: runs services by name (every node joins the same way)
   login     Sign in with your IdP; every call needs it
   join      Install the invite token your admin sent
   id        Print this node's id, to send your admin for an invite
-  watch     Stream the call records you may read
   inbox     Print the messages hosts pushed to you
   mcp       Serve the services you may call as MCP tools over stdio
   gateway   Serve them as a remote MCP server (HTTP + OAuth) for web clients
@@ -84,7 +82,7 @@ Admin: admits nodes and signs what runs where (holds the root key)
   policy    Re-publish the signed policy (push) or change its settings
 
 Host: implements the services assigned to it
-  serve     Run host.json's services; check every caller; log every call
+  serve     Run host.json's services; check every caller
   push      Send a caller a message by its node id or role, to its inbox
 
 Every command takes --help; --help-all also lists its operator flags.";
@@ -107,7 +105,7 @@ Examples:
 
 Output: one service per line, `<name>  <description>  (<roles that may call>)`;
 nothing on stdout when none. --json, one object per line:
-  {\"service\":\"orders-db\",\"description\":\"…\",\"allow\":[\"analyst\"],\"call\":true,\"read\":false,\"hosts\":2}";
+  {\"service\":\"orders-db\",\"description\":\"…\",\"allow\":[\"analyst\"],\"hosts\":2}";
 
 /// `wires login`: examples.
 pub(crate) const LOGIN_AFTER: &str = "\
@@ -125,15 +123,6 @@ Examples:
 pub(crate) const ID_AFTER: &str = "\
 Example:
   wires id                    # send this to your admin: `wires invite <id>`";
-
-/// `wires watch`: examples and output.
-pub(crate) const WATCH_AFTER: &str = "\
-Examples:
-  wires watch orders-db
-  wires watch --mine --once
-
-Readers the policy names see a service's calls in full; everyone else sees
-their own. Exit 77: every host refused the stream.";
 
 /// `wires inbox`: examples and exit codes.
 pub(crate) const INBOX_AFTER: &str = "\
@@ -173,7 +162,7 @@ Example:
 pub(crate) const SERVICE_AFTER: &str = "\
 Examples:
   wires service add orders-db --description \"Read-only SQL over the orders database\" \\
-    --allow analyst --reader security --host workbench
+    --allow analyst --host workbench
   wires service rm orders-db";
 
 /// `wires role`: examples.

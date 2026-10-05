@@ -157,10 +157,10 @@ runs from it. A host serving CLIs needs an image that also has those CLIs.
     `--policy-ttl`), `host/` (`serve`,
     `host.json`, the gate over the signed policy, the session transport,
     native services and the embedded `Host`,
-    verified identities, the call log and OTLP export, the record stream, push,
+    verified identities, the per-call log line (`call_trace`), push,
     its control sockets and the per-call push capability), `caller/` (`join`, `login`, the caller's view
     (`view.json`), `services`, `call` with service → host failover and the
-    local hints file, `mcp`, `inbox`, `watch`), `gateway/` (`wires gateway`: remote MCP over HTTP + OAuth
+    local hints file, `mcp`, `inbox`), `gateway/` (`wires gateway`: remote MCP over HTTP + OAuth
     for web clients, calling with each user's own ID token), `directory/` (the
     directory mode: `directory.redb`, `wires/directory/1` and
     `wires/directory-sub/1`, the freshness beat and replicas, `directory

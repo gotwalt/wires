@@ -93,7 +93,6 @@ impl World {
             description: description.into(),
             allow: vec![role(allow)],
             hosts: vec![host.node_id()],
-            readers: vec![],
         };
         p.services.insert(
             service("orders-db"),
@@ -187,7 +186,7 @@ async fn a_callers_keystore_holds_only_its_view() {
         id_token: crate::caller::hello::stored_token(&ks),
     };
     let held = view::refresh(&ks, &asker, false).await.unwrap();
-    let names: Vec<&str> = held.callable().map(|e| e.entry.name.as_str()).collect();
+    let names: Vec<&str> = held.view.entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["orders-db", "status"]);
     assert_eq!(held.version(), StateVersion(3));
     assert!(held.fresh.is_some(), "the directory vouched for it");
@@ -263,8 +262,7 @@ async fn without_a_verified_identity_the_view_is_empty() {
         id_token: crate::caller::hello::stored_token(&ks),
     };
     let found = view::resolve(&ks, &asker, &orders).await.unwrap().unwrap();
-    assert_eq!(found.entry.name, orders);
-    assert!(found.call);
+    assert_eq!(found.name, orders);
     assert_eq!(
         view::resolve(&ks, &asker, &service("payroll"))
             .await
@@ -278,7 +276,7 @@ async fn without_a_verified_identity_the_view_is_empty() {
         .view
         .matching("ORDERS")
         .iter()
-        .map(|e| e.entry.name.as_str())
+        .map(|e| e.name.as_str())
         .collect();
     assert_eq!(found, ["orders-db"]);
     endpoint.close().await;
@@ -344,7 +342,6 @@ async fn a_grant_and_a_revocation_reach_a_running_mcp_within_2s() {
                 description: "Weekly reports".into(),
                 allow: vec![role("staff")],
                 hosts: vec![w.ours.node_id()],
-                readers: vec![],
             },
         );
     });
@@ -384,7 +381,6 @@ async fn a_grant_and_a_revocation_reach_a_running_mcp_within_2s() {
                 description: "Weekly reports".into(),
                 allow: vec![role("payroll-team")],
                 hosts: vec![w.ours.node_id()],
-                readers: vec![],
             },
         );
     });
@@ -451,7 +447,7 @@ async fn a_view_that_cannot_be_updated_is_fetched_whole_again() {
     .unwrap()
     .clone()
     .unwrap();
-    assert_eq!(held.callable().count(), 2);
+    assert_eq!(held.view.entries.len(), 2);
     // Then updates apply on top of it.
     let v4 = w.policy(4, |p| {
         p.services.remove(&service("status"));
@@ -466,7 +462,7 @@ async fn a_view_that_cannot_be_updated_is_fetched_whole_again() {
     .unwrap()
     .clone()
     .unwrap();
-    let names: Vec<&str> = held.callable().map(|e| e.entry.name.as_str()).collect();
+    let names: Vec<&str> = held.view.entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["orders-db"]);
     follower.abort();
     endpoint.close().await;
@@ -554,12 +550,7 @@ async fn without_a_verified_identity_a_held_view_is_emptied_not_kept() {
     };
     let held = view::refresh(&ks, &lapsed, false).await.unwrap();
     assert_eq!(held.version(), StateVersion(4));
-    let names: Vec<&str> = held
-        .view
-        .entries
-        .iter()
-        .map(|e| e.entry.name.as_str())
-        .collect();
+    let names: Vec<&str> = held.view.entries.iter().map(|e| e.name.as_str()).collect();
     assert!(names.is_empty(), "kept {names:?} with no verified identity");
     endpoint.close().await;
 }
@@ -586,7 +577,7 @@ async fn an_empty_view_at_the_newest_version_is_filled_once_signed_in() {
         id_token: crate::caller::hello::stored_token(&ks),
     };
     let held = view::refresh(&ks, &asker, false).await.unwrap();
-    let names: Vec<&str> = held.callable().map(|e| e.entry.name.as_str()).collect();
+    let names: Vec<&str> = held.view.entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["orders-db", "status"]);
     endpoint.close().await;
 }

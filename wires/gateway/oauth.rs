@@ -110,7 +110,7 @@ pub(crate) async fn home<B: Backend>(State(gw): Gw<B>) -> Html<String> {
              services your identity may call, as a remote MCP server.</p>\
              <p>In Claude, add a custom connector with the URL <code>{}</code>, then sign in \
              with Google. Each call runs on the machine that hosts the service, which checks \
-             who you are and records the call.</p>",
+             who you are.</p>",
             esc(&gw.urls.resource())
         ),
     )
@@ -281,7 +281,7 @@ fn consent(urls: &PublicUrls, client: &Client, redirect: &Url, id: &str) -> Resp
         "<p><strong>{}</strong>{} wants to run wires services as you.</p>\
          <p>You'll sign in with Google. Each call then runs on the machine that hosts the \
          service, which checks your identity against the admin-signed list of who may call \
-         what, and records the call. Access ends when your sign-in expires (about an hour).</p>\
+         what. Access ends when your sign-in expires (about an hour).</p>\
          <p class=\"dim\">Sign-in returns to {}</p>\
          <form method=\"post\" action=\"/authorize/confirm\">\
          <input type=\"hidden\" name=\"id\" value=\"{}\">\

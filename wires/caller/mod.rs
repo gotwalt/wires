@@ -12,8 +12,6 @@
 //! - [`shape`] — `--jq` / `--head` / `--max-bytes`: output shaping, in-process.
 //! - [`inbox`] — `wires inbox`: what hosts pushed to this caller (card 23),
 //!   fetched from the hosts of its services, or received while `--wait`s.
-//! - [`watch_records`] — `wires watch`: stream call records from the hosts
-//!   that hold them, checking each host's hash chain.
 //! - [`lock`] — locked mode: `WIRES_LOCKED=1` refuses the override flags so a
 //!   sandboxed agent can't steer `call`/`mcp`/`inbox` off the operator's
 //!   config.
@@ -29,7 +27,7 @@
 //! - [`services`] — `wires services`: what this caller may call, read from
 //!   its view.
 //! - [`pick`] — service name → host, with failover; the local dial hints.
-//! - [`hello`] — the caller's session `Hello`.
+//! - [`hello`] — the stored ID token the caller presents in each `hello`.
 //! - [`join`] — `wires id` and `wires join <token>` (card 14; every node
 //!   joins this way, hosts included).
 
@@ -51,10 +49,9 @@ pub mod services;
 pub mod shape;
 pub mod tools;
 pub mod view;
-pub mod watch_records;
 
 /// `s` on one line: newlines and every other control character escaped, so
-/// text from elsewhere (a pushed message, a call record) can't forge a
+/// text from elsewhere (a pushed message) can't forge a
 /// second line or drive the terminal.
 pub(crate) fn one_line(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

@@ -292,7 +292,6 @@ mod tests {
                     description: String::new(),
                     allow: vec![],
                     hosts: vec![],
-                    readers: vec![],
                 },
             )
             .unwrap(),

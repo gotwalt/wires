@@ -7,7 +7,7 @@ Arguments:
 
 Options:
       --to <TO>            A node id (a service's `$WIRES_CALLER_NODE`), or a role in the policy
-      --subject <SUBJECT>  One line, recorded in the host's call log (the body only if host.json says)
+      --subject <SUBJECT>  One line, shown in the recipient's inbox
       --ttl <TTL>          How long to keep it for a recipient not listening (`90m`, `2d`; max 7d)
   -h, --help               Print help
 

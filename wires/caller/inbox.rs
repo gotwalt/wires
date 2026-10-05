@@ -503,7 +503,7 @@ impl InboxReceiver {
             .view
             .entries
             .iter()
-            .any(|e| e.entry.service.hosts.contains(&peer));
+            .any(|e| e.service.hosts.contains(&peer));
         if !hosts_one {
             return Err(format!(
                 "not a host of any service in this node's view (policy version {}); this inbox \
@@ -802,8 +802,7 @@ impl Fetcher {
                 return Vec::new();
             }
         };
-        let names: Vec<&library::ServiceName> =
-            held.view.entries.iter().map(|e| &e.entry.name).collect();
+        let names: Vec<&library::ServiceName> = held.view.entries.iter().map(|e| &e.name).collect();
         let hosts: Vec<NodeId> = crate::caller::pick::hosts_of(&held.view, names)
             .into_iter()
             .filter(|h| *h != self.me)
@@ -961,7 +960,6 @@ mod tests {
                 description: String::new(),
                 allow: vec![nobody],
                 hosts: vec![banned],
-                readers: vec![],
             },
         );
         let signed = crate::testutil::signed_policy(&root, s);

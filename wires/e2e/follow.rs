@@ -126,7 +126,6 @@ impl World {
                 description: String::new(),
                 allow: vec![role("analyst")],
                 hosts: self.hosts.iter().map(|h| h.node_id()).collect(),
-                readers: vec![],
             },
         );
         for b in 0..bans {

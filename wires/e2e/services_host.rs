@@ -9,9 +9,8 @@
 //! host trusts.
 //!
 //! - [`the_registry_decides_who_runs_what`]: an allowed role runs; a
-//!   disallowed one, and a caller with no token, are refused with the reason
-//!   (and the refusal is in the call log). Every role needs a verified
-//!   identity, even "anyone signed in".
+//!   disallowed one, and a caller with no token, are refused with the reason.
+//!   Every role needs a verified identity, even "anyone signed in".
 //! - [`a_trusted_issuer_cannot_vouch_for_another_issuers_people`]: a matcher
 //!   admits only its own issuer's principals.
 //! - [`also_require_only_tightens`]
@@ -33,10 +32,9 @@ use iroh::EndpointAddr;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::Router;
 use library::{
-    AuditRecord, Hello, Membership, NodeId, NodeIdentity, OidcNonce, PushBody, RoleName, Service,
-    SignedPolicy, StateVersion, Subject,
+    Hello, Membership, NodeId, NodeIdentity, OidcNonce, PushBody, RoleName, Service, SignedPolicy,
+    StateVersion, Subject,
 };
-use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use super::{
@@ -49,7 +47,7 @@ use crate::caller::mock_idp::MockIdp;
 use crate::host::config::HostConfig;
 use crate::host::push::{PushHost, PushSpec};
 use crate::host::serve::{services_host, services_router};
-use crate::host::transport::{AuditSink, endpoint_addr};
+use crate::host::transport::endpoint_addr;
 
 /// The network: root 1, host 10, alice 2, bob 3, carol 4.
 ///
@@ -115,7 +113,6 @@ impl World {
                 description: String::new(),
                 allow,
                 hosts: vec![self.host.node_id()],
-                readers: vec![],
             };
             s.services
                 .insert(service("orders-db"), on_host(vec![role("analyst")]));
@@ -172,15 +169,14 @@ impl World {
     }
 }
 
-/// A running host: its router, where to dial it, its keystore, its call
-/// log's records, and its push service (if any).
+/// A running host: its router, where to dial it, its keystore, and its
+/// push service (if any).
 struct Host {
     _router: Router,
     addr: EndpointAddr,
     /// The host endpoint's address book: where it can dial callers (push).
     book: MemoryLookup,
     keystore: Arc<Keystore>,
-    records: mpsc::Receiver<AuditRecord>,
     push: Option<Arc<PushHost>>,
 }
 
@@ -190,15 +186,13 @@ impl Host {
     async fn start(w: &World, config: HostConfig, state: &SignedPolicy) -> anyhow::Result<Host> {
         let keystore = Arc::new(Keystore::at(crate::testutil::temp_dir()));
         adopt(&keystore, &w.root, state);
-        let mut host = services_host(
+        let host = services_host(
             w.host.node_id(),
             w.membership(&w.host),
             Arc::clone(&keystore),
             config,
         )?;
         host.preflight(crate::clock::now_unix())?;
-        let (sink, records) = AuditSink::channel(64);
-        host.audit = Some(sink);
         let host = Arc::new(host);
         let push = host
             .config
@@ -214,7 +208,6 @@ impl Host {
             addr,
             book,
             keystore,
-            records,
             push,
         })
     }
@@ -222,14 +215,6 @@ impl Host {
     /// The admin's newer policy reaches this host (as a fetch from a directory would).
     fn adopt(&self, w: &World, state: &SignedPolicy) {
         assert!(adopt(&self.keystore, &w.root, state));
-    }
-
-    /// The next call-log record.
-    async fn record(&mut self) -> AuditRecord {
-        timeout(PATIENCE, self.records.recv())
-            .await
-            .expect("no record in time")
-            .expect("the sink closed")
     }
 }
 
@@ -248,7 +233,7 @@ const SERVICES: &str = r#"{
 async fn the_registry_decides_who_runs_what() {
     let w = World::new().await;
     let state = w.state(1, &[]);
-    let mut host = Host::start(&w, w.host_json(SERVICES, false), &state)
+    let host = Host::start(&w, w.host_json(SERVICES, false), &state)
         .await
         .unwrap();
 
@@ -270,33 +255,13 @@ async fn the_registry_decides_who_runs_what() {
         ack.head.is_none() && ack.entry.is_none(),
         "her view is current"
     );
-    match host.record().await {
-        AuditRecord::Started {
-            principal, role, ..
-        } => {
-            assert_eq!(
-                principal.unwrap().email.as_deref(),
-                Some("alice@example.com")
-            );
-            assert_eq!(role.as_str(), "analyst");
-        }
-        other => panic!("expected started, got {other:?}"),
-    }
-    assert!(matches!(host.record().await, AuditRecord::Finished { .. }));
 
-    // bob verifies, but is in no allowed role: refused, by name, and logged.
+    // bob verifies, but is in no allowed role: refused, by name.
     let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "orders-db", &[]).await;
     assert_eq!(
         out.denied(),
         "bob@example.com is in no role allowed to call orders-db (analyst)"
     );
-    match host.record().await {
-        AuditRecord::Denied { caller, reason, .. } => {
-            assert_eq!(caller, w.bob.node_id());
-            assert_eq!(reason, out.denied());
-        }
-        other => panic!("expected denied, got {other:?}"),
-    }
 
     // alice without a token: told why she has no identity, and what to do.
     let out = call(

@@ -11,16 +11,14 @@
 //!   its freshness; hosts fetch it whole, and each caller its view (the
 //!   services it may use, card 37). It never decides a call (card 36).
 //! - **host** (`host/`) — `wires serve`: implements the services the signed
-//!   policy assigns to it, checks every caller against that policy, and keeps
-//!   its own log of every call.
+//!   policy assigns to it, checks every caller against that policy, and
+//!   writes one log line per call.
 //! - **caller** (`caller/`) — `wires login | services | call | mcp | inbox`:
 //!   holds only its view, and runs remote CLIs by service name (`mcp` serves them as MCP over stdio,
 //!   for the MCP clients people already use).
 //! - **gateway** (`gateway/`) — `wires gateway`: those services as a
 //!   remote MCP server with OAuth, for web clients (Claude.ai), each call
 //!   made with the signed-in user's own ID token.
-//! - **observer** — `wires watch`: streams call records from the hosts' own
-//!   logs, to readers the registry names (card 26b, `caller/watch_records.rs`).
 //!
 //! `policy/` is where the signed policy lives on every node and how it moves.
 //!
@@ -59,7 +57,7 @@ mod policy;
 pub use host::embed::{Host, HostBuilder};
 pub use host::native::{Call, CallIo, Service, SharedIo};
 /// The types a [`Call`] is described in.
-pub use library::{CallId, NodeId, Principal, RoleName, ServiceName, StateVersion};
+pub use library::{NodeId, Principal, RoleName, ServiceName, StateVersion};
 
 /// The integration tests — the whole stack over hermetic loopback, in one
 /// place because none of them belongs to a single module's seam.
@@ -172,11 +170,6 @@ enum Command {
     /// Serve each signed-in user's services as a remote MCP server (HTTP + OAuth)
     #[command(after_help = help::GATEWAY_AFTER)]
     Gateway(gateway::GatewayArgs),
-
-    // --- reader ---
-    /// Stream the call records you may read, verified, from the services' hosts
-    #[command(after_help = help::WATCH_AFTER)]
-    Watch(caller::watch_records::WatchArgs),
 
     /// Dev build only: run the hermetic mock OIDC issuer on a loopback port
     /// until killed. Prints `issuer <url>` and `client_id <id>` on stdout.
@@ -354,11 +347,6 @@ pub fn run() {
             if let Err(e) = served {
                 exit_with(e);
             }
-        }
-        // Exit 77 when every host refused the stream.
-        Command::Watch(a) => {
-            init_quiet_logging();
-            exit_with_code(runtime().block_on(caller::watch_records::watch_cmd(a)))
         }
         #[cfg(feature = "dev-mock-idp")]
         Command::DevMockIdp(a) => {

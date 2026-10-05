@@ -4,12 +4,12 @@ This document describes the protocol as the code implements it today: `library/`
 codecs) and `wires/` (the iroh transport and CLI).
 
 **What outranks what.** The premise outranks this document, and this document outranks the code.
-The premise: remote CLIs are distributed securely over iroh; IdP authentication and authorization
-keep out anyone who isn't allowed; agents can't observe each other's work, and the isolation
-boundary is the verified person (the IdP principal); `wires watch` lets the people the registry
-names as readers observe calls, in full, for logging and compliance. If the code disagrees with
-this document, the code is the bug, unless this document breaks the premise, in which case both
-are fixed. What the premise needs and the code doesn't do yet is listed in §10.
+The premise: an agent runs a CLI that lives on another machine as if it were local; the caller is
+a person the IdP verified, who sees and can call only the services the admin-signed policy grants
+them; the machine is reached by key, with no port or VPN; and a service can message its caller
+back. If the code disagrees with this document, the code is the bug, unless this document breaks
+the premise, in which case both are fixed. What the premise needs and the code doesn't do yet is
+listed in §9.
 
 The architecture around it (who runs what, what each node keeps, and how each kind of metadata
 moves) is [fabric.md](fabric.md). Usage, roles and the demo are in [usage.md](usage.md), [the board](board/README.md) and
@@ -24,13 +24,13 @@ moves) is [fabric.md](fabric.md). Usage, roles and the demo are in [usage.md](us
 | **The caller is always `to_node_id(conn.remote_id())`**, the key iroh authenticated. It is never a wire field. Every gate below is sound only because of this. | every responder |
 | A network is named by its root key: the `fabric` field every credential signs is `root.node_id()`. | `Membership::mint`, `Policy::new` |
 | Signed objects sign a domain-separation prefix (where they have one) followed by `canonical_bytes(body)`: canonical JSON with keys sorted by `serde_json`'s default `BTreeMap` ordering. `preserve_order` and `arbitrary_precision` must never be enabled. | `library/codec.rs` |
-| Every signed body carries a signed format discriminant and a fixed, complete set of fields. **An optional signed field is not allowed**, because an absent field and a present default sign different bytes; "none" is an empty value. A new format gets a separate body, and an old verifier rejects it with `UnsupportedVersion`. Signed types refuse unknown fields at decode. | membership, policy head, items, service entry, `Fresh`, call-log entry |
+| Every signed body carries a signed format discriminant and a fixed, complete set of fields. **An optional signed field is not allowed**, because an absent field and a present default sign different bytes; "none" is an empty value. A new format gets a separate body, and an old verifier rejects it with `UnsupportedVersion`. Signed types refuse unknown fields at decode. | membership, policy head, items, service entry, `Fresh` |
 | Every signed credential signs its own authority (`fabric`), and `verify(root)` requires `fabric == root`. | membership, policy head, service entry, `Fresh` |
 | Tokens are base64url-no-pad of canonical JSON. Wire frames are a 4-byte big-endian length followed by a body; the length is checked before the body is allocated. Frame envelopes are unsigned, so `skip_serializing_if` is safe in them. | all codecs |
 | `alg` is always `Ed25519`. `not_after` is inclusive, and a credential is expired when `now > not_after`. Times are unix seconds, except `*_ms` fields. | all |
 
 Every node binds one iroh endpoint (`presets::N0`: n0 DNS/pkarr discovery and relays) and is dialed
-**by key**. Addresses are never authority; see §9 for the optional local hints file.
+**by key**. Addresses are never authority; see §8 for the optional local hints file.
 
 ## 2. Membership: badges and bans
 
@@ -45,7 +45,7 @@ transferable); `now <= not_after` (`Expired`).
 **A node is admitted by its badge and not being banned.** `check_admitted(m, fabric_root, policy,
 caller, now)` (`library/membership/policy.rs`) is `check_inclusion`, then `Banned { until }` if the
 signed policy holds a ban for `caller` (§3). Every gate asks this and nothing else about who is in:
-the session gate (§5), the record stream (§8), push and inbox fetch on a host, a caller's inbox
+the session gate (§5), push and inbox fetch on a host, a caller's inbox
 receiving a delivery (§7), the directory (§4) and the web gateway. The signed policy lists no
 members, so admitting a node is minting its badge, not an edit, and removing one is a ban that lasts
 until its badge would have expired anyway.
@@ -64,9 +64,8 @@ on its own (`library/services/{head,item,entry,signed_policy}.rs`):
 PolicyHead { format: 3, fabric, version: StateVersion(u64), issued, not_after,
              directories: [NodeId], items_hash: ItemsHash }
 SignedPolicyHead { head, alg, sig }
-SignedEntry { format: 1, fabric, version, name: ServiceName,
-              service: Service { description, allow: [RoleName], hosts: [NodeId],
-                                 readers: [RoleName] },
+SignedEntry { format: 2, fabric, version, name: ServiceName,
+              service: Service { description, allow: [RoleName], hosts: [NodeId] },
               alg, sig }
 Item = role     { key: RoleName,    body: [Matcher] }
      | service  SignedEntry          // {"kind": "service", ...the entry's fields}
@@ -81,7 +80,8 @@ SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kin
   of the items, in key order, so one signature covers the whole set: no item can be changed,
   dropped, added, or taken from another version. A service entry signs `"wires/service-entry/v1\0"`
   ‖ canonical JSON of every field but `sig`. The prefixes separate them from each other, from
-  memberships, `Fresh` (§4) and call-log entries.
+  memberships and `Fresh` (§4). Format 1 entries also carried a `readers` list; a verifier refuses
+  them (`UnsupportedVersion`).
 - **An entry's `version`** is the policy version at which it last changed. An edit re-signs only
   the entries it changes (`Policy::sign_after` the stored policy); the others keep their signature
   and version. So a caller holding a subset of entries (its view, card 37) can check each one alone
@@ -96,14 +96,14 @@ SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kin
   `old.apply(&update, root)` rebuilds the item set (held + changed − removed), recomputes the hash
   and checks the new head's signature and each changed entry. Any mismatch (an item tampered with,
   withheld or added, an older head) is an error, and the holder asks for the whole policy. A
-  **view** (`library/services/view.rs`) is `{head, entries: [ViewEntry {entry: SignedEntry, call,
-  read}]}`: a caller's services, each verifying alone; `SignedPolicy::view_for(principal, query)`
-  cuts it, and `View::apply(ViewUpdate {head, changed, removed: [ServiceName]}, root)` refuses an
+  **view** (`library/services/view.rs`) is `{head, entries: [SignedEntry]}`: the services a caller
+  may call, each verifying alone; `SignedPolicy::view_for(principal, query)` cuts it, and
+  `View::apply(ViewUpdate {head, changed: [SignedEntry], removed: [ServiceName]}, root)` refuses an
   entry older than the one held.
 - **`Policy::validate`** (run by `sign` and `verify`): no directory listed twice; every role has
   at least one matcher, and **every matcher names an issuer that has an `issuer` item**; every
-  issuer is non-blank and accepts at least one audience; every role a service's `allow` or
-  `readers` names is defined (there is no built-in role); every service host is listed once and
+  issuer is non-blank and accepts at least one audience; every role a service's `allow`
+  names is defined (there is no built-in role); every service host is listed once and
   is not banned; `settings.beat_secs > 0` and `fresh_secs >= beat_secs`.
 - **Hosts are derived.** A host is a node some service's `hosts` names (`Policy::hosts`); there is
   no host list. `is_host` and `assigns(service, host)` are false for a banned node.
@@ -150,8 +150,8 @@ SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kin
 The policy is not secret from the machines the admin placed: directories and hosts hold all of it
 (host node ids, banned node ids, role matchers, trusted IdPs, service names and descriptions, the
 directories), and so does the admin. It names no other member (card 35). **A caller holds only its
-view** (card 37, §4): the root-signed entries of the services its verified person may call or
-read, and the head. No role, no ban, no other service, and no node id but its services' hosts and
+view** (card 37, §4): the root-signed entries of the services its verified person may call,
+and the head. No role, no ban, no other service, and no node id but its services' hosts and
 the directories.
 
 ### Admin surface
@@ -167,7 +167,7 @@ The admin commands and their flags are in [usage.md § Commands by role](usage.m
 - **`issuer set <iss> --client-id <id> [--audience <aud>]… [--public-client-secret S] [--login]`**
   trusts an IdP (or changes one); `--login` makes it the one invites name. **`issuer rm <iss>`**
   stops trusting one, refused while a role's matcher names it. Which issuer invites name, and each
-  public secret, stay in the admin's keystore (`login-client.json`, §9), not in the signed policy:
+  public secret, stay in the admin's keystore (`login-client.json`, §8), not in the signed policy:
   every host holds the policy, and none needs them.
 - **`directory add <node>`** lists an unbanned node in the head's `directories` (once), invited or
   not yet: listed first, its invite then carries the policy it serves from (the command prints the
@@ -176,7 +176,7 @@ The admin commands and their flags are in [usage.md § Commands by role](usage.m
   version 1 that every directory already holds newer. Copy `policy.json` from any host or directory
   (it verifies under the root on the way in).
 - **`invite <node>` is not an edit.** It mints the node's badge, records it in the admin's
-  ledger, `issued.json` (§9: node → label, latest `not_after`), and puts it in the node's token
+  ledger, `issued.json` (§8: node → label, latest `not_after`), and puts it in the node's token
   (below): the version doesn't move and nothing is published. Two cases do edit, and then
   publish: re-inviting a node the policy bans lifts the ban (the ledger then keeps the later of the
   old and new badges' expiries), and a stored policy that has expired is re-signed (a joiner can't
@@ -279,16 +279,15 @@ to dial, 10 s per frame).
 itself, as a host does (§6): the held policy's `issuer` items and their audiences, the IdP's keys
 fetched and held in memory only, the nonce bound to the iroh-authenticated key. Then it cuts the
 view from the held policy, `SignedPolicy::view_for(principal, query)`: the root-signed service
-entries whose `allow` (marked `call`) or `readers` (marked `read`) has a role admitting the
-principal. With no token, or one that doesn't verify, no role admits and the view is empty (the
-head alone). Nothing per user is stored, and a request is **traced, not logged**: a view grants
-nothing, and the host logs every call.
+entries whose `allow` has a role admitting the principal. With no token, or one that doesn't verify, no role admits and the view is empty (the
+head alone). Nothing per user is stored, and a request is only traced: a view grants nothing,
+and the host decides every call.
 
 - `view {have, query: none, held?}`: `held` is the `ViewDigest` of the view the caller holds
   (blake3 over `"wires/view-digest/v1\0"` ‖ the view's canonical JSON). With a verified principal
   and a `held` that names exactly the view the directory would diff from: `current {fresh}` when
   `have` is the newest and `held` is the view now; a `view_update {update, fresh}` (`ViewUpdate
-  {head, changed: [ViewEntry], removed: [ServiceName]}`, the principal's view at the kept head
+  {head, changed: [SignedEntry], removed: [ServiceName]}`, the principal's view at the kept head
   `have` diffed against the view now) when `have` is one of the kept heads and `held` is the view
   at it. Anything else gets the whole `view {view, fresh}`: no `held`, one that doesn't match (a
   view cut for another identity, or the empty one `wires join` stores), and any request without a
@@ -355,7 +354,7 @@ else. `wires policy push` re-publishes it. With no directory at all, the line sa
 fails; a new node gets the policy in its invite token. Two exceptions:
 
 - **The first run.** Until a directory the publish aims at has taken one from this admin
-  (`reached.json`, §9), reaching none is a note that no directory is running yet, and exits 0. So
+  (`reached.json`, §8), reaching none is a note that no directory is running yet, and exits 0. So
   starting a network (`init`, `directory add`, edits, the directory's invite, `directory serve`)
   errors nowhere; from the first publish a directory takes, reaching none exits 1 as above.
 - **A stale copy.** A directory answering a newer version, or showing another head at the offered
@@ -401,11 +400,10 @@ back at start if it still vouches for the head on disk. Before each call's regis
   recently; try again later` (exit 77 at the caller), until a current `Fresh` arrives; then serve
   again. A ban is then honoured on every host within `fresh_secs` of its publish, at the cost of
   the directories becoming a dependency for calls. The refusal comes after the badge and ban check
-  and the ID token, so it is an admitted caller's refusal and is written to the call log like any
-  other (one record per refused call: the log shows which calls the host refused while it could
-  not vouch for its policy).
+  and the ID token, so it is an admitted caller's refusal, traced like any other (§5): the host's
+  log shows which calls it refused while it could not vouch for its policy.
 
-Push and the record stream decide under the held policy whatever its freshness.
+Push decides under the held policy whatever its freshness.
 
 **Fetch (a host's start).** `fetch` asks the directories the held head lists, in order, never
 itself, for `policy {have}`, and stops at the first answer that settles it:
@@ -427,7 +425,7 @@ assigned to it catches up at `serve` start from a directory, or by joining with 
 (re-joining never rolls back).
 
 **Callers keep their view current** (card 37; `wires/caller/view.rs`). A caller stores
-`view.json` (§9): the view, the newest `Fresh` for its head, when a directory last vouched for it,
+`view.json` (§8): the view, the newest `Fresh` for its head, when a directory last vouched for it,
 and the newest head version a host reported. The directories it asks are its view's head's (else
 the ones `wires join` stored), never itself. A node that holds the whole policy (the admin's, a
 host's, a directory's) cuts its own view from it instead of asking.
@@ -476,8 +474,9 @@ failure below is sent as `Denied` (`wires/host/gate.rs`):
    caller, now)`: the badge and the bans (§2). Anyone else — no badge, someone else's, another
    network's, expired, banned — hears only `not a member of this network`: no reason, no policy
    version. Their
-   token is never verified (no JWKS fetch, no identity-index entry), and the refusal is traced
-   (throttled), **not** written to the call log, so strangers can't fill it.
+   token is never verified (no JWKS fetch, no identity-index entry), and the refusal is traced at
+   `debug`, with at most one `info` line per 10 s counting them, so strangers can't flood the
+   host's log.
 3. **Identity.** The `id_token`, if any, is verified by the host itself (§6); the principal, or why
    there is none, is kept for the next steps. A token that fails is `your ID token could not be
    verified` or `the identity provider is unreachable from this host`; the detail is only in the
@@ -491,10 +490,16 @@ failure below is sent as `Denied` (`wires/host/gate.rs`):
 5. **Implementation.** Only an admitted caller learns whether this host implements the service,
    in `host.json` or natively (`service … is not implemented on this host`).
 
-Every refusal from step 3 on (the caller is admitted) is logged as an `AuditRecord::Denied`.
+**The host's log line.** wires keeps no record of a call beyond one ordinary `tracing` line at
+`info` in `serve`'s own output (`wires/host/call_trace.rs`): when an admitted call ends (`call
+finished`: service, caller node, the person's issuer, subject and email, role, exit code,
+`duration_ms`, and `bytes_out`, the bytes of stdout and stderr sent to the caller), and when a
+caller with a verified identity is refused from step 3 on (`call refused`: the same, without exit,
+duration and bytes, with the reason it was sent). No argv, no stdin, nothing signed, no file of its
+own; an operator who wants a record points a log collector at `serve`'s output. A refusal of an
+admitted caller with no verified identity is traced at `debug`.
 
-The host then appends the call's `Started` to its call log and `fsync`s it (§8) — if it can't, the
-call is refused (`this host can't record calls right now…`) and nothing runs — sends `HelloAck`
+The host then sends `HelloAck`
 (when the caller's `state_version` is older: its root-signed head and the called service's root-signed entry, card 37) and execs the service's fixed argv
 **with the caller's argv appended element by element, never through a shell** (after a `--` when
 the service sets `end_of_options` in `host.json`, so a CLI that honours `--` takes none of the
@@ -503,8 +508,7 @@ child's environment is built from nothing (`env_clear`): only `PATH`, `LANG` and
 inherited from `serve`; then `host.json`'s `env`; then the server-derived `WIRES_CALLER_NODE`,
 `WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_AFTER`, `WIRES_STATE_VERSION`, `WIRES_SERVICE`,
 `WIRES_ROLE`, and, when verified, `WIRES_CALLER_EMAIL`. With `push` on, also
-`WIRES_PUSH_SOCKET` and `WIRES_PUSH_TOKEN`, the call's push capability (§7), already bound to the
-call's id before the child starts. The child never gets `WIRES_HOME`, `HOME`, agent sockets or
+`WIRES_PUSH_SOCKET` and `WIRES_PUSH_TOKEN`, the call's push capability (§7). The child never gets `WIRES_HOME`, `HOME`, agent sockets or
 cloud credentials. If the connection closes, the host kills the child.
 
 The child still runs as `serve`'s own Unix user. It is told neither `WIRES_HOME` nor where the
@@ -514,24 +518,23 @@ reach whatever that user can, the host's keystore and operator socket included. 
 switch users itself; the operator does
 ([deployment.md](deployment.md#run-services-as-a-separate-unix-user)). Independently of that, the host fails closed on the parts of its
 keystore a child could tamper with: it keeps the highest policy version it has decided under in
-memory and refuses to decide under an older `policy.json` (`host configuration error`, logged
+memory and refuses to decide under an older `policy.json` (`host configuration error`, traced
 as a rollback), and it trusts only issuer keys it fetched itself (§6).
 
 **Native services** (`wires/host/native.rs`, `wires/host/embed.rs`). An app can embed
 the host (`wires::Host::builder(<keystore dir>)`, `.service(name, impl wires::Service)`, `.serve()`)
-and implement services in-process. The wire, the gate, the log and the bridge are the ones above:
+and implement services in-process. The wire, the gate, the log line and the bridge are the ones above:
 a native service is invoked by `Invoke`, reads the caller's stdin, writes stdout and stderr, and
 its exit code is the call's. Callers can't tell it from a CLI. The handler runs as a tokio task
-only after `Started` is fsynced and `HelloAck` is sent. It gets the verified caller as a type
-(`Call`: node, principal, role, policy version, service, argv, call id) in place of the `WIRES_*`
+only after `HelloAck` is sent. It gets the verified caller as a type
+(`Call`: node, principal, role, policy version, service, argv) in place of the `WIRES_*`
 variables. With push configured (`host.json` `push`, or the builder's `push_allow`), the host mints
 the call's push capability as it does for a child and hands it over in-process:
 `Call::push_to_caller(subject, body)` is checked against the same live-token registry (only this
-call's caller, until the grace period after the call ends, §7), goes through `push.allow`, and is
-logged naming the call. If the connection closes (or the host stops), a Rust handler's task is
+call's caller, until the grace period after the call ends, §7), and goes through `push.allow`. If the connection closes (or the host stops), a Rust handler's task is
 aborted at its next `.await` and the call exits -1; a Python or JavaScript handler can't be
 aborted, so its next read or write fails instead. If a handler panics, the call exits -1. Either
-way the call gets its `Finished`, and its stdio is recorded like a child's (§8). `host.json`'s
+way the host writes the call's log line, as for a child. `host.json`'s
 `also_require` applies to CLI services only: a native service is gated by the signed policy alone,
 and a handler wanting a stricter local rule checks `Call::role` or `Call::principal` itself. An
 embedded host starts like `serve`: the signed policy must assign every service to it, CLI and
@@ -542,7 +545,7 @@ check, the directory's loops (when it runs one), the protocol router with its se
 endpoint (closed). `Host::serve` is
 `serve_until` Ctrl-C, which claims SIGINT process-wide; the bindings' `serve` doesn't listen for
 it unless asked (`serve(handle_ctrl_c=True)`, `serve(true)`). The node
-key lives in the app's memory (§9): a native service is the operator's own code, as trusted as
+key lives in the app's memory (§8): a native service is the operator's own code, as trusted as
 `serve`, so nothing isolates it from the key the way a child is kept away from it.
 `bind_loopback()` binds the host's direct (IP) transport only on `127.0.0.1` and `::1`, with no
 port mapping; callers elsewhere reach it through its relay. It exists for local demos: a host bound
@@ -557,7 +560,7 @@ refuses to dial from an expired one (it refreshes first; failing that, exit 1: a
 `wires policy push` or a fresh invite). It takes the service's hosts from the service's root-signed
 entry, the last host that answered (`last-good.json`) first, then the admin's order. A name the
 view doesn't hold is asked of a directory (`resolve`); a name no directory resolves for this
-caller, or whose entry is marked `read` only, ends the call before any dial (exit 1, with `run
+caller ends the call before any dial (exit 1, with `run
 wires login` when it isn't signed in). It
 fails over to the next host **only when a dial fails** (10 s each); a host that answered has
 decided. It sends `Hello` and `Invoke` together, then, before it forwards a byte of stdin,
@@ -638,15 +641,16 @@ principal, which the host learns only when the recipient presents its token to i
 an inbox fetch, both of which it admitted by badge first. `--to <role>` names the nodes whose known
 principal the role admits; a node with no verified identity here is in no role. A fetch is checked
 like a call: at most 64 undecided at once, the badge and the bans first, and a node not admitted
-hears only `not a member of this network`, has its token left unverified, and is traced, not
-logged; a banned node's queue is dropped (each message logged `denied`), and a push to it or its
+hears only `not a member of this network`, has its token left unverified, and is traced (throttled);
+a banned node's queue is dropped (each message traced `denied`), and a push to it or its
 fetch is refused. A node holds at most 2 long polls open per host; an admitted node's policy
-refusal is answered, not logged (`wires inbox` asks every host of its services).
+refusal is answered and traced at `debug` (`wires inbox` asks every host of its services).
 
 A receiver refuses a message whose `from` is not the authenticated peer or whose `to` is not itself.
 Delivery is at least once; the receiver removes duplicates by `PushId`. The host queues up to 64
 messages per recipient (oldest dropped), in `push-queue.json`. The TTL defaults to 24 h and is at
-most 7 d. Each milestone is an `AuditRecord::Push`.
+most 7 d. Each milestone (`queued`, `delivered`, `fetched`, `expired`, `dropped`, `denied`) is
+traced at `debug`, with the subject and never the body.
 
 `wires push` hands the message to the running `serve` over one of two local sockets (NDJSON,
 `wires/host/control.rs`), each mode 0600 in a 0700 directory that the server and the operator's
@@ -665,83 +669,14 @@ client both check is owned by `geteuid()`:
   call's caller node id (never a role or another node); the operator's `push` form is refused
   there. A token is live for the call and 10 minutes after it ends (`CAPABILITY_GRACE`), so a job
   the call started can still report; tokens are memory-only, so a restart kills them. The push
-  still passes `push.allow`, and its records carry `call`, the call whose capability sent it.
+  still passes `push.allow`.
 
 This is push as built. Designed, parked ([card 31](board/backlog/31-inbox-delivery.md)): every
 callback goes to the calling node **and** principal through the call's capability only, the
 operator's `push` narrows to `--to <node-id>`, role addressing goes, and an `inbox` MCP tool
 reaches `wires mcp` and the gateway.
 
-## 8. Records
-
-**The call log** (`library/calls/call_log.rs`, `wires/host/call_log.rs`). Every `AuditRecord` a host
-produces (`started {call, caller, principal?, service, argv, state_version, role}` (the policy
-version it was decided under) —
-`finished {call, exit, duration_ms, stdout/stderr bytes, stdout_digest, stdin_bytes, stdin_digest, stdin_head ≤4 KiB}`, `denied {caller, principal?, service?, reason}`, `push {id, to,
-principal?, role?, subject, outcome, reason?, body?, call?}`; a `principal` is the verified
-`{issuer, subject, email?, …}`) becomes a `LogEntry { v: 1, host, seq, prev, at_ms, record,
-sig }`: dense 0-based `seq`, `prev` the hash of the previous entry (zero at seq 0), signed by the
-host over `"wires/call-log/v1\0"` ‖ canonical JSON of the other fields. `verify_chain` reports a bad
-signature, a gap, a broken link or a fork. The log is `call-log.jsonl` (fsync per entry), re-verified
-on open, pruned from the front after 30 days, and optionally exported over OTLP/HTTP
-(`audit.otlp`: https, or plain http only to a loopback collector). A host can still withhold or truncate its own history; rewrites are detectable only
-against a copy someone holds.
-
-**Fail closed.** Every record is awaited until it is written and fsynced (at most 5 s), never dropped
-to keep a session moving. A call's `started` is logged **before** its child is spawned; if it can't
-be, the call is refused and doesn't run. `finished`, an admitted caller's `denied` and push records describe
-something that already happened, so a failure is traced as an error and the session goes on; while
-the log stays unwritable every new call fails its own `started` and is refused, and the host serves
-again once an append succeeds (a failed append is cut off the file first). A `started` without a
-`finished` means the end wasn't recorded, not that the call never ran. Refusals of peers that are not
-admitted (no valid badge, or banned) are traced, not logged (§5), so no one outside the network can
-write to it.
-
-**The record stream** (`wires/records/1`, `wires/host/record_stream.rs`): length-prefixed JSON
-frames. The reader sends `open {hello, services, since?, mine, follow}`. The host checks admission
-first (the badge in `hello` and the bans, §2): a reader that isn't admitted gets `denied` with the
-fixed text `not a member of this network` and nothing else (the detail is traced, throttled). Before it has decided, it reads an
-`open` of at most 64 KiB, sizes no buffer from a length prefix, and holds at most 16 undecided
-readers (one more is closed unanswered). Otherwise it answers `granted {scopes, tip?, first?}`: per requested service
-assigned here, `all` when the reader's verified principal is in one of the service's `readers` roles
-and it didn't ask for `mine`, else `mine`; `tip` is the log's newest `{seq, hash}` and `first` the
-oldest seq it still holds. Then `batch`es of items after `since`, `caught_up`, and with `follow` more
-batches as the log grows. A `follow` stream is re-decided (admission, freshness, readers) whenever the
-host's signed policy changes and when the reader's ID token, the policy or its membership expires:
-`denied` ends it when access is gone (including an ID token that expired: the reader logs in and
-watches again), and a new `granted` precedes entries decided under a changed view.
-
-Each entry is sent either **in full** (signed, as stored) or inside a `hidden` run carrying only its
-`{prev, hash}` link, so the reader checks the chain across what it may not see. An entry is shown in
-full when its service was requested and granted `all`, or when its service was requested and its
-subject is the reader's **person**: the same verified principal (issuer and `sub`) the host verifies
-for the reader now, whichever node either used. A reader with no verified principal sees nothing in
-full. Subjects and services: `started` — its service, its `principal`; `finished` — its `started`'s (if
-that was pruned, the entry is only a hidden link); `denied` — its service, its `principal` (no service:
-shown only to its subject); `push` — the service of the call whose capability sent it (`call` → that
-call's `started`), and the principal it was admitted for. An operator push (no `call`), or one whose
-call's `started` was pruned, is shown only to its recipient.
-
-What hidden links reveal: a reader in no `readers` role still learns how many entries each host it
-reads logged, and under `follow`, when each was written (a run arrives as the entries are appended).
-Not what, by whom, or for which service. ([Card 09](board/backlog/09-witness.md) would replace this with
-checkpoints and inclusion proofs, and drop hidden links for non-readers.)
-
-`wires watch` asks the hosts of the services in its view (card 37: those it may read in full, and those it may call, for its own records; with no service named, all of them) and merges their backlogs by time. It keeps, in `record-marks.json`, **one chain anchor
-per host** (the furthest entry it verified there, under any view) and a **resume point per view** (the
-services asked of that host, `mine`). A view resumes from its own point, and wherever its stream passes
-the anchor the entry there must be the one verified before, and the next must link to it; entries
-before the anchor are shown only once the anchor confirms them. So a rewrite is caught even by a view
-that never saw that stretch. Against `granted`: a `tip` below the anchor is a rollback, and a different
-hash at the anchor a fork; both are alarms. A `first` past the entry after the anchor is retention: a
-notice (`host … pruned entries before seq N (retention)`), and the anchor restarts from what the host
-still holds. Any alarm stops that host's stream (exit 1) and leaves its marks at the last good entry.
-The service label a line shows is the reader's own, derived from signed records: a `started`'s service,
-paired locally with its `finished` and the pushes naming its call; the host sends no label.
-
-Nothing is broadcast: a record's content leaves a host only when a reader asks for it and may see it; any other admitted node asking gets its hash link.
-
-## 9. Keystore (`$WIRES_HOME`, else `$XDG_CONFIG_HOME/wires`, else `~/.config/wires`)
+## 8. Keystore (`$WIRES_HOME`, else `$XDG_CONFIG_HOME/wires`, else `~/.config/wires`)
 
 | File | Mode | Holder | Content |
 |---|---|---|---|
@@ -750,7 +685,7 @@ Nothing is broadcast: a record's content leaves a host only when a reader asks f
 | `issued.json` | 0600 | admin | the ledger of badges it minted: node → label (for `remove` and `service --host`), latest `not_after` (how long a ban must last); never sent |
 | `membership.json` | 0644 | every node | its badge (membership token) |
 | `policy.json` (+ `.lock`) | 0600 | admin, host, directory | the newest verified signed policy (§3); **a caller holds none** |
-| `view.json` | 0600 | caller (any node that calls) | its view: the head, the root-signed entries it may call or read, the newest `Fresh`, when a directory last vouched, the newest head a host reported (§4 *Views*) |
+| `view.json` | 0600 | caller (any node that calls) | its view: the head, the root-signed entries it may call, the newest `Fresh`, when a directory last vouched, the newest head a host reported (§4 *Views*) |
 | `directories.json` | 0600 | every joined node | the invite's directory ids: where to ask before a head names them |
 | `login.json` | 0600 | every joined node | the invite's login settings: issuer, client id, public client secret (`wires login`'s defaults) |
 | `login-client.json` | 0600 | admin | which trusted IdP invites name, and each client's public secret; never signed, never published |
@@ -761,8 +696,7 @@ Nothing is broadcast: a record's content leaves a host only when a reader asks f
 | `hints` | — | any node | optional local dial hints (below) |
 | `tools.json` | — | caller | locked mode; optional aliases |
 | `inbox/` | 0700 | caller | `new/` (≤256 unread), `read/` (last 1024), `notes/` |
-| `record-marks.json` | — | reader | `wires watch`: per host, the chain anchor, a resume point per view, recent call labels |
-| `call-log.jsonl`, `push-queue.json` | — | host | §8, §7 |
+| `push-queue.json` | — | host | §7 |
 | `gateway-client-key`, `gateway-sessions.json` | 0600 | web gateway | the key DCR client ids are MAC'd with; live web sessions keyed by token hash |
 | `jwks/` | — | caller | cached issuer keys (a host never reads it, §6) |
 | `run/serve.sock`, `run/hint` | 0600 | host | the operator's push socket; this host's own hint line |
@@ -798,7 +732,7 @@ Flags, environment variables and `--…-file` paths override the keystore, in th
 precedence. Locked mode (`WIRES_LOCKED`) refuses the credential flags and the `WIRES_NODE_SEED` /
 `WIRES_MEMBERSHIP` variables; it assumes the agent can't set its own environment.
 
-## 10. Known limits
+## 9. Known limits
 
 The full list, kept in one place, is [usage.md § Known trade-offs](usage.md#known-trade-offs). The
 ones that bound this spec:
@@ -807,15 +741,14 @@ ones that bound this spec:
   admits nobody, is served by no directory, and is dialed from by no caller.
 - A host follows one directory at a time (the others are failover it dials only when that one
   is gone), and a host newly listed as a directory runs the directory mode only after a restart.
-  Under `lenient`, a lapse shows only in the host's trace, not yet in `wires watch`.
+  Under `lenient`, a lapse shows only in the host's trace.
 - A caller holds only its view (card 37), but hosts and directories hold the whole policy (roles,
   services, host ids, bans, issuers, directories), and a directory sees who asks for which view
-  (it traces, not logs, the requests). A directory can withhold an entry from a view, or serve a
+  (it only traces the requests). A directory can withhold an entry from a view, or serve a
   stale one within `Fresh`'s bound; the host still decides every call. A removed host whose badge
-  hasn't expired still sees the argv of a caller whose view predates the removal. A caller's own
-  records of a service no longer in its view (a revoked grant) are no longer its to read with
-  `wires watch`. Until [card 09](board/backlog/09-witness.md): hidden record links (§8) tell a
-  non-reader how many entries a host logged, and when.
+  hasn't expired still sees the argv of a caller whose view predates the removal.
 - A host knows a caller's identity only once the caller presented its token to that host.
-- A host can withhold or truncate its own log (§8).
+- wires keeps no record of a call beyond the host's ordinary log line (§5): nothing signed, and
+  nothing a caller or an auditor can read back from a host. A signed call record is a future
+  design.
 - One network per keystore.

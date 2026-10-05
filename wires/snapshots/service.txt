@@ -13,5 +13,5 @@ Options:
 
 Examples:
   wires service add orders-db --description "Read-only SQL over the orders database" \
-    --allow analyst --reader security --host workbench
+    --allow analyst --host workbench
   wires service rm orders-db

@@ -540,7 +540,6 @@ mod tests {
                             description: "a service with an ordinary description".into(),
                             allow: vec![staff.clone()],
                             hosts: vec![host],
-                            readers: vec![],
                         },
                     );
                 }

@@ -1,8 +1,8 @@
 //! `wires serve host.json`: the host's one command.
 //!
 //! What the host implements — each service's command, working directory and
-//! environment, the IdPs it trusts, stricter local rules, push, and where its
-//! call log is exported — comes from `host.json` (version 2, see
+//! environment, the IdPs it trusts, stricter local rules and push — comes
+//! from `host.json` (version 2, see
 //! [`config`](super::config)). Who may call, and which IdPs are trusted,
 //! is the admin-signed policy's to say (`host.json` can only narrow). The
 //! flags left are where the host's own credentials live and `--relay-url`.
@@ -22,9 +22,7 @@ use library::NodeId;
 
 use super::config::HostConfig;
 use super::native::NativeServices;
-use super::{
-    call_log, capability, control, follow, freshness, gate, identity, otlp, push, transport,
-};
+use super::{capability, control, follow, freshness, gate, identity, push, transport};
 use crate::admin::keystore;
 use crate::caller::jwks;
 use crate::init_logging;
@@ -63,8 +61,8 @@ pub(crate) struct ServeArgs {
 
 /// `serve`: refuse to start unless this node holds a fresh signed policy
 /// that assigns every service in `host.json` to it (fetching one from a
-/// directory first if it doesn't); then serve the session and record-stream
-/// ALPNs (the directory's too, when the policy lists this node), and — with
+/// directory first if it doesn't); then serve the session ALPN (the
+/// directory's too, when the policy lists this node), and — with
 /// `push` — the inbox ALPN plus a local control socket for `wires push`,
 /// deciding every call by the signed policy as it stands at that connection.
 pub(crate) async fn serve_cmd(a: ServeArgs) -> anyhow::Result<()> {
@@ -99,10 +97,10 @@ pub(crate) struct Serving {
     pub(crate) node: library::NodeIdentity,
     /// Its membership, which names the network whose signed policy decides.
     pub(crate) membership: library::Membership,
-    /// Its keystore: the signed policy, the call log, the push queue.
+    /// Its keystore: the signed policy, the push queue.
     pub(crate) keystore: Arc<keystore::Keystore>,
     /// How it implements its CLI services, how it narrows the trusted IdPs,
-    /// push, and audit export.
+    /// and push.
     pub(crate) config: HostConfig,
     /// The services it implements in-process (card 33).
     pub(crate) native: NativeServices,
@@ -129,8 +127,8 @@ pub(crate) enum Binding {
 
 /// Serve `serving` until `shutdown` resolves: refuse to start unless the
 /// node holds a fresh signed policy that assigns every service to it
-/// (fetching one from a directory first if it doesn't), open the call log,
-/// then serve the session and record-stream ALPNs (the directory's when the
+/// (fetching one from a directory first if it doesn't), then serve the
+/// session ALPN (the directory's when the
 /// policy lists this node, and push when configured), deciding every call
 /// by the signed policy as it stands at that connection (and its signed
 /// freshness rule), and following a directory's `policy` subscription for
@@ -181,17 +179,6 @@ pub(crate) async fn serve_until(
     } else {
         None
     };
-    let exporter = match host.config.audit.as_ref().and_then(|a| a.otlp.as_deref()) {
-        Some(url) => Some(otlp::Exporter::spawn(url)?.0),
-        None => None,
-    };
-    let log = call_log::CallLog::open(
-        &ks.path(call_log::LOG_FILE),
-        node.duplicate(),
-        library::Retention::default(),
-    )?;
-    let (sink, _tee) = call_log::start(log, exporter);
-    host.audit = Some(sink);
     // The push service's queue, made before the host is shared so native
     // services can reach it.
     let push_queue = host.config.push.is_some().then(|| {
@@ -304,7 +291,7 @@ fn membership_fabric(host: &gate::ServicesHost) -> NodeId {
     host.trust_root
 }
 
-/// A host for `me` (before its call log is attached): its identity verifier
+/// A host for `me`: its identity verifier
 /// trusts the signed policy's issuers as `config` narrows them (updated
 /// whenever it reads a newer policy), and keeps their keys **in memory only**
 /// (a key set on disk could have been planted by anything running as this
@@ -360,7 +347,6 @@ pub(crate) fn services_host(
         config,
         native: Default::default(),
         identities,
-        audit: None,
         push_grants,
         push_commands: None,
         freshness,
@@ -389,8 +375,8 @@ pub(crate) async fn push_sockets(
     Ok(handles)
 }
 
-/// Serve a host on `endpoint`: the session ALPN, the record stream (`wires
-/// watch`, card 26b), the directory's two ALPNs when this node is one, plus
+/// Serve a host on `endpoint`: the session ALPN, the directory's two ALPNs
+/// when this node is one, plus
 /// the inbox ALPN when it pushes (and push's direct deliveries dial from
 /// this endpoint). Keep the router alive for as long as the host serves.
 pub(crate) fn services_router(
@@ -403,15 +389,7 @@ pub(crate) fn services_router(
     if let Some(dir) = directory {
         builder = crate::directory::serve::Running::mount(builder, dir);
     }
-    let mut builder = builder
-        .accept(
-            transport::ALPN,
-            transport::ServicesProtocol::new(Arc::clone(&host)),
-        )
-        .accept(
-            super::record_stream::ALPN,
-            super::record_stream::RecordStream::new(host),
-        );
+    let mut builder = builder.accept(transport::ALPN, transport::ServicesProtocol::new(host));
     if let Some(push) = push {
         push.attach(endpoint);
         builder = builder.accept(library::INBOX_ALPN, push::PushFetch(push));
