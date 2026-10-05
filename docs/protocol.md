@@ -401,15 +401,28 @@ per node). One more is refused with `denied` (`this directory's subscriber cap (
 **Replicas.** Each directory subscribes to every other directory its head lists, as `replica`,
 reconnecting after a failure with a pause growing from 1 s to 30 s. A `policy` frame is taken when
 its head verifies under the root, its `Fresh` vouches for that head, and it is newer; then it is
-accepted as above. So a directory that missed a publish catches up from another. There is no
-consensus: one author, and "newer" is a version number.
+accepted as above. So a directory that missed a publish catches up from another: as soon as the
+other takes it when its subscription is open (tens of milliseconds on loopback), or when its
+subscription opens (a restarted directory subscribes as it starts, about a second with n0
+discovery), but up to 30 s later while it is in a reconnect pause. There is no consensus: one
+author, and "newer" is a version number.
 
 **Publish (admin).** After every admin edit, and on `wires policy push`, the admin dials,
 concurrently, every directory the new head lists plus every directory the head before the edit
 listed (so a directory the edit drops learns it), never itself, and sends `publish`. It dials no
 host. A directory counts as delivered when it answers `published` with the offered version and the
-offered head's `HeadHash`. Stderr says `policy version N: published to K of D directory(ies)`,
-naming any not reached. **When D > 0 and K = 0 the command exits 1**: the new policy is stored on
+offered head's `HeadHash`. **A directory it could not dial is tried again**, 1 s after each try,
+until it takes the publish or 15 s from the first try have passed, when it has taken a publish
+from this admin before (`reached.json`, §8); `wires policy push` tries every directory so. A
+directory that answered with a refusal is not tried again. This covers a directory that has just
+restarted: it binds a new port, n0 discovery has no record of it for about 3 s, and a stale
+`hints` line costs a whole 5 s dial; each new dial looks the key up again. A directory never
+reached (the first run, below) is tried once, so an edit made before any directory runs doesn't
+wait. Stderr says `policy version N: published to K of D directory(ies)`, naming each directory
+not reached and each that refused; when another took it, the line adds that hosts following the
+one missed decide under the policy before it until it takes this one from a directory that did
+(a replica, below), and that `wires policy push` re-publishes it. **When D > 0 and K = 0 the
+command exits 1**: the new policy is stored on
 the admin and nowhere else. `wires policy push` re-publishes it. With no directory listed at all,
 the line says the policy is stored here and that `wires directory add` comes next, and nothing
 fails. Two exceptions:
@@ -833,7 +846,7 @@ reaches `wires mcp` and the gateway.
 | File | Mode | Holder | Content |
 |---|---|---|---|
 | `root.seed`, `node.seed` | 0600 | admin / every node | hex Ed25519 seed |
-| `reached.json` | 0600 | admin | the directories that have taken a publish from this admin: until one a publish aims at has, reaching none is the first run, not a failure (§4) |
+| `reached.json` | 0600 | admin | the directories that have taken a publish from this admin: until one a publish aims at has, reaching none is the first run, not a failure; a publish tries one of these again when it could not dial it (§4) |
 | `labels.json` | 0600 | admin | label → node id (§3 *Labels*); never signed, never sent |
 | `network.json` | 0600 | every joined node but the admin | the network string `join` or `login` stored (§2): the root, up to two directories, the login settings |
 | `policy.json` (+ `.lock`) | 0600 | admin, host, directory | the newest verified signed policy (§3); **a caller holds none** |

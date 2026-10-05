@@ -106,8 +106,9 @@ address records.
 3. **Callers** use `view.json`. The first call's `HelloAck` tells them whether the policy moved; a
    view older than a day is refreshed before dialing (by `wires call` and `wires inbox`) when a
    directory answers, and kept when none does, until the policy it came from expires.
-4. **If the admin edited while directories were off**, the edit's publish failed (exit 1) and the
-   change is only on the admin. It spreads when the admin runs `wires policy push`.
+4. **If the admin edited while directories were off**, the edit's publish failed (exit 1, after
+   trying each directory for 15 s) and the change is only on the admin. It spreads when the admin
+   runs `wires policy push`.
 
 A network survives any length of downtime, **except expiry**. If the head (90 days by default)
 expired meanwhile, nodes refuse to use it until the admin signs a new one with any edit, and
@@ -189,9 +190,14 @@ which carry each subscriber only what it may hold: a host the policy, a caller i
   view. A host or directory runs `wires join <network>`, which contacts nobody; the admin names it
   in the policy by its key. The policy doesn't change when a caller joins.
 - **Change policy.** An admin edit signs head N+1, re-signing only the service entries it changed,
-  and publishes it to every directory. Directories send every subscribed host a `policy_update`:
-  the new head, its `Fresh` and the changed items. The host applies it to its copy and checks the
-  result against the head's one signature; any mismatch, and it fetches the whole policy.
+  and publishes it to every directory. One it can't dial is tried again for up to 15 s (a
+  directory that has just restarted can't be found by its key for about 3 s); one that still
+  missed it takes the edit from another directory by its replica subscription (about 40 ms after
+  the other took it, in the loopback test `wires/e2e/restart.rs`), and until then the hosts
+  following it decide under the policy before it. Directories send every subscribed host a
+  `policy_update`: the new head, its `Fresh` and the changed items. The host applies it to its
+  copy and checks the result against the head's one signature; any mismatch, and it fetches the
+  whole policy.
   Subscribed callers (`wires mcp`, gateway sessions, `wires inbox --wait`) get their changed view
   entries, and a subscriber no longer admitted gets an emptied view and the subscription ends.
   One-shot callers learn at their next call, or when their view is a day old.
@@ -236,7 +242,8 @@ What each node receives grows with the rate of edits, not with the number of nod
 - **A one-shot caller** sends nothing in the background. It holds its view (the services it may
   call), learns of a new head in a call's `HelloAck`, and then asks a directory for what changed.
   `wires mcp` holds a subscription: the whole view once, then a beat and an update per new head.
-- **The admin** sends one publish per directory per edit.
+- **The admin** sends one publish per directory per edit (again, for up to 15 s, to one it can't
+  dial that has taken a publish before).
 
 `cargo run -q --release -p library --example policy_sizes` builds real signed policies and
 measures them. At 1,000 services (and 300 bans) it printed: the whole policy 647 KB (65 KB at

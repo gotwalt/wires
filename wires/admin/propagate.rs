@@ -4,10 +4,16 @@
 //! `directory add | rm`, `policy settings`) is signed and stored here first,
 //! then published to every directory the new head lists (and those the head
 //! before the edit listed) by key ([`fetch::publish_current`]). The admin
-//! dials no host: hosts and callers fetch from a directory. If the policy
-//! names directories and **none** took it, the command fails: the policy is
-//! in force nowhere but here. The new one stays stored here, and `wires
-//! policy push` re-publishes it once a directory is up.
+//! dials no host: hosts and callers fetch from a directory. A directory it
+//! can't dial is tried again for a while ([`fetch::Retry`]: an edit retries
+//! those that have taken a publish before, `wires policy push` every one),
+//! since one that has just restarted can't be found by its key for a few
+//! seconds (card 48). If the policy names directories and **none** took it,
+//! the command fails: the policy is in force nowhere but here. The new one
+//! stays stored here, and `wires policy push` re-publishes it once a
+//! directory is up. When some took it and some didn't, it exits 0: the edit
+//! is in force at those that took it, and the others take it from them by
+//! replica; the line names the ones missed and what that means meanwhile.
 //!
 //! Two exceptions, both about where the network is:
 //!
@@ -35,7 +41,7 @@ use clap::{Args, Subcommand};
 use library::{NodeId, StateVersion};
 
 use super::keystore::{Keystore, write_private};
-use super::{Report, run_edit};
+use super::{Report, run_edit, run_edit_with};
 use crate::policy::fetch;
 
 /// The admin keystore's record of the directories that have taken a publish
@@ -136,9 +142,14 @@ impl Propagation {
 }
 
 /// Publish the policy stored in `ks` to its directories and those in
-/// `earlier` (the policy's before the edit).
-pub(crate) async fn propagate(ks: &Keystore, earlier: &BTreeSet<NodeId>) -> Propagation {
-    settle(ks, fetch::publish_current(ks, earlier).await)
+/// `earlier` (the policy's before the edit), trying those `retry` names
+/// again for a while when the first try misses them.
+pub(crate) async fn propagate(
+    ks: &Keystore,
+    earlier: &BTreeSet<NodeId>,
+    retry: fetch::Retry,
+) -> Propagation {
+    settle(ks, fetch::publish_current(ks, earlier, retry).await)
 }
 
 /// What a publish from `ks` came to: whether it is the first run (no
@@ -208,8 +219,11 @@ pub(crate) async fn policy_cmd(a: PolicyArgs) -> Result<Report> {
             })
             .await
         }
+        // Run once the directories are up: worth waiting for each, whether
+        // or not it has taken a publish before (a directory just started is
+        // not findable by its key for a few seconds).
         PolicyCmd::Push => {
-            run_edit(|ks| {
+            run_edit_with(fetch::Retry::Every, |ks| {
                 if ks.read_root_identity()?.is_none() {
                     anyhow::bail!("no root key here: `wires policy push` runs on the admin");
                 }

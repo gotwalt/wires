@@ -63,11 +63,20 @@ pub(crate) struct Report {
 pub(crate) async fn run_edit(
     edit: impl FnOnce(&Keystore) -> anyhow::Result<Report>,
 ) -> anyhow::Result<Report> {
+    run_edit_with(crate::policy::fetch::Retry::Reached, edit).await
+}
+
+/// [`run_edit`], trying the directories `retry` names again for a while
+/// when the publish's first try misses them.
+pub(crate) async fn run_edit_with(
+    retry: crate::policy::fetch::Retry,
+    edit: impl FnOnce(&Keystore) -> anyhow::Result<Report>,
+) -> anyhow::Result<Report> {
     let ks = Keystore::resolve()?;
     let earlier = crate::policy::fetch::held_directories(&ks)?;
     let report = edit(&ks)?;
     Ok(propagate::fold(
         report,
-        propagate::propagate(&ks, &earlier).await,
+        propagate::propagate(&ks, &earlier, retry).await,
     ))
 }
