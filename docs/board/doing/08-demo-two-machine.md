@@ -18,7 +18,7 @@ The run follows [docs/demo.md](../../demo.md) (cheat sheet at its top).
       IdP/enterprise-managed auth, webhooks, polling, log tampering).
 - [x] Token comparison: n=1 in the Notes below, superseded by `bench/REPORT.md` (card 16,
       arm 5 in card 19) and `bench/push/REPORT.md` (card 24).
-- [ ] Loopback gate green on HEAD: `.scripts/demo-remote-cli.sh --quiet` and
+- [x] Loopback gate green on HEAD (5a3cecc, 2026-10-05): `.scripts/demo-remote-cli.sh --quiet` and
       `.scripts/demo-push.sh --quiet`.
 - [x] workbench on HEAD: push to `~/src/wires-demo`, `cargo build --release -p wires`,
       replace the old `wires-demo` unit (it predates the services surface), `orders.db` +
@@ -39,11 +39,21 @@ The run follows [docs/demo.md](../../demo.md) (cheat sheet at its top).
       (`deploy`/`inbox --wait`/`logs`) → `wires remove agent` → exit 77, 0 bytes out.
 - [ ] **Recording.** Capture (asciinema + agg, or screen capture) and embed it in the
       README.
-- [ ] Re-record the loopback GIF/MP4 in `docs/media/` (README): they show the refusal
+- [x] Re-record the loopback GIF/MP4 in `docs/media/` (README; done 2026-10-05, a0830bb, both demos at 132 columns): they show the refusal
       text from before cards 28 and 34 ("fabric"). Card 34 deleted the unlinked push
       recording and the casts; re-cast both demos from the scripts' narrated mode.
 
 ## Notes
+
+### Workbench on the current code (2026-10-05)
+
+A new keystore `~/.wires-demo` (node `f323da36…`) beside the old network's
+`~/.wires-wb` (the `wires-demo` unit and the `wires-gateway` container keep
+running on the old code until the human retires them). It holds `orders.db`,
+`host.json` (`orders-db`, `deploy`, `logs`, push to `analyst`), `ci/ci.sh`
+and a pinned `bin/wires` built at 5a3cecc. The systemd user unit
+`wires-host.service` (not yet enabled) runs `serve host.json` with
+`CI_JOB_SECS=90`. Waiting on the admin's network string from the laptop.
 
 ### The recordings are gone; redo them (card 39, 2026-10-05)
 
