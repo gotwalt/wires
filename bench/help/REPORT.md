@@ -5,6 +5,13 @@
 Spend $0.84 in results, plus about $0.02 of smoke tests. Written up by the integrator from the
 worker's results (the worker's harness couldn't write this file).*
 
+*Note (2026-10-05): the help text has changed since these runs and they have
+not been re-run. Cards 40–42 and 47 removed commands (`invite`, `watch`),
+changed the premise paragraph and several refusal and error sentences (a
+person no role matches is now not admitted; a service you may not call gets
+one fixed sentence). `up.sh` now signs the agent in with `wires login
+<network>`. The results below describe the help text of 2026-09-24.*
+
 **Setup.** `bench/help/up.sh` starts a hermetic loopback network with the mock IdP and five
 services. The agent is locked (`WIRES_LOCKED=1`) and allowed only `Bash(wires:*)`. `payroll`
 is refused with 77 by its host's extra role requirement (`also_require`). **Tasks:**

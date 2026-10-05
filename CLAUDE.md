@@ -16,8 +16,9 @@ things stop a CLI from being shared across an organization, and wires is
 those three and little else. **Who is calling:** the caller signs in with the
 org's IdP (`wires login`); the ID token is bound to the node key, presented
 in each call's handshake, and verified by the host itself; signing in is the
-whole of joining (no badges, no invites): a caller is in the network if a
-role in the policy matches it. **How they find it:** one
+whole of joining (no badges, no invites): a caller is in the network if its
+sign-in carries a verified email and a role in the policy matches it
+(`library::check_admitted`, used at every host and directory gate). **How they find it:** one
 admin-signed, versioned policy says which IdPs are trusted, which roles
 exist, which services exist, which hosts run each, who may call each and who
 is removed; directories hold it, hosts hold all of it and decide every call
