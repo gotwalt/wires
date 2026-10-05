@@ -1,6 +1,6 @@
 # 41 — Signing in is joining: no badges, no invites
 
-**Stage:** 2 · **Depends on:** [40](../done/40-cut-records.md), [42](../done/42-caller-identity-for-services.md) (both merged first) · **Status:** backlog · **Files:** `library/membership/` (all of it), `library/calls/{session,idp,push}.rs`, `library/services/{item,signed_policy,access}.rs`, `library/directory/frames.rs`, `wires/admin/` (all of it), `wires/caller/{join,login,view,call,inbox,mcp,services,hello}.rs`, `wires/host/{gate,transport,serve,identity,push,embed}.rs`, `wires/directory/`, `wires/policy/`, `wires/gateway/`, `wires/lib.rs`, `wires/help.rs`, `wires/snapshots/`, `wires/testutil.rs`, `wires/e2e/`, `bindings/`, `.scripts/`, `bench/*/up.sh`, `bench/wires-up.sh`, `deploy/gateway/`, `docs/protocol.md` §2–7 and §9
+**Stage:** 2 · **Depends on:** [40](../done/40-cut-records.md), [42](../done/42-caller-identity-for-services.md) (both merged) · **Status:** backlog · **Files:** `library/membership/` (all of it), `library/calls/{session,idp,push}.rs`, `library/services/{item,signed_policy,access}.rs`, `library/directory/frames.rs`, `wires/admin/` (all of it), `wires/caller/{join,login,view,call,inbox,mcp,services,hello}.rs`, `wires/host/{gate,transport,serve,identity,push,embed}.rs`, `wires/directory/`, `wires/policy/`, `wires/gateway/`, `wires/lib.rs`, `wires/help.rs`, `wires/snapshots/`, `wires/testutil.rs`, `wires/e2e/`, `bindings/`, `.scripts/`, `bench/*/up.sh`, `bench/wires-up.sh`, `deploy/gateway/`, `docs/protocol.md` §2–9
 
 ## Why (the human, 2026-10-05)
 
@@ -98,7 +98,7 @@ agent$     wires call orders-db -- "select count(*) from orders"
 `wires/e2e/first_run.rs` and `.scripts/demo-remote-cli.sh` run exactly this
 shape.
 
-## What this gives up (protocol.md §10, and *Notes* for card 39)
+## What this gives up (protocol.md §9, and *Notes* for card 39)
 
 - **The admin no longer approves each machine.** Anyone the IdP verifies
   under the trusted client, and a role matches, is in from any machine. A
@@ -115,7 +115,8 @@ shape.
 
 1. `docs/protocol.md` first: §2 becomes "Admission"; §3's invite, admin
    surface, bans and versioning; §4's directory hello and bootstrap; §5's
-   `Hello` / `HelloAck`; §6; §7's push admission; §9's keystore table; §10.
+   `Hello` / `HelloAck`; §6; §7's push admission; §8's keystore table; §9
+   (card 40 renumbered: Keystore is §8, Known limits §9).
    New signed and wire formats get new discriminants (§1).
 2. Types and signatures, tests red, implement, doctests, readability pass
    (CLAUDE.md order). New e2e coverage, at least: no token → refused at the
