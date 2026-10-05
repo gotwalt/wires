@@ -90,6 +90,8 @@ impl World {
     /// `orders-db` (analyst) and `status` (staff), both on the host.
     fn state(&self, version: u64, banned: &[NodeId]) -> SignedPolicy {
         signed_state(&self.root, version, |s| {
+            // A directory's word, which the host shows callers (card 49).
+            s.directories = vec![crate::testutil::test_directory().node_id()];
             for b in banned {
                 s.ban(*b);
             }
@@ -176,6 +178,8 @@ struct Host {
     book: MemoryLookup,
     keystore: Arc<Keystore>,
     push: Option<Arc<PushHost>>,
+    /// Who decides (and what it shows callers first).
+    services: Arc<crate::host::gate::ServicesHost>,
 }
 
 impl Host {
@@ -184,6 +188,7 @@ impl Host {
     async fn start(w: &World, config: HostConfig, state: &SignedPolicy) -> anyhow::Result<Host> {
         let keystore = Arc::new(Keystore::at(crate::testutil::temp_dir()));
         adopt(&keystore, &w.root, state);
+        crate::testutil::vouch_on_disk(&keystore, &state.head);
         let host = services_host(
             w.host.node_id(),
             w.root.node_id(),
@@ -207,12 +212,15 @@ impl Host {
             book,
             keystore,
             push,
+            services: host,
         })
     }
 
-    /// The admin's newer policy reaches this host (as a fetch from a directory would).
+    /// The admin's newer policy reaches this host (as a fetch from a
+    /// directory would), with a directory's word for it.
     fn adopt(&self, w: &World, state: &SignedPolicy) {
         assert!(adopt(&self.keystore, &w.root, state));
+        crate::testutil::vouch_for(&self.services);
     }
 }
 
@@ -585,7 +593,11 @@ async fn fetch(
 ) -> Fetched {
     let endpoint = bind(who).await;
     let mailbox = Mailbox::open(&crate::testutil::temp_dir()).unwrap();
-    let _ = w;
+    let state = crate::policy::store::read(&host.keystore, w.root.node_id())
+        .unwrap()
+        .unwrap()
+        .signed;
+    let mut vouch = crate::testutil::vouching(&state, crate::caller::vouch::Scope::AnyService);
     let hello = library::InboxFrame::Hello { id_token };
     let fetched = timeout(
         PATIENCE,
@@ -595,6 +607,7 @@ async fn fetch(
             &hello,
             Duration::ZERO,
             &mailbox,
+            &mut vouch,
         ),
     )
     .await

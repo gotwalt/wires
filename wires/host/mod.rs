@@ -22,8 +22,8 @@
 //! - [`follow`] — the host's `policy` subscription to a directory: the whole
 //!   policy once, then each edit as a delta, and a `Fresh` every beat
 //!   (card 36c).
-//! - [`freshness`] — the newest `Fresh` for the held head (`fresh.json`),
-//!   and the signed rule (`lenient` / `strict`) for when it lapses.
+//! - [`freshness`] — the newest `Fresh` per directory for the held head
+//!   (`fresh.json`): what the host shows a caller first (card 49).
 //! - [`identity`] — the ID tokens callers presented, verified and indexed.
 //! - [`call_trace`] — the one `tracing` line a call (or an admitted
 //!   caller's refusal) leaves in `serve`'s output.

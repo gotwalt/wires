@@ -136,6 +136,39 @@ pub enum Error {
     /// content).
     #[error("freshness is for another policy head")]
     FreshMismatch,
+
+    /// A [`Fresh`](crate::Fresh) that verifies is not current: past its
+    /// `until`, or signed further in the future than the clock skew allows.
+    #[error("the freshness has lapsed")]
+    FreshLapsed,
+
+    /// A [`Fresh`](crate::Fresh) lasts longer (`until - at`) than its head's
+    /// `fresh_secs` allows.
+    #[error("the freshness lasts longer than the policy allows")]
+    FreshTooLong,
+
+    /// A host presented a [`Fresh`](crate::Fresh) it signed itself, as one
+    /// of several directories (card 49): a removed host that is also a
+    /// directory could vouch for its own old head, so a caller takes a
+    /// host's own word only when the head lists it as the one directory.
+    #[error("the host vouched for its own policy, and the policy lists other directories")]
+    SelfVouched,
+
+    /// A host's [`HostProof`](crate::HostProof) names an older policy head
+    /// than the caller's view.
+    #[error("the host holds policy version {theirs}, older than this caller's {ours}")]
+    OlderHead {
+        /// The host's head version.
+        theirs: u64,
+        /// The caller's view's head version.
+        ours: u64,
+    },
+
+    /// A host's [`HostProof`](crate::HostProof) carries no
+    /// [`Fresh`](crate::Fresh) that vouches for its head to this caller
+    /// (card 49): none current, none from a directory other than the host.
+    #[error("no directory has vouched for this host's policy recently")]
+    Unvouched,
 }
 
 /// Why an OIDC ID token failed [`verify_claim`](crate::verify_claim).

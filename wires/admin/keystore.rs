@@ -36,6 +36,7 @@ pub fn home() -> Result<PathBuf> {
 }
 
 /// A keystore rooted at a directory.
+#[derive(Clone, Debug)]
 pub struct Keystore {
     dir: PathBuf,
 }

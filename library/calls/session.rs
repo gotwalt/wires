@@ -1,8 +1,13 @@
 //! Session protocol frames and their self-delimiting wire codec.
 //!
 //! A session carries a small set of [`Frame`]s over a single bidirectional
-//! stream: an opening [`Frame::Hello`] that presents the dialer's policy
-//! version and ID token (what admits it), then tagged stdio chunks ([`Frame::Stdin`] / [`Frame::Stdout`] /
+//! stream. **The host speaks first** (card 49): a [`Frame::Proof`], its
+//! root-signed head and the current [`Fresh`](crate::Fresh)es it holds for
+//! it ([`HostProof`]), and the caller sends nothing that says who it is or
+//! what it wants until that proof checks out ([`HostProof::check`]). Then the
+//! caller's [`Frame::Hello`] presents its view's policy version and its ID
+//! token (what admits it), followed at once by [`Frame::Invoke`]; then
+//! tagged stdio chunks ([`Frame::Stdin`] / [`Frame::Stdout`] /
 //! [`Frame::Stderr`]) and a final [`Frame::Exit`] carrying the child's exit
 //! code. A host that refuses the handshake answers with a terminal
 //! [`Frame::Denied`] carrying the human-readable reason instead of an ack, so
@@ -30,21 +35,35 @@
 //! | `7`  | `Invoke`    | canonical-JSON of the [`Invocation`]       |
 //! | `10` | `Hello`     | canonical-JSON of the [`Hello`]            |
 //! | `11` | `HelloAck`  | canonical-JSON of the [`HelloAck`]         |
+//! | `12` | `Open`      | empty                                      |
+//! | `13` | `Proof`     | canonical-JSON of the [`HostProof`]        |
 //!
 //! Any other tag is a [`Error::BadFrame`], tags `8` and `9` included (an
 //! older format of `Hello` and `HelloAck`).
 //!
-//! A dialer sends [`Frame::Invoke`] immediately after its `Hello`, without
-//! waiting for the ack — the host reads both, authorizes them together, and
-//! only then answers with `HelloAck` or `Denied`.
+//! # The opening, two ways
 //!
-//! [`Hello`] and [`HelloAck`] are unsigned envelopes: each part verifies on
-//! its own (the ID token under the IdP's keys and its nonce binding to the
-//! iroh-authenticated caller, the head and the service entry under the
-//! root), so omitting an absent part via `skip_serializing_if` is safe. The
-//! host is trusted because the key the caller dialed (and iroh
-//! authenticated) is in the service's root-signed entry; the ack carries no
-//! credential of its own.
+//! A QUIC stream reaches the host only once the dialer writes to it, so the
+//! dialer opens it one of two ways, and the host answers both with its
+//! `Proof` at once:
+//!
+//! - **`Open`** (a caller with no current word for this host): an empty
+//!   frame. It reads the `Proof`, checks it, and only then sends `Hello` and
+//!   `Invoke`. One more flight than a call used to take.
+//! - **`Hello` and `Invoke`** at once (a caller that already holds a current
+//!   `Fresh` for its view's head from a directory other than this host: its
+//!   own refresh, or an earlier host's proof). No extra flight; it still
+//!   checks the host's `Proof` before it sends a byte of stdin.
+//!
+//! The host reads both, authorizes them together, and answers with
+//! `HelloAck` or `Denied`.
+//!
+//! [`Hello`], [`HelloAck`] and [`HostProof`] are unsigned envelopes: each part
+//! verifies on its own (the ID token under the IdP's keys and its nonce
+//! binding to the iroh-authenticated caller, the head and the service entry
+//! under the root, each `Fresh` under a directory the head lists), so
+//! omitting an absent part via `skip_serializing_if` is safe. The ack carries
+//! no credential of its own.
 //!
 //! **The handshake carries the news** (card 37). A caller holds a view, not
 //! the policy: its `Hello` names the head version of that view, and the
@@ -63,6 +82,7 @@ use crate::head::{SignedPolicyHead, StateVersion};
 use crate::identity::NodeId;
 use crate::idp::IdToken;
 use crate::invoke::Invocation;
+use crate::proof::HostProof;
 use crate::registry::ServiceName;
 use crate::signed_policy::check_entry_version;
 
@@ -74,9 +94,13 @@ const TAG_DENIED: u8 = 6;
 const TAG_INVOKE: u8 = 7;
 const TAG_HELLO: u8 = 10;
 const TAG_HELLO_ACK: u8 = 11;
+const TAG_OPEN: u8 = 12;
+const TAG_PROOF: u8 = 13;
 
-/// The opening frame, dialer → host, followed at once
-/// by [`Frame::Invoke`]. Unsigned envelope: the token verifies on its own
+/// The caller's credential, dialer → host, followed at once by
+/// [`Frame::Invoke`]: sent only once the host's [`HostProof`] checks out, or
+/// first when the caller already holds a current word for this host (see
+/// the module docs). Unsigned envelope: the token verifies on its own
 /// (under the IdP's keys, with its nonce binding it to the
 /// iroh-authenticated caller), and it is what admits the caller.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -232,6 +256,13 @@ pub enum Frame {
     Hello(Hello),
     /// The host's ack to an admitted [`Hello`].
     HelloAck(HelloAck),
+    /// Dialer → host, first, from a caller that checks the host's proof
+    /// before it says anything: an empty frame (a QUIC stream reaches the
+    /// host only once its dialer writes).
+    Open,
+    /// Host → dialer, always the host's first frame: its head and the
+    /// current `Fresh`es it holds for it.
+    Proof(HostProof),
 }
 
 impl Frame {
@@ -287,6 +318,11 @@ impl Frame {
                 payload.push(TAG_HELLO_ACK);
                 payload.extend_from_slice(&canonical_bytes(ack)?);
             }
+            Frame::Open => payload.push(TAG_OPEN),
+            Frame::Proof(proof) => {
+                payload.push(TAG_PROOF);
+                payload.extend_from_slice(&canonical_bytes(proof)?);
+            }
         }
         length_prefixed(&payload)
     }
@@ -317,6 +353,8 @@ impl Frame {
             TAG_INVOKE => Frame::Invoke(serde_json::from_slice(body).map_err(Error::Decode)?),
             TAG_HELLO => Frame::Hello(serde_json::from_slice(body).map_err(Error::Decode)?),
             TAG_HELLO_ACK => Frame::HelloAck(serde_json::from_slice(body).map_err(Error::Decode)?),
+            TAG_OPEN if body.is_empty() => Frame::Open,
+            TAG_PROOF => Frame::Proof(serde_json::from_slice(body).map_err(Error::Decode)?),
             _ => return Err(Error::BadFrame),
         };
         Ok(Some((frame, end)))
@@ -462,6 +500,19 @@ mod tests {
                     entry,
                 })
             }),
+            Just(Frame::Open),
+            (seed(), any::<u64>(), 0usize..3).prop_map(|(rs, v, n)| {
+                let root = NodeIdentity::from_seed(rs);
+                let mut p = crate::signed_policy::Policy::new(root.node_id());
+                p.version = StateVersion(v);
+                p.not_after = i64::MAX;
+                p.directories = vec![root.node_id()];
+                let head = p.sign(&root).unwrap().head;
+                let fresh = (0..n)
+                    .map(|i| crate::fresh::Fresh::sign(&root, &head, i as i64, 900).unwrap())
+                    .collect();
+                Frame::Proof(HostProof { head, fresh })
+            }),
         ]
     }
 
@@ -551,9 +602,9 @@ mod tests {
 
     #[test]
     fn unknown_tag_is_bad_frame() {
-        // len = 1, tag = 12 (unknown).
+        // len = 1, tag = 14 (unknown).
         assert!(matches!(
-            Frame::decode(&[0, 0, 0, 1, 12]),
+            Frame::decode(&[0, 0, 0, 1, 14]),
             Err(Error::BadFrame)
         ));
         // The older hello and ack (tags 8 and 9) are no longer read.
@@ -563,6 +614,15 @@ mod tests {
                 Err(Error::BadFrame)
             ));
         }
+    }
+
+    #[test]
+    fn open_is_empty_and_nothing_else() {
+        assert_eq!(Frame::Open.encode().unwrap(), vec![0, 0, 0, 1, TAG_OPEN]);
+        assert!(matches!(
+            Frame::decode(&[0, 0, 0, 2, TAG_OPEN, 0]),
+            Err(Error::BadFrame)
+        ));
     }
 
     #[test]

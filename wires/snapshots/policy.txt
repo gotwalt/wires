@@ -12,4 +12,4 @@ Options:
 
 Examples:
   wires policy push
-  wires policy settings --freshness strict
+  wires policy settings --fresh-secs 300

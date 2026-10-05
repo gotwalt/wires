@@ -6,8 +6,6 @@ wires: denied by host: service orders-db is not assigned to this host (signed po
 
 wires: denied by host: alice@example.com is not admitted to orders-db by this host's own rules; don't retry: ask your admin for access [exit 77]
 
-wires: denied by host: this host's policy is stale: no directory has vouched for it recently; try again later [exit 77]
-
 wires: denied by host: your sign-in has expired; run `wires login` [exit 77]
 
 wires: denied by host: the identity provider is unreachable from this host; try again later [exit 77]
@@ -23,6 +21,8 @@ wires: denied by host: not admitted to this network: your sign-in has expired; r
 wires: no service named `orders-db` that you may call; see `wires services` [exit 1]
 
 wires: not signed in: run `wires login` [exit 1]
+
+wires: calling orders-db: no directory has vouched for a host of `orders-db` recently, so nothing was sent (3ef7a1c2: no directory has vouched for this host's policy recently); the network's directories may be down or out of reach: try again later, or ask your admin [exit 1]
 
 wires: stdin is not forwarded in locked mode (set by the operator: WIRES_LOCKED=1; stdin can carry local files to the host); pass the input as arguments instead [exit 2]
 

@@ -800,17 +800,18 @@ fn directory_edits_are_head_edits() {
     .unwrap();
     assert!(out.contains("removed"), "{out}");
     assert_eq!(f.policy().directories(), &[f.nodes[1].node_id()]);
-    // Removing a node (a ban) drops it from the directories too.
-    crate::admin::remove::remove_in(
+    // Removing a node (a ban) would drop it from the directories too; the
+    // last one can't go (card 49: with none, no caller calls any host).
+    let last = crate::admin::remove::remove_in(
         &f.admin,
         crate::admin::remove::WhoArgs {
             who: f.nodes[1].node_id().hex(),
             issuer: None,
             policy_ttl: Ttl::default(),
         },
-    )
-    .unwrap();
-    assert!(f.policy().directories().is_empty());
+    );
+    assert!(last.is_err());
+    assert_eq!(f.policy().directories(), &[f.nodes[1].node_id()]);
 }
 
 /// A beat never rolls back a publish accepted while it signs: what it

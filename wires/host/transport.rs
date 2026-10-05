@@ -2,10 +2,14 @@
 //!
 //! `library` stays pure (no iroh/tokio); this module is where the
 //! key-addressed session meets the iroh QUIC endpoint. The session ALPN is
-//! [`ALPN`]. A caller opens a bi-stream and sends a
+//! [`ALPN`]. A caller opens a bi-stream, and the host speaks first: its
+//! [`Frame::Proof`], the head it holds and the current `Fresh`es for it
+//! (card 49). The caller checks it ([`Vouching`]) before it sends a
 //! [`Frame::Hello`] — the policy version it holds and its IdP ID token,
 //! which is what admits it — followed at once by
-//! a [`Frame::Invoke`] naming a service plus per-call arguments. The host
+//! a [`Frame::Invoke`] naming a service plus per-call arguments (or sends
+//! both at once when it already holds a current word for this host, and
+//! still checks the proof before stdin). The host
 //! ([`serve_session_permitted`]) decides by the signed policy it holds, re-read
 //! per connection (see [`gate`](crate::host::gate)), then execs the
 //! service's fixed argv with the caller's arguments appended — never through
@@ -40,18 +44,21 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::presets::N0;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 
-use library::{Chunk, Frame, Hello, HelloAck, Invocation, NodeId, NodeIdentity, ServiceName};
+use library::{
+    Chunk, Frame, Hello, HelloAck, Invocation, NodeId, NodeIdentity, ServiceName, StateVersion,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 
+use crate::caller::vouch::{Unvouched, Vouching, all_unvouched};
 use crate::host::call_trace::CallTrace;
 use crate::host::gate::Implementation;
 use crate::host::service::Running;
 use tokio::sync::mpsc;
 
-/// The custom ALPN identifying a wires session, which opens with a
-/// [`Hello`].
-pub const ALPN: &[u8] = b"wires/session/1";
+/// The custom ALPN identifying a wires session, which opens with the host's
+/// [`Frame::Proof`] (card 49).
+pub const ALPN: &[u8] = b"wires/session/2";
 
 /// Read buffer size for pumping child / local stdio into frames.
 const PUMP_BUF: usize = 64 * 1024;
@@ -79,8 +86,10 @@ pub(crate) const MAX_INVOKE_FRAME: usize = 8 * library::MAX_ARGV_BYTES;
 pub(crate) const MAX_PREAUTH_SESSIONS: usize = 64;
 
 /// How long a host waits for the opening handshake before giving up, so a
-/// peer that connects but never speaks can't hold a session task open.
-const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// peer that connects but never speaks can't hold a session task open; and
+/// how long a caller waits for the host's proof. A caller that must refresh
+/// its view before it speaks does so within its 8 s budget.
+pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Denial reason: the host got something other than an
 /// [`Frame::Invoke`] after the handshake.
@@ -578,10 +587,13 @@ where
     serve_session_permitted(send, recv, caller, host, None, shutdown).await
 }
 
-/// The host side of a session, over an authenticated bi-stream: read the
-/// [`Frame::Hello`] (at most [`MAX_HELLO_FRAME`]) and the [`Frame::Invoke`]
-/// (at most [`MAX_INVOKE_FRAME`]), then decide by **this host's** signed
-/// policy (re-read now, so a removal applies on the next dial):
+/// The host side of a session, over an authenticated bi-stream. First, before
+/// reading who is asking, send this host's [`Frame::Proof`] (card 49): the
+/// head of **this host's** signed policy (re-read now, so a removal applies
+/// on the next dial) and the current `Fresh`es it holds for it. Then read
+/// the caller's opening, [`Frame::Open`] then [`Frame::Hello`], or a `Hello`
+/// at once (each at most [`MAX_HELLO_FRAME`]), and the [`Frame::Invoke`] (at
+/// most [`MAX_INVOKE_FRAME`]), and decide under that policy:
 ///
 /// 1. admission: its ID token (verified under the policy's issuers as
 ///    `identity.issuers` narrows them, unexpired, bound to `caller`), and
@@ -591,7 +603,7 @@ where
 ///    Anyone else hears only [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED)
 ///    (or that its sign-in expired, or the IdP is unreachable), writes no
 ///    log line, and is traced, throttled;
-/// 2. [`gate::admit`](crate::host::gate::admit): fresh → the policy lets
+/// 2. [`gate::admit`](crate::host::gate::admit): unexpired → the policy lets
 ///    the caller call it (else one fixed sentence) → assigned here →
 ///    `also_require`;
 /// 3. whether `host.json` implements the service.
@@ -619,11 +631,32 @@ where
     S: AsyncWrite + Unpin + Send + 'static,
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let first = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        read_frame_within(&mut recv, MAX_HELLO_FRAME),
-    )
-    .await;
+    let state = match host.policy() {
+        Ok(state) => state,
+        Err(e) => {
+            // The host's own fault, not the caller's: an operator error.
+            tracing::warn!("signed policy unusable: {e:#}");
+            let reason = crate::host::gate::HOST_MISCONFIGURED;
+            deny(&mut send, reason.to_string()).await;
+            return Err(Refused(reason.to_string()).into());
+        }
+    };
+    // The host speaks first: the head it decides under and who vouched for
+    // it. A caller tells it nothing until that checks out (card 49).
+    let proof = host
+        .freshness
+        .proof(&state.signed.head, crate::clock::now_unix());
+    write_frame(&mut send, &Frame::Proof(proof))
+        .await
+        .context("sending this host's proof")?;
+    let read_opening = async |recv: &mut R| {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame_within(recv, MAX_HELLO_FRAME)).await
+    };
+    let mut first = read_opening(&mut recv).await;
+    if matches!(first, Ok(Ok(Some(Frame::Open)))) {
+        // The caller checks the proof, then says who it is.
+        first = read_opening(&mut recv).await;
+    }
     let hello = match first {
         Ok(Ok(Some(Frame::Hello(hello)))) => hello,
         Ok(Ok(Some(_))) => {
@@ -653,16 +686,6 @@ where
     let service = invocation.service.clone();
     let now = crate::clock::now_unix();
 
-    let state = match host.policy() {
-        Ok(state) => state,
-        Err(e) => {
-            // The host's own fault, not the caller's: an operator error.
-            tracing::warn!("signed policy unusable: {e:#}");
-            let reason = crate::host::gate::HOST_MISCONFIGURED;
-            deny(&mut send, reason.to_string()).await;
-            return Err(Refused(reason.to_string()).into());
-        }
-    };
     // Admission first: the token, a verified email, the bans and a role. A
     // stranger costs one token check and no log line of its own.
     let verified = match host
@@ -889,28 +912,39 @@ pub(crate) struct ServiceDialed {
     pub(crate) dialed: Dialed,
 }
 
-/// Card 27's dial: try each of `targets` (a service's hosts, in the caller's
-/// preferred order) until one connects within `dial_timeout`, then open with
-/// `hello`, send `invocation` and bridge stdio on that one.
+/// Card 27's dial, with card 49's check: try each of `targets` (a service's
+/// hosts, in the caller's preferred order) until one connects within
+/// `dial_timeout` **and** shows a current policy ([`Vouching::check`]);
+/// then present `id_token` (in a `Hello` at the view's version), send
+/// `invocation` and bridge stdio on that one.
+///
+/// A host the caller holds a current word for already
+/// ([`Vouching::ready`]) is sent the `Hello` and `Invoke` at once, and its
+/// proof is still checked before any stdin; any other is sent [`Frame::Open`]
+/// and nothing more until its proof checks out.
 ///
 /// `on_ack` runs once the host's `HelloAck` has arrived and **before** any
 /// stdin is forwarded, with the host's id (the key iroh authenticated, one
-/// of `targets`) and the ack (its head version, and the head and service
-/// entry when newer than the caller's view): the caller checks the host is
-/// still assigned there and may abort the call.
+/// of `targets`), the view version the `Hello` named, and the ack (its head
+/// version, and the head and service entry when newer than that): the
+/// caller checks the host is still assigned there and may abort the call.
 ///
-/// Fails over **only on a dial failure**: once a host has answered, its
-/// refusal ([`Denied`]) or a mid-session error is final (it decided, and
-/// stdin may already be spent). Errors if no target connects, naming each
-/// failure. Does not close `endpoint`.
+/// Fails over **only on a dial failure**: no connection, or a proof that
+/// didn't check out before anything was sent ([`Unvouched`]). Once a host
+/// has the call, its refusal ([`Denied`]) or a mid-session error is final
+/// (it decided, and stdin may already be spent). Errors if no target
+/// answers, naming each failure; when every one failed its proof for want of
+/// a directory's word, saying that no directory has vouched for them
+/// ([`all_unvouched`]). Does not close `endpoint`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_service_on<R, W, E>(
     endpoint: &Endpoint,
     targets: &[EndpointAddr],
     dial_timeout: std::time::Duration,
-    hello: Hello,
+    vouch: &mut Vouching,
+    id_token: &library::IdToken,
     invocation: Invocation,
-    on_ack: impl FnOnce(NodeId, &HelloAck) -> Result<()>,
+    on_ack: impl FnOnce(NodeId, StateVersion, &HelloAck) -> Result<()>,
     stdin: R,
     stdout: W,
     stderr: E,
@@ -921,6 +955,7 @@ where
     E: AsyncWrite + Unpin,
 {
     let mut failures = Vec::new();
+    let mut lapsed = 0;
     for target in targets {
         let host = to_node_id(&target.id);
         let conn = match tokio::time::timeout(dial_timeout, endpoint.connect(target.clone(), ALPN))
@@ -943,13 +978,31 @@ where
             }
         };
         let host = to_node_id(&conn.remote_id());
-        let (send, recv) = conn.open_bi().await.context("opening bi-stream")?;
-        let dialed = dial_opened_with(
+        let (mut send, mut recv) = match conn.open_bi().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                failures.push(format!("{}: opening a stream: {e}", host.short()));
+                continue;
+            }
+        };
+        let spoke = speak(&mut send, &mut recv, host, vouch, id_token, &invocation).await;
+        if let Err(e) = spoke {
+            conn.close(0u32.into(), b"unvouched");
+            match e.downcast::<Unvouched>() {
+                Ok(u) => {
+                    tracing::info!(host = %host.hex(), "{u}");
+                    lapsed += usize::from(u.lapsed);
+                    failures.push(format!("{}: {}", host.short(), u.why));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let version = vouch.version();
+        let dialed = converse(
             send,
             recv,
-            hello,
-            invocation,
-            |ack| on_ack(host, ack),
+            |ack| on_ack(host, version, ack),
             stdin,
             stdout,
             stderr,
@@ -960,6 +1013,12 @@ where
     }
     if failures.is_empty() {
         bail!("no host to dial");
+    }
+    if lapsed == failures.len() {
+        return Err(all_unvouched(
+            &format!("a host of `{}`", invocation.service),
+            &failures,
+        ));
     }
     bail!(
         "no host answered ({}); try again later, or ask your admin whether its hosts are up",
@@ -974,56 +1033,86 @@ pub(crate) struct Dialed {
     pub(crate) exit: i32,
 }
 
-/// [`dial_opened_with`] with nothing to do at the ack (a newer head the
-/// host hands back is ignored): the session tests' form.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn dial_opened<S, R, I, W, E>(
-    send: S,
-    recv: R,
-    hello: Hello,
-    invocation: Invocation,
-    stdin: I,
-    stdout: W,
-    stderr: E,
-) -> Result<Dialed>
+/// The opening of a session from the caller's side (card 49), on a stream
+/// to `host` (the key iroh authenticated): with a current word for it
+/// already ([`Vouching::ready`]), send the `Hello` and `invocation` at once
+/// and then check the host's proof; else send [`Frame::Open`], read and
+/// check the proof (refreshing the view if the host's head is newer), and
+/// only then send the `Hello` and `invocation`. `Err(`[`Unvouched`]`)`:
+/// nothing but `Open` was sent (a dial failure); a [`Denied`]: the host
+/// refused before its proof (its policy is unusable); any other error, after
+/// speaking, stops the call before stdin.
+pub(crate) async fn speak<S, R>(
+    send: &mut S,
+    recv: &mut R,
+    host: NodeId,
+    vouch: &mut Vouching,
+    id_token: &library::IdToken,
+    invocation: &Invocation,
+) -> Result<()>
 where
-    S: AsyncWrite + Unpin + Send + 'static,
+    S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
-    I: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin,
-    E: AsyncWrite + Unpin,
 {
-    dial_opened_with(
-        send,
-        recv,
-        hello,
-        invocation,
-        |_| Ok(()),
-        stdin,
-        stdout,
-        stderr,
-    )
-    .await
+    let hello = |vouch: &Vouching| {
+        Frame::Hello(Hello {
+            state_version: vouch.version(),
+            id_token: id_token.clone(),
+        })
+    };
+    let at_once = vouch.ready(host, crate::clock::now_unix());
+    if at_once {
+        write_frame(send, &hello(vouch)).await?;
+        write_frame(send, &Frame::Invoke(invocation.clone())).await?;
+    } else if let Err(e) = write_frame(send, &Frame::Open).await {
+        return Err(Unvouched {
+            host: host.short(),
+            why: format!("{e:#}"),
+            lapsed: false,
+        }
+        .into());
+    }
+    let read = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame_within(recv, MAX_HELLO_FRAME));
+    let failed = |why: String| -> anyhow::Error {
+        if at_once {
+            anyhow!("host {}: {why}; no input was sent", host.short())
+        } else {
+            Unvouched {
+                host: host.short(),
+                why,
+                lapsed: false,
+            }
+            .into()
+        }
+    };
+    let proof = match read.await {
+        Ok(Ok(Some(Frame::Proof(proof)))) => proof,
+        Ok(Ok(Some(Frame::Denied { reason }))) => return Err(Denied::new(reason).into()),
+        Ok(Ok(Some(_))) => return Err(failed("its first frame was not a proof".into())),
+        Ok(Ok(None)) => return Err(failed("it closed before showing a proof".into())),
+        Ok(Err(e)) => return Err(failed(format!("an unreadable proof: {e:#}"))),
+        Err(_) => return Err(failed("it showed no proof in time".into())),
+    };
+    vouch
+        .check(host, &proof, crate::clock::now_unix(), !at_once)
+        .await?;
+    if !at_once {
+        write_frame(send, &hello(vouch)).await?;
+        write_frame(send, &Frame::Invoke(invocation.clone())).await?;
+    }
+    Ok(())
 }
 
-/// The dialer half of a session over an established bi-stream to an
-/// iroh-authenticated host (one the service's root-signed entry names; the
-/// caller chose it). Presents the `hello`, then reads the host's
-/// [`HelloAck`](library::HelloAck) and runs `on_ack` with it, **before**
-/// any stdin is forwarded. On any failure, aborts with no stdin sent.
-///
-/// The [`Frame::Invoke`] carrying `invocation` follows the opening
-/// immediately, without waiting for the ack.
+/// The rest of a session from the caller's side, once it has spoken
+/// ([`speak`]): read the host's [`HelloAck`](library::HelloAck) and run
+/// `on_ack` with it, **before** any stdin is forwarded; then bridge stdio.
+/// On any failure, aborts with no stdin sent.
 ///
 /// Errors if the session ends **without** an [`Frame::Exit`] — a host that
 /// closes mid-session is a failure, not a silent success.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn dial_opened_with<S, R, I, W, E>(
+pub(crate) async fn converse<S, R, I, W, E>(
     mut send: S,
     mut recv: R,
-    hello: Hello,
-    invocation: Invocation,
     on_ack: impl FnOnce(&HelloAck) -> Result<()>,
     stdin: I,
     mut stdout: W,
@@ -1036,16 +1125,13 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    write_frame(&mut send, &Frame::Hello(hello)).await?;
-    write_frame(&mut send, &Frame::Invoke(invocation)).await?;
-
-    // Read the host's ack first (it is always the host's first frame).
+    // Read the host's ack first (its first frame after the proof).
     let ack = match read_frame(&mut recv).await? {
         Some(Frame::HelloAck(ack)) => ack,
         // Refused: surface the host's reason. No stdin task has been
         // spawned yet, so nothing was forwarded and nothing hit local stdout.
         Some(Frame::Denied { reason }) => return Err(Denied::new(reason).into()),
-        Some(_) => bail!("the host's first frame was not a hello ack"),
+        Some(_) => bail!("the host's answer was not a hello ack"),
         None => bail!("the host closed before sending a hello ack"),
     };
     // Before any stdin: whether the host is still assigned the service is
@@ -1095,6 +1181,38 @@ where
         bail!("session ended without an exit code (the host closed early?)");
     }
     Ok(Dialed { exit: code })
+}
+
+/// A test dialer over an established bi-stream that trusts the host without
+/// checking its proof: it sends `hello` and `invocation` at once, skips the
+/// [`Frame::Proof`], and bridges stdio ([`converse`]). The host-side session
+/// tests' form; a real caller [`speak`]s.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dial_opened<S, R, I, W, E>(
+    mut send: S,
+    mut recv: R,
+    hello: Hello,
+    invocation: Invocation,
+    stdin: I,
+    stdout: W,
+    stderr: E,
+) -> Result<Dialed>
+where
+    S: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin,
+    I: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    write_frame(&mut send, &Frame::Hello(hello)).await?;
+    write_frame(&mut send, &Frame::Invoke(invocation)).await?;
+    match read_frame(&mut recv).await? {
+        Some(Frame::Proof(_)) => {}
+        Some(Frame::Denied { reason }) => return Err(Denied::new(reason).into()),
+        other => bail!("the host's first frame was not a proof: {other:?}"),
+    }
+    converse(send, recv, |_| Ok(()), stdin, stdout, stderr).await
 }
 
 #[cfg(test)]
@@ -1563,7 +1681,12 @@ mod tests {
         let r =
             serve_services_session(send, std::io::Cursor::new(bytes), caller, host, never()).await;
         assert!(r.is_err());
-        match read_frame(&mut answer).await.unwrap() {
+        // The host's proof always comes first (card 49).
+        let mut first = read_frame(&mut answer).await.unwrap();
+        if matches!(first, Some(Frame::Proof(_))) {
+            first = read_frame(&mut answer).await.unwrap();
+        }
+        match first {
             Some(Frame::Denied { reason }) => reason,
             other => panic!("expected a denial, got {other:?}"),
         }
@@ -1894,6 +2017,9 @@ mod tests {
             .await
             .expect("the host waited for an oversized body");
             assert!(r.is_err());
+            let Some(Frame::Proof(_)) = read_frame(&mut answer).await.unwrap() else {
+                panic!("expected the host's proof first");
+            };
             let Some(Frame::Denied { .. }) = read_frame(&mut answer).await.unwrap() else {
                 panic!("expected a denial");
             };

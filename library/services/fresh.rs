@@ -4,8 +4,17 @@
 //! Every [`Settings::beat_secs`](crate::Settings::beat_secs) each directory
 //! signs a [`Fresh`] for the head it holds, good until `at +`
 //! [`Settings::fresh_secs`](crate::Settings::fresh_secs). A node holding a
-//! current `Fresh` for its head knows its policy is the newest; when it
-//! lapses, the settings' [`FreshnessMode`](crate::FreshnessMode) decides.
+//! current `Fresh` for its head knows its policy is the newest.
+//!
+//! **What it decides** (card 49): a caller tells a host nothing (no ID
+//! token, no arguments) until a current `Fresh` vouches for the head the host
+//! holds, signed by a directory **other than that host** ([`Fresh::vouches`]).
+//! An honest directory signs only for its newest head, so within
+//! `fresh_secs` of an edit reaching the directories a host the edit removed
+//! has nothing to show. The one exception is a head that lists exactly one
+//! directory, the host itself: a one-machine network, where the host's own
+//! word is all there is. A [`FreshSet`] keeps the newest `Fresh` per
+//! directory, on a host (what it shows) and on a caller (what it has seen).
 //!
 //! A `Fresh` is signed by the directory's own node key, never the root, and is
 //! valid only because the root-signed head lists that key in `directories`
@@ -74,7 +83,8 @@ pub struct Fresh {
 impl Fresh {
     /// Sign a `Fresh` for `head` with the directory's node key.
     /// [`Error::NotADirectory`] if the head does not list `directory`;
-    /// [`Error::InvalidPolicy`] if `until < at`.
+    /// [`Error::InvalidPolicy`] if `until < at`; [`Error::FreshTooLong`] if
+    /// `until - at` is over the head's `fresh_secs`.
     pub fn sign(
         directory: &NodeIdentity,
         head: &SignedPolicyHead,
@@ -88,6 +98,9 @@ impl Fresh {
             return Err(Error::InvalidPolicy(
                 "freshness ends before it starts".into(),
             ));
+        }
+        if until.saturating_sub(at) > i64::from(head.head.fresh_secs) {
+            return Err(Error::FreshTooLong);
         }
         let body = SignedBody {
             format: FRESH_V1,
@@ -116,8 +129,9 @@ impl Fresh {
     /// Check it vouches for exactly `head` (a head the caller has already
     /// verified under its root): format and algorithm, the same fabric,
     /// version and [`HeadHash`] ([`Error::FreshMismatch`]), a signer the head
-    /// lists in `directories` ([`Error::NotADirectory`]), `at <= until`, and
-    /// the signature. Does not check the time
+    /// lists in `directories` ([`Error::NotADirectory`]), `at <= until`, a
+    /// lifetime no longer than the head's `fresh_secs`
+    /// ([`Error::FreshTooLong`]), and the signature. Does not check the time
     /// ([`is_current`](Self::is_current)).
     pub fn verify(&self, head: &SignedPolicyHead) -> Result<()> {
         if self.format != FRESH_V1 {
@@ -140,6 +154,9 @@ impl Fresh {
                 "freshness ends before it starts".into(),
             ));
         }
+        if self.until.saturating_sub(self.at) > i64::from(head.head.fresh_secs) {
+            return Err(Error::FreshTooLong);
+        }
         self.directory.verify(&self.signed_bytes()?, &self.sig)
     }
 
@@ -147,6 +164,145 @@ impl Fresh {
     /// in the future than [`CLOCK_SKEW_SECS`].
     pub fn is_current(&self, now: i64) -> bool {
         now >= self.at.saturating_sub(CLOCK_SKEW_SECS) && now <= self.until
+    }
+
+    /// Whether it lets a caller dialing `host` take `head` (verified under
+    /// the root already) as current at `now` (card 49): it
+    /// [`verify`](Self::verify)s for `head`, [`is_current`](Self::is_current)
+    /// ([`Error::FreshLapsed`]), and was signed by a directory other than
+    /// `host`, unless `head` lists exactly one directory and it is `host`
+    /// ([`Error::SelfVouched`]).
+    ///
+    /// ```
+    /// use library::{Fresh, NodeIdentity, Policy, StateVersion};
+    /// let root = NodeIdentity::from_seed([1u8; 32]);
+    /// let (a, b) = (NodeIdentity::from_seed([2u8; 32]), NodeIdentity::from_seed([3u8; 32]));
+    /// let mut policy = Policy::new(root.node_id());
+    /// policy.version = StateVersion(1);
+    /// policy.not_after = i64::MAX;
+    /// policy.directories = vec![a.node_id(), b.node_id()];
+    /// let head = policy.sign(&root).unwrap().head;
+    /// let by_a = Fresh::sign(&a, &head, 1_000, 1_900).unwrap();
+    /// // Directory `a` vouches for host `b`, but not for itself.
+    /// assert!(by_a.vouches(&head, b.node_id(), 1_500).is_ok());
+    /// assert!(by_a.vouches(&head, a.node_id(), 1_500).is_err());
+    /// ```
+    pub fn vouches(&self, head: &SignedPolicyHead, host: NodeId, now: i64) -> Result<()> {
+        self.verify(head)?;
+        if !self.is_current(now) {
+            return Err(Error::FreshLapsed);
+        }
+        let only_the_host = head.head.directories.as_slice() == [host];
+        if self.directory == host && !only_the_host {
+            return Err(Error::SelfVouched);
+        }
+        Ok(())
+    }
+}
+
+/// The most directories a [`FreshSet`] keeps a [`Fresh`] from; past it, the
+/// worst-ranked is dropped. A host shows at most this many to a caller.
+pub const MAX_FRESH_SET: usize = 16;
+
+/// The newest [`Fresh`] from each directory: what a host shows a caller
+/// before it is told anything, and what a caller keeps of what it has seen
+/// (card 49). Holding one `Fresh` per signer, not one in all, is what lets a
+/// host that is also a directory still show another directory's word, and a
+/// caller still find one to dial that directory with.
+///
+/// It verifies nothing on the way in: every use checks each `Fresh` again
+/// against the head it is asked about ([`vouching`](Self::vouching),
+/// [`current_for`](Self::current_for)), so a set read back from disk can't
+/// vouch for anything a signer didn't sign.
+///
+/// ```
+/// use library::{Fresh, FreshSet, NodeIdentity, Policy, StateVersion};
+/// let root = NodeIdentity::from_seed([1u8; 32]);
+/// let (dir, host) = (NodeIdentity::from_seed([2u8; 32]), NodeIdentity::from_seed([3u8; 32]));
+/// let mut policy = Policy::new(root.node_id());
+/// policy.version = StateVersion(1);
+/// policy.not_after = i64::MAX;
+/// policy.directories = vec![dir.node_id(), host.node_id()];
+/// let head = policy.sign(&root).unwrap().head;
+/// let mut set = FreshSet::default();
+/// assert!(set.insert(Fresh::sign(&host, &head, 1_000, 1_900).unwrap(), 1_000));
+/// assert!(set.vouching(&head, host.node_id(), 1_500).is_none(), "its own word");
+/// assert!(set.insert(Fresh::sign(&dir, &head, 1_000, 1_900).unwrap(), 1_000));
+/// assert_eq!(set.vouching(&head, host.node_id(), 1_500).unwrap().directory, dir.node_id());
+/// assert_eq!(set.current_for(&head, 1_500).len(), 2);
+/// assert!(set.current_for(&head, 1_901).is_empty());
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FreshSet(Vec<Fresh>);
+
+impl FreshSet {
+    /// Keep `fresh` if it ranks above the one held from its signer at `now`
+    /// (none held, a newer head's, or for the same head: current where the
+    /// held one isn't, then a later `until`; so one from a directory whose
+    /// clock runs ahead never displaces a current one). With
+    /// [`MAX_FRESH_SET`] signers held already, a new signer displaces the
+    /// worst-ranked, if it ranks above it. Whether it was kept.
+    pub fn insert(&mut self, fresh: Fresh, now: i64) -> bool {
+        let rank = |f: &Fresh| (f.version, f.is_current(now), f.until);
+        if let Some(held) = self.0.iter_mut().find(|f| f.directory == fresh.directory) {
+            if rank(&fresh) <= rank(held) {
+                return false;
+            }
+            *held = fresh;
+            return true;
+        }
+        if self.0.len() >= MAX_FRESH_SET {
+            let Some((worst, _)) = self.0.iter().enumerate().min_by_key(|(_, f)| rank(f)) else {
+                return false;
+            };
+            if rank(&fresh) <= rank(&self.0[worst]) {
+                return false;
+            }
+            self.0.remove(worst);
+        }
+        self.0.push(fresh);
+        true
+    }
+
+    /// The first one that [`vouches`](Fresh::vouches) for `head` to a caller
+    /// dialing `host` at `now`.
+    pub fn vouching(&self, head: &SignedPolicyHead, host: NodeId, now: i64) -> Option<&Fresh> {
+        self.0.iter().find(|f| f.vouches(head, host, now).is_ok())
+    }
+
+    /// Every one that verifies for `head` and is current at `now`, at most
+    /// [`MAX_FRESH_SET`]: what a host shows a caller.
+    pub fn current_for(&self, head: &SignedPolicyHead, now: i64) -> Vec<Fresh> {
+        self.0
+            .iter()
+            .filter(|f| f.verify(head).is_ok() && f.is_current(now))
+            .take(MAX_FRESH_SET)
+            .cloned()
+            .collect()
+    }
+
+    /// Every `Fresh` held, one per signer.
+    pub fn iter(&self) -> impl Iterator<Item = &Fresh> {
+        self.0.iter()
+    }
+
+    /// Whether it holds none.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl FromIterator<Fresh> for FreshSet {
+    /// Insert each in turn, ranking at their own `at` (what a set read back
+    /// whole needs: the one per signer with the newest head and `until`).
+    fn from_iter<I: IntoIterator<Item = Fresh>>(iter: I) -> Self {
+        let mut set = FreshSet::default();
+        for f in iter {
+            let at = f.at;
+            set.insert(f, at);
+        }
+        set
     }
 }
 
@@ -193,7 +349,7 @@ impl Fresh {
 mod tests {
     use super::*;
     use crate::head::ItemsHash;
-    use crate::head::{POLICY_V4, PolicyHead};
+    use crate::head::{POLICY_V5, PolicyHead};
     use proptest::prelude::*;
 
     fn root() -> NodeIdentity {
@@ -206,12 +362,13 @@ mod tests {
 
     fn head_with(version: u64, items: u8, directories: Vec<NodeId>) -> SignedPolicyHead {
         PolicyHead {
-            format: POLICY_V4,
+            format: POLICY_V5,
             fabric: root().node_id(),
             version: StateVersion(version),
             issued: 0,
             not_after: i64::MAX,
             directories,
+            fresh_secs: 100_000,
             items_hash: ItemsHash::from_hex(&format!("{items:02x}").repeat(32)).unwrap(),
         }
         .sign(&root())
@@ -303,11 +460,176 @@ mod tests {
         assert!(!fresh.is_current(1_901));
         assert!(fresh.is_current(1_000 - CLOCK_SKEW_SECS));
         assert!(!fresh.is_current(1_000 - CLOCK_SKEW_SECS - 1));
-        let extreme = Fresh::sign(&dir(), &head(), i64::MIN, i64::MAX).unwrap();
-        assert!(extreme.is_current(0));
+        let longest = Fresh::sign(&dir(), &head(), -50_000, 50_000).unwrap();
+        assert!(longest.is_current(0));
+    }
+
+    /// Node 3: a host that is also a directory, in [`two`].
+    fn host() -> NodeIdentity {
+        NodeIdentity::from_seed([3u8; 32])
+    }
+
+    /// A head at `version` listing [`dir`] and [`host`].
+    fn two(version: u64) -> SignedPolicyHead {
+        head_with(version, 3, vec![dir().node_id(), host().node_id()])
+    }
+
+    /// Card 49: a caller dialing a host takes another directory's word for
+    /// the host's head, never the host's own, unless the host is the head's
+    /// one directory.
+    #[test]
+    fn a_host_vouches_for_itself_only_as_the_one_directory() {
+        let h = two(5);
+        let other = Fresh::sign(&dir(), &h, 1_000, 1_900).unwrap();
+        let own = Fresh::sign(&host(), &h, 1_000, 1_900).unwrap();
+        assert!(other.vouches(&h, host().node_id(), 1_500).is_ok());
+        assert!(matches!(
+            own.vouches(&h, host().node_id(), 1_500),
+            Err(Error::SelfVouched)
+        ));
+        // To a caller dialing the other directory as a host, the host's word
+        // counts.
+        assert!(own.vouches(&h, dir().node_id(), 1_500).is_ok());
+        // The one-machine network: the host is the only directory.
+        let alone = head_with(5, 3, vec![host().node_id()]);
+        let own = Fresh::sign(&host(), &alone, 1_000, 1_900).unwrap();
+        assert!(own.vouches(&alone, host().node_id(), 1_500).is_ok());
+    }
+
+    #[test]
+    fn a_lapsed_or_mismatched_fresh_vouches_for_nothing() {
+        let h = two(5);
+        let f = Fresh::sign(&dir(), &h, 1_000, 1_900).unwrap();
+        assert!(matches!(
+            f.vouches(&h, host().node_id(), 1_901),
+            Err(Error::FreshLapsed)
+        ));
+        assert!(matches!(
+            f.vouches(&h, host().node_id(), 1_000 - CLOCK_SKEW_SECS - 1),
+            Err(Error::FreshLapsed)
+        ));
+        assert!(matches!(
+            f.vouches(&two(6), host().node_id(), 1_500),
+            Err(Error::FreshMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_set_keeps_the_best_per_signer() {
+        let (h5, h6) = (two(5), two(6));
+        let mut set = FreshSet::default();
+        assert!(set.insert(Fresh::sign(&dir(), &h5, 100, 200).unwrap(), 100));
+        assert!(!set.insert(Fresh::sign(&dir(), &h5, 50, 150).unwrap(), 100));
+        assert!(set.insert(Fresh::sign(&dir(), &h5, 150, 300).unwrap(), 150));
+        assert!(set.insert(Fresh::sign(&host(), &h5, 150, 300).unwrap(), 150));
+        assert_eq!(set.iter().count(), 2, "one per signer");
+        // A newer head's replaces the older one's, however short.
+        assert!(set.insert(Fresh::sign(&dir(), &h6, 10, 20).unwrap(), 150));
+        assert!(set.vouching(&h5, host().node_id(), 160).is_none());
+        assert_eq!(set.current_for(&h5, 160).len(), 1, "the host's own");
+        // One from the future never displaces a current one.
+        let skew = CLOCK_SKEW_SECS;
+        let mut set = FreshSet::default();
+        assert!(set.insert(Fresh::sign(&dir(), &h5, 990, 1_100).unwrap(), 1_000));
+        let ahead = Fresh::sign(&dir(), &h5, 1_000 + skew + 60, 2_000).unwrap();
+        assert!(!set.insert(ahead, 1_000));
+    }
+
+    #[test]
+    fn a_full_set_drops_its_worst() {
+        let signers: Vec<NodeIdentity> = (0..=MAX_FRESH_SET as u8)
+            .map(|i| NodeIdentity::from_seed([100 + i; 32]))
+            .collect();
+        let h = head_with(5, 3, signers.iter().map(|s| s.node_id()).collect());
+        let mut set = FreshSet::default();
+        for (i, s) in signers.iter().enumerate().take(MAX_FRESH_SET) {
+            assert!(set.insert(Fresh::sign(s, &h, 0, 100 + i as i64).unwrap(), 0));
+        }
+        let last = signers.last().unwrap();
+        // Ranked below every one held: not kept.
+        assert!(!set.insert(Fresh::sign(last, &h, 0, 50).unwrap(), 0));
+        // Above the worst: it goes in, the worst goes out.
+        assert!(set.insert(Fresh::sign(last, &h, 0, 1_000).unwrap(), 0));
+        assert_eq!(set.iter().count(), MAX_FRESH_SET);
+        assert!(set.iter().all(|f| f.until != 100), "the worst was dropped");
+    }
+
+    #[test]
+    fn a_set_round_trips_as_a_plain_list_and_verifies_on_use() {
+        let h = two(5);
+        let mut set = FreshSet::default();
+        set.insert(Fresh::sign(&dir(), &h, 100, 200).unwrap(), 100);
+        let text = serde_json::to_string(&set).unwrap();
+        assert!(text.starts_with('['), "{text}");
+        let back: FreshSet = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, set);
+        // A tampered entry read back vouches for nothing.
+        let mut forged: FreshSet = serde_json::from_str(&text).unwrap();
+        forged.0[0].until = 10_000;
+        assert!(forged.vouching(&h, host().node_id(), 5_000).is_none());
+        assert!(forged.current_for(&h, 5_000).is_empty());
+    }
+
+    /// Card 49 review: a directory's word lasts at most the head's
+    /// `fresh_secs`. One that claims longer (a removed directory signing
+    /// `until = i64::MAX`) is refused at signing and at every check.
+    #[test]
+    fn a_fresh_lasts_no_longer_than_the_head_allows() {
+        let h = head();
+        assert!(Fresh::sign(&dir(), &h, 0, 100_000).is_ok());
+        assert!(matches!(
+            Fresh::sign(&dir(), &h, 0, 100_001),
+            Err(Error::FreshTooLong)
+        ));
+        let mut forever = Fresh::sign(&dir(), &h, 0, 100).unwrap();
+        forever.until = i64::MAX;
+        forever.sig = dir().sign(&forever.signed_bytes().unwrap());
+        assert!(matches!(forever.verify(&h), Err(Error::FreshTooLong)));
+        assert!(forever.vouches(&h, host().node_id(), 1_000).is_err());
+        let mut set = FreshSet::default();
+        set.insert(forever, 1_000);
+        assert!(set.vouching(&h, host().node_id(), 1_000).is_none());
+        assert!(set.current_for(&h, 1_000).is_empty());
     }
 
     proptest! {
+        /// Whatever is inserted, in any order, a set holds at most one per
+        /// signer and at most [`MAX_FRESH_SET`], and every `Fresh` it hands a
+        /// caller vouches.
+        #[test]
+        fn a_set_stays_bounded_and_vouches_only_truly(
+            picks in proptest::collection::vec((0u8..20, 0i64..1_000, 0i64..500, 4u64..7), 0..60),
+            now in 0i64..1_500,
+        ) {
+            let signers: Vec<NodeIdentity> =
+                (0..20u8).map(|i| NodeIdentity::from_seed([60 + i; 32])).collect();
+            let heads: Vec<SignedPolicyHead> = (4..7)
+                .map(|v| head_with(v, 3, signers.iter().map(|s| s.node_id()).collect()))
+                .collect();
+            let mut set = FreshSet::default();
+            for (who, at, len, v) in picks {
+                let h = &heads[(v - 4) as usize];
+                set.insert(Fresh::sign(&signers[who as usize], h, at, at + len).unwrap(), now);
+            }
+            let mut signed: Vec<NodeId> = set.iter().map(|f| f.directory).collect();
+            let n = signed.len();
+            signed.sort();
+            signed.dedup();
+            prop_assert_eq!(signed.len(), n);
+            prop_assert!(n <= MAX_FRESH_SET);
+            for h in &heads {
+                for host in [signers[0].node_id(), signers[1].node_id()] {
+                    if let Some(f) = set.vouching(h, host, now) {
+                        prop_assert!(f.vouches(h, host, now).is_ok());
+                        prop_assert!(f.directory != host);
+                    }
+                }
+                for f in set.current_for(h, now) {
+                    prop_assert!(f.verify(h).is_ok() && f.is_current(now));
+                }
+            }
+        }
+
         #[test]
         fn any_window_verifies_and_is_current_inside_it(
             at in -1_000_000i64..1_000_000,

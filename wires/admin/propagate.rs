@@ -31,7 +31,7 @@
 //!
 //! ```text
 //! wires policy push                          # re-publish the stored policy to every directory
-//! wires policy settings --freshness strict    # the signed freshness rule (card 36c)
+//! wires policy settings --fresh-secs 300       # how long a directory's word lasts (cards 36c, 49)
 //! ```
 
 use std::collections::BTreeSet;
@@ -64,10 +64,10 @@ pub(crate) enum PolicyCmd {
     #[command(after_help = "Example:\n  wires policy push")]
     Push,
     /// Print the network's settings, or change them and publish
-    // The freshness rule (`--freshness lenient|strict`) and how often
-    // directories vouch for the policy.
+    // How often directories vouch for the policy, and for how long: the
+    // removed-host window.
     #[command(
-        after_help = "Examples:\n  wires policy settings\n  wires policy settings --freshness strict --beat-secs 60"
+        after_help = "Examples:\n  wires policy settings\n  wires policy settings --fresh-secs 300 --beat-secs 60"
     )]
     Settings(super::settings::SettingsArgs),
 }

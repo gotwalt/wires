@@ -46,7 +46,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use axum::Router;
 use axum::routing::{get, post};
 use clap::Args;
-use library::{IdToken, NodeId, View};
+use library::{FreshSet, IdToken, NodeId};
 use url::Url;
 
 use crate::admin::keystore::Keystore;
@@ -156,11 +156,12 @@ pub(crate) trait Backend: Send + Sync + 'static {
     /// The caller used for one web user's calls.
     type Caller: crate::caller::call::Caller + Send + Sync;
     /// The view of the web user `session` speaks for (current: a newer
-    /// policy applies to their next request).
-    fn view(&self, session: &Session) -> impl Future<Output = Result<Arc<View>>> + Send;
+    /// policy applies to their next request), with the `Fresh`es its
+    /// subscription brought.
+    fn view(&self, session: &Session) -> impl Future<Output = Result<Arc<HeldView>>> + Send;
     /// A caller presenting `token` in every call's handshake, dialing the
-    /// hosts `view` names.
-    fn caller(&self, token: IdToken, view: Arc<View>) -> Self::Caller;
+    /// hosts `view` names once each shows a current policy (card 49).
+    fn caller(&self, token: IdToken, view: Arc<HeldView>) -> Self::Caller;
 }
 
 /// What a web user hears when a directory refuses them admission (no role
@@ -196,6 +197,10 @@ pub(crate) struct Keystored {
     directories: Vec<NodeId>,
     /// Live views, by ID token.
     views: std::sync::Mutex<HashMap<String, UserView>>,
+    /// The `Fresh`es hosts' proofs carried, for every user (a `Fresh`
+    /// vouches for a head, not a person): so a call to a host one already
+    /// covers speaks at once (card 49).
+    proofs: Arc<std::sync::Mutex<FreshSet>>,
 }
 
 impl Keystored {
@@ -263,7 +268,7 @@ impl Keystored {
 impl Backend for Keystored {
     type Caller = PresentingCaller;
 
-    async fn view(&self, session: &Session) -> Result<Arc<View>> {
+    async fn view(&self, session: &Session) -> Result<Arc<HeldView>> {
         let now = crate::clock::now_unix();
         let mut rx = self.watch(session, now);
         // A directory refuses a person no role matches (or one removed)
@@ -278,27 +283,31 @@ impl Backend for Keystored {
             .map_err(|_| anyhow!("the view subscription ended"))?
             .clone()
             .expect("waited for a view");
-        Ok(Arc::new(held.view.clone()))
+        Ok(held)
     }
 
-    fn caller(&self, token: IdToken, view: Arc<View>) -> PresentingCaller {
+    fn caller(&self, token: IdToken, view: Arc<HeldView>) -> PresentingCaller {
         PresentingCaller {
             ks: Arc::clone(&self.ks),
             creds: self.creds.clone().presenting(token),
             endpoint: self.endpoint.clone(),
             view,
+            proofs: Arc::clone(&self.proofs),
         }
     }
 }
 
 /// Calls a service with this node's credentials over the gateway's shared
 /// endpoint, presenting a web user's ID token instead of a stored one, on
-/// the hosts that user's view names.
+/// the hosts that user's view names, once a host shows a current policy
+/// (card 49: a newer head than the view's is a dial failure here, since the
+/// user's subscription catches up on its own).
 pub(crate) struct PresentingCaller {
     ks: Arc<Keystore>,
     creds: Credentials,
     endpoint: iroh::Endpoint,
-    view: Arc<View>,
+    view: Arc<HeldView>,
+    proofs: Arc<std::sync::Mutex<FreshSet>>,
 }
 
 impl crate::caller::call::Caller for PresentingCaller {
@@ -309,9 +318,17 @@ impl crate::caller::call::Caller for PresentingCaller {
         stdin: Vec<u8>,
     ) -> Result<crate::caller::call::CallOutcome> {
         use crate::caller::call::{SERVICE_DIAL_TIMEOUT, ServiceDial, call_entry, outcome};
+        use crate::caller::vouch::{Scope, Sink, Vouching};
         let Some(entry) = self.view.entry(service) else {
             bail!("`{service}` is not a service this user may call");
         };
+        let mut vouch = Vouching::new(
+            self.creds.root(),
+            (*self.view).clone(),
+            Scope::Service(service.clone()),
+        )
+        .knowing(crate::caller::view::joined_directories(&self.ks))
+        .keeping_in(Sink::Shared(Arc::clone(&self.proofs)));
         let dial = ServiceDial {
             endpoint: &self.endpoint,
             hints: crate::caller::pick::Hints::load(&self.ks),
@@ -321,7 +338,7 @@ impl crate::caller::call::Caller for PresentingCaller {
         let result = call_entry(
             &self.creds,
             &self.ks,
-            self.view.head.head.version,
+            &mut vouch,
             entry,
             &dial,
             argv,
@@ -486,9 +503,9 @@ impl<B: Backend> Gateway<B> {
     pub(crate) async fn tools_for(
         &self,
         session: &Session,
-    ) -> Result<(Arc<View>, Vec<ViewService>)> {
+    ) -> Result<(Arc<HeldView>, Vec<ViewService>)> {
         let view = self.backend.view(session).await?;
-        let tools = services_in(&view);
+        let tools = services_in(&view.view);
         Ok((view, tools))
     }
 }
@@ -625,6 +642,7 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
         creds,
         directories,
         views: std::sync::Mutex::new(HashMap::new()),
+        proofs: Default::default(),
     };
     let mut origins = vec![
         urls.issuer.clone(),

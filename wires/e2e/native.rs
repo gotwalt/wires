@@ -35,6 +35,7 @@ use tokio::sync::oneshot;
 use super::{PATIENCE, localhost_socks};
 use crate::admin::keystore::Keystore;
 use crate::caller::mock_idp::{MOCK_CLIENT_ID, MockIdp};
+use crate::caller::vouch::Scope;
 use crate::host::transport::{Denied, call_service_on, endpoint_addr, secret_key};
 use crate::{Call, CallIo, Host, Service};
 
@@ -77,6 +78,9 @@ impl World {
         s.version = StateVersion(1);
         s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
+        // A directory vouches for it (card 49): its word is left on the
+        // host's disk ([`keystore`](Self::keystore)).
+        s.directories = vec![crate::testutil::test_directory().node_id()];
         s.roles.insert(
             RoleName::new("analyst").unwrap(),
             vec![Matcher {
@@ -105,7 +109,8 @@ impl World {
     }
 
     /// The host's keystore, as `wires join` and a first fetch leave it: its
-    /// node key, the network string, and the policy `state`.
+    /// node key, the network string, the policy `state`, and a directory's
+    /// current word for it (`fresh.json`, as its beat leaves it).
     fn keystore(&self, state: &SignedPolicy) -> std::path::PathBuf {
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);
@@ -118,6 +123,7 @@ impl World {
             crate::clock::now_unix(),
         )
         .unwrap();
+        crate::testutil::vouch_on_disk(&ks, &state.head);
         home
     }
 
@@ -148,6 +154,8 @@ impl World {
 /// An embedded host serving on loopback until dropped.
 struct Running {
     addr: EndpointAddr,
+    /// The policy it was started with: what callers check it against.
+    state: SignedPolicy,
     /// The host's endpoint (a handle to the one it serves on).
     endpoint: Endpoint,
     stop: Option<oneshot::Sender<()>>,
@@ -155,8 +163,13 @@ struct Running {
 }
 
 impl Running {
-    /// Serve `host` (built for `w.host`) on a fresh loopback endpoint.
-    async fn start(w: &World, host: Host) -> Running {
+    /// Serve `host` (built for `w.host` from the keystore at `home`) on a
+    /// fresh loopback endpoint.
+    async fn start(w: &World, host: Host, home: &std::path::Path) -> Running {
+        let state = crate::policy::store::read(&Keystore::at(home), w.root.node_id())
+            .unwrap()
+            .unwrap()
+            .signed;
         let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key(&w.host))
             .bind()
@@ -169,6 +182,7 @@ impl Running {
         }));
         Running {
             addr,
+            state,
             endpoint,
             stop: Some(stop),
             served,
@@ -225,19 +239,22 @@ async fn call_with(
         .bind()
         .await
         .unwrap();
+    let service = ServiceName::new(name).unwrap();
     let outcome = tokio::time::timeout(PATIENCE, async {
         loop {
             let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            let mut vouch = crate::testutil::vouching(&host.state, Scope::Service(service.clone()));
             let dialed = call_service_on(
                 &endpoint,
                 std::slice::from_ref(&host.addr),
                 std::time::Duration::from_secs(2),
-                hello.clone(),
+                &mut vouch,
+                &hello.id_token,
                 Invocation {
-                    service: ServiceName::new(name).unwrap(),
+                    service: service.clone(),
                     argv: library::Argv::new(args.iter().map(|a| a.to_string()).collect()).unwrap(),
                 },
-                |_, _| Ok(()),
+                |_, _, _| Ok(()),
                 std::io::Cursor::new(stdin.as_bytes().to_vec()),
                 &mut stdout,
                 &mut stderr,
@@ -282,7 +299,7 @@ async fn a_native_service_is_called_like_a_cli() {
         .service("kv", kv_example::Kv::default())
         .build()
         .unwrap();
-    let host = Running::start(&w, host).await;
+    let host = Running::start(&w, host, &home).await;
 
     // State across calls, the value on stdin, the answer on stdout.
     assert_eq!(
@@ -337,7 +354,7 @@ async fn a_refused_caller_never_reaches_the_handler() {
         .service("count", Counting(Arc::clone(&reached)))
         .build()
         .unwrap();
-    let host = Running::start(&w, host).await;
+    let host = Running::start(&w, host, &home).await;
 
     assert_eq!(
         call(&w, &host, &w.bob, "count", &[], "").await,
@@ -366,7 +383,7 @@ async fn an_unassigned_native_service_refuses_to_start() {
         .service("other", kv_example::Kv::default())
         .build()
         .unwrap();
-    let served = Running::start(&w, host).await;
+    let served = Running::start(&w, host, &home).await;
     let e = format!("{:#}", served.stop().await.unwrap_err());
     assert!(
         e.contains("native service other, but the signed policy (version 1) has no such service"),
@@ -409,7 +426,7 @@ async fn a_native_service_pushes_to_its_caller() {
         .service("notify", Notify)
         .build()
         .unwrap();
-    let host = Running::start(&w, host).await;
+    let host = Running::start(&w, host, &home).await;
     assert_eq!(
         call(&w, &host, &w.alice, "notify", &["deployed"], "").await,
         ran(0, "queued")
@@ -419,7 +436,7 @@ async fn a_native_service_pushes_to_its_caller() {
     // A host with no push configured says so to the handler.
     let home = w.keystore(&state);
     let host = w.builder(&home).service("notify", Notify).build().unwrap();
-    let host = Running::start(&w, host).await;
+    let host = Running::start(&w, host, &home).await;
     assert_eq!(
         call(&w, &host, &w.alice, "notify", &["deployed"], "").await,
         Outcome::Ran {
@@ -442,7 +459,7 @@ async fn push_allow_refuses_a_caller_in_none_of_its_roles() {
         .service("notify", Notify)
         .build()
         .unwrap();
-    let host = Running::start(&w, host).await;
+    let host = Running::start(&w, host, &home).await;
     let Outcome::Ran {
         code,
         stdout,
@@ -465,7 +482,7 @@ async fn each_verified_person_gets_their_own_kv() {
         .service("kv", kv_example::Kv::default())
         .build()
         .unwrap();
-    let host = Running::start(&w, host).await;
+    let host = Running::start(&w, host, &home).await;
     for (who, value) in [(&w.alice, "alice's"), (&w.bob, "bob's")] {
         assert_eq!(
             call(&w, &host, who, "kv", &["set", "k"], value).await,
@@ -499,7 +516,7 @@ async fn native_and_cli_services_share_one_host() {
         .service("kv", kv_example::Kv::default())
         .build()
         .unwrap();
-    let host = Running::start(&w, host).await;
+    let host = Running::start(&w, host, &home).await;
     assert_eq!(
         call(&w, &host, &w.alice, "hello", &[], "").await,
         ran(0, "hello from a CLI\n")
@@ -527,7 +544,7 @@ async fn a_stopped_host_closes_its_endpoint() {
         .service("kv", kv_example::Kv::default())
         .build()
         .unwrap();
-    let host = Running::start(&w, host).await;
+    let host = Running::start(&w, host, &home).await;
     assert_eq!(
         call(&w, &host, &w.alice, "kv", &["keys"], "").await,
         ran(0, "")

@@ -131,9 +131,10 @@ pub(crate) enum Binding {
 /// the admin's first publish. Any other host refuses to start unless it
 /// holds such a policy, fetching one from a directory first if it doesn't.
 /// Then it serves the session ALPN (and push when configured), deciding
-/// every call by the signed policy as it stands at that connection (and
-/// its signed freshness rule), and follows a directory's `policy`
-/// subscription for every edit and `Fresh` ([`follow`]).
+/// every call by the signed policy as it stands at that connection, showing
+/// each caller first the `Fresh`es it holds for that policy (card 49), and
+/// follows a directory's `policy` subscription for every edit and `Fresh`
+/// ([`follow`]).
 pub(crate) async fn serve_until(
     serving: Serving,
     shutdown: impl std::future::Future<Output = anyhow::Result<()>>,
@@ -559,39 +560,6 @@ mod tests {
         // A policy at least as new as the mark is decided under again.
         crate::policy::store::adopt_if_newer(&ks, &signed(3), root, now).unwrap();
         assert_eq!(host.policy().unwrap().version().0, 3);
-    }
-
-    /// The signed freshness rule: `lenient` decides whatever the host's
-    /// freshness; `strict` only while a current `Fresh` vouches for the
-    /// head it decides under.
-    #[test]
-    fn strict_decides_only_while_a_directory_vouches() {
-        let home = crate::testutil::temp_dir();
-        let host = host_at(&home, None).unwrap();
-        let root = library::NodeIdentity::from_seed([1u8; 32]);
-        let dir = library::NodeIdentity::from_seed([30u8; 32]);
-        let held = |mode| {
-            let mut p = library::Policy::new(root.node_id());
-            p.version = library::StateVersion(2);
-            p.not_after = i64::MAX;
-            p.directories = vec![dir.node_id()];
-            p.settings.freshness = mode;
-            crate::testutil::held(&root, p)
-        };
-        let (lenient, strict) = (
-            held(library::FreshnessMode::Lenient),
-            held(library::FreshnessMode::Strict),
-        );
-        assert!(host.check_vouched(&lenient, 100).is_ok());
-        let refused = host.check_vouched(&strict, 100).unwrap_err();
-        assert_eq!(refused.to_string(), freshness::STALE);
-        let fresh = library::Fresh::sign(&dir, &strict.signed.head, 100, 200).unwrap();
-        host.freshness
-            .offer(&fresh, &strict.signed.head, 100)
-            .unwrap();
-        assert!(host.check_vouched(&strict, 150).is_ok());
-        assert!(host.check_vouched(&strict, 201).is_err());
-        assert!(host.check_vouched(&lenient, 201).is_ok());
     }
 
     /// A key set on disk in the host's home (a caller's cache, or one planted

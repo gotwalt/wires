@@ -9,7 +9,9 @@
 //!   what was acknowledged. The fetch presents this node's ID token (`wires
 //!   login`): the host admits a fetch only as it admits a call (a role
 //!   must match the person), and learns from it who the pushes addressed
-//!   to a role are for;
+//!   to a role are for. As on a call, the host speaks first, and the token
+//!   goes only to a host whose policy a directory other than it has vouched
+//!   for lately (card 49, [`vouch`](crate::caller::vouch));
 //! - **pushed** while `wires inbox --wait` runs: it serves the inbox ALPN
 //!   ([`INBOX_ALPN`]) and accepts deliveries ([`InboxReceiver`]) only from
 //!   the hosts its view names, besides long-polling each host. It follows
@@ -57,6 +59,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::admin::keystore::{self, Keystore};
 use crate::admin::ttl::Ttl;
+use crate::caller::vouch::{Refresher, Scope, Sink, Unvouched, Vouching, all_unvouched};
 use crate::clock::now_ms;
 use crate::host::transport::{self, Denied};
 
@@ -565,17 +568,23 @@ pub(crate) enum Fetched {
     Messages(usize),
     /// It refused, and why.
     Refused(String),
+    /// It couldn't show a current policy, so it was sent nothing (card 49).
+    Unvouched(Unvouched),
 }
 
-/// Fetch from `host` over `endpoint`: say `hello`, ask for what is queued
-/// (holding up to `wait` for something to arrive), store and acknowledge
-/// it. Keeps fetching while the host hands over full batches.
+/// Fetch from `host` over `endpoint`: check the host's proof against
+/// `vouch` (card 49) before saying anything, or say `hello` at once when
+/// `vouch` holds a current word for it already and check the proof then;
+/// ask for what is queued (holding up to `wait` for something to arrive),
+/// store and acknowledge it. Keeps fetching while the host hands over full
+/// batches.
 pub(crate) async fn fetch_from(
     endpoint: &Endpoint,
     host: EndpointAddr,
     hello: &InboxFrame,
     wait: Duration,
     mailbox: &Mailbox,
+    vouch: &mut Vouching,
 ) -> Result<Fetched> {
     let me = transport::to_node_id(&endpoint.id());
     let mut total = 0;
@@ -587,14 +596,53 @@ pub(crate) async fn fetch_from(
             .map_err(|e| anyhow!("dialing: {e}"))?;
         let peer = transport::to_node_id(&conn.remote_id());
         let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
-        write_frame(&mut send, hello).await?;
-        write_frame(
-            &mut send,
-            &InboxFrame::Fetch {
-                wait_ms: wait.as_millis() as u64,
-            },
-        )
-        .await?;
+        let fetch = InboxFrame::Fetch {
+            wait_ms: wait.as_millis() as u64,
+        };
+        let at_once = vouch.ready(peer, crate::clock::now_unix());
+        if at_once {
+            write_frame(&mut send, hello).await?;
+            write_frame(&mut send, &fetch).await?;
+        } else {
+            write_frame(&mut send, &InboxFrame::Open {}).await?;
+        }
+        let proof =
+            match read_frame_within(&mut recv, FRAME_TIMEOUT, library::MAX_INBOX_HELLO).await {
+                Ok(Some(InboxFrame::Proof { proof })) => proof,
+                Ok(Some(InboxFrame::Denied { reason })) => {
+                    conn.close(0u32.into(), b"refused");
+                    return Ok(Fetched::Refused(reason));
+                }
+                other => {
+                    conn.close(0u32.into(), b"no proof");
+                    let why = match other {
+                        Err(e) => format!("no proof: {e:#}"),
+                        _ => "its first frame was not a proof".to_string(),
+                    };
+                    if at_once {
+                        bail!("host {}: {why}", peer.short());
+                    }
+                    return Ok(Fetched::Unvouched(Unvouched {
+                        host: peer.short(),
+                        why,
+                        lapsed: false,
+                    }));
+                }
+            };
+        if let Err(e) = vouch
+            .check(peer, &proof, crate::clock::now_unix(), !at_once)
+            .await
+        {
+            conn.close(0u32.into(), b"unvouched");
+            return match e.downcast::<Unvouched>() {
+                Ok(u) => Ok(Fetched::Unvouched(u)),
+                Err(e) => Err(e),
+            };
+        }
+        if !at_once {
+            write_frame(&mut send, hello).await?;
+            write_frame(&mut send, &fetch).await?;
+        }
         let answer = read_frame(&mut recv, wait + FRAME_TIMEOUT).await?;
         let messages = match answer {
             Some(InboxFrame::Deliver { messages }) => messages,
@@ -628,9 +676,10 @@ pub(crate) fn hello(token: IdToken) -> InboxFrame {
     }
 }
 
-/// Fetch from every host in `targets` at once, each bounded by `budget`
-/// (plus `wait` for a long poll). Returns what each answered (a failure to
-/// reach one is logged and left out).
+/// Fetch from every host in `targets` at once, each checked against
+/// `vouch` (card 49) and bounded by `budget` (plus `wait` for a long poll).
+/// Returns what each answered (a failure to reach one is logged and left
+/// out).
 pub(crate) async fn fetch_all(
     endpoint: &Endpoint,
     targets: &[(NodeId, EndpointAddr)],
@@ -638,16 +687,18 @@ pub(crate) async fn fetch_all(
     wait: Duration,
     budget: Duration,
     mailbox: &Mailbox,
+    vouch: &Vouching,
 ) -> Vec<(NodeId, Fetched)> {
     let mut set = tokio::task::JoinSet::new();
     for (node, addr) in targets.iter().cloned() {
         let endpoint = endpoint.clone();
         let hello = hello.clone();
         let mailbox = mailbox.clone();
+        let mut vouch = vouch.clone();
         set.spawn(async move {
             let r = tokio::time::timeout(
                 budget + wait,
-                fetch_from(&endpoint, addr, &hello, wait, &mailbox),
+                fetch_from(&endpoint, addr, &hello, wait, &mailbox, &mut vouch),
             )
             .await;
             (node, r)
@@ -774,16 +825,17 @@ struct Fetcher {
 
 impl Fetcher {
     /// The hosts of every service in the view (read now: a `--wait`
-    /// subscription keeps it current), never this node, as dial targets.
-    /// None from an expired view.
-    fn targets(&self) -> Vec<(NodeId, EndpointAddr)> {
+    /// subscription keeps it current), never this node, as dial targets,
+    /// and what each is checked against before it is told anything (card
+    /// 49). None from an expired view.
+    fn targets(&self) -> Option<(Vec<(NodeId, EndpointAddr)>, Vouching)> {
         let now = crate::clock::now_unix();
         let held = match crate::caller::view::read(&self.ks, self.fabric) {
             Ok(Some(held)) if held.view.head.check_fresh(now).is_ok() => held,
-            Ok(_) => return Vec::new(),
+            Ok(_) => return None,
             Err(e) => {
                 tracing::warn!("the stored view is unusable: {e:#}");
-                return Vec::new();
+                return None;
             }
         };
         let names: Vec<&library::ServiceName> = held.view.entries.iter().map(|e| &e.name).collect();
@@ -792,11 +844,20 @@ impl Fetcher {
             .filter(|h| *h != self.me)
             .collect();
         let hints = crate::caller::pick::Hints::load(&self.ks);
-        hosts
+        let targets = hosts
             .iter()
             .copied()
             .zip(hints.targets(&hosts, None))
-            .collect()
+            .collect();
+        let vouch = Vouching::new(self.fabric, held, Scope::AnyService)
+            .knowing(crate::caller::view::joined_directories(&self.ks))
+            .refreshing(Refresher {
+                ks: (*self.ks).clone(),
+                endpoint: self.endpoint.clone(),
+                id_token: crate::caller::hello::stored_token(&self.ks),
+            })
+            .keeping_in(Sink::Keystore((*self.ks).clone()));
+        Some((targets, vouch))
     }
 }
 
@@ -813,8 +874,7 @@ async fn read_loop(
         let round = tokio::time::Instant::now();
         // Every host refused this node: an answer, not "nothing yet" (77).
         let mut refused_by_all: Option<String> = None;
-        {
-            let targets = fetcher.targets();
+        if let Some((targets, vouch)) = fetcher.targets() {
             let (endpoint, targets, hello) = (&fetcher.endpoint, &targets, &fetcher.hello);
             let wait = if a.wait && !mailbox.has_unread() {
                 deadline
@@ -824,8 +884,17 @@ async fn read_loop(
                 Duration::ZERO
             };
             let mut refusals = Vec::new();
-            for (host, fetched) in
-                fetch_all(endpoint, targets, hello, wait, FETCH_BUDGET, mailbox).await
+            let mut unvouched = Vec::new();
+            for (host, fetched) in fetch_all(
+                endpoint,
+                targets,
+                hello,
+                wait,
+                FETCH_BUDGET,
+                mailbox,
+                &vouch,
+            )
+            .await
             {
                 match fetched {
                     Fetched::Refused(reason) => {
@@ -840,7 +909,19 @@ async fn read_loop(
                     Fetched::Messages(n) => {
                         tracing::debug!(host = %host.hex(), fetched = n, "inbox fetch")
                     }
+                    Fetched::Unvouched(u) => {
+                        tracing::info!(host = %host.hex(), "{u}");
+                        if u.lapsed {
+                            unvouched.push(format!("{}: {}", u.host, u.why));
+                        }
+                    }
                 }
+            }
+            // Fail closed, and say so once: no host was sent this node's
+            // token, because no directory has vouched for any of them.
+            if !targets.is_empty() && unvouched.len() == targets.len() {
+                let said = all_unvouched("the hosts of your services", &unvouched);
+                eprintln!("wires inbox: {said}");
             }
             if !targets.is_empty() && refusals.len() == targets.len() {
                 refused_by_all = refusals.into_iter().next();

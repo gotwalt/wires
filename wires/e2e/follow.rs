@@ -1,6 +1,6 @@
-//! Card 36c's acceptance: **hosts follow the directory by subscription, and
-//! the signed freshness rule decides what a host does when no directory
-//! vouches for its policy.**
+//! Card 36c's acceptance: **hosts follow the directory by subscription**;
+//! and card 49's: **a caller tells a host nothing until a directory other
+//! than that host vouches for the head it holds.**
 //!
 //! Policies here are signed by the root directly and handed to a directory
 //! by the admin's publish ([`publish_all`]) or [`Directory::accept`]; hosts
@@ -12,8 +12,10 @@
 //! - [`a_host_that_missed_edits_catches_up_by_one_update_on_reconnect`]
 //! - [`an_update_that_does_not_apply_makes_the_host_take_the_whole_policy`]
 //! - [`an_update_this_host_already_holds_is_skipped_not_resynced`]
-//! - [`with_every_directory_down_lenient_keeps_serving`]
-//! - [`with_every_directory_down_strict_refuses_until_one_is_back`]
+//! - [`with_every_directory_down_calls_fail_closed_until_one_is_back`]
+//! - [`a_node_banned_host_that_is_a_directory_gets_no_token`]
+//! - [`a_host_dropped_from_the_service_gets_no_token`]
+//! - [`a_one_machine_network_calls_its_host`]
 //! - [`a_host_restarted_from_disk_serves_before_any_directory_answers`]
 //! - [`a_directory_serving_an_unadoptable_policy_is_passed_over`]
 //! - [`a_publish_from_a_stale_copy_is_not_delivered`]
@@ -27,9 +29,7 @@ use std::time::{Duration, Instant};
 use iroh::Endpoint;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::Router;
-use library::{
-    FreshnessMode, Matcher, NodeIdentity, Policy, Service, Settings, SignedPolicy, StateVersion,
-};
+use library::{Matcher, NodeIdentity, Policy, Service, Settings, SignedPolicy, StateVersion};
 
 use super::{PATIENCE, bind_in, call, hello, host_config, localhost_socks, role, service};
 use crate::admin::keystore::Keystore;
@@ -38,7 +38,7 @@ use crate::clock::now_unix;
 use crate::directory::node::Directory;
 use crate::directory::serve::Running;
 use crate::host::follow::{FollowStats, Follower};
-use crate::host::freshness::{Freshness, STALE, Vouched};
+use crate::host::freshness::Freshness;
 use crate::host::native::NativeServices;
 use crate::host::serve::{Binding, Serving, serve_until};
 use crate::host::transport::endpoint_addr;
@@ -200,6 +200,7 @@ impl World {
             .run(),
         );
         Following {
+            me: node.node_id(),
             ks: Arc::clone(ks),
             root,
             freshness,
@@ -216,8 +217,18 @@ impl World {
         i: usize,
         ks: &Arc<Keystore>,
     ) -> (iroh::EndpointAddr, tokio::sync::oneshot::Sender<()>) {
+        let endpoint = self.bind(&self.hosts[i]).await;
+        self.host_on(i, ks, endpoint).await
+    }
+
+    /// [`host`](Self::host), on `endpoint` (bound for host `i`).
+    async fn host_on(
+        &self,
+        i: usize,
+        ks: &Arc<Keystore>,
+        endpoint: Endpoint,
+    ) -> (iroh::EndpointAddr, tokio::sync::oneshot::Sender<()>) {
         let node = &self.hosts[i];
-        let endpoint = self.bind(node).await;
         let addr = endpoint_addr(&node.node_id(), &localhost_socks(&endpoint), None).unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let serving = Serving {
@@ -240,7 +251,7 @@ impl World {
     }
 
     /// Alice calls `echo` on the host at `addr`: its stdout, or the
-    /// refusal.
+    /// refusal. Hand-rolled: it trusts the host without checking its proof.
     async fn call(&self, addr: &iroh::EndpointAddr) -> Result<String, String> {
         let hello = hello(&self.alice, 0, Some(&self.idp));
         match call(&self.alice, addr, hello, "echo", &[]).await {
@@ -249,6 +260,131 @@ impl World {
             } => Ok(stdout),
             super::Outcome::Denied(reason) => Err(reason),
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// Alice as `wires call` makes her: her keystore holding `policy`'s view
+    /// for her (and `fresh`, a directory's word for it), and her ID token.
+    async fn caller(&self, policy: &SignedPolicy, fresh: Option<library::Fresh>) -> Caller {
+        let ks = Keystore::at(crate::testutil::temp_dir());
+        ks.save_node(&self.alice).unwrap();
+        crate::testutil::join(&ks, &self.root, &[]);
+        let token = self.idp.mint(
+            &library::OidcNonce::for_node(&self.alice.node_id()),
+            now_unix() + 3600,
+        );
+        std::fs::write(
+            ks.path(crate::caller::login::ID_TOKEN_FILE),
+            format!("{}\n", token.as_str()),
+        )
+        .unwrap();
+        let caller = Caller {
+            ks,
+            creds: crate::caller::call::Credentials::of(
+                self.alice.duplicate(),
+                self.root.node_id(),
+            ),
+            endpoint: self.bind(&self.alice).await,
+        };
+        caller.hold(self, policy, fresh);
+        caller
+    }
+
+    /// A host that shows `proof` for `who`, and records what callers send
+    /// it (it serves nothing).
+    async fn lying_host(&self, who: &NodeIdentity, proof: library::HostProof) -> Heard {
+        let endpoint = self.bind(who).await;
+        endpoint.set_alpns(vec![crate::host::transport::ALPN.to_vec()]);
+        let heard = Heard::default();
+        let log = heard.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let Ok(conn) = incoming.await else { continue };
+                log.0.lock().unwrap().0 += 1;
+                let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+                    continue;
+                };
+                let proof = library::Frame::Proof(proof.clone());
+                let _ = crate::host::transport::write_frame(&mut send, &proof).await;
+                while let Ok(Some(frame)) = crate::host::transport::read_frame(&mut recv).await {
+                    if matches!(frame, library::Frame::Hello(_) | library::Frame::Invoke(_)) {
+                        log.0.lock().unwrap().1 += 1;
+                    }
+                }
+            }
+        });
+        heard
+    }
+}
+
+/// What a [`World::lying_host`] heard: connections, and `Hello`s or
+/// `Invoke`s.
+#[derive(Clone, Default)]
+struct Heard(Arc<std::sync::Mutex<(usize, usize)>>);
+
+impl Heard {
+    fn connections(&self) -> usize {
+        self.0.lock().unwrap().0
+    }
+    fn hellos(&self) -> usize {
+        self.0.lock().unwrap().1
+    }
+}
+
+/// Alice's `wires call echo`, from her keystore.
+struct Caller {
+    ks: Keystore,
+    creds: crate::caller::call::Credentials,
+    endpoint: Endpoint,
+}
+
+impl Caller {
+    /// Store `policy`'s view for alice (with `fresh`, a directory's word for
+    /// it), as a directory would cut it.
+    fn hold(&self, w: &World, policy: &SignedPolicy, fresh: Option<library::Fresh>) {
+        let person = super::person(&w.idp, "alice@example.com");
+        let held = crate::caller::view::HeldView::fetched(
+            policy.view_for(w.alice.node_id(), Some(&person), None),
+            fresh,
+            now_unix(),
+        );
+        crate::caller::view::write(&self.ks, w.root.node_id(), &held).unwrap();
+    }
+
+    /// Call `echo` as `wires call` does (from the stored view, refreshing it
+    /// from a directory when a host shows a newer head): its stdout, or the
+    /// error as text.
+    async fn call(&self, w: &World) -> Result<String, String> {
+        let _ = w;
+        let held = crate::caller::view::read(&self.ks, self.creds.root())
+            .unwrap()
+            .unwrap();
+        let dial = crate::caller::call::ServiceDial {
+            endpoint: &self.endpoint,
+            hints: Default::default(),
+            timeout: Duration::from_secs(3),
+        };
+        let mut stdout = Vec::new();
+        let r = crate::caller::call::call_service_with(
+            &self.creds,
+            &self.ks,
+            &held,
+            &service("echo"),
+            &dial,
+            library::Argv::default(),
+            std::io::Cursor::new(Vec::new()),
+            &mut stdout,
+            Vec::new(),
+            Default::default(),
+        )
+        .await;
+        match r {
+            Ok(0) => Ok(String::from_utf8(stdout).unwrap()),
+            Ok(code) => Err(format!("exit {code}")),
+            Err(e) => Err(match e.downcast_ref::<crate::host::transport::Denied>() {
+                Some(d) => format!("denied: {}", d.reason()),
+                None => format!("{e:#}"),
+            }),
         }
     }
 }
@@ -272,6 +408,8 @@ impl Dir {
 
 /// A running follower.
 struct Following {
+    /// The host it follows for.
+    me: library::NodeId,
     ks: Arc<Keystore>,
     root: library::NodeId,
     freshness: Arc<Freshness>,
@@ -287,7 +425,7 @@ impl Following {
             loop {
                 if let Some(h) = store::read(&self.ks, self.root).unwrap()
                     && h.version() == version
-                    && self.freshness.vouched(&h.signed.head, now_unix()) == Vouched::Current
+                    && self.freshness.vouched(&h.signed.head, self.me, now_unix())
                 {
                     return;
                 }
@@ -486,59 +624,177 @@ async fn an_update_this_host_already_holds_is_skipped_not_resynced() {
     follower.take(update, now).unwrap();
     let held = store::read(&ks, root).unwrap().unwrap();
     assert_eq!(held.signed, v2);
-    assert_eq!(
-        freshness.vouched(&held.signed.head, now),
-        Vouched::Current,
+    assert!(
+        freshness.vouched(&held.signed.head, w.hosts[0].node_id(), now),
         "the update's Fresh vouches for the head it already holds"
     );
     endpoint.close().await;
 }
 
 /// Short intervals: a `Fresh` every second, good for three.
-fn quick(freshness: FreshnessMode) -> Settings {
+fn quick() -> Settings {
     Settings {
-        freshness,
         beat_secs: 1,
         fresh_secs: 3,
     }
 }
 
-/// With every directory stopped, a `lenient` host keeps serving under its
-/// held policy.
+/// Card 49: with every directory stopped, no host can show a current word
+/// for its policy, so a caller sends none of them anything and the call
+/// fails closed, saying so (exit 1); once a directory is back, calls go
+/// through again.
 #[tokio::test]
-async fn with_every_directory_down_lenient_keeps_serving() {
+async fn with_every_directory_down_calls_fail_closed_until_one_is_back() {
     let w = World::new().await;
-    let v1 = w.policy(1, quick(FreshnessMode::Lenient), 0);
-    let d = w.directory(0, &w.keystore(&w.dirs[0], &v1)).await;
-    let ks = w.keystore(&w.hosts[0], &v1);
-    let (addr, _stop) = w.host(0, &ks).await;
-    assert_eq!(w.call(&addr).await.unwrap(), "hi\n");
-    d.stop().await;
-    // Past the last `Fresh`'s `until`.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    assert_eq!(w.call(&addr).await.unwrap(), "hi\n");
-}
-
-/// With every directory stopped, a `strict` host refuses calls once its
-/// `Fresh` lapses, and serves again once a directory is back.
-#[tokio::test]
-async fn with_every_directory_down_strict_refuses_until_one_is_back() {
-    let w = World::new().await;
-    let v1 = w.policy(1, quick(FreshnessMode::Strict), 0);
+    let v1 = w.policy(1, quick(), 0);
     let dir_ks = w.keystore(&w.dirs[0], &v1);
     let d = w.directory(0, &dir_ks).await;
     let ks = w.keystore(&w.hosts[0], &v1);
-    let (addr, _stop) = w.host(0, &ks).await;
-    // Served once a directory has vouched for its policy.
-    eventually("a vouched call", || async { w.call(&addr).await.ok() }).await;
+    let (_addr, _stop) = w.host(0, &ks).await;
+    let caller = w.caller(&v1, None).await;
+    // Served once a directory has vouched for the host's policy.
+    eventually("a vouched call", || async { caller.call(&w).await.ok() }).await;
     d.stop().await;
-    let refused = eventually("a refusal", || async { w.call(&addr).await.err() }).await;
-    assert_eq!(refused, STALE);
-    // The directory comes back (from directory.redb): calls are served again.
+    let refused = eventually("a call that fails closed", || async {
+        caller
+            .call(&w)
+            .await
+            .err()
+            .filter(|e| e.contains("no directory has vouched"))
+    })
+    .await;
+    assert!(refused.contains("no directory has vouched"), "{refused}");
+    assert!(!refused.contains("denied"), "not a refusal: {refused}");
+    // The directory comes back (from directory.redb): calls go through again.
     let d = w.directory(0, &dir_ks).await;
-    let out = eventually("a call after", || async { w.call(&addr).await.ok() }).await;
+    let out = eventually("a call after", || async { caller.call(&w).await.ok() }).await;
     assert_eq!(out, "hi\n");
     d.stop().await;
+}
+
+/// Card 49, the attack, end to end: host X (host 0) is also one of the two
+/// directories. The admin takes it out (`how`), the directory and host 1
+/// take the edit, and a caller whose view predates it still lists X. X
+/// keeps the old head and vouches for it itself; the honest directory's word
+/// for that head has lapsed. X is sent no `Hello` (no ID token) and no
+/// `Invoke`; the call reaches host 1.
+async fn a_removed_host_that_is_a_directory_gets_nothing(how: Removal) {
+    let w = World::new().await;
+    let x = &w.hosts[0];
+    let both = |p: &mut Policy| p.directories = vec![w.dirs[0].node_id(), x.node_id()];
+    let v1 = w.policy_edited(1, quick(), 0, i64::MAX, both);
+    let d = w.directory(0, &w.keystore(&w.dirs[0], &v1)).await;
+    let y_ks = w.keystore(&w.hosts[1], &v1);
+    let (_y, _stop) = w.host(1, &y_ks).await;
+    // The caller's view, vouched for by the directory then.
+    let old_word = d.dir.snapshot().unwrap().fresh.clone().unwrap();
+    let caller = w.caller(&v1, Some(old_word.clone())).await;
+
+    let x_id = x.node_id();
+    let v2 = w.policy_edited(2, quick(), 0, i64::MAX, |p| match how {
+        Removal::NodeBan => {
+            for svc in p.services.values_mut() {
+                svc.hosts.retain(|h| *h != x_id);
+            }
+            p.ban(x_id);
+        }
+        Removal::FromTheService => {
+            both(p);
+            p.services
+                .get_mut(&service("echo"))
+                .unwrap()
+                .hosts
+                .retain(|h| *h != x_id);
+        }
+    });
+    let admin = w.bind(&w.admin).await;
+    let report = publish_all(&admin, &v2, &[w.dirs[0].node_id()])
+        .await
+        .unwrap();
+    assert_eq!(report.delivered, vec![w.dirs[0].node_id()]);
+    // Past the old word's `until`: the window is `fresh_secs`.
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    assert!(!old_word.is_current(now_unix()));
+
+    // What X shows: its old head, with its own fresh word for it and the
+    // directory's lapsed one; or, still a directory, the current head with
+    // the directory's current word, which a caller checks against its view
+    // refreshed to that head.
+    let now = now_unix();
+    let proof = match how {
+        Removal::NodeBan => library::HostProof {
+            head: v1.head.clone(),
+            fresh: vec![
+                library::Fresh::sign(x, &v1.head, now, now + 3).unwrap(),
+                old_word,
+            ],
+        },
+        Removal::FromTheService => library::HostProof {
+            head: v2.head.clone(),
+            fresh: vec![d.dir.snapshot().unwrap().fresh.clone().unwrap()],
+        },
+    };
+    let heard = w.lying_host(x, proof).await;
+    let mut calls = 0;
+    while heard.connections() == 0 {
+        assert!(calls < 40, "the random order never tried X");
+        // From the view that predates the edit each time (a call that
+        // reached host 1 refreshed it).
+        caller.hold(&w, &v1, None);
+        assert_eq!(caller.call(&w).await.unwrap(), "hi\n", "host 1 served it");
+        calls += 1;
+    }
+    assert_eq!(heard.hellos(), 0, "X got no Hello, no ID token, no Invoke");
+    admin.close().await;
+    d.stop().await;
+}
+
+/// How the admin takes host X out.
+#[derive(Clone, Copy)]
+enum Removal {
+    /// `wires remove <x>`: banned, dropped from every service and from the
+    /// directories.
+    NodeBan,
+    /// `wires service rm-host`: dropped from the service, still a directory.
+    FromTheService,
+}
+
+#[tokio::test]
+async fn a_node_banned_host_that_is_a_directory_gets_no_token() {
+    a_removed_host_that_is_a_directory_gets_nothing(Removal::NodeBan).await;
+}
+
+#[tokio::test]
+async fn a_host_dropped_from_the_service_gets_no_token() {
+    a_removed_host_that_is_a_directory_gets_nothing(Removal::FromTheService).await;
+}
+
+/// Card 49: a one-machine network (the host is the only directory) works
+/// as it did: the caller takes the host's own word, and keeps it, so its
+/// next call speaks at once.
+#[tokio::test]
+async fn a_one_machine_network_calls_its_host() {
+    let w = World::new().await;
+    let me = w.hosts[0].node_id();
+    let v1 = w.policy_edited(1, Settings::default(), 0, i64::MAX, |p| {
+        p.directories = vec![me];
+        p.services.get_mut(&service("echo")).unwrap().hosts = vec![me];
+    });
+    let ks = w.keystore(&w.hosts[0], &v1);
+    let (_addr, _stop) = w.host(0, &ks).await;
+    let caller = w.caller(&v1, None).await;
+    let out = eventually("a call", || async { caller.call(&w).await.ok() }).await;
+    assert_eq!(out, "hi\n");
+    let held = crate::caller::view::read(&caller.ks, w.root.node_id())
+        .unwrap()
+        .unwrap();
+    assert!(
+        held.fresh
+            .vouching(&held.view.head, me, now_unix())
+            .is_some(),
+        "the host's own word, kept: the next call speaks at once"
+    );
+    assert_eq!(caller.call(&w).await.unwrap(), "hi\n");
 }
 
 /// A directory that serves a policy the host can't adopt (here, one that
@@ -688,4 +944,151 @@ async fn a_host_restarted_from_disk_serves_before_any_directory_answers() {
     let ks = w.keystore(&w.hosts[0], &v1);
     let (addr, _stop) = w.host(0, &ks).await;
     assert_eq!(w.call(&addr).await.unwrap(), "hi\n");
+}
+
+/// Card 49's cost, measured: a call whose caller holds no current word for
+/// the host (it sends `Open` and waits for the proof: one flight more) and
+/// one that does (it speaks at once), each on a new connection, to a real
+/// host. On loopback by default; with `WIRES_MEASURE_RELAY=1`, both ends
+/// bind n0's relays and no IP transport, so every packet goes through a
+/// public relay (needs the internet). Not run by `cargo test`:
+///
+/// ```text
+/// cargo test -p wires measure_the_extra_flight -- --ignored --nocapture
+/// WIRES_MEASURE_RELAY=1 cargo test -p wires measure_the_extra_flight -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "a measurement, not a check"]
+async fn measure_the_extra_flight() {
+    use crate::caller::vouch::Scope;
+    let relay = std::env::var_os("WIRES_MEASURE_RELAY").is_some();
+    let rounds = if relay { 30 } else { 200 };
+    let w = World::new().await;
+    let v1 = w.policy(1, Settings::default(), 0);
+    let ks = w.keystore(&w.hosts[0], &v1);
+    let now = now_unix();
+    let word = library::Fresh::sign(&w.dirs[0], &v1.head, now - 1, now + 899).unwrap();
+    std::fs::write(
+        ks.path(crate::host::freshness::FRESH_FILE),
+        serde_json::to_string(&[&word]).unwrap(),
+    )
+    .unwrap();
+    let relay_only = async |who: &NodeIdentity, alpns: Vec<Vec<u8>>| {
+        Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(crate::host::transport::secret_key(who))
+            .clear_ip_transports()
+            .alpns(alpns)
+            .bind()
+            .await
+            .unwrap()
+    };
+    let (target, _stop) = if relay {
+        let endpoint = relay_only(&w.hosts[0], vec![]).await;
+        tokio::time::timeout(PATIENCE, endpoint.online())
+            .await
+            .expect("no relay within 30 s");
+        let addr = endpoint.addr();
+        let (_, stop) = w.host_on(0, &ks, endpoint).await;
+        (addr, stop)
+    } else {
+        w.host(0, &ks).await
+    };
+    let caller = if relay {
+        relay_only(&w.alice, vec![]).await
+    } else {
+        w.bind(&w.alice).await
+    };
+    let token = w.idp.mint(
+        &library::OidcNonce::for_node(&w.alice.node_id()),
+        now + 3600,
+    );
+    let mut times = [Vec::new(), Vec::new()];
+    for round in 0..rounds + 5 {
+        // Alternate which goes first, so neither pays for the other's close.
+        let order = if round % 2 == 0 { [0, 1] } else { [1, 0] };
+        for cached in order {
+            let out = &mut times[cached];
+            let mut vouch = crate::testutil::vouching(&v1, Scope::Service(service("echo")));
+            if cached == 1 {
+                let fresh = Some(word.clone());
+                let held = crate::caller::view::HeldView::fetched(
+                    library::View {
+                        head: v1.head.clone(),
+                        entries: v1.entries().cloned().collect(),
+                    },
+                    fresh,
+                    now,
+                );
+                vouch = crate::caller::vouch::Vouching::new(
+                    w.root.node_id(),
+                    held,
+                    Scope::Service(service("echo")),
+                );
+            }
+            // The phases `call_service_on` goes through, timed apart.
+            let started = Instant::now();
+            let conn = caller
+                .connect(target.clone(), crate::host::transport::ALPN)
+                .await
+                .unwrap();
+            let connected = started.elapsed();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            let invocation = library::Invocation {
+                service: service("echo"),
+                argv: library::Argv::default(),
+            };
+            let host = w.hosts[0].node_id();
+            crate::host::transport::speak(
+                &mut send,
+                &mut recv,
+                host,
+                &mut vouch,
+                &token,
+                &invocation,
+            )
+            .await
+            .unwrap();
+            let spoke = started.elapsed();
+            let mut stdout = Vec::new();
+            crate::host::transport::converse(
+                send,
+                recv,
+                |_| Ok(()),
+                std::io::Cursor::new(Vec::new()),
+                &mut stdout,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let done = started.elapsed();
+            conn.close(0u32.into(), b"done");
+            assert_eq!(stdout, b"hi\n");
+            // The first few warm the paths up.
+            if round >= 5 {
+                out.push([connected, spoke, done]);
+            }
+        }
+    }
+    // The median of each phase (connected, spoken, done), in ms.
+    let p50 = |v: &[[Duration; 3]]| -> [f64; 3] {
+        std::array::from_fn(|i| {
+            let mut col: Vec<Duration> = v.iter().map(|t| t[i]).collect();
+            col.sort();
+            col[col.len() / 2].as_secs_f64() * 1e3
+        })
+    };
+    let [open, cached] = times;
+    let say = |what: &str, t: [f64; 3]| {
+        eprintln!(
+            "  {what}: connected {:.1} ms, spoken {:.1} ms, exit {:.1} ms",
+            t[0], t[1], t[2]
+        )
+    };
+    eprintln!(
+        "{} x {rounds}, a new connection per call (p50 from the dial):",
+        if relay { "relay only" } else { "loopback" }
+    );
+    say("Open, then the proof", p50(&open));
+    say("speaking at once     ", p50(&cached));
+    caller.close().await;
 }
