@@ -83,7 +83,7 @@ Open cards only; finished cards are in [done/](done/).
 
 | Card | Stage | Depends on | Status | Summary |
 |---|---|---|---|---|
-| [40](backlog/40-cut-records.md) | 1 | — | backlog | **Cut the call log, OTLP export and `wires watch`**, and the `readers` role with them |
+| [40](review/40-cut-records.md) | 1 | — | review | **Cut the call log, OTLP export and `wires watch`**, and the `readers` role with them |
 | [42](backlog/42-caller-identity-for-services.md) | 1 | — | backlog | **One caller identity for every service:** `WIRES_ID_TOKEN` and the verified claims, in the environment and in the native API |
 | [41](backlog/41-idp-membership.md) | 2 | 40, 42 | backlog | **Signing in is joining:** no badges, no invites, no ledger; removal names a person |
 | [39](backlog/39-premise-and-story.md) | 3 | 41 | backlog | **The story:** README, summary, post, usage and the rest rewritten to the premise |

@@ -1,6 +1,6 @@
 wires: denied by host: not a member of this network; don't retry: ask your admin for access [exit 77]
 
-wires: denied by host: sec@audit.example is in no role allowed to call orders-db (analyst); don't retry: ask your admin for access [exit 77]
+wires: denied by host: carol@partner.example is in no role allowed to call orders-db (analyst); don't retry: ask your admin for access [exit 77]
 
 wires: denied by host: orders-db needs a verified identity in role analyst; run `wires login` [exit 77]
 

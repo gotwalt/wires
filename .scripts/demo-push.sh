@@ -11,7 +11,7 @@
 #                the mock CI (.scripts/fixtures/ci.sh): deploy, status, logs;
 #                "push": {"allow": ["analyst"]}.
 #   agent     -- signs in (mock IdP) as an analyst, then only `wires call` /
-#                `wires inbox` / `wires watch`, in locked mode (WIRES_LOCKED=1).
+#                `wires inbox`, in locked mode (WIRES_LOCKED=1).
 #   root      -- the admin: init, the analyst role, the three services on the
 #                workbench, one invite per machine.
 #
@@ -19,9 +19,7 @@
 # running; `wires inbox --wait` (what an agent would run as a background
 # command) exits 0 when the build's job runs `wires push --to
 # "$WIRES_CALLER_NODE"`, and its line names the verified host; the agent's
-# `logs` call returns the failing assertion; the agent's own `wires watch`
-# shows ▶ deploy, then ⇢ build-41, then ▶ logs, in that order, from the
-# workbench's signed log; and a "sleeping" agent (nothing running) finds the
+# `logs` call returns the failing assertion; and a "sleeping" agent (nothing running) finds the
 # next build's push queued on the workbench, fetched by its next plain
 # `wires inbox`.
 #
@@ -70,15 +68,6 @@ WAIT_PID=""
 p=""
 trap 'for p in $WAIT_PID $WB_PID $IDP_PID; do kill "$p" 2>/dev/null || true; done; [ -n "$KEEP" ] || rm -rf "$D"' EXIT INT TERM
 
-# The last line of $1 holding every remaining fixed string, as
-# `<line number>:<line>` (or fail), so steps can be checked for order.
-numbered_line() {
-	local file="$1" hits
-	shift
-	hits="$(grep -n '' "$file")"
-	for s in "$@"; do hits="$(printf '%s\n' "$hits" | grep -F -- "$s" || true)"; done
-	[ -n "$hits" ] && printf '%s\n' "$hits" | tail -1
-}
 admin() { WIRES_HOME="$root" "$WIRES" "$@"; }
 # The agent: locked mode, so it can steer nothing but the service and its args.
 agent_wires() { WIRES_HOME="$agent" WIRES_LOCKED=1 "$WIRES" "$@"; }
@@ -253,85 +242,43 @@ ok "4: test_orders_total: left $GOT, right 1234.50"
 beat 3
 
 # ==========================================================================
-step "5  the workbench's own log holds the whole chain -- the agent reads its part"
-# ==========================================================================
-run "wires watch --once   # the agent's own calls, and the pushes to it"
-agent_wires watch --once >"$D/w1.out" 2>"$D/w1.err" || {
-	cat "$D/w1.err" >&2
-	bad "5: wires watch failed"
-}
-SD="$(numbered_line "$D/w1.out" "▶" "$EMAIL" "[analyst] deploy build 41")" || {
-	cat "$D/w1.out" >&2
-	bad "5: no ▶ deploy naming $EMAIL"
-}
-# `delivered` if the host's direct dial reached the waiting inbox, else
-# `fetched` by its long poll.
-SP="$(numbered_line "$D/w1.out" "⇢" "→ $EMAIL" "[analyst] \"build-41\" ")" || {
-	cat "$D/w1.out" >&2
-	bad "5: no ⇢ build-41 in the records"
-}
-SL="$(numbered_line "$D/w1.out" "▶" "$EMAIL" "[analyst] logs build 41 --tail 50")" || {
-	cat "$D/w1.out" >&2
-	bad "5: no ▶ logs naming $EMAIL"
-}
-nD="${SD%%:*}"
-nP="${SP%%:*}"
-nL="${SL%%:*}"
-[ "$nD" -lt "$nP" ] && [ "$nP" -lt "$nL" ] || {
-	cat "$D/w1.out" >&2
-	bad "5: the chain is out of order (deploy line $nD, push $nP, logs $nL)"
-}
-ok "5: ▶ deploy → ⇢ push → ▶ logs, in order, verified against the host's signed log"
-line "${SD#*:}"
-line "${SP#*:}"
-line "${SL#*:}"
-beat 3
-
-# ==========================================================================
-step "6  a sleeping agent: nothing running -- the push waits on the workbench"
+step "5  a sleeping agent: nothing running -- the push waits on the workbench"
 # ==========================================================================
 run "wires call deploy -- build 42   # and then the agent stops; no inbox running"
 agent_wires call deploy -- build 42 >"$D/d2.out" 2>"$D/d2.err" || {
 	cat "$D/d2.err" >&2
-	bad "6: wires call deploy (42) failed"
+	bad "5: wires call deploy (42) failed"
 }
 for _ in $(seq 1 $((JOB_SECS * 10 + 100))); do
 	[ -f "$JOBS/build-42/pushed_ms" ] && break
 	sleep 0.1
 done
-[ -f "$JOBS/build-42/pushed_ms" ] || bad "6: build-42's job never pushed"
+[ -f "$JOBS/build-42/pushed_ms" ] || bad "5: build-42's job never pushed"
 grep -qE "^queued +$EMAIL \($AG8\)" "$JOBS/build-42/push.out" || {
 	cat "$JOBS/build-42/push.out" "$JOBS/build-42/push.err" >&2
-	bad "6: with nothing running, build-42's push was not queued"
+	bad "5: with nothing running, build-42's push was not queued"
 }
-ok "6: build-42 failed while the agent slept; the push is queued on the workbench"
+ok "5: build-42 failed while the agent slept; the push is queued on the workbench"
 run "wires inbox   # the agent's next turn, whenever that is"
 agent_wires inbox >"$D/i2.out" 2>"$D/i2.err" || {
 	cat "$D/i2.err" >&2
-	bad "6: wires inbox failed"
+	bad "5: wires inbox failed"
 }
 grep -qF "from host $WB8 (verified)  build-42  failed: test_orders_total" "$D/i2.out" || {
 	cat "$D/i2.out" "$D/i2.err" >&2
-	bad "6: the next wires inbox did not fetch build-42"
+	bad "5: the next wires inbox did not fetch build-42"
 }
 show "$D/i2.out"
 agent_wires inbox >"$D/i3.out" 2>/dev/null
-[ ! -s "$D/i3.out" ] || bad "6: a read message was printed twice"
-agent_wires watch --once >"$D/w2.out" 2>/dev/null || true
-QF="$(numbered_line "$D/w2.out" "⇢" "→ $EMAIL" "\"build-42\" fetched")" || {
-	cat "$D/w2.out" >&2
-	bad "6: no ⇢ build-42 fetched in the records"
-}
-ok "6: fetched on the next \`wires inbox\` -- once"
-line "${QF#*:}"
-alive "$WB_PID" || bad "6: the workbench died"
+[ ! -s "$D/i3.out" ] || bad "5: a read message was printed twice"
+ok "5: fetched on the next \`wires inbox\` -- once"
+alive "$WB_PID" || bad "5: the workbench died"
 
 # ==========================================================================
 step "SUMMARY"
 # ==========================================================================
 printf '     callback  : build-41 result pushed host -> agent by key; inbox --wait woke %s ms after the build finished\n' "$LAT" >&2
 printf '     follow-up : logs -- build 41 --tail 50 -> test_orders_total left %s\n' "$GOT" >&2
-printf '     recorded  : ▶ deploy → ⇢ build-41 → ▶ logs in the host'"'"'s signed log, naming %s\n' "$EMAIL" >&2
 # shellcheck disable=SC2016 # literal backticks in the summary
 printf '     asleep    : build-42 queued on the workbench, fetched by the next `wires inbox`\n' >&2
 printf '     exposed   : nothing on the agent -- no webhook URL; %ss wall clock\n' "$((SECONDS - START))" >&2

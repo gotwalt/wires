@@ -150,7 +150,7 @@ fn error_messages_match_their_snapshot() {
         registry(Refusal::NotInRole {
             service: svc.clone(),
             allow: vec![analyst.clone()],
-            principal: Some("sec@audit.example".into()),
+            principal: Some("carol@partner.example".into()),
         })
         .to_string(),
         registry(Refusal::NotInRole {
