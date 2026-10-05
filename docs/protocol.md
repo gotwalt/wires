@@ -652,12 +652,28 @@ Node's event loop. In both, a handler that raises ends the call with exit 1 and 
 none stored (and none presented, for the gateway), the call ends at once (exit 1, `not signed in:
 run \`wires login\``), and nothing is sent. It dials from its view (§4 *Views*), refreshing it first
 when it is stale or missing. When the refresh fails it dials from a stale view that hasn't
-expired; with none, exit 1 (`wires login`, or ask the admin for `wires policy push`). It takes the service's hosts from the service's root-signed entry, the last host that
-answered (`last-good.json`) first, then the admin's order. A name the view doesn't hold is asked
+expired; with none, exit 1 (`wires login`, or ask the admin for `wires policy push`). It takes the service's hosts from the service's root-signed entry and orders them **at
+random, afresh for each call**, so a service's calls spread across its hosts; the admin's order
+means nothing. A host that failed to answer this caller's dial in the last 60 s goes last
+(`unanswered.json`, the oldest failure first), so a host that is down costs each caller one dial
+timeout a minute, not one in every few calls. A name the view doesn't hold is asked
 of a directory (`resolve`); a name no directory resolves for this caller ends the call before any
 dial (exit 1). The gateway dials from each user's subscribed view, and neither refreshes it nor
-resolves a name. It fails over to the next host **only when a dial fails** (10 s each); a host that
-answered has decided. It sends `Hello` and `Invoke` together, then, before it forwards a byte of
+resolves a name. It moves to the next host **only when a dial fails** (10 s each); a host that
+answered has decided. When a call is answered, the hosts tried before the one that answered are
+recorded in `unanswered.json` and the one that answered is cleared from it; a call no host answered
+records nothing (every host failing tells the order nothing).
+
+**What stays on one host.** Hosts share the signed policy and nothing else, so the next call may
+land on another host. What a host keeps between calls stays on it: whatever a native service
+or the CLI holds in memory or on that machine's disk (the `kv` example's map is per host); the
+callers whose identity it has verified (§7 *The identity rule*: a host learns a caller's identity
+only from that caller's call or inbox fetch to it, so `wires push --to <role>` from one host
+reaches only the callers who have called or fetched from it); and its push queue (§7). A push is
+queued on the host that sent it, and `wires inbox` asks every host of the services in its view, so
+random host choice loses no push; one queued on a host that is down waits there until it is back
+or the push expires. [Card 31](board/backlog/31-inbox-delivery.md) is where a single delivery path
+gets settled. It sends `Hello` and `Invoke` together, then, before it forwards a byte of
 stdin, checks the host: the key it dialed (which iroh authenticated) is one the root-signed entry
 lists, and, when the ack's `state_version` is newer than its view's, `HelloAck::assigns`: the head
 verifies under the root at that version, and the service's entry verifies under the root, names
@@ -842,7 +858,7 @@ reaches `wires mcp` and the gateway.
 | `fresh.json` | 0600 | host | the newest `Fresh` for the held head (§4 *Freshness at the host*) |
 | `directory.redb` | 0600 | directory | the directory's heads and items (§4) |
 | `idp-token.jwt`, `idp-refresh-token` | 0600 | caller | from `wires login` |
-| `last-good.json` | 0600 | caller | service → the host that last answered |
+| `unanswered.json` | 0600 | caller | host → when it last failed to answer this caller's dial; a host there under 60 s goes last (§5) |
 | `hints` | — (the operator's; wires never writes it) | any node | optional local dial hints (below) |
 | `tools.json` | — | caller | locked mode; optional aliases |
 | `inbox/` | 0700 | caller | `new/` (≤256 unread), `read/` (last 1024), `notes/` |
@@ -924,6 +940,9 @@ ones that bound this spec:
   `strict`, until its `not_after`, and so does a caller whose view's head lists it (above). An
   honest directory that missed a publish does the same until its replica catches up.
 - A host knows a caller's identity only once the caller presented its token to that host.
+- **Hosts share no state.** Calls to a service spread at random across its hosts, so a service
+  that keeps state between calls (in memory, or on its machine's disk) answers from whichever host
+  the call landed on, and a push sits on the host that sent it (§5 *What stays on one host*).
 - **A queued push is addressed to the node, not the person.** The host queues by node key, and the
   next admitted fetch from that node (or delivery to its `wires inbox --wait`) whose person
   `push.allow` admits takes everything queued, including what was pushed while another person was

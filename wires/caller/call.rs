@@ -1,8 +1,8 @@
 //! `wires call`: run one remote CLI by name, as if it were local.
 //!
 //! The name is a **service** (card 27): its hosts come from the service's
-//! root-signed entry in this node's view (card 37), tried last-good first
-//! with failover on a dial failure ([`crate::caller::pick`]), and the
+//! root-signed entry in this node's view (card 37), tried in a random order
+//! per call, moving on only on a dial failure ([`crate::caller::pick`]), and the
 //! session opens with the [`Hello`] (the view's head version, and the ID
 //! token `wires login` stored: no token, no call). A name the view doesn't
 //! hold is asked of a directory (`resolve`) before the call fails; nothing
@@ -46,7 +46,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::admin::keystore::{self, Keystore};
 use crate::caller::lock::{EXIT_LOCKED, Lock, check_process_stdin};
-use crate::caller::pick::{self, Hints, LastGood};
+use crate::caller::pick::{self, Hints, Unanswered};
 use crate::caller::shape::{EXIT_SHAPE, Shape, ShapeArgs, exit_code};
 use crate::caller::tools::{RemoteTool, ToolTarget, ToolsConfig};
 use crate::caller::view::{self, HeldView};
@@ -456,9 +456,9 @@ pub(crate) struct CallOpts {
 
 /// Call `service` (card 27) from the view `held` (which must be fresh):
 /// the service's entry (asked of a directory with `resolve` when the view
-/// doesn't hold it), its hosts last-good first with failover on a dial
-/// failure, the [`Hello`], the ack check ([`accept_ack`]), stdio, and the
-/// host that answered remembered. With [`CallOpts::refresh_after`], a newer
+/// doesn't hold it), its hosts in a random order per call, moving on only on
+/// a dial failure, the [`Hello`], the ack check ([`accept_ack`]), stdio, and
+/// the hosts that didn't answer remembered. With [`CallOpts::refresh_after`], a newer
 /// head a host reported is followed by a view refresh. A refusal is a
 /// [`transport::Denied`] error, as in [`dial`].
 #[allow(clippy::too_many_arguments)]
@@ -607,9 +607,10 @@ pub(crate) struct Called {
 }
 
 /// One call of the service `entry` names on the hosts it lists, from a view
-/// at `version`, over `dial`'s endpoint and hints: last-good first, failing
-/// over on a dial failure, the [`Hello`], the ack check ([`accept_ack`]),
-/// stdio, and the host that answered remembered.
+/// at `version`, over `dial`'s endpoint and hints: a random order per call
+/// ([`pick::candidates`]), moving on only on a dial failure, the [`Hello`],
+/// the ack check ([`accept_ack`]), stdio, and the hosts that didn't answer
+/// remembered.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_entry<R, W, E>(
     creds: &Credentials,
@@ -630,8 +631,14 @@ where
 {
     let service = &entry.name;
     let hello = creds.hello(ks, version)?;
-    let last_good = LastGood::path(ks);
-    let hosts = pick::candidates(&entry.service, LastGood::load(&last_good).get(service));
+    let unanswered = Unanswered::path(ks);
+    let now = crate::clock::now_unix();
+    let hosts = pick::candidates(
+        &entry.service,
+        &Unanswered::load(&unanswered),
+        now,
+        &mut rand::rng(),
+    );
     if hosts.is_empty() {
         bail!("no service named `{service}` with a host; see `wires services`");
     }
@@ -660,7 +667,7 @@ where
     if verbose {
         eprintln!("wires: {service} answered by host {}", done.host.short());
     }
-    LastGood::record(&last_good, service, done.host);
+    Unanswered::record(&unanswered, &hosts, done.host, now);
     Ok(Called {
         exit: done.dialed.exit,
         newer: (reported > version).then_some(reported),
@@ -1425,10 +1432,11 @@ mod tests {
         (r, String::from_utf8(stdout).unwrap())
     }
 
-    /// Host A is down, host B answers: the call fails over to B, presents a
-    /// `Hello` with this node's view version and stored token,
-    /// notes the newer head B reports (the next `wires services` refreshes),
-    /// and remembers B as last-good.
+    /// Host A is down, host B answers: whichever the random order tries
+    /// first, the call reaches B, presents a `Hello` with this node's view
+    /// version and stored token, and notes the newer head B reports (the next
+    /// `wires services` refreshes); once A has been tried it is remembered as
+    /// unanswered (so it goes last for a while) and B is not.
     #[tokio::test]
     async fn a_service_call_fails_over_and_notes_the_hosts_newer_head() {
         let f = fixture();
@@ -1458,40 +1466,46 @@ mod tests {
         assert_eq!(stored.version(), StateVersion(1), "a view isn't a policy");
         assert_eq!(stored.seen, StateVersion(2));
         assert!(stored.is_stale(10), "the next `wires services` refreshes");
-        let name = ServiceName::new("orders-db").unwrap();
-        let last = LastGood::load(&LastGood::path(&f.ks));
-        assert_eq!(last.get(&name), Some(b_id));
-
-        // Next call: B is tried first.
-        let (r, _) = run_service(&f, &stored, hints).await;
-        assert_eq!(r.unwrap(), 0);
-        assert_eq!(seen.lock().unwrap().len(), 2);
+        // Call until the random order has tried A first (one in two).
+        let path = Unanswered::path(&f.ks);
+        let tried_a = || {
+            Unanswered::load(&path)
+                .failed_recently(down, crate::clock::now_unix())
+                .is_some()
+        };
+        let mut calls = 1;
+        while !tried_a() {
+            assert!(calls < 40, "the order never put A first");
+            let (r, _) = run_service(&f, &stored, hints.clone()).await;
+            assert_eq!(r.unwrap(), 0);
+            calls += 1;
+        }
+        assert_eq!(seen.lock().unwrap().len(), calls, "B answered every call");
+        let now = crate::clock::now_unix();
+        assert_eq!(Unanswered::load(&path).failed_recently(b_id, now), None);
     }
 
     /// A refusal is final: no failover to the next host, and it surfaces as
-    /// `Denied` (exit 77 in `wires call`).
+    /// `Denied` (exit 77 in `wires call`). Both hosts refuse, each in its
+    /// own words: whichever the random order tried first is the only one
+    /// asked, and its reason is the one surfaced.
     #[tokio::test]
     async fn a_refusal_does_not_fail_over() {
         let f = fixture();
         let a = NodeIdentity::from_seed([84; 32]);
         let b = NodeIdentity::from_seed([85; 32]);
         let state = held(&f, &signed_at(&f.root, 1, &[a.node_id(), b.node_id()]));
-        let (a_id, a_addr, _) = fake_host(&a, Answer::Deny("not in role analyst")).await;
-        let answer = Answer::Run {
-            out: "",
-            policy: None,
-        };
-        let (b_id, b_addr, b_seen) = fake_host(&b, answer).await;
+        let (a_id, a_addr, a_seen) = fake_host(&a, Answer::Deny("a: not in role analyst")).await;
+        let (b_id, b_addr, b_seen) = fake_host(&b, Answer::Deny("b: not in role analyst")).await;
         let hints = Hints::from_pairs([(a_id, vec![a_addr]), (b_id, vec![b_addr])]);
         let (r, out) = run_service(&f, &state, hints).await;
         let err = r.unwrap_err();
         let denied = err.downcast_ref::<transport::Denied>().expect("a Denied");
-        assert_eq!(denied.reason(), "not in role analyst");
         assert_eq!(out, "");
-        assert!(
-            b_seen.lock().unwrap().is_empty(),
-            "no failover after a refusal"
-        );
+        let (a_n, b_n) = (a_seen.lock().unwrap().len(), b_seen.lock().unwrap().len());
+        assert_eq!(a_n + b_n, 1, "no failover after a refusal");
+        let asked = if a_n == 1 { "a" } else { "b" };
+        assert_eq!(denied.reason(), format!("{asked}: not in role analyst"));
         // The view may be behind the host's policy (a removal, a lost
         // grant): the next `wires services` or `wires call` refreshes it.
         let after = view::read(&f.ks, f.root.node_id()).unwrap().unwrap();

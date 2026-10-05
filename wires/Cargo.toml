@@ -44,6 +44,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 # Pure Rust, one file, ACID; the one new crate the directory brings.
 redb = "4"
 blake3 = { workspace = true }
+# The per-call host order (card 46).
+rand = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

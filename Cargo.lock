@@ -4744,6 +4744,7 @@ dependencies = [
  "libc",
  "library",
  "proptest",
+ "rand 0.10.3",
  "redb",
  "reqwest",
  "ring",
