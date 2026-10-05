@@ -1,6 +1,6 @@
 # 39 — The premise and the story
 
-**Stage:** 3 · **Depends on:** [41](../done/41-idp-membership.md) merged (the commands the docs show must exist) · **Status:** backlog; the premise itself is on the [board](../README.md) (2026-10-05) · **Files:** `README.md`, `docs/executive-summary.md`, `docs/blog/introducing-wires.md`, `docs/storytelling.md`, `docs/usage.md`, `docs/fabric.md`, `docs/demo.md`, `docs/deployment.md`, `docs/testing.md`, `docs/agent-sandbox.md`, `docs/media/`, `CLAUDE.md`, `wires/help.rs` (the premise paragraph only)
+**Stage:** 3 · **Depends on:** [41](../done/41-idp-membership.md) merged (the commands the docs show must exist) · **Status:** doing (story half merged 2026-10-05; reference half in progress); the premise itself is on the [board](../README.md) (2026-10-05) · **Files:** `README.md`, `docs/executive-summary.md`, `docs/blog/introducing-wires.md`, `docs/storytelling.md`, `docs/usage.md`, `docs/fabric.md`, `docs/demo.md`, `docs/deployment.md`, `docs/testing.md`, `docs/agent-sandbox.md`, `docs/media/`, `CLAUDE.md`, `wires/help.rs` (the premise paragraph only)
 
 ## Why
 
@@ -68,7 +68,7 @@ statements it made false.
    the host. Not "TTY versus process": `ssh host cmd` runs one command with
    no TTY.
 5. **Claim only what the code does.** A service with several hosts fails
-   over; it does not spread load ([card 46](46-spread-calls-across-hosts.md)),
+   over; it does not spread load ([card 46](../backlog/46-spread-calls-across-hosts.md)),
    so no "horizontally scalable". Hosts still hold a push queue. The limits
    list gains what card 41 gave up and that no call record is kept.
 6. **One word per thing**, in every doc and in help text: *network* (never
@@ -95,3 +95,75 @@ statements it made false.
 - [ ] No doc promises load spreading, a call record, or MCP as a goal.
 
 ## Notes
+
+### 39a, the story half (worker, 2026-10-05, branch `worker/39a-story`)
+
+Items 1–6, 8 and 9, in `README.md`, `docs/executive-summary.md`,
+`docs/blog/introducing-wires.md`, `docs/storytelling.md`, `docs/media/`
+(deleted), `CLAUDE.md`, and a dated note on card 08. Items 7 and the rest of
+the narrative docs are the other worker's.
+
+- **The core** is the board's one idea, quoted verbatim as the README's
+  tagline and in the executive summary, paraphrased once in the blog post.
+- **README** order: hook (with the real output of the group-by query) →
+  why CLIs and the three hurdles → quick tour (card 41's first run, then a
+  push and a removal) → how it works → push → MCP as a bridge → measured
+  (our benchmark plus the three external sources) → compared with what you
+  have (remote MCP, SSH, Tailscale; "no log of calls" stated plainly) →
+  limits → more. The recording is gone from it.
+- **Executive summary:** one page, ends on the next step and the board's
+  kill criteria, not on a question to the audience. Dropped the Okta,
+  OpenClaw and EU AI Act paragraph (it argued for call records, now cut, and
+  I couldn't verify its numbers).
+- **storytelling.md:** a new section with the sharpest attacks (SSH as
+  machine versus service, Tailscale, remote MCP, "where's the audit log?"),
+  "claim only what the code does", and the vocabulary of item 6.
+- **CLAUDE.md:** overview no longer says the code "still has" badges or the
+  log; protocol.md's contents listed as they are; build commands gain
+  `demo-push.sh` and `make install`; the architecture list checked against
+  the tree (adds `help.rs`/`help_snapshots.rs`/`snapshots/`, `clock.rs`,
+  `net.rs`, `mock_idp`, shaping, locked mode, `bench/help/`,
+  `bench/state-scale/`; drops `docs/media/`).
+- **Integrator note (card 47) applied:** "in the network if a role matches
+  you"; no output shown for a signed-in person in no role; no refusal text
+  for a not-allowed or unknown service quoted; the stale-view limit says the
+  hard bound is the policy's expiry, not a day; `wires remove <node>` is
+  described as taking a host or directory machine out, a person is removed
+  by email.
+- **Verified:** the quick tour was run by hand with the release binary
+  (`--features dev-mock-idp`) on one machine, three keystores, the stand-in
+  IdP in place of Google (so `init` also took `--issuer` and
+  `--public-client-secret`), hint files copied between keystores; every
+  command exited 0, none repeated; the call after `remove` exited 77. The
+  output shown is copied from that run, with long ids and the network string
+  cut short and sqlite's trailing column padding trimmed; the admin edits'
+  stderr notes are summarized in the footnote, not shown. Push output:
+  the operator form `wires push --to <node id>` was run; the in-call
+  `$WIRES_CALLER_NODE` form is shown from `.scripts/fixtures/ci.sh` without
+  output. `.scripts/demo-remote-cli.sh --quiet` passed (exit 0). External
+  sources' dates, quotes and numbers checked against the pages.
+- **Deliberate grep hits** (`badge|membership|invite|wires watch|call
+  log|reader|registry|fabric|audit|otlp|record`): CLAUDE.md 19 ("no badges,
+  no invites") and 33–35 (what was cut, and that nothing records calls) —
+  history a worker needs; CLAUDE.md 54 `docs/fabric.md` (the file's name);
+  CLAUDE.md 169 "per-call log line" (true); README 225–226 and summary 28
+  (Scalekit's own words, and that wires has no audit trail); README 263,
+  blog 41, summary 127–128 (no record of calls, stated plainly); summary 88
+  and 140, storytelling 11, 20, 71 ("recording", the verb/noun for video);
+  storytelling 33, 60–64 (the register test and the vocabulary rule naming
+  the banned words); storytelling 47 (the audit-log attack and its answer).
+
+Errors found in files not mine (for the integrator / card 43):
+
+- `wires/help.rs` line 25 (the premise paragraph, listed in this card's
+  files but code, so not touched): "an admin-signed list of who may call
+  what" uses the retired "list"; item 6 says *policy*. The snapshots follow.
+- `docs/board/README.md` line 13–15 ("Until card 41 merges, the code still
+  has badges and invites"), the lane table's links to `backlog/39-…` and
+  `backlog/41-…` (39 is now in `doing/`, 41 in `review/`), and the Roles
+  heading "The target, once card 41 merges".
+- `docs/protocol.md` uses "registry" for the policy at lines 172, 222, 428,
+  524 and 707 (§§3, 4, 5, 7); item 6 retires the word. (Line 573's
+  "live-token registry" is another thing.)
+- `bench/REPORT.md` and `bench/push/REPORT.md` notes say "admin-signed
+  registry"; dated reports, left alone.
