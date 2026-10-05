@@ -20,6 +20,18 @@ person; card 47). The rows and findings below are from the model as it was.
 `policy_sizes` re-run on 2026-10-05 printed the whole policy at 65 KB, 647 KB
 and 3.2 MB (100, 1k, 5k services); the other apex sizes above are unchanged.*
 
+*Note (2026-10-05, cards 45 and 49): the update-frame figures below describe
+the design before card 45 and are left as modeled. `PolicyUpdate`,
+`ViewUpdate`, view digests, `directory.redb` and its head history, directory
+replicas and callers' view subscriptions are gone: a host now receives the
+whole policy on each edit (65 KB, 647 KB and 3.2 MB at 100, 1k and 5k
+services, against a ~1.7 KB `policy_update`), directories don't follow each
+other, and `wires mcp`, `wires inbox --wait` and the gateway ask for their
+whole view every 60 s instead of holding a subscription. The `update_*` and
+`view_update_head` constants in `model.py` are no longer printed by
+`policy_sizes`. The 475 B freshness beat to hosts is unchanged; callers now
+also receive `Fresh`es in each host's and directory's proof (card 49).*
+
 **The question** (asked at 655a96c, before cards 35–37). Every node then held
 the whole admin-signed state and re-fetched it after every edit. How much did
 each node receive, per day, as the org grew, and what would a persistent

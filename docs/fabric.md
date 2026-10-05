@@ -33,13 +33,15 @@ authenticated by key.
 | Node | Job | Runs | ALPNs it serves | Must be up? |
 |---|---|---|---|---|
 | **Admin** | Holds the root key; signs the policy; publishes each edit to the directories. | One-shot commands: `init`, `network`, `issuer`, `role`, `service`, `directory add\|rm`, `remove`, `restore`, `policy push`, `policy settings`. | none | Only to change something. |
-| **Directory** | Holds the newest policy; signs a `Fresh` every `beat_secs` (default 300 s); gives each host the whole policy and each caller its view; streams changes to subscribers in two pools of 4,096 each by default (`--max-subscribers`): hosts and other directories in one, long-running callers' views in the other, at most 16 per person, each ending when its ID token expires. **Never decides a call.** | `wires serve` on a node the policy (or, holding none yet, the network string) lists as a directory, or `wires directory serve` alone (no `host.json`). Both refuse a keystore that holds `root.seed`. | `wires/directory/2`, `wires/directory-sub/2` | For sign-in views, edits, removals and freshness. Not for calls. |
-| **Host** | Runs services; decides every call from its own copy of the whole policy; writes one log line per call to its own output; queues and sends pushes. | `wires serve host.json`, or an app embedding `wires::Host`. | `wires/session/1`, `wires/inbox/3` | For its services' calls. |
-| **Caller** | Calls services by name, as a person their IdP verified. | `wires call` (one-shot), `wires services`, `wires inbox`; `wires mcp` and `wires gateway` (long-running; the gateway calls for each web user). | `wires/inbox/3` while `wires inbox --wait` runs | Only while calling. |
+| **Directory** | Holds the newest policy (in the node's own `policy.json`); signs a `Fresh` every `beat_secs` (default 300 s); sends each host that follows it the whole policy on every edit and a `Fresh` every beat (at most 4,096 followers by default, `--max-subscribers`); proves itself current to a caller before the caller sends its ID token, then gives it its view. **Never decides a call.** | `wires serve` on a node the policy (or, holding none yet, the network string) lists as a directory, or `wires directory serve` alone (no `host.json`). Both refuse a keystore that holds `root.seed`. | `wires/directory/3`, `wires/directory-sub/3` | For views, edits and removals, and for calls: a caller tells a host nothing without a directory's current `Fresh`, so with every directory down calls stop within `fresh_secs`. |
+| **Host** | Runs services; shows each caller its proof (its head and the directories' current `Fresh`es) before the caller sends anything; decides every call from its own copy of the whole policy; writes one log line per call to its own output; queues and sends pushes. | `wires serve host.json`, or an app embedding `wires::Host`. | `wires/session/2`, `wires/inbox/4` | For its services' calls. |
+| **Caller** | Calls services by name, as a person their IdP verified. | `wires call` (one-shot), `wires services`, `wires inbox`; `wires mcp` and `wires gateway` (long-running; the gateway calls for each web user). | `wires/inbox/4` while `wires inbox --wait` runs | Only while calling. |
 
 One machine can do several jobs: in a small network one always-on host is also the directory
-(`wires serve` runs the directory too when the policy lists its node). The loopback demo makes both
-of its hosts directories, so a removal reaches both at once.
+(`wires serve` runs the directory too when the policy lists its node). There, callers take that
+machine's own `Fresh`, since there is no other directory to ask, so removing that machine holds
+only at the policy's expiry ([protocol.md §9](protocol.md#9-known-limits)). The loopback demo makes
+both of its hosts directories, so a removal reaches both at once, and each vouches for the other.
 
 **Outside wires** a network also relies on its IdP (for `wires login`, and for the keys hosts and
 directories check ID tokens with) and on iroh's discovery and relays (n0's public ones, or your
@@ -49,21 +51,25 @@ own).
 
 | To… | You need |
 |---|---|
-| **call a service** | one reachable host of that service, and an unexpired ID token. Nothing else: the host decides from its policy on disk, and the caller dials from its view. |
-| **sign in, list or search services** | the IdP (to sign in) and one reachable directory (to cut the view). |
+| **call a service** | one reachable host of that service, an unexpired ID token, and a directory other than that host that has vouched for the host's policy within `fresh_secs` (15 minutes by default; in a one-machine network, the host's own word). The host decides from its policy on disk, and the caller dials from its view; the directory's `Fresh` reaches the caller in the host's proof or with its view, so a call is usually the only connection. |
+| **sign in, list or search services** | the IdP (to sign in) and one reachable directory (to cut the view) that can show another directory's current `Fresh` for its head (or, as the network's one directory, its own). |
 | **change the policy, or remove someone** | the admin's machine, and one reachable directory to publish to. |
-| **keep removals current everywhere** | a directory reachable by every host (hosts subscribe; an edit arrives within a second). |
+| **keep removals current everywhere** | every directory up when the admin publishes (one that misses an edit holds the old policy until `wires policy push`; the edit exits 1), and a directory reachable by every host (hosts follow one and get each edit as soon as it takes it). |
 | **keep the network alive** | the admin signs a new head before the current one expires (default 90 days; nothing renews it automatically). |
 
-**Recommended:** two directories on different machines (either can also be a host, or run
-`wires directory serve` alone).
+**Recommended:** at least two directories on different machines, so that removal holds within
+`fresh_secs`. If a host outage mustn't stop calls, don't let your only two directories be your
+hosts: with one down, the other can show only its own word, and calls to it stop within
+`fresh_secs`. Run a third directory, or one on a node that hosts nothing (`wires directory
+serve`).
 
 ### When something is down
 
 | Down | Effect |
 |---|---|
 | A host | Its services keep answering from their other hosts: each call orders a service's hosts at random and tries the next when a dial fails, and a host that failed to answer a caller in the last minute goes last for that caller. A service with one host is down with it. What the host kept between calls (a service's state, its push queue) waits there until it is back. |
-| Every directory | Calls keep working. Edits and removals don't spread; views and searches can't refresh (`wires call` and `wires inbox` fall back to the view they hold); a caller with no view yet can't call. A host that holds no policy can't start. After `fresh_secs` (default 15 min) hosts' freshness lapses: under `lenient` (the default) they keep deciding and trace the lapse; under `strict` they refuse calls until a directory is back. |
+| Every directory | Calls stop within `fresh_secs` (default 15 min): callers keep calling on the `Fresh` they and the hosts hold until it lapses, then fail closed (exit 1, `no directory has vouched for a host of … recently, so nothing was sent`) until a directory is back. Edits and removals don't spread; views and searches can't refresh; a caller with no view yet can't call. A host that holds no policy can't start. |
+| One directory of several | Hosts following it move to another. A directory that hosts nothing, left alone, can show only its own `Fresh`, so callers can't refresh their views from it (they keep the ones they hold). A directory that is also a host shows the other's word too, until it lapses. Where the only two directories are the hosts, calls to the one left stop within `fresh_secs`. |
 | The admin | Nothing, until something needs changing or the head approaches expiry. |
 | The IdP | ID tokens already issued keep working until they expire (about an hour for Google); nobody can sign in; a host that has not fetched the issuer's keys since it started can't verify anyone. |
 | iroh relays / n0 discovery | Nodes with a direct path or a hints entry still connect; others can't find each other. |
@@ -78,9 +84,9 @@ Every keystore file, its mode and holder: [protocol.md §8](protocol.md#8-keysto
 | Node | What it keeps | If lost |
 |---|---|---|
 | **Admin** | `root.seed`: **the network's whole authority**. `policy.json`: the whole signed policy, which every edit starts from. `labels.json` (its names for nodes), `login-client.json` (which IdP the network string names, and its public client secret), `reached.json` (the directories that have taken a publish), `node.seed`. | `root.seed` lost: see §4.4. `policy.json` lost: copy it back from any host or directory (it is root-signed, so any copy verifies); no command fetches it. |
-| **Directory** | `directory.redb`: the last 16 heads (for updates) and the items they name; a copy of the newest policy in `policy.json`; `network.json`, `node.seed`. | Rebuilt from a replica (it catches up by itself) or by the admin's `wires policy push`. Nothing is unique to it but its key, which the policy names. |
-| **Host** | `policy.json`: the whole signed policy; `fresh.json`, the newest `Fresh` that vouches for it; `push-queue.json`; `network.json`, `node.seed`; `run/` (the operator's push socket and its hint line). Plus `host.json`, wherever the operator keeps it. | Policy: fetched again from a directory. Queue: pushes not yet delivered are lost. |
-| **Caller** | `node.seed`, `network.json`, `view.json` (its own services: root-signed entries, each checked alone), `idp-token.jwt` (and `idp-refresh-token`), `unanswered.json` (hosts that recently failed to answer it), `inbox/`, `jwks/`. No `policy.json`. | View: fetched again. Token: `wires login`. Seed: a new node; sign in again with `wires login <network>`. |
+| **Directory** | `policy.json`: the newest policy and its whole store (no history; on a node that is also a host, the one copy both use); `network.json`, `node.seed`. Its `Fresh` is in memory only. | Restored by the admin's `wires policy push` (or, on a node that is also a host, from the directory that host follows). Nothing is unique to it but its key, which the policy names. |
+| **Host** | `policy.json`: the whole signed policy; `fresh.json`, the newest `Fresh` per directory that vouches for it (what it shows callers first); `push-queue.json`; `network.json`, `node.seed`; `run/` (the operator's push socket and its hint line). Plus `host.json`, wherever the operator keeps it. | Policy: fetched again from a directory. Queue: pushes not yet delivered are lost. |
+| **Caller** | `node.seed`, `network.json`, `view.json` (its own services: root-signed entries, each checked alone, and the newest `Fresh` per directory it has seen), `idp-token.jwt` (and `idp-refresh-token`), `unanswered.json` (hosts that recently failed to answer it), `inbox/`, `jwks/`. No `policy.json`. | View: fetched again. Token: `wires login`. Seed: a new node; sign in again with `wires login <network>`. |
 | **Web gateway** | As a caller, plus `gateway-client-key` and `gateway-sessions.json`. Its users' views are in memory only. | Sessions: users sign in again. |
 
 Nothing about the network is stored "in the network". n0 DNS and the relays hold only short-lived
@@ -99,13 +105,15 @@ address records.
 
 ### 4.3 Everything off, then on
 
-1. **Directories** load `directory.redb`, sign a new `Fresh` and accept subscriptions.
-2. **Hosts** load their policy and start serving at once, even before a directory answers. They
-   subscribe to a directory and receive anything published while they were off (one
-   `policy_update`, or the whole policy if the directory no longer keeps their version).
-3. **Callers** use `view.json`. The first call's `HelloAck` tells them whether the policy moved; a
-   view older than a day is refreshed before dialing (by `wires call` and `wires inbox`) when a
-   directory answers, and kept when none does, until the policy it came from expires.
+1. **Directories** read `policy.json`, sign a new `Fresh` and accept followers.
+2. **Hosts** load their policy and serve at once, even before a directory answers; callers talk to
+   a host once a directory's `Fresh` for its head is current (from `fresh.json`, or the first
+   frame from the directory it follows). Each host follows a directory and receives the whole
+   policy if one was published while it was off.
+3. **Callers** use `view.json`. A host's proof, or the first call's `HelloAck`, tells them whether
+   the policy moved; a view older than a day is refreshed before dialing (by `wires call` and
+   `wires inbox`) when a directory proves itself and answers, and kept when none does. Either way a
+   caller sends a host nothing until a current `Fresh` vouches for that host's head.
 4. **If the admin edited while directories were off**, the edit's publish failed (exit 1, after
    trying each directory for 15 s) and the change is only on the admin. It spreads when the admin
    runs `wires policy push`.
@@ -142,25 +150,26 @@ holds anything valuable:
 |---|---|---|---|---|
 | Root public key, first directories, sign-in settings | — (the network string is unsigned; trust on first use) | every node but the admin (`network.json`) | out of band: a wiki, a message | once, at `wires join` or `wires login <network>` |
 | Directory list | root (in the head) | every node | every head; the network string carries the first two | edits |
-| Policy head (version, hash of every item) | root | directories, hosts; callers (in their view) | admin → directories (`publish`); directory → hosts (subscription); directory → callers (view); host → caller (`HelloAck`) | each edit |
-| Service entries | root, each on its own (and covered by the head's hash) | directories and hosts: all. Callers: those they may call. | hosts: the whole policy, then a `policy_update` with each changed entry; callers: their view | edits to those services |
-| Roles, issuers, bans, settings | root (via the head) | directories, hosts | the whole policy, then `policy_update` | edits |
-| Freshness (`Fresh`) | a directory | hosts, callers | subscription beat every `beat_secs`; with each view | continuous |
-| ID token | the IdP | the caller (and, for one call, the host and the service it runs) | in each call's `Hello`, each view request, each inbox fetch; to the service as `WIRES_ID_TOKEN` | per call |
+| Policy head (version, hash of every item) | root | directories, hosts; callers (in their view) | admin → directories (`publish`); directory → hosts (subscription); directory → callers (its proof, the view); host → caller (its proof, `HelloAck`) | each edit |
+| Service entries | root, each on its own (and covered by the head's hash) | directories and hosts: all. Callers: those they may call. | hosts: the whole policy, on every edit; callers: their whole view | edits to those services |
+| Roles, issuers, bans, settings | root (via the head) | directories, hosts | the whole policy, on every edit | edits |
+| Freshness (`Fresh`) | a directory | hosts, callers | to hosts: a beat every `beat_secs`; to callers: with each view, and in each host's or directory's proof | continuous |
+| ID token | the IdP | the caller (and, for one call, the host and the service it runs) | in each call's `Hello`, each view request, each inbox fetch, each only after that host or directory proved itself current; to the service as `WIRES_ID_TOKEN` | per call |
 | Verified principal | checked by the host or directory | host memory | to the service as `WIRES_CALLER`; never on the wire | per call |
-| Push messages | — (sent over an authenticated connection) | host queue, then the caller | `wires/inbox/3`, direct or fetched | on push |
+| Push messages | — (sent over an authenticated connection) | host queue, then the caller | `wires/inbox/4`, direct or fetched | on push |
 | Addresses | iroh (pkarr) | n0 DNS, relays; local hints | iroh discovery | continuous, outside wires |
 
 ### Who talks to whom
 
 ```
                        publish (each edit)
-   admin  ─────────────────────────────────────▶  directory ◀──replica──▶ directory
+   admin  ─────────────────────────────────────▶  directory      directory
                                                    │     ▲
-        subscription: policy_update + Fresh        │     │  view / search / resolve
-                  ┌────────────────────────────────┘     │  (subscription for mcp, gateway, inbox --wait)
+        subscription: whole policy + Fresh         │     │  proof, then view / search / resolve
+                  ┌────────────────────────────────┘     │  (mcp, gateway, inbox --wait: every 60 s)
                   ▼                                       │
-                host  ◀──────── call (Hello, Invoke) ─── caller
+                host  ───── proof: head + Fresh ──────▶ caller
+                  │   ◀──────── call (Hello, Invoke) ───
                   │    ──── HelloAck: head version ───▶
                   └────────── push (or fetch) ────────▶
 ```
@@ -173,8 +182,8 @@ what the receiving node may hold.
 A gossip topic delivers every message to every member and tells each member its neighbours' keys.
 That would hand every agent the metadata the directory exists to keep from it. It also needs every
 member online and forwarding, and most callers are one-shot processes. The policy has one author
-(the root), so its copies never need merging. Updates come from the directory's subscriptions,
-which carry each subscriber only what it may hold: a host the policy, a caller its view.
+(the root), so its copies never need merging. A host gets the whole policy from the directory it
+follows, and a caller asks a directory for its view: each receives only what it may hold.
 
 ## 6. The flows
 
@@ -193,26 +202,32 @@ which carry each subscriber only what it may hold: a host the policy, a caller i
   and publishes it to every directory. One it can't dial, or that answers that it is busy, is
   tried again for up to 15 s (a directory that has just restarted can't be found by its key for
   about 3 s), when it has taken a publish from this admin before; a directory the edit drops is
-  tried once. A listed directory that still missed it takes the edit from another directory by
-  its replica subscription (about 40 ms after
-  the other took it, in the loopback test `wires/e2e/restart.rs`), and until then the hosts
-  following it decide under the policy before it. Directories send every subscribed host a
-  `policy_update`: the new head, its `Fresh` and the changed items. The host applies it to its
-  copy and checks the result against the head's one signature; any mismatch, and it fetches the
-  whole policy.
-  Subscribed callers (`wires mcp`, gateway sessions, `wires inbox --wait`) get their changed view
-  entries, and a subscriber no longer admitted gets an emptied view and the subscription ends.
-  One-shot callers learn at their next call, or when their view is a day old.
+  tried once. Directories don't replicate: when a listed directory that has taken a publish
+  before still missed it, the edit exits 1, and that directory, and the hosts following it, hold
+  the policy before it until `wires policy push` reaches it (a directory that is also a host may
+  take it sooner, from the directory its host follows; a host whose directory is behind it moves
+  to another). Directories send every host that follows them the whole new policy and its
+  `Fresh`. `wires mcp` and `wires inbox --wait` ask for their view every 60 s, and the gateway at
+  a web user's first request after 60 s, so a grant or revocation reaches them within a minute.
+  One-shot callers learn at their next call (from the host's proof or `HelloAck`), or when their
+  view is a day old.
 - **Remove.** `wires remove alice@example.com` adds a person ban: every host refuses that person
   from any machine, and every directory refuses them a view. `wires remove <node>` takes a host or
   directory machine out: it adds a node ban and drops the node from every service's hosts and
   from the directories. Neither expires;
-  `wires restore` lifts one. Every subscribed host has the new policy within a second and refuses
-  the next call.
+  `wires restore` lifts one. Every host following a directory that took the edit has the new
+  policy as soon as that directory does, and refuses the next call. Callers tell a removed host
+  nothing once the last `Fresh` for the old head lapses (`fresh_secs`; the limits are in
+  [protocol.md §9](protocol.md#9-known-limits)). Removing the last directory is refused.
 - **Call.** The caller picks one of the service's hosts from its view at random (one that failed
-  to answer it in the last minute goes last; the next is tried only when a dial fails) and dials it
-  with `Hello` (its view's head version and its ID token) and `Invoke` (service and argv). The
-  host verifies the token and admits the caller (a verified email, no ban, some role matches),
+  to answer it in the last minute goes last; the next is tried only when a dial fails) and dials
+  it. The host speaks first: its proof, its root-signed head and the current `Fresh`es it holds.
+  The caller sends nothing until a `Fresh` from a directory other than that host vouches for that
+  head (a one-machine network takes the host's own) and its view lists the host; holding such a
+  word already, it doesn't wait for the proof. A proof that doesn't check out is a dial failure,
+  and the next host is tried; when none checks out, the call fails closed (exit 1). Then it sends
+  `Hello` (its view's head version and its ID token) and `Invoke` (service and argv). The host
+  verifies the token and admits the caller (a verified email, no ban, some role matches),
   checks that a role in the service's `allow` admits it and only then that the service is
   assigned to this host, applies `host.json`'s `also_require`, and runs the service. `HelloAck`
   carries the host's head version; when it is newer than the caller's view, it also carries the
@@ -231,27 +246,29 @@ which carry each subscriber only what it may hold: a host the policy, a caller i
 
 | ALPN | Served by | Carries |
 |---|---|---|
-| `wires/session/1` | hosts | calls |
-| `wires/inbox/3` | hosts; callers in `inbox --wait` | push delivery and fetch |
-| `wires/directory/2` | directories | `publish` (from anyone; taken only if root-signed and newer), `policy {have}` (the whole policy, only for a node the policy names as a host or directory; answered with `policy`, `policy_update` or `current`), `view` and `resolve` (a caller's signed entries, cut for its verified ID token) |
-| `wires/directory-sub/2` | directories | subscriptions: `policy` (hosts: the whole policy or an update first, then a `policy_update` per new head and `fresh` beats), `view` (long-running callers: the whole view, then `view_update`s), `replica` (other directories the policy lists) |
+| `wires/session/2` | hosts | calls: the host's proof first, then the call |
+| `wires/inbox/4` | hosts; callers in `inbox --wait` | push delivery and fetch (a fetch, like a call, starts with the host's proof) |
+| `wires/directory/3` | directories | `publish` (from anyone; taken only if root-signed and newer), `policy {have}` (the whole policy, only for a node the policy names as a host or directory; answered with `policy` or `current`), `view` and `resolve` (a caller's signed entries, cut for its verified ID token, after the directory's proof) |
+| `wires/directory-sub/3` | directories | a host or directory following the policy: the whole policy when a newer head is held, else a `fresh` beat |
 
 ## 8. What it costs
 
 What each node receives grows with the rate of edits, not with the number of nodes:
 
-- **A host** fetches the whole policy once, then receives a `fresh` beat every `beat_secs` and one
-  small `policy_update` per edit (the new head, its `Fresh` and the changed item).
+- **A host** fetches the whole policy once, then receives a `fresh` beat every `beat_secs` and the
+  whole policy again per edit.
 - **A one-shot caller** sends nothing in the background. It holds its view (the services it may
-  call), learns of a new head in a call's `HelloAck`, and then asks a directory for what changed.
-  `wires mcp` holds a subscription: the whole view once, then a beat and an update per new head.
+  call), learns of a new head in a host's proof or a call's `HelloAck`, and then asks a directory
+  for its whole view again. The first call to a host in each `fresh_secs` window that no `Fresh`
+  it holds covers waits one round trip more for the host's proof. `wires mcp` and `wires inbox
+  --wait` ask for the whole view every 60 s.
 - **The admin** sends one publish per directory per edit (again, for up to 15 s, to one it can't
   dial or that is busy, when it has taken a publish before; at most 30 s in all).
 
 `cargo run -q --release -p library --example policy_sizes` builds real signed policies and
-measures them. At 1,000 services (and 300 bans) it printed: the whole policy 647 KB (65 KB at
-100 services, 3.2 MB at 5,000), a `policy_update` for one changed service 1.7 KB and for one new
-ban 1.2 KB, a freshness beat 475 B, a `HelloAck` carrying a new head and one entry 1.2 KB, a
-caller's `view.json` for 25 services 16 KB, and a network string 578 B. The per-day model in
-[`bench/state-scale/`](../bench/state-scale/REPORT.md) was made for an earlier design and has not
-been redone.
+measures them. At 1,000 services (and 300 bans) it printed (2026-10-05): the whole policy 647 KB
+(65 KB at 100 services, 3.2 MB at 5,000), which is what a host receives per edit, a freshness beat
+475 B, a `HelloAck` carrying a new head and one entry 1.2 KB, a caller's `view.json` for 25
+services 16 KB, and a network string 578 B. The per-day model in
+[`bench/state-scale/`](../bench/state-scale/REPORT.md) was made for an earlier design (deltas,
+view subscriptions, replicas) and has not been redone.

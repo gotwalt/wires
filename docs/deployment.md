@@ -58,12 +58,16 @@ The admin assigns services to the host (`wires service add … --host
 <label>=<node id>`) before it starts. A host that is not a directory and
 holds no policy, or one from before that assignment, fetches the newer
 policy from a directory when it starts, for up to 8 seconds, and exits
-saying why if none answers. While it runs, it follows one directory's
-subscription (the next listed one if that directory goes away): each admin
-edit arrives within a second as one small update, and a signed freshness
-timestamp every 5 minutes (`beat_secs`). An admin edit that reaches no
-directory exits 1 (once one has taken a publish from the admin); `wires
-policy push` re-publishes the stored policy once one is up.
+saying why if none answers. While it runs, it follows one directory (the
+next listed one if that directory goes away, or falls behind it): each
+admin edit arrives as the whole policy as soon as that directory takes it,
+and a signed freshness timestamp every 5 minutes (`beat_secs`). The host
+shows those timestamps to each caller before the caller sends anything, and
+callers send nothing to a host that holds no current one from a directory
+other than itself (15 minutes, `fresh_secs`). An admin edit that misses a
+directory that has taken a publish from the admin before exits 1, even when
+another took it; `wires policy push` re-publishes the stored policy once
+that directory is up.
 
 `serve` writes one log line per call to its stderr (`call finished`, or
 `call refused` for an admitted caller), through `tracing`: the service, the
@@ -115,8 +119,9 @@ admin's keystore: it refuses one holding `root.seed`.
 **The keystore must be writable and must persist.** `$WIRES_HOME` holds the
 host's node key and the network string it joined with (`network.json`), and
 the host rewrites its signed policy at runtime: every admin change arrives
-from a directory (`policy.json`, and the newest freshness timestamp in
-`fresh.json`; a host that is also a directory keeps `directory.redb` too).
+from a directory (`policy.json`, which is also the store of a host that is
+a directory, and the newest freshness timestamp per directory in
+`fresh.json`).
 It also holds the push queue (`push-queue.json`) and the operator's control
 socket (`run/`; for a keystore path too long for a unix socket, the socket
 goes under `$TMPDIR/wires-<uid>/` or `/tmp/wires-<uid>/` instead). The
@@ -139,28 +144,35 @@ a StatefulSet volume), `replicas: 1` (the node key is the host's address, so
 replicas sharing a key are not a load balancer), and no `Service` or
 `Ingress`. For availability, give the service more hosts, each with its own
 key: calls spread at random across them, and a caller moves to the next
-when one can't be reached. More hosts are more capacity only for a service
+when one can't be reached or can't show a directory's current word. More hosts are more capacity only for a service
 that keeps no state between calls: hosts share nothing but the policy, so a
 service's memory, its disk and its push queue stay on each host.
 
 ## Running a directory
 
 A network needs a **directory**: hosts, callers and the gateway get the
-policy from one. It holds the newest signed policy (`directory.redb`), signs
-a freshness timestamp for it every 5 minutes, takes each admin publish,
-hands each host the whole policy and then every change by subscription, and
-hands each caller its view (the services that caller may use). It never
-decides a call: hosts decide from their own copy, so calls keep working with
-every directory down. Signing in (for the view), listing services, and
-edits and removals spreading need one.
+policy from one. It holds the newest signed policy (in the node's own
+`policy.json`, with no history), signs a freshness timestamp for it every 5
+minutes, takes each admin publish, sends each host that follows it the
+whole policy on every edit and the timestamp every beat, and hands each
+caller its view (the services that caller may use) after showing that
+another directory vouched for its policy. It never decides a call: hosts
+decide from their own copy. But calls need one: a caller tells a host
+nothing until a directory other than that host has vouched for the host's
+policy within `fresh_secs` (15 minutes by default), so with every directory
+down, calls fail (exit 1) once those timestamps lapse. Signing in (for the
+view), listing services, and edits and removals spreading need one too.
 
 Where to run it:
 
 - **On a host.** When the policy lists a host's node (`wires directory add
   <label>=<node id>`), its `wires serve` runs the directory on the same
   endpoint. The simplest small network: one always-on host that is also the
-  directory. A host listed while it runs starts the directory at its next
-  restart.
+  directory. There, callers take that machine's own timestamp, since no
+  other directory exists, so removing that machine holds only at the
+  policy's expiry (90 days by default); a second directory makes removal
+  hold within `fresh_secs`. A host listed while it runs starts the directory
+  at its next restart.
 - **Alone**, with `wires directory serve` on a node that hosts nothing (no
   `host.json`), for example on the gateway machine, with its own keystore
   (the gateway never uses its own node as its directory;
@@ -183,28 +195,34 @@ wires policy push                          # admin
 No step fails by design: until a directory has taken a publish from the
 admin, an edit that reaches none says so and exits 0. After that, a new
 directory added to a running network gets the policy from the edit that
-lists it (`directory add` publishes to it) or from a replica.
+lists it (`directory add` publishes to it, once it runs) or from `wires
+policy push`.
 
-Run two, on different machines: each follows the other as a replica, so one
-that missed an edit catches up, and hosts and callers fail over between
-them. The admin publishes every edit to all of them (an edit that reaches
-none exits 1, once one has taken a publish). `--max-subscribers` (default
-4,096) caps each of two pools of subscriptions one directory serves at once:
-hosts and other directories in one, and long-running callers' views
-(`wires mcp`, gateway sessions, `wires inbox --wait`) in the other, so
-callers can't crowd out hosts. One person may hold at most 16 view
-subscriptions, and each ends when its ID token expires (the client
-subscribes again with a fresh one). Its
-keystore must persist: losing `directory.redb` loses nothing (the admin's
-`wires policy push`, or a replica, restores it), but the node key is what
-the policy lists.
+Run at least two, on different machines, so that callers and hosts move
+between them and removal holds within `fresh_secs`. Directories don't
+replicate: the admin publishes every edit to all of them, retrying one that
+can't be dialed for 15 s, and an edit that a directory which has taken a
+publish before still misses exits 1, whatever the others did. That
+directory, and the hosts following it, hold the old policy until `wires
+policy push` reaches it (a host whose directory is behind it moves to
+another). If a host outage mustn't stop calls, don't let your only two
+directories be your hosts: with one down, the other can show callers only
+its own timestamp, and calls to it stop within `fresh_secs`. Run a third
+directory, or one with `wires directory serve` on a node that hosts nothing.
+Removing the last directory is refused.
 
-**When no directory answers**, hosts keep deciding from the policy they hold
-under the default `lenient` freshness, and say so in their trace. Under
-`wires policy settings --freshness strict` a host refuses every call once
-the last freshness timestamp it holds lapses (15 minutes by default,
-`--fresh-secs`), so a ban is honoured everywhere within that time or nothing
-is served.
+`--max-subscribers` (default 4,096) caps how many hosts and directories
+follow one directory at once; callers don't subscribe (`wires mcp` and
+`wires inbox --wait` ask for their view every 60 s, the gateway at each web
+user's first request after 60 s). Its keystore must persist: losing
+`policy.json` loses nothing (the admin's `wires policy push` restores it),
+but the node key is what the policy lists.
+
+**When no directory answers**, hosts keep their policy, but callers send
+them nothing once the timestamps they and the hosts hold lapse (15 minutes
+by default, `--fresh-secs`): calls fail with exit 1 and `no directory has
+vouched for a host of … recently, so nothing was sent` until a directory is
+back.
 
 ## Reachability and discovery
 
@@ -249,13 +267,15 @@ file names, since it can't be told to use your relay.
   exit `77`, `wires: denied by host: not admitted to this network: no role
   in this network matches <email>, or you were removed: ask your admin` on
   their stderr. Directories refuse them a view. A host that is a directory
-  has the new policy at once; any other host follows a directory's
-  subscription and has it within a second. Disabling the account at the IdP also cuts them
+  has the new policy at once; any other host has it as soon as the
+  directory it follows takes the publish. Disabling the account at the IdP also cuts them
   off, within one token lifetime. There is no shared key to rotate.
 - **Remove a machine:** `wires remove <label>` takes a host or directory
   out: a node ban, and the node is dropped from every service's hosts and
-  from the directories. Callers whose view predates the removal can still
-  dial it until their view is refreshed (see
+  from the directories (removing the last directory is refused). Callers
+  whose view predates the removal tell it nothing once the last timestamp a
+  directory signed for the old policy lapses (`fresh_secs`, 15 minutes by
+  default); in a one-machine network, only at the policy's expiry (see
   [usage.md § Known trade-offs](usage.md#known-trade-offs)).
 - **Undo:** `wires restore <email|label>`. Bans don't expire otherwise. A
   restored node is not put back into services or directories: add it again.
@@ -313,7 +333,7 @@ To run one:
    `identity.issuers[].audiences` must list it there too.
 3. **The gateway joins** like a host: `wires join <network>`, with a network
    string that names a directory. It asks a directory for each signed-in
-   user's view (and follows it for as long as the session lives), so it
+   user's view (and asks again at the user's first request after 60 s), so it
    refuses to start when its network string names none, and it never uses
    its own node. The policy's roles decide what each user sees.
 4. **TLS in front.** The gateway speaks plain HTTP. `deploy/gateway/` runs
