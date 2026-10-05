@@ -1,39 +1,36 @@
-//! The host's `policy` subscription (card 36c): how a running host keeps
-//! its whole signed policy current, and learns that it is.
+//! The host's subscription to the policy: how a running host keeps its
+//! whole signed policy current, and learns that it is.
 //!
-//! A [`Follower`] subscribes (`wires/directory-sub/2`, a `hello` with no
-//! token, then `subscribe {kind: policy, have}`) to the first directory its held head lists that answers,
-//! never itself, and takes every frame the directory streams
-//! ([`Follower::take`]):
+//! A [`Follower`] subscribes (`wires/directory-sub/3`, a `hello` with no
+//! token, then `subscribe {have}`) to the first directory its held head
+//! lists that answers, never itself, and takes every frame the directory
+//! streams ([`Follower::take`]):
 //!
-//! - `policy {policy, fresh}`: the whole policy (first sync, or after a
-//!   failed update): verified under the root and adopted if newer;
-//! - `policy_update {update, fresh}`: applied to the held copy
-//!   ([`SignedPolicy::apply`](library::SignedPolicy::apply): the items'
-//!   hash and the root's one signature on the new head), then adopted;
-//! - `fresh {fresh}`: a beat for the held head.
+//! - `policy {policy, fresh}`: the whole policy (there are no deltas, card
+//!   45): verified under the root and adopted if newer;
+//! - `fresh {fresh}`: a beat, kept when it vouches for the held head.
 //!
-//! Every policy goes through [`store::adopt_if_newer`], so a directory can
-//! only fail to help; every `Fresh` must vouch for the head then held
-//! ([`Freshness::offer`]). A frame that can't be taken (an update that
-//! doesn't apply, a policy that doesn't verify) makes the follower subscribe
-//! again at once with `have: 0`, for the whole policy. When the stream ends
-//! (the directory stopped, went silent for two beats, or is no longer
-//! listed) it reconnects, trying the directory it last followed first and
-//! then the others in the head's order, backing off from 1 s to the beat
-//! (at most 30 s) while none answers. A directory whose whole policy can't
-//! be taken either (expired, say) is passed over: the next round, after a
-//! pause, starts at the directory after it. So is one that answers `denied`,
-//! at once or ending the stream (this host is not admitted, or may no
-//! longer hold the whole policy; the directory is no longer one, or busy):
-//! the follower tries the next directory at once, and starts its next round
-//! after the one that refused; a round in which every directory refused
-//! waits the growing pause. The list is re-read from the held policy each
-//! time, so a directory the admin adds is followed without a restart.
+//! Every policy goes through [`store::adopt_if_newer`] (on a host that is
+//! also a directory, through its directory's [`Directory::accept`], which
+//! adopts it: the node has one copy), so a directory can only fail to help;
+//! every `Fresh` must vouch for the head then held ([`Freshness::offer`]).
+//!
+//! A directory is **passed over** for the next one, at once, when it is
+//! behind this host (a frame for an older head than the one held: it missed
+//! a publish, and can't vouch for this host's head), when it sends a policy
+//! this host can't take (it doesn't verify, or has expired), and when it
+//! answers `denied`, at once or ending the stream (this host is not
+//! admitted, or may no longer hold the whole policy; the directory is no
+//! longer one, or busy). The next round starts at the directory after it; a
+//! round in which no directory served waits a pause growing from 1 s to the
+//! beat (at most 30 s). When the stream ends (the directory stopped, went
+//! silent for two beats, or is no longer listed) it reconnects, trying the
+//! directory it last followed first and then the others in the head's order.
+//! The list is re-read from the held policy each time, so a directory the
+//! admin adds is followed without a restart.
 //!
 //! A host that is itself a directory also vouches for its own head
-//! ([`vouch_from_local`]); its directory's replica loop keeps its copy in
-//! step with the other directories.
+//! ([`vouch_from_local`]).
 //!
 //! The follower never blocks serving: a host restarted with its policy on
 //! disk decides from it before any directory answers.
@@ -46,7 +43,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::Endpoint;
 use library::{
     DIRECTORY_SUB_ALPN, Fresh, NodeId, SignedPolicy, StateVersion, SubFrame, SubRequest,
-    SubscriptionKind,
 };
 
 use super::freshness::Freshness;
@@ -71,15 +67,12 @@ pub(crate) struct FollowStats {
     pub(crate) bytes: AtomicU64,
     /// Whole `policy` frames.
     pub(crate) wholes: AtomicU64,
-    /// `policy_update` frames.
-    pub(crate) updates: AtomicU64,
     /// `fresh` beats.
     pub(crate) beats: AtomicU64,
-    /// Subscriptions started over with `have: 0` after a frame that
-    /// couldn't be taken.
-    pub(crate) resyncs: AtomicU64,
     /// `denied` answers, at once or ending a stream.
     pub(crate) denials: AtomicU64,
+    /// Directories passed over because they were behind this host.
+    pub(crate) behind: AtomicU64,
 }
 
 /// A running host's subscription to its directories. See the module docs.
@@ -92,9 +85,11 @@ pub(crate) struct Follower {
     pub(crate) root: NodeId,
     /// Where each `Fresh` goes.
     pub(crate) freshness: Arc<Freshness>,
-    /// Whether this host runs the directory mode (decided at start): if not,
-    /// a policy that newly lists it says a restart is needed.
-    pub(crate) runs_directory: bool,
+    /// This host's own directory, when it runs one (decided at start): a
+    /// newer policy goes through it, so it serves what the host decides
+    /// under. Without one, a policy that newly lists this host says a
+    /// restart is needed.
+    pub(crate) directory: Option<Arc<Directory>>,
     /// What it received.
     pub(crate) stats: Arc<FollowStats>,
 }
@@ -105,11 +100,9 @@ enum Ended {
     /// The stream closed or went silent, after the directory answered:
     /// reconnect.
     Closed,
-    /// A frame couldn't be taken: subscribe again with `have: 0`.
-    Resync(anyhow::Error),
-    /// The directory answered `denied`, at once or ending the stream: pass
-    /// it over.
-    Denied(String),
+    /// The directory refused, is behind this host, or sent a policy this
+    /// host can't take: pass it over.
+    PassOver(String),
 }
 
 impl Follower {
@@ -126,30 +119,25 @@ impl Follower {
             .map_or(StateVersion(0), |h| h.version())
     }
 
-    /// The pause cap: the held policy's beat, at most [`MAX_BACKOFF`].
-    fn max_backoff(&self) -> Duration {
+    /// The held policy's beat.
+    fn beat(&self) -> Duration {
         let beat = store::read(&self.ks, self.root)
             .ok()
             .flatten()
             .map_or(library::DEFAULT_BEAT_SECS, |h| h.policy.settings.beat_secs);
-        Duration::from_secs(u64::from(beat.max(1))).min(MAX_BACKOFF)
+        Duration::from_secs(u64::from(beat.max(1)))
     }
 
     /// How long a subscription may stay silent before it is taken for dead:
     /// two beats and some slack.
     fn silence(&self) -> Duration {
-        let beat = store::read(&self.ks, self.root)
-            .ok()
-            .flatten()
-            .map_or(library::DEFAULT_BEAT_SECS, |h| h.policy.settings.beat_secs);
-        Duration::from_secs(2 * u64::from(beat.max(1)) + 10)
+        2 * self.beat() + Duration::from_secs(10)
     }
 
     /// Follow the directories until the task is dropped. See the module
     /// docs.
     pub(crate) async fn run(self) {
         let mut backoff = Duration::from_secs(1);
-        let mut whole = false;
         let mut last: Option<NodeId> = None;
         loop {
             if self.endpoint.is_closed() {
@@ -162,59 +150,31 @@ impl Follower {
             let order = dirs.clone();
             let mut answered = false;
             for dir in dirs {
-                let have = if whole {
-                    StateVersion(0)
-                } else {
-                    self.held_version()
-                };
-                match self.subscribe_once(dir, have).await {
+                match self.subscribe_once(dir, self.held_version()).await {
                     Ok(Ended::Closed) => {
-                        whole = false;
                         answered = true;
+                        last = Some(dir);
+                        break;
                     }
-                    Ok(Ended::Denied(reason)) => {
+                    Ok(Ended::PassOver(reason)) => {
                         tracing::info!(
                             directory = %dir.hex(),
-                            "policy subscription refused: {reason}; trying the next directory"
+                            "policy subscription: {reason}; trying the next directory"
                         );
                         // Not asked first again: the next round starts
                         // after it, and this one goes on at once.
                         last = next_after(&order, dir);
-                        continue;
-                    }
-                    Ok(Ended::Resync(e)) => {
-                        self.stats.resyncs.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(
-                            directory = %dir.hex(),
-                            "policy subscription: {e:#}; asking for the whole policy"
-                        );
-                        if whole {
-                            // Twice in a row, the second from the whole
-                            // policy: this directory serves one this host
-                            // can't take. Start the next round at the next
-                            // directory, after a pause.
-                            last = next_after(&order, dir);
-                            break;
-                        }
-                        answered = true;
-                        whole = true;
                     }
                     Err(e) => {
                         tracing::debug!(directory = %dir.hex(), "policy subscription: {e:#}");
-                        continue;
                     }
                 }
-                last = Some(dir);
-                break;
             }
             if answered {
                 backoff = Duration::from_secs(1);
-                if whole {
-                    continue;
-                }
             }
             tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(self.max_backoff());
+            backoff = (backoff * 2).min(self.beat().min(MAX_BACKOFF));
         }
     }
 
@@ -245,10 +205,7 @@ impl Follower {
         // A host presents no token: the directory admits it because the
         // policy names its key.
         let hello = SubRequest::Hello { id_token: None };
-        let subscribe = SubRequest::Subscribe {
-            kind: SubscriptionKind::Policy,
-            have,
-        };
+        let subscribe = SubRequest::Subscribe { have };
         wire::write(&mut send, &hello.encode()?).await?;
         wire::write(&mut send, &subscribe.encode()?).await?;
         let mut answered = false;
@@ -263,14 +220,17 @@ impl Follower {
             };
             self.count(&frame);
             if let SubFrame::Denied { reason } = frame {
-                return Ok(Ended::Denied(reason));
+                return Ok(Ended::PassOver(format!("refused: {reason}")));
             }
             if !answered {
                 tracing::info!(directory = %dir.hex(), have = have.0, "following the policy");
             }
             answered = true;
             if let Err(e) = self.take(frame, now_unix()) {
-                return Ok(Ended::Resync(e));
+                if e.downcast_ref::<Behind>().is_some() {
+                    self.stats.behind.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(Ended::PassOver(format!("{e:#}")));
             }
             let listed = store::read(&self.ks, self.root)
                 .ok()
@@ -291,70 +251,53 @@ impl Follower {
         s.bytes.fetch_add(bytes, Ordering::Relaxed);
         match frame {
             SubFrame::Policy { .. } => s.wholes.fetch_add(1, Ordering::Relaxed),
-            SubFrame::PolicyUpdate { .. } => s.updates.fetch_add(1, Ordering::Relaxed),
             SubFrame::Fresh { .. } => s.beats.fetch_add(1, Ordering::Relaxed),
             SubFrame::Denied { .. } => s.denials.fetch_add(1, Ordering::Relaxed),
-            _ => 0,
         };
     }
 
-    /// Take one frame at `now`: adopt the policy it brings (whole, or the
-    /// held copy with the update applied) if newer, and keep its `Fresh`.
-    /// `Err`: it can't be taken, and the follower asks for the whole policy.
+    /// Take one frame at `now`: adopt the policy it brings if newer, and
+    /// keep its `Fresh`. `Err`: it can't be taken ([`Behind`] when it is for
+    /// a head older than the one held), and the follower passes the
+    /// directory over.
     pub(crate) fn take(&self, frame: SubFrame, now: i64) -> Result<()> {
-        match frame {
-            SubFrame::Policy { policy, fresh } => {
-                policy
-                    .head
-                    .verify(self.root)
-                    .context("the policy's head doesn't verify")?;
-                fresh
-                    .verify(&policy.head)
-                    .context("the freshness doesn't vouch for the policy's head")?;
-                self.adopt(&policy, "whole", now)?;
-                self.vouch(&fresh, now)
-            }
-            SubFrame::PolicyUpdate { update, fresh } => {
-                let held = store::read(&self.ks, self.root)?
-                    .context("this host holds no policy to apply an update to")?;
-                // Already held: a host that is also a directory mirrors what
-                // its own directory takes, often before the directory it
-                // follows sends the same edit as an update from the version
-                // before. Nothing to apply; keep the `Fresh` if it is for
-                // this head.
-                if held.version() >= update.head.head.version {
-                    if held.signed.head == update.head {
-                        fresh
-                            .verify(&held.signed.head)
-                            .context("the freshness doesn't vouch for the update's head")?;
-                        return self.vouch(&fresh, now);
-                    }
-                    return Ok(());
-                }
-                let next = held
-                    .signed
-                    .apply(&update, self.root)
-                    .context("the update doesn't apply to the held policy")?;
-                fresh
-                    .verify(&next.head)
-                    .context("the freshness doesn't vouch for the update's head")?;
-                self.adopt(&next, "update", now)?;
-                self.vouch(&fresh, now)
-            }
-            SubFrame::Fresh { fresh } => self.vouch(&fresh, now),
+        let (fresh, policy) = match frame {
+            SubFrame::Policy { policy, fresh } => (fresh, Some(policy)),
+            SubFrame::Fresh { fresh } => (fresh, None),
             SubFrame::Denied { reason } => bail!("refused: {reason}"),
-            SubFrame::View { .. } | SubFrame::ViewUpdate { .. } => {
-                bail!("a view frame on a policy subscription")
+        };
+        let held = self.held_version();
+        if fresh.version < held {
+            return Err(Behind {
+                theirs: fresh.version,
+                ours: held,
             }
+            .into());
         }
+        if let Some(policy) = policy {
+            policy
+                .head
+                .verify(self.root)
+                .context("the policy's head doesn't verify")?;
+            fresh
+                .verify(&policy.head)
+                .context("the freshness doesn't vouch for the policy's head")?;
+            self.adopt(&policy, now)?;
+        }
+        self.vouch(&fresh, now)
     }
 
-    /// Adopt `policy` if newer (`how` it came, for the trace).
-    fn adopt(&self, policy: &SignedPolicy, how: &str, now: i64) -> Result<()> {
-        if store::adopt_if_newer(&self.ks, policy, self.root, now)? {
-            tracing::info!(version = policy.version().0, how, "followed a newer policy");
+    /// Adopt `policy` if newer: through this host's own directory when it
+    /// runs one, else into `policy.json`.
+    fn adopt(&self, policy: &SignedPolicy, now: i64) -> Result<()> {
+        let adopted = match &self.directory {
+            Some(dir) => dir.accept(policy, now)?,
+            None => store::adopt_if_newer(&self.ks, policy, self.root, now)?,
+        };
+        if adopted {
+            tracing::info!(version = policy.version().0, "followed a newer policy");
             let me = self.me();
-            if !self.runs_directory && policy.head.head.directories.contains(&me) {
+            if self.directory.is_none() && policy.head.head.directories.contains(&me) {
                 static SAID: AtomicBool = AtomicBool::new(false);
                 if !SAID.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
@@ -367,18 +310,12 @@ impl Follower {
         Ok(())
     }
 
-    /// Keep `fresh` if it vouches for the head held now. One for another
-    /// head (a directory behind this host, say) is skipped, not an error.
+    /// Keep `fresh` if it vouches for the head held now.
     fn vouch(&self, fresh: &Fresh, now: i64) -> Result<()> {
         let Some(held) = store::read(&self.ks, self.root)? else {
             return Ok(());
         };
         if fresh.version != held.version() {
-            tracing::debug!(
-                theirs = fresh.version.0,
-                ours = held.version().0,
-                "a freshness for another version"
-            );
             return Ok(());
         }
         self.freshness.offer(fresh, &held.signed.head, now)?;
@@ -386,8 +323,19 @@ impl Follower {
     }
 }
 
+/// A directory is behind this host: what it sent is for an older head than
+/// the one held, so it can't vouch for this host's (it missed a publish).
+#[derive(Debug, thiserror::Error)]
+#[error("the directory is behind this host (its policy version {}, ours {})", theirs.0, ours.0)]
+pub(crate) struct Behind {
+    /// The directory's version.
+    theirs: StateVersion,
+    /// This host's.
+    ours: StateVersion,
+}
+
 /// The directory after `dir` in `order` (wrapping), where the next round
-/// starts once `dir` served a policy this host couldn't take.
+/// starts once `dir` was passed over.
 fn next_after(order: &[NodeId], dir: NodeId) -> Option<NodeId> {
     let i = order.iter().position(|d| *d == dir)?;
     order.get((i + 1) % order.len()).copied()
@@ -417,5 +365,19 @@ pub(crate) async fn vouch_from_local(
         if changes.changed().await.is_err() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_next_round_starts_after_the_directory_passed_over() {
+        let n = |b: u8| library::NodeIdentity::from_seed([b; 32]).node_id();
+        let order = [n(1), n(2), n(3)];
+        assert_eq!(next_after(&order, n(1)), Some(n(2)));
+        assert_eq!(next_after(&order, n(3)), Some(n(1)));
+        assert_eq!(next_after(&order, n(9)), None);
     }
 }

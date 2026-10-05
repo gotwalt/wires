@@ -2,15 +2,16 @@
 //! directory and never dials a host; a host fetches from it and a caller is
 //! refused the whole policy; a restarted directory serves the same head with
 //! a new `Fresh`; tampered, mixed and older policies and a stranger's `Fresh`
-//! are refused; a directory that missed a publish catches up from a replica; and
-//! `wires directory serve` refuses the admin's keystore and an unlisted node.
+//! are refused; a directory that missed a publish holds the policy before it
+//! until the next publish (card 45: no replicas); and `wires directory serve`
+//! refuses the admin's keystore and an unlisted node.
 //! Card 41: a directory admits a node the policy names or a caller whose ID
 //! token verifies, and anyone may publish, but only a root-signed newer head
 //! makes it read the items; the first directory starts empty and takes the
 //! first publish. Card 47: a caller is admitted only when a role matches it
-//! (and its sign-in carries a verified email); callers' view subscriptions
-//! have a pool of their own, capped per person, and end when the token
-//! expires or the person is no longer admitted.
+//! (and its sign-in carries a verified email). Card 45: a directory shows a
+//! caller its proof before the caller presents a token, and only hosts and
+//! directories subscribe.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -162,9 +163,9 @@ impl Fabric {
     }
 
     /// Node `i`'s directory, open from `ks`, serving on its own endpoint
-    /// (and following its peers when `replicate`).
-    async fn directory(&self, i: usize, ks: &Arc<Keystore>, replicate: bool) -> Serving {
-        self.directory_with(i, ks, replicate, None).await
+    /// (and beating when `beating`).
+    async fn directory(&self, i: usize, ks: &Arc<Keystore>, beating: bool) -> Serving {
+        self.directory_with(i, ks, beating, None).await
     }
 
     /// [`directory`](Self::directory), with a shorter `stream_deadline`.
@@ -172,20 +173,20 @@ impl Fabric {
         &self,
         i: usize,
         ks: &Arc<Keystore>,
-        replicate: bool,
+        beating: bool,
         stream_deadline: Option<Duration>,
     ) -> Serving {
-        self.directory_capped(i, ks, replicate, stream_deadline, 64)
+        self.directory_capped(i, ks, beating, stream_deadline, 64)
             .await
     }
 
-    /// [`directory_with`](Self::directory_with), each subscriber pool
-    /// holding `max_subscribers`.
+    /// [`directory_with`](Self::directory_with), its subscriber pool holding
+    /// `max_subscribers`.
     async fn directory_capped(
         &self,
         i: usize,
         ks: &Arc<Keystore>,
-        replicate: bool,
+        beating: bool,
         stream_deadline: Option<Duration>,
         max_subscribers: usize,
     ) -> Serving {
@@ -205,7 +206,7 @@ impl Fabric {
         }
         let endpoint = bind(node, &self.book).await;
         let router = Running::mount(Router::builder(endpoint.clone()), &dir).spawn();
-        let running = replicate.then(|| Running::start(Arc::clone(&dir), endpoint.clone()));
+        let running = beating.then(|| Running::start(Arc::clone(&dir)));
         Serving {
             dir,
             endpoint,
@@ -233,18 +234,6 @@ impl ProtocolHandler for Counter {
         conn.close(0u32.into(), b"counted");
         Ok(())
     }
-}
-
-/// Wait until `dir` holds `version`.
-async fn until_version(dir: &Directory, version: StateVersion) {
-    tokio::time::timeout(PATIENCE, async {
-        let mut changes = dir.watch();
-        while dir.version() < version {
-            changes.changed().await.unwrap();
-        }
-    })
-    .await
-    .expect("the directory never caught up");
 }
 
 /// An admin edit reaches the directory, a host fetches it from there (a
@@ -319,7 +308,7 @@ async fn an_edit_reaches_the_directory_and_hosts_fetch_it_nobody_dials_them() {
     let policy = DirectoryRequest::Policy {
         have: StateVersion(0),
     };
-    let answer = wire::ask(&caller_ep, f.nodes[0].node_id(), None, &policy)
+    let answer = wire::ask_presenting(&caller_ep, f.nodes[0].node_id(), None, &policy)
         .await
         .unwrap();
     assert_eq!(
@@ -328,7 +317,7 @@ async fn an_edit_reaches_the_directory_and_hosts_fetch_it_nobody_dials_them() {
             reason: crate::host::gate::NOT_ADMITTED.into()
         }
     );
-    let answer = wire::ask(&caller_ep, f.nodes[0].node_id(), f.token(2), &policy)
+    let answer = wire::ask_presenting(&caller_ep, f.nodes[0].node_id(), f.token(2), &policy)
         .await
         .unwrap();
     assert!(
@@ -362,7 +351,7 @@ async fn a_publish_that_reaches_no_directory_is_reported() {
     admin_ep.close().await;
 }
 
-/// A directory restarted from `directory.redb` serves the same head, and a
+/// A directory restarted from its `policy.json` serves the same head, and a
 /// new `Fresh`.
 #[tokio::test]
 async fn a_restarted_directory_serves_the_same_head_and_a_new_fresh() {
@@ -384,8 +373,15 @@ async fn a_restarted_directory_serves_the_same_head_and_a_new_fresh() {
         let c = dir.snapshot().unwrap();
         (c.held.signed.head.clone(), c.fresh.clone().unwrap())
     };
-    // `policy.json` is behind on purpose: the store alone must serve it.
-    std::fs::remove_file(ks.path(store::POLICY_FILE)).unwrap();
+    // Its store is its `policy.json`.
+    assert_eq!(
+        store::read(&ks, f.root.node_id())
+            .unwrap()
+            .unwrap()
+            .signed
+            .head,
+        head
+    );
     let later = now + 60;
     let dir = Directory::open(
         f.nodes[0].duplicate(),
@@ -565,10 +561,12 @@ async fn a_fresh_from_a_key_not_in_directories_is_refused() {
     ));
 }
 
-/// Two directories following each other: a publish that reached only one
-/// reaches the other through its replica subscription.
+/// Card 45: directories don't replicate. A publish that reached only one
+/// leaves the other at the policy before it (it still vouches for that one,
+/// so a host holding the newer head passes it over), until the next publish
+/// reaches it.
 #[tokio::test]
-async fn a_directory_that_missed_a_publish_catches_up_from_a_replica() {
+async fn a_directory_that_missed_a_publish_stays_behind_until_the_next() {
     let f = Fabric::new(2);
     f.list_directory(0);
     f.list_directory(1);
@@ -584,14 +582,33 @@ async fn a_directory_that_missed_a_publish_catches_up_from_a_replica() {
         .unwrap();
     assert_eq!(report.delivered, vec![f.nodes[0].node_id()]);
     assert!(edit.version() > before);
-    until_version(&d1.dir, edit.version()).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(d1.dir.version(), before, "nothing hands it on");
+    assert_eq!(
+        d1.dir.snapshot().unwrap().fresh.clone().unwrap().version,
+        before
+    );
+    // The next publish to every directory brings it.
+    let report = fetch::publish_all(
+        &admin_ep,
+        &edit.signed,
+        &[f.nodes[0].node_id(), f.nodes[1].node_id()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.delivered.len(), 2);
     assert_eq!(
         d1.dir.snapshot().unwrap().held.signed,
         d0.dir.snapshot().unwrap().held.signed
     );
-    // Its own `Fresh` for the head it caught up to.
-    let fresh = d1.dir.snapshot().unwrap().fresh.clone().unwrap();
-    assert_eq!(fresh.directory, f.nodes[1].node_id());
+    // Its store is its policy.json.
+    assert_eq!(
+        store::read(&ks1, f.root.node_id())
+            .unwrap()
+            .unwrap()
+            .version(),
+        edit.version()
+    );
     admin_ep.close().await;
 }
 
@@ -619,19 +636,19 @@ async fn strangers_and_banned_nodes_hear_only_not_admitted() {
             service: ServiceName::new("status").unwrap(),
         },
     ] {
-        let answer = wire::ask(&stranger_ep, f.nodes[0].node_id(), None, &request)
+        let answer = wire::ask_presenting(&stranger_ep, f.nodes[0].node_id(), None, &request)
             .await
             .unwrap();
         assert_eq!(answer, not_admitted);
     }
     // A token another key's sign-in minted: not this stranger's.
-    let theirs = wire::ask(&stranger_ep, f.nodes[0].node_id(), f.token(1), &policy)
+    let theirs = wire::ask_presenting(&stranger_ep, f.nodes[0].node_id(), f.token(1), &policy)
         .await
         .unwrap();
     assert_eq!(theirs, not_admitted);
     // The host is answered; once banned, it isn't.
     let host_ep = bind(&f.nodes[1], &f.book).await;
-    let ask = || wire::ask(&host_ep, f.nodes[0].node_id(), None, &policy);
+    let ask = || wire::ask_presenting(&host_ep, f.nodes[0].node_id(), None, &policy);
     assert!(matches!(
         ask().await.unwrap(),
         DirectoryAnswer::Policy { .. }
@@ -717,12 +734,8 @@ async fn the_first_directory_starts_empty_and_takes_the_first_publish() {
     drop(dir);
     let d = f.directory(0, &ks, false).await;
     let caller_ep = bind(&f.nodes[1], &f.book).await;
-    let view = DirectoryRequest::View {
-        have: StateVersion(0),
-        query: None,
-        held: None,
-    };
-    let before = wire::ask(&caller_ep, f.nodes[0].node_id(), f.token(1), &view)
+    let view = view();
+    let before = wire::ask_presenting(&caller_ep, f.nodes[0].node_id(), f.token(1), &view)
         .await
         .unwrap();
     assert_eq!(
@@ -742,7 +755,7 @@ async fn the_first_directory_starts_empty_and_takes_the_first_publish() {
     .unwrap();
     assert_eq!(report.delivered, vec![f.nodes[0].node_id()]);
     assert_eq!(d.dir.version(), f.policy().version());
-    let after = wire::ask(&caller_ep, f.nodes[0].node_id(), f.token(1), &view)
+    let after = wire::ask_presenting(&caller_ep, f.nodes[0].node_id(), f.token(1), &view)
         .await
         .unwrap();
     assert!(matches!(after, DirectoryAnswer::View { .. }), "{after:?}");
@@ -857,19 +870,17 @@ async fn dial(ep: &Endpoint, to: library::NodeId, alpn: &[u8]) -> Connection {
         .unwrap()
 }
 
-/// Subscribe to directory `to` as `kind`, from `ep` presenting `id_token`:
-/// the stream the frames arrive on.
+/// Subscribe to directory `to`, from `ep` presenting `id_token`: the
+/// stream the frames arrive on.
 async fn subscribe(
     ep: &Endpoint,
     to: library::NodeId,
     id_token: Option<IdToken>,
-    kind: library::SubscriptionKind,
 ) -> (Connection, iroh::endpoint::RecvStream) {
     let conn = dial(ep, to, library::DIRECTORY_SUB_ALPN).await;
     let (mut send, recv) = conn.open_bi().await.unwrap();
     let hello = library::SubRequest::Hello { id_token };
     let sub = library::SubRequest::Subscribe {
-        kind,
         have: StateVersion(0),
     };
     wire::write(&mut send, &hello.encode().unwrap())
@@ -929,7 +940,6 @@ fn next_policy(
 /// it, or no longer names it as a host.
 #[tokio::test]
 async fn a_policy_subscription_ends_when_the_host_is_banned_or_unlisted() {
-    use library::SubscriptionKind::Policy;
     let f = Fabric::new(2); // 0: directory, 1: host
     f.list_directory(0);
     f.assign("status", 1);
@@ -941,7 +951,7 @@ async fn a_policy_subscription_ends_when_the_host_is_banned_or_unlisted() {
     let services = d.dir.snapshot().unwrap().held.policy.services.clone();
 
     // No longer a host: it holds its view, not the policy.
-    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), None, Policy).await;
+    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), None).await;
     first_frame(&mut recv).await;
     let unlisted = next_policy(&f, &d.dir, |p| p.services.clear());
     assert!(d.dir.accept(&unlisted, now_unix()).unwrap());
@@ -951,7 +961,7 @@ async fn a_policy_subscription_ends_when_the_host_is_banned_or_unlisted() {
     // A host again, then banned (which takes it off its services too).
     let relisted = next_policy(&f, &d.dir, |p| p.services = services);
     assert!(d.dir.accept(&relisted, now_unix()).unwrap());
-    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), None, Policy).await;
+    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), None).await;
     first_frame(&mut recv).await;
     let banned = next_policy(&f, &d.dir, |p| {
         p.services.clear();
@@ -964,124 +974,75 @@ async fn a_policy_subscription_ends_when_the_host_is_banned_or_unlisted() {
     );
 }
 
-/// A caller's `view` subscription needs a token that verifies and a person
-/// the policy admits; a new head that bans the caller's node or person, or
-/// in which no role matches it any more, empties its view and ends the
-/// subscription with `NOT_ADMITTED`; one that stops listing this directory
-/// ends it with `denied` (it can no longer vouch).
+/// Card 45: only a host or a directory subscribes; an admitted caller
+/// hears that it asks for its view, and a stranger `NOT_ADMITTED`. A host
+/// at the directory's head gets a beat first, and one ahead of it a beat
+/// for the directory's own (older) head.
 #[tokio::test]
-async fn a_view_subscription_ends_on_a_ban_and_when_the_directory_is_unlisted() {
-    use library::SubscriptionKind::View;
-    let f = Fabric::new(2); // 0: directory, 1: caller
+async fn only_hosts_and_directories_subscribe() {
+    let f = Fabric::new(3); // 0: directory, 1: host, 2: caller
     f.list_directory(0);
-    let (staff, matchers) = crate::testutil::staff_role();
-    service::role_set(&f.admin, staff.clone(), matchers, Ttl::default()).unwrap();
-    service::add(
-        &f.admin,
-        ServiceName::new("status").unwrap(),
-        ServiceEdit {
-            allow: Some(vec![staff]),
-            hosts: Some(vec![f.nodes[0].node_id()]),
-            ..ServiceEdit::default()
-        },
-        Ttl::default(),
-    )
-    .unwrap();
+    f.assign("status", 1);
     let ks = f.join(0);
     let d = f.directory(0, &ks, false).await;
-    let caller = f.nodes[1].node_id();
+    let dir = f.nodes[0].node_id();
+    let caller_ep = bind(&f.nodes[2], &f.book).await;
+    let (_conn, mut recv) = subscribe(&caller_ep, dir, f.token(2)).await;
+    let refused = until_denied(&mut recv).await.unwrap();
+    assert!(refused.contains("asks for its view"), "{refused}");
+    let (_conn, mut recv) = subscribe(&caller_ep, dir, None).await;
+    assert_eq!(
+        until_denied(&mut recv).await.as_deref(),
+        Some(crate::host::gate::NOT_ADMITTED)
+    );
+    // A host ahead of the directory: the directory's word for its own head.
+    let host_ep = bind(&f.nodes[1], &f.book).await;
+    let conn = dial(&host_ep, dir, library::DIRECTORY_SUB_ALPN).await;
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    for frame in [
+        library::SubRequest::Hello { id_token: None },
+        library::SubRequest::Subscribe {
+            have: StateVersion(d.dir.version().0 + 5),
+        },
+    ] {
+        wire::write(&mut send, &frame.encode().unwrap())
+            .await
+            .unwrap();
+    }
+    let library::SubFrame::Fresh { fresh } = first_frame(&mut recv).await else {
+        panic!("expected a beat");
+    };
+    assert_eq!(fresh.version, d.dir.version());
+}
+
+/// Card 45: a dialer that opens with `open` hears the directory's proof
+/// (its head and its own current `Fresh`, no entries) before it says
+/// anything else, then sends its `hello` and request on the same stream; a
+/// directory with nothing to vouch for says so instead.
+#[tokio::test]
+async fn a_directory_shows_its_proof_before_a_caller_presents_a_token() {
+    let f = Fabric::new(2); // 0: directory, 1: caller
+    f.list_directory(0);
+    let ks = f.join(0);
+    let d = f.directory(0, &ks, false).await;
     let ep = bind(&f.nodes[1], &f.book).await;
-
-    // No token: refused at the hello.
-    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), None, View).await;
-    assert_eq!(
-        until_denied(&mut recv).await.as_deref(),
-        Some(crate::host::gate::NOT_ADMITTED)
-    );
-
-    let entries = |frame: &library::SubFrame| match frame {
-        library::SubFrame::View { view, .. } => view.entries.len(),
-        other => panic!("expected a view, got {other:?}"),
-    };
-    let status = ServiceName::new("status").unwrap();
-    // An update that empties the view, then the fixed refusal ending it.
-    let emptied_then_refused = async |recv: &mut iroh::endpoint::RecvStream| {
-        let library::SubFrame::ViewUpdate { update, .. } = first_frame(recv).await else {
-            panic!("expected a view update");
-        };
-        assert_eq!(update.removed, vec![status.clone()]);
-        assert_eq!(
-            until_denied(recv).await.as_deref(),
-            Some(crate::host::gate::NOT_ADMITTED)
-        );
-    };
-    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), f.token(1), View).await;
-    assert_eq!(entries(&first_frame(&mut recv).await), 1);
-    // The caller's node banned.
-    let banned = next_policy(&f, &d.dir, |p| {
-        p.bans.insert(caller);
-    });
-    assert!(d.dir.accept(&banned, now_unix()).unwrap());
-    emptied_then_refused(&mut recv).await;
-    // Restored, then the person banned: the same, from the same node.
-    let restored = next_policy(&f, &d.dir, |p| {
-        p.bans.remove(&caller);
-    });
-    assert!(d.dir.accept(&restored, now_unix()).unwrap());
-    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), f.token(1), View).await;
-    assert_eq!(entries(&first_frame(&mut recv).await), 1);
-    let person = library::Person::new(
-        crate::testutil::test_idp().issuer.clone(),
-        "caller@example.com",
-    );
-    let banned_person = next_policy(&f, &d.dir, |p| {
-        p.person_bans.insert(person.clone());
-    });
-    assert!(d.dir.accept(&banned_person, now_unix()).unwrap());
-    emptied_then_refused(&mut recv).await;
-    // Removed, they can't subscribe again.
-    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), f.token(1), View).await;
-    assert_eq!(
-        until_denied(&mut recv).await.as_deref(),
-        Some(crate::host::gate::NOT_ADMITTED)
-    );
-    // Restored, then no role matches any more: the same.
-    let restored = next_policy(&f, &d.dir, |p| {
-        p.person_bans.remove(&person);
-    });
-    assert!(d.dir.accept(&restored, now_unix()).unwrap());
-    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), f.token(1), View).await;
-    assert_eq!(entries(&first_frame(&mut recv).await), 1);
-    let roleless = next_policy(&f, &d.dir, |p| {
-        p.services.clear();
-        p.roles.clear();
-    });
-    assert!(d.dir.accept(&roleless, now_unix()).unwrap());
-    emptied_then_refused(&mut recv).await;
-    // A role again; then the directory is unlisted.
-    let services_again = next_policy(&f, &d.dir, |p| {
-        let (staff, matchers) = crate::testutil::staff_role();
-        p.roles.insert(staff.clone(), matchers);
-        p.services.insert(
-            status.clone(),
-            library::Service {
-                description: String::new(),
-                allow: vec![staff],
-                hosts: vec![f.nodes[0].node_id()],
-            },
-        );
-    });
-    assert!(d.dir.accept(&services_again, now_unix()).unwrap());
-    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), f.token(1), View).await;
-    assert_eq!(entries(&first_frame(&mut recv).await), 1);
-
-    let me = f.nodes[0].node_id();
-    let unlisted = next_policy(&f, &d.dir, |p| {
-        p.directories.retain(|d| *d != me);
-    });
-    assert!(d.dir.accept(&unlisted, now_unix()).unwrap());
-    let reason = until_denied(&mut recv).await.unwrap();
-    assert!(reason.contains("no longer a directory"), "{reason}");
+    let dir = f.nodes[0].node_id();
+    let opened = wire::open(&ep, dir).await.unwrap();
+    let head = d.dir.snapshot().unwrap().held.signed.head.clone();
+    assert_eq!(opened.proof.head, head);
+    assert_eq!(opened.proof.fresh.len(), 1);
+    assert_eq!(opened.proof.fresh[0].directory, dir);
+    opened.proof.fresh[0].verify(&head).unwrap();
+    let answer = opened.ask(f.token(1), &view()).await.unwrap();
+    assert!(matches!(answer, DirectoryAnswer::View { .. }), "{answer:?}");
+    // Empty: nothing to show.
+    let f2 = Fabric::new(1);
+    f2.list_directory(0);
+    let ks2 = f2.join_empty(0, &[f2.nodes[0].node_id()]);
+    let _d2 = f2.directory(0, &ks2, false).await;
+    let ep2 = bind(&NodeIdentity::generate(), &f2.book).await;
+    let e = wire::open(&ep2, f2.nodes[0].node_id()).await.err().unwrap();
+    assert!(format!("{e:#}").contains("holds no policy yet"), "{e:#}");
 }
 
 /// A `hello` is small: one that announces a publish-sized body is refused
@@ -1137,7 +1098,7 @@ async fn idle_connections_do_not_hold_the_undecided_slots() {
     }
     tokio::time::sleep(deadline * 3).await;
     let member_ep = bind(&f.nodes[1], &f.book).await;
-    let answer = wire::ask(&member_ep, f.nodes[0].node_id(), f.token(1), &view())
+    let answer = wire::ask_presenting(&member_ep, f.nodes[0].node_id(), f.token(1), &view())
         .await
         .unwrap();
     assert!(matches!(answer, DirectoryAnswer::View { .. }), "{answer:?}");
@@ -1169,7 +1130,7 @@ async fn admitted_peers_do_not_hold_the_undecided_slots() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let answer = tokio::time::timeout(
         Duration::from_secs(3),
-        wire::ask(&member_ep, f.nodes[0].node_id(), f.token(1), &view()),
+        wire::ask_presenting(&member_ep, f.nodes[0].node_id(), f.token(1), &view()),
     )
     .await
     .expect("no answer in time")
@@ -1180,10 +1141,9 @@ async fn admitted_peers_do_not_hold_the_undecided_slots() {
 
 /// A person the IdP verifies but no role names, and one whose sign-in
 /// carries no verified email, hear the same `NOT_ADMITTED` bytes as a
-/// stranger: for a view, a `resolve`, and a view subscription.
+/// stranger: for a view, a `resolve`, and a subscription.
 #[tokio::test]
 async fn a_verified_token_no_role_matches_hears_not_admitted() {
-    use library::SubscriptionKind::View;
     let f = Fabric::new(2); // 0: directory, 1: the outsider's machine
     f.list_directory(0);
     let ks = f.join(0);
@@ -1202,109 +1162,27 @@ async fn a_verified_token_no_role_matches_hears_not_admitted() {
         f.token_for(1, "caller@example.com", false, exp),
     ] {
         for request in [view(), resolve.clone()] {
-            let answer = wire::ask(&ep, dir, token.clone(), &request).await.unwrap();
+            let answer = wire::ask_presenting(&ep, dir, token.clone(), &request)
+                .await
+                .unwrap();
             assert_eq!(answer, not_admitted);
         }
-        let (_conn, mut recv) = subscribe(&ep, dir, token, View).await;
+        let (_conn, mut recv) = subscribe(&ep, dir, token).await;
         assert_eq!(
             until_denied(&mut recv).await.as_deref(),
             Some(crate::host::gate::NOT_ADMITTED)
         );
     }
     // A member of `example.com` is admitted.
-    let answer = wire::ask(&ep, dir, f.token(1), &view()).await.unwrap();
+    let answer = wire::ask_presenting(&ep, dir, f.token(1), &view())
+        .await
+        .unwrap();
     assert!(matches!(answer, DirectoryAnswer::View { .. }), "{answer:?}");
 }
 
-/// Callers' view subscriptions can't stop a host subscribing: they have a
-/// pool of their own. With all 4,096 view slots taken, a 4,097th view
-/// subscription is refused, and a host's `policy` subscription is still
-/// served.
-#[tokio::test]
-async fn view_subscriptions_cannot_stop_a_host_subscribing() {
-    use super::node::DEFAULT_MAX_SUBSCRIBERS;
-    use library::SubscriptionKind::{Policy, View};
-    let f = Fabric::new(3); // 0: directory, 1: host, 2: caller
-    f.list_directory(0);
-    f.assign("status", 1);
-    let ks = f.join(0);
-    let d = f
-        .directory_capped(0, &ks, false, None, DEFAULT_MAX_SUBSCRIBERS)
-        .await;
-    let dir = f.nodes[0].node_id();
-    // 4,096 callers following their views.
-    let _taken = Arc::clone(&d.dir.view_subscribers)
-        .try_acquire_many_owned(DEFAULT_MAX_SUBSCRIBERS as u32)
-        .unwrap();
-    let caller_ep = bind(&f.nodes[2], &f.book).await;
-    let (_conn, mut recv) = subscribe(&caller_ep, dir, f.token(2), View).await;
-    let refused = until_denied(&mut recv).await.unwrap();
-    assert!(refused.contains("subscriber cap (4096)"), "{refused}");
-    // The host still subscribes.
-    let host_ep = bind(&f.nodes[1], &f.book).await;
-    let (_conn, mut recv) = subscribe(&host_ep, dir, None, Policy).await;
-    assert!(matches!(
-        first_frame(&mut recv).await,
-        library::SubFrame::Policy { .. }
-    ));
-}
-
-/// One person holds at most 16 view subscriptions on a directory at once;
-/// the 17th is refused, and another person is unaffected.
-#[tokio::test]
-async fn view_subscriptions_are_capped_per_person() {
-    use super::node::MAX_VIEW_SUBSCRIPTIONS_PER_PERSON;
-    use library::SubscriptionKind::View;
-    let f = Fabric::new(3); // 0: directory, 1 and 2: callers
-    f.list_directory(0);
-    let ks = f.join(0);
-    let _d = f.directory(0, &ks, false).await;
-    let dir = f.nodes[0].node_id();
-    let ep = bind(&f.nodes[1], &f.book).await;
-    let mut held = Vec::new();
-    for _ in 0..MAX_VIEW_SUBSCRIPTIONS_PER_PERSON {
-        let (conn, mut recv) = subscribe(&ep, dir, f.token(1), View).await;
-        first_frame(&mut recv).await;
-        held.push((conn, recv));
-    }
-    let (_conn, mut recv) = subscribe(&ep, dir, f.token(1), View).await;
-    let refused = until_denied(&mut recv).await.unwrap();
-    assert!(refused.contains("16 view subscriptions"), "{refused}");
-    let exp = now_unix() + 3600;
-    let other_ep = bind(&f.nodes[2], &f.book).await;
-    let other = f.token_for(2, "someone@example.com", true, exp);
-    let (_conn, mut recv) = subscribe(&other_ep, dir, other, View).await;
-    first_frame(&mut recv).await;
-    drop(held);
-}
-
-/// A view subscription ends when the ID token it opened with expires, with
-/// the sign-in-expired sentence (the client subscribes again with a fresh
-/// one).
-#[tokio::test]
-async fn a_view_subscription_ends_at_its_tokens_expiry() {
-    use library::SubscriptionKind::View;
-    let f = Fabric::new(2);
-    f.list_directory(0);
-    let ks = f.join(0);
-    let _d = f.directory(0, &ks, false).await;
-    let ep = bind(&f.nodes[1], &f.book).await;
-    let soon = f.token_for(1, "caller@example.com", true, now_unix() + 2);
-    let (_conn, mut recv) = subscribe(&ep, f.nodes[0].node_id(), soon, View).await;
-    first_frame(&mut recv).await;
-    assert_eq!(
-        until_denied(&mut recv).await.as_deref(),
-        Some(crate::host::gate::SIGN_IN_EXPIRED)
-    );
-}
-
-/// A caller's whole view, from version 0.
+/// A caller's whole view.
 fn view() -> DirectoryRequest {
-    DirectoryRequest::View {
-        have: StateVersion(0),
-        query: None,
-        held: None,
-    }
+    DirectoryRequest::View { query: None }
 }
 
 /// Once its head's `not_after` passes, a directory vouches for nothing,
@@ -1344,23 +1222,4 @@ async fn an_expired_policy_is_served_to_nobody_and_admits_nobody() {
         DirectoryAnswer::Denied { .. }
     ));
     assert!(!dir.admit(caller, token.as_ref(), later).await.admitted());
-}
-
-/// A replica peer that goes silent (no policy, no beat) is given up on
-/// after the silence allowance, so the follower reconnects instead of
-/// waiting forever on a half-open stream.
-#[tokio::test]
-async fn a_silent_replica_is_given_up_on() {
-    let f = Fabric::new(1);
-    f.list_directory(0);
-    let ks = f.join(0);
-    let dir = Directory::open(f.nodes[0].duplicate(), f.root.node_id(), ks, 8, now_unix()).unwrap();
-    let (mut ours, _theirs) = tokio::io::duplex(1024);
-    let r = tokio::time::timeout(
-        PATIENCE,
-        super::serve::take_from_replica(&dir, &mut ours, Duration::from_millis(100)),
-    )
-    .await
-    .expect("it gives up on its own");
-    assert!(format!("{:#}", r.unwrap_err()).contains("said nothing"));
 }

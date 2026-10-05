@@ -14,9 +14,9 @@
 //!   for lately (card 49, [`vouch`](crate::caller::vouch));
 //! - **pushed** while `wires inbox --wait` runs: it serves the inbox ALPN
 //!   ([`INBOX_ALPN`]) and accepts deliveries ([`InboxReceiver`]) only from
-//!   the hosts its view names, besides long-polling each host. It follows
-//!   its view meanwhile (a `view` subscription), so the hosts it asks and
-//!   admits follow grants and revocations.
+//!   the hosts its view names, besides long-polling each host. It asks for
+//!   its view again every minute meanwhile, so the hosts it asks and admits
+//!   follow grants and revocations.
 //!
 //! `wires inbox` then prints what is unread — one line per message, or
 //! `--json` — and marks it read. `--wait` blocks until a message arrives
@@ -454,7 +454,7 @@ static STRANGERS: transport::Throttle = transport::Throttle::new();
 /// A delivery is accepted only from a peer that **this node's view names as
 /// a host** of one of its services (card 37: the view's entries are
 /// root-signed, and iroh authenticated the peer's key; re-read per
-/// delivery, and kept current by the `--wait` subscription). A host
+/// delivery, and kept current by the `--wait` poll). A host
 /// presents no credential of its own. Each message must be from that peer
 /// and to this node.
 #[derive(Clone)]
@@ -773,18 +773,19 @@ pub(crate) async fn inbox_cmd(a: InboxArgs) -> Result<i32> {
         me: node.node_id(),
         fabric: root,
     };
-    // Card 37: while waiting, follow the view (so the hosts asked and the
-    // hosts admitted follow grants and revocations), and take a host's
-    // direct delivery.
+    // Card 37: while waiting, ask for the view again every minute (so the
+    // hosts asked and the hosts admitted follow grants and revocations),
+    // and take a host's direct delivery.
     let follower = a.wait.then(|| {
         let token_ks = Arc::clone(&ks);
-        crate::caller::view::follow(crate::caller::view::Follow {
+        crate::caller::view::poll(crate::caller::view::Poll {
             endpoint: fetcher.endpoint.clone(),
             root,
             id_token: Arc::new(move || crate::caller::hello::stored_token(&token_ks)),
             initial: crate::caller::view::read(&ks, root).ok().flatten(),
             fallback: crate::caller::view::joined_directories(&ks),
             persist: Some(Arc::clone(&ks)),
+            every: crate::caller::view::POLL,
         })
     });
     let _receiver = a.wait.then(|| {
@@ -824,8 +825,8 @@ struct Fetcher {
 }
 
 impl Fetcher {
-    /// The hosts of every service in the view (read now: a `--wait`
-    /// subscription keeps it current), never this node, as dial targets,
+    /// The hosts of every service in the view (read now: with `--wait`, a
+    /// poll keeps it current), never this node, as dial targets,
     /// and what each is checked against before it is told anything (card
     /// 49). None from an expired view.
     fn targets(&self) -> Option<(Vec<(NodeId, EndpointAddr)>, Vouching)> {
@@ -851,11 +852,12 @@ impl Fetcher {
             .collect();
         let vouch = Vouching::new(self.fabric, held, Scope::AnyService)
             .knowing(crate::caller::view::joined_directories(&self.ks))
-            .refreshing(Refresher {
-                ks: (*self.ks).clone(),
-                endpoint: self.endpoint.clone(),
-                id_token: crate::caller::hello::stored_token(&self.ks),
-            })
+            .refreshing(Refresher::keystore(
+                (*self.ks).clone(),
+                self.endpoint.clone(),
+                self.fabric,
+                crate::caller::hello::stored_token(&self.ks),
+            ))
             .keeping_in(Sink::Keystore((*self.ks).clone()));
         Some((targets, vouch))
     }

@@ -1,9 +1,9 @@
 //! `wires mcp`: a stdio MCP server whose tools are the services you may call
 //! (the entries of your view, as `wires services` lists them).
 //!
-//! The view is followed, not read once (card 37): `wires mcp` holds a
-//! `view` subscription with a directory ([`crate::caller::view::follow`]),
-//! so a grant or a revocation changes the tool list within seconds, and the
+//! The view is followed, not read once (card 37): `wires mcp` asks a
+//! directory for it again every minute ([`crate::caller::view::poll`]), so
+//! a grant or a revocation changes the tool list within a minute, and the
 //! client hears `notifications/tools/list_changed` (the server declares
 //! `tools.listChanged`). When the view holds more than
 //! [`SEARCH_THRESHOLD`] services, `tools/list` offers `search_services` and
@@ -820,8 +820,8 @@ pub(crate) fn services_in(view: &library::View) -> Vec<ViewService> {
 }
 
 /// `wires mcp`: load this node's view (refreshing it if needed) and
-/// credentials, subscribe to the view, then serve MCP on stdio, telling the
-/// client whenever the tool list changes.
+/// credentials, ask for the view again every minute, then serve MCP on
+/// stdio, telling the client whenever the tool list changes.
 ///
 /// Locked mode doesn't apply: a tool's `stdin` field is text in the
 /// client's request, never a file this process reads.
@@ -841,16 +841,17 @@ pub async fn mcp_cmd(_: McpArgs) -> Result<()> {
         .map(|h| services_in(&h.view))
         .unwrap_or_default();
     tracing::info!("wires mcp: serving {} service(s)", services.len());
-    // Follow the view: a grant or a revocation becomes `list_changed`.
+    // Ask again every minute: a grant or a revocation becomes `list_changed`.
     let endpoint = creds.bind().await?;
     let token_ks = Arc::clone(&ks);
-    let (mut views, follower) = crate::caller::view::follow(crate::caller::view::Follow {
+    let (mut views, follower) = crate::caller::view::poll(crate::caller::view::Poll {
         endpoint: endpoint.clone(),
         root: creds.root(),
         id_token: Arc::new(move || crate::caller::hello::stored_token(&token_ks)),
         initial: held,
         fallback: crate::caller::view::joined_directories(&ks),
         persist: Some(Arc::clone(&ks)),
+        every: crate::caller::view::POLL,
     });
     let (tools_tx, tools_rx) = tokio::sync::watch::channel(services.clone());
     let mapper = tokio::spawn(async move {

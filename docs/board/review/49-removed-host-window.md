@@ -1,6 +1,6 @@
 # 49 — The removed-host window
 
-**Depends on:** decide together with [45](../backlog/45-trim-policy-sync.md) · **Status:** review (built; decided by the human, 2026-10-05); 45 builds on it · **Files:** `library/calls/session.rs`, `library/services/fresh.rs`, `wires/caller/{call,view,inbox}.rs`, `wires/host/{transport,freshness,follow}.rs`, `docs/protocol.md` §4–5, §9
+**Depends on:** decide together with [45](45-trim-policy-sync.md) · **Status:** review (built; decided by the human, 2026-10-05); 45 builds on it · **Files:** `library/calls/session.rs`, `library/services/fresh.rs`, `wires/caller/{call,view,inbox}.rs`, `wires/host/{transport,freshness,follow}.rs`, `docs/protocol.md` §4–5, §9
 
 ## The problem
 
@@ -62,7 +62,7 @@ does so with an object the code already has.
 
 ## The tension with card 45
 
-[Card 45](../backlog/45-trim-policy-sync.md) proposes deleting `Fresh`, the beat and
+[Card 45](45-trim-policy-sync.md) proposes deleting `Fresh`, the beat and
 `lenient` / `strict`, because under the default a `Fresh` changes no decision
 today. Option 2 here is the first thing that would make `Fresh` decide
 something. Think this card through before building 45: either `Fresh` stays

@@ -1,12 +1,12 @@
 //! The directory's two protocols (card 36): requests on [`DIRECTORY_ALPN`]
-//! and subscriptions on [`DIRECTORY_SUB_ALPN`].
+//! and a host's subscription on [`DIRECTORY_SUB_ALPN`].
 //!
 //! Hosts and directories hold the whole signed policy; a caller holds its
-//! [`View`]: the services it may use, each a root-signed entry. Nothing here
-//! carries a proof: a whole policy checks against its head's one signature,
+//! [`View`]: the services it may use, each a root-signed entry. Both travel
+//! whole (card 45): a whole policy checks against its head's one signature,
 //! and a view's entries each carry their own.
 //!
-//! **`wires/directory/2`**: one request per stream. The dialer sends
+//! **`wires/directory/3`**: one request per stream. The dialer sends
 //! [`DirectoryRequest::Hello`] (its ID token when it acts for a person;
 //! none from a host, a directory or the admin) then one request, and the
 //! directory answers once:
@@ -14,21 +14,24 @@
 //! | request | answer |
 //! |---|---|
 //! | `publish {head}`, then `items {items}` only if asked for | `published {version, head}`: the version it now holds and that head's [`HeadHash`] |
-//! | `policy {have}` | the whole policy for a host or directory: `policy {policy, fresh}`; `policy_update {update, fresh}` from a `have` the directory still keeps; `current {fresh}` when `have` is the newest |
-//! | `view {have, query?, held?}` | the caller's view: `view {view, fresh}`, or `view_update {update, fresh}` / `current {fresh}` the same way, only when `held` ([`ViewDigest`]) names exactly the view the directory would diff from, for a verified principal (a `query` always gets a whole `view`) |
+//! | `policy {have}` | the whole policy for a host or directory: `policy {policy, fresh}`, or `current {fresh}` when `have` is the newest |
+//! | `view {query?}` | the caller's whole view: `view {view, fresh}` |
 //! | `resolve {service}` | `view {view, fresh}` holding just that service, or no entry |
 //! | anything refused | `denied {reason}` |
 //!
-//! **`wires/directory-sub/2`**: the dialer sends `hello` then
-//! [`SubRequest::Subscribe`] (`policy` for a host, `replica` for another
-//! directory, `view` for a long-running caller such as `wires mcp` or the
-//! gateway), and the directory streams [`SubFrame`]s: the subscriber's whole
-//! part first when its `have` is older (`policy` or `view`), then a
-//! `policy_update` / `view_update` for every new head, a `fresh` every beat,
-//! or a terminal `denied`. A subscriber that can't apply an update
-//! ([`SignedPolicy::apply`](crate::SignedPolicy::apply),
-//! [`View::apply`](crate::View::apply)) subscribes anew with `have: 0` and
-//! gets its whole part.
+//! A dialer that will present an ID token first sends
+//! [`DirectoryRequest::Open`] and reads the directory's
+//! [`DirectoryAnswer::Proof`] (card 45): its head and the current `Fresh`es
+//! it holds, the [`HostProof`] a host shows a caller (card 49). Only once
+//! that checks out does it send its `hello` and request, so a directory the
+//! admin removed, or one behind the caller's view, is never told a token.
+//!
+//! **`wires/directory-sub/3`**: the dialer sends `hello` then
+//! [`SubRequest::Subscribe`] with the version it holds (only a host or a
+//! directory may), and the directory streams [`SubFrame`]s: the whole
+//! `policy` whenever its head is newer than what the subscriber has, else
+//! its `fresh` for its own head (at once, and every beat), or a terminal
+//! `denied`.
 //!
 //! Who is admitted is the directory's to decide (protocol §4): a node the
 //! held policy names, a caller whose token verifies and whom
@@ -53,22 +56,22 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{canonical_bytes, hex_id, length_prefixed, prefix_len, split_frame};
+use crate::codec::{canonical_bytes, length_prefixed, prefix_len, split_frame};
 use crate::error::{Error, Result};
 use crate::fresh::Fresh;
 use crate::head::{HeadHash, SignedPolicyHead, StateVersion};
 use crate::idp::IdToken;
 use crate::item::Item;
-use crate::policy_update::PolicyUpdate;
+use crate::proof::HostProof;
 use crate::registry::ServiceName;
 use crate::signed_policy::SignedPolicy;
-use crate::view::{View, ViewUpdate};
+use crate::view::View;
 
 /// The ALPN of the directory's request protocol.
-pub const DIRECTORY_ALPN: &[u8] = b"wires/directory/2";
+pub const DIRECTORY_ALPN: &[u8] = b"wires/directory/3";
 
-/// The ALPN of the directory's subscriptions.
-pub const DIRECTORY_SUB_ALPN: &[u8] = b"wires/directory-sub/2";
+/// The ALPN of a host's subscription to the policy.
+pub const DIRECTORY_SUB_ALPN: &[u8] = b"wires/directory-sub/3";
 
 /// The largest frame either protocol accepts (a publish's `items`, or a
 /// whole `policy` of a large network), checked from the length prefix before
@@ -79,44 +82,16 @@ pub const MAX_DIRECTORY_FRAME: usize = 16 * 1024 * 1024;
 /// few KB), a publish's signed head, or a small request.
 pub const MAX_SMALL_DIRECTORY_FRAME: usize = 16 * 1024;
 
-/// Domain-separation prefix of the bytes a [`ViewDigest`] hashes.
-pub const VIEW_DIGEST_CONTEXT: &[u8] = b"wires/view-digest/v1\0";
-
-hex_id! {
-    /// Names one exact [`View`]: blake3 over [`VIEW_DIGEST_CONTEXT`] ‖ the
-    /// view's canonical JSON (its head and every entry). A
-    /// caller sends it with `view {have, held}` so the directory answers
-    /// `current` or a `view_update` only for the view the caller holds; a
-    /// view cut for someone else, or for no one, doesn't match.
-    pub struct ViewDigest([u8; 32]);
-}
-
-impl ViewDigest {
-    /// The digest of `view`.
-    ///
-    /// ```
-    /// use library::{NodeIdentity, Policy, StateVersion, ViewDigest};
-    /// let root = NodeIdentity::from_seed([1u8; 32]);
-    /// let mut policy = Policy::new(root.node_id());
-    /// policy.version = StateVersion(1);
-    /// policy.not_after = i64::MAX;
-    /// let empty = policy.sign(&root).unwrap().view_for(root.node_id(), None, None);
-    /// assert_eq!(ViewDigest::of(&empty).unwrap(), ViewDigest::of(&empty.clone()).unwrap());
-    /// ```
-    pub fn of(view: &View) -> Result<ViewDigest> {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(VIEW_DIGEST_CONTEXT);
-        hasher.update(&canonical_bytes(view)?);
-        Ok(ViewDigest(*hasher.finalize().as_bytes()))
-    }
-}
-
 /// A dialer's frame on [`DIRECTORY_ALPN`]. See the module docs.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DirectoryRequest {
-    /// Opens every stream.
+    /// Opens a stream whose dialer will present an ID token: the directory
+    /// answers with its [`DirectoryAnswer::Proof`] first, and the dialer
+    /// sends its `hello` only once that checks out.
+    Open {},
+    /// Opens every other stream, or follows the directory's proof.
     Hello {
         /// Its IdP ID token, nonce-bound to its node key, when it acts for
         /// a person (a view needs it; a host's policy and a publish don't).
@@ -144,21 +119,12 @@ pub enum DirectoryRequest {
         /// The version the dialer holds (0: none).
         have: StateVersion,
     },
-    /// The dialer's caller view (card 37): the services its verified
+    /// The dialer's whole caller view (card 37): the services its verified
     /// identity may call.
     View {
-        /// The version the dialer holds (0: none).
-        have: StateVersion,
         /// Only entries whose name or description match this.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         query: Option<String>,
-        /// The digest of the view the dialer holds at `have`
-        /// ([`ViewDigest::of`]). The directory answers `current` or a
-        /// `view_update` only when it matches the view it would diff from
-        /// (the caller's view at `have`, for the principal it presents
-        /// now); without it, or when it doesn't match, the whole view.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        held: Option<ViewDigest>,
     },
     /// One service, only if it is in the dialer's view (card 37).
     Resolve {
@@ -172,6 +138,13 @@ pub enum DirectoryRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DirectoryAnswer {
+    /// The answer to [`DirectoryRequest::Open`]: the directory's head and
+    /// the current `Fresh`es it holds for it, no entries. Not terminal: the
+    /// dialer's `hello` and request follow.
+    Proof {
+        /// The proof.
+        proof: HostProof,
+    },
     /// A publish's head verified; this is the policy the directory now
     /// holds (the published one, or one it already had at that version or
     /// newer).
@@ -194,24 +167,10 @@ pub enum DirectoryAnswer {
         /// The directory's `Fresh` for its head.
         fresh: Fresh,
     },
-    /// What moves the dialer's whole policy (at its `have`) to the newest.
-    PolicyUpdate {
-        /// The update.
-        update: PolicyUpdate,
-        /// The directory's `Fresh` for its head.
-        fresh: Fresh,
-    },
     /// A caller's view (or, for `resolve`, the one-entry or empty view).
     View {
         /// The view.
         view: View,
-        /// The directory's `Fresh` for its head.
-        fresh: Fresh,
-    },
-    /// What moves the dialer's view (at its `have`) to the newest head.
-    ViewUpdate {
-        /// The update.
-        update: ViewUpdate,
         /// The directory's `Fresh` for its head.
         fresh: Fresh,
     },
@@ -222,35 +181,21 @@ pub enum DirectoryAnswer {
     },
 }
 
-/// What a subscription follows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SubscriptionKind {
-    /// A host's whole policy.
-    Policy,
-    /// Another directory's whole policy (only from a directory the head
-    /// lists).
-    Replica,
-    /// A long-running caller's view (card 37).
-    View,
-}
-
 /// A subscriber's frame on [`DIRECTORY_SUB_ALPN`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SubRequest {
-    /// Opens the stream, as on [`DIRECTORY_ALPN`].
+    /// Opens the stream, as on [`DIRECTORY_ALPN`] (a host presents no
+    /// token).
     Hello {
-        /// Its ID token, when it acts for a person (a view needs it).
+        /// An ID token, if the dialer acts for a person.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id_token: Option<IdToken>,
     },
-    /// Follow a part of the policy.
+    /// Follow the policy.
     Subscribe {
-        /// Which part.
-        kind: SubscriptionKind,
-        /// The version the subscriber holds (0: none): the first frame comes
-        /// at once when the directory's is newer.
+        /// The version the subscriber holds (0: none): the whole policy
+        /// comes at once when the directory's is newer.
         have: StateVersion,
     },
 }
@@ -260,37 +205,16 @@ pub enum SubRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SubFrame {
-    /// The whole signed policy, for a `policy` or `replica` subscriber: the
-    /// first sync, or after an update it couldn't apply.
+    /// The whole signed policy: its head is newer than what the subscriber
+    /// has.
     Policy {
         /// The whole policy.
         policy: SignedPolicy,
         /// The `Fresh` for its head.
         fresh: Fresh,
     },
-    /// A new head for a subscriber holding the whole policy: the items
-    /// changed and the keys removed since its version.
-    PolicyUpdate {
-        /// The update.
-        update: PolicyUpdate,
-        /// The `Fresh` for its head.
-        fresh: Fresh,
-    },
-    /// The subscriber's whole view (first sync, or after a failed update).
-    View {
-        /// The whole view.
-        view: View,
-        /// The `Fresh` for its head.
-        fresh: Fresh,
-    },
-    /// A new head (or changed entries) for a subscriber holding a view.
-    ViewUpdate {
-        /// The update.
-        update: ViewUpdate,
-        /// The `Fresh` for its head.
-        fresh: Fresh,
-    },
-    /// A beat: the held head is still the newest.
+    /// A beat: the directory's `Fresh` for its own head (which may be older
+    /// than the subscriber's: then the directory is behind it).
     Fresh {
         /// The new `Fresh`.
         fresh: Fresh,
@@ -407,6 +331,7 @@ mod tests {
     fn requests() -> Vec<DirectoryRequest> {
         let signed = sample().sign(&root()).unwrap();
         vec![
+            DirectoryRequest::Open {},
             DirectoryRequest::Hello { id_token: None },
             DirectoryRequest::Hello {
                 id_token: Some(IdToken::new("a.b.c")),
@@ -421,28 +346,9 @@ mod tests {
                 have: StateVersion(2),
             },
             DirectoryRequest::View {
-                have: StateVersion(0),
                 query: Some("orders".into()),
-                held: None,
             },
-            DirectoryRequest::View {
-                have: StateVersion(0),
-                query: None,
-                held: None,
-            },
-            DirectoryRequest::View {
-                have: StateVersion(3),
-                query: None,
-                held: Some(
-                    ViewDigest::of(
-                        &sample()
-                            .sign(&root())
-                            .unwrap()
-                            .view_for(node(2), None, None),
-                    )
-                    .unwrap(),
-                ),
-            },
+            DirectoryRequest::View { query: None },
             DirectoryRequest::Resolve {
                 service: name("status"),
             },
@@ -468,6 +374,10 @@ mod tests {
             br#"{"type":"hello"}"#[..]
         );
         assert_eq!(
+            DirectoryRequest::Open {}.encode().unwrap()[4..],
+            br#"{"type":"open"}"#[..]
+        );
+        assert_eq!(
             DirectoryRequest::Policy {
                 have: StateVersion(7)
             }
@@ -475,23 +385,24 @@ mod tests {
             .unwrap()[4..],
             br#"{"have":7,"type":"policy"}"#[..]
         );
+        assert_eq!(
+            DirectoryRequest::View { query: None }.encode().unwrap()[4..],
+            br#"{"type":"view"}"#[..]
+        );
     }
 
     #[test]
     fn answers_and_subscription_frames_round_trip() {
         let signed = sample().sign(&root()).unwrap();
-        let mut next = sample();
-        next.version = StateVersion(4);
-        next.bans.insert(node(21));
-        let next = next.sign_after(&root(), &signed).unwrap();
-        let fresh = fresh(&next);
-        let update = next.update_from(&signed);
-        let alice = who("alice@example.com");
-        let view = next.view_for(node(2), Some(&alice), None);
-        let view_update = signed
-            .view_for(node(2), Some(&alice), None)
-            .update_to(&view);
+        let fresh = fresh(&signed);
+        let view = signed.view_for(node(2), Some(&who("alice@example.com")), None);
         for a in [
+            DirectoryAnswer::Proof {
+                proof: HostProof {
+                    head: signed.head.clone(),
+                    fresh: vec![fresh.clone()],
+                },
+            },
             DirectoryAnswer::Published {
                 version: StateVersion(3),
                 head: signed.head.hash().unwrap(),
@@ -500,19 +411,11 @@ mod tests {
                 fresh: fresh.clone(),
             },
             DirectoryAnswer::Policy {
-                policy: next.clone(),
-                fresh: fresh.clone(),
-            },
-            DirectoryAnswer::PolicyUpdate {
-                update: update.clone(),
+                policy: signed.clone(),
                 fresh: fresh.clone(),
             },
             DirectoryAnswer::View {
-                view: view.clone(),
-                fresh: fresh.clone(),
-            },
-            DirectoryAnswer::ViewUpdate {
-                update: view_update.clone(),
+                view,
                 fresh: fresh.clone(),
             },
             DirectoryAnswer::Denied {
@@ -527,19 +430,7 @@ mod tests {
         }
         for f in [
             SubFrame::Policy {
-                policy: next.clone(),
-                fresh: fresh.clone(),
-            },
-            SubFrame::PolicyUpdate {
-                update: update.clone(),
-                fresh: fresh.clone(),
-            },
-            SubFrame::View {
-                view,
-                fresh: fresh.clone(),
-            },
-            SubFrame::ViewUpdate {
-                update: view_update,
+                policy: signed.clone(),
                 fresh: fresh.clone(),
             },
             SubFrame::Fresh { fresh },
@@ -550,26 +441,15 @@ mod tests {
             let bytes = f.encode().unwrap();
             assert_eq!(SubFrame::decode(&bytes).unwrap(), Some((f, bytes.len())));
         }
-        for kind in [
-            SubscriptionKind::Policy,
-            SubscriptionKind::Replica,
-            SubscriptionKind::View,
+        for r in [
+            SubRequest::Hello { id_token: None },
+            SubRequest::Subscribe {
+                have: StateVersion(1),
+            },
         ] {
-            for r in [
-                SubRequest::Hello {
-                    id_token: Some(IdToken::new("a.b.c")),
-                },
-                SubRequest::Subscribe {
-                    kind,
-                    have: StateVersion(1),
-                },
-            ] {
-                let bytes = r.encode().unwrap();
-                assert_eq!(SubRequest::decode(&bytes).unwrap(), Some((r, bytes.len())));
-            }
+            let bytes = r.encode().unwrap();
+            assert_eq!(SubRequest::decode(&bytes).unwrap(), Some((r, bytes.len())));
         }
-        // What a subscriber does with a `policy_update`: apply it to its copy.
-        assert_eq!(signed.apply(&update, root().node_id()).unwrap(), next);
     }
 
     /// Only a publish's items may be large: every other request, a
@@ -613,16 +493,20 @@ mod tests {
         assert!(SubRequest::decode(&over_small).is_err());
     }
 
+    /// The frames of the delta and replica paths (gone in card 45) are
+    /// refused, as is anything unknown.
     #[test]
     fn unknown_frames_and_fields_are_refused() {
         for body in [
             r#"{"type":"offer"}"#,
             r#"{"type":"head"}"#,
+            r#"{"type":"open","id_token":"x"}"#,
             r#"{"type":"hello","credential":"x"}"#,
             r#"{"type":"publish","head":{},"items":[]}"#,
-            r#"{"type":"slice","have":1,"roles":[]}"#,
             r#"{"type":"policy"}"#,
             r#"{"type":"policy","have":1,"x":2}"#,
+            r#"{"type":"view","have":3}"#,
+            r#"{"type":"view","held":"00"}"#,
             r#"{"type":"resolve","service":"Not A Name"}"#,
         ] {
             assert!(
@@ -631,26 +515,28 @@ mod tests {
             );
         }
         for body in [
-            r#"{"type":"subscribe","kind":"everything","have":0}"#,
-            r#"{"type":"subscribe","kind":"slice","have":0}"#,
-            r#"{"type":"subscribe","kind":"policy","have":0,"roles":[]}"#,
+            r#"{"type":"subscribe","kind":"policy","have":0}"#,
+            r#"{"type":"subscribe","kind":"replica","have":0}"#,
+            r#"{"type":"subscribe"}"#,
         ] {
             assert!(SubRequest::decode(&raw(body.as_bytes())).is_err(), "{body}");
         }
         for body in [
             r#"{"type":"published"}"#,
             r#"{"type":"published","version":1}"#,
-            r#"{"type":"slice"}"#,
+            r#"{"type":"policy_update","update":{},"fresh":{}}"#,
+            r#"{"type":"view_update","update":{},"fresh":{}}"#,
         ] {
             assert!(DirectoryAnswer::decode(&raw(body.as_bytes())).is_err());
         }
-        assert!(SubFrame::decode(&raw(br#"{"type":"replica"}"#)).is_err());
+        assert!(SubFrame::decode(&raw(br#"{"type":"view","view":{},"fresh":{}}"#)).is_err());
+        assert!(SubFrame::decode(&raw(br#"{"type":"policy_update"}"#)).is_err());
     }
 
     #[test]
     fn the_alpns() {
-        assert_eq!(DIRECTORY_ALPN, b"wires/directory/2");
-        assert_eq!(DIRECTORY_SUB_ALPN, b"wires/directory-sub/2");
+        assert_eq!(DIRECTORY_ALPN, b"wires/directory/3");
+        assert_eq!(DIRECTORY_SUB_ALPN, b"wires/directory-sub/3");
     }
 
     proptest! {
@@ -663,28 +549,27 @@ mod tests {
         }
 
         #[test]
-        fn view_requests_round_trip(have in any::<u64>(), query in proptest::option::of("[a-z ]{0,16}")) {
-            let r = DirectoryRequest::View { have: StateVersion(have), query, held: None };
+        fn view_requests_round_trip(query in proptest::option::of("[a-z ]{0,16}")) {
+            let r = DirectoryRequest::View { query };
             let bytes = r.encode().unwrap();
             prop_assert_eq!(DirectoryRequest::decode(&bytes).unwrap(), Some((r, bytes.len())));
         }
 
-        /// Any update between two random policies survives the frame and
-        /// still applies.
+        /// Any whole policy survives the subscription frame and still
+        /// verifies, with its `Fresh` vouching for its head.
         #[test]
-        fn policy_updates_survive_the_frame(a in arb_policy(), b in arb_policy()) {
-            let old = a.sign(&root()).unwrap();
-            let mut b = b;
-            b.version = StateVersion(a.version.0 + 1);
-            b.directories = vec![node(30)];
-            let new = b.sign_after(&root(), &old).unwrap();
-            let frame = SubFrame::PolicyUpdate { update: new.update_from(&old), fresh: fresh(&new) };
+        fn whole_policies_survive_the_frame(a in arb_policy()) {
+            let mut a = a;
+            a.directories = vec![node(30)];
+            let signed = a.sign(&root()).unwrap();
+            let frame = SubFrame::Policy { policy: signed.clone(), fresh: fresh(&signed) };
             let bytes = frame.encode().unwrap();
-            let Some((SubFrame::PolicyUpdate { update, fresh }, _)) = SubFrame::decode(&bytes).unwrap() else {
-                panic!("not a policy_update");
+            let Some((SubFrame::Policy { policy, fresh }, _)) = SubFrame::decode(&bytes).unwrap() else {
+                panic!("not a policy");
             };
-            prop_assert!(fresh.verify(&update.head).is_ok());
-            prop_assert_eq!(old.apply(&update, root().node_id()).unwrap(), new);
+            prop_assert!(fresh.verify(&policy.head).is_ok());
+            prop_assert!(policy.verify(root().node_id()).is_ok());
+            prop_assert_eq!(policy, signed);
         }
     }
 }

@@ -16,8 +16,9 @@
 //! services a role **matching the user's IdP identity** admits, each a
 //! root-signed entry, cut by a directory for that user's own ID token
 //! (nonce-bound to the gateway's node). The gateway holds no policy: it
-//! keeps one view subscription per live session ([`Keystored`]), so a
-//! grant or a revocation applies to the user's next request. Admission
+//! keeps each live session's view in memory and asks a directory for it
+//! again at the user's first request after a minute ([`Keystored`]), so a
+//! grant or a revocation applies within a minute. Admission
 //! needs a person's verified sign-in, so the gateway's node on its own is
 //! admitted nowhere: every call it makes is a web user's.
 //!
@@ -54,7 +55,8 @@ use crate::caller::call::Credentials;
 use crate::caller::jwks::KeyFetcher;
 use crate::caller::login::{DEFAULT_ISSUER, OidcClient, random_token, save_secret};
 use crate::caller::mcp::{ViewService, services_in};
-use crate::caller::view::{self, HeldView, ViewWatch};
+use crate::caller::view::{self, HeldView};
+use crate::caller::vouch::Refresher;
 
 use self::clients::{ClientKey, MetadataFetcher};
 use self::sessions::{Session, Store};
@@ -155,13 +157,13 @@ impl PublicUrls {
 pub(crate) trait Backend: Send + Sync + 'static {
     /// The caller used for one web user's calls.
     type Caller: crate::caller::call::Caller + Send + Sync;
-    /// The view of the web user `session` speaks for (current: a newer
-    /// policy applies to their next request), with the `Fresh`es its
-    /// subscription brought.
+    /// The view of the web user `session` speaks for (asked of a directory
+    /// at most [`view::POLL`] ago), with the `Fresh`es that came with it.
     fn view(&self, session: &Session) -> impl Future<Output = Result<Arc<HeldView>>> + Send;
-    /// A caller presenting `token` in every call's handshake, dialing the
-    /// hosts `view` names once each shows a current policy (card 49).
-    fn caller(&self, token: IdToken, view: Arc<HeldView>) -> Self::Caller;
+    /// A caller presenting `session`'s ID token in every call's handshake,
+    /// dialing the hosts `view` names once each shows a current policy
+    /// (card 49).
+    fn caller(&self, session: &Session, view: Arc<HeldView>) -> Self::Caller;
 }
 
 /// What a web user hears when a directory refuses them admission (no role
@@ -170,99 +172,112 @@ pub(crate) trait Backend: Send + Sync + 'static {
 pub(crate) const NOT_ADMITTED_HERE: &str = "not admitted to this network: no role in this \
 network matches this account, or it was removed: ask your admin";
 
-/// How long a web user's first request waits for their view.
+/// How long a web user's request waits for a directory to give their view.
 const VIEW_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// One web user's live view: the subscription following it, until their
-/// ID token expires.
+/// One web user's view, as a directory last gave it, until their ID token
+/// expires.
+#[derive(Clone)]
 struct UserView {
-    /// The view as it changes.
-    rx: ViewWatch,
-    /// The subscription (aborted when the session is over).
-    task: tokio::task::JoinHandle<()>,
+    /// The view.
+    held: Arc<HeldView>,
+    /// When a directory gave it.
+    asked: std::time::Instant,
     /// The ID token's `exp`: the session is over after it.
     not_after: i64,
 }
 
+/// The web users' views (card 45: asked for, not subscribed to), by ID
+/// token, and how to ask for one.
+pub(crate) struct Views {
+    endpoint: iroh::Endpoint,
+    root: NodeId,
+    /// The directories to ask while a user's view names none (its own
+    /// view's head's, else its network string's, else its held policy's).
+    directories: Vec<NodeId>,
+    /// The network string's directories (the one-directory rule's
+    /// `known`, card 49 review).
+    known: Vec<NodeId>,
+    held: std::sync::Mutex<HashMap<String, UserView>>,
+}
+
+impl Views {
+    /// The views held now for `token` (dropping those whose tokens expired).
+    fn cached(&self, token: &IdToken, now: i64) -> Option<UserView> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        held.retain(|_, v| v.not_after >= now);
+        held.get(token.as_str()).cloned()
+    }
+
+    /// Ask a directory for `token`'s view ([`view::fetch`]: only one whose
+    /// proof checks out is told the token), within [`VIEW_WAIT`], and keep
+    /// it until `not_after`. A refusal of admission drops the view held.
+    async fn ask(&self, token: &IdToken, not_after: i64) -> Result<Arc<HeldView>> {
+        let now = crate::clock::now_unix();
+        let base = self.cached(token, now).map(|v| v.held);
+        // The view's head's, then the others it knows (card 49 review).
+        let mut dirs: Vec<NodeId> = base
+            .as_ref()
+            .map(|h| h.directories().to_vec())
+            .unwrap_or_default();
+        for d in &self.directories {
+            if !dirs.contains(d) {
+                dirs.push(*d);
+            }
+        }
+        let fetched = tokio::time::timeout(
+            VIEW_WAIT,
+            view::fetch(
+                &self.endpoint,
+                self.root,
+                &dirs,
+                &self.known,
+                base.as_deref(),
+                Some(token.clone()),
+            ),
+        )
+        .await
+        .map_err(|_| anyhow!("no directory gave this user's view within {VIEW_WAIT:?}"))
+        .and_then(|r| r);
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        match fetched {
+            Ok(view) => {
+                let view = Arc::new(view);
+                held.insert(
+                    token.as_str().to_owned(),
+                    UserView {
+                        held: Arc::clone(&view),
+                        asked: std::time::Instant::now(),
+                        not_after,
+                    },
+                );
+                Ok(view)
+            }
+            Err(e) => {
+                if e.downcast_ref::<view::NotAdmitted>().is_some() {
+                    held.remove(token.as_str());
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
 /// The production [`Backend`]: this node's keystore and credentials, one
 /// long-lived endpoint every web user's calls dial from (one node key, one
-/// endpoint: not one per call contending for the same relay slot), and one
-/// view subscription per live session, keyed by its ID token.
+/// endpoint: not one per call contending for the same relay slot), and the
+/// web users' views, each asked for again at its user's first request after
+/// [`view::POLL`].
 pub(crate) struct Keystored {
     ks: Arc<Keystore>,
     creds: Credentials,
     endpoint: iroh::Endpoint,
-    /// The directories to ask (its own view's head's, else its network
-    /// string's, else its held policy's).
-    directories: Vec<NodeId>,
     /// Live views, by ID token.
-    views: std::sync::Mutex<HashMap<String, UserView>>,
+    views: Arc<Views>,
     /// The `Fresh`es hosts' proofs carried, for every user (a `Fresh`
     /// vouches for a head, not a person): so a call to a host one already
     /// covers speaks at once (card 49).
     proofs: Arc<std::sync::Mutex<FreshSet>>,
-}
-
-impl Keystored {
-    /// The live view for `session`, subscribing on first use; sessions
-    /// whose tokens have expired are dropped (their subscriptions end).
-    fn watch(&self, session: &Session, now: i64) -> ViewWatch {
-        let mut views = self.views.lock().unwrap_or_else(|e| e.into_inner());
-        views.retain(|_, v| {
-            let live = v.not_after >= now && !v.task.is_finished();
-            if !live {
-                v.task.abort();
-            }
-            live
-        });
-        let key = session.id_token.as_str().to_owned();
-        if let Some(v) = views.get(&key) {
-            return v.rx.clone();
-        }
-        let token = session.id_token.clone();
-        let (rx, task) = view::follow(view::Follow {
-            endpoint: self.endpoint.clone(),
-            root: self.creds.root(),
-            id_token: Arc::new(move || Some(token.clone())),
-            initial: None,
-            fallback: self.directories.clone(),
-            persist: None,
-        });
-        views.insert(
-            key,
-            UserView {
-                rx: rx.clone(),
-                task,
-                not_after: session.not_after(),
-            },
-        );
-        rx
-    }
-}
-
-impl Keystored {
-    /// Whether the first directory that answers refuses `session`'s person
-    /// admission ([`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED)).
-    async fn refuses_admission(&self, session: &Session, now: i64) -> bool {
-        for &dir in &self.directories {
-            let asked = view::ask_view(
-                &self.endpoint,
-                dir,
-                Some(session.id_token.clone()),
-                self.creds.root(),
-                None,
-                None,
-                now,
-            )
-            .await;
-            match asked {
-                Ok(_) => return false,
-                Err(e) if view::Refused::is_not_admitted(&e) => return true,
-                Err(_) => continue,
-            }
-        }
-        false
-    }
 }
 
 impl Backend for Keystored {
@@ -270,29 +285,49 @@ impl Backend for Keystored {
 
     async fn view(&self, session: &Session) -> Result<Arc<HeldView>> {
         let now = crate::clock::now_unix();
-        let mut rx = self.watch(session, now);
-        // A directory refuses a person no role matches (or one removed)
-        // outright, and the subscription only retries: ask once, so they
-        // hear it now rather than as a timeout.
-        if rx.borrow().is_none() && self.refuses_admission(session, now).await {
-            return Err(anyhow!(crate::host::gate::NOT_ADMITTED).context(view::NotAdmitted));
+        let cached = self.views.cached(&session.id_token, now);
+        if let Some(v) = &cached
+            && v.asked.elapsed() < view::POLL
+        {
+            return Ok(Arc::clone(&v.held));
         }
-        let held: Arc<HeldView> = tokio::time::timeout(VIEW_WAIT, rx.wait_for(Option::is_some))
-            .await
-            .map_err(|_| anyhow!("no directory gave this user's view within {VIEW_WAIT:?}"))?
-            .map_err(|_| anyhow!("the view subscription ended"))?
-            .clone()
-            .expect("waited for a view");
-        Ok(held)
+        match self.views.ask(&session.id_token, session.not_after()).await {
+            Ok(held) => Ok(held),
+            // A directory refuses a person no role matches (or one removed)
+            // outright: they hear it now.
+            Err(e) if e.downcast_ref::<view::NotAdmitted>().is_some() => {
+                Err(anyhow!(crate::host::gate::NOT_ADMITTED).context(view::NotAdmitted))
+            }
+            // No directory answered: the view held, while there is one.
+            Err(e) => match cached {
+                Some(v) => {
+                    tracing::debug!("asking for a web user's view again: {e:#}");
+                    Ok(v.held)
+                }
+                None => Err(e),
+            },
+        }
     }
 
-    fn caller(&self, token: IdToken, view: Arc<HeldView>) -> PresentingCaller {
+    fn caller(&self, session: &Session, view: Arc<HeldView>) -> PresentingCaller {
+        let views = Arc::clone(&self.views);
+        let (token, not_after) = (session.id_token.clone(), session.not_after());
+        let refresher = Refresher(Arc::new(move || {
+            let (views, token) = (Arc::clone(&views), token.clone());
+            Box::pin(async move {
+                views
+                    .ask(&token, not_after)
+                    .await
+                    .map(|held| (*held).clone())
+            })
+        }));
         PresentingCaller {
             ks: Arc::clone(&self.ks),
-            creds: self.creds.clone().presenting(token),
+            creds: self.creds.clone().presenting(session.id_token.clone()),
             endpoint: self.endpoint.clone(),
             view,
             proofs: Arc::clone(&self.proofs),
+            refresher,
         }
     }
 }
@@ -300,14 +335,15 @@ impl Backend for Keystored {
 /// Calls a service with this node's credentials over the gateway's shared
 /// endpoint, presenting a web user's ID token instead of a stored one, on
 /// the hosts that user's view names, once a host shows a current policy
-/// (card 49: a newer head than the view's is a dial failure here, since the
-/// user's subscription catches up on its own).
+/// (card 49). A host showing a newer head than the view makes it ask a
+/// directory for the user's view first (card 45), as `wires call` does.
 pub(crate) struct PresentingCaller {
     ks: Arc<Keystore>,
     creds: Credentials,
     endpoint: iroh::Endpoint,
     view: Arc<HeldView>,
     proofs: Arc<std::sync::Mutex<FreshSet>>,
+    refresher: Refresher,
 }
 
 impl crate::caller::call::Caller for PresentingCaller {
@@ -328,6 +364,7 @@ impl crate::caller::call::Caller for PresentingCaller {
             Scope::Service(service.clone()),
         )
         .knowing(crate::caller::view::joined_directories(&self.ks))
+        .refreshing(self.refresher.clone())
         .keeping_in(Sink::Shared(Arc::clone(&self.proofs)));
         let dial = ServiceDial {
             endpoint: &self.endpoint,
@@ -636,12 +673,18 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
              network`)"
         );
     }
+    let endpoint = creds.bind().await?;
     let backend = Keystored {
         ks: Arc::clone(&ks),
-        endpoint: creds.bind().await?,
+        views: Arc::new(Views {
+            endpoint: endpoint.clone(),
+            root: creds.root(),
+            directories,
+            known: view::joined_directories(&ks),
+            held: std::sync::Mutex::new(HashMap::new()),
+        }),
+        endpoint,
         creds,
-        directories,
-        views: std::sync::Mutex::new(HashMap::new()),
         proofs: Default::default(),
     };
     let mut origins = vec![

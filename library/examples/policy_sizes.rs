@@ -1,12 +1,12 @@
 //! Measures what the directory's frames cost on the wire (card 36d), for
-//! `bench/state-scale/model.py`'s *apex* assumptions: a host's first sync
-//! (the whole policy), its updates, the freshness beat, and a caller's view.
+//! `bench/state-scale/model.py`'s *apex* assumptions: the whole policy (what
+//! a host receives on every edit, card 45), the freshness beat, and a
+//! caller's view.
 //!
 //! Builds real signed policies with the library at the model's tiers, and
 //! prints one JSON line per tier: the head, a `Fresh` and its beat frame, a
 //! signed service entry, the whole policy (as published and as the frame a
-//! host first receives), the `policy_update` frame for one changed service
-//! and for one new ban, and a caller's view of about 25 services (entry
+//! host receives), and a caller's view of about 25 services (entry
 //! count, frame and `view.json`), a `HelloAck` carrying news (card 37: the
 //! head and one service entry), and the network string every node joins
 //! with.
@@ -16,9 +16,9 @@
 //! ```
 
 use library::{
-    Audience, Fresh, HelloAck, Issuer, IssuerConfig, Item, LoginSettings, Matcher, Network, NodeId,
-    NodeIdentity, Policy, Principal, PublicClientSecret, RoleName, Service, ServiceName,
-    SignedPolicy, StateVersion, SubFrame,
+    Audience, DirectoryAnswer, Fresh, HelloAck, Issuer, IssuerConfig, Item, LoginSettings, Matcher,
+    Network, NodeId, NodeIdentity, Policy, Principal, PublicClientSecret, RoleName, Service,
+    ServiceName, SignedPolicy, StateVersion, SubFrame,
 };
 
 const ISSUED: i64 = 1_790_000_000;
@@ -110,18 +110,6 @@ fn fresh(head: &SignedPolicy) -> Fresh {
     Fresh::sign(&directory(), &head.head, ISSUED, ISSUED + 900).expect("a directory")
 }
 
-/// The bytes of the `policy_update` frame that moves `from` to `next`, with
-/// its `Fresh`; and how many items it carries.
-fn update_frame(from: &SignedPolicy, next: &SignedPolicy) -> (usize, usize) {
-    let update = next.update_from(from);
-    let items = update.changed.len() + update.removed.len();
-    let frame = SubFrame::PolicyUpdate {
-        update,
-        fresh: fresh(next),
-    };
-    (frame.encode().expect("a frame").len(), items)
-}
-
 fn measure(root: &NodeIdentity, t: &Tier) -> serde_json::Value {
     let base = policy(root, t);
     let signed = base.sign(root).expect("a valid policy");
@@ -144,31 +132,6 @@ fn measure(root: &NodeIdentity, t: &Tier) -> serde_json::Value {
     };
     let view = signed.view_for(node(5_000_000), Some(&caller), None);
 
-    // Two edits, each version + 1 and signed after the base, as the admin
-    // signs: one service's description, and a new ban.
-    let edit = |f: &dyn Fn(&mut Policy)| {
-        let mut p = base.clone();
-        p.version = StateVersion(p.version.0 + 1);
-        f(&mut p);
-        p.sign_after(root, &signed).expect("a valid policy")
-    };
-    let changed = update_frame(
-        &signed,
-        &edit(&|p: &mut Policy| {
-            p.services
-                .get_mut(&service_name(0))
-                .expect("a service")
-                .description =
-                "Read-only SQL against the orders replica, now with a 30 s timeout.".into();
-        }),
-    );
-    let banned = update_frame(
-        &signed,
-        &edit(&|p: &mut Policy| {
-            p.bans.insert(node(3_000_000));
-        }),
-    );
-
     serde_json::json!({
         "tier": t.name,
         "services": t.services,
@@ -183,15 +146,11 @@ fn measure(root: &NodeIdentity, t: &Tier) -> serde_json::Value {
             .encode()
             .expect("a frame")
             .len(),
-        "update_changed_service": changed.0,
-        "update_changed_service_items": changed.1,
-        "update_new_ban": banned.0,
-        "update_new_ban_items": banned.1,
         "view_entries": view.entries.len(),
         "view_json": len(&serde_json::json!({
             "view": &view, "fresh": &fresh, "checked": ISSUED, "seen": 0,
         })),
-        "view_frame": SubFrame::View { view, fresh: fresh.clone() }.encode().expect("a frame").len(),
+        "view_frame": DirectoryAnswer::View { view, fresh: fresh.clone() }.encode().expect("a frame").len(),
         "hello_ack_news": len(&HelloAck {
             state_version: signed.version(),
             head: Some(signed.head.clone()),

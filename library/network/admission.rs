@@ -11,7 +11,7 @@
 //! account at the IdP can get one that verifies.
 //!
 //! Every gate a caller passes asks this one function: a host's call gate
-//! and inbox fetch, and a directory's requests and view subscriptions.
+//! and inbox fetch, and a directory's requests.
 //!
 //! A host or a directory is admitted by the policy naming its key
 //! ([`Policy::is_host`], the head's `directories`), never by a token or a

@@ -54,7 +54,7 @@ services:
       WIRES_HOME: /data
       RUST_LOG: ${RUST_LOG:-warn,wires=info}
     volumes:
-      # Node key, the network string, the signed policy and directory.redb.
+      # Node key, the network string and the signed policy (the directory's store).
       # Must persist.
       - directory-keystore:/data
     restart: unless-stopped

@@ -19,16 +19,19 @@
 //!   set`, `directory add`, `service add`, `network`, `join`, `serve`,
 //!   `policy push`, `login <network>`, `services`, `call`), with no step
 //!   failing; then removal by person and by node, and `restore`.
-//! - [`follow`] — card 36c: hosts follow a directory's `policy`
-//!   subscription (deltas, resync, failover); and card 49: a caller tells a
+//! - [`follow`] — hosts follow a directory's subscription (the whole
+//!   policy per edit, card 45; failover, and passing over a directory that
+//!   is behind); and card 49: a caller tells a
 //!   host nothing until another directory vouches for the head it holds, so
 //!   a removed host (one that is also a directory included) gets no token,
 //!   and with every directory down calls fail closed.
 //! - [`views`] — card 37: each caller holds only its view, and a running
-//!   `wires mcp` hears of a grant or a revocation within 2 s.
+//!   `wires mcp` hears of a grant or a revocation at its next poll; card
+//!   45: a removed or lagging directory is told no caller's token.
 //! - [`restart`] — card 48: an admin edit made right after a directory
 //!   restarts reaches it (the publish tries a directory it can't find yet
-//!   again), and one that misses it is taken from another by replica.
+//!   again), and one that misses it holds the old policy until `wires
+//!   policy push` (card 45: no replicas), so the edit fails.
 //! - [`native`] — card 33: an embedded [`Host`](crate::Host) serves a native
 //!   service (the `kv` example), called like a CLI service.
 

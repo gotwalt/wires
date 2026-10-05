@@ -11,7 +11,7 @@
 //!   and IdP identity.
 //! - `services/` — the admin-signed policy (card 36): roles, the service
 //!   registry, policy evaluation; the items, the signed head and signed
-//!   service entries, updates, views, and freshness.
+//!   service entries, views, and freshness.
 //! - `directory/` — the directory's request and subscription frames.
 //!
 //! The folders are a filing system, not a namespace: every module is still
@@ -46,9 +46,7 @@
 //!   an [`ItemsHash`], and the [`StateVersion`] that orders them.
 //! - [`signed_policy`] — the whole [`Policy`] and [`SignedPolicy`], and the
 //!   views cut from it.
-//! - [`policy_update`] — the [`PolicyUpdate`] that moves a whole policy to a
-//!   newer head.
-//! - [`view`] — a caller's [`View`] and the [`ViewUpdate`] that moves it.
+//! - [`view`] — a caller's [`View`].
 //! - [`fresh`] — a directory's signed [`Fresh`] timestamp.
 //! - [`directory`] — the [`DirectoryRequest`] / [`SubRequest`] frames on
 //!   [`DIRECTORY_ALPN`] and [`DIRECTORY_SUB_ALPN`].
@@ -157,8 +155,6 @@ pub mod fresh;
 pub mod head;
 #[path = "services/item.rs"]
 pub mod item;
-#[path = "services/policy_update.rs"]
-pub mod policy_update;
 #[path = "services/signed_policy.rs"]
 pub mod signed_policy;
 #[path = "services/view.rs"]
@@ -178,8 +174,7 @@ pub use admission::check_admitted;
 pub use codec::B64;
 pub use directory::{
     DIRECTORY_ALPN, DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, MAX_DIRECTORY_FRAME,
-    MAX_SMALL_DIRECTORY_FRAME, SubFrame, SubRequest, SubscriptionKind, VIEW_DIGEST_CONTEXT,
-    ViewDigest,
+    MAX_SMALL_DIRECTORY_FRAME, SubFrame, SubRequest,
 };
 pub use entry::{ENTRY_CONTEXT, ENTRY_V2, SignedEntry};
 pub use error::{Error, IdTokenError, Result};
@@ -200,7 +195,6 @@ pub use item::{
 pub use network::{
     LoginSettings, NETWORK_MAX_DIRECTORIES, NETWORK_V1, Network, PublicClientSecret,
 };
-pub use policy_update::PolicyUpdate;
 pub use proof::{HostProof, Standing};
 pub use push::{
     INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_FRAME, MAX_INBOX_HELLO, MAX_PUSH_BODY,
@@ -210,4 +204,4 @@ pub use registry::{MAX_SERVICE_NAME, Service, ServiceName};
 pub use role::{EmailPattern, MAX_ROLE_NAME, Matcher, RoleName};
 pub use session::{Chunk, Frame, Hello, HelloAck};
 pub use signed_policy::{Policy, SignedPolicy};
-pub use view::{View, ViewUpdate};
+pub use view::View;

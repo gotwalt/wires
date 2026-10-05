@@ -13,9 +13,8 @@
 //! network, where the host's own word is all there is.
 //!
 //! **The cached path costs no flight.** A caller that already holds such a
-//! `Fresh` for its view's head (from its own refresh, its view subscription,
-//! or an earlier host's proof: a `Fresh` vouches for a head, not for a
-//! host) sends `Hello` and `Invoke` at once ([`Vouching::ready`]), and still
+//! `Fresh` for its view's head (from its own refresh, or an earlier host's
+//! or directory's proof: a `Fresh` vouches for a head, not for a host) sends `Hello` and `Invoke` at once ([`Vouching::ready`]), and still
 //! checks the host's proof before it sends a byte of stdin. Whatever a
 //! proof carries that vouches for the view is kept ([`Sink`]), so only the
 //! first call in each `fresh_secs` window, to a host no `Fresh` held covers,
@@ -43,16 +42,38 @@ pub(crate) enum Scope {
     AnyService,
 }
 
+/// A view being asked for again.
+pub(crate) type Refreshing =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<HeldView>> + Send>>;
+
 /// How the caller brings its view up to date when a host shows a newer
-/// head: ask the directories ([`view::refresh`]) over `endpoint`.
+/// head: a way to ask the directories for it again (from a keystore's
+/// view, [`Refresher::keystore`], or the gateway's for one web user).
 #[derive(Clone)]
-pub(crate) struct Refresher {
-    /// Where the view lives.
-    pub(crate) ks: Keystore,
-    /// This node's endpoint (any; it dials the directory ALPN).
-    pub(crate) endpoint: iroh::Endpoint,
-    /// The ID token a directory admits this node by.
-    pub(crate) id_token: Option<IdToken>,
+pub(crate) struct Refresher(pub(crate) Arc<dyn Fn() -> Refreshing + Send + Sync>);
+
+impl Refresher {
+    /// The view in `ks`, asked of the directories ([`view::refresh`]) over
+    /// `endpoint` (any; it dials the directory ALPN) for `root`'s network,
+    /// presenting `id_token`.
+    pub(crate) fn keystore(
+        ks: Keystore,
+        endpoint: iroh::Endpoint,
+        root: NodeId,
+        id_token: Option<IdToken>,
+    ) -> Refresher {
+        Refresher(Arc::new(move || {
+            let (ks, endpoint, id_token) = (ks.clone(), endpoint.clone(), id_token.clone());
+            Box::pin(async move {
+                let asker = view::Asker {
+                    endpoint: &endpoint,
+                    root,
+                    id_token,
+                };
+                view::refresh(&ks, &asker, false).await
+            })
+        }))
+    }
 }
 
 /// Where a `Fresh` a host's proof carried goes, so the next call speaks at
@@ -103,7 +124,7 @@ pub(crate) struct Vouching {
     /// What the caller wants from the host.
     scope: Scope,
     /// How to refresh the view on a newer head; none: a newer head is a
-    /// dial failure (the subscription will catch up).
+    /// dial failure.
     refresher: Option<Refresher>,
     /// Where a `Fresh` learned from a host goes.
     sink: Sink,
@@ -338,19 +359,13 @@ impl Vouching {
                 self.version().0
             );
         };
-        let asker = view::Asker {
-            endpoint: &r.endpoint,
-            root: self.root,
-            id_token: r.id_token.clone(),
-        };
-        let refreshed =
-            tokio::time::timeout(view::REFRESH_BUDGET, view::refresh(&r.ks, &asker, false))
-                .await
-                .map_err(|_| anyhow!("no directory answered within {:?}", view::REFRESH_BUDGET))
-                .and_then(|r| r)
-                .with_context(|| {
-                    format!("refreshing your view to the host's policy version {}", v.0)
-                })?;
+        let refreshed = tokio::time::timeout(view::REFRESH_BUDGET, (r.0)())
+            .await
+            .map_err(|_| anyhow!("no directory answered within {:?}", view::REFRESH_BUDGET))
+            .and_then(|r| r)
+            .with_context(|| {
+                format!("refreshing your view to the host's policy version {}", v.0)
+            })?;
         self.held = refreshed;
         Ok(())
     }

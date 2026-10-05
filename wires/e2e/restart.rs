@@ -21,8 +21,8 @@
 //!   misses it (no address yet); the admin's publish, trying again within
 //!   [`PUBLISH_BUDGET`], reaches both.
 //! - [`a_stale_address_costs_one_dial_timeout_then_the_next_try_finds_it`]
-//! - [`a_directory_that_missed_an_edit_takes_it_from_another_by_replica`]:
-//!   and how long that takes.
+//! - [`a_directory_that_missed_an_edit_holds_the_old_one_and_the_edit_fails`]:
+//!   card 45, nothing hands an edit on; `wires policy push` does.
 //! - [`a_busy_directory_is_tried_again`]: busy is no refusal.
 //! - [`a_dead_directory_the_edit_drops_is_tried_once_and_not_waited_for`]
 
@@ -34,7 +34,7 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr};
 use library::{NodeId, NodeIdentity, StateVersion};
 
-use super::{PATIENCE, bind_in, localhost_socks};
+use super::{bind_in, localhost_socks};
 use crate::admin::init::{InitArgs, init_in};
 use crate::admin::keystore::Keystore;
 use crate::admin::propagate::{Propagation, settle};
@@ -72,7 +72,7 @@ struct Net {
     admin_book: MemoryLookup,
 }
 
-/// A directory serving on its own endpoint, replicas and beats included.
+/// A directory serving on its own endpoint, beats included.
 struct Dir {
     dir: Arc<Directory>,
     endpoint: Endpoint,
@@ -94,23 +94,6 @@ impl Dir {
         self.router.shutdown().await.unwrap();
         self.endpoint.close().await;
         drop(self.dir);
-    }
-
-    /// When it comes to hold `version` (watched from now, within
-    /// [`PATIENCE`]).
-    fn took_at(&self, version: StateVersion) -> tokio::task::JoinHandle<Instant> {
-        let dir = Arc::clone(&self.dir);
-        tokio::spawn(async move {
-            tokio::time::timeout(PATIENCE, async {
-                let mut changes = dir.watch();
-                while dir.version() < version {
-                    changes.changed().await.unwrap();
-                }
-            })
-            .await
-            .expect("the directory never took the policy");
-            Instant::now()
-        })
     }
 }
 
@@ -158,7 +141,7 @@ impl Net {
         .unwrap();
         let endpoint = bind_in(node, &self.book).await;
         let router = Running::mount(Router::builder(endpoint.clone()), &dir).spawn();
-        let running = Running::start(Arc::clone(&dir), endpoint.clone());
+        let running = Running::start(Arc::clone(&dir));
         let served = Dir {
             dir,
             endpoint,
@@ -337,30 +320,43 @@ async fn a_stale_address_costs_one_dial_timeout_then_the_next_try_finds_it() {
     d1.stop().await;
 }
 
-/// A directory the admin can't reach at all after its restart misses the
-/// edit, and takes it from the other directory by its replica
-/// subscription, already open: within 2 s here (on loopback, about 40 ms
-/// after the other took it in a debug build).
+/// Card 45: a directory the admin can't reach at all after its restart
+/// misses the edit, and nothing hands it on: it holds the policy before it,
+/// and the admin's command fails (it ran before, so it is no first run),
+/// saying `wires policy push` brings it; which, once it is findable again,
+/// it does.
 #[tokio::test]
-async fn a_directory_that_missed_an_edit_takes_it_from_another_by_replica() {
+async fn a_directory_that_missed_an_edit_holds_the_old_one_and_the_edit_fails() {
     let net = Net::new();
     let (d0, d1) = net.running().await;
+    let before = d0.dir.version();
     let d0 = net.restart_0(d0, false).await;
-    // Never findable by the admin this time.
+    // Not findable by the admin this time.
     let id = endpoint_id(&net.dirs[0].node_id()).unwrap();
     tokio::time::sleep(LAG + Duration::from_millis(100)).await;
     net.admin_book.remove_endpoint_info(id);
     net.remove_alice();
     let version = net.version();
-    let (took_1, took_0) = (d1.took_at(version), d0.took_at(version));
     let once = net.publish_once().await;
     assert_eq!(once.delivered, vec![net.dirs[1].node_id()], "{once:?}");
-    let caught_up = took_0.await.unwrap() - took_1.await.unwrap();
-    eprintln!(
-        "the missed directory took version {} by replica {caught_up:?} after the other did",
-        version.0
+    let settled = settle(&net.admin, Ok((version, once)));
+    let failure = settled.failure.expect("a running directory missed it");
+    assert!(
+        failure.contains("nothing else will bring it there"),
+        "{failure}"
     );
-    assert!(caught_up < Duration::from_secs(2), "{caught_up:?}");
+    assert!(failure.contains("wires policy push"), "{failure}");
+    assert!(
+        settled.note.contains("nothing but a publish brings it"),
+        "{}",
+        settled.note
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(d0.dir.version(), before, "nothing handed it on");
+    // `wires policy push`, once the admin can find it again.
+    net.admin_book.add_endpoint_info(d0.addr());
+    let pushed = net.publish(Retry::Every).await;
+    assert_eq!(pushed.failure, None, "{}", pushed.note);
     assert_eq!(
         d0.dir.snapshot().unwrap().held.signed,
         d1.dir.snapshot().unwrap().held.signed
@@ -384,7 +380,7 @@ async fn a_busy_directory_is_tried_again() {
         drop(full);
     });
     net.remove_alice();
-    // Only to the busy one, so no replica can hand it over meanwhile.
+    // Only to the busy one.
     let only = [net.dirs[0].node_id()];
     let report = net.publish_to(&only, PUBLISH_BUDGET).await;
     assert_eq!(report.delivered, only.to_vec(), "{report:?}");

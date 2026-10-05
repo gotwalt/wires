@@ -6,12 +6,13 @@
 //! by the admin's publish ([`publish_all`]) or [`Directory::accept`]; hosts
 //! are [`Follower`]s, or whole hosts ([`serve_until`]) on hermetic loopback.
 //!
-//! - [`an_edit_reaches_every_subscribed_host_within_2s_as_one_update`]: 2 s
-//!   after the publish is answered (the fan-out, not the admin's dial), and
-//!   what it costs each host, in frames and bytes.
-//! - [`a_host_that_missed_edits_catches_up_by_one_update_on_reconnect`]
-//! - [`an_update_that_does_not_apply_makes_the_host_take_the_whole_policy`]
-//! - [`an_update_this_host_already_holds_is_skipped_not_resynced`]
+//! - [`an_edit_reaches_every_subscribed_host_within_2s_as_the_whole_policy`]:
+//!   2 s after the publish is answered (the fan-out, not the admin's dial),
+//!   and what it costs each host, in frames and bytes (card 45: the whole
+//!   policy, every time).
+//! - [`a_host_that_missed_edits_catches_up_by_one_whole_policy_on_reconnect`]
+//! - [`a_directory_behind_the_host_is_passed_over`]
+//! - [`a_policy_this_host_already_holds_keeps_its_fresh_and_feeds_its_directory`]
 //! - [`with_every_directory_down_calls_fail_closed_until_one_is_back`]
 //! - [`a_node_banned_host_that_is_a_directory_gets_no_token`]
 //! - [`a_host_dropped_from_the_service_gets_no_token`]
@@ -170,7 +171,7 @@ impl World {
         .unwrap();
         let endpoint = self.bind(node).await;
         let router = Running::mount(Router::builder(endpoint.clone()), &dir).spawn();
-        let running = Running::start(Arc::clone(&dir), endpoint.clone());
+        let running = Running::start(Arc::clone(&dir));
         Dir {
             dir,
             endpoint,
@@ -194,7 +195,7 @@ impl World {
                 ks: Arc::clone(ks),
                 root,
                 freshness: Arc::clone(&freshness),
-                runs_directory: false,
+                directory: None,
                 stats: Arc::clone(&stats),
             }
             .run(),
@@ -436,13 +437,14 @@ impl Following {
         .unwrap_or_else(|_| panic!("never reached version {}", version.0));
     }
 
-    fn frames(&self) -> (u64, u64, u64, u64) {
+    /// Whole policies taken, bytes received, directories passed over for
+    /// being behind.
+    fn frames(&self) -> (u64, u64, u64) {
         let s = &self.stats;
         (
             s.wholes.load(Ordering::SeqCst),
-            s.updates.load(Ordering::SeqCst),
             s.bytes.load(Ordering::SeqCst),
-            s.resyncs.load(Ordering::SeqCst),
+            s.behind.load(Ordering::SeqCst),
         )
     }
 }
@@ -464,10 +466,10 @@ async fn eventually<T, F: std::future::Future<Output = Option<T>>>(
     .unwrap_or_else(|_| panic!("never: {what}"))
 }
 
-/// The admin's edit reaches both subscribed hosts within 2 s, each as one
-/// `policy_update` carrying only what changed, measured in frames and bytes.
+/// The admin's edit reaches both subscribed hosts within 2 s, each as the
+/// whole policy (card 45: no deltas), measured in frames and bytes.
 #[tokio::test]
-async fn an_edit_reaches_every_subscribed_host_within_2s_as_one_update() {
+async fn an_edit_reaches_every_subscribed_host_within_2s_as_the_whole_policy() {
     let w = World::new().await;
     let v1 = w.policy(1, Settings::default(), 20);
     let d = w.directory(0, &w.keystore(&w.dirs[0], &v1)).await;
@@ -506,24 +508,22 @@ async fn an_edit_reaches_every_subscribed_host_within_2s_as_one_update() {
         fan_out < Duration::from_secs(2),
         "the subscribed hosts took {fan_out:?} after the publish"
     );
-    for (h, before) in hosts.iter().zip(&before) {
-        let after = h.frames();
-        assert_eq!(after.0, before.0, "no whole policy was sent");
-        assert_eq!(after.1, before.1 + 1, "one policy_update");
-        let bytes = after.2 - before.2;
-        eprintln!("an edit (one ban) cost this host {bytes} bytes in one frame ({took:?})");
-        assert!(bytes < 3_000, "{bytes} bytes for one ban");
-    }
-    // The update is a delta: much smaller than the whole policy.
     let whole = library::SubFrame::Policy {
         policy: v2.clone(),
         fresh: d.dir.snapshot().unwrap().fresh.clone().unwrap(),
     }
     .encode()
     .unwrap()
-    .len();
-    eprintln!("the whole policy is {whole} bytes as a frame");
-    assert!(hosts[0].frames().2 - before[0].2 < whole as u64 / 2);
+    .len() as u64;
+    for (h, before) in hosts.iter().zip(&before) {
+        let after = h.frames();
+        assert_eq!(after.0, before.0 + 1, "one whole policy");
+        let bytes = after.1 - before.1;
+        eprintln!(
+            "an edit (one ban) cost this host {bytes} bytes ({took:?}); the policy is {whole}"
+        );
+        assert_eq!(bytes, whole, "the whole policy, in one frame");
+    }
     for h in hosts {
         h.task.abort();
     }
@@ -531,10 +531,10 @@ async fn an_edit_reaches_every_subscribed_host_within_2s_as_one_update() {
     d.stop().await;
 }
 
-/// A host whose subscription was down while two edits were made gets both
-/// in one `policy_update` when it subscribes again.
+/// A host whose subscription was down while two edits were made gets the
+/// newest whole policy, once, when it subscribes again.
 #[tokio::test]
-async fn a_host_that_missed_edits_catches_up_by_one_update_on_reconnect() {
+async fn a_host_that_missed_edits_catches_up_by_one_whole_policy_on_reconnect() {
     let w = World::new().await;
     let v1 = w.policy(1, Settings::default(), 1);
     let d = w.directory(0, &w.keystore(&w.dirs[0], &v1)).await;
@@ -552,52 +552,44 @@ async fn a_host_that_missed_edits_catches_up_by_one_update_on_reconnect() {
         .unwrap();
     let again = w.follower(0, &ks).await;
     again.until(StateVersion(3)).await;
-    let (wholes, updates, _, resyncs) = again.frames();
-    assert_eq!((wholes, updates, resyncs), (0, 1, 0));
+    let (wholes, _, behind) = again.frames();
+    assert_eq!((wholes, behind), (1, 0));
     again.task.abort();
     d.stop().await;
 }
 
-/// A host holding a copy the directory's delta doesn't apply to (here, a
-/// root-signed policy at the same version but other items) fails the
-/// update's hash check, and takes the whole policy instead.
+/// Card 45: a directory that missed a publish (nothing hands it on) is
+/// behind a host that holds the newer head: it can't vouch for that head, so
+/// the host passes it over and follows the next directory, which can.
 #[tokio::test]
-async fn an_update_that_does_not_apply_makes_the_host_take_the_whole_policy() {
+async fn a_directory_behind_the_host_is_passed_over() {
     let w = World::new().await;
     let v1 = w.policy(1, Settings::default(), 1);
-    let d = w.directory(0, &w.keystore(&w.dirs[0], &v1)).await;
-    d.dir
-        .accept(&w.policy(2, Settings::default(), 2), now_unix())
-        .unwrap();
-    // Another version 1: the delta from the directory's version 1 won't
-    // hash to version 2's head when applied to it.
-    let mut forked = Policy::new(w.root.node_id());
-    forked.version = StateVersion(1);
-    forked.not_after = i64::MAX;
-    forked.directories = w.dirs.iter().map(|d| d.node_id()).collect();
-    forked.ban(NodeIdentity::from_seed([7u8; 32]).node_id());
-    let forked = crate::testutil::signed_policy(&w.root, forked);
-    let h = w.follower(0, &w.keystore(&w.hosts[0], &forked)).await;
+    let v2 = w.policy(2, Settings::default(), 2);
+    let behind = w.directory(0, &w.keystore(&w.dirs[0], &v1)).await;
+    let current = w.directory(1, &w.keystore(&w.dirs[1], &v2)).await;
+    // The host holds version 2, and its head lists the lagging one first.
+    let h = w.follower(0, &w.keystore(&w.hosts[0], &v2)).await;
     h.until(StateVersion(2)).await;
-    let (wholes, updates, _, resyncs) = h.frames();
-    assert_eq!((wholes, updates, resyncs), (1, 1, 1));
-    let held = store::read(&h.ks, h.root).unwrap().unwrap();
-    assert_eq!(held.signed, w.last.lock().unwrap().clone().unwrap());
+    let (_, _, passed) = h.frames();
+    assert_eq!(passed, 1, "the lagging directory, once");
+    assert_eq!(behind.dir.version(), StateVersion(1), "still behind");
     h.task.abort();
-    d.stop().await;
+    behind.stop().await;
+    current.stop().await;
 }
 
 /// A host that is also a directory takes the admin's publish into its own
-/// `policy.json` (its directory mirrors what it accepts) before the
-/// directory it follows sends the same edit as an update from the version
-/// before. That update is already held: it is skipped, its `Fresh` kept,
-/// and nothing is resynced (it used to fail to apply, here on the ban the
-/// edit lifts, and fetch the whole policy).
+/// `policy.json` (through its directory) before the directory it follows
+/// sends the same policy. That policy is already held: its `Fresh` is kept.
+/// And one it doesn't hold yet, from the directory it follows, goes through
+/// its own directory, which then serves it (one copy per node, card 45).
 #[tokio::test]
-async fn an_update_this_host_already_holds_is_skipped_not_resynced() {
+async fn a_policy_this_host_already_holds_keeps_its_fresh_and_feeds_its_directory() {
     let w = World::new().await;
     let v1 = w.policy(1, Settings::default(), 1);
     let v2 = w.policy(2, Settings::default(), 0); // `wires restore`
+    let v3 = w.policy(3, Settings::default(), 3);
     let ks = w.keystore(&w.hosts[0], &v1);
     let root = w.root.node_id();
     let endpoint = w.bind(&w.hosts[0]).await;
@@ -605,29 +597,48 @@ async fn an_update_this_host_already_holds_is_skipped_not_resynced() {
         Arc::clone(&ks),
         Some(&store::read(&ks, root).unwrap().unwrap().signed.head),
     ));
+    let own =
+        Directory::open(w.hosts[0].duplicate(), root, Arc::clone(&ks), 8, now_unix()).unwrap();
     let follower = Follower {
         endpoint: endpoint.clone(),
         ks: Arc::clone(&ks),
         root,
         freshness: Arc::clone(&freshness),
-        runs_directory: true,
+        directory: Some(Arc::clone(&own)),
         stats: Arc::new(FollowStats::default()),
     };
     // Its own directory got there first.
     let now = now_unix();
-    assert!(store::adopt_if_newer(&ks, &v2, root, now).unwrap());
+    assert!(own.accept(&v2, now).unwrap());
     let fresh = library::Fresh::sign(&w.dirs[1], &v2.head, now, now + 300).unwrap();
-    let update = library::SubFrame::PolicyUpdate {
-        update: v2.update_from(&v1),
-        fresh,
-    };
-    follower.take(update, now).unwrap();
+    follower
+        .take(
+            library::SubFrame::Policy {
+                policy: v2.clone(),
+                fresh,
+            },
+            now,
+        )
+        .unwrap();
     let held = store::read(&ks, root).unwrap().unwrap();
     assert_eq!(held.signed, v2);
     assert!(
         freshness.vouched(&held.signed.head, w.hosts[0].node_id(), now),
-        "the update's Fresh vouches for the head it already holds"
+        "the Fresh vouches for the head it already holds"
     );
+    // A newer one, from the directory it follows: its directory takes it.
+    let fresh = library::Fresh::sign(&w.dirs[1], &v3.head, now, now + 300).unwrap();
+    follower
+        .take(
+            library::SubFrame::Policy {
+                policy: v3.clone(),
+                fresh,
+            },
+            now,
+        )
+        .unwrap();
+    assert_eq!(own.version(), StateVersion(3));
+    assert_eq!(store::read(&ks, root).unwrap().unwrap().signed, v3);
     endpoint.close().await;
 }
 
@@ -665,25 +676,30 @@ async fn with_every_directory_down_calls_fail_closed_until_one_is_back() {
     .await;
     assert!(refused.contains("no directory has vouched"), "{refused}");
     assert!(!refused.contains("denied"), "not a refusal: {refused}");
-    // The directory comes back (from directory.redb): calls go through again.
+    // The directory comes back (from its policy.json): calls go through again.
     let d = w.directory(0, &dir_ks).await;
     let out = eventually("a call after", || async { caller.call(&w).await.ok() }).await;
     assert_eq!(out, "hi\n");
     d.stop().await;
 }
 
-/// Card 49, the attack, end to end: host X (host 0) is also one of the two
-/// directories. The admin takes it out (`how`), the directory and host 1
-/// take the edit, and a caller whose view predates it still lists X. X
-/// keeps the old head and vouches for it itself; the honest directory's word
-/// for that head has lapsed. X is sent no `Hello` (no ID token) and no
-/// `Invoke`; the call reaches host 1.
+/// Card 49, the attack, end to end: host X (host 0) is also one of the
+/// directories. The admin takes it out (`how`), the two honest directories
+/// and host 1 take the edit, and a caller whose view predates it still lists
+/// X. X keeps the old head and vouches for it itself; the honest
+/// directories' words for that head have lapsed. X is sent no `Hello` (no
+/// ID token) and no `Invoke`; the call reaches host 1, after a refresh from
+/// the honest directories, which vouch for each other (card 45: a directory
+/// is told a caller's token only on another's word).
 async fn a_removed_host_that_is_a_directory_gets_nothing(how: Removal) {
     let w = World::new().await;
     let x = &w.hosts[0];
-    let both = |p: &mut Policy| p.directories = vec![w.dirs[0].node_id(), x.node_id()];
-    let v1 = w.policy_edited(1, quick(), 0, i64::MAX, both);
+    let all = |p: &mut Policy| {
+        p.directories = vec![w.dirs[0].node_id(), w.dirs[1].node_id(), x.node_id()]
+    };
+    let v1 = w.policy_edited(1, quick(), 0, i64::MAX, all);
     let d = w.directory(0, &w.keystore(&w.dirs[0], &v1)).await;
+    let d1 = w.directory(1, &w.keystore(&w.dirs[1], &v1)).await;
     let y_ks = w.keystore(&w.hosts[1], &v1);
     let (_y, _stop) = w.host(1, &y_ks).await;
     // The caller's view, vouched for by the directory then.
@@ -699,7 +715,7 @@ async fn a_removed_host_that_is_a_directory_gets_nothing(how: Removal) {
             p.ban(x_id);
         }
         Removal::FromTheService => {
-            both(p);
+            all(p);
             p.services
                 .get_mut(&service("echo"))
                 .unwrap()
@@ -708,10 +724,12 @@ async fn a_removed_host_that_is_a_directory_gets_nothing(how: Removal) {
         }
     });
     let admin = w.bind(&w.admin).await;
-    let report = publish_all(&admin, &v2, &[w.dirs[0].node_id()])
-        .await
-        .unwrap();
-    assert_eq!(report.delivered, vec![w.dirs[0].node_id()]);
+    let honest = [w.dirs[0].node_id(), w.dirs[1].node_id()];
+    let mut report = publish_all(&admin, &v2, &honest).await.unwrap();
+    report.delivered.sort();
+    let mut want = honest.to_vec();
+    want.sort();
+    assert_eq!(report.delivered, want);
     // Past the old word's `until`: the window is `fresh_secs`.
     tokio::time::sleep(Duration::from_millis(3_500)).await;
     assert!(!old_word.is_current(now_unix()));
@@ -747,6 +765,7 @@ async fn a_removed_host_that_is_a_directory_gets_nothing(how: Removal) {
     assert_eq!(heard.hellos(), 0, "X got no Hello, no ID token, no Invoke");
     admin.close().await;
     d.stop().await;
+    d1.stop().await;
 }
 
 /// How the admin takes host X out.
@@ -798,9 +817,9 @@ async fn a_one_machine_network_calls_its_host() {
 }
 
 /// A directory that serves a policy the host can't adopt (here, one that
-/// expired after the directory took it) is passed over: the host asks it
-/// for the whole policy once, then fails over to the next directory, which
-/// serves a good one, instead of asking the first again forever.
+/// expired after the directory took it) is passed over: the host fails over
+/// to the next directory, which serves a good one, instead of asking the
+/// first again forever.
 #[tokio::test]
 async fn a_directory_serving_an_unadoptable_policy_is_passed_over() {
     let w = World::new().await;
@@ -821,11 +840,6 @@ async fn a_directory_serving_an_unadoptable_policy_is_passed_over() {
     let h = w.follower(0, &w.keystore(&w.hosts[0], &v1)).await;
     h.until(StateVersion(2)).await;
     assert_eq!(store::read(&h.ks, h.root).unwrap().unwrap().signed, good);
-    let (_, _, _, resyncs) = h.frames();
-    assert_eq!(
-        resyncs, 2,
-        "the update, then the whole policy, from the first"
-    );
     h.task.abort();
     first.stop().await;
     second.stop().await;
@@ -860,7 +874,7 @@ async fn a_publish_from_a_stale_copy_is_not_delivered() {
     let report = publish_all(&admin, &other_v3, &only).await.unwrap();
     assert_eq!(report.newer, vec![(only[0], StateVersion(3))], "{report:?}");
     let failure =
-        crate::admin::propagate::Propagation::from_publish(Ok((StateVersion(3), report)), false)
+        crate::admin::propagate::Propagation::from_publish(Ok((StateVersion(3), report)), &[])
             .failure
             .expect("the edit fails");
     assert!(failure.contains("policy.json is stale"), "{failure}");

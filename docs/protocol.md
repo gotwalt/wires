@@ -40,9 +40,10 @@ machine by the root-signed policy naming its key, and a policy by the root's sig
 
 | Who | Is admitted by | Checked where |
 |---|---|---|
-| **a caller** (any node acting for a person: `wires call`, `wires mcp`, `wires inbox`, the gateway for each web user) | an **ID token** (§6) from an issuer the held policy trusts, with an accepted audience, unexpired, whose `nonce` binds it to the iroh-authenticated key; and `check_admitted`: the token carries a **verified email**, the policy bans neither that node nor that person (§3 *Bans*), and **some role in the policy matches the person** | the session gate (§5), an inbox fetch (§7), every directory request and subscription that isn't a named node's (§4) |
+| **a caller** (any node acting for a person: `wires call`, `wires mcp`, `wires inbox`, the gateway for each web user) | an **ID token** (§6) from an issuer the held policy trusts, with an accepted audience, unexpired, whose `nonce` binds it to the iroh-authenticated key; and `check_admitted`: the token carries a **verified email**, the policy bans neither that node nor that person (§3 *Bans*), and **some role in the policy matches the person** | the session gate (§5), an inbox fetch (§7), every directory request that isn't a named node's (§4) |
 | **a host**, to a caller | before the caller sends it anything: it shows a root-signed head no older than the caller's view and a current `Fresh` for that head from a directory **other than itself** (the head's one directory being itself is the exception), and the caller's view at that head lists its key for the service (§5 *The host's proof*); iroh authenticated that key | the caller, before its `Hello` (§5); again before stdin, against the `HelloAck` |
-| **a host or a directory**, to a directory | the held policy names its key: as a host of some service (`Policy::is_host`) or in the head's `directories`, and does not ban it | the directory's `policy` request and subscriptions (§4) |
+| **a directory**, to a caller | before the caller presents its ID token: its proof, by the host's rule above (a head no older than the caller's view that lists it, and a current `Fresh` for that head from another directory, or its own as the head's one directory while the network string names no other) | the caller, before its directory `hello` (§4) |
+| **a host or a directory**, to a directory | the held policy names its key: as a host of some service (`Policy::is_host`) or in the head's `directories`, and does not ban it | the directory's `policy` request and subscription (§4) |
 | **a directory**, to anyone | the root-signed head lists it, and its `Fresh` is signed by that key | `Fresh::verify` (§4); a caller takes a host's own `Fresh` only when the head lists that host as its one directory (`Fresh::vouches`, §5) |
 | **a policy** | it verifies under the root (`SignedPolicy::verify`), is fresh, and is newer than the one held | a directory's `publish`, every copy (`adopt_if_newer`, §3) |
 | **a host delivering a push**, to a caller's inbox | it hosts a service in the caller's view | the caller's `wires inbox --wait` (§7) |
@@ -116,22 +117,18 @@ SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kin
 - **An entry's `version`** is the policy version at which it last changed. An edit re-signs only
   the entries it changes (`Policy::sign_after` the stored policy); the others keep their signature
   and version. So a caller holding a subset of entries (its view) can check each one alone
-  against the root, and keep the newest version of each.
+  against the root.
 - **`SignedPolicy::verify(root)`**, the one check for a whole policy: the head's algorithm,
   format 5, the `fabric == root` pin and signature; the items are strictly in key order and hash to
   `items_hash` (`ItemsMismatch`); every service entry verifies on its own under the root, at a
   version no later than the head's; the head's `fresh_secs` is the settings item's; then
   `Policy::validate`. **`check_fresh(now)`**: `Expired`
   when `now > not_after`. An expired policy admits nobody until the admin signs a newer one.
-- **Updates** (`library/services/policy_update.rs`). `PolicyUpdate { head, changed: [Item],
-  removed: [ItemKey] }` moves a whole policy to a newer head: `new.update_from(&old)` computes it,
-  `old.apply(&update, root)` rebuilds the item set (held + changed − removed), recomputes the hash
-  and checks the new head's signature and each changed entry. Any mismatch (an item tampered with,
-  withheld or added, an older head) is an error, and the holder asks for the whole policy. A
-  **view** (`library/services/view.rs`) is `{head, entries: [SignedEntry]}`: the services a caller
-  may call, each verifying alone; `SignedPolicy::view_for(node, principal, query)` cuts it (empty
-  when the policy bans the node or the person, or no role matches), and `View::apply(ViewUpdate {head, changed:
-  [SignedEntry], removed: [ServiceName]}, root)` refuses an entry older than the one held.
+- **Views.** A **view** (`library/services/view.rs`) is `{head, entries: [SignedEntry]}`: the
+  services a caller may call, each verifying alone; `SignedPolicy::view_for(node, principal,
+  query)` cuts it (empty when the policy bans the node or the person, or no role matches).
+  **Policies and views always travel whole**: a node that holds an older one replaces it with the
+  newer one it is sent, and nothing is ever sent as a difference from what a node holds.
 - **`Policy::validate`** (run by `sign` and `verify`): no directory listed twice; every role has
   at least one matcher, and **every matcher names an issuer that has an `issuer` item**; every
   issuer is non-blank and accepts at least one non-blank audience; every role a service's `allow`
@@ -246,15 +243,14 @@ The admin commands and their flags are in [usage.md § Commands by role](usage.m
 Every edit takes `--policy-ttl`, and every edit but `init` ends with the publish in §4. `wires policy push` changes nothing:
 it re-publishes the stored policy to every directory.
 
-## 4. The directory: `wires/directory/2` and `wires/directory-sub/2`
+## 4. The directory: `wires/directory/3` and `wires/directory-sub/3`
 
 A **directory** is a node the head lists in `directories` (`wires/directory/`). It holds the newest
-policy, signs a freshness timestamp for it, takes a newer policy from any publisher, follows the
-other directories, and answers hosts and callers. **It never decides a call**: hosts decide from
-their own copy. But a caller tells a host nothing without a directory's current word for the head
-that host holds (§5 *The host's proof*), so with every directory down calls stop within
-`fresh_secs`. It is trusted for availability and freshness only; everything it serves is
-root-signed.
+policy, signs a freshness timestamp for it, takes a newer policy from any publisher, and answers
+hosts and callers. **It never decides a call**: hosts decide from their own copy. But a caller
+tells a host nothing without a directory's current word for the head that host holds (§5 *The
+host's proof*), so with every directory down calls stop within `fresh_secs`. It is trusted for
+availability and freshness only; everything it serves is root-signed.
 
 `wires serve` runs it on the same endpoint when the policy it holds at start lists its node, or,
 holding no policy yet, when its network string lists its node. `wires directory serve` runs it
@@ -282,32 +278,44 @@ held head doesn't list it signs none and answers `policy` and views with a refus
 directory signs only for the newest head it holds: that is what lets a `Fresh` say a head is
 current, and what a caller relies on before it tells a host anything (§5).
 
-**The store** (`directory.redb`, in the directory's keystore; redb):
-
-| Table | Key → value |
-|---|---|
-| `heads` | version → the signed head and its items' content-hash keys, in order (the last 16 kept) |
-| `items` | content hash (blake3 of the item's JSON) → the item (dropped when no kept head names it) |
-| `meta` | `version` (the newest head's) |
-
-One writer, many readers. A policy is stored only if it is strictly newer, in one transaction. A
-restart reloads the newest head and signs a new `Fresh` (a `Fresh` is kept in memory only; a beat
-writes nothing to disk). A directory whose newest head has expired signs no `Fresh`, admits nobody
-and answers every request with `this directory holds only an expired policy (version N); try
-again later`, until the admin publishes a newer one. When the node's own `policy.json` is
-newer (it fetched one as a host), the store is seeded from it.
+**The store** is the node's own `policy.json` (§3 *Monotonic copies*, §8): the newest policy and
+nothing else, no history. On a node that is both a host and a directory it is the one copy both
+decide and serve from. A `Fresh` is kept in memory only (a beat writes nothing to disk), and a
+restart reads `policy.json` back and signs a new one. A directory whose newest head has expired
+signs no `Fresh`, admits nobody and answers every request with `this directory holds only an
+expired policy (version N); try again later`, until the admin publishes a newer one.
 
 **Accepting a policy** (`Directory::accept`): `SignedPolicy::verify` under the root (§3), the head
-fresh, strictly newer than the held head. Then it is stored, adopted into the directory node's own
-`policy.json` (so a host that is also a directory decides under what it serves), a `Fresh` is
-signed for it, and subscribers are woken. An older or equal one changes nothing.
+fresh, strictly newer than the held head. Then it is adopted into `policy.json` (`adopt_if_newer`),
+a `Fresh` is signed for it, and subscribers are woken. An older or equal one changes nothing. A
+directory accepts from the admin's publish, and, on a node that is also a host, from that host's
+own following of another directory (below).
 
-**`wires/directory/2`.** Frames are a 4-byte length then canonical JSON tagged by `type`
+**`wires/directory/3`.** Frames are a 4-byte length then canonical JSON tagged by `type`
 (`library/directory/frames.rs`). Every request frame, the `hello` included, is at most 16 KiB;
 only a publish's `items` frame (at most 16 MiB) is larger, and it is read only after the head it
 belongs to verified. One request per connection: the dialer sends `hello {id_token?}` then one
 request, and gets one answer (5 s to dial, 10 s per frame).
 
+- **A caller's token goes only to a directory that has shown it is current**, by the rule a host
+  shows it by (§5 *The host's proof*). A dialer that will present an ID token opens with `open {}`
+  instead; the directory answers at once with `proof {proof}`, a `HostProof` (§5): its root-signed
+  head and the current `Fresh`es it holds for it (its own and, on a node that is also a host, the
+  ones that host holds, §4 *Freshness at the host*), and no entries. An empty directory, or one
+  holding only an expired policy or one that doesn't list it, answers `denied` instead. Then the
+  dialer sends `hello {id_token}` and its request. The caller (`wires/caller/view.rs`) asks every
+  directory it would ask for its proof at once, and checks each with `HostProof::check`, against
+  its view's head and the directory dialed (holding no view yet: the head verifies under the root
+  and hasn't expired, and some `Fresh` vouches for it): the head is no older than the view's (at
+  the same version, the same head), and a current `Fresh` signed by a directory **other than the
+  one dialed** vouches for it, unless the head lists exactly that one directory and the network
+  string names no other; and the head lists the directory dialed. The `Fresh`es it counts are the proof's, the ones its view holds, and the ones every other directory showed in
+  the same round, so two directories at one head vouch for each other. As the proofs arrive, it sends
+  its token and request to each directory whose proof checks out, one at a time, until one
+  answers with a view it takes. A directory whose proof doesn't check out is a dial failure: it was
+  sent `open` and nothing else. So a directory the admin removed, or one that missed the edit
+  that removed a host, is never told a caller's token once its words have lapsed. Hosts,
+  directories and the admin present no token, and open with `hello` at once.
 - **Admission first** (`Directory::admit`), under the held policy. The peer is **named** when the
   policy names its key as a host or a directory and doesn't ban it (a key, never a token); it is an
   admitted **caller** when its `id_token` verifies (§6: the held policy's `issuer` items and their
@@ -336,11 +344,9 @@ request, and gets one answer (5 s to dial, 10 s per frame).
   whole check.
 - `policy {have}`: the whole policy, **only for a named node** (anyone else hears `denied`: `the
   whole policy is for the network's hosts and directories; a caller asks for its view`): `current
-  {fresh}` when `have` is the newest (or newer than the directory's); `policy_update {update,
-  fresh}`, the `PolicyUpdate` from the head at `have` (`update_from` against the head kept in
-  `directory.redb`), when `have` is one of the 16 kept heads; else the whole `policy {policy,
-  fresh}` (`have` 0, too old, or unknown).
-- `view {have, query?, held?}` and `resolve {service}`: a caller's view, below.
+  {fresh}` when `have` is the newest (or newer than the directory's), else the whole `policy
+  {policy, fresh}`.
+- `view {query?}` and `resolve {service}`: a caller's view, below.
 
 **Views.** The directory cuts a view from the held policy for the principal the caller's
 `hello` token verified as (above), `SignedPolicy::view_for(caller, principal, query)`: the
@@ -349,73 +355,39 @@ person never gets this far: admission refused them (`NOT_ADMITTED`). A named nod
 principal gets the empty view. Nothing per user is stored, and a request is only
 traced: a view grants nothing, and the host decides every call.
 
-- `view {have, query: none, held?}`: `held` is the `ViewDigest` of the view the caller holds
-  (blake3 over `"wires/view-digest/v1\0"` ‖ the view's canonical JSON). With a verified principal
-  and a `held` that names exactly the view the directory would diff from: `current {fresh}` when
-  `have` is the newest and `held` is the view now; a `view_update {update, fresh}` (`ViewUpdate
-  {head, changed: [SignedEntry], removed: [ServiceName]}`, the principal's view at the kept head
-  `have` diffed against the view now) when `have` is one of the kept heads and `held` is the view
-  at it. Anything else gets the whole `view {view, fresh}`: no `held`, or one that doesn't match (a
-  view cut for another identity).
-- `view {have, query: q}`: the entries whose name or description contains `q` (ignoring ASCII
-  case), always a whole `view`.
+- `view {}`: the whole view, `view {view, fresh}`.
+- `view {query: q}`: the entries whose name or description contains `q` (ignoring ASCII case).
 - `resolve {service}`: a `view` holding that one service, or no entry (it doesn't exist, or the
   caller may not use it: the two are not told apart).
 
-A caller applies a `view_update` with `View::apply` (the head verifies and is not older; each
-changed entry verifies alone and is not older than the one held; removed names were held), and
-takes a `view` when it verifies (`View::verify`: the head, and each entry on its own under the
-root, at a version no later than the head's) and its `Fresh` vouches for its head. A directory can
-withhold an entry or serve a stale view (a `Fresh` bounds how stale); neither lets anyone call
-anything, since the host decides every call from its whole policy.
+A caller takes a `view` when it verifies (`View::verify`: the head, and each entry on its own
+under the root, at a version no later than the head's) and its `Fresh` vouches for its head. A
+directory can withhold an entry or serve a stale view (a `Fresh` bounds how stale); neither lets
+anyone call anything, since the host decides every call from its whole policy.
 
-**`wires/directory-sub/2`.** The dialer sends `hello`, then `subscribe {kind, have}`, where `kind`
-is `policy` (a host), `replica` (another directory) or `view` (a long-running caller). Admission is
-the `hello`'s, as above, except that a publisher is refused here (`NOT_ADMITTED`). **Two pools, so
-callers can't exhaust hosts' subscriptions:** at most 4,096 `policy` and `replica` subscribers
-(nodes the policy names), and, apart, at most 4,096 `view` subscribers (`wires directory serve
---max-subscribers N` sets both); within the view pool, at most 16 at once for one person (issuer
-and subject: the gateway holds one per web user from its one node, so the cap is per person, not
-per node). One more is refused with `denied` (`this directory's subscriber cap (N) is reached`, or
-`you have 16 view subscriptions open here already`).
+**`wires/directory-sub/3`: a host follows the policy.** The dialer sends `hello`, then `subscribe
+{have}` (the version it holds; 0: none). Only a **named** node may subscribe: an admitted caller
+hears the `denied` above (a caller asks for its view), anyone else `NOT_ADMITTED`, a publisher
+included. At most 4,096 subscribers at once (`wires directory serve --max-subscribers N`); one
+more hears `denied` (`this directory's subscriber cap (N) is reached`). The directory sends, at
+once and then on every change of what it holds (a new head, or a beat every
+`settings.beat_secs`):
 
-- **`policy`**, only from a named node (anyone else hears the `denied` above). The first frame
-  comes at once: `fresh {fresh}` when `have` is the newest, else what `policy {have}` would answer
-  (`policy_update {update, fresh}` from a kept head, or the whole `policy {policy, fresh}`). Then,
-  for every head the directory adopts (a publish, or a replica catching up), one `policy_update`
-  from the version the subscriber was last sent, and a `fresh` beat every `settings.beat_secs` in
-  between. A subscriber ahead of the directory gets nothing until the directory catches up.
-  Subscribers at one version share one encoded frame, so a publish costs the directory one diff per
-  version its subscribers hold, not one per subscriber. The stream ends with `denied` when the head
-  stops listing this node (it can no longer vouch), and when a head bans the subscriber
-  (`NOT_ADMITTED`) or no longer names it as a host or a directory (the refusal above).
-- **`replica`**, only from a node the held head lists as a directory: `policy {policy, fresh}`
-  when the held version is newer than `have`, else `fresh {fresh}`; then the same on every
-  change. It ends with `denied` if the subscriber stops being listed.
-- **`view`**, only from an admitted caller, for the principal its `hello`'s ID token verified as
-  when the subscription opens (`wires/directory/sub_view.rs`): the whole `view {view, fresh}`
-  first, whatever `have` says (the directory keeps nothing per subscriber, so it can't know which
-  view a `have` refers to); then, for every head it adopts, a `view_update {update, fresh}` against
-  the view it sent last, and a `fresh` beat in between. A subscriber that can't apply an update
-  subscribes again and takes the whole view. The stream ends with `denied`: when the head stops
-  listing this node; **when the ID token expires** (its `exp`: `your sign-in has expired; run
-  \`wires login\``; the client subscribes again with the token it holds then); and **when a head
-  it adopts no longer admits the subscriber** (`check_admitted`: the node or person banned, or no
-  role matches any more), after a `view_update` that empties its view, with `NOT_ADMITTED`.
-  `wires mcp`, each live gateway session and
-  `wires inbox --wait` hold one (`wires/caller/view.rs`): the first frame within 10 s, then each
-  within the held `Fresh`'s lifetime plus that again (at most 10 s) of slack, or the stream is
-  taken for dead; a `denied`, at once or ending the stream, moves it to the next directory at once,
-  and each round ends with a pause of 1 s, growing to 30 s while no directory serves.
+- `policy {policy, fresh}`, the whole policy, when its head is newer than the subscriber's `have`
+  and than the last policy it sent this subscriber;
+- else `fresh {fresh}`: its `Fresh` for its own head, even when the subscriber holds a newer one
+  (so a subscriber learns the directory is behind it, below).
 
-**Replicas.** Each directory subscribes to every other directory its head lists, as `replica`,
-reconnecting after a failure with a pause growing from 1 s to 30 s. A `policy` frame is taken when
-its head verifies under the root, its `Fresh` vouches for that head, and it is newer; then it is
-accepted as above. So a directory that missed a publish catches up from another: as soon as the
-other takes it when its subscription is open (tens of milliseconds on loopback), or when its
-subscription opens (a restarted directory subscribes as it starts, about a second with n0
-discovery), but up to 30 s later while it is in a reconnect pause. There is no consensus: one
-author, and "newer" is a version number.
+Every subscriber gets the same bytes for a head and its `Fresh`: each frame is encoded once, not
+once per subscriber. The stream ends with `denied` when the head stops listing this node (it can
+no longer vouch), and when a head bans the subscriber (`NOT_ADMITTED`) or no longer names it as a
+host or a directory (the refusal above).
+
+**There is no replication.** Directories don't follow each other. A directory that missed a publish
+(down for longer than the admin's retries, below) holds the policy before it until a publish
+reaches it: the admin's next edit, or `wires policy push`. A directory that is also a host takes a
+newer head sooner, from the directory its host follows (below), since both read one
+`policy.json`. There is no consensus: one author, and "newer" is a version number.
 
 **Publish (admin).** After every admin edit, and on `wires policy push`, the admin dials,
 concurrently, every directory the new head lists plus every directory the head before the edit
@@ -431,55 +403,55 @@ dropped), so a publish takes at most 30 s. Any other refusal is a decision, and 
 again. This covers a directory that has just restarted: it binds a new port, n0 discovery has no
 record of it for about 3 s, and a stale `hints` line costs a whole 5 s dial; each new dial looks
 the key up again. A directory never reached (the first run, below) is tried once, so an edit made
-before any directory runs doesn't wait; so is a directory the edit drops, which no one else will
-hand the edit to (the others refuse it as a replica once they hold it). Stderr says `policy
+before any directory runs doesn't wait; so is a directory the edit drops. Stderr says `policy
 version N: published to K of D directory(ies)`, naming each directory not reached, each that
-refused, and each the edit dropped that it didn't reach; when another took it, the line adds that
-hosts following a listed directory it missed decide under the policy before it until that one
-takes this one from a directory that did (a replica, below), and that `wires policy push`
-re-publishes it. **When D > 0 and K = 0 the command exits 1**, unless every directory missed is
-one the edit dropped: the new policy is stored on the admin and nowhere else. `wires policy push`
-re-publishes it. With no directory listed at all, the line says the policy is stored here and
-that `wires directory add` comes next, and nothing fails. Two exceptions:
+refused, and each the edit dropped that it didn't reach. When a directory the new head lists
+missed it, the line adds that hosts following that one decide under the policy before it until it
+takes this one, that nothing else hands it on, and that `wires policy push` re-publishes it.
+**The command exits 1 when a directory the new head lists, and that has taken a publish from this
+admin before, missed it**, whatever the others did: nothing else will bring that directory the
+edit, so the admin must, with `wires policy push` once it is back. The new policy is stored on the
+admin and in force at every directory that took it. With no directory listed at all, the line
+says the policy is stored here and that `wires directory add` comes next, and nothing fails. Two
+exceptions:
 
-- **The first run.** Until a directory the publish aims at has taken one from this admin
-  (`reached.json`, §8), reaching none is a note, and exits 0: `policy version N is stored here; no
-  directory has taken a publish yet. Once one runs (wires join <network>, then wires serve or wires
-  directory serve on its node), run wires policy push`. So starting a network (`init`, `directory
-  add`, edits, the directory's `join` and `serve`, `policy push`) errors nowhere; from the first
-  publish a directory takes, reaching none exits 1 as above.
+- **The first run.** A directory that has never taken a publish from this admin (`reached.json`,
+  §8) may not run yet: missing it fails nothing. When the publish reached no directory at all, the
+  line is a note, and exits 0: `policy version N is stored here; no directory has taken a publish
+  yet. Once one runs (wires join <network>, then wires serve or wires directory serve on its
+  node), run wires policy push`. So starting a network (`init`, `directory add`, edits, the
+  directory's `join` and `serve`, `policy push`) errors nowhere; a directory starts empty and takes
+  the policy from the first publish that reaches it.
 - **A stale copy.** A directory answering a newer version, or another head at the offered one,
   kept its own: this admin's `policy.json` is behind and the edit changed nothing there. The
   command exits 1 whatever the other directories did, saying to copy `policy.json` from any host
   or directory and make the edit again.
 
-**Following (hosts).** A running host subscribes as `policy` (`wires/host/follow.rs`) to the
+**Following (hosts).** A running host subscribes (`wires/host/follow.rs`) to the
 first directory its held head lists that answers, never itself, trying the one it last followed
 first and then the others in the head's order; the list is re-read from the held policy on every
 reconnect (the network string's while it holds none), so a directory the admin adds is followed
 without a restart. It takes each frame:
 
 - `policy {policy, fresh}`: the head verifies under the root, the `Fresh` vouches for it, and
-  `adopt_if_newer` takes it if newer;
-- `policy_update {update, fresh}`: `SignedPolicy::apply(update, root)` on the held copy (the
-  items' hash and the root's one signature on the new head, each changed entry's own signature),
-  the `Fresh` vouches for the new head, then `adopt_if_newer`;
-- `fresh {fresh}`: kept if it vouches for the held head (one for another version, from a directory
-  behind this host, is skipped).
+  `adopt_if_newer` takes it if newer (on a host that is also a directory, its directory accepts
+  it, which adopts it);
+- `fresh {fresh}`: kept if it vouches for the held head.
 
-Any frame it can't take (an update that doesn't apply, a policy that doesn't verify) makes it
-subscribe again at once with `have: 0` and take the whole policy; a second failure in a row moves
-it on: the next round, after the pause below, starts at the next directory. So does a `denied`, at once or ending
-the stream (not named, no longer a host, the directory no longer one, or busy): the next
-directory is tried at once. When the stream ends (the directory stopped, or sent nothing for two
-beats plus 10 s) it reconnects, pausing from 1 s up to the beat (at most 30 s) while none answers,
-so a host every directory refuses asks each at most once per pause. The subscription never holds up serving: a host restarted with `policy.json`
+A frame for a head **older** than the one it holds means the directory is behind (it missed a
+publish), and can't vouch for this host's head: the host passes it over for the next directory
+at once. So it does a policy it can't take (one that doesn't verify, or has expired) and a
+`denied`, at once or ending the stream (not named, no longer a host, the directory no longer one,
+or busy); the next round starts after the directory passed over. When the stream ends (the
+directory stopped, or sent nothing for two beats plus 10 s) it reconnects, pausing from 1 s up to
+the beat (at most 30 s) while none answers, so a host every directory refuses asks each at most
+once per pause. The subscription never holds up serving: a host restarted with `policy.json`
 decides from it before any directory answers (a caller talks to it once a directory's `Fresh` for
 that head is current, from `fresh.json` or the first frame). A host that is itself a directory
-keeps the `Fresh` its own directory signs **and** the one of the directory it follows (its replica
-loop keeps its copy in step with the others): a caller takes its own only when the head lists it
-as the one directory. A host that is the one directory signs its own at every beat. A host that
-the policy newly lists as a directory runs the directory mode only after a restart (it traces so).
+keeps the `Fresh` its own directory signs **and** the one of the directory it follows: a caller
+takes its own only when the head lists it as the one directory. A host that is the one directory
+signs its own at every beat. A host that the policy newly lists as a directory runs the directory
+mode only after a restart (it traces so).
 
 **Freshness at the host.** The host keeps, **per directory**, the newest `Fresh` that vouches
 for its held head (`FreshSet`: by version, then a current one over one that isn't current, then
@@ -496,8 +468,7 @@ when it holds none), in order, never itself, for `policy {have}`, and stops at t
 that settles it:
 
 - a `policy` whose `Fresh` verifies against **that** policy's head, and which `adopt_if_newer`
-  takes (verified, fresh, newer), is adopted; so is the held policy with a `policy_update`
-  applied, when its `Fresh` vouches for the result;
+  takes (verified, fresh, newer), is adopted;
 - `current {fresh}` counts only when the `Fresh` verifies against the **held** head and is current
   (`at` at most 60 s ahead, `now <= until`): this node is up to date.
 
@@ -514,8 +485,9 @@ unverifiable policy.
 **Callers keep their view current** (`wires/caller/view.rs`). A caller stores
 `view.json` (§8): the view, the newest `Fresh` per directory it has seen (from a directory, or in
 a host's proof: §5), when a directory last vouched for it, and the newest head version a host
-reported. The directories it asks are its view's head's (else
-the network string's), never itself. A node that holds the whole policy (the admin's, a host's, a
+reported. A refresh asks for the whole view (`view {}`) of the directories its view's head lists
+(else the network string's), never itself, in turn, and takes the first that verifies and is no
+older than the one held. A node that holds the whole policy (the admin's, a host's, a
 directory's) cuts its own view from it instead of asking.
 
 - **`wires login`** asks for the view under the new identity, forgetting the old one. `wires join`
@@ -528,30 +500,33 @@ directory's) cuts its own view from it instead of asking.
   its proof's to settle, §5). It learns of a newer policy in the call's handshake: a host's proof
   shows its head, and before the caller has spoken a newer one makes it refresh its view first
   (§5); `HelloAck` carries the host's head version, and when it is newer than the view's, the head
-  and the called service's entry (§5). The caller then refreshes its view after the call (`view
-  {have, held}`: an update from a kept head). A name the view doesn't hold is asked of a directory
-  with `resolve` (the one-entry view and the `Fresh` for its head) before the call fails. So on an
-  unchanged policy, within a day of the last refresh and `fresh_secs` of the last `Fresh` the caller
-  saw for its view, a call is the only connection.
+  and the called service's entry (§5). The caller then refreshes its view after the call. A name
+  the view doesn't hold is asked of a directory with `resolve` (the one-entry view and the `Fresh`
+  for its head) before the call fails. So on an unchanged policy, within a day of the last refresh
+  and `fresh_secs` of the last `Fresh` the caller saw for its view, a call is the only connection.
 - **"Stale" is a day, and it doesn't bound a removed host.** The directories a caller asks are
-  its view's head's. If none answers, the caller keeps its view (and a machine the admin removed
-  that was itself a directory the stale head lists can still answer `current` with a `Fresh` it
-  signs for that old head). That is not what keeps a removed host from being told anything: each
-  host shows its proof first, and a caller sends nothing until a current `Fresh` from a directory
-  other than that host vouches for the head the host holds, and, when the host shows a newer head,
-  until a refresh has brought the view up to that head (§5 *The host's proof*). So the window in
-  which a host the admin removed can still receive a caller's token on a call or an inbox fetch is
-  `fresh_secs` (15 minutes by default) after the edit reaches the directories, within the limits
-  §9 lists (a one-directory head, a removed directory vouching for others).
+  its view's head's, then the network string's. If none passes its proof check and answers, the
+  caller keeps its view. That is not what keeps a removed host or directory from being told
+  anything: each shows its proof first, and a caller sends nothing until a current `Fresh` from a
+  directory other than the one it dials vouches for the head that one holds (above, and §5 *The
+  host's proof*), and, when a host shows a newer head, until a refresh has brought the view up to
+  that head. So the window in which a machine the admin removed can still receive a caller's
+  token, on a call, an inbox fetch or a view refresh, is `fresh_secs` (15 minutes by default) after
+  the edit reaches the directories, within the limits §9 lists (a one-directory head, a removed
+  directory vouching for others).
 - **The directories asked are the view's head's, then the network string's** not among them, so a
-  view from before a directory was added still reaches it.
+  view from before a directory was added still reaches it. Each is held to the proof rule above;
+  the one asked need not be listed by the caller's head, but must be by the head it shows.
 - **`wires services`** reads `view.json`, refreshing first when it is stale (as above). When no
   directory gave it a view and one refused this node (`NOT_ADMITTED`), it lists nothing and says what the
   person can act on (§5 *The caller*).
-- **Long-running callers subscribe** (`view` above): `wires mcp` (and sends MCP
-  `notifications/tools/list_changed` when its tools change), one subscription per live gateway
-  session (with that user's ID token; the gateway holds no policy), and `wires inbox --wait`. They
-  keep `view.json` in step (the gateway's per-user views stay in memory).
+- **Long-running callers ask again.** `wires mcp` and `wires inbox --wait` refresh their view every
+  60 s while they run, keeping `view.json` in step (`wires mcp` sends MCP
+  `notifications/tools/list_changed` when its tools change), so a grant or a revocation reaches
+  them within a minute. The gateway keeps each web user's view in memory and asks for it again,
+  with that user's ID token (the gateway holds no policy), at the user's first request after 60 s,
+  and before it tells anything to a host whose proof shows a head newer than that view (§5 *The
+  caller*).
 
 ## 5. Sessions: `wires/session/2`
 
@@ -589,9 +564,9 @@ else) and sending `Proof` at once: that policy's head and every current `Fresh` 
   host**, unless the head lists exactly one directory and it is the dialed host). At the view's
   version, the view decides whether this host serves the service (its entry lists the host);
   at a newer one, the caller first refreshes its view from a directory (8 s): the refreshed view
-  must have **reached** the host's version (a lagging directory, or a removed one answering
-  `current` for the old head it still vouches for, leaves the view behind, and a view behind the
-  host's head never decides), and the proof must then check out at the same version; then the
+  must have **reached** the host's version (a lagging directory, or a removed one vouching for
+  the old head, is told nothing and leaves the view behind, §4; and a view behind the host's head
+  never decides), and the proof must then check out at the same version; then the
   same. A head listing only the dialed host counts as a one-machine network only while the
   network string names no other directory either. **Only then** does it send `Hello` and
   `Invoke`. Any failure (a refresh that fails or stays behind, no way to refresh, an unreadable
@@ -599,7 +574,7 @@ else) and sending `Proof` at once: that policy's head and every current `Fresh` 
   One flight more than the cached path.
 - **`Hello` and `Invoke` at once** (the cached path): the caller already holds, for its view's
   head, a current `Fresh` from a directory other than this host (one per directory, in
-  `view.json`: from its own refresh, its view subscription, or an earlier host's proof; a `Fresh`
+  `view.json`: from its own refresh, or an earlier host's or directory's proof; a `Fresh`
   vouches for a head, not a host, so one host's proof covers the others), and its view lists the
   host. It costs no extra flight. It still reads and checks the host's `Proof` before it sends a
   byte of stdin, its own words counting beside the host's: a head older than the view, or another
@@ -734,9 +709,12 @@ means nothing. A host that failed to answer this caller's dial in the last 60 s 
 timeout a minute, not one in every few calls. A name the view doesn't hold is asked
 of a directory (`resolve`); a name no directory resolves for this caller ends the call before any
 dial (exit 1), and so does one resolved under a head older than the view (or than one a host has
-shown it), whose `Fresh` would otherwise let the call speak at once. The gateway dials from each user's subscribed view, and neither refreshes it nor
-resolves a name (a host showing a newer head than that view is a dial failure there; the
-subscription catches up); the `Fresh`es hosts' proofs carry it keeps in memory, for all its users.
+shown it), whose `Fresh` would otherwise let the call speak at once (a directory holding such a
+head is not even asked: its proof is behind the view, §4). The gateway dials from each user's
+view, held in memory (§4 *Callers keep their view current*), and resolves no name; a host showing
+a newer head than that view makes it refresh the user's view first, as `wires call` does, and the
+refreshed view replaces the one it holds (a refresh that fails, or stays behind, is a dial failure
+there too). The `Fresh`es hosts' proofs carry it keeps in memory, for all its users.
 It moves to the next host **only when a dial fails** (10 s each), and a proof that doesn't check
 out before anything was sent is one; a host that has the call has decided. When a call is
 answered, the hosts tried before the one that answered are recorded in `unanswered.json` and the
@@ -787,9 +765,8 @@ before); `Argv` holds at most 256 arguments and 64 KiB.
 `wires login` runs OIDC (authorization code, PKCE, loopback redirect) with `nonce =
 base64url(blake3::derive_key("wires oidc-nonce v1", node_id))`, verifies the token locally, and
 stores it in `idp-token.jwt`. Nothing is published. The token travels in the session `Hello`, the
-inbox fetch's `hello` (§7) and the directory `hello` (§4). A host gets it only once its proof
-checked out (§5 *The host's proof*, within the limits of §9); a directory gets it in the `hello`
-before it has proved anything (§9; card 45 closes that). **It is the only credential a caller
+inbox fetch's `hello` (§7) and the directory `hello` (§4), and a host or a directory gets it only
+once its proof checked out (§5 *The host's proof*, §4; within the limits of §9). **It is the only credential a caller
 presents**: it is what admits the caller (§2).
 
 A host verifies it against the issuer's JWKS under the trust of the policy it decides under: the
@@ -833,10 +810,11 @@ key); it may, or hand it to a token exchange. What that hands over:
 credential of its own: it joins with the network string (`wires join <network>`), asks the IdP for
 each web user's ID token with `nonce = for_node(gateway)`, and presents that user's token in the
 `Hello` of each call it makes for them. Nothing on the wire changes; the host sees a node
-presenting a token bound to it. The gateway holds no policy: for each live session it
-subscribes to that user's **view**, presenting the user's own ID token to a directory, which
-verifies it and cuts the view (§4 *Views*); so it offers a user only services that a role admits
-by that user's own verified principal, and a grant or revocation applies to their next request.
+presenting a token bound to it. The gateway holds no policy: it asks a directory for each web
+user's **view**, presenting the user's own ID token (only to a directory whose proof checked out,
+§4), which verifies it and cuts the view (§4 *Views*), and asks again at the user's first request
+after 60 s; so it offers a user only services that a role admits by that user's own verified
+principal, and a grant or revocation applies to their requests within a minute.
 A web user the network doesn't admit is refused at sign-in (`access_denied` at the OAuth
 callback, HTTP 403 at `/mcp`: `not admitted to this network: no role in this network matches this
 account, or it was removed: ask your admin`; the email is left out because the text returns to the
@@ -856,7 +834,7 @@ most 64 KiB. Two ways a message is delivered:
 
 - **Direct:** the host dials the recipient (3 s budget) and opens with `hello {}` (a host acts for
   no person). A running `wires inbox --wait` serves the inbox ALPN and accepts `deliver` only from a
-  node that **hosts a service in its view** (it follows its view by subscription while it
+  node that **hosts a service in its view** (it refreshes its view every 60 s while it
   waits); any other dialer hears only `NOT_ADMITTED` (§2; the reason is traced,
   throttled).
 - **Fetch:** `wires inbox` dials the hosts of every service in its view. **The host speaks first**,
@@ -927,11 +905,10 @@ reaches `wires mcp` and the gateway.
 | `reached.json` | 0600 | admin | the directories that have taken a publish from this admin: until one a publish aims at has, reaching none is the first run, not a failure; a publish tries one of these again when it could not dial it (§4) |
 | `labels.json` | 0600 | admin | label → node id (§3 *Labels*); never signed, never sent |
 | `network.json` | 0600 | every joined node but the admin | the network string `join` or `login` stored (§2): the root, up to two directories, the login settings |
-| `policy.json` (+ `.lock`) | 0600 | admin, host, directory | the newest verified signed policy (§3); **a caller holds none** |
-| `view.json` | 0600 | caller (any node that calls) | its view: the head, the root-signed entries it may call, the newest `Fresh` per directory it has seen (from a directory or a host's proof, §5), when a directory last vouched, the newest head a host reported (§4 *Views*) |
+| `policy.json` (+ `.lock`) | 0600 | admin, host, directory | the newest verified signed policy (§3), and a directory's whole store (§4); **a caller holds none** |
+| `view.json` | 0600 | caller (any node that calls) | its view: the head, the root-signed entries it may call, the newest `Fresh` per directory it has seen (from a directory, or a host's or directory's proof, §4–5), when a directory last vouched, the newest head a host reported (§4 *Views*) |
 | `login-client.json` | 0600 | admin | which trusted IdP the network string names, and each client's public secret; never signed, never published |
 | `fresh.json` | 0600 | host | the newest `Fresh` per directory for the held head, a JSON list: what it shows callers first (§4 *Freshness at the host*) |
-| `directory.redb` | 0600 | directory | the directory's heads and items (§4) |
 | `idp-token.jwt`, `idp-refresh-token` | 0600 | caller | from `wires login` |
 | `unanswered.json` | 0600 | caller | host → when it last failed to answer this caller's dial; a host there under 60 s goes last (§5) |
 | `hints` | — (the operator's; wires never writes it) | any node | optional local dial hints (below) |
@@ -967,7 +944,7 @@ to `run/hint`. A hint only says where to try; iroh still authenticates the key.
 Every file wires writes above is written atomically: a temporary file created `O_EXCL` with mode
 0600, then renamed over the target (a seed is created `O_EXCL` 0600 in place, and never
 overwritten). A file with no listed mode is 0600. A keystore directory wires creates is 0700 (an
-existing one is left as it is). `directory.redb` is redb's own file, created 0600.
+existing one is left as it is).
 
 The environment is the one way to point `wires` at another keystore (`$WIRES_HOME`, else
 `$XDG_CONFIG_HOME/wires`, else `~/.config/wires`). A caller's commands (`login`, `services`,
@@ -1006,7 +983,11 @@ ones that bound this spec:
 - **Calls depend on the directories** (card 49): a caller sends a host nothing without a current
   `Fresh` from a directory other than that host, so with every directory down, or a host cut off
   from them, calls to it stop within `fresh_secs` (15 minutes by default). Fail closed is the
-  trade for the removed-host window below.
+  trade for the removed-host window below. Refreshing a view is held to the same rule: a caller
+  sends a directory its token only on a current `Fresh` from another directory (or when the head
+  lists that one alone and the network string names no other), so with only one of several
+  directories up, callers keep the views they
+  hold, and the cached words in them lapse within `fresh_secs`.
 - A caller holds only its view, but hosts and directories hold the whole policy (roles,
   services, host ids, bans, issuers, directories), and a directory sees who asks for which view
   (it only traces the requests). A directory can withhold an entry from a view, or serve a
@@ -1037,18 +1018,20 @@ ones that bound this spec:
   lagging honest one, can't move a caller's view backwards (a view is never replaced by an older
   one, and a refresh that stays behind the host's head decides nothing), but it can keep a stale
   view in place.
-- **Directories are told the token before they prove anything.** A view refresh or `resolve` sends
-  the caller's ID token in the directory `hello` (§4), so a removed directory still in a stale
-  view's head receives stale callers' tokens. [Card 45](board/backlog/45-trim-policy-sync.md)
-  makes directories prove themselves first, as hosts do.
+- **Directories are held to the hosts' rule** (card 45): a view refresh or `resolve` sends a
+  directory the caller's ID token only after its proof checks out (§4), so a removed or lagging
+  directory gets no token once its words have lapsed, with the same limits as hosts (the
+  one-directory head and the removed directory vouching for others, above).
 - **`wires inbox --wait` takes deliveries without a proof**: a host that delivers directly is
   admitted because it hosts a service in the receiver's view, so a removed host still in a stale
   view can push to it (no token goes to the host that way).
 - A host follows one directory, and that directory's `Fresh` is what says its copy is current. A
   directory machine the admin removed can ignore the publish and keep signing a `Fresh` for the old
   head (which still lists it): the hosts following it keep that head, vouched for, until its
-  `not_after` (above). An honest directory that missed a publish does the same until its replica
-  catches up.
+  `not_after` (above). An honest directory that missed a publish does the same until a publish
+  reaches it (directories don't replicate, §4), though a host holding a newer head than its
+  directory passes that one over. The admin hears of the miss (the edit exits 1) and re-publishes
+  with `wires policy push`.
 - A host knows a caller's identity only once the caller presented its token to that host.
 - **Hosts share no state.** Calls to a service spread at random across its hosts, so a service
   that keeps state between calls (in memory, or on its machine's disk) answers from whichever host

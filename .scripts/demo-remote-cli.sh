@@ -13,10 +13,10 @@
 #                Two hosts implement it: a caller never names either. Both
 #                are also the network's directories (`wires directory add`):
 #                `serve` runs the directory too, which holds the signed
-#                policy the admin publishes; each directory follows the
-#                other (a replica subscription: an edit either one takes
-#                reaches the other within a second), and callers fetch their
-#                views from them. Both start empty, holding no
+#                policy the admin publishes (each host follows the other's
+#                directory, so each holds the other's word too), and
+#                callers fetch their views from them, once one shows the
+#                other's word for its policy. Both start empty, holding no
 #                policy, and take the admin's first `wires policy push`.
 #                Two, because step 7 stops the workbench and step 8's
 #                `wires remove` must still reach a directory.

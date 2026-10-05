@@ -8,8 +8,8 @@
 //! node back.
 //!
 //! Hosts, directories and the admin hold the whole policy; a caller holds
-//! only its view (`view.json`, [`crate::caller::view`], card 37). A directory keeps its own copy in
-//! `directory.redb` ([`crate::directory`]).
+//! only its view (`view.json`, [`crate::caller::view`], card 37). On a
+//! directory this file is its whole store ([`crate::directory`]).
 
 use anyhow::{Context, Result, bail};
 use library::{NodeId, Policy, SignedPolicy, StateVersion};

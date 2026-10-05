@@ -18,9 +18,9 @@
 //! `403` (DNS-rebinding protection). No valid bearer token is `401` with the
 //! [`challenge`].
 //!
-//! The tool list is computed per request from the user's view (card 37), which
-//! the gateway follows by subscription, so an admin's change applies
-//! to the next request.
+//! The tool list is computed per request from the user's view (card 37),
+//! which the gateway asks a directory for again at the user's first request
+//! after a minute, so an admin's change applies within a minute.
 
 use std::sync::Arc;
 
@@ -287,7 +287,7 @@ pub(crate) async fn post<B: Backend>(
         Era::Modern => (true, None),
         Era::Legacy(v) => (false, v),
     };
-    let mut server = McpServer::new(tools, gw.backend.caller(session.id_token.clone(), view))
+    let mut server = McpServer::new(tools, gw.backend.caller(&session, view))
         .with_negotiated(negotiated)
         .with_redacted_failures();
     let Some(reply) = server.handle(msg).await else {

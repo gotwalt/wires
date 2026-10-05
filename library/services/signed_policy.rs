@@ -8,9 +8,8 @@
 //! and a directory can't forge, drop or mix items. Each service item is also
 //! a [`SignedEntry`] with its own root signature, so a caller can hold just
 //! the services it may use (its [`View`], cut here by
-//! [`view_for`](SignedPolicy::view_for)) and check each one alone. Hosts
-//! follow the policy by [`PolicyUpdate`](crate::PolicyUpdate)s
-//! ([`SignedPolicy::apply`]).
+//! [`view_for`](SignedPolicy::view_for)) and check each one alone. Both
+//! travel whole: a node replaces its copy with a newer one.
 //!
 //! [`Policy`] is typed maps, so an edit can't produce two
 //! items with one key or a second settings item; [`Policy::items`] flattens

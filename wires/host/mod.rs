@@ -19,9 +19,8 @@
 //! - [`native`] — services an app implements in-process (card 33): the
 //!   public [`Service`](native::Service) trait and what a handler gets.
 //! - [`embed`] — the public [`Host`](embed::Host) an app builds and serves.
-//! - [`follow`] — the host's `policy` subscription to a directory: the whole
-//!   policy once, then each edit as a delta, and a `Fresh` every beat
-//!   (card 36c).
+//! - [`follow`] — the host's subscription to a directory: the whole policy
+//!   per edit (card 45), and a `Fresh` every beat.
 //! - [`freshness`] — the newest `Fresh` per directory for the held head
 //!   (`fresh.json`): what the host shows a caller first (card 49).
 //! - [`identity`] — the ID tokens callers presented, verified and indexed.
