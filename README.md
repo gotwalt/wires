@@ -134,10 +134,15 @@ signed version, published by key to the network's directories. Hosts follow
 a directory and hold the whole policy. An agent's machine holds only its
 view: the services its person may call.
 
-**A call.** `wires call` looks the service up in its view, dials one of its
-hosts by key, and sends the caller's ID token in the first message. The ID
-token is bound to the caller's key, so it is useless from any other machine.
-The host verifies the IdP's signature itself, checks its own copy of the
+**A call.** `wires call` looks the service up in its view and dials one of
+its hosts by key. The caller tells the host nothing until it holds a word,
+signed in the last 15 minutes by a directory other than that host, that the
+host's copy of the policy is current. The host shows its words first; a
+caller that already holds one (from its view, or an earlier call) doesn't
+wait for them. So a host the admin removed is told nothing once the last
+word for the old policy lapses. Then the caller sends its ID token, which is
+bound to the caller's key, so it is useless from any other machine. The
+host verifies the IdP's signature itself, checks its own copy of the
 policy, and runs the command. There is no auth server on the call path. A
 refusal is exit 77 with nothing on stdout. If a service has several hosts,
 each call goes to one of them at random, and on to the next if that one
@@ -284,17 +289,22 @@ output, and nothing else records calls.
 - **Hosts and directories hold the whole policy** (roles, services, host
   keys, removals). A caller holds only its view, but a directory sees who
   asks for which view.
-- **A directory must be running** to change the policy, remove someone or
-  fetch a caller's view (at sign-in, and once the view is a day old). Calls
-  don't need one: each host decides from its own copy.
+- **Calls need a directory.** A caller sends a host nothing without a word
+  from a directory other than that host, signed in the last 15 minutes
+  (`fresh_secs`), that the host's policy is current. With every directory down, calls stop
+  within 15 minutes and fail with exit 1. A directory must also be running to
+  change the policy, remove someone or fetch a caller's view.
+- **Removing a host takes up to 15 minutes.** A host the admin took off a
+  service can still receive the ID token and arguments of a caller whose view
+  is older than the edit, until the last word a directory signed for the old
+  policy lapses; a directory that missed the edit keeps vouching for the old
+  policy until `wires policy push` reaches it. In a one-machine network (one workbench is host and
+  directory) the machine's own word counts, so removing it holds only at the
+  policy's expiry; a second directory makes removal hold for callers that
+  know of it.
 - **The policy expires** 90 days after the last edit by default, and nothing
   renews it on its own. Removals don't expire; they stay until `wires
   restore`.
-- **A caller dials from the view it holds.** A host the admin took off a
-  service can still be dialed by callers whose view is stale, and receives
-  their ID token and arguments. `wires call` and `wires inbox` refresh a
-  view older than a day when a directory answers, but the hard bound is the
-  policy's expiry (90 days by default).
 - **Callbacks go to a caller's key**, not yet only to the caller that asked
   ([card 31](docs/board/backlog/31-inbox-delivery.md)).
 - **Only Google has been tested** as the IdP. The web gateway listens over

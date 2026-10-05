@@ -18,9 +18,11 @@ What's covered:
   doctests for node identity, the network string and its login settings,
   admission (`check_admitted`: node and person bans, a verified email, a
   role that matches), the signed policy
-  (head, items, root-signed service entries, bans, policy updates and their
-  `apply`, caller views, `Fresh`), roles, `authorize`, directory and session
-  frames, invocations, IdP claims and push frames.
+  (head, items, root-signed service entries, bans, caller views, `Fresh`
+  and its lifetime cap, the per-directory `FreshSet`), the host's proof
+  (`HostProof::check`: who may vouch, the one-directory case), roles,
+  `authorize`, directory and session frames, invocations, IdP claims and
+  push frames.
 - **`wires`** — each role's command functions, the keystore (round-trips,
   file modes, `serve`'s `--node-seed` → `--node-seed-file` → keystore
   precedence), the session transport over in-memory pipes and over **real loopback QUIC** (two iroh
@@ -34,20 +36,26 @@ What's covered:
   `role set`, `directory add`, `service add`, `network`, `join`, `serve`,
   `policy push`, `login <network>`, `services`, `call`), then removal by
   person from a second machine, by node, and `restore` (`e2e/first_run.rs`);
-  hosts following a directory by subscription and the `lenient` / `strict`
-  freshness rule (`e2e/follow.rs`); callers' views: what a caller's
-  keystore holds, a grant or revocation reaching a running `wires mcp`,
-  `resolve` (`e2e/views.rs`); the web gateway's OAuth and MCP paths
+  hosts following a directory and taking each edit as the whole policy, and
+  the host's proof: a removed host, or one dropped from the service, sent
+  no token; calls failing closed with every directory down and working
+  again once one is back; a one-machine network calling its host
+  (`e2e/follow.rs`); a directory that missed an edit holding the old one
+  while the edit exits 1 (`e2e/restart.rs`); callers' views: what a
+  caller's keystore holds, a grant or revocation reaching a running `wires
+  mcp` by its poll, `resolve`, a removed or lagging directory told no token
+  (`e2e/views.rs`); the web gateway's OAuth and MCP paths
   (`e2e/gateway.rs`); and an embedded host serving the native `kv` example
   (`e2e/native.rs`). `directory/tests.rs` covers the directory over
   loopback: the admin publishing to it and dialing no host, the first
   directory starting empty and taking the first publish, who it admits (a
   node the policy names, or a caller whose ID token verifies and whom a role
-  matches), its two subscription pools and the per-person cap on view
-  subscriptions, a view subscription ending at its token's expiry, hosts
-  fetching the whole policy and callers their views, a caller refused the
-  whole policy, a restart from `directory.redb`, refusing tampered, mixed
-  and older policies and a stranger's `Fresh`, catching up from a replica.
+  matches), only hosts and directories subscribing, its proof shown before
+  a caller presents a token, hosts fetching the whole policy and callers
+  their views, a caller refused the whole policy, a restart serving the
+  same head with a new `Fresh`, refusing tampered, mixed and older policies
+  and a stranger's `Fresh`, and a directory that missed a publish staying
+  behind until the next.
 - **Help text** — `help_snapshots.rs` holds every command's `--help` and
   `--help-all`, the MCP `instructions` and the key error messages as files
   in `wires/snapshots/`; after an intended change, `WIRES_BLESS=1 cargo test

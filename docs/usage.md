@@ -33,7 +33,7 @@ every role matcher names its issuer.
 | **Which host** | The policy's `hosts` for the service. Only the admin binds a name to a host. | The caller (it dials only the hosts the service's root-signed entry lists) and the host (it refuses to start, or to serve, a name not assigned to it). |
 | **Reach** | The host's node key. Callers dial a key (iroh: n0 discovery, or a local `hints` file); the host binds UDP for QUIC and has no TCP listener. | iroh authenticates the key. Any key may connect; it is refused at its first message unless its token verifies. |
 | **Push** | The host dials the caller's key, or queues for the caller's `wires inbox` fetch. A service pushes only through its call's capability, to that call's caller. | The host, at send, delivery and fetch: admitted (not removed, a role matches), and in a `push.allow` role. |
-| **Removal** | A person ban or a node ban in a new policy, published to the directories; hosts follow a directory's subscription. | Each host that has the new policy, on the removed person's or node's next call or fetch there. |
+| **Removal** | A person ban or a node ban in a new policy, published to the directories; each host follows a directory, which sends it each new policy whole. | Each host that has the new policy, on the removed person's or node's next call or fetch there. |
 
 Nothing is broadcast. **A caller holds only its view**: the root-signed
 entries of the services its verified person may call. It holds no role, no
@@ -103,8 +103,9 @@ eyJkaXJlY3RvcmllcyI6WyI2MzM2OTAzOTM4…
 
 No directory has taken a publish from this admin yet, so each edit says so
 and succeeds: the policy is stored on the admin until a directory runs.
-From the first publish a directory takes, an edit that reaches none exits 1
-(`wires policy push` re-publishes it).
+Once a directory has taken a publish, an edit that misses it exits 1, even
+when another directory took the edit: nothing else brings that directory the
+edit, so `wires policy push` re-publishes it once it is back.
 
 **3. The hosts join and serve; the admin publishes once.** `host.json` says
 only how each service runs here. A command is an argv, exec'd directly and
@@ -309,14 +310,25 @@ wires: denied by host: not admitted to this network: no role in this network mat
 A person ban holds on every machine that person signs in from. Each host
 applies it from the moment it holds the new policy, with no restart: at once
 here, since both hosts are directories; a host that isn't one follows a
-directory's subscription and has it within a second. A push to her is
+directory, which sends it the new policy as soon as it takes the publish. A push to her is
 refused at send too, and what a host had queued for her is dropped at her
 next fetch. A directory now refuses her a view, but the view her machine
 already holds stays until it is refreshed, so her own `wires services` can
 still list orders-db; every host refuses her either way. `wires restore
 alice@example.com` lifts the ban (policy version 8), and her next call
 runs. `wires remove spare` would ban the node instead and drop it from every
-service's hosts and from the directories.
+service's hosts and from the directories; callers would tell it nothing once
+the last word the workbench signed for the old policy lapsed (15 minutes at
+most), provided every directory took the edit. That takes a second directory: in a one-machine network, where one
+workbench is both host and directory, callers take that machine's own word,
+so removing it holds only at the policy's expiry
+([Known trade-offs](#known-trade-offs)). To grow one into two, start the new
+directory and run `wires policy push` right after `wires directory add`:
+until the new one vouches, the first machine can vouch only for itself under
+a policy that lists two directories, and calls fail closed within 15
+minutes. Two directories that are also the
+only hosts, as here, have a cost too: with one down, calls to the other stop
+within 15 minutes, which a third directory avoids.
 
 Run it yourself:
 
@@ -398,7 +410,7 @@ handler gets beyond a CLI is a warm process (state kept across calls) and
 the verified caller as a value: `call.principal()` (what a child gets as
 `WIRES_CALLER`), `call.id_token()` (`WIRES_ID_TOKEN`), `call.role()`,
 `call.caller()` (the node id) and `call.args()`. Details and limits are in
-[protocol.md §5](protocol.md#5-sessions-wiressession1).
+[protocol.md §5](protocol.md#5-sessions-wiressession2).
 
 An embedded host is a node like any other, with a keystore directory of its
 own that the app names (it never reads `$WIRES_HOME`):
@@ -514,8 +526,9 @@ zero TCP listeners and two UDP sockets.
 
 **One signed policy, checked locally.** The trusted IdPs, the roles, the
 services and the bans are one root-signed, versioned policy. Directories hold
-it and vouch for its freshness; hosts keep the whole policy, and each caller
-keeps its view. Hosts decide every call from their copy, re-read per
+it and vouch for its freshness; hosts keep the whole policy and show that
+word to each caller before it sends anything, and each caller keeps its
+view. Hosts decide every call from their copy, re-read per
 connection, with no round trip to an auth server or a directory. A node never
 accepts an older version, so a ban sticks.
 
@@ -609,16 +622,32 @@ What wires does not do, or does with a cost, as built:
   traces the requests). It can withhold an entry or serve a stale view (a
   signed freshness timestamp bounds how stale), which makes a caller miss a
   service, never reach one it may not use: the host decides every call.
-- **A removed host still sees a stale caller's token and argv.** A caller
-  sends its ID token and arguments with its `Hello`, and stops before stdin
-  only once the host's handshake shows a newer policy whose entry no longer
-  lists that host. A caller dials from the view it holds, so a machine
-  removed from a service can still be dialed by callers whose view
-  predates the removal. `wires call` and `wires inbox` refresh a view older
-  than a day when a directory answers; the hard bound is the policy's expiry
-  (90 days by default), because with no directory reachable, or when the
-  removed machine was itself a directory the old policy lists, the caller
-  keeps the view it has.
+- **A removed host can be told a call for up to 15 minutes.** A caller
+  dials from the view it holds, so a machine removed from a service is still
+  in the views of callers that haven't refreshed. A caller tells a host
+  nothing without a word from a directory other than that host that the
+  host's policy is current (the host shows its words first; a caller may
+  already hold one), good for `fresh_secs` (15 minutes by default); an honest
+  directory signs only for the newest policy, so once the edit reaches the
+  directories a removed host has nothing to show within that window. Until
+  then, a caller holding a word for the old policy can still send it the ID
+  token and arguments. The edit must reach every directory: one that missed
+  it keeps vouching for the old policy, so a removed host can show its word,
+  and callers still on the old policy send it their token until `wires
+  policy push` reaches that directory.
+- **A one-machine network trusts its machine's own word.** When the
+  policy lists one directory and it is the host being dialed (the first run:
+  one workbench is both), there is no other directory to ask, so removing
+  that machine holds only at the policy's expiry (90 days by default). Run a
+  second directory (`wires directory add`, then give callers the new
+  `wires network` string) to make removal hold within `fresh_secs`. Start
+  the new directory and run `wires policy push` promptly after `wires
+  directory add`: until it vouches, the first machine can vouch only for
+  itself under a policy that lists two directories, and calls fail closed
+  within 15 minutes. A
+  directory machine the admin removed can still sign words for older
+  policies that list it, so it can vouch for another removed host to a
+  caller whose view is that old ([protocol.md §9](protocol.md#9-known-limits)).
 - **A stranger costs a token check.** Any key can connect and make a host or
   directory verify one ID token (keys are fetched only for a trusted issuer,
   and refetched at most once per issuer per rate-limit window; a failed
@@ -636,20 +665,36 @@ What wires does not do, or does with a cost, as built:
   no caller dials from one. Any admin edit signs a fresh one (never with an
   earlier expiry than the one it replaces).
 - **The admin is a one-shot command.** It publishes each edit to the
-  directories only. An edit that reaches none exits 1 (until a directory has
-  first taken a publish, it is a note); `wires policy push` re-publishes it.
-  Hosts follow a directory's subscription and have each edit within a
-  second; so do `wires mcp`, gateway sessions and `wires inbox --wait`, for
-  their views. A one-shot `wires call` learns of an edit in its next call's
-  handshake and refreshes its view then. A refusal by a host also marks
-  the view as behind, so the next `wires services` or `wires call`
-  refreshes it first.
-- **With every directory down, hosts keep deciding** from their copy under
-  the default `lenient` freshness, and say so in their trace; edits and bans
-  don't spread until a directory is back. Under `wires policy settings
-  --freshness strict` they refuse every call once the last directory's
-  timestamp lapses (15 minutes by default), so a ban is honoured everywhere
-  within that time or nothing is served.
+  directories only, retrying for about 15 seconds. An edit that misses a
+  directory that has taken a publish before exits 1, even when another
+  directory took it: directories don't replicate, so hosts following the
+  one that missed it decide under the old policy, and it keeps vouching for
+  that policy (so a removed host can still be called by callers on the old
+  policy), until `wires policy push` re-publishes it. After a missed
+  publish, run `wires policy push` once the directory is back (a directory that is also a host may catch up sooner,
+  from the directory its host follows; until any directory has first taken
+  a publish, reaching none is a note). Hosts follow a directory and get each
+  edit, as the whole policy, as soon as that directory takes it. `wires
+  mcp` and `wires inbox --wait` ask for their view every 60 seconds, and
+  the gateway at each web user's first request after 60 seconds, so a grant
+  or revocation reaches them within a minute. A one-shot `wires call`
+  learns of an edit in its next call's handshake and refreshes its view
+  then. A refusal by a host also marks the view as behind, so the next
+  `wires services` or `wires call` refreshes it first.
+- **Calls fail closed without a directory.** A caller sends a host nothing
+  until a directory other than that host has vouched for the host's policy
+  within `fresh_secs` (15 minutes by default). With every directory down,
+  or a host cut off from them, calls to it fail (exit 1, `no directory has
+  vouched for a host of … recently, so nothing was sent`) once the words
+  callers hold lapse; edits and bans don't spread until a directory is
+  back. In a network whose only two directories are also its hosts (the
+  walkthrough's workbench and spare), the one left up can show only its own
+  word, so with one down, calls to the other fail within 15 minutes. If a
+  host outage mustn't stop calls, run a third directory, or one on a node
+  that hosts nothing (`wires directory serve`). The same rule holds a
+  caller's view refresh: a directory hears a caller's token only on another
+  directory's current word, so with one of several directories up, callers
+  keep the views they hold.
 - **A host knows only the identities presented to it.** Push to a role
   reaches callers it has admitted (on a call or a `wires inbox` fetch) since
   it started (card 31 removes role push).
@@ -721,22 +766,22 @@ snapshot-tested (`wires/snapshots/`).
 | | `wires issuer set <iss> --client-id ID [--audience A]… [--public-client-secret S] [--login]` · `issuer rm <iss>` | Trust an IdP (or change its client id and accepted audiences; default audience: the client id), or stop trusting one no role and no person ban names. `--login` makes it the IdP the network string names; `--public-client-secret` as for `init`. |
 | | `wires role set <name> [--issuer URL] <matcher>…` · `role rm <name>` | Define a role as an OR of matchers: `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…` (all must hold). Every matcher names its issuer, compared exactly: one without `issuer=` takes `--issuer` (default: the IdP the network string names), which must be trusted. `issuer=…` alone admits anyone that IdP verified who carries a verified email; no matcher admits a sign-in without one. `org` is Google's `hd`, read only from Google. There is no built-in role, and a person no role matches is not in the network. |
 | | `wires service add\|set <name> [--description D] [--allow role]… [--host node]…` · `service rm <name>` | Edit the services. `--host` is `label=<node id>` the first time, then the label (or the id), of a node not banned; repeat it to spread calls across several. `set` replaces each list given. |
-| | `wires directory add\|rm <node>` | List a node (not banned) as one of the network's directories, and print its next steps; or stop listing it. `label=<node id>` the first time. |
-| | `wires remove <email\|node> [--issuer URL]` | An email: a person ban (`--issuer` defaults to the IdP the network string names): every host refuses that person from any machine, and every directory refuses them a view. A node id or label: a node ban, and the node is dropped from every service's hosts and from the directories. Neither expires. |
+| | `wires directory add\|rm <node>` | List a node (not banned) as one of the network's directories, and print its next steps; or stop listing it. `label=<node id>` the first time. Removing the last directory is refused: with none, no caller would call any host. |
+| | `wires remove <email\|node> [--issuer URL]` | An email: a person ban (`--issuer` defaults to the IdP the network string names): every host refuses that person from any machine, and every directory refuses them a view. A node id or label: a node ban, and the node is dropped from every service's hosts and from the directories (refused when it is the last directory: add another first). Neither expires. |
 | | `wires restore <email\|node> [--issuer URL]` | Lift a person or node ban. A restored node is not put back into services or directories. |
-| | `wires policy push` | Re-publish the stored policy to every directory: the first publish of a new network, or after an edit that reached none. Exits 1 if a directory has taken a publish before and none took this one. |
-| | `wires policy settings [--freshness lenient\|strict] [--beat-secs N] [--fresh-secs N]` | Print the network's settings, or change them and publish. `--freshness`: what a host does when no directory has vouched for its policy recently (`lenient`, the default, keeps deciding and traces it; `strict` refuses every call until a directory is back). `--beat-secs` (default 300): how often a directory signs a freshness timestamp; `--fresh-secs` (default 900, at least the beat): how long one lasts. `strict` needs a directory: with none listed it is refused, and so is removing the last one under it. |
+| | `wires policy push` | Re-publish the stored policy to every directory: the first publish of a new network, or after an edit that missed a directory. Exits 1 if a directory that has taken a publish before misses this one too. |
+| | `wires policy settings [--beat-secs N] [--fresh-secs N]` | Print the network's settings, or change them and publish. `--beat-secs` (default 300): how often a directory signs a freshness timestamp and sends it to the hosts that follow it; `--fresh-secs` (default 900, at least the beat): how long one lasts. `--fresh-secs` is the removed-host window: a caller tells a host nothing without a current timestamp from a directory other than that host, so a removed host is told nothing once the last one for the old policy lapses, and with every directory down calls stop within it. |
 | **host** | `wires join <network>` | Store the network string (`network.json`), making the node key if there is none, and print the node id. Contacts nobody. Refuses the admin's keystore and one that joined another network. |
-| | `wires serve host.json` | Serve every service in the file once the policy assigns it here (a host that is also a directory waits for the admin's first publish; one that isn't fetches from a directory for up to 8 s at start, and exits if none answers). Then check every caller against the policy, run the service per call, and write one log line per call. It follows a directory's subscription for every edit (and, under `strict` freshness, refuses calls while no directory vouches for its policy), and runs the directory too when the policy lists this node. `--check` validates and prints what the file implements. |
+| | `wires serve host.json` | Serve every service in the file once the policy assigns it here (a host that is also a directory waits for the admin's first publish; one that isn't fetches from a directory for up to 8 s at start, and exits if none answers). Then check every caller against the policy, run the service per call, and write one log line per call. It follows a directory for every edit (the whole policy each time) and its freshness timestamps, which it shows each caller before the caller sends anything (callers send nothing to a host that has no current one), and runs the directory too when the policy lists this node. `--check` validates and prints what the file implements. |
 | | `wires push --to <node-id\|role> --subject S [--ttl D] [-- <body>]` | Hand a message for a caller to this machine's running `serve` (body from stdin if none is given). From the operator's shell: to any node or role. From a service (it has `WIRES_PUSH_TOKEN`): only to that call's caller. Prints `delivered`, `queued` or `denied` per recipient; exits `77` if every recipient was refused. |
-| **directory** | `wires directory serve [--max-subscribers N]` | Run this node's directory alone (no `host.json`), until Ctrl-C. `--max-subscribers` (default 4,096) caps two pools apart: hosts and replicas, and callers' views; one person may hold at most 16 view subscriptions, and each ends when its ID token expires. Refuses the admin's keystore, a keystore that joined no network, and a node neither the policy nor the network string lists. It starts empty and waits for the admin's first publish. |
+| **directory** | `wires directory serve [--max-subscribers N]` | Run this node's directory alone (no `host.json`), until Ctrl-C. `--max-subscribers` (default 4,096) caps how many hosts and directories may follow it at once (callers don't subscribe; they ask for their view). Refuses the admin's keystore, a keystore that joined no network, and a node neither the policy nor the network string lists. It starts empty and waits for the admin's first publish. |
 | **caller** | `wires id` | Print this node's id (making its key on first use). |
 | | `wires login [<network>] [--no-browser] [--callback-port N] [--refresh\|--reuse]` | The first time, with the network string: join, then sign in. Sign in with the IdP the network string names (the hidden `--issuer`, `--client-id`, `--client-secret` or `WIRES_OIDC_*` override it), store the key-bound ID token, and fetch your view. `--refresh` tries the stored refresh token first (with Google the refreshed token has no `nonce`, so it can't be used); `--reuse` re-checks the stored token. |
 | | `wires services [query] [--verbose] [--json]` | List the services in your view, one per line: `<name>  <description>  (<roles that may call>)`; a `query` keeps those whose name or description contains it. Nothing on stdout when there are none: stderr says why and what to do (with the premise, when the view is empty). A person no role matches, or who was removed, exits `1`: `not admitted to this network: no role in this network matches <email>, or you were removed: ask your admin`. `--json` prints one object per line, `{"service","description","allow":[…],"hosts":<count>}`, plus `host_ids` with `--verbose`. Refreshes the view first when it is over a day old, expired, or a call the host ran saw a newer policy. `--verbose` adds the hosts. |
-| | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name, from your view (a name it lacks is asked of a directory), on one of the service's hosts at random, moving to the next only when a dial fails. Stdio passes through and its exit code becomes `call`'s, except that a remote exit `77` is reported as `1` (with a note on stderr). A refusal by the host exits `77`, with nothing on stdout. No sign-in, a service you may not call, a local or transport failure, an expired view, or a newer policy (in the host's handshake) whose entry no longer lists that host exits `1`, before any stdin is sent. A usage error (a `--jq` filter that fails, or data on stdin in locked mode) exits `2`. `--verbose` names the host that answered and prints every cause of an error. |
-| | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`; not admitted to the network, with no view held, exits `1`. Refreshes a stale view first, as `call` does, and never dials from an expired one. |
-| | `wires mcp` | Serve the same services as MCP tools over stdio, following your view: a grant or revocation reaches the client as `tools/list_changed` within seconds. Each tool is a service, named as `wires services` lists it, and described by the first sentence of its description; the `instructions` are the premise plus how to pass arguments and filter output. Past 40 services it offers `search_services` and `call_service` instead of one tool each. A refusal is a tool error reading `denied by host: <reason>` and its next step. |
-| | `wires gateway --public-url https://… [--listen addr] [--client-id …] [--client-secret-file F] [--issuer URL]` | Serve them as a remote MCP server (Streamable HTTP + OAuth 2.1) for web clients such as Claude on the web. Each user signs in with the IdP through the gateway and calls with their own token, from their own view (one subscription per live session) ([deployment](deployment.md#a-web-gateway)). |
+| | `wires call <service> [--jq F] [--head N] [--max-bytes N] [--verbose] -- <args>` | Run a service by name, from your view (a name it lacks is asked of a directory), on one of the service's hosts at random, moving to the next only when a dial fails. Stdio passes through and its exit code becomes `call`'s, except that a remote exit `77` is reported as `1` (with a note on stderr). A refusal by the host exits `77`, with nothing on stdout. No sign-in, a service you may not call, a local or transport failure, an expired view, no host that could show a directory's current word for its policy (`no directory has vouched for a host of … recently, so nothing was sent`), or a newer policy (in the host's handshake) whose entry no longer lists that host exits `1`, before any stdin is sent. A usage error (a `--jq` filter that fails, or data on stdin in locked mode) exits `2`. `--verbose` names the host that answered and prints every cause of an error. |
+| | `wires inbox [--wait [--timeout D]] [--json]` | Fetch from the hosts of your services, print what they pushed (sender first), mark it read. `--wait` blocks until something arrives (and accepts direct pushes meanwhile); `--timeout` exits `124`; a refusal by every host exits `77`; not admitted to the network, with no view held, exits `1`. Refreshes a stale view first, as `call` does, and never dials from an expired one; with `--wait`, asks for the view again every 60 s. A host is sent the token only after it shows a directory's current word, as for `call`; when no host can, stderr says so. |
+| | `wires mcp` | Serve the same services as MCP tools over stdio, asking for your view every 60 s: a grant or revocation reaches the client as `tools/list_changed` within a minute. Each tool is a service, named as `wires services` lists it, and described by the first sentence of its description; the `instructions` are the premise plus how to pass arguments and filter output. Past 40 services it offers `search_services` and `call_service` instead of one tool each. A refusal is a tool error reading `denied by host: <reason>` and its next step. |
+| | `wires gateway --public-url https://… [--listen addr] [--client-id …] [--client-secret-file F] [--issuer URL]` | Serve them as a remote MCP server (Streamable HTTP + OAuth 2.1) for web clients such as Claude on the web. Each user signs in with the IdP through the gateway and calls with their own token, from their own view (held in memory and asked for again at the user's first request after 60 s) ([deployment](deployment.md#a-web-gateway)). |
 
 Every command's error ends with the next step in one clause (`run \`wires
 login\``, `see \`wires services\``, `ask your admin …`), and without
@@ -753,11 +798,15 @@ dialed now (one that just restarted can't be found by its key for a few
 seconds), or that answers that it is busy, is tried again each second for up
 to 15 s, so an edit while such a directory is down takes 15 s before it
 reports the miss (30 s at most); a directory the edit drops is tried once.
-The line names each directory not reached. When a directory has taken a publish from this admin before
-and **none** takes this one, the command still prints its result but exits
-1: the new policy is stored on the admin and nowhere else until `wires policy
-push` reaches a directory. Before that first publish, or with no directory
-listed, reaching none is a note and exits 0. A directory that holds a newer
+The line names each directory not reached. When a directory the new policy
+lists has taken a publish from this admin before and still misses this one,
+the command prints its result but exits 1, whatever the other directories
+did: the policy is in force at the directories that took it, but nothing
+else brings it to the one that missed it, and hosts following that one
+decide under the old policy until `wires policy push` reaches it. A
+directory that has never taken a publish (the first run, or one just added
+that doesn't run yet) fails nothing; with no directory listed, reaching none
+is a note and exits 0. A directory that holds a newer
 policy than the admin's fails the edit whatever the others did: the admin's
 `policy.json` is stale (copy it from any host or directory, then edit
 again). So does any edit on an admin whose `policy.json` is gone.
@@ -795,8 +844,9 @@ new policy, with no restart. The removed caller's call prints `wires: denied
 by host: not admitted to this network: no role in this network matches
 <email>, or you were removed: ask your admin`, writes nothing to stdout and
 exits `77`; the host traces it at `debug`, not as a call line (a ban is not
-told apart from no sign-in). A directory refuses a removed person a view, and
-ends a live view subscription. Pushes to a removed person or node are refused
+told apart from no sign-in). A directory refuses a removed person a view; a view
+she already holds stays until it is refreshed, and every host refuses her
+either way. Pushes to a removed person or node are refused
 at send, delivery and fetch, and a fetch by one drops what was queued for
 it. There is no shared key, so there is nothing to rotate. `wires restore` lifts a ban.
 
@@ -819,12 +869,12 @@ One Cargo workspace ([CLAUDE.md](../CLAUDE.md)):
 
 - **`library/`**: the transport-free core. `network/` (node identity, the
   network string, admission), `calls/` (session frames, invocations, IdP
-  identity, pushes), `services/` (roles, the signed policy: head, items,
-  service entries, freshness, updates, views; authorization), and
+  identity, pushes, the host's proof), `services/` (roles, the signed
+  policy: head, items, service entries, freshness, views; authorization), and
   `directory/` (the directory's frames).
 - **`wires/`**: the binary (and the embedding API), filed by role:
   `admin/`, `host/`, `caller/`, `gateway/` (the remote MCP server),
-  `directory/` (the directory: its store, its two ALPNs, `directory serve`),
+  `directory/` (the directory: its proof, its two ALPNs, `directory serve`),
   `policy/` (the signed policy on this node, published to and fetched from
   the directories), and `e2e/` for the loopback integration tests.
 - **`bindings/`**: `wires-ffi` (Python, via UniFFI) and `bindings/node/`

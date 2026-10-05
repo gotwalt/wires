@@ -23,7 +23,11 @@ admin-signed, versioned policy says which IdPs are trusted, which roles
 exist, which services exist, which hosts run each, who may call each and who
 is removed; directories hold it, hosts hold all of it and decide every call
 from their copy, and each caller holds only its view, the services its person
-may use (`wires services`). A user never handles a host's key.
+may use (`wires services`). A caller tells a host nothing without a directory's
+word, signed within `fresh_secs` (15 minutes by default) by a directory other
+than that host, that the host's policy is current (a one-machine network
+takes its own word), so calls fail closed with every directory down. A user
+never handles a host's key.
 **How they reach it:** by public key over iroh, never by network path, with
 no port opened and no VPN. One thing a local CLI can't do is also in: a
 service can push a message back to its caller (`wires push`, `wires inbox`).
@@ -34,7 +38,8 @@ MCP clients as a **bridge** from existing MCP workflows, not a goal of their
 own. The signed call log, OTLP export and `wires watch` are cut for now
 (card 40): a host writes one ordinary log line per call, and nothing else
 records calls. It is experimental research code, with no backwards
-compatibility anywhere. The goal is a sharp demo for the MCP team.
+compatibility anywhere. The goal is a sharp demo of agents running remote
+CLIs by name, with MCP clients reached through the bridge.
 
 **What outranks what:** the premise outranks the docs, and the docs outrank
 the code. When the code disagrees with `docs/protocol.md`, the code is the
@@ -170,20 +175,24 @@ runs from it. A host serving CLIs needs an image that also has those CLIs.
     per-call log line (`call_trace`), push, its control sockets and the
     per-call push capability), `caller/` (`id`, `join <network>`, `login
     [<network>]`, the hidden `dev-mock-idp` (`mock_idp.rs`), the caller's
-    view (`view.json`), `services`, `call` with service → host failover and
-    output shaping (`--jq`/`--head`/`--max-bytes`), the local hints file,
-    locked mode (`WIRES_LOCKED`) and `tools.json` aliases, `mcp`, `inbox`),
-    `gateway/` (`wires gateway`: remote MCP over HTTP + OAuth for web
-    clients, calling with each user's own ID token), `directory/` (the
-    directory mode: `directory.redb`, `wires/directory/2` and
-    `wires/directory-sub/2`, the freshness beat and replicas, `directory
-    serve`), `policy/` (the signed policy on this node: `policy.json`,
-    publishing to and fetching from the directories); `e2e/` holds the loopback
+    view (`view.json`, refreshed whole; `wires mcp` and `inbox --wait`
+    poll it every 60 s), `services`, `call` (a service's hosts in random
+    order, the next only when a dial fails; `vouch.rs` checks a host's
+    proof that a directory vouched for its policy before the caller sends
+    anything) and output shaping (`--jq`/`--head`/`--max-bytes`), the local
+    hints file, locked mode (`WIRES_LOCKED`: a `wires call` with data on
+    stdin is refused), `mcp`, `inbox`), `gateway/` (`wires gateway`: remote
+    MCP over HTTP + OAuth for web clients, calling with each user's own ID
+    token), `directory/` (the directory mode: `wires/directory/3` and
+    `wires/directory-sub/3`, its proof before a caller's token, the
+    `Fresh` beat to the hosts that follow it, `directory serve`; its store
+    is the node's `policy.json`), `policy/` (the signed policy on this node:
+    `policy.json`, publishing to and fetching from the directories); `e2e/` holds the loopback
     integration tests (`first_run.rs` is the README's quick tour) and
     `testutil.rs` the shared test fixtures. See `docs/board/README.md`
     § Roles.
   - `library/`: `network/` (node identity, the network string, admission),
-    `calls/` (session frames, IdP tokens, push), `services/` (the signed
+    `calls/` (session frames, the host's proof, IdP tokens, push), `services/` (the signed
     policy, entries, roles, views, freshness) and `directory/` (directory
     frames) are folders only — every module is declared at the crate root
     with `#[path]`, so public paths (`library::signed_policy`, …) and the

@@ -70,7 +70,9 @@ unnecessary.
   agent, or the MCP client it runs in. It holds only its view: the services
   its person may call.
 - **Directory** (usually a host doubling as one): holds the newest policy,
-  hands it to hosts, and cuts each caller its view. It never decides a call.
+  hands it to hosts, cuts each caller its view, and signs a timestamp
+  saying the policy is current, which a caller needs before it tells a host
+  anything. It never decides a call.
 
 ## What's been shown
 
@@ -81,7 +83,8 @@ unnecessary.
   database and answered correctly. A removal cut it off at its next call.
 - **The current code, on one machine:** the first run in the README, every
   step exiting 0 and none repeated; a service with two hosts that keeps
-  answering when one is down; a host pushing "build 41 failed" to the agent
+  answering when one is down (for up to 15 minutes there, since the one
+  down is the only other directory); a host pushing "build 41 failed" to the agent
   that started the build; a removed person refused at their next call (exit
   77). `.scripts/demo-remote-cli.sh` and `.scripts/demo-push.sh` check all
   of it on every run.
@@ -131,8 +134,12 @@ Waiting on a mock CI build of 60 s or 300 s, 5 runs per setup
   whichever host the call landed on.
 - **Hosts and directories hold the whole policy**; a caller holds only its
   view, but a directory sees who asks for which view.
-- **A directory must be up** to change the policy, remove someone or fetch
-  a caller's view. Calls don't need one.
+- **Calls need a directory.** A caller sends a host nothing until the host
+  shows that a directory other than itself vouched for its policy within 15
+  minutes, so with every directory down, calls stop within 15 minutes. That
+  is what keeps a removed host from being told anything after that window.
+  A directory must also be up to change the policy, remove someone or fetch
+  a caller's view.
 - **Only Google has been tested** as the IdP.
 
 The full list: [usage.md § Known trade-offs](usage.md#known-trade-offs).

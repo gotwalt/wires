@@ -35,7 +35,7 @@ clipboard. On camera, in order:
 | 4 | agent | `claude --allowedTools 'Bash(wires call orders-db:*)'`, then [the prompt](#4-the-agent-works) | Claude Code runs `wires call orders-db -- "…"`; the answer is umbrella, $999.00 of $1,629.84 (61.3%) |
 | 4 (opt.) | workbench | the `serve` output | one `call finished service=orders-db … email="<you>@gmail.com" role=analyst exit=0 …` line per call |
 | 5 | agent | [push beat](#5-the-workbench-calls-back-push): `wires call deploy -- build 41`, `wires inbox --wait --timeout 10m` | `… from host <wb8> (verified)  build-41  failed: …` |
-| 5b (with a spare) | workbench | stop `wires serve`, ask again | the spare answers (`wires call --verbose` names it) |
+| 5b (with a spare) | workbench | stop `wires serve`, ask again within 15 minutes | the spare answers (`wires call --verbose` names it) |
 | 6 | admin | `wires remove <your address>` | stderr `policy version N: published to 1 of 1 directory(ies)` (2 of 2 with a spare that is also a directory) |
 | 6 | agent | ask Claude Code the question again | exit 77, nothing on stdout: `wires: denied by host: not admitted to this network: no role in this network matches <your address>, or you were removed: ask your admin` |
 
@@ -270,9 +270,25 @@ Stop `wires serve` on the workbench and ask the question again.
 > answered: the caller moves to the next host when one can't be reached.
 > The agent never named either."
 
+This holds for a while only. Before a caller tells a host anything, the host
+must show that a directory other than itself vouched for its policy within
+the last 15 minutes (`fresh_secs`), and in this cast the workbench is the
+only other directory. The spare answers on the workbench's last word, which
+it and the agent hold; about 15 minutes after the workbench stops, calls to
+the spare fail with exit 1 (``no directory has vouched for a host of
+`orders-db` recently, so nothing was sent``) until the workbench is back. So
+record this beat soon after stopping the workbench, and don't say calls keep
+working without it. If you want the beat to hold for as long as the
+workbench is down, give the network a directory that hosts nothing: on a
+third machine (or the laptop, with its own `WIRES_HOME`), `wires id`, the
+admin's `wires directory add`, then `wires join <network>` and `wires
+directory serve` there, and `wires policy push`. The cast above doesn't
+have one.
+
 Then start `wires serve` on the workbench again before step 6: the removal
 is published to it, and an admin edit keeps trying a directory it can't
-reach for 15 s before it reports the miss.
+reach for 15 s before it reports the miss (and exits 1, since the workbench
+has taken a publish before).
 
 ### 6. Remove
 
@@ -313,6 +329,9 @@ address>` puts things back.
   `wires`, not of a Bash permission rule.
 - "Every call is recorded", "audit trail". wires keeps no record: each host
   writes one log line per call to its own output.
+- "Calls keep working with the directory down." They do for up to 15
+  minutes (`fresh_secs`); then a caller sends no host anything until a
+  directory other than that host vouches for its policy again.
 - "Load-balanced." Calls spread at random, blind to how busy each host is.
   Say: calls spread across a service's hosts, which share nothing but the
   policy.
