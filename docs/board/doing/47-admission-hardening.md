@@ -1,6 +1,6 @@
 # 47 — Admission hardening after card 41's review
 
-**Stage:** 2b · **Depends on:** [41](../done/41-idp-membership.md) · **Status:** backlog · **Files:** `library/network/admission.rs`, `library/services/{item,role,access,signed_policy}.rs`, `library/calls/idp.rs`, `wires/host/{gate,push,transport,identity}.rs`, `wires/directory/{node,serve,sub_view,sub_policy}.rs`, `wires/caller/{call,view,inbox,login,services}.rs`, their tests, `wires/e2e/`, `wires/snapshots/`, `.scripts/`, `docs/protocol.md` §2–5, §7, §9
+**Stage:** 2b · **Depends on:** [41](../done/41-idp-membership.md) · **Status:** doing · **Files:** `library/network/admission.rs`, `library/services/{item,role,access,signed_policy}.rs`, `library/calls/idp.rs`, `wires/host/{gate,push,transport,identity}.rs`, `wires/directory/{node,serve,sub_view,sub_policy}.rs`, `wires/caller/{call,view,inbox,login,services}.rs`, their tests, `wires/e2e/`, `wires/snapshots/`, `.scripts/`, `docs/protocol.md` §2–5, §7, §9
 
 ## Why
 

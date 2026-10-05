@@ -41,18 +41,26 @@ no badges and no invites.
 
 | Who | Is admitted by | Checked where |
 |---|---|---|
-| **a caller** (any node acting for a person: `wires call`, `wires mcp`, `wires inbox`, the gateway for each web user) | an **ID token** (§6) from an issuer the held policy trusts, with an accepted audience, unexpired, whose `nonce` binds it to the iroh-authenticated key; and `check_admitted`: the policy bans neither that node nor that person (§3 *Bans*) | the session gate (§5), an inbox fetch (§7), the directory's views (§4) |
+| **a caller** (any node acting for a person: `wires call`, `wires mcp`, `wires inbox`, the gateway for each web user) | an **ID token** (§6) from an issuer the held policy trusts, with an accepted audience, unexpired, whose `nonce` binds it to the iroh-authenticated key; and `check_admitted`: the token carries a **verified email**, the policy bans neither that node nor that person (§3 *Bans*), and **some role in the policy matches the person** | the session gate (§5), an inbox fetch (§7), every directory request and subscription that isn't a named node's (§4) |
 | **a host**, to a caller | its key is in the root-signed entry of the service being called (from the caller's view, or the newer one the host sends in its `HelloAck`), and iroh authenticated that key | the caller, before stdin (§5) |
 | **a host or a directory**, to a directory | the held policy names its key: as a host of some service (`Policy::is_host`) or in the head's `directories`, and does not ban it | the directory's `policy` request and subscriptions (§4) |
 | **a directory**, to anyone | the root-signed head lists it, and its `Fresh` is signed by that key | `Fresh::verify` (§4) |
 | **a policy** | it verifies under the root (`SignedPolicy::verify`), is fresh, and is newer than the one held | a directory's `publish`, every copy (`adopt_if_newer`, §3) |
 | **a host delivering a push**, to a caller's inbox | it hosts a service in the caller's view | the caller's `wires inbox --wait` (§7) |
 
-`check_admitted(policy, caller, principal)` (`library/network/admission.rs`) is `Banned` when the
-policy bans the node `caller` or the person `principal` (issuer and verified email), else `Ok`. It
-assumes the principal was verified for `caller` (the token's nonce binds it to the key iroh
-authenticated). Every role needs a verified identity too (§3 *Roles*), so a caller with no token is
-admitted nowhere: a host refuses it at the first message.
+**You are in the network if a role matches you.** `check_admitted(policy, caller, principal)`
+(`library/network/admission.rs`) is the one function that decides it, at every gate, in order:
+`Banned` when the policy bans the node `caller`; `NoVerifiedEmail` when the principal carries no
+verified email (§6); `Banned` when the policy bans the person (issuer and verified email); `NoRole`
+when no role in the policy matches the principal (§3 *Roles*); else `Ok`. It assumes the principal
+was verified for `caller` (the token's nonce binds it to the key iroh authenticated). So a caller
+with no token is admitted nowhere (a host refuses it at the first message), and neither is a
+person the IdP verified whom no role names: with a public OAuth client anyone with an account at
+the IdP can get a token that verifies, and that alone admits nobody. Every refusal of admission,
+from a host or a directory, is the one fixed text `not admitted to this network: sign in with
+\`wires login\`, or ask your admin for a role` (`NOT_ADMITTED`); the reason goes only to the
+responder's trace. A signed-in caller that hears it says what its person can act on (§5 *The
+caller*).
 
 **The network string** (`library/network/network.rs`) is everything a new node needs:
 `Network { format: 1, root: NodeId, directories: [NodeId], login: LoginSettings { issuer,
@@ -121,7 +129,7 @@ SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kin
   withheld or added, an older head) is an error, and the holder asks for the whole policy. A
   **view** (`library/services/view.rs`) is `{head, entries: [SignedEntry]}`: the services a caller
   may call, each verifying alone; `SignedPolicy::view_for(node, principal, query)` cuts it (empty
-  when the policy bans the node or the person), and `View::apply(ViewUpdate {head, changed:
+  when the policy bans the node or the person, or no role matches), and `View::apply(ViewUpdate {head, changed:
   [SignedEntry], removed: [ServiceName]}, root)` refuses an entry older than the one held.
 - **`Policy::validate`** (run by `sign` and `verify`): no directory listed twice; every role has
   at least one matcher, and **every matcher names an issuer that has an `issuer` item**; every
@@ -133,12 +141,13 @@ SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kin
   no host list. `is_host` and `assigns(service, host)` are false for a banned node.
 - **Bans.** A `ban` item names a removed node; a `person_ban` item names a removed person by
   issuer and email. Neither expires: a ban holds until the admin lifts it (`wires restore`). A
-  banned node is admitted nowhere this policy is held, whoever signs in on it; a banned person is
-  refused by every host from any node, and every directory cuts them an empty view
-  (`Policy::bans_node`, `Policy::bans_person`). A person ban matches a principal whose issuer is
-  exactly the ban's and whose **verified** email (`email_verified`, §6) equals the ban's, ignoring
-  ASCII case; a token with no verified email matches no person ban (ban the node, or narrow the
-  roles).
+  banned person is refused by every host and every directory from any node (`Policy::bans_person`).
+  **Removing a person is a person ban**: a node ban doesn't keep a person out, since a new key is
+  one `WIRES_HOME` away. A node ban removes a host or directory machine, or one specific key: that
+  node is admitted nowhere this policy is held, whoever signs in on it (`Policy::bans_node`). A
+  person ban matches a principal whose issuer is exactly the ban's and whose **verified** email
+  (`email_verified`, §6) equals the ban's, ignoring ASCII case. A principal with no verified email
+  matches no person ban, and so it can't sidestep one: admission requires a verified email (§2).
 - **Issuers.** Each `issuer` item is a trusted IdP: its exact `iss`, the OAuth `client_id`
   `wires login` signs in under, and the `aud` values hosts accept from it. A host's `host.json`
   can narrow them, never widen them (§6).
@@ -165,14 +174,15 @@ SignedPolicy { head: SignedPolicyHead, items: [Item] }   // items sorted by (kin
   IdP principal: `issuer` (exact, **required**, and trusted by an `issuer` item), `email` (exact,
   or `*@domain`), `org` (Google's `hd`), `group`. Because every matcher names its issuer, a token
   another trusted issuer minted for the same email never satisfies it. `issuer=…` alone is "anyone
-  that IdP verified". There is no built-in role: **with no verified principal, no role admits**
-  (`role_admits`).
+  that IdP verified" (who carries a verified email). There is no built-in role: **with no verified
+  principal, or one with no verified email, no role admits** (`role_admits`).
 - **`authorize(policy, caller, principal, service)`** (`library/services/access.rs`), in order:
   neither the node nor the person is banned (`Banned`; the session gate checked this before, this
   is the registry's own guard); the service exists (`UnknownService`); it allows some role
   (`NobodyAllowed`); the first role in `allow` that admits the caller's verified principal is
-  returned (`NotInRole`). A host's gate runs it on every call; a caller never does (it holds no
-  roles): what it may use is its view (§4 *Views*).
+  returned (`NotInRole`). A host's gate runs it on every call, and tells the caller the three
+  refusals apart in its trace only (§5); a caller never runs it (it holds no roles): what it may
+  use is its view (§4 *Views*).
 
 The policy is not secret from the machines the admin placed: directories and hosts hold all of it
 (host node ids, banned node ids and people, role matchers, trusted IdPs, service names and
@@ -283,17 +293,20 @@ belongs to verified. One request per connection: the dialer sends `hello {id_tok
 request, and gets one answer (5 s to dial, 10 s per frame).
 
 - **Admission first** (`Directory::admit`), under the held policy. The peer is **named** when the
-  policy names its key as a host or a directory and doesn't ban it; it is a **caller** when its
-  `id_token` verifies (§6: the held policy's `issuer` items and their audiences, the IdP's keys
-  fetched and held in memory only, the nonce bound to the iroh-authenticated key, unexpired). Either
-  is admitted (a named node may present a token too). Anyone else is a **publisher at most**: it may
-  send only a `publish`, and any other request hears `not admitted to this network; sign in with
-  \`wires login\``, traced, throttled, logged nowhere. With no policy held, nobody is named and no
+  policy names its key as a host or a directory and doesn't ban it (a key, never a token); it is an
+  admitted **caller** when its `id_token` verifies (§6: the held policy's `issuer` items and their
+  audiences, the IdP's keys fetched and held in memory only, the nonce bound to the
+  iroh-authenticated key, unexpired) **and** `check_admitted` passes (§2: a verified email, no ban
+  on the node or the person, a role that matches). Either is admitted (a named node may present a
+  token too; one that isn't admitted only means the named node holds no principal). Anyone else is
+  a **publisher at most**: it may send only a `publish`, and any other request hears `NOT_ADMITTED`
+  (§2), traced, throttled, logged nowhere: a stranger, a person the IdP verified whom no role
+  names, and a banned person all hear the same bytes. With no policy held, nobody is named and no
   issuer is trusted, so only a publish is taken (anything else hears that the directory is empty,
   above). At most 16 connections, on both ALPNs together,
   are undecided at once (one more is closed unanswered): from the connection until its `hello` is
-  decided (and, for a publisher, until its head is), and the stream must open and the `hello` arrive
-  within 10 s. An admitted peer (or a publisher whose head verified) gives up its undecided slot at
+  decided (and, for a publisher, until its head is); the stream must open within 10 s, and the
+  `hello` arrive within 10 s after that. An admitted peer (or a publisher whose head verified) gives up its undecided slot at
   once and takes one of 64 slots for admitted work (reading and answering its request, or reading
   its `subscribe`); one more hears `denied` (`this directory is busy; try again or ask another`).
 - `publish {head}` then `items {items}`: from anyone. The directory checks the **head** first: it
@@ -314,9 +327,9 @@ request, and gets one answer (5 s to dial, 10 s per frame).
 
 **Views** (card 37). The directory cuts a view from the held policy for the principal the caller's
 `hello` token verified as (above), `SignedPolicy::view_for(caller, principal, query)`: the
-root-signed service entries whose `allow` has a role admitting the principal, **none** when the
-policy bans the caller's node or person (a removed person gets an empty view, and the head). A
-named node with no token gets the empty view. Nothing per user is stored, and a request is only
+root-signed service entries whose `allow` has a role admitting the principal. A banned or unknown
+person never gets this far: admission refused them (`NOT_ADMITTED`). A named node with no admitted
+principal gets the empty view. Nothing per user is stored, and a request is only
 traced: a view grants nothing, and the host decides every call.
 
 - `view {have, query: none, held?}`: `held` is the `ViewDigest` of the view the caller holds
@@ -341,9 +354,13 @@ anything, since the host decides every call from its whole policy.
 
 **`wires/directory-sub/2`.** The dialer sends `hello`, then `subscribe {kind, have}`, where `kind`
 is `policy` (a host), `replica` (another directory) or `view` (a long-running caller). Admission is
-the `hello`'s, as above, except that a publisher is refused here (`not admitted…`). A directory
-serves at most 4,096 subscribers of any kind (`wires directory serve --max-subscribers`); one
-more is refused with `denied`.
+the `hello`'s, as above, except that a publisher is refused here (`NOT_ADMITTED`). **Two pools, so
+callers can't exhaust hosts' subscriptions:** at most 4,096 `policy` and `replica` subscribers
+(nodes the policy names), and, apart, at most 4,096 `view` subscribers (`wires directory serve
+--max-subscribers N` sets both); within the view pool, at most 16 at once for one person (issuer
+and subject: the gateway holds one per web user from its one node, so the cap is per person, not
+per node). One more is refused with `denied` (`this directory's subscriber cap (N) is reached`, or
+`you have 16 view subscriptions open here already`).
 
 - **`policy`**, only from a named node (anyone else hears the `denied` above). The first frame
   comes at once: `fresh {fresh}` when `have` is the newest, else what `policy {have}` would answer
@@ -358,13 +375,17 @@ more is refused with `denied`.
 - **`replica`**, only from a node the held head lists as a directory: `policy {policy, fresh}`
   when the held version is newer than `have`, else `fresh {fresh}`; then the same on every
   change. It ends with `denied` if the subscriber stops being listed.
-- **`view`**, only from a caller (a verified token), for the principal its `hello`'s ID token
-  verified as when the subscription opens (`wires/directory/sub_view.rs`): the whole `view {view,
-  fresh}` first, whatever `have` says (the directory keeps nothing per subscriber, so it can't know
-  which view a `have` refers to); then, for every head it adopts, a `view_update {update, fresh}`
-  against the view it sent last (so a ban empties it), and a `fresh` beat in between. A subscriber
-  that can't apply an update subscribes again and takes the whole view. The stream ends with
-  `denied` when the head stops listing this node. `wires mcp`, each live gateway session and
+- **`view`**, only from an admitted caller, for the principal its `hello`'s ID token verified as
+  when the subscription opens (`wires/directory/sub_view.rs`): the whole `view {view, fresh}`
+  first, whatever `have` says (the directory keeps nothing per subscriber, so it can't know which
+  view a `have` refers to); then, for every head it adopts, a `view_update {update, fresh}` against
+  the view it sent last, and a `fresh` beat in between. A subscriber that can't apply an update
+  subscribes again and takes the whole view. The stream ends with `denied`: when the head stops
+  listing this node; **when the ID token expires** (its `exp`: `your sign-in has expired; run
+  \`wires login\``; the client subscribes again with the token it holds then); and **when a head
+  it adopts no longer admits the subscriber** (`check_admitted`: the node or person banned, or no
+  role matches any more), after a `view_update` that empties its view, with `NOT_ADMITTED`.
+  `wires mcp`, each live gateway session and
   `wires inbox --wait` hold one (`wires/caller/view.rs`): the first frame within 10 s, then each
   within the held `Fresh`'s lifetime plus that again (at most 10 s) of slack, or the stream is
   taken for dead; a `denied`, at once or ending the stream, moves it to the next directory at once,
@@ -469,15 +490,26 @@ directory's) cuts its own view from it instead of asking.
 
 - **`wires login`** asks for the view under the new identity, forgetting the old one. `wires join`
   asks for nothing.
-- **One-shot commands make little background traffic.** `wires call` dials from the view as it
-  is, unless it is **stale** (last vouched for more than a day ago, its head expired, or a host
-  reported a newer head), missing, or doesn't hold the name: then it refreshes first. It learns of
+- **One-shot commands make little background traffic.** `wires call` and `wires inbox` dial from
+  the view as it is, unless it is **stale** (last vouched for more than a day ago, its head
+  expired, or a host reported a newer head), missing, or (for `call`) doesn't hold the name: then
+  they refresh first. A refresh that no directory answers leaves the view as it is, and the
+  command dials from it (calls keep working with every directory down; an expired head is never
+  dialed from). It learns of
   a newer policy in the call's handshake: `HelloAck` carries the host's head version, and when it
   is newer than the view's, the head and the called service's entry (§5). The caller then
   refreshes its view after the call (`view {have, held}`: an update from a kept head). A name the
   view doesn't hold is asked of a directory with `resolve` before the call fails. So on an
   unchanged fabric, within a day of the last refresh, a call is the only connection.
-- **`wires services`** reads `view.json`, refreshing first when it is stale (as above).
+- **"Stale" is a day only while a directory answers truthfully.** The directories a caller asks
+  are its view's head's. If none answers, the caller keeps its view; and a machine the admin
+  removed that was itself a directory the stale head lists can still answer `current` with a
+  `Fresh` it signs for that old head (the old head lists it, so the `Fresh` verifies), resetting
+  the day. So the hard bound on how long a caller may dial from an old view is **the view's head's
+  `not_after`** (90 days by default, §3 *Versioning*), not a day.
+- **`wires services`** reads `view.json`, refreshing first when it is stale (as above). When every
+  directory that answered refused this node (`NOT_ADMITTED`), it lists nothing and says what the
+  person can act on (§5 *The caller*).
 - **Long-running callers subscribe** (`view` above): `wires mcp` (and sends MCP
   `notifications/tools/list_changed` when its tools change), one subscription per live gateway
   session (with that user's ID token; the gateway holds no policy), and `wires inbox --wait`. They
@@ -508,10 +540,12 @@ failure below is sent as `Denied` (`wires/host/gate.rs`):
 
 1. The host holds a readable policy (else `host configuration error`).
 2. **Admission, before anything else:** the `id_token` is verified by the host itself (§6), bound
-   to the iroh-authenticated caller, then `check_admitted(policy, caller, principal)`: neither the
-   node nor the person is banned (§2). A caller whose token is missing, malformed, from an
-   untrusted issuer, for another audience or another key, or who is banned, hears only `not
-   admitted to this network; sign in with \`wires login\``: no reason, no policy version. A token
+   to the iroh-authenticated caller, then `check_admitted(policy, caller, principal)` (§2: a
+   verified email, neither the node nor the person banned, a role that matches). A caller whose
+   token is missing, malformed, from an untrusted issuer, for another audience or another key,
+   carries no verified email, who is banned, or whom no role matches, hears only `NOT_ADMITTED`
+   (§2): no reason, no policy version. Only an admitted caller's principal enters the host's
+   identity index (§6). A token
    that verifies but has expired hears `your sign-in has expired; run \`wires login\``; a host
    that can't fetch the issuer's keys says `the identity provider is unreachable from this host;
    try again later`. All three are traced at `debug`, with at most one `info` line per 10 s
@@ -520,9 +554,15 @@ failure below is sent as `Denied` (`wires/host/gate.rs`):
    for an issuer the policy trusts, and an unknown `kid` refetches at most once per issuer per
    rate-limit window, §6).
 3. **The gate** (`admit`): under `strict`, a current `Fresh` vouches for the held head (§4
-   *Freshness at the host*) → the head hasn't expired → the service is registered → it is assigned to
-   **this** host → `authorize` (the registry's `allow`) → every role in `host.json`'s `also_require`
-   for it admits the caller too (it can only narrow; the refusal doesn't name those host-local roles).
+   *Freshness at the host*) → the head hasn't expired → `authorize` (the service is registered and
+   its `allow` admits the caller) → it is assigned to **this** host → every role in `host.json`'s
+   `also_require` for it admits the caller too (it can only narrow; the refusal doesn't name those
+   host-local roles). **A host tells an admitted caller nothing about services it may not call:**
+   no such service, one nobody is allowed, and one whose `allow` doesn't admit this caller all hear
+   the same bytes, `no service named \`<name>\` that you may call`, with no role name and no
+   policy version; which it was goes to the host's trace (`refused by the registry`). Only for a
+   service the caller *is* allowed does it hear the specific refusals after it (`service <name> is
+   not assigned to this host (signed policy version N)`, the `also_require` sentence).
 4. **Implementation.** Only an admitted caller learns whether this host implements the service,
    in `host.json` or natively (`service … is not implemented on this host`).
 
@@ -616,8 +656,22 @@ The host already has the `Hello` (the caller's ID token) and the `Invoke` (argv)
 `assigns` trusts the version the host reports. So a host the admin removed (dropped from the
 service's `hosts`, or node-banned) still receives the token and argv of a caller whose view
 predates the removal, and the stdin too if it understates its version; a caller holds no ban list.
-The window per caller is bounded by its view: a current view never names the removed host, and
-`wires call` refreshes a view older than a day before dialing.
+The window per caller is its view's: a current view never names the removed host, and `wires call`
+refreshes a view older than a day before dialing **when a directory answers**. With no directory
+reachable, or when the removed machine was itself a directory the old head lists (it can vouch for
+its own old head, §4 *Callers keep their view current*), the caller keeps its view, so the hard
+bound is the view's head's `not_after` (90 days by default). Calls keep working with every
+directory down; that is the trade.
+
+**What a signed-in caller says when it is not admitted.** A host or directory says only
+`NOT_ADMITTED`. A caller holding an ID token says what its person can act on, from its own token
+(read locally, never sent anywhere else): `not admitted to this network: no role in this network
+matches <email>, or you were removed: ask your admin`; for a token with no verified email, `not
+admitted to this network: your sign-in carries no verified email, and this network admits only a
+verified email: ask your admin`; for an expired one, `not admitted to this network: your sign-in
+has expired; run \`wires login\``. `wires call` (exit 77), `wires mcp`'s tool result, `wires
+inbox`, `wires services` (exit 1) and `wires login` (right after a sign-in the network doesn't
+admit; the sign-in itself is kept, exit 0) all say it.
 
 Exit codes: `Denied` → **77**, nothing on stdout. Local or transport failure (including the checks
 above) → 1. Otherwise the remote exit code, **except that a remote 77 is reported as 1** with a
@@ -649,8 +703,9 @@ value is accepted; `exp` and `iat` are within the 60 s clock skew; `nonce == for
 `https://accounts.google.com`; `groups` is kept. A host
 remembers the latest verified principal per node (`wires/host/identity.rs`) and never lets a failure
 or an older token displace it. It knows only the callers that presented a token **to it**, and a
-node enters that index only with a token whose signature verified (a token that fails leaves no
-entry, so strangers can't grow it). A host fetches keys only for an issuer its policy trusts,
+node enters that index only once it was **admitted** (§2: its token verified and `check_admitted`
+passed; a token that fails, or a person the policy doesn't admit, leaves no entry, so strangers and
+outsiders can't grow it). A host fetches keys only for an issuer its policy trusts,
 refetches on an unknown `kid` at most once per issuer per rate-limit window, keeps issuer key sets
 **in memory only** and never reads the `jwks/` disk cache, which anything running as its user could
 write; callers keep that cache, and trust a disk entry for at most 24 h.
@@ -696,11 +751,12 @@ so it may be at most 64 KiB. Two ways a message is delivered:
 - **Direct:** the host dials the recipient (3 s budget) and opens with `hello {}` (a host acts for
   no person). A running `wires inbox --wait` serves the inbox ALPN and accepts `deliver` only from a
   node that **hosts a service in its view** (card 37; it follows its view by subscription while it
-  waits); any other dialer hears only `not admitted to this network; sign in with \`wires login\``
-  (the reason is traced, throttled).
+  waits); any other dialer hears only `NOT_ADMITTED` (§2; the reason is traced,
+  throttled).
 - **Fetch:** `wires inbox` dials the hosts of every service in its view (`hello` with its stored ID
-  token, `fetch` held open for up to 25 s, `deliver`, then `ack`). With no token stored it fetches
-  nothing and says to run `wires login`.
+  token, `fetch` held open for up to 25 s, `deliver`, then `ack`), refreshing the view first when
+  it is stale, as `wires call` does (§4 *Callers keep their view current*). With no token stored it
+  fetches nothing and says to run `wires login`.
 
 The host authorizes at send, at delivery and at fetch (`ServicesHost::decide_push`): the
 recipient's node must not be banned by the current policy, nor the person it last verified as
@@ -710,10 +766,12 @@ which the host learns only when the recipient presents its token to it: on a cal
 fetch. `--to <role>` names the nodes whose known principal the role admits; a node with no
 verified identity here is in no role. A fetch is admitted like a call: at most 64 undecided at
 once, its `hello`'s ID token verified and `check_admitted` first, and a node not admitted hears
-only `not admitted…` (or the expired or unreachable sentence of §5) and is traced (throttled); a
-banned node's or person's queue is dropped (each message traced `denied`), and a push to it or its
-fetch is refused. A node holds at most 2 long polls open per host; an admitted node's policy
-refusal is answered and traced at `debug` (`wires inbox` asks every host of its services).
+only `NOT_ADMITTED` (§2; or the expired or unreachable sentence of §5) and is traced (throttled);
+a banned node's or person's queue is dropped when it fetches (each message traced `denied`), and a
+push to it, its delivery or its fetch is refused. A node holds at most 2 long polls open per host.
+An admitted node that `push.allow` doesn't admit (or a host that pushes to no one, or can't decide
+now) hears one fixed text, `inbox fetch refused: this host does not push to you`, naming no role;
+the reason is traced at `debug` (`wires inbox` asks every host of its services).
 
 A receiver refuses a message whose `from` is not the authenticated peer or whose `to` is not itself.
 Delivery is at least once; the receiver removes duplicates by `PushId`. The host queues up to 64
@@ -817,7 +875,9 @@ ones that bound this spec:
   wires action. A longer-lived credential, when it comes ([card 29](board/backlog/29-person-identity.md)),
   must be something `wires login` hands over, never a separate step.
 - **Bans don't expire**, and they accumulate in the policy until the admin lifts them (`wires
-  restore`). A person ban matches only a verified email.
+  restore`). A person ban matches only a verified email, which is why admission requires one. A
+  node ban doesn't keep a person out (a new key is one `WIRES_HOME` away): remove a person by
+  email.
 - Nothing renews the policy head (90 days by default); an expired policy admits nobody, is served
   by no directory, and is dialed from by no caller.
 - A host follows one directory at a time (the others are failover it dials only when that one
@@ -828,8 +888,10 @@ ones that bound this spec:
   (it only traces the requests). A directory can withhold an entry from a view, or serve a
   stale one within `Fresh`'s bound; the host still decides every call. A removed host still
   receives the ID token and argv (and, if it understates its policy version, the stdin) of a caller
-  whose view predates the removal, until that caller's view is refreshed (at most a day for
-  `wires call`, §5).
+  whose view predates the removal, until that caller's view is refreshed: a day after the last
+  refresh when a directory answers, but with none reachable, or when the removed host was itself a
+  directory the old head lists, until the view's head's `not_after` (90 days by default, §5).
+  [Card 45](board/backlog/45-trim-policy-sync.md) is where freshness gets rethought.
 - A host knows a caller's identity only once the caller presented its token to that host.
 - wires keeps no record of a call beyond the host's ordinary log line (§5): nothing signed, and
   nothing a caller or an auditor can read back from a host. A signed call record is a future
