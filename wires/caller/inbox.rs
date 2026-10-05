@@ -339,6 +339,17 @@ pub(crate) fn evictions(unread: &[(i64, PushId)], cap: usize) -> Vec<PushId> {
         .collect()
 }
 
+/// When a directory refused this node admission and it holds no view, there
+/// is no host to ask: what the person can act on (`wires inbox` exits 1, as
+/// `wires services` does). With a view held, the hosts are asked (and
+/// refuse with 77).
+fn not_admitted_without_view(e: &anyhow::Error, holds_view: bool, ks: &Keystore) -> Option<String> {
+    (!holds_view
+        && e.downcast_ref::<crate::caller::view::NotAdmitted>()
+            .is_some())
+    .then(|| crate::caller::hello::explain_not_admitted_in(ks))
+}
+
 /// Keep only messages a peer may hand this node: from `peer` (the key the
 /// connection authenticated), to `me`, and not expired at `now_ms`.
 pub(crate) fn acceptable(
@@ -701,6 +712,14 @@ pub(crate) async fn inbox_cmd(a: InboxArgs) -> Result<i32> {
     // The hosts asked are the view's: refreshed first when it is stale, as
     // `wires call` does; with no directory answering, the view as it is.
     if let Err(e) = crate::caller::view::usable(&ks, &node, root, c.relay_url.as_deref()).await {
+        let holds_view = crate::caller::view::read(&ks, root)
+            .ok()
+            .flatten()
+            .is_some();
+        if let Some(said) = not_admitted_without_view(&e, holds_view, &ks) {
+            eprintln!("wires: {said}");
+            return Ok(1);
+        }
         eprintln!("wires inbox: {}", crate::help::brief(&e));
     }
     let mailbox = Mailbox::open(&keystore::home()?)?;
@@ -884,9 +903,23 @@ mod tests {
     fn the_help_names_every_exit_code() {
         let help = crate::help::INBOX_AFTER;
         assert!(help.contains("Exit: 0 "), "{help}");
-        for code in [EXIT_TIMEOUT, crate::EXIT_DENIED] {
+        for code in [1, EXIT_TIMEOUT, crate::EXIT_DENIED] {
             assert!(help.contains(&format!("{code}:")), "{code} missing: {help}");
         }
+    }
+
+    /// Not admitted and holding no view: exit 1 with what the person can
+    /// act on. Holding one, or any other failure: go on to the hosts.
+    #[test]
+    fn not_admitted_with_no_view_is_an_error() {
+        let ks = Keystore::at(crate::testutil::temp_dir());
+        let refused = anyhow::anyhow!("no directory gave this node its view")
+            .context(crate::caller::view::NotAdmitted);
+        let said = not_admitted_without_view(&refused, false, &ks).unwrap();
+        assert!(said.starts_with("not admitted to this network"), "{said}");
+        assert!(not_admitted_without_view(&refused, true, &ks).is_none());
+        let unreachable = anyhow::anyhow!("no directory answered");
+        assert!(not_admitted_without_view(&unreachable, false, &ks).is_none());
     }
 
     fn node(seed: u8) -> NodeId {
