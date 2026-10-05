@@ -1,6 +1,6 @@
 # 45 — One way to keep policy copies in step
 
-**Depends on:** [41](41-idp-membership.md) · **Status:** backlog, not scheduled (drafted from the 2026-10-04 review; the human hasn't decided) · **Files:** `library/services/{policy_update,fresh,item,view}.rs`, `library/directory/frames.rs`, `wires/directory/`, `wires/policy/`, `wires/host/{follow,freshness,gate}.rs`, `wires/caller/view.rs`, `wires/admin/settings.rs`
+**Depends on:** [41](../done/41-idp-membership.md) · **Status:** backlog, not scheduled (drafted from the 2026-10-04 review; the human hasn't decided) · **Files:** `library/services/{policy_update,fresh,item,view}.rs`, `library/directory/frames.rs`, `wires/directory/`, `wires/policy/`, `wires/host/{follow,freshness,gate}.rs`, `wires/caller/view.rs`, `wires/admin/settings.rs`
 
 ## Why
 

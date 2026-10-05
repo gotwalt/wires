@@ -1,6 +1,6 @@
 # 44 — Cut `tools.json` aliases and the caller's credential-override flags
 
-**Depends on:** [41](41-idp-membership.md) · **Status:** backlog, not scheduled (drafted from the 2026-10-04 review; the human hasn't decided) · **Files:** `wires/caller/{tools,call,mcp,lock,inbox}.rs`, `wires/gateway/`, `wires/lib.rs`, `wires/help.rs`, `wires/snapshots/`, `docs/agent-sandbox.md`, `bench/permission-probe.py`
+**Depends on:** [41](../done/41-idp-membership.md) · **Status:** backlog, not scheduled (drafted from the 2026-10-04 review; the human hasn't decided) · **Files:** `wires/caller/{tools,call,mcp,lock,inbox}.rs`, `wires/gateway/`, `wires/lib.rs`, `wires/help.rs`, `wires/snapshots/`, `docs/agent-sandbox.md`, `bench/permission-probe.py`
 
 ## Why
 

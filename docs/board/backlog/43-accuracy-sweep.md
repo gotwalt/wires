@@ -1,6 +1,6 @@
 # 43 — Accuracy sweep: nothing says what is no longer true
 
-**Stage:** 4 · **Depends on:** [39](39-premise-and-story.md), [40](../done/40-cut-records.md), [41](41-idp-membership.md), [42](../done/42-caller-identity-for-services.md) merged · **Status:** backlog · **Files:** all of them, read-mostly
+**Stage:** 4 · **Depends on:** [39](39-premise-and-story.md), [40](../done/40-cut-records.md), [41](../done/41-idp-membership.md), [42](../done/42-caller-identity-for-services.md) merged · **Status:** backlog · **Files:** all of them, read-mostly
 
 ## Why (the human, 2026-10-05)
 
