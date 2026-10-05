@@ -677,16 +677,7 @@ answered has decided. When a call is answered, the hosts tried before the one th
 recorded in `unanswered.json` and the one that answered is cleared from it; a call no host answered
 records nothing (every host failing tells the order nothing).
 
-**What stays on one host.** Hosts share the signed policy and nothing else, so the next call may
-land on another host. What a host keeps between calls stays on it: whatever a native service
-or the CLI holds in memory or on that machine's disk (the `kv` example's map is per host); the
-callers whose identity it has verified (§7 *The identity rule*: a host learns a caller's identity
-only from that caller's call or inbox fetch to it, so `wires push --to <role>` from one host
-reaches only the callers who have called or fetched from it); and its push queue (§7). A push is
-queued on the host that sent it, and `wires inbox` asks every host of the services in its view, so
-random host choice loses no push; one queued on a host that is down waits there until it is back
-or the push expires. [Card 31](board/backlog/31-inbox-delivery.md) is where a single delivery path
-gets settled. It sends `Hello` and `Invoke` together, then, before it forwards a byte of
+The caller sends `Hello` and `Invoke` together, then, before it forwards a byte of
 stdin, checks the host: the key it dialed (which iroh authenticated) is one the root-signed entry
 lists, and, when the ack's `state_version` is newer than its view's, `HelloAck::assigns`: the head
 verifies under the root at that version, and the service's entry verifies under the root, names
@@ -704,6 +695,17 @@ reachable, or when the removed machine was itself a directory the old head lists
 its own old head, §4 *Callers keep their view current*), the caller keeps its view, so the hard
 bound is the view's head's `not_after` (90 days by default). Calls keep working with every
 directory down; that is the trade.
+
+**What stays on one host.** Hosts share the signed policy and nothing else, so the next call may
+land on another host. What a host keeps between calls stays on it: whatever a native service
+or the CLI holds in memory or on that machine's disk (the `kv` example's map is per host); the
+callers whose identity it has verified (§7 *The identity rule*: a host learns a caller's identity
+only from that caller's call or inbox fetch to it, so `wires push --to <role>` from one host
+reaches only the callers who have called or fetched from it); and its push queue (§7). A push is
+queued on the host that sent it, and `wires inbox` asks every host of the services in its view, so
+random host choice loses no push; one queued on a host that is down waits there until it is back
+or the push expires. [Card 31](board/backlog/31-inbox-delivery.md) is where a single delivery path
+gets settled.
 
 **What a signed-in caller says when it is not admitted.** A host or directory says only
 `NOT_ADMITTED`. A caller holding an ID token says what its person can act on, from its own token
@@ -902,8 +904,10 @@ Every file wires writes above is written atomically: a temporary file created `O
 overwritten). A file with no listed mode is 0600. A keystore directory wires creates is 0700 (an
 existing one is left as it is). `directory.redb` is redb's own file, created 0600.
 
-`$WIRES_HOME` is the one way to point `wires` at another keystore. A caller's commands (`login`,
-`services`, `call`, `mcp`, `inbox`) take no key, relay or config flag: they use the keystore's node
+The environment is the one way to point `wires` at another keystore (`$WIRES_HOME`, else
+`$XDG_CONFIG_HOME/wires`, else `~/.config/wires`). A caller's commands (`login`, `services`,
+`call`, `mcp`, `inbox`) take no key, relay or keystore flag (`login`'s hidden flags set only the
+IdP sign-in settings): they use the keystore's node
 key and n0's relays. `serve` alone takes its node key ahead of the keystore (`--node-seed-file`,
 or `--node-seed`), for a container that mounts its key; `serve`, `directory serve` and `gateway`
 take `--relay-url` for a self-hosted relay. Locked mode (`WIRES_LOCKED`, set by the operator)

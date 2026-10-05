@@ -13,9 +13,10 @@
 //! file.
 //!
 //! Nothing else needs locking: a caller's commands take no flag that points
-//! them at another key, relay or config. Locked mode is only as strong as the
-//! agent's inability to set its own environment: `WIRES_LOCKED` itself, and
-//! `WIRES_HOME` (which picks the keystore), are read from it. Run the agent
+//! them at another key, relay or keystore. Locked mode is only as strong as
+//! the agent's inability to set its own environment: `WIRES_LOCKED` itself,
+//! and `WIRES_HOME`, `XDG_CONFIG_HOME` and `HOME` (which pick the keystore),
+//! are read from it. Run the agent
 //! where the operator, not the agent, sets them (`docs/agent-sandbox.md`).
 
 use std::io::IsTerminal;
