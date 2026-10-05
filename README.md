@@ -115,10 +115,10 @@ agent$ echo $?
 
 *The output is from a run on one machine, with `wires dev-mock-idp` (a
 stand-in IdP built only with `--features dev-mock-idp`) in place of Google,
-so that run's `init` also named the stand-in with `--issuer`. Long ids and
-the network string are cut short here. The `role set`, `directory add` and
-`service add` edits each say that no directory has taken a publish yet;
-`wires policy push` delivers the stored policy once one runs.
+so that run's `init` also named the stand-in with `--issuer`. The network
+string is cut short here. The `role set`, `directory add` and `service add`
+edits each note on stderr that the new policy is stored but not yet
+published; `wires policy push` delivers it once a directory runs.
 `./.scripts/demo-remote-cli.sh` runs the same steps, with two hosts, and
 checks every result.*
 
