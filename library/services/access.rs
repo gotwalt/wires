@@ -35,8 +35,10 @@ pub struct Grant {
     pub role: RoleName,
 }
 
-/// Why [`authorize`] refused. The `Display` text is what the caller is told
-/// and what the host's log line says, so each case is precise.
+/// Why [`authorize`] refused. The `Display` text is for the host's trace, so
+/// each case is precise; a host tells the caller none of them apart (it
+/// hears one fixed sentence for a service it may not call, and a ban is a
+/// refusal of admission).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// The policy bans the caller's node or person: the admin removed it.

@@ -1,14 +1,16 @@
 //! `wires remove <who>` and `wires restore <who>`: bans in the signed
 //! policy, by person or by node.
 //!
-//! - **An email** is a **person ban**: every host refuses that person from
-//!   any machine (the session gate and inbox fetch check the verified
-//!   principal), and every directory cuts them an empty view. The issuer is
-//!   `--issuer`, by default the one the network string names (the issuer
-//!   `wires login` signs in with).
+//! - **An email** is a **person ban**, and how a person is removed: every
+//!   host and every directory refuses that person from any machine (each
+//!   gate checks the verified principal, [`library::check_admitted`]). The
+//!   issuer is `--issuer`, by default the one the network string names (the
+//!   issuer `wires login` signs in with).
 //! - **A node id or label** ([`super::labels`]) is a **node ban**: the node
 //!   is refused everywhere, whoever signs in on it, and is dropped from
-//!   every service's hosts and from the directories.
+//!   every service's hosts and from the directories. It removes a host or
+//!   directory machine, or one specific key; it doesn't keep a person out
+//!   (a new key is one `WIRES_HOME` away).
 //!
 //! A ban has no expiry: it holds until `wires restore` lifts it. Each is an
 //! edit, published to the directories; a host refuses the next call once it

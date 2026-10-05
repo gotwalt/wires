@@ -7,7 +7,8 @@
 //! token `wires login` stored: no token, no call). A name the view doesn't
 //! hold is asked of a directory (`resolve`) before the call fails; nothing
 //! is dialed from an expired view, and a view older than a day is refreshed
-//! first. When a host's `HelloAck` reports a newer head, it carries the
+//! first when a directory answers (with none answering, the call goes ahead
+//! from the view as it is). When a host's `HelloAck` reports a newer head, it carries the
 //! head and the service's entry, and the call stops there, **before** any
 //! stdin is sent, unless that entry still lists the host; the caller then
 //! refreshes its view after the call. On an unchanged fabric, within a day

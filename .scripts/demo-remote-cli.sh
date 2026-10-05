@@ -23,8 +23,9 @@
 #                services`, `wires call orders-db …`, `wires mcp`, `wires inbox`.
 #   bob       -- bob@example.com (role analyst, not oncall): the policy lets
 #                him call orders-db, and the hosts' own rule refuses him.
-#   observer  -- carol@partner.example: signed in, but in no role, so allowed
-#                to call nothing.
+#   observer  -- carol@partner.example: signs in at the IdP, but no role
+#                matches her, so she is not in the network: told so at
+#                sign-in, by `wires services` and by `wires call`.
 #   root      -- the admin: `wires init`, `role set`, `directory add`,
 #                `service add`, `wires network` (one string, for every
 #                machine), `wires policy push`, and later `wires remove
@@ -177,7 +178,7 @@ ORDERS="$(sqlite3 "$DB" 'select count(*) from orders')"
 say "six keystores on this machine stand in for six machines:"
 say "  workbench  ${WB_ID:0:8}...  and spare ${SP_ID:0:8}...: both implement orders-db"
 say "  agent      your agent's machine ($EMAIL)"
-say "  observer   $OUTSIDER: signed in, in no role, may call nothing"
+say "  observer   $OUTSIDER: the IdP knows her; no role in the network names her"
 say "  bob        $BOB: an analyst, but not on call"
 say "  root       the human who signs who may call what, and where it runs"
 say "and a stand-in IdP at $ISSUER (card 08 swaps in Google)."
@@ -309,38 +310,49 @@ ok "3: its view, cut by the directory for its token: orders-db, because analyst 
 beat 3
 
 # ==========================================================================
-step "3b a signed-in NON-analyst sees nothing to call -- naming it anyway stops on its machine"
+step "3b signed in at the IdP, but NO ROLE names her -- she is not in the network"
 # ==========================================================================
 run "wires login <network>   # on the observer, as $OUTSIDER"
 login_as "$obs" "$OUTSIDER" "$NETWORK"
+NOT_IN="no role in this network matches $OUTSIDER, or you were removed: ask your admin"
+grep -qF "$NOT_IN" "$D/login.err" || {
+	dump "$D/login.err"
+	bad "3b: wires login did not say the network doesn't admit $OUTSIDER"
+}
+grep -F "$NOT_IN" "$D/login.err" | head -1 >"$D/login3b.err"
+show "$D/login3b.err"
 run "wires services"
-WIRES_HOME="$obs" "$WIRES" services >"$D/s2.out" 2>"$D/s2.err" || {
-	cat "$D/s2.err" >&2
-	bad "3b: wires services failed"
+set +e
+WIRES_HOME="$obs" "$WIRES" services >"$D/s2.out" 2>"$D/s2.err"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] && [ ! -s "$D/s2.out" ] || {
+	cat "$D/s2.out" "$D/s2.err" >&2
+	bad "3b: wires services for $OUTSIDER exited $rc, expected 1 and nothing listed"
 }
-[ ! -s "$D/s2.out" ] || {
-	cat "$D/s2.out" >&2
-	bad "3b: $OUTSIDER can see a service"
+grep -qF "$NOT_IN" "$D/s2.err" || {
+	dump "$D/s2.err"
+	bad "3b: wires services did not say what $OUTSIDER can act on"
 }
+show "$D/s2.err"
 run "wires call orders-db -- 'select 1'"
 set +e
 WIRES_HOME="$obs" "$WIRES" call orders-db -- "select 1" >"$D/c9.out" 2>"$D/c9.err"
 rc=$?
 set -e
-# Its view holds no service, and the directory it asks (`resolve`) has none
-# for it either, so the call stops here: exit 1, no host dialed.
+# The directory admits her to nothing (the same bytes a stranger hears), so
+# she holds no view: the call stops here, exit 1, no host dialed.
 [ "$rc" -eq 1 ] || {
 	dump "$D/c9.err"
 	bad "3b: $OUTSIDER's call exited $rc, expected 1 (nothing to dial)"
 }
-# shellcheck disable=SC2016 # literal backticks in the message
-grep -qF 'no service named `orders-db` that you may call' "$D/c9.err" || {
+grep -qF "$NOT_IN" "$D/c9.err" || {
 	cat "$D/c9.err" >&2
-	bad "3b: stopped, but not because orders-db is not one to call"
+	bad "3b: stopped, but not because the network doesn't admit $OUTSIDER"
 }
 [ ! -s "$D/c9.out" ] || bad "3b: the stopped call wrote to stdout"
 show "$D/c9.err"
-ok "3b: $OUTSIDER may not call orders-db: exit 1 on its own machine, nothing dialed"
+ok "3b: $OUTSIDER is not in the network: told at sign-in, exit 1 on her own machine, nothing dialed"
 beat 3
 
 # ==========================================================================
@@ -603,7 +615,7 @@ step "SUMMARY"
 # ==========================================================================
 printf '     name      : orders-db, a service; its hosts were never named by the caller\n' >&2
 printf '     identity  : joining is signing in; before it, nothing to call; %s allowed as analyst\n' "$EMAIL" >&2
-printf '     narrowing : %s (no role) stopped on its machine, exit 1; %s refused by the host rule, exit 77\n' "$OUTSIDER" "$BOB" >&2
+printf '     narrowing : %s (no role) not in the network, exit 1 on her machine; %s refused by the host rule, exit 77\n' "$OUTSIDER" "$BOB" >&2
 printf '     contained : .shell id refused by sqlite3 -safe, exit %s\n' "$SHELL_RC" >&2
 # shellcheck disable=SC2016 # literal backticks in the summary
 printf '     push      : host -> agent by key, fetched by `wires inbox`; --wait woke on the next\n' >&2

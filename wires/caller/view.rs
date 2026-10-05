@@ -109,7 +109,7 @@ impl HeldView {
         &self.view.head.head.directories
     }
 
-    /// Whether `wires services` and `wires call` should refresh it first:
+    /// Whether `wires services`, `wires call` and `wires inbox` should refresh it first:
     /// last vouched for
     /// more than [`VIEW_MAX_AGE_SECS`] before `now`, its head expired, or a
     /// host reported a newer head.
