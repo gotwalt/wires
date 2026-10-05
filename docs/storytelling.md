@@ -50,7 +50,8 @@ skeptic reaches for first, and the answers that hold:
 
 A sentence that is true of a card in `backlog/` but not of the code at
 `HEAD` fails the test as surely as a rebuttal does. Several hosts for a
-service means failover, not load spreading; MCP is a bridge, not the goal;
+service spread calls at random and share nothing but the policy (more
+capacity for a stateless service, not load balancing); MCP is a bridge, not the goal;
 a person is removed by email (`wires remove <email>`), not by removing
 one of their machines. Limits are stated once, in the limits section, not hedged in every
 sentence.
