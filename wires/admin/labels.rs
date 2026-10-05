@@ -63,7 +63,7 @@ impl Labels {
     pub(crate) fn save(&self, ks: &Keystore) -> Result<()> {
         create_private_dir(&ks.path(""))?;
         let json = serde_json::to_string_pretty(self).context("encoding the labels")?;
-        write_private(&ks.path(LABELS_FILE), &format!("{json}\n"))
+        write_private(&ks.path(LABELS_FILE), format!("{json}\n"))
     }
 
     /// The node `text` names: `label=<node id>` (binding the label, which

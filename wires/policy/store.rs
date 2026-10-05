@@ -113,7 +113,7 @@ pub(crate) fn adopt_if_newer(
     if text.contains('\n') {
         bail!("an encoded policy must be one line");
     }
-    write_private(&ks.path(POLICY_FILE), &format!("{text}\n"))?;
+    write_private(&ks.path(POLICY_FILE), format!("{text}\n"))?;
     Ok(true)
 }
 

@@ -97,7 +97,7 @@ impl LastGood {
         me.0.insert(service.clone(), host);
         let saved = serde_json::to_string_pretty(&me)
             .map_err(anyhow::Error::from)
-            .and_then(|json| crate::admin::keystore::write_private(path, &format!("{json}\n")));
+            .and_then(|json| crate::admin::keystore::write_private(path, format!("{json}\n")));
         if let Err(e) = saved {
             tracing::debug!("remembering the last good host: {e:#}");
         }
@@ -194,7 +194,7 @@ pub(crate) fn write_own_hint(ks: &Keystore, endpoint: &iroh::Endpoint) -> anyhow
         crate::admin::keystore::create_private_dir(dir)?;
     }
     let me = transport::to_node_id(&endpoint.id());
-    crate::admin::keystore::write_private(&path, &format!("{}\n", hint_line(me, &addrs)))
+    crate::admin::keystore::write_private(&path, format!("{}\n", hint_line(me, &addrs)))
 }
 
 /// Every host of the services in `names` that `view` holds, once each, in

@@ -115,7 +115,7 @@ impl Freshness {
             *held = Some(fresh.clone());
         }
         let text = serde_json::to_string(fresh).context("encoding a freshness")?;
-        write_private(&self.ks.path(FRESH_FILE), &format!("{text}\n"))?;
+        write_private(&self.ks.path(FRESH_FILE), format!("{text}\n"))?;
         Ok(true)
     }
 

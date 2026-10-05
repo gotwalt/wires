@@ -180,7 +180,7 @@ fn note_reached(ks: &Keystore, delivered: &[NodeId]) -> Result<()> {
     }
     all.extend(delivered.iter().copied());
     let text = serde_json::to_string(&all).context("encoding the directories reached")?;
-    write_private(&ks.path(REACHED_FILE), &format!("{text}\n"))
+    write_private(&ks.path(REACHED_FILE), format!("{text}\n"))
 }
 
 /// Fold a publish into an admin command's report: its line is the last

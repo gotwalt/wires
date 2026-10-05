@@ -148,7 +148,7 @@ pub(crate) fn write(ks: &Keystore, root: NodeId, held: &HeldView) -> Result<()> 
         .verify(root)
         .context("refusing to store a view that does not verify")?;
     let text = serde_json::to_string(held).context("encoding the view")?;
-    write_private(&ks.path(VIEW_FILE), &format!("{text}\n"))
+    write_private(&ks.path(VIEW_FILE), format!("{text}\n"))
 }
 
 /// Record that a host reported head `version` (from a `HelloAck`): the

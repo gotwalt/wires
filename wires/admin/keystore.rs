@@ -105,7 +105,7 @@ impl Keystore {
     pub fn save_network(&self, network: &Network) -> Result<PathBuf> {
         create_private_dir(&self.dir)?;
         let path = self.path(NETWORK_FILE);
-        write_private(&path, &format!("{}\n", network.encode()?))?;
+        write_private(&path, format!("{}\n", network.encode()?))?;
         Ok(path)
     }
 
