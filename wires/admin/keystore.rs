@@ -403,7 +403,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        let private = dir.join("last-good.json");
+        let private = dir.join("unanswered.json");
         write_private(&private, "1\n").unwrap();
         assert_eq!(mode(&private), 0o600);
         let lock = dir.join("policy.json.lock");

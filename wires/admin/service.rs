@@ -8,7 +8,7 @@
 //! wires issuer set https://acme.okta.com --client-id 0oa…   # trust an IdP
 //! wires role set staff --issuer https://acme.okta.com 'issuer=https://acme.okta.com'
 //! wires service add orders-db --description "Read-only SQL" --allow analyst --host workbench=3ef7…
-//! wires service set orders-db --host workbench --host spare     # failover
+//! wires service set orders-db --host workbench --host spare     # calls spread across both
 //! wires service rm  orders-db
 //! ```
 //!
@@ -72,7 +72,7 @@ pub(crate) struct ServiceEditArgs {
     #[arg(long = "allow")]
     pub(crate) allow: Vec<String>,
     /// A node that implements it: `label=<node id>` the first time, then the
-    /// label (or the id). Repeatable (failover).
+    /// label (or the id). Repeatable: calls spread across them.
     #[arg(long = "host")]
     pub(crate) host: Vec<String>,
     /// Lifetime of the new policy, from now (`90d`, `12h`, … or seconds);

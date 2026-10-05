@@ -8,7 +8,7 @@ Arguments:
 Options:
       --description <DESCRIPTION>  What it does, shown in `wires services`
       --allow <ALLOW>              A role allowed to call it (one defined with `wires role set`). Repeatable
-      --host <HOST>                A node that implements it: `label=<node id>` the first time, then the label (or the id). Repeatable (failover)
+      --host <HOST>                A node that implements it: `label=<node id>` the first time, then the label (or the id). Repeatable: calls spread across them
   -h, --help                       Print help
       --help-all                   Also list the operator and credential flags
 

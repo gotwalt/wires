@@ -1,13 +1,19 @@
 //! Service name → host (card 27). The caller never names a
 //! host: it takes the service's `hosts` from the root-signed entry in its
-//! view (card 37), tries the last one that worked first, then the rest in
-//! the admin's order, moving to the next on a dial failure (not on a
-//! refusal: a host that refused has decided). `--verbose` says which host
-//! answered.
+//! view (card 37), orders them at random afresh for each call (card 46), so
+//! a service's calls spread across its hosts, and moves to the next on a
+//! dial failure (not on a refusal: a host that refused has decided).
+//! `--verbose` says which host answered.
 //!
-//! The last host that answered for each service is remembered in
-//! `$WIRES_HOME/last-good.json` ([`LastGood`]); a hint, never an authority —
-//! a host the entry no longer lists is skipped.
+//! The only memory is of failure: a host that failed to answer this
+//! caller's dial in the last [`DEMOTE_SECS`] seconds goes last, so a host
+//! that is down costs one dial timeout a minute rather than one in every few
+//! calls. That is `$WIRES_HOME/unanswered.json` ([`Unanswered`]); a hint,
+//! never an authority — a host the entry no longer lists is never tried.
+//!
+//! Hosts share the signed policy and nothing else: what a service keeps
+//! between calls, the callers a host has verified, and its push queue stay
+//! on that host (`docs/protocol.md` §5 *What stays on one host*).
 //!
 //! # Addressing
 //!
@@ -35,13 +41,20 @@ use std::path::{Path, PathBuf};
 
 use iroh::EndpointAddr;
 use library::{NodeId, Service, ServiceName, View};
+use rand::Rng;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::admin::keystore::Keystore;
 use crate::host::transport;
 
 /// The file name under `$WIRES_HOME`.
-pub(crate) const LAST_GOOD_FILE: &str = "last-good.json";
+pub(crate) const UNANSWERED_FILE: &str = "unanswered.json";
+
+/// How long a host that failed to answer goes last, in seconds: long enough
+/// that a host that is down costs each caller one dial timeout a minute,
+/// short enough that one back from a restart takes its share again soon.
+pub(crate) const DEMOTE_SECS: i64 = 60;
 
 /// The local address-hint file under `$WIRES_HOME` (see the module docs).
 pub(crate) const HINTS_FILE: &str = "hints";
@@ -49,30 +62,37 @@ pub(crate) const HINTS_FILE: &str = "hints";
 /// Where `wires serve` writes its own hint line, under `$WIRES_HOME`.
 pub(crate) const OWN_HINT_FILE: &str = "run/hint";
 
-/// The hosts to try for `service` (its root-signed entry's), in order:
-/// `last_good` first if the entry still lists it, then the admin's
-/// order. A caller holds no ban list: a signed policy never lists a banned
-/// host (the admin's `remove` drops it from every service), and the host
-/// decides every call anyway.
-pub(crate) fn candidates(service: &Service, last_good: Option<NodeId>) -> Vec<NodeId> {
+/// The hosts to try for `service` (its root-signed entry's), in order: a
+/// fresh random order from `rng` (so calls spread across the hosts; the
+/// admin's order means nothing), except that a host `unanswered` says failed
+/// within [`DEMOTE_SECS`] of `now` goes last, the oldest failure first. A
+/// caller holds no ban list: a signed policy never lists a banned host (the
+/// admin's `remove` drops it from every service), and the host decides
+/// every call anyway.
+pub(crate) fn candidates<R: Rng + ?Sized>(
+    service: &Service,
+    unanswered: &Unanswered,
+    now: i64,
+    rng: &mut R,
+) -> Vec<NodeId> {
     let mut hosts: Vec<NodeId> = service.hosts.clone();
-    if let Some(good) = last_good
-        && let Some(at) = hosts.iter().position(|h| *h == good)
-    {
-        let good = hosts.remove(at);
-        hosts.insert(0, good);
-    }
+    hosts.shuffle(rng);
+    // Stable: the shuffle's order survives among the hosts not demoted
+    // (`None` sorts before every `Some`).
+    hosts.sort_by_key(|h| unanswered.failed_recently(*h, now));
     hosts
 }
 
-/// `last-good.json`: service → the host that last answered it.
+/// `unanswered.json`: host → when (Unix seconds) it last failed to answer
+/// this caller's dial. Only entries under [`DEMOTE_SECS`] old matter; older
+/// ones are dropped at the next save.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct LastGood(BTreeMap<ServiceName, NodeId>);
+pub(crate) struct Unanswered(BTreeMap<NodeId, i64>);
 
-impl LastGood {
-    /// `$WIRES_HOME/last-good.json`.
+impl Unanswered {
+    /// `$WIRES_HOME/unanswered.json`.
     pub(crate) fn path(ks: &Keystore) -> PathBuf {
-        ks.path(LAST_GOOD_FILE)
+        ks.path(UNANSWERED_FILE)
     }
 
     /// Load from `path`; missing or unreadable is empty (it is only a hint).
@@ -83,23 +103,41 @@ impl LastGood {
             .unwrap_or_default()
     }
 
-    /// The host that last answered `service`.
-    pub(crate) fn get(&self, service: &ServiceName) -> Option<NodeId> {
-        self.0.get(service).copied()
+    /// When `host` last failed to answer, if that was within
+    /// [`DEMOTE_SECS`] of `now` (a time ahead of `now` counts: a clock
+    /// stepped back shouldn't promote a host that is down).
+    pub(crate) fn failed_recently(&self, host: NodeId, now: i64) -> Option<i64> {
+        self.0
+            .get(&host)
+            .copied()
+            .filter(|at| now.saturating_sub(*at) < DEMOTE_SECS)
     }
 
-    /// Remember that `host` answered `service`, and save (best effort).
-    pub(crate) fn record(path: &Path, service: &ServiceName, host: NodeId) {
-        let mut me = Self::load(path);
-        if me.0.get(service) == Some(&host) {
+    /// The call tried `tried` in order and `answered` answered: every host
+    /// before it failed to answer at `now`, and `answered` is cleared.
+    /// Entries [`DEMOTE_SECS`] old are dropped.
+    pub(crate) fn note(&mut self, tried: &[NodeId], answered: NodeId, now: i64) {
+        for host in tried.iter().take_while(|h| **h != answered) {
+            self.0.insert(*host, now);
+        }
+        self.0.remove(&answered);
+        self.0.retain(|_, at| now.saturating_sub(*at) < DEMOTE_SECS);
+    }
+
+    /// [`Unanswered::note`] on the file at `path`, saved (best effort) when
+    /// it changed.
+    pub(crate) fn record(path: &Path, tried: &[NodeId], answered: NodeId, now: i64) {
+        let before = Self::load(path);
+        let mut me = before.clone();
+        me.note(tried, answered, now);
+        if me == before {
             return;
         }
-        me.0.insert(service.clone(), host);
         let saved = serde_json::to_string_pretty(&me)
             .map_err(anyhow::Error::from)
             .and_then(|json| crate::admin::keystore::write_private(path, format!("{json}\n")));
         if let Err(e) = saved {
-            tracing::debug!("remembering the last good host: {e:#}");
+            tracing::debug!("remembering the hosts that did not answer: {e:#}");
         }
     }
 }
@@ -223,6 +261,9 @@ pub(crate) fn hosts_of<'a>(
 mod tests {
     use super::*;
     use library::{NodeIdentity, Policy, Principal, StateVersion};
+    use proptest::prelude::*;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     fn node(b: u8) -> NodeId {
         NodeIdentity::from_seed([b; 32]).node_id()
@@ -266,28 +307,169 @@ mod tests {
         )
     }
 
+    /// A service on `hosts`.
+    fn on(hosts: Vec<NodeId>) -> Service {
+        Service {
+            description: String::new(),
+            allow: vec![],
+            hosts,
+        }
+    }
+
+    /// A seeded generator, so a test's draws are the same every run.
+    fn rng(seed: u64) -> StdRng {
+        StdRng::seed_from_u64(seed)
+    }
+
+    const NOW: i64 = 1_000_000;
+
     #[test]
-    fn last_good_first_then_the_admins_order() {
-        let v = view();
-        let name = ServiceName::new("orders-db").unwrap();
-        let svc = &v.entry(&name).unwrap().service;
-        assert_eq!(candidates(svc, None), vec![node(2), node(3)]);
-        assert_eq!(candidates(svc, Some(node(3))), vec![node(3), node(2)]);
-        assert_eq!(candidates(svc, Some(node(4))), vec![node(2), node(3)]);
+    fn every_host_comes_first_over_many_calls() {
+        let hosts = vec![node(2), node(3), node(4)];
+        let svc = on(hosts.clone());
+        let mut r = rng(46);
+        let mut first: BTreeMap<NodeId, u32> = BTreeMap::new();
+        for _ in 0..300 {
+            let order = candidates(&svc, &Unanswered::default(), NOW, &mut r);
+            *first.entry(order[0]).or_default() += 1;
+        }
+        for h in &hosts {
+            let n = first.get(h).copied().unwrap_or(0);
+            assert!(
+                (60..=140).contains(&n),
+                "{} came first {n} of 300",
+                h.short()
+            );
+        }
     }
 
     #[test]
-    fn last_good_round_trips_and_a_bad_file_is_empty() {
+    fn a_host_that_just_failed_goes_last_until_the_window_passes() {
+        let svc = on(vec![node(2), node(3), node(4)]);
+        let mut down = Unanswered::default();
+        // node 3 was tried first and failed; node 2 answered.
+        down.note(&[node(3), node(2)], node(2), NOW);
+        assert_eq!(down.failed_recently(node(3), NOW), Some(NOW));
+        assert_eq!(down.failed_recently(node(2), NOW), None);
+        let mut r = rng(7);
+        for _ in 0..50 {
+            let order = candidates(&svc, &down, NOW + DEMOTE_SECS - 1, &mut r);
+            assert_eq!(order[2], node(3));
+        }
+        // After the window it takes its share again.
+        let later = NOW + DEMOTE_SECS;
+        assert_eq!(down.failed_recently(node(3), later), None);
+        let firsts: Vec<NodeId> = (0..50)
+            .map(|_| candidates(&svc, &down, later, &mut r)[0])
+            .collect();
+        assert!(firsts.contains(&node(3)));
+        // And an answer clears it at once.
+        down.note(&[node(3)], node(3), NOW + 1);
+        assert_eq!(down, Unanswered::default());
+    }
+
+    #[test]
+    fn noting_an_answer_records_the_hosts_before_it_and_drops_old_entries() {
+        let mut u = Unanswered::default();
+        u.note(&[node(2), node(3), node(4)], node(4), NOW);
+        assert_eq!(
+            u,
+            Unanswered(BTreeMap::from([(node(2), NOW), (node(3), NOW)]))
+        );
+        // Later: node 2 answers first; node 3's entry ages out.
+        u.note(&[node(2)], node(2), NOW + DEMOTE_SECS);
+        assert_eq!(u, Unanswered::default());
+        // A host the call never reached (after the one that answered) is untouched.
+        u.note(&[node(5), node(6), node(7)], node(6), NOW);
+        assert_eq!(u, Unanswered(BTreeMap::from([(node(5), NOW)])));
+    }
+
+    #[test]
+    fn unanswered_round_trips_and_a_bad_file_is_empty() {
         let dir = crate::testutil::temp_dir();
-        let path = dir.join(LAST_GOOD_FILE);
-        let name = ServiceName::new("orders-db").unwrap();
-        assert_eq!(LastGood::load(&path).get(&name), None);
-        LastGood::record(&path, &name, node(3));
-        assert_eq!(LastGood::load(&path).get(&name), Some(node(3)));
-        LastGood::record(&path, &name, node(2));
-        assert_eq!(LastGood::load(&path).get(&name), Some(node(2)));
+        let path = dir.join(UNANSWERED_FILE);
+        assert_eq!(Unanswered::load(&path), Unanswered::default());
+        Unanswered::record(&path, &[node(3), node(2)], node(2), NOW);
+        assert_eq!(
+            Unanswered::load(&path).failed_recently(node(3), NOW),
+            Some(NOW)
+        );
+        Unanswered::record(&path, &[node(3)], node(3), NOW + 1);
+        assert_eq!(Unanswered::load(&path), Unanswered::default());
         std::fs::write(&path, "not json").unwrap();
-        assert_eq!(LastGood::load(&path).get(&name), None);
+        assert_eq!(Unanswered::load(&path), Unanswered::default());
+    }
+
+    /// Hosts from distinct seeds, each with when it last failed (seconds
+    /// before now: some within the window, some past it, some ahead of a
+    /// clock stepped back), or never.
+    fn arb_hosts() -> impl Strategy<Value = Vec<(NodeId, Option<i64>)>> {
+        proptest::collection::btree_map(
+            any::<u8>(),
+            proptest::option::of(-10..(2 * DEMOTE_SECS)),
+            1..7,
+        )
+        .prop_map(|m| m.into_iter().map(|(b, ago)| (node(b), ago)).collect())
+    }
+
+    fn split(hosts: &[(NodeId, Option<i64>)]) -> (Service, Unanswered) {
+        let svc = on(hosts.iter().map(|(h, _)| *h).collect());
+        let failed = hosts
+            .iter()
+            .filter_map(|(h, ago)| ago.map(|ago| (*h, NOW - ago)))
+            .collect();
+        (svc, Unanswered(failed))
+    }
+
+    proptest! {
+        /// The order is always a permutation of the service's hosts, with
+        /// every recently failed host after every other, the oldest failure
+        /// first.
+        #[test]
+        fn the_order_is_the_hosts_with_recent_failures_last(
+            hosts in arb_hosts(),
+            seed in any::<u64>(),
+        ) {
+            let (svc, down) = split(&hosts);
+            let order = candidates(&svc, &down, NOW, &mut rng(seed));
+            let mut got = order.clone();
+            got.sort();
+            let mut want = svc.hosts.clone();
+            want.sort();
+            prop_assert_eq!(got, want);
+            let keys: Vec<Option<i64>> =
+                order.iter().map(|h| down.failed_recently(*h, NOW)).collect();
+            prop_assert!(keys.windows(2).all(|w| w[0] <= w[1]), "{:?}", keys);
+        }
+
+        /// Over many calls, every host not recently failed comes first.
+        #[test]
+        fn every_healthy_host_takes_a_turn_first(
+            hosts in arb_hosts(),
+            seed in any::<u64>(),
+        ) {
+            let (svc, down) = split(&hosts);
+            let healthy: Vec<NodeId> = svc
+                .hosts
+                .iter()
+                .copied()
+                .filter(|h| down.failed_recently(*h, NOW).is_none())
+                .collect();
+            let mut r = rng(seed);
+            let firsts: Vec<NodeId> = (0..200)
+                .map(|_| candidates(&svc, &down, NOW, &mut r)[0])
+                .collect();
+            for h in &healthy {
+                prop_assert!(firsts.contains(h), "{} never came first", h.short());
+            }
+            if healthy.is_empty() {
+                // All failed recently: the oldest failure is always first.
+                let oldest = svc.hosts.iter().copied()
+                    .min_by_key(|h| down.failed_recently(*h, NOW)).unwrap();
+                let first_key = down.failed_recently(firsts[0], NOW);
+                prop_assert_eq!(first_key, down.failed_recently(oldest, NOW));
+            }
+        }
     }
 
     #[test]

@@ -26,7 +26,7 @@
 //!   root-signed entry (card 37), and how it is fetched and followed.
 //! - [`services`] — `wires services`: what this caller may call, read from
 //!   its view.
-//! - [`pick`] — service name → host, with failover; the local dial hints.
+//! - [`pick`] — service name → host, in a random order per call; the local dial hints.
 //! - [`hello`] — the stored ID token the caller presents in each `hello`.
 //! - [`join`] — `wires id` and `wires join <network>` (a host, a directory,
 //!   the gateway); `wires login <network>` joins the same way, then signs in.

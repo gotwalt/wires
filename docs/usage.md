@@ -274,9 +274,10 @@ agent$ wires inbox
 direct delivery meanwhile. `.scripts/demo-push.sh` runs the full callback: a
 build service that returns at once and pushes its result later.
 
-**8. Failover and removal.** With the workbench stopped, the same command is
-answered by the spare (`--verbose` says which host answered; callers don't
-normally care):
+**8. Two hosts, and removal.** Calls to `orders-db` land on the workbench or
+the spare at random, a new draw each call. With the workbench stopped, the
+same command is answered by the spare (`--verbose` says which host answered;
+callers don't normally care):
 
 ```console
 agent$ wires call --verbose orders-db -- "select count(*) from orders"
@@ -287,7 +288,8 @@ wires: orders-db answered by host 10e4e2c2
 ```
 
 The caller tries the next host only when a dial fails; a host that answered
-has decided. Then the admin removes alice, by email:
+has decided. For the next minute it tries the workbench last. Then the admin
+removes alice, by email:
 
 ```console
 admin$ wires remove alice@example.com
@@ -494,9 +496,11 @@ identity and ID token (`whoami`), a refused caller, a push to
 
 **Services, not hosts.** A caller cares what it is calling, not where it
 runs. The admin binds each name to its hosts in the signed policy; the caller
-tries the one that last answered, then the others, and fails over only when
-a dial fails. Moving a service changes nothing for callers. More hosts
-means failover, not more capacity: calls are not spread across them.
+tries them in a random order drawn for each call, and moves to the next only
+when a dial fails. Moving a service changes nothing for callers, and adding a
+host adds capacity: calls spread across the hosts. Hosts share nothing but
+the policy, so that holds for a service that keeps no state between calls
+(see *Known trade-offs*).
 
 **Dial by key, not by host and port.** Tailscale gives the caller's machine
 a network path to the host; you then trust every port on it, or narrow it
@@ -590,9 +594,16 @@ What wires does not do, or does with a cost, as built:
   output; nothing is signed, nothing is kept by wires, and nothing can be
   read back by a caller or an auditor. A host could leave out or alter its
   own lines.
-- **Failover, not load spreading.** A service with several hosts is tried
-  in order, the one that last answered first; every call goes to one host
-  until it stops answering ([card 46](board/backlog/46-spread-calls-across-hosts.md)).
+- **Hosts share no state.** Calls to a service with several hosts land on
+  one at random each time, so whatever a service keeps between calls (in a
+  native service's memory, or on its machine's disk; the `kv` example's
+  store) is per host, and the next call may not see it. A host knows a
+  caller's identity only after that caller called it or ran `wires inbox`,
+  so `wires push --to <role>` from one host reaches only those callers. A
+  push is queued on the host that sent it; `wires inbox` asks every host,
+  so none is missed, but one queued on a host that is down waits there
+  ([card 31](board/backlog/31-inbox-delivery.md)). The spread is per call
+  and blind to load: no host reports how busy it is.
 - **Hosts and directories hold the whole policy**: host and banned node
   ids, removed people's emails, role matchers (often people's emails),
   service names and descriptions, trusted IdPs, directories. It is signed,
@@ -715,7 +726,7 @@ snapshot-tested (`wires/snapshots/`).
 | | `wires network` | Print the network string (stdout): the root key, the policy's first two directories and the sign-in settings. Not secret. With no directory listed yet it still prints, and warns on stderr. On any other node, the string it joined with. |
 | | `wires issuer set <iss> --client-id ID [--audience A]… [--public-client-secret S] [--login]` · `issuer rm <iss>` | Trust an IdP (or change its client id and accepted audiences; default audience: the client id), or stop trusting one no role and no person ban names. `--login` makes it the IdP the network string names; `--public-client-secret` as for `init`. |
 | | `wires role set <name> [--issuer URL] <matcher>…` · `role rm <name>` | Define a role as an OR of matchers: `*@example.com`, `alice@example.com`, or `issuer=…,email=…,org=…,group=…` (all must hold). Every matcher names its issuer, compared exactly: one without `issuer=` takes `--issuer` (default: the IdP the network string names), which must be trusted. `issuer=…` alone admits anyone that IdP verified who carries a verified email; no matcher admits a sign-in without one. `org` is Google's `hd`, read only from Google. There is no built-in role, and a person no role matches is not in the network. |
-| | `wires service add\|set <name> [--description D] [--allow role]… [--host node]…` · `service rm <name>` | Edit the services. `--host` is `label=<node id>` the first time, then the label (or the id), of a node not banned; repeat it for failover. `set` replaces each list given. |
+| | `wires service add\|set <name> [--description D] [--allow role]… [--host node]…` · `service rm <name>` | Edit the services. `--host` is `label=<node id>` the first time, then the label (or the id), of a node not banned; repeat it to spread calls across several. `set` replaces each list given. |
 | | `wires directory add\|rm <node>` | List a node (not banned) as one of the network's directories, and print its next steps; or stop listing it. `label=<node id>` the first time. |
 | | `wires remove <email\|node> [--issuer URL]` | An email: a person ban (`--issuer` defaults to the IdP the network string names): every host refuses that person from any machine, and every directory refuses them a view. A node id or label: a node ban, and the node is dropped from every service's hosts and from the directories. Neither expires. |
 | | `wires restore <email\|node> [--issuer URL]` | Lift a person or node ban. A restored node is not put back into services or directories. |
