@@ -20,7 +20,7 @@ pub struct NodeId([u8; 32]);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Signature([u8; 64]);
 
-/// Signature scheme a signed object (membership, signed policy, call-log
+/// Signature scheme a signed object (membership, signed policy, service
 /// entry) was signed with. Only [`Ed25519`](Self::Ed25519) is implemented
 /// today; the tag travels on the wire so a verifier can reject an object
 /// signed with a scheme it does not support, and so other schemes can be
@@ -207,7 +207,7 @@ impl NodeIdentity {
     }
 
     /// A second owner of this key, for a task that must hold its own (the
-    /// call log's signer beside the endpoint's). Each copy is scrubbed when
+    /// directory's signer beside the endpoint's). Each copy is scrubbed when
     /// it drops. Named rather than `Clone` so every copy is deliberate and
     /// easy to find.
     ///

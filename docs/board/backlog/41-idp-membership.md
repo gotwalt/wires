@@ -1,6 +1,6 @@
 # 41 — Signing in is joining: no badges, no invites
 
-**Stage:** 2 · **Depends on:** [40](40-cut-records.md), [42](42-caller-identity-for-services.md) (both merged first) · **Status:** backlog · **Files:** `library/membership/` (all of it), `library/calls/{session,idp,push}.rs`, `library/services/{item,signed_policy,access}.rs`, `library/directory/frames.rs`, `wires/admin/` (all of it), `wires/caller/{join,login,view,call,inbox,mcp,services,hello}.rs`, `wires/host/{gate,transport,serve,identity,push,embed}.rs`, `wires/directory/`, `wires/policy/`, `wires/gateway/`, `wires/lib.rs`, `wires/help.rs`, `wires/snapshots/`, `wires/testutil.rs`, `wires/e2e/`, `bindings/`, `.scripts/`, `bench/*/up.sh`, `bench/wires-up.sh`, `deploy/gateway/`, `docs/protocol.md` §2–7 and §9
+**Stage:** 2 · **Depends on:** [40](../done/40-cut-records.md), [42](../done/42-caller-identity-for-services.md) (both merged first) · **Status:** backlog · **Files:** `library/membership/` (all of it), `library/calls/{session,idp,push}.rs`, `library/services/{item,signed_policy,access}.rs`, `library/directory/frames.rs`, `wires/admin/` (all of it), `wires/caller/{join,login,view,call,inbox,mcp,services,hello}.rs`, `wires/host/{gate,transport,serve,identity,push,embed}.rs`, `wires/directory/`, `wires/policy/`, `wires/gateway/`, `wires/lib.rs`, `wires/help.rs`, `wires/snapshots/`, `wires/testutil.rs`, `wires/e2e/`, `bindings/`, `.scripts/`, `bench/*/up.sh`, `bench/wires-up.sh`, `deploy/gateway/`, `docs/protocol.md` §2–7 and §9
 
 ## Why (the human, 2026-10-05)
 

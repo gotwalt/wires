@@ -2,7 +2,7 @@
 //! native [`Service`]s, and serve.
 //!
 //! An embedded host is `wires serve` running inside the app. It starts the
-//! same way, keeps the same call log, and decides every call by the same
+//! same way, writes the same log line per call, and decides every call by the same
 //! admin-signed policy. It must be a joined node (`WIRES_HOME=<dir> wires
 //! id`, the admin invites it, `WIRES_HOME=<dir> wires join <token>`), and
 //! the signed policy must assign each of its services to it
@@ -101,7 +101,7 @@ impl Host {
     /// ended and the endpoint is closed, so nothing of the host outlives
     /// the returned future. Errors before serving if the signed policy
     /// doesn't assign every service to this host (after trying to pull a
-    /// newer one), or the call log can't be opened. Listens for no signal.
+    /// newer one). Listens for no signal.
     pub async fn serve_until(self, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
         serve_until(self.serving, async {
             shutdown.await;
@@ -121,7 +121,7 @@ impl Host {
 
 impl HostBuilder {
     /// Also read `path` as `host.json`: its CLI services (served beside
-    /// the native ones), trusted IdPs, `push` and `audit`. Its `services`
+    /// the native ones), trusted IdPs and `push`. Its `services`
     /// may be empty.
     pub fn host_json(mut self, path: impl Into<PathBuf>) -> Self {
         self.host_json = Some(path.into());
@@ -200,7 +200,6 @@ impl HostBuilder {
                 identity: None,
                 services: Default::default(),
                 push: None,
-                audit: None,
             },
         };
         if let Some(name) = native.keys().find(|n| config.services.contains_key(*n)) {

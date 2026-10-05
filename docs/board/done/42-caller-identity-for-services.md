@@ -1,6 +1,6 @@
 # 42 — One caller identity for every service
 
-**Stage:** 1 (parallel with [40](40-cut-records.md)) · **Depends on:** — · **Status:** review · **Files:** `wires/host/{transport,native,embed,service,identity}.rs` (the child's environment, `Call`), `bindings/lib.rs`, `bindings/node/lib.rs`, `bindings/python/examples/`, `bindings/node/examples/`, `wires/examples/kv/`, `wires/e2e/{service_child,native}.rs`, `.scripts/fixtures/`, `docs/protocol.md` §5–6
+**Stage:** 1 (parallel with [40](40-cut-records.md)) · **Depends on:** — · **Status:** done (merged into `simplify` 2026-10-05) · **Files:** `wires/host/{transport,native,embed,service,identity}.rs` (the child's environment, `Call`), `bindings/lib.rs`, `bindings/node/lib.rs`, `bindings/python/examples/`, `bindings/node/examples/`, `wires/examples/kv/`, `wires/e2e/{service_child,native}.rs`, `.scripts/fixtures/`, `docs/protocol.md` §5–6
 
 ## Why (the human, 2026-10-05)
 

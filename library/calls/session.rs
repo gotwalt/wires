@@ -106,7 +106,7 @@ pub struct Hello {
 /// policy.version = StateVersion(5);
 /// policy.not_after = i64::MAX;
 /// policy.services.insert(name.clone(), Service {
-///     description: String::new(), allow: vec![], hosts: vec![host], readers: vec![],
+///     description: String::new(), allow: vec![], hosts: vec![host],
 /// });
 /// let signed = policy.sign(&root).unwrap();
 /// let ack = HelloAck {
@@ -360,7 +360,6 @@ mod tests {
                 description: String::new(),
                 allow: vec![],
                 hosts: hosts.to_vec(),
-                readers: vec![],
             },
         );
         p.sign(root).unwrap()

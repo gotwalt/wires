@@ -25,9 +25,7 @@ use crate::host::gate::{
 };
 
 /// The commands a caller runs: `wires --help` lists exactly these.
-const CALLER: &[&str] = &[
-    "services", "call", "login", "join", "id", "watch", "inbox", "mcp",
-];
+const CALLER: &[&str] = &["services", "call", "login", "join", "id", "inbox", "mcp"];
 
 /// Where the snapshots live.
 fn dir() -> PathBuf {
@@ -152,7 +150,7 @@ fn error_messages_match_their_snapshot() {
         registry(Refusal::NotInRole {
             service: svc.clone(),
             allow: vec![analyst.clone()],
-            principal: Some("sec@audit.example".into()),
+            principal: Some("carol@partner.example".into()),
         })
         .to_string(),
         registry(Refusal::NotInRole {

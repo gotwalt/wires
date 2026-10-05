@@ -153,11 +153,6 @@ impl Call {
         self.call.args().to_vec()
     }
 
-    /// This call's id in the host's call log (what `wires watch` shows).
-    pub fn id(&self) -> String {
-        self.call.id().hex()
-    }
-
     /// Up to `max` bytes of the caller's stdin; empty at EOF. Blocks until
     /// some arrive.
     pub fn read_stdin(&self, max: u32) -> Result<Vec<u8>, WiresError> {
@@ -303,7 +298,7 @@ impl HostBuilder {
     }
 
     /// Also read `path` as `host.json` (CLI services beside the foreign
-    /// ones, trusted IdPs, push, audit export).
+    /// ones, trusted IdPs, push).
     pub fn host_json(self: Arc<Self>, path: String) -> Arc<Self> {
         self.with(|b| b.host_json(path))
     }

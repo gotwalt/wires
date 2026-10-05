@@ -123,12 +123,6 @@ impl Call {
         self.call.args().to_vec()
     }
 
-    /// This call's id in the host's call log (what `wires watch` shows).
-    #[napi]
-    pub fn id(&self) -> String {
-        self.call.id().hex()
-    }
-
     /// Up to `max` bytes (default 64 KiB) of the caller's stdin; empty at
     /// EOF.
     #[napi]
@@ -254,7 +248,7 @@ impl HostBuilder {
     }
 
     /// Also read `path` as `host.json` (CLI services beside the
-    /// JavaScript ones, trusted IdPs, push, audit export).
+    /// JavaScript ones, trusted IdPs, push).
     #[napi]
     pub fn host_json<'a>(&mut self, this: This<'a>, path: String) -> This<'a> {
         self.with(|b| b.host_json(path));

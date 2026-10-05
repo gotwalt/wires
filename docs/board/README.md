@@ -8,11 +8,11 @@ reached by key, with no port or VPN; and a service can message its caller
 back. MCP clients reach the same services through a bridge.
 
 This replaces the premise of 2026-09-23. What changed, and why, is on cards
-[39](backlog/39-premise-and-story.md)–[43](backlog/43-accuracy-sweep.md):
+[39](backlog/39-premise-and-story.md)–[43](backlog/43-accuracy-sweep.md) (40 and 42 are in [done/](done/)):
 the signed call log and `wires watch` are cut for now, a node is admitted by
 its person's IdP sign-in and nothing else (no badges, no invites), and MCP
-is a bridge from existing workflows, not a goal of its own. **Until cards
-40–42 merge, the code is behind this page.**
+is a bridge from existing workflows, not a goal of its own. **Until card
+41 merges, the code still has badges and invites.**
 
 **Non-negotiables:** E2EE with a blind relay (no host or relay holds a key
 it doesn't need; a service child is handed none of the host's keystore,
@@ -54,7 +54,7 @@ honest line from someone who runs remote MCP servers behind Tailscale today.
 
 ## Roles
 
-The target, once cards 40–42 merge.
+The target, once card 41 merges.
 
 | Role | Decides | Commands |
 |---|---|---|
@@ -83,9 +83,7 @@ Open cards only; finished cards are in [done/](done/).
 
 | Card | Stage | Depends on | Status | Summary |
 |---|---|---|---|---|
-| [40](backlog/40-cut-records.md) | 1 | — | backlog | **Cut the call log, OTLP export and `wires watch`**, and the `readers` role with them |
-| [42](backlog/42-caller-identity-for-services.md) | 1 | — | backlog | **One caller identity for every service:** `WIRES_ID_TOKEN` and the verified claims, in the environment and in the native API |
-| [41](backlog/41-idp-membership.md) | 2 | 40, 42 | backlog | **Signing in is joining:** no badges, no invites, no ledger; removal names a person |
+| [41](backlog/41-idp-membership.md) | 2 | — | backlog | **Signing in is joining:** no badges, no invites, no ledger; removal names a person |
 | [39](backlog/39-premise-and-story.md) | 3 | 41 | backlog | **The story:** README, summary, post, usage and the rest rewritten to the premise |
 | [43](backlog/43-accuracy-sweep.md) | 4 | 39 | backlog | **Accuracy sweep:** every doc, comment, help text, script and example checked against the code |
 | [08](doing/08-demo-two-machine.md) | — | 43 | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent; re-record |
@@ -97,7 +95,7 @@ Open cards only; finished cards are in [done/](done/).
 | [32](backlog/32-service-sandbox-OPEN.md) | — | — | open question | **Don't build:** run each service call in a rootless microVM |
 | [18](backlog/18-front-door-OPEN.md) | — | 41 | open question | **Don't build:** `wires login <domain>`, the network string published under a domain |
 
-**Order:** 40 ‖ 42 → 41 → 39 → 43 → 08 (re-record). 44–46 are drafted, not
+**Order:** 41 → 39 → 43 → 08 (re-record). 40 and 42 are done. 44–46 are drafted, not
 scheduled.
 
 ## Rules for workers

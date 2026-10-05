@@ -48,7 +48,7 @@ pub(crate) struct ServiceArgs {
 pub(crate) enum ServiceCmd {
     /// Register a new service and publish the new policy
     #[command(
-        after_help = "Example:\n  wires service add orders-db --description \"Read-only SQL over the orders database\" \\\n    --allow analyst --reader security --host workbench --host spare"
+        after_help = "Example:\n  wires service add orders-db --description \"Read-only SQL over the orders database\" \\\n    --allow analyst --host workbench --host spare"
     )]
     Add(ServiceEditArgs),
     /// Change an existing service (each flag given replaces that list)
@@ -75,9 +75,6 @@ pub(crate) struct ServiceEditArgs {
     /// Repeatable (failover).
     #[arg(long = "host")]
     pub(crate) host: Vec<String>,
-    /// A role that may read its call records. Repeatable.
-    #[arg(long = "reader")]
-    pub(crate) reader: Vec<String>,
     /// Lifetime of the new policy, from now (`90d`, `12h`, … or seconds);
     /// never shortens the current one.
     #[arg(long = "policy-ttl", default_value = Ttl::POLICY_DEFAULT, hide = true)]
@@ -208,8 +205,6 @@ pub(crate) struct ServiceEdit {
     /// Its hosts, replacing the list (each must be a node this admin
     /// invited, and not banned).
     pub(crate) hosts: Option<Vec<NodeId>>,
-    /// Its record readers, replacing the list.
-    pub(crate) readers: Option<Vec<RoleName>>,
 }
 
 impl ServiceEdit {
@@ -223,9 +218,6 @@ impl ServiceEdit {
         }
         if let Some(h) = self.hosts {
             svc.hosts = h;
-        }
-        if let Some(r) = self.readers {
-            svc.readers = r;
         }
     }
 }
@@ -326,7 +318,6 @@ pub(crate) fn add(ks: &Keystore, name: ServiceName, edit: ServiceEdit, ttl: Ttl)
             description: String::new(),
             allow: Vec::new(),
             hosts: Vec::new(),
-            readers: Vec::new(),
         };
         edit.apply(&mut svc);
         s.services.insert(name, svc);
@@ -580,7 +571,6 @@ pub(crate) fn edit_from(ks: &Keystore, a: &ServiceEditArgs) -> Result<ServiceEdi
         description: a.description.clone(),
         allow: role_names(&a.allow)?,
         hosts: host_ids(ks, &a.host)?,
-        readers: role_names(&a.reader)?,
     })
 }
 
@@ -747,7 +737,6 @@ mod tests {
             description: Some("orders".into()),
             allow: Some(vec![role("analyst")]),
             hosts: Some(vec![host]),
-            readers: None,
         };
         let s = add(&ks, svc("orders-db"), edit.clone(), ttl()).unwrap();
         assert!(s.policy.assigns(&svc("orders-db"), host));

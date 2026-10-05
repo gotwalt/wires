@@ -200,8 +200,8 @@ pub(crate) fn write_own_hint(ks: &Keystore, endpoint: &iroh::Endpoint) -> anyhow
 }
 
 /// Every host of the services in `names` that `view` holds, once each, in
-/// first-seen order (for `wires inbox` and `wires watch`: the hosts of the
-/// services you use).
+/// first-seen order (for `wires inbox`: the hosts of the services you
+/// use).
 pub(crate) fn hosts_of<'a>(
     view: &View,
     names: impl IntoIterator<Item = &'a ServiceName>,
@@ -210,7 +210,7 @@ pub(crate) fn hosts_of<'a>(
     for name in names {
         for h in view
             .entry(name)
-            .map(|e| e.entry.service.hosts.clone())
+            .map(|e| e.service.hosts.clone())
             .unwrap_or_default()
         {
             if !out.contains(&h) {
@@ -254,7 +254,6 @@ mod tests {
             description: String::new(),
             allow: vec![staff.clone()],
             hosts,
-            readers: vec![],
         };
         s.services.insert(
             ServiceName::new("orders-db").unwrap(),
@@ -269,7 +268,7 @@ mod tests {
     fn last_good_first_then_registry_order() {
         let v = view();
         let name = ServiceName::new("orders-db").unwrap();
-        let svc = &v.entry(&name).unwrap().entry.service;
+        let svc = &v.entry(&name).unwrap().service;
         assert_eq!(candidates(svc, None), vec![node(2), node(3)]);
         assert_eq!(candidates(svc, Some(node(3))), vec![node(3), node(2)]);
         assert_eq!(candidates(svc, Some(node(4))), vec![node(2), node(3)]);

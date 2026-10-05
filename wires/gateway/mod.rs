@@ -7,8 +7,8 @@
 //! Google for an ID token whose `nonce` is bound to the gateway's node key
 //! (the same binding `wires login` makes for a caller's own node). Every call
 //! then presents **that user's** ID token in the session handshake, so the
-//! host verifies Google's signature for that user itself and records them
-//! as the caller. The gateway holds nothing a host has to trust beyond its
+//! host verifies Google's signature for that user itself and decides for
+//! them as the caller. The gateway holds nothing a host has to trust beyond its
 //! membership: it can't name a user Google didn't sign in.
 //!
 //! What a web user sees is their **view** (card 37), as for any caller: the
@@ -269,7 +269,7 @@ impl crate::caller::call::Caller for PresentingCaller {
         stdin: Vec<u8>,
     ) -> Result<crate::caller::call::CallOutcome> {
         use crate::caller::call::{SERVICE_DIAL_TIMEOUT, ServiceDial, call_entry, outcome};
-        let Some(entry) = self.view.entry(&tool.name).filter(|e| e.call) else {
+        let Some(entry) = self.view.entry(&tool.name) else {
             bail!("`{}` is not a service this user may call", tool.name);
         };
         let dial = ServiceDial {
@@ -282,7 +282,7 @@ impl crate::caller::call::Caller for PresentingCaller {
             &self.creds,
             &self.ks,
             self.view.head.head.version,
-            &entry.entry,
+            entry,
             &dial,
             argv,
             std::io::Cursor::new(stdin),
@@ -671,7 +671,6 @@ pub(crate) mod tests {
             description: "d".into(),
             allow,
             hosts: vec![node(3)],
-            readers: vec![],
         };
         let analyst = RoleName::new("analyst").unwrap();
         s.services.insert(

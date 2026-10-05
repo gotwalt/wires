@@ -35,7 +35,7 @@ pub struct Grant {
 }
 
 /// Why [`authorize`] refused. The `Display` text is what the caller is told
-/// and what the call log records, so each case is precise.
+/// and what the host's log line says, so each case is precise.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// The policy bans the caller: the admin removed it.
@@ -117,7 +117,6 @@ impl fmt::Display for Refusal {
 ///     description: String::new(),
 ///     allow: vec![staff.clone()],
 ///     hosts: vec![host],
-///     readers: vec![],
 /// });
 /// let alice = Principal {
 ///     issuer: "https://idp".into(), subject: "a".into(), email: None, org: None,
@@ -246,7 +245,6 @@ mod tests {
             description: String::new(),
             allow,
             hosts: vec![node(4)],
-            readers: vec![],
         };
         s.services.insert(name("orders-db"), svc(vec![analyst]));
         s.services.insert(name("status"), svc(vec![staff()]));

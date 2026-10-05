@@ -10,7 +10,7 @@
 //!
 //! - **Signed bytes:** [`POLICY_HEAD_CONTEXT`] followed by the canonical JSON
 //!   of `{alg, head}`. The context separates it from service entries,
-//!   memberships, call-log entries and [`Fresh`](crate::Fresh).
+//!   memberships and [`Fresh`](crate::Fresh).
 //! - **Format:** [`POLICY_V3`], a signed discriminant (formats 1 and 2 were
 //!   the signed state the policy replaced, card 36). Unknown fields are
 //!   refused at decode.

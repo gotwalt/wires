@@ -1,9 +1,9 @@
 //! The caller's **view** (card 37): the services this node's verified person
-//! may call or read, each a root-signed entry, and nothing else.
+//! may call, each a root-signed entry, and nothing else.
 //!
 //! A caller never holds the policy. It holds `$WIRES_HOME/view.json`
 //! ([`HeldView`]): the root-signed head, the directory's newest [`Fresh`]
-//! for it, and the [`ViewEntry`]s a directory cut for its ID token. No
+//! for it, and the signed entries a directory cut for its ID token. No
 //! role, no ban, no other service, and no node id but its services' hosts
 //! and the directories. Every entry verifies on its own under the root
 //! ([`View::verify`]), so a directory can't forge one; what it could do is
@@ -37,8 +37,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::Endpoint;
 use library::{
     DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, Fresh, IdToken, Membership, NodeId,
-    ServiceName, SignedPolicyHead, StateVersion, SubFrame, SubRequest, SubscriptionKind, View,
-    ViewDigest, ViewEntry,
+    ServiceName, SignedEntry, SignedPolicyHead, StateVersion, SubFrame, SubRequest,
+    SubscriptionKind, View, ViewDigest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -112,13 +112,8 @@ impl HeldView {
             || self.seen > self.version()
     }
 
-    /// The entries this caller may call (marked `call`), in name order.
-    pub(crate) fn callable(&self) -> impl Iterator<Item = &ViewEntry> {
-        self.view.entries.iter().filter(|e| e.call)
-    }
-
     /// The entry for `service`, if the view holds it.
-    pub(crate) fn entry(&self, service: &ServiceName) -> Option<&ViewEntry> {
+    pub(crate) fn entry(&self, service: &ServiceName) -> Option<&SignedEntry> {
         self.view.entry(service)
     }
 }
@@ -288,7 +283,7 @@ pub(crate) async fn ask_resolve(
             fresh
                 .verify(&view.head)
                 .context("the directory's freshness doesn't vouch for its view")?;
-            if view.entries.iter().any(|e| e.entry.name != *service) {
+            if view.entries.iter().any(|e| e.name != *service) {
                 bail!("the directory resolved {service} to another service");
             }
             Ok(view)
@@ -457,7 +452,7 @@ pub(crate) async fn resolve(
     ks: &Keystore,
     asker: &Asker<'_>,
     service: &ServiceName,
-) -> Result<Option<ViewEntry>> {
+) -> Result<Option<SignedEntry>> {
     let root = asker.badge.fabric;
     let me = transport::to_node_id(&asker.endpoint.id());
     let mut failures = Vec::new();
@@ -716,7 +711,6 @@ mod tests {
                 description: "orders".into(),
                 allow: vec![staff],
                 hosts: vec![NodeIdentity::from_seed([52; 32]).node_id()],
-                readers: vec![],
             },
         );
         crate::testutil::signed_policy(&root(), p)
@@ -748,7 +742,6 @@ mod tests {
         // A forged entry fails closed.
         let mut forged = held;
         forged.view.entries[0]
-            .entry
             .service
             .hosts
             .push(NodeIdentity::from_seed([66; 32]).node_id());

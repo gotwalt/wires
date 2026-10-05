@@ -11,18 +11,15 @@
 //!   keyed by the verified person; stdin in, stdout out, exit codes back;
 //!   the handler holds the caller's ID token and verified principal.
 //! - [`a_refused_caller_never_reaches_the_handler`]
-//! - [`a_native_call_is_logged_like_a_cli_call`]: the host's own signed,
-//!   hash-linked log (what `wires watch` streams) holds `Started` and
-//!   `Finished` with the caller's identity, role, and stdio digests.
 //! - [`an_unassigned_native_service_refuses_to_start`]
 //! - [`a_native_service_pushes_to_its_caller`]: `push_to_caller` goes through
-//!   the call's push capability and `push.allow`, and is logged naming the
-//!   call; a host without push says so, and `push.allow` refuses a caller
+//!   the call's push capability and `push.allow`; a host without push says
+//!   so, and `push.allow` refuses a caller
 //!   in none of its roles.
 //! - [`each_verified_person_gets_their_own_kv`]: two admitted people, two
 //!   namespaces.
 //! - [`native_and_cli_services_share_one_host`]: `host.json`'s CLI services
-//!   beside the native ones, through the same gate and log.
+//!   beside the native ones, through the same gate.
 //! - [`a_stopped_host_closes_its_endpoint`]: nothing outlives `serve_until`.
 
 use std::sync::Arc;
@@ -30,8 +27,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use iroh::{Endpoint, EndpointAddr};
 use library::{
-    AuditRecord, Hello, Invocation, Matcher, Membership, NodeIdentity, OidcNonce, OutputHasher,
-    Policy, RoleName, Service as Registered, ServiceName, SignedPolicy, StateVersion,
+    Hello, Invocation, Matcher, Membership, NodeIdentity, OidcNonce, Policy, RoleName,
+    Service as Registered, ServiceName, SignedPolicy, StateVersion,
 };
 use tokio::sync::oneshot;
 
@@ -101,7 +98,6 @@ impl World {
                     description: String::new(),
                     allow: allow.iter().map(|r| RoleName::new(*r).unwrap()).collect(),
                     hosts: vec![self.host.node_id()],
-                    readers: vec![],
                 },
             );
         }
@@ -159,14 +155,13 @@ struct Running {
     addr: EndpointAddr,
     /// The host's endpoint (a handle to the one it serves on).
     endpoint: Endpoint,
-    home: std::path::PathBuf,
     stop: Option<oneshot::Sender<()>>,
     served: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
 impl Running {
     /// Serve `host` (built for `w.host`) on a fresh loopback endpoint.
-    async fn start(w: &World, host: Host, home: std::path::PathBuf) -> Running {
+    async fn start(w: &World, host: Host) -> Running {
         let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key(&w.host))
             .bind()
@@ -180,7 +175,6 @@ impl Running {
         Running {
             addr,
             endpoint,
-            home,
             stop: Some(stop),
             served,
         }
@@ -293,7 +287,7 @@ async fn a_native_service_is_called_like_a_cli() {
         .service("kv", kv_example::Kv::default())
         .build()
         .unwrap();
-    let host = Running::start(&w, host, home).await;
+    let host = Running::start(&w, host).await;
 
     // State across calls, the value on stdin, the answer on stdout.
     assert_eq!(
@@ -348,7 +342,7 @@ async fn a_refused_caller_never_reaches_the_handler() {
         .service("count", Counting(Arc::clone(&reached)))
         .build()
         .unwrap();
-    let host = Running::start(&w, host, home).await;
+    let host = Running::start(&w, host).await;
 
     assert_eq!(
         call(&w, &host, &w.bob, "count", &[], "").await,
@@ -368,76 +362,6 @@ async fn a_refused_caller_never_reaches_the_handler() {
 }
 
 #[tokio::test]
-async fn a_native_call_is_logged_like_a_cli_call() {
-    let w = World::new().await;
-    let home = w.keystore(&w.state(&["kv"]));
-    let host = w
-        .builder(&home)
-        .service("kv", kv_example::Kv::default())
-        .build()
-        .unwrap();
-    let host = Running::start(&w, host, home).await;
-    assert_eq!(
-        call(&w, &host, &w.alice, "kv", &["set", "k"], "v1").await,
-        ran(0, "")
-    );
-    assert_eq!(
-        call(&w, &host, &w.bob, "kv", &["keys"], "").await,
-        Outcome::Denied("bob@example.com is in no role allowed to call kv (analyst)".into())
-    );
-    let home = host.home.clone();
-    host.stop().await.unwrap();
-
-    let entries = crate::host::call_log::read(&home.join(crate::host::call_log::LOG_FILE)).unwrap();
-    library::verify_chain(w.host.node_id(), None, &entries).expect("a signed, unbroken chain");
-    let records: Vec<&AuditRecord> = entries.iter().map(|e| &e.record).collect();
-    let [started, finished, denied] = records.as_slice() else {
-        panic!("expected Started, Finished, Denied; got {records:?}");
-    };
-    let AuditRecord::Started {
-        call,
-        caller,
-        principal,
-        service,
-        argv,
-        role,
-        ..
-    } = started
-    else {
-        panic!("expected Started first, got {started:?}");
-    };
-    assert_eq!(*caller, w.alice.node_id());
-    assert_eq!(
-        principal.as_ref().unwrap().email.as_deref(),
-        Some("alice@example.com")
-    );
-    assert_eq!(
-        (service.as_str(), argv.as_slice(), role.as_str()),
-        ("kv", &["set".to_string(), "k".to_string()][..], "analyst")
-    );
-    let AuditRecord::Finished {
-        call: done,
-        exit,
-        stdout_bytes,
-        stdin_bytes,
-        stdin_digest,
-        stdin_head,
-        ..
-    } = finished
-    else {
-        panic!("expected Finished second, got {finished:?}");
-    };
-    let mut v1 = OutputHasher::new();
-    v1.update(b"v1");
-    assert_eq!((done, *exit, *stdout_bytes), (call, 0, 0));
-    assert_eq!(
-        (*stdin_bytes, *stdin_digest, stdin_head.as_deref()),
-        (2, v1.finish(), Some("v1"))
-    );
-    assert!(matches!(denied, AuditRecord::Denied { caller, .. } if *caller == w.bob.node_id()));
-}
-
-#[tokio::test]
 async fn an_unassigned_native_service_refuses_to_start() {
     let w = World::new().await;
     let home = w.keystore(&w.state(&["kv"]));
@@ -447,7 +371,7 @@ async fn an_unassigned_native_service_refuses_to_start() {
         .service("other", kv_example::Kv::default())
         .build()
         .unwrap();
-    let served = Running::start(&w, host, home).await;
+    let served = Running::start(&w, host).await;
     let e = format!("{:#}", served.stop().await.unwrap_err());
     assert!(
         e.contains("native service other, but the signed policy (version 1) has no such service"),
@@ -490,48 +414,17 @@ async fn a_native_service_pushes_to_its_caller() {
         .service("notify", Notify)
         .build()
         .unwrap();
-    let host = Running::start(&w, host, home).await;
+    let host = Running::start(&w, host).await;
     assert_eq!(
         call(&w, &host, &w.alice, "notify", &["deployed"], "").await,
         ran(0, "queued")
     );
-    let home = host.home.clone();
     host.stop().await.unwrap();
-    let entries = crate::host::call_log::read(&home.join(crate::host::call_log::LOG_FILE)).unwrap();
-    let started = entries
-        .iter()
-        .find_map(|e| match &e.record {
-            AuditRecord::Started { call, .. } => Some(*call),
-            _ => None,
-        })
-        .expect("the call was logged");
-    let pushed = entries
-        .iter()
-        .find_map(|e| match &e.record {
-            AuditRecord::Push {
-                to,
-                call,
-                subject,
-                outcome,
-                ..
-            } => Some((*to, *call, subject.as_str().to_string(), *outcome)),
-            _ => None,
-        })
-        .expect("the push was logged");
-    assert_eq!(
-        pushed,
-        (
-            w.alice.node_id(),
-            Some(started),
-            "deployed".to_string(),
-            library::PushOutcome::Queued
-        )
-    );
 
     // A host with no push configured says so to the handler.
     let home = w.keystore(&state);
     let host = w.builder(&home).service("notify", Notify).build().unwrap();
-    let host = Running::start(&w, host, home).await;
+    let host = Running::start(&w, host).await;
     assert_eq!(
         call(&w, &host, &w.alice, "notify", &["deployed"], "").await,
         Outcome::Ran {
@@ -554,7 +447,7 @@ async fn push_allow_refuses_a_caller_in_none_of_its_roles() {
         .service("notify", Notify)
         .build()
         .unwrap();
-    let host = Running::start(&w, host, home).await;
+    let host = Running::start(&w, host).await;
     let Outcome::Ran {
         code,
         stdout,
@@ -565,20 +458,7 @@ async fn push_allow_refuses_a_caller_in_none_of_its_roles() {
     };
     assert_eq!((code, stdout.as_str()), (1, ""));
     assert!(stderr.starts_with("push refused: "), "{stderr}");
-    let home = host.home.clone();
     host.stop().await.unwrap();
-    // The refused push is in the log, as denied.
-    let entries = crate::host::call_log::read(&home.join(crate::host::call_log::LOG_FILE)).unwrap();
-    assert!(
-        entries.iter().any(|e| matches!(
-            &e.record,
-            AuditRecord::Push {
-                outcome: library::PushOutcome::Denied,
-                ..
-            }
-        )),
-        "the refused push should be logged"
-    );
 }
 
 #[tokio::test]
@@ -590,7 +470,7 @@ async fn each_verified_person_gets_their_own_kv() {
         .service("kv", kv_example::Kv::default())
         .build()
         .unwrap();
-    let host = Running::start(&w, host, home).await;
+    let host = Running::start(&w, host).await;
     for (who, value) in [(&w.alice, "alice's"), (&w.bob, "bob's")] {
         assert_eq!(
             call(&w, &host, who, "kv", &["set", "k"], value).await,
@@ -624,7 +504,7 @@ async fn native_and_cli_services_share_one_host() {
         .service("kv", kv_example::Kv::default())
         .build()
         .unwrap();
-    let host = Running::start(&w, host, home).await;
+    let host = Running::start(&w, host).await;
     assert_eq!(
         call(&w, &host, &w.alice, "hello", &[], "").await,
         ran(0, "hello from a CLI\n")
@@ -640,18 +520,7 @@ async fn native_and_cli_services_share_one_host() {
             Outcome::Denied(_)
         ));
     }
-    let home = host.home.clone();
     host.stop().await.unwrap();
-    // One log for both.
-    let entries = crate::host::call_log::read(&home.join(crate::host::call_log::LOG_FILE)).unwrap();
-    let started: Vec<&str> = entries
-        .iter()
-        .filter_map(|e| match &e.record {
-            AuditRecord::Started { service, .. } => Some(service.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(started, ["hello", "kv"]);
 }
 
 #[tokio::test]
@@ -663,7 +532,7 @@ async fn a_stopped_host_closes_its_endpoint() {
         .service("kv", kv_example::Kv::default())
         .build()
         .unwrap();
-    let host = Running::start(&w, host, home).await;
+    let host = Running::start(&w, host).await;
     assert_eq!(
         call(&w, &host, &w.alice, "kv", &["keys"], "").await,
         ran(0, "")

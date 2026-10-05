@@ -11,8 +11,6 @@
 //!   every call by the admin-signed policy (the registry's roles,
 //!   `also_require`, removal with no restart, refusing unassigned services,
 //!   push by the policy).
-//! - [`records`] — card 26b: call records streamed from the host's own log
-//!   to authorized readers (`wires watch`).
 //! - [`service_child`] — card 28 §1: a service child gets a minimal
 //!   environment and a per-call push capability, not the host's keystore.
 //! - [`gateway`] — `wires gateway`: a web MCP client signs in (OAuth, a mock
@@ -25,7 +23,7 @@
 //! - [`views`] — card 37: each caller holds only its view, and a running
 //!   `wires mcp` hears of a grant or a revocation within 2 s.
 //! - [`native`] — card 33: an embedded [`Host`](crate::Host) serves a native
-//!   service (the `kv` example), called and logged like a CLI service.
+//!   service (the `kv` example), called like a CLI service.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -46,9 +44,6 @@ use crate::host::transport::{ALPN, secret_key};
 
 /// Card 27's host side: a host decides by the signed policy.
 mod services_host;
-
-/// Card 26b: call records streamed from the host's log to authorized readers.
-mod records;
 
 /// Starting a network: no step errors, in the order each step names.
 mod first_run;

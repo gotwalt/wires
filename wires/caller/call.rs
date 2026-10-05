@@ -38,7 +38,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use library::{
     Argv, Hello, HelloAck, IdToken, Invocation, Membership, NodeId, NodeIdentity, ServiceName,
-    SignedEntry, StateVersion, ViewEntry,
+    SignedEntry, StateVersion,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -375,7 +375,7 @@ fn check_alias(held: &HeldView, plan: &Dial) -> Result<()> {
     let service = plan.invocation.service.clone();
     let listed = held
         .entry(&service)
-        .is_some_and(|e| e.entry.service.hosts.contains(&plan.target));
+        .is_some_and(|e| e.service.hosts.contains(&plan.target));
     if !listed {
         bail!(
             "the alias's host {} is not assigned `{service}` in your view (policy version {}); \
@@ -496,10 +496,8 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    // A read-only entry is not one to call: refused here, with no host
-    // traffic (a host would only refuse it).
     let entry = match held.entry(service) {
-        Some(e) => callable(Some(e), service, creds.id_token(ks).is_some())?,
+        Some(e) => e.clone(),
         None => resolve_entry(creds, ks, dial.endpoint, service).await?,
     };
     let called = call_entry(
@@ -554,23 +552,10 @@ async fn resolve_entry(
         .await
         .unwrap_or_else(|_| Err(anyhow!("no directory answered")));
     match found {
-        Ok(found) => callable(found.as_ref(), service, signed_in),
+        Ok(found) => found.ok_or_else(|| not_callable(service, signed_in)),
         Err(e) => Err(e.context(format!(
             "`{service}` is not in this node's view, and no directory could be asked"
         ))),
-    }
-}
-
-/// The entry to call `service` by: `found` if this caller may call it
-/// (marked `call`, not only `read`), else [`not_callable`].
-fn callable(
-    found: Option<&ViewEntry>,
-    service: &ServiceName,
-    signed_in: bool,
-) -> Result<SignedEntry> {
-    match found {
-        Some(e) if e.call => Ok(e.entry.clone()),
-        _ => Err(not_callable(service, signed_in)),
     }
 }
 
@@ -741,7 +726,7 @@ pub fn lookup<'a>(config: &'a ToolsConfig, name: &str) -> Result<&'a RemoteTool>
 /// anything is dialed.
 ///
 /// The shaping flags are local: they are not part of the [`Invocation`], so
-/// the host never sees them and its call record holds only `(service, argv)`.
+/// the host never sees them: it gets only `(service, argv)`.
 ///
 /// In locked mode ([`Lock`]), an override flag, or data on stdin the operator
 /// didn't allow, fails with [`EXIT_LOCKED`] before anything is dialed.
@@ -1087,7 +1072,6 @@ mod tests {
                     description: String::new(),
                     allow: vec![staff.clone()],
                     hosts: vec![server.node_id()],
-                    readers: vec![],
                 },
             );
         }
@@ -1351,7 +1335,6 @@ mod tests {
                 description: "Read-only SQL".into(),
                 allow: vec![staff],
                 hosts: hosts.to_vec(),
-                readers: vec![],
             },
         );
         crate::testutil::signed_policy(root, s)
@@ -1495,57 +1478,6 @@ mod tests {
             b_seen.lock().unwrap().is_empty(),
             "no failover after a refusal"
         );
-    }
-
-    /// A service this caller may only read is not one it may call: refused
-    /// here with the next step (exit 1, not a host's 77), and no host is
-    /// dialed. Likewise for an entry a directory resolves read-only.
-    #[tokio::test]
-    async fn a_read_only_entry_is_not_called_and_no_host_is_dialed() {
-        let f = fixture();
-        let h = NodeIdentity::from_seed([90; 32]);
-        let mut p = signed_state(&f.root, 1, &[h.node_id()])
-            .to_policy()
-            .unwrap();
-        let (staff, admins) = (
-            library::RoleName::new("staff").unwrap(),
-            library::RoleName::new("admins").unwrap(),
-        );
-        p.roles.insert(
-            admins.clone(),
-            vec![library::Matcher {
-                email: Some("root@example.com".parse().unwrap()),
-                ..library::Matcher::new(IDP)
-            }],
-        );
-        let svc = p
-            .services
-            .get_mut(&ServiceName::new("orders-db").unwrap())
-            .unwrap();
-        svc.allow = vec![admins];
-        svc.readers = vec![staff];
-        let read_only = crate::testutil::signed_policy(&f.root, p);
-        let state = held(&f, &read_only);
-        let entry = &state.view.entries[0];
-        assert!(entry.read && !entry.call);
-        let answer = Answer::Run {
-            out: "42\n",
-            policy: None,
-        };
-        let (h_id, h_addr, seen) = fake_host(&f.root, &h, answer).await;
-        let (r, out) = run_service(&f, &state, Hints::from_pairs([(h_id, vec![h_addr])])).await;
-        let err = r.unwrap_err();
-        assert!(
-            err.downcast_ref::<transport::Denied>().is_none(),
-            "not a host's refusal"
-        );
-        assert!(format!("{err:#}").contains("that you may call"), "{err:#}");
-        assert_eq!(out, "");
-        assert!(seen.lock().unwrap().is_empty(), "no host was dialed");
-
-        let name = ServiceName::new("orders-db").unwrap();
-        let err = callable(Some(entry), &name, true).unwrap_err();
-        assert!(err.to_string().contains("that you may call"), "{err}");
     }
 
     /// Every host down: one error naming each.

@@ -12,7 +12,8 @@
 //!
 //! - **Signed bytes:** [`ENTRY_CONTEXT`] followed by the canonical JSON of
 //!   every field but `sig`.
-//! - **Format:** [`ENTRY_V1`], signed; unknown fields are refused at decode.
+//! - **Format:** [`ENTRY_V2`], signed; unknown fields are refused at decode.
+//!   Format 1 also carried the service's `readers`; it is refused.
 //! - **`version`** is the policy version at which the entry last changed. An
 //!   edit re-signs only the entries it changes
 //!   ([`Policy::sign_after`](crate::Policy::sign_after)); the rest keep their
@@ -23,7 +24,7 @@
 //! use library::{NodeIdentity, Service, ServiceName, SignedEntry, StateVersion};
 //! let root = NodeIdentity::from_seed([1u8; 32]);
 //! let service = Service {
-//!     description: "uptime".into(), allow: vec![], hosts: vec![], readers: vec![],
+//!     description: "uptime".into(), allow: vec![], hosts: vec![],
 //! };
 //! let name = ServiceName::new("status").unwrap();
 //! let entry = SignedEntry::sign(&root, StateVersion(4), name, service).unwrap();
@@ -40,8 +41,9 @@ use crate::head::StateVersion;
 use crate::identity::{AlgorithmId, NodeId, NodeIdentity, Signature};
 use crate::registry::{Service, ServiceName};
 
-/// The current (and only) signed-entry format.
-pub const ENTRY_V1: u8 = 1;
+/// The current (and only accepted) signed-entry format. Format 1, whose
+/// [`Service`] also named `readers`, is refused.
+pub const ENTRY_V2: u8 = 2;
 
 /// Domain-separation prefix of a signed entry's bytes.
 pub const ENTRY_CONTEXT: &[u8] = b"wires/service-entry/v1\0";
@@ -50,7 +52,7 @@ pub const ENTRY_CONTEXT: &[u8] = b"wires/service-entry/v1\0";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedEntry {
-    /// Format discriminant; [`ENTRY_V1`]. Signed.
+    /// Format discriminant; [`ENTRY_V2`]. Signed.
     pub format: u8,
     /// The root's node id: the authority, pinned by
     /// [`verify`](Self::verify).
@@ -60,7 +62,7 @@ pub struct SignedEntry {
     pub version: StateVersion,
     /// The service's name.
     pub name: ServiceName,
-    /// Who may call and read it, and which hosts run it.
+    /// Who may call it, and which hosts run it.
     pub service: Service,
     /// Which scheme `sig` was produced with.
     pub alg: AlgorithmId,
@@ -78,7 +80,7 @@ impl SignedEntry {
         service: Service,
     ) -> Result<SignedEntry> {
         let body = SignedBody {
-            format: ENTRY_V1,
+            format: ENTRY_V2,
             fabric: root.node_id(),
             version,
             name: &name,
@@ -103,7 +105,7 @@ impl SignedEntry {
     /// (a [`View`](crate::View) or [`SignedPolicy`](crate::SignedPolicy)
     /// checks `version` against its head).
     pub fn verify(&self, root: NodeId) -> Result<()> {
-        if self.format != ENTRY_V1 {
+        if self.format != ENTRY_V2 {
             return Err(Error::UnsupportedVersion);
         }
         if self.alg != AlgorithmId::Ed25519 {
@@ -173,7 +175,6 @@ mod tests {
             description: "uptime".into(),
             allow: vec![crate::RoleName::new("staff").unwrap()],
             hosts: vec![node(10)],
-            readers: vec![],
         }
     }
 
@@ -191,7 +192,7 @@ mod tests {
     fn sign_verify_round_trip() {
         let e = entry();
         e.verify(root().node_id()).unwrap();
-        assert_eq!(e.format, ENTRY_V1);
+        assert_eq!(e.format, ENTRY_V2);
         assert_eq!(e.fabric, root().node_id());
         let back: SignedEntry = serde_json::from_slice(&canonical_bytes(&e).unwrap()).unwrap();
         assert_eq!(back, e);
@@ -240,12 +241,15 @@ mod tests {
         relabelled.fabric = root().node_id();
         assert!(relabelled.verify(root().node_id()).is_err());
 
-        let mut t = good.clone();
-        t.format = ENTRY_V1 + 1;
-        assert!(matches!(
-            t.verify(root().node_id()),
-            Err(Error::UnsupportedVersion)
-        ));
+        // Format 1 (with `readers`) and any later format: refused.
+        for format in [1, ENTRY_V2 + 1] {
+            let mut t = good.clone();
+            t.format = format;
+            assert!(matches!(
+                t.verify(root().node_id()),
+                Err(Error::UnsupportedVersion)
+            ));
+        }
     }
 
     #[test]
@@ -254,9 +258,7 @@ mod tests {
         let name = ServiceName::new("status").unwrap();
         assert!(e.is_for(root().node_id(), &name, &service()));
         let mut changed = service();
-        changed
-            .readers
-            .push(crate::RoleName::new("auditor").unwrap());
+        changed.allow.push(crate::RoleName::new("auditor").unwrap());
         assert!(!e.is_for(root().node_id(), &name, &changed));
         assert!(!e.is_for(node(9), &name, &service()));
         assert!(!e.is_for(
@@ -270,6 +272,14 @@ mod tests {
     fn unknown_fields_are_refused() {
         let mut v = serde_json::to_value(entry()).unwrap();
         v["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<SignedEntry>(v).is_err());
+    }
+
+    #[test]
+    fn a_format_1_entry_with_readers_is_refused_at_decode() {
+        let mut v = serde_json::to_value(entry()).unwrap();
+        v["format"] = serde_json::json!(1);
+        v["service"]["readers"] = serde_json::json!([]);
         assert!(serde_json::from_value::<SignedEntry>(v).is_err());
     }
 

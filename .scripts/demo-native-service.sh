@@ -25,8 +25,7 @@
 # 1 with its message; the handler's call.id_token() is the ID token alice
 # presented; bob, whose view holds no kv, dials nothing (exit 1);
 # push_to_caller reaches alice's `wires inbox` from the host's verified key;
-# the host's signed log, read by alice's own `wires watch`, shows her calls
-# with her verified email; and SIGTERM makes the example call `stop()`, so
+# and SIGTERM makes the example call `stop()`, so
 # `serve()` returns and the process exits 0 on its own.
 #
 # Python comes from uv (a uv-managed CPython, $WIRES_PYTHON, default 3.13;
@@ -276,7 +275,7 @@ grep -qF "no service named \`kv\` that you may call" "$D/c4.err" || {
 ok "bob holds no kv in his view: nothing dialed, the handler never runs"
 
 # --------------------------------------------------------------------------
-# The handler's push, and the host's own record.
+# The handler's push.
 # --------------------------------------------------------------------------
 WIRES_HOME="$agent" "$WIRES" inbox >"$D/i1.out" 2>"$D/i1.err" || {
 	dump "$D/i1.err"
@@ -288,20 +287,6 @@ grep -qF "from host ${HOST_ID:0:8} (verified)  kv: greeting set" "$D/i1.out" || 
 	bad "the handler's push_to_caller did not reach alice's inbox"
 }
 ok "push_to_caller from $LANG_NAME reached alice's wires inbox, from the host's verified key"
-
-WIRES_HOME="$agent" "$WIRES" watch --mine --once kv >"$D/w.out" 2>"$D/w.err" || {
-	dump "$D/w.err"
-	bad "wires watch failed"
-}
-grep -qE "kv +▶ [0-9a-f]+ $EMAIL .*\[analyst\] kv set greeting" "$D/w.out" || {
-	dump "$D/w.out"
-	bad "alice's watch does not show her set, with her verified email and role"
-}
-grep -qE "kv +■ [0-9a-f]+ exit 0 .*stdin \"hello\"" "$D/w.out" || {
-	dump "$D/w.out"
-	bad "alice's watch does not show the set's exit and its stdin"
-}
-ok "the host's signed log shows alice's calls to the $LANG_NAME service, with her verified email"
 
 # --------------------------------------------------------------------------
 # Stop: SIGTERM makes the example call host.stop(); serve() returns and the

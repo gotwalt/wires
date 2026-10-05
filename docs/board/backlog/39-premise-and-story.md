@@ -22,7 +22,7 @@ chose (2026-10-04/05):
   irrelevant." `wires mcp` and `wires gateway` carry existing MCP workflows
   over; the gateway is worth having for Claude on the web.
 - **Cut for now:** the signed call log, OTLP and `wires watch`
-  ([card 40](40-cut-records.md)). **Gone:** badges and invites
+  ([card 40](../done/40-cut-records.md)). **Gone:** badges and invites
   ([card 41](41-idp-membership.md)).
 
 ## What to write

@@ -5,7 +5,7 @@
 # cross-compiling. `docker build -t wires .` (or `make image`).
 #
 # The image holds only `wires`: enough for the caller side (`wires call`,
-# `wires mcp`, `wires watch`) and for `wires gateway` (deploy/gateway/). A
+# `wires mcp`, `wires inbox`) and for `wires gateway` (deploy/gateway/). A
 # host that serves CLIs needs those CLIs too: build FROM this image's build
 # stage, or copy /usr/local/bin/wires into an image that already has them.
 

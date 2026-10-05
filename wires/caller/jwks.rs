@@ -8,14 +8,14 @@
 //!
 //! - **in memory** per [`KeyFetcher`], and
 //! - for the caller's commands only, **on disk** under `$WIRES_HOME/jwks/`,
-//!   so a short-lived `wires watch` or `wires services` does not refetch on
+//!   so a short-lived `wires call` or `wires services` does not refetch on
 //!   every start. A disk entry is trusted for at most [`MAX_TTL`] from the
 //!   moment it is read.
 //!
 //! **A host never reads the disk cache** (`serve` builds its fetcher with
 //! no `cache_dir`): whatever runs as the host's user — a service child
 //! included — could plant an attacker's key there, and a host trusting it
-//! would accept forged identities, readers included. A host only trusts keys
+//! would accept forged identities. A host only trusts keys
 //! it fetched itself, over HTTPS, in this process. A caller keeps the disk
 //! cache: its keystore is its own, and whoever can write `jwks/` there can
 //! already read its node key and stored ID token.

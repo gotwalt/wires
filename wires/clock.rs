@@ -10,7 +10,7 @@ pub(crate) fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Unix time now, in milliseconds (the `at_ms` of a record, push expiry).
+/// Unix time now, in milliseconds (a push's `at_ms` and expiry).
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

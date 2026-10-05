@@ -4,18 +4,16 @@
 //! An app implements [`Service`] and registers it on a
 //! [`Host`](crate::Host). To callers it is a CLI like any other: it is invoked
 //! with arguments, reads stdin, writes stdout and stderr, and returns an exit
-//! code. `wires call`, `wires mcp`, the gateway and `wires watch` can't tell
-//! the two apart. The host runs a handler only for a call the signed policy
-//! admitted and whose `Started` record is already in the call log, and
-//! records what it read and wrote the way it records a child's stdio. What a
-//! handler gets beyond a CLI is a warm process (whatever state the app
+//! code. `wires call`, `wires mcp` and the gateway can't tell the two apart.
+//! The host runs a handler only for a call the signed policy admitted, and
+//! writes its log line the way it does a child's. What a handler gets beyond
+//! a CLI is a warm process (whatever state the app
 //! keeps between calls) and the verified caller as a type ([`Call`]) rather
 //! than `WIRES_*` environment variables.
 //!
 //! A handler runs as a tokio task. When the caller disconnects, or the
 //! session is dropped, the task is aborted at its next `.await` (clean up in
-//! `Drop`). If it panics, the call exits -1 and still gets its `Finished`
-//! record.
+//! `Drop`). If it panics, the call exits -1 and still gets its log line.
 //!
 //! With `push` configured, a handler can message its caller
 //! ([`Call::push_to_caller`]) under the same per-call capability a CLI child
@@ -28,7 +26,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use library::{
-    Argv, CallId, IdToken, NodeId, Principal, PushBody, PushOutcome, RoleName, ServiceName, Subject,
+    Argv, IdToken, NodeId, Principal, PushBody, PushOutcome, RoleName, ServiceName, Subject,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -65,7 +63,7 @@ pub trait Service: Send + Sync + 'static {
     /// Handle one admitted call and return its exit code. `call` says who
     /// is calling and with what arguments; `io` is the call's stdin, stdout
     /// and stderr. Returning closes stdout and stderr. The exit code goes
-    /// into the call record and back to the caller.
+    /// back to the caller (and into the host's log line).
     fn call(&self, call: Call, io: CallIo) -> impl Future<Output = i32> + Send;
 }
 
@@ -89,8 +87,6 @@ pub struct Call {
     pub(crate) service: ServiceName,
     /// The caller's arguments.
     pub(crate) args: Argv,
-    /// This call's id in the host's call log.
-    pub(crate) id: CallId,
     /// Its way back to the caller, when the host pushes.
     pub(crate) push: Option<CallerPush>,
 }
@@ -124,7 +120,6 @@ impl std::fmt::Debug for Call {
             .field("role", &self.role)
             .field("service", &self.service)
             .field("args", &self.args)
-            .field("id", &self.id)
             .field("push", &self.push)
             .finish_non_exhaustive()
     }
@@ -189,17 +184,11 @@ impl Call {
         self.args.as_slice()
     }
 
-    /// This call's id in the host's call log (the id `wires watch` shows).
-    pub fn id(&self) -> CallId {
-        self.id
-    }
-
     /// Send the caller a message (their `wires inbox`), as a CLI service
     /// does with `wires push` and its `WIRES_PUSH_TOKEN`. It reaches only
     /// this call's caller, only while the call runs and for a short grace
     /// period after (so a job the call started can still report), and only
-    /// if the host's `push.allow` admits them. The push is in the host's
-    /// call log, naming this call. Returns whether it was delivered or
+    /// if the host's `push.allow` admits them. Returns whether it was delivered or
     /// queued; errors if the host doesn't push, the capability has expired,
     /// the subject or body is invalid, or `push.allow` refused the caller.
     pub async fn push_to_caller(
@@ -212,8 +201,7 @@ impl Call {
             .as_ref()
             .ok_or_else(|| anyhow!("this host doesn't push (it has no `push` configured)"))?;
         let to = self.caller.hex();
-        let grant = push
-            .caps
+        push.caps
             .check(&push.token, &to, std::time::Instant::now())
             .map_err(|refusal| anyhow!("{refusal}"))?;
         let spec = PushSpec {
@@ -224,11 +212,7 @@ impl Call {
         };
         let (reply, answer) = oneshot::channel();
         push.commands
-            .send(PushCommand {
-                spec,
-                call: grant.call,
-                reply,
-            })
+            .send(PushCommand { spec, reply })
             .await
             .map_err(|_| anyhow!("the host is shutting down"))?;
         let report = answer
@@ -249,8 +233,7 @@ impl Call {
 }
 
 /// One call's stdio: what the caller sends on stdin, and where the handler
-/// writes stdout and stderr. The host records all three the way it records
-/// a CLI child's.
+/// writes stdout and stderr, bridged to the caller as a CLI child's are.
 pub struct CallIo {
     /// The caller's stdin, until they send EOF.
     pub stdin: Box<dyn AsyncRead + Send + Unpin>,
@@ -452,7 +435,6 @@ pub(crate) fn test_call() -> Call {
         role: RoleName::new("staff").unwrap(),
         service: ServiceName::new("t").unwrap(),
         args: Argv::new(vec!["a".into(), "b".into()]).unwrap(),
-        id: CallId::generate(),
         push: None,
     }
 }

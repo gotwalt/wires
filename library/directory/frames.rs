@@ -87,7 +87,7 @@ pub const VIEW_DIGEST_CONTEXT: &[u8] = b"wires/view-digest/v1\0";
 
 hex_id! {
     /// Names one exact [`View`]: blake3 over [`VIEW_DIGEST_CONTEXT`] ‖ the
-    /// view's canonical JSON (its head and every entry with its marks). A
+    /// view's canonical JSON (its head and every entry). A
     /// caller sends it with `view {have, held}` so the directory answers
     /// `current` or a `view_update` only for the view the caller holds; a
     /// view cut for someone else, or for no one, doesn't match.
@@ -145,7 +145,7 @@ pub enum DirectoryRequest {
         have: StateVersion,
     },
     /// The dialer's caller view (card 37): the services its verified
-    /// identity may call or read.
+    /// identity may call.
     View {
         /// The version the dialer holds (0: none).
         have: StateVersion,
@@ -288,7 +288,7 @@ pub enum SubFrame {
         /// The `Fresh` for its head.
         fresh: Fresh,
     },
-    /// A new head (or new marks) for a subscriber holding a view.
+    /// A new head (or changed entries) for a subscriber holding a view.
     ViewUpdate {
         /// The update.
         update: ViewUpdate,

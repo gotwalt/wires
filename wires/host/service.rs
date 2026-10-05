@@ -4,9 +4,9 @@
 //! implements a service. It needs the call's stdin to write to, its stdout
 //! and stderr to read from, and a [`Process`] to wait on or stop: a
 //! [`Running`]. A CLI child ([`Running::spawn`]) is one way to get one; an
-//! in-process handler is another. The audit taps, the kill when the caller
-//! disconnects, and the rule that stdin stops once the service ends all live
-//! in the bridge, so every kind of service gets them.
+//! in-process handler is another. The byte count for the log line, the kill
+//! when the caller disconnects, and the rule that stdin stops once the
+//! service ends all live in the bridge, so every kind of service gets them.
 
 use std::future::Future;
 use std::pin::Pin;

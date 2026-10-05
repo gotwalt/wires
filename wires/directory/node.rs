@@ -418,7 +418,7 @@ impl Directory {
             }
             DirectoryRequest::Resolve { service } => {
                 let mut view = c.held.signed.view_for(principal.as_ref(), None);
-                view.entries.retain(|e| e.entry.name == service);
+                view.entries.retain(|e| e.name == service);
                 DirectoryAnswer::View { view, fresh }
             }
             other => return self.answer(caller, other, now),

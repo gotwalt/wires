@@ -7,8 +7,8 @@
 //!
 //! - `membership/` — who is in: identities, memberships (badges), the
 //!   accept gate, and the invite token.
-//! - `calls/` — remote CLI calls: the session frames, invocations, audit
-//!   records and the host's call log, pushes, and IdP identity.
+//! - `calls/` — remote CLI calls: the session frames, invocations, pushes,
+//!   and IdP identity.
 //! - `services/` — the admin-signed policy (card 36): roles, the service
 //!   registry, policy evaluation; the items, the signed head and signed
 //!   service entries, updates, views, and freshness.
@@ -29,12 +29,8 @@
 //!   transport is in `wires`).
 //! - [`invoke`] — the [`Invocation`] (service + [`Argv`]) a caller asks a host
 //!   to run.
-//! - [`audit`] — the [`AuditRecord`]s a host keeps about each call (and each
-//!   push).
-//! - [`call_log`] — the host's own signed, hash-linked [`LogEntry`] log of
-//!   those records, and [`verify_chain`].
-//! - [`push`] — a host's [`PushMessage`] to a caller, and the [`InboxFrame`]
-//!   codec both delivery paths speak.
+//! - [`push`] — a host's [`PushMessage`] to a caller, the [`InboxFrame`]
+//!   codec both delivery paths speak, and each recipient's [`PushOutcome`].
 //! - [`idp`] — [`IdentityClaim`]: an IdP-signed ID token bound to a node key,
 //!   and [`verify_claim`], which a host runs against the issuer's [`Jwks`].
 //! - [`role`] — [`RoleName`], [`Matcher`], [`EmailPattern`]: role definitions.
@@ -94,7 +90,6 @@
 //!         description: "Read-only SQL".into(),
 //!         allow: vec![analyst.clone()],
 //!         hosts: vec![host.node_id()],
-//!         readers: vec![],
 //!     },
 //! );
 //! let signed = s.sign(&root).unwrap();
@@ -131,10 +126,6 @@ pub mod membership;
 pub mod policy;
 
 // calls/ — remote CLI calls.
-#[path = "calls/audit.rs"]
-pub mod audit;
-#[path = "calls/call_log.rs"]
-pub mod call_log;
 #[path = "calls/idp.rs"]
 pub mod idp;
 #[path = "calls/invoke.rs"]
@@ -178,18 +169,13 @@ mod codec;
 mod idp_vectors;
 
 pub use access::{Grant, Refusal, allowed_services, authorize, role_admits};
-pub use audit::{AuditRecord, CallId, OutputDigest, OutputHasher, PushOutcome, StdinCapture};
-pub use call_log::{
-    CALL_LOG_CONTEXT, CALL_LOG_V1, ChainBreak, ChainPoint, EntryHash, LogEntry, LogSeq, Retention,
-    verify_chain,
-};
 pub use codec::B64;
 pub use directory::{
     DIRECTORY_ALPN, DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, MAX_DIRECTORY_FRAME,
     MAX_SMALL_DIRECTORY_FRAME, PUBLISH_BODY_PREFIX, SubFrame, SubRequest, SubscriptionKind,
     VIEW_DIGEST_CONTEXT, ViewDigest,
 };
-pub use entry::{ENTRY_CONTEXT, ENTRY_V1, SignedEntry};
+pub use entry::{ENTRY_CONTEXT, ENTRY_V2, SignedEntry};
 pub use error::{Error, IdTokenError, Result};
 pub use fresh::{FRESH_CONTEXT, FRESH_V1, Fresh};
 pub use head::{
@@ -212,10 +198,10 @@ pub use policy::{check_admitted, check_inclusion};
 pub use policy_update::PolicyUpdate;
 pub use push::{
     INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_FRAME, MAX_INBOX_HELLO, MAX_PUSH_BODY,
-    MAX_SUBJECT, PushBody, PushId, PushMessage, Subject,
+    MAX_SUBJECT, PushBody, PushId, PushMessage, PushOutcome, Subject,
 };
 pub use registry::{MAX_SERVICE_NAME, Service, ServiceName};
 pub use role::{EmailPattern, MAX_ROLE_NAME, Matcher, RoleName};
 pub use session::{Chunk, Frame, Hello, HelloAck};
 pub use signed_policy::{Policy, SignedPolicy};
-pub use view::{View, ViewEntry, ViewUpdate};
+pub use view::{View, ViewUpdate};

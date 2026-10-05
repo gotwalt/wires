@@ -6,7 +6,7 @@
 //!    a ban; no restart needed, because the policy is re-read per
 //!    connection). Anyone else hears only [`NOT_ADMITTED`], and — checked
 //!    first by [`ServicesHost::check_member`], before its ID token is even
-//!    looked at — is traced, not written to the call log;
+//!    looked at — is traced, throttled;
 //! 2. the policy is fresh (its head's `not_after`) and, under the signed
 //!    `settings.freshness: strict`, vouched for by a current `Fresh` from a
 //!    directory ([`freshness`](super::freshness); `lenient`, the default,
@@ -17,7 +17,8 @@
 //! 5. the host's own `also_require` roles (`host.json`), which can only
 //!    narrow: the caller must be in **every** one of them.
 //!
-//! An admitted caller's refusal is also written to the call log. The
+//! An identified caller's refusal is also its log line
+//! ([`call_trace`](crate::host::call_trace)). The
 //! caller's principal is verified after the badge check and before [`admit`]
 //! runs (the ID token from the `Hello`, nonce-bound to the iroh-authenticated
 //! caller, under the policy's `issuer` items as `host.json` narrows them:
@@ -26,7 +27,7 @@
 //!
 //! [`ServicesHost`] is everything a host decides with: its own
 //! credentials, where its signed policy lives (re-read per connection), its
-//! `host.json`, the identity verifier and the call-log sink. The session
+//! `host.json` and the identity verifier. The session
 //! transport ([`ServicesProtocol`](crate::host::transport::ServicesProtocol))
 //! and the push service ([`push`](crate::host::push)) both ask it.
 
@@ -44,7 +45,6 @@ use crate::caller::jwks::VerifyError;
 use crate::host::config::HostConfig;
 use crate::host::freshness::{Freshness, STALE, Vouched};
 use crate::host::identity::{Identities, Verified};
-use crate::host::transport::AuditSink;
 use crate::host::transport::Throttle;
 use crate::policy::store::Held;
 
@@ -75,7 +75,7 @@ pub(crate) const HOST_MISCONFIGURED: &str = "host configuration error";
 static LAPSES: Throttle = Throttle::new();
 
 /// Why [`ServicesHost::decide_push`] refused a recipient. `Display` is the
-/// reason recorded and reported.
+/// reason traced and reported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PushRefusal {
     /// Banned by the current signed policy: what is queued for it goes.
@@ -95,7 +95,8 @@ impl fmt::Display for PushRefusal {
 /// A call the gate admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Admitted {
-    /// The registry role that admitted the caller (recorded in the log).
+    /// The registry role that admitted the caller (`WIRES_ROLE`, and the
+    /// call's log line).
     pub(crate) role: RoleName,
     /// The policy version the decision was made under.
     pub(crate) state_version: StateVersion,
@@ -305,8 +306,6 @@ pub(crate) struct ServicesHost {
     /// Verifies the ID tokens callers present, and remembers the verified
     /// principals (what push authorization reads).
     pub(crate) identities: Arc<Identities>,
-    /// The call log (card 26a), if any.
-    pub(crate) audit: Option<AuditSink>,
     /// The per-call push capability (when `host.json` enables push): the
     /// live tokens and the child socket a service is told about.
     pub(crate) push_grants: Option<crate::host::capability::PushGrants>,
@@ -416,7 +415,7 @@ impl ServicesHost {
     /// `state` ([`library::check_admitted`]): the badge is the network
     /// root's for this very key and current at `now`, and the policy doesn't
     /// ban the key. Checked before anything that costs this host (a token
-    /// verification, a JWKS fetch, a call-log entry). `Err` is the exact
+    /// verification, a JWKS fetch, a log line). `Err` is the exact
     /// reason, for this host's trace only; the peer hears [`NOT_ADMITTED`].
     pub(crate) fn check_member(
         &self,
@@ -676,7 +675,6 @@ mod tests {
                 description: String::new(),
                 allow: vec![role("staff")],
                 hosts: vec![node(3)],
-                readers: vec![],
             },
         );
         let cfg = HostConfig::parse(r#"{"version":2,"services":{"status":{"command":["true"]}}}"#)
@@ -705,7 +703,6 @@ mod tests {
                 description: String::new(),
                 allow: vec![role("analyst")],
                 hosts: vec![node(3)],
-                readers: vec![],
             },
         );
         let cfg = HostConfig::parse(

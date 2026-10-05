@@ -9,7 +9,7 @@
 //! *K* authenticated as *alice@corp*".
 //!
 //! Nothing is published. The caller presents the raw ID token in the session
-//! `Hello` of each call (and of each inbox fetch or record stream it opens);
+//! `Hello` of each call (and of each inbox fetch it opens);
 //! the host pairs it with the key iroh authenticated to form an
 //! [`IdentityClaim`], verifies the IdP's signature against the issuer's
 //! published keys **itself** with [`verify_claim`], under the issuers its own
