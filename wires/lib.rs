@@ -59,7 +59,7 @@ mod policy;
 pub use host::embed::{Host, HostBuilder};
 pub use host::native::{Call, CallIo, Service, SharedIo};
 /// The types a [`Call`] is described in.
-pub use library::{CallId, NodeId, Principal, RoleName, ServiceName, StateVersion};
+pub use library::{CallId, IdToken, NodeId, Principal, RoleName, ServiceName};
 
 /// The integration tests — the whole stack over hermetic loopback, in one
 /// place because none of them belongs to a single module's seam.

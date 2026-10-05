@@ -124,7 +124,16 @@ impl Call {
         self.call.caller().hex()
     }
 
-    /// The person the caller verified as (every admitted call has one).
+    /// The caller's raw ID token (a compact JWS), the one the host
+    /// verified for this call: the same token a CLI service gets as
+    /// `WIRES_ID_TOKEN`. No need to verify it again; it is a bearer
+    /// credential until it expires, so don't log it.
+    pub fn id_token(&self) -> String {
+        self.call.id_token().as_str().to_string()
+    }
+
+    /// The person the caller verified as (every admitted call has one):
+    /// the claims of `id_token`, as the host verified them.
     pub fn principal(&self) -> Principal {
         self.call.principal().into()
     }
@@ -132,11 +141,6 @@ impl Call {
     /// The registry role that admitted the caller.
     pub fn role(&self) -> String {
         self.call.role().as_str().to_string()
-    }
-
-    /// The policy version the call was decided under.
-    pub fn state_version(&self) -> u64 {
-        self.call.state_version().0
     }
 
     /// The service called.

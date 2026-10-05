@@ -79,10 +79,23 @@ impl wires::Service for Kv {
                     .await
                     .map_or(1, |()| 0)
             }
+            ["whoami"] => {
+                // Who the host verified, and the ID token it verified: a
+                // service would hand the token on (say, to a token
+                // exchange). This one echoes it without its signature,
+                // which leaves no credential, only the claims.
+                let token = call.id_token().as_str();
+                let unsigned = token.rsplit_once('.').map_or(token, |(rest, _)| rest);
+                let reply = format!("{}\n{unsigned}\n", call.principal().name());
+                io.stdout
+                    .write_all(reply.as_bytes())
+                    .await
+                    .map_or(1, |()| 0)
+            }
             _ => {
                 let _ = io
                     .stderr
-                    .write_all(b"usage: kv set KEY (value on stdin) | get KEY | keys\n")
+                    .write_all(b"usage: kv set KEY (value on stdin) | get KEY | keys | whoami\n")
                     .await;
                 2
             }

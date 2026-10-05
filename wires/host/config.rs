@@ -509,6 +509,10 @@ mod tests {
                 "env WIRES_SERVICE is set by wires itself",
             ),
             (
+                r#"{"version":2,"services":{"a":{"command":["x"],"env":{"WIRES_ID_TOKEN":"forged"}}}}"#,
+                "env WIRES_ID_TOKEN is set by wires itself",
+            ),
+            (
                 r#"{"version":2,"services":{"Bad Name":{"command":["x"]}}}"#,
                 "invalid service name",
             ),

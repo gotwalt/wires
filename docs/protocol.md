@@ -500,9 +500,14 @@ call is refused (`this host can't record calls right now…`) and nothing runs �
 the service sets `end_of_options` in `host.json`, so a CLI that honours `--` takes none of the
 caller's arguments as an option; it doesn't help a CLI that ignores `--`), in its `cwd`. The
 child's environment is built from nothing (`env_clear`): only `PATH`, `LANG` and `LC_*` are
-inherited from `serve`; then `host.json`'s `env`; then the server-derived `WIRES_CALLER_NODE`,
-`WIRES_FABRIC_ROOT`, `WIRES_MEMBERSHIP_NOT_AFTER`, `WIRES_STATE_VERSION`, `WIRES_SERVICE`,
-`WIRES_ROLE`, and, when verified, `WIRES_CALLER_EMAIL`. With `push` on, also
+inherited from `serve`; then `host.json`'s `env`; then the server-derived values, which always win
+(`host.json` can't set a `WIRES_*` name): `WIRES_CALLER_NODE` (the caller's node key, what push
+addresses), `WIRES_ID_TOKEN` (the caller's ID token, byte for byte as presented in this call's
+`Hello`), `WIRES_CALLER` (the claims the host verified from it, as one JSON object with the fields of
+`Principal`: `issuer`, `subject`, `not_after`, and `email`, `org`, `groups` when present, §6),
+`WIRES_SERVICE`, `WIRES_ROLE`, and, when the token carries a verified email, `WIRES_CALLER_EMAIL`.
+Every admitted call has a verified identity (every role needs one), so the first five are always
+set. With `push` on, also
 `WIRES_PUSH_SOCKET` and `WIRES_PUSH_TOKEN`, the call's push capability (§7), already bound to the
 call's id before the child starts. The child never gets `WIRES_HOME`, `HOME`, agent sockets or
 cloud credentials. If the connection closes, the host kills the child.
@@ -523,8 +528,9 @@ and implement services in-process. The wire, the gate, the log and the bridge ar
 a native service is invoked by `Invoke`, reads the caller's stdin, writes stdout and stderr, and
 its exit code is the call's. Callers can't tell it from a CLI. The handler runs as a tokio task
 only after `Started` is fsynced and `HelloAck` is sent. It gets the verified caller as a type
-(`Call`: node, principal, role, policy version, service, argv, call id) in place of the `WIRES_*`
-variables. With push configured (`host.json` `push`, or the builder's `push_allow`), the host mints
+(`Call`: node, ID token, principal, role, service, argv, call id) in place of the `WIRES_*`
+variables: `Call::id_token` is the token a child gets as `WIRES_ID_TOKEN`, and `Call::principal`
+the value it gets as `WIRES_CALLER`. With push configured (`host.json` `push`, or the builder's `push_allow`), the host mints
 the call's push capability as it does for a child and hands it over in-process:
 `Call::push_to_caller(subject, body)` is checked against the same live-token registry (only this
 call's caller, until the grace period after the call ends, §7), goes through `push.allow`, and is
@@ -603,6 +609,23 @@ or an older token displace it. It knows only the callers that presented a token 
 verifies a token only from a node it admitted (§5 step 2). A host keeps issuer key sets **in
 memory only** and never reads the `jwks/` disk cache, which anything running as its user could
 write; callers keep that cache, and trust a disk entry for at most 24 h.
+
+**What a service gets.** Every service the host runs for an admitted call gets the caller's raw ID
+token and the claims verified from it (§5: `WIRES_ID_TOKEN` and `WIRES_CALLER` for a child,
+`Call::id_token` and `Call::principal` natively), whoever presented it: the caller's own token from
+`wires call` and `wires mcp`, the web user's from the gateway. There is no opt-in. The service need
+not verify it again (the host checked the signature, the audience and the binding to the caller's
+key); it may, or hand it to a token exchange. What that hands over:
+
+- The token is a bearer credential until its `exp` (about an hour with Google). Inside wires it is
+  bound to the caller's key and useless from any other node; outside wires, any relying party that
+  accepts this OAuth client's audience would accept it. Every service the caller calls holds it, as
+  the host already did.
+- A child's environment is readable by other processes of the same Unix user
+  (`/proc/<pid>/environ`): one more reason to run services as a separate user
+  ([deployment.md](deployment.md#run-services-as-a-separate-unix-user)).
+- A call through the web gateway carries a token minted under the gateway's OAuth client, so its
+  `aud` differs from a `wires login` token's.
 
 **A web gateway** (`wires gateway`) is one node that carries many principals: it asks the IdP
 for each web user's ID token with `nonce = for_node(gateway)` and presents that user's token in the

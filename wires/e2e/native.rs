@@ -8,7 +8,8 @@
 //! call` uses ([`call_service_on`]).
 //!
 //! - [`a_native_service_is_called_like_a_cli`]: state kept across calls,
-//!   keyed by the verified person; stdin in, stdout out, exit codes back.
+//!   keyed by the verified person; stdin in, stdout out, exit codes back;
+//!   the handler holds the caller's ID token and verified principal.
 //! - [`a_refused_caller_never_reaches_the_handler`]
 //! - [`a_native_call_is_logged_like_a_cli_call`]: the host's own signed,
 //!   hash-linked log (what `wires watch` streams) holds `Started` and
@@ -218,6 +219,18 @@ async fn call(
     args: &[&str],
     stdin: &str,
 ) -> Outcome {
+    call_with(host, who, &w.hello(who), name, args, stdin).await
+}
+
+/// [`call`], presenting `hello` (and so its ID token).
+async fn call_with(
+    host: &Running,
+    who: &NodeIdentity,
+    hello: &Hello,
+    name: &str,
+    args: &[&str],
+    stdin: &str,
+) -> Outcome {
     let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(secret_key(who))
         .bind()
@@ -230,7 +243,7 @@ async fn call(
                 &endpoint,
                 std::slice::from_ref(&host.addr),
                 std::time::Duration::from_secs(2),
-                w.hello(who),
+                hello.clone(),
                 Invocation {
                     service: ServiceName::new(name).unwrap(),
                     argv: library::Argv::new(args.iter().map(|a| a.to_string()).collect()).unwrap(),
@@ -303,6 +316,16 @@ async fn a_native_service_is_called_like_a_cli() {
             stdout: String::new(),
             stderr: "kv: no such key\n".into()
         }
+    );
+    // `call.id_token()` is the token in the call's `Hello`, and
+    // `call.principal()` what it verified as (`whoami` echoes the token
+    // without its signature).
+    let hello = w.hello(&w.alice);
+    let token = hello.id_token.clone().unwrap();
+    let (unsigned, _) = token.as_str().rsplit_once('.').unwrap();
+    assert_eq!(
+        call_with(&host, &w.alice, &hello, "kv", &["whoami"], "").await,
+        ran(0, &format!("alice@example.com\n{unsigned}\n"))
     );
     host.stop().await.unwrap();
 }
