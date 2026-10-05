@@ -676,7 +676,7 @@ async fn with_every_directory_down_calls_fail_closed_until_one_is_back() {
     .await;
     assert!(refused.contains("no directory has vouched"), "{refused}");
     assert!(!refused.contains("denied"), "not a refusal: {refused}");
-    // The directory comes back (from directory.redb): calls go through again.
+    // The directory comes back (from its policy.json): calls go through again.
     let d = w.directory(0, &dir_ks).await;
     let out = eventually("a call after", || async { caller.call(&w).await.ok() }).await;
     assert_eq!(out, "hi\n");

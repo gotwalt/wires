@@ -40,7 +40,7 @@ use crate::host::transport::{self, Throttle};
 /// Refusals of directory peers not known to be admitted.
 static STRANGERS: Throttle = Throttle::new();
 
-/// `wires/directory/2` as a router protocol. See the module docs.
+/// `wires/directory/3` as a router protocol. See the module docs.
 #[derive(Clone, Debug)]
 pub(crate) struct DirectoryProtocol(pub(crate) Arc<Directory>);
 
@@ -210,7 +210,7 @@ fn admitted(
     Arc::clone(&dir.admitted).try_acquire_owned().ok()
 }
 
-/// `wires/directory-sub/2` as a router protocol. See the module docs.
+/// `wires/directory-sub/3` as a router protocol. See the module docs.
 #[derive(Clone, Debug)]
 pub(crate) struct SubscriptionProtocol(pub(crate) Arc<Directory>);
 

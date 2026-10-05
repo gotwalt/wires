@@ -224,8 +224,8 @@ pub(crate) async fn serve_until(
         push.clone(),
         directory.as_ref(),
     );
-    // The policy's edits, and its freshness, from a directory's `policy`
-    // subscription (card 36c), until serving ends. It never holds up
+    // The policy's edits, and its freshness, from a directory's
+    // subscription, until serving ends. It never holds up
     // serving: until a directory answers, calls are decided from the
     // policy on disk.
     let mut following = tokio::task::JoinSet::new();

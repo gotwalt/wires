@@ -83,7 +83,7 @@ Open cards only; finished cards are in [done/](done/).
 | Card | Stage | Depends on | Status | Summary |
 |---|---|---|---|---|
 | [49](review/49-removed-host-window.md) | 2 | — | review | **The removed-host window:** the host proves a current `Fresh` (from another directory) before the caller sends anything; fail closed; 15 min |
-| [45](backlog/45-trim-policy-sync.md) | 3 | 49 | backlog | One way to keep policy copies in step: no deltas, replicas or view subscriptions; `Fresh` and the beat stay for 49, `lenient`/`strict` go |
+| [45](review/45-trim-policy-sync.md) | 3 | 49 | review | One way to keep policy copies in step: no deltas, replicas or view subscriptions; `Fresh` and the beat stay for 49; a directory proves itself before a caller's token |
 | [08](doing/08-demo-two-machine.md) | last | all of the above | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent; re-record |
 | [29](backlog/29-person-identity.md) | — | — | backlog, not scheduled | **Person identity for headless agents:** `login --for`, day-passes |
 | [31](backlog/31-inbox-delivery.md) | — | — | designed, parked | **Inbox delivery:** callbacks go to the caller that asked; one delivery path |

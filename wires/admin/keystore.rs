@@ -9,8 +9,8 @@
 //!   stored ([`Keystore::read_network`]): the root key, the first
 //!   directories, the login settings.
 //! - `labels.json`: the admin's labels for nodes ([`super::labels`]).
-//! - `policy.json`: the admin-signed policy ([`crate::policy::store`]);
-//!   `directory.redb` on a directory node ([`crate::directory::db`]).
+//! - `policy.json`: the admin-signed policy ([`crate::policy::store`]),
+//!   and on a directory node its whole store ([`crate::directory`]).
 //!
 //! The resolver helper [`node_identity`] encodes the precedence the CLI
 //! uses: an inline flag wins, then the matching environment variable, then
@@ -294,8 +294,7 @@ pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> Result<(
 }
 
 /// Open `path` for writing, creating it mode `0600` if missing and never
-/// truncating it: a lock file, or a store that manages its own contents
-/// (`policy.json.lock`, `directory.redb`).
+/// truncating it: a lock file (`policy.json.lock`).
 pub(crate) fn open_private(path: &Path) -> Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true).write(true).create(true).truncate(false);

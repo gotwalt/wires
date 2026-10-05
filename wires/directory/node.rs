@@ -7,7 +7,7 @@
 //! ([`Directory::beat`]), takes a newer policy from any publisher
 //! ([`Directory::check_head`] then [`Directory::accept`]: verified under the
 //! root, fresh, strictly newer, items matching the head's `items_hash`) and
-//! answers `wires/directory/2` requests ([`Directory::answer`]). **It never
+//! answers `wires/directory/3` requests ([`Directory::answer`]). **It never
 //! decides a call.** It may start empty, holding no policy, and take the
 //! admin's first publish.
 //!

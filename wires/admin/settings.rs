@@ -2,7 +2,7 @@
 //! (cards 36c and 49): how often directories vouch, and for how long.
 //!
 //! - `--beat-secs N`: how often each directory signs a new `Fresh` (and
-//!   beats its subscriptions).
+//!   sends it to the hosts that follow it).
 //! - `--fresh-secs N`: how long each `Fresh` is good for (at least the
 //!   beat). It is the removed-host window: a caller sends a host nothing
 //!   until a current `Fresh` from another directory vouches for the host's
