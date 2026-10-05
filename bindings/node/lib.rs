@@ -105,7 +105,7 @@ impl Call {
         self.call.principal().into()
     }
 
-    /// The registry role that admitted the caller.
+    /// The role (from the signed policy) that admitted the caller.
     #[napi]
     pub fn role(&self) -> String {
         self.call.role().as_str().to_string()
@@ -228,7 +228,9 @@ impl HostBuilder {
         }
     }
 
-    /// Trust ID tokens from `issuer` for the OAuth client ids `audiences`.
+    /// Trust ID tokens from `issuer` only, and only for the OAuth client ids
+    /// `audiences` (empty: every one the policy accepts). This narrows the
+    /// IdPs the signed policy trusts; it never adds one.
     #[napi]
     pub fn trust_issuer<'a>(
         &mut self,
@@ -240,7 +242,8 @@ impl HostBuilder {
         this
     }
 
-    /// Let the host push to members of `roles` (what `pushToCaller` needs).
+    /// Let the host push to callers in `roles` (from the signed policy):
+    /// what `pushToCaller` needs.
     #[napi]
     pub fn push_allow<'a>(&mut self, this: This<'a>, roles: Vec<String>) -> This<'a> {
         self.with(|b| b.push_allow(roles));

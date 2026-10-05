@@ -1,14 +1,14 @@
 //! The **admin** role: holds the root key and signs the policy.
 //!
 //! The admin-signed policy (cards 27, 36) is a root-signed head over items:
-//! the trusted IdPs, the role definitions, the service registry (which hosts
-//! run each service), the node and person bans, the settings, and (in the
-//! head) the directories. It lists no members, and the admin mints nothing
-//! for any node: a caller is admitted by its IdP sign-in, and a host or
-//! directory by the policy naming its key. Every command here but
-//! `network` edits the policy, signs the next version, and publishes it to
-//! the directories (never to a host: hosts follow it from a directory, and
-//! callers ask one for their views).
+//! the trusted IdPs, the role definitions, the services (who may call each,
+//! which hosts run it), the node and person bans, the settings, and (in the
+//! head) the directories. The admin mints nothing for any node: a caller is
+//! admitted by its IdP sign-in when a role matches it, and a host or
+//! directory by the policy naming its key. `init` signs the first version
+//! and stores it; every edit after it signs the next version and publishes
+//! it to the directories (never to a host: hosts follow it from a directory,
+//! and callers ask one for their views).
 //!
 //! - [`init`] — `wires init`: root key, node key, the first signed policy.
 //! - [`network`] — `wires network`: the string every node joins with.

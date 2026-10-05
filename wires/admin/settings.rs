@@ -1,4 +1,4 @@
-//! `wires policy settings`: the fabric-wide settings in the signed policy
+//! `wires policy settings`: the network-wide settings in the signed policy
 //! (card 36c): the freshness rule, and how often directories vouch.
 //!
 //! - `--freshness lenient | strict`: what a host does when no directory has

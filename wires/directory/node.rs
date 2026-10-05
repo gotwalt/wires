@@ -67,14 +67,14 @@ enum ViewSince {
     Update(ViewUpdate),
 }
 
-/// What [`Directory::watch`] carries: the current state, or nothing yet.
+/// What [`Directory::watch`] carries: what it holds now, or nothing yet.
 pub(crate) type Snapshot = Option<Arc<Current>>;
 
 /// A directory. See the module docs.
 pub(crate) struct Directory {
     /// This node: its key signs `Fresh`.
     me: NodeIdentity,
-    /// The fabric root everything verifies under.
+    /// The network's root key, which everything verifies under.
     root: NodeId,
     /// Its keystore: `directory.redb`, and `policy.json`, which it keeps in
     /// step (so a host that is also the directory decides under what it
@@ -228,7 +228,7 @@ impl std::fmt::Debug for Directory {
 
 impl Directory {
     /// Open `me`'s directory in `ks` (its `directory.redb`) for `root`'s
-    /// fabric: load the newest head, or seed the store from the keystore's
+    /// network: load the newest head, or seed the store from the keystore's
     /// own `policy.json` when that is newer (a host that fetched one), then
     /// sign a `Fresh` for it. With neither, it opens empty, and takes the
     /// admin's first publish.
@@ -283,7 +283,7 @@ impl Directory {
         self.me.node_id()
     }
 
-    /// The fabric root.
+    /// The network's root key.
     pub(crate) fn root(&self) -> NodeId {
         self.root
     }

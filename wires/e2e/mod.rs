@@ -1,5 +1,5 @@
 //! The integration tests: the whole stack — signed policy, the `Hello`
-//! handshake, the registry gate, exec and the stdio bridge, push — driven
+//! handshake, the gate, exec and the stdio bridge, push — driven
 //! over hermetic loopback QUIC.
 //!
 //! Every endpoint here binds with
@@ -8,7 +8,7 @@
 //! address hints over loopback ([`localhost_socks`]).
 //!
 //! - [`services_host`] — card 27's acceptance: a host decides
-//!   every call by the admin-signed policy (the registry's roles,
+//!   every call by the admin-signed policy (its roles,
 //!   `also_require`, removal with no restart, refusing unassigned services,
 //!   push by the policy).
 //! - [`service_child`] — card 28 §1: a service child gets a minimal

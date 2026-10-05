@@ -2,8 +2,8 @@
 //! remote MCP server, for clients that can only reach one over HTTPS
 //! (Claude.ai's custom connectors, the MCP Inspector).
 //!
-//! It is a caller that acts for web users. The gateway is one admitted node;
-//! each web user signs in with Google *through* it, and the gateway asks
+//! It is a caller that acts for web users. The gateway is one node of the
+//! network; each web user signs in with Google *through* it, and the gateway asks
 //! Google for an ID token whose `nonce` is bound to the gateway's node key
 //! (the same binding `wires login` makes for a caller's own node). Every call
 //! then presents **that user's** ID token in the session handshake, so the
@@ -17,8 +17,9 @@
 //! root-signed entry, cut by a directory for that user's own ID token
 //! (nonce-bound to the gateway's node). The gateway holds no policy: it
 //! keeps one view subscription per live session ([`Keystored`]), so a
-//! grant or a revocation applies to the user's next request. Every role
-//! needs a verified identity, so the gateway's node alone admits nobody.
+//! grant or a revocation applies to the user's next request. Admission
+//! needs a person's verified sign-in, so the gateway's node on its own is
+//! admitted nowhere: every call it makes is a web user's.
 //!
 //! - [`oauth`] — the OAuth 2.1 authorization server Claude.ai signs in to
 //!   (metadata, `/authorize` → Google → `/token`), RFC 9728 / 8414 / 8707 /
@@ -185,7 +186,8 @@ pub(crate) struct Keystored {
     ks: Arc<Keystore>,
     creds: Credentials,
     endpoint: iroh::Endpoint,
-    /// The directories to ask (the gateway's own view's, else its join's).
+    /// The directories to ask (its own view's head's, else its network
+    /// string's, else its held policy's).
     directories: Vec<NodeId>,
     /// Live views, by ID token.
     views: std::sync::Mutex<HashMap<String, UserView>>,

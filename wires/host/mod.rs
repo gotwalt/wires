@@ -3,8 +3,8 @@
 //! A host is `wires serve host.json`: `host.json` (version 2) says how each
 //! service runs here; the admin-signed policy says who may call it. Every
 //! call is decided by the policy as it stands at that connection — the
-//! caller's ID token and the bans, the registry's role for the service, then
-//! any stricter local rule — and traced by the host as one ordinary log
+//! caller's ID token, the bans and a role that admits it, the policy's roles
+//! for the service, then any stricter local rule — and traced by the host as one ordinary log
 //! line.
 //!
 //! - [`serve`] — `wires serve host.json` / `--check`: preflight, bind, serve.

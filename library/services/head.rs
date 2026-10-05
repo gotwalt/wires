@@ -1,6 +1,6 @@
 //! The policy head: the root-signed summary every node holds (card 36).
 //!
-//! A [`PolicyHead`] names the fabric, a monotonic version, its lifetime, the
+//! A [`PolicyHead`] names the network root, a monotonic version, its lifetime, the
 //! directory nodes, and an [`ItemsHash`] over every item of the policy. The
 //! root signs it ([`SignedPolicyHead`]); a node holding the whole policy
 //! checks its items against the hash, so a directory can't forge an item,
@@ -11,10 +11,8 @@
 //! - **Signed bytes:** [`POLICY_HEAD_CONTEXT`] followed by the canonical JSON
 //!   of `{alg, head}`. The context separates it from service entries
 //!   and [`Fresh`](crate::Fresh).
-//! - **Format:** [`POLICY_V4`], a signed discriminant (format 3 carried bans
-//!   with an `until`; formats 1 and 2 were
-//!   the signed state the policy replaced, card 36). Unknown fields are
-//!   refused at decode.
+//! - **Format:** [`POLICY_V4`], a signed discriminant; any other format is
+//!   refused, and unknown fields are refused at decode.
 //! - **Versioning:** [`StateVersion`] only goes up, and a node adopts a head
 //!   only if it verifies, is fresh and
 //!   [is newer](SignedPolicyHead::is_newer_than).
@@ -50,8 +48,7 @@ use crate::item::Item;
 #[serde(transparent)]
 pub struct StateVersion(pub u64);
 
-/// The policy head format: 4 (format 3 banned nodes with an `until`; 1 and 2
-/// were the retired signed state).
+/// The policy head format: 4, the only one accepted.
 pub const POLICY_V4: u8 = 4;
 
 /// Domain-separation prefix of a head's signed bytes.
@@ -194,7 +191,7 @@ impl SignedPolicyHead {
         Ok(())
     }
 
-    /// Whether this head should replace `other`: same fabric and a strictly
+    /// Whether this head should replace `other`: same network root and a strictly
     /// higher version. Says nothing about signatures; verify first.
     ///
     /// ```
@@ -347,7 +344,7 @@ mod tests {
             a.check_fresh(1_001),
             Err(Error::Expired { not_after: 1_000 })
         ));
-        // Another fabric's head is never newer.
+        // Another network's head is never newer.
         let other = NodeIdentity::from_seed([9u8; 32]);
         let mut h = sample();
         h.fabric = other.node_id();
@@ -409,7 +406,7 @@ mod tests {
     fn unknown_fields_are_refused() {
         let signed = sample().sign(&root()).unwrap();
         let mut v = serde_json::to_value(&signed).unwrap();
-        v["head"]["members"] = serde_json::json!([]);
+        v["head"]["extra"] = serde_json::json!([]);
         assert!(serde_json::from_value::<SignedPolicyHead>(v).is_err());
     }
 

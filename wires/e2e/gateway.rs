@@ -12,7 +12,7 @@
 //!   `401` for a bad token.
 //! - [`concurrent_users_each_call_with_their_own_token`]: two users calling
 //!   at once through one gateway node each present their own token.
-//! - [`a_user_the_state_admits_to_nothing_is_refused_at_sign_in`]
+//! - [`a_user_who_may_call_nothing_is_refused_at_sign_in`]
 //! - [`a_code_is_single_use_and_bound_to_its_client`]
 //!
 //! The backend is scripted: the signed policy is fixed in the test (each
@@ -100,7 +100,7 @@ impl Backend for Scripted {
     }
 }
 
-/// A gateway (node 2 of [`state`]) on a loopback port, signing users in at
+/// A gateway (node 2 of [`signed_for`]) on a loopback port, signing users in at
 /// `idp`.
 struct Running {
     base: String,
@@ -629,8 +629,11 @@ async fn concurrent_users_each_call_with_their_own_token() {
     }
 }
 
+/// A user whose view is empty is refused at the callback. (The scripted
+/// backend cuts mallory, whom no role matches, an empty view; a real
+/// directory refuses her as not admitted instead.)
 #[tokio::test]
-async fn a_user_the_state_admits_to_nothing_is_refused_at_sign_in() {
+async fn a_user_who_may_call_nothing_is_refused_at_sign_in() {
     let idp = MockIdp::start("mallory@example.com").await;
     let gw = Running::start(&idp).await;
     let client = gw.register().await;

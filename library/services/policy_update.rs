@@ -70,8 +70,8 @@ impl SignedPolicy {
         }
     }
 
-    /// Apply `update` to this (verified) policy: its head must be the same
-    /// fabric's and no older; every removed key must be held and named once;
+    /// Apply `update` to this (verified) policy: its head must be for the
+    /// same network root and no older; every removed key must be held and named once;
     /// no key may be named twice; then the rebuilt policy (held items, plus
     /// the changed ones, less the removed ones) must pass
     /// [`verify`](Self::verify): the head's signature under `root`, the

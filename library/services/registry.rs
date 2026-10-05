@@ -3,7 +3,7 @@
 //!
 //! A [`Service`] is an entry in the admin-signed [`Policy`](crate::Policy):
 //! only the admin binds a [`ServiceName`] to a host, which is what closes
-//! tool-name squatting. Callers never pick a host; they pick a service, and
+//! service-name squatting. Callers never pick a host; they pick a service, and
 //! the caller resolves it to one of [`Service::hosts`].
 
 use std::fmt;
@@ -85,9 +85,9 @@ pub struct Service {
     /// caller is the call's role (`WIRES_ROLE`). Empty: nobody (default deny). Each must be
     /// defined in [`Policy::roles`](crate::Policy::roles).
     pub allow: Vec<RoleName>,
-    /// The hosts that implement it, in the admin's preference order. Each
-    /// must be in [`Policy::hosts`](crate::Policy::hosts). Empty: registered
-    /// but not served anywhere yet.
+    /// The hosts that implement it, in the admin's preference order, each
+    /// once and none banned ([`Policy::validate`](crate::Policy::validate)).
+    /// Empty: registered but not served anywhere yet.
     pub hosts: Vec<NodeId>,
 }
 
@@ -125,9 +125,6 @@ mod tests {
     #[test]
     fn service_rejects_unknown_fields() {
         let json = r#"{"description":"","allow":[],"hosts":[],"x":1}"#;
-        assert!(serde_json::from_str::<Service>(json).is_err());
-        // The retired `readers` field (entry format 1) is unknown now.
-        let json = r#"{"description":"","allow":[],"hosts":[],"readers":[]}"#;
         assert!(serde_json::from_str::<Service>(json).is_err());
     }
 }

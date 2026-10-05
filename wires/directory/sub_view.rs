@@ -9,9 +9,9 @@
 //! the time the publish takes to arrive.
 //!
 //! The principal is the ID token the subscriber presented in its `hello`,
-//! verified and admitted once, when the subscription opens, as a `view`
+//! verified once, when the subscription opens, and admitted as a `view`
 //! request is ([`Directory::admit`]): a subscriber the policy doesn't admit
-//! is refused at the `hello`. The first frame is always the whole view,
+//! is refused at the `hello`, and every later head is checked again (below). The first frame is always the whole view,
 //! whatever `have` the subscriber names: the directory stores nothing per
 //! subscriber, so it can't know which view a `have` refers to. A subscriber
 //! that can't apply an update subscribes again.

@@ -207,7 +207,7 @@ impl World {
         }
     }
 
-    /// Host `i` serving `echo` from `ks` (a whole host: gate, log,
+    /// Host `i` serving `echo` from `ks` (a whole host: gate, exec,
     /// follower), until the returned sender is dropped.
     async fn host(
         &self,

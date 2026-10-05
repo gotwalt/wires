@@ -53,7 +53,7 @@ pub const FRESH_CONTEXT: &[u8] = b"wires/fresh/v1\0";
 pub struct Fresh {
     /// Format discriminant; [`FRESH_V1`]. Signed.
     pub format: u8,
-    /// The fabric (root key) the head belongs to.
+    /// The network's root key, which the head belongs to.
     pub fabric: NodeId,
     /// The directory that signed it: must be in the head's `directories`.
     pub directory: NodeId,
@@ -273,7 +273,7 @@ mod tests {
         // Same version, other content.
         let twin = head_with(5, 4, vec![dir().node_id()]);
         assert!(matches!(fresh.verify(&twin), Err(Error::FreshMismatch)));
-        // Another fabric.
+        // Another network.
         let other = NodeIdentity::from_seed([9u8; 32]);
         let mut h = head().head;
         h.fabric = other.node_id();

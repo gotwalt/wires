@@ -1,8 +1,8 @@
 //! The host's `policy` subscription (card 36c): how a running host keeps
 //! its whole signed policy current, and learns that it is.
 //!
-//! A [`Follower`] subscribes (`wires/directory-sub/1`, `subscribe {kind:
-//! policy, have}`) to the first directory its held head lists that answers,
+//! A [`Follower`] subscribes (`wires/directory-sub/2`, a `hello` with no
+//! token, then `subscribe {kind: policy, have}`) to the first directory its held head lists that answers,
 //! never itself, and takes every frame the directory streams
 //! ([`Follower::take`]):
 //!

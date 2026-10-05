@@ -535,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn a_host_refuses_to_decide_under_a_rolled_back_state() {
+    fn a_host_refuses_to_decide_under_a_rolled_back_policy() {
         let home = crate::testutil::temp_dir();
         let host = host_at(&home, None).unwrap();
         let ks = keystore::Keystore::at(&home);

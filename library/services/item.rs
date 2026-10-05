@@ -2,7 +2,7 @@
 //!
 //! The policy is a [head](crate::PolicyHead) over a sorted list of
 //! [`Item`]s, one per role, service, banned node, banned person, trusted
-//! issuer, and one for the fabric's settings. Each item is addressed by its [`ItemKey`] (kind, then
+//! issuer, and one for the network's settings. Each item is addressed by its [`ItemKey`] (kind, then
 //! key), which is also the order the items are hashed in.
 //!
 //! The head signs an [`ItemsHash`](crate::ItemsHash) of the whole list. A
@@ -56,7 +56,7 @@ pub enum ItemKey {
     PersonBan(Person),
     /// A trusted IdP, by its issuer identifier.
     Issuer(Issuer),
-    /// The fabric's one settings item.
+    /// The network's one settings item.
     Settings,
 }
 
@@ -135,8 +135,8 @@ impl fmt::Display for Person {
 }
 
 /// A trusted IdP (the body of an `issuer` item; the issuer identifier is its
-/// key). Moves what `host.json`'s `identity.issuers` says into signed policy;
-/// a host can still narrow it locally.
+/// key). A host can narrow the trusted IdPs further in `host.json`'s
+/// `identity.issuers`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IssuerConfig {
@@ -163,7 +163,7 @@ pub enum FreshnessMode {
     Strict,
 }
 
-/// The fabric-wide settings (the body of the one `settings` item).
+/// The network-wide settings (the body of the one `settings` item).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -223,7 +223,7 @@ pub enum Item {
         /// Its client id and accepted audiences.
         body: IssuerConfig,
     },
-    /// The fabric's settings (exactly one per policy).
+    /// The network's settings (exactly one per policy).
     Settings {
         /// The settings.
         body: Settings,
@@ -382,12 +382,16 @@ mod tests {
 
     #[test]
     fn unknown_fields_and_kinds_are_refused() {
+        // The well-formed ban parses, so its variant with a body fails on the body.
+        let ban = format!(r#"{{"kind":"ban","key":"{}"}}"#, node(1).hex());
+        assert!(serde_json::from_str::<Item>(&ban).is_ok());
+        let ban_with_body = format!(r#"{{"kind":"ban","key":"{}","body":{{}}}}"#, node(1).hex());
         for bad in [
-            r#"{"kind":"ban","key":"00","body":{"until":1}}"#,
+            ban_with_body.as_str(),
             r#"{"kind":"person_ban","key":{"issuer":"https://i","email":"e@x.com","x":1}}"#,
             r#"{"kind":"settings","body":{"beat_secs":1,"fresh_secs":1,"freshness":"lenient","x":1}}"#,
             r#"{"kind":"settings","key":"k","body":{"beat_secs":1,"fresh_secs":1,"freshness":"lenient"}}"#,
-            r#"{"kind":"member","key":"x","body":{}}"#,
+            r#"{"kind":"nonsense","key":"x","body":{}}"#,
             r#"{"kind":"settings","body":{"beat_secs":1,"fresh_secs":1,"freshness":"sloppy"}}"#,
         ] {
             assert!(serde_json::from_str::<Item>(bad).is_err(), "{bad}");

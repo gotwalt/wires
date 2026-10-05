@@ -76,8 +76,8 @@ pub enum Error {
     BadFrame,
 
     /// [`Policy::sign`](crate::Policy::sign) was handed a signing key whose
-    /// node id is not the policy's `fabric` — a usage error (the fabric root
-    /// must sign its own policy).
+    /// node id is not the policy's `fabric` (its network root) — a usage
+    /// error (the root must sign its own policy).
     #[error("signing key is not the network root")]
     FabricMismatch,
 

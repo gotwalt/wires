@@ -31,7 +31,8 @@
 //! gets its whole part.
 //!
 //! Who is admitted is the directory's to decide (protocol §4): a node the
-//! held policy names, a caller whose token verifies, and, for a `publish`
+//! held policy names, a caller whose token verifies and whom
+//! [`check_admitted`](crate::check_admitted) admits, and, for a `publish`
 //! only, anyone, since the root's signature is the whole check. The caller
 //! is always the iroh-authenticated key, never a field. Frames are a 4-byte
 //! big-endian length then canonical JSON tagged by `type`. The length is
@@ -70,7 +71,7 @@ pub const DIRECTORY_ALPN: &[u8] = b"wires/directory/2";
 pub const DIRECTORY_SUB_ALPN: &[u8] = b"wires/directory-sub/2";
 
 /// The largest frame either protocol accepts (a publish's `items`, or a
-/// whole `policy` of a large fabric), checked from the length prefix before
+/// whole `policy` of a large network), checked from the length prefix before
 /// allocating.
 pub const MAX_DIRECTORY_FRAME: usize = 16 * 1024 * 1024;
 

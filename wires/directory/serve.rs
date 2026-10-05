@@ -50,7 +50,7 @@ static STRANGERS: Throttle = Throttle::new();
 /// The longest a replica waits between two attempts to follow a peer.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// `wires/directory/1` as a router protocol. See the module docs.
+/// `wires/directory/2` as a router protocol. See the module docs.
 #[derive(Clone, Debug)]
 pub(crate) struct DirectoryProtocol(pub(crate) Arc<Directory>);
 
@@ -200,7 +200,7 @@ fn admitted(
     Arc::clone(&dir.admitted).try_acquire_owned().ok()
 }
 
-/// `wires/directory-sub/1` as a router protocol. See the module docs.
+/// `wires/directory-sub/2` as a router protocol. See the module docs.
 #[derive(Clone, Debug)]
 pub(crate) struct SubscriptionProtocol(pub(crate) Arc<Directory>);
 

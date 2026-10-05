@@ -111,7 +111,7 @@ impl Signature {
 
 /// A node's signing identity: the Ed25519 secret key plus its derived address.
 ///
-/// Both fabric-root keys and node keys are `NodeIdentity` values — the role is
+/// Both network root keys and node keys are `NodeIdentity` values — the role is
 /// a matter of how the key is used (signing the policy vs. authenticating a
 /// session), not of the type.
 ///

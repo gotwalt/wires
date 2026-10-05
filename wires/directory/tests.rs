@@ -733,7 +733,7 @@ async fn the_first_directory_starts_empty_and_takes_the_first_publish() {
     admin_ep.close().await;
 }
 
-/// `wires directory serve` runs from a joined, listed node's keystore/// `wires directory serve` runs from a joined, listed node's keystore with
+/// `wires directory serve` runs from a joined, listed node's keystore with
 /// no `host.json`, and refuses the admin's keystore and an unlisted node.
 #[test]
 fn directory_serve_needs_a_listed_node_that_is_not_the_admin() {
@@ -895,8 +895,8 @@ async fn first_frame(recv: &mut iroh::endpoint::RecvStream) -> library::SubFrame
     frame
 }
 
-/// `policy` (0: directory, 1: the admin's) with `edit` applied, at the next
-/// version, root-signed.
+/// The policy `dir` holds with `edit` applied, at the next version,
+/// root-signed.
 fn next_policy(
     f: &Fabric,
     dir: &Directory,
@@ -1067,7 +1067,7 @@ async fn a_view_subscription_ends_on_a_ban_and_when_the_directory_is_unlisted() 
     assert!(reason.contains("no longer a directory"), "{reason}");
 }
 
-/// A `hello` is small:/// A `hello` is small: one that announces a publish-sized body is refused
+/// A `hello` is small: one that announces a publish-sized body is refused
 /// from its prefix, before the directory reads (or waits for) the body.
 #[tokio::test]
 async fn a_large_hello_is_refused_before_its_body_is_read() {
@@ -1104,7 +1104,7 @@ async fn a_large_hello_is_refused_before_its_body_is_read() {
 }
 
 /// Peers that connect and never open a stream give up their undecided
-/// slots at the stream deadline, so they can't lock members out.
+/// slots at the stream deadline, so they can't lock admitted callers out.
 #[tokio::test]
 async fn idle_connections_do_not_hold_the_undecided_slots() {
     let f = Fabric::new(2);

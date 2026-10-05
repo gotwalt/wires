@@ -1,6 +1,6 @@
 //! `wires mcp`: a stdio MCP server whose tools are the services you may call
-//! (the entries of your view marked `call`, as `wires services` lists
-//! them), plus `tools.json` aliases.
+//! (the entries of your view, as `wires services` lists them), plus
+//! `tools.json` aliases.
 //!
 //! The view is followed, not read once (card 37): `wires mcp` holds a
 //! `view` subscription with a directory ([`crate::caller::view::follow`]),
@@ -69,10 +69,11 @@ pub const LEGACY_PROTOCOL_VERSIONS: &[&str] =
 pub const FIRST_MODERN_VERSION: &str = "2026-07-28";
 
 /// How long a client may cache `tools/list` and `server/discover` results
-/// (the 2026-07-28 `ttlMs`). The tool list only changes with the signed
-/// state, which a client picks up within this.
+/// (the 2026-07-28 `ttlMs`). The tool list only changes with the view,
+/// which a client picks up within this.
 pub const LIST_TTL_MS: u64 = 60_000;
 
+/// The MCP `instructions`: the premise on one line, then [`USAGE`].
 pub fn instructions() -> String {
     format!("{} {USAGE}", crate::help::one_line(crate::help::PREMISE))
 }
@@ -186,7 +187,7 @@ impl<C: Caller> McpServer<C> {
     }
 
     /// Declare `tools.listChanged`: this server tells the client when its
-    /// tool list changes ([`serve`] with a view to follow).
+    /// tool list changes ([`serve_following`] with a view to follow).
     pub fn with_list_changed(mut self) -> Self {
         self.list_changed = true;
         self
@@ -605,8 +606,8 @@ fn input_schema() -> Value {
     })
 }
 
-/// The MCP description for `tool`: the first sentence of its registry
-/// description (card 38: the rest, and how to filter, are in
+/// The MCP description for `tool`: the first sentence of its description
+/// (card 38: the rest, and how to filter, are in
 /// [`instructions`]).
 fn describe(tool: &RemoteTool) -> String {
     first_sentence(&tool.description)
@@ -820,7 +821,7 @@ pub struct McpArgs {
 }
 
 /// `config`'s aliases, then one [`ToolTarget::Service`] tool per view entry
-/// (its registry description). A service in the view wins: an alias with
+/// (its description in the signed policy). A service in the view wins: an alias with
 /// the name of any service the view holds is dropped (with a warning).
 pub(crate) fn with_services(mut config: ToolsConfig, view: &library::View) -> ToolsConfig {
     config.tools.retain(|t| {
@@ -828,7 +829,7 @@ pub(crate) fn with_services(mut config: ToolsConfig, view: &library::View) -> To
             library::ServiceName::new(t.name.as_str()).is_ok_and(|n| view.entry(&n).is_some());
         if registered {
             tracing::warn!(
-                "tools.json alias `{}` is shadowed by the registered service of that name",
+                "tools.json alias `{}` is shadowed by the service of that name in your view",
                 t.name
             );
         }
@@ -1010,8 +1011,9 @@ mod tests {
             .unwrap()
     }
 
-    /// Drive `requests` (one JSON value per line) through [`serve`] and return
-    /// every stdout line, each parsed — which also proves stdout is JSON only.
+    /// Drive `requests` (one JSON value per line) through
+    /// [`serve_following`] and return every stdout line, each parsed — which
+    /// also proves stdout is JSON only.
     fn transcript(server: &mut McpServer<FakeCaller>, requests: &[Value]) -> Vec<Value> {
         let input: String = requests.iter().map(|r| format!("{r}\n")).collect();
         let mut out = Vec::new();
@@ -1411,18 +1413,18 @@ mod tests {
         );
     }
 
-    /// A view for anyone the mock IdP signed in: `services`, each callable.
+    /// A view for anyone the mock IdP signed in, holding `services`.
     fn view_of(services: &[(&str, &str)]) -> library::View {
         use library::{Policy, Service, ServiceName, StateVersion};
         let node = |b: u8| NodeIdentity::from_seed([b; 32]).node_id();
         let root = NodeIdentity::from_seed([1; 32]);
-        let mut state = Policy::new(root.node_id());
-        state.version = StateVersion(1);
-        state.not_after = i64::MAX;
+        let mut policy = Policy::new(root.node_id());
+        policy.version = StateVersion(1);
+        policy.not_after = i64::MAX;
         let (staff, anyone) = crate::testutil::staff_role();
-        state.roles.insert(staff.clone(), anyone);
+        policy.roles.insert(staff.clone(), anyone);
         for (name, desc) in services {
-            state.services.insert(
+            policy.services.insert(
                 ServiceName::new(*name).unwrap(),
                 Service {
                     description: (*desc).into(),
@@ -1439,7 +1441,7 @@ mod tests {
             groups: vec![],
             not_after: i64::MAX,
         };
-        crate::testutil::signed_policy(&root, state).view_for(
+        crate::testutil::signed_policy(&root, policy).view_for(
             crate::testutil::any_node(),
             Some(&anyone),
             None,

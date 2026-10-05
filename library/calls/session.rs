@@ -135,7 +135,7 @@ pub struct HelloAck {
 impl HelloAck {
     /// Whether this ack lets a dialer whose view is at `held` go on with a
     /// call of `service` on `host` (the iroh-authenticated peer), under the
-    /// fabric `root`. `Ok(true)` when the host's version is not newer than
+    /// network root `root`. `Ok(true)` when the host's version is not newer than
     /// `held` (nothing new), or when its head and `service`'s entry verify
     /// under `root` and the entry still lists `host`; `Ok(false)` when the
     /// newer policy no longer assigns `service` to `host` (or no longer has
@@ -218,11 +218,11 @@ pub enum Frame {
     Exit(i32),
     /// Terminal frame from the host: the call was refused, with a
     /// human-readable reason. Sent instead of a `HelloAck`, after which the
-    /// host closes. Carries no secrets — the reason describes the dialer's
-    /// own credential.
+    /// host closes. Carries no secrets: the reason says only what the
+    /// dialer can act on.
     Denied {
-        /// Why the session was refused (e.g. `not admitted to this network;
-        /// sign in with \`wires login\``).
+        /// Why the session was refused (e.g. `not admitted to this network:
+        /// sign in with \`wires login\`, or ask your admin for a role`).
         reason: String,
     },
     /// Dialer → host, right after `Hello`: which service to run and the

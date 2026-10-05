@@ -662,21 +662,21 @@ async fn a_signed_in_person_no_role_matches_is_told_so() {
     endpoint.close().await;
 }
 
-/// A caller holding the empty view `wires join` stores, at the newest
-/// version, gets its entries once it presents a token that verifies: the
-/// directory answers `current` only for the view it would send.
+/// A caller holding an empty view at the directory's newest version gets
+/// its entries on a refresh: the directory answers `current` only for the
+/// view it would send, not for any view at that version.
 #[tokio::test]
-async fn an_empty_view_at_the_newest_version_is_filled_once_signed_in() {
+async fn an_empty_view_at_the_newest_version_is_answered_whole() {
     let w = World::new();
     let v3 = w.policy(3, |_| {});
     let _serving = w.directory(&v3).await;
     let ks = w.caller_keystore(true);
     let root = w.root.node_id();
-    let joined = library::View {
+    let empty = library::View {
         head: v3.head.clone(),
         entries: vec![],
     };
-    view::write(&ks, root, &HeldView::fetched(joined, None, now_unix())).unwrap();
+    view::write(&ks, root, &HeldView::fetched(empty, None, now_unix())).unwrap();
     let endpoint = w.caller_endpoint().await;
     let asker = Asker {
         endpoint: &endpoint,

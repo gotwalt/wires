@@ -156,7 +156,7 @@ pub(crate) enum IssuerCmd {
         after_help = "Example:\n  wires issuer set https://idp.example.com --client-id <client id>"
     )]
     Set(IssuerSetArgs),
-    /// Stop trusting an IdP no role names any more, and publish
+    /// Stop trusting an IdP no role or removal names any more, and publish
     #[command(after_help = "Example:\n  wires issuer rm https://idp.example.com")]
     Rm(IssuerRmArgs),
 }
@@ -195,7 +195,7 @@ pub(crate) struct IssuerRmArgs {
     pub(crate) ttl: Ttl,
 }
 
-/// A change to one registry entry. `None` fields keep the current value
+/// A change to one service. `None` fields keep the current value
 /// (`set`); `add` requires the service not to exist, `set` requires it to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ServiceEdit {
@@ -463,8 +463,8 @@ pub(crate) fn check_hosts(s: &Policy, hosts: Option<&[NodeId]>) -> Result<()> {
 /// Parse one matcher: a bare email pattern (`*@example.com`,
 /// `alice@example.com`), or comma-separated `key=value` pairs over `issuer`
 /// (or `iss`), `email`, `org`, `group`. A matcher that names no issuer
-/// trusts `default_issuer` (`role set --issuer`, Google by default): every
-/// matcher names one.
+/// trusts `default_issuer` (`role set --issuer`, else the issuer the network
+/// string names): every matcher names one.
 pub(crate) fn parse_matcher(text: &str, default_issuer: &str) -> Result<Matcher> {
     let text = text.trim();
     let default_issuer = default_issuer.trim();

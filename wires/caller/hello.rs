@@ -12,7 +12,8 @@ use crate::caller::login::ID_TOKEN_FILE;
 use crate::host::gate::NOT_ADMITTED;
 
 /// The ID token `wires login` stored, if any. A missing token is not an
-/// error (the host decides whether the service needs one).
+/// error here: whoever needs one says `not signed in` (every host and
+/// directory request needs one).
 pub(crate) fn stored_token(ks: &Keystore) -> Option<IdToken> {
     let text = std::fs::read_to_string(ks.path(ID_TOKEN_FILE)).ok()?;
     let text = text.trim();
@@ -29,7 +30,7 @@ pub(crate) fn unverified_claims(jws: &str) -> Option<Value> {
 
 /// What a signed-in caller says when a host or directory answered
 /// [`NOT_ADMITTED`], read from its own stored token (nothing is sent): the
-/// responder tells no reason apart, but the person can act on one of these.
+/// host or directory tells no reason apart, but the person can act on one of these.
 ///
 /// - no token: [`NOT_SIGNED_IN`](crate::help::NOT_SIGNED_IN);
 /// - expired at `now`: sign in again;
@@ -68,7 +69,7 @@ pub(crate) fn explain_not_admitted_in(ks: &Keystore) -> String {
     explain_not_admitted(stored_token(ks).as_ref(), crate::clock::now_unix())
 }
 
-/// A responder's refusal `reason` as this caller says it: the
+/// A host's or directory's refusal `reason` as this caller says it: the
 /// [`explain_not_admitted`] sentence for [`NOT_ADMITTED`], else `reason`.
 pub(crate) fn say_refusal(ks: &Keystore, reason: &str) -> String {
     if reason == NOT_ADMITTED {

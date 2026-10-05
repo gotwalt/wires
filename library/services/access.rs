@@ -1,21 +1,18 @@
 //! Policy evaluation over the signed policy: **may this caller call this
-//! service**, and **which services may it call**.
+//! service**.
 //!
-//! One function, two uses: a host runs [`authorize`] on every call (then its
-//! own stricter `also_require`), and `wires services` runs
-//! [`allowed_services`] locally to list what the caller may use. Both read
-//! only the [`Policy`] (a verified [`SignedPolicy`](crate::SignedPolicy)'s
-//! items) and the caller's verified [`Principal`]; there
-//! is no network and no clock (the principal handed in is already fresh).
+//! A host runs [`authorize`] on every call (then its own stricter
+//! `also_require`). It reads only the [`Policy`] (a verified
+//! [`SignedPolicy`](crate::SignedPolicy)'s items) and the caller's verified
+//! [`Principal`]; there is no network and no clock (the principal handed in
+//! is already fresh). A caller's list of services is its view, which a
+//! directory cuts by the same role rule
+//! ([`SignedPolicy::view_for`](crate::SignedPolicy::view_for)).
 //!
-//! Neither verifies the caller's ID token: that is the gate's, before this,
-//! and so is admission ([`check_admitted`](crate::check_admitted)). Both do
-//! refuse a node or a person the policy bans, so a registry decision never
+//! It doesn't verify the caller's ID token: that is the gate's, before this,
+//! and so is admission ([`check_admitted`](crate::check_admitted)). It does
+//! refuse a node or a person the policy bans, so a policy decision never
 //! admits a removed caller.
-//!
-//! The host is the ground truth: [`allowed_services`] is defined in terms of
-//! [`authorize`], so the listing never shows a service the host would refuse
-//! on registry grounds (a host's `also_require` can still narrow it).
 
 use std::fmt;
 
@@ -25,8 +22,7 @@ use crate::registry::ServiceName;
 use crate::role::RoleName;
 use crate::signed_policy::Policy;
 
-/// A service the caller may call, and the role that admits it (what `wires
-/// services` shows as "why").
+/// A service the caller may call, and the role that admits it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
     /// The service.
@@ -95,7 +91,7 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// Decide one call against the registry, in order: neither `caller` nor the
+/// Decide one call against the policy, in order: neither `caller` nor the
 /// person `principal` is banned →
 /// `service` exists → the first role in its `allow` that admits the caller
 /// (a defined role whose matchers match its verified `principal`; with no

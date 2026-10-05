@@ -11,7 +11,7 @@
 //! from the view as it is). When a host's `HelloAck` reports a newer head, it carries the
 //! head and the service's entry, and the call stops there, **before** any
 //! stdin is sent, unless that entry still lists the host; the caller then
-//! refreshes its view after the call. On an unchanged fabric, within a day
+//! refreshes its view after the call. On an unchanged policy, within a day
 //! of the last refresh, the call is the only connection. A service in the view wins over a `tools.json`
 //! alias of the same name; an alias pins a name to one host (and address
 //! hints), which the view's entry for the alias's service must list, and
@@ -1326,7 +1326,7 @@ mod tests {
     }
 
     /// [`signed_listing`] with no directory.
-    fn signed_state(root: &NodeIdentity, version: u64, hosts: &[NodeId]) -> SignedPolicy {
+    fn signed_at(root: &NodeIdentity, version: u64, hosts: &[NodeId]) -> SignedPolicy {
         signed_listing(root, version, hosts, &[])
     }
 
@@ -1407,8 +1407,8 @@ mod tests {
         let f = fixture();
         let down = NodeIdentity::from_seed([82; 32]).node_id();
         let b = NodeIdentity::from_seed([83; 32]);
-        let v1 = signed_state(&f.root, 1, &[down, b.node_id()]);
-        let v2 = signed_state(&f.root, 2, &[down, b.node_id()]);
+        let v1 = signed_at(&f.root, 1, &[down, b.node_id()]);
+        let v2 = signed_at(&f.root, 2, &[down, b.node_id()]);
         let held_v1 = held(&f, &v1);
         let answer = Answer::Run {
             out: "42\n",
@@ -1448,7 +1448,7 @@ mod tests {
         let f = fixture();
         let a = NodeIdentity::from_seed([84; 32]);
         let b = NodeIdentity::from_seed([85; 32]);
-        let state = held(&f, &signed_state(&f.root, 1, &[a.node_id(), b.node_id()]));
+        let state = held(&f, &signed_at(&f.root, 1, &[a.node_id(), b.node_id()]));
         let (a_id, a_addr, _) = fake_host(&a, Answer::Deny("not in role analyst")).await;
         let answer = Answer::Run {
             out: "",
@@ -1472,7 +1472,7 @@ mod tests {
     async fn no_host_answering_is_an_error_naming_them() {
         let f = fixture();
         let a = NodeIdentity::from_seed([86; 32]).node_id();
-        let state = held(&f, &signed_state(&f.root, 1, &[a]));
+        let state = held(&f, &signed_at(&f.root, 1, &[a]));
         let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let (r, _) = run_service(&f, &state, Hints::from_pairs([(a, vec![dead])])).await;
         let err = format!("{:#}", r.unwrap_err());
@@ -1484,7 +1484,7 @@ mod tests {
     #[test]
     fn an_expired_view_refuses_to_dial() {
         let f = fixture();
-        let mut p = signed_state(&f.root, 1, &[NodeIdentity::from_seed([87; 32]).node_id()])
+        let mut p = signed_at(&f.root, 1, &[NodeIdentity::from_seed([87; 32]).node_id()])
             .to_policy()
             .unwrap();
         p.not_after = 1;
@@ -1510,8 +1510,8 @@ mod tests {
         let f = fixture();
         let h = NodeIdentity::from_seed([88; 32]);
         let other = NodeIdentity::from_seed([89; 32]).node_id();
-        let v1 = signed_state(&f.root, 1, &[h.node_id()]);
-        let v2 = signed_state(&f.root, 2, &[other]);
+        let v1 = signed_at(&f.root, 1, &[h.node_id()]);
+        let v2 = signed_at(&f.root, 2, &[other]);
         let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let answer = Answer::Echo {
             policy: v2,
@@ -1533,7 +1533,7 @@ mod tests {
 
         // A forged entry that lists the host: refused the same way.
         let f = fixture();
-        let mut forged = signed_state(&f.root, 2, &[other]);
+        let mut forged = signed_at(&f.root, 2, &[other]);
         if let Some(library::Item::Service(e)) = forged
             .items
             .iter_mut()
@@ -1556,7 +1556,7 @@ mod tests {
 
         // Control: a newer head that still assigns the host lets stdin through.
         let f = fixture();
-        let v2 = signed_state(&f.root, 2, &[h.node_id()]);
+        let v2 = signed_at(&f.root, 2, &[h.node_id()]);
         let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let answer = Answer::Echo {
             policy: v2,
@@ -1584,12 +1584,12 @@ mod tests {
         }
     }
 
-    /// Card 37: `wires call` on an unchanged fabric makes no connection but
+    /// Card 37: `wires call` on an unchanged policy makes no connection but
     /// the call itself: the directory its view lists hears nothing. When
     /// the host reports a newer head, the caller asks a directory after the
     /// call (and only then).
     #[tokio::test]
-    async fn a_call_on_an_unchanged_fabric_dials_only_the_host() {
+    async fn a_call_on_an_unchanged_policy_dials_only_the_host() {
         use std::sync::atomic::Ordering;
         let f = fixture();
         // A directory that counts every request.
@@ -1673,7 +1673,7 @@ mod tests {
         let f = fixture();
         let host = NodeIdentity::from_seed([90; 32]).node_id();
         let stranger = NodeIdentity::from_seed([91; 32]).node_id();
-        let state = held(&f, &signed_state(&f.root, 1, &[host]));
+        let state = held(&f, &signed_at(&f.root, 1, &[host]));
         let alias = |name: &str, node: NodeId| RemoteTool {
             name: ServiceName::new(name).unwrap(),
             description: String::new(),

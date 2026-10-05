@@ -86,7 +86,7 @@ pub struct Policy {
     pub person_bans: BTreeSet<Person>,
     /// The trusted IdPs.
     pub issuers: BTreeMap<Issuer, IssuerConfig>,
-    /// The fabric's settings.
+    /// The network's settings.
     pub settings: Settings,
 }
 
@@ -358,7 +358,7 @@ impl Policy {
 
     /// Whether `role` admits a caller presenting `principal`: a defined role
     /// one of whose matchers matches it. With no principal, or an undefined
-    /// role, nothing admits (exactly [`role_admits`](crate::role_admits)).
+    /// role, nothing admits (the rule [`authorize`](crate::authorize) applies).
     pub fn role_admits(&self, role: &RoleName, principal: Option<&Principal>) -> bool {
         admits(self.roles.get(role).map(Vec::as_slice), principal)
     }
@@ -464,7 +464,7 @@ impl SignedPolicy {
         self.head.head.version
     }
 
-    /// Whether this policy should replace `other`: same fabric and a strictly
+    /// Whether this policy should replace `other`: same network root and a strictly
     /// higher version ([`SignedPolicyHead::is_newer_than`]). Says nothing
     /// about signatures; verify first.
     pub fn is_newer_than(&self, other: &SignedPolicy) -> bool {
@@ -619,7 +619,7 @@ pub(crate) fn check_order(items: &[Item]) -> Result<()> {
     }
 }
 
-/// [`Error::InvalidPolicy`] unless `entry` belongs to `head`'s fabric and
+/// [`Error::InvalidPolicy`] unless `entry` belongs to `head`'s network root and
 /// was last changed no later than `head`'s version.
 pub(crate) fn check_entry_version(entry: &SignedEntry, head: &SignedPolicyHead) -> Result<()> {
     if entry.fabric != head.head.fabric {
@@ -1110,7 +1110,7 @@ mod tests {
                 .entries()
                 .all(|e| e.version == StateVersion(4))
         );
-        // Another fabric's policy lends nothing: every entry is its own.
+        // Another network's policy lends nothing: every entry is its own.
         let other = NodeIdentity::from_seed([9u8; 32]);
         let mut q = p.clone();
         q.fabric = other.node_id();
