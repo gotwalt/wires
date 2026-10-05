@@ -141,20 +141,29 @@ fn error_messages_match_their_snapshot() {
     let svc = ServiceName::new("orders-db").unwrap();
     let analyst = RoleName::new("analyst").unwrap();
     let v = StateVersion(7);
-    let registry = |refusal| GateRefusal::Registry {
-        refusal,
-        version: v,
-    };
-    let refusals = [
-        NOT_ADMITTED.to_owned(),
-        registry(Refusal::NotInRole {
+    // Not in its `allow`, no such service, nobody allowed: one sentence.
+    let not_callable = GateRefusal::NotCallable {
+        service: svc.clone(),
+        refusal: Refusal::NotInRole {
             service: svc.clone(),
             allow: vec![analyst.clone()],
             principal: Some("carol@partner.example".into()),
-        })
-        .to_string(),
-        registry(Refusal::UnknownService(svc.clone())).to_string(),
-        registry(Refusal::NobodyAllowed(svc.clone())).to_string(),
+        },
+    }
+    .to_string();
+    for refusal in [
+        Refusal::UnknownService(svc.clone()),
+        Refusal::NobodyAllowed(svc.clone()),
+    ] {
+        let same = GateRefusal::NotCallable {
+            service: svc.clone(),
+            refusal,
+        };
+        assert_eq!(same.to_string(), not_callable);
+    }
+    let refusals = [
+        NOT_ADMITTED.to_owned(),
+        not_callable,
         GateRefusal::NotAssigned {
             service: svc.clone(),
             version: v,
@@ -175,6 +184,20 @@ fn error_messages_match_their_snapshot() {
         .iter()
         .map(|r| format!("wires: {} [exit 77]", help::refusal(r)))
         .collect();
+    // What a signed-in caller says for a host's NOT_ADMITTED, from its own
+    // token: one with a verified email, one without, one expired.
+    {
+        use base64::Engine as _;
+        let token = |claims: &str| {
+            library::IdToken::new(format!("e30.{}.sig", library::B64.encode(claims)))
+        };
+        let with = token(r#"{"email":"carol@partner.example","email_verified":true,"exp":9}"#);
+        let without = token(r#"{"sub":"1","exp":9}"#);
+        for (t, now) in [(&with, 1), (&without, 1), (&with, 10)] {
+            let said = crate::caller::hello::explain_not_admitted(Some(t), now);
+            lines.push(format!("wires: {} [exit 77]", help::refusal(&said)));
+        }
+    }
     let call = crate::caller::call::not_callable;
     lines.push(format!("wires: {} [exit 1]", call(&svc)));
     lines.push(format!("wires: {} [exit 1]", help::NOT_SIGNED_IN));
@@ -287,7 +310,9 @@ fn a_refusal_gets_one_next_step() {
     );
     let login = "your ID token could not be verified; run `wires login`";
     assert_eq!(help::refusal(login), format!("denied by host: {login}"));
-    assert!(help::refusal("unknown service: x").ends_with("see `wires services`"));
+    assert!(
+        help::refusal("no service named `x` that you may call").ends_with("see `wires services`")
+    );
 }
 
 /// Without `--verbose`, an error prints up to its first next step, or its

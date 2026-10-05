@@ -10,7 +10,8 @@
 #
 #   host   -- `kv.py` or `kv.mts`: the embedded host, implementing kv.
 #   agent  -- alice@example.com (role analyst): calls kv.
-#   other  -- bob@other.example: signed in, but in no role that may call kv.
+#   other  -- bob@other.example: signs in at the IdP, but no role matches him,
+#             so he is not in the network.
 #   root   -- the admin: init, role set, directory add, service add, network,
 #             and the first policy push (card 41's first run).
 #
@@ -262,18 +263,18 @@ set +e
 call "$other" keys >"$D/c4.out" 2>"$D/c4.err"
 rc=$?
 set -e
-# Card 37: kv is not in bob's view (no role of his may use it), so his
-# call finds no host: nothing is dialed, and the handler never runs.
+# Card 47: no role matches bob, so no directory admits him and he holds no
+# view: nothing is dialed, and the handler never runs.
 [ "$rc" -eq 1 ] || {
 	dump "$D/c4.err"
-	bad "bob's call exited $rc, expected 1 (not in his view)"
+	bad "bob's call exited $rc, expected 1 (not in the network)"
 }
-grep -qF "no service named \`kv\` that you may call" "$D/c4.err" || {
+grep -qF "no role in this network matches bob@other.example" "$D/c4.err" || {
 	dump "$D/c4.err"
-	bad "bob's call stopped, but not for his view"
+	bad "bob's call stopped, but not because the network doesn't admit him"
 }
 [ ! -s "$D/c4.out" ] || bad "bob's call wrote to stdout"
-ok "bob holds no kv in his view: nothing dialed, the handler never runs"
+ok "bob is not in the network: nothing dialed, the handler never runs"
 
 # --------------------------------------------------------------------------
 # The handler's push.

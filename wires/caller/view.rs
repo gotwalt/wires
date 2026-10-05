@@ -15,10 +15,13 @@
 //!
 //! - `wires login` asks for the view under the new identity, from the
 //!   directories its network string names until a head names them all.
-//! - `wires services` and `wires call` refresh first when the view is older
-//!   than a day ([`VIEW_MAX_AGE_SECS`]), its head has expired, or a host
-//!   reported a newer head ([`HeldView::is_stale`]); otherwise a call dials
-//!   from the view as it is. When the host's `HelloAck` reports a newer
+//! - `wires services`, `wires call` and `wires inbox` refresh first when
+//!   the view is older than a day ([`VIEW_MAX_AGE_SECS`]), its head has
+//!   expired, or a host reported a newer head ([`HeldView::is_stale`]);
+//!   otherwise they dial from the view as it is ([`usable`]). A refresh no
+//!   directory answers leaves the view as it is: calls keep working with
+//!   every directory down, so the hard bound on dialing from an old view is
+//!   its head's `not_after`, not a day. When the host's `HelloAck` reports a newer
 //!   head, the caller records it ([`note_seen`]) and refreshes after the
 //!   call; a name not in the view is asked of a directory with `resolve`
 //!   before the call fails.
@@ -49,9 +52,16 @@ use crate::policy::store;
 /// The caller's view, under `$WIRES_HOME`.
 pub(crate) const VIEW_FILE: &str = "view.json";
 
-/// How old a view may be before `wires services` or `wires call` refreshes
-/// it: a day. It also bounds how long a caller holding a view from before a
-/// host's removal may still dial that host (protocol §5).
+/// How old a view may be before `wires services`, `wires call` or `wires
+/// inbox` refreshes it: a day.
+///
+/// This is **not** a bound on how long a caller holding a view from before a
+/// host's removal may still dial that host (protocol §5): when no directory
+/// answers the refresh, the caller keeps its view; and a removed machine
+/// that was also a directory the old head lists can answer `current` with
+/// a `Fresh` it signs for that head, resetting the day. The hard bound is
+/// the view's head's `not_after` (90 days by default): an expired view is
+/// never dialed from.
 pub(crate) const VIEW_MAX_AGE_SECS: i64 = 24 * 60 * 60;
 
 /// How long a refresh spends asking, all directories together.
@@ -99,7 +109,7 @@ impl HeldView {
         &self.view.head.head.directories
     }
 
-    /// Whether `wires services` and `wires call` should refresh it first:
+    /// Whether `wires services`, `wires call` and `wires inbox` should refresh it first:
     /// last vouched for
     /// more than [`VIEW_MAX_AGE_SECS`] before `now`, its head expired, or a
     /// host reported a newer head.
@@ -177,6 +187,29 @@ pub(crate) fn directories(ks: &Keystore, root: NodeId, me: NodeId) -> Vec<NodeId
     dirs.into_iter().filter(|d| *d != me).collect()
 }
 
+/// Every directory that answered a refresh refused this node with
+/// [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED), and none gave it a
+/// view: the context of [`refresh`]'s error then, so a command can say
+/// what the person can act on
+/// ([`explain_not_admitted`](crate::caller::hello::explain_not_admitted)).
+#[derive(Debug, thiserror::Error)]
+#[error("a directory said this node is not admitted to the network")]
+pub(crate) struct NotAdmitted;
+
+/// A directory's `denied {reason}`, as an error (so [`refresh`] can tell a
+/// refusal of admission from a directory that couldn't be reached).
+#[derive(Debug, thiserror::Error)]
+#[error("refused: {0}")]
+pub(crate) struct Refused(pub(crate) String);
+
+impl Refused {
+    /// Whether the directory refused admission.
+    fn is_not_admitted(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<Refused>()
+            .is_some_and(|r| r.0 == crate::host::gate::NOT_ADMITTED)
+    }
+}
+
 /// What a directory answered a `view` request with, verified.
 #[allow(clippy::large_enum_variant)] // one per request, moved once
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -248,7 +281,7 @@ pub(crate) async fn ask_view(
             }
             Ok(Fetched::Current(fresh))
         }
-        DirectoryAnswer::Denied { reason } => bail!("refused: {reason}"),
+        DirectoryAnswer::Denied { reason } => Err(Refused(reason).into()),
         other => bail!("an unexpected answer to `view`: {other:?}"),
     }
 }
@@ -277,7 +310,7 @@ pub(crate) async fn ask_resolve(
             }
             Ok(view)
         }
-        DirectoryAnswer::Denied { reason } => bail!("refused: {reason}"),
+        DirectoryAnswer::Denied { reason } => Err(Refused(reason).into()),
         other => bail!("an unexpected answer to `resolve`: {other:?}"),
     }
 }
@@ -303,7 +336,8 @@ pub(crate) struct Asker<'a> {
 ///   someone else).
 ///
 /// Errors when there is no view to be had (no directory answered, none
-/// held).
+/// held), with [`NotAdmitted`] as its context when a directory refused this
+/// node's admission and none gave it a view.
 pub(crate) async fn refresh(ks: &Keystore, asker: &Asker<'_>, forget: bool) -> Result<HeldView> {
     let root = asker.root;
     let me = transport::to_node_id(&asker.endpoint.id());
@@ -335,6 +369,7 @@ pub(crate) async fn refresh(ks: &Keystore, asker: &Asker<'_>, forget: bool) -> R
         });
     }
     let mut failures = Vec::new();
+    let mut not_admitted = false;
     for dir in dirs {
         let base = held.as_ref().map(|h| &h.view);
         let mut asked = ask_view(
@@ -383,13 +418,89 @@ pub(crate) async fn refresh(ks: &Keystore, asker: &Asker<'_>, forget: bool) -> R
                 write(ks, root, &current)?;
                 return Ok(current);
             }
-            Err(e) => failures.push(format!("{}: {e:#}", dir.short())),
+            Err(e) => {
+                not_admitted |= Refused::is_not_admitted(&e);
+                failures.push(format!("{}: {e:#}", dir.short()));
+            }
         }
     }
-    bail!(
+    let failed = anyhow!(
         "no directory gave this node its view ({})",
         failures.join("; ")
-    )
+    );
+    Err(if not_admitted {
+        failed.context(NotAdmitted)
+    } else {
+        failed
+    })
+}
+
+/// Refuse an expired view, saying what to do about it.
+pub(crate) fn check_fresh(held: &HeldView, now: i64) -> Result<()> {
+    if held.view.head.check_fresh(now).is_err() {
+        bail!(
+            "this node's view (policy version {}) has expired and no newer one could be \
+             fetched, so nothing was dialed; ask the admin to run `wires policy push`",
+            held.version().0
+        );
+    }
+    Ok(())
+}
+
+/// The view to dial from, as `wires call` and `wires inbox` take it: the
+/// held view as it is, unless it is missing or stale
+/// ([`HeldView::is_stale`]: older than a day, its head expired, or a host
+/// reported a newer head); then a refresh ([`refresh_now`]). A refresh that
+/// fails leaves a held view whose head hasn't expired, which is dialed from
+/// as it is (so calls keep working with every directory down); with none, it
+/// is an error, saying what the person can act on when a directory refused
+/// this node ([`NotAdmitted`]). An expired view is never returned.
+pub(crate) async fn usable(
+    ks: &Keystore,
+    node: &library::NodeIdentity,
+    root: NodeId,
+    relay: Option<&str>,
+) -> Result<HeldView> {
+    usable_with(ks, root, now_unix(), || {
+        refresh_now(ks, node, root, relay, false)
+    })
+    .await
+}
+
+/// [`usable`] at `now`, refreshing with `refresh` (tests hand it one over
+/// their own endpoint).
+pub(crate) async fn usable_with<F>(
+    ks: &Keystore,
+    root: NodeId,
+    now: i64,
+    refresh: impl FnOnce() -> F,
+) -> Result<HeldView>
+where
+    F: std::future::Future<Output = Result<HeldView>>,
+{
+    let held = read(ks, root)?.filter(|held| held.view.head.check_fresh(now).is_ok());
+    if let Some(held) = &held
+        && !held.is_stale(now)
+    {
+        return Ok(held.clone());
+    }
+    match (refresh().await, held) {
+        (Ok(refreshed), _) => {
+            check_fresh(&refreshed, now)?;
+            Ok(refreshed)
+        }
+        (Err(e), Some(held)) => {
+            tracing::debug!("refreshing a stale view: {e:#}; dialing from it as it is");
+            Ok(held)
+        }
+        (Err(e), None) if e.downcast_ref::<NotAdmitted>().is_some() => {
+            Err(e.context(crate::caller::hello::explain_not_admitted_in(ks)))
+        }
+        (Err(e), None) => Err(e.context(
+            "this node holds no current view of its services, and no directory gave it one: \
+             run `wires login` (or ask the admin to run `wires policy push`)",
+        )),
+    }
 }
 
 /// [`refresh`] as a one-shot command does it: bind an endpoint for `node`
@@ -679,7 +790,7 @@ mod tests {
         library::Principal {
             issuer: crate::testutil::test_idp().issuer.as_str().into(),
             subject: "1".into(),
-            email: None,
+            email: Some("me@example.com".into()),
             org: None,
             groups: vec![],
             not_after: i64::MAX,

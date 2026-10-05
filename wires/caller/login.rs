@@ -789,6 +789,13 @@ pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
         token_path.display(),
         login.principal.not_after
     );
+    if login.principal.email.is_none() {
+        eprintln!(
+            "wires login: your IdP gave no verified email for {}, and this network admits only \
+             a verified email: ask your admin",
+            login.principal.name()
+        );
+    }
     // Card 37: the view under the new identity (the old one was someone
     // else's, or no one's).
     let identity = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
@@ -802,6 +809,17 @@ pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
                     held.view.entries.len(),
                     held.version().0
                 ),
+                // Signed in at the IdP, but not in this network.
+                Err(e)
+                    if e.downcast_ref::<crate::caller::view::NotAdmitted>()
+                        .is_some() =>
+                {
+                    eprintln!(
+                        "wires login: signed in as {}, but {}",
+                        login.principal.name(),
+                        crate::caller::hello::explain_not_admitted_in(&ks)
+                    )
+                }
                 Err(e) => eprintln!(
                     "wires login: could not fetch your services yet ({e:#}); `wires services` asks \
                  again"

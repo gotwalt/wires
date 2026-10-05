@@ -363,6 +363,15 @@ impl Policy {
         admits(self.roles.get(role).map(Vec::as_slice), principal)
     }
 
+    /// Whether some role in the policy admits `principal`
+    /// ([`role_admits`](Self::role_admits) for any defined role): what
+    /// admission requires ([`check_admitted`](crate::check_admitted)).
+    pub fn any_role_admits(&self, principal: &Principal) -> bool {
+        self.roles
+            .values()
+            .any(|matchers| admits(Some(matchers), Some(principal)))
+    }
+
     /// Whether the policy bans `node` (a ban holds until the admin lifts
     /// it).
     pub fn bans_node(&self, node: NodeId) -> bool {
@@ -632,12 +641,14 @@ pub(crate) fn service_matches(name: &ServiceName, svc: &Service, query: &str) ->
 }
 
 /// Whether `matchers` (a role's definition, if it has one) admit `principal`.
-/// The one rule every admission check shares.
+/// The one rule every admission check shares: no role admits a principal
+/// with no verified email (admission requires one, so a person ban can't be
+/// sidestepped by leaving it out), whatever its matchers say.
 pub(crate) fn admits(matchers: Option<&[Matcher]>, principal: Option<&Principal>) -> bool {
     let (Some(matchers), Some(p)) = (matchers, principal) else {
         return false;
     };
-    matchers.iter().any(|m| m.matches(p))
+    p.email.is_some() && matchers.iter().any(|m| m.matches(p))
 }
 
 /// Shared test fixtures: a small, valid policy, and random ones.
@@ -1121,9 +1132,29 @@ mod tests {
         assert!(!p.role_admits(&role("auditor"), Some(&alice)));
         assert!(!p.role_admits(&role("staff"), None));
         assert!(!p.role_admits(&role("ghost"), Some(&alice)));
-        let mut elsewhere = alice;
+        let mut elsewhere = alice.clone();
         elsewhere.issuer = "https://partner.example".into();
         assert!(!p.role_admits(&role("analyst"), Some(&elsewhere)));
+        assert!(!p.any_role_admits(&elsewhere));
+        assert!(p.any_role_admits(&alice));
+        // No verified email: no role admits, not even `staff` (issuer only).
+        let mut no_email = alice;
+        no_email.email = None;
+        assert!(!p.role_admits(&role("staff"), Some(&no_email)));
+        assert!(!p.any_role_admits(&no_email));
+        let signed = p.sign(&root()).unwrap();
+        assert!(
+            !signed
+                .view_for(node(2), Some(&who("bob@example.com")), None)
+                .entries
+                .is_empty()
+        );
+        assert!(
+            signed
+                .view_for(node(2), Some(&no_email), None)
+                .entries
+                .is_empty()
+        );
     }
 
     #[test]

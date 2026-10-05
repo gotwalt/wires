@@ -598,14 +598,16 @@ impl PushHost {
     /// [`MAX_PREAUTH_FETCHES`] fetches are read at once and each opening
     /// frame is at most [`MAX_INBOX_HELLO`]. The fetch is admitted like a
     /// call ([`ServicesHost::admit_caller`]: its `Hello`'s ID token verifies,
-    /// and neither the node nor the person is banned); a peer that is not
-    /// admitted hears only [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED)
-    /// (or that its sign-in expired, or the IdP is unreachable) and is
-    /// traced, throttled (a banned node's queue is dropped and each
-    /// message's fate traced). An admitted node's policy refusal is
-    /// only answered: `wires inbox` asks every host of the node's services,
-    /// and a host it may not hear from would otherwise trace it on every
-    /// poll. A node holds at most [`MAX_FETCHES_PER_NODE`] long polls open.
+    /// and [`library::check_admitted`] passes); a peer that is not admitted
+    /// hears only [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED) (or
+    /// that its sign-in expired, or the IdP is unreachable) and is traced,
+    /// throttled (a banned node's or person's queue is dropped and each
+    /// message's fate traced). An admitted node's push refusal is answered
+    /// with one fixed sentence
+    /// ([`INBOX_REFUSED`](crate::host::gate::INBOX_REFUSED), no role names)
+    /// and traced at `debug`: `wires inbox` asks every host of the node's
+    /// services, and a host it may not hear from would otherwise trace it
+    /// on every poll. A node holds at most [`MAX_FETCHES_PER_NODE`] long polls open.
     pub(crate) async fn serve_fetch<S, R>(
         &self,
         mut send: S,
@@ -663,17 +665,19 @@ impl PushHost {
         // it is, and so its roles; then the bans.
         let admitted = match &id_token {
             Some(token) => self.host.admit_caller(&state, caller, token, now).await,
-            None => Err((
-                crate::host::gate::NOT_ADMITTED,
-                "no ID token presented".to_string(),
-            )),
+            None => Err(crate::host::gate::NotAdmitted {
+                said: crate::host::gate::NOT_ADMITTED,
+                why: "no ID token presented".to_string(),
+                banned: state.policy.bans_node(caller),
+            }),
         };
-        if let Err((reason, detail)) = admitted {
-            FETCH_STRANGERS.refused("inbox fetch", caller, &detail);
-            if state.policy.bans_node(caller) {
-                self.drop_queue(caller, &detail);
+        if let Err(refused) = admitted {
+            FETCH_STRANGERS.refused("inbox fetch", caller, &refused.why);
+            // A banned node or person loses what is queued for it.
+            if refused.banned || state.policy.bans_node(caller) {
+                self.drop_queue(caller, &refused.why);
             }
-            deny(&mut send, reason).await;
+            deny(&mut send, refused.said).await;
             return Ok(());
         }
         match self.authorize(caller, now) {
@@ -686,7 +690,9 @@ impl PushHost {
                 return Ok(());
             }
             Err(PushRefusal::Refused(reason)) => {
-                deny(&mut send, &format!("inbox fetch refused: {reason}")).await;
+                // No role names, no policy: the reason stays here.
+                tracing::debug!(caller = %caller.hex(), "inbox fetch refused: {reason}");
+                deny(&mut send, crate::host::gate::INBOX_REFUSED).await;
                 return Ok(());
             }
         }
@@ -1000,10 +1006,16 @@ mod tests {
         }
     }
 
-    /// A push host (4) of the network rooted at 1, whose policy bans 50–54.
-    /// (No service or role is needed: these tests stop at admission, and
-    /// `serve` isn't preflighted.)
+    /// A push host (4) of the network rooted at 1, whose policy bans 50–54
+    /// and defines no role. (No service is needed: these tests stop at
+    /// admission, and `serve` isn't preflighted.)
     fn push_host() -> Arc<PushHost> {
+        push_host_with(|_| {})
+    }
+
+    /// [`push_host`], its policy changed by `edit` first, trusting the
+    /// shared test IdP (whose user is `caller@example.com`).
+    fn push_host_with(edit: impl FnOnce(&mut library::Policy)) -> Arc<PushHost> {
         use crate::admin::keystore::Keystore;
         use library::{Policy, StateVersion};
         let root = NodeIdentity::from_seed([1u8; 32]);
@@ -1016,6 +1028,16 @@ mod tests {
         for seed in 50..55u8 {
             s.ban(node(seed));
         }
+        // Trusted even with no role naming it, so its tokens verify.
+        let mock = library::Audience::new(crate::caller::mock_idp::MOCK_CLIENT_ID);
+        s.issuers.insert(
+            crate::testutil::test_idp().issuer.clone(),
+            library::IssuerConfig {
+                client_id: mock.clone(),
+                audiences: vec![mock],
+            },
+        );
+        edit(&mut s);
         let signed = crate::testutil::signed_policy(&root, s);
         crate::policy::store::adopt_if_newer(
             &ks,
@@ -1031,6 +1053,135 @@ mod tests {
         let host = crate::host::serve::services_host(node(4), root.node_id(), Arc::new(ks), config)
             .unwrap();
         Arc::new(PushHost::from_state(Arc::new(host)))
+    }
+
+    /// A role named `name` matching `email` at the shared test IdP.
+    fn role_for(name: &str, email: &str) -> (library::RoleName, Vec<library::Matcher>) {
+        (
+            library::RoleName::new(name).unwrap(),
+            vec![library::Matcher {
+                email: Some(email.parse().unwrap()),
+                ..library::Matcher::new(crate::testutil::test_idp().issuer.as_str())
+            }],
+        )
+    }
+
+    /// The shared test IdP's user, as a host verifies it.
+    fn the_caller() -> library::Principal {
+        library::Principal {
+            issuer: crate::testutil::test_idp().issuer.as_str().into(),
+            subject: "sub-caller@example.com".into(),
+            email: Some("caller@example.com".into()),
+            org: None,
+            groups: vec![],
+            not_after: i64::MAX,
+        }
+    }
+
+    /// The opening frames of a fetch from `who`, presenting its test token.
+    fn fetch_frames(who: NodeId) -> Vec<u8> {
+        let id_token = Some(crate::testutil::test_id_token(&who));
+        let mut bytes = InboxFrame::Hello { id_token }.encode().unwrap();
+        bytes.extend(InboxFrame::Fetch { wait_ms: 0 }.encode().unwrap());
+        bytes
+    }
+
+    /// A person the IdP verified but no role names is not admitted to fetch
+    /// (the fixed sentence), and leaves no identity behind.
+    #[tokio::test]
+    async fn a_fetch_from_a_person_no_role_matches_is_not_admitted() {
+        let push = push_host();
+        let who = node(61);
+        let r = fetch_refusal(&push, fetch_frames(who), who).await;
+        assert_eq!(r, crate::host::gate::NOT_ADMITTED);
+        assert!(push.host.identities.nodes().is_empty());
+    }
+
+    /// An admitted fetcher that `push.allow` (analyst) doesn't admit hears
+    /// one fixed sentence that names no role.
+    #[tokio::test]
+    async fn an_admitted_fetcher_push_allow_refuses_hears_no_role_name() {
+        let push = push_host_with(|p| {
+            let (staff, matchers) = crate::testutil::staff_role();
+            p.roles.insert(staff, matchers);
+            let (analyst, matchers) = role_for("analyst", "someone-else@example.com");
+            p.roles.insert(analyst, matchers);
+        });
+        let who = node(62);
+        let r = fetch_refusal(&push, fetch_frames(who), who).await;
+        assert_eq!(r, crate::host::gate::INBOX_REFUSED);
+        assert!(!r.contains("analyst"), "{r}");
+    }
+
+    /// A push to a banned **person** is refused at send, from whichever
+    /// node the host last saw them on (traced `denied`, naming the
+    /// removal), and nothing is queued.
+    #[tokio::test]
+    async fn a_push_to_a_banned_person_is_denied_at_send() {
+        let (lines, _guard) = crate::host::call_trace::capture::lines();
+        let push = push_host_with(|p| {
+            let (analyst, matchers) = role_for("analyst", "caller@example.com");
+            p.roles.insert(analyst, matchers);
+            p.ban_person(library::Person::new(
+                crate::testutil::test_idp().issuer.clone(),
+                "caller@example.com",
+            ));
+        });
+        let laptop = node(63);
+        // Admitted on an earlier call, before the ban.
+        push.host.identities.record(laptop, &Ok(the_caller()));
+        let report = push
+            .send(PushSpec {
+                to: laptop.hex(),
+                subject: Subject::new("s").unwrap(),
+                body: PushBody::new("b").unwrap(),
+                ttl_secs: None,
+            })
+            .await
+            .unwrap();
+        let r = &report.results[0];
+        assert_eq!(r.outcome, PushOutcome::Denied, "{r:?}");
+        assert!(
+            r.reason.as_deref().unwrap_or_default().contains("removed"),
+            "{r:?}"
+        );
+        assert!(
+            push.queue
+                .lock()
+                .unwrap()
+                .pending(laptop, now_ms(), MAX_BATCH)
+                .is_empty()
+        );
+        assert_eq!(lines.matching("push denied").len(), 1, "{}", lines.text());
+    }
+
+    /// A banned person's fetch is refused with the fixed sentence and drops
+    /// what was queued for that node (each message traced `denied`).
+    #[tokio::test]
+    async fn a_banned_persons_fetch_drops_the_queue() {
+        let (lines, _guard) = crate::host::call_trace::capture::lines();
+        let push = push_host_with(|p| {
+            let (analyst, matchers) = role_for("analyst", "caller@example.com");
+            p.roles.insert(analyst, matchers);
+            p.ban_person(library::Person::new(
+                crate::testutil::test_idp().issuer.clone(),
+                "caller@example.com",
+            ));
+        });
+        let laptop = node(64);
+        let far = now_ms() + 60_000;
+        push.with_queue(|q| q.insert(entry(laptop, now_ms(), far), QUEUE_PER_RECIPIENT));
+        let r = fetch_refusal(&push, fetch_frames(laptop), laptop).await;
+        assert_eq!(r, crate::host::gate::NOT_ADMITTED);
+        assert!(
+            push.queue
+                .lock()
+                .unwrap()
+                .pending(laptop, now_ms(), MAX_BATCH)
+                .is_empty(),
+            "the banned person's queue is dropped"
+        );
+        assert_eq!(lines.matching("push denied").len(), 1, "{}", lines.text());
     }
 
     /// `frames` from `caller` to `push`'s fetch endpoint: the refusal.
@@ -1051,15 +1202,6 @@ mod tests {
     #[tokio::test]
     async fn a_fetch_without_a_valid_sign_in_or_from_a_banned_node_is_refused() {
         let push = push_host();
-        // The push host's policy trusts no issuer yet: give it the test IdP.
-        push.host
-            .identities
-            .set_trust(crate::host::identity::IdpTrust::per_issuer(vec![(
-                crate::testutil::test_idp().issuer.clone(),
-                vec![library::Audience::new(
-                    crate::caller::mock_idp::MOCK_CLIENT_ID,
-                )],
-            )]));
         for seed in 50..60u8 {
             let who = node(seed);
             let id_token = match seed {
@@ -1075,12 +1217,8 @@ mod tests {
             assert_eq!(r, crate::host::gate::NOT_ADMITTED, "{seed}");
         }
         assert!(
-            push.host
-                .identities
-                .nodes()
-                .iter()
-                .all(|n| (50..55u8).any(|s| node(s) == *n)),
-            "only genuine tokens leave an identity"
+            push.host.identities.nodes().is_empty(),
+            "only an admitted caller leaves an identity"
         );
     }
 

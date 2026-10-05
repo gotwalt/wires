@@ -24,7 +24,6 @@
 //! call and is the ground truth.
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
 use clap::Args;
 use library::{Audience, IdentityClaim, Issuer, NodeId, Principal, SignedEntry};
 use serde_json::Value;
@@ -68,11 +67,8 @@ pub(crate) async fn my_principal(ks: &Keystore, me: NodeId) -> Result<Option<Pri
 
 /// The `aud` claim of an unverified JWS (a string or an array of strings).
 fn unverified_audiences(jws: &str) -> Result<Vec<Audience>> {
-    let payload = jws.split('.').nth(1).context("the ID token is not a JWS")?;
-    let bytes = library::B64
-        .decode(payload.trim_end_matches('='))
-        .context("the ID token's payload is not base64url")?;
-    let json: Value = serde_json::from_slice(&bytes).context("the ID token's payload")?;
+    let json = crate::caller::hello::unverified_claims(jws)
+        .context("the ID token is not a JWS with a JSON payload")?;
     Ok(match json.get("aud") {
         Some(Value::String(a)) => vec![Audience::new(a.clone())],
         Some(Value::Array(a)) => a
@@ -86,7 +82,9 @@ fn unverified_audiences(jws: &str) -> Result<Vec<Audience>> {
 
 /// This node's view in `ks`, refreshed first when it is stale (or missing).
 /// A refresh that fails leaves the held view, with a note on stderr; with
-/// no view at all it is an error.
+/// no view at all it is an error. When a directory refused this node
+/// ([`view::NotAdmitted`]) it is an error saying what the person can act
+/// on, whatever is held: the listing would be one it can't use.
 pub(crate) async fn current_view(ks: &Keystore) -> Result<HeldView> {
     let node = keystore::node_identity_in(ks)?;
     let root = ks.network_root()?.context(crate::help::NOT_JOINED)?;
@@ -98,6 +96,9 @@ pub(crate) async fn current_view(ks: &Keystore) -> Result<HeldView> {
     }
     match view::refresh_now(ks, &node, root, None, false).await {
         Ok(fresh) => Ok(fresh),
+        Err(e) if e.downcast_ref::<view::NotAdmitted>().is_some() => Err(anyhow::anyhow!(
+            crate::caller::hello::explain_not_admitted_in(ks)
+        )),
         Err(e) => match held {
             Some(held) => {
                 eprintln!(
@@ -278,7 +279,7 @@ mod tests {
         let principal = Principal {
             issuer: crate::testutil::test_idp().issuer.as_str().into(),
             subject: "1".into(),
-            email: None,
+            email: Some("me@example.com".into()),
             org: None,
             groups: vec![],
             not_after: i64::MAX,
@@ -357,6 +358,7 @@ mod tests {
 
     #[test]
     fn audiences_come_from_the_token() {
+        use base64::Engine as _;
         let b64 = |v: &str| library::B64.encode(v);
         let one = format!("h.{}.s", b64(r#"{"aud":"client-1"}"#));
         assert_eq!(

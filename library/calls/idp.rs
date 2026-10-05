@@ -66,9 +66,24 @@ pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
 
 /// A raw OIDC ID token: a compact JWS (`header.payload.signature`), exactly as
 /// the IdP issued it. Opaque until verified.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+///
+/// It is a bearer credential, so its `Debug` never prints it (nor does the
+/// `Debug` of any frame or struct that holds one): only its length.
+///
+/// ```
+/// use library::IdToken;
+/// let t = IdToken::new("eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl");
+/// assert_eq!(format!("{t:?}"), "IdToken(<redacted, 34 bytes>)");
+/// ```
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct IdToken(String);
+
+impl fmt::Debug for IdToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "IdToken(<redacted, {} bytes>)", self.0.len())
+    }
+}
 
 impl IdToken {
     /// Wrap a compact-JWS string. No validation happens here — an `IdToken`

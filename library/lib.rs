@@ -21,7 +21,8 @@
 //! - [`identity`] — the Ed25519 [`NodeIdentity`], the [`NodeId`] / [`Signature`]
 //!   byte-newtypes, and the [`AlgorithmId`] every signed object carries.
 //! - [`admission`] — [`check_admitted`]: a caller verified by its IdP is
-//!   admitted unless the policy bans its node or its person.
+//!   admitted when its sign-in carries a verified email, the policy bans
+//!   neither its node nor its person, and a role matches it.
 //! - [`network`] — the [`Network`] string `wires join` and `wires login`
 //!   install: the root key, directories and [`LoginSettings`].
 //! - [`session`] — the [`Frame`] wire codec, opened by a [`Hello`] (the async
@@ -96,7 +97,8 @@
 //! let signed = s.sign(&root).unwrap();
 //!
 //! // A host verifies the caller's ID token (bound to the key iroh
-//! // authenticated), checks the bans, then the registry, against its
+//! // authenticated), admits it (a verified email, no ban, a role that
+//! // matches), then checks the registry, against its
 //! // verified copy.
 //! signed.verify(root.node_id()).unwrap();
 //! let policy = signed.to_policy().unwrap();

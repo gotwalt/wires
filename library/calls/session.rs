@@ -341,6 +341,20 @@ mod tests {
         ServiceName::new("orders-db").unwrap()
     }
 
+    proptest! {
+        /// No frame that carries an ID token prints it: `IdToken`'s `Debug`
+        /// is redacted, so a `{:?}` anywhere (a trace, a panic) can't leak
+        /// the bearer credential.
+        #[test]
+        fn debug_never_prints_the_id_token(jws in "[A-Za-z0-9_-]{16,64}\\.[A-Za-z0-9_-]{16,64}") {
+            let hello = Hello { state_version: StateVersion(3), id_token: IdToken::new(jws.clone()) };
+            let printed = format!("{hello:?} {:?} {:#?}", Frame::Hello(hello.clone()), hello);
+            prop_assert!(!printed.contains(&jws), "{}", printed);
+            prop_assert!(!printed.contains(jws.split('.').next().unwrap()), "{}", printed);
+            prop_assert!(printed.contains("redacted"), "{}", printed);
+        }
+    }
+
     /// A policy at `version` in which `hosts` implement `orders-db`.
     fn signed_with(
         root: &NodeIdentity,

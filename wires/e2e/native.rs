@@ -341,7 +341,7 @@ async fn a_refused_caller_never_reaches_the_handler() {
 
     assert_eq!(
         call(&w, &host, &w.bob, "count", &[], "").await,
-        Outcome::Denied("bob@example.com is in no role allowed to call count (analyst)".into())
+        Outcome::Denied("no service named `count` that you may call".into())
     );
     assert_eq!(
         reached.load(Ordering::SeqCst),

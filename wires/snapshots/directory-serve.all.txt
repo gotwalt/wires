@@ -6,7 +6,7 @@ Options:
       --relay-url <RELAY_URL>
           Use a self-hosted relay at this URL instead of the n0 default
       --max-subscribers <MAX_SUBSCRIBERS>
-          How many subscribers this directory follows at once (one more is refused) [default: 4096]
+          How many hosts and replicas may subscribe at once, and, apart, how many callers' views (one more is refused) [default: 4096]
   -h, --help
           Print help
       --help-all

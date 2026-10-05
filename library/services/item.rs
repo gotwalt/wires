@@ -210,8 +210,8 @@ pub enum Item {
         /// The banned node.
         key: NodeId,
     },
-    /// A removed person: refused by every host from any node, and cut an
-    /// empty view by every directory, until the admin restores them.
+    /// A removed person: refused by every host and every directory from any
+    /// node, until the admin restores them.
     PersonBan {
         /// The banned person.
         key: Person,

@@ -7,7 +7,8 @@
 //! token `wires login` stored: no token, no call). A name the view doesn't
 //! hold is asked of a directory (`resolve`) before the call fails; nothing
 //! is dialed from an expired view, and a view older than a day is refreshed
-//! first. When a host's `HelloAck` reports a newer head, it carries the
+//! first when a directory answers (with none answering, the call goes ahead
+//! from the view as it is). When a host's `HelloAck` reports a newer head, it carries the
 //! head and the service's entry, and the call stops there, **before** any
 //! stdin is sent, unless that entry still lists the host; the caller then
 //! refreshes its view after the call. On an unchanged fabric, within a day
@@ -291,7 +292,28 @@ impl WiresCaller {
 }
 
 impl Caller for WiresCaller {
+    /// A host's `NOT_ADMITTED` comes back as what this caller's person can
+    /// act on ([`explain_not_admitted`](crate::caller::hello::explain_not_admitted)).
     async fn call(&self, tool: &RemoteTool, argv: Argv, stdin: Vec<u8>) -> Result<CallOutcome> {
+        let outcome = self.call_as_is(tool, argv, stdin).await?;
+        Ok(match outcome {
+            CallOutcome::Denied(reason) => CallOutcome::Denied(match Keystore::resolve() {
+                Ok(ks) => crate::caller::hello::say_refusal(&ks, &reason),
+                Err(_) => reason,
+            }),
+            other => other,
+        })
+    }
+}
+
+impl WiresCaller {
+    /// [`Caller::call`], with the host's refusal as it said it.
+    async fn call_as_is(
+        &self,
+        tool: &RemoteTool,
+        argv: Argv,
+        stdin: Vec<u8>,
+    ) -> Result<CallOutcome> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         if tool.target == ToolTarget::Service {
@@ -348,50 +370,15 @@ pub(crate) fn outcome(
     }
 }
 
-/// This node's view, verified under its network root, required to exist and
-/// to be fresh: a caller never dials from an expired view (it would name
-/// hosts the admin may have since removed). A missing or expired view is
-/// refreshed from a directory first, and so is a stale one
-/// ([`HeldView::is_stale`]: older than a day, or a host reported a newer
-/// head), which bounds how long a host the admin removed can still be
-/// dialed from it; a stale view still fresh is used when no directory
-/// answers.
+/// This node's view to dial from ([`view::usable`]): never an expired one
+/// (it would name hosts the admin may have since removed); a missing or
+/// stale one ([`HeldView::is_stale`]) is refreshed from a directory first,
+/// and a stale one still unexpired is used when no directory answers. So a
+/// day bounds how long a host the admin removed can still be dialed only
+/// while a directory answers truthfully; the hard bound is the view's
+/// head's `not_after` (protocol §5).
 pub(crate) async fn usable_view(ks: &Keystore, creds: &Credentials) -> Result<HeldView> {
-    let now = crate::clock::now_unix();
-    let held =
-        view::read(ks, creds.fabric())?.filter(|held| held.view.head.check_fresh(now).is_ok());
-    if let Some(held) = &held
-        && !held.is_stale(now)
-    {
-        return Ok(held.clone());
-    }
-    let refreshed = view::refresh_now(ks, &creds.node, creds.root, creds.relay(), false).await;
-    match (refreshed, held) {
-        (Ok(refreshed), _) => {
-            check_fresh(&refreshed, now)?;
-            Ok(refreshed)
-        }
-        (Err(e), Some(held)) => {
-            tracing::debug!("refreshing a stale view: {e:#}; calling from it as it is");
-            Ok(held)
-        }
-        (Err(e), None) => Err(e.context(
-            "this node holds no current view of its services, and no directory gave it one: \
-             run `wires login` (or ask the admin to run `wires policy push`)",
-        )),
-    }
-}
-
-/// Refuse an expired view, saying what to do about it.
-fn check_fresh(held: &HeldView, now: i64) -> Result<()> {
-    if held.view.head.check_fresh(now).is_err() {
-        bail!(
-            "this node's view (policy version {}) has expired and no newer one could be \
-             fetched, so nothing was dialed; ask the admin to run `wires policy push`",
-            held.version().0
-        );
-    }
-    Ok(())
+    view::usable(ks, &creds.node, creds.root, creds.relay()).await
 }
 
 /// An alias may only pin a host that the view's entry for the alias's
@@ -1304,7 +1291,7 @@ mod tests {
         library::Principal {
             issuer: IDP.into(),
             subject: "1".into(),
-            email: None,
+            email: Some("me@example.com".into()),
             org: None,
             groups: vec![],
             not_after: i64::MAX,
@@ -1507,12 +1494,12 @@ mod tests {
             None,
             0,
         );
-        let err = format!("{:#}", check_fresh(&held, 10).unwrap_err());
+        let err = format!("{:#}", view::check_fresh(&held, 10).unwrap_err());
         assert!(
             err.contains("expired") && err.contains("wires policy push"),
             "{err}"
         );
-        assert!(check_fresh(&held, 1).is_ok());
+        assert!(view::check_fresh(&held, 1).is_ok());
     }
 
     /// Card 37 (was card 28 §8): the host's newer head and entry are checked
