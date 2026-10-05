@@ -85,6 +85,7 @@ Open cards only; finished cards are in [done/](done/).
 | [49](backlog/49-removed-host-window.md) | 2 | — | backlog, decided | **The removed-host window:** the host proves a current `Fresh` (from another directory) before the caller sends anything; fail closed; 15 min |
 | [45](backlog/45-trim-policy-sync.md) | 3 | 49 | backlog | One way to keep policy copies in step: no deltas, replicas or view subscriptions; `Fresh` and the beat stay for 49, `lenient`/`strict` go |
 | [08](doing/08-demo-two-machine.md) | last | all of the above | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent; re-record |
+| [50](backlog/50-example-services.md) | after 08 | 49, 45 | backlog, deferred | **Example services:** aws, gcp, cloudflare, vercel, gh and other CLIs behind today's popular MCP servers; federated (ID token → cloud role) and host-held patterns |
 | [29](backlog/29-person-identity.md) | — | — | backlog, not scheduled | **Person identity for headless agents:** `login --for`, day-passes |
 | [31](backlog/31-inbox-delivery.md) | — | — | designed, parked | **Inbox delivery:** callbacks go to the caller that asked; one delivery path |
 | [32](backlog/32-service-sandbox-OPEN.md) | — | — | open question | **Don't build:** run each service call in a rootless microVM |
