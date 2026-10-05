@@ -36,7 +36,9 @@ The image holds only `wires`: enough for a caller or the web gateway
 (`deploy/gateway/` runs it as `wires gateway`). A **host** image must also
 contain the binaries its `host.json` execs (`sqlite3`, `gh`, …): build your
 own image from the `Dockerfile`'s `build` stage output
-(`/usr/local/bin/wires`) plus those binaries.
+(`/usr/local/bin/wires`) plus those binaries, as
+[examples/services/Dockerfile](../examples/services/Dockerfile) does for
+each [example service](examples.md).
 
 ## Running a host
 

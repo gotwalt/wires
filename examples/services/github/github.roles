@@ -1,0 +1,3 @@
+# wires role -> the file holding that role's GitHub token (a Compose secret
+# in compose.yml). A role with no line is refused.
+analyst /run/secrets/analyst

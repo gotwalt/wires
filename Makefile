@@ -1,7 +1,7 @@
 # Dev loop over plain Cargo. `make help` lists the targets.
 SH := $(shell git ls-files '*.sh' .githooks/pre-commit)
 
-.PHONY: help build install test lint fmt fmt-check demo demo-push demo-examples python node demo-python demo-node image hooks
+.PHONY: help build install test lint fmt fmt-check demo demo-push demo-examples demo-examples-docker python node demo-python demo-node image hooks
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -27,6 +27,8 @@ demo-push: ## Run the self-asserting push demo (a host messages its caller back)
 	.scripts/demo-push.sh --quiet
 demo-examples: ## Run the example services' wrappers against stub CLIs (examples/services)
 	.scripts/demo-example-services.sh --quiet
+demo-examples-docker: ## Build two example images with stub CLIs; check them as containers (needs Docker)
+	.scripts/demo-example-services-docker.sh --quiet
 python: ## Build the Python bindings into target/python (card 33)
 	.scripts/build-python.sh
 node: ## Build the Node/TypeScript package into target/node/wires (card 33)

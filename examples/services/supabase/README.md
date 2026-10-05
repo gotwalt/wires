@@ -1,8 +1,8 @@
 # supabase: the Supabase CLI, with one access token per role that the host holds
 
 Pattern B ([docs/examples.md](../../../docs/examples.md)): the host holds one
-Supabase access token per wires role, in a file only `serve`'s user can
-read. The signed policy decides who may call `supabase`; the host's log
+Supabase access token per wires role, in a file only its container
+mounts. The signed policy decides who may call `supabase`; the host's log
 line names the person; removing someone is `wires remove`, with no token to
 rotate.
 
@@ -16,15 +16,26 @@ that is a member of only the organization the role needs.
 
 ## Once, on the host
 
+The host runs this example as a container: `wires serve` and `supabase`
+(the CLI's Linux release archive from GitHub,
+[../Dockerfile](../Dockerfile)) as the unprivileged user `wires`, with no
+port published, since wires dials out. From this directory:
+
 ```bash
-sudo cp -R examples/services /opt/wires-examples/
-sudo install -d -o wires -m 700 /etc/wires-examples/supabase /var/lib/wires-examples/supabase
-sudo -u wires sh -c 'umask 077; cat >/etc/wires-examples/supabase/analyst.token'   # paste, then Ctrl-D
-printf 'analyst /etc/wires-examples/supabase/analyst.token\n' | sudo tee /etc/wires-examples/supabase.roles
+(cd ../../.. && make image)        # once per host: the image the examples copy wires from
+install -d -m 700 secrets          # only you can open it
+cat >secrets/analyst.token         # paste the analyst's token, then Ctrl-D
+docker compose build
+docker compose run --rm supabase join <network>   # the admin's `wires network`; prints the node id
+docker compose run --rm supabase serve --check /etc/wires-examples/host.json
+docker compose up -d               # once the admin has added the service (below)
 ```
 
-Merge [host.json](host.json)'s `supabase` entry into the host's
-`host.json`. `supabase` must be on `serve`'s `PATH`. The wrapper reads the
+The token reaches the container as the Compose secret
+`/run/secrets/analyst`, which [supabase.roles](supabase.roles) gives to the
+role `analyst`; another role is a line there and a secret in
+[compose.yml](compose.yml). [host.json](host.json) and `supabase.roles` are
+mounted read-only, and `HOME` is a tmpfs. The wrapper reads the
 caller's role's file into `SUPABASE_ACCESS_TOKEN` and execs it. Its
 default allowlist is by pairs, `projects:list functions:list`, because
 `projects` alone would allow `projects delete`.

@@ -40,17 +40,25 @@ own way; this example doesn't cover them.
 
 ## Once, on the host
 
+The host runs this example as a container: `wires serve` and `kubectl`
+(the release binary, checked against its SHA-256,
+[../Dockerfile](../Dockerfile)) as the unprivileged user `wires`, with no
+port published, since wires dials out. From this directory:
+
 ```bash
-sudo cp -R examples/services /opt/wires-examples/
-sudo install -d -o wires -m 700 /var/lib/wires-examples/k8s
-printf 'analyst analytics\nsre default\n' | sudo tee /etc/wires-examples/k8s.roles
-sudo cp cluster-ca.crt /etc/wires-examples/k8s-ca.crt
+(cd ../../.. && make image)        # once per host: the image the examples copy wires from
+cp cluster-ca.crt k8s-ca.crt       # the API server's CA certificate
+$EDITOR k8s.roles host.json        # namespaces; K8S_SERVER
+docker compose build
+docker compose run --rm k8s join <network>   # the admin's `wires network`; prints the node id
+docker compose run --rm k8s serve --check /etc/wires-examples/host.json
+docker compose up -d               # once the admin has added the service (below)
 ```
 
-The role map gives each wires role a default namespace: a convenience, not
-a boundary, since `--namespace` overrides it and RBAC decides. Merge
-[host.json](host.json)'s `k8s` entry into the host's `host.json`
-(`K8S_SERVER`, `K8S_CA_FILE`). `kubectl` must be on `serve`'s `PATH`. The
+There is no secret to install. [k8s.roles](k8s.roles) gives each wires
+role a default namespace: a convenience, not a boundary, since
+`--namespace` overrides it and RBAC decides. It, [host.json](host.json)
+and the CA certificate are mounted read-only; `STATE_DIR` is a tmpfs. The
 wrapper writes a kubeconfig for the call whose `tokenFile` is the call's
 token file, which keeps the token out of `kubectl`'s argv. Its default
 subcommands are `get describe logs top events explain api-resources auth

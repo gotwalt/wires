@@ -1,0 +1,49 @@
+# The `aws` example as a container: `wires serve` and the AWS CLI, as the
+# unprivileged user `wires`. See README.md.
+#
+#   (cd ../../.. && make image)                 # once: the wires image (wires:dev)
+#   docker compose build
+#   docker compose run --rm aws join <network>  # the admin's `wires network`
+#   docker compose run --rm aws serve --check /etc/wires-examples/host.json
+#   docker compose up -d
+#
+# No AWS credential and no secret: each call brings the caller's ID token.
+# No port is published: wires dials out.
+name: wires-example-aws
+
+services:
+  aws:
+    build:
+      context: ..
+      target: aws
+      args:
+        WIRES_IMAGE: ${WIRES_IMAGE:-wires:dev}
+    image: wires-example:aws
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      RUST_LOG: ${RUST_LOG:-warn,wires=info}
+    configs:
+      - source: host-json
+        target: /etc/wires-examples/host.json
+      - source: roles
+        target: /etc/wires-examples/aws.roles
+    tmpfs:
+      - /tmp
+      # STATE_DIR (host.json): each call's token file, in memory only.
+      - /var/lib/wires-examples/aws:uid=10001,gid=10001,mode=0700
+    volumes:
+      # The node key and the signed policy: must persist.
+      - keystore:/data
+    restart: unless-stopped
+
+configs:
+  host-json:
+    file: ./host.json
+  roles:
+    file: ./aws.roles
+
+volumes:
+  keystore:

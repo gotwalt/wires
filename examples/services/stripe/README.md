@@ -1,8 +1,8 @@
 # stripe: the Stripe CLI, with one restricted key per role that the host holds
 
 Pattern B ([docs/examples.md](../../../docs/examples.md)): the host holds one
-Stripe restricted key per wires role, in a file only `serve`'s user can
-read. The signed policy decides who may call `stripe`; the host's log line
+Stripe restricted key per wires role, in a file only its container
+mounts. The signed policy decides who may call `stripe`; the host's log line
 names the person; removing someone is `wires remove`, with no key to
 rotate.
 
@@ -17,15 +17,26 @@ Start in test mode.
 
 ## Once, on the host
 
+The host runs this example as a container: `wires serve` and `stripe`
+(Stripe's apt repository, [../Dockerfile](../Dockerfile)) as the
+unprivileged user `wires`, with no port published, since wires dials out.
+From this directory:
+
 ```bash
-sudo cp -R examples/services /opt/wires-examples/
-sudo install -d -o wires -m 700 /etc/wires-examples/stripe /var/lib/wires-examples/stripe
-sudo -u wires sh -c 'umask 077; cat >/etc/wires-examples/stripe/analyst.token'   # paste, then Ctrl-D
-printf 'analyst /etc/wires-examples/stripe/analyst.token\n' | sudo tee /etc/wires-examples/stripe.roles
+(cd ../../.. && make image)        # once per host: the image the examples copy wires from
+install -d -m 700 secrets          # only you can open it
+cat >secrets/analyst.token         # paste the analyst's restricted key, then Ctrl-D
+docker compose build
+docker compose run --rm stripe join <network>   # the admin's `wires network`; prints the node id
+docker compose run --rm stripe serve --check /etc/wires-examples/host.json
+docker compose up -d               # once the admin has added the service (below)
 ```
 
-Merge [host.json](host.json)'s `stripe` entry into the host's `host.json`.
-`stripe` must be on `serve`'s `PATH`. The wrapper reads the caller's role's
+The key reaches the container as the Compose secret
+`/run/secrets/analyst`, which [stripe.roles](stripe.roles) gives to the
+role `analyst`; another role is a line there and a secret in
+[compose.yml](compose.yml). [host.json](host.json) and `stripe.roles` are
+mounted read-only, and `HOME` is a tmpfs. The wrapper reads the caller's role's
 file into `STRIPE_API_KEY`, sets `STRIPE_DEVICE_NAME` to
 `wires:<caller's email>` (Stripe shows the device name in the Dashboard),
 and execs it. Its default allowlist is by pairs, reads only

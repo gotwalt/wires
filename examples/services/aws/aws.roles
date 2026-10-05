@@ -1,0 +1,3 @@
+# wires role -> the IAM role it assumes. A role with no line is refused.
+analyst arn:aws:iam::123456789012:role/wires-readonly
+sre arn:aws:iam::123456789012:role/wires-operator

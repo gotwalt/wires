@@ -221,3 +221,49 @@ edited, for the docs pass: `CLAUDE.md` (Build System's command list and the
 `.scripts/` / layout paragraphs could name `make demo-examples`,
 `.scripts/demo-example-services.sh`, `.scripts/fixtures/stub-cli.sh` and
 top-level `examples/services/`), `docs/testing.md` (the demo list).
+
+**Containers, 2026-10-05.** Branch `worker/50b-examples-in-containers`. The
+human: "update the examples/ to not use sudo unless absolutely necessary
+… operate as dockerized services". No `sudo` is left in `examples/`,
+`docs/examples.md` or the scripts; no Rust changed.
+- **Shape.** One `examples/services/Dockerfile`: a `base` stage
+  (`debian:bookworm-slim`, the repo image's Debian, user `wires` uid 10001,
+  `/data` owned by it, `common.sh`, `wires` copied from `WIRES_IMAGE`,
+  default `wires:dev` from `make image`, so wires isn't rebuilt), a
+  `base-node` stage (node and npm copied from `node:24-bookworm-slim`), one
+  target per example installing the vendor's CLI the vendor's documented
+  way (cited at each stage), and a `stub` target for the test. Each
+  example's `compose.yml` (modelled on `deploy/gateway/`): `wires serve
+  /etc/wires-examples/host.json` as the process, `init`, `read_only`,
+  `cap_drop: ALL`, `no-new-privileges`, the keystore as a named volume at
+  `/data`, `host.json`, the role map (now a committed `<name>.roles`) and
+  the k8s CA as Compose `configs:`, `STATE_DIR` / `HOME` as tmpfs owned by
+  10001, no ports. `host.json` and the wrappers are unchanged, so the
+  hermetic demo is too.
+- **Secrets.** Pattern B credentials are Compose `secrets:` at
+  `/run/secrets/<role>`. Docker Compose 5.1 ignores a file secret's
+  `uid`/`mode` outside Swarm (it warns), so the file keeps its host mode:
+  the READMEs have the operator write it `0644` inside a `0700` `secrets/`
+  directory (git-ignored). A `0600` file is unreadable to uid 10001.
+- **The one root left:** running Docker itself (the `docker` group is
+  root-equivalent; rootless Docker or Podman avoids it). Said once in
+  `docs/examples.md` § Limits, with what the container isolates (host
+  files, processes, other examples) and what it doesn't (one user inside:
+  a call can read the keystore, every role's secret in that container, and
+  other calls' environments; separate containers per role if that
+  matters).
+- **Tests.** `make demo-examples` unchanged. New opt-in `make
+  demo-examples-docker` (`.scripts/demo-example-services-docker.sh`, ~10 s
+  warm): validates all eight compose files; builds `github` and `aws`
+  with the stub CLI via their own compose files plus an override; checks
+  `serve --check`, uid 10001 on a read-only root, the node id surviving in
+  the volume, the wrapper as a call (secret read for github, tmpfs token
+  file for aws, a refused subcommand at 77); removes everything
+  `wires-example-test-*` it made. Every real target was also built once
+  and its CLI run as uid 10001 (aws-cli 2.37.9, gcloud 587.0.0, kubectl
+  v1.37.1, gh 2.102.0, wrangler 4.147.0, vercel 62.4.0, supabase 2.119.0,
+  stripe 1.53.0); wrangler, vercel and gcloud also ran on a read-only root
+  with a tmpfs HOME. No live account.
+- Hadolint clean (DL3008/DL3016 ignored globally: apt/npm left unpinned so
+  a rebuild takes the vendor's current release; DL3022 at the stub's named
+  build context).
