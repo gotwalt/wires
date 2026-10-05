@@ -1,4 +1,4 @@
-Register services: add, set, rm (who may call and read, which hosts)
+Register services: add, set, rm (who may call them, which hosts run them)
 
 Usage: wires service <COMMAND>
 

@@ -280,7 +280,7 @@ fn consent(urls: &PublicUrls, client: &Client, redirect: &Url, id: &str) -> Resp
     let body = format!(
         "<p><strong>{}</strong>{} wants to run wires services as you.</p>\
          <p>You'll sign in with Google. Each call then runs on the machine that hosts the \
-         service, which checks your identity against the admin-signed list of who may call \
+         service, which checks your identity against the admin-signed policy of who may call \
          what. Access ends when your sign-in expires (about an hour).</p>\
          <p class=\"dim\">Sign-in returns to {}</p>\
          <form method=\"post\" action=\"/authorize/confirm\">\

@@ -31,7 +31,7 @@ use super::{Report, run_edit};
 /// `remove` and `restore` arguments.
 #[derive(Args)]
 pub(crate) struct WhoArgs {
-    /// A person's email, or a node's label or id (`label=<node id>` names it)
+    /// A person's email, or a node's label or id
     pub(crate) who: String,
     /// The IdP that verifies the email: its exact `iss` (default: the one
     /// the network string names).

@@ -7,8 +7,8 @@
 //! - **admin** (`admin/`) — holds the root key and signs the policy: which
 //!   IdPs are trusted, which roles exist, which services run where and who
 //!   may call them, who is removed, which nodes are directories. It mints
-//!   nothing for any node: a caller is admitted by its IdP sign-in, a host
-//!   or directory by the policy naming its key.
+//!   nothing for any node: a caller is admitted by its IdP sign-in when a
+//!   role matches it, a host or directory by the policy naming its key.
 //! - **directory** (`directory/`) — holds the newest policy and vouches for
 //!   its freshness; hosts fetch it whole, and each caller its view (the
 //!   services it may use, card 37). It never decides a call (card 36).
@@ -31,9 +31,9 @@
 //! TypeScript bindings (`bindings/`) are built on the same API, sharing a
 //! call's stdio through [`SharedIo`].
 //!
-//! Secrets resolve through flag → env → `--…-file` → on-disk
-//! keystore (`admin/keystore.rs`), so once the admin's credentials are
-//! installed, `wires call <service>` and `wires mcp` need no other flags — which
+//! The node key resolves through flag → env → `--node-seed-file` → on-disk
+//! keystore (`admin/keystore.rs`), so once `wires login <network>` has run,
+//! `wires call <service>` and `wires mcp` need no other flags — which
 //! is what lets `wires mcp` drop straight into an MCP client's config as
 //! `"command": "wires"`.
 //!
@@ -116,7 +116,7 @@ enum Command {
     /// Lift a removal of a person or a node
     #[command(after_help = help::RESTORE_AFTER)]
     Restore(admin::remove::WhoArgs),
-    /// Register services: add, set, rm (who may call and read, which hosts)
+    /// Register services: add, set, rm (who may call them, which hosts run them)
     #[command(after_help = help::SERVICE_AFTER)]
     Service(admin::service::ServiceArgs),
     /// Define roles from IdP identities: set, rm
@@ -136,7 +136,7 @@ enum Command {
     /// Run host.json's services: check every caller, run the call, log it
     #[command(after_help = help::SERVE_AFTER)]
     Serve(host::serve::ServeArgs),
-    /// Send a caller a message by node id or role, to its inbox (logged)
+    /// Send a caller a message by node id or role, to its inbox
     #[command(after_help = help::PUSH_AFTER)]
     Push(host::push::PushArgs),
 
@@ -205,7 +205,7 @@ async fn dev_mock_idp_cmd(a: DevMockIdpArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Exit code for an authorization refusal by the responder (sysexits
+/// Exit code for an authorization refusal by the host (sysexits
 /// `EX_NOPERM`), distinct from 1 = local/transport failure. An agent running
 /// `wires call` can tell "you are not allowed" apart from "the network is
 /// down" without parsing text.
@@ -406,10 +406,10 @@ fn print_report(result: anyhow::Result<admin::Report>) {
 
 /// Report a network-command failure and exit.
 ///
-/// An authorization refusal is its own outcome: print the responder's own
+/// An authorization refusal is its own outcome: print the host's own
 /// words and exit [`EXIT_DENIED`], not the generic 1. The downcast walks
-/// anyhow's context chain, so a `Denied` wrapped in "peer X refused this node's
-/// admission" still lands here.
+/// anyhow's context chain, so a `Denied` wrapped in "calling orders-db"
+/// still lands here.
 fn exit_with(e: anyhow::Error) -> ! {
     if let Some(d) = e.downcast_ref::<host::transport::Denied>() {
         // A signed-in caller says what its person can act on, not just
@@ -442,15 +442,11 @@ fn set_verbose(on: bool) {
 mod tests {
     use super::*;
 
-    /// Card 14's onboarding commands parse as documented.
+    /// The first-run and admin commands parse as documented.
     #[test]
     fn onboarding_commands_parse() {
         let id = "ab".repeat(32);
         assert!(Cli::try_parse_from(["wires", "init"]).is_ok());
-        // Card 41: the admin mints nothing for a node, so `init` takes no
-        // lifetime for one, and there is nothing to hand out.
-        assert!(Cli::try_parse_from(["wires", "init", "--ttl", "7d"]).is_err());
-        assert!(Cli::try_parse_from(["wires", "invite", &id]).is_err());
         assert!(Cli::try_parse_from(["wires", "network"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "remove", "alice@example.com"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "remove", "workbench"]).is_ok());
@@ -461,11 +457,9 @@ mod tests {
         assert!(Cli::try_parse_from(["wires", "remove"]).is_err());
         assert!(Cli::try_parse_from(["wires", "init", "--policy-ttl", "7d"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "remove", "alice", "--policy-ttl", "7d"]).is_ok());
-        assert!(Cli::try_parse_from(["wires", "remove", "alice", "--ttl", "7d"]).is_err());
         assert!(
             Cli::try_parse_from(["wires", "service", "rm", "db", "--policy-ttl", "7d"]).is_ok()
         );
-        assert!(Cli::try_parse_from(["wires", "service", "rm", "db", "--ttl", "7d"]).is_err());
         assert!(Cli::try_parse_from(["wires", "policy", "push"]).is_ok());
         assert!(
             Cli::try_parse_from(["wires", "init", "--issuer", "https://i", "--client-id", "c"])

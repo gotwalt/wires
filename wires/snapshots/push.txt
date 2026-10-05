@@ -1,4 +1,4 @@
-Send a caller a message by node id or role, to its inbox (logged)
+Send a caller a message by node id or role, to its inbox
 
 Usage: wires push [OPTIONS] --to <TO> --subject <SUBJECT> [BODY]...
 

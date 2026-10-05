@@ -22,7 +22,7 @@ pub const PREMISE: &str = "\
 wires is a network for authenticated remote CLI calls. Each service is a
 command-line program on another machine, run by its name, never by host or
 address. Every call runs as you: the machine that runs it checks your
-sign-in against an admin-signed list of who may call what. A refusal
+sign-in against an admin-signed policy of who may call what. A refusal
 (\"denied by host\", exit 77) is that policy, not a fault: don't retry or work
 around it; ask your admin for access.";
 
