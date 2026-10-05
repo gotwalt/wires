@@ -158,7 +158,7 @@ impl HostBuilder {
         self
     }
 
-    /// Let the host push to the members of `roles` (from the signed policy),
+    /// Let the host push to callers in `roles` (from the signed policy),
     /// tried in order, as `host.json`'s `push.allow` does: what a native
     /// service's [`Call::push_to_caller`](crate::Call::push_to_caller) needs.
     pub fn push_allow<R: Into<String>>(mut self, roles: impl IntoIterator<Item = R>) -> Self {

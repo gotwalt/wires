@@ -373,8 +373,10 @@ impl ControlClient {
 
     /// Connect to the child socket at `path` (`WIRES_PUSH_SOCKET`, handed to
     /// this process by the `serve` that spawned it, so its directory's owner
-    /// is not second-guessed: a service may run as another user). `Ok(None)`
-    /// as for [`connect`](Self::connect).
+    /// is not second-guessed). That directory is `0700` and `serve`'s user's,
+    /// so only a child running as that user can reach it: a service run as
+    /// another user can't push (protocol.md §9). `Ok(None)` as for
+    /// [`connect`](Self::connect).
     pub async fn connect_child(path: &Path) -> Result<Option<Self>> {
         match UnixStream::connect(path).await {
             Ok(stream) => {
