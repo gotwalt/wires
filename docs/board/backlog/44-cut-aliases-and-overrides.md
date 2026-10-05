@@ -1,6 +1,6 @@
 # 44 — Cut `tools.json` aliases and the caller's credential-override flags
 
-**Depends on:** [41](../done/41-idp-membership.md) · **Status:** backlog, not scheduled (drafted from the 2026-10-04 review; the human hasn't decided) · **Files:** `wires/caller/{tools,call,mcp,lock,inbox}.rs`, `wires/gateway/`, `wires/lib.rs`, `wires/help.rs`, `wires/snapshots/`, `docs/agent-sandbox.md`, `bench/permission-probe.py`
+**Depends on:** [41](../done/41-idp-membership.md) · **Status:** backlog; scheduled (the human, 2026-10-05) · **Files:** `wires/caller/{tools,call,mcp,lock,inbox}.rs`, `wires/gateway/`, `wires/lib.rs`, `wires/help.rs`, `wires/snapshots/`, `docs/agent-sandbox.md`, `bench/permission-probe.py`
 
 ## Why
 
@@ -31,5 +31,17 @@ exists largely to refuse them.
 About 1.5–2k lines. **Open:** whether anyone relies on `--relay-url` per
 command for a self-hosted relay ([deployment.md](../../deployment.md)); it
 may belong in the keystore or the network string instead.
+
+## Since this was drafted (cards 41, 43 and 47)
+
+- `--membership[-file]` and `WIRES_MEMBERSHIP` went with badges; locked mode now refuses four
+  flags and stdin.
+- `tools.json` is written 0600 like every keystore file (it was created at the umask, which let a
+  group member switch off `"locked"`).
+- `wires mcp` warns `shadowed by the service of that name in your view` when an alias loses to a
+  service.
+- The `RemoteTool` / `ToolTarget` / `remote_tool` rename was left for this card.
+- `docs/agent-sandbox.md` still tabulates an old permission probe, minus the removed rows; redo or
+  drop the table when the flags go.
 
 ## Notes

@@ -82,16 +82,25 @@ Open cards only; finished cards are in [done/](done/).
 
 | Card | Stage | Depends on | Status | Summary |
 |---|---|---|---|---|
-| [08](doing/08-demo-two-machine.md) | — | — | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent; re-record |
-| [44](backlog/44-cut-aliases-and-overrides.md) | — | 41 | backlog, not scheduled | Cut `tools.json` aliases and the caller's credential-override flags; shrink locked mode |
-| [45](backlog/45-trim-policy-sync.md) | — | 41 | backlog, not scheduled | One way to keep policy copies in step: no deltas, freshness beats, replicas or view subscriptions |
-| [46](backlog/46-spread-calls-across-hosts.md) | — | — | backlog, not scheduled | Spread calls across a service's hosts, so more hosts means more capacity |
-| [29](backlog/29-person-identity.md) | — | 41 | backlog | **Person identity for headless agents:** `login --for`, day-passes |
-| [31](backlog/31-inbox-delivery.md) | — | 41 | designed, parked | **Inbox delivery:** callbacks go to the caller that asked; one delivery path |
+| [44](backlog/44-cut-aliases-and-overrides.md) | 1 | — | backlog | Cut `tools.json` aliases and the caller's credential-override flags; shrink locked mode |
+| [46](backlog/46-spread-calls-across-hosts.md) | 1 | — | backlog | Spread calls across a service's hosts, so more hosts means more capacity |
+| [48](backlog/48-publish-misses-a-restarted-directory.md) | 1 | — | backlog | **Find the cause:** an edit right after a directory restarts reached 1 of 2 directories |
+| [49](backlog/49-removed-host-window.md) | 2 | — | backlog, design first | **The removed-host window:** a machine taken off a service can be dialed from stale views for up to 90 days |
+| [45](backlog/45-trim-policy-sync.md) | 3 | 49 | backlog | One way to keep policy copies in step: no deltas, freshness beats, replicas or view subscriptions (49 may need `Fresh`) |
+| [08](doing/08-demo-two-machine.md) | last | all of the above | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent; re-record |
+| [29](backlog/29-person-identity.md) | — | — | backlog, not scheduled | **Person identity for headless agents:** `login --for`, day-passes |
+| [31](backlog/31-inbox-delivery.md) | — | — | designed, parked | **Inbox delivery:** callbacks go to the caller that asked; one delivery path |
 | [32](backlog/32-service-sandbox-OPEN.md) | — | — | open question | **Don't build:** run each service call in a rootless microVM |
-| [18](backlog/18-front-door-OPEN.md) | — | 41 | open question | **Don't build:** `wires login <domain>`, the network string published under a domain |
+| [18](backlog/18-front-door-OPEN.md) | — | — | open question | **Don't build:** `wires login <domain>`, the network string published under a domain |
 
-**Order:** 08 (re-record the demo). 44–46 are drafted, not scheduled; 39–43 and 47 are done.
+**Order** (the human, 2026-10-05): 44, 46 and 48 can run side by side; then
+think 49 through and decide it with 45 (45 deletes `Fresh`, which 49's
+strongest option needs); then `CLAUDE.md` (its goal sentence still says "a
+sharp demo for the MCP team", and MCP is now a bridge: the human's wording);
+then 08, the demo, last. **Skipped for now:** re-running the benchmarks
+(not run on this code; their setup signs in once and a Google sign-in lasts
+an hour). What else the last pass left open is in
+[card 43](done/43-accuracy-sweep.md)'s Notes. 39–43 and 47 are done.
 
 ## Rules for workers
 

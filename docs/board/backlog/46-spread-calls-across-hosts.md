@@ -1,6 +1,6 @@
 # 46 — Spread calls across a service's hosts
 
-**Depends on:** — · **Status:** backlog, not scheduled (drafted from the 2026-10-04/05 review; the human hasn't decided) · **Files:** `wires/caller/pick.rs`, `wires/caller/call.rs`, `docs/usage.md`
+**Depends on:** — · **Status:** backlog; scheduled (the human, 2026-10-05) · **Files:** `wires/caller/pick.rs`, `wires/caller/call.rs`, `docs/usage.md`
 
 ## Why
 

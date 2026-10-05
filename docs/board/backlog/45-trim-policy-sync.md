@@ -1,6 +1,6 @@
 # 45 — One way to keep policy copies in step
 
-**Depends on:** [41](../done/41-idp-membership.md) · **Status:** backlog, not scheduled (drafted from the 2026-10-04 review; the human hasn't decided) · **Files:** `library/services/{policy_update,fresh,item,view}.rs`, `library/directory/frames.rs`, `wires/directory/`, `wires/policy/`, `wires/host/{follow,freshness,gate}.rs`, `wires/caller/view.rs`, `wires/admin/settings.rs`
+**Depends on:** [41](../done/41-idp-membership.md) · **Status:** backlog; scheduled (the human, 2026-10-05), **after [card 49](49-removed-host-window.md) is thought through** · **Files:** `library/services/{policy_update,fresh,item,view}.rs`, `library/directory/frames.rs`, `wires/directory/`, `wires/policy/`, `wires/host/{follow,freshness,gate}.rs`, `wires/caller/view.rs`, `wires/admin/settings.rs`
 
 ## Why
 
@@ -31,5 +31,19 @@ thing.
 Together about 2.25k non-test lines and five concepts (delta, digest,
 `Fresh`, replica, view subscription), with removal as prompt as it is today
 under the default setting.
+
+## Since this was drafted (cards 41, 43 and 47)
+
+- **Read [card 49](49-removed-host-window.md) first.** Its strongest option makes `Fresh` decide
+  something (a host proving it is current before a caller tells it anything), and item 2 below
+  deletes `Fresh`. Decide the two together.
+- Already gone: `directory.redb`'s `current` table and its stored `Fresh` (a beat writes nothing
+  to disk now).
+- New since: callers' view subscriptions have their own pool and a cap of 16 per person, and end
+  at the token's expiry (card 47); a replica subscription has a silence timeout (card 43). Item 3
+  below would delete both mechanisms.
+- A host that is also a directory used to resync when its follow loop saw an update it already
+  held; fixed in card 43 (`Follower::take` skips it). One fewer reason the delta path misfires.
+- The ALPNs are `wires/directory/2` and `wires/directory-sub/2`.
 
 ## Notes
