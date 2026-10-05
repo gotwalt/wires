@@ -52,7 +52,10 @@ const COLD_FETCH_BUDGET: Duration = Duration::from_secs(8);
 /// restarted can't be found by its key until its new address is known: n0
 /// discovery has no record for it for about 3 s after it starts, and a
 /// stale address hint costs a whole [`DIAL_TIMEOUT`](crate::directory::wire::DIAL_TIMEOUT)
-/// before the next try looks it up again (card 48).
+/// before the next try looks it up again (card 48). No try starts after it;
+/// one started finishes, so a publish takes at most this plus one exchange
+/// (a [`DIAL_TIMEOUT`](crate::directory::wire::DIAL_TIMEOUT) and a
+/// [`FRAME_TIMEOUT`](crate::directory::wire::FRAME_TIMEOUT)): 30 s.
 pub(crate) const PUBLISH_BUDGET: Duration = Duration::from_secs(15);
 
 /// The pause between two tries at the directories a publish missed.
@@ -80,8 +83,12 @@ pub(crate) struct PublishReport {
     /// Directories that couldn't be reached or refused it.
     pub(crate) missed: Vec<NodeId>,
     /// Of [`missed`](Self::missed), those that answered with a refusal: a
-    /// decision, not tried again.
+    /// decision, not tried again (a busy directory's answer is not one).
     pub(crate) refused: Vec<NodeId>,
+    /// The targets the published head no longer lists (this edit dropped
+    /// them): published to once, so one that is up learns it, never tried
+    /// again, and a miss there is no failure and catches up from nobody.
+    pub(crate) dropped: Vec<NodeId>,
     /// Directories holding a policy newer than the published one, or
     /// another at its version, with that version: the publisher's copy is
     /// stale, and its edit was not taken.
@@ -104,23 +111,37 @@ impl PublishReport {
             version.0,
             self.delivered.len()
         );
-        if !self.missed.is_empty() {
-            let short = |n: &NodeId| format!("{}…", n.short());
+        let short = |n: &NodeId| format!("{}…", n.short());
+        let gone: Vec<String> = self
+            .missed
+            .iter()
+            .filter(|n| self.dropped.contains(n))
+            .map(short)
+            .collect();
+        if !gone.is_empty() {
+            out.push_str(&format!(
+                "; not reached, and dropped by this edit: {}",
+                gone.join(", ")
+            ));
+        }
+        if self.missed_listed() {
+            let listed = |n: &&NodeId| !self.dropped.contains(n);
             let unreachable: Vec<String> = self
                 .missed
                 .iter()
+                .filter(listed)
                 .filter(|n| !self.refused.contains(n))
                 .map(short)
                 .collect();
-            let refused: Vec<String> = self.refused.iter().map(short).collect();
+            let refused: Vec<String> = self.refused.iter().filter(listed).map(short).collect();
             if !unreachable.is_empty() {
                 out.push_str(&format!("; not reached: {}", unreachable.join(", ")));
             }
             if !refused.is_empty() {
                 out.push_str(&format!("; refused by: {}", refused.join(", ")));
             }
-            // A directory that took it hands it on: every directory follows
-            // the others (a replica subscription).
+            // A directory that took it hands it on: every directory the
+            // head lists follows the others (a replica subscription).
             if !self.delivered.is_empty() {
                 out.push_str(&format!(
                     "; until it has version {}, hosts that follow it decide under the policy \
@@ -148,7 +169,12 @@ impl PublishReport {
     /// Whether there were directories to reach and not one took the
     /// policy: it is in force nowhere but here.
     pub(crate) fn reached_none(&self) -> bool {
-        self.delivered.is_empty() && !self.missed.is_empty()
+        self.delivered.is_empty() && self.missed_listed()
+    }
+
+    /// Whether it missed a directory the published head lists.
+    fn missed_listed(&self) -> bool {
+        self.missed.iter().any(|d| !self.dropped.contains(d))
     }
 }
 
@@ -160,7 +186,7 @@ impl PublishReport {
 enum Took {
     /// It holds the published policy.
     Delivered,
-    /// Unreachable.
+    /// Unreachable, or busy.
     Missed,
     /// It answered, refusing it.
     Refused,
@@ -201,6 +227,13 @@ pub(crate) async fn publish_all(
                         Took::Newer(version)
                     }
                 }
+                // Busy is no decision: its slots were full; try again.
+                Ok(DirectoryAnswer::Denied { reason })
+                    if reason == crate::directory::node::BUSY =>
+                {
+                    tracing::debug!(directory = %target.hex(), "publish: the directory is busy");
+                    Took::Missed
+                }
                 Ok(DirectoryAnswer::Denied { reason }) => {
                     tracing::warn!(directory = %target.hex(), "publish refused: {reason}");
                     Took::Refused
@@ -235,12 +268,15 @@ pub(crate) async fn publish_all(
     Ok(report)
 }
 
-/// [`publish_all`], then the directories it missed for want of a dial
-/// (not those that refused) and `patient` names, again and again, a
-/// [`RETRY_PAUSE`] apart, until each took it or `budget` (from the first
-/// try) is spent: a directory just restarted is not findable by its key for
-/// a few seconds, and every new dial looks its key up again. The report
-/// holds each directory's last outcome.
+/// [`publish_all`], then the directories it missed for want of a dial or
+/// because they were busy (not those that refused) and `patient` names,
+/// again and again, a [`RETRY_PAUSE`] apart, until each took it or `budget`
+/// (from the first try) is spent: a directory just restarted is not
+/// findable by its key for a few seconds, and every new dial looks its key
+/// up again. No round starts after the budget, and a round started is let
+/// finish (each exchange ends within 15 s, [`publish`]), so an answer on
+/// its way is never dropped: the whole takes at most `budget` plus one
+/// exchange. The report holds each directory's last outcome.
 pub(crate) async fn publish_retrying(
     endpoint: &Endpoint,
     policy: &SignedPolicy,
@@ -266,13 +302,7 @@ pub(crate) async fn publish_retrying(
             "publish: trying the directories not reached again"
         );
         tokio::time::sleep(RETRY_PAUSE).await;
-        // A try cut off by the deadline leaves them missed.
-        let Ok(round) =
-            tokio::time::timeout(left - RETRY_PAUSE, publish_all(endpoint, policy, &again)).await
-        else {
-            return Ok(report);
-        };
-        let round = round?;
+        let round = publish_all(endpoint, policy, &again).await?;
         report.missed.retain(|d| !again.contains(d));
         report.delivered.extend(round.delivered);
         report.missed.extend(round.missed);
@@ -310,11 +340,23 @@ pub(crate) async fn publish_current_on(
     let held = stored(ks)?;
     let me = transport::to_node_id(&endpoint.id());
     let targets = publish_targets(&held, earlier, me);
-    let patient = match retry {
+    let listed: BTreeSet<NodeId> = held.directories().iter().copied().collect();
+    // A directory this edit drops gets one try: nothing waits for it.
+    let patient: BTreeSet<NodeId> = match retry {
         Retry::Reached => crate::admin::propagate::reached(ks),
         Retry::Every => targets.iter().copied().collect(),
-    };
-    publish_retrying(endpoint, &held.signed, &targets, &patient, PUBLISH_BUDGET).await
+    }
+    .intersection(&listed)
+    .copied()
+    .collect();
+    let mut report =
+        publish_retrying(endpoint, &held.signed, &targets, &patient, PUBLISH_BUDGET).await?;
+    report.dropped = targets
+        .iter()
+        .filter(|d| !listed.contains(d))
+        .copied()
+        .collect();
+    Ok(report)
 }
 
 /// [`publish_current_on`] over a freshly bound endpoint for this keystore's
@@ -547,6 +589,30 @@ mod tests {
             ..PublishReport::default()
         };
         assert!(all_missed.reached_none());
+        // A directory this edit dropped: named as such, never said to catch
+        // up, and missing it alone fails nothing.
+        let dropped = PublishReport {
+            delivered: vec![a],
+            missed: vec![b],
+            dropped: vec![b],
+            ..PublishReport::default()
+        };
+        let line = dropped.line(StateVersion(2));
+        assert!(
+            line.contains(&format!(
+                "not reached, and dropped by this edit: {}…",
+                b.short()
+            )),
+            "{line}"
+        );
+        assert!(!line.contains("hosts that follow it"), "{line}");
+        assert!(!line.contains("; not reached:"), "{line}");
+        let only_dropped = PublishReport {
+            missed: vec![b],
+            dropped: vec![b],
+            ..PublishReport::default()
+        };
+        assert!(!only_dropped.reached_none());
         let line = all_missed.line(StateVersion(2));
         assert!(!line.contains("hosts that follow it"), "{line}");
         assert!(

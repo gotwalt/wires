@@ -411,21 +411,26 @@ author, and "newer" is a version number.
 concurrently, every directory the new head lists plus every directory the head before the edit
 listed (so a directory the edit drops learns it), never itself, and sends `publish`. It dials no
 host. A directory counts as delivered when it answers `published` with the offered version and the
-offered head's `HeadHash`. **A directory it could not dial is tried again**, 1 s after each try,
-until it takes the publish or 15 s from the first try have passed, when it has taken a publish
-from this admin before (`reached.json`, §8); `wires policy push` tries every directory so. A
-directory that answered with a refusal is not tried again. This covers a directory that has just
-restarted: it binds a new port, n0 discovery has no record of it for about 3 s, and a stale
-`hints` line costs a whole 5 s dial; each new dial looks the key up again. A directory never
-reached (the first run, below) is tried once, so an edit made before any directory runs doesn't
-wait. Stderr says `policy version N: published to K of D directory(ies)`, naming each directory
-not reached and each that refused; when another took it, the line adds that hosts following the
-one missed decide under the policy before it until it takes this one from a directory that did
-(a replica, below), and that `wires policy push` re-publishes it. **When D > 0 and K = 0 the
-command exits 1**: the new policy is stored on
-the admin and nowhere else. `wires policy push` re-publishes it. With no directory listed at all,
-the line says the policy is stored here and that `wires directory add` comes next, and nothing
-fails. Two exceptions:
+offered head's `HeadHash`. Each exchange is bounded: 5 s to dial, then 10 s for the stream, the
+frames and the answer. **A directory it could not dial, or that answered `BUSY` (its slots were
+full), is tried again**, 1 s after each try, until it takes the publish or 15 s from the first
+try have passed, when the new head lists it and it has taken a publish from this admin before
+(`reached.json`, §8); `wires policy push` tries every directory the new head lists so. No try
+starts after the 15 s, and a try already started finishes (an answer on its way is never
+dropped), so a publish takes at most 30 s. Any other refusal is a decision, and is not tried
+again. This covers a directory that has just restarted: it binds a new port, n0 discovery has no
+record of it for about 3 s, and a stale `hints` line costs a whole 5 s dial; each new dial looks
+the key up again. A directory never reached (the first run, below) is tried once, so an edit made
+before any directory runs doesn't wait; so is a directory the edit drops, which no one else will
+hand the edit to (the others refuse it as a replica once they hold it). Stderr says `policy
+version N: published to K of D directory(ies)`, naming each directory not reached, each that
+refused, and each the edit dropped that it didn't reach; when another took it, the line adds that
+hosts following a listed directory it missed decide under the policy before it until that one
+takes this one from a directory that did (a replica, below), and that `wires policy push`
+re-publishes it. **When D > 0 and K = 0 the command exits 1**, unless every directory missed is
+one the edit dropped: the new policy is stored on the admin and nowhere else. `wires policy push`
+re-publishes it. With no directory listed at all, the line says the policy is stored here and
+that `wires directory add` comes next, and nothing fails. Two exceptions:
 
 - **The first run.** Until a directory the publish aims at has taken one from this admin
   (`reached.json`, §8), reaching none is a note, and exits 0: `policy version N is stored here; no

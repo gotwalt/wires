@@ -133,3 +133,33 @@ script changed.
 `policy push` can retry every directory), `wires/directory/tests.rs` and `wires/e2e/first_run.rs`
 (the new `Retry` argument; first_run's `policy push` uses `Retry::Every`), and the board README's
 lane row.
+
+**After review (four findings, fixed on top of e5f534b).** These supersede what is above where
+they differ.
+1. *Busy is not a refusal.* A directory with every admitted slot taken answers
+   `Denied { reason: BUSY }`. That now counts as a miss and is tried again; only other refusals
+   are final. The match compares against the shared constant `directory::node::BUSY`. A dedicated
+   answer would change the wire format, and the constant is the one both sides use. Test:
+   `e2e::restart::a_busy_directory_is_tried_again`, which fails without the change.
+2. *A directory the edit drops* (`wires directory rm`) is still published to once, so a running
+   one learns it was dropped. It is never tried again, and its miss is reported apart: "not
+   reached, and dropped by this edit: X…", with no catch-up sentence, because the others refuse
+   it as a replica once they hold the new head. It doesn't count toward "reached none" (new
+   `PublishReport::dropped`). Test:
+   `e2e::restart::a_dead_directory_the_edit_drops_is_tried_once_and_not_waited_for` (one try,
+   exit 0), plus the line's unit test.
+3. *No answer is dropped at the deadline.* A retry round is no longer cut off by a timeout. No
+   round starts after the 15 s budget, and one already started finishes. Each exchange is bounded
+   (item 4), so a directory that stored the policy is never reported missed for want of its
+   answer.
+4. *Every exchange is bounded* (`directory/wire.rs` `exchange`, also used by `ask`): 5 s to dial,
+   then 10 s for opening the stream, the writes and the answer, so 15 s at most. A publish's worst
+   case is therefore the 15 s budget plus one exchange, 30 s, and `docs/protocol.md` §4 says so.
+   Test: `directory::wire::tests::a_directory_that_never_answers_is_given_up_on` (a peer that
+   takes the connection and never reads, with 8 MiB of frames, so the writes block); ends in about
+   10 s.
+
+`docs/protocol.md` §4 rewritten to match (busy, dropped directories, the exchange bound, the
+30 s worst case, exit 1 unless every miss is a dropped directory). Rerun: `cargo test --workspace`
+green (145 library, 415 wires, doctests); clippy `-D warnings` and `cargo fmt --check` clean; both
+demo scripts pass.

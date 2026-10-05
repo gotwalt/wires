@@ -188,7 +188,10 @@ pub(crate) async fn publish(
 }
 
 /// Dial `dir`, write `hello` then the already-encoded `frames`, and read
-/// the one answer.
+/// the one answer: the dial within [`DIAL_TIMEOUT`], everything after it
+/// (the stream, the writes, the answer) within [`FRAME_TIMEOUT`], so one
+/// exchange ([`ask`], [`publish`]) ends within 15 s whatever the directory
+/// does.
 async fn exchange(
     endpoint: &Endpoint,
     dir: NodeId,
@@ -200,17 +203,18 @@ async fn exchange(
         .await
         .map_err(|_| anyhow!("no answer within {DIAL_TIMEOUT:?}"))?
         .map_err(|e| anyhow!("dialing directory {}…: {e}", dir.short()))?;
-    let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
     let hello = DirectoryRequest::Hello { id_token };
-    let answer = async {
+    let answer = tokio::time::timeout(FRAME_TIMEOUT, async {
+        let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
         write(&mut send, &hello.encode()?).await?;
         for frame in frames {
             write(&mut send, frame).await?;
         }
         send.finish().ok();
         read_answer(&mut recv).await
-    }
-    .await;
+    })
+    .await
+    .unwrap_or_else(|_| Err(anyhow!("no directory answer within {FRAME_TIMEOUT:?}")));
     conn.close(0u32.into(), b"done");
     answer
 }
@@ -247,5 +251,66 @@ mod tests {
         assert!(read_sub_request(&mut over.as_slice()).await.is_err());
         // A clean end of stream is not a frame.
         assert!(read_sub_frame(&mut [].as_slice()).await.unwrap().is_none());
+    }
+
+    /// Takes a connection on the directory ALPN and then does nothing: never
+    /// takes the stream, never reads, never answers.
+    #[derive(Debug, Clone)]
+    struct Silent;
+
+    impl iroh::protocol::ProtocolHandler for Silent {
+        async fn accept(
+            &self,
+            conn: iroh::endpoint::Connection,
+        ) -> Result<(), iroh::protocol::AcceptError> {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            drop(conn);
+            Ok(())
+        }
+    }
+
+    /// An exchange with a directory that takes the connection and never
+    /// answers ends within the dial and frame timeouts, even when its frames
+    /// are too large to be buffered (the writes block): the admin's publish
+    /// has a real bound (card 48).
+    #[tokio::test]
+    async fn a_directory_that_never_answers_is_given_up_on() {
+        let book = iroh::address_lookup::memory::MemoryLookup::new();
+        let bind = |who: library::NodeIdentity| {
+            let book = book.clone();
+            async move {
+                Endpoint::builder(iroh::endpoint::presets::Minimal)
+                    .secret_key(transport::secret_key(&who))
+                    .address_lookup(book)
+                    .bind()
+                    .await
+                    .unwrap()
+            }
+        };
+        let dir = library::NodeIdentity::generate();
+        let dir_id = dir.node_id();
+        let silent = bind(dir).await;
+        let socks: Vec<std::net::SocketAddr> = silent
+            .bound_sockets()
+            .into_iter()
+            .map(crate::net::dialable)
+            .collect();
+        book.add_endpoint_info(transport::endpoint_addr(&dir_id, &socks, None).unwrap());
+        let _router = iroh::protocol::Router::builder(silent)
+            .accept(DIRECTORY_ALPN, Silent)
+            .spawn();
+        let me = bind(library::NodeIdentity::generate()).await;
+        // Far more than any stream window: the writes can't all be buffered.
+        let big = vec![0u8; 8 << 20];
+        let started = std::time::Instant::now();
+        let e = exchange(&me, dir_id, None, &[big]).await.unwrap_err();
+        let took = started.elapsed();
+        assert!(took >= FRAME_TIMEOUT, "{took:?}: {e:#}");
+        assert!(
+            took < DIAL_TIMEOUT + FRAME_TIMEOUT + Duration::from_secs(2),
+            "{took:?}"
+        );
+        assert!(format!("{e:#}").contains("no directory answer"), "{e:#}");
+        me.close().await;
     }
 }
