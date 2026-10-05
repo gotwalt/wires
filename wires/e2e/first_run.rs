@@ -44,7 +44,7 @@ use crate::caller::pick::Hints;
 use crate::caller::view::{self, Asker};
 use crate::host::serve::{Binding, Serving, serve_until};
 use crate::host::transport::{self, endpoint_addr};
-use crate::policy::fetch::{held_directories, publish_current_on};
+use crate::policy::fetch::{Retry, held_directories, publish_current_on};
 use crate::policy::store;
 use crate::{Cli, Command};
 
@@ -92,7 +92,7 @@ async fn edit(
     let report = edit(admin);
     let root = admin.network_root().unwrap().unwrap();
     let version = store::read(admin, root).unwrap().unwrap().version();
-    let published = publish_current_on(endpoint, admin, &earlier).await;
+    let published = publish_current_on(endpoint, admin, &earlier, Retry::Reached).await;
     (report, settle(admin, published.map(|r| (version, r))))
 }
 
@@ -294,7 +294,7 @@ async fn first_run() -> FirstRun {
     // admin$ wires policy push
     let earlier = held_directories(&admin).unwrap();
     let version = store::read(&admin, root).unwrap().unwrap().version();
-    let pushed = publish_current_on(&admin_ep, &admin, &earlier).await;
+    let pushed = publish_current_on(&admin_ep, &admin, &earlier, Retry::Every).await;
     let pushed = settle(&admin, pushed.map(|r| (version, r)));
     assert_eq!(pushed.failure, None, "{}", pushed.note);
     assert!(

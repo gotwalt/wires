@@ -24,6 +24,9 @@
 //!   (`lenient` / `strict`) with every directory down.
 //! - [`views`] — card 37: each caller holds only its view, and a running
 //!   `wires mcp` hears of a grant or a revocation within 2 s.
+//! - [`restart`] — card 48: an admin edit made right after a directory
+//!   restarts reaches it (the publish tries a directory it can't find yet
+//!   again), and one that misses it is taken from another by replica.
 //! - [`native`] — card 33: an embedded [`Host`](crate::Host) serves a native
 //!   service (the `kv` example), called like a CLI service.
 
@@ -55,6 +58,8 @@ mod follow;
 mod gateway;
 /// Card 33: an app serves wires calls in-process through an embedded host.
 mod native;
+/// Card 48: an edit right after a directory restarts reaches it.
+mod restart;
 /// Card 28 §1: the service child is not the host.
 mod service_child;
 /// Card 37: each caller holds only its view; grants and revocations reach

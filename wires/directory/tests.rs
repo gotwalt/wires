@@ -269,7 +269,7 @@ async fn an_edit_reaches_the_directory_and_hosts_fetch_it_nobody_dials_them() {
     let edit = f.assign("orders-db", 1);
     let report = tokio::time::timeout(
         Duration::from_secs(2),
-        fetch::publish_current_on(&admin_ep, &f.admin, &earlier),
+        fetch::publish_current_on(&admin_ep, &f.admin, &earlier, fetch::Retry::Reached),
     )
     .await
     .expect("the publish took over 2 s")
@@ -350,9 +350,14 @@ async fn a_publish_that_reaches_no_directory_is_reported() {
     let _silent = bind(&f.nodes[0], &f.book).await;
     let admin_ep = f.admin_endpoint().await;
     f.assign("status", 0);
-    let report = fetch::publish_current_on(&admin_ep, &f.admin, &Default::default())
-        .await
-        .unwrap();
+    let report = fetch::publish_current_on(
+        &admin_ep,
+        &f.admin,
+        &Default::default(),
+        fetch::Retry::Reached,
+    )
+    .await
+    .unwrap();
     assert!(report.reached_none(), "{report:?}");
     admin_ep.close().await;
 }
@@ -685,9 +690,14 @@ async fn only_a_root_signed_newer_head_makes_a_directory_read_the_items() {
     // is taken.
     let admin_ep = f.admin_endpoint().await;
     let edit = f.assign("status", 0);
-    let report = fetch::publish_current_on(&admin_ep, &f.admin, &Default::default())
-        .await
-        .unwrap();
+    let report = fetch::publish_current_on(
+        &admin_ep,
+        &f.admin,
+        &Default::default(),
+        fetch::Retry::Reached,
+    )
+    .await
+    .unwrap();
     assert_eq!(report.delivered, vec![f.nodes[0].node_id()]);
     assert_eq!(d.dir.version(), edit.version());
     admin_ep.close().await;
@@ -722,9 +732,14 @@ async fn the_first_directory_starts_empty_and_takes_the_first_publish() {
         }
     );
     let admin_ep = f.admin_endpoint().await;
-    let report = fetch::publish_current_on(&admin_ep, &f.admin, &Default::default())
-        .await
-        .unwrap();
+    let report = fetch::publish_current_on(
+        &admin_ep,
+        &f.admin,
+        &Default::default(),
+        fetch::Retry::Reached,
+    )
+    .await
+    .unwrap();
     assert_eq!(report.delivered, vec![f.nodes[0].node_id()]);
     assert_eq!(d.dir.version(), f.policy().version());
     let after = wire::ask(&caller_ep, f.nodes[0].node_id(), f.token(1), &view)

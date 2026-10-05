@@ -84,7 +84,7 @@ Open cards only; finished cards are in [done/](done/).
 |---|---|---|---|---|
 | [44](backlog/44-cut-aliases-and-overrides.md) | 1 | — | backlog | Cut `tools.json` aliases and the caller's credential-override flags; shrink locked mode |
 | [46](backlog/46-spread-calls-across-hosts.md) | 1 | — | backlog | Spread calls across a service's hosts, so more hosts means more capacity |
-| [48](backlog/48-publish-misses-a-restarted-directory.md) | 1 | — | backlog | **Find the cause:** an edit right after a directory restarts reached 1 of 2 directories |
+| [48](review/48-publish-misses-a-restarted-directory.md) | 1 | — | review | **Find the cause:** an edit right after a directory restarts reached 1 of 2 directories |
 | [49](backlog/49-removed-host-window.md) | 2 | — | backlog, decided | **The removed-host window:** the host proves a current `Fresh` (from another directory) before the caller sends anything; fail closed; 15 min |
 | [45](backlog/45-trim-policy-sync.md) | 3 | 49 | backlog | One way to keep policy copies in step: no deltas, replicas or view subscriptions; `Fresh` and the beat stay for 49, `lenient`/`strict` go |
 | [08](doing/08-demo-two-machine.md) | last | all of the above | doing | Real run: laptop ↔ workbench over relay, Claude Code as the agent; re-record |
