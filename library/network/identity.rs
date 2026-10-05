@@ -20,8 +20,8 @@ pub struct NodeId([u8; 32]);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Signature([u8; 64]);
 
-/// Signature scheme a signed object (membership, signed policy, call-log
-/// entry) was signed with. Only [`Ed25519`](Self::Ed25519) is implemented
+/// Signature scheme a signed object (signed policy head, service entry,
+/// freshness timestamp) was signed with. Only [`Ed25519`](Self::Ed25519) is implemented
 /// today; the tag travels on the wire so a verifier can reject an object
 /// signed with a scheme it does not support, and so other schemes can be
 /// added later without a format change.
@@ -111,8 +111,8 @@ impl Signature {
 
 /// A node's signing identity: the Ed25519 secret key plus its derived address.
 ///
-/// Both fabric-root keys and node keys are `NodeIdentity` values — the role is
-/// a matter of how the key is used (signing memberships vs. authenticating a
+/// Both network root keys and node keys are `NodeIdentity` values — the role is
+/// a matter of how the key is used (signing the policy vs. authenticating a
 /// session), not of the type.
 ///
 /// **The secret stays inside.** The key is a private field; it is scrubbed
@@ -207,7 +207,7 @@ impl NodeIdentity {
     }
 
     /// A second owner of this key, for a task that must hold its own (the
-    /// call log's signer beside the endpoint's). Each copy is scrubbed when
+    /// directory's signer beside the endpoint's). Each copy is scrubbed when
     /// it drops. Named rather than `Clone` so every copy is deliberate and
     /// easy to find.
     ///

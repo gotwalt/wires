@@ -6,10 +6,12 @@
 //! by the admin's publish ([`publish_all`]) or [`Directory::accept`]; hosts
 //! are [`Follower`]s, or whole hosts ([`serve_until`]) on hermetic loopback.
 //!
-//! - [`an_edit_reaches_every_subscribed_host_within_2s_as_one_update`]: and
+//! - [`an_edit_reaches_every_subscribed_host_within_2s_as_one_update`]: 2 s
+//!   after the publish is answered (the fan-out, not the admin's dial), and
 //!   what it costs each host, in frames and bytes.
 //! - [`a_host_that_missed_edits_catches_up_by_one_update_on_reconnect`]
 //! - [`an_update_that_does_not_apply_makes_the_host_take_the_whole_policy`]
+//! - [`an_update_this_host_already_holds_is_skipped_not_resynced`]
 //! - [`with_every_directory_down_lenient_keeps_serving`]
 //! - [`with_every_directory_down_strict_refuses_until_one_is_back`]
 //! - [`a_host_restarted_from_disk_serves_before_any_directory_answers`]
@@ -26,8 +28,7 @@ use iroh::Endpoint;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::Router;
 use library::{
-    FreshnessMode, Matcher, Membership, NodeIdentity, Policy, Service, Settings, SignedPolicy,
-    StateVersion,
+    FreshnessMode, Matcher, NodeIdentity, Policy, Service, Settings, SignedPolicy, StateVersion,
 };
 
 use super::{PATIENCE, bind_in, call, hello, host_config, localhost_socks, role, service};
@@ -73,10 +74,6 @@ impl World {
             idp: MockIdp::start("alice@example.com").await,
             last: Default::default(),
         }
-    }
-
-    fn badge(&self, who: &NodeIdentity) -> Membership {
-        Membership::mint(&self.root, who.node_id(), 0, i64::MAX).unwrap()
     }
 
     /// The policy at `version`: `echo` on every host for `analyst` (alice),
@@ -126,11 +123,10 @@ impl World {
                 description: String::new(),
                 allow: vec![role("analyst")],
                 hosts: self.hosts.iter().map(|h| h.node_id()).collect(),
-                readers: vec![],
             },
         );
         for b in 0..bans {
-            p.ban(NodeIdentity::from_seed([100 + b; 32]).node_id(), i64::MAX);
+            p.ban(NodeIdentity::from_seed([100 + b; 32]).node_id());
         }
         edit(&mut p);
         crate::testutil::trust_role_issuers(&mut p);
@@ -147,7 +143,7 @@ impl World {
     fn keystore(&self, who: &NodeIdentity, policy: &SignedPolicy) -> Arc<Keystore> {
         let ks = Arc::new(Keystore::at(crate::testutil::temp_dir()));
         ks.save_node(who).unwrap();
-        ks.save_membership(&self.badge(who)).unwrap();
+        crate::testutil::join(&ks, &self.root, &[]);
         store::adopt_if_newer(&ks, policy, self.root.node_id(), now_unix()).unwrap();
         ks
     }
@@ -174,7 +170,7 @@ impl World {
         .unwrap();
         let endpoint = self.bind(node).await;
         let router = Running::mount(Router::builder(endpoint.clone()), &dir).spawn();
-        let running = Running::start(Arc::clone(&dir), endpoint.clone(), self.badge(node));
+        let running = Running::start(Arc::clone(&dir), endpoint.clone());
         Dir {
             dir,
             endpoint,
@@ -197,7 +193,6 @@ impl World {
                 endpoint: endpoint.clone(),
                 ks: Arc::clone(ks),
                 root,
-                badge: self.badge(node),
                 freshness: Arc::clone(&freshness),
                 runs_directory: false,
                 stats: Arc::clone(&stats),
@@ -214,7 +209,7 @@ impl World {
         }
     }
 
-    /// Host `i` serving `echo` from `ks` (a whole host: gate, log,
+    /// Host `i` serving `echo` from `ks` (a whole host: gate, exec,
     /// follower), until the returned sender is dropped.
     async fn host(
         &self,
@@ -227,7 +222,7 @@ impl World {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let serving = Serving {
             node: node.duplicate(),
-            membership: self.badge(node),
+            root: self.root.node_id(),
             keystore: Arc::clone(ks),
             config: host_config(&[&self.idp], r#"{"echo":{"command":["echo","hi"]}}"#, ""),
             native: NativeServices::new(),
@@ -247,7 +242,7 @@ impl World {
     /// Alice calls `echo` on the host at `addr`: its stdout, or the
     /// refusal.
     async fn call(&self, addr: &iroh::EndpointAddr) -> Result<String, String> {
-        let hello = hello(&self.root, &self.alice, 0, Some(&self.idp));
+        let hello = hello(&self.alice, 0, Some(&self.idp));
         match call(&self.alice, addr, hello, "echo", &[]).await {
             super::Outcome::Ran {
                 code: 0, stdout, ..
@@ -352,15 +347,27 @@ async fn an_edit_reaches_every_subscribed_host_within_2s_as_one_update() {
     let admin = w.bind(&w.admin).await;
     let v2 = w.policy(2, Settings::default(), 21);
     let started = Instant::now();
-    let report = publish_all(&admin, &w.badge(&w.admin), &v2, &[w.dirs[0].node_id()])
+    let report = publish_all(&admin, &v2, &[w.dirs[0].node_id()])
         .await
         .unwrap();
     assert_eq!(report.delivered, vec![w.dirs[0].node_id()]);
+    let published = started.elapsed();
     for h in &hosts {
         h.until(StateVersion(2)).await;
     }
     let took = started.elapsed();
-    assert!(took < Duration::from_secs(2), "the edit took {took:?}");
+    // The claim under test is that the directory pushes the edit to its
+    // subscribers as it takes it (docs: "within seconds"), not on the next
+    // beat (300 s by default) or a reconnect. So the budget is for the
+    // fan-out after the directory answered the publish; the admin's own
+    // dial and the publish (bounded by their timeouts) are printed, not
+    // budgeted, so a loaded machine's slow handshake doesn't fail it.
+    let fan_out = took - published;
+    eprintln!("publish answered in {published:?}; both hosts held it {fan_out:?} later");
+    assert!(
+        fan_out < Duration::from_secs(2),
+        "the subscribed hosts took {fan_out:?} after the publish"
+    );
     for (h, before) in hosts.iter().zip(&before) {
         let after = h.frames();
         assert_eq!(after.0, before.0, "no whole policy was sent");
@@ -430,7 +437,7 @@ async fn an_update_that_does_not_apply_makes_the_host_take_the_whole_policy() {
     forked.version = StateVersion(1);
     forked.not_after = i64::MAX;
     forked.directories = w.dirs.iter().map(|d| d.node_id()).collect();
-    forked.ban(NodeIdentity::from_seed([7u8; 32]).node_id(), i64::MAX);
+    forked.ban(NodeIdentity::from_seed([7u8; 32]).node_id());
     let forked = crate::testutil::signed_policy(&w.root, forked);
     let h = w.follower(0, &w.keystore(&w.hosts[0], &forked)).await;
     h.until(StateVersion(2)).await;
@@ -440,6 +447,51 @@ async fn an_update_that_does_not_apply_makes_the_host_take_the_whole_policy() {
     assert_eq!(held.signed, w.last.lock().unwrap().clone().unwrap());
     h.task.abort();
     d.stop().await;
+}
+
+/// A host that is also a directory takes the admin's publish into its own
+/// `policy.json` (its directory mirrors what it accepts) before the
+/// directory it follows sends the same edit as an update from the version
+/// before. That update is already held: it is skipped, its `Fresh` kept,
+/// and nothing is resynced (it used to fail to apply, here on the ban the
+/// edit lifts, and fetch the whole policy).
+#[tokio::test]
+async fn an_update_this_host_already_holds_is_skipped_not_resynced() {
+    let w = World::new().await;
+    let v1 = w.policy(1, Settings::default(), 1);
+    let v2 = w.policy(2, Settings::default(), 0); // `wires restore`
+    let ks = w.keystore(&w.hosts[0], &v1);
+    let root = w.root.node_id();
+    let endpoint = w.bind(&w.hosts[0]).await;
+    let freshness = Arc::new(Freshness::load(
+        Arc::clone(&ks),
+        Some(&store::read(&ks, root).unwrap().unwrap().signed.head),
+    ));
+    let follower = Follower {
+        endpoint: endpoint.clone(),
+        ks: Arc::clone(&ks),
+        root,
+        freshness: Arc::clone(&freshness),
+        runs_directory: true,
+        stats: Arc::new(FollowStats::default()),
+    };
+    // Its own directory got there first.
+    let now = now_unix();
+    assert!(store::adopt_if_newer(&ks, &v2, root, now).unwrap());
+    let fresh = library::Fresh::sign(&w.dirs[1], &v2.head, now, now + 300).unwrap();
+    let update = library::SubFrame::PolicyUpdate {
+        update: v2.update_from(&v1),
+        fresh,
+    };
+    follower.take(update, now).unwrap();
+    let held = store::read(&ks, root).unwrap().unwrap();
+    assert_eq!(held.signed, v2);
+    assert_eq!(
+        freshness.vouched(&held.signed.head, now),
+        Vouched::Current,
+        "the update's Fresh vouches for the head it already holds"
+    );
+    endpoint.close().await;
 }
 
 /// Short intervals: a `Fresh` every second, good for three.
@@ -540,17 +592,16 @@ async fn a_publish_from_a_stale_copy_is_not_delivered() {
     assert!(d.dir.accept(&v2, now).unwrap());
     assert!(d.dir.accept(&v3, now).unwrap());
     let admin = w.bind(&w.admin).await;
-    let badge = w.badge(&w.admin);
     let only = [w.dirs[0].node_id()];
 
     // Two versions behind: its version 2 is older than the directory's 3.
-    let report = publish_all(&admin, &badge, &v2, &only).await.unwrap();
+    let report = publish_all(&admin, &v2, &only).await.unwrap();
     assert_eq!(report.newer, vec![(only[0], StateVersion(3))], "{report:?}");
     assert!(report.delivered.is_empty(), "{report:?}");
     // One behind: another version 3, signed from its copy of version 2.
     let other_v3 = w.policy(3, Settings::default(), 5);
     assert_ne!(other_v3.head, v3.head);
-    let report = publish_all(&admin, &badge, &other_v3, &only).await.unwrap();
+    let report = publish_all(&admin, &other_v3, &only).await.unwrap();
     assert_eq!(report.newer, vec![(only[0], StateVersion(3))], "{report:?}");
     let failure =
         crate::admin::propagate::Propagation::from_publish(Ok((StateVersion(3), report)), false)
@@ -560,7 +611,7 @@ async fn a_publish_from_a_stale_copy_is_not_delivered() {
     assert_eq!(d.dir.snapshot().unwrap().held.signed, v3, "kept its own");
 
     // The directory's own version, re-published (`policy push`): delivered.
-    let report = publish_all(&admin, &badge, &v3, &only).await.unwrap();
+    let report = publish_all(&admin, &v3, &only).await.unwrap();
     assert_eq!(report.delivered, only.to_vec(), "{report:?}");
     assert!(report.newer.is_empty());
     admin.close().await;
@@ -614,7 +665,7 @@ async fn a_host_every_directory_refuses_backs_off() {
         for svc in p.services.values_mut() {
             svc.hosts.retain(|h| *h != host);
         }
-        p.ban(host, i64::MAX);
+        p.ban(host);
     });
     let now = now_unix();
     assert!(first.dir.accept(&banned, now).unwrap());

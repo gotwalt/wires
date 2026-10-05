@@ -11,9 +11,9 @@ Options:
       --audience <AUDIENCE>
           An `aud` value hosts accept from this IdP (repeatable; default: the client id)
       --public-client-secret <PUBLIC_CLIENT_SECRET>
-          The client's public secret, which invites carry to `wires login`
+          The client's public secret, which the network string carries to `wires login`
       --login
-          Make this the IdP invites tell `wires login` to use (default: init's)
+          Make this the IdP the network string tells `wires login` to use (default: init's)
       --policy-ttl <TTL>
           Lifetime of the new policy, from now; never shortens the current one [default: 90d]
   -h, --help

@@ -3,7 +3,7 @@ Admin: stop listing a node as a directory, and publish
 Usage: wires directory rm [OPTIONS] <NODE>
 
 Arguments:
-  <NODE>  The node: an `invite --name` label or a hex node id
+  <NODE>  The node: `label=<node id>` the first time, then the label (or its id)
 
 Options:
       --policy-ttl <TTL>  Lifetime of the new policy, from now; never shortens the current one [default: 90d]

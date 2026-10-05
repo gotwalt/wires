@@ -14,8 +14,7 @@ pub enum Error {
     #[error("decode: {0}")]
     Decode(serde_json::Error),
 
-    /// A token (an invite, a membership) was not valid
-    /// base64.
+    /// A token (a network string) was not valid base64.
     #[error("token decode: {0}")]
     TokenDecode(#[from] base64::DecodeError),
 
@@ -29,35 +28,39 @@ pub enum Error {
 
     /// A credential declared a format version this build does not understand.
     ///
-    /// Membership credentials carry a *signed* `version` discriminant; a
-    /// verifier rejects any version it was not built for rather than silently
-    /// ignoring fields it cannot interpret (see [`crate::membership`]).
+    /// Signed objects carry a *signed* format discriminant; a verifier
+    /// rejects any format it was not built for rather than silently
+    /// ignoring fields it cannot interpret.
     #[error("unsupported version")]
     UnsupportedVersion,
 
-    /// A credential's `not_after` is in the past relative to the checked time.
+    /// A `not_after` is in the past relative to the checked time.
     ///
-    /// Shared by memberships and policy heads — the caller prefixes which
-    /// credential it was checking (`membership rejected: …`), so the display
-    /// deliberately does *not* name one.
+    /// A policy head's expiry — the caller prefixes what it was checking,
+    /// so the display deliberately does *not* name it.
     #[error("expired at {not_after}")]
     Expired {
         /// The credential's expiry, unix seconds.
         not_after: i64,
     },
 
-    /// The credential's subject does not match the node checking it: a
-    /// membership's member is not the authenticated caller.
-    #[error("credential subject does not match caller")]
-    SubjectMismatch,
+    /// The signed policy bans the caller's node or person (the admin
+    /// removed it; [`check_admitted`](crate::check_admitted)).
+    #[error("removed from this network")]
+    Banned,
 
-    /// The node's badge verifies, but the signed policy bans it (the admin
-    /// removed it; [`Policy::bans`](crate::Policy::bans)).
-    #[error("banned until {until}")]
-    Banned {
-        /// The ban's `until`, unix seconds.
-        until: i64,
-    },
+    /// The caller's verified principal carries no verified email, which
+    /// admission requires ([`check_admitted`](crate::check_admitted)): a
+    /// person ban matches a verified email, so a principal without one could
+    /// otherwise sidestep it.
+    #[error("the sign-in carries no verified email")]
+    NoVerifiedEmail,
+
+    /// No role in the signed policy matches the caller's verified principal
+    /// ([`check_admitted`](crate::check_admitted)): the IdP knows them, the
+    /// network doesn't.
+    #[error("no role in the policy matches this person")]
+    NoRole,
 
     /// A byte slice had the wrong length for the key, signature, id or
     /// digest it decodes to.
@@ -73,8 +76,8 @@ pub enum Error {
     BadFrame,
 
     /// [`Policy::sign`](crate::Policy::sign) was handed a signing key whose
-    /// node id is not the policy's `fabric` — a usage error (the fabric root
-    /// must sign its own policy).
+    /// node id is not the policy's `fabric` (its network root) — a usage
+    /// error (the root must sign its own policy).
     #[error("signing key is not the network root")]
     FabricMismatch,
 

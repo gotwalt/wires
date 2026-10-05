@@ -3,7 +3,7 @@
 //!
 //! A sandboxed agent that may run `wires call` can still pass `wires call`'s
 //! own flags (`docs/agent-sandbox.md`): `--tools-file`, `--node-seed-file`,
-//! `--membership-file`, `--relay-url`, … would let it point the caller at
+//! `--relay-url`, … would let it point the caller at
 //! another tools map or relay, or feed local files in as credentials. Locked
 //! mode is turned on by the **operator**, never by the agent:
 //!
@@ -14,8 +14,8 @@
 //!
 //! Once on, every [`CredArgs`] flag and `--tools-file` is refused with an
 //! error naming it ([`OVERRIDE_FLAGS`]), and so are the environment variables
-//! that override the same credentials ([`OVERRIDE_ENV`]: `WIRES_NODE_SEED`,
-//! `WIRES_MEMBERSHIP`); the shaping flags (`--jq`, `--head`, `--max-bytes`),
+//! that override the same credentials ([`OVERRIDE_ENV`]: `WIRES_NODE_SEED`);
+//! the shaping flags (`--jq`, `--head`, `--max-bytes`),
 //! `--verbose`, the service name and its arguments are untouched.
 //!
 //! **What it assumes.** Locked mode is only as strong as the agent's inability
@@ -59,14 +59,12 @@ pub const OVERRIDE_FLAGS: &[&str] = &[
     "--tools-file",
     "--node-seed",
     "--node-seed-file",
-    "--membership",
-    "--membership-file",
     "--relay-url",
 ];
 
 /// Every environment variable locked mode refuses: the ones that override
-/// this node's credentials, like `--node-seed` and `--membership` do.
-pub const OVERRIDE_ENV: &[&str] = &["WIRES_NODE_SEED", "WIRES_MEMBERSHIP"];
+/// this node's key, like `--node-seed` does.
+pub const OVERRIDE_ENV: &[&str] = &["WIRES_NODE_SEED"];
 
 /// How long a locked `wires call` waits for the first byte of a non-terminal
 /// stdin before treating it as empty (a harness may hold stdin open without
@@ -219,16 +217,12 @@ fn overrides(creds: &CredArgs, tools_file: Option<&Path>) -> Vec<&'static str> {
     let CredArgs {
         node_seed,
         node_seed_file,
-        membership,
-        membership_file,
         relay_url,
     } = creds;
     let set = [
         tools_file.is_some(),
         node_seed.is_some(),
         node_seed_file.is_some(),
-        membership.is_some(),
-        membership_file.is_some(),
         relay_url.is_some(),
     ];
     OVERRIDE_FLAGS

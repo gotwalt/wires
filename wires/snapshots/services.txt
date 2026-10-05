@@ -16,4 +16,4 @@ Examples:
 
 Output: one service per line, `<name>  <description>  (<roles that may call>)`;
 nothing on stdout when none. --json, one object per line:
-  {"service":"orders-db","description":"…","allow":["analyst"],"call":true,"read":false,"hosts":2}
+  {"service":"orders-db","description":"…","allow":["analyst"],"hosts":2}

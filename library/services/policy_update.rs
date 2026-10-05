@@ -12,7 +12,7 @@
 //! whole policy instead.
 //!
 //! ```
-//! use library::{Ban, NodeIdentity, Policy, StateVersion};
+//! use library::{NodeIdentity, Policy, StateVersion};
 //! let root = NodeIdentity::from_seed([1u8; 32]);
 //! let mut policy = Policy::new(root.node_id());
 //! policy.version = StateVersion(1);
@@ -21,7 +21,7 @@
 //!
 //! // The admin bans a node: the host receives the new head and the ban.
 //! policy.version = StateVersion(2);
-//! policy.bans.insert(NodeIdentity::from_seed([9u8; 32]).node_id(), Ban { until: 100 });
+//! policy.ban(NodeIdentity::from_seed([9u8; 32]).node_id());
 //! let v2 = policy.sign_after(&root, &v1).unwrap();
 //! let update = v2.update_from(&v1);
 //! assert_eq!(update.changed.len(), 1);
@@ -70,8 +70,8 @@ impl SignedPolicy {
         }
     }
 
-    /// Apply `update` to this (verified) policy: its head must be the same
-    /// fabric's and no older; every removed key must be held and named once;
+    /// Apply `update` to this (verified) policy: its head must be for the
+    /// same network root and no older; every removed key must be held and named once;
     /// no key may be named twice; then the rebuilt policy (held items, plus
     /// the changed ones, less the removed ones) must pass
     /// [`verify`](Self::verify): the head's signature under `root`, the
@@ -123,7 +123,6 @@ impl SignedPolicy {
 mod tests {
     use super::*;
     use crate::head::StateVersion;
-    use crate::item::Ban;
     use crate::signed_policy::Policy;
     use crate::signed_policy::fixtures::*;
     use proptest::prelude::*;
@@ -161,7 +160,7 @@ mod tests {
     fn changes_additions_and_removals_apply() {
         let old = signed();
         let new = v4(|p| {
-            p.bans.insert(node(21), Ban { until: 900 });
+            p.bans.insert(node(21));
             p.services.remove(&name("locked"));
             p.roles
                 .get_mut(&role("staff"))
@@ -187,7 +186,7 @@ mod tests {
         let old = signed();
         let new = v4(|p| {
             p.services.get_mut(&name("status")).unwrap().description = "SLOs".into();
-            p.bans.insert(node(21), Ban { until: 900 });
+            p.bans.insert(node(21));
         });
         let good = new.update_from(&old);
         assert_eq!(good.changed.len(), 2);
@@ -203,18 +202,15 @@ mod tests {
         // A tampered ban.
         let mut t = good.clone();
         for item in &mut t.changed {
-            if let Item::Ban { body, .. } = item {
-                body.until = i64::MAX;
+            if let Item::Ban { key } = item {
+                *key = node(23);
             }
         }
-        assert!(matches!(old.apply(&t, r()), Err(Error::ItemsMismatch)));
+        assert!(old.apply(&t, r()).is_err());
 
         // An extra item.
         let mut t = good.clone();
-        t.changed.push(Item::Ban {
-            key: node(22),
-            body: Ban { until: 1 },
-        });
+        t.changed.push(Item::Ban { key: node(22) });
         assert!(matches!(old.apply(&t, r()), Err(Error::ItemsMismatch)));
 
         // A false removal: of a held key, or of one not held.
@@ -313,12 +309,13 @@ mod tests {
                     match &mut update.changed[i] {
                         Item::Role { body, .. } => body.push(email("mallory@example.com")),
                         Item::Service(e) => e.service.description.push('!'),
-                        Item::Ban { body, .. } => body.until = body.until.wrapping_add(1),
+                        Item::Ban { key } => *key = node(98),
+                        Item::PersonBan { key } => key.email.push('x'),
                         Item::Issuer { body, .. } => body.audiences.push(crate::Audience::new("x")),
                         Item::Settings { body } => body.fresh_secs += 1,
                     }
                 }
-                _ => update.changed.push(Item::Ban { key: node(99), body: Ban { until: 7 } }),
+                _ => update.changed.push(Item::Ban { key: node(99) }),
             }
             prop_assert!(old.apply(&update, r()).is_err());
         }

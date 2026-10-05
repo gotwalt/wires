@@ -1,4 +1,4 @@
-//! A caller's `view` subscription on `wires/directory-sub/1` (card 37).
+//! A caller's `view` subscription on `wires/directory-sub/2` (card 37).
 //!
 //! A long-running caller (`wires mcp`, one gateway session, `wires inbox
 //! --wait`) follows its view instead of asking again: the directory sends
@@ -9,62 +9,57 @@
 //! the time the publish takes to arrive.
 //!
 //! The principal is the ID token the subscriber presented in its `hello`,
-//! verified once, when the subscription opens, as a `view` request is
-//! ([`Directory::principal`]); a subscriber that signs in again subscribes
-//! again. The first frame is always the whole view, whatever `have` the
-//! subscriber names: the directory stores nothing per subscriber, so it
-//! can't know which view a `have` refers to. A subscriber that can't apply
-//! an update subscribes again.
+//! verified once, when the subscription opens, and admitted as a `view`
+//! request is ([`Directory::admit`]): a subscriber the policy doesn't admit
+//! is refused at the `hello`, and every later head is checked again (below). The first frame is always the whole view,
+//! whatever `have` the subscriber names: the directory stores nothing per
+//! subscriber, so it can't know which view a `have` refers to. A subscriber
+//! that can't apply an update subscribes again.
 //!
-//! Every head is checked as the `hello` was: a head that bans the
-//! subscriber (or a badge that has lapsed) ends the stream with `denied`
-//! (`not a member of this network`), and so does a head that stops listing
-//! this directory (it can no longer vouch), so the caller fails over.
-
-use std::sync::Arc;
+//! A subscription takes a slot from the callers' own pool, apart from the
+//! hosts' ([`Directory::view_slot`]: at most
+//! [`MAX_VIEW_SUBSCRIPTIONS_PER_PERSON`](super::node::MAX_VIEW_SUBSCRIPTIONS_PER_PERSON)
+//! for one person), and ends with `denied`:
+//!
+//! - when its ID token expires ([`SIGN_IN_EXPIRED`]): the client subscribes
+//!   again with the token it holds then;
+//! - when a head it adopts no longer admits the subscriber
+//!   ([`library::check_admitted`]: its node or person banned, or no role
+//!   matches any more), after a `view_update` that empties its view
+//!   ([`NOT_ADMITTED`]);
+//! - when a head stops listing this directory (it can no longer vouch), so
+//!   the caller fails over.
 
 use anyhow::Result;
 use iroh::endpoint::{Connection, SendStream};
-use library::{IdToken, Membership, NodeId, Principal, SubFrame, View};
+use library::{NodeId, Principal, SubFrame, View};
 
 use super::node::{Directory, NOT_ADMITTED};
 use super::wire;
-use crate::clock::now_unix;
+use crate::host::gate::SIGN_IN_EXPIRED;
 use crate::host::transport;
 
-/// Serve one `view` subscription for the admitted `caller` (which presented
-/// `badge` and `id_token` in its `hello`) on `send`, until the caller goes
-/// or the directory stops; or with a terminal `denied` when the subscriber
-/// cap is reached, a new head no longer admits the caller (`badge` checked
-/// again, and its bans), or the head stops listing this directory.
+/// Serve one `view` subscription for `caller`, admitted as `principal` by
+/// the token in its `hello`, on `send`, until the caller goes or the
+/// directory stops; or with a terminal `denied` (see the module docs).
 pub(crate) async fn serve(
     dir: &Directory,
     conn: &Connection,
     send: &mut SendStream,
     caller: NodeId,
-    badge: &Membership,
-    id_token: Option<&IdToken>,
+    principal: Principal,
 ) -> Result<()> {
-    let Ok(_slot) = Arc::clone(&dir.subscribers).try_acquire_owned() else {
-        return deny(
-            send,
-            format!(
-                "this directory's subscriber cap ({}) is reached",
-                dir.max_subscribers
-            ),
-        )
-        .await;
+    let _slot = match dir.view_slot(&principal) {
+        Ok(slot) => slot,
+        Err(reason) => return deny(send, reason).await,
     };
-    let principal: Option<Principal> = match dir.snapshot() {
-        Some(c) => {
-            dir.principal(caller, id_token, &c.held.policy, now_unix())
-                .await
-        }
-        None => return deny(send, "this directory holds no policy yet".into()).await,
-    };
+    if dir.snapshot().is_none() {
+        return deny(send, super::node::EMPTY.into()).await;
+    }
+    let expires = tokio::time::Instant::now() + expiry(&principal, crate::clock::now_unix());
     tracing::debug!(
         peer = %caller.hex(),
-        who = principal.as_ref().map(Principal::name).as_deref().unwrap_or("-"),
+        who = %principal.name(),
         "directory: a view subscription"
     );
     let mut sent: Option<View> = None;
@@ -76,8 +71,23 @@ pub(crate) async fn serve(
                 // The head no longer lists this node: it vouches for nothing.
                 return deny(send, "no longer a directory of this network".into()).await;
             };
-            if let Err(detail) = dir.admit(caller, badge, now_unix()) {
-                tracing::info!(peer = %caller.hex(), "view subscription ended: {detail}");
+            if let Err(e) = library::check_admitted(&c.held.policy, caller, &principal) {
+                tracing::debug!(
+                    peer = %caller.hex(),
+                    who = %principal.name(),
+                    "view subscription ended: {e}"
+                );
+                if let Some(before) = &sent {
+                    let empty = View {
+                        head: c.held.signed.head.clone(),
+                        entries: Vec::new(),
+                    };
+                    let frame = SubFrame::ViewUpdate {
+                        update: before.update_to(&empty),
+                        fresh,
+                    };
+                    wire::write(send, &frame.encode()?).await?;
+                }
                 return deny(send, NOT_ADMITTED.into()).await;
             }
             let frame = match &sent {
@@ -85,7 +95,7 @@ pub(crate) async fn serve(
                     SubFrame::Fresh { fresh }
                 }
                 held => {
-                    let view = c.held.signed.view_for(principal.as_ref(), None);
+                    let view = c.held.signed.view_for(caller, Some(&principal), None);
                     let frame = match held {
                         Some(before) => SubFrame::ViewUpdate {
                             update: before.update_to(&view),
@@ -105,8 +115,20 @@ pub(crate) async fn serve(
         tokio::select! {
             changed = changes.changed() => if changed.is_err() { return Ok(()); },
             _ = conn.closed() => return Ok(()),
+            _ = tokio::time::sleep_until(expires) => {
+                tracing::debug!(peer = %caller.hex(), "view subscription ended: the ID token expired");
+                return deny(send, SIGN_IN_EXPIRED.into()).await;
+            }
         }
     }
+}
+
+/// How long from `now` until `principal`'s ID token expires (its `exp`):
+/// when the subscription it opened ends.
+fn expiry(principal: &Principal, now: i64) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        u64::try_from(principal.not_after.saturating_sub(now)).unwrap_or(0),
+    )
 }
 
 /// End the subscription with a terminal `denied`.
@@ -117,4 +139,27 @@ async fn deny(send: &mut SendStream, reason: String) -> Result<()> {
     wire::write(send, &frame.encode()?).await?;
     send.finish().ok();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn who(not_after: i64) -> Principal {
+        Principal {
+            issuer: "https://idp".into(),
+            subject: "s".into(),
+            email: Some("a@x.com".into()),
+            org: None,
+            groups: vec![],
+            not_after,
+        }
+    }
+
+    #[test]
+    fn a_subscription_lasts_until_its_token_expires_and_no_longer() {
+        assert_eq!(expiry(&who(1_000), 990), std::time::Duration::from_secs(10));
+        assert_eq!(expiry(&who(1_000), 1_000), std::time::Duration::ZERO);
+        assert_eq!(expiry(&who(1_000), 5_000), std::time::Duration::ZERO);
+    }
 }

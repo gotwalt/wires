@@ -5,8 +5,8 @@
 
 The goal is CLI-style efficiency with a permission surface as narrow as MCP's.
 The agent runs one thing, `wires call <tool> …`. What each tool does is defined
-on the host (`host.json`), checked against the caller's IdP identity, and
-recorded by the host as a structured `(service, argv)`. Output filtering that
+on the host (`host.json`) and checked against the caller's IdP identity; the
+host receives a structured `(service, argv)`, never a shell line. Output filtering that
 would normally need a shell (`| jq`, `| head`) happens inside `wires call`:
 
 ```bash
@@ -17,8 +17,8 @@ wires call gh --jq '.[].title' --head 5 -- pr list -R cli/cli --json title
 `--jq`, `--head` and `--max-bytes` go between the tool name and `--` (or
 before the tool name). A permission rule scoped to one tool,
 `Bash(wires call gh:*)`, still matches a shaped call. The flags never reach
-the host. The host's call record holds exactly what ran there. A tool's own
-filter flags, such as `gh … --jq`, are part of argv, so they are recorded.
+the host. A tool's own filter flags, such as `gh … --jq`, are part of argv,
+so they run on the host.
 Every `wires mcp` tool description tells the model this.
 
 ## What `Bash(wires call:*)` does and doesn't prevent
@@ -66,8 +66,8 @@ the claim "`wires` is the agent's only executable" is **false** for a
 Bash-rule setup on its own. The accurate claim is: the agent can run
 `wires call`, plus Claude Code's read-only commands confined to its working
 directory. It can also feed working-directory files into a call
-(`< file`, globs), which sends them to the host. The host records such stdin
-in its call record (count, digest, head).
+(`< file`, globs), which sends them to the host, and to the service it
+runs.
 
 Deny rules close specific commands: `--disallowedTools='Bash(cat:*),Bash(echo:*)'`
 refused `cat`, `echo`, and `…; cat` (deny beats the read-only allowance).
@@ -115,8 +115,8 @@ In order of how much it relies on Claude Code's command parser:
 ## Locked caller mode (card 20)
 
 Without the lock, the agent controls **`wires call`'s own flags** under any
-`Bash(wires call…)` rule: `--tools-file`, `--node-seed`, `--node-seed-file`,
-`--membership`, `--membership-file` and `--relay-url`. With them it could point the
+`Bash(wires call…)` rule: `--tools-file`, `--node-seed`, `--node-seed-file`
+and `--relay-url`. With them it could point the
 caller at another tools map or relay, present another key, or feed a local
 file in as a credential (an unlocked `--tools-file canary.txt` reads the
 file: `wires: parsing canary.txt: …`).
@@ -127,10 +127,10 @@ The operator turns the lock on with `WIRES_LOCKED=1` (any value but empty,
 
 | | locked `wires call` | locked `wires mcp` |
 |---|---|---|
-| the six flags above | **refused**, exit 2, `wires: --relay-url is not allowed in locked mode …`; nothing dialed | refused at startup, exit 1 |
-| `--jq`, `--head`, `--max-bytes`, the service name (`db_query`), its args after `--` (including ones spelled like our flags) | accepted | the `jq` / `head` / `max_bytes` / `args` fields: accepted |
+| the four flags above | **refused**, exit 2, `wires: --relay-url is not allowed in locked mode …`; nothing dialed | refused at startup, exit 1 |
+| `--jq`, `--head`, `--max-bytes`, `--verbose`, the service name (`db_query`), its args after `--` (including ones spelled like our flags) | accepted | the `jq` / `head` / `max_bytes` / `args` fields: accepted |
 | stdin | **refused if it holds any data** (exit 2), unless the operator also sets `WIRES_LOCKED_STDIN=allow`; a terminal or empty stdin is fine, and the remote gets EOF | the `stdin` field: accepted |
-| `WIRES_NODE_SEED`, `WIRES_MEMBERSHIP` (they override the node key and membership, like the flags) | **refused**, exit 2, `wires: $WIRES_NODE_SEED is not allowed in locked mode …`; nothing dialed | refused at startup, exit 1 |
+| `WIRES_NODE_SEED` (it overrides the node key, like the flags) | **refused**, exit 2, `wires: $WIRES_NODE_SEED is not allowed in locked mode …`; nothing dialed | refused at startup, exit 1 |
 | `WIRES_HOME`, `WIRES_LOCKED`, `WIRES_LOCKED_STDIN` | still read: they are how the operator configures the lock | same |
 
 **Locked mode assumes the agent can't set its own environment.** `WIRES_LOCKED`
@@ -153,8 +153,7 @@ schema teaches. On the MCP path, `stdin` is a string inside
 the client's JSON-RPC request, the model's own text; `wires mcp` never reads
 a file for it, so nothing local can ride along, and MCP clients that send SQL
 that way keep working. Operators whose tools genuinely need piped input set
-`WIRES_LOCKED_STDIN=allow` and accept the `< file` path (the host still
-records each call's stdin size, digest and head).
+`WIRES_LOCKED_STDIN=allow` and accept the `< file` path.
 
 **Probe re-run (2026-09-23, Claude Code 2.1.280, Haiku, real `wires`
 binary with an empty scratch `WIRES_HOME`, so nothing was dialed).** Raw rows:
@@ -164,31 +163,30 @@ binary with an empty scratch `WIRES_HOME`, so nothing was dialed).** Raw rows:
 |---|---|---|
 | `--tools-file canary.txt` | honored (file parsed) | **refused** by wires |
 | `--node-seed <hex>` · `--node-seed-file canary.txt` | honored | **refused** by wires |
-| `--membership AAAA` · `--membership-file canary.txt` | honored | **refused** by wires |
 | `--relay-url https://relay.invalid` (before the tool) | honored | **refused** by wires |
 | `--jq . --head 1 --max-bytes 64` | accepted | accepted |
 | `-- api x < canary.txt` | forwarded | **refused** by wires |
 | `-- api x <<'EOF' …` | forwarded | **refused** by wires (by design, above) |
 | `WIRES_LOCKED=0 wires call …` · `WIRES_HOME=. wires call …` · `env -u WIRES_LOCKED wires call …` · `unset WIRES_LOCKED; …` · `export WIRES_LOCKED=0; …` | — | **refused** by Claude Code ("requires approval") |
 
-Claude Code allowed all 18 flag and stdin commands in the table (each
+Claude Code allowed every flag and stdin command in the table (each
 unlocked and locked) under `Bash(wires call:*)`; those refusals came from
-`wires` itself. (The raw rows also probe a flag `wires` has since dropped.) The five
+`wires` itself. (The raw rows also probe flags `wires` has since dropped.) The five
 attempts to switch the lock off from the command line never reached `wires`. Under `Bash(wires call gh:*)`
 (locked), `--node-seed-file`, shaping and `< canary.txt` behaved the same;
 `wires call --relay-url … gh` was refused by Claude Code already, since a
 flag before the tool name doesn't match the `wires call gh` prefix.
 
 **What the lock does not cover.** Globs (`wires call t -- *`) still put
-working-directory *file names* into argv (not contents); the host records
-argv. The lock guards `call`, `mcp` and `inbox` only: keep the permission
+working-directory *file names* into argv (not contents), which the host
+receives. The lock guards `call`, `mcp` and `inbox` only: keep the permission
 rules at `wires call` and `wires inbox` (not `Bash(wires:*)`), because `wires
 tools add`, `join` and `login` write under `$WIRES_HOME`. And a locked caller
 is still a caller-side setting: the host authenticates the node key and
 decides every call by its signed policy either way.
 
 **`wires inbox` (card 23).** Locked, it refuses the same credential flags
-(`--node-seed*`, `--membership*`, `--relay-url`) with
+(`--node-seed`, `--node-seed-file`, `--relay-url`) with
 the same message and exit 2; `--wait`, `--timeout` and `--json` are
 accepted. It reads no stdin. Allow it with `Bash(wires inbox:*)` beside the
 call rule. What it prints is a host's words, so each line starts with the

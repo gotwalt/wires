@@ -1,0 +1,15 @@
+Lift a removal of a person or a node
+
+Usage: wires restore [OPTIONS] <WHO>
+
+Arguments:
+  <WHO>  A person's email, or a node's label or id
+
+Options:
+      --issuer <ISSUER>          The IdP that verifies the email: its exact `iss` (default: the one the network string names)
+      --policy-ttl <POLICY_TTL>  Lifetime of the new signed policy, from now (`90d`, `12h`, … or seconds). Never shortens the current policy's expiry [default: 90d]
+  -h, --help                     Print help
+      --help-all                 Also list the operator and credential flags
+
+Example:
+  wires restore alice@example.com

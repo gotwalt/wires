@@ -1,22 +1,24 @@
 """kv: a wires-native service written in Python.
 
-The same store as the Rust example (wires/examples/kv.rs): a key-value map
+The same store as the Rust example (wires/examples/kv/): a key-value map
 held in this process's memory, one namespace per verified person, so each
 caller sees only their own keys.
 
     wires call kv -- set greeting <<< 'hello'   # the value is stdin
     wires call kv -- get greeting               # hello
     wires call kv -- keys                       # greeting
+    wires call kv -- whoami                     # alice@example.com, then the ID token unsigned
     wires call kv -- throw                      # raises: exit 1, its text on stderr
 
-Run it from a joined node's keystore, trusting one IdP:
+Run it from the keystore of a node that ran `wires join <network>` (the admin
+names it as kv's host), trusting one IdP:
 
     ./.scripts/build-python.sh
     PYTHONPATH=target/python python3 bindings/python/examples/kv.py \\
         <WIRES_HOME> <issuer> <audience> [--push-to ROLE] [--loopback]
 
 With --push-to, a `set` also pushes "kv: <key> set" to the caller's
-`wires inbox` (members of ROLE may receive pushes). With --loopback, the
+`wires inbox` (people in ROLE may receive pushes). With --loopback, the
 host takes direct connections only from this machine (others come through
 its relay), so the macOS firewall doesn't prompt for Python.
 
@@ -72,11 +74,20 @@ class Kv(wires.Service):
                     keys = sorted(self._people.get(me, {}))
                 call.write_stdout("".join(f"{k}\n" for k in keys).encode())
                 return 0
+            case ["whoami"]:
+                # Who the host verified, and the ID token it verified: a
+                # service would hand the token on (say, to a token exchange).
+                # This one echoes it without its signature, which leaves no
+                # credential, only the claims.
+                unsigned = call.id_token().rsplit(".", 1)[0]
+                name = person.email or f"{person.subject} at {person.issuer}"
+                call.write_stdout(f"{name}\n{unsigned}\n".encode())
+                return 0
             case ["throw"]:
                 # An uncaught exception: the call exits 1 with its text.
                 raise RuntimeError("kv: thrown on request")
             case _:
-                call.write_stderr(b"usage: kv set KEY (value on stdin) | get KEY | keys | throw\n")
+                call.write_stderr(b"usage: kv set KEY (value on stdin) | get KEY | keys | whoami | throw\n")
                 return 2
 
 
@@ -85,7 +96,7 @@ def main() -> int:
     parser.add_argument("home", help="a joined node's keystore (WIRES_HOME)")
     parser.add_argument("issuer", help="the IdP whose ID tokens to trust")
     parser.add_argument("audience", help="the OAuth client id tokens are issued to")
-    parser.add_argument("--push-to", metavar="ROLE", help="let `set` push to members of ROLE")
+    parser.add_argument("--push-to", metavar="ROLE", help="let `set` push to people in ROLE")
     parser.add_argument("--loopback", action="store_true", help="direct connections from this machine only")
     args = parser.parse_args()
     push_to = args.push_to

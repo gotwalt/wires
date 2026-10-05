@@ -1,8 +1,8 @@
 //! Policy items: what the root-signed policy is made of (card 36).
 //!
 //! The policy is a [head](crate::PolicyHead) over a sorted list of
-//! [`Item`]s, one per role, service, ban, trusted issuer, and one for the
-//! fabric's settings. Each item is addressed by its [`ItemKey`] (kind, then
+//! [`Item`]s, one per role, service, banned node, banned person, trusted
+//! issuer, and one for the network's settings. Each item is addressed by its [`ItemKey`] (kind, then
 //! key), which is also the order the items are hashed in.
 //!
 //! The head signs an [`ItemsHash`](crate::ItemsHash) of the whole list. A
@@ -11,11 +11,15 @@
 //! signed body, items have no optional fields and refuse unknown ones.
 //!
 //! ```
-//! use library::{Ban, Item, ItemKey, NodeIdentity};
+//! use library::{Issuer, Item, ItemKey, NodeIdentity, Person};
 //! let node = NodeIdentity::from_seed([2u8; 32]).node_id();
-//! let ban = Item::Ban { key: node, body: Ban { until: 1_000 } };
+//! let ban = Item::Ban { key: node };
 //! assert_eq!(ban.key(), ItemKey::Ban(node));
-//! assert!(ItemKey::Ban(node) < ItemKey::Settings, "sorted by kind, then key");
+//! let eve = Person::new(Issuer::new("https://accounts.google.com"), "Eve@Example.com");
+//! assert_eq!(eve.email(), "eve@example.com", "stored lowercase");
+//! let removed = Item::PersonBan { key: eve.clone() };
+//! assert_eq!(removed.key(), ItemKey::PersonBan(eve.clone()));
+//! assert!(ItemKey::Ban(node) < ItemKey::PersonBan(eve), "sorted by kind, then key");
 //! ```
 
 use std::fmt;
@@ -24,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::entry::SignedEntry;
 use crate::identity::NodeId;
-use crate::idp::{Audience, Issuer};
+use crate::idp::{Audience, Issuer, Principal};
 use crate::registry::ServiceName;
 use crate::role::{Matcher, RoleName};
 
@@ -46,11 +50,13 @@ pub enum ItemKey {
     Role(RoleName),
     /// A service, by name.
     Service(ServiceName),
-    /// A ban, by the banned node.
+    /// A banned node, by its id.
     Ban(NodeId),
+    /// A banned person, by issuer and email.
+    PersonBan(Person),
     /// A trusted IdP, by its issuer identifier.
     Issuer(Issuer),
-    /// The fabric's one settings item.
+    /// The network's one settings item.
     Settings,
 }
 
@@ -61,38 +67,76 @@ impl fmt::Display for ItemKey {
             ItemKey::Role(r) => write!(f, "role:{r}"),
             ItemKey::Service(s) => write!(f, "service:{s}"),
             ItemKey::Ban(n) => write!(f, "ban:{}", n.hex()),
+            ItemKey::PersonBan(p) => write!(f, "person_ban:{p}"),
             ItemKey::Issuer(i) => write!(f, "issuer:{i}"),
             ItemKey::Settings => f.write_str("settings"),
         }
     }
 }
 
-/// A ban: node `key` is refused everywhere until `until` (inclusive, unix
-/// seconds), the not-after of the badge it cancels (card 35), so a ban never
-/// outlives what it cancels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A person, as a person ban names them: the exact issuer, and the email
+/// that issuer verified, stored lowercase. Ordered by issuer, then email.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Ban {
-    /// The ban holds while `now <= until`.
-    pub until: i64,
+pub struct Person {
+    /// The exact `iss` of the IdP that verifies them.
+    pub issuer: Issuer,
+    /// Their email, lowercase.
+    pub email: String,
 }
 
-impl Ban {
-    /// Whether the ban still holds at `now` (`now <= until`).
+impl Person {
+    /// The person `issuer` verifies as `email` (trimmed and lowercased here,
+    /// so a ban matches whatever case the IdP reports).
+    pub fn new(issuer: Issuer, email: &str) -> Person {
+        Person {
+            issuer,
+            email: email.trim().to_ascii_lowercase(),
+        }
+    }
+
+    /// Their email, lowercase.
+    pub fn email(&self) -> &str {
+        &self.email
+    }
+
+    /// Whether `principal` is this person: the same issuer, exactly, and a
+    /// **verified** email equal to this one, ignoring ASCII case. A
+    /// principal with no verified email is nobody's.
     ///
     /// ```
-    /// let ban = library::Ban { until: 100 };
-    /// assert!(ban.holds(100));
-    /// assert!(!ban.holds(101));
+    /// use library::{Issuer, Person, Principal};
+    /// let eve = Person::new(Issuer::new("https://idp"), "eve@example.com");
+    /// let mut p = Principal {
+    ///     issuer: "https://idp".into(), subject: "1".into(),
+    ///     email: Some("EVE@example.com".into()), org: None, groups: vec![], not_after: 0,
+    /// };
+    /// assert!(eve.matches(&p));
+    /// p.issuer = "https://other".into();
+    /// assert!(!eve.matches(&p), "another issuer's eve is someone else");
+    /// p.issuer = "https://idp".into();
+    /// p.email = None;
+    /// assert!(!eve.matches(&p));
     /// ```
-    pub fn holds(&self, now: i64) -> bool {
-        now <= self.until
+    pub fn matches(&self, principal: &Principal) -> bool {
+        principal.issuer == self.issuer.as_str()
+            && principal
+                .email
+                .as_deref()
+                .is_some_and(|e| e.eq_ignore_ascii_case(&self.email))
+    }
+}
+
+impl fmt::Display for Person {
+    /// `email (issuer)`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({})", self.email, self.issuer)
     }
 }
 
 /// A trusted IdP (the body of an `issuer` item; the issuer identifier is its
-/// key). Moves what `host.json`'s `identity.issuers` says into signed policy;
-/// a host can still narrow it locally.
+/// key). A host can narrow the trusted IdPs further in `host.json`'s
+/// `identity.issuers`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IssuerConfig {
@@ -119,7 +163,7 @@ pub enum FreshnessMode {
     Strict,
 }
 
-/// The fabric-wide settings (the body of the one `settings` item).
+/// The network-wide settings (the body of the one `settings` item).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -161,12 +205,16 @@ pub enum Item {
     },
     /// A service registry entry, signed by the root on its own.
     Service(SignedEntry),
-    /// A removed node.
+    /// A removed node: refused everywhere until the admin restores it.
     Ban {
         /// The banned node.
         key: NodeId,
-        /// Until when.
-        body: Ban,
+    },
+    /// A removed person: refused by every host and every directory from any
+    /// node, until the admin restores them.
+    PersonBan {
+        /// The banned person.
+        key: Person,
     },
     /// A trusted IdP.
     Issuer {
@@ -175,7 +223,7 @@ pub enum Item {
         /// Its client id and accepted audiences.
         body: IssuerConfig,
     },
-    /// The fabric's settings (exactly one per policy).
+    /// The network's settings (exactly one per policy).
     Settings {
         /// The settings.
         body: Settings,
@@ -188,7 +236,8 @@ impl Item {
         match self {
             Item::Role { key, .. } => ItemKey::Role(key.clone()),
             Item::Service(entry) => ItemKey::Service(entry.name.clone()),
-            Item::Ban { key, .. } => ItemKey::Ban(*key),
+            Item::Ban { key } => ItemKey::Ban(*key),
+            Item::PersonBan { key } => ItemKey::PersonBan(key.clone()),
             Item::Issuer { key, .. } => ItemKey::Issuer(key.clone()),
             Item::Settings { .. } => ItemKey::Settings,
         }
@@ -217,6 +266,8 @@ mod tests {
             ItemKey::Role(RoleName::new("b").unwrap()),
             ItemKey::Service(ServiceName::new("a").unwrap()),
             ItemKey::Ban(node(1)),
+            ItemKey::PersonBan(Person::new(Issuer::new("https://a"), "a@x.com")),
+            ItemKey::PersonBan(Person::new(Issuer::new("https://a"), "b@x.com")),
             ItemKey::Issuer(Issuer::new("https://a")),
             ItemKey::Settings,
         ];
@@ -242,16 +293,17 @@ mod tests {
 
     #[test]
     fn known_encodings() {
-        let ban = Item::Ban {
-            key: node(1),
-            body: Ban { until: 5 },
-        };
+        let ban = Item::Ban { key: node(1) };
         assert_eq!(
             json(&ban),
-            format!(
-                r#"{{"body":{{"until":5}},"key":"{}","kind":"ban"}}"#,
-                node(1).hex()
-            )
+            format!(r#"{{"key":"{}","kind":"ban"}}"#, node(1).hex())
+        );
+        let person = Item::PersonBan {
+            key: Person::new(Issuer::new("https://idp"), "Eve@X.com"),
+        };
+        assert_eq!(
+            json(&person),
+            r#"{"key":{"email":"eve@x.com","issuer":"https://idp"},"kind":"person_ban"}"#
         );
         let settings = Item::Settings {
             body: Settings::default(),
@@ -292,7 +344,6 @@ mod tests {
                     description: String::new(),
                     allow: vec![],
                     hosts: vec![],
-                    readers: vec![],
                 },
             )
             .unwrap(),
@@ -331,11 +382,16 @@ mod tests {
 
     #[test]
     fn unknown_fields_and_kinds_are_refused() {
+        // The well-formed ban parses, so its variant with a body fails on the body.
+        let ban = format!(r#"{{"kind":"ban","key":"{}"}}"#, node(1).hex());
+        assert!(serde_json::from_str::<Item>(&ban).is_ok());
+        let ban_with_body = format!(r#"{{"kind":"ban","key":"{}","body":{{}}}}"#, node(1).hex());
         for bad in [
-            r#"{"kind":"ban","key":"00","body":{"until":1}}"#,
+            ban_with_body.as_str(),
+            r#"{"kind":"person_ban","key":{"issuer":"https://i","email":"e@x.com","x":1}}"#,
             r#"{"kind":"settings","body":{"beat_secs":1,"fresh_secs":1,"freshness":"lenient","x":1}}"#,
             r#"{"kind":"settings","key":"k","body":{"beat_secs":1,"fresh_secs":1,"freshness":"lenient"}}"#,
-            r#"{"kind":"member","key":"x","body":{}}"#,
+            r#"{"kind":"nonsense","key":"x","body":{}}"#,
             r#"{"kind":"settings","body":{"beat_secs":1,"fresh_secs":1,"freshness":"sloppy"}}"#,
         ] {
             assert!(serde_json::from_str::<Item>(bad).is_err(), "{bad}");
@@ -350,19 +406,12 @@ mod tests {
         assert_eq!(s.fresh_secs, DEFAULT_FRESH_SECS);
     }
 
-    #[test]
-    fn a_ban_holds_through_until() {
-        let b = Ban { until: 100 };
-        assert!(b.holds(99));
-        assert!(b.holds(100));
-        assert!(!b.holds(101));
-    }
-
     proptest! {
         #[test]
-        fn items_round_trip(seed in any::<u8>(), until in any::<i64>(), strict in any::<bool>()) {
+        fn items_round_trip(seed in any::<u8>(), email in "[a-z]{1,8}@[a-z]{1,8}[.]com", strict in any::<bool>()) {
             let items = [
-                Item::Ban { key: node(seed), body: Ban { until } },
+                Item::Ban { key: node(seed) },
+                Item::PersonBan { key: Person::new(Issuer::new("https://idp"), &email) },
                 Item::Settings {
                     body: Settings {
                         freshness: if strict { FreshnessMode::Strict } else { FreshnessMode::Lenient },
@@ -378,7 +427,8 @@ mod tests {
 
         #[test]
         fn key_round_trips(seed in any::<u8>()) {
-            for key in [ItemKey::Ban(node(seed)), ItemKey::Settings] {
+            let person = ItemKey::PersonBan(Person::new(Issuer::new("https://idp"), "e@x.com"));
+            for key in [ItemKey::Ban(node(seed)), person, ItemKey::Settings] {
                 let back: ItemKey = serde_json::from_str(&serde_json::to_string(&key).unwrap()).unwrap();
                 prop_assert_eq!(back, key);
             }

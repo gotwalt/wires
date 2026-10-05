@@ -5,21 +5,21 @@
 //! `$XDG_CONFIG_HOME/wires`, else `~/.config/wires`:
 //!
 //! - `node.seed` / `root.seed`: hex-encoded 32-byte Ed25519 seeds (mode `0600`).
-//! - `membership.json`: the dialer's membership token (mode `0644` — a
-//!   *public* signed credential, not a secret).
-//! - `issued.json`: the admin's ledger of the badges it minted, with their
-//!   labels (mode `0600`; [`super::ledger`]).
+//! - `network.json`: the network string `wires join` or `wires login`
+//!   stored ([`Keystore::read_network`]): the root key, the first
+//!   directories, the login settings.
+//! - `labels.json`: the admin's labels for nodes ([`super::labels`]).
 //! - `policy.json`: the admin-signed policy ([`crate::policy::store`]);
 //!   `directory.redb` on a directory node ([`crate::directory::db`]).
 //!
-//! The resolver helpers ([`node_identity`], [`membership`])
-//! encode the precedence the CLI uses: an inline flag wins, then the matching
-//! environment variable, then an explicit `--…-file` path, then the keystore.
+//! The resolver helper [`node_identity`] encodes the precedence the CLI
+//! uses: an inline flag wins, then the matching environment variable, then
+//! an explicit `--…-file` path, then the keystore.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use library::{Membership, NodeId, NodeIdentity};
+use library::{Network, NodeId, NodeIdentity};
 use zeroize::Zeroizing;
 
 /// Resolve the wires home directory (does not create it).
@@ -87,28 +87,41 @@ impl Keystore {
         Ok(path)
     }
 
-    /// Read `membership.json` as a [`Membership`]; `None` if the file is absent.
-    pub fn read_membership(&self) -> Result<Option<Membership>> {
-        let path = self.path("membership.json");
+    /// Read `network.json` (the network string `join` or `login` stored);
+    /// `None` before either ran.
+    pub fn read_network(&self) -> Result<Option<Network>> {
+        let path = self.path(NETWORK_FILE);
         match read_to_string_opt(&path)? {
             Some(text) => Ok(Some(
-                Membership::decode(text.trim())
+                Network::decode(text.trim())
                     .with_context(|| format!("parsing {}", path.display()))?,
             )),
             None => Ok(None),
         }
     }
 
-    /// Persist `membership` to `membership.json` as its base64 token (mode
-    /// `0644` — a membership is a *public* signed credential, not a secret).
+    /// Persist `network` to `network.json` as its string (mode `0600`).
     /// Returns the written path.
-    pub fn save_membership(&self, membership: &Membership) -> Result<PathBuf> {
+    pub fn save_network(&self, network: &Network) -> Result<PathBuf> {
         create_private_dir(&self.dir)?;
-        let path = self.path("membership.json");
-        write_text_mode(&path, &membership.encode()?, Some(0o644))?;
+        let path = self.path(NETWORK_FILE);
+        write_private(&path, format!("{}\n", network.encode()?))?;
         Ok(path)
     }
+
+    /// The network this keystore is in, by its root key: the admin's own
+    /// (`root.seed`), else the one `network.json` names; `None` before
+    /// `init`, `join` or `login`.
+    pub fn network_root(&self) -> Result<Option<NodeId>> {
+        if let Some(root) = self.read_root_identity()? {
+            return Ok(Some(root.node_id()));
+        }
+        Ok(self.read_network()?.map(|n| n.root))
+    }
 }
+
+/// The file `join` and `login` store the network string in.
+pub(crate) const NETWORK_FILE: &str = "network.json";
 
 /// Resolve a node identity for `serve` / `call`: an inline `--node-seed`
 /// wins, then `$WIRES_NODE_SEED`, then an explicit `--node-seed-file`, then
@@ -130,8 +143,8 @@ pub fn node_identity(inline: Option<&str>, file: Option<&Path>) -> Result<NodeId
     let ks = Keystore::resolve()?;
     ks.read_node_identity()?.ok_or_else(|| {
         anyhow!(
-            "no node key at {}: run `wires id`, send the id to your admin, then `wires join \
-             <token>` with the token they send",
+            "no node key at {}: run `wires login <network>` (a caller) or `wires join \
+             <network>` (a host or directory) with the network string from your admin",
             ks.path("node.seed").display()
         )
     })
@@ -150,41 +163,12 @@ pub fn node_identity_in(ks: &Keystore) -> Result<NodeIdentity> {
     }
     ks.read_node_identity()?.ok_or_else(|| {
         anyhow!(
-            "no node key at {}: run `wires id`, send the id to your admin, then `wires join \
-             <token>` with the token they send",
+            "no node key at {}: a caller runs `wires login <network>`, a host or directory \
+             `wires join <network>`, with the string your admin prints with `wires network` \
+             (`wires id` makes the key alone)",
             ks.path("node.seed").display()
         )
     })
-}
-
-/// Resolve the dialer's membership for `call`: an inline `--membership`
-/// token wins, then `$WIRES_MEMBERSHIP`, then an explicit `--membership-file`,
-/// then the keystore (`membership.json`). Errors if none is found.
-pub fn membership(inline: Option<&str>, file: Option<&Path>) -> Result<Membership> {
-    if let Some(token) = inline {
-        return Membership::decode(token).context("--membership");
-    }
-    if let Some(token) = std::env::var("WIRES_MEMBERSHIP")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        return Membership::decode(&token).context("$WIRES_MEMBERSHIP");
-    }
-    if let Some(path) = file {
-        let text = read_to_string_opt(path)?
-            .ok_or_else(|| anyhow!("membership file not found: {}", path.display()))?;
-        return Membership::decode(text.trim())
-            .with_context(|| format!("parsing {}", path.display()));
-    }
-    let ks = Keystore::resolve()?;
-    if let Some(m) = ks.read_membership()? {
-        return Ok(m);
-    }
-    bail!(
-        "this node has not joined a network (no {}): run `wires join <token>` with the token \
-         your admin sent",
-        ks.path("membership.json").display()
-    );
 }
 
 /// Read a seed file into an identity, erroring if absent.
@@ -233,7 +217,7 @@ fn read_to_string_opt(path: &Path) -> Result<Option<String>> {
 }
 
 /// Create `dir` (and its parents) if missing, the new directories mode
-/// `0700`: the keystore holds seeds and the state.
+/// `0700`: the keystore holds seeds and the signed policy.
 pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -290,9 +274,9 @@ fn write_secret(path: &Path, contents: &str) -> Result<()> {
 /// previous contents or the new ones and never a splice of the two. The
 /// temporary file is created with `O_EXCL` (never following a planted file or
 /// symlink) and mode `0600` **from the start**, so no one else can open it
-/// while it is written; it is widened to `mode` (e.g. `0644` for a public
-/// membership) only after the write. With no `mode` it stays `0600`.
-pub(crate) fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) -> Result<()> {
+/// while it is written, and the file keeps that mode (protocol.md §8: every
+/// keystore file is `0600`).
+pub(crate) fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
     use std::io::Write;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
@@ -317,12 +301,9 @@ pub(crate) fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) ->
         let mut f = opts
             .open(&tmp)
             .with_context(|| format!("creating {}", tmp.display()))?;
-        f.write_all(contents.as_bytes())
+        f.write_all(contents.as_ref())
             .with_context(|| format!("writing {}", tmp.display()))?;
         drop(f);
-        if let Some(mode) = mode {
-            set_mode(&tmp, mode);
-        }
         std::fs::rename(&tmp, path)
             .with_context(|| format!("renaming {} onto {}", tmp.display(), path.display()))
     })();
@@ -332,34 +313,19 @@ pub(crate) fn write_text_mode(path: &Path, contents: &str, mode: Option<u32>) ->
     result
 }
 
-/// Set a file's unix mode (best-effort; no-op on non-unix).
-fn set_mode(path: &Path, mode: u32) {
+/// Open `path` for writing, creating it mode `0600` if missing and never
+/// truncating it: a lock file, or a store that manages its own contents
+/// (`policy.json.lock`, `directory.redb`).
+pub(crate) fn open_private(path: &Path) -> Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).ok();
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-    }
-}
-
-/// Local consistency check run before dialing: the membership must name
-/// *this* keystore's node.
-///
-/// Catches a membership copied to the wrong machine without a network
-/// round-trip, so it never masquerades as a refusal by the host.
-pub(crate) fn preflight(node: NodeId, membership: &Membership) -> Result<()> {
-    if membership.member != node {
-        bail!(
-            "this membership was issued to node {}, but this keystore's node is {} — import \
-             the invite minted for this node (`wires join <token>`)",
-            membership.member.hex(),
-            node.hex()
-        );
-    }
-    Ok(())
+    opts.open(path)
+        .with_context(|| format!("opening {}", path.display()))
 }
 
 #[cfg(test)]
@@ -428,23 +394,23 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
-    /// Card 28 §10: a file written through `write_text_mode` is never
-    /// world-readable unless asked (its temporary file is created `0600`),
-    /// and an explicit mode still applies.
+    /// A file written through `write_private` (its temporary file is
+    /// created `0600`) or opened through `open_private` is `0600`, whatever
+    /// the umask.
     #[cfg(unix)]
     #[test]
-    fn text_files_are_private_unless_widened() {
+    fn keystore_files_are_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let private = dir.join("last-good.json");
-        write_text_mode(&private, "1\n", None).unwrap();
+        write_private(&private, "1\n").unwrap();
         assert_eq!(mode(&private), 0o600);
-        let public = dir.join("membership.json");
-        write_text_mode(&public, "m\n", Some(0o644)).unwrap();
-        assert_eq!(mode(&public), 0o644);
+        let lock = dir.join("policy.json.lock");
+        open_private(&lock).unwrap();
+        assert_eq!(mode(&lock), 0o600);
         // Overwriting keeps it atomic and leaves no temporary behind.
-        write_text_mode(&private, "2\n", None).unwrap();
+        write_private(&private, "2\n").unwrap();
         assert_eq!(std::fs::read_to_string(&private).unwrap(), "2\n");
         let leftovers = std::fs::read_dir(&dir)
             .unwrap()
@@ -459,40 +425,37 @@ mod tests {
         assert_eq!(leftovers, 0);
     }
 
-    fn fixture_membership() -> Membership {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let member = NodeIdentity::from_seed([2u8; 32]).node_id();
-        Membership::mint(&root, member, 0, i64::MAX).unwrap()
+    fn network() -> Network {
+        Network::new(
+            NodeIdentity::from_seed([1u8; 32]).node_id(),
+            vec![NodeIdentity::from_seed([2u8; 32]).node_id()],
+            library::LoginSettings {
+                issuer: library::Issuer::new("https://idp"),
+                client_id: library::Audience::new("cli"),
+                public_client_secret: None,
+            },
+        )
     }
 
     #[test]
-    fn membership_round_trips_and_is_none_when_absent() {
+    fn the_network_string_round_trips_and_names_the_root() {
         let ks = Keystore::at(temp_dir());
-        assert!(ks.read_membership().unwrap().is_none());
-        let m = fixture_membership();
-        ks.save_membership(&m).unwrap();
-        assert_eq!(ks.read_membership().unwrap().unwrap(), m);
+        assert!(ks.read_network().unwrap().is_none());
+        assert!(ks.network_root().unwrap().is_none());
+        ks.save_network(&network()).unwrap();
+        assert_eq!(ks.read_network().unwrap(), Some(network()));
+        assert_eq!(ks.network_root().unwrap(), Some(network().root));
+        // The admin's root key names its network, whatever else is there.
+        let root = NodeIdentity::from_seed([7u8; 32]);
+        ks.save_root(&root).unwrap();
+        assert_eq!(ks.network_root().unwrap(), Some(root.node_id()));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn membership_file_is_0644() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_damaged_network_file_is_an_error() {
         let ks = Keystore::at(temp_dir());
-        let path = ks.save_membership(&fixture_membership()).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o644);
-    }
-
-    #[test]
-    fn membership_resolver_prefers_inline_then_file() {
-        let m = fixture_membership();
-        // Inline token wins, touching no filesystem.
-        assert_eq!(membership(Some(&m.encode().unwrap()), None).unwrap(), m);
-        // Else an explicit file is decoded.
-        let path = temp_dir().join("membership.json");
-        write_text_mode(&path, &m.encode().unwrap(), None).unwrap();
-        assert_eq!(membership(None, Some(&path)).unwrap(), m);
+        std::fs::write(ks.path(NETWORK_FILE), "not a token\n").unwrap();
+        assert!(ks.read_network().is_err());
     }
 
     #[test]
@@ -512,26 +475,5 @@ mod tests {
         let id = NodeIdentity::from_seed([11u8; 32]);
         ks.save_node(&id).unwrap();
         assert_eq!(node_identity_in(&ks).unwrap().node_id(), id.node_id());
-    }
-
-    #[test]
-    fn preflight_accepts_credentials_issued_to_this_node() {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let me = NodeIdentity::from_seed([2u8; 32]).node_id();
-        let membership = Membership::mint(&root, me, 0, i64::MAX).unwrap();
-        preflight(me, &membership).unwrap();
-    }
-
-    #[test]
-    fn preflight_rejects_a_membership_for_another_node() {
-        let root = NodeIdentity::from_seed([1u8; 32]);
-        let me = NodeIdentity::from_seed([2u8; 32]).node_id();
-        let other = NodeIdentity::from_seed([3u8; 32]).node_id();
-        let membership = Membership::mint(&root, other, 0, i64::MAX).unwrap();
-        let msg = preflight(me, &membership).unwrap_err().to_string();
-        assert!(
-            msg.contains(&other.hex()) && msg.contains(&me.hex()),
-            "{msg}"
-        );
     }
 }

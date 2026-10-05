@@ -7,8 +7,9 @@
 //! - **fetched** by `wires inbox`: a bounded catch-up from every host of the
 //!   services in this node's view (card 37), after which the host forgets
 //!   what was acknowledged. The fetch presents this node's ID token (`wires
-//!   login`), which is how a host learns who it is for pushes addressed to a
-//!   role;
+//!   login`): the host admits a fetch only as it admits a call (a role
+//!   must match the person), and learns from it who the pushes addressed
+//!   to a role are for;
 //! - **pushed** while `wires inbox --wait` runs: it serves the inbox ALPN
 //!   ([`INBOX_ALPN`]) and accepts deliveries ([`InboxReceiver`]) only from
 //!   the hosts its view names, besides long-polling each host. It follows
@@ -50,7 +51,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use iroh::{Endpoint, EndpointAddr};
-use library::{INBOX_ALPN, InboxFrame, MAX_BATCH, Membership, NodeId, PushId, PushMessage};
+use library::{INBOX_ALPN, IdToken, InboxFrame, MAX_BATCH, NodeId, PushId, PushMessage};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -185,9 +186,8 @@ impl Mailbox {
         let dir = home.join(INBOX_DIR);
         for sub in ["", "new", "read", "notes"] {
             let d = dir.join(sub);
-            std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
+            keystore::create_private_dir(&d)?;
         }
-        private(&dir);
         Ok(Self { dir })
     }
 
@@ -215,7 +215,7 @@ impl Mailbox {
                 continue;
             }
             let path = Self::file(&self.new_dir(), &m.id);
-            write_atomic(&path, &serde_json::to_vec(m)?)?;
+            keystore::write_private(&path, serde_json::to_vec(m)?)?;
             out.fresh += 1;
         }
         if out.fresh > 0 {
@@ -242,7 +242,7 @@ impl Mailbox {
                     now_ms(),
                     PushId::generate().hex()
                 ));
-                write_atomic(&path, note.as_bytes())?;
+                keystore::write_private(&path, note)?;
             }
         }
         Ok(out)
@@ -339,23 +339,15 @@ pub(crate) fn evictions(unread: &[(i64, PushId)], cap: usize) -> Vec<PushId> {
         .collect()
 }
 
-/// Write `bytes` to `path` via a temp file and a rename.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
-}
-
-/// Best-effort `0700`.
-fn private(dir: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    }
-    #[cfg(not(unix))]
-    let _ = dir;
+/// When a directory refused this node admission and it holds no view, there
+/// is no host to ask: what the person can act on (`wires inbox` exits 1, as
+/// `wires services` does). With a view held, the hosts are asked (and
+/// refuse with 77).
+fn not_admitted_without_view(e: &anyhow::Error, holds_view: bool, ks: &Keystore) -> Option<String> {
+    (!holds_view
+        && e.downcast_ref::<crate::caller::view::NotAdmitted>()
+            .is_some())
+    .then(|| crate::caller::hello::explain_not_admitted_in(ks))
 }
 
 /// Keep only messages a peer may hand this node: from `peer` (the key the
@@ -458,16 +450,17 @@ static STRANGERS: transport::Throttle = transport::Throttle::new();
 
 /// The inbox ALPN on a waiting caller: accepts deliveries from hosts.
 ///
-/// A delivery is accepted only from a peer whose badge proves it is in this
-/// network and that **this node's view names as a host** of one of its
-/// services (card 37; re-read per delivery, and kept current by the
-/// `--wait` subscription). Each message must be from that peer and to this
-/// node.
+/// A delivery is accepted only from a peer that **this node's view names as
+/// a host** of one of its services (card 37: the view's entries are
+/// root-signed, and iroh authenticated the peer's key; re-read per
+/// delivery, and kept current by the `--wait` subscription). A host
+/// presents no credential of its own. Each message must be from that peer
+/// and to this node.
 #[derive(Clone)]
 pub(crate) struct InboxReceiver {
     /// This node.
     pub(crate) me: NodeId,
-    /// The fabric root memberships and the view must chain to.
+    /// The network root the view verifies under.
     pub(crate) fabric: NodeId,
     /// Where this node's view is.
     pub(crate) keystore: Arc<Keystore>,
@@ -484,18 +477,10 @@ impl std::fmt::Debug for InboxReceiver {
 }
 
 impl InboxReceiver {
-    /// Whether `peer` may deliver here: its badge verifies, and it hosts a
-    /// service in this node's view. `Err` is why not, for this node's trace
-    /// only: the peer hears just
-    /// [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED).
-    pub(crate) fn admit(
-        &self,
-        peer: NodeId,
-        membership: &Membership,
-        now: i64,
-    ) -> std::result::Result<(), String> {
-        library::check_inclusion(membership, self.fabric, peer, now)
-            .map_err(|e| format!("membership rejected: {e}"))?;
+    /// Whether `peer` may deliver here: it hosts a service in this node's
+    /// view. `Err` is why not, for this node's trace only: the peer hears
+    /// just [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED).
+    pub(crate) fn admit(&self, peer: NodeId) -> std::result::Result<(), String> {
         let held = crate::caller::view::read(&self.keystore, self.fabric)
             .map_err(|e| format!("{e:#}"))?
             .ok_or("this node holds no view")?;
@@ -503,7 +488,7 @@ impl InboxReceiver {
             .view
             .entries
             .iter()
-            .any(|e| e.entry.service.hosts.contains(&peer));
+            .any(|e| e.service.hosts.contains(&peer));
         if !hosts_one {
             return Err(format!(
                 "not a host of any service in this node's view (policy version {}); this inbox \
@@ -520,15 +505,14 @@ impl InboxReceiver {
         S: AsyncWrite + Unpin,
         R: AsyncRead + Unpin,
     {
-        let membership =
-            match read_frame_within(&mut recv, FRAME_TIMEOUT, library::MAX_INBOX_HELLO).await? {
-                Some(InboxFrame::Hello { membership, .. }) => membership,
-                _ => {
-                    deny(&mut send, "expected hello").await;
-                    bail!("a peer spoke out of turn");
-                }
-            };
-        if let Err(detail) = self.admit(peer, &membership, crate::clock::now_unix()) {
+        match read_frame_within(&mut recv, FRAME_TIMEOUT, library::MAX_INBOX_HELLO).await? {
+            Some(InboxFrame::Hello { .. }) => {}
+            _ => {
+                deny(&mut send, "expected hello").await;
+                bail!("a peer spoke out of turn");
+            }
+        }
+        if let Err(detail) = self.admit(peer) {
             STRANGERS.refused("inbox delivery", peer, &detail);
             deny(&mut send, crate::host::gate::NOT_ADMITTED).await;
             return Ok(());
@@ -637,12 +621,12 @@ pub(crate) async fn fetch_from(
     }
 }
 
-/// The `Hello` this node presents: its membership and the ID token `wires
-/// login` stored (so the host learns who it is, for pushes by role).
-pub(crate) fn hello(ks: &Keystore, membership: &Membership) -> InboxFrame {
+/// The `Hello` this node presents: the ID token `wires login` stored, which
+/// is what admits the fetch (and tells the host who it is, for pushes by
+/// role).
+pub(crate) fn hello(token: IdToken) -> InboxFrame {
     InboxFrame::Hello {
-        membership: membership.clone(),
-        id_token: crate::caller::hello::stored_token(ks),
+        id_token: Some(token),
     }
 }
 
@@ -721,19 +705,33 @@ pub(crate) async fn inbox_cmd(a: InboxArgs) -> Result<i32> {
     }
     let c = &a.creds;
     let node = keystore::node_identity(c.node_seed.as_deref(), c.node_seed_file.as_deref())?;
-    let membership = keystore::membership(c.membership.as_deref(), c.membership_file.as_deref())?;
-    keystore::preflight(node.node_id(), &membership).map_err(anyhow::Error::msg)?;
     let ks = Arc::new(Keystore::resolve()?);
+    let root = ks.network_root()?.context(crate::help::NOT_JOINED)?;
+    let token = crate::caller::hello::stored_token(&ks)
+        .ok_or_else(|| anyhow::anyhow!(crate::help::NOT_SIGNED_IN))?;
+    // The hosts asked are the view's: refreshed first when it is stale, as
+    // `wires call` does; with no directory answering, the view as it is.
+    if let Err(e) = crate::caller::view::usable(&ks, &node, root, c.relay_url.as_deref()).await {
+        let holds_view = crate::caller::view::read(&ks, root)
+            .ok()
+            .flatten()
+            .is_some();
+        if let Some(said) = not_admitted_without_view(&e, holds_view, &ks) {
+            eprintln!("wires: {said}");
+            return Ok(1);
+        }
+        eprintln!("wires inbox: {}", crate::help::brief(&e));
+    }
     let mailbox = Mailbox::open(&keystore::home()?)?;
     let deadline = a
         .timeout
         .map(|t| tokio::time::Instant::now() + t.duration());
     let fetcher = Fetcher {
         endpoint: transport::bind(&node, c.relay_url.as_deref()).await?,
-        hello: hello(&ks, &membership),
+        hello: hello(token),
         ks: Arc::clone(&ks),
         me: node.node_id(),
-        fabric: membership.fabric,
+        fabric: root,
         relay: c.relay_url.clone(),
     };
     // Card 37: while waiting, follow the view (so the hosts asked and the
@@ -743,11 +741,9 @@ pub(crate) async fn inbox_cmd(a: InboxArgs) -> Result<i32> {
         let token_ks = Arc::clone(&ks);
         crate::caller::view::follow(crate::caller::view::Follow {
             endpoint: fetcher.endpoint.clone(),
-            badge: membership.clone(),
+            root,
             id_token: Arc::new(move || crate::caller::hello::stored_token(&token_ks)),
-            initial: crate::caller::view::read(&ks, membership.fabric)
-                .ok()
-                .flatten(),
+            initial: crate::caller::view::read(&ks, root).ok().flatten(),
             fallback: crate::caller::view::joined_directories(&ks),
             persist: Some(Arc::clone(&ks)),
         })
@@ -758,7 +754,7 @@ pub(crate) async fn inbox_cmd(a: InboxArgs) -> Result<i32> {
                 INBOX_ALPN,
                 InboxReceiver {
                     me: node.node_id(),
-                    fabric: membership.fabric,
+                    fabric: root,
                     keystore: Arc::clone(&ks),
                     mailbox: mailbox.clone(),
                 },
@@ -784,7 +780,7 @@ struct Fetcher {
     ks: Arc<Keystore>,
     /// This node.
     me: NodeId,
-    /// The fabric root the view verifies under.
+    /// The network root the view verifies under.
     fabric: NodeId,
     /// The relay to dial through, if any.
     relay: Option<String>,
@@ -793,17 +789,18 @@ struct Fetcher {
 impl Fetcher {
     /// The hosts of every service in the view (read now: a `--wait`
     /// subscription keeps it current), never this node, as dial targets.
+    /// None from an expired view.
     fn targets(&self) -> Vec<(NodeId, EndpointAddr)> {
+        let now = crate::clock::now_unix();
         let held = match crate::caller::view::read(&self.ks, self.fabric) {
-            Ok(Some(held)) => held,
-            Ok(None) => return Vec::new(),
+            Ok(Some(held)) if held.view.head.check_fresh(now).is_ok() => held,
+            Ok(_) => return Vec::new(),
             Err(e) => {
                 tracing::warn!("the stored view is unusable: {e:#}");
                 return Vec::new();
             }
         };
-        let names: Vec<&library::ServiceName> =
-            held.view.entries.iter().map(|e| &e.entry.name).collect();
+        let names: Vec<&library::ServiceName> = held.view.entries.iter().map(|e| &e.name).collect();
         let hosts: Vec<NodeId> = crate::caller::pick::hosts_of(&held.view, names)
             .into_iter()
             .filter(|h| *h != self.me)
@@ -846,10 +843,11 @@ async fn read_loop(
             {
                 match fetched {
                     Fetched::Refused(reason) => {
+                        let said = crate::caller::hello::say_refusal(&fetcher.ks, &reason);
                         eprintln!(
-                            "wires inbox: host {} refused: {reason}{}",
+                            "wires inbox: host {} refused: {said}{}",
                             host.short(),
-                            crate::help::refusal_step(&reason)
+                            crate::help::refusal_step(&said)
                         );
                         refusals.push(reason);
                     }
@@ -905,9 +903,23 @@ mod tests {
     fn the_help_names_every_exit_code() {
         let help = crate::help::INBOX_AFTER;
         assert!(help.contains("Exit: 0 "), "{help}");
-        for code in [EXIT_TIMEOUT, crate::EXIT_DENIED] {
+        for code in [1, EXIT_TIMEOUT, crate::EXIT_DENIED] {
             assert!(help.contains(&format!("{code}:")), "{code} missing: {help}");
         }
+    }
+
+    /// Not admitted and holding no view: exit 1 with what the person can
+    /// act on. Holding one, or any other failure: go on to the hosts.
+    #[test]
+    fn not_admitted_with_no_view_is_an_error() {
+        let ks = Keystore::at(crate::testutil::temp_dir());
+        let refused = anyhow::anyhow!("no directory gave this node its view")
+            .context(crate::caller::view::NotAdmitted);
+        let said = not_admitted_without_view(&refused, false, &ks).unwrap();
+        assert!(said.starts_with("not admitted to this network"), "{said}");
+        assert!(not_admitted_without_view(&refused, true, &ks).is_none());
+        let unreachable = anyhow::anyhow!("no directory answered");
+        assert!(not_admitted_without_view(&unreachable, false, &ks).is_none());
     }
 
     fn node(seed: u8) -> NodeId {
@@ -930,16 +942,17 @@ mod tests {
         Mailbox::open(&crate::testutil::temp_dir()).unwrap()
     }
 
-    /// Card 28 §9, card 37: a dialer that may not deliver here (an admitted
-    /// node that hosts none of this caller's services, however many it
-    /// hosts that the caller may not use, or another network's node) hears
-    /// only the fixed "not admitted", no reason and no policy version.
+    /// Card 28 §9, card 37: a dialer that may not deliver here (a node that
+    /// hosts none of this caller's services, however many it hosts that the
+    /// caller may not use, or one the network never heard of) hears only the
+    /// fixed "not admitted", no reason and no policy version, whatever its
+    /// `hello` carries.
     #[tokio::test]
     async fn a_refused_deliverer_hears_only_not_admitted() {
         use library::{RoleName, Service, ServiceName};
         let root = NodeIdentity::from_seed([1; 32]);
-        let (me, member, stranger) = (node(2), NodeIdentity::from_seed([3; 32]), node(4));
-        let banned = node(6);
+        let (me, signed_in, stranger) = (node(2), NodeIdentity::from_seed([3; 32]), node(4));
+        let unseen_host = node(6);
         let home = crate::testutil::temp_dir();
         let ks = Arc::new(Keystore::at(&home));
         let mut s = library::Policy::new(root.node_id());
@@ -960,12 +973,15 @@ mod tests {
             Service {
                 description: String::new(),
                 allow: vec![nobody],
-                hosts: vec![banned],
-                readers: vec![],
+                hosts: vec![unseen_host],
             },
         );
         let signed = crate::testutil::signed_policy(&root, s);
-        let held = crate::caller::view::HeldView::fetched(signed.view_for(None, None), None, 10);
+        let held = crate::caller::view::HeldView::fetched(
+            signed.view_for(crate::testutil::any_node(), None, None),
+            None,
+            10,
+        );
         crate::caller::view::write(&ks, root.node_id(), &held).unwrap();
         let receiver = InboxReceiver {
             me,
@@ -973,32 +989,18 @@ mod tests {
             keystore: ks,
             mailbox: Mailbox::open(&home).unwrap(),
         };
-        let other_root = NodeIdentity::from_seed([5; 32]);
-        for (peer, membership) in [
-            (
-                member.node_id(),
-                Membership::mint(&root, member.node_id(), 0, i64::MAX).unwrap(),
-            ),
-            (
-                stranger,
-                Membership::mint(&other_root, stranger, 0, i64::MAX).unwrap(),
-            ),
-            (
-                banned,
-                Membership::mint(&root, banned, 0, i64::MAX).unwrap(),
-            ),
+        let token = crate::testutil::test_id_token(&signed_in.node_id());
+        for (peer, id_token) in [
+            (signed_in.node_id(), None),
+            (signed_in.node_id(), Some(token)),
+            (stranger, None),
+            (unseen_host, None),
         ] {
             let (mut dialer, host_side) = tokio::io::duplex(64 * 1024);
             let (recv, send) = tokio::io::split(host_side);
-            write_frame(
-                &mut dialer,
-                &InboxFrame::Hello {
-                    membership,
-                    id_token: None,
-                },
-            )
-            .await
-            .unwrap();
+            write_frame(&mut dialer, &InboxFrame::Hello { id_token })
+                .await
+                .unwrap();
             receiver.serve(send, recv, peer).await.unwrap();
             match read_frame(&mut dialer, Duration::from_secs(1))
                 .await
@@ -1065,6 +1067,9 @@ mod tests {
             .collect();
         let s = mb.store(&batch).unwrap();
         assert_eq!(s.evicted, 3);
+        // The mailbox, its folders, messages and note are private (§8).
+        #[cfg(unix)]
+        crate::testutil::assert_private(mb.dir.parent().unwrap());
         let notes = mb.take_notes();
         assert_eq!(notes.len(), 1);
         assert!(

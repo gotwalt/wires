@@ -1,4 +1,4 @@
-Stop trusting an IdP no role names any more, and publish
+Stop trusting an IdP no role or removal names any more, and publish
 
 Usage: wires issuer rm [OPTIONS] <ISSUER>
 

@@ -10,8 +10,10 @@
 #
 #   host   -- `kv.py` or `kv.mts`: the embedded host, implementing kv.
 #   agent  -- alice@example.com (role analyst): calls kv.
-#   other  -- bob@other.example: signed in, but in no role that may call kv.
-#   root   -- the admin: init, role set, invite, service add.
+#   other  -- bob@other.example: signs in at the IdP, but no role matches him,
+#             so he is not in the network.
+#   root   -- the admin: init, role set, directory add, service add, network,
+#             and the first policy push (card 41's first run).
 #
 # The IdP is the hermetic loopback issuer (`wires dev-mock-idp`, only in the
 # `--features dev-mock-idp` build). Addressing is by key; the host writes its
@@ -22,11 +24,12 @@
 # generated from the Rust; alice's set (value on stdin), get and keys
 # round-trip through the handler, state kept between calls; the handler's
 # exit code and stderr are the caller's, and an exception it raises is exit
-# 1 with its message; bob, whose view holds no kv, dials nothing (exit 1);
-# push_to_caller reaches alice's `wires inbox` from the host's verified key;
-# the host's signed log, read by alice's own `wires watch`, shows her calls
-# with her verified email; and SIGTERM makes the example call `stop()`, so
-# `serve()` returns and the process exits 0 on its own.
+# 1 with its message; the handler's call.id_token() (TypeScript:
+# call.idToken()) is the ID token alice presented; bob, whom no role
+# matches, holds no view and dials nothing (exit 1, told he is not in the
+# network); push_to_caller reaches alice's `wires inbox` from the host's
+# verified key; and SIGTERM makes the example call `stop()`, so `serve()`
+# returns and the process exits 0 on its own.
 #
 # Python comes from uv (a uv-managed CPython, $WIRES_PYTHON, default 3.13;
 # uv downloads it on first use); TypeScript runs on Node >= 22.18, which
@@ -96,8 +99,9 @@ wait_for() {
 	done
 	return 1
 }
+# Sign keystore $1 in as $2, joining the network string $3 first.
 login_as() {
-	WIRES_HOME="$1" "$WIRES" login --no-browser >"$D/login.out" 2>"$D/login.err" &
+	WIRES_HOME="$1" "$WIRES" login --no-browser "$3" >"$D/login.out" 2>"$D/login.err" &
 	local pid=$!
 	wait_for "$D/login.err" "sign in at" 100 || bad "login printed no sign-in URL"
 	local url
@@ -121,6 +125,7 @@ if [ "$LANG_" = python ]; then
 	PYTHON_VERSION="${WIRES_PYTHON:-3.13}"
 	PY="$(.scripts/build-python.sh "$D/python")"
 	LANG_NAME=Python
+	ID_TOKEN_FN="call.id_token()"
 else
 	command -v node >/dev/null || bad "node is not on PATH"
 	# The package, installed as `wires` beside a copy of the example.
@@ -134,6 +139,7 @@ else
 		bad "kv.mts does not typecheck against the generated index.d.ts"
 	}
 	LANG_NAME=TypeScript
+	ID_TOKEN_FN="call.idToken()"
 	ok "kv.mts typechecks against the index.d.ts generated from bindings/node/lib.rs"
 fi
 
@@ -154,16 +160,13 @@ CLIENT_ID="$(awk '/^client_id /{print $2}' "$D/idp.out")"
 # The network's first policy trusts the IdP.
 WIRES_HOME="$root" "$WIRES" init --issuer "$ISSUER" --client-id "$CLIENT_ID" --public-client-secret not-so-secret >/dev/null
 HOST_ID="$(WIRES_HOME="$host" "$WIRES" id 2>/dev/null)"
-AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
-OT_ID="$(WIRES_HOME="$other" "$WIRES" id 2>/dev/null)"
 admin() { WIRES_HOME="$root" "$WIRES" "$@"; }
 
-admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1
-admin invite "$HOST_ID" --name nativehost >/dev/null 2>&1
+admin role set analyst '*@example.com' >/dev/null 2>&1
 # The host is also the network's directory (card 37: callers ask one for
-# their view). It isn't up yet, so the edits reach no directory, and a fresh
-# token carries the policy to the host.
-admin directory add nativehost >/dev/null 2>"$D/dir.err" || {
+# their view). It isn't up yet, so the edits reach no directory: it starts
+# empty and takes the admin's first publish.
+admin directory add "nativehost=$HOST_ID" >/dev/null 2>"$D/dir.err" || {
 	dump "$D/dir.err"
 	bad "wires directory add failed"
 }
@@ -172,7 +175,8 @@ admin service add kv --description "A key-value store, one namespace per person 
 	dump "$D/svc.err"
 	bad "wires service add failed"
 }
-WIRES_HOME="$host" "$WIRES" join "$(admin invite "$HOST_ID" --name nativehost 2>/dev/null)" >/dev/null
+NETWORK="$(admin network)"
+WIRES_HOME="$host" "$WIRES" join "$NETWORK" >/dev/null
 
 # --------------------------------------------------------------------------
 # The $LANG_NAME host.
@@ -192,21 +196,22 @@ wait_for "$host/run/hint" " " 300 || {
 }
 grep -qF "kv: serving as $HOST_ID" "$D/host.err" || bad "the $LANG_NAME host is not serving as its node key"
 for h in "$root" "$agent" "$other"; do cp "$host/run/hint" "$h/hints"; done
+# Its directory started empty: the admin's first publish gives it (and the
+# host) the policy that assigns it kv.
+admin policy push >/dev/null 2>"$D/push0.err" || {
+	dump "$D/push0.err"
+	bad "wires policy push failed"
+}
+grep -qF "published to 1 of 1" "$D/push0.err" || {
+	dump "$D/push0.err"
+	bad "the first publish did not reach the host's directory"
+}
 ok "the $LANG_NAME host serves kv as ${HOST_ID:0:8}... (pid $HOST_PID)"
 
-# The callers join. An invite mints a badge and edits nothing, so nothing is
-# published.
-AG_TOKEN="$(admin invite "$AG_ID" --name agent 2>"$D/invite.err")"
-OT_TOKEN="$(admin invite "$OT_ID" --name other 2>>"$D/invite.err")"
-! grep -qF "published to" "$D/invite.err" || {
-	dump "$D/invite.err"
-	bad "an invite published a policy"
-}
-WIRES_HOME="$agent" "$WIRES" join "$AG_TOKEN" >/dev/null
-WIRES_HOME="$other" "$WIRES" join "$OT_TOKEN" >/dev/null
-login_as "$agent" "$EMAIL"
-login_as "$other" "$OTHER"
-ok "the $LANG_NAME host serves the admin's signed policy; alice and bob signed in"
+# Each caller's whole onboarding: `wires login <network>`.
+login_as "$agent" "$EMAIL" "$NETWORK"
+login_as "$other" "$OTHER" "$NETWORK"
+ok "the $LANG_NAME host serves the admin's signed policy; alice and bob signed in at the IdP"
 
 # --------------------------------------------------------------------------
 # Calls.
@@ -232,6 +237,20 @@ set -e
 grep -qF "kv: no such key" "$D/c3.err" || bad "the handler's stderr did not reach the caller"
 ok "the handler's exit code (1) and stderr are the caller's"
 
+# The handler holds alice's ID token ($ID_TOKEN_FN), the one her
+# `wires call` presented; `whoami` echoes it without its signature.
+call "$agent" whoami >"$D/c6.out" 2>"$D/c6.err" || {
+	dump "$D/c6.err"
+	bad "alice's whoami failed"
+}
+TOKEN="$(cat "$agent/idp-token.jwt")"
+[ "$(sed -n 1p "$D/c6.out")" = "$EMAIL" ] || bad "whoami did not name alice"
+[ "$(sed -n 2p "$D/c6.out")" = "${TOKEN%.*}" ] || {
+	dump "$D/c6.out"
+	bad "the handler's $ID_TOKEN_FN is not the token alice presented"
+}
+ok "the $LANG_NAME handler holds alice's ID token ($ID_TOKEN_FN) and her verified email"
+
 set +e
 call "$agent" throw >"$D/c5.out" 2>"$D/c5.err"
 rc=$?
@@ -247,21 +266,21 @@ set +e
 call "$other" keys >"$D/c4.out" 2>"$D/c4.err"
 rc=$?
 set -e
-# Card 37: kv is not in bob's view (no role of his may use it), so his
-# call finds no host: nothing is dialed, and the handler never runs.
+# Card 47: no role matches bob, so no directory admits him and he holds no
+# view: nothing is dialed, and the handler never runs.
 [ "$rc" -eq 1 ] || {
 	dump "$D/c4.err"
-	bad "bob's call exited $rc, expected 1 (not in his view)"
+	bad "bob's call exited $rc, expected 1 (not in the network)"
 }
-grep -qF "no service named \`kv\` that you may call" "$D/c4.err" || {
+grep -qF "no role in this network matches bob@other.example" "$D/c4.err" || {
 	dump "$D/c4.err"
-	bad "bob's call stopped, but not for his view"
+	bad "bob's call stopped, but not because the network doesn't admit him"
 }
 [ ! -s "$D/c4.out" ] || bad "bob's call wrote to stdout"
-ok "bob holds no kv in his view: nothing dialed, the handler never runs"
+ok "bob is not in the network: nothing dialed, the handler never runs"
 
 # --------------------------------------------------------------------------
-# The handler's push, and the host's own record.
+# The handler's push.
 # --------------------------------------------------------------------------
 WIRES_HOME="$agent" "$WIRES" inbox >"$D/i1.out" 2>"$D/i1.err" || {
 	dump "$D/i1.err"
@@ -273,20 +292,6 @@ grep -qF "from host ${HOST_ID:0:8} (verified)  kv: greeting set" "$D/i1.out" || 
 	bad "the handler's push_to_caller did not reach alice's inbox"
 }
 ok "push_to_caller from $LANG_NAME reached alice's wires inbox, from the host's verified key"
-
-WIRES_HOME="$agent" "$WIRES" watch --mine --once kv >"$D/w.out" 2>"$D/w.err" || {
-	dump "$D/w.err"
-	bad "wires watch failed"
-}
-grep -qE "kv +▶ [0-9a-f]+ $EMAIL .*\[analyst\] kv set greeting" "$D/w.out" || {
-	dump "$D/w.out"
-	bad "alice's watch does not show her set, with her verified email and role"
-}
-grep -qE "kv +■ [0-9a-f]+ exit 0 .*stdin \"hello\"" "$D/w.out" || {
-	dump "$D/w.out"
-	bad "alice's watch does not show the set's exit and its stdin"
-}
-ok "the host's signed log shows alice's calls to the $LANG_NAME service, with her verified email"
 
 # --------------------------------------------------------------------------
 # Stop: SIGTERM makes the example call host.stop(); serve() returns and the

@@ -7,11 +7,15 @@
 //! - [`a_child_gets_a_minimal_environment_and_a_push_capability`]: no
 //!   `WIRES_HOME`, no `HOME`, nothing inherited beyond `PATH` and the
 //!   locale; a `WIRES_PUSH_SOCKET` + `WIRES_PUSH_TOKEN` instead.
+//! - [`a_child_gets_its_callers_id_token_and_verified_claims`]:
+//!   `WIRES_ID_TOKEN` (the token from the call's `Hello`) and `WIRES_CALLER`
+//!   (the verified `Principal`, as JSON), and no `WIRES_*` name beyond the
+//!   ones wires sets.
 //! - [`the_capability_reaches_only_the_caller`]: the child's push reaches its
-//!   caller and is logged under the call; another node, a role and the
+//!   caller, even after the call ended; another node, a role and the
 //!   operator's request form are refused; the operator's own socket still
 //!   pushes to a role.
-//! - [`a_rolled_back_state_is_refused`]: a policy older than one the host
+//! - [`a_rolled_back_policy_is_refused`]: a policy older than one the host
 //!   already decided under, copied back onto disk, decides nothing.
 
 use std::collections::BTreeMap;
@@ -20,13 +24,13 @@ use std::sync::Arc;
 
 use iroh::EndpointAddr;
 use iroh::protocol::Router;
-use library::{AuditRecord, CallId, Hello, NodeIdentity, PushBody, Service, SignedPolicy, Subject};
+use library::{
+    Hello, NodeIdentity, OidcNonce, Principal, PushBody, Service, SignedPolicy, Subject,
+};
 use tokio::sync::mpsc;
-use tokio::time::timeout;
 
 use super::{
-    Outcome, PATIENCE, adopt, bind, email_at, host_config, localhost_socks, membership, role,
-    service, signed_state,
+    Outcome, adopt, bind, email_at, host_config, localhost_socks, role, service, signed_state,
 };
 use crate::admin::keystore::Keystore;
 use crate::caller::mock_idp::MockIdp;
@@ -34,7 +38,7 @@ use crate::host::config::HostConfig;
 use crate::host::control::ControlClient;
 use crate::host::push::{PushHost, PushSpec, host_socket};
 use crate::host::serve::{push_sockets, services_host, services_router};
-use crate::host::transport::{AuditSink, endpoint_addr};
+use crate::host::transport::endpoint_addr;
 
 /// Root 1, host 10, alice 2 (an analyst, signed in), bob 3.
 struct World {
@@ -69,7 +73,6 @@ impl World {
                     description: String::new(),
                     allow: vec![role("analyst")],
                     hosts: vec![self.host.node_id()],
-                    readers: vec![],
                 },
             );
         })
@@ -85,18 +88,17 @@ impl World {
     }
 
     fn hello(&self, who: &NodeIdentity) -> Hello {
-        super::hello(&self.root, who, 1, Some(&self.idp))
+        super::hello(who, 1, Some(&self.idp))
     }
 }
 
 /// A running host with push on: router, both control sockets, the push
-/// service, its call log's records.
+/// service.
 struct Host {
     _router: Router,
     _sockets: Vec<tokio::task::JoinHandle<()>>,
     addr: EndpointAddr,
     home: PathBuf,
-    records: mpsc::Receiver<AuditRecord>,
 }
 
 impl Host {
@@ -104,16 +106,14 @@ impl Host {
         let home = crate::testutil::temp_dir();
         let keystore = Arc::new(Keystore::at(home.clone()));
         adopt(&keystore, &w.root, &w.state(1));
-        let mut host = services_host(
+        let host = services_host(
             w.host.node_id(),
-            membership(&w.root, &w.host),
+            w.root.node_id(),
             Arc::clone(&keystore),
             w.host_json(),
         )
         .unwrap();
         host.preflight(crate::clock::now_unix()).unwrap();
-        let (sink, records) = AuditSink::channel(64);
-        host.audit = Some(sink);
         let host = Arc::new(host);
         let push = Arc::new(PushHost::from_state(Arc::clone(&host)));
         let (tx, commands) = mpsc::channel(16);
@@ -127,15 +127,7 @@ impl Host {
             _sockets: sockets,
             addr,
             home,
-            records,
         }
-    }
-
-    async fn record(&mut self) -> AuditRecord {
-        timeout(PATIENCE, self.records.recv())
-            .await
-            .expect("no record in time")
-            .expect("the sink closed")
     }
 }
 
@@ -148,13 +140,17 @@ async fn call_env(
 ) -> Result<BTreeMap<String, String>, String> {
     match super::call(who, &host.addr, w.hello(who), "env", &[]).await {
         Outcome::Denied(reason) => Err(reason),
-        ran => Ok(ran
-            .stdout()
-            .lines()
-            .filter_map(|l| l.split_once('='))
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()),
+        ran => Ok(env_of(&ran)),
     }
+}
+
+/// The environment `env` printed in `ran`.
+fn env_of(ran: &Outcome) -> BTreeMap<String, String> {
+    ran.stdout()
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 fn spec(to: &str) -> PushSpec {
@@ -227,15 +223,61 @@ async fn a_child_gets_a_minimal_environment_and_a_push_capability() {
 }
 
 #[tokio::test]
+async fn a_child_gets_its_callers_id_token_and_verified_claims() {
+    let w = World::new().await;
+    let host = Host::start(&w).await;
+    let exp = crate::clock::now_unix() + 3600;
+    let mut hello = w.hello(&w.alice);
+    let token = w.idp.mint(&OidcNonce::for_node(&w.alice.node_id()), exp);
+    hello.id_token = token.clone();
+    let env = match super::call(&w.alice, &host.addr, hello, "env", &[]).await {
+        Outcome::Denied(reason) => panic!("denied: {reason}"),
+        ran => env_of(&ran),
+    };
+    // The token byte for byte as the call's `Hello` carried it.
+    assert_eq!(env["WIRES_ID_TOKEN"], token.as_str());
+    // The claims the host verified from it: the same value as `Principal`.
+    let caller: Principal = serde_json::from_str(&env["WIRES_CALLER"]).unwrap();
+    assert_eq!(
+        caller,
+        Principal {
+            issuer: w.idp.issuer.as_str().into(),
+            subject: "sub-alice@example.com".into(),
+            email: Some("alice@example.com".into()),
+            org: None,
+            groups: vec![],
+            not_after: exp,
+        }
+    );
+    let json: serde_json::Value = serde_json::from_str(&env["WIRES_CALLER"]).unwrap();
+    assert_eq!(json["email"], "alice@example.com");
+    assert_eq!(json["issuer"], w.idp.issuer.as_str());
+    assert_eq!(env["WIRES_CALLER_EMAIL"], "alice@example.com");
+    assert_eq!(env["WIRES_SERVICE"], "env");
+    // No `WIRES_*` name beyond the ones wires sets.
+    for key in env.keys().filter(|k| k.starts_with("WIRES_")) {
+        assert!(
+            [
+                "WIRES_CALLER_NODE",
+                "WIRES_ID_TOKEN",
+                "WIRES_CALLER",
+                "WIRES_CALLER_EMAIL",
+                "WIRES_SERVICE",
+                "WIRES_ROLE",
+                "WIRES_PUSH_SOCKET",
+                "WIRES_PUSH_TOKEN",
+            ]
+            .contains(&key.as_str()),
+            "{key} is not a variable wires sets: {env:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_capability_reaches_only_the_caller() {
     let w = World::new().await;
-    let mut host = Host::start(&w).await;
+    let host = Host::start(&w).await;
     let env = call_env(&w, &w.alice, &host).await.unwrap();
-    let call: CallId = match host.record().await {
-        AuditRecord::Started { call, .. } => call,
-        other => panic!("expected started, got {other:?}"),
-    };
-    assert!(matches!(host.record().await, AuditRecord::Finished { .. }));
     let socket = PathBuf::from(&env["WIRES_PUSH_SOCKET"]);
     let token = env["WIRES_PUSH_TOKEN"].clone();
     let mut child = ControlClient::connect_child(&socket)
@@ -243,19 +285,13 @@ async fn the_capability_reaches_only_the_caller() {
         .unwrap()
         .unwrap();
 
-    // Its caller, after the call ended: accepted, and logged under the call.
+    // Its caller, after the call ended: accepted.
     let report = child
         .caller_push(token.clone(), spec(&w.alice.node_id().hex()))
         .await
         .unwrap();
     assert!(report.any_accepted(), "{}", report.render());
-    match host.record().await {
-        AuditRecord::Push { to, call: via, .. } => {
-            assert_eq!(to, w.alice.node_id());
-            assert_eq!(via, Some(call), "the record names the call's capability");
-        }
-        other => panic!("expected a push record, got {other:?}"),
-    }
+    assert_eq!(report.results[0].to, w.alice.node_id());
 
     // Anyone else, a role, or a guessed token: refused.
     for (token, to, why) in [
@@ -293,14 +329,10 @@ async fn the_capability_reaches_only_the_caller() {
     let report = operator.push(spec("analyst")).await.unwrap();
     assert_eq!(report.results.len(), 1, "{}", report.render());
     assert_eq!(report.results[0].to, w.alice.node_id());
-    match host.record().await {
-        AuditRecord::Push { call: via, .. } => assert_eq!(via, None),
-        other => panic!("expected a push record, got {other:?}"),
-    }
 }
 
 #[tokio::test]
-async fn a_rolled_back_state_is_refused() {
+async fn a_rolled_back_policy_is_refused() {
     let w = World::new().await;
     let host = Host::start(&w).await;
     let ks = Keystore::at(&host.home);

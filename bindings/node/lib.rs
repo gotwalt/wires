@@ -89,22 +89,26 @@ impl Call {
         self.call.caller().hex()
     }
 
-    /// The person the caller verified as (every admitted call has one).
+    /// The caller's raw ID token (a compact JWS), the one the host
+    /// verified for this call: the same token a CLI service gets as
+    /// `WIRES_ID_TOKEN`. No need to verify it again; it is a bearer
+    /// credential until it expires, so don't log it.
+    #[napi]
+    pub fn id_token(&self) -> String {
+        self.call.id_token().as_str().to_string()
+    }
+
+    /// The person the caller verified as (every admitted call has one):
+    /// the claims of `idToken`, as the host verified them.
     #[napi]
     pub fn principal(&self) -> Principal {
         self.call.principal().into()
     }
 
-    /// The registry role that admitted the caller.
+    /// The role (from the signed policy) that admitted the caller.
     #[napi]
     pub fn role(&self) -> String {
         self.call.role().as_str().to_string()
-    }
-
-    /// The policy version the call was decided under.
-    #[napi]
-    pub fn state_version(&self) -> i64 {
-        i64::try_from(self.call.state_version().0).unwrap_or(i64::MAX)
     }
 
     /// The service called.
@@ -117,12 +121,6 @@ impl Call {
     #[napi]
     pub fn args(&self) -> Vec<String> {
         self.call.args().to_vec()
-    }
-
-    /// This call's id in the host's call log (what `wires watch` shows).
-    #[napi]
-    pub fn id(&self) -> String {
-        self.call.id().hex()
     }
 
     /// Up to `max` bytes (default 64 KiB) of the caller's stdin; empty at
@@ -222,7 +220,7 @@ impl HostBuilder {
 #[napi]
 impl HostBuilder {
     /// Start building a host whose keystore is `home` (a node joined with
-    /// `WIRES_HOME=<home> wires id` and `wires join`).
+    /// `WIRES_HOME=<home> wires join <network>`).
     #[napi(constructor)]
     pub fn new(home: String) -> Self {
         Self {
@@ -230,7 +228,9 @@ impl HostBuilder {
         }
     }
 
-    /// Trust ID tokens from `issuer` for the OAuth client ids `audiences`.
+    /// Trust ID tokens from `issuer` only, and only for the OAuth client ids
+    /// `audiences` (empty: every one the policy accepts). This narrows the
+    /// IdPs the signed policy trusts; it never adds one.
     #[napi]
     pub fn trust_issuer<'a>(
         &mut self,
@@ -242,7 +242,8 @@ impl HostBuilder {
         this
     }
 
-    /// Let the host push to members of `roles` (what `pushToCaller` needs).
+    /// Let the host push to callers in `roles` (from the signed policy):
+    /// what `pushToCaller` needs.
     #[napi]
     pub fn push_allow<'a>(&mut self, this: This<'a>, roles: Vec<String>) -> This<'a> {
         self.with(|b| b.push_allow(roles));
@@ -250,7 +251,7 @@ impl HostBuilder {
     }
 
     /// Also read `path` as `host.json` (CLI services beside the
-    /// JavaScript ones, trusted IdPs, push, audit export).
+    /// JavaScript ones, trusted IdPs, push).
     #[napi]
     pub fn host_json<'a>(&mut self, this: This<'a>, path: String) -> This<'a> {
         self.with(|b| b.host_json(path));

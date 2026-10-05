@@ -124,19 +124,23 @@ impl Call {
         self.call.caller().hex()
     }
 
-    /// The person the caller verified as (every admitted call has one).
+    /// The caller's raw ID token (a compact JWS), the one the host
+    /// verified for this call: the same token a CLI service gets as
+    /// `WIRES_ID_TOKEN`. No need to verify it again; it is a bearer
+    /// credential until it expires, so don't log it.
+    pub fn id_token(&self) -> String {
+        self.call.id_token().as_str().to_string()
+    }
+
+    /// The person the caller verified as (every admitted call has one):
+    /// the claims of `id_token`, as the host verified them.
     pub fn principal(&self) -> Principal {
         self.call.principal().into()
     }
 
-    /// The registry role that admitted the caller.
+    /// The role (from the signed policy) that admitted the caller.
     pub fn role(&self) -> String {
         self.call.role().as_str().to_string()
-    }
-
-    /// The policy version the call was decided under.
-    pub fn state_version(&self) -> u64 {
-        self.call.state_version().0
     }
 
     /// The service called.
@@ -147,11 +151,6 @@ impl Call {
     /// The caller's arguments.
     pub fn args(&self) -> Vec<String> {
         self.call.args().to_vec()
-    }
-
-    /// This call's id in the host's call log (what `wires watch` shows).
-    pub fn id(&self) -> String {
-        self.call.id().hex()
     }
 
     /// Up to `max` bytes of the caller's stdin; empty at EOF. Blocks until
@@ -279,7 +278,7 @@ impl HostBuilder {
 #[uniffi::export]
 impl HostBuilder {
     /// Start building a host whose keystore is `home` (a node joined with
-    /// `WIRES_HOME=<home> wires id` and `wires join`).
+    /// `WIRES_HOME=<home> wires join <network>`).
     #[uniffi::constructor]
     pub fn new(home: String) -> Arc<Self> {
         Arc::new(Self {
@@ -287,19 +286,21 @@ impl HostBuilder {
         })
     }
 
-    /// Trust ID tokens from `issuer` for the OAuth client ids `audiences`.
+    /// Trust ID tokens from `issuer` only, and only for the OAuth client ids
+    /// `audiences` (empty: every one the policy accepts). This narrows the
+    /// IdPs the signed policy trusts; it never adds one.
     pub fn trust_issuer(self: Arc<Self>, issuer: String, audiences: Vec<String>) -> Arc<Self> {
         self.with(|b| b.trust_issuer(issuer, audiences))
     }
 
-    /// Let the host push to members of `roles` (what `push_to_caller`
-    /// needs).
+    /// Let the host push to callers in `roles` (from the signed policy):
+    /// what `push_to_caller` needs.
     pub fn push_allow(self: Arc<Self>, roles: Vec<String>) -> Arc<Self> {
         self.with(|b| b.push_allow(roles))
     }
 
     /// Also read `path` as `host.json` (CLI services beside the foreign
-    /// ones, trusted IdPs, push, audit export).
+    /// ones, trusted IdPs, push).
     pub fn host_json(self: Arc<Self>, path: String) -> Arc<Self> {
         self.with(|b| b.host_json(path))
     }
@@ -484,7 +485,7 @@ mod tests {
             .err()
             .expect("an empty keystore can't build")
             .to_string();
-        assert!(e.contains("wires id"), "{e}");
+        assert!(e.contains("wires join <network>"), "{e}");
         let again = b.build().err().expect("a builder builds once").to_string();
         assert_eq!(again, "this builder was already built");
     }

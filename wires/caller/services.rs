@@ -24,9 +24,8 @@
 //! call and is the ground truth.
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
 use clap::Args;
-use library::{Audience, IdentityClaim, Issuer, NodeId, Principal, ViewEntry};
+use library::{Audience, IdentityClaim, Issuer, NodeId, Principal, SignedEntry};
 use serde_json::Value;
 
 use crate::admin::keystore::{self, Keystore};
@@ -68,11 +67,8 @@ pub(crate) async fn my_principal(ks: &Keystore, me: NodeId) -> Result<Option<Pri
 
 /// The `aud` claim of an unverified JWS (a string or an array of strings).
 fn unverified_audiences(jws: &str) -> Result<Vec<Audience>> {
-    let payload = jws.split('.').nth(1).context("the ID token is not a JWS")?;
-    let bytes = library::B64
-        .decode(payload.trim_end_matches('='))
-        .context("the ID token's payload is not base64url")?;
-    let json: Value = serde_json::from_slice(&bytes).context("the ID token's payload")?;
+    let json = crate::caller::hello::unverified_claims(jws)
+        .context("the ID token is not a JWS with a JSON payload")?;
     Ok(match json.get("aud") {
         Some(Value::String(a)) => vec![Audience::new(a.clone())],
         Some(Value::Array(a)) => a
@@ -86,18 +82,23 @@ fn unverified_audiences(jws: &str) -> Result<Vec<Audience>> {
 
 /// This node's view in `ks`, refreshed first when it is stale (or missing).
 /// A refresh that fails leaves the held view, with a note on stderr; with
-/// no view at all it is an error.
+/// no view at all it is an error. When a directory refused this node
+/// ([`view::NotAdmitted`]) it is an error saying what the person can act
+/// on, whatever is held: the listing would be one it can't use.
 pub(crate) async fn current_view(ks: &Keystore) -> Result<HeldView> {
     let node = keystore::node_identity_in(ks)?;
-    let badge = ks.read_membership()?.context(crate::help::NOT_JOINED)?;
-    let held = view::read(ks, badge.fabric)?;
+    let root = ks.network_root()?.context(crate::help::NOT_JOINED)?;
+    let held = view::read(ks, root)?;
     if let Some(held) = &held
         && !held.is_stale(crate::clock::now_unix())
     {
         return Ok(held.clone());
     }
-    match view::refresh_now(ks, &node, &badge, None, false).await {
+    match view::refresh_now(ks, &node, root, None, false).await {
         Ok(fresh) => Ok(fresh),
+        Err(e) if e.downcast_ref::<view::NotAdmitted>().is_some() => Err(anyhow::anyhow!(
+            crate::caller::hello::explain_not_admitted_in(ks)
+        )),
         Err(e) => match held {
             Some(held) => {
                 eprintln!(
@@ -116,9 +117,9 @@ pub(crate) async fn run(a: &ServicesArgs) -> Result<String> {
     let ks = Keystore::resolve()?;
     let held = current_view(&ks).await?;
     let matching = a.query.as_deref().map(|q| held.view.matching(q));
-    let entries: Vec<&ViewEntry> = match &matching {
-        Some(found) => found.iter().copied().filter(|e| e.call).collect(),
-        None => held.callable().collect(),
+    let entries: Vec<&SignedEntry> = match &matching {
+        Some(found) => found.clone(),
+        None => held.view.entries.iter().collect(),
     };
     if entries.is_empty() {
         let signed_in = stored_token(&ks).is_some();
@@ -157,9 +158,8 @@ pub(crate) fn empty_note(query: Option<&str>, signed_in: bool, version: u64) -> 
 }
 
 /// The roles `e`'s service allows, comma-separated.
-fn allow(e: &ViewEntry) -> String {
-    e.entry
-        .service
+fn allow(e: &SignedEntry) -> String {
+    e.service
         .allow
         .iter()
         .map(|r| r.as_str())
@@ -169,11 +169,11 @@ fn allow(e: &ViewEntry) -> String {
 
 /// The listing: one line per entry, `name  description  (roles)`, columns
 /// aligned, in name order; `verbose` appends `hosts: …`.
-pub(crate) fn render(entries: &[&ViewEntry], verbose: bool) -> String {
-    let desc = |e: &ViewEntry| one_line(&e.entry.service.description);
+pub(crate) fn render(entries: &[&SignedEntry], verbose: bool) -> String {
+    let desc = |e: &SignedEntry| one_line(&e.service.description);
     let name_w = entries
         .iter()
-        .map(|e| e.entry.name.as_str().len())
+        .map(|e| e.name.as_str().len())
         .max()
         .unwrap_or(0);
     let desc_w = entries
@@ -188,12 +188,12 @@ pub(crate) fn render(entries: &[&ViewEntry], verbose: bool) -> String {
             let pad = desc_w - d.chars().count();
             let mut line = format!(
                 "{:name_w$}  {d}{}  ({})",
-                e.entry.name.as_str(),
+                e.name.as_str(),
                 " ".repeat(pad),
                 allow(e)
             );
             if verbose {
-                let hosts: Vec<String> = e.entry.service.hosts.iter().map(NodeId::short).collect();
+                let hosts: Vec<String> = e.service.hosts.iter().map(NodeId::short).collect();
                 line.push_str(&format!("  hosts: {}", hosts.join(", ")));
             }
             line
@@ -203,16 +203,14 @@ pub(crate) fn render(entries: &[&ViewEntry], verbose: bool) -> String {
 }
 
 /// `--json`: one object per line.
-fn render_json(entries: &[&ViewEntry], verbose: bool) -> Result<String> {
+fn render_json(entries: &[&SignedEntry], verbose: bool) -> Result<String> {
     let mut lines = Vec::new();
     for e in entries {
-        let svc = &e.entry.service;
+        let svc = &e.service;
         let line = JsonLine {
-            service: e.entry.name.as_str(),
+            service: e.name.as_str(),
             description: svc.description.as_str(),
             allow: svc.allow.iter().map(|r| r.as_str()).collect(),
-            call: e.call,
-            read: e.read,
             hosts: svc.hosts.len(),
             host_ids: verbose.then(|| svc.hosts.iter().map(NodeId::hex).collect()),
         };
@@ -227,14 +225,10 @@ fn render_json(entries: &[&ViewEntry], verbose: bool) -> Result<String> {
 struct JsonLine<'a> {
     /// The service's name: what `wires call` takes.
     service: &'a str,
-    /// What it does, from the registry.
+    /// What it does, from the signed policy.
     description: &'a str,
     /// The roles that may call it.
     allow: Vec<&'a str>,
-    /// Whether you may call it.
-    call: bool,
-    /// Whether you may read its call records (`wires watch`).
-    read: bool,
     /// How many hosts run it.
     hosts: usize,
     /// With `--verbose`: the hosts' node ids.
@@ -261,43 +255,46 @@ mod tests {
     }
 
     /// A view of `orders-db` (analyst) and `status` (staff), both hosted by
-    /// node 4, for someone in both roles; `locked` only for readers.
+    /// node 4, for someone in both roles.
     fn view() -> View {
         let root = NodeIdentity::from_seed([1; 32]);
         let mut s = Policy::new(root.node_id());
         s.version = StateVersion(1);
         s.not_after = i64::MAX;
         let (_, anyone) = crate::testutil::staff_role();
-        for role in ["analyst", "staff", "auditor"] {
+        for role in ["analyst", "staff"] {
             s.roles.insert(RoleName::new(role).unwrap(), anyone.clone());
         }
-        let svc = |description: &str, allow: &str, readers: &[&str]| Service {
+        let svc = |description: &str, allow: &str| Service {
             description: description.into(),
             allow: vec![RoleName::new(allow).unwrap()],
             hosts: vec![node(4)],
-            readers: readers.iter().map(|r| RoleName::new(*r).unwrap()).collect(),
         };
         s.services.insert(
             name("orders-db"),
-            svc("Read-only SQL against\nthe orders database", "analyst", &[]),
+            svc("Read-only SQL against\nthe orders database", "analyst"),
         );
         s.services
-            .insert(name("status"), svc("Build and deploy status", "staff", &[]));
+            .insert(name("status"), svc("Build and deploy status", "staff"));
         let principal = Principal {
             issuer: crate::testutil::test_idp().issuer.as_str().into(),
             subject: "1".into(),
-            email: None,
+            email: Some("me@example.com".into()),
             org: None,
             groups: vec![],
             not_after: i64::MAX,
         };
-        crate::testutil::signed_policy(&root, s).view_for(Some(&principal), None)
+        crate::testutil::signed_policy(&root, s).view_for(
+            crate::testutil::any_node(),
+            Some(&principal),
+            None,
+        )
     }
 
     #[test]
     fn the_listing_is_aligned_and_hides_hosts() {
         let v = view();
-        let entries: Vec<&ViewEntry> = v.entries.iter().collect();
+        let entries: Vec<&SignedEntry> = v.entries.iter().collect();
         let out = render(&entries, false);
         assert_eq!(
             out,
@@ -311,7 +308,7 @@ mod tests {
     #[test]
     fn verbose_shows_hosts() {
         let v = view();
-        let entries: Vec<&ViewEntry> = v.entries.iter().collect();
+        let entries: Vec<&SignedEntry> = v.entries.iter().collect();
         let out = render(&entries, true);
         for line in out.lines() {
             assert!(
@@ -326,12 +323,8 @@ mod tests {
     #[test]
     fn a_query_finds_a_service_by_name_or_description() {
         let v = view();
-        let names = |q: &str| -> Vec<String> {
-            v.matching(q)
-                .iter()
-                .map(|e| e.entry.name.to_string())
-                .collect()
-        };
+        let names =
+            |q: &str| -> Vec<String> { v.matching(q).iter().map(|e| e.name.to_string()).collect() };
         assert_eq!(names("orders"), vec!["orders-db"]);
         assert_eq!(names("DEPLOY"), vec!["status"]);
         assert!(names("payroll").is_empty());
@@ -340,7 +333,7 @@ mod tests {
     #[test]
     fn json_is_one_object_per_line() {
         let v = view();
-        let entries: Vec<&ViewEntry> = v.entries.iter().collect();
+        let entries: Vec<&SignedEntry> = v.entries.iter().collect();
         let out = render_json(&entries, false).unwrap();
         let rows: Vec<Value> = out
             .lines()
@@ -349,11 +342,10 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["service"], "orders-db");
         assert_eq!(rows[0]["allow"], serde_json::json!(["analyst"]));
-        assert_eq!(rows[0]["call"], true);
         assert_eq!(rows[0]["hosts"], 1);
         // The shape `wires services --help` documents, in its order.
         let first = out.lines().next().unwrap();
-        let at: Vec<usize> = ["service", "description", "allow", "call", "read", "hosts"]
+        let at: Vec<usize> = ["service", "description", "allow", "hosts"]
             .iter()
             .map(|k| first.find(&format!("\"{k}\":")).unwrap())
             .collect();
@@ -366,6 +358,7 @@ mod tests {
 
     #[test]
     fn audiences_come_from_the_token() {
+        use base64::Engine as _;
         let b64 = |v: &str| library::B64.encode(v);
         let one = format!("h.{}.s", b64(r#"{"aud":"client-1"}"#));
         assert_eq!(

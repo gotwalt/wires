@@ -6,16 +6,19 @@
 //! [`InboxFrame`]s:
 //!
 //! - **direct**: the host dials the recipient's receiver (a running `wires
-//!   inbox --wait`) by node id, says [`Hello`](InboxFrame::Hello) with its own
-//!   credentials, and sends [`Deliver`](InboxFrame::Deliver); the receiver
-//!   stores what it accepts and answers [`Ack`](InboxFrame::Ack).
+//!   inbox --wait`) by node id, says [`Hello`](InboxFrame::Hello) (with no
+//!   token: a host acts for no person; the receiver admits it because it
+//!   hosts a service in the receiver's view), and sends
+//!   [`Deliver`](InboxFrame::Deliver); the receiver stores what it accepts
+//!   and answers [`Ack`](InboxFrame::Ack).
 //! - **fetch**: the recipient dials the host (`wires inbox`, no receiver
 //!   needed), says `Hello` and [`Fetch`](InboxFrame::Fetch) —
 //!   optionally holding the stream open up to `wait_ms` for a message to
 //!   arrive — and the host answers `Deliver` (possibly empty); the recipient
 //!   stores and `Ack`s, and only acknowledged messages leave the host's queue.
-//!   The recipient's `Hello` carries its IdP ID token, so a host learns a
-//!   logged-in recipient's identity (and so its roles) by the fetch alone.
+//!   The recipient's `Hello` carries its IdP ID token, which is what admits
+//!   it, and so a host learns a recipient's identity (and so its roles) by
+//!   the fetch alone.
 //!
 //! Either side may answer [`Denied`](InboxFrame::Denied) with a reason
 //! instead.
@@ -73,11 +76,10 @@ use crate::codec::{canonical_bytes, hex_id, length_prefixed, prefix_len, split_f
 use crate::error::{Error, Result};
 use crate::identity::NodeId;
 use crate::idp::IdToken;
-use crate::membership::Membership;
 
 /// The ALPN of the inbox protocol: a host's fetch endpoint and a waiting
 /// caller's receiver both speak it.
-pub const INBOX_ALPN: &[u8] = b"wires/inbox/2";
+pub const INBOX_ALPN: &[u8] = b"wires/inbox/3";
 
 /// Longest [`Subject`], in bytes.
 pub const MAX_SUBJECT: usize = 128;
@@ -97,8 +99,7 @@ pub const MAX_BATCH: usize = 32;
 pub const MAX_INBOX_FRAME: usize = 4 * 1024 * 1024;
 
 /// Largest [`InboxFrame::Hello`] or [`InboxFrame::Fetch`] a peer reads
-/// before it knows who is asking: a membership and an ID token fit in a few
-/// KiB, so a peer that isn't admitted can't make it buffer the
+/// before it knows who is asking: an ID token fits in a few KiB, so a peer that isn't admitted can't make it buffer the
 /// [`MAX_INBOX_FRAME`] a delivery may need.
 pub const MAX_INBOX_HELLO: usize = 64 * 1024;
 
@@ -124,8 +125,8 @@ impl PushId {
 }
 
 /// A push's one-line subject (`build-41`): 1–[`MAX_SUBJECT`] bytes, no
-/// control characters, not only whitespace. It is what the host's call log
-/// records by default, so it must render on one line.
+/// control characters, not only whitespace. `wires inbox` prints it as one
+/// line, so it must render on one.
 ///
 /// ```
 /// use library::Subject;
@@ -230,9 +231,9 @@ pub struct PushMessage {
     pub from: NodeId,
     /// The recipient. A receiver refuses a message addressed to anyone else.
     pub to: NodeId,
-    /// One line, recorded in the host's call log.
+    /// One line.
     pub subject: Subject,
-    /// The text; recorded in the call log only when the host opts in.
+    /// The text.
     pub body: PushBody,
     /// The host's clock when it accepted the push (unix ms).
     pub at_ms: i64,
@@ -251,14 +252,13 @@ impl PushMessage {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboxFrame {
-    /// The dialer's opening frame: its fabric membership and, from a
-    /// recipient that has logged in, its IdP ID token (nonce-bound to its
-    /// node key). The dialer's identity is the key iroh authenticated; these
-    /// only prove it is a member, and who it signed in as.
+    /// The dialer's opening frame: from a recipient, its IdP ID token
+    /// (nonce-bound to its node key), which is what admits its fetch; from
+    /// a host delivering, none. The dialer's identity is the key iroh
+    /// authenticated; the token proves who it signed in as.
     Hello {
-        /// The dialer's membership.
-        membership: Membership,
-        /// The dialer's ID token, when it holds one.
+        /// The dialer's ID token: a recipient's, required for a fetch; none
+        /// from a host.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id_token: Option<IdToken>,
     },
@@ -337,6 +337,45 @@ impl InboxFrame {
                 Err(Error::InvalidPush("an ack frame carries more than 32 ids"))
             }
             _ => Ok(()),
+        }
+    }
+}
+
+/// What happened to a push for one recipient: what `wires push` reports and
+/// what the host traces at each milestone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PushOutcome {
+    /// Accepted and held for the recipient (its receiver didn't answer).
+    Queued,
+    /// Handed to the recipient's resident receiver, which acknowledged it.
+    Delivered,
+    /// The recipient fetched it (`wires inbox`) and acknowledged it.
+    Fetched,
+    /// Its time-to-live ran out before the recipient took it.
+    Expired,
+    /// Pushed out of a full queue by a newer message.
+    Dropped,
+    /// Refused: the current signed policy no longer admits the recipient
+    /// (removed, or no role matches its person), or it holds no role in
+    /// `push.allow` (at send, delivery or fetch time).
+    Denied,
+}
+
+impl PushOutcome {
+    /// The word `wires push` prints (`queued`, `delivered`, …).
+    ///
+    /// ```
+    /// assert_eq!(library::PushOutcome::Fetched.as_str(), "fetched");
+    /// ```
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Delivered => "delivered",
+            Self::Fetched => "fetched",
+            Self::Expired => "expired",
+            Self::Dropped => "dropped",
+            Self::Denied => "denied",
         }
     }
 }

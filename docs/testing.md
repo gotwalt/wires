@@ -15,27 +15,39 @@ cargo test -p wires -- --nocapture
 What's covered:
 
 - **`library`** — property tests (`proptest`), example unit tests and runnable
-  doctests for identity, badges (memberships), invites and their login
-  settings, the signed policy (head, items, root-signed service entries,
-  bans, policy updates and their `apply`, caller views, `Fresh`), roles, the
-  registry and `authorize`, directory and session frames, invocations, call
-  records and the call log, IdP claims and push frames.
+  doctests for node identity, the network string and its login settings,
+  admission (`check_admitted`: node and person bans, a verified email, a
+  role that matches), the signed policy
+  (head, items, root-signed service entries, bans, policy updates and their
+  `apply`, caller views, `Fresh`), roles, `authorize`, directory and session
+  frames, invocations, IdP claims and push frames.
 - **`wires`** — each role's command functions, the keystore (round-trips,
-  file modes, flag → env → file → keystore precedence), the session transport
-  over in-memory pipes and over **real loopback QUIC** (two iroh endpoints on
-  localhost, no relay or discovery), and `e2e/`: the whole stack over
-  hermetic loopback (the registry deciding each call, `also_require`,
-  removal with no restart, unassigned services, push by the policy and by a
-  call's push capability, what a service child can and can't reach, the
-  record stream keyed by person, the web gateway's OAuth and MCP paths,
+  file modes, flag → env → file → keystore precedence), the session
+  transport over in-memory pipes and over **real loopback QUIC** (two iroh
+  endpoints on localhost, no relay or discovery), the host's log line for a
+  call and for a refusal (`host/call_trace.rs`, `host/transport.rs`), and
+  `e2e/`: the whole stack over hermetic loopback. That is the policy
+  deciding each call, `also_require`, removal with no restart and
+  unassigned services (`e2e/services_host.rs`); what a service child can and
+  can't reach, and its `WIRES_ID_TOKEN` and `WIRES_CALLER`
+  (`e2e/service_child.rs`); the first run from empty keystores (`init`,
+  `role set`, `directory add`, `service add`, `network`, `join`, `serve`,
+  `policy push`, `login <network>`, `services`, `call`), then removal by
+  person from a second machine, by node, and `restore` (`e2e/first_run.rs`);
   hosts following a directory by subscription and the `lenient` / `strict`
-  freshness rule (`e2e/follow.rs`), and callers' views: what a caller's
+  freshness rule (`e2e/follow.rs`); callers' views: what a caller's
   keystore holds, a grant or revocation reaching a running `wires mcp`,
-  `resolve` (`e2e/views.rs`)), and `directory/tests.rs`: the directory over
-  loopback (the admin publishing to it and dialing no host, hosts fetching
-  the whole policy and callers their views, a caller refused the whole
-  policy, a restart from `directory.redb`, refusing tampered, mixed and
-  older policies and a stranger's `Fresh`, catching up from a replica).
+  `resolve` (`e2e/views.rs`); the web gateway's OAuth and MCP paths
+  (`e2e/gateway.rs`); and an embedded host serving the native `kv` example
+  (`e2e/native.rs`). `directory/tests.rs` covers the directory over
+  loopback: the admin publishing to it and dialing no host, the first
+  directory starting empty and taking the first publish, who it admits (a
+  node the policy names, or a caller whose ID token verifies and whom a role
+  matches), its two subscription pools and the per-person cap on view
+  subscriptions, a view subscription ending at its token's expiry, hosts
+  fetching the whole policy and callers their views, a caller refused the
+  whole policy, a restart from `directory.redb`, refusing tampered, mixed
+  and older policies and a stranger's `Fresh`, catching up from a replica.
 - **Help text** — `help_snapshots.rs` holds every command's `--help` and
   `--help-all`, the MCP `instructions` and the key error messages as files
   in `wires/snapshots/`; after an intended change, `WIRES_BLESS=1 cargo test
@@ -51,19 +63,27 @@ make fmt-check   # cargo fmt --check; shfmt -d
 ## The live demo
 
 `.scripts/demo-remote-cli.sh --quiet` is the end-to-end check on real
-processes: two hosts implementing one service from
-`.scripts/fixtures/host.json`, both also the network's directories, a caller
-that logs in (a bare `wires login`, against the hermetic `dev-mock-idp`) and
-runs `wires services` / `wires call` / `wires mcp` /
-`wires inbox`, a read-only caller stopped on its own machine, an analyst the
-hosts' `also_require` refuses, a reader on `wires watch`, failover and removal, all on
-loopback in a fresh `mktemp -d`, every step asserted.
-`.scripts/demo-push.sh --quiet` does the same for push, and
+processes, run as card 41's first run: the admin's `init`, roles, two
+directories named `label=<node id>`, one service and `wires network`; two
+hosts that `wires join <network>` and serve one service from
+`.scripts/fixtures/host.json`, both also the network's directories, empty
+until the admin's `wires policy push`; then callers whose whole onboarding
+is `wires login <network>` (against the hermetic `dev-mock-idp`). It
+asserts a caller that hasn't joined listing and dialing nothing, `wires
+services` / `wires call` (arguments and stdin) / `wires mcp`, a signed-in
+person no role matches told at sign-in, by `wires services` and by `wires
+call` that she is not in the network (exit 1), an analyst the hosts'
+`also_require` refuses (exit 77), `.shell id` refused by `sqlite3 -safe`, a
+push and `wires inbox` (and `--wait`), failover to the spare, and `wires
+remove <email>`: exit 77 with nothing on stdout, and pushes refused at send
+and at fetch. All on loopback in a fresh `mktemp -d`, every step asserted.
+`.scripts/demo-push.sh --quiet` does the same for push (a build service that
+calls the agent back, a locked caller), and
 `.scripts/demo-native-service.sh --lang python|node` (`make demo-python`,
-`make demo-node`) for a native service written in Python or TypeScript:
-the kv example as the host, called with the shipped `wires`, down to a
-clean `stop()` (Python needs `uv`, TypeScript Node >= 22.18; the node demo
-also typechecks the example against the generated `index.d.ts`). All three
-build what they need with Cargo; `--keep` leaves the temporary keystores
-behind to poke at. Keep their paths short: macOS limits unix-socket paths
-to 104 bytes.
+`make demo-node`) for a native service written in Python or TypeScript: the
+kv example as the host, called with the shipped `wires`, down to a clean
+`stop()` (Python needs `uv`, TypeScript Node >= 22.18; the node demo also
+typechecks the example against the generated `index.d.ts`). All three build
+what they need with Cargo (`WIRES_BIN` and `WIRES_DEV_BIN` point them at
+binaries you built); `--keep` leaves the temporary keystores behind to poke
+at.

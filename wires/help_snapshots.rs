@@ -21,13 +21,11 @@ use crate::Cli;
 use crate::caller::lock::Refused;
 use crate::help;
 use crate::host::gate::{
-    GateRefusal, HOST_MISCONFIGURED, IDP_UNREACHABLE, NOT_ADMITTED, TOKEN_UNVERIFIED,
+    GateRefusal, HOST_MISCONFIGURED, IDP_UNREACHABLE, NOT_ADMITTED, SIGN_IN_EXPIRED,
 };
 
 /// The commands a caller runs: `wires --help` lists exactly these.
-const CALLER: &[&str] = &[
-    "services", "call", "login", "join", "id", "watch", "inbox", "mcp",
-];
+const CALLER: &[&str] = &["services", "call", "login", "inbox", "mcp"];
 
 /// Where the snapshots live.
 fn dir() -> PathBuf {
@@ -106,17 +104,40 @@ fn hides(path: &[String]) -> bool {
         .any(|a| a.is_hide_set() && a.get_long().is_some())
 }
 
+/// The snapshots the other tests here write: not a command's help.
+const NOT_HELP: &[&str] = &["mcp-server.txt", "errors.txt"];
+
 #[test]
 fn every_help_text_matches_its_snapshot() {
     let mut diffs = Vec::new();
-    diffs.extend(check("wires.txt", &help_of(&[])));
-    diffs.extend(check("wires.all.txt", &help_all_of(&[])));
+    let mut names: Vec<String> = NOT_HELP.iter().map(|s| s.to_string()).collect();
+    let mut snap = |name: String, actual: String| {
+        diffs.extend(check(&name, &actual));
+        names.push(name);
+    };
+    snap("wires.txt".into(), help_of(&[]));
+    snap("wires.all.txt".into(), help_all_of(&[]));
     for path in paths() {
         let p: Vec<&str> = path.iter().map(String::as_str).collect();
         let name = p.join("-");
-        diffs.extend(check(&format!("{name}.txt"), &help_of(&p)));
+        snap(format!("{name}.txt"), help_of(&p));
         if hides(&path) {
-            diffs.extend(check(&format!("{name}.all.txt"), &help_all_of(&p)));
+            snap(format!("{name}.all.txt"), help_all_of(&p));
+        }
+    }
+    // A snapshot that no command (or test here) writes describes something
+    // that is gone: an orphan. Blessing deletes it.
+    for entry in std::fs::read_dir(dir()).unwrap() {
+        let file = entry.unwrap().file_name().to_string_lossy().into_owned();
+        if names.contains(&file) {
+            continue;
+        }
+        if std::env::var_os("WIRES_BLESS").is_some() {
+            std::fs::remove_file(dir().join(&file)).unwrap();
+        } else {
+            diffs.push(format!(
+                "{file} is no command's snapshot (WIRES_BLESS=1 deletes it)"
+            ));
         }
     }
     assert!(diffs.is_empty(), "{}", diffs.join("\n\n"));
@@ -143,26 +164,29 @@ fn error_messages_match_their_snapshot() {
     let svc = ServiceName::new("orders-db").unwrap();
     let analyst = RoleName::new("analyst").unwrap();
     let v = StateVersion(7);
-    let registry = |refusal| GateRefusal::Registry {
-        refusal,
-        version: v,
-    };
+    // Not in its `allow`, no such service, nobody allowed: one sentence.
+    let not_callable = GateRefusal::NotCallable {
+        service: svc.clone(),
+        refusal: Refusal::NotInRole {
+            service: svc.clone(),
+            allow: vec![analyst.clone()],
+            principal: Some("carol@partner.example".into()),
+        },
+    }
+    .to_string();
+    for refusal in [
+        Refusal::UnknownService(svc.clone()),
+        Refusal::NobodyAllowed(svc.clone()),
+    ] {
+        let same = GateRefusal::NotCallable {
+            service: svc.clone(),
+            refusal,
+        };
+        assert_eq!(same.to_string(), not_callable);
+    }
     let refusals = [
         NOT_ADMITTED.to_owned(),
-        registry(Refusal::NotInRole {
-            service: svc.clone(),
-            allow: vec![analyst.clone()],
-            principal: Some("sec@audit.example".into()),
-        })
-        .to_string(),
-        registry(Refusal::NotInRole {
-            service: svc.clone(),
-            allow: vec![analyst.clone()],
-            principal: None,
-        })
-        .to_string(),
-        registry(Refusal::UnknownService(svc.clone())).to_string(),
-        registry(Refusal::NobodyAllowed(svc.clone())).to_string(),
+        not_callable,
         GateRefusal::NotAssigned {
             service: svc.clone(),
             version: v,
@@ -171,11 +195,11 @@ fn error_messages_match_their_snapshot() {
         GateRefusal::AlsoRequire {
             service: svc.clone(),
             roles: vec![analyst.clone()],
-            principal: Some("alice@example.com".into()),
+            principal: "alice@example.com".into(),
         }
         .to_string(),
         GateRefusal::Unvouched { version: v }.to_string(),
-        TOKEN_UNVERIFIED.to_owned(),
+        SIGN_IN_EXPIRED.to_owned(),
         IDP_UNREACHABLE.to_owned(),
         HOST_MISCONFIGURED.to_owned(),
     ];
@@ -183,9 +207,23 @@ fn error_messages_match_their_snapshot() {
         .iter()
         .map(|r| format!("wires: {} [exit 77]", help::refusal(r)))
         .collect();
+    // What a signed-in caller says for a host's NOT_ADMITTED, from its own
+    // token: one with a verified email, one without, one expired.
+    {
+        use base64::Engine as _;
+        let token = |claims: &str| {
+            library::IdToken::new(format!("e30.{}.sig", library::B64.encode(claims)))
+        };
+        let with = token(r#"{"email":"carol@partner.example","email_verified":true,"exp":9}"#);
+        let without = token(r#"{"sub":"1","exp":9}"#);
+        for (t, now) in [(&with, 1), (&without, 1), (&with, 10)] {
+            let said = crate::caller::hello::explain_not_admitted(Some(t), now);
+            lines.push(format!("wires: {} [exit 77]", help::refusal(&said)));
+        }
+    }
     let call = crate::caller::call::not_callable;
-    lines.push(format!("wires: {} [exit 1]", call(&svc, true)));
-    lines.push(format!("wires: {} [exit 1]", call(&svc, false)));
+    lines.push(format!("wires: {} [exit 1]", call(&svc)));
+    lines.push(format!("wires: {} [exit 1]", help::NOT_SIGNED_IN));
     for refused in [
         Refused::Flag("--node-seed"),
         Refused::Env("WIRES_NODE_SEED"),
@@ -199,7 +237,7 @@ fn error_messages_match_their_snapshot() {
         panic!("no key there");
     };
     lines.push(format!("wires: {} [exit 1]", help::brief(&no_key)));
-    let Err(bad_token) = crate::caller::join::join_in(&ks, "not-a-token", 0) else {
+    let Err(bad_token) = crate::caller::join::join_in(&ks, "not-a-token") else {
         panic!("not a token");
     };
     lines.push(format!("wires: {} [exit 1]", help::brief(&bad_token)));
@@ -289,13 +327,16 @@ fn the_premise_is_short_and_in_the_right_words() {
 /// A refusal's next step is added only when the host's reason has none.
 #[test]
 fn a_refusal_gets_one_next_step() {
+    let own_rules = "alice@example.com is not admitted to orders-db by this host's own rules";
     assert_eq!(
-        help::refusal("not a member of this network"),
-        "denied by host: not a member of this network; don't retry: ask your admin for access"
+        help::refusal(own_rules),
+        format!("denied by host: {own_rules}; don't retry: ask your admin for access")
     );
     let login = "your ID token could not be verified; run `wires login`";
     assert_eq!(help::refusal(login), format!("denied by host: {login}"));
-    assert!(help::refusal("unknown service: x").ends_with("see `wires services`"));
+    assert!(
+        help::refusal("no service named `x` that you may call").ends_with("see `wires services`")
+    );
 }
 
 /// Without `--verbose`, an error prints up to its first next step, or its

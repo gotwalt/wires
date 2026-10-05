@@ -96,16 +96,24 @@ impl State {
 
     /// An ES256 ID token for `email`, optionally with a nonce.
     fn mint_as(&self, email: &str, nonce: Option<&str>, exp: i64) -> String {
+        self.mint_claims(email, true, nonce, exp)
+    }
+
+    /// An ES256 ID token for the user `who` (its `sub` is `sub-<who>`),
+    /// carrying `who` as a verified email only when `with_email`.
+    fn mint_claims(&self, who: &str, with_email: bool, nonce: Option<&str>, exp: i64) -> String {
         let header = json!({"alg": "ES256", "kid": self.kid, "typ": "JWT"});
         let mut claims = json!({
             "iss": self.issuer,
-            "sub": format!("sub-{email}"),
+            "sub": format!("sub-{who}"),
             "aud": MOCK_CLIENT_ID,
             "exp": exp,
             "iat": exp - 3600,
-            "email": email,
-            "email_verified": true,
         });
+        if with_email {
+            claims["email"] = who.into();
+            claims["email_verified"] = true.into();
+        }
         if let Some(n) = nonce {
             claims["nonce"] = n.into();
         }
@@ -222,6 +230,23 @@ impl MockIdp {
     /// Mint a token directly (bypassing the flow) with the current key.
     pub(crate) fn mint(&self, nonce: &library::OidcNonce, exp: i64) -> library::IdToken {
         library::IdToken::new(self.state.lock().unwrap().mint(Some(nonce.as_str()), exp))
+    }
+
+    /// Mint a token for `who` directly, carrying it as a verified email
+    /// only when `with_email` (an IdP account with no verified email).
+    pub(crate) fn mint_for(
+        &self,
+        who: &str,
+        with_email: bool,
+        nonce: &library::OidcNonce,
+        exp: i64,
+    ) -> library::IdToken {
+        library::IdToken::new(self.state.lock().unwrap().mint_claims(
+            who,
+            with_email,
+            Some(nonce.as_str()),
+            exp,
+        ))
     }
 
     /// Swap in a new signing key under a new `kid`.

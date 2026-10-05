@@ -1,18 +1,19 @@
-//! A service entry the root signs on its own, like a badge (card 36d).
+//! A service entry the root signs on its own (card 36d).
 //!
 //! The policy's head signs a hash of every item ([`ItemsHash`](crate::ItemsHash)),
 //! which is all a host or directory needs: they hold the whole policy. A
 //! caller holds only the services it may use (its [`View`](crate::View)), so
 //! each service entry also carries its own root signature: a caller checks
 //! each entry alone, against the root key it joined with, and a directory can
-//! neither forge one nor move one to another fabric.
+//! neither forge one nor move one to another network.
 //!
 //! The service item in the policy *is* the signed entry, so the head's
 //! `items_hash` covers it too.
 //!
 //! - **Signed bytes:** [`ENTRY_CONTEXT`] followed by the canonical JSON of
 //!   every field but `sig`.
-//! - **Format:** [`ENTRY_V1`], signed; unknown fields are refused at decode.
+//! - **Format:** [`ENTRY_V2`], signed; any other format is refused, and
+//!   unknown fields are refused at decode.
 //! - **`version`** is the policy version at which the entry last changed. An
 //!   edit re-signs only the entries it changes
 //!   ([`Policy::sign_after`](crate::Policy::sign_after)); the rest keep their
@@ -23,12 +24,12 @@
 //! use library::{NodeIdentity, Service, ServiceName, SignedEntry, StateVersion};
 //! let root = NodeIdentity::from_seed([1u8; 32]);
 //! let service = Service {
-//!     description: "uptime".into(), allow: vec![], hosts: vec![], readers: vec![],
+//!     description: "uptime".into(), allow: vec![], hosts: vec![],
 //! };
 //! let name = ServiceName::new("status").unwrap();
 //! let entry = SignedEntry::sign(&root, StateVersion(4), name, service).unwrap();
 //! entry.verify(root.node_id()).unwrap();
-//! // Another fabric's root doesn't vouch for it.
+//! // Another network's root doesn't vouch for it.
 //! assert!(entry.verify(NodeIdentity::from_seed([2u8; 32]).node_id()).is_err());
 //! ```
 
@@ -40,8 +41,8 @@ use crate::head::StateVersion;
 use crate::identity::{AlgorithmId, NodeId, NodeIdentity, Signature};
 use crate::registry::{Service, ServiceName};
 
-/// The current (and only) signed-entry format.
-pub const ENTRY_V1: u8 = 1;
+/// The current (and only accepted) signed-entry format.
+pub const ENTRY_V2: u8 = 2;
 
 /// Domain-separation prefix of a signed entry's bytes.
 pub const ENTRY_CONTEXT: &[u8] = b"wires/service-entry/v1\0";
@@ -50,7 +51,7 @@ pub const ENTRY_CONTEXT: &[u8] = b"wires/service-entry/v1\0";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedEntry {
-    /// Format discriminant; [`ENTRY_V1`]. Signed.
+    /// Format discriminant; [`ENTRY_V2`]. Signed.
     pub format: u8,
     /// The root's node id: the authority, pinned by
     /// [`verify`](Self::verify).
@@ -60,7 +61,7 @@ pub struct SignedEntry {
     pub version: StateVersion,
     /// The service's name.
     pub name: ServiceName,
-    /// Who may call and read it, and which hosts run it.
+    /// Who may call it, and which hosts run it.
     pub service: Service,
     /// Which scheme `sig` was produced with.
     pub alg: AlgorithmId,
@@ -70,7 +71,7 @@ pub struct SignedEntry {
 
 impl SignedEntry {
     /// Sign `service` as entry `name` at `version` with the root key (the
-    /// fabric is the root's node id).
+    /// entry's `fabric` is the root's node id).
     pub fn sign(
         root: &NodeIdentity,
         version: StateVersion,
@@ -78,7 +79,7 @@ impl SignedEntry {
         service: Service,
     ) -> Result<SignedEntry> {
         let body = SignedBody {
-            format: ENTRY_V1,
+            format: ENTRY_V2,
             fabric: root.node_id(),
             version,
             name: &name,
@@ -98,12 +99,12 @@ impl SignedEntry {
     }
 
     /// Verify it on its own: format and algorithm, the `fabric == root` pin
-    /// ([`Error::InvalidSignature`] for another fabric's entry), and the
+    /// ([`Error::InvalidSignature`] for another network's entry), and the
     /// root's signature. Says nothing about which head it is served under
     /// (a [`View`](crate::View) or [`SignedPolicy`](crate::SignedPolicy)
     /// checks `version` against its head).
     pub fn verify(&self, root: NodeId) -> Result<()> {
-        if self.format != ENTRY_V1 {
+        if self.format != ENTRY_V2 {
             return Err(Error::UnsupportedVersion);
         }
         if self.alg != AlgorithmId::Ed25519 {
@@ -173,7 +174,6 @@ mod tests {
             description: "uptime".into(),
             allow: vec![crate::RoleName::new("staff").unwrap()],
             hosts: vec![node(10)],
-            readers: vec![],
         }
     }
 
@@ -191,7 +191,7 @@ mod tests {
     fn sign_verify_round_trip() {
         let e = entry();
         e.verify(root().node_id()).unwrap();
-        assert_eq!(e.format, ENTRY_V1);
+        assert_eq!(e.format, ENTRY_V2);
         assert_eq!(e.fabric, root().node_id());
         let back: SignedEntry = serde_json::from_slice(&canonical_bytes(&e).unwrap()).unwrap();
         assert_eq!(back, e);
@@ -226,7 +226,7 @@ mod tests {
                 "{t:?}"
             );
         }
-        // Another fabric's root signed it: refused under ours.
+        // Another network's root signed it: refused under ours.
         let other = NodeIdentity::from_seed([9u8; 32]);
         let foreign =
             SignedEntry::sign(&other, StateVersion(4), good.name.clone(), service()).unwrap();
@@ -240,12 +240,15 @@ mod tests {
         relabelled.fabric = root().node_id();
         assert!(relabelled.verify(root().node_id()).is_err());
 
-        let mut t = good.clone();
-        t.format = ENTRY_V1 + 1;
-        assert!(matches!(
-            t.verify(root().node_id()),
-            Err(Error::UnsupportedVersion)
-        ));
+        // Any other format: refused.
+        for format in [1, ENTRY_V2 + 1] {
+            let mut t = good.clone();
+            t.format = format;
+            assert!(matches!(
+                t.verify(root().node_id()),
+                Err(Error::UnsupportedVersion)
+            ));
+        }
     }
 
     #[test]
@@ -254,9 +257,7 @@ mod tests {
         let name = ServiceName::new("status").unwrap();
         assert!(e.is_for(root().node_id(), &name, &service()));
         let mut changed = service();
-        changed
-            .readers
-            .push(crate::RoleName::new("auditor").unwrap());
+        changed.allow.push(crate::RoleName::new("auditor").unwrap());
         assert!(!e.is_for(root().node_id(), &name, &changed));
         assert!(!e.is_for(node(9), &name, &service()));
         assert!(!e.is_for(

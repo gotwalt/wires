@@ -2,7 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Unix time now, in seconds (expiries: memberships, signed policies, tokens).
+/// Unix time now, in seconds (expiries: signed policies, freshness, ID tokens).
 pub(crate) fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -10,7 +10,7 @@ pub(crate) fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Unix time now, in milliseconds (the `at_ms` of a record, push expiry).
+/// Unix time now, in milliseconds (a push's `at_ms` and expiry).
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

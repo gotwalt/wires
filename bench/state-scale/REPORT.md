@@ -10,6 +10,16 @@ proofs), and the *apex* caller rows after card 37 (views, as built).
 history at 055ac46), and the *apex* ones by `policy_sizes`; rates are
 assumptions, listed in `model.py`'s `ASSUMPTIONS`.*
 
+*Note (2026-10-05): this models designs that have since changed, and has not
+been redone. Badges, invites, membership, reader roles, the record stream and
+`wires watch` are gone (cards 40 and 41): a node is admitted by its person's
+IdP sign-in and a role that matches, and a caller joins with a network
+string (`wires login <network>`; 578 B in `policy_sizes`), not an invite.
+Directories now also cap view subscriptions (two pools of 4,096, 16 per
+person; card 47). The rows and findings below are from the model as it was.
+`policy_sizes` re-run on 2026-10-05 printed the whole policy at 65 KB, 647 KB
+and 3.2 MB (100, 1k, 5k services); the other apex sizes above are unchanged.*
+
 **The question** (asked at 655a96c, before cards 35–37). Every node then held
 the whole admin-signed state and re-fetched it after every edit. How much did
 each node receive, per day, as the org grew, and what would a persistent

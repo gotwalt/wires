@@ -5,9 +5,11 @@
 //! wires call kv -- set greeting <<< 'hello'   # the value is stdin
 //! wires call kv -- get greeting               # hello
 //! wires call kv -- keys                       # greeting
+//! wires call kv -- whoami                     # alice@example.com, then the ID token unsigned
 //! ```
 //!
-//! Run it from a joined node's keystore, trusting one IdP:
+//! Run it from a host's keystore (one that ran `wires join <network>`),
+//! trusting one IdP:
 //!
 //! ```text
 //! cargo run -p wires --example kv -- <WIRES_HOME> <issuer> <audience>

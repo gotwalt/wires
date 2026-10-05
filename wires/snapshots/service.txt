@@ -1,4 +1,4 @@
-Register services: add, set, rm (who may call and read, which hosts)
+Register services: add, set, rm (who may call them, which hosts run them)
 
 Usage: wires service <COMMAND>
 
@@ -13,5 +13,5 @@ Options:
 
 Examples:
   wires service add orders-db --description "Read-only SQL over the orders database" \
-    --allow analyst --reader security --host workbench
+    --allow analyst --host workbench=<node id>
   wires service rm orders-db

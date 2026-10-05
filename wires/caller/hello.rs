@@ -1,74 +1,137 @@
-//! The caller's half of the session handshake: build the [`Hello`] from what
-//! this node holds: its membership, the head version of its view, and its
-//! stored ID token from `wires login` (the token travels in the handshake).
+//! The caller's half of the handshakes: the ID token `wires login` stored,
+//! which travels in each session's, inbox fetch's and directory request's
+//! `hello`; and what the caller says when a host or directory answers that
+//! it is not admitted ([`explain_not_admitted`]).
 
-use library::{Hello, IdToken, Membership, StateVersion};
+use base64::Engine as _;
+use library::IdToken;
+use serde_json::Value;
 
 use crate::admin::keystore::Keystore;
 use crate::caller::login::ID_TOKEN_FILE;
-use crate::caller::view;
+use crate::host::gate::NOT_ADMITTED;
 
-/// Build this node's [`Hello`] around `membership` (from the keystore or a
-/// `--membership` flag); the view's head version and the ID token come from
-/// `ks`. A missing ID token is not an error (the host decides whether the
-/// service needs one). A stored view that fails to verify counts as none
-/// (version 0): the host then hands back its head.
-pub(crate) fn with_membership(ks: &Keystore, membership: Membership) -> Hello {
-    let state_version = match view::read(ks, membership.fabric) {
-        Ok(Some(held)) => held.version(),
-        Ok(None) => StateVersion(0),
-        Err(e) => {
-            tracing::warn!("the stored view is unusable: {e:#}");
-            StateVersion(0)
-        }
-    };
-    Hello {
-        membership,
-        state_version,
-        id_token: stored_token(ks),
-    }
-}
-
-/// The ID token `wires login` stored, if any.
+/// The ID token `wires login` stored, if any. A missing token is not an
+/// error here: whoever needs one says `not signed in` (every host and
+/// directory request needs one).
 pub(crate) fn stored_token(ks: &Keystore) -> Option<IdToken> {
     let text = std::fs::read_to_string(ks.path(ID_TOKEN_FILE)).ok()?;
     let text = text.trim();
     (!text.is_empty()).then(|| IdToken::new(text))
 }
 
+/// The claims of an unverified compact JWS: what this caller reads from its
+/// own stored token, never a basis for a decision.
+pub(crate) fn unverified_claims(jws: &str) -> Option<Value> {
+    let payload = jws.split('.').nth(1)?;
+    let bytes = library::B64.decode(payload.trim_end_matches('=')).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// What a signed-in caller says when a host or directory answered
+/// [`NOT_ADMITTED`], read from its own stored token (nothing is sent): the
+/// host or directory tells no reason apart, but the person can act on one of these.
+///
+/// - no token: [`NOT_SIGNED_IN`](crate::help::NOT_SIGNED_IN);
+/// - expired at `now`: sign in again;
+/// - no verified email: the network admits only a verified email;
+/// - otherwise: no role matches that email, or they were removed.
+pub(crate) fn explain_not_admitted(token: Option<&IdToken>, now: i64) -> String {
+    let Some(token) = token else {
+        return format!(
+            "not admitted to this network: {}",
+            crate::help::NOT_SIGNED_IN
+        );
+    };
+    let claims = unverified_claims(token.as_str()).unwrap_or(Value::Null);
+    if claims
+        .get("exp")
+        .and_then(Value::as_i64)
+        .is_some_and(|exp| now > exp)
+    {
+        return "not admitted to this network: your sign-in has expired; run `wires login`".into();
+    }
+    let verified = matches!(claims.get("email_verified"), Some(Value::Bool(true)))
+        || claims.get("email_verified").and_then(Value::as_str) == Some("true");
+    match claims.get("email").and_then(Value::as_str) {
+        Some(email) if verified => format!(
+            "not admitted to this network: no role in this network matches {email}, or you were \
+             removed: ask your admin"
+        ),
+        _ => "not admitted to this network: your sign-in carries no verified email, and this \
+              network admits only a verified email: ask your admin"
+            .into(),
+    }
+}
+
+/// [`explain_not_admitted`] for `ks`'s stored token, now.
+pub(crate) fn explain_not_admitted_in(ks: &Keystore) -> String {
+    explain_not_admitted(stored_token(ks).as_ref(), crate::clock::now_unix())
+}
+
+/// A host's or directory's refusal `reason` as this caller says it: the
+/// [`explain_not_admitted`] sentence for [`NOT_ADMITTED`], else `reason`.
+pub(crate) fn say_refusal(ks: &Keystore, reason: &str) -> String {
+    if reason == NOT_ADMITTED {
+        explain_not_admitted_in(ks)
+    } else {
+        reason.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use library::{NodeIdentity, Policy};
 
-    fn keystore() -> Keystore {
-        Keystore::at(crate::testutil::temp_dir())
+    /// A token whose payload is `claims` (unsigned: only read here).
+    fn token(claims: Value) -> IdToken {
+        IdToken::new(format!(
+            "e30.{}.sig",
+            library::B64.encode(claims.to_string())
+        ))
+    }
+
+    /// Each kind of signed-in caller hears what it can act on, and each
+    /// names the next step.
+    #[test]
+    fn a_signed_in_caller_says_what_its_person_can_act_on() {
+        let now = 1_000;
+        let alice = token(serde_json::json!({
+            "email": "alice@x.com", "email_verified": true, "exp": 2_000
+        }));
+        assert_eq!(
+            explain_not_admitted(Some(&alice), now),
+            "not admitted to this network: no role in this network matches alice@x.com, or you \
+             were removed: ask your admin"
+        );
+        let unverified = token(serde_json::json!({
+            "email": "alice@x.com", "email_verified": false, "exp": 2_000
+        }));
+        let no_email = token(serde_json::json!({"sub": "1", "exp": 2_000}));
+        for t in [&unverified, &no_email] {
+            assert!(
+                explain_not_admitted(Some(t), now).contains("no verified email"),
+                "{}",
+                explain_not_admitted(Some(t), now)
+            );
+        }
+        assert!(explain_not_admitted(Some(&alice), 3_000).contains("expired; run `wires login`"));
+        assert!(explain_not_admitted(None, now).contains("run `wires login`"));
+        for t in [Some(&alice), Some(&no_email), None] {
+            assert!(crate::help::has_next_step(&explain_not_admitted(t, now)));
+        }
+        // Garbage is read as no email, never a panic.
+        let junk = IdToken::new("not-a-jws");
+        assert!(explain_not_admitted(Some(&junk), now).contains("no verified email"));
     }
 
     #[test]
-    fn carries_membership_view_version_and_token() {
-        let root = NodeIdentity::from_seed([1; 32]);
-        let me = NodeIdentity::from_seed([2; 32]);
-        let ks = keystore();
-        let m = Membership::mint(&root, me.node_id(), 0, i64::MAX).unwrap();
-        ks.save_membership(&m).unwrap();
-
-        let h = with_membership(&ks, m.clone());
-        assert_eq!(h.membership, m);
-        assert_eq!(h.state_version, StateVersion(0));
-        assert_eq!(h.id_token, None);
-
-        let mut s = Policy::new(root.node_id());
-        s.version = StateVersion(4);
-        s.issued = 1;
-        s.not_after = i64::MAX;
-        let signed = crate::testutil::signed_policy(&root, s);
-        let held = view::HeldView::fetched(signed.view_for(None, None), None, 10);
-        view::write(&ks, root.node_id(), &held).unwrap();
+    fn reads_the_stored_token_trimmed() {
+        let ks = Keystore::at(crate::testutil::temp_dir());
+        assert_eq!(stored_token(&ks), None);
+        std::fs::write(ks.path(ID_TOKEN_FILE), "\n").unwrap();
+        assert_eq!(stored_token(&ks), None);
         std::fs::write(ks.path(ID_TOKEN_FILE), "a.b.c\n").unwrap();
-
-        let h = with_membership(&ks, m.clone());
-        assert_eq!(h.state_version, StateVersion(4));
-        assert_eq!(h.id_token, Some(IdToken::new("a.b.c")));
+        assert_eq!(stored_token(&ks), Some(IdToken::new("a.b.c")));
     }
 }

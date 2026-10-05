@@ -3,8 +3,8 @@
 //! `library` stays pure (no iroh/tokio); this module is where the
 //! key-addressed session meets the iroh QUIC endpoint. The session ALPN is
 //! [`ALPN`]. A caller opens a bi-stream and sends a
-//! [`Frame::Hello`] — its root-signed membership, the
-//! policy version it holds, and its IdP ID token — followed at once by
+//! [`Frame::Hello`] — the policy version it holds and its IdP ID token,
+//! which is what admits it — followed at once by
 //! a [`Frame::Invoke`] naming a service plus per-call arguments. The host
 //! ([`serve_session_permitted`]) decides by the signed policy it holds, re-read
 //! per connection (see [`gate`](crate::host::gate)), then execs the
@@ -22,13 +22,17 @@
 //!   connection, so a `wires remove` takes effect on the next dial rather
 //!   than the next restart.
 //! - **Strangers are cheap.** Anyone can open a connection, so until the
-//!   host knows the peer is a member it reads small frames only
+//!   host has admitted the peer it reads small frames only
 //!   ([`MAX_HELLO_FRAME`], [`MAX_INVOKE_FRAME`]), holds at most
-//!   [`MAX_PREAUTH_SESSIONS`] such sessions, verifies no token, says only
-//!   [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED), and writes nothing to
-//!   the call log.
-//! - **No call runs unlogged.** An admitted call's `Started` is in the call
-//!   log, `fsync`ed, before its child is spawned ([`AuditSink`]).
+//!   [`MAX_PREAUTH_SESSIONS`] such sessions, spends one token check on it
+//!   (keys fetched only for a trusted issuer, an unknown `kid` refetched at
+//!   most once per window), says only
+//!   [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED) (or that its sign-in
+//!   expired, or the IdP is unreachable), and traces the refusal throttled
+//!   ([`Throttle`]), so strangers can't flood the log.
+//! - **One log line per call.** An admitted call's end, and an identified
+//!   caller's refusal, is one `info` line
+//!   ([`call_trace`](crate::host::call_trace)); nothing else is kept.
 
 use std::sync::Arc;
 
@@ -36,12 +40,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::endpoint::presets::N0;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 
-use library::{
-    Chunk, Frame, Hello, HelloAck, Invocation, NodeId, NodeIdentity, ServiceName, check_inclusion,
-};
+use library::{Chunk, Frame, Hello, HelloAck, Invocation, NodeId, NodeIdentity, ServiceName};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 
+use crate::host::call_trace::CallTrace;
 use crate::host::gate::Implementation;
 use crate::host::service::Running;
 use tokio::sync::mpsc;
@@ -54,12 +57,12 @@ pub const ALPN: &[u8] = b"wires/session/1";
 const PUMP_BUF: usize = 64 * 1024;
 
 /// Largest frame body accepted off the wire once a session is admitted.
-/// Bounds what a member can make the host buffer; generous versus the 64 KiB
+/// Bounds what an admitted caller can make the host buffer; generous versus the 64 KiB
 /// stdio chunk size, but far below "exhaust memory".
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// Largest [`Frame::Hello`] a host reads, before it knows who is asking: a
-/// badge, a policy version and an ID token fit in a few KiB.
+/// policy version and an ID token fit in a few KiB.
 pub(crate) const MAX_HELLO_FRAME: usize = 64 * 1024;
 
 /// Largest [`Frame::Invoke`] a host reads before admitting the caller. An
@@ -70,7 +73,7 @@ pub(crate) const MAX_HELLO_FRAME: usize = 64 * 1024;
 pub(crate) const MAX_INVOKE_FRAME: usize = 8 * library::MAX_ARGV_BYTES;
 
 /// How many sessions a host holds open at once *before* deciding who they are
-/// (reading `Hello`/`Invoke`, checking membership, verifying the ID token).
+/// (reading `Hello`/`Invoke`, verifying the ID token, checking the bans).
 /// One more is closed at once, without a reply. Admitted sessions don't
 /// count: the permit is returned as soon as the gate decides.
 pub(crate) const MAX_PREAUTH_SESSIONS: usize = 64;
@@ -79,108 +82,9 @@ pub(crate) const MAX_PREAUTH_SESSIONS: usize = 64;
 /// peer that connects but never speaks can't hold a session task open.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long a session waits for the call log to take one record — its turn
-/// in the queue plus the append and `fsync` — before treating the log as
-/// unavailable. See [`AuditSink::append`].
-pub(crate) const LOG_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Denial reason: the host got something other than an
 /// [`Frame::Invoke`] after the handshake.
 pub const DENY_INVOKE_REQUIRED: &str = "invoke required";
-
-/// Denial reason: the host could not record the call's `Started` entry, so
-/// the call did not run. The cause is in the host's own trace.
-pub const DENY_LOG_UNAVAILABLE: &str = "this host can't record calls right now, so it runs none; \
-                                        try again later";
-
-/// The call log could not take a record (see [`AuditSink::append`]). The
-/// text is for the host's trace, never for a caller.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LogUnavailable(String);
-
-impl std::fmt::Display for LogUnavailable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the call log did not take the record: {}", self.0)
-    }
-}
-
-impl std::error::Error for LogUnavailable {}
-
-/// One record on its way to the call log, with where to say whether it was
-/// logged. Built by [`AuditSink::append`]; drained by the log's writer
-/// ([`call_log::tee`](crate::host::call_log::tee)).
-#[derive(Debug)]
-pub struct Pending {
-    /// The record to append.
-    pub record: library::AuditRecord,
-    /// Answered once the record is durably logged (or failed to be).
-    done: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
-}
-
-impl Pending {
-    /// Tell the waiting session how the append went: `Ok` only once the
-    /// entry is written and `fsync`ed.
-    pub fn answer(self, outcome: std::result::Result<(), String>) {
-        let _ = self.done.send(outcome);
-    }
-}
-
-/// The host's handle on its call log: where sessions and pushes send
-/// [`AuditRecord`](library::AuditRecord)s.
-///
-/// **Fail closed.** [`append`](Self::append) waits (at most [`LOG_WAIT`])
-/// until the record is written and `fsync`ed, and says whether it was. A
-/// full queue is waited on, never skipped, so no record is silently dropped.
-/// A call's `Started` must be logged before its child is spawned, or the call
-/// is refused; what a failure of any later record means is decided by the
-/// caller of `append` (see [`audit`](crate::host::audit)).
-#[derive(Clone, Debug)]
-pub struct AuditSink(tokio::sync::mpsc::Sender<Pending>);
-
-impl AuditSink {
-    /// A sink and the queue the log's writer drains (at most `cap` records
-    /// waiting; a session beyond that waits its turn).
-    pub fn log_queue(cap: usize) -> (Self, tokio::sync::mpsc::Receiver<Pending>) {
-        let (tx, rx) = tokio::sync::mpsc::channel(cap);
-        (Self(tx), rx)
-    }
-
-    /// An in-memory sink (tests): every record is answered as logged once it
-    /// is in the returned receiver, which holds at most `cap`. Must be called
-    /// inside a Tokio runtime.
-    #[cfg(test)]
-    pub fn channel(cap: usize) -> (Self, tokio::sync::mpsc::Receiver<library::AuditRecord>) {
-        let (sink, mut queue) = Self::log_queue(cap);
-        let (tx, rx) = tokio::sync::mpsc::channel(cap);
-        tokio::spawn(async move {
-            while let Some(pending) = queue.recv().await {
-                let kept = tx.send(pending.record.clone()).await;
-                pending.answer(kept.map_err(|_| "the receiver is gone".to_string()));
-            }
-        });
-        (sink, rx)
-    }
-
-    /// Append `record` to the call log, waiting until it is durably written.
-    /// `Err` when the log refused it, is gone, or took longer than
-    /// [`LOG_WAIT`] (the record may still be written later).
-    pub async fn append(&self, record: library::AuditRecord) -> Result<(), LogUnavailable> {
-        let (done, answer) = tokio::sync::oneshot::channel();
-        let wait = async {
-            self.0
-                .send(Pending { record, done })
-                .await
-                .map_err(|_| LogUnavailable("the log writer is gone".into()))?;
-            answer
-                .await
-                .map_err(|_| LogUnavailable("the log writer is gone".into()))?
-                .map_err(LogUnavailable)
-        };
-        tokio::time::timeout(LOG_WAIT, wait)
-            .await
-            .map_err(|_| LogUnavailable(format!("no answer within {LOG_WAIT:?}")))?
-    }
-}
 
 /// Keeps a trace of refusals a stranger can cause from becoming a flood:
 /// each one is traced at `debug`, and at most one `info` line per
@@ -234,15 +138,14 @@ impl Throttle {
             tracing::info!(
                 refused = n,
                 last_peer = %peer.hex(),
-                "{what}: refused {n} unadmitted peer(s) since the last report (latest: {detail}); \
-                 not written to the call log"
+                "{what}: refused {n} unadmitted peer(s) since the last report (latest: {detail})"
             );
         }
     }
 }
 
-/// The refusal a session sends and returns: already traced (and, for a
-/// member, logged), so the accept loop need not warn about it again.
+/// The refusal a session sends and returns: already traced, so the accept
+/// loop need not warn about it again.
 #[derive(Debug)]
 pub(crate) struct Refused(pub(crate) String);
 
@@ -435,13 +338,14 @@ async fn deny<W: AsyncWrite + Unpin>(send: &mut W, reason: String) {
 }
 
 /// Pump a child output stream into `tx` as frames built by `make`
-/// ([`Frame::Stdout`] / [`Frame::Stderr`]).
+/// ([`Frame::Stdout`] / [`Frame::Stderr`]); returns how many bytes it sent.
 async fn pump_reader<R: AsyncRead + Unpin>(
     mut r: R,
     make: fn(Chunk) -> Frame,
     tx: mpsc::Sender<Frame>,
-) -> Result<()> {
+) -> Result<u64> {
     let mut buf = vec![0u8; PUMP_BUF];
+    let mut sent = 0u64;
     loop {
         let n = r.read(&mut buf).await.context("reading child output")?;
         if n == 0 {
@@ -454,8 +358,9 @@ async fn pump_reader<R: AsyncRead + Unpin>(
         {
             break;
         }
+        sent += n as u64;
     }
-    Ok(())
+    Ok(sent)
 }
 
 /// Read the [`Frame::Invoke`] a dialer sends right after its
@@ -472,15 +377,15 @@ async fn read_invocation<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Invocatio
 }
 
 /// Bridge a running service's stdio over the session until it exits (or
-/// stop it when `shutdown` says the dialer is gone), then log the call's
-/// `Finished` via `audit` and send its [`Frame::Exit`]. The call's `Started`
-/// is already logged and the ack already written.
+/// stop it when `shutdown` says the dialer is gone), then write the call's
+/// log line via `trace` and send its [`Frame::Exit`]. The ack is already
+/// written.
 async fn bridge<S, R>(
     send: S,
     mut recv: R,
     running: Running,
     shutdown: impl std::future::Future<Output = ()> + Send,
-    audit: Option<crate::host::audit::CallAudit>,
+    trace: CallTrace,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin + Send + 'static,
@@ -492,9 +397,6 @@ where
         stderr,
         mut process,
     } = running;
-    let stdin_tap = crate::host::audit::tap_stdin(audit.as_ref());
-    let child_stdout = crate::host::audit::tap_stdout(audit.as_ref(), stdout);
-    let child_stderr = crate::host::audit::tap_stderr(audit.as_ref(), stderr);
 
     // A single writer task serializes all server->client frames.
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
@@ -512,7 +414,6 @@ where
         loop {
             match read_frame(&mut recv).await? {
                 Some(Frame::Stdin(chunk)) => {
-                    stdin_tap.feed(chunk.as_bytes()); // audit: stdin
                     child_stdin.write_all(chunk.as_bytes()).await?;
                 }
                 Some(_) => {} // ignore unexpected frames from the dialer
@@ -523,8 +424,8 @@ where
         Ok::<(), anyhow::Error>(())
     });
 
-    let out_task = tokio::spawn(pump_reader(child_stdout, Frame::Stdout, tx.clone()));
-    let err_task = tokio::spawn(pump_reader(child_stderr, Frame::Stderr, tx.clone()));
+    let out_task = tokio::spawn(pump_reader(stdout, Frame::Stdout, tx.clone()));
+    let err_task = tokio::spawn(pump_reader(stderr, Frame::Stderr, tx.clone()));
 
     // Wait for the service, unless the dialer vanishes first — in which case
     // stop it and reap, rather than leaving an orphan behind. (The `wait()`
@@ -538,19 +439,16 @@ where
             process.wait().await.context("reaping the stopped service")?
         }
     };
-    out_task.await.context("stdout pump")??;
-    err_task.await.context("stderr pump")??;
+    let out_bytes = out_task.await.context("stdout pump")??;
+    let err_bytes = err_task.await.context("stderr pump")??;
     // The child is gone, so there is nobody left to feed. Don't wait for the
     // dialer's stdin to reach EOF: from a terminal it never does, and a
-    // `wires call tool -- ARGS` whose child ignores stdin would hang until
-    // Ctrl-D. Whatever stdin already arrived is in the audit tap.
+    // `wires call <service> -- ARGS` whose child ignores stdin would hang until
+    // Ctrl-D.
     stdin_task.abort();
     let _ = stdin_task.await;
 
-    tracing::info!(code, "service exited; closing session");
-    if let Some(audit) = audit {
-        audit.finish(code).await; // audit: finished, before the caller hears the exit
-    }
+    trace.finish(code, out_bytes + err_bytes);
     tx.send(Frame::Exit(code)).await.ok();
     drop(tx);
     writer.await.context("writer task")??;
@@ -616,35 +514,42 @@ impl iroh::protocol::ProtocolHandler for ServicesProtocol {
         // Let the dialer read a `Denied` (or the final frames) before the
         // connection is torn down; bounded so a vanished dialer can't pin us.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
-        result.map_err(|e| {
-            if e.downcast_ref::<Refused>().is_some() {
+        match result {
+            Ok(()) => Ok(()),
+            // An ordinary refusal: already traced (its `call refused`
+            // line, or the throttled stranger line), and no error to the
+            // router, which would log it again as a failed connection.
+            Err(e) if e.downcast_ref::<Refused>().is_some() => {
                 tracing::debug!(caller = %caller.hex(), "{e:#}");
-            } else {
-                tracing::warn!(caller = %caller.hex(), "session failed: {e:#}");
+                Ok(())
             }
-            iroh::protocol::AcceptError::from_boxed(e.into())
-        })
+            Err(e) => {
+                tracing::warn!(caller = %caller.hex(), "session failed: {e:#}");
+                Err(iroh::protocol::AcceptError::from_boxed(e.into()))
+            }
+        }
     }
 }
 
-/// Refuse a **member**: log the refusal in the call log (awaited; a log that
-/// can't take it is traced as an error) and send the reason.
-async fn refuse_member<W: AsyncWrite + Unpin>(
+/// Refuse an **admitted** caller: write its log line
+/// ([`call_trace::refused`](crate::host::call_trace::refused)) and send the
+/// reason, cut as the frame carries it.
+async fn refuse_admitted<W: AsyncWrite + Unpin>(
     send: &mut W,
-    audit: Option<&AuditSink>,
     caller: NodeId,
-    principal: Option<library::Principal>,
-    service: Option<ServiceName>,
+    principal: Option<&library::Principal>,
+    service: &ServiceName,
     reason: String,
 ) -> anyhow::Error {
-    crate::host::audit::denied(audit, caller, principal, service, &reason).await; // audit: denied
+    let reason = truncate_reason(reason);
+    crate::host::call_trace::refused(caller, principal, Some(service), &reason);
     deny(send, reason.clone()).await;
     Refused(reason).into()
 }
 
-/// Refuse a peer not known to be a member: send `reason`, trace `detail`
-/// (throttled), and write nothing to the call log — anyone can connect, so a
-/// stranger must not be able to fill the log or crowd out real calls.
+/// Refuse a peer not admitted: send `reason` and trace `detail`
+/// (throttled) — anyone can connect, so a stranger must not be able to
+/// flood the host's log.
 async fn refuse_stranger<W: AsyncWrite + Unpin>(
     send: &mut W,
     caller: NodeId,
@@ -678,28 +583,30 @@ where
 /// (at most [`MAX_INVOKE_FRAME`]), then decide by **this host's** signed
 /// policy (re-read now, so a removal applies on the next dial):
 ///
-/// 1. the caller's badge (membership credential), and that the policy
-///    doesn't ban it
-///    ([`ServicesHost::check_member`](crate::host::gate::ServicesHost::check_member)).
-///    Anyone else hears only [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED),
-///    costs no token verification, and is traced, not logged;
-/// 2. its ID token (verified under `identity.issuers`, bound to `caller`);
-/// 3. [`gate::admit`](crate::host::gate::admit): fresh → registered and
-///    assigned here → registry role → `also_require`;
-/// 4. whether `host.json` implements the service.
+/// 1. admission: its ID token (verified under the policy's issuers as
+///    `identity.issuers` narrows them, unexpired, bound to `caller`), and
+///    [`library::check_admitted`]: a verified email, neither the node nor
+///    the person banned, a role that matches
+///    ([`ServicesHost::admit_caller`](crate::host::gate::ServicesHost::admit_caller)).
+///    Anyone else hears only [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED)
+///    (or that its sign-in expired, or the IdP is unreachable), writes no
+///    log line, and is traced, throttled;
+/// 2. [`gate::admit`](crate::host::gate::admit): fresh → the policy lets
+///    the caller call it (else one fixed sentence) → assigned here →
+///    `also_require`;
+/// 3. whether `host.json` implements the service.
 ///
-/// An admitted caller's refusal is a [`Frame::Denied`] plus a call-log
-/// record.
+/// An admitted caller's refusal is a [`Frame::Denied`] plus its log line
+/// ([`call_trace`](crate::host::call_trace)).
 /// `preauth` is returned once this is decided.
 ///
-/// Admitted: the call's `Started` is appended to the call log and `fsync`ed
-/// **before** anything else — if it can't be, the call is refused with
-/// [`DENY_LOG_UNAVAILABLE`] and nothing runs. Then a [`Frame::HelloAck`]
-/// carrying this host's badge and policy version, plus the policy head and
+/// Admitted: a [`Frame::HelloAck`]
+/// carrying this host's policy version, plus the policy head and
 /// the called service's signed entry when the caller's view is older (so it
 /// checks this host is still assigned before stdin, then refreshes), then the service's
 /// command with the caller's argv appended (never a shell), in its `cwd`
-/// with its `env`, and the server-derived `WIRES_*` variables.
+/// with its `env`, and the server-derived `WIRES_*` variables. Its end is
+/// the call's log line.
 pub(crate) async fn serve_session_permitted<S, R>(
     mut send: S,
     mut recv: R,
@@ -712,7 +619,6 @@ where
     S: AsyncWrite + Unpin + Send + 'static,
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let audit = host.audit.as_ref();
     let first = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         read_frame_within(&mut recv, MAX_HELLO_FRAME),
@@ -757,33 +663,31 @@ where
             return Err(Refused(reason.to_string()).into());
         }
     };
-    // The badge and the bans first: a stranger costs no token verification
-    // (no JWKS fetch, no identity-index entry) and no call-log entry.
-    if let Err(detail) = host.check_member(&state, &hello.membership, caller, now) {
-        let reason = crate::host::gate::NOT_ADMITTED;
-        return Err(refuse_stranger(&mut send, caller, reason, &detail).await);
-    }
-    // Admitted from here on: every refusal is logged.
-    let (principal, missing) = host.principal(caller, hello.id_token.as_ref(), now).await;
-    let admitted = match host.decide(
-        &state,
-        caller,
-        principal.as_ref(),
-        missing.as_deref(),
-        &service,
-        now,
-    ) {
+    // Admission first: the token, a verified email, the bans and a role. A
+    // stranger costs one token check and no log line of its own.
+    let verified = match host
+        .admit_caller(&state, caller, &hello.id_token, now)
+        .await
+    {
+        Ok(verified) => verified,
+        Err(refused) => {
+            return Err(refuse_stranger(&mut send, caller, refused.said, &refused.why).await);
+        }
+    };
+    let principal = Some(verified.principal.clone());
+    // Admitted from here on: every refusal is the caller's log line.
+    let admitted = match host.decide(&state, caller, &verified, &service, now) {
         Ok(admitted) => admitted,
         Err(reason) => {
-            let who = principal.clone();
-            return Err(refuse_member(&mut send, audit, caller, who, Some(service), reason).await);
+            let who = principal.as_ref();
+            return Err(refuse_admitted(&mut send, caller, who, &service, reason).await);
         }
     };
     // Only an admitted caller learns whether this host implements it.
     let Some(implementation) = host.implementation(&service) else {
         let reason = format!("service {service} is not implemented on this host");
-        let who = principal.clone();
-        return Err(refuse_member(&mut send, audit, caller, who, Some(service), reason).await);
+        let who = principal.as_ref();
+        return Err(refuse_admitted(&mut send, caller, who, &service, reason).await);
     };
     drop(preauth);
     let version = admitted.state_version;
@@ -797,42 +701,25 @@ where
             "caller holds a newer signed policy"
         );
     }
-    tracing::info!(
+    // At `debug`: the call's one `info` line is written when it ends.
+    tracing::debug!(
         caller = %caller.hex(),
         service = %service,
         role = %admitted.role,
         state_version = version.0,
         "session accepted"
     );
-    // The call is logged before it can run; a call the log can't take
-    // doesn't run.
-    let call_audit = match crate::host::audit::CallAudit::start(
-        audit,
+    // Times the call for its log line, written when it ends.
+    let trace = CallTrace::start(
         caller,
         principal.clone(),
         service.clone(),
-        invocation.argv.as_slice(),
-        version,
         admitted.role.clone(),
-    )
-    .await
-    {
-        Ok(call_audit) => call_audit,
-        Err(e) => {
-            tracing::error!(
-                caller = %caller.hex(),
-                service = %service,
-                "call refused: its start could not be logged: {e}"
-            );
-            deny(&mut send, DENY_LOG_UNAVAILABLE.to_string()).await;
-            return Err(Refused(DENY_LOG_UNAVAILABLE.to_string()).into());
-        }
-    };
+    );
     // Card 37: a caller whose view is older gets this host's head and the
     // service's entry, to check the host is still assigned before stdin.
     let news = hello.state_version < version;
     let ack = Frame::HelloAck(HelloAck {
-        membership: host.membership.clone(),
         state_version: version,
         head: news.then(|| state.signed.head.clone()),
         entry: news
@@ -840,27 +727,22 @@ where
             .flatten(),
     });
     if let Err(e) = write_frame(&mut send, &ack).await {
-        // The caller is gone before anything ran: close the logged call.
-        if let Some(call_audit) = call_audit {
-            call_audit.finish(-1).await;
-        }
+        // The caller is gone before anything ran.
+        trace.finish(-1, 0);
         return Err(e);
     }
 
     let svc = match implementation {
         Implementation::Command(svc) => svc,
-        // An app's in-process handler (card 33): the same gate, log, ack
-        // and bridge as a child, with the verified caller as a type rather
-        // than `WIRES_*` variables.
+        // An app's in-process handler (card 33): the same gate, log line,
+        // ack and bridge as a child, with the verified caller as a type
+        // rather than `WIRES_*` variables.
         Implementation::Native(native) => {
             // The call's push capability, as a CLI child gets it (card 28
             // §1), held in-process rather than in the environment.
             let capability = match (&host.push_grants, &host.push_commands) {
                 (Some(grants), Some(commands)) => {
                     let cap = grants.caps.mint(caller);
-                    if let Some(call_audit) = &call_audit {
-                        cap.bind_call(call_audit.call());
-                    }
                     let push = crate::host::native::CallerPush {
                         caps: Arc::clone(&grants.caps),
                         token: cap.token().clone(),
@@ -870,39 +752,25 @@ where
                 }
                 _ => None,
             };
-            // No role admits a caller without a verified principal.
-            let Some(principal) = principal else {
-                if let Some(call_audit) = call_audit {
-                    call_audit.finish(-1).await;
-                }
-                return Err(anyhow!("admitted without a verified principal"));
-            };
             let call = crate::host::native::Call {
                 caller,
-                principal,
+                id_token: admitted.caller.token.clone(),
+                principal: admitted.caller.principal.clone(),
                 role: admitted.role.clone(),
-                state_version: version,
                 service: service.clone(),
                 args: invocation.argv.clone(),
-                // A host with no call log (unit tests only) still names
-                // the call.
-                id: call_audit
-                    .as_ref()
-                    .map_or_else(library::CallId::generate, |a| a.call()),
                 push: capability.as_ref().map(|(_, push)| push.clone()),
             };
             let running = crate::host::native::start(native, call);
-            let result = bridge(send, recv, running, shutdown, call_audit).await;
+            let result = bridge(send, recv, running, shutdown, trace).await;
             // Dropping the capability starts its grace period.
             drop(capability);
             return result;
         }
     };
     let Some((program, args)) = svc.argv(invocation.argv.as_slice()) else {
-        // Nothing can run: close the logged call.
-        if let Some(call_audit) = call_audit {
-            call_audit.finish(-1).await;
-        }
+        // Nothing can run.
+        trace.finish(-1, 0);
         return Err(anyhow!("empty service command"));
     };
     let mut cmd = Command::new(program);
@@ -914,18 +782,17 @@ where
     // service's own `env`, then the server-derived values (which always win;
     // `host.json` can't set them). Nothing of the host's own: no
     // `WIRES_HOME`, `HOME`, agent sockets or cloud credentials.
+    // The caller's identity is the token it presented and the claims the
+    // host verified from it, as one JSON value (protocol §5–6).
+    let who = &admitted.caller;
     let mut server: Vec<(&str, std::ffi::OsString)> = vec![
         ("WIRES_CALLER_NODE", caller.hex().into()),
-        ("WIRES_FABRIC_ROOT", host.trust_root.hex().into()),
-        (
-            "WIRES_MEMBERSHIP_NOT_AFTER",
-            hello.membership.not_after.to_string().into(),
-        ),
-        ("WIRES_STATE_VERSION", version.0.to_string().into()),
+        ("WIRES_ID_TOKEN", who.token.as_str().into()),
+        ("WIRES_CALLER", caller_json(&who.principal).into()),
         ("WIRES_SERVICE", service.as_str().into()),
         ("WIRES_ROLE", admitted.role.as_str().into()),
     ];
-    if let Some(email) = principal.as_ref().and_then(|p| p.email.as_deref()) {
+    if let Some(email) = who.principal.email.as_deref() {
         server.push(("WIRES_CALLER_EMAIL", email.into()));
     }
     // The call's push capability: this child may push to its caller, and
@@ -939,25 +806,26 @@ where
         server.push((ENV_SOCKET, socket.clone().into_os_string()));
         server.push((ENV_TOKEN, cap.token().hex().into()));
     }
-    if let (Some((cap, _)), Some(call_audit)) = (&capability, &call_audit) {
-        // Bound before spawn: the child's first push already names its call.
-        cap.bind_call(call_audit.call());
-    }
     cmd.env_clear()
         .envs(child_env(std::env::vars_os(), &svc.env, server));
     let running = match Running::spawn(cmd) {
         Ok(running) => running,
         Err(e) => {
-            if let Some(call_audit) = call_audit {
-                call_audit.finish(-1).await; // audit: finished (never ran)
-            }
+            trace.finish(-1, 0); // never ran
             return Err(e).with_context(|| format!("spawning {program}"));
         }
     };
-    let result = bridge(send, recv, running, shutdown, call_audit).await;
+    let result = bridge(send, recv, running, shutdown, trace).await;
     // Dropping the capability starts its grace period.
     drop(capability);
     result
+}
+
+/// `WIRES_CALLER`: the verified principal as one JSON object, the fields of
+/// [`Principal`](library::Principal) (`issuer`, `subject`, `not_after`, and
+/// `email`, `org`, `groups` when present), so a script reads `jq -r .email`.
+pub(crate) fn caller_json(principal: &library::Principal) -> String {
+    serde_json::to_string(principal).expect("a principal serializes")
 }
 
 /// Inherited variables a service child keeps, besides every `LC_*`: the
@@ -1005,8 +873,8 @@ impl Denied {
         Self { reason }
     }
 
-    /// The host's stated reason, verbatim (e.g. `not a member of this
-    /// network`).
+    /// The host's stated reason, verbatim (e.g. `not admitted to this
+    /// network: sign in with \`wires login\`, or ask your admin for a role`).
     pub fn reason(&self) -> &str {
         &self.reason
     }
@@ -1025,10 +893,11 @@ pub(crate) struct ServiceDialed {
 /// preferred order) until one connects within `dial_timeout`, then open with
 /// `hello`, send `invocation` and bridge stdio on that one.
 ///
-/// `on_ack` runs once the host's `HelloAck` has verified and **before** any
-/// stdin is forwarded, with the host's id and the ack (its head version,
-/// and the head and service entry when newer than the caller's view): the
-/// caller checks the host is still assigned there and may abort the call.
+/// `on_ack` runs once the host's `HelloAck` has arrived and **before** any
+/// stdin is forwarded, with the host's id (the key iroh authenticated, one
+/// of `targets`) and the ack (its head version, and the head and service
+/// entry when newer than the caller's view): the caller checks the host is
+/// still assigned there and may abort the call.
 ///
 /// Fails over **only on a dial failure**: once a host has answered, its
 /// refusal ([`Denied`]) or a mid-session error is final (it decided, and
@@ -1080,7 +949,6 @@ where
             recv,
             hello,
             invocation,
-            host,
             |ack| on_ack(host, ack),
             stdin,
             stdout,
@@ -1115,7 +983,6 @@ pub(crate) async fn dial_opened<S, R, I, W, E>(
     recv: R,
     hello: Hello,
     invocation: Invocation,
-    target: NodeId,
     stdin: I,
     stdout: W,
     stderr: E,
@@ -1132,7 +999,6 @@ where
         recv,
         hello,
         invocation,
-        target,
         |_| Ok(()),
         stdin,
         stdout,
@@ -1141,12 +1007,11 @@ where
     .await
 }
 
-/// The dialer half of a session over an established bi-stream to `target`
-/// (the iroh-authenticated host). Presents the `hello`, then reads the
-/// host's [`HelloAck`](library::HelloAck), verifies the membership in it
-/// against the dialer's own network root and `target`, then runs `on_ack`
-/// with the ack, all **before** any stdin is forwarded. On any failure,
-/// aborts with no stdin sent.
+/// The dialer half of a session over an established bi-stream to an
+/// iroh-authenticated host (one the service's root-signed entry names; the
+/// caller chose it). Presents the `hello`, then reads the host's
+/// [`HelloAck`](library::HelloAck) and runs `on_ack` with it, **before**
+/// any stdin is forwarded. On any failure, aborts with no stdin sent.
 ///
 /// The [`Frame::Invoke`] carrying `invocation` follows the opening
 /// immediately, without waiting for the ack.
@@ -1159,7 +1024,6 @@ pub(crate) async fn dial_opened_with<S, R, I, W, E>(
     mut recv: R,
     hello: Hello,
     invocation: Invocation,
-    target: NodeId,
     on_ack: impl FnOnce(&HelloAck) -> Result<()>,
     stdin: I,
     mut stdout: W,
@@ -1172,8 +1036,6 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    // The dialer's own network root is the authority for verifying the host.
-    let root = hello.membership.fabric;
     write_frame(&mut send, &Frame::Hello(hello)).await?;
     write_frame(&mut send, &Frame::Invoke(invocation)).await?;
 
@@ -1186,11 +1048,8 @@ where
         Some(_) => bail!("the host's first frame was not a hello ack"),
         None => bail!("the host closed before sending a hello ack"),
     };
-    // Before any stdin: the host's membership must be one our root signed
-    // for this very key, and current. Whether the host is still assigned the
-    // service is `on_ack`'s to check, against the ack's head and entry.
-    check_inclusion(&ack.membership, root, target, crate::clock::now_unix())
-        .map_err(|e| anyhow!("the host's membership was rejected (no stdin sent): {e}"))?;
+    // Before any stdin: whether the host is still assigned the service is
+    // `on_ack`'s to check, against the ack's head and entry.
     on_ack(&ack)?;
 
     // Local stdin -> Stdin frames, then shut down the send direction (EOF).
@@ -1244,7 +1103,7 @@ mod tests {
     use crate::admin::keystore::Keystore;
     use crate::host::config::HostConfig;
     use crate::host::gate::ServicesHost;
-    use library::{Argv, Membership, Policy, Service, StateVersion};
+    use library::{Argv, Policy, Service, StateVersion};
 
     #[test]
     fn a_service_child_gets_a_minimal_environment() {
@@ -1306,21 +1165,19 @@ mod tests {
     }
 
     /// A host implementing service `t` as `command`, allowed to role `staff`
-    /// (anyone the shared test IdP verified); its signed policy bans
+    /// (anyone the shared test IdP verified with an email); its signed policy bans
     /// [`stranger`]`(7)`.
     fn host_running(command: &[&str]) -> Arc<ServicesHost> {
         Arc::new(host_unshared(command))
     }
 
-    /// [`host_running`], logging to `audit`.
-    fn host_logging(command: &[&str], audit: AuditSink) -> Arc<ServicesHost> {
-        let mut host = host_unshared(command);
-        host.audit = Some(audit);
-        Arc::new(host)
-    }
-
     /// [`host_running`], before it is shared.
     fn host_unshared(command: &[&str]) -> ServicesHost {
+        host_with(command, |_| {})
+    }
+
+    /// [`host_unshared`], its policy changed by `edit` first.
+    fn host_with(command: &[&str], edit: impl FnOnce(&mut Policy)) -> ServicesHost {
         let (root, host) = (root(), host_id());
         let home = crate::testutil::temp_dir();
         let ks = Keystore::at(&home);
@@ -1328,7 +1185,7 @@ mod tests {
         s.version = StateVersion(1);
         s.issued = crate::clock::now_unix();
         s.not_after = i64::MAX;
-        s.ban(stranger(7).0, i64::MAX);
+        s.ban(stranger(7).0);
         let (staff, matchers) = crate::testutil::staff_role();
         s.roles.insert(staff.clone(), matchers);
         s.services.insert(
@@ -1337,9 +1194,9 @@ mod tests {
                 description: String::new(),
                 allow: vec![staff],
                 hosts: vec![host.node_id()],
-                readers: vec![],
             },
         );
+        edit(&mut s);
         let signed = crate::testutil::signed_policy(&root, s);
         crate::policy::store::adopt_if_newer(
             &ks,
@@ -1354,22 +1211,16 @@ mod tests {
             serde_json::to_string(command).unwrap()
         ))
         .unwrap();
-        crate::host::serve::services_host(
-            host.node_id(),
-            Membership::mint(&root, host.node_id(), 0, i64::MAX).unwrap(),
-            Arc::new(ks),
-            config,
-        )
-        .unwrap()
+        crate::host::serve::services_host(host.node_id(), root.node_id(), Arc::new(ks), config)
+            .unwrap()
     }
 
-    /// The caller's `Hello` (badge under the root, policy version 1, and
-    /// an ID token from the shared test IdP: service `t` needs `staff`).
+    /// The caller's `Hello` (policy version 1, and an ID token from the
+    /// shared test IdP bound to the caller's key: service `t` needs `staff`).
     fn hello() -> Hello {
         Hello {
-            membership: Membership::mint(&root(), caller_id().node_id(), 0, i64::MAX).unwrap(),
             state_version: StateVersion(1),
-            id_token: Some(crate::testutil::test_id_token(&caller_id().node_id())),
+            id_token: crate::testutil::test_id_token(&caller_id().node_id()),
         }
     }
 
@@ -1410,7 +1261,6 @@ mod tests {
             s2c_r,
             hello(),
             invoke(args),
-            host_id().node_id(),
             std::io::Cursor::new(input.to_vec()),
             &mut out,
             &mut err,
@@ -1526,7 +1376,6 @@ mod tests {
                 s2c_r,
                 hello(),
                 invoke(&[]),
-                host_id().node_id(),
                 stdin,
                 &mut out,
                 &mut err,
@@ -1623,19 +1472,14 @@ mod tests {
         crate::host::native::start(Arc::new(service), crate::host::native::test_call())
     }
 
-    /// A logged call's start, on `sink`.
-    async fn started(sink: &AuditSink) -> Option<crate::host::audit::CallAudit> {
-        crate::host::audit::CallAudit::start(
-            Some(sink),
+    /// A call's log line, timed from now.
+    fn trace() -> CallTrace {
+        CallTrace::start(
             caller_id().node_id(),
             None,
             ServiceName::new("t").unwrap(),
-            &[],
-            StateVersion(1),
             library::RoleName::new("staff").unwrap(),
         )
-        .await
-        .unwrap()
     }
 
     /// Every frame the bridge sent, in order, through the last.
@@ -1648,15 +1492,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_native_service_is_bridged_and_recorded_like_a_child() {
-        let (sink, mut records) = AuditSink::channel(8);
-        let audit = started(&sink).await;
+    async fn a_native_service_is_bridged_and_traced_like_a_child() {
+        let (lines, _guard) = crate::host::call_trace::capture::lines();
         let recv = std::io::Cursor::new(encoded(&[
             Frame::Stdin(Chunk::from_bytes(b"abc".to_vec())),
             Frame::Stdin(Chunk::from_bytes(b"def".to_vec())),
         ]));
         let (send, answer) = tokio::io::duplex(64 * 1024);
-        bridge(send, recv, native(Upper), never(), audit)
+        bridge(send, recv, native(Upper), never(), trace())
             .await
             .unwrap();
 
@@ -1673,36 +1516,20 @@ mod tests {
             (out.as_slice(), err.as_slice(), exit),
             (&b"ABCDEF"[..], &b"note"[..], Some(3))
         );
-
-        let Some(library::AuditRecord::Started { call, .. }) = records.recv().await else {
-            panic!("expected Started first");
-        };
-        let Some(library::AuditRecord::Finished {
-            call: done,
-            exit,
-            stdout_bytes,
-            stderr_bytes,
-            stdout_digest,
-            stdin_bytes,
-            stdin_head,
-            ..
-        }) = records.recv().await
-        else {
-            panic!("expected Finished second");
-        };
-        assert_eq!((done, exit, stdout_bytes, stderr_bytes), (call, 3, 6, 4));
-        let mut expect = library::OutputHasher::new();
-        expect.update(b"ABCDEF");
-        assert_eq!(stdout_digest, expect.finish());
-        assert_eq!((stdin_bytes, stdin_head.as_deref()), (6, Some("abcdef")));
+        let finished = lines.matching("call finished");
+        assert_eq!(finished.len(), 1, "{}", lines.text());
+        assert!(
+            finished[0].contains("exit=3") && finished[0].contains("bytes_out=10"),
+            "{}",
+            finished[0]
+        );
     }
 
     /// The caller disconnects mid-call: the handler is stopped, the caller
-    /// is sent exit -1, and the call still gets its `Finished` (exit -1).
+    /// is sent exit -1, and the call still gets its log line (exit -1).
     #[tokio::test]
     async fn a_native_service_is_stopped_and_finished_when_the_dialer_vanishes() {
-        let (sink, mut records) = AuditSink::channel(8);
-        let audit = started(&sink).await;
+        let (lines, _guard) = crate::host::call_trace::capture::lines();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let (send, answer) = tokio::io::duplex(64 * 1024);
         let (_hold_stdin_open, recv) = tokio::io::duplex(64);
@@ -1713,7 +1540,7 @@ mod tests {
             async move {
                 let _ = rx.await;
             },
-            audit,
+            trace(),
         ));
         tx.send(()).ok();
         let done = tokio::time::timeout(std::time::Duration::from_secs(5), bridged).await;
@@ -1724,16 +1551,9 @@ mod tests {
             frames_from(answer).await.last(),
             Some(Frame::Exit(-1))
         ));
-        let Some(library::AuditRecord::Started { call, .. }) = records.recv().await else {
-            panic!("expected Started first");
-        };
-        let Some(library::AuditRecord::Finished {
-            call: done, exit, ..
-        }) = records.recv().await
-        else {
-            panic!("expected Finished second");
-        };
-        assert_eq!((done, exit), (call, -1));
+        let finished = lines.matching("call finished");
+        assert_eq!(finished.len(), 1, "{}", lines.text());
+        assert!(finished[0].contains("exit=-1"), "{}", finished[0]);
     }
 
     /// What `host` answers to the raw `bytes` from `caller`: the denial
@@ -1759,14 +1579,13 @@ mod tests {
         refusal_by(&host_running(&["cat"]), encoded(frames), caller).await
     }
 
-    /// A key the policy bans, with a badge the root really minted for it (so
-    /// only the ban keeps it out).
+    /// A key, with a genuine ID token bound to it (seed 7's node is the one
+    /// the policy bans, so only the ban keeps it out).
     fn stranger(seed: u8) -> (NodeId, Hello) {
         let id = NodeIdentity::from_seed([seed; 32]).node_id();
         let hello = Hello {
-            membership: Membership::mint(&root(), id, 0, i64::MAX).unwrap(),
             state_version: StateVersion(1),
-            id_token: None,
+            id_token: crate::testutil::test_id_token(&id),
         };
         (id, hello)
     }
@@ -1780,68 +1599,151 @@ mod tests {
         assert_eq!(r, DENY_INVOKE_REQUIRED);
     }
 
-    /// Whatever keeps a peer out — someone else's badge, a badge from another
-    /// network, or a genuine one the policy bans — it hears the one fixed
-    /// sentence: no reason, no policy version.
+    /// A `Hello` without an ID token is refused at that first message:
+    /// it doesn't decode, and nothing runs.
     #[tokio::test]
-    async fn a_non_member_hears_only_the_fixed_refusal() {
-        let open = [Frame::Hello(hello()), Frame::Invoke(invoke(&[]))];
-        let theirs = refusal(&open, NodeIdentity::from_seed([9u8; 32]).node_id()).await;
-        let other_root = NodeIdentity::from_seed([8u8; 32]);
-        let (id, _) = stranger(7);
-        let foreign = Hello {
-            membership: Membership::mint(&other_root, id, 0, i64::MAX).unwrap(),
-            ..hello()
-        };
-        let foreign = refusal(&[Frame::Hello(foreign), Frame::Invoke(invoke(&[]))], id).await;
-        let (id, genuine) = stranger(7);
-        let banned = refusal(&[Frame::Hello(genuine), Frame::Invoke(invoke(&[]))], id).await;
-        for r in [theirs, foreign, banned] {
-            assert_eq!(r, crate::host::gate::NOT_ADMITTED);
-        }
+    async fn a_hello_without_a_token_is_refused_at_the_first_message() {
+        let body = br#"{"state_version":1}"#;
+        let mut bytes = ((body.len() + 1) as u32).to_be_bytes().to_vec();
+        bytes.push(10); // the `Hello` tag
+        bytes.extend_from_slice(body);
+        bytes.extend(Frame::Invoke(invoke(&[])).encode().unwrap());
+        let r = refusal_by(&host_running(&["cat"]), bytes, caller_id().node_id()).await;
+        assert_eq!(r, "unreadable hello");
     }
 
-    /// A banned node's ID token is never looked at: no verification, so no
-    /// JWKS fetch and no identity-index entry. (An admitted node's is.)
+    /// Whatever keeps a caller out — a token bound to another key, a forged
+    /// one, one from an issuer the policy doesn't trust, a banned node or a
+    /// banned person — it hears the one fixed sentence: no reason, no policy
+    /// version. An expired token says so (it is who it says).
     #[tokio::test]
-    async fn a_non_member_never_has_its_token_verified() {
+    async fn a_caller_without_a_valid_sign_in_hears_only_the_fixed_refusal() {
+        let open = |hello: Hello| encoded(&[Frame::Hello(hello), Frame::Invoke(invoke(&[]))]);
+        let host = host_running(&["cat"]);
+        // The caller's own token, presented by another key.
+        let theirs = refusal_by(&host, open(hello()), stranger(9).0).await;
+        // A forged token.
+        let forged = Hello {
+            id_token: library::IdToken::new("eyJhbGciOiJSUzI1NiJ9.e30.c2ln"),
+            ..hello()
+        };
+        let forged = refusal_by(&host, open(forged), caller_id().node_id()).await;
+        // A banned node, with a genuine token bound to it.
+        let (id, genuine) = stranger(7);
+        let banned = refusal_by(&host, open(genuine), id).await;
+        // A banned person, from a node nobody banned.
+        let removed = host_with(&["cat"], |p| {
+            p.ban_person(library::Person::new(
+                crate::testutil::test_idp().issuer.clone(),
+                "caller@example.com",
+            ));
+        });
+        let person = refusal_by(&removed, open(hello()), caller_id().node_id()).await;
+        // An issuer the policy no longer trusts: no role names it, so the
+        // only issuer goes and nothing verifies.
+        let untrusting = host_with(&["cat"], |p| {
+            p.roles.clear();
+            p.services.values_mut().for_each(|s| s.allow.clear());
+            p.issuers.clear();
+            p.issuers.insert(
+                library::Issuer::new("https://other-idp.example"),
+                library::IssuerConfig {
+                    client_id: library::Audience::new("x"),
+                    audiences: vec![library::Audience::new("x")],
+                },
+            );
+        });
+        let untrusted = refusal_by(&untrusting, open(hello()), caller_id().node_id()).await;
+        for r in [theirs, forged, banned, person, untrusted] {
+            assert_eq!(r, crate::host::gate::NOT_ADMITTED);
+        }
+        let expired = Hello {
+            id_token: crate::testutil::test_idp().mint(
+                &library::OidcNonce::for_node(&caller_id().node_id()),
+                crate::clock::now_unix() - 3600,
+            ),
+            ..hello()
+        };
+        let expired = refusal_by(&host, open(expired), caller_id().node_id()).await;
+        assert_eq!(expired, crate::host::gate::SIGN_IN_EXPIRED);
+    }
+
+    /// A token that verifies is not enough: a person no role matches, and a
+    /// sign-in with no verified email (even under `staff`, a role that names
+    /// only the issuer), hear the same bytes as a stranger, at the first
+    /// message, and leave no identity behind.
+    #[tokio::test]
+    async fn a_verified_token_no_role_matches_or_without_an_email_is_not_admitted() {
+        let me = caller_id().node_id();
+        let nonce = library::OidcNonce::for_node(&me);
+        let idp = crate::testutil::test_idp();
+        let exp = crate::clock::now_unix() + 3600;
+        let open = |hello: Hello| encoded(&[Frame::Hello(hello), Frame::Invoke(invoke(&[]))]);
+        // `t` allows only an analyst: someone else.
+        let narrow = host_with(&["true"], |p| {
+            p.roles.insert(
+                library::RoleName::new("analyst").unwrap(),
+                vec![library::Matcher {
+                    email: Some("analyst@example.com".parse().unwrap()),
+                    ..library::Matcher::new(idp.issuer.as_str())
+                }],
+            );
+            p.roles.remove(&library::RoleName::new("staff").unwrap());
+            p.services.values_mut().for_each(|s| {
+                s.allow = vec![library::RoleName::new("analyst").unwrap()];
+            });
+        });
+        let outsider = refusal_by(&narrow, open(hello()), me).await;
+        let no_email = Hello {
+            id_token: idp.mint_for("caller@example.com", false, &nonce, exp),
+            ..hello()
+        };
+        let host = host_unshared(&["true"]);
+        let emailless = refusal_by(&host, open(no_email), me).await;
+        for r in [outsider, emailless] {
+            assert_eq!(r, crate::host::gate::NOT_ADMITTED);
+        }
+        assert!(narrow.identities.nodes().is_empty());
+        assert!(host.identities.nodes().is_empty());
+    }
+
+    /// A token that fails leaves nothing behind: no identity-index entry
+    /// (any key can present one). A caller's that verifies is indexed.
+    #[tokio::test]
+    async fn a_failed_token_leaves_no_identity() {
         let host = host_running(&["true"]);
         let token =
             library::IdToken::new("eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIn0.");
-        let (id, mut hello_s) = stranger(7);
-        hello_s.id_token = Some(token.clone());
+        let forged = Hello {
+            id_token: token,
+            ..hello()
+        };
+        let (id, _) = stranger(9);
         let r = refusal_by(
             &host,
-            encoded(&[Frame::Hello(hello_s), Frame::Invoke(invoke(&[]))]),
+            encoded(&[Frame::Hello(forged), Frame::Invoke(invoke(&[]))]),
             id,
         )
         .await;
         assert_eq!(r, crate::host::gate::NOT_ADMITTED);
-        assert!(
-            host.identities.nodes().is_empty(),
-            "a stranger's token was verified"
-        );
-        // The member's token is verified (and fails: its issuer isn't trusted).
-        let member = Hello {
-            id_token: Some(token),
-            ..hello()
-        };
+        assert!(host.identities.nodes().is_empty(), "a failure was indexed");
         let (send, _answer) = tokio::io::duplex(64 * 1024);
-        let bytes = encoded(&[Frame::Hello(member), Frame::Invoke(invoke(&[]))]);
+        let bytes = encoded(&[Frame::Hello(hello()), Frame::Invoke(invoke(&[]))]);
         let caller = caller_id().node_id();
         let _ =
             serve_services_session(send, std::io::Cursor::new(bytes), caller, &host, never()).await;
         assert_eq!(host.identities.nodes(), [caller]);
     }
 
-    /// The card's flood: a thousand connections from keys that aren't
-    /// admitted — junk, silence, out-of-turn frames, someone else's badge,
-    /// a genuine but banned one — write nothing to the call log. An
-    /// admitted node's refusal is still logged.
+    /// A flood: a thousand connections from keys that aren't
+    /// admitted — junk, silence, out-of-turn frames, someone else's token,
+    /// a genuine token on a banned node — leave no `call refused` line, and
+    /// at most one throttled `info` report. An admitted caller's refusal is
+    /// its own line.
     #[tokio::test]
-    async fn strangers_leave_nothing_in_the_log_and_members_do() {
-        let (sink, mut records) = AuditSink::channel(2048);
-        let host = host_logging(&["true"], sink);
+    async fn strangers_leave_no_call_lines_and_admitted_callers_do() {
+        let (lines, _guard) = crate::host::call_trace::capture::lines();
+        let host = host_running(&["true"]);
         for n in 0..1000u32 {
             let key = NodeIdentity::from_seed({
                 let mut s = [0x55u8; 32];
@@ -1869,9 +1771,18 @@ mod tests {
             assert!(r.is_err());
         }
         assert!(
-            records.try_recv().is_err(),
-            "a stranger's refusal reached the call log"
+            lines.matching("call refused").is_empty(),
+            "a stranger's refusal was traced as a call"
         );
+        // The session's own `info`: only the throttled count (at most one
+        // per 10 s).
+        let info: Vec<String> = lines
+            .matching(" INFO ")
+            .into_iter()
+            .filter(|l| l.contains("wires::host::transport") || l.contains("call_trace"))
+            .filter(|l| !l.contains("unadmitted peer(s) since the last report"))
+            .collect();
+        assert!(info.is_empty(), "{info:?}");
         let unknown = Invocation {
             service: ServiceName::new("nope").unwrap(),
             argv: Argv::default(),
@@ -1882,46 +1793,38 @@ mod tests {
             caller_id().node_id(),
         )
         .await;
-        match records.recv().await {
-            Some(library::AuditRecord::Denied { caller, reason, .. }) => {
-                assert_eq!(caller, caller_id().node_id());
-                assert_eq!(reason, r);
-            }
-            other => panic!("expected the member's refusal, got {other:?}"),
-        }
+        let refused = lines.matching("call refused");
+        assert_eq!(refused.len(), 1, "{}", lines.text());
+        // …and it is the refusal's only `info` line (the gate's detail is
+        // at `debug`).
+        let info: Vec<String> = lines
+            .matching(" INFO ")
+            .into_iter()
+            .filter(|l| l.contains("wires::"))
+            .filter(|l| !l.contains("unadmitted peer(s) since the last report"))
+            // Once per host, when it first verifies a token: not the call's.
+            .filter(|l| !l.contains("trusted issuers changed"))
+            .collect();
+        assert_eq!(info, refused, "{}", lines.text());
+        let line = &refused[0];
+        assert!(line.contains(" INFO "), "{line}");
+        assert!(line.contains("service=nope"), "{line}");
+        assert!(
+            line.contains(&format!("caller={}", caller_id().node_id().hex())),
+            "{line}"
+        );
+        assert!(line.contains("subject="), "{line}");
+        assert!(line.contains(&format!("reason={r:?}")), "{line}");
     }
 
-    /// The card's acceptance: a call whose `Started` can't be logged is
-    /// refused, and its command never runs.
+    /// A call is one `call finished` line naming the service, the caller,
+    /// the person, the role, the exit code, the duration and the bytes it
+    /// sent; and no argv.
     #[tokio::test]
-    async fn a_call_whose_start_cannot_be_logged_never_runs() {
-        let dir = crate::testutil::temp_dir();
-        let marker = dir.join("ran");
-        let (sink, mut queue) = AuditSink::log_queue(4);
-        tokio::spawn(async move {
-            while let Some(p) = queue.recv().await {
-                p.answer(Err("disk full".into()));
-            }
-        });
-        let touch = format!("touch {}", marker.display());
-        let host = host_logging(&["sh", "-c", &touch], sink);
-        let r = refusal_by(
-            &host,
-            encoded(&[Frame::Hello(hello()), Frame::Invoke(invoke(&[]))]),
-            caller_id().node_id(),
-        )
-        .await;
-        assert_eq!(r, DENY_LOG_UNAVAILABLE);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!marker.exists(), "the command ran without a logged start");
-    }
-
-    /// A logged call: `Started` then `Finished`, and the child ran after
-    /// `Started` was in the log.
-    #[tokio::test]
-    async fn a_call_is_logged_started_then_finished() {
-        let (sink, mut records) = AuditSink::channel(8);
-        let host = host_logging(&["printf", "ok"], sink);
+    async fn a_call_is_one_log_line() {
+        let (lines, _guard) = crate::host::call_trace::capture::lines();
+        // The caller's arguments land in `$@`, which the script ignores.
+        let host = host_running(&["sh", "-c", "printf ok", "sh"]);
         let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
         let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
         let caller = caller_id().node_id();
@@ -1933,8 +1836,7 @@ mod tests {
             c2s_w,
             s2c_r,
             hello(),
-            invoke(&[]),
-            host_id().node_id(),
+            invoke(&["secret-arg"]),
             std::io::Cursor::new(Vec::new()),
             &mut out,
             &mut Vec::new(),
@@ -1943,16 +1845,26 @@ mod tests {
         .unwrap();
         srv.await.unwrap().unwrap();
         assert_eq!((dialed.exit, out.as_slice()), (0, &b"ok"[..]));
-        let Some(library::AuditRecord::Started { call, .. }) = records.recv().await else {
-            panic!("expected Started first");
-        };
-        let Some(library::AuditRecord::Finished {
-            call: done, exit, ..
-        }) = records.recv().await
-        else {
-            panic!("expected Finished second");
-        };
-        assert_eq!((done, exit), (call, 0));
+        let finished = lines.matching("call finished");
+        assert_eq!(finished.len(), 1, "{}", lines.text());
+        let line = &finished[0];
+        for field in [
+            " INFO ",
+            "service=t",
+            &format!("caller={}", caller_id().node_id().hex()),
+            "issuer=",
+            "subject=",
+            "role=staff",
+            "exit=0",
+            "duration_ms=",
+            "bytes_out=2",
+        ] {
+            assert!(line.contains(field), "{field} missing from {line}");
+        }
+        assert!(
+            !lines.text().contains("secret-arg"),
+            "the argv reached the log"
+        );
     }
 
     /// A `Hello` whose prefix claims 16 MiB is refused at the prefix: the
@@ -2053,5 +1965,43 @@ mod tests {
             }
             proptest::prop_assert_eq!(out, expected);
         }
+
+        /// `WIRES_CALLER` is the verified principal itself: it parses back
+        /// to the same value, and every claim is a field a script can read.
+        #[test]
+        fn caller_json_is_the_principal(
+            issuer in "[ -~]{1,24}",
+            subject in "[ -~]{1,24}",
+            email in proptest::option::of("[a-z]{1,8}@[a-z]{1,8}\\.com"),
+            org in proptest::option::of("[a-z.]{1,12}"),
+            groups in proptest::collection::vec("[ -~]{0,12}", 0..4),
+            not_after in proptest::prelude::any::<i64>(),
+        ) {
+            let p = library::Principal { issuer, subject, email, org, groups, not_after };
+            let json = caller_json(&p);
+            let back: library::Principal = serde_json::from_str(&json).unwrap();
+            proptest::prop_assert_eq!(&back, &p);
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            proptest::prop_assert_eq!(v["issuer"].as_str(), Some(p.issuer.as_str()));
+            proptest::prop_assert_eq!(v["subject"].as_str(), Some(p.subject.as_str()));
+            proptest::prop_assert_eq!(v["email"].as_str(), p.email.as_deref());
+            proptest::prop_assert_eq!(v["not_after"].as_i64(), Some(p.not_after));
+        }
+    }
+
+    #[test]
+    fn caller_json_known_answer() {
+        let p = library::Principal {
+            issuer: "https://idp.example".into(),
+            subject: "u-1".into(),
+            email: Some("a@example.com".into()),
+            org: None,
+            groups: vec!["eng".into()],
+            not_after: 1_700_000_000,
+        };
+        assert_eq!(
+            caller_json(&p),
+            r#"{"issuer":"https://idp.example","subject":"u-1","email":"a@example.com","groups":["eng"],"not_after":1700000000}"#
+        );
     }
 }

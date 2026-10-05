@@ -16,6 +16,31 @@ pub(crate) fn temp_dir() -> PathBuf {
     dir
 }
 
+/// Everything under `dir` (not `dir` itself, which the test made), as
+/// protocol.md §8 says a keystore holds it: each directory `0700`, each
+/// file and socket `0600`. Panics naming every path that isn't.
+#[cfg(unix)]
+pub(crate) fn assert_private(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fn walk(dir: &Path, wrong: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            let want = if meta.is_dir() { 0o700 } else { 0o600 };
+            if mode != want {
+                wrong.push(format!("{} is {mode:o}, not {want:o}", path.display()));
+            }
+            if meta.is_dir() {
+                walk(&path, wrong);
+            }
+        }
+    }
+    let mut wrong = Vec::new();
+    walk(dir, &mut wrong);
+    assert!(wrong.is_empty(), "not private:\n{}", wrong.join("\n"));
+}
+
 /// A scratch directory for tests that bind real unix sockets, removed on drop.
 ///
 /// A `sockaddr_un` path is capped at ~104 bytes on macOS, and macOS's
@@ -143,4 +168,36 @@ pub(crate) fn test_identity_json() -> String {
         test_idp().issuer.as_str(),
         crate::caller::mock_idp::MOCK_CLIENT_ID
     )
+}
+
+/// The network string of `root`'s network, naming `directories` and
+/// [`test_idp`] as the IdP to sign in with.
+pub(crate) fn network(
+    root: &library::NodeIdentity,
+    directories: &[library::NodeId],
+) -> library::Network {
+    library::Network::new(
+        root.node_id(),
+        directories.to_vec(),
+        library::LoginSettings {
+            issuer: test_idp().issuer.clone(),
+            client_id: library::Audience::new(crate::caller::mock_idp::MOCK_CLIENT_ID),
+            public_client_secret: None,
+        },
+    )
+}
+
+/// Join `ks` to `root`'s network ([`network`]), as `wires join` does.
+pub(crate) fn join(
+    ks: &crate::admin::keystore::Keystore,
+    root: &library::NodeIdentity,
+    directories: &[library::NodeId],
+) {
+    ks.save_network(&network(root, directories)).unwrap();
+}
+
+/// A node no test policy bans, to cut a view for when the node doesn't
+/// matter (a view depends on the node only through a node ban).
+pub(crate) fn any_node() -> library::NodeId {
+    library::NodeIdentity::from_seed([0xee; 32]).node_id()
 }

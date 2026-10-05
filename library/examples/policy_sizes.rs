@@ -8,16 +8,17 @@
 //! host first receives), the `policy_update` frame for one changed service
 //! and for one new ban, and a caller's view of about 25 services (entry
 //! count, frame and `view.json`), a `HelloAck` carrying news (card 37: the
-//! head and one service entry), and a caller's invite token.
+//! head and one service entry), and the network string every node joins
+//! with.
 //!
 //! ```text
 //! cargo run -q --release -p library --example policy_sizes
 //! ```
 
 use library::{
-    Audience, Ban, Fresh, HelloAck, Invite, Issuer, IssuerConfig, Item, LoginSettings, Matcher,
-    Membership, NodeId, NodeIdentity, Policy, Principal, PublicClientSecret, RoleName, Service,
-    ServiceName, SignedPolicy, StateVersion, SubFrame,
+    Audience, Fresh, HelloAck, Issuer, IssuerConfig, Item, LoginSettings, Matcher, Network, NodeId,
+    NodeIdentity, Policy, Principal, PublicClientSecret, RoleName, Service, ServiceName,
+    SignedPolicy, StateVersion, SubFrame,
 };
 
 const ISSUED: i64 = 1_790_000_000;
@@ -46,8 +47,8 @@ fn len<T: serde::Serialize>(value: &T) -> usize {
     serde_json::to_vec(value).expect("serializable").len()
 }
 
-/// A tier of the model: `services` (2 hosts each, 2 allow roles and 1
-/// reader, an 80-character description), `hosts`, `services / 5` roles
+/// A tier of the model: `services` (2 hosts each, 3 allow roles, an
+/// 80-character description), `hosts`, `services / 5` roles
 /// (one group matcher each), and `bans` open bans.
 struct Tier {
     name: &'static str,
@@ -88,21 +89,19 @@ fn policy(root: &NodeIdentity, t: &Tier) -> Policy {
         let service = Service {
             description:
                 "Read-only SQL against the orders replica; returns CSV. Filter with --where.".into(),
-            allow: vec![role(s % roles), role((s + 1) % roles)],
+            allow: vec![
+                role(s % roles),
+                role((s + 1) % roles),
+                role((s + 2) % roles),
+            ],
             hosts: (0..2)
                 .map(|k| node(1_000_000 + (s + k) % t.hosts))
                 .collect(),
-            readers: vec![role((s + 2) % roles)],
         };
         p.services.insert(service_name(s), service);
     }
     for b in 0..t.bans {
-        p.bans.insert(
-            node(2_000_000 + b),
-            Ban {
-                until: ISSUED + 30 * 86_400,
-            },
-        );
+        p.bans.insert(node(2_000_000 + b));
     }
     p
 }
@@ -133,9 +132,8 @@ fn measure(root: &NodeIdentity, t: &Tier) -> serde_json::Value {
         .find(|i| matches!(i, Item::Service(_)))
         .expect("a service");
 
-    // A caller in 2 roles: each role is in about 10 services' `allow` and 5
-    // services' `readers`, so about 25 services admit it (the model assumes
-    // 30 `visible_services`).
+    // A caller in 2 roles: each role is in about 15 services' `allow`, so
+    // about 25 services admit it (the model assumes 30 `visible_services`).
     let caller = Principal {
         issuer: ISS.into(),
         subject: "00u1a2b3c4".into(),
@@ -144,7 +142,7 @@ fn measure(root: &NodeIdentity, t: &Tier) -> serde_json::Value {
         groups: (0..2).map(|r| format!("eng-team-{:04}", r * 2)).collect(),
         not_after: i64::MAX,
     };
-    let view = signed.view_for(Some(&caller), None);
+    let view = signed.view_for(node(5_000_000), Some(&caller), None);
 
     // Two edits, each version + 1 and signed after the base, as the admin
     // signs: one service's description, and a new ban.
@@ -167,12 +165,7 @@ fn measure(root: &NodeIdentity, t: &Tier) -> serde_json::Value {
     let banned = update_frame(
         &signed,
         &edit(&|p: &mut Policy| {
-            p.bans.insert(
-                node(3_000_000),
-                Ban {
-                    until: ISSUED + 30 * 86_400,
-                },
-            );
+            p.bans.insert(node(3_000_000));
         }),
     );
 
@@ -200,21 +193,17 @@ fn measure(root: &NodeIdentity, t: &Tier) -> serde_json::Value {
         })),
         "view_frame": SubFrame::View { view, fresh: fresh.clone() }.encode().expect("a frame").len(),
         "hello_ack_news": len(&HelloAck {
-            membership: Membership::mint(root, node(0), ISSUED, ISSUED + 30 * 86_400)
-                .expect("a badge"),
             state_version: signed.version(),
             head: Some(signed.head.clone()),
             entry: signed.entries().next().cloned(),
         }),
-        "caller_invite_token": caller_invite(root, &signed).len(),
+        "network_string": network_string(root, &signed).len(),
     })
 }
 
-/// A caller's invite token (card 37): its badge, the policy's directory ids
-/// and Google-sized login settings with a public client secret.
-fn caller_invite(root: &NodeIdentity, signed: &SignedPolicy) -> String {
-    let badge =
-        Membership::mint(root, node(4_000_000), ISSUED, ISSUED + 30 * 86_400).expect("a badge");
+/// The network string: the root, the policy's first directory ids and
+/// Google-sized login settings with a public client secret.
+fn network_string(root: &NodeIdentity, signed: &SignedPolicy) -> String {
     let login = LoginSettings {
         issuer: Issuer::new(library::GOOGLE_ISSUER),
         client_id: Audience::new(concat!(
@@ -227,7 +216,7 @@ fn caller_invite(root: &NodeIdentity, signed: &SignedPolicy) -> String {
             "-abcdefghijklmnopqrstuvwxyz01"
         ))),
     };
-    Invite::new(badge, signed.head.head.directories.clone(), Some(login))
+    Network::new(root.node_id(), signed.head.head.directories.clone(), login)
         .encode()
         .expect("a token")
 }
@@ -236,7 +225,8 @@ fn main() {
     let root = NodeIdentity::from_seed([9; 32]);
     // The model's tiers ((users, services, hosts): company, enterprise,
     // large), with 30 days of removals as open bans (node churn 0.001 per
-    // node per day, half of it removals, two nodes per user).
+    // node per day, half of it removals, two nodes per user); bans no
+    // longer expire, so this is a month's worth of open ones.
     for t in [
         Tier {
             name: "company",

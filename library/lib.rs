@@ -5,10 +5,10 @@
 //! The source tree is grouped by concern, three folders beside the crate-wide
 //! [`error`] (and the private canonical-JSON `codec`):
 //!
-//! - `membership/` — who is in: identities, memberships (badges), the
-//!   accept gate, and the invite token.
-//! - `calls/` — remote CLI calls: the session frames, invocations, audit
-//!   records and the host's call log, pushes, and IdP identity.
+//! - `network/` — who is in: node identities, admission (bans), and the
+//!   network string every node joins with.
+//! - `calls/` — remote CLI calls: the session frames, invocations, pushes,
+//!   and IdP identity.
 //! - `services/` — the admin-signed policy (card 36): roles, the service
 //!   registry, policy evaluation; the items, the signed head and signed
 //!   service entries, updates, views, and freshness.
@@ -20,28 +20,25 @@
 //!
 //! - [`identity`] — the Ed25519 [`NodeIdentity`], the [`NodeId`] / [`Signature`]
 //!   byte-newtypes, and the [`AlgorithmId`] every signed object carries.
-//! - [`membership`] — root-signed, offline-verifiable [`Membership`] proof that a
-//!   node belongs to a fabric.
-//! - [`policy`] — [`check_inclusion`] and [`check_admitted`]: a node is
-//!   admitted by its badge and not being banned.
-//! - [`invite`] — the [`Invite`] token `wires join` installs.
+//! - [`admission`] — [`check_admitted`]: a caller verified by its IdP is
+//!   admitted when its sign-in carries a verified email, the policy bans
+//!   neither its node nor its person, and a role matches it.
+//! - [`network`] — the [`Network`] string `wires join` and `wires login`
+//!   install: the root key, directories and [`LoginSettings`].
 //! - [`session`] — the [`Frame`] wire codec, opened by a [`Hello`] (the async
 //!   transport is in `wires`).
 //! - [`invoke`] — the [`Invocation`] (service + [`Argv`]) a caller asks a host
 //!   to run.
-//! - [`audit`] — the [`AuditRecord`]s a host keeps about each call (and each
-//!   push).
-//! - [`call_log`] — the host's own signed, hash-linked [`LogEntry`] log of
-//!   those records, and [`verify_chain`].
-//! - [`push`] — a host's [`PushMessage`] to a caller, and the [`InboxFrame`]
-//!   codec both delivery paths speak.
+//! - [`push`] — a host's [`PushMessage`] to a caller, the [`InboxFrame`]
+//!   codec both delivery paths speak, and each recipient's [`PushOutcome`].
 //! - [`idp`] — [`IdentityClaim`]: an IdP-signed ID token bound to a node key,
 //!   and [`verify_claim`], which a host runs against the issuer's [`Jwks`].
 //! - [`role`] — [`RoleName`], [`Matcher`], [`EmailPattern`]: role definitions.
 //! - [`registry`] — [`ServiceName`] and the registry entry [`Service`].
-//! - [`access`] — [`authorize`] and [`allowed_services`] over the policy.
-//! - [`item`] — the policy's leaves: [`Item`] (role, service, ban, issuer,
-//!   settings) and its [`ItemKey`].
+//! - [`access`] — [`authorize`]: may this caller call this service.
+//! - [`item`] — the policy's leaves: [`Item`] (role, service, node ban,
+//!   person ban, issuer, settings), its [`ItemKey`], and the [`Person`] a
+//!   person ban names.
 //! - [`entry`] — a service's [`SignedEntry`], signed by the root on its own.
 //! - [`head`] — the root-signed [`PolicyHead`] / [`SignedPolicyHead`] over
 //!   an [`ItemsHash`], and the [`StateVersion`] that orders them.
@@ -57,12 +54,13 @@
 //!
 //! # Example: sign a policy, check a caller
 //!
-//! Every step is pure; the async/iroh half lives in the `wires` binary.
+//! Every step is pure; the async/iroh half (verifying the caller's ID token
+//! against its IdP's keys) lives in the `wires` binary.
 //!
 //! ```
 //! use library::{
-//!     Audience, Issuer, IssuerConfig, Matcher, Membership, NodeIdentity, Policy, Principal,
-//!     RoleName, Service, ServiceName, StateVersion, authorize, check_admitted,
+//!     Audience, Issuer, IssuerConfig, Matcher, NodeIdentity, Policy, Principal, RoleName,
+//!     Service, ServiceName, StateVersion, authorize, check_admitted,
 //! };
 //!
 //! let root = NodeIdentity::from_seed([1u8; 32]);
@@ -70,8 +68,8 @@
 //! let alice = NodeIdentity::from_seed([3u8; 32]);
 //!
 //! // The admin signs the trusted IdPs, the roles, the service registry
-//! // (which hosts run each) and the bans: one versioned policy. No node
-//! // list: a node is admitted by its root-signed badge.
+//! // (which hosts run each) and the bans: one versioned policy. No list of
+//! // nodes: a caller is admitted by its IdP sign-in.
 //! let analyst = RoleName::new("analyst").unwrap();
 //! let orders = ServiceName::new("orders-db").unwrap();
 //! let mut s = Policy::new(root.node_id());
@@ -94,17 +92,16 @@
 //!         description: "Read-only SQL".into(),
 //!         allow: vec![analyst.clone()],
 //!         hosts: vec![host.node_id()],
-//!         readers: vec![],
 //!     },
 //! );
 //! let signed = s.sign(&root).unwrap();
 //!
-//! // A host checks the caller's badge (bound to the key iroh authenticated)
-//! // and the bans, then the registry, against its verified copy.
+//! // A host verifies the caller's ID token (bound to the key iroh
+//! // authenticated), admits it (a verified email, no ban, a role that
+//! // matches), then checks the service's `allow`, against its
+//! // verified copy.
 //! signed.verify(root.node_id()).unwrap();
 //! let policy = signed.to_policy().unwrap();
-//! let badge = Membership::mint(&root, alice.node_id(), 0, i64::MAX).unwrap();
-//! check_admitted(&badge, root.node_id(), &policy, alice.node_id(), 0).unwrap();
 //! let who = Principal {
 //!     issuer: "https://accounts.google.com".into(),
 //!     subject: "alice".into(),
@@ -113,28 +110,23 @@
 //!     groups: vec![],
 //!     not_after: i64::MAX,
 //! };
+//! check_admitted(&policy, alice.node_id(), &who).unwrap();
 //! assert_eq!(authorize(&policy, alice.node_id(), Some(&who), &orders), Ok(analyst));
-//! // Without a verified identity, the registry refuses (and says why).
+//! // Without a verified identity, the policy refuses (and says why).
 //! assert!(authorize(&policy, alice.node_id(), None, &orders).is_err());
 //! ```
 
 pub mod error;
 
-// membership/ — who is in.
-#[path = "membership/identity.rs"]
+// network/ — who is in.
+#[path = "network/admission.rs"]
+pub mod admission;
+#[path = "network/identity.rs"]
 pub mod identity;
-#[path = "membership/invite.rs"]
-pub mod invite;
-#[path = "membership/membership.rs"]
-pub mod membership;
-#[path = "membership/policy.rs"]
-pub mod policy;
+#[path = "network/network.rs"]
+pub mod network;
 
 // calls/ — remote CLI calls.
-#[path = "calls/audit.rs"]
-pub mod audit;
-#[path = "calls/call_log.rs"]
-pub mod call_log;
 #[path = "calls/idp.rs"]
 pub mod idp;
 #[path = "calls/invoke.rs"]
@@ -177,23 +169,19 @@ mod codec;
 #[path = "calls/idp_vectors.rs"]
 mod idp_vectors;
 
-pub use access::{Grant, Refusal, allowed_services, authorize, role_admits};
-pub use audit::{AuditRecord, CallId, OutputDigest, OutputHasher, PushOutcome, StdinCapture};
-pub use call_log::{
-    CALL_LOG_CONTEXT, CALL_LOG_V1, ChainBreak, ChainPoint, EntryHash, LogEntry, LogSeq, Retention,
-    verify_chain,
-};
+pub use access::{Refusal, authorize};
+pub use admission::check_admitted;
 pub use codec::B64;
 pub use directory::{
     DIRECTORY_ALPN, DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, MAX_DIRECTORY_FRAME,
-    MAX_SMALL_DIRECTORY_FRAME, PUBLISH_BODY_PREFIX, SubFrame, SubRequest, SubscriptionKind,
-    VIEW_DIGEST_CONTEXT, ViewDigest,
+    MAX_SMALL_DIRECTORY_FRAME, SubFrame, SubRequest, SubscriptionKind, VIEW_DIGEST_CONTEXT,
+    ViewDigest,
 };
-pub use entry::{ENTRY_CONTEXT, ENTRY_V1, SignedEntry};
+pub use entry::{ENTRY_CONTEXT, ENTRY_V2, SignedEntry};
 pub use error::{Error, IdTokenError, Result};
 pub use fresh::{FRESH_CONTEXT, FRESH_V1, Fresh};
 pub use head::{
-    HeadHash, ITEMS_CONTEXT, ItemsHash, POLICY_HEAD_CONTEXT, POLICY_V3, PolicyHead,
+    HeadHash, ITEMS_CONTEXT, ItemsHash, POLICY_HEAD_CONTEXT, POLICY_V4, PolicyHead,
     SignedPolicyHead, StateVersion,
 };
 pub use identity::{AlgorithmId, NodeId, NodeIdentity, Signature};
@@ -201,21 +189,21 @@ pub use idp::{
     Audience, CLOCK_SKEW_SECS, GOOGLE_ISSUER, IdToken, IdentityClaim, Issuer, Jwk, Jwks,
     OIDC_NONCE_CONTEXT, OidcNonce, Principal, verify_claim,
 };
-pub use invite::{INVITE_MAX_DIRECTORIES, INVITE_V4, Invite, LoginSettings, PublicClientSecret};
 pub use invoke::{Argv, Invocation, MAX_ARGS, MAX_ARGV_BYTES};
 pub use item::{
-    Ban, DEFAULT_BEAT_SECS, DEFAULT_FRESH_SECS, FreshnessMode, IssuerConfig, Item, ItemKey,
+    DEFAULT_BEAT_SECS, DEFAULT_FRESH_SECS, FreshnessMode, IssuerConfig, Item, ItemKey, Person,
     Settings,
 };
-pub use membership::{MEMBERSHIP_V1, Membership};
-pub use policy::{check_admitted, check_inclusion};
+pub use network::{
+    LoginSettings, NETWORK_MAX_DIRECTORIES, NETWORK_V1, Network, PublicClientSecret,
+};
 pub use policy_update::PolicyUpdate;
 pub use push::{
     INBOX_ALPN, InboxFrame, MAX_BATCH, MAX_INBOX_FRAME, MAX_INBOX_HELLO, MAX_PUSH_BODY,
-    MAX_SUBJECT, PushBody, PushId, PushMessage, Subject,
+    MAX_SUBJECT, PushBody, PushId, PushMessage, PushOutcome, Subject,
 };
 pub use registry::{MAX_SERVICE_NAME, Service, ServiceName};
 pub use role::{EmailPattern, MAX_ROLE_NAME, Matcher, RoleName};
 pub use session::{Chunk, Frame, Hello, HelloAck};
 pub use signed_policy::{Policy, SignedPolicy};
-pub use view::{View, ViewEntry, ViewUpdate};
+pub use view::{View, ViewUpdate};

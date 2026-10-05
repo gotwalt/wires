@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
 #
-# Provision a loopback wires pair for the benchmark's `wires` arm:
+# Provision a loopback wires network for the benchmark's `wires` arm, the
+# way card 41's first run does:
 #
-#   responder -- `wires serve host.json`, implementing one service `gh` (the
-#                local `gh`, with its own auth), registered for role `bench`:
-#                $BENCH_EMAIL at $BENCH_OIDC_ISSUER (every role needs a
-#                verified identity)
-#   agent     -- the responder's hint line in its local `hints` file (loopback
-#                address by key), signed in with `wires login` (a browser
-#                opens once), so the agent runs `wires call gh -- …`
+#   admin     -- `wires init` (trusting $BENCH_OIDC_ISSUER), role `bench`
+#                ($BENCH_EMAIL: every role needs a verified identity), the
+#                workbench named by key as the directory and as the host of
+#                one service `gh`, `wires network`, then `wires policy push`
+#   workbench -- `wires join <network>`, `wires serve host.json`: the local
+#                `gh`, with its own auth; also the directory, which starts
+#                empty and takes the admin's first publish
+#   agent     -- `wires login <network>` (a browser opens once), with the
+#                workbench's hint line in its local `hints` file (loopback
+#                address by key), so the agent runs `wires call gh -- …`
 #
 # Needs BENCH_EMAIL (who may call) and BENCH_OIDC_CLIENT_ID (an OAuth client
-# of that IdP; Google "Desktop app"); BENCH_OIDC_CLIENT_SECRET if it has one;
-# BENCH_OIDC_ISSUER defaults to https://accounts.google.com.
+# of that IdP; Google "Desktop app"); BENCH_OIDC_CLIENT_SECRET if it has one
+# (a public one); BENCH_OIDC_ISSUER defaults to https://accounts.google.com.
 #
 # State lives under $BENCH_WIRES_DIR (default /tmp/wb16): short on purpose,
 # since macOS caps unix-socket paths at 104 bytes. Prints `export` lines for
-# WIRES_HOME / PATH / responder pid to $D/env.sh (and stdout), for `source`.
+# WIRES_HOME / PATH / the workbench pid to $D/env.sh (and stdout), for `source`.
 
 set -euo pipefail
 
@@ -31,25 +35,28 @@ EMAIL="${BENCH_EMAIL:?set BENCH_EMAIL to the address that may call (e.g. you@exa
 CLIENT_ID="${BENCH_OIDC_CLIENT_ID:?set BENCH_OIDC_CLIENT_ID to the IdP OAuth client id}"
 ISSUER="${BENCH_OIDC_ISSUER:-https://accounts.google.com}"
 
+admin_ks="$D/admin"
 wb="$D/wb"
 agent="$D/agent"
 if [ -f "$D/wb.pid" ] && kill -0 "$(cat "$D/wb.pid")" 2>/dev/null; then
 	kill "$(cat "$D/wb.pid")" || true
 fi
-rm -rf "$wb" "$agent"
-mkdir -p "$wb" "$agent"
+rm -rf "$admin_ks" "$wb" "$agent"
+mkdir -p "$admin_ks" "$wb" "$agent"
+admin() { WIRES_HOME="$admin_ks" "$WIRES" "$@"; }
 
-# The responder is also the admin (so every state lands in its own keystore
-# with no round-trip); the agent makes its key and joins with the one token
-# `wires invite` prints for it.
-WIRES_HOME="$wb" "$WIRES" init >/dev/null 2>&1
+# The admin starts the network; the workbench prints its id for the admin
+# to name it by. No step fails: the edits before the directory runs are
+# stored, and `policy push` delivers them.
+admin init --issuer "$ISSUER" --client-id "$CLIENT_ID" \
+	${BENCH_OIDC_CLIENT_SECRET:+--public-client-secret "$BENCH_OIDC_CLIENT_SECRET"} >/dev/null
 WB_ID="$(WIRES_HOME="$wb" "$WIRES" id 2>/dev/null)"
-WIRES_HOME="$wb" "$WIRES" role set bench --issuer "$ISSUER" "$EMAIL" >/dev/null 2>&1
-WIRES_HOME="$wb" "$WIRES" service add gh --allow bench --host "$WB_ID" \
+admin role set bench "$EMAIL" >/dev/null 2>&1
+admin directory add "workbench=$WB_ID" >/dev/null 2>&1
+admin service add gh --allow bench --host workbench \
 	--description "The GitHub CLI (gh), run on a remote machine that is already authenticated. Pass gh's arguments after --." >/dev/null 2>&1
-AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
-token="$(WIRES_HOME="$wb" "$WIRES" invite "$AG_ID" --name agent 2>/dev/null)"
-WIRES_HOME="$agent" "$WIRES" join "$token" >/dev/null
+NETWORK="$(admin network)"
+WIRES_HOME="$wb" "$WIRES" join "$NETWORK" >/dev/null
 
 cat >"$D/host.json" <<JSON
 {
@@ -61,27 +68,30 @@ JSON
 WIRES_HOME="$wb" "$WIRES" serve --check "$D/host.json" >/dev/null
 WIRES_HOME="$wb" nohup "$WIRES" serve "$D/host.json" >"$D/wb.out" 2>"$D/wb.err" </dev/null &
 echo $! >"$D/wb.pid"
-sleep 2
-kill -0 "$(cat "$D/wb.pid")" || {
-	cat "$D/wb.err" >&2
-	exit 1
-}
-# Addressing is by key: the responder's own hint line (its loopback
-# address) goes into the agent's local hints file, so no discovery or relay is
-# involved.
+# Addressing is by key: the workbench's own hint line (its loopback
+# address) goes into the others' local hints files, so no discovery or relay
+# is involved.
 for _ in $(seq 1 50); do
 	[ -s "$wb/run/hint" ] && break
 	sleep 0.1
 done
-cp "$wb/run/hint" "$agent/hints" || {
+kill -0 "$(cat "$D/wb.pid")" || {
 	cat "$D/wb.err" >&2
-	echo "wires-up: the responder wrote no hint line" >&2
 	exit 1
 }
+[ -s "$wb/run/hint" ] || {
+	cat "$D/wb.err" >&2
+	echo "wires-up: the workbench wrote no hint line" >&2
+	exit 1
+}
+cp "$wb/run/hint" "$admin_ks/hints"
+cp "$wb/run/hint" "$agent/hints"
+# The workbench's directory started empty: the first publish fills it.
+admin policy push >&2
 
-# The agent signs in once: its ID token is bound to its node key.
-WIRES_HOME="$agent" "$WIRES" login --issuer "$ISSUER" --client-id "$CLIENT_ID" \
-	${BENCH_OIDC_CLIENT_SECRET:+--client-secret "$BENCH_OIDC_CLIENT_SECRET"} >&2
+# The agent joins and signs in, in one command: its ID token is bound to its
+# node key.
+WIRES_HOME="$agent" "$WIRES" login "$NETWORK" >&2
 
 {
 	printf 'export WIRES_HOME=%q\n' "$agent"

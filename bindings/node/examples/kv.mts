@@ -1,7 +1,7 @@
 /**
  * kv: a wires-native service written in TypeScript.
  *
- * The same store as the Rust and Python examples (wires/examples/kv.rs,
+ * The same store as the Rust and Python examples (wires/examples/kv/,
  * bindings/python/examples/kv.py): a key-value map held in this process's
  * memory, one namespace per verified person, so each caller sees only their
  * own keys.
@@ -9,15 +9,17 @@
  *     wires call kv -- set greeting <<< 'hello'   # the value is stdin
  *     wires call kv -- get greeting               # hello
  *     wires call kv -- keys                       # greeting
+ *     wires call kv -- whoami                     # alice@example.com, then the ID token unsigned
  *     wires call kv -- throw                      # throws: exit 1, its message on stderr
  *
  * Run it (Node >= 22.18 runs TypeScript directly) with the package from
- * `./.scripts/build-node.sh` installed as `wires`:
+ * `./.scripts/build-node.sh` installed as `wires`, from the keystore of a
+ * node that ran `wires join <network>` (the admin names it as kv's host):
  *
  *     node kv.mts <WIRES_HOME> <issuer> <audience> [--push-to ROLE] [--loopback]
  *
  * With --push-to, a `set` also pushes "kv: <key> set" to the caller's
- * `wires inbox` (members of ROLE may receive pushes). With --loopback, the
+ * `wires inbox` (people in ROLE may receive pushes). With --loopback, the
  * host takes direct connections only from this machine (others come through
  * its relay), so the macOS firewall doesn't prompt for Node.
  *
@@ -79,11 +81,21 @@ async function kv(call: Call, push: boolean): Promise<number> {
     await call.writeStdout(Buffer.from(listing));
     return 0;
   }
+  if (verb === "whoami" && key === undefined) {
+    // Who the host verified, and the ID token it verified: a service would
+    // hand the token on (say, to a token exchange). This one echoes it
+    // without its signature, which leaves no credential, only the claims.
+    const token = call.idToken();
+    const unsigned = token.slice(0, Math.max(0, token.lastIndexOf(".")));
+    const name = who.email ?? `${who.subject} at ${who.issuer}`;
+    await call.writeStdout(Buffer.from(`${name}\n${unsigned}\n`));
+    return 0;
+  }
   if (verb === "throw" && key === undefined) {
     // An uncaught exception: the call exits 1 with its message.
     throw new Error("kv: thrown on request");
   }
-  await call.writeStderr(Buffer.from("usage: kv set KEY (value on stdin) | get KEY | keys | throw\n"));
+  await call.writeStderr(Buffer.from("usage: kv set KEY (value on stdin) | get KEY | keys | whoami | throw\n"));
   return 2;
 }
 

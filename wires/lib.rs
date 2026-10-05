@@ -4,23 +4,24 @@
 //! parsing and dispatch ([`run`], which `main.rs` calls), plus the public
 //! surface an app embeds to serve wires calls in-process (card 33):
 //!
-//! - **admin** (`admin/`) — holds the root key, mints badges and signs the
-//!   policy: which IdPs are trusted, which roles exist, which services run
-//!   where and who may call them, who is banned, which nodes are directories.
+//! - **admin** (`admin/`) — holds the root key and signs the policy: which
+//!   IdPs are trusted, which roles exist, which services run where and who
+//!   may call them, who is removed, which nodes are directories. It mints
+//!   nothing for any node: a caller is admitted by its IdP sign-in when a
+//!   role matches it, a host or directory by the policy naming its key.
 //! - **directory** (`directory/`) — holds the newest policy and vouches for
 //!   its freshness; hosts fetch it whole, and each caller its view (the
 //!   services it may use, card 37). It never decides a call (card 36).
 //! - **host** (`host/`) — `wires serve`: implements the services the signed
-//!   policy assigns to it, checks every caller against that policy, and keeps
-//!   its own log of every call.
+//!   policy assigns to it, checks every caller against that policy, and
+//!   writes one log line per call.
 //! - **caller** (`caller/`) — `wires login | services | call | mcp | inbox`:
-//!   holds only its view, and runs remote CLIs by service name (`mcp` serves them as MCP over stdio,
-//!   for the MCP clients people already use).
+//!   joins and signs in with one `wires login <network>`, holds only its
+//!   view, and runs remote CLIs by service name (`mcp` serves them as MCP
+//!   over stdio, for the MCP clients people already use).
 //! - **gateway** (`gateway/`) — `wires gateway`: those services as a
 //!   remote MCP server with OAuth, for web clients (Claude.ai), each call
 //!   made with the signed-in user's own ID token.
-//! - **observer** — `wires watch`: streams call records from the hosts' own
-//!   logs, to readers the registry names (card 26b, `caller/watch_records.rs`).
 //!
 //! `policy/` is where the signed policy lives on every node and how it moves.
 //!
@@ -30,9 +31,9 @@
 //! TypeScript bindings (`bindings/`) are built on the same API, sharing a
 //! call's stdio through [`SharedIo`].
 //!
-//! Secrets resolve through flag → env → `--…-file` → on-disk
-//! keystore (`admin/keystore.rs`), so once the admin's credentials are
-//! installed, `wires call <service>` and `wires mcp` need no other flags — which
+//! The node key resolves through flag → env → `--node-seed-file` → on-disk
+//! keystore (`admin/keystore.rs`), so once `wires login <network>` has run,
+//! `wires call <service>` and `wires mcp` need no other flags — which
 //! is what lets `wires mcp` drop straight into an MCP client's config as
 //! `"command": "wires"`.
 //!
@@ -59,7 +60,7 @@ mod policy;
 pub use host::embed::{Host, HostBuilder};
 pub use host::native::{Call, CallIo, Service, SharedIo};
 /// The types a [`Call`] is described in.
-pub use library::{CallId, NodeId, Principal, RoleName, ServiceName, StateVersion};
+pub use library::{IdToken, NodeId, Principal, RoleName, ServiceName};
 
 /// The integration tests — the whole stack over hermetic loopback, in one
 /// place because none of them belongs to a single module's seam.
@@ -103,16 +104,19 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     // --- admin ---
-    /// Create the network: the root key, this node's key and badge, the first policy
+    /// Create the network: the root key, this node's key, the first policy
     #[command(after_help = help::INIT_AFTER)]
     Init(admin::init::InitArgs),
-    /// Admit a node: mint its badge and print its join token (edits no policy)
-    #[command(after_help = help::INVITE_AFTER)]
-    Invite(admin::invite::InviteArgs),
-    /// Ban a node until its badge expires; hosts refuse its next call
+    /// Print the network string every node joins with (not secret)
+    #[command(after_help = help::NETWORK_AFTER)]
+    Network,
+    /// Remove a person (email) or a node (label or id); hosts refuse them
     #[command(after_help = help::REMOVE_AFTER)]
-    Remove(admin::invite::RemoveArgs),
-    /// Register services: add, set, rm (who may call and read, which hosts)
+    Remove(admin::remove::WhoArgs),
+    /// Lift a removal of a person or a node
+    #[command(after_help = help::RESTORE_AFTER)]
+    Restore(admin::remove::WhoArgs),
+    /// Register services: add, set, rm (who may call them, which hosts run them)
     #[command(after_help = help::SERVICE_AFTER)]
     Service(admin::service::ServiceArgs),
     /// Define roles from IdP identities: set, rm
@@ -132,7 +136,7 @@ enum Command {
     /// Run host.json's services: check every caller, run the call, log it
     #[command(after_help = help::SERVE_AFTER)]
     Serve(host::serve::ServeArgs),
-    /// Send a caller a message by node id or role, to its inbox (logged)
+    /// Send a caller a message by node id or role, to its inbox
     #[command(after_help = help::PUSH_AFTER)]
     Push(host::push::PushArgs),
 
@@ -140,10 +144,10 @@ enum Command {
     /// Print this node's id (making its key on first use), for your admin
     #[command(after_help = help::ID_AFTER)]
     Id,
-    /// Install the invite token your admin sent (without one, print this node's id)
+    /// Join a network with its string, signing nobody in (a host or directory)
     #[command(after_help = help::JOIN_AFTER)]
     Join(caller::join::JoinArgs),
-    /// Sign in with your IdP, binding your identity to this node's key
+    /// Sign in with your IdP (the first time with the network string: login <network>)
     #[command(after_help = help::LOGIN_AFTER)]
     Login(caller::login::LoginArgs),
     /// List the services you may call, one per line (a query searches them)
@@ -173,11 +177,6 @@ enum Command {
     #[command(after_help = help::GATEWAY_AFTER)]
     Gateway(gateway::GatewayArgs),
 
-    // --- reader ---
-    /// Stream the call records you may read, verified, from the services' hosts
-    #[command(after_help = help::WATCH_AFTER)]
-    Watch(caller::watch_records::WatchArgs),
-
     /// Dev build only: run the hermetic mock OIDC issuer on a loopback port
     /// until killed. Prints `issuer <url>` and `client_id <id>` on stdout.
     #[cfg(feature = "dev-mock-idp")]
@@ -206,7 +205,7 @@ async fn dev_mock_idp_cmd(a: DevMockIdpArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Exit code for an authorization refusal by the responder (sysexits
+/// Exit code for an authorization refusal by the host (sysexits
 /// `EX_NOPERM`), distinct from 1 = local/transport failure. An agent running
 /// `wires call` can tell "you are not allowed" apart from "the network is
 /// down" without parsing text.
@@ -228,7 +227,7 @@ fn init_logging() {
     init_logging_with(LOG_FILTER);
 }
 
-/// [`init_logging`] for the dialing commands (`call`, `services`, `mcp`),
+/// [`init_logging`] for the dialing commands (`call`, `services`, `mcp`, `login`),
 /// whose stderr belongs to the remote CLI, and the admin's one-shot commands:
 /// [`QUIET_LOG_FILTER`] by default, so a successful run leaves nothing of
 /// wires' own on stderr but its notes.
@@ -271,13 +270,14 @@ pub fn run() {
             init_quiet_logging();
             print_or_exit(admin::init::init_cmd(a))
         }
-        Command::Invite(a) => {
-            init_quiet_logging();
-            print_report(runtime().block_on(admin::invite::invite_cmd(a)))
-        }
+        Command::Network => print_report(admin::network::network_cmd()),
         Command::Remove(a) => {
             init_quiet_logging();
-            print_report(runtime().block_on(admin::invite::remove_cmd(a)))
+            print_report(runtime().block_on(admin::remove::remove_cmd(a)))
+        }
+        Command::Restore(a) => {
+            init_quiet_logging();
+            print_report(runtime().block_on(admin::remove::restore_cmd(a)))
         }
         Command::Service(a) => {
             init_quiet_logging();
@@ -310,7 +310,7 @@ pub fn run() {
         Command::Id => print_or_exit(caller::join::id_cmd()),
         Command::Join(a) => {
             init_quiet_logging();
-            print_or_exit(runtime().block_on(caller::join::join_cmd(a)))
+            print_or_exit(caller::join::join_cmd(a))
         }
         Command::Serve(a) => {
             if let Err(e) = runtime().block_on(host::serve::serve_cmd(a)) {
@@ -326,6 +326,7 @@ pub fn run() {
             exit_with_code(runtime().block_on(caller::inbox::inbox_cmd(a)))
         }
         Command::Login(a) => {
+            init_quiet_logging();
             if let Err(e) = runtime().block_on(caller::login::login_cmd(a)) {
                 exit_with(e);
             }
@@ -355,11 +356,6 @@ pub fn run() {
                 exit_with(e);
             }
         }
-        // Exit 77 when every host refused the stream.
-        Command::Watch(a) => {
-            init_quiet_logging();
-            exit_with_code(runtime().block_on(caller::watch_records::watch_cmd(a)))
-        }
         #[cfg(feature = "dev-mock-idp")]
         Command::DevMockIdp(a) => {
             if let Err(e) = runtime().block_on(dev_mock_idp_cmd(a)) {
@@ -388,7 +384,7 @@ fn exit_with_code(result: anyhow::Result<i32>) -> ! {
 }
 
 /// Print an admin command's notes on stderr and its result on stdout (the
-/// token, for `invite` — so `$(wires invite …)` is the token alone). A
+/// string, for `network` — so `$(wires network)` is the string alone). A
 /// failure (the new policy reached no directory) is printed last and exits
 /// 1: the work is done and stored, but not in force. An error is
 /// [`exit_with`].
@@ -411,13 +407,19 @@ fn print_report(result: anyhow::Result<admin::Report>) {
 
 /// Report a network-command failure and exit.
 ///
-/// An authorization refusal is its own outcome: print the responder's own
+/// An authorization refusal is its own outcome: print the host's own
 /// words and exit [`EXIT_DENIED`], not the generic 1. The downcast walks
-/// anyhow's context chain, so a `Denied` wrapped in "peer X refused this node's
-/// admission" still lands here.
+/// anyhow's context chain, so a `Denied` wrapped in "calling orders-db"
+/// still lands here.
 fn exit_with(e: anyhow::Error) -> ! {
     if let Some(d) = e.downcast_ref::<host::transport::Denied>() {
-        eprintln!("wires: {}", help::refusal(d.reason()));
+        // A signed-in caller says what its person can act on, not just
+        // "not admitted" (read from its own stored token).
+        let reason = match admin::keystore::Keystore::resolve() {
+            Ok(ks) => caller::hello::say_refusal(&ks, d.reason()),
+            Err(_) => d.reason().to_owned(),
+        };
+        eprintln!("wires: {}", help::refusal(&reason));
         std::process::exit(EXIT_DENIED);
     }
     if VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -441,35 +443,33 @@ fn set_verbose(on: bool) {
 mod tests {
     use super::*;
 
-    /// Card 14's onboarding commands parse as documented.
+    /// The first-run and admin commands parse as documented.
     #[test]
     fn onboarding_commands_parse() {
         let id = "ab".repeat(32);
         assert!(Cli::try_parse_from(["wires", "init"]).is_ok());
-        assert!(Cli::try_parse_from(["wires", "init", "--ttl", "7d"]).is_ok());
-        assert!(Cli::try_parse_from(["wires", "init", "--ttl", "soon"]).is_err());
-        assert!(Cli::try_parse_from(["wires", "invite", &id, "--name", "alice"]).is_ok());
-        assert!(Cli::try_parse_from(["wires", "invite"]).is_err());
-        assert!(Cli::try_parse_from(["wires", "remove", "alice"]).is_ok());
-        // Card 28: `--ttl` is a membership's lifetime, `--policy-ttl` the
-        // signed policy's.
+        assert!(Cli::try_parse_from(["wires", "network"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "remove", "alice@example.com"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "remove", "workbench"]).is_ok());
         assert!(
-            Cli::try_parse_from(["wires", "invite", &id, "--ttl", "1h", "--policy-ttl", "30d"])
-                .is_ok()
+            Cli::try_parse_from(["wires", "remove", "eve@x.com", "--issuer", "https://i"]).is_ok()
         );
+        assert!(Cli::try_parse_from(["wires", "restore", "alice@example.com"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "remove"]).is_err());
         assert!(Cli::try_parse_from(["wires", "init", "--policy-ttl", "7d"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "remove", "alice", "--policy-ttl", "7d"]).is_ok());
-        assert!(Cli::try_parse_from(["wires", "remove", "alice", "--ttl", "7d"]).is_err());
         assert!(
             Cli::try_parse_from(["wires", "service", "rm", "db", "--policy-ttl", "7d"]).is_ok()
         );
-        assert!(Cli::try_parse_from(["wires", "service", "rm", "db", "--ttl", "7d"]).is_err());
         assert!(Cli::try_parse_from(["wires", "policy", "push"]).is_ok());
         assert!(
             Cli::try_parse_from(["wires", "init", "--issuer", "https://i", "--client-id", "c"])
                 .is_ok()
         );
         assert!(Cli::try_parse_from(["wires", "directory", "add", "workbench"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["wires", "directory", "add", &format!("workbench={id}")]).is_ok()
+        );
         assert!(Cli::try_parse_from(["wires", "directory", "rm", "workbench"]).is_ok());
         assert!(Cli::try_parse_from(["wires", "directory", "serve"]).is_ok());
         assert!(
@@ -477,7 +477,12 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["wires", "directory"]).is_err());
         assert!(Cli::try_parse_from(["wires", "id"]).is_ok());
-        assert!(Cli::try_parse_from(["wires", "join"]).is_ok());
-        assert!(Cli::try_parse_from(["wires", "join", "tok"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["wires", "join"]).is_err(),
+            "the string is required"
+        );
+        assert!(Cli::try_parse_from(["wires", "join", "net"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "login", "net"]).is_ok());
+        assert!(Cli::try_parse_from(["wires", "login"]).is_ok());
     }
 }

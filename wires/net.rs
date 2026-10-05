@@ -6,8 +6,8 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use url::Url;
 
 /// Whether `url`'s host is this machine: a loopback IP, or `localhost`. The
-/// one case where plain `http` is allowed (OIDC endpoints, OTLP collectors,
-/// OAuth redirect URIs).
+/// one case where plain `http` is allowed (OIDC endpoints, OAuth redirect
+/// URIs).
 pub(crate) fn is_loopback(url: &Url) -> bool {
     match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),

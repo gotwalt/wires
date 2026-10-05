@@ -1,9 +1,9 @@
 //! The caller's **view** (card 37): the services this node's verified person
-//! may call or read, each a root-signed entry, and nothing else.
+//! may call, each a root-signed entry, and nothing else.
 //!
 //! A caller never holds the policy. It holds `$WIRES_HOME/view.json`
 //! ([`HeldView`]): the root-signed head, the directory's newest [`Fresh`]
-//! for it, and the [`ViewEntry`]s a directory cut for its ID token. No
+//! for it, and the signed entries a directory cut for its ID token. No
 //! role, no ban, no other service, and no node id but its services' hosts
 //! and the directories. Every entry verifies on its own under the root
 //! ([`View::verify`]), so a directory can't forge one; what it could do is
@@ -13,16 +13,18 @@
 //! How a view stays current, without background traffic for one-shot
 //! commands:
 //!
-//! - `wires join` stores the invite's directory ids ([`DIRECTORIES_FILE`])
-//!   and asks one for the head (an empty view: no entry before a login);
-//!   `wires login` asks for the view under the new identity.
-//! - `wires services` refreshes first when the view is older than a day
-//!   ([`VIEW_MAX_AGE_SECS`]), its head has expired, or a host reported a
-//!   newer head ([`HeldView::is_stale`]).
-//! - `wires call` dials from the view as it is. When the host's `HelloAck`
-//!   reports a newer head, the caller records it ([`note_seen`]) and
-//!   refreshes after the call; a name not in the view is asked of a
-//!   directory with `resolve` before the call fails.
+//! - `wires login` asks for the view under the new identity, from the
+//!   directories its network string names until a head names them all.
+//! - `wires services`, `wires call` and `wires inbox` refresh first when
+//!   the view is older than a day ([`VIEW_MAX_AGE_SECS`]), its head has
+//!   expired, or a host reported a newer head ([`HeldView::is_stale`]);
+//!   otherwise they dial from the view as it is ([`usable`]). A refresh no
+//!   directory answers leaves the view as it is: calls keep working with
+//!   every directory down, so the hard bound on dialing from an old view is
+//!   its head's `not_after`, not a day. When the host's `HelloAck` reports a newer
+//!   head, the caller records it ([`note_seen`]) and refreshes after the
+//!   call; a name not in the view is asked of a directory with `resolve`
+//!   before the call fails.
 //! - `wires mcp`, the gateway and `inbox --wait` hold a subscription
 //!   ([`follow`]): the whole view, then an update per new head.
 //!
@@ -36,13 +38,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::Endpoint;
 use library::{
-    DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, Fresh, IdToken, Membership, NodeId,
-    ServiceName, SignedPolicyHead, StateVersion, SubFrame, SubRequest, SubscriptionKind, View,
-    ViewDigest, ViewEntry,
+    DIRECTORY_SUB_ALPN, DirectoryAnswer, DirectoryRequest, Fresh, IdToken, NodeId, ServiceName,
+    SignedEntry, StateVersion, SubFrame, SubRequest, SubscriptionKind, View, ViewDigest,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::admin::keystore::{Keystore, write_text_mode};
+use crate::admin::keystore::{Keystore, write_private};
 use crate::clock::now_unix;
 use crate::directory::wire::{self, ask};
 use crate::host::transport;
@@ -51,11 +52,16 @@ use crate::policy::store;
 /// The caller's view, under `$WIRES_HOME`.
 pub(crate) const VIEW_FILE: &str = "view.json";
 
-/// The directory ids `wires join` stored from the invite, under
-/// `$WIRES_HOME`: where to ask before any head names them.
-pub(crate) const DIRECTORIES_FILE: &str = "directories.json";
-
-/// How old a view may be before `wires services` refreshes it: a day.
+/// How old a view may be before `wires services`, `wires call` or `wires
+/// inbox` refreshes it: a day.
+///
+/// This is **not** a bound on how long a caller holding a view from before a
+/// host's removal may still dial that host (protocol §5): when no directory
+/// answers the refresh, the caller keeps its view; and a removed machine
+/// that was also a directory the old head lists can answer `current` with
+/// a `Fresh` it signs for that head, resetting the day. The hard bound is
+/// the view's head's `not_after` (90 days by default): an expired view is
+/// never dialed from.
 pub(crate) const VIEW_MAX_AGE_SECS: i64 = 24 * 60 * 60;
 
 /// How long a refresh spends asking, all directories together.
@@ -103,7 +109,8 @@ impl HeldView {
         &self.view.head.head.directories
     }
 
-    /// Whether `wires services` should refresh it first: last vouched for
+    /// Whether `wires services`, `wires call` and `wires inbox` should refresh it first:
+    /// last vouched for
     /// more than [`VIEW_MAX_AGE_SECS`] before `now`, its head expired, or a
     /// host reported a newer head.
     pub(crate) fn is_stale(&self, now: i64) -> bool {
@@ -112,13 +119,8 @@ impl HeldView {
             || self.seen > self.version()
     }
 
-    /// The entries this caller may call (marked `call`), in name order.
-    pub(crate) fn callable(&self) -> impl Iterator<Item = &ViewEntry> {
-        self.view.entries.iter().filter(|e| e.call)
-    }
-
     /// The entry for `service`, if the view holds it.
-    pub(crate) fn entry(&self, service: &ServiceName) -> Option<&ViewEntry> {
+    pub(crate) fn entry(&self, service: &ServiceName) -> Option<&SignedEntry> {
         self.view.entry(service)
     }
 }
@@ -146,11 +148,12 @@ pub(crate) fn write(ks: &Keystore, root: NodeId, held: &HeldView) -> Result<()> 
         .verify(root)
         .context("refusing to store a view that does not verify")?;
     let text = serde_json::to_string(held).context("encoding the view")?;
-    write_text_mode(&ks.path(VIEW_FILE), &format!("{text}\n"), Some(0o600))
+    write_private(&ks.path(VIEW_FILE), format!("{text}\n"))
 }
 
 /// Record that a host reported head `version` (from a `HelloAck`): the
-/// next `wires services` refreshes first. Best effort; no view, no note.
+/// next `wires services`, `wires call` or `wires inbox` refreshes first.
+/// Best effort; no view, no note.
 pub(crate) fn note_seen(ks: &Keystore, root: NodeId, version: StateVersion) {
     let noted = (|| -> Result<()> {
         let Some(mut held) = read(ks, root)? else {
@@ -167,28 +170,62 @@ pub(crate) fn note_seen(ks: &Keystore, root: NodeId, version: StateVersion) {
     }
 }
 
-/// The directory ids `wires join` stored (empty when none).
-pub(crate) fn joined_directories(ks: &Keystore) -> Vec<NodeId> {
-    std::fs::read_to_string(ks.path(DIRECTORIES_FILE))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+/// Record that a host refused a call made from the view: it may be behind
+/// the host's policy, so the next `wires services`, `wires call` or `wires
+/// inbox` refreshes first (as if no directory had vouched for it lately).
+/// Best effort; no view, no note.
+pub(crate) fn note_refused(ks: &Keystore, root: NodeId) {
+    let noted = (|| -> Result<()> {
+        let Some(mut held) = read(ks, root)? else {
+            return Ok(());
+        };
+        held.checked = 0;
+        write(ks, root, &held)
+    })();
+    if let Err(e) = noted {
+        tracing::debug!("noting a refusal: {e:#}");
+    }
 }
 
-/// Store the invite's directory ids for [`joined_directories`].
-pub(crate) fn save_joined_directories(ks: &Keystore, dirs: &[NodeId]) -> Result<()> {
-    let text = serde_json::to_string(dirs)?;
-    write_text_mode(&ks.path(DIRECTORIES_FILE), &format!("{text}\n"), None)
+/// The directories the network string names (empty when none is stored).
+pub(crate) fn joined_directories(ks: &Keystore) -> Vec<NodeId> {
+    ks.read_network()
+        .ok()
+        .flatten()
+        .map_or_else(Vec::new, |n| n.directories)
 }
 
 /// The directories this node asks, never itself: its view's head's (or,
-/// holding none, the ones `wires join` stored).
+/// holding none, the network string's).
 pub(crate) fn directories(ks: &Keystore, root: NodeId, me: NodeId) -> Vec<NodeId> {
     let dirs = match read(ks, root) {
         Ok(Some(held)) if !held.directories().is_empty() => held.directories().to_vec(),
         _ => joined_directories(ks),
     };
     dirs.into_iter().filter(|d| *d != me).collect()
+}
+
+/// Every directory that answered a refresh refused this node with
+/// [`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED), and none gave it a
+/// view: the context of [`refresh`]'s error then, so a command can say
+/// what the person can act on
+/// ([`explain_not_admitted`](crate::caller::hello::explain_not_admitted)).
+#[derive(Debug, thiserror::Error)]
+#[error("a directory said this node is not admitted to the network")]
+pub(crate) struct NotAdmitted;
+
+/// A directory's `denied {reason}`, as an error (so [`refresh`] can tell a
+/// refusal of admission from a directory that couldn't be reached).
+#[derive(Debug, thiserror::Error)]
+#[error("refused: {0}")]
+pub(crate) struct Refused(pub(crate) String);
+
+impl Refused {
+    /// Whether the directory refused admission.
+    pub(crate) fn is_not_admitted(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<Refused>()
+            .is_some_and(|r| r.0 == crate::host::gate::NOT_ADMITTED)
+    }
 }
 
 /// What a directory answered a `view` request with, verified.
@@ -202,8 +239,8 @@ pub(crate) enum Fetched {
     Current(Fresh),
 }
 
-/// Ask directory `dir` for this node's view (presenting `badge` and
-/// `id_token`), holding `held` (whose version it names as `have`), or the
+/// Ask directory `dir` for this node's view (presenting `id_token`, which
+/// is what admits it), holding `held` (whose version it names as `have`), or the
 /// entries matching `query`. A `view_update` is applied to `held`
 /// ([`View::apply`]: each entry verified, none older than held) and comes
 /// back as the whole new view. A `current` answer is only taken for a
@@ -212,7 +249,6 @@ pub(crate) enum Fetched {
 pub(crate) async fn ask_view(
     endpoint: &Endpoint,
     dir: NodeId,
-    badge: &Membership,
     id_token: Option<IdToken>,
     root: NodeId,
     held: Option<&View>,
@@ -231,7 +267,7 @@ pub(crate) async fn ask_view(
         query,
         held: held_digest,
     };
-    match ask(endpoint, dir, badge, id_token, &request).await? {
+    match ask(endpoint, dir, id_token, &request).await? {
         DirectoryAnswer::View { view, fresh } => {
             view.verify(root)
                 .context("the directory's view does not verify")?;
@@ -263,7 +299,7 @@ pub(crate) async fn ask_view(
             }
             Ok(Fetched::Current(fresh))
         }
-        DirectoryAnswer::Denied { reason } => bail!("refused: {reason}"),
+        DirectoryAnswer::Denied { reason } => Err(Refused(reason).into()),
         other => bail!("an unexpected answer to `view`: {other:?}"),
     }
 }
@@ -273,7 +309,6 @@ pub(crate) async fn ask_view(
 pub(crate) async fn ask_resolve(
     endpoint: &Endpoint,
     dir: NodeId,
-    badge: &Membership,
     id_token: Option<IdToken>,
     root: NodeId,
     service: &ServiceName,
@@ -281,52 +316,30 @@ pub(crate) async fn ask_resolve(
     let request = DirectoryRequest::Resolve {
         service: service.clone(),
     };
-    match ask(endpoint, dir, badge, id_token, &request).await? {
+    match ask(endpoint, dir, id_token, &request).await? {
         DirectoryAnswer::View { view, fresh } => {
             view.verify(root)
                 .context("the directory's view does not verify")?;
             fresh
                 .verify(&view.head)
                 .context("the directory's freshness doesn't vouch for its view")?;
-            if view.entries.iter().any(|e| e.entry.name != *service) {
+            if view.entries.iter().any(|e| e.name != *service) {
                 bail!("the directory resolved {service} to another service");
             }
             Ok(view)
         }
-        DirectoryAnswer::Denied { reason } => bail!("refused: {reason}"),
+        DirectoryAnswer::Denied { reason } => Err(Refused(reason).into()),
         other => bail!("an unexpected answer to `resolve`: {other:?}"),
     }
 }
 
-/// Ask directory `dir` for the newest head (`head {}`): verified under
-/// `root`, with a `Fresh` that vouches for it.
-pub(crate) async fn ask_head(
-    endpoint: &Endpoint,
-    dir: NodeId,
-    badge: &Membership,
-    root: NodeId,
-) -> Result<(SignedPolicyHead, Fresh)> {
-    match ask(endpoint, dir, badge, None, &DirectoryRequest::Head {}).await? {
-        DirectoryAnswer::Head { head, fresh } => {
-            head.verify(root)
-                .context("the directory's head does not verify")?;
-            fresh
-                .verify(&head)
-                .context("the directory's freshness doesn't vouch for its head")?;
-            Ok((head, fresh))
-        }
-        DirectoryAnswer::Denied { reason } => bail!("refused: {reason}"),
-        other => bail!("an unexpected answer to `head`: {other:?}"),
-    }
-}
-
-/// Who this node is, for a refresh: its endpoint, badge, stored ID token
-/// and fabric root.
+/// Who this node is, for a refresh: its endpoint, the network's root, and
+/// its stored ID token.
 pub(crate) struct Asker<'a> {
     /// A bound endpoint for this node (not closed here).
     pub(crate) endpoint: &'a Endpoint,
-    /// This node's badge.
-    pub(crate) badge: &'a Membership,
+    /// The network's root key.
+    pub(crate) root: NodeId,
     /// The ID token to present (the one `wires login` stored).
     pub(crate) id_token: Option<IdToken>,
 }
@@ -341,9 +354,10 @@ pub(crate) struct Asker<'a> {
 ///   someone else).
 ///
 /// Errors when there is no view to be had (no directory answered, none
-/// held).
+/// held), with [`NotAdmitted`] as its context when a directory refused this
+/// node's admission and none gave it a view.
 pub(crate) async fn refresh(ks: &Keystore, asker: &Asker<'_>, forget: bool) -> Result<HeldView> {
-    let root = asker.badge.fabric;
+    let root = asker.root;
     let me = transport::to_node_id(&asker.endpoint.id());
     let now = now_unix();
     if let Some(whole) = store::read(ks, root)? {
@@ -354,7 +368,11 @@ pub(crate) async fn refresh(ks: &Keystore, asker: &Asker<'_>, forget: bool) -> R
                 None
             }
         };
-        let held = HeldView::fetched(whole.signed.view_for(principal.as_ref(), None), None, now);
+        let held = HeldView::fetched(
+            whole.signed.view_for(me, principal.as_ref(), None),
+            None,
+            now,
+        );
         write(ks, root, &held)?;
         return Ok(held);
     }
@@ -363,18 +381,18 @@ pub(crate) async fn refresh(ks: &Keystore, asker: &Asker<'_>, forget: bool) -> R
     if dirs.is_empty() {
         return held.ok_or_else(|| {
             anyhow!(
-                "this node knows no directory to ask for its view: ask your admin for a fresh \
-                 invite and `wires join` it"
+                "this node knows no directory to ask for its view: ask your admin for the \
+                 network string (`wires network`) and `wires login <network>` with it"
             )
         });
     }
     let mut failures = Vec::new();
+    let mut not_admitted = false;
     for dir in dirs {
         let base = held.as_ref().map(|h| &h.view);
         let mut asked = ask_view(
             asker.endpoint,
             dir,
-            asker.badge,
             asker.id_token.clone(),
             root,
             base,
@@ -387,7 +405,6 @@ pub(crate) async fn refresh(ks: &Keystore, asker: &Asker<'_>, forget: bool) -> R
             asked = ask_view(
                 asker.endpoint,
                 dir,
-                asker.badge,
                 asker.id_token.clone(),
                 root,
                 None,
@@ -419,13 +436,89 @@ pub(crate) async fn refresh(ks: &Keystore, asker: &Asker<'_>, forget: bool) -> R
                 write(ks, root, &current)?;
                 return Ok(current);
             }
-            Err(e) => failures.push(format!("{}: {e:#}", dir.short())),
+            Err(e) => {
+                not_admitted |= Refused::is_not_admitted(&e);
+                failures.push(format!("{}: {e:#}", dir.short()));
+            }
         }
     }
-    bail!(
+    let failed = anyhow!(
         "no directory gave this node its view ({})",
         failures.join("; ")
-    )
+    );
+    Err(if not_admitted {
+        failed.context(NotAdmitted)
+    } else {
+        failed
+    })
+}
+
+/// Refuse an expired view, saying what to do about it.
+pub(crate) fn check_fresh(held: &HeldView, now: i64) -> Result<()> {
+    if held.view.head.check_fresh(now).is_err() {
+        bail!(
+            "this node's view (policy version {}) has expired and no newer one could be \
+             fetched, so nothing was dialed; ask the admin to run `wires policy push`",
+            held.version().0
+        );
+    }
+    Ok(())
+}
+
+/// The view to dial from, as `wires call` and `wires inbox` take it: the
+/// held view as it is, unless it is missing or stale
+/// ([`HeldView::is_stale`]: older than a day, its head expired, or a host
+/// reported a newer head); then a refresh ([`refresh_now`]). A refresh that
+/// fails leaves a held view whose head hasn't expired, which is dialed from
+/// as it is (so calls keep working with every directory down); with none, it
+/// is an error, saying what the person can act on when a directory refused
+/// this node ([`NotAdmitted`]). An expired view is never returned.
+pub(crate) async fn usable(
+    ks: &Keystore,
+    node: &library::NodeIdentity,
+    root: NodeId,
+    relay: Option<&str>,
+) -> Result<HeldView> {
+    usable_with(ks, root, now_unix(), || {
+        refresh_now(ks, node, root, relay, false)
+    })
+    .await
+}
+
+/// [`usable`] at `now`, refreshing with `refresh` (tests hand it one over
+/// their own endpoint).
+pub(crate) async fn usable_with<F>(
+    ks: &Keystore,
+    root: NodeId,
+    now: i64,
+    refresh: impl FnOnce() -> F,
+) -> Result<HeldView>
+where
+    F: std::future::Future<Output = Result<HeldView>>,
+{
+    let held = read(ks, root)?.filter(|held| held.view.head.check_fresh(now).is_ok());
+    if let Some(held) = &held
+        && !held.is_stale(now)
+    {
+        return Ok(held.clone());
+    }
+    match (refresh().await, held) {
+        (Ok(refreshed), _) => {
+            check_fresh(&refreshed, now)?;
+            Ok(refreshed)
+        }
+        (Err(e), Some(held)) => {
+            tracing::debug!("refreshing a stale view: {e:#}; dialing from it as it is");
+            Ok(held)
+        }
+        (Err(e), None) if e.downcast_ref::<NotAdmitted>().is_some() => {
+            Err(e.context(crate::caller::hello::explain_not_admitted_in(ks)))
+        }
+        (Err(e), None) => Err(e.context(
+            "this node holds no current view of its services, and no directory gave it one: \
+             run `wires login` (or ask the admin to run `wires policy push`)",
+        )),
+    }
 }
 
 /// [`refresh`] as a one-shot command does it: bind an endpoint for `node`
@@ -433,7 +526,7 @@ pub(crate) async fn refresh(ks: &Keystore, asker: &Asker<'_>, forget: bool) -> R
 pub(crate) async fn refresh_now(
     ks: &Keystore,
     node: &library::NodeIdentity,
-    badge: &Membership,
+    root: NodeId,
     relay: Option<&str>,
     forget: bool,
 ) -> Result<HeldView> {
@@ -441,7 +534,7 @@ pub(crate) async fn refresh_now(
         transport::bind_with(node, relay, library::DIRECTORY_ALPN, false, Some(ks)).await?;
     let asker = Asker {
         endpoint: &endpoint,
-        badge,
+        root,
         id_token: crate::caller::hello::stored_token(ks),
     };
     let refreshed = tokio::time::timeout(REFRESH_BUDGET, refresh(ks, &asker, forget))
@@ -457,21 +550,12 @@ pub(crate) async fn resolve(
     ks: &Keystore,
     asker: &Asker<'_>,
     service: &ServiceName,
-) -> Result<Option<ViewEntry>> {
-    let root = asker.badge.fabric;
+) -> Result<Option<SignedEntry>> {
+    let root = asker.root;
     let me = transport::to_node_id(&asker.endpoint.id());
     let mut failures = Vec::new();
     for dir in directories(ks, root, me) {
-        match ask_resolve(
-            asker.endpoint,
-            dir,
-            asker.badge,
-            asker.id_token.clone(),
-            root,
-            service,
-        )
-        .await
-        {
+        match ask_resolve(asker.endpoint, dir, asker.id_token.clone(), root, service).await {
             Ok(view) => {
                 note_seen(ks, root, view.head.head.version);
                 return Ok(view.entries.into_iter().next());
@@ -492,8 +576,8 @@ pub(crate) type ViewWatch = tokio::sync::watch::Receiver<Option<Arc<HeldView>>>;
 pub(crate) struct Follow {
     /// A bound endpoint for this node (kept open by the caller).
     pub(crate) endpoint: Endpoint,
-    /// This node's badge.
-    pub(crate) badge: Membership,
+    /// The network's root key.
+    pub(crate) root: NodeId,
     /// The ID token to present at each (re)subscription: read afresh, so a
     /// new `wires login` takes effect at the next one.
     pub(crate) id_token: Arc<dyn Fn() -> Option<IdToken> + Send + Sync>,
@@ -507,7 +591,7 @@ pub(crate) struct Follow {
     pub(crate) persist: Option<Arc<Keystore>>,
 }
 
-/// Follow this node's view on `wires/directory-sub/1` until the returned
+/// Follow this node's view on `wires/directory-sub/2` until the returned
 /// task is aborted: the first directory that answers, then the next when it
 /// goes (with a growing pause, at most [`MAX_BACKOFF`]). Every change (a new
 /// view, an update applied with [`View::apply`], a new `Fresh`) is sent on
@@ -521,7 +605,7 @@ pub(crate) struct Follow {
 pub(crate) fn follow(f: Follow) -> (ViewWatch, tokio::task::JoinHandle<()>) {
     let (tx, rx) = tokio::sync::watch::channel(f.initial.clone().map(Arc::new));
     let task = tokio::spawn(async move {
-        let root = f.badge.fabric;
+        let root = f.root;
         let me = transport::to_node_id(&f.endpoint.id());
         let mut held = f.initial.clone();
         let mut backoff = Duration::from_secs(1);
@@ -602,7 +686,6 @@ async fn follow_once(
     .map_err(|e| anyhow!("dialing {}…: {e}", dir.short()))?;
     let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
     let hello = SubRequest::Hello {
-        badge: f.badge.clone(),
         id_token: (f.id_token)(),
     };
     let subscribe = SubRequest::Subscribe {
@@ -716,7 +799,6 @@ mod tests {
                 description: "orders".into(),
                 allow: vec![staff],
                 hosts: vec![NodeIdentity::from_seed([52; 32]).node_id()],
-                readers: vec![],
             },
         );
         crate::testutil::signed_policy(&root(), p)
@@ -726,7 +808,7 @@ mod tests {
         library::Principal {
             issuer: crate::testutil::test_idp().issuer.as_str().into(),
             subject: "1".into(),
-            email: None,
+            email: Some("me@example.com".into()),
             org: None,
             groups: vec![],
             not_after: i64::MAX,
@@ -738,7 +820,11 @@ mod tests {
         let ks = Keystore::at(crate::testutil::temp_dir());
         let r = root().node_id();
         assert!(read(&ks, r).unwrap().is_none());
-        let held = HeldView::fetched(signed(3).view_for(Some(&anyone()), None), None, 10);
+        let held = HeldView::fetched(
+            signed(3).view_for(crate::testutil::any_node(), Some(&anyone()), None),
+            None,
+            10,
+        );
         write(&ks, r, &held).unwrap();
         assert_eq!(read(&ks, r).unwrap(), Some(held.clone()));
         // Another root's view is refused on the way in and on the way out.
@@ -748,7 +834,6 @@ mod tests {
         // A forged entry fails closed.
         let mut forged = held;
         forged.view.entries[0]
-            .entry
             .service
             .hosts
             .push(NodeIdentity::from_seed([66; 32]).node_id());
@@ -758,7 +843,11 @@ mod tests {
 
     #[test]
     fn a_view_goes_stale_after_a_day_or_when_a_host_saw_a_newer_head() {
-        let held = HeldView::fetched(signed(3).view_for(Some(&anyone()), None), None, 1_000);
+        let held = HeldView::fetched(
+            signed(3).view_for(crate::testutil::any_node(), Some(&anyone()), None),
+            None,
+            1_000,
+        );
         assert!(!held.is_stale(1_000 + VIEW_MAX_AGE_SECS));
         assert!(held.is_stale(1_001 + VIEW_MAX_AGE_SECS));
         let ks = Keystore::at(crate::testutil::temp_dir());
@@ -771,18 +860,22 @@ mod tests {
     }
 
     #[test]
-    fn directories_come_from_the_head_else_from_join() {
+    fn directories_come_from_the_head_else_from_the_network_string() {
         let ks = Keystore::at(crate::testutil::temp_dir());
         let r = root().node_id();
         let me = NodeIdentity::from_seed([53; 32]).node_id();
         let d = NodeIdentity::from_seed([54; 32]).node_id();
         assert!(directories(&ks, r, me).is_empty());
-        save_joined_directories(&ks, &[d, me]).unwrap();
+        crate::testutil::join(&ks, &root(), &[d, me]);
         assert_eq!(directories(&ks, r, me), vec![d], "never itself");
         let mut p = signed(3).to_policy().unwrap();
         let listed = NodeIdentity::from_seed([55; 32]).node_id();
         p.directories = vec![listed];
-        let view = crate::testutil::signed_policy(&root(), p).view_for(None, None);
+        let view = crate::testutil::signed_policy(&root(), p).view_for(
+            crate::testutil::any_node(),
+            None,
+            None,
+        );
         write(&ks, r, &HeldView::fetched(view, None, 0)).unwrap();
         assert_eq!(directories(&ks, r, me), vec![listed]);
     }
@@ -849,7 +942,7 @@ mod tests {
         let now = now_unix();
         let fresh = Fresh::sign(&dir(i), &policy.head, now, now + span).unwrap();
         let view = SubFrame::View {
-            view: policy.view_for(Some(&anyone()), None),
+            view: policy.view_for(crate::testutil::any_node(), Some(&anyone()), None),
             fresh,
         };
         let denied = SubFrame::Denied {
@@ -892,7 +985,7 @@ mod tests {
         let me = NodeIdentity::from_seed([55; 32]);
         Follow {
             endpoint: endpoint(&me, book, vec![]).await,
-            badge: Membership::mint(&root(), me.node_id(), 0, i64::MAX).unwrap(),
+            root: root().node_id(),
             id_token: Arc::new(|| None),
             initial: None,
             fallback: vec![dir(0).node_id(), dir(1).node_id()],
@@ -907,7 +1000,11 @@ mod tests {
         let policy = listing();
         let held = |span: i64| {
             let fresh = Fresh::sign(&dir(0), &policy.head, 100, 100 + span).unwrap();
-            HeldView::fetched(policy.view_for(None, None), Some(fresh), 100)
+            HeldView::fetched(
+                policy.view_for(crate::testutil::any_node(), None, None),
+                Some(fresh),
+                100,
+            )
         };
         assert_eq!(silence(Some(&held(1))), Duration::from_secs(2));
         assert_eq!(silence(Some(&held(900))), Duration::from_secs(910));

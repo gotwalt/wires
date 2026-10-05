@@ -45,6 +45,22 @@ The run follows [docs/demo.md](../../demo.md) (cheat sheet at its top).
 
 ## Notes
 
+### The recordings are gone; redo them (card 39, 2026-10-05)
+
+Card 39 deleted `docs/media/demo-remote-cli.gif` and `.mp4` and took them
+out of the README (git history keeps them). They showed invites, badges and
+a reader on `wires watch`, none of which exists since cards 40 and 41. Both
+the loopback recording and the two-machine one must be made again on the
+current code. The steps above (invite, `--reader security`, `role set
+security`, re-inviting the workbench, `wires watch`, `wires remove agent`)
+describe the old surface: the provisioning is now card 41's first run (the
+README's quick tour: `init`, `role set`, `directory add
+workbench=<id>`, `service add`, `network`; `join <network>` and `serve` on
+the workbench; `policy push`; `wires login <network>` on the laptop), and
+removal is `wires remove <email>` (a person, from every machine) or
+`wires remove <node>`. `docs/demo.md` is being rewritten to match in card
+39's other half.
+
 ### Workbench on the directory model (2026-09-24)
 
 workbench runs `00b816b` (PR #8) on a new fabric: the host is also the

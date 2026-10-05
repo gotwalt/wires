@@ -8,8 +8,9 @@
 //! - [`a_callers_keystore_holds_only_its_view`]: no role, no ban, no node
 //!   id but its services' hosts and the directories, and no service it may
 //!   not use.
-//! - [`without_a_verified_identity_the_view_is_empty`]: and `resolve` finds
-//!   one service, only for a caller that may use it.
+//! - [`without_a_verified_identity_there_is_no_view`]: no directory admits
+//!   a caller with no token that verifies; `resolve` finds one service,
+//!   only for a caller that may use it.
 //! - [`a_grant_and_a_revocation_reach_a_running_mcp_within_2s`]: as
 //!   `notifications/tools/list_changed`, through the same subscription,
 //!   mapping and server `wires mcp` runs.
@@ -23,7 +24,7 @@ use std::time::{Duration, Instant};
 use iroh::Endpoint;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::Router;
-use library::{Matcher, Membership, NodeIdentity, Policy, Service, SignedPolicy, StateVersion};
+use library::{Matcher, NodeIdentity, Policy, Service, SignedPolicy, StateVersion};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -93,7 +94,6 @@ impl World {
             description: description.into(),
             allow: vec![role(allow)],
             hosts: vec![host.node_id()],
-            readers: vec![],
         };
         p.services.insert(
             service("orders-db"),
@@ -105,7 +105,7 @@ impl World {
             service("payroll"),
             on(&self.payroll_host, "payroll-team", "Salaries"),
         );
-        p.ban(self.banned.node_id(), i64::MAX);
+        p.ban(self.banned.node_id());
         edit(&mut p);
         crate::testutil::signed_policy(&self.root, p)
     }
@@ -133,22 +133,17 @@ impl World {
         }
     }
 
-    /// The caller's keystore as `wires join` leaves it (its key, badge and
-    /// the directory ids), plus an ID token when `signed_in`.
+    /// The caller's keystore as `wires login <network>` leaves it (its key
+    /// and the network string), its ID token only when `signed_in`.
     fn caller_keystore(&self, signed_in: bool) -> Keystore {
         let ks = Keystore::at(crate::testutil::temp_dir());
         ks.save_node(&self.caller).unwrap();
-        ks.save_membership(&self.badge()).unwrap();
-        view::save_joined_directories(&ks, &[self.dir_node.node_id()]).unwrap();
+        crate::testutil::join(&ks, &self.root, &[self.dir_node.node_id()]);
         if signed_in {
             let token = crate::testutil::test_id_token(&self.caller.node_id());
             std::fs::write(ks.path(ID_TOKEN_FILE), token.as_str()).unwrap();
         }
         ks
-    }
-
-    fn badge(&self) -> Membership {
-        Membership::mint(&self.root, self.caller.node_id(), 0, i64::MAX).unwrap()
     }
 
     async fn caller_endpoint(&self) -> Endpoint {
@@ -183,11 +178,11 @@ async fn a_callers_keystore_holds_only_its_view() {
     let endpoint = w.caller_endpoint().await;
     let asker = Asker {
         endpoint: &endpoint,
-        badge: &w.badge(),
+        root: w.root.node_id(),
         id_token: crate::caller::hello::stored_token(&ks),
     };
     let held = view::refresh(&ks, &asker, false).await.unwrap();
-    let names: Vec<&str> = held.callable().map(|e| e.entry.name.as_str()).collect();
+    let names: Vec<&str> = held.view.entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["orders-db", "status"]);
     assert_eq!(held.version(), StateVersion(3));
     assert!(held.fresh.is_some(), "the directory vouched for it");
@@ -233,10 +228,11 @@ async fn a_callers_keystore_holds_only_its_view() {
     endpoint.close().await;
 }
 
-/// No token, no role: the view is empty. `resolve` finds one service only
-/// for a caller that may use it.
+/// No token, no view: the directory admits no caller it can't verify, so
+/// a caller that never signed in learns nothing, not even the head.
+/// `resolve` finds one service only for a caller that may use it.
 #[tokio::test]
-async fn without_a_verified_identity_the_view_is_empty() {
+async fn without_a_verified_identity_there_is_no_view() {
     let w = World::new();
     let _dir = w.directory(&w.policy(3, |_| {})).await;
     let endpoint = w.caller_endpoint().await;
@@ -244,27 +240,26 @@ async fn without_a_verified_identity_the_view_is_empty() {
     let anonymous = w.caller_keystore(false);
     let asker = Asker {
         endpoint: &endpoint,
-        badge: &w.badge(),
+        root: w.root.node_id(),
         id_token: None,
     };
-    let held = view::refresh(&anonymous, &asker, false).await.unwrap();
-    assert!(held.view.entries.is_empty());
-    assert_eq!(held.version(), StateVersion(3), "the head, though");
-    let orders = service("orders-db");
-    assert_eq!(
-        view::resolve(&anonymous, &asker, &orders).await.unwrap(),
-        None
+    let e = format!(
+        "{:#}",
+        view::refresh(&anonymous, &asker, false).await.unwrap_err()
     );
+    assert!(e.contains(crate::host::gate::NOT_ADMITTED), "{e}");
+    assert!(view::read(&anonymous, w.root.node_id()).unwrap().is_none());
+    let orders = service("orders-db");
+    assert!(view::resolve(&anonymous, &asker, &orders).await.is_err());
 
     let ks = w.caller_keystore(true);
     let asker = Asker {
         endpoint: &endpoint,
-        badge: &w.badge(),
+        root: w.root.node_id(),
         id_token: crate::caller::hello::stored_token(&ks),
     };
     let found = view::resolve(&ks, &asker, &orders).await.unwrap().unwrap();
-    assert_eq!(found.entry.name, orders);
-    assert!(found.call);
+    assert_eq!(found.name, orders);
     assert_eq!(
         view::resolve(&ks, &asker, &service("payroll"))
             .await
@@ -278,7 +273,7 @@ async fn without_a_verified_identity_the_view_is_empty() {
         .view
         .matching("ORDERS")
         .iter()
-        .map(|e| e.entry.name.as_str())
+        .map(|e| e.name.as_str())
         .collect();
     assert_eq!(found, ["orders-db"]);
     endpoint.close().await;
@@ -299,7 +294,7 @@ async fn a_grant_and_a_revocation_reach_a_running_mcp_within_2s() {
     let token_ks = Arc::clone(&ks);
     let (mut views, follower) = view::follow(Follow {
         endpoint: endpoint.clone(),
-        badge: w.badge(),
+        root: w.root.node_id(),
         id_token: Arc::new(move || crate::caller::hello::stored_token(&token_ks)),
         initial: None,
         fallback: view::joined_directories(&ks),
@@ -344,7 +339,6 @@ async fn a_grant_and_a_revocation_reach_a_running_mcp_within_2s() {
                 description: "Weekly reports".into(),
                 allow: vec![role("staff")],
                 hosts: vec![w.ours.node_id()],
-                readers: vec![],
             },
         );
     });
@@ -384,7 +378,6 @@ async fn a_grant_and_a_revocation_reach_a_running_mcp_within_2s() {
                 description: "Weekly reports".into(),
                 allow: vec![role("payroll-team")],
                 hosts: vec![w.ours.node_id()],
-                readers: vec![],
             },
         );
     });
@@ -431,13 +424,17 @@ async fn a_view_that_cannot_be_updated_is_fetched_whole_again() {
     let endpoint = w.caller_endpoint().await;
     let (mut views, follower) = view::follow(Follow {
         endpoint: endpoint.clone(),
-        badge: w.badge(),
+        root: w.root.node_id(),
         id_token: Arc::new({
             let ks = Arc::clone(&ks);
             move || crate::caller::hello::stored_token(&ks)
         }),
         // A stale, wrong view: nothing in it.
-        initial: Some(HeldView::fetched(v3.view_for(None, None), None, 0)),
+        initial: Some(HeldView::fetched(
+            v3.view_for(crate::testutil::any_node(), None, None),
+            None,
+            0,
+        )),
         fallback: vec![],
         persist: None,
     });
@@ -451,7 +448,7 @@ async fn a_view_that_cannot_be_updated_is_fetched_whole_again() {
     .unwrap()
     .clone()
     .unwrap();
-    assert_eq!(held.callable().count(), 2);
+    assert_eq!(held.view.entries.len(), 2);
     // Then updates apply on top of it.
     let v4 = w.policy(4, |p| {
         p.services.remove(&service("status"));
@@ -466,7 +463,7 @@ async fn a_view_that_cannot_be_updated_is_fetched_whole_again() {
     .unwrap()
     .clone()
     .unwrap();
-    let names: Vec<&str> = held.callable().map(|e| e.entry.name.as_str()).collect();
+    let names: Vec<&str> = held.view.entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["orders-db"]);
     follower.abort();
     endpoint.close().await;
@@ -486,7 +483,7 @@ async fn a_refresh_from_a_kept_head_is_an_update() {
     let endpoint = w.caller_endpoint().await;
     let asker = Asker {
         endpoint: &endpoint,
-        badge: &w.badge(),
+        root: w.root.node_id(),
         id_token: crate::caller::hello::stored_token(&ks),
     };
     let held_v3 = view::refresh(&ks, &asker, false).await.unwrap().view;
@@ -500,7 +497,6 @@ async fn a_refresh_from_a_kept_head_is_an_update() {
     let answer = crate::directory::wire::ask(
         &endpoint,
         w.dir_node.node_id(),
-        &w.badge(),
         asker.id_token.clone(),
         &DirectoryRequest::View {
             have: StateVersion(3),
@@ -524,11 +520,11 @@ async fn a_refresh_from_a_kept_head_is_an_update() {
     endpoint.close().await;
 }
 
-/// A caller whose token no longer verifies can't keep entries it held:
-/// the directory can't cut an update from a view it can't name, so it sends
-/// the (empty) whole view, not an empty update over the old one.
+/// A caller whose token no longer verifies gets nothing from a directory,
+/// not even an update to the view it holds (and no host would take its
+/// calls either).
 #[tokio::test]
-async fn without_a_verified_identity_a_held_view_is_emptied_not_kept() {
+async fn without_a_verified_identity_a_held_view_is_not_refreshed() {
     let w = World::new();
     let v3 = w.policy(3, |_| {});
     let serving = w.directory(&v3).await;
@@ -536,7 +532,7 @@ async fn without_a_verified_identity_a_held_view_is_emptied_not_kept() {
     let endpoint = w.caller_endpoint().await;
     let signed_in = Asker {
         endpoint: &endpoint,
-        badge: &w.badge(),
+        root: w.root.node_id(),
         id_token: crate::caller::hello::stored_token(&ks),
     };
     let held = view::refresh(&ks, &signed_in, false).await.unwrap();
@@ -549,44 +545,146 @@ async fn without_a_verified_identity_a_held_view_is_emptied_not_kept() {
     assert!(serving.dir.accept(&v4, now_unix()).unwrap());
     let lapsed = Asker {
         endpoint: &endpoint,
-        badge: &w.badge(),
+        root: w.root.node_id(),
         id_token: None,
     };
-    let held = view::refresh(&ks, &lapsed, false).await.unwrap();
-    assert_eq!(held.version(), StateVersion(4));
-    let names: Vec<&str> = held
-        .view
-        .entries
-        .iter()
-        .map(|e| e.entry.name.as_str())
-        .collect();
-    assert!(names.is_empty(), "kept {names:?} with no verified identity");
+    let e = format!(
+        "{:#}",
+        view::refresh(&ks, &lapsed, false).await.unwrap_err()
+    );
+    assert!(e.contains(crate::host::gate::NOT_ADMITTED), "{e}");
+    let held = view::read(&ks, w.root.node_id()).unwrap().unwrap();
+    assert_eq!(held.version(), StateVersion(3), "nothing newer was given");
     endpoint.close().await;
 }
 
-/// A caller holding the empty view `wires join` stores, at the newest
-/// version, gets its entries once it presents a token that verifies: the
-/// directory answers `current` only for the view it would send.
+/// The view `wires call` and `wires inbox` dial from ([`view::usable`]):
+/// a day-old one is refreshed first when a directory answers, and with none
+/// answering it is dialed from as it is (calls never depend on a
+/// directory). (An expired one never is: `caller::call`'s tests.)
 #[tokio::test]
-async fn an_empty_view_at_the_newest_version_is_filled_once_signed_in() {
+async fn a_day_old_view_is_refreshed_before_call_and_inbox_dial_from_it() {
+    let w = World::new();
+    let root = w.root.node_id();
+    let v3 = w.policy(3, |_| {});
+    let serving = w.directory(&v3).await;
+    let ks = w.caller_keystore(true);
+    let endpoint = w.caller_endpoint().await;
+    let asker = Asker {
+        endpoint: &endpoint,
+        root,
+        id_token: crate::caller::hello::stored_token(&ks),
+    };
+    let mut held = view::refresh(&ks, &asker, false).await.unwrap();
+    // `status` is revoked at v4; the caller's view was last vouched for two
+    // days ago.
+    let mut p = v3.to_policy().unwrap();
+    p.version = StateVersion(4);
+    p.services.remove(&service("status"));
+    let v4 = p.sign_after(&w.root, &v3).unwrap();
+    assert!(serving.dir.accept(&v4, now_unix()).unwrap());
+    let day_old = now_unix() - 2 * view::VIEW_MAX_AGE_SECS;
+    held.checked = day_old;
+    view::write(&ks, root, &held).unwrap();
+    // Within a day, nothing is asked.
+    let asked = std::sync::atomic::AtomicBool::new(false);
+    let fresh = view::usable_with(&ks, root, day_old + 60, || async {
+        asked.store(true, std::sync::atomic::Ordering::SeqCst);
+        anyhow::bail!("not asked")
+    })
+    .await
+    .unwrap();
+    assert_eq!(fresh.version(), StateVersion(3));
+    assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
+    // A day on, the refresh comes first.
+    let refreshed = view::usable_with(&ks, root, now_unix(), || view::refresh(&ks, &asker, false))
+        .await
+        .unwrap();
+    assert_eq!(refreshed.version(), StateVersion(4));
+    let names: Vec<&str> = refreshed
+        .view
+        .entries
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(names, ["orders-db"]);
+    // With no directory answering, a stale view is dialed from as it is.
+    let mut stale = refreshed.clone();
+    stale.checked = day_old;
+    view::write(&ks, root, &stale).unwrap();
+    let kept = view::usable_with(&ks, root, now_unix(), || async {
+        anyhow::bail!("no directory answered")
+    })
+    .await
+    .unwrap();
+    assert_eq!(kept.version(), StateVersion(4));
+    endpoint.close().await;
+}
+
+/// A person the IdP verifies but no role names is not in the network: a
+/// directory refuses the refresh, and the error carries
+/// [`view::NotAdmitted`], so `wires login`, `wires services` and `wires
+/// call` can say what the person can act on.
+#[tokio::test]
+async fn a_signed_in_person_no_role_matches_is_told_so() {
+    let w = World::new();
+    let staffless = w.policy(3, |p| {
+        p.roles.remove(&role("staff"));
+        p.services.retain(|name, _| name.as_str() == "payroll");
+    });
+    let _serving = w.directory(&staffless).await;
+    let ks = w.caller_keystore(true);
+    let endpoint = w.caller_endpoint().await;
+    let asker = Asker {
+        endpoint: &endpoint,
+        root: w.root.node_id(),
+        id_token: crate::caller::hello::stored_token(&ks),
+    };
+    let e = view::refresh(&ks, &asker, true).await.unwrap_err();
+    assert!(e.downcast_ref::<view::NotAdmitted>().is_some(), "{e:#}");
+    let said = crate::caller::hello::explain_not_admitted_in(&ks);
+    assert_eq!(
+        said,
+        "not admitted to this network: no role in this network matches caller@example.com, or \
+         you were removed: ask your admin"
+    );
+    // With no view held, the view to dial from is that sentence.
+    let e = view::usable_with(&ks, w.root.node_id(), now_unix(), || {
+        view::refresh(&ks, &asker, true)
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        crate::help::brief(&e).starts_with(&said),
+        "{}",
+        crate::help::brief(&e)
+    );
+    endpoint.close().await;
+}
+
+/// A caller holding an empty view at the directory's newest version gets
+/// its entries on a refresh: the directory answers `current` only for the
+/// view it would send, not for any view at that version.
+#[tokio::test]
+async fn an_empty_view_at_the_newest_version_is_answered_whole() {
     let w = World::new();
     let v3 = w.policy(3, |_| {});
     let _serving = w.directory(&v3).await;
     let ks = w.caller_keystore(true);
     let root = w.root.node_id();
-    let joined = library::View {
+    let empty = library::View {
         head: v3.head.clone(),
         entries: vec![],
     };
-    view::write(&ks, root, &HeldView::fetched(joined, None, now_unix())).unwrap();
+    view::write(&ks, root, &HeldView::fetched(empty, None, now_unix())).unwrap();
     let endpoint = w.caller_endpoint().await;
     let asker = Asker {
         endpoint: &endpoint,
-        badge: &w.badge(),
+        root: w.root.node_id(),
         id_token: crate::caller::hello::stored_token(&ks),
     };
     let held = view::refresh(&ks, &asker, false).await.unwrap();
-    let names: Vec<&str> = held.callable().map(|e| e.entry.name.as_str()).collect();
+    let names: Vec<&str> = held.view.entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["orders-db", "status"]);
     endpoint.close().await;
 }

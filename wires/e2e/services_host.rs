@@ -8,20 +8,20 @@
 //! ([`super::call`]), presenting ID tokens minted by [`MockIdp`]s that the
 //! host trusts.
 //!
-//! - [`the_registry_decides_who_runs_what`]: an allowed role runs; a
-//!   disallowed one, and a caller with no token, are refused with the reason
-//!   (and the refusal is in the call log). Every role needs a verified
-//!   identity, even "anyone signed in".
+//! - [`the_policy_decides_who_runs_what`]: an allowed role runs; a
+//!   disallowed one hears the same fixed sentence as a name nobody knows,
+//!   and a caller with no token is not admitted.
+//!   Every role needs a verified identity, even "anyone signed in".
 //! - [`a_trusted_issuer_cannot_vouch_for_another_issuers_people`]: a matcher
 //!   admits only its own issuer's principals.
 //! - [`also_require_only_tightens`]
 //! - [`an_unassigned_service_refuses_to_start`]
-//! - [`a_removed_member_is_refused_on_the_next_call`]: the ban applies with
+//! - [`a_removed_node_is_refused_on_the_next_call`]: the ban applies with
 //!   no restart; a caller holding an older version gets the new head and
 //!   the called service's signed entry back in its `HelloAck`.
-//! - [`push_follows_the_signed_state`]: card 23's push and inbox fetch,
-//!   decided by the signed policy: the bans, and the registry roles in
-//!   `push.allow`.
+//! - [`push_follows_the_signed_policy`]: card 23's push and inbox fetch,
+//!   decided by the signed policy: the bans, and the policy's roles that
+//!   `host.json`'s `push.allow` names.
 //! - [`a_fetch_with_a_token_makes_a_caller_reachable_by_role`]: a logged-in
 //!   node who never called is reachable by role once its `wires inbox`
 //!   fetch presented its token, and a direct push lands in a waiting inbox.
@@ -33,10 +33,9 @@ use iroh::EndpointAddr;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::Router;
 use library::{
-    AuditRecord, Hello, Membership, NodeId, NodeIdentity, OidcNonce, PushBody, RoleName, Service,
-    SignedPolicy, StateVersion, Subject,
+    Hello, NodeId, NodeIdentity, OidcNonce, PushBody, RoleName, Service, SignedPolicy,
+    StateVersion, Subject,
 };
-use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use super::{
@@ -46,10 +45,11 @@ use super::{
 use crate::admin::keystore::Keystore;
 use crate::caller::inbox::{Fetched, InboxReceiver, Mailbox, fetch_from};
 use crate::caller::mock_idp::MockIdp;
+use crate::help;
 use crate::host::config::HostConfig;
 use crate::host::push::{PushHost, PushSpec};
 use crate::host::serve::{services_host, services_router};
-use crate::host::transport::{AuditSink, endpoint_addr};
+use crate::host::transport::endpoint_addr;
 
 /// The network: root 1, host 10, alice 2, bob 3, carol 4.
 ///
@@ -91,7 +91,7 @@ impl World {
     fn state(&self, version: u64, banned: &[NodeId]) -> SignedPolicy {
         signed_state(&self.root, version, |s| {
             for b in banned {
-                s.ban(*b, i64::MAX);
+                s.ban(*b);
             }
             s.roles.insert(
                 role("analyst"),
@@ -115,7 +115,6 @@ impl World {
                 description: String::new(),
                 allow,
                 hosts: vec![self.host.node_id()],
-                readers: vec![],
             };
             s.services
                 .insert(service("orders-db"), on_host(vec![role("analyst")]));
@@ -154,12 +153,8 @@ impl World {
         )
     }
 
-    fn membership(&self, who: &NodeIdentity) -> Membership {
-        super::membership(&self.root, who)
-    }
-
-    /// `who`'s `Hello`: its badge, the policy version it holds, and a
-    /// fresh token from its own IdP when `logged_in`.
+    /// `who`'s `Hello`: the policy version it holds, and a fresh token from
+    /// its own IdP when `logged_in` (else one that doesn't verify).
     fn hello(&self, who: &NodeIdentity, version: u64, logged_in: bool) -> Hello {
         let idp = if who.node_id() == self.alice.node_id() {
             &self.idp_alice
@@ -168,19 +163,18 @@ impl World {
         } else {
             &self.idp_carol
         };
-        super::hello(&self.root, who, version, logged_in.then_some(idp))
+        super::hello(who, version, logged_in.then_some(idp))
     }
 }
 
-/// A running host: its router, where to dial it, its keystore, its call
-/// log's records, and its push service (if any).
+/// A running host: its router, where to dial it, its keystore, and its
+/// push service (if any).
 struct Host {
     _router: Router,
     addr: EndpointAddr,
     /// The host endpoint's address book: where it can dial callers (push).
     book: MemoryLookup,
     keystore: Arc<Keystore>,
-    records: mpsc::Receiver<AuditRecord>,
     push: Option<Arc<PushHost>>,
 }
 
@@ -190,15 +184,13 @@ impl Host {
     async fn start(w: &World, config: HostConfig, state: &SignedPolicy) -> anyhow::Result<Host> {
         let keystore = Arc::new(Keystore::at(crate::testutil::temp_dir()));
         adopt(&keystore, &w.root, state);
-        let mut host = services_host(
+        let host = services_host(
             w.host.node_id(),
-            w.membership(&w.host),
+            w.root.node_id(),
             Arc::clone(&keystore),
             config,
         )?;
         host.preflight(crate::clock::now_unix())?;
-        let (sink, records) = AuditSink::channel(64);
-        host.audit = Some(sink);
         let host = Arc::new(host);
         let push = host
             .config
@@ -214,7 +206,6 @@ impl Host {
             addr,
             book,
             keystore,
-            records,
             push,
         })
     }
@@ -222,14 +213,6 @@ impl Host {
     /// The admin's newer policy reaches this host (as a fetch from a directory would).
     fn adopt(&self, w: &World, state: &SignedPolicy) {
         assert!(adopt(&self.keystore, &w.root, state));
-    }
-
-    /// The next call-log record.
-    async fn record(&mut self) -> AuditRecord {
-        timeout(PATIENCE, self.records.recv())
-            .await
-            .expect("no record in time")
-            .expect("the sink closed")
     }
 }
 
@@ -245,10 +228,10 @@ const SERVICES: &str = r#"{
 }"#;
 
 #[tokio::test]
-async fn the_registry_decides_who_runs_what() {
+async fn the_policy_decides_who_runs_what() {
     let w = World::new().await;
     let state = w.state(1, &[]);
-    let mut host = Host::start(&w, w.host_json(SERVICES, false), &state)
+    let host = Host::start(&w, w.host_json(SERVICES, false), &state)
         .await
         .unwrap();
 
@@ -270,35 +253,22 @@ async fn the_registry_decides_who_runs_what() {
         ack.head.is_none() && ack.entry.is_none(),
         "her view is current"
     );
-    match host.record().await {
-        AuditRecord::Started {
-            principal, role, ..
-        } => {
-            assert_eq!(
-                principal.unwrap().email.as_deref(),
-                Some("alice@example.com")
-            );
-            assert_eq!(role.as_str(), "analyst");
-        }
-        other => panic!("expected started, got {other:?}"),
-    }
-    assert!(matches!(host.record().await, AuditRecord::Finished { .. }));
 
-    // bob verifies, but is in no allowed role: refused, by name, and logged.
+    // bob is admitted (staff), but no role of his may call orders-db: one
+    // fixed sentence, no role named, the same as for a name nobody knows.
     let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "orders-db", &[]).await;
     assert_eq!(
         out.denied(),
-        "bob@example.com is in no role allowed to call orders-db (analyst)"
+        crate::host::gate::not_callable(&service("orders-db"))
     );
-    match host.record().await {
-        AuditRecord::Denied { caller, reason, .. } => {
-            assert_eq!(caller, w.bob.node_id());
-            assert_eq!(reason, out.denied());
-        }
-        other => panic!("expected denied, got {other:?}"),
-    }
+    assert!(!out.denied().contains("analyst"), "{}", out.denied());
+    let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "orders-dc", &[]).await;
+    assert_eq!(
+        out.denied(),
+        crate::host::gate::not_callable(&service("orders-dc"))
+    );
 
-    // alice without a token: told why she has no identity, and what to do.
+    // alice with no sign-in: not admitted at all, and told to sign in.
     let out = call(
         &w.alice,
         &host,
@@ -307,32 +277,22 @@ async fn the_registry_decides_who_runs_what() {
         &[],
     )
     .await;
-    assert!(
-        out.denied().starts_with("no ID token presented; run `wires login`; orders-db needs a verified identity in role analyst"),
-        "{}",
-        out.denied()
-    );
+    assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
+    assert!(help::has_next_step(out.denied()));
 
-    // No role admits a member without a verified identity, not even
-    // "anyone signed in"; with one, the role reaches the service's env.
+    // No sign-in, no call, not even of a service for "anyone signed in";
+    // with one, the role reaches the service's env.
     let out = call(&w.bob, &host, w.hello(&w.bob, 1, false), "status", &[]).await;
-    assert!(
-        out.denied()
-            .starts_with("no ID token presented; run `wires login`"),
-        "{}",
-        out.denied()
-    );
+    assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
     let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "status", &[]).await;
     assert_eq!(out.stdout(), "up as staff");
 
-    // A name the registry doesn't know, and a stranger (another network's
-    // badge).
+    // A name the policy doesn't know; a stranger presenting bob's token
+    // (bound to bob's key, not its own).
     let out = call(&w.alice, &host, w.hello(&w.alice, 1, true), "nope", &[]).await;
-    assert_eq!(out.denied(), "unknown service: nope");
+    assert_eq!(out.denied(), "no service named `nope` that you may call");
     let stranger = NodeIdentity::from_seed([66u8; 32]);
-    let mut hello = w.hello(&stranger, 1, false);
-    hello.membership = super::membership(&NodeIdentity::from_seed([67u8; 32]), &stranger);
-    let out = call(&stranger, &host, hello, "status", &[]).await;
+    let out = call(&stranger, &host, w.hello(&w.bob, 1, true), "status", &[]).await;
     assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
 }
 
@@ -343,23 +303,18 @@ async fn a_trusted_issuer_cannot_vouch_for_another_issuers_people() {
         .await
         .unwrap();
     // The partner IdP verifies alice@example.com, and the host trusts it,
-    // but every role names alice's own IdP (or others): nothing admits her.
+    // but every role names alice's own IdP (or others): no role matches, so
+    // she is not in the network at all.
     let partner_hello = Hello {
-        id_token: Some(w.idp_partner.mint(
+        id_token: w.idp_partner.mint(
             &OidcNonce::for_node(&w.alice.node_id()),
             crate::clock::now_unix() + 3600,
-        )),
+        ),
         ..w.hello(&w.alice, 1, false)
     };
     for svc in ["orders-db", "status"] {
         let out = call(&w.alice, &host, partner_hello.clone(), svc, &[]).await;
-        assert!(
-            out.denied().starts_with(&format!(
-                "alice@example.com is in no role allowed to call {svc}"
-            )),
-            "{}",
-            out.denied()
-        );
+        assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
     }
     // Her own IdP's token is admitted.
     let out = call(
@@ -382,7 +337,7 @@ async fn also_require_only_tightens() {
         .await
         .unwrap();
 
-    // carol is analyst (registry) and sre (host): admitted.
+    // carol is analyst (policy) and sre (host): admitted.
     let out = call(
         &w.carol,
         &host,
@@ -405,9 +360,12 @@ async fn also_require_only_tightens() {
         out.denied(),
         "alice@example.com is not admitted to orders-db by this host's own rules"
     );
-    // bob is in neither: the registry refuses first (the host can't widen).
+    // bob is in neither: the policy refuses first (the host can't widen).
     let out = call(&w.bob, &host, w.hello(&w.bob, 1, true), "orders-db", &[]).await;
-    assert!(out.denied().contains("no role allowed to call orders-db"));
+    assert_eq!(
+        out.denied(),
+        crate::host::gate::not_callable(&service("orders-db"))
+    );
 }
 
 #[tokio::test]
@@ -419,7 +377,7 @@ async fn an_unassigned_service_refuses_to_start() {
     state.services.get_mut(&service("status")).unwrap().hosts = vec![other];
     let state = crate::testutil::signed_policy(&w.root, state);
     let Err(e) = Host::start(&w, w.host_json(SERVICES, false), &state).await else {
-        panic!("a host must not serve a name the registry gives someone else");
+        panic!("a host must not serve a name the policy gives someone else");
     };
     let e = format!("{e:#}");
     assert!(
@@ -431,7 +389,7 @@ async fn an_unassigned_service_refuses_to_start() {
     let home = crate::testutil::temp_dir();
     let host = services_host(
         w.host.node_id(),
-        w.membership(&w.host),
+        w.root.node_id(),
         Arc::new(Keystore::at(home.clone())),
         w.host_json(SERVICES, false),
     )
@@ -444,7 +402,7 @@ async fn an_unassigned_service_refuses_to_start() {
 }
 
 #[tokio::test]
-async fn a_removed_member_is_refused_on_the_next_call() {
+async fn a_removed_node_is_refused_on_the_next_call() {
     let w = World::new().await;
     let host = Host::start(&w, w.host_json(SERVICES, false), &w.state(1, &[]))
         .await
@@ -459,8 +417,8 @@ async fn a_removed_member_is_refused_on_the_next_call() {
     .await;
     assert_eq!(out.stdout(), "rows: 1\n");
 
-    // `wires remove alice`: version 2, banning her, reaches the host; no
-    // restart. Her badge is still genuine and unexpired.
+    // `wires remove <alice's node>`: version 2, banning it, reaches the
+    // host; no restart. Her token is still genuine and unexpired.
     let v2 = w.state(2, &[w.alice.node_id()]);
     host.adopt(&w, &v2);
     // She still presents version 1 (and a valid token): the host's copy decides.
@@ -496,8 +454,75 @@ async fn a_removed_member_is_refused_on_the_next_call() {
     assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
 }
 
+/// `wires remove alice@example.com`: a person ban refuses her on every
+/// machine she signs in from, leaves everyone else alone, and `wires
+/// restore` lets her back.
 #[tokio::test]
-async fn push_follows_the_signed_state() {
+async fn a_removed_person_is_refused_from_any_machine_until_restored() {
+    let w = World::new().await;
+    let host = Host::start(&w, w.host_json(SERVICES, false), &w.state(1, &[]))
+        .await
+        .unwrap();
+    let laptop = &w.alice;
+    let desktop = NodeIdentity::from_seed([5u8; 32]);
+    let alice_on =
+        |node: &NodeIdentity, version: u64| super::hello(node, version, Some(&w.idp_alice));
+    let ran = call(laptop, &host, alice_on(laptop, 1), "orders-db", &["1"]).await;
+    assert_eq!(ran.stdout(), "rows: 1\n");
+    let ran = call(&desktop, &host, alice_on(&desktop, 1), "orders-db", &["2"]).await;
+    assert_eq!(ran.stdout(), "rows: 2\n");
+
+    let mut v2 = w.state(2, &[]).to_policy().unwrap();
+    v2.ban_person(library::Person::new(
+        library::Issuer::new(w.idp_alice.issuer.as_str()),
+        "alice@example.com",
+    ));
+    let v2 = crate::testutil::signed_policy(&w.root, v2);
+    host.adopt(&w, &v2);
+    for node in [laptop, &desktop] {
+        let out = call(node, &host, alice_on(node, 2), "orders-db", &[]).await;
+        assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
+    }
+    // carol, an analyst too, is unaffected.
+    let out = call(
+        &w.carol,
+        &host,
+        w.hello(&w.carol, 2, true),
+        "orders-db",
+        &["3"],
+    )
+    .await;
+    assert_eq!(out.stdout(), "rows: 3\n");
+
+    // Restored: version 3 holds no ban.
+    host.adopt(&w, &w.state(3, &[]));
+    let out = call(&desktop, &host, alice_on(&desktop, 3), "orders-db", &["4"]).await;
+    assert_eq!(out.stdout(), "rows: 4\n");
+}
+
+/// The web gateway's call, as the host sees it: a node with no credential
+/// of its own (nothing the admin minted, no sign-in of its own) presents a
+/// web user's ID token, nonce-bound to the gateway's key, and is admitted as
+/// that user; the same token from any other node is refused.
+#[tokio::test]
+async fn a_gateway_with_no_credential_of_its_own_calls_as_its_user() {
+    let w = World::new().await;
+    let host = Host::start(&w, w.host_json(SERVICES, false), &w.state(1, &[]))
+        .await
+        .unwrap();
+    let gateway = NodeIdentity::from_seed([90u8; 32]);
+    // Alice signed in at the gateway: her token's nonce is the gateway's.
+    let for_gateway = super::hello(&gateway, 1, Some(&w.idp_alice));
+    let out = call(&gateway, &host, for_gateway.clone(), "orders-db", &["9"]).await;
+    assert_eq!(out.stdout(), "rows: 9\n");
+    // Lifted off the gateway, it admits no one.
+    let thief = NodeIdentity::from_seed([91u8; 32]);
+    let out = call(&thief, &host, for_gateway, "orders-db", &[]).await;
+    assert_eq!(out.denied(), crate::host::gate::NOT_ADMITTED);
+}
+
+#[tokio::test]
+async fn push_follows_the_signed_policy() {
     let w = World::new().await;
     let host = Host::start(&w, w.host_json(SERVICES, true), &w.state(1, &[]))
         .await
@@ -527,20 +552,26 @@ async fn push_follows_the_signed_state() {
     let report = push.send(spec(&w.bob)).await.unwrap();
     assert!(!report.any_accepted(), "{}", report.render());
 
+    let token = |who: &NodeIdentity| Some(w.hello(who, 1, true).id_token);
+    // A fetch with no token is not admitted, whoever it is.
+    let Fetched::Refused(why) = fetch(&w, &w.alice, &host, None).await else {
+        panic!("a fetch without a sign-in");
+    };
+    assert!(why.contains(crate::host::gate::NOT_ADMITTED), "{why}");
     assert!(matches!(
-        fetch(&w, &w.alice, &host, None).await,
+        fetch(&w, &w.alice, &host, token(&w.alice)).await,
         Fetched::Messages(1)
     ));
-    let Fetched::Refused(why) = fetch(&w, &w.bob, &host, None).await else {
+    let Fetched::Refused(why) = fetch(&w, &w.bob, &host, token(&w.bob)).await else {
         panic!("bob may not fetch");
     };
-    assert!(why.contains("no role allowed to receive pushes"), "{why}");
+    assert_eq!(why, crate::host::gate::INBOX_REFUSED);
 
     // Banned by the policy: her queue is dropped and her fetch refused.
     push.send(spec(&w.alice)).await.unwrap();
     host.adopt(&w, &w.state(2, &[w.alice.node_id()]));
-    let Fetched::Refused(why) = fetch(&w, &w.alice, &host, None).await else {
-        panic!("a removed member may not fetch");
+    let Fetched::Refused(why) = fetch(&w, &w.alice, &host, token(&w.alice)).await else {
+        panic!("a removed node may not fetch");
     };
     assert!(why.contains(crate::host::gate::NOT_ADMITTED), "{why}");
 }
@@ -554,10 +585,8 @@ async fn fetch(
 ) -> Fetched {
     let endpoint = bind(who).await;
     let mailbox = Mailbox::open(&crate::testutil::temp_dir()).unwrap();
-    let hello = library::InboxFrame::Hello {
-        membership: w.membership(who),
-        id_token,
-    };
+    let _ = w;
+    let hello = library::InboxFrame::Hello { id_token };
     let fetched = timeout(
         PATIENCE,
         fetch_from(
@@ -601,7 +630,7 @@ async fn a_fetch_with_a_token_makes_a_caller_reachable_by_role() {
     assert!(push.send(to_staff).await.is_err());
 
     // Her `wires inbox` presents her token: now the host knows who she is.
-    let token = w.hello(&w.carol, 1, true).id_token;
+    let token = Some(w.hello(&w.carol, 1, true).id_token);
     assert!(matches!(
         fetch(&w, &w.carol, &host, token).await,
         Fetched::Messages(0)

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Demo: run a CLI on another machine from your agent -- by SERVICE name, the
-# machine reached by key, the caller verified by an IdP, every call in the
-# host's own signed log that the people the admin names may read.
+# machine reached by key, the caller verified by an IdP, every call decided
+# by the host from the admin-signed policy.
 #
 # Six keystores on one machine, all loopback:
 #
@@ -13,21 +13,30 @@
 #                Two hosts implement it: a caller never names either. Both
 #                are also the network's directories (`wires directory add`):
 #                `serve` runs the directory too, which holds the signed
-#                policy the admin publishes; each host follows the other's
-#                (a subscription: every edit arrives within a second), and
-#                callers fetch from them. Two, because step 8 stops the
-#                workbench and step 9's `wires remove` must still reach a
-#                directory.
+#                policy the admin publishes; each directory follows the
+#                other (a replica subscription: an edit either one takes
+#                reaches the other within a second), and callers fetch their
+#                views from them. Both start empty, holding no
+#                policy, and take the admin's first `wires policy push`.
+#                Two, because step 7 stops the workbench and step 8's
+#                `wires remove` must still reach a directory.
 #   agent     -- alice@example.com (roles analyst, oncall): `wires login`, `wires
 #                services`, `wires call orders-db …`, `wires mcp`, `wires inbox`.
 #   bob       -- bob@example.com (role analyst, not oncall): the policy lets
 #                him call orders-db, and the hosts' own rule refuses him.
-#   observer  -- sec@audit.example (role security): allowed to call nothing,
-#                allowed to READ orders-db's call records (`wires watch`).
+#   observer  -- carol@partner.example: signs in at the IdP, but no role
+#                matches her, so she is not in the network: told so at
+#                sign-in, by `wires services` and by `wires call`.
 #   root      -- the admin: `wires init`, `role set`, `directory add`,
-#                `service add`, one `wires invite` per machine, and later
-#                `wires remove agent`. Every change is one signed policy,
+#                `service add`, `wires network` (one string, for every
+#                machine), `wires policy push`, and later `wires remove
+#                alice@example.com`. Every change is one signed policy,
 #                published to the directories by key.
+#
+# The setup is card 41's first run: init, role set, directory add
+# label=<id>, service add, network; the hosts `join <network>` and `serve`;
+# the admin `policy push`es once; each caller's whole onboarding is `wires
+# login <network>`. No step fails and none is repeated.
 #
 # The IdP is a hermetic loopback OIDC issuer (`wires dev-mock-idp`, compiled
 # only with `--features dev-mock-idp` -- never the shipped binary). `wires login
@@ -37,20 +46,19 @@
 # host's `serve` writes its own line to run/hint and the script copies those
 # into the other keystores' local, unsigned `hints` file.
 #
-# Asserted: before login the agent's view is empty, so it lists no service
-# and its call finds no host (exit 1, "not signed in"); after a bare `wires
-# login` (the invite named the IdP) `wires services` lists orders-db (analyst);
-# the signed-in non-analyst (who may only read orders-db) sees nothing to call,
-# and naming it anyway stops on its own machine (exit 1, no host dialed); an
-# analyst the hosts' `also_require` leaves out is refused by the host (exit 77,
-# 0 bytes out); the agent's SQL runs (args, stdin, MCP); `.shell id` is refused
-# by sqlite3 -safe; the security reader's `wires watch` shows every call and
-# the host's refusal with the verified email (and nothing from the reader's own
-# stopped call), while the agent's own watch shows only its own calls;
-# the workbench pushes to the agent by key and `wires inbox` fetches it
+# Asserted: before it signs in the agent is in no network, so it lists
+# nothing and dials nothing (exit 1, "run `wires login <network>`"); after
+# `wires login <network>` `wires services` lists orders-db (analyst); a
+# person the IdP signs in but no role matches is told at sign-in that she is
+# not in the network, and `wires services` and `wires call` both exit 1 on
+# her own machine with that sentence (no host dialed); an analyst the hosts'
+# `also_require` leaves out is refused by the host (exit 77, 0 bytes out); the
+# agent's SQL runs (args, stdin, MCP); `.shell id` is refused by sqlite3
+# -safe; the workbench pushes to the agent by key and `wires inbox` fetches it
 # (--wait wakes on the next); with the workbench stopped the same call is
-# answered by the spare; after `wires remove agent` its next call exits 77
-# with zero stdout bytes, and pushes to it are refused at send and at fetch.
+# answered by the spare; after `wires remove alice@example.com` her next
+# call exits 77 with zero stdout bytes, and pushes to her are refused at send
+# and at fetch.
 #
 # Builds with Cargo (release) on first use; WIRES_BIN / WIRES_DEV_BIN override.
 #
@@ -92,7 +100,7 @@ cd "$repo"
 WIRES="${WIRES_BIN:-$repo/target/release/wires}"
 WIRES_DEV="${WIRES_DEV_BIN:-$repo/target/release/wires-mock-idp}"
 EMAIL="alice@example.com"
-READER="sec@audit.example"
+OUTSIDER="carol@partner.example"
 BOB="bob@example.com"
 EXIT_DENIED=77
 START=$SECONDS
@@ -106,16 +114,6 @@ MCP_PID=""
 p=""
 trap 'exec 3>&- 2>/dev/null || true; for p in $MCP_PID $SP_PID $WB_PID $IDP_PID; do kill "$p" 2>/dev/null || true; done; [ -n "$KEEP" ] || rm -rf "$D"' EXIT INT TERM
 
-# The one line of $1 holding every remaining fixed string (or fail).
-the_line() {
-	local file="$1" hits
-	shift
-	hits="$(cat "$file")"
-	for s in "$@"; do hits="$(printf '%s\n' "$hits" | grep -F -- "$s" || true)"; done
-	[ -n "$hits" ] && printf '%s\n' "$hits" | tail -1
-}
-# The call id on a ▶/■ record line (`HH:MM:SS <service> ▶ <id> …`).
-call_id() { printf '%s\n' "$1" | awk '{print $4}'; }
 # Each host's own hint line, into every other keystore's local hints file.
 share_hints() {
 	for h in "$root" "$agent" "$obs" "$bob"; do
@@ -149,35 +147,29 @@ bob="$D/bob"
 mkdir -p "$root" "$wb" "$sp" "$agent" "$obs" "$bob"
 
 # The IdP comes first: the network's first policy trusts it, and every role
-# names the issuer it trusts.
+# names the issuer it trusts. (Google is the default; the stand-in replaces
+# it here, so `init` names it.)
 start_mock_idp "$EMAIL"
-# The admin starts the network (its own node holds a badge too); every other
-# machine makes its key and hands the admin its id. One invite token back
-# each: a badge, which is what admits the node.
-ROOT_ID="$(WIRES_HOME="$root" "$WIRES" init --issuer "$ISSUER" --client-id "$CLIENT_ID" --public-client-secret not-so-secret |
+admin() { WIRES_HOME="$root" "$WIRES" "$@"; }
+ROOT_ID="$(admin init --issuer "$ISSUER" --client-id "$CLIENT_ID" --public-client-secret not-so-secret |
 	awk '/^network /{print $2}')"
+# The hosts print their ids (`wires id`), for the admin to name them by.
 WB_ID="$(WIRES_HOME="$wb" "$WIRES" id 2>/dev/null)"
 SP_ID="$(WIRES_HOME="$sp" "$WIRES" id 2>/dev/null)"
-AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
-OB_ID="$(WIRES_HOME="$obs" "$WIRES" id 2>/dev/null)"
-BOB_ID="$(WIRES_HOME="$bob" "$WIRES" id 2>/dev/null)"
-[ -n "$ROOT_ID" ] && [ -n "$WB_ID" ] && [ -n "$SP_ID" ] && [ -n "$AG_ID" ] && [ -n "$OB_ID" ] && [ -n "$BOB_ID" ] ||
-	bad "setup: could not read the key ids"
-AG8="${AG_ID:0:8}"
-admin() { WIRES_HOME="$root" "$WIRES" "$@"; }
-# Roles are who, by IdP identity. Then the hosts are invited and named the
-# network's directories; none is running yet, so each edit notes that and
-# succeeds -- their tokens carry the policy.
-admin role set analyst --issuer "$ISSUER" '*@example.com' >/dev/null 2>&1
-admin role set security --issuer "$ISSUER" "$READER" >/dev/null 2>&1
+[ -n "$ROOT_ID" ] && [ -n "$WB_ID" ] && [ -n "$SP_ID" ] || bad "setup: could not read the key ids"
+# Roles are who, by IdP identity (the matchers trust the issuer `init`
+# named). Then the hosts are named the network's directories, by key, once;
+# none is running yet, so each edit notes that and succeeds.
+admin role set analyst '*@example.com' >/dev/null 2>"$D/role.err" || {
+	cat "$D/role.err" >&2
+	bad "setup: wires role set failed"
+}
 # The role the hosts' host.json also requires (a stricter local rule).
-admin role set oncall --issuer "$ISSUER" "$EMAIL" >/dev/null 2>&1
-admin invite "$WB_ID" --name workbench >/dev/null 2>&1
-admin invite "$SP_ID" --name spare >/dev/null 2>&1
-for h in workbench spare; do
-	admin directory add "$h" >/dev/null 2>"$D/dir.err" || {
+admin role set oncall "$EMAIL" >/dev/null 2>&1
+for named in "workbench=$WB_ID" "spare=$SP_ID"; do
+	admin directory add "$named" >/dev/null 2>"$D/dir.err" || {
 		cat "$D/dir.err" >&2
-		bad "setup: wires directory add $h failed"
+		bad "setup: wires directory add ${named%%=*} failed"
 	}
 done
 
@@ -187,37 +179,47 @@ ORDERS="$(sqlite3 "$DB" 'select count(*) from orders')"
 
 say "six keystores on this machine stand in for six machines:"
 say "  workbench  ${WB_ID:0:8}...  and spare ${SP_ID:0:8}...: both implement orders-db"
-say "  agent      ${AG8}...  your agent's machine ($EMAIL)"
-say "  observer   ${OB_ID:0:8}...  $READER: may read the records, may call nothing"
-say "  bob        ${BOB_ID:0:8}...  $BOB: an analyst, but not on call"
-say "  root       the human who admits nodes and signs what runs where"
-say "and a stand-in IdP at $ISSUER (card 08 swaps in Google)."
+say "  agent      your agent's machine ($EMAIL)"
+say "  observer   $OUTSIDER: the IdP knows her; no role in the network names her"
+say "  bob        $BOB: an analyst, but not on call"
+say "  root       the human who signs who may call what, and where it runs"
+say "and a stand-in IdP at $ISSUER (on a real network: Google)."
 beat 5
 
 # ==========================================================================
-step "1  the admin registers ONE service, and who may call and read it"
+step "1  the admin registers ONE service, and who may call it"
 # ==========================================================================
-run "wires service add orders-db --description … --allow analyst --reader security --host workbench --host spare"
+run "wires service add orders-db --description … --allow analyst --host workbench --host spare"
 # The directories aren't up yet and none has taken a publish, so the edit
-# notes that and succeeds (the new policy is stored; a fresh token carries it
-# to them below).
+# notes that and succeeds (the new policy is stored; `policy push` delivers
+# it once they run).
 admin service add orders-db \
 	--description "Read-only SQL (sqlite3) over the orders database; pass the SQL statement as the argument." \
-	--allow analyst --reader security --host workbench --host spare >"$D/svc.out" 2>"$D/svc.err" || {
+	--allow analyst --host workbench --host spare >"$D/svc.out" 2>"$D/svc.err" || {
 	cat "$D/svc.err" >&2
 	bad "1: wires service add failed"
 }
-grep -qF "no directory is running yet" "$D/svc.err" || {
+grep -qF "no directory has taken a publish yet" "$D/svc.err" || {
 	cat "$D/svc.err" >&2
-	bad "1: wires service add did not say no directory is running yet"
+	bad "1: wires service add did not say no directory has taken a publish yet"
 }
 show "$D/svc.out"
-# A fresh token catches the hosts up (re-join never rolls a policy back).
-for pair in "$wb:$WB_ID:workbench" "$sp:$SP_ID:spare"; do
-	h="${pair%%:*}"
-	rest="${pair#*:}"
-	tok="$(admin invite "${rest%%:*}" --name "${rest#*:}" 2>/dev/null)" || true
-	WIRES_HOME="$h" "$WIRES" join "$tok" >/dev/null
+run "wires network   # one string for every machine: the root key, the directories, the IdP"
+NETWORK="$(admin network 2>"$D/network.err")" || {
+	cat "$D/network.err" >&2
+	bad "1: wires network failed"
+}
+[ ! -s "$D/network.err" ] || {
+	cat "$D/network.err" >&2
+	bad "1: wires network warned"
+}
+line "${NETWORK:0:60}..."
+run "wires join <network>   # on the workbench, and on the spare"
+for h in "$wb" "$sp"; do
+	WIRES_HOME="$h" "$WIRES" join "$NETWORK" >/dev/null 2>"$D/join.err" || {
+		cat "$D/join.err" >&2
+		bad "1: wires join failed"
+	}
 done
 HOST_JSON="$D/host.json"
 sed -e "s|__ISSUER__|$ISSUER|" -e "s|__CLIENT_ID__|$CLIENT_ID|" \
@@ -229,47 +231,50 @@ run "wires serve --check host.json   # how this host implements it; who may call
 }
 grep -qF "orders-db" "$D/check.out" || bad "1: serve --check does not list orders-db"
 show "$D/check.out"
-run "wires serve host.json   # on the workbench, and on the spare (each also a directory)"
+run "wires serve host.json   # on the workbench, and on the spare: each also a directory, empty"
 start_host "$wb" workbench
 WB_PID=$LAST_PID
 start_host "$sp" spare
 SP_PID=$LAST_PID
 share_hints
+wait_for "$D/workbench.err" "waiting for the admin's first publish" 100 || {
+	dump "$D/workbench.err"
+	bad "1: the workbench did not say it waits for the first publish"
+}
+run "wires policy push   # on the admin: the network's one bootstrap step"
+admin policy push >"$D/push0.out" 2>"$D/push0.err" || {
+	cat "$D/push0.err" >&2
+	bad "1: wires policy push failed"
+}
+grep -qF "published to 2 of 2 directory(ies)" "$D/push0.err" || {
+	cat "$D/push0.err" >&2
+	bad "1: the first publish did not reach both directories"
+}
+for h in workbench spare; do
+	wait_for "$D/$h.err" "signed policy assigns every service to this host" 100 || {
+		dump "$D/$h.err"
+		bad "1: the $h never started serving"
+	}
+done
 ok "1: workbench (pid $WB_PID) and spare (pid $SP_PID) serve orders-db, reached by key"
-# The agent and the observer are invited now. An invite mints a badge and
-# edits nothing: the policy's version doesn't move, and nothing is published.
-AG_TOKEN="$(admin invite "$AG_ID" --name agent 2>"$D/invite.err")" || {
-	cat "$D/invite.err" >&2
-	bad "setup: inviting the agent failed"
-}
-OB_TOKEN="$(admin invite "$OB_ID" --name observer 2>>"$D/invite.err")" || {
-	cat "$D/invite.err" >&2
-	bad "setup: inviting the observer failed"
-}
-BOB_TOKEN="$(admin invite "$BOB_ID" --name bob 2>>"$D/invite.err")" || {
-	cat "$D/invite.err" >&2
-	bad "setup: inviting bob failed"
-}
-if [ "$(grep -cF "unchanged" "$D/invite.err")" -ne 3 ] || grep -qF "published to" "$D/invite.err"; then
-	cat "$D/invite.err" >&2
-	bad "setup: an invite edited the policy or published it"
-fi
-WIRES_HOME="$agent" "$WIRES" join "$AG_TOKEN" >/dev/null
-WIRES_HOME="$obs" "$WIRES" join "$OB_TOKEN" >/dev/null
-WIRES_HOME="$bob" "$WIRES" join "$BOB_TOKEN" >/dev/null
 beat 2
 
 # ==========================================================================
-step "2  the agent, before signing in: no service in its view, and no host to call"
+step "2  the agent, before it signs in: in no network, so nothing to call"
 # ==========================================================================
 run "wires services"
-WIRES_HOME="$agent" "$WIRES" services >"$D/s0.out" 2>"$D/s0.err" || {
-	cat "$D/s0.err" >&2
-	bad "2: wires services failed"
+set +e
+WIRES_HOME="$agent" "$WIRES" services >"$D/s0.out" 2>"$D/s0.err"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] && [ ! -s "$D/s0.out" ] || {
+	cat "$D/s0.out" "$D/s0.err" >&2
+	bad "2: wires services before signing in exited $rc, expected 1 and nothing listed"
 }
-[ ! -s "$D/s0.out" ] || {
-	cat "$D/s0.out" >&2
-	bad "2: the agent lists a service before it signed in"
+# shellcheck disable=SC2016 # literal backticks in the message
+grep -qF 'wires login <network>' "$D/s0.err" || {
+	dump "$D/s0.err"
+	bad "2: it did not say to run wires login <network>"
 }
 show "$D/s0.err"
 run "wires call orders-db -- 'select count(*) from orders'"
@@ -277,26 +282,22 @@ set +e
 WIRES_HOME="$agent" "$WIRES" call orders-db -- "select count(*) from orders" >"$D/c0.out" 2>"$D/c0.err"
 rc=$?
 set -e
-# Card 37: the view is empty without a verified identity, so the agent
-# holds no host to dial; the directory it asks (`resolve`) says the same.
 [ "$rc" -eq 1 ] || {
 	dump "$D/c0.err"
-	bad "2: an unverified call exited $rc, expected 1 (nothing to dial)"
-}
-grep -qF "not signed in" "$D/c0.err" || {
-	dump "$D/c0.err"
-	bad "2: stopped, but not for the missing identity"
+	bad "2: a call before signing in exited $rc, expected 1 (nothing to dial)"
 }
 [ ! -s "$D/c0.out" ] || bad "2: the stopped call wrote to stdout"
 show "$D/c0.err"
-ok "2: exit 1 -- no verified identity, no service in its view, nothing dialed"
+ok "2: exit 1 -- no sign-in, nothing dialed"
 beat 3
 
 # ==========================================================================
-step "3  the agent signs in with its IdP -- the token is bound to its node key"
+step "3  the agent signs in with its IdP -- joining is signing in"
 # ==========================================================================
-run "wires login --no-browser   # the invite named the IdP and its client"
-login_as "$agent" "$EMAIL"
+run "wires login --no-browser <network>   # the string names the IdP and its client"
+login_as "$agent" "$EMAIL" "$NETWORK"
+AG_ID="$(WIRES_HOME="$agent" "$WIRES" id 2>/dev/null)"
+AG8="${AG_ID:0:8}"
 run "wires services"
 WIRES_HOME="$agent" "$WIRES" services >"$D/s1.out" 2>"$D/s1.err" || {
 	cat "$D/s1.err" >&2
@@ -311,46 +312,56 @@ ok "3: its view, cut by the directory for its token: orders-db, because analyst 
 beat 3
 
 # ==========================================================================
-step "3b a signed-in NON-analyst sees nothing to call -- naming it anyway stops on its machine"
+step "3b signed in at the IdP, but NO ROLE names her -- she is not in the network"
 # ==========================================================================
-run "wires login …   # on the observer, as $READER"
-login_as "$obs" "$READER"
+run "wires login <network>   # on the observer, as $OUTSIDER"
+login_as "$obs" "$OUTSIDER" "$NETWORK"
+NOT_IN="no role in this network matches $OUTSIDER, or you were removed: ask your admin"
+grep -qF "$NOT_IN" "$D/login.err" || {
+	dump "$D/login.err"
+	bad "3b: wires login did not say the network doesn't admit $OUTSIDER"
+}
+grep -F "$NOT_IN" "$D/login.err" | head -1 >"$D/login3b.err"
+show "$D/login3b.err"
 run "wires services"
-WIRES_HOME="$obs" "$WIRES" services >"$D/s2.out" 2>"$D/s2.err" || {
-	cat "$D/s2.err" >&2
-	bad "3b: wires services failed"
+set +e
+WIRES_HOME="$obs" "$WIRES" services >"$D/s2.out" 2>"$D/s2.err"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] && [ ! -s "$D/s2.out" ] || {
+	cat "$D/s2.out" "$D/s2.err" >&2
+	bad "3b: wires services for $OUTSIDER exited $rc, expected 1 and nothing listed"
 }
-[ ! -s "$D/s2.out" ] || {
-	cat "$D/s2.out" >&2
-	bad "3b: $READER can see a service"
+grep -qF "$NOT_IN" "$D/s2.err" || {
+	dump "$D/s2.err"
+	bad "3b: wires services did not say what $OUTSIDER can act on"
 }
+show "$D/s2.err"
 run "wires call orders-db -- 'select 1'"
 set +e
 WIRES_HOME="$obs" "$WIRES" call orders-db -- "select 1" >"$D/c9.out" 2>"$D/c9.err"
 rc=$?
 set -e
-# Its view marks orders-db read-only (role security reads it), so the call
-# stops here, as for a name not in the view: exit 1, no host dialed. Step 6a
-# checks that no host logged it.
+# The directory admits her to nothing (the same bytes a stranger hears), so
+# she holds no view: the call stops here, exit 1, no host dialed.
 [ "$rc" -eq 1 ] || {
 	dump "$D/c9.err"
-	bad "3b: $READER's call exited $rc, expected 1 (nothing to dial)"
+	bad "3b: $OUTSIDER's call exited $rc, expected 1 (nothing to dial)"
 }
-# shellcheck disable=SC2016 # literal backticks in the message
-grep -qF 'no service named `orders-db` that you may call' "$D/c9.err" || {
+grep -qF "$NOT_IN" "$D/c9.err" || {
 	cat "$D/c9.err" >&2
-	bad "3b: stopped, but not because orders-db is not one to call"
+	bad "3b: stopped, but not because the network doesn't admit $OUTSIDER"
 }
 [ ! -s "$D/c9.out" ] || bad "3b: the stopped call wrote to stdout"
 show "$D/c9.err"
-ok "3b: $READER may read orders-db, not call it: exit 1 on its own machine, nothing dialed"
+ok "3b: $OUTSIDER is not in the network: told at sign-in, exit 1 on her own machine, nothing dialed"
 beat 3
 
 # ==========================================================================
 step "3c an analyst the hosts' own rule leaves out -- the HOST refuses"
 # ==========================================================================
-run "wires login …   # on bob's machine, as $BOB: analyst, not oncall"
-login_as "$bob" "$BOB"
+run "wires login <network>   # on bob's machine, as $BOB: analyst, not oncall"
+login_as "$bob" "$BOB" "$NETWORK"
 run "wires call orders-db -- 'select 1'   # the policy admits analysts; host.json also requires oncall"
 set +e
 WIRES_HOME="$bob" "$WIRES" call orders-db -- "select 1" >"$D/c8.out" 2>"$D/c8.err"
@@ -474,65 +485,7 @@ ok "5: exit $rc from sqlite3 itself"
 beat 3
 
 # ==========================================================================
-step "6  the reader watches -- every call, from the hosts' own signed logs"
-# ==========================================================================
-run "wires watch orders-db --once   # on the observer: role security reads orders-db"
-WIRES_HOME="$obs" "$WIRES" watch orders-db --once >"$D/w1.out" 2>"$D/w1.err" || {
-	cat "$D/w1.err" >&2
-	bad "6: the reader's wires watch failed"
-}
-S1="$(the_line "$D/w1.out" "orders-db ▶" "$EMAIL" "[analyst] orders-db \"select count(*) from orders\"")" || {
-	cat "$D/w1.out" "$D/w1.err" >&2
-	bad "6: no ▶ naming $EMAIL and the args SQL"
-}
-F1="$(the_line "$D/w1.out" "■ $(call_id "$S1") exit 0 ")" || {
-	cat "$D/w1.out" >&2
-	bad "6: no ■ exit 0 for the args call"
-}
-F2="$(the_line "$D/w1.out" "■" "exit 0" "stdin \"select customer, sum(total) from orders")" || {
-	cat "$D/w1.out" >&2
-	bad "6: the stdin call's SQL is not in the records"
-}
-the_line "$D/w1.out" "▶" "$EMAIL" "orders-db \"$SQL3\"" >/dev/null || {
-	cat "$D/w1.out" >&2
-	bad "6: no ▶ for the MCP call"
-}
-F4="$(the_line "$D/w1.out" "■" "exit $SHELL_RC")" || {
-	cat "$D/w1.out" >&2
-	bad "6: no ■ exit $SHELL_RC for .shell id"
-}
-D9="$(the_line "$D/w1.out" "✗ ${BOB_ID:0:4}…" "$BOB is not admitted to orders-db by this host's own rules")" || {
-	cat "$D/w1.out" >&2
-	bad "6: the host's refusal of $BOB is not in the records"
-}
-grep -qF "${OB_ID:0:4}…" "$D/w1.out" && {
-	cat "$D/w1.out" >&2
-	bad "6: a host logged $READER's call, which should have stopped on its machine"
-}
-line "$S1"
-line "$F1"
-line "$F2"
-line "$F4"
-line "$D9"
-ok "6a: the reader sees who ran what -- and every refusal -- holding neither end's keys"
-run "wires watch --once   # on the agent: not a reader, so only its own calls"
-WIRES_HOME="$agent" "$WIRES" watch --once >"$D/w2.out" 2>"$D/w2.err" || {
-	cat "$D/w2.err" >&2
-	bad "6: the agent's wires watch failed"
-}
-the_line "$D/w2.out" "▶" "$EMAIL" >/dev/null || {
-	cat "$D/w2.out" "$D/w2.err" >&2
-	bad "6: the agent does not see its own calls"
-}
-grep -qF "${BOB_ID:0:4}…" "$D/w2.out" && {
-	cat "$D/w2.out" >&2
-	bad "6: the agent sees $BOB's refused call"
-}
-ok "6b: the agent sees its own $(grep -cF '▶' "$D/w2.out") calls and nobody else's"
-beat 3
-
-# ==========================================================================
-step "7  the workbench pushes to the agent -- by key; the agent exposes nothing"
+step "6  the workbench pushes to the agent -- by key; the agent publishes no URL"
 # ==========================================================================
 run "wires inbox --wait --timeout 1s   # nothing yet"
 set +e
@@ -541,62 +494,49 @@ rc=$?
 set -e
 [ "$rc" -eq 124 ] || {
 	cat "$D/i0.err" >&2
-	bad "7: an empty inbox --wait --timeout exited $rc, expected 124"
+	bad "6: an empty inbox --wait --timeout exited $rc, expected 124"
 }
-[ ! -s "$D/i0.out" ] || bad "7: an empty inbox printed something"
+[ ! -s "$D/i0.out" ] || bad "6: an empty inbox printed something"
 run "wires push --to $AG8… --subject build-41 -- 'failed: test_orders_total'   # on the workbench"
 WIRES_HOME="$wb" "$WIRES" push --to "$AG_ID" --subject build-41 -- "failed: test_orders_total" \
 	>"$D/p1.out" 2>"$D/p1.err" || {
 	cat "$D/p1.out" "$D/p1.err" >&2
-	bad "7: wires push failed"
+	bad "6: wires push failed"
 }
 grep -qE "^(queued|delivered) +$EMAIL \($AG8\)" "$D/p1.out" || {
 	cat "$D/p1.out" >&2
-	bad "7: the push did not reach $EMAIL"
+	bad "6: the push did not reach $EMAIL"
 }
 show "$D/p1.out"
 run "wires inbox"
 WIRES_HOME="$agent" "$WIRES" inbox >"$D/i1.out" 2>"$D/i1.err" || {
 	cat "$D/i1.err" >&2
-	bad "7: wires inbox failed"
+	bad "6: wires inbox failed"
 }
 grep -qF "from host ${WB_ID:0:8} (verified)  build-41  failed: test_orders_total" "$D/i1.out" || {
 	cat "$D/i1.out" "$D/i1.err" >&2
-	bad "7: the inbox line does not name the verified host and the message"
+	bad "6: the inbox line does not name the verified host and the message"
 }
 show "$D/i1.out"
 WIRES_HOME="$agent" "$WIRES" inbox >"$D/i2.out" 2>/dev/null
-[ ! -s "$D/i2.out" ] || bad "7: a read message was printed twice"
+[ ! -s "$D/i2.out" ] || bad "6: a read message was printed twice"
 run "wires inbox --wait --timeout 20s &   then, on the workbench: wires push … build-42"
 WIRES_HOME="$agent" "$WIRES" inbox --wait --timeout 20s >"$D/i3.out" 2>"$D/i3.err" &
 WAIT_PID=$!
 sleep 1
 WIRES_HOME="$wb" "$WIRES" push --to "$AG_ID" --subject build-42 -- "passed" >/dev/null 2>"$D/p2.err" ||
-	bad "7: the second push failed"
+	bad "6: the second push failed"
 wait "$WAIT_PID" || {
 	cat "$D/i3.err" >&2
-	bad "7: inbox --wait did not exit 0 on the push"
+	bad "6: inbox --wait did not exit 0 on the push"
 }
-grep -qF "build-42  passed" "$D/i3.out" || bad "7: inbox --wait did not print build-42"
-# The operator's push belongs to no service: its record goes to its recipient
-# only, not to the service's readers.
-WIRES_HOME="$agent" "$WIRES" watch --once >"$D/w3.out" 2>/dev/null || true
-PQ="$(the_line "$D/w3.out" "⇢" "→ $EMAIL" "\"build-41\"")" || {
-	cat "$D/w3.out" >&2
-	bad "7: the push is not in the agent's own records"
-}
-WIRES_HOME="$obs" "$WIRES" watch orders-db --once >"$D/w4.out" 2>/dev/null || true
-grep -qF "build-41" "$D/w4.out" && {
-	cat "$D/w4.out" >&2
-	bad "7: the reader of orders-db sees the operator's push to the agent"
-}
-ok "7: pushed by key, fetched with no open port; --wait woke on the next one"
+grep -qF "build-42  passed" "$D/i3.out" || bad "6: inbox --wait did not print build-42"
+ok "6: pushed by key, fetched with no open port; --wait woke on the next one"
 line "$(cat "$D/i1.out")"
-line "$PQ"
 beat 3
 
 # ==========================================================================
-step "8  the workbench goes down -- the same call is answered by the spare"
+step "7  the workbench goes down -- the same call is answered by the spare"
 # ==========================================================================
 kill "$WB_PID" 2>/dev/null || true
 wait "$WB_PID" 2>/dev/null || true
@@ -604,15 +544,15 @@ run "wires call --verbose orders-db -- 'select count(*) from orders'"
 WIRES_HOME="$agent" "$WIRES" call --verbose orders-db -- "select count(*) from orders" \
 	>"$D/c6.out" 2>"$D/c6.err" || {
 	dump "$D/c6.err"
-	bad "8: the call failed with the workbench down"
+	bad "7: the call failed with the workbench down"
 }
-grep -qx "$ORDERS" <(tr -d ' ' <"$D/c6.out") || bad "8: the failover call returned the wrong rows"
+grep -qx "$ORDERS" <(tr -d ' ' <"$D/c6.out") || bad "7: the failover call returned the wrong rows"
 grep -qF "answered by host ${SP_ID:0:8}" "$D/c6.err" || {
 	cat "$D/c6.err" >&2
-	bad "8: the call was not answered by the spare"
+	bad "7: the call was not answered by the spare"
 }
 show "$D/c6.err"
-ok "8: same name, other host -- the agent never named either"
+ok "7: same name, other host -- the agent never named either"
 run "wires serve host.json   # the workbench comes back"
 start_host "$wb" workbench
 WB_PID=$LAST_PID
@@ -620,16 +560,16 @@ share_hints
 beat 2
 
 # ==========================================================================
-step "9  the human removes the agent -- one command, no host restarts"
+step "8  the human removes $EMAIL -- one command, from every machine, no host restarts"
 # ==========================================================================
-run "wires remove agent"
-admin remove agent >"$D/remove.out" 2>"$D/remove.err" || {
+run "wires remove $EMAIL"
+admin remove "$EMAIL" >"$D/remove.out" 2>"$D/remove.err" || {
 	cat "$D/remove.err" >&2
-	bad "9: wires remove failed"
+	bad "8: wires remove failed"
 }
 grep -qF "published to 2 of 2 directory(ies)" "$D/remove.err" || {
 	cat "$D/remove.err" >&2
-	bad "9: the new policy never reached both directories"
+	bad "8: the new policy never reached both directories"
 }
 show "$D/remove.out"
 run "wires call orders-db -- 'select count(*) from orders'"
@@ -639,23 +579,25 @@ rc=$?
 set -e
 [ "$rc" -eq "$EXIT_DENIED" ] || {
 	dump "$D/c5.err"
-	bad "9: the removed agent's call exited $rc, expected $EXIT_DENIED"
+	bad "8: the removed agent's call exited $rc, expected $EXIT_DENIED"
 }
-[ "$(wc -c <"$D/c5.out" | tr -d ' ')" -eq 0 ] || bad "9: the refused call wrote $(wc -c <"$D/c5.out") bytes to stdout"
-grep -qF "not a member of this network" "$D/c5.err" || {
+[ "$(wc -c <"$D/c5.out" | tr -d ' ')" -eq 0 ] || bad "8: the refused call wrote $(wc -c <"$D/c5.out") bytes to stdout"
+grep -qF "not admitted to this network: no role in this network matches $EMAIL, or you were removed" "$D/c5.err" || {
 	cat "$D/c5.err" >&2
-	bad "9: refused, but not for the removal"
+	bad "8: refused, but not for the removal"
 }
 show "$D/c5.err"
-ok "9: exit $EXIT_DENIED, 0 bytes out"
+ok "8: exit $EXIT_DENIED, 0 bytes out"
 # Removal cuts pushes the way it cuts calls: refused at send, and at fetch.
+# The spare answered her last calls, so it knows who she is (the
+# workbench restarted in step 7 and has not seen her since).
 set +e
-WIRES_HOME="$wb" "$WIRES" push --to "$AG_ID" --subject after-removal -- "x" >"$D/p3.out" 2>"$D/p3.err"
+WIRES_HOME="$sp" "$WIRES" push --to "$AG_ID" --subject after-removal -- "x" >"$D/p3.out" 2>"$D/p3.err"
 rc=$?
 set -e
-if ! { [ "$rc" -eq "$EXIT_DENIED" ] && grep -qF "banned until" "$D/p3.out"; }; then
+if ! { [ "$rc" -eq "$EXIT_DENIED" ] && grep -qF "removed by the current signed policy" "$D/p3.out"; }; then
 	cat "$D/p3.out" "$D/p3.err" >&2
-	bad "9: a push to the removed agent exited $rc, expected $EXIT_DENIED"
+	bad "8: a push to the removed agent exited $rc, expected $EXIT_DENIED"
 fi
 set +e
 WIRES_HOME="$agent" "$WIRES" inbox >"$D/i4.out" 2>"$D/i4.err"
@@ -663,24 +605,23 @@ rc=$?
 set -e
 [ "$rc" -eq "$EXIT_DENIED" ] && [ ! -s "$D/i4.out" ] || {
 	cat "$D/i4.out" "$D/i4.err" >&2
-	bad "9: the removed agent's inbox exited $rc, expected $EXIT_DENIED and nothing"
+	bad "8: the removed agent's inbox exited $rc, expected $EXIT_DENIED and nothing"
 }
-ok "9: and no pushes -- refused at send and at fetch (exit $EXIT_DENIED)"
-alive "$SP_PID" || bad "9: the spare died"
-ok "9: the spare is still pid $SP_PID -- the removal took effect without a restart"
+ok "8: and no pushes -- refused at send and at fetch (exit $EXIT_DENIED)"
+alive "$SP_PID" || bad "8: the spare died"
+ok "8: the spare is still pid $SP_PID -- the removal took effect without a restart"
 beat 2
 
 # ==========================================================================
 step "SUMMARY"
 # ==========================================================================
 printf '     name      : orders-db, a service; its hosts were never named by the caller\n' >&2
-printf '     identity  : no identity, no view: nothing to call; %s allowed as analyst\n' "$EMAIL" >&2
-printf '     narrowing : %s (read-only) stopped on its machine, exit 1; %s refused by the host rule, exit 77\n' "$READER" "$BOB" >&2
-printf '     records   : the security reader saw every call and the host refusal; the agent only its own\n' >&2
+printf '     identity  : joining is signing in; before it, nothing to call; %s allowed as analyst\n' "$EMAIL" >&2
+printf '     narrowing : %s (no role) not in the network, exit 1 on her machine; %s refused by the host rule, exit 77\n' "$OUTSIDER" "$BOB" >&2
 printf '     contained : .shell id refused by sqlite3 -safe, exit %s\n' "$SHELL_RC" >&2
 # shellcheck disable=SC2016 # literal backticks in the summary
 printf '     push      : host -> agent by key, fetched by `wires inbox`; --wait woke on the next\n' >&2
 printf '     failover  : workbench down -> answered by the spare, same command\n' >&2
 # shellcheck disable=SC2016 # literal backticks in the summary
-printf '     revoke    : one `wires remove` -> exit 77, 0 bytes out; pushes refused; %ss wall clock\n' "$((SECONDS - START))" >&2
+printf '     revoke    : one `wires remove <email>` -> exit 77, 0 bytes out; pushes refused; %ss wall clock\n' "$((SECONDS - START))" >&2
 [ -z "$KEEP" ] || say "state kept in $D"

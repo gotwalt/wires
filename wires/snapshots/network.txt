@@ -1,0 +1,9 @@
+Print the network string every node joins with (not secret)
+
+Usage: wires network
+
+Options:
+  -h, --help  Print help
+
+Example:
+  wires network               # one string, for every node; not secret

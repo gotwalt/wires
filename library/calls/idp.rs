@@ -9,11 +9,12 @@
 //! *K* authenticated as *alice@corp*".
 //!
 //! Nothing is published. The caller presents the raw ID token in the session
-//! `Hello` of each call (and of each inbox fetch or record stream it opens);
-//! the host pairs it with the key iroh authenticated to form an
-//! [`IdentityClaim`], verifies the IdP's signature against the issuer's
-//! published keys **itself** with [`verify_claim`], under the issuers its own
-//! `host.json` trusts, and derives the [`Principal`]. No party has to trust a
+//! `Hello` of each call (and in the hello of each inbox fetch and directory
+//! request it opens); the host pairs it with the key iroh authenticated to
+//! form an [`IdentityClaim`], verifies the IdP's signature against the
+//! issuer's published keys **itself** with [`verify_claim`], under the
+//! issuers the signed policy trusts (which its `host.json` may narrow), and
+//! derives the [`Principal`]. No party has to trust a
 //! wires attestor, and hosts can trust several IdPs at once; every role
 //! matcher names the issuer it accepts.
 //!
@@ -60,15 +61,30 @@ pub const OIDC_NONCE_CONTEXT: &str = "wires oidc-nonce v1";
 pub const CLOCK_SKEW_SECS: i64 = 60;
 
 /// Google's issuer identifier: the one issuer whose `hd` (hosted domain)
-/// claim becomes [`Principal::org`], and the issuer `wires role set` names
-/// when none is given.
+/// claim becomes [`Principal::org`], and `wires init`'s default
+/// `--issuer`.
 pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
 
 /// A raw OIDC ID token: a compact JWS (`header.payload.signature`), exactly as
 /// the IdP issued it. Opaque until verified.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+///
+/// It is a bearer credential, so its `Debug` never prints it (nor does the
+/// `Debug` of any frame or struct that holds one): only its length.
+///
+/// ```
+/// use library::IdToken;
+/// let t = IdToken::new("eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl");
+/// assert_eq!(format!("{t:?}"), "IdToken(<redacted, 34 bytes>)");
+/// ```
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct IdToken(String);
+
+impl fmt::Debug for IdToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "IdToken(<redacted, {} bytes>)", self.0.len())
+    }
+}
 
 impl IdToken {
     /// Wrap a compact-JWS string. No validation happens here — an `IdToken`

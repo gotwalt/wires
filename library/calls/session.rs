@@ -1,8 +1,8 @@
 //! Session protocol frames and their self-delimiting wire codec.
 //!
 //! A session carries a small set of [`Frame`]s over a single bidirectional
-//! stream: an opening [`Frame::Hello`] that presents the dialer's membership,
-//! policy version and ID token, then tagged stdio chunks ([`Frame::Stdin`] / [`Frame::Stdout`] /
+//! stream: an opening [`Frame::Hello`] that presents the dialer's policy
+//! version and ID token (what admits it), then tagged stdio chunks ([`Frame::Stdin`] / [`Frame::Stdout`] /
 //! [`Frame::Stderr`]) and a final [`Frame::Exit`] carrying the child's exit
 //! code. A host that refuses the handshake answers with a terminal
 //! [`Frame::Denied`] carrying the human-readable reason instead of an ack, so
@@ -28,20 +28,23 @@
 //! | `4`  | `Exit`      | 4-byte big-endian `i32`                    |
 //! | `6`  | `Denied`    | UTF-8 reason bytes                         |
 //! | `7`  | `Invoke`    | canonical-JSON of the [`Invocation`]       |
-//! | `8`  | `Hello`     | canonical-JSON of the [`Hello`]            |
-//! | `9`  | `HelloAck`  | canonical-JSON of the [`HelloAck`]         |
+//! | `10` | `Hello`     | canonical-JSON of the [`Hello`]            |
+//! | `11` | `HelloAck`  | canonical-JSON of the [`HelloAck`]         |
 //!
-//! Any other tag is a [`Error::BadFrame`].
+//! Any other tag is a [`Error::BadFrame`], tags `8` and `9` included (an
+//! older format of `Hello` and `HelloAck`).
 //!
 //! A dialer sends [`Frame::Invoke`] immediately after its `Hello`, without
 //! waiting for the ack — the host reads both, authorizes them together, and
 //! only then answers with `HelloAck` or `Denied`.
 //!
 //! [`Hello`] and [`HelloAck`] are unsigned envelopes: each part verifies on
-//! its own (the membership under the root, the ID token under the IdP's keys
-//! and its nonce binding to the iroh-authenticated caller, the head and the
-//! service entry under the root), so omitting an absent part via
-//! `skip_serializing_if` is safe.
+//! its own (the ID token under the IdP's keys and its nonce binding to the
+//! iroh-authenticated caller, the head and the service entry under the
+//! root), so omitting an absent part via `skip_serializing_if` is safe. The
+//! host is trusted because the key the caller dialed (and iroh
+//! authenticated) is in the service's root-signed entry; the ack carries no
+//! credential of its own.
 //!
 //! **The handshake carries the news** (card 37). A caller holds a view, not
 //! the policy: its `Hello` names the head version of that view, and the
@@ -60,7 +63,6 @@ use crate::head::{SignedPolicyHead, StateVersion};
 use crate::identity::NodeId;
 use crate::idp::IdToken;
 use crate::invoke::Invocation;
-use crate::membership::Membership;
 use crate::registry::ServiceName;
 use crate::signed_policy::check_entry_version;
 
@@ -70,35 +72,31 @@ const TAG_STDERR: u8 = 3;
 const TAG_EXIT: u8 = 4;
 const TAG_DENIED: u8 = 6;
 const TAG_INVOKE: u8 = 7;
-const TAG_HELLO: u8 = 8;
-const TAG_HELLO_ACK: u8 = 9;
+const TAG_HELLO: u8 = 10;
+const TAG_HELLO_ACK: u8 = 11;
 
 /// The opening frame, dialer → host, followed at once
-/// by [`Frame::Invoke`]. Unsigned envelope: each part verifies on its own
-/// (the membership under the root, the token under the IdP's keys and the
-/// nonce binding to the iroh-authenticated caller).
+/// by [`Frame::Invoke`]. Unsigned envelope: the token verifies on its own
+/// (under the IdP's keys, with its nonce binding it to the
+/// iroh-authenticated caller), and it is what admits the caller.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Hello {
-    /// The dialer's root-signed membership.
-    pub membership: Membership,
     /// The head version of the dialer's view (0: none). A host holding a
     /// newer policy answers with its head and the called service's entry
     /// ([`HelloAck::head`], [`HelloAck::entry`]).
     pub state_version: StateVersion,
-    /// The dialer's IdP ID token (nonce-bound to its node key), when it has
-    /// logged in.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id_token: Option<IdToken>,
+    /// The dialer's IdP ID token (nonce-bound to its node key): the
+    /// caller's own from `wires login`, or a web user's from the gateway.
+    pub id_token: IdToken,
 }
 
-/// The host's answer to an admitted [`Hello`]: its own membership (the
-/// dialer verifies it before sending stdin), the head version it decided
+/// The host's answer to an admitted [`Hello`]: the head version it decided
 /// under, and, when that is newer than the dialer's view, its head and the
 /// called service's entry (see the module docs).
 ///
 /// ```
-/// use library::{HelloAck, Membership, NodeIdentity, Policy, Service, ServiceName, StateVersion};
+/// use library::{HelloAck, NodeIdentity, Policy, Service, ServiceName, StateVersion};
 /// let root = NodeIdentity::from_seed([1u8; 32]);
 /// let host = NodeIdentity::from_seed([2u8; 32]).node_id();
 /// let name = ServiceName::new("orders-db").unwrap();
@@ -106,11 +104,10 @@ pub struct Hello {
 /// policy.version = StateVersion(5);
 /// policy.not_after = i64::MAX;
 /// policy.services.insert(name.clone(), Service {
-///     description: String::new(), allow: vec![], hosts: vec![host], readers: vec![],
+///     description: String::new(), allow: vec![], hosts: vec![host],
 /// });
 /// let signed = policy.sign(&root).unwrap();
 /// let ack = HelloAck {
-///     membership: Membership::mint(&root, host, 0, i64::MAX).unwrap(),
 ///     state_version: StateVersion(5),
 ///     head: Some(signed.head.clone()),
 ///     entry: signed.entries().next().cloned(),
@@ -124,8 +121,6 @@ pub struct Hello {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HelloAck {
-    /// The host's root-signed membership.
-    pub membership: Membership,
     /// The head version of the policy the host decided under.
     pub state_version: StateVersion,
     /// The host's root-signed head, when it is newer than the dialer's view.
@@ -140,7 +135,7 @@ pub struct HelloAck {
 impl HelloAck {
     /// Whether this ack lets a dialer whose view is at `held` go on with a
     /// call of `service` on `host` (the iroh-authenticated peer), under the
-    /// fabric `root`. `Ok(true)` when the host's version is not newer than
+    /// network root `root`. `Ok(true)` when the host's version is not newer than
     /// `held` (nothing new), or when its head and `service`'s entry verify
     /// under `root` and the entry still lists `host`; `Ok(false)` when the
     /// newer policy no longer assigns `service` to `host` (or no longer has
@@ -223,16 +218,17 @@ pub enum Frame {
     Exit(i32),
     /// Terminal frame from the host: the call was refused, with a
     /// human-readable reason. Sent instead of a `HelloAck`, after which the
-    /// host closes. Carries no secrets — the reason describes the dialer's
-    /// own credential.
+    /// host closes. Carries no secrets: the reason says only what the
+    /// dialer can act on.
     Denied {
-        /// Why the session was refused (e.g. `not a member of this network`).
+        /// Why the session was refused (e.g. `not admitted to this network:
+        /// sign in with \`wires login\`, or ask your admin for a role`).
         reason: String,
     },
     /// Dialer → host, right after `Hello`: which service to run and the
     /// per-call arguments.
     Invoke(Invocation),
-    /// The opening frame: membership, policy version, ID token.
+    /// The opening frame: policy version, ID token.
     Hello(Hello),
     /// The host's ack to an admitted [`Hello`].
     HelloAck(HelloAck),
@@ -252,7 +248,7 @@ impl Frame {
     /// assert!(Frame::decode(&bytes[..bytes.len() - 1]).unwrap().is_none());
     ///
     /// // A refusal round-trips its reason verbatim.
-    /// let denied = Frame::Denied { reason: "not a member of this network".into() };
+    /// let denied = Frame::Denied { reason: "not admitted to this network".into() };
     /// let bytes = denied.encode().unwrap();
     /// assert_eq!(Frame::decode(&bytes).unwrap().unwrap().0, denied);
     /// ```
@@ -345,6 +341,20 @@ mod tests {
         ServiceName::new("orders-db").unwrap()
     }
 
+    proptest! {
+        /// No frame that carries an ID token prints it: `IdToken`'s `Debug`
+        /// is redacted, so a `{:?}` anywhere (a trace, a panic) can't leak
+        /// the bearer credential.
+        #[test]
+        fn debug_never_prints_the_id_token(jws in "[A-Za-z0-9_-]{16,64}\\.[A-Za-z0-9_-]{16,64}") {
+            let hello = Hello { state_version: StateVersion(3), id_token: IdToken::new(jws.clone()) };
+            let printed = format!("{hello:?} {:?} {:#?}", Frame::Hello(hello.clone()), hello);
+            prop_assert!(!printed.contains(&jws), "{}", printed);
+            prop_assert!(!printed.contains(jws.split('.').next().unwrap()), "{}", printed);
+            prop_assert!(printed.contains("redacted"), "{}", printed);
+        }
+    }
+
     /// A policy at `version` in which `hosts` implement `orders-db`.
     fn signed_with(
         root: &NodeIdentity,
@@ -360,20 +370,14 @@ mod tests {
                 description: String::new(),
                 allow: vec![],
                 hosts: hosts.to_vec(),
-                readers: vec![],
             },
         );
         p.sign(root).unwrap()
     }
 
-    /// An ack from `host` at `signed`'s version, with its news.
-    fn ack(
-        root: &NodeIdentity,
-        host: NodeId,
-        signed: &crate::signed_policy::SignedPolicy,
-    ) -> HelloAck {
+    /// An ack at `signed`'s version, with its news.
+    fn ack(signed: &crate::signed_policy::SignedPolicy) -> HelloAck {
         HelloAck {
-            membership: Membership::mint(root, host, 0, i64::MAX).unwrap(),
             state_version: signed.version(),
             head: Some(signed.head.clone()),
             entry: signed.entries().next().cloned(),
@@ -387,7 +391,7 @@ mod tests {
         let other = NodeIdentity::from_seed([3; 32]).node_id();
         let r = root.node_id();
         let v5 = signed_with(&root, 5, &[host]);
-        let ack5 = ack(&root, host, &v5);
+        let ack5 = ack(&v5);
         assert!(ack5.assigns(r, StateVersion(4), &orders(), host).unwrap());
         assert!(!ack5.assigns(r, StateVersion(4), &orders(), other).unwrap());
         // Nothing new: nothing to check, even with no head.
@@ -438,21 +442,12 @@ mod tests {
                     service: crate::registry::ServiceName::new(service).unwrap(),
                     argv: crate::invoke::Argv::new(args).unwrap(),
                 })),
-            (
-                seed(),
-                seed(),
-                any::<u64>(),
-                proptest::option::of("[a-zA-Z0-9._-]{1,40}")
-            )
-                .prop_map(|(rs, ss, v, token)| {
-                    let root = NodeIdentity::from_seed(rs);
-                    let member = NodeIdentity::from_seed(ss).node_id();
-                    Frame::Hello(Hello {
-                        membership: Membership::mint(&root, member, 0, 1).unwrap(),
-                        state_version: StateVersion(v),
-                        id_token: token.map(IdToken::new),
-                    })
-                }),
+            (any::<u64>(), "[a-zA-Z0-9._-]{1,40}").prop_map(|(v, token)| {
+                Frame::Hello(Hello {
+                    state_version: StateVersion(v),
+                    id_token: IdToken::new(token),
+                })
+            }),
             (seed(), any::<u64>(), any::<bool>()).prop_map(|(rs, v, with_news)| {
                 let root = NodeIdentity::from_seed(rs);
                 let (head, entry) = if with_news {
@@ -462,7 +457,6 @@ mod tests {
                     (None, None)
                 };
                 Frame::HelloAck(HelloAck {
-                    membership: Membership::mint(&root, root.node_id(), 0, 1).unwrap(),
                     state_version: StateVersion(v),
                     head,
                     entry,
@@ -517,7 +511,7 @@ mod tests {
 
     #[test]
     fn denied_roundtrips_empty_ascii_and_unicode() {
-        for reason in ["", "not a member of this network", "refusé — 拒否 🚫"] {
+        for reason in ["", "not admitted to this network", "refusé — 拒否 🚫"] {
             let f = Frame::Denied {
                 reason: reason.to_string(),
             };
@@ -557,11 +551,27 @@ mod tests {
 
     #[test]
     fn unknown_tag_is_bad_frame() {
-        // len = 1, tag = 10 (unknown).
+        // len = 1, tag = 12 (unknown).
         assert!(matches!(
-            Frame::decode(&[0, 0, 0, 1, 10]),
+            Frame::decode(&[0, 0, 0, 1, 12]),
             Err(Error::BadFrame)
         ));
+        // The older hello and ack (tags 8 and 9) are no longer read.
+        for tag in [8, 9] {
+            assert!(matches!(
+                Frame::decode(&[0, 0, 0, 3, tag, b'{', b'}']),
+                Err(Error::BadFrame)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_hello_without_a_token_does_not_decode() {
+        let body = br#"{"state_version":1}"#;
+        let mut bytes = ((body.len() + 1) as u32).to_be_bytes().to_vec();
+        bytes.push(TAG_HELLO);
+        bytes.extend_from_slice(body);
+        assert!(Frame::decode(&bytes).is_err());
     }
 
     #[test]

@@ -2,17 +2,19 @@
 //! (board cards 05 and 27).
 //!
 //! [`Identities`] is the in-memory index `NodeId → latest verified
-//! Principal`. It is fed every ID token a caller presents in person: in the
-//! session [`Hello`](library::Hello) of a call, and in the inbox
-//! [`Hello`](library::InboxFrame::Hello) of a fetch. Each one is verified
-//! here with card 04's [`KeyFetcher`] under
+//! Principal`. It verifies every ID token a caller presents in person: in
+//! the session [`Hello`](library::Hello) of a call, and in the inbox
+//! [`Hello`](library::InboxFrame::Hello) of a fetch, each with card 04's
+//! [`KeyFetcher`] under
 //! the host's trusted issuers ([`IdpTrust`]: the signed policy's `issuer`
 //! items, narrowed by `host.json`; card 36), which follow the policy the
 //! host decides under ([`Identities::set_trust`]). The iroh
 //! connection authenticated the presenting key, and the token's OIDC nonce
 //! binds it to that key, so a token for someone else's key never verifies.
-//! A token that fails is traced and never displaces a principal that
-//! verified.
+//! It indexes a principal only once the gate admitted it
+//! ([`ServicesHost::admit_caller`](crate::host::gate::ServicesHost::admit_caller)):
+//! any key can present a token, so a token that fails, or a person the
+//! policy doesn't admit, leaves no entry and displaces nothing.
 //!
 //! Nothing is broadcast: a host knows the identities of the callers that
 //! have spoken to it, and no others. That is what push authorization reads
@@ -21,12 +23,34 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use library::{Audience, CLOCK_SKEW_SECS, IdentityClaim, Issuer, NodeId, Principal};
+use library::{Audience, CLOCK_SKEW_SECS, IdToken, IdentityClaim, Issuer, NodeId, Principal};
 
 use crate::caller::jwks::{KeyFetcher, VerifyError};
 
 /// What verifying one token concluded.
 pub(crate) type Verdict = Result<Principal, VerifyError>;
+
+/// A caller's ID token together with the principal this host verified from
+/// it, for one call: what the gate admits ([`Admitted`](crate::host::gate::Admitted))
+/// and what the called service is handed (`WIRES_ID_TOKEN` and
+/// `WIRES_CALLER`, or [`Call::id_token`](crate::Call::id_token) and
+/// [`Call::principal`](crate::Call::principal); protocol §5–6).
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Verified {
+    /// The token, exactly as the caller presented it in its `Hello`.
+    pub(crate) token: IdToken,
+    /// What verifying it concluded.
+    pub(crate) principal: Principal,
+}
+
+impl std::fmt::Debug for Verified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The token is a bearer credential: never printed.
+        f.debug_struct("Verified")
+            .field("principal", &self.principal)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Which issuers a host accepts ID tokens from, each with its own accepted
 /// audiences (the policy's `issuer` items, narrowed by `host.json`'s
@@ -80,9 +104,9 @@ pub(crate) struct Identities {
     fetcher: KeyFetcher,
     /// Which issuers and audiences this host accepts now.
     trust: std::sync::RwLock<IdpTrust>,
-    /// Every node a token has been seen from, with the verified principal
-    /// of the latest `exp` (possibly stale by now), if any verified.
-    known: Mutex<HashMap<NodeId, Option<Principal>>>,
+    /// Every node admitted here, with the verified principal of the latest
+    /// `exp` (possibly stale by now).
+    known: Mutex<HashMap<NodeId, Principal>>,
 }
 
 impl std::fmt::Debug for Identities {
@@ -118,9 +142,12 @@ impl Identities {
         self.trust.read().expect("identity trust poisoned").clone()
     }
 
-    /// Verify the ID token `node` presented (in a session or inbox `Hello`)
-    /// and record the verdict. The iroh-authenticated key presented it
-    /// itself, so the nonce binding to `node` is the whole proof.
+    /// Verify the ID token `node` presented (in a session or inbox `Hello`).
+    /// The iroh-authenticated key presented it itself, so the nonce binding
+    /// to `node` is the whole proof. Records nothing: the gate
+    /// ([`ServicesHost::admit_caller`](crate::host::gate::ServicesHost::admit_caller))
+    /// records a principal only once the policy admits it, so neither a
+    /// stranger nor an outsider the IdP knows can grow the index.
     pub(crate) async fn verify_token(
         &self,
         node: NodeId,
@@ -132,43 +159,43 @@ impl Identities {
             id_token: id_token.clone(),
         };
         let trust = self.trust();
-        let verdict = self
-            .fetcher
+        self.fetcher
             .verify(
                 &claim,
                 &trust.issuers(),
                 trust.audiences_for_claim(&claim),
                 now,
             )
-            .await;
-        self.record(node, &verdict);
-        verdict
+            .await
     }
 
     /// Fold one verdict about `node` into the index.
     ///
     /// A verified principal (fresh or expired) replaces the held one when its
     /// `exp` is at least as late — re-logins win, and replaying an old token
-    /// cannot roll a node back to an older identity. A failure is traced,
-    /// and only notes that the node presented a token.
+    /// cannot roll a node back to an older identity. A failure is traced at
+    /// `debug` (any key can cause one; the session's throttle counts them)
+    /// and leaves no entry.
     pub(crate) fn record(&self, node: NodeId, verdict: &Verdict) {
-        let mut known = self.known.lock().expect("identity index poisoned");
-        let held = known.entry(node).or_default();
         let p = match verdict {
             Ok(p) => p,
             Err(VerifyError::Expired(p)) => &**p,
             Err(e) => {
-                tracing::warn!(node = %node.hex(), "ID token did not verify: {e}");
+                tracing::debug!(node = %node.hex(), "ID token did not verify: {e}");
                 return;
             }
         };
-        if held.as_ref().is_none_or(|h| p.not_after >= h.not_after) {
-            tracing::info!(node = %node.hex(), who = %p.name(), "identity verified");
-            *held = Some(p.clone());
+        let mut known = self.known.lock().expect("identity index poisoned");
+        let newer = known
+            .get(&node)
+            .is_none_or(|held| p.not_after >= held.not_after);
+        if newer {
+            tracing::debug!(node = %node.hex(), who = %p.name(), "identity verified");
+            known.insert(node, p.clone());
         }
     }
 
-    /// Every node a token has been seen from, verified or not.
+    /// Every node admitted here.
     pub(crate) fn nodes(&self) -> Vec<NodeId> {
         let known = self.known.lock().expect("identity index poisoned");
         known.keys().copied().collect()
@@ -177,7 +204,7 @@ impl Identities {
     /// The principal `node` last verified as, fresh or not.
     fn latest(&self, node: NodeId) -> Option<Principal> {
         let known = self.known.lock().expect("identity index poisoned");
-        known.get(&node).cloned().flatten()
+        known.get(&node).cloned()
     }
 
     /// `node`'s principal if one verified and is still fresh at `now`.
@@ -229,9 +256,9 @@ mod tests {
                 node: n.hex(),
             })),
         );
-        // Seen, but nobody verified.
+        // A token that failed leaves nothing: strangers can't grow the index.
         assert_eq!(ids.latest(n), None);
-        assert_eq!(ids.nodes(), vec![n]);
+        assert!(ids.nodes().is_empty());
         ids.record(n, &Ok(who("alice@example.com", 1_000)));
         assert_eq!(ids.current(n, 100), Some(who("alice@example.com", 1_000)));
         assert_eq!(ids.current(n, 1_000 + CLOCK_SKEW_SECS + 1), None);

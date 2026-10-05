@@ -6,20 +6,20 @@
 //! carries a proof: a whole policy checks against its head's one signature,
 //! and a view's entries each carry their own.
 //!
-//! **`wires/directory/1`**: one request per stream. The dialer sends
-//! [`DirectoryRequest::Hello`] (its badge, and its ID token when it has one)
-//! then one request, and the directory answers once:
+//! **`wires/directory/2`**: one request per stream. The dialer sends
+//! [`DirectoryRequest::Hello`] (its ID token when it acts for a person;
+//! none from a host, a directory or the admin) then one request, and the
+//! directory answers once:
 //!
 //! | request | answer |
 //! |---|---|
-//! | `publish {head, items}` | `published {version}`: the version it now holds |
-//! | `head {}` | `head {head, fresh}` |
+//! | `publish {head}`, then `items {items}` only if asked for | `published {version, head}`: the version it now holds and that head's [`HeadHash`] |
 //! | `policy {have}` | the whole policy for a host or directory: `policy {policy, fresh}`; `policy_update {update, fresh}` from a `have` the directory still keeps; `current {fresh}` when `have` is the newest |
 //! | `view {have, query?, held?}` | the caller's view: `view {view, fresh}`, or `view_update {update, fresh}` / `current {fresh}` the same way, only when `held` ([`ViewDigest`]) names exactly the view the directory would diff from, for a verified principal (a `query` always gets a whole `view`) |
 //! | `resolve {service}` | `view {view, fresh}` holding just that service, or no entry |
 //! | anything refused | `denied {reason}` |
 //!
-//! **`wires/directory-sub/1`**: the dialer sends `hello` then
+//! **`wires/directory-sub/2`**: the dialer sends `hello` then
 //! [`SubRequest::Subscribe`] (`policy` for a host, `replica` for another
 //! directory, `view` for a long-running caller such as `wires mcp` or the
 //! gateway), and the directory streams [`SubFrame`]s: the subscriber's whole
@@ -30,14 +30,18 @@
 //! [`View::apply`](crate::View::apply)) subscribes anew with `have: 0` and
 //! gets its whole part.
 //!
-//! The caller is always the iroh-authenticated key, never a field. Frames
-//! are a 4-byte big-endian length then canonical JSON tagged by `type`. The
-//! length is checked before anything is allocated: at most
-//! [`MAX_DIRECTORY_FRAME`]; the `hello` (read before its sender is admitted)
-//! at most [`MAX_SMALL_DIRECTORY_FRAME`], whatever it opens with; and a
-//! request after it over [`MAX_SMALL_DIRECTORY_FRAME`] must be a `publish`
-//! ([`PUBLISH_BODY_PREFIX`]), so nobody but an admitted publisher (whose
-//! head the directory then verifies) can make it read a large body.
+//! Who is admitted is the directory's to decide (protocol §4): a node the
+//! held policy names, a caller whose token verifies and whom
+//! [`check_admitted`](crate::check_admitted) admits, and, for a `publish`
+//! only, anyone, since the root's signature is the whole check. The caller
+//! is always the iroh-authenticated key, never a field. Frames are a 4-byte
+//! big-endian length then canonical JSON tagged by `type`. The length is
+//! checked before anything is allocated: every request, the `hello`
+//! included, is at most [`MAX_SMALL_DIRECTORY_FRAME`]; only the
+//! [`DirectoryRequest::Items`] of a publish (at most
+//! [`MAX_DIRECTORY_FRAME`]) is larger, and a directory reads it only after
+//! the publish's head verified under the root and is newer than its own, so
+//! nobody without a root-signed newer head can make it read a large body.
 //!
 //! ```
 //! use library::{DirectoryRequest, StateVersion};
@@ -52,42 +56,35 @@ use serde::{Deserialize, Serialize};
 use crate::codec::{canonical_bytes, hex_id, length_prefixed, prefix_len, split_frame};
 use crate::error::{Error, Result};
 use crate::fresh::Fresh;
-use crate::head::SignedPolicyHead;
-use crate::head::StateVersion;
+use crate::head::{HeadHash, SignedPolicyHead, StateVersion};
 use crate::idp::IdToken;
 use crate::item::Item;
-use crate::membership::Membership;
 use crate::policy_update::PolicyUpdate;
 use crate::registry::ServiceName;
 use crate::signed_policy::SignedPolicy;
 use crate::view::{View, ViewUpdate};
 
 /// The ALPN of the directory's request protocol.
-pub const DIRECTORY_ALPN: &[u8] = b"wires/directory/1";
+pub const DIRECTORY_ALPN: &[u8] = b"wires/directory/2";
 
 /// The ALPN of the directory's subscriptions.
-pub const DIRECTORY_SUB_ALPN: &[u8] = b"wires/directory-sub/1";
+pub const DIRECTORY_SUB_ALPN: &[u8] = b"wires/directory-sub/2";
 
-/// The largest frame either protocol accepts (a `publish`, or a whole
-/// `policy` of a large fabric), checked from the length prefix before
+/// The largest frame either protocol accepts (a publish's `items`, or a
+/// whole `policy` of a large network), checked from the length prefix before
 /// allocating.
 pub const MAX_DIRECTORY_FRAME: usize = 16 * 1024 * 1024;
 
-/// The largest request that is not a `publish`: a `hello` (a badge and an ID
-/// token, a few KB) or a small request.
+/// The largest request but a publish's `items`: a `hello` (an ID token, a
+/// few KB), a publish's signed head, or a small request.
 pub const MAX_SMALL_DIRECTORY_FRAME: usize = 16 * 1024;
-
-/// How the body of every encoded [`DirectoryRequest::Publish`] begins
-/// (canonical JSON sorts `head` first); no other request's does. A directory
-/// checks it before reading a request over [`MAX_SMALL_DIRECTORY_FRAME`].
-pub const PUBLISH_BODY_PREFIX: &[u8] = br#"{"head":"#;
 
 /// Domain-separation prefix of the bytes a [`ViewDigest`] hashes.
 pub const VIEW_DIGEST_CONTEXT: &[u8] = b"wires/view-digest/v1\0";
 
 hex_id! {
     /// Names one exact [`View`]: blake3 over [`VIEW_DIGEST_CONTEXT`] ‖ the
-    /// view's canonical JSON (its head and every entry with its marks). A
+    /// view's canonical JSON (its head and every entry). A
     /// caller sends it with `view {have, held}` so the directory answers
     /// `current` or a `view_update` only for the view the caller holds; a
     /// view cut for someone else, or for no one, doesn't match.
@@ -103,7 +100,7 @@ impl ViewDigest {
     /// let mut policy = Policy::new(root.node_id());
     /// policy.version = StateVersion(1);
     /// policy.not_after = i64::MAX;
-    /// let empty = policy.sign(&root).unwrap().view_for(None, None);
+    /// let empty = policy.sign(&root).unwrap().view_for(root.node_id(), None, None);
     /// assert_eq!(ViewDigest::of(&empty).unwrap(), ViewDigest::of(&empty.clone()).unwrap());
     /// ```
     pub fn of(view: &View) -> Result<ViewDigest> {
@@ -119,25 +116,28 @@ impl ViewDigest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DirectoryRequest {
-    /// Opens every stream: who the dialer is in the fabric.
+    /// Opens every stream.
     Hello {
-        /// The dialer's root-signed badge.
-        badge: Membership,
-        /// Its IdP ID token, nonce-bound to its node key, when it has one
-        /// (a view needs it; a host's policy doesn't).
+        /// Its IdP ID token, nonce-bound to its node key, when it acts for
+        /// a person (a view needs it; a host's policy and a publish don't).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id_token: Option<IdToken>,
     },
-    /// A new signed policy, from anyone: accepted when it verifies under
-    /// the directory's root, is fresh, and is newer than what it holds.
+    /// A new signed policy's head, from anyone. When it verifies under the
+    /// directory's root, is fresh and is newer than what it holds, the
+    /// directory reads the [`Items`](Self::Items) frame that follows;
+    /// otherwise it answers at once.
     Publish {
         /// The signed head.
         head: SignedPolicyHead,
+    },
+    /// The items of the policy whose head a [`Publish`](Self::Publish) just
+    /// sent: read only after that head checked out. The only frame larger
+    /// than [`MAX_SMALL_DIRECTORY_FRAME`].
+    Items {
         /// Every item, in key order.
         items: Vec<Item>,
     },
-    /// The newest head and its `Fresh`.
-    Head {},
     /// The whole signed policy, for a host or a directory (a node that holds
     /// all of it).
     Policy {
@@ -145,7 +145,7 @@ pub enum DirectoryRequest {
         have: StateVersion,
     },
     /// The dialer's caller view (card 37): the services its verified
-    /// identity may call or read.
+    /// identity may call.
     View {
         /// The version the dialer holds (0: none).
         have: StateVersion,
@@ -172,18 +172,15 @@ pub enum DirectoryRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DirectoryAnswer {
-    /// A publish was verified; this is the version the directory now holds
-    /// (the published one, or a newer one it already had).
+    /// A publish's head verified; this is the policy the directory now
+    /// holds (the published one, or one it already had at that version or
+    /// newer).
     Published {
         /// The directory's version.
         version: StateVersion,
-    },
-    /// The newest head.
-    Head {
-        /// The head.
-        head: SignedPolicyHead,
-        /// The directory's `Fresh` for it.
-        fresh: Fresh,
+        /// Its head's hash: the publisher compares it with its own to tell
+        /// a stale copy at the same version.
+        head: HeadHash,
     },
     /// The dialer's `have` is the newest head: nothing to send but freshness.
     Current {
@@ -244,9 +241,7 @@ pub enum SubscriptionKind {
 pub enum SubRequest {
     /// Opens the stream, as on [`DIRECTORY_ALPN`].
     Hello {
-        /// The subscriber's root-signed badge.
-        badge: Membership,
-        /// Its ID token, when it has one (a view needs it).
+        /// Its ID token, when it acts for a person (a view needs it).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id_token: Option<IdToken>,
     },
@@ -288,7 +283,7 @@ pub enum SubFrame {
         /// The `Fresh` for its head.
         fresh: Fresh,
     },
-    /// A new head (or new marks) for a subscriber holding a view.
+    /// A new head (or changed entries) for a subscriber holding a view.
     ViewUpdate {
         /// The update.
         update: ViewUpdate,
@@ -314,47 +309,20 @@ impl DirectoryRequest {
     }
 
     /// Decode the first frame in `buf`: `Ok(None)` until a whole frame has
-    /// arrived; an error for an oversized prefix (see
-    /// [`length`](Self::length)) or a malformed body.
-    pub fn decode(buf: &[u8]) -> Result<Option<(DirectoryRequest, usize)>> {
-        if Self::length(buf)?.is_none() {
-            return Ok(None);
-        }
-        decode_frame(buf, MAX_DIRECTORY_FRAME)
-    }
-
-    /// The body length the prefix at the start of `buf` announces, once it
-    /// is safe to read: at once for a body up to
-    /// [`MAX_SMALL_DIRECTORY_FRAME`], and for a larger one once its first
-    /// bytes show it is a publish ([`PUBLISH_BODY_PREFIX`]); `Ok(None)`
-    /// until then. [`Error::BadFrame`] when it is over
-    /// [`MAX_DIRECTORY_FRAME`], or large and not a publish (refused from the
-    /// first byte that differs, before the rest is read).
+    /// arrived; an error for a prefix over [`MAX_DIRECTORY_FRAME`] or a
+    /// malformed body. A reader caps what it reads before this: at most
+    /// [`MAX_SMALL_DIRECTORY_FRAME`] for anything but the `items` it asked
+    /// for.
     ///
     /// ```
-    /// use library::{DirectoryRequest, MAX_SMALL_DIRECTORY_FRAME};
-    /// let head = DirectoryRequest::Head {}.encode().unwrap();
-    /// assert_eq!(DirectoryRequest::length(&head).unwrap(), Some(head.len() - 4));
-    /// // A large body that opens like anything but a publish is refused early.
-    /// let mut big = ((MAX_SMALL_DIRECTORY_FRAME + 1) as u32).to_be_bytes().to_vec();
-    /// big.extend_from_slice(br#"{"type""#);
-    /// assert!(DirectoryRequest::length(&big).is_err());
+    /// use library::{DirectoryRequest, StateVersion};
+    /// let req = DirectoryRequest::Hello { id_token: None };
+    /// let bytes = req.encode().unwrap();
+    /// assert_eq!(&bytes[4..], br#"{"type":"hello"}"#);
+    /// assert_eq!(DirectoryRequest::decode(&bytes).unwrap(), Some((req, bytes.len())));
     /// ```
-    pub fn length(buf: &[u8]) -> Result<Option<usize>> {
-        let Some(len) = prefix_len(buf) else {
-            return Ok(None);
-        };
-        if len > MAX_DIRECTORY_FRAME {
-            return Err(Error::BadFrame);
-        }
-        if len <= MAX_SMALL_DIRECTORY_FRAME {
-            return Ok(Some(len));
-        }
-        let opening = &buf[4..buf.len().min(4 + PUBLISH_BODY_PREFIX.len())];
-        if !PUBLISH_BODY_PREFIX.starts_with(opening) {
-            return Err(Error::BadFrame);
-        }
-        Ok((opening.len() == PUBLISH_BODY_PREFIX.len()).then_some(len))
+    pub fn decode(buf: &[u8]) -> Result<Option<(DirectoryRequest, usize)>> {
+        decode_frame(buf, MAX_DIRECTORY_FRAME)
     }
 }
 
@@ -422,13 +390,8 @@ fn decode_frame<T: DeserializeOwned>(buf: &[u8], max: usize) -> Result<Option<(T
 mod tests {
     use super::*;
     use crate::identity::NodeIdentity;
-    use crate::item::Ban;
     use crate::signed_policy::fixtures::*;
     use proptest::prelude::*;
-
-    fn badge() -> Membership {
-        Membership::mint(&root(), node(10), 0, i64::MAX).unwrap()
-    }
 
     fn fresh(policy: &SignedPolicy) -> Fresh {
         Fresh::sign(&NodeIdentity::from_seed([30u8; 32]), &policy.head, 0, 900).unwrap()
@@ -444,19 +407,16 @@ mod tests {
     fn requests() -> Vec<DirectoryRequest> {
         let signed = sample().sign(&root()).unwrap();
         vec![
+            DirectoryRequest::Hello { id_token: None },
             DirectoryRequest::Hello {
-                badge: badge(),
-                id_token: None,
-            },
-            DirectoryRequest::Hello {
-                badge: badge(),
                 id_token: Some(IdToken::new("a.b.c")),
             },
             DirectoryRequest::Publish {
                 head: signed.head.clone(),
+            },
+            DirectoryRequest::Items {
                 items: signed.items,
             },
-            DirectoryRequest::Head {},
             DirectoryRequest::Policy {
                 have: StateVersion(2),
             },
@@ -474,7 +434,13 @@ mod tests {
                 have: StateVersion(3),
                 query: None,
                 held: Some(
-                    ViewDigest::of(&sample().sign(&root()).unwrap().view_for(None, None)).unwrap(),
+                    ViewDigest::of(
+                        &sample()
+                            .sign(&root())
+                            .unwrap()
+                            .view_for(node(2), None, None),
+                    )
+                    .unwrap(),
                 ),
             },
             DirectoryRequest::Resolve {
@@ -498,8 +464,8 @@ mod tests {
             assert_eq!(DirectoryRequest::decode(&bytes[..3]).unwrap(), None);
         }
         assert_eq!(
-            DirectoryRequest::Head {}.encode().unwrap()[4..],
-            br#"{"type":"head"}"#[..]
+            DirectoryRequest::Hello { id_token: None }.encode().unwrap()[4..],
+            br#"{"type":"hello"}"#[..]
         );
         assert_eq!(
             DirectoryRequest::Policy {
@@ -516,20 +482,19 @@ mod tests {
         let signed = sample().sign(&root()).unwrap();
         let mut next = sample();
         next.version = StateVersion(4);
-        next.bans.insert(node(21), Ban { until: 900 });
+        next.bans.insert(node(21));
         let next = next.sign_after(&root(), &signed).unwrap();
         let fresh = fresh(&next);
         let update = next.update_from(&signed);
         let alice = who("alice@example.com");
-        let view = next.view_for(Some(&alice), None);
-        let view_update = signed.view_for(Some(&alice), None).update_to(&view);
+        let view = next.view_for(node(2), Some(&alice), None);
+        let view_update = signed
+            .view_for(node(2), Some(&alice), None)
+            .update_to(&view);
         for a in [
             DirectoryAnswer::Published {
                 version: StateVersion(3),
-            },
-            DirectoryAnswer::Head {
-                head: next.head.clone(),
-                fresh: fresh.clone(),
+                head: signed.head.hash().unwrap(),
             },
             DirectoryAnswer::Current {
                 fresh: fresh.clone(),
@@ -592,7 +557,6 @@ mod tests {
         ] {
             for r in [
                 SubRequest::Hello {
-                    badge: badge(),
                     id_token: Some(IdToken::new("a.b.c")),
                 },
                 SubRequest::Subscribe {
@@ -608,56 +572,35 @@ mod tests {
         assert_eq!(signed.apply(&update, root().node_id()).unwrap(), next);
     }
 
-    /// Only a publish may be large, and it announces itself; every other
-    /// request fits the small limit and never opens like a publish.
+    /// Only a publish's items may be large: every other request, a
+    /// publish's head included, fits the small limit a reader caps it at.
     #[test]
-    fn only_publishes_are_large_and_they_announce_themselves() {
+    fn only_a_publishs_items_are_large() {
         let mut p = sample();
-        for b in 100..=255u8 {
-            p.bans
-                .insert(NodeIdentity::from_seed([b; 32]).node_id(), Ban { until: 1 });
+        for b in 100..400u16 {
+            let mut seed = [7u8; 32];
+            seed[..2].copy_from_slice(&b.to_be_bytes());
+            p.bans.insert(NodeIdentity::from_seed(seed).node_id());
         }
         let signed = p.sign(&root()).unwrap();
-        let publish = DirectoryRequest::Publish {
-            head: signed.head,
-            items: signed.items,
+        let items = DirectoryRequest::Items {
+            items: signed.items.clone(),
         }
         .encode()
         .unwrap();
-        assert!(
-            publish.len() > MAX_SMALL_DIRECTORY_FRAME,
-            "{}",
-            publish.len()
-        );
-        assert!(publish[4..].starts_with(PUBLISH_BODY_PREFIX));
-        assert!(DirectoryRequest::decode(&publish).unwrap().is_some());
+        assert!(items.len() > MAX_SMALL_DIRECTORY_FRAME, "{}", items.len());
+        assert!(DirectoryRequest::decode(&items).unwrap().is_some());
+        let head = DirectoryRequest::Publish { head: signed.head }
+            .encode()
+            .unwrap();
+        assert!(head.len() <= MAX_SMALL_DIRECTORY_FRAME);
         for r in requests() {
-            if matches!(r, DirectoryRequest::Publish { .. }) {
+            if matches!(r, DirectoryRequest::Items { .. }) {
                 continue;
             }
             let bytes = r.encode().unwrap();
             assert!(bytes.len() <= MAX_SMALL_DIRECTORY_FRAME, "{r:?}");
-            assert!(!bytes[4..].starts_with(PUBLISH_BODY_PREFIX), "{r:?}");
         }
-    }
-
-    #[test]
-    fn a_large_request_that_is_not_a_publish_is_refused_before_its_body() {
-        let body = format!(
-            r#"{{"type":"view","have":0,"query":"{}"}}"#,
-            "x".repeat(MAX_SMALL_DIRECTORY_FRAME)
-        );
-        let buf = raw(body.as_bytes());
-        // Refused from the first bytes of the body, not after reading it all.
-        assert!(DirectoryRequest::length(&buf[..4]).unwrap().is_none());
-        assert!(DirectoryRequest::length(&buf[..4 + PUBLISH_BODY_PREFIX.len()]).is_err());
-        assert!(DirectoryRequest::decode(&buf).is_err());
-        // A small one's length is known from the prefix alone.
-        let small = DirectoryRequest::Head {}.encode().unwrap();
-        assert_eq!(
-            DirectoryRequest::length(&small[..4]).unwrap(),
-            Some(small.len() - 4)
-        );
     }
 
     #[test]
@@ -674,7 +617,9 @@ mod tests {
     fn unknown_frames_and_fields_are_refused() {
         for body in [
             r#"{"type":"offer"}"#,
-            r#"{"type":"head","extra":1}"#,
+            r#"{"type":"head"}"#,
+            r#"{"type":"hello","credential":"x"}"#,
+            r#"{"type":"publish","head":{},"items":[]}"#,
             r#"{"type":"slice","have":1,"roles":[]}"#,
             r#"{"type":"policy"}"#,
             r#"{"type":"policy","have":1,"x":2}"#,
@@ -692,7 +637,11 @@ mod tests {
         ] {
             assert!(SubRequest::decode(&raw(body.as_bytes())).is_err(), "{body}");
         }
-        for body in [r#"{"type":"published"}"#, r#"{"type":"slice"}"#] {
+        for body in [
+            r#"{"type":"published"}"#,
+            r#"{"type":"published","version":1}"#,
+            r#"{"type":"slice"}"#,
+        ] {
             assert!(DirectoryAnswer::decode(&raw(body.as_bytes())).is_err());
         }
         assert!(SubFrame::decode(&raw(br#"{"type":"replica"}"#)).is_err());
@@ -700,8 +649,8 @@ mod tests {
 
     #[test]
     fn the_alpns() {
-        assert_eq!(DIRECTORY_ALPN, b"wires/directory/1");
-        assert_eq!(DIRECTORY_SUB_ALPN, b"wires/directory-sub/1");
+        assert_eq!(DIRECTORY_ALPN, b"wires/directory/2");
+        assert_eq!(DIRECTORY_SUB_ALPN, b"wires/directory-sub/2");
     }
 
     proptest! {

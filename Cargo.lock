@@ -4779,7 +4779,6 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "tokio",
- "tracing",
  "wires",
 ]
 

@@ -5,15 +5,17 @@
 #
 #   cp .env.example .env            # fill it in (never commit it)
 #   docker compose build
-#   docker compose run --rm wires-gateway id          # send the id to the admin
-#   docker compose run --rm wires-gateway join <token>
+#   docker compose run --rm wires-gateway join <network>   # the admin's `wires network`
 #   docker compose up -d
 #
-# The gateway asks a directory for each user's view, so its network needs one
-# (named with `wires directory add` before the gateway is invited). If no
-# host runs it, run it here as its own node: the optional `wires-directory`
-# service (`--profile directory`), with its own keystore; see
-# docs/deployment.md § "Running a directory".
+# The gateway holds no credential of its own: each call carries the web
+# user's ID token. It asks a directory for each user's view, so its network
+# needs one (named with `wires directory add`, and in the network string the
+# gateway joined with). If no host runs it, run it here as its own node: the
+# optional `wires-directory` service (`--profile directory`), with its own
+# keystore (`docker compose run --rm wires-directory id` for the admin's
+# `wires directory add <label>=<id>`, then `... wires-directory join
+# <network>`); see docs/deployment.md § "Running a directory".
 #
 # The tunnel's ingress (in positivesum/infra) routes the public host to
 # http://wires-gateway:8080 on this project's network; nothing is published
@@ -34,9 +36,9 @@ services:
       WIRES_GATEWAY_CLIENT_SECRET: ${WIRES_GATEWAY_CLIENT_SECRET}
       RUST_LOG: ${RUST_LOG:-warn,wires=info}
     volumes:
-      # The gateway's keystore: node key, badge, the invite's directory ids and
-      # login settings, DCR key, sessions. Must persist (the node key is the
-      # gateway's identity).
+      # The gateway's keystore: node key, the network string (network.json),
+      # DCR key, sessions. Must persist (the node key is the gateway's
+      # identity).
       - keystore:/data
     restart: unless-stopped
 
@@ -52,7 +54,8 @@ services:
       WIRES_HOME: /data
       RUST_LOG: ${RUST_LOG:-warn,wires=info}
     volumes:
-      # Node key, badge, the signed policy and directory.redb. Must persist.
+      # Node key, the network string, the signed policy and directory.redb.
+      # Must persist.
       - directory-keystore:/data
     restart: unless-stopped
 

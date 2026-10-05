@@ -1,6 +1,6 @@
 //! `wires mcp`: a stdio MCP server whose tools are the services you may call
-//! (the entries of your view marked `call`, as `wires services` lists
-//! them), plus `tools.json` aliases.
+//! (the entries of your view, as `wires services` lists them), plus
+//! `tools.json` aliases.
 //!
 //! The view is followed, not read once (card 37): `wires mcp` holds a
 //! `view` subscription with a directory ([`crate::caller::view::follow`]),
@@ -20,7 +20,7 @@
 //! [`Caller`]) and returns the remote output as one text block. There is no
 //! HTTP and no OAuth here: the caller is this node's key and the ID token
 //! `wires login` stored, presented in each call's `Hello` as `wires call`
-//! does, so the host verifies the same person and keeps the same record.
+//! does, so the host verifies the same person and decides the same way.
 //!
 //! Wire format: newline-delimited JSON-RPC 2.0 on stdin/stdout. **stdout is
 //! protocol-only** — every diagnostic goes to stderr. Both eras are served
@@ -69,10 +69,11 @@ pub const LEGACY_PROTOCOL_VERSIONS: &[&str] =
 pub const FIRST_MODERN_VERSION: &str = "2026-07-28";
 
 /// How long a client may cache `tools/list` and `server/discover` results
-/// (the 2026-07-28 `ttlMs`). The tool list only changes with the signed
-/// state, which a client picks up within this.
+/// (the 2026-07-28 `ttlMs`). The tool list only changes with the view,
+/// which a client picks up within this.
 pub const LIST_TTL_MS: u64 = 60_000;
 
+/// The MCP `instructions`: the premise on one line, then [`USAGE`].
 pub fn instructions() -> String {
     format!("{} {USAGE}", crate::help::one_line(crate::help::PREMISE))
 }
@@ -186,7 +187,7 @@ impl<C: Caller> McpServer<C> {
     }
 
     /// Declare `tools.listChanged`: this server tells the client when its
-    /// tool list changes ([`serve`] with a view to follow).
+    /// tool list changes ([`serve_following`] with a view to follow).
     pub fn with_list_changed(mut self) -> Self {
         self.list_changed = true;
         self
@@ -605,8 +606,8 @@ fn input_schema() -> Value {
     })
 }
 
-/// The MCP description for `tool`: the first sentence of its registry
-/// description (card 38: the rest, and how to filter, are in
+/// The MCP description for `tool`: the first sentence of its description
+/// (card 38: the rest, and how to filter, are in
 /// [`instructions`]).
 fn describe(tool: &RemoteTool) -> String {
     first_sentence(&tool.description)
@@ -820,25 +821,24 @@ pub struct McpArgs {
 }
 
 /// `config`'s aliases, then one [`ToolTarget::Service`] tool per view entry
-/// marked `call` (its registry description). A service in the view wins: an
-/// alias with the name of any service the view holds is dropped (with a
-/// warning), callable or not.
+/// (its description in the signed policy). A service in the view wins: an alias with
+/// the name of any service the view holds is dropped (with a warning).
 pub(crate) fn with_services(mut config: ToolsConfig, view: &library::View) -> ToolsConfig {
     config.tools.retain(|t| {
         let registered =
             library::ServiceName::new(t.name.as_str()).is_ok_and(|n| view.entry(&n).is_some());
         if registered {
             tracing::warn!(
-                "tools.json alias `{}` is shadowed by the registered service of that name",
+                "tools.json alias `{}` is shadowed by the service of that name in your view",
                 t.name
             );
         }
         !registered
     });
-    for e in view.entries.iter().filter(|e| e.call) {
+    for e in &view.entries {
         config.tools.push(RemoteTool {
-            name: e.entry.name.clone(),
-            description: e.entry.service.description.clone(),
+            name: e.name.clone(),
+            description: e.service.description.clone(),
             target: ToolTarget::Service,
             remote_tool: None,
         });
@@ -881,7 +881,7 @@ pub async fn mcp_cmd(a: McpArgs) -> Result<()> {
     let token_ks = Arc::clone(&ks);
     let (mut views, follower) = crate::caller::view::follow(crate::caller::view::Follow {
         endpoint: endpoint.clone(),
-        badge: creds.membership().clone(),
+        root: creds.root(),
         id_token: Arc::new(move || crate::caller::hello::stored_token(&token_ks)),
         initial: held,
         fallback: crate::caller::view::joined_directories(&ks),
@@ -995,7 +995,7 @@ mod tests {
             .answer("fails", Ok(exited(2, "partial", "boom\n")))
             .answer(
                 "locked",
-                Ok(CallOutcome::Denied("not a member of this network".into())),
+                Ok(CallOutcome::Denied("removed from this network".into())),
             )
             .answer(
                 "offline",
@@ -1011,8 +1011,9 @@ mod tests {
             .unwrap()
     }
 
-    /// Drive `requests` (one JSON value per line) through [`serve`] and return
-    /// every stdout line, each parsed — which also proves stdout is JSON only.
+    /// Drive `requests` (one JSON value per line) through
+    /// [`serve_following`] and return every stdout line, each parsed — which
+    /// also proves stdout is JSON only.
     fn transcript(server: &mut McpServer<FakeCaller>, requests: &[Value]) -> Vec<Value> {
         let input: String = requests.iter().map(|r| format!("{r}\n")).collect();
         let mut out = Vec::new();
@@ -1070,11 +1071,7 @@ mod tests {
             ]}}),
             text_result(3, "id\n1\nexit: 0", false),
             text_result(4, "partial\nstderr:\nboom\nexit: 2", true),
-            text_result(
-                5,
-                &crate::help::refusal("not a member of this network"),
-                true,
-            ),
+            text_result(5, &crate::help::refusal("removed from this network"), true),
             json!({"jsonrpc":"2.0","id":6,"error":{"code":-32602,"message":"unknown tool: nope"}}),
             text_result(
                 7,
@@ -1216,11 +1213,7 @@ mod tests {
         let out = transcript(&mut s, &[call(2, "locked", json!({}))]);
         assert_eq!(
             out[0],
-            text_result(
-                2,
-                &crate::help::refusal("not a member of this network"),
-                true
-            ),
+            text_result(2, &crate::help::refusal("removed from this network"), true),
             "a refusal is an answer, still shown"
         );
     }
@@ -1420,42 +1413,24 @@ mod tests {
         );
     }
 
-    /// A view for anyone the mock IdP signed in: `services` callable,
-    /// `readable` only readable (role `auditor`).
-    fn view_of(services: &[(&str, &str)], readable: &[&str]) -> library::View {
-        use library::{Policy, RoleName, Service, ServiceName, StateVersion};
+    /// A view for anyone the mock IdP signed in, holding `services`.
+    fn view_of(services: &[(&str, &str)]) -> library::View {
+        use library::{Policy, Service, ServiceName, StateVersion};
         let node = |b: u8| NodeIdentity::from_seed([b; 32]).node_id();
         let root = NodeIdentity::from_seed([1; 32]);
-        let mut state = Policy::new(root.node_id());
-        state.version = StateVersion(1);
-        state.not_after = i64::MAX;
+        let mut policy = Policy::new(root.node_id());
+        policy.version = StateVersion(1);
+        policy.not_after = i64::MAX;
         let (staff, anyone) = crate::testutil::staff_role();
-        let auditor = RoleName::new("auditor").unwrap();
-        let nobody = RoleName::new("nobody").unwrap();
-        state.roles.insert(staff.clone(), anyone.clone());
-        state.roles.insert(auditor.clone(), anyone);
-        state.roles.insert(
-            nobody.clone(),
-            vec![library::Matcher {
-                email: Some("nobody@example.com".parse().unwrap()),
-                ..library::Matcher::new(crate::testutil::test_idp().issuer.as_str())
-            }],
-        );
-        let svc = |desc: &str, allow: &RoleName, readers: Vec<RoleName>| Service {
-            description: desc.into(),
-            allow: vec![allow.clone()],
-            hosts: vec![node(4)],
-            readers,
-        };
+        policy.roles.insert(staff.clone(), anyone);
         for (name, desc) in services {
-            state
-                .services
-                .insert(ServiceName::new(*name).unwrap(), svc(desc, &staff, vec![]));
-        }
-        for name in readable {
-            state.services.insert(
+            policy.services.insert(
                 ServiceName::new(*name).unwrap(),
-                svc("read only", &nobody, vec![auditor.clone()]),
+                Service {
+                    description: (*desc).into(),
+                    allow: vec![staff.clone()],
+                    hosts: vec![node(4)],
+                },
             );
         }
         let anyone = library::Principal {
@@ -1466,23 +1441,20 @@ mod tests {
             groups: vec![],
             not_after: i64::MAX,
         };
-        crate::testutil::signed_policy(&root, state).view_for(Some(&anyone), None)
+        crate::testutil::signed_policy(&root, policy).view_for(
+            crate::testutil::any_node(),
+            Some(&anyone),
+            None,
+        )
     }
 
     /// Card 28 §8: a service in the view beats an alias of the same name,
-    /// and only services marked `call` become tools.
+    /// and every service in the view becomes a tool.
     #[test]
     fn services_become_tools_after_the_aliases_and_shadow_them() {
-        let view = view_of(
-            &[("orders-db", "Read-only SQL"), ("db_query", "shadowed")],
-            &["audit-log"],
-        );
+        let view = view_of(&[("orders-db", "Read-only SQL"), ("db_query", "shadowed")]);
         let aliases = ToolsConfig {
-            tools: vec![
-                entry("db_query", "an alias"),
-                entry("audit-log", "an alias too"),
-                entry("mine", "kept"),
-            ],
+            tools: vec![entry("db_query", "an alias"), entry("mine", "kept")],
             ..ToolsConfig::default()
         };
         let config = with_services(aliases, &view);
@@ -1494,16 +1466,13 @@ mod tests {
         assert_eq!(config.tools[2].description, "Read-only SQL");
     }
 
-    /// A service this caller may only read is not offered, and naming it
-    /// anyway (as a tool, or through `call_service`) is refused here: the
-    /// caller is never invoked, so no host is dialed. The gateway serves
-    /// the same tools ([`with_services`]).
+    /// A service not in the view is not offered, and naming it anyway (as
+    /// a tool, or through `call_service`) is refused here: the caller is
+    /// never invoked, so no host is dialed. The gateway serves the same
+    /// tools ([`with_services`]).
     #[test]
-    fn a_read_only_service_is_not_offered_or_called() {
-        let listed = with_services(
-            ToolsConfig::default(),
-            &view_of(&[("orders-db", "SQL")], &["audit-log"]),
-        );
+    fn a_service_not_in_the_view_is_not_offered_or_called() {
+        let listed = with_services(ToolsConfig::default(), &view_of(&[("orders-db", "SQL")]));
         let mut s = McpServer::new(listed, FakeCaller::default());
         let out = transcript(
             &mut s,
@@ -1529,7 +1498,7 @@ mod tests {
             .collect();
         let pairs: Vec<(&str, &str)> = many.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
         let mut s = McpServer::new(
-            with_services(ToolsConfig::default(), &view_of(&pairs, &["audit-log"])),
+            with_services(ToolsConfig::default(), &view_of(&pairs)),
             FakeCaller::default(),
         );
         let out = transcript(
@@ -1559,7 +1528,7 @@ mod tests {
                 tools: vec![entry("mine", "an alias")],
                 ..ToolsConfig::default()
             },
-            &view_of(&pairs, &[]),
+            &view_of(&pairs),
         );
         let mut s = McpServer::new(config, FakeCaller::default());
         let out = transcript(
@@ -1611,7 +1580,7 @@ mod tests {
             .collect();
         let pairs: Vec<(&str, &str)> = few.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
         let s = McpServer::new(
-            with_services(ToolsConfig::default(), &view_of(&pairs, &[])),
+            with_services(ToolsConfig::default(), &view_of(&pairs)),
             FakeCaller::default(),
         );
         let list = s.tools_list(false);
@@ -1622,10 +1591,10 @@ mod tests {
     /// only when it differs; `initialize` declares `listChanged`.
     #[tokio::test]
     async fn a_changed_view_is_announced_between_replies() {
-        let one = with_services(ToolsConfig::default(), &view_of(&[("a", "one")], &[]));
+        let one = with_services(ToolsConfig::default(), &view_of(&[("a", "one")]));
         let two = with_services(
             ToolsConfig::default(),
-            &view_of(&[("a", "one"), ("b", "two")], &[]),
+            &view_of(&[("a", "one"), ("b", "two")]),
         );
         let (tx, rx) = tokio::sync::watch::channel(one.clone());
         let mut s = McpServer::new(one.clone(), FakeCaller::default()).with_list_changed();

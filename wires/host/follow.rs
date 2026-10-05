@@ -1,8 +1,8 @@
 //! The host's `policy` subscription (card 36c): how a running host keeps
 //! its whole signed policy current, and learns that it is.
 //!
-//! A [`Follower`] subscribes (`wires/directory-sub/1`, `subscribe {kind:
-//! policy, have}`) to the first directory its held head lists that answers,
+//! A [`Follower`] subscribes (`wires/directory-sub/2`, a `hello` with no
+//! token, then `subscribe {kind: policy, have}`) to the first directory its held head lists that answers,
 //! never itself, and takes every frame the directory streams
 //! ([`Follower::take`]):
 //!
@@ -45,8 +45,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::Endpoint;
 use library::{
-    DIRECTORY_SUB_ALPN, Fresh, Membership, NodeId, SignedPolicy, StateVersion, SubFrame,
-    SubRequest, SubscriptionKind,
+    DIRECTORY_SUB_ALPN, Fresh, NodeId, SignedPolicy, StateVersion, SubFrame, SubRequest,
+    SubscriptionKind,
 };
 
 use super::freshness::Freshness;
@@ -90,8 +90,6 @@ pub(crate) struct Follower {
     pub(crate) ks: Arc<Keystore>,
     /// The network root everything verifies under.
     pub(crate) root: NodeId,
-    /// The host's badge, which each subscription opens with.
-    pub(crate) badge: Membership,
     /// Where each `Fresh` goes.
     pub(crate) freshness: Arc<Freshness>,
     /// Whether this host runs the directory mode (decided at start): if not,
@@ -244,10 +242,9 @@ impl Follower {
         have: StateVersion,
     ) -> Result<Ended> {
         let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
-        let hello = SubRequest::Hello {
-            badge: self.badge.clone(),
-            id_token: None,
-        };
+        // A host presents no token: the directory admits it because the
+        // policy names its key.
+        let hello = SubRequest::Hello { id_token: None };
         let subscribe = SubRequest::Subscribe {
             kind: SubscriptionKind::Policy,
             have,
@@ -320,6 +317,20 @@ impl Follower {
             SubFrame::PolicyUpdate { update, fresh } => {
                 let held = store::read(&self.ks, self.root)?
                     .context("this host holds no policy to apply an update to")?;
+                // Already held: a host that is also a directory mirrors what
+                // its own directory takes, often before the directory it
+                // follows sends the same edit as an update from the version
+                // before. Nothing to apply; keep the `Fresh` if it is for
+                // this head.
+                if held.version() >= update.head.head.version {
+                    if held.signed.head == update.head {
+                        fresh
+                            .verify(&held.signed.head)
+                            .context("the freshness doesn't vouch for the update's head")?;
+                        return self.vouch(&fresh, now);
+                    }
+                    return Ok(());
+                }
                 let next = held
                     .signed
                     .apply(&update, self.root)

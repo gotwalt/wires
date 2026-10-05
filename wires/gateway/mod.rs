@@ -2,22 +2,24 @@
 //! remote MCP server, for clients that can only reach one over HTTPS
 //! (Claude.ai's custom connectors, the MCP Inspector).
 //!
-//! It is a caller that acts for web users. The gateway is one admitted node;
-//! each web user signs in with Google *through* it, and the gateway asks
+//! It is a caller that acts for web users. The gateway is one node of the
+//! network; each web user signs in with Google *through* it, and the gateway asks
 //! Google for an ID token whose `nonce` is bound to the gateway's node key
 //! (the same binding `wires login` makes for a caller's own node). Every call
 //! then presents **that user's** ID token in the session handshake, so the
-//! host verifies Google's signature for that user itself and records them
-//! as the caller. The gateway holds nothing a host has to trust beyond its
-//! membership: it can't name a user Google didn't sign in.
+//! host verifies Google's signature for that user itself and decides for
+//! them as the caller. The gateway holds no credential of its own (it joined
+//! with the network string, like any node), and nothing a host has to trust:
+//! it can't name a user Google didn't sign in.
 //!
 //! What a web user sees is their **view** (card 37), as for any caller: the
 //! services a role **matching the user's IdP identity** admits, each a
 //! root-signed entry, cut by a directory for that user's own ID token
 //! (nonce-bound to the gateway's node). The gateway holds no policy: it
 //! keeps one view subscription per live session ([`Keystored`]), so a
-//! grant or a revocation applies to the user's next request. Every role
-//! needs a verified identity, so the gateway's node alone admits nobody.
+//! grant or a revocation applies to the user's next request. Admission
+//! needs a person's verified sign-in, so the gateway's node on its own is
+//! admitted nowhere: every call it makes is a web user's.
 //!
 //! - [`oauth`] — the OAuth 2.1 authorization server Claude.ai signs in to
 //!   (metadata, `/authorize` → Google → `/token`), RFC 9728 / 8414 / 8707 /
@@ -68,17 +70,17 @@ pub(crate) const SCOPE: &str = "wires";
 /// `wires gateway` arguments. Secrets resolve flag → environment → file.
 #[derive(Args, Debug)]
 pub struct GatewayArgs {
-    /// The public origin clients reach (the MCP endpoint is `<origin>/mcp`).
-    // The OAuth issuer, e.g. `https://wires.positivesum.ai`. Falls back to
-    // `$WIRES_GATEWAY_URL`.
+    /// The public origin clients reach (the MCP endpoint is `<origin>/mcp`;
+    /// or `$WIRES_GATEWAY_URL`).
+    // The OAuth issuer, e.g. `https://wires.positivesum.ai`.
     #[arg(long)]
     pub public_url: Option<String>,
     /// Where to listen for HTTP (TLS is the tunnel's or proxy's job).
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub listen: SocketAddr,
-    /// The IdP's Web application client id (hosts must trust it as an audience).
-    // Its redirect URI is `<public-url>/oauth/callback`. Falls back to
-    // `$WIRES_GATEWAY_CLIENT_ID`.
+    /// The IdP's Web application client id, which hosts must trust as an
+    /// audience (or `$WIRES_GATEWAY_CLIENT_ID`).
+    // Its redirect URI is `<public-url>/oauth/callback`.
     #[arg(long)]
     pub client_id: Option<String>,
     /// Read the client secret from this file (or `$WIRES_GATEWAY_CLIENT_SECRET`).
@@ -162,6 +164,12 @@ pub(crate) trait Backend: Send + Sync + 'static {
     fn caller(&self, token: IdToken, view: Arc<View>) -> Self::Caller;
 }
 
+/// What a web user hears when a directory refuses them admission (no role
+/// matches them, or they were removed): the CLI's sentence, without the
+/// email (it goes back to the MCP client in a redirect or a reply).
+pub(crate) const NOT_ADMITTED_HERE: &str = "not admitted to this network: no role in this \
+network matches this account, or it was removed: ask your admin";
+
 /// How long a web user's first request waits for their view.
 const VIEW_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -184,7 +192,8 @@ pub(crate) struct Keystored {
     ks: Arc<Keystore>,
     creds: Credentials,
     endpoint: iroh::Endpoint,
-    /// The directories to ask (the gateway's own view's, else its join's).
+    /// The directories to ask (its own view's head's, else its network
+    /// string's, else its held policy's).
     directories: Vec<NodeId>,
     /// Live views, by ID token.
     views: std::sync::Mutex<HashMap<String, UserView>>,
@@ -209,7 +218,7 @@ impl Keystored {
         let token = session.id_token.clone();
         let (rx, task) = view::follow(view::Follow {
             endpoint: self.endpoint.clone(),
-            badge: self.creds.membership().clone(),
+            root: self.creds.root(),
             id_token: Arc::new(move || Some(token.clone())),
             initial: None,
             fallback: self.directories.clone(),
@@ -227,11 +236,43 @@ impl Keystored {
     }
 }
 
+impl Keystored {
+    /// Whether the first directory that answers refuses `session`'s person
+    /// admission ([`NOT_ADMITTED`](crate::host::gate::NOT_ADMITTED)).
+    async fn refuses_admission(&self, session: &Session, now: i64) -> bool {
+        for &dir in &self.directories {
+            let asked = view::ask_view(
+                &self.endpoint,
+                dir,
+                Some(session.id_token.clone()),
+                self.creds.root(),
+                None,
+                None,
+                now,
+            )
+            .await;
+            match asked {
+                Ok(_) => return false,
+                Err(e) if view::Refused::is_not_admitted(&e) => return true,
+                Err(_) => continue,
+            }
+        }
+        false
+    }
+}
+
 impl Backend for Keystored {
     type Caller = PresentingCaller;
 
     async fn view(&self, session: &Session) -> Result<Arc<View>> {
-        let mut rx = self.watch(session, crate::clock::now_unix());
+        let now = crate::clock::now_unix();
+        let mut rx = self.watch(session, now);
+        // A directory refuses a person no role matches (or one removed)
+        // outright, and the subscription only retries: ask once, so they
+        // hear it now rather than as a timeout.
+        if rx.borrow().is_none() && self.refuses_admission(session, now).await {
+            return Err(anyhow!(crate::host::gate::NOT_ADMITTED).context(view::NotAdmitted));
+        }
         let held: Arc<HeldView> = tokio::time::timeout(VIEW_WAIT, rx.wait_for(Option::is_some))
             .await
             .map_err(|_| anyhow!("no directory gave this user's view within {VIEW_WAIT:?}"))?
@@ -269,7 +310,7 @@ impl crate::caller::call::Caller for PresentingCaller {
         stdin: Vec<u8>,
     ) -> Result<crate::caller::call::CallOutcome> {
         use crate::caller::call::{SERVICE_DIAL_TIMEOUT, ServiceDial, call_entry, outcome};
-        let Some(entry) = self.view.entry(&tool.name).filter(|e| e.call) else {
+        let Some(entry) = self.view.entry(&tool.name) else {
             bail!("`{}` is not a service this user may call", tool.name);
         };
         let dial = ServiceDial {
@@ -282,7 +323,7 @@ impl crate::caller::call::Caller for PresentingCaller {
             &self.creds,
             &self.ks,
             self.view.head.head.version,
-            &entry.entry,
+            entry,
             &dial,
             argv,
             std::io::Cursor::new(stdin),
@@ -559,10 +600,11 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
     })?;
     let node = creds.node_id();
     // Where web users' views come from: the directories this node knows
-    // (its own view's head, else its invite's, else its whole policy's).
-    let mut directories = view::directories(&ks, creds.fabric(), node);
+    // (its own view's head, else its network string's, else its whole
+    // policy's).
+    let mut directories = view::directories(&ks, creds.root(), node);
     if directories.is_empty()
-        && let Some(held) = crate::policy::store::read(&ks, creds.fabric())?
+        && let Some(held) = crate::policy::store::read(&ks, creds.root())?
     {
         directories = held
             .directories()
@@ -573,8 +615,9 @@ pub async fn gateway_cmd(a: GatewayArgs) -> Result<()> {
     }
     if directories.is_empty() {
         bail!(
-            "this node knows no directory to ask for its users' views: join with an invite from \
-             an admin whose policy names one (`wires directory add`)"
+            "this node knows no directory to ask for its users' views: `wires join <network>` \
+             with a string that names one (the admin's `wires directory add`, then `wires \
+             network`)"
         );
     }
     let backend = Keystored {
@@ -649,7 +692,7 @@ pub(crate) mod tests {
         let mut s = Policy::new(node(1));
         s.version = StateVersion(1);
         s.not_after = i64::MAX;
-        s.ban(node(9), i64::MAX);
+        s.ban(node(9));
         s.roles.insert(
             RoleName::new("analyst").unwrap(),
             ["alice@example.com", "bob@example.com"]
@@ -671,7 +714,6 @@ pub(crate) mod tests {
             description: "d".into(),
             allow,
             hosts: vec![node(3)],
-            readers: vec![],
         };
         let analyst = RoleName::new("analyst").unwrap();
         s.services.insert(
@@ -698,7 +740,11 @@ pub(crate) mod tests {
     #[test]
     fn a_web_user_gets_the_services_whose_roles_match_them() {
         let names = |email: &str| -> Vec<String> {
-            let view = signed_for(library::GOOGLE_ISSUER).view_for(Some(&principal(email)), None);
+            let view = signed_for(library::GOOGLE_ISSUER).view_for(
+                crate::testutil::any_node(),
+                Some(&principal(email)),
+                None,
+            );
             with_services(ToolsConfig::default(), &view)
                 .tools
                 .iter()

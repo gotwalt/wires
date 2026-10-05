@@ -22,8 +22,7 @@
 //! 2. `to` is exactly that call's caller node (never a role, never another
 //!    node).
 //!
-//! The push then goes through the same `push.allow` check as any other, and
-//! its call-log records name the call whose capability sent it.
+//! The push then goes through the same `push.allow` check as any other.
 //!
 //! The operator socket keeps full `wires push --to <node|role>` power. The
 //! child is told neither where it is nor where the keystore is, but a child
@@ -38,7 +37,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use library::{CallId, NodeId};
+use library::NodeId;
 
 /// How long a call's push token stays live after the call ends: long enough
 /// for a build or job the call started to report back, short enough that a
@@ -101,8 +100,6 @@ impl fmt::Debug for PushToken {
 pub(crate) struct Grant {
     /// The call's caller: the only node the token can push to.
     pub(crate) caller: NodeId,
-    /// The call's id in the call log, once its `Started` record exists.
-    pub(crate) call: Option<CallId>,
     /// When the token dies; `None` while the call is still running.
     pub(crate) expires: Option<Instant>,
 }
@@ -156,20 +153,12 @@ impl Capabilities {
             token.clone(),
             Grant {
                 caller,
-                call: None,
                 expires: None,
             },
         );
         CallCapability {
             caps: Arc::clone(self),
             token,
-        }
-    }
-
-    /// Attach the call-log id of the call `token` was minted for.
-    pub(crate) fn bind_call(&self, token: &PushToken, call: CallId) {
-        if let Some(g) = self.lock().get_mut(token) {
-            g.call = Some(call);
         }
     }
 
@@ -221,7 +210,7 @@ fn prune(grants: &mut HashMap<PushToken, Grant>, now: Instant) {
 /// fails half-way still has its token expire.
 #[derive(Debug)]
 pub(crate) struct CallCapability {
-    /// The registry it was minted in.
+    /// The token store it was minted in.
     caps: Arc<Capabilities>,
     /// The token.
     token: PushToken,
@@ -232,11 +221,6 @@ impl CallCapability {
     pub(crate) fn token(&self) -> &PushToken {
         &self.token
     }
-
-    /// Attach the call's log id (see [`Capabilities::bind_call`]).
-    pub(crate) fn bind_call(&self, call: CallId) {
-        self.caps.bind_call(&self.token, call);
-    }
 }
 
 impl Drop for CallCapability {
@@ -245,7 +229,7 @@ impl Drop for CallCapability {
     }
 }
 
-/// What `serve` hands its sessions when push is on: the token registry and
+/// What `serve` hands its sessions when push is on: the live tokens and
 /// where the child socket is.
 #[derive(Clone, Debug)]
 pub(crate) struct PushGrants {
@@ -374,13 +358,6 @@ mod tests {
         let now = Instant::now();
         let grant = caps.check(cap.token(), &node(2).hex(), now).unwrap();
         assert_eq!(grant.caller, node(2));
-        assert_eq!(grant.call, None);
-        let call = CallId::generate();
-        cap.bind_call(call);
-        assert_eq!(
-            caps.check(cap.token(), &node(2).hex(), now).unwrap().call,
-            Some(call)
-        );
         for to in [
             node(3).hex(),
             "analyst".into(),

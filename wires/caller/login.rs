@@ -7,7 +7,9 @@
 //! holder of node key *K* signed in as *alice@corp*" — to anyone who checks
 //! the IdP's signature, with no wires-run attestor in the loop.
 //!
-//! Then:
+//! `wires login <network>` first joins the network the string names
+//! ([`crate::caller::join::join_in`]): a caller's whole onboarding is that
+//! one command. Then:
 //!
 //! 1. the token is verified locally (the same [`KeyFetcher::verify`] a host
 //!    runs), so a misconfigured client fails here and not at the host;
@@ -15,17 +17,17 @@
 //!    [`REFRESH_TOKEN_FILE`] when the IdP granted one;
 //! 3. nothing is published: `wires call` presents the stored token in its
 //!    session `Hello` (and `wires inbox` in its fetch), and the host verifies
-//!    it there;
+//!    it there; it is the only credential a caller has, and what admits it;
 //! 4. the caller asks a directory for its view under the new identity (card
 //!    37): the services it may now use.
 //!
-//! Configuration (flag, else environment, else the invite's login settings
-//! that `wires join` stored in [`LOGIN_SETTINGS_FILE`], card 37): `--issuer`
-//! / `WIRES_OIDC_ISSUER` (last resort `https://accounts.google.com`),
-//! `--client-id` / `WIRES_OIDC_CLIENT_ID` (required from one of the three),
+//! Configuration (flag, else environment, else the network string's login
+//! settings, in `network.json`): `--issuer` / `WIRES_OIDC_ISSUER` (last
+//! resort `https://accounts.google.com`), `--client-id` /
+//! `WIRES_OIDC_CLIENT_ID` (required from one of the three),
 //! `--client-secret` / `WIRES_OIDC_CLIENT_SECRET` (Google "Desktop app"
-//! clients have a non-confidential one). After `wires join`, a bare `wires
-//! login` is enough.
+//! clients have a non-confidential one). After the first `wires login
+//! <network>`, a bare `wires login` is enough.
 //!
 //! The small HTTP/1.1 reader/writer here ([`read_request`],
 //! [`write_response`]) serves only the loopback redirect (and the test
@@ -55,8 +57,6 @@ pub(crate) const DEFAULT_ISSUER: &str = "https://accounts.google.com";
 pub(crate) const ID_TOKEN_FILE: &str = "idp-token.jwt";
 /// The IdP refresh token, when one was granted (mode `0600`).
 pub(crate) const REFRESH_TOKEN_FILE: &str = "idp-refresh-token";
-/// The invite's login settings, stored by `wires join` (card 37).
-pub(crate) const LOGIN_SETTINGS_FILE: &str = "login.json";
 /// How long the loopback listener waits for the browser to come back.
 pub(crate) const CALLBACK_WAIT: Duration = Duration::from_secs(300);
 /// The scopes requested: an ID token with the email claim, nothing more.
@@ -83,6 +83,9 @@ const DRAIN_WAIT: Duration = Duration::from_secs(2);
 /// `login` arguments.
 #[derive(Args, Debug, Default)]
 pub(crate) struct LoginArgs {
+    /// The network string your admin prints with `wires network` (the first
+    /// time only: it joins this node to that network).
+    pub network: Option<String>,
     /// Hex 32-byte seed of this node's key. Falls back to `$WIRES_NODE_SEED`,
     /// then `--node-seed-file`, then the keystore (`node.seed`).
     #[arg(long, hide = true)]
@@ -90,16 +93,16 @@ pub(crate) struct LoginArgs {
     /// Read the node key seed (hex) from this file.
     #[arg(long, hide = true)]
     pub node_seed_file: Option<std::path::PathBuf>,
-    /// OIDC issuer. Falls back to `$WIRES_OIDC_ISSUER`, then the invite's,
-    /// then Google.
+    /// OIDC issuer. Falls back to `$WIRES_OIDC_ISSUER`, then the network
+    /// string's, then Google.
     #[arg(long, hide = true)]
     pub issuer: Option<String>,
     /// OAuth client id. Falls back to `$WIRES_OIDC_CLIENT_ID`, then the
-    /// invite's.
+    /// network string's.
     #[arg(long, hide = true)]
     pub client_id: Option<String>,
     /// OAuth client secret (non-confidential for Desktop-app clients). Falls
-    /// back to `$WIRES_OIDC_CLIENT_SECRET`, then the invite's.
+    /// back to `$WIRES_OIDC_CLIENT_SECRET`, then the network string's.
     #[arg(long, hide = true)]
     pub client_secret: Option<String>,
     /// Renew with the stored refresh token; the browser only if that fails.
@@ -132,10 +135,10 @@ pub(crate) struct OidcClient {
 
 impl OidcClient {
     /// Resolve from flags, else the `WIRES_OIDC_*` environment, else the
-    /// invite's login settings (`joined`, which `wires join` stored). The
-    /// invite's client id and secret are used only for the invite's issuer:
-    /// naming another issuer needs its own client id.
-    fn resolve(a: &LoginArgs, joined: Option<LoginSettings>) -> Result<Self> {
+    /// network string's login settings (`joined`). Its client id and secret
+    /// are used only for its issuer: naming another issuer needs its own
+    /// client id.
+    pub(crate) fn resolve(a: &LoginArgs, joined: Option<LoginSettings>) -> Result<Self> {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let named_issuer = a.issuer.clone().or_else(|| env("WIRES_OIDC_ISSUER"));
         let joined = joined.filter(|s| {
@@ -150,9 +153,10 @@ impl OidcClient {
             .or_else(|| joined.as_ref().map(|s| s.client_id.as_str().to_owned()))
             .ok_or_else(|| {
                 anyhow!(
-                    "no OAuth client id: join with an invite from an admin whose policy trusts \
-                     an IdP, or pass --client-id (or set $WIRES_OIDC_CLIENT_ID; for Google, \
-                     create a \"Desktop app\" OAuth client in the Cloud Console)"
+                    "no OAuth client id: run `wires login <network>` with the string your \
+                     admin prints with `wires network`, or pass --client-id (or set \
+                     $WIRES_OIDC_CLIENT_ID; for Google, create a \"Desktop app\" OAuth client \
+                     in the Cloud Console)"
                 )
             })?;
         Ok(Self {
@@ -419,7 +423,7 @@ async fn token_request(
     Ok(reply)
 }
 
-/// Verify the reply's ID token as a claim for `node`, like any reader would.
+/// Verify the reply's ID token as a claim for `node`, as any verifier would.
 async fn finish(
     fetcher: &KeyFetcher,
     client: &OidcClient,
@@ -679,7 +683,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// Write `contents` to `path` with mode `0600`, atomically (temp + rename).
 pub(crate) fn save_secret(path: &Path, contents: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::admin::keystore::create_private_dir(dir)?;
     }
     let tmp = path.with_extension("tmp");
     let _ = std::fs::remove_file(&tmp);
@@ -722,8 +726,14 @@ fn open_browser(url: &Url, launch: bool) {
 
 /// `wires login`.
 pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
-    crate::init_logging();
     let ks = keystore::Keystore::resolve()?;
+    if let Some(network) = &a.network {
+        let joined = crate::caller::join::join_in(&ks, network)?;
+        eprintln!(
+            "wires login: joined network {}… (signing in next)",
+            joined.root.short()
+        );
+    }
     let home = keystore::home()?;
     let node =
         keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?.node_id();
@@ -778,38 +788,51 @@ pub(crate) async fn login_cmd(a: LoginArgs) -> Result<()> {
         token_path.display(),
         login.principal.not_after
     );
+    if login.principal.email.is_none() {
+        eprintln!(
+            "wires login: your IdP gave no verified email for {}, and this network admits only \
+             a verified email: ask your admin",
+            login.principal.name()
+        );
+    }
     // Card 37: the view under the new identity (the old one was someone
     // else's, or no one's).
     let identity = keystore::node_identity(a.node_seed.as_deref(), a.node_seed_file.as_deref())?;
-    if let Some(badge) = ks.read_membership()? {
-        match crate::caller::view::refresh_now(&ks, &identity, &badge, None, true).await {
-            Ok(held) => eprintln!(
-                "wires login: {} service(s) you may call (policy version {}); see `wires \
+    match ks.network_root()? {
+        None => eprintln!("wires login: {}", crate::help::NOT_JOINED),
+        Some(root) => {
+            match crate::caller::view::refresh_now(&ks, &identity, root, None, true).await {
+                Ok(held) => eprintln!(
+                    "wires login: {} service(s) you may call (policy version {}); see `wires \
                  services`",
-                held.callable().count(),
-                held.version().0
-            ),
-            Err(e) => eprintln!(
-                "wires login: could not fetch your services yet ({e:#}); `wires services` asks \
+                    held.view.entries.len(),
+                    held.version().0
+                ),
+                // Signed in at the IdP, but not in this network.
+                Err(e)
+                    if e.downcast_ref::<crate::caller::view::NotAdmitted>()
+                        .is_some() =>
+                {
+                    eprintln!(
+                        "wires login: signed in as {}, but {}",
+                        login.principal.name(),
+                        crate::caller::hello::explain_not_admitted_in(&ks)
+                    )
+                }
+                Err(e) => eprintln!(
+                    "wires login: could not fetch your services yet ({e:#}); `wires services` asks \
                  again"
-            ),
+                ),
+            }
         }
     }
     Ok(())
 }
 
-/// The invite's login settings `wires join` stored, if any (unreadable is
-/// none: flags and the environment still work).
+/// The network string's login settings, if this node joined one
+/// (unreadable is none: flags and the environment still work).
 pub(crate) fn read_settings(ks: &keystore::Keystore) -> Option<LoginSettings> {
-    let text = std::fs::read_to_string(ks.path(LOGIN_SETTINGS_FILE)).ok()?;
-    serde_json::from_str(text.trim()).ok()
-}
-
-/// Store the invite's login settings for [`read_settings`] (`0600`: the
-/// client secret is public, but it is nobody else's business).
-pub(crate) fn save_settings(ks: &keystore::Keystore, settings: &LoginSettings) -> Result<()> {
-    let text = serde_json::to_string(settings)?;
-    save_secret(&ks.path(LOGIN_SETTINGS_FILE), &format!("{text}\n"))
+    ks.read_network().ok().flatten().map(|n| n.login)
 }
 
 #[cfg(test)]
@@ -838,27 +861,27 @@ mod tests {
         assert_ne!(a.verifier, b.verifier);
     }
 
-    /// Card 37: after `wires join <token>`, `wires login` needs no
-    /// `--issuer` / `--client-id` / `--client-secret`: the invite's login
-    /// settings sign in against the mock IdP end to end. A flag still wins,
-    /// and another issuer doesn't borrow the invite's client.
+    /// After joining with the network string, `wires login` needs no
+    /// `--issuer` / `--client-id` / `--client-secret`: its login settings
+    /// sign in against the mock IdP end to end. A flag still wins, and
+    /// another issuer doesn't borrow the string's client.
     #[tokio::test]
-    async fn after_join_a_bare_login_signs_in_with_the_invites_settings() {
-        use library::{Invite, LoginSettings, Membership, NodeIdentity, PublicClientSecret};
+    async fn after_join_a_bare_login_signs_in_with_the_networks_settings() {
+        use library::{LoginSettings, Network, NodeIdentity, PublicClientSecret};
         let idp = MockIdp::start("alice@example.com").await;
         let ks = keystore::Keystore::at(crate::testutil::temp_dir());
-        let (me, _) = crate::caller::join::id_in(&ks).unwrap();
         let root = NodeIdentity::from_seed([61; 32]);
-        let invite = Invite::new(
-            Membership::mint(&root, me, 0, i64::MAX).unwrap(),
+        let network = Network::new(
+            root.node_id(),
             vec![],
-            Some(LoginSettings {
+            LoginSettings {
                 issuer: idp.issuer.clone(),
                 client_id: Audience::new(idp.client_id.clone()),
                 public_client_secret: Some(PublicClientSecret::new("not-so-secret")),
-            }),
+            },
         );
-        crate::caller::join::join_in(&ks, &invite.encode().unwrap(), 0).unwrap();
+        crate::caller::join::join_in(&ks, &network.encode().unwrap()).unwrap();
+        let me = keystore::node_identity_in(&ks).unwrap().node_id();
 
         let bare = LoginArgs::default();
         let client = OidcClient::resolve(&bare, read_settings(&ks)).unwrap();

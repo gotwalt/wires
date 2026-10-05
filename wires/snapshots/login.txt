@@ -1,6 +1,9 @@
-Sign in with your IdP, binding your identity to this node's key
+Sign in with your IdP (the first time with the network string: login <network>)
 
-Usage: wires login [OPTIONS]
+Usage: wires login [OPTIONS] [NETWORK]
+
+Arguments:
+  [NETWORK]  The network string your admin prints with `wires network` (the first time only: it joins this node to that network)
 
 Options:
       --refresh                        Renew with the stored refresh token; the browser only if that fails
@@ -11,5 +14,6 @@ Options:
       --help-all                       Also list the operator and credential flags
 
 Examples:
-  wires login
+  wires login <network>       # the first time: join and sign in
+  wires login                 # again, when your sign-in expires
   wires login --no-browser    # prints the URL to open elsewhere

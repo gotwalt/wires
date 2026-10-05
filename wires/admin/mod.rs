@@ -1,51 +1,48 @@
-//! The **admin** role: holds the root key, mints badges and signs the
-//! policy.
+//! The **admin** role: holds the root key and signs the policy.
 //!
 //! The admin-signed policy (cards 27, 36) is a root-signed head over items:
-//! the trusted IdPs, the role definitions, the service registry (which hosts
-//! run each service), the bans, the settings, and (in the head) the
-//! directories. It lists no members (card 35): a node is admitted by the
-//! root-signed badge the admin mints for it, so inviting one is no edit.
-//! Every other command here edits the policy, signs the next version, and
-//! publishes it to the directories (never to a host: hosts follow it from a
-//! directory, and callers ask one for their views).
+//! the trusted IdPs, the role definitions, the services (who may call each,
+//! which hosts run it), the node and person bans, the settings, and (in the
+//! head) the directories. The admin mints nothing for any node: a caller is
+//! admitted by its IdP sign-in when a role matches it, and a host or
+//! directory by the policy naming its key. `init` signs the first version
+//! and stores it; every edit after it signs the next version and publishes
+//! it to the directories (never to a host: hosts follow it from a directory,
+//! and callers ask one for their views).
 //!
-//! - [`init`] — `wires init`: root key, node key, the admin's own badge, the
-//!   first signed policy.
-//! - [`invite`] — `wires invite` (one token per joiner: a badge, no edit)
-//!   and `wires remove` (a ban).
-//! - [`login_client`] — `login-client.json`: which trusted IdP invites tell
-//!   `wires login` to use, and its public client secret (card 37).
-//! - [`ledger`] — `issued.json`: the badges this admin minted, with their
-//!   labels and expiries (how long a ban must last).
+//! - [`init`] — `wires init`: root key, node key, the first signed policy.
+//! - [`network`] — `wires network`: the string every node joins with.
+//! - [`remove`] — `wires remove` and `wires restore`: person and node bans.
+//! - [`labels`] — `labels.json`: the admin's names for nodes
+//!   (`label=<node id>` the first time, the label afterwards).
+//! - [`login_client`] — `login-client.json`: which trusted IdP the network
+//!   string tells `wires login` to use, and its public client secret.
 //! - [`service`] — `wires service add | set | rm`, `wires role set | rm`,
 //!   `wires issuer set | rm`, and the edits behind `wires directory add |
 //!   rm`.
 //! - [`propagate`] — publishing each edit to the directories (an edit that
-//!   reaches none fails), and `wires policy push`.
+//!   reaches none fails, after the first run), and `wires policy push`.
 //! - [`settings`] — `wires policy settings`: the freshness rule and the
 //!   directories' beat, in the signed policy.
-//! - [`keystore`] — the on-disk home: keys, the membership, and the
+//! - [`keystore`] — the on-disk home: keys, the network string, and the
 //!   flag → env → file → keystore resolution every command uses.
-//! - [`ttl`] — the `--ttl` / `--policy-ttl` / `--timeout` lifetimes.
+//! - [`ttl`] — the `--policy-ttl` / `--timeout` lifetimes.
 
 pub mod init;
-pub mod invite;
 pub mod keystore;
-pub mod ledger;
+pub mod labels;
 pub mod login_client;
+pub mod network;
 pub mod propagate;
+pub mod remove;
 pub mod service;
 pub mod settings;
 pub mod ttl;
 
-use std::collections::BTreeSet;
-
 use keystore::Keystore;
-use library::{NodeId, StateVersion};
 
-/// What an admin command prints: `stdout` is the result (the token, for
-/// `invite`), `notes` then `hint` go to stderr, and a `failure` (the new
+/// What an admin command prints: `stdout` is the result (the network
+/// string, for `network`), `notes` then `hint` go to stderr, and a `failure` (the new
 /// policy reached no directory) goes last on stderr and makes the command
 /// exit 1.
 #[derive(Debug, Default)]
@@ -73,42 +70,4 @@ pub(crate) async fn run_edit(
         report,
         propagate::propagate(&ks, &earlier).await,
     ))
-}
-
-/// An admin command that usually doesn't edit the policy (`invite`): `cmd`
-/// against the resolved keystore, then a publish **only if** the stored
-/// policy's version moved ([`run_if_edited_in`]).
-pub(crate) async fn run_if_edited(
-    cmd: impl FnOnce(&Keystore) -> anyhow::Result<Report>,
-) -> anyhow::Result<Report> {
-    let ks = Keystore::resolve()?;
-    run_if_edited_in(&ks, cmd, async |ks, earlier| {
-        propagate::propagate(ks, earlier).await
-    })
-    .await
-}
-
-/// [`run_if_edited`] against `ks`, with the publish as a parameter (the
-/// testable form): `push` runs, and its outcome is folded into the report,
-/// only when `cmd` left a newer policy stored than it found.
-pub(crate) async fn run_if_edited_in(
-    ks: &Keystore,
-    cmd: impl FnOnce(&Keystore) -> anyhow::Result<Report>,
-    push: impl AsyncFnOnce(&Keystore, &BTreeSet<NodeId>) -> propagate::Propagation,
-) -> anyhow::Result<Report> {
-    let before = held_version(ks)?;
-    let earlier = crate::policy::fetch::held_directories(ks)?;
-    let report = cmd(ks)?;
-    if held_version(ks)? == before {
-        return Ok(report);
-    }
-    Ok(propagate::fold(report, push(ks, &earlier).await))
-}
-
-/// The version of the policy `ks` holds (`None`: it holds none).
-fn held_version(ks: &Keystore) -> anyhow::Result<Option<StateVersion>> {
-    let Some(root) = crate::policy::store::fabric(ks)? else {
-        return Ok(None);
-    };
-    Ok(crate::policy::store::read(ks, root)?.map(|h| h.version()))
 }

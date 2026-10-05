@@ -3,20 +3,31 @@
 //!
 //! [`Directory`] holds the newest signed policy (in `directory.redb`, with
 //! the typed copy in memory), signs a [`Fresh`] for its head
-//! ([`Directory::beat`]), takes a newer policy from anyone admitted
-//! ([`Directory::accept`]: verified under the root, fresh, strictly newer,
-//! items matching the head's `items_hash`) and answers `wires/directory/1`
-//! requests ([`Directory::answer`]). **It never decides a call.**
+//! ([`Directory::beat`]), takes a newer policy from any publisher
+//! ([`Directory::check_head`] then [`Directory::accept`]: verified under the
+//! root, fresh, strictly newer, items matching the head's `items_hash`) and
+//! answers `wires/directory/2` requests ([`Directory::answer`]). **It never
+//! decides a call.** It may start empty, holding no policy, and take the
+//! admin's first publish.
 //!
-//! A caller asks for its **view** (card 37): the services its verified IdP
-//! principal may call or read, each a root-signed entry
-//! ([`Directory::answer_caller`]). The directory verifies the ID token the
-//! caller presented in its `hello` itself, as a host does (the policy's
-//! signed `issuer` items, the IdP's keys held in memory, the nonce bound to
-//! the iroh-authenticated key), and cuts the view from the policy it holds
-//! ([`SignedPolicy::view_for`]). Nothing per user is stored, and a request
-//! is traced, not logged: a view grants nothing (the host decides every
-//! call), and without a verified principal the view is empty.
+//! Who is asking is decided at the `hello` ([`Directory::admit`]): a node
+//! the held policy names as a host or directory ([`Peer::named`], by its
+//! key), and a caller whose ID token verifies and whom the policy admits
+//! ([`Peer::principal`]: [`library::check_admitted`], a verified email, no
+//! ban, a role that matches) are admitted; anyone else may only publish,
+//! and hears [`NOT_ADMITTED`] for anything more. The directory verifies the
+//! token itself, as a host does (the policy's signed `issuer` items, the
+//! IdP's keys held in memory, the nonce bound to the iroh-authenticated
+//! key), and cuts the caller's **view** (card 37) from the policy it holds
+//! ([`SignedPolicy::view_for`]): the root-signed entries its principal may
+//! call. Nothing per user is stored, and a request is traced, not logged: a
+//! view grants nothing (the host decides every call).
+//!
+//! Subscriptions come from two pools, so callers can't exhaust the hosts':
+//! [`Directory::subscribers`] for the nodes the policy names (`policy` and
+//! `replica`), and [`Directory::view_subscribers`] for callers' `view`
+//! subscriptions, at most [`MAX_VIEW_SUBSCRIPTIONS_PER_PERSON`] of them for
+//! one person ([`Directory::view_slot`]).
 //!
 //! Every change of head or freshness is published on a watch channel
 //! ([`Directory::watch`]), which the subscriptions follow.
@@ -25,9 +36,8 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, anyhow};
 use library::{
-    DirectoryAnswer, DirectoryRequest, Fresh, IdToken, IdentityClaim, Membership, NodeId,
-    NodeIdentity, Policy, Principal, SignedPolicy, StateVersion, View, ViewDigest, ViewUpdate,
-    check_admitted, check_inclusion,
+    DirectoryAnswer, DirectoryRequest, Fresh, IdToken, IdentityClaim, Item, NodeId, NodeIdentity,
+    Policy, Principal, SignedPolicy, SignedPolicyHead, StateVersion, View, ViewDigest, ViewUpdate,
 };
 
 use super::db::{DB_FILE, DirectoryDb};
@@ -57,14 +67,14 @@ enum ViewSince {
     Update(ViewUpdate),
 }
 
-/// What [`Directory::watch`] carries: the current state, or nothing yet.
+/// What [`Directory::watch`] carries: what it holds now, or nothing yet.
 pub(crate) type Snapshot = Option<Arc<Current>>;
 
 /// A directory. See the module docs.
 pub(crate) struct Directory {
     /// This node: its key signs `Fresh`.
     me: NodeIdentity,
-    /// The fabric root everything verifies under.
+    /// The network's root key, which everything verifies under.
     root: NodeId,
     /// Its keystore: `directory.redb`, and `policy.json`, which it keeps in
     /// step (so a host that is also the directory decides under what it
@@ -77,10 +87,16 @@ pub(crate) struct Directory {
     /// Serializes accepts and beats (the store has one writer, and the
     /// head announced is always the newest held).
     write: std::sync::Mutex<()>,
-    /// The subscriber cap (local config).
+    /// The subscriber cap of each pool (local config).
     pub(crate) max_subscribers: usize,
-    /// The subscribers following now.
+    /// The `policy` and `replica` subscribers following now: nodes the
+    /// policy names. Callers never take one.
     pub(crate) subscribers: Arc<tokio::sync::Semaphore>,
+    /// The callers' `view` subscribers following now, apart from
+    /// [`subscribers`](Self::subscribers).
+    pub(crate) view_subscribers: Arc<tokio::sync::Semaphore>,
+    /// How many `view` subscriptions each person (issuer, subject) holds.
+    view_per_person: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), usize>>>,
     /// Connections not yet admitted (bounded: any key can dial). A permit
     /// is held from the connection until its `hello` is decided, never
     /// longer.
@@ -119,11 +135,83 @@ pub(crate) const MAX_ADMITTED: usize = 64;
 /// What an admitted node hears when [`MAX_ADMITTED`] are in hand.
 pub(crate) const BUSY: &str = "this directory is busy; try again or ask another";
 
-/// The default subscriber cap.
+/// The default subscriber cap, of each pool: the nodes the policy names
+/// (`policy` and `replica`), and callers' `view` subscriptions.
 pub(crate) const DEFAULT_MAX_SUBSCRIBERS: usize = 4096;
+
+/// How many `view` subscriptions one person (issuer and subject) may hold
+/// at once on a directory. Per person, not per node: a gateway holds one per
+/// web user from its one node.
+pub(crate) const MAX_VIEW_SUBSCRIPTIONS_PER_PERSON: usize = 16;
 
 /// What a node not admitted hears on either ALPN, whatever the reason.
 pub(crate) use crate::host::gate::NOT_ADMITTED;
+
+/// What a directory holding no policy answers every request but a publish.
+pub(crate) const EMPTY: &str = "this directory holds no policy yet: it is waiting for the \
+                                admin's first publish (`wires policy push`)";
+
+/// Who a directory peer is, as its `hello` decided ([`Directory::admit`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Peer {
+    /// The iroh-authenticated key.
+    pub(crate) node: NodeId,
+    /// The held policy names it as a host or a directory (and doesn't ban
+    /// it): it may hold the whole policy.
+    pub(crate) named: bool,
+    /// Who its ID token verified as, under the held policy's issuers, when
+    /// the held policy admits that person ([`library::check_admitted`]);
+    /// `None` otherwise.
+    pub(crate) principal: Option<Principal>,
+}
+
+impl Peer {
+    /// Whether it may ask more than a publish: named, or an admitted
+    /// caller.
+    pub(crate) fn admitted(&self) -> bool {
+        self.named || self.principal.is_some()
+    }
+}
+
+/// One person's hold on a `view` subscription: a slot in
+/// [`Directory::view_subscribers`] and one of their
+/// [`MAX_VIEW_SUBSCRIPTIONS_PER_PERSON`]. Both are given back on drop.
+pub(crate) struct ViewSlot {
+    /// The pool slot.
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    /// Who holds it, and the count to give it back to.
+    person: (String, String),
+    per_person: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), usize>>>,
+}
+
+impl Drop for ViewSlot {
+    fn drop(&mut self) {
+        let mut held = self.per_person.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = held.get_mut(&self.person) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                held.remove(&self.person);
+            }
+        }
+    }
+}
+
+/// What [`Directory::check_head`] makes of a publish's head.
+#[derive(Debug)]
+pub(crate) enum HeadCheck {
+    /// Root-signed, fresh and newer than the held head: read its items.
+    Wanted,
+    /// Not newer: what the directory holds (its version and head hash),
+    /// which is the answer.
+    Held {
+        /// The held version.
+        version: StateVersion,
+        /// The held head's hash.
+        head: library::HeadHash,
+    },
+    /// Refused, and why.
+    Refused(String),
+}
 
 /// What a node that is neither a host nor a directory hears when it asks
 /// for (or subscribes to) the whole policy (card 37).
@@ -140,9 +228,10 @@ impl std::fmt::Debug for Directory {
 
 impl Directory {
     /// Open `me`'s directory in `ks` (its `directory.redb`) for `root`'s
-    /// fabric: load the newest head, or seed the store from the keystore's
-    /// own `policy.json` when that is newer (a node that joined by invite
-    /// holds one), then sign a `Fresh` for it.
+    /// network: load the newest head, or seed the store from the keystore's
+    /// own `policy.json` when that is newer (a host that fetched one), then
+    /// sign a `Fresh` for it. With neither, it opens empty, and takes the
+    /// admin's first publish.
     pub(crate) fn open(
         me: NodeIdentity,
         root: NodeId,
@@ -174,6 +263,8 @@ impl Directory {
             write: std::sync::Mutex::new(()),
             max_subscribers,
             subscribers: Arc::new(tokio::sync::Semaphore::new(max_subscribers)),
+            view_subscribers: Arc::new(tokio::sync::Semaphore::new(max_subscribers)),
+            view_per_person: Default::default(),
             undecided: Arc::new(tokio::sync::Semaphore::new(MAX_UNDECIDED)),
             admitted: Arc::new(tokio::sync::Semaphore::new(MAX_ADMITTED)),
             stream_deadline: super::wire::FRAME_TIMEOUT,
@@ -192,7 +283,7 @@ impl Directory {
         self.me.node_id()
     }
 
-    /// The fabric root.
+    /// The network's root key.
     pub(crate) fn root(&self) -> NodeId {
         self.root
     }
@@ -237,9 +328,6 @@ impl Directory {
             return Ok(());
         };
         let fresh = self.sign_fresh(&current.held, now);
-        if let Some(f) = &fresh {
-            self.db.set_fresh(f)?;
-        }
         #[cfg(test)]
         if let Some(hook) = self.beat_hook.lock().unwrap().take() {
             hook();
@@ -252,8 +340,16 @@ impl Directory {
     }
 
     /// A `Fresh` for `held`'s head from `now`, or `None` (traced) when the
-    /// head doesn't list this node.
+    /// head doesn't list this node or has expired (an expired policy is
+    /// served by no directory).
     fn sign_fresh(&self, held: &Held, now: i64) -> Option<Fresh> {
+        if let Err(e) = held.check_fresh(now) {
+            tracing::warn!(
+                version = held.version().0,
+                "this directory vouches for nothing: the policy it holds {e}; publish a newer one"
+            );
+            return None;
+        }
         let secs = i64::from(held.policy.settings.fresh_secs);
         match Fresh::sign(&self.me, &held.signed.head, now, now.saturating_add(secs)) {
             Ok(f) => Some(f),
@@ -285,127 +381,168 @@ impl Directory {
             tracing::warn!("could not keep policy.json in step with the directory: {e:#}");
         }
         let fresh = self.sign_fresh(&held, now);
-        if let Some(f) = &fresh {
-            self.db.set_fresh(f)?;
-        }
         tracing::info!(version = held.version().0, "directory: took a newer policy");
         self.current
             .send_replace(Some(Arc::new(Current { held, fresh })));
         Ok(true)
     }
 
-    /// Whether `caller`, presenting `badge`, is admitted: the badge verifies
-    /// under the root and names it, and the held policy (if any) doesn't ban
-    /// it. `Err` is the detail, for this node's trace only.
-    pub(crate) fn admit(&self, caller: NodeId, badge: &Membership, now: i64) -> Result<(), String> {
-        let result = match self.snapshot() {
-            Some(c) => check_admitted(badge, self.root, &c.held.policy, caller, now),
-            None => check_inclusion(badge, self.root, caller, now),
+    /// Who `caller` is, from its `hello`'s `id_token` (see [`Peer`]): named
+    /// when the held policy names it as a host or directory (by its key), an
+    /// admitted caller when the token verifies under the held policy and
+    /// [`library::check_admitted`] passes (the reason it doesn't is traced).
+    /// Holding no policy, it admits nobody (anyone may still publish).
+    pub(crate) async fn admit(&self, caller: NodeId, id_token: Option<&IdToken>, now: i64) -> Peer {
+        // An expired policy admits nobody.
+        let held = self.snapshot().filter(|c| c.held.check_fresh(now).is_ok());
+        let named = self.holds_whole(caller);
+        let principal = match (held, id_token) {
+            (Some(c), Some(token)) => self
+                .principal(caller, token, &c.held.policy, now)
+                .await
+                .filter(
+                    |p| match library::check_admitted(&c.held.policy, caller, p) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::debug!(
+                                peer = %caller.hex(),
+                                who = %p.name(),
+                                "directory: not admitted: {e}"
+                            );
+                            false
+                        }
+                    },
+                ),
+            _ => None,
         };
-        result.map_err(|e| format!("{}… is not admitted: {e}", caller.short()))
+        Peer {
+            node: caller,
+            named,
+            principal,
+        }
     }
 
-    /// The answer to one request from an admitted `caller`.
+    /// The first half of a publish: whether `head` is one to read the items
+    /// of. Root-signed and fresh, and newer than the held head:
+    /// [`HeadCheck::Wanted`]. Root-signed but not newer: the held version
+    /// and head hash, read no further ([`HeadCheck::Held`]). Anything else is
+    /// refused. Nobody but the root can make a directory read a publish's
+    /// items.
+    pub(crate) fn check_head(&self, head: &SignedPolicyHead, now: i64) -> HeadCheck {
+        if let Err(e) = head.verify(self.root) {
+            return HeadCheck::Refused(format!("the published head does not verify: {e}"));
+        }
+        if let Err(e) = head.check_fresh(now) {
+            return HeadCheck::Refused(format!("the published policy has expired: {e}"));
+        }
+        match self.snapshot() {
+            Some(c) if head.head.version <= c.held.version() => match c.held.signed.head.hash() {
+                Ok(hash) => HeadCheck::Held {
+                    version: c.held.version(),
+                    head: hash,
+                },
+                Err(e) => HeadCheck::Refused(format!("hashing the held head: {e}")),
+            },
+            _ => HeadCheck::Wanted,
+        }
+    }
+
+    /// The second half of a publish from `peer`: `head` with `items`,
+    /// [`accept`](Self::accept)ed, answered with the version and head hash
+    /// the directory then holds.
+    pub(crate) fn publish(
+        &self,
+        peer: NodeId,
+        head: SignedPolicyHead,
+        items: Vec<Item>,
+        now: i64,
+    ) -> DirectoryAnswer {
+        let candidate = SignedPolicy { head, items };
+        if let Err(e) = self.accept(&candidate, now) {
+            tracing::info!(peer = %peer.hex(), "publish refused: {e:#}");
+            return DirectoryAnswer::Denied {
+                reason: crate::host::transport::truncate_reason(format!(
+                    "the published policy was refused: {e:#}"
+                )),
+            };
+        }
+        match self.snapshot() {
+            Some(c) => match c.held.signed.head.hash() {
+                Ok(head) => DirectoryAnswer::Published {
+                    version: c.held.version(),
+                    head,
+                },
+                Err(e) => DirectoryAnswer::Denied {
+                    reason: format!("hashing the held head: {e}"),
+                },
+            },
+            None => DirectoryAnswer::Denied {
+                reason: EMPTY.into(),
+            },
+        }
+    }
+
+    /// The answer to one request (not a publish: see
+    /// [`check_head`](Self::check_head)) from `peer`, which
+    /// [`admit`](Self::admit) admitted:
+    ///
+    /// - `policy {have}`, for a named node only (card 37: a caller holds
+    ///   its view): `current {fresh}`, a `policy_update` from a kept head
+    ///   (card 36c), or the whole policy;
+    /// - `view {have, query: None, held}`: for a verified principal whose
+    ///   `held` digest names exactly the view this directory would diff
+    ///   from ([`view_since`](Self::view_since)), `current {fresh}` at the
+    ///   held version or a `view_update` from a kept `have` (the caller
+    ///   applies it with [`library::View::apply`]); else the whole view;
+    /// - `view {have, query: Some(q)}`: the entries matching `q`, always a
+    ///   whole (searched) view;
+    /// - `resolve {service}`: a view holding just that service, or no entry.
+    ///
+    /// Every view is cut for `peer`'s node and admitted principal (a named
+    /// node with none gets the empty one). Traced, not logged (see the
+    /// module docs).
     pub(crate) fn answer(
         &self,
-        caller: NodeId,
+        peer: &Peer,
         request: DirectoryRequest,
         now: i64,
     ) -> DirectoryAnswer {
         let denied = |reason: String| DirectoryAnswer::Denied {
             reason: crate::host::transport::truncate_reason(reason),
         };
-        match request {
-            DirectoryRequest::Publish { head, items } => {
-                let candidate = SignedPolicy { head, items };
-                match self.accept(&candidate, now) {
-                    Ok(_) => DirectoryAnswer::Published {
-                        version: self.version(),
-                    },
-                    Err(e) => {
-                        tracing::info!(peer = %caller.hex(), "publish refused: {e:#}");
-                        denied(format!("the published policy was refused: {e:#}"))
-                    }
-                }
+        if !peer.admitted() {
+            return denied(NOT_ADMITTED.into());
+        }
+        let (c, fresh) = match self.current_with_fresh(now) {
+            Ok(held) => held,
+            Err(reason) => return denied(reason),
+        };
+        let principal = peer.principal.as_ref();
+        let answer = match request {
+            DirectoryRequest::Policy { .. } if !peer.named => {
+                return denied(VIEW_NOT_POLICY.into());
             }
-            DirectoryRequest::Head {} => match self.current_with_fresh() {
-                Ok((c, fresh)) => DirectoryAnswer::Head {
-                    head: c.held.signed.head.clone(),
-                    fresh,
-                },
-                Err(reason) => denied(reason),
-            },
-            // The whole policy, for hosts and directories only (card 37: a
-            // caller holds its view), or the delta from a kept `have`
-            // (card 36c).
-            DirectoryRequest::Policy { .. } if !self.holds_whole(caller) => {
-                denied(VIEW_NOT_POLICY.into())
-            }
-            DirectoryRequest::Policy { have } => match self.current_with_fresh() {
-                Ok((c, fresh)) => match super::sub_policy::since(self, &c, have) {
+            DirectoryRequest::Policy { have } => {
+                return match super::sub_policy::since(self, &c, have) {
                     Since::Current => DirectoryAnswer::Current { fresh },
                     Since::Update(update) => DirectoryAnswer::PolicyUpdate { update, fresh },
                     Since::Whole => DirectoryAnswer::Policy {
                         policy: c.held.signed.clone(),
                         fresh,
                     },
-                },
-                Err(reason) => denied(reason),
-            },
-            DirectoryRequest::View { .. } | DirectoryRequest::Resolve { .. } => {
-                denied("a view needs the caller's ID token: ask through `answer_caller`".into())
+                };
             }
-            DirectoryRequest::Hello { .. } => denied("a second hello".into()),
-        }
-    }
-
-    /// Whether `node` may hold the whole policy (card 37): a host of one of
-    /// its services, or one of its directories, in the policy held now. A
-    /// caller holds its view instead.
-    pub(crate) fn holds_whole(&self, node: NodeId) -> bool {
-        self.snapshot()
-            .is_some_and(|c| c.held.policy.is_host(node) || c.held.directories().contains(&node))
-    }
-
-    /// The answer to a caller's `view` or `resolve` (anything else is
-    /// [`answer`](Self::answer)'s), from an admitted `caller` that presented
-    /// `id_token` in its `hello`:
-    ///
-    /// - `view {have, query: None, held}`: for a verified principal whose
-    ///   `held` digest names exactly the view this directory would diff
-    ///   from ([`view_since`](Self::view_since)), `current {fresh}` at the
-    ///   held version or a `view_update` from a kept `have` (the caller
-    ///   applies it with [`library::View::apply`]); else the whole view (so
-    ///   without a verified principal, the empty view, whole: a caller
-    ///   can't keep entries it isn't entitled to);
-    /// - `view {have, query: Some(q)}`: the entries matching `q`, always a
-    ///   whole (searched) view;
-    /// - `resolve {service}`: a view holding just that service, or no entry.
-    ///
-    /// Traced, not logged (see the module docs).
-    pub(crate) async fn answer_caller(
-        &self,
-        caller: NodeId,
-        id_token: Option<&IdToken>,
-        request: DirectoryRequest,
-        now: i64,
-    ) -> DirectoryAnswer {
-        let denied = |reason: String| DirectoryAnswer::Denied {
-            reason: crate::host::transport::truncate_reason(reason),
-        };
-        let (c, fresh) = match self.current_with_fresh() {
-            Ok(held) => held,
-            Err(reason) => return denied(reason),
-        };
-        let principal = self.principal(caller, id_token, &c.held.policy, now).await;
-        let who = principal.as_ref().map(Principal::name);
-        let answer = match request {
             DirectoryRequest::View { have, query, held } => {
-                let after = c.held.signed.view_for(principal.as_ref(), query.as_deref());
+                let after = c
+                    .held
+                    .signed
+                    .view_for(peer.node, principal, query.as_deref());
                 // Less than the whole view only for a verified principal
                 // asking for all of it, holding exactly what we'd diff from.
-                let since = match (&principal, &query, held) {
-                    (Some(p), None, Some(held)) => self.view_since(&c, p, have, held, &after),
+                let since = match (principal, &query, held) {
+                    (Some(p), None, Some(held)) => {
+                        self.view_since(&c, peer.node, p, have, held, &after)
+                    }
                     _ => None,
                 };
                 match since {
@@ -417,24 +554,66 @@ impl Directory {
                 }
             }
             DirectoryRequest::Resolve { service } => {
-                let mut view = c.held.signed.view_for(principal.as_ref(), None);
-                view.entries.retain(|e| e.entry.name == service);
+                let mut view = c.held.signed.view_for(peer.node, principal, None);
+                view.entries.retain(|e| e.name == service);
                 DirectoryAnswer::View { view, fresh }
             }
-            other => return self.answer(caller, other, now),
+            DirectoryRequest::Hello { .. } => return denied("a second hello".into()),
+            DirectoryRequest::Publish { .. } | DirectoryRequest::Items { .. } => {
+                return denied("a publish is a head and then its items".into());
+            }
         };
         let entries = match &answer {
             DirectoryAnswer::View { view, .. } => view.entries.len(),
             _ => 0,
         };
         tracing::debug!(
-            peer = %caller.hex(),
-            who = who.as_deref().unwrap_or("-"),
+            peer = %peer.node.hex(),
+            who = principal.map(Principal::name).as_deref().unwrap_or("-"),
             entries,
             version = c.held.version().0,
             "directory: answered a view"
         );
         answer
+    }
+
+    /// A `view` subscription slot for `principal`: one of
+    /// [`view_subscribers`](Self::view_subscribers), and one of their
+    /// [`MAX_VIEW_SUBSCRIPTIONS_PER_PERSON`]; `Err` is the refusal.
+    pub(crate) fn view_slot(&self, principal: &Principal) -> Result<ViewSlot, String> {
+        let person = (principal.issuer.clone(), principal.subject.clone());
+        let mut held = self
+            .view_per_person
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let n = held.entry(person.clone()).or_default();
+        if *n >= MAX_VIEW_SUBSCRIPTIONS_PER_PERSON {
+            return Err(format!(
+                "you have {MAX_VIEW_SUBSCRIPTIONS_PER_PERSON} view subscriptions open here already"
+            ));
+        }
+        let Ok(slot) = Arc::clone(&self.view_subscribers).try_acquire_owned() else {
+            return Err(format!(
+                "this directory's subscriber cap ({}) is reached",
+                self.max_subscribers
+            ));
+        };
+        *n += 1;
+        Ok(ViewSlot {
+            _slot: slot,
+            person,
+            per_person: Arc::clone(&self.view_per_person),
+        })
+    }
+
+    /// Whether `node` may hold the whole policy (card 37): a host of one of
+    /// its services, or one of its directories, in the policy held now (a
+    /// banned node is neither). A caller holds its view instead.
+    pub(crate) fn holds_whole(&self, node: NodeId) -> bool {
+        self.snapshot().is_some_and(|c| {
+            !c.held.policy.bans_node(node)
+                && (c.held.policy.is_host(node) || c.held.directories().contains(&node))
+        })
     }
 
     /// What brings a caller holding the view `held` names (at `have`) to
@@ -446,6 +625,7 @@ impl Directory {
     fn view_since(
         &self,
         c: &Current,
+        node: NodeId,
         principal: &Principal,
         have: StateVersion,
         held: ViewDigest,
@@ -462,21 +642,20 @@ impl Directory {
             .policy_at(have)
             .ok()
             .flatten()?
-            .view_for(Some(principal), None);
+            .view_for(node, Some(principal), None);
         matches(&before).then(|| ViewSince::Update(before.update_to(after)))
     }
 
     /// Who `caller` is: its `id_token` verified under `policy`'s trusted
     /// issuers (each with its accepted audiences) and bound to `caller`'s
-    /// key, or `None` (no token, or one that doesn't verify, traced).
-    pub(crate) async fn principal(
+    /// key, unexpired, or `None` (one that doesn't verify, traced).
+    async fn principal(
         &self,
         caller: NodeId,
-        id_token: Option<&IdToken>,
+        id_token: &IdToken,
         policy: &Policy,
         now: i64,
     ) -> Option<Principal> {
-        let id_token = id_token?;
         let trust = IdpTrust::per_issuer(
             policy
                 .issuers
@@ -506,11 +685,16 @@ impl Directory {
         }
     }
 
-    /// The held policy and its `Fresh`, or why there is none to serve.
-    fn current_with_fresh(&self) -> Result<(Arc<Current>, Fresh), String> {
-        let c = self
-            .snapshot()
-            .ok_or_else(|| "this directory holds no policy yet".to_string())?;
+    /// The held policy and its `Fresh`, or why there is none to serve (an
+    /// expired policy is served to nobody).
+    fn current_with_fresh(&self, now: i64) -> Result<(Arc<Current>, Fresh), String> {
+        let c = self.snapshot().ok_or_else(|| EMPTY.to_string())?;
+        if c.held.check_fresh(now).is_err() {
+            return Err(format!(
+                "this directory holds only an expired policy (version {}); try again later",
+                c.held.version().0
+            ));
+        }
         let fresh = c.fresh.clone().ok_or_else(|| {
             format!(
                 "this node is not a directory of the policy it holds (version {})",

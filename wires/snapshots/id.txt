@@ -6,4 +6,4 @@ Options:
   -h, --help  Print help
 
 Example:
-  wires id                    # send this to your admin: `wires invite <id>`
+  wires id                    # the admin names this node: `wires directory add wb=<id>`

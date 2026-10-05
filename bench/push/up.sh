@@ -4,18 +4,20 @@
 # running the mock CI (.scripts/fixtures/ci.sh: deploy / status / logs) and
 # one agent keystore per arm, so parallel lanes never share a mailbox.
 #
-#   root      -- `wires init`, the three CI services on the workbench for
-#                role `bench` ($BENCH_EMAIL at $BENCH_OIDC_ISSUER: every role
-#                needs a verified identity), one invite per machine
-#   workbench -- `wires serve host.json`: implements the three services, and
-#                pushes to `bench`
-#   agent-<arm> -- joined with its invite and signed in with `wires login`
-#                (a browser opens once per arm); the bench runs Claude Code
-#                with WIRES_HOME=<that keystore> and WIRES_LOCKED=1
+#   root      -- `wires init`, the workbench named by key as the directory
+#                and as the host of the three CI services for role `bench`
+#                ($BENCH_EMAIL at $BENCH_OIDC_ISSUER: every role needs a
+#                verified identity), `wires network`, `wires policy push`
+#   workbench -- `wires join <network>`, `wires serve host.json`: implements
+#                the three services, pushes to `bench`, and is the directory
+#                (it starts empty and takes the first publish)
+#   agent-<arm> -- `wires login <network>` (a browser opens once per arm);
+#                the bench runs Claude Code with WIRES_HOME=<that keystore>
+#                and WIRES_LOCKED=1
 #
 # Needs BENCH_EMAIL (who may call) and BENCH_OIDC_CLIENT_ID (an OAuth client
-# of that IdP; Google "Desktop app"); BENCH_OIDC_CLIENT_SECRET if it has one;
-# BENCH_OIDC_ISSUER defaults to https://accounts.google.com.
+# of that IdP; Google "Desktop app"); BENCH_OIDC_CLIENT_SECRET if it has one
+# (a public one); BENCH_OIDC_ISSUER defaults to https://accounts.google.com.
 #
 # State lives under $BENCH_PUSH_DIR (default /tmp/wb24): short, because macOS
 # caps unix-socket paths at 104 bytes. Writes $D/env.sh (export lines).
@@ -46,15 +48,19 @@ fi
 rm -rf "$D/root" "$D/wb" "$D/jobs" "$D"/agent-*
 mkdir -p "$D/root" "$D/wb" "$D/jobs"
 
-WIRES_HOME="$D/root" "$WIRES" init >/dev/null
+admin() { WIRES_HOME="$D/root" "$WIRES" "$@"; }
+admin init --issuer "$ISSUER" --client-id "$CLIENT_ID" \
+	${BENCH_OIDC_CLIENT_SECRET:+--public-client-secret "$BENCH_OIDC_CLIENT_SECRET"} >/dev/null
 WB_ID="$(WIRES_HOME="$D/wb" "$WIRES" id 2>/dev/null)"
-WIRES_HOME="$D/root" "$WIRES" invite "$WB_ID" --name workbench >/dev/null 2>&1
-WIRES_HOME="$D/root" "$WIRES" role set bench --issuer "$ISSUER" "$EMAIL" >/dev/null
-# The workbench isn't up yet: each edit reaches no host and exits 1 (the state
-# is stored; the workbench's token carries it). Any other failure stops here.
+admin role set bench "$EMAIL" >/dev/null 2>&1
+# The workbench isn't up yet: each edit is stored here and says no directory
+# has taken a publish yet (exit 0); `policy push` delivers it below.
+admin directory add "workbench=$WB_ID" >/dev/null 2>"$D/dir.err" || {
+	cat "$D/dir.err" >&2
+	exit 1
+}
 add() {
-	WIRES_HOME="$D/root" "$WIRES" service add "$1" --allow bench --host workbench --description "$2" >/dev/null 2>"$D/svc.err" ||
-		grep -qF "reached none of its 1 host(s)" "$D/svc.err" || {
+	admin service add "$1" --allow bench --host workbench --description "$2" >/dev/null 2>"$D/svc.err" || {
 		cat "$D/svc.err" >&2
 		exit 1
 	}
@@ -62,8 +68,8 @@ add() {
 add deploy "Start a CI build in the background: deploy -- build <n>. Returns at once; the result is pushed to your wires inbox when the build finishes."
 add status "A build's state: status -- build <n> (running / failed)."
 add logs "A build's log: logs -- build <n> [--tail N] (default: last 50 lines)."
-tok="$(WIRES_HOME="$D/root" "$WIRES" invite "$WB_ID" --name workbench 2>/dev/null)" || true
-WIRES_HOME="$D/wb" "$WIRES" join "$tok" >/dev/null
+NETWORK="$(admin network)"
+WIRES_HOME="$D/wb" "$WIRES" join "$NETWORK" >/dev/null
 
 # The demo's host.json, with the bench's IdP and role. $D/jobs/job-secs (set
 # by bench.py per duration) overrides CI_JOB_SECS.
@@ -92,17 +98,16 @@ done
 # Addressing is by key; on loopback the workbench's hint line stands in for
 # n0 discovery.
 cp "$D/wb/run/hint" "$D/root/hints"
+# The workbench's directory started empty: the first publish fills it.
+admin policy push >&2
 
 for arm in "$@"; do
 	h="$D/agent-$arm"
 	mkdir -p "$h"
-	id="$(WIRES_HOME="$h" "$WIRES" id 2>/dev/null)"
-	tok="$(WIRES_HOME="$D/root" "$WIRES" invite "$id" --name "agent-$arm" 2>/dev/null)"
-	WIRES_HOME="$h" "$WIRES" join "$tok" >/dev/null
 	cp "$D/wb/run/hint" "$h/hints"
-	# Each arm signs in once: its ID token is bound to its own node key.
-	WIRES_HOME="$h" "$WIRES" login --issuer "$ISSUER" --client-id "$CLIENT_ID" \
-		${BENCH_OIDC_CLIENT_SECRET:+--client-secret "$BENCH_OIDC_CLIENT_SECRET"} >&2
+	# Each arm joins and signs in once: its ID token is bound to its own
+	# node key.
+	WIRES_HOME="$h" "$WIRES" login "$NETWORK" >&2
 	WIRES_HOME="$h" "$WIRES" services 2>/dev/null | grep -q '^deploy ' || {
 		echo "up: agent-$arm does not see the CI services" >&2
 		exit 1

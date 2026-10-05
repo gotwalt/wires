@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# A mock CI host for the push demo (card 24): three tools in one script,
-# exposed by .scripts/fixtures/push-host.json.
+# A mock CI host for the push demo (card 24): three services in one script,
+# each implemented by .scripts/fixtures/push-host.json.
 #
 #   ci.sh deploy build <n>             start build <n> in the background; return at once
 #   ci.sh status build <n>             running / failed (the poll path)
@@ -24,7 +24,7 @@
 #                present, overrides it at deploy time (the benchmark sets it)
 #   CI_WIRES     the wires binary for `wires push` (default: `wires` on PATH)
 #
-# Every tool call is appended to $CI_JOBS/calls.log as
+# Every call is appended to $CI_JOBS/calls.log as
 # `<epoch ms> <tool> <caller8> <args>`, and a finished build writes
 # $CI_JOBS/build-<n>/done_ms: the benchmark measures reaction latency from them.
 
