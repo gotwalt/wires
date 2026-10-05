@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "services": {
+    "stripe": {
+      "command": [
+        "/opt/wires-examples/services/stripe/wrapper.sh"
+      ],
+      "env": {
+        "ROLE_MAP": "/etc/wires-examples/stripe.roles",
+        "HOME": "/var/lib/wires-examples/stripe"
+      }
+    }
+  }
+}

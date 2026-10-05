@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "services": {
+    "supabase": {
+      "command": [
+        "/opt/wires-examples/services/supabase/wrapper.sh"
+      ],
+      "env": {
+        "ROLE_MAP": "/etc/wires-examples/supabase.roles",
+        "HOME": "/var/lib/wires-examples/supabase"
+      }
+    }
+  }
+}

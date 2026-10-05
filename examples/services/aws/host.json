@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "services": {
+    "aws": {
+      "command": [
+        "/opt/wires-examples/services/aws/wrapper.sh"
+      ],
+      "env": {
+        "ROLE_MAP": "/etc/wires-examples/aws.roles",
+        "STATE_DIR": "/var/lib/wires-examples/aws",
+        "AWS_DEFAULT_REGION": "us-east-1"
+      }
+    }
+  }
+}

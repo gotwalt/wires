@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "services": {
+    "github": {
+      "command": [
+        "/opt/wires-examples/services/github/wrapper.sh"
+      ],
+      "env": {
+        "ROLE_MAP": "/etc/wires-examples/github.roles",
+        "HOME": "/var/lib/wires-examples/github"
+      }
+    }
+  }
+}

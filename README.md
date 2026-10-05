@@ -329,6 +329,10 @@ The full list: [docs/usage.md § Known trade-offs](docs/usage.md#known-trade-off
 - [docs/usage.md](docs/usage.md): the roles, a walkthrough with output,
   `host.json`, locking an agent down to `wires`, and the
   [commands by role](docs/usage.md#commands-by-role).
+- [docs/examples.md](docs/examples.md): eight CLIs that teams reach today
+  through vendor MCP servers (`aws`, `gcloud`, `kubectl`, `gh`, `wrangler`,
+  `vercel`, `supabase`, `stripe`) as wires services, each with its wrapper,
+  its vendor setup and what it doesn't cover.
 - [docs/protocol.md](docs/protocol.md): the protocol, as the code does it.
 - [docs/executive-summary.md](docs/executive-summary.md): the product on one
   page.
